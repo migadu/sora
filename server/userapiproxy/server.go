@@ -358,9 +358,9 @@ func (s *Server) Start() error {
 func (s *Server) setupHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Track metrics
-		metrics.ConnectionsTotal.WithLabelValues("userapi_proxy").Inc()
-		metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy").Inc()
-		defer metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy").Dec()
+		metrics.ConnectionsTotal.WithLabelValues("userapi_proxy", s.name, "").Inc()
+		metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, "").Inc()
+		defer metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, "").Dec()
 
 		// Check if this is an authentication endpoint (no JWT required)
 		isAuthEndpoint := strings.HasPrefix(r.URL.Path, "/user/auth/")

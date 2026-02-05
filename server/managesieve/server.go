@@ -464,8 +464,8 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		totalCount := s.totalConnections.Add(1)
 
 		// Prometheus metrics - connection established
-		metrics.ConnectionsTotal.WithLabelValues("managesieve").Inc()
-		metrics.ConnectionsCurrent.WithLabelValues("managesieve").Inc()
+		metrics.ConnectionsTotal.WithLabelValues("managesieve", s.name, s.hostname).Inc()
+		metrics.ConnectionsCurrent.WithLabelValues("managesieve", s.name, s.hostname).Inc()
 		authCount := s.authenticatedConnections.Load()
 
 		sessionCtx, sessionCancel := context.WithCancel(s.appCtx)

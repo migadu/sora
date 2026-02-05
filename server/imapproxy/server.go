@@ -536,13 +536,13 @@ func (s *Server) acceptConnections() error {
 			defer s.wg.Done()
 
 			// Track proxy connection
-			metrics.ConnectionsTotal.WithLabelValues("imap_proxy").Inc()
-			metrics.ConnectionsCurrent.WithLabelValues("imap_proxy").Inc()
+			metrics.ConnectionsTotal.WithLabelValues("imap_proxy", s.name, s.hostname).Inc()
+			metrics.ConnectionsCurrent.WithLabelValues("imap_proxy", s.name, s.hostname).Inc()
 
 			session := newSession(s, conn)
 			if session == nil {
 				// PROXY protocol error - connection already closed in newSession
-				metrics.ConnectionsCurrent.WithLabelValues("imap_proxy").Dec()
+				metrics.ConnectionsCurrent.WithLabelValues("imap_proxy", s.name, s.hostname).Dec()
 				if releaseConn != nil {
 					releaseConn()
 				}
@@ -558,7 +558,7 @@ func (s *Server) acceptConnections() error {
 					// Clean up session from active tracking
 					s.removeSession(session)
 					// Decrement metrics
-					metrics.ConnectionsCurrent.WithLabelValues("imap_proxy").Dec()
+					metrics.ConnectionsCurrent.WithLabelValues("imap_proxy", s.name, s.hostname).Dec()
 					// Close connection
 					conn.Close()
 					// Ensure connection limiter is released on panic

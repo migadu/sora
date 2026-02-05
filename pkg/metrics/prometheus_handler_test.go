@@ -21,7 +21,7 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 		ConnectionsTotal.Reset()
 		S3OperationsTotal.Reset()
 
-		ConnectionsTotal.WithLabelValues("imap").Add(10)
+		ConnectionsTotal.WithLabelValues("imap", testServerName, testHostname).Add(10)
 		S3OperationsTotal.WithLabelValues("PUT", "success").Add(5)
 
 		// Create test server with Prometheus handler
@@ -57,7 +57,7 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 		}
 
 		// Check specific metric values
-		if !strings.Contains(bodyStr, `sora_connections_total{protocol="imap"} 10`) {
+		if !strings.Contains(bodyStr, `sora_connections_total{hostname="test-host",protocol="imap",server_name="test-server"} 10`) {
 			t.Error("Expected IMAP connections total to be 10")
 		}
 
@@ -101,8 +101,8 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 		ConnectionsTotal.Reset()
 		ConnectionsCurrent.Reset()
 
-		ConnectionsTotal.WithLabelValues("imap").Add(100)
-		ConnectionsCurrent.WithLabelValues("imap").Set(25)
+		ConnectionsTotal.WithLabelValues("imap", testServerName, testHostname).Add(100)
+		ConnectionsCurrent.WithLabelValues("imap", testServerName, testHostname).Set(25)
 
 		handler := promhttp.Handler()
 		server := httptest.NewServer(handler)
@@ -140,9 +140,9 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 		// Reset and set up histogram
 		ConnectionDuration.Reset()
 
-		ConnectionDuration.WithLabelValues("imap").Observe(0.1)
-		ConnectionDuration.WithLabelValues("imap").Observe(1.0)
-		ConnectionDuration.WithLabelValues("imap").Observe(5.0)
+		ConnectionDuration.WithLabelValues("imap", testServerName, testHostname).Observe(0.1)
+		ConnectionDuration.WithLabelValues("imap", testServerName, testHostname).Observe(1.0)
+		ConnectionDuration.WithLabelValues("imap", testServerName, testHostname).Observe(5.0)
 
 		handler := promhttp.Handler()
 		server := httptest.NewServer(handler)
@@ -172,11 +172,11 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 		}
 
 		// Check for histogram count and sum
-		if !strings.Contains(bodyStr, "sora_connection_duration_seconds_count{protocol=\"imap\"} 3") {
+		if !strings.Contains(bodyStr, "sora_connection_duration_seconds_count{hostname=\"test-host\",protocol=\"imap\",server_name=\"test-server\"} 3") {
 			t.Error("Expected histogram count to be 3")
 		}
 
-		if !strings.Contains(bodyStr, "sora_connection_duration_seconds_sum{protocol=\"imap\"}") {
+		if !strings.Contains(bodyStr, "sora_connection_duration_seconds_sum{hostname=\"test-host\",protocol=\"imap\",server_name=\"test-server\"}") {
 			t.Error("Expected histogram sum metric")
 		}
 	})
@@ -234,7 +234,7 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 		// Goroutine updating metrics
 		go func() {
 			for i := 0; i < 100; i++ {
-				ConnectionsTotal.WithLabelValues("imap").Inc()
+				ConnectionsTotal.WithLabelValues("imap", testServerName, testHostname).Inc()
 				time.Sleep(1 * time.Millisecond)
 			}
 			done <- true
@@ -272,7 +272,7 @@ func TestPrometheusHTTPHandler(t *testing.T) {
 		}
 
 		bodyStr := string(body)
-		if !strings.Contains(bodyStr, `sora_connections_total{protocol="imap"} 100`) {
+		if !strings.Contains(bodyStr, `sora_connections_total{hostname="test-host",protocol="imap",server_name="test-server"} 100`) {
 			t.Error("Expected final connection count to be 100")
 		}
 	})
@@ -491,10 +491,10 @@ func TestMetricsWithRealWorldData(t *testing.T) {
 
 		// Connection activity
 		for _, protocol := range protocols {
-			ConnectionsTotal.WithLabelValues(protocol).Add(1000)
-			ConnectionsCurrent.WithLabelValues(protocol).Set(50)
-			AuthenticationAttempts.WithLabelValues(protocol, "success").Add(950)
-			AuthenticationAttempts.WithLabelValues(protocol, "failure").Add(50)
+			ConnectionsTotal.WithLabelValues(protocol, testServerName, testHostname).Add(1000)
+			ConnectionsCurrent.WithLabelValues(protocol, testServerName, testHostname).Set(50)
+			AuthenticationAttempts.WithLabelValues(protocol, testServerName, testHostname, "success").Add(950)
+			AuthenticationAttempts.WithLabelValues(protocol, testServerName, testHostname, "failure").Add(50)
 		}
 
 		// Database activity
@@ -537,8 +537,8 @@ func TestMetricsWithRealWorldData(t *testing.T) {
 
 		// Verify various metrics are present with expected values
 		expectedMetrics := []string{
-			`sora_connections_total{protocol="imap"} 1000`,
-			`sora_authentication_attempts_total{protocol="imap",result="success"} 950`,
+			`sora_connections_total{hostname="test-host",protocol="imap",server_name="test-server"} 1000`,
+			`sora_authentication_attempts_total{hostname="test-host",protocol="imap",result="success",server_name="test-server"} 950`,
 			`sora_db_queries_total{operation="SELECT",role="read",status="success"} 5000`,
 			`sora_s3_operations_total{operation="PUT",status="success"} 2000`,
 			`sora_cache_operations_total{operation="get",result="hit"} 10000`,

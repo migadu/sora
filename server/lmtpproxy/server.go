@@ -512,8 +512,8 @@ func (s *Server) acceptConnections() error {
 			defer s.wg.Done()
 
 			// Track proxy connection
-			metrics.ConnectionsTotal.WithLabelValues("lmtp_proxy").Inc()
-			metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Inc()
+			metrics.ConnectionsTotal.WithLabelValues("lmtp_proxy", s.name, s.hostname).Inc()
+			metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy", s.name, s.hostname).Inc()
 
 			session := newSession(s, conn, proxyInfo)
 			session.releaseConn = releaseConn // Set cleanup function on session
@@ -526,7 +526,7 @@ func (s *Server) acceptConnections() error {
 					// Unregister session from active tracking
 					s.unregisterSession(session)
 					// Decrement metrics
-					metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Dec()
+					metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy", s.name, s.hostname).Dec()
 					// Close connection
 					conn.Close()
 					// Ensure connection limiter is released on panic

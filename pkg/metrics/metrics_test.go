@@ -8,6 +8,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+const (
+	testServerName = "test-server"
+	testHostname   = "test-host"
+)
+
 // Test basic metrics registration and functionality
 func TestConnectionMetrics(t *testing.T) {
 	// Reset the metrics before testing
@@ -25,35 +30,35 @@ func TestConnectionMetrics(t *testing.T) {
 			name:     "connections_total_increment",
 			protocol: "imap",
 			testFunc: func(protocol string) {
-				ConnectionsTotal.WithLabelValues(protocol).Inc()
+				ConnectionsTotal.WithLabelValues(protocol, testServerName, testHostname).Inc()
 			},
 		},
 		{
 			name:     "connections_current_set",
 			protocol: "pop3",
 			testFunc: func(protocol string) {
-				ConnectionsCurrent.WithLabelValues(protocol).Set(5)
+				ConnectionsCurrent.WithLabelValues(protocol, testServerName, testHostname).Set(5)
 			},
 		},
 		{
 			name:     "authenticated_connections_increment",
 			protocol: "lmtp",
 			testFunc: func(protocol string) {
-				AuthenticatedConnectionsCurrent.WithLabelValues(protocol).Inc()
+				AuthenticatedConnectionsCurrent.WithLabelValues(protocol, testServerName, testHostname).Inc()
 			},
 		},
 		{
 			name:     "authentication_attempts_success",
 			protocol: "imap",
 			testFunc: func(protocol string) {
-				AuthenticationAttempts.WithLabelValues(protocol, "success").Inc()
+				AuthenticationAttempts.WithLabelValues(protocol, testServerName, testHostname, "success").Inc()
 			},
 		},
 		{
 			name:     "authentication_attempts_failure",
 			protocol: "imap",
 			testFunc: func(protocol string) {
-				AuthenticationAttempts.WithLabelValues(protocol, "failure").Inc()
+				AuthenticationAttempts.WithLabelValues(protocol, testServerName, testHostname, "failure").Inc()
 			},
 		},
 	}
@@ -65,23 +70,23 @@ func TestConnectionMetrics(t *testing.T) {
 			// Verify the metric was updated
 			switch tt.name {
 			case "connections_total_increment":
-				if got := testutil.ToFloat64(ConnectionsTotal.WithLabelValues(tt.protocol)); got != 1 {
+				if got := testutil.ToFloat64(ConnectionsTotal.WithLabelValues(tt.protocol, testServerName, testHostname)); got != 1 {
 					t.Errorf("Expected ConnectionsTotal to be 1, got %f", got)
 				}
 			case "connections_current_set":
-				if got := testutil.ToFloat64(ConnectionsCurrent.WithLabelValues(tt.protocol)); got != 5 {
+				if got := testutil.ToFloat64(ConnectionsCurrent.WithLabelValues(tt.protocol, testServerName, testHostname)); got != 5 {
 					t.Errorf("Expected ConnectionsCurrent to be 5, got %f", got)
 				}
 			case "authenticated_connections_increment":
-				if got := testutil.ToFloat64(AuthenticatedConnectionsCurrent.WithLabelValues(tt.protocol)); got != 1 {
+				if got := testutil.ToFloat64(AuthenticatedConnectionsCurrent.WithLabelValues(tt.protocol, testServerName, testHostname)); got != 1 {
 					t.Errorf("Expected AuthenticatedConnectionsCurrent to be 1, got %f", got)
 				}
 			case "authentication_attempts_success":
-				if got := testutil.ToFloat64(AuthenticationAttempts.WithLabelValues(tt.protocol, "success")); got != 1 {
+				if got := testutil.ToFloat64(AuthenticationAttempts.WithLabelValues(tt.protocol, testServerName, testHostname, "success")); got != 1 {
 					t.Errorf("Expected AuthenticationAttempts success to be 1, got %f", got)
 				}
 			case "authentication_attempts_failure":
-				if got := testutil.ToFloat64(AuthenticationAttempts.WithLabelValues(tt.protocol, "failure")); got != 1 {
+				if got := testutil.ToFloat64(AuthenticationAttempts.WithLabelValues(tt.protocol, testServerName, testHostname, "failure")); got != 1 {
 					t.Errorf("Expected AuthenticationAttempts failure to be 1, got %f", got)
 				}
 			}
@@ -98,7 +103,7 @@ func TestConnectionDurationHistogram(t *testing.T) {
 
 	for _, protocol := range protocols {
 		for _, duration := range durations {
-			ConnectionDuration.WithLabelValues(protocol).Observe(duration)
+			ConnectionDuration.WithLabelValues(protocol, testServerName, testHostname).Observe(duration)
 		}
 	}
 
@@ -107,7 +112,7 @@ func TestConnectionDurationHistogram(t *testing.T) {
 	// We can verify by checking the count is greater than 0
 	for _, protocol := range protocols {
 		// Use the histogram count suffix to get observation count
-		metric := ConnectionDuration.WithLabelValues(protocol)
+		metric := ConnectionDuration.WithLabelValues(protocol, testServerName, testHostname)
 		// Record one more observation to verify it's working
 		metric.Observe(0.5)
 	}
@@ -324,7 +329,7 @@ func TestHistogramBuckets(t *testing.T) {
 	}{
 		{
 			name:         "connection_duration_buckets",
-			histogram:    ConnectionDuration.WithLabelValues("imap"),
+			histogram:    ConnectionDuration.WithLabelValues("imap", testServerName, testHostname),
 			expectedMin:  0.005, // Prometheus default buckets start at 0.005
 			expectedMax:  10.0,  // Prometheus default buckets end at 10
 			testDuration: 1.5,
@@ -371,12 +376,12 @@ func TestMetricsLabels(t *testing.T) {
 		ConnectionsTotal.Reset()
 
 		for _, protocol := range protocols {
-			ConnectionsTotal.WithLabelValues(protocol).Inc()
+			ConnectionsTotal.WithLabelValues(protocol, testServerName, testHostname).Inc()
 		}
 
 		// Verify each protocol label was recorded
 		for _, protocol := range protocols {
-			count := testutil.ToFloat64(ConnectionsTotal.WithLabelValues(protocol))
+			count := testutil.ToFloat64(ConnectionsTotal.WithLabelValues(protocol, testServerName, testHostname))
 			if count != 1 {
 				t.Errorf("Expected count 1 for protocol %s, got %f", protocol, count)
 			}
@@ -418,7 +423,7 @@ func TestMetricsOutput(t *testing.T) {
 	S3OperationsTotal.Reset()
 
 	// Record some test data
-	ConnectionsTotal.WithLabelValues("imap").Inc()
+	ConnectionsTotal.WithLabelValues("imap", testServerName, testHostname).Inc()
 	S3OperationsTotal.WithLabelValues("PUT", "success").Add(5)
 
 	// Test that metrics can be gathered (this is what the Prometheus handler does)

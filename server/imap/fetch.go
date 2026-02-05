@@ -595,7 +595,7 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 			// Track memory usage for cached data
 			if s.memTracker != nil {
 				if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-					metrics.SessionMemoryLimitExceeded.WithLabelValues("imap").Inc()
+					metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 					return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
 				}
 			}
@@ -635,7 +635,7 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 		// Track memory usage for S3 data
 		if s.memTracker != nil {
 			if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-				metrics.SessionMemoryLimitExceeded.WithLabelValues("imap").Inc()
+				metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 				return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
 			}
 		}
@@ -658,7 +658,7 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 	// Track memory usage for disk data
 	if s.memTracker != nil {
 		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-			metrics.SessionMemoryLimitExceeded.WithLabelValues("imap").Inc()
+			metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 			return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
 		}
 	}

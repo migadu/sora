@@ -127,8 +127,8 @@ func (s *IMAPSession) Login(address, password string) error {
 			}
 
 			// Prometheus metrics - successful authentication
-			metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
-			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
+			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
+			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 
 			// Record successful authentication
 			if s.server.authLimiter != nil {
@@ -138,7 +138,7 @@ func (s *IMAPSession) Login(address, password string) error {
 			// Register connection for tracking
 			if err := s.registerConnection(addressParsed.BaseAddress()); err != nil {
 				// Connection limit reached - undo authentication and reject
-				metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Dec()
+				metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Dec()
 				s.IMAPUser = nil
 				s.Session.User = nil
 				return &imap.Error{
@@ -163,7 +163,7 @@ func (s *IMAPSession) Login(address, password string) error {
 		}
 
 		// Record failed master password authentication
-		metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
+		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 		if s.server.authLimiter != nil {
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressParsed.BaseAddress(), false)
 		}
@@ -199,7 +199,7 @@ func (s *IMAPSession) Login(address, password string) error {
 		}
 
 		// Record failed authentication
-		metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
+		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 		if s.server.authLimiter != nil {
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressParsed.BaseAddress(), false)
 		}
@@ -239,8 +239,8 @@ func (s *IMAPSession) Login(address, password string) error {
 	}
 
 	// Prometheus metrics - successful authentication
-	metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
-	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
+	metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
+	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 
 	// Domain and user tracking
 	metrics.TrackDomainConnection("imap", addressParsed.Domain())

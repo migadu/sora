@@ -12,7 +12,7 @@ var (
 			Name: "sora_connections_total",
 			Help: "Total number of connections established",
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	ConnectionsCurrent = promauto.NewGaugeVec(
@@ -20,7 +20,7 @@ var (
 			Name: "sora_connections_current",
 			Help: "Current number of active connections",
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	AuthenticatedConnectionsCurrent = promauto.NewGaugeVec(
@@ -28,7 +28,7 @@ var (
 			Name: "sora_authenticated_connections_current",
 			Help: "Current number of authenticated connections",
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	ConnectionDuration = promauto.NewHistogramVec(
@@ -37,7 +37,7 @@ var (
 			Help:    "Duration of connections in seconds",
 			Buckets: prometheus.DefBuckets,
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	AuthenticationAttempts = promauto.NewCounterVec(
@@ -45,7 +45,7 @@ var (
 			Name: "sora_authentication_attempts_total",
 			Help: "Total number of authentication attempts",
 		},
-		[]string{"protocol", "result"},
+		[]string{"protocol", "server_name", "hostname", "result"},
 	)
 )
 
@@ -317,7 +317,7 @@ var (
 			Help:    "Peak memory allocated by session during its lifetime in bytes",
 			Buckets: []float64{1024, 10240, 102400, 1048576, 10485760, 52428800, 104857600}, // 1KB to 100MB
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	SessionMemoryLimitExceeded = promauto.NewCounterVec(
@@ -325,7 +325,7 @@ var (
 			Name: "sora_session_memory_limit_exceeded_total",
 			Help: "Total number of times session memory limit was exceeded",
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 )
 
@@ -354,7 +354,7 @@ var (
 			Name: "sora_connection_timeouts_total",
 			Help: "Total number of connection timeouts by protocol and reason",
 		},
-		[]string{"protocol", "reason"}, // reason: idle, slow_throughput, session_max, tls_on_plain_port
+		[]string{"protocol", "server_name", "hostname", "reason"}, // reason: idle, slow_throughput, session_max, tls_on_plain_port
 	)
 )
 
@@ -366,7 +366,7 @@ var (
 			Name: "sora_auth_rate_limiter_ip_username_entries",
 			Help: "Number of IP+username entries in auth rate limiter",
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	AuthRateLimiterIPEntries = promauto.NewGaugeVec(
@@ -374,7 +374,7 @@ var (
 			Name: "sora_auth_rate_limiter_ip_entries",
 			Help: "Number of IP failure entries in auth rate limiter",
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	AuthRateLimiterUsernameEntries = promauto.NewGaugeVec(
@@ -382,7 +382,7 @@ var (
 			Name: "sora_auth_rate_limiter_username_entries",
 			Help: "Number of username failure entries in auth rate limiter",
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	AuthRateLimiterBlockedIPs = promauto.NewGaugeVec(
@@ -390,7 +390,7 @@ var (
 			Name: "sora_auth_rate_limiter_blocked_ips",
 			Help: "Number of blocked IPs in auth rate limiter",
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	// Connection tracker memory usage (proxy mode)
@@ -399,7 +399,7 @@ var (
 			Name: "sora_connection_tracker_users",
 			Help: "Number of users tracked in connection tracker",
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	ConnectionTrackerInstanceIDs = promauto.NewGaugeVec(
@@ -407,7 +407,7 @@ var (
 			Name: "sora_connection_tracker_instance_ids",
 			Help: "Number of instance IDs tracked across all users",
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	ConnectionTrackerIPs = promauto.NewGaugeVec(
@@ -415,7 +415,7 @@ var (
 			Name: "sora_connection_tracker_ips",
 			Help: "Number of IPs tracked across all users",
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	ConnectionTrackerBroadcastQueue = promauto.NewGaugeVec(
@@ -423,7 +423,7 @@ var (
 			Name: "sora_connection_tracker_broadcast_queue_size",
 			Help: "Size of connection tracker broadcast queue",
 		},
-		[]string{"protocol"},
+		[]string{"protocol", "server_name", "hostname"},
 	)
 
 	// Affinity manager memory usage

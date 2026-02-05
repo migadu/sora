@@ -689,7 +689,7 @@ func (s *LMTPSession) Logout() error {
 	activeCount := s.backend.activeConnections.Add(-1)
 
 	// Prometheus metrics - connection closed
-	metrics.ConnectionsCurrent.WithLabelValues("lmtp").Dec()
+	metrics.ConnectionsCurrent.WithLabelValues("lmtp", s.backend.name, s.backend.hostname).Dec()
 
 	if s.cancel != nil {
 		s.cancel()

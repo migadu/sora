@@ -448,8 +448,8 @@ func (s *POP3Server) Start(errChan chan error) {
 		authCount := s.authenticatedConnections.Load()
 
 		// Prometheus metrics - connection established
-		metrics.ConnectionsTotal.WithLabelValues("pop3").Inc()
-		metrics.ConnectionsCurrent.WithLabelValues("pop3").Inc()
+		metrics.ConnectionsTotal.WithLabelValues("pop3", s.name, s.hostname).Inc()
+		metrics.ConnectionsCurrent.WithLabelValues("pop3", s.name, s.hostname).Inc()
 
 		// Initialize memory tracker with configured limit
 		memTracker := serverPkg.NewSessionMemoryTracker(s.sessionMemoryLimit)

@@ -525,8 +525,8 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 		}
 
 		// Track proxy connection
-		metrics.ConnectionsTotal.WithLabelValues("pop3_proxy").Inc()
-		metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy").Inc()
+		metrics.ConnectionsTotal.WithLabelValues("pop3_proxy", s.name, s.hostname).Inc()
+		metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy", s.name, s.hostname).Inc()
 
 		// Track session for graceful shutdown
 		s.addSession(session)
@@ -542,7 +542,7 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 					// Clean up session from active tracking
 					s.removeSession(session)
 					// Decrement metrics
-					metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy").Dec()
+					metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy", s.name, s.hostname).Dec()
 					// Close connection
 					conn.Close()
 					// Ensure connection limiter is released on panic

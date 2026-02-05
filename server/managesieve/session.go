@@ -229,13 +229,13 @@ func (s *ManageSieveSession) handleConnection() {
 						if s.server.authLimiter != nil {
 							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.BaseAddress(), false)
 						}
-						metrics.AuthenticationAttempts.WithLabelValues("managesieve", "failure").Inc()
+						metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
 						s.sendResponse("NO Authentication failed\r\n")
 						continue
 					}
 				} else {
 					// Record failed master password authentication
-					metrics.AuthenticationAttempts.WithLabelValues("managesieve", "failure").Inc()
+					metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
 					if s.server.authLimiter != nil {
 						s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.BaseAddress(), false)
 					}
@@ -260,7 +260,7 @@ func (s *ManageSieveSession) handleConnection() {
 						if s.server.authLimiter != nil {
 							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.BaseAddress(), false)
 						}
-						metrics.AuthenticationAttempts.WithLabelValues("managesieve", "failure").Inc()
+						metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
 						s.sendResponse("NO Authentication failed\r\n")
 						continue
 					}
@@ -275,7 +275,7 @@ func (s *ManageSieveSession) handleConnection() {
 					if s.server.authLimiter != nil {
 						s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), false)
 					}
-					metrics.AuthenticationAttempts.WithLabelValues("managesieve", "failure").Inc()
+					metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
 					s.sendResponse("NO Authentication failed\r\n")
 					continue
 				}
@@ -317,8 +317,8 @@ func (s *ManageSieveSession) handleConnection() {
 			}
 
 			// Track successful authentication
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve", "success").Inc()
-			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve").Inc()
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "success").Inc()
+			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve", s.server.name, s.server.hostname).Inc()
 
 			// Track domain and user connection activity
 			if s.User != nil {
@@ -1005,12 +1005,12 @@ func (s *ManageSieveSession) closeWithoutLock() error {
 	}
 
 	// Prometheus metrics - connection closed
-	metrics.ConnectionsCurrent.WithLabelValues("managesieve").Dec()
+	metrics.ConnectionsCurrent.WithLabelValues("managesieve", s.server.name, s.server.hostname).Dec()
 
 	if s.User != nil {
 		// If authenticated, decrement the authenticated connections counter
 		if s.authenticated {
-			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve").Dec()
+			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve", s.server.name, s.server.hostname).Dec()
 			authCount = s.server.authenticatedConnections.Add(-1)
 
 			// Unregister connection from tracker
@@ -1058,7 +1058,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	defer func() {
 		if !success {
 			// Track failed authentication if not already successful
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve", "failure").Inc()
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
 			metrics.CriticalOperationDuration.WithLabelValues("managesieve_authentication").Observe(time.Since(start).Seconds())
 		}
 	}()
@@ -1212,7 +1212,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 			impersonating = true
 		} else {
 			// Record failed master password authentication
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve", "failure").Inc()
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
 
 			// Master username suffix was provided but master password was wrong - fail immediately
 			s.sendResponse("NO Invalid master credentials\r\n")
@@ -1343,8 +1343,8 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	}
 
 	// Track successful authentication
-	metrics.AuthenticationAttempts.WithLabelValues("managesieve", "success").Inc()
-	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve").Inc()
+	metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "success").Inc()
+	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve", s.server.name, s.server.hostname).Inc()
 	metrics.CriticalOperationDuration.WithLabelValues("managesieve_authentication").Observe(time.Since(start).Seconds())
 
 	// Register connection for tracking

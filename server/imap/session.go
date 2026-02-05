@@ -212,12 +212,12 @@ func (s *IMAPSession) Close() error {
 	}
 
 	// Observe connection duration
-	metrics.ConnectionDuration.WithLabelValues("imap").Observe(time.Since(s.startTime).Seconds())
+	metrics.ConnectionDuration.WithLabelValues("imap", s.server.name, s.server.hostname).Observe(time.Since(s.startTime).Seconds())
 
 	// Log and record peak memory usage
 	if s.memTracker != nil {
 		peak := s.memTracker.Peak()
-		metrics.SessionMemoryPeakBytes.WithLabelValues("imap").Observe(float64(peak))
+		metrics.SessionMemoryPeakBytes.WithLabelValues("imap", s.server.name, s.server.hostname).Observe(float64(peak))
 		if peak > 0 {
 			s.InfoLog("session memory peak", "bytes", server.FormatBytes(peak))
 		}
@@ -226,11 +226,11 @@ func (s *IMAPSession) Close() error {
 	s.server.totalConnections.Add(-1)
 
 	// Prometheus metrics - connection closed
-	metrics.ConnectionsCurrent.WithLabelValues("imap").Dec()
+	metrics.ConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Dec()
 
 	if s.IMAPUser != nil {
 		s.server.authenticatedConnections.Add(-1)
-		metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Dec()
+		metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Dec()
 		s.InfoLog("closing session")
 
 		// Unregister connection from tracker

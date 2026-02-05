@@ -695,8 +695,8 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	totalCount := s.totalConnections.Add(1)
 
 	// Prometheus metrics - connection established
-	metrics.ConnectionsTotal.WithLabelValues("imap").Inc()
-	metrics.ConnectionsCurrent.WithLabelValues("imap").Inc()
+	metrics.ConnectionsTotal.WithLabelValues("imap", s.name, s.hostname).Inc()
+	metrics.ConnectionsCurrent.WithLabelValues("imap", s.name, s.hostname).Inc()
 
 	// Initialize memory tracker with configured limit
 	memTracker := serverPkg.NewSessionMemoryTracker(s.sessionMemoryLimit)

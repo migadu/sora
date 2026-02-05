@@ -83,7 +83,7 @@ func (s *Session) handleConnection() {
 	defer s.cancel()
 	defer s.close()
 	defer s.server.unregisterSession(s)
-	defer metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy").Dec()
+	defer metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy", s.server.name, s.server.hostname).Dec()
 
 	// Ensure connections are closed when context is cancelled (e.g. by absolute timeout or server shutdown)
 	// This serves as a fail-safe to unblock reads that don't inherently respect context cancellation

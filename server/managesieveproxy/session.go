@@ -582,7 +582,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 					// Track successful authentication using resolved email
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, s.username, true)
-					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
+					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "success").Inc()
 					if addr, err := server.NewAddress(s.username); err == nil {
 						metrics.TrackDomainConnection("managesieve_proxy", addr.Domain())
 						metrics.TrackUserActivity("managesieve_proxy", addr.FullAddress(), "connection", 1)
@@ -660,7 +660,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			if !checkMasterCredential(password, s.server.masterPassword) {
 				// Wrong master password - fail immediately
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, parsedAddr.BaseAddress(), false)
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return consts.ErrAuthenticationFailed
 			}
 			// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
@@ -711,7 +711,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				// Invalid response from remotelookup (malformed 2xx) - this is a server bug, fail hard
 				s.WarnLog("remotelookup invalid response - server bug", "error", err)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return fmt.Errorf("remotelookup server error: invalid response")
 			}
 
@@ -728,7 +728,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				s.DebugLog("remotelookup transient error - service unavailable", "error", err)
 				metrics.RemoteLookupResult.WithLabelValues("managesieve", "transient_error_rejected").Inc()
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return fmt.Errorf("remotelookup service unavailable")
 			} else {
 				// Unknown error type - log and fallthrough
@@ -784,7 +784,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 				// Use resolvedEmail for rate limiting (not submitted username with token)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, resolvedEmail, true)
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "success").Inc()
 
 				// For metrics, use resolvedEmail for accurate tracking
 				if addr, err := server.NewAddress(resolvedEmail); err == nil {
@@ -829,7 +829,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				}
 
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 
 				// Single consolidated log for authentication failure
 				s.InfoLog("authentication failed", "reason", "invalid_password", "cached", false, "method", "remotelookup")
@@ -839,7 +839,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			case proxy.AuthTemporarilyUnavailable:
 				// RemoteLookup service is temporarily unavailable - tell user to retry later
 				s.WarnLog("remotelookup service temporarily unavailable")
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "unavailable").Inc()
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
 
 			case proxy.AuthUserNotFound:
@@ -852,7 +852,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					s.InfoLog("User not found in remotelookup, local lookup disabled - rejecting")
 					metrics.RemoteLookupResult.WithLabelValues("managesieve", "user_not_found_rejected").Inc()
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
-					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 					return consts.ErrAuthenticationFailed
 				}
 			}
@@ -891,7 +891,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			}
 
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, address.BaseAddress(), false)
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 			return fmt.Errorf("account not found: %w", err)
 		}
 	} else {
@@ -943,7 +943,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			}
 
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, false)
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "failure").Inc()
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 			return fmt.Errorf("%w: %w", consts.ErrAuthenticationFailed, err)
 		}
 	}
@@ -952,7 +952,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	s.isRemoteLookupAccount = false
 	s.username = address.BaseAddress() // Set username for backend impersonation (without +detail)
 	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, nil, username, true)
-	metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", "success").Inc()
+	metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "success").Inc()
 	metrics.TrackDomainConnection("managesieve_proxy", address.Domain())
 	metrics.TrackUserActivity("managesieve_proxy", address.FullAddress(), "connection", 1)
 
@@ -1342,7 +1342,7 @@ func (s *Session) close() {
 	s.InfoLog("disconnected", "duration", duration, "backend", s.serverAddr)
 
 	// Decrement current connections metric
-	metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy").Dec()
+	metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname).Dec()
 
 	// Unregister connection SYNCHRONOUSLY to prevent leak
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits

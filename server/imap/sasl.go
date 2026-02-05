@@ -84,7 +84,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					address, err := server.NewAddress(targetUserToImpersonate)
 					if err != nil {
 						s.DebugLog("failed to parse impersonation target user", "target_user", targetUserToImpersonate, "error", err)
-						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
+						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
 							Code: imap.ResponseCodeAuthorizationFailed,
@@ -106,7 +106,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 							}
 						}
 
-						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
+						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
 							Code: imap.ResponseCodeAuthorizationFailed,
@@ -139,8 +139,8 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						s.InfoLog("authentication successful", "address", loginAddr, "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 					}
 
-					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
-					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
+					metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
+					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 
 					// Trigger cache warmup for the authenticated user (if configured)
 					s.triggerCacheWarmup()
@@ -157,7 +157,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 				}
 
 				// Record failed master password authentication
-				metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
+				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 				if s.server.authLimiter != nil {
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, usernameParsed.BaseAddress(), false)
 				}
@@ -180,7 +180,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					targetUserToImpersonate := identity
 					if targetUserToImpersonate == "" {
 						s.DebugLog("master SASL authentication successful but no authorization identity provided", "username", username)
-						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
+						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
 							Code: imap.ResponseCodeAuthorizationFailed,
@@ -195,7 +195,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					address, err := server.NewAddress(targetUserToImpersonate)
 					if err != nil {
 						s.DebugLog("failed to parse impersonation target user", "target_user", targetUserToImpersonate, "error", err)
-						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
+						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
 							Code: imap.ResponseCodeAuthorizationFailed,
@@ -217,7 +217,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 							}
 						}
 
-						metrics.AuthenticationAttempts.WithLabelValues("imap", "failure").Inc()
+						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 						return &imap.Error{
 							Type: imap.StatusResponseTypeNo,
 							Code: imap.ResponseCodeAuthorizationFailed, // Target user does not exist
@@ -250,8 +250,8 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						s.InfoLog("authentication successful", "address", loginAddr, "account_id", AccountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 					}
 
-					metrics.AuthenticationAttempts.WithLabelValues("imap", "success").Inc()
-					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap").Inc()
+					metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
+					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 
 					// Trigger cache warmup for the authenticated user (if configured)
 					s.triggerCacheWarmup()

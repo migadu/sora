@@ -80,7 +80,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	resultMemory := int64(len(messages) * 200)
 	if s.memTracker != nil && resultMemory > 0 {
 		if allocErr := s.memTracker.Allocate(resultMemory); allocErr != nil {
-			metrics.SessionMemoryLimitExceeded.WithLabelValues("imap").Inc()
+			metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 			return nil, s.internalError("session memory limit exceeded: %v", allocErr)
 		}
 		defer s.memTracker.Free(resultMemory)

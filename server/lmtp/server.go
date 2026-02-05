@@ -380,8 +380,8 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	b.activeConnections.Add(1)
 
 	// Prometheus metrics - connection established
-	metrics.ConnectionsTotal.WithLabelValues("lmtp").Inc()
-	metrics.ConnectionsCurrent.WithLabelValues("lmtp").Inc()
+	metrics.ConnectionsTotal.WithLabelValues("lmtp", b.name, b.hostname).Inc()
+	metrics.ConnectionsCurrent.WithLabelValues("lmtp", b.name, b.hostname).Inc()
 
 	s := &LMTPSession{
 		backend:   b,

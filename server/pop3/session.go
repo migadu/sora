@@ -287,10 +287,10 @@ func (s *POP3Session) handleConnection() {
 							"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
 
 						// Track rate limiting
-						metrics.AuthenticationAttempts.WithLabelValues("pop3", "rate_limited").Inc()
+						metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "rate_limited").Inc()
 					} else {
 						s.DebugLog("[PASS] rate limited", "error", err)
-						metrics.AuthenticationAttempts.WithLabelValues("pop3", "rate_limited").Inc()
+						metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "rate_limited").Inc()
 					}
 
 					if s.handleClientError(writer, "-ERR [LOGIN-DELAY] Too many authentication attempts. Please try again later.\r\n") {
@@ -327,7 +327,7 @@ func (s *POP3Session) handleConnection() {
 					}
 				} else {
 					// Record failed master password authentication
-					metrics.AuthenticationAttempts.WithLabelValues("pop3", "failure").Inc()
+					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
 					if s.server.authLimiter != nil {
 						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.BaseAddress(), false)
 					}
@@ -384,7 +384,7 @@ func (s *POP3Session) handleConnection() {
 						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress(), false)
 					}
 					// Track failed authentication
-					metrics.AuthenticationAttempts.WithLabelValues("pop3", "failure").Inc()
+					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
 					metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
 					if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
 						s.DebugLog("authentication failed")
@@ -448,7 +448,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Track successful authentication
-			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3").Inc()
+			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
 			metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
 
 			// Track domain and user connection activity
@@ -1447,7 +1447,7 @@ func (s *POP3Session) handleConnection() {
 					impersonating = true
 				} else {
 					// Record failed master password authentication
-					metrics.AuthenticationAttempts.WithLabelValues("pop3", "failure").Inc()
+					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
 
 					// Master username suffix was provided but master password was wrong - fail immediately
 					if s.handleClientError(writer, "-ERR [AUTH] Invalid master credentials\r\n") {
@@ -1886,7 +1886,7 @@ func (s *POP3Session) closeWithoutLock() error {
 	var authCount int64 = 0
 
 	// Prometheus metrics - connection closed
-	metrics.ConnectionsCurrent.WithLabelValues("pop3").Dec()
+	metrics.ConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Dec()
 
 	(*s.conn).Close()
 
@@ -1902,7 +1902,7 @@ func (s *POP3Session) closeWithoutLock() error {
 	if s.User != nil {
 		if s.authenticated {
 			authCount = s.server.authenticatedConnections.Add(-1)
-			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3").Dec()
+			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Dec()
 
 			// Unregister connection from tracker
 			s.unregisterConnection()
