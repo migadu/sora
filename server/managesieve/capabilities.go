@@ -5,17 +5,17 @@ import (
 	"strings"
 )
 
-// GoSieveSupportedExtensions lists all SIEVE extensions that the underlying
+// SupportedExtensions lists all SIEVE extensions that the underlying
 // go-sieve library (github.com/migadu/go-sieve) can validate and execute.
 //
-// This is the authoritative list of what can be configured in supported_extensions.
+// This is the authoritative list of extensions available in Sora.
 // Extensions not in this list will cause script validation to fail.
 //
 // NOTE: Core RFC 5228 commands (require, if/elsif/else, stop, redirect, keep, discard)
 // are always available and don't need to be in this list.
 //
-// Based on: github.com/migadu/go-sieve@v0.0.0-20250924160026-17d8f94a0a43/interp/load.go
-var GoSieveSupportedExtensions = []string{
+// Based on: github.com/migadu/go-sieve@v0.0.0-20260205165323-e27a093d6315/interp/load.go
+var SupportedExtensions = []string{
 	// Core extensions from RFC 5228
 	"fileinto",          // RFC 5228 - Store messages in specified mailbox
 	"envelope",          // RFC 5228 - Test envelope addresses
@@ -34,19 +34,8 @@ var GoSieveSupportedExtensions = []string{
 	"vacation",   // RFC 5230 - Vacation auto-responder
 	"copy",       // RFC 3894 - Copy extension for redirect and fileinto
 	"regex",      // draft-murchison-sieve-regex - Regular expression match type
-}
-
-// CommonlyUsedExtensions provides a recommended default list of extensions
-// for production use. This is what gets configured in config.toml.example.
-var CommonlyUsedExtensions = []string{
-	"fileinto",
-	"vacation",
-	"envelope",
-	"imap4flags",
-	"variables",
-	"relational",
-	"copy",
-	"regex",
+	"date",       // RFC 5260 - Date and index extensions - date test
+	"index",      // RFC 5260 - Date and index extensions - header indexing
 }
 
 // ValidateExtensions checks if the provided extensions are supported by go-sieve.
@@ -58,7 +47,7 @@ func ValidateExtensions(extensions []string) error {
 
 	// Build map of all supported extensions
 	supportedMap := make(map[string]bool)
-	for _, ext := range GoSieveSupportedExtensions {
+	for _, ext := range SupportedExtensions {
 		supportedMap[ext] = true
 	}
 
@@ -71,9 +60,9 @@ func ValidateExtensions(extensions []string) error {
 	}
 
 	if len(invalid) > 0 {
-		return fmt.Errorf("invalid SIEVE extensions: %s (go-sieve supports: %s)",
+		return fmt.Errorf("invalid SIEVE extensions: %s (supported: %s)",
 			strings.Join(invalid, ", "),
-			strings.Join(GoSieveSupportedExtensions, ", "))
+			strings.Join(SupportedExtensions, ", "))
 	}
 
 	return nil

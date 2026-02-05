@@ -955,7 +955,6 @@ type ManageSieveServerConfig struct {
 	MaxConnections         int                   `toml:"max_connections"`        // Maximum concurrent connections
 	MaxConnectionsPerIP    int                   `toml:"max_connections_per_ip"` // Maximum connections per IP address
 	MaxScriptSize          string                `toml:"max_script_size"`
-	SupportedExtensions    []string              `toml:"supported_extensions"` // List of supported Sieve extensions
 	InsecureAuth           bool                  `toml:"insecure_auth"`
 	MasterSASLUsername     string                `toml:"master_sasl_username"`
 	MasterSASLPassword     string                `toml:"master_sasl_password"`
@@ -1394,6 +1393,11 @@ type AdminCLIConfig struct {
 	InsecureSkipVerify *bool  `toml:"insecure_skip_verify"` // Skip TLS verification (default: true)
 }
 
+// SieveConfig holds Sieve script engine configuration
+type SieveConfig struct {
+	EnabledExtensions []string `toml:"enabled_extensions"` // List of enabled Sieve extensions (empty = all extensions enabled)
+}
+
 // Config holds all configuration for the application.
 type Config struct {
 	Logging          LoggingConfig          `toml:"logging"`
@@ -1407,6 +1411,7 @@ type Config struct {
 	Uploader         UploaderConfig         `toml:"uploader"`
 	Metadata         MetadataConfig         `toml:"metadata"`
 	SharedMailboxes  SharedMailboxesConfig  `toml:"shared_mailboxes"`
+	Sieve            SieveConfig            `toml:"sieve"`
 	Relay            RelayConfig            `toml:"relay"`
 	AdminCLI         AdminCLIConfig         `toml:"admin_cli"`         // Admin CLI tool configuration
 	TimeoutScheduler TimeoutSchedulerConfig `toml:"timeout_scheduler"` // Global timeout scheduler configuration

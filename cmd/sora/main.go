@@ -1068,6 +1068,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
 		FTSRetention:         ftsRetention,
 		MaxMessageSize:       maxMessageSize,
+		SieveExtensions:      deps.config.Sieve.EnabledExtensions,
 	})
 
 	if err != nil {
@@ -1230,7 +1231,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		TLSConfig:              tlsConfig,
 		Debug:                  serverConfig.Debug,
 		MaxScriptSize:          maxSize,
-		SupportedExtensions:    serverConfig.SupportedExtensions,
+		SupportedExtensions:    deps.config.Sieve.EnabledExtensions,
 		MasterSASLUsername:     serverConfig.MasterSASLUsername,
 		MasterSASLPassword:     serverConfig.MasterSASLPassword,
 		MaxConnections:         serverConfig.MaxConnections,

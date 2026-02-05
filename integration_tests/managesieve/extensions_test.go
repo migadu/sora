@@ -34,9 +34,9 @@ func TestManageSieveConfigurableExtensions(t *testing.T) {
 		testExtensions(t, configuredExtensions, configuredExtensions)
 	})
 
-	// Test 4: Commonly used production extensions
-	t.Run("CommonlyUsedExtensions", func(t *testing.T) {
-		configuredExtensions := []string{"fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex"}
+	// Test 4: All supported extensions
+	t.Run("AllSupportedExtensions", func(t *testing.T) {
+		configuredExtensions := []string{"fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex", "date", "index", "encoded-character"}
 		testExtensions(t, configuredExtensions, configuredExtensions)
 	})
 }

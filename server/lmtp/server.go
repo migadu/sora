@@ -165,7 +165,8 @@ type LMTPServerOptions struct {
 	ProxyProtocolTrustedProxies []string // CIDR blocks for PROXY protocol validation (defaults to trusted_networks if empty)
 	TrustedNetworks             []string // Global trusted networks for parameter forwarding
 	FTSRetention                time.Duration
-	MaxMessageSize              int64 // Maximum size for incoming messages in bytes
+	MaxMessageSize              int64    // Maximum size for incoming messages in bytes
+	SieveExtensions             []string // Sieve extensions to enable (nil/empty = all default extensions)
 }
 
 func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -225,7 +226,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 
 	// Initialize Sieve script cache with a reasonable default size and TTL
 	// 5 minute TTL ensures cross-server updates are picked up relatively quickly
-	backend.sieveCache = NewSieveScriptCache(100, 5*time.Minute)
+	backend.sieveCache = NewSieveScriptCache(100, 5*time.Minute, options.SieveExtensions)
 
 	// Parse and cache the default Sieve script at startup
 	// The default script uses fileinto extension, so we need to allow it

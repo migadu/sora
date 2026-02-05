@@ -624,6 +624,25 @@ allow_user_create = false        # Allow regular users to create shared mailboxe
 default_rights = "lrswipkxtea"   # Default ACL rights for shared mailbox creators (full rights by default)
                                 # Rights: l=lookup, r=read, s=seen, w=write, i=insert, p=post, k=create, x=delete, t=delete-msg, e=expunge, a=admin
 
+# =============================================================================
+# SIEVE EXTENSIONS (Global Configuration)
+# =============================================================================
+# Configure which SIEVE extensions are enabled globally for both:
+#   - LMTP server: script execution during message delivery
+#   - ManageSieve server: script validation during PUTSCRIPT
+#
+
+[sieve]
+# List of enabled SIEVE extensions (empty = all extensions enabled)
+# Common extensions: fileinto, vacation, envelope, imap4flags, variables, relational, copy, regex, date, index
+# Comparators: comparator-i;octet, comparator-i;ascii-casemap, comparator-i;ascii-numeric, comparator-i;unicode-casemap
+#
+# Example (commonly used subset):
+# enabled_extensions = ["fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex", "date", "index"]
+#
+# Default (all extensions enabled):
+enabled_extensions = []
+
 # IMPORTANT NOTES:
 # - Shared mailboxes are restricted to users within the same domain for security
 # - Creators automatically receive the default_rights on mailboxes they create
@@ -968,24 +987,8 @@ addr = ":4190"
 max_connections = 200
 max_connections_per_ip = 3
 max_script_size = "16kb"      # Maximum size for a SIEVE script.
-# Supported SIEVE extensions that scripts can use via "require" statement.
-# This list controls which extensions are validated and allowed when scripts are uploaded.
-#
-# IMPORTANT: Extensions listed here will be advertised to clients in CAPABILITY responses.
-# Clients can then use "require 'extension'" in their scripts, and scripts using those
-# extensions will be accepted during PUTSCRIPT validation.
-#
-# Available extensions that go-sieve supports:
-#   - fileinto, envelope, encoded-character, imap4flags, variables, relational, copy, regex, vacation
-#   - comparator-i;octet, comparator-i;ascii-casemap, comparator-i;ascii-numeric, comparator-i;unicode-casemap
-#
-# DEFAULT BEHAVIOR: If supported_extensions is not specified (commented out or empty),
-# ALL available extensions listed above will be enabled by default.
-#
-# Common production configuration (explicitly limiting to commonly used extensions):
-supported_extensions = ["fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex"]
-#
-# To enable ALL extensions, simply comment out or remove the supported_extensions line above.
+# NOTE: SIEVE extensions are configured globally in the [sieve] section above.
+# This allows consistent extension support across LMTP delivery and ManageSieve script validation.
 insecure_auth = false                            # Allow plaintext auth. SECURITY: Should be false in production.
 master_sasl_username = ""
 master_sasl_password = ""
@@ -1499,19 +1502,8 @@ timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = di
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24h)
 timeouts.min_bytes_per_minute = 0           # Minimum throughput (bytes/min, 0 = disabled, default: 0, can set to 512 for slowloris protection)
 
-# --- SIEVE EXTENSIONS ---
-# Supported SIEVE extensions advertised to clients and validated during script upload.
-# MUST match (or be a subset of) what your backend ManageSieve servers support.
-#
-# This list determines which extensions clients can use in their SIEVE scripts.
-# Extensions not in this list will be rejected during PUTSCRIPT with "extension not supported" error.
-#
-# Available extensions that go-sieve supports:
-#   - fileinto, envelope, encoded-character, imap4flags, variables, relational, copy, regex, vacation
-#   - comparator-i;octet, comparator-i;ascii-casemap, comparator-i;ascii-numeric, comparator-i;unicode-casemap
-#
-# Common production configuration (should match your backend):
-supported_extensions = ["fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex"]
+# NOTE: SIEVE extensions are configured globally in the [sieve] section.
+# The proxy should match capabilities from backend servers.
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)

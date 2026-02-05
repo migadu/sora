@@ -239,8 +239,8 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 	// Use all supported extensions by default if none are configured
 	if len(serverInstance.supportedExtensions) == 0 {
-		serverInstance.supportedExtensions = GoSieveSupportedExtensions
-		logger.Debug("ManageSieve: No supported_extensions configured - using all available", "name", name, "extensions", GoSieveSupportedExtensions)
+		serverInstance.supportedExtensions = SupportedExtensions
+		logger.Debug("ManageSieve: No supported_extensions configured - using all available", "name", name, "extensions", SupportedExtensions)
 	}
 
 	// Create connection limiter with trusted networks from server configuration

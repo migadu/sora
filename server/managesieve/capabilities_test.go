@@ -5,24 +5,24 @@ import (
 	"testing"
 )
 
-func TestGoSieveSupportedExtensions(t *testing.T) {
+func TestSupportedExtensions(t *testing.T) {
 	// Verify supported extensions are defined
-	if len(GoSieveSupportedExtensions) == 0 {
-		t.Fatal("GoSieveSupportedExtensions should not be empty")
+	if len(SupportedExtensions) == 0 {
+		t.Fatal("SupportedExtensions should not be empty")
 	}
 
 	// Verify essential extensions that go-sieve supports are present
 	essentials := []string{"fileinto", "envelope", "variables", "vacation"}
 	for _, essential := range essentials {
 		found := false
-		for _, cap := range GoSieveSupportedExtensions {
+		for _, cap := range SupportedExtensions {
 			if cap == essential {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Errorf("Essential extension %q not found in GoSieveSupportedExtensions", essential)
+			t.Errorf("Essential extension %q not found in SupportedExtensions", essential)
 		}
 	}
 }
@@ -172,25 +172,25 @@ func TestSieveCapabilitiesFormat(t *testing.T) {
 	}
 }
 
-func TestCommonlyUsedExtensions(t *testing.T) {
-	// Verify CommonlyUsedExtensions are all supported by go-sieve
-	err := ValidateExtensions(CommonlyUsedExtensions)
+func TestAllSupportedExtensions(t *testing.T) {
+	// Verify all SupportedExtensions are valid (this should always pass)
+	err := ValidateExtensions(SupportedExtensions)
 	if err != nil {
-		t.Errorf("CommonlyUsedExtensions contains unsupported extensions: %v", err)
+		t.Errorf("SupportedExtensions validation failed: %v", err)
 	}
 
-	// Verify essential extensions are in the commonly used list
-	essentials := []string{"fileinto", "vacation"}
+	// Verify essential extensions are in the list
+	essentials := []string{"fileinto", "vacation", "variables", "envelope"}
 	for _, essential := range essentials {
 		found := false
-		for _, ext := range CommonlyUsedExtensions {
+		for _, ext := range SupportedExtensions {
 			if ext == essential {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Errorf("Essential extension %q not in CommonlyUsedExtensions", essential)
+			t.Errorf("Essential extension %q not in SupportedExtensions", essential)
 		}
 	}
 }
@@ -302,7 +302,7 @@ func TestSASLCapabilityAdvertisement(t *testing.T) {
 			capabilityOutput.WriteString(`"IMPLEMENTATION" "ManageSieve"` + "\r\n")
 
 			// Write SIEVE capabilities
-			capabilities := GetSieveCapabilities(CommonlyUsedExtensions)
+			capabilities := GetSieveCapabilities(SupportedExtensions)
 			extensionsStr := strings.Join(capabilities, " ")
 			capabilityOutput.WriteString(`"SIEVE" "` + extensionsStr + `"` + "\r\n")
 

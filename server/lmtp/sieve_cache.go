@@ -21,24 +21,27 @@ type SieveScriptCacheEntry struct {
 
 // SieveScriptCache implements an LRU cache for parsed Sieve scripts with TTL
 type SieveScriptCache struct {
-	mu              sync.RWMutex
-	cache           map[string]*SieveScriptCacheEntry
-	maxEntries      int
-	ttl             time.Duration // Time to live for cache entries
-	accessOrder     []string      // Track access order for LRU eviction
-	cleanupInterval time.Duration
-	stopCleanup     chan struct{}
+	mu                sync.RWMutex
+	cache             map[string]*SieveScriptCacheEntry
+	maxEntries        int
+	ttl               time.Duration // Time to live for cache entries
+	accessOrder       []string      // Track access order for LRU eviction
+	cleanupInterval   time.Duration
+	stopCleanup       chan struct{}
+	enabledExtensions []string // Sieve extensions to enable (nil = all)
 }
 
-// NewSieveScriptCache creates a new Sieve script cache with the specified maximum entries and TTL
-func NewSieveScriptCache(maxEntries int, ttl time.Duration) *SieveScriptCache {
+// NewSieveScriptCache creates a new Sieve script cache with the specified maximum entries, TTL, and enabled extensions.
+// If enabledExtensions is nil or empty, all extensions are enabled.
+func NewSieveScriptCache(maxEntries int, ttl time.Duration, enabledExtensions []string) *SieveScriptCache {
 	cache := &SieveScriptCache{
-		cache:           make(map[string]*SieveScriptCacheEntry),
-		maxEntries:      maxEntries,
-		ttl:             ttl,
-		accessOrder:     make([]string, 0, maxEntries),
-		cleanupInterval: 5 * time.Minute, // Cleanup every 5 minutes
-		stopCleanup:     make(chan struct{}),
+		cache:             make(map[string]*SieveScriptCacheEntry),
+		maxEntries:        maxEntries,
+		ttl:               ttl,
+		accessOrder:       make([]string, 0, maxEntries),
+		cleanupInterval:   5 * time.Minute, // Cleanup every 5 minutes
+		stopCleanup:       make(chan struct{}),
+		enabledExtensions: enabledExtensions,
 	}
 
 	// Start background cleanup goroutine
@@ -201,8 +204,15 @@ func (c *SieveScriptCache) GetOrCreate(scriptContent string, AccountID int64, or
 		return executor, nil
 	}
 
-	// Create new executor with all supported extensions for user scripts
-	executor, err := sieveengine.NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, oracle, []string{"envelope", "fileinto", "redirect", "encoded-character", "imap4flags", "variables", "relational", "vacation", "copy", "regex"})
+	// Use configured extensions (nil means all extensions enabled)
+	extensions := c.enabledExtensions
+	if len(extensions) == 0 {
+		// Empty list means use all default extensions
+		extensions = sieveengine.DefaultSieveExtensions
+	}
+
+	// Create new executor with configured extensions
+	executor, err := sieveengine.NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, oracle, extensions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sieve executor: %w", err)
 	}
@@ -240,8 +250,15 @@ func (c *SieveScriptCache) GetOrCreateWithMetadata(scriptContent string, scriptI
 
 	c.mu.Unlock()
 
-	// Create new executor with all supported extensions for user scripts
-	executor, err := sieveengine.NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, oracle, []string{"envelope", "fileinto", "redirect", "encoded-character", "imap4flags", "variables", "relational", "vacation", "copy", "regex"})
+	// Use configured extensions (nil means all extensions enabled)
+	extensions := c.enabledExtensions
+	if len(extensions) == 0 {
+		// Empty list means use all default extensions
+		extensions = sieveengine.DefaultSieveExtensions
+	}
+
+	// Create new executor with configured extensions
+	executor, err := sieveengine.NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, oracle, extensions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sieve executor: %w", err)
 	}

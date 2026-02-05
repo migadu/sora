@@ -8,7 +8,7 @@ import (
 )
 
 // TestDefaultExtensions verifies that when no supported_extensions are configured,
-// all extensions from GoSieveSupportedExtensions are used by default.
+// all extensions from SupportedExtensions are used by default.
 func TestDefaultExtensions(t *testing.T) {
 	// Create a minimal server with no supported_extensions configured
 	options := ManageSieveServerOptions{
@@ -31,18 +31,18 @@ func TestDefaultExtensions(t *testing.T) {
 	}
 	defer server.Close()
 
-	// Verify that supportedExtensions contains all GoSieveSupportedExtensions
-	if len(server.supportedExtensions) != len(GoSieveSupportedExtensions) {
-		t.Errorf("Expected %d default extensions, got %d", len(GoSieveSupportedExtensions), len(server.supportedExtensions))
+	// Verify that supportedExtensions contains all SupportedExtensions
+	if len(server.supportedExtensions) != len(SupportedExtensions) {
+		t.Errorf("Expected %d default extensions, got %d", len(SupportedExtensions), len(server.supportedExtensions))
 	}
 
-	// Verify each extension from GoSieveSupportedExtensions is present
+	// Verify each extension from SupportedExtensions is present
 	extensionMap := make(map[string]bool)
 	for _, ext := range server.supportedExtensions {
 		extensionMap[ext] = true
 	}
 
-	for _, expectedExt := range GoSieveSupportedExtensions {
+	for _, expectedExt := range SupportedExtensions {
 		if !extensionMap[expectedExt] {
 			t.Errorf("Expected extension %q not found in default extensions", expectedExt)
 		}
@@ -131,8 +131,8 @@ func TestEmptyExtensionsArray(t *testing.T) {
 	}
 	defer server.Close()
 
-	// Verify that supportedExtensions contains all GoSieveSupportedExtensions
-	if len(server.supportedExtensions) != len(GoSieveSupportedExtensions) {
-		t.Errorf("Expected %d default extensions for empty array, got %d", len(GoSieveSupportedExtensions), len(server.supportedExtensions))
+	// Verify that supportedExtensions contains all SupportedExtensions
+	if len(server.supportedExtensions) != len(SupportedExtensions) {
+		t.Errorf("Expected %d default extensions for empty array, got %d", len(SupportedExtensions), len(server.supportedExtensions))
 	}
 }

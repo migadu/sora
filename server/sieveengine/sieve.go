@@ -8,6 +8,7 @@ import (
 
 	"github.com/foxcpp/go-sieve"
 	"github.com/foxcpp/go-sieve/interp"
+	"github.com/migadu/sora/server/managesieve"
 )
 
 type Action string
@@ -19,6 +20,10 @@ const (
 	ActionRedirect Action = "redirect"
 	ActionVacation Action = "vacation"
 )
+
+// DefaultSieveExtensions is an alias for the authoritative list of supported Sieve extensions.
+// The canonical list is maintained in server/managesieve/capabilities.go
+var DefaultSieveExtensions = managesieve.SupportedExtensions
 
 type Result struct {
 	Action         Action
