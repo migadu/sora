@@ -345,6 +345,8 @@ func (s *Server) Start() error {
 	// Configure SoraConn (LMTP proxy doesn't have timeout protection currently)
 	connConfig := server.SoraConnConfig{
 		Protocol:             "lmtp_proxy",
+		ServerName:           s.name,
+		Hostname:             s.hostname,
 		EnableTimeoutChecker: false,
 	}
 

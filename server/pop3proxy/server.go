@@ -234,7 +234,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("POP3-PROXY", options.AuthRateLimit, options.TrustedProxies)
+	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("POP3-PROXY", options.Name, hostname, options.AuthRateLimit, options.TrustedProxies)
 
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter
@@ -404,6 +404,8 @@ func (s *POP3ProxyServer) Start() error {
 	// Configure SoraConn with timeout protection
 	connConfig := server.SoraConnConfig{
 		Protocol:             "pop3_proxy",
+		ServerName:           s.name,
+		Hostname:             s.hostname,
 		IdleTimeout:          s.commandTimeout,
 		AbsoluteTimeout:      s.absoluteSessionTimeout,
 		MinBytesPerMinute:    s.minBytesPerMinute,

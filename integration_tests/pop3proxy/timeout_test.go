@@ -31,7 +31,7 @@ func TestIdleTimeoutTrigger(t *testing.T) {
 	proxyAddr := common.GetRandomAddress(t)
 
 	// Record initial idle timeout count
-	initialIdleTimeouts := testutil.ToFloat64(metrics.ConnectionTimeoutsTotal.WithLabelValues("pop3_proxy", "idle"))
+	initialIdleTimeouts := testutil.ToFloat64(metrics.ConnectionTimeoutsTotal.WithLabelValues("pop3_proxy", "test-proxy", "localhost", "idle"))
 	t.Logf("Initial idle timeout count: %.0f", initialIdleTimeouts)
 
 	// Create proxy server with short idle timeout for testing
@@ -133,7 +133,7 @@ func TestIdleTimeoutTrigger(t *testing.T) {
 
 	// Verify idle timeout metric increased
 	time.Sleep(500 * time.Millisecond) // Give metrics time to update
-	newIdleTimeouts := testutil.ToFloat64(metrics.ConnectionTimeoutsTotal.WithLabelValues("pop3_proxy", "idle"))
+	newIdleTimeouts := testutil.ToFloat64(metrics.ConnectionTimeoutsTotal.WithLabelValues("pop3_proxy", "test-proxy", "localhost", "idle"))
 	if newIdleTimeouts <= initialIdleTimeouts {
 		t.Errorf("Expected idle timeout count to increase from %.0f, but got %.0f", initialIdleTimeouts, newIdleTimeouts)
 	} else {

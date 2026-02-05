@@ -217,7 +217,7 @@ func VerifyPassword(hashedPassword, password string) error {
 			status = "failure"
 		}
 		// Use custom metric for password verification timing (not a DB query)
-		metrics.AuthenticationAttempts.WithLabelValues(hashType, status).Inc()
+		metrics.PasswordVerificationAttempts.WithLabelValues(hashType, status).Inc()
 		// Track duration to monitor bcrypt/hash performance
 		duration := time.Since(start).Seconds()
 		if duration > 0.1 { // Log slow password verifications (>100ms)

@@ -13,10 +13,10 @@ func TestConnectionTrackerProtocolFiltering(t *testing.T) {
 	defer cancel()
 
 	// Create two trackers for different protocols sharing the same cluster
-	imapTracker := NewConnectionTracker("IMAP", "instance-1", nil, 0, 0, 1000, false)
+	imapTracker := NewConnectionTracker("IMAP", "", "", "instance-1", nil, 0, 0, 1000, false)
 	defer imapTracker.Stop()
 
-	lmtpTracker := NewConnectionTracker("LMTP", "instance-2", nil, 0, 0, 1000, false)
+	lmtpTracker := NewConnectionTracker("LMTP", "", "", "instance-2", nil, 0, 0, 1000, false)
 	defer lmtpTracker.Stop()
 
 	// Register an IMAP connection
@@ -126,7 +126,7 @@ func TestConnectionTrackerProtocolFiltering(t *testing.T) {
 // LMTP tracker accumulated thousands of ghost IMAP connections.
 func TestConnectionTrackerProtocolLeakScenario(t *testing.T) {
 
-	lmtpTracker := NewConnectionTracker("LMTP", "lmtp-instance", nil, 0, 0, 1000, false)
+	lmtpTracker := NewConnectionTracker("LMTP", "", "", "lmtp-instance", nil, 0, 0, 1000, false)
 	defer lmtpTracker.Stop()
 
 	// Simulate 1000 IMAP connections being broadcast to LMTP tracker

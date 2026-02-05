@@ -7,7 +7,7 @@ import (
 
 // TestLocalInstancesMapLeak proves that LocalInstances map accumulates zero-count entries
 func TestLocalInstancesMapLeak(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 1000, false)
+	tracker := NewConnectionTracker("test", "", "", "instance-1", nil, 0, 0, 1000, false)
 	defer tracker.Stop()
 
 	ctx := context.Background()
@@ -89,7 +89,7 @@ func TestLocalInstancesMapLeak(t *testing.T) {
 // TestLocalInstancesMapGrowthWithMultipleInstances tests that the fix prevents map growth
 func TestLocalInstancesMapGrowthWithMultipleInstances(t *testing.T) {
 	// Test that LocalInstances map doesn't accumulate zero-count entries after fix
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 1000, false)
+	tracker := NewConnectionTracker("test", "", "", "instance-1", nil, 0, 0, 1000, false)
 	defer tracker.Stop()
 
 	ctx := context.Background()
@@ -156,7 +156,7 @@ func TestLocalInstancesMapGrowthWithMultipleInstances(t *testing.T) {
 // TestLocalInstancesVsPerIPCountConsistency tests the inconsistency between cleanup strategies
 func TestLocalInstancesVsPerIPCountConsistency(t *testing.T) {
 	// Test with per-IP limiting enabled
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 10, 1000, false)
+	tracker := NewConnectionTracker("test", "", "", "instance-1", nil, 0, 10, 1000, false)
 	defer tracker.Stop()
 
 	ctx := context.Background()
@@ -231,7 +231,7 @@ func TestLocalInstancesVsPerIPCountConsistency(t *testing.T) {
 
 // TestMemoryImpactWithManyUsers tests map growth with many users
 func TestMemoryImpactWithManyUsers(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 0, 0, 10000, false)
+	tracker := NewConnectionTracker("test", "", "", "instance-1", nil, 0, 0, 10000, false)
 	defer tracker.Stop()
 
 	ctx := context.Background()

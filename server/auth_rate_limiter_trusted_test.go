@@ -27,7 +27,7 @@ func TestAuthRateLimiter_TrustedNetworks_BothTiers(t *testing.T) {
 	}
 
 	trustedNetworks := []string{"10.0.0.0/8", "192.168.1.0/24"}
-	limiter := NewAuthRateLimiterWithTrustedNetworks("TEST", cfg, trustedNetworks)
+	limiter := NewAuthRateLimiterWithTrustedNetworks("TEST", "", "", cfg, trustedNetworks)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -147,7 +147,7 @@ func TestAuthRateLimiter_TrustedNetworks_UsernameStatsTracked(t *testing.T) {
 	}
 
 	trustedNetworks := []string{"172.16.0.0/12"}
-	limiter := NewAuthRateLimiterWithTrustedNetworks("TEST", cfg, trustedNetworks)
+	limiter := NewAuthRateLimiterWithTrustedNetworks("TEST", "", "", cfg, trustedNetworks)
 	defer limiter.Stop()
 
 	ctx := context.Background()

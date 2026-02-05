@@ -29,7 +29,7 @@ func TestAuthRateLimiter_TwoTierBlocking_SharedIP(t *testing.T) {
 		CacheCleanupInterval:   1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -95,7 +95,7 @@ func TestAuthRateLimiter_TwoTierBlocking_DistributedAttack(t *testing.T) {
 		CacheCleanupInterval:   1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -148,7 +148,7 @@ func TestAuthRateLimiter_TwoTierBlocking_Cleanup(t *testing.T) {
 		CacheCleanupInterval:   50 * time.Millisecond, // Fast cleanup for testing
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -209,7 +209,7 @@ func TestAuthRateLimiter_TwoTierBlocking_SuccessfulAuthClears(t *testing.T) {
 		CacheCleanupInterval:   1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -268,7 +268,7 @@ func TestAuthRateLimiter_TwoTierBlocking_Stats(t *testing.T) {
 		CacheCleanupInterval:   1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()

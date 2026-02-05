@@ -20,14 +20,14 @@ func TestClusterPerUserPerIP_GossipPropagation(t *testing.T) {
 	clientAddr2 := clientIP + ":10002"
 
 	// Node 1 - local mode tracker (simulates cluster node)
-	node1 := NewConnectionTracker("IMAP", "node-1", nil, 10, 3, 0, false)
+	node1 := NewConnectionTracker("IMAP", "", "", "node-1", nil, 10, 3, 0, false)
 	if node1 == nil {
 		t.Fatal("Failed to create node1 tracker")
 	}
 	defer node1.Stop()
 
 	// Node 2 - local mode tracker (simulates cluster node)
-	node2 := NewConnectionTracker("IMAP", "node-2", nil, 10, 3, 0, false)
+	node2 := NewConnectionTracker("IMAP", "", "", "node-2", nil, 10, 3, 0, false)
 	if node2 == nil {
 		t.Fatal("Failed to create node2 tracker")
 	}
@@ -99,7 +99,7 @@ func TestClusterPerUserPerIP_StateSnapshot(t *testing.T) {
 	ip2 := "192.168.1.101"
 
 	// Create tracker and register connections from multiple IPs
-	tracker := NewConnectionTracker("IMAP", "node-1", nil, 20, 5, 0, false)
+	tracker := NewConnectionTracker("IMAP", "", "", "node-1", nil, 20, 5, 0, false)
 	if tracker == nil {
 		t.Fatal("Failed to create tracker")
 	}
@@ -173,7 +173,7 @@ func TestClusterPerUserPerIP_StateSnapshot(t *testing.T) {
 	}
 
 	// Create a second tracker and reconcile with the snapshot
-	tracker2 := NewConnectionTracker("IMAP", "node-2", nil, 20, 5, 0, false)
+	tracker2 := NewConnectionTracker("IMAP", "", "", "node-2", nil, 20, 5, 0, false)
 	if tracker2 == nil {
 		t.Fatal("Failed to create tracker2")
 	}
@@ -220,7 +220,7 @@ func TestClusterPerUserPerIP_DifferentIPsAllowed(t *testing.T) {
 	username := "multiip@example.com"
 	protocol := "IMAP"
 
-	tracker := NewConnectionTracker("IMAP", "node-1", nil, 50, 3, 0, false)
+	tracker := NewConnectionTracker("IMAP", "", "", "node-1", nil, 50, 3, 0, false)
 	if tracker == nil {
 		t.Fatal("Failed to create tracker")
 	}

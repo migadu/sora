@@ -77,13 +77,13 @@ func TestClusterRateLimitSync(t *testing.T) {
 		CacheCleanupInterval: 1 * time.Minute,
 	}
 
-	limiter1 := NewAuthRateLimiter("imap", rateLimitCfg)
+	limiter1 := NewAuthRateLimiter("imap", "", "", rateLimitCfg)
 	if limiter1 == nil {
 		t.Fatal("Failed to create limiter1")
 	}
 	defer limiter1.Stop()
 
-	limiter2 := NewAuthRateLimiter("imap", rateLimitCfg)
+	limiter2 := NewAuthRateLimiter("imap", "", "", rateLimitCfg)
 	if limiter2 == nil {
 		t.Fatal("Failed to create limiter2")
 	}
@@ -291,13 +291,13 @@ func TestClusterUsernameRateLimitSync(t *testing.T) {
 		CacheCleanupInterval:   1 * time.Minute,
 	}
 
-	limiter1 := NewAuthRateLimiter("imap", rateLimitCfg)
+	limiter1 := NewAuthRateLimiter("imap", "", "", rateLimitCfg)
 	if limiter1 == nil {
 		t.Fatal("Failed to create limiter1")
 	}
 	defer limiter1.Stop()
 
-	limiter2 := NewAuthRateLimiter("imap", rateLimitCfg)
+	limiter2 := NewAuthRateLimiter("imap", "", "", rateLimitCfg)
 	if limiter2 == nil {
 		t.Fatal("Failed to create limiter2")
 	}

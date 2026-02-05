@@ -110,7 +110,7 @@ func setupProxyWithConnectionTracking(t *testing.T, rdb *resilient.ResilientData
 	t.Helper()
 
 	// Create connection tracker
-	tracker := server.NewConnectionTracker("IMAP", "test-instance", nil, 5, 2, 1000, false)
+	tracker := server.NewConnectionTracker("IMAP", "", "", "test-instance", nil, 5, 2, 1000, false)
 
 	opts := imapproxy.ServerOptions{
 		Name:                   "test-proxy",

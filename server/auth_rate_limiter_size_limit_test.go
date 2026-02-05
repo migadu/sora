@@ -19,7 +19,7 @@ func TestIPUsernameSizeLimit(t *testing.T) {
 		MaxIPUsernameEntries:     5,             // Small limit for testing
 	}
 
-	limiter := NewAuthRateLimiter("test", config)
+	limiter := NewAuthRateLimiter("test", "", "", config)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -90,7 +90,7 @@ func TestIPSizeLimit(t *testing.T) {
 		MaxIPEntries:         3,             // Small limit for testing
 	}
 
-	limiter := NewAuthRateLimiter("test", config)
+	limiter := NewAuthRateLimiter("test", "", "", config)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -157,7 +157,7 @@ func TestUsernameSizeLimit(t *testing.T) {
 		MaxUsernameEntries:     4,             // Small limit for testing
 	}
 
-	limiter := NewAuthRateLimiter("test", config)
+	limiter := NewAuthRateLimiter("test", "", "", config)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -226,7 +226,7 @@ func TestSizeLimitDisabled(t *testing.T) {
 		MaxIPUsernameEntries:     0, // Disabled - unlimited
 	}
 
-	limiter := NewAuthRateLimiter("test", config)
+	limiter := NewAuthRateLimiter("test", "", "", config)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -259,7 +259,7 @@ func TestEvictionOrderByFirstFailure(t *testing.T) {
 		MaxIPUsernameEntries:     3,
 	}
 
-	limiter := NewAuthRateLimiter("test", config)
+	limiter := NewAuthRateLimiter("test", "", "", config)
 	defer limiter.Stop()
 
 	ctx := context.Background()

@@ -87,7 +87,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 	}
 
 	// Create auth rate limiter
-	authLimiter := server.NewAuthRateLimiter("user-api", options.AuthRateLimit)
+	authLimiter := server.NewAuthRateLimiter("user-api", options.Name, "", options.AuthRateLimit)
 
 	// Initialize authentication cache if configured
 	var authCache *lookupcache.LookupCache

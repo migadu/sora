@@ -683,7 +683,7 @@ func (s *LMTPSession) Logout() error {
 		s.releaseConn = nil
 	}
 
-	metrics.ConnectionDuration.WithLabelValues("lmtp").Observe(time.Since(s.startTime).Seconds())
+	metrics.ConnectionDuration.WithLabelValues("lmtp", s.backend.name, s.backend.hostname).Observe(time.Since(s.startTime).Seconds())
 
 	// Decrement active connections (not total - total is cumulative)
 	activeCount := s.backend.activeConnections.Add(-1)

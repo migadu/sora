@@ -47,6 +47,14 @@ var (
 		},
 		[]string{"protocol", "server_name", "hostname", "result"},
 	)
+
+	PasswordVerificationAttempts = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_password_verification_attempts_total",
+			Help: "Total number of password hash verification attempts by hash type",
+		},
+		[]string{"hash_type", "result"},
+	)
 )
 
 // Database performance metrics

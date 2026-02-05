@@ -15,7 +15,7 @@ import (
 // - After pruning per-instance data, user entries are removed only when the total count reaches 0.
 
 func TestGossipCleanup_DoesNotRemoveRemoteEntriesWhenInstanceAlive(t *testing.T) {
-	tracker := NewConnectionTracker("LMTP", "local-instance", nil, 0, 0, 0, false)
+	tracker := NewConnectionTracker("LMTP", "", "", "local-instance", nil, 0, 0, 0, false)
 	defer tracker.Stop()
 
 	remoteInstanceID := "remote-node"
@@ -53,7 +53,7 @@ func TestGossipCleanup_DoesNotRemoveRemoteEntriesWhenInstanceAlive(t *testing.T)
 }
 
 func TestGossipCleanup_PurgesStaleInstanceData(t *testing.T) {
-	tracker := NewConnectionTracker("LMTP", "local-instance", nil, 0, 0, 0, false)
+	tracker := NewConnectionTracker("LMTP", "", "", "local-instance", nil, 0, 0, 0, false)
 	defer tracker.Stop()
 
 	remoteInstanceID := "remote-node"
@@ -102,7 +102,7 @@ func TestGossipCleanup_PurgesStaleInstanceData(t *testing.T) {
 // TestGossipCleanupPreservesActiveConnections verifies that connections
 // with LocalCount > 0 are never cleaned up, even if old.
 func TestGossipCleanupPreservesActiveConnections(t *testing.T) {
-	tracker := NewConnectionTracker("LMTP", "test-instance", nil, 0, 0, 0, false)
+	tracker := NewConnectionTracker("LMTP", "", "", "test-instance", nil, 0, 0, 0, false)
 	defer tracker.Stop()
 
 	accountID := int64(12345)
@@ -135,7 +135,7 @@ func TestGossipCleanupPreservesActiveConnections(t *testing.T) {
 // TestFirstSeenNotUpdatedByLastUpdate verifies that FirstSeen stays constant
 // even when LastUpdate is refreshed (simulating gossip behavior).
 func TestFirstSeenNotUpdatedByLastUpdate(t *testing.T) {
-	tracker := NewConnectionTracker("LMTP", "test-instance", nil, 0, 0, 0, false)
+	tracker := NewConnectionTracker("LMTP", "", "", "test-instance", nil, 0, 0, 0, false)
 	defer tracker.Stop()
 
 	accountID := int64(12345)
@@ -177,7 +177,7 @@ func TestFirstSeenNotUpdatedByLastUpdate(t *testing.T) {
 // (snapshotOnly=true) clean up entries when local count reaches 0, even if
 // they've received gossip about other instances showing TotalCount > 0.
 func TestSnapshotOnlyBackendCleansUpLocalEntries(t *testing.T) {
-	tracker := NewConnectionTracker("LMTP", "backend-instance", nil, 0, 0, 0, true) // snapshotOnly=true
+	tracker := NewConnectionTracker("LMTP", "", "", "backend-instance", nil, 0, 0, 0, true) // snapshotOnly=true
 	defer tracker.Stop()
 
 	accountID := int64(12345)

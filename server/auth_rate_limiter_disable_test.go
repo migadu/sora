@@ -23,7 +23,7 @@ func TestAuthRateLimiter_DisableByZero(t *testing.T) {
 		CacheCleanupInterval:     1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("test", config)
+	limiter := NewAuthRateLimiter("test", "", "", config)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -73,7 +73,7 @@ func TestAuthRateLimiter_DisableTier1Only(t *testing.T) {
 		CacheCleanupInterval:     1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("test", config)
+	limiter := NewAuthRateLimiter("test", "", "", config)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -122,7 +122,7 @@ func TestAuthRateLimiter_DisableTier2Only(t *testing.T) {
 		CacheCleanupInterval:     1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("test", config)
+	limiter := NewAuthRateLimiter("test", "", "", config)
 	defer limiter.Stop()
 
 	ctx := context.Background()

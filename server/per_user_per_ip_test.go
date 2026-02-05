@@ -8,7 +8,7 @@ import (
 
 func TestConnectionTracker_PerUserPerIPLimit(t *testing.T) {
 	// Create tracker with per-user limit of 10 but per-user-per-IP limit of 2
-	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 10, 2, 0, false)
+	tracker := NewConnectionTracker("IMAP", "", "", "test-instance", nil, 10, 2, 0, false)
 	if tracker == nil {
 		t.Fatal("NewConnectionTracker returned nil")
 	}
@@ -86,7 +86,7 @@ func TestConnectionTracker_PerUserPerIPLimit(t *testing.T) {
 
 func TestConnectionTracker_PerUserPerIPWithMultipleUsers(t *testing.T) {
 	// Test that per-user-per-IP is tracked separately for each user
-	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 20, 3, 0, false)
+	tracker := NewConnectionTracker("IMAP", "", "", "test-instance", nil, 20, 3, 0, false)
 	if tracker == nil {
 		t.Fatal("NewConnectionTracker returned nil")
 	}
@@ -140,7 +140,7 @@ func TestConnectionTracker_PerUserPerIPWithMultipleUsers(t *testing.T) {
 
 func TestConnectionTracker_PerUserPerIPDisabled(t *testing.T) {
 	// Create tracker with per-user-per-IP limit disabled (0)
-	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 10, 0, 0, false)
+	tracker := NewConnectionTracker("IMAP", "", "", "test-instance", nil, 10, 0, 0, false)
 	if tracker == nil {
 		t.Fatal("NewConnectionTracker returned nil")
 	}
@@ -169,7 +169,7 @@ func TestConnectionTracker_PerUserPerIPDisabled(t *testing.T) {
 
 func TestConnectionTracker_PerUserPerIPCleanup(t *testing.T) {
 	// Test that per-IP counters are cleaned up when connections are unregistered
-	tracker := NewConnectionTracker("IMAP", "test-instance", nil, 10, 2, 0, false)
+	tracker := NewConnectionTracker("IMAP", "", "", "test-instance", nil, 10, 2, 0, false)
 	if tracker == nil {
 		t.Fatal("NewConnectionTracker returned nil")
 	}

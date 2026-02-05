@@ -19,7 +19,7 @@ func TestClusterRateLimiter_BroadcastQueueSizeLimit(t *testing.T) {
 		CacheCleanupInterval:     1 * time.Hour,
 	}
 
-	limiter := NewAuthRateLimiter("test", config)
+	limiter := NewAuthRateLimiter("test", "", "", config)
 	defer limiter.Stop()
 
 	// Create cluster limiter (this would normally happen via SetClusterManager)
@@ -91,7 +91,7 @@ func TestClusterRateLimiter_QueueEvictionPreservesNewest(t *testing.T) {
 		CacheCleanupInterval:     1 * time.Hour,
 	}
 
-	limiter := NewAuthRateLimiter("test", config)
+	limiter := NewAuthRateLimiter("test", "", "", config)
 	defer limiter.Stop()
 
 	crl := &ClusterRateLimiter{
@@ -160,7 +160,7 @@ func TestClusterRateLimiter_QueueDoesNotGrowUnbounded(t *testing.T) {
 		CacheCleanupInterval:     1 * time.Hour,
 	}
 
-	limiter := NewAuthRateLimiter("test", config)
+	limiter := NewAuthRateLimiter("test", "", "", config)
 	defer limiter.Stop()
 
 	crl := &ClusterRateLimiter{

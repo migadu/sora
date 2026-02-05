@@ -145,6 +145,11 @@ type SoraConn struct {
 	// Buffered reader (created if TLS detection is used)
 	reader *bufio.Reader
 
+	// Server context for metrics
+	protocol   string
+	serverName string
+	hostname   string
+
 	// Timeout protection
 	idleTimeout         time.Duration // Maximum idle time (e.g., 5 minutes)
 	absoluteTimeout     time.Duration // Maximum session duration (e.g., 30 minutes)
@@ -168,7 +173,6 @@ type SoraConn struct {
 	proxyInfoMutex sync.RWMutex
 
 	// Connection metadata
-	protocol string // "imap", "pop3", "lmtp", "managesieve", "imap_proxy", etc.
 	username string // Set after authentication
 
 	// Timeout callback
@@ -184,6 +188,8 @@ type SoraConn struct {
 // SoraConnConfig holds configuration for creating a SoraConn
 type SoraConnConfig struct {
 	Protocol             string        // Protocol name for logging/metrics
+	ServerName           string        // Server name for metrics
+	Hostname             string        // Hostname for metrics
 	IdleTimeout          time.Duration // 0 = no idle timeout
 	AbsoluteTimeout      time.Duration // 0 = no absolute timeout
 	MinBytesPerMinute    int64         // 0 = no throughput checking
@@ -224,6 +230,8 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 		ja4Fingerprint:      config.InitialJA4,
 		proxyInfo:           config.InitialProxyInfo,
 		protocol:            config.Protocol,
+		serverName:          config.ServerName,
+		hostname:            config.Hostname,
 		username:            "",
 		onTimeout:           config.OnTimeout,
 		closed:              false,
@@ -268,7 +276,7 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 	if c.absoluteTimeout > 0 && sessionDuration >= c.absoluteTimeout {
 		remoteAddr := c.remoteAddr
 		logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "session_max", "duration", sessionDuration.Round(time.Second), "max", c.absoluteTimeout)
-		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, "session_max").Inc()
+		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, c.serverName, c.hostname, "session_max").Inc()
 
 		// Call timeout handler before closing (if provided)
 		if c.onTimeout != nil {
@@ -331,7 +339,7 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 			if avgBytesPerMin < c.minBytesPerMinute && consecutiveSlow >= 2 {
 				remoteAddr := c.remoteAddr
 				logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "slow_throughput", "bytes_per_min_avg", int(avgBytesPerMin), "bytes_per_min_current", int(bytesPerMinute), "required", c.minBytesPerMinute, "consecutive_slow", consecutiveSlow)
-				metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, "slow_throughput").Inc()
+				metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, c.serverName, c.hostname, "slow_throughput").Inc()
 
 				// Call timeout handler before closing (if provided)
 				if c.onTimeout != nil {
@@ -354,7 +362,7 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 	if c.idleTimeout > 0 && idleTime >= c.idleTimeout {
 		remoteAddr := c.remoteAddr
 		logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "idle", "idle_time", idleTime.Round(time.Second), "max_idle", c.idleTimeout)
-		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, "idle").Inc()
+		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, c.serverName, c.hostname, "idle").Inc()
 
 		// Call timeout handler before closing (if provided)
 		if c.onTimeout != nil {
@@ -571,7 +579,7 @@ func (c *SoraConn) DetectAndRejectTLS() error {
 		c.Conn.Write([]byte("ERROR: TLS connection attempted on plain-text port. Use STARTTLS or connect to the TLS port.\r\n"))
 
 		// Record metric
-		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, "tls_on_plain_port").Inc()
+		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, c.serverName, c.hostname, "tls_on_plain_port").Inc()
 
 		// Close the connection
 		c.Close()
@@ -838,7 +846,7 @@ func (c *SoraTLSConn) detectAndRejectPlainText() error {
 		c.tcpConn.Write([]byte("ERROR: Plain-text connection attempted on TLS port. Use STARTTLS or connect to the plain-text port.\r\n"))
 
 		// Record metric
-		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.connConfig.Protocol, "plain_text_on_tls_port").Inc()
+		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.SoraConn.protocol, c.SoraConn.serverName, c.SoraConn.hostname, "plain_text_on_tls_port").Inc()
 
 		// Close the connection
 		c.SoraConn.Close()

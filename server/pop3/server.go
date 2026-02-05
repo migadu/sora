@@ -149,7 +149,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("POP3", options.AuthRateLimit, options.TrustedNetworks)
+	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("POP3", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
 
 	// Initialize authentication cache from config
 	// Default to enabled if not explicitly configured
@@ -299,6 +299,8 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		// Create ConnectionTracker with nil cluster manager (local mode only)
 		server.connTracker = serverPkg.NewConnectionTracker(
 			"POP3",                             // protocol name
+			name,                               // server name
+			hostname,                           // hostname
 			instanceID,                         // unique instance identifier
 			nil,                                // no cluster manager = local mode
 			options.MaxConnectionsPerUser,      // per-user connection limit
@@ -323,6 +325,8 @@ func (s *POP3Server) Start(errChan chan error) {
 	// Configure SoraConn with timeout protection
 	connConfig := serverPkg.SoraConnConfig{
 		Protocol:             "pop3",
+		ServerName:           s.name,
+		Hostname:             s.hostname,
 		IdleTimeout:          s.commandTimeout,
 		AbsoluteTimeout:      s.absoluteSessionTimeout,
 		MinBytesPerMinute:    s.minBytesPerMinute,

@@ -987,7 +987,7 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 
 func (s *ManageSieveSession) closeWithoutLock() error {
 	// Observe connection duration
-	metrics.ConnectionDuration.WithLabelValues("managesieve").Observe(time.Since(s.startTime).Seconds())
+	metrics.ConnectionDuration.WithLabelValues("managesieve", s.server.name, s.server.hostname).Observe(time.Since(s.startTime).Seconds())
 
 	// Decrement connection counters
 	totalCount := s.server.totalConnections.Add(-1)

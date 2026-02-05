@@ -80,8 +80,10 @@ type AuthLimiter interface {
 
 // AuthRateLimiter provides two-tier rate limiting: IP+username and IP-only blocking
 type AuthRateLimiter struct {
-	config   AuthRateLimiterConfig
-	protocol string
+	config     AuthRateLimiterConfig
+	protocol   string
+	serverName string
+	hostname   string
 
 	// Trusted networks for exemption
 	trustedNetworks []string
@@ -144,12 +146,12 @@ type UsernameFailureInfo struct {
 }
 
 // NewAuthRateLimiter creates a new authentication rate limiter.
-func NewAuthRateLimiter(protocol string, config AuthRateLimiterConfig) *AuthRateLimiter {
-	return NewAuthRateLimiterWithTrustedNetworks(protocol, config, nil)
+func NewAuthRateLimiter(protocol, serverName, hostname string, config AuthRateLimiterConfig) *AuthRateLimiter {
+	return NewAuthRateLimiterWithTrustedNetworks(protocol, serverName, hostname, config, nil)
 }
 
 // NewAuthRateLimiterWithTrustedNetworks creates a new authentication rate limiter with trusted networks exemption.
-func NewAuthRateLimiterWithTrustedNetworks(protocol string, config AuthRateLimiterConfig, trustedNetworks []string) *AuthRateLimiter {
+func NewAuthRateLimiterWithTrustedNetworks(protocol, serverName, hostname string, config AuthRateLimiterConfig, trustedNetworks []string) *AuthRateLimiter {
 	if !config.Enabled {
 		return nil
 	}
@@ -157,6 +159,8 @@ func NewAuthRateLimiterWithTrustedNetworks(protocol string, config AuthRateLimit
 	limiter := &AuthRateLimiter{
 		config:                config,
 		protocol:              protocol,
+		serverName:            serverName,
+		hostname:              hostname,
 		trustedNetworks:       trustedNetworks,
 		blockedIPUsernames:    make(map[string]*BlockedIPUsernameInfo),
 		blockedIPs:            make(map[string]*BlockedIPInfo),
@@ -803,10 +807,10 @@ func (a *AuthRateLimiter) cleanupExpiredEntries() {
 	totalUsernames := len(a.usernameFailureCounts)
 	a.usernameMu.RUnlock()
 
-	metrics.AuthRateLimiterIPUsernameEntries.WithLabelValues(a.protocol).Set(float64(totalIPUsername))
-	metrics.AuthRateLimiterIPEntries.WithLabelValues(a.protocol).Set(float64(totalIPFailures))
-	metrics.AuthRateLimiterUsernameEntries.WithLabelValues(a.protocol).Set(float64(totalUsernames))
-	metrics.AuthRateLimiterBlockedIPs.WithLabelValues(a.protocol).Set(float64(totalBlockedIPs))
+	metrics.AuthRateLimiterIPUsernameEntries.WithLabelValues(a.protocol, a.serverName, a.hostname).Set(float64(totalIPUsername))
+	metrics.AuthRateLimiterIPEntries.WithLabelValues(a.protocol, a.serverName, a.hostname).Set(float64(totalIPFailures))
+	metrics.AuthRateLimiterUsernameEntries.WithLabelValues(a.protocol, a.serverName, a.hostname).Set(float64(totalUsernames))
+	metrics.AuthRateLimiterBlockedIPs.WithLabelValues(a.protocol, a.serverName, a.hostname).Set(float64(totalBlockedIPs))
 
 	// Log memory usage stats every 10 cleanup cycles (~50 minutes with 5min default cleanup interval)
 	// This helps monitor for memory leaks and effectiveness of size caps

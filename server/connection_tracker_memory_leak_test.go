@@ -8,7 +8,7 @@ import (
 
 // TestConnectionTracker_PerIPCountByInstanceCleanup tests that empty instance maps are removed during cleanup
 func TestConnectionTracker_PerIPCountByInstanceCleanup(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 100, 0, 0, false)
+	tracker := NewConnectionTracker("test", "", "", "instance-1", nil, 100, 0, 0, false)
 	defer tracker.Stop()
 
 	// Simulate a user connecting and disconnecting from multiple instances via gossip
@@ -73,7 +73,7 @@ func TestConnectionTracker_PerIPCountByInstanceCleanup(t *testing.T) {
 
 // TestConnectionTracker_PerIPCountCleanup tests that zero-count PerIPCount entries are removed during cleanup
 func TestConnectionTracker_PerIPCountCleanup(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 100, 5, 0, false)
+	tracker := NewConnectionTracker("test", "", "", "instance-1", nil, 100, 5, 0, false)
 	defer tracker.Stop()
 
 	ctx := context.Background()
@@ -182,7 +182,7 @@ func TestConnectionTracker_PerIPCountCleanup(t *testing.T) {
 
 // TestConnectionTracker_CleanupPreventsBoundlessGrowth tests that cleanup prevents memory leaks over time
 func TestConnectionTracker_CleanupPreventsBoundlessGrowth(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 100, 3, 0, false)
+	tracker := NewConnectionTracker("test", "", "", "instance-1", nil, 100, 3, 0, false)
 	defer tracker.Stop()
 
 	// Simulate user connecting from many instances over time
@@ -240,7 +240,7 @@ func TestConnectionTracker_CleanupPreventsBoundlessGrowth(t *testing.T) {
 
 // TestConnectionTracker_CleanupHandlesEmptyMaps tests cleanup doesn't crash on empty/nil maps
 func TestConnectionTracker_CleanupHandlesEmptyMaps(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 100, 0, 0, false)
+	tracker := NewConnectionTracker("test", "", "", "instance-1", nil, 100, 0, 0, false)
 	defer tracker.Stop()
 
 	// Add user with empty maps
@@ -269,7 +269,7 @@ func TestConnectionTracker_CleanupHandlesEmptyMaps(t *testing.T) {
 
 // TestConnectionTracker_CleanupFrequency tests that cleanup runs periodically
 func TestConnectionTracker_CleanupFrequency(t *testing.T) {
-	tracker := NewConnectionTracker("test", "instance-1", nil, 100, 0, 0, false)
+	tracker := NewConnectionTracker("test", "", "", "instance-1", nil, 100, 0, 0, false)
 	defer tracker.Stop()
 
 	ctx := context.Background()

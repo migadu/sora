@@ -368,7 +368,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("IMAP", options.AuthRateLimit, options.TrustedNetworks)
+	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("IMAP", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
 
 	// Initialize search rate limiter
 	searchRateLimiter := serverPkg.NewSearchRateLimiter("IMAP", options.SearchRateLimitPerMin, options.SearchRateLimitWindow)
@@ -669,6 +669,8 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		// Create ConnectionTracker with nil cluster manager (local mode only)
 		s.connTracker = serverPkg.NewConnectionTracker(
 			"IMAP",                             // protocol name
+			name,                               // server name
+			hostname,                           // hostname
 			instanceID,                         // unique instance identifier
 			nil,                                // no cluster manager = local mode
 			options.MaxConnectionsPerUser,      // per-user connection limit
@@ -865,6 +867,8 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 	// Configure SoraConn
 	connConfig := serverPkg.SoraConnConfig{
 		Protocol:             "imap",
+		ServerName:           s.name,
+		Hostname:             s.hostname,
 		IdleTimeout:          s.commandTimeout,
 		AbsoluteTimeout:      s.absoluteSessionTimeout,
 		MinBytesPerMinute:    s.minBytesPerMinute,

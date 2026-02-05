@@ -1871,12 +1871,12 @@ func (s *POP3Session) handleClientError(writer *bufio.Writer, errMsg string) boo
 }
 
 func (s *POP3Session) closeWithoutLock() error {
-	metrics.ConnectionDuration.WithLabelValues("pop3").Observe(time.Since(s.startTime).Seconds())
+	metrics.ConnectionDuration.WithLabelValues("pop3", s.server.name, s.server.hostname).Observe(time.Since(s.startTime).Seconds())
 
 	// Log and record peak memory usage
 	if s.memTracker != nil {
 		peak := s.memTracker.Peak()
-		metrics.SessionMemoryPeakBytes.WithLabelValues("pop3").Observe(float64(peak))
+		metrics.SessionMemoryPeakBytes.WithLabelValues("pop3", s.server.name, s.server.hostname).Observe(float64(peak))
 		if peak > 0 {
 			s.DebugLog("session memory peak", "peak", server.FormatBytes(peak))
 		}
@@ -1960,7 +1960,7 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 				// Track memory usage for cached data
 				if s.memTracker != nil {
 					if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-						metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3").Inc()
+						metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
 						return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
 					}
 				}
@@ -1994,7 +1994,7 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 		// Track memory usage for S3 data
 		if s.memTracker != nil {
 			if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-				metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3").Inc()
+				metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
 				return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
 			}
 		}
@@ -2027,7 +2027,7 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 	// Track memory usage for disk data
 	if s.memTracker != nil {
 		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-			metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3").Inc()
+			metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
 			return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
 		}
 	}

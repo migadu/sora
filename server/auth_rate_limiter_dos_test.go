@@ -23,7 +23,7 @@ func TestAuthRateLimiter_DoSPrevention(t *testing.T) {
 		IPWindowDuration:       15 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()

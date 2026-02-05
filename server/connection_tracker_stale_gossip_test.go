@@ -19,10 +19,10 @@ import (
 // 7. Result: Node B still shows user X with connections from Node A
 func TestStaleConnectionsFromMissedUnregister(t *testing.T) {
 	// Create two connection trackers (simulating two nodes)
-	nodeA := NewConnectionTracker("LMTP", "node-a", nil, 0, 0, 10000, false)
+	nodeA := NewConnectionTracker("LMTP", "", "", "node-a", nil, 0, 0, 10000, false)
 	defer nodeA.Stop()
 
-	nodeB := NewConnectionTracker("LMTP", "node-b", nil, 0, 0, 10000, false)
+	nodeB := NewConnectionTracker("LMTP", "", "", "node-b", nil, 0, 0, 10000, false)
 	defer nodeB.Stop()
 
 	accountID := int64(12345)
@@ -112,7 +112,7 @@ func TestStaleConnectionsFromMissedUnregister(t *testing.T) {
 // TestStateSnapshotRemovesStaleInstances verifies that when a node sends a state snapshot,
 // any entries for that node that are NOT in the snapshot should be removed.
 func TestStateSnapshotRemovesStaleInstances(t *testing.T) {
-	tracker := NewConnectionTracker("LMTP", "local-node", nil, 0, 0, 10000, false)
+	tracker := NewConnectionTracker("LMTP", "", "", "local-node", nil, 0, 0, 10000, false)
 	defer tracker.Stop()
 
 	// Set up initial state: We have connections from two remote nodes
@@ -219,7 +219,7 @@ func TestStateSnapshotRemovesStaleInstances(t *testing.T) {
 // TestStateSnapshotDoesNotAffectOtherInstances verifies that a state snapshot from
 // one node doesn't remove entries from other nodes.
 func TestStateSnapshotDoesNotAffectOtherInstances(t *testing.T) {
-	tracker := NewConnectionTracker("LMTP", "local-node", nil, 0, 0, 10000, false)
+	tracker := NewConnectionTracker("LMTP", "", "", "local-node", nil, 0, 0, 10000, false)
 	defer tracker.Stop()
 
 	accountID := int64(100)

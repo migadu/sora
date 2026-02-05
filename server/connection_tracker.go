@@ -89,6 +89,8 @@ type UserConnectionInfo struct {
 // ConnectionTracker manages connection tracking using gossip protocol
 type ConnectionTracker struct {
 	name           string
+	serverName     string
+	hostname       string
 	instanceID     string
 	clusterManager *cluster.Manager
 
@@ -135,7 +137,7 @@ type LookupCacheInvalidator interface {
 // If clusterMgr is provided, uses gossip protocol for cluster-wide tracking (for proxies).
 // If clusterMgr is nil, operates in local-only mode (for backend servers).
 // If snapshotOnly is true, only broadcasts periodic state snapshots (no individual register/unregister events).
-func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, maxEventQueueSize int, snapshotOnly bool) *ConnectionTracker {
+func NewConnectionTracker(name, serverName, hostname string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, maxEventQueueSize int, snapshotOnly bool) *ConnectionTracker {
 	// Use default if not specified
 	if maxEventQueueSize <= 0 {
 		maxEventQueueSize = defaultMaxEventQueueSize
@@ -143,6 +145,8 @@ func NewConnectionTracker(name string, instanceID string, clusterMgr *cluster.Ma
 
 	ct := &ConnectionTracker{
 		name:                       name,
+		serverName:                 serverName,
+		hostname:                   hostname,
 		instanceID:                 instanceID,
 		clusterManager:             clusterMgr,
 		connections:                make(map[int64]*UserConnectionInfo),
@@ -1032,14 +1036,14 @@ func (ct *ConnectionTracker) cleanup() {
 			"users", cleanedUsers, "instance_ids", cleanedInstances, "ips", cleanedIPs)
 	}
 
-	metrics.ConnectionTrackerUsers.WithLabelValues(ct.name).Set(float64(totalUsers))
-	metrics.ConnectionTrackerInstanceIDs.WithLabelValues(ct.name).Set(float64(totalInstanceIDs))
-	metrics.ConnectionTrackerIPs.WithLabelValues(ct.name).Set(float64(totalIPs))
+	metrics.ConnectionTrackerUsers.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(totalUsers))
+	metrics.ConnectionTrackerInstanceIDs.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(totalInstanceIDs))
+	metrics.ConnectionTrackerIPs.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(totalIPs))
 
 	ct.queueMu.Lock()
 	queueSize := len(ct.broadcastQueue)
 	ct.queueMu.Unlock()
-	metrics.ConnectionTrackerBroadcastQueue.WithLabelValues(ct.name).Set(float64(queueSize))
+	metrics.ConnectionTrackerBroadcastQueue.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(queueSize))
 
 	// Log memory usage stats every 10 cleanup cycles (~10 minutes with 1m cleanup interval)
 	ct.cleanupCounter++

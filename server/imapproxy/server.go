@@ -246,7 +246,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("IMAP-PROXY", opts.AuthRateLimit, opts.TrustedProxies)
+	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("IMAP-PROXY", opts.Name, hostname, opts.AuthRateLimit, opts.TrustedProxies)
 
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter
@@ -395,6 +395,8 @@ func (s *Server) Start() error {
 		// Wrap with SoraTLSListener for TLS + JA4 capture + timeout protection
 		connConfig := server.SoraConnConfig{
 			Protocol:             "imap_proxy",
+			ServerName:           s.name,
+			Hostname:             s.hostname,
 			IdleTimeout:          s.commandTimeout,
 			AbsoluteTimeout:      s.absoluteSessionTimeout,
 			MinBytesPerMinute:    s.minBytesPerMinute,
@@ -430,6 +432,8 @@ func (s *Server) Start() error {
 		// Wrap with SoraTLSListener for TLS + JA4 capture + timeout protection
 		connConfig := server.SoraConnConfig{
 			Protocol:             "imap_proxy",
+			ServerName:           s.name,
+			Hostname:             s.hostname,
 			IdleTimeout:          s.commandTimeout,
 			AbsoluteTimeout:      s.absoluteSessionTimeout,
 			MinBytesPerMinute:    s.minBytesPerMinute,
@@ -469,6 +473,8 @@ func (s *Server) Start() error {
 		// Wrap with SoraListener for timeout protection (no TLS/JA4)
 		connConfig := server.SoraConnConfig{
 			Protocol:             "imap_proxy",
+			ServerName:           s.name,
+			Hostname:             s.hostname,
 			IdleTimeout:          s.commandTimeout,
 			AbsoluteTimeout:      s.absoluteSessionTimeout,
 			MinBytesPerMinute:    s.minBytesPerMinute,

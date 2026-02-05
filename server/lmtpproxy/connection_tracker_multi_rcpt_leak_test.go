@@ -17,7 +17,7 @@ import (
 // recipient's accountID, but on close() it unregistered using s.accountID which is
 // overwritten on each RCPT. This leaked the first recipient forever.
 func TestConnectionTracker_MultiRCPTDoesNotLeak(t *testing.T) {
-	tracker := server.NewConnectionTracker("LMTP", "test-instance", nil, 0, 0, 1000, false)
+	tracker := server.NewConnectionTracker("LMTP", "", "", "test-instance", nil, 0, 0, 1000, false)
 	defer tracker.Stop()
 
 	// Provide a real net.Conn so InfoLog/DebugLog (used by close()) can access RemoteAddr safely.

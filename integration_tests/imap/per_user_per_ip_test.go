@@ -81,7 +81,7 @@ func setupServerWithPerUserPerIPLimit(t *testing.T, maxPerUser, maxPerUserPerIP 
 
 	// Create connection tracker with per-user-per-IP limit
 	instanceID := fmt.Sprintf("test-per-user-per-ip-%d", time.Now().UnixNano())
-	tracker := serverPkg.NewConnectionTracker("IMAP", instanceID, nil, maxPerUser, maxPerUserPerIP, 0, false)
+	tracker := serverPkg.NewConnectionTracker("IMAP", "", "", instanceID, nil, maxPerUser, maxPerUserPerIP, 0, false)
 	if tracker == nil {
 		t.Fatal("Failed to create connection tracker")
 	}
@@ -272,7 +272,7 @@ func TestPerUserPerIPLimit_MultipleUsers(t *testing.T) {
 	}
 
 	instanceID := fmt.Sprintf("test-multi-user-%d", time.Now().UnixNano())
-	tracker := serverPkg.NewConnectionTracker("IMAP", instanceID, nil, 20, 2, 0, false)
+	tracker := serverPkg.NewConnectionTracker("IMAP", "", "", instanceID, nil, 20, 2, 0, false)
 	if tracker == nil {
 		t.Fatal("Failed to create connection tracker")
 	}

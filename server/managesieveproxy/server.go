@@ -209,7 +209,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("SIEVE-PROXY", opts.AuthRateLimit, opts.TrustedProxies)
+	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("SIEVE-PROXY", opts.Name, hostname, opts.AuthRateLimit, opts.TrustedProxies)
 
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter
@@ -383,6 +383,8 @@ func (s *Server) Start() error {
 	// Configure SoraConn with timeout protection
 	connConfig := server.SoraConnConfig{
 		Protocol:             "managesieve_proxy",
+		ServerName:           s.name,
+		Hostname:             s.hostname,
 		IdleTimeout:          s.commandTimeout,
 		AbsoluteTimeout:      s.absoluteSessionTimeout,
 		MinBytesPerMinute:    s.minBytesPerMinute,

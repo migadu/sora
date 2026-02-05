@@ -156,7 +156,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", options.AuthRateLimit, options.TrustedNetworks)
+	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
 
 	// Initialize authentication cache from config
 	// Default to enabled if not explicitly configured
@@ -319,6 +319,8 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		// Create ConnectionTracker with nil cluster manager (local mode only)
 		serverInstance.connTracker = serverPkg.NewConnectionTracker(
 			"ManageSieve",                      // protocol name
+			name,                               // server name
+			hostname,                           // hostname
 			instanceID,                         // unique instance identifier
 			nil,                                // no cluster manager = local mode
 			options.MaxConnectionsPerUser,      // per-user connection limit
@@ -343,6 +345,8 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 	// Configure SoraConn with timeout protection
 	connConfig := serverPkg.SoraConnConfig{
 		Protocol:             "managesieve",
+		ServerName:           s.name,
+		Hostname:             s.hostname,
 		IdleTimeout:          s.commandTimeout,
 		AbsoluteTimeout:      s.absoluteSessionTimeout,
 		MinBytesPerMinute:    s.minBytesPerMinute,

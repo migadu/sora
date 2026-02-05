@@ -20,7 +20,7 @@ func TestAuthRateLimiterBasicIPBlocking(t *testing.T) {
 		CacheCleanupInterval: 1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -64,7 +64,7 @@ func TestAuthRateLimiterProgressiveDelays(t *testing.T) {
 		CacheCleanupInterval: 1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -116,7 +116,7 @@ func TestAuthRateLimiterUsernameTracking(t *testing.T) {
 		IPWindowDuration:       15 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -169,7 +169,7 @@ func TestAuthRateLimiterSuccessResetsFailures(t *testing.T) {
 		UsernameWindowDuration: 30 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -213,7 +213,7 @@ func TestAuthRateLimiterDisabled(t *testing.T) {
 		MaxAttemptsPerIP: 1,     // Would block after 1 failure if enabled
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -244,7 +244,7 @@ func TestAuthRateLimiterMaxDelayCapEnforced(t *testing.T) {
 		CacheCleanupInterval: 1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -291,7 +291,7 @@ func TestAuthRateLimiterGetStats(t *testing.T) {
 		UsernameWindowDuration: 30 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -341,7 +341,7 @@ func TestAuthRateLimiterCleanupExpiredEntries(t *testing.T) {
 		CacheCleanupInterval: 50 * time.Millisecond, // Frequent cleanup
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -385,7 +385,7 @@ func TestAuthRateLimiterUsernameCleanup(t *testing.T) {
 		CacheCleanupInterval:   50 * time.Millisecond,  // Frequent cleanup
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -440,7 +440,7 @@ func TestAuthRateLimiterCompleteMemoryCleanup(t *testing.T) {
 		CacheCleanupInterval:   50 * time.Millisecond, // Cleanup every 50ms
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -539,7 +539,7 @@ func TestAuthRateLimiterContinuousCleanup(t *testing.T) {
 		CacheCleanupInterval:   50 * time.Millisecond, // Cleanup every 50ms
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -596,7 +596,7 @@ func TestAuthRateLimiterConcurrentAccess(t *testing.T) {
 		CacheCleanupInterval: 1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -636,7 +636,7 @@ func TestAuthRateLimiterWithTrustedNetworks(t *testing.T) {
 	}
 
 	trustedNets := []string{"10.0.0.0/8", "192.168.1.0/24"}
-	limiter := NewAuthRateLimiterWithTrustedNetworks("imap", cfg, trustedNets)
+	limiter := NewAuthRateLimiterWithTrustedNetworks("imap", "", "", cfg, trustedNets)
 	if limiter == nil {
 		t.Fatal("Failed to create limiter with trusted networks")
 	}
@@ -659,7 +659,7 @@ func TestAuthRateLimiterTrustedNetworksWithProxy(t *testing.T) {
 	}
 
 	trustedNets := []string{"10.0.0.0/8", "192.168.1.0/24"}
-	limiter := NewAuthRateLimiterWithTrustedNetworks("imap", cfg, trustedNets)
+	limiter := NewAuthRateLimiterWithTrustedNetworks("imap", "", "", cfg, trustedNets)
 	if limiter == nil {
 		t.Fatal("Failed to create limiter with trusted networks")
 	}
@@ -720,7 +720,7 @@ func TestAuthRateLimiterProxyProtocolInfo(t *testing.T) {
 	}
 
 	trustedNets := []string{"127.0.0.0/8"} // Trust localhost/proxy
-	limiter := NewAuthRateLimiterWithTrustedNetworks("imap", cfg, trustedNets)
+	limiter := NewAuthRateLimiterWithTrustedNetworks("imap", "", "", cfg, trustedNets)
 	if limiter == nil {
 		t.Fatal("Failed to create limiter")
 	}
@@ -789,7 +789,7 @@ func TestAuthRateLimiter_IPUsernameBlocking_Basic(t *testing.T) {
 		CacheCleanupInterval:     1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -828,7 +828,7 @@ func TestAuthRateLimiter_IPUsernameBlocking_IsolatesUsers(t *testing.T) {
 		CacheCleanupInterval: 1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -887,7 +887,7 @@ func TestAuthRateLimiter_IPUsernameBlocking_DifferentIPsSameUser(t *testing.T) {
 		CacheCleanupInterval: 1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -939,7 +939,7 @@ func TestAuthRateLimiter_IPUsernameBlocking_SuccessClears(t *testing.T) {
 		CacheCleanupInterval: 1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -997,7 +997,7 @@ func TestAuthRateLimiter_IPUsernameBlocking_EmptyUsername(t *testing.T) {
 		CacheCleanupInterval: 1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -1045,7 +1045,7 @@ func TestAuthRateLimiter_TierInteraction_BothTiersActive(t *testing.T) {
 		CacheCleanupInterval: 1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -1096,7 +1096,7 @@ func TestAuthRateLimiter_TierInteraction_Tier2OnlyWhenDisabledTier1(t *testing.T
 		CacheCleanupInterval: 1 * time.Minute,
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
@@ -1153,7 +1153,7 @@ func TestAuthRateLimiter_IPUsernameBlocking_CleanupExpired(t *testing.T) {
 		CacheCleanupInterval: 50 * time.Millisecond, // Fast cleanup
 	}
 
-	limiter := NewAuthRateLimiter("imap", cfg)
+	limiter := NewAuthRateLimiter("imap", "", "", cfg)
 	defer limiter.Stop()
 
 	ctx := context.Background()
