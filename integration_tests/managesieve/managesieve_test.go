@@ -187,10 +187,8 @@ func TestManageSieveScriptOperations(t *testing.T) {
 	// Test 1: PUTSCRIPT - store a script
 	t.Log("=== Testing PUTSCRIPT ===")
 	vacationScript := `require ["vacation"]; if header :contains "subject" "vacation" { vacation "I'm on vacation"; }`
-	sendCommand(t, writer, fmt.Sprintf("PUTSCRIPT \"vacation\" %s", vacationScript))
-	response := readSimpleResponse(t, reader)
-	if !strings.Contains(response, "OK") {
-		t.Errorf("PUTSCRIPT failed: %s", response)
+	if err := putScriptWithLiteral(t, reader, writer, "vacation", vacationScript); err != nil {
+		t.Errorf("PUTSCRIPT failed: %v", err)
 	} else {
 		t.Logf("PUTSCRIPT succeeded")
 	}
@@ -198,18 +196,18 @@ func TestManageSieveScriptOperations(t *testing.T) {
 	// Test 2: LISTSCRIPTS - should show the script
 	t.Log("=== Testing LISTSCRIPTS ===")
 	sendCommand(t, writer, "LISTSCRIPTS")
-	response = readSimpleResponse(t, reader)
+	listResponse := readListScriptsResponse(t, reader)
 	// Just check that we get some response - parsing the complex format is tricky
-	if strings.HasPrefix(response, "NO") {
-		t.Errorf("LISTSCRIPTS failed: %s", response)
+	if strings.HasPrefix(listResponse, "NO") {
+		t.Errorf("LISTSCRIPTS failed: %s", listResponse)
 	} else {
-		t.Logf("LISTSCRIPTS response: %s", strings.TrimSpace(response))
+		t.Logf("LISTSCRIPTS response: %s", strings.TrimSpace(listResponse))
 	}
 
 	// Test 3: SETACTIVE - activate the script
 	t.Log("=== Testing SETACTIVE ===")
 	sendCommand(t, writer, "SETACTIVE \"vacation\"")
-	response = readSimpleResponse(t, reader)
+	response := readSimpleResponse(t, reader)
 	if !strings.Contains(response, "OK") {
 		t.Errorf("SETACTIVE failed: %s", response)
 	} else {
@@ -640,12 +638,12 @@ func TestManageSieveScriptEdgeCases(t *testing.T) {
 	// Test 2: PUTSCRIPT with invalid Sieve syntax
 	t.Log("=== Testing PUTSCRIPT with invalid Sieve syntax ===")
 	invalidScript := `invalid sieve syntax here`
-	sendCommand(t, writer, fmt.Sprintf("PUTSCRIPT \"invalid\" %s", invalidScript))
-	response = readResponse(t, reader)
-	if strings.Contains(response, "OK") {
-		t.Errorf("PUTSCRIPT with invalid syntax should fail: %s", response)
+	err = putScriptWithLiteral(t, reader, writer, "invalid", invalidScript)
+	if err == nil {
+		t.Errorf("PUTSCRIPT with invalid syntax should fail")
+	} else {
+		t.Logf("Invalid syntax correctly rejected: %v", err)
 	}
-	t.Logf("Invalid syntax response: %s", strings.TrimSpace(response))
 
 	// Test 3: SETACTIVE with non-existent script
 	t.Log("=== Testing SETACTIVE with non-existent script ===")
@@ -659,31 +657,34 @@ func TestManageSieveScriptEdgeCases(t *testing.T) {
 	// Test 4: Create and test script name with special characters
 	t.Log("=== Testing PUTSCRIPT with special characters in name ===")
 	specialScript := `require ["fileinto"]; fileinto "INBOX";`
-	sendCommand(t, writer, fmt.Sprintf("PUTSCRIPT \"test-script_123\" %s", specialScript))
-	response = readResponse(t, reader)
-	if !strings.Contains(response, "OK") {
-		t.Errorf("PUTSCRIPT with valid special characters should succeed: %s", response)
+	err = putScriptWithLiteral(t, reader, writer, "test-script_123", specialScript)
+	if err != nil {
+		t.Errorf("PUTSCRIPT with valid special characters should succeed: %v", err)
+	} else {
+		t.Logf("PUTSCRIPT with special characters succeeded")
 	}
 
 	// Test 5: Test maximum script name length handling
 	t.Log("=== Testing PUTSCRIPT with very long script name ===")
 	longName := strings.Repeat("a", 255) // Very long script name
-	sendCommand(t, writer, fmt.Sprintf("PUTSCRIPT \"%s\" %s", longName, specialScript))
-	response = readResponse(t, reader)
+	err = putScriptWithLiteral(t, reader, writer, longName, specialScript)
 	// The server may accept or reject this - just log the behavior
-	t.Logf("Long name response: %s", strings.TrimSpace(response))
+	if err != nil {
+		t.Logf("Long name rejected: %v", err)
+	} else {
+		t.Logf("Long name accepted")
+	}
 
 	// Test 6: Test script with unsupported extensions (should fail)
 	t.Log("=== Testing PUTSCRIPT with unsupported extensions ===")
 	rejectScript := `require ["fileinto", "reject"]; if header :contains "subject" "test" { reject "Spam not allowed"; } else { fileinto "INBOX"; }`
-	sendCommand(t, writer, fmt.Sprintf("PUTSCRIPT \"reject_script\" %s", rejectScript))
-	response = readResponse(t, reader)
-	if strings.Contains(response, "OK") {
-		t.Errorf("PUTSCRIPT with unsupported 'reject' extension should fail: %s", response)
-	} else if strings.Contains(response, "unsupported extension") || strings.Contains(response, "reject") {
-		t.Logf("Unsupported 'reject' extension correctly rejected: %s", strings.TrimSpace(response))
+	err = putScriptWithLiteral(t, reader, writer, "reject_script", rejectScript)
+	if err == nil {
+		t.Errorf("PUTSCRIPT with unsupported 'reject' extension should fail")
+	} else if strings.Contains(err.Error(), "unsupported") || strings.Contains(err.Error(), "reject") {
+		t.Logf("Unsupported 'reject' extension correctly rejected: %v", err)
 	} else {
-		t.Logf("Reject extension response: %s", strings.TrimSpace(response))
+		t.Logf("Reject extension response: %v", err)
 	}
 
 	// Test 7: Test script with only supported extensions using literal string format
@@ -716,6 +717,148 @@ func TestManageSieveScriptEdgeCases(t *testing.T) {
 	}
 
 	t.Logf("Successfully completed ManageSieve edge cases test")
+}
+
+func TestManageSieveScriptNameWithSpaces(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupManageSieveServer(t)
+	defer server.Close()
+
+	// Connect and authenticate
+	conn, err := net.Dial("tcp", server.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect to ManageSieve server: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	// Authenticate
+	authenticateManageSieve(t, reader, writer, account)
+
+	// Test 1: Verify script names WITHOUT spaces work (baseline)
+	t.Log("=== Testing PUTSCRIPT with script name without spaces (baseline) ===")
+	scriptContent := `require ["fileinto"]; fileinto "INBOX";`
+	if err := putScriptWithLiteral(t, reader, writer, "vacation", scriptContent); err != nil {
+		t.Fatalf("PUTSCRIPT without spaces should work: %v", err)
+	} else {
+		t.Logf("Successfully created script without spaces in name")
+	}
+
+	// Clean up baseline test
+	sendCommand(t, writer, "DELETESCRIPT \"vacation\"")
+	readSimpleResponse(t, reader)
+
+	// Test 2: PUTSCRIPT with script name containing spaces
+	t.Log("=== Testing PUTSCRIPT with script name containing spaces ===")
+	if err := putScriptWithLiteral(t, reader, writer, "my vacation script", scriptContent); err != nil {
+		t.Errorf("PUTSCRIPT with spaces in name should succeed: %v", err)
+	} else {
+		t.Logf("Successfully created script with spaces in name")
+	}
+
+	// Test 2: LISTSCRIPTS - should show the script with spaces
+	t.Log("=== Testing LISTSCRIPTS shows script with spaces ===")
+	sendCommand(t, writer, "LISTSCRIPTS")
+	listResponse := readListScriptsResponse(t, reader)
+	if !strings.Contains(listResponse, "my vacation script") {
+		t.Errorf("LISTSCRIPTS should show script with spaces: %s", listResponse)
+	} else {
+		t.Logf("LISTSCRIPTS correctly shows script with spaces")
+	}
+
+	// Test 3: GETSCRIPT with script name containing spaces
+	t.Log("=== Testing GETSCRIPT with script name containing spaces ===")
+	sendCommand(t, writer, "GETSCRIPT \"my vacation script\"")
+	response := readGetScriptResponse(t, reader)
+	if strings.HasPrefix(response, "NO") {
+		t.Errorf("GETSCRIPT with spaces in name should succeed: %s", response)
+	} else {
+		t.Logf("Successfully retrieved script with spaces in name")
+	}
+
+	// Test 4: SETACTIVE with script name containing spaces
+	t.Log("=== Testing SETACTIVE with script name containing spaces ===")
+	sendCommand(t, writer, "SETACTIVE \"my vacation script\"")
+	response = readSimpleResponse(t, reader)
+	if !strings.Contains(response, "OK") {
+		t.Errorf("SETACTIVE with spaces in name should succeed: %s", response)
+	} else {
+		t.Logf("Successfully activated script with spaces in name")
+	}
+
+	// Test 5: Verify script is active
+	t.Log("=== Verifying script with spaces is active ===")
+	sendCommand(t, writer, "LISTSCRIPTS")
+	listResponse = readListScriptsResponse(t, reader)
+	if !strings.Contains(listResponse, "my vacation script") || !strings.Contains(listResponse, "ACTIVE") {
+		t.Logf("Warning: LISTSCRIPTS may not clearly show ACTIVE status: %s", listResponse)
+	} else {
+		t.Logf("Script with spaces is active: %s", listResponse)
+	}
+
+	// Test 6: DELETESCRIPT with script name containing spaces
+	t.Log("=== Testing DELETESCRIPT with script name containing spaces ===")
+	sendCommand(t, writer, "DELETESCRIPT \"my vacation script\"")
+	response = readSimpleResponse(t, reader)
+	if !strings.Contains(response, "OK") {
+		t.Errorf("DELETESCRIPT with spaces in name should succeed: %s", response)
+	} else {
+		t.Logf("Successfully deleted script with spaces in name")
+	}
+
+	// Test 7: Test script name with multiple spaces and special characters
+	t.Log("=== Testing script name with multiple spaces and special characters ===")
+	complexName := "my  complex  vacation  script  2024"
+	if err := putScriptWithLiteral(t, reader, writer, complexName, scriptContent); err != nil {
+		t.Errorf("PUTSCRIPT with complex name should succeed: %v", err)
+	} else {
+		t.Logf("Successfully created script with complex name")
+	}
+
+	// Clean up
+	sendCommand(t, writer, fmt.Sprintf("DELETESCRIPT \"%s\"", complexName))
+	readSimpleResponse(t, reader)
+
+	t.Logf("Successfully completed script name with spaces test")
+}
+
+// Helper function to upload a script using literal format
+func putScriptWithLiteral(t *testing.T, reader *bufio.Reader, writer *bufio.Writer, scriptName, scriptContent string) error {
+	t.Helper()
+
+	// Send PUTSCRIPT command with literal format: PUTSCRIPT "name" {length+}
+	literalCommand := fmt.Sprintf("PUTSCRIPT \"%s\" {%d+}", scriptName, len(scriptContent))
+	writer.WriteString(literalCommand + "\r\n")
+	writer.Flush()
+
+	// Wait for continuation response (+)
+	continuationResponse, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("failed to read continuation response: %v", err)
+	}
+	continuationResponse = strings.TrimSpace(continuationResponse)
+	if !strings.HasPrefix(continuationResponse, "+") {
+		return fmt.Errorf("expected continuation response (+), got: %s", continuationResponse)
+	}
+
+	// Send the literal data
+	writer.WriteString(scriptContent)
+	writer.Flush()
+
+	// Read the final response
+	finalResponse, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("failed to read final response: %v", err)
+	}
+	finalResponse = strings.TrimSpace(finalResponse)
+	if !strings.HasPrefix(finalResponse, "OK") {
+		return fmt.Errorf("PUTSCRIPT failed: %s", finalResponse)
+	}
+
+	return nil
 }
 
 func TestManageSieveTLS(t *testing.T) {

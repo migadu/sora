@@ -149,6 +149,42 @@ func TestParseLine(t *testing.T) {
 			wantArgs: []string{"testuser@example.com"},
 			wantErr:  false,
 		},
+		{
+			name:     "ManageSieve PUTSCRIPT with script name containing spaces",
+			line:     `PUTSCRIPT "my vacation script" {43+}`,
+			hasTag:   false,
+			wantTag:  "",
+			wantCmd:  "PUTSCRIPT",
+			wantArgs: []string{`"my vacation script"`, `{43+}`},
+			wantErr:  false,
+		},
+		{
+			name:     "ManageSieve GETSCRIPT with script name containing spaces",
+			line:     `GETSCRIPT "my vacation script"`,
+			hasTag:   false,
+			wantTag:  "",
+			wantCmd:  "GETSCRIPT",
+			wantArgs: []string{`"my vacation script"`},
+			wantErr:  false,
+		},
+		{
+			name:     "ManageSieve SETACTIVE with script name containing spaces",
+			line:     `SETACTIVE "my vacation script"`,
+			hasTag:   false,
+			wantTag:  "",
+			wantCmd:  "SETACTIVE",
+			wantArgs: []string{`"my vacation script"`},
+			wantErr:  false,
+		},
+		{
+			name:     "ManageSieve DELETESCRIPT with script name containing spaces",
+			line:     `DELETESCRIPT "my vacation script"`,
+			hasTag:   false,
+			wantTag:  "",
+			wantCmd:  "DELETESCRIPT",
+			wantArgs: []string{`"my vacation script"`},
+			wantErr:  false,
+		},
 	}
 
 	for _, tt := range tests {

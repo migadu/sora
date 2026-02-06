@@ -120,8 +120,18 @@ func (s *ManageSieveSession) handleConnection() {
 			continue
 		}
 
-		parts := strings.SplitN(line, " ", 3)
-		command := strings.ToUpper(parts[0])
+		// Use proper command parser that handles quoted strings with spaces
+		// ManageSieve doesn't use tags, so hasTag=false
+		_, command, args, parseErr := server.ParseLine(line, false)
+		if parseErr != nil {
+			s.sendResponse(fmt.Sprintf("NO Invalid command syntax: %v\r\n", parseErr))
+			continue
+		}
+
+		// For backward compatibility, create parts array (command + args)
+		parts := make([]string, 0, len(args)+1)
+		parts = append(parts, command)
+		parts = append(parts, args...)
 
 		// If debug logging is active, it might log the raw command.
 		// This ensures that if any such logging exists, it will be of a masked line.
