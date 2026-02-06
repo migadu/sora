@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/emersion/go-message"
 	"github.com/foxcpp/go-sieve"
 	"github.com/foxcpp/go-sieve/interp"
 	"github.com/migadu/sora/server/managesieve"
@@ -387,181 +388,76 @@ func ApplyHeaderEdits(messageBytes []byte, edits []HeaderEdit) ([]byte, error) {
 		return messageBytes, nil
 	}
 
-	// Find the header/body boundary
-	headerEndIndex := bytes.Index(messageBytes, []byte("\r\n\r\n"))
-	if headerEndIndex == -1 {
-		// No clear boundary, treat entire message as headers
-		headerEndIndex = len(messageBytes)
+	// Parse message using go-message
+	entity, err := message.Read(bytes.NewReader(messageBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse message: %w", err)
 	}
 
-	headerBytes := messageBytes[:headerEndIndex]
-	bodyBytes := messageBytes[headerEndIndex:]
-
-	// Parse headers into a map
-	headers := parseHeaders(headerBytes)
-
-	// Apply edits in order
+	// Apply header edits
 	for _, edit := range edits {
-		fieldNameLower := strings.ToLower(edit.FieldName)
-
 		switch edit.Action {
 		case "add":
-			// Add header (at beginning or end based on Last flag)
-			headerLine := edit.FieldName + ": " + edit.Value
 			if edit.Last {
-				headers[fieldNameLower] = append(headers[fieldNameLower], headerLine)
+				// Add at the end - go-message naturally adds to the end
+				entity.Header.Add(edit.FieldName, edit.Value)
 			} else {
-				headers[fieldNameLower] = append([]string{headerLine}, headers[fieldNameLower]...)
+				// Add at the beginning - need to preserve existing and prepend
+				existingValues := entity.Header.Values(edit.FieldName)
+				entity.Header.Del(edit.FieldName)
+				entity.Header.Add(edit.FieldName, edit.Value)
+				for _, v := range existingValues {
+					entity.Header.Add(edit.FieldName, v)
+				}
 			}
 
 		case "delete":
-			values := headers[fieldNameLower]
-			if len(values) == 0 {
-				continue
-			}
-
 			if edit.Index > 0 {
 				// Delete specific index
+				values := entity.Header.Values(edit.FieldName)
+				if len(values) == 0 {
+					continue
+				}
+
 				idx := edit.Index - 1
 				if edit.Last {
 					idx = len(values) - edit.Index
 				}
+
 				if idx >= 0 && idx < len(values) {
-					headers[fieldNameLower] = append(values[:idx], values[idx+1:]...)
-				}
-			} else if edit.Value != "" {
-				// Delete first matching value
-				newValues := make([]string, 0, len(values))
-				deleted := false
-				for _, line := range values {
-					// Extract value part after ": "
-					colonIdx := strings.Index(line, ": ")
-					if colonIdx == -1 {
-						newValues = append(newValues, line)
-						continue
+					entity.Header.Del(edit.FieldName)
+					for i, v := range values {
+						if i != idx {
+							entity.Header.Add(edit.FieldName, v)
+						}
 					}
-					lineValue := line[colonIdx+2:]
-					if !deleted && lineValue == edit.Value {
+				}
+
+			} else if edit.Value != "" {
+				// Delete first occurrence matching value
+				values := entity.Header.Values(edit.FieldName)
+				entity.Header.Del(edit.FieldName)
+				deleted := false
+				for _, v := range values {
+					if !deleted && v == edit.Value {
 						deleted = true
 						continue
 					}
-					newValues = append(newValues, line)
+					entity.Header.Add(edit.FieldName, v)
 				}
-				headers[fieldNameLower] = newValues
+
 			} else {
 				// Delete all occurrences
-				delete(headers, fieldNameLower)
+				entity.Header.Del(edit.FieldName)
 			}
 		}
 	}
 
-	// Reconstruct message
+	// Write modified message back to bytes
 	var buf bytes.Buffer
-
-	// Write headers in consistent order (preserving original order where possible)
-	// Parse original header order
-	originalOrder := extractHeaderOrder(headerBytes)
-	written := make(map[string]bool)
-
-	// Write headers in original order first
-	for _, fieldName := range originalOrder {
-		fieldNameLower := strings.ToLower(fieldName)
-		if lines, ok := headers[fieldNameLower]; ok {
-			for _, line := range lines {
-				buf.WriteString(line)
-				buf.WriteString("\r\n")
-			}
-			written[fieldNameLower] = true
-		}
+	if err := entity.WriteTo(&buf); err != nil {
+		return nil, fmt.Errorf("failed to write modified message: %w", err)
 	}
-
-	// Write any new headers that weren't in original
-	for fieldNameLower, lines := range headers {
-		if !written[fieldNameLower] {
-			for _, line := range lines {
-				buf.WriteString(line)
-				buf.WriteString("\r\n")
-			}
-		}
-	}
-
-	// Write body
-	buf.Write(bodyBytes)
 
 	return buf.Bytes(), nil
-}
-
-// parseHeaders parses raw header bytes into a map[lowercase-name][]header-lines
-func parseHeaders(headerBytes []byte) map[string][]string {
-	headers := make(map[string][]string)
-	lines := bytes.Split(headerBytes, []byte("\r\n"))
-
-	var currentFieldName string
-	var currentLine string
-
-	for _, line := range lines {
-		lineStr := string(line)
-
-		// Check if this is a continuation line (starts with space or tab)
-		if len(lineStr) > 0 && (lineStr[0] == ' ' || lineStr[0] == '\t') {
-			if currentFieldName != "" {
-				currentLine += "\r\n" + lineStr
-			}
-			continue
-		}
-
-		// Save previous header if any
-		if currentFieldName != "" {
-			fieldNameLower := strings.ToLower(currentFieldName)
-			headers[fieldNameLower] = append(headers[fieldNameLower], currentLine)
-		}
-
-		// Parse new header
-		colonIdx := strings.Index(lineStr, ":")
-		if colonIdx == -1 {
-			currentFieldName = ""
-			currentLine = ""
-			continue
-		}
-
-		currentFieldName = lineStr[:colonIdx]
-		currentLine = lineStr
-	}
-
-	// Save last header
-	if currentFieldName != "" {
-		fieldNameLower := strings.ToLower(currentFieldName)
-		headers[fieldNameLower] = append(headers[fieldNameLower], currentLine)
-	}
-
-	return headers
-}
-
-// extractHeaderOrder extracts the order of header field names from raw header bytes
-func extractHeaderOrder(headerBytes []byte) []string {
-	var order []string
-	seen := make(map[string]bool)
-	lines := bytes.Split(headerBytes, []byte("\r\n"))
-
-	for _, line := range lines {
-		lineStr := string(line)
-
-		// Skip continuation lines
-		if len(lineStr) > 0 && (lineStr[0] == ' ' || lineStr[0] == '\t') {
-			continue
-		}
-
-		colonIdx := strings.Index(lineStr, ":")
-		if colonIdx == -1 {
-			continue
-		}
-
-		fieldName := lineStr[:colonIdx]
-		if !seen[fieldName] {
-			order = append(order, fieldName)
-			seen[fieldName] = true
-		}
-	}
-
-	return order
 }
