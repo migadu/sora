@@ -17,7 +17,6 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-smtp"
-	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -52,16 +51,17 @@ func (s *LMTPSession) sendToExternalRelay(from string, to string, message []byte
 // LMTPSession represents a single LMTP session.
 type LMTPSession struct {
 	server.Session
-	backend     *LMTPServerBackend
-	sender      *server.Address
-	conn        *smtp.Conn
-	cancel      context.CancelFunc
-	ctx         context.Context
-	mutex       sync.RWMutex
-	mutexHelper *server.MutexTimeoutHelper
-	releaseConn func() // Function to release connection from limiter
-	useMasterDB bool   // Pin session to master DB after a write to ensure consistency
-	startTime   time.Time
+	backend       *LMTPServerBackend
+	sender        *server.Address
+	recipientAddr *server.Address // Original recipient address (may include +detail)
+	conn          *smtp.Conn
+	cancel        context.CancelFunc
+	ctx           context.Context
+	mutex         sync.RWMutex
+	mutexHelper   *server.MutexTimeoutHelper
+	releaseConn   func() // Function to release connection from limiter
+	useMasterDB   bool   // Pin session to master DB after a write to ensure consistency
+	startTime     time.Time
 }
 
 func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
@@ -162,30 +162,24 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	var AccountID int64
-	err = s.backend.rdb.QueryRowWithRetry(readCtx, `
-		SELECT c.account_id
-		FROM credentials c
-		JOIN accounts a ON c.account_id = a.id
-		WHERE LOWER(c.address) = $1 AND a.deleted_at IS NULL
-	`, lookupAddress).Scan(&AccountID)
+	// Look up account ID by credential address (excluding deleted accounts)
+	AccountID, err := s.backend.rdb.GetActiveAccountIDByAddressWithRetry(readCtx, lookupAddress)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// User not found - permanent failure
+		if errors.Is(err, consts.ErrUserNotFound) {
+			// User not found or account deleted - permanent failure
 			s.DebugLog("user not found", "address", lookupAddress)
 			return &smtp.SMTPError{
 				Code:         550,
 				EnhancedCode: smtp.EnhancedCode{5, 1, 1},
 				Message:      "No such user here",
 			}
-		} else {
-			// Database error (connection failure, timeout, etc.) - temporary failure
-			s.WarnLog("database error during user lookup", "address", lookupAddress, "error", err)
-			return &smtp.SMTPError{
-				Code:         451,
-				EnhancedCode: smtp.EnhancedCode{4, 4, 3},
-				Message:      "Temporary failure, please try again later",
-			}
+		}
+		// Database error (connection failure, timeout, etc.) - temporary failure
+		s.WarnLog("database error during user lookup", "address", lookupAddress, "error", err)
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 4, 3},
+			Message:      "Temporary failure, please try again later",
 		}
 	}
 
@@ -220,6 +214,23 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	}
 	defer release()
 	s.User = server.NewUser(primaryAddr, AccountID) // Always use primary address
+
+	// Construct envelope recipient address for Sieve:
+	// - If original recipient has +detail, preserve it but use primary address domain
+	// - This handles both direct delivery (user+detail@domain) and aliases (alias+detail@otherdomain)
+	envelopeRecipient := toAddress
+	if toAddress.Detail() != "" && toAddress.BaseAddress() != primaryAddr.BaseAddress() {
+		// Alias with +detail: construct primaryUser+detail@primaryDomain
+		primaryWithDetail, err := server.NewAddress(primaryAddr.LocalPart() + "+" + toAddress.Detail() + "@" + primaryAddr.Domain())
+		if err != nil {
+			// Fallback to original if construction fails
+			s.WarnLog("failed to construct envelope address with detail", "error", err)
+		} else {
+			envelopeRecipient = primaryWithDetail
+		}
+	}
+	s.recipientAddr = &envelopeRecipient // Store for Sieve envelope (with +detail preserved on primary address)
+
 	// Pin the session to the master DB to prevent reading stale data from a replica.
 	s.useMasterDB = true
 
@@ -378,9 +389,14 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	}
 
 	// Create the sieve context (used for both default and user scripts)
+	// Use recipientAddr (original RCPT TO with +detail) for envelope, not primary address
+	envelopeTo := s.User.Address.FullAddress()
+	if s.recipientAddr != nil {
+		envelopeTo = s.recipientAddr.FullAddress()
+	}
 	sieveCtx := sieveengine.Context{
 		EnvelopeFrom: s.sender.FullAddress(),
-		EnvelopeTo:   s.User.Address.FullAddress(),
+		EnvelopeTo:   envelopeTo,
 		Header:       messageContent.Header.Map(),
 		Body:         *plaintextBody,
 	}

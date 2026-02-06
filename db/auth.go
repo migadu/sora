@@ -377,6 +377,34 @@ func (db *Database) GetAccountIDByAddress(ctx context.Context, address string) (
 	return accountID, nil
 }
 
+// GetActiveAccountIDByAddress retrieves the account ID for a given credential address,
+// ensuring the account is not deleted. This is the preferred method for LMTP/SMTP
+// recipient validation where we need to reject deleted accounts.
+func (db *Database) GetActiveAccountIDByAddress(ctx context.Context, address string) (int64, error) {
+	var accountID int64
+	normalizedAddress := strings.ToLower(strings.TrimSpace(address))
+
+	if normalizedAddress == "" {
+		return 0, errors.New("address cannot be empty")
+	}
+
+	// Query credentials with account deletion check
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT c.account_id
+		FROM credentials c
+		JOIN accounts a ON c.account_id = a.id
+		WHERE LOWER(c.address) = $1 AND a.deleted_at IS NULL
+	`, normalizedAddress).Scan(&accountID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, consts.ErrUserNotFound
+		}
+		logger.Error("Database: error fetching active account ID", "address", normalizedAddress, "err", err)
+		return 0, fmt.Errorf("database error fetching active account ID: %w", err)
+	}
+	return accountID, nil
+}
+
 // decodePasswordData handles prefix checking and decoding for common hash formats.
 // It returns the raw decoded data.
 func decodePasswordData(hashedPassword, pB64, pB64Explicit, pHex string) (data []byte, err error) {

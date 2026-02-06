@@ -98,6 +98,20 @@ func (rd *ResilientDatabase) GetAccountIDByAddressWithRetry(ctx context.Context,
 	return result.(int64), nil
 }
 
+// GetActiveAccountIDByAddressWithRetry retrieves the account ID for a credential address
+// with retry logic, ensuring the account is not deleted. This is the preferred method for
+// LMTP/SMTP recipient validation.
+func (rd *ResilientDatabase) GetActiveAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetActiveAccountIDByAddress(ctx, address)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrUserNotFound)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
+}
+
 func (rd *ResilientDatabase) CreateDefaultMailboxesWithRetry(ctx context.Context, AccountID int64) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).CreateDefaultMailboxes(ctx, tx, AccountID)
