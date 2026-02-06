@@ -36,6 +36,9 @@ var SupportedExtensions = []string{
 	"regex",      // draft-murchison-sieve-regex - Regular expression match type
 	"date",       // RFC 5260 - Date and index extensions - date test
 	"index",      // RFC 5260 - Date and index extensions - header indexing
+	"editheader", // RFC 5293 - Editheader extension - add/delete headers
+	"mailbox",    // RFC 5490 - Mailbox existence test
+	"subaddress", // RFC 5233 - Subaddress extension (user+detail@domain)
 }
 
 // ValidateExtensions checks if the provided extensions are supported by go-sieve.

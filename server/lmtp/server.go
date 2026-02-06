@@ -229,8 +229,12 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	backend.sieveCache = NewSieveScriptCache(100, 5*time.Minute, options.SieveExtensions)
 
 	// Parse and cache the default Sieve script at startup
-	// The default script uses fileinto extension, so we need to allow it
-	defaultExecutor, err := sieveengine.NewSieveExecutorWithExtensions(defaultSieveScript, []string{"fileinto"})
+	// Use the same extensions as configured for user scripts (or all if not specified)
+	defaultExtensions := options.SieveExtensions
+	if len(defaultExtensions) == 0 {
+		defaultExtensions = sieveengine.DefaultSieveExtensions
+	}
+	defaultExecutor, err := sieveengine.NewSieveExecutorWithExtensions(defaultSieveScript, defaultExtensions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse default Sieve script: %w", err)
 	}

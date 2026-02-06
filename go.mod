@@ -33,7 +33,7 @@ require (
 )
 
 // Use forked versions until upstreams are updated
-replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20260205165323-e27a093d6315
+replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20260206073348-d47e90518da5
 
 replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20260128111640-3fb460c84dc0
 
