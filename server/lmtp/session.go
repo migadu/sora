@@ -358,30 +358,9 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 
-	// Store message locally for background upload to S3
-	// Check if file already exists to prevent race condition:
-	// If a duplicate arrives while uploader is processing the first copy,
-	// we don't want to overwrite/delete the file the uploader is reading.
-	expectedPath := s.backend.uploader.FilePath(contentHash, s.AccountID())
-	var filePath *string
-	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
-		// File doesn't exist, safe to write
-		filePath, err = s.backend.uploader.StoreLocally(contentHash, s.AccountID(), fullMessageBytes)
-		if err != nil {
-			return s.InternalError("failed to save message to disk: %v", err)
-		}
-		s.DebugLog("message accepted locally", "path", *filePath)
-	} else if err == nil {
-		// File already exists (likely being processed by uploader or concurrent duplicate delivery)
-		// Don't overwrite it, and don't set filePath so we won't try to delete it later
-		filePath = nil
-		s.DebugLog("message file already exists, skipping write (concurrent delivery)", "path", expectedPath)
-	} else {
-		// Stat error (permission issue, etc.)
-		return s.InternalError("failed to check file existence: %v", err)
-	}
-
-	// SIEVE script processing
+	// SIEVE script processing (BEFORE storing locally)
+	// We need to run Sieve and apply header edits BEFORE storing the message,
+	// so that the stored file has the modified headers
 
 	// Create a context for read operations that respects session pinning
 	readCtx := s.ctx
@@ -499,6 +478,67 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		}
 	}
 
+	// Apply header edits if any (RFC 5293 - editheader extension)
+	if len(result.HeaderEdits) > 0 {
+		s.DebugLog("applying header edits", "count", len(result.HeaderEdits))
+		modifiedBytes, err := sieveengine.ApplyHeaderEdits(fullMessageBytes, result.HeaderEdits)
+		if err != nil {
+			s.WarnLog("failed to apply header edits", "error", err)
+			// Continue with original message on error
+		} else {
+			// Update fullMessageBytes with modified version
+			fullMessageBytes = modifiedBytes
+			// Recalculate content hash with modified message
+			contentHash = helpers.HashContent(fullMessageBytes)
+			// Re-parse message content for updated headers
+			messageContent, err = server.ParseMessage(bytes.NewReader(fullMessageBytes))
+			if err != nil {
+				s.WarnLog("failed to re-parse message after header edits", "error", err)
+				// Continue with what we have
+			} else {
+				// Update extracted header data
+				mailHeader = mail.Header{Header: messageContent.Header}
+				subject, _ = mailHeader.Subject()
+				messageID, _ = mailHeader.MessageID()
+				sentDate, _ = mailHeader.Date()
+				inReplyTo, _ = mailHeader.MsgIDList("In-Reply-To")
+				if sentDate.IsZero() {
+					sentDate = time.Now()
+				}
+				// Update raw headers text
+				headerEndIndex = bytes.Index(fullMessageBytes, []byte("\r\n\r\n"))
+				if headerEndIndex != -1 {
+					rawHeadersText = string(fullMessageBytes[:headerEndIndex])
+				}
+				s.DebugLog("message headers updated after edits", "content_hash", contentHash)
+			}
+		}
+	}
+
+	// Store message locally for background upload to S3
+	// This happens AFTER Sieve processing and header edits, so we store the modified message
+	// Check if file already exists to prevent race condition:
+	// If a duplicate arrives while uploader is processing the first copy,
+	// we don't want to overwrite/delete the file the uploader is reading.
+	expectedPath := s.backend.uploader.FilePath(contentHash, s.AccountID())
+	var filePath *string
+	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
+		// File doesn't exist, safe to write
+		filePath, err = s.backend.uploader.StoreLocally(contentHash, s.AccountID(), fullMessageBytes)
+		if err != nil {
+			return s.InternalError("failed to save message to disk: %v", err)
+		}
+		s.DebugLog("message accepted locally", "path", *filePath)
+	} else if err == nil {
+		// File already exists (likely being processed by uploader or concurrent duplicate delivery)
+		// Don't overwrite it, and don't set filePath so we won't try to delete it later
+		filePath = nil
+		s.DebugLog("message file already exists, skipping write (concurrent delivery)", "path", expectedPath)
+	} else {
+		// Stat error (permission issue, etc.)
+		return s.InternalError("failed to check file existence: %v", err)
+	}
+
 	s.DebugLog("executing sieve action", "action", result.Action)
 
 	switch result.Action {
@@ -511,9 +551,9 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		if result.Copy {
 			s.DebugLog("sieve fileinto :copy action", "mailbox", mailboxName)
 
-			// First save to the specified mailbox
+			// First save to the specified mailbox (with :create if specified)
 			err := s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
-				subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
+				subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText, result.CreateMailbox)
 			if err != nil {
 				// Allow duplicates (message already in target mailbox)
 				if !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -525,9 +565,9 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			// Then save to INBOX (for the :copy functionality)
 			s.DebugLog("saving copy to inbox due to :copy modifier")
 
-			// Call saveMessageToMailbox again for INBOX
+			// Call saveMessageToMailbox again for INBOX (no :create for INBOX - it always exists)
 			err = s.saveMessageToMailbox(consts.MailboxInbox, fullMessageBytes, contentHash,
-				subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
+				subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText, false)
 			if err != nil {
 				// Allow duplicates (message already in INBOX)
 				if !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -591,8 +631,10 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	}
 
 	// Save the message to the determined mailbox (either the specified one or INBOX)
+	// For fileinto actions without :copy, pass the :create flag if specified
+	createMailbox := result.Action == sieveengine.ActionFileInto && result.CreateMailbox
 	err = s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
-		subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText)
+		subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText, createMailbox)
 	if err != nil {
 		// Handle duplicate messages (acceptable in LMTP - return success)
 		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -803,7 +845,7 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 	fullMessageBytes []byte, contentHash string, subject string, messageID string,
 	sentDate time.Time, inReplyTo []string, bodyStructure *imap.BodyStructure,
-	plaintextBody *string, recipients []helpers.Recipient, rawHeadersText string) error {
+	plaintextBody *string, recipients []helpers.Recipient, rawHeadersText string, createMailbox bool) error {
 
 	// Create a context for read operations that respects session pinning
 	readCtx := s.ctx
@@ -811,16 +853,29 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
-	mailbox, err := s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), mailboxName)
-	if err != nil {
-		if err == consts.ErrMailboxNotFound {
-			s.WarnLog("mailbox not found, falling back to inbox", "mailbox", mailboxName)
-			mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
-			if err != nil {
-				return fmt.Errorf("failed to get INBOX mailbox: %v", err)
+	// If :create flag is set, use GetOrCreateMailboxByNameWithRetry
+	var mailbox *db.DBMailbox
+	var err error
+	if createMailbox {
+		s.DebugLog("creating mailbox if it doesn't exist", "mailbox", mailboxName)
+		mailbox, err = s.backend.rdb.GetOrCreateMailboxByNameWithRetry(s.ctx, s.AccountID(), mailboxName)
+		if err != nil {
+			return fmt.Errorf("failed to get or create mailbox '%s': %v", mailboxName, err)
+		}
+		s.DebugLog("mailbox ready for delivery", "mailbox", mailboxName, "mailbox_id", mailbox.ID)
+	} else {
+		// Normal behavior: get mailbox, fallback to INBOX if not found
+		mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), mailboxName)
+		if err != nil {
+			if err == consts.ErrMailboxNotFound {
+				s.WarnLog("mailbox not found, falling back to inbox", "mailbox", mailboxName)
+				mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
+				if err != nil {
+					return fmt.Errorf("failed to get INBOX mailbox: %v", err)
+				}
+			} else {
+				return fmt.Errorf("failed to get mailbox '%s': %v", mailboxName, err)
 			}
-		} else {
-			return fmt.Errorf("failed to get mailbox '%s': %v", mailboxName, err)
 		}
 	}
 

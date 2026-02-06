@@ -1,6 +1,7 @@
 package sieveengine
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -25,6 +26,15 @@ const (
 // The canonical list is maintained in server/managesieve/capabilities.go
 var DefaultSieveExtensions = managesieve.SupportedExtensions
 
+// HeaderEdit represents a header modification from editheader extension
+type HeaderEdit struct {
+	Action    string // "add" or "delete"
+	FieldName string
+	Value     string
+	Last      bool // for addheader: add at end; for deleteheader: count from end
+	Index     int  // for deleteheader: specific index (0 means all)
+}
+
 type Result struct {
 	Action         Action
 	Mailbox        string            // used for fileinto
@@ -35,6 +45,8 @@ type Result struct {
 	VacationMsg    string            // used for vacation - message body
 	VacationIsMime bool              // used for vacation - is MIME message
 	Copy           bool              // RFC3894 - :copy modifier for redirect and fileinto
+	CreateMailbox  bool              // RFC5490 - :create modifier (mailbox extension)
+	HeaderEdits    []HeaderEdit      // RFC5293 - editheader extension (addheader/deleteheader)
 	Additional     map[string]string // future-proofing
 }
 
@@ -175,6 +187,18 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		// With normal fileinto (no :copy), ImplicitKeep would be false, but an explicit keep
 		// after fileinto should still save a copy to INBOX
 		result.Copy = data.ImplicitKeep || data.Keep
+
+		// Check if :create modifier was used (RFC 5490 - mailbox extension)
+		// MailboxesCreate contains mailboxes that should be created if they don't exist
+		if len(data.MailboxesCreate) > 0 {
+			// Check if the target mailbox should be created
+			for _, createMailbox := range data.MailboxesCreate {
+				if createMailbox == result.Mailbox {
+					result.CreateMailbox = true
+					break
+				}
+			}
+		}
 	} else if len(data.RedirectAddr) > 0 {
 		// Handle redirect action (takes precedence over vacation)
 		// Use the first redirect address (we could support multiple redirects in the future)
@@ -220,6 +244,20 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 	// Handle flags
 	if len(data.Flags) > 0 {
 		result.Flags = data.Flags
+	}
+
+	// Handle header edits (RFC 5293 - editheader extension)
+	if len(data.HeaderEdits) > 0 {
+		result.HeaderEdits = make([]HeaderEdit, len(data.HeaderEdits))
+		for i, edit := range data.HeaderEdits {
+			result.HeaderEdits[i] = HeaderEdit{
+				Action:    edit.Action,
+				FieldName: edit.FieldName,
+				Value:     edit.Value,
+				Last:      edit.Last,
+				Index:     edit.Index,
+			}
+		}
 	}
 
 	return result, nil
@@ -340,4 +378,190 @@ func (m *SieveMessage) HeaderGet(key string) ([]string, error) {
 
 func (m *SieveMessage) MessageSize() int {
 	return m.Size
+}
+
+// ApplyHeaderEdits applies header modifications to raw message bytes (RFC 5293)
+// Returns the modified message bytes with header edits applied
+func ApplyHeaderEdits(messageBytes []byte, edits []HeaderEdit) ([]byte, error) {
+	if len(edits) == 0 {
+		return messageBytes, nil
+	}
+
+	// Find the header/body boundary
+	headerEndIndex := bytes.Index(messageBytes, []byte("\r\n\r\n"))
+	if headerEndIndex == -1 {
+		// No clear boundary, treat entire message as headers
+		headerEndIndex = len(messageBytes)
+	}
+
+	headerBytes := messageBytes[:headerEndIndex]
+	bodyBytes := messageBytes[headerEndIndex:]
+
+	// Parse headers into a map
+	headers := parseHeaders(headerBytes)
+
+	// Apply edits in order
+	for _, edit := range edits {
+		fieldNameLower := strings.ToLower(edit.FieldName)
+
+		switch edit.Action {
+		case "add":
+			// Add header (at beginning or end based on Last flag)
+			headerLine := edit.FieldName + ": " + edit.Value
+			if edit.Last {
+				headers[fieldNameLower] = append(headers[fieldNameLower], headerLine)
+			} else {
+				headers[fieldNameLower] = append([]string{headerLine}, headers[fieldNameLower]...)
+			}
+
+		case "delete":
+			values := headers[fieldNameLower]
+			if len(values) == 0 {
+				continue
+			}
+
+			if edit.Index > 0 {
+				// Delete specific index
+				idx := edit.Index - 1
+				if edit.Last {
+					idx = len(values) - edit.Index
+				}
+				if idx >= 0 && idx < len(values) {
+					headers[fieldNameLower] = append(values[:idx], values[idx+1:]...)
+				}
+			} else if edit.Value != "" {
+				// Delete first matching value
+				newValues := make([]string, 0, len(values))
+				deleted := false
+				for _, line := range values {
+					// Extract value part after ": "
+					colonIdx := strings.Index(line, ": ")
+					if colonIdx == -1 {
+						newValues = append(newValues, line)
+						continue
+					}
+					lineValue := line[colonIdx+2:]
+					if !deleted && lineValue == edit.Value {
+						deleted = true
+						continue
+					}
+					newValues = append(newValues, line)
+				}
+				headers[fieldNameLower] = newValues
+			} else {
+				// Delete all occurrences
+				delete(headers, fieldNameLower)
+			}
+		}
+	}
+
+	// Reconstruct message
+	var buf bytes.Buffer
+
+	// Write headers in consistent order (preserving original order where possible)
+	// Parse original header order
+	originalOrder := extractHeaderOrder(headerBytes)
+	written := make(map[string]bool)
+
+	// Write headers in original order first
+	for _, fieldName := range originalOrder {
+		fieldNameLower := strings.ToLower(fieldName)
+		if lines, ok := headers[fieldNameLower]; ok {
+			for _, line := range lines {
+				buf.WriteString(line)
+				buf.WriteString("\r\n")
+			}
+			written[fieldNameLower] = true
+		}
+	}
+
+	// Write any new headers that weren't in original
+	for fieldNameLower, lines := range headers {
+		if !written[fieldNameLower] {
+			for _, line := range lines {
+				buf.WriteString(line)
+				buf.WriteString("\r\n")
+			}
+		}
+	}
+
+	// Write body
+	buf.Write(bodyBytes)
+
+	return buf.Bytes(), nil
+}
+
+// parseHeaders parses raw header bytes into a map[lowercase-name][]header-lines
+func parseHeaders(headerBytes []byte) map[string][]string {
+	headers := make(map[string][]string)
+	lines := bytes.Split(headerBytes, []byte("\r\n"))
+
+	var currentFieldName string
+	var currentLine string
+
+	for _, line := range lines {
+		lineStr := string(line)
+
+		// Check if this is a continuation line (starts with space or tab)
+		if len(lineStr) > 0 && (lineStr[0] == ' ' || lineStr[0] == '\t') {
+			if currentFieldName != "" {
+				currentLine += "\r\n" + lineStr
+			}
+			continue
+		}
+
+		// Save previous header if any
+		if currentFieldName != "" {
+			fieldNameLower := strings.ToLower(currentFieldName)
+			headers[fieldNameLower] = append(headers[fieldNameLower], currentLine)
+		}
+
+		// Parse new header
+		colonIdx := strings.Index(lineStr, ":")
+		if colonIdx == -1 {
+			currentFieldName = ""
+			currentLine = ""
+			continue
+		}
+
+		currentFieldName = lineStr[:colonIdx]
+		currentLine = lineStr
+	}
+
+	// Save last header
+	if currentFieldName != "" {
+		fieldNameLower := strings.ToLower(currentFieldName)
+		headers[fieldNameLower] = append(headers[fieldNameLower], currentLine)
+	}
+
+	return headers
+}
+
+// extractHeaderOrder extracts the order of header field names from raw header bytes
+func extractHeaderOrder(headerBytes []byte) []string {
+	var order []string
+	seen := make(map[string]bool)
+	lines := bytes.Split(headerBytes, []byte("\r\n"))
+
+	for _, line := range lines {
+		lineStr := string(line)
+
+		// Skip continuation lines
+		if len(lineStr) > 0 && (lineStr[0] == ' ' || lineStr[0] == '\t') {
+			continue
+		}
+
+		colonIdx := strings.Index(lineStr, ":")
+		if colonIdx == -1 {
+			continue
+		}
+
+		fieldName := lineStr[:colonIdx]
+		if !seen[fieldName] {
+			order = append(order, fieldName)
+			seen[fieldName] = true
+		}
+	}
+
+	return order
 }
