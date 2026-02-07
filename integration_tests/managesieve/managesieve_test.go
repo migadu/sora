@@ -289,14 +289,12 @@ func TestManageSieveScriptDeactivation(t *testing.T) {
 	// Test 1: Create and activate a script
 	t.Log("=== Creating and activating a script ===")
 	vacationScript := `require ["vacation"]; if header :contains "subject" "vacation" { vacation "I'm on vacation"; }`
-	sendCommand(t, writer, fmt.Sprintf("PUTSCRIPT \"vacation\" %s", vacationScript))
-	response := readSimpleResponse(t, reader)
-	if !strings.Contains(response, "OK") {
-		t.Fatalf("PUTSCRIPT failed: %s", response)
+	if err := putScriptWithLiteral(t, reader, writer, "vacation", vacationScript); err != nil {
+		t.Fatalf("PUTSCRIPT failed: %v", err)
 	}
 
 	sendCommand(t, writer, "SETACTIVE \"vacation\"")
-	response = readSimpleResponse(t, reader)
+	response := readSimpleResponse(t, reader)
 	if !strings.Contains(response, "OK") {
 		t.Fatalf("SETACTIVE vacation failed: %s", response)
 	}
