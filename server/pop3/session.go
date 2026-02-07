@@ -431,7 +431,6 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			s.inboxMailboxID = inboxMailboxID.ID
-			s.authenticated = true
 			s.User = server.NewUser(*userAddress, accountID) // Initialize User for connection tracking
 			s.deleted = make(map[int]bool)                   // Initialize deletion map on authentication
 			s.useMasterDB = true                             // Pin session to master DB after a write to ensure consistency
@@ -450,6 +449,10 @@ func (s *POP3Session) handleConnection() {
 			// Track successful authentication
 			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
 			metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
+
+			// IMPORTANT: Set authenticated flag AFTER incrementing both counters to prevent race condition
+			// If session closes between counter increments and flag setting, cleanup won't decrement
+			s.authenticated = true
 
 			// Track domain and user connection activity
 			if s.User != nil {

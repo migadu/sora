@@ -312,7 +312,6 @@ func (s *ManageSieveSession) handleConnection() {
 			}
 			defer release()
 
-			s.authenticated = true
 			s.User = server.NewUser(address, accountID)
 
 			// Increment authenticated connections counter
@@ -329,6 +328,10 @@ func (s *ManageSieveSession) handleConnection() {
 			// Track successful authentication
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "success").Inc()
 			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve", s.server.name, s.server.hostname).Inc()
+
+			// IMPORTANT: Set authenticated flag AFTER incrementing both counters to prevent race condition
+			// If session closes between counter increments and flag setting, cleanup won't decrement
+			s.authenticated = true
 
 			// Track domain and user connection activity
 			if s.User != nil {
@@ -1338,7 +1341,6 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	}
 	defer release()
 
-	s.authenticated = true
 	s.User = server.NewUser(*targetAddress, accountID)
 
 	// Increment authenticated connections counter
@@ -1356,6 +1358,10 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "success").Inc()
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve", s.server.name, s.server.hostname).Inc()
 	metrics.CriticalOperationDuration.WithLabelValues("managesieve_authentication").Observe(time.Since(start).Seconds())
+
+	// IMPORTANT: Set authenticated flag AFTER incrementing both counters to prevent race condition
+	// If session closes between counter increments and flag setting, cleanup won't decrement
+	s.authenticated = true
 
 	// Register connection for tracking
 	s.registerConnection(targetAddress.FullAddress())

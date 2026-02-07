@@ -121,8 +121,6 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						return s.internalError("failed to get primary email: %v", primErr)
 					}
 
-					s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
-					s.Session.User = &s.IMAPUser.User
 					// Ensure default mailboxes for the impersonated user
 					if dbErr := s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, AccountID); dbErr != nil {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
@@ -141,6 +139,11 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+
+					// IMPORTANT: Set user state AFTER incrementing both counters to prevent race condition
+					// If session closes between counter increments and user state setting, cleanup won't decrement
+					s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
+					s.Session.User = &s.IMAPUser.User
 
 					// Trigger cache warmup for the authenticated user (if configured)
 					s.triggerCacheWarmup()
@@ -232,8 +235,6 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						return s.internalError("failed to get primary email: %v", primErr)
 					}
 
-					s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
-					s.Session.User = &s.IMAPUser.User
 					// Ensure default mailboxes for the impersonated user
 					if dbErr := s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, AccountID); dbErr != nil {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
@@ -252,6 +253,11 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 					metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
 					metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+
+					// IMPORTANT: Set user state AFTER incrementing both counters to prevent race condition
+					// If session closes between counter increments and user state setting, cleanup won't decrement
+					s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
+					s.Session.User = &s.IMAPUser.User
 
 					// Trigger cache warmup for the authenticated user (if configured)
 					s.triggerCacheWarmup()

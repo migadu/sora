@@ -112,9 +112,6 @@ func (s *IMAPSession) Login(address, password string) error {
 				return s.internalError("failed to get primary email: %v", err)
 			}
 
-			s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
-			s.Session.User = &s.IMAPUser.User
-
 			s.server.authenticatedConnections.Add(1)
 			duration := time.Since(authStart)
 
@@ -129,6 +126,11 @@ func (s *IMAPSession) Login(address, password string) error {
 			// Prometheus metrics - successful authentication
 			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
 			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+
+			// IMPORTANT: Set user state AFTER incrementing both counters to prevent race condition
+			// If session closes between counter increments and user state setting, cleanup won't decrement
+			s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
+			s.Session.User = &s.IMAPUser.User
 
 			// Record successful authentication
 			if s.server.authLimiter != nil {
@@ -224,9 +226,6 @@ func (s *IMAPSession) Login(address, password string) error {
 		return s.internalError("failed to get primary email: %v", err)
 	}
 
-	s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
-	s.Session.User = &s.IMAPUser.User
-
 	s.server.authenticatedConnections.Add(1)
 	duration := time.Since(authStart)
 
@@ -241,6 +240,11 @@ func (s *IMAPSession) Login(address, password string) error {
 	// Prometheus metrics - successful authentication
 	metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "success").Inc()
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+
+	// IMPORTANT: Set user state AFTER incrementing both counters to prevent race condition
+	// If session closes between counter increments and user state setting, cleanup won't decrement
+	s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
+	s.Session.User = &s.IMAPUser.User
 
 	// Domain and user tracking
 	metrics.TrackDomainConnection("imap", addressParsed.Domain())
