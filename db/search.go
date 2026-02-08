@@ -515,8 +515,9 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		return nil, fmt.Errorf("getMessagesQueryExecutor: failed to scan messages: %w", err)
 	}
 
-	// Log warning if we hit the result limit (may indicate client needs to refine search)
-	if len(messages) >= resultLimit {
+	// Log warning if we hit the default result limit (may indicate client needs to refine search)
+	// Don't warn if caller explicitly requested this limit (limit > 0)
+	if limit == 0 && len(messages) >= resultLimit {
 		logger.Warn("Database: search query hit result limit", "limit", resultLimit, "mailbox_id", mailboxID, "complex", isComplexQuery, "message", "Client may need to use more specific search criteria")
 	}
 
