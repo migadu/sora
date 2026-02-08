@@ -374,7 +374,8 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 		}}
 
 		// Get the sorted messages (most recent first)
-		messages, err := db.GetMessagesSorted(ctx, mailbox.ID, criteria, sortCriteria)
+		// Limit to messageCount to avoid fetching too many messages
+		messages, err := db.GetMessagesSorted(ctx, mailbox.ID, criteria, sortCriteria, messageCount)
 		if err != nil {
 
 			log.Printf("WarmUp: failed to get recent messages for mailbox '%s': %v", mailboxName, err)

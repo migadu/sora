@@ -14,9 +14,11 @@ import (
 )
 
 const (
-	// MaxSearchResults limits search queries to prevent memory exhaustion on large mailboxes
-	// This is a safety limit - IMAP clients should use reasonable search criteria
-	MaxSearchResults = 1000
+	// MaxSearchResults is the default limit for SEARCH/SORT operations returning message metadata
+	// This includes full Message structs (subjects, recipients, body_structure, etc) but NOT message bodies
+	// Estimated ~2KB per message: 100k messages = ~200MB of memory for results
+	// IMAP FETCH is NOT limited by this - it uses GetMessagesByNumSet() which has no limit
+	MaxSearchResults = 100000
 
 	// MaxComplexSortResults limits expensive sorting operations (JSONB sorts, etc.)
 	// Lower limit due to per-row JSONB processing overhead
@@ -394,7 +396,7 @@ func (db *Database) needsComplexQuery(criteria *imap.SearchCriteria, orderByClau
 
 // getMessagesQueryExecutor is a helper function to execute the message retrieval query,
 // handling both default and custom sorting with optimized query selection.
-func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, orderByClause string) ([]Message, error) {
+func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, orderByClause string, limit int) ([]Message, error) {
 	paramCounter := 0
 
 	var finalQueryString string
@@ -406,16 +408,19 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 
 	// Determine appropriate result limit based on query complexity
 	isComplexQuery := db.needsComplexQuery(criteria, orderByClause)
-	if isComplexQuery {
+	if limit > 0 {
+		// Caller specified an explicit limit - use it
+		resultLimit = limit
+	} else if isComplexQuery {
 		// Complex queries (CTE, JSONB sorting) get lower limits due to processing overhead
 		if strings.Contains(strings.ToLower(orderByClause), "coalesce(") ||
 			strings.Contains(strings.ToLower(orderByClause), "jsonb_array_elements") {
-			resultLimit = MaxComplexSortResults // 1k for expensive JSONB sorting
+			resultLimit = MaxComplexSortResults // 500 for expensive JSONB sorting
 		} else {
-			resultLimit = MaxSearchResults // 5k for other complex queries (FTS, sequence)
+			resultLimit = MaxSearchResults // 100k for other complex queries (FTS, sequence)
 		}
 	} else {
-		resultLimit = MaxSearchResults // 5k for simple queries - reasonable for IMAP clients
+		resultLimit = MaxSearchResults // 100k for simple queries - reasonable for IMAP clients
 	}
 
 	// Use optimized query path when possible
@@ -518,8 +523,8 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 	return messages, nil
 }
 
-func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria) ([]Message, error) {
-	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, "") // Empty string triggers default sort
+func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, limit int) ([]Message, error) {
+	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, "", limit) // Empty string triggers default sort
 	if err != nil {
 		return nil, fmt.Errorf("GetMessagesWithCriteria: %w", err)
 	}
@@ -527,7 +532,7 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64
 }
 
 // GetMessagesSorted retrieves messages that match the search criteria, sorted according to the provided sort criteria
-func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion) ([]Message, error) {
+func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit int) ([]Message, error) {
 	// Build ORDER BY clause first to determine if it requires complex query
 	// We'll use a temporary prefix to check complexity, then rebuild with correct prefix
 	tempOrderBy := db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
@@ -542,7 +547,7 @@ func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID int64, crit
 		orderBy = tempOrderBy
 	}
 
-	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, orderBy)
+	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, orderBy, limit)
 	if err != nil {
 		// The error from getMessagesQueryExecutor will be wrapped here
 		return nil, fmt.Errorf("GetMessagesSorted: %w", err)

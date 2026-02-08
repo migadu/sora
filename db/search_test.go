@@ -13,8 +13,9 @@ import (
 
 // TestSearchConstants tests the search-related constants
 func TestSearchConstants(t *testing.T) {
-	assert.Equal(t, 1000, MaxSearchResults)
+	assert.Equal(t, 100000, MaxSearchResults)
 	assert.Equal(t, 500, MaxComplexSortResults)
+	assert.Less(t, MaxComplexSortResults, MaxSearchResults, "Complex sort limit should be less than search limit")
 }
 
 // Database test helpers for search tests
@@ -437,7 +438,7 @@ func TestGetMessagesWithCriteria(t *testing.T) {
 
 	// Test 1: Search empty mailbox (should return empty results)
 	criteria := &imap.SearchCriteria{}
-	messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages)
 
@@ -447,7 +448,7 @@ func TestGetMessagesWithCriteria(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		UID: []imap.UIDSet{uidSet},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox, so no results
 
@@ -457,7 +458,7 @@ func TestGetMessagesWithCriteria(t *testing.T) {
 		Since:  now.Add(-7 * 24 * time.Hour),
 		Before: now,
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox, so no results
 
@@ -466,13 +467,13 @@ func TestGetMessagesWithCriteria(t *testing.T) {
 		Flag:    []imap.Flag{imap.FlagSeen},
 		NotFlag: []imap.Flag{imap.FlagDeleted},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox, so no results
 
 	// Test 5: Search with invalid mailbox ID
 	criteria = &imap.SearchCriteria{}
-	messages, err = db.GetMessagesWithCriteria(ctx, 99999, criteria)
+	messages, err = db.GetMessagesWithCriteria(ctx, 99999, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Invalid mailbox returns empty
 
@@ -495,7 +496,7 @@ func TestGetMessagesSorted(t *testing.T) {
 	sortCriteria := []imap.SortCriterion{
 		{Key: imap.SortKeyArrival, Reverse: false},
 	}
-	messages, err := db.GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria)
+	messages, err := db.GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages)
 
@@ -503,7 +504,7 @@ func TestGetMessagesSorted(t *testing.T) {
 	sortCriteria = []imap.SortCriterion{
 		{Key: imap.SortKeyArrival, Reverse: true},
 	}
-	messages, err = db.GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria)
+	messages, err = db.GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -511,7 +512,7 @@ func TestGetMessagesSorted(t *testing.T) {
 	sortCriteria = []imap.SortCriterion{
 		{Key: imap.SortKeySubject, Reverse: false},
 	}
-	messages, err = db.GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria)
+	messages, err = db.GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -519,7 +520,7 @@ func TestGetMessagesSorted(t *testing.T) {
 	sortCriteria = []imap.SortCriterion{
 		{Key: imap.SortKeySize, Reverse: false},
 	}
-	messages, err = db.GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria)
+	messages, err = db.GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -529,7 +530,7 @@ func TestGetMessagesSorted(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		UID: []imap.UIDSet{uidSet},
 	}
-	messages, err = db.GetMessagesSorted(ctx, 99999, criteria, sortCriteria)
+	messages, err = db.GetMessagesSorted(ctx, 99999, criteria, sortCriteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Invalid mailbox
 
@@ -551,7 +552,7 @@ func TestFullTextSearch(t *testing.T) {
 	criteria := &imap.SearchCriteria{
 		Body: []string{"important"},
 	}
-	messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -559,7 +560,7 @@ func TestFullTextSearch(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		Body: []string{"meeting agenda"},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -568,7 +569,7 @@ func TestFullTextSearch(t *testing.T) {
 	// criteria = &imap.SearchCriteria{
 	//     Text: []string{"conference call"},
 	// }
-	// messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	// messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	// assert.NoError(t, err)
 	// assert.Empty(t, messages) // Empty mailbox
 
@@ -576,7 +577,7 @@ func TestFullTextSearch(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		Body: []string{"user@example.com"},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -586,7 +587,7 @@ func TestFullTextSearch(t *testing.T) {
 			{Key: "Subject", Value: "test"},
 		},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -721,7 +722,7 @@ func TestSearchPerformanceBasic(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				start := time.Now()
-				messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, tc.criteria)
+				messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, tc.criteria, 0)
 				elapsed := time.Since(start)
 
 				assert.NoError(t, err)
@@ -770,7 +771,7 @@ func TestSearchEdgeCases(t *testing.T) {
 	criteria := &imap.SearchCriteria{
 		Body: []string{""},
 	}
-	messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty search term in empty mailbox
 
@@ -778,7 +779,7 @@ func TestSearchEdgeCases(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		Body: []string{"   "},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Whitespace search
 
@@ -786,7 +787,7 @@ func TestSearchEdgeCases(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		Body: []string{"测试"},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Unicode search
 
@@ -794,7 +795,7 @@ func TestSearchEdgeCases(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		Body: []string{"user@example.com [urgent]"},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Special characters
 
@@ -809,7 +810,7 @@ func TestSearchEdgeCases(t *testing.T) {
 		Since:   time.Now().Add(-30 * 24 * time.Hour),
 		Before:  time.Now(),
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria)
+	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Complex criteria on empty mailbox
 

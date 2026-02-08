@@ -114,9 +114,9 @@ func (rd *ResilientDatabase) GetMessageTextBodyWithRetry(ctx context.Context, ui
 	return result.(string), nil
 }
 
-func (rd *ResilientDatabase) GetMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion) ([]db.Message, error) {
+func (rd *ResilientDatabase) GetMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit int) ([]db.Message, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria)
+		return rd.getOperationalDatabaseForOperation(false).GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria, limit)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
 	if err != nil {
@@ -171,9 +171,9 @@ func (rd *ResilientDatabase) ListMessagesWithRetry(ctx context.Context, mailboxI
 	return result.([]db.Message), nil
 }
 
-func (rd *ResilientDatabase) GetMessagesWithCriteriaWithRetry(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria) ([]db.Message, error) {
+func (rd *ResilientDatabase) GetMessagesWithCriteriaWithRetry(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, limit int) ([]db.Message, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetMessagesWithCriteria(ctx, mailboxID, criteria)
+		return rd.getOperationalDatabaseForOperation(false).GetMessagesWithCriteria(ctx, mailboxID, criteria, limit)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
 	if err != nil {
