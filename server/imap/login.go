@@ -140,6 +140,7 @@ func (s *IMAPSession) Login(address, password string) error {
 			// Register connection for tracking
 			if err := s.registerConnection(addressParsed.BaseAddress()); err != nil {
 				// Connection limit reached - undo authentication and reject
+				s.server.authenticatedConnections.Add(-1)
 				metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Dec()
 				s.IMAPUser = nil
 				s.Session.User = nil
@@ -258,6 +259,7 @@ func (s *IMAPSession) Login(address, password string) error {
 	// Register connection for tracking
 	if err := s.registerConnection(addressParsed.BaseAddress()); err != nil {
 		// Connection limit reached - undo authentication and reject
+		s.server.authenticatedConnections.Add(-1)
 		metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Dec()
 		s.IMAPUser = nil
 		s.Session.User = nil
