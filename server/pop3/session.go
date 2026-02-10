@@ -1605,7 +1605,6 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			s.inboxMailboxID = inboxMailboxID.ID
-			s.authenticated = true
 			// Initialize User for connection tracking - will use correct email below
 			// For impersonation: authzID, otherwise: authnID
 			var userEmail string
@@ -1628,11 +1627,19 @@ func (s *POP3Session) handleConnection() {
 			if impersonating {
 				duration := time.Since(start)
 				s.InfoLog("authentication successful", "address", authzID, "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-				// Register connection for tracking with the impersonated user's email
+			}
+
+			// Track successful authentication - MUST be before setting authenticated flag
+			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
+			metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
+
+			// IMPORTANT: Set authenticated flag AFTER incrementing both counters to prevent race condition
+			s.authenticated = true
+
+			// Register connection for tracking
+			if impersonating {
 				s.registerConnection(authzID)
 			} else {
-				// Regular SASL auth - Authenticate() already logged, just register connection
-				// Register connection for tracking with the authenticated user's email
 				s.registerConnection(authnID)
 			}
 
