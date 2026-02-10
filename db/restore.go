@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 )
 
@@ -237,12 +238,22 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		if err == pgx.ErrNoRows {
 			// Mailbox doesn't exist, create it
 			err = tx.QueryRow(ctx, `
-				INSERT INTO mailboxes (account_id, name, uid_validity, created_at, updated_at)
-				VALUES ($1, $2, extract(epoch from now())::bigint, now(), now())
+				INSERT INTO mailboxes (account_id, name, uid_validity, created_at, updated_at, path)
+				VALUES ($1, $2, extract(epoch from now())::bigint, now(), now(), '')
 				RETURNING id
 			`, accountID, mailboxPath).Scan(&mailboxID)
 			if err != nil {
 				return 0, fmt.Errorf("failed to create mailbox %s: %w", mailboxPath, err)
+			}
+
+			// Update the path now that we have the mailbox ID
+			// This prevents the mailbox from being left with an empty path
+			computedPath := helpers.GetMailboxPath("", mailboxID) // Root-level mailbox
+			_, err = tx.Exec(ctx, `
+				UPDATE mailboxes SET path = $1 WHERE id = $2
+			`, computedPath, mailboxID)
+			if err != nil {
+				return 0, fmt.Errorf("failed to update path for mailbox %s: %w", mailboxPath, err)
 			}
 		} else if err != nil {
 			return 0, fmt.Errorf("failed to check mailbox %s: %w", mailboxPath, err)

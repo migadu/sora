@@ -97,6 +97,7 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
@@ -1355,6 +1356,17 @@ func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Conte
 
 			if err != nil {
 				return nil, fmt.Errorf("failed during insert-on-conflict-returning: %w", err)
+			}
+
+			// Update the path now that we have the mailbox ID
+			// This prevents mailboxes from being left with empty path = ''
+			// Only update if path is empty (to handle ON CONFLICT case where mailbox already existed)
+			mailboxPath := helpers.GetMailboxPath("", mb.ID) // Root-level mailbox
+			_, err = tx.Exec(ctx, `
+				UPDATE mailboxes SET path = $1 WHERE id = $2 AND (path = '' OR path IS NULL)
+			`, mailboxPath, mb.ID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to update mailbox path: %w", err)
 			}
 
 			logger.Info("Created or found mailbox via upsert", "name", name)

@@ -767,6 +767,14 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		return consts.ErrInternalError
 	}
 
+	// Validate mailbox path is not empty (data corruption check)
+	// An empty path would cause the child UPDATE query to match ALL mailboxes,
+	// leading to constraint violations. See production bug 2026-02-10.
+	if oldPath == "" {
+		logger.Error("Database: mailbox has empty path (data corruption)", "mailbox_id", mailboxID, "name", oldName)
+		return fmt.Errorf("mailbox has invalid empty path (data corruption)")
+	}
+
 	// Separately, check if the mailbox has children. This avoids using GROUP BY with FOR UPDATE.
 	// Use owner's account_id for accurate child count (important for shared mailboxes)
 	var hasChildren bool
