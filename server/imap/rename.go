@@ -70,21 +70,23 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 	}
 
 	// Determine the new parent mailbox ID
+	// Use the owner's AccountID for shared mailbox support
+	ownerAccountID := oldMailbox.AccountID
 	var newParentMailboxID *int64
 	newParts := strings.Split(newName, string(consts.MailboxDelimiter))
 	if len(newParts) > 1 {
 		newParentPath := strings.Join(newParts[:len(newParts)-1], string(consts.MailboxDelimiter))
-		newParentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, newParentPath)
+		newParentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, ownerAccountID, newParentPath)
 		if err == consts.ErrMailboxNotFound {
 			// Parent does not exist, so we need to create it.
 			// This is a common expectation for IMAP clients.
 			s.DebugLog("new parent mailbox does not exist, auto-creating", "parent", newParentPath, "target", newName)
-			createErr := s.server.rdb.CreateMailboxWithRetry(s.ctx, AccountID, newParentPath, nil)
+			createErr := s.server.rdb.CreateMailboxWithRetry(s.ctx, ownerAccountID, newParentPath, nil)
 			if createErr != nil {
 				return s.internalError("failed to auto-create new parent mailbox '%s': %v", newParentPath, createErr)
 			}
 			// Fetch the newly created parent to get its ID.
-			newParentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, newParentPath)
+			newParentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(s.ctx, ownerAccountID, newParentPath)
 			if err != nil {
 				return s.internalError("failed to fetch auto-created new parent mailbox '%s': %v", newParentPath, err)
 			}
@@ -95,7 +97,8 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 	}
 	// If len(newParts) <= 1, newParentMailboxID remains nil, which is correct for a top-level mailbox.
 
-	err = s.server.rdb.RenameMailboxWithRetry(s.ctx, oldMailbox.ID, AccountID, newName, newParentMailboxID)
+	// Rename using the mailbox owner's AccountID
+	err = s.server.rdb.RenameMailboxWithRetry(s.ctx, oldMailbox.ID, ownerAccountID, newName, newParentMailboxID)
 	if err != nil {
 		return s.internalError("failed to rename mailbox '%s' to '%s': %v", existingName, newName, err)
 	}

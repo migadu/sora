@@ -130,9 +130,10 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, AccountID i
 	mailbox.UIDValidity = uint32(uidValidityInt64)
 
 	// Separately, check if the mailbox has children using an efficient EXISTS query.
+	// For shared mailboxes, check using the owner's account_id to get accurate child count
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%')
-	`, AccountID, mailbox.Path).Scan(&mailbox.HasChildren)
+	`, mailbox.AccountID, mailbox.Path).Scan(&mailbox.HasChildren)
 	if err != nil {
 		logger.Error("Database: failed to check for children of mailbox", "mailbox_id", mailboxID, "err", err)
 		return nil, consts.ErrInternalError
@@ -201,10 +202,10 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	mailbox.AccountID = accountID
 
 	// Separately, check if the mailbox has children using an efficient EXISTS query.
-	// For shared mailboxes, check all children (not just user's children)
+	// For shared mailboxes, check using the owner's account_id to get accurate child count
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE LENGTH(path) = LENGTH($1) + 16 AND path LIKE $1 || '%')
-	`, mailbox.Path).Scan(&mailbox.HasChildren)
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%')
+	`, accountID, mailbox.Path).Scan(&mailbox.HasChildren)
 	if err != nil {
 		logger.Error("Database: failed to check for children of mailbox", "name", name, "err", err)
 		return nil, consts.ErrInternalError
@@ -739,8 +740,9 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	}
 
 	// Check if the new name already exists within the same transaction to prevent race conditions.
+	// Use case-sensitive comparison to match the unique constraint
 	var existingID int64
-	err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = $2", AccountID, strings.ToLower(newName)).Scan(&existingID)
+	err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND name = $2", AccountID, newName).Scan(&existingID)
 	if err == nil {
 		// A mailbox with the new name was found.
 		return consts.ErrMailboxAlreadyExists
@@ -766,10 +768,20 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	}
 
 	// Separately, check if the mailbox has children. This avoids using GROUP BY with FOR UPDATE.
+	// Use owner's account_id for accurate child count (important for shared mailboxes)
 	var hasChildren bool
+	var ownerAccountID int64
+	err = tx.QueryRow(ctx, `
+		SELECT account_id FROM mailboxes WHERE id = $1
+	`, mailboxID).Scan(&ownerAccountID)
+	if err != nil {
+		logger.Error("Database: failed to get mailbox owner", "mailbox_id", mailboxID, "err", err)
+		return consts.ErrInternalError
+	}
+
 	err = tx.QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND path LIKE $2 || '%' AND path != $2)
-	`, AccountID, oldPath).Scan(&hasChildren)
+	`, ownerAccountID, oldPath).Scan(&hasChildren)
 	if err != nil {
 		logger.Error("Database: failed to check for children of mailbox", "mailbox_id", mailboxID, "err", err)
 		return consts.ErrInternalError
@@ -805,10 +817,40 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// Construct the new path
 	newPath := helpers.GetMailboxPath(newParentPath, mailboxID)
 
+	// Before updating, check if any child would conflict with existing mailboxes
+	if hasChildren {
+		delimiter := string(consts.MailboxDelimiter)
+		oldPrefix := oldName + delimiter
+		newPrefix := newName + delimiter
+
+		// Check if any child's new name would conflict with an existing mailbox
+		var conflictCount int
+		err = tx.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM mailboxes existing
+			WHERE existing.account_id = $1
+			  AND EXISTS (
+				SELECT 1 FROM mailboxes child
+				WHERE child.account_id = $1
+				  AND child.path LIKE $2 || '%'
+				  AND child.path != $2
+				  AND existing.name = $3 || SUBSTRING(child.name FROM LENGTH($4) + 1)
+			  )
+		`, ownerAccountID, oldPath, newPrefix, oldPrefix).Scan(&conflictCount)
+		if err != nil {
+			logger.Error("Database: failed to check for conflicting child names", "mailbox_id", mailboxID, "err", err)
+			return consts.ErrInternalError
+		}
+		if conflictCount > 0 {
+			logger.Error("Database: rename would create conflicting child names", "mailbox_id", mailboxID, "old_name", oldName, "new_name", newName, "conflicts", conflictCount)
+			return fmt.Errorf("rename would create conflicting mailbox names (%d conflicts)", conflictCount)
+		}
+	}
+
 	// Update the target mailbox itself.
 	_, err = tx.Exec(ctx, `
-		UPDATE mailboxes 
-		SET name = $1, path = $2, updated_at = now() 
+		UPDATE mailboxes
+		SET name = $1, path = $2, updated_at = now()
 		WHERE id = $3
 	`, newName, newPath, mailboxID)
 	if err != nil {
@@ -826,17 +868,17 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		// SUBSTRING to only replace the prefix, which is safer than a global REPLACE.
 		_, err = tx.Exec(ctx, `
 			UPDATE mailboxes
-			SET 
+			SET
 				name = $1 || SUBSTRING(name FROM LENGTH($2) + 1),
-				path = CASE 
+				path = CASE
 					WHEN $3 != $4 THEN $3 || SUBSTRING(path FROM LENGTH($4) + 1)
 					ELSE path
 				END,
 				updated_at = now()
-			WHERE 
+			WHERE
 				account_id = $5 AND
 				path LIKE $4 || '%' AND path != $4
-		`, newPrefix, oldPrefix, newPath, oldPath, AccountID)
+		`, newPrefix, oldPrefix, newPath, oldPath, ownerAccountID)
 
 		if err != nil {
 			return fmt.Errorf("failed to update child mailboxes: %w", err)
