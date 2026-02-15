@@ -56,10 +56,15 @@ go test -run "TestMessage" ./db          # Message operation tests
 # Account management (note: use 'accounts' subcommand)
 ./sora-admin accounts create --config config.toml --email user@example.com --password pass
 ./sora-admin accounts update --config config.toml --email user@example.com --password newpass
+./sora-admin accounts purge-domain --config config.toml --domain example.com  # Purge all accounts in domain
 
 # Import/Export maildir
 ./sora-admin import-maildir --config config.toml --email user@example.com --path /path/to/maildir
+./sora-admin import-maildir --config config.toml --email user@example.com --path /path/to/maildir --incremental  # Skip already imported
 ./sora-admin export-maildir --config config.toml --email user@example.com --path /path/to/export
+
+# Content verification and debugging
+./sora-admin verify-content-hash --config config.toml --hash <blake3-hash>  # Verify message integrity in S3
 
 # Monitoring and health
 ./sora-admin health --config config.toml                      # Check system health
@@ -112,7 +117,11 @@ go test -run "TestMessage" ./db          # Message operation tests
    - server/lmtp/ - Mail delivery with SIEVE script execution
    - server/pop3/ - POP3 with SASL authentication
    - server/managesieve/ - SIEVE script management
-   - server/sieveengine/ - SIEVE script interpreter
+   - server/sieveengine/ - SIEVE script interpreter with extensions:
+     - **editheader**: Add, delete, and modify message headers
+     - **mailbox**: Enhanced mailbox operations
+     - **subaddress**: Plus addressing (user+tag@domain) support
+     - vacation, fileinto, redirect, and other standard extensions
    - **server/adminapi/** - REST API for administration and monitoring (HTTP)
    - **server/userapi/** - REST API for user mailbox access (HTTP, JWT-based)
    - **server/delivery/** - Shared message delivery functionality (used by LMTP and Admin API)
@@ -199,9 +208,14 @@ Sora supports horizontal scaling through proxy mode:
 1. **Frontend Proxy**: Load balances across multiple backend servers
 2. **Backend Servers**: Handle actual protocol operations
 3. **Server Affinity**: Consistent user routing to same backend
-4. **Health-Based Routing**: Automatic failover to healthy backends
+4. **Health-Based Routing**:
+   - Automatic failover to healthy backends
+   - Configurable health check intervals
+   - Three consecutive failures mark backend unhealthy
+   - FailoverManager tracks host health with failure thresholds
 5. **Connection Tracking**: Cluster-wide connection monitoring via gossip
-6. **Supported Protocols**: IMAP, POP3, ManageSieve, LMTP
+6. **Supported Protocols**: IMAP, POP3, ManageSieve, LMTP, User API
+7. **Proxy-Only Mode**: Can run without database access (configuration optimized)
 
 Configuration example:
 ```toml
@@ -246,16 +260,30 @@ Sora includes comprehensive clustering capabilities:
 ### Resilience Features
 
 1. **Connection Pooling**: Separate read/write pools with configurable limits
-2. **Circuit Breakers**: Protect against cascading failures in S3 and external services
-3. **Rate Limiting**: 
+2. **Circuit Breakers**:
+   - Protect against cascading failures in S3 and external services
+   - Enhanced recovery mechanism with proactive monitoring
+   - Intelligent permanent error handling (don't trip on permanent failures)
+3. **Rate Limiting**:
    - Per-IP and per-username authentication rate limiting
    - Progressive delays before fast IP blocking
    - Cluster-wide synchronization in cluster mode
-4. **Health Monitoring**: Component-level health checks (database, S3, circuit breakers, cluster)
+4. **Health Monitoring**:
+   - Component-level health checks (database, S3, circuit breakers, cluster)
+   - Backend health checks with configurable failure thresholds (3 consecutive failures)
+   - Optimized connection validation using connection state
 5. **Graceful Degradation**: Fallback strategies under load
 6. **Connection Limits**: Per-protocol and per-IP limits to prevent resource exhaustion
 7. **Retry Logic**: Exponential backoff for transient failures
 8. **Distributed Task Processing**: Background workers for uploads, cleanup, and relay
+9. **Panic Recovery**:
+   - Mailbox tracker desynchronization recovery
+   - Malformed MIME message handling
+   - Body structure validation with fallbacks
+10. **Race Condition Prevention**:
+    - Concurrent message delivery handling
+    - File existence checks before storage
+    - Duplicate message detection
 
 ### Shared Mailboxes and ACL (RFC 4314)
 
@@ -300,7 +328,9 @@ The import/export tools use a local SQLite database (`sora-maildir.db`) to track
 - **Schema**: Messages table with `s3_uploaded` and `s3_uploaded_at` columns
 - **First Import**: Scans maildir, uploads all messages, marks as `s3_uploaded = 1`
 - **Re-Import**: Skips messages already marked as uploaded (13x faster - just SQLite check)
-- **Incremental Import**: Only processes new messages (not in SQLite cache)
+- **Incremental Import**: `--incremental` flag skips already-imported messages (fast path)
+- **Recent Flag Handling**: Properly preserves IMAP \Recent flag during import
+- **Duplicate Detection**: Intelligent handling to prevent orphaned files
 - **Migration**: Automatically adds columns to existing databases, marks old messages as uploaded
 
 This enables fast re-runs and true incremental imports without re-checking PostgreSQL or S3.
@@ -430,6 +460,9 @@ Disk-based relay queue for reliable message forwarding:
 - **Max Attempts**: Configurable maximum retry count (default: 10 over ~32 hours)
 - **Background Worker**: Processes queue at configurable intervals
 - **Batch Processing**: Configurable batch size for efficient processing
+- **Crash Recovery**: Automatic recovery of orphaned messages after server restart
+- **Old Message Cleanup**: Periodic purging of old failed messages
+- **Error Classification**: RelayError type distinguishes transient vs. permanent failures
 - **Metrics**: Prometheus integration for queue depth and delivery statistics
 
 #### Configuration
@@ -738,6 +771,60 @@ logger.Error("Failed to connect", "err", err)
 Do not use the standard `log` package - use `logger` instead.
 
 ## Recent Major Updates
+
+### Production Hardening and Reliability (December 2024 - February 2025)
+- **82 commits** focused on stability, resilience, and production readiness
+- **Race Condition Fixes**: Multiple fixes for concurrent message delivery and upload handling
+- **Panic Recovery**: Robust error handling for malformed MIME messages and body structure validation
+- **Duplicate Message Handling**: Intelligent deduplication preventing orphaned files
+- **Circuit Breaker Enhancements**: Improved recovery mechanism and permanent error handling
+- **Database Connection Management**: Enhanced shutdown handling and connection pool resilience
+
+### SIEVE Engine Enhancements (December 2024 - January 2025)
+- **New Extensions**: editheader, mailbox, subaddress (plus addressing)
+- **Header Editing**: Full support for adding, deleting, and modifying message headers via SIEVE
+- **Subaddress/Plus Addressing**: Native support for user+tag@domain addressing
+- **Implicit Keep Fix**: Proper handling of implicit keep with vacation and redirect actions
+- **Script Deactivation**: Ability to deactivate SIEVE scripts without deletion
+- **Centralized Extension Config**: Global configuration for all SIEVE extensions
+
+### Relay Queue Improvements (January 2025)
+- **Crash Recovery**: Automatic recovery of orphaned messages after server restart
+- **Old Message Cleanup**: Periodic purging of old failed messages
+- **Error Classification**: Dedicated RelayError type for transient vs. permanent failures
+- **Vacation Integration**: Conditional sending based on relay queue availability
+- **Failover Manager**: Host health tracking with configurable failure thresholds
+
+### Proxy and Health Monitoring (December 2024 - January 2025)
+- **Backend Health Checks**: Configurable health check intervals with failure thresholds
+- **Proxy-Only Mode**: Improved configuration for deployments without database access
+- **LMTP Proxy Enhancements**: User-not-found response configuration (reject/tempfail)
+- **Connection Validation**: Optimized health checks using connection state vs. Ping
+- **Failover Manager**: Smart routing based on backend health status
+
+### Admin Tool Enhancements (January - February 2025)
+- **Domain-Level Purging**: Bulk account deletion by domain with S3 cleanup
+- **Incremental Import**: Skip already-imported messages using SQLite cache
+- **Content Hash Verification**: Admin command to verify message integrity in S3
+- **Batched S3 Deletion**: Efficient bulk deletion for account purging
+- **Failed Upload Tracking**: Enhanced monitoring with email attribution
+- **Recent Flag Handling**: Proper preservation of IMAP \Recent flag during import
+
+### Database and Performance (December 2024 - January 2025)
+- **Batched Pruning**: PruneOldMessageBodies now processes in batches for efficiency
+- **Query Limits**: Explicit limit parameters for message query functions
+- **Deduplication Logic**: Handle same message_id with different content_hash
+- **Sequence Number Handling**: Direct database values for consistency after expunge
+- **Mailbox Deletion**: Proper message expunge marking on mailbox delete
+- **Search Optimization**: Support for nested OR/NOT clauses, rate limit to 60/min
+
+### IMAP Protocol Fixes (December 2024 - February 2025)
+- **BODY Structure**: Ensure Extended field populated for consistency
+- **STATUS Command**: Accurate message counts for non-selected mailboxes
+- **Expunge Processing**: Handle large count mismatches with database reconciliation
+- **Mailbox Tracker**: Panic recovery for desynchronization during updates
+- **Plus Addressing**: Correct S3 key storage for user+tag@domain addresses
+- **Poll Race Conditions**: Integration tests and fixes for APPEND/POLL timing
 
 ### ACL and Shared Mailboxes (2025)
 - Complete RFC 4314 implementation with 11 ACL rights
