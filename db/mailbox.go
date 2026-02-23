@@ -164,11 +164,13 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	var accountID int64
 
 	// First try to find owned mailbox, then check for shared mailbox with ACL access
+	// Use LOWER() on both sides to ensure consistent case-insensitive comparison
+	// regardless of database locale (C/POSIX locales don't lowercase non-ASCII in LOWER())
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
 		FROM mailboxes m
 		LEFT JOIN mailbox_acls acl ON m.id = acl.mailbox_id AND acl.account_id = $1
-		WHERE LOWER(m.name) = $2
+		WHERE LOWER(m.name) = LOWER($2)
 		  AND (
 		    -- Owned mailbox (shared or non-shared, owner always has access)
 		    (m.account_id = $1)
@@ -188,7 +190,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 		     ))
 		  )
 		LIMIT 1
-	`, AccountID, strings.ToLower(name)).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
+	`, AccountID, name).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
 
 	if err != nil {
 		if err == pgx.ErrNoRows {
