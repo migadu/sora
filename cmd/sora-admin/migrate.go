@@ -48,8 +48,9 @@ func handleMigrateCommand(ctx context.Context) {
 func printMigrateUsage() {
 	fmt.Printf(`Database Schema Migration Management
 
-This command can be run safely while sora instances are running. The golang-migrate
-library uses its own internal advisory lock to ensure only one migration runs at a time.
+The 'version' subcommand can be run safely while sora instances are running (it queries
+schema_migrations directly without acquiring locks). The 'up', 'down', and 'force'
+subcommands require stopping sora instances first.
 
 Usage:
   sora-admin migrate <subcommand> [options]
@@ -145,13 +146,49 @@ func handleMigrateVersion(ctx context.Context) {
 	}
 	fs.Parse(os.Args[3:])
 
-	m, db, err := getMigrateInstance(ctx)
-	if err != nil {
-		logger.Fatalf("Failed to initialize migration tool: %v", err)
+	// Query schema_migrations directly instead of using golang-migrate's m.Version(),
+	// which acquires an exclusive advisory lock. This allows checking the version
+	// while sora instances are running (they hold shared advisory locks that would
+	// block an exclusive lock acquisition).
+	dbCfg := globalConfig.Database.Write
+	if dbCfg == nil || len(dbCfg.Hosts) == 0 {
+		logger.Fatalf("Write database configuration is missing or has no hosts")
 	}
-	defer db.Close()
 
-	showVersion(m)
+	sslMode := "disable"
+	if dbCfg.TLSMode {
+		sslMode = "require"
+	}
+	connString := fmt.Sprintf("postgres://%s:%s@%s:%v/%s?sslmode=%s",
+		dbCfg.User, dbCfg.Password, dbCfg.Hosts[0], dbCfg.Port, dbCfg.Name, sslMode)
+
+	sqlDB, err := sql.Open("pgx", connString)
+	if err != nil {
+		logger.Fatalf("Failed to open database connection: %v", err)
+	}
+	defer sqlDB.Close()
+
+	if err := sqlDB.PingContext(ctx); err != nil {
+		logger.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	var version int
+	var dirty bool
+	err = sqlDB.QueryRowContext(ctx, "SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&version, &dirty)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			logger.Info("Current migration version: none")
+			return
+		}
+		logger.Fatalf("Failed to query migration version: %v", err)
+	}
+
+	logger.Info("Current migration version", "version", version)
+	if dirty {
+		logger.Info("Dirty state: YES (Database may be in an inconsistent state. Use 'force' to fix.)")
+	} else {
+		logger.Info("Dirty state: no")
+	}
 }
 
 func handleMigrateForce(ctx context.Context) {

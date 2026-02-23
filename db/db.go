@@ -303,19 +303,25 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 	if err != nil {
 		return fmt.Errorf("failed to open a temporary sql.DB for migrations: %w", err)
 	}
-	defer sqlDB.Close()
+	// NOTE: We do NOT defer sqlDB.Close() here. sql.DB.Close() waits for all in-flight
+	// queries to finish, but the migration goroutine may be blocked on pg_advisory_lock()
+	// which would cause a deadlock. Instead, we close sqlDB explicitly when the goroutine
+	// completes, or spawn a cleanup goroutine on timeout.
 
 	if err := sqlDB.PingContext(ctx); err != nil {
+		sqlDB.Close()
 		return fmt.Errorf("failed to ping temporary DB for migrations: %w", err)
 	}
 
 	dbDriver, err := pgxv5.WithInstance(sqlDB, &pgxv5.Config{})
 	if err != nil {
+		sqlDB.Close()
 		return fmt.Errorf("failed to create migration db driver: %w", err)
 	}
 
 	m, err := migrate.NewWithInstance("iofs", sourceDriver, "pgx5", dbDriver)
 	if err != nil {
+		sqlDB.Close()
 		return fmt.Errorf("failed to create migrate instance: %w", err)
 	}
 
@@ -324,9 +330,11 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 	// Get current version from migration driver (needed for proper state tracking)
 	currentVersion, dirty, err = m.Version()
 	if err != nil && err != migrate.ErrNilVersion {
+		sqlDB.Close()
 		return fmt.Errorf("failed to get current migration version: %w", err)
 	}
 	if dirty {
+		sqlDB.Close()
 		return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", currentVersion)
 	}
 
@@ -349,6 +357,9 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 	var skipFinalVerification bool
 	select {
 	case err := <-errChan:
+		// Migration goroutine completed - safe to close sqlDB now
+		defer sqlDB.Close()
+
 		// Check if error is a lock acquisition timeout (another instance is running migrations)
 		if err != nil && err != migrate.ErrNoChange {
 			// If it's a lock acquisition error, verify migrations instead of failing
@@ -356,14 +367,16 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 				logger.Info("Database: migration lock acquisition failed (another instance is running migrations)")
 				logger.Info("Database: verifying current migration state")
 
-				// Query schema_migrations directly to avoid lock contention
+				// Query schema_migrations directly using the main pool to avoid lock contention
 				var newVersion uint
-				var dirty bool
-				queryErr := sqlDB.QueryRow("SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&newVersion, &dirty)
-				if queryErr != nil && queryErr != sql.ErrNoRows {
+				var newDirty bool
+				verifyCtx, verifyCancel := context.WithTimeout(ctx, 10*time.Second)
+				defer verifyCancel()
+				queryErr := db.WritePool.QueryRow(verifyCtx, "SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&newVersion, &newDirty)
+				if queryErr != nil && queryErr != pgx.ErrNoRows {
 					return fmt.Errorf("failed to verify migration version after lock timeout: %w", queryErr)
 				}
-				if dirty {
+				if newDirty {
 					return fmt.Errorf("database is in a dirty migration state after lock timeout (version %d)", newVersion)
 				}
 
@@ -383,18 +396,32 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 			logger.Info("Database: migrations applied successfully")
 		}
 	case <-migrateCtx.Done():
-		// Timeout occurred - likely another instance is running migrations
+		// Timeout occurred - likely another instance is running migrations.
+		// IMPORTANT: The migration goroutine may be blocked on pg_advisory_lock().
+		// We MUST NOT call sqlDB.Close() here because it waits for in-flight queries,
+		// which would deadlock. Instead, spawn a cleanup goroutine that waits for
+		// the migration goroutine to finish and then closes sqlDB properly.
+		go func() {
+			logger.Info("Database: spawning cleanup goroutine for timed-out migration")
+			<-errChan // Wait for the migration goroutine to eventually finish
+			sqlDB.Close()
+			logger.Info("Database: cleaned up timed-out migration resources")
+		}()
+
 		logger.Info("Database: migration attempt timed out (another instance may be running migrations)")
 		logger.Info("Database: verifying current migration state")
 
-		// Query schema_migrations directly to avoid lock contention
+		// Query schema_migrations using the main WritePool (NOT sqlDB, which may be
+		// contended by the migration goroutine's advisory lock)
 		var newVersion uint
-		var dirty bool
-		queryErr := sqlDB.QueryRow("SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&newVersion, &dirty)
-		if queryErr != nil && queryErr != sql.ErrNoRows {
+		var newDirty bool
+		verifyCtx, verifyCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer verifyCancel()
+		queryErr := db.WritePool.QueryRow(verifyCtx, "SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&newVersion, &newDirty)
+		if queryErr != nil && queryErr != pgx.ErrNoRows {
 			return fmt.Errorf("failed to verify migration version after timeout: %w", queryErr)
 		}
-		if dirty {
+		if newDirty {
 			return fmt.Errorf("database is in a dirty migration state after timeout (version %d)", newVersion)
 		}
 
