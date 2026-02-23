@@ -313,8 +313,8 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 
 	// --- Phase 2a: FTS Body Pruning (for old messages) ---
 	if w.ftsRetention > 0 {
-		// This prunes the text_body of old messages to save space, but keeps the
-		// text_body_tsv so that full-text search on the body continues to work.
+		// This prunes text_body and headers of old messages to save space, but keeps
+		// text_body_tsv and headers_tsv so that full-text search continues to work.
 		// Use the batched version which commits between batches to avoid timeout issues.
 		prunedBodiesCount, err = w.rdb.PruneOldMessageBodiesBatchedWithRetry(ctx, w.ftsRetention)
 		if err != nil {

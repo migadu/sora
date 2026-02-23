@@ -564,14 +564,14 @@ func TestFullTextSearch(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
-	// Test 3: Search in both headers and body (TEXT) - Skip due to schema limitations
-	// Note: TEXT search requires headers_tsv column which may not be available
-	// criteria = &imap.SearchCriteria{
-	//     Text: []string{"conference call"},
-	// }
-	// messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
-	// assert.NoError(t, err)
-	// assert.Empty(t, messages) // Empty mailbox
+	// Test 3: Search in both headers and body (TEXT)
+	criteria = &imap.SearchCriteria{
+		Text: []string{"conference call"},
+	}
+	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
+	assert.NoError(t, err)
+	// TEXT search matches against both text_body_tsv and headers_tsv
+	t.Logf("TEXT search for 'conference call' returned %d results", len(messages))
 
 	// Test 4: Search with special characters
 	criteria = &imap.SearchCriteria{

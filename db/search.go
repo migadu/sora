@@ -119,17 +119,17 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 		// Note: This column is in message_contents table, only joined in complex query
 		conditions = append(conditions, fmt.Sprintf("text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s)", param))
 	}
-	// Text search - searches both headers and body
-	// Note: text_body_tsv is in message_contents table, which is only available in complex query path
+	// Text search - searches both headers and body (RFC 3501: TEXT matches header or body)
+	// Note: text_body_tsv and headers_tsv are in message_contents table, only available in complex query path
 	for _, textCriteria := range criteria.Text {
 		param := nextParam()
 		args[param] = textCriteria
 		// Search in both headers and body text using full-text search
-		// Note: headers_tsv column may not exist in current schema, so search only body for now
-		// Note: This column is in message_contents table, only joined in complex query
+		// Either TSV matching is sufficient; NULL-safe so pruned columns are skipped gracefully
+		// Note: These columns are in message_contents table, only joined in complex query
 		conditions = append(conditions, fmt.Sprintf(
-			"(text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s))",
-			param))
+			"((text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s)) OR (headers_tsv IS NOT NULL AND headers_tsv @@ plainto_tsquery('simple', @%s)))",
+			param, param))
 	}
 
 	// Flags
@@ -477,7 +477,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 				m.account_id, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
 				m.internal_date, m.size, m.body_structure, m.created_modseq, m.updated_modseq, m.expunged_modseq,
 				m.flags_changed_at, m.subject, m.sent_date, m.message_id,
-				m.in_reply_to, m.recipients_json, mc.text_body_tsv,
+				m.in_reply_to, m.recipients_json, mc.text_body_tsv, mc.headers_tsv,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_email_sort, m.cc_email_sort
 			FROM messages m
 			JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid

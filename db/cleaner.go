@@ -191,9 +191,9 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 	return deletedCount, nil
 }
 
-// PruneOldMessageBodies sets the text_body to NULL for message contents
+// PruneOldMessageBodies sets text_body and headers to NULL for message contents
 // where all associated non-expunged messages are older than the given retention period.
-// This saves storage while preserving the text_body_tsv for full-text search.
+// This saves storage while preserving text_body_tsv and headers_tsv for full-text search.
 // NOTE: This function is designed to work in a single-batch mode when called with a transaction.
 // For production use with large datasets, use PruneOldMessageBodiesBatched instead.
 func (d *Database) PruneOldMessageBodies(ctx context.Context, tx pgx.Tx, retention time.Duration) (int64, error) {
@@ -205,7 +205,7 @@ func (d *Database) PruneOldMessageBodies(ctx context.Context, tx pgx.Tx, retenti
 		WITH candidates AS (
 			SELECT content_hash
 			FROM message_contents
-			WHERE text_body IS NOT NULL
+			WHERE text_body IS NOT NULL OR headers IS NOT NULL
 			LIMIT $2
 		),
 		prunable AS (
@@ -221,6 +221,7 @@ func (d *Database) PruneOldMessageBodies(ctx context.Context, tx pgx.Tx, retenti
 		UPDATE message_contents mc
 		SET
 			text_body = NULL,
+			headers = NULL,
 			updated_at = now()
 		FROM prunable p
 		WHERE mc.content_hash = p.content_hash
@@ -233,7 +234,7 @@ func (d *Database) PruneOldMessageBodies(ctx context.Context, tx pgx.Tx, retenti
 	return tag.RowsAffected(), nil
 }
 
-// PruneOldMessageBodiesBatched processes message body pruning in multiple batches,
+// PruneOldMessageBodiesBatched processes message body and header pruning in multiple batches,
 // committing between batches to avoid transaction timeout issues.
 // This should be used for production cleanup operations on large databases.
 func (d *Database) PruneOldMessageBodiesBatched(ctx context.Context, retention time.Duration) (int64, error) {
@@ -258,7 +259,7 @@ func (d *Database) PruneOldMessageBodiesBatched(ctx context.Context, retention t
 			WITH candidates AS (
 				SELECT content_hash
 				FROM message_contents
-				WHERE text_body IS NOT NULL
+				WHERE text_body IS NOT NULL OR headers IS NOT NULL
 				LIMIT $2
 			),
 			prunable AS (
@@ -274,6 +275,7 @@ func (d *Database) PruneOldMessageBodiesBatched(ctx context.Context, retention t
 			UPDATE message_contents mc
 			SET
 				text_body = NULL,
+				headers = NULL,
 				updated_at = now()
 			FROM prunable p
 			WHERE mc.content_hash = p.content_hash

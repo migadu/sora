@@ -422,19 +422,21 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	}
 
 	// Insert into message_contents. ON CONFLICT DO NOTHING handles content deduplication.
-	// We always store headers for FTS. For the body, if the message is older than the FTS
-	// retention period, we store NULL to save space but still generate the TSV for searching.
+	// For messages older than the FTS retention period, we store NULL for both text_body
+	// and headers to save space, but still generate the TSV vectors for searching.
 	var textBodyArg any = sanePlaintextBody
+	var headersArg any = saneRawHeaders
 	if options.FTSRetention > 0 && options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
 		textBodyArg = nil
+		headersArg = nil
 	}
 
-	// For old messages, textBodyArg is NULL, but sanePlaintextBody is used for TSV generation.
+	// For old messages, textBodyArg/headersArg are NULL, but the raw values are used for TSV generation.
 	_, err = tx.Exec(ctx, `
 		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
-		VALUES ($1, $2, to_tsvector('simple', $3), $4, to_tsvector('simple', $4))
+		VALUES ($1, $2, to_tsvector('simple', $3), $4, to_tsvector('simple', $5))
 		ON CONFLICT (content_hash) DO NOTHING
-	`, options.ContentHash, textBodyArg, sanePlaintextBody, saneRawHeaders)
+	`, options.ContentHash, textBodyArg, sanePlaintextBody, headersArg, saneRawHeaders)
 	if err != nil {
 		logger.Error("Database: failed to insert message content", "content_hash", options.ContentHash, "err", err)
 		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
@@ -701,19 +703,21 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	}
 
 	// Insert into message_contents. ON CONFLICT DO NOTHING handles content deduplication.
-	// We always store headers for FTS. For the body, if the message is older than the FTS
-	// retention period, we store NULL to save space but still generate the TSV for searching.
+	// For messages older than the FTS retention period, we store NULL for both text_body
+	// and headers to save space, but still generate the TSV vectors for searching.
 	var textBodyArg any = sanePlaintextBody
+	var headersArg any = saneRawHeaders
 	if options.FTSRetention > 0 && options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
 		textBodyArg = nil
+		headersArg = nil
 	}
 
-	// For old messages, textBodyArg is NULL, but sanePlaintextBody is used for TSV generation.
+	// For old messages, textBodyArg/headersArg are NULL, but the raw values are used for TSV generation.
 	_, err = tx.Exec(ctx, `
 		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
-		VALUES ($1, $2, to_tsvector('simple', $3), $4, to_tsvector('simple', $4))
+		VALUES ($1, $2, to_tsvector('simple', $3), $4, to_tsvector('simple', $5))
 		ON CONFLICT (content_hash) DO NOTHING
-	`, options.ContentHash, textBodyArg, sanePlaintextBody, saneRawHeaders)
+	`, options.ContentHash, textBodyArg, sanePlaintextBody, headersArg, saneRawHeaders)
 	if err != nil {
 		logger.Error("Database: failed to insert message content", "content_hash", options.ContentHash, "err", err)
 		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
