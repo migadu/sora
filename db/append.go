@@ -373,6 +373,33 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
 	saneRawHeaders := helpers.SanitizeUTF8(options.RawHeaders)
 
+	// PostgreSQL tsvector has a hard limit of 1,048,575 bytes (1MB).
+	// For extremely large messages (>1MB plaintext), skip FTS indexing entirely.
+	// These are typically spam, newsletters, or malformed messages - not legitimate correspondence.
+	// Use empty strings for FTS to avoid indexing overhead while still storing the full content.
+	const maxFTSBytes = 1024 * 1024 // 1 MB
+	sanePlaintextBodyForFTS := sanePlaintextBody
+	saneRawHeadersForFTS := saneRawHeaders
+
+	skipFTS := false
+	if len(sanePlaintextBody) > maxFTSBytes {
+		logger.Info("Database: skipping FTS indexing for very large message body",
+			"content_hash", truncateHash(options.ContentHash), "size_bytes", len(sanePlaintextBody))
+		sanePlaintextBodyForFTS = ""
+		skipFTS = true
+	}
+	if len(saneRawHeaders) > maxFTSBytes {
+		logger.Info("Database: skipping FTS indexing for very large headers",
+			"content_hash", truncateHash(options.ContentHash), "size_bytes", len(saneRawHeaders))
+		saneRawHeadersForFTS = ""
+		skipFTS = true
+	}
+
+	if skipFTS {
+		// Increment metric for monitoring
+		metrics.LargeFTSSkipped.Inc()
+	}
+
 	err = tx.QueryRow(ctx, `
 		INSERT INTO messages
 			(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
@@ -422,13 +449,31 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	}
 
 	// Insert into message_contents. ON CONFLICT DO NOTHING handles content deduplication.
-	// For messages older than the FTS retention period, we store NULL for both text_body
-	// and headers to save space, but still generate the TSV vectors for searching.
+	// For messages older than the FTS retention period, we store NULL for text_body
+	// and empty string for headers (which has NOT NULL constraint) to save space,
+	// but still generate the TSV vectors for searching.
+	// Also skip storing very large message bodies (>64KB) to avoid database bloat.
+	const maxStoredBodySize = 64 * 1024 // 64 KB
 	var textBodyArg any = sanePlaintextBody
 	var headersArg any = saneRawHeaders
+
 	if options.FTSRetention > 0 && options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
 		textBodyArg = nil
-		headersArg = nil
+		headersArg = "" // headers column is NOT NULL, use empty string
+	} else if len(sanePlaintextBody) > maxStoredBodySize {
+		// Message body is too large to store in database - full content is in S3
+		logger.Info("Database: skipping text_body storage for very large message",
+			"content_hash", truncateHash(options.ContentHash), "size_bytes", len(sanePlaintextBody))
+		textBodyArg = nil
+		metrics.LargeBodyStorageSkipped.Inc()
+	}
+
+	if len(saneRawHeaders) > maxStoredBodySize {
+		// Headers are unusually large - skip storing in database
+		logger.Info("Database: skipping headers storage for very large headers",
+			"content_hash", truncateHash(options.ContentHash), "size_bytes", len(saneRawHeaders))
+		headersArg = ""
+		metrics.LargeBodyStorageSkipped.Inc()
 	}
 
 	// For old messages, textBodyArg/headersArg are NULL, but the raw values are used for TSV generation.
@@ -436,7 +481,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
 		VALUES ($1, $2, to_tsvector('simple', $3), $4, to_tsvector('simple', $5))
 		ON CONFLICT (content_hash) DO NOTHING
-	`, options.ContentHash, textBodyArg, sanePlaintextBody, headersArg, saneRawHeaders)
+	`, options.ContentHash, textBodyArg, sanePlaintextBodyForFTS, headersArg, saneRawHeadersForFTS)
 	if err != nil {
 		logger.Error("Database: failed to insert message content", "content_hash", options.ContentHash, "err", err)
 		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback
@@ -654,6 +699,33 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
 	saneRawHeaders := helpers.SanitizeUTF8(options.RawHeaders)
 
+	// PostgreSQL tsvector has a hard limit of 1,048,575 bytes (1MB).
+	// For extremely large messages (>1MB plaintext), skip FTS indexing entirely.
+	// These are typically spam, newsletters, or malformed messages - not legitimate correspondence.
+	// Use empty strings for FTS to avoid indexing overhead while still storing the full content.
+	const maxFTSBytes = 1024 * 1024 // 1 MB
+	sanePlaintextBodyForFTS := sanePlaintextBody
+	saneRawHeadersForFTS := saneRawHeaders
+
+	skipFTS := false
+	if len(sanePlaintextBody) > maxFTSBytes {
+		logger.Info("Database: skipping FTS indexing for very large message body",
+			"content_hash", truncateHash(options.ContentHash), "size_bytes", len(sanePlaintextBody))
+		sanePlaintextBodyForFTS = ""
+		skipFTS = true
+	}
+	if len(saneRawHeaders) > maxFTSBytes {
+		logger.Info("Database: skipping FTS indexing for very large headers",
+			"content_hash", truncateHash(options.ContentHash), "size_bytes", len(saneRawHeaders))
+		saneRawHeadersForFTS = ""
+		skipFTS = true
+	}
+
+	if skipFTS {
+		// Increment metric for monitoring
+		metrics.LargeFTSSkipped.Inc()
+	}
+
 	err = tx.QueryRow(ctx, `
 		INSERT INTO messages
 			(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
@@ -703,13 +775,31 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	}
 
 	// Insert into message_contents. ON CONFLICT DO NOTHING handles content deduplication.
-	// For messages older than the FTS retention period, we store NULL for both text_body
-	// and headers to save space, but still generate the TSV vectors for searching.
+	// For messages older than the FTS retention period, we store NULL for text_body
+	// and empty string for headers (which has NOT NULL constraint) to save space,
+	// but still generate the TSV vectors for searching.
+	// Also skip storing very large message bodies (>64KB) to avoid database bloat.
+	const maxStoredBodySize = 64 * 1024 // 64 KB
 	var textBodyArg any = sanePlaintextBody
 	var headersArg any = saneRawHeaders
+
 	if options.FTSRetention > 0 && options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
 		textBodyArg = nil
-		headersArg = nil
+		headersArg = "" // headers column is NOT NULL, use empty string
+	} else if len(sanePlaintextBody) > maxStoredBodySize {
+		// Message body is too large to store in database - full content is in S3
+		logger.Info("Database: skipping text_body storage for very large message",
+			"content_hash", truncateHash(options.ContentHash), "size_bytes", len(sanePlaintextBody))
+		textBodyArg = nil
+		metrics.LargeBodyStorageSkipped.Inc()
+	}
+
+	if len(saneRawHeaders) > maxStoredBodySize {
+		// Headers are unusually large - skip storing in database
+		logger.Info("Database: skipping headers storage for very large headers",
+			"content_hash", truncateHash(options.ContentHash), "size_bytes", len(saneRawHeaders))
+		headersArg = ""
+		metrics.LargeBodyStorageSkipped.Inc()
 	}
 
 	// For old messages, textBodyArg/headersArg are NULL, but the raw values are used for TSV generation.
@@ -717,7 +807,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, headers_tsv)
 		VALUES ($1, $2, to_tsvector('simple', $3), $4, to_tsvector('simple', $5))
 		ON CONFLICT (content_hash) DO NOTHING
-	`, options.ContentHash, textBodyArg, sanePlaintextBody, headersArg, saneRawHeaders)
+	`, options.ContentHash, textBodyArg, sanePlaintextBodyForFTS, headersArg, saneRawHeadersForFTS)
 	if err != nil {
 		logger.Error("Database: failed to insert message content", "content_hash", options.ContentHash, "err", err)
 		return 0, 0, consts.ErrDBInsertFailed // Transaction will rollback

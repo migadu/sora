@@ -89,6 +89,20 @@ var (
 			Help: "Total number of accounts",
 		},
 	)
+
+	LargeFTSSkipped = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_large_fts_skipped_total",
+			Help: "Total number of messages skipped from FTS indexing due to large size (>1MB)",
+		},
+	)
+
+	LargeBodyStorageSkipped = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_large_body_storage_skipped_total",
+			Help: "Total number of message bodies/headers not stored in database due to large size (>64KB)",
+		},
+	)
 )
 
 // Storage metrics

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"mime/quotedprintable"
+	"regexp"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
@@ -13,6 +14,16 @@ import (
 	"github.com/k3a/html2text"
 	"lukechampine.com/blake3"
 )
+
+// stripBase64DataURIs removes base64-encoded data URIs from HTML to prevent huge plaintext conversions.
+// Common in newsletters with embedded images: <img src="data:image/png;base64,iVBORw0KG...">
+// Matches base64 strings >= 50 characters (roughly 37+ bytes of data)
+var dataURIRegex = regexp.MustCompile(`data:[^;]+;base64,[A-Za-z0-9+/=]{50,}`)
+
+func stripBase64DataURIs(html string) string {
+	// Replace long base64 data URIs with a placeholder
+	return dataURIRegex.ReplaceAllString(html, "[embedded-image]")
+}
 
 func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 	if msg == nil {
@@ -61,7 +72,16 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 
 	// If we don't have a plaintext body but we have an HTML body, convert it to plaintext
 	if plaintextBody == nil && htmlBody != nil {
-		plaintext := html2text.HTML2Text(*htmlBody)
+		// Strip base64-encoded data URIs before conversion to avoid massive plaintext
+		cleanedHTML := stripBase64DataURIs(*htmlBody)
+
+		// Also truncate extremely large HTML before conversion (>1MB) to prevent resource exhaustion
+		const maxHTMLForConversion = 1024 * 1024 // 1 MB
+		if len(cleanedHTML) > maxHTMLForConversion {
+			cleanedHTML = cleanedHTML[:maxHTMLForConversion]
+		}
+
+		plaintext := html2text.HTML2Text(cleanedHTML)
 		plaintextBody = &plaintext
 	}
 
