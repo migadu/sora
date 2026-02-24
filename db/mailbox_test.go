@@ -614,6 +614,101 @@ func TestGetMailboxMessageCountAndSizeSum(t *testing.T) {
 	t.Logf("Successfully tested GetMailboxMessageCountAndSizeSum with accountID: %d, mailboxID: %d", accountID, mailbox.ID)
 }
 
+// TestGetMailboxSummariesBatch tests batch mailbox summary retrieval
+func TestGetMailboxSummariesBatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID := setupMailboxTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Create multiple mailboxes
+	mailboxNames := []string{"BatchTest1", "BatchTest2", "BatchTest3", "BatchTest4", "BatchTest5",
+		"BatchTest6", "BatchTest7", "BatchTest8", "BatchTest9", "BatchTest10"}
+	var mailboxIDs []int64
+
+	for _, name := range mailboxNames {
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		err = db.CreateMailbox(ctx, tx, accountID, name, nil)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+
+		mbox, err := db.GetMailboxByName(ctx, accountID, name)
+		require.NoError(t, err)
+		mailboxIDs = append(mailboxIDs, mbox.ID)
+	}
+
+	t.Run("AllMailboxes", func(t *testing.T) {
+		summaries, err := db.GetMailboxSummariesBatch(ctx, mailboxIDs)
+		assert.NoError(t, err)
+		assert.Equal(t, len(mailboxIDs), len(summaries), "should return summary for each mailbox")
+
+		for _, id := range mailboxIDs {
+			s, ok := summaries[id]
+			assert.True(t, ok, "summary should exist for mailbox ID %d", id)
+			assert.Equal(t, 0, s.NumMessages, "empty mailbox should have 0 messages")
+			assert.Equal(t, 0, s.UnseenCount, "empty mailbox should have 0 unseen")
+			assert.True(t, s.UIDNext > 0, "UIDNext should be > 0")
+		}
+	})
+
+	t.Run("EmptyInput", func(t *testing.T) {
+		summaries, err := db.GetMailboxSummariesBatch(ctx, []int64{})
+		assert.NoError(t, err)
+		assert.NotNil(t, summaries)
+		assert.Empty(t, summaries)
+	})
+
+	t.Run("NonExistentIDs", func(t *testing.T) {
+		summaries, err := db.GetMailboxSummariesBatch(ctx, []int64{999999, 999998, 999997})
+		assert.NoError(t, err)
+		assert.NotNil(t, summaries)
+		assert.Empty(t, summaries, "non-existent IDs should return empty map")
+	})
+
+	t.Run("MixedExistentAndNonExistent", func(t *testing.T) {
+		mixedIDs := []int64{mailboxIDs[0], 999999, mailboxIDs[1], 999998}
+		summaries, err := db.GetMailboxSummariesBatch(ctx, mixedIDs)
+		assert.NoError(t, err)
+		assert.Equal(t, 2, len(summaries), "should only return summaries for existing mailboxes")
+		assert.Contains(t, summaries, mailboxIDs[0])
+		assert.Contains(t, summaries, mailboxIDs[1])
+	})
+
+	t.Run("SubsetOfMailboxes", func(t *testing.T) {
+		subset := mailboxIDs[:3]
+		summaries, err := db.GetMailboxSummariesBatch(ctx, subset)
+		assert.NoError(t, err)
+		assert.Equal(t, 3, len(summaries))
+	})
+
+	t.Run("ConsistentWithSingleSummary", func(t *testing.T) {
+		// Verify batch results match individual GetMailboxSummary results
+		batchSummaries, err := db.GetMailboxSummariesBatch(ctx, mailboxIDs)
+		require.NoError(t, err)
+
+		for _, id := range mailboxIDs {
+			singleSummary, err := db.GetMailboxSummary(ctx, id)
+			require.NoError(t, err)
+
+			batchSummary, ok := batchSummaries[id]
+			require.True(t, ok)
+
+			assert.Equal(t, singleSummary.NumMessages, batchSummary.NumMessages, "NumMessages mismatch for ID %d", id)
+			assert.Equal(t, singleSummary.UnseenCount, batchSummary.UnseenCount, "UnseenCount mismatch for ID %d", id)
+			assert.Equal(t, singleSummary.UIDNext, batchSummary.UIDNext, "UIDNext mismatch for ID %d", id)
+			assert.Equal(t, singleSummary.TotalSize, batchSummary.TotalSize, "TotalSize mismatch for ID %d", id)
+			assert.Equal(t, singleSummary.HighestModSeq, batchSummary.HighestModSeq, "HighestModSeq mismatch for ID %d", id)
+		}
+	})
+
+	t.Logf("Successfully tested GetMailboxSummariesBatch with %d mailboxes", len(mailboxIDs))
+}
+
 // TestMailboxNameValidation tests mailbox name validation scenarios
 func TestMailboxNameValidation(t *testing.T) {
 	tests := []struct {

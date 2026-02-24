@@ -39,6 +39,12 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 		parentFolders = calculateParentFolders(mboxes)
 	}
 
+	// Build name -> DBMailbox mapping for batch STATUS lookups
+	nameToMailbox := make(map[string]*db.DBMailbox, len(mboxes))
+	for _, mbox := range mboxes {
+		nameToMailbox[mbox.Name] = mbox
+	}
+
 	var l []imap.ListData
 	for _, mbox := range mboxes {
 		// Check if mailbox matches any of the patterns
@@ -81,14 +87,69 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 	hasListStatusCap := s.GetCapabilities().Has(imap.CapListStatus)
 
 	// Now handle STATUS returns if needed - after we've processed all mailboxes
-	// This avoids the deadlock when Status() tries to acquire a write lock
+	// Use batch query to fetch all summaries in a single database round-trip
+	// instead of N individual Status() calls (which each do 3 queries).
 	if options.ReturnStatus != nil && hasListStatusCap {
-		// Process STATUS returns in a separate loop to avoid lock contention
-		for i := range l {
-			data := &l[i]
-			if data.Mailbox != "" {
-				statusData, err := s.Status(data.Mailbox, options.ReturnStatus)
-				if err == nil && statusData != nil {
+		// Collect mailbox IDs for all listed mailboxes
+		var mailboxIDs []int64
+		for _, data := range l {
+			if data.Mailbox == "" {
+				continue
+			}
+			if mbox, ok := nameToMailbox[data.Mailbox]; ok {
+				mailboxIDs = append(mailboxIDs, mbox.ID)
+			}
+		}
+
+		if len(mailboxIDs) > 0 {
+			// Single batch query replaces N * 3 individual queries
+			summaries, err := s.server.rdb.GetMailboxSummariesBatchWithRetry(readCtx, mailboxIDs)
+			if err != nil {
+				s.DebugLog("failed to get batch mailbox summaries", "error", err)
+			} else {
+				// Populate STATUS data from batch results
+				for i := range l {
+					data := &l[i]
+					if data.Mailbox == "" {
+						continue
+					}
+					mbox, ok := nameToMailbox[data.Mailbox]
+					if !ok {
+						continue
+					}
+					summary, ok := summaries[mbox.ID]
+					if !ok {
+						continue
+					}
+
+					statusData := &imap.StatusData{
+						Mailbox:     data.Mailbox,
+						UIDValidity: mbox.UIDValidity,
+					}
+
+					if options.ReturnStatus.NumMessages {
+						num := uint32(summary.NumMessages)
+						statusData.NumMessages = &num
+					}
+					if options.ReturnStatus.UIDNext {
+						statusData.UIDNext = imap.UID(summary.UIDNext)
+					}
+					if options.ReturnStatus.NumRecent {
+						num := uint32(summary.RecentCount)
+						statusData.NumRecent = &num
+					}
+					if options.ReturnStatus.NumUnseen {
+						num := uint32(summary.UnseenCount)
+						statusData.NumUnseen = &num
+					}
+					if s.GetCapabilities().Has(imap.CapCondStore) && options.ReturnStatus.HighestModSeq {
+						statusData.HighestModSeq = summary.HighestModSeq
+					}
+					if options.ReturnStatus.AppendLimit && s.server.appendLimit > 0 {
+						limit := uint32(s.server.appendLimit)
+						statusData.AppendLimit = &limit
+					}
+
 					data.Status = statusData
 
 					numMessagesStr := "n/a"
@@ -100,9 +161,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 						numUnseenStr = fmt.Sprint(*statusData.NumUnseen)
 					}
 
-					s.InfoLog("mailbox status", "mailbox", data.Mailbox, "num_messages", numMessagesStr, "uid_next", statusData.UIDNext, "uid_validity", statusData.UIDValidity, "num_unseen", numUnseenStr, "highest_modseq", statusData.HighestModSeq)
-				} else {
-					s.InfoLog("failed to get status for mailbox", "mailbox", data.Mailbox, "error", err) // err can be nil if statusData is nil
+					s.DebugLog("mailbox status", "mailbox", data.Mailbox, "num_messages", numMessagesStr, "uid_next", statusData.UIDNext, "uid_validity", statusData.UIDValidity, "num_unseen", numUnseenStr, "highest_modseq", statusData.HighestModSeq)
 				}
 			}
 		}

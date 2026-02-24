@@ -657,6 +657,66 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 	return &s, nil
 }
 
+func (d *Database) GetMailboxSummariesBatch(ctx context.Context, mailboxIDs []int64) (map[int64]*MailboxSummary, error) {
+	if len(mailboxIDs) == 0 {
+		return map[int64]*MailboxSummary{}, nil
+	}
+
+	start := time.Now()
+	var err error
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "error"
+		}
+		metrics.DBQueryDuration.WithLabelValues("mailbox_summary_batch", "read").Observe(time.Since(start).Seconds())
+		metrics.DBQueriesTotal.WithLabelValues("mailbox_summary_batch", status, "read").Inc()
+	}()
+
+	tx, err := d.GetReadPoolWithContext(ctx).BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	const batchQuery = `
+		SELECT
+			mb.id,
+			mb.highest_uid + 1,
+			COALESCE(ms.message_count, 0),
+			COALESCE(ms.total_size, 0),
+			COALESCE(ms.highest_modseq, 1),
+			COALESCE(ms.unseen_count, 0)
+		FROM mailboxes mb
+		LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
+		WHERE mb.id = ANY($1)
+	`
+	rows, err := tx.Query(ctx, batchQuery, mailboxIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query batch mailbox summaries: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[int64]*MailboxSummary, len(mailboxIDs))
+	for rows.Next() {
+		var mailboxID int64
+		var s MailboxSummary
+		if err = rows.Scan(&mailboxID, &s.UIDNext, &s.NumMessages, &s.TotalSize, &s.HighestModSeq, &s.UnseenCount); err != nil {
+			return nil, fmt.Errorf("failed to scan batch mailbox summary: %w", err)
+		}
+		result[mailboxID] = &s
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating batch mailbox summaries: %w", err)
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit GetMailboxSummariesBatch transaction: %w", err)
+	}
+
+	return result, nil
+}
+
 func (d *Database) GetMailboxMessageCountAndSizeSum(ctx context.Context, mailboxID int64) (int, int64, error) {
 	var count int
 	var size int64

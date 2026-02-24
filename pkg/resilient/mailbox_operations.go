@@ -73,6 +73,20 @@ func (rd *ResilientDatabase) GetMailboxSummaryWithRetry(ctx context.Context, mai
 	return result.(*db.MailboxSummary), nil
 }
 
+func (rd *ResilientDatabase) GetMailboxSummariesBatchWithRetry(ctx context.Context, mailboxIDs []int64) (map[int64]*db.MailboxSummary, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetMailboxSummariesBatch(ctx, mailboxIDs)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return map[int64]*db.MailboxSummary{}, nil
+	}
+	return result.(map[int64]*db.MailboxSummary), nil
+}
+
 func (rd *ResilientDatabase) GetMailboxesWithRetry(ctx context.Context, AccountID int64, subscribed bool) ([]*db.DBMailbox, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetMailboxes(ctx, AccountID, subscribed)
