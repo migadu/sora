@@ -417,27 +417,26 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		defaultResult, defaultEvalErr := s.backend.defaultSieveExecutor.Evaluate(s.ctx, sieveCtx)
 		if defaultEvalErr != nil {
 			metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
-			s.DebugLog("default sieve script evaluation error", "error", defaultEvalErr)
+			s.WarnLog("default sieve script evaluation error", "error", defaultEvalErr)
 			// fallback: default to INBOX
 			result = sieveengine.Result{Action: sieveengine.ActionKeep}
 		} else {
 			metrics.SieveExecutions.WithLabelValues("lmtp", "success").Inc()
 			// Set the result from the default script
 			result = defaultResult
-			s.DebugLog("default sieve script result", "action", result.Action)
 
 			// Log more details about the action
 			switch result.Action {
 			case sieveengine.ActionFileInto:
-				s.DebugLog("default sieve fileinto", "mailbox", result.Mailbox)
+				s.InfoLog("default sieve fileinto", "mailbox", result.Mailbox, "copy", result.Copy, "create", result.CreateMailbox)
 			case sieveengine.ActionRedirect:
-				s.DebugLog("default sieve redirect", "redirect_to", result.RedirectTo)
+				s.InfoLog("default sieve redirect", "redirect_to", result.RedirectTo, "copy", result.Copy)
 			case sieveengine.ActionDiscard:
-				s.DebugLog("default sieve discard")
+				s.InfoLog("default sieve discard")
 			case sieveengine.ActionVacation:
-				s.DebugLog("default sieve vacation response triggered")
+				s.InfoLog("default sieve vacation response triggered")
 			case sieveengine.ActionKeep:
-				s.DebugLog("default sieve keep")
+				s.InfoLog("default sieve keep")
 			}
 		}
 	} else {
@@ -463,26 +462,25 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			userResult, userEvalErr := userSieveExecutor.Evaluate(s.ctx, sieveCtx)
 			if userEvalErr != nil {
 				metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
-				s.DebugLog("user sieve script evaluation error", "error", userEvalErr)
+				s.WarnLog("user sieve script evaluation error", "error", userEvalErr)
 				// Keep the result from the default script
 			} else {
 				metrics.SieveExecutions.WithLabelValues("lmtp", "success").Inc()
 				// Override the result with the user script result
 				result = userResult
-				s.DebugLog("user sieve script overrode result", "action", result.Action)
 
 				// Log more details about the action
 				switch result.Action {
 				case sieveengine.ActionFileInto:
-					s.DebugLog("user sieve fileinto", "mailbox", result.Mailbox)
+					s.InfoLog("user sieve fileinto", "mailbox", result.Mailbox, "copy", result.Copy, "create", result.CreateMailbox)
 				case sieveengine.ActionRedirect:
-					s.DebugLog("user sieve redirect", "redirect_to", result.RedirectTo)
+					s.InfoLog("user sieve redirect", "redirect_to", result.RedirectTo, "copy", result.Copy)
 				case sieveengine.ActionDiscard:
-					s.DebugLog("user sieve discard")
+					s.InfoLog("user sieve discard")
 				case sieveengine.ActionVacation:
-					s.DebugLog("user sieve vacation response triggered")
+					s.InfoLog("user sieve vacation response triggered")
 				case sieveengine.ActionKeep:
-					s.DebugLog("user sieve keep")
+					s.InfoLog("user sieve keep")
 				}
 			}
 		}
@@ -555,17 +553,17 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		return s.InternalError("failed to check file existence: %v", err)
 	}
 
-	s.DebugLog("executing sieve action", "action", result.Action)
+	s.InfoLog("executing sieve action", "action", result.Action)
 
 	switch result.Action {
 	case sieveengine.ActionDiscard:
-		s.DebugLog("sieve message discarded")
+		s.InfoLog("sieve message discarded")
 		return nil
 
 	case sieveengine.ActionFileInto:
 		mailboxName = result.Mailbox
 		if result.Copy {
-			s.DebugLog("sieve fileinto :copy action", "mailbox", mailboxName)
+			s.InfoLog("sieve fileinto :copy - saving to both mailbox and inbox", "mailbox", mailboxName)
 
 			// First save to the specified mailbox (with :create if specified)
 			err := s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
@@ -596,7 +594,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			s.InfoLog("message delivered according to fileinto :copy directive")
 			return nil
 		} else {
-			s.DebugLog("sieve fileinto action", "mailbox", mailboxName)
+			s.InfoLog("sieve fileinto - saving to mailbox only", "mailbox", mailboxName)
 		}
 
 	case sieveengine.ActionRedirect:
