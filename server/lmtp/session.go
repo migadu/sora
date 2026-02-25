@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -394,10 +395,18 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	if s.recipientAddr != nil {
 		envelopeTo = s.recipientAddr.FullAddress()
 	}
+
+	// Normalize header keys to lowercase for Sieve (RFC 5228 requires case-insensitive header matching)
+	// The go-sieve library expects lowercase header keys
+	normalizedHeaders := make(map[string][]string)
+	for key, values := range messageContent.Header.Map() {
+		normalizedHeaders[strings.ToLower(key)] = values
+	}
+
 	sieveCtx := sieveengine.Context{
 		EnvelopeFrom: s.sender.FullAddress(),
 		EnvelopeTo:   envelopeTo,
-		Header:       messageContent.Header.Map(),
+		Header:       normalizedHeaders,
 		Body:         *plaintextBody,
 	}
 
@@ -466,21 +475,30 @@ func (s *LMTPSession) Data(r io.Reader) error {
 				// Keep the result from the default script
 			} else {
 				metrics.SieveExecutions.WithLabelValues("lmtp", "success").Inc()
-				// Override the result with the user script result
-				result = userResult
 
-				// Log more details about the action
-				switch result.Action {
-				case sieveengine.ActionFileInto:
-					s.InfoLog("user sieve fileinto", "mailbox", result.Mailbox, "copy", result.Copy, "create", result.CreateMailbox)
-				case sieveengine.ActionRedirect:
-					s.InfoLog("user sieve redirect", "redirect_to", result.RedirectTo, "copy", result.Copy)
-				case sieveengine.ActionDiscard:
-					s.InfoLog("user sieve discard")
-				case sieveengine.ActionVacation:
-					s.InfoLog("user sieve vacation response triggered")
-				case sieveengine.ActionKeep:
-					s.InfoLog("user sieve keep")
+				// Merge user script result with default script result
+				// If user script returns implicit keep (ActionKeep), preserve the default script's action
+				// Otherwise, the user script overrides the default
+				if userResult.Action == sieveengine.ActionKeep && result.Action != sieveengine.ActionKeep {
+					s.InfoLog("user sieve implicit keep - preserving default script action", "default_action", result.Action)
+					// Keep the default script result (don't override)
+				} else {
+					// User script has an explicit action, override the default
+					result = userResult
+
+					// Log more details about the action
+					switch result.Action {
+					case sieveengine.ActionFileInto:
+						s.InfoLog("user sieve fileinto", "mailbox", result.Mailbox, "copy", result.Copy, "create", result.CreateMailbox)
+					case sieveengine.ActionRedirect:
+						s.InfoLog("user sieve redirect", "redirect_to", result.RedirectTo, "copy", result.Copy)
+					case sieveengine.ActionDiscard:
+						s.InfoLog("user sieve discard")
+					case sieveengine.ActionVacation:
+						s.InfoLog("user sieve vacation response triggered")
+					case sieveengine.ActionKeep:
+						s.InfoLog("user sieve explicit keep")
+					}
 				}
 			}
 		}
