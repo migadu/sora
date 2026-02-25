@@ -18,8 +18,8 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 	AccountID := s.AccountID()
 	release()
 
-	if existingName == newName {
-		s.DebugLog("new mailbox name is the same as current one", "mailbox", existingName)
+	if strings.EqualFold(existingName, newName) {
+		s.DebugLog("new mailbox name is the same as current one (case-insensitive)", "mailbox", existingName)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAlreadyExists,

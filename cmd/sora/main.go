@@ -527,10 +527,11 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		wakeInterval := cfg.Cleanup.GetWakeIntervalWithDefault()
 		maxAgeRestriction := cfg.Cleanup.GetMaxAgeRestrictionWithDefault()
 		ftsRetention := cfg.Cleanup.GetFTSRetentionWithDefault()
+		ftsSourceRetention := cfg.Cleanup.GetFTSSourceRetentionWithDefault()
 		healthStatusRetention := cfg.Cleanup.GetHealthStatusRetentionWithDefault()
 
 		cleanupErrChan := make(chan error, 1)
-		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, cleanupErrChan)
+		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, ftsSourceRetention, healthStatusRetention, cleanupErrChan)
 
 		// Start error listener for cleanup worker
 		go func() {
@@ -911,7 +912,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	defer deps.serverManager.Done()
 
 	appendLimit := serverConfig.GetAppendLimitWithDefault()
-	ftsRetention := deps.config.Cleanup.GetFTSRetentionWithDefault()
+	ftsSourceRetention := deps.config.Cleanup.GetFTSSourceRetentionWithDefault()
 
 	authRateLimit := server.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
@@ -987,7 +988,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			WarmupMailboxes:              deps.config.LocalCache.WarmupMailboxes,
 			WarmupAsync:                  deps.config.LocalCache.WarmupAsync,
 			WarmupTimeout:                deps.config.LocalCache.WarmupTimeout,
-			FTSRetention:                 ftsRetention,
+			FTSSourceRetention:           ftsSourceRetention,
 			CapabilityFilters:            serverConfig.ClientFilters,
 			DisabledCaps:                 serverConfig.DisabledCaps,
 			Version:                      version,
@@ -1032,7 +1033,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 	deps.serverManager.Add()
 	defer deps.serverManager.Done()
 
-	ftsRetention := deps.config.Cleanup.GetFTSRetentionWithDefault()
+	ftsSourceRetention := deps.config.Cleanup.GetFTSSourceRetentionWithDefault()
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
 	maxMessageSize, err := serverConfig.GetMaxMessageSize()
@@ -1066,7 +1067,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		ProxyProtocol:        serverConfig.ProxyProtocol,
 		ProxyProtocolTimeout: proxyProtocolTimeout,
 		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
-		FTSRetention:         ftsRetention,
+		FTSSourceRetention:   ftsSourceRetention,
 		MaxMessageSize:       maxMessageSize,
 		SieveExtensions:      deps.config.Sieve.EnabledExtensions,
 	})
@@ -1794,7 +1795,7 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		return
 	}
 
-	ftsRetention := deps.config.Cleanup.GetFTSRetentionWithDefault()
+	ftsSourceRetention := deps.config.Cleanup.GetFTSSourceRetentionWithDefault()
 
 	// Collect valid backends from all proxy server configs
 	validBackends := make(map[string][]string)
@@ -1838,7 +1839,7 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		TLSKeyFile:         serverConfig.TLSKeyFile,
 		TLSVerify:          serverConfig.TLSVerify,
 		Hostname:           deps.hostname,
-		FTSRetention:       ftsRetention,
+		FTSSourceRetention: ftsSourceRetention,
 		AffinityManager:    deps.affinityManager,
 		ValidBackends:      validBackends,
 		ConnectionTrackers: deps.connectionTrackers,

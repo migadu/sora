@@ -307,6 +307,120 @@ func (d *Database) PruneOldMessageBodiesBatched(ctx context.Context, retention t
 	return totalPruned, nil
 }
 
+// PruneOldMessageVectors sets text_body_tsv and headers_tsv to NULL for message contents
+// where all associated non-expunged messages are older than the given retention period.
+// This completely removes search capability for old messages to save space.
+// NOTE: This is a more aggressive cleanup than PruneOldMessageBodies - use with caution.
+// For production use with large datasets, use PruneOldMessageVectorsBatched instead.
+func (d *Database) PruneOldMessageVectors(ctx context.Context, tx pgx.Tx, retention time.Duration) (int64, error) {
+	const batchSize = 100
+
+	query := `
+		WITH candidates AS (
+			SELECT content_hash
+			FROM message_contents
+			WHERE text_body_tsv IS NOT NULL OR headers_tsv IS NOT NULL
+			LIMIT $2
+		),
+		prunable AS (
+			SELECT c.content_hash
+			FROM candidates c
+			WHERE NOT EXISTS (
+				SELECT 1 FROM messages m
+				WHERE m.content_hash = c.content_hash
+				  AND m.expunged_at IS NULL
+				  AND m.sent_date >= (now() - $1::interval)
+			)
+		)
+		UPDATE message_contents mc
+		SET
+			text_body_tsv = NULL,
+			headers_tsv = NULL,
+			updated_at = now()
+		FROM prunable p
+		WHERE mc.content_hash = p.content_hash
+	`
+	tag, err := tx.Exec(ctx, query, retention, batchSize)
+	if err != nil {
+		return 0, fmt.Errorf("failed to prune old message vectors: %w", err)
+	}
+
+	return tag.RowsAffected(), nil
+}
+
+// PruneOldMessageVectorsBatched processes message vector pruning in multiple batches,
+// committing between batches to avoid transaction timeout issues.
+// This should be used for production cleanup operations on large databases.
+func (d *Database) PruneOldMessageVectorsBatched(ctx context.Context, retention time.Duration) (int64, error) {
+	const batchSize = 100
+	var totalPruned int64
+	maxBatches := 1000 // Safety limit: max 100,000 records per cleanup run
+
+	for batch := 0; batch < maxBatches; batch++ {
+		// Check if context is cancelled
+		if ctx.Err() != nil {
+			return totalPruned, ctx.Err()
+		}
+
+		// Start a new transaction for this batch
+		tx, err := d.GetWritePool().Begin(ctx)
+		if err != nil {
+			return totalPruned, fmt.Errorf("failed to begin transaction for batch %d: %w", batch, err)
+		}
+
+		// Process one batch
+		query := `
+			WITH candidates AS (
+				SELECT content_hash
+				FROM message_contents
+				WHERE text_body_tsv IS NOT NULL OR headers_tsv IS NOT NULL
+				LIMIT $2
+			),
+			prunable AS (
+				SELECT c.content_hash
+				FROM candidates c
+				WHERE NOT EXISTS (
+					SELECT 1 FROM messages m
+					WHERE m.content_hash = c.content_hash
+					  AND m.expunged_at IS NULL
+					  AND m.sent_date >= (now() - $1::interval)
+				)
+			)
+			UPDATE message_contents mc
+			SET
+				text_body_tsv = NULL,
+				headers_tsv = NULL,
+				updated_at = now()
+			FROM prunable p
+			WHERE mc.content_hash = p.content_hash
+		`
+		tag, err := tx.Exec(ctx, query, retention, batchSize)
+		if err != nil {
+			tx.Rollback(ctx)
+			return totalPruned, fmt.Errorf("failed to prune message vectors in batch %d: %w", batch, err)
+		}
+
+		rowsAffected := tag.RowsAffected()
+
+		// Commit this batch
+		if err := tx.Commit(ctx); err != nil {
+			return totalPruned, fmt.Errorf("failed to commit batch %d: %w", batch, err)
+		}
+
+		totalPruned += rowsAffected
+
+		// If we processed zero rows, we're done (no more candidates)
+		if rowsAffected == 0 {
+			break
+		}
+
+		// Sleep briefly between batches to avoid overwhelming the database
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return totalPruned, nil
+}
+
 // GetUnusedContentHashes finds content_hash values in message_contents that are no longer referenced
 // by any message row at all. These are candidates for global cleanup.
 func (d *Database) GetUnusedContentHashes(ctx context.Context, limit int) ([]string, error) {

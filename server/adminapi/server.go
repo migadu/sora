@@ -53,7 +53,7 @@ type Server struct {
 	tlsKeyFile         string
 	tlsVerify          bool
 	hostname           string
-	ftsRetention       time.Duration
+	ftsSourceRetention time.Duration
 	affinityManager    AffinityManager
 	validBackends      map[string][]string
 	connectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker
@@ -77,7 +77,7 @@ type ServerOptions struct {
 	TLSKeyFile         string
 	TLSVerify          bool
 	Hostname           string
-	FTSRetention       time.Duration
+	FTSSourceRetention time.Duration
 	AffinityManager    AffinityManager
 	ValidBackends      map[string][]string                  // Map of protocol -> valid backend addresses
 	ConnectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker (for gossip-based kick)
@@ -174,7 +174,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		tlsKeyFile:         options.TLSKeyFile,
 		tlsVerify:          options.TLSVerify,
 		hostname:           options.Hostname,
-		ftsRetention:       options.FTSRetention,
+		ftsSourceRetention: options.FTSSourceRetention,
 		affinityManager:    options.AffinityManager,
 		validBackends:      options.ValidBackends,
 		connectionTrackers: options.ConnectionTrackers,

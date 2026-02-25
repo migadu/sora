@@ -246,13 +246,13 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 	}
 
 	deliveryCtx := &delivery.DeliveryContext{
-		Ctx:          ctx,
-		RDB:          s.rdb,
-		Uploader:     s.uploader,
-		Hostname:     s.hostname,
-		FTSRetention: s.ftsRetention,
-		MetricsLabel: "http_delivery",
-		Logger:       logger,
+		Ctx:                ctx,
+		RDB:                s.rdb,
+		Uploader:           s.uploader,
+		Hostname:           s.hostname,
+		FTSSourceRetention: s.ftsSourceRetention,
+		MetricsLabel:       "http_delivery",
+		Logger:             logger,
 	}
 
 	sieveExecutor := &delivery.StandardSieveExecutor{

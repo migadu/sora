@@ -494,11 +494,14 @@ retry_interval = "30s"        # Initial delay between retry attempts (exponentia
 # messages according to configured retention policies.
 
 [cleanup]
-grace_period = "14d"          # Recovery window for accidentally deleted messages before permanent removal.
-wake_interval = "1h"          # How often the cleanup worker runs.
-max_age_restriction = ""      # Max message age before auto-expungement. Empty = no limit. e.g., "90d", "365d".
-fts_retention = "730d"        # How long to keep full-text search content in DB. Older messages lose searchability.
-health_status_retention = "30d" # How long to retain health status history in the database.
+grace_period = "14d"              # Recovery window for accidentally deleted messages before permanent removal.
+wake_interval = "1h"              # How often the cleanup worker runs.
+max_age_restriction = ""          # Max message age before auto-expungement. Empty = no limit. e.g., "90d", "365d".
+fts_retention = ""                # How long to keep FTS search vectors (text_body_tsv, headers_tsv). Empty = keep forever (default).
+                                  # WARNING: Setting this removes search capability for old messages. Use with caution.
+fts_source_retention = "730d"     # How long to keep original message text (text_body, headers) that FTS indexes are built from.
+                                  # Older messages remain searchable via vectors but original text is removed to save space.
+health_status_retention = "30d"   # How long to retain health status history in the database.
 
 # EXTERNAL RELAY CONFIGURATION
 # =============================================================================

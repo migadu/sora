@@ -17,23 +17,16 @@ import (
 // ERROR: duplicate key value violates unique constraint "mailboxes_account_id_name_unique" (SQLSTATE 23505)
 //
 // ROOT CAUSE:
-// The old code used LOWER(name) for the existence check (case-insensitive),
-// but the database unique constraint is case-sensitive.
+// The old code used case-sensitive checks for rename conflict detection,
+// but GetMailboxByName uses case-insensitive matching (LOWER on both sides).
+// This inconsistency meant a rename could bypass the existence check when the
+// target name existed with different casing, leading to a constraint violation.
 //
-// Scenario:
-// 1. User has mailbox "Amazon" (capital A)
-// 2. User has mailbox "amazon" with children
-// 3. User renames "amazon" to "Amazon"
-// 4. OLD BUG: LOWER("Amazon") = LOWER("amazon") so check passes
-// 5. UPDATE tries to rename "amazon" → "Amazon"
-// 6. Constraint violation because "Amazon" already exists (case-sensitive)
-//
-// OR more likely for "amazontest":
-// 1. User has "Amazontest" or "AMAZONTEST"
-// 2. User has "amazon" and tries to rename to "amazontest"
-// 3. OLD BUG: LOWER("Amazontest") = LOWER("amazontest") so check passes
-// 4. UPDATE tries to create "amazontest"
-// 5. Constraint violation
+// The fix ensures:
+// 1. GetMailboxByName uses LOWER() on both sides (case-insensitive lookup)
+// 2. IMAP CREATE prevents creating case-duplicate mailboxes
+// 3. IMAP RENAME uses case-insensitive same-name check
+// 4. RenameMailbox DB function uses case-insensitive existence check
 func TestMailbox_RenameCaseSensitivityBug(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -50,22 +43,21 @@ func TestMailbox_RenameCaseSensitivityBug(t *testing.T) {
 		t.Fatalf("Login failed: %v", err)
 	}
 
-	// Test Case 1: Simple case mismatch
+	// Test Case 1: Rename to a name that conflicts case-insensitively with another mailbox
 	t.Run("SimpleCaseMismatch", func(t *testing.T) {
-		// Create "TestFolder"
+		// Create "TestFolder" and a separate "OtherFolder"
 		if err := c.Create("TestFolder", nil).Wait(); err != nil {
 			t.Fatalf("CREATE TestFolder failed: %v", err)
 		}
 
-		// Create "testfolder" (lowercase)
-		if err := c.Create("testfolder", nil).Wait(); err != nil {
-			t.Fatalf("CREATE testfolder failed: %v", err)
+		if err := c.Create("OtherFolder", nil).Wait(); err != nil {
+			t.Fatalf("CREATE OtherFolder failed: %v", err)
 		}
 
-		// Try to rename "testfolder" to "TestFolder"
-		err := c.Rename("testfolder", "TestFolder", nil).Wait()
+		// Try to rename "OtherFolder" to "testfolder" (case-insensitive conflict with "TestFolder")
+		err := c.Rename("OtherFolder", "testfolder", nil).Wait()
 		if err == nil {
-			t.Errorf("RENAME should have failed (case conflict), but succeeded")
+			t.Errorf("RENAME should have failed (case-insensitive conflict with TestFolder), but succeeded")
 		} else {
 			errStr := err.Error()
 			// With the FIX: Should get ALREADYEXISTS error
@@ -79,8 +71,16 @@ func TestMailbox_RenameCaseSensitivityBug(t *testing.T) {
 			}
 		}
 
+		// Also verify that creating a case-duplicate mailbox is prevented
+		err = c.Create("testfolder", nil).Wait()
+		if err == nil {
+			t.Errorf("CREATE should have failed (case-insensitive duplicate of TestFolder), but succeeded")
+		} else {
+			t.Logf("✓ CREATE correctly prevented case-duplicate: %v", err)
+		}
+
 		// Cleanup
-		c.Delete("testfolder").Wait()
+		c.Delete("OtherFolder").Wait()
 		c.Delete("TestFolder").Wait()
 	})
 
@@ -102,11 +102,10 @@ func TestMailbox_RenameCaseSensitivityBug(t *testing.T) {
 		t.Logf("Created: amazon, amazon/subfolder, Amazontest")
 
 		// Try to rename "amazon" to "amazontest" (lowercase)
-		// OLD BUG: LOWER("Amazontest") = LOWER("amazontest"), so check passes
-		// Then UPDATE fails with constraint violation
+		// This should fail because "Amazontest" already exists (case-insensitive match)
 		err := c.Rename("amazon", "amazontest", nil).Wait()
 		if err == nil {
-			t.Errorf("RENAME should have failed (case conflict with 'Amazontest'), but succeeded")
+			t.Errorf("RENAME should have failed (case-insensitive conflict with 'Amazontest'), but succeeded")
 		} else {
 			errStr := err.Error()
 			if strings.Contains(errStr, "SQLSTATE") || strings.Contains(errStr, "23505") ||

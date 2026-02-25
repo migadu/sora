@@ -802,9 +802,11 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	}
 
 	// Check if the new name already exists within the same transaction to prevent race conditions.
-	// Use case-sensitive comparison to match the unique constraint
+	// Use case-insensitive comparison (LOWER on both sides) to match GetMailboxByName behavior
+	// and prevent constraint violations from case-mismatched duplicates.
+	// Exclude the mailbox being renamed (id != $3) to allow case-only renames (e.g., "amazon" → "Amazon").
 	var existingID int64
-	err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND name = $2", AccountID, newName).Scan(&existingID)
+	err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND id != $3", AccountID, newName, mailboxID).Scan(&existingID)
 	if err == nil {
 		// A mailbox with the new name was found.
 		return consts.ErrMailboxAlreadyExists

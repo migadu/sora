@@ -201,6 +201,28 @@ go test -run "TestMessage" ./db          # Message operation tests
 3. Messages older than grace period are permanently deleted from PostgreSQL and S3
 4. Optional: `max_age_restriction` enables ephemeral storage (auto-expunge old messages)
 
+#### Full-Text Search Retention
+Sora provides granular control over FTS data retention to balance storage costs with search capability:
+
+1. **FTS Source Retention** (`fts_source_retention`):
+   - Controls how long to keep original message text (`text_body`, `headers`)
+   - Default: 730 days (2 years)
+   - After retention period: source text is deleted but FTS vectors remain
+   - Messages remain fully searchable via `text_body_tsv` and `headers_tsv`
+   - Backwards compatible: falls back to `fts_retention` if not set
+
+2. **FTS Vector Retention** (`fts_retention`):
+   - Controls how long to keep FTS search vectors (`text_body_tsv`, `headers_tsv`)
+   - Default: unlimited (keep forever)
+   - After retention period: search capability is completely removed
+   - WARNING: Use with caution - removes search functionality for old messages
+   - Typically set much higher than source retention (e.g., 3+ years)
+
+3. **Batched Processing**:
+   - Both pruning operations use batched processing (100 records per batch)
+   - Commits between batches to avoid transaction timeout issues
+   - Configurable safety limit (max 100,000 records per cleanup run)
+
 ### Proxy Mode Architecture
 
 Sora supports horizontal scaling through proxy mode:
@@ -770,6 +792,60 @@ logger.Error("Failed to connect", "err", err)
 
 Do not use the standard `log` package - use `logger` instead.
 
+
+## Workflow Orchestration
+
+### 1. Plan Node Default
+- Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)
+- If something goes sideways, STOP and re-plan immediately - don't keep pushing
+- Use plan mode for verification steps, not just building
+- Write detailed specs upfront to reduce ambiguity
+
+### 2. Subagent Strategy
+- Use subagents liberally to keep main context window clean
+- Offload research, exploration, and parallel analysis to subagents
+- For complex problems, throw more compute at it via subagents
+- One task per subagent for focused execution
+
+### 3. Self-Improvement Loop
+- After ANY correction from the user: update tasks/lessons.md with the pattern
+- Write rules for yourself that prevent the same mistake
+- Ruthlessly iterate on these lessons until mistake rate drops
+- Review lessons at session start for relevant project
+
+### 4. Verification Before Done
+- Never mark a task complete without proving it works
+- Diff behavior between main and your changes when relevant
+- Ask yourself: "Would a staff engineer approve this?"
+- Run tests, check logs, demonstrate correctness
+
+### 5. Demand Elegance (Balanced)
+- For non-trivial changes: pause and ask "is there a more elegant way?"
+- If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"
+- Skip this for simple, obvious fixes - don't over-engineer
+- Challenge your own work before presenting it
+
+### 6. Autonomous Bug Fixing
+- When given a bug report: just fix it. Don't ask for hand-holding
+- Point at logs, errors, failing tests - then resolve them
+- Zero context switching required from the user
+- Go fix failing CI tests without being told how
+
+## Task Management
+
+1. **Plan First**: Write plan to tasks/todo.md with checkable items
+2. **Verify Plan**: Check in before starting implementation
+3. **Track Progress**: Mark items complete as you go
+4. **Explain Changes**: High-level summary at each step
+5. **Document Results**: Add review section to tasks/todo.md
+6. **Capture Lessons**: Update tasks/lessons.md after corrections
+
+## Core Principles
+
+- **Simplicity First**: Make every change as simple as possible. Impact minimal code.
+- **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
+- **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+
 ## Recent Major Updates
 
 ### Production Hardening and Reliability (December 2024 - February 2025)
@@ -810,8 +886,9 @@ Do not use the standard `log` package - use `logger` instead.
 - **Failed Upload Tracking**: Enhanced monitoring with email attribution
 - **Recent Flag Handling**: Proper preservation of IMAP \Recent flag during import
 
-### Database and Performance (December 2024 - January 2025)
-- **Batched Pruning**: PruneOldMessageBodies now processes in batches for efficiency
+### Database and Performance (December 2024 - February 2025)
+- **Granular FTS Retention**: Separate control for FTS source text and vectors (fts_source_retention vs fts_retention)
+- **Batched Pruning**: PruneOldMessageBodies and PruneOldMessageVectors process in batches for efficiency
 - **Query Limits**: Explicit limit parameters for message query functions
 - **Deduplication Logic**: Handle same message_id with different content_hash
 - **Sequence Number Handling**: Direct database values for consistency after expunge

@@ -109,9 +109,10 @@ func TestSharedMailbox_DeleteWithChildren(t *testing.T) {
 	}
 }
 
-// TestMailbox_RenameCaseSensitivity tests the bug where renaming a mailbox
-// fails with "duplicate key violation" when the new name differs only in case
-// from an existing mailbox.
+// TestMailbox_RenameCaseSensitivity tests that renaming a mailbox to a name
+// that differs only in case from an existing mailbox is properly rejected.
+// With case-insensitive mailbox lookups (LOWER on both sides), the system
+// prevents both creating case-duplicate mailboxes and renaming into case conflicts.
 func TestMailbox_RenameCaseSensitivity(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -128,32 +129,45 @@ func TestMailbox_RenameCaseSensitivity(t *testing.T) {
 		t.Fatalf("Login failed: %v", err)
 	}
 
-	// Create mailboxes with different cases
-	mailboxLower := "testfolder"
-	mailboxUpper := "TESTFOLDER"
-	mailboxMixed := "TestFolder"
+	// Create two distinct mailboxes
+	mailboxExisting := "testfolder"
+	mailboxOther := "otherfolder"
 
-	if err := c.Create(mailboxLower, nil).Wait(); err != nil {
-		t.Fatalf("CREATE %s failed: %v", mailboxLower, err)
+	if err := c.Create(mailboxExisting, nil).Wait(); err != nil {
+		t.Fatalf("CREATE %s failed: %v", mailboxExisting, err)
 	}
-	if err := c.Create(mailboxUpper, nil).Wait(); err != nil {
-		t.Fatalf("CREATE %s failed: %v", mailboxUpper, err)
+	if err := c.Create(mailboxOther, nil).Wait(); err != nil {
+		t.Fatalf("CREATE %s failed: %v", mailboxOther, err)
 	}
 
-	t.Logf("✓ Created mailboxes: %s, %s", mailboxLower, mailboxUpper)
+	t.Logf("✓ Created mailboxes: %s, %s", mailboxExisting, mailboxOther)
 
-	// BUG: This should fail because the uniqueness check uses LOWER(name)
-	// but the actual unique constraint is case-sensitive
-	err = c.Rename(mailboxLower, mailboxMixed, nil).Wait()
+	// Verify that creating a case-duplicate is prevented
+	err = c.Create("TESTFOLDER", nil).Wait()
 	if err == nil {
-		t.Logf("RENAME to mixed case succeeded (this is actually fine if no conflict)")
+		t.Errorf("CREATE TESTFOLDER should have failed (case-insensitive duplicate of testfolder)")
 	} else {
-		// Check if it's the right error
+		t.Logf("✓ CREATE correctly prevented case-duplicate: %v", err)
+	}
+
+	// Verify that renaming to a case-insensitive conflict is rejected
+	err = c.Rename(mailboxOther, "TestFolder", nil).Wait()
+	if err == nil {
+		t.Errorf("RENAME should have failed (case-insensitive conflict with testfolder)")
+	} else {
 		if !contains(err.Error(), "exists") && !contains(err.Error(), "duplicate") && !contains(err.Error(), "unique") {
 			t.Errorf("Expected 'already exists' or 'duplicate' error, got: %v", err)
 		} else {
 			t.Logf("✓ RENAME correctly failed with: %v", err)
 		}
+	}
+
+	// Verify that renaming to the same name (case-insensitive) is rejected
+	err = c.Rename(mailboxExisting, "TESTFOLDER", nil).Wait()
+	if err == nil {
+		t.Errorf("RENAME to same name (different case) should have failed")
+	} else {
+		t.Logf("✓ RENAME to same name (different case) correctly failed: %v", err)
 	}
 }
 

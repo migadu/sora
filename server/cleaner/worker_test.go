@@ -64,6 +64,14 @@ func (m *mockDatabase) PruneOldMessageBodiesBatchedWithRetry(ctx context.Context
 	args := m.Called(ctx, retention)
 	return args.Get(0).(int64), args.Error(1)
 }
+func (m *mockDatabase) PruneOldMessageVectorsWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
+	args := m.Called(ctx, retention)
+	return args.Get(0).(int64), args.Error(1)
+}
+func (m *mockDatabase) PruneOldMessageVectorsBatchedWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
+	args := m.Called(ctx, retention)
+	return args.Get(0).(int64), args.Error(1)
+}
 func (m *mockDatabase) GetUnusedContentHashesWithRetry(ctx context.Context, limit int) ([]string, error) {
 	args := m.Called(ctx, limit)
 	return args.Get(0).([]string), args.Error(1)
@@ -110,7 +118,8 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 
 	gracePeriod := 14 * 24 * time.Hour
 	maxAge := 365 * 24 * time.Hour
-	ftsRetention := 730 * 24 * time.Hour
+	ftsRetention := 0 * time.Hour // Don't prune vectors in this test
+	ftsSourceRetention := 730 * 24 * time.Hour
 	healthRetention := 30 * 24 * time.Hour
 
 	worker := &CleanupWorker{
@@ -120,6 +129,7 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 		gracePeriod:           gracePeriod,
 		maxAgeRestriction:     maxAge,
 		ftsRetention:          ftsRetention,
+		ftsSourceRetention:    ftsSourceRetention,
 		healthStatusRetention: healthRetention,
 	}
 
@@ -149,8 +159,9 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	mockS3.On("DeleteWithRetry", ctx, "example.com/user2/hash2-not-found").Return(notFoundErr).Once()
 	mockDB.On("DeleteExpungedMessagesByS3KeyPartsBatchWithRetry", ctx, userScopedCandidates).Return(int64(2), nil).Once()
 
-	// Phase 2a: FTS pruning
-	mockDB.On("PruneOldMessageBodiesBatchedWithRetry", ctx, ftsRetention).Return(int64(15), nil).Once()
+	// Phase 2a: FTS source pruning
+	mockDB.On("PruneOldMessageBodiesBatchedWithRetry", ctx, ftsSourceRetention).Return(int64(15), nil).Once()
+	// Phase 2a2: FTS vector pruning (skipped since ftsRetention = 0)
 
 	// Phase 2b: Global resource cleanup
 	orphanHashes := []string{"orphan1", "orphan2"}
@@ -198,7 +209,8 @@ func TestCleanupWorker_RunOnce_PartialFailures(t *testing.T) {
 		s3:                    mockS3,
 		cache:                 mockCache,
 		maxAgeRestriction:     1 * time.Hour,
-		ftsRetention:          1 * time.Hour,
+		ftsRetention:          0,
+		ftsSourceRetention:    1 * time.Hour,
 		healthStatusRetention: 1 * time.Hour,
 	}
 
@@ -233,7 +245,8 @@ func TestCleanupWorker_RunOnce_S3DeleteFails(t *testing.T) {
 		rdb:                   mockDB,
 		s3:                    mockS3,
 		maxAgeRestriction:     1 * time.Hour,
-		ftsRetention:          1 * time.Hour,
+		ftsRetention:          0,
+		ftsSourceRetention:    1 * time.Hour,
 		healthStatusRetention: 1 * time.Hour,
 	}
 
@@ -291,5 +304,157 @@ func TestCleanupWorker_RunOnce_NoOp(t *testing.T) {
 	mockDB.AssertExpectations(t)
 	mockDB.AssertNotCalled(t, "ExpungeOldMessagesWithRetry")
 	mockDB.AssertNotCalled(t, "PruneOldMessageBodiesBatchedWithRetry")
+	mockDB.AssertNotCalled(t, "PruneOldMessageVectorsBatchedWithRetry")
 	mockCache.AssertNotCalled(t, "Delete")
+}
+
+func TestCleanupWorker_RunOnce_VectorPruning(t *testing.T) {
+	// Test that vector pruning is called when ftsRetention > 0
+	mockDB := new(mockDatabase)
+	mockCache := new(mockCache)
+	ctx := context.Background()
+
+	ftsRetention := 1095 * 24 * time.Hour      // 3 years
+	ftsSourceRetention := 730 * 24 * time.Hour // 2 years
+
+	worker := &CleanupWorker{
+		rdb:                   mockDB,
+		cache:                 mockCache,
+		ftsRetention:          ftsRetention,
+		ftsSourceRetention:    ftsSourceRetention,
+		healthStatusRetention: 1 * time.Hour,
+	}
+
+	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
+	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
+	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
+
+	// Both pruning functions should be called
+	mockDB.On("PruneOldMessageBodiesBatchedWithRetry", ctx, ftsSourceRetention).Return(int64(10), nil).Once()
+	mockDB.On("PruneOldMessageVectorsBatchedWithRetry", ctx, ftsRetention).Return(int64(5), nil).Once()
+
+	mockDB.On("GetUnusedContentHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+
+	err := worker.runOnce(ctx)
+
+	assert.NoError(t, err)
+	mockDB.AssertExpectations(t)
+}
+
+func TestCleanupWorker_RunOnce_NoFTSPruningWhenBothZero(t *testing.T) {
+	// When both ftsRetention and ftsSourceRetention are 0, no pruning should occur
+	mockDB := new(mockDatabase)
+	mockCache := new(mockCache)
+	ctx := context.Background()
+
+	worker := &CleanupWorker{
+		rdb:                   mockDB,
+		cache:                 mockCache,
+		ftsRetention:          0, // keep vectors forever
+		ftsSourceRetention:    0, // keep source forever
+		healthStatusRetention: 1 * time.Hour,
+	}
+
+	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
+	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
+	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
+
+	// Neither PruneOldMessageBodiesBatchedWithRetry nor PruneOldMessageVectorsBatchedWithRetry should be called
+	// (no On() setup means test will fail if they're called)
+
+	mockDB.On("GetUnusedContentHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+
+	err := worker.runOnce(ctx)
+
+	assert.NoError(t, err)
+	mockDB.AssertExpectations(t)
+	// Verify pruning was NOT called
+	mockDB.AssertNotCalled(t, "PruneOldMessageBodiesBatchedWithRetry", mock.Anything, mock.Anything)
+	mockDB.AssertNotCalled(t, "PruneOldMessageVectorsBatchedWithRetry", mock.Anything, mock.Anything)
+}
+
+func TestCleanupWorker_RunOnce_SourceOnlyPruning(t *testing.T) {
+	// Only source retention is set, vector retention is 0 (keep forever)
+	mockDB := new(mockDatabase)
+	mockCache := new(mockCache)
+	ctx := context.Background()
+
+	ftsSourceRetention := 365 * 24 * time.Hour // 1 year
+
+	worker := &CleanupWorker{
+		rdb:                   mockDB,
+		cache:                 mockCache,
+		ftsRetention:          0, // keep vectors forever
+		ftsSourceRetention:    ftsSourceRetention,
+		healthStatusRetention: 1 * time.Hour,
+	}
+
+	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
+	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
+	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
+
+	// Source pruning should be called
+	mockDB.On("PruneOldMessageBodiesBatchedWithRetry", ctx, ftsSourceRetention).Return(int64(20), nil).Once()
+	// Vector pruning should NOT be called (ftsRetention = 0)
+
+	mockDB.On("GetUnusedContentHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+
+	err := worker.runOnce(ctx)
+
+	assert.NoError(t, err)
+	mockDB.AssertExpectations(t)
+	mockDB.AssertNotCalled(t, "PruneOldMessageVectorsBatchedWithRetry", mock.Anything, mock.Anything)
+}
+
+func TestCleanupWorker_RunOnce_VectorOnlyPruning(t *testing.T) {
+	// Unusual config: vector retention set but source retention is 0 (keep source forever)
+	mockDB := new(mockDatabase)
+	mockCache := new(mockCache)
+	ctx := context.Background()
+
+	ftsRetention := 1095 * 24 * time.Hour // 3 years
+
+	worker := &CleanupWorker{
+		rdb:                   mockDB,
+		cache:                 mockCache,
+		ftsRetention:          ftsRetention,
+		ftsSourceRetention:    0, // keep source forever
+		healthStatusRetention: 1 * time.Hour,
+	}
+
+	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
+	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
+	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
+
+	// Source pruning should NOT be called (ftsSourceRetention = 0)
+	// Vector pruning should be called
+	mockDB.On("PruneOldMessageVectorsBatchedWithRetry", ctx, ftsRetention).Return(int64(8), nil).Once()
+
+	mockDB.On("GetUnusedContentHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+
+	err := worker.runOnce(ctx)
+
+	assert.NoError(t, err)
+	mockDB.AssertExpectations(t)
+	mockDB.AssertNotCalled(t, "PruneOldMessageBodiesBatchedWithRetry", mock.Anything, mock.Anything)
 }

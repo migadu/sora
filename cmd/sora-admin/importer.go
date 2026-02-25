@@ -49,7 +49,7 @@ type ImporterOptions struct {
 	ImportDelay          time.Duration // Delay between imports to control rate
 	SievePath            string        // Path to Sieve script file to import
 	PreserveUIDs         bool          // Preserve UIDs from dovecot-uidlist files
-	FTSRetention         time.Duration // FTS retention period to skip old messages
+	FTSSourceRetention   time.Duration // FTS source retention period to skip storing text for old messages
 	TestMode             bool          // Skip S3 uploads for testing (messages stored in DB only)
 	BatchSize            int           // Number of messages to process in each batch (default: 20)
 	BatchTransactionMode bool          // Use single transaction per batch (faster but less resilient, default: false)
@@ -1706,7 +1706,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 			RawHeaders:           up.metadata.rawHeaders,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
-			FTSRetention:         i.options.FTSRetention,
+			FTSSourceRetention:   i.options.FTSSourceRetention,
 		})
 
 		if err != nil {
@@ -1787,7 +1787,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]str
 			RawHeaders:           up.metadata.rawHeaders,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
-			FTSRetention:         i.options.FTSRetention,
+			FTSSourceRetention:   i.options.FTSSourceRetention,
 		})
 
 		if err != nil {

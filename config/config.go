@@ -246,7 +246,8 @@ type CleanupConfig struct {
 	GracePeriod           string `toml:"grace_period"`
 	WakeInterval          string `toml:"wake_interval"`
 	MaxAgeRestriction     string `toml:"max_age_restriction"`
-	FTSRetention          string `toml:"fts_retention"`
+	FTSRetention          string `toml:"fts_retention"`        // How long to keep FTS vectors (text_body_tsv, headers_tsv)
+	FTSSourceRetention    string `toml:"fts_source_retention"` // How long to keep source text (text_body, headers)
 	HealthStatusRetention string `toml:"health_status_retention"`
 }
 
@@ -274,12 +275,26 @@ func (c *CleanupConfig) GetMaxAgeRestriction() (time.Duration, error) {
 	return helpers.ParseDuration(c.MaxAgeRestriction)
 }
 
-// GetFTSRetention parses the FTS retention duration
+// GetFTSRetention parses the FTS retention duration (for vector data)
 func (c *CleanupConfig) GetFTSRetention() (time.Duration, error) {
 	if c.FTSRetention == "" {
-		return 730 * 24 * time.Hour, nil // 2 years default
+		return 0, nil // 0 means keep vectors forever (default)
 	}
 	return helpers.ParseDuration(c.FTSRetention)
+}
+
+// GetFTSSourceRetention parses the FTS source retention duration (for text_body and headers)
+// This controls how long we keep the original text that FTS indexes are built from.
+// If not set, falls back to FTSRetention for backwards compatibility.
+func (c *CleanupConfig) GetFTSSourceRetention() (time.Duration, error) {
+	if c.FTSSourceRetention != "" {
+		return helpers.ParseDuration(c.FTSSourceRetention)
+	}
+	// Backwards compatibility: if fts_source_retention not set, use fts_retention
+	if c.FTSRetention != "" {
+		return helpers.ParseDuration(c.FTSRetention)
+	}
+	return 730 * 24 * time.Hour, nil // 2 years default
 }
 
 // GetHealthStatusRetention parses the health status retention duration
@@ -1470,7 +1485,7 @@ func NewDefaultConfig() Config {
 		Cleanup: CleanupConfig{
 			GracePeriod:           "14d",
 			WakeInterval:          "1h",
-			FTSRetention:          "730d", // 2 years default
+			FTSSourceRetention:    "730d", // 2 years default for source text
 			HealthStatusRetention: "30d",
 		},
 		LocalCache: LocalCacheConfig{
@@ -2011,7 +2026,16 @@ func (c *CleanupConfig) GetMaxAgeRestrictionWithDefault() time.Duration {
 func (c *CleanupConfig) GetFTSRetentionWithDefault() time.Duration {
 	retention, err := c.GetFTSRetention()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup fts_retention: %v, using default (2 years)", err)
+		log.Printf("WARNING: Failed to parse cleanup fts_retention: %v, using default (keep forever)", err)
+		return 0
+	}
+	return retention
+}
+
+func (c *CleanupConfig) GetFTSSourceRetentionWithDefault() time.Duration {
+	retention, err := c.GetFTSSourceRetention()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cleanup fts_source_retention: %v, using default (2 years)", err)
 		return 730 * 24 * time.Hour
 	}
 	return retention

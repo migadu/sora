@@ -44,6 +44,8 @@ type DatabaseManager interface {
 	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
 	PruneOldMessageBodiesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	PruneOldMessageBodiesBatchedWithRetry(ctx context.Context, retention time.Duration) (int64, error)
+	PruneOldMessageVectorsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
+	PruneOldMessageVectorsBatchedWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUnusedContentHashesWithRetry(ctx context.Context, limit int) ([]string, error)
 	DeleteMessageContentsByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error)
 	GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, limit int) ([]int64, error)
@@ -67,7 +69,8 @@ type CleanupWorker struct {
 	interval              time.Duration
 	gracePeriod           time.Duration
 	maxAgeRestriction     time.Duration
-	ftsRetention          time.Duration
+	ftsRetention          time.Duration // How long to keep FTS vectors (text_body_tsv, headers_tsv)
+	ftsSourceRetention    time.Duration // How long to keep source text (text_body, headers)
 	healthStatusRetention time.Duration
 	stopCh                chan struct{}
 	errCh                 chan<- error
@@ -77,7 +80,7 @@ type CleanupWorker struct {
 }
 
 // New creates a new CleanupWorker.
-func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention time.Duration, errCh chan<- error) *CleanupWorker {
+func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, ftsSourceRetention, healthStatusRetention time.Duration, errCh chan<- error) *CleanupWorker {
 	// Wrap S3 storage with resilient patterns including circuit breakers
 	resilientS3 := resilient.NewResilientS3Storage(s3)
 
@@ -89,6 +92,7 @@ func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.C
 		gracePeriod:           gracePeriod,
 		maxAgeRestriction:     maxAgeRestriction,
 		ftsRetention:          ftsRetention,
+		ftsSourceRetention:    ftsSourceRetention,
 		healthStatusRetention: healthStatusRetention,
 		stopCh:                make(chan struct{}),
 		errCh:                 errCh,
@@ -125,7 +129,12 @@ func (w *CleanupWorker) run(ctx context.Context) {
 	if w.maxAgeRestriction > 0 {
 		logParts = append(logParts, fmt.Sprintf("max age restriction: %v", w.maxAgeRestriction))
 	}
-	logParts = append(logParts, fmt.Sprintf("FTS retention: %v", w.ftsRetention))
+	if w.ftsRetention > 0 {
+		logParts = append(logParts, fmt.Sprintf("FTS vector retention: %v", w.ftsRetention))
+	}
+	if w.ftsSourceRetention > 0 {
+		logParts = append(logParts, fmt.Sprintf("FTS source retention: %v", w.ftsSourceRetention))
+	}
 	logParts = append(logParts, fmt.Sprintf("health status retention: %v", w.healthStatusRetention))
 
 	logger.Info("Cleanup: Worker processing", "config", strings.Join(logParts, ", "))
@@ -311,17 +320,31 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		logger.Info("Cleanup: no user-scoped objects to clean up")
 	}
 
-	// --- Phase 2a: FTS Body Pruning (for old messages) ---
-	if w.ftsRetention > 0 {
+	// --- Phase 2a: FTS Source Text Pruning (for old messages) ---
+	if w.ftsSourceRetention > 0 {
 		// This prunes text_body and headers of old messages to save space, but keeps
 		// text_body_tsv and headers_tsv so that full-text search continues to work.
 		// Use the batched version which commits between batches to avoid timeout issues.
-		prunedBodiesCount, err = w.rdb.PruneOldMessageBodiesBatchedWithRetry(ctx, w.ftsRetention)
+		prunedBodiesCount, err = w.rdb.PruneOldMessageBodiesBatchedWithRetry(ctx, w.ftsSourceRetention)
 		if err != nil {
-			logger.Error("Cleanup: Failed to prune old message bodies", "error", err)
+			logger.Error("Cleanup: Failed to prune old message source text", "error", err)
 			// Continue with other cleanup tasks even if this fails
 		} else if prunedBodiesCount > 0 {
-			logger.Info("Cleanup: Pruned text_body for old message contents", "count", prunedBodiesCount, "age", w.ftsRetention)
+			logger.Info("Cleanup: Pruned text_body for old message contents", "count", prunedBodiesCount, "age", w.ftsSourceRetention)
+		}
+	}
+
+	// --- Phase 2a2: FTS Vector Pruning (for very old messages) ---
+	if w.ftsRetention > 0 {
+		// This prunes text_body_tsv and headers_tsv of old messages, completely removing search capability.
+		// This is more aggressive than source pruning - use with caution.
+		// Use the batched version which commits between batches to avoid timeout issues.
+		prunedVectorsCount, err := w.rdb.PruneOldMessageVectorsBatchedWithRetry(ctx, w.ftsRetention)
+		if err != nil {
+			logger.Error("Cleanup: Failed to prune old message vectors", "error", err)
+			// Continue with other cleanup tasks even if this fails
+		} else if prunedVectorsCount > 0 {
+			logger.Info("Cleanup: Pruned text_body_tsv for old message contents", "count", prunedVectorsCount, "age", w.ftsRetention)
 		}
 	}
 

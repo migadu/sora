@@ -149,7 +149,7 @@ type InsertMessageOptions struct {
 	RawHeaders           string
 	PreservedUID         *uint32       // Optional: preserved UID from import
 	PreservedUIDValidity *uint32       // Optional: preserved UIDVALIDITY from import
-	FTSRetention         time.Duration // Optional: FTS retention period to skip old messages
+	FTSSourceRetention   time.Duration // Optional: FTS source retention period to skip storing text for old messages
 }
 
 func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
@@ -457,23 +457,24 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	var textBodyArg any = sanePlaintextBody
 	var headersArg any = saneRawHeaders
 
-	if options.FTSRetention > 0 && options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
+	if options.FTSSourceRetention > 0 && options.SentDate.Before(time.Now().Add(-options.FTSSourceRetention)) {
 		textBodyArg = nil
 		headersArg = "" // headers column is NOT NULL, use empty string
-	} else if len(sanePlaintextBody) > maxStoredBodySize {
-		// Message body is too large to store in database - full content is in S3
-		logger.Info("Database: skipping text_body storage for very large message",
-			"content_hash", truncateHash(options.ContentHash), "size_bytes", len(sanePlaintextBody))
-		textBodyArg = nil
-		metrics.LargeBodyStorageSkipped.Inc()
-	}
-
-	if len(saneRawHeaders) > maxStoredBodySize {
-		// Headers are unusually large - skip storing in database
-		logger.Info("Database: skipping headers storage for very large headers",
-			"content_hash", truncateHash(options.ContentHash), "size_bytes", len(saneRawHeaders))
-		headersArg = ""
-		metrics.LargeBodyStorageSkipped.Inc()
+	} else {
+		if len(sanePlaintextBody) > maxStoredBodySize {
+			// Message body is too large to store in database - full content is in S3
+			logger.Info("Database: skipping text_body storage for very large message",
+				"content_hash", truncateHash(options.ContentHash), "size_bytes", len(sanePlaintextBody))
+			textBodyArg = nil
+			metrics.LargeBodyStorageSkipped.Inc()
+		}
+		if len(saneRawHeaders) > maxStoredBodySize {
+			// Headers are unusually large - skip storing in database
+			logger.Info("Database: skipping headers storage for very large headers",
+				"content_hash", truncateHash(options.ContentHash), "size_bytes", len(saneRawHeaders))
+			headersArg = ""
+			metrics.LargeBodyStorageSkipped.Inc()
+		}
 	}
 
 	// For old messages, textBodyArg/headersArg are NULL, but the raw values are used for TSV generation.
@@ -783,23 +784,24 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	var textBodyArg any = sanePlaintextBody
 	var headersArg any = saneRawHeaders
 
-	if options.FTSRetention > 0 && options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
+	if options.FTSSourceRetention > 0 && options.SentDate.Before(time.Now().Add(-options.FTSSourceRetention)) {
 		textBodyArg = nil
 		headersArg = "" // headers column is NOT NULL, use empty string
-	} else if len(sanePlaintextBody) > maxStoredBodySize {
-		// Message body is too large to store in database - full content is in S3
-		logger.Info("Database: skipping text_body storage for very large message",
-			"content_hash", truncateHash(options.ContentHash), "size_bytes", len(sanePlaintextBody))
-		textBodyArg = nil
-		metrics.LargeBodyStorageSkipped.Inc()
-	}
-
-	if len(saneRawHeaders) > maxStoredBodySize {
-		// Headers are unusually large - skip storing in database
-		logger.Info("Database: skipping headers storage for very large headers",
-			"content_hash", truncateHash(options.ContentHash), "size_bytes", len(saneRawHeaders))
-		headersArg = ""
-		metrics.LargeBodyStorageSkipped.Inc()
+	} else {
+		if len(sanePlaintextBody) > maxStoredBodySize {
+			// Message body is too large to store in database - full content is in S3
+			logger.Info("Database: skipping text_body storage for very large message",
+				"content_hash", truncateHash(options.ContentHash), "size_bytes", len(sanePlaintextBody))
+			textBodyArg = nil
+			metrics.LargeBodyStorageSkipped.Inc()
+		}
+		if len(saneRawHeaders) > maxStoredBodySize {
+			// Headers are unusually large - skip storing in database
+			logger.Info("Database: skipping headers storage for very large headers",
+				"content_hash", truncateHash(options.ContentHash), "size_bytes", len(saneRawHeaders))
+			headersArg = ""
+			metrics.LargeBodyStorageSkipped.Inc()
+		}
 	}
 
 	// For old messages, textBodyArg/headersArg are NULL, but the raw values are used for TSV generation.

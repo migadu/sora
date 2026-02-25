@@ -106,20 +106,20 @@ func (c *connectionLimitingConn) Close() error {
 }
 
 type LMTPServerBackend struct {
-	addr           string
-	name           string
-	hostname       string
-	rdb            *resilient.ResilientDatabase
-	s3             *storage.S3Storage
-	uploader       *uploader.UploadWorker
-	server         *smtp.Server
-	appCtx         context.Context
-	tlsConfig      *tls.Config
-	debug          bool
-	ftsRetention   time.Duration
-	maxMessageSize int64               // Maximum size for incoming messages
-	relayQueue     delivery.RelayQueue // Disk-based queue for relay retry
-	relayWorker    RelayWorkerNotifier // Optional: notifies worker for immediate processing
+	addr               string
+	name               string
+	hostname           string
+	rdb                *resilient.ResilientDatabase
+	s3                 *storage.S3Storage
+	uploader           *uploader.UploadWorker
+	server             *smtp.Server
+	appCtx             context.Context
+	tlsConfig          *tls.Config
+	debug              bool
+	ftsSourceRetention time.Duration
+	maxMessageSize     int64               // Maximum size for incoming messages
+	relayQueue         delivery.RelayQueue // Disk-based queue for relay retry
+	relayWorker        RelayWorkerNotifier // Optional: notifies worker for immediate processing
 
 	// Connection counters
 	totalConnections  atomic.Int64
@@ -164,7 +164,7 @@ type LMTPServerOptions struct {
 	ProxyProtocolTimeout        string   // Timeout for reading PROXY headers
 	ProxyProtocolTrustedProxies []string // CIDR blocks for PROXY protocol validation (defaults to trusted_networks if empty)
 	TrustedNetworks             []string // Global trusted networks for parameter forwarding
-	FTSRetention                time.Duration
+	FTSSourceRetention          time.Duration
 	MaxMessageSize              int64    // Maximum size for incoming messages in bytes
 	SieveExtensions             []string // Sieve extensions to enable (nil/empty = all default extensions)
 }
@@ -198,19 +198,19 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	}
 
 	backend := &LMTPServerBackend{
-		addr:           addr,
-		name:           name,
-		appCtx:         appCtx,
-		hostname:       hostname,
-		rdb:            rdb,
-		s3:             s3,
-		uploader:       uploadWorker,
-		debug:          options.Debug,
-		ftsRetention:   options.FTSRetention,
-		maxMessageSize: options.MaxMessageSize,
-		proxyReader:    proxyReader,
-		relayQueue:     options.RelayQueue,
-		relayWorker:    options.RelayWorker,
+		addr:               addr,
+		name:               name,
+		appCtx:             appCtx,
+		hostname:           hostname,
+		rdb:                rdb,
+		s3:                 s3,
+		uploader:           uploadWorker,
+		debug:              options.Debug,
+		ftsSourceRetention: options.FTSSourceRetention,
+		maxMessageSize:     options.MaxMessageSize,
+		proxyReader:        proxyReader,
+		relayQueue:         options.RelayQueue,
+		relayWorker:        options.RelayWorker,
 	}
 
 	// Create connection limiter with trusted networks from proxy configuration
