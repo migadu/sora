@@ -177,7 +177,31 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 			param := nextParam()
 			args[param] = lowerValue
 			conditions = append(conditions, fmt.Sprintf("LOWER(%sin_reply_to) = @%s", datePrefix, param))
-		case "from", "to", "cc", "bcc", "reply-to":
+		case "from":
+			param := nextParam()
+			// Support partial matching on both email address and display name
+			// This allows searching for "peter" to find "peter@whatever.com" or "Peter Smith"
+			// Note: *_sort columns are already lowercase
+			args[param] = "%" + lowerValue + "%"
+			conditions = append(conditions, fmt.Sprintf(
+				"(%sfrom_email_sort LIKE @%s OR %sfrom_name_sort LIKE @%s)",
+				datePrefix, param, datePrefix, param))
+		case "to":
+			param := nextParam()
+			// Support partial matching on both email address and display name
+			// Note: *_sort columns are already lowercase
+			args[param] = "%" + lowerValue + "%"
+			conditions = append(conditions, fmt.Sprintf(
+				"(%sto_email_sort LIKE @%s OR %sto_name_sort LIKE @%s)",
+				datePrefix, param, datePrefix, param))
+		case "cc":
+			param := nextParam()
+			// Support partial email matching using indexed cc_email_sort column
+			// Note: CC doesn't have a name_sort column, only email
+			args[param] = "%" + lowerValue + "%"
+			conditions = append(conditions, fmt.Sprintf("%scc_email_sort LIKE @%s", datePrefix, param))
+		case "bcc", "reply-to":
+			// BCC and Reply-To don't have dedicated sort columns, fall back to JSONB search
 			recipientJSONParam := nextParam()
 			recipientValue := fmt.Sprintf(`[{"type": "%s", "email": "%s"}]`, lowerKey, lowerValue)
 			args[recipientJSONParam] = recipientValue

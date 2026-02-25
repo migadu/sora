@@ -210,7 +210,7 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 	}
 
 	searchQuery := `
-		SELECT 
+		SELECT
 			m.id, m.uid, m.mailbox_id, m.subject, m.sent_date, m.internal_date,
 			m.size, m.flags, m.custom_flags, m.message_id, m.in_reply_to,
 			m.recipients_json, m.content_hash, m.s3_domain, m.s3_localpart,
@@ -221,6 +221,11 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 		AND (
 			LOWER(m.subject) LIKE LOWER($2)
+			OR m.from_email_sort LIKE LOWER($2)
+			OR m.from_name_sort LIKE LOWER($2)
+			OR m.to_email_sort LIKE LOWER($2)
+			OR m.to_name_sort LIKE LOWER($2)
+			OR m.cc_email_sort LIKE LOWER($2)
 			OR mc.text_body_tsv @@ plainto_tsquery($3)
 			OR mc.headers_tsv @@ plainto_tsquery($3)
 		)
