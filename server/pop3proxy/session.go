@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -150,6 +151,13 @@ func (s *POP3ProxySession) handleConnection() {
 			writer.Flush()
 
 		case "PASS":
+			// Check insecure_auth: reject PASS over non-TLS when insecure_auth is false
+			if !s.server.insecureAuth && !s.isConnectionSecure() {
+				if s.handleAuthError(writer, "-ERR Authentication requires TLS connection\r\n") {
+					return
+				}
+				continue
+			}
 			authStart := time.Now()
 			if s.username == "" {
 				if s.handleAuthError(writer, "-ERR Must provide USER first\r\n") {
@@ -1347,6 +1355,22 @@ func (s *POP3ProxySession) copyReaderToConnWithDeadline(dst net.Conn, src *bufio
 			return totalBytes, nil
 		}
 	}
+}
+
+// isConnectionSecure checks if the underlying connection is TLS-encrypted.
+func (s *POP3ProxySession) isConnectionSecure() bool {
+	conn := s.clientConn
+	for conn != nil {
+		if _, ok := conn.(*tls.Conn); ok {
+			return true
+		}
+		if wrapper, ok := conn.(interface{ Unwrap() net.Conn }); ok {
+			conn = wrapper.Unwrap()
+		} else {
+			break
+		}
+	}
+	return false
 }
 
 func checkMasterCredential(provided string, actual []byte) bool {

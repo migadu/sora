@@ -167,6 +167,7 @@ type LMTPServerOptions struct {
 	FTSSourceRetention          time.Duration
 	MaxMessageSize              int64    // Maximum size for incoming messages in bytes
 	SieveExtensions             []string // Sieve extensions to enable (nil/empty = all default extensions)
+	InsecureAuth                bool     // Allow PLAIN auth over non-TLS connections (default: true for LMTP behind trusted network)
 }
 
 func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -276,8 +277,12 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	s := smtp.NewServer(backend)
 	s.Addr = addr
 	s.Domain = hostname
-	s.AllowInsecureAuth = true
+	s.AllowInsecureAuth = options.InsecureAuth
 	s.LMTP = true
+	s.MaxRecipients = 1 // Enforce single recipient per LMTP transaction.
+	// Our session processes one recipient at a time (Rcpt overwrites).
+	// This makes the behavior explicit and advertises LIMITS RCPTMAX=1 in LHLO,
+	// so the MTA sends each recipient in a separate transaction.
 
 	// Configure XCLIENT support (always enabled)
 	s.EnableXCLIENT = true

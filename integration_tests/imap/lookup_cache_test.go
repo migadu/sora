@@ -585,8 +585,9 @@ func setupIMAPServerWithLookupCacheCustom(t *testing.T, enabled bool, positiveTT
 		uploadWorker,
 		nil, // cache.Cache
 		imap.IMAPServerOptions{
-			Config:      testConfig,
-			LookupCache: lookupCacheConfig,
+			InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
+			Config:       testConfig,
+			LookupCache:  lookupCacheConfig,
 		},
 	)
 	if err != nil {

@@ -1284,10 +1284,12 @@ type ServerConfig struct {
 	TLSUseStartTLS bool   `toml:"tls_use_starttls,omitempty"`
 	MaxMessageSize string `toml:"max_message_size,omitempty"` // Maximum size for incoming LMTP messages
 
+	// Auth security
+	InsecureAuth bool `toml:"insecure_auth,omitempty"` // Allow PLAIN auth over non-TLS connections (default: false for ManageSieve, true for IMAP/LMTP behind proxy)
+
 	// ManageSieve specific
 	MaxScriptSize       string   `toml:"max_script_size,omitempty"`
 	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // List of supported Sieve extensions (additional to builtins)
-	InsecureAuth        bool     `toml:"insecure_auth,omitempty"`
 
 	// Proxy specific
 	RemoteAddrs            []string `toml:"remote_addrs,omitempty"`

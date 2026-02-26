@@ -301,7 +301,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		name:                       opts.Name,
 		addr:                       opts.Addr,
 		hostname:                   hostname,
-		insecureAuth:               opts.InsecureAuth,
+		insecureAuth:               opts.InsecureAuth || !opts.TLS, // Auto-enable when TLS not configured
 		masterUsername:             []byte(opts.MasterUsername),
 		masterPassword:             []byte(opts.MasterPassword),
 		masterSASLUsername:         []byte(opts.MasterSASLUsername),

@@ -761,6 +761,7 @@ func setupIMAPServerWithRateLimiting(t *testing.T, rateLimitConfig server.AuthRa
 		nil, // upload worker
 		nil, // cache
 		serverImap.IMAPServerOptions{
+			InsecureAuth:  true, // Allow PLAIN auth (no TLS in tests)
 			AuthRateLimit: rateLimitConfig,
 		},
 	)

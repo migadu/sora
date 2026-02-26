@@ -68,7 +68,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	// Create a context that signals to use the master DB if the session is pinned.
 	readCtx := s.ctx
-	if s.useMasterDB {
+	if s.useMasterDB.Load() {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
@@ -296,7 +296,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	defer release()
 
 	// Pin this session to the master DB to ensure read-your-writes consistency.
-	s.useMasterDB = true
+	s.useMasterDB.Store(true)
 
 	// After re-acquiring the lock, check again if the context is still valid
 	if s.ctx.Err() != nil {

@@ -65,6 +65,9 @@ type Server struct {
 	// Listen backlog
 	listenBacklog int
 
+	// Auth security
+	insecureAuth bool
+
 	// Debug logging
 	debug       bool
 	debugWriter io.Writer
@@ -166,6 +169,9 @@ type ServerOptions struct {
 
 	// Authentication limits
 	MaxAuthErrors int // Maximum authentication errors before disconnection (default: 2)
+
+	// Auth security
+	InsecureAuth bool // Allow PLAIN auth over non-TLS connections
 
 	// Debug logging
 	Debug bool // Enable debug logging with password masking
@@ -347,6 +353,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		limiter:                    limiter,
 		listenBacklog:              listenBacklog,
+		insecureAuth:               opts.InsecureAuth || !opts.TLS, // Auto-enable when TLS not configured
 		debug:                      opts.Debug,
 		debugWriter:                debugWriter,
 		maxAuthErrors:              opts.MaxAuthErrors,

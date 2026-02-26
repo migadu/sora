@@ -72,7 +72,8 @@ func setupServerWithPerUserPerIPLimit(t *testing.T, maxPerUser, maxPerUserPerIP 
 		uploadWorker,
 		nil,
 		imap.IMAPServerOptions{
-			Config: testConfig,
+			InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
+			Config:       testConfig,
 		},
 	)
 	if err != nil {
@@ -264,7 +265,8 @@ func TestPerUserPerIPLimit_MultipleUsers(t *testing.T) {
 		uploadWorker,
 		nil,
 		imap.IMAPServerOptions{
-			Config: testConfig,
+			InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
+			Config:       testConfig,
 		},
 	)
 	if err != nil {

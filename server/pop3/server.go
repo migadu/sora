@@ -73,6 +73,9 @@ type POP3Server struct {
 	// XCLIENT is always enabled but limited to trusted networks
 	trustedNetworks []string
 
+	// Auth security
+	insecureAuth bool // Allow PLAIN auth over non-TLS connections
+
 	// Memory limiting
 	sessionMemoryLimit int64
 
@@ -117,6 +120,7 @@ type POP3ServerOptions struct {
 	CommandTimeout              time.Duration             // Maximum idle time before disconnection
 	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = use default 30m)
 	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
+	InsecureAuth                bool                      // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
 	Config                      *config.Config            // Full config for shared settings like connection tracking timeouts
 }
 
@@ -205,6 +209,13 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		logger.Info("POP3: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
+	// Apply default idle timeout if not configured (RFC 1939 §3: at least 10 minutes)
+	commandTimeout := options.CommandTimeout
+	if commandTimeout == 0 {
+		commandTimeout = Pop3DefaultIdleTimeout
+		logger.Info("POP3: Using default idle timeout (RFC 1939 §3)", "name", name, "timeout", commandTimeout)
+	}
+
 	server := &POP3Server{
 		hostname:               hostname,
 		name:                   name,
@@ -225,8 +236,9 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		trustedNetworks:        options.TrustedNetworks,
 		sessionMemoryLimit:     options.SessionMemoryLimit,
 		authIdleTimeout:        options.AuthIdleTimeout,
-		commandTimeout:         options.CommandTimeout,
+		commandTimeout:         commandTimeout,
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
+		insecureAuth:           options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
 		minBytesPerMinute:      options.MinBytesPerMinute,
 		activeSessions:         make(map[*POP3Session]struct{}),
 	}

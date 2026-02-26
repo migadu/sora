@@ -75,6 +75,7 @@ func setupIMAPServerWithProxyProtocol(t *testing.T, maxTotal, maxPerIP int, trus
 		uploadWorker,
 		nil, // cache.Cache
 		imap.IMAPServerOptions{
+			InsecureAuth:         true, // Allow PLAIN auth (no TLS in tests)
 			MaxConnections:       maxTotal,
 			MaxConnectionsPerIP:  maxPerIP,
 			ProxyProtocol:        true,

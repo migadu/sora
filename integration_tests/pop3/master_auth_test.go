@@ -45,6 +45,7 @@ func setupPOP3ServerWithMasterAuth(t *testing.T) (*common.TestServer, common.Tes
 		nil, // uploadWorker
 		nil, // cache
 		pop3.POP3ServerOptions{
+			InsecureAuth:       true, // Allow PLAIN auth (no TLS in tests)
 			Config:             testConfig,
 			MasterUsername:     masterUsername,
 			MasterPassword:     masterPassword,

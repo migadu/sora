@@ -61,6 +61,9 @@ type POP3ProxyServer struct {
 	// Listen backlog
 	listenBacklog int
 
+	// Auth security
+	insecureAuth bool
+
 	// Debug logging
 	debug       bool
 	debugWriter io.Writer
@@ -123,6 +126,7 @@ func (mw *maskingWriter) Write(p []byte) (n int, err error) {
 
 type POP3ProxyServerOptions struct {
 	Name                     string // Server name for logging
+	InsecureAuth             bool   // Allow PLAIN auth over non-TLS connections
 	Debug                    bool
 	TLS                      bool
 	TLSCertFile              string
@@ -355,6 +359,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		listenBacklog:              listenBacklog,
 		maxAuthErrors:              options.MaxAuthErrors,
+		insecureAuth:               options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
 		debug:                      options.Debug,
 		debugWriter:                debugWriter,
 		activeSessions:             make(map[*POP3ProxySession]struct{}),

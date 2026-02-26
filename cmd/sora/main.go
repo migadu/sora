@@ -996,6 +996,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			MetadataMaxEntriesPerMailbox: deps.config.Metadata.MaxEntriesPerMailbox,
 			MetadataMaxEntriesPerServer:  deps.config.Metadata.MaxEntriesPerServer,
 			MetadataMaxTotalSize:         deps.config.Metadata.MaxTotalSize,
+			InsecureAuth:                 serverConfig.InsecureAuth || !serverConfig.TLS, // Default true when TLS not enabled (backend behind proxy)
 			Config:                       &deps.config,
 		})
 	if err != nil {
@@ -1070,6 +1071,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		FTSSourceRetention:   ftsSourceRetention,
 		MaxMessageSize:       maxMessageSize,
 		SieveExtensions:      deps.config.Sieve.EnabledExtensions,
+		InsecureAuth:         serverConfig.InsecureAuth || !serverConfig.TLS, // Default true when TLS not enabled (LMTP behind trusted network)
 	})
 
 	if err != nil {
@@ -1148,6 +1150,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		CommandTimeout:         commandTimeout,
 		AbsoluteSessionTimeout: absoluteSessionTimeout,
 		MinBytesPerMinute:      serverConfig.GetMinBytesPerMinute(),
+		InsecureAuth:           serverConfig.InsecureAuth || !serverConfig.TLS, // Default true when TLS not enabled (backend behind proxy)
 		Config:                 &deps.config,
 	})
 
@@ -1223,7 +1226,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	}
 
 	s, err := managesieve.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.resilientDB, managesieve.ManageSieveServerOptions{
-		InsecureAuth:           serverConfig.InsecureAuth,
+		InsecureAuth:           serverConfig.InsecureAuth || !serverConfig.TLS, // Ignored when TLS not configured
 		TLSVerify:              serverConfig.TLSVerify,
 		TLS:                    serverConfig.TLS,
 		TLSCertFile:            serverConfig.TLSCertFile,
@@ -1380,6 +1383,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		TrustedNetworks:          deps.config.Servers.TrustedNetworks,
 		ListenBacklog:            serverConfig.ListenBacklog,
 		MaxAuthErrors:            serverConfig.GetMaxAuthErrors(),
+		InsecureAuth:             serverConfig.InsecureAuth || !serverConfig.TLS,
 		Debug:                    serverConfig.Debug,
 	})
 	if err != nil {
@@ -1500,6 +1504,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		ListenBacklog:            serverConfig.ListenBacklog,
 		LookupCache:              serverConfig.LookupCache,
 		MaxAuthErrors:            serverConfig.GetMaxAuthErrors(),
+		InsecureAuth:             serverConfig.InsecureAuth || !serverConfig.TLS,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create POP3 proxy server: %w", err)
@@ -1588,7 +1593,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		Addr:                     serverConfig.Addr,
 		RemoteAddrs:              serverConfig.RemoteAddrs,
 		RemotePort:               remotePort,
-		InsecureAuth:             serverConfig.InsecureAuth,
+		InsecureAuth:             serverConfig.InsecureAuth || !serverConfig.TLS, // Ignored when TLS not configured
 		MasterUsername:           serverConfig.MasterUsername,
 		MasterPassword:           serverConfig.MasterPassword,
 		MasterSASLUsername:       serverConfig.MasterSASLUsername,

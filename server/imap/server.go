@@ -330,6 +330,8 @@ type IMAPServerOptions struct {
 	CommandTimeout         time.Duration // Maximum idle time before disconnection
 	AbsoluteSessionTimeout time.Duration // Maximum total session duration (0 = use default 30m)
 	MinBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
+	// Auth security
+	InsecureAuth bool // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
 	// Full config for shared mailboxes and other features
 	Config *config.Config
 }
@@ -643,7 +645,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	s.server = imapserver.New(&imapserver.Options{
 		NewSession:   s.newSession,
 		Logger:       log.Default(),
-		InsecureAuth: true, // We handle TLS authentication ourselves
+		InsecureAuth: options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
 		DebugWriter:  debugWriter,
 		Caps:         s.caps,
 		TLSConfig:    nil,

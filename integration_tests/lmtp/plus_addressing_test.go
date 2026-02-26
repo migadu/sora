@@ -96,7 +96,7 @@ func TestLMTP_PlusAddressingWithSharedUploader(t *testing.T) {
 		rdb,
 		sharedUploader,
 		nil, // cache
-		imapserver.IMAPServerOptions{},
+		imapserver.IMAPServerOptions{InsecureAuth: true},
 	)
 	if err != nil {
 		t.Fatalf("Failed to create IMAP server: %v", err)
@@ -448,7 +448,7 @@ The Sieve :create modifier should automatically create it.
 		rdb,
 		uploader,
 		nil,
-		imapserver.IMAPServerOptions{},
+		imapserver.IMAPServerOptions{InsecureAuth: true},
 	)
 	if err != nil {
 		t.Fatalf("Failed to create IMAP server: %v", err)
@@ -597,7 +597,7 @@ if header :contains "subject" ["Izvod po dinarskom", "Izvod po deviznom"] {
 		rdb,
 		sharedUploader,
 		nil,
-		imapserver.IMAPServerOptions{},
+		imapserver.IMAPServerOptions{InsecureAuth: true},
 	)
 	if err != nil {
 		t.Fatalf("Failed to create IMAP server: %v", err)

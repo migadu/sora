@@ -75,7 +75,8 @@ func SetupIMAPServerWithConnectionTracking(t *testing.T, maxConnectionsPerUser i
 		uploadWorker,
 		nil,
 		imap.IMAPServerOptions{
-			Config: testConfig,
+			InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
+			Config:       testConfig,
 		},
 	)
 	if err != nil {

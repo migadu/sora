@@ -575,7 +575,8 @@ func setupPOP3ServerWithLookupCache(t *testing.T, enabled bool, positiveTTL, neg
 		uploadWorker,
 		nil, // cache.Cache
 		pop3.POP3ServerOptions{
-			LookupCache: lookupCacheConfig,
+			InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
+			LookupCache:  lookupCacheConfig,
 		},
 	)
 	if err != nil {
@@ -679,7 +680,8 @@ func setupPOP3ServerWithLookupCacheCustom(t *testing.T, enabled bool, positiveTT
 		uploadWorker,
 		nil, // cache.Cache
 		pop3.POP3ServerOptions{
-			LookupCache: lookupCacheConfig,
+			InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
+			LookupCache:  lookupCacheConfig,
 		},
 	)
 	if err != nil {

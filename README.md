@@ -8,11 +8,11 @@ It provides enterprise-grade email infrastructure with modern storage backends, 
 ## Features
 
 ### Core Protocols
-- **IMAP4rev1** server with IDLE, ESEARCH, ACL, and other extensions
-- **LMTP** for reliable message delivery with SIEVE filtering
-- **POP3** with SASL authentication
-- **ManageSieve** for script management
-- **SIEVE** filtering with vacation responses
+- **IMAP4rev1** server with IDLE, CONDSTORE, ESEARCH, SORT, MOVE, ACL, BINARY, and other extensions
+- **LMTP** for reliable message delivery with SIEVE filtering and vacation auto-reply loop prevention
+- **POP3** with SASL authentication and multi-layer timeout protection
+- **ManageSieve** for script management with STARTTLS
+- **SIEVE** filtering with vacation responses, editheader, fileinto :copy, redirect :copy
 - **HTTP API** for administration and monitoring
 
 ### Storage Architecture
@@ -71,7 +71,7 @@ Sora is designed for:
 
 ## Requirements
 
-- Go 1.23+
+- Go 1.24+
 - PostgreSQL 14+ with pg_trgm extension
 - S3-compatible object storage (MinIO, AWS S3, etc.)
 - Port 7946 (for cluster gossip protocol, optional)
@@ -543,7 +543,7 @@ Access health status via:
 
 Or via HTTP API:
 ```bash
-curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/adnin/health/overview
+curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/admin/health/overview
 ```
 
 ### Prometheus Metrics

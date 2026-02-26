@@ -146,6 +146,9 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		}
 	}
 
+	// Track UIDs that fail the UNCHANGEDSINCE precondition (RFC 7162 §3.1.3)
+	var failedUIDs imap.UIDSet
+
 	for _, msg := range messages {
 		// CONDSTORE functionality - only process if capability is enabled
 		if s.GetCapabilities().Has(imap.CapCondStore) && options != nil && options.UnchangedSince > 0 {
@@ -162,6 +165,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 			if uint64(currentModSeq) > options.UnchangedSince {
 				s.DebugLog("CONDSTORE skipping message", "uid", msg.UID, "modseq", currentModSeq, "unchanged_since", options.UnchangedSince)
+				failedUIDs.AddNum(msg.UID)
 				continue
 			}
 		}
@@ -198,6 +202,33 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 			flags:  newFlags,
 			modSeq: newModSeq,
 		})
+	}
+
+	// RFC 7162 §3.1.3: If any messages failed the UNCHANGEDSINCE check,
+	// return NO [MODIFIED <uid-set>] after sending FETCH responses for successful updates.
+	if len(failedUIDs) > 0 {
+		s.DebugLog("CONDSTORE: returning MODIFIED for failed UIDs", "uids", failedUIDs.String())
+
+		// Still send FETCH responses for successfully modified messages (before the NO)
+		if !sanitizedStoreFlags.Silent {
+			for _, modified := range modifiedMessages {
+				m := w.CreateMessage(modified.seq)
+				m.WriteFlags(modified.flags)
+				m.WriteUID(modified.uid)
+				if s.GetCapabilities().Has(imap.CapCondStore) {
+					m.WriteModSeq(uint64(modified.modSeq))
+				}
+				if err := m.Close(); err != nil {
+					s.DebugLog("failed to close fetch response", "uid", modified.uid, "error", err)
+				}
+			}
+		}
+
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCode("MODIFIED"),
+			Text: "UNCHANGEDSINCE precondition failed for some messages",
+		}
 	}
 
 	// Before responding with fetches, check if context is still valid

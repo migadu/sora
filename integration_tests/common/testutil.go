@@ -232,7 +232,8 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 		uploadWorker, // properly initialized UploadWorker
 		nil,          // cache.Cache
 		imap.IMAPServerOptions{
-			Config: testConfig,
+			InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
+			Config:       testConfig,
 		},
 	)
 	if err != nil {
@@ -360,7 +361,7 @@ func SetupPOP3Server(t *testing.T) (*TestServer, TestAccount) {
 		rdb,
 		nil, // uploader.UploadWorker
 		nil, // cache.Cache
-		pop3.POP3ServerOptions{},
+		pop3.POP3ServerOptions{InsecureAuth: true},
 	)
 	if err != nil {
 		t.Fatalf("Failed to create POP3 server: %v", err)
@@ -471,6 +472,7 @@ func SetupIMAPServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 		uploadWorker, // properly initialized UploadWorker
 		nil,          // cache.Cache
 		imap.IMAPServerOptions{
+			InsecureAuth:         true,                               // Allow PLAIN auth (no TLS in tests)
 			ProxyProtocol:        true,                               // Enable PROXY protocol support
 			ProxyProtocolTimeout: "5s",                               // Timeout for PROXY headers
 			TrustedNetworks:      []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
@@ -561,6 +563,7 @@ func SetupIMAPServerWithPROXYAndDatabase(t *testing.T, rdb *resilient.ResilientD
 		uploadWorker, // properly initialized UploadWorker
 		nil,          // cache.Cache
 		imap.IMAPServerOptions{
+			InsecureAuth:         true,                               // Allow PLAIN auth (no TLS in tests)
 			ProxyProtocol:        true,                               // Enable PROXY protocol support
 			ProxyProtocolTimeout: "5s",                               // Timeout for PROXY headers
 			TrustedNetworks:      []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
@@ -653,6 +656,7 @@ func SetupIMAPServerWithMaster(t *testing.T) (*TestServer, TestAccount) {
 		uploadWorker, // properly initialized UploadWorker
 		nil,          // cache.Cache
 		imap.IMAPServerOptions{
+			InsecureAuth:       true,                               // Allow PLAIN auth (no TLS in tests)
 			ProxyProtocol:      false,                              // Disable PROXY protocol (ID command mode)
 			TrustedNetworks:    []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
 			MasterSASLUsername: []byte(masterUsername),             // Master username for proxy authentication
@@ -717,6 +721,7 @@ func SetupPOP3ServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 		nil, // uploader.UploadWorker
 		nil, // cache.Cache
 		pop3.POP3ServerOptions{
+			InsecureAuth:         true,                               // Allow PLAIN auth (no TLS in tests)
 			ProxyProtocol:        true,                               // Enable PROXY protocol support
 			ProxyProtocolTimeout: "5s",                               // Timeout for PROXY headers
 			TrustedNetworks:      []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
@@ -779,6 +784,7 @@ func SetupPOP3ServerForXCLIENT(t *testing.T) (*TestServer, TestAccount) {
 		nil, // uploader.UploadWorker
 		nil, // cache.Cache
 		pop3.POP3ServerOptions{
+			InsecureAuth:         true,                               // Allow PLAIN auth (no TLS in tests)
 			ProxyProtocol:        false,                              // Disable PROXY protocol (using XCLIENT instead)
 			ProxyProtocolTimeout: "5s",                               // Not used when ProxyProtocol is false
 			TrustedNetworks:      []string{"127.0.0.0/8", "::1/128"}, // Trust localhost for XCLIENT commands
@@ -840,6 +846,7 @@ func SetupPOP3ServerWithMaster(t *testing.T) (*TestServer, TestAccount) {
 		nil, // uploader.UploadWorker
 		nil, // cache.Cache
 		pop3.POP3ServerOptions{
+			InsecureAuth:       true,                               // Allow PLAIN auth (no TLS in tests)
 			ProxyProtocol:      false,                              // Disable PROXY protocol (XCLIENT mode)
 			TrustedNetworks:    []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
 			MasterSASLUsername: masterUsername,                     // Master username for proxy authentication
@@ -896,6 +903,7 @@ func SetupPOP3ServerWithTimeout(t *testing.T, commandTimeout time.Duration) (*Te
 		nil, // uploader.UploadWorker
 		nil, // cache.Cache
 		pop3.POP3ServerOptions{
+			InsecureAuth:   true, // Allow PLAIN auth (no TLS in tests)
 			CommandTimeout: commandTimeout,
 		},
 	)
@@ -920,6 +928,57 @@ func SetupPOP3ServerWithTimeout(t *testing.T, commandTimeout time.Duration) (*Te
 			}
 		case <-time.After(1 * time.Second):
 			// Timeout waiting for server to shut down
+		}
+	}
+
+	return &TestServer{
+		Address:     address,
+		Server:      server,
+		cleanup:     cleanup,
+		ResilientDB: rdb,
+	}, account
+}
+
+// SetupPOP3ServerWithInsecureAuth sets up a POP3 server with configurable insecure_auth for testing
+func SetupPOP3ServerWithInsecureAuth(t *testing.T, insecureAuth bool) (*TestServer, TestAccount) {
+	t.Helper()
+
+	rdb := SetupTestDatabase(t)
+	account := CreateTestAccount(t, rdb)
+	address := GetRandomAddress(t)
+
+	server, err := pop3.New(
+		context.Background(),
+		"test-insecure-auth",
+		"localhost",
+		address,
+		&storage.S3Storage{},
+		rdb,
+		nil,
+		nil,
+		pop3.POP3ServerOptions{
+			InsecureAuth: insecureAuth,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create POP3 server with insecure_auth=%v: %v", insecureAuth, err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		server.Start(errChan)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	cleanup := func() {
+		server.Close()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("POP3 server error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
 		}
 	}
 
@@ -1233,6 +1292,7 @@ func SetupIMAPServerWithTimeout(t *testing.T, commandTimeout time.Duration) (*Te
 		nil, // upload worker
 		nil, // cache
 		imap.IMAPServerOptions{
+			InsecureAuth:   true, // Allow PLAIN auth (no TLS in tests)
 			CommandTimeout: commandTimeout,
 		},
 	)
@@ -1287,6 +1347,7 @@ func SetupIMAPServerWithSlowloris(t *testing.T, commandTimeout time.Duration, mi
 		nil, // upload worker
 		nil, // cache
 		imap.IMAPServerOptions{
+			InsecureAuth:      true, // Allow PLAIN auth (no TLS in tests)
 			CommandTimeout:    commandTimeout,
 			MinBytesPerMinute: minBytesPerMinute,
 		},

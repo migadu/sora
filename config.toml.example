@@ -974,7 +974,8 @@ proxy_protocol_timeout = "5s"
 # auth_rate_limit.enabled = false
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "2m"             # Maximum idle time before disconnection (default: 2 minutes for POP3)
+timeouts.command_timeout = "10m"            # Maximum idle time before disconnection (default: 10m per RFC 1939 §3).
+                                            # RFC 1939 requires auto-logout timer of at least 10 minutes.
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24 hours)
 timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 

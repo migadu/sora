@@ -101,6 +101,7 @@ func setupIMAPServerWithConnectionLimits(t *testing.T, maxTotal, maxPerIP int) (
 		uploadWorker,
 		nil, // cache.Cache
 		imap.IMAPServerOptions{
+			InsecureAuth:        true, // Allow PLAIN auth (no TLS in tests)
 			MaxConnections:      maxTotal,
 			MaxConnectionsPerIP: maxPerIP,
 			TrustedNetworks:     []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections

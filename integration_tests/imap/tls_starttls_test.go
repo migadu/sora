@@ -66,10 +66,11 @@ func setupIMAPServerWithTLS(t *testing.T, tlsEnabled bool, certFile, keyFile str
 		uploadWorker,
 		nil, // cache.Cache
 		imapserver.IMAPServerOptions{
-			TLS:         tlsEnabled,
-			TLSCertFile: certFile,
-			TLSKeyFile:  keyFile,
-			TLSVerify:   false, // Don't require client certificates for testing
+			InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
+			TLS:          tlsEnabled,
+			TLSCertFile:  certFile,
+			TLSKeyFile:   keyFile,
+			TLSVerify:    false, // Don't require client certificates for testing
 		},
 	)
 	if err != nil {

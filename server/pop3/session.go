@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -25,9 +26,9 @@ import (
 	"github.com/migadu/sora/server"
 )
 
-const Pop3MaxErrorsAllowed = 3          // Maximum number of errors tolerated before the connection is terminated
-const Pop3ErrorDelay = 3 * time.Second  // Wait for this many seconds before allowing another command
-const Pop3IdleTimeout = 5 * time.Minute // Maximum duration of inactivity before the connection is closed
+const Pop3MaxErrorsAllowed = 3                  // Maximum number of errors tolerated before the connection is terminated
+const Pop3ErrorDelay = 3 * time.Second          // Wait for this many seconds before allowing another command
+const Pop3DefaultIdleTimeout = 10 * time.Minute // RFC 1939 §3: auto-logout timer MUST be at least 10 minutes
 
 type POP3Session struct {
 	server.Session
@@ -243,6 +244,15 @@ func (s *POP3Session) handleConnection() {
 				s.DebugLog("pass without user")
 				writer.WriteString("-ERR Must provide USER first\r\n")
 				writer.Flush()
+				continue
+			}
+
+			// Check insecure_auth: reject PASS over non-TLS when insecure_auth is false
+			if !s.server.insecureAuth && !s.isConnectionSecure() {
+				s.DebugLog("authentication rejected - TLS required", "address", userAddress.FullAddress())
+				if s.handleClientError(writer, "-ERR Authentication requires TLS connection\r\n") {
+					return
+				}
 				continue
 			}
 
@@ -487,7 +497,7 @@ func (s *POP3Session) handleConnection() {
 				return
 			}
 
-			// Acquire read lock to check inbox mailbox ID
+			// Acquire read lock to check inbox mailbox ID and compute deleted adjustments
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
 				s.WarnLog("failed to acquire read lock within timeout")
@@ -503,7 +513,11 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			mailboxID := s.inboxMailboxID
+			// RFC 1939 §5: STAT must exclude messages marked as deleted in this session.
+			// Compute the count and size of deleted messages to subtract from DB totals.
+			deletedCount, deletedSize := computeDeletedStats(s.messages, s.deleted)
 			release()
+
 			messagesCount, size, err := s.server.rdb.GetMailboxMessageCountAndSizeSumWithRetry(readCtx, mailboxID)
 			if err != nil {
 				s.DebugLog("stat error", "error", err)
@@ -511,7 +525,18 @@ func (s *POP3Session) handleConnection() {
 				writer.Flush()
 				continue
 			}
-			writer.WriteString(fmt.Sprintf("+OK %d %d\r\n", messagesCount, size))
+
+			// Adjust for session-local deletions
+			adjustedCount := messagesCount - deletedCount
+			adjustedSize := size - deletedSize
+			if adjustedCount < 0 {
+				adjustedCount = 0
+			}
+			if adjustedSize < 0 {
+				adjustedSize = 0
+			}
+
+			writer.WriteString(fmt.Sprintf("+OK %d %d\r\n", adjustedCount, adjustedSize))
 			success = true
 
 		case "LIST":
@@ -532,7 +557,7 @@ func (s *POP3Session) handleConnection() {
 				return
 			}
 
-			// Acquire read lock to check authentication state
+			// Acquire read lock to check authentication state and loading needs
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
 				s.WarnLog("failed to acquire read lock within timeout")
@@ -542,6 +567,7 @@ func (s *POP3Session) handleConnection() {
 			}
 			isAuthenticated := s.authenticated
 			mailboxID := s.inboxMailboxID
+			needsLoading := (s.messages == nil)
 			useMasterDB := s.useMasterDB
 			release()
 
@@ -552,52 +578,95 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			// Create a context for read operations that respects session pinning
-			readCtx := ctx
-			if useMasterDB {
-				readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-			}
-
-			messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
-			if err != nil {
-				s.DebugLog("list error", "error", err)
-				writer.WriteString("-ERR Internal server error\r\n")
-				writer.Flush()
-				continue
-			}
-
-			// Acquire write lock to update session state and read the data
-			acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
-			if !acquired {
-				s.WarnLog("failed to acquire write lock within timeout")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				continue
-			}
-			s.messages = messages
-			s.DebugLog("loaded messages from database", "count", len(messages), "mailbox_id", mailboxID)
-
-			// Copy the data needed for the response.
-			type listInfo struct {
-				size int64
-			}
-			var responseData []listInfo
-			for i, msg := range s.messages {
-				if !s.deleted[i] {
-					responseData = append(responseData, listInfo{size: int64(msg.Size)})
+			// Load messages if not yet loaded
+			if needsLoading {
+				// Create a context for read operations that respects session pinning
+				readCtx := ctx
+				if useMasterDB {
+					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
-			}
-			release() // Release lock before I/O.
 
-			// Phase 4: Build and send response outside the lock.
-			writer.WriteString(fmt.Sprintf("+OK %d messages\r\n", len(responseData)))
-			if len(responseData) > 0 {
-				for i, info := range responseData {
-					writer.WriteString(fmt.Sprintf("%d %d\r\n", i+1, info.size))
+				messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
+				if err != nil {
+					s.DebugLog("list error", "error", err)
+					writer.WriteString("-ERR Internal server error\r\n")
+					writer.Flush()
+					continue
 				}
+
+				// Acquire write lock to update session state
+				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+				if !acquired {
+					s.WarnLog("failed to acquire write lock within timeout")
+					writer.WriteString("-ERR Server busy, please try again\r\n")
+					writer.Flush()
+					continue
+				}
+				s.messages = messages
+				s.DebugLog("loaded messages from database", "count", len(messages), "mailbox_id", mailboxID)
+				release()
 			}
-			writer.WriteString(".\r\n")
-			s.DebugLog("listed messages", "count", len(s.messages))
+
+			// Handle LIST with message number argument (RFC 1939 §5)
+			if len(parts) > 1 {
+				msgNumber, err := strconv.Atoi(parts[1])
+				if err != nil || msgNumber < 1 {
+					if s.handleClientError(writer, "-ERR Invalid message number\r\n") {
+						return
+					}
+					continue
+				}
+
+				// Acquire read lock to access messages
+				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
+				if !acquired {
+					s.WarnLog("failed to acquire read lock within timeout")
+					writer.WriteString("-ERR Server busy, please try again\r\n")
+					writer.Flush()
+					continue
+				}
+
+				ok, line := buildSingleListResponse(s.messages, s.deleted, msgNumber)
+				release()
+
+				if !ok {
+					if msgNumber > len(s.messages) {
+						if s.handleClientError(writer, "-ERR No such message\r\n") {
+							return
+						}
+					} else {
+						if s.handleClientError(writer, "-ERR Message is deleted\r\n") {
+							return
+						}
+					}
+					continue
+				}
+
+				writer.WriteString(fmt.Sprintf("+OK %s\r\n", line))
+			} else {
+				// LIST without arguments - list all messages
+				// Acquire read lock to access messages and deleted status
+				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
+				if !acquired {
+					s.WarnLog("failed to acquire read lock within timeout")
+					writer.WriteString("-ERR Server busy, please try again\r\n")
+					writer.Flush()
+					continue
+				}
+
+				// Build response lines preserving original message numbers (RFC 1939 §5).
+				responseLines := buildListResponseLines(s.messages, s.deleted)
+				nonDeletedCount := countNonDeletedMessages(s.messages, s.deleted)
+				release() // Release lock before I/O.
+
+				// Build and send response outside the lock.
+				writer.WriteString(fmt.Sprintf("+OK %d messages\r\n", nonDeletedCount))
+				for _, line := range responseLines {
+					writer.WriteString(line + "\r\n")
+				}
+				writer.WriteString(".\r\n")
+			}
+			s.DebugLog("list command executed")
 
 			success = true
 
@@ -716,24 +785,15 @@ func (s *POP3Session) handleConnection() {
 					continue
 				}
 
-				// Copy the data needed for the response.
-				type uidlInfo struct {
-					uid imap.UID
-				}
-				var responseData []uidlInfo
-				for i, msg := range s.messages {
-					if !s.deleted[i] {
-						responseData = append(responseData, uidlInfo{uid: msg.UID})
-					}
-				}
+				// Build response lines preserving original message numbers (RFC 1939 §5).
+				responseLines := buildUIDLResponseLines(s.messages, s.deleted)
+				nonDeletedCount := countNonDeletedMessages(s.messages, s.deleted)
 				release() // Release lock before I/O.
 
 				// Phase 4: Build and send response outside the lock.
-				writer.WriteString(fmt.Sprintf("+OK %d messages\r\n", len(responseData)))
-				if len(responseData) > 0 {
-					for i, info := range responseData {
-						writer.WriteString(fmt.Sprintf("%d %d\r\n", i+1, info.uid))
-					}
+				writer.WriteString(fmt.Sprintf("+OK %d messages\r\n", nonDeletedCount))
+				for _, line := range responseLines {
+					writer.WriteString(line + "\r\n")
 				}
 				writer.WriteString(".\r\n")
 			}
@@ -1347,6 +1407,15 @@ func (s *POP3Session) handleConnection() {
 			mechanism = strings.ToUpper(mechanism)
 			if mechanism != "PLAIN" {
 				if s.handleClientError(writer, "-ERR Unsupported authentication mechanism\r\n") {
+					return
+				}
+				continue
+			}
+
+			// Check insecure_auth: reject AUTH over non-TLS when insecure_auth is false
+			if !s.server.insecureAuth && !s.isConnectionSecure() {
+				s.DebugLog("AUTH PLAIN rejected - TLS required")
+				if s.handleClientError(writer, "-ERR Authentication requires TLS connection\r\n") {
 					return
 				}
 				continue
@@ -2098,6 +2167,32 @@ func (s *POP3Session) startTerminationPoller() {
 			// Session ended normally
 		}
 	}()
+}
+
+// isConnectionSecure checks if the underlying connection is TLS-encrypted.
+// Used when insecure_auth is false to reject auth over non-TLS connections.
+func (s *POP3Session) isConnectionSecure() bool {
+	if s.conn == nil || *s.conn == nil {
+		return false
+	}
+	conn := *s.conn
+	// Check if the connection itself is TLS
+	if _, ok := conn.(*tls.Conn); ok {
+		return true
+	}
+	// Unwrap connection layers to find TLS
+	currentConn := conn
+	for currentConn != nil {
+		if _, ok := currentConn.(*tls.Conn); ok {
+			return true
+		}
+		if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
+			currentConn = wrapper.Unwrap()
+		} else {
+			break
+		}
+	}
+	return false
 }
 
 func checkMasterCredential(provided string, actual []byte) bool {

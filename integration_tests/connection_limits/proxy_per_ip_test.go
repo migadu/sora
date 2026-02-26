@@ -58,8 +58,9 @@ func TestProxyRealClientIPLimiting(t *testing.T) {
 		context.Background(), "test", "localhost", address,
 		&storage.S3Storage{}, rdb, uploadWorker, nil,
 		imap.IMAPServerOptions{
-			MaxConnections:       10, // Allow multiple total connections
-			MaxConnectionsPerIP:  1,  // But only 1 per IP
+			InsecureAuth:         true, // Allow PLAIN auth (no TLS in tests)
+			MaxConnections:       10,   // Allow multiple total connections
+			MaxConnectionsPerIP:  1,    // But only 1 per IP
 			ProxyProtocol:        true,
 			ProxyProtocolTimeout: "5s",
 			TrustedNetworks:      trustedNetworks,

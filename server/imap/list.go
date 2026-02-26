@@ -23,7 +23,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 
 	// Create a context that signals to use the master DB if the session is pinned.
 	readCtx := s.ctx
-	if s.useMasterDB {
+	if s.useMasterDB.Load() {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 

@@ -220,7 +220,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		appCtx:                 serverCtx,
 		cancel:                 serverCancel,
 		useStartTLS:            options.TLSUseStartTLS,
-		insecureAuth:           options.InsecureAuth,
+		insecureAuth:           options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
 		maxScriptSize:          options.MaxScriptSize,
 		supportedExtensions:    options.SupportedExtensions,
 		masterUsername:         []byte(options.MasterUsername),

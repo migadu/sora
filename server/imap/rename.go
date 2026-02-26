@@ -69,6 +69,45 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 		}
 	}
 
+	// RFC 3501 §6.3.5: Renaming INBOX is special — moves messages to the new
+	// mailbox while leaving INBOX intact (empty, same UID validity).
+	if strings.EqualFold(existingName, consts.MailboxInbox) {
+		// 1. Create the destination mailbox
+		err = s.server.rdb.CreateMailboxWithRetry(s.ctx, AccountID, newName, nil)
+		if err != nil {
+			return s.internalError("failed to create destination mailbox '%s': %v", newName, err)
+		}
+
+		// 2. Get the new mailbox ID
+		newMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, newName)
+		if err != nil {
+			return s.internalError("failed to get new mailbox '%s': %v", newName, err)
+		}
+
+		// 3. Get all message UIDs from INBOX
+		inboxMessages, err := s.server.rdb.ListMessagesWithRetry(s.ctx, oldMailbox.ID)
+		if err != nil {
+			return s.internalError("failed to list INBOX messages: %v", err)
+		}
+
+		if len(inboxMessages) > 0 {
+			uids := make([]imap.UID, len(inboxMessages))
+			for i, msg := range inboxMessages {
+				uids[i] = msg.UID
+			}
+
+			// 4. Move all messages from INBOX to the new mailbox
+			_, err = s.server.rdb.MoveMessagesWithRetry(s.ctx, &uids, oldMailbox.ID, newMailbox.ID, AccountID)
+		}
+		if err != nil {
+			return s.internalError("failed to move messages from INBOX to '%s': %v", newName, err)
+		}
+
+		s.DebugLog("INBOX renamed (RFC 3501): messages moved to new mailbox, INBOX preserved empty",
+			"new_name", newName)
+		return nil
+	}
+
 	// Determine the new parent mailbox ID
 	// Use the owner's AccountID for shared mailbox support
 	ownerAccountID := oldMailbox.AccountID

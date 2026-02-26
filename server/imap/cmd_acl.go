@@ -49,7 +49,7 @@ func (s *IMAPSession) MyRights(mailbox string) (*imap.MyRightsData, error) {
 
 	// Create context for database operations
 	readCtx := s.ctx
-	if s.useMasterDB {
+	if s.useMasterDB.Load() {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
@@ -104,7 +104,7 @@ func (s *IMAPSession) GetACL(mailbox string) (*imap.GetACLData, error) {
 
 	// Create context for database operations
 	readCtx := s.ctx
-	if s.useMasterDB {
+	if s.useMasterDB.Load() {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
@@ -185,7 +185,7 @@ func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, m
 
 	// Create context for database operations
 	writeCtx := s.ctx
-	if s.useMasterDB {
+	if s.useMasterDB.Load() {
 		writeCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 
@@ -336,7 +336,7 @@ func (s *IMAPSession) ListRights(mailbox string, identifier imap.RightsIdentifie
 
 	// Create context for database operations
 	readCtx := s.ctx
-	if s.useMasterDB {
+	if s.useMasterDB.Load() {
 		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
 	}
 

@@ -22,11 +22,20 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortC
 		return nil, s.internalError("failed to acquire lock for sort")
 	}
 	sessionTrackerSnapshot := s.sessionTracker
+	if s.selectedMailbox == nil {
+		release()
+		return nil, s.internalError("no mailbox selected for sort")
+	}
 	selectedMailboxID := s.selectedMailbox.ID
 	release()
 
 	if sessionTrackerSnapshot == nil {
 		return nil, s.internalError("no session tracker available for sort")
+	}
+
+	// Check for context cancellation before database query
+	if s.ctx.Err() != nil {
+		return nil, s.internalError("request aborted")
 	}
 
 	// Pass both search criteria and sort criteria to the database layer

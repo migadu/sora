@@ -146,9 +146,42 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 			_, _, err := s.server.rdb.AddMessageFlagsWithRetry(s.ctx, uid, destMailbox.ID, []imap.Flag{imap.FlagSeen})
 			if err != nil {
 				s.DebugLog("failed to mark message as seen in Trash", "uid", uid, "error", err)
-				// Continue with other messages even if one fails
 			}
 		}
+	}
+
+	// RFC 6851 §3.3: MOVE MUST include EXPUNGE notifications for the removed messages
+	// before the tagged OK response. Sequence numbers must be reported in descending order
+	// because each EXPUNGE causes renumbering of higher sequence numbers.
+	if len(messages) > 0 {
+		// Collect sequence numbers of moved messages and sort descending
+		seqNums := make([]uint32, 0, len(messages))
+		for _, msg := range messages {
+			// Only include messages that were actually moved (present in the UID map)
+			if _, ok := messageUIDMap[msg.UID]; ok {
+				seqNums = append(seqNums, msg.Seq)
+			}
+		}
+
+		// Sort descending — each EXPUNGE renumbers, so highest first
+		for i, j := 0, len(seqNums)-1; i < j; i, j = i+1, j-1 {
+			seqNums[i], seqNums[j] = seqNums[j], seqNums[i]
+		}
+
+		for _, seq := range seqNums {
+			if err := w.WriteExpunge(seq); err != nil {
+				s.DebugLog("failed to write EXPUNGE", "seq", seq, "error", err)
+			}
+		}
+
+		// Update session message count
+		current := s.currentNumMessages.Load()
+		removed := uint32(len(seqNums))
+		if removed > current {
+			removed = current
+		}
+		s.currentNumMessages.Store(current - removed)
+		s.DebugLog("sent EXPUNGE notifications for moved messages", "count", len(seqNums))
 	}
 
 	return nil

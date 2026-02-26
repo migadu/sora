@@ -68,6 +68,7 @@ func setupIMAPServerWithCapabilityFilters(t *testing.T, filters []config.ClientC
 		uploadWorker, // properly initialized UploadWorker
 		nil,          // cache.Cache
 		imapserver.IMAPServerOptions{
+			InsecureAuth:      true, // Allow PLAIN auth (no TLS in tests)
 			CapabilityFilters: filters,
 		},
 	)

@@ -216,7 +216,8 @@ func TestIMAP_StatusAppendLimit(t *testing.T) {
 		uploadWorker,
 		nil, // cache.Cache
 		imapServer.IMAPServerOptions{
-			AppendLimit: expectedAppendLimit,
+			InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
+			AppendLimit:  expectedAppendLimit,
 		},
 	)
 	if err != nil {

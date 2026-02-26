@@ -397,13 +397,47 @@ func isValidContentHash(hash string) bool {
 
 func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []byte) (*string, error) {
 	path := w.FilePath(contentHash, accountID)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return nil, fmt.Errorf("failed to create directory %s: %w", filepath.Dir(path), err)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
+
+	// Write file with fsync to ensure durability before the DB transaction commits.
+	// Without fsync, a crash could leave the DB referencing a file that never made it to disk.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create file %s: %w", path, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(path) // Clean up partial write
 		return nil, fmt.Errorf("failed to write file %s: %w", path, err)
 	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to fsync file %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close file %s: %w", path, err)
+	}
+
+	// Fsync the parent directory to ensure the directory entry is durable.
+	if err := syncDir(dir); err != nil {
+		logger.Warn("Uploader: Failed to fsync directory (non-fatal)", "dir", dir, "error", err)
+		// Non-fatal: the file data is already synced, directory entry may survive without this
+	}
+
 	return &path, nil
+}
+
+// syncDir fsyncs a directory to ensure new file entries are durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func (w *UploadWorker) RemoveLocalFile(path string) error {

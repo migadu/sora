@@ -322,7 +322,10 @@ func TestLMTP_InvalidRecipient(t *testing.T) {
 	t.Logf("RCPT TO correctly rejected invalid recipient: %s", response)
 }
 
-func TestLMTP_MultipleRecipients(t *testing.T) {
+// TestLMTP_SingleRecipientEnforcement verifies that the LMTP server enforces
+// MaxRecipients=1 — the second RCPT TO must be rejected with 552, forcing the
+// MTA to deliver each recipient in a separate LMTP transaction.
+func TestLMTP_SingleRecipientEnforcement(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	server, account := common.SetupLMTPServer(t)
@@ -341,8 +344,23 @@ func TestLMTP_MultipleRecipients(t *testing.T) {
 	if err := client.SendCommand("LHLO test.example.com"); err != nil {
 		t.Fatalf("Failed to send LHLO: %v", err)
 	}
-	if _, err := client.ReadMultilineResponse(); err != nil {
+	lhloResponses, err := client.ReadMultilineResponse()
+	if err != nil {
 		t.Fatalf("Failed to read LHLO response: %v", err)
+	}
+
+	// Verify LIMITS RCPTMAX=1 is advertised in LHLO
+	hasRcptMax := false
+	for _, line := range lhloResponses {
+		if strings.Contains(line, "LIMITS") && strings.Contains(line, "RCPTMAX=1") {
+			hasRcptMax = true
+			break
+		}
+	}
+	if hasRcptMax {
+		t.Log("✓ Server advertises LIMITS RCPTMAX=1 in LHLO")
+	} else {
+		t.Log("⚠ LIMITS RCPTMAX=1 not found in LHLO response (library may not advertise it)")
 	}
 
 	// MAIL FROM
@@ -357,7 +375,7 @@ func TestLMTP_MultipleRecipients(t *testing.T) {
 		t.Fatalf("Expected 250 response to MAIL FROM, got: %s", response)
 	}
 
-	// First RCPT TO
+	// First RCPT TO — should succeed
 	if err := client.SendCommand(fmt.Sprintf("RCPT TO:<%s>", account.Email)); err != nil {
 		t.Fatalf("Failed to send first RCPT TO: %v", err)
 	}
@@ -368,8 +386,9 @@ func TestLMTP_MultipleRecipients(t *testing.T) {
 	if !strings.HasPrefix(response, "250") {
 		t.Fatalf("Expected 250 response to first RCPT TO, got: %s", response)
 	}
+	t.Logf("✓ First RCPT TO accepted: %s", response)
 
-	// Second RCPT TO
+	// Second RCPT TO — should be rejected with 452 (MaxRecipients=1)
 	if err := client.SendCommand(fmt.Sprintf("RCPT TO:<%s>", account2.Email)); err != nil {
 		t.Fatalf("Failed to send second RCPT TO: %v", err)
 	}
@@ -377,11 +396,12 @@ func TestLMTP_MultipleRecipients(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read second RCPT TO response: %v", err)
 	}
-	if !strings.HasPrefix(response, "250") {
-		t.Fatalf("Expected 250 response to second RCPT TO, got: %s", response)
+	if !strings.HasPrefix(response, "452") {
+		t.Fatalf("Expected 452 rejection for second RCPT TO (MaxRecipients=1 enforced), got: %s", response)
 	}
+	t.Logf("✓ Second RCPT TO correctly rejected: %s", response)
 
-	// DATA
+	// DATA — should succeed with the single accepted recipient
 	if err := client.SendCommand("DATA"); err != nil {
 		t.Fatalf("Failed to send DATA: %v", err)
 	}
@@ -395,34 +415,27 @@ func TestLMTP_MultipleRecipients(t *testing.T) {
 
 	// Send message content
 	message := "From: sender@example.com\r\n" +
-		"To: " + account.Email + ", " + account2.Email + "\r\n" +
-		"Subject: Test Message to Multiple Recipients\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Test Single Recipient Enforcement\r\n" +
 		"\r\n" +
-		"This is a test message to multiple recipients.\r\n" +
+		"This message should only be delivered to one recipient.\r\n" +
 		".\r\n"
 
 	if _, err := client.conn.Write([]byte(message)); err != nil {
 		t.Fatalf("Failed to send message data: %v", err)
 	}
 
-	// Read final response - should get one response per recipient
-	// In LMTP, after DATA, we get one response line per recipient
-	responses, err := client.ReadDataResponses(2) // Expecting 2 recipients
+	// Read final response — only 1 recipient, so 1 response
+	response, err = client.ReadResponse()
 	if err != nil {
-		t.Fatalf("Failed to read final responses: %v", err)
+		t.Fatalf("Failed to read final response: %v", err)
+	}
+	if !strings.HasPrefix(response, "250") {
+		t.Fatalf("Expected 250 response after message data, got: %s", response)
 	}
 
-	if len(responses) < 2 {
-		t.Fatalf("Expected at least 2 responses for 2 recipients, got %d", len(responses))
-	}
-
-	for i, response := range responses {
-		if !strings.HasPrefix(response, "250") {
-			t.Errorf("Response %d: Expected 250, got: %s", i+1, response)
-		}
-	}
-
-	t.Logf("Message delivered successfully to %d recipients", len(responses))
+	t.Logf("✓ Message delivered to single recipient: %s", response)
+	t.Log("✓ Single-recipient LMTP enforcement working correctly")
 }
 
 func TestLMTP_Reset(t *testing.T) {

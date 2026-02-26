@@ -83,6 +83,7 @@ func setupIMAPServerWithMasterAuth(t *testing.T) (*common.TestServer, common.Tes
 		uploadWorker,
 		nil,
 		imap.IMAPServerOptions{
+			InsecureAuth:       true, // Allow PLAIN auth (no TLS in tests)
 			Config:             testConfig,
 			MasterUsername:     []byte(masterUsername),
 			MasterPassword:     []byte(masterPassword),

@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"strings"
@@ -203,8 +204,10 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 		case "bcc", "reply-to":
 			// BCC and Reply-To don't have dedicated sort columns, fall back to JSONB search
 			recipientJSONParam := nextParam()
-			recipientValue := fmt.Sprintf(`[{"type": "%s", "email": "%s"}]`, lowerKey, lowerValue)
-			args[recipientJSONParam] = recipientValue
+			// Use json.Marshal to safely build JSONB value (handles special characters in search values)
+			recipientEntry := []map[string]string{{"type": lowerKey, "email": lowerValue}}
+			recipientJSON, _ := json.Marshal(recipientEntry)
+			args[recipientJSONParam] = string(recipientJSON)
 			conditions = append(conditions, fmt.Sprintf(`%srecipients_json @> @%s::jsonb`, datePrefix, recipientJSONParam))
 		default:
 			return "", nil, &imap.Error{

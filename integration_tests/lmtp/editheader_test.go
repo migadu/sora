@@ -185,7 +185,7 @@ keep;
 		rdb,
 		sharedUploader,
 		nil,
-		imapserver.IMAPServerOptions{},
+		imapserver.IMAPServerOptions{InsecureAuth: true},
 	)
 	if err != nil {
 		t.Fatalf("Failed to create IMAP server: %v", err)
@@ -429,7 +429,7 @@ keep;
 		rdb,
 		sharedUploader,
 		nil,
-		imapserver.IMAPServerOptions{},
+		imapserver.IMAPServerOptions{InsecureAuth: true},
 	)
 	if err != nil {
 		t.Fatalf("Failed to create IMAP server: %v", err)

@@ -794,7 +794,12 @@ func (s *LMTPSession) InternalError(format string, a ...any) error {
 func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, originalMessage *message.Entity) error {
 	if s.backend.relayQueue == nil {
 		s.DebugLog("relay not configured, cannot send vacation response", "sender", s.sender.FullAddress())
-		// Do not return error, as the Sieve engine might have already recorded the attempt.
+		return nil
+	}
+
+	// RFC 5230 §4.5: Check suppression rules before sending vacation response.
+	if reason := shouldSuppressVacation(s.sender, originalMessage); reason != "" {
+		s.DebugLog("vacation suppressed", "reason", reason)
 		return nil
 	}
 

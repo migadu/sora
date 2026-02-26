@@ -9,3 +9,5 @@ sora-admin
 !sora/
 !sora-admin/
 vendor/
+CLAUDE.md
+.claude/

@@ -48,7 +48,7 @@ type IMAPSession struct {
 
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
-	useMasterDB           bool // Pin session to master DB after a write to ensure consistency
+	useMasterDB           atomic.Bool // Pin session to master DB after a write to ensure consistency
 
 	// Memory tracking
 	memTracker *server.SessionMemoryTracker
