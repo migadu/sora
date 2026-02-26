@@ -661,6 +661,21 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 }
 
 // Stop stops the User API proxy server
+// ReloadConfig updates runtime-configurable settings from new config.
+func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
+	var reloaded []string
+
+	if cfg.JWTSecret != "" && cfg.JWTSecret != s.jwtSecret {
+		s.jwtSecret = cfg.JWTSecret
+		reloaded = append(reloaded, "jwt_secret")
+	}
+
+	if len(reloaded) > 0 {
+		logger.Info("User API proxy config reloaded", "name", s.name, "updated", reloaded)
+	}
+	return nil
+}
+
 func (s *Server) Stop() error {
 	logger.Info("User API Proxy: Stopping", "name", s.name)
 

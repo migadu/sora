@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/cache"
@@ -186,11 +187,30 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 }
 
 // Start starts the HTTP API server
-func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options ServerOptions, errChan chan error) {
+// ReloadConfig updates runtime-configurable settings from new config.
+func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
+	var reloaded []string
+
+	if cfg.APIKey != "" && cfg.APIKey != s.apiKey {
+		s.apiKey = cfg.APIKey
+		reloaded = append(reloaded, "api_key")
+	}
+	if len(cfg.AllowedHosts) > 0 {
+		s.allowedHosts = cfg.AllowedHosts
+		reloaded = append(reloaded, "allowed_hosts")
+	}
+
+	if len(reloaded) > 0 {
+		logger.Info("Admin API config reloaded", "name", s.name, "updated", reloaded)
+	}
+	return nil
+}
+
+func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options ServerOptions, errChan chan error) *Server {
 	server, err := New(rdb, options)
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create HTTP API server: %w", err)
-		return
+		return nil
 	}
 
 	protocol := "HTTP"
@@ -202,9 +222,12 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 		serverName = "default"
 	}
 	logger.Info("HTTP API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
-	if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
-		errChan <- fmt.Errorf("HTTP API server failed: %w", err)
-	}
+	go func() {
+		if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
+			errChan <- fmt.Errorf("HTTP API server failed: %w", err)
+		}
+	}()
+	return server
 }
 
 // start initializes and starts the HTTP server

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -396,17 +395,12 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		envelopeTo = s.recipientAddr.FullAddress()
 	}
 
-	// Normalize header keys to lowercase for Sieve (RFC 5228 requires case-insensitive header matching)
-	// The go-sieve library expects lowercase header keys
-	normalizedHeaders := make(map[string][]string)
-	for key, values := range messageContent.Header.Map() {
-		normalizedHeaders[strings.ToLower(key)] = values
-	}
-
+	// Note: Header normalization is now handled by sieveengine.Evaluate()
+	// to ensure consistent case-insensitive matching per RFC 5228 §2.6.2.1
 	sieveCtx := sieveengine.Context{
 		EnvelopeFrom: s.sender.FullAddress(),
 		EnvelopeTo:   envelopeTo,
-		Header:       normalizedHeaders,
+		Header:       messageContent.Header.Map(),
 		Body:         *plaintextBody,
 	}
 
@@ -455,7 +449,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	// If user has an active script, run it and let it override the resultAction
 	if err == nil && activeScript != nil {
-		s.DebugLog("using user sieve script", "name", activeScript.Name, "script_id", activeScript.ID, "updated_at", activeScript.UpdatedAt.Format(time.RFC3339))
+		s.InfoLog("using user sieve script", "name", activeScript.Name, "script_id", activeScript.ID, "updated_at", activeScript.UpdatedAt.Format(time.RFC3339))
 		// Try to get the user script from cache or create and cache it with metadata validation
 		userSieveExecutor, userScriptErr := s.backend.sieveCache.GetOrCreateWithMetadata(
 			activeScript.Script,
@@ -465,7 +459,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			sieveVacOracle,
 		)
 		if userScriptErr != nil {
-			s.DebugLog("failed to get/create sieve executor", "error", userScriptErr)
+			s.WarnLog("failed to get/create sieve executor", "error", userScriptErr)
 			// Keep the result from the default script
 		} else {
 			userResult, userEvalErr := userSieveExecutor.Evaluate(s.ctx, sieveCtx)

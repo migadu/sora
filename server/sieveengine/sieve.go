@@ -144,8 +144,15 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		To:   ctx.EnvelopeTo,
 	}
 
+	// RFC 5228 §2.6.2.1: Header field names are case-insensitive
+	// Normalize all header keys to lowercase to ensure consistent matching
+	normalizedHeaders := make(map[string][]string, len(ctx.Header))
+	for key, values := range ctx.Header {
+		normalizedHeaders[strings.ToLower(key)] = values
+	}
+
 	message := &SieveMessage{
-		Headers: ctx.Header,
+		Headers: normalizedHeaders,
 		Body:    []byte(ctx.Body),
 		Size:    len(ctx.Body),
 	}
@@ -374,7 +381,9 @@ type SieveMessage struct {
 }
 
 func (m *SieveMessage) HeaderGet(key string) ([]string, error) {
-	return m.Headers[key], nil
+	// RFC 5228 §2.6.2.1: Header field names are case-insensitive
+	// Since LMTP normalizes headers to lowercase, we must do case-insensitive lookup
+	return m.Headers[strings.ToLower(key)], nil
 }
 
 func (m *SieveMessage) MessageSize() int {

@@ -576,3 +576,79 @@ if not header :contains "precedence" ["list", "bulk", "junk"] {
 		})
 	}
 }
+
+func TestHeaderCaseInsensitivity(t *testing.T) {
+	// RFC 5228 §2.6.2.1: Header field names are case-insensitive
+	// This test verifies that header matching works regardless of case
+	// in both the script and the header map
+	script := `
+require "vacation";
+if header :contains "From" "@gmail.com" {
+  vacation :days 1 :subject "Gmail blocked" "Please use your domain email";
+}
+`
+
+	tests := []struct {
+		name           string
+		headerKey      string // "From", "from", "FROM", etc.
+		expectedAction Action
+	}{
+		{
+			name:           "Capital From (standard)",
+			headerKey:      "From",
+			expectedAction: ActionVacation,
+		},
+		{
+			name:           "Lowercase from (LMTP normalized)",
+			headerKey:      "from",
+			expectedAction: ActionVacation,
+		},
+		{
+			name:           "Uppercase FROM",
+			headerKey:      "FROM",
+			expectedAction: ActionVacation,
+		},
+		{
+			name:           "Mixed case FrOm",
+			headerKey:      "FrOm",
+			expectedAction: ActionVacation,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a fresh oracle and executor for each test to avoid rate limiting
+			oracle := newMockVacationOracle()
+			enabledExtensions := []string{"vacation"}
+			executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, enabledExtensions)
+			if err != nil {
+				t.Fatalf("Failed to create executor: %v", err)
+			}
+
+			headers := map[string][]string{
+				tt.headerKey: {"sender@gmail.com"},
+				"Subject":    {"Test"},
+			}
+
+			ctx := Context{
+				EnvelopeFrom: "sender@gmail.com",
+				EnvelopeTo:   "recipient@example.com",
+				Header:       headers,
+				Body:         "Test body",
+			}
+
+			result, err := executor.Evaluate(context.Background(), ctx)
+			if err != nil {
+				t.Fatalf("Failed to evaluate script: %v", err)
+			}
+
+			if result.Action != tt.expectedAction {
+				t.Errorf("Expected action %s, got %s", tt.expectedAction, result.Action)
+			}
+
+			if result.Action == ActionVacation && result.VacationSubj != "Gmail blocked" {
+				t.Errorf("Expected vacation subject 'Gmail blocked', got '%s'", result.VacationSubj)
+			}
+		})
+	}
+}

@@ -183,6 +183,9 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// Check if file already exists to prevent race condition:
 	// If a duplicate APPEND arrives while uploader is processing the first copy,
 	// we don't want to overwrite/delete the file the uploader is reading.
+	if s.server.uploader == nil {
+		return nil, s.internalError("uploader not configured — cannot store message")
+	}
 	expectedPath := s.server.uploader.FilePath(contentHash, s.AccountID())
 	var filePath *string
 	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
@@ -376,6 +379,9 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	}
 
 	success = true
+
+	// Track for session summary
+	s.messagesAppended.Add(1)
 
 	s.DebugLog("successfully appended message", "mailbox", mboxName, "uid", messageUID, "uidvalidity", mailbox.UIDValidity)
 

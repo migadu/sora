@@ -633,6 +633,30 @@ func (s *Server) sendGracefulShutdownMessage() {
 }
 
 // Stop stops the LMTP proxy server.
+// ReloadConfig updates runtime-configurable settings from new config.
+// Called on SIGHUP. Only affects new connections; existing sessions keep old settings.
+func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
+	var reloaded []string
+
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != s.absoluteSessionTimeout {
+		s.absoluteSessionTimeout = timeout
+		reloaded = append(reloaded, "absolute_session_timeout")
+	}
+	if maxSize := cfg.GetMaxMessageSizeWithDefault(); maxSize != s.maxMessageSize {
+		s.maxMessageSize = maxSize
+		reloaded = append(reloaded, "max_message_size")
+	}
+	if cfg.Debug != s.debug {
+		s.debug = cfg.Debug
+		reloaded = append(reloaded, "debug")
+	}
+
+	if len(reloaded) > 0 {
+		logger.Info("LMTP proxy config reloaded", "name", s.name, "updated", reloaded)
+	}
+	return nil
+}
+
 func (s *Server) Stop() error {
 	logger.Info("Stopping LMTP proxy server", "name", s.name)
 

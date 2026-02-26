@@ -52,6 +52,12 @@ type IMAPSession struct {
 
 	// Memory tracking
 	memTracker *server.SessionMemoryTracker
+
+	// Session statistics for summary logging
+	messagesAppended atomic.Uint32
+	messagesExpunged atomic.Uint32
+	messagesMoved    atomic.Uint32
+	messagesCopied   atomic.Uint32
 }
 
 func (s *IMAPSession) Context() context.Context {
@@ -212,7 +218,8 @@ func (s *IMAPSession) Close() error {
 	}
 
 	// Observe connection duration
-	metrics.ConnectionDuration.WithLabelValues("imap", s.server.name, s.server.hostname).Observe(time.Since(s.startTime).Seconds())
+	duration := time.Since(s.startTime)
+	metrics.ConnectionDuration.WithLabelValues("imap", s.server.name, s.server.hostname).Observe(duration.Seconds())
 
 	// Log and record peak memory usage
 	if s.memTracker != nil {
@@ -221,6 +228,20 @@ func (s *IMAPSession) Close() error {
 		if peak > 0 {
 			s.InfoLog("session memory peak", "bytes", server.FormatBytes(peak))
 		}
+	}
+
+	// Log session summary with statistics (similar to Dovecot)
+	appended := s.messagesAppended.Load()
+	expunged := s.messagesExpunged.Load()
+	moved := s.messagesMoved.Load()
+	copied := s.messagesCopied.Load()
+	if appended > 0 || expunged > 0 || moved > 0 || copied > 0 {
+		s.InfoLog("session summary",
+			"duration", fmt.Sprintf("%.1fs", duration.Seconds()),
+			"appended", appended,
+			"expunged", expunged,
+			"moved", moved,
+			"copied", copied)
 	}
 
 	s.server.totalConnections.Add(-1)

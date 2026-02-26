@@ -154,11 +154,30 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 }
 
 // Start starts the HTTP Mail API server
-func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options ServerOptions, errChan chan error) {
+// ReloadConfig updates runtime-configurable settings from new config.
+func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
+	var reloaded []string
+
+	if len(cfg.AllowedOrigins) > 0 {
+		s.allowedOrigins = cfg.AllowedOrigins
+		reloaded = append(reloaded, "allowed_origins")
+	}
+	if len(cfg.AllowedHosts) > 0 {
+		s.allowedHosts = cfg.AllowedHosts
+		reloaded = append(reloaded, "allowed_hosts")
+	}
+
+	if len(reloaded) > 0 {
+		logger.Info("User API config reloaded", "name", s.name, "updated", reloaded)
+	}
+	return nil
+}
+
+func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options ServerOptions, errChan chan error) *Server {
 	server, err := New(rdb, options)
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create HTTP Mail API server: %w", err)
-		return
+		return nil
 	}
 
 	protocol := "HTTP"
@@ -170,9 +189,12 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 		serverName = "default"
 	}
 	logger.Info("HTTP Mail API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
-	if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
-		errChan <- fmt.Errorf("HTTP Mail API server failed: %w", err)
-	}
+	go func() {
+		if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
+			errChan <- fmt.Errorf("HTTP Mail API server failed: %w", err)
+		}
+	}()
+	return server
 }
 
 // start initializes and starts the HTTP server

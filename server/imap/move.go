@@ -184,5 +184,8 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		s.DebugLog("sent EXPUNGE notifications for moved messages", "count", len(seqNums))
 	}
 
+	// Track for session summary
+	s.messagesMoved.Add(uint32(len(messageUIDMap)))
+
 	return nil
 }

@@ -92,6 +92,24 @@ type serverDependencies struct {
 	connectionTrackersMux sync.Mutex                           // protects connectionTrackers map
 	proxyServers          map[string]adminapi.ProxyServer      // proxy name -> proxy server interface (for backend health)
 	proxyServersMux       sync.Mutex                           // protects proxyServers map
+	runningServers        map[string]ConfigReloader            // server name -> reloadable server
+	runningServersMux     sync.Mutex                           // protects runningServers map
+}
+
+// ConfigReloader is implemented by servers that support runtime config reload via SIGHUP.
+// Existing connections keep their current settings; new connections use the updated values.
+type ConfigReloader interface {
+	ReloadConfig(config.ServerConfig) error
+}
+
+// registerServer tracks a running server for config reload
+func (deps *serverDependencies) registerServer(name string, server ConfigReloader) {
+	deps.runningServersMux.Lock()
+	defer deps.runningServersMux.Unlock()
+	if deps.runningServers == nil {
+		deps.runningServers = make(map[string]ConfigReloader)
+	}
+	deps.runningServers[name] = server
 }
 
 func main() {
@@ -203,6 +221,50 @@ func main() {
 		defer deps.relayWorker.Stop()
 	}
 
+	// SIGHUP handler for config reload — set up AFTER deps is created so we can
+	// update deps.config directly. Servers that hold Config *config.Config pointers
+	// (IMAP, POP3, ManageSieve) will see changes through the shared pointer.
+	reloadChan := make(chan os.Signal, 1)
+	signal.Notify(reloadChan, syscall.SIGHUP)
+	go func() {
+		for range reloadChan {
+			logger.Info("SIGHUP received — reloading configuration", "config", *configPath)
+
+			// Re-read the full config for per-server dispatch
+			newCfg := config.NewDefaultConfig()
+			if err := config.LoadConfigFromFile(*configPath, &newCfg); err != nil {
+				logger.Error("Config reload failed — keeping current config", "error", err)
+				continue
+			}
+
+			// Update shared config settings (propagates via Config pointer)
+			handleConfigReload(*configPath, &deps.config, errorHandler)
+
+			// Dispatch per-server reload to running servers
+			deps.runningServersMux.Lock()
+			serverCount := len(deps.runningServers)
+			deps.runningServersMux.Unlock()
+
+			if serverCount > 0 {
+				newServers := newCfg.GetAllServers()
+				serversByName := make(map[string]config.ServerConfig, len(newServers))
+				for _, s := range newServers {
+					serversByName[s.Name] = s
+				}
+
+				deps.runningServersMux.Lock()
+				for name, srv := range deps.runningServers {
+					if newServerCfg, ok := serversByName[name]; ok {
+						if err := srv.ReloadConfig(newServerCfg); err != nil {
+							logger.Error("Failed to reload server config", "server", name, "error", err)
+						}
+					}
+				}
+				deps.runningServersMux.Unlock()
+			}
+		}
+	}()
+
 	// Start all configured servers
 	errChan := startServers(ctx, deps)
 
@@ -260,6 +322,78 @@ func cleanupDatabaseDefaults(cfg *config.Config) {
 			cfg.Database.Read = nil
 		}
 	}
+}
+
+// handleConfigReload re-reads config and applies safe-to-reload settings.
+// Settings that require restart (listen addresses, database, S3, cluster) are NOT reloaded.
+func handleConfigReload(configPath string, currentCfg *config.Config, errorHandler *errors.ErrorHandler) {
+	newCfg := config.NewDefaultConfig()
+
+	// Re-read config file
+	if err := config.LoadConfigFromFile(configPath, &newCfg); err != nil {
+		logger.Error("Config reload failed — keeping current config", "error", err)
+		return
+	}
+
+	// Track what was reloaded
+	var reloaded []string
+
+	// 1. Logging level changes require restart (logger doesn't support runtime level change)
+	if newCfg.Logging.Level != currentCfg.Logging.Level {
+		logger.Info("Config reload: logging.level changed but requires restart to take effect",
+			"current", currentCfg.Logging.Level, "new", newCfg.Logging.Level)
+	}
+
+	// 2. Reload cleanup settings
+	if newCfg.Cleanup.GracePeriod != currentCfg.Cleanup.GracePeriod {
+		reloaded = append(reloaded, fmt.Sprintf("cleanup.grace_period: %s → %s", currentCfg.Cleanup.GracePeriod, newCfg.Cleanup.GracePeriod))
+		currentCfg.Cleanup.GracePeriod = newCfg.Cleanup.GracePeriod
+	}
+	if newCfg.Cleanup.WakeInterval != currentCfg.Cleanup.WakeInterval {
+		reloaded = append(reloaded, fmt.Sprintf("cleanup.wake_interval: %s → %s", currentCfg.Cleanup.WakeInterval, newCfg.Cleanup.WakeInterval))
+		currentCfg.Cleanup.WakeInterval = newCfg.Cleanup.WakeInterval
+	}
+	if newCfg.Cleanup.MaxAgeRestriction != currentCfg.Cleanup.MaxAgeRestriction {
+		reloaded = append(reloaded, fmt.Sprintf("cleanup.max_age_restriction: %s → %s", currentCfg.Cleanup.MaxAgeRestriction, newCfg.Cleanup.MaxAgeRestriction))
+		currentCfg.Cleanup.MaxAgeRestriction = newCfg.Cleanup.MaxAgeRestriction
+	}
+
+	// 3. Reload shared mailbox settings
+	if newCfg.SharedMailboxes != currentCfg.SharedMailboxes {
+		reloaded = append(reloaded, "shared_mailboxes")
+		currentCfg.SharedMailboxes = newCfg.SharedMailboxes
+	}
+
+	// 4. Reload sieve settings
+	if len(newCfg.Sieve.EnabledExtensions) > 0 {
+		reloaded = append(reloaded, "sieve.enabled_extensions")
+		currentCfg.Sieve = newCfg.Sieve
+	}
+
+	// 5. Reload metadata limits
+	if newCfg.Metadata != currentCfg.Metadata {
+		reloaded = append(reloaded, "metadata")
+		currentCfg.Metadata = newCfg.Metadata
+	}
+
+	// 6. Reload trusted_networks (propagates to servers via Config pointer)
+	if len(newCfg.Servers.TrustedNetworks) > 0 {
+		currentCfg.Servers.TrustedNetworks = newCfg.Servers.TrustedNetworks
+		reloaded = append(reloaded, "servers.trusted_networks")
+	}
+
+	if len(reloaded) == 0 {
+		logger.Info("Config reload: no runtime changes detected")
+	} else {
+		for _, item := range reloaded {
+			logger.Info("Config reloaded", "setting", item)
+		}
+		logger.Info("Config reload complete", "changes", len(reloaded))
+	}
+
+	// Dispatch per-server config reload to running servers
+	// Note: handleConfigReload receives *config.Config (not deps), so we need
+	// a reference to deps. This is passed via closure in the SIGHUP handler.
 }
 
 // loadAndValidateConfig loads configuration from file and validates all server configurations
@@ -1025,6 +1159,8 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 		s.Close()
 	}()
 
+	deps.registerServer(serverConfig.Name, s)
+
 	if err := s.Serve(serverConfig.Addr); err != nil {
 		errChan <- err
 	}
@@ -1086,6 +1222,8 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 			logger.Info("Error closing LMTP server", "error", err)
 		}
 	}()
+
+	deps.registerServer(serverConfig.Name, lmtpServer)
 
 	lmtpServer.Start(errChan)
 }
@@ -1180,6 +1318,8 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		logger.Info("Shutting down POP3 server", "name", serverConfig.Name)
 		s.Close()
 	}()
+
+	deps.registerServer(serverConfig.Name, s)
 
 	s.Start(errChan)
 }
@@ -1279,6 +1419,8 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		logger.Info("Shutting down ManageSieve server", "name", serverConfig.Name)
 		s.Close()
 	}()
+
+	deps.registerServer(serverConfig.Name, s)
 
 	s.Start(errChan)
 }
@@ -1426,6 +1568,8 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		server.Stop()
 	}()
 
+	deps.registerServer(serverConfig.Name, server)
+
 	if err := server.Start(); err != nil && ctx.Err() == nil {
 		errChan <- fmt.Errorf("IMAP proxy server error: %w", err)
 	}
@@ -1545,6 +1689,8 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		logger.Info("Shutting down POP3 proxy server", "name", serverConfig.Name)
 		server.Stop()
 	}()
+
+	deps.registerServer(serverConfig.Name, server)
 
 	server.Start()
 }
@@ -1667,6 +1813,8 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		server.Stop()
 	}()
 
+	deps.registerServer(serverConfig.Name, server)
+
 	server.Start()
 }
 
@@ -1786,6 +1934,8 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		server.Stop()
 	}()
 
+	deps.registerServer(serverConfig.Name, server)
+
 	if err := server.Start(); err != nil && ctx.Err() == nil {
 		errChan <- fmt.Errorf("LMTP proxy server error: %w", err)
 	}
@@ -1851,7 +2001,10 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		ProxyServers:       deps.proxyServers,
 	}
 
-	adminapi.Start(ctx, deps.resilientDB, options, errChan)
+	srv := adminapi.Start(ctx, deps.resilientDB, options, errChan)
+	if srv != nil {
+		deps.registerServer(serverConfig.Name, srv)
+	}
 }
 
 func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
@@ -1907,7 +2060,10 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		TLSVerify:      serverConfig.TLSVerify,
 	}
 
-	mailapi.Start(ctx, deps.resilientDB, options, errChan)
+	srv := mailapi.Start(ctx, deps.resilientDB, options, errChan)
+	if srv != nil {
+		deps.registerServer(serverConfig.Name, srv)
+	}
 }
 
 func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
@@ -1973,6 +2129,8 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		logger.Info("Shutting down User API proxy server", "name", serverConfig.Name)
 		server.Stop()
 	}()
+
+	deps.registerServer(serverConfig.Name, server)
 
 	if err := server.Start(); err != nil && ctx.Err() == nil {
 		errChan <- fmt.Errorf("user API proxy server error: %w", err)

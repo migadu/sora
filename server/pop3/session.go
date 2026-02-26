@@ -49,6 +49,11 @@ type POP3Session struct {
 	useMasterDB    bool               // Pin session to master DB after a write to ensure consistency
 	startTime      time.Time
 	memTracker     *server.SessionMemoryTracker // Memory usage tracker for this session
+
+	// Session statistics for summary logging
+	messagesRetrieved int // Messages retrieved with RETR
+	messagesDeleted   int // Messages marked for deletion with DELE
+	messagesExpunged  int // Messages actually expunged on QUIT
 }
 
 func (s *POP3Session) handleConnection() {
@@ -1194,6 +1199,10 @@ func (s *POP3Session) handleConnection() {
 				metrics.TrackDomainBytes("pop3", s.Domain(), "out", int64(msg.Size))
 				metrics.TrackDomainMessage("pop3", s.Domain(), "fetched")
 			}
+
+			// Track for session summary
+			s.messagesRetrieved++
+
 			success = true
 
 		case "NOOP":
@@ -1351,6 +1360,10 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			s.deleted[msgNumber-1] = true
+
+			// Track for session summary
+			s.messagesDeleted++
+
 			release()
 
 			writer.WriteString("+OK Message deleted\r\n")
@@ -1849,8 +1862,10 @@ func (s *POP3Session) handleConnection() {
 			for _, msg := range messagesToExpunge {
 				s.DebugLog("will expunge message", "uid", msg.UID)
 				// Delete from cache before expunging
-				if err := s.server.cache.Delete(msg.ContentHash); err != nil && !isNotExist(err) {
-					s.WarnLog("failed to delete message from cache", "content_hash", msg.ContentHash, "error", err)
+				if s.server.cache != nil {
+					if err := s.server.cache.Delete(msg.ContentHash); err != nil && !isNotExist(err) {
+						s.WarnLog("failed to delete message from cache", "content_hash", msg.ContentHash, "error", err)
+					}
 				}
 				expungeUIDs = append(expungeUIDs, msg.UID)
 			}
@@ -1862,6 +1877,8 @@ func (s *POP3Session) handleConnection() {
 					s.DebugLog("error expunging messages", "mailbox_id", mailboxID, "error", err)
 				} else {
 					s.DebugLog("successfully expunged messages", "count", len(expungeUIDs), "mailbox_id", mailboxID)
+					// Track for session summary
+					s.messagesExpunged = len(expungeUIDs)
 				}
 			} else {
 				s.DebugLog("no messages to expunge", "mailbox_id", mailboxID)
@@ -1950,7 +1967,8 @@ func (s *POP3Session) handleClientError(writer *bufio.Writer, errMsg string) boo
 }
 
 func (s *POP3Session) closeWithoutLock() error {
-	metrics.ConnectionDuration.WithLabelValues("pop3", s.server.name, s.server.hostname).Observe(time.Since(s.startTime).Seconds())
+	duration := time.Since(s.startTime)
+	metrics.ConnectionDuration.WithLabelValues("pop3", s.server.name, s.server.hostname).Observe(duration.Seconds())
 
 	// Log and record peak memory usage
 	if s.memTracker != nil {
@@ -1959,6 +1977,15 @@ func (s *POP3Session) closeWithoutLock() error {
 		if peak > 0 {
 			s.DebugLog("session memory peak", "peak", server.FormatBytes(peak))
 		}
+	}
+
+	// Log session summary with statistics (similar to Dovecot)
+	if s.messagesRetrieved > 0 || s.messagesDeleted > 0 || s.messagesExpunged > 0 {
+		s.InfoLog("session summary",
+			"duration", fmt.Sprintf("%.1fs", duration.Seconds()),
+			"retrieved", s.messagesRetrieved,
+			"deleted", s.messagesDeleted,
+			"expunged", s.messagesExpunged)
 	}
 
 	totalCount := s.server.totalConnections.Add(-1)
@@ -2027,7 +2054,11 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 
 	if msg.IsUploaded {
 		// Try cache first
-		data, err := s.server.cache.Get(msg.ContentHash)
+		var data []byte
+		var err error
+		if s.server.cache != nil {
+			data, err = s.server.cache.Get(msg.ContentHash)
+		}
 		if err == nil && data != nil {
 			// Validate cached data is not empty
 			if len(data) == 0 {
@@ -2078,12 +2109,18 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 			}
 		}
 		// Store in cache
-		logger.Debug("POP3: Storing in cache", "uid", msg.UID, "hash", msg.ContentHash)
-		_ = s.server.cache.Put(msg.ContentHash, data)
+		if s.server.cache != nil {
+			logger.Debug("POP3: Storing in cache", "uid", msg.UID, "hash", msg.ContentHash)
+			_ = s.server.cache.Put(msg.ContentHash, data)
+		}
 		return data, nil
 	}
 
 	// If not uploaded to S3, try fetch from local disk
+	if s.server.uploader == nil {
+		logger.Debug("POP3: No uploader configured, message not available", "uid", msg.UID)
+		return nil, consts.ErrMessageNotAvailable
+	}
 	logger.Debug("POP3: Fetching not yet uploaded message from disk", "uid", msg.UID)
 	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
 	data, err := os.ReadFile(filePath)

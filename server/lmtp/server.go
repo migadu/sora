@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 
 	"github.com/emersion/go-smtp"
@@ -500,6 +501,26 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 		// Server closed without error (shouldn't normally happen, but handle gracefully)
 		logger.Info("lmtp server stopped gracefully", "name", b.name)
 	}
+}
+
+// ReloadConfig updates runtime-configurable settings from new config.
+// Called on SIGHUP. Only affects new deliveries; in-flight messages keep old settings.
+func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
+	var reloaded []string
+
+	if maxSize := cfg.GetMaxMessageSizeWithDefault(); maxSize != b.maxMessageSize {
+		b.maxMessageSize = maxSize
+		reloaded = append(reloaded, "max_message_size")
+	}
+	if cfg.Debug != b.debug {
+		b.debug = cfg.Debug
+		reloaded = append(reloaded, "debug")
+	}
+
+	if len(reloaded) > 0 {
+		logger.Info("LMTP config reloaded", "name", b.name, "updated", reloaded)
+	}
+	return nil
 }
 
 func (b *LMTPServerBackend) Close() error {

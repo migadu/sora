@@ -1,4 +1,4 @@
-.PHONY: all clean build sora sora-admin install tests tests-race reset-test-db \
+.PHONY: all clean build sora sora-admin install tests tests-race reset-test-db build-test-sora-admin \
 	integration-tests integration-tests-imap integration-tests-lmtp integration-tests-pop3 \
 	integration-tests-managesieve integration-tests-imapproxy integration-tests-lmtpproxy \
 	integration-tests-pop3proxy integration-tests-managesieveproxy integration-tests-userapiproxy \
@@ -47,9 +47,13 @@ install:
 	go install ./cmd/sora
 	go install ./cmd/sora-admin
 
+# Build sora-admin for integration tests (some tests exec the binary directly)
+build-test-sora-admin:
+	go build $(LDFLAGS) -o integration_tests/sora-admin ./cmd/sora-admin
+
 # Clean build artifacts
 clean:
-	rm -f $(SORA_BINARY) $(SORA_ADMIN_BINARY) $(SORA_LINUX_BINARY) $(SORA_ADMIN_LINUX_BINARY) $(SORA_FREEBSD_BINARY) $(SORA_ADMIN_FREEBSD_BINARY)
+	rm -f $(SORA_BINARY) $(SORA_ADMIN_BINARY) $(SORA_LINUX_BINARY) $(SORA_ADMIN_LINUX_BINARY) $(SORA_FREEBSD_BINARY) $(SORA_ADMIN_FREEBSD_BINARY) integration_tests/sora-admin
 
 # Run tests with verbose output
 tests:
@@ -106,11 +110,11 @@ integration-tests-quick: integration-tests-imap-quick integration-tests-lmtp int
 	integration-tests-config integration-tests-sora-admin integration-tests-relay
 
 # Core protocol integration tests
-integration-tests-imap: reset-test-db
+integration-tests-imap: reset-test-db build-test-sora-admin
 	@echo "Running IMAP integration tests..."
 	@cd integration_tests/imap && go test $(TEST_FLAGS) .
 
-integration-tests-imap-quick: reset-test-db
+integration-tests-imap-quick: reset-test-db build-test-sora-admin
 	@echo "Running IMAP integration tests (quick mode, skipping long tests)..."
 	@cd integration_tests/imap && go test -short $(TEST_FLAGS) .
 

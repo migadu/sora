@@ -8,6 +8,7 @@ sora
 sora-admin
 !sora/
 !sora-admin/
+integration_tests/sora-admin
 vendor/
 CLAUDE.md
 .claude/

@@ -135,5 +135,8 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 		metrics.TrackDomainMessage("imap", s.IMAPUser.Address.Domain(), "deleted")
 	}
 
+	// Track for session summary
+	s.messagesExpunged.Add(uint32(len(messagesToExpunge)))
+
 	return nil
 }

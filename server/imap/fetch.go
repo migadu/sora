@@ -645,6 +645,9 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 	}
 
 	// If not uploaded to S3, fetch from local disk
+	if s.server.uploader == nil {
+		return nil, fmt.Errorf("message UID %d not yet uploaded and no uploader configured", msg.UID)
+	}
 	s.DebugLog("fetching not yet uploaded message from disk", "uid", msg.UID)
 	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
 	data, err := os.ReadFile(filePath)

@@ -205,7 +205,7 @@ func (d *Database) PruneOldMessageBodies(ctx context.Context, tx pgx.Tx, retenti
 		WITH candidates AS (
 			SELECT content_hash
 			FROM message_contents
-			WHERE text_body IS NOT NULL OR headers IS NOT NULL
+			WHERE text_body IS NOT NULL OR headers != ''
 			LIMIT $2
 		),
 		prunable AS (
@@ -221,7 +221,7 @@ func (d *Database) PruneOldMessageBodies(ctx context.Context, tx pgx.Tx, retenti
 		UPDATE message_contents mc
 		SET
 			text_body = NULL,
-			headers = NULL,
+			headers = '',
 			updated_at = now()
 		FROM prunable p
 		WHERE mc.content_hash = p.content_hash
@@ -259,7 +259,7 @@ func (d *Database) PruneOldMessageBodiesBatched(ctx context.Context, retention t
 			WITH candidates AS (
 				SELECT content_hash
 				FROM message_contents
-				WHERE text_body IS NOT NULL OR headers IS NOT NULL
+				WHERE text_body IS NOT NULL OR headers != ''
 				LIMIT $2
 			),
 			prunable AS (
@@ -275,7 +275,7 @@ func (d *Database) PruneOldMessageBodiesBatched(ctx context.Context, retention t
 			UPDATE message_contents mc
 			SET
 				text_body = NULL,
-				headers = NULL,
+				headers = '',
 				updated_at = now()
 			FROM prunable p
 			WHERE mc.content_hash = p.content_hash

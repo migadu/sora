@@ -1369,6 +1369,42 @@ func (s *IMAPServer) GetLimiter() *serverPkg.ConnectionLimiter {
 	return s.limiter
 }
 
+// ReloadConfig updates runtime-configurable settings from new config.
+// Called on SIGHUP. Only affects new connections; existing sessions keep old settings.
+func (s *IMAPServer) ReloadConfig(cfg config.ServerConfig) error {
+	var reloaded []string
+
+	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != s.commandTimeout {
+		s.commandTimeout = timeout
+		reloaded = append(reloaded, "command_timeout")
+	}
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != s.absoluteSessionTimeout {
+		s.absoluteSessionTimeout = timeout
+		reloaded = append(reloaded, "absolute_session_timeout")
+	}
+	if bpm := cfg.GetMinBytesPerMinute(); bpm != s.minBytesPerMinute {
+		s.minBytesPerMinute = bpm
+		reloaded = append(reloaded, "min_bytes_per_minute")
+	}
+	if limit, err := cfg.GetSessionMemoryLimit(); err == nil && limit != s.sessionMemoryLimit {
+		s.sessionMemoryLimit = limit
+		reloaded = append(reloaded, "session_memory_limit")
+	}
+	if cfg.MasterSASLUsername != string(s.masterSASLUsername) {
+		s.masterSASLUsername = []byte(cfg.MasterSASLUsername)
+		reloaded = append(reloaded, "master_sasl_username")
+	}
+	if cfg.MasterSASLPassword != string(s.masterSASLPassword) {
+		s.masterSASLPassword = []byte(cfg.MasterSASLPassword)
+		reloaded = append(reloaded, "master_sasl_password")
+	}
+
+	if len(reloaded) > 0 {
+		logger.Info("IMAP config reloaded", "name", s.name, "updated", reloaded)
+	}
+	return nil
+}
+
 // GetLookupCache returns the lookup cache for testing purposes
 func (s *IMAPServer) GetLookupCache() *lookupcache.LookupCache {
 	return s.lookupCache

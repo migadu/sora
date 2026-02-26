@@ -735,6 +735,50 @@ func (s *Server) monitorActiveSessions() {
 	}
 }
 
+// ReloadConfig updates runtime-configurable settings from new config.
+// Called on SIGHUP. Only affects new connections; existing sessions keep old settings.
+func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
+	var reloaded []string
+
+	if newVal := cfg.GetMaxAuthErrors(); newVal != s.maxAuthErrors {
+		s.maxAuthErrors = newVal
+		reloaded = append(reloaded, "max_auth_errors")
+	}
+	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != s.authIdleTimeout {
+		s.authIdleTimeout = timeout
+		reloaded = append(reloaded, "auth_idle_timeout")
+	}
+	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != s.commandTimeout {
+		s.commandTimeout = timeout
+		reloaded = append(reloaded, "command_timeout")
+	}
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != s.absoluteSessionTimeout {
+		s.absoluteSessionTimeout = timeout
+		reloaded = append(reloaded, "absolute_session_timeout")
+	}
+	if bpm := cfg.GetMinBytesPerMinute(); bpm != s.minBytesPerMinute {
+		s.minBytesPerMinute = bpm
+		reloaded = append(reloaded, "min_bytes_per_minute")
+	}
+	if cfg.MasterSASLUsername != string(s.masterSASLUsername) {
+		s.masterSASLUsername = []byte(cfg.MasterSASLUsername)
+		reloaded = append(reloaded, "master_sasl_username")
+	}
+	if cfg.MasterSASLPassword != string(s.masterSASLPassword) {
+		s.masterSASLPassword = []byte(cfg.MasterSASLPassword)
+		reloaded = append(reloaded, "master_sasl_password")
+	}
+	if cfg.Debug != s.debug {
+		s.debug = cfg.Debug
+		reloaded = append(reloaded, "debug")
+	}
+
+	if len(reloaded) > 0 {
+		logger.Info("ManageSieve proxy config reloaded", "name", s.name, "updated", reloaded)
+	}
+	return nil
+}
+
 // GetLimiter returns the connection limiter for testing purposes
 func (s *Server) GetLimiter() *server.ConnectionLimiter {
 	return s.limiter

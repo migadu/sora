@@ -102,5 +102,8 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 
 	s.DebugLog("messages copied", "from", selectedMailboxName, "to", mboxName)
 
+	// Track for session summary
+	s.messagesCopied.Add(uint32(len(uidMap)))
+
 	return copyData, nil
 }

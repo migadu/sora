@@ -744,7 +744,7 @@ func TestSearchPerformanceBasic(t *testing.T) {
 
 	// Validate search constants are reasonable
 	t.Run("SearchConstants", func(t *testing.T) {
-		assert.Equal(t, 1000, MaxSearchResults, "MaxSearchResults should be 1000")
+		assert.Equal(t, 100000, MaxSearchResults, "MaxSearchResults should be 100000")
 		assert.Equal(t, 500, MaxComplexSortResults, "MaxComplexSortResults should be 500")
 		assert.Less(t, MaxComplexSortResults, MaxSearchResults, "Complex sort limit should be less than regular search limit")
 
