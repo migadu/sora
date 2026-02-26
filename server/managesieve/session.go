@@ -706,7 +706,7 @@ func (s *ManageSieveSession) handleGetScript(name string) bool {
 	}
 
 	// Remove surrounding quotes if present (same as PUTSCRIPT)
-	name = server.UnquoteString(name)
+	name = strings.TrimSpace(server.UnquoteString(name))
 
 	// Acquire a read lock only to get the necessary session state.
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -748,7 +748,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	}
 
 	// Validate script name - must not be empty and should be a valid identifier
-	name = server.UnquoteString(name) // Remove surrounding quotes if present
+	name = strings.TrimSpace(server.UnquoteString(name)) // Remove surrounding quotes and whitespace
 	if name == "" {
 		s.sendResponse("NO Script name cannot be empty\r\n")
 		return false
@@ -856,7 +856,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	}
 
 	// Remove surrounding quotes if present (same as PUTSCRIPT)
-	name = server.UnquoteString(name)
+	name = strings.TrimSpace(server.UnquoteString(name))
 
 	// Phase 1: Read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -951,7 +951,7 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 	}
 
 	// Remove surrounding quotes if present (same as PUTSCRIPT)
-	name = server.UnquoteString(name)
+	name = strings.TrimSpace(server.UnquoteString(name))
 
 	// Phase 1: Read session state
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
