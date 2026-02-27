@@ -2,6 +2,7 @@ package imap
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
@@ -83,6 +84,13 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	// Perform the batch copy operation
 	uidMap, err := s.server.rdb.CopyMessagesWithRetry(s.ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, AccountID)
 	if err != nil {
+		// Return proper IMAP NO for user errors instead of [SERVERBUG]
+		if strings.Contains(err.Error(), "source and destination mailboxes cannot be the same") {
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Text: "Cannot copy messages to the same mailbox",
+			}
+		}
 		return nil, s.internalError("failed to copy messages: %v", err)
 	}
 

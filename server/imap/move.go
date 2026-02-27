@@ -168,13 +168,25 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 			seqNums[i], seqNums[j] = seqNums[j], seqNums[i]
 		}
 
-		for _, seq := range seqNums {
-			if err := w.WriteExpunge(seq); err != nil {
-				s.DebugLog("failed to write EXPUNGE", "seq", seq, "error", err)
+		// Use the session tracker to queue expunge events. This ensures:
+		// 1. The tracker's internal message count is decremented correctly
+		// 2. EXPUNGE notifications are sent to the client when flushed
+		// 3. No tracker desync on next poll (which would force disconnection)
+		// We previously used w.WriteExpunge() which bypassed the tracker.
+		if s.mailboxTracker != nil {
+			for _, seq := range seqNums {
+				s.mailboxTracker.QueueExpunge(seq)
+			}
+		} else {
+			// Fallback: write directly if no tracker (shouldn't happen in normal operation)
+			for _, seq := range seqNums {
+				if err := w.WriteExpunge(seq); err != nil {
+					s.DebugLog("failed to write EXPUNGE", "seq", seq, "error", err)
+				}
 			}
 		}
 
-		// Update session message count
+		// Update session message count to match
 		current := s.currentNumMessages.Load()
 		removed := uint32(len(seqNums))
 		if removed > current {
