@@ -135,6 +135,13 @@ func (rs *ResilientS3Storage) PutWithRetry(ctx context.Context, key string, body
 	return err
 }
 
+// IsHealthy returns true if S3 circuit breakers are not open (S3 is reachable).
+// Used by the cleaner to skip destructive operations when S3 is down.
+func (rs *ResilientS3Storage) IsHealthy() bool {
+	return rs.putBreaker.State() != circuitbreaker.StateOpen &&
+		rs.getBreaker.State() != circuitbreaker.StateOpen
+}
+
 func (rs *ResilientS3Storage) DeleteWithRetry(ctx context.Context, key string) error {
 	config := retry.BackoffConfig{
 		InitialInterval: 1 * time.Second,

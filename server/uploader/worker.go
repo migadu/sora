@@ -314,8 +314,17 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	start := time.Now()
 	err = w.s3.PutWithRetry(ctx, s3Key, bytes.NewReader(data), upload.Size)
 	if err != nil {
-		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after S3 failure", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
+		// Only count toward max_attempts for permanent errors (e.g., invalid data).
+		// Transient S3 errors (network, timeout, circuit breaker) should NOT count,
+		// because the upload will succeed once S3 recovers. This prevents message loss
+		// from CleanupFailedUploads running after max_attempts is exhausted during
+		// a prolonged S3 outage.
+		if !w.isTransientS3Error(err) {
+			if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
+				logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after S3 failure", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
+			}
+		} else {
+			logger.Warn("Uploader: Transient S3 error — NOT counting toward max_attempts", "hash", upload.ContentHash, "account_id", upload.AccountID)
 		}
 		logger.Error("Uploader: Upload failed", "hash", upload.ContentHash, "account_id", upload.AccountID, "key", s3Key, "error", err)
 
@@ -438,6 +447,28 @@ func syncDir(dir string) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// isTransientS3Error checks if an S3 error is transient (network/timeout/circuit breaker)
+// and should NOT count toward max_attempts. Only permanent errors should exhaust attempts.
+func (w *UploadWorker) isTransientS3Error(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	transientPatterns := []string{
+		"connection refused", "connection reset", "connection timeout",
+		"i/o timeout", "network unreachable", "no such host",
+		"temporary failure", "service unavailable", "internal server error",
+		"bad gateway", "gateway timeout", "timeout", "slowdown",
+		"throttling", "rate limit", "circuit breaker",
+	}
+	for _, pattern := range transientPatterns {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *UploadWorker) RemoveLocalFile(path string) error {

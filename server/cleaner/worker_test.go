@@ -91,6 +91,11 @@ func (m *mockDatabase) FinalizeAccountDeletionsWithRetry(ctx context.Context, ac
 
 type mockS3 struct {
 	mock.Mock
+	healthy bool
+}
+
+func (m *mockS3) IsHealthy() bool {
+	return m.healthy
 }
 
 func (m *mockS3) DeleteWithRetry(ctx context.Context, key string) error {
@@ -112,7 +117,7 @@ func (m *mockCache) Delete(contentHash string) error {
 func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	// Setup
 	mockDB := new(mockDatabase)
-	mockS3 := new(mockS3)
+	mockS3 := &mockS3{healthy: true}
 	mockCache := new(mockCache)
 	ctx := context.Background()
 
@@ -201,7 +206,7 @@ func TestCleanupWorker_RunOnce_LockNotAcquired(t *testing.T) {
 
 func TestCleanupWorker_RunOnce_PartialFailures(t *testing.T) {
 	mockDB := new(mockDatabase)
-	mockS3 := new(mockS3)
+	mockS3 := &mockS3{healthy: true}
 	mockCache := new(mockCache)
 	ctx := context.Background()
 	worker := &CleanupWorker{
@@ -239,7 +244,7 @@ func TestCleanupWorker_RunOnce_PartialFailures(t *testing.T) {
 
 func TestCleanupWorker_RunOnce_S3DeleteFails(t *testing.T) {
 	mockDB := new(mockDatabase)
-	mockS3 := new(mockS3)
+	mockS3 := &mockS3{healthy: true}
 	ctx := context.Background()
 	worker := &CleanupWorker{
 		rdb:                   mockDB,
@@ -284,6 +289,7 @@ func TestCleanupWorker_RunOnce_NoOp(t *testing.T) {
 	ctx := context.Background()
 	worker := &CleanupWorker{
 		rdb:                   mockDB,
+		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
 		healthStatusRetention: 1 * time.Hour,
 	}
@@ -319,6 +325,7 @@ func TestCleanupWorker_RunOnce_VectorPruning(t *testing.T) {
 
 	worker := &CleanupWorker{
 		rdb:                   mockDB,
+		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
 		ftsRetention:          ftsRetention,
 		ftsSourceRetention:    ftsSourceRetention,
@@ -354,6 +361,7 @@ func TestCleanupWorker_RunOnce_NoFTSPruningWhenBothZero(t *testing.T) {
 
 	worker := &CleanupWorker{
 		rdb:                   mockDB,
+		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
 		ftsRetention:          0, // keep vectors forever
 		ftsSourceRetention:    0, // keep source forever
@@ -393,6 +401,7 @@ func TestCleanupWorker_RunOnce_SourceOnlyPruning(t *testing.T) {
 
 	worker := &CleanupWorker{
 		rdb:                   mockDB,
+		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
 		ftsRetention:          0, // keep vectors forever
 		ftsSourceRetention:    ftsSourceRetention,
@@ -421,6 +430,45 @@ func TestCleanupWorker_RunOnce_SourceOnlyPruning(t *testing.T) {
 	mockDB.AssertNotCalled(t, "PruneOldMessageVectorsBatchedWithRetry", mock.Anything, mock.Anything)
 }
 
+func TestCleanupWorker_RunOnce_SkipsFailedUploadCleanupWhenS3Unhealthy(t *testing.T) {
+	// CRITICAL SAFETY TEST: When S3 is down, CleanupFailedUploads must NOT run.
+	// If it runs during S3 outage, it would delete messages that can't be uploaded,
+	// causing permanent message loss.
+	mockDB := new(mockDatabase)
+	mockS3 := &mockS3{healthy: false} // S3 is DOWN
+	mockCache := new(mockCache)
+	ctx := context.Background()
+
+	worker := &CleanupWorker{
+		rdb:                   mockDB,
+		s3:                    mockS3,
+		cache:                 mockCache,
+		healthStatusRetention: 1 * time.Hour,
+	}
+
+	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
+	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
+
+	// CleanupFailedUploadsWithRetry should NOT be called when S3 is unhealthy
+	// (no On() setup means test fails if it's called)
+
+	// Other cleanup operations should still proceed
+	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
+	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
+	mockDB.On("GetUnusedContentHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+
+	err := worker.runOnce(ctx)
+
+	assert.NoError(t, err)
+	mockDB.AssertExpectations(t)
+	// CRITICAL: Verify CleanupFailedUploads was NOT called
+	mockDB.AssertNotCalled(t, "CleanupFailedUploadsWithRetry", mock.Anything, mock.Anything)
+	t.Log("✓ CleanupFailedUploads correctly skipped when S3 is unhealthy — messages preserved")
+}
+
 func TestCleanupWorker_RunOnce_VectorOnlyPruning(t *testing.T) {
 	// Unusual config: vector retention set but source retention is 0 (keep source forever)
 	mockDB := new(mockDatabase)
@@ -431,6 +479,7 @@ func TestCleanupWorker_RunOnce_VectorOnlyPruning(t *testing.T) {
 
 	worker := &CleanupWorker{
 		rdb:                   mockDB,
+		s3:                    &mockS3{healthy: true},
 		cache:                 mockCache,
 		ftsRetention:          ftsRetention,
 		ftsSourceRetention:    0, // keep source forever

@@ -55,6 +55,7 @@ type DatabaseManager interface {
 // S3Manager defines the interface for S3 operations required by the cleaner.
 type S3Manager interface {
 	DeleteWithRetry(ctx context.Context, key string) error
+	IsHealthy() bool // Check if S3 is reachable (circuit breaker state)
 }
 
 // CacheManager defines the interface for cache operations required by the cleaner.
@@ -222,13 +223,19 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 
 	// --- Phase 0a: Cleanup of failed uploads ---
 	// This removes message metadata for messages that were never successfully uploaded to S3.
-	failedUploadsCount, err = w.rdb.CleanupFailedUploadsWithRetry(ctx, w.gracePeriod)
-	if err != nil {
-		// Log the error but continue, as other cleanup tasks can still proceed.
-		logger.Error("Cleanup: Failed to clean up failed uploads", "error", err)
-	} else if failedUploadsCount > 0 {
-		logger.Info("Cleanup: Cleaned up failed upload messages", "count", failedUploadsCount)
-	}
+	// SAFETY: Only run when S3 is healthy. If S3 is down, messages can't be uploaded,
+	// and deleting their metadata would cause permanent message loss.
+	if !w.s3.IsHealthy() {
+		logger.Warn("Cleanup: Skipping failed upload cleanup — S3 is unhealthy (circuit breaker open). Messages preserved for retry when S3 recovers.")
+	} else {
+		failedUploadsCount, err = w.rdb.CleanupFailedUploadsWithRetry(ctx, w.gracePeriod)
+		if err != nil {
+			// Log the error but continue, as other cleanup tasks can still proceed.
+			logger.Error("Cleanup: Failed to clean up failed uploads", "error", err)
+		} else if failedUploadsCount > 0 {
+			logger.Info("Cleanup: Cleaned up failed upload messages", "count", failedUploadsCount)
+		}
+	} // end S3 healthy check
 
 	// --- Phase 0: Process soft-deleted accounts ---
 	// This prepares accounts for deletion by expunging their messages and removing
