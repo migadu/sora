@@ -5,12 +5,12 @@ package cleaner
 // It uses a database table-based lock to ensure that only one instance of the
 // cleanup worker is running at a time. The cleanup process involves listing
 // S3 objects that are candidates for deletion and removing them from both
-// S3 and the database. The worker runs at a specified interval, which can
-// be configured to a minimum of 1 hour if set too small. The grace period
-// is the time after which S3 objects are considered for deletion. The
-// worker is designed to be started in a separate goroutine and will
-// continue running until the context is done. It logs its progress and
-// any errors encountered during the cleanup process.
+// S3 and the database. The worker runs at a specified interval, with a
+// minimum allowed interval of 1 minute. The grace period is the time after
+// which S3 objects are considered for deletion. The worker is designed to be
+// started in a separate goroutine and will continue running until the context
+// is done. It logs its progress and any errors encountered during the
+// cleanup process.
 
 import (
 	"context"

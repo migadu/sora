@@ -1693,6 +1693,12 @@ func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Reques
 		params.Until = &untilTime
 	}
 
+	// Validate time range: since must be before or equal to until
+	if params.Since != nil && params.Until != nil && params.Since.After(*params.Until) {
+		s.writeError(w, http.StatusBadRequest, "Invalid time range: 'since' must be before or equal to 'until'")
+		return
+	}
+
 	if limitStr != "" {
 		limit, err := strconv.Atoi(limitStr)
 		if err != nil || limit < 0 {
@@ -1747,6 +1753,14 @@ func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate message IDs are positive
+	for _, id := range req.MessageIDs {
+		if id <= 0 {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid message_id: %d (must be positive)", id))
+			return
+		}
+	}
+
 	// Build parameters
 	params := db.RestoreMessagesParams{
 		Email:       email,
@@ -1770,6 +1784,12 @@ func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		params.Until = &untilTime
+	}
+
+	// Validate time range: since must be before or equal to until
+	if params.Since != nil && params.Until != nil && params.Since.After(*params.Until) {
+		s.writeError(w, http.StatusBadRequest, "Invalid time range: 'since' must be before or equal to 'until'")
+		return
 	}
 
 	// Restore messages
