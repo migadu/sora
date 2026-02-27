@@ -1,0 +1,44 @@
+#!/bin/sh
+
+# Sora Mail Server — FreeBSD rc.d service script
+# Install: cp dist/sora.rc /usr/local/etc/rc.d/sora && chmod +x /usr/local/etc/rc.d/sora
+# Enable:  sysrc sora_enable=YES
+# Start:   service sora start
+# Reload:  service sora reload  (sends SIGHUP for config reload)
+# Logs:    tail -f /var/log/sora/sora.log
+
+# PROVIDE: sora
+# REQUIRE: LOGIN networking postgresql
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="sora"
+rcvar="sora_enable"
+
+load_rc_config $name
+
+: ${sora_enable:="NO"}
+: ${sora_user:="sora"}
+: ${sora_group:="sora"}
+: ${sora_config:="/usr/local/etc/sora/config.toml"}
+: ${sora_logdir:="/var/log/sora"}
+: ${sora_spooldir:="/var/spool/sora"}
+
+pidfile="/var/run/${name}.pid"
+command="/usr/local/bin/sora"
+command_args="--config ${sora_config}"
+
+# SIGHUP triggers config reload
+sig_reload="HUP"
+
+start_precmd="sora_precmd"
+
+sora_precmd()
+{
+    # Ensure required directories exist
+    install -d -o ${sora_user} -g ${sora_group} -m 750 ${sora_logdir}
+    install -d -o ${sora_user} -g ${sora_group} -m 750 ${sora_spooldir}
+}
+
+run_rc_command "$1"

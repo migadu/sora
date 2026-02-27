@@ -1,0 +1,47 @@
+# Sora Mail Server — systemd service file
+# Install: cp dist/sora.service /etc/systemd/system/sora.service
+# Enable:  systemctl daemon-reload && systemctl enable sora
+# Start:   systemctl start sora
+# Reload:  systemctl reload sora  (sends SIGHUP for config reload)
+# Logs:    journalctl -u sora -f
+
+[Unit]
+Description=Sora Mail Server
+Documentation=https://github.com/migadu/sora
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=sora
+Group=sora
+
+ExecStart=/usr/local/bin/sora --config /etc/sora/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Graceful shutdown (30s timeout matches server's internal shutdown timeout)
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Restart on failure with backoff
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/spool/sora /var/cache/sora /var/log/sora
+
+# File descriptor limits (for many concurrent connections)
+LimitNOFILE=65536
+
+# Allow binding to privileged ports (143, 993, 110, 995, etc.)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
