@@ -2,6 +2,7 @@ package imap
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
@@ -95,7 +96,13 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 					s.DebugLog("auto-creating parent mailbox", "mailbox", parentPathWithoutDelim)
 					err = s.server.rdb.CreateMailboxWithRetry(ctx, AccountID, parentPathWithoutDelim, currentParentID)
 					if err != nil {
-						return s.internalError("failed to auto-create parent mailbox '%s': %v", parentPathWithoutDelim, err)
+						// Handle race condition: another session may have created the same parent
+						// mailbox concurrently. If so, just fetch the existing one.
+						if errors.Is(err, consts.ErrDBUniqueViolation) {
+							s.DebugLog("parent mailbox already exists (concurrent create)", "mailbox", parentPathWithoutDelim)
+						} else {
+							return s.internalError("failed to auto-create parent mailbox '%s': %v", parentPathWithoutDelim, err)
+						}
 					}
 
 					parentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, parentPathWithoutDelim)

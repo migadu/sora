@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -122,7 +123,12 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 			s.DebugLog("new parent mailbox does not exist, auto-creating", "parent", newParentPath, "target", newName)
 			createErr := s.server.rdb.CreateMailboxWithRetry(s.ctx, ownerAccountID, newParentPath, nil)
 			if createErr != nil {
-				return s.internalError("failed to auto-create new parent mailbox '%s': %v", newParentPath, createErr)
+				// Handle race condition: another session may have created the parent concurrently
+				if errors.Is(createErr, consts.ErrDBUniqueViolation) {
+					s.DebugLog("parent mailbox already exists (concurrent create)", "parent", newParentPath)
+				} else {
+					return s.internalError("failed to auto-create new parent mailbox '%s': %v", newParentPath, createErr)
+				}
 			}
 			// Fetch the newly created parent to get its ID.
 			newParentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(s.ctx, ownerAccountID, newParentPath)
