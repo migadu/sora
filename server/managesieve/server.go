@@ -79,6 +79,9 @@ type ManageSieveServer struct {
 	// Connection tracking
 	connTracker *serverPkg.ConnectionTracker
 
+	// Startup throttle to prevent thundering herd on restart
+	startupThrottleUntil time.Time
+
 	// Active session tracking for graceful shutdown
 	activeSessionsMutex sync.RWMutex
 	activeSessions      map[*ManageSieveSession]struct{}
@@ -425,7 +428,16 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 	// Start session monitoring routine
 	go s.monitorActiveSessions()
 
+	// Set startup throttle for 30 seconds
+	s.startupThrottleUntil = time.Now().Add(30 * time.Second)
+	logger.Info("ManageSieve: Startup throttle active for 30s", "name", s.name)
+
 	for {
+		// Startup throttle: spread reconnection load after server restart
+		if !s.startupThrottleUntil.IsZero() && time.Now().Before(s.startupThrottleUntil) {
+			time.Sleep(5 * time.Millisecond) // ~200 new connections/second during startup
+		}
+
 		conn, err := listener.Accept()
 		if err != nil {
 			// Check if this is a PROXY protocol error (connection-specific, not fatal)

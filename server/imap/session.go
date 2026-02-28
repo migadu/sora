@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -128,6 +129,25 @@ func (s *IMAPSession) internalError(format string, a ...any) *imap.Error {
 	errorText := fmt.Sprintf(format, a...)
 	// Log using structured logging with the formatted message
 	s.InfoLog(errorText)
+
+	// Detect transient infrastructure errors (DB exhaustion, network issues)
+	// and return [UNAVAILABLE] instead of [SERVERBUG] so clients back off
+	// instead of retrying aggressively
+	errLower := strings.ToLower(errorText)
+	if strings.Contains(errLower, "no more connections") ||
+		strings.Contains(errLower, "failed to connect") ||
+		strings.Contains(errLower, "connection refused") ||
+		strings.Contains(errLower, "too many clients") ||
+		strings.Contains(errLower, "connection pool") ||
+		strings.Contains(errLower, "max_client_conn") ||
+		strings.Contains(errLower, "operation failed after") {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeUnavailable,
+			Text: "Service temporarily unavailable, please try again later",
+		}
+	}
+
 	return &imap.Error{
 		Type: imap.StatusResponseTypeNo,
 		Code: imap.ResponseCodeServerBug,

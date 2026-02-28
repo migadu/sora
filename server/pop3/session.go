@@ -420,7 +420,7 @@ func (s *POP3Session) handleConnection() {
 			err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID)
 			if err != nil {
 				s.DebugLog("error creating default mailboxes", "error", err)
-				writer.WriteString("-ERR Internal server error\r\n")
+				writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 				writer.Flush()
 				continue
 			}
@@ -431,7 +431,7 @@ func (s *POP3Session) handleConnection() {
 			inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, accountID, consts.MailboxInbox)
 			if err != nil {
 				s.DebugLog("error getting inbox", "error", err)
-				writer.WriteString("-ERR Internal server error\r\n")
+				writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 				writer.Flush()
 				continue
 			}
@@ -526,7 +526,7 @@ func (s *POP3Session) handleConnection() {
 			messagesCount, size, err := s.server.rdb.GetMailboxMessageCountAndSizeSumWithRetry(readCtx, mailboxID)
 			if err != nil {
 				s.DebugLog("stat error", "error", err)
-				writer.WriteString("-ERR Internal server error\r\n")
+				writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 				writer.Flush()
 				continue
 			}
@@ -594,7 +594,7 @@ func (s *POP3Session) handleConnection() {
 				messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.DebugLog("list error", "error", err)
-					writer.WriteString("-ERR Internal server error\r\n")
+					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 					writer.Flush()
 					continue
 				}
@@ -723,7 +723,7 @@ func (s *POP3Session) handleConnection() {
 				messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.DebugLog("uidl error", "error", err)
-					writer.WriteString("-ERR Internal server error\r\n")
+					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 					writer.Flush()
 					continue
 				}
@@ -877,7 +877,7 @@ func (s *POP3Session) handleConnection() {
 				loadedMessages, err = s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.DebugLog("top error", "error", err)
-					writer.WriteString("-ERR Internal server error\r\n")
+					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 					writer.Flush()
 					continue
 				}
@@ -947,7 +947,7 @@ func (s *POP3Session) handleConnection() {
 					writer.WriteString("-ERR Message not available\r\n")
 				} else {
 					s.DebugLog("top internal error", "error", err)
-					writer.WriteString("-ERR Internal server error\r\n")
+					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 				}
 				writer.Flush()
 				continue
@@ -1083,7 +1083,7 @@ func (s *POP3Session) handleConnection() {
 				loadedMessages, err = s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.DebugLog("retr error", "error", err)
-					writer.WriteString("-ERR Internal server error\r\n")
+					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 					writer.Flush()
 					continue
 				}
@@ -1150,7 +1150,7 @@ func (s *POP3Session) handleConnection() {
 					writer.WriteString("-ERR Message not available\r\n")
 				} else {
 					s.DebugLog("retr internal error", "error", err)
-					writer.WriteString("-ERR Internal server error\r\n")
+					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 				}
 				writer.Flush()
 				continue
@@ -1318,7 +1318,7 @@ func (s *POP3Session) handleConnection() {
 				loadedMessages, err = s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.DebugLog("dele error", "error", err)
-					writer.WriteString("-ERR Internal server error\r\n")
+					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 					writer.Flush()
 					continue
 				}
@@ -1661,7 +1661,7 @@ func (s *POP3Session) handleConnection() {
 			err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID)
 			if err != nil {
 				s.DebugLog("error creating default mailboxes", "error", err)
-				writer.WriteString("-ERR Internal server error\r\n")
+				writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 				writer.Flush()
 				continue
 			}
@@ -1672,7 +1672,7 @@ func (s *POP3Session) handleConnection() {
 			inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, accountID, consts.MailboxInbox)
 			if err != nil {
 				s.DebugLog("error getting inbox", "error", err)
-				writer.WriteString("-ERR Internal server error\r\n")
+				writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 				writer.Flush()
 				continue
 			}

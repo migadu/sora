@@ -55,14 +55,24 @@ type ClientCapabilityFilter struct {
 // connectionLimitingListener wraps a net.Listener to enforce connection limits and rate limits at the TCP level
 type connectionLimitingListener struct {
 	net.Listener
-	limiter     *serverPkg.ConnectionLimiter
-	authLimiter serverPkg.AuthLimiter
-	name        string
+	limiter         *serverPkg.ConnectionLimiter
+	authLimiter     serverPkg.AuthLimiter
+	name            string
+	startedAt       time.Time     // When the listener started accepting connections
+	startupThrottle time.Duration // Grace period during which new connections are throttled (e.g., 30s)
+	startupDelay    time.Duration // Delay between accepts during startup throttle (e.g., 5ms)
 }
 
 // Accept accepts connections and checks connection limits before returning them
 func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 	for {
+		// Startup throttle: spread reconnection load after server restart
+		// During the startup grace period, add a small delay between accepts
+		// to prevent thundering herd on the database connection pool
+		if l.startupThrottle > 0 && time.Since(l.startedAt) < l.startupThrottle {
+			time.Sleep(l.startupDelay)
+		}
+
 		conn, err := l.Listener.Accept()
 		if err != nil {
 			return nil, err
@@ -940,13 +950,17 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		}
 	}
 
-	// Wrap listener with connection limiting and rate limiting
+	// Wrap listener with connection limiting, rate limiting, and startup throttling
 	limitedListener := &connectionLimitingListener{
-		Listener:    listener,
-		limiter:     s.limiter,
-		authLimiter: s.authLimiter,
-		name:        s.name,
+		Listener:        listener,
+		limiter:         s.limiter,
+		authLimiter:     s.authLimiter,
+		name:            s.name,
+		startedAt:       time.Now(),
+		startupThrottle: 30 * time.Second,     // Throttle for 30s after startup
+		startupDelay:    5 * time.Millisecond, // ~200 new connections/second during throttle
 	}
+	logger.Info("IMAP: Startup throttle active for 30s (5ms delay between accepts)", "name", s.name)
 
 	err = s.server.Serve(limitedListener)
 

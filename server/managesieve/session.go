@@ -676,7 +676,7 @@ func (s *ManageSieveSession) handleListScripts() bool {
 
 	scripts, err := s.server.rdb.GetUserScriptsWithRetry(readCtx, accountID)
 	if err != nil {
-		s.sendResponse("NO Internal server error\r\n")
+		s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
 		return false
 	}
 
@@ -791,7 +791,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, accountID)
 	if err != nil {
 		if err != consts.ErrDBNotFound {
-			s.sendResponse("NO Internal server error\r\n")
+			s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
 			return false
 		}
 	}
@@ -800,7 +800,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	if script != nil {
 		_, err := s.server.rdb.UpdateScriptWithRetry(s.ctx, script.ID, accountID, name, content)
 		if err != nil {
-			s.sendResponse("NO Internal server error\r\n")
+			s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
 			return false
 		}
 
@@ -818,7 +818,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	} else {
 		_, err = s.server.rdb.CreateScriptWithRetry(s.ctx, accountID, name, content)
 		if err != nil {
-			s.sendResponse("NO Internal server error\r\n")
+			s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
 			return false
 		}
 		responseMsg = "OK Script stored\r\n"
@@ -873,7 +873,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	if name == "" {
 		err := s.server.rdb.DeactivateAllScriptsWithRetry(s.ctx, accountID)
 		if err != nil {
-			s.sendResponse("NO Internal server error\r\n")
+			s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
 			return false
 		}
 
@@ -903,7 +903,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 			s.sendResponse("NO No such script\r\n")
 			return false
 		}
-		s.sendResponse("NO Internal server error\r\n")
+		s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
 		return false
 	}
 
@@ -921,7 +921,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 
 	err = s.server.rdb.SetScriptActiveWithRetry(s.ctx, script.ID, accountID, true)
 	if err != nil {
-		s.sendResponse("NO Internal server error\r\n")
+		s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
 		return false
 	}
 
@@ -976,13 +976,13 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 			s.sendResponse("NO No such script\r\n") // RFC uses NO for "No such script"
 			return false
 		}
-		s.sendResponse("NO Internal server error\r\n") // RFC uses NO for server errors
+		s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n") // RFC uses NO for server errors
 		return false
 	}
 
 	err = s.server.rdb.DeleteScriptByIDWithRetry(s.ctx, script.ID, accountID)
 	if err != nil {
-		s.sendResponse("NO Internal server error\r\n")
+		s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
 		return false
 	}
 
