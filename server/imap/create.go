@@ -141,6 +141,15 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	// Final phase: actual creation - no locks needed as it's a DB operation
 	err = s.server.rdb.CreateMailboxWithRetry(ctx, AccountID, name, parentMailboxID)
 	if err != nil {
+		// Handle race condition: another session may have created the same mailbox
+		// between our existence check and the actual INSERT.
+		if errors.Is(err, consts.ErrDBUniqueViolation) {
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeAlreadyExists,
+				Text: "Mailbox already exists",
+			}
+		}
 		return s.internalError("failed to create mailbox '%s': %v", name, err)
 	}
 
