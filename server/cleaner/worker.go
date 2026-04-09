@@ -345,6 +345,12 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 				}
 				// Yield to prevent database CPU/WAL starvation for incoming LMTP requests
 				time.Sleep(1 * time.Second)
+
+				// HARD BRAKE: Cap FTS pruning to 2,000 rows per cycle to prevent WAL ballooning
+				if ftsPrunedCount >= 2000 {
+					logger.Info("Cleanup: Yielding FTS prune early to prevent WAL bloat.")
+					break
+				}
 			} else {
 				break
 			}
@@ -356,7 +362,11 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	for i := 0; i < 50; i++ {
 		nullifiedLegacyCount, newLastHash, err := w.rdb.NullifyLegacyTextBodiesWithRetry(ctx, w.lastNullifyHash)
 		if err != nil {
-			logger.Error("Cleanup: Failed to nullify legacy text bodies", "error", err)
+			if errors.Is(err, context.DeadlineExceeded) || err.Error() == "timeout: context deadline exceeded" || err.Error() == "failed to nullify legacy text_body rows: timeout: context deadline exceeded" {
+				logger.Info("Cleanup: Yielding legacy nullification early. Reached the 5-minute scheduling time limit.")
+			} else {
+				logger.Error("Cleanup: Failed to nullify legacy text bodies", "error", err)
+			}
 			break
 		}
 		w.lastNullifyHash = newLastHash
@@ -366,8 +376,15 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 			logger.Info("Cleanup: Removed legacy text bodies, reclaiming storage", "count", nullifiedLegacyCount)
 			// Yield to prevent database CPU/WAL starvation for incoming LMTP requests
 			time.Sleep(1 * time.Second)
+
+			// HARD BRAKE: Prevent WAL ballooning by strictly capping the maximum number of massive row mutations per cycle.
+			// It will process up to a max of 2,000 updates ~every 5 minutes.
+			if legacyNullifiedCount >= 2000 {
+				logger.Info("Cleanup: Yielding legacy nullification early to prevent WAL bloat.")
+				break
+			}
 		}
-		
+
 		if w.lastNullifyHash == "" {
 			logger.Info("Cleanup: Reached end of message_contents table for legacy nullification.")
 			break // Done: reached end of the table

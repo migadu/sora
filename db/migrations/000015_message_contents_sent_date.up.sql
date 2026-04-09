@@ -37,51 +37,53 @@
 -- pruning), run the following OUTSIDE sora, in small batches during a
 -- maintenance window:
 --
---   DO $$ 
---   DECLARE 
---       batch_size INT := 10000;
---       last_hash VARCHAR(64) := '';
---       rows_updated INT;
---   BEGIN 
---       LOOP
---           -- Find the next batch of content_hashes to process using the Primary Key directly
---           WITH next_batch AS (
---               SELECT content_hash 
---               FROM message_contents
---               WHERE content_hash > last_hash
---               ORDER BY content_hash ASC 
---               LIMIT batch_size
---           ),
---           -- Calculate the earliest sent_date for those hashes
---           computed_dates AS (
---               SELECT m.content_hash, MIN(m.sent_date) AS min_sent_date
---               FROM next_batch nb
---               JOIN messages m ON m.content_hash = nb.content_hash
---               GROUP BY m.content_hash
---           )
---           -- Update exactly the ones that need it
---           UPDATE message_contents mc
---           SET sent_date = cd.min_sent_date
---           FROM computed_dates cd
---           WHERE mc.content_hash = cd.content_hash
---             AND mc.sent_date IS NULL;
--- 
---           GET DIAGNOSTICS rows_updated = ROW_COUNT;
--- 
---           -- Fetch the actual max hash from the batch to advance the cursor securely
---           SELECT MAX(content_hash) INTO last_hash FROM (
---               SELECT content_hash FROM message_contents
---               WHERE content_hash > last_hash
---               ORDER BY content_hash ASC 
---               LIMIT batch_size
---           ) sub;
--- 
---           -- If the cursor couldn't advance, we have reached the end of the table
---           EXIT WHEN last_hash IS NULL;
--- 
---           PERFORM pg_sleep(0.05); -- brief yield to alleviate WAL pressure
---       END LOOP; 
---   END $$;
+-- #!/usr/bin/env bash
+-- set -euo pipefail
+
+-- # Connection — set these or use PGPASSWORD + command-line args
+-- DB_HOST="${PGHOST:-localhost}"
+-- DB_NAME="${PGDATABASE:-sora}"
+-- DB_USER="${PGUSER:-sora}"
+-- PSQL="psql -h $DB_HOST -U $DB_USER -d $DB_NAME -qtAX"
+
+-- BATCH=50000
+-- CUR=0
+-- TOTAL=0
+-- N=0
+
+-- MAX=$($PSQL -c "SELECT COALESCE(MAX(id),0) FROM messages")
+-- echo "Max message ID: $MAX"
+-- [ "$MAX" -eq 0 ] && { echo "Nothing to do."; exit 0; }
+
+-- while [ "$CUR" -lt "$MAX" ]; do
+--   NEXT=$((CUR + BATCH))
+--   N=$((N + 1))
+
+--   ROWS=$($PSQL <<SQL
+--     WITH batch AS (
+--       SELECT content_hash, MIN(sent_date) AS sd
+--       FROM messages
+--       WHERE id > $CUR AND id <= $NEXT
+--       GROUP BY content_hash
+--     )
+--     UPDATE message_contents mc
+--     SET sent_date = batch.sd
+--     FROM batch
+--     WHERE mc.content_hash = batch.content_hash
+--       AND mc.sent_date IS NULL
+--     RETURNING 1;
+-- SQL
+--   )
+--   ROWS=$(echo "$ROWS" | grep -c '1' || true)
+
+--   TOTAL=$((TOTAL + ROWS))
+--   CUR=$NEXT
+--   echo "Batch $N (IDs ≤ $CUR): $ROWS rows. Total: $TOTAL"
+--   sleep 0.01
+-- done
+
+-- echo "Done. Total updated: $TOTAL"
+
 
 ALTER TABLE message_contents ADD COLUMN IF NOT EXISTS sent_date timestamptz;
 

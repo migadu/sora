@@ -1,6 +1,8 @@
 package imap
 
 import (
+	"strings"
+
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/helpers"
@@ -182,6 +184,10 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		}
 
 		if err != nil {
+			if strings.Contains(err.Error(), "not found (may be expunged or moved)") {
+				s.DebugLog("Store: skipping message because it was concurrently expunged or moved", "uid", msg.UID)
+				continue
+			}
 			return s.internalError("failed to update flags for message: %v", err)
 		}
 
