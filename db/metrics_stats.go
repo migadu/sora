@@ -48,14 +48,13 @@ func (d *Database) GetMetricsStats(ctx context.Context) (*MetricsStats, error) {
 	}
 
 	// Get total messages (non-expunged, for non-deleted accounts)
-	// Note: mailboxes don't have deleted_at, but messages have expunged_at
+	// Use pre-aggregated mailbox_stats table instead of counting all messages
 	err = pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM messages msg
-		INNER JOIN mailboxes m ON msg.mailbox_id = m.id
+		SELECT COALESCE(SUM(ms.message_count), 0)
+		FROM mailbox_stats ms
+		INNER JOIN mailboxes m ON ms.mailbox_id = m.id
 		INNER JOIN accounts a ON m.account_id = a.id
-		WHERE msg.expunged_at IS NULL
-		AND a.deleted_at IS NULL
+		WHERE a.deleted_at IS NULL
 	`).Scan(&stats.TotalMessages)
 	if err != nil {
 		return nil, err
