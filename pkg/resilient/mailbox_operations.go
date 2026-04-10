@@ -232,7 +232,9 @@ func (rd *ResilientDatabase) DeleteMailboxWithRetry(ctx context.Context, mailbox
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(true).DeleteMailbox(ctx, tx, mailboxID, AccountID)
 	}
-	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	// Deleting a mailbox is a bulk operation that cleans up thousands of messages and triggers sequence updates.
+	// Treat it with administrative timeouts rather than tight 15s write timeouts.
+	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutAdmin, op)
 	return err
 }
 

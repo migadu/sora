@@ -344,13 +344,9 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 					break
 				}
 				// Yield to prevent database CPU/WAL starvation for incoming LMTP requests
-				time.Sleep(1 * time.Second)
-
-				// HARD BRAKE: Cap FTS pruning to 2,000 rows per cycle to prevent WAL ballooning
-				if ftsPrunedCount >= 2000 {
-					logger.Info("Cleanup: Yielding FTS prune early to prevent WAL bloat.")
-					break
-				}
+				// A 2-second sleep paces WAL generation at ~500 updates/sec (with 1000-row batches),
+				// which allows autovacuum and WAL archiving to keep up effortlessly.
+				time.Sleep(2 * time.Second)
 			} else {
 				break
 			}
@@ -375,14 +371,9 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 			legacyNullifiedCount += nullifiedLegacyCount
 			logger.Info("Cleanup: Removed legacy text bodies, reclaiming storage", "count", nullifiedLegacyCount)
 			// Yield to prevent database CPU/WAL starvation for incoming LMTP requests
-			time.Sleep(1 * time.Second)
-
-			// HARD BRAKE: Prevent WAL ballooning by strictly capping the maximum number of massive row mutations per cycle.
-			// It will process up to a max of 2,000 updates ~every 5 minutes.
-			if legacyNullifiedCount >= 2000 {
-				logger.Info("Cleanup: Yielding legacy nullification early to prevent WAL bloat.")
-				break
-			}
+			// A 2-second sleep paces WAL generation at ~500 updates/sec (with 1000-row batches),
+			// allowing us to process up to 50,000 rows per cycle cleanly without WAL bloat.
+			time.Sleep(2 * time.Second)
 		}
 
 		if w.lastNullifyHash == "" {

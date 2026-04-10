@@ -141,92 +141,62 @@ func (db *Database) GetMessagesByNumSet(ctx context.Context, mailboxID int64, nu
 }
 
 func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, uidSet imap.UIDSet, includeBodyStructure bool) ([]Message, error) {
-	var messages []Message
+	if len(uidSet) == 0 {
+		return nil, nil
+	}
 
 	bsCol := ""
 	if includeBodyStructure {
 		bsCol = "m.body_structure, "
 	}
 
+	// Consolidate all UID ranges into a single WHERE clause to avoid executing hundreds
+	// of individual database queries for fragmented fetches (e.g. Apple Mail).
+	var conditions []string
+	var args []any
+	args = append(args, mailboxID)
+
 	for _, uidRange := range uidSet {
-		// OPTIMIZATION: Use offset+range pattern instead of full-mailbox CTE.
-		// Instead of computing ROW_NUMBER() over ALL non-expunged messages (O(N)),
-		// we COUNT messages before the range start (index-only scan) and only
-		// number messages within the requested UID range.
-		// This reduces cost from O(N) to O(range_size + index_scan_to_start).
-		//
-		// Filter to uploaded messages only.  A message that is not yet uploaded to S3
-		// has its body on local disk only — on any other node its body is inaccessible
-		// and FETCH would return a misleading empty literal.  Only serving uploaded
-		// messages ensures consistent, correct behaviour across all nodes.
-
-		var rows pgx.Rows
-		var err error
-		var rangeDesc string
-
 		if uidRange.Stop == imap.UID(0) {
-			// Wildcard range (e.g., 1:*)
-			rangeDesc = fmt.Sprintf("%d:*", uidRange.Start)
-			query := fmt.Sprintf(`
-				WITH
-				  range_messages AS (
-				    SELECT *, ROW_NUMBER() OVER(ORDER BY uid) as range_pos
-				    FROM messages
-				    WHERE mailbox_id = $1 AND uid >= $2 AND expunged_at IS NULL
-				  ),
-				  preceding AS (
-				    SELECT COUNT(*) as cnt FROM messages
-				    WHERE mailbox_id = $1 AND uid < $2 AND expunged_at IS NULL
-				  )
-				SELECT
-				    m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-				    m.internal_date, m.size, %sm.created_modseq, m.updated_modseq, m.expunged_modseq,
-				    (SELECT cnt FROM preceding) + m.range_pos as seqnum,
-				    m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
-				FROM range_messages m
-				WHERE m.uploaded = true
-				ORDER BY m.uid`, bsCol)
-			rows, err = db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, uint32(uidRange.Start))
+			args = append(args, uint32(uidRange.Start))
+			conditions = append(conditions, fmt.Sprintf("m.uid >= $%d", len(args)))
 		} else {
-			// Regular range (e.g., 1:5)
-			rangeDesc = fmt.Sprintf("%d:%d", uidRange.Start, uidRange.Stop)
-			query := fmt.Sprintf(`
-				WITH
-				  range_messages AS (
-				    SELECT *, ROW_NUMBER() OVER(ORDER BY uid) as range_pos
-				    FROM messages
-				    WHERE mailbox_id = $1 AND uid >= $2 AND uid <= $3 AND expunged_at IS NULL
-				  ),
-				  preceding AS (
-				    SELECT COUNT(*) as cnt FROM messages
-				    WHERE mailbox_id = $1 AND uid < $2 AND expunged_at IS NULL
-				  )
-				SELECT
-				    m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-				    m.internal_date, m.size, %sm.created_modseq, m.updated_modseq, m.expunged_modseq,
-				    (SELECT cnt FROM preceding) + m.range_pos as seqnum,
-				    m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
-				FROM range_messages m
-				WHERE m.uploaded = true
-				ORDER BY m.uid`, bsCol)
-			rows, err = db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, uint32(uidRange.Start), uint32(uidRange.Stop))
+			args = append(args, uint32(uidRange.Start), uint32(uidRange.Stop))
+			conditions = append(conditions, fmt.Sprintf("(m.uid >= $%d AND m.uid <= $%d)", len(args)-1, len(args)))
 		}
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to query messages with UID range %s: %v", rangeDesc, err)
-		}
-
-		rangeMessages, err := scanMessages(rows, includeBodyStructure)
-		if err != nil {
-			return nil, err
-		}
-
-		messages = append(messages, rangeMessages...)
 	}
-	return messages, nil
+
+	whereClause := strings.Join(conditions, " OR ")
+
+	query := fmt.Sprintf(`
+		WITH numbered AS (
+			SELECT uid, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
+			FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+		)
+		SELECT
+			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
+			m.internal_date, m.size, %sm.created_modseq, m.updated_modseq, m.expunged_modseq,
+			n.seqnum,
+			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+		FROM messages m
+		JOIN numbered n ON m.uid = n.uid
+		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
+		  AND (%s)
+		ORDER BY m.uid`, bsCol, whereClause)
+
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query messages with UID set: %w", err)
+	}
+
+	return scanMessages(rows, includeBodyStructure)
 }
 
 func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, seqSet imap.SeqSet, includeBodyStructure bool) ([]Message, error) {
+	if len(seqSet) == 0 {
+		return nil, nil
+	}
 	if len(seqSet) == 1 && seqSet[0].Start == 1 && (seqSet[0].Stop == 0) {
 		log.Printf("Database: SeqSet includes all messages (1:*) for mailbox %d", mailboxID)
 		return db.fetchAllActiveMessagesRaw(ctx, mailboxID, includeBodyStructure)
@@ -237,49 +207,47 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 		bsCol = "m.body_structure, "
 	}
 
-	var allMessages []Message
+	// Consolidate sequence ranges into a single query dynamically.
+	var conditions []string
+	var args []any
+	args = append(args, mailboxID)
 
 	for _, seqRange := range seqSet {
-		// Filter to uploaded messages only (see getMessagesByUIDSet for the rationale).
-		baseQuery := fmt.Sprintf(`
-			WITH numbered_messages AS (
-				SELECT *, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
-				FROM messages
-				WHERE mailbox_id = $1 AND expunged_at IS NULL
-			)
-			SELECT 
-				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-				m.internal_date, m.size, %sm.created_modseq, m.updated_modseq, m.expunged_modseq, m.seqnum,
-				m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
-			FROM numbered_messages m
-		`, bsCol)
-
-		var rows pgx.Rows
-		var err error
-
 		if seqRange.Stop == 0 {
-			// Wildcard range (e.g., 5:*) — no upper bound
-			query := baseQuery + " WHERE m.seqnum >= $2 AND m.uploaded = true ORDER BY m.uid"
-			rows, err = db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, seqRange.Start)
+			args = append(args, seqRange.Start)
+			conditions = append(conditions, fmt.Sprintf("n.seqnum >= $%d", len(args)))
 		} else {
-			// Bounded range (e.g., 1:5)
-			query := baseQuery + " WHERE m.seqnum >= $2 AND m.seqnum <= $3 AND m.uploaded = true ORDER BY m.uid"
-			rows, err = db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, seqRange.Start, seqRange.Stop)
+			args = append(args, seqRange.Start, seqRange.Stop)
+			conditions = append(conditions, fmt.Sprintf("(n.seqnum >= $%d AND n.seqnum <= $%d)", len(args)-1, len(args)))
 		}
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to query messages for sequence range %d:%d: %v",
-				seqRange.Start, seqRange.Stop, err)
-		}
-
-		rangeMessages, err := scanMessages(rows, includeBodyStructure)
-		if err != nil {
-			return nil, err
-		}
-
-		allMessages = append(allMessages, rangeMessages...)
 	}
-	return allMessages, nil
+
+	whereClause := strings.Join(conditions, " OR ")
+
+	query := fmt.Sprintf(`
+		WITH numbered AS (
+			SELECT uid, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
+			FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+		)
+		SELECT 
+			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
+			m.internal_date, m.size, %sm.created_modseq, m.updated_modseq, m.expunged_modseq,
+			n.seqnum,
+			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+		FROM messages m
+		JOIN numbered n ON m.uid = n.uid
+		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
+		  AND (%s)
+		ORDER BY m.uid
+	`, bsCol, whereClause)
+
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query messages with Seq set: %w", err)
+	}
+
+	return scanMessages(rows, includeBodyStructure)
 }
 
 func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int64, includeBodyStructure bool) ([]Message, error) {
@@ -410,18 +378,23 @@ func (db *Database) GetMessageBodyStructure(ctx context.Context, uid imap.UID, m
 func (db *Database) GetMessagesByFlag(ctx context.Context, mailboxID int64, flag imap.Flag) ([]Message, error) {
 	// Convert the IMAP flag to its corresponding bitwise value
 	bitwiseFlag := FlagToBitwise(flag)
-	// OPTIMIZATION: Use correlated COUNT subquery instead of full-mailbox CTE.
-	// Flag-based queries typically return small result sets (e.g., \Deleted for EXPUNGE),
-	// so per-row COUNT is more efficient than materializing the entire mailbox.
-	// Each COUNT uses an index-only scan on idx_messages_mailbox_uid_active.
+
+	// Use a unified ROW_NUMBER() CTE instead of a correlated COUNT(*) subquery.
+	// While a correlated count is fast for 1-2 rows, fetching 50,000 flagged messages
+	// forces Postgres to execute COUNT(*) 50,000 times, causing massive O(N^2) timeouts.
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+		WITH numbered AS (
+			SELECT uid, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
+			FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+		)
 		SELECT
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
 			m.internal_date, m.size, m.created_modseq, m.updated_modseq, m.expunged_modseq,
-			(SELECT COUNT(*) FROM messages m2
-			 WHERE m2.mailbox_id = $1 AND m2.uid <= m.uid AND m2.expunged_at IS NULL) as seqnum,
+			n.seqnum,
 			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
+		JOIN numbered n ON m.uid = n.uid
 		WHERE m.mailbox_id = $1 AND (m.flags & $2) != 0 AND m.expunged_at IS NULL
 		ORDER BY m.uid
 	`, mailboxID, bitwiseFlag)
@@ -450,14 +423,17 @@ type MessageUIDSeq struct {
 // for messages with the \Deleted flag, optimized for EXPUNGE operations.
 // This avoids fetching unnecessary columns like body_structure and recipients_json.
 func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID int64) ([]MessageUIDSeq, error) {
-	// OPTIMIZATION: Use correlated COUNT subquery instead of full-mailbox CTE.
-	// EXPUNGE typically affects a small number of messages, so per-row COUNT
-	// is more efficient than materializing the entire mailbox for ROW_NUMBER().
+	// Use unified ROW_NUMBER() CTE instead of a correlated subquery for sequence mapping
+	// to prevent massive O(N^2) timeouts if a user attempts to bulk-delete thousands of messages.
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
-		SELECT m.uid,
-			(SELECT COUNT(*) FROM messages m2
-			 WHERE m2.mailbox_id = $1 AND m2.uid <= m.uid AND m2.expunged_at IS NULL) as seqnum
+		WITH numbered AS (
+			SELECT uid, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
+			FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+		)
+		SELECT m.uid, n.seqnum
 		FROM messages m
+		JOIN numbered n ON m.uid = n.uid
 		WHERE m.mailbox_id = $1 AND (m.flags & $2) != 0 AND m.expunged_at IS NULL
 		ORDER BY m.uid
 	`, mailboxID, FlagToBitwise(imap.FlagDeleted))

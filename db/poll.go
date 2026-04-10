@@ -28,18 +28,11 @@ type MailboxPoll struct {
 }
 
 func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSeq uint64) (*MailboxPoll, error) {
-	tx, err := db.GetReadPool().BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	// Use background context for rollback to ensure it always completes
-	defer tx.Rollback(context.Background())
-
 	// OPTIMIZATION: Early exit if modseq hasn't changed
 	// This avoids expensive window functions when mailbox is idle
 	var currentModSeq uint64
 	var messageCount int
-	err = tx.QueryRow(ctx, `
+	err := db.GetReadPool().QueryRow(ctx, `
 		SELECT
 			COALESCE(ms.highest_modseq, 0) AS highest_modseq,
 			COALESCE(ms.message_count, 0) AS message_count
@@ -68,7 +61,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	// expunged messages instead of a correlated subquery.
 	// The window function approach computes all expunged sequence numbers in one pass,
 	// replacing the O(N*M) correlated subquery with O(N log N) sorting.
-	rows, err := tx.Query(ctx, `
+	rows, err := db.GetReadPool().Query(ctx, `
 		SELECT * FROM (
 			WITH
 			  global_stats AS (
