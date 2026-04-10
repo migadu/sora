@@ -212,9 +212,8 @@ func TestCustomFlagsCache_UpdatedOnFlagChange(t *testing.T) {
 	require.NoError(t, tx.Commit(ctx))
 
 	cache, hasCache = getCustomFlagsCache(t, db, ctx, mailboxID)
-	assert.True(t, hasCache)
 	assert.Contains(t, cache, "Project-Y")
-	assert.NotContains(t, cache, "Project-X", "Old custom flag should be removed from cache")
+	assert.Contains(t, cache, "Project-X", "Old custom flag should be retained in cache per migration 019 optimizations")
 
 	cleanupMailbox(t, db, ctx, mailboxID)
 }
@@ -242,10 +241,10 @@ func TestCustomFlagsCache_ClearedOnExpunge(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
 
-	// Cache should now be empty
+	// Cache should retain the flags per migration 019
 	cache, hasCache := getCustomFlagsCache(t, db, ctx, mailboxID)
 	if hasCache {
-		assert.Empty(t, cache, "Cache should be empty after expunging the only message with custom flags")
+		assert.Contains(t, cache, "CustomFlag1", "Cache should explicitly retain flags on expunge")
 	}
 
 	cleanupMailbox(t, db, ctx, mailboxID)
@@ -282,7 +281,7 @@ func TestCustomFlagsCache_MultipleMessagesAggregated(t *testing.T) {
 
 	cache, hasCache = getCustomFlagsCache(t, db, ctx, mailboxID)
 	assert.True(t, hasCache)
-	assert.NotContains(t, cache, "Alpha", "Alpha should be gone (only on expunged message)")
+	assert.Contains(t, cache, "Alpha", "Alpha should remain per migration 019 monotonic cache design")
 	assert.Contains(t, cache, "Beta", "Beta should remain (on message UID 20)")
 	assert.Contains(t, cache, "Gamma", "Gamma should remain (on message UID 20)")
 

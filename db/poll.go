@@ -72,24 +72,23 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 				LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
 				WHERE mb.id = $1
 			  ),
-			  -- Get all messages visible at sinceModSeq point (active + recently expunged)
-			  -- and assign sequence numbers using ROW_NUMBER.
-			  -- This replaces the O(N*M) correlated subquery with a single O(N log N) window function.
-			  visible_messages AS (
-			    SELECT
-			        m.uid,
-			        ROW_NUMBER() OVER (ORDER BY m.uid) AS orig_seq_num,
-			        SUM(CASE WHEN m.expunged_at IS NULL THEN 1 ELSE 0 END) OVER (ORDER BY m.uid) AS new_seq_num
-			    FROM messages m
-			    WHERE m.mailbox_id = $1
-			      AND (m.expunged_modseq IS NULL OR m.expunged_modseq > $2)
-			  ),
+			  -- Get changed messages and calculate their sequence numbers dynamically
+			  -- using correlated subqueries heavily optimized by UID/Mailbox indexes.
+			  -- This replaces an O(N) full-mailbox ROW_NUMBER window function with O(M log N).
 			  current_mailbox_state AS (
 			    SELECT
 			        m.uid,
 			        CASE 
-			          WHEN m.expunged_at IS NOT NULL THEN vm.orig_seq_num
-			          ELSE vm.new_seq_num
+			          WHEN m.expunged_at IS NOT NULL THEN 
+			            (SELECT COUNT(*) FROM messages m2 
+			             WHERE m2.mailbox_id = $1 
+			               AND (m2.expunged_modseq IS NULL OR m2.expunged_modseq > $2) 
+			               AND m2.uid <= m.uid)
+			          ELSE 
+			            (SELECT COUNT(*) FROM messages m2 
+			             WHERE m2.mailbox_id = $1 
+			               AND m2.expunged_at IS NULL 
+			               AND m2.uid <= m.uid)
 			        END AS seq_num,
 			        m.flags,
 			        m.custom_flags,
@@ -97,7 +96,6 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			        COALESCE(m.updated_modseq, 0) AS updated_modseq_val,
 			        m.expunged_modseq
 			    FROM messages m
-			    INNER JOIN visible_messages vm ON m.uid = vm.uid
 			    WHERE m.mailbox_id = $1
 			      AND (m.expunged_modseq IS NULL OR m.expunged_modseq > $2)
 			      AND (m.created_modseq > $2 OR COALESCE(m.updated_modseq, 0) > $2 OR COALESCE(m.expunged_modseq, 0) > $2)

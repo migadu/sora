@@ -131,7 +131,7 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	// --- Mock expectations ---
 	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
 	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
-	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "someHash", nil).Maybe()
+	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "", nil).Maybe()
 	mockDB.On("ExpungeOldMessagesWithRetry", ctx, maxAge).Return(int64(5), nil).Once()
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, gracePeriod).Return(int64(1), nil).Once()
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, gracePeriod).Return(int64(1), nil).Once()
@@ -209,7 +209,7 @@ func TestCleanupWorker_RunOnce_PartialFailures(t *testing.T) {
 
 	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
 	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
-	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "someHash", nil).Maybe()
+	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "", nil).Maybe()
 
 	// Expunge fails, but worker should continue
 	mockDB.On("ExpungeOldMessagesWithRetry", ctx, mock.Anything).Return(int64(0), errors.New("db error expunge")).Once()
@@ -245,7 +245,7 @@ func TestCleanupWorker_RunOnce_S3DeleteFails(t *testing.T) {
 
 	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
 	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
-	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "someHash", nil).Maybe()
+	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "", nil).Maybe()
 	mockDB.On("ExpungeOldMessagesWithRetry", ctx, mock.Anything).Return(int64(0), nil)
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil)
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil)
@@ -284,7 +284,7 @@ func TestCleanupWorker_RunOnce_NoOp(t *testing.T) {
 
 	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
 	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
-	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "someHash", nil).Maybe()
+	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "", nil).Maybe()
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
@@ -320,7 +320,7 @@ func TestCleanupWorker_RunOnce_VectorPruning(t *testing.T) {
 
 	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
 	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
-	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "someHash", nil).Maybe()
+	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "", nil).Maybe()
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
@@ -355,7 +355,7 @@ func TestCleanupWorker_RunOnce_NoFTSPruningWhenBothZero(t *testing.T) {
 
 	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
 	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
-	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "someHash", nil).Maybe()
+	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "", nil).Maybe()
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
@@ -392,7 +392,7 @@ func TestCleanupWorker_RunOnce_NoFTSRetention(t *testing.T) {
 
 	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
 	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
-	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "someHash", nil).Maybe()
+	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "", nil).Maybe()
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
@@ -429,7 +429,7 @@ func TestCleanupWorker_RunOnce_SkipsFailedUploadCleanupWhenS3Unhealthy(t *testin
 
 	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
 	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
-	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "someHash", nil).Maybe()
+	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "", nil).Maybe()
 
 	// CleanupFailedUploadsWithRetry should NOT be called when S3 is unhealthy
 	// (no On() setup means test fails if it's called)
@@ -469,7 +469,7 @@ func TestCleanupWorker_RunOnce_VectorOnlyPruning(t *testing.T) {
 
 	mockDB.On("AcquireCleanupLockWithRetry", ctx).Return(true, nil).Once()
 	mockDB.On("ReleaseCleanupLockWithRetry", ctx).Return(nil).Once()
-	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "someHash", nil).Maybe()
+	mockDB.On("NullifyLegacyTextBodiesWithRetry", mock.Anything, mock.Anything).Return(int64(5), "", nil).Maybe()
 	mockDB.On("CleanupFailedUploadsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupSoftDeletedAccountsWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("CleanupOldVacationResponsesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()

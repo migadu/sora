@@ -495,6 +495,65 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		needsSeqNumSearch = true
 	}
 
+	if needsSeqNumSearch && !strings.Contains(strings.ToLower(orderByClause), "seqnum") {
+		// If we only need seqnum for WHERE filtering, we can map the SeqSets to UIDSets
+		// and completely bypass the catastrophic ROW_NUMBER() materialization!
+		var mapSeqToUID func(*imap.SearchCriteria) error
+		mapSeqToUID = func(c *imap.SearchCriteria) error {
+			if c == nil {
+				return nil
+			}
+			if len(c.SeqNum) > 0 {
+				for _, seqSet := range c.SeqNum {
+					var mappedUIDSet imap.UIDSet
+					for _, seqRange := range seqSet {
+						startUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Start)
+						if err != nil {
+							continue // Out of bounds or invalid
+						}
+
+						uidRange := imap.UIDRange{Start: startUID}
+						if seqRange.Stop == 0 {
+							uidRange.Stop = 0
+						} else {
+							stopUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Stop)
+							if err != nil {
+								uidRange.Stop = 0 // Cap to highest
+							} else {
+								uidRange.Start = min(startUID, stopUID)
+								uidRange.Stop = max(startUID, stopUID)
+							}
+						}
+						mappedUIDSet = append(mappedUIDSet, uidRange)
+					}
+					if len(mappedUIDSet) > 0 {
+						c.UID = append(c.UID, mappedUIDSet)
+					}
+				}
+				// Clear the SeqNum criteria since we moved them to UID
+				c.SeqNum = nil
+			}
+			for i := range c.Not {
+				if err := mapSeqToUID(&c.Not[i]); err != nil {
+					return err
+				}
+			}
+			for i := range c.Or {
+				if err := mapSeqToUID(&c.Or[i][0]); err != nil {
+					return err
+				}
+				if err := mapSeqToUID(&c.Or[i][1]); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		if err := mapSeqToUID(criteria); err == nil {
+			needsSeqNumSearch = false
+		}
+	}
+
 	// Use optimized query path when possible
 	if !isComplexQuery {
 		// Fast path: Simple query with table aliases

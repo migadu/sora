@@ -169,18 +169,12 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 	whereClause := strings.Join(conditions, " OR ")
 
 	query := fmt.Sprintf(`
-		WITH numbered AS (
-			SELECT uid, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
-			FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
-		)
 		SELECT
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
 			m.internal_date, m.size, %sm.created_modseq, m.updated_modseq, m.expunged_modseq,
-			n.seqnum,
+			(SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = m.mailbox_id AND m2.uid <= m.uid AND m2.expunged_at IS NULL) as seqnum,
 			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
-		JOIN numbered n ON m.uid = n.uid
 		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
 		  AND (%s)
 		ORDER BY m.uid`, bsCol, whereClause)
@@ -191,6 +185,20 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 	}
 
 	return scanMessages(rows, includeBodyStructure)
+}
+
+func (db *Database) getUIDBySeqNum(ctx context.Context, mailboxID int64, seqNum uint32) (imap.UID, error) {
+	if seqNum == 0 {
+		return 0, fmt.Errorf("invalid sequence number 0")
+	}
+	var uid uint32
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT uid FROM messages 
+		WHERE mailbox_id = $1 AND expunged_at IS NULL 
+		ORDER BY uid ASC 
+		OFFSET $2 LIMIT 1
+	`, mailboxID, seqNum-1).Scan(&uid)
+	return imap.UID(uid), err
 }
 
 func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, seqSet imap.SeqSet, includeBodyStructure bool) ([]Message, error) {
@@ -207,36 +215,51 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 		bsCol = "m.body_structure, "
 	}
 
-	// Consolidate sequence ranges into a single query dynamically.
+	// Map sequence ranges to UID ranges to prevent O(N) ROW_NUMBER() CTE scans
 	var conditions []string
 	var args []any
 	args = append(args, mailboxID)
 
 	for _, seqRange := range seqSet {
-		if seqRange.Stop == 0 {
-			args = append(args, seqRange.Start)
-			conditions = append(conditions, fmt.Sprintf("n.seqnum >= $%d", len(args)))
-		} else {
-			args = append(args, seqRange.Start, seqRange.Stop)
-			conditions = append(conditions, fmt.Sprintf("(n.seqnum >= $%d AND n.seqnum <= $%d)", len(args)-1, len(args)))
+		startUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Start)
+		if err != nil {
+			// If we fail to resolve Start (e.g. out of bounds), skip this range
+			continue
 		}
+
+		if seqRange.Stop == 0 {
+			args = append(args, startUID)
+			conditions = append(conditions, fmt.Sprintf("m.uid >= $%d", len(args)))
+		} else {
+			stopUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Stop)
+			if err != nil {
+				// Stop is out of bounds, meaning we fetch up to the highest message we have
+				args = append(args, startUID)
+				conditions = append(conditions, fmt.Sprintf("m.uid >= $%d", len(args)))
+			} else {
+				// Safely ensure min/max alignment in case of reverse sequence bounds requested by client
+				minUid := min(startUID, stopUID)
+				maxUid := max(startUID, stopUID)
+				args = append(args, minUid, maxUid)
+				conditions = append(conditions, fmt.Sprintf("(m.uid >= $%d AND m.uid <= $%d)", len(args)-1, len(args)))
+			}
+		}
+	}
+
+	if len(conditions) == 0 {
+		// No valid sequences requested
+		return nil, nil
 	}
 
 	whereClause := strings.Join(conditions, " OR ")
 
 	query := fmt.Sprintf(`
-		WITH numbered AS (
-			SELECT uid, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
-			FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
-		)
 		SELECT 
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
 			m.internal_date, m.size, %sm.created_modseq, m.updated_modseq, m.expunged_modseq,
-			n.seqnum,
+			(SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = m.mailbox_id AND m2.uid <= m.uid AND m2.expunged_at IS NULL) as seqnum,
 			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
-		JOIN numbered n ON m.uid = n.uid
 		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
 		  AND (%s)
 		ORDER BY m.uid
@@ -244,7 +267,7 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query messages with Seq set: %w", err)
+		return nil, fmt.Errorf("failed to query messages with mapped Seq set: %w", err)
 	}
 
 	return scanMessages(rows, includeBodyStructure)
