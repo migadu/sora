@@ -648,18 +648,23 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 
 	// If we have unseen messages, find the first unseen sequence number
 	if s.UnseenCount > 0 {
-		// OPTIMIZATION: Compute sequence number with two efficient index scans
-		// instead of materializing the entire mailbox via CTE + ROW_NUMBER().
-		// 1. MIN(uid) finds the first unseen UID (index scan on mailbox_id + flags)
-		// 2. COUNT(*) counts non-expunged messages before it (index-only scan on
-		//    idx_messages_mailbox_uid_active)
+		// OPTIMIZATION: Compute sequence number with two separate, efficient queries.
+		// Splitting them prevents the PostgreSQL query planner from creating a suboptimal
+		// nested loop or bitmap heap plan that could timeout on large mailboxes.
+		var firstUnseenUID int64
 		err = d.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-			SELECT COUNT(*) + 1 FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
-			  AND uid < (SELECT MIN(uid) FROM messages
-			             WHERE mailbox_id = $1 AND (flags & $2) = 0
-			             AND expunged_at IS NULL)
-		`, mailboxID, FlagSeen).Scan(&s.FirstUnseenSeqNum)
+			SELECT uid FROM messages 
+			WHERE mailbox_id = $1 AND (flags & $2) = 0 AND expunged_at IS NULL
+			ORDER BY uid ASC LIMIT 1
+		`, mailboxID, FlagSeen).Scan(&firstUnseenUID)
+
+		if err == nil {
+			err = d.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+				SELECT COUNT(*) + 1 FROM messages
+				WHERE mailbox_id = $1 AND expunged_at IS NULL
+				  AND uid < $2
+			`, mailboxID, firstUnseenUID).Scan(&s.FirstUnseenSeqNum)
+		}
 
 		if err != nil && err != pgx.ErrNoRows {
 			logger.Error("Database: failed to get first unseen sequence number", "mailbox_id", mailboxID, "err", err)
