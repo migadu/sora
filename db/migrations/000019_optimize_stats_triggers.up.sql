@@ -146,14 +146,16 @@ RETURNS TRIGGER AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
         UPDATE mailbox_stats ms
-        SET custom_flags_cache = COALESCE(
-            (SELECT jsonb_agg(DISTINCT flag ORDER BY flag)
-             FROM messages m
-             CROSS JOIN LATERAL jsonb_array_elements_text(m.custom_flags) AS elem(flag)
-             WHERE m.mailbox_id = am.mailbox_id
-               AND m.expunged_at IS NULL
-               AND flag !~ '^\\'),
-            '[]'::jsonb
+        SET custom_flags_cache = (
+            SELECT COALESCE(jsonb_agg(DISTINCT flag ORDER BY flag), '[]'::jsonb)
+            FROM (
+                SELECT jsonb_array_elements_text(COALESCE(ms.custom_flags_cache, '[]'::jsonb)) AS flag
+                UNION
+                SELECT jsonb_array_elements_text(n.custom_flags) AS flag
+                FROM new_table n
+                WHERE n.mailbox_id = ms.mailbox_id AND n.custom_flags IS NOT NULL
+            ) sub
+            WHERE flag !~ '^\\'
         )
         FROM (
             SELECT DISTINCT mailbox_id 
@@ -163,54 +165,33 @@ BEGIN
         WHERE ms.mailbox_id = am.mailbox_id;
 
     ELSIF TG_OP = 'DELETE' THEN
-        UPDATE mailbox_stats ms
-        SET custom_flags_cache = COALESCE(
-            (SELECT jsonb_agg(DISTINCT flag ORDER BY flag)
-             FROM messages m
-             CROSS JOIN LATERAL jsonb_array_elements_text(m.custom_flags) AS elem(flag)
-             WHERE m.mailbox_id = am.mailbox_id
-               AND m.expunged_at IS NULL
-               AND flag !~ '^\\'),
-            '[]'::jsonb
-        )
-        FROM (
-            SELECT DISTINCT mailbox_id 
-            FROM old_table 
-            WHERE mailbox_id IS NOT NULL AND custom_flags IS NOT NULL AND custom_flags != '[]'::jsonb
-        ) am
-        WHERE ms.mailbox_id = am.mailbox_id;
+        -- Retaining custom flags on expunge is highly optimized (O(1)) and compliant with RFC 3501.
+        -- We no longer rescan the entire mailbox just to delete a custom flag that zero messages use.
+        NULL;
 
     ELSE -- UPDATE
         UPDATE mailbox_stats ms
-        SET custom_flags_cache = COALESCE(
-            (SELECT jsonb_agg(DISTINCT flag ORDER BY flag)
-             FROM messages m
-             CROSS JOIN LATERAL jsonb_array_elements_text(m.custom_flags) AS elem(flag)
-             WHERE m.mailbox_id = am.mailbox_id
-               AND m.expunged_at IS NULL
-               AND flag !~ '^\\'),
-            '[]'::jsonb
+        SET custom_flags_cache = (
+            SELECT COALESCE(jsonb_agg(DISTINCT flag ORDER BY flag), '[]'::jsonb)
+            FROM (
+                SELECT jsonb_array_elements_text(COALESCE(ms.custom_flags_cache, '[]'::jsonb)) AS flag
+                UNION
+                SELECT jsonb_array_elements_text(n.custom_flags) AS flag
+                FROM new_table n
+                JOIN old_table o ON n.id = o.id
+                WHERE n.mailbox_id = ms.mailbox_id 
+                  AND n.custom_flags IS NOT NULL 
+                  AND (n.custom_flags IS DISTINCT FROM o.custom_flags OR n.mailbox_id IS DISTINCT FROM o.mailbox_id)
+            ) sub
+            WHERE flag !~ '^\\'
         )
         FROM (
-            SELECT DISTINCT o.mailbox_id
-            FROM old_table o
-            JOIN new_table n ON o.id = n.id
-            WHERE o.mailbox_id IS NOT NULL
-              AND (
-                  o.custom_flags IS DISTINCT FROM n.custom_flags OR 
-                  (o.expunged_at IS NULL) IS DISTINCT FROM (n.expunged_at IS NULL) OR
-                  o.mailbox_id IS DISTINCT FROM n.mailbox_id
-              )
-            UNION
             SELECT DISTINCT n.mailbox_id
             FROM old_table o
             JOIN new_table n ON o.id = n.id
             WHERE n.mailbox_id IS NOT NULL
-              AND (
-                  o.custom_flags IS DISTINCT FROM n.custom_flags OR 
-                  (o.expunged_at IS NULL) IS DISTINCT FROM (n.expunged_at IS NULL) OR
-                  o.mailbox_id IS DISTINCT FROM n.mailbox_id
-              )
+              AND n.custom_flags IS NOT NULL AND n.custom_flags != '[]'::jsonb
+              AND (n.custom_flags IS DISTINCT FROM o.custom_flags OR n.mailbox_id IS DISTINCT FROM o.mailbox_id)
         ) am
         WHERE ms.mailbox_id = am.mailbox_id;
     END IF;
