@@ -117,18 +117,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trigger_messages_stats_insert_stmt ON messages;
 CREATE TRIGGER trigger_messages_stats_insert_stmt
     AFTER INSERT ON messages
     REFERENCING NEW TABLE AS new_table
     FOR EACH STATEMENT
     EXECUTE FUNCTION maintain_mailbox_stats_statement();
 
+DROP TRIGGER IF EXISTS trigger_messages_stats_delete_stmt ON messages;
 CREATE TRIGGER trigger_messages_stats_delete_stmt
     AFTER DELETE ON messages
     REFERENCING OLD TABLE AS old_table
     FOR EACH STATEMENT
     EXECUTE FUNCTION maintain_mailbox_stats_statement();
 
+DROP TRIGGER IF EXISTS trigger_messages_stats_update_stmt ON messages;
 CREATE TRIGGER trigger_messages_stats_update_stmt
     AFTER UPDATE ON messages
     REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table
@@ -216,18 +219,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trigger_zzz_custom_flags_cache_insert_stmt ON messages;
 CREATE TRIGGER trigger_zzz_custom_flags_cache_insert_stmt
     AFTER INSERT ON messages
     REFERENCING NEW TABLE AS new_table
     FOR EACH STATEMENT
     EXECUTE FUNCTION maintain_custom_flags_cache_statement();
 
+DROP TRIGGER IF EXISTS trigger_zzz_custom_flags_cache_delete_stmt ON messages;
 CREATE TRIGGER trigger_zzz_custom_flags_cache_delete_stmt
     AFTER DELETE ON messages
     REFERENCING OLD TABLE AS old_table
     FOR EACH STATEMENT
     EXECUTE FUNCTION maintain_custom_flags_cache_statement();
 
+DROP TRIGGER IF EXISTS trigger_zzz_custom_flags_cache_update_stmt ON messages;
 CREATE TRIGGER trigger_zzz_custom_flags_cache_update_stmt
     AFTER UPDATE ON messages
     REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table

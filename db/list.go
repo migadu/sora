@@ -26,13 +26,17 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 
 	// Now query only the non-expunged messages
 	query := `
+		WITH numbered_messages AS (
+			SELECT *, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
+			FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+		)
 		SELECT 
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-			m.internal_date, m.size, m.created_modseq, m.updated_modseq, m.expunged_modseq, ms.seqnum,
+			m.internal_date, m.size, m.created_modseq, m.updated_modseq, m.expunged_modseq, m.seqnum,
 			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
-		FROM messages m
-		JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
-		WHERE m.mailbox_id = $1 ORDER BY m.uid`
+		FROM numbered_messages m
+		ORDER BY m.uid`
 
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID)
 	if err != nil {

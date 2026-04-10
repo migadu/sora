@@ -31,7 +31,6 @@ func setupUploadWorkerTest(t *testing.T) *Database {
 		"sieve_scripts",
 		"pending_uploads",
 		"message_contents",
-		"message_sequences",
 		"mailbox_stats",
 		"messages",
 		"mailboxes",

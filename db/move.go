@@ -21,7 +21,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	}
 
 	// Acquire locks on both mailboxes in a consistent order to prevent deadlocks.
-	// The triggers for message_sequences and mailbox_stats will attempt to acquire
+	// The triggers for mailbox_stats will attempt to acquire
 	// locks, and a concurrent MOVE operation between the same two mailboxes could
 	// otherwise lead to a deadlock (A->B locks B then A; B->A locks A then B).
 	var lock1, lock2 int64

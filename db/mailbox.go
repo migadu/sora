@@ -648,13 +648,17 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 
 	// If we have unseen messages, find the first unseen sequence number
 	if s.UnseenCount > 0 {
-		// With the message_sequences cache, we can directly look up the sequence number
-		// of the first unseen message in a single, efficient query.
+		// OPTIMIZATION: Compute sequence number with two efficient index scans
+		// instead of materializing the entire mailbox via CTE + ROW_NUMBER().
+		// 1. MIN(uid) finds the first unseen UID (index scan on mailbox_id + flags)
+		// 2. COUNT(*) counts non-expunged messages before it (index-only scan on
+		//    idx_messages_mailbox_uid_active)
 		err = d.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-			SELECT ms.seqnum FROM messages m
-			JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
-			WHERE m.mailbox_id = $1 AND (m.flags & $2) = 0
-			ORDER BY m.uid LIMIT 1
+			SELECT COUNT(*) + 1 FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			  AND uid < (SELECT MIN(uid) FROM messages
+			             WHERE mailbox_id = $1 AND (flags & $2) = 0
+			             AND expunged_at IS NULL)
 		`, mailboxID, FlagSeen).Scan(&s.FirstUnseenSeqNum)
 
 		if err != nil && err != pgx.ErrNoRows {

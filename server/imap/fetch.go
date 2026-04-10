@@ -219,19 +219,18 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 
 	// ARCHITECTURE DECISION: Use database sequence numbers directly, not sessionTracker.EncodeSeqNum().
 	//
-	// The message_sequences table is the source of truth for sequence numbers.  Database
-	// triggers renumber sequences atomically when messages are expunged, so the sequence
-	// numbers in FETCH responses always reflect the canonical mailbox state.
+	// Sequence numbers are computed dynamically via ROW_NUMBER() OVER (ORDER BY uid) at query time,
+	// ensuring they always reflect the canonical mailbox state without relying on cached tables.
 	//
 	// Why NOT EncodeSeqNum:
 	//   1. EncodeSeqNum is designed for in-memory servers that track deltas from a snapshot.
 	//      Our server uses PostgreSQL as the authority — applying EncodeSeqNum on top of
-	//      database-renumbered sequences causes off-by-one errors.
+	//      dynamically-computed sequences causes off-by-one errors.
 	//   2. The go-imap MailboxTracker/SessionTracker pair translates from an initial snapshot
-	//      through in-flight expunges.  Our database triggers perform this renumbering
-	//      directly, making the tracker layer redundant for sequence number translation.
+	//      through in-flight expunges.  Our database queries already compute correct positions,
+	//      making the tracker layer redundant for sequence number translation.
 	//
-	// Trade-off: if a concurrent EXPUNGE renumbers sequences between the DB query and the
+	// Trade-off: if a concurrent EXPUNGE changes sequence positions between the DB query and the
 	// response write, the seqnums in THIS response may not match the client's pre-expunge
 	// view.  The Poll mechanism detects desyncs and forces a reconnection (BYE) in extreme
 	// cases.  In practice this race is rare because expunge notifications are delivered to

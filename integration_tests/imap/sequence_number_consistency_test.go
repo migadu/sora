@@ -483,3 +483,67 @@ func TestIMAP_SequenceNumberConsistency_LargeMailbox(t *testing.T) {
 
 	t.Log("Large mailbox FETCH verified: correct sequence and UID mapping")
 }
+
+// TestIMAP_SequenceNumberConsistency_WildcardFetch tests that wildcards in
+// sequence ranges (e.g. "5:*") correctly bound sequence evaluation.
+func TestIMAP_SequenceNumberConsistency_WildcardFetch(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c1, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer c1.Logout()
+
+	if err := c1.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	if _, err := c1.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select failed: %v", err)
+	}
+
+	t.Log("Creating 15 messages")
+	messageCount := 15
+	for i := 1; i <= messageCount; i++ {
+		msg := fmt.Sprintf("Subject: msg%d\r\n\r\nbody%d", i, i)
+		appendCmd := c1.Append("INBOX", int64(len(msg)), nil)
+		if _, err := appendCmd.Write([]byte(msg)); err != nil {
+			t.Fatalf("APPEND write failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("APPEND close failed: %v", err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("APPEND failed: %v", err)
+		}
+	}
+
+	// Fetch sequence range 10:* (from sequence 10 to the end)
+	t.Log("Testing Fetch with wildcard sequence 10:*")
+	seqSet := imap.SeqSet{}
+	seqSet.AddRange(10, 0) // 0 implies '*'
+	fetchResults, err := c1.Fetch(seqSet, &imap.FetchOptions{
+		UID: true,
+	}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH wildcard failed: %v", err)
+	}
+
+	if len(fetchResults) != 6 {
+		t.Fatalf("Expected 6 fetch results (10, 11, 12, 13, 14, 15), got %d", len(fetchResults))
+	}
+
+	// Verify sequences 10 to 15
+	for i, result := range fetchResults {
+		expectedSeq := uint32(10 + i)
+		if result.SeqNum != expectedSeq {
+			t.Errorf("Wildcard FETCH result %d: expected sequence %d, got %d", i, expectedSeq, result.SeqNum)
+		}
+	}
+
+	t.Log("Wildcard FETCH verified: fetched dynamic unbounded upper limit using 0-stop sequence")
+}

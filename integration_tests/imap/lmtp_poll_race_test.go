@@ -144,8 +144,8 @@ func TestIMAP_LMTPPollRaceCondition(t *testing.T) {
 
 		t.Logf("Delivered message %d/%d via LMTP", i, numMessages)
 
-		// Immediately poll IMAP to try to catch the race condition
-		// where message_sequences might not be populated yet
+		// Immediately poll IMAP to try to catch any race conditions
+		// with sequence number computation
 		if err := client.Noop().Wait(); err != nil {
 			t.Fatalf("NOOP failed after message %d: %v", i, err)
 		}

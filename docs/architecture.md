@@ -56,9 +56,9 @@ To handle the high demands of a modern mail server, Sora's database schema inclu
 
 *   **Statistics Caching (`mailbox_stats`)**: To avoid slow `COUNT(*)` and `SUM(size)` queries on the large `messages` table, Sora maintains a `mailbox_stats` table. This table stores pre-calculated counts and sizes for each mailbox. It is updated efficiently by a `FOR EACH ROW` trigger on the `messages` table, making IMAP `SELECT` and `STATUS` commands extremely fast.
 
-*   **Sequence Number Caching (`message_sequences`)**: Calculating IMAP sequence numbers traditionally requires an expensive `ROW_NUMBER()` window function. Sora pre-calculates and caches these in the `message_sequences` table. This cache is maintained by a `FOR EACH STATEMENT` trigger, which rebuilds the sequence numbers for a mailbox after any change, dramatically improving performance for operations on large mailboxes.
+*   **Dynamic Sequence Numbers**: IMAP sequence numbers are computed dynamically at query time using PostgreSQL's `ROW_NUMBER()` window function. To avoid materializing entire mailboxes, Sora uses optimized query patterns: an offset+range approach for UID-based FETCH (the hottest path), correlated COUNT subqueries for flag-based queries, and direct COUNT for first-unseen lookups. A partial covering index `(mailbox_id, uid) WHERE expunged_at IS NULL` enables efficient index-only scans for these computations.
  
-*   **Concurrency Control (`pg_advisory_xact_lock`)**: To prevent race conditions and deadlocks during concurrent operations (e.g., two clients modifying the same mailbox simultaneously), Sora uses PostgreSQL advisory locks. By acquiring a lock on a specific mailbox ID, functions like `MoveMessages` and the `maintain_message_sequences` trigger ensure that operations are serialized, guaranteeing data consistency in the cache tables.
+*   **Concurrency Control (`pg_advisory_xact_lock`)**: To prevent race conditions and deadlocks during concurrent operations (e.g., two clients modifying the same mailbox simultaneously), Sora uses PostgreSQL advisory locks. By acquiring a lock on a specific mailbox ID, functions like `MoveMessages` ensure that operations are serialized, guaranteeing data consistency in the cache tables.
 
 ### Core Services
 

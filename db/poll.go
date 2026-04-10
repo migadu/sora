@@ -64,8 +64,8 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		}, nil
 	}
 
-	// OPTIMIZATION: Use message_sequences table for active messages and a window function
-	// for expunged messages instead of a correlated subquery.
+	// OPTIMIZATION: Use a window function for active and recently
+	// expunged messages instead of a correlated subquery.
 	// The window function approach computes all expunged sequence numbers in one pass,
 	// replacing the O(N*M) correlated subquery with O(N log N) sorting.
 	rows, err := tx.Query(ctx, `
@@ -85,7 +85,8 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			  visible_messages AS (
 			    SELECT
 			        m.uid,
-			        ROW_NUMBER() OVER (ORDER BY m.uid) AS computed_seq_num
+			        ROW_NUMBER() OVER (ORDER BY m.uid) AS orig_seq_num,
+			        SUM(CASE WHEN m.expunged_at IS NULL THEN 1 ELSE 0 END) OVER (ORDER BY m.uid) AS new_seq_num
 			    FROM messages m
 			    WHERE m.mailbox_id = $1
 			      AND (m.expunged_modseq IS NULL OR m.expunged_modseq > $2)
@@ -93,16 +94,9 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			  current_mailbox_state AS (
 			    SELECT
 			        m.uid,
-			        CASE
-			            WHEN m.expunged_modseq IS NOT NULL THEN
-			                -- Use pre-computed sequence number from visible_messages window function.
-			                -- The INNER JOIN guarantees vm.computed_seq_num is never NULL here
-			                -- since visible_messages and current_mailbox_state share the same
-			                -- (mailbox_id, expunged_modseq) filter predicates.
-			                vm.computed_seq_num
-			            ELSE
-			                -- For non-expunged messages, use the cached sequence number from trigger
-			                ms.seqnum
+			        CASE 
+			          WHEN m.expunged_at IS NOT NULL THEN vm.orig_seq_num
+			          ELSE vm.new_seq_num
 			        END AS seq_num,
 			        m.flags,
 			        m.custom_flags,
@@ -110,14 +104,10 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			        COALESCE(m.updated_modseq, 0) AS updated_modseq_val,
 			        m.expunged_modseq
 			    FROM messages m
-			    LEFT JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
 			    INNER JOIN visible_messages vm ON m.uid = vm.uid
 			    WHERE m.mailbox_id = $1
 			      AND (m.expunged_modseq IS NULL OR m.expunged_modseq > $2)
 			      AND (m.created_modseq > $2 OR COALESCE(m.updated_modseq, 0) > $2 OR COALESCE(m.expunged_modseq, 0) > $2)
-			      -- Skip messages where sequence hasn't been assigned yet (race with trigger)
-			      -- For expunged messages we have vm.computed_seq_num, for active messages we need ms.seqnum
-			      AND (m.expunged_modseq IS NOT NULL OR ms.seqnum IS NOT NULL)
 			  ),
 			  changed_messages AS (
 			    SELECT

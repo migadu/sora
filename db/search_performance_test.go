@@ -187,15 +187,6 @@ func (pts *PerformanceTestSuite) createMessageBatch(ctx context.Context, tx pgx.
 			return fmt.Errorf("failed to insert message content %d: %w", i, err)
 		}
 
-		// Insert into message_sequences for sequence number tracking
-		_, err = tx.Exec(ctx, `
-			INSERT INTO message_sequences (mailbox_id, uid, seqnum)
-			VALUES ($1, $2, $3)
-			ON CONFLICT (mailbox_id, uid) DO NOTHING`,
-			pts.mailboxID, currentUID, currentUID)
-		if err != nil {
-			return fmt.Errorf("failed to insert message sequence %d: %w", i, err)
-		}
 	}
 
 	return nil

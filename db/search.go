@@ -41,10 +41,10 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 		return fmt.Sprintf("%s%d", paramPrefix, *paramCounter)
 	}
 
-	// For SeqNum - use seqnum column directly in CTE context
+	// For SeqNum - use seqnum column with appropriate prefix
 	seqColumn := "seqnum"
-	if tablePrefix == "m" {
-		seqColumn = "ms.seqnum" // When joining with message_sequences
+	if tablePrefix != "" {
+		seqColumn = tablePrefix + ".seqnum"
 	}
 	for _, seqSet := range criteria.SeqNum {
 		seqCond, seqArgs, err := buildNumSetCondition(seqSet, seqColumn, paramPrefix, paramCounter)
@@ -485,18 +485,20 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		}
 
 		// Fast path: Simple query without joining message_contents.
-		// We still need to generate seqnum for non-UID searches.
+		// We use a CTE to dynamically generate sequence numbers safely.
 		const simpleQuery = `			
-			SELECT 
-				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-				m.internal_date, m.size, m.created_modseq, m.updated_modseq, m.expunged_modseq, ms.seqnum,
-				m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
-			FROM messages m
-			JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
-		`
-		// The WHERE clause needs to be applied to the joined result.
-		// The join condition on message_sequences implicitly filters for non-expunged messages.
-		finalQueryString = fmt.Sprintf("%s WHERE m.mailbox_id = @mailboxID AND %s %s LIMIT %d", simpleQuery, whereCondition, orderByClause, resultLimit)
+		WITH numbered_messages AS (
+			SELECT *, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
+			FROM messages
+			WHERE mailbox_id = @mailboxID AND expunged_at IS NULL
+		)
+		SELECT 
+			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
+			m.internal_date, m.size, m.created_modseq, m.updated_modseq, m.expunged_modseq, m.seqnum,
+			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+		FROM numbered_messages m`
+		// The WHERE clause needs to be applied to the outer selection.
+		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", simpleQuery, whereCondition, orderByClause, resultLimit)
 		metricsLabel = "search_messages_simple"
 	} else {
 		// Complex path: Use CTE with empty table prefix (CTE columns are accessed directly)
@@ -518,14 +520,13 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		WITH message_seqs AS (
 			SELECT
 				m.id, m.uid,
-				ms.seqnum,
+				ROW_NUMBER() OVER(ORDER BY uid) as seqnum,
 				m.account_id, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
 				m.internal_date, m.size, m.created_modseq, m.updated_modseq, m.expunged_modseq,
 				m.flags_changed_at, m.subject, m.sent_date, m.message_id,
 				m.in_reply_to, m.recipients_json, mc.text_body_tsv, mc.headers_tsv,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
 			FROM messages m
-			JOIN message_sequences ms ON m.mailbox_id = ms.mailbox_id AND m.uid = ms.uid
 			LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
 			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL
 		)

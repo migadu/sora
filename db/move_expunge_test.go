@@ -157,11 +157,6 @@ func TestMoveMessages(t *testing.T) {
 	assert.Equal(t, destMsgCountBefore+1, destMsgCountAfter, "Destination message count should increase")
 	assert.Equal(t, destSizeBefore+512, destSizeAfter, "Destination total size should increase")
 
-	var seqCount int
-	err = db.GetReadPool().QueryRow(ctx, "SELECT COUNT(*) FROM message_sequences WHERE mailbox_id = $1", srcMailboxID).Scan(&seqCount)
-	require.NoError(t, err)
-	assert.Equal(t, 0, seqCount, "Source mailbox should have no entries in message_sequences")
-
 	// Test 2: Verify message moved to destination
 	destMessages, err := db.ListMessages(ctx, destMailboxID)
 	assert.NoError(t, err)
@@ -230,11 +225,6 @@ func TestExpungeMessageUIDs(t *testing.T) {
 	// Verify cache integrity after expunge
 	srcMsgCountAfter, _, _ := getMoveExpungeMailboxStats(t, db, ctx, srcMailboxID)
 	assert.Equal(t, srcMsgCountBefore-1, srcMsgCountAfter, "Message count should decrease after expunge")
-
-	var seqCount int
-	err = db.GetReadPool().QueryRow(ctx, "SELECT COUNT(*) FROM message_sequences WHERE mailbox_id = $1", srcMailboxID).Scan(&seqCount)
-	require.NoError(t, err)
-	assert.Equal(t, 0, seqCount, "Mailbox should have no entries in message_sequences after expunge")
 
 	// Test 2: Verify message is expunged
 	messages, err := db.ListMessages(ctx, srcMailboxID)
