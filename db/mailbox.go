@@ -653,9 +653,10 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 		// nested loop or bitmap heap plan that could timeout on large mailboxes.
 		var firstUnseenUID int64
 		err = d.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-			SELECT uid FROM messages 
-			WHERE mailbox_id = $1 AND (flags & $2) = 0 AND expunged_at IS NULL
-			ORDER BY uid ASC LIMIT 1
+			SELECT m.uid FROM message_state ms
+			JOIN messages m ON ms.message_id = m.id
+			WHERE ms.mailbox_id = $1 AND (ms.flags & $2) = 0 AND m.expunged_at IS NULL
+			ORDER BY ms.message_id ASC LIMIT 1
 		`, mailboxID, FlagSeen).Scan(&firstUnseenUID)
 
 		if err == nil {

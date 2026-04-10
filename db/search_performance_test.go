@@ -144,12 +144,17 @@ func (pts *PerformanceTestSuite) createMessageBatch(ctx context.Context, tx pgx.
 
 		// Create simple message using direct SQL insert (simplified approach)
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages
-			(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart,
-			 flags, custom_flags, internal_date, size, subject, sent_date, in_reply_to, body_structure,
-			 recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_email_sort, cc_email_sort)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-			        nextval('messages_modseq'), $18, $19, $20, $21, $22)`,
+			WITH inserted AS (
+				INSERT INTO messages
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart,
+				 internal_date, size, subject, sent_date, in_reply_to, body_structure,
+				 recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_email_sort, cc_email_sort)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $11, $12, $13, $14, $15, $16, $17,
+						nextval('messages_modseq'), $18, $19, $20, $21, $22)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags)
+			SELECT id, mailbox_id, $9, $10 FROM inserted`,
 			pts.accountID,                      // account_id
 			pts.mailboxID,                      // mailbox_id
 			"INBOX",                            // mailbox_path

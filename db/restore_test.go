@@ -622,7 +622,7 @@ func TestRestoreMessages_PreservesFlags(t *testing.T) {
 	var originalFlags int
 	var originalCustomFlags []byte
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT uid, flags, custom_flags FROM messages WHERE id = $1",
+		"SELECT m.uid, ms.flags, ms.custom_flags FROM messages m JOIN message_state ms ON m.id = ms.message_id WHERE id = $1",
 		msgID).Scan(&originalUID, &originalFlags, &originalCustomFlags)
 	require.NoError(t, err)
 
@@ -670,7 +670,7 @@ func TestRestoreMessages_PreservesFlags(t *testing.T) {
 	var restoredCustomFlags []byte
 	var restoredExpungedAt *time.Time
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT uid, flags, custom_flags, expunged_at FROM messages WHERE id = $1",
+		"SELECT m.uid, ms.flags, ms.custom_flags, m.expunged_at FROM messages m JOIN message_state ms ON m.id = ms.message_id WHERE id = $1",
 		msgID).Scan(&restoredUID, &restoredFlags, &restoredCustomFlags, &restoredExpungedAt)
 	require.NoError(t, err)
 
@@ -892,9 +892,15 @@ func TestRestoreMessages_SameMessageIDInDifferentMailboxes(t *testing.T) {
 
 	// Mark both as expunged and set \Deleted flag (bit 8)
 	_, err = tx4.Exec(ctx, `
+		UPDATE message_state
+		SET flags = flags | 8
+		WHERE message_id IN ($1, $2)
+	`, inboxMsgID, trashMsgID)
+	require.NoError(t, err)
+
+	_, err = tx4.Exec(ctx, `
 		UPDATE messages
-		SET expunged_at = NOW(),
-		    flags = flags | 8
+		SET expunged_at = NOW()
 		WHERE id IN ($1, $2)
 	`, inboxMsgID, trashMsgID)
 	require.NoError(t, err)
@@ -906,11 +912,11 @@ func TestRestoreMessages_SameMessageIDInDifferentMailboxes(t *testing.T) {
 	var inboxFlags, trashFlags int
 	var inboxExpunged, trashExpunged bool
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT flags, expunged_at IS NOT NULL FROM messages WHERE id = $1",
+		"SELECT ms.flags, m.expunged_at IS NOT NULL FROM messages m JOIN message_state ms ON m.id = ms.message_id WHERE m.id = $1",
 		inboxMsgID).Scan(&inboxFlags, &inboxExpunged)
 	require.NoError(t, err)
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT flags, expunged_at IS NOT NULL FROM messages WHERE id = $1",
+		"SELECT ms.flags, m.expunged_at IS NOT NULL FROM messages m JOIN message_state ms ON m.id = ms.message_id WHERE m.id = $1",
 		trashMsgID).Scan(&trashFlags, &trashExpunged)
 	require.NoError(t, err)
 
@@ -941,11 +947,11 @@ func TestRestoreMessages_SameMessageIDInDifferentMailboxes(t *testing.T) {
 	var inboxMailboxID, trashRestoredMailboxID int64
 
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT flags, expunged_at IS NOT NULL, mailbox_id FROM messages WHERE id = $1",
+		"SELECT ms.flags, m.expunged_at IS NOT NULL, m.mailbox_id FROM messages m JOIN message_state ms ON m.id = ms.message_id WHERE id = $1",
 		inboxMsgID).Scan(&inboxRestoredFlags, &inboxRestoredExpunged, &inboxMailboxID)
 	require.NoError(t, err)
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT flags, expunged_at IS NOT NULL, mailbox_id FROM messages WHERE id = $1",
+		"SELECT ms.flags, m.expunged_at IS NOT NULL, m.mailbox_id FROM messages m JOIN message_state ms ON m.id = ms.message_id WHERE id = $1",
 		trashMsgID).Scan(&trashRestoredFlags, &trashRestoredExpunged, &trashRestoredMailboxID)
 	require.NoError(t, err)
 
