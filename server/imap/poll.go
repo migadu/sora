@@ -56,7 +56,7 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 			}
 			return nil // Return success - no updates to send
 		}
-		
+
 		// If the context was canceled (e.g. client disconnected), gracefully skip.
 		if errors.Is(err, context.Canceled) {
 			s.DebugLog("session context cancelled during database poll")

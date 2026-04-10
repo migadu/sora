@@ -468,6 +468,33 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		resultLimit = MaxSearchResults // 100k for simple queries - reasonable for IMAP clients
 	}
 
+	needsSeqNumSearch := false
+	var checkSeqNum func(*imap.SearchCriteria) bool
+	checkSeqNum = func(c *imap.SearchCriteria) bool {
+		if c == nil {
+			return false
+		}
+		if len(c.SeqNum) > 0 {
+			return true
+		}
+		for _, n := range c.Not {
+			if checkSeqNum(&n) {
+				return true
+			}
+		}
+		for _, pair := range c.Or {
+			if checkSeqNum(&pair[0]) || checkSeqNum(&pair[1]) {
+				return true
+			}
+		}
+		return false
+	}
+	needsSeqNumSearch = checkSeqNum(criteria)
+	// If ordering uses sequence numbers dynamically, we can't push it down
+	if strings.Contains(strings.ToLower(orderByClause), "seqnum") {
+		needsSeqNumSearch = true
+	}
+
 	// Use optimized query path when possible
 	if !isComplexQuery {
 		// Fast path: Simple query with table aliases
@@ -478,8 +505,6 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		whereArgs["mailboxID"] = mailboxID
 
 		// For simple queries, ensure ORDER BY uses "m." prefix
-		// Default to DESC so newest messages are returned first (iOS Mail expects this)
-		// NOTE: ESEARCH MIN/MAX logic in server/imap/search.go handles DESC order correctly
 		if orderByClause == "" {
 			orderByClause = "ORDER BY m.uid DESC"
 		}
@@ -493,7 +518,8 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			SELECT 
 				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
 				m.internal_date, m.size, m.created_modseq, m.updated_modseq, m.expunged_modseq, 
-				m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+				m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json,
+				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
 			FROM messages m
 			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 			%s
@@ -511,22 +537,58 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		outerOrderByClause := strings.ReplaceAll(orderByClause, "m.", "f.")
 		finalQueryString = fmt.Sprintf(simpleQueryTemplate, whereCondition, orderByClause, resultLimit, outerOrderByClause)
 		metricsLabel = "search_messages_simple"
+
+	} else if !needsSeqNumSearch {
+		// Modern Complex path: We need FTS or JSONB generic headers, BUT we do NOT need SeqNum filtering.
+		// Thus, we can push down complex where clauses (FTS joins) into the CTE too!
+		whereCondition, whereArgs, err = db.buildSearchCriteriaWithPrefix(criteria, "p", &paramCounter, "m")
+		if err != nil {
+			return nil, err
+		}
+		whereArgs["mailboxID"] = mailboxID
+
+		if orderByClause == "" {
+			orderByClause = "ORDER BY m.uid DESC"
+		}
+
+		const complexQueryTemplate = `
+		WITH filtered_messages AS (
+			SELECT 
+				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
+				m.internal_date, m.size, m.created_modseq, m.updated_modseq, m.expunged_modseq, 
+				m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json,
+				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
+			FROM messages m
+			LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
+			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
+			%s
+			LIMIT %d
+		)
+		SELECT 
+			f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
+			f.internal_date, f.size, f.created_modseq, f.updated_modseq, f.expunged_modseq, 
+			(SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = f.mailbox_id AND m2.uid <= f.uid AND m2.expunged_at IS NULL) as seqnum,
+			f.flags_changed_at, f.subject, f.sent_date, f.message_id, f.in_reply_to, f.recipients_json
+		FROM filtered_messages f
+		%s`
+
+		outerOrderByClause := strings.ReplaceAll(orderByClause, "m.", "f.")
+		finalQueryString = fmt.Sprintf(complexQueryTemplate, whereCondition, orderByClause, resultLimit, outerOrderByClause)
+		metricsLabel = "search_messages_complex_fast"
+
 	} else {
-		// Complex path: Use CTE with empty table prefix (CTE columns are accessed directly)
+		// Legacy Complex path: Use CTE with empty table prefix because SeqNum filtering REQUIRES evaluating Sequence IDs BEFORE where
 		whereCondition, whereArgs, err = db.buildSearchCriteriaWithPrefix(criteria, "p", &paramCounter, "")
 		if err != nil {
 			return nil, err
 		}
 		whereArgs["mailboxID"] = mailboxID
 
-		// For CTE queries, ensure ORDER BY uses no prefix
-		// Default to DESC so newest messages are returned first (iOS Mail expects this)
-		// NOTE: ESEARCH MIN/MAX logic in server/imap/search.go handles DESC order correctly
 		if orderByClause == "" {
 			orderByClause = "ORDER BY uid DESC"
 		}
 
-		// Complex path: Use CTE when sequence numbers or FTS are needed
+		// Complex path: Use CTE when sequence numbers are needed in WHERE
 		const complexQuery = `
 		WITH message_seqs AS (
 			SELECT
@@ -547,7 +609,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
 		FROM message_seqs`
 		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, orderByClause, resultLimit)
-		metricsLabel = "search_messages_complex"
+		metricsLabel = "search_messages_complex_legacy"
 	}
 
 	start := time.Now()
