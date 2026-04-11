@@ -222,8 +222,13 @@ func TestCompleteS3Upload(t *testing.T) {
 
 	// Create a corresponding message
 	_, err := db.GetWritePool().Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, content_hash, uploaded, s3_domain, s3_localpart, message_id, sent_date, internal_date, flags, size, body_structure, recipients_json, created_modseq, uid)
-		VALUES ($1, $2, $3, FALSE, 'domain', 'localpart', 'msgid', now(), now(), 0, 1024, 'body', '[]', 1, 1)
+		WITH inserted AS (
+			INSERT INTO messages (account_id, mailbox_id, content_hash, uploaded, s3_domain, s3_localpart, message_id, sent_date, internal_date, size, body_structure, recipients_json, created_modseq, uid)
+			VALUES ($1, $2, $3, FALSE, 'domain', 'localpart', 'msgid', now(), now(), 1024, 'body', '[]', 1, 1)
+			RETURNING id, mailbox_id
+		)
+		INSERT INTO message_state (message_id, mailbox_id, flags)
+		SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, mailboxID, contentHash)
 	require.NoError(t, err)
 
@@ -268,9 +273,14 @@ func TestIsContentHashUploaded(t *testing.T) {
 
 	// Create messages
 	_, err := db.GetWritePool().Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, content_hash, uploaded, s3_domain, s3_localpart, message_id, sent_date, internal_date, flags, size, body_structure, recipients_json, created_modseq, uid)
-		VALUES ($1, $2, $3, TRUE, 'd', 'l', 'm1', now(), now(), 0, 1, 'b', '[]', 1, 1), 
-		       ($1, $2, $4, FALSE, 'd', 'l', 'm2', now(), now(), 0, 1, 'b', '[]', 2, 2)
+		WITH inserted AS (
+			INSERT INTO messages (account_id, mailbox_id, content_hash, uploaded, s3_domain, s3_localpart, message_id, sent_date, internal_date, size, body_structure, recipients_json, created_modseq, uid)
+			VALUES ($1, $2, $3, TRUE, 'd', 'l', 'm1', now(), now(), 1, 'b', '[]', 1, 1), 
+			       ($1, $2, $4, FALSE, 'd', 'l', 'm2', now(), now(), 1, 'b', '[]', 2, 2)
+			RETURNING id, mailbox_id
+		)
+		INSERT INTO message_state (message_id, mailbox_id, flags)
+		SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, mailboxID, hashUploaded, hashNotUploaded)
 	require.NoError(t, err)
 

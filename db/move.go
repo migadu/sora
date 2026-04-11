@@ -117,25 +117,42 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		// Step 2: Insert new copies with new UIDs
 		// The expunged messages are now excluded from the unique index, so this succeeds
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages (
-				account_id, content_hash, uploaded, message_id, in_reply_to,
-				subject, sent_date, internal_date, flags, custom_flags, size,
-				body_structure, recipients_json, s3_domain, s3_localpart,
-				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
-				mailbox_id, mailbox_path, flags_changed_at, created_modseq, uid
+			WITH src_data AS (
+				SELECT
+					m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
+					m.subject, m.sent_date, m.internal_date, m.size,
+					m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
+					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort,
+					m.id AS original_id,
+					d.new_uid
+				FROM messages m
+				JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
+			),
+			inserted AS (
+				INSERT INTO messages (
+					account_id, content_hash, uploaded, message_id, in_reply_to,
+					subject, sent_date, internal_date, size,
+					body_structure, recipients_json, s3_domain, s3_localpart,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
+					mailbox_id, mailbox_path, created_modseq, uid
+				)
+				SELECT
+					account_id, content_hash, uploaded, message_id, in_reply_to,
+					subject, sent_date, internal_date, size,
+					body_structure, recipients_json, s3_domain, s3_localpart,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
+					$1 AS mailbox_id,
+					$2 AS mailbox_path,
+					nextval('messages_modseq') AS created_modseq,
+					new_uid
+				FROM src_data
+				RETURNING id, uid
 			)
-			SELECT
-				m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
-				m.subject, m.sent_date, m.internal_date, m.flags, m.custom_flags, m.size,
-				m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
-				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort,
-				$1 AS mailbox_id,
-				$2 AS mailbox_path,
-				NOW() AS flags_changed_at,
-				nextval('messages_modseq') AS created_modseq,
-				d.new_uid
-			FROM messages m
-			JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
+			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
+			SELECT i.id, $1, ms.flags, ms.custom_flags, NOW(), nextval('messages_modseq')
+			FROM inserted i
+			JOIN src_data s ON s.new_uid = i.uid
+			JOIN message_state ms ON ms.message_id = s.original_id
 		`, srcMailboxID, destMailboxName, messageIDs, newUIDs)
 		if err != nil {
 			logger.Error("Database: failed to insert new messages for same-mailbox move", "err", err)
@@ -145,25 +162,42 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	} else {
 		// Different mailbox: normal insert from existing rows
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages (
-				account_id, content_hash, uploaded, message_id, in_reply_to,
-				subject, sent_date, internal_date, flags, custom_flags, size,
-				body_structure, recipients_json, s3_domain, s3_localpart,
-				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
-				mailbox_id, mailbox_path, flags_changed_at, created_modseq, uid
+			WITH src_data AS (
+				SELECT
+					m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
+					m.subject, m.sent_date, m.internal_date, m.size,
+					m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
+					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort,
+					m.id AS original_id,
+					d.new_uid
+				FROM messages m
+				JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
+			),
+			inserted AS (
+				INSERT INTO messages (
+					account_id, content_hash, uploaded, message_id, in_reply_to,
+					subject, sent_date, internal_date, size,
+					body_structure, recipients_json, s3_domain, s3_localpart,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
+					mailbox_id, mailbox_path, created_modseq, uid
+				)
+				SELECT
+					account_id, content_hash, uploaded, message_id, in_reply_to,
+					subject, sent_date, internal_date, size,
+					body_structure, recipients_json, s3_domain, s3_localpart,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
+					$1 AS mailbox_id,
+					$2 AS mailbox_path,
+					nextval('messages_modseq') AS created_modseq,
+					new_uid
+				FROM src_data
+				RETURNING id, uid
 			)
-			SELECT
-				m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
-				m.subject, m.sent_date, m.internal_date, m.flags, m.custom_flags, m.size,
-				m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
-				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort,
-				$1 AS mailbox_id,
-				$2 AS mailbox_path,
-				NOW() AS flags_changed_at,
-				nextval('messages_modseq'),
-				d.new_uid
-			FROM messages m
-			JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
+			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
+			SELECT i.id, $1, ms.flags, ms.custom_flags, NOW(), nextval('messages_modseq')
+			FROM inserted i
+			JOIN src_data s ON s.new_uid = i.uid
+			JOIN message_state ms ON ms.message_id = s.original_id
 		`, destMailboxID, destMailboxName, messageIDs, newUIDs)
 		if err != nil {
 			logger.Error("Database: failed to batch insert messages into destination mailbox", "err", err)

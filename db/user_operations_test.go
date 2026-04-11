@@ -85,8 +85,13 @@ func TestGetAllMessagesForUserVerification(t *testing.T) {
 		}
 
 		query := fmt.Sprintf(`
-			INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, expunged_at, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
-			VALUES ($1, $2, $3, $4, $5, $5, $6, 0, %s, TRUE, $7, $8, $9, 'body', '[]', $10)
+			WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, expunged_at, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
+				VALUES ($1, $2, $3, $4, $5, $5, $6, %s, TRUE, $7, $8, $9, 'body', '[]', $10)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 		`, expungedAt)
 
 		_, err = tx3.Exec(ctx, query,
@@ -265,8 +270,13 @@ func TestMarkMessagesAsNotUploaded(t *testing.T) {
 		require.NoError(t, err)
 
 		query := `
-			INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, expunged_at, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
-			VALUES ($1, $2, $3, $4, $5, $5, $6, 0, NULL, TRUE, $7, $8, $9, 'body', '[]', $10)
+			WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, expunged_at, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
+				VALUES ($1, $2, $3, $4, $5, $5, $6, NULL, TRUE, $7, $8, $9, 'body', '[]', $10)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 		`
 
 		_, err = tx3.Exec(ctx, query,

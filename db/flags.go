@@ -57,8 +57,9 @@ func (db *Database) getAllFlagsForMessage(ctx context.Context, tx pgx.Tx, messag
 	var bitwiseFlags int
 	var customFlagsJSON []byte
 	err := tx.QueryRow(ctx, `
-		SELECT flags, custom_flags FROM messages
-		WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL
+		SELECT ms.flags, ms.custom_flags FROM messages m
+		JOIN message_state ms ON m.id = ms.message_id
+		WHERE m.uid = $1 AND m.mailbox_id = $2 AND m.expunged_at IS NULL
 	`, messageUID, mailboxID).Scan(&bitwiseFlags, &customFlagsJSON)
 
 	if err != nil {
@@ -104,10 +105,11 @@ func (db *Database) SetMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 		return nil, 0, fmt.Errorf("failed to marshal custom keywords for SetMessageFlags: %w", err)
 	}
 	err = tx.QueryRow(ctx, `
-		UPDATE messages
+		UPDATE message_state ms
 		SET flags = $1, custom_flags = $2, flags_changed_at = $3, updated_modseq = nextval('messages_modseq')
-		WHERE uid = $4 AND mailbox_id = $5 AND expunged_at IS NULL
-		RETURNING COALESCE(updated_modseq, created_modseq)
+		FROM messages m
+		WHERE ms.message_id = m.id AND m.uid = $4 AND ms.mailbox_id = $5 AND m.expunged_at IS NULL
+		RETURNING COALESCE(ms.updated_modseq, m.created_modseq)
 	`, bitwiseSystemFlags, customKeywordsJSON, time.Now(), messageUID, mailboxID).Scan(&modSeq)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to execute set message flags for UID %d in mailbox %d: %w", messageUID, mailboxID, err)
@@ -132,9 +134,10 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 		if hasCustom {
 			// Custom keywords update follows — skip modseq bump here to avoid double increment
 			ct, execErr := tx.Exec(ctx, `
-				UPDATE messages
-				SET flags = flags | $1, flags_changed_at = $2
-				WHERE uid = $3 AND mailbox_id = $4 AND expunged_at IS NULL
+				UPDATE message_state ms
+				SET flags = ms.flags | $1, flags_changed_at = $2
+				FROM messages m
+				WHERE ms.message_id = m.id AND m.uid = $3 AND ms.mailbox_id = $4 AND m.expunged_at IS NULL
 			`, bitwiseSystemFlagsToAdd, time.Now(), messageUID, mailboxID)
 			if execErr != nil {
 				return nil, 0, fmt.Errorf("failed to add system flags for UID %d: %w", messageUID, execErr)
@@ -145,10 +148,11 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 		} else {
 			// Only system flags to update — bump modseq here
 			err = tx.QueryRow(ctx, `
-				UPDATE messages
-				SET flags = flags | $1, flags_changed_at = $2, updated_modseq = nextval('messages_modseq')
-				WHERE uid = $3 AND mailbox_id = $4 AND expunged_at IS NULL
-				RETURNING COALESCE(updated_modseq, created_modseq)
+				UPDATE message_state ms
+				SET flags = ms.flags | $1, flags_changed_at = $2, updated_modseq = nextval('messages_modseq')
+				FROM messages m
+				WHERE ms.message_id = m.id AND m.uid = $3 AND ms.mailbox_id = $4 AND m.expunged_at IS NULL
+				RETURNING COALESCE(ms.updated_modseq, m.created_modseq)
 			`, bitwiseSystemFlagsToAdd, time.Now(), messageUID, mailboxID).Scan(&finalModSeq)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
@@ -163,17 +167,18 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 	if hasCustom {
 		// This is always the last update — bump modseq here
 		err = tx.QueryRow(ctx, `
-			UPDATE messages
+			UPDATE message_state ms
 			SET custom_flags = (
 				SELECT COALESCE(jsonb_agg(DISTINCT flag_element ORDER BY flag_element), '[]'::jsonb) -- ORDER BY for deterministic output if needed
 				FROM (
-					SELECT jsonb_array_elements_text(custom_flags) AS flag_element FROM messages WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL
+					SELECT jsonb_array_elements_text(ms2.custom_flags) AS flag_element FROM message_state ms2 WHERE ms2.message_id = ms.message_id
 					UNION ALL
 					SELECT unnest($3::text[]) AS flag_element
 				) AS combined_flags
 			), flags_changed_at = $4, updated_modseq = nextval('messages_modseq')
-			WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL
-			RETURNING COALESCE(updated_modseq, created_modseq)
+			FROM messages m
+			WHERE ms.message_id = m.id AND m.uid = $1 AND ms.mailbox_id = $2 AND m.expunged_at IS NULL
+			RETURNING COALESCE(ms.updated_modseq, m.created_modseq)
 		`, messageUID, mailboxID, customKeywordsToAdd, time.Now()).Scan(&finalModSeq)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -210,9 +215,10 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUI
 		if hasCustom {
 			// Custom keywords update follows — skip modseq bump here to avoid double increment
 			ct, execErr := tx.Exec(ctx, `
-				UPDATE messages
-				SET flags = flags & $1, flags_changed_at = $2
-				WHERE uid = $3 AND mailbox_id = $4 AND expunged_at IS NULL
+				UPDATE message_state ms
+				SET flags = ms.flags & $1, flags_changed_at = $2
+				FROM messages m
+				WHERE ms.message_id = m.id AND m.uid = $3 AND ms.mailbox_id = $4 AND m.expunged_at IS NULL
 			`, negatedSystemFlags, time.Now(), messageUID, mailboxID)
 			if execErr != nil {
 				return nil, 0, fmt.Errorf("failed to remove system flags for UID %d: %w", messageUID, execErr)
@@ -223,10 +229,11 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUI
 		} else {
 			// Only system flags to update — bump modseq here
 			err = tx.QueryRow(ctx, `
-				UPDATE messages
-				SET flags = flags & $1, flags_changed_at = $2, updated_modseq = nextval('messages_modseq')
-				WHERE uid = $3 AND mailbox_id = $4 AND expunged_at IS NULL
-				RETURNING COALESCE(updated_modseq, created_modseq)
+				UPDATE message_state ms
+				SET flags = ms.flags & $1, flags_changed_at = $2, updated_modseq = nextval('messages_modseq')
+				FROM messages m
+				WHERE ms.message_id = m.id AND m.uid = $3 AND ms.mailbox_id = $4 AND m.expunged_at IS NULL
+				RETURNING COALESCE(ms.updated_modseq, m.created_modseq)
 			`, negatedSystemFlags, time.Now(), messageUID, mailboxID).Scan(&finalModSeq)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
@@ -241,11 +248,12 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUI
 	if hasCustom {
 		// This is always the last update — bump modseq here
 		err = tx.QueryRow(ctx, `
-			UPDATE messages
-			SET custom_flags = custom_flags - $3::text[],
+			UPDATE message_state ms
+			SET custom_flags = ms.custom_flags - $3::text[],
 			    flags_changed_at = $4, updated_modseq = nextval('messages_modseq')
-			WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL
-			RETURNING COALESCE(updated_modseq, created_modseq)
+			FROM messages m
+			WHERE ms.message_id = m.id AND m.uid = $1 AND ms.mailbox_id = $2 AND m.expunged_at IS NULL
+			RETURNING COALESCE(ms.updated_modseq, m.created_modseq)
 		`, messageUID, mailboxID, customKeywordsToRemove, time.Now()).Scan(&finalModSeq)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -306,9 +314,10 @@ func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxI
 	// Fallback: full scan query (used if cache column doesn't exist yet or cache is NULL)
 	query := `
 		SELECT DISTINCT flag
-		FROM messages CROSS JOIN LATERAL jsonb_array_elements_text(custom_flags) AS elem(flag)
-		WHERE mailbox_id = $1
-		  AND expunged_at IS NULL
+		FROM message_state ms CROSS JOIN LATERAL jsonb_array_elements_text(ms.custom_flags) AS elem(flag)
+		JOIN messages m ON m.id = ms.message_id
+		WHERE ms.mailbox_id = $1
+		  AND m.expunged_at IS NULL
 		  AND flag !~ '^\\';
 	`
 	rows, err := db.GetReadPool().Query(ctx, query, mailboxID)

@@ -82,8 +82,9 @@ func (db *Database) GetUnseenCountForMailbox(ctx context.Context, accountID int6
 	var count int
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT COUNT(*) 
-		FROM messages 
-		WHERE mailbox_id = $1 AND expunged_at IS NULL AND (flags & $2) = 0
+		FROM messages m
+		LEFT JOIN message_state ms ON ms.message_id = m.id
+		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL AND (ms.flags & $2) = 0
 	`, mailbox.ID, FlagSeen).Scan(&count)
 
 	if err != nil {
@@ -103,11 +104,12 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 	query := `
 		SELECT 
 			m.id, m.uid, m.mailbox_id, m.subject, m.sent_date, m.internal_date,
-			m.size, m.flags, m.custom_flags, m.message_id, m.in_reply_to,
+			m.size, ms.flags, ms.custom_flags, m.message_id, m.in_reply_to,
 			m.recipients_json, m.content_hash, m.s3_domain, m.s3_localpart,
 			mb.name as mailbox_path
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 	`
 
@@ -115,7 +117,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 	argPos := 2
 
 	if unseenOnly {
-		query += fmt.Sprintf(" AND (m.flags & $%d) = 0", argPos)
+		query += fmt.Sprintf(" AND (ms.flags & $%d) = 0", argPos)
 		args = append(args, FlagSeen)
 		argPos++
 	}
@@ -212,12 +214,13 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 	searchQuery := `
 		SELECT
 			m.id, m.uid, m.mailbox_id, m.subject, m.sent_date, m.internal_date,
-			m.size, m.flags, m.custom_flags, m.message_id, m.in_reply_to,
+			m.size, ms.flags, ms.custom_flags, m.message_id, m.in_reply_to,
 			m.recipients_json, m.content_hash, m.s3_domain, m.s3_localpart,
 			mb.name as mailbox_path
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
 		LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
+		LEFT JOIN message_state ms ON ms.message_id = m.id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 		AND (
 			LOWER(m.subject) LIKE LOWER($2)
@@ -394,11 +397,12 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 	query := `
 		SELECT 
 			m.id, m.uid, m.mailbox_id, m.subject, m.sent_date, m.internal_date,
-			m.size, m.flags, m.custom_flags, m.message_id, m.in_reply_to,
+			m.size, ms.flags, ms.custom_flags, m.message_id, m.in_reply_to,
 			m.recipients_json, m.content_hash, m.s3_domain, m.s3_localpart,
 			mb.name as mailbox_path
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id
 		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
 	`
 
@@ -461,9 +465,10 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 	var currentFlags int
 	var currentCustomFlags []byte
 	err = tx.QueryRow(ctx, `
-		SELECT flags, custom_flags 
-		FROM messages 
-		WHERE id = $1 AND account_id = $2 AND expunged_at IS NULL
+		SELECT ms.flags, ms.custom_flags 
+		FROM messages m
+		LEFT JOIN message_state ms ON ms.message_id = m.id
+		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
 	`, messageID, accountID).Scan(&currentFlags, &currentCustomFlags)
 
 	if err != nil {
@@ -502,9 +507,10 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 
 	// Update flags
 	_, err = tx.Exec(ctx, `
-		UPDATE messages 
-		SET flags = $1, custom_flags = $2, updated_at = now()
-		WHERE id = $3 AND account_id = $4
+		UPDATE message_state ms
+		SET flags = $1, custom_flags = $2, flags_changed_at = now(), updated_modseq = nextval('messages_modseq')
+		FROM messages m
+		WHERE ms.message_id = m.id AND m.id = $3 AND m.account_id = $4
 	`, newFlags, customFlagsJSON, messageID, accountID)
 
 	if err != nil {

@@ -339,16 +339,25 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 
 		// Restore the message and clear the \Deleted flag
 		// FlagDeleted = 8 (bit 3), so we use bitwise AND with NOT 8 to clear it
+		_, err = tx.Exec(ctx, `
+			UPDATE message_state
+			SET mailbox_id = $2,
+			    flags = flags & ~8,
+			    flags_changed_at = now(),
+			    updated_modseq = nextval('messages_modseq')
+			WHERE message_id = $1
+		`, msg.id, targetMailboxID)
+		if err != nil {
+			return 0, fmt.Errorf("failed to restore message_state for message %d: %w", msg.id, err)
+		}
+
 		result, err := tx.Exec(ctx, `
 			UPDATE messages
 			SET expunged_at = NULL,
 			    expunged_modseq = NULL,
 			    mailbox_id = $2,
 			    uid = $3,
-			    flags = flags & ~8,
-			    flags_changed_at = now(),
-			    updated_at = now(),
-			    updated_modseq = nextval('messages_modseq')
+			    updated_at = now()
 			WHERE id = $1
 		`, msg.id, targetMailboxID, nextUID)
 		if err != nil {

@@ -138,8 +138,13 @@ func TestExpungeOldMessages(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
-		VALUES ($1, $2, 100, $3, $4, $4, 100, 0, TRUE, 'domain', 'part', 'msgid100', 'body', '[]', 100, $5)
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
+		VALUES ($1, $2, 100, $3, $4, $4, 100, TRUE, 'domain', 'part', 'msgid100', 'body', '[]', 100, $5)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, mailboxID, oldHash, time.Now(), oldCreatedAt)
 	require.NoError(t, err)
 
@@ -153,8 +158,13 @@ func TestExpungeOldMessages(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
-		VALUES ($1, $2, 101, $3, $4, $4, 100, 0, TRUE, 'domain', 'part', 'msgid101', 'body', '[]', 101, $5)
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
+		VALUES ($1, $2, 101, $3, $4, $4, 100, TRUE, 'domain', 'part', 'msgid101', 'body', '[]', 101, $5)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, mailboxID, recentHash, time.Now(), recentCreatedAt)
 	require.NoError(t, err)
 
@@ -216,8 +226,13 @@ func TestCleanupFailedUploads(t *testing.T) {
 
 	oldCreatedAt := time.Now().Add(-25 * time.Hour) // 25 hours old
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
-		VALUES ($1, $2, 200, $3, $4, $4, 100, 0, FALSE, 'domain', 'part', 'msgid200', 'body', '[]', 200, $5)
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
+		VALUES ($1, $2, 200, $3, $4, $4, 100, FALSE, 'domain', 'part', 'msgid200', 'body', '[]', 200, $5)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, mailboxID, oldFailedHash, time.Now(), oldCreatedAt)
 	require.NoError(t, err)
 
@@ -238,8 +253,13 @@ func TestCleanupFailedUploads(t *testing.T) {
 
 	recentCreatedAt := time.Now().Add(-5 * time.Hour) // 5 hours old
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
-		VALUES ($1, $2, 201, $3, $4, $4, 100, 0, FALSE, 'domain', 'part', 'msgid201', 'body', '[]', 201, $5)
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
+		VALUES ($1, $2, 201, $3, $4, $4, 100, FALSE, 'domain', 'part', 'msgid201', 'body', '[]', 201, $5)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, mailboxID, recentFailedHash, time.Now(), recentCreatedAt)
 	require.NoError(t, err)
 
@@ -306,8 +326,13 @@ func TestGetUserScopedObjectsForCleanup(t *testing.T) {
 
 	expungedAt := time.Now().Add(-25 * time.Hour) // 25 hours ago
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
-		VALUES ($1, $2, 300, $3, $4, $4, 100, 0, TRUE, 'test-domain', 'test-localpart', 'msgid300', 'body', '[]', 300, $5)
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
+		VALUES ($1, $2, 300, $3, $4, $4, 100, TRUE, 'test-domain', 'test-localpart', 'msgid300', 'body', '[]', 300, $5)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, mailboxID, cleanupHash, time.Now(), expungedAt)
 	require.NoError(t, err)
 
@@ -362,8 +387,13 @@ func TestDeleteExpungedMessagesByS3KeyPartsBatch(t *testing.T) {
 		require.NoError(t, err)
 
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
-			VALUES ($1, $2, $3, $4, $5, $5, 100, 0, TRUE, 'batch-domain', 'batch-part', $6, 'body', '[]', $7, NOW())
+			WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
+			VALUES ($1, $2, $3, $4, $5, $5, 100, TRUE, 'batch-domain', 'batch-part', $6, 'body', '[]', $7, NOW())
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 		`, accountID, mailboxID, 400+i, hash, time.Now(), fmt.Sprintf("batchmsg%d", i), 400+i)
 		require.NoError(t, err)
 
@@ -526,8 +556,13 @@ func TestDeleteMessageByHashAndMailbox(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
-		VALUES ($1, $2, 500, $3, $4, $4, 100, 0, TRUE, 'delete-domain', 'delete-part', 'delete-msg-id', 'body', '[]', 500)
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
+		VALUES ($1, $2, 500, $3, $4, $4, 100, TRUE, 'delete-domain', 'delete-part', 'delete-msg-id', 'body', '[]', 500)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, mailboxID, deleteHash, time.Now())
 	require.NoError(t, err)
 
@@ -611,15 +646,25 @@ func TestGetUserScopedObjectsForCleanup_LiveMessagePreventsCleanup(t *testing.T)
 	// Create EXPUNGED message in INBOX (old, past grace period)
 	expungedAt := time.Now().Add(-25 * time.Hour) // 25 hours ago (past 24h grace)
 	_, err = tx2.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
-		VALUES ($1, $2, 1, $3, $4, $4, 100, 0, TRUE, 'test-domain', 'test-localpart', 'msgid-inbox', 'body', '[]', 1, $5)
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
+		VALUES ($1, $2, 1, $3, $4, $4, 100, TRUE, 'test-domain', 'test-localpart', 'msgid-inbox', 'body', '[]', 1, $5)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, inboxID, sharedContentHash, time.Now().Add(-26*time.Hour), expungedAt)
 	require.NoError(t, err)
 
 	// Create LIVE message in Archive (same content_hash, but NOT expunged)
 	_, err = tx2.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
-		VALUES ($1, $2, 1, $3, $4, $4, 100, 0, TRUE, 'test-domain', 'test-localpart', 'msgid-archive', 'body', '[]', 2, NULL)
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
+		VALUES ($1, $2, 1, $3, $4, $4, 100, TRUE, 'test-domain', 'test-localpart', 'msgid-archive', 'body', '[]', 2, NULL)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, archiveID, sharedContentHash, time.Now().Add(-26*time.Hour))
 	require.NoError(t, err)
 
@@ -704,15 +749,25 @@ func TestGetUserScopedObjectsForCleanup_AllExpungedAllowsCleanup(t *testing.T) {
 
 	// Create EXPUNGED message in INBOX
 	_, err = tx2.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
-		VALUES ($1, $2, 2, $3, $4, $4, 100, 0, TRUE, 'all-domain', 'all-part', 'msgid-inbox-exp', 'body', '[]', 3, $5)
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
+		VALUES ($1, $2, 2, $3, $4, $4, 100, TRUE, 'all-domain', 'all-part', 'msgid-inbox-exp', 'body', '[]', 3, $5)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, inboxID, allExpungedHash, time.Now().Add(-26*time.Hour), expungedAt)
 	require.NoError(t, err)
 
 	// Create EXPUNGED message in Archive (same content_hash, also expunged)
 	_, err = tx2.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
-		VALUES ($1, $2, 2, $3, $4, $4, 100, 0, TRUE, 'all-domain', 'all-part', 'msgid-archive-exp', 'body', '[]', 4, $5)
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
+		VALUES ($1, $2, 2, $3, $4, $4, 100, TRUE, 'all-domain', 'all-part', 'msgid-archive-exp', 'body', '[]', 4, $5)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, archiveID, allExpungedHash, time.Now().Add(-26*time.Hour), expungedAt)
 	require.NoError(t, err)
 
@@ -796,8 +851,13 @@ func TestCleanerWorkflow_MovedMessageS3Preservation(t *testing.T) {
 	// Insert message in INBOX (will be moved later)
 	oldCreatedAt := time.Now().Add(-48 * time.Hour) // Created 48 hours ago
 	_, err = tx2.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
-		VALUES ($1, $2, 1, $3, $4, $4, $5, 0, TRUE, 'move-domain', 'move-part', 'moved-msg-id', 'body', '[]', 1, $6)
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
+		VALUES ($1, $2, 1, $3, $4, $4, $5, TRUE, 'move-domain', 'move-part', 'moved-msg-id', 'body', '[]', 1, $6)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, inboxID, contentHash, time.Now().Add(-48*time.Hour), len(messageBody), oldCreatedAt)
 	require.NoError(t, err)
 
@@ -826,8 +886,13 @@ func TestCleanerWorkflow_MovedMessageS3Preservation(t *testing.T) {
 
 	// Create new message in Archive (same content_hash - shared S3 object)
 	_, err = tx3.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
-		VALUES ($1, $2, 1, $3, $4, $4, $5, 0, TRUE, 'move-domain', 'move-part', 'moved-msg-id', 'body', '[]', 2, NOW())
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
+		VALUES ($1, $2, 1, $3, $4, $4, $5, TRUE, 'move-domain', 'move-part', 'moved-msg-id', 'body', '[]', 2, NOW())
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, archiveID, contentHash, time.Now().Add(-48*time.Hour), len(messageBody))
 	require.NoError(t, err)
 
@@ -976,12 +1041,17 @@ func TestPruneOldMessageVectors(t *testing.T) {
 	// Insert a messages row for each — realistic setup.
 	for i, hash := range []string{oldHash, recentHash, nullDateHash} {
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date,
-			                      internal_date, size, flags, uploaded,
-			                      s3_domain, s3_localpart, message_id,
-			                      body_structure, recipients_json, created_modseq)
-			VALUES ($1, $2, $3, $4, NOW(), NOW(), 100, 0, TRUE,
-			        'pvec-domain', 'pvec-part', $5, 'body', '[]', $6)
+			WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date,
+				                      internal_date, size, uploaded,
+				                      s3_domain, s3_localpart, message_id,
+				                      body_structure, recipients_json, created_modseq)
+				VALUES ($1, $2, $3, $4, NOW(), NOW(), 100, TRUE,
+				        'pvec-domain', 'pvec-part', $5, 'body', '[]', $6)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 		`, accountID, mailboxID, 600+i, hash, fmt.Sprintf("pvec%d@example.com", i), 600+i)
 		require.NoError(t, err)
 	}

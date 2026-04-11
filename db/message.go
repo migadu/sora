@@ -170,11 +170,12 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 
 	query := fmt.Sprintf(`
 		SELECT
-			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-			m.internal_date, m.size, %sm.created_modseq, m.updated_modseq, m.expunged_modseq,
+			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
+			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
 			(SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = m.mailbox_id AND m2.uid <= m.uid AND m2.expunged_at IS NULL) as seqnum,
-			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
+		LEFT JOIN message_state ms ON ms.message_id = m.id
 		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
 		  AND (%s)
 		ORDER BY m.uid`, bsCol, whereClause)
@@ -255,11 +256,12 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 
 	query := fmt.Sprintf(`
 		SELECT 
-			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-			m.internal_date, m.size, %sm.created_modseq, m.updated_modseq, m.expunged_modseq,
+			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
+			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
 			(SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = m.mailbox_id AND m2.uid <= m.uid AND m2.expunged_at IS NULL) as seqnum,
-			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
+		LEFT JOIN message_state ms ON ms.message_id = m.id
 		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
 		  AND (%s)
 		ORDER BY m.uid
@@ -289,10 +291,11 @@ func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int
 			WHERE mailbox_id = $1 AND expunged_at IS NULL
 		)
 		SELECT 
-			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-			m.internal_date, m.size, %sm.created_modseq, m.updated_modseq, m.expunged_modseq, m.seqnum,
-			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
+			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq, m.seqnum,
+			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM numbered_messages m
+		LEFT JOIN message_state ms ON ms.message_id = m.id
 		WHERE m.uploaded = true
 		ORDER BY m.uid
 	`, bsCol)
@@ -412,13 +415,14 @@ func (db *Database) GetMessagesByFlag(ctx context.Context, mailboxID int64, flag
 			WHERE mailbox_id = $1 AND expunged_at IS NULL
 		)
 		SELECT
-			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-			m.internal_date, m.size, m.created_modseq, m.updated_modseq, m.expunged_modseq,
+			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
+			m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq,
 			n.seqnum,
-			m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		JOIN numbered n ON m.uid = n.uid
-		WHERE m.mailbox_id = $1 AND (m.flags & $2) != 0 AND m.expunged_at IS NULL
+		LEFT JOIN message_state ms ON ms.message_id = m.id
+		WHERE m.mailbox_id = $1 AND (ms.flags & $2) != 0 AND m.expunged_at IS NULL
 		ORDER BY m.uid
 	`, mailboxID, bitwiseFlag)
 	if err != nil {
@@ -457,7 +461,8 @@ func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID 
 		SELECT m.uid, n.seqnum
 		FROM messages m
 		JOIN numbered n ON m.uid = n.uid
-		WHERE m.mailbox_id = $1 AND (m.flags & $2) != 0 AND m.expunged_at IS NULL
+		LEFT JOIN message_state ms ON ms.message_id = m.id
+		WHERE m.mailbox_id = $1 AND (ms.flags & $2) != 0 AND m.expunged_at IS NULL
 		ORDER BY m.uid
 	`, mailboxID, FlagToBitwise(imap.FlagDeleted))
 	if err != nil {

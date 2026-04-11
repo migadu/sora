@@ -83,7 +83,7 @@ func TestInsertMessage_LargeFTSSkip(t *testing.T) {
 	// Verify message was inserted
 	messages, err := db.ListMessages(ctx, mailboxID)
 	assert.NoError(t, err)
-	assert.Len(t, messages, 1)
+	require.Len(t, messages, 1)
 	assert.Equal(t, "Large FTS Test", messages[0].Subject)
 
 	// Verify that the tsvector was created (even if empty)
@@ -169,7 +169,7 @@ func TestInsertMessage_LargeBodyStorageSkip(t *testing.T) {
 	// Verify message was inserted
 	messages, err := db.ListMessages(ctx, mailboxID)
 	assert.NoError(t, err)
-	assert.Len(t, messages, 1)
+	require.Len(t, messages, 1)
 	assert.Equal(t, "Large Storage Test", messages[0].Subject)
 
 	// Verify that text_body is NULL (not stored)
@@ -255,7 +255,7 @@ func TestInsertMessage_NormalSizeStored(t *testing.T) {
 	// Verify message was inserted
 	messages, err := db.ListMessages(ctx, mailboxID)
 	assert.NoError(t, err)
-	assert.Len(t, messages, 1)
+	require.Len(t, messages, 1)
 	assert.Equal(t, "Normal Size Test", messages[0].Subject)
 
 	// Verify that text_body is NULL and text_body_tsv is NOT NULL (stored)
@@ -347,7 +347,7 @@ func TestInsertMessage_LargeHeaders(t *testing.T) {
 	// Verify message was inserted
 	messages, err := db.ListMessages(ctx, mailboxID)
 	assert.NoError(t, err)
-	assert.Len(t, messages, 1)
+	require.Len(t, messages, 1)
 	assert.Equal(t, "Large Headers Test", messages[0].Subject)
 
 	// Verify that headers column is empty string (not stored due to size)

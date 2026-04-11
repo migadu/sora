@@ -211,8 +211,13 @@ func TestPruneWithSKIPLOCKED(t *testing.T) {
 
 		// Insert old message
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, expunged_at, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
-			VALUES ($1, $2, $3, $4, $5, $5, $6, 0, NULL, TRUE, 'test-domain', $7, $8, 'body', '[]', $3)
+			WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, expunged_at, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
+			VALUES ($1, $2, $3, $4, $5, $5, $6, NULL, TRUE, 'test-domain', $7, $8, 'body', '[]', $3)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 		`, accountID, mailboxID, 2000+i, contentHash, oldSentDate, len(testBody),
 			fmt.Sprintf("test-localpart-skip-%d", i),
 			fmt.Sprintf("msgid-skip-%d", i))
@@ -361,8 +366,13 @@ func TestPruneConcurrentWorkers(t *testing.T) {
 
 		// Insert old message
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, expunged_at, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
-			VALUES ($1, $2, $3, $4, $5, $5, $6, 0, NULL, TRUE, 'test-domain', $7, $8, 'body', '[]', $3)
+			WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, expunged_at, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
+			VALUES ($1, $2, $3, $4, $5, $5, $6, NULL, TRUE, 'test-domain', $7, $8, 'body', '[]', $3)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 		`, accountID, mailboxID, 3000+i, contentHash, oldSentDate, len(testBody),
 			fmt.Sprintf("test-localpart-concurrent-%d", i),
 			fmt.Sprintf("msgid-concurrent-%d", i))
@@ -504,8 +514,13 @@ func TestCleanupLock_NoDeadlockWithUserQueries(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = txData.Exec(ctx, `
-		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, flags, expunged_at, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
-		VALUES ($1, $2, 4000, $3, $4, $4, $5, 0, NULL, TRUE, 'test-domain', 'test-localpart-deadlock', 'msgid-deadlock', 'body', '[]', 4000)
+		WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, expunged_at, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
+		VALUES ($1, $2, 4000, $3, $4, $4, $5, NULL, TRUE, 'test-domain', 'test-localpart-deadlock', 'msgid-deadlock', 'body', '[]', 4000)
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags)
+			SELECT id, mailbox_id, 0 FROM inserted
 	`, accountID, mailboxID, contentHash, oldSentDate, len(testBody))
 	require.NoError(t, err)
 

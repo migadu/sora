@@ -22,10 +22,14 @@ import (
 	"database/sql"
 	"errors"
 	"hash/crc32"
+	"io/fs"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx driver for database/sql
 	"github.com/migadu/sora/config"
 	"github.com/stretchr/testify/assert"
@@ -47,54 +51,42 @@ func resetMigrationState(t *testing.T, targetVersion int) {
 	// migrate() timeout. Using setupTestDatabase / NewDatabaseFromConfig with
 	// runMigrations=true would hit the dirty-state guard and fail before we
 	// can clean anything up.
-	database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(), false, false)
+	database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(), true, false)
 	if err != nil {
 		t.Fatalf("resetMigrationState: connect to DB: %v", err)
 	}
-	defer database.Close()
 
-	pool := database.WritePool
-
-	// --- Migration 13: optimize_acl_queries ---
-	// Drop indexes, trigger, function, and column added by migration 13.
-	for _, stmt := range []string{
-		`DROP INDEX IF EXISTS idx_mailboxes_shared_owner_domain`,
-		`DROP INDEX IF EXISTS idx_mailbox_acls_anyone_rights`,
-		`DROP INDEX IF EXISTS idx_mailbox_acls_mailbox_account_rights`,
-		`DROP INDEX IF EXISTS idx_credentials_account_primary`,
-		`DROP INDEX IF EXISTS idx_credentials_domain`,
-		`DROP TRIGGER IF EXISTS trigger_maintain_credentials_domain ON credentials`,
-		`DROP FUNCTION IF EXISTS maintain_credentials_domain()`,
-		`ALTER TABLE credentials DROP COLUMN IF EXISTS domain`,
-	} {
-		if _, err := pool.Exec(ctx, stmt); err != nil {
-			t.Fatalf("resetMigrationState: %s: %v", stmt, err)
-		}
+	migrations, err := fs.Sub(MigrationsFS, "migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
 	}
 
-	// --- Migration 12: prune_partial_indexes ---
-	// Drop the two partial indexes added by migration 12 (IF EXISTS → idempotent).
-	_, err = pool.Exec(ctx, `DROP INDEX IF EXISTS idx_message_contents_bodies_prunable`)
+	sourceDriver, err := iofs.New(migrations, ".")
 	if err != nil {
-		t.Fatalf("resetMigrationState: drop bodies index: %v", err)
-	}
-	_, err = pool.Exec(ctx, `DROP INDEX IF EXISTS idx_message_contents_vectors_prunable`)
-	if err != nil {
-		t.Fatalf("resetMigrationState: drop vectors index: %v", err)
+		t.Fatalf("failed to create migration source driver: %v", err)
 	}
 
-	// Ensure schema_migrations has exactly one row at targetVersion, not dirty.
-	_, err = pool.Exec(ctx, `DELETE FROM schema_migrations WHERE version >= $1`, targetVersion)
+	// We open a direct sql.DB here since migrate.NewWithInstance takes sqlDB
+	// but the driver name is pgx. Actually, we can just use the target
+	// URL directly.
+	m, err := migrate.NewWithSourceInstance("iofs", sourceDriver, "postgres://postgres:password@localhost:5432/sora_test_db?sslmode=disable")
 	if err != nil {
-		t.Fatalf("resetMigrationState: delete schema_migrations: %v", err)
+		t.Fatalf("failed to create migrate instance: %v", err)
 	}
-	_, err = pool.Exec(ctx, `
-		INSERT INTO schema_migrations (version, dirty)
-		VALUES ($1, false)
-		ON CONFLICT (version) DO UPDATE SET dirty = false`, targetVersion)
-	if err != nil {
-		t.Fatalf("resetMigrationState: insert schema_migrations: %v", err)
+
+	// First ensure we are at the latest!
+	err = m.Up()
+	if err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("failed to ensure latest migration state: %v", err)
 	}
+
+	// Then gracefully downgrade to target version. This runs all .down.sql scripts cleanly!
+	err = m.Migrate(uint(targetVersion))
+	if err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("failed to rollback to target version %d: %v", targetVersion, err)
+	}
+
+	database.Close()
 }
 
 // TestMigrationAdvisoryLockSingleConn directly exercises the root cause and

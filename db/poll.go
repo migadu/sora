@@ -90,15 +90,16 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			               AND m2.expunged_at IS NULL 
 			               AND m2.uid <= m.uid)
 			        END AS seq_num,
-			        m.flags,
-			        m.custom_flags,
+			        ms.flags,
+			        ms.custom_flags,
 			        m.created_modseq,
-			        COALESCE(m.updated_modseq, 0) AS updated_modseq_val,
+			        COALESCE(ms.updated_modseq, 0) AS updated_modseq_val,
 			        m.expunged_modseq
 			    FROM messages m
+			    LEFT JOIN message_state ms ON ms.message_id = m.id
 			    WHERE m.mailbox_id = $1
 			      AND (m.expunged_modseq IS NULL OR m.expunged_modseq > $2)
-			      AND (m.created_modseq > $2 OR COALESCE(m.updated_modseq, 0) > $2 OR COALESCE(m.expunged_modseq, 0) > $2)
+			      AND (m.created_modseq > $2 OR COALESCE(ms.updated_modseq, 0) > $2 OR COALESCE(m.expunged_modseq, 0) > $2)
 			  ),
 			  changed_messages AS (
 			    SELECT
