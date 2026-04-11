@@ -82,9 +82,9 @@ func TestIMAP_NILFlagAlreadyInDatabase(t *testing.T) {
 	// This simulates what would happen if NIL was stored before validation
 	t.Log("Injecting NIL flag directly into database...")
 	_, err = server.ResilientDB.ExecWithRetry(ctx, `
-		UPDATE messages
+		UPDATE message_state
 		SET custom_flags = jsonb_build_array('$Valid', 'NIL', '$Another')
-		WHERE uid = $1 AND mailbox_id = $2
+		WHERE message_id = (SELECT id FROM messages WHERE uid = $1 AND mailbox_id = $2)
 	`, uid, mailbox.ID)
 	if err != nil {
 		t.Fatalf("Failed to inject NIL flag: %v", err)

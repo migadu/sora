@@ -133,16 +133,24 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 			param, param))
 	}
 
+	// State prefix for fields moved to message_state
+	statePrefix := ""
+	if tablePrefix == "m" {
+		statePrefix = "ms."
+	} else if tablePrefix != "" {
+		statePrefix = tablePrefix + "."
+	}
+
 	// Flags
 	for _, flag := range criteria.Flag {
 		param := nextParam()
 		args[param] = FlagToBitwise(flag)
-		conditions = append(conditions, fmt.Sprintf("(%sflags & @%s) != 0", datePrefix, param))
+		conditions = append(conditions, fmt.Sprintf("(%sflags & @%s) != 0", statePrefix, param))
 	}
 	for _, flag := range criteria.NotFlag {
 		param := nextParam()
 		args[param] = FlagToBitwise(flag)
-		conditions = append(conditions, fmt.Sprintf("(%sflags & @%s) = 0", datePrefix, param))
+		conditions = append(conditions, fmt.Sprintf("(%sflags & @%s) = 0", statePrefix, param))
 	}
 
 	// MODSEQ filtering (CONDSTORE extension - RFC 7162)
@@ -154,7 +162,7 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 		// GREATEST returns the largest non-NULL value
 		conditions = append(conditions, fmt.Sprintf(
 			"GREATEST(%screated_modseq, COALESCE(%supdated_modseq, 0), COALESCE(%sexpunged_modseq, 0)) >= @%s",
-			datePrefix, datePrefix, datePrefix, param))
+			datePrefix, statePrefix, datePrefix, param))
 	}
 
 	// Header conditions
@@ -528,6 +536,8 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 					}
 					if len(mappedUIDSet) > 0 {
 						c.UID = append(c.UID, mappedUIDSet)
+					} else if len(seqSet) > 0 {
+						c.UID = append(c.UID, []imap.UIDRange{{Start: 0, Stop: 0}})
 					}
 				}
 				// Clear the SeqNum criteria since we moved them to UID
@@ -575,11 +585,12 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		const simpleQueryTemplate = `
 		WITH filtered_messages AS (
 			SELECT 
-				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-				m.internal_date, m.size, m.created_modseq, m.updated_modseq, m.expunged_modseq, 
-				m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json,
+				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
+				m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq, 
+				ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
 			FROM messages m
+			LEFT JOIN message_state ms ON ms.message_id = m.id
 			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 			%s
 			LIMIT %d
@@ -613,12 +624,13 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		const complexQueryTemplate = `
 		WITH filtered_messages AS (
 			SELECT 
-				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-				m.internal_date, m.size, m.created_modseq, m.updated_modseq, m.expunged_modseq, 
-				m.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json,
+				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
+				m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq, 
+				ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
 			FROM messages m
 			LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
+			LEFT JOIN message_state ms ON ms.message_id = m.id
 			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 			%s
 			LIMIT %d
@@ -653,13 +665,14 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			SELECT
 				m.id, m.uid,
 				ROW_NUMBER() OVER(ORDER BY uid) as seqnum,
-				m.account_id, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, m.flags, m.custom_flags,
-				m.internal_date, m.size, m.created_modseq, m.updated_modseq, m.expunged_modseq,
-				m.flags_changed_at, m.subject, m.sent_date, m.message_id,
+				m.account_id, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
+				m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq,
+				ms.flags_changed_at, m.subject, m.sent_date, m.message_id,
 				m.in_reply_to, m.recipients_json, mc.text_body_tsv, mc.headers_tsv,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
 			FROM messages m
 			LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
+			LEFT JOIN message_state ms ON ms.message_id = m.id
 			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL
 		)
 		SELECT 
