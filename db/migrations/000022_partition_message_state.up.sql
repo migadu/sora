@@ -4,7 +4,7 @@
 
 BEGIN;
 
-CREATE TABLE message_state (
+CREATE TABLE IF NOT EXISTS message_state (
     message_id BIGINT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
     mailbox_id BIGINT REFERENCES mailboxes(id) ON DELETE CASCADE,
     flags INTEGER NOT NULL DEFAULT 0,
