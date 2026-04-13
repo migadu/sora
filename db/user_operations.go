@@ -80,12 +80,13 @@ func (db *Database) GetUnseenCountForMailbox(ctx context.Context, accountID int6
 	}
 
 	var count int
-	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+	query := fmt.Sprintf(`
 		SELECT COUNT(*) 
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id
-		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL AND (ms.flags & $2) = 0
-	`, mailbox.ID, FlagSeen).Scan(&count)
+		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL AND (ms.flags & %d) = 0
+	`, FlagSeen)
+	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, query, mailbox.ID).Scan(&count)
 
 	if err != nil {
 		return 0, fmt.Errorf("failed to get unseen count: %w", err)
@@ -117,9 +118,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 	argPos := 2
 
 	if unseenOnly {
-		query += fmt.Sprintf(" AND (ms.flags & $%d) = 0", argPos)
-		args = append(args, FlagSeen)
-		argPos++
+		query += fmt.Sprintf(" AND (ms.flags & %d) = 0", FlagSeen)
 	}
 
 	query += " ORDER BY m.internal_date DESC"

@@ -511,15 +511,10 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 		// Create search criteria to get all messages (no filters)
 		criteria := &imap.SearchCriteria{}
 
-		// Create sort criteria to order by internal date descending (most recent first)
-		sortCriteria := []imap.SortCriterion{{
-			Key:     imap.SortKeyArrival,
-			Reverse: true, // Most recent first
-		}}
-
-		// Get the sorted messages (most recent first)
-		// Limit to messageCount to avoid fetching too many messages
-		messages, err := db.GetMessagesSorted(ctx, mailbox.ID, criteria, sortCriteria, messageCount)
+		// Get the most recent messages. Use GetMessagesWithCriteria to trigger the
+		// fast-path ORDER BY uid DESC which operates in O(1) via indices, instead of
+		// forcing a massive in-memory ordering on internal_date.
+		messages, err := db.GetMessagesWithCriteria(ctx, mailbox.ID, criteria, messageCount)
 		if err != nil {
 
 			log.Printf("WarmUp: failed to get recent messages for mailbox '%s': %v", mailboxName, err)

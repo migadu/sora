@@ -652,12 +652,16 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 		// Splitting them prevents the PostgreSQL query planner from creating a suboptimal
 		// nested loop or bitmap heap plan that could timeout on large mailboxes.
 		var firstUnseenUID int64
-		err = d.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		// Inline FlagSeen in the query string so the PostgreSQL query planner
+		// can match the condition against the partial index WHERE (flags & 1) = 0.
+		// Using a parameter ($2) prevents the planner from using the partial index.
+		query := fmt.Sprintf(`
 			SELECT m.uid FROM message_state ms
 			JOIN messages m ON ms.message_id = m.id
-			WHERE ms.mailbox_id = $1 AND (ms.flags & $2) = 0 AND m.expunged_at IS NULL
+			WHERE ms.mailbox_id = $1 AND (ms.flags & %d) = 0 AND m.expunged_at IS NULL
 			ORDER BY ms.message_id ASC LIMIT 1
-		`, mailboxID, FlagSeen).Scan(&firstUnseenUID)
+		`, FlagSeen)
+		err = d.GetReadPoolWithContext(ctx).QueryRow(ctx, query, mailboxID).Scan(&firstUnseenUID)
 
 		if err == nil {
 			err = d.GetReadPoolWithContext(ctx).QueryRow(ctx, `

@@ -50,31 +50,50 @@ func SplitFlags(flags []imap.Flag) (systemFlags []imap.Flag, customKeywords []st
 	return
 }
 
+// resolveMessageID resolves a (mailbox_id, uid) pair to a message_id using
+// the unique index on messages(mailbox_id, uid). This decouples flag updates
+// from the messages table, enabling direct PK updates on message_state
+// without cross-table UPDATE ... FROM joins that cause lock contention
+// under high concurrency.
+func (db *Database) resolveMessageID(ctx context.Context, tx pgx.Tx, messageUID imap.UID, mailboxID int64) (int64, error) {
+	var messageID int64
+	err := tx.QueryRow(ctx, `
+		SELECT id FROM messages
+		WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL
+	`, messageUID, mailboxID).Scan(&messageID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, fmt.Errorf("message UID %d in mailbox %d not found (may be expunged or moved)", messageUID, mailboxID)
+		}
+		return 0, fmt.Errorf("failed to resolve message ID for UID %d in mailbox %d: %w", messageUID, mailboxID, err)
+	}
+	return messageID, nil
+}
+
 // getAllFlagsForMessage retrieves all system and custom flags for a given message.
+// Uses a direct PK lookup on message_state for maximum performance.
 // This function must be called within the same transaction as any preceding update
 // to ensure it reads the latest state.
-func (db *Database) getAllFlagsForMessage(ctx context.Context, tx pgx.Tx, messageUID imap.UID, mailboxID int64) ([]imap.Flag, error) {
+func (db *Database) getAllFlagsForMessage(ctx context.Context, tx pgx.Tx, messageID int64) ([]imap.Flag, error) {
 	var bitwiseFlags int
 	var customFlagsJSON []byte
 	err := tx.QueryRow(ctx, `
-		SELECT ms.flags, ms.custom_flags FROM messages m
-		JOIN message_state ms ON m.id = ms.message_id
-		WHERE m.uid = $1 AND m.mailbox_id = $2 AND m.expunged_at IS NULL
-	`, messageUID, mailboxID).Scan(&bitwiseFlags, &customFlagsJSON)
+		SELECT flags, custom_flags FROM message_state
+		WHERE message_id = $1
+	`, messageID).Scan(&bitwiseFlags, &customFlagsJSON)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Message might have been expunged or doesn't exist.
-			return nil, fmt.Errorf("message UID %d in mailbox %d not found: %w", messageUID, mailboxID, err)
+			return nil, fmt.Errorf("message_state for message %d not found: %w", messageID, err)
 		}
-		return nil, fmt.Errorf("failed to get flags for message UID %d in mailbox %d: %w", messageUID, mailboxID, err)
+		return nil, fmt.Errorf("failed to get flags for message %d: %w", messageID, err)
 	}
 
 	allFlags := BitwiseToFlags(bitwiseFlags)
 	var customKeywords []string
 	if err := json.Unmarshal(customFlagsJSON, &customKeywords); err != nil {
-		log.Printf("Database: error unmarshalling custom_flags for UID %d (mailbox %d): %v. JSON: %s", messageUID, mailboxID, err, string(customFlagsJSON))
-		return nil, fmt.Errorf("failed to unmarshal custom_flags for UID %d (mailbox %d): %w", messageUID, mailboxID, err)
+		log.Printf("Database: error unmarshalling custom_flags for message %d: %v. JSON: %s", messageID, err, string(customFlagsJSON))
+		return nil, fmt.Errorf("failed to unmarshal custom_flags for message %d: %w", messageID, err)
 	}
 
 	// Convert custom keywords to imap.Flag and sanitize to remove invalid values
@@ -98,6 +117,12 @@ func (db *Database) SetMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 		metrics.DBQueriesTotal.WithLabelValues("flags_set", status, "write").Inc()
 	}()
 
+	// Resolve message_id once, then use direct PK updates on message_state
+	messageID, err := db.resolveMessageID(ctx, tx, messageUID, mailboxID)
+	if err != nil {
+		return nil, 0, err
+	}
+
 	systemFlagsToSet, customKeywordsToSet := SplitFlags(newFlags)
 	bitwiseSystemFlags := FlagsToBitwise(systemFlagsToSet)
 	customKeywordsJSON, err := json.Marshal(customKeywordsToSet)
@@ -105,17 +130,16 @@ func (db *Database) SetMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 		return nil, 0, fmt.Errorf("failed to marshal custom keywords for SetMessageFlags: %w", err)
 	}
 	err = tx.QueryRow(ctx, `
-		UPDATE message_state ms
+		UPDATE message_state
 		SET flags = $1, custom_flags = $2, flags_changed_at = $3, updated_modseq = nextval('messages_modseq')
-		FROM messages m
-		WHERE ms.message_id = m.id AND m.uid = $4 AND ms.mailbox_id = $5 AND m.expunged_at IS NULL
-		RETURNING COALESCE(ms.updated_modseq, m.created_modseq)
-	`, bitwiseSystemFlags, customKeywordsJSON, time.Now(), messageUID, mailboxID).Scan(&modSeq)
+		WHERE message_id = $4
+		RETURNING updated_modseq
+	`, bitwiseSystemFlags, customKeywordsJSON, time.Now(), messageID).Scan(&modSeq)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to execute set message flags for UID %d in mailbox %d: %w", messageUID, mailboxID, err)
 	}
 
-	currentFlags, err := db.getAllFlagsForMessage(ctx, tx, messageUID, mailboxID)
+	currentFlags, err := db.getAllFlagsForMessage(ctx, tx, messageID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -124,6 +148,12 @@ func (db *Database) SetMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 }
 
 func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
+	// Resolve message_id once, then use direct PK updates on message_state
+	messageID, err := db.resolveMessageID(ctx, tx, messageUID, mailboxID)
+	if err != nil {
+		return nil, 0, err
+	}
+
 	systemFlagsToAdd, customKeywordsToAdd := SplitFlags(newFlags)
 	hasCustom := len(customKeywordsToAdd) > 0
 	var finalModSeq int64
@@ -134,11 +164,10 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 		if hasCustom {
 			// Custom keywords update follows — skip modseq bump here to avoid double increment
 			ct, execErr := tx.Exec(ctx, `
-				UPDATE message_state ms
-				SET flags = ms.flags | $1, flags_changed_at = $2
-				FROM messages m
-				WHERE ms.message_id = m.id AND m.uid = $3 AND ms.mailbox_id = $4 AND m.expunged_at IS NULL
-			`, bitwiseSystemFlagsToAdd, time.Now(), messageUID, mailboxID)
+				UPDATE message_state
+				SET flags = flags | $1, flags_changed_at = $2
+				WHERE message_id = $3
+			`, bitwiseSystemFlagsToAdd, time.Now(), messageID)
 			if execErr != nil {
 				return nil, 0, fmt.Errorf("failed to add system flags for UID %d: %w", messageUID, execErr)
 			}
@@ -148,12 +177,11 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 		} else {
 			// Only system flags to update — bump modseq here
 			err = tx.QueryRow(ctx, `
-				UPDATE message_state ms
-				SET flags = ms.flags | $1, flags_changed_at = $2, updated_modseq = nextval('messages_modseq')
-				FROM messages m
-				WHERE ms.message_id = m.id AND m.uid = $3 AND ms.mailbox_id = $4 AND m.expunged_at IS NULL
-				RETURNING COALESCE(ms.updated_modseq, m.created_modseq)
-			`, bitwiseSystemFlagsToAdd, time.Now(), messageUID, mailboxID).Scan(&finalModSeq)
+				UPDATE message_state
+				SET flags = flags | $1, flags_changed_at = $2, updated_modseq = nextval('messages_modseq')
+				WHERE message_id = $3
+				RETURNING updated_modseq
+			`, bitwiseSystemFlagsToAdd, time.Now(), messageID).Scan(&finalModSeq)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
 					return nil, 0, fmt.Errorf("message UID %d in mailbox %d not found (may be expunged or moved)", messageUID, mailboxID)
@@ -167,19 +195,18 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 	if hasCustom {
 		// This is always the last update — bump modseq here
 		err = tx.QueryRow(ctx, `
-			UPDATE message_state ms
+			UPDATE message_state
 			SET custom_flags = (
-				SELECT COALESCE(jsonb_agg(DISTINCT flag_element ORDER BY flag_element), '[]'::jsonb) -- ORDER BY for deterministic output if needed
+				SELECT COALESCE(jsonb_agg(DISTINCT flag_element ORDER BY flag_element), '[]'::jsonb)
 				FROM (
-					SELECT jsonb_array_elements_text(ms2.custom_flags) AS flag_element FROM message_state ms2 WHERE ms2.message_id = ms.message_id
+					SELECT jsonb_array_elements_text(message_state.custom_flags) AS flag_element
 					UNION ALL
-					SELECT unnest($3::text[]) AS flag_element
+					SELECT unnest($2::text[]) AS flag_element
 				) AS combined_flags
-			), flags_changed_at = $4, updated_modseq = nextval('messages_modseq')
-			FROM messages m
-			WHERE ms.message_id = m.id AND m.uid = $1 AND ms.mailbox_id = $2 AND m.expunged_at IS NULL
-			RETURNING COALESCE(ms.updated_modseq, m.created_modseq)
-		`, messageUID, mailboxID, customKeywordsToAdd, time.Now()).Scan(&finalModSeq)
+			), flags_changed_at = $3, updated_modseq = nextval('messages_modseq')
+			WHERE message_id = $1
+			RETURNING updated_modseq
+		`, messageID, customKeywordsToAdd, time.Now()).Scan(&finalModSeq)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, 0, fmt.Errorf("message UID %d in mailbox %d not found (may be expunged or moved)", messageUID, mailboxID)
@@ -194,7 +221,7 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 		return nil, 0, fmt.Errorf("no flags to add for UID %d", messageUID)
 	}
 
-	currentFlags, err := db.getAllFlagsForMessage(ctx, tx, messageUID, mailboxID)
+	currentFlags, err := db.getAllFlagsForMessage(ctx, tx, messageID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -203,6 +230,12 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 }
 
 func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUID imap.UID, mailboxID int64, flagsToRemove []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
+	// Resolve message_id once, then use direct PK updates on message_state
+	messageID, err := db.resolveMessageID(ctx, tx, messageUID, mailboxID)
+	if err != nil {
+		return nil, 0, err
+	}
+
 	systemFlagsToRemove, customKeywordsToRemove := SplitFlags(flagsToRemove)
 	var finalModSeq int64
 	var hasUpdate bool
@@ -215,11 +248,10 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUI
 		if hasCustom {
 			// Custom keywords update follows — skip modseq bump here to avoid double increment
 			ct, execErr := tx.Exec(ctx, `
-				UPDATE message_state ms
-				SET flags = ms.flags & $1, flags_changed_at = $2
-				FROM messages m
-				WHERE ms.message_id = m.id AND m.uid = $3 AND ms.mailbox_id = $4 AND m.expunged_at IS NULL
-			`, negatedSystemFlags, time.Now(), messageUID, mailboxID)
+				UPDATE message_state
+				SET flags = flags & $1, flags_changed_at = $2
+				WHERE message_id = $3
+			`, negatedSystemFlags, time.Now(), messageID)
 			if execErr != nil {
 				return nil, 0, fmt.Errorf("failed to remove system flags for UID %d: %w", messageUID, execErr)
 			}
@@ -229,12 +261,11 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUI
 		} else {
 			// Only system flags to update — bump modseq here
 			err = tx.QueryRow(ctx, `
-				UPDATE message_state ms
-				SET flags = ms.flags & $1, flags_changed_at = $2, updated_modseq = nextval('messages_modseq')
-				FROM messages m
-				WHERE ms.message_id = m.id AND m.uid = $3 AND ms.mailbox_id = $4 AND m.expunged_at IS NULL
-				RETURNING COALESCE(ms.updated_modseq, m.created_modseq)
-			`, negatedSystemFlags, time.Now(), messageUID, mailboxID).Scan(&finalModSeq)
+				UPDATE message_state
+				SET flags = flags & $1, flags_changed_at = $2, updated_modseq = nextval('messages_modseq')
+				WHERE message_id = $3
+				RETURNING updated_modseq
+			`, negatedSystemFlags, time.Now(), messageID).Scan(&finalModSeq)
 			if err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
 					return nil, 0, fmt.Errorf("message UID %d in mailbox %d not found (may be expunged or moved)", messageUID, mailboxID)
@@ -248,13 +279,12 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUI
 	if hasCustom {
 		// This is always the last update — bump modseq here
 		err = tx.QueryRow(ctx, `
-			UPDATE message_state ms
-			SET custom_flags = ms.custom_flags - $3::text[],
-			    flags_changed_at = $4, updated_modseq = nextval('messages_modseq')
-			FROM messages m
-			WHERE ms.message_id = m.id AND m.uid = $1 AND ms.mailbox_id = $2 AND m.expunged_at IS NULL
-			RETURNING COALESCE(ms.updated_modseq, m.created_modseq)
-		`, messageUID, mailboxID, customKeywordsToRemove, time.Now()).Scan(&finalModSeq)
+			UPDATE message_state
+			SET custom_flags = custom_flags - $2::text[],
+			    flags_changed_at = $3, updated_modseq = nextval('messages_modseq')
+			WHERE message_id = $1
+			RETURNING updated_modseq
+		`, messageID, customKeywordsToRemove, time.Now()).Scan(&finalModSeq)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, 0, fmt.Errorf("message UID %d in mailbox %d not found (may be expunged or moved)", messageUID, mailboxID)
@@ -269,7 +299,7 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUI
 		return nil, 0, fmt.Errorf("no flags to remove for UID %d", messageUID)
 	}
 
-	currentFlags, err := db.getAllFlagsForMessage(ctx, tx, messageUID, mailboxID)
+	currentFlags, err := db.getAllFlagsForMessage(ctx, tx, messageID)
 	if err != nil {
 		return nil, 0, err
 	}
