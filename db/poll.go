@@ -140,69 +140,56 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	}
 
 	// Phase 2: Dynamic Sequence Hydration
-	uids := make([]uint32, len(rawUpdates))
-	for i, u := range rawUpdates {
-		uids[i] = uint32(u.UID)
+	// We use an optimized sequential stream. The sparse correlated subquery path is entirely
+	// removed because it results in O(K * N) tuple scans, causing major performance degradation for
+	// mailboxes with many messages. A sequential stream of the UID and expunged_at columns requires
+	// only a single Index-Only scan, running in O(N) time but mapping with O(K) memory.
+
+	interestedUIDs := make(map[uint32]bool, len(rawUpdates))
+	for _, u := range rawUpdates {
+		interestedUIDs[uint32(u.UID)] = true
 	}
+	seqMap := make(map[uint32]uint32, len(rawUpdates))
 
-	seqMap := make(map[uint32]uint32)
+	// OPTIMIZATION: We select expunged_modseq instead of expunged_at. Since expunged_modseq
+	// is NULL when expunged_at is NULL, the logical evaluation is identical. This allows
+	// PostgreSQL to fulfill the query utilizing an Index-Only Scan on the covering index
+	// idx_messages_mailbox_uid_expunged_modseq without ever reading heap table data.
+	seqRows, err := db.GetReadPool().Query(ctx, `
+		SELECT uid, expunged_modseq
+		FROM messages
+		WHERE mailbox_id = $1 AND (expunged_modseq IS NULL OR expunged_modseq > $2)
+		ORDER BY uid ASC
+	`, mailboxID, sinceModSeq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query sequences: %w", err)
+	}
+	defer seqRows.Close()
 
-	if sinceModSeq > 0 && len(rawUpdates) <= 50 {
-		// SPARSE PATH: Evaluate correlation strictly for the requested UIDs
-		seqRows, err := db.GetReadPool().Query(ctx, `
-			SELECT m.uid,
-			  (SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = $1 AND m2.uid <= m.uid AND m2.expunged_at IS NULL) as active_seq,
-			  (SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = $1 AND m2.uid <= m.uid AND m2.expunged_modseq > $2) as exp_offset
-			FROM messages m
-			WHERE m.mailbox_id = $1 AND m.uid = ANY($3)
-		`, mailboxID, sinceModSeq, uids)
-		if err != nil {
-			return nil, fmt.Errorf("failed to map sparse sequence numbers: %w", err)
+	activeCount := uint32(0)
+	expungedOffset := uint32(0)
+
+	for seqRows.Next() {
+		var uid uint32
+		var exp sql.NullInt64
+		if err := seqRows.Scan(&uid, &exp); err != nil {
+			return nil, fmt.Errorf("failed to scan sequence row: %w", err)
 		}
-		defer seqRows.Close()
-
-		for seqRows.Next() {
-			var uid, active, offset uint32
-			if err := seqRows.Scan(&uid, &active, &offset); err != nil {
-				return nil, fmt.Errorf("failed to scan sparse sequence: %w", err)
-			}
-			seqMap[uid] = active + offset
+		if !exp.Valid {
+			activeCount++
+		} else {
+			expungedOffset++
 		}
-		if err := seqRows.Err(); err != nil {
-			return nil, fmt.Errorf("error in sparse hydration: %w", err)
-		}
-	} else {
-		// DENSE PATH: Stream the entire active block sequentially without memory CTEs
-		seqRows, err := db.GetReadPool().Query(ctx, `
-			SELECT uid, expunged_at
-			FROM messages
-			WHERE mailbox_id = $1 AND (expunged_at IS NULL OR expunged_modseq > $2)
-			ORDER BY uid ASC
-		`, mailboxID, sinceModSeq)
-		if err != nil {
-			return nil, fmt.Errorf("failed to query dense sequences: %w", err)
-		}
-		defer seqRows.Close()
 
-		activeCount := uint32(0)
-		expungedOffset := uint32(0)
-
-		for seqRows.Next() {
-			var uid uint32
-			var exp sql.NullTime
-			if err := seqRows.Scan(&uid, &exp); err != nil {
-				return nil, fmt.Errorf("failed to scan dense sequence row: %w", err)
-			}
-			if !exp.Valid {
-				activeCount++
-			} else {
-				expungedOffset++
-			}
+		if interestedUIDs[uid] {
 			seqMap[uid] = activeCount + expungedOffset
+			if len(seqMap) == len(interestedUIDs) {
+				break // Early exit: all modified messages mapped
+			}
 		}
-		if err := seqRows.Err(); err != nil {
-			return nil, fmt.Errorf("error iterating dense sequences: %w", err)
-		}
+	}
+	if err := seqRows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating sequences: %w", err)
 	}
 
 	for i := range rawUpdates {
