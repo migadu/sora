@@ -91,7 +91,7 @@ BEGIN
                 MAX(mb.modseq_val) AS max_modseq
             FROM old_table o
             JOIN new_table n ON o.id = n.id
-            LEFT JOIN message_state ms ON ms.message_id = n.id
+            LEFT JOIN message_state ms ON ms.message_id = n.id AND ms.mailbox_id = o.mailbox_id
             CROSS JOIN LATERAL (
                 SELECT o.mailbox_id AS mailbox_id,
                        -1 AS count_delta,
@@ -159,7 +159,7 @@ BEGIN
                    SUM(1 - (ms.flags & 1)) AS unseen_delta,
                    MAX(ms.updated_modseq) AS modseq_val
             FROM new_table ms
-            JOIN messages m ON m.id = ms.message_id
+            JOIN messages m ON m.id = ms.message_id AND m.mailbox_id = ms.mailbox_id
             WHERE m.expunged_at IS NULL AND ms.mailbox_id IS NOT NULL
             GROUP BY ms.mailbox_id
         )
@@ -191,7 +191,7 @@ BEGIN
             SELECT ms.mailbox_id,
                    SUM(1 - (ms.flags & 1)) AS unseen_delta
             FROM old_table ms
-            JOIN messages m ON m.id = ms.message_id
+            JOIN messages m ON m.id = ms.message_id AND m.mailbox_id = ms.mailbox_id
             WHERE m.expunged_at IS NULL AND ms.mailbox_id IS NOT NULL
             GROUP BY ms.mailbox_id
         )
@@ -208,7 +208,7 @@ BEGIN
                 MAX(n.updated_modseq) AS modseq_val
             FROM old_table o
             JOIN new_table n ON o.message_id = n.message_id
-            JOIN messages m ON m.id = n.message_id
+            JOIN messages m ON m.id = n.message_id AND m.mailbox_id = n.mailbox_id
             WHERE m.expunged_at IS NULL AND n.mailbox_id IS NOT NULL AND n.flags IS DISTINCT FROM o.flags
             GROUP BY n.mailbox_id
         )

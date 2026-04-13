@@ -66,9 +66,15 @@ BEGIN
         changes_with_flags AS (
             SELECT 
                 c.*,
-                COALESCE(ms.flags & 1, 0) AS seen_flag
+                CASE 
+                    WHEN c.was_active OR c.is_active THEN (
+                        SELECT COALESCE(ms.flags & 1, 0)
+                        FROM message_state ms
+                        WHERE ms.message_id = c.message_id AND ms.mailbox_id = c.old_mailbox_id
+                    )
+                    ELSE 0
+                END AS seen_flag
             FROM relevant_changes c
-            JOIN message_state ms ON ms.message_id = c.message_id
         ),
         deltas AS (
             -- Subtractions from old mailbox (expunge or move)
