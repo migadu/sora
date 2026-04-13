@@ -449,6 +449,29 @@ func (db *Database) needsComplexQuery(criteria *imap.SearchCriteria, orderByClau
 	return false
 }
 
+// needsIndexScanBiasBuster checks if the target query contains unstructured text filters
+// (such as LIKE '%...%' or FTS) that benefit from Postgres's bitmap heap scanning over
+// falling back to a naive backward streaming index scan.
+func (db *Database) needsIndexScanBiasBuster(criteria *imap.SearchCriteria) bool {
+	if criteria == nil {
+		return false
+	}
+	if len(criteria.Text) > 0 || len(criteria.Body) > 0 || len(criteria.Header) > 0 {
+		return true
+	}
+	for _, notCriteria := range criteria.Not {
+		if db.needsIndexScanBiasBuster(&notCriteria) {
+			return true
+		}
+	}
+	for _, orPair := range criteria.Or {
+		if db.needsIndexScanBiasBuster(&orPair[0]) || db.needsIndexScanBiasBuster(&orPair[1]) {
+			return true
+		}
+	}
+	return false
+}
+
 // getMessagesQueryExecutor is a helper function to execute the message retrieval query,
 // handling both default and custom sorting with optimized query selection.
 func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, orderByClause string, limit int) ([]Message, error) {
@@ -606,9 +629,12 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		// Neutralize the "Limit + Order By" backward index scan bias for non-FTS queries.
 		// A memory sort of a single mailbox's rows takes <30ms, but streaming the mailbox
 		// backward to find a massive needle-in-haystack (e.g. Header searches) times out at 5s.
-		innerOrderByClause := strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
-		if innerOrderByClause == orderByClause {
-			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+		innerOrderByClause := orderByClause
+		if db.needsIndexScanBiasBuster(criteria) {
+			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+			if innerOrderByClause == orderByClause {
+				innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+			}
 		}
 
 		// Note: The ordering clause uses "m." prefix initially, but we need it to use "f." for the outer query
@@ -653,9 +679,12 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			FROM filtered_messages f
 			%s`
 
-		innerOrderByClause := strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
-		if innerOrderByClause == orderByClause {
-			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+		innerOrderByClause := orderByClause
+		if db.needsIndexScanBiasBuster(criteria) {
+			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+			if innerOrderByClause == orderByClause {
+				innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+			}
 		}
 
 		outerOrderByClause := strings.ReplaceAll(orderByClause, "m.", "f.")
@@ -691,9 +720,12 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
 		LEFT JOIN message_state ms ON ms.message_id = m.id`
 
-		innerOrderByClause := strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
-		if innerOrderByClause == orderByClause {
-			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+		innerOrderByClause := orderByClause
+		if db.needsIndexScanBiasBuster(criteria) {
+			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+			if innerOrderByClause == orderByClause {
+				innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+			}
 		}
 		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, innerOrderByClause, resultLimit)
 		metricsLabel = "search_messages_complex_legacy"
