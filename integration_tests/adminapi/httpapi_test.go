@@ -1402,39 +1402,59 @@ func TestMessageRestoration(t *testing.T) {
 	// 3. Create and delete test messages directly in database
 	// Insert message 1 in INBOX (with \Seen flag = 1)
 	var msgID1, msgID2, msgID3 int64
+	var inboxID int64
 	err = server.rdb.GetDatabase().GetWritePool().QueryRow(ctx,
-		`INSERT INTO messages (account_id, mailbox_id, mailbox_path, uid, s3_domain, s3_localpart, content_hash,
-		 subject, message_id, recipients_json, body_structure, internal_date, sent_date, size, flags,
-		 created_modseq, expunged_at)
-		 VALUES ($1, (SELECT id FROM mailboxes WHERE account_id = $1 AND name = 'INBOX'), 'INBOX', 1,
-		 'test', 'test1', 'test-hash-1', 'Test message 1', '<msg1@test.com>', '[]'::jsonb, ''::bytea,
-		 NOW(), NOW(), 100, 1, 1, NOW())
-		 RETURNING id`, accountID).Scan(&msgID1)
+		`SELECT id FROM mailboxes WHERE account_id = $1 AND name = 'INBOX'`, accountID).Scan(&inboxID)
+	if err != nil {
+		t.Fatalf("Failed to get INBOX ID: %v", err)
+	}
+
+	err = server.rdb.GetDatabase().GetWritePool().QueryRow(ctx,
+		`WITH inserted AS (
+			INSERT INTO messages (account_id, mailbox_id, mailbox_path, uid, s3_domain, s3_localpart, content_hash,
+			 subject, message_id, recipients_json, body_structure, internal_date, sent_date, size,
+			 created_modseq, expunged_at)
+			 VALUES ($1, $2, 'INBOX', 1, 'test', 'test1', 'test-hash-1', 'Test message 1', '<msg1@test.com>',
+			 '[]'::jsonb, ''::bytea, NOW(), NOW(), 100, 1, NOW())
+			RETURNING id
+		)
+		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
+		SELECT id, $2, 1, '[]'::jsonb, NOW(), nextval('messages_modseq') FROM inserted
+		RETURNING message_id`, accountID, inboxID).Scan(&msgID1)
 	if err != nil {
 		t.Fatalf("Failed to insert message 1: %v", err)
 	}
 
 	// Insert message 2 in INBOX (no flags)
 	err = server.rdb.GetDatabase().GetWritePool().QueryRow(ctx,
-		`INSERT INTO messages (account_id, mailbox_id, mailbox_path, uid, s3_domain, s3_localpart, content_hash,
-		 subject, message_id, recipients_json, body_structure, internal_date, sent_date, size, flags,
-		 created_modseq, expunged_at)
-		 VALUES ($1, (SELECT id FROM mailboxes WHERE account_id = $1 AND name = 'INBOX'), 'INBOX', 2,
-		 'test', 'test2', 'test-hash-2', 'Test message 2', '<msg2@test.com>', '[]'::jsonb, ''::bytea,
-		 NOW(), NOW(), 200, 0, 2, NOW())
-		 RETURNING id`, accountID).Scan(&msgID2)
+		`WITH inserted AS (
+			INSERT INTO messages (account_id, mailbox_id, mailbox_path, uid, s3_domain, s3_localpart, content_hash,
+			 subject, message_id, recipients_json, body_structure, internal_date, sent_date, size,
+			 created_modseq, expunged_at)
+			 VALUES ($1, $2, 'INBOX', 2, 'test', 'test2', 'test-hash-2', 'Test message 2', '<msg2@test.com>',
+			 '[]'::jsonb, ''::bytea, NOW(), NOW(), 200, 2, NOW())
+			RETURNING id
+		)
+		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
+		SELECT id, $2, 0, '[]'::jsonb, NOW(), nextval('messages_modseq') FROM inserted
+		RETURNING message_id`, accountID, inboxID).Scan(&msgID2)
 	if err != nil {
 		t.Fatalf("Failed to insert message 2: %v", err)
 	}
 
 	// Insert message 3 in Archive (with \Flagged flag = 4)
 	err = server.rdb.GetDatabase().GetWritePool().QueryRow(ctx,
-		`INSERT INTO messages (account_id, mailbox_id, mailbox_path, uid, s3_domain, s3_localpart, content_hash,
-		 subject, message_id, recipients_json, body_structure, internal_date, sent_date, size, flags,
-		 created_modseq, expunged_at)
-		 VALUES ($1, $2, 'INBOX/Archive', 1, 'test', 'test3', 'test-hash-3', 'Test message 3', '<msg3@test.com>',
-		 '[]'::jsonb, ''::bytea, NOW(), NOW(), 300, 4, 3, NOW())
-		 RETURNING id`, accountID, archiveID).Scan(&msgID3)
+		`WITH inserted AS (
+			INSERT INTO messages (account_id, mailbox_id, mailbox_path, uid, s3_domain, s3_localpart, content_hash,
+			 subject, message_id, recipients_json, body_structure, internal_date, sent_date, size,
+			 created_modseq, expunged_at)
+			 VALUES ($1, $2, 'INBOX/Archive', 1, 'test', 'test3', 'test-hash-3', 'Test message 3', '<msg3@test.com>',
+			 '[]'::jsonb, ''::bytea, NOW(), NOW(), 300, 3, NOW())
+			RETURNING id
+		)
+		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
+		SELECT id, $2, 4, '[]'::jsonb, NOW(), nextval('messages_modseq') FROM inserted
+		RETURNING message_id`, accountID, archiveID).Scan(&msgID3)
 	if err != nil {
 		t.Fatalf("Failed to insert message 3: %v", err)
 	}
@@ -1547,12 +1567,17 @@ func TestMessageRestoration(t *testing.T) {
 		// Insert another deleted message in Archive
 		var msgID4 int64
 		err := server.rdb.GetDatabase().GetWritePool().QueryRow(ctx,
-			`INSERT INTO messages (account_id, mailbox_id, mailbox_path, uid, s3_domain, s3_localpart, content_hash,
-			 subject, message_id, recipients_json, body_structure, internal_date, sent_date, size, flags,
-			 created_modseq, expunged_at)
-			 VALUES ($1, $2, 'INBOX/Archive', 2, 'test', 'test4', 'test-hash-4', 'Test message 4', '<msg4@test.com>',
-			 '[]'::jsonb, ''::bytea, NOW(), NOW(), 400, 0, 4, NOW())
-			 RETURNING id`, accountID, archiveID).Scan(&msgID4)
+			`WITH inserted AS (
+				INSERT INTO messages (account_id, mailbox_id, mailbox_path, uid, s3_domain, s3_localpart, content_hash,
+				 subject, message_id, recipients_json, body_structure, internal_date, sent_date, size,
+				 created_modseq, expunged_at)
+				 VALUES ($1, $2, 'INBOX/Archive', 2, 'test', 'test4', 'test-hash-4', 'Test message 4', '<msg4@test.com>',
+				 '[]'::jsonb, ''::bytea, NOW(), NOW(), 400, 4, NOW())
+				RETURNING id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
+			SELECT id, $2, 0, '[]'::jsonb, NOW(), nextval('messages_modseq') FROM inserted
+			RETURNING message_id`, accountID, archiveID).Scan(&msgID4)
 		if err != nil {
 			t.Fatalf("Failed to insert message 4: %v", err)
 		}

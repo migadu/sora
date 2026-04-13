@@ -603,10 +603,9 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			FROM filtered_messages f
 			%s`
 
-		// Neutralize the "Limit + Order By" backward index scan bias.
-		// By injecting "+ 0", we implicitly decouple the inner CTE from the uid index,
-		// forcing the planner to evaluate highly selective WHERE clauses natively via
-		// Bitmap/FTS scans before sorting, stopping catastrophic streaming timeouts.
+		// Neutralize the "Limit + Order By" backward index scan bias for non-FTS queries.
+		// A memory sort of a single mailbox's rows takes <30ms, but streaming the mailbox
+		// backward to find a massive needle-in-haystack (e.g. Header searches) times out at 5s.
 		innerOrderByClause := strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
 		if innerOrderByClause == orderByClause {
 			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
@@ -640,7 +639,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 					ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json,
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
 				FROM messages m
-				INNER JOIN messages_fts mc ON m.content_hash = mc.content_hash
+				LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
 				LEFT JOIN message_state ms ON ms.message_id = m.id
 				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 				%s
@@ -654,13 +653,8 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			FROM filtered_messages f
 			%s`
 
-		innerOrderByClause := strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
-		if innerOrderByClause == orderByClause {
-			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
-		}
-
 		outerOrderByClause := strings.ReplaceAll(orderByClause, "m.", "f.")
-		finalQueryString = fmt.Sprintf(complexQueryTemplate, whereCondition, innerOrderByClause, resultLimit, outerOrderByClause)
+		finalQueryString = fmt.Sprintf(complexQueryTemplate, whereCondition, orderByClause, resultLimit, outerOrderByClause)
 		metricsLabel = "search_messages_complex_fast"
 
 	} else {
@@ -680,27 +674,19 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		WITH message_seqs AS (
 			SELECT
 				m.id, m.uid,
-				ROW_NUMBER() OVER(ORDER BY uid) as seqnum,
-				m.account_id, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
-				m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq,
-				ms.flags_changed_at, m.subject, m.sent_date, m.message_id,
-				m.in_reply_to, m.recipients_json, mc.text_body_tsv, mc.headers_tsv,
-				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
+				ROW_NUMBER() OVER(ORDER BY uid) as seqnum
 			FROM messages m
-			LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
-			LEFT JOIN message_state ms ON ms.message_id = m.id
 			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL
 		)
 		SELECT 
-			id, account_id, uid, mailbox_id, content_hash, s3_domain, s3_localpart, uploaded, flags, custom_flags,
-			internal_date, size, created_modseq, updated_modseq, expunged_modseq, seqnum,
-			flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
-		FROM message_seqs`
-		innerOrderByClause := strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
-		if innerOrderByClause == orderByClause {
-			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
-		}
-		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, innerOrderByClause, resultLimit)
+			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
+			m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq, seq.seqnum,
+			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+		FROM message_seqs seq
+		INNER JOIN messages m ON m.id = seq.id
+		LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+		LEFT JOIN message_state ms ON ms.message_id = m.id`
+		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, orderByClause, resultLimit)
 		metricsLabel = "search_messages_complex_legacy"
 	}
 
@@ -716,14 +702,20 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 	metrics.DBQueriesTotal.WithLabelValues(metricsLabel, status, "read").Inc()
 
 	if err != nil {
-		logger.Error("Database: failed executing query", "query", finalQueryString, "args", whereArgs, "err", err)
+		logger.Error("Database: failed executing query", "query", finalQueryString, "args", whereArgs, "err", err, "duration", time.Since(start))
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
 	defer rows.Close()
 
+	scanStart := time.Now()
 	messages, err := scanMessages(rows, false)
+	scanDuration := time.Since(scanStart)
 	if err != nil {
+		logger.Error("Database: failed scanning messages", "err", err, "scan_duration", scanDuration, "query_duration", time.Since(start), "mailbox_id", mailboxID)
 		return nil, fmt.Errorf("getMessagesQueryExecutor: failed to scan messages: %w", err)
+	}
+	if scanDuration > 5*time.Second {
+		logger.Warn("Database: slow message scan detected", "scan_duration", scanDuration, "row_count", len(messages), "mailbox_id", mailboxID, "query_type", metricsLabel)
 	}
 
 	// Dynamic sequence hydration (O(1) mapped iteration rather than PostgreSQL quadratic windowing)
