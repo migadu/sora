@@ -35,8 +35,7 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID
 		WITH updated AS (
 			UPDATE messages m
 			SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
-			FROM unnest($2::bigint[]) AS t(uid)
-			WHERE m.mailbox_id = $1 AND m.uid = t.uid AND m.expunged_at IS NULL
+			WHERE m.mailbox_id = $1 AND m.uid = ANY($2::bigint[]) AND m.expunged_at IS NULL
 			RETURNING expunged_modseq
 		)
 		SELECT COUNT(*), COALESCE(MAX(expunged_modseq), 0)

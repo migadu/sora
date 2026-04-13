@@ -66,15 +66,10 @@ BEGIN
         changes_with_flags AS (
             SELECT 
                 c.*,
-                CASE 
-                    WHEN c.was_active OR c.is_active THEN (
-                        SELECT COALESCE(ms.flags & 1, 0)
-                        FROM message_state ms
-                        WHERE ms.message_id = c.message_id AND ms.mailbox_id = c.old_mailbox_id
-                    )
-                    ELSE 0
-                END AS seen_flag
+                COALESCE(ms.flags & 1, 0) AS seen_flag
             FROM relevant_changes c
+            LEFT JOIN message_state ms ON ms.message_id = c.message_id AND ms.mailbox_id = c.old_mailbox_id
+            WHERE c.was_active OR c.is_active
         ),
         deltas AS (
             -- Subtractions from old mailbox (expunge or move)
@@ -104,13 +99,14 @@ BEGIN
             UNION ALL
             
             -- Modseq updates for pure expunges
+            -- We can read directly from relevant_changes for this batch because we don't need seen_flag
             SELECT 
                 new_mailbox_id AS mailbox_id,
                 0 AS count_delta,
                 0 AS unseen_delta,
                 0::BIGINT AS size_delta,
                 MAX(expunged_modseq) AS max_modseq
-            FROM changes_with_flags
+            FROM relevant_changes
             WHERE is_active = false AND was_active = true
             GROUP BY new_mailbox_id
         ),
