@@ -99,20 +99,27 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 				SELECT COALESCE(MIN(uid), 0) AS min_uid, COALESCE(MAX(uid), 0) AS max_uid FROM changed_messages_raw
 			  ),
 			  base_count AS (
-				SELECT COUNT(*) as alive_base FROM messages m, bounds b
-				WHERE m.mailbox_id = $1 AND m.uid < b.min_uid AND m.expunged_at IS NULL
+				SELECT COUNT(*) as alive_base
+				FROM messages m
+				WHERE m.mailbox_id = $1
+				  AND m.uid < (SELECT min_uid FROM bounds)
+				  AND m.expunged_at IS NULL
 			  ),
 			  base_expunged_count AS (
-				SELECT COUNT(*) as expunged_base FROM messages m, bounds b
-				WHERE m.mailbox_id = $1 AND m.uid < b.min_uid AND m.expunged_modseq > $2
+				SELECT COUNT(*) as expunged_base
+				FROM messages m
+				WHERE m.mailbox_id = $1
+				  AND m.uid < (SELECT min_uid FROM bounds)
+				  AND m.expunged_modseq > $2
 			  ),
 			  range_counts AS (
-				SELECT 
-					m.uid, 
+				SELECT
+					m.uid,
 					COUNT(CASE WHEN m.expunged_at IS NULL THEN 1 END) OVER(ORDER BY m.uid ASC) as alive_offset,
 					COUNT(CASE WHEN m.expunged_modseq > $2 THEN 1 END) OVER(ORDER BY m.uid ASC) as expunged_offset
-				FROM messages m, bounds b
-				WHERE m.mailbox_id = $1 AND m.uid BETWEEN b.min_uid AND b.max_uid 
+				FROM messages m
+				WHERE m.mailbox_id = $1
+				  AND m.uid BETWEEN (SELECT min_uid FROM bounds) AND (SELECT max_uid FROM bounds)
 				  AND (m.expunged_at IS NULL OR m.expunged_modseq > $2)
 			  ),
 			  -- 2. Calculate their sequence numbers dynamically using bounded window functions

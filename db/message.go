@@ -185,13 +185,18 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 			SELECT COALESCE(MIN(uid), 0) as min_uid, COALESCE(MAX(uid), 0) as max_uid FROM filtered_messages
 		),
 		base_count AS (
-			SELECT COUNT(*) as base FROM messages m, bounds b
-			WHERE m.mailbox_id = $1 AND m.uid < b.min_uid AND m.expunged_at IS NULL
+			SELECT COUNT(*) as base
+			FROM messages m
+			WHERE m.mailbox_id = $1
+			  AND m.uid < (SELECT min_uid FROM bounds)
+			  AND m.expunged_at IS NULL
 		),
 		range_counts AS (
 			SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid ASC) as offset
-			FROM messages m, bounds b
-			WHERE m.mailbox_id = $1 AND m.uid BETWEEN b.min_uid AND b.max_uid AND m.expunged_at IS NULL
+			FROM messages m
+			WHERE m.mailbox_id = $1
+			  AND m.uid BETWEEN (SELECT min_uid FROM bounds) AND (SELECT max_uid FROM bounds)
+			  AND m.expunged_at IS NULL
 		)
 		SELECT
 			f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
@@ -294,13 +299,18 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 			SELECT COALESCE(MIN(uid), 0) as min_uid, COALESCE(MAX(uid), 0) as max_uid FROM filtered_messages
 		),
 		base_count AS (
-			SELECT COUNT(*) as base FROM messages m, bounds b
-			WHERE m.mailbox_id = $1 AND m.uid < b.min_uid AND m.expunged_at IS NULL
+			SELECT COUNT(*) as base
+			FROM messages m
+			WHERE m.mailbox_id = $1
+			  AND m.uid < (SELECT min_uid FROM bounds)
+			  AND m.expunged_at IS NULL
 		),
 		range_counts AS (
 			SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid ASC) as offset
-			FROM messages m, bounds b
-			WHERE m.mailbox_id = $1 AND m.uid BETWEEN b.min_uid AND b.max_uid AND m.expunged_at IS NULL
+			FROM messages m
+			WHERE m.mailbox_id = $1
+			  AND m.uid BETWEEN (SELECT min_uid FROM bounds) AND (SELECT max_uid FROM bounds)
+			  AND m.expunged_at IS NULL
 		)
 		SELECT 
 			f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
