@@ -147,7 +147,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 
 	seqMap := make(map[uint32]uint32)
 
-	if sinceModSeq > 0 && len(rawUpdates) <= 1000 {
+	if sinceModSeq > 0 && len(rawUpdates) <= 50 {
 		// SPARSE PATH: Evaluate correlation strictly for the requested UIDs
 		seqRows, err := db.GetReadPool().Query(ctx, `
 			SELECT m.uid,
