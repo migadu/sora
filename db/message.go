@@ -145,6 +145,25 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 		return nil, nil
 	}
 
+	// Dynamic sequence optimization constraint logic.
+	// If the user requests fewer than 1000 messages (e.g., discrete sparse fetch or small block 1:100),
+	// using 1000 correlated COUNT(*) subqueries takes ~10ms total.
+	// If the user requests FETCH 1:* or 100000:*, doing 100,000 subqueries evaluates the index 100,000 times, taking 1,000s!
+	// Conversely, using the bulk CTE for discrete fetches of UID 1 and UID 5,000,000 evaluates window functions over ALL 5,000,000 rows between them!
+	var maxK uint32
+	for _, uidRange := range uidSet {
+		if uidRange.Stop == imap.UID(0) {
+			maxK = 10000000 // Unbounded range
+			break
+		}
+		if uidRange.Stop > uidRange.Start {
+			maxK += uint32(uidRange.Stop - uidRange.Start + 1)
+		} else {
+			maxK += 1
+		}
+	}
+	useCorrelatedSubquery := maxK < 1000
+
 	bsColInner := ""
 	bsColOuter := ""
 	if includeBodyStructure {
@@ -170,43 +189,65 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 
 	whereClause := strings.Join(conditions, " OR ")
 
-	query := fmt.Sprintf(`
-		WITH filtered_messages AS (
+	var query string
+	if useCorrelatedSubquery {
+		query = fmt.Sprintf(`
+			WITH filtered_messages AS (
+				SELECT
+					m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
+					m.internal_date, m.size, %[1]sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
+					ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+				FROM messages m
+				LEFT JOIN message_state ms ON ms.message_id = m.id
+				WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
+				  AND (%[2]s)
+			)
 			SELECT
-				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
-				m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
-				ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
-			FROM messages m
-			LEFT JOIN message_state ms ON ms.message_id = m.id
-			WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
-			  AND (%s)
-		),
-		bounds AS (
-			SELECT COALESCE(MIN(uid), 0) as min_uid, COALESCE(MAX(uid), 0) as max_uid FROM filtered_messages
-		),
-		base_count AS (
-			SELECT COUNT(*) as base
-			FROM messages m
-			WHERE m.mailbox_id = $1
-			  AND m.uid < (SELECT min_uid FROM bounds)
-			  AND m.expunged_at IS NULL
-		),
-		range_counts AS (
-			SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid ASC) as offset
-			FROM messages m
-			WHERE m.mailbox_id = $1
-			  AND m.uid BETWEEN (SELECT min_uid FROM bounds) AND (SELECT max_uid FROM bounds)
-			  AND m.expunged_at IS NULL
-		)
-		SELECT
-			f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
-			f.internal_date, f.size, %sf.created_modseq, f.updated_modseq, f.expunged_modseq,
-			(bc.base + rc.offset) as seqnum,
-			f.flags_changed_at, f.subject, f.sent_date, f.message_id, f.in_reply_to, f.recipients_json
-		FROM filtered_messages f
-		CROSS JOIN base_count bc
-		JOIN range_counts rc ON f.uid = rc.uid
-		ORDER BY f.uid`, bsColInner, whereClause, bsColOuter)
+				f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
+				f.internal_date, f.size, %[3]sf.created_modseq, f.updated_modseq, f.expunged_modseq,
+				(SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = $1 AND m2.uid <= f.uid AND m2.expunged_at IS NULL) as seqnum,
+				f.flags_changed_at, f.subject, f.sent_date, f.message_id, f.in_reply_to, f.recipients_json
+			FROM filtered_messages f
+			ORDER BY f.uid`, bsColInner, whereClause, bsColOuter)
+	} else {
+		query = fmt.Sprintf(`
+			WITH filtered_messages AS (
+				SELECT
+					m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
+					m.internal_date, m.size, %[1]sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
+					ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+				FROM messages m
+				LEFT JOIN message_state ms ON ms.message_id = m.id
+				WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
+				  AND (%[2]s)
+			),
+			bounds AS MATERIALIZED (
+				SELECT COALESCE(MIN(uid), 0) as min_uid, COALESCE(MAX(uid), 0) as max_uid FROM filtered_messages
+			),
+			base_count AS MATERIALIZED (
+				SELECT COUNT(*) as base
+				FROM messages m
+				WHERE m.mailbox_id = $1
+				  AND m.uid < (SELECT min_uid FROM bounds)
+				  AND m.expunged_at IS NULL
+			),
+			range_counts AS MATERIALIZED (
+				SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid ASC) as offset
+				FROM messages m
+				WHERE m.mailbox_id = $1
+				  AND m.uid BETWEEN (SELECT min_uid FROM bounds) AND (SELECT max_uid FROM bounds)
+				  AND m.expunged_at IS NULL
+			)
+			SELECT
+				f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
+				f.internal_date, f.size, %[3]sf.created_modseq, f.updated_modseq, f.expunged_modseq,
+				(bc.base + rc.offset) as seqnum,
+				f.flags_changed_at, f.subject, f.sent_date, f.message_id, f.in_reply_to, f.recipients_json
+			FROM filtered_messages f
+			CROSS JOIN base_count bc
+			JOIN range_counts rc ON f.uid = rc.uid
+			ORDER BY f.uid`, bsColInner, whereClause, bsColOuter)
+	}
 
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
 	if err != nil {

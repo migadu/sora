@@ -601,17 +601,17 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			%s
 			LIMIT %d
 		),
-		bounds AS (
+		bounds AS MATERIALIZED (
 			SELECT COALESCE(MIN(uid), 0) as min_uid, COALESCE(MAX(uid), 0) as max_uid FROM filtered_messages
 		),
-		base_count AS (
+		base_count AS MATERIALIZED (
 			SELECT COUNT(*) as base
 			FROM messages m
 			WHERE m.mailbox_id = @mailboxID
 			  AND m.uid < (SELECT min_uid FROM bounds)
 			  AND m.expunged_at IS NULL
 		),
-		range_counts AS (
+		range_counts AS MATERIALIZED (
 			SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid ASC) as offset
 			FROM messages m
 			WHERE m.mailbox_id = @mailboxID
@@ -660,17 +660,17 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			%s
 			LIMIT %d
 		),
-		bounds AS (
+		bounds AS MATERIALIZED (
 			SELECT COALESCE(MIN(uid), 0) as min_uid, COALESCE(MAX(uid), 0) as max_uid FROM filtered_messages
 		),
-		base_count AS (
+		base_count AS MATERIALIZED (
 			SELECT COUNT(*) as base
 			FROM messages m
 			WHERE m.mailbox_id = @mailboxID
 			  AND m.uid < (SELECT min_uid FROM bounds)
 			  AND m.expunged_at IS NULL
 		),
-		range_counts AS (
+		range_counts AS MATERIALIZED (
 			SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid ASC) as offset
 			FROM messages m
 			WHERE m.mailbox_id = @mailboxID
