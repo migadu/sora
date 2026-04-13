@@ -603,9 +603,18 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			FROM filtered_messages f
 			%s`
 
+		// Neutralize the "Limit + Order By" backward index scan bias.
+		// By injecting "+ 0", we implicitly decouple the inner CTE from the uid index,
+		// forcing the planner to evaluate highly selective WHERE clauses natively via
+		// Bitmap/FTS scans before sorting, stopping catastrophic streaming timeouts.
+		innerOrderByClause := strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+		if innerOrderByClause == orderByClause {
+			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+		}
+
 		// Note: The ordering clause uses "m." prefix initially, but we need it to use "f." for the outer query
 		outerOrderByClause := strings.ReplaceAll(orderByClause, "m.", "f.")
-		finalQueryString = fmt.Sprintf(simpleQueryTemplate, whereCondition, orderByClause, resultLimit, outerOrderByClause)
+		finalQueryString = fmt.Sprintf(simpleQueryTemplate, whereCondition, innerOrderByClause, resultLimit, outerOrderByClause)
 		metricsLabel = "search_messages_simple"
 
 	} else if !needsSeqNumSearch {
@@ -645,8 +654,13 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			FROM filtered_messages f
 			%s`
 
+		innerOrderByClause := strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+		if innerOrderByClause == orderByClause {
+			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+		}
+
 		outerOrderByClause := strings.ReplaceAll(orderByClause, "m.", "f.")
-		finalQueryString = fmt.Sprintf(complexQueryTemplate, whereCondition, orderByClause, resultLimit, outerOrderByClause)
+		finalQueryString = fmt.Sprintf(complexQueryTemplate, whereCondition, innerOrderByClause, resultLimit, outerOrderByClause)
 		metricsLabel = "search_messages_complex_fast"
 
 	} else {
@@ -682,7 +696,11 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			internal_date, size, created_modseq, updated_modseq, expunged_modseq, seqnum,
 			flags_changed_at, subject, sent_date, message_id, in_reply_to, recipients_json
 		FROM message_seqs`
-		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, orderByClause, resultLimit)
+		innerOrderByClause := strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+		if innerOrderByClause == orderByClause {
+			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+		}
+		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, innerOrderByClause, resultLimit)
 		metricsLabel = "search_messages_complex_legacy"
 	}
 
