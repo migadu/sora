@@ -95,52 +95,28 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			    JOIN messages m ON ms.message_id = m.id
 			    WHERE ms.mailbox_id = $1 AND ms.updated_modseq > $2
 			  ),
-			  bounds AS (
-				SELECT COALESCE(MIN(uid), 0) AS min_uid, COALESCE(MAX(uid), 0) AS max_uid FROM changed_messages_raw
-			  ),
-			  base_count AS (
-				SELECT COUNT(*) as alive_base
-				FROM messages m
-				WHERE m.mailbox_id = $1
-				  AND m.uid < (SELECT min_uid FROM bounds)
-				  AND m.expunged_at IS NULL
-			  ),
-			  base_expunged_count AS (
-				SELECT COUNT(*) as expunged_base
-				FROM messages m
-				WHERE m.mailbox_id = $1
-				  AND m.uid < (SELECT min_uid FROM bounds)
-				  AND m.expunged_modseq > $2
-			  ),
-			  range_counts AS (
-				SELECT
-					m.uid,
-					COUNT(CASE WHEN m.expunged_at IS NULL THEN 1 END) OVER(ORDER BY m.uid ASC) as alive_offset,
-					COUNT(CASE WHEN m.expunged_modseq > $2 THEN 1 END) OVER(ORDER BY m.uid ASC) as expunged_offset
-				FROM messages m
-				WHERE m.mailbox_id = $1
-				  AND m.uid BETWEEN (SELECT min_uid FROM bounds) AND (SELECT max_uid FROM bounds)
-				  AND (m.expunged_at IS NULL OR m.expunged_modseq > $2)
-			  ),
-			  -- 2. Calculate their sequence numbers dynamically using bounded window functions
+			  -- 2. Calculate their sequence numbers dynamically using optimal index-only correlated subqueries.
+			  -- Since changed_messages_raw usually only contains a small number of changed messages (K < 100),
+			  -- executing index-only subqueries avoids all MATERIALIZED table memory overhead AND avoids
+			  -- the Postgres 12+ recursive un-materialized inline window function trap.
 			  current_mailbox_state AS (
 			    SELECT
 			        cms.uid,
-			        CASE 
-			          WHEN cms.expunged_at IS NOT NULL THEN 
-			            (bc.alive_base + COALESCE(rc.alive_offset, 0)) + (bec.expunged_base + COALESCE(rc.expunged_offset, 0))
-			          ELSE 
-			            (bc.alive_base + COALESCE(rc.alive_offset, 0))
-			        END AS seq_num,
+			        (
+			          (SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = $1 AND m2.uid <= cms.uid AND m2.expunged_at IS NULL)
+			          +
+			          CASE 
+			            WHEN cms.expunged_at IS NOT NULL THEN 
+			              (SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = $1 AND m2.uid <= cms.uid AND m2.expunged_modseq > $2)
+			            ELSE 0 
+			          END
+			        ) AS seq_num,
 			        cms.flags,
 			        cms.custom_flags,
 			        cms.created_modseq,
 			        cms.updated_modseq_val,
 			        cms.expunged_modseq
 			    FROM changed_messages_raw cms
-				CROSS JOIN base_count bc
-				CROSS JOIN base_expunged_count bec
-				LEFT JOIN range_counts rc ON cms.uid = rc.uid
 			    WHERE (cms.expunged_modseq IS NULL OR cms.expunged_modseq > $2)
 			  ),
 			  changed_messages AS (
