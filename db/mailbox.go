@@ -49,20 +49,22 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 	// 1. CTE to materialize user's domain once (eliminates repeated SPLIT_PART calls)
 	// 2. Uses credentials.domain column instead of SPLIT_PART(address, '@', 2)
 	// 3. Composite indexes on mailbox_acls allow efficient rights filtering
+	ownerDomain, err := db.GetAccountDomain(ctx, AccountID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return []*DBMailbox{}, nil
+		}
+		return nil, fmt.Errorf("failed to retrieve user domain: %w", err)
+	}
+
+	// Optimized query using the injected domain
 	query := `
-		WITH user_domain AS (
-			SELECT domain
-			FROM credentials
-			WHERE account_id = $1 AND primary_identity = TRUE
-			LIMIT 1
-		)
 		SELECT DISTINCT
 			m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id,
 			EXISTS(SELECT 1 FROM mailboxes child WHERE child.account_id = m.account_id AND LENGTH(child.path) = LENGTH(m.path) + 16 AND child.path LIKE m.path || '%') AS has_children
 		FROM mailboxes m
 		LEFT JOIN mailbox_acls acl ON m.id = acl.mailbox_id AND acl.account_id = $1 AND position('l' IN acl.rights) > 0
 		LEFT JOIN mailbox_acls anyone_acl ON m.id = anyone_acl.mailbox_id AND anyone_acl.identifier = 'anyone' AND position('l' IN anyone_acl.rights) > 0
-		CROSS JOIN user_domain ud
 		WHERE
 			-- All mailboxes owned by user (including shared mailboxes they created)
 			m.account_id = $1
@@ -73,7 +75,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			-- Shared mailboxes with "anyone" access (same domain, must have 'l' right)
 			(COALESCE(m.is_shared, FALSE) = TRUE
 			 AND anyone_acl.mailbox_id IS NOT NULL
-			 AND m.owner_domain = ud.domain)
+			 AND m.owner_domain = $2)
 	`
 
 	if subscribed {
@@ -84,7 +86,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 	query += " ORDER BY m.name"
 
 	// Prepare the query to fetch all mailboxes for the given user
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, AccountID)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, AccountID, ownerDomain)
 	if err != nil {
 		return nil, err
 	}
@@ -182,16 +184,19 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	var uidValidityInt64 int64
 	var accountID int64
 
+	ownerDomain, fetchErr := db.GetAccountDomain(ctx, AccountID)
+	if fetchErr != nil {
+		// Log the error but don't fail immediately, wait for the actual query execution
+		if !errors.Is(fetchErr, pgx.ErrNoRows) {
+			logger.Error("Database: failed to get account domain for GetMailboxByName", "err", fetchErr)
+		}
+		ownerDomain = "" // fallback
+	}
+
 	// Optimized query using denormalized domain column
 	// Use LOWER() on both sides to ensure consistent case-insensitive comparison
 	// regardless of database locale (C/POSIX locales don't lowercase non-ASCII in LOWER())
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		WITH user_domain AS (
-			SELECT domain
-			FROM credentials
-			WHERE account_id = $1 AND primary_identity = TRUE
-			LIMIT 1
-		)
 		SELECT id, name, uid_validity, path, subscribed, created_at, updated_at, account_id FROM (
 			-- 1) Owned by user
 			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
@@ -216,16 +221,15 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
 			FROM mailbox_acls anyone_acl
 			JOIN mailboxes m ON m.id = anyone_acl.mailbox_id
-			CROSS JOIN user_domain ud
 			WHERE anyone_acl.identifier = 'anyone' 
 			  AND position('l' IN anyone_acl.rights) > 0
 			  AND LOWER(m.name) = LOWER($2)
 			  AND m.account_id != $1
 			  AND COALESCE(m.is_shared, FALSE) = TRUE
-			  AND m.owner_domain = ud.domain
+			  AND m.owner_domain = $3
 		) sub
 		LIMIT 1
-	`, AccountID, name).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
+	`, AccountID, name, ownerDomain).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

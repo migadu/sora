@@ -140,60 +140,97 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	}
 
 	// Phase 2: Dynamic Sequence Hydration
-	// We use an optimized sequential stream. The sparse correlated subquery path is entirely
-	// removed because it results in O(K * N) tuple scans, causing major performance degradation for
-	// mailboxes with many messages. A sequential stream of the UID and expunged_at columns requires
-	// only a single Index-Only scan, running in O(N) time but mapping with O(K) memory.
+	// For small update sets (K <= 50), it is vastly faster to let PostgreSQL count index tuples
+	// entirely in the database engine via batched requests, rather than streaming potentially
+	// 100,000 rows across the network to Go just to find the sequence number of 1 changed message.
+	// For dense updates, we fall back to a single sequential O(N) stream to avoid O(K*N) Postgres load.
 
-	interestedUIDs := make(map[uint32]bool, len(rawUpdates))
-	for _, u := range rawUpdates {
-		interestedUIDs[uint32(u.UID)] = true
-	}
-	seqMap := make(map[uint32]uint32, len(rawUpdates))
-
-	// OPTIMIZATION: We select expunged_modseq instead of expunged_at. Since expunged_modseq
-	// is NULL when expunged_at is NULL, the logical evaluation is identical. This allows
-	// PostgreSQL to fulfill the query utilizing an Index-Only Scan on the covering index
-	// idx_messages_mailbox_uid_expunged_modseq without ever reading heap table data.
-	seqRows, err := db.GetReadPool().Query(ctx, `
-		SELECT uid, expunged_modseq
-		FROM messages
-		WHERE mailbox_id = $1 AND (expunged_modseq IS NULL OR expunged_modseq > $2)
-		ORDER BY uid ASC
-	`, mailboxID, sinceModSeq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query sequences: %w", err)
-	}
-	defer seqRows.Close()
-
-	activeCount := uint32(0)
-	expungedOffset := uint32(0)
-
-	for seqRows.Next() {
-		var uid uint32
-		var exp sql.NullInt64
-		if err := seqRows.Scan(&uid, &exp); err != nil {
-			return nil, fmt.Errorf("failed to scan sequence row: %w", err)
-		}
-		if !exp.Valid {
-			activeCount++
-		} else {
-			expungedOffset++
-		}
-
-		if interestedUIDs[uid] {
-			seqMap[uid] = activeCount + expungedOffset
-			if len(seqMap) == len(interestedUIDs) {
-				break // Early exit: all modified messages mapped
+	if len(rawUpdates) <= 50 {
+		batch := &pgx.Batch{}
+		for _, u := range rawUpdates {
+			if !u.IsExpunge {
+				// Base sequence number: count of active messages with UID <= target
+				batch.Queue(`
+					SELECT COUNT(*) FROM messages 
+					WHERE mailbox_id = $1 AND expunged_modseq IS NULL AND uid <= $2
+				`, mailboxID, u.UID)
+			} else {
+				// Expunged sequence number includes messages that were expunged in this poll window
+				batch.Queue(`
+					SELECT COUNT(*) FROM messages
+					WHERE mailbox_id = $1 AND (expunged_modseq IS NULL OR expunged_modseq > $2) AND uid <= $3
+				`, mailboxID, sinceModSeq, u.UID)
 			}
 		}
-	}
-	if err := seqRows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating sequences: %w", err)
-	}
 
-	for i := range rawUpdates {
-		rawUpdates[i].SeqNum = seqMap[uint32(rawUpdates[i].UID)]
+		br := db.GetReadPool().SendBatch(ctx, batch)
+		for i := range rawUpdates {
+			var seq uint32
+			if err := br.QueryRow().Scan(&seq); err != nil {
+				_ = br.Close()
+				return nil, fmt.Errorf("failed to count sparse sequence: %w", err)
+			}
+			rawUpdates[i].SeqNum = seq
+		}
+		if err := br.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close sparse sequence batch: %w", err)
+		}
+	} else {
+		// Dense stream
+		interestedUIDs := make(map[uint32]bool, len(rawUpdates))
+		for _, u := range rawUpdates {
+			interestedUIDs[uint32(u.UID)] = true
+		}
+		seqMap := make(map[uint32]uint32, len(rawUpdates))
+
+		// OPTIMIZATION: We select expunged_modseq instead of expunged_at. Since expunged_modseq
+		// is NULL when expunged_at is NULL, the logical evaluation is identical. This allows
+		// PostgreSQL to fulfill the query utilizing an Index-Only Scan on the covering index
+		// idx_messages_mailbox_uid_expunged_modseq without ever reading heap table data.
+		seqRows, err := db.GetReadPool().Query(ctx, `
+			SELECT uid, expunged_modseq
+			FROM messages
+			WHERE mailbox_id = $1 AND (expunged_modseq IS NULL OR expunged_modseq > $2)
+			ORDER BY uid ASC
+		`, mailboxID, sinceModSeq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query sequences: %w", err)
+		}
+		defer seqRows.Close()
+
+		activeCount := uint32(0)
+		expungedOffset := uint32(0)
+
+		for seqRows.Next() {
+			var uid uint32
+			var exp sql.NullInt64
+			if err := seqRows.Scan(&uid, &exp); err != nil {
+				return nil, fmt.Errorf("failed to scan sequence row: %w", err)
+			}
+			if !exp.Valid {
+				activeCount++
+			} else {
+				expungedOffset++
+			}
+
+			if interestedUIDs[uid] {
+				if !exp.Valid {
+					seqMap[uid] = activeCount
+				} else {
+					seqMap[uid] = activeCount + expungedOffset
+				}
+				if len(seqMap) == len(interestedUIDs) {
+					break // Early exit: all modified messages mapped
+				}
+			}
+		}
+		if err := seqRows.Err(); err != nil {
+			return nil, fmt.Errorf("error iterating sequences: %w", err)
+		}
+
+		for i := range rawUpdates {
+			rawUpdates[i].SeqNum = seqMap[uint32(rawUpdates[i].UID)]
+		}
 	}
 
 	// Sort correctly for correct IMAP processing:

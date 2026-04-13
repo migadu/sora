@@ -101,14 +101,26 @@ func (d *Database) GetUserScopedObjectsForCleanup(ctx context.Context, olderThan
 		}
 
 		query := `
-			WITH scan_window AS (
-				SELECT m.account_id, m.s3_domain, m.s3_localpart, m.content_hash
-				FROM messages m
-				WHERE m.uploaded = TRUE AND m.expunged_at IS NOT NULL
-				  AND (m.account_id, m.s3_domain, m.s3_localpart, m.content_hash) > ($1, $2, $3, $4)
-				GROUP BY m.account_id, m.s3_domain, m.s3_localpart, m.content_hash
-				ORDER BY m.account_id, m.s3_domain, m.s3_localpart, m.content_hash
-				LIMIT $5
+			WITH RECURSIVE scan_window AS (
+				(
+					SELECT m.account_id, m.s3_domain, m.s3_localpart, m.content_hash
+					FROM messages m
+					WHERE m.uploaded = TRUE AND m.expunged_at IS NOT NULL
+					  AND (m.account_id, m.s3_domain, m.s3_localpart, m.content_hash) > ($1, $2, $3, $4)
+					ORDER BY m.account_id, m.s3_domain, m.s3_localpart, m.content_hash
+					LIMIT 1
+				)
+				UNION ALL
+				SELECT t.account_id, t.s3_domain, t.s3_localpart, t.content_hash
+				FROM (
+					SELECT m.account_id, m.s3_domain, m.s3_localpart, m.content_hash
+					FROM messages m
+					JOIN scan_window sw ON true
+					WHERE m.uploaded = TRUE AND m.expunged_at IS NOT NULL
+					  AND (m.account_id, m.s3_domain, m.s3_localpart, m.content_hash) > (sw.account_id, sw.s3_domain, sw.s3_localpart, sw.content_hash)
+					ORDER BY m.account_id, m.s3_domain, m.s3_localpart, m.content_hash
+					LIMIT 1
+				) t
 			)
 			SELECT 
 				sw.account_id, sw.s3_domain, sw.s3_localpart, sw.content_hash,
@@ -118,7 +130,7 @@ func (d *Database) GetUserScopedObjectsForCleanup(ctx context.Context, olderThan
 					  AND m2.content_hash = sw.content_hash
 					  AND (m2.expunged_at IS NULL OR m2.expunged_at >= $6)
 				) as is_orphan
-			FROM scan_window sw
+			FROM (SELECT * FROM scan_window LIMIT $5) sw
 			ORDER BY sw.account_id, sw.s3_domain, sw.s3_localpart, sw.content_hash
 		`
 

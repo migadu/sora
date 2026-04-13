@@ -128,6 +128,30 @@ type Database struct {
 	ReadFailover                 *FailoverManager // Failover manager for read operations
 	lockConn                     *pgxpool.Conn    // Connection holding the advisory lock
 	uidValidityMismatchLoggedMap sync.Map         // Tracks mailbox IDs that have already logged UIDVALIDITY mismatch (mailboxID -> bool)
+	AccountDomainCache           sync.Map         // Cache for account_id -> domain string
+}
+
+// GetAccountDomain retrieves the domain for an account, using an in-memory cache
+// to avoid repeated database lookups for the same account.
+func (db *Database) GetAccountDomain(ctx context.Context, accountID int64) (string, error) {
+	if val, ok := db.AccountDomainCache.Load(accountID); ok {
+		return val.(string), nil
+	}
+
+	var domain string
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT domain
+		FROM credentials
+		WHERE account_id = $1 AND primary_identity = TRUE
+		LIMIT 1
+	`, accountID).Scan(&domain)
+
+	if err != nil {
+		return "", fmt.Errorf("failed to get domain for account %d: %w", accountID, err)
+	}
+
+	db.AccountDomainCache.Store(accountID, domain)
+	return domain, nil
 }
 
 func (db *Database) Close() {

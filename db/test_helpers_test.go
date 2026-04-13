@@ -27,7 +27,7 @@ type TestConfig struct {
 }
 
 // setupTestDatabase creates a database connection using local PostgreSQL and config-test.toml
-func setupTestDatabase(t *testing.T) *Database {
+func setupTestDatabase(t testing.TB) *Database {
 	ctx := context.Background()
 
 	// Find the config-test.toml file by walking up from current directory

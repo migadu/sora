@@ -51,9 +51,17 @@ func resetMigrationState(t *testing.T, targetVersion int) {
 	// migrate() timeout. Using setupTestDatabase / NewDatabaseFromConfig with
 	// runMigrations=true would hit the dirty-state guard and fail before we
 	// can clean anything up.
-	database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(), true, false)
+	database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(), false, false)
 	if err != nil {
 		t.Fatalf("resetMigrationState: connect to DB: %v", err)
+	}
+
+	// Drop and recreate the public schema to ensure a completely clean slate,
+	// wiping away any "dirty" migration state or conflicting left-over data
+	// from previous test failures. This makes the downgrade rock solid.
+	_, err = database.WritePool.Exec(ctx, "DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+	if err != nil {
+		t.Fatalf("resetMigrationState: failed to clear schema: %v", err)
 	}
 
 	migrations, err := fs.Sub(MigrationsFS, "migrations")
