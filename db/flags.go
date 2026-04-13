@@ -322,6 +322,14 @@ func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxI
 		SELECT custom_flags_cache FROM mailbox_stats WHERE mailbox_id = $1
 	`, mailboxID).Scan(&cachedFlagsJSON)
 
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("failed to query custom_flags_cache for mailbox %d: %w", mailboxID, err)
+	}
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return []string{}, nil
+	}
+
 	if err == nil && cachedFlagsJSON != nil {
 		var cachedFlags []string
 		if err := json.Unmarshal(cachedFlagsJSON, &cachedFlags); err == nil {
