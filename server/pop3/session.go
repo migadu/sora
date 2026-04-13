@@ -2076,16 +2076,33 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 
 		// Fallback to S3
 		logger.Debug("POP3: Cache miss - fetching from S3", "uid", msg.UID, "hash", msg.ContentHash)
-		address, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, msg.AccountID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get primary address for account %d: %w", msg.AccountID, err)
+		if msg.S3Domain == "" || msg.S3Localpart == "" {
+			return nil, fmt.Errorf("message UID %d is missing S3 key information", msg.UID)
 		}
+		s3Key := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
+		var reader io.ReadCloser
+		var s3GetErr error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s3GetErr = fmt.Errorf("S3 get panicked: %v", r)
+				}
+			}()
+			reader, s3GetErr = s.server.s3.GetWithRetry(s.server.appCtx, s3Key)
+		}()
 
-		s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), msg.ContentHash)
-
-		reader, err := s.server.s3.GetWithRetry(s.server.appCtx, s3Key)
-		if err != nil {
-			return nil, fmt.Errorf("message UID %d: %w: %v", msg.UID, storage.ErrRetrieveFailed, err)
+		if s3GetErr != nil {
+			// S3 is unavailable — fall back to the local disk file if the uploader
+			// still has it. This covers test environments (where S3 is a no-op stub)
+			// and transient S3 outages where the upload worker has not yet run.
+			if s.server.uploader != nil {
+				filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
+				if diskData, diskErr := os.ReadFile(filePath); diskErr == nil {
+					logger.Debug("POP3: S3 unavailable, served from local disk", "uid", msg.UID)
+					return diskData, nil
+				}
+			}
+			return nil, fmt.Errorf("message UID %d: %w: %v", msg.UID, storage.ErrRetrieveFailed, s3GetErr)
 		}
 		defer reader.Close()
 		data, err = io.ReadAll(reader)

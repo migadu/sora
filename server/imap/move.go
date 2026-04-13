@@ -2,11 +2,9 @@ package imap
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
-	"github.com/migadu/sora/consts"
 )
 
 func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest string) error {
@@ -141,18 +139,6 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		}
 	} else {
 		s.DebugLog("no messages were moved, skipping COPYUID response")
-	}
-
-	isTrashFolder := strings.EqualFold(dest, "Trash") || dest == consts.MailboxTrash
-	if isTrashFolder && len(mappedDestUIDs) > 0 {
-		s.DebugLog("automatically marking moved messages as seen in Trash folder", "count", len(mappedDestUIDs))
-
-		for _, uid := range mappedDestUIDs {
-			_, _, err := s.server.rdb.AddMessageFlagsWithRetry(s.ctx, uid, destMailbox.ID, []imap.Flag{imap.FlagSeen})
-			if err != nil {
-				s.DebugLog("failed to mark message as seen in Trash", "uid", uid, "error", err)
-			}
-		}
 	}
 
 	// NOTE: We do NOT send EXPUNGE notifications here directly.

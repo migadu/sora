@@ -78,6 +78,42 @@ func (rd *ResilientDatabase) SetMessageFlagsWithRetry(ctx context.Context, messa
 
 // --- Fetch Wrappers ---
 
+func (rd *ResilientDatabase) AddMessageFlagsBatchWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag) ([]db.BatchFlagUpdateResult, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(true).AddMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, newFlags)
+	}
+
+	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]db.BatchFlagUpdateResult), nil
+}
+
+func (rd *ResilientDatabase) RemoveMessageFlagsBatchWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, flagsToRemove []imap.Flag) ([]db.BatchFlagUpdateResult, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(true).RemoveMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, flagsToRemove)
+	}
+
+	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]db.BatchFlagUpdateResult), nil
+}
+
+func (rd *ResilientDatabase) SetMessageFlagsBatchWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag) ([]db.BatchFlagUpdateResult, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(true).SetMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, newFlags)
+	}
+
+	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]db.BatchFlagUpdateResult), nil
+}
+
 func (rd *ResilientDatabase) GetMessageEnvelopeWithRetry(ctx context.Context, UID imap.UID, mailboxID int64) (*imap.Envelope, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetMessageEnvelope(ctx, UID, mailboxID)

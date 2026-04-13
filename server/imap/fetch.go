@@ -186,6 +186,54 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 		return nil
 	}
 
+	// Determine if this FETCH implicitly marks messages as \Seen (any non-PEEK body section)
+	markSeen := false
+	for _, bs := range options.BodySection {
+		if !bs.Peek {
+			markSeen = true
+			break
+		}
+	}
+
+	if markSeen {
+		var uidsToMarkSeen []imap.UID
+		for _, msg := range messages {
+			seen := false
+			systemFlags, _ := db.SplitFlags(db.BitwiseToFlags(msg.BitwiseFlags))
+			for _, flag := range systemFlags {
+				if flag == imap.FlagSeen {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				uidsToMarkSeen = append(uidsToMarkSeen, msg.UID)
+			}
+		}
+
+		if len(uidsToMarkSeen) > 0 {
+			_, err := s.server.rdb.AddMessageFlagsBatchWithRetry(s.ctx, uidsToMarkSeen, selectedMailboxID, []imap.Flag{imap.FlagSeen})
+			if err != nil {
+				s.DebugLog("failed to batch mark messages as seen", "error", err)
+			} else {
+				// Update in-memory models immediately so the fetch response has the flag
+				for i := range messages {
+					seen := false
+					flags := db.BitwiseToFlags(messages[i].BitwiseFlags)
+					for _, f := range flags {
+						if f == imap.FlagSeen {
+							seen = true
+							break
+						}
+					}
+					if !seen {
+						messages[i].BitwiseFlags = db.FlagsToBitwise(append(flags, imap.FlagSeen))
+					}
+				}
+			}
+		}
+	}
+
 	// Process all messages without repeatedly acquiring the mutex
 	var totalBytesFetched int64
 	for _, msg := range messages {
@@ -241,23 +289,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 		return nil
 	}
 
-	markSeen := false
-	for _, bs := range options.BodySection {
-		if !bs.Peek {
-			markSeen = true
-			break
-		}
-	}
-	if markSeen {
-		newFlagsComplete, _, err := s.server.rdb.AddMessageFlagsWithRetry(s.ctx, msg.UID, selectedMailboxID, []imap.Flag{imap.FlagSeen})
-		if err != nil {
-			s.DebugLog("failed to set seen flag", "uid", msg.UID, "error", err)
-		} else {
-			systemFlags, customKeywords := db.SplitFlags(newFlagsComplete)
-			msg.BitwiseFlags = db.FlagsToBitwise(systemFlags)
-			msg.CustomFlags = customKeywords
-		}
-	}
+	// Removed individual markSeen logic here because it is now batched before iteration.
 
 	m := w.CreateMessage(seqNum)
 	if m == nil {
@@ -504,29 +536,22 @@ func (s *IMAPSession) handleBinarySectionSize(w *imapserver.FetchResponseWriter,
 func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message, selectedMailboxID int64) error {
 	for _, section := range options.BodySection {
 		var sectionContent []byte
-		var extractionErr error // For errors from imapserver.Extract... functions
-		satisfiedFromDB := false
 
-		// Fallback or other section types
-		// If not satisfied from DB, or if there was an error extracting from DB-sourced content (extractionErr != nil),
-		// or if it's a complex section type that always requires full body.
-		if !satisfiedFromDB || extractionErr != nil {
-			if loadErr := s.ensureBodyDataLoaded(msg, bodyData, bodyDataFetched); loadErr != nil {
-				// Graceful degradation: return empty body sections instead of failing
-				// the entire multi-message FETCH. This prevents one broken message
-				// (missing S3 content, 0-byte message, etc.) from making the whole
-				// mailbox listing fail for webmail clients like Roundcube/SOGo.
-				s.WarnLog("failed to load message body, returning empty body section", "uid", msg.UID, "error", loadErr)
-			}
+		if loadErr := s.ensureBodyDataLoaded(msg, bodyData, bodyDataFetched); loadErr != nil {
+			// Graceful degradation: return empty body sections instead of failing
+			// the entire multi-message FETCH. This prevents one broken message
+			// (missing S3 content, 0-byte message, etc.) from making the whole
+			// mailbox listing fail for webmail clients like Roundcube/SOGo.
+			s.WarnLog("failed to load message body, returning empty body section", "uid", msg.UID, "error", loadErr)
+		}
 
-			if *bodyData != nil { // Only extract if bodyData was successfully loaded
-				// Extract section. If MIME parsing fails/panics, safeExtractBodySection handles it gracefully.
-				// We return whatever the extractor gives us - email servers should be transparent conduits.
-				sectionContent = safeExtractBodySection(*bodyData, section)
-			} else {
-				s.DebugLog("body data is nil, returning empty", "uid", msg.UID)
-				// sectionContent remains nil, will be set to []byte{} below
-			}
+		if *bodyData != nil { // Only extract if bodyData was successfully loaded
+			// Extract section. If MIME parsing fails/panics, safeExtractBodySection handles it gracefully.
+			// We return whatever the extractor gives us - email servers should be transparent conduits.
+			sectionContent = safeExtractBodySection(*bodyData, section)
+		} else {
+			s.DebugLog("body data is nil, returning empty", "uid", msg.UID)
+			// sectionContent remains nil, will be set to []byte{} below
 		}
 
 		if sectionContent == nil { // Ensure not nil for WriteBodySection

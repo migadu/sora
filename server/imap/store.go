@@ -1,10 +1,9 @@
 package imap
 
 import (
-	"strings"
-
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 )
 
@@ -151,6 +150,9 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	// Track UIDs that fail the UNCHANGEDSINCE precondition (RFC 7162 §3.1.3)
 	var failedUIDs imap.UIDSet
 
+	var validUIDs []imap.UID
+	seqMap := make(map[imap.UID]uint32)
+
 	for _, msg := range messages {
 		// CONDSTORE functionality - only process if capability is enabled
 		if s.GetCapabilities().Has(imap.CapCondStore) && options != nil && options.UnchangedSince > 0 {
@@ -172,42 +174,39 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 			}
 		}
 
-		var newFlags []imap.Flag
-		var newModSeq int64
+		validUIDs = append(validUIDs, msg.UID)
+		seqMap[msg.UID] = msg.Seq
+	}
+
+	if len(validUIDs) > 0 {
+		var batchResults []db.BatchFlagUpdateResult
 		switch sanitizedStoreFlags.Op {
 		case imap.StoreFlagsAdd:
-			newFlags, newModSeq, err = s.server.rdb.AddMessageFlagsWithRetry(s.ctx, msg.UID, msg.MailboxID, sanitizedStoreFlags.Flags)
+			batchResults, err = s.server.rdb.AddMessageFlagsBatchWithRetry(s.ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
 		case imap.StoreFlagsDel:
-			newFlags, newModSeq, err = s.server.rdb.RemoveMessageFlagsWithRetry(s.ctx, msg.UID, msg.MailboxID, sanitizedStoreFlags.Flags)
+			batchResults, err = s.server.rdb.RemoveMessageFlagsBatchWithRetry(s.ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
 		case imap.StoreFlagsSet:
-			newFlags, newModSeq, err = s.server.rdb.SetMessageFlagsWithRetry(s.ctx, msg.UID, msg.MailboxID, sanitizedStoreFlags.Flags)
+			batchResults, err = s.server.rdb.SetMessageFlagsBatchWithRetry(s.ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
 		}
 
 		if err != nil {
-			if strings.Contains(err.Error(), "not found (may be expunged or moved)") {
-				s.DebugLog("Store: skipping message because it was concurrently expunged or moved", "uid", msg.UID)
-				continue
-			}
-			return s.internalError("failed to update flags for message: %v", err)
+			return s.internalError("failed to update flags for batch: %v", err)
 		}
 
-		if newModSeq == 0 { // Should not happen if DB functions are correct
-			s.DebugLog("message received zero MODSEQ after flag update", "uid", msg.UID)
+		for _, res := range batchResults {
+			modifiedMessages = append(modifiedMessages, struct {
+				seq    uint32
+				uid    imap.UID
+				flags  []imap.Flag
+				modSeq int64
+			}{
+				seq:    seqMap[res.UID],
+				uid:    res.UID,
+				flags:  res.Flags,
+				modSeq: res.ModSeq,
+			})
+			s.DebugLog("operation updated message", "uid", res.UID, "new_modseq", res.ModSeq)
 		}
-
-		s.DebugLog("operation updated message", "uid", msg.UID, "new_modseq", newModSeq)
-
-		modifiedMessages = append(modifiedMessages, struct {
-			seq    uint32
-			uid    imap.UID
-			flags  []imap.Flag
-			modSeq int64
-		}{
-			seq:    msg.Seq,
-			uid:    msg.UID,
-			flags:  newFlags,
-			modSeq: newModSeq,
-		})
 	}
 
 	// RFC 7162 §3.1.3: If any messages failed the UNCHANGEDSINCE check,

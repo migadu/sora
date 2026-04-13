@@ -163,12 +163,14 @@ BEGIN
             WHERE m.expunged_at IS NULL AND ms.mailbox_id IS NOT NULL
             GROUP BY ms.mailbox_id
         )
-        UPDATE mailbox_stats mstats
-        SET unseen_count = mstats.unseen_count + d.unseen_delta,
-            highest_modseq = GREATEST(mstats.highest_modseq, d.modseq_val),
-            updated_at = now()
-        FROM deltas d
-        WHERE mstats.mailbox_id = d.mailbox_id;
+        -- FIXED: Use INSERT ... ON CONFLICT DO UPDATE so unseen_deltas are not lost
+        -- if this trigger executes before the messages trigger
+        INSERT INTO mailbox_stats (mailbox_id, unseen_count, highest_modseq, updated_at)
+        SELECT mailbox_id, unseen_delta, modseq_val, now() FROM deltas
+        ON CONFLICT (mailbox_id) DO UPDATE SET
+            unseen_count = mailbox_stats.unseen_count + EXCLUDED.unseen_count,
+            highest_modseq = GREATEST(mailbox_stats.highest_modseq, EXCLUDED.highest_modseq),
+            updated_at = now();
 
         UPDATE mailbox_stats mstats
         SET custom_flags_cache = (

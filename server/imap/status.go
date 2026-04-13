@@ -73,7 +73,14 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 		statusData.NumRecent = &num
 	}
 	if options.NumUnseen {
-		num := uint32(summary.UnseenCount)
+		// Defensive: clamp negative values to 0 to prevent uint32 wraparound
+		// (database bug in migration 000025 could cause negative unseen_count)
+		unseenCount := summary.UnseenCount
+		if unseenCount < 0 {
+			s.WarnLog("negative unseen_count detected, clamping to 0", "mailbox", mboxName, "unseen_count", unseenCount)
+			unseenCount = 0
+		}
+		num := uint32(unseenCount)
 		statusData.NumUnseen = &num
 	}
 	if s.GetCapabilities().Has(imap.CapCondStore) && options.HighestModSeq {

@@ -139,7 +139,13 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 						statusData.NumRecent = &num
 					}
 					if options.ReturnStatus.NumUnseen {
-						num := uint32(summary.UnseenCount)
+						// Defensive: clamp negative values to 0 to prevent uint32 wraparound
+						unseenCount := summary.UnseenCount
+						if unseenCount < 0 {
+							s.WarnLog("negative unseen_count detected in LIST, clamping to 0", "mailbox", mbox.Name, "unseen_count", unseenCount)
+							unseenCount = 0
+						}
+						num := uint32(unseenCount)
 						statusData.NumUnseen = &num
 					}
 					if s.GetCapabilities().Has(imap.CapCondStore) && options.ReturnStatus.HighestModSeq {
