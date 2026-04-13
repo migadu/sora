@@ -600,13 +600,32 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 			%s
 			LIMIT %d
+		),
+		bounds AS (
+			SELECT COALESCE(MIN(uid), 0) as min_uid, COALESCE(MAX(uid), 0) as max_uid FROM filtered_messages
+		),
+		base_count AS (
+			SELECT COUNT(*) as base
+			FROM messages m
+			WHERE m.mailbox_id = @mailboxID
+			  AND m.uid < (SELECT min_uid FROM bounds)
+			  AND m.expunged_at IS NULL
+		),
+		range_counts AS (
+			SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid ASC) as offset
+			FROM messages m
+			WHERE m.mailbox_id = @mailboxID
+			  AND m.uid BETWEEN (SELECT min_uid FROM bounds) AND (SELECT max_uid FROM bounds)
+			  AND m.expunged_at IS NULL
 		)
 		SELECT
 			f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
 			f.internal_date, f.size, f.created_modseq, f.updated_modseq, f.expunged_modseq,
-			(SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = @mailboxID AND m2.uid <= f.uid AND m2.expunged_at IS NULL) as seqnum,
+			(bc.base + rc.offset) as seqnum,
 			f.flags_changed_at, f.subject, f.sent_date, f.message_id, f.in_reply_to, f.recipients_json
 		FROM filtered_messages f
+		CROSS JOIN base_count bc
+		JOIN range_counts rc ON f.uid = rc.uid
 		%s`
 
 		// Note: The ordering clause uses "m." prefix initially, but we need it to use "f." for the outer query
@@ -640,13 +659,32 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 			%s
 			LIMIT %d
+		),
+		bounds AS (
+			SELECT COALESCE(MIN(uid), 0) as min_uid, COALESCE(MAX(uid), 0) as max_uid FROM filtered_messages
+		),
+		base_count AS (
+			SELECT COUNT(*) as base
+			FROM messages m
+			WHERE m.mailbox_id = @mailboxID
+			  AND m.uid < (SELECT min_uid FROM bounds)
+			  AND m.expunged_at IS NULL
+		),
+		range_counts AS (
+			SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid ASC) as offset
+			FROM messages m
+			WHERE m.mailbox_id = @mailboxID
+			  AND m.uid BETWEEN (SELECT min_uid FROM bounds) AND (SELECT max_uid FROM bounds)
+			  AND m.expunged_at IS NULL
 		)
 		SELECT
 			f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
 			f.internal_date, f.size, f.created_modseq, f.updated_modseq, f.expunged_modseq,
-			(SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = @mailboxID AND m2.uid <= f.uid AND m2.expunged_at IS NULL) as seqnum,
+			(bc.base + rc.offset) as seqnum,
 			f.flags_changed_at, f.subject, f.sent_date, f.message_id, f.in_reply_to, f.recipients_json
 		FROM filtered_messages f
+		CROSS JOIN base_count bc
+		JOIN range_counts rc ON f.uid = rc.uid
 		%s`
 
 		outerOrderByClause := strings.ReplaceAll(orderByClause, "m.", "f.")

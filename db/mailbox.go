@@ -193,25 +193,36 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			LIMIT 1
 		)
 		SELECT id, name, uid_validity, path, subscribed, created_at, updated_at, account_id FROM (
+			-- 1) Owned by user
 			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
 			FROM mailboxes m
 			WHERE m.account_id = $1 AND LOWER(m.name) = LOWER($2)
 
 			UNION ALL
 
+			-- 2) Specifically shared to this user explicitly via ACL
 			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
-			FROM mailboxes m
-			LEFT JOIN mailbox_acls acl ON m.id = acl.mailbox_id AND acl.account_id = $1 AND position('l' IN acl.rights) > 0
-			LEFT JOIN mailbox_acls anyone_acl ON m.id = anyone_acl.mailbox_id AND anyone_acl.identifier = 'anyone' AND position('l' IN anyone_acl.rights) > 0
-			CROSS JOIN user_domain ud
-			WHERE LOWER(m.name) = LOWER($2)
+			FROM mailbox_acls acl
+			JOIN mailboxes m ON m.id = acl.mailbox_id
+			WHERE acl.account_id = $1 
+			  AND position('l' IN acl.rights) > 0
+			  AND LOWER(m.name) = LOWER($2)
 			  AND m.account_id != $1
 			  AND COALESCE(m.is_shared, FALSE) = TRUE
-			  AND (
-			    (acl.account_id IS NOT NULL)
-			    OR
-			    (anyone_acl.mailbox_id IS NOT NULL AND m.owner_domain = ud.domain)
-			  )
+
+			UNION ALL
+
+			-- 3) Publicly shared within the same domain ('anyone' ACL)
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
+			FROM mailbox_acls anyone_acl
+			JOIN mailboxes m ON m.id = anyone_acl.mailbox_id
+			CROSS JOIN user_domain ud
+			WHERE anyone_acl.identifier = 'anyone' 
+			  AND position('l' IN anyone_acl.rights) > 0
+			  AND LOWER(m.name) = LOWER($2)
+			  AND m.account_id != $1
+			  AND COALESCE(m.is_shared, FALSE) = TRUE
+			  AND m.owner_domain = ud.domain
 		) sub
 		LIMIT 1
 	`, AccountID, name).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
