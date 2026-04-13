@@ -124,11 +124,20 @@ func (d *Database) GetUserScopedObjectsForCleanup(ctx context.Context, olderThan
 			)
 			SELECT 
 				sw.account_id, sw.s3_domain, sw.s3_localpart, sw.content_hash,
-				NOT EXISTS (
-					SELECT 1 FROM messages m2
-					WHERE m2.account_id = sw.account_id
-					  AND m2.content_hash = sw.content_hash
-					  AND (m2.expunged_at IS NULL OR m2.expunged_at >= $6)
+				(
+					NOT EXISTS (
+						SELECT 1 FROM messages m_active
+						WHERE m_active.account_id = sw.account_id
+						  AND m_active.content_hash = sw.content_hash
+						  AND m_active.expunged_at IS NULL
+					)
+					AND
+					NOT EXISTS (
+						SELECT 1 FROM messages m_recent
+						WHERE m_recent.account_id = sw.account_id
+						  AND m_recent.content_hash = sw.content_hash
+						  AND m_recent.expunged_at >= $6
+					)
 				) as is_orphan
 			FROM (SELECT * FROM scan_window LIMIT $5) sw
 			ORDER BY sw.account_id, sw.s3_domain, sw.s3_localpart, sw.content_hash

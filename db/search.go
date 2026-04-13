@@ -141,16 +141,13 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 		statePrefix = tablePrefix + "."
 	}
 
-	// Flags
+	// Flags - inline the flag bitmasks to allow Postgres to use partial indexes natively
+	// (e.g. idx_message_state_first_unseen) instead of parameterized variables that defeat the query planner
 	for _, flag := range criteria.Flag {
-		param := nextParam()
-		args[param] = FlagToBitwise(flag)
-		conditions = append(conditions, fmt.Sprintf("(%sflags & @%s) != 0", statePrefix, param))
+		conditions = append(conditions, fmt.Sprintf("(%sflags & %d) != 0", statePrefix, FlagToBitwise(flag)))
 	}
 	for _, flag := range criteria.NotFlag {
-		param := nextParam()
-		args[param] = FlagToBitwise(flag)
-		conditions = append(conditions, fmt.Sprintf("(%sflags & @%s) = 0", statePrefix, param))
+		conditions = append(conditions, fmt.Sprintf("(%sflags & %d) = 0", statePrefix, FlagToBitwise(flag)))
 	}
 
 	// MODSEQ filtering (CONDSTORE extension - RFC 7162)
@@ -443,10 +440,9 @@ func (db *Database) needsComplexQuery(criteria *imap.SearchCriteria, orderByClau
 		}
 	}
 
-	// Check if ORDER BY clause requires complex operations
-	if strings.Contains(strings.ToLower(orderByClause), "seqnum") ||
-		strings.Contains(strings.ToLower(orderByClause), "jsonb_array_elements") ||
-		strings.Contains(strings.ToLower(orderByClause), "coalesce(") {
+	// Check if ORDER BY clause requires sequence number complex operations
+	// We do NOT check for 'coalesce' or 'json' operations since the Simple Query syntax natively supports them
+	if strings.Contains(strings.ToLower(orderByClause), "seqnum") {
 		return true
 	}
 
@@ -589,7 +585,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		simpleQueryTemplate := `
 			WITH filtered_messages AS (
 				SELECT
-					m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
+					m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 					m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq,
 					ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json,
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
@@ -630,12 +626,12 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		complexQueryTemplate := `
 			WITH filtered_messages AS (
 				SELECT
-					m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
+					m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 					m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq,
 					ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json,
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
 				FROM messages m
-				LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+				INNER JOIN messages_fts mc ON m.content_hash = mc.content_hash
 				LEFT JOIN message_state ms ON ms.message_id = m.id
 				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 				%s
@@ -671,7 +667,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			SELECT
 				m.id, m.uid,
 				ROW_NUMBER() OVER(ORDER BY uid) as seqnum,
-				m.account_id, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
+				m.account_id, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 				m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq,
 				ms.flags_changed_at, m.subject, m.sent_date, m.message_id,
 				m.in_reply_to, m.recipients_json, mc.text_body_tsv, mc.headers_tsv,
