@@ -531,9 +531,13 @@ func (s *POP3Session) handleConnection() {
 
 		case "LIST":
 			start := time.Now()
+			var backendDuration float64
 			recordMetrics := func(status string) {
 				metrics.CommandsTotal.WithLabelValues("pop3", "LIST", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "LIST").Observe(time.Since(start).Seconds())
+				if backendDuration == 0 {
+					backendDuration = time.Since(start).Seconds()
+				}
+				metrics.CommandDuration.WithLabelValues("pop3", "LIST").Observe(backendDuration)
 			}
 
 			// Check context before processing command
@@ -634,6 +638,7 @@ func (s *POP3Session) handleConnection() {
 					continue
 				}
 
+				backendDuration = time.Since(start).Seconds()
 				writer.WriteString(fmt.Sprintf("+OK %s\r\n", line))
 			} else {
 				// LIST without arguments - list all messages
@@ -653,6 +658,8 @@ func (s *POP3Session) handleConnection() {
 				release() // Release lock before I/O.
 
 				// Build and send response outside the lock.
+				backendDuration = time.Since(start).Seconds()
+
 				writer.WriteString(fmt.Sprintf("+OK %d messages\r\n", nonDeletedCount))
 				for _, line := range responseLines {
 					writer.WriteString(line + "\r\n")
@@ -665,9 +672,13 @@ func (s *POP3Session) handleConnection() {
 
 		case "UIDL":
 			start := time.Now()
+			var backendDuration float64
 			recordMetrics := func(status string) {
 				metrics.CommandsTotal.WithLabelValues("pop3", "UIDL", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "UIDL").Observe(time.Since(start).Seconds())
+				if backendDuration == 0 {
+					backendDuration = time.Since(start).Seconds()
+				}
+				metrics.CommandDuration.WithLabelValues("pop3", "UIDL").Observe(backendDuration)
 			}
 
 			// Check context before processing command
@@ -769,6 +780,8 @@ func (s *POP3Session) handleConnection() {
 
 				// Use UID as the unique identifier (more reliable than ContentHash)
 				release()
+
+				backendDuration = time.Since(start).Seconds()
 				writer.WriteString(fmt.Sprintf("+OK %d %d\r\n", msgNumber, msg.UID))
 			} else {
 				// UIDL without arguments - list all messages
@@ -788,6 +801,7 @@ func (s *POP3Session) handleConnection() {
 				release() // Release lock before I/O.
 
 				// Phase 4: Build and send response outside the lock.
+				backendDuration = time.Since(start).Seconds()
 				writer.WriteString(fmt.Sprintf("+OK %d messages\r\n", nonDeletedCount))
 				for _, line := range responseLines {
 					writer.WriteString(line + "\r\n")
@@ -800,9 +814,13 @@ func (s *POP3Session) handleConnection() {
 
 		case "TOP":
 			start := time.Now()
+			var backendDuration float64
 			recordMetrics := func(status string) {
 				metrics.CommandsTotal.WithLabelValues("pop3", "TOP", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "TOP").Observe(time.Since(start).Seconds())
+				if backendDuration == 0 {
+					backendDuration = time.Since(start).Seconds()
+				}
+				metrics.CommandDuration.WithLabelValues("pop3", "TOP").Observe(backendDuration)
 			}
 
 			// Check context before processing command
@@ -1010,6 +1028,8 @@ func (s *POP3Session) handleConnection() {
 
 			// Dot-stuff per RFC 1939
 			stuffedResult := dotStuffPOP3(result)
+
+			backendDuration = time.Since(start).Seconds()
 			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", len(result)))
 			writer.WriteString(stuffedResult)
 			writer.WriteString("\r\n.\r\n")
@@ -1024,9 +1044,13 @@ func (s *POP3Session) handleConnection() {
 
 		case "RETR":
 			retrieveStart := time.Now()
+			var backendDuration float64
 			recordMetrics := func(status string) {
 				metrics.CommandsTotal.WithLabelValues("pop3", "RETR", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "RETR").Observe(time.Since(retrieveStart).Seconds())
+				if backendDuration == 0 {
+					backendDuration = time.Since(retrieveStart).Seconds()
+				}
+				metrics.CommandDuration.WithLabelValues("pop3", "RETR").Observe(backendDuration)
 			}
 
 			// Check context before processing command
@@ -1187,6 +1211,8 @@ func (s *POP3Session) handleConnection() {
 
 			// Dot-stuff the message body per RFC 1939 to prevent premature termination
 			stuffedBody := dotStuffPOP3(string(bodyData))
+
+			backendDuration = time.Since(retrieveStart).Seconds()
 			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", msg.Size))
 			writer.WriteString(stuffedBody)
 			writer.WriteString("\r\n.\r\n")
@@ -1200,7 +1226,7 @@ func (s *POP3Session) handleConnection() {
 			// Track successful message retrieval
 			metrics.MessageThroughput.WithLabelValues("pop3", "retrieved", "success").Inc()
 			metrics.BytesThroughput.WithLabelValues("pop3", "out").Add(float64(msg.Size))
-			metrics.CriticalOperationDuration.WithLabelValues("pop3_retrieve").Observe(time.Since(retrieveStart).Seconds())
+			metrics.CriticalOperationDuration.WithLabelValues("pop3_retrieve").Observe(backendDuration)
 
 			// Track domain and user activity - RETR is bandwidth intensive!
 			if s.User != nil {
