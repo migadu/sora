@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"database/sql"
 
@@ -57,180 +58,171 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		}, nil
 	}
 
-	// OPTIMIZATION: Use a window function for active and recently
-	// expunged messages instead of a correlated subquery.
-	// The window function approach computes all expunged sequence numbers in one pass,
-	// replacing the O(N*M) correlated subquery with O(N log N) sorting.
+	// Phase 1: Fetch Raw Changes
+	// Instead of a massive CTE pipeline, we directly pull exactly the messages that changed.
 	rows, err := db.GetReadPool().Query(ctx, `
-		SELECT * FROM (
-			WITH
-			  global_stats AS (
-				SELECT
-					COALESCE(ms.message_count, 0) AS total_messages,
-					COALESCE(ms.highest_modseq, 0) AS highest_mailbox_modseq
-				FROM mailboxes mb
-				LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
-				WHERE mb.id = $1
-			  ),
-			  -- 1. Find all changed messages using a UNION to ensure PostgreSQL can effectively
-			  -- use specific modseq indexes (created, updated, expunged) instead of falling
-			  -- back to scanning the entire mailbox over massive OR queries.
-			  changed_messages_raw AS (
-			    SELECT m.uid, m.expunged_at, m.created_modseq, m.expunged_modseq, ms.flags, ms.custom_flags, COALESCE(ms.updated_modseq, 0) AS updated_modseq_val
-			    FROM messages m
-			    LEFT JOIN message_state ms ON ms.message_id = m.id
-			    WHERE m.mailbox_id = $1 AND m.created_modseq > $2
-			    
-			    UNION
-			    
-			    SELECT m.uid, m.expunged_at, m.created_modseq, m.expunged_modseq, ms.flags, ms.custom_flags, COALESCE(ms.updated_modseq, 0) AS updated_modseq_val
-			    FROM messages m
-			    LEFT JOIN message_state ms ON ms.message_id = m.id
-			    WHERE m.mailbox_id = $1 AND m.expunged_modseq > $2
-			    
-			    UNION
-			    
-			    SELECT m.uid, m.expunged_at, m.created_modseq, m.expunged_modseq, ms.flags, ms.custom_flags, ms.updated_modseq AS updated_modseq_val
-			    FROM message_state ms
-			    JOIN messages m ON ms.message_id = m.id
-			    WHERE ms.mailbox_id = $1 AND ms.updated_modseq > $2
-			  ),
-			  -- 2. Calculate their sequence numbers dynamically using optimal index-only correlated subqueries.
-			  -- Since changed_messages_raw usually only contains a small number of changed messages (K < 100),
-			  -- executing index-only subqueries avoids all MATERIALIZED table memory overhead AND avoids
-			  -- the Postgres 12+ recursive un-materialized inline window function trap.
-			  current_mailbox_state AS (
-			    SELECT
-			        cms.uid,
-			        (
-			          (SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = $1 AND m2.uid <= cms.uid AND m2.expunged_at IS NULL)
-			          +
-			          CASE 
-			            WHEN cms.expunged_at IS NOT NULL THEN 
-			              (SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = $1 AND m2.uid <= cms.uid AND m2.expunged_modseq > $2)
-			            ELSE 0 
-			          END
-			        ) AS seq_num,
-			        cms.flags,
-			        cms.custom_flags,
-			        cms.created_modseq,
-			        cms.updated_modseq_val,
-			        cms.expunged_modseq
-			    FROM changed_messages_raw cms
-			    WHERE (cms.expunged_modseq IS NULL OR cms.expunged_modseq > $2)
-			  ),
-			  changed_messages AS (
-			    SELECT
-			        cms.uid,
-			        cms.seq_num,
-			        cms.flags,
-			        cms.custom_flags,
-			        cms.expunged_modseq,
-			        GREATEST(cms.created_modseq, cms.updated_modseq_val, COALESCE(cms.expunged_modseq, 0)) AS effective_modseq,
-			        true AS is_message_update
-			    FROM current_mailbox_state cms
-			  )
-			SELECT
-			    cm.uid,
-			    cm.seq_num,
-			    cm.flags,
-			    cm.custom_flags,
-			    cm.expunged_modseq,
-			    cm.effective_modseq,
-			    cm.is_message_update,
-			    gs.total_messages,
-			    gs.highest_mailbox_modseq AS current_modseq
-			FROM changed_messages cm, global_stats gs
-			UNION ALL
-			SELECT
-			    NULL AS uid,
-			    NULL AS seq_num,
-			    NULL AS flags,
-			    NULL AS custom_flags,
-			    NULL AS expunged_modseq,
-			    NULL AS effective_modseq,
-			    false AS is_message_update,
-			    gs.total_messages,
-			    gs.highest_mailbox_modseq AS current_modseq
-			FROM global_stats gs
-			WHERE NOT EXISTS (SELECT 1 FROM changed_messages)
-		) AS combined_results
-		ORDER BY
-		    is_message_update DESC,
-		    (expunged_modseq IS NOT NULL) DESC,
-		    CASE WHEN expunged_modseq IS NOT NULL THEN -seq_num ELSE seq_num END ASC
+		SELECT uid, expunged_at, flags, custom_flags, created, updated, expunged FROM (
+			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq as created, ms.updated_modseq as updated, m.expunged_modseq as expunged
+			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id
+			WHERE m.mailbox_id = $1 AND m.created_modseq > $2
+			UNION
+			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq
+			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id
+			WHERE m.mailbox_id = $1 AND m.expunged_modseq > $2
+			UNION
+			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq
+			FROM message_state ms JOIN messages m ON ms.message_id = m.id
+			WHERE ms.mailbox_id = $1 AND ms.updated_modseq > $2
+		) sub
 	`, mailboxID, sinceModSeq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query combined mailbox poll: %w", err)
+		return nil, fmt.Errorf("failed to fetch raw changes: %w", err)
 	}
 	defer rows.Close()
 
-	var updates []MessageUpdate
-	var pollData MailboxPoll
-	firstRowProcessed := false
-
+	var rawUpdates []MessageUpdate
 	for rows.Next() {
-		var (
-			uidScannable             sql.NullInt32 // imap.UID is uint32
-			seqNumScannable          sql.NullInt32 // uint32
-			bitwiseFlagsScannable    sql.NullInt32 // INTEGER in DB
-			expungedModSeqPtr        *int64
-			customFlagsJSON          []byte
-			effectiveModSeqScannable sql.NullInt64
-			isMessageUpdate          bool
-			rowTotalMessages         uint32
-			rowCurrentModSeq         uint64
-		)
+		var uid uint32
+		var expungedAt sql.NullTime
+		var flags sql.NullInt32
+		var customFlagsJSON []byte
+		var created sql.NullInt64
+		var updated sql.NullInt64
+		var expunged sql.NullInt64
 
-		err := rows.Scan(
-			&uidScannable,
-			&seqNumScannable,
-			&bitwiseFlagsScannable,
-			&customFlagsJSON,
-			&expungedModSeqPtr,
-			&effectiveModSeqScannable,
-			&isMessageUpdate,
-			&rowTotalMessages,
-			&rowCurrentModSeq,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan combined poll data: %w", err)
+		if err := rows.Scan(&uid, &expungedAt, &flags, &customFlagsJSON, &created, &updated, &expunged); err != nil {
+			return nil, fmt.Errorf("failed to scan raw change: %w", err)
 		}
 
-		if !firstRowProcessed {
-			pollData.NumMessages = rowTotalMessages
-			pollData.ModSeq = rowCurrentModSeq
-			firstRowProcessed = true
+		var customFlags []string
+		if customFlagsJSON != nil {
+			if err := json.Unmarshal(customFlagsJSON, &customFlags); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal custom_flags in poll: %w", err)
+			}
 		}
 
-		if isMessageUpdate {
-			if !uidScannable.Valid || !seqNumScannable.Valid || !bitwiseFlagsScannable.Valid || !effectiveModSeqScannable.Valid {
-				return nil, fmt.Errorf("unexpected NULL value in message update row: uid_valid=%v, seq_valid=%v, flags_valid=%v, effective_modseq_valid=%v", uidScannable.Valid, seqNumScannable.Valid, bitwiseFlagsScannable.Valid, effectiveModSeqScannable.Valid)
-			}
-			var customFlags []string
-			if customFlagsJSON != nil { // Will be []byte("[]") if empty, or []byte("null")
-				if err := json.Unmarshal(customFlagsJSON, &customFlags); err != nil {
-					return nil, fmt.Errorf("failed to unmarshal custom_flags in poll: %w, json: %s", err, string(customFlagsJSON))
-				}
-			}
-			if !effectiveModSeqScannable.Valid { // Should always be valid if isMessageUpdate is true
-				return nil, fmt.Errorf("unexpected NULL effective_modseq in message update row for UID %d", uidScannable.Int32)
-			}
-			updates = append(updates, MessageUpdate{
-				UID:             imap.UID(uidScannable.Int32),
-				SeqNum:          uint32(seqNumScannable.Int32),
-				BitwiseFlags:    int(bitwiseFlagsScannable.Int32),
-				IsExpunge:       expungedModSeqPtr != nil,
-				CustomFlags:     customFlags,
-				EffectiveModSeq: uint64(effectiveModSeqScannable.Int64),
-			})
+		effective := uint64(0)
+		if created.Valid && uint64(created.Int64) > effective {
+			effective = uint64(created.Int64)
 		}
+		if updated.Valid && uint64(updated.Int64) > effective {
+			effective = uint64(updated.Int64)
+		}
+		if expunged.Valid && uint64(expunged.Int64) > effective {
+			effective = uint64(expunged.Int64)
+		}
+
+		bitwise := 0
+		if flags.Valid {
+			bitwise = int(flags.Int32)
+		}
+
+		rawUpdates = append(rawUpdates, MessageUpdate{
+			UID:             imap.UID(uid),
+			BitwiseFlags:    bitwise,
+			IsExpunge:       expungedAt.Valid,
+			CustomFlags:     customFlags,
+			EffectiveModSeq: effective,
+		})
 	}
-
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating through combined poll results: %w", err)
+		return nil, fmt.Errorf("error iterating raw changes: %w", err)
 	}
 
-	pollData.Updates = updates
+	pollData := MailboxPoll{
+		Updates:     []MessageUpdate{},
+		NumMessages: uint32(messageCount),
+		ModSeq:      currentModSeq,
+	}
+
+	if len(rawUpdates) == 0 {
+		return &pollData, nil
+	}
+
+	// Phase 2: Dynamic Sequence Hydration
+	uids := make([]uint32, len(rawUpdates))
+	for i, u := range rawUpdates {
+		uids[i] = uint32(u.UID)
+	}
+
+	seqMap := make(map[uint32]uint32)
+
+	if sinceModSeq > 0 && len(rawUpdates) <= 1000 {
+		// SPARSE PATH: Evaluate correlation strictly for the requested UIDs
+		seqRows, err := db.GetReadPool().Query(ctx, `
+			SELECT m.uid,
+			  (SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = $1 AND m2.uid <= m.uid AND m2.expunged_at IS NULL) as active_seq,
+			  (SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = $1 AND m2.uid <= m.uid AND m2.expunged_modseq > $2) as exp_offset
+			FROM messages m
+			WHERE m.mailbox_id = $1 AND m.uid = ANY($3)
+		`, mailboxID, sinceModSeq, uids)
+		if err != nil {
+			return nil, fmt.Errorf("failed to map sparse sequence numbers: %w", err)
+		}
+		defer seqRows.Close()
+
+		for seqRows.Next() {
+			var uid, active, offset uint32
+			if err := seqRows.Scan(&uid, &active, &offset); err != nil {
+				return nil, fmt.Errorf("failed to scan sparse sequence: %w", err)
+			}
+			seqMap[uid] = active + offset
+		}
+		if err := seqRows.Err(); err != nil {
+			return nil, fmt.Errorf("error in sparse hydration: %w", err)
+		}
+	} else {
+		// DENSE PATH: Stream the entire active block sequentially without memory CTEs
+		seqRows, err := db.GetReadPool().Query(ctx, `
+			SELECT uid, expunged_at
+			FROM messages
+			WHERE mailbox_id = $1 AND (expunged_at IS NULL OR expunged_modseq > $2)
+			ORDER BY uid ASC
+		`, mailboxID, sinceModSeq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query dense sequences: %w", err)
+		}
+		defer seqRows.Close()
+
+		activeCount := uint32(0)
+		expungedOffset := uint32(0)
+
+		for seqRows.Next() {
+			var uid uint32
+			var exp sql.NullTime
+			if err := seqRows.Scan(&uid, &exp); err != nil {
+				return nil, fmt.Errorf("failed to scan dense sequence row: %w", err)
+			}
+			if !exp.Valid {
+				activeCount++
+			} else {
+				expungedOffset++
+			}
+			seqMap[uid] = activeCount + expungedOffset
+		}
+		if err := seqRows.Err(); err != nil {
+			return nil, fmt.Errorf("error iterating dense sequences: %w", err)
+		}
+	}
+
+	for i := range rawUpdates {
+		rawUpdates[i].SeqNum = seqMap[uint32(rawUpdates[i].UID)]
+	}
+
+	// Sort correctly for correct IMAP processing:
+	// Expunged processed top-down, flags processed bottom-up.
+	sort.Slice(rawUpdates, func(i, j int) bool {
+		a := rawUpdates[i]
+		b := rawUpdates[j]
+		if a.IsExpunge != b.IsExpunge {
+			return a.IsExpunge
+		}
+		if a.IsExpunge {
+			return a.SeqNum > b.SeqNum
+		}
+		return a.SeqNum < b.SeqNum
+	})
+
+	pollData.Updates = rawUpdates
 	return &pollData, nil
 }

@@ -1,8 +1,13 @@
--- Revert migration 024: Remove custom_flags_cache initialization from trigger
+-- Revert migration 024: Remove custom_flags_cache initialization
 --
--- This reverts the trigger back to not initializing custom_flags_cache,
--- but does NOT remove the backfilled data (that would be destructive).
+-- This reverts the column default back to NULL and restores the original trigger.
+-- Does NOT remove the backfilled data (that would be destructive).
 
+-- Revert column default to NULL
+ALTER TABLE mailbox_stats
+ALTER COLUMN custom_flags_cache SET DEFAULT NULL;
+
+-- Restore original trigger function
 CREATE OR REPLACE FUNCTION maintain_mailbox_stats()
 RETURNS TRIGGER AS $$
 DECLARE

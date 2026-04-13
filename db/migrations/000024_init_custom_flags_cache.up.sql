@@ -4,15 +4,19 @@
 -- with custom_flags_cache = NULL, causing expensive LATERAL queries to run
 -- on every SELECT until the custom_flags_cache trigger populates it.
 --
--- Solution: Modify the trigger to initialize custom_flags_cache to '[]'::jsonb
--- when creating new mailbox_stats rows.
+-- Solution: Change column default to '[]'::jsonb so all new rows are initialized automatically.
 
 -- First, backfill existing NULL entries
 UPDATE mailbox_stats
 SET custom_flags_cache = '[]'::jsonb
 WHERE custom_flags_cache IS NULL;
 
--- Now modify the trigger to initialize new rows with empty array
+-- Change column default from NULL to '[]'::jsonb
+-- This ensures ALL future INSERTs get '[]' automatically, even outside the trigger
+ALTER TABLE mailbox_stats
+ALTER COLUMN custom_flags_cache SET DEFAULT '[]'::jsonb;
+
+-- Now modify the trigger to use COALESCE on conflict (for pre-existing rows)
 CREATE OR REPLACE FUNCTION maintain_mailbox_stats()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -74,15 +78,17 @@ BEGIN
     END IF;
 
     -- Insert or update mailbox_stats
-    -- CHANGE: Initialize custom_flags_cache to '[]'::jsonb on INSERT
-    INSERT INTO mailbox_stats (mailbox_id, message_count, unseen_count, total_size, highest_modseq, updated_at, custom_flags_cache)
-    VALUES (v_mailbox_id, count_delta, unseen_delta, size_delta, modseq_val, now(), '[]'::jsonb)
+    -- NOTE: custom_flags_cache now has DEFAULT '[]'::jsonb, so we don't need to set it explicitly
+    -- We only need COALESCE in the ON CONFLICT to catch pre-existing NULL rows
+    INSERT INTO mailbox_stats (mailbox_id, message_count, unseen_count, total_size, highest_modseq, updated_at)
+    VALUES (v_mailbox_id, count_delta, unseen_delta, size_delta, modseq_val, now())
     ON CONFLICT (mailbox_id) DO UPDATE SET
         message_count = mailbox_stats.message_count + count_delta,
         unseen_count = mailbox_stats.unseen_count + unseen_delta,
         total_size = mailbox_stats.total_size + size_delta,
         highest_modseq = GREATEST(mailbox_stats.highest_modseq, modseq_val),
-        updated_at = now();
+        updated_at = now(),
+        custom_flags_cache = COALESCE(mailbox_stats.custom_flags_cache, '[]'::jsonb);
 
     IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
 END;
