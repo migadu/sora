@@ -175,7 +175,7 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 			0 as seqnum,
 			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
-		LEFT JOIN message_state ms ON ms.message_id = m.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
 		  AND (%[2]s)
 		ORDER BY m.uid`, bsColInner, whereClause)
@@ -268,7 +268,7 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 			0 as seqnum,
 			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
-		LEFT JOIN message_state ms ON ms.message_id = m.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
 		  AND (%s)
 		ORDER BY m.uid
@@ -304,7 +304,7 @@ func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int
 			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
 			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
-		LEFT JOIN message_state ms ON ms.message_id = m.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL AND m.uploaded = true
 		ORDER BY m.uid ASC
 	`, bsCol)
@@ -431,7 +431,7 @@ func (db *Database) GetMessagesByFlag(ctx context.Context, mailboxID int64, flag
 			0 as seqnum,
 			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
-		LEFT JOIN message_state ms ON ms.message_id = m.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND (ms.flags & $2) != 0 AND m.expunged_at IS NULL
 		ORDER BY m.uid
 	`, mailboxID, bitwiseFlag)
@@ -474,7 +474,7 @@ func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID 
 		SELECT m.uid, n.seqnum
 		FROM messages m
 		JOIN numbered n ON m.uid = n.uid
-		LEFT JOIN message_state ms ON ms.message_id = m.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND (ms.flags & $2) != 0 AND m.expunged_at IS NULL
 		ORDER BY m.uid
 	`, mailboxID, FlagToBitwise(imap.FlagDeleted))

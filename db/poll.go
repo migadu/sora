@@ -63,11 +63,11 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	rows, err := db.GetReadPool().Query(ctx, `
 		SELECT uid, expunged_at, flags, custom_flags, created, updated, expunged FROM (
 			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq as created, ms.updated_modseq as updated, m.expunged_modseq as expunged
-			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id
+			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 			WHERE m.mailbox_id = $1 AND m.created_modseq > $2
 			UNION
 			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq
-			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id
+			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 			WHERE m.mailbox_id = $1 AND m.expunged_modseq > $2
 			UNION
 			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq

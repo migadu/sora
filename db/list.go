@@ -32,7 +32,7 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 			m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
 			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
-		LEFT JOIN message_state ms ON ms.message_id = m.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 		ORDER BY m.uid`
 

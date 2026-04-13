@@ -613,7 +613,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 					ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json,
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
 				FROM messages m
-				LEFT JOIN message_state ms ON ms.message_id = m.id
+				LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 				%s
 				LIMIT %d
@@ -666,7 +666,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
 				FROM messages m
 				LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
-				LEFT JOIN message_state ms ON ms.message_id = m.id
+				LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 				%s
 				LIMIT %d
@@ -718,7 +718,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		FROM message_seqs seq
 		INNER JOIN messages m ON m.id = seq.id
 		LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
-		LEFT JOIN message_state ms ON ms.message_id = m.id`
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id`
 
 		innerOrderByClause := orderByClause
 		if db.needsIndexScanBiasBuster(criteria) {

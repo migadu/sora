@@ -83,7 +83,7 @@ func (db *Database) GetUnseenCountForMailbox(ctx context.Context, accountID int6
 	query := fmt.Sprintf(`
 		SELECT COUNT(*) 
 		FROM messages m
-		LEFT JOIN message_state ms ON ms.message_id = m.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL AND (ms.flags & %d) = 0
 	`, FlagSeen)
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, query, mailbox.ID).Scan(&count)
@@ -110,7 +110,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 			mb.name as mailbox_path
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
-		LEFT JOIN message_state ms ON ms.message_id = m.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 	`
 
@@ -219,7 +219,7 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
 		LEFT JOIN messages_fts mf ON m.content_hash = mf.content_hash
-		LEFT JOIN message_state ms ON ms.message_id = m.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 		AND (
 			LOWER(m.subject) LIKE LOWER($2)
@@ -401,7 +401,7 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 			mb.name as mailbox_path
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
-		LEFT JOIN message_state ms ON ms.message_id = m.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
 	`
 
@@ -466,7 +466,7 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 	err = tx.QueryRow(ctx, `
 		SELECT ms.flags, ms.custom_flags 
 		FROM messages m
-		LEFT JOIN message_state ms ON ms.message_id = m.id
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
 	`, messageID, accountID).Scan(&currentFlags, &currentCustomFlags)
 
