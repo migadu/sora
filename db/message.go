@@ -167,7 +167,7 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 			conditions = append(conditions, fmt.Sprintf("(m.uid >= $%d AND m.uid <= $%d)", len(args)-1, len(args)))
 		}
 	}
-	
+
 	whereClause := strings.Join(conditions, " OR ")
 
 	query := fmt.Sprintf(`

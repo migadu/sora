@@ -95,27 +95,35 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			    JOIN messages m ON ms.message_id = m.id
 			    WHERE ms.mailbox_id = $1 AND ms.updated_modseq > $2
 			  ),
-			  -- 2. Calculate their sequence numbers dynamically using correlated subqueries
-			  -- heavily optimized by specific partial indexes. We split the OR condition
-			  -- into two separate COUNT() queries to guarantee index usage.
+			  bounds AS (
+				SELECT COALESCE(MIN(uid), 0) AS min_uid, COALESCE(MAX(uid), 0) AS max_uid FROM changed_messages_raw
+			  ),
+			  base_count AS (
+				SELECT COUNT(*) as alive_base FROM messages m, bounds b
+				WHERE m.mailbox_id = $1 AND m.uid < b.min_uid AND m.expunged_at IS NULL
+			  ),
+			  base_expunged_count AS (
+				SELECT COUNT(*) as expunged_base FROM messages m, bounds b
+				WHERE m.mailbox_id = $1 AND m.uid < b.min_uid AND m.expunged_modseq > $2
+			  ),
+			  range_counts AS (
+				SELECT 
+					m.uid, 
+					COUNT(CASE WHEN m.expunged_at IS NULL THEN 1 END) OVER(ORDER BY m.uid ASC) as alive_offset,
+					COUNT(CASE WHEN m.expunged_modseq > $2 THEN 1 END) OVER(ORDER BY m.uid ASC) as expunged_offset
+				FROM messages m, bounds b
+				WHERE m.mailbox_id = $1 AND m.uid BETWEEN b.min_uid AND b.max_uid 
+				  AND (m.expunged_at IS NULL OR m.expunged_modseq > $2)
+			  ),
+			  -- 2. Calculate their sequence numbers dynamically using bounded window functions
 			  current_mailbox_state AS (
 			    SELECT
 			        cms.uid,
 			        CASE 
 			          WHEN cms.expunged_at IS NOT NULL THEN 
-			            (SELECT COUNT(*) FROM messages m2 
-			             WHERE m2.mailbox_id = $1 
-			               AND m2.expunged_at IS NULL 
-			               AND m2.uid <= cms.uid) + 
-			            (SELECT COUNT(*) FROM messages m2 
-			             WHERE m2.mailbox_id = $1 
-			               AND m2.expunged_modseq > $2 
-			               AND m2.uid <= cms.uid)
+			            (bc.alive_base + COALESCE(rc.alive_offset, 0)) + (bec.expunged_base + COALESCE(rc.expunged_offset, 0))
 			          ELSE 
-			            (SELECT COUNT(*) FROM messages m2 
-			             WHERE m2.mailbox_id = $1 
-			               AND m2.expunged_at IS NULL 
-			               AND m2.uid <= cms.uid)
+			            (bc.alive_base + COALESCE(rc.alive_offset, 0))
 			        END AS seq_num,
 			        cms.flags,
 			        cms.custom_flags,
@@ -123,6 +131,9 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			        cms.updated_modseq_val,
 			        cms.expunged_modseq
 			    FROM changed_messages_raw cms
+				CROSS JOIN base_count bc
+				CROSS JOIN base_expunged_count bec
+				LEFT JOIN range_counts rc ON cms.uid = rc.uid
 			    WHERE (cms.expunged_modseq IS NULL OR cms.expunged_modseq > $2)
 			  ),
 			  changed_messages AS (
