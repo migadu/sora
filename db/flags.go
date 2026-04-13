@@ -377,20 +377,5 @@ func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxI
 		result[i] = string(f)
 	}
 
-	// OPTIMIZATION: If we fell through to the full scan (because the cache was NULL),
-	// permanently populate the cache now so this expensive 3.5s lateral query NEVER runs again!
-	// We only UPDATE where it's NULL to avoid clobbering concurrent trigger updates.
-	var writeErr error
-	if len(result) == 0 {
-		_, writeErr = db.GetWritePool().Exec(ctx, "UPDATE mailbox_stats SET custom_flags_cache = '[]'::jsonb WHERE mailbox_id = $1 AND custom_flags_cache IS NULL", mailboxID)
-	} else {
-		if cacheBytes, marshalErr := json.Marshal(result); marshalErr == nil {
-			_, writeErr = db.GetWritePool().Exec(ctx, "UPDATE mailbox_stats SET custom_flags_cache = $1 WHERE mailbox_id = $2 AND custom_flags_cache IS NULL", cacheBytes, mailboxID)
-		}
-	}
-	if writeErr != nil {
-		log.Printf("Database: failed to lazily populate custom_flags_cache for mailbox %d: %v", mailboxID, writeErr)
-	}
-
 	return result, nil
 }
