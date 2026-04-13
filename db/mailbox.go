@@ -646,41 +646,42 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 		return nil, fmt.Errorf("failed to get mailbox summary stats: %w", err)
 	}
 
-	// If we have unseen messages, find the first unseen sequence number
-	if s.UnseenCount > 0 {
-		// OPTIMIZATION: Compute sequence number with two separate, efficient queries.
-		// Splitting them prevents the PostgreSQL query planner from creating a suboptimal
-		// nested loop or bitmap heap plan that could timeout on large mailboxes.
-		var firstUnseenUID int64
-		// Inline FlagSeen in the query string so the PostgreSQL query planner
-		// can match the condition against the partial index WHERE (flags & 1) = 0.
-		// Using a parameter ($2) prevents the planner from using the partial index.
-		query := fmt.Sprintf(`
-			SELECT m.uid FROM message_state ms
-			JOIN messages m ON ms.message_id = m.id
-			WHERE ms.mailbox_id = $1 AND (ms.flags & %d) = 0 AND m.expunged_at IS NULL
-			ORDER BY ms.message_id ASC LIMIT 1
-		`, FlagSeen)
-		err = d.GetReadPoolWithContext(ctx).QueryRow(ctx, query, mailboxID).Scan(&firstUnseenUID)
-
-		if err == nil {
-			err = d.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-				SELECT COUNT(*) + 1 FROM messages
-				WHERE mailbox_id = $1 AND expunged_at IS NULL
-				  AND uid < $2
-			`, mailboxID, firstUnseenUID).Scan(&s.FirstUnseenSeqNum)
-		}
-
-		if err != nil && err != pgx.ErrNoRows {
-			logger.Error("Database: failed to get first unseen sequence number", "mailbox_id", mailboxID, "err", err)
-			s.FirstUnseenSeqNum = 0 // Default to 0 on failure
-		}
-	} else {
-		// No unseen messages
-		s.FirstUnseenSeqNum = 0
-	}
+	// FirstUnseenSeqNum computation is extremely expensive (O(N) count).
+	// It has been extracted to GetFirstUnseenSeqNum() so that background STATUS
+	// commands don't paralyze the DB connection pool.
+	s.FirstUnseenSeqNum = 0
 
 	return &s, nil
+}
+
+// GetFirstUnseenSeqNum performs the expensive O(N) count translation of the first unseen UID into a sequence number.
+// This must only be called for IMAP SELECT/EXAMINE where the IMAP protocol mandates [UNSEEN <seq>].
+func (d *Database) GetFirstUnseenSeqNum(ctx context.Context, mailboxID int64) (uint32, error) {
+	var firstUnseenUID int64
+	query := fmt.Sprintf(`
+		SELECT m.uid FROM message_state ms
+		JOIN messages m ON ms.message_id = m.id
+		WHERE ms.mailbox_id = $1 AND (ms.flags & %d) = 0 AND m.expunged_at IS NULL
+		ORDER BY ms.message_id ASC LIMIT 1
+	`, FlagSeen)
+	err := d.GetReadPoolWithContext(ctx).QueryRow(ctx, query, mailboxID).Scan(&firstUnseenUID)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("failed to fetch first unseen UID: %w", err)
+	}
+
+	var seqNum uint32
+	err = d.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT COUNT(*) + 1 FROM messages
+		WHERE mailbox_id = $1 AND expunged_at IS NULL
+		  AND uid < $2
+	`, mailboxID, firstUnseenUID).Scan(&seqNum)
+	if err != nil {
+		return 0, fmt.Errorf("failed to compute sequence number for UID %d: %w", firstUnseenUID, err)
+	}
+	return seqNum, nil
 }
 
 func (d *Database) GetMailboxSummariesBatch(ctx context.Context, mailboxIDs []int64) (map[int64]*MailboxSummary, error) {

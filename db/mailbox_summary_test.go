@@ -86,7 +86,10 @@ func TestGetMailboxSummaryFirstUnseen(t *testing.T) {
 		summary, err := db.GetMailboxSummary(ctx, mailboxID)
 		require.NoError(t, err)
 		assert.Equal(t, 0, summary.UnseenCount, "UnseenCount should be 0 for empty mailbox")
-		assert.Equal(t, uint32(0), summary.FirstUnseenSeqNum, "FirstUnseenSeqNum should be 0 for empty mailbox")
+
+		seqNum, err := db.GetFirstUnseenSeqNum(ctx, mailboxID)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(0), seqNum, "FirstUnseenSeqNum should be 0 for empty mailbox")
 	})
 
 	// --- Scenario 2: All messages are seen ---
@@ -101,7 +104,10 @@ func TestGetMailboxSummaryFirstUnseen(t *testing.T) {
 		summary, err := db.GetMailboxSummary(ctx, mailboxID)
 		require.NoError(t, err)
 		assert.Equal(t, 0, summary.UnseenCount, "UnseenCount should be 0 when all messages are seen")
-		assert.Equal(t, uint32(0), summary.FirstUnseenSeqNum, "FirstUnseenSeqNum should be 0 when all messages are seen")
+
+		seqNum, err := db.GetFirstUnseenSeqNum(ctx, mailboxID)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(0), seqNum, "FirstUnseenSeqNum should be 0 when all messages are seen")
 
 		// Cleanup for next scenario
 		tx, err = db.GetWritePool().Begin(ctx)
@@ -135,7 +141,10 @@ func TestGetMailboxSummaryFirstUnseen(t *testing.T) {
 		summary, err := db.GetMailboxSummary(ctx, mailboxID)
 		require.NoError(t, err)
 		assert.Equal(t, 3, summary.UnseenCount, "UnseenCount should be 3")
-		assert.Equal(t, uint32(1), summary.FirstUnseenSeqNum, "FirstUnseenSeqNum should be 1 when all are unseen")
+
+		seqNum, err := db.GetFirstUnseenSeqNum(ctx, mailboxID)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(1), seqNum, "FirstUnseenSeqNum should be 1 when all are unseen")
 
 		// Cleanup
 		tx, err = db.GetWritePool().Begin(ctx)
@@ -169,7 +178,10 @@ func TestGetMailboxSummaryFirstUnseen(t *testing.T) {
 		summary, err := db.GetMailboxSummary(ctx, mailboxID)
 		require.NoError(t, err)
 		assert.Equal(t, 2, summary.UnseenCount, "UnseenCount should be 2")
-		assert.Equal(t, uint32(3), summary.FirstUnseenSeqNum, "FirstUnseenSeqNum should be 3 (pointing to UID 30)")
+
+		seqNum, err := db.GetFirstUnseenSeqNum(ctx, mailboxID)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(3), seqNum, "FirstUnseenSeqNum should be 3 (pointing to UID 30)")
 
 		// Cleanup
 		tx, err = db.GetWritePool().Begin(ctx)

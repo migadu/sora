@@ -190,10 +190,20 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	s.currentNumMessages.Store(uint32(currentSummary.NumMessages))
 	s.currentHighestModSeq.Store(currentSummary.HighestModSeq)
 
-	// Store the first unseen message sequence number from the mailbox summary
-	s.firstUnseenSeqNum.Store(currentSummary.FirstUnseenSeqNum)
-	if currentSummary.FirstUnseenSeqNum > 0 {
-		s.DebugLog("first unseen message", "seq", currentSummary.FirstUnseenSeqNum)
+	// Extract the first unseen message sequence number lazily natively for SELECT explicitly.
+	// We do not compute this natively in GetMailboxSummary to prevent O(N) counts across all background STATUS checks.
+	var firstUnseenSeqNum uint32
+	if currentSummary.UnseenCount > 0 {
+		seq, seqErr := s.server.rdb.GetFirstUnseenSeqNumWithRetry(readCtx, mailbox.ID)
+		if seqErr == nil {
+			firstUnseenSeqNum = seq
+		} else {
+			s.WarnLog("failed to dynamically compute first unseen sequence number", "mailbox_id", mailbox.ID, "err", seqErr)
+		}
+	}
+	s.firstUnseenSeqNum.Store(firstUnseenSeqNum)
+	if firstUnseenSeqNum > 0 {
+		s.DebugLog("first unseen message dynamically bound", "seq", firstUnseenSeqNum)
 	}
 
 	s.selectedMailbox = mailbox
