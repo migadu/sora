@@ -653,8 +653,13 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			FROM filtered_messages f
 			%s`
 
+		innerOrderByClause := strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+		if innerOrderByClause == orderByClause {
+			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+		}
+
 		outerOrderByClause := strings.ReplaceAll(orderByClause, "m.", "f.")
-		finalQueryString = fmt.Sprintf(complexQueryTemplate, whereCondition, orderByClause, resultLimit, outerOrderByClause)
+		finalQueryString = fmt.Sprintf(complexQueryTemplate, whereCondition, innerOrderByClause, resultLimit, outerOrderByClause)
 		metricsLabel = "search_messages_complex_fast"
 
 	} else {
@@ -669,7 +674,6 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			orderByClause = "ORDER BY uid DESC"
 		}
 
-		// Complex path: Use CTE when sequence numbers are needed in WHERE
 		const complexQuery = `
 		WITH message_seqs AS (
 			SELECT
@@ -686,7 +690,12 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		INNER JOIN messages m ON m.id = seq.id
 		LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
 		LEFT JOIN message_state ms ON ms.message_id = m.id`
-		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, orderByClause, resultLimit)
+
+		innerOrderByClause := strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+		if innerOrderByClause == orderByClause {
+			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+		}
+		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, innerOrderByClause, resultLimit)
 		metricsLabel = "search_messages_complex_legacy"
 	}
 
@@ -711,11 +720,11 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 	messages, err := scanMessages(rows, false)
 	scanDuration := time.Since(scanStart)
 	if err != nil {
-		logger.Error("Database: failed scanning messages", "err", err, "scan_duration", scanDuration, "query_duration", time.Since(start), "mailbox_id", mailboxID)
+		logger.Error("Database: failed scanning messages", "err", err, "scan_duration", scanDuration, "query_duration", time.Since(start), "mailbox_id", mailboxID, "query", finalQueryString, "args", whereArgs)
 		return nil, fmt.Errorf("getMessagesQueryExecutor: failed to scan messages: %w", err)
 	}
 	if scanDuration > 5*time.Second {
-		logger.Warn("Database: slow message scan detected", "scan_duration", scanDuration, "row_count", len(messages), "mailbox_id", mailboxID, "query_type", metricsLabel)
+		logger.Warn("Database: slow message scan detected", "scan_duration", scanDuration, "row_count", len(messages), "mailbox_id", mailboxID, "query_type", metricsLabel, "query", finalQueryString, "args", whereArgs)
 	}
 
 	// Dynamic sequence hydration (O(1) mapped iteration rather than PostgreSQL quadratic windowing)
