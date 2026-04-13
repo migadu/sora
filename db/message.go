@@ -145,9 +145,11 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 		return nil, nil
 	}
 
-	bsCol := ""
+	bsColInner := ""
+	bsColOuter := ""
 	if includeBodyStructure {
-		bsCol = "m.body_structure, "
+		bsColInner = "m.body_structure, "
+		bsColOuter = "f.body_structure, "
 	}
 
 	// Consolidate all UID ranges into a single WHERE clause to avoid executing hundreds
@@ -199,7 +201,7 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 		FROM filtered_messages f
 		CROSS JOIN base_count bc
 		JOIN range_counts rc ON f.uid = rc.uid
-		ORDER BY f.uid`, bsCol, whereClause, bsCol)
+		ORDER BY f.uid`, bsColInner, whereClause, bsColOuter)
 
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
 	if err != nil {
@@ -232,9 +234,11 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 		return db.fetchAllActiveMessagesRaw(ctx, mailboxID, includeBodyStructure)
 	}
 
-	bsCol := ""
+	bsColInner := ""
+	bsColOuter := ""
 	if includeBodyStructure {
-		bsCol = "m.body_structure, "
+		bsColInner = "m.body_structure, "
+		bsColOuter = "f.body_structure, "
 	}
 
 	// Map sequence ranges to UID ranges to prevent O(N) ROW_NUMBER() CTE scans
@@ -307,7 +311,7 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 		CROSS JOIN base_count bc
 		JOIN range_counts rc ON f.uid = rc.uid
 		ORDER BY f.uid
-	`, bsCol, whereClause, bsCol)
+	`, bsColInner, whereClause, bsColOuter)
 
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
 	if err != nil {
@@ -328,7 +332,7 @@ func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int
 
 	query := fmt.Sprintf(`
 		WITH numbered_messages AS (
-			SELECT *, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
+			SELECT *, ROW_NUMBER() OVER(ORDER BY uid ASC) as seqnum
 			FROM messages
 			WHERE mailbox_id = $1 AND expunged_at IS NULL
 		)
@@ -339,7 +343,7 @@ func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int
 		FROM numbered_messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id
 		WHERE m.uploaded = true
-		ORDER BY m.uid
+		ORDER BY m.uid ASC
 	`, bsCol)
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID)
 	if err != nil {
