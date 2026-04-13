@@ -180,32 +180,13 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 			LEFT JOIN message_state ms ON ms.message_id = m.id
 			WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
 			  AND (%s)
-		),
-		bounds AS (
-			SELECT COALESCE(MIN(uid), 0) as min_uid, COALESCE(MAX(uid), 0) as max_uid FROM filtered_messages
-		),
-		base_count AS (
-			SELECT COUNT(*) as base
-			FROM messages m
-			WHERE m.mailbox_id = $1
-			  AND m.uid < (SELECT min_uid FROM bounds)
-			  AND m.expunged_at IS NULL
-		),
-		range_counts AS (
-			SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid ASC) as offset
-			FROM messages m
-			WHERE m.mailbox_id = $1
-			  AND m.uid BETWEEN (SELECT min_uid FROM bounds) AND (SELECT max_uid FROM bounds)
-			  AND m.expunged_at IS NULL
 		)
 		SELECT
 			f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
 			f.internal_date, f.size, %sf.created_modseq, f.updated_modseq, f.expunged_modseq,
-			(bc.base + rc.offset) as seqnum,
+			(SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = $1 AND m2.uid <= f.uid AND m2.expunged_at IS NULL) as seqnum,
 			f.flags_changed_at, f.subject, f.sent_date, f.message_id, f.in_reply_to, f.recipients_json
 		FROM filtered_messages f
-		CROSS JOIN base_count bc
-		JOIN range_counts rc ON f.uid = rc.uid
 		ORDER BY f.uid`, bsColInner, whereClause, bsColOuter)
 
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
@@ -286,7 +267,7 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 
 	query := fmt.Sprintf(`
 		WITH filtered_messages AS (
-			SELECT 
+			SELECT
 				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, ms.flags, ms.custom_flags,
 				m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
 				ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
@@ -294,32 +275,13 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 			LEFT JOIN message_state ms ON ms.message_id = m.id
 			WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
 			  AND (%s)
-		),
-		bounds AS (
-			SELECT COALESCE(MIN(uid), 0) as min_uid, COALESCE(MAX(uid), 0) as max_uid FROM filtered_messages
-		),
-		base_count AS (
-			SELECT COUNT(*) as base
-			FROM messages m
-			WHERE m.mailbox_id = $1
-			  AND m.uid < (SELECT min_uid FROM bounds)
-			  AND m.expunged_at IS NULL
-		),
-		range_counts AS (
-			SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid ASC) as offset
-			FROM messages m
-			WHERE m.mailbox_id = $1
-			  AND m.uid BETWEEN (SELECT min_uid FROM bounds) AND (SELECT max_uid FROM bounds)
-			  AND m.expunged_at IS NULL
 		)
-		SELECT 
+		SELECT
 			f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
 			f.internal_date, f.size, %sf.created_modseq, f.updated_modseq, f.expunged_modseq,
-			(bc.base + rc.offset) as seqnum,
+			(SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = $1 AND m2.uid <= f.uid AND m2.expunged_at IS NULL) as seqnum,
 			f.flags_changed_at, f.subject, f.sent_date, f.message_id, f.in_reply_to, f.recipients_json
 		FROM filtered_messages f
-		CROSS JOIN base_count bc
-		JOIN range_counts rc ON f.uid = rc.uid
 		ORDER BY f.uid
 	`, bsColInner, whereClause, bsColOuter)
 
