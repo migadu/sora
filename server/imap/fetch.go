@@ -1,22 +1,17 @@
 package imap
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
-	"github.com/emersion/go-message/textproto"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/storage"
-
-	tp "net/textproto"
 
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -512,69 +507,6 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 		var extractionErr error // For errors from imapserver.Extract... functions
 		satisfiedFromDB := false
 
-		// Is this a request for specific header fields of the main message? (e.g., BODY[HEADER.FIELDS (SUBJECT FROM)])
-		isHeaderFieldsRequest := section.Specifier == imap.PartSpecifierHeader && len(section.HeaderFields) > 0 && len(section.Part) == 0
-
-		// Is this a request for all headers of the main message? (e.g., BODY[HEADER])
-		isAllHeadersRequest := section.Specifier == imap.PartSpecifierHeader && len(section.HeaderFields) == 0 && len(section.HeaderFieldsNot) == 0 && len(section.Part) == 0
-
-		if isHeaderFieldsRequest {
-			headersText, dbErr := s.server.rdb.GetMessageHeadersWithRetry(s.ctx, msg.UID, selectedMailboxID)
-			if dbErr == nil && headersText != "" {
-				// Ensure headersText is a valid block for parsing, ending with \r\n if not empty.
-				headerBlockToParse := headersText
-				if !strings.HasSuffix(headerBlockToParse, crlf) && headerBlockToParse != "" {
-					headerBlockToParse += crlf
-				}
-				parsedDBHeader, parseErr := textproto.ReadHeader(bufio.NewReader(bytes.NewReader([]byte(headerBlockToParse))))
-				if parseErr == nil {
-					sectionContent, extractionErr = extractRequestedHeaders(parsedDBHeader, section)
-					if extractionErr == nil && section.Partial != nil {
-						sectionContent = extractPartial(sectionContent, section.Partial)
-					}
-					satisfiedFromDB = true
-					s.DebugLog("served BODY HEADER.FIELDS from database", "uid", msg.UID)
-				} else {
-					s.DebugLog("error parsing DB headers for HEADER.FIELDS, falling back", "uid", msg.UID, "error", parseErr)
-					extractionErr = parseErr // Signal to fallback to full body parsing
-				}
-			} else {
-				if dbErr != nil {
-					s.DebugLog("failed to get headers from DB for BODY HEADER.FIELDS, falling back", "uid", msg.UID, "error", dbErr)
-					extractionErr = dbErr // Signal to fallback
-				} else {
-					s.DebugLog("headers from DB for BODY HEADER.FIELDS are empty, falling back", "uid", msg.UID)
-					// extractionErr remains nil, fallback will happen due to !satisfiedFromDB
-				}
-			}
-		} else if isAllHeadersRequest {
-			headersText, dbErr := s.server.rdb.GetMessageHeadersWithRetry(s.ctx, msg.UID, selectedMailboxID)
-			if dbErr == nil && headersText != "" {
-				// headersText from DB is the block of headers.
-				// It might be "H1:V1" or "H1:V1\r\nH2:V2".
-				// We need to ensure its own last line ends with crlf, then add the final separator crlf.
-				if !strings.HasSuffix(headersText, crlf) {
-					headersText += crlf
-				}
-				sectionContent = []byte(headersText + crlf)
-				if section.Partial != nil {
-					sectionContent = extractPartial(sectionContent, section.Partial)
-				}
-				satisfiedFromDB = true
-				s.DebugLog("served BODY HEADER from database", "uid", msg.UID)
-			} else {
-				if dbErr != nil {
-					s.DebugLog("failed to get headers from DB for BODY HEADER, falling back", "uid", msg.UID, "error", dbErr)
-				} else {
-					s.DebugLog("headers from DB for BODY HEADER are empty, falling back", "uid", msg.UID)
-				}
-			}
-		}
-		// Note: We do NOT serve BODY[TEXT] from the database's text_body field.
-		// The text_body field contains decoded plaintext for search/indexing purposes only.
-		// BODY[TEXT] must return the raw encoded body as it appears in the original message,
-		// which requires fetching and parsing the full message body.
-
 		// Fallback or other section types
 		// If not satisfied from DB, or if there was an error extracting from DB-sourced content (extractionErr != nil),
 		// or if it's a complex section type that always requires full body.
@@ -727,77 +659,4 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 	}
 
 	return data, nil
-}
-
-// extractRequestedHeaders filters headers from a parsedDBHeader based on the section criteria.
-// It constructs a new textproto.Header containing only the desired fields and then writes it.
-// This approach preserves the original raw formatting of the selected header lines.
-func extractRequestedHeaders(parsedDBHeader textproto.Header, section *imap.FetchItemBodySection) ([]byte, error) {
-	var rawLinesToOutput [][]byte // Collect raw lines in the desired output order
-
-	// Create a set of fields to exclude for quick lookup (canonical keys)
-	excludeSet := make(map[string]struct{})
-	for _, notField := range section.HeaderFieldsNot {
-		excludeSet[tp.CanonicalMIMEHeaderKey(notField)] = struct{}{}
-	}
-
-	if len(section.HeaderFields) > 0 {
-		// Specific fields requested. Output in the order requested by the client.
-		// Keep track of canonical keys already processed to handle cases like ("Subject", "subject") in request.
-		processedCanonicalRequestKeys := make(map[string]struct{})
-
-		for _, reqKey := range section.HeaderFields {
-			canonicalReqKey := tp.CanonicalMIMEHeaderKey(reqKey)
-
-			if _, alreadyProcessed := processedCanonicalRequestKeys[canonicalReqKey]; alreadyProcessed {
-				continue // Already handled all instances of this canonical key due to a previous request (e.g., "SUBJECT" after "Subject")
-			}
-			if _, exclude := excludeSet[canonicalReqKey]; exclude {
-				processedCanonicalRequestKeys[canonicalReqKey] = struct{}{} // Mark as skipped
-				continue
-			}
-
-			// FieldsByKey iterates over all occurrences of a header with the given canonical key.
-			// These occurrences are iterated in their original relative order from the message.
-			fieldsIterator := parsedDBHeader.FieldsByKey(canonicalReqKey)
-			for fieldsIterator.Next() {
-				// The key from fieldsIterator.Key() is already canonical.
-				rawLine, err := fieldsIterator.Raw()
-				if err != nil {
-					return nil, fmt.Errorf("error getting raw header line for %s: %w", fieldsIterator.Key(), err)
-				}
-				rawLinesToOutput = append(rawLinesToOutput, rawLine)
-			}
-			processedCanonicalRequestKeys[canonicalReqKey] = struct{}{}
-		}
-	} else {
-		// All fields requested (e.g., BODY[HEADER.FIELDS ()] or BODY[HEADER]).
-		// textproto.Header.Fields() iterates in the original message order.
-		fieldsIterator := parsedDBHeader.Fields()
-		for fieldsIterator.Next() {
-			canonicalKey := fieldsIterator.Key() // Key() from iterator is already canonical
-			if _, exclude := excludeSet[canonicalKey]; exclude {
-				continue
-			}
-			rawLine, err := fieldsIterator.Raw()
-			if err != nil {
-				return nil, fmt.Errorf("error getting raw header line for %s: %w", canonicalKey, err)
-			}
-			rawLinesToOutput = append(rawLinesToOutput, rawLine)
-		}
-	}
-
-	// Construct the new Header object by adding raw lines in reverse order
-	// so that WriteHeader outputs them in the correct (original/requested) order.
-	var newHdr textproto.Header
-	for i := len(rawLinesToOutput) - 1; i >= 0; i-- {
-		newHdr.AddRaw(rawLinesToOutput[i]) // AddRaw prepends effectively due to WriteHeader's behavior
-	}
-
-	var buf bytes.Buffer
-	if err := textproto.WriteHeader(&buf, newHdr); err != nil {
-		return nil, fmt.Errorf("failed to write filtered header: %w", err)
-	}
-
-	return buf.Bytes(), nil
 }

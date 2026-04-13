@@ -197,90 +197,24 @@ func (db *Database) GetReadPoolWithContext(ctx context.Context) *pgxpool.Pool {
 	return db.ReadPool
 }
 
-func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration) error {
-	// FAST PATH: Check current database version BEFORE setting up migration infrastructure.
-	// This avoids expensive migration driver initialization when migrations are already up-to-date.
-	// This is critical during concurrent instance restarts to prevent contention on migration locks.
-
-	var currentVersion uint
-	var dirty bool
-
-	// Query the schema_migrations table directly using the existing pool
-	err := db.WritePool.QueryRow(ctx, "SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&currentVersion, &dirty)
-	if err != nil && err != pgx.ErrNoRows {
-		// If the table doesn't exist yet, we'll catch it below and run migrations
-		logger.Info("Database: could not query schema_migrations table (may not exist yet)", "err", err)
-	} else if err == nil {
-		// Table exists and we got a version
-		if dirty {
-			return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", currentVersion)
-		}
-
-		// Now check the latest available migration version from embedded files
-		migrations, err := fs.Sub(MigrationsFS, "migrations")
-		if err != nil {
-			return fmt.Errorf("failed to get migrations subdirectory: %w", err)
-		}
-
-		sourceDriver, err := iofs.New(migrations, ".")
-		if err != nil {
-			return fmt.Errorf("failed to create migration source driver: %w", err)
-		}
-
-		firstVersion, err := sourceDriver.First()
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				logger.Info("Database: no migration files found", "version", currentVersion)
-				return nil
-			}
-			return fmt.Errorf("failed to get first migration version: %w", err)
-		}
-
-		// Find the latest migration version
-		latestVersion := firstVersion
-		currentSourceVersion := firstVersion
-		for {
-			next, err := sourceDriver.Next(currentSourceVersion)
-			if err != nil {
-				if errors.Is(err, fs.ErrNotExist) {
-					break
-				}
-				return fmt.Errorf("failed to iterate migration versions: %w", err)
-			}
-			latestVersion = next
-			currentSourceVersion = next
-		}
-
-		// Fast exit if already up-to-date
-		if currentVersion >= latestVersion {
-			logger.Info("Database: migrations are up to date. Skipping migration infrastructure setup", "current", currentVersion, "latest", latestVersion)
-			return nil
-		}
-
-		logger.Info("Database: migrations needed. Proceeding with migration", "current", currentVersion, "latest", latestVersion)
-	}
-
-	// SLOW PATH: Migrations are needed or schema_migrations doesn't exist yet.
-	// Set up the full migration infrastructure and run migrations.
-
+// getLatestMigrationVersion retrieves the latest available migration version from the embedded file system.
+func getLatestMigrationVersion() (uint, error) {
 	migrations, err := fs.Sub(MigrationsFS, "migrations")
 	if err != nil {
-		return fmt.Errorf("failed to get migrations subdirectory: %w", err)
+		return 0, fmt.Errorf("failed to get migrations subdirectory: %w", err)
 	}
 
 	sourceDriver, err := iofs.New(migrations, ".")
 	if err != nil {
-		return fmt.Errorf("failed to create migration source driver: %w", err)
+		return 0, fmt.Errorf("failed to create migration source driver: %w", err)
 	}
 
-	// Find the latest available migration version for verification later
 	firstVersion, err := sourceDriver.First()
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			logger.Info("Database: no migration files found. Skipping migrations")
-			return nil
+			return 0, nil // 0 signifies no migrations found
 		}
-		return fmt.Errorf("failed to get first migration version: %w", err)
+		return 0, fmt.Errorf("failed to get first migration version: %w", err)
 	}
 
 	latestVersion := firstVersion
@@ -291,247 +225,159 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 			if errors.Is(err, fs.ErrNotExist) {
 				break
 			}
-			return fmt.Errorf("failed to iterate migration versions: %w", err)
+			return 0, fmt.Errorf("failed to iterate migration versions: %w", err)
 		}
 		latestVersion = next
 		currentSourceVersion = next
 	}
 
-	// The pgx/v5 migrate driver's WithInstance function expects a *sql.DB instance.
-	// We'll create a temporary one from our existing pool's configuration.
-	sqlDB, err := sql.Open("pgx", db.WritePool.Config().ConnString())
+	return latestVersion, nil
+}
+
+func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration) error {
+	// Attempt to become the migration leader BEFORE querying the fast path.
+	// Only the leader executes migrations. Other instances wait for the leader to finish.
+	// By handling this ourselves, we avoid blocking inside golang-migrate and we don't
+	// put artificial timeouts on the instance that is actively doing work.
+	var isMigrationLeader bool
+
+	// We use the main WritePool to acquire a session-level lock.
+	// The lock will be tied to this specific connection.
+	leaderConn, err := db.WritePool.Acquire(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to open a temporary sql.DB for migrations: %w", err)
-	}
-	// IMPORTANT: Limit the migration sqlDB to exactly ONE connection.
-	//
-	// golang-migrate uses session-level advisory locks (pg_advisory_lock /
-	// pg_advisory_unlock) for mutual exclusion. Session-level locks are tied to
-	// the specific database connection on which they were acquired. If Lock() and
-	// Unlock() happen to use *different* connections from a pool, pg_advisory_unlock
-	// returns false (lock not held on this connection) and golang-migrate ignores
-	// that boolean — silently failing to release the lock.
-	//
-	// The result is a startup deadlock: the instance that "completed" migrations
-	// still holds the advisory lock on its idle pooled connection, so the other
-	// instance blocks on pg_advisory_lock indefinitely.
-	//
-	// Forcing a single connection guarantees that Lock, Run, SetVersion, and
-	// Unlock all execute on the exact same PostgreSQL session.
-	sqlDB.SetMaxOpenConns(1)
-	sqlDB.SetMaxIdleConns(1)
-
-	// NOTE: We do NOT defer sqlDB.Close() here. sql.DB.Close() waits for all in-flight
-	// queries to finish, but the migration goroutine may be blocked on pg_advisory_lock()
-	// which would cause a deadlock. Instead, we close sqlDB explicitly when the goroutine
-	// completes, or spawn a cleanup goroutine on timeout.
-
-	if err := sqlDB.PingContext(ctx); err != nil {
-		sqlDB.Close()
-		return fmt.Errorf("failed to ping temporary DB for migrations: %w", err)
+		return fmt.Errorf("failed to acquire connection for migration leader election: %w", err)
 	}
 
-	// CRITICAL: start the timeout BEFORE entering the migration driver setup.
-	//
-	// pgxv5.WithInstance() calls ensureVersionTable() which calls Lock() which
-	// calls pg_advisory_lock() — a BLOCKING PostgreSQL call that uses
-	// context.Background() internally, so it is NOT cancellable via Go contexts.
-	// If another server holds the migration advisory lock, this call blocks
-	// indefinitely, and the migrateCtx timeout never fires because it hasn't been
-	// created yet.
-	//
-	// By starting the goroutine (and therefore the migrateCtx) BEFORE calling
-	// WithInstance, the timeout covers the entire advisory-lock acquisition,
-	// migration execution, and cleanup path.
-	logger.Info("Database: migration timeout configured", "timeout", migrationTimeout)
-	migrateCtx, cancel := context.WithTimeout(ctx, migrationTimeout)
-	defer cancel()
+	var leaderConnReleased bool
+	defer func() {
+		if !leaderConnReleased {
+			if isMigrationLeader {
+				leaderConn.QueryRow(context.Background(), "SELECT pg_advisory_unlock($1)", consts.SoraMigrationLeaderLockID).Scan(nil)
+			}
+			leaderConn.Release()
+			leaderConnReleased = true
+		}
+	}()
 
-	// migrationCancelled is set to true when migrateCtx fires before the
-	// migration goroutine has had a chance to run m.Up(). The goroutine
-	// checks this flag after unblocking from pg_advisory_lock() so it can
-	// exit without writing dirty=true or applying any schema changes.
-	// This prevents a race where the goroutine wakes up *after* migrate()
-	// has already returned and modifies schema_migrations behind the caller's back.
-	var migrationCancelled atomic.Bool
+	err = leaderConn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", consts.SoraMigrationLeaderLockID).Scan(&isMigrationLeader)
+	if err != nil {
+		return fmt.Errorf("failed to try acquiring migration leader lock: %w", err)
+	}
 
-	// errChan carries the result of the entire migration sequence.
-	// Buffered so the goroutine can exit even if we have already moved on to
-	// the polling path after a timeout.
-	errChan := make(chan error, 1)
-	go func() {
-		// Everything from here on can block on pg_advisory_lock().
-		// It all lives inside this goroutine so the migrateCtx deadline is
-		// meaningful: when it fires we can spawn a cleanup goroutine and poll
-		// schema_migrations directly instead of waiting indefinitely.
+	// FAST PATH: Check current database version BEFORE setting up migration infrastructure.
+	// This avoids expensive migration driver initialization when migrations are already up-to-date.
+	var currentVersion uint
+	var dirty bool
+
+	// Query the schema_migrations table directly using the existing pool
+	err = db.WritePool.QueryRow(ctx, "SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&currentVersion, &dirty)
+	if err != nil && err != pgx.ErrNoRows {
+		logger.Info("Database: could not query schema_migrations table (may not exist yet)", "err", err)
+	} else if err == nil {
+		if dirty {
+			// If we hold the leader lock AND the DB is dirty, it means the previous leader
+			// crashed mid-migration and orphaned the lock. Manual intervention is required.
+			if isMigrationLeader {
+				return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", currentVersion)
+			}
+			// If we DO NOT hold the leader lock, someone else is holding it and actively migrating.
+			// dirty=true is expected in this state. We just fall through to the waiting loop.
+		} else {
+			latestVersion, err := getLatestMigrationVersion()
+			if err != nil {
+				return err
+			}
+
+			// Fast exit if already up-to-date
+			if currentVersion >= latestVersion && !dirty {
+				logger.Info("Database: migrations are up to date. Skipping migration infrastructure setup", "current", currentVersion, "latest", latestVersion)
+				return nil
+			}
+			logger.Info("Database: migrations needed. Proceeding with migration", "current", currentVersion, "latest", latestVersion)
+		}
+	}
+
+	latestVersion, err := getLatestMigrationVersion()
+	if err != nil {
+		return err
+	}
+
+	if latestVersion == 0 {
+		logger.Info("Database: no migration files found. Skipping migrations")
+		return nil
+	}
+
+	if isMigrationLeader {
+		// WE ARE THE LEADER.
+		logger.Info("Database: acquired migration leader lock, proceeding with migrations")
+
+		// Set up sqlDB and run golang-migrate WITHOUT an artificial timeout that would
+		// kill our own migration. We use the startup context directly.
+		sqlDB, err := sql.Open("pgx", db.WritePool.Config().ConnString())
+		if err != nil {
+			return fmt.Errorf("failed to open a temporary sql.DB for migrations: %w", err)
+		}
+		sqlDB.SetMaxOpenConns(1)
+		sqlDB.SetMaxIdleConns(1)
+		defer sqlDB.Close()
+
+		if err := sqlDB.PingContext(ctx); err != nil {
+			return fmt.Errorf("failed to ping temporary DB for migrations: %w", err)
+		}
 
 		dbDriver, err := pgxv5.WithInstance(sqlDB, &pgxv5.Config{
-			// MultiStatementEnabled is disabled because it cannot properly parse
-			// PL/pgSQL functions with dollar-quoted bodies ($$) that contain semicolons.
-			// The simple semicolon-based parser splits inside function bodies, breaking
-			// the migration.
-			//
-			// Since we don't use CREATE INDEX CONCURRENTLY or other DDL that requires
-			// running outside of transaction blocks in our migrations, it's safe to
-			// run all statements in a single transaction.
-			MultiStatementEnabled: false,
+			MultiStatementEnabled: false, // Prevents PL/pgSQL parsing issues
 		})
 		if err != nil {
-			errChan <- fmt.Errorf("failed to create migration db driver: %w", err)
-			return
+			return fmt.Errorf("failed to create migration db driver: %w", err)
+		}
+
+		// Re-initialize source driver strictly for golang-migrate execution
+		migrations, err := fs.Sub(MigrationsFS, "migrations")
+		if err != nil {
+			return fmt.Errorf("failed to get migrations subdirectory: %w", err)
+		}
+
+		sourceDriver, err := iofs.New(migrations, ".")
+		if err != nil {
+			return fmt.Errorf("failed to create migration source driver: %w", err)
 		}
 
 		m, err := migrate.NewWithInstance("iofs", sourceDriver, "pgx5", dbDriver)
 		if err != nil {
-			errChan <- fmt.Errorf("failed to create migrate instance: %w", err)
-			return
+			return fmt.Errorf("failed to create migrate instance: %w", err)
 		}
 
 		m.Log = &migrationLogger{}
 
-		// Check current version (also acquires the advisory lock internally).
-		ver, dirty, err := m.Version()
-		if err != nil && err != migrate.ErrNilVersion {
-			errChan <- fmt.Errorf("failed to get current migration version: %w", err)
-			return
-		}
-		if dirty {
-			errChan <- fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", ver)
-			return
-		}
+		// Run migrations with a background heartbeat to verify we are not stuck indefinitely
+		logger.Info("Database: attempting to run migrations up to latest version", "latest", latestVersion)
 
-		// IMPORTANT: Check whether migrateCtx already fired while this goroutine
-		// was blocked in pg_advisory_lock() inside WithInstance(). If it did, the
-		// caller has already moved on to the polling path and returned an error.
-		// Running m.Up() here would write dirty=true and apply schema changes
-		// AFTER migrate() has returned — corrupting the database state from the
-		// caller's perspective and causing races with test cleanup / peer servers.
-		if migrationCancelled.Load() {
-			logger.Info("Database: migration goroutine: cancelled while waiting for advisory lock — skipping m.Up() to avoid post-return schema mutation")
-			errChan <- fmt.Errorf("migration cancelled: timed out while waiting for advisory lock")
-			return
-		}
-
-		logger.Info("Database: current migration version, running migrations", "version", ver)
-		logger.Info("Database: attempting to run migrations")
-		errChan <- m.Up()
-	}()
-
-	// Wait for either completion or timeout
-	var skipFinalVerification bool
-	select {
-	case err := <-errChan:
-		// Migration goroutine completed - safe to close sqlDB now
-		defer sqlDB.Close()
-
-		// Check if error is a lock acquisition timeout (another instance is running migrations)
-		if err != nil && err != migrate.ErrNoChange {
-			// If it's a lock acquisition error, verify migrations instead of failing
-			if errors.Is(err, migrate.ErrLockTimeout) {
-				logger.Info("Database: migration lock acquisition failed (another instance is running migrations)")
-				logger.Info("Database: verifying current migration state")
-
-				// Query schema_migrations directly using the main pool to avoid lock contention
-				var newVersion uint
-				var newDirty bool
-				verifyCtx, verifyCancel := context.WithTimeout(ctx, 10*time.Second)
-				defer verifyCancel()
-				queryErr := db.WritePool.QueryRow(verifyCtx, "SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&newVersion, &newDirty)
-				if queryErr != nil && queryErr != pgx.ErrNoRows {
-					return fmt.Errorf("failed to verify migration version after lock timeout: %w", queryErr)
-				}
-				if newDirty {
-					return fmt.Errorf("database is in a dirty migration state after lock timeout (version %d)", newVersion)
-				}
-
-				// Check if the version is now up-to-date (>= latest available migration)
-				if newVersion >= latestVersion {
-					logger.Info("Database: migration version verified (migrations completed by another instance)", "version", newVersion)
-					skipFinalVerification = true // Skip final verification since we already verified directly
-				} else {
-					return fmt.Errorf("lock acquisition failed and database is not up-to-date (current: %d, latest: %d)", newVersion, latestVersion)
-				}
-			} else {
-				return fmt.Errorf("failed to run migrations: %w", err)
-			}
-		} else if err == migrate.ErrNoChange {
-			logger.Info("Database: migrations are up to date")
-		} else {
-			logger.Info("Database: migrations applied successfully")
-		}
-	case <-migrateCtx.Done():
-		// Timeout occurred - likely another instance is running migrations.
-		// Signal the migration goroutine not to run m.Up() if it is still waiting
-		// on pg_advisory_lock(). Without this, the goroutine could wake up after
-		// migrate() has returned and write dirty=true / apply schema changes behind
-		// the caller's back, causing test cleanup races and production inconsistency.
-		migrationCancelled.Store(true)
-
-		// IMPORTANT: The migration goroutine may be blocked on pg_advisory_lock().
-		// We MUST NOT call sqlDB.Close() here because it waits for in-flight queries,
-		// which would deadlock. Instead, spawn a cleanup goroutine that waits for
-		// the migration goroutine to finish and then closes sqlDB properly.
+		errChan := make(chan error, 1)
 		go func() {
-			logger.Info("Database: spawning cleanup goroutine for timed-out migration")
-			<-errChan // Wait for the migration goroutine to eventually finish
-			sqlDB.Close()
-			logger.Info("Database: cleaned up timed-out migration resources")
+			errChan <- m.Up()
 		}()
 
-		logger.Info("Database: migration attempt timed out (another instance may be running migrations)")
-		logger.Info("Database: polling for migration completion by another instance")
+		heartbeat := time.NewTicker(30 * time.Second)
+		defer heartbeat.Stop()
 
-		// Poll schema_migrations using the main WritePool (NOT sqlDB, which may be
-		// contended by the migration goroutine's advisory lock waiting for another
-		// instance to finish).
-		//
-		// We poll instead of doing a single check because the other instance may
-		// still be actively running migrations when our timeout fires. A single
-		// version check at timeout time would see a stale version and fail even
-		// though the other instance is about to commit the final migration.
-		//
-		// Use 3x the configured migration timeout as the overall poll deadline to
-		// give the other instance a generous window to complete.
-		pollDeadline := 3 * migrationTimeout
-		pollCtx, pollCancel := context.WithTimeout(ctx, pollDeadline)
-		defer pollCancel()
-
-		pollInterval := 5 * time.Second
-		pollTicker := time.NewTicker(pollInterval)
-		defer pollTicker.Stop()
-
-		var migrationDoneByPeer bool
-		for !migrationDoneByPeer {
+		var mErr error
+	migrateLoop:
+		for {
 			select {
-			case <-pollCtx.Done():
-				return fmt.Errorf("timed out waiting for another instance to complete migrations (waited %s, current version still below latest %d)", pollDeadline, latestVersion)
-			case <-pollTicker.C:
-				var newVersion uint
-				var newDirty bool
-				verifyCtx, verifyCancel := context.WithTimeout(ctx, 10*time.Second)
-				queryErr := db.WritePool.QueryRow(verifyCtx, "SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&newVersion, &newDirty)
-				verifyCancel()
-				if queryErr != nil && queryErr != pgx.ErrNoRows {
-					logger.Warn("Database: error polling migration version, retrying", "err", queryErr)
-					continue
-				}
-				if newDirty {
-					return fmt.Errorf("database is in a dirty migration state while waiting for peer migrations (version %d)", newVersion)
-				}
-				if newVersion >= latestVersion {
-					logger.Info("Database: migrations completed by another instance", "version", newVersion)
-					skipFinalVerification = true
-					migrationDoneByPeer = true
-				} else {
-					logger.Info("Database: waiting for peer to complete migrations", "current", newVersion, "latest", latestVersion)
-				}
+			case mErr = <-errChan:
+				break migrateLoop
+			case <-heartbeat.C:
+				logger.Info("Database: migrations are still actively running... please wait")
 			}
 		}
-	}
 
-	// Final verification (skip if we already verified via direct query above).
-	// m is scoped inside the goroutine, so we use the WritePool for the check.
-	if !skipFinalVerification {
+		err = mErr
+		if err != nil && err != migrate.ErrNoChange {
+			return fmt.Errorf("failed to run migrations: %w", err)
+		}
+
+		// Verify final state
 		var finalVersion uint
 		var finalDirty bool
 		verifyCtx, verifyCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -544,10 +390,56 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 			return fmt.Errorf("database is in a dirty migration state (version %d). Manual intervention required", finalVersion)
 		}
 		logger.Info("Database: migration complete", "version", finalVersion)
-	} else {
-		logger.Info("Database: migrations verified, proceeding with startup")
+		return nil
 	}
-	return nil
+
+	// WE ARE NOT THE LEADER.
+	// We release the pooled connection immediately.
+	if !leaderConnReleased {
+		leaderConn.Release()
+		leaderConnReleased = true
+	}
+
+	// Wait for the leader to finish.
+	// Since we know another instance is currently migrating, we don't start
+	// any golang-migrate infrastructure which is prone to stalling and deadlocks.
+	// We just poll the schema_migrations table gracefully.
+	logger.Info("Database: another instance is currently running migrations. Waiting...")
+
+	// Use 3x the configured migration timeout as the overall poll deadline to
+	// give the other instance a generous window to complete.
+	pollDeadline := 3 * migrationTimeout
+	pollCtx, pollCancel := context.WithTimeout(ctx, pollDeadline)
+	defer pollCancel()
+
+	pollInterval := 5 * time.Second
+	pollTicker := time.NewTicker(pollInterval)
+	defer pollTicker.Stop()
+
+	for {
+		select {
+		case <-pollCtx.Done():
+			return fmt.Errorf("timed out waiting for another instance to complete migrations (waited %s, current version still below latest %d)", pollDeadline, latestVersion)
+		case <-pollTicker.C:
+			var newVersion uint
+			var newDirty bool
+			verifyCtx, verifyCancel := context.WithTimeout(ctx, 10*time.Second)
+			queryErr := db.WritePool.QueryRow(verifyCtx, "SELECT version, dirty FROM schema_migrations LIMIT 1").Scan(&newVersion, &newDirty)
+			verifyCancel()
+			if queryErr != nil && queryErr != pgx.ErrNoRows {
+				logger.Warn("Database: error polling migration version, retrying", "err", queryErr)
+				continue
+			}
+
+			// If it's dirty, the leader is still running. So just keep waiting!
+			if newVersion >= latestVersion && !newDirty {
+				logger.Info("Database: migrations completed by another instance", "version", newVersion)
+				return nil
+			} else {
+				logger.Info("Database: waiting for peer to complete migrations", "current", newVersion, "latest", latestVersion, "dirty", newDirty)
+			}
+		}
+	}
 }
 
 // GetPoolHealth returns the health status of database connection pools

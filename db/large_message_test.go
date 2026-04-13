@@ -87,10 +87,10 @@ func TestInsertMessage_LargeFTSSkip(t *testing.T) {
 	assert.Equal(t, "Large FTS Test", messages[0].Subject)
 
 	// Verify that the tsvector was created (even if empty)
-	// by checking that message_contents row exists
+	// by checking that messages_fts row exists
 	var storedHash string
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT content_hash FROM message_contents WHERE content_hash = $1",
+		"SELECT content_hash FROM messages_fts WHERE content_hash = $1",
 		contentHash).Scan(&storedHash)
 	assert.NoError(t, err)
 	assert.Equal(t, contentHash, storedHash)
@@ -98,8 +98,8 @@ func TestInsertMessage_LargeFTSSkip(t *testing.T) {
 	t.Logf("Successfully tested large FTS skip with messageID: %d, UID: %d", messageID, uid)
 }
 
-// TestInsertMessage_LargeBodyStorageSkip tests that messages with body >64KB don't store text_body
-func TestInsertMessage_LargeBodyStorageSkip(t *testing.T) {
+// TestInsertMessage_LargeBodyTruncation tests that messages with body >64KB have text_body truncated to 64KB
+func TestInsertMessage_LargeBodyTruncation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
 	}
@@ -114,7 +114,7 @@ func TestInsertMessage_LargeBodyStorageSkip(t *testing.T) {
 
 	now := time.Now()
 
-	// Create a message with >64KB plaintext body (storage skip threshold)
+	// Create a message with >64KB plaintext body (truncation threshold)
 	largeBody := strings.Repeat("B", 64*1024+1) // 64KB + 1 byte
 
 	bodyStructure := &imap.BodyStructureSinglePart{
@@ -172,16 +172,17 @@ func TestInsertMessage_LargeBodyStorageSkip(t *testing.T) {
 	require.Len(t, messages, 1)
 	assert.Equal(t, "Large Storage Test", messages[0].Subject)
 
-	// Verify that text_body is NULL (not stored)
+	// Verify that text_body is truncated to exactly 64KB
 	var textBody, textBodyTSV *string
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT text_body, text_body_tsv::text FROM message_contents WHERE content_hash = $1",
+		"SELECT text_body, text_body_tsv::text FROM messages_fts WHERE content_hash = $1",
 		contentHash).Scan(&textBody, &textBodyTSV)
 	assert.NoError(t, err)
-	assert.Nil(t, textBody, "text_body should be NULL for large messages")
-	assert.NotNil(t, textBodyTSV, "text_body_tsv should NOT be NULL since it now indexes the first 64KB")
+	require.NotNil(t, textBody, "text_body should be truncated, not NULL")
+	assert.Equal(t, 64*1024, len(*textBody), "text_body should be truncated to exactly 64KB")
+	assert.Nil(t, textBodyTSV, "text_body_tsv should be NULL since worker hasn't processed it yet")
 
-	t.Logf("Successfully tested large body storage skip with messageID: %d, UID: %d", messageID, uid)
+	t.Logf("Successfully tested large body truncation with messageID: %d, UID: %d", messageID, uid)
 }
 
 // TestInsertMessage_NormalSizeStored tests that normal-sized messages are stored and indexed
@@ -261,15 +262,11 @@ func TestInsertMessage_NormalSizeStored(t *testing.T) {
 	// Verify that text_body is NULL and text_body_tsv is NOT NULL (stored)
 	var textBody, textBodyTSV *string
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT text_body, text_body_tsv::text FROM message_contents WHERE content_hash = $1",
+		"SELECT text_body, text_body_tsv::text FROM messages_fts WHERE content_hash = $1",
 		contentHash).Scan(&textBody, &textBodyTSV)
 	assert.NoError(t, err)
-	assert.Nil(t, textBody, "text_body should be NULL for normal-sized messages due to trigger")
-	assert.NotNil(t, textBodyTSV, "text_body_tsv should NOT be NULL for normal-sized messages")
-	if textBodyTSV != nil {
-		assert.Contains(t, *textBodyTSV, "normal")
-		assert.Contains(t, *textBodyTSV, "searchable")
-	}
+	assert.NotNil(t, textBody, "text_body should NOT be NULL for normal-sized messages initially")
+	assert.Nil(t, textBodyTSV, "text_body_tsv should be NULL initially because worker processes asynchronously")
 
 	t.Logf("Successfully tested normal size storage with messageID: %d, UID: %d", messageID, uid)
 }
@@ -353,7 +350,7 @@ func TestInsertMessage_LargeHeaders(t *testing.T) {
 	// Verify that headers column is empty string (not stored due to size)
 	var headers string
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT headers FROM message_contents WHERE content_hash = $1",
+		"SELECT headers FROM messages_fts WHERE content_hash = $1",
 		contentHash).Scan(&headers)
 	assert.NoError(t, err)
 	assert.Equal(t, "", headers, "headers should be empty string for large headers")

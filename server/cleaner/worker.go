@@ -43,9 +43,8 @@ type DatabaseManager interface {
 	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
 	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
 	PruneOldMessageVectorsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
-	NullifyLegacyTextBodiesWithRetry(ctx context.Context, lastHash string) (int64, string, error)
-	GetUnusedContentHashesWithRetry(ctx context.Context, limit int) ([]string, error)
-	DeleteMessageContentsByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error)
+	GetUnusedFTSHashesWithRetry(ctx context.Context, limit int) ([]string, error)
+	DeleteMessagesFTSByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error)
 	GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, limit int) ([]int64, error)
 	FinalizeAccountDeletionsWithRetry(ctx context.Context, accountIDs []int64) (int64, error)
 }
@@ -70,7 +69,6 @@ type CleanupWorker struct {
 	maxAgeRestriction     time.Duration
 	ftsRetention          time.Duration // How long to keep FTS vectors (text_body_tsv, headers_tsv)
 	healthStatusRetention time.Duration
-	lastNullifyHash       string // Cursor for O(1) Key-Set Pagination of legacy records
 	stopCh                chan struct{}
 	errCh                 chan<- error
 	wg                    sync.WaitGroup
@@ -203,7 +201,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	var failedUploadsCount, deletedAccountCount, vacationCount, healthCount int64
 	var successfulDeletes []db.UserScopedObjectForCleanup
 	var orphanHashCount, finalizedAccountCount int64
-	var ftsPrunedCount, legacyNullifiedCount int64
+	var ftsPrunedCount int64
 
 	// First handle max age restriction if configured
 	if w.maxAgeRestriction > 0 {
@@ -322,13 +320,10 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		logger.Info("Cleanup: no user-scoped objects to clean up")
 	}
 
-	// --- Phase 2a: FTS Vector Pruning ---
-	// text_body is never persisted (the trigger clears it at insert time).
-	// This phase deletes message_contents rows whose fts_retention has expired, removing
-	// both the FTS search vectors and the raw headers used for IMAP fast-path header fetches.
+	// --- Phase 2a: FTS Vector & Queue Pruning ---
+	// This phase deletes exclusively from messages_fts rows whose fts_retention has expired,
+	// removing the FTS search vectors to strictly reclaim database storage bloat.
 	if w.ftsRetention > 0 {
-		// This prunes text_body_tsv and headers_tsv of old messages, completely removing search capability.
-		// This is more aggressive than source pruning - use with caution.
 		// Process in batches of 1000, up to 10 times per loop to keep transactions tiny.
 		for i := 0; i < 10; i++ {
 			prunedVectorsCount, err := w.rdb.PruneOldMessageVectorsWithRetry(ctx, w.ftsRetention)
@@ -339,7 +334,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 
 			if prunedVectorsCount > 0 {
 				ftsPrunedCount += prunedVectorsCount
-				logger.Info("Cleanup: Pruned text_body_tsv for old message contents", "count", prunedVectorsCount, "age", w.ftsRetention)
+				logger.Info("Cleanup: Pruned expired FTS indexes deeply from messages_fts table", "count", prunedVectorsCount, "age", w.ftsRetention)
 				if prunedVectorsCount < 1000 {
 					break
 				}
@@ -352,64 +347,26 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 			}
 		}
 	}
-
-	// --- Phase 2a-bis: Systematically nullify text_body for legacy rows.
-	// This ensures that migration 000016 reclaims storage safely without taking massive down-time updates.
-	for i := 0; i < 50; i++ {
-		nullifiedLegacyCount, newLastHash, err := w.rdb.NullifyLegacyTextBodiesWithRetry(ctx, w.lastNullifyHash)
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || err.Error() == "timeout: context deadline exceeded" || err.Error() == "failed to nullify legacy text_body rows: timeout: context deadline exceeded" {
-				logger.Info("Cleanup: Yielding legacy nullification early. Reached the 5-minute scheduling time limit.")
-			} else {
-				logger.Error("Cleanup: Failed to nullify legacy text bodies", "error", err)
-			}
-			break
-		}
-		w.lastNullifyHash = newLastHash
-
-		if nullifiedLegacyCount > 0 {
-			legacyNullifiedCount += nullifiedLegacyCount
-			logger.Info("Cleanup: Removed legacy text bodies, reclaiming storage", "count", nullifiedLegacyCount)
-			// Yield to prevent database CPU/WAL starvation for incoming LMTP requests
-			// A 2-second sleep paces WAL generation at ~500 updates/sec (with 1000-row batches),
-			// allowing us to process up to 50,000 rows per cycle cleanly without WAL bloat.
-			time.Sleep(2 * time.Second)
-		}
-
-		if w.lastNullifyHash == "" {
-			logger.Info("Cleanup: Reached end of message_contents table for legacy nullification.")
-			break // Done: reached end of the table
-		}
-	}
-
-	// --- Phase 2b: Global resource cleanup (message_contents and cache) ---
-	orphanHashes, err := w.rdb.GetUnusedContentHashesWithRetry(ctx, db.BATCH_PURGE_SIZE)
+	// --- Phase 2b: Global resource cleanup (messages_fts orphan sweep) ---
+	// If a user permanently deletes an email (S3 object deleted), their FTS vector
+	// is orphaned in messages_fts. The vector TTL (Phase 2a) eventually kills it,
+	// but sweeping guarantees we don't leak vectors infinitely if fts_retention = 0.
+	orphanHashes, err := w.rdb.GetUnusedFTSHashesWithRetry(ctx, db.BATCH_PURGE_SIZE)
 	if err != nil {
-		logger.Error("Cleanup: Failed to list unused content hashes for global cleanup", "error", err)
-		return fmt.Errorf("failed to list unused content hashes for global cleanup: %w", err)
+		logger.Error("Cleanup: Failed to list unused FTS hashes for global cleanup", "error", err)
+		return fmt.Errorf("failed to list unused FTS hashes for global cleanup: %w", err)
 	}
 
 	orphanHashCount = int64(len(orphanHashes))
 	if len(orphanHashes) > 0 {
-		logger.Info("Cleanup: Found orphaned content hashes for global cleanup", "count", len(orphanHashes))
+		logger.Info("Cleanup: Found orphaned FTS vectors for global cleanup", "count", len(orphanHashes))
 
-		// Batch delete from message_contents table
-		deletedCount, err := w.rdb.DeleteMessageContentsByHashBatchWithRetry(ctx, orphanHashes)
+		deletedCount, err := w.rdb.DeleteMessagesFTSByHashBatchWithRetry(ctx, orphanHashes)
 		if err != nil {
-			logger.Error("Cleanup: Failed to batch delete from message_contents - will be retried on next run", "error", err)
+			logger.Error("Cleanup: Failed to batch delete from messages_fts - will be retried on next run", "error", err)
 		} else if deletedCount > 0 {
-			logger.Info("Cleanup: Deleted rows from message_contents", "count", deletedCount)
+			logger.Info("Cleanup: Deleted orphaned FTS vectors", "count", deletedCount)
 		}
-
-		// Delete from local cache one by one. This is a local filesystem operation, so looping is fine.
-		for _, cHash := range orphanHashes {
-			if err := w.cache.Delete(cHash); err != nil {
-				// This is not critical, as the cache has its own TTL and eviction policies.
-				logger.Warn("Cleanup: Failed to delete from cache", "hash", cHash, "error", err)
-			}
-		}
-	} else {
-		logger.Info("Cleanup: no orphaned content hashes to clean up")
 	}
 
 	// --- Phase 3: Final account deletion ---
@@ -437,8 +394,8 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	logger.Info("Cleanup: Cycle completed", "failed_uploads", failedUploadsCount,
 		"soft_deleted_accounts", deletedAccountCount, "vacation_responses", vacationCount,
 		"health_statuses", healthCount, "s3_objects", len(successfulDeletes),
-		"orphan_hashes", orphanHashCount, "finalized_accounts", finalizedAccountCount,
-		"fts_pruned", ftsPrunedCount, "legacy_nullified", legacyNullifiedCount)
+		"orphan_fts_hashes", orphanHashCount, "finalized_accounts", finalizedAccountCount,
+		"fts_pruned", ftsPrunedCount)
 
 	return nil
 }

@@ -428,30 +428,6 @@ func TestListMessages(t *testing.T) {
 	t.Logf("Successfully tested ListMessages with accountID: %d, mailboxID: %d", accountID, mailboxID)
 }
 
-// TestGetMessageTextBody tests message body retrieval
-func TestGetMessageTextBody(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping database integration test in short mode")
-	}
-
-	db, accountID, mailboxID := setupMessageTestDatabase(t)
-	defer db.Close()
-
-	ctx := context.Background()
-
-	// Test 1: Get body for non-existent message
-	body, err := db.GetMessageTextBody(ctx, imap.UID(1), mailboxID)
-	assert.Error(t, err) // Should return error for non-existent message
-	assert.Empty(t, body)
-
-	// Test 2: Get body for non-existent mailbox
-	body, err = db.GetMessageTextBody(ctx, imap.UID(1), 99999)
-	assert.Error(t, err) // Should return error for non-existent mailbox
-	assert.Empty(t, body)
-
-	t.Logf("Successfully tested GetMessageTextBody with accountID: %d, mailboxID: %d", accountID, mailboxID)
-}
-
 // TestGetMessageEnvelope tests message envelope retrieval
 func TestGetMessageEnvelope(t *testing.T) {
 	if testing.Short() {

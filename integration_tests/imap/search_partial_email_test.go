@@ -91,6 +91,11 @@ func TestIMAP_SearchPartialEmail(t *testing.T) {
 		}
 	}
 
+	// Flush FTS staging queue so all appended messages get their tsvectors built immediately
+	if err := server.FlushFTSQueue(); err != nil {
+		t.Fatalf("Failed to flush FTS queue: %v", err)
+	}
+
 	// Test 1: Search for "peter" in FROM field (should find messages 1 and 2)
 	t.Run("Partial FROM local part", func(t *testing.T) {
 		searchResults, err := c.Search(&imap.SearchCriteria{

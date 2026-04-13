@@ -3,11 +3,19 @@
 BEGIN;
 
 ALTER TABLE messages
-    ADD COLUMN flags INTEGER NOT NULL DEFAULT 0,
-    ADD COLUMN custom_flags JSONB NOT NULL DEFAULT '[]'::jsonb,
-    ADD COLUMN flags_changed_at TIMESTAMPTZ,
-    ADD COLUMN updated_modseq BIGINT,
-    ADD CONSTRAINT max_custom_flags_check CHECK (jsonb_array_length(custom_flags) <= 50);
+    ADD COLUMN IF NOT EXISTS flags INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS custom_flags JSONB NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS flags_changed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS updated_modseq BIGINT;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'max_custom_flags_check' AND conrelid = 'messages'::regclass
+    ) THEN
+        ALTER TABLE messages ADD CONSTRAINT max_custom_flags_check CHECK (jsonb_array_length(custom_flags) <= 50);
+    END IF;
+END $$;
 
 -- Migrate data back
 UPDATE messages m
@@ -19,19 +27,19 @@ FROM message_state ms
 WHERE m.id = ms.message_id;
 
 -- Recreate indices
-CREATE INDEX idx_messages_updated_modseq ON messages (updated_modseq) WHERE updated_modseq IS NOT NULL;
-CREATE INDEX idx_messages_mailbox_id_updated_modseq ON messages (mailbox_id, updated_modseq);
-CREATE INDEX idx_messages_custom_flags ON messages USING GIN (custom_flags);
+CREATE INDEX IF NOT EXISTS idx_messages_updated_modseq ON messages (updated_modseq) WHERE updated_modseq IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id_updated_modseq ON messages (mailbox_id, updated_modseq);
+CREATE INDEX IF NOT EXISTS idx_messages_custom_flags ON messages USING GIN (custom_flags);
 
 -- Recreate idx_messages_mailbox_common_search with (flags & 1)
 DROP INDEX IF EXISTS idx_messages_mailbox_common_search;
-CREATE INDEX idx_messages_mailbox_common_search ON messages (mailbox_id, (flags & 1), internal_date, size, uid) WHERE expunged_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_common_search ON messages (mailbox_id, (flags & 1), internal_date, size, uid) WHERE expunged_at IS NULL;
 
 -- Recreate idx_messages_mailbox_modseqs
 DROP INDEX IF EXISTS idx_messages_mailbox_modseqs;
-CREATE INDEX idx_messages_mailbox_modseqs ON messages (mailbox_id, created_modseq, updated_modseq, expunged_modseq);
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_modseqs ON messages (mailbox_id, created_modseq, updated_modseq, expunged_modseq);
 
-CREATE INDEX idx_messages_first_unseen ON messages (mailbox_id, uid) WHERE (flags & 1) = 0 AND expunged_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_first_unseen ON messages (mailbox_id, uid) WHERE (flags & 1) = 0 AND expunged_at IS NULL;
 
 -- Drop table
 DROP TABLE message_state;

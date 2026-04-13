@@ -482,26 +482,6 @@ func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID 
 	return results, rows.Err()
 }
 
-// GetMessageHeaders retrieves the raw headers for a specific message.
-func (db *Database) GetMessageHeaders(ctx context.Context, messageUID imap.UID, mailboxID int64) (string, error) {
-	var headers string
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT mc.headers
-		FROM message_contents mc
-		JOIN messages m ON m.content_hash = mc.content_hash
-		WHERE m.uid = $1 AND m.mailbox_id = $2 AND m.expunged_at IS NULL
-	`, messageUID, mailboxID).Scan(&headers)
-
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return "", fmt.Errorf("no message found with UID %d in mailbox %d or no content associated", messageUID, mailboxID)
-		}
-		return "", fmt.Errorf("failed to query message headers for UID %d: %w", messageUID, err)
-	}
-
-	return headers, nil
-}
-
 // GetRecentMessagesForWarmup fetches the most recent messages from specified mailboxes for cache warming
 // Returns a map of mailboxName -> []contentHash for the most recent messages
 func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {

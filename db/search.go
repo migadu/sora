@@ -111,23 +111,23 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 	}
 
 	// Body full-text search
-	// Note: text_body_tsv is in message_contents table, which is only available in complex query path
+	// Note: text_body_tsv is in messages_fts table, which is only available in complex query path
 	for _, bodyCriteria := range criteria.Body {
 		param := nextParam()
 		args[param] = bodyCriteria
 		// Handle case where FTS data may be cleaned up (text_body_tsv is NULL)
 		// This ensures search still works but returns no results for cleaned messages
-		// Note: This column is in message_contents table, only joined in complex query
+		// Note: This column is in messages_fts table, only joined in complex query
 		conditions = append(conditions, fmt.Sprintf("text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s)", param))
 	}
 	// Text search - searches both headers and body (RFC 3501: TEXT matches header or body)
-	// Note: text_body_tsv and headers_tsv are in message_contents table, only available in complex query path
+	// Note: text_body_tsv and headers_tsv are in messages_fts table, only available in complex query path
 	for _, textCriteria := range criteria.Text {
 		param := nextParam()
 		args[param] = textCriteria
 		// Search in both headers and body text using full-text search
 		// Either TSV matching is sufficient; NULL-safe so pruned columns are skipped gracefully
-		// Note: These columns are in message_contents table, only joined in complex query
+		// Note: These columns are in messages_fts table, only joined in complex query
 		conditions = append(conditions, fmt.Sprintf(
 			"((text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s)) OR (headers_tsv IS NOT NULL AND headers_tsv @@ plainto_tsquery('simple', @%s)))",
 			param, param))
@@ -397,14 +397,14 @@ func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix str
 }
 
 // needsComplexQuery determines if the search criteria requires the complex CTE query
-// with ROW_NUMBER() and message_contents JOIN, or if we can use the optimized simple query
+// with ROW_NUMBER() and messages_fts JOIN, or if we can use the optimized simple query
 func (db *Database) needsComplexQuery(criteria *imap.SearchCriteria, orderByClause string) bool {
 	// Need complex query for full-text search
 	if len(criteria.Body) > 0 || len(criteria.Text) > 0 {
 		return true
 	}
 
-	// Need complex query for generic header searches (requires headers_tsv from message_contents)
+	// Need complex query for generic header searches (requires headers_tsv from messages_fts)
 	for _, headerField := range criteria.Header {
 		lowerKey := strings.ToLower(headerField.Key)
 		// Check if this is a generic header (not one with a dedicated column)
@@ -578,7 +578,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			orderByClause = "ORDER BY m.uid DESC"
 		}
 
-		// Fast path: Simple query without joining message_contents.
+		// Fast path: Simple query without joining messages_fts.
 		// We use a scalar subquery to dynamically generate sequence numbers safely only for the matched rows.
 		// This incredibly speeds up queries with LIMIT (like searches or sorts returning latest 50 messages)
 		// because Postgres filters and sorts the base table directly without materializing the whole mailbox.
@@ -629,7 +629,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 				ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
 			FROM messages m
-			LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
+			LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
 			LEFT JOIN message_state ms ON ms.message_id = m.id
 			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 			%s
@@ -671,7 +671,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 				m.in_reply_to, m.recipients_json, mc.text_body_tsv, mc.headers_tsv,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
 			FROM messages m
-			LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
+			LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
 			LEFT JOIN message_state ms ON ms.message_id = m.id
 			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL
 		)

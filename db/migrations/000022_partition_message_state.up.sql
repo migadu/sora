@@ -14,27 +14,23 @@ CREATE TABLE IF NOT EXISTS message_state (
     CONSTRAINT max_custom_flags_check CHECK (jsonb_array_length(custom_flags) <= 50)
 );
 
--- Backfill data
-INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-SELECT id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq FROM messages;
-
 -- Indexes for the new state table
-CREATE INDEX idx_message_state_mailbox_id_updated_modseq ON message_state (mailbox_id, updated_modseq) WHERE updated_modseq IS NOT NULL;
-CREATE INDEX idx_message_state_custom_flags ON message_state USING GIN (custom_flags);
+CREATE INDEX IF NOT EXISTS idx_message_state_mailbox_id_updated_modseq ON message_state (mailbox_id, updated_modseq) WHERE updated_modseq IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_message_state_custom_flags ON message_state USING GIN (custom_flags);
 
 -- Drop old columns and indices from messages
-DROP INDEX IF EXISTS idx_messages_updated_modseq;
-DROP INDEX IF EXISTS idx_messages_mailbox_id_updated_modseq;
-DROP INDEX IF EXISTS idx_messages_custom_flags;
-DROP INDEX IF EXISTS idx_messages_mailbox_common_search;
-DROP INDEX IF EXISTS idx_messages_mailbox_modseqs;
-DROP INDEX IF EXISTS idx_messages_first_unseen;
+-- DROP INDEX IF EXISTS idx_messages_updated_modseq;
+-- DROP INDEX IF EXISTS idx_messages_mailbox_id_updated_modseq;
+-- DROP INDEX IF EXISTS idx_messages_custom_flags;
+-- DROP INDEX IF EXISTS idx_messages_mailbox_common_search;
+-- DROP INDEX IF EXISTS idx_messages_mailbox_modseqs;
+-- DROP INDEX IF EXISTS idx_messages_first_unseen;
 
 -- Recreate indices on messages without mutable fields
-CREATE INDEX idx_messages_mailbox_common_search ON messages (mailbox_id, internal_date, size, uid) WHERE expunged_at IS NULL;
-CREATE INDEX idx_messages_mailbox_modseqs ON messages (mailbox_id, created_modseq, expunged_modseq);
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_common_search ON messages (mailbox_id, internal_date, size, uid) WHERE expunged_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_mailbox_modseqs ON messages (mailbox_id, created_modseq, expunged_modseq);
 
-CREATE INDEX idx_message_state_first_unseen ON message_state (mailbox_id, message_id) WHERE (flags & 1) = 0;
+CREATE INDEX IF NOT EXISTS idx_message_state_first_unseen ON message_state (mailbox_id, message_id) WHERE (flags & 1) = 0;
 
 -- ============================================================================
 -- 1. DROP OLD TRIGGERS
@@ -260,11 +256,18 @@ CREATE TRIGGER trigger_message_state_stats_update_stmt
     REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table
     FOR EACH STATEMENT EXECUTE FUNCTION maintain_mailbox_stats_state();
 
-ALTER TABLE messages
-    DROP CONSTRAINT max_custom_flags_check,
-    DROP COLUMN flags,
-    DROP COLUMN custom_flags,
-    DROP COLUMN flags_changed_at,
-    DROP COLUMN updated_modseq;
+-- Set defaults on legacy columns so INSERTs that only write to message_state
+-- don't violate NOT NULL constraints during the transition period.
+ALTER TABLE messages ALTER COLUMN flags SET DEFAULT 0;
+
+-- ALTER TABLE messages
+--     DROP CONSTRAINT max_custom_flags_check,
+--     DROP COLUMN flags,
+--     DROP COLUMN custom_flags,
+--     DROP COLUMN flags_changed_at,
+--     DROP COLUMN updated_modseq;
+DROP TRIGGER IF EXISTS zzz_sync_message_state_trigger ON messages;
+DROP FUNCTION IF EXISTS sync_message_state();
 
 COMMIT;
+

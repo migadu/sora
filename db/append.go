@@ -154,7 +154,7 @@ type InsertMessageOptions struct {
 	RawHeaders           string
 	PreservedUID         *uint32       // Optional: preserved UID from import
 	PreservedUIDValidity *uint32       // Optional: preserved UIDVALIDITY from import
-	FTSRetention         time.Duration // Optional: skip creating message_contents entirely for messages older than this
+	FTSRetention         time.Duration // Optional: skip creating messages_fts entirely for messages older than this
 }
 
 func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
@@ -494,37 +494,28 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			"content_hash", truncateHash(options.ContentHash), "account_id", upload.AccountID)
 	}
 
-	// ---- FTS INDEXING (best-effort, non-fatal) ----
-	// Insert into message_contents AFTER the critical message row and pending_upload
-	// are secured. This runs with a capped sub-context so the to_tsvector() trigger
-	// cannot exhaust the write timeout budget. If this fails, the message is still
+	// ---- FTS STAGING QUEUE (best-effort, non-fatal) ----
+	// Insert into messages_fts AFTER the critical message row and pending_upload
+	// are secured. This safely enqueues the raw payloads for the background daemon
+	// to asynchronously perform the expensive to_tsvector() conversion. If this fails, the message is still
 	// delivered and uploaded to S3 — it just won't be FTS-searchable.
 	//
-	// Skip message_contents entirely when the message is already past the FTS retention
+	// Skip messages_fts entirely when the message is already past the FTS retention
 	// window. Creating the row would only add immediate work for the cleanup worker.
 	if options.FTSRetention == 0 || options.SentDate.IsZero() || !options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
-		// Decide what to store in message_contents.
+		// Decide what to store in messages_fts.
 		// Skip very large bodies/headers (>64KB) — the full content is always available in S3.
-		// text_body is immediately cleared by the trigger after computing text_body_tsv,
-		// so it is never actually persisted in the database.
+		// text_body and headers are staged in messages_fts, then processed implicitly by fts_worker.
 		const maxStoredBodySize = 64 * 1024 // 64 KB
-		// Note: sanePlaintextBody and saneRawHeaders are already sanitized via SanitizeUTF8
+		var textBodyArg any = sanePlaintextBody
+		var headersArg any = saneRawHeaders
 
-		// Prevent PostgreSQL to_tsvector DOS vulnerability (context deadline exceeded)
-		// by deleting excessively long tokens (e.g. base64 blobs, hex dumps) that cause O(N^2)
-		// parsing behavior in the text search engine. FTS is only useful for human words anyway.
-		safeFtsBody := helpers.RemoveLongTokens(sanePlaintextBody, 128)
-		safeFtsHeaders := helpers.RemoveLongTokens(saneRawHeaders, 128)
-
-		var textBodyArg any = safeFtsBody
-		var headersArg any = safeFtsHeaders
-
-		if len(safeFtsBody) > maxStoredBodySize {
+		if len(sanePlaintextBody) > maxStoredBodySize {
 			truncLen := maxStoredBodySize
-			for truncLen > 0 && !utf8.RuneStart(safeFtsBody[truncLen]) {
+			for truncLen > 0 && !utf8.RuneStart(sanePlaintextBody[truncLen]) {
 				truncLen--
 			}
-			textBodyArg = safeFtsBody[:truncLen]
+			textBodyArg = sanePlaintextBody[:truncLen]
 			logger.Info("Database: truncating text_body for FTS indexing to 64KB for very large message",
 				"content_hash", truncateHash(options.ContentHash), "original_size_bytes", len(sanePlaintextBody))
 			metrics.LargeBodyStorageSkipped.Inc()
@@ -536,79 +527,25 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			metrics.LargeBodyStorageSkipped.Inc()
 		}
 
-		// Only insert when there is actual content. A missing message_contents row is
-		// expected for old/large messages and is handled gracefully downstream (unsearchable).
+		textBodyStr, _ := textBodyArg.(string)
 		headersStr, _ := headersArg.(string)
-		if textBodyArg != nil || headersStr != "" {
-			// Use a SAVEPOINT to isolate the FTS INSERT. If the to_tsvector() trigger
-			// times out or causes an error, ROLLBACK TO SAVEPOINT restores the transaction
-			// to a clean state so the COMMIT succeeds with the critical data intact.
-			// Without this, a cancelled query puts PostgreSQL in "aborted" state and the
-			// COMMIT silently becomes a ROLLBACK, losing the message row.
-			_, spErr := tx.Exec(ctx, "SAVEPOINT fts_insert")
-			if spErr != nil {
-				logger.Warn("Database: failed to create savepoint for FTS insert (non-fatal)",
-					"content_hash", truncateHash(options.ContentHash), "err", spErr)
-			} else {
-				// Give FTS its own independent 10s budget. We rely exclusively on PostgreSQL's
-				// server-side statement_timeout. We MUST use context.Background() here because
-				// if a Go context deadline is exceeded during a pgx operation, pgx assumes the
-				// connection is stuck and ungracefully closes the underlying TCP connection!
-				// This bubbles up as "conn closed" and breaks the parent LMTP session.
-				ftsCtx := context.Background()
-
-				// Set PostgreSQL's statement_timeout as the enforcer.
-				_, _ = tx.Exec(ftsCtx, "SET LOCAL statement_timeout = 10000") // 10 seconds
-
-				// Prevent lock contention pile-ups during parallel LMTP delivery to multiple
-				// recipients by taking a non-blocking advisory lock on the content_hash.
-				// hashtext() deterministically maps the string to a 32-bit integer.
-				var lockAcquired bool
-				err = tx.QueryRow(ftsCtx, "SELECT pg_try_advisory_xact_lock(hashtext($1), 0)", options.ContentHash).Scan(&lockAcquired)
-
+		if textBodyStr != "" || headersStr != "" {
+			_, saveErr := tx.Exec(ctx, "SAVEPOINT fts_insert")
+			if saveErr == nil {
+				_, err = tx.Exec(ctx, `
+					INSERT INTO messages_fts (content_hash, text_body, headers, sent_date)
+					VALUES ($1, $2, $3, $4)
+					ON CONFLICT (content_hash) DO NOTHING
+				`, options.ContentHash, textBodyArg, headersArg, options.SentDate)
 				if err != nil {
-					logger.Warn("Database: failed to attempt advisory lock for FTS (non-fatal)", "err", err)
-					// Proceed without lock to degrade gracefully
-					lockAcquired = true
-				}
-
-				ftsOK := true
-				if !lockAcquired {
-					// Another parallel transaction is currently inserting this exact content_hash.
-					// We can assume they'll succeed and we bypass the slow row lock.
-					logger.Info("Database: skipping FTS insert due to concurrent indexing (advisory lock held)", "content_hash", truncateHash(options.ContentHash))
+					tx.Exec(ctx, "ROLLBACK TO SAVEPOINT fts_insert")
+					logger.Warn("Database: failed to insert message fts payload (non-fatal, message will be unsearchable)",
+						"content_hash", truncateHash(options.ContentHash), "err", err)
 				} else {
-					// Fast-path: Check if the message_contents row already exists.
-					var exists bool
-					err = tx.QueryRow(ftsCtx, "SELECT EXISTS(SELECT 1 FROM message_contents WHERE content_hash = $1)", options.ContentHash).Scan(&exists)
-					if err != nil {
-						ftsOK = false
-						logger.Warn("Database: failed to check message_contents existence (non-fatal, message will be unsearchable)",
-							"content_hash", truncateHash(options.ContentHash), "err", err)
-					} else if !exists {
-						_, err = tx.Exec(ftsCtx, `
-							INSERT INTO message_contents (content_hash, text_body, headers, sent_date)
-							VALUES ($1, $2, $3, $4)
-							ON CONFLICT (content_hash) DO NOTHING
-						`, options.ContentHash, textBodyArg, headersArg, options.SentDate)
-						if err != nil {
-							ftsOK = false
-							logger.Warn("Database: failed to insert message content (non-fatal, message will be unsearchable)",
-								"content_hash", truncateHash(options.ContentHash), "err", err)
-						}
-					}
+					tx.Exec(ctx, "RELEASE SAVEPOINT fts_insert")
 				}
-
-				// Clean up the savepoint: RELEASE on success, ROLLBACK on failure.
-				// ftsCtx is context.Background() so it is safe to reuse here —
-				// these are fast control-flow commands that must always succeed.
-				if ftsOK {
-					_, _ = tx.Exec(ftsCtx, "SET LOCAL statement_timeout = 0")
-					_, _ = tx.Exec(ftsCtx, "RELEASE SAVEPOINT fts_insert")
-				} else {
-					_, _ = tx.Exec(ftsCtx, "ROLLBACK TO SAVEPOINT fts_insert")
-					_, _ = tx.Exec(ftsCtx, "SET LOCAL statement_timeout = 0")
-				}
+			} else {
+				logger.Warn("Database: failed to create savepoint for fts_insert", "err", saveErr)
 			}
 		}
 	}
@@ -882,10 +819,10 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		return 0, 0, consts.ErrDBInsertFailed
 	}
 
-	// Skip message_contents entirely when the message is already past the FTS retention
+	// Skip messages_fts entirely when the message is already past the FTS retention
 	// window. Creating the row would only add immediate work for the cleanup worker.
 	if options.FTSRetention == 0 || options.SentDate.IsZero() || !options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
-		// Decide what to store in message_contents.
+		// Decide what to store in messages_fts.
 		// Skip very large bodies/headers (>64KB) — the full content is always available in S3.
 		const maxStoredBodySize = 64 * 1024 // 64 KB
 		var textBodyArg any = sanePlaintextBody
@@ -908,60 +845,27 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			metrics.LargeBodyStorageSkipped.Inc()
 		}
 
-		// Only insert when there is actual content. A missing message_contents row is
+		// Only insert when there is actual content. A missing messages_fts row is
 		// expected for old/large messages and is handled gracefully downstream (unsearchable).
+		textBodyStr, _ := textBodyArg.(string)
 		headersStr, _ := headersArg.(string)
-		if textBodyArg != nil || headersStr != "" {
-			// Use a SAVEPOINT to isolate the FTS INSERT (same pattern as InsertMessage).
-			_, spErr := tx.Exec(ctx, "SAVEPOINT fts_insert")
-			if spErr != nil {
-				logger.Warn("Database: failed to create savepoint for FTS insert (non-fatal)",
-					"content_hash", truncateHash(options.ContentHash), "err", spErr)
-			} else {
-				// Give FTS its own independent 10s budget without Go-level cancellation.
-				ftsCtx := context.Background()
-
-				_, _ = tx.Exec(ftsCtx, "SET LOCAL statement_timeout = 10000") // 10 seconds
-
-				var lockAcquired bool
-				err = tx.QueryRow(ftsCtx, "SELECT pg_try_advisory_xact_lock(hashtext($1), 0)", options.ContentHash).Scan(&lockAcquired)
+		if textBodyStr != "" || headersStr != "" {
+			_, saveErr := tx.Exec(ctx, "SAVEPOINT fts_insert")
+			if saveErr == nil {
+				_, err = tx.Exec(ctx, `
+					INSERT INTO messages_fts (content_hash, text_body, headers, sent_date)
+					VALUES ($1, $2, $3, $4)
+					ON CONFLICT (content_hash) DO NOTHING
+				`, options.ContentHash, textBodyArg, headersArg, options.SentDate)
 				if err != nil {
-					logger.Warn("Database: failed to attempt advisory lock for FTS (non-fatal)", "err", err)
-					lockAcquired = true // Proceed without lock to degrade gracefully
-				}
-
-				ftsOK := true
-				if !lockAcquired {
-					logger.Info("Database: skipping FTS insert due to concurrent indexing (advisory lock held)", "content_hash", truncateHash(options.ContentHash))
+					tx.Exec(ctx, "ROLLBACK TO SAVEPOINT fts_insert")
+					logger.Warn("Database: failed to insert message fts payload (non-fatal, message will be unsearchable)",
+						"content_hash", truncateHash(options.ContentHash), "err", err)
 				} else {
-					var exists bool
-					err = tx.QueryRow(ftsCtx, "SELECT EXISTS(SELECT 1 FROM message_contents WHERE content_hash = $1)", options.ContentHash).Scan(&exists)
-					if err != nil {
-						ftsOK = false
-						logger.Warn("Database: failed to check message_contents existence (non-fatal, message will be unsearchable)",
-							"content_hash", truncateHash(options.ContentHash), "err", err)
-					} else if !exists {
-						_, err = tx.Exec(ftsCtx, `
-							INSERT INTO message_contents (content_hash, text_body, headers, sent_date)
-							VALUES ($1, $2, $3, $4)
-							ON CONFLICT (content_hash) DO NOTHING
-						`, options.ContentHash, textBodyArg, headersArg, options.SentDate)
-						if err != nil {
-							ftsOK = false
-							logger.Warn("Database: failed to insert message content (non-fatal, message will be unsearchable)",
-								"content_hash", truncateHash(options.ContentHash), "err", err)
-						}
-					}
+					tx.Exec(ctx, "RELEASE SAVEPOINT fts_insert")
 				}
-
-				// Clean up savepoint (see InsertMessage for rationale).
-				if ftsOK {
-					_, _ = tx.Exec(ftsCtx, "SET LOCAL statement_timeout = 0")
-					_, _ = tx.Exec(ftsCtx, "RELEASE SAVEPOINT fts_insert")
-				} else {
-					_, _ = tx.Exec(ftsCtx, "ROLLBACK TO SAVEPOINT fts_insert")
-					_, _ = tx.Exec(ftsCtx, "SET LOCAL statement_timeout = 0")
-				}
+			} else {
+				logger.Warn("Database: failed to create savepoint for fts_insert", "err", saveErr)
 			}
 		}
 	}

@@ -184,7 +184,7 @@ func (pts *PerformanceTestSuite) createMessageBatch(ctx context.Context, tx pgx.
 
 		// Insert message content for full-text search — trigger handles FTS vector generation
 		_, err = tx.Exec(ctx, `
-			INSERT INTO message_contents (content_hash, text_body, headers)
+			INSERT INTO messages_fts (content_hash, text_body, headers)
 			VALUES ($1, $2, $3)
 			ON CONFLICT (content_hash) DO NOTHING`,
 			contentHash, body, headers)
@@ -397,6 +397,27 @@ func TestSearchPerformance(t *testing.T) {
 			err = pts.CreateTestMessages(ctx, pts.config.LargeDataset-pts.config.MediumDataset, "newsletter")
 			require.NoError(t, err)
 		}
+
+		// Process the asynchronous FTS queue before answering search queries
+		var totalProcessed int
+		for {
+			tx, err := pts.db.GetWritePool().Begin(ctx)
+			require.NoError(t, err)
+
+			processed, err := pts.db.ProcessFTSBatch(ctx, tx, 1000)
+			if err != nil {
+				tx.Rollback(ctx)
+				t.Fatalf("Failed to process FTS batch: %v", err)
+			}
+			err = tx.Commit(ctx)
+			require.NoError(t, err)
+
+			if processed == 0 {
+				break
+			}
+			totalProcessed += processed
+		}
+		t.Logf("Processed %d async FTS records", totalProcessed)
 	})
 
 	t.Run("SimpleSearchPerformance", func(t *testing.T) {

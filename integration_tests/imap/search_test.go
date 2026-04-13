@@ -86,6 +86,11 @@ func TestIMAP_SearchOperations(t *testing.T) {
 		}
 	}
 
+	// Flush FTS staging queue so all appended messages get their tsvectors built immediately
+	if err := server.FlushFTSQueue(); err != nil {
+		t.Fatalf("Failed to flush FTS queue: %v", err)
+	}
+
 	// Test 1: Search by flag
 	searchResults, err := c.Search(&imap.SearchCriteria{
 		Flag: []imap.Flag{imap.FlagSeen},

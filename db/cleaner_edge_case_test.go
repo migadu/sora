@@ -204,8 +204,8 @@ func TestPruneWithSKIPLOCKED(t *testing.T) {
 
 		// Insert message content
 		_, err = tx.Exec(ctx, `
-			INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, sent_date, created_at, updated_at)
-			VALUES ($1, $2, to_tsvector('english', $2), '', $3, NOW(), NOW())
+			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers, sent_date, created_at)
+			VALUES ($1, $2, to_tsvector('english', $2), '', $3, NOW())
 		`, contentHash, testBody, oldSentDate)
 		require.NoError(t, err)
 
@@ -235,7 +235,7 @@ func TestPruneWithSKIPLOCKED(t *testing.T) {
 	var lockedHashes []string
 	rows, err := txLongRunning.Query(ctx, `
 		SELECT content_hash 
-		FROM message_contents 
+		FROM messages_fts 
 		WHERE content_hash = ANY($1)
 		ORDER BY content_hash
 		LIMIT 5
@@ -359,8 +359,8 @@ func TestPruneConcurrentWorkers(t *testing.T) {
 
 		// Insert message content
 		_, err = tx.Exec(ctx, `
-			INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, sent_date, created_at, updated_at)
-			VALUES ($1, $2, to_tsvector('english', $2), '', $3, NOW(), NOW())
+			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers, sent_date, created_at)
+			VALUES ($1, $2, to_tsvector('english', $2), '', $3, NOW())
 		`, contentHash, testBody, oldSentDate)
 		require.NoError(t, err)
 
@@ -440,7 +440,7 @@ func TestPruneConcurrentWorkers(t *testing.T) {
 		contentHash := fmt.Sprintf("concurrent_%s_%d_%d", t.Name(), testTimestamp, i)
 		var body *string
 		err = db.GetReadPool().QueryRow(ctx,
-			"SELECT text_body FROM message_contents WHERE content_hash = $1",
+			"SELECT text_body FROM messages_fts WHERE content_hash = $1",
 			contentHash).Scan(&body)
 		if err == nil && body != nil {
 			unprunedCount++
@@ -508,7 +508,7 @@ func TestCleanupLock_NoDeadlockWithUserQueries(t *testing.T) {
 	oldSentDate := time.Now().Add(-48 * time.Hour)
 
 	_, err = txData.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers, sent_date)
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers, sent_date)
 		VALUES ($1, $2, to_tsvector('english', $2), '', $3)
 	`, contentHash, testBody, oldSentDate)
 	require.NoError(t, err)
@@ -542,7 +542,7 @@ func TestCleanupLock_NoDeadlockWithUserQueries(t *testing.T) {
 		// Note: text_body is always NULL after trigger, so we read headers instead
 		var headers string
 		err = txUser.QueryRow(ctx,
-			"SELECT headers FROM message_contents WHERE content_hash = $1 FOR SHARE",
+			"SELECT headers FROM messages_fts WHERE content_hash = $1 FOR SHARE",
 			contentHash).Scan(&headers)
 		if err != nil {
 			t.Logf("User query: SELECT failed: %v", err)

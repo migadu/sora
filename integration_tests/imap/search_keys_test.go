@@ -66,6 +66,11 @@ func TestIMAP_SearchKeys(t *testing.T) {
 		}
 	}
 
+	// Flush FTS staging queue so all appended messages get their tsvectors built immediately
+	if err := server.FlushFTSQueue(); err != nil {
+		t.Fatalf("Failed to flush FTS queue: %v", err)
+	}
+
 	// Test OR (Subject Apple OR Subject Banana)
 	// Or field is [][2]SearchCriteria
 	criteria := &imap.SearchCriteria{

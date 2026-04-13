@@ -258,37 +258,26 @@ func (rd *ResilientDatabase) PruneOldMessageVectorsWithRetry(ctx context.Context
 	}
 	return result.(int64), nil
 }
-
-func (rd *ResilientDatabase) NullifyLegacyTextBodiesWithRetry(ctx context.Context, lastHash string) (int64, string, error) {
-	type resultType struct {
-		count int64
-		hash  string
-	}
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		count, newHash, err := rd.getOperationalDatabaseForOperation(true).NullifyLegacyTextBodies(ctx, tx, lastHash)
-		return resultType{count: count, hash: newHash}, err
-	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutAdmin, op)
-	if err != nil {
-		return 0, "", err
-	}
-	res := result.(resultType)
-	return res.count, res.hash, nil
-}
-
-func (rd *ResilientDatabase) GetUnusedContentHashesWithRetry(ctx context.Context, batchSize int) ([]string, error) {
+func (rd *ResilientDatabase) GetUnusedFTSHashesWithRetry(ctx context.Context, batchSize int) ([]string, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetUnusedContentHashes(ctx, batchSize)
+		return rd.getOperationalDatabaseForOperation(false).GetUnusedFTSHashes(ctx, batchSize)
 	}
-	// Use timeoutSearch (not timeoutRead) — this is a full-table anti-join scan on
-	// message_contents that can be slow immediately after a large pruning run leaves
-	// many dead tuples. 30s (timeoutRead) is insufficient; use the search timeout
-	// (typically 60s) to give PostgreSQL enough time before autovacuum catches up.
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutSearch, op)
 	if err != nil {
 		return nil, err
 	}
 	return result.([]string), nil
+}
+
+func (rd *ResilientDatabase) DeleteMessagesFTSByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(true).DeleteMessagesFTSByHashBatch(ctx, tx, hashes)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
 }
 
 func (rd *ResilientDatabase) GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, batchSize int) ([]int64, error) {
@@ -305,17 +294,6 @@ func (rd *ResilientDatabase) GetDanglingAccountsForFinalDeletionWithRetry(ctx co
 func (rd *ResilientDatabase) DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, candidates []db.UserScopedObjectForCleanup) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).DeleteExpungedMessagesByS3KeyPartsBatch(ctx, tx, candidates)
-	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
-	if err != nil {
-		return 0, err
-	}
-	return result.(int64), nil
-}
-
-func (rd *ResilientDatabase) DeleteMessageContentsByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(true).DeleteMessageContentsByHashBatch(ctx, tx, hashes)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	if err != nil {
@@ -457,4 +435,15 @@ func (rd *ResilientDatabase) executeReadWithRetry(ctx context.Context, config re
 		return nil
 	}, config)
 	return result, err
+}
+
+func (rd *ResilientDatabase) ProcessFTSBatchWithRetry(ctx context.Context, limit int) (int, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(true).ProcessFTSBatch(ctx, tx, limit)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int), nil
 }

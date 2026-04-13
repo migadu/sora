@@ -72,34 +72,58 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 				LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
 				WHERE mb.id = $1
 			  ),
-			  -- Get changed messages and calculate their sequence numbers dynamically
-			  -- using correlated subqueries heavily optimized by UID/Mailbox indexes.
-			  -- This replaces an O(N) full-mailbox ROW_NUMBER window function with O(M log N).
+			  -- 1. Find all changed messages using a UNION to ensure PostgreSQL can effectively
+			  -- use specific modseq indexes (created, updated, expunged) instead of falling
+			  -- back to scanning the entire mailbox over massive OR queries.
+			  changed_messages_raw AS (
+			    SELECT m.uid, m.expunged_at, m.created_modseq, m.expunged_modseq, ms.flags, ms.custom_flags, COALESCE(ms.updated_modseq, 0) AS updated_modseq_val
+			    FROM messages m
+			    LEFT JOIN message_state ms ON ms.message_id = m.id
+			    WHERE m.mailbox_id = $1 AND m.created_modseq > $2
+			    
+			    UNION
+			    
+			    SELECT m.uid, m.expunged_at, m.created_modseq, m.expunged_modseq, ms.flags, ms.custom_flags, COALESCE(ms.updated_modseq, 0) AS updated_modseq_val
+			    FROM messages m
+			    LEFT JOIN message_state ms ON ms.message_id = m.id
+			    WHERE m.mailbox_id = $1 AND m.expunged_modseq > $2
+			    
+			    UNION
+			    
+			    SELECT m.uid, m.expunged_at, m.created_modseq, m.expunged_modseq, ms.flags, ms.custom_flags, ms.updated_modseq AS updated_modseq_val
+			    FROM message_state ms
+			    JOIN messages m ON ms.message_id = m.id
+			    WHERE ms.mailbox_id = $1 AND ms.updated_modseq > $2
+			  ),
+			  -- 2. Calculate their sequence numbers dynamically using correlated subqueries
+			  -- heavily optimized by specific partial indexes. We split the OR condition
+			  -- into two separate COUNT() queries to guarantee index usage.
 			  current_mailbox_state AS (
 			    SELECT
-			        m.uid,
+			        cms.uid,
 			        CASE 
-			          WHEN m.expunged_at IS NOT NULL THEN 
+			          WHEN cms.expunged_at IS NOT NULL THEN 
 			            (SELECT COUNT(*) FROM messages m2 
 			             WHERE m2.mailbox_id = $1 
-			               AND (m2.expunged_modseq IS NULL OR m2.expunged_modseq > $2) 
-			               AND m2.uid <= m.uid)
+			               AND m2.expunged_at IS NULL 
+			               AND m2.uid <= cms.uid) + 
+			            (SELECT COUNT(*) FROM messages m2 
+			             WHERE m2.mailbox_id = $1 
+			               AND m2.expunged_modseq > $2 
+			               AND m2.uid <= cms.uid)
 			          ELSE 
 			            (SELECT COUNT(*) FROM messages m2 
 			             WHERE m2.mailbox_id = $1 
 			               AND m2.expunged_at IS NULL 
-			               AND m2.uid <= m.uid)
+			               AND m2.uid <= cms.uid)
 			        END AS seq_num,
-			        ms.flags,
-			        ms.custom_flags,
-			        m.created_modseq,
-			        COALESCE(ms.updated_modseq, 0) AS updated_modseq_val,
-			        m.expunged_modseq
-			    FROM messages m
-			    LEFT JOIN message_state ms ON ms.message_id = m.id
-			    WHERE m.mailbox_id = $1
-			      AND (m.expunged_modseq IS NULL OR m.expunged_modseq > $2)
-			      AND (m.created_modseq > $2 OR COALESCE(ms.updated_modseq, 0) > $2 OR COALESCE(m.expunged_modseq, 0) > $2)
+			        cms.flags,
+			        cms.custom_flags,
+			        cms.created_modseq,
+			        cms.updated_modseq_val,
+			        cms.expunged_modseq
+			    FROM changed_messages_raw cms
+			    WHERE (cms.expunged_modseq IS NULL OR cms.expunged_modseq > $2)
 			  ),
 			  changed_messages AS (
 			    SELECT

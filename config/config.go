@@ -256,7 +256,7 @@ type CleanupConfig struct {
 	GracePeriod           string `toml:"grace_period"`
 	WakeInterval          string `toml:"wake_interval"`
 	MaxAgeRestriction     string `toml:"max_age_restriction"`
-	FTSRetention          string `toml:"fts_retention"` // How long to keep the message_contents row (FTS vectors + raw headers)
+	FTSRetention          string `toml:"fts_retention"` // How long to keep the messages_fts row (FTS vectors + raw headers)
 	HealthStatusRetention string `toml:"health_status_retention"`
 }
 

@@ -92,28 +92,6 @@ func (rd *ResilientDatabase) GetMessageEnvelopeWithRetry(ctx context.Context, UI
 	return result.(*imap.Envelope), nil
 }
 
-func (rd *ResilientDatabase) GetMessageHeadersWithRetry(ctx context.Context, messageUID imap.UID, mailboxID int64) (string, error) {
-	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetMessageHeaders(ctx, messageUID, mailboxID)
-	}
-	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
-	if err != nil {
-		return "", err
-	}
-	return result.(string), nil
-}
-
-func (rd *ResilientDatabase) GetMessageTextBodyWithRetry(ctx context.Context, uid imap.UID, mailboxID int64) (string, error) {
-	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetMessageTextBody(ctx, uid, mailboxID)
-	}
-	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
-	if err != nil {
-		return "", err
-	}
-	return result.(string), nil
-}
-
 func (rd *ResilientDatabase) GetMessageBodyStructureWithRetry(ctx context.Context, uid imap.UID, mailboxID int64) (*imap.BodyStructure, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetMessageBodyStructure(ctx, uid, mailboxID)

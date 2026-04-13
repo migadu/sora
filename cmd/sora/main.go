@@ -29,6 +29,7 @@ import (
 	"github.com/migadu/sora/server/adminapi"
 	"github.com/migadu/sora/server/cleaner"
 	"github.com/migadu/sora/server/delivery"
+	"github.com/migadu/sora/server/fts"
 	"github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/imapproxy"
 	"github.com/migadu/sora/server/lmtp"
@@ -82,6 +83,7 @@ type serverDependencies struct {
 	uploadWorker          *uploader.UploadWorker
 	cacheInstance         *cache.Cache
 	cleanupWorker         *cleaner.CleanupWorker
+	ftsWorker             *fts.Worker
 	relayQueue            *relayqueue.DiskQueue
 	relayWorker           *relayqueue.Worker
 	healthIntegration     *health.HealthIntegration
@@ -220,6 +222,9 @@ func main() {
 	}
 	if deps.cleanupWorker != nil {
 		defer deps.cleanupWorker.Stop()
+	}
+	if deps.ftsWorker != nil {
+		defer deps.ftsWorker.Stop()
 	}
 	if deps.uploadWorker != nil {
 		defer deps.uploadWorker.Stop()
@@ -615,7 +620,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	deps.healthIntegration = health.NewHealthIntegration(deps.resilientDB)
 
 	if storageServicesNeeded {
-		logger.Info("Mail storage services are enabled. Starting cache, uploader, and cleaner.")
+		logger.Info("Mail storage services are enabled. Starting cache, uploader, fts daemon, and cleaner.")
 
 		// Register S3 health check
 		deps.healthIntegration.RegisterS3Check(deps.storage)
@@ -717,6 +722,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 		cleanupErrChan := make(chan error, 1)
 		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, cleanupErrChan)
+		deps.ftsWorker = fts.NewWorker(deps.resilientDB)
 
 		// Start error listener for cleanup worker
 		go func() {
@@ -725,6 +731,11 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			}
 		}()
 
+		// Start FTS worker
+		logger.Info("Starting FTS background daemon")
+		deps.ftsWorker.Start(ctx)
+
+		// Start cleanup worker
 		if err := deps.cleanupWorker.Start(ctx); err != nil {
 			errorHandler.FatalError("start cleanup worker", err)
 			os.Exit(errorHandler.WaitForExit())

@@ -2,63 +2,13 @@ package db
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"strings"
-	"time"
 
 	"github.com/emersion/go-imap/v2"
-	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
-	"github.com/migadu/sora/pkg/metrics"
 )
-
-// GetMessageTextBody fetches the plain text body of a message from the message_contents table.
-// This text_body is the canonical textual representation used for indexing and
-// can be used for IMAP BODY[TEXT] requests.
-func (db *Database) GetMessageTextBody(ctx context.Context, uid imap.UID, mailboxID int64) (string, error) {
-	var textBody sql.NullString // Use sql.NullString to handle case where LEFT JOIN finds no match
-
-	start := time.Now()
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT mc.text_body
-		FROM messages m
-		LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
-		WHERE m.uid = $1 AND m.mailbox_id = $2 AND m.expunged_at IS NULL
-	`, uid, mailboxID).Scan(&textBody)
-
-	// Record metrics
-	status := "success"
-	if err != nil {
-		status = "error"
-	}
-	metrics.DBQueryDuration.WithLabelValues("fetch_message_body", "read").Observe(time.Since(start).Seconds())
-	metrics.DBQueriesTotal.WithLabelValues("fetch_message_body", status, "read").Inc()
-
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// This means the message itself was not found in the 'messages' table.
-			return "", fmt.Errorf("message with UID %d in mailbox %d not found: %w", uid, mailboxID, err)
-		}
-		// Other database error during query execution.
-		logger.Error("Database: database error fetching text_body", "uid", uid, "mailbox_id", mailboxID, "err", err)
-		return "", fmt.Errorf("database error fetching text_body: %w", err)
-	}
-
-	if !textBody.Valid {
-		// No message_contents row for this message. This is expected for:
-		//   - messages older than fts_retention (row never created at insert time)
-		//   - messages with body > 64KB (body skipped at insert time)
-		//   - messages whose row was deleted by PruneOldMessageVectors
-		// The full message is always retrievable from S3.
-		return "", nil
-	}
-
-	return textBody.String, nil
-}
 
 func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailboxID int64) (*imap.Envelope, error) {
 	var envelope imap.Envelope

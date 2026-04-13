@@ -219,7 +219,7 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			mb.name as mailbox_path
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
-		LEFT JOIN message_contents mc ON m.content_hash = mc.content_hash
+		LEFT JOIN messages_fts mf ON m.content_hash = mf.content_hash
 		LEFT JOIN message_state ms ON ms.message_id = m.id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 		AND (
@@ -229,8 +229,8 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			OR m.to_email_sort LIKE LOWER($2)
 			OR m.to_name_sort LIKE LOWER($2)
 			OR m.cc_email_sort LIKE LOWER($2)
-			OR mc.text_body_tsv @@ plainto_tsquery($3)
-			OR mc.headers_tsv @@ plainto_tsquery($3)
+			OR mf.text_body_tsv @@ plainto_tsquery($3)
+			OR mf.headers_tsv @@ plainto_tsquery($3)
 		)
 		ORDER BY m.internal_date DESC
 		LIMIT 100

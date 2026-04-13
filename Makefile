@@ -67,7 +67,7 @@ tests-race:
 # Timeout set to 20m to accommodate long-running tests like slowloris (takes ~7 minutes)
 TEST_TIMEOUT = 20m
 TEST_FLAGS = -v -tags=integration -count=1 -timeout=$(TEST_TIMEOUT)
-DB_NAME = sora_mail_db
+DB_NAME = sora_test_db
 DB_USER = postgres
 DB_HOST = localhost
 DB_PORT = 5432

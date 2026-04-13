@@ -45,6 +45,12 @@ func main() {
 	// previous structural panics. Next step NewDatabaseFromConfig will recreate them.
 	log.Printf("Resetting database %s to pristine state...", dbName)
 
+	// Forcefully disconnect dangling test connections to prevent DROP SCHEMA locks
+	_, _ = conn.Exec(ctx, `
+		SELECT pg_terminate_backend(pid) 
+		FROM pg_stat_activity 
+		WHERE datname = $1 AND pid <> pg_backend_pid();`, dbName)
+
 	// Drop pg_trgm first to allow public schema to be dropped
 	queries := []string{
 		"DROP EXTENSION IF EXISTS pg_trgm CASCADE;",
@@ -57,7 +63,11 @@ func main() {
 		if _, err := conn.Exec(ctx, query); err != nil {
 			// If it fails, fallback to truncating tables as before just in case
 			log.Printf("Warning: failed to drop schema (%v). Falling back to TRUNCATE.", err)
-			fallbackToTruncate(ctx, conn)
+
+			// Create a fresh uncancelled context for the fallback so it doesn't fail instantly!
+			fallbackCtx, fallbackCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer fallbackCancel()
+			fallbackToTruncate(fallbackCtx, conn)
 			return
 		}
 	}
@@ -68,7 +78,7 @@ func main() {
 func fallbackToTruncate(ctx context.Context, conn *pgx.Conn) {
 	tables := []string{
 		"vacation_responses", "sieve_scripts", "pending_uploads",
-		"message_contents", "messages", "mailbox_stats", "mailbox_acls",
+		"messages_fts", "messages", "mailbox_stats", "mailbox_acls",
 		"mailboxes", "credentials", "accounts", "metadata", "health_status",
 		"cache_metrics",
 	}

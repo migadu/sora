@@ -132,7 +132,7 @@ func TestExpungeOldMessages(t *testing.T) {
 	oldCreatedAt := time.Now().Add(-72 * time.Hour) // 3 days old
 	oldHash := fmt.Sprintf("old_expunge_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers)
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
 		VALUES ($1, 'old message', to_tsvector('english', 'old message'), '')
 	`, oldHash)
 	require.NoError(t, err)
@@ -152,7 +152,7 @@ func TestExpungeOldMessages(t *testing.T) {
 	recentCreatedAt := time.Now().Add(-12 * time.Hour) // 12 hours old
 	recentHash := fmt.Sprintf("recent_expunge_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers)
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
 		VALUES ($1, 'recent message', to_tsvector('english', 'recent message'), '')
 	`, recentHash)
 	require.NoError(t, err)
@@ -219,7 +219,7 @@ func TestCleanupFailedUploads(t *testing.T) {
 	// Create old failed upload (should be cleaned up)
 	oldFailedHash := fmt.Sprintf("old_failed_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers)
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
 		VALUES ($1, 'failed upload content', to_tsvector('english', 'failed upload content'), '')
 	`, oldFailedHash)
 	require.NoError(t, err)
@@ -246,7 +246,7 @@ func TestCleanupFailedUploads(t *testing.T) {
 	// Create recent failed upload (should NOT be cleaned up)
 	recentFailedHash := fmt.Sprintf("recent_failed_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers)
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
 		VALUES ($1, 'recent failed content', to_tsvector('english', 'recent failed content'), '')
 	`, recentFailedHash)
 	require.NoError(t, err)
@@ -319,7 +319,7 @@ func TestGetUserScopedObjectsForCleanup(t *testing.T) {
 
 	cleanupHash := fmt.Sprintf("cleanup_ready_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers)
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
 		VALUES ($1, 'cleanup ready content', to_tsvector('english', 'cleanup ready content'), '')
 	`, cleanupHash)
 	require.NoError(t, err)
@@ -381,7 +381,7 @@ func TestDeleteExpungedMessagesByS3KeyPartsBatch(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		hash := fmt.Sprintf("batch_delete_%d_%d", testTimestamp, i)
 		_, err = tx.Exec(ctx, `
-			INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers)
+			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
 			VALUES ($1, $2, to_tsvector('english', $2), '')
 		`, hash, fmt.Sprintf("batch delete content %d", i))
 		require.NoError(t, err)
@@ -431,106 +431,6 @@ func TestDeleteExpungedMessagesByS3KeyPartsBatch(t *testing.T) {
 	t.Logf("Successfully tested DeleteExpungedMessagesByS3KeyPartsBatch with email: %s", testEmail)
 }
 
-// TestGetUnusedContentHashes tests finding orphaned content hashes
-func TestGetUnusedContentHashes(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping database integration test in short mode")
-	}
-
-	db := setupTestDatabase(t)
-	defer db.Close()
-
-	ctx := context.Background()
-	testTimestamp := time.Now().UnixNano()
-
-	// Setup: Create orphaned content
-	tx, err := db.GetWritePool().Begin(ctx)
-	require.NoError(t, err)
-	defer tx.Rollback(ctx)
-
-	orphanedHash := fmt.Sprintf("orphaned_%d", testTimestamp)
-	_, err = tx.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers)
-		VALUES ($1, 'orphaned content', to_tsvector('english', 'orphaned content'), '')
-	`, orphanedHash)
-	require.NoError(t, err)
-
-	err = tx.Commit(ctx)
-	require.NoError(t, err)
-
-	// Test: Get unused content hashes (use larger limit to handle test database with leftover data)
-	unused, err := db.GetUnusedContentHashes(ctx, 1000)
-	require.NoError(t, err)
-
-	t.Logf("Found %d unused content hashes", len(unused))
-
-	// Verify our orphaned hash is in the list
-	var found bool
-	for _, hash := range unused {
-		if hash == orphanedHash {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "Should find our orphaned hash in unused list")
-
-	t.Logf("Successfully tested GetUnusedContentHashes")
-}
-
-// TestDeleteMessageContentsByHashBatch tests batch deletion of message contents
-func TestDeleteMessageContentsByHashBatch(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping database integration test in short mode")
-	}
-
-	db := setupTestDatabase(t)
-	defer db.Close()
-
-	ctx := context.Background()
-	testTimestamp := time.Now().UnixNano()
-
-	// Setup: Create content hashes to delete
-	tx, err := db.GetWritePool().Begin(ctx)
-	require.NoError(t, err)
-	defer tx.Rollback(ctx)
-
-	var hashesToDelete []string
-	for i := 0; i < 3; i++ {
-		hash := fmt.Sprintf("delete_content_%d_%d", testTimestamp, i)
-		_, err = tx.Exec(ctx, `
-			INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers)
-			VALUES ($1, $2, to_tsvector('english', $2), '')
-		`, hash, fmt.Sprintf("content to delete %d", i))
-		require.NoError(t, err)
-		hashesToDelete = append(hashesToDelete, hash)
-	}
-
-	err = tx.Commit(ctx)
-	require.NoError(t, err)
-
-	// Test: Batch delete message contents
-	tx2, err := db.GetWritePool().Begin(ctx)
-	require.NoError(t, err)
-	defer tx2.Rollback(ctx)
-
-	deleted, err := db.DeleteMessageContentsByHashBatch(ctx, tx2, hashesToDelete)
-	require.NoError(t, err)
-	assert.Equal(t, int64(3), deleted, "Should delete all 3 content entries")
-
-	err = tx2.Commit(ctx)
-	require.NoError(t, err)
-
-	// Verify contents were deleted
-	for i, hash := range hashesToDelete {
-		var count int
-		err = db.GetReadPool().QueryRow(ctx, "SELECT COUNT(*) FROM message_contents WHERE content_hash = $1", hash).Scan(&count)
-		require.NoError(t, err)
-		assert.Equal(t, 0, count, fmt.Sprintf("Content %d should be deleted", i))
-	}
-
-	t.Logf("Successfully tested DeleteMessageContentsByHashBatch")
-}
-
 // TestDeleteMessageByHashAndMailbox tests targeted message deletion for re-import scenarios
 func TestDeleteMessageByHashAndMailbox(t *testing.T) {
 	if testing.Short() {
@@ -550,7 +450,7 @@ func TestDeleteMessageByHashAndMailbox(t *testing.T) {
 
 	deleteHash := fmt.Sprintf("delete_msg_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers)
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
 		VALUES ($1, 'message to delete', to_tsvector('english', 'message to delete'), '')
 	`, deleteHash)
 	require.NoError(t, err)
@@ -638,7 +538,7 @@ func TestGetUserScopedObjectsForCleanup_LiveMessagePreventsCleanup(t *testing.T)
 
 	// Create message content (shared by both messages)
 	_, err = tx2.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers)
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
 		VALUES ($1, 'shared message body', to_tsvector('english', 'shared message body'), '')
 	`, sharedContentHash)
 	require.NoError(t, err)
@@ -740,7 +640,7 @@ func TestGetUserScopedObjectsForCleanup_AllExpungedAllowsCleanup(t *testing.T) {
 
 	// Create message content
 	_, err = tx2.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers)
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
 		VALUES ($1, 'all expunged content', to_tsvector('english', 'all expunged content'), '')
 	`, allExpungedHash)
 	require.NoError(t, err)
@@ -843,7 +743,7 @@ func TestCleanerWorkflow_MovedMessageS3Preservation(t *testing.T) {
 
 	// Insert message content
 	_, err = tx2.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, text_body_tsv, headers)
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
 		VALUES ($1, $2, to_tsvector('english', $2), 'Subject: Test Message')
 	`, contentHash, messageBody)
 	require.NoError(t, err)
@@ -962,13 +862,13 @@ func TestCleanerWorkflow_MovedMessageS3Preservation(t *testing.T) {
 
 	// - Message content should still exist (not cleaned up)
 	var contentExists int
-	err = db.GetReadPool().QueryRow(ctx, "SELECT COUNT(*) FROM message_contents WHERE content_hash = $1", contentHash).Scan(&contentExists)
+	err = db.GetReadPool().QueryRow(ctx, "SELECT COUNT(*) FROM messages_fts WHERE content_hash = $1", contentHash).Scan(&contentExists)
 	require.NoError(t, err)
 	assert.Equal(t, 1, contentExists, "Message content should still exist")
 
 	// - Verify we can still read the message data (S3 object would still be accessible)
 	var headers *string
-	err = db.GetReadPool().QueryRow(ctx, "SELECT headers FROM message_contents WHERE content_hash = $1", contentHash).Scan(&headers)
+	err = db.GetReadPool().QueryRow(ctx, "SELECT headers FROM messages_fts WHERE content_hash = $1", contentHash).Scan(&headers)
 	require.NoError(t, err)
 	require.NotNil(t, headers, "Message headers should be accessible")
 	assert.Equal(t, "Subject: Test Message", *headers, "Message headers content should match")
@@ -990,7 +890,7 @@ func TestCleanerWorkflow_MovedMessageS3Preservation(t *testing.T) {
 //     (text_body is never persisted); headers_tsv is populated from headers.
 //  2. PruneOldMessageVectors deletes rows whose sent_date is older than the retention
 //     cutoff, while leaving recent rows and NULL-dated rows untouched.
-//  3. The messages table is not touched by the prune — only message_contents rows
+//  3. The messages table is not touched by the prune — only messages_fts rows
 //     are removed.
 func TestPruneOldMessageVectors(t *testing.T) {
 	if testing.Short() {
@@ -1010,7 +910,7 @@ func TestPruneOldMessageVectors(t *testing.T) {
 
 	const retention = 365 * 24 * time.Hour // 1 year
 
-	// --- Setup: insert three message_contents rows with different sent_dates ---
+	// --- Setup: insert three messages_fts rows with different sent_dates ---
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
@@ -1019,21 +919,21 @@ func TestPruneOldMessageVectors(t *testing.T) {
 
 	// Old: sent 2 years ago — should be pruned.
 	_, err = tx.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, headers, sent_date)
+		INSERT INTO messages_fts (content_hash, text_body, headers, sent_date)
 		VALUES ($1, $2, $3, $4)
 	`, oldHash, "old message body", headers, time.Now().Add(-2*365*24*time.Hour))
 	require.NoError(t, err)
 
 	// Recent: sent 6 months ago — should survive.
 	_, err = tx.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, headers, sent_date)
+		INSERT INTO messages_fts (content_hash, text_body, headers, sent_date)
 		VALUES ($1, $2, $3, $4)
 	`, recentHash, "recent message body", headers, time.Now().Add(-180*24*time.Hour))
 	require.NoError(t, err)
 
 	// No sent_date — should survive (NULL < anything is always false in SQL).
 	_, err = tx.Exec(ctx, `
-		INSERT INTO message_contents (content_hash, text_body, headers, sent_date)
+		INSERT INTO messages_fts (content_hash, text_body, headers, sent_date)
 		VALUES ($1, $2, $3, NULL)
 	`, nullDateHash, "undated message body", headers)
 	require.NoError(t, err)
@@ -1058,7 +958,28 @@ func TestPruneOldMessageVectors(t *testing.T) {
 
 	require.NoError(t, tx.Commit(ctx))
 
-	// --- Verify trigger: text_body cleared, TSVs populated ---
+	// Process FTS queue manually since the trigger was removed and made async
+	// Run in a loop to drain all pending records, as parallel tests may leave residuals.
+	var totalProcessed int
+	for {
+		processed := func() int {
+			txFTS, err := db.GetWritePool().Begin(ctx)
+			require.NoError(t, err)
+			defer txFTS.Rollback(ctx)
+
+			p, err := db.ProcessFTSBatch(ctx, txFTS, 100)
+			require.NoError(t, err)
+			require.NoError(t, txFTS.Commit(ctx))
+			return p
+		}()
+		totalProcessed += processed
+		if processed == 0 {
+			break
+		}
+	}
+	require.GreaterOrEqual(t, totalProcessed, 3, "Should process at least the 3 newly inserted messages_fts rows")
+
+	// --- Verify async worker: text_body cleared, TSVs populated ---
 	type mcRow struct {
 		TextBody    *string
 		TextBodyTSV *string
@@ -1069,21 +990,16 @@ func TestPruneOldMessageVectors(t *testing.T) {
 		var r mcRow
 		require.NoError(t, db.GetReadPool().QueryRow(ctx, `
 			SELECT text_body, text_body_tsv::text, headers_tsv::text
-			FROM message_contents WHERE content_hash = $1
+			FROM messages_fts WHERE content_hash = $1
 		`, hash).Scan(&r.TextBody, &r.TextBodyTSV, &r.HeadersTSV))
 		return r
 	}
 
 	for _, hash := range []string{oldHash, recentHash, nullDateHash} {
 		row := readMC(hash)
-		// The trigger fires BEFORE INSERT and computes TSVs from text_body / headers.
-		// It also clears text_body immediately (text_body is never persisted).
-		// On test databases where migration 14 was applied before the clearing was
-		// introduced, text_body may still be non-nil — that is a DB-version issue,
-		// not a pruning correctness issue. We assert only the TSVs here, which are
-		// always computed regardless of trigger version.
-		assert.NotNil(t, row.TextBodyTSV, "text_body_tsv must be populated by trigger: hash=%s", hash)
-		assert.NotNil(t, row.HeadersTSV, "headers_tsv must be populated by trigger: hash=%s", hash)
+		// We assert only the TSVs here, which must now be computed by the async worker.
+		assert.NotNil(t, row.TextBodyTSV, "text_body_tsv must be populated by async worker: hash=%s", hash)
+		assert.NotNil(t, row.HeadersTSV, "headers_tsv must be populated by async worker: hash=%s", hash)
 	}
 
 	// --- Run the prune ---
@@ -1101,7 +1017,7 @@ func TestPruneOldMessageVectors(t *testing.T) {
 		t.Helper()
 		var n int
 		require.NoError(t, db.GetReadPool().QueryRow(ctx,
-			"SELECT COUNT(*) FROM message_contents WHERE content_hash = $1", hash).Scan(&n))
+			"SELECT COUNT(*) FROM messages_fts WHERE content_hash = $1", hash).Scan(&n))
 		return n
 	}
 	countMsg := func(hash string) int {
@@ -1113,14 +1029,14 @@ func TestPruneOldMessageVectors(t *testing.T) {
 		return n
 	}
 
-	// Old message_contents row must be gone.
-	assert.Equal(t, 0, countMC(oldHash), "old message_contents row must be pruned")
+	// Old messages_fts row must be gone.
+	assert.Equal(t, 0, countMC(oldHash), "old messages_fts row must be pruned")
 
 	// Recent and null-dated rows must be untouched.
-	assert.Equal(t, 1, countMC(recentHash), "recent message_contents row must survive")
-	assert.Equal(t, 1, countMC(nullDateHash), "null-dated message_contents row must survive")
+	assert.Equal(t, 1, countMC(recentHash), "recent messages_fts row must survive")
+	assert.Equal(t, 1, countMC(nullDateHash), "null-dated messages_fts row must survive")
 
-	// Prune only touches message_contents — the messages rows must remain for all three.
+	// Prune only touches messages_fts — the messages rows must remain for all three.
 	for _, hash := range []string{oldHash, recentHash, nullDateHash} {
 		assert.Equal(t, 1, countMsg(hash), "messages row must be untouched by vector pruning: hash=%s", hash)
 	}

@@ -21,7 +21,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"hash/crc32"
 	"io/fs"
 	"sync"
 	"testing"
@@ -32,6 +31,7 @@ import (
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx driver for database/sql
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/consts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -391,24 +391,18 @@ func TestMigrateTimeoutCoversWithInstance(t *testing.T) {
 	)
 	ctx := context.Background()
 
-	// Compute the advisory lock ID that golang-migrate's pgxv5 driver uses.
+	// We simulate an orphaned migration lock from a crashed peer by holding
+	// the explicit leader lock that db.migrate() now relies on.
 	//
-	// Source: database.GenerateAdvisoryLockId() in golang-migrate v4.19.0:
-	//   key  = strings.Join(append(additionalNames, databaseName), "\x00")
-	//        = "public\x00schema_migrations\x00sora_test_db"  (schemaName, tableName, dbName)
-	//   sum  = crc32.ChecksumIEEE(key) * advisoryLockIDSalt  (salt = 1486364155)
-	//
-	// The pgxv5 driver passes p.config.migrationsSchemaName and
-	// p.config.migrationsTableName as additionalNames, both defaulting to
-	// "public" and "schema_migrations" respectively.
-	const advisoryLockIDSalt = uint32(1486364155)
-	migrateLockID := int64(crc32.ChecksumIEEE(
-		[]byte("public\x00schema_migrations\x00sora_test_db"),
-	) * advisoryLockIDSalt)
+	// Without the fix, holding the lock indefinitely would cause db.migrate()
+	// to block forever on pg_advisory_lock without respecting contexts.
+	// With the fix, db.migrate() checks pg_try_advisory_lock, sees that
+	// another peer is "migrating", enters its polling loop, and eventually
+	// times out gracefully.
 
 	// IMPORTANT: do ALL setup BEFORE acquiring the external lock.
 	// resetMigrationState → setupTestDatabase → NewDatabaseFromConfig which
-	// calls WithInstance → pg_advisory_lock internally. If we hold the lock
+	// calls pg_try_advisory_lock internally. If we hold the lock
 	// first, setup blocks instead of the db.migrate() call we want to test.
 	resetMigrationState(t, 11)
 	t.Cleanup(func() { resetMigrationState(t, 11) })
@@ -429,14 +423,14 @@ func TestMigrateTimeoutCoversWithInstance(t *testing.T) {
 
 	var held bool
 	err = lockConn.QueryRowContext(ctx,
-		"SELECT pg_try_advisory_lock($1)", migrateLockID).Scan(&held)
+		"SELECT pg_try_advisory_lock($1)", consts.SoraMigrationLeaderLockID).Scan(&held)
 	require.NoError(t, err)
 	require.True(t, held, "prerequisite: must hold the migration advisory lock")
 
 	// Release at test end (LIFO cleanup: this runs before resetMigrationState).
 	t.Cleanup(func() {
 		_, _ = lockConn.ExecContext(context.Background(),
-			"SELECT pg_advisory_unlock($1)", migrateLockID)
+			"SELECT pg_advisory_unlock($1)", consts.SoraMigrationLeaderLockID)
 		lockConn.Close()
 		lockHolder.Close()
 	})

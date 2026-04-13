@@ -177,7 +177,7 @@ func (d *Database) GetUserScopedObjectsForCleanup(ctx context.Context, olderThan
 
 // DeleteExpungedMessagesByS3KeyPartsBatch deletes all expunged message rows
 // from the database that match the given batches of S3 key components.
-// It does NOT delete from message_contents, as the content may be shared.
+// It does NOT delete from messages_fts, as the content may be shared.
 func (d *Database) DeleteExpungedMessagesByS3KeyPartsBatch(ctx context.Context, tx pgx.Tx, candidates []UserScopedObjectForCleanup) (int64, error) {
 	if len(candidates) == 0 {
 		return 0, nil
@@ -225,19 +225,6 @@ func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, tx pgx.Tx,
 	return tag.RowsAffected(), nil
 }
 
-// DeleteMessageContentsByHashBatch deletes multiple rows from the message_contents table.
-// This should only be called after confirming the hashes are no longer in use by any message.
-func (d *Database) DeleteMessageContentsByHashBatch(ctx context.Context, tx pgx.Tx, contentHashes []string) (int64, error) {
-	if len(contentHashes) == 0 {
-		return 0, nil
-	}
-	tag, err := tx.Exec(ctx, `DELETE FROM message_contents WHERE content_hash = ANY($1)`, contentHashes)
-	if err != nil {
-		return 0, fmt.Errorf("failed to batch delete from message_contents: %w", err)
-	}
-	return tag.RowsAffected(), nil
-}
-
 // CleanupFailedUploads deletes message rows and their corresponding pending_uploads
 // that are older than the grace period and were never successfully uploaded to S3.
 // This prevents orphaned message metadata from accumulating due to persistent upload failures.
@@ -272,32 +259,27 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 	return deletedCount, nil
 }
 
-// PruneOldMessageVectors deletes message_contents rows whose fts_retention has expired.
-// Each row holds FTS search vectors (text_body_tsv, headers_tsv) and the raw headers used
-// for IMAP fast-path header fetches (BODY[HEADER] / BODY[HEADER.FIELDS]).
-// text_body is never persisted — the trigger clears it immediately after computing
-// text_body_tsv at insert time.
+// PruneOldMessageVectors deletes messages_fts rows whose fts_retention has expired.
+// Each row holds FTS search vectors (text_body_tsv, headers_tsv).
 //
 // The DELETE uses a CTE with LIMIT to cap each invocation at maxPruneRows rows,
 // preventing long-held locks and WAL bloat if fts_retention is shortened dramatically.
 // The cleanup worker calls this periodically; remaining rows are pruned on the next cycle.
 //
-// The range scan uses the idx_message_contents_sent_date partial index (WHERE sent_date
+// The range scan uses the idx_messages_fts_sent_date partial index (WHERE sent_date
 // IS NOT NULL), so pre-existing rows with NULL sent_date are never selected.
-//
-// NOTE: The trigger does NOT fire on DELETE.
 func (d *Database) PruneOldMessageVectors(ctx context.Context, tx pgx.Tx, retention time.Duration) (int64, error) {
 	const maxPruneRows = 1_000
 
 	tag, err := tx.Exec(ctx, `
 		WITH expired AS (
-			SELECT content_hash FROM message_contents
+			SELECT content_hash FROM messages_fts
 			WHERE sent_date < (now() - $1::interval)
 			ORDER BY sent_date
 			FOR UPDATE SKIP LOCKED
 			LIMIT $2
 		)
-		DELETE FROM message_contents
+		DELETE FROM messages_fts
 		WHERE content_hash IN (SELECT content_hash FROM expired)
 	`, retention, maxPruneRows)
 	if err != nil {
@@ -307,110 +289,33 @@ func (d *Database) PruneOldMessageVectors(ctx context.Context, tx pgx.Tx, retent
 	return tag.RowsAffected(), nil
 }
 
-// NullifyLegacyTextBodies systematically sets text_body = NULL for legacy messages.
-// Prior to migration 000016, text_body was retained in the database until fts_source_retention
-// expired. The new trigger clears it immediately. This function safely nullifies lingering
-// text_body fields to reclaim backend storage.
+// GetUnusedFTSHashes finds content_hash values in messages_fts that are no longer referenced
+// by any message row at all. These are candidates for early cleanup even before TTL expires.
 //
-// To prevent massive sequential scans on a table with no index on text_body=NULL, this uses
-// an O(1) Key-Set Pagination cursor that bounds the active search window to 10,000 rows.
-func (d *Database) NullifyLegacyTextBodies(ctx context.Context, tx pgx.Tx, lastHash string) (int64, string, error) {
-	// targetUpdateRows caps the ultimate write burst (e.g. 1000)
-	// scanWindowSize bounds the fast PK sequential scan (e.g. 10,000)
-	const targetUpdateRows = 1_000
-	const scanWindowSize = 10_000
-
-	var processedCount int64
-	var newLastHash string
-	// If starting point is empty, explicitly set to start of ascii space
-	if lastHash == "" {
-		lastHash = ""
-	}
-
-	err := tx.QueryRow(ctx, `
-		WITH scan_window AS (
-			SELECT content_hash
-			FROM message_contents
-			WHERE content_hash > $1
-			ORDER BY content_hash
-			LIMIT $2
-		),
-		legacy AS (
-			SELECT mc.content_hash 
-			FROM scan_window sw
-			JOIN message_contents mc ON mc.content_hash = sw.content_hash
-			WHERE mc.text_body IS NOT NULL
-			FOR UPDATE SKIP LOCKED
-			LIMIT $3
-		),
-		nullified AS (
-			UPDATE message_contents mc
-			SET text_body = NULL
-			FROM legacy
-			WHERE mc.content_hash = legacy.content_hash
-			RETURNING mc.content_hash
-		)
-		SELECT 
-			(SELECT count(*) FROM nullified) AS rows_updated,
-			(SELECT max(content_hash) FROM scan_window) AS max_hash
-	`, lastHash, scanWindowSize, targetUpdateRows).Scan(&processedCount, &newLastHash)
-	if err != nil {
-		return 0, "", fmt.Errorf("failed to nullify legacy text_body rows: %w", err)
-	}
-
-	// If newLastHash is empty (no rows in scan_window), we reached the end of the table
-	if newLastHash == "" {
-		newLastHash = ""
-	}
-
-	// We return processedCount as how many were actually updated,
-	// BUT because scan_window returns 10,000 quickly even if processedCount=0,
-	// the worker will loop smoothly through empty spaces in 10,000 row chunks.
-	return processedCount, newLastHash, nil
-}
-
-// GetUnusedContentHashes finds content_hash values in message_contents that are no longer referenced
-// by any message row at all. These are candidates for global cleanup.
-//
-// Uses a bounded scan-window approach: each batch scans a fixed number of
-// message_contents rows (via PK index) and filters for orphans within that window.
-// This ensures predictable, bounded query time regardless of orphan density.
-// If orphans are sparse, a batch may return zero results and the cursor advances.
-func (d *Database) GetUnusedContentHashes(ctx context.Context, limit int) ([]string, error) {
-	// scanWindowSize: how many message_contents rows to examine per batch.
-	// Each row requires one index probe into messages via
-	// idx_messages_content_hash_account_id, so 5000 rows ≈ 5000 index lookups
-	// — fast and predictable, typically <1s per batch.
+// Uses a bounded scan-window approach to limit query duration.
+func (d *Database) GetUnusedFTSHashes(ctx context.Context, limit int) ([]string, error) {
 	const scanWindowSize = 5000
-	const maxBatches = 200                  // Upper bound: scan up to 1M rows total
-	const maxRunDuration = 30 * time.Second // Wall-clock cap
+	const maxBatches = 200
+	const maxRunDuration = 30 * time.Second
 
 	var allHashes []string
 	var lastHash string
 	runDeadline := time.Now().Add(maxRunDuration)
 
 	for batch := 0; batch < maxBatches && len(allHashes) < limit; batch++ {
-		// Respect the per-run time cap
 		if time.Now().After(runDeadline) {
-			logger.Info("GetUnusedContentHashes: reached time limit, returning partial results",
+			logger.Info("GetUnusedFTSHashes: reached time limit, returning partial results",
 				"found", len(allHashes), "requested", limit, "batches", batch)
 			break
 		}
-
-		// Check if context is cancelled
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 
-		// Single query that returns both the orphan hashes and the window boundary.
-		// The scan_window CTE scans exactly scanWindowSize rows from the PK index,
-		// bounding the work. The outer query filters for orphans and also returns
-		// the window's max hash so we can advance the cursor, even when zero orphans
-		// are found.
 		query := `
 			WITH scan_window AS (
 				SELECT mc.content_hash
-				FROM message_contents mc
+				FROM messages_fts mc
 				WHERE mc.content_hash > $1
 				ORDER BY mc.content_hash
 				LIMIT $2
@@ -432,10 +337,9 @@ func (d *Database) GetUnusedContentHashes(ctx context.Context, limit int) ([]str
 		var batchHashes []string
 		err := d.GetReadPool().QueryRow(ctx, query, lastHash, scanWindowSize).Scan(&windowEnd, &batchHashes)
 		if err != nil {
-			return nil, fmt.Errorf("failed to query unused content hashes: %w", err)
+			return nil, fmt.Errorf("failed to query unused FTS hashes: %w", err)
 		}
 
-		// Empty window_end means no more rows in message_contents
 		if windowEnd == "" {
 			break
 		}
@@ -443,7 +347,6 @@ func (d *Database) GetUnusedContentHashes(ctx context.Context, limit int) ([]str
 		lastHash = windowEnd
 
 		if len(batchHashes) > 0 {
-			// Only take as many as we still need
 			remaining := limit - len(allHashes)
 			if len(batchHashes) > remaining {
 				batchHashes = batchHashes[:remaining]
@@ -451,11 +354,22 @@ func (d *Database) GetUnusedContentHashes(ctx context.Context, limit int) ([]str
 			allHashes = append(allHashes, batchHashes...)
 		}
 
-		// Short sleep between batches to reduce DB pressure
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	return allHashes, nil
+}
+
+// DeleteMessagesFTSByHashBatch deletes multiple rows from the messages_fts table.
+func (d *Database) DeleteMessagesFTSByHashBatch(ctx context.Context, tx pgx.Tx, contentHashes []string) (int64, error) {
+	if len(contentHashes) == 0 {
+		return 0, nil
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM messages_fts WHERE content_hash = ANY($1)`, contentHashes)
+	if err != nil {
+		return 0, fmt.Errorf("failed to batch delete from messages_fts: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // CleanupSoftDeletedAccounts permanently deletes accounts that have been soft-deleted
