@@ -855,6 +855,9 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 		if endpoint.MinConnections > 0 {
 			config.MinConns = int32(endpoint.MinConnections)
 		}
+		if endpoint.MinIdleConnections > 0 {
+			config.MinIdleConns = int32(endpoint.MinIdleConnections)
+		}
 
 		if endpoint.MaxConnLifetime != "" {
 			lifetime, err := endpoint.GetMaxConnLifetime()
@@ -880,20 +883,21 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 		// This runs a background goroutine that checks idle connections periodically
 		config.HealthCheckPeriod = 15 * time.Second
 
-		// Configure BeforeAcquire to validate connections before use
+		// Configure PrepareConn to validate connections before use
 		// This is critical for circuit breaker recovery: when testing if the database
 		// has recovered, we need to ensure we're not reusing dead connections from a
 		// previous outage. Without this, the circuit breaker can get stuck in an
 		// infinite OPEN -> HALF_OPEN -> OPEN loop even when the database is healthy.
-		config.BeforeAcquire = func(ctx context.Context, conn *pgx.Conn) bool {
+		config.PrepareConn = func(ctx context.Context, conn *pgx.Conn) (bool, error) {
 			// Check if the connection is still alive without calling Ping
 			// Ping can trigger pool operations and cause infinite loop detection
 			// Instead, we check if the underlying connection is closed
 			if conn.IsClosed() {
-				// Connection is dead, don't use it - pool will create a new one
-				return false
+				// Connection is dead, destroy it and retry with a new one
+				return false, nil
 			}
-			return true
+			// Connection is valid, allow it to be used
+			return true, nil
 		}
 
 		dbPool, err := pgxpool.NewWithConfig(ctx, config)

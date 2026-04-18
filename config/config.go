@@ -37,17 +37,18 @@ type DatabaseEndpointConfig struct {
 	//   - Service discovery endpoints (Consul, K8s services)
 	//
 	// READ HOSTS: Multiple hosts are common for read replica load balancing
-	Hosts           []string `toml:"hosts"`
-	Port            any      `toml:"port"` // Database port (default: "5432"), can be string or integer
-	User            string   `toml:"user"`
-	Password        string   `toml:"password"`
-	Name            string   `toml:"name"`
-	TLSMode         bool     `toml:"tls"`
-	MaxConnections  int      `toml:"max_connections"`    // Maximum number of connections in the pool
-	MinConnections  int      `toml:"min_connections"`    // Minimum number of connections in the pool
-	MaxConnLifetime string   `toml:"max_conn_lifetime"`  // Maximum lifetime of a connection
-	MaxConnIdleTime string   `toml:"max_conn_idle_time"` // Maximum idle time before a connection is closed
-	QueryTimeout    string   `toml:"query_timeout"`      // Per-endpoint timeout for individual database queries (e.g., "30s")
+	Hosts              []string `toml:"hosts"`
+	Port               any      `toml:"port"` // Database port (default: "5432"), can be string or integer
+	User               string   `toml:"user"`
+	Password           string   `toml:"password"`
+	Name               string   `toml:"name"`
+	TLSMode            bool     `toml:"tls"`
+	MaxConnections     int      `toml:"max_connections"`      // Maximum number of connections in the pool
+	MinConnections     int      `toml:"min_connections"`      // Minimum number of connections in the pool (eagerly created on startup)
+	MinIdleConnections int      `toml:"min_idle_connections"` // Minimum number of idle connections (lazily maintained, superior to min_connections)
+	MaxConnLifetime    string   `toml:"max_conn_lifetime"`    // Maximum lifetime of a connection
+	MaxConnIdleTime    string   `toml:"max_conn_idle_time"`   // Maximum idle time before a connection is closed
+	QueryTimeout       string   `toml:"query_timeout"`        // Per-endpoint timeout for individual database queries (e.g., "30s")
 }
 
 // DatabaseConfig holds database configuration with separate read/write endpoints
@@ -1492,30 +1493,32 @@ func NewDefaultConfig() Config {
 			SearchTimeout: "1m",
 			WriteTimeout:  "15s",
 			Write: &DatabaseEndpointConfig{
-				Hosts:           []string{"localhost"},
-				Port:            "5432",
-				User:            "postgres",
-				Password:        "",
-				Name:            "sora_mail_db",
-				TLSMode:         false,
-				MaxConnections:  100,
-				MinConnections:  10,
-				MaxConnLifetime: "1h",
-				MaxConnIdleTime: "30m",
-				QueryTimeout:    "30s",
+				Hosts:              []string{"localhost"},
+				Port:               "5432",
+				User:               "postgres",
+				Password:           "",
+				Name:               "sora_mail_db",
+				TLSMode:            false,
+				MaxConnections:     100,
+				MinConnections:     0,
+				MinIdleConnections: 5,
+				MaxConnLifetime:    "1h",
+				MaxConnIdleTime:    "5m",
+				QueryTimeout:       "30s",
 			},
 			Read: &DatabaseEndpointConfig{
-				Hosts:           []string{"localhost"},
-				Port:            "5432",
-				User:            "postgres",
-				Password:        "",
-				Name:            "sora_mail_db",
-				TLSMode:         false,
-				MaxConnections:  100,
-				MinConnections:  10,
-				MaxConnLifetime: "1h",
-				MaxConnIdleTime: "30m",
-				QueryTimeout:    "30s",
+				Hosts:              []string{"localhost"},
+				Port:               "5432",
+				User:               "postgres",
+				Password:           "",
+				Name:               "sora_mail_db",
+				TLSMode:            false,
+				MaxConnections:     100,
+				MinConnections:     0,
+				MinIdleConnections: 10,
+				MaxConnLifetime:    "1h",
+				MaxConnIdleTime:    "5m",
+				QueryTimeout:       "30s",
 			},
 		},
 		S3: S3Config{
