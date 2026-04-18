@@ -204,8 +204,8 @@ func TestPruneWithSKIPLOCKED(t *testing.T) {
 
 		// Insert message content
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers, sent_date, created_at)
-			VALUES ($1, $2, to_tsvector('english', $2), '', $3, NOW())
+			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, sent_date, created_at)
+			VALUES ($1, $2, to_tsvector('english', $2), $3, NOW())
 		`, contentHash, testBody, oldSentDate)
 		require.NoError(t, err)
 
@@ -359,8 +359,8 @@ func TestPruneConcurrentWorkers(t *testing.T) {
 
 		// Insert message content
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers, sent_date, created_at)
-			VALUES ($1, $2, to_tsvector('english', $2), '', $3, NOW())
+			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, sent_date, created_at)
+			VALUES ($1, $2, to_tsvector('english', $2), $3, NOW())
 		`, contentHash, testBody, oldSentDate)
 		require.NoError(t, err)
 
@@ -508,8 +508,8 @@ func TestCleanupLock_NoDeadlockWithUserQueries(t *testing.T) {
 	oldSentDate := time.Now().Add(-48 * time.Hour)
 
 	_, err = txData.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers, sent_date)
-		VALUES ($1, $2, to_tsvector('english', $2), '', $3)
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, sent_date)
+		VALUES ($1, $2, to_tsvector('english', $2), $3)
 	`, contentHash, testBody, oldSentDate)
 	require.NoError(t, err)
 
@@ -539,18 +539,18 @@ func TestCleanupLock_NoDeadlockWithUserQueries(t *testing.T) {
 		defer txUser.Rollback(ctx)
 
 		// Simulate user query reading the content
-		// Note: text_body is always NULL after trigger, so we read headers instead
-		var headers string
+		// Note: text_body is always NULL after async FTS processing, so we read content_hash
+		var hash string
 		err = txUser.QueryRow(ctx,
-			"SELECT headers FROM messages_fts WHERE content_hash = $1 FOR SHARE",
-			contentHash).Scan(&headers)
+			"SELECT content_hash FROM messages_fts WHERE content_hash = $1 FOR SHARE",
+			contentHash).Scan(&hash)
 		if err != nil {
 			t.Logf("User query: SELECT failed: %v", err)
 			userQueryDone <- false
 			return
 		}
 
-		t.Logf("User query: successfully read content (%d bytes)", len(headers))
+		t.Logf("User query: successfully read content (%d bytes)", len(hash))
 		time.Sleep(500 * time.Millisecond) // Hold the lock so pruning correctly skips it
 		txUser.Commit(ctx)
 		userQueryDone <- true

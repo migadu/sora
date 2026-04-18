@@ -132,8 +132,8 @@ func TestExpungeOldMessages(t *testing.T) {
 	oldCreatedAt := time.Now().Add(-72 * time.Hour) // 3 days old
 	oldHash := fmt.Sprintf("old_expunge_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
-		VALUES ($1, 'old message', to_tsvector('english', 'old message'), '')
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
+		VALUES ($1, 'old message', to_tsvector('english', 'old message'))
 	`, oldHash)
 	require.NoError(t, err)
 
@@ -152,8 +152,8 @@ func TestExpungeOldMessages(t *testing.T) {
 	recentCreatedAt := time.Now().Add(-12 * time.Hour) // 12 hours old
 	recentHash := fmt.Sprintf("recent_expunge_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
-		VALUES ($1, 'recent message', to_tsvector('english', 'recent message'), '')
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
+		VALUES ($1, 'recent message', to_tsvector('english', 'recent message'))
 	`, recentHash)
 	require.NoError(t, err)
 
@@ -219,8 +219,8 @@ func TestCleanupFailedUploads(t *testing.T) {
 	// Create old failed upload (should be cleaned up)
 	oldFailedHash := fmt.Sprintf("old_failed_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
-		VALUES ($1, 'failed upload content', to_tsvector('english', 'failed upload content'), '')
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
+		VALUES ($1, 'failed upload content', to_tsvector('english', 'failed upload content'))
 	`, oldFailedHash)
 	require.NoError(t, err)
 
@@ -246,8 +246,8 @@ func TestCleanupFailedUploads(t *testing.T) {
 	// Create recent failed upload (should NOT be cleaned up)
 	recentFailedHash := fmt.Sprintf("recent_failed_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
-		VALUES ($1, 'recent failed content', to_tsvector('english', 'recent failed content'), '')
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
+		VALUES ($1, 'recent failed content', to_tsvector('english', 'recent failed content'))
 	`, recentFailedHash)
 	require.NoError(t, err)
 
@@ -319,8 +319,8 @@ func TestGetUserScopedObjectsForCleanup(t *testing.T) {
 
 	cleanupHash := fmt.Sprintf("cleanup_ready_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
-		VALUES ($1, 'cleanup ready content', to_tsvector('english', 'cleanup ready content'), '')
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
+		VALUES ($1, 'cleanup ready content', to_tsvector('english', 'cleanup ready content'))
 	`, cleanupHash)
 	require.NoError(t, err)
 
@@ -381,8 +381,8 @@ func TestDeleteExpungedMessagesByS3KeyPartsBatch(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		hash := fmt.Sprintf("batch_delete_%d_%d", testTimestamp, i)
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
-			VALUES ($1, $2, to_tsvector('english', $2), '')
+			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
+			VALUES ($1, $2, to_tsvector('english', $2))
 		`, hash, fmt.Sprintf("batch delete content %d", i))
 		require.NoError(t, err)
 
@@ -450,8 +450,8 @@ func TestDeleteMessageByHashAndMailbox(t *testing.T) {
 
 	deleteHash := fmt.Sprintf("delete_msg_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
-		VALUES ($1, 'message to delete', to_tsvector('english', 'message to delete'), '')
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
+		VALUES ($1, 'message to delete', to_tsvector('english', 'message to delete'))
 	`, deleteHash)
 	require.NoError(t, err)
 
@@ -538,8 +538,8 @@ func TestGetUserScopedObjectsForCleanup_LiveMessagePreventsCleanup(t *testing.T)
 
 	// Create message content (shared by both messages)
 	_, err = tx2.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
-		VALUES ($1, 'shared message body', to_tsvector('english', 'shared message body'), '')
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
+		VALUES ($1, 'shared message body', to_tsvector('english', 'shared message body'))
 	`, sharedContentHash)
 	require.NoError(t, err)
 
@@ -640,8 +640,8 @@ func TestGetUserScopedObjectsForCleanup_AllExpungedAllowsCleanup(t *testing.T) {
 
 	// Create message content
 	_, err = tx2.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
-		VALUES ($1, 'all expunged content', to_tsvector('english', 'all expunged content'), '')
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
+		VALUES ($1, 'all expunged content', to_tsvector('english', 'all expunged content'))
 	`, allExpungedHash)
 	require.NoError(t, err)
 
@@ -743,8 +743,8 @@ func TestCleanerWorkflow_MovedMessageS3Preservation(t *testing.T) {
 
 	// Insert message content
 	_, err = tx2.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, headers)
-		VALUES ($1, $2, to_tsvector('english', $2), 'Subject: Test Message')
+		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
+		VALUES ($1, $2, to_tsvector('english', $2))
 	`, contentHash, messageBody)
 	require.NoError(t, err)
 
@@ -867,11 +867,11 @@ func TestCleanerWorkflow_MovedMessageS3Preservation(t *testing.T) {
 	assert.Equal(t, 1, contentExists, "Message content should still exist")
 
 	// - Verify we can still read the message data (S3 object would still be accessible)
-	var headers *string
-	err = db.GetReadPool().QueryRow(ctx, "SELECT headers FROM messages_fts WHERE content_hash = $1", contentHash).Scan(&headers)
+	var textBody *string
+	err = db.GetReadPool().QueryRow(ctx, "SELECT text_body FROM messages_fts WHERE content_hash = $1", contentHash).Scan(&textBody)
 	require.NoError(t, err)
-	require.NotNil(t, headers, "Message headers should be accessible")
-	assert.Equal(t, "Subject: Test Message", *headers, "Message headers content should match")
+	require.NotNil(t, textBody, "Message text_body should be accessible")
+	assert.Contains(t, *textBody, "This is the message body", "Message content should match")
 
 	t.Logf("✓ Step 6 PASSED: Final state verified")
 	t.Logf("  - INBOX expunged row: DELETED ✓")
@@ -886,8 +886,8 @@ func TestCleanerWorkflow_MovedMessageS3Preservation(t *testing.T) {
 // TestPruneOldMessageVectors is a realistic database integration test that proves
 // the correctness of the FTS retention cleanup path end-to-end:
 //
-//  1. INSERT trigger: text_body is cleared immediately after computing text_body_tsv
-//     (text_body is never persisted); headers_tsv is populated from headers.
+//  1. INSERT: text_body is stored, then processed by FTS worker to populate text_body_tsv
+//     (text_body is cleared after processing).
 //  2. PruneOldMessageVectors deletes rows whose sent_date is older than the retention
 //     cutoff, while leaving recent rows and NULL-dated rows untouched.
 //  3. The messages table is not touched by the prune — only messages_fts rows
@@ -915,43 +915,36 @@ func TestPruneOldMessageVectors(t *testing.T) {
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
 
-	headers := "From: alice@example.com\r\nSubject: Test\r\n"
-
 	// Old: sent 2 years ago — should be pruned.
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, headers, sent_date)
-		VALUES ($1, $2, $3, $4)
-	`, oldHash, "old message body", headers, time.Now().Add(-2*365*24*time.Hour))
+		INSERT INTO messages_fts (content_hash, text_body, sent_date)
+		VALUES ($1, $2, $3)
+	`, oldHash, "old message body", time.Now().Add(-2*365*24*time.Hour))
 	require.NoError(t, err)
 
 	// Recent: sent 6 months ago — should survive.
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, headers, sent_date)
-		VALUES ($1, $2, $3, $4)
-	`, recentHash, "recent message body", headers, time.Now().Add(-180*24*time.Hour))
+		INSERT INTO messages_fts (content_hash, text_body, sent_date)
+		VALUES ($1, $2, $3)
+	`, recentHash, "recent message body", time.Now().Add(-180*24*time.Hour))
 	require.NoError(t, err)
 
 	// No sent_date — should survive (NULL < anything is always false in SQL).
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, headers, sent_date)
-		VALUES ($1, $2, $3, NULL)
-	`, nullDateHash, "undated message body", headers)
+		INSERT INTO messages_fts (content_hash, text_body, sent_date)
+		VALUES ($1, $2, NULL)
+	`, nullDateHash, "undated message body")
 	require.NoError(t, err)
 
-	// Insert a messages row for each — realistic setup.
+	// Insert a messages row for each — realistic setup (without message_state since we're only testing FTS pruning).
 	for i, hash := range []string{oldHash, recentHash, nullDateHash} {
 		_, err = tx.Exec(ctx, `
-			WITH inserted AS (
-				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date,
-				                      internal_date, size, uploaded,
-				                      s3_domain, s3_localpart, message_id,
-				                      body_structure, recipients_json, created_modseq)
-				VALUES ($1, $2, $3, $4, NOW(), NOW(), 100, TRUE,
-				        'pvec-domain', 'pvec-part', $5, 'body', '[]', $6)
-				RETURNING id, mailbox_id
-			)
-			INSERT INTO message_state (message_id, mailbox_id, flags)
-			SELECT id, mailbox_id, 0 FROM inserted
+			INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date,
+			                      internal_date, size, uploaded,
+			                      s3_domain, s3_localpart, message_id,
+			                      body_structure, recipients_json, created_modseq)
+			VALUES ($1, $2, $3, $4, NOW(), NOW(), 100, TRUE,
+			        'pvec-domain', 'pvec-part', $5, 'body', '[]', $6)
 		`, accountID, mailboxID, 600+i, hash, fmt.Sprintf("pvec%d@example.com", i), 600+i)
 		require.NoError(t, err)
 	}
@@ -983,23 +976,21 @@ func TestPruneOldMessageVectors(t *testing.T) {
 	type mcRow struct {
 		TextBody    *string
 		TextBodyTSV *string
-		HeadersTSV  *string
 	}
 	readMC := func(hash string) mcRow {
 		t.Helper()
 		var r mcRow
 		require.NoError(t, db.GetReadPool().QueryRow(ctx, `
-			SELECT text_body, text_body_tsv::text, headers_tsv::text
+			SELECT text_body, text_body_tsv::text
 			FROM messages_fts WHERE content_hash = $1
-		`, hash).Scan(&r.TextBody, &r.TextBodyTSV, &r.HeadersTSV))
+		`, hash).Scan(&r.TextBody, &r.TextBodyTSV))
 		return r
 	}
 
 	for _, hash := range []string{oldHash, recentHash, nullDateHash} {
 		row := readMC(hash)
-		// We assert only the TSVs here, which must now be computed by the async worker.
+		// text_body_tsv must be populated by the async worker
 		assert.NotNil(t, row.TextBodyTSV, "text_body_tsv must be populated by async worker: hash=%s", hash)
-		assert.NotNil(t, row.HeadersTSV, "headers_tsv must be populated by async worker: hash=%s", hash)
 	}
 
 	// --- Run the prune ---

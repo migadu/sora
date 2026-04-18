@@ -121,16 +121,35 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 		conditions = append(conditions, fmt.Sprintf("text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s)", param))
 	}
 	// Text search - searches both headers and body (RFC 3501: TEXT matches header or body)
-	// Note: text_body_tsv and headers_tsv are in messages_fts table, only available in complex query path
+	// We search:
+	//   1. text_body_tsv (FTS index on message body in messages_fts table)
+	//   2. Dedicated columns: subject, from/to/cc sort columns (indexed in messages table)
+	//
+	// Note: headers_tsv was removed in migration 000030 because all searchable headers
+	// (From/To/Cc/Subject) have dedicated indexed columns. The headers_tsv index was
+	// 7.5 GB (vs text_body_tsv at 1.2 GB) and caused 12+ second UPDATE queries.
 	for _, textCriteria := range criteria.Text {
 		param := nextParam()
 		args[param] = textCriteria
-		// Search in both headers and body text using full-text search
-		// Either TSV matching is sufficient; NULL-safe so pruned columns are skipped gracefully
-		// Note: These columns are in messages_fts table, only joined in complex query
+		likeParam := nextParam()
+		lowerText := strings.ToLower(textCriteria)
+		args[likeParam] = "%" + lowerText + "%"
+
+		// Search across: body FTS, subject column, and recipient sort columns
+		// Note: text_body_tsv is in messages_fts table (complex query only)
+		// Note: *_sort columns are already lowercase, so no need for LOWER()
 		conditions = append(conditions, fmt.Sprintf(
-			"((text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s)) OR (headers_tsv IS NOT NULL AND headers_tsv @@ plainto_tsquery('simple', @%s)))",
-			param, param))
+			"((text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s)) "+
+				"OR LOWER(%ssubject) LIKE @%s "+
+				"OR %sfrom_email_sort LIKE @%s "+
+				"OR %sfrom_name_sort LIKE @%s "+
+				"OR %sto_email_sort LIKE @%s "+
+				"OR %sto_name_sort LIKE @%s "+
+				"OR %scc_email_sort LIKE @%s)",
+			param, datePrefix, likeParam,
+			datePrefix, likeParam, datePrefix, likeParam,
+			datePrefix, likeParam, datePrefix, likeParam,
+			datePrefix, likeParam))
 	}
 
 	// State prefix for fields moved to message_state
@@ -216,13 +235,14 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 			conditions = append(conditions, fmt.Sprintf(`%srecipients_json @> @%s::jsonb`, datePrefix, recipientJSONParam))
 		default:
 			// Generic HEADER search for arbitrary headers (e.g., HEADER List-ID "value")
-			// Use FTS search on headers_tsv column
-			// Note: needsComplexQuery() will detect this and use complex query path
-			param := nextParam()
-			args[param] = lowerValue
-			conditions = append(conditions, fmt.Sprintf(
-				"headers_tsv IS NOT NULL AND headers_tsv @@ plainto_tsquery('simple', @%s)",
-				param))
+			// Note: headers_tsv was removed in migration 000030. Generic header searches
+			// on non-standard headers (List-ID, X-*, etc.) will return no results.
+			// All commonly-searched headers (From/To/Cc/Subject/Message-ID/etc.) have
+			// dedicated columns above, so this only affects rare searches.
+			// Return FALSE condition to match nothing (could also return error)
+			conditions = append(conditions, "FALSE")
+			logger.Warn("Generic HEADER search not supported after headers_tsv removal",
+				"header", lowerKey, "value", lowerValue)
 		}
 	}
 
@@ -407,19 +427,9 @@ func (db *Database) needsComplexQuery(criteria *imap.SearchCriteria, orderByClau
 		return true
 	}
 
-	// Need complex query for generic header searches (requires headers_tsv from messages_fts)
-	for _, headerField := range criteria.Header {
-		lowerKey := strings.ToLower(headerField.Key)
-		// Check if this is a generic header (not one with a dedicated column)
-		switch lowerKey {
-		case "from", "to", "cc", "bcc", "subject", "message-id", "in-reply-to", "reply-to":
-			// These have dedicated columns, no need for complex query
-			continue
-		default:
-			// Generic header requires headers_tsv search
-			return true
-		}
-	}
+	// Note: Generic header searches no longer need complex query after headers_tsv removal.
+	// They will return FALSE (no matches) per the buildSearchCriteria logic above.
+	// All commonly-searched headers have dedicated columns (from/to/cc/subject/etc.)
 
 	// Need complex query for sequence number searches (requires seqnum calculation)
 	for _, seqSet := range criteria.SeqNum {
@@ -803,6 +813,306 @@ func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID int64, crit
 	if err != nil {
 		// The error from getMessagesQueryExecutor will be wrapped here
 		return nil, fmt.Errorf("GetMessagesSorted: %w", err)
+	}
+	return messages, nil
+}
+
+func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, orderByClause string, limit int) ([]SearchMessageResult, error) {
+	paramCounter := 0
+
+	var finalQueryString string
+	var metricsLabel string
+	var resultLimit int
+	var whereCondition string
+	var whereArgs pgx.NamedArgs
+	var err error
+
+	// Determine appropriate result limit based on query complexity
+	isComplexQuery := db.needsComplexQuery(criteria, orderByClause)
+	if limit > 0 {
+		// Caller specified an explicit limit - use it
+		resultLimit = limit
+	} else if isComplexQuery {
+		// Complex queries (CTE, JSONB sorting) get lower limits due to processing overhead
+		if strings.Contains(strings.ToLower(orderByClause), "coalesce(") ||
+			strings.Contains(strings.ToLower(orderByClause), "jsonb_array_elements") {
+			resultLimit = MaxComplexSortResults // 500 for expensive JSONB sorting
+		} else {
+			resultLimit = MaxSearchResults // 100k for other complex queries (FTS, sequence)
+		}
+	} else {
+		resultLimit = MaxSearchResults // 100k for simple queries - reasonable for IMAP clients
+	}
+
+	needsSeqNumSearch := false
+	var checkSeqNum func(*imap.SearchCriteria) bool
+	checkSeqNum = func(c *imap.SearchCriteria) bool {
+		if c == nil {
+			return false
+		}
+		if len(c.SeqNum) > 0 {
+			return true
+		}
+		for _, n := range c.Not {
+			if checkSeqNum(&n) {
+				return true
+			}
+		}
+		for _, pair := range c.Or {
+			if checkSeqNum(&pair[0]) || checkSeqNum(&pair[1]) {
+				return true
+			}
+		}
+		return false
+	}
+	needsSeqNumSearch = checkSeqNum(criteria)
+	// If ordering uses sequence numbers dynamically, we can't push it down
+	if strings.Contains(strings.ToLower(orderByClause), "seqnum") {
+		needsSeqNumSearch = true
+	}
+
+	if needsSeqNumSearch && !strings.Contains(strings.ToLower(orderByClause), "seqnum") {
+		// If we only need seqnum for WHERE filtering, we can map the SeqSets to UIDSets
+		// and completely bypass the catastrophic ROW_NUMBER() materialization!
+		var mapSeqToUID func(*imap.SearchCriteria) error
+		mapSeqToUID = func(c *imap.SearchCriteria) error {
+			if c == nil {
+				return nil
+			}
+			if len(c.SeqNum) > 0 {
+				for _, seqSet := range c.SeqNum {
+					var mappedUIDSet imap.UIDSet
+					for _, seqRange := range seqSet {
+						startUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Start)
+						if err != nil {
+							continue // Out of bounds or invalid
+						}
+
+						uidRange := imap.UIDRange{Start: startUID}
+						if seqRange.Stop == 0 {
+							uidRange.Stop = 0
+						} else {
+							stopUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Stop)
+							if err != nil {
+								uidRange.Stop = 0 // Cap to highest
+							} else {
+								uidRange.Start = min(startUID, stopUID)
+								uidRange.Stop = max(startUID, stopUID)
+							}
+						}
+						mappedUIDSet = append(mappedUIDSet, uidRange)
+					}
+					if len(mappedUIDSet) > 0 {
+						c.UID = append(c.UID, mappedUIDSet)
+					} else if len(seqSet) > 0 {
+						c.UID = append(c.UID, []imap.UIDRange{{Start: 0, Stop: 0}})
+					}
+				}
+				// Clear the SeqNum criteria since we moved them to UID
+				c.SeqNum = nil
+			}
+			for i := range c.Not {
+				if err := mapSeqToUID(&c.Not[i]); err != nil {
+					return err
+				}
+			}
+			for i := range c.Or {
+				if err := mapSeqToUID(&c.Or[i][0]); err != nil {
+					return err
+				}
+				if err := mapSeqToUID(&c.Or[i][1]); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		if err := mapSeqToUID(criteria); err == nil {
+			needsSeqNumSearch = false
+		}
+	}
+
+	// Use optimized query path when possible
+	if !isComplexQuery {
+		// Fast path: Simple query with table aliases
+		whereCondition, whereArgs, err = db.buildSearchCriteriaWithPrefix(criteria, "p", &paramCounter, "m")
+		if err != nil {
+			return nil, err
+		}
+		whereArgs["mailboxID"] = mailboxID
+
+		// For simple queries, ensure ORDER BY uses "m." prefix
+		if orderByClause == "" {
+			orderByClause = "ORDER BY m.uid DESC"
+		}
+
+		// Dynamic sequence optimization: Sequence numbers are computed natively downstream
+		// via db.HydrateSearchMessageSequences in Go, completely bypassing Postgres' O(N^2) constraints.
+		simpleQueryTemplate := `
+				SELECT
+					m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum
+				FROM messages m
+				LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
+				%s
+				LIMIT %d`
+
+		// Neutralize the "Limit + Order By" backward index scan bias for non-FTS queries.
+		// A memory sort of a single mailbox's rows takes <30ms, but streaming the mailbox
+		// backward to find a massive needle-in-haystack (e.g. Header searches) times out at 5s.
+		innerOrderByClause := orderByClause
+		if db.needsIndexScanBiasBuster(criteria) {
+			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+			if innerOrderByClause == orderByClause {
+				innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+			}
+		}
+
+		finalQueryString = fmt.Sprintf(simpleQueryTemplate, whereCondition, innerOrderByClause, resultLimit)
+		metricsLabel = "search_messages_simple"
+
+	} else if !needsSeqNumSearch {
+		// Modern Complex path: We need FTS or JSONB generic headers, BUT we do NOT need SeqNum filtering.
+		// Thus, we can push down complex where clauses (FTS joins) into the CTE too!
+		whereCondition, whereArgs, err = db.buildSearchCriteriaWithPrefix(criteria, "p", &paramCounter, "m")
+		if err != nil {
+			return nil, err
+		}
+		whereArgs["mailboxID"] = mailboxID
+
+		if orderByClause == "" {
+			orderByClause = "ORDER BY m.uid DESC"
+		}
+
+		// Dynamic sequence optimization: Sequence numbers are computed natively downstream
+		// via db.HydrateSearchMessageSequences in Go, completely bypassing Postgres' O(N^2) constraints.
+		complexQueryTemplate := `
+				SELECT
+					m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum
+				FROM messages m
+				LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+				LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
+				%s
+				LIMIT %d`
+
+		innerOrderByClause := orderByClause
+		if db.needsIndexScanBiasBuster(criteria) {
+			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+			if innerOrderByClause == orderByClause {
+				innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+			}
+		}
+
+		finalQueryString = fmt.Sprintf(complexQueryTemplate, whereCondition, innerOrderByClause, resultLimit)
+		metricsLabel = "search_messages_complex_fast"
+
+	} else {
+		// Legacy Complex path: Use CTE with empty table prefix because SeqNum filtering REQUIRES evaluating Sequence IDs BEFORE where
+		whereCondition, whereArgs, err = db.buildSearchCriteriaWithPrefix(criteria, "p", &paramCounter, "")
+		if err != nil {
+			return nil, err
+		}
+		whereArgs["mailboxID"] = mailboxID
+
+		if orderByClause == "" {
+			orderByClause = "ORDER BY uid DESC"
+		}
+
+		const complexQuery = `
+		WITH message_seqs AS (
+			SELECT
+				m.id, m.uid,
+				ROW_NUMBER() OVER(ORDER BY uid) as seqnum
+			FROM messages m
+			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL
+		)
+		SELECT 
+			m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq, seq.seqnum
+		FROM message_seqs seq
+		INNER JOIN messages m ON m.id = seq.id
+		LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id`
+
+		innerOrderByClause := orderByClause
+		if db.needsIndexScanBiasBuster(criteria) {
+			innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+			if innerOrderByClause == orderByClause {
+				innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+			}
+		}
+		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, innerOrderByClause, resultLimit)
+		metricsLabel = "search_messages_complex_legacy"
+	}
+
+	start := time.Now()
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, finalQueryString, whereArgs)
+
+	// Record metrics
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	metrics.DBQueryDuration.WithLabelValues(metricsLabel, "read").Observe(time.Since(start).Seconds())
+	metrics.DBQueriesTotal.WithLabelValues(metricsLabel, status, "read").Inc()
+
+	if err != nil {
+		logger.Error("Database: failed executing query", "query", finalQueryString, "args", whereArgs, "err", err, "duration", time.Since(start))
+		return nil, fmt.Errorf("failed to execute query: %w", err)
+	}
+	defer rows.Close()
+
+	scanStart := time.Now()
+	messages, err := scanSearchMessages(rows)
+	scanDuration := time.Since(scanStart)
+	if err != nil {
+		logger.Error("Database: failed scanning messages", "err", err, "scan_duration", scanDuration, "query_duration", time.Since(start), "mailbox_id", mailboxID, "query", finalQueryString, "args", whereArgs)
+		return nil, fmt.Errorf("getMessagesQueryExecutor: failed to scan messages: %w", err)
+	}
+	if scanDuration > 5*time.Second {
+		logger.Warn("Database: slow message scan detected", "scan_duration", scanDuration, "row_count", len(messages), "mailbox_id", mailboxID, "query_type", metricsLabel, "query", finalQueryString, "args", whereArgs)
+	}
+
+	// Dynamic sequence hydration (O(1) mapped iteration rather than PostgreSQL quadratic windowing)
+	if len(messages) > 0 {
+		if err := db.HydrateSearchMessageSequences(ctx, mailboxID, messages); err != nil {
+			return nil, fmt.Errorf("failed to hydrate sequences dynamically: %w", err)
+		}
+	}
+
+	// Log warning if we hit the default result limit (may indicate client needs to refine search)
+	// Don't warn if caller explicitly requested this limit (limit > 0)
+	if limit == 0 && len(messages) >= resultLimit {
+		logger.Warn("Database: search query hit result limit", "limit", resultLimit, "mailbox_id", mailboxID, "complex", isComplexQuery, "message", "Client may need to use more specific search criteria")
+	}
+
+	return messages, nil
+}
+
+// SearchMessagesWithCriteria retrieves only lightweight message metadata needed for IMAP SEARCH requests.
+func (db *Database) SearchMessagesWithCriteria(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, limit int) ([]SearchMessageResult, error) {
+	messages, err := db.getSearchMessagesQueryExecutor(ctx, mailboxID, criteria, "", limit) // Empty string triggers default sort
+	if err != nil {
+		return nil, fmt.Errorf("SearchMessagesWithCriteria: %w", err)
+	}
+	return messages, nil
+}
+
+// SearchMessagesSorted retrieves lightweight message metadata that matches the search criteria, sorted.
+func (db *Database) SearchMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit int) ([]SearchMessageResult, error) {
+	tempOrderBy := db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
+	isComplexQuery := db.needsComplexQuery(criteria, tempOrderBy)
+
+	var orderBy string
+	if isComplexQuery {
+		orderBy = db.buildSortOrderClauseWithPrefix(sortCriteria, "")
+	} else {
+		orderBy = tempOrderBy
+	}
+
+	messages, err := db.getSearchMessagesQueryExecutor(ctx, mailboxID, criteria, orderBy, limit)
+	if err != nil {
+		return nil, fmt.Errorf("SearchMessagesSorted: %w", err)
 	}
 	return messages, nil
 }

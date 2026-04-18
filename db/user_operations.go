@@ -229,7 +229,6 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			OR m.to_name_sort LIKE LOWER($2)
 			OR m.cc_email_sort LIKE LOWER($2)
 			OR mf.text_body_tsv @@ plainto_tsquery($3)
-			OR mf.headers_tsv @@ plainto_tsquery($3)
 		)
 		ORDER BY m.internal_date DESC
 		LIMIT 100

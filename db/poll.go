@@ -152,7 +152,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 				// Base sequence number: count of active messages with UID <= target
 				batch.Queue(`
 					SELECT COUNT(*) FROM messages 
-					WHERE mailbox_id = $1 AND expunged_modseq IS NULL AND uid <= $2
+					WHERE mailbox_id = $1 AND expunged_at IS NULL AND uid <= $2
 				`, mailboxID, u.UID)
 			} else {
 				// Expunged sequence number includes messages that were expunged in this poll window

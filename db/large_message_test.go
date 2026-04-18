@@ -347,13 +347,13 @@ func TestInsertMessage_LargeHeaders(t *testing.T) {
 	require.Len(t, messages, 1)
 	assert.Equal(t, "Large Headers Test", messages[0].Subject)
 
-	// Verify that headers column is empty string (not stored due to size)
-	var headers string
+	// Verify that messages_fts row was created with text_body
+	var textBody *string
 	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT headers FROM messages_fts WHERE content_hash = $1",
-		contentHash).Scan(&headers)
+		"SELECT text_body FROM messages_fts WHERE content_hash = $1",
+		contentHash).Scan(&textBody)
 	assert.NoError(t, err)
-	assert.Equal(t, "", headers, "headers should be empty string for large headers")
+	assert.NotNil(t, textBody, "text_body should be populated for FTS processing")
 
 	t.Logf("Successfully tested large headers with messageID: %d, UID: %d", messageID, uid)
 }

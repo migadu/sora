@@ -40,6 +40,20 @@ type Message struct {
 	ExpungedModSeq *int64
 }
 
+// SearchMessageResult represents a lightweight slice of message metadata
+// used exclusively for IMAP SEARCH/SORT operations to prevent massive
+// data serialization over the database wire.
+type SearchMessageResult struct {
+	ID             int64
+	UID            imap.UID
+	MailboxID      int64
+	ContentHash    string
+	CreatedModSeq  int64
+	UpdatedModSeq  *int64
+	ExpungedModSeq *int64
+	Seq            uint32
+}
+
 // MessagePart represents a part of an email message (e.g., body, attachments)
 type MessagePart struct {
 	MessageID  int64  // Reference to the message ID
@@ -371,6 +385,31 @@ func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {
 	return messages, nil
 }
 
+func scanSearchMessages(rows pgx.Rows) ([]SearchMessageResult, error) {
+	defer rows.Close()
+
+	var messages []SearchMessageResult
+	for rows.Next() {
+		var msg SearchMessageResult
+
+		// Scan ONLY the subset of columns required for SEARCH / SORT / CONDSTORE
+		if err := rows.Scan(
+			&msg.ID, &msg.UID, &msg.MailboxID, &msg.ContentHash,
+			&msg.CreatedModSeq, &msg.UpdatedModSeq, &msg.ExpungedModSeq, &msg.Seq,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan search message: %v", err)
+		}
+
+		messages = append(messages, msg)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error scanning search rows: %v", err)
+	}
+
+	return messages, nil
+}
+
 // deserializeBodyStructure deserializes and validates a body_structure blob, returning a fallback on any error.
 func deserializeBodyStructure(data []byte, msgSize int, accountID, mailboxID int64, uid imap.UID, contentHash string) *imap.BodyStructure {
 	if len(data) > 0 {
@@ -524,10 +563,10 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 		// Create search criteria to get all messages (no filters)
 		criteria := &imap.SearchCriteria{}
 
-		// Get the most recent messages. Use GetMessagesWithCriteria to trigger the
+		// Get the most recent messages. Use SearchMessagesWithCriteria to trigger the
 		// fast-path ORDER BY uid DESC which operates in O(1) via indices, instead of
 		// forcing a massive in-memory ordering on internal_date.
-		messages, err := db.GetMessagesWithCriteria(ctx, mailbox.ID, criteria, messageCount)
+		messages, err := db.SearchMessagesWithCriteria(ctx, mailbox.ID, criteria, messageCount)
 		if err != nil {
 
 			log.Printf("WarmUp: failed to get recent messages for mailbox '%s': %v", mailboxName, err)
@@ -557,17 +596,40 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 // HydrateMessageSequences takes a slice of messages and dynamically maps their IMAP sequence numbers (Seq)
 // using a highly optimized O(1) Index-Only streaming pass through the database, rather than O(K*N) subqueries.
 func (db *Database) HydrateMessageSequences(ctx context.Context, mailboxID int64, messages []Message) error {
+	return hydrateSequencesCore(ctx, db, mailboxID, messages,
+		func(m *Message) uint32 { return uint32(m.UID) },
+		func(m *Message, seq uint32) { m.Seq = seq },
+	)
+}
+
+// HydrateSearchMessageSequences works the same as HydrateMessageSequences but operates
+// on the lightweight SearchMessageResult struct.
+func (db *Database) HydrateSearchMessageSequences(ctx context.Context, mailboxID int64, messages []SearchMessageResult) error {
+	return hydrateSequencesCore(ctx, db, mailboxID, messages,
+		func(m *SearchMessageResult) uint32 { return uint32(m.UID) },
+		func(m *SearchMessageResult, seq uint32) { m.Seq = seq },
+	)
+}
+
+func hydrateSequencesCore[T any](
+	ctx context.Context,
+	db *Database,
+	mailboxID int64,
+	messages []T,
+	getUID func(*T) uint32,
+	setSeq func(*T, uint32),
+) error {
 	if len(messages) == 0 {
 		return nil
 	}
 
 	if len(messages) <= 50 {
 		batch := &pgx.Batch{}
-		for _, m := range messages {
+		for i := range messages {
 			batch.Queue(`
 				SELECT COUNT(*) FROM messages 
-				WHERE mailbox_id = $1 AND expunged_modseq IS NULL AND uid <= $2
-			`, mailboxID, m.UID)
+				WHERE mailbox_id = $1 AND expunged_at IS NULL AND uid <= $2
+			`, mailboxID, getUID(&messages[i]))
 		}
 		br := db.GetReadPoolWithContext(ctx).SendBatch(ctx, batch)
 		for i := range messages {
@@ -576,7 +638,7 @@ func (db *Database) HydrateMessageSequences(ctx context.Context, mailboxID int64
 				_ = br.Close()
 				return fmt.Errorf("failed to count sparse sequence: %w", err)
 			}
-			messages[i].Seq = seq
+			setSeq(&messages[i], seq)
 		}
 		if err := br.Close(); err != nil {
 			return fmt.Errorf("failed to close sparse sequence batch: %w", err)
@@ -585,8 +647,8 @@ func (db *Database) HydrateMessageSequences(ctx context.Context, mailboxID int64
 	}
 
 	interestedUIDs := make(map[uint32]bool, len(messages))
-	for _, m := range messages {
-		interestedUIDs[uint32(m.UID)] = true
+	for i := range messages {
+		interestedUIDs[getUID(&messages[i])] = true
 	}
 
 	seqRows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
@@ -622,7 +684,7 @@ func (db *Database) HydrateMessageSequences(ctx context.Context, mailboxID int64
 	}
 
 	for i := range messages {
-		messages[i].Seq = seqMap[uint32(messages[i].UID)]
+		setSeq(&messages[i], seqMap[getUID(&messages[i])])
 	}
 
 	return nil

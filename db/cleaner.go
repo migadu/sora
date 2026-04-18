@@ -281,7 +281,7 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 }
 
 // PruneOldMessageVectors deletes messages_fts rows whose fts_retention has expired.
-// Each row holds FTS search vectors (text_body_tsv, headers_tsv).
+// Each row holds the FTS search vector (text_body_tsv).
 //
 // The DELETE uses a CTE with LIMIT to cap each invocation at maxPruneRows rows,
 // preventing long-held locks and WAL bloat if fts_retention is shortened dramatically.

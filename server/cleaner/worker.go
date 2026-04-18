@@ -67,7 +67,7 @@ type CleanupWorker struct {
 	interval              time.Duration
 	gracePeriod           time.Duration
 	maxAgeRestriction     time.Duration
-	ftsRetention          time.Duration // How long to keep FTS vectors (text_body_tsv, headers_tsv)
+	ftsRetention          time.Duration // How long to keep FTS vectors
 	healthStatusRetention time.Duration
 	stopCh                chan struct{}
 	errCh                 chan<- error

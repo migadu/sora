@@ -119,7 +119,7 @@ func (pts *PerformanceTestSuite) createMessageBatch(ctx context.Context, tx pgx.
 		pts.nextUID++ // Increment for next message
 
 		// Generate varied content based on message type
-		subject, body, headers := pts.generateMessageContent(i, messageType)
+		subject, body, _ := pts.generateMessageContent(i, messageType)
 		contentHash := fmt.Sprintf("hash_%s_%d", messageType, currentUID)
 		messageID := fmt.Sprintf("<%d.%s@test.example.com>", currentUID, messageType)
 
@@ -182,12 +182,12 @@ func (pts *PerformanceTestSuite) createMessageBatch(ctx context.Context, tx pgx.
 			return fmt.Errorf("failed to insert message %d: %w", i, err)
 		}
 
-		// Insert message content for full-text search — trigger handles FTS vector generation
+		// Insert message content for full-text search — async worker handles FTS vector generation
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body, headers)
-			VALUES ($1, $2, $3)
+			INSERT INTO messages_fts (content_hash, text_body)
+			VALUES ($1, $2)
 			ON CONFLICT (content_hash) DO NOTHING`,
-			contentHash, body, headers)
+			contentHash, body)
 		if err != nil {
 			return fmt.Errorf("failed to insert message content %d: %w", i, err)
 		}

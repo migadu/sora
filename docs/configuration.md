@@ -87,7 +87,7 @@ This configures the background janitorial service.
 
 *   `grace_period`: How long to wait before permanently deleting a message that a user has expunged (e.g., `"14d"`). This acts as a recovery window.
 *   `max_age_restriction`: Automatically expunge messages older than this duration (e.g., `"365d"`). Leave empty to disable.
-*   `fts_retention`: How long to keep the `message_contents` row — which contains the FTS search vectors (`text_body_tsv`, `headers_tsv`) and the raw `headers` used for IMAP fast-path header fetches (default: empty — keep indefinitely). When this period expires the entire row is deleted: FTS search stops working for that message and `BODY[HEADER]` / `BODY[HEADER.FIELDS]` fall back to S3. Note: `text_body` is never persisted — it is cleared by a database trigger immediately after the FTS vector is computed at insert time.
+*   `fts_retention`: How long to keep the `messages_fts` row — which contains the FTS search vector (`text_body_tsv`) (default: empty — keep indefinitely). When this period expires the entire row is deleted and FTS search stops working for that message. Note: `text_body` is never persisted — it is cleared after the FTS vector is computed by the background worker.
 
 ### `[servers.*]`
 

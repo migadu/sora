@@ -153,6 +153,20 @@ func (rd *ResilientDatabase) GetMessagesSorted(ctx context.Context, mailboxID in
 	return result.([]db.Message), nil
 }
 
+func (rd *ResilientDatabase) SearchMessagesSortedWithRetry(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit int) ([]db.SearchMessageResult, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(false).SearchMessagesSorted(ctx, mailboxID, criteria, sortCriteria, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []db.SearchMessageResult{}, nil
+	}
+	return result.([]db.SearchMessageResult), nil
+}
+
 func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, AccountID int64) (map[imap.UID]imap.UID, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).MoveMessages(ctx, tx, ids, srcMailboxID, destMailboxID, AccountID)
@@ -208,6 +222,20 @@ func (rd *ResilientDatabase) GetMessagesWithCriteriaWithRetry(ctx context.Contex
 		return []db.Message{}, nil
 	}
 	return result.([]db.Message), nil
+}
+
+func (rd *ResilientDatabase) SearchMessagesWithCriteriaWithRetry(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, limit int) ([]db.SearchMessageResult, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(false).SearchMessagesWithCriteria(ctx, mailboxID, criteria, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []db.SearchMessageResult{}, nil
+	}
+	return result.([]db.SearchMessageResult), nil
 }
 
 // --- Message Restoration Wrappers ---

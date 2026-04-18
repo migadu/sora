@@ -373,7 +373,6 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	saneSubject := helpers.SanitizeUTF8(options.Subject)
 	saneInReplyToStr := helpers.SanitizeUTF8(inReplyToStr)
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
-	saneRawHeaders := helpers.SanitizeUTF8(options.RawHeaders)
 
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
@@ -504,11 +503,10 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	// window. Creating the row would only add immediate work for the cleanup worker.
 	if options.FTSRetention == 0 || options.SentDate.IsZero() || !options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
 		// Decide what to store in messages_fts.
-		// Skip very large bodies/headers (>64KB) — the full content is always available in S3.
-		// text_body and headers are staged in messages_fts, then processed implicitly by fts_worker.
+		// Skip very large bodies (>64KB) — the full content is always available in S3.
+		// text_body is staged in messages_fts, then processed by fts_worker.
 		const maxStoredBodySize = 64 * 1024 // 64 KB
 		var textBodyArg any = sanePlaintextBody
-		var headersArg any = saneRawHeaders
 
 		if len(sanePlaintextBody) > maxStoredBodySize {
 			truncLen := maxStoredBodySize
@@ -520,23 +518,16 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 				"content_hash", truncateHash(options.ContentHash), "original_size_bytes", len(sanePlaintextBody))
 			metrics.LargeBodyStorageSkipped.Inc()
 		}
-		if len(saneRawHeaders) > maxStoredBodySize {
-			logger.Info("Database: skipping headers storage for very large headers",
-				"content_hash", truncateHash(options.ContentHash), "size_bytes", len(saneRawHeaders))
-			headersArg = ""
-			metrics.LargeBodyStorageSkipped.Inc()
-		}
 
 		textBodyStr, _ := textBodyArg.(string)
-		headersStr, _ := headersArg.(string)
-		if textBodyStr != "" || headersStr != "" {
+		if textBodyStr != "" {
 			_, saveErr := tx.Exec(ctx, "SAVEPOINT fts_insert")
 			if saveErr == nil {
 				_, err = tx.Exec(ctx, `
-					INSERT INTO messages_fts (content_hash, text_body, headers, sent_date)
-					VALUES ($1, $2, $3, $4)
+					INSERT INTO messages_fts (content_hash, text_body, sent_date)
+					VALUES ($1, $2, $3)
 					ON CONFLICT (content_hash) DO NOTHING
-				`, options.ContentHash, textBodyArg, headersArg, options.SentDate)
+				`, options.ContentHash, textBodyArg, options.SentDate)
 				if err != nil {
 					tx.Exec(ctx, "ROLLBACK TO SAVEPOINT fts_insert")
 					logger.Warn("Database: failed to insert message fts payload (non-fatal, message will be unsearchable)",
@@ -754,7 +745,6 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	saneSubject := helpers.SanitizeUTF8(options.Subject)
 	saneInReplyToStr := helpers.SanitizeUTF8(inReplyToStr)
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
-	saneRawHeaders := helpers.SanitizeUTF8(options.RawHeaders)
 
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
@@ -823,10 +813,9 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	// window. Creating the row would only add immediate work for the cleanup worker.
 	if options.FTSRetention == 0 || options.SentDate.IsZero() || !options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
 		// Decide what to store in messages_fts.
-		// Skip very large bodies/headers (>64KB) — the full content is always available in S3.
+		// Skip very large bodies (>64KB) — the full content is always available in S3.
 		const maxStoredBodySize = 64 * 1024 // 64 KB
 		var textBodyArg any = sanePlaintextBody
-		var headersArg any = saneRawHeaders
 
 		if len(sanePlaintextBody) > maxStoredBodySize {
 			truncLen := maxStoredBodySize
@@ -838,25 +827,18 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 				"content_hash", truncateHash(options.ContentHash), "original_size_bytes", len(sanePlaintextBody))
 			metrics.LargeBodyStorageSkipped.Inc()
 		}
-		if len(saneRawHeaders) > maxStoredBodySize {
-			logger.Info("Database: skipping headers storage for very large headers",
-				"content_hash", truncateHash(options.ContentHash), "size_bytes", len(saneRawHeaders))
-			headersArg = ""
-			metrics.LargeBodyStorageSkipped.Inc()
-		}
 
 		// Only insert when there is actual content. A missing messages_fts row is
 		// expected for old/large messages and is handled gracefully downstream (unsearchable).
 		textBodyStr, _ := textBodyArg.(string)
-		headersStr, _ := headersArg.(string)
-		if textBodyStr != "" || headersStr != "" {
+		if textBodyStr != "" {
 			_, saveErr := tx.Exec(ctx, "SAVEPOINT fts_insert")
 			if saveErr == nil {
 				_, err = tx.Exec(ctx, `
-					INSERT INTO messages_fts (content_hash, text_body, headers, sent_date)
-					VALUES ($1, $2, $3, $4)
+					INSERT INTO messages_fts (content_hash, text_body, sent_date)
+					VALUES ($1, $2, $3)
 					ON CONFLICT (content_hash) DO NOTHING
-				`, options.ContentHash, textBodyArg, headersArg, options.SentDate)
+				`, options.ContentHash, textBodyArg, options.SentDate)
 				if err != nil {
 					tx.Exec(ctx, "ROLLBACK TO SAVEPOINT fts_insert")
 					logger.Warn("Database: failed to insert message fts payload (non-fatal, message will be unsearchable)",

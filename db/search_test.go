@@ -570,7 +570,7 @@ func TestFullTextSearch(t *testing.T) {
 	}
 	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
 	assert.NoError(t, err)
-	// TEXT search matches against both text_body_tsv and headers_tsv
+	// TEXT search matches against text_body_tsv and dedicated header columns (subject, from/to/cc sort fields)
 	t.Logf("TEXT search for 'conference call' returned %d results", len(messages))
 
 	// Test 4: Search with special characters

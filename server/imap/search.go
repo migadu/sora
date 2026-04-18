@@ -69,7 +69,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 
 	// The configured search_timeout is now automatically applied by the resilient DB layer.
 	// SEARCH only returns UIDs, so we can use a high limit (0 = use default MaxSearchResults)
-	messages, err := s.server.rdb.GetMessagesWithCriteriaWithRetry(s.ctx, selectedMailboxID, criteria, 0)
+	messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(s.ctx, selectedMailboxID, criteria, 0)
 	if err != nil {
 		// The resilient layer already logs retry attempts. We just log the final error.
 		s.DebugLog("[SEARCH] final error after retries", "error", err)
@@ -77,8 +77,8 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		return nil, s.internalError("failed to search messages: %v", err)
 	}
 
-	// Track memory for search results (approximate: 200 bytes per message metadata)
-	resultMemory := int64(len(messages) * 200)
+	// Track memory for search results (approximate: 64 bytes per message lightweight metadata)
+	resultMemory := int64(len(messages) * 64)
 	if s.memTracker != nil && resultMemory > 0 {
 		if allocErr := s.memTracker.Allocate(resultMemory); allocErr != nil {
 			metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()

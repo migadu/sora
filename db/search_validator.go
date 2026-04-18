@@ -277,8 +277,7 @@ func (v *SearchCriteriaValidator) validateTextTerms(terms []string, fieldName st
 }
 
 func (v *SearchCriteriaValidator) validateHeader(header imap.SearchCriteriaHeaderField) error {
-	// All headers are now supported via FTS (generic headers use headers_tsv search)
-	// No need to check whitelist - just validate the values
+	// Standard headers (From/To/Cc/Subject) use dedicated indexed columns.
 
 	// Validate header key
 	if len(header.Key) == 0 {
