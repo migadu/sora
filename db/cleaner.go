@@ -111,35 +111,35 @@ func (d *Database) GetUserScopedObjectsForCleanup(ctx context.Context, olderThan
 					LIMIT 1
 				)
 				UNION ALL
-				SELECT t.account_id, t.s3_domain, t.s3_localpart, t.content_hash
-				FROM (
-					SELECT m.account_id, m.s3_domain, m.s3_localpart, m.content_hash
-					FROM messages m
-					JOIN scan_window sw ON true
-					WHERE m.uploaded = TRUE AND m.expunged_at IS NOT NULL
-					  AND (m.account_id, m.s3_domain, m.s3_localpart, m.content_hash) > (sw.account_id, sw.s3_domain, sw.s3_localpart, sw.content_hash)
-					ORDER BY m.account_id, m.s3_domain, m.s3_localpart, m.content_hash
+				SELECT m.account_id, m.s3_domain, m.s3_localpart, m.content_hash
+				FROM scan_window sw
+				CROSS JOIN LATERAL (
+					SELECT m2.account_id, m2.s3_domain, m2.s3_localpart, m2.content_hash
+					FROM messages m2
+					WHERE m2.uploaded = TRUE AND m2.expunged_at IS NOT NULL
+					  AND (m2.account_id, m2.s3_domain, m2.s3_localpart, m2.content_hash) > (sw.account_id, sw.s3_domain, sw.s3_localpart, sw.content_hash)
+					ORDER BY m2.account_id, m2.s3_domain, m2.s3_localpart, m2.content_hash
 					LIMIT 1
-				) t
+				) m
 			)
 			SELECT 
 				sw.account_id, sw.s3_domain, sw.s3_localpart, sw.content_hash,
-				(
-					NOT EXISTS (
-						SELECT 1 FROM messages m_active
-						WHERE m_active.account_id = sw.account_id
-						  AND m_active.content_hash = sw.content_hash
-						  AND m_active.expunged_at IS NULL
-					)
-					AND
-					NOT EXISTS (
-						SELECT 1 FROM messages m_recent
-						WHERE m_recent.account_id = sw.account_id
-						  AND m_recent.content_hash = sw.content_hash
-						  AND m_recent.expunged_at >= $6
-					)
-				) as is_orphan
+				(active.found IS NULL AND recent.found IS NULL) as is_orphan
 			FROM (SELECT * FROM scan_window LIMIT $5) sw
+			LEFT JOIN LATERAL (
+				SELECT 1 as found FROM messages m_active
+				WHERE m_active.account_id = sw.account_id
+				  AND m_active.content_hash = sw.content_hash
+				  AND m_active.expunged_at IS NULL
+				LIMIT 1
+			) active ON true
+			LEFT JOIN LATERAL (
+				SELECT 1 as found FROM messages m_recent
+				WHERE m_recent.account_id = sw.account_id
+				  AND m_recent.content_hash = sw.content_hash
+				  AND m_recent.expunged_at >= $6
+				LIMIT 1
+			) recent ON true
 			ORDER BY sw.account_id, sw.s3_domain, sw.s3_localpart, sw.content_hash
 		`
 
@@ -346,11 +346,13 @@ func (d *Database) GetUnusedFTSHashes(ctx context.Context, limit int) ([]string,
 				ARRAY(
 					SELECT sw.content_hash
 					FROM scan_window sw
-					WHERE NOT EXISTS (
-						SELECT 1
+					LEFT JOIN LATERAL (
+						SELECT 1 as found
 						FROM messages m
 						WHERE m.content_hash = sw.content_hash
-					)
+						LIMIT 1
+					) active_msg ON true
+					WHERE active_msg.found IS NULL
 				) AS orphan_hashes
 		`
 
