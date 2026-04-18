@@ -158,7 +158,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 				// Expunged sequence number includes messages that were expunged in this poll window
 				batch.Queue(`
 					SELECT COUNT(*) FROM messages
-					WHERE mailbox_id = $1 AND (expunged_modseq IS NULL OR expunged_modseq > $2) AND uid <= $3
+					WHERE mailbox_id = $1 AND (expunged_at IS NULL OR expunged_modseq > $2) AND uid <= $3
 				`, mailboxID, sinceModSeq, u.UID)
 			}
 		}
@@ -183,14 +183,11 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		}
 		seqMap := make(map[uint32]uint32, len(rawUpdates))
 
-		// OPTIMIZATION: We select expunged_modseq instead of expunged_at. Since expunged_modseq
-		// is NULL when expunged_at is NULL, the logical evaluation is identical. This allows
-		// PostgreSQL to fulfill the query utilizing an Index-Only Scan on the covering index
-		// idx_messages_mailbox_uid_expunged_modseq without ever reading heap table data.
+		// OPTIMIZATION: Using expunged_at IS NULL matches the active partial covering index.
 		seqRows, err := db.GetReadPool().Query(ctx, `
 			SELECT uid, expunged_modseq
 			FROM messages
-			WHERE mailbox_id = $1 AND (expunged_modseq IS NULL OR expunged_modseq > $2)
+			WHERE mailbox_id = $1 AND (expunged_at IS NULL OR expunged_modseq > $2)
 			ORDER BY uid ASC
 		`, mailboxID, sinceModSeq)
 		if err != nil {

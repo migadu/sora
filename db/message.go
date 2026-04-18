@@ -654,7 +654,7 @@ func hydrateSequencesCore[T any](
 	seqRows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
 		SELECT uid
 		FROM messages
-		WHERE mailbox_id = $1 AND expunged_modseq IS NULL
+		WHERE mailbox_id = $1 AND expunged_at IS NULL
 		ORDER BY uid ASC
 	`, mailboxID)
 	if err != nil {

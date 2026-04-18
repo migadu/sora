@@ -8,22 +8,6 @@ import (
 func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Message, error) {
 	var messages []Message
 
-	// First, check if there are any messages in the mailbox at all (including expunged)
-	var totalCount, expungedCount int
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT 
-			COUNT(*) as total_count,
-			COUNT(*) FILTER (WHERE expunged_at IS NOT NULL) as expunged_count
-		FROM 
-			messages
-		WHERE 
-			mailbox_id = $1
-	`, mailboxID).Scan(&totalCount, &expungedCount)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to count messages: %v", err)
-	}
-
 	// Now query only the non-expunged messages
 	query := `
 		SELECT 
