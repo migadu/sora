@@ -172,10 +172,10 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 
 	for _, uidRange := range uidSet {
 		if uidRange.Stop == imap.UID(0) {
-			args = append(args, uint32(uidRange.Start))
+			args = append(args, int64(uidRange.Start))
 			conditions = append(conditions, fmt.Sprintf("m.uid >= $%d", len(args)))
 		} else {
-			args = append(args, uint32(uidRange.Start), uint32(uidRange.Stop))
+			args = append(args, int64(uidRange.Start), int64(uidRange.Stop))
 			conditions = append(conditions, fmt.Sprintf("(m.uid >= $%d AND m.uid <= $%d)", len(args)-1, len(args)))
 		}
 	}
@@ -250,19 +250,19 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 		}
 
 		if seqRange.Stop == 0 {
-			args = append(args, startUID)
+			args = append(args, int64(startUID))
 			conditions = append(conditions, fmt.Sprintf("m.uid >= $%d", len(args)))
 		} else {
 			stopUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Stop)
 			if err != nil {
 				// Stop is out of bounds, meaning we fetch up to the highest message we have
-				args = append(args, startUID)
+				args = append(args, int64(startUID))
 				conditions = append(conditions, fmt.Sprintf("m.uid >= $%d", len(args)))
 			} else {
 				// Safely ensure min/max alignment in case of reverse sequence bounds requested by client
 				minUid := min(startUID, stopUID)
 				maxUid := max(startUID, stopUID)
-				args = append(args, minUid, maxUid)
+				args = append(args, int64(minUid), int64(maxUid))
 				conditions = append(conditions, fmt.Sprintf("(m.uid >= $%d AND m.uid <= $%d)", len(args)-1, len(args)))
 			}
 		}
@@ -447,7 +447,7 @@ func (db *Database) GetMessageBodyStructure(ctx context.Context, uid imap.UID, m
 		SELECT body_structure, size, account_id, content_hash
 		FROM messages
 		WHERE mailbox_id = $1 AND uid = $2
-	`, mailboxID, uid).Scan(&bodyStructureBytes, &size, &accountID, &contentHash)
+	`, mailboxID, int64(uid)).Scan(&bodyStructureBytes, &size, &accountID, &contentHash)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve body_structure: %w", err)
@@ -624,11 +624,11 @@ func hydrateSequencesCore[T any](
 	}
 
 	interestedUIDs := make(map[uint32]*T, len(messages))
-	var uids []uint32
+	var uids []int64
 	for i := range messages {
 		uid := getUID(&messages[i])
 		interestedUIDs[uid] = &messages[i]
-		uids = append(uids, uid)
+		uids = append(uids, int64(uid))
 	}
 
 	// Use optimal O(1) Index-Only CTE to hydrate dynamically calculated sequences directly
@@ -642,7 +642,7 @@ func hydrateSequencesCore[T any](
 		)
 		SELECT uid, seqnum 
 		FROM numbered 
-		WHERE uid = ANY($2::int[])
+		WHERE uid = ANY($2::bigint[])
 	`, mailboxID, uids)
 
 	if err != nil {
@@ -651,12 +651,12 @@ func hydrateSequencesCore[T any](
 	defer rows.Close()
 
 	for rows.Next() {
-		var uid uint32
+		var uid int64
 		var seq int64
 		if err := rows.Scan(&uid, &seq); err != nil {
 			return fmt.Errorf("failed to scan sequence stream: %w", err)
 		}
-		if msgPtr, ok := interestedUIDs[uid]; ok {
+		if msgPtr, ok := interestedUIDs[uint32(uid)]; ok {
 			setSeq(msgPtr, uint32(seq))
 		}
 	}

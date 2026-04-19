@@ -85,7 +85,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
             internal_date, subject, in_reply_to, message_id, recipients_json 
         FROM messages 
         WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL
-    `, UID, mailboxID).Scan(
+    `, int64(UID), mailboxID).Scan(
 		&msg.InternalDate,
 		&msg.Subject,
 		&msg.InReplyTo,
