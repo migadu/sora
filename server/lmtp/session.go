@@ -320,7 +320,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		}
 	}
 
-	// Reset the metric timer NOW. Network transmission from a slow MTA 
+	// Reset the metric timer NOW. Network transmission from a slow MTA
 	// can artificially inflate backend processing latency metrics.
 	start = time.Now()
 

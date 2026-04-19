@@ -623,69 +623,43 @@ func hydrateSequencesCore[T any](
 		return nil
 	}
 
-	if len(messages) <= 50 {
-		batch := &pgx.Batch{}
-		for i := range messages {
-			batch.Queue(`
-				SELECT COUNT(*) FROM messages 
-				WHERE mailbox_id = $1 AND expunged_at IS NULL AND uid <= $2
-			`, mailboxID, getUID(&messages[i]))
-		}
-		br := db.GetReadPoolWithContext(ctx).SendBatch(ctx, batch)
-		for i := range messages {
-			var seq uint32
-			if err := br.QueryRow().Scan(&seq); err != nil {
-				_ = br.Close()
-				return fmt.Errorf("failed to count sparse sequence: %w", err)
-			}
-			setSeq(&messages[i], seq)
-		}
-		if err := br.Close(); err != nil {
-			return fmt.Errorf("failed to close sparse sequence batch: %w", err)
-		}
-		return nil
-	}
-
-	interestedUIDs := make(map[uint32]bool, len(messages))
+	interestedUIDs := make(map[uint32]*T, len(messages))
+	var uids []uint32
 	for i := range messages {
-		interestedUIDs[getUID(&messages[i])] = true
+		uid := getUID(&messages[i])
+		interestedUIDs[uid] = &messages[i]
+		uids = append(uids, uid)
 	}
 
-	seqRows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
-		SELECT uid
-		FROM messages
-		WHERE mailbox_id = $1 AND expunged_at IS NULL
-		ORDER BY uid ASC
-	`, mailboxID)
+	// Use optimal O(1) Index-Only CTE to hydrate dynamically calculated sequences directly
+	// from PostgreSQL without doing O(N) COUNT(*) queries or O(N) full-index stream to the application.
+	// This mirrors the efficient design utilized in GetDeletedMessageUIDsAndSeqs.
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+		WITH numbered AS (
+			SELECT uid, ROW_NUMBER() OVER(ORDER BY uid ASC) as seqnum
+			FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+		)
+		SELECT uid, seqnum 
+		FROM numbered 
+		WHERE uid = ANY($2::int[])
+	`, mailboxID, uids)
+
 	if err != nil {
 		return fmt.Errorf("failed to query sequence streams: %w", err)
 	}
-	defer seqRows.Close()
+	defer rows.Close()
 
-	activeCount := uint32(0)
-	seqMap := make(map[uint32]uint32, len(interestedUIDs))
-
-	for seqRows.Next() {
+	for rows.Next() {
 		var uid uint32
-		if err := seqRows.Scan(&uid); err != nil {
+		var seq int64
+		if err := rows.Scan(&uid, &seq); err != nil {
 			return fmt.Errorf("failed to scan sequence stream: %w", err)
 		}
-		activeCount++
-
-		if interestedUIDs[uid] {
-			seqMap[uid] = activeCount
-			if len(seqMap) == len(interestedUIDs) {
-				break
-			}
+		if msgPtr, ok := interestedUIDs[uid]; ok {
+			setSeq(msgPtr, uint32(seq))
 		}
 	}
-	if err := seqRows.Err(); err != nil {
-		return fmt.Errorf("error in sequence stream: %w", err)
-	}
 
-	for i := range messages {
-		setSeq(&messages[i], seqMap[getUID(&messages[i])])
-	}
-
-	return nil
+	return rows.Err()
 }

@@ -10,44 +10,22 @@ import (
 	"github.com/migadu/sora/logger"
 )
 
-func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailboxID int64) (*imap.Envelope, error) {
+// BuildEnvelope efficiently constructs an IMAP envelope natively from a pre-fetched Message.
+func BuildEnvelope(msg *Message) (*imap.Envelope, error) {
 	var envelope imap.Envelope
-
-	var inReplyTo string
-	var recipientsJSON []byte
-	var internalMessageDBId int64
-
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-        SELECT 
-            id, internal_date, subject, in_reply_to, message_id, recipients_json 
-        FROM 
-            messages
-        WHERE 
-            uid = $1 AND
-						mailbox_id = $2 AND
-						expunged_at IS NULL
-    `, UID, mailboxID).Scan(
-		&internalMessageDBId,
-		&envelope.Date,
-		&envelope.Subject,
-		&inReplyTo,
-		&envelope.MessageID,
-		&recipientsJSON,
-	)
-	if err != nil {
-		logger.Error("Database: failed to fetch envelope fields", "uid", UID, "mailbox_id", mailboxID, "err", err)
-		return nil, err
-	}
+	envelope.Date = msg.InternalDate
+	envelope.Subject = msg.Subject
+	envelope.MessageID = msg.MessageID
 
 	// Split the In-Reply-To header into individual message IDs
-	if inReplyTo != "" {
-		envelope.InReplyTo = strings.Split(inReplyTo, " ")
+	if msg.InReplyTo != "" {
+		envelope.InReplyTo = strings.Split(msg.InReplyTo, " ")
 	} else {
 		envelope.InReplyTo = nil
 	}
 
 	var recipients []helpers.Recipient
-	if err := json.Unmarshal(recipientsJSON, &recipients); err != nil {
+	if err := json.Unmarshal(msg.RecipientsJSON, &recipients); err != nil {
 		logger.Error("Database: failed to decode recipients JSON", "err", err)
 		return nil, err
 	}
@@ -60,7 +38,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 
 		parts := strings.Split(emailAddress, "@")
 		if len(parts) != 2 {
-			logger.Warn("Database: malformed email address for recipient", "email", emailAddress, "type", addressType, "uid", UID, "mailbox_id", mailboxID)
+			logger.Warn("Database: malformed email address for recipient", "email", emailAddress, "type", addressType, "uid", msg.UID, "mailbox_id", msg.MailboxID)
 			continue
 		}
 		mailboxPart, hostNamePart := parts[0], parts[1]
@@ -85,7 +63,7 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 		case "sender":
 			envelope.Sender = append(envelope.Sender, address)
 		default:
-			logger.Warn("Database: unhandled address type", "type", addressType, "uid", UID, "mailbox_id", mailboxID)
+			logger.Warn("Database: unhandled address type", "type", addressType, "uid", msg.UID, "mailbox_id", msg.MailboxID)
 		}
 	}
 
@@ -95,4 +73,29 @@ func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailbo
 	}
 
 	return &envelope, nil
+}
+
+func (db *Database) GetMessageEnvelope(ctx context.Context, UID imap.UID, mailboxID int64) (*imap.Envelope, error) {
+	var msg Message
+	msg.UID = UID
+	msg.MailboxID = mailboxID
+
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+        SELECT 
+            internal_date, subject, in_reply_to, message_id, recipients_json 
+        FROM messages 
+        WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL
+    `, UID, mailboxID).Scan(
+		&msg.InternalDate,
+		&msg.Subject,
+		&msg.InReplyTo,
+		&msg.MessageID,
+		&msg.RecipientsJSON,
+	)
+	if err != nil {
+		logger.Error("Database: failed to fetch envelope fields", "uid", UID, "mailbox_id", mailboxID, "err", err)
+		return nil, err
+	}
+
+	return BuildEnvelope(&msg)
 }

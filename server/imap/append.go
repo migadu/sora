@@ -118,7 +118,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	}
 
 	// Reset the metric timer NOW. Network transmission from a slow client
-	// can take 20+ seconds for a large payload, which artificially inflates 
+	// can take 20+ seconds for a large payload, which artificially inflates
 	// backend processing latency metrics.
 	start = time.Now()
 

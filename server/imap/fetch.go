@@ -308,7 +308,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 	}
 
 	if options.Envelope {
-		if err := s.writeEnvelope(m, msg.UID, selectedMailboxID); err != nil {
+		if err := s.writeEnvelope(m, msg); err != nil {
 			return err
 		}
 	}
@@ -428,10 +428,10 @@ func (s *IMAPSession) writeBasicMessageData(m *imapserver.FetchResponseWriter, m
 	return nil
 }
 
-func (s *IMAPSession) writeEnvelope(m *imapserver.FetchResponseWriter, messageUID imap.UID, mailboxID int64) error {
-	envelope, err := s.server.rdb.GetMessageEnvelopeWithRetry(s.ctx, messageUID, mailboxID)
+func (s *IMAPSession) writeEnvelope(m *imapserver.FetchResponseWriter, msg *db.Message) error {
+	envelope, err := db.BuildEnvelope(msg)
 	if err != nil {
-		return s.internalError("failed to retrieve envelope for message UID %d: %v", messageUID, err)
+		return s.internalError("failed to build envelope for message UID %d: %v", msg.UID, err)
 	}
 	m.WriteEnvelope(envelope)
 	return nil

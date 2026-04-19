@@ -114,20 +114,6 @@ func (rd *ResilientDatabase) SetMessageFlagsBatchWithRetry(ctx context.Context, 
 	return result.([]db.BatchFlagUpdateResult), nil
 }
 
-func (rd *ResilientDatabase) GetMessageEnvelopeWithRetry(ctx context.Context, UID imap.UID, mailboxID int64) (*imap.Envelope, error) {
-	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetMessageEnvelope(ctx, UID, mailboxID)
-	}
-	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return nil, nil
-	}
-	return result.(*imap.Envelope), nil
-}
-
 func (rd *ResilientDatabase) GetMessageBodyStructureWithRetry(ctx context.Context, uid imap.UID, mailboxID int64) (*imap.BodyStructure, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetMessageBodyStructure(ctx, uid, mailboxID)
