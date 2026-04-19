@@ -320,6 +320,10 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		}
 	}
 
+	// Reset the metric timer NOW. Network transmission from a slow MTA 
+	// can artificially inflate backend processing latency metrics.
+	start = time.Now()
+
 	// Check if message exceeds configured limit
 	if s.backend.maxMessageSize > 0 && int64(buf.Len()) > s.backend.maxMessageSize {
 		s.WarnLog("message size exceeds limit", "size", buf.Len(), "limit", s.backend.maxMessageSize)

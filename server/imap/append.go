@@ -117,6 +117,11 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		return nil, s.internalError("failed to read message: %v", err)
 	}
 
+	// Reset the metric timer NOW. Network transmission from a slow client
+	// can take 20+ seconds for a large payload, which artificially inflates 
+	// backend processing latency metrics.
+	start = time.Now()
+
 	// Use the full message bytes as received for hashing, size, and header extraction.
 	fullMessageBytes := buf.Bytes()
 
