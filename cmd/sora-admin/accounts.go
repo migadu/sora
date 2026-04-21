@@ -700,6 +700,7 @@ func showAccount(ctx context.Context, cfg AdminConfig, email string, jsonOutput 
 
 		fmt.Printf("  Mailboxes:     %d\n", accountDetails.MailboxCount)
 		fmt.Printf("  Messages:      %d\n", accountDetails.MessageCount)
+		fmt.Printf("  Storage Used:  %s\n", formatBytes(accountDetails.StorageUsed))
 
 		fmt.Printf("\nCredentials (%d):\n", len(accountDetails.Credentials))
 		for _, cred := range accountDetails.Credentials {

@@ -363,3 +363,84 @@ func TestListAccounts(t *testing.T) {
 
 	t.Logf("Successfully tested ListAccounts with %d total accounts", len(accounts))
 }
+
+// TestGetAccountDetailsStorageUsed verifies that GetAccountDetails reports
+// storage_used as the sum of message sizes across all mailboxes, and that it
+// matches the value reported by ListAccounts for the same account.
+func TestGetAccountDetailsStorageUsed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, testEmail := setupAccountManagementTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	req := CreateAccountRequest{
+		Email:     testEmail,
+		Password:  "password123",
+		IsPrimary: true,
+		HashType:  "bcrypt",
+	}
+	_, err = db.CreateAccount(ctx, tx, req)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit(ctx))
+
+	accountID, err := db.GetAccountIDByAddress(ctx, testEmail)
+	require.NoError(t, err)
+
+	// Before any mailbox exists, storage_used must be 0.
+	details, err := db.GetAccountDetails(ctx, testEmail)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), details.StorageUsed, "storage_used should be 0 with no mailboxes")
+
+	// Create an empty mailbox — storage_used should still be 0.
+	tx2, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx2.Rollback(ctx)
+	require.NoError(t, db.CreateMailbox(ctx, tx2, accountID, "INBOX", nil))
+	require.NoError(t, tx2.Commit(ctx))
+
+	inbox, err := db.GetMailboxByName(ctx, accountID, "INBOX")
+	require.NoError(t, err)
+
+	details, err = db.GetAccountDetails(ctx, testEmail)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), details.StorageUsed, "storage_used should be 0 with an empty mailbox")
+	assert.Equal(t, int64(1), details.MailboxCount)
+	assert.Equal(t, int64(0), details.MessageCount)
+
+	// insertTestMessage (defined in restore_test.go) inserts a message of size 512.
+	const messageSize = int64(512)
+	insertTestMessage(t, db, accountID, inbox.ID, "INBOX", "Storage 1", "<storage1@example.com>")
+	insertTestMessage(t, db, accountID, inbox.ID, "INBOX", "Storage 2", "<storage2@example.com>")
+	insertTestMessage(t, db, accountID, inbox.ID, "INBOX", "Storage 3", "<storage3@example.com>")
+
+	expectedStorage := 3 * messageSize
+
+	details, err = db.GetAccountDetails(ctx, testEmail)
+	require.NoError(t, err)
+	assert.Equal(t, expectedStorage, details.StorageUsed, "GetAccountDetails should report sum of message sizes")
+	assert.Equal(t, int64(3), details.MessageCount)
+	assert.Equal(t, int64(1), details.MailboxCount)
+
+	// ListAccounts must report the same value for this account.
+	accounts, err := db.ListAccounts(ctx)
+	require.NoError(t, err)
+
+	var found bool
+	for _, a := range accounts {
+		if a.AccountID == accountID {
+			assert.Equal(t, expectedStorage, a.StorageUsed,
+				"ListAccounts storage_used should match GetAccountDetails")
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "created account should appear in ListAccounts")
+}

@@ -188,6 +188,11 @@ components:
           type: integer
           format: int64
           example: 42
+        storage_used:
+          type: integer
+          format: int64
+          example: 52428800
+          description: "Total storage used in bytes (excludes expunged messages)"
 
     AccountExists:
       type: object

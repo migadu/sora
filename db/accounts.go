@@ -647,6 +647,7 @@ type AccountDetails struct {
 	Credentials  []AccountCredentialDetails `json:"credentials"`
 	MailboxCount int64                      `json:"mailbox_count"`
 	MessageCount int64                      `json:"message_count"`
+	StorageUsed  int64                      `json:"storage_used"`
 }
 
 // GetAccountDetails retrieves comprehensive details for an account by any associated email.
@@ -663,11 +664,12 @@ func (db *Database) GetAccountDetails(ctx context.Context, email string) (*Accou
 	err = db.GetReadPool().QueryRow(ctx, `
 		SELECT a.id, a.created_at, a.deleted_at,
 			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id) AS mailbox_count,
-			   COALESCE((SELECT SUM(message_count) FROM mailbox_stats WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = a.id)), 0) AS message_count
+			   COALESCE((SELECT SUM(message_count) FROM mailbox_stats WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = a.id)), 0) AS message_count,
+			   COALESCE((SELECT SUM(total_size) FROM mailbox_stats WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = a.id)), 0) AS storage_used
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id
 		WHERE LOWER(c.address) = $1
-	`, normalizedEmail).Scan(&details.ID, &details.CreatedAt, &details.DeletedAt, &details.MailboxCount, &details.MessageCount)
+	`, normalizedEmail).Scan(&details.ID, &details.CreatedAt, &details.DeletedAt, &details.MailboxCount, &details.MessageCount, &details.StorageUsed)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
