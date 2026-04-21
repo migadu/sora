@@ -560,25 +560,11 @@ func (i *Importer) processSubscriptions() error {
 			folderName = decoded
 		}
 
-		// Check if mailbox exists, create if needed
-		mailbox, err := i.rdb.GetMailboxByNameWithRetry(i.ctx, user.AccountID(), folderName)
+		// Check if mailbox exists, create if needed (handles hierarchical setup automatically)
+		mailbox, err := i.rdb.GetOrCreateMailboxByNameWithRetry(i.ctx, user.AccountID(), folderName)
 		if err != nil {
-			if err == consts.ErrMailboxNotFound {
-				logger.Info("Creating missing mailbox", "name", folderName)
-				if err := i.rdb.CreateMailboxWithRetry(i.ctx, user.AccountID(), folderName, nil); err != nil {
-					logger.Info("Warning: Failed to create mailbox", "name", folderName, "error", err)
-					continue
-				}
-				// Get the newly created mailbox
-				mailbox, err = i.rdb.GetMailboxByNameWithRetry(i.ctx, user.AccountID(), folderName)
-				if err != nil {
-					logger.Info("Warning: Failed to get newly created mailbox", "name", folderName, "error", err)
-					continue
-				}
-			} else {
-				logger.Info("Warning: Failed to check mailbox", "name", folderName, "error", err)
-				continue
-			}
+			logger.Info("Warning: Failed to get or create mailbox", "name", folderName, "error", err)
+			continue
 		}
 
 		// Subscribe the user to the folder

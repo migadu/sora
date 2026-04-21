@@ -87,6 +87,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -97,7 +98,6 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
-	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
@@ -1470,42 +1470,58 @@ func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Conte
 			return &mb, nil // Found it, we're done.
 		}
 
-		// If it's not found, create it.
-		if errors.Is(err, pgx.ErrNoRows) {
-			// Generate a new UID validity value (using current time in nanoseconds)
-			uidValidity := uint32(time.Now().UnixNano())
-
-			// Use INSERT ... ON CONFLICT to handle race conditions.
-			// We use RETURNING to get the created (or existing) row in one go.
-			// This is more efficient than a separate SELECT.
-			err := tx.QueryRow(ctx, `
-				INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path)
-				VALUES ($1, $2, $3, TRUE, '')
-				ON CONFLICT (account_id, name) DO UPDATE SET subscribed = TRUE
-				RETURNING id, account_id, name
-			`, AccountID, name, int64(uidValidity)).Scan(&mb.ID, &mb.AccountID, &mb.Name)
-
-			if err != nil {
-				return nil, fmt.Errorf("failed during insert-on-conflict-returning: %w", err)
-			}
-
-			// Update the path now that we have the mailbox ID
-			// This prevents mailboxes from being left with empty path = ''
-			// Only update if path is empty (to handle ON CONFLICT case where mailbox already existed)
-			mailboxPath := helpers.GetMailboxPath("", mb.ID) // Root-level mailbox
-			_, err = tx.Exec(ctx, `
-				UPDATE mailboxes SET path = $1 WHERE id = $2 AND (path = '' OR path IS NULL)
-			`, mailboxPath, mb.ID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to update mailbox path: %w", err)
-			}
-
-			logger.Info("Created or found mailbox via upsert", "name", name)
-			return &mb, nil
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("failed to get mailbox: %w", err)
 		}
 
-		// A different, unexpected error occurred.
-		return nil, fmt.Errorf("failed to get mailbox: %w", err)
+		dbLayer := rd.getOperationalDatabaseForOperation(true)
+		parts := strings.Split(name, string(consts.MailboxDelimiter))
+		var currentParentID *int64
+
+		if len(parts) > 1 {
+			for i := 1; i < len(parts); i++ {
+				parentName := strings.Join(parts[:i], string(consts.MailboxDelimiter))
+				var pID int64
+				err := tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND name = $2", AccountID, parentName).Scan(&pID)
+				if err != nil {
+					if errors.Is(err, pgx.ErrNoRows) {
+						err = dbLayer.CreateMailbox(ctx, tx, AccountID, parentName, currentParentID)
+						if err != nil && !errors.Is(err, consts.ErrDBUniqueViolation) {
+							return nil, fmt.Errorf("failed to auto-create parent mailbox '%s': %w", parentName, err)
+						}
+						// Retrieve the parent ID, handles both successful creation and concurrent creation
+						err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND name = $2", AccountID, parentName).Scan(&pID)
+						if err != nil {
+							return nil, fmt.Errorf("failed to fetch parent mailbox '%s' after creation: %w", parentName, err)
+						}
+					} else {
+						return nil, fmt.Errorf("failed to check parent mailbox '%s': %w", parentName, err)
+					}
+				}
+				currentParentID = &pID
+			}
+		}
+
+		// Create the target mailbox
+		err = dbLayer.CreateMailbox(ctx, tx, AccountID, name, currentParentID)
+		if err != nil && !errors.Is(err, consts.ErrDBUniqueViolation) {
+			return nil, fmt.Errorf("failed to create mailbox '%s': %w", name, err)
+		}
+
+		// Fetch the newly created (or concurrently created) mailbox
+		err = tx.QueryRow(ctx, "SELECT id, account_id, name FROM mailboxes WHERE account_id = $1 AND name = $2", AccountID, name).Scan(&mb.ID, &mb.AccountID, &mb.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch created mailbox '%s': %w", name, err)
+		}
+
+		// Ensure the mailbox is marked as subscribed, as expected by importer and LMTP create
+		_, err = tx.Exec(ctx, "UPDATE mailboxes SET subscribed = TRUE WHERE id = $1", mb.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to subscribe mailbox '%s': %w", name, err)
+		}
+
+		logger.Info("Created or found mailbox via upsert", "name", name)
+		return &mb, nil
 	}
 
 	// Use the existing resilient transaction helper.
