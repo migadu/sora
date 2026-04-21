@@ -50,6 +50,7 @@ type ImporterOptions struct {
 	BatchTransactionMode bool          // Use single transaction per batch (faster but less resilient, default: false)
 	Incremental          bool          // Use SQLite cache to skip already-imported messages (default: false = always read all)
 	MaxMessageSize       int64         // Maximum message size to import (bytes, 0 = use default)
+	PathsFile            string        // Path to a file containing a list of relative or absolute paths to import
 }
 
 // resilientDB defines the interface for database operations needed by the importer.
@@ -108,6 +109,11 @@ type messageMetadata struct {
 }
 
 // Importer handles the maildir import process.
+type failedImport struct {
+	path   string
+	reason string
+}
+
 type Importer struct {
 	ctx         context.Context // Context for cancellation support
 	maildirPath string
@@ -124,6 +130,9 @@ type Importer struct {
 	skippedMessages  int64
 	failedMessages   int64
 	startTime        time.Time
+
+	failedPathsMutex sync.Mutex
+	failedPaths      []failedImport
 
 	// Dovecot keyword mapping: ID -> keyword name
 	dovecotKeywords map[int]string
@@ -258,7 +267,14 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	return importer, nil
 }
 
-// Close cleans up resources used by the importer.
+// recordFailedPath safely records a file path and reason that failed to be imported.
+func (i *Importer) recordFailedPath(path, reason string) {
+	i.failedPathsMutex.Lock()
+	defer i.failedPathsMutex.Unlock()
+	i.failedPaths = append(i.failedPaths, failedImport{path: path, reason: reason})
+}
+
+// Close closes the importer and its resources.
 func (i *Importer) Close() error {
 	if i.sqliteDB != nil {
 		if err := i.sqliteDB.Close(); err != nil {
@@ -445,7 +461,15 @@ func (i *Importer) Run() error {
 		return fmt.Errorf("failed to import messages: %w", err)
 	}
 
-	return i.printSummary()
+	if err := i.printSummary(); err != nil {
+		logger.Warn("Failed to print summary", "error", err)
+	}
+
+	if i.failedMessages > 0 {
+		return fmt.Errorf("import completed with %d failed messages", i.failedMessages)
+	}
+
+	return nil
 }
 
 // processSubscriptions reads and processes the Dovecot subscriptions file
@@ -905,6 +929,17 @@ func (i *Importer) printSummary() error {
 	if i.options.Dovecot {
 		fmt.Printf("\nNote: Dovecot subscriptions and keywords files processed if present.\n")
 	}
+
+	i.failedPathsMutex.Lock()
+	defer i.failedPathsMutex.Unlock()
+	if len(i.failedPaths) > 0 {
+		fmt.Printf("\nFailed Messages (%d):\n", len(i.failedPaths))
+		for _, fp := range i.failedPaths {
+			fmt.Printf("  - %s (Reason: %s)\n", fp.path, fp.reason)
+		}
+		fmt.Printf("\nYou can retry these specific paths using the --paths-file flag.\n")
+	}
+
 	return nil
 }
 
@@ -1167,133 +1202,138 @@ func (i *Importer) scanMaildir() error {
 	}
 
 	// --- Filesystem Walk (Producer) ---
-	walkErr := filepath.Walk(cleanPath, func(path string, info os.FileInfo, err error) error {
-		select {
-		case <-i.ctx.Done():
-			return i.ctx.Err() // Stop walking if context is cancelled.
-		default:
-		}
-		if err != nil {
-			return err
-		}
-
-		// We are looking for directories that are maildir folders.
-		if !info.IsDir() {
-			return nil
-		}
-
-		// Security check: ensure path is within maildir
-		if !strings.HasPrefix(filepath.Clean(path), cleanPath) {
-			return fmt.Errorf("path outside maildir: %s", path)
-		}
-
-		// Check if this directory is a maildir folder
-		if !isMaildirFolder(path) {
-			// This is not a maildir folder, continue walking.
-			return nil
-		}
-
-		// Determine mailbox name
-		relPath, err := filepath.Rel(cleanPath, path)
-		if err != nil {
-			return fmt.Errorf("could not get relative path for %s: %w", path, err)
-		}
-
-		var mailboxName string
-		if relPath == "." {
-			mailboxName = "INBOX"
-		} else {
-			// Handle different maildir naming conventions
-			// Common formats:
-			// .Sent (Dovecot style)
-			// Sent (Courier style)
-			// .Sent.2024 (hierarchical)
-
-			// Remove leading dot if present
-			cleanName := strings.TrimPrefix(relPath, ".")
-
-			// Replace maildir separator (.) with IMAP separator (/)
-			mailboxName = strings.ReplaceAll(cleanName, ".", "/")
-
-			// Decode Modified UTF-7 encoding used by Dovecot/IMAP for non-ASCII folder names
-			// e.g. "R&AOk-pertoire" -> "Répertoire"
-			if decoded, decErr := helpers.DecodeModifiedUTF7(mailboxName); decErr != nil {
-				logger.Warn("Failed to decode Modified UTF-7 mailbox name, using raw name", "name", mailboxName, "error", decErr)
-			} else {
-				mailboxName = decoded
+	var walkErr error
+	if i.options.PathsFile != "" {
+		walkErr = i.processPathsFile(cleanPath, filesToProcess)
+	} else {
+		walkErr = filepath.Walk(cleanPath, func(path string, info os.FileInfo, err error) error {
+			select {
+			case <-i.ctx.Done():
+				return i.ctx.Err() // Stop walking if context is cancelled.
+			default:
+			}
+			if err != nil {
+				return err
 			}
 
-			// Validate the mailbox name doesn't contain problematic characters
-			if strings.ContainsAny(mailboxName, "\t\r\n") {
-				logger.Info("Warning: Skipping mailbox with invalid characters", "mailbox", mailboxName)
+			// We are looking for directories that are maildir folders.
+			if !info.IsDir() {
 				return nil
 			}
 
-			// Trim any leading or trailing spaces from the mailbox name
-			mailboxName = strings.TrimSpace(mailboxName)
-
-			// Handle special folder name mappings
-			switch strings.ToLower(mailboxName) {
-			case "sent", "sent items", "sent mail":
-				mailboxName = "Sent"
-			case "drafts", "draft":
-				mailboxName = "Drafts"
-			case "trash", "deleted", "deleted items":
-				mailboxName = "Trash"
-			case "junk", "spam":
-				mailboxName = "Junk"
-			case "archive", "archives":
-				mailboxName = "Archive"
+			// Security check: ensure path is within maildir
+			if !strings.HasPrefix(filepath.Clean(path), cleanPath) {
+				return fmt.Errorf("path outside maildir: %s", path)
 			}
-		}
 
-		logger.Info("Processing maildir folder", "path", relPath, "mailbox", mailboxName, "has_delimiter", strings.Contains(mailboxName, "/"))
+			// Check if this directory is a maildir folder
+			if !isMaildirFolder(path) {
+				// This is not a maildir folder, continue walking.
+				return nil
+			}
 
-		// Check if this mailbox should be imported
-		if !i.shouldImportMailbox(mailboxName) {
-			logger.Info("Skipping mailbox (filtered)", "mailbox", mailboxName)
-			return nil
-		}
-
-		// This is a maildir folder, process the messages within it.
-		// Only scan 'cur' and 'new' directories (skip 'tmp' as it contains incomplete messages)
-		for _, subDir := range []string{"cur", "new"} {
-			messages, err := os.ReadDir(filepath.Join(path, subDir))
+			// Determine mailbox name
+			relPath, err := filepath.Rel(cleanPath, path)
 			if err != nil {
-				logger.Info("Failed to read directory", "path", filepath.Join(path, subDir), "error", err)
-				continue
+				return fmt.Errorf("could not get relative path for %s: %w", path, err)
 			}
 
-			for _, message := range messages {
-				if message.IsDir() {
+			var mailboxName string
+			if relPath == "." {
+				mailboxName = "INBOX"
+			} else {
+				// Handle different maildir naming conventions
+				// Common formats:
+				// .Sent (Dovecot style)
+				// Sent (Courier style)
+				// .Sent.2024 (hierarchical)
+
+				// Remove leading dot if present
+				cleanName := strings.TrimPrefix(relPath, ".")
+
+				// Replace maildir separator (.) with IMAP separator (/)
+				mailboxName = strings.ReplaceAll(cleanName, ".", "/")
+
+				// Decode Modified UTF-7 encoding used by Dovecot/IMAP for non-ASCII folder names
+				// e.g. "R&AOk-pertoire" -> "Répertoire"
+				if decoded, decErr := helpers.DecodeModifiedUTF7(mailboxName); decErr != nil {
+					logger.Warn("Failed to decode Modified UTF-7 mailbox name, using raw name", "name", mailboxName, "error", decErr)
+				} else {
+					mailboxName = decoded
+				}
+
+				// Validate the mailbox name doesn't contain problematic characters
+				if strings.ContainsAny(mailboxName, "\t\r\n") {
+					logger.Info("Warning: Skipping mailbox with invalid characters", "mailbox", mailboxName)
+					return nil
+				}
+
+				// Trim any leading or trailing spaces from the mailbox name
+				mailboxName = strings.TrimSpace(mailboxName)
+
+				// Handle special folder name mappings
+				switch strings.ToLower(mailboxName) {
+				case "sent", "sent items", "sent mail":
+					mailboxName = "Sent"
+				case "drafts", "draft":
+					mailboxName = "Drafts"
+				case "trash", "deleted", "deleted items":
+					mailboxName = "Trash"
+				case "junk", "spam":
+					mailboxName = "Junk"
+				case "archive", "archives":
+					mailboxName = "Archive"
+				}
+			}
+
+			logger.Info("Processing maildir folder", "path", relPath, "mailbox", mailboxName, "has_delimiter", strings.Contains(mailboxName, "/"))
+
+			// Check if this mailbox should be imported
+			if !i.shouldImportMailbox(mailboxName) {
+				logger.Info("Skipping mailbox (filtered)", "mailbox", mailboxName)
+				return nil
+			}
+
+			// This is a maildir folder, process the messages within it.
+			// Only scan 'cur' and 'new' directories (skip 'tmp' as it contains incomplete messages)
+			for _, subDir := range []string{"cur", "new"} {
+				messages, err := os.ReadDir(filepath.Join(path, subDir))
+				if err != nil {
+					logger.Info("Failed to read directory", "path", filepath.Join(path, subDir), "error", err)
 					continue
 				}
 
-				if isValidMaildirMessage(message.Name()) {
-					filesToProcess <- fileToProcess{
-						path:        filepath.Join(path, subDir, message.Name()),
-						filename:    message.Name(),
-						mailboxName: mailboxName,
+				for _, message := range messages {
+					if message.IsDir() {
+						continue
+					}
+
+					if isValidMaildirMessage(message.Name()) {
+						filesToProcess <- fileToProcess{
+							path:        filepath.Join(path, subDir, message.Name()),
+							filename:    message.Name(),
+							mailboxName: mailboxName,
+						}
 					}
 				}
 			}
-		}
 
-		// Parse dovecot-uidlist if preserving UIDs
-		if i.options.PreserveUIDs {
-			uidList, err := ParseDovecotUIDList(path)
-			if err != nil {
-				logger.Info("Warning: Failed to parse dovecot-uidlist", "path", path, "error", err)
-			} else if uidList != nil {
-				i.dovecotUIDLists[path] = uidList
-				logger.Info("Loaded dovecot-uidlist", "mailbox", mailboxName,
-					"uidvalidity", uidList.UIDValidity, "next_uid", uidList.NextUID, "mappings", len(uidList.UIDMappings))
+			// Parse dovecot-uidlist if preserving UIDs
+			if i.options.PreserveUIDs {
+				uidList, err := ParseDovecotUIDList(path)
+				if err != nil {
+					logger.Info("Warning: Failed to parse dovecot-uidlist", "path", path, "error", err)
+				} else if uidList != nil {
+					i.dovecotUIDLists[path] = uidList
+					logger.Info("Loaded dovecot-uidlist", "mailbox", mailboxName,
+						"uidvalidity", uidList.UIDValidity, "next_uid", uidList.NextUID, "mappings", len(uidList.UIDMappings))
+				}
 			}
-		}
 
-		// Do not skip the directory, so we can find nested maildir folders.
-		return nil
-	})
+			// Do not skip the directory, so we can find nested maildir folders.
+			return nil
+		})
+	}
 
 	// Close the channel to signal workers that there are no more files.
 	close(filesToProcess)
@@ -1625,6 +1665,8 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 
 				if err != nil {
 					logger.Warn("Failed to read file", "path", msg.path, "error", err)
+					i.recordFailedPath(msg.path, fmt.Sprintf("read error: %v", err))
+					atomic.AddInt64(&i.failedMessages, 1)
 					return
 				}
 			}
@@ -1640,6 +1682,8 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 			metadata, err := i.parseMessageMetadata(content, msg.filename, msg.path)
 			if err != nil {
 				logger.Warn("Failed to parse message", "path", msg.path, "error", err)
+				i.recordFailedPath(msg.path, fmt.Sprintf("parse error: %v", err))
+				atomic.AddInt64(&i.failedMessages, 1)
 				return
 			}
 
@@ -1653,8 +1697,26 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 			// Upload to S3 (FileBasedS3Mock now has proper locking for directory creation)
 			if !i.options.TestMode && i.s3 != nil {
 				s3Key := helpers.NewS3Key(metadata.domain, metadata.localpart, msg.hash)
-				if err := i.s3.Put(s3Key, bytes.NewReader(content), msg.size); err != nil {
-					logger.Warn("S3 upload failed", "path", msg.path, "error", err)
+
+				var s3Err error
+				maxRetries := 3
+				backoff := 500 * time.Millisecond
+				for attempt := 1; attempt <= maxRetries; attempt++ {
+					if attempt > 1 {
+						time.Sleep(backoff)
+						backoff *= 2
+						logger.Info("Retrying S3 upload", "path", msg.path, "attempt", attempt)
+					}
+					s3Err = i.s3.Put(s3Key, bytes.NewReader(content), msg.size)
+					if s3Err == nil {
+						break
+					}
+				}
+
+				if s3Err != nil {
+					logger.Warn("S3 upload failed after retries", "path", msg.path, "error", s3Err)
+					i.recordFailedPath(msg.path, fmt.Sprintf("s3 upload error: %v", s3Err))
+					atomic.AddInt64(&i.failedMessages, 1)
 					return
 				}
 			}
@@ -1729,8 +1791,11 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 				atomic.AddInt64(&i.skippedMessages, 1)
 				continue
 			}
-			// Non-recoverable error - fail entire batch
-			return nil, fmt.Errorf("failed to insert message (hash: %s): %w", up.msg.hash, err)
+			// Non-recoverable error for this message - record and continue
+			logger.Error("DB insert failed for message", "hash", up.msg.hash, "error", err)
+			i.recordFailedPath(up.msg.path, fmt.Sprintf("db insert error: %v", err))
+			atomic.AddInt64(&i.failedMessages, 1)
+			continue
 		}
 
 		successHashes = append(successHashes, up.msg.hash)
@@ -2008,7 +2073,6 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 		successHashes, err = i.insertBatchToDB(uploaded)
 		if err != nil {
 			logger.Error("DB inserts failed", "error", err)
-			atomic.AddInt64(&i.failedMessages, int64(len(uploaded)))
 			return err
 		}
 
@@ -2028,12 +2092,107 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 
 	if err != nil {
 		logger.Error("Batch processing failed", "error", err)
-		atomic.AddInt64(&i.failedMessages, int64(len(uploaded)))
+		// Everything in uploaded that wasn't successfully inserted is already tracked if individual mode
+		// Let's ensure BatchTransactionMode logs all if it aborted
+		if i.options.BatchTransactionMode {
+			for _, up := range uploaded {
+				i.recordFailedPath(up.msg.path, fmt.Sprintf("batch transaction aborted: %v", err))
+			}
+			atomic.AddInt64(&i.failedMessages, int64(len(uploaded)))
+		}
 		return err
 	}
 
 	atomic.AddInt64(&i.importedMessages, int64(len(successHashes)))
 	logger.Info("Batch complete", "imported", len(successHashes))
+	return nil
+}
+
+// processPathsFile reads specific message paths from a file and sends them to the workers
+func (i *Importer) processPathsFile(cleanPath string, filesToProcess chan<- fileToProcess) error {
+	content, err := os.ReadFile(i.options.PathsFile)
+	if err != nil {
+		return fmt.Errorf("failed to read paths file: %w", err)
+	}
+
+	logger.Info("Processing specific paths from file", "file", i.options.PathsFile)
+	lines := strings.Split(string(content), "\n")
+	processedDirs := make(map[string]bool)
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		var fullPath string
+		if filepath.IsAbs(line) {
+			fullPath = filepath.Clean(line)
+		} else {
+			fullPath = filepath.Join(cleanPath, line)
+		}
+
+		if !strings.HasPrefix(fullPath, cleanPath) {
+			logger.Warn("Skipping path outside maildir", "path", line)
+			continue
+		}
+
+		// Message paths are structured like dir/cur/msg_file or dir/new/msg_file
+		// dir is the maildir folder root.
+		dir := filepath.Dir(filepath.Dir(fullPath))
+
+		if i.options.PreserveUIDs && !processedDirs[dir] {
+			uidList, err := ParseDovecotUIDList(dir)
+			if err == nil && uidList != nil {
+				i.dovecotUIDLists[dir] = uidList
+				logger.Info("Loaded dovecot-uidlist", "path", dir)
+			}
+			processedDirs[dir] = true
+		}
+
+		relPath, err := filepath.Rel(cleanPath, dir)
+		if err != nil {
+			logger.Warn("Could not get relative path", "path", dir, "error", err)
+			continue
+		}
+
+		var mailboxName string
+		if relPath == "." {
+			mailboxName = "INBOX"
+		} else {
+			cleanName := strings.TrimPrefix(relPath, ".")
+			mailboxName = strings.ReplaceAll(cleanName, ".", "/")
+			if decoded, decErr := helpers.DecodeModifiedUTF7(mailboxName); decErr == nil {
+				mailboxName = decoded
+			}
+			mailboxName = strings.TrimSpace(mailboxName)
+			switch strings.ToLower(mailboxName) {
+			case "sent", "sent items", "sent mail":
+				mailboxName = "Sent"
+			case "drafts", "draft":
+				mailboxName = "Drafts"
+			case "trash", "deleted", "deleted items":
+				mailboxName = "Trash"
+			case "junk", "spam":
+				mailboxName = "Junk"
+			case "archive", "archives":
+				mailboxName = "Archive"
+			}
+		}
+
+		if !i.shouldImportMailbox(mailboxName) {
+			continue
+		}
+
+		filename := filepath.Base(fullPath)
+		if isValidMaildirMessage(filename) {
+			filesToProcess <- fileToProcess{
+				path:        fullPath,
+				filename:    filename,
+				mailboxName: mailboxName,
+			}
+		}
+	}
 	return nil
 }
 

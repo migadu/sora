@@ -337,13 +337,14 @@ func TestProcessBatch_DBInsertFailure(t *testing.T) {
 		processErr := importer.processBatch(batch)
 
 		// --- Assert ---
-		// 1. The function should return an error.
-		require.Error(t, processErr, "processBatch should return an error on DB insert failure")
-		assert.Contains(t, processErr.Error(), "simulated db connection error")
+		// 1. The function should NOT return an error. Individual transaction mode continues on error!
+		require.NoError(t, processErr, "processBatch should NOT return an error on DB insert failure in safe mode")
 
 		// 2. The failed messages counter should be incremented.
 		// The batch had 1 message, which was "uploaded" but failed to insert.
 		assert.Equal(t, int64(1), importer.failedMessages, "failedMessages counter should be incremented")
+		assert.Equal(t, 1, len(importer.failedPaths), "failedPaths should contain the failed message")
+		assert.Contains(t, importer.failedPaths[0].reason, "simulated db connection error")
 
 		// 3. The imported messages counter should NOT be incremented.
 		assert.Equal(t, int64(0), importer.importedMessages, "importedMessages counter should be zero")

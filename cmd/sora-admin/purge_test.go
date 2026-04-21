@@ -438,8 +438,9 @@ func setupPurgeTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 		},
 	}
 
-	// Create ResilientDatabase
-	rdb, err := resilient.NewResilientDatabase(ctx, cfg, false, false)
+	// Setup database connection with migrations enabled
+	ctx = context.Background()
+	rdb, err := resilient.NewResilientDatabase(ctx, cfg, false, true)
 	if err != nil {
 		t.Skipf("Failed to connect to test database: %v", err)
 	}

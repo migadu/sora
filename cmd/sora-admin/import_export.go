@@ -58,6 +58,7 @@ func handleImportMaildir(ctx context.Context) {
 	startDate := fs.String("start-date", "", "Import only messages after this date (YYYY-MM-DD)")
 	endDate := fs.String("end-date", "", "Import only messages before this date (YYYY-MM-DD)")
 	incremental := fs.Bool("incremental", false, "Skip messages already marked as imported in SQLite cache")
+	pathsFile := fs.String("paths-file", "", "Path to a file containing a list of paths (relative to maildir root or absolute) to import")
 
 	fs.Usage = func() {
 		fmt.Printf(`Import maildir from a given path
@@ -84,6 +85,7 @@ Options:
   --mailbox-filter string Comma-separated list of mailboxes to import (e.g. INBOX,Sent,Archive*)
   --start-date string     Import only messages after this date (YYYY-MM-DD)
   --end-date string       Import only messages before this date (YYYY-MM-DD)
+  --paths-file string     Path to a file containing paths to import (one per line)
   --config string        Path to TOML configuration file (required)
 
 IMPORTANT: --maildir-path must point to a maildir root directory (containing cur/, new/, tmp/ subdirectories),
@@ -112,6 +114,9 @@ Examples:
 
   # Import messages from 2023
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --start-date 2023-01-01 --end-date 2023-12-31
+
+  # Import from specific paths file
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --paths-file failed_paths.txt
 
   # Import with cleanup (removes SQLite database after completion)
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db
@@ -222,6 +227,7 @@ Examples:
 		BatchTransactionMode: *batchTxMode,
 		Incremental:          *incremental,
 		MaxMessageSize:       globalConfig.GetImportMessageLimit(),
+		PathsFile:            *pathsFile,
 	}
 
 	importer, err := NewImporter(ctx, *maildirPath, *email, *jobs, rdb, s3, options)

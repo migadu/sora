@@ -311,7 +311,7 @@ func setupACLTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 
 	// Create database connection
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, true)
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}

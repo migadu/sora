@@ -85,9 +85,10 @@ func TestImporter_SynchronousUploadFlow(t *testing.T) {
 			s3Storage = nil
 		}
 
-		// Create importer with actual S3 or TestMode
+		// Create importer with TestMode to bypass actual S3 uploads
+		// storage.New() doesn't fail immediately if local minio is down, so we force TestMode
 		options := ImporterOptions{
-			TestMode: s3Storage == nil, // Use TestMode if S3 not available
+			TestMode: true,
 		}
 
 		importer, err := NewImporter(ctx, maildirPath, testEmail, 4, rdb, s3Storage, options)

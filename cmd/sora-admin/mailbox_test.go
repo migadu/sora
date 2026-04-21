@@ -191,9 +191,9 @@ func setupMailboxTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 		t.Fatalf("Failed to load test configuration: %v", err)
 	}
 
-	// Create resilient database connection
+	// Create resilient database connection with migrations enabled
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, false)
+	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, true)
 	if err != nil {
 		t.Fatalf("Failed to create resilient database: %v", err)
 	}

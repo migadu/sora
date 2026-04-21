@@ -52,7 +52,7 @@ func setupTestDatabase(t testing.TB) *Database {
 		},
 	}
 
-	database, err := NewDatabaseFromConfig(ctx, dbConfig, true, false)
+	database, err := NewDatabaseFromConfig(ctx, dbConfig, true, true)
 	require.NoError(t, err, "Failed to connect to test database. Please ensure PostgreSQL is running and %s database exists", cfg.Database.Write.Name)
 
 	// Verify pg_trgm extension is available
