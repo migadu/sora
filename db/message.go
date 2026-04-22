@@ -631,18 +631,22 @@ func hydrateSequencesCore[T any](
 		uids = append(uids, int64(uid))
 	}
 
-	// Use optimal O(1) Index-Only CTE to hydrate dynamically calculated sequences directly
-	// from PostgreSQL without doing O(N) COUNT(*) queries or O(N) full-index stream to the application.
-	// This mirrors the efficient design utilized in GetDeletedMessageUIDsAndSeqs.
+	// Optimized sequence hydration: Instead of computing ROW_NUMBER for entire mailbox
+	// (expensive for large mailboxes), we count messages with UID < each target UID.
+	// This uses the idx_messages_mailbox_id_uid index efficiently.
+	// For N target UIDs in a mailbox with M messages: O(N log M) vs O(M) for ROW_NUMBER.
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
-		WITH numbered AS (
-			SELECT uid, ROW_NUMBER() OVER(ORDER BY uid ASC) as seqnum
-			FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
-		)
-		SELECT uid, seqnum 
-		FROM numbered 
-		WHERE uid = ANY($2::bigint[])
+		SELECT
+			m.uid,
+			(SELECT COUNT(*) + 1
+			 FROM messages
+			 WHERE mailbox_id = $1
+			   AND expunged_at IS NULL
+			   AND uid < m.uid) as seqnum
+		FROM messages m
+		WHERE m.mailbox_id = $1
+		  AND m.expunged_at IS NULL
+		  AND m.uid = ANY($2::bigint[])
 	`, mailboxID, uids)
 
 	if err != nil {

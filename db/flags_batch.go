@@ -104,6 +104,9 @@ func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 
 	systemFlagsToSet, customKeywordsToSet := SplitFlags(newFlags)
 	bitwiseSystemFlags := FlagsToBitwise(systemFlagsToSet)
+	if customKeywordsToSet == nil {
+		customKeywordsToSet = []string{}
+	}
 	customKeywordsJSON, err := json.Marshal(customKeywordsToSet)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal custom keywords for SetMessageFlagsBatch: %w", err)
@@ -111,8 +114,9 @@ func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 
 	rows, err := tx.Query(ctx, `
 		UPDATE message_state
-		SET flags = $1, custom_flags = $2, flags_changed_at = $3, updated_modseq = nextval('messages_modseq')
+		SET flags = $1, custom_flags = $2::jsonb, flags_changed_at = $3, updated_modseq = nextval('messages_modseq')
 		WHERE message_id = ANY($4)
+		  AND (flags != $1 OR custom_flags != $2::jsonb)
 		RETURNING message_id, updated_modseq
 	`, bitwiseSystemFlags, customKeywordsJSON, time.Now(), messageIDs)
 	if err != nil {
@@ -130,6 +134,10 @@ func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+
+	if len(updatedModSeqs) == 0 {
+		return []BatchFlagUpdateResult{}, nil
 	}
 
 	currentFlagsMap, err := db.getAllFlagsForMessages(ctx, tx, messageIDs)
@@ -164,72 +172,47 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 	}
 
 	systemFlagsToAdd, customKeywordsToAdd := SplitFlags(newFlags)
-	hasCustom := len(customKeywordsToAdd) > 0
-
-	updatedModSeqs := make(map[int64]int64)
-
-	if len(systemFlagsToAdd) > 0 {
-		bitwiseSystemFlagsToAdd := FlagsToBitwise(systemFlagsToAdd)
-		if hasCustom {
-			// Custom keywords update follows — skip modseq bump here to avoid double increment
-			_, execErr := tx.Exec(ctx, `
-				UPDATE message_state
-				SET flags = flags | $1, flags_changed_at = $2
-				WHERE message_id = ANY($3)
-			`, bitwiseSystemFlagsToAdd, time.Now(), messageIDs)
-			if execErr != nil {
-				return nil, fmt.Errorf("failed to batch add system flags: %w", execErr)
-			}
-		} else {
-			// Only system flags to update — bump modseq here
-			rows, err := tx.Query(ctx, `
-				UPDATE message_state
-				SET flags = flags | $1, flags_changed_at = $2, updated_modseq = nextval('messages_modseq')
-				WHERE message_id = ANY($3)
-				RETURNING message_id, updated_modseq
-			`, bitwiseSystemFlagsToAdd, time.Now(), messageIDs)
-			if err != nil {
-				return nil, fmt.Errorf("failed to batch add system flags: %w", err)
-			}
-			defer rows.Close()
-			for rows.Next() {
-				var id, modSeq int64
-				if err := rows.Scan(&id, &modSeq); err == nil {
-					updatedModSeqs[id] = modSeq
-				}
-			}
-		}
+	if customKeywordsToAdd == nil {
+		customKeywordsToAdd = []string{}
 	}
+	bitwiseSystemFlagsToAdd := FlagsToBitwise(systemFlagsToAdd)
 
-	if hasCustom {
-		// This is always the last update — bump modseq here
-		rows, err := tx.Query(ctx, `
-			UPDATE message_state
-			SET custom_flags = (
+	rows, err := tx.Query(ctx, `
+		UPDATE message_state
+		SET flags = flags | $1,
+		    custom_flags = (
 				SELECT COALESCE(jsonb_agg(DISTINCT flag_element ORDER BY flag_element), '[]'::jsonb)
 				FROM (
 					SELECT jsonb_array_elements_text(message_state.custom_flags) AS flag_element
 					UNION ALL
 					SELECT unnest($2::text[]) AS flag_element
 				) AS combined_flags
-			), flags_changed_at = $3, updated_modseq = nextval('messages_modseq')
-			WHERE message_id = ANY($1)
-			RETURNING message_id, updated_modseq
-		`, messageIDs, customKeywordsToAdd, time.Now())
-		if err != nil {
-			return nil, fmt.Errorf("failed to batch add custom keywords: %w", err)
+			),
+		    flags_changed_at = $3,
+		    updated_modseq = nextval('messages_modseq')
+		WHERE message_id = ANY($4)
+		  AND ( (flags & $1) != $1 OR NOT (custom_flags @> to_jsonb($2::text[])) )
+		RETURNING message_id, updated_modseq
+	`, bitwiseSystemFlagsToAdd, customKeywordsToAdd, time.Now(), messageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute batch add message flags in mailbox %d: %w", mailboxID, err)
+	}
+	defer rows.Close()
+
+	updatedModSeqs := make(map[int64]int64)
+	for rows.Next() {
+		var id, modSeq int64
+		if err := rows.Scan(&id, &modSeq); err != nil {
+			return nil, err
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var id, modSeq int64
-			if err := rows.Scan(&id, &modSeq); err == nil {
-				updatedModSeqs[id] = modSeq
-			}
-		}
+		updatedModSeqs[id] = modSeq
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	if len(updatedModSeqs) == 0 {
-		return nil, fmt.Errorf("no flags were added in batch")
+		return []BatchFlagUpdateResult{}, nil
 	}
 
 	currentFlagsMap, err := db.getAllFlagsForMessages(ctx, tx, messageIDs)
@@ -264,68 +247,41 @@ func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, mess
 	}
 
 	systemFlagsToRemove, customKeywordsToRemove := SplitFlags(flagsToRemove)
-	hasCustom := len(customKeywordsToRemove) > 0
+	if customKeywordsToRemove == nil {
+		customKeywordsToRemove = []string{}
+	}
+	bitwiseSystemFlagsToRemove := FlagsToBitwise(systemFlagsToRemove)
+	negatedSystemFlags := ^bitwiseSystemFlagsToRemove
+
+	rows, err := tx.Query(ctx, `
+		UPDATE message_state
+		SET flags = flags & $1,
+		    custom_flags = custom_flags - $2::text[],
+		    flags_changed_at = $3,
+		    updated_modseq = nextval('messages_modseq')
+		WHERE message_id = ANY($4)
+		  AND ( (flags & $5) > 0 OR custom_flags ?| $2::text[] )
+		RETURNING message_id, updated_modseq
+	`, negatedSystemFlags, customKeywordsToRemove, time.Now(), messageIDs, bitwiseSystemFlagsToRemove)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute batch remove message flags in mailbox %d: %w", mailboxID, err)
+	}
+	defer rows.Close()
 
 	updatedModSeqs := make(map[int64]int64)
-
-	if len(systemFlagsToRemove) > 0 {
-		bitwiseSystemFlagsToRemove := FlagsToBitwise(systemFlagsToRemove)
-		negatedSystemFlags := ^bitwiseSystemFlagsToRemove
-
-		if hasCustom {
-			// Custom keywords update follows — skip modseq bump here to avoid double increment
-			_, execErr := tx.Exec(ctx, `
-				UPDATE message_state
-				SET flags = flags & $1, flags_changed_at = $2
-				WHERE message_id = ANY($3)
-			`, negatedSystemFlags, time.Now(), messageIDs)
-			if execErr != nil {
-				return nil, fmt.Errorf("failed to batch remove system flags: %w", execErr)
-			}
-		} else {
-			// Only system flags to update — bump modseq here
-			rows, err := tx.Query(ctx, `
-				UPDATE message_state
-				SET flags = flags & $1, flags_changed_at = $2, updated_modseq = nextval('messages_modseq')
-				WHERE message_id = ANY($3)
-				RETURNING message_id, updated_modseq
-			`, negatedSystemFlags, time.Now(), messageIDs)
-			if err != nil {
-				return nil, fmt.Errorf("failed to batch remove system flags: %w", err)
-			}
-			defer rows.Close()
-			for rows.Next() {
-				var id, modSeq int64
-				if err := rows.Scan(&id, &modSeq); err == nil {
-					updatedModSeqs[id] = modSeq
-				}
-			}
+	for rows.Next() {
+		var id, modSeq int64
+		if err := rows.Scan(&id, &modSeq); err != nil {
+			return nil, err
 		}
+		updatedModSeqs[id] = modSeq
 	}
-
-	if hasCustom {
-		// This is always the last update — bump modseq here
-		rows, err := tx.Query(ctx, `
-			UPDATE message_state
-			SET custom_flags = custom_flags - $2::text[],
-			    flags_changed_at = $3, updated_modseq = nextval('messages_modseq')
-			WHERE message_id = ANY($1)
-			RETURNING message_id, updated_modseq
-		`, messageIDs, customKeywordsToRemove, time.Now())
-		if err != nil {
-			return nil, fmt.Errorf("failed to batch remove custom keywords: %w", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var id, modSeq int64
-			if err := rows.Scan(&id, &modSeq); err == nil {
-				updatedModSeqs[id] = modSeq
-			}
-		}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	if len(updatedModSeqs) == 0 {
-		return nil, fmt.Errorf("no flags were removed in batch")
+		return []BatchFlagUpdateResult{}, nil
 	}
 
 	currentFlagsMap, err := db.getAllFlagsForMessages(ctx, tx, messageIDs)
