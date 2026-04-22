@@ -82,6 +82,23 @@ var (
 		[]string{"operation", "role"},
 	)
 
+	MessageFetchChunked = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_message_fetch_chunked_total",
+			Help: "Total number of chunked message fetches (result sets larger than chunk_size)",
+		},
+		[]string{"type"}, // "uid_set", "seq_set", "all_messages"
+	)
+
+	MessageFetchChunks = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "sora_message_fetch_chunks",
+			Help:    "Number of chunks required per large message fetch",
+			Buckets: []float64{1, 2, 5, 10, 20, 50, 100},
+		},
+		[]string{"type"}, // "uid_set", "seq_set", "all_messages"
+	)
+
 	MailboxesTotal = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "sora_mailboxes_total",

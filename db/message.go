@@ -11,6 +11,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 // Message struct to represent an email message
@@ -182,6 +183,35 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 
 	whereClause := strings.Join(conditions, " OR ")
 
+	// Check if result set would be too large
+	countQuery := fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM messages m
+		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
+		  AND (%s)
+	`, whereClause)
+
+	var estimatedCount int64
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, countQuery, args...).Scan(&estimatedCount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count messages in UID set: %w", err)
+	}
+
+	if estimatedCount > int64(db.fetchMaxResults) {
+		return nil, fmt.Errorf("result set too large (%d messages), maximum allowed is %d", estimatedCount, db.fetchMaxResults)
+	}
+
+	if estimatedCount <= int64(db.fetchChunkSize) {
+		// Small result set: fetch in single query
+		return db.fetchMessagesByUIDSetDirect(ctx, mailboxID, whereClause, args, includeBodyStructure, bsColInner)
+	}
+
+	// Large result set: fetch in chunks
+	log.Printf("Database: Chunking UID fetch for mailbox %d (%d messages, %d per chunk)", mailboxID, estimatedCount, db.fetchChunkSize)
+	return db.fetchMessagesByUIDSetChunked(ctx, mailboxID, whereClause, args, includeBodyStructure, bsColInner, db.fetchChunkSize)
+}
+
+func (db *Database) fetchMessagesByUIDSetDirect(ctx context.Context, mailboxID int64, whereClause string, args []any, includeBodyStructure bool, bsColInner string) ([]Message, error) {
 	query := fmt.Sprintf(`
 		SELECT
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
@@ -207,6 +237,65 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 		return nil, err
 	}
 	return messages, nil
+}
+
+func (db *Database) fetchMessagesByUIDSetChunked(ctx context.Context, mailboxID int64, whereClause string, args []any, includeBodyStructure bool, bsColInner string, chunkSize int) ([]Message, error) {
+	metrics.MessageFetchChunked.WithLabelValues("uid_set").Inc()
+
+	var allMessages []Message
+	var lastUID int64
+	chunkCount := 0
+
+	for {
+		query := fmt.Sprintf(`
+			SELECT
+				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
+				m.internal_date, m.size, %[1]sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
+				0 as seqnum,
+				ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			FROM messages m
+			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+			WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
+			  AND (%[2]s)
+			  AND m.uid > $%d
+			ORDER BY m.uid ASC
+			LIMIT $%d`, bsColInner, whereClause, len(args)+1, len(args)+2)
+
+		argsWithLimit := append(append([]any{}, args...), lastUID, chunkSize)
+		rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, argsWithLimit...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query messages chunk after uid %d: %w", lastUID, err)
+		}
+
+		messages, err := scanMessages(rows, includeBodyStructure)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(messages) == 0 {
+			break
+		}
+
+		lastUID = int64(messages[len(messages)-1].UID)
+		allMessages = append(allMessages, messages...)
+		chunkCount++
+
+		// Check context cancellation between chunks
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("chunked fetch cancelled: %w", ctx.Err())
+		}
+
+		if len(messages) < chunkSize {
+			break
+		}
+	}
+
+	metrics.MessageFetchChunks.WithLabelValues("uid_set").Observe(float64(chunkCount))
+
+	if err := db.HydrateMessageSequences(ctx, mailboxID, allMessages); err != nil {
+		return nil, err
+	}
+	return allMessages, nil
 }
 
 func (db *Database) getUIDBySeqNum(ctx context.Context, mailboxID int64, seqNum uint32) (imap.UID, error) {
@@ -275,6 +364,35 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 
 	whereClause := strings.Join(conditions, " OR ")
 
+	// Check if result set would be too large
+	countQuery := fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM messages m
+		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
+		  AND (%s)
+	`, whereClause)
+
+	var estimatedCount int64
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, countQuery, args...).Scan(&estimatedCount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count messages in Seq set: %w", err)
+	}
+
+	if estimatedCount > int64(db.fetchMaxResults) {
+		return nil, fmt.Errorf("result set too large (%d messages), maximum allowed is %d", estimatedCount, db.fetchMaxResults)
+	}
+
+	if estimatedCount <= int64(db.fetchChunkSize) {
+		// Small result set: fetch in single query
+		return db.fetchMessagesBySeqSetDirect(ctx, mailboxID, whereClause, args, includeBodyStructure, bsColInner)
+	}
+
+	// Large result set: fetch in chunks
+	log.Printf("Database: Chunking Seq fetch for mailbox %d (%d messages, %d per chunk)", mailboxID, estimatedCount, db.fetchChunkSize)
+	return db.fetchMessagesBySeqSetChunked(ctx, mailboxID, whereClause, args, includeBodyStructure, bsColInner, db.fetchChunkSize)
+}
+
+func (db *Database) fetchMessagesBySeqSetDirect(ctx context.Context, mailboxID int64, whereClause string, args []any, includeBodyStructure bool, bsColInner string) ([]Message, error) {
 	query := fmt.Sprintf(`
 		SELECT
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
@@ -303,17 +421,103 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 	return messages, nil
 }
 
+func (db *Database) fetchMessagesBySeqSetChunked(ctx context.Context, mailboxID int64, whereClause string, args []any, includeBodyStructure bool, bsColInner string, chunkSize int) ([]Message, error) {
+	metrics.MessageFetchChunked.WithLabelValues("seq_set").Inc()
+
+	var allMessages []Message
+	var lastUID int64
+	chunkCount := 0
+
+	for {
+		query := fmt.Sprintf(`
+			SELECT
+				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
+				m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
+				0 as seqnum,
+				ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			FROM messages m
+			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+			WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
+			  AND (%s)
+			  AND m.uid > $%d
+			ORDER BY m.uid ASC
+			LIMIT $%d
+		`, bsColInner, whereClause, len(args)+1, len(args)+2)
+
+		argsWithLimit := append(append([]any{}, args...), lastUID, chunkSize)
+		rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, argsWithLimit...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query messages chunk after uid %d: %w", lastUID, err)
+		}
+
+		messages, err := scanMessages(rows, includeBodyStructure)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(messages) == 0 {
+			break
+		}
+
+		lastUID = int64(messages[len(messages)-1].UID)
+		allMessages = append(allMessages, messages...)
+		chunkCount++
+
+		// Check context cancellation between chunks
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("chunked fetch cancelled: %w", ctx.Err())
+		}
+
+		if len(messages) < chunkSize {
+			break
+		}
+	}
+
+	metrics.MessageFetchChunks.WithLabelValues("seq_set").Observe(float64(chunkCount))
+
+	if err := db.HydrateMessageSequences(ctx, mailboxID, allMessages); err != nil {
+		return nil, err
+	}
+	return allMessages, nil
+}
+
 func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int64, includeBodyStructure bool) ([]Message, error) {
 	// Filter to uploaded messages only (same as getMessagesBySeqSet / getMessagesByUIDSet).
 	// This path handles the rare edge-case SeqSet "1:*" where the wildcard was not
 	// resolved (session count == 0).  See getMessagesByUIDSet for the full rationale.
+
+	// Check message count first
+	var messageCount int64
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT COUNT(*) FROM messages
+		WHERE mailbox_id = $1 AND expunged_at IS NULL AND uploaded = true
+	`, mailboxID).Scan(&messageCount)
+	if err != nil {
+		return nil, fmt.Errorf("fetchAllActiveMessagesRaw: failed to count messages: %w", err)
+	}
+
+	if messageCount > int64(db.fetchMaxResults) {
+		return nil, fmt.Errorf("result set too large (%d messages), maximum allowed is %d", messageCount, db.fetchMaxResults)
+	}
+
+	if messageCount <= int64(db.fetchChunkSize) {
+		// Small mailbox: fetch in single query
+		return db.fetchAllActiveMessagesRawDirect(ctx, mailboxID, includeBodyStructure)
+	}
+
+	// Large mailbox: fetch in chunks
+	log.Printf("Database: Chunking SeqSet 1:* fetch for mailbox %d (%d messages, %d per chunk)", mailboxID, messageCount, db.fetchChunkSize)
+	return db.fetchAllActiveMessagesRawChunked(ctx, mailboxID, includeBodyStructure, db.fetchChunkSize)
+}
+
+func (db *Database) fetchAllActiveMessagesRawDirect(ctx context.Context, mailboxID int64, includeBodyStructure bool) ([]Message, error) {
 	bsCol := ""
 	if includeBodyStructure {
 		bsCol = "m.body_structure, "
 	}
 
 	query := fmt.Sprintf(`
-		SELECT 
+		SELECT
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
 			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
 			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
@@ -334,6 +538,68 @@ func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int
 		return nil, err
 	}
 	return messages, nil
+}
+
+func (db *Database) fetchAllActiveMessagesRawChunked(ctx context.Context, mailboxID int64, includeBodyStructure bool, chunkSize int) ([]Message, error) {
+	metrics.MessageFetchChunked.WithLabelValues("all_messages").Inc()
+
+	bsCol := ""
+	if includeBodyStructure {
+		bsCol = "m.body_structure, "
+	}
+
+	var allMessages []Message
+	var lastUID int64
+	chunkCount := 0
+
+	for {
+		query := fmt.Sprintf(`
+			SELECT
+				m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
+				m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
+				ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			FROM messages m
+			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+			WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL AND m.uploaded = true
+			  AND m.uid > $2
+			ORDER BY m.uid ASC
+			LIMIT $3
+		`, bsCol)
+
+		rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, lastUID, chunkSize)
+		if err != nil {
+			return nil, fmt.Errorf("fetchAllActiveMessagesRaw: failed to query chunk after uid %d: %w", lastUID, err)
+		}
+
+		messages, err := scanMessages(rows, includeBodyStructure)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(messages) == 0 {
+			break
+		}
+
+		lastUID = int64(messages[len(messages)-1].UID)
+		allMessages = append(allMessages, messages...)
+		chunkCount++
+
+		// Check context cancellation between chunks
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("chunked fetch cancelled: %w", ctx.Err())
+		}
+
+		if len(messages) < chunkSize {
+			break
+		}
+	}
+
+	metrics.MessageFetchChunks.WithLabelValues("all_messages").Observe(float64(chunkCount))
+
+	if err := db.HydrateMessageSequences(ctx, mailboxID, allMessages); err != nil {
+		return nil, err
+	}
+	return allMessages, nil
 }
 
 func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {
@@ -625,29 +891,71 @@ func hydrateSequencesCore[T any](
 
 	interestedUIDs := make(map[uint32]*T, len(messages))
 	var uids []int64
+	var minUID, maxUID uint32 = 0xFFFFFFFF, 0
+
 	for i := range messages {
 		uid := getUID(&messages[i])
+		if uid < minUID {
+			minUID = uid
+		}
+		if uid > maxUID {
+			maxUID = uid
+		}
 		interestedUIDs[uid] = &messages[i]
 		uids = append(uids, int64(uid))
 	}
 
-	// Optimized sequence hydration: Instead of computing ROW_NUMBER for entire mailbox
-	// (expensive for large mailboxes), we count messages with UID < each target UID.
-	// This uses the idx_messages_mailbox_id_uid index efficiently.
-	// For N target UIDs in a mailbox with M messages: O(N log M) vs O(M) for ROW_NUMBER.
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
-		SELECT
-			m.uid,
-			(SELECT COUNT(*) + 1
-			 FROM messages
-			 WHERE mailbox_id = $1
-			   AND expunged_at IS NULL
-			   AND uid < m.uid) as seqnum
-		FROM messages m
-		WHERE m.mailbox_id = $1
-		  AND m.expunged_at IS NULL
-		  AND m.uid = ANY($2::bigint[])
-	`, mailboxID, uids)
+	distance := maxUID - minUID
+	var rows pgx.Rows
+	var err error
+
+	// If we are modifying a very sparse list of sequences relative to the size of the array,
+	// use the targeted correlation query. Otherwise, fall back to the optimized bounded window function.
+	if len(messages) >= 100 && uint64(distance) < uint64(len(messages))*100 {
+		// Optimized sequence hydration using batch approach:
+		// 1. Find min/max UID in our target set
+		// 2. Count how many messages exist below min UID (base offset)
+		// 3. Use ROW_NUMBER only on the UID range containing our targets
+		// This is much faster than full-mailbox ROW_NUMBER for dense sequence fetches.
+		rows, err = db.GetReadPoolWithContext(ctx).Query(ctx, `
+			WITH target_uids AS (
+				SELECT unnest($2::bigint[]) AS uid
+			),
+			uid_range AS (
+				SELECT MIN(uid) as min_uid, MAX(uid) as max_uid FROM target_uids
+			),
+			base_offset AS (
+				SELECT COUNT(*)::bigint as offset
+				FROM messages
+				WHERE mailbox_id = $1
+				  AND expunged_at IS NULL
+				  AND uid < (SELECT min_uid FROM uid_range)
+			),
+			windowed AS (
+				SELECT
+					uid,
+					ROW_NUMBER() OVER(ORDER BY uid) as relative_seq
+				FROM messages
+				WHERE mailbox_id = $1
+				  AND expunged_at IS NULL
+				  AND uid >= (SELECT min_uid FROM uid_range)
+				  AND uid <= (SELECT max_uid FROM uid_range)
+			)
+			SELECT w.uid, (w.relative_seq + b.offset)::bigint as seqnum
+			FROM windowed w, base_offset b
+			WHERE w.uid = ANY($2::bigint[])
+		`, mailboxID, uids)
+	} else {
+		// Sparse sequence hydration using indexed lateral approach.
+		rows, err = db.GetReadPoolWithContext(ctx).Query(ctx, `
+			SELECT t.uid,
+				   (SELECT COUNT(*) + 1 
+					FROM messages m 
+					WHERE m.mailbox_id = $1 AND expunged_at IS NULL AND m.uid < t.uid
+				   ) as seqnum
+			FROM unnest($2::bigint[]) as t(uid)
+		`, mailboxID, uids)
+	}
 
 	if err != nil {
 		return fmt.Errorf("failed to query sequence streams: %w", err)

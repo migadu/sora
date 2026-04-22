@@ -58,6 +58,8 @@ type DatabaseConfig struct {
 	SearchTimeout    string                  `toml:"search_timeout"`    // Specific timeout for complex search queries (default: "60s")
 	WriteTimeout     string                  `toml:"write_timeout"`     // Timeout for write operations (default: "10s")
 	MigrationTimeout string                  `toml:"migration_timeout"` // Timeout for auto-migrations at startup (default: "2m")
+	FetchChunkSize   int                     `toml:"fetch_chunk_size"`  // Number of messages to fetch per chunk for large result sets (default: 5000)
+	FetchMaxResults  int                     `toml:"fetch_max_results"` // Maximum number of messages allowed in a single fetch operation (default: 100000)
 	Write            *DatabaseEndpointConfig `toml:"write"`             // Write database configuration
 	Read             *DatabaseEndpointConfig `toml:"read"`              // Read database configuration (can have multiple hosts for load balancing)
 	PoolTypeOverride string                  `toml:"-"`                 // Internal: Override pool type in logs (not in config file)
@@ -122,6 +124,22 @@ func (d *DatabaseConfig) GetMigrationTimeout() (time.Duration, error) {
 		return 2 * time.Minute, nil // Default 2 minute timeout for auto-migrations
 	}
 	return helpers.ParseDuration(d.MigrationTimeout)
+}
+
+// GetFetchChunkSize returns the chunk size for large message fetches
+func (d *DatabaseConfig) GetFetchChunkSize() int {
+	if d.FetchChunkSize <= 0 {
+		return 5000 // Default: 5k messages per chunk
+	}
+	return d.FetchChunkSize
+}
+
+// GetFetchMaxResults returns the maximum number of messages allowed in a single fetch
+func (d *DatabaseConfig) GetFetchMaxResults() int {
+	if d.FetchMaxResults <= 0 {
+		return 100000 // Default: 100k message hard cap
+	}
+	return d.FetchMaxResults
 }
 
 // S3Config holds S3 configuration.
