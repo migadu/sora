@@ -415,7 +415,8 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		// Check for a unique constraint violation
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" &&
 			(pgErr.ConstraintName == "messages_message_id_mailbox_id_key" ||
-				pgErr.ConstraintName == "messages_message_id_mailbox_id_active_idx") {
+				pgErr.ConstraintName == "messages_message_id_mailbox_id_active_idx" ||
+				pgErr.ConstraintName == "idx_messages_mailbox_id_uid") {
 			// Unique constraint violation on message_id - message already exists in this mailbox.
 			// The transaction is now in an aborted state and must be rolled back.
 			// We cannot query for the existing message within this transaction.
@@ -787,7 +788,8 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		// Check for a unique constraint violation
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" &&
 			(pgErr.ConstraintName == "messages_message_id_mailbox_id_key" ||
-				pgErr.ConstraintName == "messages_message_id_mailbox_id_active_idx") {
+				pgErr.ConstraintName == "messages_message_id_mailbox_id_active_idx" ||
+				pgErr.ConstraintName == "idx_messages_mailbox_id_uid") {
 			// Unique constraint violation on message_id - message already exists in this mailbox.
 			// The transaction is now in an aborted state and must be rolled back.
 			// We cannot query for the existing message within this transaction.

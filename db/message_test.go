@@ -826,3 +826,89 @@ func TestInsertMessage_DuplicateDoesNotCreateOrphanedPendingUpload(t *testing.T)
 // - LMTP deletes file on duplicate detection
 //
 // The fix checks if file exists before writing in server/lmtp/session.go:347-364
+
+// TestInsertMessageFromImporter_DuplicateExpungedUID tests that if an importer
+// tries to reuse a preserved UID that belonged to an expunged message,
+// it gracefully returns ErrDBUniqueViolation (causing the importer to skip it)
+// rather than escalating it to a hard DB error.
+func TestInsertMessageFromImporter_DuplicateExpungedUID(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, mailboxID := setupMessageTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// 1. Insert original message
+	tx, err := db.WritePool.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	preservedUID := uint32(97)
+	uidVal := uint32(1)
+
+	options1 := &InsertMessageOptions{
+		AccountID:            accountID,
+		MailboxID:            mailboxID,
+		MailboxName:          "INBOX",
+		S3Domain:             "example.com",
+		S3Localpart:          "expunge-test",
+		ContentHash:          "hash-content-expunge",
+		MessageID:            "unique-expunge-id@example.com",
+		Subject:              "Will be expunged",
+		Size:                 100,
+		SentDate:             time.Now(),
+		PreservedUID:         &preservedUID,
+		PreservedUIDValidity: &uidVal,
+	}
+
+	msgID1, uid1, err := db.InsertMessageFromImporter(ctx, tx, options1)
+	require.NoError(t, err, "First insert should succeed")
+	assert.Equal(t, int64(97), uid1, "UID should be preserved")
+
+	err = tx.Commit(ctx)
+	require.NoError(t, err)
+
+	// 2. Expunge the message to "delete" it but keep it in DB for IMAP UID history
+	tx2, err := db.WritePool.Begin(ctx)
+	require.NoError(t, err)
+	defer tx2.Rollback(ctx)
+
+	_, err = tx2.Exec(ctx, "UPDATE messages SET expunged_at = NOW() WHERE id = $1", msgID1)
+	require.NoError(t, err)
+	err = tx2.Commit(ctx)
+	require.NoError(t, err)
+
+	// 3. Try to import the SAME preserved UID (97) but from a different message
+	// The deduplication logic will NOT see the first message because it checks expunged_at IS NULL.
+	// We expect the unique constraint idx_messages_mailbox_id_uid to catch it
+	// and cleanly return consts.ErrDBUniqueViolation, instead of failing the import.
+	tx3, err := db.WritePool.Begin(ctx)
+	require.NoError(t, err)
+	defer tx3.Rollback(ctx)
+
+	options2 := &InsertMessageOptions{
+		AccountID:            accountID,
+		MailboxID:            mailboxID,
+		MailboxName:          "INBOX",
+		S3Domain:             "example.com",
+		S3Localpart:          "expunge-test-2",
+		ContentHash:          "hash-content-expunge-2",          // different
+		MessageID:            "unique-expunge-id-2@example.com", // different
+		Subject:              "This is a new message with old UID",
+		Size:                 100,
+		SentDate:             time.Now(),
+		PreservedUID:         &preservedUID,
+		PreservedUIDValidity: &uidVal,
+	}
+
+	_, _, err = db.InsertMessageFromImporter(ctx, tx3, options2)
+
+	require.Error(t, err, "Second insert using an already-used UID must fail constraint")
+	require.ErrorIs(t, err, consts.ErrDBUniqueViolation,
+		"Expected ErrDBUniqueViolation so importer cleanly skips, but got a hard error")
+
+	// The defer tx3.Rollback(ctx) will handle cleaning up the aborted transaction.
+}
