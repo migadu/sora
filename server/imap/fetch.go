@@ -240,7 +240,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 
 	err := s.server.rdb.StreamMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet, cb, needsBodyStructure)
 	if writeErr != nil {
-		recordMetrics("failure")
+		// Bypass explicit metric tracking for socket disconnections, identically to pre-streaming behavior
 		return writeErr
 	}
 	if err != nil {
