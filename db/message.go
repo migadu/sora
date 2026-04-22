@@ -11,6 +11,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -134,30 +135,37 @@ func BitwiseToFlags(bitwiseFlags int) []imap.Flag {
 	return flags
 }
 
-func (db *Database) GetMessagesByNumSet(ctx context.Context, mailboxID int64, numSet imap.NumSet, includeBodyStructure ...bool) ([]Message, error) {
+// MessageStreamCallback is invoked sequentially for each chunk of messages fetched from the database.
+type MessageStreamCallback func(chunk []Message) error
+
+func (db *Database) StreamMessagesByNumSet(ctx context.Context, mailboxID int64, numSet imap.NumSet, cb MessageStreamCallback, includeBodyStructure ...bool) error {
 	includeBS := len(includeBodyStructure) > 0 && includeBodyStructure[0]
 	if uidSet, ok := numSet.(imap.UIDSet); ok {
-		messages, err := db.getMessagesByUIDSet(ctx, mailboxID, uidSet, includeBS)
-		if err != nil {
-			return nil, err
-		}
-		return messages, nil
+		return db.streamMessagesByUIDSet(ctx, mailboxID, uidSet, cb, includeBS)
 	}
 
 	if seqSet, ok := numSet.(imap.SeqSet); ok {
-		messages, err := db.getMessagesBySeqSet(ctx, mailboxID, seqSet, includeBS)
-		if err != nil {
-			return nil, err
-		}
-		return messages, nil
+		return db.streamMessagesBySeqSet(ctx, mailboxID, seqSet, cb, includeBS)
 	}
 
-	return nil, fmt.Errorf("unsupported NumSet type: %T", numSet)
+	return fmt.Errorf("unsupported NumSet type: %T", numSet)
 }
 
-func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, uidSet imap.UIDSet, includeBodyStructure bool) ([]Message, error) {
+func (db *Database) GetMessagesByNumSet(ctx context.Context, mailboxID int64, numSet imap.NumSet, includeBodyStructure ...bool) ([]Message, error) {
+	var allMessages []Message
+	err := db.StreamMessagesByNumSet(ctx, mailboxID, numSet, func(chunk []Message) error {
+		allMessages = append(allMessages, chunk...)
+		return nil
+	}, includeBodyStructure...)
+	if err != nil {
+		return nil, err
+	}
+	return allMessages, nil
+}
+
+func (db *Database) streamMessagesByUIDSet(ctx context.Context, mailboxID int64, uidSet imap.UIDSet, cb MessageStreamCallback, includeBodyStructure bool) error {
 	if len(uidSet) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	bsColInner := ""
@@ -183,68 +191,22 @@ func (db *Database) getMessagesByUIDSet(ctx context.Context, mailboxID int64, ui
 
 	whereClause := strings.Join(conditions, " OR ")
 
-	// Check if result set would be too large
-	countQuery := fmt.Sprintf(`
-		SELECT COUNT(*)
-		FROM messages m
-		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
-		  AND (%s)
-	`, whereClause)
-
-	var estimatedCount int64
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, countQuery, args...).Scan(&estimatedCount)
-	if err != nil {
-		return nil, fmt.Errorf("failed to count messages in UID set: %w", err)
-	}
-
-	if estimatedCount > int64(db.fetchMaxResults) {
-		return nil, fmt.Errorf("result set too large (%d messages), maximum allowed is %d", estimatedCount, db.fetchMaxResults)
-	}
-
-	if estimatedCount <= int64(db.fetchChunkSize) {
-		// Small result set: fetch in single query
-		return db.fetchMessagesByUIDSetDirect(ctx, mailboxID, whereClause, args, includeBodyStructure, bsColInner)
-	}
-
-	// Large result set: fetch in chunks
-	log.Printf("Database: Chunking UID fetch for mailbox %d (%d messages, %d per chunk)", mailboxID, estimatedCount, db.fetchChunkSize)
-	return db.fetchMessagesByUIDSetChunked(ctx, mailboxID, whereClause, args, includeBodyStructure, bsColInner, db.fetchChunkSize)
+	// Large result sets are chunked to prevent RAM spikes. We do not cap max results for streams.
+	logger.Debug("Database: Streaming UID fetch", "mailbox_id", mailboxID, "chunk_size", db.fetchChunkSize)
+	return db.streamMessagesByUIDSetChunked(ctx, mailboxID, whereClause, args, cb, includeBodyStructure, bsColInner, db.fetchChunkSize)
 }
 
-func (db *Database) fetchMessagesByUIDSetDirect(ctx context.Context, mailboxID int64, whereClause string, args []any, includeBodyStructure bool, bsColInner string) ([]Message, error) {
-	query := fmt.Sprintf(`
-		SELECT
-			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
-			m.internal_date, m.size, %[1]sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
-			0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
-		FROM messages m
-		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
-		  AND (%[2]s)
-		ORDER BY m.uid`, bsColInner, whereClause)
-
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query messages with UID set: %w", err)
-	}
-
-	messages, err := scanMessages(rows, includeBodyStructure)
-	if err != nil {
-		return nil, err
-	}
-	if err := db.HydrateMessageSequences(ctx, mailboxID, messages); err != nil {
-		return nil, err
-	}
-	return messages, nil
-}
-
-func (db *Database) fetchMessagesByUIDSetChunked(ctx context.Context, mailboxID int64, whereClause string, args []any, includeBodyStructure bool, bsColInner string, chunkSize int) ([]Message, error) {
+func (db *Database) streamMessagesByUIDSetChunked(ctx context.Context, mailboxID int64, whereClause string, args []any, cb MessageStreamCallback, includeBodyStructure bool, bsColInner string, chunkSize int) error {
 	metrics.MessageFetchChunked.WithLabelValues("uid_set").Inc()
 
-	var allMessages []Message
 	var lastUID int64
 	chunkCount := 0
+
+	defer func() {
+		if chunkCount > 0 {
+			metrics.MessageFetchChunks.WithLabelValues("uid_set").Observe(float64(chunkCount))
+		}
+	}()
 
 	for {
 		query := fmt.Sprintf(`
@@ -264,12 +226,12 @@ func (db *Database) fetchMessagesByUIDSetChunked(ctx context.Context, mailboxID 
 		argsWithLimit := append(append([]any{}, args...), lastUID, chunkSize)
 		rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, argsWithLimit...)
 		if err != nil {
-			return nil, fmt.Errorf("failed to query messages chunk after uid %d: %w", lastUID, err)
+			return fmt.Errorf("failed to query messages chunk after uid %d: %w", lastUID, err)
 		}
 
 		messages, err := scanMessages(rows, includeBodyStructure)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		if len(messages) == 0 {
@@ -277,12 +239,19 @@ func (db *Database) fetchMessagesByUIDSetChunked(ctx context.Context, mailboxID 
 		}
 
 		lastUID = int64(messages[len(messages)-1].UID)
-		allMessages = append(allMessages, messages...)
 		chunkCount++
 
 		// Check context cancellation between chunks
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("chunked fetch cancelled: %w", ctx.Err())
+			return fmt.Errorf("chunked fetch cancelled: %w", ctx.Err())
+		}
+
+		if err := db.HydrateMessageSequences(ctx, mailboxID, messages); err != nil {
+			return err
+		}
+
+		if err := cb(messages); err != nil {
+			return err
 		}
 
 		if len(messages) < chunkSize {
@@ -290,12 +259,7 @@ func (db *Database) fetchMessagesByUIDSetChunked(ctx context.Context, mailboxID 
 		}
 	}
 
-	metrics.MessageFetchChunks.WithLabelValues("uid_set").Observe(float64(chunkCount))
-
-	if err := db.HydrateMessageSequences(ctx, mailboxID, allMessages); err != nil {
-		return nil, err
-	}
-	return allMessages, nil
+	return nil
 }
 
 func (db *Database) getUIDBySeqNum(ctx context.Context, mailboxID int64, seqNum uint32) (imap.UID, error) {
@@ -312,13 +276,13 @@ func (db *Database) getUIDBySeqNum(ctx context.Context, mailboxID int64, seqNum 
 	return imap.UID(uid), err
 }
 
-func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, seqSet imap.SeqSet, includeBodyStructure bool) ([]Message, error) {
+func (db *Database) streamMessagesBySeqSet(ctx context.Context, mailboxID int64, seqSet imap.SeqSet, cb MessageStreamCallback, includeBodyStructure bool) error {
 	if len(seqSet) == 0 {
-		return nil, nil
+		return nil
 	}
 	if len(seqSet) == 1 && seqSet[0].Start == 1 && (seqSet[0].Stop == 0) {
 		log.Printf("Database: SeqSet includes all messages (1:*) for mailbox %d", mailboxID)
-		return db.fetchAllActiveMessagesRaw(ctx, mailboxID, includeBodyStructure)
+		return db.streamAllActiveMessagesRaw(ctx, mailboxID, cb, includeBodyStructure)
 	}
 
 	bsColInner := ""
@@ -359,74 +323,27 @@ func (db *Database) getMessagesBySeqSet(ctx context.Context, mailboxID int64, se
 
 	if len(conditions) == 0 {
 		// No valid sequences requested
-		return nil, nil
+		return nil
 	}
 
 	whereClause := strings.Join(conditions, " OR ")
 
-	// Check if result set would be too large
-	countQuery := fmt.Sprintf(`
-		SELECT COUNT(*)
-		FROM messages m
-		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
-		  AND (%s)
-	`, whereClause)
-
-	var estimatedCount int64
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, countQuery, args...).Scan(&estimatedCount)
-	if err != nil {
-		return nil, fmt.Errorf("failed to count messages in Seq set: %w", err)
-	}
-
-	if estimatedCount > int64(db.fetchMaxResults) {
-		return nil, fmt.Errorf("result set too large (%d messages), maximum allowed is %d", estimatedCount, db.fetchMaxResults)
-	}
-
-	if estimatedCount <= int64(db.fetchChunkSize) {
-		// Small result set: fetch in single query
-		return db.fetchMessagesBySeqSetDirect(ctx, mailboxID, whereClause, args, includeBodyStructure, bsColInner)
-	}
-
-	// Large result set: fetch in chunks
-	log.Printf("Database: Chunking Seq fetch for mailbox %d (%d messages, %d per chunk)", mailboxID, estimatedCount, db.fetchChunkSize)
-	return db.fetchMessagesBySeqSetChunked(ctx, mailboxID, whereClause, args, includeBodyStructure, bsColInner, db.fetchChunkSize)
+	// Large result sets are chunked to prevent RAM spikes. We do not cap max results for streams.
+	logger.Debug("Database: Streaming Seq fetch", "mailbox_id", mailboxID, "chunk_size", db.fetchChunkSize)
+	return db.streamMessagesBySeqSetChunked(ctx, mailboxID, whereClause, args, cb, includeBodyStructure, bsColInner, db.fetchChunkSize)
 }
 
-func (db *Database) fetchMessagesBySeqSetDirect(ctx context.Context, mailboxID int64, whereClause string, args []any, includeBodyStructure bool, bsColInner string) ([]Message, error) {
-	query := fmt.Sprintf(`
-		SELECT
-			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
-			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq,
-			0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
-		FROM messages m
-		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
-		  AND (%s)
-		ORDER BY m.uid
-	`, bsColInner, whereClause)
-
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query messages with mapped Seq set: %w", err)
-	}
-
-	messages, err := scanMessages(rows, includeBodyStructure)
-	if err != nil {
-		return nil, err
-	}
-	if err := db.HydrateMessageSequences(ctx, mailboxID, messages); err != nil {
-		return nil, err
-	}
-	return messages, nil
-}
-
-func (db *Database) fetchMessagesBySeqSetChunked(ctx context.Context, mailboxID int64, whereClause string, args []any, includeBodyStructure bool, bsColInner string, chunkSize int) ([]Message, error) {
+func (db *Database) streamMessagesBySeqSetChunked(ctx context.Context, mailboxID int64, whereClause string, args []any, cb MessageStreamCallback, includeBodyStructure bool, bsColInner string, chunkSize int) error {
 	metrics.MessageFetchChunked.WithLabelValues("seq_set").Inc()
 
-	var allMessages []Message
 	var lastUID int64
 	chunkCount := 0
+
+	defer func() {
+		if chunkCount > 0 {
+			metrics.MessageFetchChunks.WithLabelValues("seq_set").Observe(float64(chunkCount))
+		}
+	}()
 
 	for {
 		query := fmt.Sprintf(`
@@ -447,12 +364,12 @@ func (db *Database) fetchMessagesBySeqSetChunked(ctx context.Context, mailboxID 
 		argsWithLimit := append(append([]any{}, args...), lastUID, chunkSize)
 		rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, argsWithLimit...)
 		if err != nil {
-			return nil, fmt.Errorf("failed to query messages chunk after uid %d: %w", lastUID, err)
+			return fmt.Errorf("failed to query messages chunk after uid %d: %w", lastUID, err)
 		}
 
 		messages, err := scanMessages(rows, includeBodyStructure)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		if len(messages) == 0 {
@@ -460,12 +377,19 @@ func (db *Database) fetchMessagesBySeqSetChunked(ctx context.Context, mailboxID 
 		}
 
 		lastUID = int64(messages[len(messages)-1].UID)
-		allMessages = append(allMessages, messages...)
 		chunkCount++
 
 		// Check context cancellation between chunks
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("chunked fetch cancelled: %w", ctx.Err())
+			return fmt.Errorf("chunked fetch cancelled: %w", ctx.Err())
+		}
+
+		if err := db.HydrateMessageSequences(ctx, mailboxID, messages); err != nil {
+			return err
+		}
+
+		if err := cb(messages); err != nil {
+			return err
 		}
 
 		if len(messages) < chunkSize {
@@ -473,74 +397,15 @@ func (db *Database) fetchMessagesBySeqSetChunked(ctx context.Context, mailboxID 
 		}
 	}
 
-	metrics.MessageFetchChunks.WithLabelValues("seq_set").Observe(float64(chunkCount))
-
-	if err := db.HydrateMessageSequences(ctx, mailboxID, allMessages); err != nil {
-		return nil, err
-	}
-	return allMessages, nil
+	return nil
 }
 
-func (db *Database) fetchAllActiveMessagesRaw(ctx context.Context, mailboxID int64, includeBodyStructure bool) ([]Message, error) {
-	// Filter to uploaded messages only (same as getMessagesBySeqSet / getMessagesByUIDSet).
-	// This path handles the rare edge-case SeqSet "1:*" where the wildcard was not
-	// resolved (session count == 0).  See getMessagesByUIDSet for the full rationale.
-
-	// Check message count first
-	var messageCount int64
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT COUNT(*) FROM messages
-		WHERE mailbox_id = $1 AND expunged_at IS NULL AND uploaded = true
-	`, mailboxID).Scan(&messageCount)
-	if err != nil {
-		return nil, fmt.Errorf("fetchAllActiveMessagesRaw: failed to count messages: %w", err)
-	}
-
-	if messageCount > int64(db.fetchMaxResults) {
-		return nil, fmt.Errorf("result set too large (%d messages), maximum allowed is %d", messageCount, db.fetchMaxResults)
-	}
-
-	if messageCount <= int64(db.fetchChunkSize) {
-		// Small mailbox: fetch in single query
-		return db.fetchAllActiveMessagesRawDirect(ctx, mailboxID, includeBodyStructure)
-	}
-
-	// Large mailbox: fetch in chunks
-	log.Printf("Database: Chunking SeqSet 1:* fetch for mailbox %d (%d messages, %d per chunk)", mailboxID, messageCount, db.fetchChunkSize)
-	return db.fetchAllActiveMessagesRawChunked(ctx, mailboxID, includeBodyStructure, db.fetchChunkSize)
+func (db *Database) streamAllActiveMessagesRaw(ctx context.Context, mailboxID int64, cb MessageStreamCallback, includeBodyStructure bool) error {
+	logger.Debug("Database: Streaming SeqSet 1:* fetch", "mailbox_id", mailboxID, "chunk_size", db.fetchChunkSize)
+	return db.streamAllActiveMessagesRawChunked(ctx, mailboxID, cb, includeBodyStructure, db.fetchChunkSize)
 }
 
-func (db *Database) fetchAllActiveMessagesRawDirect(ctx context.Context, mailboxID int64, includeBodyStructure bool) ([]Message, error) {
-	bsCol := ""
-	if includeBodyStructure {
-		bsCol = "m.body_structure, "
-	}
-
-	query := fmt.Sprintf(`
-		SELECT
-			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
-			m.internal_date, m.size, %sm.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
-		FROM messages m
-		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL AND m.uploaded = true
-		ORDER BY m.uid ASC
-	`, bsCol)
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID)
-	if err != nil {
-		return nil, fmt.Errorf("fetchAllActiveMessagesRaw: failed to query: %w", err)
-	}
-	messages, err := scanMessages(rows, includeBodyStructure)
-	if err != nil {
-		return nil, err
-	}
-	if err := db.HydrateMessageSequences(ctx, mailboxID, messages); err != nil {
-		return nil, err
-	}
-	return messages, nil
-}
-
-func (db *Database) fetchAllActiveMessagesRawChunked(ctx context.Context, mailboxID int64, includeBodyStructure bool, chunkSize int) ([]Message, error) {
+func (db *Database) streamAllActiveMessagesRawChunked(ctx context.Context, mailboxID int64, cb MessageStreamCallback, includeBodyStructure bool, chunkSize int) error {
 	metrics.MessageFetchChunked.WithLabelValues("all_messages").Inc()
 
 	bsCol := ""
@@ -548,9 +413,15 @@ func (db *Database) fetchAllActiveMessagesRawChunked(ctx context.Context, mailbo
 		bsCol = "m.body_structure, "
 	}
 
-	var allMessages []Message
 	var lastUID int64
+	var nextSeqNum uint32 = 1
 	chunkCount := 0
+
+	defer func() {
+		if chunkCount > 0 {
+			metrics.MessageFetchChunks.WithLabelValues("all_messages").Observe(float64(chunkCount))
+		}
+	}()
 
 	for {
 		query := fmt.Sprintf(`
@@ -568,12 +439,12 @@ func (db *Database) fetchAllActiveMessagesRawChunked(ctx context.Context, mailbo
 
 		rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, lastUID, chunkSize)
 		if err != nil {
-			return nil, fmt.Errorf("fetchAllActiveMessagesRaw: failed to query chunk after uid %d: %w", lastUID, err)
+			return fmt.Errorf("fetchAllActiveMessagesRaw: failed to query chunk after uid %d: %w", lastUID, err)
 		}
 
 		messages, err := scanMessages(rows, includeBodyStructure)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		if len(messages) == 0 {
@@ -581,12 +452,22 @@ func (db *Database) fetchAllActiveMessagesRawChunked(ctx context.Context, mailbo
 		}
 
 		lastUID = int64(messages[len(messages)-1].UID)
-		allMessages = append(allMessages, messages...)
 		chunkCount++
 
 		// Check context cancellation between chunks
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("chunked fetch cancelled: %w", ctx.Err())
+			return fmt.Errorf("chunked fetch cancelled: %w", ctx.Err())
+		}
+
+		// Because we comprehensively requested all active messages sequentially from UID 0
+		// tracking their absolute sequential order natively skips any need for DB re-queries!
+		for i := range messages {
+			messages[i].Seq = nextSeqNum
+			nextSeqNum++
+		}
+
+		if err := cb(messages); err != nil {
+			return err
 		}
 
 		if len(messages) < chunkSize {
@@ -594,12 +475,7 @@ func (db *Database) fetchAllActiveMessagesRawChunked(ctx context.Context, mailbo
 		}
 	}
 
-	metrics.MessageFetchChunks.WithLabelValues("all_messages").Observe(float64(chunkCount))
-
-	if err := db.HydrateMessageSequences(ctx, mailboxID, allMessages); err != nil {
-		return nil, err
-	}
-	return allMessages, nil
+	return nil
 }
 
 func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {

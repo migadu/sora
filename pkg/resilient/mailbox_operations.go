@@ -62,6 +62,14 @@ func (rd *ResilientDatabase) GetMessagesByNumSetWithRetry(ctx context.Context, m
 	return result.([]db.Message), nil
 }
 
+func (rd *ResilientDatabase) StreamMessagesByNumSetWithRetry(ctx context.Context, mailboxID int64, numSet imap.NumSet, cb db.MessageStreamCallback, includeBodyStructure ...bool) error {
+	op := func(ctx context.Context) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(false).StreamMessagesByNumSet(ctx, mailboxID, numSet, cb, includeBodyStructure...)
+	}
+	_, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
+	return err
+}
+
 func (rd *ResilientDatabase) GetMailboxSummaryWithRetry(ctx context.Context, mailboxID int64) (*db.MailboxSummary, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetMailboxSummary(ctx, mailboxID)

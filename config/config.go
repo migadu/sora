@@ -59,7 +59,6 @@ type DatabaseConfig struct {
 	WriteTimeout     string                  `toml:"write_timeout"`     // Timeout for write operations (default: "10s")
 	MigrationTimeout string                  `toml:"migration_timeout"` // Timeout for auto-migrations at startup (default: "2m")
 	FetchChunkSize   int                     `toml:"fetch_chunk_size"`  // Number of messages to fetch per chunk for large result sets (default: 5000)
-	FetchMaxResults  int                     `toml:"fetch_max_results"` // Maximum number of messages allowed in a single fetch operation (default: 20000)
 	Write            *DatabaseEndpointConfig `toml:"write"`             // Write database configuration
 	Read             *DatabaseEndpointConfig `toml:"read"`              // Read database configuration (can have multiple hosts for load balancing)
 	PoolTypeOverride string                  `toml:"-"`                 // Internal: Override pool type in logs (not in config file)
@@ -132,14 +131,6 @@ func (d *DatabaseConfig) GetFetchChunkSize() int {
 		return 5000 // Default: 5k messages per chunk
 	}
 	return d.FetchChunkSize
-}
-
-// GetFetchMaxResults returns the maximum number of messages allowed in a single fetch
-func (d *DatabaseConfig) GetFetchMaxResults() int {
-	if d.FetchMaxResults <= 0 {
-		return 20000 // Default: 20k message hard cap to prevent massive RAM spikes
-	}
-	return d.FetchMaxResults
 }
 
 // S3Config holds S3 configuration.

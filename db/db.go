@@ -130,7 +130,6 @@ type Database struct {
 	uidValidityMismatchLoggedMap sync.Map         // Tracks mailbox IDs that have already logged UIDVALIDITY mismatch (mailboxID -> bool)
 	AccountDomainCache           sync.Map         // Cache for account_id -> domain string
 	fetchChunkSize               int              // Number of messages to fetch per chunk for large result sets
-	fetchMaxResults              int              // Maximum number of messages allowed in a single fetch operation
 }
 
 // GetAccountDomain retrieves the domain for an account, using an in-memory cache
@@ -696,12 +695,11 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 	}
 
 	db := &Database{
-		WritePool:       writePool,
-		ReadPool:        readPool,
-		WriteFailover:   writeFailover,
-		ReadFailover:    readFailover,
-		fetchChunkSize:  dbConfig.GetFetchChunkSize(),
-		fetchMaxResults: dbConfig.GetFetchMaxResults(),
+		WritePool:      writePool,
+		ReadPool:       readPool,
+		WriteFailover:  writeFailover,
+		ReadFailover:   readFailover,
+		fetchChunkSize: dbConfig.GetFetchChunkSize(),
 	}
 
 	if runMigrations {

@@ -124,66 +124,14 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	release()
 
 	needsBodyStructure := options.BodyStructure != nil
-	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet, needsBodyStructure)
-	if err != nil {
-		recordMetrics("failure")
-		return s.internalError("failed to retrieve messages: %v", err)
-	}
 
-	// Check if mailbox changed during our operation
+	// Check if mailbox changed IMMEDIATELY after acquiring the read lock.
 	if modSeqSnapshot > 0 && s.currentHighestModSeq.Load() > modSeqSnapshot {
-		s.WarnLog("mailbox changed during FETCH operation", "old_modseq", modSeqSnapshot, "new_modseq", s.currentHighestModSeq.Load())
-		// For sequence sets, this could mean we fetched wrong messages
+		s.WarnLog("mailbox changed during FETCH operation startup", "old_modseq", modSeqSnapshot, "new_modseq", s.currentHighestModSeq.Load())
 		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
-			// Re-decode and re-fetch to ensure consistency
-			decodedNumSet = s.decodeNumSet(numSet) // This will re-lock, but it's a rare case
-			messages, err = s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet, needsBodyStructure)
-			if err != nil {
-				recordMetrics("failure")
-				return s.internalError("failed to retrieve messages: %v", err)
-			}
+			// Re-decode to ensure consistency before we lock-in the streaming pipeline
+			decodedNumSet = s.decodeNumSet(numSet)
 		}
-	}
-
-	if len(messages) == 0 {
-		recordMetrics("success")
-		return nil
-	}
-
-	// CONDSTORE functionality - only process if capability is enabled
-	if s.GetCapabilities().Has(imap.CapCondStore) && options.ChangedSince > 0 {
-		s.DebugLog("CONDSTORE FETCH with CHANGEDSINCE", "changed_since", options.ChangedSince)
-		var filteredMessages []db.Message
-
-		for _, msg := range messages {
-			var highestModSeq int64
-			highestModSeq = msg.CreatedModSeq
-
-			if msg.UpdatedModSeq != nil && *msg.UpdatedModSeq > highestModSeq {
-				highestModSeq = *msg.UpdatedModSeq
-			}
-
-			if msg.ExpungedModSeq != nil && *msg.ExpungedModSeq > highestModSeq {
-				highestModSeq = *msg.ExpungedModSeq
-			}
-
-			if uint64(highestModSeq) > options.ChangedSince {
-				s.DebugLog("CONDSTORE including message", "uid", msg.UID, "modseq", highestModSeq, "changed_since", options.ChangedSince)
-				filteredMessages = append(filteredMessages, msg)
-			} else {
-				s.DebugLog("CONDSTORE skipping message", "uid", msg.UID, "modseq", highestModSeq, "changed_since", options.ChangedSince)
-			}
-		}
-
-		messages = filteredMessages
-	}
-
-	// We don't need to check mailbox validity again since we'll use the snapshot consistently
-	// and will detect any issues with the individual message sequence numbers
-
-	if sessionTrackerSnapshot == nil {
-		s.DebugLog("session tracker is nil, cannot process messages")
-		return nil
 	}
 
 	// Determine if this FETCH implicitly marks messages as \Seen (any non-PEEK body section)
@@ -195,57 +143,102 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 		}
 	}
 
-	if markSeen {
-		var uidsToMarkSeen []imap.UID
-		for _, msg := range messages {
-			seen := false
-			systemFlags, _ := db.SplitFlags(db.BitwiseToFlags(msg.BitwiseFlags))
-			for _, flag := range systemFlags {
-				if flag == imap.FlagSeen {
-					seen = true
-					break
-				}
-			}
-			if !seen {
-				uidsToMarkSeen = append(uidsToMarkSeen, msg.UID)
-			}
-		}
-
-		if len(uidsToMarkSeen) > 0 {
-			_, err := s.server.rdb.AddMessageFlagsBatchWithRetry(s.ctx, uidsToMarkSeen, selectedMailboxID, []imap.Flag{imap.FlagSeen})
-			if err != nil {
-				s.DebugLog("failed to batch mark messages as seen", "error", err)
-			} else {
-				// Update in-memory models immediately so the fetch response has the flag
-				for i := range messages {
-					seen := false
-					flags := db.BitwiseToFlags(messages[i].BitwiseFlags)
-					for _, f := range flags {
-						if f == imap.FlagSeen {
-							seen = true
-							break
-						}
-					}
-					if !seen {
-						messages[i].BitwiseFlags = db.FlagsToBitwise(append(flags, imap.FlagSeen))
-					}
-				}
-			}
-		}
+	if sessionTrackerSnapshot == nil {
+		s.DebugLog("session tracker is nil, cannot process messages")
+		return nil
 	}
 
-	// Process all messages without repeatedly acquiring the mutex
 	var totalBytesFetched int64
-	for _, msg := range messages {
-		totalBytesFetched += int64(msg.Size)
-		metrics.MessageThroughput.WithLabelValues("imap", "fetched", "success").Inc()
-		if s.IMAPUser != nil {
-			metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
+	cb := func(messages []db.Message) error {
+		// CONDSTORE functionality - only process if capability is enabled
+		if s.GetCapabilities().Has(imap.CapCondStore) && options.ChangedSince > 0 {
+			s.DebugLog("CONDSTORE FETCH with CHANGEDSINCE", "changed_since", options.ChangedSince)
+			var filteredMessages []db.Message
+
+			for _, msg := range messages {
+				var highestModSeq int64
+				highestModSeq = msg.CreatedModSeq
+
+				if msg.UpdatedModSeq != nil && *msg.UpdatedModSeq > highestModSeq {
+					highestModSeq = *msg.UpdatedModSeq
+				}
+
+				if msg.ExpungedModSeq != nil && *msg.ExpungedModSeq > highestModSeq {
+					highestModSeq = *msg.ExpungedModSeq
+				}
+
+				if uint64(highestModSeq) > options.ChangedSince {
+					s.DebugLog("CONDSTORE including message", "uid", msg.UID, "modseq", highestModSeq, "changed_since", options.ChangedSince)
+					filteredMessages = append(filteredMessages, msg)
+				} else {
+					s.DebugLog("CONDSTORE skipping message", "uid", msg.UID, "modseq", highestModSeq, "changed_since", options.ChangedSince)
+				}
+			}
+
+			messages = filteredMessages
 		}
-		// Use the previously captured sessionTrackerSnapshot for all messages
-		if err := s.writeMessageFetchData(w, &msg, options, selectedMailboxID, sessionTrackerSnapshot); err != nil {
-			return err
+
+		if len(messages) == 0 {
+			return nil
 		}
+
+		if markSeen {
+			var uidsToMarkSeen []imap.UID
+			for _, msg := range messages {
+				seen := false
+				systemFlags, _ := db.SplitFlags(db.BitwiseToFlags(msg.BitwiseFlags))
+				for _, flag := range systemFlags {
+					if flag == imap.FlagSeen {
+						seen = true
+						break
+					}
+				}
+				if !seen {
+					uidsToMarkSeen = append(uidsToMarkSeen, msg.UID)
+				}
+			}
+
+			if len(uidsToMarkSeen) > 0 {
+				_, err := s.server.rdb.AddMessageFlagsBatchWithRetry(s.ctx, uidsToMarkSeen, selectedMailboxID, []imap.Flag{imap.FlagSeen})
+				if err != nil {
+					s.DebugLog("failed to batch mark messages as seen", "error", err)
+				} else {
+					// Update in-memory models immediately so the fetch response has the flag
+					for i := range messages {
+						seen := false
+						flags := db.BitwiseToFlags(messages[i].BitwiseFlags)
+						for _, f := range flags {
+							if f == imap.FlagSeen {
+								seen = true
+								break
+							}
+						}
+						if !seen {
+							messages[i].BitwiseFlags = db.FlagsToBitwise(append(flags, imap.FlagSeen))
+						}
+					}
+				}
+			}
+		}
+
+		for _, msg := range messages {
+			totalBytesFetched += int64(msg.Size)
+			metrics.MessageThroughput.WithLabelValues("imap", "fetched", "success").Inc()
+			if s.IMAPUser != nil {
+				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
+			}
+			// Use the previously captured sessionTrackerSnapshot for all messages
+			if err := s.writeMessageFetchData(w, &msg, options, selectedMailboxID, sessionTrackerSnapshot); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	err := s.server.rdb.StreamMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet, cb, needsBodyStructure)
+	if err != nil {
+		recordMetrics("failure")
+		return s.internalError("failed to retrieve messages: %v", err)
 	}
 
 	if s.IMAPUser != nil {

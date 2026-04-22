@@ -118,28 +118,6 @@ func TestChunkedMessageFetch(t *testing.T) {
 		t.Logf("Fetched %d messages via Seq 1:* in %v (should have used chunking)", len(messages), elapsed)
 	})
 
-	// Test 4: Test max results limit
-	t.Run("max_results_limit", func(t *testing.T) {
-		// Temporarily set a very low limit
-		originalMaxResults := db.fetchMaxResults
-		db.fetchMaxResults = 500
-		defer func() { db.fetchMaxResults = originalMaxResults }()
-
-		uidSet := imap.UIDSet{imap.UIDRange{Start: 1, Stop: imap.UID(messageCount)}}
-
-		_, err := db.GetMessagesByNumSet(ctx, mailboxID, uidSet)
-		if err == nil {
-			t.Fatal("Expected error for exceeding max results limit, got nil")
-		}
-
-		expectedError := fmt.Sprintf("result set too large (%d messages), maximum allowed is %d", messageCount, 500)
-		if err.Error() != expectedError {
-			t.Errorf("Expected error %q, got %q", expectedError, err.Error())
-		}
-
-		t.Logf("Correctly rejected fetch exceeding limit: %v", err)
-	})
-
 	// Test 5: Verify message ordering is preserved through chunking
 	t.Run("message_ordering", func(t *testing.T) {
 		uidSet := imap.UIDSet{imap.UIDRange{Start: 1, Stop: imap.UID(messageCount)}}
