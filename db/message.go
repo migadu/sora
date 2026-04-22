@@ -781,59 +781,32 @@ func hydrateSequencesCore[T any](
 		uids = append(uids, int64(uid))
 	}
 
-	distance := maxUID - minUID
-	// Use Window strategy unconditionally for large arrays (> 200 items) to prevent O(N) timeout risks
-	// from too many index subqueries. For smaller arrays, use Window only if they are grouped densely.
-	useWindowStrategy := len(messages) > 200 || (len(messages) > 0 && uint64(distance) < uint64(len(messages))*50)
-
-	var rows pgx.Rows
-	var err error
-
-	if useWindowStrategy {
-		// Optimized sequence hydration using batch approach:
-		// 1. Find min/max UID in our target set
-		// 2. Count how many messages exist below min UID (base offset)
-		// 3. Use ROW_NUMBER only on the UID range containing our targets
-		// This is much faster than full-mailbox ROW_NUMBER for dense sequence fetches.
-		rows, err = db.GetReadPoolWithContext(ctx).Query(ctx, `
-			WITH target_uids AS (
-				SELECT unnest($2::bigint[]) AS uid
-			),
-			uid_range AS (
-				SELECT MIN(uid) as min_uid, MAX(uid) as max_uid FROM target_uids
-			),
-			base_offset AS (
-				SELECT COUNT(*)::bigint as offset
-				FROM messages
-				WHERE mailbox_id = $1
-				  AND expunged_at IS NULL
-				  AND uid < (SELECT min_uid FROM uid_range)
-			),
-			windowed AS (
-				SELECT
-					uid,
-					ROW_NUMBER() OVER(ORDER BY uid) as relative_seq
-				FROM messages
-				WHERE mailbox_id = $1
-				  AND expunged_at IS NULL
-				  AND uid >= (SELECT min_uid FROM uid_range)
-				  AND uid <= (SELECT max_uid FROM uid_range)
-			)
-			SELECT w.uid, (w.relative_seq + b.offset)::bigint as seqnum
-			FROM windowed w, base_offset b
-			WHERE w.uid = ANY($2::bigint[])
-		`, mailboxID, uids)
-	} else {
-		// Sparse sequence hydration using indexed lateral approach.
-		rows, err = db.GetReadPoolWithContext(ctx).Query(ctx, `
-			SELECT t.uid,
-				   (SELECT COUNT(*) + 1 
-					FROM messages m 
-					WHERE m.mailbox_id = $1 AND expunged_at IS NULL AND m.uid < t.uid
-				   ) as seqnum
+	// High-performance sequence hydration for arbitrary arrays (dense or sparse).
+	// By calculating the delta (gap) between consecutive UIDs and computing a running sum,
+	// PostgreSQL sweeps linearly forward over the B-Tree index exactly once, rather than
+	// N distinct scalar subqueries from 0, and avoids O(N*logN) ROW_NUMBER() materialize cliffs
+	// when min-to-max distance is huge.
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+		WITH target_uids AS (
+			SELECT uid,
+			       LAG(uid, 1, 0::bigint) OVER (ORDER BY uid) as prev_uid
 			FROM unnest($2::bigint[]) as t(uid)
-		`, mailboxID, uids)
-	}
+		),
+		gaps AS (
+			SELECT t.uid,
+			       (SELECT COUNT(*)::bigint 
+			        FROM messages m 
+			        WHERE m.mailbox_id = $1 
+			          AND m.expunged_at IS NULL 
+			          AND m.uid > t.prev_uid 
+			          AND m.uid <= t.uid
+			       ) as gap_count
+			FROM target_uids t
+		)
+		SELECT uid,
+		       SUM(gap_count) OVER (ORDER BY uid)::bigint as seqnum
+		FROM gaps
+	`, mailboxID, uids)
 
 	if err != nil {
 		return fmt.Errorf("failed to query sequence streams: %w", err)
