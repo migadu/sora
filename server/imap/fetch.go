@@ -149,6 +149,8 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	}
 
 	var totalBytesFetched int64
+	var writeErr error
+
 	cb := func(messages []db.Message) error {
 		// CONDSTORE functionality - only process if capability is enabled
 		if s.GetCapabilities().Has(imap.CapCondStore) && options.ChangedSince > 0 {
@@ -229,6 +231,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 			}
 			// Use the previously captured sessionTrackerSnapshot for all messages
 			if err := s.writeMessageFetchData(w, &msg, options, selectedMailboxID, sessionTrackerSnapshot); err != nil {
+				writeErr = err
 				return err
 			}
 		}
@@ -236,6 +239,10 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	}
 
 	err := s.server.rdb.StreamMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet, cb, needsBodyStructure)
+	if writeErr != nil {
+		recordMetrics("failure")
+		return writeErr
+	}
 	if err != nil {
 		recordMetrics("failure")
 		return s.internalError("failed to retrieve messages: %v", err)
