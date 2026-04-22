@@ -58,6 +58,16 @@ func (m *mockUploaderDB) IsContentHashUploadedWithRetry(ctx context.Context, con
 	args := m.Called(ctx, contentHash, accountID)
 	return args.Bool(0), args.Error(1)
 }
+func (m *mockUploaderDB) ExecuteWithS3ObjectSessionLock(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error {
+	args := m.Called(ctx, contentHash, accountID, executionFunc)
+	if args.Bool(0) {
+		err := executionFunc()
+		if err != nil {
+			return err
+		}
+	}
+	return args.Error(1)
+}
 func (m *mockUploaderDB) CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64) error {
 	args := m.Called(ctx, contentHash, accountID)
 	return args.Error(0)
@@ -265,6 +275,11 @@ func TestProcessSingleUpload_S3ExistsButLocalFileMissing_SelfHeals(t *testing.T)
 		Return(serverAddress(t, "user@somedomain.com"), nil)
 	mockDB.On("IsContentHashUploadedWithRetry", mock.Anything, contentHash, accountID).
 		Return(false, nil)
+
+	// Since we mock S3 existence as true, ExistsWithRetry returns true, but we actually
+	// DO need to simulate the execution of ExecuteWithS3ObjectSessionLock since the uploader runs it.
+	mockDB.On("ExecuteWithS3ObjectSessionLock", mock.Anything, contentHash, accountID, mock.Anything).
+		Return(true, nil)
 
 	// S3: object already exists (the first uploader attempt PUT it there).
 	mockS3.On("ExistsWithRetry", mock.Anything, mock.AnythingOfType("string")).

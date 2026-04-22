@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"time"
 
@@ -46,6 +47,60 @@ func (d *Database) ReleaseCleanupLock(ctx context.Context, tx pgx.Tx) error {
 	// Transaction-scoped locks (pg_advisory_xact_lock) are automatically released
 	// on COMMIT or ROLLBACK, so we don't need to explicitly unlock.
 	return nil
+}
+
+// GetS3ObjectLockID generates a stable int64 lock ID for a given object pair.
+// Uses FNV-1a to ensure consistency across nodes.
+func GetS3ObjectLockID(accountID int64, contentHash string) int64 {
+	h := fnv.New64a()
+	h.Write([]byte(fmt.Sprintf("%d:%s", accountID, contentHash)))
+	return int64(h.Sum64())
+}
+
+// AcquireS3ObjectLock attempts to acquire a transaction-scoped advisory lock for a specific S3 object.
+func (d *Database) AcquireS3ObjectLock(ctx context.Context, tx pgx.Tx, accountID int64, contentHash string) error {
+	lockID := GetS3ObjectLockID(accountID, contentHash)
+	_, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", lockID)
+	return err
+}
+
+// IsS3ObjectOrphan performs a fast query inside a transaction to double-check
+// if any active messages or pending uploads exist for the given S3 object.
+// Note: It does NOT explicitly check for (uploaded = FALSE AND expunged_at IS NULL),
+// because such records inherently imply a `pending_uploads` row exists that will be
+// caught by the pending check, keeping this check computationally lightweight.
+func (d *Database) IsS3ObjectOrphan(ctx context.Context, tx pgx.Tx, accountID int64, contentHash string, gracePeriod time.Duration) (bool, error) {
+	threshold := time.Now().Add(-gracePeriod).UTC()
+
+	var isOrphan bool
+	err := tx.QueryRow(ctx, `
+		SELECT 
+			(active.found IS NULL AND recent.found IS NULL AND pending.found IS NULL) as is_orphan
+		FROM 
+			(SELECT 1 as dummy) d
+		LEFT JOIN LATERAL (
+			SELECT 1 as found FROM messages m_active
+			WHERE m_active.account_id = $1
+			  AND m_active.content_hash = $2
+			  AND m_active.expunged_at IS NULL
+			LIMIT 1
+		) active ON true
+		LEFT JOIN LATERAL (
+			SELECT 1 as found FROM messages m_recent
+			WHERE m_recent.account_id = $1
+			  AND m_recent.content_hash = $2
+			  AND m_recent.expunged_at >= $3
+			LIMIT 1
+		) recent ON true
+		LEFT JOIN LATERAL (
+			SELECT 1 as found FROM pending_uploads pu
+			WHERE pu.account_id = $1
+			  AND pu.content_hash = $2
+			LIMIT 1
+		) pending ON true
+	`, accountID, contentHash, threshold).Scan(&isOrphan)
+
+	return isOrphan, err
 }
 
 // ExpungeOldMessages marks messages older than the specified duration as expunged

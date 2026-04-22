@@ -25,6 +25,7 @@ type mockDB struct {
 	ExhaustUploadAttemptsWithRetryFunc         func(ctx context.Context, contentHash string, accountID int64, maxAttempts int) error
 	GetPrimaryEmailForAccountWithRetryFunc     func(ctx context.Context, accountID int64) (server.Address, error)
 	IsContentHashUploadedWithRetryFunc         func(ctx context.Context, contentHash string, accountID int64) (bool, error)
+	ExecuteWithS3ObjectSessionLockFunc         func(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error
 	CompleteS3UploadWithRetryFunc              func(ctx context.Context, contentHash string, accountID int64) error
 	PendingUploadExistsWithRetryFunc           func(ctx context.Context, contentHash string, accountID int64) (bool, error)
 	GetFailedUploadsWithRetryFunc              func(ctx context.Context, maxAttempts int, limit int) ([]db.PendingUpload, error)
@@ -61,6 +62,21 @@ func (m *mockDB) IsContentHashUploadedWithRetry(ctx context.Context, contentHash
 
 func (m *mockDB) CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64) error {
 	return m.CompleteS3UploadWithRetryFunc(ctx, contentHash, accountID)
+}
+
+func (m *mockDB) ExecuteWithS3ObjectSessionLock(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error {
+	if m.ExecuteWithS3ObjectSessionLockFunc != nil {
+		return m.ExecuteWithS3ObjectSessionLockFunc(ctx, contentHash, accountID, executionFunc)
+	}
+	// Fallback behavior: just execute the operation
+	err := executionFunc()
+	if err != nil {
+		return err
+	}
+	// Note: We leave CompleteS3UploadWithRetry up to the test to verify usually.
+	// We do NOT explicitly call it here because `executionFunc` inside UploaderWorker
+	// calls CompleteS3UploadWithRetry internally now.
+	return nil
 }
 
 func (m *mockDB) PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {

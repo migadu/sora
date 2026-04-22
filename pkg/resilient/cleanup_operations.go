@@ -2,13 +2,53 @@ package resilient
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/db"
 )
 
 // --- Cleanup Worker Wrappers ---
+
+func (rd *ResilientDatabase) ExecuteS3DeleteTxWithRetry(ctx context.Context, accountID int64, contentHash string, gracePeriod time.Duration, s3DeleteFunc func() error) (bool, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		// Acquire transaction-level lock
+		lockErr := rd.getOperationalDatabaseForOperation(true).AcquireS3ObjectLock(ctx, tx, accountID, contentHash)
+		if lockErr != nil {
+			return false, lockErr
+		}
+
+		// Double-check if object is still an orphan
+		isOrphan, orphanErr := rd.getOperationalDatabaseForOperation(true).IsS3ObjectOrphan(ctx, tx, accountID, contentHash, gracePeriod)
+		if orphanErr != nil {
+			return false, orphanErr
+		}
+
+		if !isOrphan {
+			return false, nil // Skip S3 deletion!
+		}
+
+		// Execute S3 deletion
+		s3Err := s3DeleteFunc()
+		if s3Err != nil {
+			var awsErr *awshttp.ResponseError
+			if errors.As(s3Err, &awsErr) && awsErr.HTTPStatusCode() == 404 {
+				return true, nil // Object already deleted, safe to treat as success & clean up DB
+			}
+			return false, s3Err
+		}
+
+		return true, nil
+	}
+
+	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
 
 func (rd *ResilientDatabase) AcquireCleanupLockWithRetry(ctx context.Context) (bool, error) {
 	// Transaction-scoped advisory lock - use executeWriteInTxWithRetry

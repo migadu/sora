@@ -14,7 +14,6 @@ package cleaner
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -26,7 +25,6 @@ import (
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/resilient"
 
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/migadu/sora/storage"
 )
 
@@ -41,6 +39,7 @@ type DatabaseManager interface {
 	CleanupOldVacationResponsesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
+	ExecuteS3DeleteTxWithRetry(ctx context.Context, accountID int64, contentHash string, gracePeriod time.Duration, s3DeleteFunc func() error) (bool, error)
 	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
 	PruneOldMessageVectorsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUnusedFTSHashesWithRetry(ctx context.Context, limit int) ([]string, error)
@@ -288,24 +287,26 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 			}
 
 			s3Key := helpers.NewS3Key(candidate.S3Domain, candidate.S3Localpart, candidate.ContentHash)
-			s3Err := w.s3.DeleteWithRetry(ctx, s3Key)
 
-			isS3ObjectNotFoundError := false
-			var awsErr *awshttp.ResponseError
-			if s3Err != nil && errors.As(s3Err, &awsErr) {
-				isS3ObjectNotFoundError = (awsErr.HTTPStatusCode() == 404)
-			}
+			// Use transaction-scoped advisory lock and double-check to prevent race condition
+			// where a new message arrives right before the S3 object is deleted.
+			s3Deleted, txErr := w.rdb.ExecuteS3DeleteTxWithRetry(ctx, candidate.AccountID, candidate.ContentHash, w.gracePeriod, func() error {
+				return w.s3.DeleteWithRetry(ctx, s3Key)
+			})
 
-			if s3Err != nil && !isS3ObjectNotFoundError {
-				logger.Error("Cleanup: Failed to delete S3 object", "key", s3Key, "error", s3Err)
+			if txErr != nil {
+				// The S3 delete failed or the lock acquisition failed.
+				logger.Error("Cleaner: Failed to delete S3 object or acquire lock", "key", s3Key, "error", txErr)
 				failedS3Keys = append(failedS3Keys, s3Key)
 				continue // Skip to the next candidate
 			}
 
-			if isS3ObjectNotFoundError {
-				logger.Info("Cleanup: S3 object not found - proceeding with DB cleanup", "key", s3Key)
+			if s3Deleted {
+				successfulDeletes = append(successfulDeletes, candidate)
+			} else {
+				// isOrphan check inside the lock returned false, or something prevented deletion
+				logger.Info("Cleanup: object is no longer an orphan, skipping S3 deletion", "hash", candidate.ContentHash)
 			}
-			successfulDeletes = append(successfulDeletes, candidate)
 		}
 
 		if len(successfulDeletes) > 0 {

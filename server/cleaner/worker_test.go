@@ -3,12 +3,9 @@ package cleaner
 import (
 	"context"
 	"errors"
-	"net/http"
 	"testing"
 	"time"
 
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/migadu/sora/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -51,6 +48,10 @@ func (m *mockDatabase) CleanupOldHealthStatusesWithRetry(ctx context.Context, re
 func (m *mockDatabase) GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error) {
 	args := m.Called(ctx, gracePeriod, limit)
 	return args.Get(0).([]db.UserScopedObjectForCleanup), args.Error(1)
+}
+func (m *mockDatabase) ExecuteS3DeleteTxWithRetry(ctx context.Context, accountID int64, contentHash string, gracePeriod time.Duration, s3DeleteFunc func() error) (bool, error) {
+	args := m.Called(ctx, accountID, contentHash, gracePeriod, s3DeleteFunc)
+	return args.Bool(0), args.Error(1)
 }
 func (m *mockDatabase) DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error) {
 	args := m.Called(ctx, objects)
@@ -139,15 +140,16 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 		{ContentHash: "hash2-not-found", S3Domain: "example.com", S3Localpart: "user2"},
 	}
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, gracePeriod, db.BATCH_PURGE_SIZE).Return(userScopedCandidates, nil).Once()
-	mockS3.On("DeleteWithRetry", ctx, "example.com/user1/hash1").Return(nil).Once()
-	// Create a proper AWS HTTP 404 error
-	notFoundErr := &awshttp.ResponseError{
-		ResponseError: &smithyhttp.ResponseError{
-			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 404}},
-			Err:      errors.New("not found"),
-		},
-	}
-	mockS3.On("DeleteWithRetry", ctx, "example.com/user2/hash2-not-found").Return(notFoundErr).Once()
+
+	// hash1: ExecuteS3DeleteTxWithRetry acquires lock, confirms orphan, deletes S3 → success
+	mockDB.On("ExecuteS3DeleteTxWithRetry", ctx, int64(0), "hash1", gracePeriod, mock.AnythingOfType("func() error")).
+		Return(true, nil).Once()
+
+	// hash2-not-found: ExecuteS3DeleteTxWithRetry acquires lock, confirms orphan, calls s3DeleteFunc → S3 returns 404
+	// → the real implementation catches 404 internally and returns (true, nil)
+	mockDB.On("ExecuteS3DeleteTxWithRetry", ctx, int64(0), "hash2-not-found", gracePeriod, mock.AnythingOfType("func() error")).
+		Return(true, nil).Once()
+
 	mockDB.On("DeleteExpungedMessagesByS3KeyPartsBatchWithRetry", ctx, userScopedCandidates).Return(int64(2), nil).Once()
 
 	// Phase 2a2: FTS vector pruning (skipped since ftsRetention = 0)
@@ -245,7 +247,9 @@ func TestCleanupWorker_RunOnce_S3DeleteFails(t *testing.T) {
 	s3Err := errors.New("s3 is down")
 	candidates := []db.UserScopedObjectForCleanup{{ContentHash: "hash1", S3Domain: "d", S3Localpart: "l"}}
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return(candidates, nil).Once()
-	mockS3.On("DeleteWithRetry", ctx, "d/l/hash1").Return(s3Err).Once()
+	// ExecuteS3DeleteTxWithRetry returns the S3 error (not a 404, so not handled internally)
+	mockDB.On("ExecuteS3DeleteTxWithRetry", ctx, mock.Anything, "hash1", mock.Anything, mock.AnythingOfType("func() error")).
+		Return(false, s3Err).Once()
 
 	// DB batch delete should not be called for the failed S3 key
 

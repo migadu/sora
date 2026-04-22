@@ -41,6 +41,7 @@ type UploaderDB interface {
 	ExhaustUploadAttemptsWithRetry(ctx context.Context, contentHash string, accountID int64, maxAttempts int) error
 	GetPrimaryEmailForAccountWithRetry(ctx context.Context, accountID int64) (server.Address, error)
 	IsContentHashUploadedWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error)
+	ExecuteWithS3ObjectSessionLock(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error
 	CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64) error
 	PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error)
 	GetUploaderStatsWithRetry(ctx context.Context, maxAttempts int) (*db.UploaderStats, error)
@@ -428,7 +429,21 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 			// remove the pending_upload record) so the user's messages are accessible.
 			logger.Info("Uploader: Local file missing but content found in S3 - self-healing upload",
 				"hash", upload.ContentHash, "account_id", upload.AccountID)
-			if err := w.rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
+
+			err = w.rdb.ExecuteWithS3ObjectSessionLock(ctx, upload.ContentHash, upload.AccountID, func() error {
+				// Use detached background context during shutdown to ensure state consistency
+				dbCtx := ctx
+				if ctx.Err() != nil {
+					var cancel context.CancelFunc
+					dbCtx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					logger.Info("Uploader: Using background context for self-heal DB finalization during shutdown", "hash", upload.ContentHash)
+				}
+
+				return w.rdb.CompleteS3UploadWithRetry(dbCtx, upload.ContentHash, upload.AccountID)
+			})
+
+			if err != nil {
 				logger.Error("Uploader: CRITICAL - Failed to complete upload after S3 existence recovery",
 					"hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 				return // Retry next cycle; do NOT increment attempts
@@ -453,18 +468,42 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		return
 	}
 
-	// Attempt to upload to S3 using resilient wrapper with circuit breakers and retries.
-	// The storage layer should handle checking for existence.
+	// Attempt to upload to S3 using session-level advisory lock instead of transaction-level.
+	// This ensures we do not execute long-running I/O within a single open Postgres transaction.
 	start := time.Now()
-	err = w.s3.PutWithRetry(ctx, s3Key, bytes.NewReader(data), upload.Size)
+	var shutdownRequested bool
 
-	// Check if shutdown was requested during S3 upload
-	shutdownRequested := false
-	select {
-	case <-ctx.Done():
-		shutdownRequested = true
-	default:
-	}
+	err = w.rdb.ExecuteWithS3ObjectSessionLock(ctx, upload.ContentHash, upload.AccountID, func() error {
+		// Capture if shutdown is requested during our execution
+		select {
+		case <-ctx.Done():
+			shutdownRequested = true
+		default:
+		}
+
+		// Run S3 PUT
+		s3Err := w.s3.PutWithRetry(ctx, s3Key, bytes.NewReader(data), upload.Size)
+		if s3Err != nil {
+			return s3Err
+		}
+
+		// Finalize the upload in the database.
+		// It's critical to do this *before* removing the local source file.
+		//
+		// During shutdown, use a background context with a timeout to ensure the database
+		// update completes even though the main context is canceled. This prevents the
+		// "context canceled" error that leaves uploads in an inconsistent state (uploaded
+		// to S3 but not marked complete in the database).
+		dbCtx := ctx
+		if shutdownRequested || ctx.Err() != nil {
+			var cancel context.CancelFunc
+			dbCtx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			logger.Info("Uploader: Using background context for DB finalization during shutdown", "hash", upload.ContentHash)
+		}
+
+		return w.rdb.CompleteS3UploadWithRetry(dbCtx, upload.ContentHash, upload.AccountID)
+	})
 
 	if err != nil {
 		// Only count toward max_attempts for permanent errors (e.g., invalid data).
@@ -477,38 +516,16 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 				logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after S3 failure", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 			}
 		} else {
-			logger.Warn("Uploader: Transient S3 error - NOT counting toward max_attempts", "hash", upload.ContentHash, "account_id", upload.AccountID)
+			logger.Warn("Uploader: Transient error during S3 upload/DB finalization - NOT counting toward max_attempts", "hash", upload.ContentHash, "account_id", upload.AccountID)
 		}
-		logger.Error("Uploader: Upload failed", "hash", upload.ContentHash, "account_id", upload.AccountID, "key", s3Key, "error", err)
+		logger.Error("Uploader: Upload or finalize failed", "hash", upload.ContentHash, "account_id", upload.AccountID, "key", s3Key, "error", err)
 
 		// Track upload failure
 		metrics.UploadWorkerJobs.WithLabelValues("failure").Inc()
 		metrics.S3UploadAttempts.WithLabelValues("failure").Inc()
 		metrics.UploadWorkerDuration.Observe(time.Since(start).Seconds())
-		return
-	}
 
-	// Finalize the upload in the database. This is a transactional operation.
-	// It's critical to do this *before* removing the local source file.
-	//
-	// During shutdown, use a background context with a timeout to ensure the database
-	// update completes even though the main context is canceled. This prevents the
-	// "context canceled" error that leaves uploads in an inconsistent state (uploaded
-	// to S3 but not marked complete in the database).
-	dbCtx := ctx
-	if shutdownRequested {
-		var cancel context.CancelFunc
-		dbCtx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		logger.Info("Uploader: Using background context for DB finalization during shutdown", "hash", upload.ContentHash)
-	}
-
-	err = w.rdb.CompleteS3UploadWithRetry(dbCtx, upload.ContentHash, upload.AccountID)
-	if err != nil {
-		// If this fails, the S3 object might be orphaned temporarily, but the task is not lost.
-		// The task will be retried after the lease expires. Because the local file still
-		// exists, the retry can succeed.
-		logger.Error("Uploader: CRITICAL - Failed to finalize DB after S3 upload - will retry", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
+		// IMPORTANT: We do not retry here, the retry loop will pick it up later from pending_uploads
 		return
 	}
 
