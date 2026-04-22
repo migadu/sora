@@ -751,8 +751,6 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	// Connection limits are now handled at the listener level
 	sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
-	totalCount := s.totalConnections.Add(1)
-
 	// Prometheus metrics - connection established
 	metrics.ConnectionsTotal.WithLabelValues("imap", s.name, s.hostname).Inc()
 	metrics.ConnectionsCurrent.WithLabelValues("imap", s.name, s.hostname).Inc()
@@ -892,13 +890,12 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	// Track session in WaitGroup for graceful drain
 	s.sessionsWg.Add(1)
 
-	authCount := s.authenticatedConnections.Load()
 	// Log proxy session ID if present for end-to-end tracing
 	if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
 		logger.Debug("IMAP: Received proxy session ID from PROXY v2 TLV", "name", s.name, "session_id", proxyInfo.ProxySessionID)
-		session.InfoLog("connected", "conn_total", totalCount, "conn_auth", authCount, "proxy_session", proxyInfo.ProxySessionID)
+		session.InfoLog("connected", "proxy_session", proxyInfo.ProxySessionID)
 	} else {
-		session.InfoLog("connected", "conn_total", totalCount, "conn_auth", authCount)
+		session.InfoLog("connected")
 	}
 	return session, greeting, nil
 }
