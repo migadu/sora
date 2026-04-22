@@ -906,12 +906,14 @@ func hydrateSequencesCore[T any](
 	}
 
 	distance := maxUID - minUID
+	// Use Window strategy unconditionally for large arrays (> 200 items) to prevent O(N) timeout risks
+	// from too many index subqueries. For smaller arrays, use Window only if they are grouped densely.
+	useWindowStrategy := len(messages) > 200 || (len(messages) > 0 && uint64(distance) < uint64(len(messages))*50)
+
 	var rows pgx.Rows
 	var err error
 
-	// If we are modifying a very sparse list of sequences relative to the size of the array,
-	// use the targeted correlation query. Otherwise, fall back to the optimized bounded window function.
-	if len(messages) >= 100 && uint64(distance) < uint64(len(messages))*100 {
+	if useWindowStrategy {
 		// Optimized sequence hydration using batch approach:
 		// 1. Find min/max UID in our target set
 		// 2. Count how many messages exist below min UID (base offset)
