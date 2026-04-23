@@ -312,7 +312,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		// Note: If connection is truly closed, this error response won't reach the client,
 		// but the SMTP library handles failed writes gracefully and we need proper cleanup.
 		s.WarnLog("error reading message data", "error", err, "bytes_read", buf.Len())
-		recordMetrics("failure")
+		// Bypass metric tracking for client socket timeouts so they don't skew our P99 durations
 		return &smtp.SMTPError{
 			Code:         421,
 			EnhancedCode: smtp.EnhancedCode{4, 4, 2},
