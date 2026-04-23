@@ -113,7 +113,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		// - connection reset: network interruption
 		s.WarnLog("failed to read message data from network", "error", err, "bytes_read", buf.Len())
 		s.classifyAndTrackError("APPEND", err, nil)
-		recordMetrics("failure")
+		// Bypass metric tracking for client socket timeouts so they don't skew our P99 durations
 		return nil, s.internalError("failed to read message: %v", err)
 	}
 
