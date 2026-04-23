@@ -444,9 +444,13 @@ func (s *ManageSieveSession) handleConnection() {
 				n, err := io.ReadFull(s.reader, literalContent)
 				if err != nil || n != length {
 					s.sendResponse("NO Failed to read literal string content\r\n")
-					recordMetrics("failure")
+					// Bypass metrics for client socket timeouts (network transmission errors)
 					continue
 				}
+				
+				// Reset the metric timer NOW to exclude the time the client took to upload the script
+				start = time.Now()
+				
 				scriptContent = string(literalContent)
 			}
 
