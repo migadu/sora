@@ -507,6 +507,54 @@ func TestProcessSingleUpload(t *testing.T) {
 		_, err := os.Stat(filePath)
 		assert.True(t, os.IsNotExist(err), "local file should be removed even if cache move fails")
 	})
+
+	t.Run("empty file refuses upload", func(t *testing.T) {
+		worker, rdb, s3, _, _ := setupTestWorker(t)
+		// Write an empty file (simulating disk corruption or truncation)
+		filePath := worker.FilePath(testHash, testAccountID)
+		require.NoError(t, os.MkdirAll(filepath.Dir(filePath), 0755))
+		require.NoError(t, os.WriteFile(filePath, []byte{}, 0644))
+
+		var markedAttempt atomic.Bool
+		var s3PutCalled atomic.Bool
+		rdb.MarkUploadAttemptWithRetryFunc = func(ctx context.Context, contentHash string, accountID int64) error {
+			markedAttempt.Store(true)
+			return nil
+		}
+		s3.PutWithRetryFunc = func(ctx context.Context, key string, reader io.Reader, size int64) error {
+			s3PutCalled.Store(true)
+			return nil
+		}
+
+		worker.processSingleUpload(context.Background(), baseUpload)
+
+		assert.False(t, s3PutCalled.Load(), "S3 Put must NOT be called for empty file")
+		assert.True(t, markedAttempt.Load(), "upload attempt should be marked as failed")
+	})
+
+	t.Run("size mismatch refuses upload", func(t *testing.T) {
+		worker, rdb, s3, _, _ := setupTestWorker(t)
+		// Write a file with different size than expected
+		filePath := worker.FilePath(testHash, testAccountID)
+		require.NoError(t, os.MkdirAll(filepath.Dir(filePath), 0755))
+		require.NoError(t, os.WriteFile(filePath, []byte("short"), 0644)) // 5 bytes, expected 9
+
+		var markedAttempt atomic.Bool
+		var s3PutCalled atomic.Bool
+		rdb.MarkUploadAttemptWithRetryFunc = func(ctx context.Context, contentHash string, accountID int64) error {
+			markedAttempt.Store(true)
+			return nil
+		}
+		s3.PutWithRetryFunc = func(ctx context.Context, key string, reader io.Reader, size int64) error {
+			s3PutCalled.Store(true)
+			return nil
+		}
+
+		worker.processSingleUpload(context.Background(), baseUpload)
+
+		assert.False(t, s3PutCalled.Load(), "S3 Put must NOT be called for size-mismatched file")
+		assert.True(t, markedAttempt.Load(), "upload attempt should be marked as failed")
+	})
 }
 
 func TestProcessPendingUploads(t *testing.T) {
@@ -576,7 +624,7 @@ func TestProcessSingleUpload_ShutdownDuringFinalization(t *testing.T) {
 		ID:          1,
 		AccountID:   100,
 		ContentHash: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
-		Size:        100,
+		Size:        9, // len("test data")
 		CreatedAt:   time.Now(),
 		Attempts:    0,
 	}

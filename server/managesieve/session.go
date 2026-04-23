@@ -447,10 +447,10 @@ func (s *ManageSieveSession) handleConnection() {
 					// Bypass metrics for client socket timeouts (network transmission errors)
 					continue
 				}
-				
+
 				// Reset the metric timer NOW to exclude the time the client took to upload the script
 				start = time.Now()
-				
+
 				scriptContent = string(literalContent)
 			}
 

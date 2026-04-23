@@ -468,6 +468,23 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		return
 	}
 
+	// Validate data integrity before uploading to S3.
+	// The TOCTOU race that caused empty uploads has been fixed (file existence
+	// check before StoreLocally), but this guard catches any other corruption
+	// scenario (disk errors, unknown bugs) to prevent uploading garbage to S3
+	// and marking the message as uploaded when the content is wrong.
+	if int64(len(data)) != upload.Size {
+		logger.Error("Uploader: CRITICAL - File size mismatch, refusing to upload corrupted data",
+			"hash", upload.ContentHash, "account_id", upload.AccountID,
+			"file_size", len(data), "expected_size", upload.Size, "path", filePath)
+		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
+			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after size mismatch",
+				"hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
+		}
+		metrics.UploadWorkerJobs.WithLabelValues("failure").Inc()
+		return
+	}
+
 	// Attempt to upload to S3 using session-level advisory lock instead of transaction-level.
 	// This ensures we do not execute long-running I/O within a single open Postgres transaction.
 	start := time.Now()
