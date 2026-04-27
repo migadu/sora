@@ -33,7 +33,7 @@ func safeExtractBodySection(bodyData []byte, section *imap.FetchItemBodySection)
 	// For BODY[] (full message), if extraction returns empty but we have body data,
 	// it means MIME parsing failed silently. Return the raw body so clients can see the content.
 	// For other sections (BODY[TEXT], BODY[1], etc.), empty is valid (part doesn't exist).
-	if len(result) == 0 && section.Specifier == imap.PartSpecifierNone && len(bodyData) > 0 {
+	if len(result) == 0 && len(section.Part) == 0 && section.Specifier == imap.PartSpecifierNone && len(bodyData) > 0 {
 		return bodyData
 	}
 

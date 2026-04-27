@@ -268,6 +268,28 @@ func TestIMAP_FetchBodySections(t *testing.T) {
 			t.Errorf("BODY[TEXT] without PEEK should set \\Seen flag")
 		}
 	})
+
+	// Test Case 5: Non-existent part should return empty, not the full message body
+	t.Run("NonExistentPart", func(t *testing.T) {
+		msg := "From: sender@example.com\r\n" +
+			"To: " + account.Email + "\r\n" +
+			"Subject: Test Non-existent part\r\n" +
+			"Date: " + time.Now().Format(time.RFC1123Z) + "\r\n" +
+			"\r\n" +
+			"Body content\r\n"
+
+		uid := appendMessage(t, c, msg)
+
+		// Fetch BODY[2] - this part does not exist in a single-part message
+		part2 := fetchBodySection(t, c, uid, &imap.FetchItemBodySection{
+			Specifier: imap.PartSpecifierNone,
+			Part:      []int{2},
+		})
+
+		if len(part2) != 0 {
+			t.Fatalf("BODY[2] for single-part message should return 0 bytes, but got %d bytes: %q", len(part2), string(part2))
+		}
+	})
 }
 
 // appendMessage appends a message and returns its UID
