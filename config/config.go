@@ -174,6 +174,22 @@ type ClusterAffinityConfig struct {
 	CachePath       string `toml:"cache_path"`       // SQLite path for persistent affinity (default: "" = disabled)
 }
 
+// GetTTL parses and returns the affinity TTL duration
+func (c *ClusterAffinityConfig) GetTTL() (time.Duration, error) {
+	if c.TTL == "" {
+		return 24 * time.Hour, nil // Default: 24h
+	}
+	return helpers.ParseDuration(c.TTL)
+}
+
+// GetCleanupInterval parses and returns the affinity cleanup interval duration
+func (c *ClusterAffinityConfig) GetCleanupInterval() (time.Duration, error) {
+	if c.CleanupInterval == "" {
+		return 1 * time.Hour, nil // Default: 1h
+	}
+	return helpers.ParseDuration(c.CleanupInterval)
+}
+
 // ClusterConfig holds cluster coordination configuration using gossip protocol
 type ClusterConfig struct {
 	Enabled           bool                       `toml:"enabled"`              // Enable cluster mode

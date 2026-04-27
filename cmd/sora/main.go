@@ -942,10 +942,21 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		}
 		logger.Info("Cluster manager initialized", "node_id", deps.clusterManager.GetNodeID(), "members", deps.clusterManager.GetMemberCount(), "leader", deps.clusterManager.GetLeaderID())
 
+		affinityTTL, err := cfg.Cluster.Affinity.GetTTL()
+		if err != nil {
+			logger.Warn("Invalid affinity TTL in config, falling back to 24h", "error", err)
+			affinityTTL = 24 * time.Hour
+		}
+		
+		affinityCleanup, err := cfg.Cluster.Affinity.GetCleanupInterval()
+		if err != nil {
+			logger.Warn("Invalid affinity cleanup interval in config, falling back to 1h", "error", err)
+			affinityCleanup = 1 * time.Hour
+		}
+
 		// Initialize affinity manager for cluster-wide user-to-backend affinity
-		// Default TTL: 1 hour, Cleanup interval: 10 minutes
-		deps.affinityManager = server.NewAffinityManager(deps.clusterManager, true, 1*time.Hour, 10*time.Minute)
-		logger.Info("Affinity manager initialized for cluster-wide user routing")
+		deps.affinityManager = server.NewAffinityManager(deps.clusterManager, true, affinityTTL, affinityCleanup)
+		logger.Info("Affinity manager initialized for cluster-wide user routing", "ttl", affinityTTL, "cleanup_interval", affinityCleanup)
 
 		// Attach persistent affinity store if configured
 		if cfg.Cluster.Affinity.CachePath != "" && deps.affinityManager != nil {
