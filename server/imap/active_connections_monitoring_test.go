@@ -331,3 +331,106 @@ func TestMonitorActiveConnections_ZeroConnections(t *testing.T) {
 
 	t.Log("✓ Monitoring works correctly with zero connections")
 }
+
+// TestActiveConnections_IncrementDecrement verifies total and authenticated connections are tracked correctly
+func TestActiveConnections_IncrementDecrement(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := &IMAPServer{
+		name:   "test-imap",
+		appCtx: ctx,
+	}
+
+	// Initial counts should be 0
+	if count := server.totalConnections.Load(); count != 0 {
+		t.Fatalf("Expected 0 initial total connections, got %d", count)
+	}
+	if count := server.authenticatedConnections.Load(); count != 0 {
+		t.Fatalf("Expected 0 initial authenticated connections, got %d", count)
+	}
+
+	// Simulate connection increment
+	server.totalConnections.Add(1)
+	if count := server.totalConnections.Load(); count != 1 {
+		t.Errorf("Expected 1 total connection after increment, got %d", count)
+	}
+
+	// Simulate auth increment
+	server.authenticatedConnections.Add(1)
+	if count := server.authenticatedConnections.Load(); count != 1 {
+		t.Errorf("Expected 1 authenticated connection after increment, got %d", count)
+	}
+
+	// Add more connections
+	server.totalConnections.Add(1)
+	server.totalConnections.Add(1)
+	if count := server.totalConnections.Load(); count != 3 {
+		t.Errorf("Expected 3 total connections, got %d", count)
+	}
+
+	// Decrement connections
+	server.totalConnections.Add(-1)
+	if count := server.totalConnections.Load(); count != 2 {
+		t.Errorf("Expected 2 total connections after decrement, got %d", count)
+	}
+
+	// Decrement auth
+	server.authenticatedConnections.Add(-1)
+	if count := server.authenticatedConnections.Load(); count != 0 {
+		t.Errorf("Expected 0 authenticated connections after decrement, got %d", count)
+	}
+
+	server.totalConnections.Add(-1)
+	server.totalConnections.Add(-1)
+	if count := server.totalConnections.Load(); count != 0 {
+		t.Errorf("Expected 0 total connections after all decremented, got %d", count)
+	}
+
+	t.Log("✓ Active connections increment/decrement works correctly")
+}
+
+// TestActiveConnections_RaceDetection verifies no race conditions with -race flag
+func TestActiveConnections_RaceDetection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := &IMAPServer{
+		name:   "test-imap",
+		appCtx: ctx,
+	}
+
+	// Concurrently increment/decrement from multiple goroutines
+	var wg sync.WaitGroup
+	iterations := 100
+
+	for i := 0; i < iterations; i++ {
+		wg.Add(2)
+
+		// Incrementer
+		go func() {
+			defer wg.Done()
+			server.totalConnections.Add(1)
+			server.authenticatedConnections.Add(1)
+		}()
+
+		// Decrementer
+		go func() {
+			defer wg.Done()
+			server.totalConnections.Add(-1)
+			server.authenticatedConnections.Add(-1)
+		}()
+	}
+
+	wg.Wait()
+
+	// Final count should be 0 (100 increments - 100 decrements)
+	if count := server.totalConnections.Load(); count != 0 {
+		t.Errorf("Expected 0 final total count, got %d", count)
+	}
+	if count := server.authenticatedConnections.Load(); count != 0 {
+		t.Errorf("Expected 0 final authenticated count, got %d", count)
+	}
+
+	t.Log("✓ No race conditions detected with atomic operations")
+}

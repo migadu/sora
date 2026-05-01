@@ -755,6 +755,8 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	metrics.ConnectionsTotal.WithLabelValues("imap", s.name, s.hostname).Inc()
 	metrics.ConnectionsCurrent.WithLabelValues("imap", s.name, s.hostname).Inc()
 
+	s.totalConnections.Add(1)
+
 	// Initialize memory tracker with configured limit
 	memTracker := serverPkg.NewSessionMemoryTracker(s.sessionMemoryLimit)
 
