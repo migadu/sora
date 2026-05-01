@@ -217,7 +217,7 @@ func (db *Database) streamMessagesByUIDSetChunked(ctx context.Context, mailboxID
 				ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 			FROM messages m
 			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-			WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
+			WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 			  AND (%[2]s)
 			  AND m.uid > $%d
 			ORDER BY m.uid ASC
@@ -354,7 +354,7 @@ func (db *Database) streamMessagesBySeqSetChunked(ctx context.Context, mailboxID
 				ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 			FROM messages m
 			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-			WHERE m.mailbox_id = $1 AND m.uploaded = true AND m.expunged_at IS NULL
+			WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 			  AND (%s)
 			  AND m.uid > $%d
 			ORDER BY m.uid ASC
@@ -431,7 +431,7 @@ func (db *Database) streamAllActiveMessagesRawChunked(ctx context.Context, mailb
 				ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 			FROM messages m
 			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-			WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL AND m.uploaded = true
+			WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 			  AND m.uid > $2
 			ORDER BY m.uid ASC
 			LIMIT $3

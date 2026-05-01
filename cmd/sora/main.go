@@ -947,7 +947,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			logger.Warn("Invalid affinity TTL in config, falling back to 24h", "error", err)
 			affinityTTL = 24 * time.Hour
 		}
-		
+
 		affinityCleanup, err := cfg.Cluster.Affinity.GetCleanupInterval()
 		if err != nil {
 			logger.Warn("Invalid affinity cleanup interval in config, falling back to 1h", "error", err)
