@@ -1181,6 +1181,20 @@ func (s *Session) connectToBackendAndAuth() error {
 
 		s.DebugLog("StartTLS negotiation successful with backend", "backend", actualAddr)
 		s.backendConn = tlsConn
+		backendReader = bufio.NewReader(s.backendConn)
+		backendWriter = bufio.NewWriter(s.backendConn)
+
+		// Read backend capabilities sent automatically after STARTTLS
+		for {
+			line, err := backendReader.ReadString('\n')
+			if err != nil {
+				s.backendConn.Close()
+				return fmt.Errorf("%w: failed to read backend capabilities after STARTTLS: %w", server.ErrBackendConnectionFailed, err)
+			}
+			if strings.HasPrefix(strings.TrimSpace(line), "OK") {
+				break
+			}
+		}
 	}
 
 	// Now authenticate to backend

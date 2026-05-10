@@ -558,6 +558,9 @@ func (s *ManageSieveSession) handleConnection() {
 			s.writer = bufio.NewWriter(tlsConn)
 			s.isTLS = true
 
+			// RFC 5804 requires sending capabilities immediately after STARTTLS
+			s.sendCapabilitiesGreeting()
+
 			// Release lock immediately after updating connection state
 			release()
 
