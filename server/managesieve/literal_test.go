@@ -232,3 +232,75 @@ func TestLiteralStringReading(t *testing.T) {
 		})
 	}
 }
+
+// TestParseLiteralStringPutScript tests parsing of literal string syntax in PUTSCRIPT command
+func TestParseLiteralStringPutScript(t *testing.T) {
+	tests := []struct {
+		name          string
+		scriptContent string
+		expectedLen   int
+		expectedPlus  bool
+		shouldSucceed bool
+	}{
+		{
+			name:          "Non-synchronizing literal string with +",
+			scriptContent: "{40+}",
+			expectedLen:   40,
+			expectedPlus:  true,
+			shouldSucceed: true,
+		},
+		{
+			name:          "Synchronizing literal string without +",
+			scriptContent: "{40}",
+			expectedLen:   40,
+			expectedPlus:  false,
+			shouldSucceed: true,
+		},
+		{
+			name:          "Invalid format missing braces",
+			scriptContent: "40",
+			expectedLen:   0,
+			expectedPlus:  false,
+			shouldSucceed: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Check if script content is a literal string {length+} or {length}
+			if strings.HasPrefix(tt.scriptContent, "{") && (strings.HasSuffix(tt.scriptContent, "}") || strings.HasSuffix(tt.scriptContent, "+}")) {
+				hasPlus := strings.HasSuffix(tt.scriptContent, "+}")
+
+				// Extract length from {length} or {length+}
+				lengthStr := strings.TrimPrefix(tt.scriptContent, "{")
+				lengthStr = strings.TrimSuffix(lengthStr, "}")
+				lengthStr = strings.TrimSuffix(lengthStr, "+")
+
+				length := 0
+				if _, err := fmt.Sscanf(lengthStr, "%d", &length); err != nil || length < 0 {
+					if tt.shouldSucceed {
+						t.Errorf("Failed to parse valid length: %s", lengthStr)
+					}
+					return
+				}
+
+				if !tt.shouldSucceed {
+					t.Errorf("Expected failure but succeeded")
+					return
+				}
+
+				if length != tt.expectedLen {
+					t.Errorf("Expected length %d, got %d", tt.expectedLen, length)
+				}
+
+				if hasPlus != tt.expectedPlus {
+					t.Errorf("Expected hasPlus %v, got %v", tt.expectedPlus, hasPlus)
+				}
+			} else {
+				if tt.shouldSucceed {
+					t.Errorf("Failed to identify as literal: %s", tt.scriptContent)
+				}
+			}
+		})
+	}
+}

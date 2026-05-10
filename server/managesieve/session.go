@@ -425,10 +425,15 @@ func (s *ManageSieveSession) handleConnection() {
 			scriptName := parts[1]
 			scriptContent := parts[2]
 
-			// Check if script content is a literal string {length+}
-			if strings.HasPrefix(scriptContent, "{") && strings.HasSuffix(scriptContent, "+}") {
-				// Extract length from {length+}
-				lengthStr := strings.TrimSuffix(strings.TrimPrefix(scriptContent, "{"), "+}")
+			// Check if script content is a literal string {length+} or {length}
+			if strings.HasPrefix(scriptContent, "{") && (strings.HasSuffix(scriptContent, "}") || strings.HasSuffix(scriptContent, "+}")) {
+				hasPlus := strings.HasSuffix(scriptContent, "+}")
+
+				// Extract length from {length} or {length+}
+				lengthStr := strings.TrimPrefix(scriptContent, "{")
+				lengthStr = strings.TrimSuffix(lengthStr, "}")
+				lengthStr = strings.TrimSuffix(lengthStr, "+")
+
 				length := 0
 				if _, err := fmt.Sscanf(lengthStr, "%d", &length); err != nil || length < 0 {
 					s.sendResponse("NO Invalid literal string length\r\n")
@@ -436,8 +441,10 @@ func (s *ManageSieveSession) handleConnection() {
 					continue
 				}
 
-				// Send continuation response (+ ready for literal data)
-				s.sendResponse("+\r\n")
+				if !hasPlus {
+					// Send continuation response (+ ready for literal data) only for synchronizing literals
+					s.sendResponse("+\r\n")
+				}
 
 				// Read the literal content (length bytes)
 				literalContent := make([]byte, length)
