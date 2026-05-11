@@ -72,28 +72,24 @@ func TestManageSieveRegexExtension(t *testing.T) {
 	t.Log("=== Testing script with regex extension ===")
 	regexScript := `require ["fileinto", "regex"]; if header :regex "subject" ".*test.*" { fileinto "Test"; } else { fileinto "INBOX"; }`
 
-	// Use literal string format: PUTSCRIPT "name" {length+}
-	literalCommand := fmt.Sprintf("PUTSCRIPT \"regex_test\" {%d+}", len(regexScript))
+	// Use non-synchronizing literal: PUTSCRIPT "name" {length+} scriptcontent
+	// With {length+}, server does NOT send continuation response (RFC 5804 §4)
+	literalCommand := fmt.Sprintf("PUTSCRIPT \"regex_test\" {%d+}\r\n%s", len(regexScript), regexScript)
 	writer.WriteString(literalCommand + "\r\n")
 	writer.Flush()
 
-	// Wait for continuation response (+)
-	continuationResponse := readResponse(t, reader)
-	if !strings.Contains(continuationResponse, "+") {
-		t.Errorf("Expected continuation response, got: %s", continuationResponse)
-	}
-
-	// Send the script content
-	writer.WriteString(regexScript + "\r\n")
-	writer.Flush()
-
-	// Read the final response
+	// Read the final response (no continuation response for non-synchronizing literals)
 	response := readResponse(t, reader)
 	if !strings.Contains(response, "OK") {
 		t.Errorf("Script with regex extension should succeed: %s", response)
 	} else {
 		t.Logf("Regex extension script accepted: %s", strings.TrimSpace(response))
 	}
+
+	// Send LOGOUT to cleanly close the session
+	writer.WriteString("LOGOUT\r\n")
+	writer.Flush()
+	_ = readResponse(t, reader)
 
 	// Test 2: Script without regex extension but using regex syntax should fail
 	t.Log("=== Testing regex syntax without regex extension ===")
@@ -144,25 +140,20 @@ func TestManageSieveRegexExtension(t *testing.T) {
 	authenticateManageSieve(t, reader2, writer2, account)
 
 	// Try to upload script with regex extension
-	literalCommand2 := fmt.Sprintf("PUTSCRIPT \"regex_fail_test\" {%d+}", len(regexScript))
+	literalCommand2 := fmt.Sprintf("PUTSCRIPT \"regex_fail_test\" {%d+}\r\n%s", len(regexScript), regexScript)
 	writer2.WriteString(literalCommand2 + "\r\n")
 	writer2.Flush()
 
-	// Wait for continuation response (+)
-	continuationResponse2 := readResponse(t, reader2)
-	if !strings.Contains(continuationResponse2, "+") {
-		t.Errorf("Expected continuation response, got: %s", continuationResponse2)
-	}
-
-	// Send the script content
-	writer2.WriteString(regexScript + "\r\n")
-	writer2.Flush()
-
-	// Read the final response
+	// Read the final response (no continuation response for non-synchronizing literals)
 	response2 := readResponse(t, reader2)
 	if strings.Contains(response2, "OK") {
 		t.Errorf("Script with regex extension should fail when regex is not supported: %s", response2)
 	} else {
 		t.Logf("Regex extension script correctly rejected: %s", strings.TrimSpace(response2))
 	}
+
+	// Send LOGOUT to cleanly close the second session
+	writer2.WriteString("LOGOUT\r\n")
+	writer2.Flush()
+	_ = readResponse(t, reader2)
 }

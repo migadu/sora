@@ -114,6 +114,12 @@ func TestManageSieveBasicConnection(t *testing.T) {
 		t.Errorf("Expected OK response at end of CAPABILITY, got: %v", capabilityLines)
 	}
 
+	// Send LOGOUT to cleanly close the session
+	writer.WriteString("LOGOUT\r\n")
+	writer.Flush()
+	// Read BYE response (don't fail test if server already closed connection)
+	_, _ = reader.ReadString('\n')
+
 	t.Logf("Successfully connected to ManageSieve server at %s", server.Address)
 	_ = account // Use account variable to avoid unused variable error
 }
@@ -161,6 +167,11 @@ func TestManageSieveAuthentication(t *testing.T) {
 	if !strings.Contains(response, "OK") {
 		t.Errorf("Authentication failed: %s", response)
 	}
+
+	// Send LOGOUT to cleanly close the session
+	writer.WriteString("LOGOUT\r\n")
+	writer.Flush()
+	_, _ = reader.ReadString('\n')
 
 	t.Logf("Successfully authenticated to ManageSieve server with account %s", account.Email)
 }
@@ -264,6 +275,11 @@ func TestManageSieveScriptOperations(t *testing.T) {
 		t.Logf("DELETESCRIPT correctly failed for non-existent script")
 	}
 
+	// Send LOGOUT to cleanly close the session
+	writer.WriteString("LOGOUT\r\n")
+	writer.Flush()
+	_ = readResponse(t, reader)
+
 	t.Log("Successfully completed comprehensive ManageSieve script operations test")
 }
 
@@ -353,6 +369,11 @@ func TestManageSieveScriptDeactivation(t *testing.T) {
 	if !strings.Contains(response, "OK") {
 		t.Errorf("DELETESCRIPT failed: %s", response)
 	}
+
+	// Send LOGOUT to cleanly close the session
+	writer.WriteString("LOGOUT\r\n")
+	writer.Flush()
+	_ = readResponse(t, reader)
 
 	t.Log("Successfully completed script deactivation test")
 }
@@ -533,6 +554,12 @@ func TestManageSieveMultipleConnections(t *testing.T) {
 				}
 			}
 
+			// Send LOGOUT to cleanly close the session
+			writer.WriteString("LOGOUT\r\n")
+			writer.Flush()
+			// Read BYE response (don't fail test if server already closed connection)
+			_, _ = reader.ReadString('\n')
+
 			t.Logf("Connection %d: Successfully completed", connNum)
 		}(i)
 	}
@@ -685,34 +712,28 @@ func TestManageSieveScriptEdgeCases(t *testing.T) {
 		t.Logf("Reject extension response: %v", err)
 	}
 
-	// Test 7: Test script with only supported extensions using literal string format
-	t.Log("=== Testing PUTSCRIPT with literal string format ===")
+	// Test 7: Test script with only supported extensions using non-synchronizing literal format
+	t.Log("=== Testing PUTSCRIPT with non-synchronizing literal format ===")
 	supportedScript := `require ["fileinto", "vacation"]; if header :contains "subject" "vacation" { vacation "I'm on vacation"; } else { fileinto "INBOX"; }`
 
-	// Use literal string format: PUTSCRIPT "name" {length+}
-	literalCommand := fmt.Sprintf("PUTSCRIPT \"supported\" {%d+}", len(supportedScript))
+	// Use non-synchronizing literal: PUTSCRIPT "name" {length+} scriptcontent
+	// With {length+}, server does NOT send continuation response (RFC 5804 §4)
+	literalCommand := fmt.Sprintf("PUTSCRIPT \"supported\" {%d+}\r\n%s", len(supportedScript), supportedScript)
 	writer.WriteString(literalCommand + "\r\n")
 	writer.Flush()
 
-	// Wait for continuation response (+)
-	continuationResponse := readResponse(t, reader)
-	if !strings.HasPrefix(continuationResponse, "+") {
-		t.Errorf("Expected continuation response (+), got: %s", continuationResponse)
-		return
-	}
-	t.Logf("Received continuation response: %s", strings.TrimSpace(continuationResponse))
-
-	// Now send the literal data
-	writer.WriteString(supportedScript)
-	writer.Flush()
-
-	// Read the final response
+	// Read the final response (no continuation response for non-synchronizing literals)
 	response = readResponse(t, reader)
 	if !strings.Contains(response, "OK") {
-		t.Errorf("PUTSCRIPT with literal string format should succeed: %s", response)
+		t.Errorf("PUTSCRIPT with non-synchronizing literal format should succeed: %s", response)
 	} else {
-		t.Logf("Literal string format script accepted: %s", strings.TrimSpace(response))
+		t.Logf("Non-synchronizing literal format script accepted: %s", strings.TrimSpace(response))
 	}
+
+	// Send LOGOUT to cleanly close the session
+	writer.WriteString("LOGOUT\r\n")
+	writer.Flush()
+	_ = readResponse(t, reader)
 
 	t.Logf("Successfully completed ManageSieve edge cases test")
 }
@@ -820,33 +841,25 @@ func TestManageSieveScriptNameWithSpaces(t *testing.T) {
 	sendCommand(t, writer, fmt.Sprintf("DELETESCRIPT \"%s\"", complexName))
 	readSimpleResponse(t, reader)
 
+	// Send LOGOUT to cleanly close the session
+	writer.WriteString("LOGOUT\r\n")
+	writer.Flush()
+	_ = readResponse(t, reader)
+
 	t.Logf("Successfully completed script name with spaces test")
 }
 
-// Helper function to upload a script using literal format
+// Helper function to upload a script using non-synchronizing literal format
 func putScriptWithLiteral(t *testing.T, reader *bufio.Reader, writer *bufio.Writer, scriptName, scriptContent string) error {
 	t.Helper()
 
-	// Send PUTSCRIPT command with literal format: PUTSCRIPT "name" {length+}
-	literalCommand := fmt.Sprintf("PUTSCRIPT \"%s\" {%d+}", scriptName, len(scriptContent))
+	// Use non-synchronizing literal: PUTSCRIPT "name" {length+} scriptcontent
+	// With {length+}, server does NOT send continuation response (RFC 5804 §4)
+	literalCommand := fmt.Sprintf("PUTSCRIPT \"%s\" {%d+}\r\n%s", scriptName, len(scriptContent), scriptContent)
 	writer.WriteString(literalCommand + "\r\n")
 	writer.Flush()
 
-	// Wait for continuation response (+)
-	continuationResponse, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("failed to read continuation response: %v", err)
-	}
-	continuationResponse = strings.TrimSpace(continuationResponse)
-	if !strings.HasPrefix(continuationResponse, "+") {
-		return fmt.Errorf("expected continuation response (+), got: %s", continuationResponse)
-	}
-
-	// Send the literal data
-	writer.WriteString(scriptContent)
-	writer.Flush()
-
-	// Read the final response
+	// Read the final response (no continuation response for non-synchronizing literals)
 	finalResponse, err := reader.ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("failed to read final response: %v", err)

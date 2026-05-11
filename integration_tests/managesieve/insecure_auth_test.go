@@ -333,13 +333,21 @@ func TestInsecureAuthWithSTARTTLS(t *testing.T) {
 
 	t.Logf("✓ TLS handshake completed")
 
-	// After STARTTLS, the server does NOT automatically resend capabilities per RFC 5804.
-	// The server just continues in the command loop, now over TLS.
-	// We can directly send AUTH command now since we're over TLS.
+	// After STARTTLS, the server automatically sends capabilities greeting per RFC 5804.
+	// Read the capabilities greeting (capabilities followed by OK)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Failed to read capabilities after STARTTLS: %v", err)
+		}
+		line = strings.TrimSpace(line)
+		// The greeting ends with OK line
+		if strings.HasPrefix(line, "OK") {
+			break
+		}
+	}
 
-	// Give the server a moment to release any locks from STARTTLS processing
-	// Note: The server uses deferred lock releases which may take a moment to complete
-	time.Sleep(500 * time.Millisecond)
+	t.Logf("✓ Capabilities greeting received after STARTTLS")
 
 	// Now authenticate - should succeed since we're over TLS
 	authzID := ""

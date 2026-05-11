@@ -72,22 +72,13 @@ func TestManageSieveExtensionValidation(t *testing.T) {
 	t.Log("=== Testing script with supported envelope extension ===")
 	envelopeScript := `require ["fileinto", "envelope"]; if envelope :is "from" "example.com" { fileinto "Domain"; } else { fileinto "INBOX"; }`
 
-	// Use literal string format: PUTSCRIPT "name" {length+}
-	literalCommand := fmt.Sprintf("PUTSCRIPT \"envelope_test\" {%d+}", len(envelopeScript))
+	// Use non-synchronizing literal: PUTSCRIPT "name" {length+} scriptcontent
+	// With {length+}, server does NOT send continuation response (RFC 5804 §4)
+	literalCommand := fmt.Sprintf("PUTSCRIPT \"envelope_test\" {%d+}\r\n%s", len(envelopeScript), envelopeScript)
 	writer.WriteString(literalCommand + "\r\n")
 	writer.Flush()
 
-	// Wait for continuation response (+)
-	continuationResponse := readResponse(t, reader)
-	if !strings.Contains(continuationResponse, "+") {
-		t.Errorf("Expected continuation response, got: %s", continuationResponse)
-	}
-
-	// Send the script content
-	writer.WriteString(envelopeScript + "\r\n")
-	writer.Flush()
-
-	// Read the final response
+	// Read the final response (no continuation response for non-synchronizing literals)
 	response := readResponse(t, reader)
 	if !strings.Contains(response, "OK") {
 		t.Errorf("Script with supported envelope extension should succeed: %s", response)
@@ -99,26 +90,23 @@ func TestManageSieveExtensionValidation(t *testing.T) {
 	t.Log("=== Testing script with unsupported variables extension ===")
 	variablesScript := `require ["fileinto", "variables"]; set "domain" "example.com"; if header :contains "from" "${domain}" { fileinto "Domain"; }`
 
-	// Use literal string format: PUTSCRIPT "name" {length+}
-	literalCommand2 := fmt.Sprintf("PUTSCRIPT \"variables_test\" {%d+}", len(variablesScript))
+	// Use non-synchronizing literal: PUTSCRIPT "name" {length+} scriptcontent
+	literalCommand2 := fmt.Sprintf("PUTSCRIPT \"variables_test\" {%d+}\r\n%s", len(variablesScript), variablesScript)
 	writer.WriteString(literalCommand2 + "\r\n")
 	writer.Flush()
 
-	// Wait for continuation response (+)
-	continuationResponse2 := readResponse(t, reader)
-	if !strings.Contains(continuationResponse2, "+") {
-		t.Errorf("Expected continuation response, got: %s", continuationResponse2)
-	}
-
-	// Send the script content
-	writer.WriteString(variablesScript + "\r\n")
-	writer.Flush()
-
-	// Read the final response
+	// Read the final response (no continuation response for non-synchronizing literals)
 	response = readResponse(t, reader)
 	if strings.Contains(response, "OK") {
 		t.Errorf("Script with unsupported variables extension should fail: %s", response)
 	} else {
 		t.Logf("Variables extension script correctly rejected: %s", strings.TrimSpace(response))
 	}
+
+	// Send LOGOUT to cleanly close the session
+	writer.WriteString("LOGOUT\r\n")
+	writer.Flush()
+
+	// Read the BYE response
+	_ = readResponse(t, reader)
 }
