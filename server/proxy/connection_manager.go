@@ -234,6 +234,32 @@ func (cm *ConnectionManager) IsBackendHealthy(backend string) bool {
 	return health.IsHealthy
 }
 
+// IsBackendHealthyForAffinity checks if a backend is healthy WITHOUT auto-recovery.
+// This ensures users who failed over to a different backend stay there,
+// even if their original affinity backend recovers.
+// Auto-recovery still applies for consistent-hash routing (allows new users to use recovered backends).
+func (cm *ConnectionManager) IsBackendHealthyForAffinity(backend string) bool {
+	// If health checks are disabled, always return true (all backends healthy)
+	if !cm.enableBackendHealthCheck {
+		return true
+	}
+
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+
+	health, exists := cm.backendHealth[backend]
+	if !exists {
+		// No health record = healthy (never attempted connection yet)
+		return true
+	}
+
+	// For affinity checks, do NOT apply auto-recovery
+	// Return the actual health status WITHOUT checking the 1-minute grace period
+	// Even if the backend was marked unhealthy >1 minute ago, we still consider it unhealthy
+	// for affinity purposes (sticky failover)
+	return health.IsHealthy
+}
+
 // IsRemoteLookupBackendHealthy checks if a remote lookup backend (not in pool) is healthy
 // Returns true if healthy or unknown, false if marked unhealthy
 // Auto-recovers backends after 1 minute of being marked unhealthy
@@ -1265,8 +1291,8 @@ func resolveAffinityRoute(params RouteParams, affinityMgr AffinityManager, resul
 			}
 		}
 
-		// Check if resolved backend is healthy
-		if params.ConnManager.IsBackendHealthy(targetAddr) {
+		// Check if resolved backend is healthy (without auto-recovery for sticky failover)
+		if params.ConnManager.IsBackendHealthyForAffinity(targetAddr) {
 			if foundProtocol == params.Protocol {
 				logger.Info("Using cluster affinity", "proxy", params.ProxyName, "user", params.Username, "backend", targetAddr)
 				return targetAddr, "affinity"

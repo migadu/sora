@@ -289,8 +289,6 @@ func setupPOP3ProxyWithFallback(t *testing.T, rdb *resilient.ResilientDatabase, 
 		ConnectTimeout:         10 * time.Second,
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
-		AffinityValidity:       24 * time.Hour,
-		AffinityStickiness:     0.9,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,
 		},

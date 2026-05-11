@@ -39,8 +39,6 @@ type POP3ProxyServer struct {
 	connTracker            *server.ConnectionTracker
 	wg                     sync.WaitGroup
 	enableAffinity         bool
-	affinityValidity       time.Duration
-	affinityStickiness     float64
 	authLimiter            server.AuthLimiter
 	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	remotelookupConfig     *config.RemoteLookupConfig
@@ -151,8 +149,6 @@ type POP3ProxyServerOptions struct {
 	MinBytesPerMinute        int64         // Minimum throughput
 	EnableAffinity           bool
 	EnableBackendHealthCheck bool // Enable backend health checking (default: true)
-	AffinityValidity         time.Duration
-	AffinityStickiness       float64
 	AuthRateLimit            server.AuthRateLimiterConfig
 	RemoteLookup             *config.RemoteLookupConfig
 	TrustedProxies           []string // CIDR blocks for trusted proxies that can forward parameters
@@ -230,13 +226,6 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
 		logger.Debug("WARNING: Failed to resolve some addresses for POP3 proxy", "proxy", options.Name, "error", err)
-	}
-
-	// Validate affinity stickiness
-	stickiness := options.AffinityStickiness
-	if stickiness < 0.0 || stickiness > 1.0 {
-		logger.Debug("WARNING: invalid POP3 proxy affinity_stickiness - using default 1.0", "proxy", options.Name, "value", stickiness)
-		stickiness = 1.0
 	}
 
 	// Initialize authentication rate limiter with trusted networks
@@ -347,8 +336,6 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		masterSASLPassword:         options.MasterSASLPassword,
 		connManager:                connManager,
 		enableAffinity:             options.EnableAffinity,
-		affinityValidity:           options.AffinityValidity,
-		affinityStickiness:         stickiness,
 		authLimiter:                authLimiter,
 		trustedProxies:             options.TrustedProxies,
 		remotelookupConfig:         options.RemoteLookup,

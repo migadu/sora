@@ -45,8 +45,6 @@ type Server struct {
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	enableAffinity         bool
-	affinityValidity       time.Duration
-	affinityStickiness     float64
 	authLimiter            server.AuthLimiter
 	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
 	remotelookupConfig     *config.RemoteLookupConfig
@@ -113,8 +111,6 @@ type ServerOptions struct {
 	MinBytesPerMinute        int64         // Minimum throughput
 	EnableAffinity           bool
 	EnableBackendHealthCheck bool // Enable backend health checking (default: true)
-	AffinityValidity         time.Duration
-	AffinityStickiness       float64
 	AuthRateLimit            server.AuthRateLimiterConfig
 	RemoteLookup             *config.RemoteLookupConfig
 	TrustedProxies           []string // CIDR blocks for trusted proxies that can forward parameters
@@ -195,13 +191,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
 		logger.Debug("ManageSieve Proxy: Failed to resolve addresses", "name", opts.Name, "error", err)
-	}
-
-	// Validate affinity stickiness
-	stickiness := opts.AffinityStickiness
-	if stickiness < 0.0 || stickiness > 1.0 {
-		logger.Debug("ManageSieve Proxy: WARNING - invalid affinity_stickiness, using default 1.0", "name", opts.Name, "value", stickiness)
-		stickiness = 1.0
 	}
 
 	// Validate SIEVE extensions
@@ -318,8 +307,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		ctx:                        ctx,
 		cancel:                     cancel,
 		enableAffinity:             opts.EnableAffinity,
-		affinityValidity:           opts.AffinityValidity,
-		affinityStickiness:         stickiness,
 		authLimiter:                authLimiter,
 		trustedProxies:             opts.TrustedProxies,
 		remotelookupConfig:         opts.RemoteLookup,

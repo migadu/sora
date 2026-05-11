@@ -290,8 +290,6 @@ func setupPOP3ProxyWithPROXY(t *testing.T, rdb *resilient.ResilientDatabase, pro
 		ConnectTimeout:         10 * time.Second,
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
-		AffinityValidity:       24 * time.Hour,
-		AffinityStickiness:     0.9,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,
 		},
@@ -365,8 +363,6 @@ func setupPOP3ProxyWithXCLIENT(t *testing.T, rdb *resilient.ResilientDatabase, p
 		ConnectTimeout:         10 * time.Second,
 		AuthIdleTimeout:        30 * time.Minute,
 		EnableAffinity:         true,
-		AffinityValidity:       24 * time.Hour,
-		AffinityStickiness:     0.9,
 		AuthRateLimit: server.AuthRateLimiterConfig{
 			Enabled: false,
 		},

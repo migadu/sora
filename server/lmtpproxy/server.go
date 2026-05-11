@@ -37,8 +37,6 @@ type Server struct {
 	tlsVerify              bool
 	tlsConfig              *tls.Config // Global TLS config from TLS manager or per-server config
 	enableAffinity         bool
-	affinityValidity       time.Duration
-	affinityStickiness     float64
 	wg                     sync.WaitGroup
 	ctx                    context.Context
 	cancel                 context.CancelFunc
@@ -96,8 +94,6 @@ type ServerOptions struct {
 	AuthIdleTimeout          time.Duration
 	EnableAffinity           bool
 	EnableBackendHealthCheck bool // Enable backend health checking (default: true)
-	AffinityValidity         time.Duration
-	AffinityStickiness       float64
 	RemoteLookup             *config.RemoteLookupConfig
 	TrustedProxies           []string      // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT         bool          // Whether backend supports XCLIENT command for forwarding
@@ -178,13 +174,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
 		logger.Debug("LMTP Proxy: Failed to resolve addresses", "name", opts.Name, "error", err)
-	}
-
-	// Validate affinity stickiness
-	stickiness := opts.AffinityStickiness
-	if stickiness < 0.0 || stickiness > 1.0 {
-		logger.Debug("LMTP Proxy: WARNING - invalid affinity_stickiness, using default 1.0", "name", opts.Name, "value", stickiness)
-		stickiness = 1.0
 	}
 
 	// Parse trusted networks for connection filtering
@@ -286,8 +275,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		tlsKeyFile:             opts.TLSKeyFile,
 		tlsVerify:              opts.TLSVerify,
 		enableAffinity:         opts.EnableAffinity,
-		affinityValidity:       opts.AffinityValidity,
-		affinityStickiness:     stickiness,
 		ctx:                    ctx,
 		cancel:                 cancel,
 		trustedProxies:         opts.TrustedProxies,

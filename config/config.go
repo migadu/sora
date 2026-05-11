@@ -1144,8 +1144,6 @@ type ManageSieveProxyServerConfig struct {
 	RemoteLookup           *RemoteLookupConfig   `toml:"remote_lookup"`            // Database-driven user routing
 	EnableAffinity         bool                  `toml:"enable_affinity"`
 	RemoteHealthChecks     *bool                 `toml:"remote_health_checks"` // Enable backend health checking (default: true)
-	AffinityStickiness     float64               `toml:"affinity_stickiness"`  // Probability (0.0 to 1.0) of using an affinity server.
-	AffinityValidity       string                `toml:"affinity_validity"`
 }
 
 // GetRemoteHealthChecks returns whether backend health checking is enabled.
@@ -1180,9 +1178,7 @@ type LMTPProxyServerConfig struct {
 	MaxMessageSize         string              `toml:"max_message_size"`  // Maximum message size announced in EHLO
 	EnableAffinity         bool                `toml:"enable_affinity"`
 	RemoteHealthChecks     *bool               `toml:"remote_health_checks"` // Enable backend health checking (default: true)
-	AffinityStickiness     float64             `toml:"affinity_stickiness"`  // Probability (0.0 to 1.0) of using an affinity server.
-	AffinityValidity       string              `toml:"affinity_validity"`
-	RemoteLookup           *RemoteLookupConfig `toml:"remote_lookup"` // Database-driven user routing
+	RemoteLookup           *RemoteLookupConfig `toml:"remote_lookup"`        // Database-driven user routing
 }
 
 // GetRemoteHealthChecks returns whether backend health checking is enabled.
@@ -1334,8 +1330,6 @@ type ServerConfig struct {
 	AuthIdleTimeout        string   `toml:"auth_idle_timeout,omitempty"`
 	EnableAffinity         bool     `toml:"enable_affinity,omitempty"`
 	RemoteHealthChecks     *bool    `toml:"remote_health_checks,omitempty"` // Enable backend health checking (default: true)
-	AffinityStickiness     float64  `toml:"affinity_stickiness,omitempty"`
-	AffinityValidity       string   `toml:"affinity_validity,omitempty"`
 
 	// HTTP API specific
 	APIKey       string   `toml:"api_key,omitempty"`
