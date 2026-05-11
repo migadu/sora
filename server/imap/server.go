@@ -539,6 +539,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			imap.CapListStatus:    struct{}{},
 			imap.CapBinary:        struct{}{},
 			imap.CapCondStore:     struct{}{},
+			imap.CapQResync:       struct{}{},
 			imap.CapChildren:      struct{}{},
 			imap.CapID:            struct{}{},
 			imap.CapNamespace:     struct{}{},
@@ -781,10 +782,11 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	// Initialize session with full server capabilities
 	// These will be filtered in GetCapabilities() when JA4 fingerprint becomes available
-	session.sessionCaps = make(imap.CapSet)
+	initialCaps := make(imap.CapSet)
 	for cap := range s.caps {
-		session.sessionCaps[cap] = struct{}{}
+		initialCaps[cap] = struct{}{}
 	}
+	session.sessionCaps.Store(initialCaps)
 
 	// Extract real client IP and proxy IP from PROXY protocol if available
 	// Need to unwrap connection layers to get to proxyProtocolConn

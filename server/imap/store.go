@@ -1,6 +1,8 @@
 package imap
 
 import (
+	"fmt"
+
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/db"
@@ -231,7 +233,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCode("MODIFIED"),
+			Code: imap.ResponseCode(fmt.Sprintf("MODIFIED %s", failedUIDs.String())),
 			Text: "UNCHANGEDSINCE precondition failed for some messages",
 		}
 	}

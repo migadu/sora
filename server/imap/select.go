@@ -233,6 +233,55 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		selectData.HighestModSeq = s.currentHighestModSeq.Load()
 	}
 
+	// Handle QRESYNC parameter if provided
+	// RFC 7162 §3.2.5: QRESYNC SELECT parameter for efficient resynchronization
+	// Note: options.QResync is only populated by imapserver if ENABLE QRESYNC was sent
+	if options != nil && options.QResync != nil {
+		qr := options.QResync
+		s.DebugLog("processing QRESYNC SELECT", "uidvalidity", qr.UIDValidity, "modseq", qr.ModSeq)
+
+		// Validate UIDValidity matches current mailbox
+		// RFC 7162 §3.2.5: If UIDVALIDITY doesn't match, client must resync from scratch
+		if qr.UIDValidity != s.selectedMailbox.UIDValidity {
+			s.DebugLog("QRESYNC UIDVALIDITY mismatch", "client", qr.UIDValidity, "server", s.selectedMailbox.UIDValidity)
+			// Don't return error - just omit VANISHED/Modified responses
+			// Client will detect mismatch and perform full resync
+			return selectData, nil
+		}
+
+		// Get vanished UIDs since client's last modseq
+		vanishedUIDs, err := s.server.rdb.GetVanishedUIDsWithRetry(readCtx, mailbox.ID, qr.ModSeq, selectData.HighestModSeq)
+		if err != nil {
+			s.WarnLog("failed to get vanished UIDs for QRESYNC", "err", err)
+			// Don't fail the SELECT - just omit VANISHED response
+		} else if len(vanishedUIDs) > 0 {
+			// Convert UIDs to optimized ranges
+			selectData.Vanished = convertUIDsToRanges(vanishedUIDs)
+			s.DebugLog("QRESYNC VANISHED", "count", len(vanishedUIDs), "ranges", len(selectData.Vanished))
+		}
+
+		// Get messages that changed since client's last modseq
+		changedMsgs, err := s.server.rdb.GetMessagesChangedSinceWithRetry(readCtx, mailbox.ID, qr.ModSeq)
+		if err != nil {
+			s.WarnLog("failed to get changed messages for QRESYNC", "err", err)
+			// Don't fail the SELECT - just omit Modified responses
+		} else if len(changedMsgs) > 0 {
+			// Build Modified slice with sequence numbers
+			selectData.Modified = make([]imap.SelectModifiedData, 0, len(changedMsgs))
+
+			// For QRESYNC, we report messages that still exist (not expunged)
+			for _, msg := range changedMsgs {
+				selectData.Modified = append(selectData.Modified, imap.SelectModifiedData{
+					SeqNum: msg.SeqNum,
+					UID:    msg.UID,
+					Flags:  msg.Flags,
+					ModSeq: msg.ModSeq,
+				})
+			}
+			s.DebugLog("QRESYNC Modified", "count", len(selectData.Modified))
+		}
+	}
+
 	return selectData, nil
 }
 

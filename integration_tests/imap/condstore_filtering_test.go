@@ -33,8 +33,8 @@ func TestIMAP_CONDSTOREFiltering_iOSBeforeAfterID(t *testing.T) {
 		{
 			ClientName:    "com\\.apple\\.email\\.maild",
 			ClientVersion: ".*",
-			DisableCaps:   []string{"CONDSTORE"},
-			Reason:        "iOS Apple Mail has CONDSTORE implementation issues",
+			DisableCaps:   []string{"CONDSTORE", "QRESYNC"},
+			Reason:        "iOS Apple Mail has CONDSTORE implementation issues (QRESYNC depends on CONDSTORE)",
 		},
 	}
 
@@ -317,8 +317,8 @@ func TestIMAP_CONDSTOREFiltering_NonIOSClient(t *testing.T) {
 		{
 			ClientName:    "com\\.apple\\.email\\.maild",
 			ClientVersion: ".*",
-			DisableCaps:   []string{"CONDSTORE"},
-			Reason:        "iOS Apple Mail has CONDSTORE implementation issues",
+			DisableCaps:   []string{"CONDSTORE", "QRESYNC"},
+			Reason:        "iOS Apple Mail has CONDSTORE implementation issues (QRESYNC depends on CONDSTORE)",
 		},
 	}
 
@@ -393,8 +393,8 @@ func TestIMAP_CONDSTOREFiltering_UnidentifiedClient(t *testing.T) {
 		{
 			ClientName:    "com\\.apple\\.email\\.maild",
 			ClientVersion: ".*",
-			DisableCaps:   []string{"CONDSTORE"},
-			Reason:        "iOS Apple Mail has CONDSTORE implementation issues",
+			DisableCaps:   []string{"CONDSTORE", "QRESYNC"},
+			Reason:        "iOS Apple Mail has CONDSTORE implementation issues (QRESYNC depends on CONDSTORE)",
 		},
 	}
 
@@ -456,8 +456,8 @@ func TestIMAP_CONDSTOREFiltering_ComprehensiveBeforeAfterID(t *testing.T) {
 		{
 			ClientName:    "com\\.apple\\.email\\.maild",
 			ClientVersion: ".*",
-			DisableCaps:   []string{"CONDSTORE"},
-			Reason:        "iOS Apple Mail has CONDSTORE implementation issues",
+			DisableCaps:   []string{"CONDSTORE", "QRESYNC"},
+			Reason:        "iOS Apple Mail has CONDSTORE implementation issues (QRESYNC depends on CONDSTORE)",
 		},
 	}
 

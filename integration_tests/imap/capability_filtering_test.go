@@ -365,8 +365,8 @@ func TestIMAP_CapabilityFiltering_iOSAppleMail(t *testing.T) {
 		{
 			ClientName:    "com\\.apple\\.email\\.maild",
 			ClientVersion: ".*",
-			DisableCaps:   []string{"ESEARCH", "CONDSTORE", "ESORT", "BINARY"},
-			Reason:        "iOS Apple Mail has ESEARCH, CONDSTORE, ESORT, and BINARY implementation issues",
+			DisableCaps:   []string{"ESEARCH", "CONDSTORE", "QRESYNC", "ESORT", "BINARY"},
+			Reason:        "iOS Apple Mail has ESEARCH, CONDSTORE, ESORT, and BINARY implementation issues (QRESYNC depends on CONDSTORE)",
 		},
 	}
 

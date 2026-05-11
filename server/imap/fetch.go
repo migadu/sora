@@ -123,6 +123,33 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	decodedNumSet = s.decodeNumSetLocked(numSet)
 	release()
 
+	// QRESYNC: Handle VANISHED modifier (RFC 7162 §3.2.4)
+	// VANISHED returns UIDs of expunged messages since ChangedSince modseq
+	// Only valid with QRESYNC enabled and ChangedSince parameter
+	if s.GetCapabilities().Has(imap.CapQResync) && options.Vanished && options.ChangedSince > 0 {
+		s.DebugLog("FETCH with VANISHED modifier", "changed_since", options.ChangedSince)
+
+		vanishedUIDs, err := s.server.rdb.GetVanishedUIDsForFetchWithRetry(s.ctx, selectedMailboxID, options.ChangedSince)
+		if err != nil {
+			s.WarnLog("failed to retrieve vanished UIDs", "error", err)
+			// Don't fail the FETCH - just continue without VANISHED response
+		} else if len(vanishedUIDs) > 0 {
+			// Convert UIDs to ranges for efficient transmission
+			uidSet := convertUIDsToRanges(vanishedUIDs)
+			// RFC 7162 §3.2.6: VANISHED (EARLIER) response must appear before FETCH responses
+			// The 'true' parameter indicates this is sent before FETCH responses
+			w.WriteVanished(uidSet, true)
+			s.DebugLog("wrote VANISHED response", "count", len(vanishedUIDs))
+		}
+	} else if options.Vanished {
+		// VANISHED modifier used without QRESYNC or ChangedSince - protocol violation
+		recordMetrics("failure")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Text: "VANISHED requires QRESYNC and CHANGEDSINCE",
+		}
+	}
+
 	needsBodyStructure := options.BodyStructure != nil
 
 	// Check if mailbox changed IMMEDIATELY after acquiring the read lock.
@@ -684,4 +711,30 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 	}
 
 	return data, nil
+}
+
+// convertUIDsToRanges converts a sorted slice of UIDs into UIDSet ranges.
+// This optimizes network transmission by grouping consecutive UIDs.
+// Example: [1,2,3,5,6,10] -> [{Start:1, Stop:3}, {Start:5, Stop:6}, {Start:10, Stop:10}]
+func convertUIDsToRanges(uids []imap.UID) imap.UIDSet {
+	if len(uids) == 0 {
+		return imap.UIDSet{}
+	}
+
+	uidSet := make(imap.UIDSet, 0, len(uids)/2+1) // Estimate ~50% compression
+	start := uids[0]
+	prev := uids[0]
+
+	for i := 1; i < len(uids); i++ {
+		if uids[i] != prev+1 {
+			// End of range
+			uidSet = append(uidSet, imap.UIDRange{Start: start, Stop: prev})
+			start = uids[i]
+		}
+		prev = uids[i]
+	}
+
+	// Add final range
+	uidSet = append(uidSet, imap.UIDRange{Start: start, Stop: prev})
+	return uidSet
 }

@@ -92,6 +92,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -1531,4 +1532,55 @@ func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Conte
 	}
 
 	return result.(*db.DBMailbox), nil
+}
+
+// QRESYNC Support (RFC 7162)
+// These methods provide efficient mailbox resynchronization for IMAP clients.
+
+// GetVanishedUIDsWithRetry returns UIDs that were expunged between sinceModSeq and untilModSeq.
+func (rd *ResilientDatabase) GetVanishedUIDsWithRetry(ctx context.Context, mailboxID int64, sinceModSeq, untilModSeq uint64) ([]imap.UID, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetVanishedUIDs(ctx, mailboxID, sinceModSeq, untilModSeq)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]imap.UID), nil
+}
+
+// GetMessagesChangedSinceWithRetry returns messages that were created or modified after sinceModSeq.
+func (rd *ResilientDatabase) GetMessagesChangedSinceWithRetry(ctx context.Context, mailboxID int64, sinceModSeq uint64) ([]db.QResyncModifiedMessage, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetMessagesChangedSince(ctx, mailboxID, sinceModSeq)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]db.QResyncModifiedMessage), nil
+}
+
+// GetVanishedUIDsForFetchWithRetry returns vanished UIDs for FETCH VANISHED modifier.
+func (rd *ResilientDatabase) GetVanishedUIDsForFetchWithRetry(ctx context.Context, mailboxID int64, sinceModSeq uint64) ([]imap.UID, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(false).GetVanishedUIDsForFetch(ctx, mailboxID, sinceModSeq)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]imap.UID), nil
+}
+
+// ValidateQResyncUIDValidityWithRetry checks if the client's UIDValidity matches the current mailbox.
+func (rd *ResilientDatabase) ValidateQResyncUIDValidityWithRetry(ctx context.Context, mailboxID int64, clientUIDValidity uint32) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(false).ValidateQResyncUIDValidity(ctx, mailboxID, clientUIDValidity)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
 }

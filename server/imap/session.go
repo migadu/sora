@@ -39,7 +39,7 @@ type IMAPSession struct {
 	clientID       *imap.IDData
 	ja4Fingerprint string                                           // JA4 TLS fingerprint
 	ja4Conn        interface{ GetJA4Fingerprint() (string, error) } // Reference to JA4 conn if fingerprint not yet available
-	sessionCaps    imap.CapSet                                      // Per-session capabilities after filtering
+	sessionCaps    atomic.Value                                     // imap.CapSet - per-session capabilities after filtering (lock-free access)
 
 	// Atomic counters for lock-free access
 	currentHighestModSeq atomic.Uint64
@@ -66,9 +66,6 @@ func (s *IMAPSession) Context() context.Context {
 
 // GetCapabilities returns the effective capabilities for this session
 // If session-specific capabilities haven't been set, it returns the server's default capabilities
-// GetCapabilities returns the effective capabilities for this session
-// If session-specific capabilities haven't been set, it returns the server's default capabilities
-// GetCapabilities returns the effective capabilities for this session
 func (s *IMAPSession) GetCapabilities() imap.CapSet {
 
 	// If we have a pending JA4 connection, try to capture fingerprint now
@@ -80,16 +77,30 @@ func (s *IMAPSession) GetCapabilities() imap.CapSet {
 			s.InfoLog("JA4 fingerprint captured during lazy evaluation", "fingerprint", s.ja4Fingerprint)
 
 			// Re-initialize capabilities from server defaults
-			s.sessionCaps = make(imap.CapSet)
+			caps := make(imap.CapSet)
 			for cap := range s.server.caps {
-				s.sessionCaps[cap] = struct{}{}
+				caps[cap] = struct{}{}
 			}
+			s.sessionCaps.Store(caps)
 
 			s.applyCapabilityFilters()
 		}
 	}
 
-	return s.sessionCaps
+	// Atomic load - safe for concurrent access
+	// Return a copy to prevent concurrent modification issues
+	if capsVal := s.sessionCaps.Load(); capsVal != nil {
+		stored := capsVal.(imap.CapSet)
+		// Make a defensive copy - maps are reference types!
+		caps := make(imap.CapSet, len(stored))
+		for k, v := range stored {
+			caps[k] = v
+		}
+		return caps
+	}
+
+	// Fallback to server capabilities if not yet initialized
+	return s.server.caps
 }
 
 // SetClientID stores the client ID information and applies capability filtering
@@ -101,14 +112,17 @@ func (s *IMAPSession) SetClientID(clientID *imap.IDData) {
 // applyCapabilityFilters applies client-specific capability filtering based on client ID and TLS fingerprint
 func (s *IMAPSession) applyCapabilityFilters() {
 	// Start with the server's full capability set
-	s.sessionCaps = make(imap.CapSet)
+	caps := make(imap.CapSet)
 	originalCapCount := len(s.server.caps)
 	for cap := range s.server.caps {
-		s.sessionCaps[cap] = struct{}{}
+		caps[cap] = struct{}{}
 	}
 
 	// Apply capability filtering based on client identification and/or TLS fingerprint
-	disabledCaps := s.server.filterCapabilitiesForClient(s.sessionCaps, s.clientID, s.ja4Fingerprint)
+	disabledCaps := s.server.filterCapabilitiesForClient(caps, s.clientID, s.ja4Fingerprint)
+
+	// Atomic store - safe for concurrent access
+	s.sessionCaps.Store(caps)
 
 	if len(disabledCaps) > 0 {
 		var clientInfo string
@@ -119,7 +133,7 @@ func (s *IMAPSession) applyCapabilityFilters() {
 		} else {
 			clientInfo = "unknown client"
 		}
-		s.InfoLog("capability filters applied", "client", clientInfo, "disabled", disabledCaps, "enabled", len(s.sessionCaps), "total", originalCapCount)
+		s.InfoLog("capability filters applied", "client", clientInfo, "disabled", disabledCaps, "enabled", len(caps), "total", originalCapCount)
 	}
 }
 
