@@ -11,8 +11,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/BurntSushi/toml"
-	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/server/relayqueue"
 )
 
@@ -45,15 +43,10 @@ func handleRelayCommand(ctx context.Context) {
 
 func handleRelayStats(_ context.Context) {
 	flags := flag.NewFlagSet("relay stats", flag.ExitOnError)
-	configPath := flags.String("config", "config.toml", "Configuration file path")
 	flags.Parse(os.Args[3:])
 
-	// Load config to get relay queue path
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		os.Exit(1)
-	}
+	// Use global config for relay queue path
+	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
 		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
@@ -89,17 +82,12 @@ func handleRelayStats(_ context.Context) {
 
 func handleRelayList(_ context.Context) {
 	flags := flag.NewFlagSet("relay list", flag.ExitOnError)
-	configPath := flags.String("config", "config.toml", "Configuration file path")
 	queueType := flags.String("queue", "pending", "Queue to list (pending, processing, failed)")
 	limit := flags.Int("limit", 100, "Maximum number of messages to display")
 	flags.Parse(os.Args[3:])
 
-	// Load config
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		os.Exit(1)
-	}
+	// Use global config
+	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
 		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
@@ -195,7 +183,6 @@ func handleRelayList(_ context.Context) {
 
 func handleRelayShow(_ context.Context) {
 	flags := flag.NewFlagSet("relay show", flag.ExitOnError)
-	configPath := flags.String("config", "config.toml", "Configuration file path")
 	messageID := flags.String("id", "", "Message ID to display (required)")
 	queueType := flags.String("queue", "pending", "Queue to search (pending, processing, failed)")
 	flags.Parse(os.Args[3:])
@@ -206,12 +193,8 @@ func handleRelayShow(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// Load config
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		os.Exit(1)
-	}
+	// Use global config
+	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
 		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
@@ -280,7 +263,6 @@ func handleRelayShow(_ context.Context) {
 
 func handleRelayDelete(_ context.Context) {
 	flags := flag.NewFlagSet("relay delete", flag.ExitOnError)
-	configPath := flags.String("config", "config.toml", "Configuration file path")
 	messageID := flags.String("id", "", "Message ID to delete (use 'all' to delete all messages)")
 	queueType := flags.String("queue", "failed", "Queue to delete from (pending, processing, failed)")
 	confirm := flags.Bool("confirm", false, "Confirm deletion (required)")
@@ -297,12 +279,8 @@ func handleRelayDelete(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// Load config
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		os.Exit(1)
-	}
+	// Use global config
+	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
 		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
@@ -361,7 +339,6 @@ func handleRelayDelete(_ context.Context) {
 
 func handleRelayRequeue(_ context.Context) {
 	flags := flag.NewFlagSet("relay requeue", flag.ExitOnError)
-	configPath := flags.String("config", "config.toml", "Configuration file path")
 	messageID := flags.String("id", "", "Message ID to requeue (use 'all' to requeue all failed messages)")
 	confirm := flags.Bool("confirm", false, "Confirm requeue operation (required)")
 	flags.Parse(os.Args[3:])
@@ -377,12 +354,8 @@ func handleRelayRequeue(_ context.Context) {
 		os.Exit(1)
 	}
 
-	// Load config
-	cfg, err := loadConfig(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-		os.Exit(1)
-	}
+	// Use global config
+	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
 		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
@@ -525,19 +498,4 @@ Notes:
   - Queue types: pending, processing, failed
   - Requeue resets attempt count and clears error history
 `)
-}
-
-// loadConfig is a helper to load relay-specific config
-func loadConfig(path string) (*config.Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
-	}
-
-	var cfg config.Config
-	if err := toml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse config: %w", err)
-	}
-
-	return &cfg, nil
 }

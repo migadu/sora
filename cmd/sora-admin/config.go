@@ -68,6 +68,9 @@ func handleConfigValidate(_ context.Context) {
 		if os.Args[i] == "--config" && i+1 < len(os.Args) {
 			configFile = os.Args[i+1]
 			break
+		} else if strings.HasPrefix(os.Args[i], "--config=") {
+			configFile = strings.TrimPrefix(os.Args[i], "--config=")
+			break
 		}
 	}
 
@@ -178,6 +181,9 @@ func handleConfigDump(_ context.Context) {
 		if os.Args[i] == "--config" && i+1 < len(os.Args) {
 			configFile = os.Args[i+1]
 			skipNext = true
+			continue
+		} else if strings.HasPrefix(os.Args[i], "--config=") {
+			configFile = strings.TrimPrefix(os.Args[i], "--config=")
 			continue
 		}
 		if os.Args[i] == "dump" {

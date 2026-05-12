@@ -43,6 +43,7 @@ type AdminConfig struct {
 	HTTPAPIAddr               string                       `toml:"http_api_addr"`                 // HTTP API address for kick operations (e.g., "http://localhost:8080")
 	HTTPAPIKey                string                       `toml:"http_api_key"`                  // HTTP API key for authentication
 	HTTPAPIInsecureSkipVerify bool                         `toml:"http_api_insecure_skip_verify"` // Skip TLS certificate verification (default: true for localhost)
+	Relay                     config.RelayConfig           `toml:"relay"`
 }
 
 // GetImportMessageLimit returns the import message size limit with proper fallback logic
@@ -116,6 +117,7 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	cfg.DynamicServers = fullCfg.DynamicServers
 	cfg.HTTPAPIAddr = fullCfg.AdminCLI.Addr
 	cfg.HTTPAPIKey = fullCfg.AdminCLI.APIKey
+	cfg.Relay = fullCfg.Relay
 
 	// Default to true for insecure skip verify (safer for localhost usage)
 	cfg.HTTPAPIInsecureSkipVerify = true
@@ -162,6 +164,9 @@ func main() {
 		// Skip --config and its value when looking for command
 		if os.Args[i] == "--config" && i+1 < len(os.Args) {
 			i++ // Skip the value
+		} else if strings.HasPrefix(os.Args[i], "--config=") {
+			// Skip the --config=value flag entirely
+			continue
 		}
 	}
 
@@ -184,6 +189,8 @@ func main() {
 		if os.Args[i] == "--config" && i+1 < len(os.Args) {
 			configPath = os.Args[i+1]
 			i++ // Skip the config path value
+		} else if strings.HasPrefix(os.Args[i], "--config=") {
+			configPath = strings.TrimPrefix(os.Args[i], "--config=")
 		} else {
 			newArgs = append(newArgs, os.Args[i])
 		}

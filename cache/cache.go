@@ -220,32 +220,6 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 		c.shards[i] = &cacheShard{db: db}
 	}
 
-	// Legacy migration
-	legacyPath := filepath.Join(basePath, IndexDB)
-	if _, err := os.Stat(legacyPath); err == nil {
-		logger.Info("Cache: Found legacy cache_index.db, migrating to shards")
-		legacyDb, err := sql.Open("sqlite", legacyPath)
-		if err == nil {
-			rows, err := legacyDb.Query(`SELECT path, size, mod_time FROM cache_index`)
-			if err == nil {
-				for rows.Next() {
-					var path string
-					var size int64
-					var modTime time.Time
-					if err := rows.Scan(&path, &size, &modTime); err == nil {
-						relPath, _ := filepath.Rel(dataDir, path)
-						hash := strings.ReplaceAll(relPath, string(filepath.Separator), "")
-						shard := c.getShard(hash)
-						shard.db.Exec(`INSERT OR IGNORE INTO cache_index (path, size, mod_time) VALUES (?, ?, ?)`, path, size, modTime)
-					}
-				}
-				rows.Close()
-			}
-			legacyDb.Close()
-			os.Rename(legacyPath, legacyPath+".migrated") // TODO: remove after deployment
-		}
-	}
-
 	go c.processAccessLog()
 	c.StartPurgeLoop(context.Background())
 	return c, nil
