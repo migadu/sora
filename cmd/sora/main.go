@@ -636,10 +636,6 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			errorHandler.FatalError("initialize cache", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
-		if err := deps.cacheInstance.SyncFromDisk(); err != nil {
-			errorHandler.FatalError("sync cache from disk", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
 		deps.cacheInstance.StartPurgeLoop(ctx)
 
 		// Register cache health check
@@ -653,7 +649,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 				if err != nil {
 					return fmt.Errorf("cache error: %w", err)
 				}
-				if stats.TotalSize < 0 {
+				if stats.TotalSizeBytes < 0 {
 					return fmt.Errorf("cache stats unavailable")
 				}
 				return nil

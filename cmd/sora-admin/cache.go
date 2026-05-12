@@ -227,10 +227,10 @@ func showCacheStats(ctx context.Context, cfg AdminConfig) error {
 	fmt.Printf("================\n\n")
 	fmt.Printf("Cache path:         %s\n", cfg.LocalCache.Path)
 	fmt.Printf("Object count:       %d\n", stats.ObjectCount)
-	fmt.Printf("Total size:         %d bytes (%s)\n", stats.TotalSize, formatBytes(stats.TotalSize))
+	fmt.Printf("Total size:         %d bytes (%s)\n", stats.TotalSizeBytes, formatBytes(stats.TotalSizeBytes))
 	fmt.Printf("Capacity:           %d bytes (%s)\n", capacityBytes, cfg.LocalCache.Capacity)
 	fmt.Printf("Max object size:    %d bytes (%s)\n", maxObjectSizeBytes, cfg.LocalCache.MaxObjectSize)
-	fmt.Printf("Utilization:        %.1f%%\n", float64(stats.TotalSize)/float64(capacityBytes)*100)
+	fmt.Printf("Utilization:        %.1f%%\n", float64(stats.TotalSizeBytes)/float64(capacityBytes)*100)
 
 	return nil
 }
@@ -277,7 +277,7 @@ func purgeCacheWithConfirmation(ctx context.Context, cfg AdminConfig, autoConfir
 		return fmt.Errorf("failed to get cache statistics before purge: %w", err)
 	}
 
-	fmt.Printf("Purging %d objects (%s) from cache...\n", stats.ObjectCount, formatBytes(stats.TotalSize))
+	fmt.Printf("Purging %d objects (%s) from cache...\n", stats.ObjectCount, formatBytes(stats.TotalSizeBytes))
 
 	// Purge all cached objects
 	if err := cacheInstance.PurgeAll(ctx); err != nil {

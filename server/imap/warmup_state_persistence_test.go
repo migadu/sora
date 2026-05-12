@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -339,8 +340,7 @@ func TestWarmupStateAtomicWrite(t *testing.T) {
 		t.Fatalf("Failed to read dir: %v", err)
 	}
 	for _, entry := range entries {
-		if entry.Name() != warmupStateFile && entry.Name() != "data" && entry.Name() != "cache_index.db" &&
-			entry.Name() != "cache_index.db-wal" && entry.Name() != "cache_index.db-shm" {
+		if entry.Name() != warmupStateFile && entry.Name() != "data" && !strings.HasPrefix(entry.Name(), "cache_index") {
 			t.Errorf("Unexpected file in cache dir: %s (possible leaked temp file)", entry.Name())
 		}
 	}
