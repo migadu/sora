@@ -52,6 +52,7 @@ func setupIMAPServerWithMasterAuth(t *testing.T) (*common.TestServer, common.Tes
 		1,
 		3,
 		time.Second,
+		0,
 		"test-instance",
 		rdb,
 		&storage.S3Storage{},

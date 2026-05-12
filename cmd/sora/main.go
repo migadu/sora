@@ -740,15 +740,20 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		// Initialize and start the upload worker
 		retryInterval := cfg.Uploader.GetRetryIntervalWithDefault()
 		uploadErrChan := make(chan error, 1)
-		deps.uploadWorker, err = uploader.New(ctx, cfg.Uploader.Path, cfg.Uploader.BatchSize, cfg.Uploader.Concurrency, cfg.Uploader.MaxAttempts, retryInterval, hostname, deps.resilientDB, deps.storage, deps.cacheInstance, uploadErrChan)
+		maxStagingSize, err := cfg.Uploader.GetMaxStagingSize()
+		if err != nil {
+			errorHandler.FatalError("parse uploader max_staging_size", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+		deps.uploadWorker, err = uploader.New(ctx, cfg.Uploader.Path, cfg.Uploader.BatchSize, cfg.Uploader.Concurrency, cfg.Uploader.MaxAttempts, retryInterval, maxStagingSize, hostname, deps.resilientDB, deps.storage, deps.cacheInstance, uploadErrChan)
 		if err != nil {
 			errorHandler.FatalError("create upload worker", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
 		cleanupGracePeriod, cgpErr := cfg.Uploader.GetCleanupGracePeriod()
 		if cgpErr != nil {
-			logger.Warn("Failed to parse uploader cleanup_grace_period - using default (1h)", "error", cgpErr)
-			cleanupGracePeriod = time.Hour
+			errorHandler.FatalError("parse uploader cleanup_grace_period", cgpErr)
+			os.Exit(errorHandler.WaitForExit())
 		}
 		deps.uploadWorker.SetCleanupGracePeriod(cleanupGracePeriod)
 

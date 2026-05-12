@@ -399,6 +399,7 @@ type UploaderConfig struct {
 	MaxAttempts        int    `toml:"max_attempts"`
 	RetryInterval      string `toml:"retry_interval"`
 	CleanupGracePeriod string `toml:"cleanup_grace_period"` // Minimum age of a local upload file before cleanup considers it (default: "1h"). Must exceed the longest possible DB transaction to avoid the race where a file is deleted before its pending_upload record commits.
+	MaxStagingSize     string `toml:"max_staging_size"`     // Maximum size of the global upload staging queue (e.g. "100gb"). If set and exceeded, new appends are rejected.
 }
 
 // GetRetryInterval parses the retry interval duration
@@ -417,6 +418,14 @@ func (c *UploaderConfig) GetCleanupGracePeriod() (time.Duration, error) {
 		return time.Hour, nil // safe default: no real transaction stays open for an hour
 	}
 	return helpers.ParseDuration(c.CleanupGracePeriod)
+}
+
+// GetMaxStagingSize parses the maximum staging size.
+func (c *UploaderConfig) GetMaxStagingSize() (int64, error) {
+	if c.MaxStagingSize == "" {
+		return 0, nil // 0 means no limit
+	}
+	return helpers.ParseSize(c.MaxStagingSize)
 }
 
 // ProxyProtocolConfig holds PROXY protocol configuration

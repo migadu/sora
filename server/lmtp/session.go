@@ -591,6 +591,18 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	// Check if file already exists to prevent race condition:
 	// If a duplicate arrives while uploader is processing the first copy,
 	// we don't want to overwrite/delete the file the uploader is reading.
+
+	// Safety guard: Reject if global staging limit is exceeded
+	if s.backend.uploader.IsStagingLimitExceeded(int64(len(fullMessageBytes))) {
+		s.WarnLog("rejecting delivery due to upload staging size limit exceeded")
+		recordMetrics("failure")
+		return &smtp.SMTPError{
+			Code:         452,
+			EnhancedCode: smtp.EnhancedCode{4, 3, 1},
+			Message:      "Insufficient system storage",
+		}
+	}
+
 	expectedPath := s.backend.uploader.FilePath(contentHash, s.AccountID())
 	var filePath *string
 	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {

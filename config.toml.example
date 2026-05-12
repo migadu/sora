@@ -520,6 +520,8 @@ batch_size = 20               # Number of messages batched together per upload o
 concurrency = 10              # Number of concurrent upload workers.
 max_attempts = 5              # Maximum retry attempts for failed uploads.
 retry_interval = "30s"        # Initial delay between retry attempts (exponential backoff is applied).
+cleanup_grace_period = "1h"   # Minimum age of a local upload file before cleanup considers it.
+max_staging_size = "100gb"    # Maximum size of the global upload staging queue (e.g. "100gb"). If set and exceeded, new appends are rejected.
 
 # CLEANUP PROCESS CONFIGURATION
 # =============================================================================

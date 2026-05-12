@@ -69,6 +69,7 @@ if envelope :matches :detail "To" "*" {
 		2,             // concurrency
 		3,             // max attempts
 		5*time.Second, // retry interval
+		0,             // maxStagingSize
 		"test-shared-host",
 		rdb,
 		s3Storage,

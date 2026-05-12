@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -83,6 +84,9 @@ type UploadWorker struct {
 	// NotifyUploadQueued processes the queue in the caller's goroutine
 	// instead of waking the background worker.  See EnableSyncUpload.
 	syncUpload syncBool
+
+	maxStagingSize     int64
+	currentStagingSize int64 // Atomic tracker for the global staging queue size
 }
 
 // syncBool is a goroutine-safe boolean flag backed by a sync.Mutex.
@@ -107,7 +111,7 @@ func (b *syncBool) Load() bool {
 	return b.val
 }
 
-func New(ctx context.Context, path string, batchSize int, concurrency int, maxAttempts int, retryInterval time.Duration, instanceID string, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, errCh chan<- error) (*UploadWorker, error) {
+func New(ctx context.Context, path string, batchSize int, concurrency int, maxAttempts int, retryInterval time.Duration, maxStagingSize int64, instanceID string, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, errCh chan<- error) (*UploadWorker, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		if err := os.MkdirAll(path, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create local path %s: %w", path, err)
@@ -122,36 +126,37 @@ func New(ctx context.Context, path string, batchSize int, concurrency int, maxAt
 	if cache != nil {
 		uploaderCache = cache
 	}
-	return newWithS3Interface(path, batchSize, concurrency, maxAttempts, retryInterval, instanceID, rdb, resilientS3, uploaderCache, errCh)
+	return newWithS3Interface(path, batchSize, concurrency, maxAttempts, retryInterval, maxStagingSize, instanceID, rdb, resilientS3, uploaderCache, errCh)
 }
 
 // NewWithS3Interface creates an UploadWorker with custom UploaderS3 and UploaderCache
 // implementations.  This is intended for test environments where a no-op S3 and/or
 // a no-op cache are needed.  The caller is responsible for any wrapping it requires.
-func NewWithS3Interface(path string, batchSize int, concurrency int, maxAttempts int, retryInterval time.Duration, instanceID string, rdb *resilient.ResilientDatabase, s3 UploaderS3, uploaderCache UploaderCache, errCh chan<- error) (*UploadWorker, error) {
+func NewWithS3Interface(path string, batchSize int, concurrency int, maxAttempts int, retryInterval time.Duration, maxStagingSize int64, instanceID string, rdb *resilient.ResilientDatabase, s3 UploaderS3, uploaderCache UploaderCache, errCh chan<- error) (*UploadWorker, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		if err := os.MkdirAll(path, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create local path %s: %w", path, err)
 		}
 	}
-	return newWithS3Interface(path, batchSize, concurrency, maxAttempts, retryInterval, instanceID, rdb, s3, uploaderCache, errCh)
+	return newWithS3Interface(path, batchSize, concurrency, maxAttempts, retryInterval, maxStagingSize, instanceID, rdb, s3, uploaderCache, errCh)
 }
 
-func newWithS3Interface(path string, batchSize int, concurrency int, maxAttempts int, retryInterval time.Duration, instanceID string, rdb *resilient.ResilientDatabase, s3 UploaderS3, uploaderCache UploaderCache, errCh chan<- error) (*UploadWorker, error) {
+func newWithS3Interface(path string, batchSize int, concurrency int, maxAttempts int, retryInterval time.Duration, maxStagingSize int64, instanceID string, rdb *resilient.ResilientDatabase, s3 UploaderS3, uploaderCache UploaderCache, errCh chan<- error) (*UploadWorker, error) {
 	notifyCh := make(chan struct{}, 1)
 	return &UploadWorker{
-		rdb:           rdb,
-		s3:            s3,
-		cache:         uploaderCache,
-		errCh:         errCh,
-		path:          path,
-		batchSize:     batchSize,
-		concurrency:   concurrency,
-		maxAttempts:   maxAttempts,
-		retryInterval: retryInterval,
-		instanceID:    instanceID,
-		notifyCh:      notifyCh,
-		stopCh:        make(chan struct{}),
+		rdb:            rdb,
+		s3:             s3,
+		cache:          uploaderCache,
+		errCh:          errCh,
+		path:           path,
+		batchSize:      batchSize,
+		concurrency:    concurrency,
+		maxAttempts:    maxAttempts,
+		retryInterval:  retryInterval,
+		maxStagingSize: maxStagingSize,
+		instanceID:     instanceID,
+		notifyCh:       notifyCh,
+		stopCh:         make(chan struct{}),
 	}, nil
 }
 
@@ -713,6 +718,9 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 	metrics.QueueDepth.WithLabelValues("s3_upload_pending").Set(float64(stats.TotalPending))
 	metrics.QueueDepth.WithLabelValues("s3_upload_failed").Set(float64(stats.FailedUploads))
 
+	// Update atomic cache for the staging limit guard
+	atomic.StoreInt64(&w.currentStagingSize, stats.TotalPendingSize)
+
 	// Log summary
 	if stats.TotalPending > 0 || stats.FailedUploads > 0 {
 		logger.Info("UploaderMonitor: Queue status", "pending", stats.TotalPending,
@@ -735,6 +743,16 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// IsStagingLimitExceeded checks if the total staging size across the system
+// plus the provided additional size exceeds the configured max staging size.
+func (w *UploadWorker) IsStagingLimitExceeded(additionalSize int64) bool {
+	if w.maxStagingSize <= 0 {
+		return false // No limit configured
+	}
+	currentSize := atomic.LoadInt64(&w.currentStagingSize)
+	return currentSize+additionalSize > w.maxStagingSize
 }
 
 func removeEmptyParents(path, stopAt string) {

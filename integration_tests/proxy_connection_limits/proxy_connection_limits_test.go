@@ -54,6 +54,7 @@ func setupIMAPServerWithProxyProtocol(t *testing.T, maxTotal, maxPerIP int, trus
 		1,                    // concurrency
 		3,                    // maxAttempts
 		time.Second,          // retryInterval
+		0,                    // maxStagingSize
 		"test-instance",      // instanceID
 		rdb,                  // database
 		&storage.S3Storage{}, // S3 storage

@@ -34,7 +34,7 @@ func TestInsecureAuthAutoEnabled_IMAP(t *testing.T) {
 	errCh := make(chan error, 1)
 	uploadWorker, err := uploader.New(
 		context.Background(), tempDir, 10, 1, 3, time.Second,
-		"test-instance", rdb, &storage.S3Storage{}, nil, errCh,
+		0, "test-instance", rdb, &storage.S3Storage{}, nil, errCh,
 	)
 	if err != nil {
 		t.Fatalf("Failed to create upload worker: %v", err)
@@ -93,7 +93,7 @@ func TestInsecureAuthExplicitlyEnabled_IMAP(t *testing.T) {
 	errCh := make(chan error, 1)
 	uploadWorker, err := uploader.New(
 		context.Background(), tempDir, 10, 1, 3, time.Second,
-		"test-instance", rdb, &storage.S3Storage{}, nil, errCh,
+		0, "test-instance", rdb, &storage.S3Storage{}, nil, errCh,
 	)
 	if err != nil {
 		t.Fatalf("Failed to create upload worker: %v", err)

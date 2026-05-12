@@ -138,6 +138,14 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// Check if file already exists to prevent race condition:
 	// If a duplicate arrives while uploader is processing the first copy,
 	// we don't want to overwrite/delete the file the uploader is reading.
+
+	// Safety guard: Reject if global staging limit is exceeded
+	if d.Uploader.IsStagingLimitExceeded(int64(len(messageBytes))) {
+		d.Logger.Log("Rejecting delivery due to upload staging size limit exceeded")
+		result.ErrorMessage = "Insufficient system storage (staging limit reached)"
+		return result, fmt.Errorf("staging limit exceeded")
+	}
+
 	expectedPath := d.Uploader.FilePath(contentHash, recipient.AccountID)
 	var filePath *string
 	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {

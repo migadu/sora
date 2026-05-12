@@ -226,6 +226,20 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		recordMetrics("failure")
 		return nil, s.internalError("uploader not configured - cannot store message")
 	}
+
+	// Safety guard: Reject if global staging limit is exceeded
+	if s.server.uploader.IsStagingLimitExceeded(int64(len(fullMessageBytes))) {
+		s.WarnLog("rejecting APPEND due to upload staging size limit exceeded")
+		imapErr := &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeUnavailable,
+			Text: "System storage limit reached, please try again later",
+		}
+		s.classifyAndTrackError("APPEND", nil, imapErr)
+		recordMetrics("failure")
+		return nil, imapErr
+	}
+
 	expectedPath := s.server.uploader.FilePath(contentHash, s.AccountID())
 	var filePath *string
 	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {

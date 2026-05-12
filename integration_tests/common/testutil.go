@@ -262,6 +262,7 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 		1,           // concurrency
 		3,           // maxAttempts
 		time.Second, // retryInterval
+		0,           // maxStagingSize
 		"localhost", // instanceID — must match imap.New hostname arg
 		rdb,         // database
 		&NoopUploaderS3{},
@@ -372,6 +373,7 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 		1,                    // concurrency
 		3,                    // maxAttempts
 		time.Second,          // retryInterval
+		0,                    // maxStagingSize
 		"test-instance",      // instanceID
 		rdb,                  // database
 		&storage.S3Storage{}, // S3 storage
@@ -500,6 +502,7 @@ func SetupLMTPServer(t *testing.T) (*TestServer, TestAccount) {
 		2,           // concurrency
 		3,           // max attempts
 		time.Second, // retry interval
+		0,           // maxStagingSize
 		"localhost", // instanceID must match lmtp.New hostname arg
 		rdb,
 		&NoopUploaderS3{},
@@ -665,6 +668,7 @@ func SetupIMAPServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 		1,                    // concurrency
 		3,                    // maxAttempts
 		time.Second,          // retryInterval
+		0,                    // maxStagingSize
 		"test-instance",      // instanceID
 		rdb,                  // database
 		&storage.S3Storage{}, // S3 storage
@@ -756,6 +760,7 @@ func SetupIMAPServerWithPROXYAndDatabase(t *testing.T, rdb *resilient.ResilientD
 		1,                    // concurrency
 		3,                    // maxAttempts
 		time.Second,          // retryInterval
+		0,                    // maxStagingSize
 		"test-instance",      // instanceID
 		rdb,                  // database
 		&storage.S3Storage{}, // S3 storage
@@ -849,6 +854,7 @@ func SetupIMAPServerWithMaster(t *testing.T) (*TestServer, TestAccount) {
 		1,                    // concurrency
 		3,                    // maxAttempts
 		time.Second,          // retryInterval
+		0,                    // maxStagingSize
 		"test-instance",      // instanceID
 		rdb,                  // database
 		&storage.S3Storage{}, // S3 storage
@@ -1232,6 +1238,7 @@ func SetupLMTPServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 		2,               // concurrency
 		3,               // maxAttempts
 		5*time.Second,   // retryInterval
+		0,               // maxStagingSize
 		"test-instance", // instanceID
 		rdb,             // database
 		s3Storage,       // s3
@@ -1319,6 +1326,7 @@ func SetupLMTPServerWithXCLIENT(t *testing.T) (*TestServer, TestAccount) {
 		2,               // concurrency
 		3,               // maxAttempts
 		5*time.Second,   // retryInterval
+		0,               // maxStagingSize
 		"test-instance", // instanceID
 		rdb,             // database
 		s3Storage,       // s3

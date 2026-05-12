@@ -45,6 +45,7 @@ func setupIMAPServerWithTLS(t *testing.T, tlsEnabled bool, certFile, keyFile str
 		1,                    // concurrency
 		3,                    // maxAttempts
 		time.Second,          // retryInterval
+		0,                    // maxStagingSize
 		"test-instance",      // instanceID
 		rdb,                  // database
 		&storage.S3Storage{}, // S3 storage

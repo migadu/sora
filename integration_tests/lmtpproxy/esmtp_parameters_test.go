@@ -42,6 +42,7 @@ func TestLMTPProxyESMTPParameters(t *testing.T) {
 		2,             // concurrency
 		3,             // max attempts
 		5*time.Second, // retry interval
+		0,             // maxStagingSize
 		"test-backend",
 		rdb,
 		s3,
@@ -289,6 +290,7 @@ func TestLMTPProxyFullDeliveryWithESMTP(t *testing.T) {
 		2,             // concurrency
 		3,             // max attempts
 		5*time.Second, // retry interval
+		0,             // maxStagingSize
 		"test-backend",
 		rdb,
 		s3,

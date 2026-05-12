@@ -44,6 +44,7 @@ func SetupIMAPServerWithConnectionTracking(t *testing.T, maxConnectionsPerUser i
 		1,
 		3,
 		time.Second,
+		0,
 		"test-instance",
 		rdb,
 		&storage.S3Storage{},

@@ -43,7 +43,7 @@ func TestProxyRealClientIPLimiting(t *testing.T) {
 	errCh := make(chan error, 1)
 	uploadWorker, err := uploader.New(
 		context.Background(),
-		tempDir, 10, 1, 3, time.Second,
+		tempDir, 10, 1, 3, time.Second, 0,
 		"test-instance", rdb, &storage.S3Storage{}, nil, errCh,
 	)
 	if err != nil {

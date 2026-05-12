@@ -52,6 +52,7 @@ func TestLMTP_PlusAddressingWithSharedUploader(t *testing.T) {
 		2,           // concurrency
 		3,           // max attempts
 		time.Second, // retry interval
+		0,
 		"localhost", // must match lmtp/imap server hostname
 		rdb,
 		&common.NoopUploaderS3{},
@@ -322,6 +323,7 @@ fileinto :create "Projects/RFC5490";
 		2,
 		3,
 		time.Second,
+		0,
 		"localhost",
 		rdb,
 		&common.NoopUploaderS3{},
@@ -557,7 +559,8 @@ if header :contains "subject" ["Izvod po dinarskom", "Izvod po deviznom"] {
 		2,
 		3,
 		5*time.Second,
-		"test-host",
+		0,
+		"test-instance",
 		rdb,
 		s3Storage,
 		nil,

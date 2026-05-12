@@ -89,11 +89,12 @@ if envelope :matches :detail "To" "*" {
 	sharedUploader, err := uploader.New(
 		ctx,
 		sharedTempDir,
-		10,            // batch size
-		2,             // concurrency
-		3,             // max attempts
-		5*time.Second, // retry interval
-		"test-shared-host",
+		10,              // batch size
+		2,               // concurrency
+		3,               // maxAttempts
+		time.Second,     // retryInterval
+		0,               // maxStagingSize
+		"test-instance", // instanceID",
 		rdb,
 		s3Storage,
 		nil, // cache
