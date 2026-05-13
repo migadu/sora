@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/emersion/go-message"
-	"github.com/foxcpp/go-sieve"
-	"github.com/foxcpp/go-sieve/interp"
+	"github.com/migadu/go-sieve"
+	"github.com/migadu/go-sieve/interp"
 	"github.com/migadu/sora/server/managesieve"
 )
 

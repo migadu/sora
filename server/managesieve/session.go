@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/foxcpp/go-sieve"
+	"github.com/migadu/go-sieve"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"

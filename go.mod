@@ -15,13 +15,13 @@ require (
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/emersion/go-smtp v0.24.0
 	github.com/exaring/ja4plus v0.0.2
-	github.com/foxcpp/go-sieve v0.0.0-20240130002450-72d6b002882a
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/golang-migrate/migrate/v4 v4.19.0
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/memberlist v0.5.3
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/k3a/html2text v1.2.1
+	github.com/migadu/go-sieve v1.0.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/stretchr/testify v1.11.1
@@ -33,8 +33,6 @@ require (
 )
 
 // Use forked versions until upstreams are updated
-replace github.com/foxcpp/go-sieve => github.com/migadu/go-sieve v0.0.0-20260206073348-d47e90518da5
-
 replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20260511103356-493ff5a8f548
 
 replace github.com/emersion/go-smtp => github.com/dejanstrbac/go-smtp v0.0.0-20260313205502-a1dea4f0d630

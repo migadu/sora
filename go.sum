@@ -187,8 +187,8 @@ github.com/migadu/go-imap/v2 v2.0.0-20260511103356-493ff5a8f548 h1:GJ93eIm3CFamC
 github.com/migadu/go-imap/v2 v2.0.0-20260511103356-493ff5a8f548/go.mod h1:fANqLgPMG/WlVwUYwI7s1XWnNZqgM9FSvlecO/hs1WI=
 github.com/migadu/go-message v0.0.0-20251204083122-d583d81190da h1:AOv2uDrSq1ly/RkWa46Dt6+Uj3nKyrPBd3AMhZxRSLk=
 github.com/migadu/go-message v0.0.0-20251204083122-d583d81190da/go.mod h1:XpJyL70LwRvq2a8rVbHXikPgKj8+aI0kGdHlg16ibYA=
-github.com/migadu/go-sieve v0.0.0-20260206073348-d47e90518da5 h1:gD6/XE0UKehTaj8+H4YHj4v0NyeRKEm3RxqkRqbrF8s=
-github.com/migadu/go-sieve v0.0.0-20260206073348-d47e90518da5/go.mod h1:XykjlGKeykHsZKfFBDlmJiFbbQT+6Li9iUNNuZQNqxg=
+github.com/migadu/go-sieve v1.0.0 h1:drZVZNgaMAV7DWhr/Yt6TooE+dCM4H3y56OmF+T6mfs=
+github.com/migadu/go-sieve v1.0.0/go.mod h1:acDCLKCYxNSRPgMKUPYPhSpddNj6PerKg8Pwca0tuwo=
 github.com/moby/docker-image-spec v1.3.1 h1:jMKff3w6PgbfSa69GfNg+zN/XLhfXJGnEx3Nl2EsFP0=
 github.com/moby/docker-image-spec v1.3.1/go.mod h1:eKmb5VW8vQEh/BAr2yvVNvuiJuY6UIocYsFu/DxxRpo=
 github.com/moby/term v0.5.0 h1:xt8Q1nalod/v7BqbG21f8mQPqH+xAaC9C3N3wfWbVP0=
