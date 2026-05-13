@@ -391,6 +391,10 @@ func (m *SieveMessage) MessageSize() int {
 	return m.Size
 }
 
+func (m *SieveMessage) BodyRaw() ([]byte, bool, error) {
+	return m.Body, m.Body != nil, nil
+}
+
 // ApplyHeaderEdits applies header modifications to raw message bytes (RFC 5293)
 // Returns the modified message bytes with header edits applied
 func ApplyHeaderEdits(messageBytes []byte, edits []HeaderEdit) ([]byte, error) {
