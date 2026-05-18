@@ -193,11 +193,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		logger.Debug("ManageSieve Proxy: Failed to resolve addresses", "name", opts.Name, "error", err)
 	}
 
-	// Validate SIEVE extensions
-	if err := managesieve.ValidateExtensions(opts.SupportedExtensions); err != nil {
-		cancel()
-		return nil, fmt.Errorf("invalid ManageSieve proxy configuration: %w", err)
+	// Filter SIEVE extensions
+	validExts, invalidExts := managesieve.FilterExtensions(opts.SupportedExtensions)
+	if len(invalidExts) > 0 {
+		logger.Warn("ManageSieveProxy: ignoring invalid SIEVE extensions", "name", opts.Name, "invalid", invalidExts, "supported", managesieve.SupportedExtensions)
 	}
+	opts.SupportedExtensions = validExts
 
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("SIEVE-PROXY", opts.Name, hostname, opts.AuthRateLimit, opts.TrustedProxies)

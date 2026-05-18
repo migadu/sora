@@ -1255,12 +1255,12 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	if tracker != nil {
 		s.SetConnTracker(tracker)
 		defer tracker.Stop()
-			// Store in deps for admin API access
-			if deps.connectionTrackers != nil {
-				deps.connectionTrackersMux.Lock()
-				deps.connectionTrackers["IMAP-"+serverConfig.Name] = tracker
-				deps.connectionTrackersMux.Unlock()
-			}
+		// Store in deps for admin API access
+		if deps.connectionTrackers != nil {
+			deps.connectionTrackersMux.Lock()
+			deps.connectionTrackers["IMAP-"+serverConfig.Name] = tracker
+			deps.connectionTrackersMux.Unlock()
+		}
 	}
 
 	go func() {
@@ -1411,12 +1411,12 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 	if tracker != nil {
 		s.SetConnTracker(tracker)
 		defer tracker.Stop()
-			// Store in deps for admin API access
-			if deps.connectionTrackers != nil {
-				deps.connectionTrackersMux.Lock()
-				deps.connectionTrackers["POP3-"+serverConfig.Name] = tracker
-				deps.connectionTrackersMux.Unlock()
-			}
+		// Store in deps for admin API access
+		if deps.connectionTrackers != nil {
+			deps.connectionTrackersMux.Lock()
+			deps.connectionTrackers["POP3-"+serverConfig.Name] = tracker
+			deps.connectionTrackersMux.Unlock()
+		}
 	}
 
 	go func() {
@@ -1510,12 +1510,12 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	if tracker != nil {
 		s.SetConnTracker(tracker)
 		defer tracker.Stop()
-			// Store in deps for admin API access
-			if deps.connectionTrackers != nil {
-				deps.connectionTrackersMux.Lock()
-				deps.connectionTrackers["ManageSieve-"+serverConfig.Name] = tracker
-				deps.connectionTrackersMux.Unlock()
-			}
+		// Store in deps for admin API access
+		if deps.connectionTrackers != nil {
+			deps.connectionTrackersMux.Lock()
+			deps.connectionTrackers["ManageSieve-"+serverConfig.Name] = tracker
+			deps.connectionTrackersMux.Unlock()
+		}
 	}
 
 	go func() {

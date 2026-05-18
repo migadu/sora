@@ -145,11 +145,12 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		}
 	}
 
-	// Validate SIEVE extensions
-	if err := ValidateExtensions(options.SupportedExtensions); err != nil {
-		serverCancel()
-		return nil, fmt.Errorf("invalid ManageSieve configuration: %w", err)
+	// Filter SIEVE extensions
+	validExts, invalidExts := FilterExtensions(options.SupportedExtensions)
+	if len(invalidExts) > 0 {
+		logger.Warn("ManageSieve: ignoring invalid SIEVE extensions", "name", name, "invalid", invalidExts, "supported", SupportedExtensions)
 	}
+	options.SupportedExtensions = validExts
 
 	// Validate TLS configuration: tls_use_starttls only makes sense when tls = true
 	if !options.TLS && options.TLSUseStartTLS {

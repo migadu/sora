@@ -95,54 +95,55 @@ func TestSieveCapabilitiesNoDuplicates(t *testing.T) {
 	}
 }
 
-func TestValidateExtensions(t *testing.T) {
+func TestFilterExtensions(t *testing.T) {
 	tests := []struct {
-		name       string
-		extensions []string
-		wantErr    bool
+		name        string
+		extensions  []string
+		wantInvalid bool
 	}{
 		{
-			name:       "Valid extensions",
-			extensions: []string{"vacation", "regex"},
-			wantErr:    false,
+			name:        "Valid extensions",
+			extensions:  []string{"vacation", "regex"},
+			wantInvalid: false,
 		},
 		{
-			name:       "Valid go-sieve supported extensions",
-			extensions: []string{"fileinto", "envelope", "variables"},
-			wantErr:    false,
+			name:        "Valid go-sieve supported extensions",
+			extensions:  []string{"fileinto", "envelope", "variables"},
+			wantInvalid: false,
 		},
 		{
-			name:       "Mixed valid extensions",
-			extensions: []string{"vacation", "fileinto", "regex", "copy"},
-			wantErr:    false,
+			name:        "Mixed valid extensions",
+			extensions:  []string{"vacation", "fileinto", "regex", "copy"},
+			wantInvalid: false,
 		},
 		{
-			name:       "Invalid extension",
-			extensions: []string{"unsupported_extension"},
-			wantErr:    true,
+			name:        "Invalid extension",
+			extensions:  []string{"unsupported_extension"},
+			wantInvalid: true,
 		},
 		{
-			name:       "Mixed valid and invalid",
-			extensions: []string{"vacation", "invalid", "regex"},
-			wantErr:    true,
+			name:        "Mixed valid and invalid",
+			extensions:  []string{"vacation", "invalid", "regex"},
+			wantInvalid: true,
 		},
 		{
-			name:       "Empty list",
-			extensions: []string{},
-			wantErr:    false,
+			name:        "Empty list",
+			extensions:  []string{},
+			wantInvalid: false,
 		},
 		{
-			name:       "Nil list",
-			extensions: nil,
-			wantErr:    false,
+			name:        "Nil list",
+			extensions:  nil,
+			wantInvalid: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateExtensions(tt.extensions)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ValidateExtensions() error = %v, wantErr %v", err, tt.wantErr)
+			_, invalid := FilterExtensions(tt.extensions)
+			hasInvalid := len(invalid) > 0
+			if hasInvalid != tt.wantInvalid {
+				t.Errorf("FilterExtensions() hasInvalid = %v, wantInvalid %v (invalid items: %v)", hasInvalid, tt.wantInvalid, invalid)
 			}
 		})
 	}
@@ -174,9 +175,9 @@ func TestSieveCapabilitiesFormat(t *testing.T) {
 
 func TestAllSupportedExtensions(t *testing.T) {
 	// Verify all SupportedExtensions are valid (this should always pass)
-	err := ValidateExtensions(SupportedExtensions)
-	if err != nil {
-		t.Errorf("SupportedExtensions validation failed: %v", err)
+	_, invalid := FilterExtensions(SupportedExtensions)
+	if len(invalid) > 0 {
+		t.Errorf("SupportedExtensions validation failed, invalid extensions found: %v", invalid)
 	}
 
 	// Verify essential extensions are in the list

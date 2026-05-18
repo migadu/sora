@@ -1,10 +1,5 @@
 package managesieve
 
-import (
-	"fmt"
-	"strings"
-)
-
 // SupportedExtensions lists all SIEVE extensions that the underlying
 // go-sieve library (github.com/migadu/go-sieve) can validate and execute.
 //
@@ -72,11 +67,11 @@ var DefaultEnabledExtensions = []string{
 	"body",
 }
 
-// ValidateExtensions checks if the provided extensions are supported by go-sieve.
-// Returns an error listing any invalid extensions.
-func ValidateExtensions(extensions []string) error {
+// FilterExtensions checks if the provided extensions are supported by go-sieve.
+// Returns a slice of valid extensions and a slice of invalid extensions.
+func FilterExtensions(extensions []string) (valid []string, invalid []string) {
 	if len(extensions) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Build map of all supported extensions
@@ -85,21 +80,15 @@ func ValidateExtensions(extensions []string) error {
 		supportedMap[ext] = true
 	}
 
-	// Check for invalid extensions
-	var invalid []string
 	for _, ext := range extensions {
-		if !supportedMap[ext] {
+		if supportedMap[ext] {
+			valid = append(valid, ext)
+		} else {
 			invalid = append(invalid, ext)
 		}
 	}
 
-	if len(invalid) > 0 {
-		return fmt.Errorf("invalid SIEVE extensions: %s (supported: %s)",
-			strings.Join(invalid, ", "),
-			strings.Join(SupportedExtensions, ", "))
-	}
-
-	return nil
+	return valid, invalid
 }
 
 // GetSieveCapabilities returns the SIEVE capabilities that should be advertised
