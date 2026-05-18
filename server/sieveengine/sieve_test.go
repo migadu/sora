@@ -652,3 +652,73 @@ if header :contains "From" "@gmail.com" {
 		})
 	}
 }
+
+func TestBodyExtension(t *testing.T) {
+	script := `
+require ["body", "fileinto"];
+if body :contains "URGENT" {
+	fileinto "Urgent";
+} else {
+	keep;
+}
+`
+
+	enabledExtensions := []string{"body", "fileinto"}
+	executor, err := NewSieveExecutorWithExtensions(script, enabledExtensions)
+	if err != nil {
+		t.Fatalf("Failed to create executor: %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		body           string
+		expectedAction Action
+		expectedBox    string
+	}{
+		{
+			name:           "Contains URGENT",
+			body:           "This is an URGENT message!",
+			expectedAction: ActionFileInto,
+			expectedBox:    "Urgent",
+		},
+		{
+			name:           "Contains urgent (case-insensitive)",
+			body:           "This is an urgent message!",
+			expectedAction: ActionFileInto,
+			expectedBox:    "Urgent",
+		},
+		{
+			name:           "Does not contain URGENT",
+			body:           "Just a regular message.",
+			expectedAction: ActionKeep,
+			expectedBox:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := Context{
+				EnvelopeFrom: "sender@example.com",
+				EnvelopeTo:   "recipient@example.com",
+				Header: map[string][]string{
+					"Subject":      {"Test message"},
+					"From":         {"sender@example.com"},
+					"Content-Type": {"text/plain"},
+				},
+				Body: tt.body,
+			}
+
+			result, err := executor.Evaluate(context.Background(), ctx)
+			if err != nil {
+				t.Fatalf("Failed to evaluate script: %v", err)
+			}
+
+			if result.Action != tt.expectedAction {
+				t.Errorf("Expected action %s, got %s", tt.expectedAction, result.Action)
+			}
+			if result.Action == ActionFileInto && result.Mailbox != tt.expectedBox {
+				t.Errorf("Expected mailbox %s, got %s", tt.expectedBox, result.Mailbox)
+			}
+		})
+	}
+}

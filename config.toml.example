@@ -671,15 +671,15 @@ default_rights = "lrswipkxtea"   # Default ACL rights for shared mailbox creator
 [sieve]
 # List of enabled SIEVE extensions (empty = use safe defaults)
 #
-# Default (empty = 18 safe extensions, editheader disabled for security):
+# Default (empty = 19 safe extensions, editheader disabled for security):
 # - Core: fileinto, envelope, encoded-character
 # - Comparators: comparator-i;octet, comparator-i;ascii-casemap, comparator-i;ascii-numeric, comparator-i;unicode-casemap
-# - Common: imap4flags, variables, relational, vacation, copy, regex, date, index, mailbox, subaddress
+# - Common: imap4flags, variables, relational, vacation, copy, regex, date, index, mailbox, subaddress, body
 #
 enabled_extensions = []
 #
 # To enable header editing (allows users to modify message headers via SIEVE):
-# enabled_extensions = ["fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex", "date", "index", "editheader", "mailbox", "subaddress", "encoded-character", "comparator-i;octet", "comparator-i;ascii-casemap", "comparator-i;ascii-numeric", "comparator-i;unicode-casemap"]
+# enabled_extensions = ["fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex", "date", "index", "editheader", "mailbox", "subaddress", "encoded-character", "comparator-i;octet", "comparator-i;ascii-casemap", "comparator-i;ascii-numeric", "comparator-i;unicode-casemap", "body"]
 
 # IMPORTANT NOTES:
 # - Shared mailboxes are restricted to users within the same domain for security

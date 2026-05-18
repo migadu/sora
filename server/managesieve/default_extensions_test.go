@@ -63,6 +63,7 @@ func TestDefaultExtensions(t *testing.T) {
 		"comparator-i;ascii-casemap",
 		"comparator-i;ascii-numeric",
 		"comparator-i;unicode-casemap",
+		"body",
 	}
 
 	for _, expectedExt := range configExampleExtensions {
