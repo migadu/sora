@@ -52,6 +52,38 @@ func (rd *ResilientDatabase) InsertMessageWithRetry(ctx context.Context, options
 	return resSlice[0], resSlice[1], nil
 }
 
+func (rd *ResilientDatabase) InsertMessagesBatchWithRetry(ctx context.Context, options []*db.InsertMessageOptions, uploads []db.PendingUpload) ([]int64, []int64, []string, error) {
+	if len(options) == 0 {
+		return nil, nil, nil, nil
+	}
+
+	// Group by mailbox ID - we require all options to belong to the same mailbox
+	mailboxID := options[0].MailboxID
+
+	// Lock the mailbox at the Go level to prevent connection pool starvation during mass concurrent inserts.
+	unlock := rd.getOperationalDatabaseForOperation(true).LockMailbox(mailboxID)
+	defer unlock()
+
+	type batchResult struct {
+		rowIDs []int64
+		uids   []int64
+		hashes []string
+	}
+
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		rowIDs, uids, hashes, opErr := rd.getOperationalDatabaseForOperation(true).InsertMessagesBatch(ctx, tx, options, uploads)
+		return batchResult{rowIDs: rowIDs, uids: uids, hashes: hashes}, opErr
+	}
+
+	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	if err != nil || result == nil {
+		return nil, nil, nil, err
+	}
+
+	res := result.(batchResult)
+	return res.rowIDs, res.uids, res.hashes, nil
+}
+
 func (rd *ResilientDatabase) GetMessagesByNumSetWithRetry(ctx context.Context, mailboxID int64, numSet imap.NumSet, includeBodyStructure ...bool) ([]db.Message, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(false).GetMessagesByNumSet(ctx, mailboxID, numSet, includeBodyStructure...)

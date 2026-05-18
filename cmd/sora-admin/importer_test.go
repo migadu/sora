@@ -118,6 +118,21 @@ func (m *mockResilientDatabase) InsertMessageFromImporterWithRetry(ctx context.C
 	}
 	return 1, 1, nil
 }
+func (m *mockResilientDatabase) InsertMessagesFromImporterBatchWithRetry(ctx context.Context, opts []*db.InsertMessageOptions) ([]int64, []int64, []string, error) {
+	if m.insertMessageShouldFail {
+		return nil, nil, nil, m.insertMessageError
+	}
+	ids := make([]int64, len(opts))
+	uids := make([]int64, len(opts))
+	hashes := make([]string, len(opts))
+	for i := range opts {
+		ids[i] = int64(i + 1)
+		uids[i] = int64(i + 1)
+		hashes[i] = opts[i].ContentHash
+	}
+	return ids, uids, hashes, nil
+}
+
 func (m *mockResilientDatabase) DeleteMessageByHashAndMailboxWithRetry(ctx context.Context, accountID, mailboxID int64, hash string) (int64, error) {
 	return 0, nil
 }

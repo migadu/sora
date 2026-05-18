@@ -856,3 +856,401 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 
 	return messageRowId, uidToUse, nil
 }
+
+// InsertMessagesBatch performs a high-performance bulk insert of messages.
+//
+// Requirements:
+// - All messages MUST belong to the same MailboxID and AccountID
+// - Recommended batch size: 100-1000 messages (larger batches have diminishing returns)
+// - Duplicates are automatically filtered before insert
+//
+// Returns:
+// - messageIDs: Row IDs of successfully inserted messages
+// - uids: Assigned UIDs (same length as messageIDs)
+// - contentHashes: Content hashes of successfully inserted messages (same length as messageIDs)
+// - error: Non-nil if batch fails (all-or-nothing semantics)
+func (d *Database) InsertMessagesBatch(
+	ctx context.Context,
+	tx pgx.Tx,
+	options []*InsertMessageOptions,
+	uploads []PendingUpload,
+) ([]int64, []int64, []string, error) {
+	if len(options) == 0 {
+		return nil, nil, nil, nil
+	}
+
+	mailboxID := options[0].MailboxID
+	accountID := options[0].AccountID
+	isImporter := len(uploads) == 0 // Importers don't pass pending uploads
+
+	// 1. Validate that all options belong to the same mailbox and account
+	for _, opt := range options {
+		if opt.MailboxID != mailboxID {
+			return nil, nil, nil, fmt.Errorf("InsertMessagesBatch: mixed MailboxIDs in batch (expected %d, got %d)", mailboxID, opt.MailboxID)
+		}
+		if opt.AccountID != accountID {
+			return nil, nil, nil, fmt.Errorf("InsertMessagesBatch: mixed AccountIDs in batch (expected %d, got %d)", accountID, opt.AccountID)
+		}
+	}
+
+	// 2. Pre-sanitize and process options
+	type processedMessage struct {
+		Opt                *InsertMessageOptions
+		Upload             *PendingUpload
+		SaneMessageID      string
+		SaneMailboxName    string
+		SaneSubject        string
+		SanePlaintextBody  string
+		SaneInReplyToStr   string
+		BodyStructureData  []byte
+		RecipientsJSON     []byte
+		CustomKeywordsJSON []byte
+		BitwiseFlags       int32
+		SubjectSort        string
+		FromNameSort       string
+		FromEmailSort      string
+		ToNameSort         string
+		ToEmailSort        string
+		CcEmailSort        string
+		AssignedUID        int64
+	}
+
+	processed := make([]*processedMessage, 0, len(options))
+	messageIDs := make([]string, 0, len(options))
+	contentHashes := make([]string, 0, len(options))
+
+	for i, opt := range options {
+		saneMessageID := helpers.SanitizeUTF8(opt.MessageID)
+		saneMailboxName := helpers.SanitizeUTF8(opt.MailboxName)
+		if saneMessageID == "" {
+			saneMessageID = fmt.Sprintf("<%d@%s>", time.Now().UnixNano()+int64(i), saneMailboxName)
+		}
+
+		bodyStructureData, err := helpers.SerializeBodyStructureGob(opt.BodyStructure)
+		if err != nil {
+			logger.Error("Database: failed to serialize BodyStructure in batch", "err", err)
+			continue // Skip this message, but process others
+		}
+
+		if opt.InternalDate.IsZero() {
+			opt.InternalDate = time.Now()
+		}
+
+		saneRecipients := make([]helpers.Recipient, len(opt.Recipients))
+		for j, r := range opt.Recipients {
+			saneRecipients[j] = helpers.Recipient{
+				Name:         helpers.SanitizeUTF8(r.Name),
+				EmailAddress: helpers.SanitizeUTF8(r.EmailAddress),
+				AddressType:  r.AddressType,
+			}
+		}
+
+		recipientsJSON, err := json.Marshal(saneRecipients)
+		if err != nil {
+			logger.Error("Database: failed to marshal recipients in batch", "err", err)
+			continue
+		}
+
+		subjectSort := helpers.SanitizeSubjectForSort(opt.Subject)
+		var fromNameSort, fromEmailSort, toNameSort, toEmailSort, ccEmailSort string
+		var fromFound, toFound, ccFound bool
+		for _, r := range saneRecipients {
+			switch r.AddressType {
+			case "from":
+				if !fromFound {
+					fromNameSort = strings.ToLower(r.Name)
+					fromEmailSort = strings.ToLower(r.EmailAddress)
+					fromFound = true
+				}
+			case "to":
+				if !toFound {
+					toNameSort = strings.ToLower(r.Name)
+					toEmailSort = strings.ToLower(r.EmailAddress)
+					toFound = true
+				}
+			case "cc":
+				if !ccFound {
+					ccEmailSort = strings.ToLower(r.EmailAddress)
+					ccFound = true
+				}
+			}
+			if fromFound && toFound && ccFound {
+				break
+			}
+		}
+
+		inReplyToStr := strings.Join(opt.InReplyTo, " ")
+		systemFlagsToSet, customKeywordsToSet := SplitFlags(opt.Flags)
+		bitwiseFlags := FlagsToBitwise(systemFlagsToSet)
+
+		var customKeywordsJSON []byte
+		if len(customKeywordsToSet) == 0 {
+			customKeywordsJSON = []byte("[]")
+		} else {
+			customKeywordsJSON, err = json.Marshal(customKeywordsToSet)
+			if err != nil {
+				logger.Error("Database: failed to marshal custom keywords in batch", "err", err)
+				continue
+			}
+		}
+
+		var uploadPtr *PendingUpload
+		if !isImporter && i < len(uploads) {
+			uploadPtr = &uploads[i]
+		}
+
+		processed = append(processed, &processedMessage{
+			Opt:                opt,
+			Upload:             uploadPtr,
+			SaneMessageID:      saneMessageID,
+			SaneMailboxName:    saneMailboxName,
+			SaneSubject:        helpers.SanitizeUTF8(opt.Subject),
+			SanePlaintextBody:  helpers.SanitizeUTF8(opt.PlaintextBody),
+			SaneInReplyToStr:   helpers.SanitizeUTF8(inReplyToStr),
+			BodyStructureData:  bodyStructureData,
+			RecipientsJSON:     recipientsJSON,
+			CustomKeywordsJSON: customKeywordsJSON,
+			BitwiseFlags:       int32(bitwiseFlags),
+			SubjectSort:        subjectSort,
+			FromNameSort:       fromNameSort,
+			FromEmailSort:      fromEmailSort,
+			ToNameSort:         toNameSort,
+			ToEmailSort:        toEmailSort,
+			CcEmailSort:        ccEmailSort,
+		})
+		messageIDs = append(messageIDs, saneMessageID)
+		contentHashes = append(contentHashes, opt.ContentHash)
+	}
+
+	if len(processed) == 0 {
+		return nil, nil, nil, nil
+	}
+
+	// 3. Deduplication (Find exact duplicates in one query)
+	rows, err := tx.Query(ctx, `
+		SELECT message_id, content_hash FROM messages 
+		WHERE mailbox_id = $1 
+		AND (message_id, content_hash) IN (SELECT * FROM UNNEST($2::text[], $3::text[]))
+		AND expunged_at IS NULL
+	`, mailboxID, messageIDs, contentHashes)
+
+	if err != nil && err != pgx.ErrNoRows {
+		return nil, nil, nil, fmt.Errorf("InsertMessagesBatch: failed to check duplicates: %w", err)
+	}
+
+	duplicateSet := make(map[string]bool)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var msgID, hash string
+			if err := rows.Scan(&msgID, &hash); err == nil {
+				duplicateSet[msgID+"||"+hash] = true
+			}
+		}
+	}
+
+	// Filter out duplicates
+	uniqueProcessed := make([]*processedMessage, 0, len(processed))
+	for _, p := range processed {
+		key := p.SaneMessageID + "||" + p.Opt.ContentHash
+		if duplicateSet[key] {
+			logger.Info("Database: duplicate message detected in batch, skipping", "message_id", p.SaneMessageID, "content_hash", p.Opt.ContentHash)
+			continue
+		}
+		uniqueProcessed = append(uniqueProcessed, p)
+	}
+
+	if len(uniqueProcessed) == 0 {
+		return nil, nil, nil, nil
+	}
+
+	// 4. Content Deduplication (Find already uploaded S3 hashes)
+	uploadedHashesSet := make(map[string]bool)
+	if !isImporter {
+		uHashes := make([]string, 0, len(uniqueProcessed))
+		for _, p := range uniqueProcessed {
+			uHashes = append(uHashes, p.Opt.ContentHash)
+		}
+		uRows, err := tx.Query(ctx, `
+			SELECT DISTINCT content_hash FROM messages
+			WHERE account_id = $1 AND uploaded = TRUE AND content_hash = ANY($2) AND expunged_at IS NULL
+		`, accountID, uHashes)
+		if err == nil {
+			defer uRows.Close()
+			for uRows.Next() {
+				var hash string
+				if err := uRows.Scan(&hash); err == nil {
+					uploadedHashesSet[hash] = true
+				}
+			}
+		}
+	}
+
+	// 5. Bulk UID Allocation
+	// Handle preserved UIDVALIDITY first
+	if isImporter && uniqueProcessed[0].Opt.PreservedUID != nil && uniqueProcessed[0].Opt.PreservedUIDValidity != nil {
+		var hasMessages bool
+		_ = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL LIMIT 1)`, mailboxID).Scan(&hasMessages)
+		var currentUIDValidity uint32
+		_ = tx.QueryRow(ctx, `SELECT uid_validity FROM mailboxes WHERE id = $1`, mailboxID).Scan(&currentUIDValidity)
+
+		preservedValidity := *uniqueProcessed[0].Opt.PreservedUIDValidity
+		if hasMessages && currentUIDValidity != preservedValidity {
+			// UIDVALIDITY mismatch, fallback to normal append for all
+			if _, logged := d.uidValidityMismatchLoggedMap.LoadOrStore(mailboxID, true); !logged {
+				logger.Warn("Database: UIDVALIDITY mismatch in batch, ignoring preserved UIDs", "mailbox_id", mailboxID)
+			}
+			for _, p := range uniqueProcessed {
+				p.Opt.PreservedUID = nil
+			}
+		} else if !hasMessages && currentUIDValidity != preservedValidity {
+			_, _ = tx.Exec(ctx, `UPDATE mailboxes SET uid_validity = $2 WHERE id = $1`, mailboxID, preservedValidity)
+			logger.Info("Database: set UIDVALIDITY for first preserved message in batch", "mailbox_id", mailboxID)
+		}
+	}
+
+	// Allocate UIDs
+	var autoIncrementCount int
+	var highestUID int64
+	var maxPreservedUID int64
+
+	for _, p := range uniqueProcessed {
+		if p.Opt.PreservedUID != nil {
+			u := int64(*p.Opt.PreservedUID)
+			p.AssignedUID = u
+			if u > maxPreservedUID {
+				maxPreservedUID = u
+			}
+		} else {
+			autoIncrementCount++
+		}
+	}
+
+	if maxPreservedUID > 0 {
+		_ = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = GREATEST(highest_uid, $2) WHERE id = $1 RETURNING highest_uid`, mailboxID, maxPreservedUID).Scan(&highestUID)
+	}
+
+	if autoIncrementCount > 0 {
+		_ = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + $2 WHERE id = $1 RETURNING highest_uid`, mailboxID, autoIncrementCount).Scan(&highestUID)
+		// Distribute newly allocated UIDs (from lowest to highest)
+		currentAutoUID := highestUID - int64(autoIncrementCount) + 1
+		for _, p := range uniqueProcessed {
+			if p.Opt.PreservedUID == nil {
+				p.AssignedUID = currentAutoUID
+				currentAutoUID++
+			}
+		}
+	}
+
+	// 6. Execute Inserts via pgx.Batch
+	batch := &pgx.Batch{}
+
+	for _, p := range uniqueProcessed {
+		uploaded := isImporter || uploadedHashesSet[p.Opt.ContentHash]
+
+		batch.Queue(`
+			WITH inserted AS (
+				INSERT INTO messages
+					(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
+				VALUES
+					($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, nextval('messages_modseq'), $17, $18, $19, $20, $21, $22)
+				RETURNING id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
+			SELECT id, $2, $23, $24, NOW(), nextval('messages_modseq') FROM inserted
+			RETURNING message_id
+		`,
+			p.Opt.AccountID, mailboxID, p.SaneMailboxName, p.AssignedUID, p.SaneMessageID, p.Opt.ContentHash,
+			p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.InternalDate, p.Opt.Size, p.SaneSubject, p.Opt.SentDate,
+			p.SaneInReplyToStr, p.BodyStructureData, p.RecipientsJSON, uploaded, p.SubjectSort,
+			p.FromNameSort, p.FromEmailSort, p.ToNameSort, p.ToEmailSort, p.CcEmailSort,
+			p.BitwiseFlags, p.CustomKeywordsJSON,
+		)
+
+		if !uploaded && p.Upload != nil {
+			batch.Queue(`
+				INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
+				VALUES ($1, $2, $3, NOW(), $4)
+				ON CONFLICT (content_hash) DO NOTHING
+			`, p.Upload.InstanceID, p.Upload.ContentHash, p.Upload.Size, p.Upload.AccountID)
+		}
+
+		if p.Opt.FTSRetention == 0 || !p.Opt.SentDate.IsZero() && p.Opt.SentDate.Before(time.Now().Add(-p.Opt.FTSRetention)) {
+			// Skip FTS
+		} else {
+			const maxStoredBodySize = 64 * 1024 // 64 KB
+			var textBodyArg any = p.SanePlaintextBody
+
+			if len(p.SanePlaintextBody) > maxStoredBodySize {
+				truncLen := maxStoredBodySize
+				for truncLen > 0 && !utf8.RuneStart(p.SanePlaintextBody[truncLen]) {
+					truncLen--
+				}
+				textBodyArg = p.SanePlaintextBody[:truncLen]
+				metrics.LargeBodyStorageSkipped.Inc()
+			}
+
+			textBodyStr, _ := textBodyArg.(string)
+			if textBodyStr != "" {
+				batch.Queue(`
+					INSERT INTO messages_fts (content_hash, text_body, sent_date)
+					VALUES ($1, $2, $3)
+					ON CONFLICT (content_hash) DO NOTHING
+				`, p.Opt.ContentHash, textBodyArg, p.Opt.SentDate)
+			}
+		}
+	}
+
+	br := tx.SendBatch(ctx, batch)
+	defer br.Close()
+
+	var insertedRowIDs []int64
+	var insertedUIDs []int64
+	var insertedHashes []string
+
+	// pgx.Batch guarantees results are returned in the same order as queued
+	for _, p := range uniqueProcessed {
+		var rowID int64
+		err := br.QueryRow().Scan(&rowID)
+		if err != nil {
+			// If unique constraint violation occurs during batch execution, we fail the batch
+			if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
+				return nil, nil, nil, consts.ErrDBUniqueViolation
+			}
+			return nil, nil, nil, fmt.Errorf("InsertMessagesBatch: failed execution: %w", err)
+		}
+		insertedRowIDs = append(insertedRowIDs, rowID)
+		insertedUIDs = append(insertedUIDs, p.AssignedUID)
+		insertedHashes = append(insertedHashes, p.Opt.ContentHash)
+
+		uploaded := isImporter || uploadedHashesSet[p.Opt.ContentHash]
+		if !uploaded && p.Upload != nil {
+			_, err = br.Exec() // pending_uploads
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("InsertMessagesBatch: failed pending_upload: %w", err)
+			}
+		}
+
+		if p.Opt.FTSRetention == 0 || !p.Opt.SentDate.IsZero() && p.Opt.SentDate.Before(time.Now().Add(-p.Opt.FTSRetention)) {
+			// Skip FTS
+		} else {
+			textBodyStr, _ := p.SanePlaintextBody, false
+			if len(p.SanePlaintextBody) > 64*1024 {
+				textBodyStr = "..." // Mocked just to check if we queued it
+			}
+			if textBodyStr != "" {
+				_, err = br.Exec() // messages_fts
+				if err != nil {
+					return nil, nil, nil, fmt.Errorf("InsertMessagesBatch: failed messages_fts: %w", err)
+				}
+			}
+		}
+	}
+
+	return insertedRowIDs, insertedUIDs, insertedHashes, nil
+}
+
+// InsertMessageFromImporterBatch is a wrapper for InsertMessagesBatch tailored for sora-admin import
+func (d *Database) InsertMessagesFromImporterBatch(ctx context.Context, tx pgx.Tx, options []*InsertMessageOptions) ([]int64, []int64, []string, error) {
+	return d.InsertMessagesBatch(ctx, tx, options, nil)
+}

@@ -912,3 +912,78 @@ func TestInsertMessageFromImporter_DuplicateExpungedUID(t *testing.T) {
 
 	// The defer tx3.Rollback(ctx) will handle cleaning up the aborted transaction.
 }
+
+func TestInsertMessagesBatch_LargeVolume(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	dbInstance := setupTestDatabase(t)
+	defer dbInstance.Close()
+
+	// 1. Create a test account and mailbox
+	tx, err := dbInstance.WritePool.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	email := fmt.Sprintf("batchtest_%d@example.com", time.Now().UnixNano())
+	accountID := createTestAccount(t, dbInstance, email, "password")
+	mailboxID := createTestMailbox(t, dbInstance, accountID, "BatchTestBox")
+
+	// Create 1000 messages
+	opts := make([]*InsertMessageOptions, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		opts = append(opts, &InsertMessageOptions{
+			AccountID:     accountID,
+			MailboxID:     mailboxID,
+			MailboxName:   "BatchTestBox",
+			MessageID:     fmt.Sprintf("<batch-test-%d@example.com>", i),
+			ContentHash:   fmt.Sprintf("hash-%d", i),
+			Size:          1024,
+			Subject:       fmt.Sprintf("Batch Test %d", i),
+			PlaintextBody: fmt.Sprintf("Body %d", i),
+			SentDate:      time.Now(),
+		})
+	}
+
+	rowIDs, uids, hashes, err := dbInstance.InsertMessagesBatch(ctx, tx, opts, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1000, len(rowIDs))
+	assert.Equal(t, 1000, len(uids))
+	assert.Equal(t, 1000, len(hashes))
+
+	// Verify UIDs are sequential
+	for i := 1; i < len(uids); i++ {
+		assert.Equal(t, uids[i-1]+1, uids[i])
+	}
+
+	// 3. Test Deduplication (Insert 500 duplicates + 500 new)
+	optsDup := make([]*InsertMessageOptions, 0, 1000)
+	// 500 duplicates
+	for i := 0; i < 500; i++ {
+		optsDup = append(optsDup, opts[i])
+	}
+	// 500 new
+	for i := 1000; i < 1500; i++ {
+		optsDup = append(optsDup, &InsertMessageOptions{
+			AccountID:     accountID,
+			MailboxID:     mailboxID,
+			MailboxName:   "BatchTestBox",
+			MessageID:     fmt.Sprintf("<batch-test-%d@example.com>", i),
+			ContentHash:   fmt.Sprintf("hash-%d", i),
+			Size:          1024,
+			Subject:       fmt.Sprintf("Batch Test %d", i),
+			PlaintextBody: fmt.Sprintf("Body %d", i),
+			SentDate:      time.Now(),
+		})
+	}
+
+	rowIDs2, uids2, hashes2, err := dbInstance.InsertMessagesBatch(ctx, tx, optsDup, nil)
+	require.NoError(t, err)
+
+	// Should only insert 500
+	assert.Equal(t, 500, len(rowIDs2))
+	assert.Equal(t, 500, len(uids2))
+	assert.Equal(t, 500, len(hashes2))
+	assert.Equal(t, uids[999]+1, uids2[0]) // Starts after the last one
+}

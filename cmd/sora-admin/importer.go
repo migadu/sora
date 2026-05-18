@@ -69,6 +69,7 @@ type resilientDB interface {
 	QueryRowWithRetry(ctx context.Context, sql string, args ...any) pgx.Row
 	GetOrCreateMailboxByNameWithRetry(ctx context.Context, accountID int64, name string) (*db.DBMailbox, error)
 	InsertMessageFromImporterWithRetry(ctx context.Context, opts *db.InsertMessageOptions) (int64, int64, error)
+	InsertMessagesFromImporterBatchWithRetry(ctx context.Context, opts []*db.InsertMessageOptions) ([]int64, []int64, []string, error)
 	DeleteMessageByHashAndMailboxWithRetry(ctx context.Context, accountID, mailboxID int64, hash string) (int64, error)
 	BeginTxWithRetry(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
 	GetOperationalDatabase() *db.Database
@@ -1723,7 +1724,7 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 }
 
 // insertBatchToDB inserts all uploaded messages in a batch
-// Note: Each message insert uses InsertMessageFromImporterWithRetry which has its own transaction
+// It groups messages by mailbox and uses the highly-optimized InsertMessagesFromImporterBatchWithRetry
 func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 	// Get user info once
 	address, err := server.NewAddress(i.email)
@@ -1739,17 +1740,26 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 
 	var successHashes []string
 
-	// Process each message in the batch
-	// Note: InsertMessageFromImporterWithRetry handles transactions and retries internally
+	// Group messages by mailbox to take advantage of batch inserts
+	type groupedMsg struct {
+		opt  *db.InsertMessageOptions
+		hash string
+		path string
+	}
+
+	mailboxGroups := make(map[string][]groupedMsg)
+
 	for _, up := range uploaded {
 		// Get/create mailbox (cached)
 		mailbox, err := i.getOrCreateMailbox(i.ctx, user.AccountID(), up.msg.mailbox)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get or create mailbox '%s': %w", up.msg.mailbox, err)
+			logger.Error("Failed to get or create mailbox", "mailbox", up.msg.mailbox, "error", err)
+			i.recordFailedPath(up.msg.path, fmt.Sprintf("mailbox error: %v", err))
+			atomic.AddInt64(&i.failedMessages, 1)
+			continue
 		}
 
-		// Insert into PostgreSQL with built-in transaction and retry
-		_, _, err = i.rdb.InsertMessageFromImporterWithRetry(i.ctx, &db.InsertMessageOptions{
+		opt := &db.InsertMessageOptions{
 			AccountID:            user.AccountID(),
 			MailboxID:            mailbox.ID,
 			S3Domain:             address.Domain(),
@@ -1769,22 +1779,70 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 			RawHeaders:           up.metadata.rawHeaders,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
+		}
+		mailboxGroups[up.msg.mailbox] = append(mailboxGroups[up.msg.mailbox], groupedMsg{
+			opt:  opt,
+			hash: up.msg.hash,
+			path: up.msg.path,
 		})
+	}
 
-		if err != nil {
-			if errors.Is(err, consts.ErrDBUniqueViolation) {
-				// Message already exists - skip but continue processing batch
-				atomic.AddInt64(&i.skippedMessages, 1)
+	const maxBatchSize = 500
+
+	for _, group := range mailboxGroups {
+		for idx := 0; idx < len(group); idx += maxBatchSize {
+			end := idx + maxBatchSize
+			if end > len(group) {
+				end = len(group)
+			}
+			chunk := group[idx:end]
+
+			opts := make([]*db.InsertMessageOptions, 0, len(chunk))
+			for _, gm := range chunk {
+				opts = append(opts, gm.opt)
+			}
+
+			_, _, insertedHashesBatch, err := i.rdb.InsertMessagesFromImporterBatchWithRetry(i.ctx, opts)
+			if err != nil {
+				if errors.Is(err, consts.ErrDBUniqueViolation) {
+					// The entire batch failed due to a unique constraint violation that wasn't caught by deduplication.
+					// This shouldn't happen with the new deduplication logic unless there's a race condition.
+					// We fall back to processing them one by one.
+					logger.Debug("Batch insert failed with unique violation, falling back to individual inserts", "mailbox_id", opts[0].MailboxID, "chunk_size", len(chunk))
+					for _, gm := range chunk {
+						_, _, indErr := i.rdb.InsertMessageFromImporterWithRetry(i.ctx, gm.opt)
+						if indErr != nil {
+							if errors.Is(indErr, consts.ErrDBUniqueViolation) {
+								atomic.AddInt64(&i.skippedMessages, 1)
+								continue
+							}
+							logger.Error("DB insert failed for message", "hash", gm.hash, "error", indErr)
+							i.recordFailedPath(gm.path, fmt.Sprintf("db insert error: %v", indErr))
+							atomic.AddInt64(&i.failedMessages, 1)
+							continue
+						}
+						successHashes = append(successHashes, gm.hash)
+					}
+					continue
+				}
+				// Unrecoverable batch error
+				logger.Error("DB batch insert failed", "mailbox_id", opts[0].MailboxID, "error", err)
+				for _, gm := range chunk {
+					i.recordFailedPath(gm.path, fmt.Sprintf("db batch insert error: %v", err))
+				}
+				atomic.AddInt64(&i.failedMessages, int64(len(chunk)))
 				continue
 			}
-			// Non-recoverable error for this message - record and continue
-			logger.Error("DB insert failed for message", "hash", up.msg.hash, "error", err)
-			i.recordFailedPath(up.msg.path, fmt.Sprintf("db insert error: %v", err))
-			atomic.AddInt64(&i.failedMessages, 1)
-			continue
-		}
 
-		successHashes = append(successHashes, up.msg.hash)
+			// Add successfully inserted hashes to successHashes
+			successHashes = append(successHashes, insertedHashesBatch...)
+
+			// Calculate skipped messages (deduplicated by the database)
+			skipped := len(chunk) - len(insertedHashesBatch)
+			if skipped > 0 {
+				atomic.AddInt64(&i.skippedMessages, int64(skipped))
+			}
+		}
 	}
 
 	return successHashes, nil

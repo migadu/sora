@@ -208,6 +208,48 @@ func (rd *ResilientDatabase) InsertMessageFromImporterWithRetry(ctx context.Cont
 	return resSlice[0], resSlice[1], nil
 }
 
+func (rd *ResilientDatabase) InsertMessagesFromImporterBatchWithRetry(ctx context.Context, options []*db.InsertMessageOptions) ([]int64, []int64, []string, error) {
+	if len(options) == 0 {
+		return nil, nil, nil, nil
+	}
+
+	// Lock the mailbox at the Go level to prevent connection pool starvation during mass concurrent imports.
+	unlock := rd.getOperationalDatabaseForOperation(true).LockMailbox(options[0].MailboxID)
+	defer unlock()
+
+	// Importer writes are less safe to retry automatically, so limit retries.
+	config := retry.BackoffConfig{
+		InitialInterval: 250 * time.Millisecond,
+		MaxInterval:     3 * time.Second,
+		Multiplier:      1.8,
+		Jitter:          true,
+		MaxRetries:      2,
+		OperationName:   "db_importer_insert_messages_batch",
+	}
+
+	type batchResult struct {
+		rowIDs []int64
+		uids   []int64
+		hashes []string
+	}
+
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		rowIDs, uids, hashes, opErr := rd.getOperationalDatabaseForOperation(true).InsertMessagesFromImporterBatch(ctx, tx, options)
+		if opErr != nil {
+			return nil, opErr
+		}
+		return batchResult{rowIDs: rowIDs, uids: uids, hashes: hashes}, nil
+	}
+
+	result, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutAdmin, op)
+	if err != nil || result == nil {
+		return nil, nil, nil, err
+	}
+
+	res := result.(batchResult)
+	return res.rowIDs, res.uids, res.hashes, nil
+}
+
 func (rd *ResilientDatabase) CleanupSoftDeletedAccountsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(true).CleanupSoftDeletedAccounts(ctx, tx, gracePeriod)
