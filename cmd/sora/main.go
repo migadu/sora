@@ -1249,20 +1249,18 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 		return
 	}
 
-	// Start local connection tracker for backend server
-	if serverConfig.MaxConnectionsPerUser > 0 {
-		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := server.NewConnectionTracker("IMAP", serverConfig.Name, deps.hostname, instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, false)
-		if tracker != nil {
-			s.SetConnTracker(tracker)
-			defer tracker.Stop()
+	// Start local connection tracker for backend server (always enabled for admin visibility)
+	instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
+	tracker := server.NewConnectionTracker("IMAP", serverConfig.Name, deps.hostname, instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, false)
+	if tracker != nil {
+		s.SetConnTracker(tracker)
+		defer tracker.Stop()
 			// Store in deps for admin API access
 			if deps.connectionTrackers != nil {
 				deps.connectionTrackersMux.Lock()
 				deps.connectionTrackers["IMAP-"+serverConfig.Name] = tracker
 				deps.connectionTrackersMux.Unlock()
 			}
-		}
 	}
 
 	go func() {
@@ -1407,20 +1405,18 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		return
 	}
 
-	// Start local connection tracker for backend server
-	if serverConfig.MaxConnectionsPerUser > 0 {
-		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := server.NewConnectionTracker("POP3", serverConfig.Name, deps.hostname, instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, false)
-		if tracker != nil {
-			s.SetConnTracker(tracker)
-			defer tracker.Stop()
+	// Start local connection tracker for backend server (always enabled for admin visibility)
+	instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
+	tracker := server.NewConnectionTracker("POP3", serverConfig.Name, deps.hostname, instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, false)
+	if tracker != nil {
+		s.SetConnTracker(tracker)
+		defer tracker.Stop()
 			// Store in deps for admin API access
 			if deps.connectionTrackers != nil {
 				deps.connectionTrackersMux.Lock()
 				deps.connectionTrackers["POP3-"+serverConfig.Name] = tracker
 				deps.connectionTrackersMux.Unlock()
 			}
-		}
 	}
 
 	go func() {
@@ -1508,20 +1504,18 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		return
 	}
 
-	// Start local connection tracker for backend server
-	if serverConfig.MaxConnectionsPerUser > 0 {
-		instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-		tracker := server.NewConnectionTracker("ManageSieve", serverConfig.Name, deps.hostname, instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, false)
-		if tracker != nil {
-			s.SetConnTracker(tracker)
-			defer tracker.Stop()
+	// Start local connection tracker for backend server (always enabled for admin visibility)
+	instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
+	tracker := server.NewConnectionTracker("ManageSieve", serverConfig.Name, deps.hostname, instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, false)
+	if tracker != nil {
+		s.SetConnTracker(tracker)
+		defer tracker.Stop()
 			// Store in deps for admin API access
 			if deps.connectionTrackers != nil {
 				deps.connectionTrackersMux.Lock()
 				deps.connectionTrackers["ManageSieve-"+serverConfig.Name] = tracker
 				deps.connectionTrackersMux.Unlock()
 			}
-		}
 	}
 
 	go func() {

@@ -76,10 +76,10 @@ func newAdminDatabase(ctx context.Context, cfg *config.DatabaseConfig) (*resilie
 // createHTTPAPIClient creates an HTTP client for calling the HTTP API
 func createHTTPAPIClient(cfg AdminConfig) (*http.Client, error) {
 	if cfg.HTTPAPIAddr == "" {
-		return nil, fmt.Errorf("http_api_addr not configured (required for kick operations)")
+		return nil, fmt.Errorf("admin_cli.addr not configured in config.toml (required for HTTP API operations)")
 	}
 	if cfg.HTTPAPIKey == "" {
-		return nil, fmt.Errorf("http_api_key not configured (required for kick operations)")
+		return nil, fmt.Errorf("admin_cli.api_key not configured in config.toml (required for HTTP API operations)")
 	}
 
 	// Create custom transport with optional TLS verification skip
