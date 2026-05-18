@@ -160,6 +160,20 @@ func (cm *ConnectionManager) FindPoolBackendByHost(host string) (string, bool) {
 	return "", false
 }
 
+// HasBackend checks if a backend is currently configured in the connection manager pool.
+// This ensures that we do not attempt to route to backends that have been removed
+// from the configuration but are still present in the affinity cache.
+func (cm *ConnectionManager) HasBackend(backend string) bool {
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+	for _, addr := range cm.remoteAddrs {
+		if addr == backend {
+			return true
+		}
+	}
+	return false
+}
+
 // GetBackendByConsistentHash returns a backend for a username using consistent hashing
 // Automatically excludes unhealthy backends and tries the next one in the ring
 // Returns empty string if all backends are unhealthy
@@ -1289,6 +1303,20 @@ func resolveAffinityRoute(params RouteParams, affinityMgr AffinityManager, resul
 					return "", ""
 				}
 			}
+		}
+
+		// Check if the backend is still configured in our pool.
+		// It might have been removed from the config since the affinity was cached.
+		if !params.ConnManager.HasBackend(targetAddr) {
+			logger.Info("Cluster affinity backend no longer configured - deleting affinity", "proxy", params.ProxyName, "backend", lastAddr, "user", params.Username, "protocol", foundProtocol)
+			affinityMgr.DeleteBackend(params.Username, foundProtocol)
+
+			if foundProtocol == params.Protocol {
+				logger.Debug("Retrying affinity lookup after deleting unconfigured same-protocol affinity",
+					"proxy", params.ProxyName, "user", params.Username, "protocol", params.Protocol)
+				continue
+			}
+			break
 		}
 
 		// Check if resolved backend is healthy (without auto-recovery for sticky failover)

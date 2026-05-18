@@ -19,6 +19,7 @@ func TestAffinityFailoverIntegration(t *testing.T) {
 	t.Run("UnhealthyBackendFailover", testUnhealthyBackendFailover)
 	t.Run("FailoverUpdatesPropagation", testFailoverUpdatesPropagation)
 	t.Run("BackendAutoRecovery", testBackendAutoRecovery)
+	t.Run("RemovedBackendAffinity", testRemovedBackendAffinity)
 }
 
 // testHealthyBackendAffinity verifies affinity routing to healthy backend
@@ -283,6 +284,67 @@ func TestAffinityCleanup(t *testing.T) {
 	}
 
 	t.Logf("✅ PASS: Expired affinities are automatically cleaned up")
+}
+
+// testRemovedBackendAffinity verifies that if a backend is removed from the configuration,
+// the connection manager will ignore the cached affinity, delete it, and fall back to another backend.
+func testRemovedBackendAffinity(t *testing.T) {
+	// Create cluster and affinity manager
+	cluster1, err := createTestCluster("node-1", 26946, []string{})
+	if err != nil {
+		t.Fatalf("Failed to create cluster: %v", err)
+	}
+	defer cluster1.Shutdown()
+
+	affinity := server.NewAffinityManager(cluster1, true, 24*time.Hour, 1*time.Hour)
+
+	// Create connection manager with only two backends
+	backends := []string{"backend1:143", "backend2:143"}
+	connMgr, err := NewConnectionManager(backends, 143, false, false, false, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to create connection manager: %v", err)
+	}
+	connMgr.SetAffinityManager(affinity)
+
+	// Simulate a scenario where the user previously had affinity to backend3
+	// but backend3 was subsequently removed from the proxy configuration
+	affinity.SetBackend("user@example.com", "backend3:143", "imap")
+
+	// Verify affinity is initially set
+	backend, found := affinity.GetBackend("user@example.com", "imap")
+	if !found || backend != "backend3:143" {
+		t.Fatalf("Affinity not set correctly")
+	}
+
+	// Determine route - should detect removed backend and delete affinity
+	result, err := DetermineRoute(RouteParams{
+		Ctx:                   context.Background(),
+		Username:              "user@example.com",
+		Protocol:              "imap",
+		IsRemoteLookupAccount: false,
+		RoutingInfo:           nil,
+		ConnManager:           connMgr,
+		EnableAffinity:        true,
+		ProxyName:             "Test Proxy",
+	})
+
+	if err != nil {
+		t.Fatalf("DetermineRoute failed: %v", err)
+	}
+
+	// Should NOT route to backend3 (removed from pool)
+	if result.PreferredAddr == "backend3:143" {
+		t.Error("Should not route to removed backend3")
+	}
+
+	// Verify affinity was deleted
+	time.Sleep(100 * time.Millisecond) // wait for asynchronous cleanup if any, though it's synchronous here
+	_, found = affinity.GetBackend("user@example.com", "imap")
+	if found {
+		t.Error("Affinity should be deleted after detecting removed backend")
+	}
+
+	t.Logf("✅ PASS: Removed backend detected, affinity deleted, fell back safely")
 }
 
 // Helper function to create test cluster
