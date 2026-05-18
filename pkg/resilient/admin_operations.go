@@ -173,6 +173,10 @@ func (rd *ResilientDatabase) CleanupFailedUploadsWithRetry(ctx context.Context, 
 }
 
 func (rd *ResilientDatabase) InsertMessageFromImporterWithRetry(ctx context.Context, options *db.InsertMessageOptions) (messageID int64, uid int64, err error) {
+	// Lock the mailbox at the Go level to prevent connection pool starvation during mass concurrent imports.
+	unlock := rd.getOperationalDatabaseForOperation(true).LockMailbox(options.MailboxID)
+	defer unlock()
+
 	// Importer writes are less safe to retry automatically, so limit retries.
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,

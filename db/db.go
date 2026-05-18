@@ -82,6 +82,8 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 //go:embed migrations/*.sql
@@ -129,7 +131,30 @@ type Database struct {
 	lockConn                     *pgxpool.Conn    // Connection holding the advisory lock
 	uidValidityMismatchLoggedMap sync.Map         // Tracks mailbox IDs that have already logged UIDVALIDITY mismatch (mailboxID -> bool)
 	AccountDomainCache           sync.Map         // Cache for account_id -> domain string
+	mailboxMutexes               sync.Map         // Cache for per-mailbox locks to prevent connection starvation (mailboxID -> *sync.Mutex)
 	fetchChunkSize               int              // Number of messages to fetch per chunk for large result sets
+}
+
+var (
+	mailboxLockWaitDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "sora_go_mailbox_lock_wait_seconds",
+		Help:    "Time spent waiting for Go-level mailbox mutex",
+		Buckets: []float64{0.001, 0.01, 0.1, 0.5, 1, 5},
+	}, []string{"mailbox_id"})
+)
+
+// LockMailbox acquires an in-memory mutex for a specific mailbox.
+// This prevents connection pool starvation during mass concurrent inserts to the same mailbox,
+// by serializing the workers in Go memory BEFORE they acquire a database connection.
+// Returns an unlock function to be called in a defer statement.
+func (db *Database) LockMailbox(mailboxID int64) func() {
+	start := time.Now()
+	v, _ := db.mailboxMutexes.LoadOrStore(mailboxID, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	duration := time.Since(start).Seconds()
+	mailboxLockWaitDuration.WithLabelValues(fmt.Sprintf("%d", mailboxID)).Observe(duration)
+	return func() { mu.Unlock() }
 }
 
 // GetAccountDomain retrieves the domain for an account, using an in-memory cache
@@ -689,9 +714,17 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 			readFailover = writeFailover // Share the same failover manager
 		}
 	} else {
-		// If no read config specified, use write pool for reads
-		readPool = writePool
-		readFailover = writeFailover // Share the same failover manager
+		// If no read config specified, create a dedicated read pool pointing to the write database.
+		// This prevents read queries (UI/IMAP clients) from timing out due to connection pool starvation
+		// when heavy write operations (mass imports/deliveries) exhaust all connections.
+		readFailover = NewFailoverManager(dbConfig.Write, "read")
+		readPool, err = createPoolFromEndpointWithFailover(ctx, dbConfig.Write, dbConfig.GetDebug(), "read", readFailover)
+		if err != nil {
+			logger.Warn("Database: failed to create dedicated read pool", "err", err)
+			logger.Info("Database: falling back to shared write pool for read operations")
+			readPool = writePool
+			readFailover = writeFailover // Share the same failover manager
+		}
 	}
 
 	db := &Database{

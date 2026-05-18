@@ -25,6 +25,10 @@ func (rd *ResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, Acco
 }
 
 func (rd *ResilientDatabase) InsertMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload) (messageID int64, uid int64, err error) {
+	// Lock the mailbox at the Go level to prevent connection pool starvation during mass concurrent inserts.
+	unlock := rd.getOperationalDatabaseForOperation(true).LockMailbox(options.MailboxID)
+	defer unlock()
+
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		id, u, opErr := rd.getOperationalDatabaseForOperation(true).InsertMessage(ctx, tx, options, upload)
 		// Always return the result slice (including UID), even on error
