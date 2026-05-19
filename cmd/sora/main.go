@@ -1251,7 +1251,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 
 	// Start local connection tracker for backend server (always enabled for admin visibility)
 	instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-	tracker := server.NewConnectionTracker("IMAP", serverConfig.Name, deps.hostname, instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, false)
+	tracker := server.NewConnectionTracker("IMAP", serverConfig.Name, deps.hostname, instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, true)
 	if tracker != nil {
 		s.SetConnTracker(tracker)
 		defer tracker.Stop()
@@ -1407,7 +1407,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 
 	// Start local connection tracker for backend server (always enabled for admin visibility)
 	instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-	tracker := server.NewConnectionTracker("POP3", serverConfig.Name, deps.hostname, instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, false)
+	tracker := server.NewConnectionTracker("POP3", serverConfig.Name, deps.hostname, instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, true)
 	if tracker != nil {
 		s.SetConnTracker(tracker)
 		defer tracker.Stop()
@@ -1506,7 +1506,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 
 	// Start local connection tracker for backend server (always enabled for admin visibility)
 	instanceID := fmt.Sprintf("%s-%s", deps.hostname, serverConfig.Name)
-	tracker := server.NewConnectionTracker("ManageSieve", serverConfig.Name, deps.hostname, instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, false)
+	tracker := server.NewConnectionTracker("ManageSieve", serverConfig.Name, deps.hostname, instanceID, nil, serverConfig.MaxConnectionsPerUser, serverConfig.MaxConnectionsPerUserPerIP, 0, true)
 	if tracker != nil {
 		s.SetConnTracker(tracker)
 		defer tracker.Stop()
