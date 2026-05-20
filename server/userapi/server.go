@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -472,22 +473,13 @@ func (s *Server) allowedHostsMiddleware(next http.Handler) http.Handler {
 // Utility functions
 
 func getClientIP(r *http.Request) string {
-	// Try X-Forwarded-For header first (for proxies)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		return strings.TrimSpace(ips[0])
+	// Extract IP from RemoteAddr (which may be set by PROXY protocol or real TCP peer)
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// If splitting fails, return as-is (already an IP without port)
+		return r.RemoteAddr
 	}
-
-	// Try X-Real-IP header
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-
-	// Fall back to RemoteAddr
-	if idx := strings.LastIndex(r.RemoteAddr, ":"); idx != -1 {
-		return r.RemoteAddr[:idx]
-	}
-	return r.RemoteAddr
+	return host
 }
 
 func isIPAllowed(clientIP string, allowedHosts []string) bool {

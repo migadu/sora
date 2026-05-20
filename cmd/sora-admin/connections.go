@@ -539,7 +539,6 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 		return nil
 	}
 
-
 	// Apply filters (domain, protocol and instanceID are client-side filters)
 	filteredConnections := result.Connections
 	if domain != "" || protocol != "" || instanceID != "" {

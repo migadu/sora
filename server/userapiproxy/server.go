@@ -534,17 +534,8 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, backendAdd
 	r.Header.Set("X-Real-IP", realClientIP)
 	r.Header.Set("X-Forwarded-For", realClientIP)
 
-	// Add headers for backend to identify the authenticated user (if authenticated)
-	// Backend should trust these headers from trusted proxy networks
-	if userEmail != nil {
-		r.Header.Set("X-Forwarded-User", *userEmail)
-	}
-	if accountID != nil {
-		r.Header.Set("X-Forwarded-User-ID", fmt.Sprintf("%d", *accountID))
-	}
-
-	// Keep Authorization header for backend verification if needed
-	// (Backend can choose to skip validation for trusted networks)
+	// Keep Authorization header for backend JWT validation
+	// Backend always validates the JWT token
 
 	// Proxy the request
 	proxy.ServeHTTP(w, r)

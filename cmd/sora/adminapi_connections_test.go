@@ -80,7 +80,7 @@ func TestAdminAPIConnections_StorageNodeIntegration(t *testing.T) {
 	if resp.Count != 1 {
 		t.Errorf("Expected 1 connection, got %d. Note: %s", resp.Count, resp.Note)
 	}
-	
+
 	if len(resp.Connections) != 1 {
 		t.Errorf("Expected 1 connection details, got %d", len(resp.Connections))
 	} else {
