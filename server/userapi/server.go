@@ -41,26 +41,31 @@ type Server struct {
 	tlsCertFile                string
 	tlsKeyFile                 string
 	tlsVerify                  bool
+	proxyReader                *server.ProxyProtocolReader
 }
 
 // ServerOptions holds configuration options for the HTTP Mail API server
 type ServerOptions struct {
-	Name           string
-	Addr           string
-	JWTSecret      string
-	TokenDuration  time.Duration
-	TokenIssuer    string
-	AllowedOrigins []string
-	AllowedHosts   []string
-	Storage        *storage.S3Storage
-	Cache          *cache.Cache
-	AuthRateLimit  server.AuthRateLimiterConfig
-	LookupCache    *config.LookupCacheConfig // Authentication cache configuration
-	TLS            bool
-	TLSConfig      *tls.Config // TLS config from manager (takes precedence over cert files)
-	TLSCertFile    string
-	TLSKeyFile     string
-	TLSVerify      bool
+	Name                        string
+	Addr                        string
+	JWTSecret                   string
+	TokenDuration               time.Duration
+	TokenIssuer                 string
+	AllowedOrigins              []string
+	AllowedHosts                []string
+	Storage                     *storage.S3Storage
+	Cache                       *cache.Cache
+	AuthRateLimit               server.AuthRateLimiterConfig
+	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
+	TLS                         bool
+	TLSConfig                   *tls.Config // TLS config from manager (takes precedence over cert files)
+	TLSCertFile                 string
+	TLSKeyFile                  string
+	TLSVerify                   bool
+	ProxyProtocol               bool
+	ProxyProtocolTimeout        string
+	ProxyProtocolTrustedProxies []string
+	TrustedNetworks             []string // Fallback if trusted proxies empty
 }
 
 // New creates a new HTTP Mail API server
@@ -131,6 +136,22 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		logger.Info("User API: Lookup cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
+	// Initialize PROXY protocol reader if enabled
+	var proxyReader *server.ProxyProtocolReader
+	if options.ProxyProtocol {
+		proxyConfig := server.ProxyProtocolConfig{
+			Enabled:        true,
+			Timeout:        options.ProxyProtocolTimeout,
+			TrustedProxies: getProxyProtocolTrustedProxies(options.ProxyProtocolTrustedProxies, options.TrustedNetworks),
+		}
+		var err error
+		proxyReader, err = server.NewProxyProtocolReader("USER-API", proxyConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create PROXY protocol reader: %w", err)
+		}
+		logger.Info("PROXY protocol enabled for incoming connections", "server", options.Name)
+	}
+
 	s := &Server{
 		name:                       options.Name,
 		addr:                       options.Addr,
@@ -150,6 +171,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		tlsCertFile:                options.TLSCertFile,
 		tlsKeyFile:                 options.TLSKeyFile,
 		tlsVerify:                  options.TLSVerify,
+		proxyReader:                proxyReader,
 	}
 
 	return s, nil
@@ -223,6 +245,20 @@ func (s *Server) start(ctx context.Context) error {
 		}
 	}()
 
+	// Create listener
+	listener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("failed to create listener: %w", err)
+	}
+
+	// Wrap listener with PROXY protocol support if enabled
+	if s.proxyReader != nil {
+		listener = &proxyProtocolListener{
+			Listener:    listener,
+			proxyReader: s.proxyReader,
+		}
+	}
+
 	// Start server with or without TLS
 	if s.tls {
 		// Use TLS config from manager if provided, otherwise create one for static certs
@@ -249,12 +285,12 @@ func (s *Server) start(ctx context.Context) error {
 		// If using TLS manager (tlsConfig from manager), pass empty cert files
 		// The GetCertificate callback in the config will handle certificate retrieval
 		if s.tlsConfig != nil {
-			return s.server.ListenAndServeTLS("", "")
+			return s.server.ServeTLS(listener, "", "")
 		}
 		// Otherwise use static certificate files
-		return s.server.ListenAndServeTLS(s.tlsCertFile, s.tlsKeyFile)
+		return s.server.ServeTLS(listener, s.tlsCertFile, s.tlsKeyFile)
 	}
-	return s.server.ListenAndServe()
+	return s.server.Serve(listener)
 }
 
 // SetupRoutes configures all HTTP routes and middleware
@@ -502,4 +538,64 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
 
 func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, map[string]string{"error": message})
+}
+
+// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
+	if len(proxyProtocolTrusted) > 0 {
+		return proxyProtocolTrusted
+	}
+	return trustedNetworks
+}
+
+// proxyProtocolListener wraps a net.Listener to read PROXY protocol headers
+type proxyProtocolListener struct {
+	net.Listener
+	proxyReader *server.ProxyProtocolReader
+}
+
+// Accept wraps the underlying Accept to read PROXY protocol headers
+func (l *proxyProtocolListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	// Read PROXY protocol header (this validates the connection is from trusted proxy)
+	proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
+	if err != nil {
+		// Log with original connection's remote address (the proxy's IP)
+		logger.Error("PROXY protocol error", "server", "user_api", "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
+		conn.Close()
+		return nil, err
+	}
+
+	// Only wrap if we got proxy info - this preserves the real client IP in RemoteAddr()
+	if proxyInfo != nil && proxyInfo.SrcIP != "" {
+		return &proxyProtocolConn{
+			Conn:      wrappedConn,
+			proxyInfo: proxyInfo,
+		}, nil
+	}
+
+	// No proxy info, return wrapped connection as-is
+	return wrappedConn, nil
+}
+
+// proxyProtocolConn wraps a net.Conn to carry PROXY protocol info
+type proxyProtocolConn struct {
+	net.Conn
+	proxyInfo *server.ProxyProtocolInfo
+}
+
+// RemoteAddr returns the real client address from PROXY protocol if available
+func (c *proxyProtocolConn) RemoteAddr() net.Addr {
+	if c.proxyInfo != nil && c.proxyInfo.SrcIP != "" {
+		// Return a custom address with the real client IP
+		return &net.TCPAddr{
+			IP:   net.ParseIP(c.proxyInfo.SrcIP),
+			Port: c.proxyInfo.SrcPort,
+		}
+	}
+	return c.Conn.RemoteAddr()
 }

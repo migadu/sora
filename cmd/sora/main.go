@@ -2140,22 +2140,26 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 	}
 
 	options := mailapi.ServerOptions{
-		Name:           serverConfig.Name,
-		Addr:           serverConfig.Addr,
-		JWTSecret:      serverConfig.JWTSecret,
-		TokenDuration:  tokenDuration,
-		TokenIssuer:    serverConfig.TokenIssuer,
-		AllowedOrigins: serverConfig.AllowedOrigins,
-		AllowedHosts:   serverConfig.AllowedHosts,
-		Storage:        deps.storage,
-		Cache:          deps.cacheInstance,
-		AuthRateLimit:  authRateLimit,
-		LookupCache:    serverConfig.LookupCache,
-		TLS:            serverConfig.TLS,
-		TLSConfig:      tlsConfig, // From TLS manager (if available)
-		TLSCertFile:    serverConfig.TLSCertFile,
-		TLSKeyFile:     serverConfig.TLSKeyFile,
-		TLSVerify:      serverConfig.TLSVerify,
+		Name:                        serverConfig.Name,
+		Addr:                        serverConfig.Addr,
+		JWTSecret:                   serverConfig.JWTSecret,
+		TokenDuration:               tokenDuration,
+		TokenIssuer:                 serverConfig.TokenIssuer,
+		AllowedOrigins:              serverConfig.AllowedOrigins,
+		AllowedHosts:                serverConfig.AllowedHosts,
+		Storage:                     deps.storage,
+		Cache:                       deps.cacheInstance,
+		AuthRateLimit:               authRateLimit,
+		LookupCache:                 serverConfig.LookupCache,
+		TLS:                         serverConfig.TLS,
+		TLSConfig:                   tlsConfig, // From TLS manager (if available)
+		TLSCertFile:                 serverConfig.TLSCertFile,
+		TLSKeyFile:                  serverConfig.TLSKeyFile,
+		TLSVerify:                   serverConfig.TLSVerify,
+		ProxyProtocol:               serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:        serverConfig.GetProxyProtocolTimeoutWithDefault(),
+		ProxyProtocolTrustedProxies: deps.config.Servers.TrustedNetworks,
+		TrustedNetworks:             deps.config.Servers.TrustedNetworks,
 	}
 
 	srv := mailapi.Start(ctx, deps.resilientDB, options, errChan)
@@ -2211,6 +2215,9 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		RemoteLookup:             serverConfig.RemoteLookup,
 		LookupCache:              serverConfig.LookupCache,
 		AffinityManager:          deps.affinityManager,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
+		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 	})
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create User API proxy server: %w", err)

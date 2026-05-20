@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,13 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
+)
+
+type contextKey string
+
+const (
+	clientIPKey   contextKey = "client-ip"
+	clientPortKey contextKey = "client-port"
 )
 
 // JWTClaims represents the JWT token claims (must match userapi.JWTClaims)
@@ -86,8 +94,9 @@ type ServerOptions struct {
 	ClusterManager           *cluster.Manager           // Optional: enables cluster-wide per-IP limiting
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
-	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
-	ProxyProtocolTimeout string // Timeout for reading PROXY protocol headers (e.g., "5s")
+	ProxyProtocol          bool   // Enable PROXY protocol support for incoming connections
+	ProxyProtocolTimeout   string // Timeout for reading PROXY protocol headers (e.g., "5s")
+	RemoteUseProxyProtocol bool   // Use PROXY protocol for backend connections
 }
 
 // New creates a new User API proxy server
@@ -164,10 +173,35 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 			InsecureSkipVerify: !opts.RemoteTLSVerify,
 			Renegotiation:      tls.RenegotiateNever,
 		},
-		DialContext: (&net.Dialer{
-			Timeout:   connectTimeout,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := (&net.Dialer{
+				Timeout:   connectTimeout,
+				KeepAlive: 30 * time.Second,
+			}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if opts.RemoteUseProxyProtocol {
+				// Retrieve client IP and port from context
+				if cIP, ok := ctx.Value(clientIPKey).(string); ok {
+					if cPort, ok := ctx.Value(clientPortKey).(int); ok {
+						// Retrieve local IP/port from conn to use as server IP/port in PROXY header
+						var serverIP string = "127.0.0.1"
+						var serverPort int = 0
+						if localAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
+							serverIP = localAddr.IP.String()
+							serverPort = localAddr.Port
+						}
+						// Write PROXY v2 header
+						if err := server.WriteProxyV2Header(conn, cIP, cPort, serverIP, serverPort, "tcp"); err != nil {
+							conn.Close()
+							return nil, fmt.Errorf("failed to write PROXY v2 header: %w", err)
+						}
+					}
+				}
+			}
+			return conn, nil
+		},
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
@@ -533,6 +567,17 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, backendAdd
 	// Backend should trust these headers from trusted proxy networks
 	r.Header.Set("X-Real-IP", realClientIP)
 	r.Header.Set("X-Forwarded-For", realClientIP)
+
+	// Inject client IP and port into context for transport.DialContext to pick up
+	ctx := r.Context()
+	host, portStr, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		if port, err := strconv.Atoi(portStr); err == nil {
+			ctx = context.WithValue(ctx, clientIPKey, host)
+			ctx = context.WithValue(ctx, clientPortKey, port)
+		}
+	}
+	r = r.WithContext(ctx)
 
 	// Keep Authorization header for backend JWT validation
 	// Backend always validates the JWT token

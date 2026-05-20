@@ -1225,37 +1225,75 @@ type HTTPAPIConfig struct {
 
 // UserAPIServerConfig holds User API server configuration
 type UserAPIServerConfig struct {
-	Start          bool     `toml:"start"`
-	Addr           string   `toml:"addr"`
-	JWTSecret      string   `toml:"jwt_secret"`
-	TokenDuration  string   `toml:"token_duration"`  // JWT token validity duration (default: 24h)
-	TokenIssuer    string   `toml:"token_issuer"`    // JWT issuer (default: sora-mail-api)
-	AllowedOrigins []string `toml:"allowed_origins"` // CORS allowed origins
-	AllowedHosts   []string `toml:"allowed_hosts"`   // If empty, all hosts are allowed
-	TLS            bool     `toml:"tls"`
-	TLSCertFile    string   `toml:"tls_cert_file"`
-	TLSKeyFile     string   `toml:"tls_key_file"`
-	TLSVerify      bool     `toml:"tls_verify"` // Verify client certificates (mutual TLS)
+	Start                       bool     `toml:"start"`
+	Addr                        string   `toml:"addr"`
+	JWTSecret                   string   `toml:"jwt_secret"`
+	TokenDuration               string   `toml:"token_duration"`  // JWT token validity duration (default: 24h)
+	TokenIssuer                 string   `toml:"token_issuer"`    // JWT issuer (default: sora-mail-api)
+	AllowedOrigins              []string `toml:"allowed_origins"` // CORS allowed origins
+	AllowedHosts                []string `toml:"allowed_hosts"`   // If empty, all hosts are allowed
+	TLS                         bool     `toml:"tls"`
+	TLSCertFile                 string   `toml:"tls_cert_file"`
+	TLSKeyFile                  string   `toml:"tls_key_file"`
+	TLSVerify                   bool     `toml:"tls_verify"` // Verify client certificates (mutual TLS)
+	ProxyProtocol               bool     `toml:"proxy_protocol"`
+	ProxyProtocolTimeout        string   `toml:"proxy_protocol_timeout"`
+	ProxyProtocolTrustedProxies []string `toml:"proxy_protocol_trusted_proxies"`
+}
+
+// GetProxyProtocolTimeout returns parsed duration for proxy protocol timeout or default 5s
+func (c *UserAPIServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
+	if c.ProxyProtocolTimeout == "" {
+		return 5 * time.Second, nil
+	}
+	return helpers.ParseDuration(c.ProxyProtocolTimeout)
+}
+
+// GetProxyProtocolTimeoutWithDefault returns proxy protocol timeout or default 5s
+func (c *UserAPIServerConfig) GetProxyProtocolTimeoutWithDefault() string {
+	if c.ProxyProtocolTimeout == "" {
+		return "5s"
+	}
+	return c.ProxyProtocolTimeout
 }
 
 // UserAPIProxyServerConfig holds User API proxy server configuration
 type UserAPIProxyServerConfig struct {
-	Start               bool     `toml:"start"`
-	Addr                string   `toml:"addr"`
-	RemoteAddrs         []string `toml:"remote_addrs"`
-	RemotePort          any      `toml:"remote_port"`            // Default port for backends if not in address
-	JWTSecret           string   `toml:"jwt_secret"`             // JWT secret for token validation (must match backend)
-	MaxConnections      int      `toml:"max_connections"`        // Maximum concurrent connections
-	MaxConnectionsPerIP int      `toml:"max_connections_per_ip"` // Maximum connections per IP address
-	TLS                 bool     `toml:"tls"`
-	TLSCertFile         string   `toml:"tls_cert_file"`
-	TLSKeyFile          string   `toml:"tls_key_file"`
-	TLSVerify           bool     `toml:"tls_verify"`
-	RemoteTLS           bool     `toml:"remote_tls"`
-	RemoteTLSVerify     bool     `toml:"remote_tls_verify"`
-	ConnectTimeout      string   `toml:"connect_timeout"`
-	EnableAffinity      bool     `toml:"enable_affinity"`
-	RemoteHealthChecks  *bool    `toml:"remote_health_checks"` // Enable backend health checking (default: true)
+	Start                  bool     `toml:"start"`
+	Addr                   string   `toml:"addr"`
+	RemoteAddrs            []string `toml:"remote_addrs"`
+	RemotePort             any      `toml:"remote_port"`            // Default port for backends if not in address
+	JWTSecret              string   `toml:"jwt_secret"`             // JWT secret for token validation (must match backend)
+	MaxConnections         int      `toml:"max_connections"`        // Maximum concurrent connections
+	MaxConnectionsPerIP    int      `toml:"max_connections_per_ip"` // Maximum connections per IP address
+	TLS                    bool     `toml:"tls"`
+	TLSCertFile            string   `toml:"tls_cert_file"`
+	TLSKeyFile             string   `toml:"tls_key_file"`
+	TLSVerify              bool     `toml:"tls_verify"`
+	RemoteTLS              bool     `toml:"remote_tls"`
+	RemoteTLSVerify        bool     `toml:"remote_tls_verify"`
+	ConnectTimeout         string   `toml:"connect_timeout"`
+	EnableAffinity         bool     `toml:"enable_affinity"`
+	RemoteHealthChecks     *bool    `toml:"remote_health_checks"`      // Enable backend health checking (default: true)
+	RemoteUseProxyProtocol bool     `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
+	ProxyProtocol          bool     `toml:"proxy_protocol"`            // Enable PROXY protocol for incoming connections
+	ProxyProtocolTimeout   string   `toml:"proxy_protocol_timeout"`    // Timeout for reading PROXY protocol headers
+}
+
+// GetProxyProtocolTimeout returns parsed duration for proxy protocol timeout or default 5s
+func (c *UserAPIProxyServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
+	if c.ProxyProtocolTimeout == "" {
+		return 5 * time.Second, nil
+	}
+	return helpers.ParseDuration(c.ProxyProtocolTimeout)
+}
+
+// GetProxyProtocolTimeoutWithDefault returns proxy protocol timeout or default 5s
+func (c *UserAPIProxyServerConfig) GetProxyProtocolTimeoutWithDefault() string {
+	if c.ProxyProtocolTimeout == "" {
+		return "5s"
+	}
+	return c.ProxyProtocolTimeout
 }
 
 // GetRemoteHealthChecks returns whether backend health checking is enabled.
