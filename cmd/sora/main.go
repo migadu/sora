@@ -1281,12 +1281,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
-	maxMessageSize, err := serverConfig.GetMaxMessageSize()
-	if err != nil {
-		logger.Info("LMTP: Invalid max_message_size - using default (50MB)", "name",
-			serverConfig.Name, err)
-		maxMessageSize = 50 * 1024 * 1024
-	}
+	maxMessageSize := serverConfig.GetMaxMessageSizeWithDefault()
 
 	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config

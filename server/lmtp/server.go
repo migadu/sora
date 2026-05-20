@@ -26,6 +26,9 @@ import (
 	"github.com/migadu/sora/storage"
 )
 
+// DefaultMaxMessageSize is the default maximum message size for LMTP (50MB)
+const DefaultMaxMessageSize = 50 * 1024 * 1024
+
 // getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {

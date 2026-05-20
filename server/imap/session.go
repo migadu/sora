@@ -103,6 +103,20 @@ func (s *IMAPSession) GetCapabilities() imap.CapSet {
 	return s.server.caps
 }
 
+// AppendLimit implements the SessionAppendLimit interface from go-imap.
+// Returns the maximum size in bytes that can be uploaded in an APPEND command.
+// The go-imap library uses this to:
+// 1. Check literal size BEFORE reading data (prevents memory exhaustion)
+// 2. For LITERAL+ (non-synchronizing), drain oversized data to prevent stream corruption
+// 3. Advertise APPENDLIMIT=<size> capability to clients
+func (s *IMAPSession) AppendLimit() uint32 {
+	limit := s.server.appendLimit
+	if limit <= 0 {
+		limit = DefaultAppendLimit // 25MB fallback
+	}
+	return uint32(limit)
+}
+
 // SetClientID stores the client ID information and applies capability filtering
 func (s *IMAPSession) SetClientID(clientID *imap.IDData) {
 	s.clientID = clientID

@@ -296,12 +296,16 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	var buf bytes.Buffer
 
-	// Limit the read if max_message_size is configured
-	var reader io.Reader = r
-	if s.backend.maxMessageSize > 0 {
-		// Add 1 byte to detect when limit is exceeded
-		reader = io.LimitReader(r, s.backend.maxMessageSize+1)
+	// Enforce message size limit BEFORE reading into memory to prevent DoS
+	// Default: 50MB (configurable). Without limit, malicious senders could
+	// deliver 50+ MB messages × concurrent connections causing memory exhaustion.
+	limitToUse := s.backend.maxMessageSize
+	if limitToUse <= 0 {
+		limitToUse = DefaultMaxMessageSize // 50MB fallback
 	}
+
+	// Add 1 byte to detect when limit is exceeded
+	reader := io.LimitReader(r, limitToUse+1)
 
 	_, err := io.Copy(&buf, reader)
 	if err != nil {
@@ -325,13 +329,14 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	start = time.Now()
 
 	// Check if message exceeds configured limit
-	if s.backend.maxMessageSize > 0 && int64(buf.Len()) > s.backend.maxMessageSize {
-		s.WarnLog("message size exceeds limit", "size", buf.Len(), "limit", s.backend.maxMessageSize)
+	// LimitReader allows reading limitToUse+1 bytes to detect oversized messages
+	if int64(buf.Len()) > limitToUse {
+		s.WarnLog("message size exceeds limit", "size", buf.Len(), "limit", limitToUse)
 		recordMetrics("failure")
 		return &smtp.SMTPError{
 			Code:         552,
 			EnhancedCode: smtp.EnhancedCode{5, 3, 4},
-			Message:      fmt.Sprintf("message size exceeds maximum allowed size of %d bytes", s.backend.maxMessageSize),
+			Message:      fmt.Sprintf("message size exceeds maximum allowed size of %d bytes", limitToUse),
 		}
 	}
 

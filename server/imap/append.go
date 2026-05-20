@@ -104,6 +104,11 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		return nil, imapErr
 	}
 
+	// NOTE: Size checking is handled by go-imap library via SessionAppendLimit interface.
+	// The library checks r.Size() against AppendLimit() BEFORE calling this handler,
+	// and drains oversized LITERAL+ data to prevent command stream corruption.
+	// See: imapserver/append.go in github.com/migadu/go-imap
+
 	// Read the entire message into a buffer
 	var buf bytes.Buffer
 	if _, err = io.Copy(&buf, r); err != nil {
@@ -134,18 +139,6 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: "empty message rejected: a message must contain at least headers",
-		}
-	}
-
-	// Check if the message exceeds the configured APPENDLIMIT
-	if s.server.appendLimit > 0 && int64(len(fullMessageBytes)) > s.server.appendLimit {
-		s.DebugLog("message size exceeds APPENDLIMIT", "size", len(fullMessageBytes), "limit", s.server.appendLimit)
-		s.classifyAndTrackError("APPEND", nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTooBig})
-		recordMetrics("failure")
-		return nil, &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeTooBig,
-			Text: fmt.Sprintf("message size %d bytes exceeds maximum allowed size of %d bytes", len(fullMessageBytes), s.server.appendLimit),
 		}
 	}
 

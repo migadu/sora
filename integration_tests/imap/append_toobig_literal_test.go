@@ -18,7 +18,7 @@ import (
 // literal data instead of allowing it to leak into the command stream.
 //
 // Bug reproduction: Apple Mail sends APPEND with {234310148+} (234MB) which exceeds
-// the 100MB limit. The server responds with NO [TOOBIG], but the client has already
+// the 25MB limit. The server responds with NO [TOOBIG], but the client has already
 // started sending the literal data. If the server doesn't drain this data, it bleeds
 // into the command parser, causing "expected SP" errors and treating message headers
 // as IMAP commands (e.g., "Subject: BAD Unknown command").
@@ -83,8 +83,8 @@ func TestIMAP_AppendTooBigLiteralPlus(t *testing.T) {
 	expectOK("A002")
 
 	// Create a message that would be too large
-	// APPENDLIMIT is 100MB (104857600 bytes) by default
-	oversizedBytes := 104857600 + 1000 // Slightly over the limit
+	// APPENDLIMIT is 25MB (26214400 bytes) by default
+	oversizedBytes := 26214400 + 1000 // Slightly over the limit
 
 	// Construct a realistic message with Apple Mail headers (similar to production)
 	messageHeader := strings.ReplaceAll(`Subject: =?utf-8?Q?Re=3A_Test_Message?=
@@ -182,8 +182,9 @@ Content-Type: text/plain; charset=utf-8
 }
 
 // TestIMAP_AppendTooBigSynchronizing tests the same scenario but with
-// synchronizing literals (without the +), which should handle correctly
-// because the server can reject before the client sends data.
+// synchronizing literals (without the +). Per RFC 3501, the server MUST
+// send continuation for synchronizing literals before the client sends data.
+// The server can only reject AFTER reading the literal (in the handler).
 func TestIMAP_AppendTooBigSynchronizing(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -239,28 +240,21 @@ func TestIMAP_AppendTooBigSynchronizing(t *testing.T) {
 	expectOK("A001")
 
 	// Send APPEND with synchronizing literal (no +)
-	oversizedBytes := 104857600 + 1000
+	oversizedBytes := 26214400 + 1000 // Over 25MB default limit
 	send(fmt.Sprintf("A002 APPEND INBOX {%d}", oversizedBytes))
 
-	// Server should respond with NO [TOOBIG] immediately without continuation
-	foundTooBig := false
-	for {
-		line := readLine()
-		if strings.Contains(line, "[TOOBIG]") {
-			foundTooBig = true
-			t.Logf("Got expected TOOBIG response: %s", strings.TrimSpace(line))
-		}
-		if strings.HasPrefix(line, "A002 NO") {
-			break
-		}
-		if strings.HasPrefix(line, "+ ") {
-			t.Error("Server sent continuation for oversized synchronizing literal!")
-		}
+	// With Migadu's go-imap fork, the server checks the literal size from {size}
+	// BEFORE sending continuation response. This is an optimization that prevents
+	// memory exhaustion by rejecting oversized messages immediately without reading data.
+	// The server responds with NO [TOOBIG] directly, without sending "+ " continuation.
+	line := readLine()
+	if !strings.HasPrefix(line, "A002 NO") {
+		t.Fatalf("Expected NO [TOOBIG] response, got: %s", line)
 	}
-
-	if !foundTooBig {
-		t.Error("Did not receive [TOOBIG] response code")
+	if !strings.Contains(line, "[TOOBIG]") {
+		t.Fatalf("Expected [TOOBIG] response code, got: %s", line)
 	}
+	t.Logf("Got expected TOOBIG response: %s", strings.TrimSpace(line))
 
 	// Connection should be fine
 	send("A003 NOOP")

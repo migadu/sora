@@ -38,15 +38,15 @@ func TestAppendSizeLimit_EnforcedCorrectly(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "No limit configured (0)",
-			appendLimit: 0,      // No limit
-			messageSize: 100000, // 100KB
+			name:        "No limit configured (0) - uses 25MB fallback",
+			appendLimit: 0,      // 0 means use fallback (25MB)
+			messageSize: 100000, // 100KB (under fallback)
 			expectError: false,
 		},
 		{
-			name:        "Large message with no limit",
-			appendLimit: 0,        // No limit
-			messageSize: 10000000, // 10MB
+			name:        "Large message with 0 limit - uses 25MB fallback",
+			appendLimit: 0,        // 0 means use fallback (25MB)
+			messageSize: 10000000, // 10MB (under fallback)
 			expectError: false,
 		},
 	}
@@ -57,10 +57,14 @@ func TestAppendSizeLimit_EnforcedCorrectly(t *testing.T) {
 			messageData := createTestMessage(tt.messageSize)
 
 			// Simulate the size limit check logic from Append() method
-			// The actual code in append.go lines 69-77 checks:
-			// if s.server.appendLimit > 0 && int64(len(fullMessageBytes)) > s.server.appendLimit
+			// Apply fallback if limit is 0 (matches production code)
+			limitToUse := tt.appendLimit
+			if limitToUse <= 0 {
+				limitToUse = 25 * 1024 * 1024 // 25MB fallback
+			}
+
 			var sizeError bool
-			if tt.appendLimit > 0 && int64(len(messageData)) > tt.appendLimit {
+			if int64(len(messageData)) > limitToUse {
 				sizeError = true
 			}
 
@@ -156,33 +160,52 @@ func TestAppendSizeLimit_BoundaryConditions(t *testing.T) {
 	}
 }
 
-// TestAppendSizeLimit_Zero verifies that zero means unlimited
+// TestAppendSizeLimit_Zero verifies that zero uses 25MB fallback
 func TestAppendSizeLimit_Zero(t *testing.T) {
-	limit := int64(0) // Unlimited
+	limit := int64(0) // Uses 25MB fallback
 
-	sizes := []int{
-		1024,              // 1KB
-		1024 * 1024,       // 1MB
-		10 * 1024 * 1024,  // 10MB
-		100 * 1024 * 1024, // 100MB
+	tests := []struct {
+		size        int
+		expectError bool
+	}{
+		{1024, false},             // 1KB (under fallback)
+		{1024 * 1024, false},      // 1MB (under fallback)
+		{10 * 1024 * 1024, false}, // 10MB (under fallback)
+		{24 * 1024 * 1024, false}, // 24MB (under fallback)
+		{26 * 1024 * 1024, true},  // 26MB (over 25MB fallback)
 	}
 
-	for _, size := range sizes {
-		t.Run(formatBytes(int64(size)), func(t *testing.T) {
-			messageData := createTestMessage(size)
+	for _, tt := range tests {
+		t.Run(formatBytes(int64(tt.size)), func(t *testing.T) {
+			messageData := createTestMessage(tt.size)
 
-			// Apply size check logic
+			// Apply size check logic with fallback
+			limitToUse := limit
+			if limitToUse <= 0 {
+				limitToUse = 25 * 1024 * 1024 // 25MB fallback
+			}
+
 			var sizeError bool
-			if limit > 0 && int64(len(messageData)) > limit {
+			if int64(len(messageData)) > limitToUse {
 				sizeError = true
 			}
 
-			if sizeError {
-				t.Errorf("Expected no error for unlimited size, but got error for size %d",
-					len(messageData))
+			if tt.expectError {
+				if !sizeError {
+					t.Errorf("Expected error for size %d (over 25MB fallback), but got none",
+						len(messageData))
+				} else {
+					t.Logf("✓ Fallback test passed: %d bytes correctly rejected (over 25MB fallback)",
+						len(messageData))
+				}
 			} else {
-				t.Logf("✓ Unlimited test passed: %d bytes accepted with no limit",
-					len(messageData))
+				if sizeError {
+					t.Errorf("Expected no error for size %d (under 25MB fallback), but got error",
+						len(messageData))
+				} else {
+					t.Logf("✓ Fallback test passed: %d bytes accepted (under 25MB fallback)",
+						len(messageData))
+				}
 			}
 		})
 	}

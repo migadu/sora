@@ -43,15 +43,15 @@ func TestMessageSizeLimit_EnforcedCorrectly(t *testing.T) {
 			errorContains:  "message size exceeds maximum",
 		},
 		{
-			name:           "No limit configured (0)",
-			maxMessageSize: 0,      // No limit
-			messageSize:    100000, // 100KB
+			name:           "No limit configured (0) - uses 50MB fallback",
+			maxMessageSize: 0,      // 0 means use fallback (50MB)
+			messageSize:    100000, // 100KB (under fallback)
 			expectError:    false,
 		},
 		{
-			name:           "Large message with no limit",
-			maxMessageSize: 0,        // No limit
-			messageSize:    10000000, // 10MB
+			name:           "Large message with 0 limit - uses 50MB fallback",
+			maxMessageSize: 0,        // 0 means use fallback (50MB)
+			messageSize:    10000000, // 10MB (under fallback)
 			expectError:    false,
 		},
 	}
@@ -73,13 +73,15 @@ func TestMessageSizeLimit_EnforcedCorrectly(t *testing.T) {
 			reader := strings.NewReader(messageData)
 
 			// Simulate the size limit check logic from Data() method
-			var buf bytes.Buffer
-			var limitedReader io.Reader = reader
-
-			if session.backend.maxMessageSize > 0 {
-				// Add 1 byte to detect when limit is exceeded
-				limitedReader = io.LimitReader(reader, session.backend.maxMessageSize+1)
+			// Apply fallback if limit is 0 (matches production code)
+			limitToUse := session.backend.maxMessageSize
+			if limitToUse <= 0 {
+				limitToUse = 50 * 1024 * 1024 // 50MB fallback
 			}
+
+			var buf bytes.Buffer
+			// Add 1 byte to detect when limit is exceeded
+			limitedReader := io.LimitReader(reader, limitToUse+1)
 
 			_, err := io.Copy(&buf, limitedReader)
 			if err != nil {
@@ -88,7 +90,7 @@ func TestMessageSizeLimit_EnforcedCorrectly(t *testing.T) {
 
 			// Check if message exceeds configured limit
 			var sizeError error
-			if session.backend.maxMessageSize > 0 && int64(buf.Len()) > session.backend.maxMessageSize {
+			if int64(buf.Len()) > limitToUse {
 				sizeError = &struct{ error }{error: io.EOF} // Placeholder error for testing
 			}
 
@@ -111,11 +113,11 @@ func TestMessageSizeLimit_EnforcedCorrectly(t *testing.T) {
 				}
 			}
 
-			// Verify that when limit is exceeded, we don't read more than maxMessageSize+1
-			if tt.expectError && session.backend.maxMessageSize > 0 {
-				if int64(buf.Len()) > session.backend.maxMessageSize+1 {
+			// Verify that when limit is exceeded, we don't read more than limitToUse+1
+			if tt.expectError {
+				if int64(buf.Len()) > limitToUse+1 {
 					t.Errorf("Read too much data. Expected at most %d bytes, got %d bytes",
-						session.backend.maxMessageSize+1, buf.Len())
+						limitToUse+1, buf.Len())
 				}
 			}
 		})
@@ -186,49 +188,49 @@ func TestMessageSizeLimit_LimitReaderBehavior(t *testing.T) {
 	}
 }
 
-// TestMessageSizeLimit_ZeroMeansUnlimited tests that 0 means no limit
-func TestMessageSizeLimit_ZeroMeansUnlimited(t *testing.T) {
+// TestMessageSizeLimit_ZeroUsesFallback tests that 0 triggers 50MB fallback limit
+func TestMessageSizeLimit_ZeroUsesFallback(t *testing.T) {
 	backend := &LMTPServerBackend{
-		maxMessageSize: 0, // 0 means no limit
+		maxMessageSize: 0, // 0 means use 50MB fallback
 	}
 
 	session := &LMTPSession{
 		backend: backend,
 	}
 
-	// Create a very large message (10MB)
-	largeSize := 10 * 1024 * 1024
-	largeMessage := strings.Repeat("X", largeSize)
-	reader := strings.NewReader(largeMessage)
+	// Create a message under the 50MB fallback (10MB)
+	smallSize := 10 * 1024 * 1024
+	smallMessage := strings.Repeat("X", smallSize)
+	reader := strings.NewReader(smallMessage)
 
-	// Simulate the check - should NOT apply limit when maxMessageSize is 0
-	var buf bytes.Buffer
-	var limitedReader io.Reader = reader
-
-	if session.backend.maxMessageSize > 0 {
-		// This should NOT execute when maxMessageSize is 0
-		limitedReader = io.LimitReader(reader, session.backend.maxMessageSize+1)
+	// Simulate the check - should apply 50MB fallback when maxMessageSize is 0
+	limitToUse := session.backend.maxMessageSize
+	if limitToUse <= 0 {
+		limitToUse = 50 * 1024 * 1024 // 50MB fallback
 	}
+
+	var buf bytes.Buffer
+	limitedReader := io.LimitReader(reader, limitToUse+1)
 
 	n, err := io.Copy(&buf, limitedReader)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	// Should read all data
-	if int(n) != largeSize {
-		t.Errorf("Expected to read %d bytes (no limit), but read %d bytes",
-			largeSize, n)
+	// Should read all data (10MB is under 50MB fallback)
+	if int(n) != smallSize {
+		t.Errorf("Expected to read %d bytes, but read %d bytes",
+			smallSize, n)
 	}
 
-	// Should not trigger size error
+	// Should not trigger size error (10MB < 50MB)
 	var sizeError error
-	if session.backend.maxMessageSize > 0 && int64(buf.Len()) > session.backend.maxMessageSize {
+	if int64(buf.Len()) > limitToUse {
 		sizeError = &struct{ error }{error: io.EOF}
 	}
 
 	if sizeError != nil {
-		t.Errorf("Expected no error with maxMessageSize=0, but got error")
+		t.Errorf("Expected no error with message under 50MB fallback, but got error")
 	}
 }
 

@@ -641,11 +641,8 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		s.listenBacklog = 1024 // Default backlog
 	}
 
-	if s.appendLimit > 0 {
-		appendLimitCapName := imap.Cap(fmt.Sprintf("APPENDLIMIT=%d", s.appendLimit))
-		s.caps[appendLimitCapName] = struct{}{}
-		s.caps.Has(imap.CapAppendLimit)
-	}
+	// NOTE: APPENDLIMIT capability is automatically added by go-imap when it detects
+	// our SessionAppendLimit interface implementation (see imapserver/capability.go)
 
 	// Enable ACL capability only if shared mailboxes are enabled
 	if s.config != nil && s.config.SharedMailboxes.Enabled {
