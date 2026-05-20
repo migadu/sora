@@ -566,19 +566,13 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 // Utility functions
 
 func getClientIP(r *http.Request) string {
-	// Try X-Forwarded-For header first (for proxies)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		return strings.TrimSpace(ips[0])
+	// Extract IP from RemoteAddr (which may be set by PROXY protocol or real TCP peer)
+	// Never trust X-Forwarded-For or X-Real-IP headers as they are attacker-controlled
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// If splitting fails, return as-is (already an IP without port)
+		return r.RemoteAddr
 	}
-
-	// Try X-Real-IP header
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-
-	// Fall back to RemoteAddr
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 	return host
 }
 

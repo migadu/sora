@@ -243,12 +243,13 @@ func TestProxyForwardsHeaders(t *testing.T) {
 	// Make request through proxy
 	resp = tc.makeProxyRequest(t, "GET", "/user/mailboxes", nil)
 
-	// The fact that we don't get a 401 means the backend trusted the proxy's headers
+	// The fact that we don't get a 401 means the backend validated the JWT token
+	// (proxy forwards the Authorization header, backend validates it)
 	if resp.StatusCode == http.StatusUnauthorized {
-		t.Fatalf("Backend did not trust proxy's forwarded headers")
+		t.Fatalf("Backend rejected valid JWT token")
 	}
 
-	t.Logf("Backend successfully trusted proxy headers, status: %d", resp.StatusCode)
+	t.Logf("Backend successfully validated JWT from proxy, status: %d", resp.StatusCode)
 }
 
 // TestProxyUserRouting tests that proxy routes users consistently
