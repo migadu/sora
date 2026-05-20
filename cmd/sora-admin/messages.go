@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -192,8 +193,8 @@ Examples:
 		parts := strings.Split(*ids, ",")
 		for _, part := range parts {
 			part = strings.TrimSpace(part)
-			var id int64
-			if _, err := fmt.Sscanf(part, "%d", &id); err != nil {
+			id, err := strconv.ParseInt(part, 10, 64)
+			if err != nil {
 				logger.Fatalf("Invalid message ID '%s': %v", part, err)
 			}
 			messageIDs = append(messageIDs, id)

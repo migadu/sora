@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"github.com/migadu/sora/logger"
 
+	"strconv"
+
 	"github.com/migadu/sora/config"
 )
 
@@ -40,8 +42,9 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig) (Us
 		case string:
 			// Try to parse string as int
 			if v != "" {
-				parsed, err := fmt.Sscanf(v, "%d", &remotePort)
-				if err != nil || parsed != 1 {
+				var err error
+				remotePort, err = strconv.Atoi(v)
+				if err != nil {
 					logger.Debug("RemoteLookup: Warning - failed to parse remote_port, using default", "value", v)
 					remotePort = 0
 				}

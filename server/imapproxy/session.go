@@ -209,7 +209,7 @@ func (s *Session) handleConnection() {
 				// Check if username is a literal
 				if strings.HasPrefix(args[0], "{") && strings.HasSuffix(args[0], "}") {
 					literalSize, err := server.ParseLiteral(args[0])
-					if err != nil {
+					if err != nil || literalSize > 8192 {
 						if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in username", tag)) {
 							return
 						}
@@ -250,7 +250,7 @@ func (s *Session) handleConnection() {
 					// Check if password is a literal
 					if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
 						literalSize, err := server.ParseLiteral(line)
-						if err != nil {
+						if err != nil || literalSize > 8192 {
 							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
 								return
 							}
@@ -284,7 +284,7 @@ func (s *Session) handleConnection() {
 					// Check if password is a literal (username was not)
 					if strings.HasPrefix(args[1], "{") && strings.HasSuffix(args[1], "}") {
 						literalSize, err := server.ParseLiteral(args[1])
-						if err != nil {
+						if err != nil || literalSize > 8192 {
 							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
 								return
 							}

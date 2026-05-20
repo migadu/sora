@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -853,8 +854,8 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 		contentHash := parts[len(parts)-1] // Last component is the hash
 
 		// Parse account ID
-		var accountID int64
-		if _, err := fmt.Sscanf(accountIDStr, "%d", &accountID); err != nil {
+		accountID, err := strconv.ParseInt(accountIDStr, 10, 64)
+		if err != nil {
 			logger.Warn("UploaderCleanup: Invalid account ID in path", "path", path, "error", err)
 			return nil
 		}
