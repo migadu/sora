@@ -75,7 +75,7 @@ func (d *Database) GetMessagesChangedSince(ctx context.Context, mailboxID int64,
 			COALESCE(ms.flags, 0),
 			COALESCE(ms.custom_flags, '[]'::jsonb),
 			GREATEST(m.created_modseq, COALESCE(ms.updated_modseq, 0)),
-			(SELECT COUNT(*) FROM messages m2 WHERE m2.mailbox_id = m.mailbox_id AND m2.expunged_at IS NULL AND m2.uid <= m.uid) AS seqnum
+			0::integer AS seqnum
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1
@@ -119,6 +119,14 @@ func (d *Database) GetMessagesChangedSince(ctx context.Context, mailboxID int64,
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating changed messages: %w", err)
+	}
+
+	// Hydrate dynamic sequence numbers in-memory using optimized gap cumulative SUM trick
+	if err := hydrateSequencesCore(ctx, d, mailboxID, messages,
+		func(m *QResyncModifiedMessage) uint32 { return uint32(m.UID) },
+		func(m *QResyncModifiedMessage, seq uint32) { m.SeqNum = seq },
+	); err != nil {
+		return nil, fmt.Errorf("failed to hydrate modified message sequences: %w", err)
 	}
 
 	return messages, nil
