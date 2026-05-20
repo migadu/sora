@@ -1,10 +1,10 @@
 package db
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha512"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -75,8 +75,8 @@ func verifySSHA512(hashedPassword, password string) error {
 	h.Write(salt)
 	calculatedHash := h.Sum(nil)
 
-	// Compare the hashes
-	if !bytes.Equal(storedHash, calculatedHash) {
+	// Compare the hashes using constant-time comparison to prevent timing attacks
+	if subtle.ConstantTimeCompare(storedHash, calculatedHash) != 1 {
 		logger.Debug("verifySSHA512: Hash mismatch", "password_len", len(password), "salt_len", len(salt), "hash_prefix", hashPrefix)
 		return errors.New("invalid password")
 	}
@@ -103,8 +103,8 @@ func verifySHA512(hashedPassword, password string) error {
 	h.Write([]byte(password))
 	calculatedHash := h.Sum(nil)
 
-	// Compare the hashes
-	if !bytes.Equal(storedHash, calculatedHash) {
+	// Compare the hashes using constant-time comparison to prevent timing attacks
+	if subtle.ConstantTimeCompare(storedHash, calculatedHash) != 1 {
 		return errors.New("invalid password")
 	}
 
