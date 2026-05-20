@@ -524,3 +524,22 @@ func TestMultipleAddresses(t *testing.T) {
 		t.Errorf("totalEntries = %d, want %d", totalEntries, len(addresses))
 	}
 }
+
+func TestFilePermissions(t *testing.T) {
+	dbPath := tempDBPath(t)
+	c, err := New(dbPath, time.Hour, 24*time.Hour, time.Hour)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer c.Close()
+
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("os.Stat() error: %v", err)
+	}
+
+	mode := info.Mode().Perm()
+	if mode != 0600 {
+		t.Errorf("expected 0600 permissions, got %04o", mode)
+	}
+}

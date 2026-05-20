@@ -296,3 +296,22 @@ func TestClose_DoubleClose(t *testing.T) {
 	// Second close should not panic
 	store.Close()
 }
+
+func TestFilePermissions(t *testing.T) {
+	dbPath := tempDB(t)
+	store, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer store.Close()
+
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("os.Stat() error: %v", err)
+	}
+
+	mode := info.Mode().Perm()
+	if mode != 0600 {
+		t.Errorf("expected 0600 permissions, got %04o", mode)
+	}
+}

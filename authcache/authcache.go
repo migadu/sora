@@ -95,6 +95,20 @@ func New(dbPath string, maxAge, purgeUnused, cleanupInterval time.Duration) (*Ca
 // openAndValidate opens a SQLite database, sets pragmas, creates the schema,
 // and runs an integrity check. Returns an error if any step fails.
 func openAndValidate(dbPath string) (*sql.DB, error) {
+	if dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
+		// Ensure the database file has 0600 permissions.
+		// If the file does not exist, pre-create it with 0600 permissions.
+		f, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create or set permissions on database file: %w", err)
+		}
+		f.Close()
+		// If the file already exists, enforce 0600 permissions on it.
+		if err := os.Chmod(dbPath, 0600); err != nil {
+			return nil, fmt.Errorf("failed to enforce 0600 permissions on database file: %w", err)
+		}
+	}
+
 	sqliteDB, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open: %w", err)
