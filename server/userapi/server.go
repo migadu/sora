@@ -519,11 +519,26 @@ func getClientIP(r *http.Request) string {
 }
 
 func isIPAllowed(clientIP string, allowedHosts []string) bool {
-	for _, allowedHost := range allowedHosts {
-		if allowedHost == clientIP {
+	networks, err := server.ParseTrustedNetworks(allowedHosts)
+	if err != nil {
+		logger.Warn("userapi: failed to parse allowed hosts as CIDR, falling back to literal matching", "error", err)
+		for _, allowedHost := range allowedHosts {
+			if allowedHost == clientIP {
+				return true
+			}
+		}
+		return false
+	}
+
+	ip := net.ParseIP(clientIP)
+	if ip == nil {
+		return false
+	}
+
+	for _, network := range networks {
+		if network.Contains(ip) {
 			return true
 		}
-		// TODO: Add CIDR block support if needed
 	}
 	return false
 }
