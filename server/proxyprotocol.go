@@ -317,7 +317,7 @@ func (r *ProxyProtocolReader) parseProxyV1(reader *bufio.Reader) (*ProxyProtocol
 func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocolInfo, error) {
 	// Read the 16-byte header
 	header := make([]byte, 16)
-	_, err := reader.Read(header)
+	_, err := io.ReadFull(reader, header)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read PROXY v2 header: %w", err)
 	}
@@ -353,7 +353,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 		// Skip the remaining bytes
 		if length > 0 {
 			skipData := make([]byte, length)
-			_, err := reader.Read(skipData)
+			_, err := io.ReadFull(reader, skipData)
 			if err != nil {
 				return nil, fmt.Errorf("failed to skip LOCAL command data: %w", err)
 			}
@@ -380,7 +380,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			return nil, fmt.Errorf("insufficient data for IPv4 addresses")
 		}
 		addrData := make([]byte, 12)
-		_, err := reader.Read(addrData)
+		_, err := io.ReadFull(reader, addrData)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read IPv4 address data: %w", err)
 		}
@@ -422,7 +422,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 			return nil, fmt.Errorf("insufficient data for IPv6 addresses")
 		}
 		addrData := make([]byte, 36)
-		_, err := reader.Read(addrData)
+		_, err := io.ReadFull(reader, addrData)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read IPv6 address data: %w", err)
 		}
@@ -465,7 +465,7 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 		// Skip the data
 		if length > 0 {
 			skipData := make([]byte, length)
-			_, err := reader.Read(skipData)
+			_, err := io.ReadFull(reader, skipData)
 			if err != nil {
 				return nil, fmt.Errorf("failed to skip UNKNOWN address data: %w", err)
 			}
@@ -490,12 +490,9 @@ func parseTLVs(reader *bufio.Reader, dataLen int) (map[byte][]byte, error) {
 	}
 
 	tlvData := make([]byte, dataLen)
-	n, err := reader.Read(tlvData)
+	_, err := io.ReadFull(reader, tlvData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read TLV data: %w", err)
-	}
-	if n != dataLen {
-		return nil, fmt.Errorf("incomplete TLV data: expected %d bytes, got %d", dataLen, n)
 	}
 
 	// Parse TLVs

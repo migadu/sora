@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"io"
 	"net"
 	"testing"
 )
@@ -574,5 +575,74 @@ func TestJA4ExtractionFromClientConn(t *testing.T) {
 		}
 	} else {
 		t.Error("Failed to extract JA4 from mock connection")
+	}
+}
+
+type fragmentedReader struct {
+	data      []byte
+	chunkSize int
+	offset    int
+}
+
+func (r *fragmentedReader) Read(p []byte) (int, error) {
+	if r.offset >= len(r.data) {
+		return 0, io.EOF
+	}
+	toRead := len(p)
+	if toRead > r.chunkSize {
+		toRead = r.chunkSize
+	}
+	if r.offset+toRead > len(r.data) {
+		toRead = len(r.data) - r.offset
+	}
+	copy(p, r.data[r.offset:r.offset+toRead])
+	r.offset += toRead
+	return toRead, nil
+}
+
+func TestProxyV2ShortReadBug(t *testing.T) {
+	// Generate a valid PROXY v2 header with IPv4 and TLV data
+	tlvs := map[byte][]byte{
+		TLVTypeJA4Fingerprint: []byte("t13d411100_6be44479b708_d41ae481755e"),
+	}
+	header, err := GenerateProxyV2HeaderWithTLVs(
+		"192.168.1.100", 54321,
+		"10.0.0.1", 143,
+		"TCP", tlvs,
+	)
+	if err != nil {
+		t.Fatalf("GenerateProxyV2HeaderWithTLVs() failed: %v", err)
+	}
+
+	// Create a mock ProxyProtocolReader
+	config := ProxyProtocolConfig{
+		Enabled:        true,
+		TrustedProxies: []string{"0.0.0.0/0"},
+	}
+	proxyReader, err := NewProxyProtocolReader("test", config)
+	if err != nil {
+		t.Fatalf("Failed to create ProxyProtocolReader: %v", err)
+	}
+
+	// Use a fragmented reader with 2-byte chunk size.
+	// This will return at most 2 bytes per underlying Read,
+	// exposing any standard reader.Read() calls that expect a full read.
+	fragReader := &fragmentedReader{
+		data:      header,
+		chunkSize: 2,
+	}
+	reader := bufio.NewReader(fragReader)
+
+	info, err := proxyReader.parseProxyV2(reader)
+	if err != nil {
+		t.Fatalf("parseProxyV2() failed on short-read: %v", err)
+	}
+
+	// Verify the parsed data matches
+	if info.SrcIP != "192.168.1.100" || info.SrcPort != 54321 {
+		t.Errorf("Unexpected parsed info: IP=%s, Port=%d", info.SrcIP, info.SrcPort)
+	}
+	if info.JA4Fingerprint != "t13d411100_6be44479b708_d41ae481755e" {
+		t.Errorf("Unexpected JA4 fingerprint: %s", info.JA4Fingerprint)
 	}
 }
