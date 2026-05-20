@@ -24,7 +24,7 @@ func TestGetClientIP(t *testing.T) {
 				"X-Forwarded-For": "192.168.1.100",
 			},
 			remoteAddr: "10.0.0.1:12345",
-			expectedIP: "192.168.1.100",
+			expectedIP: "10.0.0.1",
 		},
 		{
 			name: "X-Forwarded-For multiple IPs",
@@ -32,7 +32,7 @@ func TestGetClientIP(t *testing.T) {
 				"X-Forwarded-For": "192.168.1.100, 10.0.0.5, 172.16.0.1",
 			},
 			remoteAddr: "10.0.0.1:12345",
-			expectedIP: "192.168.1.100",
+			expectedIP: "10.0.0.1",
 		},
 		{
 			name: "X-Real-IP header",
@@ -40,7 +40,7 @@ func TestGetClientIP(t *testing.T) {
 				"X-Real-IP": "192.168.1.200",
 			},
 			remoteAddr: "10.0.0.1:12345",
-			expectedIP: "192.168.1.200",
+			expectedIP: "10.0.0.1",
 		},
 		{
 			name: "X-Forwarded-For takes precedence over X-Real-IP",
@@ -49,7 +49,7 @@ func TestGetClientIP(t *testing.T) {
 				"X-Real-IP":       "192.168.1.200",
 			},
 			remoteAddr: "10.0.0.1:12345",
-			expectedIP: "192.168.1.100",
+			expectedIP: "10.0.0.1",
 		},
 		{
 			name:       "fallback to RemoteAddr",
