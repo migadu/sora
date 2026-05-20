@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -197,20 +198,20 @@ func (s *Session) handleConnection() {
 				arg1 := args[1]
 
 				// Check if it's a literal string {number+} or {number}
-				if strings.HasPrefix(arg1, "{") && strings.HasSuffix(arg1, "}") || strings.HasSuffix(arg1, "+}") {
+				if strings.HasPrefix(arg1, "{") && (strings.HasSuffix(arg1, "}") || strings.HasSuffix(arg1, "+}")) {
 					// Literal string - need to read the specified number of bytes
-					var literalSize int
 					literalStr := strings.TrimPrefix(arg1, "{")
 					literalStr = strings.TrimSuffix(literalStr, "}")
 					literalStr = strings.TrimSuffix(literalStr, "+")
 
-					_, err := fmt.Sscanf(literalStr, "%d", &literalSize)
-					if err != nil || literalSize < 0 || literalSize > 8192 {
+					literalSize64, err := strconv.ParseInt(literalStr, 10, 64)
+					if err != nil || literalSize64 < 0 || literalSize64 > 8192 {
 						if s.handleAuthError(`NO "Invalid literal size"`) {
 							return
 						}
 						continue
 					}
+					literalSize := int(literalSize64)
 
 					s.DebugLog("AUTHENTICATE reading literal", "bytes", literalSize)
 

@@ -1135,16 +1135,16 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 		// Check if it's a literal string {number+} or {number}
 		if strings.HasPrefix(arg2, "{") && (strings.HasSuffix(arg2, "}") || strings.HasSuffix(arg2, "+}")) {
 			// Literal string - need to read the specified number of bytes
-			var literalSize int
 			literalStr := strings.TrimPrefix(arg2, "{")
 			literalStr = strings.TrimSuffix(literalStr, "}")
 			literalStr = strings.TrimSuffix(literalStr, "+")
 
-			_, err := fmt.Sscanf(literalStr, "%d", &literalSize)
-			if err != nil || literalSize < 0 || literalSize > 8192 {
+			literalSize64, err := strconv.ParseInt(literalStr, 10, 64)
+			if err != nil || literalSize64 < 0 || literalSize64 > 8192 {
 				s.sendResponse("NO Invalid literal size\r\n")
 				return false
 			}
+			literalSize := int(literalSize64)
 
 			s.DebugLog("reading authenticate literal", "size_bytes", literalSize)
 

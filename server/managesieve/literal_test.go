@@ -3,7 +3,7 @@ package managesieve
 import (
 	"bufio"
 	"encoding/base64"
-	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -65,18 +65,18 @@ func TestParseLiteralStringAuthenticate(t *testing.T) {
 				if strings.HasPrefix(arg2, "{") && (strings.HasSuffix(arg2, "}") || strings.HasSuffix(arg2, "+}")) {
 					// Literal string - in real code this would read from the stream
 					// For testing, we use the provided literalData
-					var literalSize int
 					literalStr := strings.TrimPrefix(arg2, "{")
 					literalStr = strings.TrimSuffix(literalStr, "}")
 					literalStr = strings.TrimSuffix(literalStr, "+")
 
-					_, err := fmt.Sscanf(literalStr, "%d", &literalSize)
-					if err != nil || literalSize < 0 || literalSize > 8192 {
+					literalSize64, err := strconv.ParseInt(literalStr, 10, 64)
+					if err != nil || literalSize64 < 0 || literalSize64 > 8192 {
 						if tt.shouldSucceed {
 							t.Errorf("Invalid literal size: %s", arg2)
 						}
 						return
 					}
+					literalSize := int(literalSize64)
 
 					if len(tt.literalData) != literalSize {
 						t.Errorf("Literal data length mismatch: expected %d, got %d", literalSize, len(tt.literalData))
@@ -136,8 +136,6 @@ func TestLiteralStringSize(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var literalSize int
-
 			// Check format first - must have { and }
 			if !strings.HasPrefix(tt.literalSpec, "{") ||
 				!(strings.HasSuffix(tt.literalSpec, "}") || strings.HasSuffix(tt.literalSpec, "+}")) {
@@ -152,8 +150,12 @@ func TestLiteralStringSize(t *testing.T) {
 			literalStr = strings.TrimSuffix(literalStr, "}")
 			literalStr = strings.TrimSuffix(literalStr, "+")
 
-			_, err := fmt.Sscanf(literalStr, "%d", &literalSize)
-			valid := err == nil && literalSize >= 0 && literalSize <= 8192
+			literalSize64, err := strconv.ParseInt(literalStr, 10, 64)
+			valid := err == nil && literalSize64 >= 0 && literalSize64 <= 8192
+			var literalSize int
+			if valid {
+				literalSize = int(literalSize64)
+			}
 
 			if valid != tt.wantValid {
 				t.Errorf("Validity mismatch: expected %v, got %v (size=%d, err=%v)", tt.wantValid, valid, literalSize, err)
@@ -201,15 +203,15 @@ func TestLiteralStringReading(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Parse literal size
-			var literalSize int
 			literalStr := strings.TrimPrefix(tt.literalSpec, "{")
 			literalStr = strings.TrimSuffix(literalStr, "}")
 			literalStr = strings.TrimSuffix(literalStr, "+")
 
-			_, err := fmt.Sscanf(literalStr, "%d", &literalSize)
+			literalSize64, err := strconv.ParseInt(literalStr, 10, 64)
 			if err != nil {
 				t.Fatalf("Failed to parse literal size: %v", err)
 			}
+			literalSize := int(literalSize64)
 
 			// Simulate reading from stream
 			reader := bufio.NewReader(strings.NewReader(tt.streamData))
@@ -276,13 +278,14 @@ func TestParseLiteralStringPutScript(t *testing.T) {
 				lengthStr = strings.TrimSuffix(lengthStr, "}")
 				lengthStr = strings.TrimSuffix(lengthStr, "+")
 
-				length := 0
-				if _, err := fmt.Sscanf(lengthStr, "%d", &length); err != nil || length < 0 {
+				length64, err := strconv.ParseInt(lengthStr, 10, 64)
+				if err != nil || length64 < 0 {
 					if tt.shouldSucceed {
 						t.Errorf("Failed to parse valid length: %s", lengthStr)
 					}
 					return
 				}
+				length := int(length64)
 
 				if !tt.shouldSucceed {
 					t.Errorf("Expected failure but succeeded")
