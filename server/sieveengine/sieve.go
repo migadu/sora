@@ -166,12 +166,29 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		vacationResponses: make(map[string]time.Time),
 	}
 
+	// Limit execution time of the Sieve script to prevent CPU/resource exhaustion
+	timeout := 2 * time.Second
+	if deadline, ok := evalCtx.Deadline(); ok {
+		left := time.Until(deadline)
+		if left < timeout {
+			timeout = left
+		}
+	}
+	timeoutCtx, cancel := context.WithTimeout(evalCtx, timeout)
+	defer cancel()
+
 	// Create runtime data
 	data := sieve.NewRuntimeData(e.script, execPolicy, envelope, message) // RuntimeData holds policy
 
 	// Execute the script
-	err := e.script.Execute(evalCtx, data) // Pass the evaluation context
+	if err := timeoutCtx.Err(); err != nil {
+		return Result{Action: ActionKeep}, err
+	}
+	err := e.script.Execute(timeoutCtx, data) // Pass the evaluation context
 	if err != nil {
+		return Result{Action: ActionKeep}, err
+	}
+	if err := timeoutCtx.Err(); err != nil {
 		return Result{Action: ActionKeep}, err
 	}
 
@@ -230,7 +247,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		for sender, vacation := range data.VacationResponses {
 			// Check with the policy/oracle if we should send this vacation response
 			duration := time.Duration(vacation.Days) * 24 * time.Hour
-			allowed, err := execPolicy.VacationResponseAllowed(evalCtx, data, sender, vacation.Handle, duration)
+			allowed, err := execPolicy.VacationResponseAllowed(timeoutCtx, data, sender, vacation.Handle, duration)
 			if err != nil {
 				// Log error but don't fail the message delivery
 				continue
@@ -244,7 +261,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 				result.VacationIsMime = vacation.IsMime
 
 				// Record that we sent the vacation response
-				_ = execPolicy.SendVacationResponse(evalCtx, data, sender, vacation.From, vacation.Subject, vacation.Body, vacation.IsMime)
+				_ = execPolicy.SendVacationResponse(timeoutCtx, data, sender, vacation.From, vacation.Subject, vacation.Body, vacation.IsMime)
 			}
 			break // Only process the first vacation response
 		}

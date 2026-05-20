@@ -722,3 +722,32 @@ if body :contains "URGENT" {
 		})
 	}
 }
+
+func TestEvaluateCancelledContext(t *testing.T) {
+	script := `
+keep;
+`
+
+	executor, err := NewSieveExecutor(script)
+	if err != nil {
+		t.Fatalf("Failed to create executor: %v", err)
+	}
+
+	ctx := Context{
+		EnvelopeFrom: "sender@example.com",
+		EnvelopeTo:   "recipient@example.com",
+		Header: map[string][]string{
+			"Subject": {"Test"},
+		},
+		Body: "Test body",
+	}
+
+	// Create an already cancelled context
+	evalCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = executor.Evaluate(evalCtx, ctx)
+	if err == nil {
+		t.Error("Expected error when evaluating with cancelled context, got nil")
+	}
+}
