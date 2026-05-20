@@ -35,7 +35,7 @@ func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, 
 	}
 
 	op := func(ctx context.Context) (any, error) {
-		id, hash, dbErr := rd.getOperationalDatabaseForOperation(false).GetCredentialForAuth(ctx, address)
+		id, hash, dbErr := rd.getOperationalDatabaseForOperation(ctx, false).GetCredentialForAuth(ctx, address)
 		if dbErr != nil {
 			return nil, dbErr
 		}
@@ -109,7 +109,7 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 	}
 
 	op := func(ctx context.Context) (any, error) {
-		id, hash, dbErr := rd.getOperationalDatabaseForOperation(false).GetCredentialForAuth(ctx, address)
+		id, hash, dbErr := rd.getOperationalDatabaseForOperation(ctx, false).GetCredentialForAuth(ctx, address)
 		if dbErr != nil {
 			return nil, dbErr
 		}

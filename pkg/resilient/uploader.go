@@ -14,7 +14,7 @@ import (
 // This allows the lock (and execution) to happen safely over long-running operations (like S3 transfers)
 // without holding open a PostgreSQL transaction, entirely avoiding database bloat and vacuum blockages.
 func (rd *ResilientDatabase) ExecuteWithS3ObjectSessionLock(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error {
-	pool := rd.getOperationalDatabaseForOperation(true).GetWritePool()
+	pool := rd.getOperationalDatabaseForOperation(ctx, true).GetWritePool()
 
 	// Use a 30s timeout purely for acquiring the connection and the lock
 	lockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -44,7 +44,7 @@ func (rd *ResilientDatabase) ExecuteWithS3ObjectSessionLock(ctx context.Context,
 
 func (rd *ResilientDatabase) AcquireAndLeasePendingUploadsWithRetry(ctx context.Context, instanceId string, limit int, retryInterval time.Duration, maxAttempts int) ([]db.PendingUpload, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(true).AcquireAndLeasePendingUploads(ctx, tx, instanceId, limit, retryInterval, maxAttempts)
+		return rd.getOperationalDatabaseForOperation(ctx, true).AcquireAndLeasePendingUploads(ctx, tx, instanceId, limit, retryInterval, maxAttempts)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	if err != nil {
@@ -58,7 +58,7 @@ func (rd *ResilientDatabase) AcquireAndLeasePendingUploadsWithRetry(ctx context.
 
 func (rd *ResilientDatabase) MarkUploadAttemptWithRetry(ctx context.Context, contentHash string, accountID int64) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).MarkUploadAttempt(ctx, tx, contentHash, accountID)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).MarkUploadAttempt(ctx, tx, contentHash, accountID)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	return err
@@ -66,7 +66,7 @@ func (rd *ResilientDatabase) MarkUploadAttemptWithRetry(ctx context.Context, con
 
 func (rd *ResilientDatabase) IsContentHashUploadedWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).IsContentHashUploaded(ctx, contentHash, accountID)
+		return rd.getOperationalDatabaseForOperation(ctx, false).IsContentHashUploaded(ctx, contentHash, accountID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
 	if err != nil {
@@ -77,7 +77,7 @@ func (rd *ResilientDatabase) IsContentHashUploadedWithRetry(ctx context.Context,
 
 func (rd *ResilientDatabase) ExhaustUploadAttemptsWithRetry(ctx context.Context, contentHash string, accountID int64, maxAttempts int) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).ExhaustUploadAttempts(ctx, tx, contentHash, accountID, maxAttempts)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).ExhaustUploadAttempts(ctx, tx, contentHash, accountID, maxAttempts)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	return err
@@ -85,7 +85,7 @@ func (rd *ResilientDatabase) ExhaustUploadAttemptsWithRetry(ctx context.Context,
 
 func (rd *ResilientDatabase) DeleteFailedUploadWithRetry(ctx context.Context, contentHash string, accountID int64) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(true).DeleteFailedUpload(ctx, tx, contentHash, accountID)
+		return rd.getOperationalDatabaseForOperation(ctx, true).DeleteFailedUpload(ctx, tx, contentHash, accountID)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	if err != nil {
@@ -96,7 +96,7 @@ func (rd *ResilientDatabase) DeleteFailedUploadWithRetry(ctx context.Context, co
 
 func (rd *ResilientDatabase) PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).PendingUploadExists(ctx, contentHash, accountID)
+		return rd.getOperationalDatabaseForOperation(ctx, false).PendingUploadExists(ctx, contentHash, accountID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
 	if err != nil {

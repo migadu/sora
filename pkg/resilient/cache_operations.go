@@ -11,7 +11,7 @@ import (
 
 func (rd *ResilientDatabase) FindExistingContentHashesWithRetry(ctx context.Context, hashes []string) ([]string, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).FindExistingContentHashes(ctx, hashes)
+		return rd.getOperationalDatabaseForOperation(ctx, false).FindExistingContentHashes(ctx, hashes)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
 	if err != nil {
@@ -25,7 +25,7 @@ func (rd *ResilientDatabase) FindExistingContentHashesWithRetry(ctx context.Cont
 
 func (rd *ResilientDatabase) GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetRecentMessagesForWarmup(ctx, AccountID, mailboxNames, messageCount)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetRecentMessagesForWarmup(ctx, AccountID, mailboxNames, messageCount)
 	}
 	result, err := rd.executeReadWithRetry(ctx, apiRetryConfig, timeoutRead, op)
 	if err != nil {
@@ -43,7 +43,7 @@ func (rd *ResilientDatabase) StoreCacheMetricsWithRetry(ctx context.Context, ins
 	config := writeRetryConfig
 	config.MaxRetries = 2 // Override for this specific, less critical write
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).StoreCacheMetrics(ctx, tx, instanceID, serverHostname, hits, misses, uptimeSeconds)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).StoreCacheMetrics(ctx, tx, instanceID, serverHostname, hits, misses, uptimeSeconds)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
 	return err
@@ -51,7 +51,7 @@ func (rd *ResilientDatabase) StoreCacheMetricsWithRetry(ctx context.Context, ins
 
 func (rd *ResilientDatabase) CleanupOldCacheMetricsWithRetry(ctx context.Context, olderThan time.Duration) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(true).CleanupOldCacheMetrics(ctx, tx, olderThan)
+		return rd.getOperationalDatabaseForOperation(ctx, true).CleanupOldCacheMetrics(ctx, tx, olderThan)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	if err != nil {

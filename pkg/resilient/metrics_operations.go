@@ -11,7 +11,7 @@ func (rdb *ResilientDatabase) GetMetricsStatsWithRetry(ctx context.Context) (*me
 	config := readRetryConfig
 
 	op := func(ctx context.Context) (any, error) {
-		dbStats, err := rdb.getOperationalDatabaseForOperation(false).GetMetricsStats(ctx)
+		dbStats, err := rdb.getOperationalDatabaseForOperation(ctx, false).GetMetricsStats(ctx)
 		if err != nil {
 			return nil, err
 		}

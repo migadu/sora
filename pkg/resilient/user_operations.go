@@ -11,7 +11,7 @@ func (rdb *ResilientDatabase) GetAccountIDByEmailWithRetry(ctx context.Context, 
 	config := readRetryConfig
 
 	op := func(ctx context.Context) (any, error) {
-		return rdb.getOperationalDatabaseForOperation(false).GetAccountIDByEmail(ctx, email)
+		return rdb.getOperationalDatabaseForOperation(ctx, false).GetAccountIDByEmail(ctx, email)
 	}
 
 	result, err := rdb.executeReadWithRetry(ctx, config, timeoutRead, op)
@@ -26,7 +26,7 @@ func (rdb *ResilientDatabase) GetMailboxesForUserWithRetry(ctx context.Context, 
 	config := readRetryConfig
 
 	op := func(ctx context.Context) (any, error) {
-		return rdb.getOperationalDatabaseForOperation(false).GetMailboxesForUser(ctx, accountID, subscribed)
+		return rdb.getOperationalDatabaseForOperation(ctx, false).GetMailboxesForUser(ctx, accountID, subscribed)
 	}
 
 	result, err := rdb.executeReadWithRetry(ctx, config, timeoutRead, op)
@@ -41,7 +41,7 @@ func (rdb *ResilientDatabase) GetMessageCountForMailboxWithRetry(ctx context.Con
 	config := readRetryConfig
 
 	op := func(ctx context.Context) (any, error) {
-		return rdb.getOperationalDatabaseForOperation(false).GetMessageCountForMailbox(ctx, accountID, mailboxPath)
+		return rdb.getOperationalDatabaseForOperation(ctx, false).GetMessageCountForMailbox(ctx, accountID, mailboxPath)
 	}
 
 	result, err := rdb.executeReadWithRetry(ctx, config, timeoutRead, op)
@@ -56,7 +56,7 @@ func (rdb *ResilientDatabase) GetUnseenCountForMailboxWithRetry(ctx context.Cont
 	config := readRetryConfig
 
 	op := func(ctx context.Context) (any, error) {
-		return rdb.getOperationalDatabaseForOperation(false).GetUnseenCountForMailbox(ctx, accountID, mailboxPath)
+		return rdb.getOperationalDatabaseForOperation(ctx, false).GetUnseenCountForMailbox(ctx, accountID, mailboxPath)
 	}
 
 	result, err := rdb.executeReadWithRetry(ctx, config, timeoutRead, op)
@@ -71,7 +71,7 @@ func (rdb *ResilientDatabase) GetMessagesForMailboxWithRetry(ctx context.Context
 	config := readRetryConfig
 
 	op := func(ctx context.Context) (any, error) {
-		return rdb.getOperationalDatabaseForOperation(false).GetMessagesForMailbox(ctx, accountID, mailboxPath, limit, offset, unseenOnly)
+		return rdb.getOperationalDatabaseForOperation(ctx, false).GetMessagesForMailbox(ctx, accountID, mailboxPath, limit, offset, unseenOnly)
 	}
 
 	result, err := rdb.executeReadWithRetry(ctx, config, timeoutRead, op)
@@ -86,7 +86,7 @@ func (rdb *ResilientDatabase) SearchMessagesInMailboxWithRetry(ctx context.Conte
 	config := readRetryConfig
 
 	op := func(ctx context.Context) (any, error) {
-		return rdb.getOperationalDatabaseForOperation(false).SearchMessagesInMailbox(ctx, accountID, mailboxPath, query)
+		return rdb.getOperationalDatabaseForOperation(ctx, false).SearchMessagesInMailbox(ctx, accountID, mailboxPath, query)
 	}
 
 	result, err := rdb.executeReadWithRetry(ctx, config, timeoutSearch, op)
@@ -101,7 +101,7 @@ func (rdb *ResilientDatabase) GetMessageByIDWithRetry(ctx context.Context, accou
 	config := readRetryConfig
 
 	op := func(ctx context.Context) (any, error) {
-		return rdb.getOperationalDatabaseForOperation(false).GetMessageByID(ctx, accountID, messageID)
+		return rdb.getOperationalDatabaseForOperation(ctx, false).GetMessageByID(ctx, accountID, messageID)
 	}
 
 	result, err := rdb.executeReadWithRetry(ctx, config, timeoutRead, op)
@@ -117,7 +117,7 @@ func (rdb *ResilientDatabase) UpdateMessageFlagsWithRetry(ctx context.Context, a
 
 	op := func(ctx context.Context) (any, error) {
 		// UpdateMessageFlags handles its own transaction internally
-		return nil, rdb.getOperationalDatabaseForOperation(true).UpdateMessageFlags(ctx, accountID, messageID, addFlags, removeFlags)
+		return nil, rdb.getOperationalDatabaseForOperation(ctx, true).UpdateMessageFlags(ctx, accountID, messageID, addFlags, removeFlags)
 	}
 
 	_, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
@@ -130,7 +130,7 @@ func (rdb *ResilientDatabase) CreateMailboxForUserWithRetry(ctx context.Context,
 
 	op := func(ctx context.Context) (any, error) {
 		// CreateMailboxForUser handles its own transaction internally
-		return nil, rdb.getOperationalDatabaseForOperation(true).CreateMailboxForUser(ctx, accountID, mailboxPath)
+		return nil, rdb.getOperationalDatabaseForOperation(ctx, true).CreateMailboxForUser(ctx, accountID, mailboxPath)
 	}
 
 	_, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
@@ -143,7 +143,7 @@ func (rdb *ResilientDatabase) DeleteMailboxForUserWithRetry(ctx context.Context,
 
 	op := func(ctx context.Context) (any, error) {
 		// DeleteMailboxForUser handles its own transaction internally
-		return nil, rdb.getOperationalDatabaseForOperation(true).DeleteMailboxForUser(ctx, accountID, mailboxPath)
+		return nil, rdb.getOperationalDatabaseForOperation(ctx, true).DeleteMailboxForUser(ctx, accountID, mailboxPath)
 	}
 
 	_, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
@@ -156,7 +156,7 @@ func (rdb *ResilientDatabase) SubscribeToMailboxWithRetry(ctx context.Context, a
 
 	op := func(ctx context.Context) (any, error) {
 		// SubscribeToMailbox handles its own transaction internally
-		return nil, rdb.getOperationalDatabaseForOperation(true).SubscribeToMailbox(ctx, accountID, mailboxPath)
+		return nil, rdb.getOperationalDatabaseForOperation(ctx, true).SubscribeToMailbox(ctx, accountID, mailboxPath)
 	}
 
 	_, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
@@ -169,7 +169,7 @@ func (rdb *ResilientDatabase) UnsubscribeFromMailboxWithRetry(ctx context.Contex
 
 	op := func(ctx context.Context) (any, error) {
 		// UnsubscribeFromMailbox handles its own transaction internally
-		return nil, rdb.getOperationalDatabaseForOperation(true).UnsubscribeFromMailbox(ctx, accountID, mailboxPath)
+		return nil, rdb.getOperationalDatabaseForOperation(ctx, true).UnsubscribeFromMailbox(ctx, accountID, mailboxPath)
 	}
 
 	_, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
@@ -181,7 +181,7 @@ func (rdb *ResilientDatabase) GetAllMessagesForUserVerificationWithRetry(ctx con
 	config := readRetryConfig
 
 	op := func(ctx context.Context) (any, error) {
-		return rdb.getOperationalDatabaseForOperation(false).GetAllMessagesForUserVerification(ctx, accountID)
+		return rdb.getOperationalDatabaseForOperation(ctx, false).GetAllMessagesForUserVerification(ctx, accountID)
 	}
 
 	result, err := rdb.executeReadWithRetry(ctx, config, timeoutRead, op)
@@ -196,7 +196,7 @@ func (rdb *ResilientDatabase) GetMessagesByContentHashWithRetry(ctx context.Cont
 	config := readRetryConfig
 
 	op := func(ctx context.Context) (any, error) {
-		return rdb.getOperationalDatabaseForOperation(false).GetMessagesByContentHash(ctx, accountID, contentHash)
+		return rdb.getOperationalDatabaseForOperation(ctx, false).GetMessagesByContentHash(ctx, accountID, contentHash)
 	}
 
 	result, err := rdb.executeReadWithRetry(ctx, config, timeoutRead, op)
@@ -211,7 +211,7 @@ func (rdb *ResilientDatabase) MarkMessagesAsNotUploadedWithRetry(ctx context.Con
 	config := writeRetryConfig
 
 	op := func(ctx context.Context) (any, error) {
-		return rdb.getOperationalDatabaseForOperation(true).MarkMessagesAsNotUploaded(ctx, s3Keys)
+		return rdb.getOperationalDatabaseForOperation(ctx, true).MarkMessagesAsNotUploaded(ctx, s3Keys)
 	}
 
 	result, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)

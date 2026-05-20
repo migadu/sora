@@ -31,7 +31,7 @@ var sieveWriteRetryConfig = retry.BackoffConfig{
 // GetUserScriptsWithRetry retrieves all Sieve scripts for a user with retry logic
 func (rd *ResilientDatabase) GetUserScriptsWithRetry(ctx context.Context, AccountID int64) ([]*db.SieveScript, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetUserScripts(ctx, AccountID)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetUserScripts(ctx, AccountID)
 	}
 
 	result, err := rd.executeReadWithRetry(ctx, sieveReadRetryConfig, timeoutRead, op)
@@ -45,7 +45,7 @@ func (rd *ResilientDatabase) GetUserScriptsWithRetry(ctx context.Context, Accoun
 // GetScriptByNameWithRetry retrieves a specific Sieve script by name with retry logic
 func (rd *ResilientDatabase) GetScriptByNameWithRetry(ctx context.Context, name string, AccountID int64) (*db.SieveScript, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetScriptByName(ctx, name, AccountID)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetScriptByName(ctx, name, AccountID)
 	}
 
 	result, err := rd.executeReadWithRetry(ctx, sieveReadRetryConfig, timeoutRead, op)
@@ -60,13 +60,13 @@ func (rd *ResilientDatabase) GetScriptByNameWithRetry(ctx context.Context, name 
 func (rd *ResilientDatabase) CreateOrUpdateScriptWithRetry(ctx context.Context, AccountID int64, name, script string) (*db.SieveScript, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		// Check if script exists
-		existing, err := rd.getOperationalDatabaseForOperation(false).GetScriptByName(ctx, name, AccountID)
+		existing, err := rd.getOperationalDatabaseForOperation(ctx, false).GetScriptByName(ctx, name, AccountID)
 		if err == nil {
 			// Update existing script
-			return rd.getOperationalDatabaseForOperation(true).UpdateScript(ctx, tx, existing.ID, AccountID, name, script)
+			return rd.getOperationalDatabaseForOperation(ctx, true).UpdateScript(ctx, tx, existing.ID, AccountID, name, script)
 		}
 		// Create new script
-		return rd.getOperationalDatabaseForOperation(true).CreateScript(ctx, tx, AccountID, name, script)
+		return rd.getOperationalDatabaseForOperation(ctx, true).CreateScript(ctx, tx, AccountID, name, script)
 	}
 
 	result, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
@@ -81,13 +81,13 @@ func (rd *ResilientDatabase) CreateOrUpdateScriptWithRetry(ctx context.Context, 
 func (rd *ResilientDatabase) DeleteScriptWithRetry(ctx context.Context, name string, AccountID int64) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		// Get script ID
-		script, err := rd.getOperationalDatabaseForOperation(false).GetScriptByName(ctx, name, AccountID)
+		script, err := rd.getOperationalDatabaseForOperation(ctx, false).GetScriptByName(ctx, name, AccountID)
 		if err != nil {
 			return nil, err
 		}
 
 		// Delete script
-		return nil, rd.getOperationalDatabaseForOperation(true).DeleteScript(ctx, tx, script.ID, AccountID)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).DeleteScript(ctx, tx, script.ID, AccountID)
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
@@ -98,13 +98,13 @@ func (rd *ResilientDatabase) DeleteScriptWithRetry(ctx context.Context, name str
 func (rd *ResilientDatabase) ActivateScriptWithRetry(ctx context.Context, name string, AccountID int64) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		// Get script ID
-		script, err := rd.getOperationalDatabaseForOperation(false).GetScriptByName(ctx, name, AccountID)
+		script, err := rd.getOperationalDatabaseForOperation(ctx, false).GetScriptByName(ctx, name, AccountID)
 		if err != nil {
 			return nil, err
 		}
 
 		// Activate script (deactivates all others automatically)
-		return nil, rd.getOperationalDatabaseForOperation(true).SetScriptActive(ctx, tx, script.ID, AccountID, true)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).SetScriptActive(ctx, tx, script.ID, AccountID, true)
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
@@ -115,13 +115,13 @@ func (rd *ResilientDatabase) ActivateScriptWithRetry(ctx context.Context, name s
 func (rd *ResilientDatabase) DeactivateScriptWithRetry(ctx context.Context, name string, AccountID int64) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		// Get script ID
-		script, err := rd.getOperationalDatabaseForOperation(false).GetScriptByName(ctx, name, AccountID)
+		script, err := rd.getOperationalDatabaseForOperation(ctx, false).GetScriptByName(ctx, name, AccountID)
 		if err != nil {
 			return nil, err
 		}
 
 		// Deactivate script
-		return nil, rd.getOperationalDatabaseForOperation(true).SetScriptActive(ctx, tx, script.ID, AccountID, false)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).SetScriptActive(ctx, tx, script.ID, AccountID, false)
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
@@ -131,7 +131,7 @@ func (rd *ResilientDatabase) DeactivateScriptWithRetry(ctx context.Context, name
 // UpdateScriptWithRetry updates an existing Sieve script with retry logic
 func (rd *ResilientDatabase) UpdateScriptWithRetry(ctx context.Context, scriptID, AccountID int64, name, script string) (*db.SieveScript, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(true).UpdateScript(ctx, tx, scriptID, AccountID, name, script)
+		return rd.getOperationalDatabaseForOperation(ctx, true).UpdateScript(ctx, tx, scriptID, AccountID, name, script)
 	}
 
 	result, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
@@ -145,7 +145,7 @@ func (rd *ResilientDatabase) UpdateScriptWithRetry(ctx context.Context, scriptID
 // CreateScriptWithRetry creates a new Sieve script with retry logic
 func (rd *ResilientDatabase) CreateScriptWithRetry(ctx context.Context, AccountID int64, name, script string) (*db.SieveScript, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(true).CreateScript(ctx, tx, AccountID, name, script)
+		return rd.getOperationalDatabaseForOperation(ctx, true).CreateScript(ctx, tx, AccountID, name, script)
 	}
 
 	result, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
@@ -159,7 +159,7 @@ func (rd *ResilientDatabase) CreateScriptWithRetry(ctx context.Context, AccountI
 // SetScriptActiveWithRetry sets a script's active status with retry logic
 func (rd *ResilientDatabase) SetScriptActiveWithRetry(ctx context.Context, scriptID, AccountID int64, active bool) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).SetScriptActive(ctx, tx, scriptID, AccountID, active)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).SetScriptActive(ctx, tx, scriptID, AccountID, active)
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
@@ -169,7 +169,7 @@ func (rd *ResilientDatabase) SetScriptActiveWithRetry(ctx context.Context, scrip
 // DeleteScriptByIDWithRetry deletes a Sieve script by ID with retry logic
 func (rd *ResilientDatabase) DeleteScriptByIDWithRetry(ctx context.Context, scriptID, AccountID int64) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).DeleteScript(ctx, tx, scriptID, AccountID)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).DeleteScript(ctx, tx, scriptID, AccountID)
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
@@ -179,7 +179,7 @@ func (rd *ResilientDatabase) DeleteScriptByIDWithRetry(ctx context.Context, scri
 // GetActiveScriptWithRetry retrieves the currently active Sieve script for a user with retry logic
 func (rd *ResilientDatabase) GetActiveScriptWithRetry(ctx context.Context, AccountID int64) (*db.SieveScript, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetActiveScript(ctx, AccountID)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetActiveScript(ctx, AccountID)
 	}
 
 	result, err := rd.executeReadWithRetry(ctx, sieveReadRetryConfig, timeoutRead, op)
@@ -193,7 +193,7 @@ func (rd *ResilientDatabase) GetActiveScriptWithRetry(ctx context.Context, Accou
 // DeactivateAllScriptsWithRetry deactivates all Sieve scripts for an account with retry logic
 func (rd *ResilientDatabase) DeactivateAllScriptsWithRetry(ctx context.Context, AccountID int64) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).DeactivateAllScripts(ctx, tx, AccountID)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).DeactivateAllScripts(ctx, tx, AccountID)
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
@@ -205,7 +205,7 @@ func (rd *ResilientDatabase) DeactivateAllScriptsWithRetry(ctx context.Context, 
 // HasRecentVacationResponseWithRetry checks if a vacation response was sent recently with retry logic
 func (rd *ResilientDatabase) HasRecentVacationResponseWithRetry(ctx context.Context, AccountID int64, recipient string, duration time.Duration) (bool, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).HasRecentVacationResponse(ctx, AccountID, recipient, duration)
+		return rd.getOperationalDatabaseForOperation(ctx, false).HasRecentVacationResponse(ctx, AccountID, recipient, duration)
 	}
 
 	result, err := rd.executeReadWithRetry(ctx, sieveReadRetryConfig, timeoutRead, op)
@@ -219,7 +219,7 @@ func (rd *ResilientDatabase) HasRecentVacationResponseWithRetry(ctx context.Cont
 // RecordVacationResponseWithRetry records that a vacation response was sent with retry logic
 func (rd *ResilientDatabase) RecordVacationResponseWithRetry(ctx context.Context, AccountID int64, recipient string) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).RecordVacationResponse(ctx, tx, AccountID, recipient)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RecordVacationResponse(ctx, tx, AccountID, recipient)
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)

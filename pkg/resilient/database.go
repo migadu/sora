@@ -494,11 +494,11 @@ func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, arg
 
 	if useMaster, ok := ctx.Value(consts.UseMasterDBKey).(bool); ok && useMaster {
 		// Explicitly requested to use master/write database
-		db := rd.getOperationalDatabaseForOperation(true)
+		db := rd.getOperationalDatabaseForOperation(ctx, true)
 		pool = db.WritePool
 	} else {
 		// Use read database for queries by default
-		db := rd.getOperationalDatabaseForOperation(false)
+		db := rd.getOperationalDatabaseForOperation(ctx, false)
 		pool = db.ReadPool
 	}
 
@@ -554,10 +554,10 @@ func (r *resilientRow) Scan(dest ...any) error {
 	op := func(ctx context.Context) (any, error) {
 		var pool *pgxpool.Pool
 		if useMaster, ok := r.ctx.Value(consts.UseMasterDBKey).(bool); ok && useMaster {
-			db := r.rd.getOperationalDatabaseForOperation(true)
+			db := r.rd.getOperationalDatabaseForOperation(r.ctx, true)
 			pool = db.WritePool
 		} else {
-			db := r.rd.getOperationalDatabaseForOperation(false)
+			db := r.rd.getOperationalDatabaseForOperation(r.ctx, false)
 			pool = db.ReadPool
 		}
 		// The error from Scan (including pgx.ErrNoRows) is returned directly.
@@ -621,7 +621,7 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 		defer cancel()
 
 		result, cbErr := rd.writeBreaker.Execute(func() (any, error) {
-			t, txErr := rd.getOperationalDatabaseForOperation(true).BeginTx(writeCtx, txOptions)
+			t, txErr := rd.getOperationalDatabaseForOperation(writeCtx, true).BeginTx(writeCtx, txOptions)
 			return t, txErr
 		})
 
@@ -667,7 +667,7 @@ func (rd *ResilientDatabase) UpdatePasswordWithRetry(ctx context.Context, addres
 		OperationName:   "db_update_password",
 	}
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).UpdatePassword(ctx, tx, address, newHashedPassword)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).UpdatePassword(ctx, tx, address, newHashedPassword)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
 
@@ -726,7 +726,7 @@ var importExportRetryConfig = retry.BackoffConfig{
 
 func (rd *ResilientDatabase) DeleteMessageByHashAndMailboxWithRetry(ctx context.Context, AccountID, mailboxID int64, hash string) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(true).DeleteMessageByHashAndMailbox(ctx, tx, AccountID, mailboxID, hash)
+		return rd.getOperationalDatabaseForOperation(ctx, true).DeleteMessageByHashAndMailbox(ctx, tx, AccountID, mailboxID, hash)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, importExportRetryConfig, timeoutWrite, op)
 	if err != nil {
@@ -737,7 +737,7 @@ func (rd *ResilientDatabase) DeleteMessageByHashAndMailboxWithRetry(ctx context.
 
 func (rd *ResilientDatabase) CompleteS3UploadWithRetry(ctx context.Context, hash string, accountID int64) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).CompleteS3Upload(ctx, tx, hash, accountID)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).CompleteS3Upload(ctx, tx, hash, accountID)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, importExportRetryConfig, timeoutWrite, op)
 	return err
@@ -755,7 +755,7 @@ func (rd *ResilientDatabase) StoreHealthStatusWithRetry(ctx context.Context, hos
 		OperationName:   "db_store_health_status",
 	}
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(true).StoreHealthStatus(ctx, tx, hostname, componentName, status, lastError, checkCount, failCount, metadata)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).StoreHealthStatus(ctx, tx, hostname, componentName, status, lastError, checkCount, failCount, metadata)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
 	return err
@@ -963,9 +963,15 @@ func (rd *ResilientDatabase) getCurrentDatabaseForOperation(isWrite bool) *db.Da
 }
 
 // getOperationalDatabaseForOperation returns the database to use for operations, with runtime failover
-func (rd *ResilientDatabase) getOperationalDatabaseForOperation(isWrite bool) *db.Database {
+func (rd *ResilientDatabase) getOperationalDatabaseForOperation(ctx context.Context, isWrite bool) *db.Database {
 	if rd.failoverManager == nil {
 		panic("failover manager not initialized")
+	}
+
+	if !isWrite && ctx != nil {
+		if useMaster, ok := ctx.Value(consts.UseMasterDBKey).(bool); ok && useMaster {
+			isWrite = true
+		}
 	}
 
 	// Try to get a healthy database, with failover if needed
@@ -975,7 +981,7 @@ func (rd *ResilientDatabase) getOperationalDatabaseForOperation(isWrite bool) *d
 // GetOperationalDatabase returns the underlying database instance for write operations
 // This is used by the importer for batch transaction mode
 func (rd *ResilientDatabase) GetOperationalDatabase() *db.Database {
-	return rd.getOperationalDatabaseForOperation(true)
+	return rd.getOperationalDatabaseForOperation(context.Background(), true)
 }
 
 // getHealthyDatabaseWithFailover attempts to get a healthy database, failing over if necessary
@@ -1475,7 +1481,7 @@ func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Conte
 			return nil, fmt.Errorf("failed to get mailbox: %w", err)
 		}
 
-		dbLayer := rd.getOperationalDatabaseForOperation(true)
+		dbLayer := rd.getOperationalDatabaseForOperation(ctx, true)
 		parts := strings.Split(name, string(consts.MailboxDelimiter))
 		var currentParentID *int64
 
@@ -1540,7 +1546,7 @@ func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Conte
 // GetVanishedUIDsWithRetry returns UIDs that were expunged between sinceModSeq and untilModSeq.
 func (rd *ResilientDatabase) GetVanishedUIDsWithRetry(ctx context.Context, mailboxID int64, sinceModSeq, untilModSeq uint64) ([]imap.UID, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetVanishedUIDs(ctx, mailboxID, sinceModSeq, untilModSeq)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetVanishedUIDs(ctx, mailboxID, sinceModSeq, untilModSeq)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
@@ -1552,7 +1558,7 @@ func (rd *ResilientDatabase) GetVanishedUIDsWithRetry(ctx context.Context, mailb
 // GetMessagesChangedSinceWithRetry returns messages that were created or modified after sinceModSeq.
 func (rd *ResilientDatabase) GetMessagesChangedSinceWithRetry(ctx context.Context, mailboxID int64, sinceModSeq uint64) ([]db.QResyncModifiedMessage, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetMessagesChangedSince(ctx, mailboxID, sinceModSeq)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetMessagesChangedSince(ctx, mailboxID, sinceModSeq)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
@@ -1564,7 +1570,7 @@ func (rd *ResilientDatabase) GetMessagesChangedSinceWithRetry(ctx context.Contex
 // GetVanishedUIDsForFetchWithRetry returns vanished UIDs for FETCH VANISHED modifier.
 func (rd *ResilientDatabase) GetVanishedUIDsForFetchWithRetry(ctx context.Context, mailboxID int64, sinceModSeq uint64) ([]imap.UID, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetVanishedUIDsForFetch(ctx, mailboxID, sinceModSeq)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetVanishedUIDsForFetch(ctx, mailboxID, sinceModSeq)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
@@ -1576,7 +1582,7 @@ func (rd *ResilientDatabase) GetVanishedUIDsForFetchWithRetry(ctx context.Contex
 // ValidateQResyncUIDValidityWithRetry checks if the client's UIDValidity matches the current mailbox.
 func (rd *ResilientDatabase) ValidateQResyncUIDValidityWithRetry(ctx context.Context, mailboxID int64, clientUIDValidity uint32) (bool, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).ValidateQResyncUIDValidity(ctx, mailboxID, clientUIDValidity)
+		return rd.getOperationalDatabaseForOperation(ctx, false).ValidateQResyncUIDValidity(ctx, mailboxID, clientUIDValidity)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {

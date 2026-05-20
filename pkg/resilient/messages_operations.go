@@ -16,7 +16,7 @@ func (rd *ResilientDatabase) AddMessageFlagsWithRetry(ctx context.Context, messa
 		modSeq int64
 	}
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		flags, modSeq, err := rd.getOperationalDatabaseForOperation(true).AddMessageFlags(ctx, tx, messageUID, mailboxID, newFlags)
+		flags, modSeq, err := rd.getOperationalDatabaseForOperation(ctx, true).AddMessageFlags(ctx, tx, messageUID, mailboxID, newFlags)
 		if err != nil {
 			return nil, err
 		}
@@ -38,7 +38,7 @@ func (rd *ResilientDatabase) RemoveMessageFlagsWithRetry(ctx context.Context, me
 		modSeq int64
 	}
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		flags, modSeq, err := rd.getOperationalDatabaseForOperation(true).RemoveMessageFlags(ctx, tx, messageUID, mailboxID, flagsToRemove)
+		flags, modSeq, err := rd.getOperationalDatabaseForOperation(ctx, true).RemoveMessageFlags(ctx, tx, messageUID, mailboxID, flagsToRemove)
 		if err != nil {
 			return nil, err
 		}
@@ -60,7 +60,7 @@ func (rd *ResilientDatabase) SetMessageFlagsWithRetry(ctx context.Context, messa
 		modSeq int64
 	}
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		flags, modSeq, err := rd.getOperationalDatabaseForOperation(true).SetMessageFlags(ctx, tx, messageUID, mailboxID, newFlags)
+		flags, modSeq, err := rd.getOperationalDatabaseForOperation(ctx, true).SetMessageFlags(ctx, tx, messageUID, mailboxID, newFlags)
 		if err != nil {
 			return nil, err
 		}
@@ -80,7 +80,7 @@ func (rd *ResilientDatabase) SetMessageFlagsWithRetry(ctx context.Context, messa
 
 func (rd *ResilientDatabase) AddMessageFlagsBatchWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag) ([]db.BatchFlagUpdateResult, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(true).AddMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, newFlags)
+		return rd.getOperationalDatabaseForOperation(ctx, true).AddMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, newFlags)
 	}
 
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
@@ -92,7 +92,7 @@ func (rd *ResilientDatabase) AddMessageFlagsBatchWithRetry(ctx context.Context, 
 
 func (rd *ResilientDatabase) RemoveMessageFlagsBatchWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, flagsToRemove []imap.Flag) ([]db.BatchFlagUpdateResult, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(true).RemoveMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, flagsToRemove)
+		return rd.getOperationalDatabaseForOperation(ctx, true).RemoveMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, flagsToRemove)
 	}
 
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
@@ -104,7 +104,7 @@ func (rd *ResilientDatabase) RemoveMessageFlagsBatchWithRetry(ctx context.Contex
 
 func (rd *ResilientDatabase) SetMessageFlagsBatchWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag) ([]db.BatchFlagUpdateResult, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(true).SetMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, newFlags)
+		return rd.getOperationalDatabaseForOperation(ctx, true).SetMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, newFlags)
 	}
 
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
@@ -116,7 +116,7 @@ func (rd *ResilientDatabase) SetMessageFlagsBatchWithRetry(ctx context.Context, 
 
 func (rd *ResilientDatabase) GetMessageBodyStructureWithRetry(ctx context.Context, uid imap.UID, mailboxID int64) (*imap.BodyStructure, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetMessageBodyStructure(ctx, uid, mailboxID)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetMessageBodyStructure(ctx, uid, mailboxID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
@@ -127,7 +127,7 @@ func (rd *ResilientDatabase) GetMessageBodyStructureWithRetry(ctx context.Contex
 
 func (rd *ResilientDatabase) GetMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit int) ([]db.Message, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria, limit)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetMessagesSorted(ctx, mailboxID, criteria, sortCriteria, limit)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
 	if err != nil {
@@ -141,7 +141,7 @@ func (rd *ResilientDatabase) GetMessagesSorted(ctx context.Context, mailboxID in
 
 func (rd *ResilientDatabase) SearchMessagesSortedWithRetry(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit int) ([]db.SearchMessageResult, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).SearchMessagesSorted(ctx, mailboxID, criteria, sortCriteria, limit)
+		return rd.getOperationalDatabaseForOperation(ctx, false).SearchMessagesSorted(ctx, mailboxID, criteria, sortCriteria, limit)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
 	if err != nil {
@@ -155,7 +155,7 @@ func (rd *ResilientDatabase) SearchMessagesSortedWithRetry(ctx context.Context, 
 
 func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, AccountID int64) (map[imap.UID]imap.UID, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(true).MoveMessages(ctx, tx, ids, srcMailboxID, destMailboxID, AccountID)
+		return rd.getOperationalDatabaseForOperation(ctx, true).MoveMessages(ctx, tx, ids, srcMailboxID, destMailboxID, AccountID)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	if err != nil {
@@ -168,7 +168,7 @@ func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]i
 
 func (rd *ResilientDatabase) GetMailboxMessageCountAndSizeSumWithRetry(ctx context.Context, mailboxID int64) (int, int64, error) {
 	op := func(ctx context.Context) (any, error) {
-		c, s, err := rd.getOperationalDatabaseForOperation(false).GetMailboxMessageCountAndSizeSum(ctx, mailboxID)
+		c, s, err := rd.getOperationalDatabaseForOperation(ctx, false).GetMailboxMessageCountAndSizeSum(ctx, mailboxID)
 		if err != nil {
 			return nil, err
 		}
@@ -184,7 +184,7 @@ func (rd *ResilientDatabase) GetMailboxMessageCountAndSizeSumWithRetry(ctx conte
 
 func (rd *ResilientDatabase) ListMessagesWithRetry(ctx context.Context, mailboxID int64) ([]db.Message, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).ListMessages(ctx, mailboxID)
+		return rd.getOperationalDatabaseForOperation(ctx, false).ListMessages(ctx, mailboxID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
@@ -198,7 +198,7 @@ func (rd *ResilientDatabase) ListMessagesWithRetry(ctx context.Context, mailboxI
 
 func (rd *ResilientDatabase) GetMessagesWithCriteriaWithRetry(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, limit int) ([]db.Message, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).GetMessagesWithCriteria(ctx, mailboxID, criteria, limit)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetMessagesWithCriteria(ctx, mailboxID, criteria, limit)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
 	if err != nil {
@@ -212,7 +212,7 @@ func (rd *ResilientDatabase) GetMessagesWithCriteriaWithRetry(ctx context.Contex
 
 func (rd *ResilientDatabase) SearchMessagesWithCriteriaWithRetry(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, limit int) ([]db.SearchMessageResult, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).SearchMessagesWithCriteria(ctx, mailboxID, criteria, limit)
+		return rd.getOperationalDatabaseForOperation(ctx, false).SearchMessagesWithCriteria(ctx, mailboxID, criteria, limit)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
 	if err != nil {
@@ -228,7 +228,7 @@ func (rd *ResilientDatabase) SearchMessagesWithCriteriaWithRetry(ctx context.Con
 
 func (rd *ResilientDatabase) ListDeletedMessagesWithRetry(ctx context.Context, params db.ListDeletedMessagesParams) ([]db.DeletedMessage, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(false).ListDeletedMessages(ctx, params)
+		return rd.getOperationalDatabaseForOperation(ctx, false).ListDeletedMessages(ctx, params)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
@@ -242,7 +242,7 @@ func (rd *ResilientDatabase) ListDeletedMessagesWithRetry(ctx context.Context, p
 
 func (rd *ResilientDatabase) RestoreMessagesWithRetry(ctx context.Context, params db.RestoreMessagesParams) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(true).RestoreMessages(ctx, tx, params)
+		return rd.getOperationalDatabaseForOperation(ctx, true).RestoreMessages(ctx, tx, params)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	if err != nil {
