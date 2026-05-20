@@ -43,7 +43,22 @@ func (s *IMAPSession) Login(address, password string) error {
 	// Apply progressive authentication delay BEFORE any other checks
 	// Create a fake net.Addr from the RemoteIP for delay calculation
 	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-	server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-LOGIN")
+	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-LOGIN"); err != nil {
+		if errors.Is(err, server.ErrDelayQueueFull) {
+			// Delay queue full - reject immediately to prevent goroutine exhaustion
+			logger.Info("IMAP: Delay queue full, rejecting connection", "address", address, "ip", s.RemoteIP)
+			return &imap.Error{
+				Type: imap.StatusResponseTypeBye,
+				Code: imap.ResponseCodeAlert,
+				Text: "Too many concurrent authentication attempts. Please try again later.",
+			}
+		}
+		// Context cancelled or other error
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBye,
+			Text: "Connection closed",
+		}
+	}
 
 	// Check authentication rate limiting after delay using proxy-aware method
 	if s.server.authLimiter != nil {

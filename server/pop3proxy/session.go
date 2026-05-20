@@ -418,7 +418,15 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 	// Apply progressive authentication delay BEFORE any other checks
 	remoteAddr := s.clientConn.RemoteAddr()
-	server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-PROXY")
+	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-PROXY"); err != nil {
+		if errors.Is(err, server.ErrDelayQueueFull) {
+			// Delay queue full - reject immediately to prevent goroutine exhaustion
+			logger.Info("POP3 Proxy: Delay queue full, rejecting connection", "username", username, "remote", remoteAddr)
+			return errors.New("too many concurrent authentication attempts")
+		}
+		// Context cancelled or other error
+		return err
+	}
 
 	// Check cache first (before rate limiter to avoid delays for cached successful auth)
 	// Use server name as cache key to avoid collisions between different proxies/servers

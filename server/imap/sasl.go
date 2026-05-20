@@ -8,6 +8,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-sasl"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
@@ -44,7 +45,22 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 			// Apply progressive authentication delay BEFORE any other checks
 			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-			server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-SASL")
+			if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-SASL"); err != nil {
+				if errors.Is(err, server.ErrDelayQueueFull) {
+					// Delay queue full - reject immediately to prevent goroutine exhaustion
+					logger.Info("IMAP: Delay queue full, rejecting connection", "username", username, "ip", s.RemoteIP)
+					return &imap.Error{
+						Type: imap.StatusResponseTypeBye,
+						Code: imap.ResponseCodeAlert,
+						Text: "Too many concurrent authentication attempts. Please try again later.",
+					}
+				}
+				// Context cancelled or other error
+				return &imap.Error{
+					Type: imap.StatusResponseTypeBye,
+					Text: "Connection closed",
+				}
+			}
 
 			// Check authentication rate limiting after delay
 			if s.server.authLimiter != nil {

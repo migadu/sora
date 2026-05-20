@@ -269,7 +269,19 @@ func (s *POP3Session) handleConnection() {
 
 			// Apply progressive authentication delay BEFORE any other checks
 			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-			server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-PASS")
+			if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-PASS"); err != nil {
+				if errors.Is(err, server.ErrDelayQueueFull) {
+					// Delay queue full - reject immediately to prevent goroutine exhaustion
+					logger.Info("POP3: Delay queue full, rejecting connection", "address", userAddress.FullAddress(), "ip", s.RemoteIP)
+					recordMetrics("failure")
+					if s.handleClientError(writer, "-ERR [IN-USE] Too many concurrent authentication attempts. Please try again later.\r\n") {
+						return
+					}
+					continue
+				}
+				// Context cancelled or other error - close connection
+				return
+			}
 
 			// Check authentication rate limiting after delay
 			if s.server.authLimiter != nil {
@@ -1660,7 +1672,19 @@ func (s *POP3Session) handleConnection() {
 
 				// Apply progressive authentication delay BEFORE any other checks
 				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-				server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-SASL")
+				if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-SASL"); err != nil {
+					if errors.Is(err, server.ErrDelayQueueFull) {
+						// Delay queue full - reject immediately to prevent goroutine exhaustion
+						logger.Info("POP3: Delay queue full, rejecting connection", "address", address.FullAddress(), "ip", s.RemoteIP)
+						recordMetrics("failure")
+						if s.handleClientError(writer, "-ERR [IN-USE] Too many concurrent authentication attempts. Please try again later.\r\n") {
+							return
+						}
+						continue
+					}
+					// Context cancelled or other error - close connection
+					return
+				}
 
 				// Check authentication rate limiting after delay
 				if s.server.authLimiter != nil {

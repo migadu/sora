@@ -431,6 +431,39 @@ var (
 		[]string{"protocol", "server_name", "hostname"},
 	)
 
+	// Auth delay queue metrics (per-IP semaphore tracking)
+	AuthDelayQueueDepth = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sora_auth_delay_queue_depth",
+			Help: "Current number of connections waiting in auth delay queue per IP",
+		},
+		[]string{"protocol", "ip"},
+	)
+
+	AuthDelayRejections = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_auth_delay_rejections_total",
+			Help: "Total number of connections rejected due to full delay queue per IP",
+		},
+		[]string{"protocol", "ip"},
+	)
+
+	AuthDelayCompleted = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_auth_delay_completed_total",
+			Help: "Total number of auth delays completed successfully",
+		},
+		[]string{"protocol", "ip"},
+	)
+
+	AuthDelayCancelled = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_auth_delay_cancelled_total",
+			Help: "Total number of auth delays cancelled (connection closed, shutdown, etc.)",
+		},
+		[]string{"protocol", "ip"},
+	)
+
 	// Connection tracker memory usage (proxy mode)
 	ConnectionTrackerUsers = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{

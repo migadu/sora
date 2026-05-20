@@ -520,7 +520,15 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 	// Apply progressive authentication delay BEFORE any other checks
 	remoteAddr := s.clientConn.RemoteAddr()
-	server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-PROXY")
+	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-PROXY"); err != nil {
+		if errors.Is(err, server.ErrDelayQueueFull) {
+			// Delay queue full - reject immediately to prevent goroutine exhaustion
+			logger.Info("ManageSieve Proxy: Delay queue full, rejecting connection", "username", username, "remote", remoteAddr)
+			return errors.New("too many concurrent authentication attempts")
+		}
+		// Context cancelled or other error
+		return err
+	}
 
 	// Check cache first (before rate limiter to avoid delays for cached successful auth)
 	// Use server name as cache key to avoid collisions between different proxies/servers

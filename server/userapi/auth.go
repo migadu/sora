@@ -79,7 +79,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Apply progressive authentication delay BEFORE any other checks
-	server.ApplyAuthenticationDelay(ctx, s.authLimiter, remoteAddr, "USER-API-LOGIN")
+	if err := server.ApplyAuthenticationDelay(ctx, s.authLimiter, remoteAddr, "USER-API-LOGIN"); err != nil {
+		if errors.Is(err, server.ErrDelayQueueFull) {
+			// Delay queue full - reject immediately to prevent goroutine exhaustion
+			logger.Info("User API: Delay queue full, rejecting connection", "email", req.Email, "remote", remoteAddr)
+			s.writeError(w, http.StatusTooManyRequests, "Too many concurrent authentication attempts. Please try again later.")
+			return
+		}
+		// Context cancelled or other error
+		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
+		return
+	}
 
 	var accountID int64
 	var hashedPassword string
