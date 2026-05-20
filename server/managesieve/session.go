@@ -24,6 +24,8 @@ import (
 	"github.com/migadu/sora/server"
 )
 
+const ManageSieveMaxLineLength = 8192 // ManageSieve commands can be longer than POP3
+
 type ManageSieveSession struct {
 	server.Session
 	mutex         sync.RWMutex
@@ -102,8 +104,14 @@ func (s *ManageSieveSession) handleConnection() {
 			(*s.conn).SetReadDeadline(time.Time{}) // No timeout
 		}
 
-		line, err := s.reader.ReadString('\n')
+		line, err := server.ReadBoundedLine(s.reader, ManageSieveMaxLineLength)
 		if err != nil {
+			if err == server.ErrLineTooLong {
+				s.sendResponse(`NO "Command line too long"`)
+				s.writer.Flush()
+				s.WarnLog("line too long, closing connection")
+				return
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				s.sendRawLine("BYE (TRYLATER) \"Connection timed out due to inactivity, please reconnect\"")
 				s.writer.Flush()

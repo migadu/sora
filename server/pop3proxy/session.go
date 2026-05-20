@@ -100,8 +100,14 @@ func (s *POP3ProxySession) handleConnection() {
 			}
 		}
 
-		line, err := reader.ReadString('\n')
+		line, err := server.ReadBoundedLine(reader, 1024) // POP3 line limit per RFC 1939
 		if err != nil {
+			if err == server.ErrLineTooLong {
+				writer.WriteString("-ERR Line too long\r\n")
+				writer.Flush()
+				s.WarnLog("line too long, closing connection")
+				return
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				s.DebugLog("Client timed out waiting for command")
 				writer.WriteString("-ERR Idle timeout, closing connection\r\n")

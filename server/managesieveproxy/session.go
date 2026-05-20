@@ -132,8 +132,14 @@ func (s *Session) handleConnection() {
 		}
 
 		// Read command from client
-		line, err := s.clientReader.ReadString('\n')
+		line, err := server.ReadBoundedLine(s.clientReader, 8192) // ManageSieve line limit
 		if err != nil {
+			if err == server.ErrLineTooLong {
+				s.sendResponse(`NO "Command line too long"`)
+				s.clientWriter.Flush()
+				s.WarnLog("line too long, closing connection")
+				return
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				s.DebugLog("client timed out waiting for command")
 				s.sendResponse(`NO "Idle timeout"`)

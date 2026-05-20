@@ -31,6 +31,7 @@ import (
 const Pop3MaxErrorsAllowed = 3                  // Maximum number of errors tolerated before the connection is terminated
 const Pop3ErrorDelay = 3 * time.Second          // Wait for this many seconds before allowing another command
 const Pop3DefaultIdleTimeout = 10 * time.Minute // RFC 1939 §3: auto-logout timer MUST be at least 10 minutes
+const Pop3MaxLineLength = 1024                  // RFC 1939 §3: commands and responses limited to 512 octets (use 1024 for safety)
 
 type POP3Session struct {
 	server.Session
@@ -94,8 +95,14 @@ func (s *POP3Session) handleConnection() {
 			(*s.conn).SetReadDeadline(time.Time{}) // No timeout
 		}
 
-		line, err := reader.ReadString('\n')
+		line, err := server.ReadBoundedLine(reader, Pop3MaxLineLength)
 		if err != nil {
+			if err == server.ErrLineTooLong {
+				writer.WriteString("-ERR Line too long\r\n")
+				writer.Flush()
+				s.WarnLog("line too long, closing connection")
+				return
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				writer.WriteString("-ERR Connection timed out due to inactivity\r\n")
 				writer.Flush()
