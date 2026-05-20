@@ -161,6 +161,20 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
 					s.Session.User = &s.IMAPUser.User
 
+					// Register connection for tracking
+					if err := s.registerConnection(address.BaseAddress()); err != nil {
+						// Connection limit reached - undo authentication and reject
+						s.server.authenticatedConnections.Add(-1)
+						metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Dec()
+						s.IMAPUser = nil
+						s.Session.User = nil
+						return &imap.Error{
+							Type: imap.StatusResponseTypeNo,
+							Code: imap.ResponseCodeLimit,
+							Text: "Maximum connections reached",
+						}
+					}
+
 					// Trigger cache warmup for the authenticated user (if configured)
 					s.triggerCacheWarmup()
 
@@ -274,6 +288,20 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// If session closes between counter increments and user state setting, cleanup won't decrement
 					s.IMAPUser = NewIMAPUser(primaryAddr, AccountID)
 					s.Session.User = &s.IMAPUser.User
+
+					// Register connection for tracking
+					if err := s.registerConnection(address.BaseAddress()); err != nil {
+						// Connection limit reached - undo authentication and reject
+						s.server.authenticatedConnections.Add(-1)
+						metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Dec()
+						s.IMAPUser = nil
+						s.Session.User = nil
+						return &imap.Error{
+							Type: imap.StatusResponseTypeNo,
+							Code: imap.ResponseCodeLimit,
+							Text: "Maximum connections reached",
+						}
+					}
 
 					// Trigger cache warmup for the authenticated user (if configured)
 					s.triggerCacheWarmup()
