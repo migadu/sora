@@ -217,6 +217,12 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		logger.Info("ManageSieve: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
+	// Apply default maxScriptSize if not set
+	maxScriptSize := options.MaxScriptSize
+	if maxScriptSize == 0 {
+		maxScriptSize = DefaultMaxScriptSize
+	}
+
 	serverInstance := &ManageSieveServer{
 		hostname:               hostname,
 		name:                   name,
@@ -226,7 +232,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		cancel:                 serverCancel,
 		useStartTLS:            options.TLSUseStartTLS,
 		insecureAuth:           options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
-		maxScriptSize:          options.MaxScriptSize,
+		maxScriptSize:          maxScriptSize,
 		supportedExtensions:    options.SupportedExtensions,
 		masterUsername:         []byte(options.MasterUsername),
 		masterPassword:         []byte(options.MasterPassword),

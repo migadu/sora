@@ -2,6 +2,7 @@ package managesieve
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -434,12 +436,18 @@ func (s *ManageSieveSession) handleConnection() {
 				lengthStr = strings.TrimSuffix(lengthStr, "}")
 				lengthStr = strings.TrimSuffix(lengthStr, "+")
 
-				length := 0
-				if _, err := fmt.Sscanf(lengthStr, "%d", &length); err != nil || length < 0 {
+				length64, parseErr := strconv.ParseInt(lengthStr, 10, 64)
+				if parseErr != nil || length64 < 0 {
 					s.sendResponse("NO Invalid literal string length\r\n")
 					recordMetrics("failure")
 					continue
 				}
+				if length64 > s.server.maxScriptSize {
+					s.sendResponse(fmt.Sprintf("NO (MAXSCRIPTSIZE) Script size %d exceeds maximum allowed size %d\r\n", length64, s.server.maxScriptSize))
+					recordMetrics("failure")
+					continue
+				}
+				length := int(length64)
 
 				if !hasPlus {
 					// Send continuation response (+ ready for literal data) only for synchronizing literals
@@ -447,13 +455,16 @@ func (s *ManageSieveSession) handleConnection() {
 				}
 
 				// Read the literal content (length bytes)
-				literalContent := make([]byte, length)
-				n, err := io.ReadFull(s.reader, literalContent)
-				if err != nil || n != length {
+				var buf bytes.Buffer
+				if _, err := io.CopyN(&buf, s.reader, int64(length)); err != nil {
 					s.sendResponse("NO Failed to read literal string content\r\n")
 					// Bypass metrics for client socket timeouts (network transmission errors)
 					continue
 				}
+				literalContent := buf.Bytes()
+
+				// Read the trailing CRLF after literal (RFC 5804 compliance)
+				s.reader.ReadString('\n')
 
 				// Reset the metric timer NOW to exclude the time the client took to upload the script
 				start = time.Now()
@@ -778,7 +789,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	release()
 
 	// Phase 2: Validate and perform DB operations
-	if s.server.maxScriptSize > 0 && int64(len(content)) > s.server.maxScriptSize {
+	if int64(len(content)) > s.server.maxScriptSize {
 		s.sendResponse(fmt.Sprintf("NO (MAXSCRIPTSIZE) Script size %d exceeds maximum allowed size %d\r\n", len(content), s.server.maxScriptSize))
 		return false
 	}
