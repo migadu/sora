@@ -1294,8 +1294,8 @@ func (s *POP3Session) handleConnection() {
 				recordMetrics("failure")
 				continue
 			}
-			defer release()
 			s.deleted = make(map[int]bool)
+			release()
 
 			writer.WriteString("+OK\r\n")
 			s.DebugLog("deleted messages reset")
@@ -1853,13 +1853,13 @@ func (s *POP3Session) handleConnection() {
 					recordMetrics("failure")
 					continue
 				}
-				defer release()
 
 				if langTag == "*" {
 					s.language = "en" // Default to English
 				} else {
 					s.language = langTag
 				}
+				release()
 
 				writer.WriteString(fmt.Sprintf("+OK Language changed to %s\r\n", s.language))
 			}
