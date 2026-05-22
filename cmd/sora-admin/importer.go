@@ -1870,7 +1870,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]str
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback(i.ctx)
+	defer tx.Rollback(context.Background())
 
 	// Get the underlying database for direct access to InsertMessageFromImporter
 	database := i.rdb.GetOperationalDatabase()

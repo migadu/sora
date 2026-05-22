@@ -781,32 +781,57 @@ func hydrateSequencesCore[T any](
 		uids = append(uids, int64(uid))
 	}
 
-	// High-performance sequence hydration for arbitrary arrays (dense or sparse).
-	// By calculating the delta (gap) between consecutive UIDs and computing a running sum,
-	// PostgreSQL sweeps linearly forward over the B-Tree index exactly once, rather than
-	// N distinct scalar subqueries from 0, and avoids O(N*logN) ROW_NUMBER() materialize cliffs
-	// when min-to-max distance is huge.
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
-		WITH target_uids AS (
+	var query string
+	if len(messages) >= 1000 {
+		// High-performance sweeping sequence hydration for large results.
+		// Instead of N individual index scans, we calculate sequences for the mailbox
+		// up to the highest requested UID using a single index scan and ROW_NUMBER(),
+		// then join against the requested UIDs.
+		query = `
+			WITH range_bounds AS (
+				SELECT MAX(uid) as max_uid 
+				FROM unnest($2::bigint[]) as t(uid)
+			),
+			all_uids AS (
+				SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid) as seqnum
+				FROM messages m
+				CROSS JOIN range_bounds
+				WHERE m.mailbox_id = $1 
+				  AND m.expunged_at IS NULL 
+				  AND m.uid <= range_bounds.max_uid
+			)
+			SELECT a.uid, a.seqnum
+			FROM all_uids a
+			JOIN unnest($2::bigint[]) t(uid) ON a.uid = t.uid
+		`
+	} else {
+		// Extremely fast gap-based hydration for small sets of UIDs (<1000).
+		// By calculating the delta (gap) between consecutive UIDs and computing a running sum,
+		// we avoid the O(N) ROW_NUMBER sweep which could be slow for huge mailboxes.
+		query = `
+			WITH target_uids AS (
+				SELECT uid,
+					   LAG(uid, 1, 0::bigint) OVER (ORDER BY uid) as prev_uid
+				FROM unnest($2::bigint[]) as t(uid)
+			),
+			gaps AS (
+				SELECT t.uid,
+					   (SELECT COUNT(*)::bigint 
+						FROM messages m 
+						WHERE m.mailbox_id = $1 
+						  AND m.expunged_at IS NULL 
+						  AND m.uid > t.prev_uid 
+						  AND m.uid <= t.uid
+					   ) as gap_count
+				FROM target_uids t
+			)
 			SELECT uid,
-			       LAG(uid, 1, 0::bigint) OVER (ORDER BY uid) as prev_uid
-			FROM unnest($2::bigint[]) as t(uid)
-		),
-		gaps AS (
-			SELECT t.uid,
-			       (SELECT COUNT(*)::bigint 
-			        FROM messages m 
-			        WHERE m.mailbox_id = $1 
-			          AND m.expunged_at IS NULL 
-			          AND m.uid > t.prev_uid 
-			          AND m.uid <= t.uid
-			       ) as gap_count
-			FROM target_uids t
-		)
-		SELECT uid,
-		       SUM(gap_count) OVER (ORDER BY uid)::bigint as seqnum
-		FROM gaps
-	`, mailboxID, uids)
+				   SUM(gap_count) OVER (ORDER BY uid)::bigint as seqnum
+			FROM gaps
+		`
+	}
+
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, uids)
 
 	if err != nil {
 		return fmt.Errorf("failed to query sequence streams: %w", err)

@@ -666,7 +666,7 @@ func (d *Database) PurgeMessagesByIDs(ctx context.Context, messageIDs []int64) (
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.Background())
 
 	result, err := tx.Exec(ctx, `DELETE FROM messages WHERE id = ANY($1)`, messageIDs)
 	if err != nil {
@@ -713,7 +713,7 @@ func (d *Database) ExpungeAllMessagesForAccount(ctx context.Context, accountID i
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.Background())
 
 	result, err := tx.Exec(ctx, `
 		UPDATE messages
@@ -803,7 +803,7 @@ func (d *Database) PurgeMailboxesForAccount(ctx context.Context, accountID int64
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.Background())
 
 	_, err = tx.Exec(ctx, `DELETE FROM mailboxes WHERE account_id = $1`, accountID)
 	if err != nil {
@@ -824,7 +824,7 @@ func (d *Database) PurgeCredentialsForAccount(ctx context.Context, accountID int
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.Background())
 
 	_, err = tx.Exec(ctx, `DELETE FROM credentials WHERE account_id = $1`, accountID)
 	if err != nil {
@@ -846,7 +846,7 @@ func (d *Database) PurgeAccount(ctx context.Context, accountID int64) error {
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.Background())
 
 	_, err = tx.Exec(ctx, `DELETE FROM accounts WHERE id = $1`, accountID)
 	if err != nil {

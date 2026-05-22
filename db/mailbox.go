@@ -59,23 +59,38 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 
 	// Optimized query using the injected domain
 	query := `
-		SELECT DISTINCT
+		WITH accessible_mailboxes AS (
+			-- 1. All mailboxes owned by user (including shared mailboxes they created)
+			SELECT id, name, uid_validity, path, subscribed, created_at, updated_at, account_id
+			FROM mailboxes
+			WHERE account_id = $1
+
+			UNION
+
+			-- 2. Shared mailboxes where user has direct ACL access (must have at least 'l' lookup right)
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
+			FROM mailboxes m
+			INNER JOIN mailbox_acls acl ON m.id = acl.mailbox_id
+			WHERE m.is_shared = TRUE
+			  AND acl.account_id = $1
+			  AND position('l' IN acl.rights) > 0
+
+			UNION
+
+			-- 3. Shared mailboxes with "anyone" access (same domain, must have 'l' right)
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
+			FROM mailboxes m
+			INNER JOIN mailbox_acls anyone_acl ON m.id = anyone_acl.mailbox_id
+			WHERE m.is_shared = TRUE
+			  AND m.owner_domain = $2
+			  AND anyone_acl.identifier = 'anyone'
+			  AND position('l' IN anyone_acl.rights) > 0
+		)
+		SELECT 
 			m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id,
 			EXISTS(SELECT 1 FROM mailboxes child WHERE child.account_id = m.account_id AND LENGTH(child.path) = LENGTH(m.path) + 16 AND child.path LIKE m.path || '%') AS has_children
-		FROM mailboxes m
-		LEFT JOIN mailbox_acls acl ON m.id = acl.mailbox_id AND acl.account_id = $1 AND position('l' IN acl.rights) > 0
-		LEFT JOIN mailbox_acls anyone_acl ON m.id = anyone_acl.mailbox_id AND anyone_acl.identifier = 'anyone' AND position('l' IN anyone_acl.rights) > 0
-		WHERE
-			-- All mailboxes owned by user (including shared mailboxes they created)
-			m.account_id = $1
-			OR
-			-- Shared mailboxes where user has direct ACL access (must have at least 'l' lookup right)
-			(COALESCE(m.is_shared, FALSE) = TRUE AND acl.account_id IS NOT NULL)
-			OR
-			-- Shared mailboxes with "anyone" access (same domain, must have 'l' right)
-			(COALESCE(m.is_shared, FALSE) = TRUE
-			 AND anyone_acl.mailbox_id IS NOT NULL
-			 AND m.owner_domain = $2)
+		FROM accessible_mailboxes m
+		WHERE 1=1
 	`
 
 	if subscribed {
