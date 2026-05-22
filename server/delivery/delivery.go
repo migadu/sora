@@ -97,6 +97,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	messageID, _ := mailHeader.MessageID()
 	sentDate, _ := mailHeader.Date()
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
+	references, _ := mailHeader.MsgIDList("References")
 
 	if sentDate.IsZero() {
 		sentDate = time.Now()
@@ -213,6 +214,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			PlaintextBody:        *plaintextBody,
 			SentDate:             sentDate,
 			InReplyTo:            inReplyTo,
+			References:           references,
 			BodyStructure:        bodyStructure,
 			Recipients:           recipients,
 			Flags:                []imap.Flag{}, // Unread
@@ -358,6 +360,7 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 	messageID, _ := mailHeader.MessageID()
 	sentDate, _ := mailHeader.Date()
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
+	references, _ := mailHeader.MsgIDList("References")
 
 	if sentDate.IsZero() {
 		sentDate = time.Now()
@@ -391,6 +394,7 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 			PlaintextBody: *plaintextBody,
 			SentDate:      sentDate,
 			InReplyTo:     inReplyTo,
+			References:    references,
 			BodyStructure: bodyStructure,
 			Recipients:    recipients,
 			Flags:         []imap.Flag{},

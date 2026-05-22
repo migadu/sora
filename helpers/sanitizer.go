@@ -157,3 +157,17 @@ func RemoveLongTokens(s string, maxTokenLen int) string {
 
 	return buf.String()
 }
+
+// TruncateUTF8Safe safely truncates a UTF-8 string to a maximum byte length without cutting a multibyte rune in half.
+func TruncateUTF8Safe(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+
+	// Find the nearest valid rune boundary by scanning backwards
+	truncLen := maxBytes
+	for truncLen > 0 && !utf8.RuneStart(s[truncLen]) {
+		truncLen--
+	}
+	return s[:truncLen]
+}

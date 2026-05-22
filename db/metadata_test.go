@@ -325,7 +325,8 @@ func TestMetadataMaxSize(t *testing.T) {
 	err = tx.Commit(ctx)
 	require.NoError(t, err)
 
-	// Request with MAXSIZE that only allows first entry
+	// Request with MAXSIZE=10. This should return the "small" entry (5 bytes),
+	// skip the "large" entry (16 bytes), and populate LongEntries with 16.
 	maxSize := uint32(10)
 	options := &imap.GetMetadataOptions{MaxSize: &maxSize}
 
@@ -339,19 +340,18 @@ func TestMetadataMaxSize(t *testing.T) {
 	err = tx.Commit(ctx)
 	require.NoError(t, err)
 
-	// With MAXSIZE=10, should stop when size limit is reached
-	// The query returns results ordered by entry_name, so we get what fits
-	// We should get at least some results (not exceed limit)
-	if len(result.Entries) > 0 {
-		// Verify total size doesn't exceed limit
-		totalSize := uint32(0)
-		for _, v := range result.Entries {
-			if v != nil {
-				totalSize += uint32(len(*v))
-			}
-		}
-		assert.LessOrEqual(t, totalSize, maxSize, "Total size should not exceed MAXSIZE")
-	}
+	// Verify the result contains the small entry but NOT the large entry
+	assert.Equal(t, 1, len(result.Entries))
+
+	val, ok := result.Entries["/private/small"]
+	assert.True(t, ok)
+	assert.Equal(t, "small", string(*val))
+
+	_, ok = result.Entries["/private/large"]
+	assert.False(t, ok)
+
+	// Verify LongEntries was correctly populated with the size of the skipped entry
+	assert.Equal(t, uint32(16), result.LongEntries)
 }
 
 // TestMetadataEmptyValue tests storing empty/nil values

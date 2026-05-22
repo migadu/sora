@@ -499,9 +499,13 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	messageID, _ := mailHeader.MessageID()
 	sentDate, _ := mailHeader.Date()
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
+	references, _ := mailHeader.MsgIDList("References")
 
 	if len(inReplyTo) == 0 {
 		inReplyTo = nil
+	}
+	if len(references) == 0 {
+		references = nil
 	}
 
 	if sentDate.IsZero() {
@@ -560,6 +564,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			PlaintextBody: actualPlaintextBody,
 			SentDate:      sentDate,
 			InReplyTo:     inReplyTo,
+			References:    references,
 			BodyStructure: &bodyStructure,
 			Recipients:    recipients,
 			RawHeaders:    rawHeadersText,

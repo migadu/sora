@@ -139,7 +139,6 @@ func (db *Database) GetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 		Entries: make(map[string]*[]byte),
 	}
 
-	totalSize := uint32(0)
 	for rows.Next() {
 		var entryName string
 		var entryValue []byte
@@ -151,11 +150,12 @@ func (db *Database) GetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 		// Check MAXSIZE limit if specified
 		if options != nil && options.MaxSize != nil {
 			entrySize := uint32(len(entryValue))
-			if totalSize+entrySize > *options.MaxSize {
-				// TODO: Return METADATA response code with size exceeded
-				break
+			if entrySize > *options.MaxSize {
+				if entrySize > result.LongEntries {
+					result.LongEntries = entrySize
+				}
+				continue
 			}
-			totalSize += entrySize
 		}
 
 		// Store the value (nil means entry exists but has no value)

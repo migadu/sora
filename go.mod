@@ -30,9 +30,6 @@ require (
 	modernc.org/sqlite v1.39.0
 )
 
-// Use forked versions until upstreams are updated
-replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20260511103356-493ff5a8f548
-
 replace github.com/emersion/go-smtp => github.com/dejanstrbac/go-smtp v0.0.0-20260313205502-a1dea4f0d630
 
 replace github.com/emersion/go-message => github.com/migadu/go-message v0.0.0-20251204083122-d583d81190da
@@ -90,3 +87,5 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	rsc.io/binaryregexp v0.2.0 // indirect
 )
+
+replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20260522103947-e20da68f2907

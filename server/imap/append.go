@@ -168,6 +168,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	var subject, messageID string
 	var sentDate time.Time
 	var inReplyTo []string
+	var references []string
 	var actualPlaintextBody string
 	var recipients []helpers.Recipient
 
@@ -177,9 +178,13 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		messageID, _ = mailHeader.MessageID()
 		sentDate, _ = mailHeader.Date()
 		inReplyTo, _ = mailHeader.MsgIDList("In-Reply-To")
+		references, _ = mailHeader.MsgIDList("References")
 
 		if len(inReplyTo) == 0 {
 			inReplyTo = nil
+		}
+		if len(references) == 0 {
+			references = nil
 		}
 
 		extractedPlaintext, extractErr := helpers.ExtractPlaintextBody(messageContent)
@@ -284,6 +289,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			PlaintextBody: actualPlaintextBody,
 			SentDate:      sentDate,
 			InReplyTo:     inReplyTo,
+			References:    references,
 			BodyStructure: &bodyStructure,
 			Recipients:    recipients,
 			RawHeaders:    rawHeadersText,

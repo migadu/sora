@@ -30,6 +30,8 @@ type DBMessage struct {
 	CustomFlags  []string `json:"custom_flags,omitempty"`
 	MessageID    string   `json:"message_id"`
 	InReplyTo    string   `json:"in_reply_to,omitempty"`
+	References   string   `json:"references,omitempty"`
+	Recipients   []string `json:"recipients,omitempty"`
 	ContentHash  string   `json:"content_hash"`
 	S3Domain     string   `json:"-"`
 	S3Localpart  string   `json:"-"`
@@ -395,8 +397,8 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 	query := `
 		SELECT 
 			m.id, m.uid, m.mailbox_id, m.subject, m.sent_date, m.internal_date,
-			m.size, ms.flags, ms.custom_flags, m.message_id, m.in_reply_to,
-			m.recipients_json, m.content_hash, m.s3_domain, m.s3_localpart,
+			m.size, ms.flags, ms.custom_flags, m.message_id, m.in_reply_to, m.references,
+			m.recipients_json, m.content_hash, ms.flags_changed_at, m.s3_domain, m.s3_localpart,
 			mb.name as mailbox_path
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
@@ -407,12 +409,13 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 	msg := &DBMessage{}
 	var customFlagsJSON []byte
 	var recipientsJSON []byte
+	var flagsChangedAt any
 
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, query, messageID, accountID).Scan(
 		&msg.ID, &msg.UID, &msg.MailboxID, &msg.Subject, &msg.Date,
 		&msg.InternalDate, &msg.Size, &msg.Flags, &customFlagsJSON,
-		&msg.MessageID, &msg.InReplyTo, &recipientsJSON, &msg.ContentHash,
-		&msg.S3Domain, &msg.S3Localpart, &msg.MailboxPath,
+		&msg.MessageID, &msg.InReplyTo, &msg.References, &recipientsJSON, &msg.ContentHash,
+		&flagsChangedAt, &msg.S3Domain, &msg.S3Localpart, &msg.MailboxPath,
 	)
 
 	if err != nil {

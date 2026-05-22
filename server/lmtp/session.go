@@ -389,6 +389,14 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	messageID, _ := mailHeader.MessageID()
 	sentDate, _ := mailHeader.Date()
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
+	references, _ := mailHeader.MsgIDList("References")
+
+	if len(inReplyTo) == 0 {
+		inReplyTo = nil
+	}
+	if len(references) == 0 {
+		references = nil
+	}
 
 	if sentDate.IsZero() {
 		sentDate = time.Now()
@@ -578,6 +586,13 @@ func (s *LMTPSession) Data(r io.Reader) error {
 				messageID, _ = mailHeader.MessageID()
 				sentDate, _ = mailHeader.Date()
 				inReplyTo, _ = mailHeader.MsgIDList("In-Reply-To")
+				references, _ = mailHeader.MsgIDList("References")
+				if len(inReplyTo) == 0 {
+					inReplyTo = nil
+				}
+				if len(references) == 0 {
+					references = nil
+				}
 				if sentDate.IsZero() {
 					sentDate = time.Now()
 				}
@@ -644,7 +659,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 			// First save to the specified mailbox (with :create if specified)
 			err := s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
-				subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText, result.CreateMailbox)
+				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, rawHeadersText, result.CreateMailbox)
 			if err != nil {
 				// Allow duplicates (message already in target mailbox)
 				if !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -659,7 +674,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 			// Call saveMessageToMailbox again for INBOX (no :create for INBOX - it always exists)
 			err = s.saveMessageToMailbox(consts.MailboxInbox, fullMessageBytes, contentHash,
-				subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText, false)
+				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, rawHeadersText, false)
 			if err != nil {
 				// Allow duplicates (message already in INBOX)
 				if !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -729,7 +744,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	// For fileinto actions without :copy, pass the :create flag if specified
 	createMailbox := result.Action == sieveengine.ActionFileInto && result.CreateMailbox
 	err = s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
-		subject, messageID, sentDate, inReplyTo, bodyStructure, plaintextBody, recipients, rawHeadersText, createMailbox)
+		subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, rawHeadersText, createMailbox)
 	if err != nil {
 		// Handle duplicate messages (acceptable in LMTP - return success)
 		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -971,7 +986,7 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 // saveMessageToMailbox saves a message to the specified mailbox
 func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 	fullMessageBytes []byte, contentHash string, subject string, messageID string,
-	sentDate time.Time, inReplyTo []string, bodyStructure *imap.BodyStructure,
+	sentDate time.Time, inReplyTo []string, references []string, bodyStructure *imap.BodyStructure,
 	plaintextBody *string, recipients []helpers.Recipient, rawHeadersText string, createMailbox bool) error {
 
 	// Create a context for read operations that respects session pinning
@@ -1025,6 +1040,7 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 			PlaintextBody: *plaintextBody,
 			SentDate:      sentDate,
 			InReplyTo:     inReplyTo,
+			References:    references,
 			BodyStructure: bodyStructure,
 			Recipients:    recipients,
 			Flags:         []imap.Flag{}, // Explicitly set empty flags to mark as unread

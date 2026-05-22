@@ -35,10 +35,11 @@ type Message struct {
 	SentDate       time.Time  // The date the message was sent
 	Size           int        // Size of the message in bytes
 	MessageID      string     // Unique Message-ID from the message headers
+	InReplyTo      string
+	References     string
 	BodyStructure  *imap.BodyStructure
 	CreatedModSeq  int64
 	UpdatedModSeq  *int64
-	InReplyTo      string
 	RecipientsJSON []byte
 	ExpungedModSeq *int64
 }

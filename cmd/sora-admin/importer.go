@@ -101,6 +101,7 @@ type messageMetadata struct {
 	plaintextBody        string
 	sentDate             time.Time
 	inReplyTo            []string
+	references           []string
 	bodyStructure        *imap.BodyStructure
 	recipients           []helpers.Recipient
 	rawHeaders           string
@@ -1525,9 +1526,13 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 	messageID, _ := mailHeader.MessageID()
 	sentDate, _ := mailHeader.Date()
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
+	references, _ := mailHeader.MsgIDList("References")
 
 	if len(inReplyTo) == 0 {
 		inReplyTo = nil
+	}
+	if len(references) == 0 {
+		references = nil
 	}
 
 	// If the Date header is missing or invalid, fall back to the file's modification time.
@@ -1601,6 +1606,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		plaintextBody:        plaintextBody,
 		sentDate:             sentDate,
 		inReplyTo:            inReplyTo,
+		references:           references,
 		bodyStructure:        &bodyStructure,
 		recipients:           recipients,
 		rawHeaders:           rawHeaders,
@@ -1774,6 +1780,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 			PlaintextBody:        up.metadata.plaintextBody,
 			SentDate:             up.metadata.sentDate,
 			InReplyTo:            up.metadata.inReplyTo,
+			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
 			Recipients:           up.metadata.recipients,
 			RawHeaders:           up.metadata.rawHeaders,
@@ -1905,6 +1912,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]str
 			PlaintextBody:        up.metadata.plaintextBody,
 			SentDate:             up.metadata.sentDate,
 			InReplyTo:            up.metadata.inReplyTo,
+			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
 			Recipients:           up.metadata.recipients,
 			RawHeaders:           up.metadata.rawHeaders,

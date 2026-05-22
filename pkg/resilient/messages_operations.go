@@ -224,6 +224,20 @@ func (rd *ResilientDatabase) SearchMessagesWithCriteriaWithRetry(ctx context.Con
 	return result.([]db.SearchMessageResult), nil
 }
 
+func (rd *ResilientDatabase) GetMessagesForThreadingWithRetry(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria) ([]db.ThreadMessageResult, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetMessagesForThreading(ctx, mailboxID, criteria)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return []db.ThreadMessageResult{}, nil
+	}
+	return result.([]db.ThreadMessageResult), nil
+}
+
 // --- Message Restoration Wrappers ---
 
 func (rd *ResilientDatabase) ListDeletedMessagesWithRetry(ctx context.Context, params db.ListDeletedMessagesParams) ([]db.DeletedMessage, error) {

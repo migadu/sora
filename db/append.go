@@ -149,6 +149,7 @@ type InsertMessageOptions struct {
 	PlaintextBody        string
 	SentDate             time.Time
 	InReplyTo            []string
+	References           []string
 	BodyStructure        *imap.BodyStructure
 	Recipients           []helpers.Recipient
 	RawHeaders           string
@@ -371,15 +372,19 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 
 	// Sanitize inputs
 	saneSubject := helpers.SanitizeUTF8(options.Subject)
-	saneInReplyToStr := helpers.SanitizeUTF8(inReplyToStr)
+	saneInReplyToStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(inReplyToStr), 2000)
+
+	referencesStr := strings.Join(options.References, " ")
+	saneReferencesStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(referencesStr), 2000)
+
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
 
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
 			INSERT INTO messages
-				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, "references", body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
 			VALUES
-				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @in_reply_to, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort)
+				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @in_reply_to, @references, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort)
 			RETURNING id
 		)
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -401,6 +406,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		"subject":         saneSubject,
 		"sent_date":       options.SentDate,
 		"in_reply_to":     saneInReplyToStr,
+		"references":      saneReferencesStr,
 		"body_structure":  bodyStructureData,
 		"recipients_json": recipientsJSON,
 		"subject_sort":    subjectSort,
@@ -744,15 +750,19 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 
 	// Sanitize inputs
 	saneSubject := helpers.SanitizeUTF8(options.Subject)
-	saneInReplyToStr := helpers.SanitizeUTF8(inReplyToStr)
+	saneInReplyToStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(inReplyToStr), 2000)
+
+	referencesStr := strings.Join(options.References, " ")
+	saneReferencesStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(referencesStr), 2000)
+
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
 
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
 			INSERT INTO messages
-				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
 			VALUES
-				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @in_reply_to, @body_structure, @recipients_json, true, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort)
+				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @in_reply_to, @references, @body_structure, @recipients_json, true, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort)
 			RETURNING id
 		)
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -774,6 +784,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		"subject":         saneSubject,
 		"sent_date":       options.SentDate,
 		"in_reply_to":     saneInReplyToStr,
+		"references":      saneReferencesStr,
 		"body_structure":  bodyStructureData,
 		"recipients_json": recipientsJSON,
 		"subject_sort":    subjectSort,
@@ -902,6 +913,7 @@ func (d *Database) InsertMessagesBatch(
 		SaneSubject        string
 		SanePlaintextBody  string
 		SaneInReplyToStr   string
+		SaneReferencesStr  string
 		BodyStructureData  []byte
 		RecipientsJSON     []byte
 		CustomKeywordsJSON []byte
@@ -1006,7 +1018,8 @@ func (d *Database) InsertMessagesBatch(
 			SaneMailboxName:    saneMailboxName,
 			SaneSubject:        helpers.SanitizeUTF8(opt.Subject),
 			SanePlaintextBody:  helpers.SanitizeUTF8(opt.PlaintextBody),
-			SaneInReplyToStr:   helpers.SanitizeUTF8(inReplyToStr),
+			SaneInReplyToStr:   helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(inReplyToStr), 2000),
+			SaneReferencesStr:  helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(strings.Join(opt.References, " ")), 2000),
 			BodyStructureData:  bodyStructureData,
 			RecipientsJSON:     recipientsJSON,
 			CustomKeywordsJSON: customKeywordsJSON,
@@ -1151,18 +1164,18 @@ func (d *Database) InsertMessagesBatch(
 		batch.Queue(`
 			WITH inserted AS (
 				INSERT INTO messages
-					(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
+					(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
 				VALUES
-					($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, nextval('messages_modseq'), $17, $18, $19, $20, $21, $22)
+					($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, nextval('messages_modseq'), $18, $19, $20, $21, $22, $23)
 				RETURNING id
 			)
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-			SELECT id, $2, $23, $24, NOW(), nextval('messages_modseq') FROM inserted
+			SELECT id, $2, $24, $25, NOW(), nextval('messages_modseq') FROM inserted
 			RETURNING message_id
 		`,
 			p.Opt.AccountID, mailboxID, p.SaneMailboxName, p.AssignedUID, p.SaneMessageID, p.Opt.ContentHash,
 			p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.InternalDate, p.Opt.Size, p.SaneSubject, p.Opt.SentDate,
-			p.SaneInReplyToStr, p.BodyStructureData, p.RecipientsJSON, uploaded, p.SubjectSort,
+			p.SaneInReplyToStr, p.SaneReferencesStr, p.BodyStructureData, p.RecipientsJSON, uploaded, p.SubjectSort,
 			p.FromNameSort, p.FromEmailSort, p.ToNameSort, p.ToEmailSort, p.CcEmailSort,
 			p.BitwiseFlags, p.CustomKeywordsJSON,
 		)
