@@ -33,14 +33,16 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	// This avoids expensive window functions when mailbox is idle
 	var currentModSeq uint64
 	var messageCount int
+	var uidNext uint32
 	err := db.GetReadPool().QueryRow(ctx, `
 		SELECT
 			COALESCE(ms.highest_modseq, 0) AS highest_modseq,
-			COALESCE(ms.message_count, 0) AS message_count
+			COALESCE(ms.message_count, 0) AS message_count,
+			mb.highest_uid
 		FROM mailboxes mb
 		LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
 		WHERE mb.id = $1
-	`, mailboxID).Scan(&currentModSeq, &messageCount)
+	`, mailboxID).Scan(&currentModSeq, &messageCount, &uidNext)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Mailbox was deleted while session was active
@@ -140,26 +142,49 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	}
 
 	// Phase 2: Dynamic Sequence Hydration
-	// For small update sets (K <= 50), it is vastly faster to let PostgreSQL count index tuples
-	// entirely in the database engine via batched requests, rather than streaming potentially
-	// 100,000 rows across the network to Go just to find the sequence number of 1 changed message.
-	// For dense updates, we fall back to a single sequential O(N) stream to avoid O(K*N) Postgres load.
+	// Using Bidirectional Sequence Counting: If the requested UID is in the second half of the mailbox,
+	// we count BACKWARDS from the total active message count instead of FORWARDS from zero.
+	// This reduces O(N) index scans down to O(1) for recent updates.
+	// For dense updates, we fall back to a single sequential stream to avoid O(K*N) Postgres load.
 
 	if len(rawUpdates) <= 50 {
 		batch := &pgx.Batch{}
 		for _, u := range rawUpdates {
 			if !u.IsExpunge {
-				// Base sequence number: count of active messages with UID <= target
-				batch.Queue(`
-					SELECT COUNT(*) FROM messages 
-					WHERE mailbox_id = $1 AND expunged_at IS NULL AND uid <= $2
-				`, mailboxID, u.UID)
+				if uint32(u.UID) > (uidNext / 2) {
+					// Count backwards: TotalActive - COUNT(Active > Target)
+					batch.Queue(`
+						SELECT $1::int - COUNT(*)::int FROM messages 
+						WHERE mailbox_id = $2 AND expunged_at IS NULL AND uid > $3
+					`, messageCount, mailboxID, u.UID)
+				} else {
+					// Count forwards: COUNT(Active <= Target)
+					batch.Queue(`
+						SELECT COUNT(*)::int FROM messages 
+						WHERE mailbox_id = $1 AND expunged_at IS NULL AND uid <= $2
+					`, mailboxID, u.UID)
+				}
 			} else {
-				// Expunged sequence number includes messages that were expunged in this poll window
-				batch.Queue(`
-					SELECT COUNT(*) FROM messages
-					WHERE mailbox_id = $1 AND (expunged_at IS NULL OR expunged_modseq > $2) AND uid <= $3
-				`, mailboxID, sinceModSeq, u.UID)
+				if uint32(u.UID) > (uidNext / 2) {
+					// Expunged backward count:
+					// ClientTotal = TotalActive + COUNT(ExpungedSinceModSeq)
+					// ClientMessagesAfter = COUNT((Active OR ExpungedSinceModSeq) AND uid > Target)
+					// SeqNum = ClientTotal - ClientMessagesAfter
+					batch.Queue(`
+						SELECT (
+							$1::int + 
+							(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $2 AND expunged_at IS NOT NULL AND expunged_modseq > $3)
+						) - COUNT(*)::int 
+						FROM messages
+						WHERE mailbox_id = $2 AND (expunged_at IS NULL OR expunged_modseq > $3) AND uid > $4
+					`, messageCount, mailboxID, sinceModSeq, u.UID)
+				} else {
+					// Expunged forward count
+					batch.Queue(`
+						SELECT COUNT(*)::int FROM messages
+						WHERE mailbox_id = $1 AND (expunged_at IS NULL OR expunged_modseq > $2) AND uid <= $3
+					`, mailboxID, sinceModSeq, u.UID)
+				}
 			}
 		}
 

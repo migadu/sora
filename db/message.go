@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -781,57 +782,86 @@ func hydrateSequencesCore[T any](
 		uids = append(uids, int64(uid))
 	}
 
+	var messageCount int
+	var uidNext uint32
+
+	// Fetch mailbox stats for bidirectional sweep decision.
+	// On deadlock/lock timeout, gracefully fall back to forward sweep.
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT COALESCE(ms.message_count, 0), COALESCE(mb.highest_uid, 1)
+		FROM mailboxes mb
+		LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
+		WHERE mb.id = $1
+	`, mailboxID).Scan(&messageCount, &uidNext)
+
+	useForwardSweep := true // Default to forward sweep
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Mailbox doesn't exist - this is a real error
+			return fmt.Errorf("mailbox %d not found for sequence hydration", mailboxID)
+		}
+		// On deadlock or other transient errors, fall back to forward sweep
+		// This prevents test flakiness during concurrent execution
+		uidNext = maxUID + 1
+		messageCount = 0
+	} else {
+		// Bidirectional Sweep Sequence Hydration
+		// Determine whether a forward sweep or backward sweep is more efficient
+		// by estimating which boundary the requested UIDs are closer to.
+		// We compare the UID range position against the mailbox midpoint.
+		midpoint := uidNext / 2
+
+		// Use the minimum requested UID to determine direction:
+		// If min requested UID is in first half, scan forward; otherwise scan backward
+		useForwardSweep = minUID <= midpoint
+	}
+
 	var query string
-	if len(messages) >= 1000 {
-		// High-performance sweeping sequence hydration for large results.
-		// Instead of N individual index scans, we calculate sequences for the mailbox
-		// up to the highest requested UID using a single index scan and ROW_NUMBER(),
-		// then join against the requested UIDs.
+	var args []interface{}
+
+	if useForwardSweep {
+		// Forward Sweep (Faster for older messages)
 		query = `
 			WITH range_bounds AS (
-				SELECT MAX(uid) as max_uid 
+				SELECT MAX(uid) as max_uid
 				FROM unnest($2::bigint[]) as t(uid)
 			),
 			all_uids AS (
 				SELECT m.uid, ROW_NUMBER() OVER(ORDER BY m.uid) as seqnum
 				FROM messages m
 				CROSS JOIN range_bounds
-				WHERE m.mailbox_id = $1 
-				  AND m.expunged_at IS NULL 
+				WHERE m.mailbox_id = $1
+				  AND m.expunged_at IS NULL
 				  AND m.uid <= range_bounds.max_uid
 			)
 			SELECT a.uid, a.seqnum
 			FROM all_uids a
 			JOIN unnest($2::bigint[]) t(uid) ON a.uid = t.uid
 		`
+		args = []interface{}{mailboxID, uids}
 	} else {
-		// Extremely fast gap-based hydration for small sets of UIDs (<1000).
-		// By calculating the delta (gap) between consecutive UIDs and computing a running sum,
-		// we avoid the O(N) ROW_NUMBER sweep which could be slow for huge mailboxes.
+		// Backward Sweep (Faster for recent messages, utilizing exact O(1) messageCount)
 		query = `
-			WITH target_uids AS (
-				SELECT uid,
-					   LAG(uid, 1, 0::bigint) OVER (ORDER BY uid) as prev_uid
+			WITH range_bounds AS (
+				SELECT MIN(uid) as min_uid
 				FROM unnest($2::bigint[]) as t(uid)
 			),
-			gaps AS (
-				SELECT t.uid,
-					   (SELECT COUNT(*)::bigint 
-						FROM messages m 
-						WHERE m.mailbox_id = $1 
-						  AND m.expunged_at IS NULL 
-						  AND m.uid > t.prev_uid 
-						  AND m.uid <= t.uid
-					   ) as gap_count
-				FROM target_uids t
+			all_uids AS (
+				SELECT m.uid, $3::int - ROW_NUMBER() OVER(ORDER BY m.uid DESC) + 1 as seqnum
+				FROM messages m
+				CROSS JOIN range_bounds
+				WHERE m.mailbox_id = $1
+				  AND m.expunged_at IS NULL
+				  AND m.uid >= range_bounds.min_uid
 			)
-			SELECT uid,
-				   SUM(gap_count) OVER (ORDER BY uid)::bigint as seqnum
-			FROM gaps
+			SELECT a.uid, a.seqnum
+			FROM all_uids a
+			JOIN unnest($2::bigint[]) t(uid) ON a.uid = t.uid
 		`
+		args = []interface{}{mailboxID, uids, messageCount}
 	}
 
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, uids)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
 
 	if err != nil {
 		return fmt.Errorf("failed to query sequence streams: %w", err)
