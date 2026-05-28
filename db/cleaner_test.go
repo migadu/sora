@@ -340,7 +340,7 @@ func TestGetUserScopedObjectsForCleanup(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test: Get objects for cleanup (older than 24 hours)
-	candidates, err := db.GetUserScopedObjectsForCleanup(ctx, 24*time.Hour, 10)
+	candidates, err := db.GetUserScopedObjectsForCleanup(ctx, 24*time.Hour, 1000)
 	require.NoError(t, err)
 
 	t.Logf("Found %d candidates for cleanup", len(candidates))

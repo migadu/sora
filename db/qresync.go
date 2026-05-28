@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
@@ -207,4 +208,62 @@ func (d *Database) ValidateQResyncUIDValidity(ctx context.Context, mailboxID int
 
 func (d *Database) ValidateQResyncUIDValidityWithRetry(ctx context.Context, mailboxID int64, clientUIDValidity uint32) (bool, error) {
 	return d.ValidateQResyncUIDValidity(ctx, mailboxID, clientUIDValidity)
+}
+
+// GetActiveUIDsInSet returns the active (non-expunged) UIDs in the mailbox that fall within the given UIDSet.
+// This is used for QRESYNC SELECT to efficiently check which of the client's known UIDs are still active.
+func (d *Database) GetActiveUIDsInSet(ctx context.Context, mailboxID int64, uidSet imap.UIDSet) ([]imap.UID, error) {
+	if len(uidSet) == 0 {
+		return nil, nil
+	}
+
+	var conditions []string
+	var args []any
+	args = append(args, mailboxID)
+
+	for _, uidRange := range uidSet {
+		if uidRange.Stop == imap.UID(0) || uidRange.Start == uidRange.Stop {
+			args = append(args, int64(uidRange.Start))
+			conditions = append(conditions, fmt.Sprintf("uid = $%d", len(args)))
+		} else {
+			args = append(args, int64(uidRange.Start), int64(uidRange.Stop))
+			conditions = append(conditions, fmt.Sprintf("(uid >= $%d AND uid <= $%d)", len(args)-1, len(args)))
+		}
+	}
+
+	whereClause := strings.Join(conditions, " OR ")
+
+	query := fmt.Sprintf(`
+		SELECT uid
+		FROM messages
+		WHERE mailbox_id = $1
+		  AND expunged_at IS NULL
+		  AND (%s)
+		ORDER BY uid
+	`, whereClause)
+
+	rows, err := d.GetReadPool().Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active UIDs in set: %w", err)
+	}
+	defer rows.Close()
+
+	var uids []imap.UID
+	for rows.Next() {
+		var uid uint32
+		if err := rows.Scan(&uid); err != nil {
+			return nil, fmt.Errorf("failed to scan active UID: %w", err)
+		}
+		uids = append(uids, imap.UID(uid))
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating active UIDs in set: %w", err)
+	}
+
+	return uids, nil
+}
+
+func (d *Database) GetActiveUIDsInSetWithRetry(ctx context.Context, mailboxID int64, uidSet imap.UIDSet) ([]imap.UID, error) {
+	return d.GetActiveUIDsInSet(ctx, mailboxID, uidSet)
 }

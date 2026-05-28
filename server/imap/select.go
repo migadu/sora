@@ -250,11 +250,50 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		}
 
 		// Get vanished UIDs since client's last modseq
-		vanishedUIDs, err := s.server.rdb.GetVanishedUIDsWithRetry(readCtx, mailbox.ID, qr.ModSeq, selectData.HighestModSeq)
-		if err != nil {
-			s.WarnLog("failed to get vanished UIDs for QRESYNC", "err", err)
-			// Don't fail the SELECT - just omit VANISHED response
-		} else if len(vanishedUIDs) > 0 {
+		var vanishedUIDs []imap.UID
+		if len(qr.KnownUIDs) > 0 {
+			// Compute vanished UIDs by comparing KnownUIDs with active UIDs in the database.
+			// This is 100% accurate, handles cleaner purges, and prevents sequence staleness bugs.
+			activeUIDs, err := s.server.rdb.GetActiveUIDsInSetWithRetry(readCtx, mailbox.ID, qr.KnownUIDs)
+			if err != nil {
+				s.WarnLog("failed to get active UIDs for QRESYNC", "err", err)
+				// Fallback to database vanished log history
+				vanishedUIDs, err = s.server.rdb.GetVanishedUIDsWithRetry(readCtx, mailbox.ID, qr.ModSeq, selectData.HighestModSeq)
+				if err != nil {
+					s.WarnLog("failed to get vanished UIDs fallback for QRESYNC", "err", err)
+				}
+			} else {
+				// Convert active UIDs slice to a set for O(1) checks
+				activeMap := make(map[imap.UID]struct{}, len(activeUIDs))
+				for _, uid := range activeUIDs {
+					activeMap[uid] = struct{}{}
+				}
+
+				// Find which of the client's known UIDs are no longer active
+				uidNext := selectData.UIDNext
+				for _, r := range qr.KnownUIDs {
+					start := r.Start
+					stop := r.Stop
+					if uidNext > 0 && stop >= uidNext {
+						stop = uidNext - 1
+					}
+					for uid := start; uid <= stop; uid++ {
+						if _, ok := activeMap[uid]; !ok {
+							vanishedUIDs = append(vanishedUIDs, uid)
+						}
+					}
+				}
+			}
+		} else {
+			// Fallback to database vanished log history when KnownUIDs is empty
+			var err error
+			vanishedUIDs, err = s.server.rdb.GetVanishedUIDsWithRetry(readCtx, mailbox.ID, qr.ModSeq, selectData.HighestModSeq)
+			if err != nil {
+				s.WarnLog("failed to get vanished UIDs for QRESYNC", "err", err)
+			}
+		}
+
+		if len(vanishedUIDs) > 0 {
 			// Convert UIDs to optimized ranges
 			selectData.Vanished = convertUIDsToRanges(vanishedUIDs)
 			s.DebugLog("QRESYNC VANISHED", "count", len(vanishedUIDs), "ranges", len(selectData.Vanished))
@@ -271,6 +310,10 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 
 			// For QRESYNC, we report messages that still exist (not expunged)
 			for _, msg := range changedMsgs {
+				if msg.SeqNum == 0 {
+					s.WarnLog("skipping modified message with invalid sequence number 0", "uid", msg.UID)
+					continue
+				}
 				selectData.Modified = append(selectData.Modified, imap.SelectModifiedData{
 					SeqNum: msg.SeqNum,
 					UID:    msg.UID,

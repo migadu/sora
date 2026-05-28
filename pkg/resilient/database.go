@@ -1590,3 +1590,15 @@ func (rd *ResilientDatabase) ValidateQResyncUIDValidityWithRetry(ctx context.Con
 	}
 	return result.(bool), nil
 }
+
+// GetActiveUIDsInSetWithRetry returns the active UIDs in the mailbox that fall within the given UIDSet.
+func (rd *ResilientDatabase) GetActiveUIDsInSetWithRetry(ctx context.Context, mailboxID int64, uidSet imap.UIDSet) ([]imap.UID, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetActiveUIDsInSet(ctx, mailboxID, uidSet)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]imap.UID), nil
+}

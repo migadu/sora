@@ -134,12 +134,28 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 			s.WarnLog("failed to retrieve vanished UIDs", "error", err)
 			// Don't fail the FETCH - just continue without VANISHED response
 		} else if len(vanishedUIDs) > 0 {
-			// Convert UIDs to ranges for efficient transmission
-			uidSet := convertUIDsToRanges(vanishedUIDs)
-			// RFC 7162 §3.2.6: VANISHED (EARLIER) response must appear before FETCH responses
-			// The 'true' parameter indicates this is sent before FETCH responses
-			w.WriteVanished(uidSet, true)
-			s.DebugLog("wrote VANISHED response", "count", len(vanishedUIDs))
+			// RFC 7162 §3.2.4.1: The VANISHED Fetch modifier only returns vanished responses
+			// for messages IN the requested UID set. Filter to subset.
+			var filteredUIDs []imap.UID
+			if uidSet, ok := numSet.(imap.UIDSet); ok {
+				for _, uid := range vanishedUIDs {
+					if uidSet.Contains(uid) {
+						filteredUIDs = append(filteredUIDs, uid)
+					}
+				}
+			} else {
+				// Fallback (for SeqSet fetch which shouldn't have VANISHED modifier by spec)
+				filteredUIDs = vanishedUIDs
+			}
+
+			if len(filteredUIDs) > 0 {
+				// Convert UIDs to ranges for efficient transmission
+				uidSet := convertUIDsToRanges(filteredUIDs)
+				// RFC 7162 §3.2.6: VANISHED (EARLIER) response must appear before FETCH responses
+				// The 'true' parameter indicates this is sent before FETCH responses
+				w.WriteVanished(uidSet, true)
+				s.DebugLog("wrote VANISHED response", "count", len(filteredUIDs))
+			}
 		}
 	} else if options.Vanished {
 		// VANISHED modifier used without QRESYNC or ChangedSince - protocol violation

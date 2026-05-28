@@ -442,6 +442,222 @@ func TestIMAP_FetchVanished(t *testing.T) {
 	t.Log("✅ FETCH VANISHED test completed")
 }
 
+// TestIMAP_QResyncSequenceNumberStaleness validates that QRESYNC Modified responses
+// contain sequence numbers based on CURRENT mailbox state (not historical state).
+// This is the CORRECT behavior per RFC 7162 §3.2.5.
+//
+// Test scenario:
+// 1. Client syncs at modseq 1636 with messages [1,2,3,4,5] at seqnums [1,2,3,4,5]
+// 2. Message 3 gets flag change at modseq 1637
+// 3. Message 1 gets expunged at modseq 1639
+// 4. Client QRESYNCs with modseq 1636 (their last known state)
+// 5. Server returns:
+//   - VANISHED: UID 1 (tells client to remove UID 1 from cache)
+//   - Modified: UID 3, seqnum 2 (CURRENT state after expunge)
+//
+// 6. Client processes VANISHED first → removes UID 1 → shifts seqnums down
+// 7. Client processes Modified → UID 3 at seqnum 2 matches their updated cache
+// 8. Result: NO stuttering, cache stays synchronized
+//
+// This test validates that sequence numbers reflect CURRENT state, which combined
+// with accurate VANISHED responses (via set subtraction), prevents Apple Mail stuttering.
+func TestIMAP_QResyncSequenceNumberStaleness(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Enable QRESYNC
+	t.Log("=== Enabling QRESYNC ===")
+	enableCmd := c.Enable(imap.CapQResync)
+	enableData, err := enableCmd.Wait()
+	if err != nil {
+		t.Fatalf("ENABLE QRESYNC failed: %v", err)
+	}
+	if !enableData.Caps.Has(imap.CapQResync) {
+		t.Fatal("Server did not enable QRESYNC capability")
+	}
+
+	// Initial SELECT
+	mbox, err := c.Select("INBOX", &imap.SelectOptions{}).Wait()
+	if err != nil {
+		t.Fatalf("Initial SELECT failed: %v", err)
+	}
+	t.Logf("Initial: UIDValidity=%d, HighestModSeq=%d", mbox.UIDValidity, mbox.HighestModSeq)
+
+	initialUIDValidity := mbox.UIDValidity
+
+	// Step 1: Append 5 messages to establish baseline
+	t.Log("=== Step 1: Appending 5 messages ===")
+	var uids []imap.UID
+	for i := 1; i <= 5; i++ {
+		msg := fmt.Sprintf("From: sender@example.com\r\n"+
+			"To: %s\r\n"+
+			"Subject: Message %d\r\n"+
+			"Date: %s\r\n"+
+			"\r\n"+
+			"Body %d\r\n", account.Email, i, time.Now().Format(time.RFC1123Z), i)
+
+		appendCmd := c.Append("INBOX", int64(len(msg)), nil)
+		appendCmd.Write([]byte(msg))
+		appendCmd.Close()
+		appendData, err := appendCmd.Wait()
+		if err != nil {
+			t.Fatalf("APPEND %d failed: %v", i, err)
+		}
+		uids = append(uids, appendData.UID)
+		t.Logf("  Appended UID %d (will be seqnum %d)", appendData.UID, i)
+	}
+
+	// Step 2: SELECT to get baseline state (simulate client's last sync)
+	t.Log("=== Step 2: SELECT to capture baseline state (client's last sync) ===")
+	mbox, err = c.Select("INBOX", &imap.SelectOptions{}).Wait()
+	if err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	clientLastModSeq := mbox.HighestModSeq
+	t.Logf("Client's last sync: ModSeq=%d, Messages=%d", clientLastModSeq, mbox.NumMessages)
+	t.Logf("  Expected seqnums: UID %d=seq1, UID %d=seq2, UID %d=seq3, UID %d=seq4, UID %d=seq5",
+		uids[0], uids[1], uids[2], uids[3], uids[4])
+
+	// Record the original sequence number for UID 3 (message 3)
+	originalSeqForUID3 := uint32(3)
+
+	// Step 3: Modify message 3 (change flags) - this should be in Modified response
+	t.Logf("=== Step 3: Marking message 3 (UID %d) as \\Seen ===", uids[2])
+	storeCmd := c.Store(imap.SeqSetNum(3), &imap.StoreFlags{
+		Op:    imap.StoreFlagsAdd,
+		Flags: []imap.Flag{imap.FlagSeen},
+	}, nil)
+	if err := storeCmd.Close(); err != nil {
+		t.Fatalf("STORE failed: %v", err)
+	}
+	t.Log("  Message 3 flag changed (creates modseq > clientLastModSeq)")
+
+	// Step 4: Expunge message 1 - this changes sequence numbers for all remaining messages
+	t.Logf("=== Step 4: Expunging message 1 (UID %d) ===", uids[0])
+	storeCmd = c.Store(imap.SeqSetNum(1), &imap.StoreFlags{
+		Op:    imap.StoreFlagsSet,
+		Flags: []imap.Flag{imap.FlagDeleted},
+	}, nil)
+	if err := storeCmd.Close(); err != nil {
+		t.Fatalf("STORE \\Deleted failed: %v", err)
+	}
+
+	expungeCmd := c.Expunge()
+	if err := expungeCmd.Close(); err != nil {
+		t.Fatalf("EXPUNGE failed: %v", err)
+	}
+	t.Logf("  Message 1 expunged - sequence numbers shifted down!")
+	t.Logf("  NEW seqnums: UID %d=seq1, UID %d=seq2, UID %d=seq3, UID %d=seq4",
+		uids[1], uids[2], uids[3], uids[4])
+	t.Logf("  ⚠️  UID %d moved from seq3 → seq2", uids[2])
+
+	// Step 5: Client performs QRESYNC with their last known modseq
+	t.Logf("=== Step 5: Client QRESYNC with modseq=%d (before flag change) ===", clientLastModSeq)
+	qresyncMbox, err := c.Select("INBOX", &imap.SelectOptions{
+		QResync: &imap.QResyncData{
+			UIDValidity: initialUIDValidity,
+			ModSeq:      clientLastModSeq,
+		},
+	}).Wait()
+	if err != nil {
+		t.Fatalf("QRESYNC SELECT failed: %v", err)
+	}
+
+	t.Logf("QRESYNC response:")
+	t.Logf("  NumMessages=%d, HighestModSeq=%d", qresyncMbox.NumMessages, qresyncMbox.HighestModSeq)
+	t.Logf("  Vanished=%v", qresyncMbox.Vanished)
+	t.Logf("  Modified messages=%d", len(qresyncMbox.Modified))
+
+	// Step 6: Analyze the bug
+	t.Log("=== Step 6: Analyzing sequence number staleness ===")
+
+	// Check VANISHED includes UID 1
+	foundUID1Vanished := false
+	for _, uidRange := range qresyncMbox.Vanished {
+		if uids[0] >= uidRange.Start && uids[0] <= uidRange.Stop {
+			foundUID1Vanished = true
+			break
+		}
+	}
+	if !foundUID1Vanished {
+		t.Errorf("❌ VANISHED missing UID %d (message 1)", uids[0])
+	} else {
+		t.Logf("✅ VANISHED includes UID %d", uids[0])
+	}
+
+	// Check Modified includes UID 3 with CURRENT sequence number
+	foundUID3Modified := false
+	var uid3SeqInModified uint32
+	for _, mod := range qresyncMbox.Modified {
+		if mod.UID == uids[2] {
+			foundUID3Modified = true
+			uid3SeqInModified = mod.SeqNum
+			t.Logf("Modified: UID %d reported at SeqNum=%d, ModSeq=%d, Flags=%v",
+				mod.UID, mod.SeqNum, mod.ModSeq, mod.Flags)
+			break
+		}
+	}
+
+	if !foundUID3Modified {
+		t.Fatalf("❌ Modified missing UID %d (message 3 with flag change)", uids[2])
+	}
+
+	// VALIDATION: Server correctly reports CURRENT seqnum (not historical)
+	t.Log("\n=== VALIDATION: Sequence Numbers Reflect Current State ===")
+	t.Logf("Client's historical state (at modseq %d):", clientLastModSeq)
+	t.Logf("  UID %d was at SeqNum=%d", uids[2], originalSeqForUID3)
+	t.Logf("Server's response (CURRENT state after expunge):")
+	t.Logf("  UID %d reported at SeqNum=%d", uids[2], uid3SeqInModified)
+
+	if uid3SeqInModified != originalSeqForUID3 {
+		t.Logf("\n✅ CORRECT: Sequence numbers reflect CURRENT state (not historical)")
+		t.Logf("   Historical SeqNum=%d (client's last sync state)", originalSeqForUID3)
+		t.Logf("   Current SeqNum=%d (after VANISHED UID 1 processed)", uid3SeqInModified)
+		t.Logf("\n   RFC 7162 §3.2.5 Protocol Flow:")
+		t.Logf("   1. Client receives VANISHED: UID 1")
+		t.Logf("   2. Client processes VANISHED → removes UID 1 → shifts seqnums down")
+		t.Logf("   3. Client receives Modified: UID %d at seqnum %d", uids[2], uid3SeqInModified)
+		t.Logf("   4. Client's cache now matches server state → NO stuttering")
+		t.Logf("\n   This is the CORRECT behavior - sequence numbers are current,")
+		t.Logf("   and VANISHED response ensures client cache stays synchronized.")
+	} else {
+		t.Errorf("❌ UNEXPECTED: Sequence numbers match historical state")
+		t.Errorf("   This would indicate sequence numbers are not being computed correctly")
+	}
+
+	// Additional check: Verify current state by fetching
+	t.Log("\n=== Verification: Fetch current message at seqnum 2 ===")
+	fetchCmd := c.Fetch(imap.SeqSetNum(2), &imap.FetchOptions{
+		UID:   true,
+		Flags: true,
+	})
+	fetchMsgs, err := fetchCmd.Collect()
+	if err != nil {
+		t.Fatalf("FETCH failed: %v", err)
+	}
+	if len(fetchMsgs) == 1 {
+		t.Logf("Current message at seqnum 2: UID=%d, Flags=%v",
+			fetchMsgs[0].UID, fetchMsgs[0].Flags)
+		if fetchMsgs[0].UID == uids[2] {
+			t.Logf("✅ Confirms UID %d is NOW at seqnum 2 (after expunge)", uids[2])
+		}
+	}
+
+	t.Log("\n=== Test completed - QRESYNC behavior validated as correct ===")
+}
+
 // TestIMAP_QResyncEmptyMailbox tests QRESYNC with empty mailbox
 func TestIMAP_QResyncEmptyMailbox(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
