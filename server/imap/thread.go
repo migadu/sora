@@ -37,7 +37,9 @@ func (s *IMAPSession) Thread(numKind imapserver.NumKind, algorithm imap.ThreadAl
 	case imap.ThreadOrderedSubject:
 		return s.threadOrderedSubject(numKind, messages), nil
 	case imap.ThreadReferences:
-		return s.threadReferences(numKind, messages), nil
+		return s.threadReferences(numKind, messages, false), nil
+	case imap.ThreadRefs:
+		return s.threadReferences(numKind, messages, true), nil
 	default:
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeBad,
@@ -116,7 +118,7 @@ type jwzNode struct {
 }
 
 // threadReferences implements the REFERENCES threading algorithm (RFC 5256 section 2.2 / JWZ algorithm)
-func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db.ThreadMessageResult) []imap.ThreadData {
+func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db.ThreadMessageResult, skipSubjectGrouping bool) []imap.ThreadData {
 	// The JWZ algorithm:
 	// 1. Group by Message-ID
 	idTable := make(map[string]*jwzNode)
@@ -219,7 +221,83 @@ func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db
 		}
 	}
 
-	// 5. Sort root nodes
+	// 5. Subject Grouping (RFC 5256 JWZ algorithm phase 5)
+	if !skipSubjectGrouping {
+		subjectTable := make(map[string]*jwzNode)
+
+		for _, root := range rootNodes {
+			// Only consider nodes that are still roots (might have been merged in this loop)
+			if root.parent != nil {
+				continue
+			}
+
+			subj := getSubject(root)
+			if subj == "" {
+				continue
+			}
+
+			existing, ok := subjectTable[subj]
+			if !ok || existing == root {
+				subjectTable[subj] = root
+				continue
+			}
+
+			// Merge root and existing
+			if existing.msg == nil && root.msg == nil {
+				// Both are dummies: merge root's children into existing
+				for _, child := range root.children {
+					child.parent = existing
+					existing.children = append(existing.children, child)
+				}
+				root.children = nil // effectively discarded
+			} else if existing.msg == nil || root.msg == nil {
+				// One is dummy: make it the parent of the real one
+				var dummy, real *jwzNode
+				if existing.msg == nil {
+					dummy, real = existing, root
+				} else {
+					dummy, real = root, existing
+					subjectTable[subj] = dummy
+				}
+				real.parent = dummy
+				dummy.children = append(dummy.children, real)
+			} else {
+				// Neither is dummy: create new dummy to parent both
+				newDummy := &jwzNode{}
+				existing.parent = newDummy
+				root.parent = newDummy
+				newDummy.children = append(newDummy.children, existing, root)
+				subjectTable[subj] = newDummy
+			}
+		}
+
+		// Rebuild rootNodes to include any newly created dummies and exclude merged nodes
+		var newRoots []*jwzNode
+		seen := make(map[*jwzNode]bool)
+
+		for _, root := range rootNodes {
+			if root.parent == nil {
+				if root.msg == nil && len(root.children) == 0 {
+					continue // Discarded dummy
+				}
+				if !seen[root] {
+					newRoots = append(newRoots, root)
+					seen[root] = true
+				}
+			}
+		}
+		for _, node := range subjectTable {
+			if node.parent == nil {
+				if !seen[node] {
+					newRoots = append(newRoots, node)
+					seen[node] = true
+				}
+			}
+		}
+		rootNodes = newRoots
+	}
+
+	// 6. Sort root nodes
 	sort.Slice(rootNodes, func(i, j int) bool {
 		dateI := getEarliestDate(rootNodes[i])
 		dateJ := getEarliestDate(rootNodes[j])
@@ -246,6 +324,18 @@ func (s *IMAPSession) getMessageID(numKind imapserver.NumKind, msg db.ThreadMess
 		return uint32(msg.UID)
 	}
 	return msg.Seq
+}
+
+func getSubject(node *jwzNode) string {
+	if node.msg != nil {
+		return node.msg.SubjectSort
+	}
+	for _, child := range node.children {
+		if s := getSubject(child); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 func isAncestor(child, parent *jwzNode) bool {

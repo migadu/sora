@@ -545,6 +545,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			imap.CapNamespace:                 struct{}{},
 			imap.CapMetadata:                  struct{}{},
 			imap.Cap("THREAD=REFERENCES"):     struct{}{},
+			imap.Cap("THREAD=REFS"):           struct{}{},
 			imap.Cap("THREAD=ORDEREDSUBJECT"): struct{}{},
 			imap.Cap("MULTISEARCH"):           struct{}{},
 		},
