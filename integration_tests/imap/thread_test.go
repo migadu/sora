@@ -129,4 +129,28 @@ func TestIMAP_Thread_Integration(t *testing.T) {
 			t.Errorf("Expected second thread to have chain [4], got %v", res[1].Chain)
 		}
 	})
+
+	t.Run("WITH_SEARCH_CRITERIA", func(t *testing.T) {
+		// Test filtering using a body search (maps to messages_fts 'mc' alias)
+		// and a flag search (maps to message_state 'ms' alias)
+		opts := &imapclient.ThreadOptions{
+			Algorithm: imap.ThreadReferences,
+			SearchCriteria: &imap.SearchCriteria{
+				NotFlag: []imap.Flag{imap.FlagDeleted}, // Requires ms alias to prove the SQL syntax is correct
+			},
+		}
+
+		res, err := c.UIDThread(opts).Wait()
+		if err != nil {
+			t.Fatalf("UID THREAD WITH_SEARCH_CRITERIA failed: %v", err)
+		}
+
+		if len(res) != 2 {
+			t.Fatalf("Expected 2 thread result, got %d", len(res))
+		}
+
+		if len(res[0].Chain) != 3 {
+			t.Errorf("Expected first thread to have chain of 3, got %v", res[0].Chain)
+		}
+	})
 }

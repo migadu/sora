@@ -45,6 +45,8 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64
 		latest_msgs AS (
 			SELECT m.uid, m.message_id, m.in_reply_to, m."references", m.subject_sort, m.sent_date
 			FROM messages m
+			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+			LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
 			WHERE m.mailbox_id = @mailbox_id
 			  AND m.expunged_at IS NULL
 			  AND %s
