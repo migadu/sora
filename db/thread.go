@@ -27,7 +27,7 @@ const ThreadMaxMessages = 5000
 
 // GetMessagesForThreading executes a query to retrieve threading metadata for all matching messages.
 // It leverages idx_messages_mailbox_dates_uid for high performance index-only scans.
-func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria) ([]ThreadMessageResult, error) {
+func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, includeSubject bool) ([]ThreadMessageResult, error) {
 	paramCounter := 0
 	whereClause, whereArgs, err := db.buildSearchCriteria(criteria, "m", &paramCounter)
 	if err != nil {
@@ -36,6 +36,12 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64
 
 	whereArgs["mailbox_id"] = mailboxID
 
+	subjectSelect1 := `'' AS subject_sort`
+	subjectSelect2 := `l.subject_sort`
+	if includeSubject {
+		subjectSelect1 = `m.subject_sort`
+	}
+
 	finalQueryString := fmt.Sprintf(`
 		WITH seq AS (
 			SELECT uid, ROW_NUMBER() OVER(ORDER BY uid ASC) as seqnum
@@ -43,7 +49,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64
 			WHERE mailbox_id = @mailbox_id AND expunged_at IS NULL
 		),
 		latest_msgs AS (
-			SELECT m.uid, m.message_id, m.in_reply_to, m."references", m.subject_sort, m.sent_date
+			SELECT m.uid, m.message_id, m.in_reply_to, m."references", %s, m.sent_date
 			FROM messages m
 			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 			LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
@@ -53,11 +59,11 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64
 			ORDER BY m.uid DESC
 			LIMIT %d
 		)
-		SELECT l.uid, l.message_id, l.in_reply_to, l."references", l.subject_sort, l.sent_date, seq.seqnum
+		SELECT l.uid, l.message_id, l.in_reply_to, l."references", %s, l.sent_date, seq.seqnum
 		FROM latest_msgs l
 		JOIN seq ON l.uid = seq.uid
 		ORDER BY l.uid ASC
-	`, whereClause, ThreadMaxMessages)
+	`, subjectSelect1, whereClause, ThreadMaxMessages, subjectSelect2)
 
 	start := time.Now()
 	rows, err := db.ReadPool.Query(ctx, finalQueryString, whereArgs)

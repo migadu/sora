@@ -57,6 +57,10 @@ func TestIMAP_Thread_Integration(t *testing.T) {
 			body: "Message-ID: <msg4@example.com>\r\nSubject: Unrelated\r\n\r\nDifferent thread",
 			date: time.Now().Add(-1 * time.Hour),
 		},
+		{
+			body: "Message-ID: <msg5@example.com>\r\nSubject: Test Thread\r\n\r\nDisconnected but same subject",
+			date: time.Now(),
+		},
 	}
 
 	for _, msg := range messages {
@@ -88,12 +92,12 @@ func TestIMAP_Thread_Integration(t *testing.T) {
 			t.Fatalf("Expected 2 threads, got %d", len(res))
 		}
 
-		// First thread should be the "Test Thread" (UIDs 1, 2, 3)
-		if len(res[0].Chain) != 3 {
-			t.Errorf("Expected first thread to have 3 messages in chain, got %d", len(res[0].Chain))
+		// First thread should be the "Test Thread" (UIDs 1, 2, 3) AND 5 (since it shares the subject)
+		if len(res[0].Chain) != 4 {
+			t.Errorf("Expected first thread to have 4 messages in chain, got %d", len(res[0].Chain))
 		} else {
-			if res[0].Chain[0] != 1 || res[0].Chain[1] != 2 || res[0].Chain[2] != 3 {
-				t.Errorf("Expected chain [1 2 3], got %v", res[0].Chain)
+			if res[0].Chain[0] != 1 || res[0].Chain[1] != 2 || res[0].Chain[2] != 3 || res[0].Chain[3] != 5 {
+				t.Errorf("Expected chain [1 2 3 5], got %v", res[0].Chain)
 			}
 		}
 
@@ -121,12 +125,58 @@ func TestIMAP_Thread_Integration(t *testing.T) {
 		// First thread: 1 -> 2 -> 3
 		// Since it's a linear chain of replies (each has 1 child), the JWZ builder
 		// should collapse them into a single Chain slice for efficiency.
-		if len(res[0].Chain) != 3 {
-			t.Errorf("Expected linear replies to collapse into chain of 3, got %d", len(res[0].Chain))
+		// However, Message 5 shares the subject "Test Thread", so it MUST be grouped into this thread under a dummy node.
+		if len(res[0].Chain) != 0 {
+			t.Errorf("Expected dummy root node (empty chain), got %v", res[0].Chain)
+		}
+		if len(res[0].SubThreads) != 2 {
+			t.Fatalf("Expected 2 subthreads under dummy node, got %d", len(res[0].SubThreads))
+		}
+
+		// SubThread 0: The linear chain 1->2->3
+		if len(res[0].SubThreads[0].Chain) != 3 {
+			t.Errorf("Expected linear replies to collapse into chain of 3, got %d", len(res[0].SubThreads[0].Chain))
+		}
+		// SubThread 1: The isolated message 5 that was grouped by subject
+		if len(res[0].SubThreads[1].Chain) != 1 || res[0].SubThreads[1].Chain[0] != 5 {
+			t.Errorf("Expected message 5 as second subthread, got %v", res[0].SubThreads[1].Chain)
 		}
 
 		if len(res[1].Chain) != 1 || res[1].Chain[0] != 4 {
 			t.Errorf("Expected second thread to have chain [4], got %v", res[1].Chain)
+		}
+	})
+
+	t.Run("REFS", func(t *testing.T) {
+		opts := &imapclient.ThreadOptions{
+			Algorithm:      imap.ThreadRefs,
+			SearchCriteria: &imap.SearchCriteria{},
+		}
+
+		res, err := c.UIDThread(opts).Wait()
+		if err != nil {
+			t.Fatalf("UID THREAD REFS failed: %v", err)
+		}
+
+		// REFS explicitly skips Subject Grouping.
+		// Therefore, Message 5 (which has the same subject but no ID link) MUST be placed in its own root thread!
+		if len(res) != 3 {
+			t.Fatalf("Expected 3 root threads for REFS, got %d", len(res))
+		}
+
+		// First thread: 1 -> 2 -> 3 (Linked by IDs)
+		if len(res[0].Chain) != 3 {
+			t.Errorf("Expected linear replies to collapse into chain of 3, got %d", len(res[0].Chain))
+		}
+
+		// Second thread: 4 (Isolated message)
+		if len(res[1].Chain) != 1 || res[1].Chain[0] != 4 {
+			t.Errorf("Expected thread for msg 4, got %v", res[1].Chain)
+		}
+
+		// Third thread: 5 (Isolated message, NOT grouped with 1,2,3)
+		if len(res[2].Chain) != 1 || res[2].Chain[0] != 5 {
+			t.Errorf("Expected thread for msg 5, got %v", res[2].Chain)
 		}
 	})
 
@@ -149,8 +199,11 @@ func TestIMAP_Thread_Integration(t *testing.T) {
 			t.Fatalf("Expected 2 thread result, got %d", len(res))
 		}
 
-		if len(res[0].Chain) != 3 {
-			t.Errorf("Expected first thread to have chain of 3, got %v", res[0].Chain)
+		if len(res[0].Chain) != 0 {
+			t.Errorf("Expected dummy root node (empty chain), got %v", res[0].Chain)
+		}
+		if len(res[0].SubThreads) != 2 {
+			t.Fatalf("Expected 2 subthreads, got %d", len(res[0].SubThreads))
 		}
 	})
 }

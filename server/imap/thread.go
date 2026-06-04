@@ -22,7 +22,8 @@ func (s *IMAPSession) Thread(numKind imapserver.NumKind, algorithm imap.ThreadAl
 		}
 	}
 
-	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(s.ctx, s.selectedMailbox.ID, criteria)
+	includeSubject := algorithm == imap.ThreadReferences || algorithm == imap.ThreadOrderedSubject
+	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(s.ctx, s.selectedMailbox.ID, criteria, includeSubject)
 	if err != nil {
 		logger.Error("Failed to fetch messages for threading", "err", err)
 		return nil, fmt.Errorf("failed to fetch messages for threading: %w", err)
