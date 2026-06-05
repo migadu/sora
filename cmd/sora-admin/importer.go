@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -931,7 +932,9 @@ func (i *Importer) printSummary() error {
 	return nil
 }
 
-// hashFile calculates the SHA256 hash of a file without loading it entirely into memory.
+// hashFile calculates the SHA256 hash of a file, decompressing if it's gzip compressed.
+// This streams the file content to handle potential gzip decompression without loading
+// the entire file into memory.
 func hashFile(path string) (string, int64, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -939,10 +942,35 @@ func hashFile(path string) (string, int64, error) {
 	}
 	defer file.Close()
 
-	hasher := sha256.New()
-	size, err := io.Copy(hasher, file)
-	if err != nil {
+	// Read magic bytes to check for gzip
+	magic := make([]byte, 2)
+	n, err := file.Read(magic)
+	if err != nil && err != io.EOF {
 		return "", 0, err
+	}
+
+	// Seek back to start
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", 0, err
+	}
+
+	var reader io.Reader = file
+
+	// If gzip magic number is present, wrap with gzip.Reader
+	if n == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+		gzReader, err := gzip.NewReader(file)
+		if err != nil {
+			return "", 0, fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		defer gzReader.Close()
+		reader = gzReader
+	}
+
+	// Calculate hash of the (decompressed) content
+	hasher := sha256.New()
+	size, err := io.Copy(hasher, reader)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to hash file: %w", err)
 	}
 
 	return hex.EncodeToString(hasher.Sum(nil)), size, nil
@@ -1512,6 +1540,31 @@ func (i *Importer) getOrCreateMailbox(ctx context.Context, AccountID int64, name
 	return mailbox, err
 }
 
+// decompressIfNeeded checks if content is gzip compressed and decompresses it if needed.
+// This is required for Dovecot maildir imports where messages may be compressed using
+// the zlib plugin (configured with mail_compression_save = gz).
+// The function checks for the gzip magic number (0x1f 0x8b) and decompresses if present.
+func decompressIfNeeded(content []byte) ([]byte, error) {
+	// Check for gzip magic number (1f 8b)
+	if len(content) >= 2 && content[0] == 0x1f && content[1] == 0x8b {
+		reader, err := gzip.NewReader(bytes.NewReader(content))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		defer reader.Close()
+
+		decompressed, err := io.ReadAll(reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress gzip content: %w", err)
+		}
+
+		return decompressed, nil
+	}
+
+	// Content is not gzipped, return as-is
+	return content, nil
+}
+
 // parseMessageMetadata extracts metadata from message content
 func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (*messageMetadata, error) {
 	// Parse email
@@ -1664,6 +1717,15 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 				}
 			}
 
+			// Decompress if the file is gzip compressed (Dovecot compression)
+			content, err = decompressIfNeeded(content)
+			if err != nil {
+				logger.Warn("Failed to decompress file", "path", msg.path, "error", err)
+				i.recordFailedPath(msg.path, fmt.Sprintf("decompression error: %v", err))
+				atomic.AddInt64(&i.failedMessages, 1)
+				return
+			}
+
 			// Check for cancellation after I/O
 			select {
 			case <-i.ctx.Done():
@@ -1700,7 +1762,7 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 						backoff *= 2
 						logger.Info("Retrying S3 upload", "path", msg.path, "attempt", attempt)
 					}
-					s3Err = i.s3.Put(s3Key, bytes.NewReader(content), msg.size)
+					s3Err = i.s3.Put(s3Key, bytes.NewReader(content), int64(len(content)))
 					if s3Err == nil {
 						break
 					}
@@ -1775,7 +1837,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 			MessageID:            up.metadata.messageID,
 			Flags:                up.metadata.flags,
 			InternalDate:         up.metadata.sentDate,
-			Size:                 up.msg.size,
+			Size:                 int64(len(up.content)),
 			Subject:              up.metadata.subject,
 			PlaintextBody:        up.metadata.plaintextBody,
 			SentDate:             up.metadata.sentDate,
@@ -1907,7 +1969,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]str
 			MessageID:            up.metadata.messageID,
 			Flags:                up.metadata.flags,
 			InternalDate:         up.metadata.sentDate,
-			Size:                 up.msg.size,
+			Size:                 int64(len(up.content)),
 			Subject:              up.metadata.subject,
 			PlaintextBody:        up.metadata.plaintextBody,
 			SentDate:             up.metadata.sentDate,
