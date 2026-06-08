@@ -115,7 +115,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	}
 
 	if isESEARCH && options != nil {
-		s.InfoLog("ESEARCH options provided", "min", options.ReturnMin, "max", options.ReturnMax, "all", options.ReturnAll, "count", options.ReturnCount)
+		s.DebugLog("ESEARCH options provided", "min", options.ReturnMin, "max", options.ReturnMax, "all", options.ReturnAll, "count", options.ReturnCount, "numKind", numKind)
 
 		// At this point, isESEARCH is true and capability is verified
 		if options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount {

@@ -19,6 +19,7 @@ const (
 	// This includes full Message structs (subjects, recipients, body_structure, etc) but NOT message bodies
 	// Estimated ~2KB per message: 100k messages = ~200MB of memory for results
 	// IMAP FETCH is NOT limited by this - it uses GetMessagesByNumSet() which has no limit
+	// SEARCH ALL is also exempted from this limit to avoid breaking clients like imapsync
 	MaxSearchResults = 100000
 
 	// MaxComplexSortResults limits expensive sorting operations (JSONB sorts, etc.)
@@ -29,6 +30,32 @@ const (
 // buildSearchCriteria builds the SQL WHERE clause for the search criteria
 func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPrefix string, paramCounter *int) (string, pgx.NamedArgs, error) {
 	return db.buildSearchCriteriaWithPrefix(criteria, paramPrefix, paramCounter, "m")
+}
+
+// isCriteriaSearchAll checks if the search criteria is effectively a "SEARCH ALL" command,
+// i.e., it has no filtering conditions and will match all messages in the mailbox.
+func isCriteriaSearchAll(criteria *imap.SearchCriteria) bool {
+	if criteria == nil {
+		return true
+	}
+
+	// Check if all fields are empty/default
+	return len(criteria.SeqNum) == 0 &&
+		len(criteria.UID) == 0 &&
+		criteria.Since.IsZero() &&
+		criteria.Before.IsZero() &&
+		criteria.SentSince.IsZero() &&
+		criteria.SentBefore.IsZero() &&
+		len(criteria.Header) == 0 &&
+		len(criteria.Body) == 0 &&
+		len(criteria.Text) == 0 &&
+		len(criteria.Flag) == 0 &&
+		len(criteria.NotFlag) == 0 &&
+		criteria.Larger == 0 &&
+		criteria.Smaller == 0 &&
+		len(criteria.Not) == 0 &&
+		len(criteria.Or) == 0 &&
+		criteria.ModSeq == nil
 }
 
 // buildSearchCriteriaWithPrefix builds the SQL WHERE clause with configurable table prefix
@@ -496,9 +523,16 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 
 	// Determine appropriate result limit based on query complexity
 	isComplexQuery := db.needsComplexQuery(criteria, orderByClause)
+	isSearchAll := isCriteriaSearchAll(criteria)
+
 	if limit > 0 {
 		// Caller specified an explicit limit - use it
 		resultLimit = limit
+	} else if isSearchAll {
+		// SEARCH ALL should return all messages to avoid breaking clients like imapsync
+		// This is safe because SEARCH only returns UIDs/sequence numbers (4 bytes each)
+		// Even 1 million messages would only be ~4MB of UIDs
+		resultLimit = 0 // No limit for SEARCH ALL
 	} else if isComplexQuery {
 		// Complex queries (CTE, JSONB sorting) get lower limits due to processing overhead
 		if strings.Contains(strings.ToLower(orderByClause), "coalesce(") ||
@@ -649,7 +683,16 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 
 		// Note: The ordering clause uses "m." prefix initially, but we need it to use "f." for the outer query
 		outerOrderByClause := strings.ReplaceAll(orderByClause, "m.", "f.")
-		finalQueryString = fmt.Sprintf(simpleQueryTemplate, whereCondition, innerOrderByClause, resultLimit, outerOrderByClause)
+		if resultLimit > 0 {
+			finalQueryString = fmt.Sprintf(simpleQueryTemplate, whereCondition, innerOrderByClause, resultLimit, outerOrderByClause)
+		} else {
+			// No limit for SEARCH ALL - build query without LIMIT clause
+			// Note: This template needs special handling for the CTE structure
+			noLimitTemplate := strings.Replace(simpleQueryTemplate, "LIMIT %d", "", 1)
+			// The simple template uses 4 parameters (whereCondition, innerOrderByClause, resultLimit, outerOrderByClause)
+			// After removing LIMIT, we need only 3 parameters
+			finalQueryString = fmt.Sprintf(noLimitTemplate, whereCondition, innerOrderByClause, outerOrderByClause)
+		}
 		metricsLabel = "search_messages_simple"
 
 	} else if !needsSeqNumSearch {
@@ -698,7 +741,13 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		}
 
 		outerOrderByClause := strings.ReplaceAll(orderByClause, "m.", "f.")
-		finalQueryString = fmt.Sprintf(complexQueryTemplate, whereCondition, innerOrderByClause, resultLimit, outerOrderByClause)
+		if resultLimit > 0 {
+			finalQueryString = fmt.Sprintf(complexQueryTemplate, whereCondition, innerOrderByClause, resultLimit, outerOrderByClause)
+		} else {
+			// No limit for SEARCH ALL - remove the LIMIT clause from template
+			noLimitTemplate := strings.Replace(complexQueryTemplate, "LIMIT %d", "", 1)
+			finalQueryString = fmt.Sprintf(noLimitTemplate, whereCondition, innerOrderByClause, outerOrderByClause)
+		}
 		metricsLabel = "search_messages_complex_fast"
 
 	} else {
@@ -737,7 +786,12 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 				innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
 			}
 		}
-		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, innerOrderByClause, resultLimit)
+		if resultLimit > 0 {
+			finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, innerOrderByClause, resultLimit)
+		} else {
+			// No limit for SEARCH ALL
+			finalQueryString = fmt.Sprintf("%s WHERE %s %s", complexQuery, whereCondition, innerOrderByClause)
+		}
 		metricsLabel = "search_messages_complex_legacy"
 	}
 
@@ -777,8 +831,8 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 	}
 
 	// Log warning if we hit the default result limit (may indicate client needs to refine search)
-	// Don't warn if caller explicitly requested this limit (limit > 0)
-	if limit == 0 && len(messages) >= resultLimit {
+	// Don't warn if caller explicitly requested this limit (limit > 0) or if it's SEARCH ALL (resultLimit == 0)
+	if limit == 0 && resultLimit > 0 && len(messages) >= resultLimit {
 		logger.Warn("Database: search query hit result limit", "limit", resultLimit, "mailbox_id", mailboxID, "complex", isComplexQuery, "message", "Client may need to use more specific search criteria")
 	}
 
@@ -829,9 +883,16 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 
 	// Determine appropriate result limit based on query complexity
 	isComplexQuery := db.needsComplexQuery(criteria, orderByClause)
+	isSearchAll := isCriteriaSearchAll(criteria)
+
 	if limit > 0 {
 		// Caller specified an explicit limit - use it
 		resultLimit = limit
+	} else if isSearchAll {
+		// SEARCH ALL should return all messages to avoid breaking clients like imapsync
+		// This is safe because SEARCH only returns UIDs/sequence numbers (4 bytes each)
+		// Even 1 million messages would only be ~4MB of UIDs
+		resultLimit = 0 // No limit for SEARCH ALL
 	} else if isComplexQuery {
 		// Complex queries (CTE, JSONB sorting) get lower limits due to processing overhead
 		if strings.Contains(strings.ToLower(orderByClause), "coalesce(") ||
@@ -968,7 +1029,19 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 			}
 		}
 
-		finalQueryString = fmt.Sprintf(simpleQueryTemplate, whereCondition, innerOrderByClause, resultLimit)
+		if resultLimit > 0 {
+			finalQueryString = fmt.Sprintf(simpleQueryTemplate, whereCondition, innerOrderByClause, resultLimit)
+		} else {
+			// No limit for SEARCH ALL - build query without LIMIT clause
+			noLimitTemplate := `
+				SELECT
+					m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum
+				FROM messages m
+				LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
+				%s`
+			finalQueryString = fmt.Sprintf(noLimitTemplate, whereCondition, innerOrderByClause)
+		}
 		metricsLabel = "search_messages_simple"
 
 	} else if !needsSeqNumSearch {
@@ -1004,7 +1077,20 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 			}
 		}
 
-		finalQueryString = fmt.Sprintf(complexQueryTemplate, whereCondition, innerOrderByClause, resultLimit)
+		if resultLimit > 0 {
+			finalQueryString = fmt.Sprintf(complexQueryTemplate, whereCondition, innerOrderByClause, resultLimit)
+		} else {
+			// No limit for SEARCH ALL - build query without LIMIT clause
+			noLimitTemplate := `
+				SELECT
+					m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum
+				FROM messages m
+				LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+				LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
+				%s`
+			finalQueryString = fmt.Sprintf(noLimitTemplate, whereCondition, innerOrderByClause)
+		}
 		metricsLabel = "search_messages_complex_fast"
 
 	} else {
@@ -1041,7 +1127,12 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 				innerOrderByClause = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
 			}
 		}
-		finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, innerOrderByClause, resultLimit)
+		if resultLimit > 0 {
+			finalQueryString = fmt.Sprintf("%s WHERE %s %s LIMIT %d", complexQuery, whereCondition, innerOrderByClause, resultLimit)
+		} else {
+			// No limit for SEARCH ALL
+			finalQueryString = fmt.Sprintf("%s WHERE %s %s", complexQuery, whereCondition, innerOrderByClause)
+		}
 		metricsLabel = "search_messages_complex_legacy"
 	}
 
@@ -1081,8 +1172,8 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 	}
 
 	// Log warning if we hit the default result limit (may indicate client needs to refine search)
-	// Don't warn if caller explicitly requested this limit (limit > 0)
-	if limit == 0 && len(messages) >= resultLimit {
+	// Don't warn if caller explicitly requested this limit (limit > 0) or if it's SEARCH ALL (resultLimit == 0)
+	if limit == 0 && resultLimit > 0 && len(messages) >= resultLimit {
 		logger.Warn("Database: search query hit result limit", "limit", resultLimit, "mailbox_id", mailboxID, "complex", isComplexQuery, "message", "Client may need to use more specific search criteria")
 	}
 
