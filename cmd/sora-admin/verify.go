@@ -4,11 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
@@ -43,7 +45,7 @@ Usage:
 
 Subcommands:
   s3       Verify S3 storage consistency for a user
-  hash     Check if specific content hash exists in S3
+  hash     Verify a specific content hash exists in S3 and is intact (download + decrypt + re-hash)
 
 Examples:
   sora-admin verify s3 --email user@example.com --config config.toml
@@ -406,6 +408,33 @@ func printVerificationSummary(result *verificationResult, showMissing, dryRun, f
 	}
 }
 
+// verifyS3Content downloads the full object body, decrypts it (storage.Get
+// handles decryption transparently when client-side encryption is enabled),
+// and verifies that the BLAKE3 hash of the content matches the expected hash
+// embedded in the S3 key. It returns an error if the body cannot be fully
+// read (truncation → "unexpected EOF"), decryption fails (GCM auth failure on
+// a corrupt tail), or the recomputed hash does not match.
+func verifyS3Content(s3Storage *storage.S3Storage, s3Key, expectedHash string) error {
+	reader, err := s3Storage.Get(s3Key)
+	if err != nil {
+		return fmt.Errorf("download/decrypt failed: %w", err)
+	}
+	defer reader.Close()
+
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		return fmt.Errorf("read failed: %w", err)
+	}
+
+	fmt.Printf("  Size: %d bytes (decrypted)\n", len(content))
+
+	actualHash := helpers.HashContent(content)
+	if actualHash != expectedHash {
+		return fmt.Errorf("BLAKE3 mismatch: content hashes to %s (object is corrupt)", actualHash)
+	}
+	return nil
+}
+
 func handleVerifyHash(ctx context.Context) {
 	// Parse verify hash specific flags
 	fs := flag.NewFlagSet("verify hash", flag.ExitOnError)
@@ -413,6 +442,7 @@ func handleVerifyHash(ctx context.Context) {
 	hash := fs.String("hash", "", "Content hash to verify (required)")
 	email := fs.String("email", "", "Email address (required)")
 	showDetails := fs.Bool("details", false, "Show detailed information about messages using this hash")
+	skipDB := fs.Bool("skip-db", false, "Verify S3 content only, without connecting to the database")
 
 	fs.Usage = func() {
 		fmt.Printf(`Verify if a specific content hash exists in S3
@@ -425,15 +455,26 @@ Options:
   --email string      Email address for the account (required)
   --config string     Path to TOML configuration file (required)
   --details           Show detailed information about messages using this hash
+  --skip-db           Verify S3 content only, without connecting to the database
 
 This command checks:
-  1. If the content hash exists in S3
-  2. Which messages in the database reference this hash
-  3. Upload status of messages with this hash
+  1. If the content hash exists in S3 (HEAD)
+  2. That the full object body downloads, decrypts, and re-hashes to the
+     expected BLAKE3 hash (catches truncated/corrupt objects that pass HEAD
+     but fail on read with "unexpected EOF")
+  3. Which messages in the database reference this hash
+  4. Upload status of messages with this hash
+
+The S3 key is derived entirely from --email and --hash, so steps 1-2 need no
+database. Steps 3-4 are best-effort: if the database is unreachable (or
+--skip-db is given) they are skipped and S3 verification still runs.
 
 Examples:
-  # Check if hash exists
+  # Check if hash exists and is intact
   sora-admin verify hash --hash 31feeacf2ac918697614eab56d70098ed08fd44b6ab3a6a6726785128989402b --email user@example.com --config config.toml
+
+  # Verify S3 content only, no database connection
+  sora-admin verify hash --hash 31feeacf... --email user@example.com --skip-db --config config.toml
 
   # Show detailed message information
   sora-admin verify hash --hash 31feeacf... --email user@example.com --details --config config.toml
@@ -458,18 +499,22 @@ Examples:
 	}
 
 	// Run verification
-	if err := verifyContentHash(ctx, globalConfig, *hash, *email, *showDetails); err != nil {
+	if err := verifyContentHash(ctx, globalConfig, *hash, *email, *showDetails, *skipDB); err != nil {
 		logger.Fatalf("Verification failed: %v", err)
 	}
 }
 
-func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string, showDetails bool) error {
-	// Initialize database
-	rdb, err := newAdminDatabase(ctx, &cfg.Database)
-	if err != nil {
-		return fmt.Errorf("failed to initialize database: %w", err)
+func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string, showDetails, skipDB bool) error {
+	// Parse email to get domain and localpart. The S3 key is derived entirely
+	// from this and the hash — no database lookup is required to verify the
+	// object itself.
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid email format: %s", email)
 	}
-	defer rdb.Close()
+	localpart := parts[0]
+	domain := parts[1]
+	s3Key := fmt.Sprintf("%s/%s/%s", domain, localpart, hash)
 
 	// Initialize S3 storage
 	s3Timeout, err := cfg.S3.GetTimeout()
@@ -497,38 +542,66 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 		}
 	}
 
-	// Get account ID
-	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, email)
-	if err != nil {
-		return fmt.Errorf("failed to find account: %w", err)
-	}
-
-	// Parse email to get domain and localpart
-	parts := strings.Split(email, "@")
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid email format: %s", email)
-	}
-	localpart := parts[0]
-	domain := parts[1]
-
-	// Construct S3 key
-	s3Key := fmt.Sprintf("%s/%s/%s", domain, localpart, hash)
-
 	fmt.Printf("Checking content hash: %s\n", hash)
-	fmt.Printf("Account: %s (ID: %d)\n", email, accountID)
+	fmt.Printf("Account: %s\n", email)
 	fmt.Printf("S3 Key: %s\n\n", s3Key)
 
-	// Check if exists in S3
-	exists, sizeStr, err := s3Storage.Exists(s3Key)
+	// Check if exists in S3. This is only a HEAD request — it confirms the key
+	// is indexed by the provider, NOT that the body is fully readable. The
+	// second return value is the object's version ID (the native file ID on
+	// Backblaze B2), not its size.
+	exists, versionID, err := s3Storage.Exists(s3Key)
 	if err != nil {
 		return fmt.Errorf("failed to check S3: %w", err)
 	}
 
-	if exists {
-		fmt.Printf("✓ Content EXISTS in S3\n")
-		fmt.Printf("  Size: %s\n", sizeStr)
-	} else {
+	// contentIntact tracks whether the deep verification (download + decrypt +
+	// re-hash) succeeded. It stays true when the object is absent so the
+	// existing "missing" branches in the summary remain authoritative.
+	contentIntact := true
+
+	if !exists {
 		fmt.Printf("✗ Content MISSING from S3\n")
+	} else {
+		fmt.Printf("✓ Content EXISTS in S3 (HEAD ok)\n")
+		if versionID != "" {
+			fmt.Printf("  Version ID: %s\n", versionID)
+		}
+
+		// Deep verification: a clean HEAD does not prove the body is intact.
+		// Truncated or corrupt objects (e.g. an incomplete B2 large-file
+		// upload) pass HEAD but fail on GET with a short read, decryption
+		// failure, or hash mismatch — this is the check that actually catches
+		// the "unexpected EOF" failures seen when fetching messages.
+		if err := verifyS3Content(s3Storage, s3Key, hash); err != nil {
+			contentIntact = false
+			fmt.Printf("  ✗ Content verification FAILED: %v\n", err)
+		} else {
+			fmt.Printf("  ✓ Content verified: full body downloaded, decrypted, BLAKE3 matches\n")
+		}
+	}
+
+	// The S3 verification above is complete and required no database. The
+	// remaining DB cross-reference (which messages use this hash, upload status)
+	// is best-effort: it is skipped on --skip-db or if the database is
+	// unreachable, so a storage-only node can still verify object integrity.
+	if skipDB {
+		fmt.Printf("\nDatabase cross-reference skipped (--skip-db).\n")
+		printS3OnlySummary(exists, contentIntact)
+		return nil
+	}
+
+	rdb, err := newAdminDatabase(ctx, &cfg.Database)
+	if err != nil {
+		fmt.Printf("\n⚠️  Database unavailable, skipping message cross-reference: %v\n", err)
+		printS3OnlySummary(exists, contentIntact)
+		return nil
+	}
+	defer rdb.Close()
+
+	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, email)
+	if err != nil {
+		return fmt.Errorf("failed to find account: %w", err)
 	}
 
 	// Get messages with this hash from database
@@ -582,7 +655,12 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 
 	// Summary and recommendations
 	fmt.Printf("\nSummary:\n")
-	if exists && uploaded > 0 {
+	if exists && !contentIntact {
+		fmt.Printf("✗ CRITICAL: Object exists in S3 but its body is corrupt or unreadable\n")
+		fmt.Printf("  HEAD succeeds but the full body cannot be downloaded/decrypted or fails the hash check.\n")
+		fmt.Printf("  Users will get errors (e.g. \"unexpected EOF\") trying to read these messages.\n")
+		fmt.Printf("  The S3 object must be re-uploaded from the original source, or the messages deleted.\n")
+	} else if exists && uploaded > 0 {
 		fmt.Printf("✓ Everything looks good\n")
 	} else if !exists && notUploaded > 0 {
 		fmt.Printf("✗ Problem detected: Content missing from S3 and messages marked as not uploaded\n")
@@ -599,4 +677,21 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 	}
 
 	return nil
+}
+
+// printS3OnlySummary prints a verdict for the S3-only case, where no database
+// cross-reference was performed (--skip-db or DB unavailable).
+func printS3OnlySummary(exists, contentIntact bool) {
+	fmt.Printf("\nSummary:\n")
+	switch {
+	case exists && contentIntact:
+		fmt.Printf("✓ S3 object exists and its content is intact (downloaded, decrypted, BLAKE3 verified)\n")
+	case exists && !contentIntact:
+		fmt.Printf("✗ CRITICAL: Object exists in S3 but its body is corrupt or unreadable\n")
+		fmt.Printf("  HEAD succeeds but the full body cannot be downloaded/decrypted or fails the hash check.\n")
+		fmt.Printf("  Users will get errors (e.g. \"unexpected EOF\") trying to read these messages.\n")
+		fmt.Printf("  The S3 object must be re-uploaded from the original source, or the messages deleted.\n")
+	default:
+		fmt.Printf("✗ Content MISSING from S3\n")
+	}
 }
