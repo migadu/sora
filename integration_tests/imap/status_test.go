@@ -167,6 +167,89 @@ func TestIMAP_ComprehensiveMailboxStatus(t *testing.T) {
 	t.Log("Comprehensive mailbox status test completed successfully")
 }
 
+// TestIMAP_StatusSize tests that STATUS SIZE (RFC 8438) returns the sum of
+// RFC822.SIZE of all messages in the mailbox.
+func TestIMAP_StatusSize(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+
+	// Empty INBOX should report SIZE 0.
+	statusData, err := c.Status("INBOX", &imap.StatusOptions{Size: true}).Wait()
+	if err != nil {
+		t.Fatalf("STATUS SIZE on empty INBOX failed: %v", err)
+	}
+	if statusData.Size == nil {
+		t.Fatal("Size should be populated when requested")
+	}
+	if *statusData.Size != 0 {
+		t.Errorf("Expected SIZE 0 on empty INBOX, got %d", *statusData.Size)
+	}
+
+	// Append a couple of messages of differing sizes.
+	messages := []string{
+		"From: a@example.com\r\nTo: " + account.Email + "\r\nSubject: One\r\n\r\nShort body.\r\n",
+		"From: b@example.com\r\nTo: " + account.Email + "\r\nSubject: Two\r\n\r\n" + strings.Repeat("padding ", 200) + "\r\n",
+	}
+	for _, msg := range messages {
+		appendCmd := c.Append("INBOX", int64(len(msg)), &imap.AppendOptions{Time: time.Now()})
+		if _, err := appendCmd.Write([]byte(msg)); err != nil {
+			t.Fatalf("APPEND write failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("APPEND close failed: %v", err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("APPEND failed: %v", err)
+		}
+	}
+
+	// Sum the per-message RFC822.SIZE via FETCH as the source of truth.
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("SELECT INBOX failed: %v", err)
+	}
+	fetchMsgs, err := c.Fetch(imap.SeqSetNum(1, 2), &imap.FetchOptions{RFC822Size: true}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH RFC822.SIZE failed: %v", err)
+	}
+	var expectedSize int64
+	for _, m := range fetchMsgs {
+		expectedSize += m.RFC822Size
+	}
+	if expectedSize == 0 {
+		t.Fatal("Expected non-zero summed RFC822.SIZE")
+	}
+
+	// STATUS SIZE must match the summed per-message sizes.
+	statusData, err = c.Status("INBOX", &imap.StatusOptions{Size: true, NumMessages: true}).Wait()
+	if err != nil {
+		t.Fatalf("STATUS SIZE after append failed: %v", err)
+	}
+	if statusData.Size == nil {
+		t.Fatal("Size should be populated when requested")
+	}
+	if *statusData.Size != expectedSize {
+		t.Errorf("STATUS SIZE = %d, expected sum of RFC822.SIZE = %d", *statusData.Size, expectedSize)
+	}
+
+	var numMessages uint32
+	if statusData.NumMessages != nil {
+		numMessages = *statusData.NumMessages
+	}
+	t.Logf("STATUS SIZE test passed - SIZE: %d bytes across %d messages", *statusData.Size, numMessages)
+}
+
 // TestIMAP_StatusAppendLimit tests that STATUS correctly returns APPENDLIMIT
 func TestIMAP_StatusAppendLimit(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)

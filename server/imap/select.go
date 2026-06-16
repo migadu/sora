@@ -209,6 +209,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	s.selectedMailbox = mailbox
 	s.mailboxTracker = imapserver.NewMailboxTracker(s.currentNumMessages.Load())
 	s.sessionTracker = s.mailboxTracker.NewSession()
+	s.savedSearchUIDs = nil // RFC 5182: the "$" saved result is reset on mailbox change
 
 	// Track domain and user command activity
 	if s.IMAPUser != nil {

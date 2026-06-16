@@ -50,6 +50,12 @@ type IMAPSession struct {
 	lastHighestUID        imap.UID
 	useMasterDB           atomic.Bool // Pin session to master DB after a write to ensure consistency
 
+	// savedSearchUIDs holds the SEARCH RETURN (SAVE) result set referenced by
+	// "$" (RFC 5182 / RFC 9051 §6.4.4.1). It is per-session, scoped to the
+	// currently selected mailbox, stored as UIDs (stable across EXPUNGE), and
+	// never persisted. Guarded by s.mutex; reset on every mailbox change.
+	savedSearchUIDs imap.UIDSet
+
 	// Memory tracking
 	memTracker *server.SessionMemoryTracker
 
@@ -338,11 +344,38 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.currentHighestModSeq.Store(0)
 	s.currentNumMessages.Store(0)
 	s.firstUnseenSeqNum.Store(0)
+	s.savedSearchUIDs = nil // saved "$" result is scoped to the selected mailbox
+}
+
+// setSavedSearchResult stores the SEARCH RETURN (SAVE) result set (RFC 5182).
+// Called outside any held mutex; acquires the write lock for a quick assignment.
+func (s *IMAPSession) setSavedSearchResult(uids imap.UIDSet) {
+	s.mutex.Lock()
+	s.savedSearchUIDs = uids
+	s.mutex.Unlock()
+}
+
+// savedSearchResultLocked returns a copy of the saved "$" result set.
+// The caller MUST hold s.mutex (read or write lock).
+func (s *IMAPSession) savedSearchResultLocked() imap.UIDSet {
+	if len(s.savedSearchUIDs) == 0 {
+		return imap.UIDSet{}
+	}
+	out := make(imap.UIDSet, len(s.savedSearchUIDs))
+	copy(out, s.savedSearchUIDs)
+	return out
 }
 
 // decodeNumSetLocked translates client sequence numbers to server sequence numbers.
 // IMPORTANT: The caller MUST hold s.mutex (either read or write lock) when calling this method.
 func (s *IMAPSession) decodeNumSetLocked(numSet imap.NumSet) imap.NumSet {
+	// RFC 5182 / RFC 9051 §6.4.4.1: resolve the "$" saved-search-result marker to
+	// this session's saved UID set (empty if nothing has been saved). The marker
+	// is always a UIDSet, so the result bypasses sequence-number translation.
+	if imap.IsSearchRes(numSet) {
+		return s.savedSearchResultLocked()
+	}
+
 	if s.sessionTracker == nil {
 		return numSet
 	}

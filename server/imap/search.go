@@ -114,6 +114,34 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		}
 	}
 
+	// RFC 5182 §2.4 / RFC 9051 §6.4.4.1: SEARCH RETURN (SAVE) stores the result
+	// set referenced later by "$". The saved set is always stored as UIDs (stable
+	// across EXPUNGE). Combination rules:
+	//   - SAVE with ALL, or with neither MIN nor MAX  -> save the full match set
+	//   - SAVE with MIN and/or MAX but not ALL        -> save just MIN/MAX message(s)
+	//   - COUNT never restricts what is saved
+	// Messages are returned newest-first, so messages[0]=MAX UID, last=MIN UID.
+	if options != nil && options.ReturnSave {
+		var saved imap.UIDSet
+		if len(messages) > 0 {
+			saveFull := options.ReturnAll || (!options.ReturnMin && !options.ReturnMax)
+			if saveFull {
+				for _, msg := range messages {
+					saved.AddNum(msg.UID)
+				}
+			} else {
+				if options.ReturnMin {
+					saved.AddNum(messages[len(messages)-1].UID)
+				}
+				if options.ReturnMax {
+					saved.AddNum(messages[0].UID)
+				}
+			}
+		}
+		s.setSavedSearchResult(saved)
+		s.DebugLog("saved SEARCH result for '$'", "count", len(saved))
+	}
+
 	if isESEARCH && options != nil {
 		s.DebugLog("ESEARCH options provided", "min", options.ReturnMin, "max", options.ReturnMax, "all", options.ReturnAll, "count", options.ReturnCount, "numKind", numKind)
 
@@ -272,8 +300,16 @@ func (s *IMAPSession) decodeSearchCriteriaLocked(criteria *imap.SearchCriteria) 
 		decoded.SeqNum[i] = s.decodeNumSetLocked(seqSet).(imap.SeqSet)
 	}
 
-	// UID sets don't need decoding like sequence numbers do
-	// The * wildcard should already be handled by the go-imap library
+	// UID sets don't need sequence-number decoding, but a "$" marker in the UID
+	// criteria must be resolved to this session's saved search result (RFC 5182).
+	decoded.UID = make([]imap.UIDSet, len(criteria.UID))
+	for i, uidSet := range criteria.UID {
+		if imap.IsSearchRes(uidSet) {
+			decoded.UID[i] = s.savedSearchResultLocked()
+		} else {
+			decoded.UID[i] = uidSet
+		}
+	}
 
 	decoded.Not = make([]imap.SearchCriteria, len(criteria.Not))
 	for i, not := range criteria.Not {

@@ -90,6 +90,12 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 		limit := uint32(s.server.appendLimit)
 		statusData.AppendLimit = &limit
 	}
+	if options.Size {
+		// RFC 8438: SIZE is the sum of RFC822.SIZE of all messages in the
+		// mailbox. Served from the mailbox_stats cache (total_size).
+		size := summary.TotalSize
+		statusData.Size = &size
+	}
 
 	numMessagesStr := "n/a"
 	if statusData.NumMessages != nil {

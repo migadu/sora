@@ -25,6 +25,11 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	}
 	mailboxID := s.selectedMailbox.ID
 	AccountID := s.AccountID()
+	// RFC 5182: resolve a "$" marker (UID EXPUNGE $) to the saved search result.
+	if uidSet != nil && imap.IsSearchRes(*uidSet) {
+		resolved := s.savedSearchResultLocked()
+		uidSet = &resolved
+	}
 	release()
 
 	// Check ACL permissions - requires 'e' (expunge) right

@@ -12,3 +12,4 @@ integration_tests/sora-admin
 vendor/
 CLAUDE.md
 .claude/
+config-live.toml
