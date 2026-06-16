@@ -2105,117 +2105,132 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 		return nil, fmt.Errorf("request aborted")
 	}
 
-	if msg.IsUploaded {
-		// Try cache first
-		var data []byte
-		var err error
-		if s.server.cache != nil {
-			data, err = s.server.cache.Get(msg.ContentHash)
+	data, err := s.loadMessageBody(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Single accounting point for every source in loadMessageBody (cache, S3, disk).
+	if s.memTracker != nil {
+		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
+			metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
+			return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
 		}
-		if err == nil && data != nil {
-			// Validate cached data is not empty
-			if len(data) == 0 {
-				logger.Warn("POP3: Cache contains empty body", "uid", msg.UID, "hash", msg.ContentHash)
-				// Don't return empty data, fall through to S3
-				data = nil
-			} else {
-				logger.Debug("POP3: Cache hit", "uid", msg.UID)
-				// Track memory usage for cached data
-				if s.memTracker != nil {
-					if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-						metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
-						return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
-					}
+	}
+	return data, nil
+}
+
+// loadMessageBody returns the raw message body from the fastest available source.
+// Preference order:
+//   - uploaded messages:     local cache → S3 → local staging disk (S3 outage)
+//   - not-yet-uploaded msgs: local staging disk → S3 (cross-node / late-upload race)
+func (s *POP3Session) loadMessageBody(msg *db.Message) ([]byte, error) {
+	if msg.IsUploaded {
+		// Try cache first (nil-safe: cache is optional and not configured in tests).
+		if s.server.cache != nil {
+			if cacheData, cacheErr := s.server.cache.Get(msg.ContentHash); cacheErr == nil && cacheData != nil {
+				// Validate cached data is not empty
+				if len(cacheData) == 0 {
+					logger.Warn("POP3: Cache contains empty body, falling through to S3", "uid", msg.UID, "content_hash", msg.ContentHash)
+				} else {
+					logger.Debug("POP3: Cache hit", "uid", msg.UID)
+					return cacheData, nil
 				}
-				return data, nil
 			}
 		}
 
 		// Fallback to S3
 		logger.Debug("POP3: Cache miss - fetching from S3", "uid", msg.UID, "hash", msg.ContentHash)
-		if msg.S3Domain == "" || msg.S3Localpart == "" {
-			return nil, fmt.Errorf("message UID %d is missing S3 key information", msg.UID)
-		}
-		s3Key := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
-		var reader io.ReadCloser
-		var s3GetErr error
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					s3GetErr = fmt.Errorf("S3 get panicked: %v", r)
-				}
-			}()
-			reader, s3GetErr = s.server.s3.GetWithRetry(s.server.appCtx, s3Key)
-		}()
-
-		if s3GetErr != nil {
-			// S3 is unavailable — fall back to the local disk file if the uploader
+		data, err := s.fetchBodyFromS3(msg)
+		if err != nil {
+			// S3 is unavailable — fall back to the local staging file if the uploader
 			// still has it. This covers test environments (where S3 is a no-op stub)
 			// and transient S3 outages where the upload worker has not yet run.
 			if s.server.uploader != nil {
 				filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-				if diskData, diskErr := os.ReadFile(filePath); diskErr == nil {
+				if diskData, diskErr := os.ReadFile(filePath); diskErr == nil && len(diskData) > 0 {
 					logger.Debug("POP3: S3 unavailable, served from local disk", "uid", msg.UID)
 					return diskData, nil
 				}
 			}
-			return nil, fmt.Errorf("message UID %d: %w: %v", msg.UID, storage.ErrRetrieveFailed, s3GetErr)
-		}
-		defer reader.Close()
-		data, err = io.ReadAll(reader)
-		if err != nil {
 			return nil, err
-		}
-		// Validate S3 data is not empty
-		if len(data) == 0 {
-			logger.Warn("POP3: Retrieved empty body from S3", "uid", msg.UID, "hash", msg.ContentHash, "s3_key", s3Key)
-			return nil, fmt.Errorf("message UID %d (hash: %s): %w", msg.UID, msg.ContentHash, storage.ErrEmptyData)
-		}
-		// Track memory usage for S3 data
-		if s.memTracker != nil {
-			if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-				metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
-				return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
-			}
-		}
-		// Store in cache
-		if s.server.cache != nil {
-			logger.Debug("POP3: Storing in cache", "uid", msg.UID, "hash", msg.ContentHash)
-			_ = s.server.cache.Put(msg.ContentHash, data)
 		}
 		return data, nil
 	}
 
-	// If not uploaded to S3, try fetch from local disk
+	// Not yet uploaded to S3: the body should be in this node's local staging dir.
 	if s.server.uploader == nil {
 		logger.Debug("POP3: No uploader configured, message not available", "uid", msg.UID)
 		return nil, consts.ErrMessageNotAvailable
 	}
 	logger.Debug("POP3: Fetching not yet uploaded message from disk", "uid", msg.UID)
 	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
+	data, diskErr := os.ReadFile(filePath)
+	if diskErr == nil && len(data) > 0 {
+		return data, nil
+	}
+
+	// Local staging file is missing or empty. In a multi-backend cluster the body
+	// may have been delivered/staged on another node and already uploaded to S3,
+	// while this node's in-memory message still reads uploaded=false. Try S3 with
+	// the stored key before giving up. NoSuchKey fails fast, so this is cheap when S3 has nothing yet.
+	if msg.S3Domain != "" && msg.S3Localpart != "" {
+		if s3Data, s3Err := s.fetchBodyFromS3(msg); s3Err == nil {
+			logger.Debug("POP3: local staging file missing, served from S3", "uid", msg.UID)
+			return s3Data, nil
+		}
+	}
+
+	if diskErr != nil {
+		if os.IsNotExist(diskErr) {
 			logger.Debug("POP3: Message not found locally - assuming pending", "uid", msg.UID, "hash", msg.ContentHash)
 			return nil, consts.ErrMessageNotAvailable
 		}
-		// Other error trying to access the local file
-		return nil, fmt.Errorf("error retrieving message UID %d from local disk: %w", msg.UID, err)
+		return nil, fmt.Errorf("error retrieving message UID %d from local disk: %w", msg.UID, diskErr)
 	}
-	if data == nil { // Should ideally not happen if GetLocalFile returns nil, nil for "not found"
-		return nil, fmt.Errorf("message UID %d (hash %s) not found on disk (GetLocalFile returned nil data, nil error)", msg.UID, msg.ContentHash)
+	return nil, fmt.Errorf("message UID %d: empty body on disk and not in S3", msg.UID)
+}
+
+// fetchBodyFromS3 retrieves a message body from S3 using the key components
+// stored on the message record. It validates the payload is non-empty and warms
+// the local cache on success.
+func (s *POP3Session) fetchBodyFromS3(msg *db.Message) ([]byte, error) {
+	if msg.S3Domain == "" || msg.S3Localpart == "" {
+		return nil, fmt.Errorf("message UID %d is missing S3 key information", msg.UID)
 	}
-	// Validate disk data is not empty
+	s3Key := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
+
+	// Guard against a nil-client panic (e.g. test stubs using &storage.S3Storage{})
+	// so it becomes an error rather than killing the connection goroutine.
+	var reader io.ReadCloser
+	var s3GetErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s3GetErr = fmt.Errorf("S3 get panicked: %v", r)
+			}
+		}()
+		reader, s3GetErr = s.server.s3.GetWithRetry(s.server.appCtx, s3Key)
+	}()
+	if s3GetErr != nil {
+		logger.Debug("POP3: S3 GetWithRetry failed", "uid", msg.UID, "s3_key", s3Key, "error", s3GetErr)
+		return nil, fmt.Errorf("message UID %d: %w: %v", msg.UID, storage.ErrRetrieveFailed, s3GetErr)
+	}
+	defer reader.Close()
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		logger.Debug("POP3: failed to read S3 response", "uid", msg.UID, "error", err)
+		return nil, err
+	}
 	if len(data) == 0 {
-		logger.Warn("POP3: Retrieved empty body from disk", "uid", msg.UID, "hash", msg.ContentHash, "path", filePath)
-		return nil, fmt.Errorf("message UID %d has empty body on disk (hash: %s, path: %s)", msg.UID, msg.ContentHash, filePath)
+		logger.Warn("POP3: Retrieved empty body from S3", "uid", msg.UID, "hash", msg.ContentHash, "s3_key", s3Key)
+		return nil, fmt.Errorf("message UID %d (hash: %s): %w", msg.UID, msg.ContentHash, storage.ErrEmptyData)
 	}
-	// Track memory usage for disk data
-	if s.memTracker != nil {
-		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-			metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
-			return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
-		}
+
+	logger.Debug("POP3: successfully fetched from S3", "uid", msg.UID, "size", len(data))
+	if s.server.cache != nil {
+		_ = s.server.cache.Put(msg.ContentHash, data)
 	}
 	return data, nil
 }

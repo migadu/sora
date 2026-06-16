@@ -615,6 +615,31 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 }
 
 func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
+	data, err := s.loadMessageBody(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	// Single accounting point for every source in loadMessageBody (cache, S3, disk).
+	if s.memTracker != nil {
+		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
+			metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+			return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
+		}
+	}
+	return data, nil
+}
+
+// loadMessageBody returns the raw message body from the fastest available source.
+// Preference order:
+//   - uploaded messages:     local cache → S3 → local staging disk (S3 outage)
+//   - not-yet-uploaded msgs: local staging disk → S3 (cross-node / late-upload race)
+//
+// The S3 fallback on the not-uploaded path is what self-heals the common
+// multi-backend situation where a body was delivered/staged on another node and
+// has since been uploaded, while this node's in-memory message still reads
+// uploaded=false.
+func (s *IMAPSession) loadMessageBody(msg *db.Message) ([]byte, error) {
 	if msg.IsUploaded {
 		// Try cache first (nil-safe: cache is optional and not configured in tests).
 		if s.server.cache != nil {
@@ -626,106 +651,103 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 					s.WarnLog("cache contains empty body, falling through to S3", "uid", msg.UID, "content_hash", msg.ContentHash)
 				} else {
 					s.DebugLog("cache hit", "uid", msg.UID)
-					if s.memTracker != nil {
-						if allocErr := s.memTracker.Allocate(int64(len(cacheData))); allocErr != nil {
-							metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
-							return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
-						}
-					}
 					return cacheData, nil
 				}
 			}
 		}
 
-		// Fallback to S3
+		// Fallback to S3.
 		s.DebugLog("cache miss, fetching from S3", "uid", msg.UID, "content_hash", msg.ContentHash)
-		// Use the stored S3 key components from the message record to prevent race conditions
-		// if the user's primary email has changed since the message was stored.
-		if msg.S3Domain == "" || msg.S3Localpart == "" {
-			return nil, fmt.Errorf("message UID %d is missing S3 key information", msg.UID)
-		}
-		s3Key := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
-
-		// s3GetWithRetryPanic wraps GetWithRetry so that a nil-client panic
-		// (e.g. in test environments using &storage.S3Storage{}) is converted
-		// to an error rather than propagating and killing the connection goroutine.
-		var reader io.ReadCloser
-		var s3GetErr error
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					s3GetErr = fmt.Errorf("S3 get panicked: %v", r)
-				}
-			}()
-			reader, s3GetErr = s.server.s3.GetWithRetry(s.server.appCtx, s3Key)
-		}()
-		if s3GetErr != nil {
-			s.DebugLog("S3 GetWithRetry failed", "uid", msg.UID, "s3_key", s3Key, "error", s3GetErr)
-			// S3 is unavailable — fall back to the local disk file if the uploader
+		data, err := s.fetchBodyFromS3(msg)
+		if err != nil {
+			// S3 is unavailable — fall back to the local staging file if the uploader
 			// still has it.  This covers test environments (where S3 is a no-op stub)
 			// and transient S3 outages where the upload worker has not yet run.
 			if s.server.uploader != nil {
 				filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-				if diskData, diskErr := os.ReadFile(filePath); diskErr == nil {
+				if diskData, diskErr := os.ReadFile(filePath); diskErr == nil && len(diskData) > 0 {
 					s.DebugLog("S3 unavailable, served from local disk", "uid", msg.UID)
 					return diskData, nil
 				}
 			}
-			return nil, fmt.Errorf("message UID %d: %w: %v", msg.UID, storage.ErrRetrieveFailed, s3GetErr)
-		}
-		defer reader.Close()
-		data, err := io.ReadAll(reader)
-		if err != nil {
-			s.DebugLog("failed to read S3 response", "uid", msg.UID, "error", err)
 			return nil, err
-		}
-
-		// Validate we got data
-		if len(data) == 0 {
-			s.WarnLog("S3 returned empty data", "uid", msg.UID, "s3_key", s3Key, "expected_size", msg.Size,
-				"get_breaker_state", s.server.s3.GetGetBreakerState())
-			return nil, fmt.Errorf("message UID %d (expected %d bytes): %w", msg.UID, msg.Size, storage.ErrEmptyData)
-		}
-
-		s.DebugLog("successfully fetched from S3", "uid", msg.UID, "size", len(data))
-
-		// Track memory usage for S3 data
-		if s.memTracker != nil {
-			if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-				metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
-				return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
-			}
-		}
-
-		// Store in cache if available (nil-safe).
-		if s.server.cache != nil {
-			_ = s.server.cache.Put(msg.ContentHash, data)
 		}
 		return data, nil
 	}
 
-	// If not uploaded to S3, fetch from local disk
+	// Not yet uploaded to S3: the body should be in this node's local staging dir.
 	if s.server.uploader == nil {
 		return nil, fmt.Errorf("message UID %d not yet uploaded and no uploader configured", msg.UID)
 	}
 	s.DebugLog("fetching not yet uploaded message from disk", "uid", msg.UID)
 	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("message UID %d from disk: %w: %v", msg.UID, storage.ErrRetrieveFailed, err)
-	}
-	if data == nil {
-		return nil, fmt.Errorf("message UID %d not found on disk", msg.UID)
+	data, diskErr := os.ReadFile(filePath)
+	if diskErr == nil && len(data) > 0 {
+		return data, nil
 	}
 
-	// Track memory usage for disk data
-	if s.memTracker != nil {
-		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-			metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
-			return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
+	// Local staging file is missing or empty. In a multi-backend cluster the body
+	// may have been delivered/staged on another node and already uploaded to S3,
+	// while this node's in-memory message still reads uploaded=false. Try S3 with
+	// the stored key before giving up — this self-heals the cross-node fetch race
+	// (and the same-node race where the upload worker finished after the message
+	// row was read). NoSuchKey fails fast, so this is cheap when S3 has nothing yet.
+	if msg.S3Domain != "" && msg.S3Localpart != "" {
+		if s3Data, s3Err := s.fetchBodyFromS3(msg); s3Err == nil {
+			s.DebugLog("local staging file missing, served from S3", "uid", msg.UID)
+			return s3Data, nil
 		}
 	}
 
+	if diskErr != nil {
+		return nil, fmt.Errorf("message UID %d from disk: %w: %v", msg.UID, storage.ErrRetrieveFailed, diskErr)
+	}
+	return nil, fmt.Errorf("message UID %d: empty body on disk and not in S3", msg.UID)
+}
+
+// fetchBodyFromS3 retrieves a message body from S3 using the key components
+// stored on the message record (which guard against the user's primary address
+// changing after the message was stored). It validates the payload is non-empty
+// and warms the local cache on success.
+func (s *IMAPSession) fetchBodyFromS3(msg *db.Message) ([]byte, error) {
+	if msg.S3Domain == "" || msg.S3Localpart == "" {
+		return nil, fmt.Errorf("message UID %d is missing S3 key information", msg.UID)
+	}
+	s3Key := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
+
+	// Guard against a nil-client panic (e.g. test stubs using &storage.S3Storage{})
+	// so it becomes an error rather than killing the connection goroutine.
+	var reader io.ReadCloser
+	var s3GetErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s3GetErr = fmt.Errorf("S3 get panicked: %v", r)
+			}
+		}()
+		reader, s3GetErr = s.server.s3.GetWithRetry(s.server.appCtx, s3Key)
+	}()
+	if s3GetErr != nil {
+		s.DebugLog("S3 GetWithRetry failed", "uid", msg.UID, "s3_key", s3Key, "error", s3GetErr)
+		return nil, fmt.Errorf("message UID %d: %w: %v", msg.UID, storage.ErrRetrieveFailed, s3GetErr)
+	}
+	defer reader.Close()
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		s.DebugLog("failed to read S3 response", "uid", msg.UID, "error", err)
+		return nil, err
+	}
+	if len(data) == 0 {
+		s.WarnLog("S3 returned empty data", "uid", msg.UID, "s3_key", s3Key, "expected_size", msg.Size,
+			"get_breaker_state", s.server.s3.GetGetBreakerState())
+		return nil, fmt.Errorf("message UID %d (expected %d bytes): %w", msg.UID, msg.Size, storage.ErrEmptyData)
+	}
+
+	s.DebugLog("successfully fetched from S3", "uid", msg.UID, "size", len(data))
+	if s.server.cache != nil {
+		_ = s.server.cache.Put(msg.ContentHash, data)
+	}
 	return data, nil
 }
 
