@@ -2,10 +2,12 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/consts"
 )
 
@@ -99,6 +101,31 @@ func (db *Database) UpdateScript(ctx context.Context, tx pgx.Tx, scriptID, Accou
 		return nil, err
 	}
 	return &s, nil
+}
+
+// RenameScript renames a Sieve script in a single atomic statement. The script's
+// active state and content are preserved (only the name changes). It returns:
+//   - consts.ErrDBNotFound if no script named oldName exists for the account
+//   - consts.ErrDBUniqueViolation if a script named newName already exists
+//
+// Because the rename is a single UPDATE, there is no read-then-write window: the
+// UNIQUE (account_id, name) constraint resolves name collisions atomically.
+func (db *Database) RenameScript(ctx context.Context, tx pgx.Tx, AccountID int64, oldName, newName string) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE sieve_scripts SET name = $1, updated_at = now()
+		WHERE name = $2 AND account_id = $3
+	`, newName, oldName, AccountID)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
+			return consts.ErrDBUniqueViolation
+		}
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return consts.ErrDBNotFound
+	}
+	return nil
 }
 
 func (db *Database) DeleteScript(ctx context.Context, tx pgx.Tx, scriptID, AccountID int64) error {

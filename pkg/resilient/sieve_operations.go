@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/retry"
 )
@@ -197,6 +198,20 @@ func (rd *ResilientDatabase) DeactivateAllScriptsWithRetry(ctx context.Context, 
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
+	return err
+}
+
+// RenameScriptWithRetry renames a Sieve script with retry logic. The rename is a
+// single atomic UPDATE, so there is no read-then-write window: the script's active
+// state is preserved and the UNIQUE (account_id, name) constraint resolves name
+// collisions. It returns consts.ErrDBNotFound if oldName does not exist, or
+// consts.ErrDBUniqueViolation if newName already exists.
+func (rd *ResilientDatabase) RenameScriptWithRetry(ctx context.Context, AccountID int64, oldName, newName string) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RenameScript(ctx, tx, AccountID, oldName, newName)
+	}
+
+	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op, consts.ErrDBNotFound, consts.ErrDBUniqueViolation)
 	return err
 }
 

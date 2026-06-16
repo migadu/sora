@@ -54,12 +54,14 @@ func (s *ManageSieveSession) sendCapabilities() {
 		s.WarnLog("failed to acquire read lock", "operation", "sendCapabilities")
 		// Send minimal capabilities if lock fails
 		s.sendRawLine(fmt.Sprintf("\"IMPLEMENTATION\" \"%s\"", "ManageSieve"))
+		s.sendRawLine("\"VERSION\" \"1.0\"")
 		s.sendRawLine("\"SIEVE\" \"fileinto vacation\"")
 		return
 	}
 	defer release()
 
 	s.sendRawLine(fmt.Sprintf("\"IMPLEMENTATION\" \"%s\"", "ManageSieve"))
+	s.sendRawLine("\"VERSION\" \"1.0\"")
 
 	// Build capabilities: builtin + configured extensions
 	capabilities := GetSieveCapabilities(s.server.supportedExtensions)
@@ -496,6 +498,136 @@ func (s *ManageSieveSession) handleConnection() {
 				recordMetrics("failure")
 			}
 
+		case "CHECKSCRIPT":
+			start := time.Now()
+			recordMetrics := func(status string) {
+				metrics.CommandsTotal.WithLabelValues("managesieve", "CHECKSCRIPT", status).Inc()
+				metrics.CommandDuration.WithLabelValues("managesieve", "CHECKSCRIPT").Observe(time.Since(start).Seconds())
+			}
+
+			if !s.authenticated {
+				s.sendResponse("NO Not authenticated\r\n")
+				recordMetrics("failure")
+				continue
+			}
+			if len(parts) < 2 {
+				s.sendResponse("NO Syntax: CHECKSCRIPT scriptContent\r\n")
+				recordMetrics("failure")
+				continue
+			}
+			scriptContent := parts[1]
+
+			// Check if script content is a literal string {length+} or {length}
+			if strings.HasPrefix(scriptContent, "{") && (strings.HasSuffix(scriptContent, "}") || strings.HasSuffix(scriptContent, "+}")) {
+				hasPlus := strings.HasSuffix(scriptContent, "+}")
+
+				// Extract length from {length} or {length+}
+				lengthStr := strings.TrimPrefix(scriptContent, "{")
+				lengthStr = strings.TrimSuffix(lengthStr, "}")
+				lengthStr = strings.TrimSuffix(lengthStr, "+")
+
+				length64, parseErr := strconv.ParseInt(lengthStr, 10, 64)
+				if parseErr != nil || length64 < 0 {
+					s.sendResponse("NO Invalid literal string length\r\n")
+					recordMetrics("failure")
+					continue
+				}
+				if length64 > s.server.maxScriptSize {
+					s.sendResponse(fmt.Sprintf("NO (MAXSCRIPTSIZE) Script size %d exceeds maximum allowed size %d\r\n", length64, s.server.maxScriptSize))
+					recordMetrics("failure")
+					continue
+				}
+				length := int(length64)
+
+				if !hasPlus {
+					// Send continuation response (+ ready for literal data) only for synchronizing literals
+					s.sendResponse("+\r\n")
+				}
+
+				// Read the literal content (length bytes)
+				var buf bytes.Buffer
+				if _, err := io.CopyN(&buf, s.reader, int64(length)); err != nil {
+					s.sendResponse("NO Failed to read literal string content\r\n")
+					// Bypass metrics for client socket timeouts (network transmission errors)
+					continue
+				}
+				literalContent := buf.Bytes()
+
+				// Read the trailing CRLF after literal (RFC 5804 compliance)
+				s.reader.ReadString('\n')
+
+				// Reset the metric timer NOW to exclude the time the client took to upload the script
+				start = time.Now()
+
+				scriptContent = string(literalContent)
+			} else {
+				scriptContent = server.UnquoteString(scriptContent)
+			}
+
+			if s.handleCheckScript(scriptContent) {
+				recordMetrics("success")
+			} else {
+				recordMetrics("failure")
+			}
+
+		case "HAVESPACE":
+			start := time.Now()
+			recordMetrics := func(status string) {
+				metrics.CommandsTotal.WithLabelValues("managesieve", "HAVESPACE", status).Inc()
+				metrics.CommandDuration.WithLabelValues("managesieve", "HAVESPACE").Observe(time.Since(start).Seconds())
+			}
+
+			if !s.authenticated {
+				s.sendResponse("NO Not authenticated\r\n")
+				recordMetrics("failure")
+				continue
+			}
+			if len(parts) < 3 {
+				s.sendResponse("NO Syntax: HAVESPACE scriptName scriptSize\r\n")
+				recordMetrics("failure")
+				continue
+			}
+			scriptName := strings.TrimSpace(server.UnquoteString(parts[1]))
+			sizeStr := parts[2]
+			size64, parseErr := strconv.ParseInt(sizeStr, 10, 64)
+			if parseErr != nil || size64 < 0 {
+				s.sendResponse("NO Invalid script size\r\n")
+				recordMetrics("failure")
+				continue
+			}
+
+			if s.handleHaveSpace(scriptName, size64) {
+				recordMetrics("success")
+			} else {
+				recordMetrics("failure")
+			}
+
+		case "RENAMESCRIPT":
+			start := time.Now()
+			recordMetrics := func(status string) {
+				metrics.CommandsTotal.WithLabelValues("managesieve", "RENAMESCRIPT", status).Inc()
+				metrics.CommandDuration.WithLabelValues("managesieve", "RENAMESCRIPT").Observe(time.Since(start).Seconds())
+			}
+
+			if !s.authenticated {
+				s.sendResponse("NO Not authenticated\r\n")
+				recordMetrics("failure")
+				continue
+			}
+			if len(parts) < 3 {
+				s.sendResponse("NO Syntax: RENAMESCRIPT oldName newName\r\n")
+				recordMetrics("failure")
+				continue
+			}
+			oldName := strings.TrimSpace(server.UnquoteString(parts[1]))
+			newName := strings.TrimSpace(server.UnquoteString(parts[2]))
+
+			if s.handleRenameScript(oldName, newName) {
+				recordMetrics("success")
+			} else {
+				recordMetrics("failure")
+			}
+
 		case "SETACTIVE":
 			start := time.Now()
 			recordMetrics := func(status string) {
@@ -875,6 +1007,102 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	}
 	s.sendResponse(responseMsg)
 	return true
+}
+
+func (s *ManageSieveSession) handleCheckScript(content string) bool {
+	// Check if the context is closing before proceeding.
+	if s.ctx.Err() != nil {
+		s.DebugLog("request aborted", "command", "CHECKSCRIPT")
+		s.sendResponse("NO Session closed\r\n")
+		return false
+	}
+
+	if int64(len(content)) > s.server.maxScriptSize {
+		s.sendResponse(fmt.Sprintf("NO (MAXSCRIPTSIZE) Script size %d exceeds maximum allowed size %d\r\n", len(content), s.server.maxScriptSize))
+		return false
+	}
+
+	scriptReader := strings.NewReader(content)
+	options := sieve.DefaultOptions()
+	// Configure extensions based on server configuration
+	// If no extensions are configured, none are supported
+	options.EnabledExtensions = s.server.supportedExtensions
+	_, err := sieve.Load(scriptReader, options)
+	if err != nil {
+		s.sendResponse(fmt.Sprintf("NO Script validation failed: %v\r\n", err))
+		return false
+	}
+
+	s.sendResponse("OK\r\n")
+	return true
+}
+
+func (s *ManageSieveSession) handleHaveSpace(name string, size int64) bool {
+	// Check if the context is closing before proceeding.
+	if s.ctx.Err() != nil {
+		s.DebugLog("request aborted", "command", "HAVESPACE")
+		s.sendResponse("NO Session closed\r\n")
+		return false
+	}
+
+	if size > s.server.maxScriptSize {
+		s.sendResponse(fmt.Sprintf("NO (MAXSCRIPTSIZE) Script size %d exceeds maximum allowed size %d\r\n", size, s.server.maxScriptSize))
+		return false
+	}
+
+	s.sendResponse("OK\r\n")
+	return true
+}
+
+func (s *ManageSieveSession) handleRenameScript(oldName, newName string) bool {
+	// Check if the context is closing before proceeding.
+	if s.ctx.Err() != nil {
+		s.DebugLog("request aborted", "command", "RENAMESCRIPT")
+		s.sendResponse("NO Session closed\r\n")
+		return false
+	}
+
+	if oldName == "" || newName == "" {
+		s.sendResponse("NO Script name cannot be empty\r\n")
+		return false
+	}
+
+	// Read session state
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	if !acquired {
+		s.WarnLog("failed to acquire read lock", "command", "RENAMESCRIPT")
+		s.sendResponse("NO Server busy, try again later\r\n")
+		return false
+	}
+	accountID := s.AccountID()
+	release()
+
+	// Rename atomically in a single UPDATE. The UNIQUE (account_id, name) constraint
+	// resolves new-name collisions, so there is no read-then-write (TOCTOU) window and
+	// no exposure to read-replica lag. The script's active state is preserved.
+	err := s.server.rdb.RenameScriptWithRetry(s.ctx, accountID, oldName, newName)
+	switch {
+	case err == nil:
+		// Pin session to master so subsequent reads in this session see the rename.
+		acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+		if !acquired {
+			s.WarnLog("failed to acquire write lock", "command", "RENAMESCRIPT", "purpose", "pin_session")
+		} else {
+			s.useMasterDB = true
+			release()
+		}
+		s.sendResponse("OK\r\n")
+		return true
+	case errors.Is(err, consts.ErrDBNotFound):
+		s.sendResponse("NO (NONEXISTENT) \"Script does not exist\"\r\n")
+		return false
+	case errors.Is(err, consts.ErrDBUniqueViolation):
+		s.sendResponse("NO (ALREADYEXISTS) \"A script with the new name already exists\"\r\n")
+		return false
+	default:
+		s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
+		return false
+	}
 }
 
 func (s *ManageSieveSession) handleSetActive(name string) bool {
