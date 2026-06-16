@@ -265,7 +265,7 @@ Examples:
 		logger.Fatalf("Failed to set affinity: %v", err)
 	}
 
-	fmt.Printf("✓ Affinity set successfully and gossiped to cluster\n")
+	fmt.Printf("[OK] Affinity set successfully and gossiped to cluster\n")
 	fmt.Printf("  User: %s\n", *userEmail)
 	fmt.Printf("  Protocol: %s\n", *protocol)
 	fmt.Printf("  Backend: %s\n", *backendAddr)
@@ -411,7 +411,7 @@ Examples:
 		logger.Fatalf("Failed to delete affinity: %v", err)
 	}
 
-	fmt.Printf("✓ Affinity deleted successfully and gossiped to cluster\n")
+	fmt.Printf("[OK] Affinity deleted successfully and gossiped to cluster\n")
 	fmt.Printf("  User: %s\n", *userEmail)
 	fmt.Printf("  Protocol: %s\n", *protocol)
 	if msg, ok := respData["message"].(string); ok {
@@ -733,7 +733,7 @@ func kickConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, 
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	fmt.Printf("\n✅ %s\n", result["message"])
+	fmt.Printf("\n[OK] %s\n", result["message"])
 	if protocols, ok := result["protocols"].([]any); ok {
 		fmt.Printf("   Protocols: %v\n", protocols)
 	}

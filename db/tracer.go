@@ -19,8 +19,8 @@ func (ct *CustomTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, dat
 // TraceQueryEnd is called at the end of Query, QueryRow, and Exec calls.
 func (ct *CustomTracer) TraceQueryEnd(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryEndData) {
 	if data.Err != nil {
-		log.Printf("Database: ❌ %v", data.Err)
+		log.Printf("Database: [FAIL] %v", data.Err)
 	} else {
-		log.Printf("Database: ✅ %v", data.CommandTag)
+		log.Printf("Database: [OK] %v", data.CommandTag)
 	}
 }

@@ -297,7 +297,7 @@ func (d *Database) ExhaustUploadAttempts(ctx context.Context, tx pgx.Tx, content
 
 // DeleteFailedUpload deletes the pending_uploads record and any unuploaded message rows
 // for the given content hash + account. Used by the admin tool to clean up entries where
-// the content is permanently lost (✗ MISSING in S3 and no local file).
+// the content is permanently lost ([FAIL] MISSING in S3 and no local file).
 // Returns the number of message rows that were deleted.
 func (d *Database) DeleteFailedUpload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64) (int64, error) {
 	var deleted int64

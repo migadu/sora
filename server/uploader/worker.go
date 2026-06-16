@@ -417,7 +417,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		// In case (b) - and whenever S3 already has the content for any reason - we can
 		// self-heal by calling CompleteS3UploadWithRetry directly, without the local file.
 		// This prevents CleanupFailedUploads from eventually deleting the user's messages
-		// even though their content is safely stored in S3 (the ✓ EXISTS scenario).
+		// even though their content is safely stored in S3 (the [OK] EXISTS scenario).
 		logger.Warn("Uploader: Local file missing -> checking S3 for existing content",
 			"hash", upload.ContentHash, "account_id", upload.AccountID, "path", filePath)
 

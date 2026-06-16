@@ -22,7 +22,7 @@ func purgeDomain(ctx context.Context, cfg AdminConfig, domain string) error {
 	}
 	defer rdb.Close()
 
-	fmt.Printf("🔍 Scanning for accounts in domain: %s\n\n", domain)
+	fmt.Printf("Scanning for accounts in domain: %s\n\n", domain)
 
 	// Get all accounts for this domain
 	accounts, err := rdb.GetAccountsByDomain(ctx, domain)
@@ -47,20 +47,20 @@ func purgeDomain(ctx context.Context, cfg AdminConfig, domain string) error {
 	skippedCount := 0
 
 	for i, acct := range accounts {
-		fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+		fmt.Printf("===================================================\n")
 		fmt.Printf("Account %d/%d: %s (ID: %d)\n", i+1, len(accounts), acct.PrimaryEmail, acct.AccountID)
-		fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n")
+		fmt.Printf("===================================================\n\n")
 
 		// Check if already purged (account doesn't exist in DB anymore)
 		result, err := rdb.AccountExistsWithRetry(ctx, acct.PrimaryEmail)
 		if err != nil {
-			fmt.Printf("❌ Error checking account existence: %v\n\n", err)
+			fmt.Printf("[FAIL] Error checking account existence: %v\n\n", err)
 			failedCount++
 			continue
 		}
 
 		if !result.Exists {
-			fmt.Printf("⏭️  Account already purged, skipping\n\n")
+			fmt.Printf("[SKIP] Account already purged, skipping\n\n")
 			skippedCount++
 			continue
 		}
@@ -68,23 +68,23 @@ func purgeDomain(ctx context.Context, cfg AdminConfig, domain string) error {
 		// Purge this account (reuse the purge logic)
 		err = purgeAccount(ctx, cfg, rdb, acct.AccountID, acct.PrimaryEmail)
 		if err != nil {
-			fmt.Printf("❌ Failed to purge account: %v\n\n", err)
+			fmt.Printf("[FAIL] Failed to purge account: %v\n\n", err)
 			failedCount++
 			continue
 		}
 
-		fmt.Printf("✅ Successfully purged account: %s\n\n", acct.PrimaryEmail)
+		fmt.Printf("[OK] Successfully purged account: %s\n\n", acct.PrimaryEmail)
 		successCount++
 	}
 
 	// Summary
-	fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	fmt.Printf("===================================================\n")
 	fmt.Printf("SUMMARY\n")
-	fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	fmt.Printf("===================================================\n")
 	fmt.Printf("Total accounts:    %d\n", len(accounts))
-	fmt.Printf("✅ Purged:          %d\n", successCount)
-	fmt.Printf("⏭️  Already purged:  %d\n", skippedCount)
-	fmt.Printf("❌ Failed:          %d\n", failedCount)
+	fmt.Printf("[OK] Purged:          %d\n", successCount)
+	fmt.Printf("[SKIP] Already purged:  %d\n", skippedCount)
+	fmt.Printf("[FAIL] Failed:          %d\n", failedCount)
 
 	if failedCount > 0 {
 		return fmt.Errorf("%d account(s) failed to purge - re-run command to retry", failedCount)
@@ -141,7 +141,7 @@ func purgeAccountWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilien
 	if err != nil {
 		return fmt.Errorf("failed to expunge messages: %w", err)
 	}
-	fmt.Printf("✓ Marked %d messages as expunged (or already expunged)\n", expungedCount)
+	fmt.Printf("[OK] Marked %d messages as expunged (or already expunged)\n", expungedCount)
 
 	// Step 2: Delete S3 objects and clean up DB
 	// We iterate in batches: Fetch -> Delete S3 -> Delete DB
@@ -215,7 +215,7 @@ func purgeAccountWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilien
 				return fmt.Errorf("failed to delete messages from DB: %w", err)
 			}
 			totalDBDeletes += deleted
-			fmt.Printf("    ✓ Deleted %d S3 objects and %d DB records this batch\n", len(successfulDeletes), deleted)
+			fmt.Printf("    [OK] Deleted %d S3 objects and %d DB records this batch\n", len(successfulDeletes), deleted)
 		} else if failedDeletes > 0 && len(batch) > 0 {
 			// If we found objects but failed to delete ANY of them, we are stuck.
 			// The next iteration will find the same objects.
@@ -223,7 +223,7 @@ func purgeAccountWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilien
 		}
 	}
 
-	fmt.Printf("\n✓ Successfully cleaned up %d S3 objects and %d message records\n", totalS3Deletes, totalDBDeletes)
+	fmt.Printf("\n[OK] Successfully cleaned up %d S3 objects and %d message records\n", totalS3Deletes, totalDBDeletes)
 
 	// Step 3: Delete mailboxes, credentials, account
 	fmt.Printf("\nStep 3: Removing account data...\n")
@@ -231,17 +231,17 @@ func purgeAccountWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilien
 	if err := rdb.PurgeMailboxesForAccount(ctx, accountID); err != nil {
 		return fmt.Errorf("failed to purge mailboxes: %w", err)
 	}
-	fmt.Printf("✓ Deleted mailboxes\n")
+	fmt.Printf("[OK] Deleted mailboxes\n")
 
 	if err := rdb.PurgeCredentialsForAccount(ctx, accountID); err != nil {
 		return fmt.Errorf("failed to purge credentials: %w", err)
 	}
-	fmt.Printf("✓ Deleted credentials\n")
+	fmt.Printf("[OK] Deleted credentials\n")
 
 	if err := rdb.PurgeAccount(ctx, accountID); err != nil {
 		return fmt.Errorf("failed to purge account: %w", err)
 	}
-	fmt.Printf("✓ Deleted account\n")
+	fmt.Printf("[OK] Deleted account\n")
 
 	return nil
 }

@@ -456,7 +456,7 @@ This command purges ALL accounts under a domain (e.g., *@example.com).
 It iterates through all accounts and purges each one using the resumable
 expunge-then-cleanup pattern.
 
-⚠️  WARNING: This is IRREVERSIBLE and will delete:
+WARNING: This is IRREVERSIBLE and will delete:
   - All accounts with emails ending in @<domain>
   - All their messages (from S3 and database)
   - All their mailboxes
@@ -504,7 +504,7 @@ Examples:
 		logger.Fatalf("Failed to purge domain: %v", err)
 	}
 
-	fmt.Printf("\n✅ Successfully purged all accounts for domain: %s\n", *domain)
+	fmt.Printf("\n[OK] Successfully purged all accounts for domain: %s\n", *domain)
 }
 
 func printAccountsUsage() {

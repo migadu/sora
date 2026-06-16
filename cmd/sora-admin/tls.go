@@ -615,9 +615,9 @@ func displayCertificatesTable(certs []CertificateInfo, showDetails bool) error {
 			}
 
 			if cert.InLocalCache {
-				fmt.Printf("Local Cache:     ✓ YES (%s)\n", cert.LocalPath)
+				fmt.Printf("Local Cache:     [OK] YES (%s)\n", cert.LocalPath)
 			} else {
-				fmt.Printf("Local Cache:     ✗ NO\n")
+				fmt.Printf("Local Cache:     [FAIL] NO\n")
 			}
 
 			fmt.Println()

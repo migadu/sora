@@ -106,7 +106,7 @@ Examples:
 	// Load full configuration - this will show all warnings
 	cfg := config.NewDefaultConfig()
 	if err := config.LoadConfigFromFile(configFile, &cfg); err != nil {
-		fmt.Printf("❌ Configuration validation FAILED:\n")
+		fmt.Printf("[FAIL] Configuration validation FAILED:\n")
 		fmt.Printf("   %v\n", err)
 		os.Exit(1)
 	}
@@ -115,14 +115,14 @@ Examples:
 	allServers := cfg.GetAllServers()
 
 	if len(allServers) == 0 {
-		fmt.Printf("⚠️  Warning: No servers configured\n")
+		fmt.Printf("[WARN] Warning: No servers configured\n")
 		fmt.Printf("   Please configure at least one server in the config file\n\n")
 	}
 
 	hasErrors := false
 	for _, server := range allServers {
 		if err := server.Validate(); err != nil {
-			fmt.Printf("❌ Server '%s' validation failed:\n", server.Name)
+			fmt.Printf("[FAIL] Server '%s' validation failed:\n", server.Name)
 			fmt.Printf("   %v\n", err)
 			hasErrors = true
 		}
@@ -133,7 +133,7 @@ Examples:
 	serverAddresses := make(map[string]string) // addr -> server name
 	for _, server := range allServers {
 		if serverNames[server.Name] {
-			fmt.Printf("❌ Duplicate server name '%s' found\n", server.Name)
+			fmt.Printf("[FAIL] Duplicate server name '%s' found\n", server.Name)
 			fmt.Printf("   Each server must have a unique name\n")
 			hasErrors = true
 		}
@@ -141,7 +141,7 @@ Examples:
 
 		// Check for address conflicts
 		if existingServerName, exists := serverAddresses[server.Addr]; exists {
-			fmt.Printf("❌ Duplicate server address '%s' found\n", server.Addr)
+			fmt.Printf("[FAIL] Duplicate server address '%s' found\n", server.Addr)
 			fmt.Printf("   Server '%s' and '%s' cannot bind to the same address\n",
 				existingServerName, server.Name)
 			hasErrors = true
@@ -150,11 +150,11 @@ Examples:
 	}
 
 	if hasErrors {
-		fmt.Printf("\n❌ Configuration validation FAILED with errors\n")
+		fmt.Printf("\n[FAIL] Configuration validation FAILED with errors\n")
 		os.Exit(1)
 	}
 
-	fmt.Printf("✅ Configuration is valid!\n")
+	fmt.Printf("[OK] Configuration is valid!\n")
 	if len(allServers) > 0 {
 		fmt.Printf("\nConfigured servers:\n")
 		for _, server := range allServers {

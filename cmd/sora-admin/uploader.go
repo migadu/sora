@@ -97,9 +97,9 @@ Options:
   --limit int   Maximum number of failed uploads to process (default: 100)
 
 Actions taken per upload:
-  ✓ EXISTS in S3  → CompleteS3Upload: marks messages as uploaded=TRUE, removes pending record.
+  [OK] EXISTS in S3  → CompleteS3Upload: marks messages as uploaded=TRUE, removes pending record.
                     Users regain access to their messages immediately.
-  ✗ MISSING in S3 → DeleteFailedUpload: removes undeliverable message rows and pending record.
+  [FAIL] MISSING in S3 → DeleteFailedUpload: removes undeliverable message rows and pending record.
                     Content was never stored in S3; the message is permanently lost.
 
 Examples:
@@ -188,7 +188,7 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 
 		if exists {
 			// Content is in S3 - mark messages as uploaded=TRUE, remove pending record.
-			fmt.Printf("  [REPAIR] id=%-10d account=%-8d hash=%.16s... ✓ EXISTS in S3 → CompleteS3Upload\n",
+			fmt.Printf("  [REPAIR] id=%-10d account=%-8d hash=%.16s... [OK] EXISTS in S3 → CompleteS3Upload\n",
 				upload.ID, upload.AccountID, upload.ContentHash)
 			if !dryRun {
 				if err := rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
@@ -200,7 +200,7 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 			resolved++
 		} else {
 			// Content is NOT in S3 - the message was never delivered. Clean up.
-			fmt.Printf("  [DELETE] id=%-10d account=%-8d hash=%.16s... ✗ MISSING in S3 → DeleteFailedUpload\n",
+			fmt.Printf("  [DELETE] id=%-10d account=%-8d hash=%.16s... [FAIL] MISSING in S3 → DeleteFailedUpload\n",
 				upload.ID, upload.AccountID, upload.ContentHash)
 			if !dryRun {
 				n, err := rdb.DeleteFailedUploadWithRetry(ctx, upload.ContentHash, upload.AccountID)
@@ -215,7 +215,7 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 		}
 	}
 
-	fmt.Printf("\nSummary: %d repaired (✓ EXISTS), %d deleted (✗ MISSING), %d skipped\n", resolved, deleted, skipped)
+	fmt.Printf("\nSummary: %d repaired ([OK] EXISTS), %d deleted ([FAIL] MISSING), %d skipped\n", resolved, deleted, skipped)
 	if dryRun {
 		fmt.Println("(dry run - run without --dry-run to apply changes)")
 	}
@@ -230,7 +230,7 @@ Usage:
 
 Subcommands:
   status   Show uploader queue status and failed uploads
-  resolve  Resolve failed uploads: repair ✓ EXISTS entries, delete ✗ MISSING entries
+  resolve  Resolve failed uploads: repair [OK] EXISTS entries, delete [FAIL] MISSING entries
 
 Examples:
   sora-admin uploader status
@@ -345,9 +345,9 @@ func showUploaderStatus(ctx context.Context, cfg AdminConfig, showFailed bool, f
 					exists, _, checkErr := s3Storage.Exists(s3Key)
 					if checkErr == nil {
 						if exists {
-							s3Status = "✓ EXISTS"
+							s3Status = "[OK] EXISTS"
 						} else {
-							s3Status = "✗ MISSING"
+							s3Status = "[FAIL] MISSING"
 						}
 					}
 				}
