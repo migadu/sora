@@ -37,7 +37,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	err := db.GetReadPool().QueryRow(ctx, `
 		SELECT
 			COALESCE(ms.highest_modseq, 0) AS highest_modseq,
-			COALESCE(ms.message_count, 0) AS message_count,
+			(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL) AS message_count,
 			mb.highest_uid
 		FROM mailboxes mb
 		LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
@@ -154,9 +154,9 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 				if uint32(u.UID) > (uidNext / 2) {
 					// Count backwards: TotalActive - COUNT(Active > Target)
 					batch.Queue(`
-						SELECT $1::int - COUNT(*)::int FROM messages 
-						WHERE mailbox_id = $2 AND expunged_at IS NULL AND uid > $3
-					`, messageCount, mailboxID, u.UID)
+						SELECT (SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL) - COUNT(*)::int FROM messages
+						WHERE mailbox_id = $1 AND expunged_at IS NULL AND uid > $2
+					`, mailboxID, u.UID)
 				} else {
 					// Count forwards: COUNT(Active <= Target)
 					batch.Queue(`
@@ -172,12 +172,12 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 					// SeqNum = ClientTotal - ClientMessagesAfter
 					batch.Queue(`
 						SELECT (
-							$1::int + 
-							(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $2 AND expunged_at IS NOT NULL AND expunged_modseq > $3)
-						) - COUNT(*)::int 
+							(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL) +
+							(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND expunged_at IS NOT NULL AND expunged_modseq > $2)
+						) - COUNT(*)::int
 						FROM messages
-						WHERE mailbox_id = $2 AND (expunged_at IS NULL OR expunged_modseq > $3) AND uid > $4
-					`, messageCount, mailboxID, sinceModSeq, u.UID)
+						WHERE mailbox_id = $1 AND (expunged_at IS NULL OR expunged_modseq > $2) AND uid > $3
+					`, mailboxID, sinceModSeq, u.UID)
 				} else {
 					// Expunged forward count
 					batch.Queue(`

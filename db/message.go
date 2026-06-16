@@ -783,17 +783,15 @@ func hydrateSequencesCore[T any](
 		uids = append(uids, int64(uid))
 	}
 
-	var messageCount int
 	var uidNext uint32
 
 	// Fetch mailbox stats for bidirectional sweep decision.
 	// On deadlock/lock timeout, gracefully fall back to forward sweep.
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT COALESCE(ms.message_count, 0), COALESCE(mb.highest_uid, 1)
-		FROM mailboxes mb
-		LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
-		WHERE mb.id = $1
-	`, mailboxID).Scan(&messageCount, &uidNext)
+		SELECT COALESCE(highest_uid, 1)
+		FROM mailboxes
+		WHERE id = $1
+	`, mailboxID).Scan(&uidNext)
 
 	useForwardSweep := true // Default to forward sweep
 	if err != nil {
@@ -804,7 +802,6 @@ func hydrateSequencesCore[T any](
 		// On deadlock or other transient errors, fall back to forward sweep
 		// This prevents test flakiness during concurrent execution
 		uidNext = maxUID + 1
-		messageCount = 0
 	} else {
 		// Bidirectional Sweep Sequence Hydration
 		// Determine whether a forward sweep or backward sweep is more efficient
@@ -841,14 +838,19 @@ func hydrateSequencesCore[T any](
 		`
 		args = []interface{}{mailboxID, uids}
 	} else {
-		// Backward Sweep (Faster for recent messages, utilizing exact O(1) messageCount)
+		// Backward Sweep (Faster for recent messages, utilizing exact live count)
 		query = `
 			WITH range_bounds AS (
 				SELECT MIN(uid) as min_uid
 				FROM unnest($2::bigint[]) as t(uid)
 			),
+			active_count AS (
+				SELECT COUNT(*)::int as cnt
+				FROM messages
+				WHERE mailbox_id = $1 AND expunged_at IS NULL
+			),
 			all_uids AS (
-				SELECT m.uid, $3::int - ROW_NUMBER() OVER(ORDER BY m.uid DESC) + 1 as seqnum
+				SELECT m.uid, (SELECT cnt FROM active_count) - ROW_NUMBER() OVER(ORDER BY m.uid DESC) + 1 as seqnum
 				FROM messages m
 				CROSS JOIN range_bounds
 				WHERE m.mailbox_id = $1
@@ -859,7 +861,7 @@ func hydrateSequencesCore[T any](
 			FROM all_uids a
 			JOIN unnest($2::bigint[]) t(uid) ON a.uid = t.uid
 		`
-		args = []interface{}{mailboxID, uids, messageCount}
+		args = []interface{}{mailboxID, uids}
 	}
 
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)

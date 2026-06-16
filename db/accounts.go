@@ -603,7 +603,8 @@ func (db *Database) GetCredentialDetails(ctx context.Context, email string) (*Cr
 			   a.id, a.created_at, a.deleted_at,
 			   (SELECT COUNT(*) FROM credentials WHERE account_id = a.id) AS total_credentials,
 			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id) AS mailbox_count,
-			   COALESCE((SELECT SUM(message_count) FROM mailbox_stats WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = a.id)), 0) AS message_count
+			   -- Live count (not the mailbox_stats cache) so per-account quota is always correct.
+			   COALESCE((SELECT COUNT(*) FROM messages WHERE account_id = a.id AND expunged_at IS NULL), 0) AS message_count
 		FROM credentials c
 		JOIN accounts a ON c.account_id = a.id
 		WHERE LOWER(c.address) = LOWER($1)
@@ -664,8 +665,9 @@ func (db *Database) GetAccountDetails(ctx context.Context, email string) (*Accou
 	err = db.GetReadPool().QueryRow(ctx, `
 		SELECT a.id, a.created_at, a.deleted_at,
 			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id) AS mailbox_count,
-			   COALESCE((SELECT SUM(message_count) FROM mailbox_stats WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = a.id)), 0) AS message_count,
-			   COALESCE((SELECT SUM(total_size) FROM mailbox_stats WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE account_id = a.id)), 0) AS storage_used
+			   -- Live count/size (not the mailbox_stats cache) so per-account quota is always correct.
+			   COALESCE((SELECT COUNT(*) FROM messages WHERE account_id = a.id AND expunged_at IS NULL), 0) AS message_count,
+			   COALESCE((SELECT SUM(size) FROM messages WHERE account_id = a.id AND expunged_at IS NULL), 0) AS storage_used
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id
 		WHERE LOWER(c.address) = $1
@@ -770,6 +772,9 @@ func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) 
 		WITH account_stats AS (
 			SELECT mb.account_id,
 				   COUNT(mb.id) as mailbox_count,
+				   -- Bulk all-accounts listing intentionally uses the mailbox_stats cache (kept accurate
+				   -- by the stats triggers + the admin recalculate-stats command) to avoid a full
+				   -- messages-table aggregate on every listing. Per-account quota lookups use live counts.
 				   COALESCE(SUM(ms.message_count), 0) as message_count,
 				   COALESCE(SUM(ms.total_size), 0) as storage_used
 			FROM mailboxes mb
@@ -822,6 +827,9 @@ func (db *Database) ListAccountsByDomain(ctx context.Context, domain string) ([]
 		WITH account_stats AS (
 			SELECT mb.account_id,
 				   COUNT(mb.id) as mailbox_count,
+				   -- Bulk all-accounts listing intentionally uses the mailbox_stats cache (kept accurate
+				   -- by the stats triggers + the admin recalculate-stats command) to avoid a full
+				   -- messages-table aggregate on every listing. Per-account quota lookups use live counts.
 				   COALESCE(SUM(ms.message_count), 0) as message_count,
 				   COALESCE(SUM(ms.total_size), 0) as storage_used
 			FROM mailboxes mb

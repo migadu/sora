@@ -768,10 +768,13 @@ func (d *Database) GetMailboxSummariesBatch(ctx context.Context, mailboxIDs []in
 	return result, nil
 }
 
+// GetMailboxMessageCountAndSizeSum returns the count and total size of active messages in a mailbox.
+// Used by POP3 STAT. Reads from the mailbox_stats cache (O(1)) — consistent with IMAP STATUS, which
+// also serves counts from the cache (see GetMailboxSummary). The cache is kept accurate by the stats
+// triggers; correctness does not depend on live counting here.
 func (d *Database) GetMailboxMessageCountAndSizeSum(ctx context.Context, mailboxID int64) (int, int64, error) {
 	var count int
 	var size int64
-	// This query is optimized to use the mailbox_stats cache table.
 	err := d.GetReadPoolWithContext(ctx).QueryRow(ctx,
 		"SELECT message_count, total_size FROM mailbox_stats WHERE mailbox_id = $1",
 		mailboxID).Scan(&count, &size)
