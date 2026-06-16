@@ -155,6 +155,10 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 						limit := uint32(s.server.appendLimit)
 						statusData.AppendLimit = &limit
 					}
+					if options.ReturnStatus.Size {
+						size := summary.TotalSize
+						statusData.Size = &size
+					}
 
 					data.Status = statusData
 

@@ -221,12 +221,13 @@ func TestIMAP_ListStatus(t *testing.T) {
 		t.Fatalf("APPEND wait failed: %v", err)
 	}
 
-	// Use LIST with RETURN (STATUS (MESSAGES UNSEEN UIDNEXT))
+	// Use LIST with RETURN (STATUS (MESSAGES UNSEEN UIDNEXT SIZE))
 	options := &imap.ListOptions{
 		ReturnStatus: &imap.StatusOptions{
 			NumMessages: true,
 			NumUnseen:   true,
 			UIDNext:     true,
+			Size:        true,
 		},
 	}
 
@@ -260,6 +261,12 @@ func TestIMAP_ListStatus(t *testing.T) {
 
 	if inbox.Status.UIDNext == 0 {
 		t.Error("UIDNext missing or 0 in LIST-STATUS response")
+	}
+
+	if inbox.Status.Size == nil {
+		t.Error("Size missing in LIST-STATUS response")
+	} else if *inbox.Status.Size != int64(len(testMessage)) {
+		t.Errorf("Expected size %d, got %d", len(testMessage), *inbox.Status.Size)
 	}
 
 	// Check that unrequested fields are NOT present (e.g. UIDValidity was not requested)
