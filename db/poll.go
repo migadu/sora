@@ -66,15 +66,23 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		SELECT uid, expunged_at, flags, custom_flags, created, updated, expunged FROM (
 			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq as created, ms.updated_modseq as updated, m.expunged_modseq as expunged
 			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-			WHERE m.mailbox_id = $1 AND m.created_modseq > $2
+			-- New messages: created since the client's last sync and still active. The expunged_at IS NULL
+			-- guard drops create+expunge-in-window phantoms (created since, already gone) which the client
+			-- never saw -- reporting them would desync the client's sequence numbers.
+			WHERE m.mailbox_id = $1 AND m.created_modseq > $2 AND m.expunged_at IS NULL
 			UNION
 			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq
 			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-			WHERE m.mailbox_id = $1 AND m.expunged_modseq > $2
+			-- Only report expunges for messages the client already knew about (created at or before its
+			-- last-seen modseq). A message created AND expunged within this poll window was never sent to
+			-- the client (no EXISTS), so emitting an EXPUNGE for it would shift the client's sequence
+			-- numbers against a message it never saw -> tracker desync (Outlook stops showing new mail).
+			WHERE m.mailbox_id = $1 AND m.expunged_modseq > $2 AND m.created_modseq <= $2
 			UNION
 			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq
-			FROM message_state ms JOIN messages m ON ms.message_id = m.id
-			WHERE ms.mailbox_id = $1 AND ms.updated_modseq > $2
+			FROM message_state ms JOIN messages m ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+			-- Flag updates only for active messages; an expunge is reported by the branch above.
+			WHERE ms.mailbox_id = $1 AND ms.updated_modseq > $2 AND m.expunged_at IS NULL
 		) sub
 	`, mailboxID, sinceModSeq)
 	if err != nil {
@@ -166,23 +174,28 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 				}
 			} else {
 				if uint32(u.UID) > (uidNext / 2) {
-					// Expunged backward count:
-					// ClientTotal = TotalActive + COUNT(ExpungedSinceModSeq)
-					// ClientMessagesAfter = COUNT((Active OR ExpungedSinceModSeq) AND uid > Target)
-					// SeqNum = ClientTotal - ClientMessagesAfter
+					// Expunged backward count. The expunge sequence number must be the message's
+					// position in the CLIENT's pre-poll view: messages it already knew
+					// (created_modseq <= sinceModSeq) that it has not yet been told are gone
+					// (expunged_at IS NULL OR expunged_modseq > sinceModSeq). Restricting every term to
+					// created_modseq <= sinceModSeq keeps messages added in this same poll (and
+					// create+expunge-in-window phantoms) out of the count.
+					// ClientTotal = ClientKnownActive + ClientKnownExpungedSince
+					// SeqNum = ClientTotal - COUNT(ClientView AND uid > Target)
 					batch.Queue(`
 						SELECT (
-							(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL) +
-							(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND expunged_at IS NOT NULL AND expunged_modseq > $2)
+							(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND created_modseq <= $2 AND expunged_at IS NULL) +
+							(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND created_modseq <= $2 AND expunged_at IS NOT NULL AND expunged_modseq > $2)
 						) - COUNT(*)::int
 						FROM messages
-						WHERE mailbox_id = $1 AND (expunged_at IS NULL OR expunged_modseq > $2) AND uid > $3
+						WHERE mailbox_id = $1 AND created_modseq <= $2 AND (expunged_at IS NULL OR expunged_modseq > $2) AND uid > $3
 					`, mailboxID, sinceModSeq, u.UID)
 				} else {
-					// Expunged forward count
+					// Expunged forward count: client-view messages (created at/before sinceModSeq,
+					// not yet acked as expunged) with uid <= target.
 					batch.Queue(`
 						SELECT COUNT(*)::int FROM messages
-						WHERE mailbox_id = $1 AND (expunged_at IS NULL OR expunged_modseq > $2) AND uid <= $3
+						WHERE mailbox_id = $1 AND created_modseq <= $2 AND (expunged_at IS NULL OR expunged_modseq > $2) AND uid <= $3
 					`, mailboxID, sinceModSeq, u.UID)
 				}
 			}
@@ -212,7 +225,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		seqRows, err := db.GetReadPool().Query(ctx, `
 			SELECT uid, expunged_modseq
 			FROM messages
-			WHERE mailbox_id = $1 AND (expunged_at IS NULL OR expunged_modseq > $2)
+			WHERE mailbox_id = $1 AND (expunged_at IS NULL OR (expunged_modseq > $2 AND created_modseq <= $2))
 			ORDER BY uid ASC
 		`, mailboxID, sinceModSeq)
 		if err != nil {
