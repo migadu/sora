@@ -71,6 +71,7 @@ type SMTPRelayHandler struct {
 	UseStartTLS    bool   // Use STARTTLS instead of direct TLS
 	TLSCertFile    string // Client certificate for mTLS (optional)
 	TLSKeyFile     string // Client key for mTLS (optional)
+	HELOHost       string // Hostname for EHLO/HELO greeting (empty = go-smtp default "localhost")
 	MetricsLabel   string
 	Logger         Logger
 	CircuitBreaker *circuitbreaker.CircuitBreaker // Circuit breaker for resilience
@@ -163,6 +164,16 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 			metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		}
 	}()
+
+	// Send EHLO/HELO with the configured hostname. When unset, go-smtp uses its
+	// default ("localhost"). For STARTTLS connections the pre-TLS EHLO already used
+	// the default; this sets the name on the post-upgrade EHLO, which is the one the
+	// receiving server records for the transaction.
+	if r.HELOHost != "" {
+		if relayErr = c.Hello(r.HELOHost); relayErr != nil {
+			return &RelayError{Err: relayErr, Permanent: IsPermanentError(relayErr)}
+		}
+	}
 
 	if relayErr = c.Mail(from, nil); relayErr != nil {
 		// Classify SMTP error (5xx = permanent, 4xx = temporary)
@@ -315,7 +326,7 @@ type CircuitBreakerConfig struct {
 }
 
 // NewRelayHandlerFromConfig creates the appropriate relay handler based on configuration with circuit breaker
-func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsLabel string, useTLS, tlsVerify, useStartTLS bool, tlsCertFile, tlsKeyFile string, logger Logger, cbConfig CircuitBreakerConfig) RelayHandler {
+func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsLabel string, useTLS, tlsVerify, useStartTLS bool, tlsCertFile, tlsKeyFile, heloHost string, logger Logger, cbConfig CircuitBreakerConfig) RelayHandler {
 	// Apply defaults if not set
 	if cbConfig.Threshold <= 0 {
 		cbConfig.Threshold = 5
@@ -361,6 +372,7 @@ func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsL
 			UseStartTLS:    useStartTLS,
 			TLSCertFile:    tlsCertFile,
 			TLSKeyFile:     tlsKeyFile,
+			HELOHost:       heloHost,
 			MetricsLabel:   metricsLabel,
 			Logger:         logger,
 			CircuitBreaker: cb,

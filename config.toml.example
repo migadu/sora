@@ -557,6 +557,7 @@ smtp_host = "smtp.example.com:587"                # SMTP relay host and port
 smtp_tls = true                                   # Use TLS (recommended: true)
 smtp_tls_verify = true                            # Verify TLS certificates (recommended: true)
 smtp_use_starttls = true                          # Use STARTTLS (port 587) instead of direct TLS (port 465)
+# smtp_helo_host = "mail.example.com"            # Hostname sent in EHLO/HELO (default: system hostname). Set to your FQDN for deliverability.
 # smtp_tls_cert_file = "/path/to/client.crt"     # Client certificate for mTLS (optional)
 # smtp_tls_key_file = "/path/to/client.key"      # Client key for mTLS (optional)
 

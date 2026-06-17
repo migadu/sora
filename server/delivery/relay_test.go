@@ -36,6 +36,7 @@ func TestNewRelayHandlerFromConfig(t *testing.T) {
 		useStartTLS         bool
 		tlsCertFile         string
 		tlsKeyFile          string
+		heloHost            string
 		expectedHandlerType string
 		expectedNil         bool
 	}{
@@ -47,6 +48,7 @@ func TestNewRelayHandlerFromConfig(t *testing.T) {
 			useTLS:              true,
 			tlsVerify:           true,
 			useStartTLS:         true,
+			heloHost:            "mail.example.com",
 			expectedHandlerType: "*delivery.SMTPRelayHandler",
 		},
 		{
@@ -82,6 +84,7 @@ func TestNewRelayHandlerFromConfig(t *testing.T) {
 				tt.useStartTLS,
 				tt.tlsCertFile,
 				tt.tlsKeyFile,
+				tt.heloHost,
 				logger,
 				CircuitBreakerConfig{}, // Use defaults
 			)
@@ -115,6 +118,9 @@ func TestNewRelayHandlerFromConfig(t *testing.T) {
 				}
 				if smtpHandler.UseStartTLS != tt.useStartTLS {
 					t.Errorf("Expected UseStartTLS %v, got %v", tt.useStartTLS, smtpHandler.UseStartTLS)
+				}
+				if smtpHandler.HELOHost != tt.heloHost {
+					t.Errorf("Expected HELOHost %s, got %s", tt.heloHost, smtpHandler.HELOHost)
 				}
 			}
 
@@ -355,6 +361,7 @@ func BenchmarkNewRelayHandlerFromConfig(b *testing.B) {
 				true,
 				"",
 				"",
+				"",
 				logger,
 				CircuitBreakerConfig{},
 			)
@@ -372,6 +379,7 @@ func BenchmarkNewRelayHandlerFromConfig(b *testing.B) {
 				false,
 				false,
 				false,
+				"",
 				"",
 				"",
 				logger,

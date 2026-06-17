@@ -480,6 +480,7 @@ func TestNewRelayHandlerFromConfigIntegration(t *testing.T) {
 				true,
 				"",
 				"",
+				"",
 				logger,
 				delivery.CircuitBreakerConfig{}, // Empty circuit breaker config (uses defaults)
 			)

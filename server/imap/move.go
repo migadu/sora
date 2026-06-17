@@ -116,7 +116,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	// Trigger spam training if configured and moving to/from Junk folder
 	if s.server.spamTraining != nil && len(messageUIDMap) > 0 {
-		s.triggerSpamTraining(s.ctx, selectedMailboxID, destMailbox.ID, s.selectedMailbox.Name, dest, messageUIDMap)
+		s.triggerSpamTraining(s.ctx, destMailbox.ID, s.selectedMailbox.Name, dest, messageUIDMap)
 	}
 
 	var mappedSourceUIDs []imap.UID

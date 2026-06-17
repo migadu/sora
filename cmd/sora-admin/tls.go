@@ -395,7 +395,7 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 			}
 
 			// Check if certificate exists in local cache
-			certInfo.InLocalCache, certInfo.LocalPath = checkLocalCache(cacheDir, certInfo.Domain, certInfo.S3Key)
+			certInfo.InLocalCache, certInfo.LocalPath = checkLocalCache(cacheDir, certInfo.Domain)
 
 			certs = append(certs, certInfo)
 
@@ -541,7 +541,7 @@ func parseCertificateData(data []byte, info *CertificateInfo) {
 	}
 }
 
-func checkLocalCache(cacheDir string, domain string, s3Key string) (bool, string) {
+func checkLocalCache(cacheDir string, domain string) (bool, string) {
 	// Check if cache directory exists
 	if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
 		return false, ""
@@ -1049,6 +1049,11 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	now := time.Now()
 
 	for _, domain := range domainsToCache {
+		// Honor cancellation between domains (each iteration may issue slow S3 downloads)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		// Cache both ECDSA and RSA variants
 		variants := []struct {
 			name string

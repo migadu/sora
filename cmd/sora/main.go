@@ -836,10 +836,11 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					cfg.Relay.SMTPUseStartTLS,
 					cfg.Relay.SMTPTLSCertFile,
 					cfg.Relay.SMTPTLSKeyFile,
+					cfg.Relay.GetSMTPHELOHost(),
 					&serverLogger{},
 					cbConfig,
 				)
-				logger.Info("Relay handler configured: type=smtp", "host", cfg.Relay.SMTPHost, "tls", cfg.Relay.SMTPTLS, "starttls", cfg.Relay.SMTPUseStartTLS, "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
+				logger.Info("Relay handler configured: type=smtp", "host", cfg.Relay.SMTPHost, "helo", cfg.Relay.GetSMTPHELOHost(), "tls", cfg.Relay.SMTPTLS, "starttls", cfg.Relay.SMTPUseStartTLS, "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
 			} else if cfg.Relay.IsHTTP() {
 				relayType = "http"
 				relayHandler = delivery.NewRelayHandlerFromConfig(
@@ -851,6 +852,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					false,
 					false,
 					false,
+					"",
 					"",
 					"",
 					&serverLogger{},

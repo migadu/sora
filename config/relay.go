@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"time"
 
 	"github.com/migadu/sora/helpers"
@@ -18,6 +19,7 @@ type RelayConfig struct {
 	SMTPUseStartTLS bool   `toml:"smtp_use_starttls"`  // Use STARTTLS instead of direct TLS (default: false)
 	SMTPTLSCertFile string `toml:"smtp_tls_cert_file"` // Client certificate for mTLS (optional)
 	SMTPTLSKeyFile  string `toml:"smtp_tls_key_file"`  // Client key for mTLS (optional)
+	SMTPHELOHost    string `toml:"smtp_helo_host"`     // Hostname to send in EHLO/HELO (default: "localhost"). Set to your FQDN for correct deliverability.
 
 	// HTTP API relay configuration
 	HTTPURL   string `toml:"http_url"`   // HTTP API endpoint (e.g., "https://api.example.com/v1/mail/deliver")
@@ -60,6 +62,19 @@ func (r *RelayConfig) IsHTTP() bool {
 // IsQueueEnabled returns true if relay is configured (queue is always enabled when relay is configured)
 func (r *RelayConfig) IsQueueEnabled() bool {
 	return r.IsConfigured()
+}
+
+// GetSMTPHELOHost returns the hostname to send in EHLO/HELO. If smtp_helo_host
+// is not configured, it falls back to the system hostname, and finally to
+// "localhost" if the system hostname cannot be determined.
+func (r *RelayConfig) GetSMTPHELOHost() string {
+	if r.SMTPHELOHost != "" {
+		return r.SMTPHELOHost
+	}
+	if hostname, err := os.Hostname(); err == nil && hostname != "" {
+		return hostname
+	}
+	return "localhost"
 }
 
 // GetQueuePath returns the queue path with default if not set

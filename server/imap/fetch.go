@@ -62,23 +62,6 @@ func safeExtractBinarySectionSize(bodyData []byte, section *imap.FetchItemBinary
 	return imapserver.ExtractBinarySectionSize(bytes.NewReader(bodyData), section)
 }
 
-const crlf = "\r\n"
-
-func extractPartial(b []byte, partial *imap.SectionPartial) []byte {
-	if partial == nil {
-		return b
-	}
-
-	end := partial.Offset + partial.Size
-	if partial.Offset > int64(len(b)) {
-		return nil
-	}
-	if end > int64(len(b)) {
-		end = int64(len(b))
-	}
-	return b[partial.Offset:end]
-}
-
 func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
 	start := time.Now()
 	recordMetrics := func(status string) {
@@ -272,8 +255,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 			if s.IMAPUser != nil {
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
-			// Use the previously captured sessionTrackerSnapshot for all messages
-			if err := s.writeMessageFetchData(w, &msg, options, selectedMailboxID, sessionTrackerSnapshot); err != nil {
+			if err := s.writeMessageFetchData(w, &msg, options, selectedMailboxID); err != nil {
 				writeErr = err
 				return err
 			}
@@ -300,7 +282,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 }
 
 // writeMessageFetchData handles writing all FETCH data items for a single message.
-func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, sessionTracker *imapserver.SessionTracker) error {
+func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64) error {
 	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
 
 	// ARCHITECTURE DECISION: Use database sequence numbers directly, not sessionTracker.EncodeSeqNum().
@@ -401,7 +383,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 
 	if len(options.BodySection) > 0 || len(options.BinarySection) > 0 || len(options.BinarySectionSize) > 0 {
 		if len(options.BodySection) > 0 {
-			if err := s.handleBodySections(m, &bodyData, &bodyDataFetched, options, msg, selectedMailboxID); err != nil {
+			if err := s.handleBodySections(m, &bodyData, &bodyDataFetched, options, msg); err != nil {
 				return err
 			}
 		}
@@ -576,7 +558,7 @@ func (s *IMAPSession) handleBinarySectionSize(w *imapserver.FetchResponseWriter,
 	return nil
 }
 
-func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message, selectedMailboxID int64) error {
+func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
 	for _, section := range options.BodySection {
 		var sectionContent []byte
 

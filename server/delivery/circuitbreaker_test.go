@@ -33,6 +33,7 @@ func TestSMTPRelayHandler_CircuitBreakerIntegration(t *testing.T) {
 		false,
 		"",
 		"",
+		"",
 		logger,
 		cbConfig,
 	)
@@ -126,6 +127,7 @@ func TestHTTPRelayHandler_CircuitBreakerIntegration(t *testing.T) {
 		false,
 		"",
 		"",
+		"",
 		logger,
 		cbConfig,
 	)
@@ -210,6 +212,7 @@ func TestCircuitBreaker_CustomConfiguration(t *testing.T) {
 				false,
 				"",
 				"",
+				"",
 				&testLogger{},
 				tt.config,
 			)
@@ -263,6 +266,7 @@ func TestCircuitBreaker_StateTransitions(t *testing.T) {
 		false,
 		false,
 		false,
+		"",
 		"",
 		"",
 		trackingLogger,
@@ -320,6 +324,7 @@ func TestCircuitBreaker_GetCircuitBreaker(t *testing.T) {
 			false,
 			"",
 			"",
+			"",
 			&testLogger{},
 			cbConfig,
 		)
@@ -346,6 +351,7 @@ func TestCircuitBreaker_GetCircuitBreaker(t *testing.T) {
 			false,
 			false,
 			false,
+			"",
 			"",
 			"",
 			&testLogger{},
@@ -390,6 +396,7 @@ func TestCircuitBreaker_PermanentErrorsDoNotTrigger(t *testing.T) {
 			false,
 			"",
 			"",
+			"",
 			logger,
 			cbConfig,
 		)
@@ -412,9 +419,10 @@ func TestCircuitBreaker_PermanentErrorsDoNotTrigger(t *testing.T) {
 		// We do this by checking the IsSuccessful logic manually since we can't easily inject errors
 		if smtpHandler.CircuitBreaker != nil {
 			// The IsSuccessful callback should return true for permanent errors
-			// This is what prevents them from counting toward circuit opening
-			shouldBeSuccessful := testErr == nil || IsPermanentError(testErr)
-			if !shouldBeSuccessful {
+			// This is what prevents them from counting toward circuit opening.
+			// IsPermanentError is the exact classification the callback uses for
+			// non-nil errors.
+			if !IsPermanentError(testErr) {
 				t.Error("Circuit breaker should treat permanent errors as successful")
 			}
 		}
@@ -442,6 +450,7 @@ func TestCircuitBreaker_PermanentErrorsDoNotTrigger(t *testing.T) {
 			false,
 			false,
 			false,
+			"",
 			"",
 			"",
 			logger,
@@ -495,6 +504,7 @@ func TestCircuitBreaker_PermanentErrorsDoNotTrigger(t *testing.T) {
 			false,
 			false,
 			false,
+			"",
 			"",
 			"",
 			logger,

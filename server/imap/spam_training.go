@@ -14,7 +14,7 @@ import (
 )
 
 // triggerSpamTraining submits messages for spam filter training when moved to/from Junk folder
-func (s *IMAPSession) triggerSpamTraining(ctx context.Context, srcMailboxID, destMailboxID int64, srcMailboxName, destMailboxName string, messageUIDMap map[imap.UID]imap.UID) {
+func (s *IMAPSession) triggerSpamTraining(ctx context.Context, destMailboxID int64, srcMailboxName, destMailboxName string, messageUIDMap map[imap.UID]imap.UID) {
 	// Determine if this is a spam training operation
 	var trainingType spamtraining.TrainingType
 	var isTraining bool
@@ -48,8 +48,9 @@ func (s *IMAPSession) triggerSpamTraining(ctx context.Context, srcMailboxID, des
 
 // submitMessageTraining fetches message from S3 and submits it for training
 func (s *IMAPSession) submitMessageTraining(ctx context.Context, mailboxID int64, uid imap.UID, trainingType spamtraining.TrainingType, userEmail, srcMailbox, destMailbox string) {
-	// Use background context to avoid cancellation when original context expires
-	bgCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// Detach from the caller's cancellation — this runs as a fire-and-forget goroutine
+	// that must outlive the IMAP command — while preserving the context's values (trace IDs, etc.).
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
 	defer cancel()
 
 	// Get message metadata
