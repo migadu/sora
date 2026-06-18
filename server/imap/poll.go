@@ -353,7 +353,9 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		for _, customFlag := range update.CustomFlags {
 			allFlags = append(allFlags, imap.Flag(customFlag))
 		}
-		s.mailboxTracker.QueueMessageFlags(update.SeqNum, update.UID, allFlags, nil)
+		// Pass the change's modseq so CONDSTORE-aware sessions receive MODSEQ in the
+		// unsolicited FETCH response (RFC 7162 §3.2); the writer omits it otherwise.
+		s.mailboxTracker.QueueMessageFlags(update.SeqNum, update.UID, allFlags, update.EffectiveModSeq, nil)
 	}
 
 	// Store sessionTracker reference before releasing lock to avoid race condition
