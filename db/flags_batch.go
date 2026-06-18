@@ -104,6 +104,11 @@ func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 
 	systemFlagsToSet, customKeywordsToSet := SplitFlags(newFlags)
 	bitwiseSystemFlags := FlagsToBitwise(systemFlagsToSet)
+	// Fold keywords onto the case already used in this mailbox (RFC 9051 §2.3.2).
+	customKeywordsToSet, err = db.canonicalizeKeywords(ctx, tx, mailboxID, customKeywordsToSet)
+	if err != nil {
+		return nil, err
+	}
 	if customKeywordsToSet == nil {
 		customKeywordsToSet = []string{}
 	}
@@ -172,6 +177,12 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 	}
 
 	systemFlagsToAdd, customKeywordsToAdd := SplitFlags(newFlags)
+	// Fold keywords onto the case already used in this mailbox (RFC 9051 §2.3.2)
+	// so adding a different-case variant of an existing keyword is a no-op merge.
+	customKeywordsToAdd, err = db.canonicalizeKeywords(ctx, tx, mailboxID, customKeywordsToAdd)
+	if err != nil {
+		return nil, err
+	}
 	if customKeywordsToAdd == nil {
 		customKeywordsToAdd = []string{}
 	}
@@ -247,6 +258,12 @@ func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, mess
 	}
 
 	systemFlagsToRemove, customKeywordsToRemove := SplitFlags(flagsToRemove)
+	// Fold the keywords to remove onto the case stored in this mailbox
+	// (RFC 9051 §2.3.2) so removal is case-insensitive.
+	customKeywordsToRemove, err = db.canonicalizeKeywords(ctx, tx, mailboxID, customKeywordsToRemove)
+	if err != nil {
+		return nil, err
+	}
 	if customKeywordsToRemove == nil {
 		customKeywordsToRemove = []string{}
 	}

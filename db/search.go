@@ -190,10 +190,24 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 	// Flags - inline the flag bitmasks to allow Postgres to use partial indexes natively
 	// (e.g. idx_message_state_first_unseen) instead of parameterized variables that defeat the query planner
 	for _, flag := range criteria.Flag {
-		conditions = append(conditions, fmt.Sprintf("(%sflags & %d) != 0", statePrefix, FlagToBitwise(flag)))
+		bitwise := FlagToBitwise(flag)
+		if bitwise != 0 {
+			conditions = append(conditions, fmt.Sprintf("(%sflags & %d) != 0", statePrefix, bitwise))
+		} else {
+			param := nextParam()
+			args[param] = string(flag)
+			conditions = append(conditions, fmt.Sprintf("%scustom_flags @> jsonb_build_array(@%s::text)", statePrefix, param))
+		}
 	}
 	for _, flag := range criteria.NotFlag {
-		conditions = append(conditions, fmt.Sprintf("(%sflags & %d) = 0", statePrefix, FlagToBitwise(flag)))
+		bitwise := FlagToBitwise(flag)
+		if bitwise != 0 {
+			conditions = append(conditions, fmt.Sprintf("(%sflags & %d) = 0", statePrefix, bitwise))
+		} else {
+			param := nextParam()
+			args[param] = string(flag)
+			conditions = append(conditions, fmt.Sprintf("NOT (%scustom_flags @> jsonb_build_array(@%s::text))", statePrefix, param))
+		}
 	}
 
 	// MODSEQ filtering (CONDSTORE extension - RFC 7162)
@@ -512,6 +526,9 @@ func (db *Database) needsIndexScanBiasBuster(criteria *imap.SearchCriteria) bool
 // getMessagesQueryExecutor is a helper function to execute the message retrieval query,
 // handling both default and custom sorting with optimized query selection.
 func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, orderByClause string, limit int) ([]Message, error) {
+	if err := db.canonicalizeSearchCriteriaKeywords(ctx, nil, mailboxID, criteria); err != nil {
+		return nil, err
+	}
 	paramCounter := 0
 
 	var finalQueryString string
@@ -872,6 +889,9 @@ func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID int64, crit
 }
 
 func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, orderByClause string, limit int) ([]SearchMessageResult, error) {
+	if err := db.canonicalizeSearchCriteriaKeywords(ctx, nil, mailboxID, criteria); err != nil {
+		return nil, err
+	}
 	paramCounter := 0
 
 	var finalQueryString string
@@ -1206,4 +1226,83 @@ func (db *Database) SearchMessagesSorted(ctx context.Context, mailboxID int64, c
 		return nil, fmt.Errorf("SearchMessagesSorted: %w", err)
 	}
 	return messages, nil
+}
+
+// canonicalizeSearchCriteriaKeywords folds keywords in criteria.Flag and criteria.NotFlag
+// (including nested Not and Or search criteria) onto the canonical case established for the mailbox.
+func (db *Database) canonicalizeSearchCriteriaKeywords(ctx context.Context, tx pgx.Tx, mailboxID int64, criteria *imap.SearchCriteria) error {
+	if criteria == nil {
+		return nil
+	}
+
+	// Read canonical map once if there are any custom flags in this criteria tree.
+	var checkCustomFlags func(*imap.SearchCriteria) bool
+	checkCustomFlags = func(c *imap.SearchCriteria) bool {
+		if c == nil {
+			return false
+		}
+		for _, f := range c.Flag {
+			if FlagToBitwise(f) == 0 {
+				return true
+			}
+		}
+		for _, f := range c.NotFlag {
+			if FlagToBitwise(f) == 0 {
+				return true
+			}
+		}
+		for i := range c.Not {
+			if checkCustomFlags(&c.Not[i]) {
+				return true
+			}
+		}
+		for i := range c.Or {
+			if checkCustomFlags(&c.Or[i][0]) || checkCustomFlags(&c.Or[i][1]) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !checkCustomFlags(criteria) {
+		return nil
+	}
+
+	canonical, err := db.mailboxKeywordCanonicalMap(ctx, tx, mailboxID)
+	if err != nil {
+		return err
+	}
+
+	var rewrite func(*imap.SearchCriteria)
+	rewrite = func(c *imap.SearchCriteria) {
+		if c == nil {
+			return
+		}
+		for i, f := range c.Flag {
+			if FlagToBitwise(f) == 0 {
+				key := foldKeyword(string(f))
+				if canon, ok := canonical[key]; ok {
+					c.Flag[i] = imap.Flag(canon)
+				}
+			}
+		}
+		for i, f := range c.NotFlag {
+			if FlagToBitwise(f) == 0 {
+				key := foldKeyword(string(f))
+				if canon, ok := canonical[key]; ok {
+					c.NotFlag[i] = imap.Flag(canon)
+				}
+			}
+		}
+		for i := range c.Not {
+			rewrite(&c.Not[i])
+		}
+		for i := range c.Or {
+			rewrite(&c.Or[i][0])
+			rewrite(&c.Or[i][1])
+		}
+	}
+
+	rewrite(criteria)
+	return nil
 }

@@ -465,12 +465,13 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 	// Get current flags
 	var currentFlags int
 	var currentCustomFlags []byte
+	var mailboxID int64
 	err = tx.QueryRow(ctx, `
-		SELECT ms.flags, ms.custom_flags 
+		SELECT ms.flags, ms.custom_flags, m.mailbox_id
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
-	`, messageID, accountID).Scan(&currentFlags, &currentCustomFlags)
+	`, messageID, accountID).Scan(&currentFlags, &currentCustomFlags, &mailboxID)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -484,24 +485,42 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		json.Unmarshal(currentCustomFlags, &customFlags)
 	}
 
+	// Keyword identity is case-insensitive (RFC 9051 §2.3.2): fold incoming
+	// keywords onto the case already established for this mailbox so adds/removes
+	// match existing keywords regardless of case and never create a second variant.
+	canonical, err := db.mailboxKeywordCanonicalMap(ctx, tx, mailboxID)
+	if err != nil {
+		return err
+	}
+
 	// Apply flag changes
 	newFlags := currentFlags
 	for _, flag := range addFlags {
 		if strings.HasPrefix(flag, "\\") {
 			newFlags |= stringFlagToBitwise(flag)
-		} else {
-			if !contains(customFlags, flag) {
-				customFlags = append(customFlags, flag)
-			}
+			continue
+		}
+		canon, ok := canonical[foldKeyword(flag)]
+		if !ok {
+			// First case seen for this keyword in the mailbox becomes canonical.
+			canon = flag
+			canonical[foldKeyword(flag)] = flag
+		}
+		if !contains(customFlags, canon) {
+			customFlags = append(customFlags, canon)
 		}
 	}
 
 	for _, flag := range removeFlags {
 		if strings.HasPrefix(flag, "\\") {
 			newFlags &^= stringFlagToBitwise(flag)
-		} else {
-			customFlags = removeString(customFlags, flag)
+			continue
 		}
+		canon := flag
+		if c, ok := canonical[foldKeyword(flag)]; ok {
+			canon = c
+		}
+		customFlags = removeString(customFlags, canon)
 	}
 
 	customFlagsJSON, _ := json.Marshal(customFlags)

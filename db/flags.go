@@ -50,6 +50,145 @@ func SplitFlags(flags []imap.Flag) (systemFlags []imap.Flag, customKeywords []st
 	return
 }
 
+// foldKeyword returns the case-insensitive identity key for a keyword.
+// Per RFC 9051 §2.3.2, keyword matching is case-insensitive, so two keywords
+// that differ only in case (e.g. "WAREHOUSING" and "warehousing") are the same
+// keyword and must never be stored or advertised as two distinct values.
+func foldKeyword(kw string) string {
+	return strings.ToLower(kw)
+}
+
+// dedupKeywordsByFold collapses case-variants of the same keyword to a single
+// representative (the lexicographically smallest case, for determinism), so a
+// mailbox never advertises e.g. both "WAREHOUSING" and "warehousing" in its
+// FLAGS list (RFC 9051 §2.3.2). Order of the result is otherwise preserved.
+// Post-migration the stored data holds a single case per keyword, so this is a
+// no-op safety net that also covers cross-mailbox COPY/MOVE and any raced write.
+func dedupKeywordsByFold(in []string) []string {
+	if len(in) < 2 {
+		return in
+	}
+	// First pass: choose the representative case per fold key.
+	rep := make(map[string]string, len(in))
+	for _, kw := range in {
+		key := foldKeyword(kw)
+		if cur, ok := rep[key]; !ok || kw < cur {
+			rep[key] = kw
+		}
+	}
+	// Second pass: emit each fold key once, in first-seen order.
+	seen := make(map[string]struct{}, len(rep))
+	out := make([]string, 0, len(rep))
+	for _, kw := range in {
+		key := foldKeyword(kw)
+		if _, done := seen[key]; done {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, rep[key])
+	}
+	return out
+}
+
+// mailboxKeywordCanonicalMap returns a fold(keyword) -> canonical-case map of the
+// keywords already known for a mailbox, read from the custom_flags_cache registry
+// in mailbox_stats (maintained by the stats triggers). The read happens inside the
+// caller's transaction so concurrent flag writes observe a consistent registry.
+//
+// A missing stats row, NULL/empty cache, or unmarshal error yields an empty map
+// (treated as "no keywords known yet") rather than failing the flag write.
+func (db *Database) mailboxKeywordCanonicalMap(ctx context.Context, tx pgx.Tx, mailboxID int64) (map[string]string, error) {
+	var cacheJSON []byte
+	var err error
+	if tx != nil {
+		err = tx.QueryRow(ctx, `SELECT custom_flags_cache FROM mailbox_stats WHERE mailbox_id = $1`, mailboxID).Scan(&cacheJSON)
+	} else {
+		err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `SELECT custom_flags_cache FROM mailbox_stats WHERE mailbox_id = $1`, mailboxID).Scan(&cacheJSON)
+	}
+	canonical := make(map[string]string)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return canonical, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read custom_flags_cache for mailbox %d: %w", mailboxID, err)
+	}
+	if len(cacheJSON) == 0 {
+		return canonical, nil
+	}
+	var existing []string
+	if err := json.Unmarshal(cacheJSON, &existing); err != nil {
+		// A malformed cache must not break flag writes; treat as an empty registry.
+		log.Printf("Database: failed to unmarshal custom_flags_cache for mailbox %d: %v", mailboxID, err)
+		return canonical, nil
+	}
+	for _, e := range existing {
+		if e == "" || strings.HasPrefix(e, "\\") {
+			continue
+		}
+		key := foldKeyword(e)
+		// Legacy/raced caches may still hold >1 case for a keyword; pick a stable
+		// representative (lexicographically smallest) so the result is deterministic.
+		// Post-migration the cache holds a single case per keyword, so this is a no-op.
+		if cur, ok := canonical[key]; !ok || e < cur {
+			canonical[key] = e
+		}
+	}
+	return canonical, nil
+}
+
+// canonicalizeKeywords folds each keyword onto the case already established for it
+// in the mailbox, implementing case-insensitive keyword identity (RFC 9051 §2.3.2).
+// The first case seen for a keyword in a mailbox is its canonical form; later
+// references in any other case are mapped onto it. A keyword with no existing
+// variant is returned unchanged and establishes the canonical case going forward.
+//
+// keywords must already be split out from system flags (no '\'-prefixed values).
+// Returns a sorted, duplicate-free slice (matching SplitFlags' output contract):
+// folding two input cases onto one canonical value can introduce duplicates.
+//
+// Callers should only invoke this when there is at least one custom keyword; an
+// empty input returns immediately without touching the database.
+func (db *Database) canonicalizeKeywords(ctx context.Context, tx pgx.Tx, mailboxID int64, keywords []string) ([]string, error) {
+	if len(keywords) == 0 {
+		return keywords, nil
+	}
+
+	canonical, err := db.mailboxKeywordCanonicalMap(ctx, tx, mailboxID)
+	if err != nil {
+		return nil, err
+	}
+
+	return foldKeywordsWithMap(canonical, keywords), nil
+}
+
+// foldKeywordsWithMap folds keywords onto the canonical case held in `canonical`
+// (fold-key -> canonical-case). A keyword with no entry registers its own case as
+// the canonical one (first-seen wins) by mutating the map, so the SAME map can be
+// threaded across many messages — e.g. a single-mailbox import batch or a MOVE of
+// several messages — to keep every message's keyword case consistent without a
+// per-message database round-trip.
+//
+// keywords must already be split out from system flags (no '\'-prefixed values).
+// Returns a sorted, duplicate-free slice (matching SplitFlags' output contract).
+func foldKeywordsWithMap(canonical map[string]string, keywords []string) []string {
+	if len(keywords) == 0 {
+		return keywords
+	}
+	out := make([]string, 0, len(keywords))
+	for _, kw := range keywords {
+		key := foldKeyword(kw)
+		if c, ok := canonical[key]; ok {
+			out = append(out, c)
+		} else {
+			canonical[key] = kw
+			out = append(out, kw)
+		}
+	}
+	slices.Sort(out)
+	out = slices.Compact(out)
+	return out
+}
+
 // resolveMessageID resolves a (mailbox_id, uid) pair to a message_id using
 // the unique index on messages(mailbox_id, uid). This decouples flag updates
 // from the messages table, enabling direct PK updates on message_state
@@ -125,6 +264,11 @@ func (db *Database) SetMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 
 	systemFlagsToSet, customKeywordsToSet := SplitFlags(newFlags)
 	bitwiseSystemFlags := FlagsToBitwise(systemFlagsToSet)
+	// Fold keywords onto the case already used in this mailbox (RFC 9051 §2.3.2).
+	customKeywordsToSet, err = db.canonicalizeKeywords(ctx, tx, mailboxID, customKeywordsToSet)
+	if err != nil {
+		return nil, 0, err
+	}
 	customKeywordsJSON, err := json.Marshal(customKeywordsToSet)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to marshal custom keywords for SetMessageFlags: %w", err)
@@ -155,6 +299,13 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 	}
 
 	systemFlagsToAdd, customKeywordsToAdd := SplitFlags(newFlags)
+	// Fold keywords onto the case already used in this mailbox (RFC 9051 §2.3.2)
+	// so adding a different-case variant of an existing keyword is a no-op merge
+	// rather than creating a duplicate.
+	customKeywordsToAdd, err = db.canonicalizeKeywords(ctx, tx, mailboxID, customKeywordsToAdd)
+	if err != nil {
+		return nil, 0, err
+	}
 	hasCustom := len(customKeywordsToAdd) > 0
 	var finalModSeq int64
 	var hasUpdate bool
@@ -237,6 +388,12 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUI
 	}
 
 	systemFlagsToRemove, customKeywordsToRemove := SplitFlags(flagsToRemove)
+	// Fold the keywords to remove onto the case stored in this mailbox
+	// (RFC 9051 §2.3.2) so removal is case-insensitive.
+	customKeywordsToRemove, err = db.canonicalizeKeywords(ctx, tx, mailboxID, customKeywordsToRemove)
+	if err != nil {
+		return nil, 0, err
+	}
 	var finalModSeq int64
 	var hasUpdate bool
 
@@ -343,7 +500,7 @@ func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxI
 			for i, f := range sanitizedFlags {
 				result[i] = string(f)
 			}
-			return result, nil
+			return dedupKeywordsByFold(result), nil
 		}
 		// If unmarshal fails, fall through to the full scan
 		log.Printf("Database: failed to unmarshal custom_flags_cache for mailbox %d, falling back to full scan", mailboxID)
@@ -385,5 +542,5 @@ func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxI
 		result[i] = string(f)
 	}
 
-	return result, nil
+	return dedupKeywordsByFold(result), nil
 }

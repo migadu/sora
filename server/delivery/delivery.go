@@ -171,6 +171,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// Determine target mailbox
 	var mailboxName string
 	var discarded bool
+	var sieveFlags []imap.Flag // flags set by the Sieve script (imap4flags, RFC 5232)
 
 	if recipient.TargetMailbox != "" {
 		// Use explicit target mailbox (bypasses Sieve - for migrations)
@@ -178,7 +179,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		discarded = false
 	} else {
 		// Execute Sieve scripts
-		mailboxName, discarded, err = d.SieveExecutor.ExecuteSieve(
+		mailboxName, discarded, sieveFlags, err = d.SieveExecutor.ExecuteSieve(
 			d.Ctx,
 			recipient,
 			messageEntity,
@@ -217,7 +218,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			References:           references,
 			BodyStructure:        bodyStructure,
 			Recipients:           recipients,
-			Flags:                []imap.Flag{}, // Unread
+			Flags:                sieveFlags, // Flags set by the Sieve script (imap4flags); empty -> unread
 			RawHeaders:           rawHeadersText,
 			FTSRetention:         d.FTSRetention,
 			PreservedUID:         recipient.PreservedUID,
@@ -340,7 +341,8 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 }
 
 // SaveMessageToMailbox saves a message to a specific mailbox (helper for Sieve :copy).
-func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient RecipientInfo, mailboxName string, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string) error {
+// flags carries any keywords/flags set by the Sieve script (imap4flags, RFC 5232).
+func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient RecipientInfo, mailboxName string, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string, flags []imap.Flag) error {
 	mailbox, err := d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, mailboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
@@ -397,7 +399,7 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 			References:    references,
 			BodyStructure: bodyStructure,
 			Recipients:    recipients,
-			Flags:         []imap.Flag{},
+			Flags:         flags,
 			RawHeaders:    rawHeadersText,
 			FTSRetention:  d.FTSRetention,
 		},

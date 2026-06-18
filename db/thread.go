@@ -28,6 +28,12 @@ const ThreadMaxMessages = 5000
 // GetMessagesForThreading executes a query to retrieve threading metadata for all matching messages.
 // It leverages idx_messages_mailbox_dates_uid for high performance index-only scans.
 func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, includeSubject bool) ([]ThreadMessageResult, error) {
+	// Fold custom keywords in the criteria onto the mailbox's canonical case so
+	// THREAD ... KEYWORD <name> matches case-insensitively (RFC 9051 §2.3.2),
+	// mirroring the SEARCH executors.
+	if err := db.canonicalizeSearchCriteriaKeywords(ctx, nil, mailboxID, criteria); err != nil {
+		return nil, err
+	}
 	paramCounter := 0
 	whereClause, whereArgs, err := db.buildSearchCriteria(criteria, "m", &paramCounter)
 	if err != nil {

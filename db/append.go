@@ -85,30 +85,39 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, fmt.Errorf("failed to get destination mailbox name: %w", err)
 	}
 
+	// Keyword identity is case-insensitive (RFC 9051 §2.3.2): fold each copied
+	// message's keywords onto the destination mailbox's canonical case so the
+	// destination never ends up reporting two cases of the same keyword.
+	customFlagsCanon, err := db.canonicalizeMovedCustomFlags(ctx, tx, destMailboxID, messageIDs)
+	if err != nil {
+		return nil, err
+	}
+
 	// Batch insert the copied messages.
 	// RFC 3501 §2.3.2: \Recent is a session flag and must NOT be stored
 	// persistently.  Preserve only the source message's existing flags.
 	_, err = tx.Exec(ctx, `
 		WITH src_data AS (
-			SELECT 
+			SELECT
 				m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
 				m.subject, m.sent_date, m.internal_date, m.size,
 				m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort,
 				m.id AS original_id,
-				d.new_uid
+				d.new_uid,
+				d.custom_flags_canon
 			FROM messages m
-			JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
+			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[]) AS d(message_id, new_uid, custom_flags_canon) ON m.id = d.message_id
 		),
 		inserted AS (
 			INSERT INTO messages (
-				account_id, content_hash, uploaded, message_id, in_reply_to, 
-				subject, sent_date, internal_date, size, 
+				account_id, content_hash, uploaded, message_id, in_reply_to,
+				subject, sent_date, internal_date, size,
 				body_structure, recipients_json, s3_domain, s3_localpart,
 				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
 				mailbox_id, mailbox_path, created_modseq, uid
 			)
-			SELECT 
+			SELECT
 				account_id, content_hash, uploaded, message_id, in_reply_to,
 				subject, sent_date, internal_date, size,
 				body_structure, recipients_json, s3_domain, s3_localpart,
@@ -121,11 +130,11 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 			RETURNING id, uid
 		)
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-		SELECT i.id, $1, ms.flags, ms.custom_flags, NOW(), nextval('messages_modseq')
+		SELECT i.id, $1, ms.flags, s.custom_flags_canon, NOW(), nextval('messages_modseq')
 		FROM inserted i
 		JOIN src_data s ON s.new_uid = i.uid
 		JOIN message_state ms ON ms.message_id = s.original_id
-	`, destMailboxID, destMailboxName, messageIDs, newUIDs)
+	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon)
 	if err != nil {
 		return nil, fmt.Errorf("failed to batch copy messages: %w", err)
 	}
@@ -357,6 +366,13 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 
 	systemFlagsToSet, customKeywordsToSet := SplitFlags(options.Flags)
 	bitwiseFlags := FlagsToBitwise(systemFlagsToSet)
+	// Fold keywords onto the case already used in this mailbox (RFC 9051 §2.3.2)
+	// so an APPEND/import carrying a different-case variant of an existing keyword
+	// does not introduce a second case.
+	customKeywordsToSet, err = d.canonicalizeKeywords(ctx, tx, options.MailboxID, customKeywordsToSet)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to canonicalize custom keywords for InsertMessage: %w", err)
+	}
 
 	var customKeywordsJSON []byte
 	if len(customKeywordsToSet) == 0 {
@@ -735,6 +751,13 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 
 	systemFlagsToSet, customKeywordsToSet := SplitFlags(options.Flags)
 	bitwiseFlags := FlagsToBitwise(systemFlagsToSet)
+	// Fold keywords onto the case already used in this mailbox (RFC 9051 §2.3.2)
+	// so an APPEND/import carrying a different-case variant of an existing keyword
+	// does not introduce a second case.
+	customKeywordsToSet, err = d.canonicalizeKeywords(ctx, tx, options.MailboxID, customKeywordsToSet)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to canonicalize custom keywords for InsertMessage: %w", err)
+	}
 
 	var customKeywordsJSON []byte
 	if len(customKeywordsToSet) == 0 {
@@ -904,6 +927,16 @@ func (d *Database) InsertMessagesBatch(
 		}
 	}
 
+	// Keyword identity is case-insensitive (RFC 9051 §2.3.2). This batch is
+	// single-mailbox, so read the mailbox's canonical keyword map once and fold
+	// every message's keywords onto it (first-seen case wins, shared across the
+	// whole batch). The per-write canonicalizer can't be used here: the cache is
+	// not updated until the batch commits, so it would see no intra-batch keywords.
+	batchCanonical, err := d.mailboxKeywordCanonicalMap(ctx, tx, mailboxID)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("InsertMessagesBatch: failed to read canonical keywords for mailbox %d: %w", mailboxID, err)
+	}
+
 	// 2. Pre-sanitize and process options
 	type processedMessage struct {
 		Opt                *InsertMessageOptions
@@ -993,6 +1026,8 @@ func (d *Database) InsertMessagesBatch(
 
 		inReplyToStr := strings.Join(opt.InReplyTo, " ")
 		systemFlagsToSet, customKeywordsToSet := SplitFlags(opt.Flags)
+		// Fold onto the batch's shared canonical map (RFC 9051 §2.3.2).
+		customKeywordsToSet = foldKeywordsWithMap(batchCanonical, customKeywordsToSet)
 		bitwiseFlags := FlagsToBitwise(systemFlagsToSet)
 
 		var customKeywordsJSON []byte

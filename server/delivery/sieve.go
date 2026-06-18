@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-message"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/sieveengine"
@@ -14,7 +16,7 @@ import (
 
 // SieveExecutor interface defines the contract for Sieve script execution.
 type SieveExecutor interface {
-	ExecuteSieve(ctx context.Context, recipient RecipientInfo, messageEntity *message.Entity, plaintextBody *string, fullMessageBytes []byte) (mailboxName string, discarded bool, err error)
+	ExecuteSieve(ctx context.Context, recipient RecipientInfo, messageEntity *message.Entity, plaintextBody *string, fullMessageBytes []byte) (mailboxName string, discarded bool, flags []imap.Flag, err error)
 }
 
 // VacationOracle implements the sieveengine.VacationOracle interface using the database.
@@ -52,7 +54,7 @@ type StandardSieveExecutor struct {
 
 // ExecuteSieve executes Sieve scripts and returns target mailbox.
 // Returns: mailboxName, discarded, error
-func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient RecipientInfo, messageEntity *message.Entity, plaintextBody *string, fullMessageBytes []byte) (string, bool, error) {
+func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient RecipientInfo, messageEntity *message.Entity, plaintextBody *string, fullMessageBytes []byte) (string, bool, []imap.Flag, error) {
 	// Default to INBOX
 	mailboxName := consts.MailboxInbox
 
@@ -73,7 +75,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	activeScript, err := s.DeliveryCtx.RDB.GetActiveScriptWithRetry(ctx, recipient.AccountID)
 	if err != nil && err != consts.ErrDBNotFound {
 		// Non-critical error, continue with INBOX delivery
-		return mailboxName, false, nil
+		return mailboxName, false, nil, nil
 	}
 
 	var result sieveengine.Result
@@ -82,13 +84,13 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		executor, err := sieveengine.NewSieveExecutorWithOracle(activeScript.Script, recipient.AccountID, s.VacationOracle)
 		if err != nil {
 			metrics.SieveExecutions.WithLabelValues(s.DeliveryCtx.MetricsLabel, "failure").Inc()
-			return mailboxName, false, nil
+			return mailboxName, false, nil, nil
 		}
 
 		result, err = executor.Evaluate(ctx, sieveCtx)
 		if err != nil {
 			metrics.SieveExecutions.WithLabelValues(s.DeliveryCtx.MetricsLabel, "failure").Inc()
-			return mailboxName, false, nil
+			return mailboxName, false, nil, nil
 		}
 
 		metrics.SieveExecutions.WithLabelValues(s.DeliveryCtx.MetricsLabel, "success").Inc()
@@ -97,18 +99,22 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		result = sieveengine.Result{Action: sieveengine.ActionKeep}
 	}
 
+	// Flags set by the Sieve script via imap4flags (RFC 5232). Applied to every
+	// locally stored copy of the message.
+	sieveFlags := helpers.SanitizeFlags(helpers.StringsToFlags(result.Flags))
+
 	// Process result
 	switch result.Action {
 	case sieveengine.ActionDiscard:
-		return "", true, nil
+		return "", true, nil, nil
 
 	case sieveengine.ActionFileInto:
 		mailboxName = result.Mailbox
 		if result.Copy {
 			// Save to specified mailbox
-			err := s.DeliveryCtx.SaveMessageToMailbox(ctx, recipient, result.Mailbox, fullMessageBytes, messageEntity, plaintextBody)
+			err := s.DeliveryCtx.SaveMessageToMailbox(ctx, recipient, result.Mailbox, fullMessageBytes, messageEntity, plaintextBody, sieveFlags)
 			if err != nil {
-				return "", false, err
+				return "", false, nil, err
 			}
 			// Also save to INBOX
 			mailboxName = consts.MailboxInbox
@@ -122,7 +128,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 				err := s.RelayHandler.SendToExternalRelay(recipient.FromAddress.FullAddress(), result.RedirectTo, fullMessageBytes)
 				if err == nil && !result.Copy {
 					// Successfully redirected without copy
-					return "", true, nil
+					return "", true, nil, nil
 				}
 			} else if s.RelayQueue != nil {
 				// Queue for background delivery with retry
@@ -132,7 +138,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 					s.DeliveryCtx.Logger.Log("Failed to enqueue redirect message: %v", err)
 				} else if !result.Copy {
 					// Successfully queued for redirect without copy
-					return "", true, nil
+					return "", true, nil, nil
 				}
 			}
 		}
@@ -150,5 +156,5 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		mailboxName = consts.MailboxInbox
 	}
 
-	return mailboxName, false, nil
+	return mailboxName, false, sieveFlags, nil
 }

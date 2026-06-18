@@ -646,6 +646,14 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	s.InfoLog("executing sieve action", "action", result.Action)
 
+	// Flags set by the Sieve script via imap4flags (RFC 5232: setflag/addflag/
+	// removeflag). The Sieve engine resolves them into result.Flags; apply them to
+	// every locally stored copy. Sanitize to drop NIL/empty values.
+	sieveFlags := helpers.SanitizeFlags(helpers.StringsToFlags(result.Flags))
+	if len(sieveFlags) > 0 {
+		s.InfoLog("sieve set flags on message", "flags", result.Flags)
+	}
+
 	switch result.Action {
 	case sieveengine.ActionDiscard:
 		s.InfoLog("sieve message discarded")
@@ -659,7 +667,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 			// First save to the specified mailbox (with :create if specified)
 			err := s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
-				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, rawHeadersText, result.CreateMailbox)
+				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, rawHeadersText, result.CreateMailbox, sieveFlags)
 			if err != nil {
 				// Allow duplicates (message already in target mailbox)
 				if !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -674,7 +682,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 			// Call saveMessageToMailbox again for INBOX (no :create for INBOX - it always exists)
 			err = s.saveMessageToMailbox(consts.MailboxInbox, fullMessageBytes, contentHash,
-				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, rawHeadersText, false)
+				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, rawHeadersText, false, sieveFlags)
 			if err != nil {
 				// Allow duplicates (message already in INBOX)
 				if !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -744,7 +752,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	// For fileinto actions without :copy, pass the :create flag if specified
 	createMailbox := result.Action == sieveengine.ActionFileInto && result.CreateMailbox
 	err = s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
-		subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, rawHeadersText, createMailbox)
+		subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, rawHeadersText, createMailbox, sieveFlags)
 	if err != nil {
 		// Handle duplicate messages (acceptable in LMTP - return success)
 		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -983,11 +991,14 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 	return nil
 }
 
-// saveMessageToMailbox saves a message to the specified mailbox
+// saveMessageToMailbox saves a message to the specified mailbox.
+// flags carries any keywords/flags set by the Sieve script (imap4flags, RFC 5232);
+// they are stored on the message (InsertMessage folds keyword case per RFC 9051 §2.3.2).
 func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 	fullMessageBytes []byte, contentHash string, subject string, messageID string,
 	sentDate time.Time, inReplyTo []string, references []string, bodyStructure *imap.BodyStructure,
-	plaintextBody *string, recipients []helpers.Recipient, rawHeadersText string, createMailbox bool) error {
+	plaintextBody *string, recipients []helpers.Recipient, rawHeadersText string, createMailbox bool,
+	flags []imap.Flag) error {
 
 	// Create a context for read operations that respects session pinning
 	readCtx := s.ctx
@@ -1043,7 +1054,7 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 			References:    references,
 			BodyStructure: bodyStructure,
 			Recipients:    recipients,
-			Flags:         []imap.Flag{}, // Explicitly set empty flags to mark as unread
+			Flags:         flags, // Flags set by the Sieve script (imap4flags); empty -> unread
 			RawHeaders:    rawHeadersText,
 			FTSRetention:  s.backend.ftsRetention,
 		},

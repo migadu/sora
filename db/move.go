@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/emersion/go-imap/v2"
@@ -160,6 +161,17 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		}
 		logger.Info("Database: moved message(s) with new UIDs in same-mailbox move (old messages marked as expunged)", "count", len(messageIDs))
 	} else {
+		// Different mailbox: keyword identity is case-insensitive (RFC 9051 §2.3.2),
+		// so fold each moved message's keywords onto the DESTINATION mailbox's
+		// canonical case before inserting. Without this, a message carrying
+		// "WAREHOUSING" moved into a mailbox whose canonical case is "warehousing"
+		// would leave that mailbox reporting two cases of the same keyword across
+		// its messages — the per-message inconsistency that trips strict clients.
+		customFlagsCanon, err := db.canonicalizeMovedCustomFlags(ctx, tx, destMailboxID, messageIDs)
+		if err != nil {
+			return nil, err
+		}
+
 		// Different mailbox: normal insert from existing rows
 		_, err = tx.Exec(ctx, `
 			WITH src_data AS (
@@ -169,9 +181,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort,
 					m.id AS original_id,
-					d.new_uid
+					d.new_uid,
+					d.custom_flags_canon
 				FROM messages m
-				JOIN unnest($3::bigint[], $4::bigint[]) AS d(message_id, new_uid) ON m.id = d.message_id
+				JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[]) AS d(message_id, new_uid, custom_flags_canon) ON m.id = d.message_id
 			),
 			inserted AS (
 				INSERT INTO messages (
@@ -194,11 +207,11 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 				RETURNING id, uid
 			)
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-			SELECT i.id, $1, ms.flags, ms.custom_flags, NOW(), nextval('messages_modseq')
+			SELECT i.id, $1, ms.flags, s.custom_flags_canon, NOW(), nextval('messages_modseq')
 			FROM inserted i
 			JOIN src_data s ON s.new_uid = i.uid
 			JOIN message_state ms ON ms.message_id = s.original_id
-		`, destMailboxID, destMailboxName, messageIDs, newUIDs)
+		`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon)
 		if err != nil {
 			logger.Error("Database: failed to batch insert messages into destination mailbox", "err", err)
 			return nil, fmt.Errorf("failed to move messages: %w", err)
@@ -223,4 +236,57 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	}
 
 	return messageUIDMap, nil
+}
+
+// canonicalizeMovedCustomFlags returns, for each id in messageIDs (in order), the
+// JSON-encoded custom_flags array folded onto destMailboxID's canonical keyword
+// case (RFC 9051 §2.3.2). The result is parallel to messageIDs and is passed as a
+// jsonb[] into the cross-mailbox move INSERT, so a moved message adopts the
+// destination's existing case for any keyword it already uses; keywords new to the
+// destination keep their case and become canonical there (first-seen wins, shared
+// across the whole moved set). Every entry is a valid JSON array ("[]" when empty).
+func (db *Database) canonicalizeMovedCustomFlags(ctx context.Context, tx pgx.Tx, destMailboxID int64, messageIDs []int64) ([]string, error) {
+	destCanonical, err := db.mailboxKeywordCanonicalMap(ctx, tx, destMailboxID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read destination canonical keywords for move: %w", err)
+	}
+
+	srcCustomFlags := make(map[int64][]byte, len(messageIDs))
+	rows, err := tx.Query(ctx, `SELECT message_id, custom_flags FROM message_state WHERE message_id = ANY($1)`, messageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read source custom_flags for move: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var mid int64
+		var cf []byte
+		if err := rows.Scan(&mid, &cf); err != nil {
+			return nil, fmt.Errorf("failed to scan source custom_flags for move: %w", err)
+		}
+		srcCustomFlags[mid] = cf
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating source custom_flags for move: %w", err)
+	}
+
+	out := make([]string, len(messageIDs))
+	for i, mid := range messageIDs {
+		var kws []string
+		if raw := srcCustomFlags[mid]; len(raw) > 0 {
+			if err := json.Unmarshal(raw, &kws); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal source custom_flags for move (message %d): %w", mid, err)
+			}
+		}
+		folded := foldKeywordsWithMap(destCanonical, kws)
+		if len(folded) == 0 {
+			out[i] = "[]"
+			continue
+		}
+		encoded, err := json.Marshal(folded)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal canonical custom_flags for move (message %d): %w", mid, err)
+		}
+		out[i] = string(encoded)
+	}
+	return out, nil
 }

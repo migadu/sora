@@ -2,9 +2,11 @@ package imap
 
 import (
 	"context"
-	"github.com/migadu/sora/logger"
 	"sort"
+	"strings"
 	"sync"
+
+	"github.com/migadu/sora/logger"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -48,9 +50,18 @@ func getPermanentFlags() []imap.Flag {
 // found to be in use within this specific mailbox.
 // This is used for the FLAGS response in SELECT/EXAMINE.
 func getDisplayFlags(ctx context.Context, rdb *resilient.ResilientDatabase, dbMbox *db.DBMailbox) []imap.Flag {
-	// Start with a base set of system flags and common keywords
-	// Using a map to ensure uniqueness
-	flagsMap := make(map[imap.Flag]struct{})
+	// Keyword identity is case-insensitive (RFC 9051 §2.3.2), so we must never
+	// advertise two case-variants of the same keyword. Key the set by the folded
+	// (lower-cased) flag name and keep one representative case per identity.
+	// Base/system flags are added first and win the case choice, so a stored
+	// "$junk" never overrides the conventional "$Junk".
+	flagsByFold := make(map[string]imap.Flag)
+	addFlag := func(f imap.Flag) {
+		key := strings.ToLower(string(f))
+		if _, exists := flagsByFold[key]; !exists {
+			flagsByFold[key] = f
+		}
+	}
 
 	baseFlags := []imap.Flag{
 		// Standard system flags
@@ -68,7 +79,7 @@ func getDisplayFlags(ctx context.Context, rdb *resilient.ResilientDatabase, dbMb
 	}
 
 	for _, f := range baseFlags {
-		flagsMap[f] = struct{}{}
+		addFlag(f)
 	}
 
 	// Fetch custom flags actually used in this mailbox from the database
@@ -81,13 +92,13 @@ func getDisplayFlags(ctx context.Context, rdb *resilient.ResilientDatabase, dbMb
 			logger.Debug("Error fetching custom flags for mailbox", "mailbox_id", dbMbox.ID, "name", dbMbox.Name, "error", err)
 		} else {
 			for _, cf := range customFlagsFromDB {
-				flagsMap[imap.Flag(cf)] = struct{}{}
+				addFlag(imap.Flag(cf))
 			}
 		}
 	}
 
-	finalFlagsList := make([]imap.Flag, 0, len(flagsMap))
-	for f := range flagsMap {
+	finalFlagsList := make([]imap.Flag, 0, len(flagsByFold))
+	for _, f := range flagsByFold {
 		finalFlagsList = append(finalFlagsList, f)
 	}
 	sort.Slice(finalFlagsList, func(i, j int) bool { return finalFlagsList[i] < finalFlagsList[j] }) // For consistent order

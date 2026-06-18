@@ -74,6 +74,20 @@ func SanitizeUTF8ForFTS(s string) string {
 	return string(buf)
 }
 
+// StringsToFlags converts a slice of flag/keyword names (e.g. the flags resolved by
+// a Sieve script's imap4flags actions) into IMAP flags. It does not validate or
+// deduplicate; pair it with SanitizeFlags to drop invalid values.
+func StringsToFlags(names []string) []imap.Flag {
+	if len(names) == 0 {
+		return nil
+	}
+	flags := make([]imap.Flag, 0, len(names))
+	for _, n := range names {
+		flags = append(flags, imap.Flag(n))
+	}
+	return flags
+}
+
 // SanitizeFlags removes invalid flag values that could cause IMAP protocol errors.
 // This prevents issues like NIL appearing as a flag, which triggers errors:
 // "Keyword used without being in FLAGS: NIL"
