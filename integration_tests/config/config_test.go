@@ -291,3 +291,51 @@ remote_port = "993"
 
 	t.Logf("Successfully parsed proxy configs with remote_port from TOML")
 }
+
+// TestMasterUsernameConfigForBackends verifies that master_username / master_password are accepted
+// on POP3 and ManageSieve *backend* server blocks. main.go wires these into pop3.New/managesieve.New
+// (mirroring the IMAP backend) so that direct, non-proxied user@domain@MASTER logins work on all
+// three backends. This guards the config contract for those server types.
+func TestMasterUsernameConfigForBackends(t *testing.T) {
+	tomlContent := `
+[[server]]
+type = "pop3"
+name = "test-pop3-backend"
+addr = ":110"
+master_username = "admin"
+master_password = "secret-pass"
+
+[[server]]
+type = "managesieve"
+name = "test-managesieve-backend"
+addr = ":4190"
+master_username = "admin"
+master_password = "secret-pass"
+`
+
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "master_backend_config.toml")
+	if err := os.WriteFile(configFile, []byte(tomlContent), 0644); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+
+	cfg := &config.Config{}
+	if err := config.LoadConfigFromFile(configFile, cfg); err != nil {
+		t.Fatalf("Failed to load test config: %v", err)
+	}
+
+	if len(cfg.DynamicServers) != 2 {
+		t.Fatalf("Expected 2 servers, got %d", len(cfg.DynamicServers))
+	}
+
+	for _, s := range cfg.DynamicServers {
+		if s.MasterUsername != "admin" {
+			t.Errorf("%s (%s): expected master_username=admin, got %q", s.Name, s.Type, s.MasterUsername)
+		}
+		if s.MasterPassword != "secret-pass" {
+			t.Errorf("%s (%s): expected master_password=secret-pass, got %q", s.Name, s.Type, s.MasterPassword)
+		}
+	}
+
+	t.Log("Successfully parsed master_username/master_password on POP3 and ManageSieve backend blocks")
+}
