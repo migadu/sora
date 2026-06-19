@@ -86,6 +86,12 @@ func (c *ManageSieveClient) Close() error {
 
 // setupManageSieveProxyWithMasterAuth creates ManageSieve proxy with master authentication configured
 func setupManageSieveProxyWithMasterAuth(t *testing.T, rdb *common.TestServer, proxyAddr string, backendAddrs []string) *common.TestServer {
+	return setupManageSieveProxyWithMasterUsername(t, rdb, proxyAddr, backendAddrs, proxyMasterUsername, proxyMasterPassword)
+}
+
+// setupManageSieveProxyWithMasterUsername is like setupManageSieveProxyWithMasterAuth but lets the
+// caller choose the client→proxy master username/password (e.g. a master token containing '@').
+func setupManageSieveProxyWithMasterUsername(t *testing.T, rdb *common.TestServer, proxyAddr string, backendAddrs []string, masterUsername, masterPassword string) *common.TestServer {
 	t.Helper()
 
 	hostname := "test-managesieve-proxy-master"
@@ -96,8 +102,8 @@ func setupManageSieveProxyWithMasterAuth(t *testing.T, rdb *common.TestServer, p
 		RemoteAddrs: backendAddrs,
 		RemotePort:  4190,
 		// Master credentials for CLIENT→PROXY authentication (@ separator format)
-		MasterUsername: proxyMasterUsername,
-		MasterPassword: proxyMasterPassword,
+		MasterUsername: masterUsername,
+		MasterPassword: masterPassword,
 		// Master credentials for PROXY→BACKEND authentication (SASL)
 		// MUST match what backend expects
 		MasterSASLUsername: proxyMasterSASLUsername,
@@ -241,6 +247,62 @@ func TestManageSieveProxy_MasterUsernameAuthentication(t *testing.T) {
 			t.Fatal("Expected authentication to fail with wrong master password through proxy")
 		}
 		t.Logf("✓ Authentication correctly failed with wrong master password: %s", response)
+	})
+}
+
+// TestManageSieveProxy_MasterTokenWithAtSign reproduces a master token that itself contains '@'.
+// The submitted username becomes user@domain@<master@token>, so the address parser must treat
+// everything after the SECOND '@' as the suffix and match it against the configured master username.
+func TestManageSieveProxy_MasterTokenWithAtSign(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Master token that contains an '@' (e.g. an email-like master identity).
+	const masterTokenWithAt = "admin@master.example.com"
+	const masterTokenPassword = "proxy_master_123"
+
+	backendServer, account := common.SetupManageSieveServerWithMaster(t)
+	defer backendServer.Close()
+
+	proxyAddress := common.GetRandomAddress(t)
+	proxy := setupManageSieveProxyWithMasterUsername(t, backendServer, proxyAddress, []string{backendServer.Address}, masterTokenWithAt, masterTokenPassword)
+	defer proxy.Close()
+
+	t.Run("AUTHENTICATE with master token containing @ through proxy", func(t *testing.T) {
+		client, err := NewManageSieveClient(proxyAddress)
+		if err != nil {
+			t.Fatalf("Failed to connect to ManageSieve proxy: %v", err)
+		}
+		defer client.Close()
+
+		// Submitted form: user@domain.com@admin@master.example.com
+		username := account.Email + "@" + masterTokenWithAt
+		authString := "\x00" + username + "\x00" + masterTokenPassword
+		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
+
+		if err := client.SendCommand(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"", encoded)); err != nil {
+			t.Fatalf("AUTHENTICATE command failed: %v", err)
+		}
+
+		response, err := client.ReadResponse()
+		if err != nil || !strings.HasPrefix(response, "OK") {
+			t.Fatalf("Authentication with @-containing master token failed: %s (err: %v)", response, err)
+		}
+		t.Log("✓ Authenticated through proxy with master token containing @")
+
+		// The session must bind to the impersonated account's scripts.
+		if err := client.SendCommand("LISTSCRIPTS"); err != nil {
+			t.Fatalf("LISTSCRIPTS command failed: %v", err)
+		}
+		for {
+			response, err := client.ReadResponse()
+			if err != nil {
+				t.Fatalf("Failed to read LISTSCRIPTS response: %v", err)
+			}
+			if response == "OK" {
+				break
+			}
+		}
+		t.Log("✓ LISTSCRIPTS successful through proxy with @-containing master token")
 	})
 }
 

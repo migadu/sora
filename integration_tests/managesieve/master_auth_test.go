@@ -274,6 +274,48 @@ func TestManageSieve_MasterSASLAuthentication(t *testing.T) {
 		}
 		t.Log("✓ LISTSCRIPTS successful")
 	})
+
+	// Regression: a master-SASL impersonation target carrying a +detail (subaddress) must
+	// resolve to the base account. The backend previously looked up FullAddress() here, which
+	// kept the +detail/@suffix and failed to find the credential (the proxy hits this path when
+	// it forwards a suffixed identity for a master/token login). It must use BaseAddress(),
+	// consistent with the master-username path and the IMAP/POP3 backends.
+	t.Run("AUTHENTICATE PLAIN impersonating a +detail target resolves to base account", func(t *testing.T) {
+		client, err := NewManageSieveClient(server.Address)
+		if err != nil {
+			t.Fatalf("Failed to connect to ManageSieve server: %v", err)
+		}
+		defer client.Close()
+
+		// Impersonate user+detail@domain — base address is account.Email.
+		detailTarget := strings.Replace(account.Email, "@", "+admin@", 1)
+		authString := detailTarget + "\x00" + masterSASLUsername + "\x00" + masterSASLPassword
+		encoded := base64.StdEncoding.EncodeToString([]byte(authString))
+
+		if err := client.SendCommand(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"", encoded)); err != nil {
+			t.Fatalf("AUTHENTICATE command failed: %v", err)
+		}
+
+		response, err := client.ReadResponse()
+		if err != nil || !strings.HasPrefix(response, "OK") {
+			t.Fatalf("Authentication failed for +detail impersonation target %q: %s (err: %v)", detailTarget, response, err)
+		}
+		t.Logf("✓ Authenticated impersonating %q (resolved to base account)", detailTarget)
+
+		if err := client.SendCommand("LISTSCRIPTS"); err != nil {
+			t.Fatalf("LISTSCRIPTS command failed: %v", err)
+		}
+		for {
+			response, err := client.ReadResponse()
+			if err != nil {
+				t.Fatalf("Failed to read LISTSCRIPTS response: %v", err)
+			}
+			if response == "OK" {
+				break
+			}
+		}
+		t.Log("✓ LISTSCRIPTS successful")
+	})
 }
 
 // TestManageSieve_MasterAuthenticationPriority tests authentication priority
