@@ -248,6 +248,8 @@ func main() {
 		handleVerifyCommand(ctx)
 	case "tls":
 		handleTLSCommand(ctx)
+	case "sieve":
+		handleSieveCommand(ctx)
 	default:
 		fmt.Printf("Unknown command: %s\n\n", command)
 		printUsage()
@@ -289,6 +291,7 @@ Commands:
   import        Import maildir data
   export        Export maildir data
   tls           TLS certificate management (list certificates from S3 and cache)
+  sieve         Manage user Sieve filtering scripts
   version       Show version information
   help          Show this help message
 
@@ -302,6 +305,8 @@ Examples:
   sora-admin --config config.toml connections kick --user user@example.com
   sora-admin --config config.toml affinity set --user user@example.com --protocol imap --backend 192.168.1.10:993
   sora-admin --config config.toml config validate
+  sora-admin --config config.toml sieve list --email user@example.com
+  sora-admin --config config.toml sieve put --email user@example.com --name myscript --file script.sieve
 
 Use 'sora-admin --config PATH <command> --help' for more information about a command group.
 Use 'sora-admin --config PATH <command> <subcommand> --help' for detailed help on specific commands.
