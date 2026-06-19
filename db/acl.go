@@ -48,6 +48,20 @@ const (
 	AnyoneIdentifier = "anyone"
 )
 
+// unionRights returns the set union of two ACL rights strings, preserving the
+// order of first appearance and removing duplicates.
+func unionRights(a, b string) string {
+	var sb strings.Builder
+	seen := make(map[rune]bool, len(a)+len(b))
+	for _, r := range a + b {
+		if !seen[r] {
+			seen[r] = true
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
 // ValidateACLRights checks if a rights string contains only valid ACL rights
 func ValidateACLRights(rights string) error {
 	for _, r := range rights {
@@ -256,55 +270,46 @@ func (db *Database) GetUserMailboxRights(ctx context.Context, mailboxID, account
 		return AllACLRights, nil
 	}
 
-	// Check ACL table for user-specific rights
-	var rights string
+	// Effective rights are the UNION of the user-specific ACL and any applicable
+	// "anyone" ACL. This matches has_mailbox_right(), which grants a right if EITHER
+	// entry contains it; MYRIGHTS must report the same set the server enforces.
+	// (RFC 4314 §2 leaves the combination of matching identifiers implementation-defined.)
+	var userRights string
 	err = db.GetReadPool().QueryRow(ctx, `
 		SELECT rights
 		FROM mailbox_acls
 		WHERE mailbox_id = $1 AND account_id = $2
-	`, mailboxID, accountID).Scan(&rights)
-	if err == nil {
-		return rights, nil
-	}
-	if err != pgx.ErrNoRows {
+	`, mailboxID, accountID).Scan(&userRights)
+	if err != nil && err != pgx.ErrNoRows {
 		return "", fmt.Errorf("failed to query user ACL: %w", err)
 	}
 
-	// No user-specific ACL, check for "anyone" identifier (same domain only)
+	// Add "anyone" rights for users in the mailbox owner's domain.
+	var anyoneRights string
 	if ownerDomain != nil {
-		// Get user's domain
 		var userDomain string
-		err = db.GetReadPool().QueryRow(ctx, `
+		derr := db.GetReadPool().QueryRow(ctx, `
 			SELECT SPLIT_PART(address, '@', 2)
 			FROM credentials
 			WHERE account_id = $1 AND primary_identity = TRUE
 		`, accountID).Scan(&userDomain)
-		if err != nil {
-			if err == pgx.ErrNoRows {
-				return "", nil // No primary credential, no access
-			}
-			return "", fmt.Errorf("failed to get user domain: %w", err)
+		if derr != nil && derr != pgx.ErrNoRows {
+			return "", fmt.Errorf("failed to get user domain: %w", derr)
 		}
-
-		// Check if user is in same domain and "anyone" ACL exists
-		if userDomain == *ownerDomain {
-			var anyoneRights string
-			err = db.GetReadPool().QueryRow(ctx, `
+		if derr == nil && userDomain == *ownerDomain {
+			aerr := db.GetReadPool().QueryRow(ctx, `
 				SELECT rights
 				FROM mailbox_acls
 				WHERE mailbox_id = $1 AND identifier = $2
 			`, mailboxID, AnyoneIdentifier).Scan(&anyoneRights)
-			if err == nil {
-				return anyoneRights, nil
-			}
-			if err != pgx.ErrNoRows {
-				return "", fmt.Errorf("failed to query 'anyone' ACL: %w", err)
+			if aerr != nil && aerr != pgx.ErrNoRows {
+				return "", fmt.Errorf("failed to query 'anyone' ACL: %w", aerr)
 			}
 		}
 	}
 
-	// No access found
-	return "", nil
+	// Union (empty if the user has neither a direct nor an "anyone" grant).
+	return unionRights(userRights, anyoneRights), nil
 }
 
 // GetAccessibleMailboxes returns all mailboxes accessible to a user

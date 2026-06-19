@@ -12,6 +12,7 @@ import (
 func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
 	// First, safely read session state with a single mutex acquisition
 	var selectedMailboxID int64
+	var selectedMailboxOwnerID int64
 	var decodedNumSet imap.NumSet
 
 	// Acquire read mutex to safely read session state
@@ -36,6 +37,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	}
 
 	selectedMailboxID = s.selectedMailbox.ID
+	selectedMailboxOwnerID = s.selectedMailbox.AccountID
 
 	// Capture modseq before unlocking
 	modSeqSnapshot := s.currentHighestModSeq.Load()
@@ -55,63 +57,33 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		Flags:  sanitizedFlags,
 	}
 
-	// Check ACL permissions based on which flags are being modified
-	// Need 'w' (write) for general flags, 's' (seen) for \Seen, 't' (delete-msg) for \Deleted
-	var needsWrite, needsSeen, needsDelete bool
-	for _, flag := range sanitizedFlags {
-		switch flag {
-		case imap.FlagSeen:
-			needsSeen = true
-		case imap.FlagDeleted:
-			needsDelete = true
-		default:
-			needsWrite = true
-		}
+	// RFC 4314 §4: STORE requires 's' to modify \Seen, 't' for \Deleted, and 'w'
+	// for all other flags. Fetch the user's rights once (owner fast-path).
+	storeRights, err := s.userRightsForMailbox(s.ctx, selectedMailboxID, selectedMailboxOwnerID)
+	if err != nil {
+		return s.internalError("failed to get user rights for mailbox: %v", err)
 	}
 
-	// Check required permissions
-	if needsWrite {
-		hasWriteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.AccountID(), 'w')
-		if err != nil {
-			return s.internalError("failed to check write permission: %v", err)
-		}
-		if !hasWriteRight {
-			s.DebugLog("user does not have write permission")
+	if sanitizedStoreFlags.Op != imap.StoreFlagsSet {
+		// Add (+FLAGS) / Del (-FLAGS) only touch the listed flags. RFC 4314 §4:
+		// STORE SHOULD NOT fail if the user can modify at least one specified flag,
+		// so apply the permitted subset and silently drop the rest; fail only when
+		// the user can modify none of them.
+		permitted := filterFlagsByRights(sanitizedFlags, storeRights)
+		if len(permitted) == 0 && len(sanitizedFlags) > 0 {
+			s.DebugLog("user lacks permission to modify any of the specified flags")
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNoPerm,
-				Text: "You do not have permission to modify flags on this mailbox",
+				Text: "You do not have permission to modify the specified flags",
 			}
 		}
+		sanitizedFlags = permitted
+		sanitizedStoreFlags.Flags = permitted
 	}
-	if needsSeen {
-		hasSeenRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.AccountID(), 's')
-		if err != nil {
-			return s.internalError("failed to check seen permission: %v", err)
-		}
-		if !hasSeenRight {
-			s.DebugLog("user does not have seen permission")
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeNoPerm,
-				Text: "You do not have permission to modify \\Seen flag on this mailbox",
-			}
-		}
-	}
-	if needsDelete {
-		hasDeleteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.AccountID(), 't')
-		if err != nil {
-			return s.internalError("failed to check delete permission: %v", err)
-		}
-		if !hasDeleteRight {
-			s.DebugLog("user does not have delete permission")
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeNoPerm,
-				Text: "You do not have permission to modify \\Deleted flag on this mailbox",
-			}
-		}
-	}
+	// Note: STORE FLAGS (replace) does not reject here. RFC 4314 §4 forbids modifying
+	// flags the user lacks rights for; a naive replace would also clear UNLISTED flags.
+	// The apply step below preserves the current value of each non-modifiable flag.
 
 	// Perform database operations outside of lock
 	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
@@ -188,7 +160,35 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		case imap.StoreFlagsDel:
 			batchResults, err = s.server.rdb.RemoveMessageFlagsBatchWithRetry(s.ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
 		case imap.StoreFlagsSet:
-			batchResults, err = s.server.rdb.SetMessageFlagsBatchWithRetry(s.ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
+			// RFC 4314 §4: a replace must not modify flags the user lacks rights for.
+			// Per message, compute the target = requested values for modifiable flags
+			// + preserved current values for the rest, then SET each distinct target
+			// as one batch. For the owner (full rights) every message's target equals
+			// the requested set, collapsing to a single batch (no behaviour change).
+			currentByUID := make(map[imap.UID][]imap.Flag, len(messages))
+			for _, msg := range messages {
+				cur := db.BitwiseToFlags(msg.BitwiseFlags)
+				for _, cf := range msg.CustomFlags {
+					cur = append(cur, imap.Flag(cf))
+				}
+				currentByUID[msg.UID] = cur
+			}
+			groupUIDs := make(map[string][]imap.UID)
+			groupFlags := make(map[string][]imap.Flag)
+			for _, uid := range validUIDs {
+				target := replaceTargetFlags(currentByUID[uid], sanitizedStoreFlags.Flags, storeRights)
+				key := flagSetKey(target)
+				groupUIDs[key] = append(groupUIDs[key], uid)
+				groupFlags[key] = target
+			}
+			for key, uids := range groupUIDs {
+				var res []db.BatchFlagUpdateResult
+				res, err = s.server.rdb.SetMessageFlagsBatchWithRetry(s.ctx, uids, selectedMailboxID, groupFlags[key])
+				if err != nil {
+					break
+				}
+				batchResults = append(batchResults, res...)
+			}
 		}
 
 		if err != nil {

@@ -271,7 +271,16 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// permanently.  It is tracked per-session via lastHighestUID / NumRecent in
 	// SELECT.  Storing it in the database bitfield causes every future FETCH
 	// FLAGS response to show \Recent, which is a protocol violation.
-	appendFlags := sanitizedFlags
+	//
+	// RFC 4314 §4: store only the flags the user has the right to set on the
+	// target mailbox (\Seen↔'s', \Deleted↔'t', other flags↔'w'); lacking a flag
+	// right must NOT fail the APPEND. The owner holds every right.
+	appendRights, err := s.userRightsForMailbox(readCtx, mailbox.ID, mailbox.AccountID)
+	if err != nil {
+		recordMetrics("failure")
+		return nil, s.internalError("failed to get user rights for mailbox '%s': %v", mboxName, err)
+	}
+	appendFlags := filterFlagsByRights(sanitizedFlags, appendRights)
 
 	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(s.ctx,
 		&db.InsertMessageOptions{

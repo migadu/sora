@@ -461,12 +461,108 @@ func TestACL_ListMyRights(t *testing.T) {
 	t.Logf("✓ All LISTRIGHTS/MYRIGHTS tests passed")
 }
 
-// TestACL_RightsResponseOnSelect tests for the RIGHTS response code on SELECT/EXAMINE.
+// TestACL_RightsResponseOnSelect verifies RFC 4314 §5.2 (READ-ONLY vs READ-WRITE
+// response code based on rights) and §5.1.1 (PERMANENTFLAGS reflects the user's
+// flag rights) on SELECT of a shared mailbox.
 func TestACL_RightsResponseOnSelect(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
-	// Note: This test verifies RFC 4314 compliance for RIGHTS response code
-	// The go-imap library may or may not support this response code yet
-	t.Skip("RIGHTS response code on SELECT is optional per RFC 4314")
+
+	server, account1 := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	email2, password2 := createSecondUser(t, server, "example.com", "rwcode")
+
+	c1, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer c1.Logout()
+	if err := c1.Login(account1.Email, account1.Password).Wait(); err != nil {
+		t.Fatalf("Owner login failed: %v", err)
+	}
+
+	sharedMailbox := fmt.Sprintf("Shared/TestRWCode-%d", common.GetTimestamp())
+	if err := c1.Create(sharedMailbox, nil).Wait(); err != nil {
+		t.Fatalf("Failed to create shared mailbox: %v", err)
+	}
+	defer func() { c1.Delete(sharedMailbox).Wait() }()
+
+	c2, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial for user2: %v", err)
+	}
+	defer c2.Logout()
+	if err := c2.Login(email2, password2).Wait(); err != nil {
+		t.Fatalf("User2 login failed: %v", err)
+	}
+
+	// Helper: re-grant rights, then SELECT as user2 and return the SelectData.
+	selectWithRights := func(rights string) *imap.SelectData {
+		t.Helper()
+		if err := c1.SetACL(sharedMailbox, imap.RightsIdentifier(email2), imap.RightModificationReplace, imap.RightSet(rights)).Wait(); err != nil {
+			t.Fatalf("SETACL %q failed: %v", rights, err)
+		}
+		data, err := c2.Select(sharedMailbox, nil).Wait()
+		if err != nil {
+			t.Fatalf("User2 SELECT with rights %q failed: %v", rights, err)
+		}
+		c2.Unselect().Wait()
+		return data
+	}
+
+	// 'lr' only: none of i/e/s/t/w → READ-ONLY, and no permanent flags.
+	d := selectWithRights("lr")
+	if !d.ReadOnly {
+		t.Errorf("rights 'lr': expected READ-ONLY SELECT, got READ-WRITE")
+	}
+	if len(d.PermanentFlags) != 0 {
+		t.Errorf("rights 'lr': expected empty PERMANENTFLAGS, got %v", d.PermanentFlags)
+	}
+
+	// 'lri': 'i' grants modify access → READ-WRITE, but no flag rights → no permanent flags.
+	d = selectWithRights("lri")
+	if d.ReadOnly {
+		t.Errorf("rights 'lri': expected READ-WRITE SELECT (has 'i'), got READ-ONLY")
+	}
+	if len(d.PermanentFlags) != 0 {
+		t.Errorf("rights 'lri': expected empty PERMANENTFLAGS (no s/t/w), got %v", d.PermanentFlags)
+	}
+
+	// 'lrs': 's' → READ-WRITE and PERMANENTFLAGS == [\Seen] only.
+	d = selectWithRights("lrs")
+	if d.ReadOnly {
+		t.Errorf("rights 'lrs': expected READ-WRITE SELECT, got READ-ONLY")
+	}
+	if !containsFlag(d.PermanentFlags, imap.FlagSeen) || containsFlag(d.PermanentFlags, imap.FlagDeleted) || containsFlag(d.PermanentFlags, imap.FlagWildcard) {
+		t.Errorf("rights 'lrs': expected PERMANENTFLAGS to contain only \\Seen, got %v", d.PermanentFlags)
+	}
+
+	// 'lrw': 'w' → READ-WRITE and PERMANENTFLAGS include \Answered/\Flagged/\Draft/\* but not \Seen/\Deleted.
+	d = selectWithRights("lrw")
+	if d.ReadOnly {
+		t.Errorf("rights 'lrw': expected READ-WRITE SELECT, got READ-ONLY")
+	}
+	if !containsFlag(d.PermanentFlags, imap.FlagWildcard) || !containsFlag(d.PermanentFlags, imap.FlagAnswered) {
+		t.Errorf("rights 'lrw': expected PERMANENTFLAGS to include \\* and \\Answered, got %v", d.PermanentFlags)
+	}
+	if containsFlag(d.PermanentFlags, imap.FlagSeen) || containsFlag(d.PermanentFlags, imap.FlagDeleted) {
+		t.Errorf("rights 'lrw': PERMANENTFLAGS should not include \\Seen (no 's') or \\Deleted (no 't'), got %v", d.PermanentFlags)
+	}
+
+	// Owner: full rights → READ-WRITE and full PERMANENTFLAGS including \*.
+	ownerData, err := c1.Select(sharedMailbox, nil).Wait()
+	if err != nil {
+		t.Fatalf("Owner SELECT failed: %v", err)
+	}
+	c1.Unselect().Wait()
+	if ownerData.ReadOnly {
+		t.Errorf("owner SELECT should be READ-WRITE, got READ-ONLY")
+	}
+	if !containsFlag(ownerData.PermanentFlags, imap.FlagWildcard) || !containsFlag(ownerData.PermanentFlags, imap.FlagSeen) || !containsFlag(ownerData.PermanentFlags, imap.FlagDeleted) {
+		t.Errorf("owner PERMANENTFLAGS should be the full set incl \\*, \\Seen, \\Deleted, got %v", ownerData.PermanentFlags)
+	}
+
+	t.Logf("✓ READ-ONLY/READ-WRITE response code and PERMANENTFLAGS correctly reflect ACL rights")
 }
 
 // TestACL_OwnerCannotBeLockedOut verifies that the owner always has full rights and cannot be locked out

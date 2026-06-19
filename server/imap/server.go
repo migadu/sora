@@ -650,10 +650,12 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// NOTE: APPENDLIMIT capability is automatically added by go-imap when it detects
 	// our SessionAppendLimit interface implementation (see imapserver/capability.go)
 
-	// Enable ACL capability only if shared mailboxes are enabled
-	if s.config != nil && s.config.SharedMailboxes.Enabled {
-		s.caps[imap.CapACL] = struct{}{} // RFC 4314 - Access Control List
-	}
+	// NOTE: ACL (RFC 4314) and its RIGHTS= capability are automatically added by
+	// go-imap when it detects our SessionACL interface implementation (the GetACL/
+	// SetACL/MyRights/etc. methods on IMAPSession; see imapserver/capability.go).
+	// Advertisement is therefore independent of SharedMailboxes.Enabled — the ACL
+	// commands (notably MYRIGHTS) are functional on a user's own mailboxes
+	// regardless of whether shared mailboxes are configured.
 
 	// Setup TLS if TLS is enabled and certificate and key files are provided
 	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {

@@ -6,6 +6,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 )
 
 func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData, error) {
@@ -51,12 +52,14 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 		return nil, s.internalError("failed to fetch destination mailbox '%s': %v", mboxName, err)
 	}
 
-	// Check ACL permissions - requires 'i' (insert) right on destination mailbox
-	hasInsertRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, destMailbox.ID, AccountID, 'i')
+	// RFC 4314 §4: COPY requires the 'i' (insert) right on the destination. We fetch
+	// the user's full rights here so the same value can drive per-flag filtering of
+	// the copied messages below (the owner holds every right).
+	destRights, err := s.userRightsForMailbox(s.ctx, destMailbox.ID, destMailbox.AccountID)
 	if err != nil {
-		return nil, s.internalError("failed to check insert permission on destination: %v", err)
+		return nil, s.internalError("failed to check destination permissions: %v", err)
 	}
-	if !hasInsertRight {
+	if !strings.ContainsRune(destRights, 'i') {
 		s.DebugLog("user does not have insert permission on destination", "mailbox", mboxName)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -92,6 +95,36 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 			}
 		}
 		return nil, s.internalError("failed to copy messages: %v", err)
+	}
+
+	// RFC 4314 §4: only flags the user has the right to set are stored on the newly
+	// created messages (\Seen↔'s', \Deleted↔'t', other flags↔'w'); a missing flag
+	// right must NOT fail the COPY. The owner holds every right, so this is a no-op
+	// for personal mailboxes. Copies preserve source flags, so we strip the ones the
+	// user may not set on the destination, grouped per flag for efficient batching.
+	if !(strings.ContainsRune(destRights, 's') && strings.ContainsRune(destRights, 't') && strings.ContainsRune(destRights, 'w')) {
+		stripUIDsByFlag := make(map[imap.Flag][]imap.UID)
+		for _, msg := range messages {
+			destUID, ok := uidMap[msg.UID]
+			if !ok {
+				continue
+			}
+			msgFlags := db.BitwiseToFlags(msg.BitwiseFlags)
+			for _, cf := range msg.CustomFlags {
+				msgFlags = append(msgFlags, imap.Flag(cf))
+			}
+			for _, f := range msgFlags {
+				if !flagRightHeld(f, destRights) {
+					stripUIDsByFlag[f] = append(stripUIDsByFlag[f], destUID)
+				}
+			}
+		}
+		for f, uids := range stripUIDsByFlag {
+			if _, rmErr := s.server.rdb.RemoveMessageFlagsBatchWithRetry(s.ctx, uids, destMailbox.ID, []imap.Flag{f}); rmErr != nil {
+				// The copy already succeeded; log and continue rather than fail it.
+				s.WarnLog("failed to strip flag the user cannot set on COPY", "flag", string(f), "error", rmErr)
+			}
+		}
 	}
 
 	// The uidMap contains the mapping of original UIDs to new UIDs.

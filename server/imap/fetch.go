@@ -71,6 +71,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
+	var selectedMailboxOwnerID int64
 	var sessionTrackerSnapshot *imapserver.SessionTracker
 	var decodedNumSet imap.NumSet
 
@@ -97,6 +98,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	}
 
 	selectedMailboxID = s.selectedMailbox.ID
+	selectedMailboxOwnerID = s.selectedMailbox.AccountID
 	sessionTrackerSnapshot = s.sessionTracker
 
 	// Capture modseq before unlocking
@@ -166,6 +168,21 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 		if !bs.Peek {
 			markSeen = true
 			break
+		}
+	}
+
+	// RFC 4314 §5.1.1: a FETCH that would implicitly set \Seen MUST NOT do so when the
+	// user lacks the 's' right on the mailbox. The owner always holds every right, so
+	// only shared-mailbox grantees incur the permission check. Fail closed (suppress the
+	// implicit \Seen) if the check itself errors.
+	if markSeen && selectedMailboxOwnerID != s.AccountID() {
+		hasSeen, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.AccountID(), db.ACLRightSeen)
+		if err != nil {
+			s.WarnLog("failed to check 's' right for implicit \\Seen; suppressing", "error", err)
+			markSeen = false
+		} else if !hasSeen {
+			s.DebugLog("user lacks 's' right; not implicitly marking messages \\Seen on FETCH")
+			markSeen = false
 		}
 	}
 

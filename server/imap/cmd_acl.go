@@ -4,11 +4,36 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 )
+
+// prepareACLIdentifier performs RFC 4314 §3 identifier preparation. Full SASLprep
+// is not applied (ACL identifiers here are email addresses or "anyone"); instead
+// we reject the cases a SASLprep pass would also reject — an empty/whitespace-only
+// identifier ("results in an empty string") or one containing control characters
+// (prohibited output). On failure the caller MUST respond BAD.
+func prepareACLIdentifier(identifier imap.RightsIdentifier) error {
+	id := string(identifier)
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("empty identifier")
+	}
+	// RFC 4314 §2: identifiers starting with "-" are reserved for "negative
+	// rights". This server does not implement negative rights, so such an
+	// identifier must be refused rather than treated as an ordinary account.
+	if strings.HasPrefix(id, "-") {
+		return fmt.Errorf("negative-right identifiers are not supported")
+	}
+	for _, r := range id {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("identifier contains control characters")
+		}
+	}
+	return nil
+}
 
 // ACL Extension (RFC 4314) Implementation
 //
@@ -86,7 +111,7 @@ func (s *IMAPSession) MyRights(mailbox string) (*imap.MyRightsData, error) {
 // GetACL retrieves the access control list for a mailbox.
 // RFC 4314 Section 3.3 - GETACL command
 //
-// The user must have either the 'l' (lookup) or 'a' (admin) right on the mailbox.
+// The user must have the 'a' (administer) right on the mailbox (RFC 4314 §3.3).
 func (s *IMAPSession) GetACL(mailbox string) (*imap.GetACLData, error) {
 	s.DebugLog("GETACL command", "mailbox", mailbox)
 
@@ -121,18 +146,16 @@ func (s *IMAPSession) GetACL(mailbox string) (*imap.GetACLData, error) {
 		return nil, s.internalError("failed to fetch mailbox '%s': %v", mailbox, err)
 	}
 
-	// Check permission - user needs 'l' (lookup) or 'a' (admin) right
-	hasLookup, err := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mbox.ID, AccountID, db.ACLRightLookup)
-	if err != nil {
-		return nil, s.internalError("failed to check lookup permission: %v", err)
-	}
+	// Check permission - RFC 4314 §3.3: GETACL requires the 'a' (administer) right.
+	// The owner implicitly holds 'a'. A lookup-only user must NOT be able to read the
+	// ACL (information disclosure), so 'l' alone is not accepted here.
 	hasAdmin, err := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mbox.ID, AccountID, db.ACLRightAdmin)
 	if err != nil {
 		return nil, s.internalError("failed to check admin permission: %v", err)
 	}
 
-	if !hasLookup && !hasAdmin {
-		s.DebugLog("user does not have permission to view ACL", "mailbox", mailbox)
+	if !hasAdmin {
+		s.DebugLog("user does not have admin permission to view ACL", "mailbox", mailbox)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNoPerm,
@@ -148,12 +171,37 @@ func (s *IMAPSession) GetACL(mailbox string) (*imap.GetACLData, error) {
 
 	// Convert ACL entries to IMAP format
 	// Use the identifier field directly (email or "anyone")
-	aclList := make([]imap.ACLEntry, 0, len(aclEntries))
+	aclList := make([]imap.ACLEntry, 0, len(aclEntries)+1)
 	for _, entry := range aclEntries {
 		aclList = append(aclList, imap.ACLEntry{
 			Identifier: imap.RightsIdentifier(entry.Identifier),
 			Rights:     stringToRightSet(entry.Rights),
 		})
+	}
+
+	// RFC 4314 §3.3 example shows the mailbox owner listed with full rights. The
+	// owner row is only materialized in mailbox_acls for shared mailboxes, so for
+	// personal mailboxes (and any case where it is absent) synthesize it, ensuring
+	// GETACL never returns an empty ACL that omits the owner. If the owner address
+	// cannot be resolved (rare data-integrity case), omit the synthesized entry
+	// rather than failing the whole command.
+	if ownerEmail, ownerErr := s.server.rdb.GetPrimaryEmailForAccountWithRetry(readCtx, mbox.AccountID); ownerErr != nil {
+		s.WarnLog("could not resolve mailbox owner for GETACL owner entry", "mailbox", mailbox, "error", ownerErr)
+	} else {
+		ownerIdentifier := ownerEmail.FullAddress()
+		ownerListed := false
+		for _, entry := range aclList {
+			if strings.EqualFold(string(entry.Identifier), ownerIdentifier) {
+				ownerListed = true
+				break
+			}
+		}
+		if !ownerListed {
+			aclList = append(aclList, imap.ACLEntry{
+				Identifier: imap.RightsIdentifier(ownerIdentifier),
+				Rights:     stringToRightSet(db.AllACLRights),
+			})
+		}
 	}
 
 	s.DebugLog("returning ACL entries", "count", len(aclList), "mailbox", mailbox)
@@ -170,6 +218,36 @@ func (s *IMAPSession) GetACL(mailbox string) (*imap.GetACLData, error) {
 // The user must have the 'a' (admin) right on the mailbox.
 func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, modification imap.RightModification, rights imap.RightSet) error {
 	s.DebugLog("SETACL command", "mailbox", mailbox, "identifier", identifier, "modification", modification, "rights", rights)
+
+	// RFC 4314 §3: prepare the identifier; an empty/invalid identifier MUST be
+	// refused with a BAD response.
+	if err := prepareACLIdentifier(identifier); err != nil {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Code: imap.ResponseCodeClientBug,
+			Text: "Invalid ACL identifier",
+		}
+	}
+
+	// RFC 4314 §3.1: an unrecognized right MUST cause a BAD response; the server
+	// MUST NOT silently ignore unrecognized rights. Validate before any normalization
+	// (rightSetToString silently drops unknown chars, which would otherwise let "ZZ"
+	// collapse to an empty set and revoke the entry). The go-imap wire layer has
+	// already expanded the obsolete virtual rights c/d to k/x/t/e, so the only valid
+	// characters at this point are the standard rights in db.AllACLRights.
+	for _, r := range rights {
+		if !strings.ContainsRune(db.AllACLRights, rune(r)) {
+			text := fmt.Sprintf("The %c right is not supported", rune(r))
+			if rune(r) >= 'A' && rune(r) <= 'Z' {
+				text = "Uppercase rights are not allowed"
+			}
+			return &imap.Error{
+				Type: imap.StatusResponseTypeBad,
+				Code: imap.ResponseCodeClientBug,
+				Text: text,
+			}
+		}
+	}
 
 	// Get user ID
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
@@ -322,6 +400,15 @@ func (s *IMAPSession) DeleteACL(mailbox string, identifier imap.RightsIdentifier
 func (s *IMAPSession) ListRights(mailbox string, identifier imap.RightsIdentifier) (*imap.ListRightsData, error) {
 	s.DebugLog("LISTRIGHTS command", "mailbox", mailbox, "identifier", identifier)
 
+	// RFC 4314 §3: an empty/invalid identifier MUST be refused with a BAD response.
+	if err := prepareACLIdentifier(identifier); err != nil {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeBad,
+			Code: imap.ResponseCodeClientBug,
+			Text: "Invalid ACL identifier",
+		}
+	}
+
 	// Get user ID
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
@@ -367,32 +454,41 @@ func (s *IMAPSession) ListRights(mailbox string, identifier imap.RightsIdentifie
 		}
 	}
 
-	// Verify identifier exists
+	// Verify the identifier. Special identifiers ("anyone") are valid without a
+	// backing account; any other identifier must resolve to an existing account.
 	identifierEmail := string(identifier)
-	_, err = s.server.rdb.GetAccountIDByAddressWithRetry(readCtx, identifierEmail)
-	if err != nil {
-		if err == consts.ErrUserNotFound {
-			return nil, &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeNonExistent,
-				Text: fmt.Sprintf("user '%s' does not exist", identifierEmail),
+	if !db.IsSpecialIdentifier(identifierEmail) {
+		_, err = s.server.rdb.GetAccountIDByAddressWithRetry(readCtx, identifierEmail)
+		if err != nil {
+			if err == consts.ErrUserNotFound {
+				return nil, &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeNonExistent,
+					Text: fmt.Sprintf("user '%s' does not exist", identifierEmail),
+				}
 			}
+			return nil, s.internalError("failed to get account ID for '%s': %v", identifierEmail, err)
 		}
-		return nil, s.internalError("failed to get account ID for '%s': %v", identifierEmail, err)
 	}
 
-	// Return all available rights
-	// Required rights: none (empty set)
-	// Optional rights: all ACL rights (lrswipkxtea)
-	allRights := stringToRightSet(db.AllACLRights)
+	// RFC 4314 §3.7: rights listed in the same string are "tied" — the server must
+	// grant them all or none. Sora grants every right independently, so each right
+	// is returned as its own single-character group rather than one bundled string
+	// (which would falsely advertise all 11 rights as an all-or-none unit). No
+	// rights are always-granted, so RequiredRights is empty. The go-imap wire layer
+	// adds the obsolete virtual c/d rights as their own groups.
+	optionalRights := make([]imap.RightSet, 0, len(db.AllACLRights))
+	for _, r := range db.AllACLRights {
+		optionalRights = append(optionalRights, imap.RightSet{imap.Right(r)})
+	}
 
 	s.DebugLog("returning available rights", "identifier", identifierEmail, "mailbox", mailbox)
 
 	return &imap.ListRightsData{
 		Mailbox:        mailbox,
 		Identifier:     identifier,
-		RequiredRights: imap.RightSet{},            // No required rights
-		OptionalRights: []imap.RightSet{allRights}, // All rights are optional
+		RequiredRights: imap.RightSet{},
+		OptionalRights: optionalRights,
 	}, nil
 }
 

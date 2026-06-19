@@ -527,12 +527,13 @@ func TestACL_PermissionDenied(t *testing.T) {
 		t.Logf("✓ DELETEACL correctly denied for user without admin rights: %v", err)
 	}
 
-	// User2 should be able to GETACL (requires 'l' lookup right which they have)
+	// User2 should NOT be able to GETACL - RFC 4314 §3.3 requires the 'a' (admin)
+	// right; lookup/read alone must not expose the ACL (information disclosure).
 	_, err = c2.GetACL(sharedMailbox).Wait()
-	if err != nil {
-		t.Errorf("GETACL should succeed for user with lookup rights: %v", err)
+	if err == nil {
+		t.Errorf("GETACL should fail for user without admin rights")
 	} else {
-		t.Logf("✓ GETACL succeeded for user with lookup rights")
+		t.Logf("✓ GETACL correctly denied for user without admin rights: %v", err)
 	}
 
 	// User2 should be able to MYRIGHTS (no special permission required)
@@ -589,4 +590,71 @@ func TestACL_CrossDomainDenied(t *testing.T) {
 	} else {
 		t.Logf("✓ SETACL correctly denied for cross-domain access: %v", err)
 	}
+}
+
+// TestACL_CompatibilityRights verifies RFC 4314 Section 2.1.1 (Obsolete Rights) compatibility.
+// If a client sets 'c' or 'd', they must be expanded.
+// When returning rights, the server must inject 'c' and 'd' back if the corresponding standard rights are set.
+func TestACL_CompatibilityRights(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account1 := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	domain := strings.Split(account1.Email, "@")[1]
+	email2 := fmt.Sprintf("user2-%d@%s", common.GetTimestamp(), domain)
+	password2 := "password2"
+
+	req := db.CreateAccountRequest{
+		Email:     email2,
+		Password:  password2,
+		HashType:  "bcrypt",
+		IsPrimary: true,
+	}
+	if _, err := server.ResilientDB.CreateAccountWithRetry(context.Background(), req); err != nil {
+		t.Fatalf("Failed to create second user: %v", err)
+	}
+
+	c1, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c1.Logout()
+
+	if err := c1.Login(account1.Email, account1.Password).Wait(); err != nil {
+		t.Fatalf("User1 login failed: %v", err)
+	}
+
+	sharedMailbox := "Shared/TestCompatRights"
+	if err := c1.Create(sharedMailbox, nil).Wait(); err != nil {
+		t.Fatalf("Failed to create shared mailbox: %v", err)
+	}
+	defer func() { c1.Delete(sharedMailbox).Wait() }()
+
+	// Grant user2 compatibility rights "c" and "d" along with "lrswi"
+	err = c1.SetACL(sharedMailbox, imap.RightsIdentifier(email2), imap.RightModificationReplace, imap.RightSet("lrswicd")).Wait()
+	if err != nil {
+		t.Fatalf("SETACL command failed with compatibility rights: %v", err)
+	}
+
+	// GETACL - should show 'c' and 'd' mapped back, plus their standard expansions 'k' and 'xte'
+	getACLData, err := c1.GetACL(sharedMailbox).Wait()
+	if err != nil {
+		t.Fatalf("GETACL command failed: %v", err)
+	}
+
+	user2Rights, foundUser2 := getACLData.Rights[imap.RightsIdentifier(email2)]
+	if !foundUser2 {
+		t.Fatalf("User2 not found in ACL response")
+	}
+	rightsStr := user2Rights.String()
+
+	// We expect 'k' (from 'c'), 'x', 't', 'e' (from 'd'), plus 'c' and 'd' for compatibility.
+	for _, r := range "lrswikxtecd" {
+		if !strings.ContainsRune(rightsStr, r) {
+			t.Errorf("Expected right %c to be present in returned rights %q", r, rightsStr)
+		}
+	}
+
+	t.Logf("✓ Compatibility rights 'c' and 'd' successfully set, expanded, and serialized: %s", rightsStr)
 }

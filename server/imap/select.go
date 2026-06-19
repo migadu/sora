@@ -82,6 +82,13 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 		}
 	}
 
+	// Compute the user's effective rights once, for READ-ONLY signalling (RFC 4314
+	// §5.2) and PERMANENTFLAGS filtering (§5.1.1).
+	userRights, err := s.userRightsForMailbox(readCtx, mailbox.ID, mailbox.AccountID)
+	if err != nil {
+		return nil, s.internalError("failed to get user rights for mailbox '%s': %v", mboxName, err)
+	}
+
 	currentSummary, err := s.server.rdb.GetMailboxSummaryWithRetry(readCtx, mailbox.ID)
 	if err != nil {
 		return nil, s.internalError("failed to get current summary for selected mailbox '%s': %v", mboxName, err)
@@ -220,8 +227,12 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	selectData := &imap.SelectData{
 		// Flags defined for this mailbox (system flags, common keywords, and in-use custom flags)
 		Flags: getDisplayFlags(readCtx, s.server.rdb, mailbox),
-		// Flags that can be changed, including \* for custom
-		PermanentFlags:    getPermanentFlags(),
+		// Flags that can be changed, restricted to the user's flag rights (RFC 4314 §5.1.1)
+		PermanentFlags: getPermanentFlags(userRights),
+		// RFC 4314 §5.2: SELECT is READ-ONLY when the user holds none of the rights
+		// that permit modifying the mailbox — insert ('i'), expunge ('e'), or the
+		// shared-flag rights (Sora shares all flags: 's','t','w').
+		ReadOnly:          !strings.ContainsAny(userRights, "iestw"),
 		NumMessages:       s.currentNumMessages.Load(),
 		UIDNext:           imap.UID(currentSummary.UIDNext),
 		UIDValidity:       s.selectedMailbox.UIDValidity,

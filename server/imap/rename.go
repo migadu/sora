@@ -116,6 +116,19 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 	newParts := strings.Split(newName, string(consts.MailboxDelimiter))
 	if len(newParts) > 1 {
 		newParentPath := strings.Join(newParts[:len(newParts)-1], string(consts.MailboxDelimiter))
+
+		// RFC 4314 §4: moving a mailbox to a DIFFERENT parent requires the "k"
+		// (create) right on the new parent — or, when the new parent must be
+		// auto-created, on the nearest existing ancestor that CREATE would extend.
+		// A pure rename that keeps the same parent needs no "k". (Owners hold "k".)
+		oldParts := strings.Split(existingName, string(consts.MailboxDelimiter))
+		oldParentPath := strings.Join(oldParts[:len(oldParts)-1], string(consts.MailboxDelimiter))
+		if !strings.EqualFold(oldParentPath, newParentPath) {
+			if permErr := s.checkCreateRightForHierarchy(newParentPath, ownerAccountID, AccountID); permErr != nil {
+				return permErr
+			}
+		}
+
 		newParentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, ownerAccountID, newParentPath)
 		if err == consts.ErrMailboxNotFound {
 			// Parent does not exist, so we need to create it.
@@ -149,5 +162,39 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 	}
 
 	s.DebugLog("mailbox renamed", "old_name", existingName, "new_name", newName)
+	return nil
+}
+
+// checkCreateRightForHierarchy verifies the acting user holds the "k" (create)
+// right on the nearest existing ancestor of newParentPath — the mailbox a CREATE
+// would extend — per RFC 4314 §4. It returns nil when an existing ancestor grants
+// "k", or when no ancestor exists yet (a top-level create in the user's own
+// namespace). ownerAccountID owns the hierarchy; accountID is the acting user.
+// This covers both an existing destination parent and one that must be auto-created.
+func (s *IMAPSession) checkCreateRightForHierarchy(newParentPath string, ownerAccountID, accountID int64) error {
+	parts := strings.Split(newParentPath, string(consts.MailboxDelimiter))
+	for i := len(parts); i >= 1; i-- {
+		ancestorPath := strings.Join(parts[:i], string(consts.MailboxDelimiter))
+		ancestor, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, ownerAccountID, ancestorPath)
+		if err == consts.ErrMailboxNotFound {
+			continue
+		}
+		if err != nil {
+			return s.internalError("failed to resolve ancestor mailbox '%s': %v", ancestorPath, err)
+		}
+		hasCreateRight, kerr := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, ancestor.ID, accountID, 'k')
+		if kerr != nil {
+			return s.internalError("failed to check create permission on '%s': %v", ancestorPath, kerr)
+		}
+		if !hasCreateRight {
+			s.DebugLog("user lacks create permission on destination hierarchy", "ancestor", ancestorPath)
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeNoPerm,
+				Text: "You do not have permission to create a mailbox under the destination parent",
+			}
+		}
+		return nil
+	}
 	return nil
 }

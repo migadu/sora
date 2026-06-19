@@ -36,13 +36,29 @@ func NewMailbox(dbmbx *db.DBMailbox, numMessages uint32, highestModSeq uint64) *
 	}
 }
 
-// GetPermanentFlags returns flags that can be permanently changed, including \* for custom flags.
-func getPermanentFlags() []imap.Flag {
-	// All mailboxes allow standard system flags to be set.
-	// The \* indicates that clients can define their own keywords.
-	return []imap.Flag{
-		imap.FlagSeen, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted, imap.FlagDraft, imap.FlagWildcard,
+// getPermanentFlags returns the flags the user can permanently change, restricted
+// to the rights they hold (RFC 4314 §5.1.1: FLAGS/PERMANENTFLAGS MUST reflect the
+// current user's rights). Per RFC 4314 §4: \Seen needs 's', \Deleted needs 't',
+// every other flag (and custom keywords, signalled by \*) needs 'w'. The mailbox
+// owner holds all rights, so this returns the full set for personal mailboxes.
+func getPermanentFlags(rights string) []imap.Flag {
+	hasW := strings.ContainsRune(rights, 'w')
+	flags := make([]imap.Flag, 0, 6)
+	if strings.ContainsRune(rights, 's') {
+		flags = append(flags, imap.FlagSeen)
 	}
+	if hasW {
+		flags = append(flags, imap.FlagAnswered, imap.FlagFlagged)
+	}
+	if strings.ContainsRune(rights, 't') {
+		flags = append(flags, imap.FlagDeleted)
+	}
+	if hasW {
+		// \Draft is an ordinary system flag ('w'); \* signals that the client may
+		// define its own keywords, which also requires 'w'.
+		flags = append(flags, imap.FlagDraft, imap.FlagWildcard)
+	}
+	return flags
 }
 
 // GetDisplayFlags returns flags that are "defined" for this mailbox.
