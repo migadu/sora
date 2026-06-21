@@ -503,6 +503,15 @@ func (s *POP3Session) handleConnection() {
 				return
 			}
 
+			// Check authentication state (atomic read, no lock needed)
+			if !s.authenticated.Load() {
+				recordMetrics("failure")
+				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
+					return
+				}
+				continue
+			}
+
 			// Create a context for read operations that respects session pinning (atomic read, no lock needed)
 			readCtx := ctx
 			if s.useMasterDB.Load() {
@@ -849,6 +858,15 @@ func (s *POP3Session) handleConnection() {
 				return
 			}
 
+			// Check authentication state (atomic read, no lock needed)
+			if !s.authenticated.Load() {
+				recordMetrics("failure")
+				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
+					return
+				}
+				continue
+			}
+
 			if len(parts) < 3 {
 				recordMetrics("failure")
 				if s.handleClientError(writer, "-ERR Missing message number or lines parameter\r\n") {
@@ -870,15 +888,6 @@ func (s *POP3Session) handleConnection() {
 			if err != nil || lines < 0 {
 				recordMetrics("failure")
 				if s.handleClientError(writer, "-ERR Invalid lines parameter\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if !s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
 					return
 				}
 				continue
@@ -1003,8 +1012,11 @@ func (s *POP3Session) handleConnection() {
 				// Dot-stuff per RFC 1939
 				stuffedResult := dotStuffPOP3(result)
 				writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", len(result)))
-				writer.WriteString(stuffedResult)
-				writer.WriteString("\r\n.\r\n")
+				if strings.HasSuffix(stuffedResult, "\r\n") {
+					writer.WriteString(stuffedResult + ".\r\n")
+				} else {
+					writer.WriteString(stuffedResult + "\r\n.\r\n")
+				}
 				s.DebugLog("retrieved headers for message", "uid", msg.UID)
 				// Free memory immediately after sending response
 				if s.memTracker != nil && bodyData != nil {
@@ -1050,8 +1062,11 @@ func (s *POP3Session) handleConnection() {
 
 			backendDuration = time.Since(start).Seconds()
 			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", len(result)))
-			writer.WriteString(stuffedResult)
-			writer.WriteString("\r\n.\r\n")
+			if strings.HasSuffix(stuffedResult, "\r\n") {
+				writer.WriteString(stuffedResult + ".\r\n")
+			} else {
+				writer.WriteString(stuffedResult + "\r\n.\r\n")
+			}
 			s.DebugLog("retrieved top lines of message", "lines", lines, "uid", msg.UID)
 
 			// Free memory immediately after sending response
@@ -1233,8 +1248,11 @@ func (s *POP3Session) handleConnection() {
 
 			backendDuration = time.Since(retrieveStart).Seconds()
 			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", msg.Size))
-			writer.WriteString(stuffedBody)
-			writer.WriteString("\r\n.\r\n")
+			if strings.HasSuffix(stuffedBody, "\r\n") {
+				writer.WriteString(stuffedBody + ".\r\n")
+			} else {
+				writer.WriteString(stuffedBody + "\r\n.\r\n")
+			}
 			s.DebugLog("retrieved message", "uid", msg.UID)
 
 			// Free memory immediately after sending response
@@ -1267,6 +1285,15 @@ func (s *POP3Session) handleConnection() {
 				metrics.CommandDuration.WithLabelValues("pop3", "NOOP").Observe(time.Since(start).Seconds())
 			}
 
+			// Check authentication state (atomic read, no lock needed)
+			if !s.authenticated.Load() {
+				recordMetrics("failure")
+				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
+					return
+				}
+				continue
+			}
+
 			writer.WriteString("+OK\r\n")
 
 			recordMetrics("success")
@@ -1283,6 +1310,15 @@ func (s *POP3Session) handleConnection() {
 				s.WarnLog("request aborted, aborting rset command")
 				recordMetrics("failure")
 				return
+			}
+
+			// Check authentication state (atomic read, no lock needed)
+			if !s.authenticated.Load() {
+				recordMetrics("failure")
+				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
+					return
+				}
+				continue
 			}
 
 			// Acquire write lock to update deleted map
@@ -1316,6 +1352,15 @@ func (s *POP3Session) handleConnection() {
 				return
 			}
 
+			// Check authentication state (atomic read, no lock needed)
+			if !s.authenticated.Load() {
+				recordMetrics("failure")
+				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
+					return
+				}
+				continue
+			}
+
 			if len(parts) < 2 {
 				logger.Debug("missing message number")
 				recordMetrics("failure")
@@ -1330,15 +1375,6 @@ func (s *POP3Session) handleConnection() {
 				s.DebugLog("dele invalid message number", "error", err)
 				recordMetrics("failure")
 				if s.handleClientError(writer, "-ERR Invalid message number\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if !s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
 					return
 				}
 				continue
