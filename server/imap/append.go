@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"time"
 
@@ -112,13 +113,29 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// Read the entire message into a buffer
 	var buf bytes.Buffer
 	if _, err = io.Copy(&buf, r); err != nil {
-		// Network read errors during APPEND command are typically:
-		// - unexpected EOF: client disconnected mid-transmission
-		// - context canceled: timeout or shutdown
-		// - connection reset: network interruption
+		// Network read errors during APPEND are typically a client disconnect,
+		// read timeout, or connection reset mid-transmission.
 		s.WarnLog("failed to read message data from network", "error", err, "bytes_read", buf.Len())
+
+		// Record the metric here (network_error / network_timeout, both client_error).
+		// We do NOT call recordMetrics() so slow-client socket timeouts don't skew P99.
 		s.classifyAndTrackError("APPEND", err, nil)
-		// Bypass metric tracking for client socket timeouts so they don't skew our P99 durations
+
+		// A network read failure is a client-side condition, not a server bug, so
+		// return a plain NO rather than [SERVERBUG] from internalError. Note: go-imap
+		// drains the literal after this handler returns (imapserver/append.go), so for
+		// a genuinely broken connection that drain fails too and the client never sees
+		// this reply — it matters only for the narrow case of a short LITERAL+ send on
+		// a still-open connection.
+		var netErr net.Error
+		if errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &netErr) {
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Text: "failed to read message: connection interrupted mid-transmission",
+			}
+		}
+
+		// Non-network read failure: keep [SERVERBUG]/[UNAVAILABLE] classification.
 		return nil, s.internalError("failed to read message: %v", err)
 	}
 
@@ -135,11 +152,13 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// where io.Copy returns nil error but reads no data.
 	if len(fullMessageBytes) == 0 {
 		s.WarnLog("rejecting empty message APPEND (0 bytes)")
-		recordMetrics("failure")
-		return nil, &imap.Error{
+		imapErr := &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: "empty message rejected: a message must contain at least headers",
 		}
+		metrics.ProtocolErrors.WithLabelValues("imap", "APPEND", "empty_message", "client_error").Inc()
+		recordMetrics("failure")
+		return nil, imapErr
 	}
 
 	// Extract raw headers string.

@@ -183,8 +183,8 @@ github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D
 github.com/matttproud/golang_protobuf_extensions v1.0.1/go.mod h1:D8He9yQNgCq6Z5Ld7szi9bcBfOoFv/3dc6xSMkL2PC0=
 github.com/miekg/dns v1.1.26 h1:gPxPSwALAeHJSjarOs00QjVdV9QoBvc1D2ujQUr5BzU=
 github.com/miekg/dns v1.1.26/go.mod h1:bPDLeHnStXmXAq1m/Ch/hvfNHr14JKNPMBo3VZKjuso=
-github.com/migadu/go-imap/v2 v2.0.0-20260621070605-69ce5237a8e1 h1:bJVlECH7upW/bT84Egeo/AZED3AeWLW1kyjHxean8q0=
-github.com/migadu/go-imap/v2 v2.0.0-20260621070605-69ce5237a8e1/go.mod h1:aYm5wcL+qOPSvjsoU54BBqAYWsuSNExkoly5VIygcVQ=
+github.com/migadu/go-imap/v2 v2.0.0-20260621130350-a60ab4235a72 h1:3PoABh4d0em++ci7Lu64ZOE09pz/LeLfifySEhRhzCc=
+github.com/migadu/go-imap/v2 v2.0.0-20260621130350-a60ab4235a72/go.mod h1:aYm5wcL+qOPSvjsoU54BBqAYWsuSNExkoly5VIygcVQ=
 github.com/migadu/go-message v0.0.0-20251204083122-d583d81190da h1:AOv2uDrSq1ly/RkWa46Dt6+Uj3nKyrPBd3AMhZxRSLk=
 github.com/migadu/go-message v0.0.0-20251204083122-d583d81190da/go.mod h1:XpJyL70LwRvq2a8rVbHXikPgKj8+aI0kGdHlg16ibYA=
 github.com/migadu/go-sieve v1.0.0 h1:drZVZNgaMAV7DWhr/Yt6TooE+dCM4H3y56OmF+T6mfs=

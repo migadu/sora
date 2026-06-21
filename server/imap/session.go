@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -203,7 +205,6 @@ func (s *IMAPSession) classifyAndTrackError(command string, err error, imapErr *
 	var errorType, severity string
 
 	if imapErr != nil {
-
 		// Classify based on IMAP error code and type
 		switch imapErr.Code {
 		case imap.ResponseCodeAuthenticationFailed:
@@ -221,6 +222,9 @@ func (s *IMAPSession) classifyAndTrackError(command string, err error, imapErr *
 		case imap.ResponseCodeTooBig:
 			errorType = "message_too_big"
 			severity = "client_error"
+		case imap.ResponseCodeUnavailable:
+			errorType = "service_unavailable"
+			severity = "server_error"
 		default:
 			if imapErr.Type == imap.StatusResponseTypeBad {
 				errorType = "invalid_command"
@@ -232,12 +236,20 @@ func (s *IMAPSession) classifyAndTrackError(command string, err error, imapErr *
 		}
 	} else if err != nil {
 		// Classify based on underlying error
+		var netErr net.Error
+		isNetErr := errors.As(err, &netErr)
 		switch {
 		case errors.Is(err, context.DeadlineExceeded):
 			errorType = "timeout"
 			severity = "server_error"
 		case errors.Is(err, context.Canceled):
 			errorType = "canceled"
+			severity = "client_error"
+		case errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || (isNetErr && !netErr.Timeout()):
+			errorType = "network_error"
+			severity = "client_error"
+		case isNetErr && netErr.Timeout():
+			errorType = "network_timeout"
 			severity = "client_error"
 		case errors.Is(err, os.ErrPermission):
 			errorType = "permission_denied"
