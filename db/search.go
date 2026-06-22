@@ -243,6 +243,13 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 			param := nextParam()
 			args[param] = lowerValue
 			conditions = append(conditions, fmt.Sprintf("LOWER(%sin_reply_to) = @%s", datePrefix, param))
+		case "references":
+			// The References header holds a space-separated chain of Message-IDs.
+			// Threading clients search it for a containing Message-ID, so match
+			// as a substring against the dedicated column added in migration 000036.
+			param := nextParam()
+			args[param] = "%" + lowerValue + "%"
+			conditions = append(conditions, fmt.Sprintf(`LOWER(%s"references") LIKE @%s`, datePrefix, param))
 		case "from":
 			param := nextParam()
 			// Support partial matching on both email address and display name
@@ -275,14 +282,13 @@ func (db *Database) buildSearchCriteriaWithPrefix(criteria *imap.SearchCriteria,
 			args[recipientJSONParam] = string(recipientJSON)
 			conditions = append(conditions, fmt.Sprintf(`%srecipients_json @> @%s::jsonb`, datePrefix, recipientJSONParam))
 		default:
-			// Generic HEADER search for arbitrary headers (e.g., HEADER List-ID "value")
-			// Note: headers_tsv was removed in migration 000030. Generic header searches
-			// on non-standard headers (List-ID, X-*, etc.) will return no results.
-			// All commonly-searched headers (From/To/Cc/Subject/Message-ID/etc.) have
-			// dedicated columns above, so this only affects rare searches.
-			// Return FALSE condition to match nothing (could also return error)
+			// HEADER search on a header without a dedicated, indexed column
+			// (e.g. List-ID, X-*). Sora stores no raw-header representation to
+			// query, so these match nothing. All commonly-searched headers
+			// (From/To/Cc/Subject/Message-ID/In-Reply-To/References) are handled
+			// above via dedicated columns. Return FALSE to match nothing.
 			conditions = append(conditions, "FALSE")
-			logger.Warn("Generic HEADER search not supported after headers_tsv removal",
+			logger.Debug("HEADER search on non-indexed header returns no results",
 				"header", lowerKey, "value", lowerValue)
 		}
 	}

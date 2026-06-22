@@ -18,6 +18,42 @@ func TestSearchConstants(t *testing.T) {
 	assert.Less(t, MaxComplexSortResults, MaxSearchResults, "Complex sort limit should be less than search limit")
 }
 
+// TestBuildSearchHeaderConditions verifies the SQL emitted for HEADER search
+// criteria. buildSearchCriteria only assembles strings and never touches the
+// receiver, so a nil *Database is sufficient and no database is required.
+func TestBuildSearchHeaderConditions(t *testing.T) {
+	var db *Database // builder does not dereference the receiver
+
+	tests := []struct {
+		name        string
+		header      imap.SearchCriteriaHeaderField
+		wantContain string // substring that must appear in the generated SQL
+	}{
+		{
+			name:        "References maps to the references column",
+			header:      imap.SearchCriteriaHeaderField{Key: "References", Value: "<parent@example.com>"},
+			wantContain: `LOWER(m."references") LIKE`,
+		},
+		{
+			name:        "non-indexed header matches nothing",
+			header:      imap.SearchCriteriaHeaderField{Key: "X-Custom", Value: "anything"},
+			wantContain: "FALSE",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			paramCounter := 0
+			criteria := &imap.SearchCriteria{
+				Header: []imap.SearchCriteriaHeaderField{tt.header},
+			}
+			condition, _, err := db.buildSearchCriteria(criteria, "p", &paramCounter)
+			require.NoError(t, err)
+			assert.Contains(t, condition, tt.wantContain)
+		})
+	}
+}
+
 // Database test helpers for search tests
 func setupSearchTestDatabase(t *testing.T) (*Database, int64, int64) {
 	db := setupTestDatabase(t)
@@ -217,7 +253,16 @@ func TestBuildSearchCriteria(t *testing.T) {
 			hasError: false,
 		},
 		{
-			name: "search with generic header (now supported via FTS)",
+			name: "search by references header",
+			criteria: &imap.SearchCriteria{
+				Header: []imap.SearchCriteriaHeaderField{
+					{Key: "References", Value: "<parent@example.com>"},
+				},
+			},
+			hasError: false,
+		},
+		{
+			name: "search with non-indexed header (matches nothing, no error)",
 			criteria: &imap.SearchCriteria{
 				Header: []imap.SearchCriteriaHeaderField{
 					{Key: "X-Custom-Header", Value: "value"},
