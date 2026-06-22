@@ -265,9 +265,9 @@ func (s *IMAPSession) classifyAndTrackError(command string, err error, imapErr *
 		case errors.Is(err, context.DeadlineExceeded):
 			errorType = "timeout"
 			severity = "server_error"
-		case errors.Is(err, context.Canceled):
-			errorType = "canceled"
-			severity = "client_error"
+		// context.Canceled is handled by the early-return at the top of this
+		// method (a client disconnect is suppressed, not tracked), so it never
+		// reaches this switch.
 		case errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || (isNetErr && !netErr.Timeout()):
 			errorType = "network_error"
 			severity = "client_error"

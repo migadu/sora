@@ -2026,7 +2026,7 @@ func (s *POP3Session) handleConnection() {
 		default:
 			metrics.CommandsTotal.WithLabelValues("pop3", "UNKNOWN", "failure").Inc()
 			fmt.Fprintf(writer, "-ERR Unknown command: %s\r\n", cmd)
-			s.DebugLog("unknown command", "command", cmd)
+			s.WarnLog("unknown command", "command", cmd, "line", helpers.MaskSensitive(line, cmd, "PASS", "AUTH"))
 		}
 
 		// Flush response and check for timeout
