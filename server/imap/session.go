@@ -266,6 +266,18 @@ func (s *IMAPSession) classifyAndTrackError(command string, err error, imapErr *
 	}
 
 	metrics.ProtocolErrors.WithLabelValues("imap", command, errorType, severity).Inc()
+
+	// Surface every tracked protocol error at WARN with the same labels exposed on
+	// the sora_protocol_errors_total metric. Without this the counter increments
+	// silently and operators can't correlate a rising metric (e.g. a client
+	// repeatedly appending to a non-existent mailbox) with a concrete cause.
+	// Prefer imapErr for the detail string: its Text carries the human-readable
+	// context (such as the mailbox name) that the underlying err often lacks.
+	detail := err
+	if imapErr != nil {
+		detail = imapErr
+	}
+	s.WarnLog("protocol error", "command", command, "error_type", errorType, "severity", severity, "error", detail)
 }
 
 func (s *IMAPSession) Close() error {
