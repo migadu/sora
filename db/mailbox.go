@@ -86,9 +86,16 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			  AND anyone_acl.identifier = 'anyone'
 			  AND position('l' IN anyone_acl.rights) > 0
 		)
-		SELECT 
+		SELECT
 			m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id,
-			EXISTS(SELECT 1 FROM mailboxes child WHERE child.account_id = m.account_id AND LENGTH(child.path) = LENGTH(m.path) + 16 AND child.path LIKE m.path || '%') AS has_children
+			-- has_children: does a direct child exist? The child's direct-parent path is
+			-- its path minus the final 16-char ancestor segment, matched by equality so the
+			-- expression index idx_mailboxes_account_parent_path (migration 000038) applies.
+			-- The previous per-row correlated subquery matched children with LIKE on m.path,
+			-- whose pattern is a column expression, so PostgreSQL could not use a prefix
+			-- index and seq-scanned the account's mailboxes once per row -- O(N^2), which
+			-- exceeded the read query_timeout for accounts with tens of thousands of mailboxes.
+			EXISTS(SELECT 1 FROM mailboxes child WHERE child.account_id = m.account_id AND LEFT(child.path, LENGTH(child.path) - 16) = m.path) AS has_children
 		FROM accessible_mailboxes m
 		WHERE 1=1
 	`
@@ -166,7 +173,9 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, AccountID i
 	mailbox.UIDValidity = uint32(uidValidityInt64)
 
 	// Separately, check if the mailbox has children using an efficient EXISTS query.
-	// For shared mailboxes, check using the owner's account_id to get accurate child count
+	// For shared mailboxes, check using the owner's account_id to get accurate child count.
+	// $2 is a bind parameter, so PostgreSQL treats `path LIKE $2 || '%'` as a constant
+	// prefix and uses idx_mailboxes_path_prefix (unlike the correlated form in GetMailboxes).
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%')
 	`, mailbox.AccountID, mailbox.Path).Scan(&mailbox.HasChildren)
@@ -258,7 +267,9 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	mailbox.AccountID = accountID
 
 	// Separately, check if the mailbox has children using an efficient EXISTS query.
-	// For shared mailboxes, check using the owner's account_id to get accurate child count
+	// For shared mailboxes, check using the owner's account_id to get accurate child count.
+	// $2 is a bind parameter, so PostgreSQL treats `path LIKE $2 || '%'` as a constant
+	// prefix and uses idx_mailboxes_path_prefix (unlike the correlated form in GetMailboxes).
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%')
 	`, accountID, mailbox.Path).Scan(&mailbox.HasChildren)
