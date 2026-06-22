@@ -56,7 +56,6 @@ func TestInsertMessage_LargeFTSSkip(t *testing.T) {
 		Size:          int64(len(largeBody)),
 		Subject:       "Large FTS Test",
 		PlaintextBody: largeBody,
-		RawHeaders:    "From: test@example.com\r\nTo: recipient@example.com\r\n",
 		SentDate:      now.Add(-time.Hour),
 		InReplyTo:     []string{},
 		BodyStructure: &bs,
@@ -142,7 +141,6 @@ func TestInsertMessage_LargeBodyTruncation(t *testing.T) {
 		Size:          int64(len(largeBody)),
 		Subject:       "Large Storage Test",
 		PlaintextBody: largeBody,
-		RawHeaders:    "From: test@example.com\r\nTo: recipient@example.com\r\n",
 		SentDate:      now.Add(-time.Hour),
 		InReplyTo:     []string{},
 		BodyStructure: &bs,
@@ -229,7 +227,6 @@ func TestInsertMessage_NormalSizeStored(t *testing.T) {
 		Size:          int64(len(normalBody)),
 		Subject:       "Normal Size Test",
 		PlaintextBody: normalBody,
-		RawHeaders:    "From: test@example.com\r\nTo: recipient@example.com\r\n",
 		SentDate:      now.Add(-time.Hour),
 		InReplyTo:     []string{},
 		BodyStructure: &bs,
@@ -269,91 +266,4 @@ func TestInsertMessage_NormalSizeStored(t *testing.T) {
 	assert.Nil(t, textBodyTSV, "text_body_tsv should be NULL initially because worker processes asynchronously")
 
 	t.Logf("Successfully tested normal size storage with messageID: %d, UID: %d", messageID, uid)
-}
-
-// TestInsertMessage_LargeHeaders tests that large headers are handled correctly
-func TestInsertMessage_LargeHeaders(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping database integration test in short mode")
-	}
-
-	db, accountID, mailboxID := setupMessageTestDatabase(t)
-	defer db.Close()
-
-	ctx := context.Background()
-	tx, err := db.GetWritePool().Begin(ctx)
-	require.NoError(t, err)
-	defer tx.Rollback(ctx)
-
-	now := time.Now()
-
-	normalBody := "Normal body content"
-	// Create abnormally large headers (>64KB)
-	largeHeaders := "From: test@example.com\r\n"
-	largeHeaders += "X-Large-Header: " + strings.Repeat("H", 64*1024) + "\r\n"
-
-	bodyStructure := &imap.BodyStructureSinglePart{
-		Type:     "text",
-		Subtype:  "plain",
-		Params:   map[string]string{"charset": "utf-8"},
-		Encoding: "7bit",
-		Size:     uint32(len(normalBody)),
-	}
-	var bs imap.BodyStructure = bodyStructure
-
-	// Use unique content hash per run to avoid ON CONFLICT DO NOTHING hiding stale data
-	contentHash := fmt.Sprintf("large-headers-hash-%d", time.Now().UnixNano())
-
-	options := &InsertMessageOptions{
-		AccountID:     accountID,
-		MailboxID:     mailboxID,
-		MailboxName:   "INBOX",
-		S3Domain:      "example.com",
-		S3Localpart:   "test/large-headers",
-		ContentHash:   contentHash,
-		MessageID:     "<large-headers@example.com>",
-		Flags:         []imap.Flag{},
-		InternalDate:  now,
-		Size:          int64(len(normalBody)),
-		Subject:       "Large Headers Test",
-		PlaintextBody: normalBody,
-		RawHeaders:    largeHeaders,
-		SentDate:      now.Add(-time.Hour),
-		InReplyTo:     []string{},
-		BodyStructure: &bs,
-	}
-
-	upload := PendingUpload{
-		AccountID:   accountID,
-		ContentHash: contentHash,
-		InstanceID:  "test-instance",
-		Size:        int64(len(normalBody)),
-		Attempts:    0,
-		CreatedAt:   now,
-		UpdatedAt:   now,
-	}
-
-	messageID, uid, err := db.InsertMessage(ctx, tx, options, upload)
-	assert.NoError(t, err)
-	assert.Greater(t, messageID, int64(0))
-	assert.Greater(t, uid, int64(0))
-
-	err = tx.Commit(ctx)
-	require.NoError(t, err)
-
-	// Verify message was inserted
-	messages, err := db.ListMessages(ctx, mailboxID)
-	assert.NoError(t, err)
-	require.Len(t, messages, 1)
-	assert.Equal(t, "Large Headers Test", messages[0].Subject)
-
-	// Verify that messages_fts row was created with text_body
-	var textBody *string
-	err = db.GetReadPool().QueryRow(ctx,
-		"SELECT text_body FROM messages_fts WHERE content_hash = $1",
-		contentHash).Scan(&textBody)
-	assert.NoError(t, err)
-	assert.NotNil(t, textBody, "text_body should be populated for FTS processing")
-
-	t.Logf("Successfully tested large headers with messageID: %d, UID: %d", messageID, uid)
 }

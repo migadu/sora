@@ -9,19 +9,12 @@ import (
 	"github.com/migadu/sora/logger"
 )
 
-// NOTE: headerAllowlist and extractSearchableHeaders() are DEPRECATED and unused.
-// headers_tsv column has been removed entirely because all searchable headers have
-// dedicated indexed columns in the messages table:
-//   - Subject → messages.subject (indexed, used with LIKE for partial match)
-//   - From/To/Cc → messages.*_email_sort, *_name_sort (indexed, used with LIKE)
-//   - Message-ID, In-Reply-To → messages.message_id, in_reply_to (indexed, exact match)
-//
-// The headers_tsv GIN index was 7.5 GB (vs text_body_tsv at 1.2 GB) due to indexing
-// Received chains, DKIM signatures, and other noise. Removing it saves 7.5 GB and
-// eliminates 12+ second FTS update queries that were blocked on GIN index updates.
-//
-// This code is retained temporarily for backward compatibility during migration.
-// TODO: Remove after migration 000030 is deployed to all environments.
+// Only message bodies are indexed for full-text search (text_body_tsv). The
+// headers/headers_tsv columns were dropped in migration 000030: all searchable
+// headers have dedicated indexed columns on the messages table (subject,
+// *_email_sort/*_name_sort, message_id, in_reply_to, "references"), and the
+// headers_tsv GIN index was 7.5 GB of Received-chain/DKIM noise that caused
+// 12+ second FTS update queries.
 
 // ProcessFTSBatch processes up to 'limit' rows from messages_fts staging queue.
 func (d *Database) ProcessFTSBatch(ctx context.Context, tx pgx.Tx, limit int) (int, error) {
@@ -113,8 +106,3 @@ func (d *Database) ProcessFTSBatch(ctx context.Context, tx pgx.Tx, limit int) (i
 
 	return len(items), nil
 }
-
-// extractSearchableHeaders is DEPRECATED and unused after migration 000030.
-// The headers column was dropped entirely because all searchable headers have
-// dedicated columns in the messages table.
-// This function is retained temporarily for backward compatibility during migration.

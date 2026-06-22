@@ -77,7 +77,6 @@ func insertTestMessageWithUIDForTrigger(t *testing.T, db *Database, ctx context.
 		Size:          512,
 		Subject:       fmt.Sprintf("Trigger Test %d", uid),
 		PlaintextBody: "body",
-		RawHeaders:    "headers",
 		SentDate:      now,
 		PreservedUID:  &uid,
 		BodyStructure: &bs,

@@ -44,7 +44,6 @@ func TestInsertMessage_BadUnicodeData(t *testing.T) {
 		subject       string
 		messageID     string
 		body          string
-		headers       string
 		inReplyTo     []string
 		recipients    []helpers.Recipient
 		wantSubject   string // expected subject after sanitization
@@ -55,7 +54,6 @@ func TestInsertMessage_BadUnicodeData(t *testing.T) {
 			subject:       "Invoice \\u0000 Payment",
 			messageID:     "<msg-backslash-u@example.com>",
 			body:          "Please see \\u0000 attached invoice \\u1234 for details \\uABCD end",
-			headers:       "From: sender@example.com\r\nSubject: Invoice \\u0000 Payment\r\n",
 			wantSubject:   "Invoice \\u0000 Payment",
 			wantMessageID: "<msg-backslash-u@example.com>",
 		},
@@ -64,7 +62,6 @@ func TestInsertMessage_BadUnicodeData(t *testing.T) {
 			subject:       "Hello\x00World",
 			messageID:     "<msg-null-bytes@example.com>",
 			body:          "Body with\x00null\x00bytes",
-			headers:       "From: test@example.com\r\n",
 			wantSubject:   "HelloWorld",
 			wantMessageID: "<msg-null-bytes@example.com>",
 		},
@@ -73,7 +70,6 @@ func TestInsertMessage_BadUnicodeData(t *testing.T) {
 			subject:       "Subject\xFFwith\xFEbad bytes",
 			messageID:     "<msg-invalid-utf8@example.com>",
 			body:          "Body\xFFwith\xFEinvalid\xC0sequences",
-			headers:       "From: test@example.com\r\n",
 			wantSubject:   "Subjectwithbad bytes",
 			wantMessageID: "<msg-invalid-utf8@example.com>",
 		},
@@ -82,7 +78,6 @@ func TestInsertMessage_BadUnicodeData(t *testing.T) {
 			subject:       "Combined\x00\\u0000\xFFtest",
 			messageID:     "<msg-combined@example.com>",
 			body:          "Body\x00with\\u1234and\xFFinvalid",
-			headers:       "From: test\x00@example.com\r\nX-Data: \\u0000\r\n",
 			wantSubject:   "Combined\\u0000test",
 			wantMessageID: "<msg-combined@example.com>",
 		},
@@ -91,7 +86,6 @@ func TestInsertMessage_BadUnicodeData(t *testing.T) {
 			subject:       "Normal subject",
 			messageID:     "\x00\x00\x00",
 			body:          "Normal body",
-			headers:       "From: test@example.com\r\n",
 			wantSubject:   "Normal subject",
 			wantMessageID: "", // empty messageID after sanitization triggers auto-generation
 		},
@@ -100,7 +94,6 @@ func TestInsertMessage_BadUnicodeData(t *testing.T) {
 			subject:   "Recipient test",
 			messageID: "<msg-recipients@example.com>",
 			body:      "Normal body",
-			headers:   "From: test@example.com\r\n",
 			recipients: []helpers.Recipient{
 				{EmailAddress: "from\x00@example.com", AddressType: "from", Name: "Sender\xFFName"},
 				{EmailAddress: "to@example.com", AddressType: "to", Name: "To\x00Name"},
@@ -113,7 +106,6 @@ func TestInsertMessage_BadUnicodeData(t *testing.T) {
 			subject:       "Reply test",
 			messageID:     "<msg-reply@example.com>",
 			body:          "Normal body",
-			headers:       "From: test@example.com\r\n",
 			inReplyTo:     []string{"<parent\x00@example.com>", "<other\xFF@example.com>"},
 			wantSubject:   "Reply test",
 			wantMessageID: "<msg-reply@example.com>",
@@ -153,7 +145,6 @@ func TestInsertMessage_BadUnicodeData(t *testing.T) {
 				Size:          int64(len(tt.body)),
 				Subject:       tt.subject,
 				PlaintextBody: tt.body,
-				RawHeaders:    tt.headers,
 				SentDate:      now.Add(-time.Hour),
 				InReplyTo:     inReplyTo,
 				BodyStructure: makeBodyStructure(),

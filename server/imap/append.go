@@ -166,18 +166,6 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		return nil, imapErr
 	}
 
-	// Extract raw headers string.
-	// Headers are typically terminated by a double CRLF (\r\n\r\n).
-	var rawHeadersText string
-	headerEndIndex := bytes.Index(fullMessageBytes, []byte("\r\n\r\n"))
-	if headerEndIndex != -1 {
-		rawHeadersText = string(fullMessageBytes[:headerEndIndex])
-	} else {
-		// Log if headers are not clearly separated. rawHeadersText will be empty.
-		// This might indicate a malformed email or an email with only headers and no body separator.
-		s.DebugLog("could not find standard header/body separator in message")
-	}
-
 	messageContent, err := server.ParseMessage(bytes.NewReader(fullMessageBytes))
 	if err != nil {
 		// ParseMessage can fail for severely malformed MIME (e.g., missing header colons).
@@ -329,7 +317,6 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			References:    references,
 			BodyStructure: &bodyStructure,
 			Recipients:    recipients,
-			RawHeaders:    rawHeadersText,
 			FTSRetention:  s.server.ftsRetention,
 		},
 		db.PendingUpload{

@@ -38,7 +38,6 @@ func insertTestMessageWithUID(t *testing.T, db *Database, ctx context.Context, t
 		Size:          1024,
 		Subject:       fmt.Sprintf("Summary Test Message %d", uid),
 		PlaintextBody: "body",
-		RawHeaders:    "headers",
 		SentDate:      now,
 		PreservedUID:  &uid, // Use the provided UID
 		BodyStructure: &bs,  // Add a non-nil body structure

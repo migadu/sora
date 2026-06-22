@@ -84,13 +84,6 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	metrics.BytesThroughput.WithLabelValues(d.MetricsLabel, "in").Add(float64(len(messageBytes)))
 	metrics.MessageThroughput.WithLabelValues(d.MetricsLabel, "received", "success").Inc()
 
-	// Extract raw headers
-	var rawHeadersText string
-	headerEndIndex := bytes.Index(messageBytes, []byte("\r\n\r\n"))
-	if headerEndIndex != -1 {
-		rawHeadersText = string(messageBytes[:headerEndIndex])
-	}
-
 	// Parse message metadata
 	mailHeader := mail.Header{Header: messageEntity.Header}
 	subject, _ := mailHeader.Subject()
@@ -219,7 +212,6 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			BodyStructure:        bodyStructure,
 			Recipients:           recipients,
 			Flags:                sieveFlags, // Flags set by the Sieve script (imap4flags); empty -> unread
-			RawHeaders:           rawHeadersText,
 			FTSRetention:         d.FTSRetention,
 			PreservedUID:         recipient.PreservedUID,
 			PreservedUIDValidity: recipient.PreservedUIDVal,
@@ -373,12 +365,6 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 	bodyStructure := &bodyStructureVal
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
 
-	var rawHeadersText string
-	headerEndIndex := bytes.Index(messageBytes, []byte("\r\n\r\n"))
-	if headerEndIndex != -1 {
-		rawHeadersText = string(messageBytes[:headerEndIndex])
-	}
-
 	size := int64(len(messageBytes))
 
 	_, _, err = d.RDB.InsertMessageWithRetry(ctx,
@@ -400,7 +386,6 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 			BodyStructure: bodyStructure,
 			Recipients:    recipients,
 			Flags:         flags,
-			RawHeaders:    rawHeadersText,
 			FTSRetention:  d.FTSRetention,
 		},
 		db.PendingUpload{

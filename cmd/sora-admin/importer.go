@@ -105,7 +105,6 @@ type messageMetadata struct {
 	references           []string
 	bodyStructure        *imap.BodyStructure
 	recipients           []helpers.Recipient
-	rawHeaders           string
 	flags                []imap.Flag
 	preservedUID         *uint32
 	preservedUIDValidity *uint32
@@ -1620,11 +1619,6 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 
-	var rawHeaders string
-	if idx := bytes.Index(content, []byte("\r\n\r\n")); idx != -1 {
-		rawHeaders = string(content[:idx])
-	}
-
 	// Flags
 	var flags []imap.Flag
 	if i.options.PreserveFlags {
@@ -1662,7 +1656,6 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		references:           references,
 		bodyStructure:        &bodyStructure,
 		recipients:           recipients,
-		rawHeaders:           rawHeaders,
 		flags:                flags,
 		preservedUID:         preservedUID,
 		preservedUIDValidity: preservedUIDValidity,
@@ -1845,7 +1838,6 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
 			Recipients:           up.metadata.recipients,
-			RawHeaders:           up.metadata.rawHeaders,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
 		}
@@ -1977,7 +1969,6 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]str
 			References:           up.metadata.references,
 			BodyStructure:        up.metadata.bodyStructure,
 			Recipients:           up.metadata.recipients,
-			RawHeaders:           up.metadata.rawHeaders,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
 		})

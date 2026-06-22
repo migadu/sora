@@ -362,15 +362,9 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	metrics.BytesThroughput.WithLabelValues("lmtp", "in").Add(float64(len(fullMessageBytes)))
 	metrics.MessageThroughput.WithLabelValues("lmtp", "received", "success").Inc()
 
-	// Extract raw headers string.
-	// Headers are typically terminated by a double CRLF (\r\n\r\n).
-	var rawHeadersText string
-	headerEndIndex := bytes.Index(fullMessageBytes, []byte("\r\n\r\n"))
-	if headerEndIndex != -1 {
-		rawHeadersText = string(fullMessageBytes[:headerEndIndex])
-	} else {
-		// Log if headers are not clearly separated. rawHeadersText will be empty.
-		// This might indicate a malformed email or an email with only headers and no body separator.
+	// Warn if headers are not clearly separated from the body. This might
+	// indicate a malformed email or an email with only headers and no separator.
+	if bytes.Index(fullMessageBytes, []byte("\r\n\r\n")) == -1 {
 		s.WarnLog("could not find standard header/body separator in message")
 	}
 
@@ -596,11 +590,6 @@ func (s *LMTPSession) Data(r io.Reader) error {
 				if sentDate.IsZero() {
 					sentDate = time.Now()
 				}
-				// Update raw headers text
-				headerEndIndex = bytes.Index(fullMessageBytes, []byte("\r\n\r\n"))
-				if headerEndIndex != -1 {
-					rawHeadersText = string(fullMessageBytes[:headerEndIndex])
-				}
 				s.DebugLog("message headers updated after edits", "content_hash", contentHash)
 			}
 		}
@@ -667,7 +656,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 			// First save to the specified mailbox (with :create if specified)
 			err := s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
-				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, rawHeadersText, result.CreateMailbox, sieveFlags)
+				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, result.CreateMailbox, sieveFlags)
 			if err != nil {
 				// Allow duplicates (message already in target mailbox)
 				if !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -682,7 +671,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 			// Call saveMessageToMailbox again for INBOX (no :create for INBOX - it always exists)
 			err = s.saveMessageToMailbox(consts.MailboxInbox, fullMessageBytes, contentHash,
-				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, rawHeadersText, false, sieveFlags)
+				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, false, sieveFlags)
 			if err != nil {
 				// Allow duplicates (message already in INBOX)
 				if !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -752,7 +741,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	// For fileinto actions without :copy, pass the :create flag if specified
 	createMailbox := result.Action == sieveengine.ActionFileInto && result.CreateMailbox
 	err = s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
-		subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, rawHeadersText, createMailbox, sieveFlags)
+		subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, createMailbox, sieveFlags)
 	if err != nil {
 		// Handle duplicate messages (acceptable in LMTP - return success)
 		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -997,7 +986,7 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 	fullMessageBytes []byte, contentHash string, subject string, messageID string,
 	sentDate time.Time, inReplyTo []string, references []string, bodyStructure *imap.BodyStructure,
-	plaintextBody *string, recipients []helpers.Recipient, rawHeadersText string, createMailbox bool,
+	plaintextBody *string, recipients []helpers.Recipient, createMailbox bool,
 	flags []imap.Flag) error {
 
 	// Create a context for read operations that respects session pinning
@@ -1055,7 +1044,6 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 			BodyStructure: bodyStructure,
 			Recipients:    recipients,
 			Flags:         flags, // Flags set by the Sieve script (imap4flags); empty -> unread
-			RawHeaders:    rawHeadersText,
 			FTSRetention:  s.backend.ftsRetention,
 		},
 		db.PendingUpload{

@@ -533,12 +533,6 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 
-	var rawHeadersText string
-	headerEndIndex := bytes.Index(content, []byte("\r\n\r\n"))
-	if headerEndIndex != -1 {
-		rawHeadersText = string(content[:headerEndIndex])
-	}
-
 	// Import into INBOX by default (since we don't have mailbox information from S3)
 	// Default mailboxes should already be created at this point
 	mailbox, err := si.rdb.GetMailboxByNameWithRetry(ctx, user.AccountID(), "INBOX")
@@ -567,7 +561,6 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			References:    references,
 			BodyStructure: &bodyStructure,
 			Recipients:    recipients,
-			RawHeaders:    rawHeadersText,
 		},
 		db.PendingUpload{
 			InstanceID:  hostname,

@@ -161,7 +161,6 @@ type InsertMessageOptions struct {
 	References           []string
 	BodyStructure        *imap.BodyStructure
 	Recipients           []helpers.Recipient
-	RawHeaders           string
 	PreservedUID         *uint32       // Optional: preserved UID from import
 	PreservedUIDValidity *uint32       // Optional: preserved UIDVALIDITY from import
 	FTSRetention         time.Duration // Optional: skip creating messages_fts entirely for messages older than this

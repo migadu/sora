@@ -323,7 +323,6 @@ func TestMailboxPurge(t *testing.T) {
 			Size:          int64(len(messageContent)),
 			BodyStructure: &bodyStruct,
 			Recipients:    []helpers.Recipient{},
-			RawHeaders:    "",
 		}
 
 		_, _, err = rdb.InsertMessageFromImporterWithRetry(ctx, opts)
