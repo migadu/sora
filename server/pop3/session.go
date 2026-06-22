@@ -2023,6 +2023,16 @@ func (s *POP3Session) handleConnection() {
 
 			recordMetrics("success")
 
+		case "LAST":
+			// LAST is an obsolete command from RFC 1081 (the original POP3),
+			// removed in RFC 1939. Some legacy clients still probe for it.
+			// Reject it like any unsupported command so the client falls back
+			// to UIDL/STAT, but log at debug level since it is a known
+			// obsolete command rather than garbage/probing traffic.
+			metrics.CommandsTotal.WithLabelValues("pop3", "LAST", "failure").Inc()
+			writer.WriteString("-ERR LAST is obsolete (RFC 1939)\r\n")
+			s.DebugLog("rejected obsolete command", "command", cmd)
+
 		default:
 			metrics.CommandsTotal.WithLabelValues("pop3", "UNKNOWN", "failure").Inc()
 			fmt.Fprintf(writer, "-ERR Unknown command: %s\r\n", cmd)
