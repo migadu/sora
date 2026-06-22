@@ -92,7 +92,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64
 		var sentDate *time.Time
 
 		if err := rows.Scan(&msg.UID, &msgID, &inReplyTo, &references, &subjectSort, &sentDate, &msg.Seq); err != nil {
-			return nil, fmt.Errorf("failed to scan thread message: %v", err)
+			return nil, fmt.Errorf("failed to scan thread message: %w", err)
 		}
 
 		if msgID != nil {
@@ -115,7 +115,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error scanning thread rows: %v", err)
+		return nil, fmt.Errorf("error scanning thread rows: %w", err)
 	}
 	metrics.DBQueriesTotal.WithLabelValues("search_thread", "success", "read").Inc()
 

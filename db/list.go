@@ -22,7 +22,7 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query messages: %v", err)
+		return nil, fmt.Errorf("failed to query messages: %w", err)
 	}
 	messages, err = scanMessages(rows, false) // scanMessages will close rows
 	if err != nil {

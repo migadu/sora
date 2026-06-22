@@ -175,6 +175,19 @@ func (s *IMAPSession) internalError(format string, a ...any) *imap.Error {
 		}
 	}
 
+	// A canceled request context means the client went away mid-command. The
+	// client will never read this response, and it is not a server fault, so
+	// return a plain NO (no SERVERBUG/UNAVAILABLE code) — that keeps commandStatus
+	// from counting it as a server_error or logging it at WARN. Note this is
+	// distinct from context.DeadlineExceeded (a server-side timeout), which falls
+	// through to the transient/[UNAVAILABLE] handling below.
+	if actualErr != nil && errors.Is(actualErr, context.Canceled) {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Command aborted",
+		}
+	}
+
 	// Detect transient infrastructure errors (DB exhaustion, circuit breakers,
 	// storage failures, timeouts) and return [UNAVAILABLE] instead of [SERVERBUG]
 	// so clients back off instead of retrying aggressively.
@@ -199,6 +212,16 @@ func (s *IMAPSession) internalError(format string, a ...any) *imap.Error {
 // classifyAndTrackError classifies IMAP errors and tracks them in metrics
 func (s *IMAPSession) classifyAndTrackError(command string, err error, imapErr *imap.Error) {
 	if err == nil && imapErr == nil {
+		return
+	}
+
+	// A canceled request context means the client disconnected mid-command (a
+	// server-side timeout surfaces as context.DeadlineExceeded, not Canceled).
+	// That is the client's doing, not a protocol violation or server fault, so
+	// don't record it in sora_protocol_errors_total or surface it at WARN —
+	// otherwise normal client churn inflates the error rate operators alert on.
+	if err != nil && errors.Is(err, context.Canceled) {
+		s.DebugLog("command aborted by client disconnect", "command", command, "error", err)
 		return
 	}
 

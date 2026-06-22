@@ -359,7 +359,7 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 				}
 			}
 		}
-		return fmt.Errorf("failed to create mailbox: %v", err)
+		return fmt.Errorf("failed to create mailbox: %w", err)
 	}
 
 	// Update the path now that we have the ID
@@ -479,7 +479,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, Account
 				return fmt.Errorf("failed to get existing mailbox ID: %w", err)
 			}
 		} else {
-			return fmt.Errorf("failed to create mailbox: %v", err)
+			return fmt.Errorf("failed to create mailbox: %w", err)
 		}
 	}
 
@@ -823,7 +823,7 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailbox
 		UPDATE mailboxes SET subscribed = $1, updated_at = now() WHERE id = $2 AND account_id = $3
 	`, subscribed, mailboxID, AccountID)
 	if err != nil {
-		return fmt.Errorf("failed to update subscription status for mailbox %d: %v", mailboxID, err)
+		return fmt.Errorf("failed to update subscription status for mailbox %d: %w", mailboxID, err)
 	}
 
 	return nil

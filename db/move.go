@@ -61,13 +61,13 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		var messageID int64
 		var sourceUID imap.UID
 		if err := rows.Scan(&messageID, &sourceUID); err != nil {
-			return nil, fmt.Errorf("failed to scan message ID and UID: %v", err)
+			return nil, fmt.Errorf("failed to scan message ID and UID: %w", err)
 		}
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
 	}
 	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating through source messages: %v", err)
+		return nil, fmt.Errorf("error iterating through source messages: %w", err)
 	}
 
 	if len(messageIDs) == 0 {
@@ -231,7 +231,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 
 		if err != nil {
 			logger.Error("Database: failed to mark original messages as expunged", "err", err)
-			return nil, fmt.Errorf("failed to mark original messages as expunged: %v", err)
+			return nil, fmt.Errorf("failed to mark original messages as expunged: %w", err)
 		}
 	}
 

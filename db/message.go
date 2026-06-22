@@ -506,7 +506,7 @@ func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {
 		)
 
 		if err := rows.Scan(scanArgs...); err != nil {
-			return nil, fmt.Errorf("failed to scan message: %v", err)
+			return nil, fmt.Errorf("failed to scan message: %w", err)
 		}
 
 		if includeBodyStructure {
@@ -523,7 +523,7 @@ func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error scanning rows: %v", err)
+		return nil, fmt.Errorf("error scanning rows: %w", err)
 	}
 
 	return messages, nil
@@ -541,14 +541,14 @@ func scanSearchMessages(rows pgx.Rows) ([]SearchMessageResult, error) {
 			&msg.ID, &msg.UID, &msg.MailboxID, &msg.ContentHash,
 			&msg.CreatedModSeq, &msg.UpdatedModSeq, &msg.ExpungedModSeq, &msg.Seq,
 		); err != nil {
-			return nil, fmt.Errorf("failed to scan search message: %v", err)
+			return nil, fmt.Errorf("failed to scan search message: %w", err)
 		}
 
 		messages = append(messages, msg)
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error scanning search rows: %v", err)
+		return nil, fmt.Errorf("error scanning search rows: %w", err)
 	}
 
 	return messages, nil

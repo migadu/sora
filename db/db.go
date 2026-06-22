@@ -697,7 +697,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 	writeFailover := NewFailoverManager(dbConfig.Write, poolType)
 	writePool, err := createPoolFromEndpointWithFailover(ctx, dbConfig.Write, dbConfig.GetDebug(), poolType, writeFailover)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create %s pool: %v", poolType, err)
+		return nil, fmt.Errorf("failed to create %s pool: %w", poolType, err)
 	}
 
 	// Create read pool and failover manager
@@ -874,7 +874,7 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 
 		config, err := pgxpool.ParseConfig(connString)
 		if err != nil {
-			lastErr = fmt.Errorf("unable to parse connection string: %v", err)
+			lastErr = fmt.Errorf("unable to parse connection string: %w", err)
 			failoverManager.MarkHostUnhealthy(selectedHost, lastErr)
 			continue
 		}
@@ -897,7 +897,7 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 		if endpoint.MaxConnLifetime != "" {
 			lifetime, err := endpoint.GetMaxConnLifetime()
 			if err != nil {
-				lastErr = fmt.Errorf("invalid max_conn_lifetime: %v", err)
+				lastErr = fmt.Errorf("invalid max_conn_lifetime: %w", err)
 				failoverManager.MarkHostUnhealthy(selectedHost, lastErr)
 				continue
 			}
@@ -907,7 +907,7 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 		if endpoint.MaxConnIdleTime != "" {
 			idleTime, err := endpoint.GetMaxConnIdleTime()
 			if err != nil {
-				lastErr = fmt.Errorf("invalid max_conn_idle_time: %v", err)
+				lastErr = fmt.Errorf("invalid max_conn_idle_time: %w", err)
 				failoverManager.MarkHostUnhealthy(selectedHost, lastErr)
 				continue
 			}
@@ -937,14 +937,14 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 
 		dbPool, err := pgxpool.NewWithConfig(ctx, config)
 		if err != nil {
-			lastErr = fmt.Errorf("failed to create connection pool: %v", err)
+			lastErr = fmt.Errorf("failed to create connection pool: %w", err)
 			failoverManager.MarkHostUnhealthy(selectedHost, lastErr)
 			continue
 		}
 
 		if err := dbPool.Ping(ctx); err != nil {
 			dbPool.Close()
-			lastErr = fmt.Errorf("failed to connect to the database: %v", err)
+			lastErr = fmt.Errorf("failed to connect to the database: %w", err)
 			failoverManager.MarkHostUnhealthy(selectedHost, lastErr)
 			continue
 		}
