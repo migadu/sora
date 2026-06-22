@@ -776,7 +776,10 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		whereArgs["mailboxID"] = mailboxID
 
 		if orderByClause == "" {
-			orderByClause = "ORDER BY uid DESC"
+			// The legacy CTE path's outer query joins message_seqs (seq.uid) and
+			// messages (m.uid), so the default ORDER BY must qualify uid as m.uid to
+			// avoid an ambiguous column reference (SQLSTATE 42702).
+			orderByClause = "ORDER BY m.uid DESC"
 		}
 
 		const complexQuery = `
@@ -866,19 +869,12 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64
 
 // GetMessagesSorted retrieves messages that match the search criteria, sorted according to the provided sort criteria
 func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit int) ([]Message, error) {
-	// Build ORDER BY clause first to determine if it requires complex query
-	// We'll use a temporary prefix to check complexity, then rebuild with correct prefix
-	tempOrderBy := db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
-	isComplexQuery := db.needsComplexQuery(criteria, tempOrderBy)
-
-	var orderBy string
-	if isComplexQuery {
-		// Complex queries use CTE, so no table prefix needed
-		orderBy = db.buildSortOrderClauseWithPrefix(sortCriteria, "")
-	} else {
-		// Simple queries use table aliases, so use "m" prefix
-		orderBy = tempOrderBy
-	}
+	// Every query path in getMessagesQueryExecutor aliases the messages table as
+	// "m". The complex paths additionally LEFT JOIN messages_fts (which also has a
+	// sent_date column) and the seqnum CTE joins message_seqs (which also has uid),
+	// so an unqualified ORDER BY column would be ambiguous (SQLSTATE 42702). Always
+	// qualify sort columns with "m.".
+	orderBy := db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
 
 	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, orderBy, limit)
 	if err != nil {
@@ -1122,7 +1118,10 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 		whereArgs["mailboxID"] = mailboxID
 
 		if orderByClause == "" {
-			orderByClause = "ORDER BY uid DESC"
+			// The legacy CTE path's outer query joins message_seqs (seq.uid) and
+			// messages (m.uid), so the default ORDER BY must qualify uid as m.uid to
+			// avoid an ambiguous column reference (SQLSTATE 42702).
+			orderByClause = "ORDER BY m.uid DESC"
 		}
 
 		const complexQuery = `
@@ -1211,15 +1210,12 @@ func (db *Database) SearchMessagesWithCriteria(ctx context.Context, mailboxID in
 
 // SearchMessagesSorted retrieves lightweight message metadata that matches the search criteria, sorted.
 func (db *Database) SearchMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit int) ([]SearchMessageResult, error) {
-	tempOrderBy := db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
-	isComplexQuery := db.needsComplexQuery(criteria, tempOrderBy)
-
-	var orderBy string
-	if isComplexQuery {
-		orderBy = db.buildSortOrderClauseWithPrefix(sortCriteria, "")
-	} else {
-		orderBy = tempOrderBy
-	}
+	// Every query path in getSearchMessagesQueryExecutor aliases the messages table
+	// as "m". The complex paths additionally LEFT JOIN messages_fts (which also has
+	// a sent_date column) and the seqnum CTE joins message_seqs (which also has
+	// uid), so an unqualified ORDER BY column would be ambiguous (SQLSTATE 42702).
+	// Always qualify sort columns with "m.".
+	orderBy := db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
 
 	messages, err := db.getSearchMessagesQueryExecutor(ctx, mailboxID, criteria, orderBy, limit)
 	if err != nil {

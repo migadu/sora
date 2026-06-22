@@ -537,6 +537,72 @@ func TestGetMessagesSorted(t *testing.T) {
 	t.Logf("Successfully tested GetMessagesSorted with accountID: %d, mailboxID: %d", accountID, mailboxID)
 }
 
+// TestSortedSearchWithComplexCriteria is a regression test for an ambiguous
+// column reference (SQLSTATE 42702) that occurred when a full-text (Body/Text)
+// search was combined with a SORT. Complex query paths LEFT JOIN messages_fts,
+// which also has a sent_date column, so an unqualified "ORDER BY sent_date" was
+// ambiguous between messages.sent_date and messages_fts.sent_date. The bug is a
+// query-planner error, so it reproduces even against an empty mailbox.
+func TestSortedSearchWithComplexCriteria(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, _, mailboxID := setupSearchTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Now()
+
+	cases := []struct {
+		name     string
+		criteria *imap.SearchCriteria
+		sort     []imap.SortCriterion
+	}{
+		{
+			// Exact production scenario: body FTS + date range + SORT DATE.
+			name: "body+daterange sort date",
+			criteria: &imap.SearchCriteria{
+				Body:   []string{"fence"},
+				Since:  now.Add(-365 * 24 * time.Hour),
+				Before: now,
+			},
+			sort: []imap.SortCriterion{{Key: imap.SortKeyDate, Reverse: false}},
+		},
+		{
+			name:     "body sort arrival reverse",
+			criteria: &imap.SearchCriteria{Body: []string{"important"}},
+			sort:     []imap.SortCriterion{{Key: imap.SortKeyArrival, Reverse: true}},
+		},
+		{
+			name:     "text sort subject",
+			criteria: &imap.SearchCriteria{Text: []string{"conference call"}},
+			sort:     []imap.SortCriterion{{Key: imap.SortKeySubject, Reverse: false}},
+		},
+		{
+			name:     "text sort size",
+			criteria: &imap.SearchCriteria{Text: []string{"agenda"}},
+			sort:     []imap.SortCriterion{{Key: imap.SortKeySize, Reverse: true}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// SearchMessagesSorted is the lightweight path that produced the
+			// original "column reference sent_date is ambiguous" error.
+			searchResults, err := db.SearchMessagesSorted(ctx, mailboxID, tc.criteria, tc.sort, 0)
+			assert.NoError(t, err, "SearchMessagesSorted must not error on complex criteria + sort")
+			assert.Empty(t, searchResults)
+
+			// GetMessagesSorted is the heavyweight path; it has the same join
+			// structure and was vulnerable to the same ambiguity.
+			messages, err := db.GetMessagesSorted(ctx, mailboxID, tc.criteria, tc.sort, 0)
+			assert.NoError(t, err, "GetMessagesSorted must not error on complex criteria + sort")
+			assert.Empty(t, messages)
+		})
+	}
+}
+
 // TestFullTextSearch tests full-text search capabilities
 func TestFullTextSearch(t *testing.T) {
 	if testing.Short() {
