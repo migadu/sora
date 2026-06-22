@@ -2,6 +2,7 @@ package imap
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,9 +12,35 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
 
 	"github.com/migadu/sora/pkg/metrics"
+)
+
+// errBodyTransientlyUnavailable marks a message body that exists (or will shortly) but
+// cannot be retrieved from this node right now. Two causes feed it, both transient:
+//   - not yet uploaded: staged for upload, not on local disk here and not in S3 yet
+//     (the upload worker will land it shortly); see bodyUploadStillPending.
+//   - S3 unavailable: the message is uploaded but S3 is unreachable (network/timeout/
+//     5xx/circuit-open) — distinct from a 404/NoSuchKey, which is permanent loss.
+//
+// The FETCH is answered with NO [UNAVAILABLE] so the client retries, rather than being
+// handed an empty body it might act on destructively (e.g. an automated consumer that
+// deletes a message after a "successful" but empty read). The wrapping error text
+// carries the specific cause for logging.
+var errBodyTransientlyUnavailable = errors.New("message body temporarily unavailable")
+
+// bodyFetchRetry* tune the bounded retry of the S3 read on the not-yet-uploaded path.
+// They absorb the read-before-write race where the background S3 PUT lands shortly after
+// the FETCH (e.g. a cross-node delivery still uploading). The wait is only ever spent
+// when an upload is still pending (loadMessageBody gates on bodyUploadStillPending), so a
+// body that is never coming is not waited on; and because a transient result aborts the
+// FETCH command, at most one message per command pays it. FETCH clients tolerate this, so
+// the window is generous: ~(bodyFetchRetryAttempts-1) * bodyFetchRetryDelay ≈ 1s.
+const (
+	bodyFetchRetryAttempts = 3
+	bodyFetchRetryDelay    = 500 * time.Millisecond
 )
 
 // safeExtractBodySection wraps imapserver.ExtractBodySection with panic recovery.
@@ -535,6 +562,11 @@ func (s *IMAPSession) ensureBodyDataLoaded(msg *db.Message, bodyData *[]byte, bo
 
 func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
 	if err := s.ensureBodyDataLoaded(msg, bodyData, bodyDataFetched); err != nil {
+		// Transient: body staged for upload but not yet retrievable from this node.
+		// Ask the client to retry instead of returning an empty section.
+		if errors.Is(err, errBodyTransientlyUnavailable) {
+			return s.transientBodyUnavailable(msg.UID, err)
+		}
 		// Graceful degradation: return empty binary sections instead of failing the
 		// entire multi-message FETCH. This prevents one broken message (missing S3
 		// content, etc.) from making the whole mailbox listing fail for webmail clients.
@@ -561,6 +593,11 @@ func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, bo
 
 func (s *IMAPSession) handleBinarySectionSize(w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
 	if err := s.ensureBodyDataLoaded(msg, bodyData, bodyDataFetched); err != nil {
+		// Transient: body staged for upload but not yet retrievable from this node.
+		// Ask the client to retry instead of reporting a zero size.
+		if errors.Is(err, errBodyTransientlyUnavailable) {
+			return s.transientBodyUnavailable(msg.UID, err)
+		}
 		// Graceful degradation: return zero sizes instead of failing the entire FETCH.
 		s.WarnLog("failed to load message body, returning zero binary section sizes", "uid", msg.UID, "error", err)
 	}
@@ -580,6 +617,13 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 		var sectionContent []byte
 
 		if loadErr := s.ensureBodyDataLoaded(msg, bodyData, bodyDataFetched); loadErr != nil {
+			// Transient: the body is staged for upload but not yet retrievable from
+			// this node (read-before-upload race, or cross-node staging). Fail the
+			// FETCH with NO [UNAVAILABLE] so the client retries instead of receiving
+			// (and possibly acting on) an empty body. See errBodyTransientlyUnavailable.
+			if errors.Is(loadErr, errBodyTransientlyUnavailable) {
+				return s.transientBodyUnavailable(msg.UID, loadErr)
+			}
 			// Graceful degradation: return empty body sections instead of failing
 			// the entire multi-message FETCH. This prevents one broken message
 			// (missing S3 content, 0-byte message, etc.) from making the whole
@@ -613,6 +657,21 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 	return nil
 }
 
+// transientBodyUnavailable records the event and returns the IMAP error used when a
+// message body is staged for upload but not yet retrievable from this node. Returning
+// NO [UNAVAILABLE] (instead of degrading to an empty body) tells the client to retry
+// once the upload lands, and — critically — prevents an automated consumer from treating
+// an empty read as success and deleting the message.
+func (s *IMAPSession) transientBodyUnavailable(uid imap.UID, cause error) *imap.Error {
+	s.WarnLog("message body not yet available, asking client to retry", "uid", uid, "error", cause)
+	metrics.CommandsTotal.WithLabelValues("imap", "FETCH", "unavailable").Inc()
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeUnavailable,
+		Text: "Message body temporarily unavailable, please retry",
+	}
+}
+
 func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 	data, err := s.loadMessageBody(msg)
 	if err != nil {
@@ -634,10 +693,16 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 //   - uploaded messages:     local cache → S3 → local staging disk (S3 outage)
 //   - not-yet-uploaded msgs: local staging disk → S3 (cross-node / late-upload race)
 //
-// The S3 fallback on the not-uploaded path is what self-heals the common
-// multi-backend situation where a body was delivered/staged on another node and
-// has since been uploaded, while this node's in-memory message still reads
-// uploaded=false.
+// The S3 fallback on the not-uploaded path (with a short bounded retry) is what
+// self-heals the common multi-backend situation where a body was delivered/staged on
+// another node and has since been uploaded, while this node's in-memory message still
+// reads uploaded=false.
+//
+// When the not-uploaded body cannot be served from disk or S3, the error distinguishes
+// transient from permanent: if the upload is still pending (or the message has since
+// been marked uploaded) it returns errBodyTransientlyUnavailable so the FETCH handler answers
+// NO [UNAVAILABLE] and the client retries; otherwise the content is genuinely gone and
+// a generic retrieve error is returned so the handler degrades to an empty body.
 func (s *IMAPSession) loadMessageBody(msg *db.Message) ([]byte, error) {
 	if msg.IsUploaded {
 		// Try cache first (nil-safe: cache is optional and not configured in tests).
@@ -669,6 +734,28 @@ func (s *IMAPSession) loadMessageBody(msg *db.Message) ([]byte, error) {
 					return diskData, nil
 				}
 			}
+			// The message is marked uploaded but S3 could not serve it and the local
+			// staging copy is gone. Distinguish a transient S3 outage (network/timeout/
+			// 5xx/circuit-open) from a genuinely missing object (404/NoSuchKey): on a
+			// transient failure ask the client to retry instead of handing back an empty
+			// body for what is really a still-present message. A NoSuchKey falls through
+			// to graceful empty-body degradation (the object is permanently gone).
+			// Only a genuine S3-reachability failure is transient. fetchBodyFromS3 wraps
+			// such failures (network/timeout/5xx/circuit-open) in ErrRetrieveFailed; it
+			// also wraps NoSuchKey there, which IsNotFoundError excludes. Permanent
+			// conditions (empty/0-byte object, missing S3 key, read error) are NOT
+			// ErrRetrieveFailed and must NOT be reported transient, or the client would
+			// retry forever instead of degrading to an empty body.
+			if errors.Is(err, storage.ErrRetrieveFailed) && !resilient.IsNotFoundError(err) {
+				return nil, fmt.Errorf("message UID %d: %w (S3 unavailable): %v", msg.UID, errBodyTransientlyUnavailable, err)
+			}
+			// Permanent. A NoSuchKey on an uploaded message is genuine content loss worth
+			// alerting on — logged only here, where the message is marked uploaded (a 404
+			// during the not-yet-uploaded race is expected and not logged). Either way it
+			// degrades to an empty body for the caller (see handleBodySections).
+			if resilient.IsNotFoundError(err) {
+				s.WarnLog("message marked uploaded but missing from S3 (NoSuchKey)", "uid", msg.UID, "content_hash", msg.ContentHash, "s3_domain", msg.S3Domain, "s3_localpart", msg.S3Localpart)
+			}
 			return nil, err
 		}
 		return data, nil
@@ -680,28 +767,81 @@ func (s *IMAPSession) loadMessageBody(msg *db.Message) ([]byte, error) {
 	}
 	s.DebugLog("fetching not yet uploaded message from disk", "uid", msg.UID)
 	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-	data, diskErr := os.ReadFile(filePath)
-	if diskErr == nil && len(data) > 0 {
+	if data, diskErr := os.ReadFile(filePath); diskErr == nil && len(data) > 0 {
 		return data, nil
 	}
 
-	// Local staging file is missing or empty. In a multi-backend cluster the body
-	// may have been delivered/staged on another node and already uploaded to S3,
-	// while this node's in-memory message still reads uploaded=false. Try S3 with
-	// the stored key before giving up — this self-heals the cross-node fetch race
-	// (and the same-node race where the upload worker finished after the message
-	// row was read). NoSuchKey fails fast, so this is cheap when S3 has nothing yet.
+	// Local staging file is missing or empty. In a multi-backend cluster the body may
+	// have been delivered/staged on another node and already uploaded to S3, while this
+	// node's in-memory message still reads uploaded=false.
+	//
+	// Decide up front whether the body is still expected to arrive — a pending upload
+	// exists, or it was already uploaded elsewhere. We only wait-and-retry S3 when it is:
+	// there is no point sleeping for a body that is never coming, and gating the wait this
+	// way keeps a bulk FETCH over abandoned uploads from paying the delay on every message.
+	pending := s.bodyUploadStillPending(msg)
+
 	if msg.S3Domain != "" && msg.S3Localpart != "" {
-		if s3Data, s3Err := s.fetchBodyFromS3(msg); s3Err == nil {
-			s.DebugLog("local staging file missing, served from S3", "uid", msg.UID)
-			return s3Data, nil
+		attempts := 1
+		if pending {
+			attempts = bodyFetchRetryAttempts
+		}
+		for attempt := 0; attempt < attempts; attempt++ {
+			s3Data, s3Err := s.fetchBodyFromS3(msg)
+			if s3Err == nil {
+				s.DebugLog("local staging file missing, served from S3", "uid", msg.UID, "attempt", attempt)
+				return s3Data, nil
+			}
+			// Only NoSuchKey ("object hasn't landed yet") benefits from waiting and
+			// retrying. Any other error is either a transient outage that GetWithRetry
+			// already exhausted its own backoff on (looping would just multiply that
+			// latency) or a permanent condition — stop and let classification decide.
+			if !resilient.IsNotFoundError(s3Err) {
+				break
+			}
+			if attempt < attempts-1 {
+				select {
+				case <-time.After(bodyFetchRetryDelay):
+				case <-s.ctx.Done():
+					return nil, s.ctx.Err()
+				}
+			}
 		}
 	}
 
-	if diskErr != nil {
-		return nil, fmt.Errorf("message UID %d from disk: %w: %v", msg.UID, storage.ErrRetrieveFailed, diskErr)
+	// Still unavailable. If an upload is in flight the FETCH handler should answer
+	// NO [UNAVAILABLE] (client retries); otherwise the content is genuinely gone and we
+	// degrade gracefully to an empty body.
+	if pending {
+		return nil, fmt.Errorf("message UID %d: %w", msg.UID, errBodyTransientlyUnavailable)
 	}
-	return nil, fmt.Errorf("message UID %d: empty body on disk and not in S3", msg.UID)
+	return nil, fmt.Errorf("message UID %d: %w: body not on disk and not in S3", msg.UID, storage.ErrRetrieveFailed)
+}
+
+// bodyUploadStillPending reports whether the system still intends to make this body
+// available — i.e. a pending_upload record exists, or the message has since been marked
+// uploaded (so a retry should find it in S3). It distinguishes the transient
+// read-before-upload race from genuine, permanent content loss. On a DB error it returns
+// true (conservative: a client retry is safer than handing back an empty body that the
+// client may treat as the real, empty message).
+func (s *IMAPSession) bodyUploadStillPending(msg *db.Message) bool {
+	pending, err := s.server.rdb.PendingUploadExistsWithRetry(s.ctx, msg.ContentHash, msg.AccountID)
+	if err != nil {
+		s.WarnLog("could not check pending-upload status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
+		return true
+	}
+	if pending {
+		return true
+	}
+	// No pending upload: the body may have just been uploaded (uploaded flipped to true
+	// between our in-memory snapshot and now). If so it's transient — a retry should
+	// serve it from S3 via the uploaded path.
+	uploaded, err := s.server.rdb.IsContentHashUploadedWithRetry(s.ctx, msg.ContentHash, msg.AccountID)
+	if err != nil {
+		s.WarnLog("could not check uploaded status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
+		return true
+	}
+	return uploaded
 }
 
 // fetchBodyFromS3 retrieves a message body from S3 using the key components
@@ -728,7 +868,7 @@ func (s *IMAPSession) fetchBodyFromS3(msg *db.Message) ([]byte, error) {
 	}()
 	if s3GetErr != nil {
 		s.DebugLog("S3 GetWithRetry failed", "uid", msg.UID, "s3_key", s3Key, "error", s3GetErr)
-		return nil, fmt.Errorf("message UID %d: %w: %v", msg.UID, storage.ErrRetrieveFailed, s3GetErr)
+		return nil, fmt.Errorf("message UID %d: %w: %w", msg.UID, storage.ErrRetrieveFailed, s3GetErr)
 	}
 	defer reader.Close()
 

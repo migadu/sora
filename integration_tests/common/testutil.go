@@ -9,8 +9,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +29,70 @@ import (
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
+
+// ScriptedS3 is a minimal S3 GetObject emulator for fetch-path tests. It returns a real
+// NoSuchKey 404 — which the AWS SDK deserializes into the same typed *types.NoSuchKey that
+// production sees — for the first FailFirst GETs, then serves the configured body. This
+// drives the not-yet-uploaded retry path with genuine S3 responses (real error
+// classification, the bounded retry, and the pending-gate), which the empty-stub S3 cannot.
+// Construct it with NewScriptedS3.
+type ScriptedS3 struct {
+	mu        sync.Mutex
+	body      []byte
+	failFirst int
+	gets      int
+}
+
+// SetBody sets the body served once the scripted NoSuchKey responses are exhausted.
+func (f *ScriptedS3) SetBody(b []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.body = append([]byte(nil), b...)
+}
+
+// GetCount returns how many GET requests have been received so far.
+func (f *ScriptedS3) GetCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gets
+}
+
+func (f *ScriptedS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusNotImplemented)
+		return
+	}
+	f.mu.Lock()
+	f.gets++
+	n, body, failFirst := f.gets, f.body, f.failFirst
+	f.mu.Unlock()
+
+	if n <= failFirst {
+		w.Header().Set("Content-Type", "application/xml")
+		w.Header().Set("x-amz-request-id", "test-req")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>`)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// NewScriptedS3 starts a fake S3 endpoint (cleaned up via t.Cleanup) that returns NoSuchKey
+// for the first failFirst GETs, then the body. It returns the controller plus a real
+// *storage.S3Storage pointed at it (path-style addressing makes the httptest server a valid
+// S3 endpoint).
+func NewScriptedS3(t *testing.T, failFirst int) (*ScriptedS3, *storage.S3Storage) {
+	t.Helper()
+	fake := &ScriptedS3{failFirst: failFirst}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+	s3, err := storage.New(srv.URL, "test", "test", "test-bucket", false, false, 5*time.Second)
+	if err != nil {
+		t.Fatalf("storage.New(fake S3): %v", err)
+	}
+	return fake, s3
+}
 
 // NoopUploaderS3 is a no-op S3 implementation used in integration tests.
 // PutWithRetry always succeeds (returns nil), allowing the upload worker to
@@ -59,6 +126,7 @@ type TestServer struct {
 	cleanup      func()
 	ResilientDB  *resilient.ResilientDatabase
 	uploadWorker *uploader.UploadWorker // exposed for WaitForUploads
+	UploadPath   string                 // local staging dir; set by setups that need to manipulate staged files
 }
 
 // WaitForUploads blocks until all pending uploads for this test server have
@@ -345,6 +413,117 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 		cleanup:      cleanup,
 		ResilientDB:  rdb,
 		uploadWorker: uploadWorker,
+		UploadPath:   tempDir,
+	}, account
+}
+
+// SetupIMAPServerForUploadRace creates an IMAP server whose upload worker is
+// constructed but NOT started and NOT in synchronous mode. APPENDed messages are
+// therefore staged on local disk and recorded in pending_uploads, but never marked
+// uploaded=true (no worker processes the queue). This lets tests reproduce the
+// "not-yet-uploaded" body-fetch race: delete the staged file under TestServer.UploadPath
+// to simulate a fetch hitting a node that does not hold the staging file while S3 does
+// not yet have the object. The IMAP server's S3 is an empty stub, so body reads miss S3.
+func SetupIMAPServerForUploadRace(t *testing.T) (*TestServer, TestAccount) {
+	t.Helper()
+	return SetupIMAPServerForUploadRaceWithS3(t, &storage.S3Storage{})
+}
+
+// SetupIMAPServerForUploadRaceWithS3 is SetupIMAPServerForUploadRace with a caller-provided
+// S3 backend, letting a test script GET responses (e.g. NoSuchKey then a body via a fake S3
+// endpoint) to exercise the not-yet-uploaded retry/timing path end to end.
+func SetupIMAPServerForUploadRaceWithS3(t *testing.T, s3Storage *storage.S3Storage) (*TestServer, TestAccount) {
+	t.Helper()
+
+	rdb := SetupTestDatabase(t)
+	account := CreateTestAccount(t, rdb)
+	address := GetRandomAddress(t)
+
+	tempDir, err := os.MkdirTemp("", "sora-test-upload-race-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+
+	// instanceID must match the IMAP server hostname ("localhost") so that the
+	// pending_uploads rows are attributable, matching the other setups.
+	uploadWorker, err := uploader.NewWithS3Interface(
+		tempDir,     // path
+		10,          // batchSize
+		1,           // concurrency
+		3,           // maxAttempts
+		time.Second, // retryInterval
+		0,           // maxStagingSize
+		"localhost", // instanceID — must match imap.New hostname arg
+		rdb,         // database
+		&NoopUploaderS3{},
+		&NoopUploaderCache{},
+		errCh,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create upload worker: %v", err)
+	}
+	// Deliberately NOT calling EnableSyncUpload()/Start(): uploads stay pending so
+	// APPENDed messages remain uploaded=false with their bodies only on local disk.
+
+	testConfig := &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{
+			Enabled:               true,
+			NamespacePrefix:       "Shared/",
+			AllowUserCreate:       true,
+			DefaultRights:         "lrswipkxtea",
+			AllowAnyoneIdentifier: true,
+		},
+	}
+
+	server, err := imap.New(
+		context.Background(),
+		"test",
+		"localhost",
+		address,
+		s3Storage,
+		rdb,
+		uploadWorker,
+		nil, // cache.Cache
+		imap.IMAPServerOptions{
+			InsecureAuth: true,
+			Config:       testConfig,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create IMAP server: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		if err := server.Serve(address); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+			errChan <- fmt.Errorf("IMAP server error: %w", err)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	cleanup := func() {
+		server.Close()
+		uploadWorker.Stop() // no-op if never started
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("IMAP server error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+		}
+		os.RemoveAll(tempDir)
+	}
+
+	return &TestServer{
+		Address:      address,
+		Server:       server,
+		cleanup:      cleanup,
+		ResilientDB:  rdb,
+		uploadWorker: uploadWorker,
+		UploadPath:   tempDir,
 	}, account
 }
 

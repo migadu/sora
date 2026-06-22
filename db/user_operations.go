@@ -303,6 +303,7 @@ type MessageHashInfo struct {
 	Subject     string
 	Uploaded    bool
 	ContentHash string
+	Expunged    bool // true if the message is soft-deleted (expunged_at IS NOT NULL), pending cleanup
 }
 
 // GetAllMessagesForUserVerification retrieves S3 info for all non-expunged messages for a user
@@ -335,13 +336,16 @@ func (db *Database) GetAllMessagesForUserVerification(ctx context.Context, accou
 	return messages, rows.Err()
 }
 
-// GetMessagesByContentHash retrieves all messages with a specific content hash for an account
+// GetMessagesByContentHash retrieves all messages with a specific content hash for an
+// account, INCLUDING expunged (soft-deleted) messages. Each result carries an Expunged
+// flag so callers (e.g. content-hash verification) can distinguish a live reference from
+// one that is merely pending two-phase cleanup, rather than misreporting it as an orphan.
 func (db *Database) GetMessagesByContentHash(ctx context.Context, accountID int64, contentHash string) ([]MessageHashInfo, error) {
 	query := `
-		SELECT m.id, m.uid, mb.name as mailbox_path, m.subject, m.uploaded, m.content_hash
+		SELECT m.id, m.uid, mb.name as mailbox_path, m.subject, m.uploaded, m.content_hash, (m.expunged_at IS NOT NULL) AS expunged
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
-		WHERE m.account_id = $1 AND m.content_hash = $2 AND m.expunged_at IS NULL
+		WHERE m.account_id = $1 AND m.content_hash = $2
 		ORDER BY m.id
 	`
 
@@ -354,7 +358,7 @@ func (db *Database) GetMessagesByContentHash(ctx context.Context, accountID int6
 	var messages []MessageHashInfo
 	for rows.Next() {
 		var msg MessageHashInfo
-		err := rows.Scan(&msg.ID, &msg.UID, &msg.MailboxPath, &msg.Subject, &msg.Uploaded, &msg.ContentHash)
+		err := rows.Scan(&msg.ID, &msg.UID, &msg.MailboxPath, &msg.Subject, &msg.Uploaded, &msg.ContentHash, &msg.Expunged)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan message: %w", err)
 		}

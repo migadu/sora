@@ -179,6 +179,73 @@ func (rd *ResilientDatabase) SetAuthCache(cache authCacheInterface) {
 	rd.authCache = cache
 }
 
+// isQuerySuccessful reports whether a database query error should be treated as a
+// success by the query circuit breaker — i.e. it is an expected application/protocol
+// outcome rather than a database system failure. Extracted as a named function so the
+// classification is unit-testable.
+func isQuerySuccessful(err error) bool {
+	if err == nil {
+		return true
+	}
+	// An *imap.Error returned through a streaming callback (e.g. a FETCH whose body is
+	// temporarily unavailable from S3) is an IMAP protocol/application outcome, not a
+	// database system failure — the underlying query already succeeded. Don't let it trip
+	// the DB breaker, which would escalate an S3 outage into a DB-read outage.
+	var imapErr *imap.Error
+	if errors.As(err, &imapErr) {
+		return true
+	}
+	// Business logic errors that should NOT trip the circuit breaker.
+	if errors.Is(err, consts.ErrUserNotFound) ||
+		errors.Is(err, consts.ErrMailboxNotFound) ||
+		errors.Is(err, consts.ErrMessageNotAvailable) ||
+		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
+		errors.Is(err, consts.ErrAccountAlreadyExists) ||
+		errors.Is(err, consts.ErrNotPermitted) ||
+		errors.Is(err, consts.ErrDBNotFound) ||
+		errors.Is(err, consts.ErrMessageExists) ||
+		errors.Is(err, pgx.ErrNoRows) {
+		return true
+	}
+	return false // Actual system failure
+}
+
+// isWriteSuccessful is the write-breaker counterpart of isQuerySuccessful. In addition to
+// the query cases it tolerates unique-constraint violations and self-resolving transient
+// PostgreSQL errors (deadlock / serialization failure), which are retried.
+func isWriteSuccessful(err error) bool {
+	if err == nil {
+		return true
+	}
+	var imapErr *imap.Error
+	if errors.As(err, &imapErr) {
+		return true
+	}
+	if errors.Is(err, consts.ErrUserNotFound) ||
+		errors.Is(err, consts.ErrMailboxNotFound) ||
+		errors.Is(err, consts.ErrMessageNotAvailable) ||
+		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
+		errors.Is(err, consts.ErrAccountAlreadyExists) ||
+		errors.Is(err, consts.ErrNotPermitted) ||
+		errors.Is(err, consts.ErrDBNotFound) ||
+		errors.Is(err, consts.ErrDBUniqueViolation) ||
+		errors.Is(err, consts.ErrMessageExists) ||
+		errors.Is(err, pgx.ErrNoRows) {
+		return true
+	}
+	// Transient PostgreSQL errors (deadlock, serialization failure) are retried and should
+	// not count as circuit breaker failures — they are self-resolving.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "40P01", // deadlock detected
+			"40001": // serialization failure
+			return true
+		}
+	}
+	return false // Actual system failure
+}
+
 func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, enableHealthCheck bool, runMigrations bool) (*ResilientDatabase, error) {
 	return NewResilientDatabaseWithOptions(ctx, config, enableHealthCheck, runMigrations, false)
 }
@@ -224,24 +291,7 @@ func NewResilientDatabaseWithOptions(ctx context.Context, config *config.Databas
 	}
 	// Configure IsSuccessful to treat business logic errors as successes
 	// Only system errors (connection failures, timeouts, etc.) should count as failures
-	querySettings.IsSuccessful = func(err error) bool {
-		if err == nil {
-			return true // Success
-		}
-		// Business logic errors that should NOT trip the circuit breaker
-		if errors.Is(err, consts.ErrUserNotFound) ||
-			errors.Is(err, consts.ErrMailboxNotFound) ||
-			errors.Is(err, consts.ErrMessageNotAvailable) ||
-			errors.Is(err, consts.ErrMailboxAlreadyExists) ||
-			errors.Is(err, consts.ErrAccountAlreadyExists) ||
-			errors.Is(err, consts.ErrNotPermitted) ||
-			errors.Is(err, consts.ErrDBNotFound) ||
-			errors.Is(err, consts.ErrMessageExists) ||
-			errors.Is(err, pgx.ErrNoRows) {
-			return true // Treat as success - these are expected application errors
-		}
-		return false // Actual system failure
-	}
+	querySettings.IsSuccessful = isQuerySuccessful
 
 	writeSettings := circuitbreaker.DefaultSettings("database_write")
 	writeSettings.MaxRequests = 10 // Allow more test requests in half-open state for faster recovery
@@ -275,35 +325,7 @@ func NewResilientDatabaseWithOptions(ctx context.Context, config *config.Databas
 	}
 	// Configure IsSuccessful to treat business logic errors as successes
 	// Only system errors (connection failures, timeouts, etc.) should count as failures
-	writeSettings.IsSuccessful = func(err error) bool {
-		if err == nil {
-			return true // Success
-		}
-		// Business logic errors that should NOT trip the circuit breaker
-		if errors.Is(err, consts.ErrUserNotFound) ||
-			errors.Is(err, consts.ErrMailboxNotFound) ||
-			errors.Is(err, consts.ErrMessageNotAvailable) ||
-			errors.Is(err, consts.ErrMailboxAlreadyExists) ||
-			errors.Is(err, consts.ErrAccountAlreadyExists) ||
-			errors.Is(err, consts.ErrNotPermitted) ||
-			errors.Is(err, consts.ErrDBNotFound) ||
-			errors.Is(err, consts.ErrDBUniqueViolation) ||
-			errors.Is(err, consts.ErrMessageExists) ||
-			errors.Is(err, pgx.ErrNoRows) {
-			return true // Treat as success - these are expected application errors
-		}
-		// Transient PostgreSQL errors (deadlock, serialization failure) are retried
-		// and should not count as circuit breaker failures — they are self-resolving.
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) {
-			switch pgErr.Code {
-			case "40P01", // deadlock detected
-				"40001": // serialization failure
-				return true
-			}
-		}
-		return false // Actual system failure
-	}
+	writeSettings.IsSuccessful = isWriteSuccessful
 
 	// Create failover manager
 	failoverManager, err := newRuntimeFailoverManager(ctx, config, runMigrations, skipReadReplicas)

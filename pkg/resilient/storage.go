@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/retry"
@@ -113,6 +114,47 @@ func (rs *ResilientS3Storage) isRetryableError(err error) bool {
 // 404s during a real outage won't cause a cascade either.
 func (rs *ResilientS3Storage) isRetryableGetError(err error) bool {
 	return rs.classifyRetryable(err, false)
+}
+
+// IsNotFoundError reports whether err represents an S3 "object does not exist"
+// condition (HTTP 404 / NoSuchKey), as opposed to a transient outage
+// (network/timeout/5xx/circuit-open). Readers use it to distinguish permanent
+// content loss from a retryable S3 unavailability: a missing object should degrade
+// to an empty body, whereas a transient failure should ask the client to retry.
+func IsNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Structured AWS SDK check first — most reliable.
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		code := apiErr.ErrorCode()
+		// NoSuchBucket is a bucket configuration/system issue, not a missing object.
+		if code == "NoSuchBucket" {
+			return false
+		}
+		if code == "NoSuchKey" || code == "NotFound" {
+			return true
+		}
+	}
+	var httpErr *awshttp.ResponseError
+	if errors.As(err, &httpErr) && httpErr.HTTPStatusCode() == 404 {
+		return true
+	}
+	// Fallback to string matching for wrapped/flattened errors and S3-compatible
+	// providers that don't surface a typed HTTP status.
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "nosuchkey") || strings.Contains(s, "notfound") {
+		return true
+	}
+	if strings.Contains(s, "not found") {
+		// Guard against false positives in network/DNS lookup or pgx errors
+		if strings.Contains(s, "host not found") || strings.Contains(s, "address not found") || strings.Contains(s, "name not found") {
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 func (rs *ResilientS3Storage) classifyRetryable(err error, retry404 bool) bool {
@@ -363,14 +405,23 @@ func (rs *ResilientS3Storage) executeS3OperationWithRetry(ctx context.Context, b
 		res, cbErr := breaker.Execute(op)
 		if cbErr != nil {
 			retryable := isRetryable(cbErr)
-			// Log every S3 failure so we can diagnose what triggers circuit breaker trips.
-			// Without this, tripped breakers are invisible until users report empty bodies.
-			logger.Warn("S3 operation failed",
-				"breaker", breaker.Name(),
-				"key", key,
-				"error", cbErr,
-				"breaker_state", breaker.State(),
-				"retryable", retryable)
+			// A 404/NoSuchKey is a benign, expected outcome for a GET (the caller decides
+			// whether a missing object matters — e.g. it is normal during the not-yet-uploaded
+			// fetch race) and never trips the breaker, so log it at Debug to avoid noise. Real
+			// failures (transient outages, breaker trips) stay at Warn to remain diagnosable.
+			if IsNotFoundError(cbErr) {
+				logger.Debug("S3 object not found",
+					"breaker", breaker.Name(),
+					"key", key,
+					"error", cbErr)
+			} else {
+				logger.Warn("S3 operation failed",
+					"breaker", breaker.Name(),
+					"key", key,
+					"error", cbErr,
+					"breaker_state", breaker.State(),
+					"retryable", retryable)
+			}
 
 			if retryable {
 				return cbErr // Signal to retry

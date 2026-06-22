@@ -24,6 +24,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
 )
@@ -990,12 +991,21 @@ func (s *POP3Session) handleConnection() {
 			if err != nil {
 				if err == consts.ErrMessageNotAvailable {
 					writer.WriteString("-ERR Message not available\r\n")
+				} else if errors.Is(err, errBodyTransientlyUnavailable) {
+					s.WarnLog("TOP: message body temporarily unavailable, asking client to retry", "uid", msg.UID, "error", err)
+					writer.WriteString("-ERR [SYS/TEMP] Message temporarily unavailable, please try again later\r\n")
 				} else {
 					s.DebugLog("top internal error", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 				}
 				writer.Flush()
-				recordMetrics("failure")
+				// A transient "retry later" is not a server failure; bucket it separately
+				// so the failure metric reflects only genuine failures.
+				if errors.Is(err, errBodyTransientlyUnavailable) {
+					recordMetrics("unavailable")
+				} else {
+					recordMetrics("failure")
+				}
 				continue
 			}
 
@@ -1214,12 +1224,21 @@ func (s *POP3Session) handleConnection() {
 			if err != nil {
 				if err == consts.ErrMessageNotAvailable {
 					writer.WriteString("-ERR Message not available\r\n")
+				} else if errors.Is(err, errBodyTransientlyUnavailable) {
+					s.WarnLog("RETR: message body temporarily unavailable, asking client to retry", "uid", msg.UID, "error", err)
+					writer.WriteString("-ERR [SYS/TEMP] Message temporarily unavailable, please try again later\r\n")
 				} else {
 					s.DebugLog("retr internal error", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
 				}
 				writer.Flush()
-				recordMetrics("failure")
+				// A transient "retry later" is not a server failure; bucket it separately
+				// so the failure metric reflects only genuine failures.
+				if errors.Is(err, errBodyTransientlyUnavailable) {
+					recordMetrics("unavailable")
+				} else {
+					recordMetrics("failure")
+				}
 				continue
 			}
 			s.DebugLog("retrieved message body", "uid", msg.UID)
@@ -2135,6 +2154,30 @@ func (s *POP3Session) Close() error {
 	return s.closeWithoutLock()
 }
 
+// errBodyTransientlyUnavailable marks a message body that exists (or will shortly) but
+// cannot be retrieved from this node right now. Two causes feed it, both transient:
+//   - not yet uploaded: staged for upload, not on local disk here and not in S3 yet
+//     (the upload worker will land it shortly); see bodyUploadStillPending.
+//   - S3 unavailable: the message is uploaded but S3 is unreachable (network/timeout/
+//     5xx/circuit-open) — distinct from a 404/NoSuchKey, which is permanent loss.
+//
+// RETR/TOP answer it with -ERR [SYS/TEMP] ... please try again later so the client
+// retries (and does not DELE), rather than -ERR Message not available which reads as a
+// permanent failure. The wrapping error text carries the specific cause for logging.
+var errBodyTransientlyUnavailable = errors.New("message body temporarily unavailable")
+
+// pop3BodyFetchRetry* tune the bounded retry of the S3 read on the not-yet-uploaded path.
+// They absorb the read-before-write race where the background S3 PUT lands shortly after
+// the fetch (e.g. a cross-node delivery still uploading). The wait is only ever spent
+// when an upload is still pending (loadMessageBody gates on bodyUploadStillPending), so a
+// body that is never coming is not waited on; and because a transient result aborts the
+// connection/session command, at most one message per command pays it. The window is generous:
+// ~(pop3BodyFetchRetryAttempts-1) * pop3BodyFetchRetryDelay ≈ 1s.
+const (
+	pop3BodyFetchRetryAttempts = 3
+	pop3BodyFetchRetryDelay    = 500 * time.Millisecond
+)
+
 func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 	if s.ctx.Err() != nil {
 		s.DebugLog("request aborted, aborting message body fetch")
@@ -2189,7 +2232,29 @@ func (s *POP3Session) loadMessageBody(msg *db.Message) ([]byte, error) {
 					return diskData, nil
 				}
 			}
-			return nil, err
+			// The message is marked uploaded but S3 could not serve it and the local
+			// staging copy is gone. Distinguish a transient S3 outage (network/timeout/
+			// 5xx/circuit-open) from a genuinely missing object (404/NoSuchKey): on a
+			// transient failure ask the client to retry (RETR/TOP -> -ERR [SYS/TEMP])
+			// instead of reporting the message permanently gone. A NoSuchKey maps to
+			// -ERR Message not available (the object is permanently lost).
+			// Only a genuine S3-reachability failure is transient. fetchBodyFromS3 wraps
+			// such failures (network/timeout/5xx/circuit-open) in ErrRetrieveFailed; it
+			// also wraps NoSuchKey there, which IsNotFoundError excludes. Permanent
+			// conditions (empty/0-byte object, missing S3 key, read error) are NOT
+			// ErrRetrieveFailed and must NOT be reported transient, or the client would
+			// retry forever instead of getting -ERR Message not available.
+			if errors.Is(err, storage.ErrRetrieveFailed) && !resilient.IsNotFoundError(err) {
+				return nil, fmt.Errorf("message UID %d: %w (S3 unavailable): %v", msg.UID, errBodyTransientlyUnavailable, err)
+			}
+			// Permanent. A NoSuchKey on an uploaded message is genuine content loss worth
+			// alerting on — logged only here, where the message is marked uploaded (a 404
+			// during the not-yet-uploaded race is expected and not logged). RETR/TOP map
+			// ErrMessageNotAvailable to -ERR Message not available.
+			if resilient.IsNotFoundError(err) {
+				s.WarnLog("message marked uploaded but missing from S3 (NoSuchKey)", "uid", msg.UID, "content_hash", msg.ContentHash, "s3_domain", msg.S3Domain, "s3_localpart", msg.S3Localpart)
+			}
+			return nil, consts.ErrMessageNotAvailable
 		}
 		return data, nil
 	}
@@ -2201,30 +2266,80 @@ func (s *POP3Session) loadMessageBody(msg *db.Message) ([]byte, error) {
 	}
 	logger.Debug("POP3: Fetching not yet uploaded message from disk", "uid", msg.UID)
 	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-	data, diskErr := os.ReadFile(filePath)
-	if diskErr == nil && len(data) > 0 {
+	if data, diskErr := os.ReadFile(filePath); diskErr == nil && len(data) > 0 {
 		return data, nil
 	}
 
-	// Local staging file is missing or empty. In a multi-backend cluster the body
-	// may have been delivered/staged on another node and already uploaded to S3,
-	// while this node's in-memory message still reads uploaded=false. Try S3 with
-	// the stored key before giving up. NoSuchKey fails fast, so this is cheap when S3 has nothing yet.
+	// Local staging file is missing or empty. In a multi-backend cluster the body may
+	// have been delivered/staged on another node and already uploaded to S3, while this
+	// node's in-memory message still reads uploaded=false. Try S3 with the stored key —
+	// with a short bounded retry to absorb the read-before-write race where the S3 PUT
+	// lands within the same second as this fetch. NoSuchKey fails fast, so each miss is cheap.
+	//
+	// Decide up front whether the body is still expected to arrive. We only wait-and-retry
+	// S3 when it is: there is no point sleeping for a body that is never coming.
+	pending := s.bodyUploadStillPending(msg)
+
 	if msg.S3Domain != "" && msg.S3Localpart != "" {
-		if s3Data, s3Err := s.fetchBodyFromS3(msg); s3Err == nil {
-			logger.Debug("POP3: local staging file missing, served from S3", "uid", msg.UID)
-			return s3Data, nil
+		attempts := 1
+		if pending {
+			attempts = pop3BodyFetchRetryAttempts
+		}
+		for attempt := 0; attempt < attempts; attempt++ {
+			s3Data, s3Err := s.fetchBodyFromS3(msg)
+			if s3Err == nil {
+				logger.Debug("POP3: local staging file missing, served from S3", "uid", msg.UID, "attempt", attempt)
+				return s3Data, nil
+			}
+			// Only NoSuchKey ("object hasn't landed yet") benefits from waiting and
+			// retrying. Any other error is either a transient outage that GetWithRetry
+			// already exhausted its own backoff on (looping would just multiply that
+			// latency) or a permanent condition — stop and let classification decide.
+			if !resilient.IsNotFoundError(s3Err) {
+				break
+			}
+			if attempt < attempts-1 {
+				select {
+				case <-time.After(pop3BodyFetchRetryDelay):
+				case <-s.ctx.Done():
+					return nil, s.ctx.Err()
+				}
+			}
 		}
 	}
 
-	if diskErr != nil {
-		if os.IsNotExist(diskErr) {
-			logger.Debug("POP3: Message not found locally - assuming pending", "uid", msg.UID, "hash", msg.ContentHash)
-			return nil, consts.ErrMessageNotAvailable
-		}
-		return nil, fmt.Errorf("error retrieving message UID %d from local disk: %w", msg.UID, diskErr)
+	// Body still unavailable. Distinguish transient from permanent: if the upload is still
+	// pending (or the message has since been marked uploaded), the body is in flight — tell
+	// the client to retry (errBodyTransientlyUnavailable -> -ERR [SYS/TEMP] ... try again later, and
+	// the client must not DELE). Otherwise the content is genuinely gone, which RETR/TOP map
+	// to -ERR Message not available.
+	if pending {
+		return nil, errBodyTransientlyUnavailable
 	}
-	return nil, fmt.Errorf("message UID %d: empty body on disk and not in S3", msg.UID)
+	logger.Debug("POP3: message body not on disk and not in S3, content unavailable", "uid", msg.UID, "hash", msg.ContentHash)
+	return nil, consts.ErrMessageNotAvailable
+}
+
+// bodyUploadStillPending reports whether the system still intends to make this body
+// available — i.e. a pending_upload record exists, or the message has since been marked
+// uploaded (so a retry should find it in S3). It distinguishes the transient
+// read-before-upload race from genuine, permanent content loss. On a DB error it returns
+// true (conservative: a client retry is safer than reporting the message permanently gone).
+func (s *POP3Session) bodyUploadStillPending(msg *db.Message) bool {
+	pending, err := s.server.rdb.PendingUploadExistsWithRetry(s.ctx, msg.ContentHash, msg.AccountID)
+	if err != nil {
+		s.WarnLog("could not check pending-upload status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
+		return true
+	}
+	if pending {
+		return true
+	}
+	uploaded, err := s.server.rdb.IsContentHashUploadedWithRetry(s.ctx, msg.ContentHash, msg.AccountID)
+	if err != nil {
+		s.WarnLog("could not check uploaded status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
+		return true
+	}
+	return uploaded
 }
 
 // fetchBodyFromS3 retrieves a message body from S3 using the key components
@@ -2250,7 +2365,7 @@ func (s *POP3Session) fetchBodyFromS3(msg *db.Message) ([]byte, error) {
 	}()
 	if s3GetErr != nil {
 		logger.Debug("POP3: S3 GetWithRetry failed", "uid", msg.UID, "s3_key", s3Key, "error", s3GetErr)
-		return nil, fmt.Errorf("message UID %d: %w: %v", msg.UID, storage.ErrRetrieveFailed, s3GetErr)
+		return nil, fmt.Errorf("message UID %d: %w: %w", msg.UID, storage.ErrRetrieveFailed, s3GetErr)
 	}
 	defer reader.Close()
 

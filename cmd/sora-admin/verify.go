@@ -779,62 +779,79 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 		return nil
 	}
 
-	// Count uploaded vs not uploaded
-	uploaded := 0
-	notUploaded := 0
+	// Count by upload + expunge status. Expunged (soft-deleted) messages still reference
+	// the S3 object until two-phase cleanup removes them, so they are NOT orphans.
+	liveUploaded, liveNotUploaded, expungedCount := 0, 0, 0
 	for _, msg := range messages {
+		if msg.Expunged {
+			expungedCount++
+			continue
+		}
 		if msg.Uploaded {
-			uploaded++
+			liveUploaded++
 		} else {
-			notUploaded++
+			liveNotUploaded++
 		}
 	}
+	liveCount := liveUploaded + liveNotUploaded
 
-	fmt.Printf("  Uploaded: %d\n", uploaded)
-	fmt.Printf("  Not uploaded: %d\n", notUploaded)
+	fmt.Printf("  Live: %d (uploaded: %d, not uploaded: %d)\n", liveCount, liveUploaded, liveNotUploaded)
+	fmt.Printf("  Expunged (pending cleanup): %d\n", expungedCount)
 
 	// Show detailed information if requested
 	if showDetails {
 		fmt.Printf("\nDetailed message information:\n")
-		fmt.Printf("%-10s %-20s %-15s %-10s %s\n", "ID", "Mailbox", "UID", "Uploaded", "Subject")
-		fmt.Printf("%s\n", strings.Repeat("-", 100))
+		fmt.Printf("%-10s %-20s %-15s %-10s %-10s %s\n", "ID", "Mailbox", "UID", "Uploaded", "Expunged", "Subject")
+		fmt.Printf("%s\n", strings.Repeat("-", 110))
 		for _, msg := range messages {
 			uploadStatus := "FALSE"
 			if msg.Uploaded {
 				uploadStatus = "TRUE"
 			}
+			expungeStatus := "FALSE"
+			if msg.Expunged {
+				expungeStatus = "TRUE"
+			}
 			subject := msg.Subject
 			if len(subject) > 40 {
 				subject = subject[:37] + "..."
 			}
-			fmt.Printf("%-10d %-20s %-15d %-10s %s\n",
-				msg.ID, msg.MailboxPath, msg.UID, uploadStatus, subject)
+			fmt.Printf("%-10d %-20s %-15d %-10s %-10s %s\n",
+				msg.ID, msg.MailboxPath, msg.UID, uploadStatus, expungeStatus, subject)
 		}
 	}
 
-	// Summary and recommendations
+	// Summary and recommendations. Conditions are evaluated against LIVE (non-expunged)
+	// references; an object referenced only by expunged messages is awaiting cleanup, not orphaned.
 	fmt.Printf("\nSummary:\n")
-	if exists && !contentIntact {
+	switch {
+	case exists && !contentIntact:
 		fmt.Printf("[FAIL] CRITICAL: Object exists in S3 but its body is corrupt or unreadable\n")
 		fmt.Printf("  HEAD succeeds but the full body cannot be downloaded/decrypted or fails the hash check.\n")
 		fmt.Printf("  Users will get errors (e.g. \"unexpected EOF\") trying to read these messages.\n")
 		fmt.Printf("  The S3 object must be re-uploaded from the original source, or the messages deleted.\n")
-	} else if exists && uploaded > 0 {
+	case liveCount == 0 && expungedCount > 0:
+		if exists {
+			fmt.Printf("[OK] Object exists in S3, referenced only by %d expunged message(s) pending cleanup\n", expungedCount)
+			fmt.Printf("  This is NOT an orphan: the cleaner removes the S3 object once the grace period elapses.\n")
+		} else {
+			fmt.Printf("[OK] Content already removed from S3; %d expunged message row(s) pending cleanup\n", expungedCount)
+		}
+	case exists && liveUploaded > 0:
 		fmt.Printf("[OK] Everything looks good\n")
-	} else if !exists && notUploaded > 0 {
+	case !exists && liveNotUploaded > 0:
 		fmt.Printf("[FAIL] Problem detected: Content missing from S3 and messages marked as not uploaded\n")
 		fmt.Printf("  This likely indicates stuck uploads from the race condition bug\n")
 		fmt.Printf("  Safe to delete these messages (content was never successfully stored)\n")
-	} else if !exists && uploaded > 0 {
+	case !exists && liveUploaded > 0:
 		fmt.Printf("[FAIL] CRITICAL: Messages marked as uploaded but content missing from S3\n")
 		fmt.Printf("  Users will get errors trying to read these messages\n")
 		fmt.Printf("  Need to either restore S3 content or delete messages\n")
-	} else if exists && notUploaded > 0 {
+	case exists && liveNotUploaded > 0:
 		fmt.Printf("[WARN] Content exists in S3 but messages marked as not uploaded\n")
 		fmt.Printf("  Can fix by marking messages as uploaded:\n")
 		fmt.Printf("  UPDATE messages SET uploaded = TRUE WHERE content_hash = '%s' AND account_id = %d;\n", hash, accountID)
 	}
-
 	return nil
 }
 

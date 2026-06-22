@@ -279,6 +279,7 @@ func setupRealLMTPBackend(t *testing.T, rdb *resilient.ResilientDatabase, addr s
 		1,
 		3,
 		time.Second,
+		0, // maxStagingSize
 		"test-lmtp-backend",
 		rdb,
 		&storage.S3Storage{},
