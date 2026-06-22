@@ -16,6 +16,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/retry"
 	"github.com/migadu/sora/storage"
 )
@@ -237,7 +238,7 @@ func (rs *ResilientS3Storage) GetWithRetry(ctx context.Context, key string) (io.
 	op := func() (any, error) {
 		return rs.storage.Get(key)
 	}
-	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, rs.isRetryableGetError, op, key)
+	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, rs.isRetryableGetError, op, key, "GET")
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +266,7 @@ func (rs *ResilientS3Storage) PutWithRetry(ctx context.Context, key string, body
 		}
 		return nil, rs.storage.Put(key, body, size)
 	}
-	_, err := rs.executeS3OperationWithRetry(ctx, rs.putBreaker, config, rs.isRetryableError, op, key)
+	_, err := rs.executeS3OperationWithRetry(ctx, rs.putBreaker, config, rs.isRetryableError, op, key, "PUT")
 	return err
 }
 
@@ -289,7 +290,7 @@ func (rs *ResilientS3Storage) DeleteWithRetry(ctx context.Context, key string) e
 	op := func() (any, error) {
 		return nil, rs.storage.Delete(key)
 	}
-	_, err := rs.executeS3OperationWithRetry(ctx, rs.deleteBreaker, config, rs.isRetryableError, op, key)
+	_, err := rs.executeS3OperationWithRetry(ctx, rs.deleteBreaker, config, rs.isRetryableError, op, key, "DELETE")
 	return err
 }
 
@@ -316,7 +317,7 @@ func (rs *ResilientS3Storage) PutObjectWithRetry(ctx context.Context, key string
 		}
 		return rs.storage.Client.PutObject(ctx, input)
 	}
-	result, err := rs.executeS3OperationWithRetry(ctx, rs.putBreaker, config, rs.isRetryableError, op, key)
+	result, err := rs.executeS3OperationWithRetry(ctx, rs.putBreaker, config, rs.isRetryableError, op, key, "PUT")
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +342,7 @@ func (rs *ResilientS3Storage) GetObjectWithRetry(ctx context.Context, key string
 		}
 		return rs.storage.Client.GetObject(ctx, input)
 	}
-	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, rs.isRetryableGetError, op, key)
+	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, rs.isRetryableGetError, op, key, "GET")
 	if err != nil {
 		return nil, err
 	}
@@ -387,7 +388,7 @@ func (rs *ResilientS3Storage) StatObjectWithRetry(ctx context.Context, key strin
 		}
 		return rs.storage.Client.HeadObject(ctx, input)
 	}
-	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, rs.isRetryableError, op, key)
+	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, rs.isRetryableError, op, key, "STAT")
 	if err != nil {
 		return nil, err
 	}
@@ -399,7 +400,7 @@ func (rs *ResilientS3Storage) StatObjectWithRetry(ctx context.Context, key strin
 // with retries and a circuit breaker.  The isRetryable function determines which errors
 // are worth retrying.  Only transient errors (5xx, timeouts, connection issues) are
 // retried; client errors like 404 NoSuchKey fail immediately.
-func (rs *ResilientS3Storage) executeS3OperationWithRetry(ctx context.Context, breaker *circuitbreaker.CircuitBreaker, config retry.BackoffConfig, isRetryable func(error) bool, op func() (any, error), key string) (any, error) {
+func (rs *ResilientS3Storage) executeS3OperationWithRetry(ctx context.Context, breaker *circuitbreaker.CircuitBreaker, config retry.BackoffConfig, isRetryable func(error) bool, op func() (any, error), key string, operation string) (any, error) {
 	var result any
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		res, cbErr := breaker.Execute(op)
@@ -433,7 +434,37 @@ func (rs *ResilientS3Storage) executeS3OperationWithRetry(ctx context.Context, b
 		result = res
 		return nil
 	}, config)
+	// Record exactly one outcome per logical operation, after all retries have
+	// settled. err is the final result of the (possibly retried) call, so a
+	// transient failure that eventually succeeds is counted as a single success
+	// rather than several errors plus a success.
+	RecordS3Operation(operation, err)
 	return result, err
+}
+
+// RecordS3Operation records exactly one outcome for the sora_s3_operations_total
+// error-rate metric per *logical* S3 operation. Callers invoke it once, after any
+// retries have settled — never per attempt — so the error rate is not inflated by
+// transient failures that ultimately succeed.
+//
+// Status mirrors the circuit breaker's notion of a genuine S3 failure: an object
+// that does not exist (404 / NoSuchKey) and a client cancellation are recorded
+// under their own statuses and excluded from "error", so the rate reflects only
+// real infrastructure failures (timeouts, 5xx, throttling, network). Direct
+// (non-retrying) callers such as the User API call this once per operation too.
+func RecordS3Operation(operation string, err error) {
+	var status string
+	switch {
+	case err == nil:
+		status = "success"
+	case IsNotFoundError(err):
+		status = "not_found"
+	case errors.Is(err, context.Canceled):
+		status = "canceled"
+	default:
+		status = "error"
+	}
+	metrics.S3OperationsTotal.WithLabelValues(operation, status).Inc()
 }
 
 func (rs *ResilientS3Storage) GetGetBreakerState() circuitbreaker.State {

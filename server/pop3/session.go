@@ -2024,7 +2024,8 @@ func (s *POP3Session) handleConnection() {
 			recordMetrics("success")
 
 		default:
-			writer.WriteString(fmt.Sprintf("-ERR Unknown command: %s\r\n", cmd))
+			metrics.CommandsTotal.WithLabelValues("pop3", "UNKNOWN", "failure").Inc()
+			fmt.Fprintf(writer, "-ERR Unknown command: %s\r\n", cmd)
 			s.DebugLog("unknown command", "command", cmd)
 		}
 

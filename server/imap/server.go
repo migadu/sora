@@ -906,7 +906,10 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	} else {
 		session.InfoLog("connected")
 	}
-	return session, greeting, nil
+	// Wrap the session so every IMAP command records throughput/latency metrics
+	// in one place (see metered.go). The wrapper embeds *IMAPSession, so all
+	// optional extension interfaces remain satisfied.
+	return newMeteredSession(session), greeting, nil
 }
 
 // trackConnection adds a connection to the active connections map

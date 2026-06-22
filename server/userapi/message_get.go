@@ -12,6 +12,7 @@ import (
 
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/resilient"
 )
 
 // handleGetMessage retrieves a message in JSON format
@@ -110,6 +111,8 @@ func (s *Server) handleGetMessageBody(w http.ResponseWriter, r *http.Request) {
 
 		s3Key := helpers.NewS3Key(message.S3Domain, message.S3Localpart, message.ContentHash)
 		reader, err := s.storage.Get(s3Key)
+		// Direct (non-retrying) S3 get: record one outcome for the error-rate metric.
+		resilient.RecordS3Operation("GET", err)
 		if err != nil {
 			logger.Warn("HTTP Mail API: Error retrieving message body from S3", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to retrieve message body")
@@ -223,6 +226,8 @@ func (s *Server) handleGetMessageRaw(w http.ResponseWriter, r *http.Request) {
 
 		s3Key := helpers.NewS3Key(message.S3Domain, message.S3Localpart, message.ContentHash)
 		reader, err := s.storage.Get(s3Key)
+		// Direct (non-retrying) S3 get: record one outcome for the error-rate metric.
+		resilient.RecordS3Operation("GET", err)
 		if err != nil {
 			logger.Warn("HTTP Mail API: Error retrieving message from S3", "name", s.name, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to retrieve message")

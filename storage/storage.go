@@ -238,10 +238,11 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 		_, err = s.Client.PutObject(ctx, input)
 		if err != nil {
 			metrics.StorageOperationErrors.WithLabelValues("PUT", classifyS3Error(err)).Inc()
-			metrics.S3OperationsTotal.WithLabelValues("PUT", "error").Inc()
-		} else {
-			metrics.S3OperationsTotal.WithLabelValues("PUT", "success").Inc()
 		}
+		// sora_s3_operations_total (the error-rate counter) is recorded once per
+		// logical operation by the resilient layer (resilient.RecordS3Operation)
+		// after retries settle, so it is intentionally not incremented per attempt
+		// here. Duration stays per attempt as a true per-call latency sample.
 		metrics.S3OperationDuration.WithLabelValues("PUT").Observe(time.Since(start).Seconds())
 		return err
 	}
@@ -256,9 +257,6 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 	_, err := s.Client.PutObject(ctx, input)
 	if err != nil {
 		metrics.StorageOperationErrors.WithLabelValues("PUT", classifyS3Error(err)).Inc()
-		metrics.S3OperationsTotal.WithLabelValues("PUT", "error").Inc()
-	} else {
-		metrics.S3OperationsTotal.WithLabelValues("PUT", "success").Inc()
 	}
 	metrics.S3OperationDuration.WithLabelValues("PUT").Observe(time.Since(start).Seconds())
 	return err
@@ -322,10 +320,12 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 		Key:    aws.String(key),
 	}
 
+	// sora_s3_operations_total (the error-rate counter) is recorded once per
+	// logical operation by the resilient layer (resilient.RecordS3Operation)
+	// after retries settle, not per attempt here. Duration stays per attempt.
 	result, err := s.Client.GetObject(ctx, input)
 	if err != nil {
 		cancel() // cancel immediately on error
-		metrics.S3OperationsTotal.WithLabelValues("GET", "error").Inc()
 		metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
 		return nil, err
 	}
@@ -336,7 +336,6 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 		encryptedData, err := io.ReadAll(result.Body)
 		cancel() // done with the HTTP connection
 		if err != nil {
-			metrics.S3OperationsTotal.WithLabelValues("GET", "error").Inc()
 			metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
 			result.Body.Close()
 			return nil, fmt.Errorf("failed to read encrypted data: %w", err)
@@ -351,7 +350,6 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 
 		decryptedData, err := s.decryptData(encryptedData)
 		if err != nil {
-			metrics.S3OperationsTotal.WithLabelValues("GET", "error").Inc()
 			metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
 			logger.Error("Storage: Decryption failed", "key", key, "encrypted_size", len(encryptedData), "error", err)
 			return nil, fmt.Errorf("failed to decrypt data: %w", err)
@@ -364,7 +362,6 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 			logger.Debug("Storage: Successfully decrypted data", "key", key, "decrypted_size", len(decryptedData))
 		}
 
-		metrics.S3OperationsTotal.WithLabelValues("GET", "success").Inc()
 		metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
 		return io.NopCloser(bytes.NewReader(decryptedData)), nil
 	}
@@ -372,7 +369,6 @@ func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
 	// Non-encrypted path: body streams from the HTTP connection.
 	// The timeout context must stay alive until the caller finishes reading,
 	// so we wrap the body to cancel the context on Close().
-	metrics.S3OperationsTotal.WithLabelValues("GET", "success").Inc()
 	metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
 	return &cancelOnCloseReader{ReadCloser: result.Body, cancel: cancel}, nil
 }
@@ -409,7 +405,6 @@ func (s *S3Storage) Delete(key string) error {
 		var apiErr smithy.APIError
 		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidRequest" {
 			logger.Debug("STORAGE: Object does not exist in S3 - delete is no-op", "key", key)
-			metrics.S3OperationsTotal.WithLabelValues("DELETE", "success").Inc()
 			metrics.S3OperationDuration.WithLabelValues("DELETE").Observe(time.Since(start).Seconds())
 			return nil
 		}
@@ -418,17 +413,17 @@ func (s *S3Storage) Delete(key string) error {
 		var httpErr *awshttp.ResponseError
 		if errors.As(err, &httpErr) && httpErr.HTTPStatusCode() == http.StatusNotFound {
 			logger.Debug("STORAGE: Object does not exist in S3 - delete is no-op", "key", key)
-			metrics.S3OperationsTotal.WithLabelValues("DELETE", "success").Inc()
 			metrics.S3OperationDuration.WithLabelValues("DELETE").Observe(time.Since(start).Seconds())
 			return nil
 		}
 
-		metrics.S3OperationsTotal.WithLabelValues("DELETE", "error").Inc()
 		metrics.S3OperationDuration.WithLabelValues("DELETE").Observe(time.Since(start).Seconds())
 		return err
 	}
 
-	metrics.S3OperationsTotal.WithLabelValues("DELETE", "success").Inc()
+	// sora_s3_operations_total (the error-rate counter) is recorded once per
+	// logical operation by the resilient layer (resilient.RecordS3Operation)
+	// after retries settle, not per attempt here.
 	metrics.S3OperationDuration.WithLabelValues("DELETE").Observe(time.Since(start).Seconds())
 	return nil
 }
