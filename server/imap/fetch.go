@@ -91,8 +91,11 @@ func safeExtractBinarySectionSize(bodyData []byte, section *imap.FetchItemBinary
 
 func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
 	start := time.Now()
-	recordMetrics := func(status string) {
-		metrics.CommandsTotal.WithLabelValues("imap", "FETCH", status).Inc()
+	// recordMetrics records throughput + latency, classifying the status the same
+	// way the meteredSession wrapper does (success / client_error / server_error)
+	// so FETCH stays consistent with the rest of sora_commands_total. Pass nil on success.
+	recordMetrics := func(err error) {
+		metrics.CommandsTotal.WithLabelValues("imap", "FETCH", commandStatus(err)).Inc()
 		metrics.CommandDuration.WithLabelValues("imap", "FETCH").Observe(time.Since(start).Seconds())
 	}
 
@@ -105,23 +108,25 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.WarnLog("failed to acquire read lock within timeout")
-		recordMetrics("failure")
-		return &imap.Error{
+		imapErr := &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeServerBug,
 			Text: "Server busy, please try again",
 		}
+		recordMetrics(imapErr)
+		return imapErr
 	}
 
 	if s.selectedMailbox == nil {
 		release()
 		s.DebugLog("no mailbox selected")
-		recordMetrics("failure")
-		return &imap.Error{
+		imapErr := &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeNonExistent,
 			Text: "No mailbox selected",
 		}
+		recordMetrics(imapErr)
+		return imapErr
 	}
 
 	selectedMailboxID = s.selectedMailbox.ID
@@ -171,11 +176,12 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 		}
 	} else if options.Vanished {
 		// VANISHED modifier used without QRESYNC or ChangedSince - protocol violation
-		recordMetrics("failure")
-		return &imap.Error{
+		imapErr := &imap.Error{
 			Type: imap.StatusResponseTypeBad,
 			Text: "VANISHED requires QRESYNC and CHANGEDSINCE",
 		}
+		recordMetrics(imapErr)
+		return imapErr
 	}
 
 	needsBodyStructure := options.BodyStructure != nil
@@ -313,15 +319,16 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 		return writeErr
 	}
 	if err != nil {
-		recordMetrics("failure")
-		return s.internalError("failed to retrieve messages: %v", err)
+		ierr := s.internalError("failed to retrieve messages: %v", err)
+		recordMetrics(ierr)
+		return ierr
 	}
 
 	if s.IMAPUser != nil {
 		metrics.TrackDomainBytes("imap", s.IMAPUser.Domain(), "out", totalBytesFetched)
 	}
 
-	recordMetrics("success")
+	recordMetrics(nil)
 	return nil
 }
 
@@ -664,12 +671,15 @@ func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, body
 // an empty read as success and deleting the message.
 func (s *IMAPSession) transientBodyUnavailable(uid imap.UID, cause error) *imap.Error {
 	s.WarnLog("message body not yet available, asking client to retry", "uid", uid, "error", cause)
-	metrics.CommandsTotal.WithLabelValues("imap", "FETCH", "unavailable").Inc()
-	return &imap.Error{
+	imapErr := &imap.Error{
 		Type: imap.StatusResponseTypeNo,
 		Code: imap.ResponseCodeUnavailable,
 		Text: "Message body temporarily unavailable, please retry",
 	}
+	// NO [UNAVAILABLE] is a server-side transient condition (body upload lag);
+	// commandStatus folds it into "server_error" to match the wrapper taxonomy.
+	metrics.CommandsTotal.WithLabelValues("imap", "FETCH", commandStatus(imapErr)).Inc()
+	return imapErr
 }
 
 func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {

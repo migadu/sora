@@ -57,8 +57,11 @@ func extractBodyStructureSafe(data []byte) imap.BodyStructure {
 
 func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
 	start := time.Now()
-	recordMetrics := func(status string) {
-		metrics.CommandsTotal.WithLabelValues("imap", "APPEND", status).Inc()
+	// recordMetrics records throughput + latency, classifying the status the same
+	// way the meteredSession wrapper does (success / client_error / server_error)
+	// so APPEND stays consistent with the rest of sora_commands_total. Pass nil on success.
+	recordMetrics := func(err error) {
+		metrics.CommandsTotal.WithLabelValues("imap", "APPEND", commandStatus(err)).Inc()
 		metrics.CommandDuration.WithLabelValues("imap", "APPEND").Observe(time.Since(start).Seconds())
 	}
 
@@ -78,20 +81,22 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 				Text: fmt.Sprintf("mailbox '%s' does not exist", mboxName),
 			}
 			s.classifyAndTrackError("APPEND", err, imapErr)
-			recordMetrics("failure")
+			recordMetrics(imapErr)
 			return nil, imapErr
 		}
 		s.classifyAndTrackError("APPEND", err, nil)
-		recordMetrics("failure")
-		return nil, s.internalError("failed to fetch mailbox '%s': %v", mboxName, err)
+		ierr := s.internalError("failed to fetch mailbox '%s': %v", mboxName, err)
+		recordMetrics(ierr)
+		return nil, ierr
 	}
 
 	// Check ACL permissions - requires 'i' (insert) right
 	hasInsertRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mailbox.ID, s.AccountID(), 'i')
 	if err != nil {
 		s.classifyAndTrackError("APPEND", err, nil)
-		recordMetrics("failure")
-		return nil, s.internalError("failed to check insert permission: %v", err)
+		ierr := s.internalError("failed to check insert permission: %v", err)
+		recordMetrics(ierr)
+		return nil, ierr
 	}
 	if !hasInsertRight {
 		s.DebugLog("user does not have insert permission", "mailbox", mboxName)
@@ -101,7 +106,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			Text: "You do not have permission to append messages to this mailbox",
 		}
 		s.classifyAndTrackError("APPEND", nil, imapErr)
-		recordMetrics("failure")
+		recordMetrics(imapErr)
 		return nil, imapErr
 	}
 
@@ -157,7 +162,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			Text: "empty message rejected: a message must contain at least headers",
 		}
 		metrics.ProtocolErrors.WithLabelValues("imap", "APPEND", "empty_message", "client_error").Inc()
-		recordMetrics("failure")
+		recordMetrics(imapErr)
 		return nil, imapErr
 	}
 
@@ -240,8 +245,9 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// If a duplicate APPEND arrives while uploader is processing the first copy,
 	// we don't want to overwrite/delete the file the uploader is reading.
 	if s.server.uploader == nil {
-		recordMetrics("failure")
-		return nil, s.internalError("uploader not configured - cannot store message")
+		ierr := s.internalError("uploader not configured - cannot store message")
+		recordMetrics(ierr)
+		return nil, ierr
 	}
 
 	// Safety guard: Reject if global staging limit is exceeded
@@ -253,7 +259,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			Text: "System storage limit reached, please try again later",
 		}
 		s.classifyAndTrackError("APPEND", nil, imapErr)
-		recordMetrics("failure")
+		recordMetrics(imapErr)
 		return nil, imapErr
 	}
 
@@ -263,8 +269,9 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		// File doesn't exist, safe to write
 		filePath, err = s.server.uploader.StoreLocally(contentHash, s.AccountID(), fullMessageBytes)
 		if err != nil {
-			recordMetrics("failure")
-			return nil, s.internalError("failed to save message to disk: %v", err)
+			ierr := s.internalError("failed to save message to disk: %v", err)
+			recordMetrics(ierr)
+			return nil, ierr
 		}
 		s.DebugLog("message accepted locally", "path", *filePath)
 	} else if err == nil {
@@ -274,8 +281,9 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		s.DebugLog("message file already exists, skipping write (concurrent APPEND)", "path", expectedPath)
 	} else {
 		// Stat error (permission issue, etc.)
-		recordMetrics("failure")
-		return nil, s.internalError("failed to check file existence: %v", err)
+		ierr := s.internalError("failed to check file existence: %v", err)
+		recordMetrics(ierr)
+		return nil, ierr
 	}
 
 	size := int64(len(fullMessageBytes))
@@ -296,8 +304,9 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// right must NOT fail the APPEND. The owner holds every right.
 	appendRights, err := s.userRightsForMailbox(readCtx, mailbox.ID, mailbox.AccountID)
 	if err != nil {
-		recordMetrics("failure")
-		return nil, s.internalError("failed to get user rights for mailbox '%s': %v", mboxName, err)
+		ierr := s.internalError("failed to get user rights for mailbox '%s': %v", mboxName, err)
+		recordMetrics(ierr)
+		return nil, ierr
 	}
 	appendFlags := filterFlagsByRights(sanitizedFlags, appendRights)
 
@@ -345,7 +354,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			}
 			s.DebugLog("duplicate message detected, skipping upload", "messageID", messageID, "existing_uid", messageUID)
 			// Return success with existing UID - don't notify uploader
-			recordMetrics("success")
+			recordMetrics(nil)
 			return &imap.AppendData{
 				UID:         imap.UID(messageUID),
 				UIDValidity: mailbox.UIDValidity,
@@ -360,8 +369,9 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		if filePath != nil {
 			s.DebugLog("keeping file for cleanup job after error", "content_hash", contentHash)
 		}
-		recordMetrics("failure")
-		return nil, s.internalError("failed to insert message metadata: %v", err)
+		ierr := s.internalError("failed to insert message metadata: %v", err)
+		recordMetrics(ierr)
+		return nil, ierr
 	}
 
 	// Before updating the session state, check if the context is still valid
@@ -369,7 +379,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	if s.ctx.Err() != nil {
 		s.DebugLog("request aborted after message insertion")
 		// We've already inserted the message successfully, so still return success
-		recordMetrics("success")
+		recordMetrics(nil)
 		return &imap.AppendData{
 			UID:         imap.UID(messageUID),
 			UIDValidity: mailbox.UIDValidity,
@@ -387,7 +397,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
 	if !acquired {
 		s.DebugLog("failed to acquire write lock within timeout")
-		recordMetrics("success")
+		recordMetrics(nil)
 		return &imap.AppendData{
 			UID:         imap.UID(messageUID),
 			UIDValidity: mailbox.UIDValidity,
@@ -401,7 +411,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	// After re-acquiring the lock, check again if the context is still valid
 	if s.ctx.Err() != nil {
 		s.DebugLog("request aborted during mutex acquisition")
-		recordMetrics("success")
+		recordMetrics(nil)
 		return &imap.AppendData{
 			UID:         imap.UID(messageUID),
 			UIDValidity: mailbox.UIDValidity,
@@ -436,7 +446,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	s.DebugLog("successfully appended message", "mailbox", mboxName, "uid", messageUID, "uidvalidity", mailbox.UIDValidity)
 
-	recordMetrics("success")
+	recordMetrics(nil)
 	return &imap.AppendData{
 		UID:         imap.UID(messageUID),
 		UIDValidity: mailbox.UIDValidity,

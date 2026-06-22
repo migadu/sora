@@ -1,6 +1,8 @@
 package imap
 
 import (
+	"context"
+	"errors"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -59,14 +61,54 @@ func newMeteredSession(s *IMAPSession) imapserver.Session {
 }
 
 // recordCommand emits the throughput counter and latency histogram for a single
-// command invocation. status is derived from whether the handler returned an error.
-func recordCommand(command string, start time.Time, err error) {
-	status := "success"
-	if err != nil {
-		status = "failure"
+// command invocation. The status label is success / client_error / server_error
+// (see commandStatus): expected client-side outcomes — a tagged NO/BAD such as a
+// rate-limited retry, a missing mailbox, or a mid-command client disconnect — are
+// kept out of the server_error bucket so they don't inflate the error rate
+// operators alert on. Only genuine server faults are logged at WARN (with session
+// context: user, remote IP, session id); benign client errors stay quiet to avoid
+// log spam from aggressive clients (e.g. iOS Mail retry storms).
+func (m *meteredSession) recordCommand(command string, start time.Time, err error) {
+	status := commandStatus(err)
+	if status == statusServerError {
+		m.WarnLog("command failed", "command", command, "error", err)
 	}
 	metrics.CommandsTotal.WithLabelValues("imap", command, status).Inc()
 	metrics.CommandDuration.WithLabelValues("imap", command).Observe(time.Since(start).Seconds())
+}
+
+const (
+	statusSuccess     = "success"
+	statusClientError = "client_error"
+	statusServerError = "server_error"
+)
+
+// commandStatus classifies a command's returned error for the sora_commands_total
+// status label. IMAP handlers report client-visible conditions as a tagged NO/BAD
+// response (*imap.Error); only those carrying a server fault code (SERVERBUG /
+// UNAVAILABLE) are genuine server errors. A non-IMAP error escaping a handler is
+// treated as a server fault unless it is a client-driven cancellation.
+func commandStatus(err error) string {
+	if err == nil {
+		return statusSuccess
+	}
+
+	var imapErr *imap.Error
+	if errors.As(err, &imapErr) {
+		switch imapErr.Code {
+		case imap.ResponseCodeServerBug, imap.ResponseCodeUnavailable:
+			return statusServerError
+		default:
+			return statusClientError
+		}
+	}
+
+	// Plain error that wasn't wrapped into an *imap.Error: a client disconnect or
+	// cancellation is the client's doing; anything else is an unexpected fault.
+	if errors.Is(err, context.Canceled) {
+		return statusClientError
+	}
+	return statusServerError
 }
 
 // --- Authenticated state ---
@@ -74,63 +116,63 @@ func recordCommand(command string, start time.Time, err error) {
 func (m *meteredSession) Select(mboxName string, options *imap.SelectOptions) (*imap.SelectData, error) {
 	start := time.Now()
 	data, err := m.IMAPSession.Select(mboxName, options)
-	recordCommand("SELECT", start, err)
+	m.recordCommand("SELECT", start, err)
 	return data, err
 }
 
 func (m *meteredSession) Create(name string, options *imap.CreateOptions) error {
 	start := time.Now()
 	err := m.IMAPSession.Create(name, options)
-	recordCommand("CREATE", start, err)
+	m.recordCommand("CREATE", start, err)
 	return err
 }
 
 func (m *meteredSession) Delete(mboxName string) error {
 	start := time.Now()
 	err := m.IMAPSession.Delete(mboxName)
-	recordCommand("DELETE", start, err)
+	m.recordCommand("DELETE", start, err)
 	return err
 }
 
 func (m *meteredSession) Rename(existingName, newName string, options *imap.RenameOptions) error {
 	start := time.Now()
 	err := m.IMAPSession.Rename(existingName, newName, options)
-	recordCommand("RENAME", start, err)
+	m.recordCommand("RENAME", start, err)
 	return err
 }
 
 func (m *meteredSession) Subscribe(mailboxName string) error {
 	start := time.Now()
 	err := m.IMAPSession.Subscribe(mailboxName)
-	recordCommand("SUBSCRIBE", start, err)
+	m.recordCommand("SUBSCRIBE", start, err)
 	return err
 }
 
 func (m *meteredSession) Unsubscribe(mailboxName string) error {
 	start := time.Now()
 	err := m.IMAPSession.Unsubscribe(mailboxName)
-	recordCommand("UNSUBSCRIBE", start, err)
+	m.recordCommand("UNSUBSCRIBE", start, err)
 	return err
 }
 
 func (m *meteredSession) List(w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
 	start := time.Now()
 	err := m.IMAPSession.List(w, ref, patterns, options)
-	recordCommand("LIST", start, err)
+	m.recordCommand("LIST", start, err)
 	return err
 }
 
 func (m *meteredSession) Status(mboxName string, options *imap.StatusOptions) (*imap.StatusData, error) {
 	start := time.Now()
 	data, err := m.IMAPSession.Status(mboxName, options)
-	recordCommand("STATUS", start, err)
+	m.recordCommand("STATUS", start, err)
 	return data, err
 }
 
 func (m *meteredSession) Namespace() (*imap.NamespaceData, error) {
 	start := time.Now()
 	data, err := m.IMAPSession.Namespace()
-	recordCommand("NAMESPACE", start, err)
+	m.recordCommand("NAMESPACE", start, err)
 	return data, err
 }
 
@@ -139,56 +181,56 @@ func (m *meteredSession) Namespace() (*imap.NamespaceData, error) {
 func (m *meteredSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) error {
 	start := time.Now()
 	err := m.IMAPSession.Expunge(w, uidSet)
-	recordCommand("EXPUNGE", start, err)
+	m.recordCommand("EXPUNGE", start, err)
 	return err
 }
 
 func (m *meteredSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
 	start := time.Now()
 	data, err := m.IMAPSession.Search(numKind, criteria, options)
-	recordCommand("SEARCH", start, err)
+	m.recordCommand("SEARCH", start, err)
 	return data, err
 }
 
 func (m *meteredSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortCriterion, charset string, searchCriteria *imap.SearchCriteria, options *imap.SortOptions) (*imap.SortData, error) {
 	start := time.Now()
 	data, err := m.IMAPSession.Sort(numKind, sortCriteria, charset, searchCriteria, options)
-	recordCommand("SORT", start, err)
+	m.recordCommand("SORT", start, err)
 	return data, err
 }
 
 func (m *meteredSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
 	start := time.Now()
 	err := m.IMAPSession.Store(w, numSet, flags, options)
-	recordCommand("STORE", start, err)
+	m.recordCommand("STORE", start, err)
 	return err
 }
 
 func (m *meteredSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData, error) {
 	start := time.Now()
 	data, err := m.IMAPSession.Copy(numSet, mboxName)
-	recordCommand("COPY", start, err)
+	m.recordCommand("COPY", start, err)
 	return data, err
 }
 
 func (m *meteredSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest string) error {
 	start := time.Now()
 	err := m.IMAPSession.Move(w, numSet, dest)
-	recordCommand("MOVE", start, err)
+	m.recordCommand("MOVE", start, err)
 	return err
 }
 
 func (m *meteredSession) Thread(numKind imapserver.NumKind, algorithm imap.ThreadAlgorithm, charset string, criteria *imap.SearchCriteria) ([]imap.ThreadData, error) {
 	start := time.Now()
 	data, err := m.IMAPSession.Thread(numKind, algorithm, charset, criteria)
-	recordCommand("THREAD", start, err)
+	m.recordCommand("THREAD", start, err)
 	return data, err
 }
 
 func (m *meteredSession) MultiSearch(numKind imapserver.NumKind, mailboxes []string, criteria *imap.SearchCriteria, options *imap.SearchOptions) ([]*imap.SearchData, error) {
 	start := time.Now()
 	data, err := m.IMAPSession.MultiSearch(numKind, mailboxes, criteria, options)
-	recordCommand("MULTISEARCH", start, err)
+	m.recordCommand("MULTISEARCH", start, err)
 	return data, err
 }
 
@@ -197,14 +239,14 @@ func (m *meteredSession) MultiSearch(numKind imapserver.NumKind, mailboxes []str
 func (m *meteredSession) GetMetadata(mailbox string, entries []string, options *imap.GetMetadataOptions) (*imap.GetMetadataData, error) {
 	start := time.Now()
 	data, err := m.IMAPSession.GetMetadata(mailbox, entries, options)
-	recordCommand("GETMETADATA", start, err)
+	m.recordCommand("GETMETADATA", start, err)
 	return data, err
 }
 
 func (m *meteredSession) SetMetadata(mailbox string, entries map[string]*[]byte) error {
 	start := time.Now()
 	err := m.IMAPSession.SetMetadata(mailbox, entries)
-	recordCommand("SETMETADATA", start, err)
+	m.recordCommand("SETMETADATA", start, err)
 	return err
 }
 
@@ -213,34 +255,34 @@ func (m *meteredSession) SetMetadata(mailbox string, entries map[string]*[]byte)
 func (m *meteredSession) GetACL(mailbox string) (*imap.GetACLData, error) {
 	start := time.Now()
 	data, err := m.IMAPSession.GetACL(mailbox)
-	recordCommand("GETACL", start, err)
+	m.recordCommand("GETACL", start, err)
 	return data, err
 }
 
 func (m *meteredSession) SetACL(mailbox string, identifier imap.RightsIdentifier, modification imap.RightModification, rights imap.RightSet) error {
 	start := time.Now()
 	err := m.IMAPSession.SetACL(mailbox, identifier, modification, rights)
-	recordCommand("SETACL", start, err)
+	m.recordCommand("SETACL", start, err)
 	return err
 }
 
 func (m *meteredSession) DeleteACL(mailbox string, identifier imap.RightsIdentifier) error {
 	start := time.Now()
 	err := m.IMAPSession.DeleteACL(mailbox, identifier)
-	recordCommand("DELETEACL", start, err)
+	m.recordCommand("DELETEACL", start, err)
 	return err
 }
 
 func (m *meteredSession) ListRights(mailbox string, identifier imap.RightsIdentifier) (*imap.ListRightsData, error) {
 	start := time.Now()
 	data, err := m.IMAPSession.ListRights(mailbox, identifier)
-	recordCommand("LISTRIGHTS", start, err)
+	m.recordCommand("LISTRIGHTS", start, err)
 	return data, err
 }
 
 func (m *meteredSession) MyRights(mailbox string) (*imap.MyRightsData, error) {
 	start := time.Now()
 	data, err := m.IMAPSession.MyRights(mailbox)
-	recordCommand("MYRIGHTS", start, err)
+	m.recordCommand("MYRIGHTS", start, err)
 	return data, err
 }
