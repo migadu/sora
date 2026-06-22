@@ -139,11 +139,19 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 						statusData.NumRecent = &num
 					}
 					if options.ReturnStatus.NumUnseen {
-						// Defensive: clamp negative values to 0 to prevent uint32 wraparound
+						// The unseen_count cache can underflow below zero under concurrent
+						// flag/expunge races (see db.lockMailboxStats). Self-heal by
+						// recomputing from the authoritative message_state, then use the
+						// repaired value; fall back to clamping if the repair fails.
 						unseenCount := summary.UnseenCount
 						if unseenCount < 0 {
-							s.WarnLog("negative unseen_count detected in LIST, clamping to 0", "mailbox", mbox.Name, "unseen_count", unseenCount)
-							unseenCount = 0
+							s.WarnLog("negative unseen_count detected in LIST, recomputing", "mailbox", mbox.Name, "unseen_count", unseenCount)
+							if repaired, rErr := s.server.rdb.RecomputeMailboxUnseenWithRetry(s.ctx, mbox.ID); rErr != nil {
+								s.WarnLog("failed to recompute unseen_count in LIST, clamping to 0", "mailbox", mbox.Name, "err", rErr)
+								unseenCount = 0
+							} else {
+								unseenCount = int(repaired)
+							}
 						}
 						num := uint32(unseenCount)
 						statusData.NumUnseen = &num

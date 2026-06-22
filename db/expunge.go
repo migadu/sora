@@ -29,6 +29,13 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID
 
 	logger.Info("Database: expunging messages", "count", len(uids), "mailbox_id", mailboxID, "uids", uids)
 
+	// Serialize unseen_count maintenance per mailbox so the expunge trigger and a
+	// concurrent flag-change trigger can't race their cross-table reads and drift
+	// the cache negative. See lockMailboxStats for the full rationale.
+	if err = lockMailboxStats(ctx, tx, mailboxID); err != nil {
+		return 0, err
+	}
+
 	var currentModSeq int64
 	var rowsAffected int64
 	err = tx.QueryRow(ctx, `

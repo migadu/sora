@@ -256,6 +256,12 @@ func (db *Database) SetMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 		metrics.DBQueriesTotal.WithLabelValues("flags_set", status, "write").Inc()
 	}()
 
+	// Serialize unseen_count maintenance per mailbox (see lockMailboxStats) so the
+	// flag-change trigger can't race a concurrent expunge/move trigger.
+	if err = lockMailboxStats(ctx, tx, mailboxID); err != nil {
+		return nil, 0, err
+	}
+
 	// Resolve message_id once, then use direct PK updates on message_state
 	messageID, err := db.resolveMessageID(ctx, tx, messageUID, mailboxID)
 	if err != nil {
@@ -292,6 +298,12 @@ func (db *Database) SetMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 }
 
 func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
+	// Serialize unseen_count maintenance per mailbox (see lockMailboxStats) so the
+	// flag-change trigger can't race a concurrent expunge/move trigger.
+	if err = lockMailboxStats(ctx, tx, mailboxID); err != nil {
+		return nil, 0, err
+	}
+
 	// Resolve message_id once, then use direct PK updates on message_state
 	messageID, err := db.resolveMessageID(ctx, tx, messageUID, mailboxID)
 	if err != nil {
@@ -381,6 +393,12 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 }
 
 func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUID imap.UID, mailboxID int64, flagsToRemove []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
+	// Serialize unseen_count maintenance per mailbox (see lockMailboxStats) so the
+	// flag-change trigger can't race a concurrent expunge/move trigger.
+	if err = lockMailboxStats(ctx, tx, mailboxID); err != nil {
+		return nil, 0, err
+	}
+
 	// Resolve message_id once, then use direct PK updates on message_state
 	messageID, err := db.resolveMessageID(ctx, tx, messageUID, mailboxID)
 	if err != nil {

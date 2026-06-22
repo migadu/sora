@@ -525,9 +525,13 @@ func (d *Database) HardDeleteAccounts(ctx context.Context, tx pgx.Tx, accountIDs
 	// Sort the IDs to ensure a consistent lock acquisition order.
 	sort.Slice(mailboxIDs, func(i, j int) bool { return mailboxIDs[i] < mailboxIDs[j] })
 
-	// Acquire locks in a deterministic order.
+	// Lock the mailbox rows (ascending id, deterministic) before expunging their
+	// messages. This serializes against concurrent EXPUNGE/STORE/MOVE on the same
+	// mailboxes (which lock the mailbox row first too — see lockMailboxStats),
+	// keeping unseen_count maintenance race-free, and replaces the previous
+	// pg_advisory lock to avoid the global advisory-keyspace collision.
 	if len(mailboxIDs) > 0 {
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(id) FROM unnest($1::bigint[]) AS id", mailboxIDs); err != nil {
+		if _, err := tx.Exec(ctx, "SELECT 1 FROM mailboxes WHERE id = ANY($1) ORDER BY id FOR UPDATE", mailboxIDs); err != nil {
 			return fmt.Errorf("failed to acquire locks for account deletion: %w", err)
 		}
 	}

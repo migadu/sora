@@ -97,6 +97,12 @@ func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 		metrics.DBQueriesTotal.WithLabelValues("flags_set_batch", "success", "write").Inc()
 	}()
 
+	// Serialize unseen_count maintenance per mailbox (see lockMailboxStats) so the
+	// flag-change trigger can't race a concurrent expunge/move trigger.
+	if err := lockMailboxStats(ctx, tx, mailboxID); err != nil {
+		return nil, err
+	}
+
 	idToUID, messageIDs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
 	if err != nil || len(messageIDs) == 0 {
 		return nil, err
@@ -170,6 +176,12 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 		metrics.DBQueryDuration.WithLabelValues("flags_add_batch", "write").Observe(time.Since(start).Seconds())
 		metrics.DBQueriesTotal.WithLabelValues("flags_add_batch", "success", "write").Inc()
 	}()
+
+	// Serialize unseen_count maintenance per mailbox (see lockMailboxStats) so the
+	// flag-change trigger can't race a concurrent expunge/move trigger.
+	if err := lockMailboxStats(ctx, tx, mailboxID); err != nil {
+		return nil, err
+	}
 
 	idToUID, messageIDs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
 	if err != nil || len(messageIDs) == 0 {
@@ -251,6 +263,12 @@ func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, mess
 		metrics.DBQueryDuration.WithLabelValues("flags_del_batch", "write").Observe(time.Since(start).Seconds())
 		metrics.DBQueriesTotal.WithLabelValues("flags_del_batch", "success", "write").Inc()
 	}()
+
+	// Serialize unseen_count maintenance per mailbox (see lockMailboxStats) so the
+	// flag-change trigger can't race a concurrent expunge/move trigger.
+	if err := lockMailboxStats(ctx, tx, mailboxID); err != nil {
+		return nil, err
+	}
 
 	idToUID, messageIDs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
 	if err != nil || len(messageIDs) == 0 {

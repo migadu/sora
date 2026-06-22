@@ -251,6 +251,28 @@ func (rd *ResilientDatabase) ExpungeMessageUIDsWithRetry(ctx context.Context, ma
 	return result.(int64), nil
 }
 
+// RecomputeMailboxUnseenWithRetry recomputes and repairs the cached unseen_count
+// for a single mailbox from the authoritative message_state. Used as a self-heal
+// on the rare read path that observes a negative (underflowed) value.
+func (rd *ResilientDatabase) RecomputeMailboxUnseenWithRetry(ctx context.Context, mailboxID int64) (int64, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).RecomputeMailboxUnseen(ctx, tx, mailboxID)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
+}
+
+// ReconcileNegativeMailboxStatsWithRetry repairs every mailbox whose cached
+// unseen_count has underflowed below zero. Each mailbox is fixed in its own short
+// transaction, so this method manages its own transactions rather than running
+// inside one. Intended to be called periodically by the cleanup worker.
+func (rd *ResilientDatabase) ReconcileNegativeMailboxStatsWithRetry(ctx context.Context) (int64, error) {
+	return rd.getOperationalDatabaseForOperation(ctx, true).ReconcileNegativeMailboxStats(ctx)
+}
+
 func (rd *ResilientDatabase) GetPrimaryEmailForAccountWithRetry(ctx context.Context, accountID int64) (server.Address, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetPrimaryEmailForAccount(ctx, accountID)

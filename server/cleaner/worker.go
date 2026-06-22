@@ -46,6 +46,7 @@ type DatabaseManager interface {
 	DeleteMessagesFTSByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error)
 	GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, limit int) ([]int64, error)
 	FinalizeAccountDeletionsWithRetry(ctx context.Context, accountIDs []int64) (int64, error)
+	ReconcileNegativeMailboxStatsWithRetry(ctx context.Context) (int64, error)
 }
 
 // S3Manager defines the interface for S3 operations required by the cleaner.
@@ -256,6 +257,17 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		} else if healthCount > 0 {
 			logger.Info("Cleanup: Deleted old health statuses", "count", healthCount, "retention", w.healthStatusRetention)
 		}
+	}
+
+	// --- Reconcile drifted mailbox stats ---
+	// The unseen_count cache is maintained incrementally by triggers and can drift
+	// negative under concurrent flag/expunge races (see db.lockMailboxStats). This
+	// heals any underflowed counters and acts as a continuous safety net. Runs under
+	// the cluster-wide cleanup lock, so only one node performs it per cycle.
+	if reconciledCount, err := w.rdb.ReconcileNegativeMailboxStatsWithRetry(ctx); err != nil {
+		logger.Error("Cleanup: Failed to reconcile negative mailbox stats", "error", err)
+	} else if reconciledCount > 0 {
+		logger.Info("Cleanup: Reconciled mailboxes with negative unseen_count", "count", reconciledCount)
 	}
 
 	// --- Phase 1: User-scoped cleanup (S3 objects and message references) ---

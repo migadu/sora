@@ -21,27 +21,19 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		logger.Info("Database: moving messages within the same mailbox, will assign new UIDs", "mailbox_id", srcMailboxID)
 	}
 
-	// Acquire locks on both mailboxes in a consistent order to prevent deadlocks.
-	// The triggers for mailbox_stats will attempt to acquire
-	// locks, and a concurrent MOVE operation between the same two mailboxes could
-	// otherwise lead to a deadlock (A->B locks B then A; B->A locks A then B).
-	var lock1, lock2 int64
-	if srcMailboxID < destMailboxID {
-		lock1 = srcMailboxID
-		lock2 = destMailboxID
-	} else {
-		lock1 = destMailboxID
-		lock2 = srcMailboxID
-	}
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1), pg_advisory_xact_lock($2)", lock1, lock2); err != nil {
-		return nil, fmt.Errorf("failed to acquire locks for move on mailboxes %d and %d: %w", srcMailboxID, destMailboxID, err)
+	// Serialize unseen_count maintenance for both mailboxes by locking their
+	// mailbox rows in ascending id order (see lockMailboxStats). This both
+	// prevents the flag/expunge-vs-move trigger race from drifting the cache and
+	// keeps a consistent lock ordering, so a concurrent MOVE between the same two
+	// mailboxes cannot deadlock (A->B and B->A lock the same rows in the same order).
+	if err := lockMailboxStatsPair(ctx, tx, srcMailboxID, destMailboxID); err != nil {
+		return nil, fmt.Errorf("failed to lock mailbox stats for move on mailboxes %d and %d: %w", srcMailboxID, destMailboxID, err)
 	}
 
 	// Lock source message rows early (before INSERT triggers) to establish a
-	// consistent lock ordering: advisory mailbox lock → row locks on source rows.
-	// Without FOR UPDATE here, concurrent EXPUNGE could hold row locks and then
-	// wait for the advisory lock while MOVE holds the advisory lock and waits
-	// for those same row locks → deadlock.
+	// consistent lock ordering: mailbox_stats row locks → row locks on source rows.
+	// Every unseen-mutating path (MOVE, EXPUNGE, STORE) acquires the mailbox_stats
+	// row first and message rows second, so they cannot deadlock against each other.
 	rows, err := tx.Query(ctx, `
 		SELECT id, uid FROM messages
 		WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL

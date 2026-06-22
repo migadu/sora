@@ -78,6 +78,14 @@ func (m *mockDatabase) FinalizeAccountDeletionsWithRetry(ctx context.Context, ac
 	return args.Get(0).(int64), args.Error(1)
 }
 
+// ReconcileNegativeMailboxStatsWithRetry is a non-critical maintenance step run on
+// every cleanup cycle. The orchestration tests don't assert on it, so this is a
+// plain no-op (avoids requiring a per-test expectation); the real recompute/repair
+// logic is covered by integration tests against a live database.
+func (m *mockDatabase) ReconcileNegativeMailboxStatsWithRetry(ctx context.Context) (int64, error) {
+	return 0, nil
+}
+
 type mockS3 struct {
 	mock.Mock
 	healthy bool
