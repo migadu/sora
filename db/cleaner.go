@@ -532,6 +532,22 @@ func (d *Database) HardDeleteAccounts(ctx context.Context, tx pgx.Tx, accountIDs
 		}
 	}
 
+	// Mark all messages as expunged BEFORE deleting their mailboxes. Order matters:
+	// messages.mailbox_id is ON DELETE SET NULL, and the maintain_mailbox_stats_messages
+	// trigger UPSERTs a mailbox_stats row for any still-active message that gets detached
+	// by that SET NULL. If the mailbox row is already gone (deleted first), that UPSERT
+	// violates mailbox_stats_mailbox_id_fkey and aborts the whole purge transaction.
+	// Expunging first means the SET NULL pass only touches already-expunged rows, which the
+	// trigger ignores. This also signals the next cleanup phase to remove the S3 objects.
+	_, err = tx.Exec(ctx, `
+		UPDATE messages
+		SET expunged_at = now(), expunged_modseq = nextval('messages_modseq')
+		WHERE account_id = ANY($1) AND expunged_at IS NULL
+	`, accountIDs)
+	if err != nil {
+		return fmt.Errorf("failed to expunge messages for batch deletion: %w", err)
+	}
+
 	// Use = ANY($1) for efficient batch operations
 	batchOps := []struct {
 		tableName string
@@ -547,17 +563,6 @@ func (d *Database) HardDeleteAccounts(ctx context.Context, tx pgx.Tx, accountIDs
 		if _, err := tx.Exec(ctx, op.query, accountIDs); err != nil {
 			return fmt.Errorf("failed to batch delete from %s: %w", op.tableName, err)
 		}
-	}
-
-	// Mark all messages for the deleted accounts as expunged.
-	// This signals the next phase of the cleanup worker to remove the S3 objects.
-	_, err = tx.Exec(ctx, `
-		UPDATE messages 
-		SET expunged_at = now(), expunged_modseq = nextval('messages_modseq')
-		WHERE account_id = ANY($1) AND expunged_at IS NULL
-	`, accountIDs)
-	if err != nil {
-		return fmt.Errorf("failed to expunge messages for batch deletion: %w", err)
 	}
 
 	return nil
@@ -804,6 +809,20 @@ func (d *Database) PurgeMailboxesForAccount(ctx context.Context, accountID int64
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(context.Background())
+
+	// Expunge any still-active messages before deleting their mailboxes. The
+	// messages.mailbox_id FK is ON DELETE SET NULL, and the maintain_mailbox_stats_messages
+	// trigger UPSERTs a mailbox_stats row for an active message detached that way; if the
+	// mailbox row is already deleted, that UPSERT violates mailbox_stats_mailbox_id_fkey.
+	// Callers (e.g. domain purge) normally expunge first, so this is usually a no-op, but
+	// it keeps this hard-delete helper self-safe against a bare DELETE FROM mailboxes.
+	if _, err = tx.Exec(ctx, `
+		UPDATE messages
+		SET expunged_at = now(), expunged_modseq = nextval('messages_modseq')
+		WHERE account_id = $1 AND expunged_at IS NULL
+	`, accountID); err != nil {
+		return fmt.Errorf("failed to expunge messages before purging mailboxes: %w", err)
+	}
 
 	_, err = tx.Exec(ctx, `DELETE FROM mailboxes WHERE account_id = $1`, accountID)
 	if err != nil {
