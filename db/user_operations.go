@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
@@ -14,27 +15,27 @@ import (
 
 // DBMessage represents a simplified message structure for API responses
 type DBMessage struct {
-	ID           int64    `json:"id"`
-	UID          int64    `json:"uid"`
-	MailboxID    int64    `json:"mailbox_id"`
-	MailboxPath  string   `json:"mailbox_path"`
-	Subject      string   `json:"subject"`
-	From         string   `json:"from"`
-	To           []string `json:"to"`
-	Cc           []string `json:"cc,omitempty"`
-	Bcc          []string `json:"bcc,omitempty"`
-	Date         string   `json:"date"`
-	InternalDate string   `json:"internal_date"`
-	Size         int      `json:"size"`
-	Flags        []string `json:"flags"`
-	CustomFlags  []string `json:"custom_flags,omitempty"`
-	MessageID    string   `json:"message_id"`
-	InReplyTo    string   `json:"in_reply_to,omitempty"`
-	References   string   `json:"references,omitempty"`
-	Recipients   []string `json:"recipients,omitempty"`
-	ContentHash  string   `json:"content_hash"`
-	S3Domain     string   `json:"-"`
-	S3Localpart  string   `json:"-"`
+	ID           int64     `json:"id"`
+	UID          int64     `json:"uid"`
+	MailboxID    int64     `json:"mailbox_id"`
+	MailboxPath  string    `json:"mailbox_path"`
+	Subject      string    `json:"subject"`
+	From         string    `json:"from"`
+	To           []string  `json:"to"`
+	Cc           []string  `json:"cc,omitempty"`
+	Bcc          []string  `json:"bcc,omitempty"`
+	Date         time.Time `json:"date"`
+	InternalDate time.Time `json:"internal_date"`
+	Size         int       `json:"size"`
+	Flags        []string  `json:"flags"`
+	CustomFlags  []string  `json:"custom_flags,omitempty"`
+	MessageID    string    `json:"message_id"`
+	InReplyTo    string    `json:"in_reply_to,omitempty"`
+	References   string    `json:"references,omitempty"`
+	Recipients   []string  `json:"recipients,omitempty"`
+	ContentHash  string    `json:"content_hash"`
+	S3Domain     string    `json:"-"`
+	S3Localpart  string    `json:"-"`
 }
 
 // RecipientInfo represents email recipient information
@@ -53,16 +54,34 @@ func (db *Database) GetMailboxesForUser(ctx context.Context, accountID int64, su
 	return db.GetMailboxes(ctx, accountID, subscribed)
 }
 
+// canReadMailbox reports whether accountID may read the contents of mailbox.
+// CheckMailboxPermission returns true for the owner, so personal mailboxes always
+// pass; for a shared mailbox owned by another account it requires the 'r' (read)
+// ACL right. This mirrors the IMAP SELECT gate (server/imap/select.go) so the User
+// API cannot expose a mailbox's messages to a user who only holds 'l' (lookup).
+func (db *Database) canReadMailbox(ctx context.Context, mailbox *DBMailbox, accountID int64) (bool, error) {
+	if mailbox.AccountID == accountID {
+		return true, nil
+	}
+	return db.CheckMailboxPermission(ctx, mailbox.ID, accountID, ACLRightRead)
+}
+
 // GetMessageCountForMailbox retrieves total message count
 func (db *Database) GetMessageCountForMailbox(ctx context.Context, accountID int64, mailboxPath string) (int, error) {
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return 0, err
 	}
+	// Hide counts for shared mailboxes the user can see ('l') but not read ('r').
+	if ok, err := db.canReadMailbox(ctx, mailbox, accountID); err != nil {
+		return 0, err
+	} else if !ok {
+		return 0, nil
+	}
 
 	var count int
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT COUNT(*) 
+		SELECT COUNT(*)
 		FROM messages 
 		WHERE mailbox_id = $1 AND expunged_at IS NULL
 	`, mailbox.ID).Scan(&count)
@@ -79,6 +98,12 @@ func (db *Database) GetUnseenCountForMailbox(ctx context.Context, accountID int6
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
 		return 0, err
+	}
+	// Hide counts for shared mailboxes the user can see ('l') but not read ('r').
+	if ok, err := db.canReadMailbox(ctx, mailbox, accountID); err != nil {
+		return 0, err
+	} else if !ok {
+		return 0, nil
 	}
 
 	var count int
@@ -103,11 +128,18 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 	if err != nil {
 		return nil, err
 	}
+	// Require the 'r' (read) right for shared mailboxes; 'l' (lookup) alone must not
+	// expose message contents. Treat a denial as not-found to avoid leaking existence.
+	if ok, err := db.canReadMailbox(ctx, mailbox, accountID); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, consts.ErrMailboxNotFound
+	}
 
 	query := `
-		SELECT 
-			m.id, m.uid, m.mailbox_id, m.subject, m.sent_date, m.internal_date,
-			m.size, ms.flags, ms.custom_flags, m.message_id, m.in_reply_to,
+		SELECT
+			m.id, m.uid, m.mailbox_id, COALESCE(m.subject, ''), m.sent_date, m.internal_date,
+			m.size, COALESCE(ms.flags, 0), ms.custom_flags, m.message_id, COALESCE(m.in_reply_to, ''),
 			m.recipients_json, m.content_hash, m.s3_domain, m.s3_localpart,
 			mb.name as mailbox_path
 		FROM messages m
@@ -147,10 +179,11 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 		msg := &DBMessage{}
 		var customFlagsJSON []byte
 		var recipientsJSON []byte
+		var flagsBitmask int
 
 		err := rows.Scan(
 			&msg.ID, &msg.UID, &msg.MailboxID, &msg.Subject, &msg.Date,
-			&msg.InternalDate, &msg.Size, &msg.Flags, &customFlagsJSON,
+			&msg.InternalDate, &msg.Size, &flagsBitmask, &customFlagsJSON,
 			&msg.MessageID, &msg.InReplyTo, &recipientsJSON, &msg.ContentHash,
 			&msg.S3Domain, &msg.S3Localpart, &msg.MailboxPath,
 		)
@@ -194,7 +227,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 		}
 
 		// Convert bitwise flags to string array
-		msg.Flags = bitwiseFlagsToStrings(msg.Flags)
+		msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
 		messages = append(messages, msg)
 	}
 
@@ -211,11 +244,18 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 	if err != nil {
 		return nil, err
 	}
+	// Require the 'r' (read) right for shared mailboxes; 'l' (lookup) alone must not
+	// expose message contents. Treat a denial as not-found to avoid leaking existence.
+	if ok, err := db.canReadMailbox(ctx, mailbox, accountID); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, consts.ErrMailboxNotFound
+	}
 
 	searchQuery := `
 		SELECT
-			m.id, m.uid, m.mailbox_id, m.subject, m.sent_date, m.internal_date,
-			m.size, ms.flags, ms.custom_flags, m.message_id, m.in_reply_to,
+			m.id, m.uid, m.mailbox_id, COALESCE(m.subject, ''), m.sent_date, m.internal_date,
+			m.size, COALESCE(ms.flags, 0), ms.custom_flags, m.message_id, COALESCE(m.in_reply_to, ''),
 			m.recipients_json, m.content_hash, m.s3_domain, m.s3_localpart,
 			mb.name as mailbox_path
 		FROM messages m
@@ -248,10 +288,11 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		msg := &DBMessage{}
 		var customFlagsJSON []byte
 		var recipientsJSON []byte
+		var flagsBitmask int
 
 		err := rows.Scan(
 			&msg.ID, &msg.UID, &msg.MailboxID, &msg.Subject, &msg.Date,
-			&msg.InternalDate, &msg.Size, &msg.Flags, &customFlagsJSON,
+			&msg.InternalDate, &msg.Size, &flagsBitmask, &customFlagsJSON,
 			&msg.MessageID, &msg.InReplyTo, &recipientsJSON, &msg.ContentHash,
 			&msg.S3Domain, &msg.S3Localpart, &msg.MailboxPath,
 		)
@@ -279,7 +320,7 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			}
 		}
 
-		msg.Flags = bitwiseFlagsToStrings(msg.Flags)
+		msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
 		messages = append(messages, msg)
 	}
 
@@ -400,8 +441,8 @@ func (db *Database) MarkMessagesAsNotUploaded(ctx context.Context, s3Keys []stri
 func (db *Database) GetMessageByID(ctx context.Context, accountID int64, messageID int64) (*DBMessage, error) {
 	query := `
 		SELECT 
-			m.id, m.uid, m.mailbox_id, m.subject, m.sent_date, m.internal_date,
-			m.size, ms.flags, ms.custom_flags, m.message_id, m.in_reply_to, m.references,
+			m.id, m.uid, m.mailbox_id, COALESCE(m.subject, ''), m.sent_date, m.internal_date,
+			m.size, COALESCE(ms.flags, 0), ms.custom_flags, m.message_id, COALESCE(m.in_reply_to, ''), COALESCE(m."references", ''),
 			m.recipients_json, m.content_hash, ms.flags_changed_at, m.s3_domain, m.s3_localpart,
 			mb.name as mailbox_path
 		FROM messages m
@@ -414,10 +455,11 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 	var customFlagsJSON []byte
 	var recipientsJSON []byte
 	var flagsChangedAt any
+	var flagsBitmask int
 
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, query, messageID, accountID).Scan(
 		&msg.ID, &msg.UID, &msg.MailboxID, &msg.Subject, &msg.Date,
-		&msg.InternalDate, &msg.Size, &msg.Flags, &customFlagsJSON,
+		&msg.InternalDate, &msg.Size, &flagsBitmask, &customFlagsJSON,
 		&msg.MessageID, &msg.InReplyTo, &msg.References, &recipientsJSON, &msg.ContentHash,
 		&flagsChangedAt, &msg.S3Domain, &msg.S3Localpart, &msg.MailboxPath,
 	)
@@ -454,7 +496,7 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 		}
 	}
 
-	msg.Flags = bitwiseFlagsToStrings(msg.Flags)
+	msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
 	return msg, nil
 }
 
