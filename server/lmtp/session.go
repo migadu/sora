@@ -364,7 +364,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	// Warn if headers are not clearly separated from the body. This might
 	// indicate a malformed email or an email with only headers and no separator.
-	if bytes.Index(fullMessageBytes, []byte("\r\n\r\n")) == -1 {
+	if !bytes.Contains(fullMessageBytes, []byte("\r\n\r\n")) {
 		s.WarnLog("could not find standard header/body separator in message")
 	}
 

@@ -542,6 +542,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		warmupSemaphore:              warmupSemaphore,
 		caps: imap.CapSet{
 			imap.CapIMAP4rev1:                 struct{}{},
+			imap.CapIMAP4rev2:                 struct{}{},
 			imap.CapLiteralPlus:               struct{}{},
 			imap.CapSASLIR:                    struct{}{},
 			imap.CapMove:                      struct{}{},

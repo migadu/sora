@@ -42,7 +42,11 @@ type meteredSession struct {
 // override here ever drifts from the real signature (which would silently make
 // the server treat that command as unsupported), these break the build instead.
 var (
-	_ imapserver.Session               = (*meteredSession)(nil)
+	_ imapserver.Session = (*meteredSession)(nil)
+	// SessionIMAP4rev2 is required because the server advertises CapIMAP4rev2;
+	// the imapserver library silently degrades and drops the capability if the
+	// session does not implement it. Keep this assertion to catch regressions.
+	_ imapserver.SessionIMAP4rev2      = (*meteredSession)(nil)
 	_ imapserver.SessionNamespace      = (*meteredSession)(nil)
 	_ imapserver.SessionMove           = (*meteredSession)(nil)
 	_ imapserver.SessionSASL           = (*meteredSession)(nil)
