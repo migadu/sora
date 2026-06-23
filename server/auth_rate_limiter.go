@@ -85,8 +85,10 @@ type AuthRateLimiter struct {
 	serverName string
 	hostname   string
 
-	// Trusted networks for exemption
-	trustedNetworks []string
+	// Networks exempt from IP-based rate limiting. Resolved from config.ExemptNetworks,
+	// falling back to the trusted_networks passed at construction when unset. Deliberately
+	// decoupled from PROXY/XCLIENT source-IP trust. (security-audit M2)
+	exemptNetworks []string
 
 	// Tier 1: IP+username blocking (fast, protects shared IPs)
 	blockedIPUsernames map[string]*BlockedIPUsernameInfo
@@ -156,12 +158,21 @@ func NewAuthRateLimiterWithTrustedNetworks(protocol, serverName, hostname string
 		return nil
 	}
 
+	// Resolve the rate-limit exemption list. An explicitly configured exempt_networks
+	// (even an empty list) decouples rate-limit exemption from PROXY/XCLIENT trust; when
+	// unset (nil) it falls back to the trusted_networks passed in (backward-compatible). (M2)
+	exemptNetworks := trustedNetworks
+	if config.ExemptNetworks != nil {
+		exemptNetworks = config.ExemptNetworks
+		logger.Debug("Auth limiter: using decoupled exempt_networks", "protocol", protocol, "count", len(exemptNetworks))
+	}
+
 	limiter := &AuthRateLimiter{
 		config:                config,
 		protocol:              protocol,
 		serverName:            serverName,
 		hostname:              hostname,
-		trustedNetworks:       trustedNetworks,
+		exemptNetworks:        exemptNetworks,
 		blockedIPUsernames:    make(map[string]*BlockedIPUsernameInfo),
 		blockedIPs:            make(map[string]*BlockedIPInfo),
 		ipFailureCounts:       make(map[string]*IPFailureInfo),
@@ -204,8 +215,8 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, remoteAddr net.Add
 		ip = remoteAddr.String()
 	}
 
-	// Check if IP is from a trusted network (never rate limit trusted IPs)
-	if a.isFromTrustedNetwork(ip) {
+	// Exempt networks are never rate limited (decoupled from PROXY/XCLIENT trust)
+	if a.isRateLimitExempt(ip) {
 		return nil
 	}
 
@@ -309,8 +320,8 @@ func (a *AuthRateLimiter) IsIPBlocked(remoteAddr net.Addr) bool {
 		ip = remoteAddr.String()
 	}
 
-	// Check if IP is in trusted networks (never block trusted IPs)
-	if a.isFromTrustedNetwork(ip) {
+	// Exempt networks are never blocked (Tier 2)
+	if a.isRateLimitExempt(ip) {
 		return false
 	}
 
@@ -347,8 +358,8 @@ func (a *AuthRateLimiter) IsIPBlockedWithProxy(conn net.Conn, proxyInfo *ProxyPr
 		}
 	}
 
-	// Check if IP is in trusted networks (never block trusted IPs)
-	if a.isFromTrustedNetwork(realClientIP) {
+	// Exempt networks are never blocked (Tier 2)
+	if a.isRateLimitExempt(realClientIP) {
 		return false
 	}
 
@@ -374,12 +385,12 @@ func (a *AuthRateLimiter) CanAttemptAuthWithProxy(ctx context.Context, conn net.
 	// Extract real client IP and proxy IP
 	clientIP, proxyIP := GetConnectionIPs(conn, proxyInfo)
 
-	// Check if the real client IP is from a trusted network
-	if a.isFromTrustedNetwork(clientIP) {
+	// Exempt the real client IP from rate limiting if it is in the exempt networks
+	if a.isRateLimitExempt(clientIP) {
 		if proxyIP != "" {
-			logger.Debug("Auth limiter: Skipping rate limiting for trusted client", "protocol", a.protocol, "client", clientIP, "proxy", proxyIP)
+			logger.Debug("Auth limiter: Skipping rate limiting for exempt client", "protocol", a.protocol, "client", clientIP, "proxy", proxyIP)
 		} else {
-			logger.Debug("Auth limiter: Skipping rate limiting for trusted client", "protocol", a.protocol, "client", clientIP)
+			logger.Debug("Auth limiter: Skipping rate limiting for exempt client", "protocol", a.protocol, "client", clientIP)
 		}
 		return nil
 	}
@@ -399,39 +410,41 @@ func (a *AuthRateLimiter) RecordAuthAttemptWithProxy(ctx context.Context, conn n
 	clientIP, proxyIP := GetConnectionIPs(conn, proxyInfo)
 
 	now := time.Now()
-	isTrusted := a.isFromTrustedNetwork(clientIP)
+	isExempt := a.isRateLimitExempt(clientIP)
 
 	if !success {
 		// Failed authentication: track IP+username (Tier 1), IP-only (Tier 2), and username (statistics)
 
-		// Tier 1 & 2: Skip IP-based tracking for trusted networks (no blocking)
-		if !isTrusted {
+		// Tier 1 & 2: Skip IP-based tracking for exempt networks (no blocking)
+		if !isExempt {
 			a.updateIPUsernameFailure(clientIP, username, now) // Tier 1: Fast IP+username blocking
 			a.updateFailureTracking(clientIP, now)             // Tier 2: Slow IP-only blocking
 		} else {
 			if proxyIP != "" {
-				logger.Debug("Auth limiter: Skipping IP-based tracking for trusted client (tracking username only)", "protocol", a.protocol, "client", clientIP, "proxy", proxyIP)
+				logger.Debug("Auth limiter: Skipping IP-based tracking for exempt client (tracking username only)", "protocol", a.protocol, "client", clientIP, "proxy", proxyIP)
 			} else {
-				logger.Debug("Auth limiter: Skipping IP-based tracking for trusted client (tracking username only)", "protocol", a.protocol, "client", clientIP)
+				logger.Debug("Auth limiter: Skipping IP-based tracking for exempt client (tracking username only)", "protocol", a.protocol, "client", clientIP)
 			}
 		}
 
-		// Username statistics: ALWAYS track (even from trusted networks)
-		// This is critical for detecting attacks through webmail/trusted proxies
+		// Username statistics: ALWAYS track (even from exempt networks)
+		// This is critical for detecting attacks through webmail/exempt hosts
 		a.updateUsernameFailure(username, now) // Statistics only
 	} else {
 		// Successful authentication: clear all tracking
-		if !isTrusted {
+		if !isExempt {
 			a.clearIPUsernameFailure(clientIP, username) // Clear Tier 1
 			a.clearFailureTracking(clientIP)             // Clear Tier 2
 		}
-		a.clearUsernameFailure(username) // Clear statistics (always, even for trusted networks)
+		a.clearUsernameFailure(username) // Clear statistics (always, even for exempt networks)
 	}
 }
 
-// isFromTrustedNetwork checks if an IP address is in the trusted networks
-func (a *AuthRateLimiter) isFromTrustedNetwork(ipStr string) bool {
-	if len(a.trustedNetworks) == 0 {
+// isRateLimitExempt reports whether an IP is exempt from IP-based blocking (Tier 1 and
+// Tier 2). Username statistics are tracked regardless. The exemption list is decoupled
+// from PROXY/XCLIENT source-IP trust. (security-audit M2)
+func (a *AuthRateLimiter) isRateLimitExempt(ipStr string) bool {
+	if len(a.exemptNetworks) == 0 {
 		return false
 	}
 
@@ -440,8 +453,8 @@ func (a *AuthRateLimiter) isFromTrustedNetwork(ipStr string) bool {
 		return false
 	}
 
-	// Check against trusted networks
-	for _, cidr := range a.trustedNetworks {
+	// Check against the exempt networks
+	for _, cidr := range a.exemptNetworks {
 		_, network, err := net.ParseCIDR(cidr)
 		if err != nil {
 			continue
@@ -466,27 +479,27 @@ func (a *AuthRateLimiter) RecordAuthAttempt(ctx context.Context, remoteAddr net.
 	}
 
 	now := time.Now()
-	isTrusted := a.isFromTrustedNetwork(ip)
+	isExempt := a.isRateLimitExempt(ip)
 
 	if !success {
 		// Failed authentication: track IP+username (Tier 1), IP-only (Tier 2), and username (statistics)
 
-		// Tier 1 & 2: Skip IP-based tracking for trusted networks (no blocking)
-		if !isTrusted {
+		// Tier 1 & 2: Skip IP-based tracking for exempt networks (no blocking)
+		if !isExempt {
 			a.updateIPUsernameFailure(ip, username, now) // Tier 1: Fast IP+username blocking
 			a.updateFailureTracking(ip, now)             // Tier 2: Slow IP-only blocking
 		}
 
-		// Username statistics: ALWAYS track (even from trusted networks)
-		// This is critical for detecting attacks through webmail/trusted proxies
+		// Username statistics: ALWAYS track (even from exempt networks)
+		// This is critical for detecting attacks through webmail/exempt hosts
 		a.updateUsernameFailure(username, now) // Statistics only
 	} else {
 		// Successful authentication: clear all tracking
-		if !isTrusted {
+		if !isExempt {
 			a.clearIPUsernameFailure(ip, username) // Clear Tier 1
 			a.clearFailureTracking(ip)             // Clear Tier 2
 		}
-		a.clearUsernameFailure(username) // Clear statistics (always, even for trusted networks)
+		a.clearUsernameFailure(username) // Clear statistics (always, even for exempt networks)
 	}
 }
 

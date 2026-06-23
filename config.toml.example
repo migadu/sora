@@ -804,9 +804,20 @@ shard_count = 0  # Default: 0 (runtime.NumCPU())
 # Note: Debug logging is now configured per-server using the 'debug' option on individual servers
 
 # --- TRUSTED NETWORKS ---
-# Networks trusted for proxy parameter forwarding (XCLIENT, ID commands, etc.)
-# These networks can forward client information through proxy protocols
-trusted_networks = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "::1/128"]
+# Hosts trusted to (a) assert a client IP via PROXY protocol / XCLIENT / IMAP ID, and
+# (b) skip auth rate limiting (unless auth_rate_limit.exempt_networks overrides this).
+#
+# EMPTY BY DEFAULT (fail-closed): no host is trusted. Set it to the IPs/CIDRs of YOUR
+# proxies — keep it as narrow as possible. Do NOT list whole private ranges
+# (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16): on a shared/multi-tenant network that lets
+# any neighbor spoof client IPs and bypass rate limiting (startup logs a warning if you do).
+#
+# - proxy_protocol listeners REQUIRE a non-empty list here (the server refuses to start otherwise).
+# - LMTP delivery admission is independent of this and still accepts RFC1918 by default,
+#   so leaving this empty does NOT break mail delivery.
+#
+# trusted_networks = ["10.20.0.5/32", "10.20.0.6/32"]   # e.g. only your two proxy hosts
+trusted_networks = []
 
 
 # DYNAMIC SERVER CONFIGURATION
@@ -1021,6 +1032,15 @@ auth_rate_limit.ip_window_duration = "30m"        # Time window for counting IP 
 # Username tracking (statistics only, does NOT block - prevents DoS)
 auth_rate_limit.max_attempts_per_username = 10    # Track username failures across all IPs (monitoring only).
 auth_rate_limit.username_window_duration = "60m"  # Time window for username failure tracking.
+
+# Exempt networks: IPs in these CIDRs skip IP-based blocking (Tier 1 + Tier 2). Username
+# statistics are still tracked. This is DECOUPLED from [servers] trusted_networks (which
+# governs PROXY/XCLIENT source-IP trust): a host allowed to forward a client IP is NOT
+# automatically exempt from rate limiting, and vice versa. Keep this list as narrow as
+# possible — ideally just your own webmail/relay hosts that make many legitimate logins.
+#   - key omitted          -> falls back to [servers] trusted_networks (backward-compatible)
+#   - exempt_networks = []  -> exempt nobody (every IP is rate-limited)
+# auth_rate_limit.exempt_networks = ["10.0.0.5/32"]  # e.g. only the webmail host
 
 # Progressive delays (applied before blocking thresholds)
 auth_rate_limit.delay_start_threshold = 2         # Failed attempts before applying progressive authentication delays.

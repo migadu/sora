@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"reflect"
 	"strconv"
@@ -467,6 +468,20 @@ type AuthRateLimiterConfig struct {
 	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username tracking entries (0 = unlimited, default: 100000)
 	MaxIPEntries         int `toml:"max_ip_entries"`          // Maximum IP failure tracking entries (0 = unlimited, default: 50000)
 	MaxUsernameEntries   int `toml:"max_username_entries"`    // Maximum username tracking entries (0 = unlimited, default: 50000)
+
+	// Networks exempt from IP-based blocking (Tier 1 IP+username and Tier 2 IP-only).
+	// Username statistics are still tracked even for exempt IPs.
+	//
+	// DECOUPLED from [servers] trusted_networks, which governs PROXY/XCLIENT source-IP
+	// trust: a host allowed to forward a client IP is not automatically exempt from rate
+	// limiting, and vice versa. Keep this as narrow as possible — ideally just your own
+	// webmail/relay hosts that legitimately make many auth attempts from one IP.
+	//
+	// Resolution (security-audit M2):
+	//   - key absent → falls back to trusted_networks (backward-compatible default)
+	//   - exempt_networks = []           → exempt nobody (every IP is rate-limited)
+	//   - exempt_networks = ["a", "b"]   → exempt only these CIDRs
+	ExemptNetworks []string `toml:"exempt_networks,omitempty"`
 }
 
 // DefaultAuthRateLimiterConfig returns sensible defaults for authentication rate limiting
@@ -1082,7 +1097,12 @@ func NewDefaultConfig() Config {
 			DefaultRights:   "lrswipkxtea", // Full rights for creators
 		},
 		Servers: ServersConfig{
-			TrustedNetworks: []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10"},
+			// Empty by default (fail-closed): no host is trusted to assert a client IP via
+			// PROXY/XCLIENT or to skip auth rate limiting. Set this explicitly to your proxy
+			// IPs. proxy_protocol listeners REQUIRE a non-empty list (enforced at startup).
+			// LMTP delivery admission keeps its own RFC1918 default, so mail flow is
+			// unaffected. (security-audit M2)
+			TrustedNetworks: nil,
 		},
 		Uploader: UploaderConfig{
 			Path:          "/tmp/sora/uploads",
@@ -1578,6 +1598,56 @@ func (c *Config) GetAllServers() []ServerConfig {
 	}
 
 	return allServers
+}
+
+// ProxyProtocolListenersMissingTrust returns the names of enabled listeners that accept
+// PROXY protocol while trusted_networks is empty. With no trusted proxies, a PROXY header
+// from any reachable host could spoof the client IP, so this combination must fail closed
+// at startup. (security-audit M2)
+func (c *Config) ProxyProtocolListenersMissingTrust() []string {
+	if len(c.Servers.TrustedNetworks) > 0 {
+		return nil
+	}
+	var names []string
+	for _, s := range c.GetAllServers() {
+		if s.ProxyProtocol {
+			names = append(names, s.Name)
+		}
+	}
+	return names
+}
+
+// broadPrivateRanges are the full RFC1918 / IPv6-ULA / link-local supernets. Trusting any
+// of these whole-cloth grants client-IP spoofing and rate-limit exemption to every host on
+// the private network — almost always wider than intended. (security-audit M2)
+var broadPrivateRanges = []string{
+	"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10",
+}
+
+// TrustedNetworksHaveBroadPrivateRanges reports whether any configured trusted network is
+// (or is broader than) a whole private supernet — the insecure-wide pattern that the old
+// default shipped. Narrow CIDRs (e.g. a single proxy /32) do not trigger it.
+func TrustedNetworksHaveBroadPrivateRanges(networks []string) bool {
+	for _, broad := range broadPrivateRanges {
+		_, broadNet, err := net.ParseCIDR(broad)
+		if err != nil {
+			continue
+		}
+		broadOnes, _ := broadNet.Mask.Size()
+		for _, entry := range networks {
+			_, n, err := net.ParseCIDR(strings.TrimSpace(entry))
+			if err != nil {
+				continue
+			}
+			// Match if the configured network covers the whole supernet: it contains the
+			// supernet's base address and its mask is no narrower than the supernet's.
+			ones, _ := n.Mask.Size()
+			if ones <= broadOnes && n.Contains(broadNet.IP) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // LoadConfigFromFile loads configuration from a TOML file and trims whitespace from all string fields

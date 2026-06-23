@@ -5,6 +5,18 @@ import (
 	"testing"
 )
 
+// TestNew_WiresMaxConnections confirms the configured connection cap reaches the
+// field the LimitListener uses (catches an option-wiring typo).
+func TestNew_WiresMaxConnections(t *testing.T) {
+	s, err := New(nil, ServerOptions{APIKey: strings.Repeat("k", 16), MaxConnections: 5})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if s.maxConnections != 5 {
+		t.Errorf("maxConnections = %d, want 5", s.maxConnections)
+	}
+}
+
 // TestNew_RejectsWeakAPIKey verifies the Admin API refuses to start with a missing
 // or too-short API key (audit H6). The key check runs before any DB use, so New can
 // be called with a nil rdb here.

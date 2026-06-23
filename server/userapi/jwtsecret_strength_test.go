@@ -5,6 +5,18 @@ import (
 	"testing"
 )
 
+// TestNew_WiresMaxConnections confirms the configured connection cap reaches the
+// field the LimitListener uses (catches an option-wiring typo).
+func TestNew_WiresMaxConnections(t *testing.T) {
+	s, err := New(nil, ServerOptions{JWTSecret: strings.Repeat("k", 32), MaxConnections: 7})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if s.maxConnections != 7 {
+		t.Errorf("maxConnections = %d, want 7", s.maxConnections)
+	}
+}
+
 // TestNew_RejectsWeakJWTSecret verifies the User API refuses to start with a missing
 // or sub-32-byte JWT secret (audit H6 / RFC 7518 §3.2). The secret check runs before
 // any DB use, so New can be called with a nil rdb here.

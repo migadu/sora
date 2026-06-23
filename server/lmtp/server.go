@@ -135,8 +135,13 @@ type LMTPServerBackend struct {
 	// Listen backlog
 	listenBacklog int
 
-	// Trusted networks for connection filtering
+	// Trusted networks for connection admission (NewSession). Defaults to private
+	// networks when trusted_networks is unset, since LMTP is internal-only.
 	trustedNetworks []*net.IPNet
+
+	// Trusted networks permitted to override the real client IP via XCLIENT/XRCPTFORWARD.
+	// Fails closed: empty = trust nobody (no RFC1918 default), unlike trustedNetworks. (M2)
+	xclientTrustedNets []*net.IPNet
 
 	// Sieve script caching
 	sieveCache           *SieveScriptCache
@@ -288,6 +293,11 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// This makes the behavior explicit and advertises LIMITS RCPTMAX=1 in LHLO,
 	// so the MTA sends each recipient in a separate transaction.
 
+	// Bound idle/slow connections so a held connection cannot pin a goroutine
+	// indefinitely (slowloris). Generous values: legit transactions finish in seconds.
+	s.ReadTimeout = 5 * time.Minute
+	s.WriteTimeout = 2 * time.Minute
+
 	// Configure XCLIENT support (always enabled)
 	s.EnableXCLIENT = true
 
@@ -295,32 +305,40 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// Enable custom RCPT TO parameters like XRCPTFORWARD
 	s.EnableRCPTExtensions = true
 
-	// Set trusted networks for XCLIENT using global trusted networks
-	var trustedProxies []string
-	if len(options.TrustedNetworks) > 0 {
-		// Use global trusted networks
-		trustedProxies = options.TrustedNetworks
-	} else {
-		// Use safe default trusted networks (RFC1918 private networks + localhost)
-		trustedProxies = []string{
+	// Connection admission (NewSession): LMTP is internal-only, so when trusted_networks
+	// is unset we default to private networks. This gate intentionally keeps the RFC1918
+	// default — emptying the list must NOT silently reject all delivery.
+	admissionProxies := options.TrustedNetworks
+	if len(admissionProxies) == 0 {
+		admissionProxies = []string{
 			"127.0.0.0/8",    // localhost
 			"::1/128",        // IPv6 localhost
 			"10.0.0.0/8",     // RFC1918 private networks
 			"172.16.0.0/12",  // RFC1918 private networks
 			"192.168.0.0/16", // RFC1918 private networks
 		}
+		logger.Info("LMTP: trusted_networks empty; accepting delivery from default private ranges (RFC1918+localhost). Set trusted_networks to restrict.", "name", name)
 	}
-
-	trustedNets, err := server.ParseTrustedNetworks(trustedProxies)
+	admissionNets, err := server.ParseTrustedNetworks(admissionProxies)
 	if err != nil {
 		// Log the error and use empty trusted networks to prevent server crash
-		logger.Debug("failed to parse trusted networks, xclient disabled", "name", name, "error", err)
-		trustedNets = []*net.IPNet{}
+		logger.Debug("failed to parse trusted networks, connection admission disabled", "name", name, "error", err)
+		admissionNets = []*net.IPNet{}
 	}
-	s.XCLIENTTrustedNets = trustedNets
+	backend.trustedNetworks = admissionNets
 
-	// Store trusted networks in backend for connection filtering
-	backend.trustedNetworks = trustedNets
+	// XCLIENT / XRCPTFORWARD source-IP override: fail closed. Use ONLY the explicitly
+	// configured trusted_networks (no RFC1918 default), matching IMAP (server/imap/id.go)
+	// and POP3 (server/pop3/xclient.go), which deny forwarding when the list is empty.
+	// Overriding the client IP is a higher privilege than connecting, so it must be granted
+	// explicitly. (security-audit M2)
+	xclientNets, err := server.ParseTrustedNetworks(options.TrustedNetworks)
+	if err != nil {
+		logger.Debug("failed to parse XCLIENT trusted networks, XCLIENT disabled", "name", name, "error", err)
+		xclientNets = []*net.IPNet{}
+	}
+	backend.xclientTrustedNets = xclientNets
+	s.XCLIENTTrustedNets = xclientNets
 
 	// Configure StartTLS if enabled and TLS config is available
 	if options.TLSUseStartTLS && backend.tlsConfig != nil {

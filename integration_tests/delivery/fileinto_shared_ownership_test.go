@@ -257,15 +257,12 @@ func countLiveInMailbox(t *testing.T, rdb interface {
 // TargetMailbox — the Admin API /deliver mechanism; a plain SIEVE `fileinto` target
 // reaches the same DeliverMessage resolution.)
 //
-// KNOWN-FAILING GAP (intentionally red so it gets fixed): DeliverMessage's inline mailbox
-// resolution resolves the shared mailbox and attributes the message to its owner (good,
-// B2), but — unlike SaveMessageToMailbox and the LMTP path — it does NOT call
-// CheckMailboxPermission for the 'i' right before writing. Confirmed: with only 'lr' the
-// message is written into the owner's shared mailbox. So a recipient with mere
-// lookup/read access (or an Admin API caller delivering "as" that recipient) can inject
-// mail into a shared mailbox they cannot insert into. Fix: apply the same 'i'-right check
-// + INBOX fallback in DeliverMessage's resolution (e.g. share one resolveOwnedTarget
-// helper with SaveMessageToMailbox).
+// Regression guard for a fixed gap: DeliverMessage's inline resolution attributes to the
+// mailbox owner (B2) AND — like SaveMessageToMailbox and the LMTP path — now calls
+// CheckMailboxPermission for the 'i' right before writing, falling back to INBOX on
+// denial. Without that check a recipient with mere lookup/read access (or an Admin API
+// caller delivering "as" that recipient) could inject mail into a shared mailbox they
+// cannot insert into.
 func TestDelivery_DeliverMessage_FileintoSharedMailbox_RequiresInsertRight(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	imapSrv, contributor, fake := common.SetupIMAPServerWithRealS3(t)

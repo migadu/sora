@@ -76,25 +76,31 @@ func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) err
 	return nil
 }
 
-// isFromTrustedProxy checks if the LMTP connection is from a trusted proxy
+// isFromTrustedProxy reports whether the peer may override the real client IP via
+// XCLIENT/XRCPTFORWARD. It fails closed: an empty trusted_networks list trusts nobody,
+// matching IMAP (server/imap/id.go) and POP3 (server/pop3/xclient.go). It deliberately
+// does NOT fall back to RFC1918 defaults — overriding the client IP is a higher privilege
+// than merely connecting (which NewSession still permits from private networks). (M2)
 func (s *LMTPSession) isFromTrustedProxy() bool {
-	// Get the underlying network connection through the SMTP connection
-	netConn := s.conn.Conn()
+	// When PROXY protocol is used, IsTrustedForwardingWithProxy checks the proxy's IP
+	// (s.ProxyIP); otherwise it falls back to the direct connection's remote address.
+	return server.IsTrustedForwardingWithProxy(s.conn.Conn(), s.ProxyIP, s.xclientTrustedProxies())
+}
 
-	// First try to get trusted proxies from PROXY protocol config
-	var trustedProxies []string
+// xclientTrustedProxies returns the CIDR blocks trusted to send XCLIENT/XRCPTFORWARD
+// source-IP overrides, using exactly the configured lists with no RFC1918 fallback.
+func (s *LMTPSession) xclientTrustedProxies() []string {
+	// With PROXY protocol enabled, honor the (possibly separate) proxy_protocol_trusted_proxies
+	// list, which itself falls back only to the configured trusted_networks — never to RFC1918.
 	if s.backend.proxyReader != nil {
-		trustedProxies = server.GetTrustedProxiesForServer(s.backend.proxyReader)
-	} else {
-		// If PROXY protocol is disabled, use the server's own trusted networks
-		// Convert trusted networks back to string format for compatibility
-		for _, network := range s.backend.trustedNetworks {
-			trustedProxies = append(trustedProxies, network.String())
-		}
+		return s.backend.proxyReader.GetTrustedProxies()
 	}
 
-	// When PROXY protocol is used, check the proxy's IP (not the real client IP)
-	return server.IsTrustedForwardingWithProxy(netConn, s.ProxyIP, trustedProxies)
+	var trustedProxies []string
+	for _, network := range s.backend.xclientTrustedNets {
+		trustedProxies = append(trustedProxies, network.String())
+	}
+	return trustedProxies
 }
 
 // ParseRCPTForward processes XRCPTFORWARD parameters from RCPT TO command

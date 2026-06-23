@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/netutil"
+
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 
@@ -47,6 +49,8 @@ type Server struct {
 	uploader           *uploader.UploadWorker
 	storage            *storage.S3Storage
 	relayQueue         delivery.RelayQueue // Global relay queue for mail delivery
+	maxMessageSize     int64               // Max accepted mail-injection body size (bytes); 0 -> default
+	maxConnections     int                 // Max concurrent connections; 0 -> unlimited
 	server             *http.Server
 	tls                bool
 	tlsConfig          *tls.Config // TLS config from manager (takes precedence) or nil
@@ -73,6 +77,8 @@ type ServerOptions struct {
 	Uploader           *uploader.UploadWorker
 	Storage            *storage.S3Storage
 	RelayQueue         delivery.RelayQueue // Global relay queue for mail delivery
+	MaxMessageSize     int64               // Max accepted mail-injection body size (bytes); 0 -> 50MB default
+	MaxConnections     int                 // Max concurrent connections; 0 -> unlimited
 	TLS                bool
 	TLSConfig          *tls.Config // TLS config from manager (takes precedence over cert files)
 	TLSCertFile        string
@@ -185,6 +191,8 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		uploader:           options.Uploader,
 		storage:            options.Storage,
 		relayQueue:         options.RelayQueue,
+		maxMessageSize:     options.MaxMessageSize,
+		maxConnections:     options.MaxConnections,
 		tls:                options.TLS,
 		tlsConfig:          options.TLSConfig,
 		tlsCertFile:        options.TLSCertFile,
@@ -259,6 +267,14 @@ func (s *Server) start(ctx context.Context) error {
 	s.server = &http.Server{
 		Addr:    s.addr,
 		Handler: router,
+		// ReadHeaderTimeout bounds slowloris-on-headers. Read/Write are generous on
+		// purpose: the mail-injection endpoint accepts bodies up to max_message_size
+		// (the body SIZE is bounded by MaxBytesReader in handleDeliverMail), so a tight
+		// whole-request limit would cut off large legitimate uploads.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Graceful shutdown
@@ -284,6 +300,12 @@ func (s *Server) start(ctx context.Context) error {
 			Listener:    listener,
 			proxyReader: s.proxyReader,
 		}
+	}
+
+	// Cap concurrent connections (0 = unlimited, like the other server types) to
+	// prevent connection/goroutine exhaustion on the HTTP API.
+	if s.maxConnections > 0 {
+		listener = netutil.LimitListener(listener, s.maxConnections)
 	}
 
 	// Start server with or without TLS

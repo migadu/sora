@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/netutil"
+
 	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/cache"
@@ -27,6 +29,7 @@ type Server struct {
 	jwtSecret                  string
 	tokenDuration              time.Duration
 	tokenIssuer                string
+	maxConnections             int // Max concurrent connections; 0 -> unlimited
 	allowedOrigins             []string
 	allowedHosts               []string
 	rdb                        *resilient.ResilientDatabase
@@ -51,6 +54,7 @@ type ServerOptions struct {
 	JWTSecret                   string
 	TokenDuration               time.Duration
 	TokenIssuer                 string
+	MaxConnections              int // Max concurrent connections; 0 -> unlimited
 	AllowedOrigins              []string
 	AllowedHosts                []string
 	Storage                     *storage.S3Storage
@@ -164,6 +168,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		name:                       options.Name,
 		addr:                       options.Addr,
 		jwtSecret:                  options.JWTSecret,
+		maxConnections:             options.MaxConnections,
 		tokenDuration:              options.TokenDuration,
 		tokenIssuer:                options.TokenIssuer,
 		allowedOrigins:             options.AllowedOrigins,
@@ -234,11 +239,12 @@ func (s *Server) start(ctx context.Context) error {
 	router := s.SetupRoutes()
 
 	s.server = &http.Server{
-		Addr:         s.addr,
-		Handler:      router,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              s.addr,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second, // slowloris-on-headers defense
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Graceful shutdown
@@ -265,6 +271,12 @@ func (s *Server) start(ctx context.Context) error {
 			Listener:    listener,
 			proxyReader: s.proxyReader,
 		}
+	}
+
+	// Cap concurrent connections (0 = unlimited, like the other server types) to
+	// prevent connection/goroutine exhaustion on the HTTP API.
+	if s.maxConnections > 0 {
+		listener = netutil.LimitListener(listener, s.maxConnections)
 	}
 
 	// Start server with or without TLS

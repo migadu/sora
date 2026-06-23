@@ -55,9 +55,22 @@ func (l *adminAPILogger) Log(format string, args ...any) {
 	logger.Debug("Mail delivery", "msg", fmt.Sprintf(format, args...))
 }
 
+// defaultMaxMessageSize is used to cap the mail-injection body when the server's
+// max_message_size is not configured.
+const defaultMaxMessageSize = 50 * 1024 * 1024 // 50 MB
+
 // handleDeliverMail handles HTTP mail delivery (mimics LMTP flow exactly)
 func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	// Bound the request body to the configured max_message_size (same limit LMTP uses),
+	// covering both the multipart and raw rfc822/text paths so a single large request
+	// cannot exhaust process memory.
+	maxBody := s.maxMessageSize
+	if maxBody <= 0 {
+		maxBody = defaultMaxMessageSize
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
 
 	// Parse request based on Content-Type
 	var req DeliverMailRequest

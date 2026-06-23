@@ -440,6 +440,29 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		}
 	}
 
+	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
+	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
+	if missing := cfg.ProxyProtocolListenersMissingTrust(); len(missing) > 0 {
+		errorHandler.ValidationError("trusted_networks",
+			fmt.Errorf("proxy_protocol is enabled on server(s) %s but [servers] trusted_networks is empty; "+
+				"set trusted_networks to your trusted proxy IPs/CIDRs (otherwise any client could spoof its "+
+				"source IP via a PROXY header)", strings.Join(missing, ", ")))
+		os.Exit(errorHandler.WaitForExit())
+	}
+
+	// Surface the trusted_networks posture so operators notice the fail-closed default and
+	// the insecure-wide pattern. (security-audit M2)
+	if len(cfg.Servers.TrustedNetworks) == 0 {
+		logger.Info("trusted_networks is empty (fail-closed default): PROXY/XCLIENT client-IP forwarding and " +
+			"auth rate-limit exemption are disabled; LMTP still accepts delivery from default private ranges. " +
+			"Set [servers] trusted_networks to your proxy IPs to enable forwarding/exemption.")
+	} else if config.TrustedNetworksHaveBroadPrivateRanges(cfg.Servers.TrustedNetworks) {
+		logger.Warn("trusted_networks includes whole private ranges (e.g. 10.0.0.0/8): every host on those " +
+			"networks is trusted to spoof client IPs via PROXY/XCLIENT and to bypass auth rate limiting. " +
+			"Narrow trusted_networks to your actual proxy IPs; use auth_rate_limit.exempt_networks to scope " +
+			"rate-limit exemption separately.")
+	}
+
 	// Check for server name conflicts
 	serverNames := make(map[string]bool)
 	serverAddresses := make(map[string]string) // addr -> server name
@@ -1031,6 +1054,11 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 				httpServer := &http.Server{
 					Addr:    ":80",
 					Handler: handler,
+					// Internet-facing (HTTP-01) — bound slow clients (slowloris).
+					ReadHeaderTimeout: 10 * time.Second,
+					ReadTimeout:       30 * time.Second,
+					WriteTimeout:      30 * time.Second,
+					IdleTimeout:       120 * time.Second,
 				}
 
 				// Graceful shutdown handler
@@ -1545,6 +1573,11 @@ func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, se
 	server := &http.Server{
 		Addr:    serverConfig.Addr,
 		Handler: mux,
+		// Bound slow clients (slowloris).
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
@@ -2099,6 +2132,8 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		Uploader:           deps.uploadWorker,
 		Storage:            deps.storage,
 		RelayQueue:         deps.relayQueue, // Global relay queue
+		MaxMessageSize:     serverConfig.GetMaxMessageSizeWithDefault(),
+		MaxConnections:     serverConfig.MaxConnections,
 		TLS:                serverConfig.TLS,
 		TLSConfig:          tlsConfig, // From TLS manager (if available)
 		TLSCertFile:        serverConfig.TLSCertFile,
@@ -2159,6 +2194,7 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		JWTSecret:                   serverConfig.JWTSecret,
 		TokenDuration:               tokenDuration,
 		TokenIssuer:                 serverConfig.TokenIssuer,
+		MaxConnections:              serverConfig.MaxConnections,
 		AllowedOrigins:              serverConfig.AllowedOrigins,
 		AllowedHosts:                serverConfig.AllowedHosts,
 		Storage:                     deps.storage,

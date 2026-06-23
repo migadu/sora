@@ -192,42 +192,14 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		}
 	}
 
-	// Resolve the mailbox to get its ID and Owner
-	mailbox, err := d.RDB.GetMailboxByNameWithRetry(d.Ctx, recipient.AccountID, mailboxName)
+	// Resolve the destination mailbox (supporting shared mailboxes owned by another
+	// account), enforce the 'i' right, attribute the message to the mailbox owner, and
+	// stage the already-saved body under the owner's path. The body was stored locally
+	// under recipient.AccountID above.
+	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(d.Ctx, recipient, mailboxName, contentHash)
 	if err != nil {
-		if err == consts.ErrMailboxNotFound {
-			mailbox, err = d.RDB.GetMailboxByNameWithRetry(d.Ctx, recipient.AccountID, consts.MailboxInbox)
-			if err != nil {
-				result.ErrorMessage = fmt.Sprintf("Failed to get INBOX: %v", err)
-				return result, err
-			}
-		} else {
-			result.ErrorMessage = fmt.Sprintf("Failed to get mailbox '%s': %v", mailboxName, err)
-			return result, err
-		}
-	}
-
-	// Determine destination owner
-	destAccountID := mailbox.AccountID
-
-	if d.OwnerResolver == nil {
-		d.OwnerResolver = resilient.NewOwnerResolver(d.RDB)
-	}
-
-	destS3Domain, destS3Localpart, err := d.OwnerResolver.ResolveDestinationOwner(d.Ctx, destAccountID, recipient.AccountID, recipient.Address.Domain(), recipient.Address.LocalPart())
-	if err != nil {
-		result.ErrorMessage = fmt.Sprintf("Failed to resolve owner for destination mailbox '%s': %v", mailbox.Name, err)
+		result.ErrorMessage = fmt.Sprintf("Failed to resolve destination mailbox: %v", err)
 		return result, err
-	}
-
-	if destAccountID != recipient.AccountID {
-		sourcePath := d.Uploader.FilePath(contentHash, recipient.AccountID)
-		destPath := d.Uploader.FilePath(contentHash, destAccountID)
-		if sourcePath != destPath {
-			if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
-				d.Logger.Log("failed to stage local file for cross-account delivery: %v", err)
-			}
-		}
 	}
 
 	// Save message to mailbox
@@ -318,7 +290,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	metrics.TrackUserActivity(d.MetricsLabel, recipient.Address.FullAddress(), "command", 1)
 
 	result.Success = true
-	result.MailboxName = mailboxName
+	result.MailboxName = mailbox.Name // resolved mailbox (may be INBOX after an ACL-denied fallback)
 	result.MessageUID = uint32(messageUID)
 	return result, nil
 }
@@ -371,34 +343,78 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 	}, nil
 }
 
-// SaveMessageToMailbox saves a message to a specific mailbox (helper for Sieve :copy).
-// flags carries any keywords/flags set by the Sieve script (imap4flags, RFC 5232).
-func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient RecipientInfo, mailboxName string, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string, flags []imap.Flag) error {
-	mailbox, err := d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, mailboxName)
+// resolveOwnedTarget resolves mailboxName for the recipient, supporting shared
+// mailboxes owned by another account. For a cross-account target it enforces the 'i'
+// (insert) right (RFC 4314), falling back to the recipient's INBOX on denial, then
+// resolves the destination OWNER's account id + S3 domain/localpart (via OwnerResolver)
+// so the message is attributed to the mailbox owner rather than the recipient (B2), and
+// — for a cross-account target — hardlinks the already-staged body to the owner's
+// staging path so the uploader writes it under the owner's S3 path.
+//
+// The body MUST already be stored locally under recipient.AccountID (e.g. via
+// Uploader.StoreLocally) before this is called. DeliverMessage's inline save and
+// SaveMessageToMailbox both use this so the two paths cannot drift (e.g. one of them
+// skipping the 'i' right check).
+func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient RecipientInfo, mailboxName, contentHash string) (mailbox *db.DBMailbox, destAccountID int64, destS3Domain, destS3Localpart string, err error) {
+	mailbox, err = d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, mailboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			// Fallback to INBOX
 			mailbox, err = d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, consts.MailboxInbox)
-			if err != nil {
-				return err
-			}
-		} else {
-			return err
+		}
+		if err != nil {
+			return nil, 0, "", "", err
 		}
 	}
 
 	// Enforce the insert ('i') right for shared mailboxes owned by another account: a
-	// SIEVE fileinto must not write into a mailbox the recipient can only look up
-	// (RFC 4314). On denial (or check error) deliver to the recipient's own INBOX.
+	// SIEVE fileinto / delivery must not write into a mailbox the recipient can only
+	// look up (RFC 4314). On denial (or check error) deliver to the recipient's INBOX.
 	if mailbox.AccountID != recipient.AccountID {
 		canInsert, permErr := d.RDB.CheckMailboxPermissionWithRetry(ctx, mailbox.ID, recipient.AccountID, db.ACLRightInsert)
 		if permErr != nil || !canInsert {
-			d.Logger.Log("fileinto denied: no insert right on shared mailbox %q, delivering to INBOX (err=%v)", mailbox.Name, permErr)
-			mailbox, err = d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, consts.MailboxInbox)
-			if err != nil {
-				return err
+			d.Logger.Log("delivery denied: no insert right on shared mailbox %q, delivering to INBOX (err=%v)", mailbox.Name, permErr)
+			if mailbox, err = d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, consts.MailboxInbox); err != nil {
+				return nil, 0, "", "", err
 			}
 		}
+	}
+
+	// Lazy-init OwnerResolver for tests or contexts where it wasn't pre-populated.
+	if d.OwnerResolver == nil {
+		d.OwnerResolver = resilient.NewOwnerResolver(d.RDB)
+	}
+
+	destAccountID = mailbox.AccountID
+	destS3Domain, destS3Localpart, err = d.OwnerResolver.ResolveDestinationOwner(ctx, destAccountID, recipient.AccountID, recipient.Address.Domain(), recipient.Address.LocalPart())
+	if err != nil {
+		return nil, 0, "", "", fmt.Errorf("failed to resolve owner for destination mailbox '%s': %v", mailbox.Name, err)
+	}
+
+	// For a cross-account target the body was staged under the recipient's account;
+	// hardlink it to the owner's staging path so the uploader writes the body under the
+	// owner's S3 path (B2).
+	if destAccountID != recipient.AccountID {
+		sourcePath := d.Uploader.FilePath(contentHash, recipient.AccountID)
+		destPath := d.Uploader.FilePath(contentHash, destAccountID)
+		if sourcePath != destPath {
+			if linkErr := helpers.LinkOrCopyFile(sourcePath, destPath); linkErr != nil {
+				d.Logger.Log("failed to stage local file for cross-account delivery: %v", linkErr)
+			}
+		}
+	}
+
+	return mailbox, destAccountID, destS3Domain, destS3Localpart, nil
+}
+
+// SaveMessageToMailbox saves a message to a specific mailbox (helper for Sieve :copy).
+// flags carries any keywords/flags set by the Sieve script (imap4flags, RFC 5232).
+func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient RecipientInfo, mailboxName string, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string, flags []imap.Flag) error {
+	contentHash := helpers.HashContent(messageBytes)
+
+	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash)
+	if err != nil {
+		return err
 	}
 
 	// Parse message metadata
@@ -413,34 +429,9 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 		sentDate = time.Now()
 	}
 
-	contentHash := helpers.HashContent(messageBytes)
 	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(messageBytes))
 	bodyStructure := &bodyStructureVal
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
-
-	// Determine destination owner
-	destAccountID := mailbox.AccountID
-
-	// Lazy-init OwnerResolver for tests or contexts where it wasn't pre-populated
-	if d.OwnerResolver == nil {
-		d.OwnerResolver = resilient.NewOwnerResolver(d.RDB)
-	}
-
-	destS3Domain, destS3Localpart, err := d.OwnerResolver.ResolveDestinationOwner(ctx, destAccountID, recipient.AccountID, recipient.Address.Domain(), recipient.Address.LocalPart())
-	if err != nil {
-		return fmt.Errorf("failed to resolve owner for destination mailbox '%s': %v", mailbox.Name, err)
-	}
-
-	if destAccountID != recipient.AccountID {
-		// Ensure the local file exists under the destination owner's staging directory.
-		sourcePath := d.Uploader.FilePath(contentHash, recipient.AccountID)
-		destPath := d.Uploader.FilePath(contentHash, destAccountID)
-		if sourcePath != destPath {
-			if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
-				d.Logger.Log("failed to stage local file for cross-account delivery: %v", err)
-			}
-		}
-	}
 
 	size := int64(len(messageBytes))
 
