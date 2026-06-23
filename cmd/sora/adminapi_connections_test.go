@@ -35,7 +35,7 @@ func TestAdminAPIConnections_StorageNodeIntegration(t *testing.T) {
 	errChan := make(chan error, 1)
 	opts := adminapi.ServerOptions{
 		Addr:               "127.0.0.1:0", // random port
-		APIKey:             "test-key",
+		APIKey:             "test-key-16-chars-long",
 		ConnectionTrackers: deps.connectionTrackers,
 	}
 	// adminapi.Start will bind and listen in background
@@ -54,7 +54,7 @@ func TestAdminAPIConnections_StorageNodeIntegration(t *testing.T) {
 
 	// Make request to list connections
 	req, _ := http.NewRequest("GET", "http://127.0.0.1:29091/admin/connections", nil)
-	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Authorization", "Bearer test-key-16-chars-long")
 	client := &http.Client{Timeout: time.Second}
 	respObj, err := client.Do(req)
 	if err != nil {
