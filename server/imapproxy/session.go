@@ -464,9 +464,24 @@ func (s *Session) handleConnection() {
 			s.sendResponse(fmt.Sprintf("%s OK CAPABILITY completed", tag))
 
 		case "ID":
+			idName := s.server.idName
+			if idName == "" {
+				idName = "Sora-Proxy"
+			}
+			version := s.server.idVersion
+			if version == "" {
+				version = "1.0"
+			}
+			vendor := s.server.idVendor
+			if vendor == "" {
+				vendor = "Migadu-Mail GmbH"
+			}
+			supportURL := s.server.idSupportURL
+			if supportURL == "" {
+				supportURL = "https://migadu.com"
+			}
 			// Handle ID command - this is where we add forwarding parameter support
-			// For now, just respond with a basic server ID
-			s.sendResponse("* ID (\"name\" \"Sora-Proxy\" \"version\" \"1.0\")")
+			s.sendResponse(fmt.Sprintf("* ID (\"name\" %q \"version\" %q \"vendor\" %q \"support-url\" %q)", idName, version, vendor, supportURL))
 			s.sendResponse(fmt.Sprintf("%s OK ID completed", tag))
 
 		case "NOOP":

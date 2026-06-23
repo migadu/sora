@@ -38,15 +38,30 @@ func (s *IMAPSession) ID(clientID *imap.IDData) *imap.IDData {
 	}
 
 	// Build server response with basic server information
-	version := s.server.version
+	idName := s.server.idName
+	if idName == "" {
+		idName = "Sora"
+	}
+	version := s.server.idVersion
 	if version == "" {
-		version = "dev"
+		version = s.server.version
+		if version == "" {
+			version = "dev"
+		}
+	}
+	vendor := s.server.idVendor
+	if vendor == "" {
+		vendor = "Migadu-Mail GmbH"
+	}
+	supportURL := s.server.idSupportURL
+	if supportURL == "" {
+		supportURL = "https://migadu.com"
 	}
 	serverID := &imap.IDData{
-		Name:       "Sora",
+		Name:       idName,
 		Version:    version,
-		Vendor:     "Migadu-Mail GmbH",
-		SupportURL: "https://migadu.com",
+		Vendor:     vendor,
+		SupportURL: supportURL,
 	}
 
 	// Add forwarding parameters to response if we're acting as a proxy

@@ -73,6 +73,12 @@ type Server struct {
 	// (e.g. " X-ICEWARP-SERVER"). Empty when none configured.
 	additionalCapsSuffix string
 
+	// IMAP ID command custom identity (defaults used if empty)
+	idName       string
+	idVersion    string
+	idVendor     string
+	idSupportURL string
+
 	// Debug logging
 	debug       bool
 	debugWriter io.Writer
@@ -186,6 +192,12 @@ type ServerOptions struct {
 	// CAPABILITY is relayed from the backend, so for full coverage also set
 	// additional_caps on the backend server block.
 	AdditionalCaps []string
+
+	// IMAP ID command identity
+	IDName       string
+	IDVersion    string
+	IDVendor     string
+	IDSupportURL string
 
 	// Debug logging
 	Debug bool // Enable debug logging with password masking
@@ -382,6 +394,10 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		listenBacklog:              listenBacklog,
 		insecureAuth:               opts.InsecureAuth || !opts.TLS, // Auto-enable when TLS not configured
 		additionalCapsSuffix:       additionalCapsSuffix,
+		idName:                     opts.IDName,
+		idVersion:                  opts.IDVersion,
+		idVendor:                   opts.IDVendor,
+		idSupportURL:               opts.IDSupportURL,
 		debug:                      opts.Debug,
 		debugWriter:                debugWriter,
 		maxAuthErrors:              opts.MaxAuthErrors,

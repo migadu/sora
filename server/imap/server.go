@@ -300,6 +300,12 @@ type IMAPServer struct {
 	// (e.g. "X-ICEWARP-SERVER" for server-type fingerprinting). See AdditionalCaps.
 	additionalCaps []imap.Cap
 
+	// IMAP ID command custom identity (defaults used if empty)
+	idName       string
+	idVersion    string
+	idVendor     string
+	idSupportURL string
+
 	// Command timeout and throughput enforcement
 	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	commandTimeout         time.Duration
@@ -351,6 +357,11 @@ type IMAPServerOptions struct {
 	DisabledCaps []string
 	// Extra, non-standard capability tokens advertised verbatim (e.g. "X-ICEWARP-SERVER")
 	AdditionalCaps []string
+	// IMAP ID command identity
+	IDName       string
+	IDVersion    string
+	IDVendor     string
+	IDSupportURL string
 	// Version information
 	Version string
 	// Metadata limits (RFC 5464)
@@ -640,6 +651,11 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		s.additionalCaps = append(s.additionalCaps, imap.Cap(capStr))
 		logger.Debug("IMAP: Advertising additional capability (global server setting)", "name", name, "capability", capStr)
 	}
+
+	s.idName = options.IDName
+	s.idVersion = options.IDVersion
+	s.idVendor = options.IDVendor
+	s.idSupportURL = options.IDSupportURL
 
 	// Create connection limiter with trusted networks from server configuration
 	// For IMAP backend:

@@ -912,6 +912,10 @@ type IMAPServerConfig struct {
 	CommandTimeout         string                `toml:"command_timeout"`           // Maximum idle time before disconnection (e.g., "5m", default: 5 minutes)
 	AbsoluteSessionTimeout string                `toml:"absolute_session_timeout"`  // Maximum total session duration (e.g., "24h", default: 24 hours)
 	MinBytesPerMinute      int64                 `toml:"min_bytes_per_minute"`      // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
+	IDName                 string                `toml:"id_name"`                   // IMAP ID command 'name' field
+	IDVersion              string                `toml:"id_version"`                // IMAP ID command 'version' field
+	IDVendor               string                `toml:"id_vendor"`                 // IMAP ID command 'vendor' field
+	IDSupportURL           string                `toml:"id_support_url"`            // IMAP ID command 'support-url' field
 }
 
 // GetSearchRateLimitWindow parses the search rate limit window duration
@@ -1075,6 +1079,10 @@ type IMAPProxyServerConfig struct {
 	RemoteHealthChecks     *bool                 `toml:"remote_health_checks"` // Enable backend health checking (default: true)
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`      // Authentication rate limiting
 	RemoteLookup           *RemoteLookupConfig   `toml:"remote_lookup"`        // Database-driven user routing
+	IDName                 string                `toml:"id_name"`              // IMAP ID command 'name' field
+	IDVersion              string                `toml:"id_version"`           // IMAP ID command 'version' field
+	IDVendor               string                `toml:"id_vendor"`            // IMAP ID command 'vendor' field
+	IDSupportURL           string                `toml:"id_support_url"`       // IMAP ID command 'support-url' field
 }
 
 // GetRemoteHealthChecks returns whether backend health checking is enabled.
@@ -1415,6 +1423,10 @@ type ServerConfig struct {
 	ClientFilters  []ClientCapabilityFilter `toml:"client_filters,omitempty"`
 	DisabledCaps   []string                 `toml:"disabled_caps,omitempty"`   // Globally disabled capabilities (IMAP specific)
 	AdditionalCaps []string                 `toml:"additional_caps,omitempty"` // Extra capability tokens advertised verbatim, e.g. "X-ICEWARP-SERVER" (IMAP specific)
+	IDName         string                   `toml:"id_name,omitempty"`         // IMAP ID command 'name' field (IMAP specific)
+	IDVersion      string                   `toml:"id_version,omitempty"`      // IMAP ID command 'version' field (IMAP specific)
+	IDVendor       string                   `toml:"id_vendor,omitempty"`       // IMAP ID command 'vendor' field (IMAP specific)
+	IDSupportURL   string                   `toml:"id_support_url,omitempty"`  // IMAP ID command 'support-url' field (IMAP specific)
 }
 
 // TimeoutSchedulerConfig holds global timeout scheduler configuration

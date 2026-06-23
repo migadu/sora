@@ -927,6 +927,14 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # For full coverage when clients connect through a proxy (greeting AND
 # post-login), set additional_caps on BOTH the proxy and the backend blocks.
 
+# --- IMAP ID COMMAND CUSTOMIZATION ---
+# Override the fields returned by the IMAP ID command (RFC 2971).
+# If left empty, Sora defaults will be used ("Sora", "Migadu-Mail GmbH", etc.).
+# id_name = "Dovecot"
+# id_version = "2.3.20"
+# id_vendor = "Dovecot authors"
+# id_support_url = "https://dovecot.org"
+
 # --- CLIENT CAPABILITY FILTERS ---
 # Disable specific IMAP capabilities for problematic clients based on their ID or TLS fingerprint
 # This helps work around client bugs while maintaining full functionality for well-behaved clients
@@ -1240,6 +1248,14 @@ auth_idle_timeout = "2m"        # Idle timeout between commands during authentic
                               # Cleared after successful authentication.
                               # Note: absolute_session_timeout (below) separately limits total session duration.
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
+
+# --- IMAP ID COMMAND CUSTOMIZATION ---
+# Override the fields returned by the IMAP ID command (RFC 2971) in proxy mode.
+# If left empty, Sora defaults will be used ("Sora-Proxy", "1.0", etc.).
+# id_name = "Dovecot"
+# id_version = "2.3.20"
+# id_vendor = "Dovecot authors"
+# id_support_url = "https://dovecot.org"
 
 # --- TIMEOUT CONFIGURATION ---
 # IMPORTANT: IMAP proxy cannot detect IDLE commands (RFC 2177), so command_timeout should be disabled (0).
