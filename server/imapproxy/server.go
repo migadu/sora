@@ -68,6 +68,11 @@ type Server struct {
 	// Auth security
 	insecureAuth bool
 
+	// Extra capability tokens advertised in the pre-auth greeting and CAPABILITY
+	// response, pre-joined as a space-prefixed suffix for cheap concatenation
+	// (e.g. " X-ICEWARP-SERVER"). Empty when none configured.
+	additionalCapsSuffix string
+
 	// Debug logging
 	debug       bool
 	debugWriter io.Writer
@@ -176,6 +181,12 @@ type ServerOptions struct {
 	// Auth security
 	InsecureAuth bool // Allow PLAIN auth over non-TLS connections
 
+	// Extra, non-standard capability tokens advertised verbatim in the proxy's
+	// pre-auth greeting and CAPABILITY response (e.g. "X-ICEWARP-SERVER"). Post-auth
+	// CAPABILITY is relayed from the backend, so for full coverage also set
+	// additional_caps on the backend server block.
+	AdditionalCaps []string
+
 	// Debug logging
 	Debug bool // Enable debug logging with password masking
 }
@@ -283,6 +294,18 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		listenBacklog = 1024 // Default backlog
 	}
 
+	// Pre-build the additional capability suffix (space-prefixed, empties skipped)
+	// for cheap concatenation into the pre-auth greeting and CAPABILITY response.
+	var additionalCapsSuffix string
+	for _, capStr := range opts.AdditionalCaps {
+		if capStr != "" {
+			additionalCapsSuffix += " " + capStr
+		}
+	}
+	if additionalCapsSuffix != "" {
+		logger.Info("IMAP Proxy: Advertising additional capabilities", "name", opts.Name, "capabilities", additionalCapsSuffix)
+	}
+
 	// Initialize authentication cache from config
 	// Apply defaults if not configured (enabled by default for performance)
 	var lookupCache *lookupcache.LookupCache
@@ -358,6 +381,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		limiter:                    limiter,
 		listenBacklog:              listenBacklog,
 		insecureAuth:               opts.InsecureAuth || !opts.TLS, // Auto-enable when TLS not configured
+		additionalCapsSuffix:       additionalCapsSuffix,
 		debug:                      opts.Debug,
 		debugWriter:                debugWriter,
 		maxAuthErrors:              opts.MaxAuthErrors,

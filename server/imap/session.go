@@ -111,6 +111,16 @@ func (s *IMAPSession) GetCapabilities() imap.CapSet {
 	return s.server.caps
 }
 
+// AdditionalCapabilities implements the imapserver.SessionAdditionalCaps interface.
+// It returns extra, non-standard capability tokens (configured via additional_caps)
+// that go-imap advertises verbatim in every CAPABILITY emission — including the
+// unauthenticated greeting — bypassing its known-capability allowlist. This is how
+// Sora advertises vendor tokens such as "X-ICEWARP-SERVER" for client server-type
+// detection. Returns nil when none are configured (no extra tokens advertised).
+func (s *IMAPSession) AdditionalCapabilities() []imap.Cap {
+	return s.server.additionalCaps
+}
+
 // AppendLimit implements the SessionAppendLimit interface from go-imap.
 // Returns the maximum size in bytes that can be uploaded in an APPEND command.
 // The go-imap library uses this to:

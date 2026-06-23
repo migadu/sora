@@ -296,6 +296,10 @@ type IMAPServer struct {
 	// Client capability filtering
 	capFilters []ClientCapabilityFilter
 
+	// Extra, non-standard capability tokens advertised verbatim to all clients
+	// (e.g. "X-ICEWARP-SERVER" for server-type fingerprinting). See AdditionalCaps.
+	additionalCaps []imap.Cap
+
 	// Command timeout and throughput enforcement
 	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	commandTimeout         time.Duration
@@ -345,6 +349,8 @@ type IMAPServerOptions struct {
 	CapabilityFilters []config.ClientCapabilityFilter
 	// Global capability disabling
 	DisabledCaps []string
+	// Extra, non-standard capability tokens advertised verbatim (e.g. "X-ICEWARP-SERVER")
+	AdditionalCaps []string
 	// Version information
 	Version string
 	// Metadata limits (RFC 5464)
@@ -620,6 +626,19 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 				logger.Debug("IMAP: WARNING - Cannot disable capability, not found in defaults", "name", name, "capability", capStr)
 			}
 		}
+	}
+
+	// Extra, non-standard capability tokens advertised verbatim to all clients.
+	// These bypass the go-imap known-capability allowlist (via SessionAdditionalCaps)
+	// and appear in every CAPABILITY emission, including the greeting. Used to make
+	// clients that key behavior on a vendor token (e.g. eM Client + X-ICEWARP-SERVER)
+	// recognize the server. Empty tokens are skipped.
+	for _, capStr := range options.AdditionalCaps {
+		if capStr == "" {
+			continue
+		}
+		s.additionalCaps = append(s.additionalCaps, imap.Cap(capStr))
+		logger.Debug("IMAP: Advertising additional capability (global server setting)", "name", name, "capability", capStr)
 	}
 
 	// Create connection limiter with trusted networks from server configuration

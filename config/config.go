@@ -1412,8 +1412,9 @@ type ServerConfig struct {
 	RemoteLookup *RemoteLookupConfig `toml:"remote_lookup,omitempty"`
 
 	// Client capability filtering (IMAP specific)
-	ClientFilters []ClientCapabilityFilter `toml:"client_filters,omitempty"`
-	DisabledCaps  []string                 `toml:"disabled_caps,omitempty"` // Globally disabled capabilities (IMAP specific)
+	ClientFilters  []ClientCapabilityFilter `toml:"client_filters,omitempty"`
+	DisabledCaps   []string                 `toml:"disabled_caps,omitempty"`   // Globally disabled capabilities (IMAP specific)
+	AdditionalCaps []string                 `toml:"additional_caps,omitempty"` // Extra capability tokens advertised verbatim, e.g. "X-ICEWARP-SERVER" (IMAP specific)
 }
 
 // TimeoutSchedulerConfig holds global timeout scheduler configuration

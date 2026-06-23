@@ -42,17 +42,18 @@ type meteredSession struct {
 // override here ever drifts from the real signature (which would silently make
 // the server treat that command as unsupported), these break the build instead.
 var (
-	_ imapserver.Session             = (*meteredSession)(nil)
-	_ imapserver.SessionNamespace    = (*meteredSession)(nil)
-	_ imapserver.SessionMove         = (*meteredSession)(nil)
-	_ imapserver.SessionSASL         = (*meteredSession)(nil)
-	_ imapserver.SessionAppendLimit  = (*meteredSession)(nil)
-	_ imapserver.SessionCapabilities = (*meteredSession)(nil)
-	_ imapserver.SessionMetadata     = (*meteredSession)(nil)
-	_ imapserver.SessionACL          = (*meteredSession)(nil)
-	_ imapserver.SessionThread       = (*meteredSession)(nil)
-	_ imapserver.SessionMultiSearch  = (*meteredSession)(nil)
-	_ imapserver.SessionID           = (*meteredSession)(nil)
+	_ imapserver.Session               = (*meteredSession)(nil)
+	_ imapserver.SessionNamespace      = (*meteredSession)(nil)
+	_ imapserver.SessionMove           = (*meteredSession)(nil)
+	_ imapserver.SessionSASL           = (*meteredSession)(nil)
+	_ imapserver.SessionAppendLimit    = (*meteredSession)(nil)
+	_ imapserver.SessionCapabilities   = (*meteredSession)(nil)
+	_ imapserver.SessionAdditionalCaps = (*meteredSession)(nil)
+	_ imapserver.SessionMetadata       = (*meteredSession)(nil)
+	_ imapserver.SessionACL            = (*meteredSession)(nil)
+	_ imapserver.SessionThread         = (*meteredSession)(nil)
+	_ imapserver.SessionMultiSearch    = (*meteredSession)(nil)
+	_ imapserver.SessionID             = (*meteredSession)(nil)
 )
 
 // newMeteredSession wraps an IMAP session for command metric collection.

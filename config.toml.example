@@ -899,6 +899,34 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # NOTE: Do not disable core capabilities like IMAP4rev1, STARTTLS, or AUTH=PLAIN
 # as this will break basic IMAP functionality.
 
+# --- ADDITIONAL CAPABILITY TOKENS ---
+# Advertise extra, non-standard capability tokens to ALL clients, verbatim. These
+# are appended to the CAPABILITY list (greeting, post-login, and the explicit
+# CAPABILITY command) in addition to the standard capabilities — they do not
+# replace anything.
+#
+# Primary use case: server-type fingerprinting. Some clients enable behavior based
+# on a vendor token rather than standard advertisements. For example, eM Client
+# keys its "IceWarp" server detection on the X-ICEWARP-SERVER token, and only then
+# displays custom IMAP keywords/tags (which Sora already supports via \* in
+# PERMANENTFLAGS). Advertising the token flips eM Client from "Other" to "IceWarp".
+#
+# additional_caps = ["X-ICEWARP-SERVER"]
+#
+# CAVEAT: tokens here are advertised to EVERY client, not just the one you are
+# targeting. A token that makes one client assume a particular server type may
+# trigger that vendor's behaviors in other clients too. Use sparingly.
+#
+# Supported on both backend (type = "imap") and proxy (type = "imap_proxy")
+# server blocks. They cover different points of the connection:
+#   - backend: greeting, post-login OK [CAPABILITY], and explicit CAPABILITY.
+#     Through a proxy these reach the client too, since the proxy relays the
+#     backend's post-login CAPABILITY.
+#   - imap_proxy: the proxy's own pre-auth greeting and pre-auth CAPABILITY
+#     (post-auth is transparently relayed from the backend).
+# For full coverage when clients connect through a proxy (greeting AND
+# post-login), set additional_caps on BOTH the proxy and the backend blocks.
+
 # --- CLIENT CAPABILITY FILTERS ---
 # Disable specific IMAP capabilities for problematic clients based on their ID or TLS fingerprint
 # This helps work around client bugs while maintaining full functionality for well-behaved clients

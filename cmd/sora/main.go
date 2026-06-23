@@ -1237,6 +1237,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			WarmupTimeout:                deps.config.LocalCache.WarmupTimeout,
 			CapabilityFilters:            serverConfig.ClientFilters,
 			DisabledCaps:                 serverConfig.DisabledCaps,
+			AdditionalCaps:               serverConfig.AdditionalCaps,
 			Version:                      version,
 			MetadataMaxEntrySize:         deps.config.Metadata.MaxEntrySize,
 			MetadataMaxEntriesPerMailbox: deps.config.Metadata.MaxEntriesPerMailbox,
@@ -1631,6 +1632,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		ListenBacklog:            serverConfig.ListenBacklog,
 		MaxAuthErrors:            serverConfig.GetMaxAuthErrors(),
 		InsecureAuth:             serverConfig.InsecureAuth || !serverConfig.TLS,
+		AdditionalCaps:           serverConfig.AdditionalCaps,
 		Debug:                    serverConfig.Debug,
 	})
 	if err != nil {
