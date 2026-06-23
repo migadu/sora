@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
@@ -124,14 +125,15 @@ func (s *POP3ProxySession) handleConnection() {
 
 		line = strings.TrimSpace(line)
 
-		// Log client command with password masking if debug is enabled
-		s.DebugLog("client command", "line", line)
-
 		parts := strings.Fields(line)
 		if len(parts) == 0 {
 			continue // Ignore empty lines
 		}
 		cmd := strings.ToUpper(parts[0])
+
+		// Log the client command, masking credentials (PASS/AUTH) so a cleartext
+		// password never reaches the debug log.
+		s.DebugLog("client command", "line", helpers.MaskSensitive(line, cmd, "PASS", "AUTH"))
 
 		switch cmd {
 		case "CAPA":

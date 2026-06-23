@@ -17,6 +17,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
@@ -160,9 +161,6 @@ func (s *Session) handleConnection() {
 
 		line = strings.TrimRight(line, "\r\n")
 
-		// Log client command with password masking if debug is enabled
-		s.DebugLog("client command", "cmd", line)
-
 		// Use the shared command parser. IMAP commands have tags.
 		tag, command, args, err := server.ParseLine(line, true)
 		if err != nil {
@@ -179,6 +177,10 @@ func (s *Session) handleConnection() {
 			}
 			continue
 		}
+
+		// Log the parsed client command, masking credentials (LOGIN/AUTHENTICATE) so a
+		// cleartext password never reaches the debug log.
+		s.DebugLog("client command", "cmd", helpers.MaskSensitive(line, command, "LOGIN", "AUTHENTICATE"))
 
 		if tag == "" { // Empty line
 			continue
