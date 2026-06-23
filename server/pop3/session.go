@@ -186,6 +186,16 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
+			// USER requires an argument; reject a missing one rather than indexing
+			// parts[1] and panicking (RFC 1939: USER name).
+			if len(parts) < 2 {
+				recordMetrics("failure")
+				if s.handleClientError(writer, "-ERR Missing username\r\n") {
+					return
+				}
+				continue
+			}
+
 			// We will only accept email addresses as address
 			// Remove quotes if present for compatibility
 			username := server.UnquoteString(parts[1])
@@ -245,6 +255,16 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			s.DebugLog("authentication attempt", "address", userAddress.FullAddress())
+
+			// PASS requires an argument; reject a missing one rather than indexing
+			// parts[1] and panicking (RFC 1939: PASS string).
+			if len(parts) < 2 {
+				recordMetrics("failure")
+				if s.handleClientError(writer, "-ERR Missing password\r\n") {
+					return
+				}
+				continue
+			}
 
 			// Remove quotes from password if present for compatibility
 			password := server.UnquoteString(parts[1])

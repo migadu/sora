@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -542,6 +543,14 @@ func (s *POP3Server) Start(errChan chan error) {
 			// Ensure session is always removed from map, even if handleConnection panics
 			// or never completes. This prevents memory leaks in the activeSessions map.
 			defer s.removeSession(session)
+			// Recover from any panic in the session goroutine. Without this, a single
+			// malformed command (e.g. a missing argument) would propagate an unrecovered
+			// panic and crash the entire server process, dropping every connection.
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("POP3: session panic recovered", "name", s.name, "panic", r, "stack", string(debug.Stack()))
+				}
+			}()
 			session.handleConnection()
 		}()
 	}
