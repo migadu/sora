@@ -261,13 +261,23 @@ func (s *Server) generateToken(email string, accountID int64) (string, time.Time
 
 // validateToken validates a JWT token and returns the claims
 func (s *Server) validateToken(tokenString string) (*JWTClaims, error) {
+	// Pin the algorithm to HS256 (rejects alg=none / key-confusion), require an exp
+	// claim, and enforce the issuer we sign tokens with (when configured).
+	opts := []jwt.ParserOption{
+		jwt.WithValidMethods([]string{"HS256"}),
+		jwt.WithExpirationRequired(),
+	}
+	if s.tokenIssuer != "" {
+		opts = append(opts, jwt.WithIssuer(s.tokenIssuer))
+	}
+
 	token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (any, error) {
 		// Verify signing method
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return []byte(s.jwtSecret), nil
-	})
+	}, opts...)
 
 	if err != nil {
 		return nil, fmt.Errorf("token validation failed: %w", err)

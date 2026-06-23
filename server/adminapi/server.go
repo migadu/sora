@@ -135,10 +135,18 @@ type ProxyBackendInfo struct {
 	Backends  []BackendHealthInfo `json:"backends"`
 }
 
+// minAPIKeyLength is the minimum accepted Admin API key length. The key is the
+// primary gate for the Admin API (account CRUD, kick, mail injection), so a short
+// key is a real brute-force risk; reject it at startup rather than run with it.
+const minAPIKeyLength = 16
+
 // New creates a new HTTP API server
 func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, error) {
 	if options.APIKey == "" {
 		return nil, fmt.Errorf("API key is required for HTTP API server")
+	}
+	if len(options.APIKey) < minAPIKeyLength {
+		return nil, fmt.Errorf("API key must be at least %d characters (got %d) — use a long, random value", minAPIKeyLength, len(options.APIKey))
 	}
 
 	// Validate TLS configuration

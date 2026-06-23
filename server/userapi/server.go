@@ -68,10 +68,18 @@ type ServerOptions struct {
 	TrustedNetworks             []string // Fallback if trusted proxies empty
 }
 
+// minJWTSecretLength is the minimum accepted JWT signing secret length. RFC 7518
+// §3.2 requires an HS256 key of at least 256 bits (32 bytes); a weaker secret is
+// brute-forceable offline, allowing token forgery for any account.
+const minJWTSecretLength = 32
+
 // New creates a new HTTP Mail API server
 func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, error) {
 	if options.JWTSecret == "" {
 		return nil, fmt.Errorf("JWT secret is required for Mail API server")
+	}
+	if len(options.JWTSecret) < minJWTSecretLength {
+		return nil, fmt.Errorf("JWT secret must be at least %d bytes for HS256 (RFC 7518 §3.2); got %d", minJWTSecretLength, len(options.JWTSecret))
 	}
 
 	if options.TokenDuration == 0 {

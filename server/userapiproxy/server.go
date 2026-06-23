@@ -588,13 +588,16 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, backendAdd
 
 // validateToken validates a JWT token and returns the claims
 func (s *Server) validateToken(tokenString string) (*JWTClaims, error) {
+	// Pin the algorithm to HS256 and require an exp claim. Issuer validation is left
+	// to the backend (authoritative), which has the configured issuer; the proxy only
+	// validates enough to route.
 	token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (any, error) {
 		// Verify signing method
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return []byte(s.jwtSecret), nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 
 	if err != nil {
 		return nil, fmt.Errorf("token validation failed: %w", err)

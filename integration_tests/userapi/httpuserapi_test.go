@@ -1132,7 +1132,7 @@ func TestAuthRateLimiting(t *testing.T) {
 		serverOptions := userapi.ServerOptions{
 			Name:          "test-server-rate-limit-1",
 			Addr:          "127.0.0.1:0",
-			JWTSecret:     "test-secret-key",
+			JWTSecret:     "test-secret-key-for-testing-only",
 			TokenDuration: 1 * time.Hour,
 			TokenIssuer:   "test-issuer",
 			Storage:       nil,
@@ -1206,7 +1206,7 @@ func TestAuthRateLimiting(t *testing.T) {
 		serverOptions := userapi.ServerOptions{
 			Name:          "test-server-rate-limit-2",
 			Addr:          "127.0.0.1:0",
-			JWTSecret:     "test-secret-key",
+			JWTSecret:     "test-secret-key-for-testing-only",
 			TokenDuration: 1 * time.Hour,
 			TokenIssuer:   "test-issuer",
 			Storage:       nil,
