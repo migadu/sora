@@ -19,7 +19,7 @@ require (
 	github.com/hashicorp/memberlist v0.5.3
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/k3a/html2text v1.2.1
-	github.com/migadu/go-sieve v1.0.0
+	github.com/migadu/go-sieve v1.0.1-0.20260623221321-ca9507030c70
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/stretchr/testify v1.11.1
