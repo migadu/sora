@@ -29,6 +29,12 @@ const (
 type JWTClaims struct {
 	Email     string `json:"email"`
 	AccountID int64  `json:"account_id"`
+	// AuthEpoch is the credential's password epoch (credentials.updated_at, unix
+	// seconds) at the time the token was issued. The refresh endpoint compares it
+	// against the current epoch so a password change invalidates the session; a
+	// missing/zero value (e.g. a token issued before this field existed) is treated
+	// as stale and forces re-login. See db.GetCredentialEpoch.
+	AuthEpoch int64 `json:"auth_epoch,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -177,8 +183,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 generateToken:
 
+	// Bind the token to the current password epoch so a later password change or
+	// account deletion invalidates it at refresh time (the cache fast-path above
+	// can skip the DB, so fetch it here for both paths).
+	_, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, req.Email)
+	if err != nil {
+		logger.Warn("HTTP Mail API: Error fetching credential epoch", "name", s.name, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "Token generation failed")
+		return
+	}
+
 	// Generate JWT token
-	token, expiresAt, err := s.generateToken(req.Email, accountID)
+	token, expiresAt, err := s.generateToken(req.Email, accountID, epoch.Unix())
 	if err != nil {
 		logger.Warn("HTTP Mail API: Error generating token", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Token generation failed")
@@ -217,8 +233,34 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate new token with extended expiration
-	newToken, expiresAt, err := s.generateToken(claims.Email, claims.AccountID)
+	ctx := r.Context()
+
+	// Refresh-gate: re-validate account state before renewing. A stateless JWT is
+	// otherwise non-revocable, so refresh is where we cut off sessions for accounts
+	// that have been deleted/disabled or had their password changed since the token
+	// was issued. This bounds a leaked token to at most one token_duration window.
+	accountID, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, claims.Email)
+	if err != nil {
+		if errors.Is(err, consts.ErrUserNotFound) {
+			// Account soft-deleted or credential removed since the token was issued.
+			logger.Info("HTTP Mail API: Refusing refresh for deleted/unknown account", "name", s.name, "email", claims.Email)
+			s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+			return
+		}
+		logger.Warn("HTTP Mail API: Error revalidating account on refresh", "name", s.name, "error", err)
+		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
+		return
+	}
+	if claims.AuthEpoch < epoch.Unix() {
+		// Password changed after this token was issued (or the token predates the
+		// auth_epoch claim) — force a fresh login instead of renewing.
+		logger.Info("HTTP Mail API: Refusing refresh for stale token (password changed)", "name", s.name, "email", claims.Email)
+		s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+		return
+	}
+
+	// Generate new token with extended expiration, carrying the current epoch.
+	newToken, expiresAt, err := s.generateToken(claims.Email, accountID, epoch.Unix())
 	if err != nil {
 		logger.Warn("HTTP Mail API: Error generating refresh token", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Token generation failed")
@@ -229,19 +271,22 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		Token:     newToken,
 		ExpiresAt: expiresAt.Unix(),
 		Email:     claims.Email,
-		AccountID: claims.AccountID,
+		AccountID: accountID,
 	}
 
 	s.writeJSON(w, http.StatusOK, response)
 }
 
-// generateToken creates a new JWT token for the user
-func (s *Server) generateToken(email string, accountID int64) (string, time.Time, error) {
+// generateToken creates a new JWT token for the user. authEpoch binds the token
+// to the credential's password version (see JWTClaims.AuthEpoch) so a later
+// password change can invalidate it on refresh.
+func (s *Server) generateToken(email string, accountID int64, authEpoch int64) (string, time.Time, error) {
 	expiresAt := time.Now().Add(s.tokenDuration)
 
 	claims := JWTClaims{
 		Email:     email,
 		AccountID: accountID,
+		AuthEpoch: authEpoch,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),

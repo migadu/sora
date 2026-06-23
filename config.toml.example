@@ -1837,6 +1837,10 @@ name = "user-api"
 addr = ":8081"
 jwt_secret = "your-secret-jwt-signing-key-here"  # REQUIRED: Secret key for signing JWT tokens. KEEP SECRET!
 token_duration = "24h"        # JWT token validity duration (e.g., "24h", "7d", "12h").
+                              # Tokens are validated statelessly and cannot be revoked before they expire,
+                              # so this is clamped to a maximum of 7d (168h); larger values are reduced with
+                              # a startup warning. A password change or account deletion stops token *renewal*
+                              # at /user/auth/refresh, so a leaked token survives at most one token_duration.
 token_issuer = "sora-mail-api" # JWT issuer field (optional, for token validation).
 allowed_origins = ["*"]       # CORS allowed origins for web clients. Use specific origins in production: ["https://mail.example.com"]
 allowed_hosts = []            # IP addresses allowed to access API. Empty = all hosts.

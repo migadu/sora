@@ -77,6 +77,13 @@ type ServerOptions struct {
 // brute-forceable offline, allowing token forgery for any account.
 const minJWTSecretLength = 32
 
+// maxTokenDuration caps how long a User API JWT may live. JWTs are validated
+// statelessly, so a token cannot be revoked before it expires — a password change
+// or account deletion only stops *renewal* at refresh time. Clamping the duration
+// bounds the window in which a leaked or post-revocation token remains usable.
+// Seven days is generous for an access token while keeping that window finite.
+const maxTokenDuration = 7 * 24 * time.Hour
+
 // New creates a new HTTP Mail API server
 func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, error) {
 	if options.JWTSecret == "" {
@@ -88,6 +95,11 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 
 	if options.TokenDuration == 0 {
 		options.TokenDuration = 24 * time.Hour // Default to 24 hours
+	}
+	if options.TokenDuration > maxTokenDuration {
+		logger.Warn("User API: token_duration exceeds maximum; clamping",
+			"name", options.Name, "configured", options.TokenDuration.String(), "max", maxTokenDuration.String())
+		options.TokenDuration = maxTokenDuration
 	}
 
 	if options.TokenIssuer == "" {

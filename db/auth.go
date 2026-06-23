@@ -357,6 +357,39 @@ func (db *Database) GetCredentialForAuth(ctx context.Context, address string) (a
 	return accountID, hashedPassword, nil
 }
 
+// GetCredentialEpoch returns the account ID and the credential's "password epoch"
+// (its updated_at, which UpdateAccount bumps on every genuine password change) for
+// an address, requiring the account to be active (not soft-deleted).
+//
+// The User API binds each issued JWT to this epoch so that a password change or
+// account deletion invalidates previously issued tokens when they are refreshed —
+// stateless JWTs are otherwise non-revocable. A transparent login rehash
+// (UpdatePassword) deliberately does NOT bump updated_at, so it does not
+// invalidate live sessions. Returns consts.ErrUserNotFound when the credential is
+// missing or the account is soft-deleted.
+func (db *Database) GetCredentialEpoch(ctx context.Context, address string) (accountID int64, epoch time.Time, err error) {
+	normalizedAddress := strings.ToLower(strings.TrimSpace(address))
+	if normalizedAddress == "" {
+		return 0, time.Time{}, errors.New("address cannot be empty")
+	}
+
+	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT c.account_id, c.updated_at
+		FROM credentials c
+		JOIN accounts a ON c.account_id = a.id
+		WHERE LOWER(c.address) = $1 AND a.deleted_at IS NULL
+	`, normalizedAddress).Scan(&accountID, &epoch)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, time.Time{}, consts.ErrUserNotFound
+		}
+		logger.Error("Database: error fetching credential epoch", "address", normalizedAddress, "err", err)
+		return 0, time.Time{}, fmt.Errorf("database error fetching credential epoch: %w", err)
+	}
+
+	return accountID, epoch, nil
+}
+
 // GetAccountIDByAddress retrieves the main user ID associated with a given identity (address)
 // by looking it up in the `credentials` table.
 func (db *Database) GetAccountIDByAddress(ctx context.Context, address string) (int64, error) {

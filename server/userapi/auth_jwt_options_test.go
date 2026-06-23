@@ -26,7 +26,7 @@ func TestValidateToken_ParserOptions(t *testing.T) {
 	hour := jwt.NewNumericDate(time.Now().Add(time.Hour))
 
 	t.Run("valid token round-trips", func(t *testing.T) {
-		tok, _, err := s.generateToken("user@example.com", 1)
+		tok, _, err := s.generateToken("user@example.com", 1, 0)
 		if err != nil {
 			t.Fatalf("generate: %v", err)
 		}
