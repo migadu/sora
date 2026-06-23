@@ -904,7 +904,6 @@ type IMAPServerConfig struct {
 	TLSCertFile            string                `toml:"tls_cert_file"`
 	TLSKeyFile             string                `toml:"tls_key_file"`
 	TLSVerify              bool                  `toml:"tls_verify"`
-	DisabledCaps           []string              `toml:"disabled_caps"`             // List of capabilities to disable globally for this server
 	AuthRateLimit          AuthRateLimiterConfig `toml:"auth_rate_limit"`           // Authentication rate limiting
 	SearchRateLimitPerMin  int                   `toml:"search_rate_limit_per_min"` // Search rate limit (searches per minute, 0=disabled)
 	SearchRateLimitWindow  string                `toml:"search_rate_limit_window"`  // Search rate limit time window (default: 1m)
