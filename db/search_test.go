@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/sora/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -16,6 +18,78 @@ func TestSearchConstants(t *testing.T) {
 	assert.Equal(t, 100000, MaxSearchResults)
 	assert.Equal(t, 500, MaxComplexSortResults)
 	assert.Less(t, MaxComplexSortResults, MaxSearchResults, "Complex sort limit should be less than search limit")
+}
+
+// TestSeqNumSearchQueryPathSelection verifies the query-path selection after the
+// seqnum→UID rewrite in getMessagesQueryExecutor:
+//
+//   - A pure sequence-number search (SEARCH <seqset>) is rewritten from sequence
+//     numbers to UID ranges and then served by the optimized "simple" path —
+//     without the unnecessary messages_fts join used by the complex paths.
+//   - A search that also carries an FTS term (BODY) stays on the complex-fast
+//     path, because recomputing complexity after the rewrite still sees the FTS
+//     criteria.
+//
+// The assertions key off the per-path Prometheus query counters, which is the
+// only externally observable signal of which template was executed.
+func TestSeqNumSearchQueryPathSelection(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	suite := NewPerformanceTestSuite(t, FastPerformanceConfig)
+	defer suite.Close()
+
+	ctx := context.Background()
+	require.NoError(t, suite.CreateTestMessages(ctx, 10, "business"))
+
+	// Counter for a given query-path label (success/read).
+	pathCount := func(label string) float64 {
+		return testutil.ToFloat64(metrics.DBQueriesTotal.WithLabelValues(label, "success", "read"))
+	}
+
+	t.Run("PureSeqNumUsesSimplePath", func(t *testing.T) {
+		simpleBefore := pathCount("search_messages_simple")
+		fastBefore := pathCount("search_messages_complex_fast")
+		legacyBefore := pathCount("search_messages_complex_legacy")
+
+		criteria := &imap.SearchCriteria{
+			SeqNum: []imap.SeqSet{{imap.SeqRange{Start: 1, Stop: 5}}},
+		}
+		messages, err := suite.db.GetMessagesWithCriteria(ctx, suite.mailboxID, criteria, 0)
+		require.NoError(t, err)
+		require.NotEmpty(t, messages, "sequence search 1:5 should return messages")
+
+		assert.Equal(t, 1.0, pathCount("search_messages_simple")-simpleBefore,
+			"pure SeqNum search should be rewritten to UIDs and use the simple query path")
+		assert.Equal(t, 0.0, pathCount("search_messages_complex_fast")-fastBefore,
+			"pure SeqNum search must not use the complex-fast (messages_fts join) path")
+		assert.Equal(t, 0.0, pathCount("search_messages_complex_legacy")-legacyBefore,
+			"pure SeqNum search must not use the legacy ROW_NUMBER path")
+	})
+
+	t.Run("SeqNumWithFTSStaysComplex", func(t *testing.T) {
+		simpleBefore := pathCount("search_messages_simple")
+		fastBefore := pathCount("search_messages_complex_fast")
+		legacyBefore := pathCount("search_messages_complex_legacy")
+
+		// BODY keeps the query complex even after the seqnum→UID rewrite, so the
+		// recompute must NOT downgrade it to the simple path. The FTS term may
+		// match zero rows in the test environment; only the chosen path matters.
+		criteria := &imap.SearchCriteria{
+			SeqNum: []imap.SeqSet{{imap.SeqRange{Start: 1, Stop: 5}}},
+			Body:   []string{"report"},
+		}
+		_, err := suite.db.GetMessagesWithCriteria(ctx, suite.mailboxID, criteria, 0)
+		require.NoError(t, err)
+
+		assert.Equal(t, 0.0, pathCount("search_messages_simple")-simpleBefore,
+			"SeqNum+BODY search must not be downgraded to the simple path")
+		assert.Equal(t, 1.0, pathCount("search_messages_complex_fast")-fastBefore,
+			"SeqNum+BODY search should use the complex-fast path (FTS, no ROW_NUMBER)")
+		assert.Equal(t, 0.0, pathCount("search_messages_complex_legacy")-legacyBefore,
+			"SeqNum+BODY search should not need the legacy ROW_NUMBER path")
+	})
 }
 
 // TestBuildSearchHeaderConditions verifies the SQL emitted for HEADER search
