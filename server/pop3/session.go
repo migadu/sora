@@ -376,7 +376,17 @@ func (s *POP3Session) handleConnection() {
 
 			// Try master SASL password authentication (traditional)
 			if !authSuccess && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
-				if userAddress.BaseAddress() == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
+				if checkMasterCredential(userAddress.BaseAddress(), s.server.masterSASLUsername) && checkMasterCredential(password, s.server.masterSASLPassword) {
+					// Network gate: master SASL is a tenant-wide impersonation capability.
+					// Anchored to the real socket peer (cannot be forged via PROXY/XCLIENT forwarding).
+					if !s.server.masterSASLGate.Allowed((*s.conn).RemoteAddr()) {
+						s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString((*s.conn).RemoteAddr()))
+						recordMetrics("failure")
+						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
+							return
+						}
+						continue
+					}
 					s.DebugLog("master sasl password authentication successful", "base_address", userAddress.BaseAddress())
 					authSuccess = true
 					masterAuthUsed = true
@@ -1672,7 +1682,17 @@ func (s *POP3Session) handleConnection() {
 			// 2. Check for Master SASL Authentication (traditional)
 			if !impersonating && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
 				// Check if this is a master SASL login
-				if authnID == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
+				if checkMasterCredential(authnID, s.server.masterSASLUsername) && checkMasterCredential(password, s.server.masterSASLPassword) {
+					// Network gate: master SASL is a tenant-wide impersonation capability.
+					// Anchored to the real socket peer (cannot be forged via PROXY/XCLIENT forwarding).
+					if !s.server.masterSASLGate.Allowed((*s.conn).RemoteAddr()) {
+						s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString((*s.conn).RemoteAddr()))
+						recordMetrics("failure")
+						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
+							return
+						}
+						continue
+					}
 					// Master SASL authentication successful
 					if authzID == "" {
 						s.DebugLog("master sasl authentication successful but no authorization identity provided", "authn_id", authnID)

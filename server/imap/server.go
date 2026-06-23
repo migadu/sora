@@ -241,6 +241,7 @@ type IMAPServer struct {
 	masterPassword     []byte
 	masterSASLUsername []byte
 	masterSASLPassword []byte
+	masterSASLGate     *serverPkg.MasterSASLNetworkGate
 	appendLimit        int64
 	ftsRetention       time.Duration
 	version            string
@@ -328,6 +329,7 @@ type IMAPServerOptions struct {
 	MasterPassword              []byte
 	MasterSASLUsername          []byte
 	MasterSASLPassword          []byte
+	MasterSASLAllowedNetworks   []string // Source networks allowed to use master SASL (empty = any, anchored to real socket peer)
 	AppendLimit                 int64
 	MaxConnections              int
 	MaxConnectionsPerIP         int
@@ -418,6 +420,16 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("IMAP", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
 	serverPkg.RegisterRateLimiter("imap", name, authLimiter)
+
+	// Initialize the master SASL network gate. Fail closed on a misconfigured
+	// allow-list rather than silently disabling the gate.
+	masterSASLGate, err := serverPkg.NewMasterSASLNetworkGate(options.MasterSASLAllowedNetworks)
+	if err != nil {
+		return nil, fmt.Errorf("invalid master_sasl_allowed_networks: %w", err)
+	}
+	if len(options.MasterSASLPassword) > 0 && !masterSASLGate.Enabled() {
+		logger.Warn("IMAP: master SASL enabled without master_sasl_allowed_networks; backend trusts any source that knows the secret. Restrict backend ports to proxy hosts or set master_sasl_allowed_networks.", "name", name)
+	}
 
 	// Initialize search rate limiter
 	searchRateLimiter := serverPkg.NewSearchRateLimiter("IMAP", options.SearchRateLimitPerMin, options.SearchRateLimitWindow)
@@ -573,6 +585,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		masterPassword:         options.MasterPassword,
 		masterSASLUsername:     options.MasterSASLUsername,
 		masterSASLPassword:     options.MasterSASLPassword,
+		masterSASLGate:         masterSASLGate,
 		authIdleTimeout:        options.AuthIdleTimeout,
 		commandTimeout:         options.CommandTimeout,
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
@@ -1764,6 +1777,12 @@ func (s *IMAPServer) ReloadConfig(cfg config.ServerConfig) error {
 	if cfg.MasterSASLPassword != string(s.masterSASLPassword) {
 		s.masterSASLPassword = []byte(cfg.MasterSASLPassword)
 		reloaded = append(reloaded, "master_sasl_password")
+	}
+	if gate, err := serverPkg.NewMasterSASLNetworkGate(cfg.MasterSASLAllowedNetworks); err != nil {
+		logger.Warn("IMAP config reload: invalid master_sasl_allowed_networks, keeping previous gate", "name", s.name, "error", err)
+	} else if !s.masterSASLGate.Equal(gate) {
+		s.masterSASLGate = gate
+		reloaded = append(reloaded, "master_sasl_allowed_networks")
 	}
 
 	if len(reloaded) > 0 {

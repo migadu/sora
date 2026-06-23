@@ -209,6 +209,20 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 				if checkMasterCredential(username, s.server.masterSASLUsername) &&
 					checkMasterCredential(password, s.server.masterSASLPassword) {
 
+					// Network gate: master SASL is a tenant-wide impersonation capability,
+					// so it may optionally be restricted to the proxy hosts. Anchored to the
+					// real socket peer (NetConn().RemoteAddr()), which cannot be forged via
+					// PROXY/XCLIENT/ID forwarding (those only rewrite s.RemoteIP/s.ProxyIP).
+					if !s.server.masterSASLGate.Allowed(netConn.RemoteAddr()) {
+						s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
+						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
+						return &imap.Error{
+							Type: imap.StatusResponseTypeNo,
+							Code: imap.ResponseCodeAuthenticationFailed,
+							Text: "Authentication failed",
+						}
+					}
+
 					// Master SASL credentials match. The user to log in as is the authorization-identity.
 					targetUserToImpersonate := identity
 					if targetUserToImpersonate == "" {

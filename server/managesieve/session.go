@@ -288,7 +288,16 @@ func (s *ManageSieveSession) handleConnection() {
 
 			// Try master SASL password authentication (traditional)
 			if !authSuccess && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
-				if address.BaseAddress() == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
+				if checkMasterCredential(address.BaseAddress(), s.server.masterSASLUsername) && checkMasterCredential(password, s.server.masterSASLPassword) {
+					// Network gate: master SASL is a tenant-wide impersonation capability.
+					// Anchored to the real socket peer (cannot be forged via PROXY/XCLIENT forwarding).
+					if !s.server.masterSASLGate.Allowed((*s.conn).RemoteAddr()) {
+						s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString((*s.conn).RemoteAddr()))
+						metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
+						s.sendResponse("NO Authentication failed\r\n")
+						recordMetrics("failure")
+						continue
+					}
 					s.DebugLog("master sasl password authentication successful", "address", address.BaseAddress())
 					authSuccess = true
 					masterAuthUsed = true

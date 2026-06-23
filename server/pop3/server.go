@@ -51,6 +51,7 @@ type POP3Server struct {
 	masterPassword     []byte
 	masterSASLUsername []byte
 	masterSASLPassword []byte
+	masterSASLGate     *serverPkg.MasterSASLNetworkGate
 
 	// Connection counters
 	totalConnections         atomic.Int64
@@ -108,6 +109,7 @@ type POP3ServerOptions struct {
 	MasterPassword              string
 	MasterSASLUsername          string
 	MasterSASLPassword          string
+	MasterSASLAllowedNetworks   []string // Source networks allowed to use master SASL (empty = any, anchored to real socket peer)
 	MaxConnections              int
 	MaxConnectionsPerIP         int
 	MaxConnectionsPerUser       int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
@@ -159,6 +161,17 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("POP3", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
 	serverPkg.RegisterRateLimiter("pop3", name, authLimiter)
+
+	// Initialize the master SASL network gate. Fail closed on a misconfigured
+	// allow-list rather than silently disabling the gate.
+	masterSASLGate, err := serverPkg.NewMasterSASLNetworkGate(options.MasterSASLAllowedNetworks)
+	if err != nil {
+		serverCancel()
+		return nil, fmt.Errorf("invalid master_sasl_allowed_networks: %w", err)
+	}
+	if len(options.MasterSASLPassword) > 0 && !masterSASLGate.Enabled() {
+		logger.Warn("POP3: master SASL enabled without master_sasl_allowed_networks; backend trusts any source that knows the secret. Restrict backend ports to proxy hosts or set master_sasl_allowed_networks.", "name", name)
+	}
 
 	// Initialize authentication cache from config
 	// Default to enabled if not explicitly configured
@@ -235,6 +248,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		masterPassword:         []byte(options.MasterPassword),
 		masterSASLUsername:     []byte(options.MasterSASLUsername),
 		masterSASLPassword:     []byte(options.MasterSASLPassword),
+		masterSASLGate:         masterSASLGate,
 		proxyReader:            proxyReader,
 		authLimiter:            authLimiter,
 		lookupCache:            lookupCache,
@@ -780,6 +794,12 @@ func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 	if cfg.MasterSASLPassword != string(s.masterSASLPassword) {
 		s.masterSASLPassword = []byte(cfg.MasterSASLPassword)
 		reloaded = append(reloaded, "master_sasl_password")
+	}
+	if gate, err := serverPkg.NewMasterSASLNetworkGate(cfg.MasterSASLAllowedNetworks); err != nil {
+		logger.Warn("POP3 config reload: invalid master_sasl_allowed_networks, keeping previous gate", "name", s.name, "error", err)
+	} else if !s.masterSASLGate.Equal(gate) {
+		s.masterSASLGate = gate
+		reloaded = append(reloaded, "master_sasl_allowed_networks")
 	}
 
 	if len(reloaded) > 0 {

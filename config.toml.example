@@ -870,6 +870,16 @@ master_username = ""          # Master username for administrative IMAP access (
 master_password = ""          # Password for master_username.
 master_sasl_username = ""     # Alternative master username for SASL authentication.
 master_sasl_password = ""     # Password for master_sasl_username.
+# master_sasl credentials let the holder impersonate ANY user (no per-user password).
+# This is how the proxy authenticates to backends. SECURITY: backend ports MUST be
+# reachable only by the proxy hosts — anyone who can reach this port and knows the
+# master SASL secret can log in as any user. As defense-in-depth, restrict which
+# source networks may use master SASL below. The check is anchored to the real TCP
+# peer (NOT forgeable via PROXY/XCLIENT/IMAP ID forwarding), so list the PROXY hosts,
+# not end-client IPs. Support staff use master_username at the proxy front door and
+# are unaffected by this list. Empty = disabled (any source accepted — legacy behavior;
+# a startup WARNING is logged when master SASL is set without this gate).
+master_sasl_allowed_networks = []   # e.g. ["10.0.0.0/24", "192.168.1.10"]
 
 # --- TLS/SSL CONFIGURATION ---
 # TWO OPTIONS:
