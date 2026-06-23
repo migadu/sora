@@ -21,6 +21,13 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 		}
 	}
 
+	// Reject pathologically complex/deep criteria before decoding or building a query.
+	// A deeply nested or very wide criteria tree would otherwise recurse unbounded and
+	// generate an unusable SQL clause (see validateSearchCriteria).
+	if err := s.validateSearchCriteria("SEARCH", criteria); err != nil {
+		return nil, err
+	}
+
 	// First safely read and decode session state
 	var selectedMailboxID int64
 	var currentNumMessages uint32

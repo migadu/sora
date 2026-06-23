@@ -24,6 +24,11 @@ func (s *IMAPSession) MultiSearch(numKind imapserver.NumKind, mailboxes []string
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed"}
 	}
 
+	// Reject pathologically complex/deep criteria before decoding or building a query.
+	if err := s.validateSearchCriteria("MULTISEARCH", criteria); err != nil {
+		return nil, err
+	}
+
 	accountID := s.IMAPUser.AccountID()
 
 	// Get all mailboxes for the account to resolve names to IDs

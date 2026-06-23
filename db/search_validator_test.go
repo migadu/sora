@@ -692,3 +692,66 @@ func TestMaxTermCountValidation(t *testing.T) {
 	assert.False(t, result.Valid)
 	assert.True(t, result.HasErrorsForField("total"))
 }
+
+// nestNot wraps criteria in `depth` levels of NOT, building the tree iteratively (so the
+// test helper itself never recurses) — mirroring what a hostile client achieves with a
+// deeply nested SEARCH command.
+func nestNot(depth int) *imap.SearchCriteria {
+	c := &imap.SearchCriteria{Flag: []imap.Flag{imap.FlagSeen}}
+	for i := 0; i < depth; i++ {
+		c = &imap.SearchCriteria{Not: []imap.SearchCriteria{*c}}
+	}
+	return c
+}
+
+func TestValidateSearchCriteria_NestingDepthCap(t *testing.T) {
+	validator := NewSearchCriteriaValidator()
+
+	// At the limit: valid.
+	atLimit := validator.ValidateSearchCriteria(nestNot(validator.MaxNestingDepth))
+	assert.True(t, atLimit.Valid, "criteria nested exactly to the depth limit should be accepted")
+
+	// One past the limit: rejected with a depth error.
+	overLimit := validator.ValidateSearchCriteria(nestNot(validator.MaxNestingDepth + 5))
+	assert.False(t, overLimit.Valid, "criteria nested past the depth limit must be rejected")
+	assert.True(t, overLimit.HasErrorsForField("depth"))
+}
+
+func TestValidateSearchCriteria_DeepTreeDoesNotOverflow(t *testing.T) {
+	validator := NewSearchCriteriaValidator()
+
+	// A pathologically deep tree (far beyond anything a 50 KiB command could carry) must
+	// be rejected WITHOUT the validator recursing all the way down — proving the depth
+	// guard bounds the recursion and cannot exhaust the stack. If the guard were missing,
+	// this would crash the test binary with a fatal stack overflow.
+	result := validator.ValidateSearchCriteria(nestNot(500_000))
+	assert.False(t, result.Valid)
+	assert.True(t, result.HasErrorsForField("depth"))
+}
+
+func TestValidateSearchCriteria_TotalNodeCap(t *testing.T) {
+	validator := NewSearchCriteriaValidator()
+
+	// A shallow (depth 1) but very wide tree: many sibling OR pairs at the same level.
+	// This stays well under the depth cap yet would expand into a huge ORed SQL clause,
+	// so it must be rejected by the total-node guard.
+	wide := &imap.SearchCriteria{}
+	for i := 0; i < validator.MaxTotalNodes*2; i++ {
+		wide.Or = append(wide.Or, [2]imap.SearchCriteria{
+			{Flag: []imap.Flag{imap.FlagSeen}},
+			{Flag: []imap.Flag{imap.FlagAnswered}},
+		})
+	}
+
+	result := validator.ValidateSearchCriteria(wide)
+	assert.False(t, result.Valid, "a wide criteria tree exceeding the node cap must be rejected")
+	assert.True(t, result.HasErrorsForField("nodes"))
+
+	// A modest fan-out stays valid.
+	small := &imap.SearchCriteria{
+		Or: [][2]imap.SearchCriteria{
+			{{Flag: []imap.Flag{imap.FlagSeen}}, {Flag: []imap.Flag{imap.FlagAnswered}}},
+		},
+	}
+	assert.True(t, validator.ValidateSearchCriteria(small).Valid)
+}
