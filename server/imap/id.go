@@ -46,7 +46,7 @@ func (s *IMAPSession) ID(clientID *imap.IDData) *imap.IDData {
 	if version == "" {
 		version = s.server.version
 		if version == "" {
-			version = "dev"
+			version = "1.0"
 		}
 	}
 	vendor := s.server.idVendor

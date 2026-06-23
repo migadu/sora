@@ -466,7 +466,7 @@ func (s *Session) handleConnection() {
 		case "ID":
 			idName := s.server.idName
 			if idName == "" {
-				idName = "Sora-Proxy"
+				idName = "Sora"
 			}
 			version := s.server.idVersion
 			if version == "" {
