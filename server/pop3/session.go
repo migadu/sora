@@ -1564,8 +1564,8 @@ func (s *POP3Session) handleConnection() {
 				writer.WriteString("+ \r\n")
 				writer.Flush()
 
-				// Read the authentication data
-				authLine, err := reader.ReadString('\n')
+				// Read the authentication data (bounded to avoid a pre-auth memory blow-up)
+				authLine, err := server.ReadBoundedLine(reader, Pop3MaxLineLength)
 				if err != nil {
 					s.DebugLog("error reading auth data", "error", err)
 					recordMetrics("failure")

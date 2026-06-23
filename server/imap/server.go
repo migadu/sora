@@ -1632,6 +1632,31 @@ func (s *IMAPServer) filterCapabilitiesForClient(sessionCaps imap.CapSet, client
 		}
 	}
 
+	// Advertising IMAP4rev2 (RFC 9051) folds formerly-optional extensions
+	// (ESEARCH, SEARCHRES, CONDSTORE, QRESYNC, IDLE, MOVE, NAMESPACE, UIDPLUS,
+	// ...) into the base protocol. go-imap's CapSet.Has() therefore reports any
+	// of those as present whenever IMAP4rev2 is in the set — even after we delete
+	// the standalone capability key above. A client we identified as buggy (e.g.
+	// iOS Mail with broken ESEARCH/CONDSTORE) would consequently still be told the
+	// capability works, both in the CAPABILITY advertisement (which go-imap builds
+	// via Has()) and in the per-command capability gates (s.GetCapabilities().Has).
+	// When we disable any capability that IMAP4rev2 implies, also drop IMAP4rev2
+	// for this session: the client is downgraded to IMAP4rev1, where the surviving
+	// capabilities are advertised individually and the disabled ones are genuinely
+	// absent. The probe set reuses go-imap's own implication logic so this stays
+	// correct if the set of rev2-implied capabilities changes upstream.
+	if _, hasRev2 := sessionCaps[imap.CapIMAP4rev2]; hasRev2 {
+		rev2Probe := imap.CapSet{imap.CapIMAP4rev2: {}}
+		for _, capStr := range disabledCaps {
+			if rev2Probe.Has(imap.Cap(capStr)) {
+				delete(sessionCaps, imap.CapIMAP4rev2)
+				disabledCaps = append(disabledCaps, string(imap.CapIMAP4rev2))
+				logger.Debug("IMAP: Dropped IMAP4rev2 because a rev2-implied capability was filtered", "name", s.name, "trigger", capStr)
+				break
+			}
+		}
+	}
+
 	return disabledCaps
 }
 

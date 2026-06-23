@@ -55,7 +55,7 @@ func handleCreateAccount(ctx context.Context) {
 	email := fs.String("email", "", "Email address for the new account (required unless --credentials is provided)")
 	password := fs.String("password", "", "Password for the new account (required unless --password-hash or --credentials is provided)")
 	passwordHash := fs.String("password-hash", "", "Pre-computed password hash (alternative to --password)")
-	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512, sha512)")
+	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512)")
 	credentials := fs.String("credentials", "", "JSON string containing multiple credentials (alternative to single email/password)")
 
 	fs.Usage = func() {
@@ -68,7 +68,7 @@ Options:
   --email string         Email address for the new account (required unless --credentials is provided)
   --password string      Password for the new account (required unless --password-hash or --credentials is provided)
   --password-hash string Pre-computed password hash (alternative to --password)
-  --hash string          Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
+  --hash string          Password hash type: bcrypt, ssha512 (default: bcrypt)
   --credentials string   JSON string containing multiple credentials (alternative to single email/password)
 
 Examples:
@@ -118,7 +118,7 @@ Examples:
 	}
 
 	// Validate hash type
-	validHashTypes := []string{"bcrypt", "ssha512", "sha512"}
+	validHashTypes := []string{"bcrypt", "ssha512"} // sha512 (unsalted) dropped for new credentials; still verified for legacy accounts
 	hashTypeValid := false
 	for _, validType := range validHashTypes {
 		if *hashType == validType {
@@ -250,7 +250,7 @@ func handleUpdateAccount(ctx context.Context) {
 	password := fs.String("password", "", "New password for the account (optional if --password-hash or --make-primary is provided)")
 	passwordHash := fs.String("password-hash", "", "Pre-computed password hash (alternative to --password)")
 	makePrimary := fs.Bool("make-primary", false, "Make this credential the primary identity for the account")
-	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512, sha512)")
+	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512)")
 
 	// Database connection flags (overrides from config file)
 
@@ -265,7 +265,7 @@ Options:
   --password string      New password for the account (optional if --password-hash or --make-primary is provided)
   --password-hash string Pre-computed password hash (alternative to --password)
   --make-primary         Make this credential the primary identity for the account
-  --hash string          Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
+  --hash string          Password hash type: bcrypt, ssha512 (default: bcrypt)
 
 Examples:
   sora-admin --config config.toml accounts update --email user@example.com --password newpassword
@@ -301,7 +301,7 @@ Examples:
 	}
 
 	// Validate hash type
-	validHashTypes := []string{"bcrypt", "ssha512", "sha512"}
+	validHashTypes := []string{"bcrypt", "ssha512"} // sha512 (unsalted) dropped for new credentials; still verified for legacy accounts
 	hashTypeValid := false
 	for _, validType := range validHashTypes {
 		if *hashType == validType {

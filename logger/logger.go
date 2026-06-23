@@ -80,9 +80,20 @@ import (
 	"log/syslog"
 	"os"
 	"runtime"
+	"strings"
 
 	"github.com/migadu/sora/config"
 )
+
+// syslogLineSanitizer collapses CR/LF. Unlike Go's stdlib slog handlers (which
+// escape control chars), the syslog writer emits the message verbatim, so an
+// attacker-controlled field (username, mailbox name, …) could otherwise inject a
+// forged syslog line. sanitizeSyslogLine is applied to every syslog message.
+var syslogLineSanitizer = strings.NewReplacer("\n", "\\n", "\r", "\\r")
+
+func sanitizeSyslogLine(s string) string {
+	return syslogLineSanitizer.Replace(s)
+}
 
 var (
 	// Global logger instance
@@ -130,6 +141,9 @@ func (h *syslogHandler) Handle(_ context.Context, r slog.Record) error {
 			}
 		}
 	}
+
+	// Collapse CR/LF (message + attrs) to prevent log forging.
+	msg = sanitizeSyslogLine(msg)
 
 	switch r.Level {
 	case slog.LevelDebug:

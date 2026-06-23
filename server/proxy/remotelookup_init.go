@@ -2,12 +2,31 @@ package proxy
 
 import (
 	"fmt"
-	"github.com/migadu/sora/logger"
-
+	"net"
+	"net/url"
 	"strconv"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/logger"
 )
+
+// validateRemoteLookupURL requires https:// for non-loopback hosts. A plaintext
+// remote-lookup endpoint exposes the user's password and the returned password hash
+// to an on-path attacker, who can also forge the backend-routing response.
+func validateRemoteLookupURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid remotelookup.url: %w", err)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	host := u.Hostname()
+	if ip := net.ParseIP(host); host == "localhost" || (ip != nil && ip.IsLoopback()) {
+		return nil // http:// allowed only to loopback (dev/test)
+	}
+	return fmt.Errorf("remotelookup.url must use https:// for non-loopback hosts (got scheme %q); plaintext exposes credentials and password hashes", u.Scheme)
+}
 
 // InitializeRemoteLookup creates an HTTP remotelookup client from configuration
 func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig) (UserRoutingLookup, error) {
@@ -17,6 +36,9 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig) (Us
 
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("remotelookup.url is required when remotelookup is enabled")
+	}
+	if err := validateRemoteLookupURL(cfg.URL); err != nil {
+		return nil, err
 	}
 
 	// Get HTTP timeout

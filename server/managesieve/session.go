@@ -493,7 +493,7 @@ func (s *ManageSieveSession) handleConnection() {
 				literalContent := buf.Bytes()
 
 				// Read the trailing CRLF after literal (RFC 5804 compliance)
-				s.reader.ReadString('\n')
+				server.ReadBoundedLine(s.reader, ManageSieveMaxLineLength)
 
 				// Reset the metric timer NOW to exclude the time the client took to upload the script
 				start = time.Now()
@@ -563,7 +563,7 @@ func (s *ManageSieveSession) handleConnection() {
 				literalContent := buf.Bytes()
 
 				// Read the trailing CRLF after literal (RFC 5804 compliance)
-				s.reader.ReadString('\n')
+				server.ReadBoundedLine(s.reader, ManageSieveMaxLineLength)
 
 				// Reset the metric timer NOW to exclude the time the client took to upload the script
 				start = time.Now()
@@ -1055,7 +1055,9 @@ func (s *ManageSieveSession) handleCheckScript(content string) bool {
 	return true
 }
 
-func (s *ManageSieveSession) handleHaveSpace(name string, size int64) bool {
+// handleHaveSpace implements RFC 5804 HAVESPACE. The script name is part of the
+// command syntax but unused here: capacity is governed solely by maxScriptSize.
+func (s *ManageSieveSession) handleHaveSpace(_ string, size int64) bool {
 	// Check if the context is closing before proceeding.
 	if s.ctx.Err() != nil {
 		s.DebugLog("request aborted", "command", "HAVESPACE")
@@ -1404,7 +1406,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 			}
 
 			// Read the trailing CRLF after literal
-			s.reader.ReadString('\n')
+			server.ReadBoundedLine(s.reader, ManageSieveMaxLineLength)
 
 			authData = string(literalData)
 		} else {
@@ -1415,8 +1417,8 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 		// No initial response, send continuation
 		s.sendResponse("\"\"\r\n")
 
-		// Read the authentication data
-		authLine, err := s.reader.ReadString('\n')
+		// Read the authentication data (bounded to avoid a pre-auth memory blow-up)
+		authLine, err := server.ReadBoundedLine(s.reader, ManageSieveMaxLineLength)
 		if err != nil {
 			s.WarnLog("error reading auth data", "error", err)
 			s.sendResponse("NO Authentication failed\r\n")

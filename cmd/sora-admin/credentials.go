@@ -49,7 +49,7 @@ func handleAddCredential(ctx context.Context) {
 	password := fs.String("password", "", "Password for the new credential (required unless --password-hash is provided)")
 	passwordHash := fs.String("password-hash", "", "Pre-computed password hash (alternative to --password)")
 	makePrimary := fs.Bool("make-primary", false, "Make this the new primary identity for the account")
-	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512, sha512)")
+	hashType := fs.String("hash", "bcrypt", "Password hash type (bcrypt, ssha512)")
 
 	// Database connection flags (overrides from config file)
 
@@ -65,7 +65,7 @@ Options:
   --password string      Password for the new credential (required unless --password-hash is provided)
   --password-hash string Pre-computed password hash (alternative to --password)
   --make-primary         Make this the new primary identity for the account
-  --hash string          Password hash type: bcrypt, ssha512, sha512 (default: bcrypt)
+  --hash string          Password hash type: bcrypt, ssha512 (default: bcrypt)
 
 Examples:
   sora-admin --config config.toml credentials add --primary admin@example.com --email alias@example.com --password mypassword
@@ -105,7 +105,7 @@ Examples:
 	}
 
 	// Validate hash type
-	validHashTypes := []string{"bcrypt", "ssha512", "sha512"}
+	validHashTypes := []string{"bcrypt", "ssha512"} // sha512 (unsalted) dropped for new credentials; still verified for legacy accounts
 	hashTypeValid := false
 	for _, validType := range validHashTypes {
 		if *hashType == validType {
