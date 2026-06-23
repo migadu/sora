@@ -360,7 +360,10 @@ peers = []                                      # Initial seed nodes for cluster
                                                 # IMPORTANT: Do NOT include this node's own node_id in the peers list!
                                                 # Only list OTHER nodes in the cluster. Self-references will be filtered out
                                                 # automatically and a warning will be logged.
-secret_key = ""                                 # Cluster encryption key: base64-encoded 32-byte key (REQUIRED for production)
+secret_key = ""                                 # Cluster encryption key: base64-encoded 32-byte key.
+                                                # REQUIRED whenever cluster mode is enabled — the server refuses to
+                                                # start without it (gossip carries auth/rate-limit/kick state that an
+                                                # unencrypted channel would let any reachable host forge).
                                                 # Generate with: openssl rand -base64 32
 
 # --- GOSSIP EVENT QUEUE SETTINGS ---

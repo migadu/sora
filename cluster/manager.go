@@ -157,7 +157,16 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 		mlConfig.SecretKey = keyBytes
 		logger.Info("Cluster encryption enabled with secret key")
 	} else {
-		logger.Warn("Cluster encryption disabled - secret_key not configured (NOT recommended for production)")
+		// secret_key is mandatory when cluster mode is enabled. Gossip carries
+		// security-sensitive state (auth-failure counts, IP blocks, connection-kick
+		// commands); without encryption any host able to reach the gossip port can
+		// forge these messages. Fail closed rather than running unauthenticated.
+		logger.Error("Cluster mode ERROR: 'secret_key' is required when cluster mode is enabled")
+		logger.Error("Gossip carries auth-failure state, IP blocks, and connection-kick commands")
+		logger.Error("Without encryption, any host able to reach the gossip port can forge them")
+		logger.Error("Generate a key with: openssl rand -base64 32")
+		cancel()
+		return nil, fmt.Errorf("cluster secret_key is required when cluster mode is enabled (generate one with: openssl rand -base64 32)")
 	}
 
 	// Create memberlist
