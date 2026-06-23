@@ -823,6 +823,8 @@ trusted_networks = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/1
 # - lmtp_proxy: LMTP proxy server for load balancing
 # - metrics: Prometheus metrics HTTP endpoint
 # - http_admin_api: REST API server for administrative operations
+# - http_user_api: REST API server for user mailbox access (JWT auth)
+# - user_api_proxy: User API proxy server for load balancing
 #
 # IMPORTANT: You must configure at least one server for Sora to start.
 

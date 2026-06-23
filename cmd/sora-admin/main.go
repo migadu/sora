@@ -37,7 +37,6 @@ type AdminConfig struct {
 	SharedMailboxes           config.SharedMailboxesConfig `toml:"shared_mailboxes"`
 	TLS                       config.TLSConfig             `toml:"tls"` // TLS configuration for accessing Let's Encrypt S3 bucket
 	AdminCLI                  config.AdminCLIConfig        `toml:"admin_cli"`
-	Servers                   config.ServersConfig         // Server configs for fallback (e.g., IMAP append_limit)
 	DynamicServers            []config.ServerConfig        // Populated from full config
 	Server                    []map[string]any             `toml:"server"`                        // Ignore server config array, not needed for admin commands
 	HTTPAPIAddr               string                       `toml:"http_api_addr"`                 // HTTP API address for kick operations (e.g., "http://localhost:8080")
@@ -58,8 +57,8 @@ func (c *AdminConfig) GetImportMessageLimit() int64 {
 		}
 	}
 
-	// Priority 2: Fall back to IMAP append_limit (for backward compatibility)
-	if appendLimit, err := c.Servers.GetAppendLimit(); err == nil && appendLimit > 0 {
+	// Priority 2: Fall back to the configured IMAP server's append_limit
+	if appendLimit, err := config.IMAPAppendLimit(c.DynamicServers); err == nil && appendLimit > 0 {
 		return appendLimit
 	}
 
@@ -113,7 +112,6 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	cfg.SharedMailboxes = fullCfg.SharedMailboxes
 	cfg.TLS = fullCfg.TLS
 	cfg.AdminCLI = fullCfg.AdminCLI
-	cfg.Servers = fullCfg.Servers
 	cfg.DynamicServers = fullCfg.DynamicServers
 	cfg.HTTPAPIAddr = fullCfg.AdminCLI.Addr
 	cfg.HTTPAPIKey = fullCfg.AdminCLI.APIKey

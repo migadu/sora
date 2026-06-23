@@ -2065,22 +2065,20 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		return
 	}
 
-	// Collect valid backends from all proxy server configs
+	// Collect valid backends from all configured proxy servers ([[server]] entries).
 	validBackends := make(map[string][]string)
-
-	// Collect IMAP proxy backends
-	if deps.config.Servers.IMAPProxy.Start && len(deps.config.Servers.IMAPProxy.RemoteAddrs) > 0 {
-		validBackends["imap"] = append(validBackends["imap"], deps.config.Servers.IMAPProxy.RemoteAddrs...)
+	proxyProtocolByType := map[string]string{
+		"imap_proxy":        "imap",
+		"pop3_proxy":        "pop3",
+		"managesieve_proxy": "managesieve",
 	}
-
-	// Collect POP3 proxy backends
-	if deps.config.Servers.POP3Proxy.Start && len(deps.config.Servers.POP3Proxy.RemoteAddrs) > 0 {
-		validBackends["pop3"] = append(validBackends["pop3"], deps.config.Servers.POP3Proxy.RemoteAddrs...)
-	}
-
-	// Collect ManageSieve proxy backends
-	if deps.config.Servers.ManageSieveProxy.Start && len(deps.config.Servers.ManageSieveProxy.RemoteAddrs) > 0 {
-		validBackends["managesieve"] = append(validBackends["managesieve"], deps.config.Servers.ManageSieveProxy.RemoteAddrs...)
+	for _, srv := range deps.config.DynamicServers {
+		if !srv.IsEnabled() || len(srv.RemoteAddrs) == 0 {
+			continue
+		}
+		if protocol, ok := proxyProtocolByType[srv.Type]; ok {
+			validBackends[protocol] = append(validBackends[protocol], srv.RemoteAddrs...)
+		}
 	}
 
 	// Get TLS config from manager if TLS is enabled
