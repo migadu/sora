@@ -356,7 +356,8 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 		// Parse JSON response - if this fails on a 200 response, it's a server bug
 		var lookupResp HTTPRemoteLookupResponse
 		if err := json.Unmarshal(bodyBytes, &lookupResp); err != nil {
-			logger.Warn("remotelookup: Failed to parse JSON", "user", lookupEmail, "error", err, "body", string(bodyBytes))
+			// Do not log the body: a (partially) valid response can contain password_hash.
+			logger.Warn("remotelookup: Failed to parse JSON", "user", lookupEmail, "error", err, "body_len", len(bodyBytes))
 			return nil, fmt.Errorf("%w: failed to parse JSON response: %v", ErrRemoteLookupInvalidResponse, err)
 		}
 

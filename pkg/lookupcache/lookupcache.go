@@ -3,6 +3,7 @@ package lookupcache
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"sync"
@@ -153,9 +154,11 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 	// Hash the provided password for comparison
 	passwordHash := HashPassword(password)
 
-	// Check if password matches cached hash
-	// Note: entry.PasswordHash should never be empty for valid entries, but we check defensively
-	passwordMatches := (entry.PasswordHash != "" && entry.PasswordHash == passwordHash)
+	// Check if password matches cached hash (constant-time to avoid a timing oracle
+	// on the cached SHA-256 hex). Note: entry.PasswordHash should never be empty for
+	// valid entries, but we check defensively.
+	passwordMatches := entry.PasswordHash != "" &&
+		subtle.ConstantTimeCompare([]byte(entry.PasswordHash), []byte(passwordHash)) == 1
 
 	// Handle negative cache entries (failed authentication)
 	if entry.Result != AuthSuccess {

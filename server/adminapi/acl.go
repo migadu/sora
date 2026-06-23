@@ -62,7 +62,7 @@ func (s *Server) handleACLGrant(w http.ResponseWriter, r *http.Request) {
 	// Grant ACL
 	if err := aclSvc.Grant(r.Context(), req.Owner, req.Mailbox, req.Identifier, req.Rights); err != nil {
 		logger.Debug("Admin API: ACL grant failed", "error", err)
-		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
+		s.writeError(w, http.StatusInternalServerError, "Failed to grant ACL")
 		return
 	}
 
@@ -106,7 +106,7 @@ func (s *Server) handleACLRevoke(w http.ResponseWriter, r *http.Request) {
 	// Revoke ACL
 	if err := aclSvc.Revoke(r.Context(), req.Owner, req.Mailbox, req.Identifier); err != nil {
 		logger.Debug("Admin API: ACL revoke failed", "error", err)
-		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
+		s.writeError(w, http.StatusInternalServerError, "Failed to revoke ACL")
 		return
 	}
 
@@ -144,7 +144,7 @@ func (s *Server) handleACLList(w http.ResponseWriter, r *http.Request) {
 	acls, err := aclSvc.List(r.Context(), owner, mailbox)
 	if err != nil {
 		logger.Debug("Admin API: ACL list failed", "error", err)
-		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
+		s.writeError(w, http.StatusInternalServerError, "Failed to list ACLs")
 		return
 	}
 

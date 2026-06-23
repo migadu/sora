@@ -3,7 +3,7 @@
 // This package provides a production-ready POP3 server with:
 //   - RFC 1939 POP3 core protocol
 //   - RFC 1734 POP3 authentication (SASL)
-//   - TLS/STLS support
+//   - Implicit TLS (POP3S) support
 //   - UIDL (Unique ID Listing) support
 //   - Top command for message previews
 //   - Message deletion tracking
@@ -41,7 +41,6 @@
 //   - USER: Specify username
 //   - PASS: Provide password
 //   - QUIT: End session
-//   - STLS: Upgrade to TLS
 //
 // Transaction:
 //   - STAT: Get mailbox statistics

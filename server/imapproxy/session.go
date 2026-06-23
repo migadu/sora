@@ -721,7 +721,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	}
 
 	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods
-	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, nil, username); err != nil {
+	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, username); err != nil {
 		// Check if this is a rate limit error
 		var rateLimitErr *server.RateLimitError
 		if errors.As(err, &rateLimitErr) {

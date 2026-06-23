@@ -48,6 +48,15 @@ func (s *ManageSieveSession) sendRawLine(line string) {
 	s.writer.WriteString(line + "\r\n")
 }
 
+// quoteSieveString renders s as a ManageSieve quoted string (RFC 5804 §1.2),
+// escaping backslash and double-quote so an embedded quote in a script name or
+// client tag cannot break response framing.
+func quoteSieveString(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
+	return "\"" + s + "\""
+}
+
 func (s *ManageSieveSession) sendCapabilities() {
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
@@ -693,6 +702,15 @@ func (s *ManageSieveSession) handleConnection() {
 				recordMetrics("failure")
 				continue
 			}
+			// RFC 5804 §2.2 / RFC 3207: reject (and close) if the client pipelined any
+			// data after STARTTLS before the TLS handshake. Such buffered plaintext may
+			// be a MITM command-injection attempt; we must not process it post-TLS.
+			if s.reader.Buffered() > 0 {
+				s.WarnLog("STARTTLS rejected: client sent data before TLS handshake")
+				s.sendResponse("NO Pipelined data after STARTTLS is not allowed\r\n")
+				recordMetrics("failure")
+				return
+			}
 			s.sendResponse("OK Begin TLS negotiation\r\n")
 
 			// Upgrade the connection to TLS
@@ -746,7 +764,7 @@ func (s *ManageSieveSession) handleConnection() {
 			// sieve-connect uses this to verify capabilities were received
 			if len(parts) > 1 {
 				tag := server.UnquoteString(parts[1])
-				s.sendResponse(fmt.Sprintf("OK (TAG \"%s\") \"Done\"\r\n", tag))
+				s.sendResponse(fmt.Sprintf("OK (TAG %s) \"Done\"\r\n", quoteSieveString(tag)))
 			} else {
 				s.sendResponse("OK\r\n")
 			}
@@ -859,7 +877,7 @@ func (s *ManageSieveSession) handleListScripts() bool {
 	}
 
 	for _, script := range scripts {
-		line := fmt.Sprintf("\"%s\"", script.Name)
+		line := quoteSieveString(script.Name)
 		if script.Active {
 			line += " ACTIVE"
 		}

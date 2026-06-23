@@ -367,10 +367,12 @@ func (s *Server) setupRoutes() http.Handler {
 	mux.HandleFunc("/admin/affinity/list", routeHandler("GET", s.handleAffinityList))
 	mux.HandleFunc("/admin/affinity/stats", routeHandler("GET", s.handleAffinityStats))
 
-	// Wrap with middleware (in reverse order - last applied is outermost)
+	// Wrap with middleware (in reverse order - last applied is outermost).
+	// The host allowlist is outermost so off-allowlist clients are rejected before
+	// the bearer-token comparison runs at all.
 	handler := s.loggingMiddleware(mux)
-	handler = s.allowedHostsMiddleware(handler)
 	handler = s.authMiddleware(handler)
+	handler = s.allowedHostsMiddleware(handler)
 
 	return handler
 }
