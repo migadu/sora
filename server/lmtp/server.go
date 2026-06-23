@@ -125,6 +125,9 @@ type LMTPServerBackend struct {
 	relayQueue     delivery.RelayQueue // Disk-based queue for relay retry
 	relayWorker    RelayWorkerNotifier // Optional: notifies worker for immediate processing
 
+	redirectRateLimit  int
+	redirectRateWindow time.Duration
+
 	// Connection counters
 	totalConnections  atomic.Int64
 	activeConnections atomic.Int64
@@ -177,6 +180,8 @@ type LMTPServerOptions struct {
 	MaxMessageSize              int64    // Maximum size for incoming messages in bytes
 	SieveExtensions             []string // Sieve extensions to enable (nil/empty = all default extensions)
 	InsecureAuth                bool     // Allow PLAIN auth over non-TLS connections (default: true for LMTP behind trusted network)
+	RedirectRateLimit           int
+	RedirectRateWindow          time.Duration
 }
 
 func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -208,19 +213,21 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	}
 
 	backend := &LMTPServerBackend{
-		addr:           addr,
-		name:           name,
-		appCtx:         appCtx,
-		hostname:       hostname,
-		rdb:            rdb,
-		s3:             s3,
-		uploader:       uploadWorker,
-		debug:          options.Debug,
-		ftsRetention:   options.FTSRetention,
-		maxMessageSize: options.MaxMessageSize,
-		proxyReader:    proxyReader,
-		relayQueue:     options.RelayQueue,
-		relayWorker:    options.RelayWorker,
+		addr:               addr,
+		name:               name,
+		appCtx:             appCtx,
+		hostname:           hostname,
+		rdb:                rdb,
+		s3:                 s3,
+		uploader:           uploadWorker,
+		debug:              options.Debug,
+		ftsRetention:       options.FTSRetention,
+		maxMessageSize:     options.MaxMessageSize,
+		proxyReader:        proxyReader,
+		relayQueue:         options.RelayQueue,
+		relayWorker:        options.RelayWorker,
+		redirectRateLimit:  options.RedirectRateLimit,
+		redirectRateWindow: options.RedirectRateWindow,
 	}
 
 	// Create connection limiter with trusted networks from proxy configuration

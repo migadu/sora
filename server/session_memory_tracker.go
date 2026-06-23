@@ -52,6 +52,20 @@ func (t *SessionMemoryTracker) Allocate(bytes int64) error {
 	return nil
 }
 
+// CanAllocate reports whether allocating `bytes` more would stay within the limit,
+// WITHOUT committing the allocation. Use it to refuse an oversized read (e.g. a giant
+// message body) before pulling it into memory — the post-read Allocate() can only
+// detect the overrun after the OOM has already happened. (security-audit M13)
+func (t *SessionMemoryTracker) CanAllocate(bytes int64) bool {
+	if t.maxAllowed <= 0 {
+		return true // unlimited
+	}
+	if bytes < 0 {
+		return false
+	}
+	return t.allocatedBytes.Load()+bytes <= t.maxAllowed
+}
+
 // Free records memory deallocation
 func (t *SessionMemoryTracker) Free(bytes int64) {
 	if bytes < 0 {

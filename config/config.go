@@ -788,6 +788,8 @@ func (c *RemoteLookupConfig) GetRemotePort() (int, error) {
 type ServerLimitsConfig struct {
 	SearchRateLimitPerMin int    `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled)
 	SearchRateLimitWindow string `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
+	RedirectRateLimit     *int   `toml:"redirect_rate_limit,omitempty"`       // Redirect rate limit (per account across the window, 0=unlimited, default: 100)
+	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (default: 1h)
 	SessionMemoryLimit    string `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
 	MaxAuthErrors         int    `toml:"max_auth_errors,omitempty"`           // Maximum authentication errors before disconnection (default: 2)
 }
@@ -1177,6 +1179,22 @@ func (s *ServerConfig) GetSearchRateLimitWindow() (time.Duration, error) {
 		return helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
 	}
 	return time.Minute, nil // Default: 1 minute
+}
+
+// GetRedirectRateLimit returns the redirect rate limit
+func (s *ServerConfig) GetRedirectRateLimit() int {
+	if s.Limits != nil && s.Limits.RedirectRateLimit != nil {
+		return *s.Limits.RedirectRateLimit
+	}
+	return 100 // Default: 100
+}
+
+// GetRedirectRateWindow parses the redirect rate limit window duration
+func (s *ServerConfig) GetRedirectRateWindow() (time.Duration, error) {
+	if s.Limits != nil && s.Limits.RedirectRateWindow != "" {
+		return helpers.ParseDuration(s.Limits.RedirectRateWindow)
+	}
+	return time.Hour, nil // Default: 1 hour
 }
 
 // GetSessionMemoryLimit parses the session memory limit

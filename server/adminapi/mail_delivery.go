@@ -270,10 +270,12 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 	}
 
 	sieveExecutor := &delivery.StandardSieveExecutor{
-		DeliveryCtx:     deliveryCtx,
-		VacationOracle:  vacationOracle,
-		VacationHandler: vacationHandler,
-		RelayQueue:      s.relayQueue,
+		DeliveryCtx:        deliveryCtx,
+		VacationOracle:     vacationOracle,
+		VacationHandler:    vacationHandler,
+		RelayQueue:         s.relayQueue,
+		RedirectRateLimit:  s.redirectRateLimit,
+		RedirectRateWindow: s.redirectRateWindow,
 	}
 
 	deliveryCtx.SieveExecutor = sieveExecutor

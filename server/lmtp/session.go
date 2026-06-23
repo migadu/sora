@@ -512,6 +512,9 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			activeScript.UpdatedAt,
 			s.AccountID(),
 			sieveVacOracle,
+			sieveVacOracle,
+			s.backend.redirectRateLimit,
+			s.backend.redirectRateWindow,
 		)
 		if userScriptErr != nil {
 			s.WarnLog("failed to get/create sieve executor", "error", userScriptErr)

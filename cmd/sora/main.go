@@ -1326,6 +1326,12 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
 	}
 
+	redirectRateWindow, err := serverConfig.GetRedirectRateWindow()
+	if err != nil {
+		logger.Info("LMTP: Invalid redirect rate window - using default (1 hour)", "name", serverConfig.Name, "error", err)
+		redirectRateWindow = time.Hour
+	}
+
 	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
 		RelayQueue:           deps.relayQueue,  // Global relay queue
 		RelayWorker:          deps.relayWorker, // Global relay worker for immediate processing
@@ -1346,6 +1352,8 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		FTSRetention:         deps.ftsRetention,
 		SieveExtensions:      deps.config.Sieve.EnabledExtensions,
 		InsecureAuth:         serverConfig.InsecureAuth || !serverConfig.TLS, // Default true when TLS not enabled (LMTP behind trusted network)
+		RedirectRateLimit:    serverConfig.GetRedirectRateLimit(),
+		RedirectRateWindow:   redirectRateWindow,
 	})
 
 	if err != nil {
@@ -2123,6 +2131,12 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		}
 	}
 
+	redirectRateWindow, err := serverConfig.GetRedirectRateWindow()
+	if err != nil {
+		logger.Info("Admin API: Invalid redirect rate window - using default (1 hour)", "name", serverConfig.Name, "error", err)
+		redirectRateWindow = time.Hour
+	}
+
 	options := adminapi.ServerOptions{
 		Name:               serverConfig.Name,
 		Addr:               serverConfig.Addr,
@@ -2146,6 +2160,8 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		ConnectionTrackers: deps.connectionTrackers,
 		ProxyServers:       deps.proxyServers,
 		AuthCache:          deps.authCacheInstance,
+		RedirectRateLimit:  serverConfig.GetRedirectRateLimit(),
+		RedirectRateWindow: redirectRateWindow,
 	}
 
 	srv := adminapi.Start(ctx, deps.resilientDB, options, errChan)

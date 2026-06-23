@@ -65,6 +65,8 @@ type Server struct {
 	proxyServers       map[string]ProxyServer               // proxy name -> proxy server
 	proxyReader        *server.ProxyProtocolReader          // PROXY protocol support
 	authCache          AuthCacheStats                       // persistent auth cache (optional)
+	redirectRateLimit  int                                  // Max redirects per account
+	redirectRateWindow time.Duration                        // Window for redirect limit
 }
 
 // ServerOptions holds configuration options for the HTTP API server
@@ -91,6 +93,8 @@ type ServerOptions struct {
 	ConnectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker (for gossip-based kick)
 	ProxyServers       map[string]ProxyServer               // proxy name -> proxy server (for backend health)
 	AuthCache          AuthCacheStats                       // persistent auth cache (optional)
+	RedirectRateLimit  int
+	RedirectRateWindow time.Duration
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol               bool     // Enable PROXY protocol support for incoming connections
@@ -206,6 +210,8 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		proxyServers:       options.ProxyServers,
 		proxyReader:        proxyReader,
 		authCache:          options.AuthCache,
+		redirectRateLimit:  options.RedirectRateLimit,
+		redirectRateWindow: options.RedirectRateWindow,
 	}
 
 	return s, nil

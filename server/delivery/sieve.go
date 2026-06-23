@@ -38,6 +38,16 @@ func (o *VacationOracle) RecordVacationResponseSent(ctx context.Context, Account
 	return o.RDB.RecordVacationResponseWithRetry(ctx, AccountID, originalSender)
 }
 
+// CountRedirectsSince returns the number of redirects performed by the given account within the specified duration window.
+func (o *VacationOracle) CountRedirectsSince(ctx context.Context, accountID int64, window time.Duration) (int, error) {
+	return o.RDB.CountRedirectsSinceWithRetry(ctx, accountID, window)
+}
+
+// RecordRedirect records that a redirect action was performed.
+func (o *VacationOracle) RecordRedirect(ctx context.Context, accountID int64) error {
+	return o.RDB.RecordRedirectWithRetry(ctx, accountID)
+}
+
 // RelayQueue interface defines operations for queuing relay messages
 type RelayQueue interface {
 	Enqueue(from, to, messageType string, messageBytes []byte) error
@@ -45,11 +55,13 @@ type RelayQueue interface {
 
 // StandardSieveExecutor implements the standard Sieve execution flow.
 type StandardSieveExecutor struct {
-	DeliveryCtx     *DeliveryContext
-	VacationOracle  *VacationOracle
-	VacationHandler VacationHandler
-	RelayHandler    RelayHandler
-	RelayQueue      RelayQueue // Optional: disk-based queue for relay retry
+	DeliveryCtx        *DeliveryContext
+	VacationOracle     *VacationOracle
+	VacationHandler    VacationHandler
+	RelayHandler       RelayHandler
+	RelayQueue         RelayQueue // Optional: disk-based queue for relay retry
+	RedirectRateLimit  int
+	RedirectRateWindow time.Duration
 }
 
 // ExecuteSieve executes Sieve scripts and returns target mailbox.
@@ -81,7 +93,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	var result sieveengine.Result
 	if activeScript != nil {
 		// Execute user script
-		executor, err := sieveengine.NewSieveExecutorWithOracle(activeScript.Script, recipient.AccountID, s.VacationOracle)
+		executor, err := sieveengine.NewSieveExecutorWithOracle(activeScript.Script, recipient.AccountID, s.VacationOracle, s.VacationOracle, s.RedirectRateLimit, s.RedirectRateWindow)
 		if err != nil {
 			metrics.SieveExecutions.WithLabelValues(s.DeliveryCtx.MetricsLabel, "failure").Inc()
 			return mailboxName, false, nil, nil

@@ -198,7 +198,7 @@ func (c *SieveScriptCache) Size() int {
 }
 
 // GetOrCreate attempts to get a cached executor, or creates and caches it if not found
-func (c *SieveScriptCache) GetOrCreate(scriptContent string, AccountID int64, oracle sieveengine.VacationOracle) (sieveengine.Executor, error) {
+func (c *SieveScriptCache) GetOrCreate(scriptContent string, AccountID int64, vacOracle sieveengine.VacationOracle, redirectOracle sieveengine.RedirectOracle, redirectRateLimit int, redirectRateWindow time.Duration) (sieveengine.Executor, error) {
 	// Try to get from cache first
 	if executor, found := c.Get(scriptContent); found {
 		return executor, nil
@@ -212,7 +212,7 @@ func (c *SieveScriptCache) GetOrCreate(scriptContent string, AccountID int64, or
 	}
 
 	// Create new executor with configured extensions
-	executor, err := sieveengine.NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, oracle, extensions)
+	executor, err := sieveengine.NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, vacOracle, redirectOracle, redirectRateLimit, redirectRateWindow, extensions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sieve executor: %w", err)
 	}
@@ -224,7 +224,7 @@ func (c *SieveScriptCache) GetOrCreate(scriptContent string, AccountID int64, or
 }
 
 // GetOrCreateWithMetadata attempts to get a cached executor with validation, or creates and caches it if not found
-func (c *SieveScriptCache) GetOrCreateWithMetadata(scriptContent string, scriptID int64, updatedAt time.Time, AccountID int64, oracle sieveengine.VacationOracle) (sieveengine.Executor, error) {
+func (c *SieveScriptCache) GetOrCreateWithMetadata(scriptContent string, scriptID int64, updatedAt time.Time, AccountID int64, vacOracle sieveengine.VacationOracle, redirectOracle sieveengine.RedirectOracle, redirectRateLimit int, redirectRateWindow time.Duration) (sieveengine.Executor, error) {
 	c.mu.Lock()
 
 	key := hashScript(scriptContent)
@@ -258,7 +258,7 @@ func (c *SieveScriptCache) GetOrCreateWithMetadata(scriptContent string, scriptI
 	}
 
 	// Create new executor with configured extensions
-	executor, err := sieveengine.NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, oracle, extensions)
+	executor, err := sieveengine.NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, vacOracle, redirectOracle, redirectRateLimit, redirectRateWindow, extensions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sieve executor: %w", err)
 	}

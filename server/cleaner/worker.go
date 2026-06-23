@@ -37,6 +37,7 @@ type DatabaseManager interface {
 	CleanupFailedUploadsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupSoftDeletedAccountsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupOldVacationResponsesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
+	CleanupOldRedirectsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
 	ExecuteS3DeleteTxWithRetry(ctx context.Context, accountID int64, contentHash string, gracePeriod time.Duration, s3DeleteFunc func() error) (bool, error)
@@ -198,7 +199,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	}()
 
 	// Initialize counters for summary logging
-	var failedUploadsCount, deletedAccountCount, vacationCount, healthCount int64
+	var failedUploadsCount, deletedAccountCount, vacationCount, redirectCount, healthCount int64
 	var successfulDeletes []db.UserScopedObjectForCleanup
 	var orphanHashCount, finalizedAccountCount int64
 	var ftsPrunedCount int64
@@ -247,6 +248,17 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		// Continue with S3 cleanup even if vacation cleanup fails
 	} else if vacationCount > 0 {
 		logger.Info("Cleanup: Deleted old vacation responses", "count", vacationCount)
+	}
+
+	// Clean up old redirect-rate-limit log entries. Mirrors vacation cleanup: the
+	// redirect_log table accumulates one row per relayed SIEVE redirect, so it must
+	// be pruned or it grows unbounded. The grace period safely exceeds any redirect
+	// rate window (default 1h), so live rate-limit counts are never affected.
+	redirectCount, err = w.rdb.CleanupOldRedirectsWithRetry(ctx, w.gracePeriod)
+	if err != nil {
+		logger.Error("Cleanup: Failed to clean up old redirect log entries", "error", err)
+	} else if redirectCount > 0 {
+		logger.Info("Cleanup: Deleted old redirect log entries", "count", redirectCount)
 	}
 
 	// --- Cleanup of old health statuses ---
@@ -406,6 +418,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// Log cleanup cycle summary for observability
 	logger.Info("Cleanup: Cycle completed", "failed_uploads", failedUploadsCount,
 		"soft_deleted_accounts", deletedAccountCount, "vacation_responses", vacationCount,
+		"redirect_log", redirectCount,
 		"health_statuses", healthCount, "s3_objects", len(successfulDeletes),
 		"orphan_fts_hashes", orphanHashCount, "finalized_accounts", finalizedAccountCount,
 		"fts_pruned", ftsPrunedCount)

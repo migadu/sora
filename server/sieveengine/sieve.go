@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/mail"
 	"strings"
 	"time"
 
 	"github.com/emersion/go-message"
 	"github.com/migadu/go-sieve"
 	"github.com/migadu/go-sieve/interp"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/server/managesieve"
 )
 
@@ -71,6 +73,13 @@ type VacationOracle interface {
 	RecordVacationResponseSent(ctx context.Context, AccountID int64, originalSender string, handle string) error
 }
 
+// RedirectOracle defines the methods SievePolicy needs to interact with
+// persistent storage for redirect tracking.
+type RedirectOracle interface {
+	CountRedirectsSince(ctx context.Context, accountID int64, window time.Duration) (int, error)
+	RecordRedirect(ctx context.Context, accountID int64) error
+}
+
 type Executor interface {
 	Evaluate(evalCtx context.Context, ctx Context) (Result, error)
 }
@@ -111,13 +120,13 @@ func NewSieveExecutorWithExtensions(scriptContent string, enabledExtensions []st
 	}, nil
 }
 
-// NewSieveExecutorWithOracle creates a new SieveExecutor with the given script content, AccountID, and vacation oracle.
-func NewSieveExecutorWithOracle(scriptContent string, AccountID int64, oracle VacationOracle) (Executor, error) {
-	return NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, oracle, nil)
+// NewSieveExecutorWithOracle creates a new SieveExecutor with the given script content, AccountID, and oracles.
+func NewSieveExecutorWithOracle(scriptContent string, AccountID int64, vacOracle VacationOracle, redirectOracle RedirectOracle, redirectRateLimit int, redirectRateWindow time.Duration) (Executor, error) {
+	return NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, vacOracle, redirectOracle, redirectRateLimit, redirectRateWindow, nil)
 }
 
-// NewSieveExecutorWithOracleAndExtensions creates a new SieveExecutor with the given script content, AccountID, vacation oracle, and enabled extensions.
-func NewSieveExecutorWithOracleAndExtensions(scriptContent string, AccountID int64, oracle VacationOracle, enabledExtensions []string) (Executor, error) {
+// NewSieveExecutorWithOracleAndExtensions creates a new SieveExecutor with the given script content, AccountID, oracles, and enabled extensions.
+func NewSieveExecutorWithOracleAndExtensions(scriptContent string, AccountID int64, vacOracle VacationOracle, redirectOracle RedirectOracle, redirectRateLimit int, redirectRateWindow time.Duration, enabledExtensions []string) (Executor, error) {
 	scriptReader := strings.NewReader(scriptContent)
 	options := sieve.DefaultOptions()
 	options.EnabledExtensions = enabledExtensions
@@ -127,8 +136,11 @@ func NewSieveExecutorWithOracleAndExtensions(scriptContent string, AccountID int
 	}
 
 	policy := &SievePolicy{
-		AccountID:      AccountID,
-		vacationOracle: oracle,
+		AccountID:          AccountID,
+		vacationOracle:     vacOracle,
+		redirectOracle:     redirectOracle,
+		redirectRateLimit:  redirectRateLimit,
+		redirectRateWindow: redirectRateWindow,
 	}
 
 	return &SieveExecutor{
@@ -161,9 +173,12 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 	// Create a per-execution policy to ensure thread safety and isolation.
 	// The e.policy acts as a template containing configuration.
 	execPolicy := &SievePolicy{
-		AccountID:         e.policy.AccountID,
-		vacationOracle:    e.policy.vacationOracle,
-		vacationResponses: make(map[string]time.Time),
+		AccountID:          e.policy.AccountID,
+		vacationOracle:     e.policy.vacationOracle,
+		redirectOracle:     e.policy.redirectOracle,
+		redirectRateLimit:  e.policy.redirectRateLimit,
+		redirectRateWindow: e.policy.redirectRateWindow,
+		vacationResponses:  make(map[string]time.Time),
 	}
 
 	// Limit execution time of the Sieve script to prevent CPU/resource exhaustion
@@ -301,10 +316,42 @@ type SievePolicy struct {
 
 	AccountID      int64
 	vacationOracle VacationOracle
+
+	redirectOracle     RedirectOracle
+	redirectRateLimit  int
+	redirectRateWindow time.Duration
 }
 
 func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData, addr string) (bool, error) {
-	// For now, always allow redirects
+	// (3) Validate target. Malformed -> skip redirect, keep message.
+	// Note: go-sieve redirects to its own copy of addr; this is a format gate only.
+	if _, err := mail.ParseAddress(addr); err != nil {
+		return false, nil
+	}
+
+	// (2) Loop / backscatter suppression (RFC 5230-style).
+	headerGet := func(k string) []string {
+		vals, _ := d.Msg.HeaderGet(k)
+		return vals
+	}
+	if reason := helpers.ShouldSuppressAuto(d.Envelope.EnvelopeFrom(), headerGet); reason != "" {
+		return false, nil
+	}
+
+	// (1) Per-account rate limit.
+	if p.redirectOracle != nil && p.redirectRateLimit > 0 {
+		n, err := p.redirectOracle.CountRedirectsSince(ctx, p.AccountID, p.redirectRateWindow)
+		if err != nil {
+			// fail-closed-to-keep
+			return false, nil
+		}
+		if n >= p.redirectRateLimit {
+			return false, nil
+		}
+		if err := p.redirectOracle.RecordRedirect(ctx, p.AccountID); err != nil {
+			// Best effort, log error implicitly or explicitly if a logger becomes available in context
+		}
+	}
 	return true, nil
 }
 

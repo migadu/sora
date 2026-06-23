@@ -240,3 +240,29 @@ func (rd *ResilientDatabase) RecordVacationResponseWithRetry(ctx context.Context
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
 	return err
 }
+
+// Redirect rate limit methods
+
+// CountRedirectsSinceWithRetry returns the number of redirects performed by the given account within the specified duration window with retry logic
+func (rd *ResilientDatabase) CountRedirectsSinceWithRetry(ctx context.Context, AccountID int64, duration time.Duration) (int, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).CountRedirectsSince(ctx, AccountID, duration)
+	}
+
+	result, err := rd.executeReadWithRetry(ctx, sieveReadRetryConfig, timeoutRead, op)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.(int), nil
+}
+
+// RecordRedirectWithRetry records that a redirect action was performed with retry logic
+func (rd *ResilientDatabase) RecordRedirectWithRetry(ctx context.Context, AccountID int64) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RecordRedirect(ctx, tx, AccountID)
+	}
+
+	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
+	return err
+}

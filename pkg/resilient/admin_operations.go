@@ -283,6 +283,17 @@ func (rd *ResilientDatabase) CleanupOldVacationResponsesWithRetry(ctx context.Co
 	return result.(int64), nil
 }
 
+func (rd *ResilientDatabase) CleanupOldRedirectsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).CleanupOldRedirects(ctx, tx, gracePeriod)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
+}
+
 func (rd *ResilientDatabase) CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, true).CleanupOldHealthStatuses(ctx, tx, retention)

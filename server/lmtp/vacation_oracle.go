@@ -40,3 +40,13 @@ func (o *dbVacationOracle) RecordVacationResponseSent(ctx context.Context, Accou
 	// For this example, we'll ignore 'handle' for the DB recording.
 	return o.rdb.RecordVacationResponseWithRetry(ctx, AccountID, originalSender)
 }
+
+// CountRedirectsSince returns the number of redirects performed by the given account within the specified duration window.
+func (o *dbVacationOracle) CountRedirectsSince(ctx context.Context, accountID int64, window time.Duration) (int, error) {
+	return o.rdb.CountRedirectsSinceWithRetry(ctx, accountID, window)
+}
+
+// RecordRedirect records that a redirect action was performed.
+func (o *dbVacationOracle) RecordRedirect(ctx context.Context, accountID int64) error {
+	return o.rdb.RecordRedirectWithRetry(ctx, accountID)
+}

@@ -5,11 +5,11 @@ import (
 	"context"
 	"fmt"
 	"mime"
-	"strings"
 	"time"
 
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
 )
@@ -36,30 +36,22 @@ type StandardVacationHandler struct {
 }
 
 // shouldSuppressVacation implements RFC 5230 §4.5 mandatory suppression rules for
-// vacation auto-replies, returning a non-empty reason if a reply must NOT be sent:
-//   - null/empty sender (MAIL FROM:<>): bounce/DSN messages never get replies
-//   - Auto-Submitted (not "no"): messages from other auto-responders → loop risk
-//   - Precedence bulk/junk/list: mailing lists / mass mailings
-//   - List-Id present (RFC 2919): additional mailing-list safety net
+// vacation auto-replies, returning a non-empty reason if a reply must NOT be sent.
+// It delegates to the shared helpers.ShouldSuppressAuto.
 func shouldSuppressVacation(sender *server.Address, originalMessage *message.Entity) string {
-	if sender == nil || sender.FullAddress() == "" {
-		return "null or empty sender (bounce message)"
+	envFrom := ""
+	if sender != nil {
+		envFrom = sender.FullAddress()
 	}
-	if autoSubmitted := originalMessage.Header.Get("Auto-Submitted"); autoSubmitted != "" {
-		if strings.ToLower(strings.TrimSpace(autoSubmitted)) != "no" {
-			return fmt.Sprintf("Auto-Submitted: %s", autoSubmitted)
+
+	headerGet := func(k string) []string {
+		if val := originalMessage.Header.Get(k); val != "" {
+			return []string{val}
 		}
+		return nil
 	}
-	if precedence := originalMessage.Header.Get("Precedence"); precedence != "" {
-		p := strings.ToLower(strings.TrimSpace(precedence))
-		if p == "bulk" || p == "junk" || p == "list" {
-			return fmt.Sprintf("Precedence: %s", precedence)
-		}
-	}
-	if listID := originalMessage.Header.Get("List-Id"); listID != "" {
-		return fmt.Sprintf("List-Id: %s", listID)
-	}
-	return ""
+
+	return helpers.ShouldSuppressAuto(envFrom, headerGet)
 }
 
 // log emits a message via the optional Logger.

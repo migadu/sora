@@ -287,6 +287,14 @@ func (m *mockVacationOracle) RecordVacationResponseSent(ctx context.Context, acc
 	return nil
 }
 
+func (m *mockVacationOracle) CountRedirectsSince(ctx context.Context, accountID int64, window time.Duration) (int, error) {
+	return 0, nil
+}
+
+func (m *mockVacationOracle) RecordRedirect(ctx context.Context, accountID int64) error {
+	return nil
+}
+
 func (m *mockVacationOracle) makeKey(accountID int64, originalSender string, handle string) string {
 	return string(rune(accountID)) + ":" + originalSender + ":" + handle
 }
@@ -303,7 +311,7 @@ if not header :contains "precedence" ["list", "bulk", "junk"] {
 
 	oracle := newMockVacationOracle()
 	enabledExtensions := []string{"envelope", "fileinto", "redirect", "encoded-character", "imap4flags", "variables", "relational", "vacation", "copy", "regex"}
-	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 6007, oracle, enabledExtensions)
+	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 6007, oracle, oracle, 10, time.Hour, enabledExtensions)
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
@@ -349,7 +357,7 @@ keep;
 
 	oracle := newMockVacationOracle()
 	enabledExtensions := []string{"vacation"}
-	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, enabledExtensions)
+	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, enabledExtensions)
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
@@ -386,7 +394,7 @@ discard;
 
 	oracle := newMockVacationOracle()
 	enabledExtensions := []string{"vacation"}
-	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, enabledExtensions)
+	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, enabledExtensions)
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
@@ -421,7 +429,7 @@ fileinto "Archive";
 
 	oracle := newMockVacationOracle()
 	enabledExtensions := []string{"vacation", "fileinto"}
-	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, enabledExtensions)
+	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, enabledExtensions)
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
@@ -462,7 +470,7 @@ vacation :days 7 :subject "Away" "I'm away";
 
 	oracle := newMockVacationOracle()
 	enabledExtensions := []string{"vacation"}
-	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, enabledExtensions)
+	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, enabledExtensions)
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
@@ -489,7 +497,7 @@ vacation :days 7 :subject "Away" "I'm away";
 
 	// Second evaluation immediately after - should NOT trigger vacation (rate limited)
 	// Need to create new executor instance to simulate new message evaluation
-	executor2, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, enabledExtensions)
+	executor2, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, enabledExtensions)
 	if err != nil {
 		t.Fatalf("Failed to create executor (second): %v", err)
 	}
@@ -516,7 +524,7 @@ if not header :contains "precedence" ["list", "bulk", "junk"] {
 
 	oracle := newMockVacationOracle()
 	enabledExtensions := []string{"vacation"}
-	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, enabledExtensions)
+	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, enabledExtensions)
 	if err != nil {
 		t.Fatalf("Failed to create executor: %v", err)
 	}
@@ -620,7 +628,7 @@ if header :contains "From" "@gmail.com" {
 			// Create a fresh oracle and executor for each test to avoid rate limiting
 			oracle := newMockVacationOracle()
 			enabledExtensions := []string{"vacation"}
-			executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, enabledExtensions)
+			executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, enabledExtensions)
 			if err != nil {
 				t.Fatalf("Failed to create executor: %v", err)
 			}
