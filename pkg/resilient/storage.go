@@ -270,6 +270,24 @@ func (rs *ResilientS3Storage) PutWithRetry(ctx context.Context, key string, body
 	return err
 }
 
+func (rs *ResilientS3Storage) CopyWithRetry(ctx context.Context, sourcePath, destPath string) error {
+	config := retry.BackoffConfig{
+		InitialInterval: 1 * time.Second,
+		MaxInterval:     30 * time.Second,
+		Multiplier:      2.0,
+		Jitter:          true,
+		MaxRetries:      3,
+		OperationName:   "s3_copy",
+	}
+
+	op := func() (any, error) {
+		return nil, rs.storage.Copy(sourcePath, destPath)
+	}
+	// Copy behaves somewhat like a Put in terms of failure modes and resource usage
+	_, err := rs.executeS3OperationWithRetry(ctx, rs.putBreaker, config, rs.isRetryableError, op, destPath, "COPY")
+	return err
+}
+
 // IsHealthy returns true if S3 circuit breakers are not open (S3 is reachable).
 // Used by the cleaner to skip destructive operations when S3 is down.
 func (rs *ResilientS3Storage) IsHealthy() bool {

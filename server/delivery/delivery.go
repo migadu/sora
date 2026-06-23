@@ -36,6 +36,7 @@ type DeliveryContext struct {
 	MetricsLabel  string // "lmtp" or "http_delivery"
 	SieveExecutor SieveExecutor
 	Logger        Logger
+	OwnerResolver *resilient.OwnerResolver
 }
 
 // Logger interface for logging delivery operations.
@@ -191,15 +192,53 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		}
 	}
 
+	// Resolve the mailbox to get its ID and Owner
+	mailbox, err := d.RDB.GetMailboxByNameWithRetry(d.Ctx, recipient.AccountID, mailboxName)
+	if err != nil {
+		if err == consts.ErrMailboxNotFound {
+			mailbox, err = d.RDB.GetMailboxByNameWithRetry(d.Ctx, recipient.AccountID, consts.MailboxInbox)
+			if err != nil {
+				result.ErrorMessage = fmt.Sprintf("Failed to get INBOX: %v", err)
+				return result, err
+			}
+		} else {
+			result.ErrorMessage = fmt.Sprintf("Failed to get mailbox '%s': %v", mailboxName, err)
+			return result, err
+		}
+	}
+
+	// Determine destination owner
+	destAccountID := mailbox.AccountID
+
+	if d.OwnerResolver == nil {
+		d.OwnerResolver = resilient.NewOwnerResolver(d.RDB)
+	}
+
+	destS3Domain, destS3Localpart, err := d.OwnerResolver.ResolveDestinationOwner(d.Ctx, destAccountID, recipient.AccountID, recipient.Address.Domain(), recipient.Address.LocalPart())
+	if err != nil {
+		result.ErrorMessage = fmt.Sprintf("Failed to resolve owner for destination mailbox '%s': %v", mailbox.Name, err)
+		return result, err
+	}
+
+	if destAccountID != recipient.AccountID {
+		sourcePath := d.Uploader.FilePath(contentHash, recipient.AccountID)
+		destPath := d.Uploader.FilePath(contentHash, destAccountID)
+		if sourcePath != destPath {
+			if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
+				d.Logger.Log("failed to stage local file for cross-account delivery: %v", err)
+			}
+		}
+	}
+
 	// Save message to mailbox
 	size := int64(len(messageBytes))
 	_, messageUID, err := d.RDB.InsertMessageWithRetry(d.Ctx,
 		&db.InsertMessageOptions{
-			AccountID:            recipient.AccountID,
-			MailboxID:            0, // Will be set by InsertMessage based on mailboxName
-			S3Domain:             recipient.Address.Domain(),
-			S3Localpart:          recipient.Address.LocalPart(),
-			MailboxName:          mailboxName,
+			AccountID:            destAccountID,
+			MailboxID:            mailbox.ID,
+			S3Domain:             destS3Domain,
+			S3Localpart:          destS3Localpart,
+			MailboxName:          mailbox.Name,
 			ContentHash:          contentHash,
 			MessageID:            messageID,
 			InternalDate:         time.Now(),
@@ -220,7 +259,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			ContentHash: contentHash,
 			InstanceID:  d.Hostname,
 			Size:        size,
-			AccountID:   recipient.AccountID,
+			AccountID:   destAccountID,
 		})
 
 	if err != nil {
@@ -379,14 +418,38 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 	bodyStructure := &bodyStructureVal
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
 
+	// Determine destination owner
+	destAccountID := mailbox.AccountID
+
+	// Lazy-init OwnerResolver for tests or contexts where it wasn't pre-populated
+	if d.OwnerResolver == nil {
+		d.OwnerResolver = resilient.NewOwnerResolver(d.RDB)
+	}
+
+	destS3Domain, destS3Localpart, err := d.OwnerResolver.ResolveDestinationOwner(ctx, destAccountID, recipient.AccountID, recipient.Address.Domain(), recipient.Address.LocalPart())
+	if err != nil {
+		return fmt.Errorf("failed to resolve owner for destination mailbox '%s': %v", mailbox.Name, err)
+	}
+
+	if destAccountID != recipient.AccountID {
+		// Ensure the local file exists under the destination owner's staging directory.
+		sourcePath := d.Uploader.FilePath(contentHash, recipient.AccountID)
+		destPath := d.Uploader.FilePath(contentHash, destAccountID)
+		if sourcePath != destPath {
+			if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
+				d.Logger.Log("failed to stage local file for cross-account delivery: %v", err)
+			}
+		}
+	}
+
 	size := int64(len(messageBytes))
 
 	_, _, err = d.RDB.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
-			AccountID:     recipient.AccountID,
+			AccountID:     destAccountID,
 			MailboxID:     mailbox.ID,
-			S3Domain:      recipient.Address.Domain(),
-			S3Localpart:   recipient.Address.LocalPart(),
+			S3Domain:      destS3Domain,
+			S3Localpart:   destS3Localpart,
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,
@@ -406,7 +469,7 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 			ContentHash: contentHash,
 			InstanceID:  d.Hostname,
 			Size:        size,
-			AccountID:   recipient.AccountID,
+			AccountID:   destAccountID,
 		})
 
 	return err

@@ -21,6 +21,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/delivery"
 	"github.com/migadu/sora/server/sieveengine"
@@ -58,6 +59,7 @@ type LMTPSession struct {
 	conn          *smtp.Conn
 	cancel        context.CancelFunc
 	ctx           context.Context
+	ownerResolver *resilient.OwnerResolver
 	mutex         sync.RWMutex
 	mutexHelper   *server.MutexTimeoutHelper
 	releaseConn   func() // Function to release connection from limiter
@@ -978,16 +980,41 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 		}
 	}
 
+	// Determine destination owner
+	destAccountID := mailbox.AccountID
+
+	// Lazy-init ownerResolver
+	if s.ownerResolver == nil {
+		s.ownerResolver = resilient.NewOwnerResolver(s.backend.rdb)
+	}
+
+	destS3Domain, destS3Localpart, ownerErr := s.ownerResolver.ResolveDestinationOwner(readCtx, destAccountID, s.AccountID(), s.User.Domain(), s.User.LocalPart())
+	if ownerErr != nil {
+		return fmt.Errorf("failed to resolve owner for destination mailbox '%s': %v", mailbox.Name, ownerErr)
+	}
+
+	if destAccountID != s.AccountID() {
+
+		// Ensure the local file exists under the destination owner's staging directory.
+		// The original was staged under s.AccountID() by StoreLocally before Sieve.
+		sourcePath := s.backend.uploader.FilePath(contentHash, s.AccountID())
+		destPath := s.backend.uploader.FilePath(contentHash, destAccountID)
+		if sourcePath != destPath {
+			if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
+				s.WarnLog("failed to stage local file for cross-account LMTP delivery", "source", sourcePath, "dest", destPath, "error", err)
+			}
+		}
+	}
+
 	size := int64(len(fullMessageBytes))
 
-	// User.Address is always the primary address (set during RCPT TO)
 	// No need to query - it's already cached in the session
 	_, messageUID, err := s.backend.rdb.InsertMessageWithRetry(s.ctx,
 		&db.InsertMessageOptions{
-			AccountID:     s.AccountID(),
+			AccountID:     destAccountID,
 			MailboxID:     mailbox.ID,
-			S3Domain:      s.User.Domain(),
-			S3Localpart:   s.User.LocalPart(),
+			S3Domain:      destS3Domain,
+			S3Localpart:   destS3Localpart,
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,
@@ -1007,7 +1034,7 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 			ContentHash: contentHash,
 			InstanceID:  s.backend.hostname,
 			Size:        size,
-			AccountID:   s.AccountID(),
+			AccountID:   destAccountID,
 		})
 
 	if err != nil {

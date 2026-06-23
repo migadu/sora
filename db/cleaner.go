@@ -108,6 +108,25 @@ func (d *Database) IsS3ObjectOrphan(ctx context.Context, tx pgx.Tx, accountID in
 func (d *Database) ExpungeOldMessages(ctx context.Context, tx pgx.Tx, olderThan time.Duration) (int64, error) {
 	threshold := time.Now().Add(-olderThan).UTC()
 
+	// Lock the affected mailbox rows (ascending id) before the bulk expunge, so the
+	// stats triggers serialize against concurrent STORE/EXPUNGE/MOVE on those
+	// mailboxes (see lockMailboxStats) and unseen_count cannot drift. Acquiring the
+	// mailbox rows first preserves the global lock order (mailbox row → message rows
+	// → mailbox_stats via trigger), so this stays deadlock-free against every other
+	// path. This is a cross-mailbox bulk op that can lock many rows, but it runs only
+	// in the cleaner under the cleanup lock when max_age_restriction is configured.
+	if _, err := tx.Exec(ctx, `
+		SELECT id FROM mailboxes
+		WHERE id IN (
+			SELECT DISTINCT mailbox_id FROM messages
+			WHERE created_at < $1 AND expunged_at IS NULL AND mailbox_id IS NOT NULL
+		)
+		ORDER BY id
+		FOR UPDATE
+	`, threshold); err != nil {
+		return 0, fmt.Errorf("failed to lock mailboxes for age-based expunge: %w", err)
+	}
+
 	result, err := tx.Exec(ctx, `
 		UPDATE messages
 		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')

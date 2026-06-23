@@ -153,9 +153,9 @@ func (rd *ResilientDatabase) SearchMessagesSortedWithRetry(ctx context.Context, 
 	return result.([]db.SearchMessageResult), nil
 }
 
-func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, AccountID int64) (map[imap.UID]imap.UID, error) {
+func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).MoveMessages(ctx, tx, ids, srcMailboxID, destMailboxID, AccountID)
+		return rd.getOperationalDatabaseForOperation(ctx, true).MoveMessages(ctx, tx, ids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	if err != nil {

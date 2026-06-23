@@ -140,7 +140,7 @@ func TestMoveMessages(t *testing.T) {
 	defer tx.Rollback(ctx)
 
 	uids := []imap.UID{messageUID}
-	uidMapping, err := db.MoveMessages(ctx, tx, &uids, srcMailboxID, destMailboxID, accountID)
+	uidMapping, err := db.MoveMessages(ctx, tx, &uids, srcMailboxID, destMailboxID, accountID, "example.com", "user", "")
 	assert.NoError(t, err)
 	assert.NotEmpty(t, uidMapping)
 	assert.Contains(t, uidMapping, messageUID)
@@ -174,7 +174,7 @@ func TestMoveMessages(t *testing.T) {
 	defer tx2.Rollback(ctx)
 
 	nonExistentUIDs := []imap.UID{9999}
-	uidMapping, err = db.MoveMessages(ctx, tx2, &nonExistentUIDs, srcMailboxID, destMailboxID, accountID)
+	uidMapping, err = db.MoveMessages(ctx, tx2, &nonExistentUIDs, srcMailboxID, destMailboxID, accountID, "example.com", "user", "")
 	assert.NoError(t, err)
 	assert.Empty(t, uidMapping) // No messages to move
 
@@ -359,7 +359,7 @@ func TestCopyMessagesAdvanced(t *testing.T) {
 	defer tx.Rollback(ctx)
 
 	uids := []imap.UID{messageUID}
-	_, err = db.CopyMessages(ctx, tx, &uids, srcMailboxID, srcMailboxID, accountID)
+	_, err = db.CopyMessages(ctx, tx, &uids, srcMailboxID, srcMailboxID, accountID, "example.com", "user", "")
 	assert.Error(t, err) // Should fail - same source and destination
 
 	tx.Rollback(ctx)
@@ -373,7 +373,7 @@ func TestCopyMessagesAdvanced(t *testing.T) {
 	srcMsgCountBefore, _, srcSizeBefore := getMoveExpungeMailboxStats(t, db, ctx, srcMailboxID)
 	destMsgCountBefore, _, destSizeBefore := getMoveExpungeMailboxStats(t, db, ctx, destMailboxID)
 
-	uidMapping, err := db.CopyMessages(ctx, tx2, &uids, srcMailboxID, destMailboxID, accountID)
+	uidMapping, err := db.CopyMessages(ctx, tx2, &uids, srcMailboxID, destMailboxID, accountID, "example.com", "user", "")
 	assert.NoError(t, err)
 	assert.NotEmpty(t, uidMapping)
 	assert.Contains(t, uidMapping, messageUID)

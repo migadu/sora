@@ -11,7 +11,7 @@ import (
 	"github.com/migadu/sora/logger"
 )
 
-func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID, srcMailboxID, destMailboxID int64, AccountID int64) (map[imap.UID]imap.UID, error) {
+func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, error) {
 	// Map to store the original UID to new UID mapping
 	messageUIDMap := make(map[imap.UID]imap.UID)
 
@@ -168,9 +168,9 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		_, err = tx.Exec(ctx, `
 			WITH src_data AS (
 				SELECT
-					m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
+					m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
 					m.subject, m.sent_date, m.internal_date, m.size,
-					m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
+					m.body_structure, m.recipients_json,
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort,
 					m.id AS original_id,
 					d.new_uid,
@@ -187,9 +187,9 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					mailbox_id, mailbox_path, created_modseq, uid
 				)
 				SELECT
-					account_id, content_hash, uploaded, message_id, in_reply_to,
+					$6 AS account_id, content_hash, uploaded, message_id, in_reply_to,
 					subject, sent_date, internal_date, size,
-					body_structure, recipients_json, s3_domain, s3_localpart,
+					body_structure, recipients_json, $7 AS s3_domain, $8 AS s3_localpart,
 					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
 					$1 AS mailbox_id,
 					$2 AS mailbox_path,
@@ -203,11 +203,21 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 			FROM inserted i
 			JOIN src_data s ON s.new_uid = i.uid
 			JOIN message_state ms ON ms.message_id = s.original_id
-		`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon)
+		`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart)
 		if err != nil {
 			logger.Error("Database: failed to batch insert messages into destination mailbox", "err", err)
 			return nil, fmt.Errorf("failed to move messages: %w", err)
 		}
+	}
+
+	// Re-stage uploads for any moved rows whose body is not yet in S3, so the
+	// background uploader writes the body under the destination owner's S3 path
+	// and marks the new row uploaded. Without this, a cross-account move of a
+	// not-yet-uploaded message would never reach the owner's path and would
+	// become unreadable once local staging is cleaned up. ON CONFLICT makes this
+	// a no-op for same-account moves (the source's pending_upload still applies).
+	if err := db.restagePendingUploads(ctx, tx, destMailboxID, newUIDs, instanceID); err != nil {
+		return nil, err
 	}
 
 	// Mark the original messages as expunged in the source mailbox

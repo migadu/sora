@@ -28,7 +28,7 @@ func truncateHash(hash string) string {
 
 // CopyMessages copies multiple messages from a source mailbox to a destination mailbox within a given transaction.
 // It returns a map of old UIDs to new UIDs.
-func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, AccountID int64) (map[imap.UID]imap.UID, error) {
+func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, error) {
 	messageUIDMap := make(map[imap.UID]imap.UID)
 	if srcMailboxID == destMailboxID {
 		return nil, fmt.Errorf("source and destination mailboxes cannot be the same")
@@ -99,9 +99,9 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	_, err = tx.Exec(ctx, `
 		WITH src_data AS (
 			SELECT
-				m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
+				m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
 				m.subject, m.sent_date, m.internal_date, m.size,
-				m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
+				m.body_structure, m.recipients_json,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort,
 				m.id AS original_id,
 				d.new_uid,
@@ -118,9 +118,9 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				mailbox_id, mailbox_path, created_modseq, uid
 			)
 			SELECT
-				account_id, content_hash, uploaded, message_id, in_reply_to,
+				$6 AS account_id, content_hash, uploaded, message_id, in_reply_to,
 				subject, sent_date, internal_date, size,
-				body_structure, recipients_json, s3_domain, s3_localpart,
+				body_structure, recipients_json, $7 AS s3_domain, $8 AS s3_localpart,
 				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
 				$1 AS mailbox_id,
 				$2 AS mailbox_path,
@@ -134,12 +134,46 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		FROM inserted i
 		JOIN src_data s ON s.new_uid = i.uid
 		JOIN message_state ms ON ms.message_id = s.original_id
-	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon)
+	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart)
 	if err != nil {
 		return nil, fmt.Errorf("failed to batch copy messages: %w", err)
 	}
 
+	// Re-stage uploads for any copied rows whose body is not yet in S3, so the
+	// background uploader writes the body under the destination owner's S3 path
+	// (s3_domain/s3_localpart) and marks the new row uploaded. Without this, a
+	// cross-account copy of a not-yet-uploaded message would never reach the
+	// owner's path and would become unreadable once local staging is cleaned up.
+	// ON CONFLICT makes this a no-op for same-account copies, where the source's
+	// pending_upload already covers (content_hash, account_id).
+	if err := db.restagePendingUploads(ctx, tx, destMailboxID, newUIDs, instanceID); err != nil {
+		return nil, err
+	}
+
 	return messageUIDMap, nil
+}
+
+// restagePendingUploads ensures every just-inserted, not-yet-uploaded message in
+// (mailboxID, newUIDs) has a pending_upload under its own account so the uploader
+// writes the body under that account's S3 path. The local staging file must already
+// exist under FilePath(content_hash, account_id) (the caller hardlinks it for
+// cross-account inserts). instanceID must be the hostname of the server holding the
+// local file so its own worker, not a peer, picks the task up.
+func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailboxID int64, newUIDs []int64, instanceID string) error {
+	if len(newUIDs) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
+		SELECT $1, m.content_hash, m.size, NOW(), m.account_id
+		FROM messages m
+		WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.uploaded = FALSE AND m.expunged_at IS NULL
+		ON CONFLICT (content_hash, account_id) DO NOTHING`,
+		instanceID, mailboxID, newUIDs)
+	if err != nil {
+		return fmt.Errorf("failed to re-stage pending uploads: %w", err)
+	}
+	return nil
 }
 
 type InsertMessageOptions struct {

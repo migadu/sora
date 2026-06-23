@@ -7,6 +7,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 )
 
 func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData, error) {
@@ -84,8 +85,55 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 		sourceUIDs = append(sourceUIDs, msg.UID)
 	}
 
+	// Identify cross-account operations and relocate S3 objects if necessary.
+	destS3Domain := s.Session.User.Domain()
+	destS3Localpart := s.Session.User.LocalPart()
+	if destMailbox.AccountID != s.AccountID() {
+		domain, localpart, err := s.server.rdb.ResolveAccountS3Owner(s.ctx, destMailbox.AccountID)
+		if err != nil {
+			return nil, s.internalError("failed to resolve owner for destination mailbox: %v", err)
+		}
+		destS3Domain = domain
+		destS3Localpart = localpart
+	}
+
+	for _, msg := range messages {
+		if msg.AccountID == destMailbox.AccountID {
+			continue // Same owner: body already lives under the correct S3 path.
+		}
+		// Cross-account copy: the new row will be owned by the destination mailbox
+		// owner, so the body must be reachable under the owner's S3 path.
+		if msg.IsUploaded {
+			// Body is in S3 under the source's path; copy it to the owner's path
+			// (skip if the owner already has it, e.g. via dedup).
+			sourceKey := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
+			destKey := helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash)
+			exists, err := s.server.s3.ExistsWithRetry(s.ctx, destKey)
+			if err != nil {
+				s.WarnLog("failed to check if S3 object exists at destination", "destKey", destKey, "error", err)
+			}
+			if !exists {
+				if err := s.server.s3.CopyWithRetry(s.ctx, sourceKey, destKey); err != nil {
+					return nil, s.internalError("failed to copy S3 object for message: %v", err)
+				}
+			}
+		} else if s.server.uploader != nil {
+			// Body is still staged locally under the source account. Hardlink it to
+			// the owner's staging path so the uploader (re-staged in CopyMessages)
+			// uploads it under the owner's path. Failing here would silently lose the
+			// body, so treat it as fatal rather than warning and proceeding.
+			sourcePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
+			destPath := s.server.uploader.FilePath(msg.ContentHash, destMailbox.AccountID)
+			if sourcePath != destPath {
+				if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
+					return nil, s.internalError("failed to stage local file for cross-account copy: %v", err)
+				}
+			}
+		}
+	}
+
 	// Perform the batch copy operation
-	uidMap, err := s.server.rdb.CopyMessagesWithRetry(s.ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, AccountID)
+	uidMap, err := s.server.rdb.CopyMessagesWithRetry(s.ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname)
 	if err != nil {
 		// Return proper IMAP NO for user errors instead of [SERVERBUG]
 		if strings.Contains(err.Error(), "source and destination mailboxes cannot be the same") {

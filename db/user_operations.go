@@ -526,6 +526,14 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		return fmt.Errorf("failed to get current flags: %w", err)
 	}
 
+	// Serialize unseen_count maintenance for this mailbox (see lockMailboxStats)
+	// before mutating flags. Without this, a User API flag change racing an IMAP/POP3
+	// EXPUNGE on the same message double-counts the "no longer unseen" event and
+	// drifts unseen_count negative — the same bug the IMAP paths already guard against.
+	if err = lockMailboxStats(ctx, tx, mailboxID); err != nil {
+		return err
+	}
+
 	var customFlags []string
 	if len(currentCustomFlags) > 0 {
 		json.Unmarshal(currentCustomFlags, &customFlags)

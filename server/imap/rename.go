@@ -97,8 +97,15 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 				uids[i] = msg.UID
 			}
 
-			// 4. Move all messages from INBOX to the new mailbox
-			_, err = s.server.rdb.MoveMessagesWithRetry(s.ctx, &uids, oldMailbox.ID, newMailbox.ID, AccountID)
+			// 4. Move all messages from INBOX to the new mailbox. This is a
+			// same-account move, so the S3 owner is the account itself; resolve it
+			// rather than swallowing the error (an empty domain/localpart would
+			// corrupt the moved messages' S3 paths).
+			domain, localpart, resolveErr := s.server.rdb.ResolveAccountS3Owner(s.ctx, AccountID)
+			if resolveErr != nil {
+				return s.internalError("failed to resolve S3 owner for INBOX rename: %v", resolveErr)
+			}
+			_, err = s.server.rdb.MoveMessagesWithRetry(s.ctx, &uids, oldMailbox.ID, newMailbox.ID, AccountID, domain, localpart, s.server.hostname)
 		}
 		if err != nil {
 			return s.internalError("failed to move messages from INBOX to '%s': %v", newName, err)

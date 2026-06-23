@@ -417,6 +417,207 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 	}, account
 }
 
+// SetupIMAPServerWithRealS3 creates an IMAP server backed by an in-memory FakeS3
+// (real PutObject/GetObject/HeadObject/CopyObject). Both the upload worker and the
+// IMAP server share the same storage, and the worker runs in synchronous mode with
+// NO local cache — so an APPENDed message is uploaded to S3 and its local staging
+// file is removed, forcing subsequent FETCHes (and cross-account server-side COPY)
+// to exercise the genuine S3 round-trip. Shared mailboxes are enabled.
+func SetupIMAPServerWithRealS3(t *testing.T) (*TestServer, TestAccount, *FakeS3) {
+	t.Helper()
+
+	rdb := SetupTestDatabase(t)
+	account := CreateTestAccount(t, rdb)
+	address := GetRandomAddress(t)
+
+	tempDir, err := os.MkdirTemp("", "sora-test-reals3-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+
+	fake, s3storage := NewFakeS3Storage(t)
+
+	errCh := make(chan error, 1)
+	// instanceID must match the IMAP server hostname ("localhost") because
+	// pending_uploads.instance_id is set to the hostname and the worker queries
+	// WHERE instance_id = $1.
+	uploadWorker, err := uploader.New(
+		context.Background(),
+		tempDir,     // path
+		10,          // batchSize
+		1,           // concurrency
+		3,           // maxAttempts
+		time.Second, // retryInterval
+		0,           // maxStagingSize
+		"localhost", // instanceID
+		rdb,
+		s3storage,
+		nil, // no cache: local file removed after upload, so FETCH must hit S3
+		errCh,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create upload worker: %v", err)
+	}
+	uploadWorker.EnableSyncUpload()
+	if err := uploadWorker.Start(context.Background()); err != nil {
+		t.Fatalf("Failed to start upload worker: %v", err)
+	}
+
+	testConfig := &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{
+			Enabled:               true,
+			NamespacePrefix:       "Shared/",
+			AllowUserCreate:       true,
+			DefaultRights:         "lrswipkxtea",
+			AllowAnyoneIdentifier: true,
+		},
+	}
+
+	server, err := imap.New(
+		context.Background(),
+		"test",
+		"localhost",
+		address,
+		s3storage,
+		rdb,
+		uploadWorker,
+		nil, // cache.Cache
+		imap.IMAPServerOptions{
+			InsecureAuth: true,
+			Config:       testConfig,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create IMAP server: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		if err := server.Serve(address); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+			errChan <- fmt.Errorf("IMAP server error: %w", err)
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	cleanup := func() {
+		server.Close()
+		uploadWorker.Stop()
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Logf("IMAP server error during shutdown: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+		}
+		os.RemoveAll(tempDir)
+	}
+
+	return &TestServer{
+		Address:      address,
+		Server:       server,
+		cleanup:      cleanup,
+		ResilientDB:  rdb,
+		uploadWorker: uploadWorker,
+		UploadPath:   tempDir,
+	}, account, fake
+}
+
+// NewSyncUploaderWithS3 builds a synchronous, no-cache upload worker backed by the
+// same in-memory FakeS3, leased under the given instanceID. It is started and torn
+// down via t.Cleanup. Use a distinct instanceID per server so workers don't race on
+// each other's pending_uploads.
+func NewSyncUploaderWithS3(t *testing.T, rdb *resilient.ResilientDatabase, fake *FakeS3, instanceID string) *uploader.UploadWorker {
+	t.Helper()
+	s3storage, err := storage.New(
+		fake.Endpoint(), "test-access-key", "test-secret-key", "test-bucket",
+		false, false, 10*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create S3 storage: %v", err)
+	}
+	tempDir, err := os.MkdirTemp("", "sora-test-sync-up-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	errCh := make(chan error, 1)
+	up, err := uploader.New(
+		context.Background(),
+		tempDir, 10, 1, 3, time.Second, 0,
+		instanceID, rdb, s3storage, nil, errCh,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create upload worker: %v", err)
+	}
+	up.EnableSyncUpload()
+	if err := up.Start(context.Background()); err != nil {
+		t.Fatalf("Failed to start upload worker: %v", err)
+	}
+	t.Cleanup(func() {
+		up.Stop()
+		os.RemoveAll(tempDir)
+	})
+	return up
+}
+
+// StartLMTPServerWithS3 starts an LMTP backend that shares rdb and is backed by the
+// same in-memory FakeS3, with a synchronous real-S3 uploader and no local cache — so
+// an LMTP-delivered (or SIEVE fileinto'd) message is uploaded to S3 and its staging
+// file removed, exactly like the IMAP real-S3 setup. It uses a DISTINCT hostname
+// ("lmtp-host") so its uploader's pending_uploads (instance_id) never race with the
+// IMAP server's "localhost" uploader. Returns the LMTP listen address; the server,
+// uploader, and temp dir are torn down via t.Cleanup.
+func StartLMTPServerWithS3(t *testing.T, rdb *resilient.ResilientDatabase, fake *FakeS3) string {
+	t.Helper()
+
+	s3storage, err := storage.New(
+		fake.Endpoint(),
+		"test-access-key",
+		"test-secret-key",
+		"test-bucket",
+		false, false, 10*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create S3 storage for LMTP: %v", err)
+	}
+
+	tempDir, err := os.MkdirTemp("", "sora-test-lmtp-reals3-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+
+	const lmtpHost = "lmtp-host"
+	errCh := make(chan error, 1)
+	up, err := uploader.New(
+		context.Background(),
+		tempDir, 10, 1, 3, time.Second, 0,
+		lmtpHost, // instanceID must match the LMTP server hostname below
+		rdb, s3storage, nil, errCh,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create LMTP upload worker: %v", err)
+	}
+	up.EnableSyncUpload()
+	if err := up.Start(context.Background()); err != nil {
+		t.Fatalf("Failed to start LMTP upload worker: %v", err)
+	}
+
+	addr := GetRandomAddress(t)
+	srv, err := lmtp.New(context.Background(), "test-lmtp", lmtpHost, addr, s3storage, rdb, up, lmtp.LMTPServerOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create LMTP server: %v", err)
+	}
+	go srv.Start(make(chan error, 1))
+	time.Sleep(200 * time.Millisecond)
+
+	t.Cleanup(func() {
+		srv.Close()
+		up.Stop()
+		os.RemoveAll(tempDir)
+	})
+	return addr
+}
+
 // SetupIMAPServerForUploadRace creates an IMAP server whose upload worker is
 // constructed but NOT started and NOT in synchronous mode. APPENDed messages are
 // therefore staged on local disk and recorded in pending_uploads, but never marked

@@ -381,7 +381,7 @@ func TestCopyMessages(t *testing.T) {
 	defer tx2.Rollback(ctx)
 
 	emptyUIDs := []imap.UID{}
-	uidMapping, err := db.CopyMessages(ctx, tx2, &emptyUIDs, mailboxID, sentMailbox.ID, accountID)
+	uidMapping, err := db.CopyMessages(ctx, tx2, &emptyUIDs, mailboxID, sentMailbox.ID, accountID, "example.com", "user", "")
 	assert.NoError(t, err)
 	assert.Empty(t, uidMapping)
 
@@ -394,7 +394,7 @@ func TestCopyMessages(t *testing.T) {
 	defer tx3.Rollback(ctx)
 
 	nonExistentUIDs := []imap.UID{1, 2, 3}
-	uidMapping, err = db.CopyMessages(ctx, tx3, &nonExistentUIDs, mailboxID, sentMailbox.ID, accountID)
+	uidMapping, err = db.CopyMessages(ctx, tx3, &nonExistentUIDs, mailboxID, sentMailbox.ID, accountID, "example.com", "user", "")
 	assert.NoError(t, err)
 	assert.Empty(t, uidMapping) // Should be empty since no messages exist
 

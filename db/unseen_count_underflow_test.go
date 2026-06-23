@@ -299,3 +299,93 @@ func TestUnseenCountConcurrentFlagExpungeRace(t *testing.T) {
 	assert.Equal(t, authoritative, cached, "cached unseen_count must match the authoritative count after concurrent flag/expunge races")
 	t.Logf("✓ Concurrent flag/expunge race: cached=%d authoritative=%d", cached, authoritative)
 }
+
+// TestUnseenCountUserAPIFlagExpungeRace is the regression test for the User API
+// flag path. UpdateMessageFlags (server/userapi) manages its own transaction and
+// previously did NOT lock the mailbox row, so a User API "mark \Seen" racing an
+// IMAP/POP3 EXPUNGE on the same message double-counted the "no longer unseen"
+// event and drifted unseen_count negative — the same bug the IMAP paths guard
+// against. With the lockMailboxStats guard added to UpdateMessageFlags, the cache
+// must stay consistent with the authoritative count and never go negative.
+func TestUnseenCountUserAPIFlagExpungeRace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	db := setupTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	accountID, err := db.CreateAccount(ctx, tx, CreateAccountRequest{
+		Email:     fmt.Sprintf("test_uapi_race_%d@example.com", time.Now().UnixNano()),
+		Password:  "password",
+		IsPrimary: true,
+		HashType:  "bcrypt",
+	})
+	require.NoError(t, err)
+	require.NoError(t, db.CreateMailbox(ctx, tx, accountID, "UApiRace", nil))
+	require.NoError(t, tx.Commit(ctx))
+
+	mailbox, err := db.GetMailboxByName(ctx, accountID, "UApiRace")
+	require.NoError(t, err)
+
+	// Insert unseen messages, capturing both the DB message id (used by the User
+	// API) and the UID (used by EXPUNGE).
+	type msgRef struct {
+		id  int64
+		uid imap.UID
+	}
+	const numMessages = 150
+	refs := make([]msgRef, 0, numMessages)
+	for i := 0; i < numMessages; i++ {
+		tx2, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		opts := &InsertMessageOptions{
+			AccountID: accountID, MailboxID: mailbox.ID, MailboxName: mailbox.Name,
+			S3Domain: "example.com", S3Localpart: fmt.Sprintf("uapi-s3-%d", i),
+			ContentHash: fmt.Sprintf("uapi-hash-%d", i), MessageID: fmt.Sprintf("<uapi-%d@example.com>", i),
+			Flags: []imap.Flag{}, InternalDate: time.Now(), Size: 1024,
+			Subject: "UApiRace", PlaintextBody: "test", SentDate: time.Now(),
+		}
+		id, uid, err := db.InsertMessage(ctx, tx2, opts, PendingUpload{AccountID: accountID, ContentHash: opts.ContentHash})
+		require.NoError(t, err)
+		require.NoError(t, tx2.Commit(ctx))
+		refs = append(refs, msgRef{id: id, uid: imap.UID(uid)})
+	}
+
+	require.Equal(t, int64(numMessages), readUnseenCount(ctx, t, db, mailbox.ID), "all inserted messages should be unseen")
+
+	// For every message, race a User API "mark \Seen" (UpdateMessageFlags, which
+	// opens its own transaction) against an IMAP EXPUNGE. The mailbox-row lock in
+	// UpdateMessageFlags must serialize its trigger bookkeeping with the expunge.
+	var wg sync.WaitGroup
+	for _, ref := range refs {
+		ref := ref
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = db.UpdateMessageFlags(ctx, accountID, ref.id, []string{"\\Seen"}, nil)
+		}()
+		go func() {
+			defer wg.Done()
+			tx, err := db.GetWritePool().Begin(ctx)
+			if err != nil {
+				return
+			}
+			if _, err := db.ExpungeMessageUIDs(ctx, tx, mailbox.ID, ref.uid); err != nil {
+				_ = tx.Rollback(ctx)
+				return
+			}
+			_ = tx.Commit(ctx)
+		}()
+	}
+	wg.Wait()
+
+	cached := readUnseenCount(ctx, t, db, mailbox.ID)
+	authoritative := authoritativeUnseenCount(ctx, t, db, mailbox.ID)
+
+	assert.GreaterOrEqual(t, cached, int64(0), "unseen_count must never go negative")
+	assert.Equal(t, authoritative, cached, "cached unseen_count must match the authoritative count after concurrent User API flag / expunge races")
+	t.Logf("✓ Concurrent User API flag / expunge race: cached=%d authoritative=%d", cached, authoritative)
+}

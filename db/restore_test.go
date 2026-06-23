@@ -871,7 +871,7 @@ func TestRestoreMessages_SameMessageIDInDifferentMailboxes(t *testing.T) {
 	defer tx3.Rollback(ctx)
 
 	uids := []imap.UID{imap.UID(inboxUID)}
-	copiedUIDs, err := db.CopyMessages(ctx, tx3, &uids, inboxID, trashID, accountID)
+	copiedUIDs, err := db.CopyMessages(ctx, tx3, &uids, inboxID, trashID, accountID, "example.com", "user", "")
 	require.NoError(t, err)
 	require.Len(t, copiedUIDs, 1)
 

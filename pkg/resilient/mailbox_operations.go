@@ -284,11 +284,22 @@ func (rd *ResilientDatabase) GetPrimaryEmailForAccountWithRetry(ctx context.Cont
 	return result.(server.Address), nil
 }
 
+// ResolveAccountS3Owner retrieves the S3 domain and localpart for a given account.
+// This is used for cross-account operations (shared mailboxes) to ensure
+// messages and S3 objects are attributed to the mailbox owner, not the inserter.
+func (rd *ResilientDatabase) ResolveAccountS3Owner(ctx context.Context, accountID int64) (domain, localpart string, err error) {
+	ownerEmail, err := rd.GetPrimaryEmailForAccountWithRetry(ctx, accountID)
+	if err != nil {
+		return "", "", err
+	}
+	return ownerEmail.Domain(), ownerEmail.LocalPart(), nil
+}
+
 // --- Mailbox Management Wrappers ---
 
-func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, AccountID int64) (map[imap.UID]imap.UID, error) {
+func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).CopyMessages(ctx, tx, uids, srcMailboxID, destMailboxID, AccountID)
+		return rd.getOperationalDatabaseForOperation(ctx, true).CopyMessages(ctx, tx, uids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	if err != nil {

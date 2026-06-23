@@ -251,11 +251,26 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		return nil, imapErr
 	}
 
-	expectedPath := s.server.uploader.FilePath(contentHash, s.AccountID())
+	destAccountID := mailbox.AccountID
+	destS3Domain := s.Session.User.Domain()
+	destS3Localpart := s.Session.User.LocalPart()
+
+	if destAccountID != s.AccountID() {
+		domain, localpart, err := s.server.rdb.ResolveAccountS3Owner(readCtx, destAccountID)
+		if err != nil {
+			ierr := s.internalError("failed to resolve owner for mailbox '%s': %v", mboxName, err)
+			recordMetrics(ierr)
+			return nil, ierr
+		}
+		destS3Domain = domain
+		destS3Localpart = localpart
+	}
+
+	expectedPath := s.server.uploader.FilePath(contentHash, destAccountID)
 	var filePath *string
 	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
 		// File doesn't exist, safe to write
-		filePath, err = s.server.uploader.StoreLocally(contentHash, s.AccountID(), fullMessageBytes)
+		filePath, err = s.server.uploader.StoreLocally(contentHash, destAccountID, fullMessageBytes)
 		if err != nil {
 			ierr := s.internalError("failed to save message to disk: %v", err)
 			recordMetrics(ierr)
@@ -300,10 +315,10 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(s.ctx,
 		&db.InsertMessageOptions{
-			AccountID:     s.AccountID(),
+			AccountID:     destAccountID,
 			MailboxID:     mailbox.ID,
-			S3Domain:      s.Session.User.Domain(),
-			S3Localpart:   s.Session.User.LocalPart(),
+			S3Domain:      destS3Domain,
+			S3Localpart:   destS3Localpart,
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,
@@ -323,7 +338,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 			InstanceID:  s.server.hostname,
 			ContentHash: contentHash,
 			Size:        size,
-			AccountID:   s.AccountID(),
+			AccountID:   destAccountID,
 		})
 	if err != nil {
 		// Handle duplicate messages (either pre-detected or from unique constraint violation)
