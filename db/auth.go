@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -459,4 +462,49 @@ func (db *Database) GetPrimaryEmailForAccount(ctx context.Context, accountID int
 	}
 
 	return address, nil
+}
+
+var (
+	// rehashSemaphore limits the number of concurrent bcrypt rehash operations
+	// to prevent CPU exhaustion during large-scale legacy hash migrations.
+	rehashSemaphore = make(chan struct{}, max(1, runtime.NumCPU()/2))
+	rehashGroup     singleflight.Group
+)
+
+// QueueRehash securely schedules a password rehash operation.
+// It uses singleflight to deduplicate concurrent rehash requests for the same address,
+// and a semaphore to limit the total number of concurrent bcrypt operations globally.
+func QueueRehash(key string, rehashFn func(ctx context.Context)) {
+	go func() {
+		// Recover so a panic in rehashFn (or re-panicked through singleflight to the
+		// leader and every waiter on this key) drops the best-effort rehash instead of
+		// crashing the whole process.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Rehash: panic recovered", "address", key, "panic", r, "stack", string(debug.Stack()))
+			}
+		}()
+		rehashGroup.Do(key, func() (interface{}, error) {
+			// Non-blocking acquire: when the rehash concurrency limit is saturated, shed
+			// this rehash rather than parking the goroutine. Rehash is best-effort and
+			// idempotent — the account keeps its legacy hash and is rehashed on a later
+			// login — so spreading the work across logins beats queueing a goroutine per
+			// login during a post-migration thundering herd.
+			select {
+			case rehashSemaphore <- struct{}{}:
+				defer func() { <-rehashSemaphore }()
+			default:
+				logger.Debug("Rehash: skipped, concurrency limit reached", "address", key)
+				return nil, nil
+			}
+
+			// Bound the rehash work (chiefly the DB update). bcrypt.GenerateFromPassword
+			// is CPU-bound and does not observe ctx; the semaphore above is what caps
+			// concurrent bcrypt cost.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			rehashFn(ctx)
+			return nil, nil
+		})
+	}()
 }

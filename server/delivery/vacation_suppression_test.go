@@ -1,4 +1,4 @@
-package lmtp
+package delivery
 
 import (
 	"strings"

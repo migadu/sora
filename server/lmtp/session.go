@@ -22,6 +22,7 @@ import (
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/delivery"
 	"github.com/migadu/sora/server/sieveengine"
 )
 
@@ -890,94 +891,36 @@ func (s *LMTPSession) InternalError(format string, a ...any) error {
 	}
 }
 
-// handleVacationResponse constructs and sends a vacation auto-response.
-// The decision to send and the recording of the response event are handled
-// by the Sieve engine's policy, using the VacationOracle.
+// lmtpDeliveryLogger adapts an LMTP session to the delivery.Logger interface so the
+// shared vacation handler's diagnostics flow through the session's structured logger.
+type lmtpDeliveryLogger struct{ s *LMTPSession }
+
+func (l *lmtpDeliveryLogger) Log(format string, args ...any) {
+	l.s.DebugLog(fmt.Sprintf(format, args...))
+}
+
+// notifyRelayWorker nudges the relay worker to process the queue immediately rather
+// than waiting for its next poll.
+func (s *LMTPSession) notifyRelayWorker() {
+	if s.backend.relayWorker != nil {
+		s.backend.relayWorker.NotifyQueued()
+	}
+}
+
+// handleVacationResponse sends a vacation auto-response by delegating to the shared
+// delivery handler (the same path the Admin API uses): RFC 5230 §4.5 suppression, the
+// ":from" ownership constraint, RFC 2047 subject encoding, and message construction
+// all live there. The send decision and per-sender rate-limiting are handled upstream
+// by the Sieve engine's VacationOracle.
 func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, originalMessage *message.Entity) error {
-	if s.backend.relayQueue == nil {
-		s.DebugLog("relay not configured, cannot send vacation response", "sender", s.sender.FullAddress())
-		return nil
+	handler := &delivery.StandardVacationHandler{
+		Hostname:       s.HostName,
+		RelayQueue:     s.backend.relayQueue,
+		Logger:         &lmtpDeliveryLogger{s: s},
+		IsOwnedAddress: s.backend.rdb.IsAddressOwnedByAccountWithRetry,
+		RelayNotify:    s.notifyRelayWorker,
 	}
-
-	// RFC 5230 §4.5: Check suppression rules before sending vacation response.
-	if reason := shouldSuppressVacation(s.sender, originalMessage); reason != "" {
-		s.DebugLog("vacation suppressed", "reason", reason)
-		return nil
-	}
-
-	// Create the vacation response message
-	var vacationFrom string
-	if result.VacationFrom != "" {
-		vacationFrom = result.VacationFrom
-		s.DebugLog("using custom vacation from address", "from", vacationFrom)
-	} else {
-		vacationFrom = s.User.Address.FullAddress()
-		s.DebugLog("using default vacation from address", "from", vacationFrom)
-	}
-
-	var vacationSubject string
-	if result.VacationSubj != "" {
-		vacationSubject = result.VacationSubj
-		s.DebugLog("using custom vacation subject", "subject", vacationSubject)
-	} else {
-		vacationSubject = "Auto: Out of Office"
-		s.DebugLog("using default vacation subject", "subject", vacationSubject)
-	}
-
-	// Get the original message ID for the In-Reply-To header
-	originalHeader := mail.Header{Header: originalMessage.Header}
-	originalMessageID, _ := originalHeader.MessageID()
-	if originalMessageID != "" {
-		s.DebugLog("using original message id for in-reply-to", "message_id", originalMessageID)
-	}
-
-	s.DebugLog("creating vacation response message")
-	var vacationMessage bytes.Buffer
-	var h message.Header
-	h.Set("From", vacationFrom)
-	h.Set("To", s.sender.FullAddress())
-	h.Set("Subject", vacationSubject)
-	messageID := fmt.Sprintf("<%d.vacation@%s>", time.Now().UnixNano(), s.HostName)
-	h.Set("Message-ID", messageID)
-	s.DebugLog("vacation message id", "message_id", messageID)
-
-	if originalMessageID != "" {
-		h.Set("In-Reply-To", originalMessageID)
-		h.Set("References", originalMessageID)
-	}
-	h.Set("Auto-Submitted", "auto-replied")
-	h.Set("X-Auto-Response-Suppress", "All")
-	h.Set("Date", time.Now().Format(time.RFC1123Z))
-	h.Set("Content-Type", "text/plain; charset=utf-8")
-
-	w, err := message.CreateWriter(&vacationMessage, h)
-	if err != nil {
-		s.WarnLog("error creating message writer", "error", err)
-		return fmt.Errorf("failed to create message writer: %w", err)
-	}
-
-	s.DebugLog("adding vacation message body", "body_length", len(result.VacationMsg))
-	_, err = w.Write([]byte(result.VacationMsg))
-	if err != nil {
-		w.Close()
-		s.WarnLog("error writing vacation message body", "error", err)
-		return fmt.Errorf("failed to write vacation message body: %w", err)
-	}
-
-	w.Close()
-
-	// Send vacation response (relay queue existence checked at start of function)
-	sendErr := s.sendToExternalRelay(vacationFrom, s.sender.FullAddress(), vacationMessage.Bytes())
-	if sendErr != nil {
-		s.WarnLog("error enqueuing vacation response", "error", sendErr)
-		// The Sieve engine's policy should have already recorded the response attempt.
-		// Failure here is a delivery issue.
-		return fmt.Errorf("failed to enqueue vacation response: %w", sendErr)
-	}
-	s.InfoLog("queued vacation response for relay delivery", "to", s.sender.FullAddress())
-
-	// The recording of the vacation response is now handled by SievePolicy via VacationOracle
-	return nil
+	return handler.HandleVacationResponse(s.ctx, s.AccountID(), result, s.sender, &s.User.Address, originalMessage)
 }
 
 // saveMessageToMailbox saves a message to the specified mailbox.
@@ -1017,6 +960,20 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 				}
 			} else {
 				return fmt.Errorf("failed to get mailbox '%s': %v", mailboxName, err)
+			}
+		}
+	}
+
+	// Enforce the insert ('i') right for shared mailboxes owned by another account: a
+	// SIEVE fileinto must not write into a mailbox the recipient can only look up
+	// (RFC 4314). On denial (or check error) deliver to the recipient's own INBOX.
+	if mailbox.AccountID != s.AccountID() {
+		canInsert, permErr := s.backend.rdb.CheckMailboxPermissionWithRetry(readCtx, mailbox.ID, s.AccountID(), db.ACLRightInsert)
+		if permErr != nil || !canInsert {
+			s.WarnLog("fileinto denied: no insert right on shared mailbox, delivering to INBOX", "mailbox", mailbox.Name, "error", permErr)
+			mailbox, err = s.backend.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), consts.MailboxInbox)
+			if err != nil {
+				return fmt.Errorf("failed to get INBOX mailbox: %v", err)
 			}
 		}
 	}

@@ -240,9 +240,10 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 	// Create delivery context with relay queue
 	vacationOracle := &delivery.VacationOracle{RDB: s.rdb}
 	vacationHandler := &delivery.StandardVacationHandler{
-		Hostname:   s.hostname,
-		RelayQueue: s.relayQueue,
-		Logger:     logger,
+		Hostname:       s.hostname,
+		RelayQueue:     s.relayQueue,
+		Logger:         logger,
+		IsOwnedAddress: s.rdb.IsAddressOwnedByAccountWithRetry,
 	}
 
 	deliveryCtx := &delivery.DeliveryContext{

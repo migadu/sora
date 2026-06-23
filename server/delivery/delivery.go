@@ -348,6 +348,20 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 		}
 	}
 
+	// Enforce the insert ('i') right for shared mailboxes owned by another account: a
+	// SIEVE fileinto must not write into a mailbox the recipient can only look up
+	// (RFC 4314). On denial (or check error) deliver to the recipient's own INBOX.
+	if mailbox.AccountID != recipient.AccountID {
+		canInsert, permErr := d.RDB.CheckMailboxPermissionWithRetry(ctx, mailbox.ID, recipient.AccountID, db.ACLRightInsert)
+		if permErr != nil || !canInsert {
+			d.Logger.Log("fileinto denied: no insert right on shared mailbox %q, delivering to INBOX (err=%v)", mailbox.Name, permErr)
+			mailbox, err = d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, consts.MailboxInbox)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	// Parse message metadata
 	mailHeader := mail.Header{Header: messageEntity.Header}
 	subject, _ := mailHeader.Subject()

@@ -1808,7 +1808,7 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 
 	// Asynchronously rehash if needed
 	if db.NeedsRehash(hashedPassword) {
-		go func() {
+		db.QueueRehash(address, func(updateCtx context.Context) {
 			newHash, hashErr := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 			if hashErr != nil {
 				logger.Error("Rehash: Failed to generate new hash", "address", address, "error", hashErr)
@@ -1823,10 +1823,6 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 				newHashedPassword = string(newHash)
 			}
 
-			// Use a new context for this background task
-			updateCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-
 			// Update password in database
 			if err := s.rdb.UpdatePasswordWithRetry(updateCtx, address, newHashedPassword); err != nil {
 				logger.Error("Rehash: Failed to update password", "address", address, "error", err)
@@ -1837,7 +1833,7 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 					s.lookupCache.Invalidate(address)
 				}
 			}
-		}()
+		})
 	}
 
 	return accountID, nil

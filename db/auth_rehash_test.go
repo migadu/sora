@@ -1,8 +1,12 @@
 package db
 
 import (
+	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -185,5 +189,78 @@ func TestRehashOperation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestQueueRehash_PanicRecovery verifies that a panic inside the rehash function is
+// recovered rather than crashing the whole process. The rehash runs in a detached
+// goroutine, so without recover() an unrecovered panic would take the binary down —
+// the same failure mode as the C1 POP3 fix. It also confirms the concurrency permit
+// is released during the panic unwind, so a subsequent rehash still runs.
+func TestQueueRehash_PanicRecovery(t *testing.T) {
+	// 1) A panicking rehash must not crash the test binary.
+	started := make(chan struct{})
+	QueueRehash("panic-key", func(ctx context.Context) {
+		close(started)
+		panic("boom in rehash")
+	})
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("panicking rehash never ran")
+	}
+	// Let the deferred recover unwind in the rehash goroutine. If recovery were
+	// missing, the unrecovered panic would already have killed the binary.
+	time.Sleep(50 * time.Millisecond)
+
+	// 2) A subsequent rehash must still execute — proves the semaphore permit was
+	// released while the panic unwound (the deferred release ran).
+	done := make(chan struct{})
+	QueueRehash("ok-key", func(ctx context.Context) {
+		close(done)
+	})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subsequent rehash did not run (permit leaked on panic?)")
+	}
+}
+
+// TestQueueRehash_LoadShedding verifies that when the rehash concurrency limit is
+// saturated, a further rehash is shed (dropped) rather than queued. A shed rehash
+// must NOT run even after the in-flight rehashes release their permits — that's what
+// distinguishes load-shedding from blocking-then-running.
+func TestQueueRehash_LoadShedding(t *testing.T) {
+	capN := cap(rehashSemaphore)
+	release := make(chan struct{})
+	var holding sync.WaitGroup
+	holding.Add(capN)
+
+	// Saturate every permit with a rehash that blocks until released (distinct keys so
+	// singleflight doesn't dedup them).
+	for i := 0; i < capN; i++ {
+		QueueRehash(fmt.Sprintf("hold-%d", i), func(ctx context.Context) {
+			holding.Done()
+			<-release
+		})
+	}
+	holding.Wait() // all permits now held
+
+	// This one must be shed.
+	ran := make(chan struct{}, 1)
+	QueueRehash("shed-key", func(ctx context.Context) {
+		ran <- struct{}{}
+	})
+	time.Sleep(100 * time.Millisecond) // time to shed (or, if broken, to block)
+
+	// Free the permits. If shed-key had QUEUED, it would now acquire one and run.
+	close(release)
+	time.Sleep(200 * time.Millisecond)
+
+	select {
+	case <-ran:
+		t.Error("rehash ran after permits were freed — it was queued, not shed")
+	default:
+		// expected: shed immediately, never ran
 	}
 }

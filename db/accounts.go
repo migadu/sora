@@ -335,6 +335,20 @@ func (db *Database) ListCredentials(ctx context.Context, email string) ([]Creden
 	return credentials, nil
 }
 
+// IsAddressOwnedByAccount reports whether address is a credential of accountID
+// (case-insensitive exact match). Used to constrain user-supplied SIEVE vacation
+// ":from" addresses to addresses the account actually owns (RFC 5230 §4.4).
+func (db *Database) IsAddressOwnedByAccount(ctx context.Context, accountID int64, address string) (bool, error) {
+	var exists bool
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM credentials WHERE account_id = $1 AND LOWER(address) = LOWER($2))`,
+		accountID, address).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check address ownership: %w", err)
+	}
+	return exists, nil
+}
+
 var (
 	ErrCannotDeletePrimaryCredential = errors.New("cannot delete the primary credential. Use update-account to make another credential primary first")
 	ErrCannotDeleteLastCredential    = errors.New("cannot delete the last credential for an account. Use delete-account to remove the entire account")
