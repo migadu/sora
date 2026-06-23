@@ -414,16 +414,32 @@ func (exporter *Exporter) shouldExportMailbox(mailboxName string) bool {
 	return false
 }
 
+// mailboxDir resolves the on-disk maildir directory (the parent of cur/new/tmp)
+// for an IMAP mailbox name, guaranteeing the result stays within the export
+// root. A malicious or legacy mailbox name containing ".." path segments (e.g.
+// "../../etc") would otherwise let filepath.Join escape exporter.maildirPath and
+// write arbitrary files. This is defence-in-depth: mailbox creation, rename, and
+// import already reject such names (helpers.MailboxNameHasTraversal), but the
+// exporter must never trust a name already persisted in the database.
+func (exporter *Exporter) mailboxDir(mailboxName string) (string, error) {
+	if mailboxName == "INBOX" {
+		return exporter.maildirPath, nil
+	}
+	// Standard maildir uses folders without leading dots.
+	dir := filepath.Join(exporter.maildirPath, mailboxName)
+	rel, err := filepath.Rel(exporter.maildirPath, dir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("mailbox %q resolves outside the export directory", mailboxName)
+	}
+	return dir, nil
+}
+
 // createMailboxDirectory creates the maildir structure for a mailbox
 func (exporter *Exporter) createMailboxDirectory(mailboxName string) error {
-	// Convert IMAP mailbox name to maildir path
-	var dirName string
-	if mailboxName == "INBOX" {
-		dirName = exporter.maildirPath
-	} else {
-		// Convert IMAP separator (/) to filesystem-safe separator
-		// Standard maildir uses folders without leading dots
-		dirName = filepath.Join(exporter.maildirPath, mailboxName)
+	// Convert IMAP mailbox name to a contained maildir path
+	dirName, err := exporter.mailboxDir(mailboxName)
+	if err != nil {
+		return err
 	}
 
 	// Create cur, new, and tmp directories
@@ -588,14 +604,12 @@ func (exporter *Exporter) exportMessage(msg *db.Message, mailboxName string) err
 		filename = exporter.generateMaildirFilename(msg)
 	}
 
-	// Determine target directory
-	var targetDir string
-	if mailboxName == "INBOX" {
-		targetDir = filepath.Join(exporter.maildirPath, "cur")
-	} else {
-		// Standard maildir uses folders without leading dots
-		targetDir = filepath.Join(exporter.maildirPath, mailboxName, "cur")
+	// Determine target directory (containment-checked against the export root)
+	mailboxDir, err := exporter.mailboxDir(mailboxName)
+	if err != nil {
+		return err
 	}
+	targetDir := filepath.Join(mailboxDir, "cur")
 
 	targetPath := filepath.Join(targetDir, filename)
 
@@ -829,12 +843,11 @@ func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) err
 		// Create DovecotUIDList from mappings
 		uidList := CreateDovecotUIDListFromMessages(uidValidity, mappings)
 
-		// Determine maildir path for this mailbox
-		var maildirPath string
-		if mailboxName == "INBOX" {
-			maildirPath = exporter.maildirPath
-		} else {
-			maildirPath = filepath.Join(exporter.maildirPath, mailboxName)
+		// Determine maildir path for this mailbox (containment-checked)
+		maildirPath, err := exporter.mailboxDir(mailboxName)
+		if err != nil {
+			logger.Info("Warning: Skipping dovecot-uidlist for unsafe mailbox name", "mailbox", mailboxName, "error", err)
+			continue
 		}
 
 		// Write dovecot-uidlist file

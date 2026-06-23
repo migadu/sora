@@ -7,6 +7,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/helpers"
 )
 
 func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameOptions) error {
@@ -25,6 +26,18 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAlreadyExists,
 			Text: "The new mailbox name is the same as the current one.",
+		}
+	}
+
+	// Reject path-traversal segments ("." / "..") in the destination with a
+	// clean client error (db.RenameMailbox enforces this too, as defence-in-depth
+	// for non-IMAP callers).
+	if helpers.MailboxNameHasTraversal(newName) {
+		s.DebugLog("rejecting rename to name with path traversal segment", "name", newName)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeCannot,
+			Text: "Invalid mailbox name",
 		}
 	}
 

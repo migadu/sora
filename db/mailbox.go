@@ -288,6 +288,14 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 		return consts.ErrMailboxInvalidName
 	}
 
+	// Reject "." / ".." path segments: such names would let the maildir
+	// exporter escape its target directory (path traversal) when the hierarchy
+	// is materialised on disk.
+	if helpers.MailboxNameHasTraversal(name) {
+		logger.Error("Database: attempted to create mailbox with path traversal segment", "name", name, "account_id", AccountID)
+		return consts.ErrMailboxInvalidName
+	}
+
 	// Avoid low uid_validity which may cause issues with some IMAP clients
 	// Use nanoseconds to significantly reduce the chance of collision on rapid creation.
 	uidValidity := uint32(time.Now().UnixNano())
@@ -841,6 +849,12 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// Validate mailbox name doesn't contain problematic characters
 	if strings.ContainsAny(newName, "\t\r\n\x00") {
 		logger.Error("Database: attempted to rename mailbox to name with invalid characters", "name", newName, "account_id", AccountID)
+		return consts.ErrMailboxInvalidName
+	}
+
+	// Reject "." / ".." path segments to prevent maildir-export path traversal.
+	if helpers.MailboxNameHasTraversal(newName) {
+		logger.Error("Database: attempted to rename mailbox to name with path traversal segment", "name", newName, "account_id", AccountID)
 		return consts.ErrMailboxInvalidName
 	}
 

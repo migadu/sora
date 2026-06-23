@@ -8,6 +8,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 )
 
 // Create a new mailbox
@@ -20,6 +21,19 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	}
 	AccountID := s.AccountID()
 	release()
+
+	// Reject path-traversal segments ("." / "..") up front with a clean client
+	// error. These names would let the maildir exporter escape its target
+	// directory; db.CreateMailbox enforces this too, but checking here avoids a
+	// misleading SERVERBUG response and short-circuits parent auto-creation.
+	if helpers.MailboxNameHasTraversal(name) {
+		s.DebugLog("rejecting mailbox name with path traversal segment", "name", name)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeCannot,
+			Text: "Invalid mailbox name",
+		}
+	}
 
 	// Add config to context for shared mailbox detection
 	ctx := s.ctx
