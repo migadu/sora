@@ -54,8 +54,12 @@ type Session struct {
 // newSession creates a new ManageSieve proxy session.
 func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *Session {
 	sessionCtx, sessionCancel := context.WithCancel(s.ctx)
-	// Check if connection is already TLS (implicit TLS)
-	_, isTLS := conn.(*tls.Conn)
+	// Detect implicit TLS from the listener configuration rather than a
+	// `conn.(*tls.Conn)` type assertion: the listener wraps the real *tls.Conn
+	// (SoraTLSConn), so the assertion always fails and would reject auth over a
+	// secure channel when insecure_auth=false. Mirrors the non-proxy ManageSieve
+	// server. STARTTLS connections start plain and flip isTLS=true after upgrade.
+	isTLS := s.tls && !s.tlsUseStartTLS
 
 	// Determine client address (use PROXY protocol info if available)
 	clientAddr := server.GetAddrString(conn.RemoteAddr())
@@ -353,7 +357,7 @@ func (s *Session) handleConnection() {
 			}
 
 			// Check if already using TLS
-			if _, ok := s.clientConn.(*tls.Conn); ok {
+			if s.isTLS {
 				if s.handleAuthError(`NO "Already using TLS"`) {
 					return
 				}
@@ -1023,8 +1027,8 @@ func (s *Session) sendCapabilities() error {
 		return fmt.Errorf("failed to write SIEVE: %w", err)
 	}
 
-	// Check if we're on a TLS connection
-	_, isSecure := s.clientConn.(*tls.Conn)
+	// Check if we're on a TLS connection (implicit TLS or post-STARTTLS).
+	isSecure := s.isTLS
 
 	// Advertise STARTTLS if configured and not already using TLS
 	if s.server.tls && s.server.tlsUseStartTLS && !isSecure {

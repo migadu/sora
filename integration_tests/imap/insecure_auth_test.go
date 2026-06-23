@@ -4,6 +4,7 @@ package imap_test
 
 import (
 	"context"
+	"crypto/tls"
 	"os"
 	"testing"
 	"time"
@@ -130,4 +131,74 @@ func TestInsecureAuthExplicitlyEnabled_IMAP(t *testing.T) {
 	}
 
 	t.Log("✓ LOGIN succeeded with InsecureAuth=true")
+}
+
+// TestSecureAuthOverImplicitTLS_IMAP is the M9 regression test: with TLS
+// configured and InsecureAuth=false, a client connecting over implicit TLS must
+// be allowed to authenticate. Before the fix, go-imap's default
+// `conn.(*tls.Conn)` check failed against Sora's wrapped connection
+// (connectionLimitingConn -> SoraTLSConn -> *tls.Conn) and auth was rejected on
+// a perfectly secure channel. The fix wires imapserver.Options.IsTLS to
+// server.ConnIsTLS, which unwraps to find the real *tls.Conn.
+func TestSecureAuthOverImplicitTLS_IMAP(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	address := common.GetRandomAddress(t)
+
+	tempDir, err := os.MkdirTemp("", "sora-test-upload-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	errCh := make(chan error, 1)
+	uploadWorker, err := uploader.New(
+		context.Background(), tempDir, 10, 1, 3, time.Second,
+		0, "test-instance", rdb, &storage.S3Storage{}, nil, errCh,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create upload worker: %v", err)
+	}
+
+	// TLS configured + InsecureAuth explicitly false = the secure posture.
+	server, err := imapserver.New(
+		context.Background(), "test-secure-tls", "localhost", address,
+		&storage.S3Storage{}, rdb, uploadWorker, nil,
+		imapserver.IMAPServerOptions{
+			InsecureAuth: false,
+			TLS:          true,
+			TLSCertFile:  "../../testdata/sora.crt",
+			TLSKeyFile:   "../../testdata/sora.key",
+			TLSVerify:    false,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create IMAP server: %v", err)
+	}
+
+	go func() {
+		if err := server.Serve(address); err != nil {
+			t.Logf("IMAP server error: %v", err)
+		}
+	}()
+	defer server.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	c, err := imapclient.DialTLS(address, &imapclient.Options{
+		TLSConfig: &tls.Config{InsecureSkipVerify: true},
+	})
+	if err != nil {
+		t.Fatalf("Failed to establish implicit-TLS connection: %v", err)
+	}
+	defer c.Close()
+
+	// LOGIN must succeed: the connection is genuinely TLS-secured, so the
+	// insecure_auth=false gate should permit authentication.
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Expected LOGIN to succeed over implicit TLS with InsecureAuth=false, but got: %v", err)
+	}
+
+	t.Log("✓ LOGIN succeeded over implicit TLS with InsecureAuth=false (M9 fixed)")
 }

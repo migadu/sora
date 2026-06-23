@@ -734,9 +734,14 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		NewSession:   s.newSession,
 		Logger:       log.Default(),
 		InsecureAuth: options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
-		DebugWriter:  debugWriter,
-		Caps:         s.caps,
-		TLSConfig:    nil,
+		// IsTLS unwraps Sora's connection layers (connectionLimitingConn ->
+		// SoraTLSConn -> *tls.Conn) to detect implicit TLS. Without it, go-imap's
+		// default `conn.(*tls.Conn)` assertion fails on our wrapped connections
+		// and rejects auth when insecure_auth=false even over a secure channel.
+		IsTLS:       serverPkg.ConnIsTLS,
+		DebugWriter: debugWriter,
+		Caps:        s.caps,
+		TLSConfig:   nil,
 	})
 
 	// Start connection limiter cleanup

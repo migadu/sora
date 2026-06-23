@@ -501,6 +501,31 @@ func (c *SoraConn) Unwrap() net.Conn {
 	return c.Conn
 }
 
+// ConnIsTLS reports whether conn is, or wraps, a *tls.Conn.
+//
+// Sora's listeners hand protocol handlers a connection wrapped in several
+// layers (connection limiter, SoraTLSConn, PROXY-protocol reader, ...), so a
+// bare `conn.(*tls.Conn)` type assertion fails even on implicit-TLS ports. This
+// helper walks the Unwrap() chain to find the real *tls.Conn. It is the single
+// source of truth used to gate authentication when insecure_auth is false; a
+// wrong "not TLS" answer would reject auth on a perfectly secure connection.
+//
+// Note: for SoraTLSConn the underlying *tls.Conn only becomes reachable after
+// PerformHandshake() has run, so call this after the handshake completes.
+func ConnIsTLS(conn net.Conn) bool {
+	for conn != nil {
+		if _, ok := conn.(*tls.Conn); ok {
+			return true
+		}
+		if wrapper, ok := conn.(interface{ Unwrap() net.Conn }); ok {
+			conn = wrapper.Unwrap()
+		} else {
+			break
+		}
+	}
+	return false
+}
+
 // ErrTLSOnPlainPort is returned when TLS traffic is detected on a plain-text port
 var ErrTLSOnPlainPort = errors.New("TLS connection attempted on plain-text port")
 

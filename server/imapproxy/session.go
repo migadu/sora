@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/subtle"
-	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -195,7 +194,7 @@ func (s *Session) handleConnection() {
 		switch command {
 		case "LOGIN":
 			// Check insecure_auth: reject LOGIN over non-TLS when insecure_auth is false
-			if !s.server.insecureAuth && !s.isConnectionSecure() {
+			if !s.server.insecureAuth && !server.ConnIsTLS(s.clientConn) {
 				if s.handleAuthError(fmt.Sprintf("%s NO [PRIVACYREQUIRED] Authentication requires TLS connection", tag)) {
 					return
 				}
@@ -1617,22 +1616,6 @@ func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int
 
 func isClosingError(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed)
-}
-
-// isConnectionSecure checks if the underlying connection is TLS-encrypted.
-func (s *Session) isConnectionSecure() bool {
-	conn := s.clientConn
-	for conn != nil {
-		if _, ok := conn.(*tls.Conn); ok {
-			return true
-		}
-		if wrapper, ok := conn.(interface{ Unwrap() net.Conn }); ok {
-			conn = wrapper.Unwrap()
-		} else {
-			break
-		}
-	}
-	return false
 }
 
 func checkMasterCredential(provided string, actual []byte) bool {

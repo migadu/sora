@@ -669,3 +669,57 @@ func TestSoraTLSListenerWithRealCerts(t *testing.T) {
 
 	t.Logf("✓ SoraTLSListener captured JA4 fingerprint: %s", ja4)
 }
+
+// unwrapConn is a minimal net.Conn wrapper exposing Unwrap(), mimicking the
+// listener-level wrappers (connectionLimitingConn, proxyProtocolConn) that sit
+// between go-imap and the real *tls.Conn.
+type unwrapConn struct {
+	net.Conn
+}
+
+func (c unwrapConn) Unwrap() net.Conn { return c.Conn }
+
+// TestConnIsTLS verifies the auth-gating helper detects a *tls.Conn through the
+// layers of wrappers Sora's listeners apply. This is the "secure posture" that
+// was previously untested: a wrong answer rejects auth on a secure channel when
+// insecure_auth=false (IMAP M9 / ManageSieve proxy).
+func TestConnIsTLS(t *testing.T) {
+	clientPipe, serverPipe := net.Pipe()
+	defer clientPipe.Close()
+	defer serverPipe.Close()
+
+	// tls.Server yields a *tls.Conn regardless of handshake state; ConnIsTLS
+	// checks the type, so no handshake is needed to exercise the detection.
+	tlsConn := tls.Server(serverPipe, &tls.Config{})
+
+	// A real SoraConn whose underlying Conn is the *tls.Conn — this is exactly
+	// the post-handshake shape of SoraTLSConn (SoraConn.Conn == *tls.Conn).
+	soraOverTLS := NewSoraConn(tlsConn, SoraConnConfig{Protocol: "test"})
+	defer soraOverTLS.Close()
+
+	// A plain SoraConn over a non-TLS pipe must NOT be considered secure.
+	plainSora := NewSoraConn(serverPipe, SoraConnConfig{Protocol: "test"})
+
+	tests := []struct {
+		name string
+		conn net.Conn
+		want bool
+	}{
+		{"nil", nil, false},
+		{"plain pipe", clientPipe, false},
+		{"plain SoraConn", plainSora, false},
+		{"direct *tls.Conn", tlsConn, true},
+		{"one wrapper over tls", unwrapConn{Conn: tlsConn}, true},
+		{"two wrappers over tls", unwrapConn{Conn: unwrapConn{Conn: tlsConn}}, true},
+		{"real SoraConn over tls (post-handshake shape)", soraOverTLS, true},
+		{"wrapper over SoraConn over tls", unwrapConn{Conn: soraOverTLS}, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ConnIsTLS(tc.conn); got != tc.want {
+				t.Errorf("ConnIsTLS(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}

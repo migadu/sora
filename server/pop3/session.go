@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/subtle"
-	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -245,7 +244,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Check insecure_auth: reject PASS over non-TLS when insecure_auth is false
-			if !s.server.insecureAuth && !s.isConnectionSecure() {
+			if !s.server.insecureAuth && !server.ConnIsTLS(*s.conn) {
 				s.DebugLog("authentication rejected - TLS required", "address", userAddress.FullAddress())
 				recordMetrics("failure")
 				if s.handleClientError(writer, "-ERR Authentication requires TLS connection\r\n") {
@@ -1545,7 +1544,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Check insecure_auth: reject AUTH over non-TLS when insecure_auth is false
-			if !s.server.insecureAuth && !s.isConnectionSecure() {
+			if !s.server.insecureAuth && !server.ConnIsTLS(*s.conn) {
 				s.DebugLog("AUTH PLAIN rejected - TLS required")
 				recordMetrics("failure")
 				if s.handleClientError(writer, "-ERR Authentication requires TLS connection\r\n") {
@@ -2471,32 +2470,6 @@ func (s *POP3Session) startTerminationPoller() {
 			// Session ended normally
 		}
 	}()
-}
-
-// isConnectionSecure checks if the underlying connection is TLS-encrypted.
-// Used when insecure_auth is false to reject auth over non-TLS connections.
-func (s *POP3Session) isConnectionSecure() bool {
-	if s.conn == nil || *s.conn == nil {
-		return false
-	}
-	conn := *s.conn
-	// Check if the connection itself is TLS
-	if _, ok := conn.(*tls.Conn); ok {
-		return true
-	}
-	// Unwrap connection layers to find TLS
-	currentConn := conn
-	for currentConn != nil {
-		if _, ok := currentConn.(*tls.Conn); ok {
-			return true
-		}
-		if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
-			currentConn = wrapper.Unwrap()
-		} else {
-			break
-		}
-	}
-	return false
 }
 
 func checkMasterCredential(provided string, actual []byte) bool {
