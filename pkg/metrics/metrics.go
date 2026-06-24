@@ -75,9 +75,14 @@ var (
 
 	DBQueryDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "sora_db_query_duration_seconds",
-			Help:    "Duration of database queries in seconds",
-			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0},
+			Name: "sora_db_query_duration_seconds",
+			Help: "Duration of database queries in seconds",
+			// Buckets extend to 60s because search operations (search_messages_complex_fast,
+			// etc.) are bounded by the 60s search_timeout, not by a 2s ceiling. With the old
+			// top finite bucket at 2.0s, any search slower than 2s fell into the (2.0, +Inf]
+			// overflow bucket, where histogram_quantile cannot interpolate — pinning p99 at
+			// ~2.0s and making the metric useless for the very queries it most needed to track.
+			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0},
 		},
 		[]string{"operation", "role"},
 	)

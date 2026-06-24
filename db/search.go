@@ -529,6 +529,176 @@ func (db *Database) needsIndexScanBiasBuster(criteria *imap.SearchCriteria) bool
 	return false
 }
 
+// hasNestedFTS reports whether any OR/NOT subtree of the criteria contains a
+// full-text (Body/Text) condition. The TEXT UNION rewrite can only split an FTS
+// term that appears as a single top-level AND factor; an FTS term buried inside
+// OR/NOT cannot be lifted into a UNION branch without changing semantics, so its
+// presence disqualifies the rewrite.
+func hasNestedFTS(c *imap.SearchCriteria) bool {
+	if c == nil {
+		return false
+	}
+	for i := range c.Not {
+		if criteriaContainsFTS(&c.Not[i]) {
+			return true
+		}
+	}
+	for i := range c.Or {
+		if criteriaContainsFTS(&c.Or[i][0]) || criteriaContainsFTS(&c.Or[i][1]) {
+			return true
+		}
+	}
+	return false
+}
+
+// criteriaContainsFTS reports whether the criteria contains a Body/Text condition
+// anywhere (top level or nested).
+func criteriaContainsFTS(c *imap.SearchCriteria) bool {
+	if c == nil {
+		return false
+	}
+	if len(c.Body) > 0 || len(c.Text) > 0 {
+		return true
+	}
+	return hasNestedFTS(c)
+}
+
+// canUseTextUnion reports whether a search is eligible for the TEXT UNION rewrite.
+//
+// IMAP TEXT search expands to an OR that mixes messages_fts.text_body_tsv (reachable
+// only through the content_hash join) with LIKE filters on messages.* columns. A
+// single OR spanning two tables cannot be driven by any one index, so on a large
+// mailbox the planner degrades to a full mailbox scan with a per-row probe into
+// messages_fts (measured at 24s vs 13.6s for the UNION form). The rewrite splits the
+// term into an indexable header branch (trigram indexes on messages) UNION an
+// indexable body branch (FTS GIN on messages_fts).
+//
+// Eligibility is intentionally conservative — exactly one top-level TEXT term, no
+// BODY term, and no FTS nested in OR/NOT — so the decomposition is a simple two-branch
+// UNION with no disjunction cross-product. Everything else falls back to the existing
+// complex-fast path unchanged. This is a strict subset of the complex-fast conditions
+// (needsSeqNumSearch must be false, ORDER BY must not need seqnum).
+func (db *Database) canUseTextUnion(criteria *imap.SearchCriteria, needsSeqNumSearch bool, orderByClause string) bool {
+	if criteria == nil || needsSeqNumSearch {
+		return false
+	}
+	if len(criteria.Text) != 1 || len(criteria.Body) != 0 {
+		return false
+	}
+	if hasNestedFTS(criteria) {
+		return false
+	}
+	if strings.Contains(strings.ToLower(orderByClause), "seqnum") {
+		return false
+	}
+	return true
+}
+
+// buildTextSearchBranches generates the two SQL predicates for a single IMAP TEXT
+// term, split for the UNION rewrite. The body predicate matches messages_fts.
+// text_body_tsv (unqualified so it resolves to the joined messages_fts row, exactly
+// as in buildSearchCriteriaWithPrefix); the header predicate matches the indexed
+// messages.* sort columns. Together they are semantically identical to the combined
+// OR produced for criteria.Text, just separated so each side can use its own index.
+func buildTextSearchBranches(text string, args pgx.NamedArgs, paramPrefix string, paramCounter *int) (headerCond, bodyCond string) {
+	next := func() string {
+		*paramCounter++
+		return fmt.Sprintf("%s%d", paramPrefix, *paramCounter)
+	}
+	tsParam := next()
+	args[tsParam] = text
+	likeParam := next()
+	args[likeParam] = "%" + strings.ToLower(text) + "%"
+
+	bodyCond = fmt.Sprintf("text_body_tsv IS NOT NULL AND text_body_tsv @@ plainto_tsquery('simple', @%s)", tsParam)
+	headerCond = fmt.Sprintf(
+		"(LOWER(m.subject) LIKE @%[1]s "+
+			"OR m.from_email_sort LIKE @%[1]s "+
+			"OR m.from_name_sort LIKE @%[1]s "+
+			"OR m.to_email_sort LIKE @%[1]s "+
+			"OR m.to_name_sort LIKE @%[1]s "+
+			"OR m.cc_email_sort LIKE @%[1]s)",
+		likeParam)
+	return headerCond, bodyCond
+}
+
+// Sort columns carried through the UNION CTE (in addition to each branch's data
+// projection) so the outer ORDER BY, which references the CTE alias f, can sort by
+// them. They are not returned to the caller. The lightweight projection omits the
+// non-name columns from its data set, so it must carry them here too; the full
+// projection already includes internal_date/sent_date/size and only needs the *_sort
+// columns. Each must appear EXACTLY ONCE across (branchSelect + sortColumns) or the CTE
+// gets a duplicate column.
+const (
+	textUnionSortColumnsFull  = "m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort"
+	textUnionSortColumnsLight = "m.internal_date, m.sent_date, m.size, " + textUnionSortColumnsFull
+)
+
+// buildTextUnionQuery builds the validated TEXT UNION query for an eligible search
+// (see canUseTextUnion). branchSelect is the per-branch data projection from messages m
+// / message_state ms; sortColumns are the additional messages.* columns the outer ORDER
+// BY needs (see textUnionSortColumns*); outerSelect is the final projection over the
+// deduped CTE alias f (and is where "0 as seqnum" lives). All non-Text criteria are
+// built once and replicated into both branches so combined searches (TEXT +
+// flags/dates/etc.) stay correct.
+func (db *Database) buildTextUnionQuery(criteria *imap.SearchCriteria, mailboxID int64, branchSelect, sortColumns, outerSelect, orderByClause string, resultLimit int, paramCounter *int) (string, pgx.NamedArgs, error) {
+	// Base (non-Text) conditions, replicated into both branches. A shallow copy with
+	// Text cleared is sufficient: buildSearchCriteriaWithPrefix only reads the criteria.
+	base := *criteria
+	base.Text = nil
+	baseCond, args, err := db.buildSearchCriteriaWithPrefix(&base, paramPrefix, paramCounter, "m")
+	if err != nil {
+		return "", nil, err
+	}
+
+	headerCond, bodyCond := buildTextSearchBranches(criteria.Text[0], args, paramPrefix, paramCounter)
+
+	if orderByClause == "" {
+		orderByClause = "ORDER BY m.uid DESC"
+	}
+	// The outer query sorts the (small) deduped CTE, so the bias-buster is applied for
+	// parity with the validated query; it is harmless on a CTE with no index to scan.
+	outerOrder := orderByClause
+	if db.needsIndexScanBiasBuster(criteria) {
+		outerOrder = strings.ReplaceAll(outerOrder, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+		if outerOrder == orderByClause {
+			outerOrder = strings.ReplaceAll(outerOrder, "ORDER BY uid", "ORDER BY uid + 0")
+		}
+	}
+	outerOrder = strings.ReplaceAll(outerOrder, "m.", "f.")
+
+	args["mailboxID"] = mailboxID
+
+	limitClause := ""
+	if resultLimit > 0 {
+		limitClause = fmt.Sprintf("LIMIT %d", resultLimit)
+	}
+
+	query := fmt.Sprintf(`
+		WITH matched AS (
+			SELECT %[1]s, %[2]s
+			FROM messages m
+			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%[3]s) AND (%[4]s)
+			UNION
+			SELECT %[1]s, %[2]s
+			FROM messages m
+			LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%[3]s) AND (%[5]s)
+		)
+		SELECT %[6]s
+		FROM matched f
+		%[7]s
+		%[8]s`,
+		branchSelect, sortColumns, baseCond, headerCond, bodyCond, outerSelect, outerOrder, limitClause)
+
+	return query, args, nil
+}
+
+// paramPrefix is the named-argument prefix used across the search query builders.
+const paramPrefix = "p"
+
 // resolveResultLimit selects the row cap for a search query. It must be called
 // AFTER any seqnum→UID rewrite so that isComplexQuery reflects the final query
 // shape: a search that was only "complex" because of sequence-number criteria is
@@ -730,6 +900,24 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			finalQueryString = fmt.Sprintf(noLimitTemplate, whereCondition, innerOrderByClause, outerOrderByClause)
 		}
 		metricsLabel = "search_messages_simple"
+
+	} else if db.canUseTextUnion(criteria, needsSeqNumSearch, orderByClause) {
+		// TEXT UNION path: split the single mixed-table TEXT OR into an indexable
+		// header branch (trigram indexes on messages) UNION an indexable body branch
+		// (FTS GIN on messages_fts), avoiding the full-mailbox-scan + per-row probe the
+		// combined OR forces on large mailboxes. See canUseTextUnion.
+		const branchSelect = `m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
+			m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq,
+			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json`
+		const outerSelect = `f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
+			f.internal_date, f.size, f.created_modseq, f.updated_modseq, f.expunged_modseq,
+			0 as seqnum,
+			f.flags_changed_at, f.subject, f.sent_date, f.message_id, f.in_reply_to, f.recipients_json`
+		finalQueryString, whereArgs, err = db.buildTextUnionQuery(criteria, mailboxID, branchSelect, textUnionSortColumnsFull, outerSelect, orderByClause, resultLimit, &paramCounter)
+		if err != nil {
+			return nil, err
+		}
+		metricsLabel = "search_messages_complex_text_union"
 
 	} else if !needsSeqNumSearch {
 		// Modern Complex path: We need FTS or JSONB generic headers, BUT we do NOT need SeqNum filtering.
@@ -1065,6 +1253,17 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 			finalQueryString = fmt.Sprintf(noLimitTemplate, whereCondition, innerOrderByClause)
 		}
 		metricsLabel = "search_messages_simple"
+
+	} else if db.canUseTextUnion(criteria, needsSeqNumSearch, orderByClause) {
+		// TEXT UNION path (lightweight columns): see canUseTextUnion and the matching
+		// branch in getMessagesQueryExecutor.
+		const branchSelect = `m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq`
+		const outerSelect = `f.id, f.uid, f.mailbox_id, f.content_hash, f.created_modseq, f.updated_modseq, f.expunged_modseq, 0 as seqnum`
+		finalQueryString, whereArgs, err = db.buildTextUnionQuery(criteria, mailboxID, branchSelect, textUnionSortColumnsLight, outerSelect, orderByClause, resultLimit, &paramCounter)
+		if err != nil {
+			return nil, err
+		}
+		metricsLabel = "search_messages_complex_text_union"
 
 	} else if !needsSeqNumSearch {
 		// Modern Complex path: We need FTS or JSONB generic headers, BUT we do NOT need SeqNum filtering.

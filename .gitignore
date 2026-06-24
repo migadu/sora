@@ -13,3 +13,4 @@ vendor/
 CLAUDE.md
 .claude/
 config-live.toml
+tasks/todo.md

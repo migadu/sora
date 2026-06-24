@@ -3,10 +3,12 @@ package db
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -126,6 +128,219 @@ func TestBuildSearchHeaderConditions(t *testing.T) {
 			assert.Contains(t, condition, tt.wantContain)
 		})
 	}
+}
+
+// TestCanUseTextUnion verifies eligibility for the TEXT UNION rewrite. The decision
+// is a pure function of the criteria, so a nil *Database suffices.
+func TestCanUseTextUnion(t *testing.T) {
+	var db *Database // canUseTextUnion does not dereference the receiver
+
+	tests := []struct {
+		name          string
+		criteria      *imap.SearchCriteria
+		needsSeqNum   bool
+		orderByClause string
+		want          bool
+	}{
+		{
+			name:     "single TEXT term is eligible",
+			criteria: &imap.SearchCriteria{Text: []string{"invoice"}},
+			want:     true,
+		},
+		{
+			name:     "TEXT plus non-FTS filters is eligible",
+			criteria: &imap.SearchCriteria{Text: []string{"invoice"}, Flag: []imap.Flag{imap.FlagSeen}},
+			want:     true,
+		},
+		{
+			name:     "no TEXT term is ineligible",
+			criteria: &imap.SearchCriteria{Body: []string{"invoice"}},
+			want:     false,
+		},
+		{
+			name:     "BODY alongside TEXT is ineligible",
+			criteria: &imap.SearchCriteria{Text: []string{"invoice"}, Body: []string{"report"}},
+			want:     false,
+		},
+		{
+			name:     "multiple TEXT terms are ineligible",
+			criteria: &imap.SearchCriteria{Text: []string{"invoice", "report"}},
+			want:     false,
+		},
+		{
+			name: "TEXT nested in OR is ineligible",
+			criteria: &imap.SearchCriteria{
+				Text: []string{"invoice"},
+				Or: [][2]imap.SearchCriteria{{
+					{Text: []string{"report"}},
+					{Flag: []imap.Flag{imap.FlagFlagged}},
+				}},
+			},
+			want: false,
+		},
+		{
+			name:        "needsSeqNumSearch is ineligible",
+			criteria:    &imap.SearchCriteria{Text: []string{"invoice"}},
+			needsSeqNum: true,
+			want:        false,
+		},
+		{
+			name:          "ORDER BY seqnum is ineligible",
+			criteria:      &imap.SearchCriteria{Text: []string{"invoice"}},
+			orderByClause: "ORDER BY seqnum DESC",
+			want:          false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := db.canUseTextUnion(tt.criteria, tt.needsSeqNum, tt.orderByClause)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestBuildTextUnionQuerySQL verifies the SQL shape and arguments emitted for the
+// TEXT UNION rewrite. buildTextUnionQuery only assembles strings, so a nil *Database
+// is sufficient.
+func TestBuildTextUnionQuerySQL(t *testing.T) {
+	var db *Database
+
+	t.Run("pure TEXT splits into header and body branches", func(t *testing.T) {
+		paramCounter := 0
+		criteria := &imap.SearchCriteria{Text: []string{"Invoice"}}
+		const branchSelect = "m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq"
+		const outerSelect = "f.id, f.uid, f.mailbox_id, f.content_hash, f.created_modseq, f.updated_modseq, f.expunged_modseq, 0 as seqnum"
+
+		query, args, err := db.buildTextUnionQuery(criteria, 42, branchSelect, textUnionSortColumnsLight, outerSelect, "", MaxSearchResults, &paramCounter)
+		require.NoError(t, err)
+
+		// Two indexable branches, UNIONed.
+		assert.Contains(t, query, "UNION")
+		// Body branch: FTS join + tsvector predicate.
+		assert.Contains(t, query, "JOIN messages_fts mc ON m.content_hash = mc.content_hash")
+		assert.Contains(t, query, "text_body_tsv @@ plainto_tsquery('simple',")
+		// Header branch: trigram-indexable LIKE columns.
+		assert.Contains(t, query, "LOWER(m.subject) LIKE")
+		assert.Contains(t, query, "m.from_email_sort LIKE")
+		assert.Contains(t, query, "m.cc_email_sort LIKE")
+		// Outer query orders the deduped CTE (bias-busted) and limits.
+		assert.Contains(t, query, "FROM matched f")
+		assert.Contains(t, query, "ORDER BY f.uid + 0 DESC")
+		assert.Contains(t, query, fmt.Sprintf("LIMIT %d", MaxSearchResults))
+		// Sort columns carried in the CTE for ORDER BY.
+		assert.Contains(t, query, "m.subject_sort")
+
+		// Args: mailbox, tsquery term (original case), and lowercased LIKE pattern.
+		assert.Equal(t, int64(42), args["mailboxID"])
+		var sawTerm, sawLike bool
+		for _, v := range args {
+			if v == "Invoice" {
+				sawTerm = true
+			}
+			if v == "%invoice%" {
+				sawLike = true
+			}
+		}
+		assert.True(t, sawTerm, "tsquery arg should preserve original term case")
+		assert.True(t, sawLike, "LIKE arg should be lowercased and wildcard-wrapped")
+	})
+
+	t.Run("non-Text filter is replicated into both branches", func(t *testing.T) {
+		paramCounter := 0
+		criteria := &imap.SearchCriteria{
+			Text: []string{"invoice"},
+			Flag: []imap.Flag{imap.FlagSeen},
+		}
+		const branchSelect = "m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq"
+		const outerSelect = "f.id, f.uid, f.mailbox_id, f.content_hash, f.created_modseq, f.updated_modseq, f.expunged_modseq, 0 as seqnum"
+
+		query, _, err := db.buildTextUnionQuery(criteria, 7, branchSelect, textUnionSortColumnsLight, outerSelect, "", MaxSearchResults, &paramCounter)
+		require.NoError(t, err)
+
+		// The \Seen base condition (ms.flags & 1) must appear once per UNION branch.
+		seenFlag := FlagToBitwise(imap.FlagSeen)
+		needle := fmt.Sprintf("(ms.flags & %d) != 0", seenFlag)
+		assert.Equal(t, 2, strings.Count(query, needle),
+			"non-Text base filter should be replicated into both UNION branches")
+	})
+}
+
+// TestTextUnionSearchResults verifies that the TEXT UNION rewrite returns the same
+// set as the combined-OR form: a term matching only the body, only a header, or both
+// are all returned (the both-match deduped to one row), and non-matches excluded. It
+// also asserts the UNION query path is the one actually executed.
+func TestTextUnionSearchResults(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, mailboxID := setupSearchTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	// Unique, lowercase token so both the trigram (subject/header) and tsvector (body)
+	// matchers fire on it and it cannot collide with other content.
+	const token = "zzuniontokenzz"
+
+	bs := imap.BodyStructure(&imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Size: 100})
+	bsBytes, err := helpers.SerializeBodyStructureGob(&bs)
+	require.NoError(t, err)
+
+	// insertMsg inserts one message; bodyTSVText (when non-empty) is written directly to
+	// messages_fts.text_body_tsv because the async FTS worker does not run in tests.
+	insertMsg := func(uid int64, subject, contentHash, bodyTSVText string) {
+		_, err := db.GetWritePool().Exec(ctx, `
+			WITH inserted AS (
+				INSERT INTO messages
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart,
+				 internal_date, size, subject, sent_date, body_structure, recipients_json, created_modseq,
+				 subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
+				VALUES ($1,$2,'INBOX',$3,$4,$5,'d',$6, now(), 100, $7, now(), $8, '[]'::jsonb, nextval('messages_modseq'),
+				        $9, '', '', '', '', '')
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags)
+			SELECT id, mailbox_id, 0, '[]'::jsonb FROM inserted`,
+			accountID, mailboxID, uid, fmt.Sprintf("<%d@test>", uid), contentHash,
+			fmt.Sprintf("lp-%d", uid), subject, bsBytes, normalizeForSort(subject))
+		require.NoError(t, err)
+
+		if bodyTSVText != "" {
+			_, err = db.GetWritePool().Exec(ctx, `
+				INSERT INTO messages_fts (content_hash, text_body_tsv)
+				VALUES ($1, to_tsvector('simple', $2))
+				ON CONFLICT (content_hash) DO UPDATE SET text_body_tsv = EXCLUDED.text_body_tsv`,
+				contentHash, bodyTSVText)
+			require.NoError(t, err)
+		}
+	}
+
+	insertMsg(1, "Re: "+token+" please", "hash-A", "")                   // header-only match
+	insertMsg(2, "unrelated subject", "hash-B", "monthly "+token+" pdf") // body-only match
+	insertMsg(3, "about "+token, "hash-C", "the "+token+" is here")      // matches BOTH (dedup)
+	insertMsg(4, "nothing relevant", "hash-D", "plain ordinary content") // control: no match
+
+	pathCount := func(label string) float64 {
+		return testutil.ToFloat64(metrics.DBQueriesTotal.WithLabelValues(label, "success", "read"))
+	}
+	unionBefore := pathCount("search_messages_complex_text_union")
+
+	results, err := db.SearchMessagesWithCriteria(ctx, mailboxID, &imap.SearchCriteria{Text: []string{token}}, 0)
+	require.NoError(t, err)
+
+	gotUIDs := map[imap.UID]bool{}
+	for _, r := range results {
+		gotUIDs[r.UID] = true
+	}
+	assert.Len(t, results, 3, "union should return header-only, body-only, and both-match messages, deduped")
+	assert.True(t, gotUIDs[1], "header-only match must be returned")
+	assert.True(t, gotUIDs[2], "body-only match must be returned")
+	assert.True(t, gotUIDs[3], "both-match must be returned exactly once")
+	assert.False(t, gotUIDs[4], "non-matching message must be excluded")
+
+	assert.Equal(t, 1.0, pathCount("search_messages_complex_text_union")-unionBefore,
+		"TEXT search should execute via the UNION path")
 }
 
 // Database test helpers for search tests
