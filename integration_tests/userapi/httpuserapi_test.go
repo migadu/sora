@@ -1176,7 +1176,11 @@ func TestAuthRateLimiting(t *testing.T) {
 			t.Logf("Failed attempt %d: Got expected 401 Unauthorized", i+1)
 		}
 
-		// 4th attempt should be blocked with 429
+		// 4th attempt should be blocked. The block returns 401 "Invalid credentials"
+		// (NOT 429) so a rate-limited request is indistinguishable from a wrong-password
+		// failure, preventing account/IP enumeration (security-audit M14). We use the
+		// CORRECT password here: without the block it would return 200, so a 401 proves
+		// the block is in effect.
 		loginBody := map[string]string{
 			"email":    account.Email,
 			"password": account.Password, // Even with correct password!
@@ -1189,12 +1193,12 @@ func TestAuthRateLimiting(t *testing.T) {
 		}
 		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusTooManyRequests {
+		if resp.StatusCode != http.StatusUnauthorized {
 			bodyBytes, _ := io.ReadAll(resp.Body)
-			t.Errorf("Expected 429 Too Many Requests, got %d. Body: %s", resp.StatusCode, string(bodyBytes))
+			t.Errorf("Expected 401 Unauthorized (block masked as bad credentials), got %d. Body: %s", resp.StatusCode, string(bodyBytes))
 		}
 
-		t.Logf("✓ IP successfully blocked after 3 failed attempts (got 429)")
+		t.Logf("✓ IP successfully blocked after 3 failed attempts (got 401, indistinguishable from bad credentials)")
 	})
 
 	t.Run("Success_Resets_Failure_Count", func(t *testing.T) {
