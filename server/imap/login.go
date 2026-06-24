@@ -75,23 +75,21 @@ func (s *IMAPSession) Login(address, password string) error {
 
 				// Track rate limiting as a specific error type
 				metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
-
-				// Send BYE with ALERT per RFC 3501
-				// This immediately closes the connection with an informative message
-				return &imap.Error{
-					Type: imap.StatusResponseTypeBye,
-					Code: imap.ResponseCodeAlert,
-					Text: "Too many failed authentication attempts. Please try again later.",
-				}
+			} else {
+				// Unknown rate limiting error (shouldn't happen, but handle gracefully)
+				s.DebugLog("rate limited", "error", err)
+				metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
 			}
 
-			// Unknown rate limiting error (shouldn't happen, but handle gracefully)
-			s.DebugLog("rate limited", "error", err)
-			metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
+			// Return the SAME response as a bad-credential failure (NO [AUTHENTICATIONFAILED],
+			// identical text to the regular-auth path below) instead of a distinct BYE/ALERT.
+			// A divergent rate-limit response is an oracle: it confirms a targeted account/IP is
+			// being limited, which on a shared egress IP signals a deliberate lockout. The block
+			// is still enforced — only its observable form is made indistinguishable. (security-audit M14)
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeAuthenticationFailed,
-				Text: "Too many authentication attempts. Please try again later.",
+				Text: "Invalid address or password",
 			}
 		}
 	}

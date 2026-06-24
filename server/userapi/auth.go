@@ -130,8 +130,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Check authentication rate limiting (after cache check to avoid delays for cached hits)
 	if s.authLimiter != nil {
 		if err := s.authLimiter.CanAttemptAuth(ctx, remoteAddr, req.Email); err != nil {
+			// Return the SAME response as a bad-credential failure (401 "Invalid credentials")
+			// rather than a distinct 429. A divergent rate-limit response lets an attacker tell
+			// "this account/IP is being limited" apart from "wrong password", and on a shared
+			// egress IP confirms a targeted account is under attack. The block is still enforced;
+			// only its observable response is made indistinguishable. (security-audit M14)
+			// (Timing is intentionally NOT equalized here: running bcrypt on an already-blocked
+			// attempt would turn the rate limiter into a CPU-amplification vector. The fast
+			// rejection is existence-independent, so it is not a user-enumeration oracle.)
 			logger.Debug("User API: Login rate limited", "name", s.name, "ip", clientIP, "email", req.Email, "error", err)
-			s.writeError(w, http.StatusTooManyRequests, "Too many authentication attempts. Please try again later.")
+			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
 			return
 		}
 	}
@@ -140,6 +148,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	accountID, hashedPassword, err = s.rdb.GetCredentialForAuthWithRetry(ctx, req.Email)
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
+			// Equalize response timing with the wrong-password path (which runs bcrypt) so
+			// response time can't reveal whether the account exists. (security-audit M14)
+			db.DummyVerifyPassword(req.Password)
 			// Cache negative result if cache enabled (result=1 for user not found)
 			if s.authCache != nil {
 				s.authCache.SetFailure(req.Email, 1, req.Password)

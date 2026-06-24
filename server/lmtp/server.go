@@ -29,6 +29,12 @@ import (
 // DefaultMaxMessageSize is the default maximum message size for LMTP (50MB)
 const DefaultMaxMessageSize = 50 * 1024 * 1024
 
+// defaultLMTPMaxConnections bounds total concurrent LMTP connections when the operator
+// leaves max_connections unset. Generous enough not to throttle legitimate burst delivery
+// from internal MTAs, but finite so a single trusted source cannot exhaust resources.
+// (security-audit M13)
+const defaultLMTPMaxConnections = 1000
+
 // getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
@@ -230,10 +236,20 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		redirectRateWindow: options.RedirectRateWindow,
 	}
 
-	// Create connection limiter with trusted networks from proxy configuration
-	// LMTP doesn't use per-IP connection limits, only total connection limits
+	// Create connection limiter with trusted networks from proxy configuration.
+	// LMTP doesn't use per-IP connection limits (per-IP=0) — internal MTAs legitimately
+	// fan many concurrent deliveries through a single trusted source IP, so a per-IP cap
+	// would throttle normal traffic. We DO enforce a total ceiling: without one a single
+	// trusted source could open unbounded connections and exhaust goroutines/memory. When
+	// max_connections is unset (<=0) we apply a generous default rather than "unlimited",
+	// matching the listenBacklog default below. (security-audit M13)
+	maxConnections := options.MaxConnections
+	if maxConnections <= 0 {
+		maxConnections = defaultLMTPMaxConnections
+		logger.Info("LMTP: max_connections unset; applying default total connection ceiling", "name", name, "max_connections", maxConnections)
+	}
 	limiterTrustedProxies := server.GetTrustedProxiesForServer(backend.proxyReader)
-	backend.limiter = server.NewConnectionLimiterWithTrustedNets("LMTP", options.MaxConnections, 0, limiterTrustedProxies)
+	backend.limiter = server.NewConnectionLimiterWithTrustedNets("LMTP", maxConnections, 0, limiterTrustedProxies)
 
 	// Set listen backlog with reasonable default
 	backend.listenBacklog = options.ListenBacklog

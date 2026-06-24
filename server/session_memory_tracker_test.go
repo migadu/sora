@@ -88,6 +88,34 @@ func TestSessionMemoryTracker_LimitEnforcement(t *testing.T) {
 	assert.Equal(t, int64(1000), tracker.Current(), "Should not have allocated")
 }
 
+// TestSessionMemoryTracker_CanAllocate covers the pre-read guard (security-audit M13):
+// CanAllocate must report whether a prospective allocation fits WITHOUT committing it,
+// so callers can refuse an oversized body before reading it into memory.
+func TestSessionMemoryTracker_CanAllocate(t *testing.T) {
+	// Unlimited tracker: everything fits, nothing is committed.
+	unlimited := NewSessionMemoryTracker(0)
+	assert.True(t, unlimited.CanAllocate(1<<40), "0=unlimited should permit any size")
+	assert.Equal(t, int64(0), unlimited.Current(), "CanAllocate must not commit")
+
+	tracker := NewSessionMemoryTracker(1000)
+
+	// Fits exactly at and below the limit.
+	assert.True(t, tracker.CanAllocate(1000))
+	assert.True(t, tracker.CanAllocate(1))
+	// One byte over the limit does not fit.
+	assert.False(t, tracker.CanAllocate(1001))
+	// Negative is never allocatable.
+	assert.False(t, tracker.CanAllocate(-1))
+	// Pure query: no bytes were committed by any of the above.
+	assert.Equal(t, int64(0), tracker.Current())
+
+	// After a partial commit, the remaining headroom is respected.
+	require.NoError(t, tracker.Allocate(600))
+	assert.True(t, tracker.CanAllocate(400), "400 fits in remaining 400")
+	assert.False(t, tracker.CanAllocate(401), "401 exceeds remaining 400")
+	assert.Equal(t, int64(600), tracker.Current(), "CanAllocate still commits nothing")
+}
+
 func TestSessionMemoryTracker_NegativeAllocation(t *testing.T) {
 	tracker := NewSessionMemoryTracker(0)
 

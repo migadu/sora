@@ -70,10 +70,12 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 				}
 				if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, targetUser); err != nil {
 					s.DebugLog("SASL PLAIN rate limited", "error", err)
+					// Same response as a bad-credential failure (matches Login below) so the
+					// rate-limit state isn't an observable oracle. (security-audit M14)
 					return &imap.Error{
 						Type: imap.StatusResponseTypeNo,
 						Code: imap.ResponseCodeAuthenticationFailed,
-						Text: "Too many authentication attempts. Please try again later.",
+						Text: "Invalid address or password",
 					}
 				}
 			}

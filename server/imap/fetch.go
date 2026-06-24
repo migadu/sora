@@ -683,6 +683,15 @@ func (s *IMAPSession) transientBodyUnavailable(uid imap.UID, cause error) *imap.
 }
 
 func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
+	// Pre-read guard: refuse a body that can't fit the session budget BEFORE pulling it
+	// into memory. The post-read Allocate() below can only detect the overrun once the
+	// body is already resident — too late to prevent the OOM. msg.Size is the stored
+	// metadata size, so this bounds the single allocation. (security-audit M13)
+	if s.memTracker != nil && msg.Size > 0 && !s.memTracker.CanAllocate(int64(msg.Size)) {
+		metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+		return nil, fmt.Errorf("session memory limit exceeded: message size %d bytes exceeds available budget", msg.Size)
+	}
+
 	data, err := s.loadMessageBody(msg)
 	if err != nil {
 		return nil, err

@@ -4,11 +4,13 @@ package imap_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/server"
@@ -740,6 +742,87 @@ func TestIMAP_RateLimiting_Disabled(t *testing.T) {
 	}
 
 	t.Logf("✓ Rate limiting disabled - no blocking after many failures")
+}
+
+// TestIMAP_RateLimiting_ResponseIndistinguishableFromBadCred is the end-to-end proof for
+// security-audit M14: a Tier-1 (IP+username) blocked LOGIN must return the EXACT same wire
+// response as an ordinary wrong-password failure. If it returned a distinct response (the old
+// BYE [ALERT] "Too many failed authentication attempts"), an attacker on a shared egress IP
+// could use it as an oracle to confirm a targeted account is under attack / being locked out.
+//
+// Against the pre-fix code this test fails: the blocked attempt came back as a BYE (connection
+// drop / distinct text), not a NO with the bad-credential text.
+func TestIMAP_RateLimiting_ResponseIndistinguishableFromBadCred(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// Tier 1 only (IP+username), Tier 2 + delays disabled so we isolate the blocked-response shape.
+	srv, account1 := setupIMAPServerWithRateLimiting(t, server.AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIPUsername: 3,
+		IPUsernameBlockDuration:  2 * time.Minute,
+		IPUsernameWindowDuration: 5 * time.Minute,
+		MaxAttemptsPerIP:         0,   // Tier 2 disabled
+		DelayStartThreshold:      100, // delays disabled
+		CleanupInterval:          1 * time.Minute,
+	})
+	defer srv.Close()
+
+	// A second account we never block — gives us the canonical bad-credential response.
+	account2 := common.CreateTestAccount(t, srv.ResilientDB)
+
+	loginErr := func(email, password string) error {
+		c, err := imapclient.DialInsecure(srv.Address, nil)
+		if err != nil {
+			t.Fatalf("dial failed: %v", err)
+		}
+		defer c.Close()
+		return c.Login(email, password).Wait()
+	}
+
+	asImapErr := func(label string, err error) *imap.Error {
+		if err == nil {
+			t.Fatalf("%s: login should have failed", label)
+		}
+		var ie *imap.Error
+		if !errors.As(err, &ie) {
+			// A BYE/connection-drop surfaces as a non-*imap.Error here, which by itself means the
+			// blocked response is still distinguishable from a NO bad-credential failure.
+			t.Fatalf("%s: error is not *imap.Error (response still distinguishable): %T %v", label, err, err)
+		}
+		return ie
+	}
+
+	// Canonical bad-credential failure (account2 is below its Tier-1 threshold).
+	badCred := asImapErr("bad-cred", loginErr(account2.Email, "wrong-password"))
+
+	// Drive account1 into a Tier-1 block.
+	for i := 0; i < 3; i++ {
+		if err := loginErr(account1.Email, fmt.Sprintf("wrong%d", i)); err == nil {
+			t.Fatal("login should have failed with wrong password")
+		}
+	}
+	time.Sleep(50 * time.Millisecond) // let the limiter commit the block
+
+	// Blocked attempt — even with the CORRECT password it must be refused, and the refusal must
+	// look exactly like a wrong password.
+	blocked := asImapErr("blocked", loginErr(account1.Email, account1.Password))
+
+	if blocked.Type != badCred.Type || blocked.Code != badCred.Code || blocked.Text != badCred.Text {
+		t.Fatalf("rate-limit response distinguishable from bad-cred (M14 oracle):\n"+
+			"  bad-cred: type=%v code=%v text=%q\n"+
+			"  blocked:  type=%v code=%v text=%q",
+			badCred.Type, badCred.Code, badCred.Text, blocked.Type, blocked.Code, blocked.Text)
+	}
+
+	// Belt-and-suspenders: the response must not leak any rate-limit wording.
+	low := strings.ToLower(blocked.Text)
+	for _, banned := range []string{"too many", "blocked", "rate", "alert", "later", "delay"} {
+		if strings.Contains(low, banned) {
+			t.Fatalf("blocked response leaks rate-limit wording %q: %q", banned, blocked.Text)
+		}
+	}
+
+	t.Logf("✓ blocked LOGIN is byte-identical to bad-cred: type=%v code=%v text=%q", blocked.Type, blocked.Code, blocked.Text)
 }
 
 // setupIMAPServerWithRateLimiting creates an IMAP server with custom rate limiting config

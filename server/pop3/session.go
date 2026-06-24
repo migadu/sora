@@ -324,7 +324,10 @@ func (s *POP3Session) handleConnection() {
 					}
 
 					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR [LOGIN-DELAY] Too many authentication attempts. Please try again later.\r\n") {
+					// Same response as a bad-credential failure (the [AUTH] line below) instead of a
+					// distinct [LOGIN-DELAY], so the rate-limit state isn't an observable oracle that
+					// confirms a targeted account/IP is being limited. (security-audit M14)
+					if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
 						return
 					}
 					continue
@@ -1785,7 +1788,9 @@ func (s *POP3Session) handleConnection() {
 					if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
 						s.DebugLog("sasl plain rate limited", "error", err)
 						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [LOGIN-DELAY] Too many authentication attempts. Please try again later.\r\n") {
+						// Same response as a bad-credential failure (the [AUTH] line below) so the
+						// rate-limit state isn't an observable oracle. (security-audit M14)
+						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
 							return
 						}
 						continue
@@ -2232,6 +2237,15 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 	if s.ctx.Err() != nil {
 		s.DebugLog("request aborted, aborting message body fetch")
 		return nil, fmt.Errorf("request aborted")
+	}
+
+	// Pre-read guard: refuse a body that can't fit the session budget BEFORE pulling it
+	// into memory. The post-read Allocate() below can only detect the overrun once the
+	// body is already resident — too late to prevent the OOM. msg.Size is the stored
+	// metadata size, so this bounds the single allocation. (security-audit M13)
+	if s.memTracker != nil && msg.Size > 0 && !s.memTracker.CanAllocate(int64(msg.Size)) {
+		metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
+		return nil, fmt.Errorf("session memory limit exceeded: message size %d bytes exceeds available budget", msg.Size)
 	}
 
 	data, err := s.loadMessageBody(msg)

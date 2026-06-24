@@ -24,6 +24,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/lookupcache"
@@ -1828,6 +1829,11 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 	// Fetch credentials from database (no caching - we handle that here)
 	accountID, hashedPassword, err := s.rdb.GetCredentialForAuthWithRetry(ctx, address)
 	if err != nil {
+		// Equalize response timing with the wrong-password path (which runs bcrypt) so an
+		// attacker can't use response time to tell whether the account exists. (security-audit M14)
+		if errors.Is(err, consts.ErrUserNotFound) {
+			db.DummyVerifyPassword(password)
+		}
 		// Cache negative result if enabled (user not found)
 		if s.lookupCache != nil {
 			// AuthUserNotFound = 1 (from lookupcache package)

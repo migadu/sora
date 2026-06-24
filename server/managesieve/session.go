@@ -242,7 +242,9 @@ func (s *ManageSieveSession) handleConnection() {
 						s.DebugLog("rate limited", "error", err)
 					}
 
-					s.sendResponse("NO Too many authentication attempts. Please try again later.\r\n")
+					// Same response as a bad-credential failure (the "NO Authentication failed"
+					// line below) so the rate-limit state isn't an observable oracle. (security-audit M14)
+					s.sendResponse("NO Authentication failed\r\n")
 					recordMetrics("failure")
 					continue
 				}
@@ -1603,7 +1605,9 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 		if s.server.authLimiter != nil {
 			if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
 				s.DebugLog("rate limited", "error", err)
-				s.sendResponse("NO Too many authentication attempts. Please try again later.\r\n")
+				// Same response as a bad-credential failure (the "NO Authentication failed" line
+				// below) so the rate-limit state isn't an observable oracle. (security-audit M14)
+				s.sendResponse("NO Authentication failed\r\n")
 				return false
 			}
 		}

@@ -267,6 +267,33 @@ func VerifyPassword(hashedPassword, password string) error {
 	}
 }
 
+// dummyBcryptHash is a fixed, valid bcrypt hash at the current default cost. It is never
+// a real credential — it exists only to burn the same CPU as a genuine password
+// verification on auth paths that would otherwise short-circuit (account not found).
+var dummyBcryptHash []byte
+
+func init() {
+	// Generated once at startup so the cost always tracks bcrypt.DefaultCost (rather than
+	// drifting if the bcrypt default changes). The one-time cost is negligible.
+	if h, err := bcrypt.GenerateFromPassword([]byte("sora-timing-equalization-placeholder"), bcrypt.DefaultCost); err == nil {
+		dummyBcryptHash = h
+	} else {
+		// Defensive: GenerateFromPassword effectively never fails. Fall back to a known
+		// valid cost-10 hash so DummyVerifyPassword still performs real bcrypt work
+		// (a malformed hash would return instantly and defeat timing equalization).
+		dummyBcryptHash = []byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy")
+	}
+}
+
+// DummyVerifyPassword performs a constant-cost bcrypt comparison that always fails.
+// Call it on the "account not found" branch of an authentication path so the response
+// takes ~the same time as the "wrong password" branch (which runs bcrypt). Without it,
+// a non-existent account returns measurably faster than an existing one, giving an
+// attacker a user-enumeration timing oracle. (security-audit M14)
+func DummyVerifyPassword(password string) {
+	_ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(password))
+}
+
 // needsRehash checks if a bcrypt hash needs to be rehashed with the current default cost
 func NeedsRehash(hash string) bool {
 	// Only check bcrypt hashes
