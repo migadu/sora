@@ -29,6 +29,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"sync"
@@ -70,7 +71,14 @@ type Cache struct {
 func New(dbPath string, maxAge, purgeUnused, cleanupInterval time.Duration) (*Cache, error) {
 	sqliteDB, err := openAndValidate(dbPath)
 	if err != nil {
-		// Database may be corrupted — try to recreate
+		if !isCorruptionError(err) {
+			// Not corruption (e.g. permission denied, missing directory,
+			// read-only filesystem). Deleting and recreating cannot fix these
+			// and would only produce a misleading "corrupted" log — surface the
+			// real error so the operator can fix the path/permissions.
+			return nil, fmt.Errorf("failed to open auth cache db: %w", err)
+		}
+		// Database is genuinely corrupted — delete and recreate.
 		logger.Warn("AuthCache: Database appears corrupted, recreating", "path", dbPath, "error", err)
 		if removeErr := removeDBFiles(dbPath); removeErr != nil {
 			return nil, fmt.Errorf("failed to remove corrupted auth cache db: %w", removeErr)
@@ -90,6 +98,30 @@ func New(dbPath string, maxAge, purgeUnused, cleanupInterval time.Duration) (*Ca
 	}
 
 	return cache, nil
+}
+
+// isCorruptionError reports whether err indicates an actually corrupt SQLite
+// database, as opposed to a filesystem or permission problem. Only corruption
+// is safely recoverable by deleting and recreating the file; permission, path,
+// and read-only errors must be surfaced so an operator can fix them rather than
+// being silently (and futilely) "recreated".
+func isCorruptionError(err error) bool {
+	// Filesystem/access problems are never corruption.
+	if errors.Is(err, fs.ErrPermission) || errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, sig := range []string{
+		"disk image is malformed", // "database disk image is malformed"
+		"malformed",
+		"not a database", // "file is not a database"
+		"file is encrypted",
+	} {
+		if strings.Contains(msg, sig) {
+			return true
+		}
+	}
+	return false
 }
 
 // openAndValidate opens a SQLite database, sets pragmas, creates the schema,

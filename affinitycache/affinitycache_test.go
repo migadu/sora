@@ -2,6 +2,9 @@ package affinitycache
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -284,6 +287,43 @@ func TestCorruptedDB_Recreates(t *testing.T) {
 	now := time.Now()
 	if err := store.Set(ctx, AffinityEntry{Username: "a@b.com", Protocol: "imap", Backend: "b:143", AssignedAt: now, ExpiresAt: now.Add(time.Hour), NodeID: "n1"}); err != nil {
 		t.Fatalf("Set() after recovery error: %v", err)
+	}
+}
+
+func TestIsCorruptionError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"permission denied", fmt.Errorf("failed to create or set permissions on database file: %w", fs.ErrPermission), false},
+		{"missing directory", fmt.Errorf("open db: %w", fs.ErrNotExist), false},
+		{"locked is not corruption", errors.New("database is locked"), false},
+		{"disk image malformed", errors.New("database disk image is malformed"), true},
+		{"file is not a database", errors.New("file is not a database"), true},
+		{"encrypted or not a database", errors.New("file is encrypted or is not a database"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isCorruptionError(tt.err); got != tt.want {
+				t.Errorf("isCorruptionError(%q) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNew_PermissionError verifies a permission problem is surfaced as an error
+// rather than being misreported as corruption and futilely "recreated".
+func TestNew_PermissionError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses filesystem permissions")
+	}
+	dir := filepath.Join(t.TempDir(), "ro")
+	if err := os.Mkdir(dir, 0o500); err != nil { // read+execute, no write
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if _, err := New(filepath.Join(dir, "affinity.db")); err == nil {
+		t.Fatal("expected error creating db in read-only directory")
 	}
 }
 
