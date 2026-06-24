@@ -461,7 +461,7 @@ func (s *Session) handleConnection() {
 			return
 
 		case "CAPABILITY":
-			s.sendResponse("* CAPABILITY IMAP4rev1 AUTH=PLAIN LOGIN" + s.server.additionalCapsSuffix)
+			s.sendResponse("* CAPABILITY IMAP4rev2 IMAP4rev1 AUTH=PLAIN LOGIN" + s.server.additionalCapsSuffix)
 			s.sendResponse(fmt.Sprintf("%s OK CAPABILITY completed", tag))
 
 		case "ID":
@@ -527,7 +527,7 @@ func (s *Session) sendGreeting() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	greeting := "* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN LOGIN" + s.server.additionalCapsSuffix + "] Proxy Ready\r\n"
+	greeting := "* OK [CAPABILITY IMAP4rev2 IMAP4rev1 AUTH=PLAIN LOGIN" + s.server.additionalCapsSuffix + "] Proxy Ready\r\n"
 	_, err := s.clientWriter.WriteString(greeting)
 	if err != nil {
 		return err
