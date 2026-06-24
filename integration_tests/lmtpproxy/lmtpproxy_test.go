@@ -210,6 +210,10 @@ func setupLMTPProxyWithXCLIENT(t *testing.T, backendAddress string) (string, *LM
 			TrustedProxies:         []string{"127.0.0.0/8", "::1/128"}, // Trust localhost
 			ConnectTimeout:         5 * time.Second,
 			AuthIdleTimeout:        30 * time.Second,
+			// Enable proxy debug logging: tests here assert on proxy DEBUG lines
+			// (e.g. "XCLIENT and session reset completed"), which ProxySessionLogger
+			// gates behind this flag.
+			Debug: true,
 		},
 	)
 	if err != nil {

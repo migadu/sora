@@ -3,8 +3,6 @@ package lmtpproxy
 import (
 	"bufio"
 	"fmt"
-	"github.com/migadu/sora/logger"
-	"math/rand"
 	"strings"
 	"time"
 
@@ -19,8 +17,9 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 	// NewForwardingParams will extract real client IP from PROXY protocol or connection.
 	forwardingParams := server.NewForwardingParams(s.clientConn, s.proxyInfo)
 
-	// Add proxy-specific information
-	forwardingParams.SessionID = s.generateSessionID()
+	// Add proxy-specific information. Reuse the session id generated at construction so
+	// the proxy's logs (session=<id>) and the backend's logs (proxy_session=<id>) match.
+	forwardingParams.SessionID = s.sessionID
 	// Use ESMTP for PROTO parameter as per Postfix XCLIENT spec (valid values: SMTP, ESMTP)
 	forwardingParams.Protocol = "ESMTP"
 
@@ -60,7 +59,7 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 	// Ensure the deadline is cleared when the function returns.
 	defer func() {
 		if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
-			logger.Debug("LMTP Proxy: Warning - failed to clear read deadline after XCLIENT", "name", s.server.name, "error", err)
+			s.DebugLog("failed to clear read deadline after XCLIENT", "error", err)
 		}
 	}()
 
@@ -73,10 +72,10 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 	response = strings.TrimRight(response, "\r\n")
 
 	if strings.HasPrefix(response, "250") {
-		logger.Debug("LMTP Proxy: XCLIENT forwarding completed", "name", s.server.name, "user", s.username, "params", xclientParams)
+		s.DebugLog("XCLIENT forwarding completed", "params", xclientParams)
 	} else if strings.HasPrefix(response, "220") {
 		// XCLIENT succeeded - server reset session and sent new greeting
-		logger.Debug("LMTP Proxy: XCLIENT accepted - server reset session", "name", s.server.name, "greeting", response)
+		s.DebugLog("XCLIENT accepted - server reset session", "greeting", response)
 
 		// After XCLIENT, the session resets and we need to send LHLO again
 		lhloCommand := fmt.Sprintf("LHLO %s\r\n", s.server.hostname)
@@ -94,7 +93,7 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 				return fmt.Errorf("failed to read LHLO response after XCLIENT: %v", err)
 			}
 			lhloResponse = strings.TrimRight(lhloResponse, "\r\n")
-			logger.Debug("LMTP Proxy: Backend LHLO after XCLIENT", "name", s.server.name, "response", lhloResponse)
+			s.DebugLog("backend LHLO after XCLIENT", "response", lhloResponse)
 
 			// Check if this is the final response line (doesn't have "-" after status code)
 			if len(lhloResponse) >= 3 && lhloResponse[3] != '-' {
@@ -102,25 +101,13 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 			}
 		}
 
-		logger.Debug("LMTP Proxy: XCLIENT and session reset completed", "name", s.server.name, "user", s.username)
+		s.DebugLog("XCLIENT and session reset completed")
 	} else if strings.HasPrefix(response, "550") || strings.HasPrefix(response, "5") {
 		return fmt.Errorf("backend rejected XCLIENT command: %s", response)
 	} else {
 		// Unexpected response - log but don't fail
-		logger.Debug("LMTP Proxy: Unexpected XCLIENT response", "name", s.server.name, "response", response)
+		s.DebugLog("unexpected XCLIENT response", "response", response)
 	}
 
 	return nil
-}
-
-// generateSessionID creates a unique session identifier for this proxy session
-func (s *Session) generateSessionID() string {
-	// Generate a unique session ID for tracking.
-	sessionUser := s.username
-	if sessionUser == "" {
-		sessionUser = "unknown"
-	}
-	// A combination of protocol, hostname, username, and a random number
-	// provides a reasonably unique identifier for logging and debugging.
-	return fmt.Sprintf("lmtp-proxy-%s-%s-%d", s.server.hostname, sessionUser, rand.Intn(1000000))
 }

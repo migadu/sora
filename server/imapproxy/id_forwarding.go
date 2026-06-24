@@ -6,17 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/server"
 )
-
-// generateSessionID creates a unique session identifier for this proxy session
-func (s *Session) generateSessionID() string {
-	// Generate a unique session ID for tracking.
-	// A combination of protocol, hostname, username, and a random number
-	// provides a reasonably unique identifier for logging and debugging.
-	return fmt.Sprintf("imap-proxy-%s-%s-%d", s.server.hostname, s.username, rand.Intn(1000000))
-}
 
 // sendForwardingParametersToBackend sends an ID command to the backend server
 // with forwarding parameters containing the real client information
@@ -25,8 +16,10 @@ func (s *Session) sendForwardingParametersToBackend() error {
 	// The session does not have proxyInfo, so we pass nil.
 	forwardingParams := server.NewForwardingParams(s.clientConn, nil)
 
-	// Add proxy-specific information
-	forwardingParams.SessionID = s.generateSessionID()
+	// Add proxy-specific information. The session id is generated once at session
+	// construction and reused here so the proxy's logs (session=<id>) and the
+	// backend's logs (proxy_session=<id>) share the same value for tracing.
+	forwardingParams.SessionID = s.sessionID
 	forwardingParams.Variables["proxy-server"] = s.server.hostname
 	forwardingParams.Variables["proxy-user"] = s.username
 
@@ -42,9 +35,7 @@ func (s *Session) sendForwardingParametersToBackend() error {
 		fingerprint, err := ja4Conn.GetJA4Fingerprint()
 		if err == nil && fingerprint != "" {
 			forwardingParams.Variables["ja4-fingerprint"] = fingerprint
-			if s.server.debug {
-				logger.Debug("Forwarding JA4 fingerprint", "proxy", s.server.name, "user", s.username, "fingerprint", fingerprint)
-			}
+			s.DebugLog("forwarding JA4 fingerprint", "fingerprint", fingerprint)
 		}
 	}
 
@@ -85,7 +76,7 @@ func (s *Session) sendForwardingParametersToBackend() error {
 	// Ensure the deadline is cleared when the function returns.
 	defer func() {
 		if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
-			logger.Warn("Failed to clear read deadline after ID response", "proxy", s.server.name, "error", err)
+			s.WarnLog("failed to clear read deadline after ID response", "error", err)
 		}
 	}()
 
@@ -100,13 +91,9 @@ func (s *Session) sendForwardingParametersToBackend() error {
 
 		if strings.HasPrefix(response, "* ID") {
 			// Backend sent ID response, continue reading
-			if s.server.debug {
-				logger.Debug("Backend ID response", "proxy", s.server.name, "response", response)
-			}
+			s.DebugLog("backend ID response", "response", response)
 		} else if strings.HasPrefix(response, tag+" OK") {
-			if s.server.debug {
-				logger.Debug("ID forwarding completed successfully", "proxy", s.server.name, "user", s.username)
-			}
+			s.DebugLog("ID forwarding completed successfully")
 			break
 		} else if strings.HasPrefix(response, tag+" NO") || strings.HasPrefix(response, tag+" BAD") {
 			return fmt.Errorf("backend rejected ID command: %s", response)

@@ -15,7 +15,6 @@ import (
 
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
-	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
@@ -36,6 +35,7 @@ type POP3ProxySession struct {
 	routingInfo           *proxy.UserRoutingInfo
 	routingMethod         string // Routing method used: remotelookup, affinity, consistent_hash, roundrobin
 	serverAddr            string
+	sessionID             string // Proxy session ID for end-to-end tracing (also forwarded to the backend)
 	authenticated         bool
 	mutex                 sync.Mutex
 	errorCount            int
@@ -67,7 +67,7 @@ func (s *POP3ProxySession) handleConnection() {
 	// Enforce absolute session timeout to prevent hung sessions from leaking
 	if s.server.absoluteSessionTimeout > 0 {
 		timeout := time.AfterFunc(s.server.absoluteSessionTimeout, func() {
-			logger.Info("Absolute session timeout reached - force closing", "proxy", s.server.name, "duration", s.server.absoluteSessionTimeout, "username", s.username)
+			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.server.absoluteSessionTimeout)
 			s.cancel() // Force cancel context to unblock any stuck I/O
 		})
 		defer timeout.Stop()
@@ -387,6 +387,7 @@ func (s *POP3ProxySession) getLogger() *server.ProxySessionLogger {
 		ClientConn: s.clientConn,
 		Username:   s.username,
 		AccountID:  s.accountID,
+		SessionID:  s.sessionID,
 		Debug:      s.server.debug,
 	}
 }
@@ -403,6 +404,11 @@ func (s *POP3ProxySession) DebugLog(msg string, keysAndValues ...any) {
 // WarnLog logs at WARN level with session context
 func (s *POP3ProxySession) WarnLog(msg string, keysAndValues ...any) {
 	s.getLogger().WarnLog(msg, keysAndValues...)
+}
+
+// ErrorLog logs at ERROR level with session context
+func (s *POP3ProxySession) ErrorLog(msg string, keysAndValues ...any) {
+	s.getLogger().ErrorLog(msg, keysAndValues...)
 }
 
 func (s *POP3ProxySession) authenticate(username, password string) error {
@@ -422,7 +428,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-PROXY"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
-			logger.Info("POP3 Proxy: Delay queue full, rejecting connection", "username", username, "remote", remoteAddr)
+			s.InfoLog("delay queue full, rejecting connection", "username", username)
 			return errors.New("too many concurrent authentication attempts")
 		}
 		// Context cancelled or other error
@@ -545,9 +551,8 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		// Check if this is a rate limit error
 		var rateLimitErr *server.RateLimitError
 		if errors.As(err, &rateLimitErr) {
-			logger.Info("POP3 Proxy: Rate limit exceeded",
+			s.InfoLog("rate limit exceeded",
 				"username", username,
-				"ip", rateLimitErr.IP,
 				"reason", rateLimitErr.Reason,
 				"failure_count", rateLimitErr.FailureCount,
 				"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
@@ -618,12 +623,10 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				actualEmail = routingInfo.ActualEmail
 			}
 		}
-		// Get client address (GetAddrString is safe - uses IP.String() for TCP/UDP, no DNS lookup)
-		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 		if err != nil {
-			logger.Debug("remotelookup authentication", "proto", "pop3_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
+			s.DebugLog("remotelookup authentication", "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
 		} else {
-			logger.Debug("remotelookup authentication", "proto", "pop3_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
+			s.DebugLog("remotelookup authentication", "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
 		}
 
 		if err != nil {
@@ -1182,7 +1185,7 @@ func (s *POP3ProxySession) close() {
 	if s.releaseConn != nil {
 		s.releaseConn()
 		s.releaseConn = nil // Prevent double-release
-		logger.Debug("Connection limit released in close()", "proxy", s.server.name)
+		s.DebugLog("Connection limit released in close()")
 	}
 
 	// Log disconnection at INFO level

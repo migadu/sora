@@ -21,6 +21,7 @@ import (
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -84,6 +85,10 @@ func newSession(s *Server, conn net.Conn) *Session {
 		cancel:       sessionCancel,
 		errorCount:   0,
 		startTime:    time.Now(),
+		// Generate the session id once, up front, so every log line for this
+		// connection carries it. It's also forwarded to the backend (PROXY v2 TLV /
+		// XCLIENT) and logged there as proxy_session for end-to-end tracing.
+		sessionID: idgen.New(),
 	}
 }
 
@@ -91,7 +96,7 @@ func newSession(s *Server, conn net.Conn) *Session {
 func (s *Session) handleConnection() {
 	defer s.cancel()
 	defer s.close()
-	defer logger.Debug("handleConnection() returning", "proxy", s.server.name, "username", s.username)
+	defer s.DebugLog("handleConnection() returning")
 
 	// Ensure connections are closed when context is cancelled (e.g. by absolute timeout or server shutdown)
 	// This serves as a fail-safe to unblock reads that don't inherently respect context cancellation
@@ -109,7 +114,7 @@ func (s *Session) handleConnection() {
 	// Enforce absolute session timeout to prevent hung sessions from leaking
 	if s.server.absoluteSessionTimeout > 0 {
 		timeout := time.AfterFunc(s.server.absoluteSessionTimeout, func() {
-			logger.Info("Absolute session timeout reached - force closing", "proxy", s.server.name, "duration", s.server.absoluteSessionTimeout, "username", s.username)
+			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.server.absoluteSessionTimeout)
 			s.cancel() // Force cancel context to unblock any stuck I/O
 		})
 		defer timeout.Stop()
@@ -125,10 +130,9 @@ func (s *Session) handleConnection() {
 		}
 	}
 
-	clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
 	// Send greeting
 	if err := s.sendGreeting(); err != nil {
-		logger.Error("Failed to send greeting", "proxy", s.server.name, "remote", clientAddr, "error", err)
+		s.ErrorLog("Failed to send greeting", "error", err)
 		return
 	}
 
@@ -139,7 +143,7 @@ func (s *Session) handleConnection() {
 		// from sitting in the authentication phase forever.
 		if s.server.authIdleTimeout > 0 {
 			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
-				logger.Error("Failed to set read deadline", "proxy", s.server.name, "remote", clientAddr, "error", err)
+				s.ErrorLog("Failed to set read deadline", "error", err)
 				return
 			}
 		}
@@ -555,6 +559,7 @@ func (s *Session) getLogger() *server.ProxySessionLogger {
 		ClientConn: s.clientConn,
 		Username:   s.username,
 		AccountID:  s.accountID,
+		SessionID:  s.sessionID,
 		Debug:      s.server.debug,
 	}
 }
@@ -572,6 +577,11 @@ func (s *Session) DebugLog(msg string, keysAndValues ...any) {
 // WarnLog logs at WARN level with session context
 func (s *Session) WarnLog(msg string, keysAndValues ...any) {
 	s.getLogger().WarnLog(msg, keysAndValues...)
+}
+
+// ErrorLog logs at ERROR level with session context
+func (s *Session) ErrorLog(msg string, keysAndValues ...any) {
+	s.getLogger().ErrorLog(msg, keysAndValues...)
 }
 
 // authenticateUser authenticates the user against the database.
@@ -601,7 +611,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-PROXY"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
-			logger.Info("IMAP Proxy: Delay queue full, rejecting connection", "username", username, "remote", remoteAddr)
+			s.InfoLog("delay queue full, rejecting connection", "username", username)
 			return errors.New("too many concurrent authentication attempts")
 		}
 		// Context cancelled or other error
@@ -726,9 +736,8 @@ func (s *Session) authenticateUser(username, password string) error {
 		// Check if this is a rate limit error
 		var rateLimitErr *server.RateLimitError
 		if errors.As(err, &rateLimitErr) {
-			logger.Info("IMAP Proxy: Rate limit exceeded",
+			s.InfoLog("rate limit exceeded",
 				"username", username,
-				"ip", rateLimitErr.IP,
 				"reason", rateLimitErr.Reason,
 				"failure_count", rateLimitErr.FailureCount,
 				"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
@@ -761,7 +770,7 @@ func (s *Session) authenticateUser(username, password string) error {
 
 	if parseErr == nil && parsedAddr.HasSuffix() {
 		// Has suffix - check if it matches configured master username
-		logger.Debug("Comparing master username", "provided_suffix", parsedAddr.Suffix(), "configured_master", string(s.server.masterUsername))
+		s.DebugLog("Comparing master username", "provided_suffix", parsedAddr.Suffix(), "configured_master", string(s.server.masterUsername))
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
 			// Suffix matches master username - validate master password locally
 			if !checkMasterCredential(password, s.server.masterPassword) {
@@ -806,15 +815,13 @@ func (s *Session) authenticateUser(username, password string) error {
 				actualEmail = routingInfo.ActualEmail
 			}
 		}
-		// Get client address (GetAddrString is safe - uses IP.String() for TCP/UDP, no DNS lookup)
-		clientAddr := server.GetAddrString(s.clientConn.RemoteAddr())
-		logger.Debug("remotelookup authentication", "proto", "imap_proxy", "name", s.server.name, "remote", clientAddr, "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
+		s.DebugLog("remotelookup authentication", "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
 
 		if err != nil {
 			// Categorize the error type to determine fallback behavior
 			if errors.Is(err, proxy.ErrRemoteLookupInvalidResponse) {
 				// Invalid response from remotelookup (malformed 2xx) - this is a server bug, fail hard
-				logger.Error("remotelookup returned invalid response - server bug", "proxy", s.server.name, "user", username, "error", err)
+				s.ErrorLog("remotelookup returned invalid response - server bug", "error", err)
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return fmt.Errorf("remotelookup server error: invalid response")
@@ -1118,11 +1125,6 @@ func (s *Session) connectToBackend() error {
 	connectCtx, connectCancel := context.WithTimeout(s.ctx, connectTimeout)
 	defer connectCancel()
 
-	// Generate session ID if not already generated
-	if s.sessionID == "" {
-		s.sessionID = s.generateSessionID()
-	}
-
 	// Ensure routing info has client connection for JA4 fingerprint extraction
 	if s.routingInfo == nil {
 		// Create minimal routing info with client connection for JA4 extraction
@@ -1191,7 +1193,7 @@ func (s *Session) connectToBackend() error {
 	readTimeout := s.server.connManager.GetConnectTimeout()
 	if err := s.backendConn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
 		s.backendConn.Close()
-		logger.Error("Failed to set read deadline for backend greeting", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
+		s.ErrorLog("Failed to set read deadline for backend greeting", "backend", s.serverAddr, "error", err)
 		return fmt.Errorf("failed to set read deadline for greeting: %w", err)
 	}
 
@@ -1199,7 +1201,7 @@ func (s *Session) connectToBackend() error {
 	_, err = s.backendReader.ReadString('\n')
 	if err != nil {
 		s.backendConn.Close()
-		logger.Error("Failed to read backend greeting", "proxy", s.server.name, "backend", s.serverAddr, "user", s.username, "error", err)
+		s.ErrorLog("Failed to read backend greeting", "backend", s.serverAddr, "error", err)
 		return fmt.Errorf("failed to read backend greeting: %w", err)
 	}
 
@@ -1221,7 +1223,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 	// Set a deadline for the authentication process
 	authTimeout := s.server.connManager.GetConnectTimeout()
 	if err := s.backendConn.SetDeadline(time.Now().Add(authTimeout)); err != nil {
-		logger.Error("Failed to set auth deadline", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
+		s.ErrorLog("Failed to set auth deadline", "backend", s.serverAddr, "error", err)
 		return "", fmt.Errorf("failed to set auth deadline: %w", err)
 	}
 
@@ -1233,7 +1235,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 	_, err := s.backendWriter.WriteString(authCmd)
 	if err != nil {
 		s.mu.Unlock()
-		logger.Error("Failed to send AUTHENTICATE command to backend", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
+		s.ErrorLog("Failed to send AUTHENTICATE command to backend", "backend", s.serverAddr, "error", err)
 		return "", fmt.Errorf("%w: failed to send AUTHENTICATE command: %w", server.ErrBackendAuthFailed, err)
 	}
 	s.backendWriter.Flush()
@@ -1242,7 +1244,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 	// Read authentication response
 	response, err := s.backendReader.ReadString('\n')
 	if err != nil {
-		logger.Error("Failed to read auth response from backend", "proxy", s.server.name, "backend", s.serverAddr, "error", err)
+		s.ErrorLog("Failed to read auth response from backend", "backend", s.serverAddr, "error", err)
 		return "", fmt.Errorf("%w: failed to read auth response: %w", server.ErrBackendAuthFailed, err)
 	}
 
@@ -1265,7 +1267,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time) bool {
 	// Connect to backend
 	if err := s.connectToBackend(); err != nil {
-		logger.Error("Failed to connect to backend", "proxy", s.server.name, "user", s.username, "error", err)
+		s.ErrorLog("Failed to connect to backend", "error", err)
 		s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", clientTag))
 		return false
 	}
@@ -1288,7 +1290,7 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 	// Authenticate to backend with master credentials
 	backendResponse, err := s.authenticateToBackend()
 	if err != nil {
-		logger.Error("Backend authentication failed", "proxy", s.server.name, "user", s.username, "backend", s.serverAddr, "error", err)
+		s.ErrorLog("Backend authentication failed", "backend", s.serverAddr, "error", err)
 
 		// CRITICAL: Invalidate cache on backend authentication failure
 		// This ensures the next request does fresh remotelookup/database lookup
@@ -1346,32 +1348,32 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 func (s *Session) startProxy() {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error("PANIC in startProxy()", "proxy", s.server.name, "username", s.username, "panic", r)
+			s.ErrorLog("PANIC in startProxy()", "panic", r)
 			// Re-panic to preserve stack trace
 			panic(r)
 		}
 	}()
-	logger.Debug("startProxy() called", "proxy", s.server.name, "username", s.username)
+	s.DebugLog("startProxy() called")
 	if s.backendConn == nil {
-		logger.Error("Backend connection not established", "proxy", s.server.name, "user", s.username)
+		s.ErrorLog("Backend connection not established")
 		return
 	}
 
 	var wg sync.WaitGroup
-	logger.Debug("Created waitgroup", "proxy", s.server.name, "username", s.username)
+	s.DebugLog("Created waitgroup")
 
 	// Start activity updater
 	activityCtx, activityCancel := context.WithCancel(s.ctx)
 	defer activityCancel()
-	logger.Debug("Starting activity updater", "proxy", s.server.name, "username", s.username)
+	s.DebugLog("Starting activity updater")
 	go s.updateActivityPeriodically(activityCtx)
 
 	// Client to backend
-	logger.Debug("Starting client-to-backend copy goroutine", "proxy", s.server.name, "username", s.username)
+	s.DebugLog("Starting client-to-backend copy goroutine")
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer logger.Debug("Client-to-backend copy goroutine exiting", "proxy", s.server.name, "username", s.username)
+		defer s.DebugLog("Client-to-backend copy goroutine exiting")
 		// If this copy returns, it means the client has closed the connection or there was an error.
 		// We use half-close (CloseWrite) to signal EOF to the backend while allowing the backend
 		// to finish sending its response. This prevents "broken pipe" errors on LOGOUT.
@@ -1381,7 +1383,7 @@ func (s *Session) startProxy() {
 			// This works for both *net.TCPConn and *tls.Conn (Go 1.23+)
 			if closeWriter, ok := s.backendConn.(interface{ CloseWrite() error }); ok {
 				if err := closeWriter.CloseWrite(); err != nil {
-					logger.Debug("Failed to half-close backend connection", "proxy", s.server.name, "username", s.username, "error", err)
+					s.DebugLog("Failed to half-close backend connection", "error", err)
 				}
 			} else {
 				// Fallback for connections that don't support half-close
@@ -1389,7 +1391,7 @@ func (s *Session) startProxy() {
 			}
 		}()
 		bytesIn, err := server.CopyWithDeadline(s.ctx, s.backendConn, s.clientConn, "client-to-backend")
-		logger.Debug("Client-to-backend copy finished", "proxy", s.server.name, "username", s.username, "bytes", bytesIn, "error", err)
+		s.DebugLog("Client-to-backend copy finished", "bytes", bytesIn, "error", err)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "in").Add(float64(bytesIn))
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("error copying from client to backend", "error", err)
@@ -1397,11 +1399,11 @@ func (s *Session) startProxy() {
 	}()
 
 	// Backend to client
-	logger.Debug("Starting backend-to-client copy goroutine", "proxy", s.server.name, "username", s.username)
+	s.DebugLog("Starting backend-to-client copy goroutine")
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer logger.Debug("Backend-to-client copy goroutine exiting", "proxy", s.server.name, "username", s.username)
+		defer s.DebugLog("Backend-to-client copy goroutine exiting")
 		// If this copy returns, it means the backend has closed the connection or there was an error.
 		// We close the client connection to unblock the client-to-backend copy operation.
 		// The backend connection is NOT closed here — it is closed after wg.Wait() to avoid
@@ -1428,7 +1430,7 @@ func (s *Session) startProxy() {
 			// Fallback to direct copy if no buffered reader (shouldn't happen in normal flow)
 			bytesOut, err = server.CopyWithDeadline(s.ctx, s.clientConn, s.backendConn, "backend-to-client")
 		}
-		logger.Debug("Backend-to-client copy finished", "proxy", s.server.name, "username", s.username, "bytes", bytesOut, "error", err)
+		s.DebugLog("Backend-to-client copy finished", "bytes", bytesOut, "error", err)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "out").Add(float64(bytesOut))
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("error copying from backend to client", "error", err)
@@ -1442,24 +1444,24 @@ func (s *Session) startProxy() {
 	//   - this goroutine waits for ctx.Done()
 	//   - ctx.Done() fires when handleConnection() returns
 	//   - handleConnection() can't return because it's blocked in wg.Wait()
-	logger.Debug("Starting context cancellation handler goroutine", "proxy", s.server.name, "username", s.username)
+	s.DebugLog("Starting context cancellation handler goroutine")
 	go func() {
-		defer logger.Debug("Context cancellation handler goroutine exiting", "proxy", s.server.name, "username", s.username)
-		logger.Debug("Context cancellation handler waiting for ctx.Done()", "proxy", s.server.name, "username", s.username)
+		defer s.DebugLog("Context cancellation handler goroutine exiting")
+		s.DebugLog("Context cancellation handler waiting for ctx.Done()")
 		<-s.ctx.Done()
-		logger.Debug("Context cancelled - closing connections", "proxy", s.server.name, "username", s.username)
+		s.DebugLog("Context cancelled - closing connections")
 		s.clientConn.Close()
 		s.backendConn.Close()
 	}()
 
-	logger.Debug("Waiting for copy goroutines to finish", "proxy", s.server.name, "username", s.username)
+	s.DebugLog("Waiting for copy goroutines to finish")
 	wg.Wait()
 	// Full close of backend connection after both goroutines have exited.
 	// This ensures the client-to-backend goroutine's CloseWrite() has time to signal
 	// EOF to the backend before the connection is fully torn down, preventing
 	// "broken pipe" errors on the storage backend.
 	s.backendConn.Close()
-	logger.Debug("Copy goroutines finished - startProxy() returning", "proxy", s.server.name, "username", s.username)
+	s.DebugLog("Copy goroutines finished - startProxy() returning")
 }
 
 // close closes all connections.
@@ -1467,7 +1469,7 @@ func (s *Session) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	logger.Debug("Session close() called", "proxy", s.server.name, "username", s.username, "account_id", s.accountID)
+	s.DebugLog("Session close() called")
 
 	// Remove session from active tracking
 	s.server.removeSession(s)
@@ -1476,7 +1478,7 @@ func (s *Session) close() {
 	if s.releaseConn != nil {
 		s.releaseConn()
 		s.releaseConn = nil // Prevent double-release
-		logger.Debug("Connection limit released in close()", "proxy", s.server.name)
+		s.DebugLog("Connection limit released in close()")
 	}
 
 	// Log disconnection at INFO level
@@ -1496,17 +1498,17 @@ func (s *Session) close() {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 
-		logger.Debug("Attempting to unregister connection", "proxy", s.server.name, "account_id", s.accountID, "username", s.username, "client_addr", s.clientAddr)
+		s.DebugLog("Attempting to unregister connection")
 
 		// Use cached client address to avoid race with connection close
 		if err := s.server.connTracker.UnregisterConnection(ctx, s.accountID, "IMAP", s.clientAddr); err != nil {
 			// Connection tracking is non-critical monitoring data, so log but continue
 			s.WarnLog("Failed to unregister connection", "error", err)
 		} else {
-			logger.Debug("Successfully unregistered connection", "proxy", s.server.name, "account_id", s.accountID, "username", s.username)
+			s.DebugLog("Successfully unregistered connection")
 		}
 	} else {
-		logger.Debug("Skipping unregister - no connTracker", "proxy", s.server.name, "account_id", s.accountID)
+		s.DebugLog("Skipping unregister - no connTracker")
 	}
 
 	if s.clientConn != nil {
@@ -1545,7 +1547,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 	}
 
 	// Register for kick notifications
-	logger.Debug("IMAP Proxy: Registering session for kick notifications", "username", s.username, "account_id", s.accountID, "client_addr", s.clientAddr)
+	s.DebugLog("registering session for kick notifications")
 	kickChan := s.server.connTracker.RegisterSession(s.accountID)
 	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
 

@@ -525,7 +525,7 @@ func (s *Server) acceptConnections() error {
 			// CRITICAL: Panic recovery MUST clean up metrics and limiter
 			defer func() {
 				if r := recover(); r != nil {
-					logger.Debug("LMTP Proxy: Session panic recovered", "name", s.name, "panic", r)
+					session.DebugLog("session panic recovered", "panic", r)
 					// Unregister session from active tracking
 					s.unregisterSession(session)
 					// Decrement metrics

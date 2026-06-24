@@ -20,6 +20,7 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -520,6 +521,9 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 			cancel:      sessionCancel,
 			releaseConn: releaseConn, // Set cleanup function on session
 			proxyInfo:   proxyInfo,
+			// Generate the session id once, up front, so every log line carries it.
+			// It's also forwarded to the backend (XCLIENT), logged there as proxy_session.
+			sessionID: idgen.New(),
 		}
 
 		// Use real client IP from PROXY protocol if available
@@ -546,7 +550,7 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 			// CRITICAL: Panic recovery MUST call removeSession to prevent leak
 			defer func() {
 				if r := recover(); r != nil {
-					logger.Debug("POP3 Proxy: Session panic recovered", "proxy", s.name, "panic", r)
+					session.DebugLog("session panic recovered", "panic", r)
 					// Clean up session from active tracking
 					s.removeSession(session)
 					// Decrement metrics

@@ -622,7 +622,7 @@ func (s *Server) acceptConnections() error {
 			// CRITICAL: Panic recovery MUST call removeSession to prevent leak
 			defer func() {
 				if r := recover(); r != nil {
-					logger.Error("Session panic recovered", "proxy", s.name, "error", r)
+					session.ErrorLog("session panic recovered", "error", r)
 					// Clean up session from active tracking
 					s.removeSession(session)
 					// Decrement metrics

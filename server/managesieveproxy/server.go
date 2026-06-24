@@ -542,7 +542,7 @@ func (s *Server) acceptConnections() error {
 			// CRITICAL: Panic recovery MUST call removeSession to prevent leak
 			defer func() {
 				if r := recover(); r != nil {
-					logger.Debug("ManageSieve Proxy: Session panic recovered", "name", s.name, "panic", r)
+					session.DebugLog("session panic recovered", "panic", r)
 					// Clean up session from active tracking
 					s.removeSession(session)
 					// Decrement metrics

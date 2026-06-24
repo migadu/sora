@@ -16,6 +16,7 @@ import (
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -39,6 +40,7 @@ type Session struct {
 	accountID             int64
 	serverAddr            string
 	routingMethod         string
+	sessionID             string // Proxy session ID for end-to-end tracing (also forwarded to the backend)
 	clientAddr            string // Cached client address to avoid race with connection close
 	releaseConn           func() // Connection limiter cleanup function
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
@@ -77,6 +79,9 @@ func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *
 		startTime:            time.Now(),
 		proxyInfo:            proxyInfo,
 		registeredAccountIDs: make(map[int64]struct{}),
+		// Generate the session id once, up front, so every log line carries it.
+		// It's also forwarded to the backend (XCLIENT), logged there as proxy_session.
+		sessionID: idgen.New(),
 	}
 }
 
@@ -515,6 +520,7 @@ func (s *Session) getLogger() *server.ProxySessionLogger {
 		ClientConn: s.clientConn,
 		Username:   s.username,
 		AccountID:  s.accountID,
+		SessionID:  s.sessionID,
 		Debug:      s.server.debug,
 	}
 }
@@ -532,6 +538,11 @@ func (s *Session) DebugLog(msg string, keyvals ...any) {
 // WarnLog logs at WARN level with session context
 func (s *Session) WarnLog(msg string, keyvals ...any) {
 	s.getLogger().WarnLog(msg, keyvals...)
+}
+
+// ErrorLog logs at ERROR level with session context
+func (s *Session) ErrorLog(msg string, keyvals ...any) {
+	s.getLogger().ErrorLog(msg, keyvals...)
 }
 
 // stripUnsupportedRCPTParameters removes ESMTP parameters from RCPT TO commands that

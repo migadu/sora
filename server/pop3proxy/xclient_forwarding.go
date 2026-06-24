@@ -3,8 +3,6 @@ package pop3proxy
 import (
 	"bufio"
 	"fmt"
-	"github.com/migadu/sora/logger"
-	"math/rand"
 	"strings"
 	"time"
 
@@ -19,8 +17,10 @@ func (s *POP3ProxySession) sendForwardingParametersToBackend(writer *bufio.Write
 	// NewForwardingParams will extract real client IP from PROXY protocol or connection.
 	forwardingParams := server.NewForwardingParams(s.clientConn, s.proxyInfo)
 
-	// Add session-specific details not handled by NewForwardingParams
-	forwardingParams.SessionID = s.generateSessionID()
+	// Add session-specific details not handled by NewForwardingParams.
+	// Reuse the session id generated at construction so the proxy's logs (session=<id>)
+	// and the backend's logs (proxy_session=<id>) share the same value for tracing.
+	forwardingParams.SessionID = s.sessionID
 
 	// Add proxy-specific information
 	forwardingParams.Variables["proxy-server"] = s.server.hostname
@@ -54,7 +54,7 @@ func (s *POP3ProxySession) sendForwardingParametersToBackend(writer *bufio.Write
 	// Ensure the deadline is cleared when the function returns.
 	defer func() {
 		if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
-			logger.Debug("POP3 Proxy: Warning - failed to clear read deadline after XCLIENT response", "proxy", s.server.name, "error", err)
+			s.DebugLog("failed to clear read deadline after XCLIENT response", "error", err)
 		}
 	}()
 
@@ -67,23 +67,13 @@ func (s *POP3ProxySession) sendForwardingParametersToBackend(writer *bufio.Write
 	response = strings.TrimRight(response, "\r\n")
 
 	if strings.HasPrefix(response, "+OK") {
-		if s.server.debug {
-			logger.Debug("POP3 Proxy: XCLIENT forwarding completed successfully", "proxy", s.server.name, "user", s.username, "params", xclientParams)
-		}
+		s.DebugLog("XCLIENT forwarding completed successfully", "params", xclientParams)
 	} else if strings.HasPrefix(response, "-ERR") {
 		return fmt.Errorf("backend rejected XCLIENT command: %s", response)
 	} else {
 		// Unexpected response - log but don't fail
-		logger.Debug("POP3 Proxy: Unexpected XCLIENT response from backend", "proxy", s.server.name, "response", response)
+		s.DebugLog("unexpected XCLIENT response from backend", "response", response)
 	}
 
 	return nil
-}
-
-// generateSessionID creates a unique session identifier for this proxy session
-func (s *POP3ProxySession) generateSessionID() string {
-	// Generate a unique session ID for tracking.
-	// A combination of protocol, hostname, username, and a random number
-	// provides a reasonably unique identifier for logging and debugging.
-	return fmt.Sprintf("pop3-proxy-%s-%s-%d", s.server.hostname, s.username, rand.Intn(1000000))
 }
