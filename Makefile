@@ -1,5 +1,5 @@
 .PHONY: all clean build sora sora-admin install tests tests-race reset-test-db build-test-sora-admin \
-	integration-tests integration-tests-imap integration-tests-lmtp integration-tests-pop3 \
+	integration-tests integration-tests-imap integration-tests-imap-slowloris integration-tests-lmtp integration-tests-pop3 \
 	integration-tests-managesieve integration-tests-imapproxy integration-tests-lmtpproxy \
 	integration-tests-pop3proxy integration-tests-managesieveproxy integration-tests-userapiproxy \
 	integration-tests-connection-limits integration-tests-lmtp-connection-limits \
@@ -64,9 +64,13 @@ tests-race:
 	go test -v -race ./...
 
 # Helper variables for integration tests
-# Timeout set to 20m to accommodate long-running tests like slowloris (takes ~7 minutes)
 TEST_TIMEOUT = 20m
 TEST_FLAGS = -v -tags=integration -count=1 -timeout=$(TEST_TIMEOUT)
+# Slowloris timing tests live in their own package (integration_tests/imap_slowloris)
+# so they don't share the imap package's timeout budget. The two tests use real
+# wall-clock sleeps (~7m + ~9.5m run serially), so they get a larger timeout.
+SLOWLORIS_TIMEOUT = 25m
+SLOWLORIS_FLAGS = -v -tags=integration -count=1 -timeout=$(SLOWLORIS_TIMEOUT)
 DB_NAME = sora_test_db
 DB_USER = postgres
 DB_HOST = localhost
@@ -77,7 +81,7 @@ reset-test-db:
 	@SORA_TEST_DB_NAME="$(DB_NAME)" DB_HOST="$(DB_HOST)" DB_PORT="$(DB_PORT)" DB_USER="$(DB_USER)" go run ./scripts/reset-test-db/main.go > /dev/null 2>&1 || true
 
 # Run all integration tests (requires PostgreSQL)
-integration-tests: integration-tests-imap integration-tests-lmtp integration-tests-pop3 \
+integration-tests: integration-tests-imap integration-tests-imap-slowloris integration-tests-lmtp integration-tests-pop3 \
 	integration-tests-managesieve integration-tests-imapproxy integration-tests-lmtpproxy \
 	integration-tests-pop3proxy integration-tests-managesieveproxy integration-tests-userapiproxy \
 	integration-tests-connection-limits integration-tests-lmtp-connection-limits \
@@ -102,6 +106,12 @@ integration-tests-imap: reset-test-db build-test-sora-admin
 integration-tests-imap-quick: reset-test-db build-test-sora-admin
 	@echo "Running IMAP integration tests (quick mode, skipping long tests)..."
 	@cd integration_tests/imap && go test -short $(TEST_FLAGS) .
+
+# Long-running slowloris timing tests (real wall-clock, ~16m total) — isolated
+# package with its own timeout so they don't collide with the imap suite cap.
+integration-tests-imap-slowloris: reset-test-db build-test-sora-admin
+	@echo "Running IMAP slowloris timing tests (long-running)..."
+	@cd integration_tests/imap_slowloris && go test $(SLOWLORIS_FLAGS) .
 
 integration-tests-lmtp: reset-test-db
 	@echo "Running LMTP integration tests..."
@@ -232,8 +242,9 @@ help:
 	@echo "  integration-tests-quick - Run integration tests, skip long tests (e.g., slowloris)"
 	@echo ""
 	@echo "Core protocol integration tests:"
-	@echo "  integration-tests-imap          - IMAP protocol tests (includes long tests)"
+	@echo "  integration-tests-imap          - IMAP protocol tests"
 	@echo "  integration-tests-imap-quick    - IMAP protocol tests (quick, skip long tests)"
+	@echo "  integration-tests-imap-slowloris - IMAP slowloris timing tests (long-running, ~16m)"
 	@echo "  integration-tests-lmtp          - LMTP delivery tests"
 	@echo "  integration-tests-pop3          - POP3 protocol tests"
 	@echo "  integration-tests-managesieve   - ManageSieve tests"

@@ -1,7 +1,7 @@
 //go:build integration
 // +build integration
 
-package imap_test
+package imap_slowloris_test
 
 import (
 	"bufio"
