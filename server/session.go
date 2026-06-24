@@ -87,3 +87,8 @@ func (s *Session) DebugLog(msg string, keysAndValues ...any) {
 func (s *Session) WarnLog(msg string, keysAndValues ...any) {
 	s.log(logger.Warn, msg, keysAndValues...)
 }
+
+// ErrorLog logs at ERROR level with session context and structured key-value pairs
+func (s *Session) ErrorLog(msg string, keysAndValues ...any) {
+	s.log(logger.Error, msg, keysAndValues...)
+}

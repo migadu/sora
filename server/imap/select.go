@@ -226,7 +226,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 
 	selectData := &imap.SelectData{
 		// Flags defined for this mailbox (system flags, common keywords, and in-use custom flags)
-		Flags: getDisplayFlags(readCtx, s.server.rdb, mailbox),
+		Flags: getDisplayFlags(readCtx, s.server.rdb, mailbox, s.DebugLog),
 		// Flags that can be changed, restricted to the user's flag rights (RFC 4314 §5.1.1)
 		PermanentFlags: getPermanentFlags(userRights),
 		// RFC 4314 §5.2: SELECT is READ-ONLY when the user holds none of the rights

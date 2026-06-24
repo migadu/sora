@@ -19,7 +19,6 @@ import (
 	"github.com/migadu/go-sieve"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
-	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
@@ -217,7 +216,7 @@ func (s *ManageSieveSession) handleConnection() {
 			if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-LOGIN"); err != nil {
 				if errors.Is(err, server.ErrDelayQueueFull) {
 					// Delay queue full - reject immediately to prevent goroutine exhaustion
-					logger.Info("ManageSieve: Delay queue full, rejecting connection", "username", parts[0], "ip", s.RemoteIP)
+					s.InfoLog("delay queue full, rejecting connection", "username", parts[0])
 					s.sendResponse("NO Too many concurrent authentication attempts. Please try again later.\r\n")
 					recordMetrics("failure")
 					continue
@@ -232,9 +231,8 @@ func (s *ManageSieveSession) handleConnection() {
 					// Check if this is a rate limit error
 					var rateLimitErr *server.RateLimitError
 					if errors.As(err, &rateLimitErr) {
-						logger.Info("ManageSieve: Rate limit exceeded",
+						s.InfoLog("rate limit exceeded",
 							"address", address.FullAddress(),
-							"ip", rateLimitErr.IP,
 							"reason", rateLimitErr.Reason,
 							"failure_count", rateLimitErr.FailureCount,
 							"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
@@ -1593,7 +1591,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 		if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-SASL"); err != nil {
 			if errors.Is(err, server.ErrDelayQueueFull) {
 				// Delay queue full - reject immediately to prevent goroutine exhaustion
-				logger.Info("ManageSieve: Delay queue full, rejecting connection", "address", address.FullAddress(), "ip", s.RemoteIP)
+				s.InfoLog("delay queue full, rejecting connection", "address", address.FullAddress())
 				s.sendResponse("NO Too many concurrent authentication attempts. Please try again later.\r\n")
 				return false
 			}

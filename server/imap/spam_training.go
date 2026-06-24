@@ -9,7 +9,6 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
-	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/spamtraining"
 )
 
@@ -57,7 +56,7 @@ func (s *IMAPSession) submitMessageTraining(ctx context.Context, mailboxID int64
 	numSet := imap.UIDSetNum(uid)
 	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(bgCtx, mailboxID, numSet)
 	if err != nil {
-		logger.Warn("Failed to get message for spam training",
+		s.WarnLog("failed to get message for spam training",
 			"mailbox_id", mailboxID,
 			"uid", uid,
 			"type", trainingType,
@@ -66,7 +65,7 @@ func (s *IMAPSession) submitMessageTraining(ctx context.Context, mailboxID int64
 	}
 
 	if len(messages) == 0 {
-		logger.Warn("Message not found for spam training",
+		s.WarnLog("message not found for spam training",
 			"mailbox_id", mailboxID,
 			"uid", uid,
 			"type", trainingType)
@@ -77,7 +76,7 @@ func (s *IMAPSession) submitMessageTraining(ctx context.Context, mailboxID int64
 
 	// Validate S3 key components before attempting fetch
 	if msg.S3Domain == "" || msg.S3Localpart == "" || msg.ContentHash == "" {
-		logger.Warn("Message missing S3 key information - skipping spam training",
+		s.WarnLog("message missing S3 key information - skipping spam training",
 			"uid", uid,
 			"type", trainingType,
 			"has_domain", msg.S3Domain != "",
@@ -92,7 +91,7 @@ func (s *IMAPSession) submitMessageTraining(ctx context.Context, mailboxID int64
 	// Fetch message body from S3
 	reader, err := s.server.s3.GetWithRetry(bgCtx, s3Key)
 	if err != nil {
-		logger.Warn("Failed to fetch message body from S3 for spam training",
+		s.WarnLog("failed to fetch message body from S3 for spam training",
 			"content_hash", msg.ContentHash,
 			"uid", uid,
 			"type", trainingType,
@@ -104,7 +103,7 @@ func (s *IMAPSession) submitMessageTraining(ctx context.Context, mailboxID int64
 	// Read message body
 	messageBodyBytes, err := io.ReadAll(reader)
 	if err != nil {
-		logger.Warn("Failed to read message body for spam training",
+		s.WarnLog("failed to read message body for spam training",
 			"content_hash", msg.ContentHash,
 			"uid", uid,
 			"type", trainingType,
@@ -115,7 +114,7 @@ func (s *IMAPSession) submitMessageTraining(ctx context.Context, mailboxID int64
 	// Strip attachments from message
 	strippedBody, err := spamtraining.StripAttachments(messageBodyBytes)
 	if err != nil {
-		logger.Warn("Failed to strip attachments for spam training",
+		s.WarnLog("failed to strip attachments for spam training",
 			"uid", uid,
 			"type", trainingType,
 			"error", err)

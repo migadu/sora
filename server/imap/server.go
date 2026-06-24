@@ -956,7 +956,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	// Log proxy session ID if present for end-to-end tracing
 	if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
-		logger.Debug("IMAP: Received proxy session ID from PROXY v2 TLV", "name", s.name, "session_id", proxyInfo.ProxySessionID)
+		session.DebugLog("received proxy session ID from PROXY v2 TLV", "proxy_session", proxyInfo.ProxySessionID)
 		session.InfoLog("connected", "proxy_session", proxyInfo.ProxySessionID)
 	} else {
 		session.InfoLog("connected")

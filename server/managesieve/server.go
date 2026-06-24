@@ -500,12 +500,11 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		}
 
 		// Increment total connections counter
-		totalCount := s.totalConnections.Add(1)
+		s.totalConnections.Add(1)
 
 		// Prometheus metrics - connection established
 		metrics.ConnectionsTotal.WithLabelValues("managesieve", s.name, s.hostname).Inc()
 		metrics.ConnectionsCurrent.WithLabelValues("managesieve", s.name, s.hostname).Inc()
-		authCount := s.authenticatedConnections.Load()
 
 		sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
@@ -555,15 +554,8 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		// Initialize the mutex helper
 		session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "MANAGESIEVE", logFunc)
 
-		// Build connection info for logging
-		var remoteInfo string
-		if session.ProxyIP != "" {
-			remoteInfo = fmt.Sprintf("%s proxy=%s", session.RemoteIP, session.ProxyIP)
-		} else {
-			remoteInfo = session.RemoteIP
-		}
-		// Log connection with connection counters
-		logger.Debug("ManageSieve: new connection", "name", s.name, "remote", remoteInfo, "total_connections", totalCount, "authenticated_connections", authCount)
+		// Log connection with session context (protocol, remote, session id, conn counters)
+		session.DebugLog("new connection")
 
 		// Track session for graceful shutdown
 		s.addSession(session)

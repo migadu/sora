@@ -16,8 +16,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/migadu/sora/logger"
-
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -292,7 +290,7 @@ func (s *POP3Session) handleConnection() {
 			if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-PASS"); err != nil {
 				if errors.Is(err, server.ErrDelayQueueFull) {
 					// Delay queue full - reject immediately to prevent goroutine exhaustion
-					logger.Info("POP3: Delay queue full, rejecting connection", "address", userAddress.FullAddress(), "ip", s.RemoteIP)
+					s.InfoLog("delay queue full, rejecting connection", "address", userAddress.FullAddress())
 					recordMetrics("failure")
 					if s.handleClientError(writer, "-ERR [IN-USE] Too many concurrent authentication attempts. Please try again later.\r\n") {
 						return
@@ -309,9 +307,8 @@ func (s *POP3Session) handleConnection() {
 					// Check if this is a rate limit error
 					var rateLimitErr *server.RateLimitError
 					if errors.As(err, &rateLimitErr) {
-						logger.Info("POP3: Rate limit exceeded",
+						s.InfoLog("rate limit exceeded",
 							"address", userAddress.FullAddress(),
-							"ip", rateLimitErr.IP,
 							"reason", rateLimitErr.Reason,
 							"failure_count", rateLimitErr.FailureCount,
 							"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
@@ -1018,7 +1015,7 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			logger.Debug("POP3: Fetching message headers", "uid", msg.UID)
+			s.DebugLog("fetching message headers", "uid", msg.UID)
 			bodyData, err := s.getMessageBody(&msg)
 			if err != nil {
 				if err == consts.ErrMessageNotAvailable {
@@ -1251,7 +1248,7 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			logger.Debug("POP3: Fetching message body", "uid", msg.UID)
+			s.DebugLog("fetching message body", "uid", msg.UID)
 			bodyData, err := s.getMessageBody(&msg)
 			if err != nil {
 				if err == consts.ErrMessageNotAvailable {
@@ -1413,7 +1410,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			if len(parts) < 2 {
-				logger.Debug("missing message number")
+				s.DebugLog("missing message number")
 				recordMetrics("failure")
 				if s.handleClientError(writer, "-ERR Missing message number\r\n") {
 					return
@@ -1772,7 +1769,7 @@ func (s *POP3Session) handleConnection() {
 				if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-SASL"); err != nil {
 					if errors.Is(err, server.ErrDelayQueueFull) {
 						// Delay queue full - reject immediately to prevent goroutine exhaustion
-						logger.Info("POP3: Delay queue full, rejecting connection", "address", address.FullAddress(), "ip", s.RemoteIP)
+						s.InfoLog("delay queue full, rejecting connection", "address", address.FullAddress())
 						recordMetrics("failure")
 						if s.handleClientError(writer, "-ERR [IN-USE] Too many concurrent authentication attempts. Please try again later.\r\n") {
 							return
@@ -2274,16 +2271,16 @@ func (s *POP3Session) loadMessageBody(msg *db.Message) ([]byte, error) {
 			if cacheData, cacheErr := s.server.cache.Get(msg.ContentHash); cacheErr == nil && cacheData != nil {
 				// Validate cached data is not empty
 				if len(cacheData) == 0 {
-					logger.Warn("POP3: Cache contains empty body, falling through to S3", "uid", msg.UID, "content_hash", msg.ContentHash)
+					s.WarnLog("cache contains empty body, falling through to S3", "uid", msg.UID, "content_hash", msg.ContentHash)
 				} else {
-					logger.Debug("POP3: Cache hit", "uid", msg.UID)
+					s.DebugLog("cache hit", "uid", msg.UID)
 					return cacheData, nil
 				}
 			}
 		}
 
 		// Fallback to S3
-		logger.Debug("POP3: Cache miss - fetching from S3", "uid", msg.UID, "hash", msg.ContentHash)
+		s.DebugLog("cache miss - fetching from S3", "uid", msg.UID, "hash", msg.ContentHash)
 		data, err := s.fetchBodyFromS3(msg)
 		if err != nil {
 			// S3 is unavailable — fall back to the local staging file if the uploader
@@ -2292,7 +2289,7 @@ func (s *POP3Session) loadMessageBody(msg *db.Message) ([]byte, error) {
 			if s.server.uploader != nil {
 				filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
 				if diskData, diskErr := os.ReadFile(filePath); diskErr == nil && len(diskData) > 0 {
-					logger.Debug("POP3: S3 unavailable, served from local disk", "uid", msg.UID)
+					s.DebugLog("S3 unavailable, served from local disk", "uid", msg.UID)
 					return diskData, nil
 				}
 			}
@@ -2325,10 +2322,10 @@ func (s *POP3Session) loadMessageBody(msg *db.Message) ([]byte, error) {
 
 	// Not yet uploaded to S3: the body should be in this node's local staging dir.
 	if s.server.uploader == nil {
-		logger.Debug("POP3: No uploader configured, message not available", "uid", msg.UID)
+		s.DebugLog("no uploader configured, message not available", "uid", msg.UID)
 		return nil, consts.ErrMessageNotAvailable
 	}
-	logger.Debug("POP3: Fetching not yet uploaded message from disk", "uid", msg.UID)
+	s.DebugLog("fetching not yet uploaded message from disk", "uid", msg.UID)
 	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
 	if data, diskErr := os.ReadFile(filePath); diskErr == nil && len(data) > 0 {
 		return data, nil
@@ -2352,7 +2349,7 @@ func (s *POP3Session) loadMessageBody(msg *db.Message) ([]byte, error) {
 		for attempt := 0; attempt < attempts; attempt++ {
 			s3Data, s3Err := s.fetchBodyFromS3(msg)
 			if s3Err == nil {
-				logger.Debug("POP3: local staging file missing, served from S3", "uid", msg.UID, "attempt", attempt)
+				s.DebugLog("local staging file missing, served from S3", "uid", msg.UID, "attempt", attempt)
 				return s3Data, nil
 			}
 			// Only NoSuchKey ("object hasn't landed yet") benefits from waiting and
@@ -2380,7 +2377,7 @@ func (s *POP3Session) loadMessageBody(msg *db.Message) ([]byte, error) {
 	if pending {
 		return nil, errBodyTransientlyUnavailable
 	}
-	logger.Debug("POP3: message body not on disk and not in S3, content unavailable", "uid", msg.UID, "hash", msg.ContentHash)
+	s.DebugLog("message body not on disk and not in S3, content unavailable", "uid", msg.UID, "hash", msg.ContentHash)
 	return nil, consts.ErrMessageNotAvailable
 }
 
@@ -2428,22 +2425,22 @@ func (s *POP3Session) fetchBodyFromS3(msg *db.Message) ([]byte, error) {
 		reader, s3GetErr = s.server.s3.GetWithRetry(s.server.appCtx, s3Key)
 	}()
 	if s3GetErr != nil {
-		logger.Debug("POP3: S3 GetWithRetry failed", "uid", msg.UID, "s3_key", s3Key, "error", s3GetErr)
+		s.DebugLog("S3 GetWithRetry failed", "uid", msg.UID, "s3_key", s3Key, "error", s3GetErr)
 		return nil, fmt.Errorf("message UID %d: %w: %w", msg.UID, storage.ErrRetrieveFailed, s3GetErr)
 	}
 	defer reader.Close()
 
 	data, err := io.ReadAll(reader)
 	if err != nil {
-		logger.Debug("POP3: failed to read S3 response", "uid", msg.UID, "error", err)
+		s.DebugLog("failed to read S3 response", "uid", msg.UID, "error", err)
 		return nil, err
 	}
 	if len(data) == 0 {
-		logger.Warn("POP3: Retrieved empty body from S3", "uid", msg.UID, "hash", msg.ContentHash, "s3_key", s3Key)
+		s.WarnLog("retrieved empty body from S3", "uid", msg.UID, "hash", msg.ContentHash, "s3_key", s3Key)
 		return nil, fmt.Errorf("message UID %d (hash: %s): %w", msg.UID, msg.ContentHash, storage.ErrEmptyData)
 	}
 
-	logger.Debug("POP3: successfully fetched from S3", "uid", msg.UID, "size", len(data))
+	s.DebugLog("successfully fetched from S3", "uid", msg.UID, "size", len(data))
 	if s.server.cache != nil {
 		_ = s.server.cache.Put(msg.ContentHash, data)
 	}

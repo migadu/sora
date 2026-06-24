@@ -489,8 +489,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		// Create a new context for this session that inherits from app context
 		sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
-		totalCount := s.totalConnections.Add(1)
-		authCount := s.authenticatedConnections.Load()
+		s.totalConnections.Add(1)
 
 		// Prometheus metrics - connection established
 		metrics.ConnectionsTotal.WithLabelValues("pop3", s.name, s.hostname).Inc()
@@ -538,14 +537,7 @@ func (s *POP3Server) Start(errChan chan error) {
 		session.Stats = s
 		session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "POP3", session.InfoLog)
 
-		// Build connection info for logging
-		var remoteInfo string
-		if session.ProxyIP != "" {
-			remoteInfo = fmt.Sprintf("%s proxy=%s", session.RemoteIP, session.ProxyIP)
-		} else {
-			remoteInfo = session.RemoteIP
-		}
-		logger.Debug("POP3: new connection", "name", s.name, "remote", remoteInfo, "total_connections", totalCount, "authenticated_connections", authCount)
+		session.DebugLog("new connection")
 
 		// Track session for graceful shutdown
 		s.addSession(session)
@@ -563,7 +555,7 @@ func (s *POP3Server) Start(errChan chan error) {
 			// panic and crash the entire server process, dropping every connection.
 			defer func() {
 				if r := recover(); r != nil {
-					logger.Error("POP3: session panic recovered", "name", s.name, "panic", r, "stack", string(debug.Stack()))
+					session.ErrorLog("session panic recovered", "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 			session.handleConnection()

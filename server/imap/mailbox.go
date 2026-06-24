@@ -2,11 +2,9 @@ package imap
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
-
-	"github.com/migadu/sora/logger"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -65,7 +63,7 @@ func getPermanentFlags(rights string) []imap.Flag {
 // This includes standard system flags, common keywords, and any custom flags
 // found to be in use within this specific mailbox.
 // This is used for the FLAGS response in SELECT/EXAMINE.
-func getDisplayFlags(ctx context.Context, rdb *resilient.ResilientDatabase, dbMbox *db.DBMailbox) []imap.Flag {
+func getDisplayFlags(ctx context.Context, rdb *resilient.ResilientDatabase, dbMbox *db.DBMailbox, debugLog func(string, ...any)) []imap.Flag {
 	// Keyword identity is case-insensitive (RFC 9051 §2.3.2), so we must never
 	// advertise two case-variants of the same keyword. Key the set by the folded
 	// (lower-cased) flag name and keep one representative case per identity.
@@ -105,7 +103,7 @@ func getDisplayFlags(ctx context.Context, rdb *resilient.ResilientDatabase, dbMb
 		if err != nil {
 			// Log the error, but don't fail the SELECT/EXAMINE.
 			// The client will still get the base set of flags.
-			logger.Debug("Error fetching custom flags for mailbox", "mailbox_id", dbMbox.ID, "name", dbMbox.Name, "error", err)
+			debugLog("error fetching custom flags for mailbox", "mailbox_id", dbMbox.ID, "name", dbMbox.Name, "error", err)
 		} else {
 			for _, cf := range customFlagsFromDB {
 				addFlag(imap.Flag(cf))
@@ -117,6 +115,6 @@ func getDisplayFlags(ctx context.Context, rdb *resilient.ResilientDatabase, dbMb
 	for _, f := range flagsByFold {
 		finalFlagsList = append(finalFlagsList, f)
 	}
-	sort.Slice(finalFlagsList, func(i, j int) bool { return finalFlagsList[i] < finalFlagsList[j] }) // For consistent order
+	slices.Sort(finalFlagsList) // For consistent order
 	return finalFlagsList
 }

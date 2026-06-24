@@ -9,7 +9,6 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/db"
-	"github.com/migadu/sora/logger"
 )
 
 var _ imapserver.SessionThread = (*IMAPSession)(nil)
@@ -30,7 +29,7 @@ func (s *IMAPSession) Thread(numKind imapserver.NumKind, algorithm imap.ThreadAl
 	includeSubject := algorithm == imap.ThreadReferences || algorithm == imap.ThreadOrderedSubject
 	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(s.ctx, s.selectedMailbox.ID, criteria, includeSubject)
 	if err != nil {
-		logger.Error("Failed to fetch messages for threading", "err", err)
+		s.ErrorLog("failed to fetch messages for threading", "err", err)
 		return nil, fmt.Errorf("failed to fetch messages for threading: %w", err)
 	}
 
