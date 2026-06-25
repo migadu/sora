@@ -33,28 +33,64 @@ const Pop3MaxLineLength = 1024                  // RFC 1939 §3: commands and re
 
 type POP3Session struct {
 	server.Session
-	server         *POP3Server
-	conn           *net.Conn    // Connection to the client
-	mutex          sync.RWMutex // Mutex for protecting session state
-	mutexHelper    *server.MutexTimeoutHelper
-	authenticated  atomic.Bool        // Flag to indicate if the user has been authenticated
-	messages       []db.Message       // List of messages in the mailbox as returned by the LIST command
-	deleted        map[int]bool       // Map of message IDs marked for deletion
-	inboxMailboxID int64              // POP3 suppots only INBOX
-	ctx            context.Context    // Context for this session
-	cancel         context.CancelFunc // Function to cancel the session's context
-	errorsCount    int                // Number of errors encountered during the session
-	language       string             // Current language for responses (default "en")
-	utf8Mode       atomic.Bool        // UTF8 mode enabled for this session
-	releaseConn    func()             // Function to release connection from limiter
-	useMasterDB    atomic.Bool        // Pin session to master DB after a write to ensure consistency
-	startTime      time.Time
-	memTracker     *server.SessionMemoryTracker // Memory usage tracker for this session
+	server           *POP3Server
+	conn             *net.Conn    // Connection to the client
+	mutex            sync.RWMutex // Mutex for protecting session state
+	mutexHelper      *server.MutexTimeoutHelper
+	authenticated    atomic.Bool        // Flag to indicate if the user has been authenticated
+	messages         []db.POP3Message   // Lean message list for the mailbox, cached for the session (RFC 1939 stable numbering)
+	messagesMemBytes int64              // Bytes charged to memTracker for the cached messages slice (guarded by mutex)
+	deleted          map[int]bool       // Map of message IDs marked for deletion
+	inboxMailboxID   int64              // POP3 suppots only INBOX
+	ctx              context.Context    // Context for this session
+	cancel           context.CancelFunc // Function to cancel the session's context
+	errorsCount      int                // Number of errors encountered during the session
+	language         string             // Current language for responses (default "en")
+	utf8Mode         atomic.Bool        // UTF8 mode enabled for this session
+	releaseConn      func()             // Function to release connection from limiter
+	useMasterDB      atomic.Bool        // Pin session to master DB after a write to ensure consistency
+	startTime        time.Time
+	memTracker       *server.SessionMemoryTracker // Memory usage tracker for this session
 
 	// Session statistics for summary logging
 	messagesRetrieved int // Messages retrieved with RETR
 	messagesDeleted   int // Messages marked for deletion with DELE
 	messagesExpunged  int // Messages actually expunged on QUIT
+}
+
+// errPOP3MailboxTooLarge indicates the INBOX listing would exceed the session
+// memory limit. POP3 has no pagination (RFC 1939), so rather than silently
+// truncate the mailbox the server refuses the listing; the operator can raise
+// [limits] session_memory_limit (or set it to 0 for unlimited) to allow very
+// large mailboxes.
+var errPOP3MailboxTooLarge = errors.New("mailbox too large for session memory limit")
+
+// setMessagesLocked stores the freshly loaded list as the session's cached
+// messages and charges it against the per-session memory tracker, so the cached
+// slice counts toward the same [limits] session_memory_limit as fetched message
+// bodies. It must be called with the write lock held. It releases any prior
+// charge first (idempotent across reloads) and returns errPOP3MailboxTooLarge
+// without storing anything if the listing would exceed the limit.
+func (s *POP3Session) setMessagesLocked(messages []db.POP3Message) error {
+	var charged int64
+	for i := range messages {
+		charged += messages[i].ApproxMemSize()
+	}
+	if s.memTracker != nil {
+		if s.messagesMemBytes > 0 {
+			s.memTracker.Free(s.messagesMemBytes)
+			s.messagesMemBytes = 0
+		}
+		if err := s.memTracker.Allocate(charged); err != nil {
+			metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
+			s.WarnLog("INBOX listing exceeds session memory limit",
+				"messages", len(messages), "bytes", charged, "limit", s.memTracker.MaxAllowed())
+			return errPOP3MailboxTooLarge
+		}
+		s.messagesMemBytes = charged
+	}
+	s.messages = messages
+	return nil
 }
 
 func (s *POP3Session) handleConnection() {
@@ -635,7 +671,7 @@ func (s *POP3Session) handleConnection() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
 
-				messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
+				messages, err := s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.DebugLog("list error", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
@@ -653,9 +689,17 @@ func (s *POP3Session) handleConnection() {
 					recordMetrics("failure")
 					continue
 				}
-				s.messages = messages
-				s.DebugLog("loaded messages from database", "count", len(messages), "mailbox_id", mailboxID)
+				storeErr := s.setMessagesLocked(messages)
+				if storeErr == nil {
+					s.DebugLog("loaded messages from database", "count", len(messages), "mailbox_id", mailboxID)
+				}
 				release()
+				if storeErr != nil {
+					writer.WriteString("-ERR [SYS/TEMP] Mailbox too large to open in this session\r\n")
+					writer.Flush()
+					recordMetrics("failure")
+					continue
+				}
 			}
 
 			// Handle LIST with message number argument (RFC 1939 §5)
@@ -774,7 +818,7 @@ func (s *POP3Session) handleConnection() {
 				if s.useMasterDB.Load() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
-				messages, err := s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
+				messages, err := s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.DebugLog("uidl error", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
@@ -792,8 +836,14 @@ func (s *POP3Session) handleConnection() {
 					recordMetrics("failure")
 					continue
 				}
-				s.messages = messages
+				storeErr := s.setMessagesLocked(messages)
 				release()
+				if storeErr != nil {
+					writer.WriteString("-ERR [SYS/TEMP] Mailbox too large to open in this session\r\n")
+					writer.Flush()
+					recordMetrics("failure")
+					continue
+				}
 			}
 
 			// Handle UIDL with message number argument
@@ -937,14 +987,14 @@ func (s *POP3Session) handleConnection() {
 			release()
 
 			// Phase 2: Load messages if needed (outside of any lock).
-			var loadedMessages []db.Message
+			var loadedMessages []db.POP3Message
 			if needsLoading {
 				// Create a context for read operations that respects session pinning (atomic read, no lock needed)
 				readCtx := ctx
 				if s.useMasterDB.Load() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
-				loadedMessages, err = s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
+				loadedMessages, err = s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.DebugLog("top error", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
@@ -955,7 +1005,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Phase 3: Acquire lock to check message state and get a copy of the message.
-			var msg db.Message
+			var msg db.POP3Message
 			var isDeleted bool
 			var msgFound = false
 
@@ -976,7 +1026,13 @@ func (s *POP3Session) handleConnection() {
 
 			// If we loaded messages, update the session state.
 			if needsLoading {
-				s.messages = loadedMessages
+				if storeErr := s.setMessagesLocked(loadedMessages); storeErr != nil {
+					release()
+					writer.WriteString("-ERR [SYS/TEMP] Mailbox too large to open in this session\r\n")
+					writer.Flush()
+					recordMetrics("failure")
+					continue
+				}
 				s.DebugLog("loaded messages from database", "count", len(s.messages), "mailbox_id", mailboxID)
 			}
 
@@ -1173,14 +1229,14 @@ func (s *POP3Session) handleConnection() {
 			release()
 
 			// Phase 2: Load messages if needed (outside of any lock).
-			var loadedMessages []db.Message
+			var loadedMessages []db.POP3Message
 			if needsLoading {
 				// Create a context for read operations that respects session pinning (atomic read, no lock needed)
 				readCtx := ctx
 				if s.useMasterDB.Load() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
-				loadedMessages, err = s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
+				loadedMessages, err = s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.DebugLog("retr error", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
@@ -1191,7 +1247,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Phase 3: Acquire lock to check message state and get a copy of the message.
-			var msg db.Message
+			var msg db.POP3Message
 			var isDeleted bool
 			var msgFound = false
 
@@ -1210,7 +1266,13 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			if needsLoading {
-				s.messages = loadedMessages
+				if storeErr := s.setMessagesLocked(loadedMessages); storeErr != nil {
+					release()
+					writer.WriteString("-ERR [SYS/TEMP] Mailbox too large to open in this session\r\n")
+					writer.Flush()
+					recordMetrics("failure")
+					continue
+				}
 				s.DebugLog("loaded messages from database", "count", len(s.messages), "mailbox_id", mailboxID)
 			}
 
@@ -1442,14 +1504,14 @@ func (s *POP3Session) handleConnection() {
 			release()
 
 			// Phase 2: Load messages if needed (outside of any lock).
-			var loadedMessages []db.Message
+			var loadedMessages []db.POP3Message
 			if needsLoading {
 				// Create a context for read operations that respects session pinning (atomic read, no lock needed)
 				readCtx := ctx
 				if s.useMasterDB.Load() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
-				loadedMessages, err = s.server.rdb.ListMessagesWithRetry(readCtx, mailboxID)
+				loadedMessages, err = s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID)
 				if err != nil {
 					s.DebugLog("dele error", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
@@ -1471,7 +1533,13 @@ func (s *POP3Session) handleConnection() {
 
 			// If we loaded messages, update the session state.
 			if needsLoading {
-				s.messages = loadedMessages
+				if storeErr := s.setMessagesLocked(loadedMessages); storeErr != nil {
+					release()
+					writer.WriteString("-ERR [SYS/TEMP] Mailbox too large to open in this session\r\n")
+					writer.Flush()
+					recordMetrics("failure")
+					continue
+				}
 				s.DebugLog("loaded messages from database", "count", len(s.messages), "mailbox_id", mailboxID)
 			}
 
@@ -1994,7 +2062,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Phase 1: Collect messages to expunge under a read lock.
-			var messagesToExpunge []db.Message
+			var messagesToExpunge []db.POP3Message
 			var mailboxID int64
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
@@ -2177,9 +2245,14 @@ func (s *POP3Session) closeWithoutLock() error {
 		}
 		s.InfoLog("closed", "total_connections", totalCount, "authenticated_connections", authCount)
 
-		// Clean up session state
+		// Clean up session state. Release the memory charged for the cached message
+		// list back to the session tracker before dropping the slice.
 		s.User = nil
 		s.Id = ""
+		if s.memTracker != nil && s.messagesMemBytes > 0 {
+			s.memTracker.Free(s.messagesMemBytes)
+		}
+		s.messagesMemBytes = 0
 		s.messages = nil
 		s.deleted = nil
 		s.authenticated.Store(false)
@@ -2230,7 +2303,7 @@ const (
 	pop3BodyFetchRetryDelay    = 500 * time.Millisecond
 )
 
-func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
+func (s *POP3Session) getMessageBody(msg *db.POP3Message) ([]byte, error) {
 	if s.ctx.Err() != nil {
 		s.DebugLog("request aborted, aborting message body fetch")
 		return nil, fmt.Errorf("request aborted")
@@ -2264,7 +2337,7 @@ func (s *POP3Session) getMessageBody(msg *db.Message) ([]byte, error) {
 // Preference order:
 //   - uploaded messages:     local cache → S3 → local staging disk (S3 outage)
 //   - not-yet-uploaded msgs: local staging disk → S3 (cross-node / late-upload race)
-func (s *POP3Session) loadMessageBody(msg *db.Message) ([]byte, error) {
+func (s *POP3Session) loadMessageBody(msg *db.POP3Message) ([]byte, error) {
 	if msg.IsUploaded {
 		// Try cache first (nil-safe: cache is optional and not configured in tests).
 		if s.server.cache != nil {
@@ -2386,7 +2459,7 @@ func (s *POP3Session) loadMessageBody(msg *db.Message) ([]byte, error) {
 // uploaded (so a retry should find it in S3). It distinguishes the transient
 // read-before-upload race from genuine, permanent content loss. On a DB error it returns
 // true (conservative: a client retry is safer than reporting the message permanently gone).
-func (s *POP3Session) bodyUploadStillPending(msg *db.Message) bool {
+func (s *POP3Session) bodyUploadStillPending(msg *db.POP3Message) bool {
 	pending, err := s.server.rdb.PendingUploadExistsWithRetry(s.ctx, msg.ContentHash, msg.AccountID)
 	if err != nil {
 		s.WarnLog("could not check pending-upload status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
@@ -2406,7 +2479,7 @@ func (s *POP3Session) bodyUploadStillPending(msg *db.Message) bool {
 // fetchBodyFromS3 retrieves a message body from S3 using the key components
 // stored on the message record. It validates the payload is non-empty and warms
 // the local cache on success.
-func (s *POP3Session) fetchBodyFromS3(msg *db.Message) ([]byte, error) {
+func (s *POP3Session) fetchBodyFromS3(msg *db.POP3Message) ([]byte, error) {
 	if msg.S3Domain == "" || msg.S3Localpart == "" {
 		return nil, fmt.Errorf("message UID %d is missing S3 key information", msg.UID)
 	}

@@ -14,13 +14,13 @@ import (
 func TestListResponsePreservesMessageNumbers(t *testing.T) {
 	tests := []struct {
 		name     string
-		messages []db.Message
+		messages []db.POP3Message
 		deleted  map[int]bool
 		expected []string // expected lines in the multi-line response body
 	}{
 		{
 			name: "no deletions",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 				{Size: 300, UID: 3},
@@ -34,7 +34,7 @@ func TestListResponsePreservesMessageNumbers(t *testing.T) {
 		},
 		{
 			name: "middle message deleted",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 				{Size: 300, UID: 3},
@@ -48,7 +48,7 @@ func TestListResponsePreservesMessageNumbers(t *testing.T) {
 		},
 		{
 			name: "first message deleted",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 				{Size: 300, UID: 3},
@@ -62,7 +62,7 @@ func TestListResponsePreservesMessageNumbers(t *testing.T) {
 		},
 		{
 			name: "last message deleted",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 				{Size: 300, UID: 3},
@@ -76,7 +76,7 @@ func TestListResponsePreservesMessageNumbers(t *testing.T) {
 		},
 		{
 			name: "multiple non-contiguous deletions",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 				{Size: 300, UID: 3},
@@ -94,7 +94,7 @@ func TestListResponsePreservesMessageNumbers(t *testing.T) {
 		},
 		{
 			name: "all messages deleted",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 			},
@@ -103,7 +103,7 @@ func TestListResponsePreservesMessageNumbers(t *testing.T) {
 		},
 		{
 			name:     "empty mailbox",
-			messages: []db.Message{},
+			messages: []db.POP3Message{},
 			deleted:  map[int]bool{},
 			expected: []string{},
 		},
@@ -134,13 +134,13 @@ func TestListResponsePreservesMessageNumbers(t *testing.T) {
 func TestUIDLResponsePreservesMessageNumbers(t *testing.T) {
 	tests := []struct {
 		name     string
-		messages []db.Message
+		messages []db.POP3Message
 		deleted  map[int]bool
 		expected []string // expected lines in the multi-line response body
 	}{
 		{
 			name: "no deletions",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 				{Size: 300, UID: 3},
@@ -154,7 +154,7 @@ func TestUIDLResponsePreservesMessageNumbers(t *testing.T) {
 		},
 		{
 			name: "middle message deleted",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 				{Size: 300, UID: 3},
@@ -168,7 +168,7 @@ func TestUIDLResponsePreservesMessageNumbers(t *testing.T) {
 		},
 		{
 			name: "first message deleted",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 				{Size: 300, UID: 3},
@@ -182,7 +182,7 @@ func TestUIDLResponsePreservesMessageNumbers(t *testing.T) {
 		},
 		{
 			name: "multiple non-contiguous deletions",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 10},
 				{Size: 200, UID: 20},
 				{Size: 300, UID: 30},
@@ -200,7 +200,7 @@ func TestUIDLResponsePreservesMessageNumbers(t *testing.T) {
 		},
 		{
 			name: "all messages deleted",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 			},
@@ -231,7 +231,7 @@ func TestUIDLResponsePreservesMessageNumbers(t *testing.T) {
 // TestListResponseCount verifies that the count in the +OK header matches
 // the number of non-deleted messages.
 func TestListResponseCount(t *testing.T) {
-	messages := []db.Message{
+	messages := []db.POP3Message{
 		{Size: 100, UID: 1},
 		{Size: 200, UID: 2},
 		{Size: 300, UID: 3},
@@ -251,7 +251,7 @@ func TestListResponseCount(t *testing.T) {
 
 // TestUIDLResponseCount verifies the same for UIDL.
 func TestUIDLResponseCount(t *testing.T) {
-	messages := []db.Message{
+	messages := []db.POP3Message{
 		{Size: 100, UID: 1},
 		{Size: 200, UID: 2},
 		{Size: 300, UID: 3},
@@ -272,7 +272,7 @@ func TestUIDLResponseCount(t *testing.T) {
 // TestSingleMessageListResponse verifies the single-message LIST response format
 // per RFC 1939 §5: "LIST msg" returns "+OK msg size".
 func TestSingleMessageListResponse(t *testing.T) {
-	messages := []db.Message{
+	messages := []db.POP3Message{
 		{Size: 100, UID: 1},
 		{Size: 200, UID: 2},
 		{Size: 300, UID: 3},
@@ -341,7 +341,7 @@ func TestSingleMessageListResponse(t *testing.T) {
 
 // TestListResponseMessageNumbersAreOneIndexed verifies POP3 message numbers start at 1.
 func TestListResponseMessageNumbersAreOneIndexed(t *testing.T) {
-	messages := []db.Message{
+	messages := []db.POP3Message{
 		{Size: 999, UID: 42},
 	}
 	deleted := map[int]bool{}
@@ -360,14 +360,14 @@ func TestListResponseMessageNumbersAreOneIndexed(t *testing.T) {
 func TestComputeDeletedStats(t *testing.T) {
 	tests := []struct {
 		name          string
-		messages      []db.Message
+		messages      []db.POP3Message
 		deleted       map[int]bool
 		expectedCount int
 		expectedSize  int64
 	}{
 		{
 			name: "no deletions",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 				{Size: 300, UID: 3},
@@ -378,7 +378,7 @@ func TestComputeDeletedStats(t *testing.T) {
 		},
 		{
 			name: "one deletion",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 				{Size: 300, UID: 3},
@@ -389,7 +389,7 @@ func TestComputeDeletedStats(t *testing.T) {
 		},
 		{
 			name: "multiple deletions",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 				{Size: 300, UID: 3},
@@ -401,7 +401,7 @@ func TestComputeDeletedStats(t *testing.T) {
 		},
 		{
 			name: "all deleted",
-			messages: []db.Message{
+			messages: []db.POP3Message{
 				{Size: 100, UID: 1},
 				{Size: 200, UID: 2},
 			},
@@ -411,7 +411,7 @@ func TestComputeDeletedStats(t *testing.T) {
 		},
 		{
 			name:          "empty mailbox",
-			messages:      []db.Message{},
+			messages:      []db.POP3Message{},
 			deleted:       map[int]bool{},
 			expectedCount: 0,
 			expectedSize:  0,
@@ -441,7 +441,7 @@ func TestComputeDeletedStats(t *testing.T) {
 // TestStatAdjustmentWithDeletions verifies the STAT adjustment logic:
 // the DB-reported count/size minus deleted messages' count/size.
 func TestStatAdjustmentWithDeletions(t *testing.T) {
-	messages := []db.Message{
+	messages := []db.POP3Message{
 		{Size: 100, UID: 1},
 		{Size: 200, UID: 2},
 		{Size: 300, UID: 3},
@@ -468,7 +468,7 @@ func TestStatAdjustmentWithDeletions(t *testing.T) {
 
 // TestUIDLResponseUsesUID verifies that UIDL uses the UID as unique-id, not the index.
 func TestUIDLResponseUsesUID(t *testing.T) {
-	messages := []db.Message{
+	messages := []db.POP3Message{
 		{Size: 100, UID: imap.UID(42)},
 		{Size: 200, UID: imap.UID(99)},
 	}

@@ -44,6 +44,31 @@ type Message struct {
 	ExpungedModSeq *int64
 }
 
+// POP3Message is the minimal per-message projection used by the POP3 protocol
+// (LIST/UIDL/RETR/TOP/DELE/STAT). POP3 only ever reads these seven fields, so it
+// deliberately omits the heavy columns of Message (subject, recipients_json,
+// message_id, body structure, flags, modseqs, dates). A session that caches an
+// entire INBOX then holds several times less memory, and the listing query can
+// skip both the message_state JOIN and the sequence-number hydration that POP3
+// never consumes (message numbers are positional, not Seq-based).
+type POP3Message struct {
+	AccountID   int64
+	UID         imap.UID
+	ContentHash string
+	S3Domain    string
+	S3Localpart string
+	Size        int
+	IsUploaded  bool
+}
+
+// ApproxMemSize estimates the heap bytes retained by this cached entry, for
+// charging against the per-session memory limit. It counts a fixed struct
+// overhead plus the backing arrays of the variable-length string fields.
+func (m POP3Message) ApproxMemSize() int64 {
+	const structOverhead = 96 // struct fields + slice element + string headers
+	return int64(structOverhead + len(m.ContentHash) + len(m.S3Domain) + len(m.S3Localpart))
+}
+
 // SearchMessageResult represents a lightweight slice of message metadata
 // used exclusively for IMAP SEARCH/SORT operations to prevent massive
 // data serialization over the database wire.
