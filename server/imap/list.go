@@ -117,6 +117,16 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 					if !ok {
 						continue
 					}
+					// RFC 4314: STATUS data requires the 'r' (read) right. A shared mailbox can
+					// be listed with only 'l' (lookup); don't leak its counts via LIST-STATUS.
+					// Owned mailboxes (owner == this account) always have 'r', so only the few
+					// shared ones incur an ACL check — the batch fast path is preserved.
+					if mbox.AccountID != s.AccountID() {
+						hasRead, permErr := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mbox.ID, s.AccountID(), 'r')
+						if permErr != nil || !hasRead {
+							continue
+						}
+					}
 					summary, ok := summaries[mbox.ID]
 					if !ok {
 						continue

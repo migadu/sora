@@ -59,6 +59,17 @@ func (s *IMAPSession) MultiSearch(numKind imapserver.NumKind, mailboxes []string
 			}
 		}
 
+		// RFC 4314: SEARCH requires the 'r' (read) right. GetMailboxes also lists shared
+		// mailboxes that are visible with only the 'l' (lookup) right; skip any the user
+		// cannot read so MULTISEARCH cannot leak message UIDs/counts from them.
+		hasRead, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, mbox.ID, accountID, 'r')
+		if err != nil {
+			return nil, s.internalError("failed to check read permission for %s: %v", mboxName, err)
+		}
+		if !hasRead {
+			continue
+		}
+
 		// Execute search for this mailbox
 		messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(s.ctx, mbox.ID, criteria, 0)
 		if err != nil {
