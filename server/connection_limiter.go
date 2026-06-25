@@ -196,8 +196,14 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 		}
 	}
 
-	// Increment total counter
+	// Increment total counter, then re-check the limit. CanAcceptWithRealIP above is
+	// only an advisory pre-check; without this post-increment guard two concurrent
+	// accepts at (max-1) could both pass it and overshoot maxConnections.
 	total := cl.currentTotal.Add(1)
+	if cl.maxConnections > 0 && total > int64(cl.maxConnections) {
+		cl.currentTotal.Add(-1)
+		return nil, fmt.Errorf("maximum connections reached (%d/%d)", cl.maxConnections, cl.maxConnections)
+	}
 
 	// Log every 1000th accept to track connection rate
 	if total%1000 == 0 {
@@ -219,6 +225,18 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 			value, _ := cl.perIPConnections.LoadOrStore(trackingIP, &atomic.Int64{})
 			ipCounter = value.(*atomic.Int64)
 			perIP = ipCounter.Add(1)
+		}
+
+		// Post-increment per-IP guard, mirroring the total-counter guard above: close the
+		// check/increment TOCTOU so concurrent accepts from one IP can't overshoot maxPerIP.
+		if perIP > int64(cl.maxPerIP) {
+			if cl.ipTracker != nil {
+				cl.ipTracker.DecrementIP(trackingIP)
+			} else if ipCounter != nil {
+				ipCounter.Add(-1)
+			}
+			cl.currentTotal.Add(-1)
+			return nil, fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", trackingIP, cl.maxPerIP, cl.maxPerIP)
 		}
 
 		if realClientIP != "" {
