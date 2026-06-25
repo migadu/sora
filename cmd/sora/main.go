@@ -20,6 +20,7 @@ import (
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/errors"
 	"github.com/migadu/sora/pkg/health"
@@ -1095,6 +1096,20 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	for _, server := range allServers {
 		// Warn about unused config options
 		server.WarnUnusedConfigOptions(func(format string, args ...any) { logger.Info(fmt.Sprintf(format, args...)) })
+
+		// Surface a dangerous misconfiguration: plaintext authentication allowed without
+		// TLS on a publicly reachable listener (clients would send credentials in the
+		// clear). Mirrors each server's effective insecure-auth (InsecureAuth || !TLS)
+		// and stays silent on the normal private-backend-behind-proxy deployment, where
+		// BindIsPubliclyReachable is false for loopback/private binds (and for a wildcard
+		// bind on a host with no globally-routable address).
+		switch server.Type {
+		case "imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy":
+			if (server.InsecureAuth || !server.TLS) && helpers.BindIsPubliclyReachable(server.Addr) {
+				logger.Warn("plaintext authentication is allowed without TLS on a publicly reachable address; configure TLS or set insecure_auth=false",
+					"type", server.Type, "name", server.Name, "addr", server.Addr)
+			}
+		}
 
 		switch server.Type {
 		case "imap":
