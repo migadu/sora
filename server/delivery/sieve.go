@@ -3,6 +3,7 @@ package delivery
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -62,6 +63,7 @@ type StandardSieveExecutor struct {
 	RelayQueue         RelayQueue // Optional: disk-based queue for relay retry
 	RedirectRateLimit  int
 	RedirectRateWindow time.Duration
+	MaxRedirectHops    int
 }
 
 // ExecuteSieve executes Sieve scripts and returns target mailbox.
@@ -93,7 +95,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	var result sieveengine.Result
 	if activeScript != nil {
 		// Execute user script
-		executor, err := sieveengine.NewSieveExecutorWithOracle(activeScript.Script, recipient.AccountID, s.VacationOracle, s.VacationOracle, s.RedirectRateLimit, s.RedirectRateWindow)
+		executor, err := sieveengine.NewSieveExecutorWithOracle(activeScript.Script, recipient.AccountID, s.VacationOracle, s.VacationOracle, s.RedirectRateLimit, s.RedirectRateWindow, s.MaxRedirectHops)
 		if err != nil {
 			metrics.SieveExecutions.WithLabelValues(s.DeliveryCtx.MetricsLabel, "failure").Inc()
 			return mailboxName, false, nil, nil
@@ -135,16 +137,18 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	case sieveengine.ActionRedirect:
 		// Handle redirect via external relay
 		if recipient.FromAddress != nil {
+			// Stamp the outgoing copy with an incremented hop count (loop backstop).
+			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(helpers.RedirectHopCount(helpers.HeaderGetter(messageEntity.Header.Map()))+1))
 			// Try immediate delivery first if queue is not configured
 			if s.RelayQueue == nil && s.RelayHandler != nil {
-				err := s.RelayHandler.SendToExternalRelay(recipient.FromAddress.FullAddress(), result.RedirectTo, fullMessageBytes)
+				err := s.RelayHandler.SendToExternalRelay(recipient.FromAddress.FullAddress(), result.RedirectTo, relayBytes)
 				if err == nil && !result.Copy {
 					// Successfully redirected without copy
 					return "", true, nil, nil
 				}
 			} else if s.RelayQueue != nil {
 				// Queue for background delivery with retry
-				err := s.RelayQueue.Enqueue(recipient.FromAddress.FullAddress(), result.RedirectTo, "redirect", fullMessageBytes)
+				err := s.RelayQueue.Enqueue(recipient.FromAddress.FullAddress(), result.RedirectTo, "redirect", relayBytes)
 				if err != nil {
 					// Failed to enqueue, log error but don't fail delivery
 					s.DeliveryCtx.Logger.Log("Failed to enqueue redirect message: %v", err)

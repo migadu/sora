@@ -133,6 +133,7 @@ type LMTPServerBackend struct {
 
 	redirectRateLimit  int
 	redirectRateWindow time.Duration
+	maxRedirectHops    int
 
 	// Connection counters
 	totalConnections  atomic.Int64
@@ -188,6 +189,7 @@ type LMTPServerOptions struct {
 	InsecureAuth                bool     // Allow PLAIN auth over non-TLS connections (default: true for LMTP behind trusted network)
 	RedirectRateLimit           int
 	RedirectRateWindow          time.Duration
+	MaxRedirectHops             int
 }
 
 func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -234,6 +236,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		relayWorker:        options.RelayWorker,
 		redirectRateLimit:  options.RedirectRateLimit,
 		redirectRateWindow: options.RedirectRateWindow,
+		maxRedirectHops:    options.MaxRedirectHops,
 	}
 
 	// Create connection limiter with trusted networks from proxy configuration.

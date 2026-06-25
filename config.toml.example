@@ -1012,6 +1012,10 @@ limits.search_rate_limit_per_min = 60    # Maximum searches per minute per user 
 limits.search_rate_limit_window = "1m"   # Time window for search rate limiting (default: "1m").
 limits.redirect_rate_limit = 100         # Maximum SIEVE redirects per user (default: 100, set to 0 to disable).
 limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h").
+limits.max_redirect_hops = 2             # Max times one message may be redirected before suppression — mail-loop
+                                         # backstop, counted via the X-Sora-Loop header (default: 2; 1 = allow a
+                                         # single redirect then stop; 0 = unlimited). Delivered-To loop detection
+                                         # still applies regardless of this value.
 limits.max_auth_errors = 2               # Maximum authentication errors before disconnection (default: 2).
                                          # Applies to proxy servers only (imap_proxy, pop3_proxy, managesieve_proxy).
                                          # Protects against malformed commands and protocol abuse during authentication.

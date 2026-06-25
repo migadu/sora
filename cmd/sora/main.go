@@ -1363,6 +1363,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		InsecureAuth:         serverConfig.InsecureAuth || !serverConfig.TLS, // Default true when TLS not enabled (LMTP behind trusted network)
 		RedirectRateLimit:    serverConfig.GetRedirectRateLimit(),
 		RedirectRateWindow:   redirectRateWindow,
+		MaxRedirectHops:      serverConfig.GetMaxRedirectHops(),
 	})
 
 	if err != nil {
@@ -2173,6 +2174,7 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		AuthCache:          deps.authCacheInstance,
 		RedirectRateLimit:  serverConfig.GetRedirectRateLimit(),
 		RedirectRateWindow: redirectRateWindow,
+		MaxRedirectHops:    serverConfig.GetMaxRedirectHops(),
 	}
 
 	srv := adminapi.Start(ctx, deps.resilientDB, options, errChan)

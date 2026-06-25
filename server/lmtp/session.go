@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/delivery"
+	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/sieveengine"
 )
 
@@ -377,6 +379,44 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		return s.InternalError("failed to parse message: %v", err)
 	}
 
+	// Mail-loop detection + Delivered-To stamping (Postfix-style). If this message is in
+	// a Sora redirect loop (our X-Sora-Loop marker present AND a Delivered-To for this
+	// recipient), it has looped back to us — reject it instead of delivering (and possibly
+	// re-redirecting) it again. Otherwise stamp Delivered-To with the account's PRIMARY
+	// address (s.User.Address, set in Rcpt) — the same value the Admin API path uses — so
+	// loop detection is consistent across aliases and ingress paths, and within-account
+	// content dedup (per-account S3 keys) is preserved. Re-parse so downstream header/
+	// metadata extraction sees the stamped header (the prepended header does not change MIME
+	// body structure, so the buf.Bytes()-based body structure below stays correct).
+	if s.User != nil {
+		deliveredTo := s.User.Address.BaseAddress()
+		if helpers.IsRedirectLoop(helpers.HeaderGetter(messageContent.Header.Map()), deliveredTo) {
+			s.WarnLog("mail loop detected via Delivered-To, rejecting", "recipient", deliveredTo)
+			recordMetrics("failure")
+			return &smtp.SMTPError{
+				Code:         550,
+				EnhancedCode: smtp.EnhancedCode{5, 4, 6},
+				Message:      "routing loop detected (Delivered-To)",
+			}
+		}
+		// Add our Received: trace for the LMTP delivery hop (the final hop, as an MDA such
+		// as Dovecot would add), then put Delivered-To on top so it is the first header of
+		// the delivered message.
+		helo := ""
+		if s.conn != nil {
+			helo = s.conn.Hostname()
+		}
+		received := helpers.BuildReceivedHeader(
+			helpers.ReceivedFrom(helo, s.RemoteIP),
+			s.backend.hostname, "LMTP", deliveredTo, idgen.New(), time.Now().Format(time.RFC1123Z))
+		fullMessageBytes = helpers.PrependRawHeader(fullMessageBytes, received)
+		fullMessageBytes = helpers.PrependHeaderLine(fullMessageBytes, helpers.DeliveredToHeader, deliveredTo)
+		if messageContent, err = server.ParseMessage(bytes.NewReader(fullMessageBytes)); err != nil {
+			recordMetrics("failure")
+			return s.InternalError("failed to re-parse message after Delivered-To/Received: %v", err)
+		}
+	}
+
 	contentHash := helpers.HashContent(fullMessageBytes)
 	s.DebugLog("message parsed", "content_hash", contentHash)
 
@@ -515,6 +555,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			sieveVacOracle,
 			s.backend.redirectRateLimit,
 			s.backend.redirectRateWindow,
+			s.backend.maxRedirectHops,
 		)
 		if userScriptErr != nil {
 			s.WarnLog("failed to get/create sieve executor", "error", userScriptErr)
@@ -705,7 +746,10 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		// Queue the message for external relay delivery if configured
 		if s.backend.relayQueue != nil {
 			s.DebugLog("queueing message for relay delivery")
-			err := s.sendToExternalRelay(s.sender.FullAddress(), result.RedirectTo, fullMessageBytes)
+			// Stamp the outgoing copy with an incremented hop count (loop backstop).
+			hops := helpers.RedirectHopCount(helpers.HeaderGetter(messageContent.Header.Map()))
+			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(hops+1))
+			err := s.sendToExternalRelay(s.sender.FullAddress(), result.RedirectTo, relayBytes)
 			if err != nil {
 				s.DebugLog("error enqueuing redirected message, falling back to inbox", "error", err)
 				// Continue processing even if queue fails, store in INBOX as fallback

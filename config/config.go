@@ -797,6 +797,7 @@ type ServerLimitsConfig struct {
 	SearchRateLimitWindow string `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
 	RedirectRateLimit     *int   `toml:"redirect_rate_limit,omitempty"`       // Redirect rate limit (per account across the window, 0=unlimited, default: 100)
 	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (default: 1h)
+	MaxRedirectHops       *int   `toml:"max_redirect_hops,omitempty"`         // Max times one message may be redirected before suppression (mail-loop backstop, 0=unlimited, default: 2)
 	SessionMemoryLimit    string `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
 	MaxAuthErrors         int    `toml:"max_auth_errors,omitempty"`           // Maximum authentication errors before disconnection (default: 2)
 }
@@ -1208,6 +1209,15 @@ func (s *ServerConfig) GetRedirectRateWindow() (time.Duration, error) {
 		return helpers.ParseDuration(s.Limits.RedirectRateWindow)
 	}
 	return time.Hour, nil // Default: 1 hour
+}
+
+// GetMaxRedirectHops returns how many times one message may be redirected before
+// further redirects are suppressed (mail-loop backstop). 0 means unlimited.
+func (s *ServerConfig) GetMaxRedirectHops() int {
+	if s.Limits != nil && s.Limits.MaxRedirectHops != nil {
+		return *s.Limits.MaxRedirectHops
+	}
+	return helpers.DefaultMaxRedirectHops
 }
 
 // GetSessionMemoryLimit parses the session memory limit

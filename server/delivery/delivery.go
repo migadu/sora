@@ -22,6 +22,7 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/uploader"
 )
 
@@ -84,6 +85,27 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	metrics.MessageSizeBytes.WithLabelValues(d.MetricsLabel).Observe(float64(len(messageBytes)))
 	metrics.BytesThroughput.WithLabelValues(d.MetricsLabel, "in").Add(float64(len(messageBytes)))
 	metrics.MessageThroughput.WithLabelValues(d.MetricsLabel, "received", "success").Inc()
+
+	// Mail-loop detection + Delivered-To stamping (Postfix-style; see the LMTP path).
+	// Skipped for the migration/Sieve-bypass path (TargetMailbox set): those imports
+	// must preserve the original bytes/UIDs and commonly already carry a Delivered-To.
+	// Reject a message in a Sora redirect loop (X-Sora-Loop marker + matching
+	// Delivered-To), otherwise stamp the recipient address and re-parse.
+	if recipient.Address != nil && recipient.TargetMailbox == "" {
+		deliveredTo := recipient.Address.BaseAddress()
+		if helpers.IsRedirectLoop(helpers.HeaderGetter(messageEntity.Header.Map()), deliveredTo) {
+			result.ErrorMessage = "routing loop detected (Delivered-To)"
+			return result, fmt.Errorf("mail loop detected for %s", deliveredTo)
+		}
+		// Add our Received: trace for this delivery hop, then Delivered-To on top.
+		received := helpers.BuildReceivedHeader("", d.Hostname, "HTTP", deliveredTo, idgen.New(), time.Now().Format(time.RFC1123Z))
+		messageBytes = helpers.PrependRawHeader(messageBytes, received)
+		messageBytes = helpers.PrependHeaderLine(messageBytes, helpers.DeliveredToHeader, deliveredTo)
+		if messageEntity, err = message.Read(bytes.NewReader(messageBytes)); err != nil {
+			result.ErrorMessage = fmt.Sprintf("Invalid RFC822 message after Delivered-To/Received: %v", err)
+			return result, err
+		}
+	}
 
 	// Parse message metadata
 	mailHeader := mail.Header{Header: messageEntity.Header}

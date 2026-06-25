@@ -276,6 +276,7 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 		RelayQueue:         s.relayQueue,
 		RedirectRateLimit:  s.redirectRateLimit,
 		RedirectRateWindow: s.redirectRateWindow,
+		MaxRedirectHops:    s.maxRedirectHops,
 	}
 
 	deliveryCtx.SieveExecutor = sieveExecutor

@@ -67,6 +67,7 @@ type Server struct {
 	authCache          AuthCacheStats                       // persistent auth cache (optional)
 	redirectRateLimit  int                                  // Max redirects per account
 	redirectRateWindow time.Duration                        // Window for redirect limit
+	maxRedirectHops    int                                  // Max redirect hops per message (mail-loop backstop)
 }
 
 // ServerOptions holds configuration options for the HTTP API server
@@ -95,6 +96,7 @@ type ServerOptions struct {
 	AuthCache          AuthCacheStats                       // persistent auth cache (optional)
 	RedirectRateLimit  int
 	RedirectRateWindow time.Duration
+	MaxRedirectHops    int
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol               bool     // Enable PROXY protocol support for incoming connections
@@ -212,6 +214,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		authCache:          options.AuthCache,
 		redirectRateLimit:  options.RedirectRateLimit,
 		redirectRateWindow: options.RedirectRateWindow,
+		maxRedirectHops:    options.MaxRedirectHops,
 	}
 
 	return s, nil

@@ -121,12 +121,12 @@ func NewSieveExecutorWithExtensions(scriptContent string, enabledExtensions []st
 }
 
 // NewSieveExecutorWithOracle creates a new SieveExecutor with the given script content, AccountID, and oracles.
-func NewSieveExecutorWithOracle(scriptContent string, AccountID int64, vacOracle VacationOracle, redirectOracle RedirectOracle, redirectRateLimit int, redirectRateWindow time.Duration) (Executor, error) {
-	return NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, vacOracle, redirectOracle, redirectRateLimit, redirectRateWindow, nil)
+func NewSieveExecutorWithOracle(scriptContent string, AccountID int64, vacOracle VacationOracle, redirectOracle RedirectOracle, redirectRateLimit int, redirectRateWindow time.Duration, maxRedirectHops int) (Executor, error) {
+	return NewSieveExecutorWithOracleAndExtensions(scriptContent, AccountID, vacOracle, redirectOracle, redirectRateLimit, redirectRateWindow, maxRedirectHops, nil)
 }
 
 // NewSieveExecutorWithOracleAndExtensions creates a new SieveExecutor with the given script content, AccountID, oracles, and enabled extensions.
-func NewSieveExecutorWithOracleAndExtensions(scriptContent string, AccountID int64, vacOracle VacationOracle, redirectOracle RedirectOracle, redirectRateLimit int, redirectRateWindow time.Duration, enabledExtensions []string) (Executor, error) {
+func NewSieveExecutorWithOracleAndExtensions(scriptContent string, AccountID int64, vacOracle VacationOracle, redirectOracle RedirectOracle, redirectRateLimit int, redirectRateWindow time.Duration, maxRedirectHops int, enabledExtensions []string) (Executor, error) {
 	scriptReader := strings.NewReader(scriptContent)
 	options := sieve.DefaultOptions()
 	options.EnabledExtensions = enabledExtensions
@@ -141,6 +141,7 @@ func NewSieveExecutorWithOracleAndExtensions(scriptContent string, AccountID int
 		redirectOracle:     redirectOracle,
 		redirectRateLimit:  redirectRateLimit,
 		redirectRateWindow: redirectRateWindow,
+		maxRedirectHops:    maxRedirectHops,
 	}
 
 	return &SieveExecutor{
@@ -320,6 +321,7 @@ type SievePolicy struct {
 	redirectOracle     RedirectOracle
 	redirectRateLimit  int
 	redirectRateWindow time.Duration
+	maxRedirectHops    int // mail-loop backstop; 0 = unlimited
 }
 
 func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData, addr string) (bool, error) {
@@ -334,6 +336,14 @@ func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData
 		vals, _ := d.Msg.HeaderGet(k)
 		return vals
 	}
+
+	// (0) Mail-loop backstop: refuse to redirect a message Sora has already
+	// redirected maxRedirectHops times (counted via the X-Sora-Loop header).
+	// maxRedirectHops <= 0 disables this backstop (Delivered-To still applies).
+	if p.maxRedirectHops > 0 && helpers.RedirectHopCount(headerGet) >= p.maxRedirectHops {
+		return false, nil
+	}
+
 	if reason := helpers.ShouldSuppressAuto(d.Envelope.EnvelopeFrom(), headerGet); reason != "" {
 		return false, nil
 	}

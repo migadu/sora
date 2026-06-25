@@ -50,7 +50,7 @@ func evalRedirect(t *testing.T, target string, vacOracle VacationOracle, redirec
 	t.Helper()
 	script := fmt.Sprintf("redirect %q;", target)
 	exts := []string{"envelope", "fileinto", "redirect", "encoded-character", "imap4flags", "variables", "relational", "vacation", "copy", "regex"}
-	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, vacOracle, redirectOracle, limit, window, exts)
+	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, vacOracle, redirectOracle, limit, window, 0, exts)
 	if err != nil {
 		t.Fatalf("failed to create executor for target %q: %v", target, err)
 	}
