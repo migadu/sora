@@ -17,6 +17,11 @@
 # - Syntax errors (e.g., "f" instead of "false") will fail with helpful hints
 # - Run './sora --config config.toml' to validate your configuration
 
+# GLOBAL: bcrypt cost factor for password hashing (clamped to 10..14, default 12).
+# Higher is stronger but slower per login; raising it transparently rehashes existing
+# lower-cost hashes on the user's next successful login.
+bcrypt_cost = 12
+
 # ADMIN CLI CONFIGURATION (for sora-admin tool)
 # =============================================================================
 # Configuration for the sora-admin CLI tool to connect to the HTTP Admin API server.

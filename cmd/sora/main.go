@@ -19,6 +19,7 @@ import (
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/errors"
 	"github.com/migadu/sora/pkg/health"
@@ -142,6 +143,9 @@ func main() {
 	// Clean up default database config if user explicitly set empty sections
 	// This allows proxy-only mode without database
 	cleanupDatabaseDefaults(&cfg)
+
+	// Apply the configured bcrypt cost (clamped) for password hashing/rehash.
+	db.SetBcryptCost(cfg.GetBcryptCost())
 
 	// Initialize logging with zap logger
 	logFile, err := logger.Initialize(cfg.Logging)

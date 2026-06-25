@@ -1029,8 +1029,26 @@ type Config struct {
 	AdminCLI         AdminCLIConfig         `toml:"admin_cli"`         // Admin CLI tool configuration
 	TimeoutScheduler TimeoutSchedulerConfig `toml:"timeout_scheduler"` // Global timeout scheduler configuration
 
+	BcryptCost *int `toml:"bcrypt_cost,omitempty"` // bcrypt cost for password hashing (clamped 10..14, default 12)
+
 	// Dynamic server instances (top-level array)
 	DynamicServers []ServerConfig `toml:"server"`
+}
+
+// GetBcryptCost returns the configured bcrypt cost for password hashing, clamped to
+// [10, 14] (rejects weaker-than-current and absurdly slow values). Default 12.
+func (c *Config) GetBcryptCost() int {
+	cost := 12
+	if c.BcryptCost != nil {
+		cost = *c.BcryptCost
+	}
+	if cost < 10 {
+		cost = 10
+	}
+	if cost > 14 {
+		cost = 14
+	}
+	return cost
 }
 
 // NewDefaultConfig creates a Config struct with default values.

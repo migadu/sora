@@ -196,10 +196,31 @@ func GenerateSHA512HashHex(password string) string {
 	return sha512PrefixHex + encoded
 }
 
+// BcryptCost is the cost used for password hashing and rehash decisions. Default 12;
+// override at startup via SetBcryptCost (from config). Set once before serving, then
+// read concurrently.
+var BcryptCost = 12
+
+// SetBcryptCost sets the bcrypt cost (clamped to [10,14]) and regenerates the timing
+// dummy hash so DummyVerifyPassword keeps matching real-verify timing. Call once at
+// startup, before serving.
+func SetBcryptCost(cost int) {
+	if cost < 10 {
+		cost = 10
+	}
+	if cost > 14 {
+		cost = 14
+	}
+	BcryptCost = cost
+	if h, err := bcrypt.GenerateFromPassword([]byte("sora-timing-equalization-placeholder"), BcryptCost); err == nil {
+		dummyBcryptHash = h
+	}
+}
+
 // GenerateBcryptHash creates a new bcrypt hash with the BLF-CRYPT prefix
 // Returns a string in the format {BLF-CRYPT}bcrypt_hash
 func GenerateBcryptHash(password string) (string, error) {
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), BcryptCost)
 	if err != nil {
 		return "", fmt.Errorf("error generating bcrypt hash: %w", err)
 	}
@@ -273,9 +294,9 @@ func VerifyPassword(hashedPassword, password string) error {
 var dummyBcryptHash []byte
 
 func init() {
-	// Generated once at startup so the cost always tracks bcrypt.DefaultCost (rather than
+	// Generated once at startup so the cost always tracks BcryptCost (rather than
 	// drifting if the bcrypt default changes). The one-time cost is negligible.
-	if h, err := bcrypt.GenerateFromPassword([]byte("sora-timing-equalization-placeholder"), bcrypt.DefaultCost); err == nil {
+	if h, err := bcrypt.GenerateFromPassword([]byte("sora-timing-equalization-placeholder"), BcryptCost); err == nil {
 		dummyBcryptHash = h
 	} else {
 		// Defensive: GenerateFromPassword effectively never fails. Fall back to a known
@@ -319,7 +340,7 @@ func NeedsRehash(hash string) bool {
 
 	// Current cost should be between the $2a$ and the next $
 	currentCost := parts[2]
-	defaultCost := fmt.Sprintf("%02d", bcrypt.DefaultCost)
+	defaultCost := fmt.Sprintf("%02d", BcryptCost)
 
 	return currentCost != defaultCost
 }

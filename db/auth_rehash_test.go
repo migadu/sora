@@ -22,7 +22,7 @@ func TestNeedsRehash(t *testing.T) {
 			name: "Default Cost Bcrypt",
 			hashCreator: func() string {
 				// Generate bcrypt with default cost
-				hash, _ := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost)
+				hash, _ := bcrypt.GenerateFromPassword([]byte("password"), BcryptCost)
 				return string(hash)
 			},
 			needsRehash: false,
@@ -31,7 +31,7 @@ func TestNeedsRehash(t *testing.T) {
 			name: "Lower Cost Bcrypt",
 			hashCreator: func() string {
 				// Generate bcrypt with lower cost
-				hash, _ := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost-1)
+				hash, _ := bcrypt.GenerateFromPassword([]byte("password"), BcryptCost-1)
 				return string(hash)
 			},
 			needsRehash: true,
@@ -40,9 +40,9 @@ func TestNeedsRehash(t *testing.T) {
 			name: "Higher Cost Bcrypt",
 			hashCreator: func() string {
 				// Generate bcrypt with higher cost (if possible)
-				cost := bcrypt.DefaultCost + 1
+				cost := BcryptCost + 1
 				if cost > bcrypt.MaxCost {
-					t.Skipf("Cannot test with higher cost; DefaultCost (%d) is too close to MaxCost (%d)", bcrypt.DefaultCost, bcrypt.MaxCost)
+					t.Skipf("Cannot test with higher cost; DefaultCost (%d) is too close to MaxCost (%d)", BcryptCost, bcrypt.MaxCost)
 				}
 				hash, err := bcrypt.GenerateFromPassword([]byte("password"), cost)
 				if err != nil {
@@ -56,7 +56,7 @@ func TestNeedsRehash(t *testing.T) {
 			name: "BLF-CRYPT Default Cost",
 			hashCreator: func() string {
 				// Generate bcrypt with default cost
-				hash, _ := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost)
+				hash, _ := bcrypt.GenerateFromPassword([]byte("password"), BcryptCost)
 				return "{BLF-CRYPT}" + string(hash)
 			},
 			needsRehash: false,
@@ -65,7 +65,7 @@ func TestNeedsRehash(t *testing.T) {
 			name: "BLF-CRYPT Lower Cost",
 			hashCreator: func() string {
 				// Generate bcrypt with lower cost
-				hash, _ := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost-1)
+				hash, _ := bcrypt.GenerateFromPassword([]byte("password"), BcryptCost-1)
 				return "{BLF-CRYPT}" + string(hash)
 			},
 			needsRehash: true,
@@ -119,7 +119,7 @@ func TestRehashOperation(t *testing.T) {
 		{
 			name: "Standard Bcrypt with Default Cost",
 			hash: func() string {
-				hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+				hash, _ := bcrypt.GenerateFromPassword([]byte(password), BcryptCost)
 				return string(hash)
 			}(),
 			needsRehash: false,
@@ -135,7 +135,7 @@ func TestRehashOperation(t *testing.T) {
 		{
 			name: "BLF-CRYPT with Default Cost",
 			hash: func() string {
-				hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+				hash, _ := bcrypt.GenerateFromPassword([]byte(password), BcryptCost)
 				return "{BLF-CRYPT}" + string(hash)
 			}(),
 			needsRehash: false,
@@ -174,7 +174,7 @@ func TestRehashOperation(t *testing.T) {
 
 			// If rehashing is needed, test that we can create a new hash that doesn't need rehashing
 			if tt.needsRehash {
-				newHashBytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+				newHashBytes, err := bcrypt.GenerateFromPassword([]byte(password), BcryptCost)
 				if err != nil {
 					t.Fatalf("Failed to generate default cost hash: %v", err)
 				}

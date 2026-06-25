@@ -873,7 +873,7 @@ func (s *POP3Server) Authenticate(ctx context.Context, address, password string)
 	// Asynchronously rehash if needed
 	if db.NeedsRehash(hashedPassword) {
 		db.QueueRehash(address, func(updateCtx context.Context) {
-			newHash, hashErr := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+			newHash, hashErr := bcrypt.GenerateFromPassword([]byte(password), db.BcryptCost)
 			if hashErr != nil {
 				logger.Error("Rehash: Failed to generate new hash", "address", address, "error", hashErr)
 				return

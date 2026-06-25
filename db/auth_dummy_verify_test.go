@@ -15,8 +15,8 @@ func TestDummyBcryptHash_Valid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dummyBcryptHash is not a valid bcrypt hash: %v", err)
 	}
-	if cost != bcrypt.DefaultCost {
-		t.Fatalf("dummyBcryptHash cost = %d, want DefaultCost %d (timing must match real verifications)", cost, bcrypt.DefaultCost)
+	if cost != BcryptCost {
+		t.Fatalf("dummyBcryptHash cost = %d, want configured BcryptCost %d (timing must match real verifications)", cost, BcryptCost)
 	}
 
 	// It must never accidentally match a password.
@@ -31,7 +31,7 @@ func TestDummyBcryptHash_Valid(t *testing.T) {
 // against a genuine bcrypt verification at the same default cost and require the two
 // durations to land in the same ballpark.
 func TestDummyVerifyPassword_Equalizes(t *testing.T) {
-	realHash, err := bcrypt.GenerateFromPassword([]byte("the-real-password"), bcrypt.DefaultCost)
+	realHash, err := bcrypt.GenerateFromPassword([]byte("the-real-password"), BcryptCost)
 	if err != nil {
 		t.Fatalf("failed to generate real hash: %v", err)
 	}
