@@ -1490,6 +1490,18 @@ func (s *ServerConfig) Validate() error {
 		return fmt.Errorf("invalid server type '%s', must be one of: %s", s.Type, strings.Join(validTypes, ", "))
 	}
 
+	// Master credentials: a configured master username with an EMPTY master
+	// password is dangerous — auth uses subtle.ConstantTimeCompare, and
+	// ConstantTimeCompare("", "") == 1, so an empty client password would
+	// authenticate as ANY account via the user@domain@MASTER mechanism.
+	// Fail closed rather than start with a silent full-impersonation hole.
+	if s.MasterUsername != "" && s.MasterPassword == "" {
+		return fmt.Errorf("server %q: master_username is set but master_password is empty; refusing to start (an empty password would allow impersonation of any account)", s.Name)
+	}
+	if s.MasterSASLUsername != "" && s.MasterSASLPassword == "" {
+		return fmt.Errorf("server %q: master_sasl_username is set but master_sasl_password is empty; refusing to start (an empty password would allow impersonation of any account)", s.Name)
+	}
+
 	return nil
 }
 

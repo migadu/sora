@@ -149,7 +149,7 @@ func (s *Session) handleConnection() {
 		}
 
 		// Read command from client
-		line, err := s.clientReader.ReadString('\n')
+		line, err := server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth line to prevent memory exhaustion
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				s.DebugLog("client timed out waiting for command")
@@ -235,7 +235,7 @@ func (s *Session) handleConnection() {
 					username = string(literalBuf)
 
 					// Read the rest of the line (should be password or another literal)
-					line, err := s.clientReader.ReadString('\n')
+					line, err := server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth line to prevent memory exhaustion
 					if err != nil {
 						if err != io.EOF {
 							s.DebugLog("error reading password after username literal", "error", err)
@@ -276,7 +276,7 @@ func (s *Session) handleConnection() {
 						password = string(literalBuf)
 
 						// Read CRLF after literal
-						if _, err := s.clientReader.ReadString('\n'); err != nil && err != io.EOF {
+						if _, err := server.ReadBoundedLine(s.clientReader, 1024); err != nil && err != io.EOF {
 							s.DebugLog("error reading CRLF after password literal", "error", err)
 						}
 					} else {
@@ -310,7 +310,7 @@ func (s *Session) handleConnection() {
 						password = string(literalBuf)
 
 						// Read CRLF after literal
-						if _, err := s.clientReader.ReadString('\n'); err != nil && err != io.EOF {
+						if _, err := server.ReadBoundedLine(s.clientReader, 1024); err != nil && err != io.EOF {
 							s.DebugLog("error reading CRLF after password literal", "error", err)
 						}
 					}
@@ -386,7 +386,7 @@ func (s *Session) handleConnection() {
 
 				// Read SASL response from client
 				var err error
-				saslLine, err = s.clientReader.ReadString('\n')
+				saslLine, err = server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth SASL response
 				if err != nil {
 					if err != io.EOF {
 						s.DebugLog("error reading SASL response", "error", err)
@@ -773,7 +773,7 @@ func (s *Session) authenticateUser(username, password string) error {
 		s.DebugLog("Comparing master username", "provided_suffix", parsedAddr.Suffix(), "configured_master", string(s.server.masterUsername))
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
 			// Suffix matches master username - validate master password locally
-			if !checkMasterCredential(password, s.server.masterPassword) {
+			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
 				// Wrong master password - fail immediately
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, parsedAddr.BaseAddress(), false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()

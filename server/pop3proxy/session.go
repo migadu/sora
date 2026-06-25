@@ -254,7 +254,7 @@ func (s *POP3ProxySession) handleConnection() {
 				writer.Flush()
 
 				// Read the authentication data
-				authLine, err := reader.ReadString('\n')
+				authLine, err := server.ReadBoundedLine(reader, 1024) // bound pre-auth SASL response
 				if err != nil {
 					writer.WriteString("-ERR Authentication failed\r\n")
 					writer.Flush()
@@ -583,7 +583,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		// Has suffix - check if it matches configured master username
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), []byte(s.server.masterUsername)) {
 			// Suffix matches master username - validate master password locally
-			if !checkMasterCredential(password, []byte(s.server.masterPassword)) {
+			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, []byte(s.server.masterPassword)) {
 				// Wrong master password - fail immediately
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, parsedAddr.BaseAddress(), false)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "failure").Inc()

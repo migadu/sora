@@ -255,7 +255,7 @@ func (s *ManageSieveSession) handleConnection() {
 			var accountID int64
 			if len(s.server.masterUsername) > 0 && address.HasSuffix() && checkMasterCredential(address.Suffix(), s.server.masterUsername) {
 				// Suffix matches MasterUsername, authenticate with MasterPassword
-				if checkMasterCredential(password, s.server.masterPassword) {
+				if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
 					s.DebugLog("master username authentication successful", "address", address.BaseAddress(), "master_username", address.Suffix())
 					authSuccess = true
 					masterAuthUsed = true
@@ -1484,7 +1484,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	// 1. Check for Master Username Authentication (user@domain.com@MASTER_USERNAME)
 	if parseErr == nil && len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername) {
 		// Suffix matches MasterUsername, authenticate with MasterPassword
-		if checkMasterCredential(password, s.server.masterPassword) {
+		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
 			// Determine target user to impersonate
 			targetUserToImpersonate := authzID
 			if targetUserToImpersonate == "" {

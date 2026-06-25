@@ -267,6 +267,14 @@ func main() {
 				deps.runningServersMux.Lock()
 				for name, srv := range deps.runningServers {
 					if newServerCfg, ok := serversByName[name]; ok {
+						// Re-validate before applying: keeps the fail-closed startup guards
+						// (e.g. master_username with an empty master_password) effective on
+						// SIGHUP reload. Invalid new config is skipped; the server keeps
+						// running on its previous, already-validated config.
+						if err := newServerCfg.Validate(); err != nil {
+							logger.Error("Skipping reload: invalid new server config", "server", name, "error", err)
+							continue
+						}
 						if err := srv.ReloadConfig(newServerCfg); err != nil {
 							logger.Error("Failed to reload server config", "server", name, "error", err)
 						}

@@ -87,7 +87,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			// 1. Check for Master Username Authentication (user@domain.com@MASTER_USERNAME)
 			if parseErr == nil && len(s.server.masterUsername) > 0 && usernameParsed.HasSuffix() && checkMasterCredential(usernameParsed.Suffix(), s.server.masterUsername) {
 				// Suffix matches MasterUsername, authenticate with MasterPassword
-				if checkMasterCredential(password, s.server.masterPassword) {
+				if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
 					// Determine target user to impersonate
 					targetUserToImpersonate := identity
 					if targetUserToImpersonate == "" {

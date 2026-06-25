@@ -56,10 +56,16 @@ type Server struct {
 	tlsConfig                  *tls.Config // Global TLS config from TLS manager (optional)
 	trustedProxies             []string    // CIDR blocks for trusted proxies
 	limiter                    *server.ConnectionLimiter
-	httpServer                 *http.Server
-	ctx                        context.Context
-	cancel                     context.CancelFunc
-	wg                         sync.WaitGroup
+	// connReleases holds the connection-limiter release callback for each live
+	// connection, keyed by net.Conn, so the slot is freed on StateClosed/
+	// StateHijacked. Without this the limiter counter only ever increments and
+	// the proxy eventually refuses every connection (permanent DoS).
+	connReleases   map[net.Conn]func()
+	connReleasesMu sync.Mutex
+	httpServer     *http.Server
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
 
 	// Shared HTTP transport (prevents connection pool leaks)
 	transport *http.Transport
@@ -293,6 +299,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		proxyReader:                proxyReader,
 		ctx:                        ctx,
 		cancel:                     cancel,
+		connReleases:               make(map[net.Conn]func()),
 	}, nil
 }
 
@@ -684,13 +691,30 @@ func (s *Server) connStateHandler(conn net.Conn, state http.ConnState) {
 	case http.StateNew:
 		// Check connection limits
 		if s.limiter != nil {
-			if _, err := s.limiter.AcceptWithRealIP(conn.RemoteAddr(), ""); err != nil {
+			release, err := s.limiter.AcceptWithRealIP(conn.RemoteAddr(), "")
+			if err != nil {
 				logger.Info("User API Proxy: Connection rejected", "name", s.name, "error", err)
 				conn.Close()
+				return
 			}
+			// Remember the release callback so the limiter slot is freed when the
+			// connection closes (see connReleases doc). Previously the callback was
+			// discarded, leaking a slot per connection.
+			s.connReleasesMu.Lock()
+			s.connReleases[conn] = release
+			s.connReleasesMu.Unlock()
 		}
-	case http.StateClosed:
-		// Connection closed - limiter will handle cleanup
+	case http.StateClosed, http.StateHijacked:
+		// Connection is gone — free the limiter slot. StateHijacked is also
+		// terminal for the ConnState hook, so release here too to avoid a leak.
+		// release() is sync.Once-guarded, so calling it once here is safe.
+		s.connReleasesMu.Lock()
+		release := s.connReleases[conn]
+		delete(s.connReleases, conn)
+		s.connReleasesMu.Unlock()
+		if release != nil {
+			release()
+		}
 	}
 }
 

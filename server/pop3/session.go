@@ -338,7 +338,7 @@ func (s *POP3Session) handleConnection() {
 			var accountID int64
 			if len(s.server.masterUsername) > 0 && userAddress.HasSuffix() && checkMasterCredential(userAddress.Suffix(), s.server.masterUsername) {
 				// Suffix matches MasterUsername, authenticate with MasterPassword
-				if checkMasterCredential(password, s.server.masterPassword) {
+				if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
 					s.DebugLog("master username authentication successful", "base_address", userAddress.BaseAddress(), "master_username", userAddress.Suffix())
 					authSuccess = true
 					masterAuthUsed = true
@@ -1633,7 +1633,7 @@ func (s *POP3Session) handleConnection() {
 			// 1. Check for Master Username Authentication (user@domain.com@MASTER_USERNAME)
 			if parseErr == nil && len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername) {
 				// Suffix matches MasterUsername, authenticate with MasterPassword
-				if checkMasterCredential(password, s.server.masterPassword) {
+				if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
 					// Determine target user to impersonate
 					targetUserToImpersonate := authzID
 					if targetUserToImpersonate == "" {

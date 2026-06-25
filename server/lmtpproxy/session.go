@@ -154,8 +154,8 @@ func (s *Session) handleConnection() {
 			}
 		}
 
-		// Read command from client
-		line, err := s.clientReader.ReadString('\n')
+		// Read command from client (bounded to prevent pre-auth memory exhaustion)
+		line, err := server.ReadBoundedLine(s.clientReader, 8192)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				s.DebugLog("Client timed out waiting for command")

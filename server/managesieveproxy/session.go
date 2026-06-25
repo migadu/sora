@@ -178,9 +178,9 @@ func (s *Session) handleConnection() {
 		switch command {
 		case "AUTHENTICATE":
 			s.DebugLog("AUTHENTICATE command", "args_len", len(args))
-			for i, arg := range args {
-				s.DebugLog("AUTHENTICATE arg", "index", i, "value", arg)
-			}
+			// NOTE: do not log raw AUTHENTICATE args — for SASL PLAIN with an
+			// inline initial response, args holds the client's base64 credentials.
+			// The masked command log above already covers this.
 
 			// Check if authentication is allowed over non-TLS connection
 			if !s.isTLS && !s.server.insecureAuth {
@@ -231,7 +231,7 @@ func (s *Session) handleConnection() {
 					}
 
 					// Read the trailing CRLF after literal
-					s.clientReader.ReadString('\n')
+					server.ReadBoundedLine(s.clientReader, 1024) // bound trailing CRLF drain
 
 					saslLine = string(literalData)
 				} else {
@@ -244,7 +244,7 @@ func (s *Session) handleConnection() {
 				s.sendContinuation()
 
 				// Read SASL response
-				saslLine, err = s.clientReader.ReadString('\n')
+				saslLine, err = server.ReadBoundedLine(s.clientReader, 8192) // bound pre-auth SASL response
 				if err != nil {
 					s.DebugLog("error reading SASL response", "error", err)
 					return
@@ -685,7 +685,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		// Has suffix - check if it matches configured master username
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
 			// Suffix matches master username - validate master password locally
-			if !checkMasterCredential(password, s.server.masterPassword) {
+			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
 				// Wrong master password - fail immediately
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, parsedAddr.BaseAddress(), false)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
@@ -1237,8 +1237,10 @@ func (s *Session) authenticateToBackend() error {
 	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, string(s.server.masterSASLUsername), string(s.server.masterSASLPassword))
 	encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
-	s.DebugLog("Auth string format", "authorize_id", s.username, "authenticate_id", string(s.server.masterSASLUsername))
-	s.DebugLog("Sending AUTHENTICATE command", "encoded", encoded)
+	// Do NOT log `encoded` or the master SASL username: `encoded` base64-decodes
+	// to "user\x00masterUser\x00masterPassword", i.e. the tenant-wide master
+	// impersonation credential. The IMAP/POP3 proxies deliberately never log it.
+	s.DebugLog("authenticating to backend via master SASL", "impersonate_user", s.username)
 
 	// ManageSieve requires quoted strings for command arguments
 	_, err := backendWriter.WriteString(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"\r\n", encoded))
