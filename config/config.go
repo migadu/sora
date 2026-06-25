@@ -592,6 +592,13 @@ type RemoteLookupConfig struct {
 	RemoteUseIDCommand     bool   `toml:"remote_use_id_command"`     // Use IMAP ID command (IMAP only)
 	RemoteUseXCLIENT       bool   `toml:"remote_use_xclient"`        // Use XCLIENT command (POP3/LMTP)
 
+	// RestrictToPool, when true, refuses a backend address returned by the remote-lookup
+	// API unless it is in the configured pool (remote_addrs); routing then falls back to
+	// in-pool selection (consistent-hash/round-robin). Defends against SSRF via a
+	// compromised/MITM'd lookup API. Default false (routing mode may legitimately return
+	// dynamic out-of-pool backends).
+	RestrictToPool bool `toml:"restrict_to_pool"`
+
 	// Circuit breaker configuration
 	CircuitBreaker *RemoteLookupCircuitBreakerConfig `toml:"circuit_breaker"` // Circuit breaker configuration
 

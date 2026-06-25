@@ -155,6 +155,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		return nil, fmt.Errorf("failed to create connection manager: %w", err)
 	}
 
+	// SSRF defense: when enabled, refuse remote-lookup backends not in the configured pool.
+	connManager.SetRestrictRemoteLookupToPool(opts.RemoteLookup != nil && opts.RemoteLookup.RestrictToPool)
+
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
 		logger.Warn("User API Proxy: Failed to resolve addresses", "name", opts.Name, "error", err)
@@ -450,7 +453,10 @@ func (s *Server) getBackendForUser(email string, accountID int64) (string, error
 	// 1. Check lookup cache first (if enabled)
 	if s.lookupCache != nil {
 		cached, found := s.lookupCache.Get(s.name, email)
-		if found && !cached.IsNegative {
+		// AllowRemoteLookupBackend re-validates the cached address against the pool when
+		// restrict_to_pool is on (defends against a stale entry surviving a pool shrink);
+		// it is a passthrough when the feature is off.
+		if found && !cached.IsNegative && s.connManager.AllowRemoteLookupBackend(cached.ServerAddress) {
 			// Positive cache entry - use cached route
 			// NOTE: We do NOT refresh routing cache. Entries should expire after
 			// positive_ttl to allow periodic revalidation via remotelookup.
@@ -469,7 +475,11 @@ func (s *Server) getBackendForUser(email string, accountID int64) (string, error
 
 	// 2. Check affinity (if configured)
 	if s.affinityManager != nil {
-		if backend, found := s.affinityManager.GetBackend(email, "userapi"); found {
+		// AllowRemoteLookupBackend gates the affinity address too: affinity is gossip-synced
+		// and persisted, so a poisoned/out-of-pool entry from another node must not be dialed
+		// when restrict_to_pool is on. Passthrough when the feature is off. On refusal this
+		// falls through to consistent hash below.
+		if backend, found := s.affinityManager.GetBackend(email, "userapi"); found && s.connManager.AllowRemoteLookupBackend(backend) {
 			logger.Debug("User API Proxy: Using affinity backend", "name", s.name, "user", email, "backend", backend)
 			// Cache the route if lookup cache is enabled
 			if s.lookupCache != nil {
@@ -492,7 +502,10 @@ func (s *Server) getBackendForUser(email string, accountID int64) (string, error
 		if err != nil {
 			logger.Warn("User API Proxy: RemoteLookup failed", "name", s.name, "user", email, "error", err)
 			// Fall through to consistent hash
-		} else if routingInfo != nil && routingInfo.ServerAddress != "" {
+		} else if routingInfo != nil && routingInfo.ServerAddress != "" && s.connManager.AllowRemoteLookupBackend(routingInfo.ServerAddress) {
+			// restrict_to_pool (SSRF defense): AllowRemoteLookupBackend logs and returns
+			// false for an out-of-pool address, so this branch is skipped and routing
+			// falls through to consistent hash below — the bad address is never dialed.
 			logger.Debug("User API Proxy: Using remotelookup backend", "name", s.name, "user", email, "backend", routingInfo.ServerAddress)
 
 			// Set affinity for future requests

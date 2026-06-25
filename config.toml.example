@@ -1464,6 +1464,14 @@ remote_tls_verify = true              # Verify backend TLS certificates
 # remote_port = 143                   # Default port to append if server address doesn't include port (default: 143)
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
 remote_use_id_command = false         # Send IMAP ID command to backends (IMAP only)
+# restrict_to_pool = false            # SSRF defense (routing mode). When true, a backend
+                                      # address returned by the remote_lookup API is used
+                                      # ONLY if it is in this proxy's configured pool
+                                      # (remote_addrs); an out-of-pool address is refused
+                                      # and routing falls back to in-pool selection
+                                      # (consistent-hash/round-robin). Leave false if you
+                                      # rely on the lookup API to return dynamic backends
+                                      # outside remote_addrs. Default: false.
 
 
   # --- CIRCUIT BREAKER FOR REMOTE_LOOKUP ENDPOINT ---

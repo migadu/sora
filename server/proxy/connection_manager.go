@@ -34,8 +34,12 @@ type BackendHealth struct {
 
 // ConnectionManager manages connections to multiple remote servers with round-robin and failover
 type ConnectionManager struct {
-	serverName             string // Server name for logging
-	remoteAddrs            []string
+	serverName  string // Server name for logging
+	remoteAddrs []string
+	// configuredAddrs is the original normalized pool from config (remote_addrs),
+	// captured before ResolveAddresses() rewrites remoteAddrs to resolved IPs. Used by
+	// AllowRemoteLookupBackend so restrict_to_pool matches hostnames as configured.
+	configuredAddrs        []string
 	remotePort             int // Default port for backends if not in address
 	remoteTLS              bool
 	remoteTLSUseStartTLS   bool // Use STARTTLS for backend connections (only relevant if remoteTLS is true)
@@ -60,6 +64,52 @@ type ConnectionManager struct {
 
 	// Affinity manager (optional, for cluster-wide affinity)
 	affinityManager AffinityManager
+
+	// restrictRemoteLookupToPool, when true, refuses a remote-lookup-returned backend
+	// that is not in the configured pool (SSRF defense). Set via
+	// SetRestrictRemoteLookupToPool; default false preserves dynamic routing. Written
+	// once at startup (before serving) and then read-only, so it needs no lock.
+	restrictRemoteLookupToPool bool
+}
+
+// SetRestrictRemoteLookupToPool controls whether a backend address returned by the
+// remote-lookup API must be a member of the configured pool (remote_addrs). When
+// enabled, an out-of-pool address is refused and routing falls back to in-pool
+// selection, so a compromised/MITM'd lookup API cannot point the proxy at an
+// arbitrary internal host.
+func (cm *ConnectionManager) SetRestrictRemoteLookupToPool(v bool) {
+	cm.restrictRemoteLookupToPool = v
+}
+
+// AllowRemoteLookupBackend reports whether a backend address returned by the remote-lookup
+// API may be dialed. With restrict-to-pool off it always allows. With it on, the address
+// must match a member of the configured pool — compared by canonical host:port against both
+// the originally configured addresses (hostnames) and their resolved forms (IPs) — so a
+// compromised or MITM'd lookup API cannot redirect the proxy to an arbitrary host. The
+// refusal is logged here so every call site (DetermineRoute and the User API proxy, which
+// does not use DetermineRoute) reports it consistently.
+func (cm *ConnectionManager) AllowRemoteLookupBackend(addr string) bool {
+	if !cm.restrictRemoteLookupToPool {
+		return true
+	}
+	if addr != "" {
+		target := normalizeHostPort(addr, 0)
+		cm.healthMu.RLock()
+		resolved := cm.remoteAddrs
+		cm.healthMu.RUnlock()
+		for _, a := range cm.configuredAddrs {
+			if normalizeHostPort(a, 0) == target {
+				return true
+			}
+		}
+		for _, a := range resolved {
+			if normalizeHostPort(a, 0) == target {
+				return true
+			}
+		}
+	}
+	logger.Error("refusing out-of-pool backend (restrict_to_pool)", "server", cm.serverName, "backend", addr)
+	return false
 }
 
 // NewConnectionManager creates a new connection manager
@@ -108,6 +158,7 @@ func NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(remoteAddrs []stri
 	cm := &ConnectionManager{
 		serverName:               serverName,
 		remoteAddrs:              normalizedAddrs,
+		configuredAddrs:          normalizedAddrs,
 		remotePort:               remotePort,
 		remoteTLS:                remoteTLS,
 		remoteTLSUseStartTLS:     remoteTLSUseStartTLS,
@@ -1238,11 +1289,22 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 	}
 
 	if result.RoutingInfo != nil && result.RoutingInfo.ServerAddress != "" {
-		// Use server address from routing info (remotelookup specified backend)
-		result.PreferredAddr = result.RoutingInfo.ServerAddress
-		logger.Debug("Using routing lookup", "proxy", params.ProxyName, "user", params.Username, "server", result.PreferredAddr)
-		result.RoutingMethod = "remotelookup"
-		result.IsRemoteLookupRoute = true
+		// restrict_to_pool (SSRF defense): only honor the remote-lookup-specified backend
+		// if it is in the configured pool. Otherwise fall through to in-pool routing below,
+		// so the proxy never dials an attacker-chosen host. AllowRemoteLookupBackend logs
+		// the refusal and is a no-op (always true) when the feature is disabled.
+		if params.ConnManager.AllowRemoteLookupBackend(result.RoutingInfo.ServerAddress) {
+			// Use server address from routing info (remotelookup specified backend)
+			result.PreferredAddr = result.RoutingInfo.ServerAddress
+			logger.Debug("Using routing lookup", "proxy", params.ProxyName, "user", params.Username, "server", result.PreferredAddr)
+			result.RoutingMethod = "remotelookup"
+			result.IsRemoteLookupRoute = true
+		} else {
+			// Blocked out-of-pool address (logged in AllowRemoteLookupBackend): drop it so
+			// the affinity and consistent-hash steps below still run and the user is routed
+			// to a valid in-pool backend instead of being stranded on a single rejected route.
+			result.RoutingInfo.ServerAddress = ""
+		}
 	}
 
 	// 2. If no routing info from remotelookup, try cluster-wide affinity

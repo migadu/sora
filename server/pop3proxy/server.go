@@ -224,6 +224,9 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		return nil, fmt.Errorf("failed to create connection manager: %w", err)
 	}
 
+	// SSRF defense: when enabled, refuse remote-lookup backends not in the configured pool.
+	connManager.SetRestrictRemoteLookupToPool(options.RemoteLookup != nil && options.RemoteLookup.RestrictToPool)
+
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
 		logger.Debug("WARNING: Failed to resolve some addresses for POP3 proxy", "proxy", options.Name, "error", err)
