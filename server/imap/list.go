@@ -123,7 +123,11 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 					// shared ones incur an ACL check — the batch fast path is preserved.
 					if mbox.AccountID != s.AccountID() {
 						hasRead, permErr := s.server.rdb.CheckMailboxPermissionWithRetry(readCtx, mbox.ID, s.AccountID(), 'r')
-						if permErr != nil || !hasRead {
+						if permErr != nil {
+							s.DebugLog("LIST-STATUS: skipping STATUS, ACL read-check failed", "mailbox", data.Mailbox, "error", permErr)
+							continue
+						}
+						if !hasRead {
 							continue
 						}
 					}

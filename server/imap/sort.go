@@ -8,6 +8,13 @@ import (
 // Sort implements the SORT extension (RFC 5256), SORT=DISPLAY extension (RFC 5957),
 // and ESORT extension (RFC 5267). It returns sorted message data according to the provided criteria.
 func (s *IMAPSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortCriterion, charset string, searchCriteria *imap.SearchCriteria, options *imap.SortOptions) (*imap.SortData, error) {
+	// SORT is a full search; share the per-account SEARCH rate limiter.
+	if s.server.searchRateLimiter != nil && s.IMAPUser != nil {
+		if err := s.server.searchRateLimiter.CanSearch(s.ctx, s.IMAPUser.AccountID()); err != nil {
+			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: err.Error()}
+		}
+	}
+
 	// Reject pathologically complex/deep criteria before decoding or building a query.
 	if err := s.validateSearchCriteria("SORT", searchCriteria); err != nil {
 		return nil, err
