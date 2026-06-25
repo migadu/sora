@@ -435,6 +435,7 @@ func (s *Session) handleConnection() {
 				}
 
 				tlsConfig = &tls.Config{
+					MinVersion:    tls.VersionTLS12,
 					Certificates:  []tls.Certificate{cert},
 					ClientAuth:    tls.NoClientCert,
 					Renegotiation: tls.RenegotiateNever,

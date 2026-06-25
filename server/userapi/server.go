@@ -92,6 +92,9 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 	if len(options.JWTSecret) < minJWTSecretLength {
 		return nil, fmt.Errorf("JWT secret must be at least %d bytes for HS256 (RFC 7518 §3.2); got %d", minJWTSecretLength, len(options.JWTSecret))
 	}
+	if options.JWTSecret == "your-secret-jwt-signing-key-here" {
+		return nil, fmt.Errorf("JWT secret is the placeholder value from config.toml.example — set a real, random jwt_secret")
+	}
 
 	if options.TokenDuration == 0 {
 		options.TokenDuration = 24 * time.Hour // Default to 24 hours
@@ -494,19 +497,33 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 		// Check if origin is allowed
 		if origin != "" && len(s.allowedOrigins) > 0 {
 			allowed := false
+			wildcard := false
 			for _, allowedOrigin := range s.allowedOrigins {
-				if allowedOrigin == "*" || allowedOrigin == origin {
+				if allowedOrigin == "*" {
+					allowed = true
+					wildcard = true
+					break
+				}
+				if allowedOrigin == origin {
 					allowed = true
 					break
 				}
 			}
 
 			if allowed {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 				w.Header().Set("Access-Control-Max-Age", "3600")
-				w.Header().Set("Access-Control-Allow-Credentials", "true")
+				if wildcard {
+					// A wildcard origin must NOT be combined with credentials (CORS spec):
+					// reflecting a concrete origin + Allow-Credentials lets any site make
+					// credentialed cross-origin reads. Emit literal "*" without credentials.
+					w.Header().Set("Access-Control-Allow-Origin", "*")
+				} else {
+					// Specific configured origin: safe to reflect and allow credentials.
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					w.Header().Set("Access-Control-Allow-Credentials", "true")
+				}
 			}
 		}
 

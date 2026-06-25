@@ -160,6 +160,10 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 	if len(options.APIKey) < minAPIKeyLength {
 		return nil, fmt.Errorf("API key must be at least %d characters (got %d) — use a long, random value", minAPIKeyLength, len(options.APIKey))
 	}
+	switch options.APIKey {
+	case "your-api-key-here", "your-secret-api-key-here":
+		return nil, fmt.Errorf("API key is the placeholder value from config.toml.example — set a real, random api_key")
+	}
 
 	// Validate TLS configuration
 	if options.TLS {
@@ -327,6 +331,7 @@ func (s *Server) start(ctx context.Context) error {
 		} else {
 			// Create new TLS config for static certificates
 			tlsConfig = &tls.Config{
+				MinVersion:    tls.VersionTLS12,
 				Renegotiation: tls.RenegotiateNever,
 			}
 		}

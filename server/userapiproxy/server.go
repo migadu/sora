@@ -118,6 +118,14 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		cancel()
 		return nil, fmt.Errorf("JWT secret is required for User API proxy")
 	}
+	if len(opts.JWTSecret) < 32 {
+		cancel()
+		return nil, fmt.Errorf("JWT secret must be at least 32 bytes for HS256 (RFC 7518 §3.2); got %d", len(opts.JWTSecret))
+	}
+	if opts.JWTSecret == "your-secret-jwt-signing-key-here" {
+		cancel()
+		return nil, fmt.Errorf("JWT secret is the placeholder value from config.toml.example — set a real, random jwt_secret")
+	}
 
 	// Set default timeout if not specified
 	connectTimeout := opts.ConnectTimeout

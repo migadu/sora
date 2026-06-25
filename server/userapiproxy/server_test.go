@@ -235,7 +235,7 @@ func TestNewServerValidation(t *testing.T) {
 				Addr:        ":8080",
 				RemoteAddrs: []string{"backend1:8081"},
 				RemotePort:  8081,
-				JWTSecret:   "test-secret",
+				JWTSecret:   "test-secret-key-at-least-32-bytes!!",
 			},
 			shouldErr: false,
 		},
@@ -260,6 +260,28 @@ func TestNewServerValidation(t *testing.T) {
 			},
 			shouldErr: true,
 			errMsg:    "JWT secret is required",
+		},
+		{
+			name: "JWT secret too short",
+			opts: ServerOptions{
+				Name:        "test-proxy",
+				Addr:        ":8080",
+				RemoteAddrs: []string{"backend1:8081"},
+				JWTSecret:   "short-secret",
+			},
+			shouldErr: true,
+			errMsg:    "JWT secret must be at least 32 bytes",
+		},
+		{
+			name: "JWT secret is example placeholder",
+			opts: ServerOptions{
+				Name:        "test-proxy",
+				Addr:        ":8080",
+				RemoteAddrs: []string{"backend1:8081"},
+				JWTSecret:   "your-secret-jwt-signing-key-here",
+			},
+			shouldErr: true,
+			errMsg:    "JWT secret is the placeholder",
 		},
 	}
 
