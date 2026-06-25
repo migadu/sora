@@ -54,6 +54,42 @@ func shouldSuppressVacation(sender *server.Address, originalMessage *message.Ent
 	return helpers.ShouldSuppressAuto(envFrom, headerGet)
 }
 
+// recipientIsAddressed reports whether at least one of the account's addresses appears in
+// the message's To or Cc header (RFC 5230 §4.5 "personal message" rule). It prevents
+// auto-replying to mail the user received only via Bcc, or via an alias/list not present
+// in To/Cc — classic backscatter. Ownership (not a literal match) is used so aliases and
+// plus-addressed recipients still count. Returns an error only if the ownership lookup fails.
+func (h *StandardVacationHandler) recipientIsAddressed(ctx context.Context, accountID int64, originalMessage *message.Entity) (bool, error) {
+	hdr := mail.Header{Header: originalMessage.Header}
+	var recipients []*mail.Address
+	for _, field := range []string{"To", "Cc"} {
+		if list, err := hdr.AddressList(field); err == nil {
+			recipients = append(recipients, list...)
+		}
+	}
+	for _, a := range recipients {
+		// Check the address as written and its base form (without +detail). Credentials
+		// are stored without plus-addressing detail, and a plus-addressed or aliased
+		// recipient is still a personal recipient — so jane+tag@ must not be suppressed.
+		candidates := []string{a.Address}
+		if parsed, err := server.NewAddress(a.Address); err == nil {
+			if base := parsed.BaseAddress(); base != a.Address {
+				candidates = append(candidates, base)
+			}
+		}
+		for _, c := range candidates {
+			owned, err := h.IsOwnedAddress(ctx, accountID, c)
+			if err != nil {
+				return false, err
+			}
+			if owned {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // log emits a message via the optional Logger.
 func (h *StandardVacationHandler) log(format string, args ...any) {
 	if h.Logger != nil {
@@ -101,6 +137,20 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 	if reason := shouldSuppressVacation(fromAddr, originalMessage); reason != "" {
 		h.log("[VACATION] suppressed: %s", reason)
 		return nil
+	}
+
+	// RFC 5230 §4.5: only auto-reply to "personal" mail — at least one of the account's
+	// addresses must appear in To/Cc. Avoids backscatter to Bcc'd or list/alias mail the
+	// user wasn't directly addressed on. On lookup error, fail open and proceed (the
+	// null-sender/Auto-Submitted/per-sender-period protections still apply).
+	if h.IsOwnedAddress != nil {
+		addressed, err := h.recipientIsAddressed(ctx, AccountID, originalMessage)
+		if err != nil {
+			h.log("[VACATION] To/Cc ownership check failed, proceeding: %v", err)
+		} else if !addressed {
+			h.log("[VACATION] suppressed: account address not in To/Cc (not a personal message)")
+			return nil
+		}
 	}
 
 	// Create vacation response message. A user-supplied ":from" is honored only if it
