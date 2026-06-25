@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -41,7 +42,7 @@ type AdminConfig struct {
 	Server                    []map[string]any             `toml:"server"`                        // Ignore server config array, not needed for admin commands
 	HTTPAPIAddr               string                       `toml:"http_api_addr"`                 // HTTP API address for kick operations (e.g., "http://localhost:8080")
 	HTTPAPIKey                string                       `toml:"http_api_key"`                  // HTTP API key for authentication
-	HTTPAPIInsecureSkipVerify bool                         `toml:"http_api_insecure_skip_verify"` // Skip TLS certificate verification (default: true for localhost)
+	HTTPAPIInsecureSkipVerify bool                         `toml:"http_api_insecure_skip_verify"` // Skip TLS cert verification. Default: auto (loopback addr -> skip; remote -> verify).
 	Relay                     config.RelayConfig           `toml:"relay"`
 }
 
@@ -117,13 +118,47 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	cfg.HTTPAPIKey = fullCfg.AdminCLI.APIKey
 	cfg.Relay = fullCfg.Relay
 
-	// Default to true for insecure skip verify (safer for localhost usage)
-	cfg.HTTPAPIInsecureSkipVerify = true
+	// Default: verify the Admin API server's TLS certificate. Skip verification
+	// automatically only for loopback addresses (local admin use with self-signed
+	// certs), where there is no MITM surface. For a remote Admin API, verification
+	// stays ON so a network attacker cannot present a forged cert and capture the
+	// bearer API key. Operators can still override via admin_cli.insecure_skip_verify.
+	cfg.HTTPAPIInsecureSkipVerify = isLoopbackHostPort(fullCfg.AdminCLI.Addr)
 	if fullCfg.AdminCLI.InsecureSkipVerify != nil {
 		cfg.HTTPAPIInsecureSkipVerify = *fullCfg.AdminCLI.InsecureSkipVerify
 	}
 
 	return nil
+}
+
+// isLoopbackHostPort reports whether addr (host:port, [::1]:port, or a bare host,
+// with an optional scheme) targets a loopback interface. Used to decide whether the
+// admin CLI may skip TLS verification by default.
+func isLoopbackHostPort(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	if i := strings.Index(addr, "://"); i >= 0 {
+		addr = addr[i+3:]
+	}
+	if strings.Contains(addr, "@") {
+		// userinfo present (e.g. "http://127.0.0.1:8080@evil.com"): the real host is after
+		// '@'. Ambiguous and a spoofing vector — do not auto-skip verification.
+		return false
+	}
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+	host = strings.TrimPrefix(host, "[")
+	host = strings.TrimSuffix(host, "]")
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 func main() {

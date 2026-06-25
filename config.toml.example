@@ -25,7 +25,7 @@
 [admin_cli]
 addr = "http://localhost:8080"              # HTTP Admin API endpoint address (use https:// if TLS is enabled)
 api_key = "your-api-key-here"               # API key matching the http_admin_api server configuration
-insecure_skip_verify = true                 # Skip TLS certificate verification (default: true). Set to false for production with valid certs.
+insecure_skip_verify = true                 # Skip TLS cert verification. Default when unset: skip only for a loopback addr, verify for remote. This explicit 'true' forces skip regardless of host (fine for localhost; remove it for a remote admin API).
 
 # Maximum message size for maildir import operations
 # Messages larger than this will be skipped during import
