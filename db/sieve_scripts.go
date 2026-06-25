@@ -77,10 +77,23 @@ func (db *Database) GetScriptByName(ctx context.Context, name string, AccountID 
 	return &script, nil
 }
 
+// maxScriptsPerAccount caps how many Sieve scripts one account may create, preventing
+// an authenticated user from exhausting shared PostgreSQL storage by looping
+// PUTSCRIPT/PUT with distinct names. Updates to existing scripts are unaffected.
+const maxScriptsPerAccount = 100
+
 func (db *Database) CreateScript(ctx context.Context, tx pgx.Tx, AccountID int64, name, script string) (*SieveScript, error) {
+	var count int
+	if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM sieve_scripts WHERE account_id = $1", AccountID).Scan(&count); err != nil {
+		return nil, err
+	}
+	if count >= maxScriptsPerAccount {
+		return nil, fmt.Errorf("maximum number of sieve scripts (%d) reached", maxScriptsPerAccount)
+	}
+
 	var s SieveScript
 	err := tx.QueryRow(ctx, `
-		INSERT INTO sieve_scripts (account_id, name, script, active) 
+		INSERT INTO sieve_scripts (account_id, name, script, active)
 		VALUES ($1, $2, $3, false) 
 		RETURNING id, account_id, name, script, active, updated_at
 	`, AccountID, name, script).Scan(&s.ID, &s.AccountID, &s.Name, &s.Script, &s.Active, &s.UpdatedAt)

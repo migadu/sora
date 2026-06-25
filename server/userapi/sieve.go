@@ -103,10 +103,20 @@ func (s *Server) handleGetFilter(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, response)
 }
 
+// maxSieveScriptSize bounds a user-supplied Sieve script (matches the value advertised
+// by the capabilities endpoint). Enforced on PUT to prevent an oversized body from
+// exhausting memory or bloating the shared sieve_scripts table.
+const maxSieveScriptSize = 65536
+
 // handlePutFilter creates or updates a Sieve script
 func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	ctx := r.Context()
+
+	// Bound the request body before decoding so a huge PUT cannot exhaust memory.
+	// 2x the script cap covers JSON escaping (newlines/quotes/control chars expand) plus the
+	// envelope; the real limit is the len(req.Script) check below after decoding.
+	r.Body = http.MaxBytesReader(w, r.Body, 2*maxSieveScriptSize+1024)
 
 	accountID, err := getAccountIDFromContext(ctx)
 	if err != nil {
@@ -135,6 +145,11 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 
 	if req.Script == "" {
 		s.writeError(w, http.StatusBadRequest, "Script content is required")
+		return
+	}
+
+	if len(req.Script) > maxSieveScriptSize {
+		s.writeError(w, http.StatusRequestEntityTooLarge, "Script exceeds maximum size")
 		return
 	}
 
