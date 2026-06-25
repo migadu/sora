@@ -84,8 +84,11 @@ func normalizeHostPort(addr string, defaultPort int) string {
 	// handles IPv6 addresses like "[::1]:143".
 	host, port, err := net.SplitHostPort(addr)
 	if err == nil {
-		// Address is already in a valid host:port format.
-		// Re-join to ensure canonical format (e.g., for IPv6).
+		// Address is already in a valid host:port format. Canonicalize the host (e.g.
+		// IPv6 zero-compression) so different spellings of the same address compare equal.
+		if ip := net.ParseIP(host); ip != nil {
+			host = ip.String()
+		}
 		return net.JoinHostPort(host, port)
 	}
 

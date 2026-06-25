@@ -346,8 +346,11 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 			return nil, fmt.Errorf("%w: unexpected status code: %d", ErrRemoteLookupTransient, resp.StatusCode)
 		}
 
-		// Only read and parse body for 200 OK responses
-		bodyBytes, readErr := io.ReadAll(resp.Body)
+		// Only read and parse body for 200 OK responses. Bound the read: a legitimate
+		// lookup response is a tiny JSON object, so cap it to defend against a
+		// compromised/MITM'd endpoint returning a huge body.
+		const maxRemoteLookupBodyBytes = 1 << 20 // 1 MiB
+		bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRemoteLookupBodyBytes))
 		if readErr != nil {
 			logger.Warn("remotelookup: Failed to read response body", "user", lookupEmail, "error", readErr)
 			return nil, fmt.Errorf("%w: failed to read response body: %v", ErrRemoteLookupTransient, readErr)
@@ -449,7 +452,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 		if !c.verifyPassword(password, lookupResp.PasswordHash) {
 			// Don't cache auth failures - password verification failed
 			// Could be wrong password or password change in progress
-			logger.Info("remotelookup: Password verification failed", "user", authEmail, "source", "api", "hash_prefix", hashPrefix)
+			logger.Debug("remotelookup: Password verification failed", "user", authEmail, "source", "api", "hash_prefix", hashPrefix)
 			return nil, AuthFailed, nil
 		}
 	}

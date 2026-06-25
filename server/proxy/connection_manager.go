@@ -670,6 +670,8 @@ func (cm *ConnectionManager) GetTLSConfig() *tls.Config {
 		},
 		// Disable renegotiation (not supported in TLS 1.3, causes errors)
 		Renegotiation: tls.RenegotiateNever,
+		// Floor the proxy->backend leg at TLS 1.2 (avoid downgrade to 1.0/1.1).
+		MinVersion: tls.VersionTLS12,
 	}
 }
 
@@ -924,6 +926,8 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 			},
 			// Disable renegotiation (not supported in TLS 1.3, causes errors)
 			Renegotiation: tls.RenegotiateNever,
+			// Floor the proxy->backend leg at TLS 1.2 (avoid downgrade to 1.0/1.1).
+			MinVersion: tls.VersionTLS12,
 		}
 		conn, err = tls.DialWithDialer(dialer, "tcp", resolvedAddr, tlsConfig)
 	} else {
@@ -1055,6 +1059,8 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 			},
 			// Disable renegotiation (not supported in TLS 1.3, causes errors)
 			Renegotiation: tls.RenegotiateNever,
+			// Floor the proxy->backend leg at TLS 1.2 (avoid downgrade to 1.0/1.1).
+			MinVersion: tls.VersionTLS12,
 		}
 		logger.Debug("Starting TLS handshake", "addr", addr, "InsecureSkipVerify", !remoteTLSVerify)
 		tlsConn := tls.Client(conn, tlsConfig)
