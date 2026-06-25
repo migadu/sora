@@ -246,6 +246,21 @@ Examples:
 			cfg.TLS.LetsEncrypt.S3.SecretKey = "***MASKED***"
 		}
 		cfg.Cluster.SecretKey = "***MASKED***"
+		for i := range cfg.DynamicServers {
+			sc := &cfg.DynamicServers[i]
+			if sc.APIKey != "" {
+				sc.APIKey = "***MASKED***"
+			}
+			if sc.JWTSecret != "" {
+				sc.JWTSecret = "***MASKED***"
+			}
+			if sc.MasterPassword != "" {
+				sc.MasterPassword = "***MASKED***"
+			}
+			if sc.MasterSASLPassword != "" {
+				sc.MasterSASLPassword = "***MASKED***"
+			}
+		}
 	}
 
 	// Output in requested format
