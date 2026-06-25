@@ -111,7 +111,7 @@ func (s *IMAPSession) Login(address, password string) error {
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
 			// Use base address (without suffix) to get account
-			AccountID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, addressParsed.BaseAddress())
+			AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, addressParsed.BaseAddress())
 			if err != nil {
 				return err
 			}

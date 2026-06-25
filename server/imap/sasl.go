@@ -109,7 +109,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						}
 					}
 
-					AccountID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
+					AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
 						s.DebugLog("failed to get account ID for impersonation target", "target_user", targetUserToImpersonate, "error", err)
 
@@ -251,7 +251,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						}
 					}
 
-					AccountID, err := s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
+					AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
 						s.DebugLog("failed to get account ID for impersonation target", "target_user", targetUserToImpersonate, "error", err)
 

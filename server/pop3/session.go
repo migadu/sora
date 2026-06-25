@@ -379,7 +379,7 @@ func (s *POP3Session) handleConnection() {
 					authSuccess = true
 					masterAuthUsed = true
 					// Use base address (without suffix) to get account
-					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, userAddress.BaseAddress())
+					accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, userAddress.BaseAddress())
 					if err != nil {
 						s.DebugLog("failed to get account id for user", "base_address", userAddress.BaseAddress(), "error", err)
 						// Record failed attempt
@@ -427,7 +427,7 @@ func (s *POP3Session) handleConnection() {
 					authSuccess = true
 					masterAuthUsed = true
 					// For master password, we need to get the user ID
-					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, userAddress.BaseAddress())
+					accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, userAddress.BaseAddress())
 					if err != nil {
 						s.DebugLog("failed to get account id for master user", "base_address", userAddress.BaseAddress(), "error", err)
 						// Record failed attempt
@@ -1722,7 +1722,7 @@ func (s *POP3Session) handleConnection() {
 						continue
 					}
 
-					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+					accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
 					if err != nil {
 						s.DebugLog("failed to get account id for impersonation target user", "target_user", targetUserToImpersonate, "error", err)
 						recordMetrics("failure")
@@ -1784,7 +1784,7 @@ func (s *POP3Session) handleConnection() {
 						continue
 					}
 
-					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+					accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
 					if err != nil {
 						s.DebugLog("failed to get account id for impersonation target user", "authz_id", authzID, "error", err)
 						recordMetrics("failure")

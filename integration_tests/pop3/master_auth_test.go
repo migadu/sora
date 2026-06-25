@@ -172,6 +172,41 @@ func TestPOP3_MasterUsernameAuthentication(t *testing.T) {
 	})
 }
 
+// TestPOP3_MasterAuth_RejectsDeletedAccount verifies that master authentication
+// observes the same deleted_at gate as normal login: a soft-deleted account must
+// NOT be reachable via the master credential. Otherwise support would see a
+// mailbox the user can no longer access (the master path is the only DB gate on
+// that flow, since the master password is validated against config, not the DB).
+func TestPOP3_MasterAuth_RejectsDeletedAccount(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := setupPOP3ServerWithMasterAuth(t)
+	defer server.Close()
+
+	// Soft-delete the account (sets deleted_at) — exactly what `accounts delete` does.
+	if err := server.ResilientDB.DeleteAccountWithRetry(context.Background(), account.Email); err != nil {
+		t.Fatalf("Failed to soft-delete account: %v", err)
+	}
+
+	client, err := NewPOP3Client(server.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect to POP3 server: %v", err)
+	}
+	defer client.Close()
+
+	// USER format: user@domain.com@MASTER_USERNAME with the correct master password.
+	username := account.Email + "@" + masterUsername
+	client.SendCommand("USER " + username)
+	client.ReadResponse()
+
+	client.SendCommand("PASS " + masterPassword)
+	response, _ := client.ReadResponse()
+	if strings.HasPrefix(response, "+OK") {
+		t.Fatalf("master auth must NOT reach a soft-deleted account, got: %s", response)
+	}
+	t.Logf("✓ master auth correctly rejected soft-deleted account: %s", response)
+}
+
 // TestPOP3_MasterSASLAuthentication tests AUTH PLAIN with master credentials
 func TestPOP3_MasterSASLAuthentication(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)

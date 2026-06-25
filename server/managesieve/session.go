@@ -261,7 +261,7 @@ func (s *ManageSieveSession) handleConnection() {
 					authSuccess = true
 					masterAuthUsed = true
 					// Use base address (without suffix) to get account
-					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
+					accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
 						s.WarnLog("failed to get account id", "address", address.BaseAddress(), "error", err)
 						// Record failed attempt
@@ -303,7 +303,7 @@ func (s *ManageSieveSession) handleConnection() {
 					authSuccess = true
 					masterAuthUsed = true
 					// For master password, we need to get the user ID
-					accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
+					accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
 						s.WarnLog("failed to get account id for master user", "address", address.BaseAddress(), "error", err)
 						// Record failed attempt
@@ -1507,7 +1507,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 				return false
 			}
 
-			accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
+			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 			if err != nil {
 				s.WarnLog("failed to get account id for impersonation target", "target_user", targetUserToImpersonate, "error", err)
 				s.sendResponse("NO Impersonation target user not found\r\n")
@@ -1551,7 +1551,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 			// consistent with the master-username path above and the IMAP/POP3 backends.
 			// Using FullAddress() here would fail to resolve impersonation targets that carry
 			// a suffix/+detail (e.g. a master token forwarded by the proxy).
-			accountID, err = s.server.rdb.GetAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
+			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 			if err != nil {
 				s.WarnLog("failed to get account id for impersonation target", "target_user", authzID, "error", err)
 				s.sendResponse("NO Impersonation target user not found\r\n")
