@@ -82,13 +82,18 @@ func (db *Database) GetScriptByName(ctx context.Context, name string, AccountID 
 // PUTSCRIPT/PUT with distinct names. Updates to existing scripts are unaffected.
 const maxScriptsPerAccount = 100
 
+// ErrSieveScriptLimitReached is returned by CreateScript when the account already has
+// maxScriptsPerAccount scripts. It is a permanent condition (not transient), so callers
+// can map it to a permanent protocol error rather than a retryable one.
+var ErrSieveScriptLimitReached = errors.New("maximum number of sieve scripts reached")
+
 func (db *Database) CreateScript(ctx context.Context, tx pgx.Tx, AccountID int64, name, script string) (*SieveScript, error) {
 	var count int
 	if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM sieve_scripts WHERE account_id = $1", AccountID).Scan(&count); err != nil {
 		return nil, err
 	}
 	if count >= maxScriptsPerAccount {
-		return nil, fmt.Errorf("maximum number of sieve scripts (%d) reached", maxScriptsPerAccount)
+		return nil, fmt.Errorf("%w (limit %d)", ErrSieveScriptLimitReached, maxScriptsPerAccount)
 	}
 
 	var s SieveScript

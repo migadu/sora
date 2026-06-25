@@ -18,6 +18,7 @@ import (
 
 	"github.com/migadu/go-sieve"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
@@ -1008,6 +1009,10 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	} else {
 		_, err = s.server.rdb.CreateScriptWithRetry(s.ctx, accountID, name, content)
 		if err != nil {
+			if errors.Is(err, db.ErrSieveScriptLimitReached) {
+				s.sendResponse("NO (QUOTA/MAXSCRIPTS) \"Too many scripts for this account\"\r\n")
+				return false
+			}
 			s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
 			return false
 		}
