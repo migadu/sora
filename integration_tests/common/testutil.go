@@ -216,7 +216,12 @@ func SetupTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 func CreateTestAccount(t *testing.T, rdb *resilient.ResilientDatabase) TestAccount {
 	t.Helper()
 
-	email := fmt.Sprintf("test-%s-%d@example.com", strings.ToLower(t.Name()), time.Now().UnixNano())
+	// Subtest names embed '/' (and '#NN' for duplicate names), neither of which is a
+	// valid email local-part character since the local-part validation was tightened
+	// (M3 audit fix). Sanitize them so helpers invoked inside t.Run subtests still
+	// produce a creatable test address.
+	safeName := strings.NewReplacer("/", "-", "#", "-").Replace(strings.ToLower(t.Name()))
+	email := fmt.Sprintf("test-%s-%d@example.com", safeName, time.Now().UnixNano())
 	password := "s3cur3p4ss!"
 
 	req := db.CreateAccountRequest{
