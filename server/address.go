@@ -8,7 +8,7 @@ import (
 
 // RFC 5322 compliant email validation regex
 // This allows for more valid email addresses than the previous regex
-const LocalPartRegex = `^(?i)(?:[a-z0-9!#$%&'*+/=?^_\{\|\}~-])+(?:\.(?:[a-z0-9!#$%&'*+/=?^_\{\|\}~-])+)*$`
+const LocalPartRegex = `^(?i)(?:[a-z0-9!#$%&'*+=?^_\{\|\}~-])+(?:\.(?:[a-z0-9!#$%&'*+=?^_\{\|\}~-])+)*$`
 const DomainNameRegex = `^(?i)(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`
 
 // Length limits for email addresses
