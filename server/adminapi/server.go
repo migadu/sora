@@ -989,7 +989,7 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// 1. Get the account ID for the primary email address in the path.
-	accountID, err := s.rdb.GetAccountIDByAddressWithRetry(ctx, primaryEmail)
+	accountID, err := s.rdb.GetActiveAccountIDByAddressWithRetry(ctx, primaryEmail)
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, "Account not found for the specified primary email")

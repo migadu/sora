@@ -37,7 +37,7 @@ func (s *Service) Grant(ctx context.Context, owner, mailboxName, identifier, rig
 	}
 
 	// Get owner account ID
-	ownerAccountID, err := s.rdb.GetAccountIDByAddressWithRetry(ctx, owner)
+	ownerAccountID, err := s.rdb.GetActiveAccountIDByAddressWithRetry(ctx, owner)
 	if err != nil {
 		return fmt.Errorf("owner account not found: %w", err)
 	}
@@ -58,7 +58,7 @@ func (s *Service) Grant(ctx context.Context, owner, mailboxName, identifier, rig
 //   - identifier: Email address of the user or "anyone"
 func (s *Service) Revoke(ctx context.Context, owner, mailboxName, identifier string) error {
 	// Get owner account ID
-	ownerAccountID, err := s.rdb.GetAccountIDByAddressWithRetry(ctx, owner)
+	ownerAccountID, err := s.rdb.GetActiveAccountIDByAddressWithRetry(ctx, owner)
 	if err != nil {
 		return fmt.Errorf("owner account not found: %w", err)
 	}
@@ -93,7 +93,7 @@ func (s *Service) Revoke(ctx context.Context, owner, mailboxName, identifier str
 //   - List of ACL entries with identifier and rights
 func (s *Service) List(ctx context.Context, owner, mailboxName string) ([]ACLEntry, error) {
 	// Get owner account ID
-	ownerAccountID, err := s.rdb.GetAccountIDByAddressWithRetry(ctx, owner)
+	ownerAccountID, err := s.rdb.GetActiveAccountIDByAddressWithRetry(ctx, owner)
 	if err != nil {
 		return nil, fmt.Errorf("owner account not found: %w", err)
 	}

@@ -300,7 +300,7 @@ func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, m
 	// Validate identifier - must be email or "anyone"
 	if !db.IsSpecialIdentifier(identifierStr) {
 		// Validate it's a valid email by checking if user exists
-		_, err := s.server.rdb.GetAccountIDByAddressWithRetry(writeCtx, identifierStr)
+		_, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(writeCtx, identifierStr)
 		if err != nil {
 			if err == consts.ErrUserNotFound {
 				return &imap.Error{
@@ -458,7 +458,7 @@ func (s *IMAPSession) ListRights(mailbox string, identifier imap.RightsIdentifie
 	// backing account; any other identifier must resolve to an existing account.
 	identifierEmail := string(identifier)
 	if !db.IsSpecialIdentifier(identifierEmail) {
-		_, err = s.server.rdb.GetAccountIDByAddressWithRetry(readCtx, identifierEmail)
+		_, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(readCtx, identifierEmail)
 		if err != nil {
 			if err == consts.ErrUserNotFound {
 				return nil, &imap.Error{

@@ -1114,6 +1114,31 @@ func TestErrorScenarios(t *testing.T) {
 		server.expectError(t, body, "not found")
 	})
 
+	t.Run("add credential to soft-deleted account is rejected", func(t *testing.T) {
+		email := fmt.Sprintf("deleted-acct-%d@example.com", time.Now().UnixNano())
+
+		// Create, then soft-delete the account (sets deleted_at).
+		createReq := adminapi.CreateAccountRequest{Email: email, Password: "password"}
+		if resp, body := server.makeRequest(t, "POST", "/admin/accounts", createReq); resp.StatusCode != http.StatusCreated {
+			t.Fatalf("failed to create account: %d %s", resp.StatusCode, string(body))
+		}
+		if err := server.rdb.DeleteAccountWithRetry(context.Background(), email); err != nil {
+			t.Fatalf("failed to soft-delete account: %v", err)
+		}
+
+		// Adding a credential to a soft-deleted account must be rejected like a missing
+		// one (admin must restore first) — matches the deleted_at gate on normal login.
+		addReq := adminapi.AddCredentialRequest{
+			Email:    fmt.Sprintf("deleted-alias-%d@example.com", time.Now().UnixNano()),
+			Password: "password",
+		}
+		resp, body := server.makeRequest(t, "POST", "/admin/accounts/"+email+"/credentials", addReq)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("Expected status %d for soft-deleted account, got %d. Body: %s", http.StatusNotFound, resp.StatusCode, string(body))
+		}
+		server.expectError(t, body, "not found")
+	})
+
 	t.Run("get credential for non-existent email", func(t *testing.T) {
 		nonExistentEmail := "nonexistent-credential@example.com"
 
