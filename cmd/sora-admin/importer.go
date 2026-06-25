@@ -1236,8 +1236,10 @@ func (i *Importer) scanMaildir() error {
 				return nil
 			}
 
-			// Security check: ensure path is within maildir
-			if !strings.HasPrefix(filepath.Clean(path), cleanPath) {
+			// Security check: ensure path is within maildir. filepath.Rel rejects
+			// sibling-prefix bypasses (e.g. /srv/maildir-evil vs /srv/maildir) that a
+			// strings.HasPrefix check would allow.
+			if rel, relErr := filepath.Rel(cleanPath, filepath.Clean(path)); relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 				return fmt.Errorf("path outside maildir: %s", path)
 			}
 
@@ -1552,9 +1554,14 @@ func decompressIfNeeded(content []byte) ([]byte, error) {
 		}
 		defer reader.Close()
 
-		decompressed, err := io.ReadAll(reader)
+		// Bound decompression to avoid a gzip bomb exhausting memory.
+		const maxDecompressedSize = 256 << 20 // 256 MiB
+		decompressed, err := io.ReadAll(io.LimitReader(reader, maxDecompressedSize+1))
 		if err != nil {
 			return nil, fmt.Errorf("failed to decompress gzip content: %w", err)
+		}
+		if len(decompressed) > maxDecompressedSize {
+			return nil, fmt.Errorf("decompressed gzip content exceeds %d bytes", maxDecompressedSize)
 		}
 
 		return decompressed, nil
@@ -2237,7 +2244,7 @@ func (i *Importer) processPathsFile(cleanPath string, filesToProcess chan<- file
 			fullPath = filepath.Join(cleanPath, line)
 		}
 
-		if !strings.HasPrefix(fullPath, cleanPath) {
+		if rel, relErr := filepath.Rel(cleanPath, fullPath); relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			logger.Warn("Skipping path outside maildir", "path", line)
 			continue
 		}
