@@ -232,7 +232,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		var mailboxID int64
 		err := tx.QueryRow(ctx, `
 			SELECT id FROM mailboxes
-			WHERE account_id = $1 AND name = $2
+			WHERE account_id = $1 AND LOWER(name) = LOWER($2)
 		`, accountID, mailboxPath).Scan(&mailboxID)
 
 		if err == pgx.ErrNoRows {

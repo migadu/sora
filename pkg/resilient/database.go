@@ -99,6 +99,7 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
@@ -1491,10 +1492,17 @@ func (rd *ResilientDatabase) monitorPoolGroup(pools []*DatabasePool, poolType st
 // GetOrCreateMailboxByNameWithRetry retrieves a mailbox by name, creating it if it doesn't exist.
 // This is more efficient than separate get and create calls as it aims to do it in a single transaction.
 func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Context, AccountID int64, name string) (*db.DBMailbox, error) {
+	// Mailbox names are case-insensitive (Option A; matches GetMailboxByName and
+	// the UNIQUE(account_id, LOWER(name)) index). Every lookup below folds case so
+	// a request for "Inbox"/"archive" resolves to an existing "INBOX"/"Archive"
+	// instead of creating a case-variant duplicate. CanonicalMailboxName only
+	// normalizes the reserved INBOX spelling so a freshly-created inbox is stored
+	// as "INBOX" (RFC 3501 §5.1); all other names keep their as-typed case.
+	name = helpers.CanonicalMailboxName(name)
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		// First, try to get the mailbox within the transaction.
+		// First, try to get the mailbox within the transaction (case-insensitive).
 		var mb db.DBMailbox
-		err := tx.QueryRow(ctx, "SELECT id, account_id, name FROM mailboxes WHERE account_id = $1 AND name = $2", AccountID, name).Scan(&mb.ID, &mb.AccountID, &mb.Name)
+		err := tx.QueryRow(ctx, "SELECT id, account_id, name FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2)", AccountID, name).Scan(&mb.ID, &mb.AccountID, &mb.Name)
 		if err == nil {
 			return &mb, nil // Found it, we're done.
 		}
@@ -1511,7 +1519,7 @@ func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Conte
 			for i := 1; i < len(parts); i++ {
 				parentName := strings.Join(parts[:i], string(consts.MailboxDelimiter))
 				var pID int64
-				err := tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND name = $2", AccountID, parentName).Scan(&pID)
+				err := tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2)", AccountID, parentName).Scan(&pID)
 				if err != nil {
 					if errors.Is(err, pgx.ErrNoRows) {
 						err = dbLayer.CreateMailbox(ctx, tx, AccountID, parentName, currentParentID)
@@ -1519,7 +1527,7 @@ func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Conte
 							return nil, fmt.Errorf("failed to auto-create parent mailbox '%s': %w", parentName, err)
 						}
 						// Retrieve the parent ID, handles both successful creation and concurrent creation
-						err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND name = $2", AccountID, parentName).Scan(&pID)
+						err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2)", AccountID, parentName).Scan(&pID)
 						if err != nil {
 							return nil, fmt.Errorf("failed to fetch parent mailbox '%s' after creation: %w", parentName, err)
 						}
@@ -1537,8 +1545,9 @@ func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Conte
 			return nil, fmt.Errorf("failed to create mailbox '%s': %w", name, err)
 		}
 
-		// Fetch the newly created (or concurrently created) mailbox
-		err = tx.QueryRow(ctx, "SELECT id, account_id, name FROM mailboxes WHERE account_id = $1 AND name = $2", AccountID, name).Scan(&mb.ID, &mb.AccountID, &mb.Name)
+		// Fetch the newly created (or concurrently created) mailbox (case-insensitive,
+		// so a concurrent creator that stored a different case is still found).
+		err = tx.QueryRow(ctx, "SELECT id, account_id, name FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2)", AccountID, name).Scan(&mb.ID, &mb.AccountID, &mb.Name)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch created mailbox '%s': %w", name, err)
 		}

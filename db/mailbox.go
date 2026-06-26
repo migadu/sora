@@ -282,6 +282,12 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 }
 
 func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64) error {
+	// Mailbox names are case-insensitive (Option A): the UNIQUE(account_id,
+	// LOWER(name)) index rejects any case-variant of an existing name. Folding
+	// INBOX additionally guarantees the reserved inbox is stored as the canonical
+	// "INBOX" (RFC 3501 §5.1); other names keep their as-typed case.
+	name = helpers.CanonicalMailboxName(name)
+
 	// Validate mailbox name doesn't contain problematic characters
 	if strings.ContainsAny(name, "\t\r\n\x00") {
 		logger.Error("Database: attempted to create mailbox with invalid characters", "name", name, "account_id", AccountID)
@@ -459,7 +465,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, Account
 	err := tx.QueryRow(ctx, `
 		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path)
 		VALUES ($1, $2, $3, $4, '')
-		ON CONFLICT (account_id, name) DO NOTHING
+		ON CONFLICT (account_id, LOWER(name)) DO NOTHING
 		RETURNING id
 	`, AccountID, name, int64(uidValidity), true).Scan(&mailboxID)
 
@@ -476,11 +482,13 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, Account
 			}
 		}
 
-		// If the mailbox already exists (no rows returned), fetch its ID
+		// If the mailbox already exists (no rows returned), fetch its ID. The
+		// conflict may be on a different-case row (case-insensitive uniqueness),
+		// so match case-insensitively rather than on the exact spelling.
 		if err == pgx.ErrNoRows {
 			err := tx.QueryRow(ctx, `
-				SELECT id FROM mailboxes 
-				WHERE account_id = $1 AND name = $2
+				SELECT id FROM mailboxes
+				WHERE account_id = $1 AND LOWER(name) = LOWER($2)
 			`, AccountID, name).Scan(&mailboxID)
 
 			if err != nil {
@@ -609,7 +617,7 @@ func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, Accou
 	// This avoids 5 INSERT attempts on every LMTP delivery when mailboxes already exist
 	var inboxExists bool
 	err := tx.QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND name = 'INBOX')
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LOWER(name) = 'inbox')
 	`, AccountID).Scan(&inboxExists)
 	if err != nil {
 		return fmt.Errorf("failed to check for INBOX existence: %w", err)
@@ -631,7 +639,7 @@ func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, Accou
 		// The DO UPDATE clause with a no-op is a common way to get RETURNING to work with conflicts.
 		err := tx.QueryRow(ctx, `
 			INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path) VALUES ($1, $2, $3, TRUE, '')
-			ON CONFLICT (account_id, name) DO UPDATE
+			ON CONFLICT (account_id, LOWER(name)) DO UPDATE
 			SET subscribed = TRUE -- Ensure default mailboxes are always subscribed
 			RETURNING id
 		`, AccountID, mailboxName, int64(uidValidity)).Scan(&mailboxID)
@@ -1039,6 +1047,30 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			return fmt.Errorf("failed to update child mailboxes: %w", err)
 		}
 
+	}
+
+	// Keep the denormalized messages.mailbox_path in sync with the new name(s).
+	// This column stores the mailbox NAME and is used by RestoreMessages to route
+	// expunged messages back to a mailbox by that name; leaving it pointing at the
+	// pre-rename name would resurrect a mailbox under the old name on restore.
+	// After the updates above, the renamed mailbox and all of its descendants are
+	// exactly the mailboxes whose path is prefixed by newPath (true for both a
+	// simple rename, where newPath == oldPath, and a move, where descendant paths
+	// were re-prefixed to newPath), so set each affected message's mailbox_path to
+	// its mailbox's current name. Expunged rows are included on purpose — they are
+	// precisely what RestoreMessages reads. Only mailbox_path changes, so the
+	// per-statement stats trigger (which keys on mailbox_id/expunged_at) is a no-op.
+	_, err = tx.Exec(ctx, `
+		UPDATE messages m
+		SET mailbox_path = mb.name
+		FROM mailboxes mb
+		WHERE m.mailbox_id = mb.id
+		  AND mb.account_id = $1
+		  AND mb.path LIKE $2 || '%'
+		  AND m.mailbox_path IS DISTINCT FROM mb.name
+	`, ownerAccountID, newPath)
+	if err != nil {
+		return fmt.Errorf("failed to sync message mailbox_path after rename of mailbox %d: %w", mailboxID, err)
 	}
 
 	return nil
