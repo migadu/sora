@@ -690,6 +690,12 @@ enabled_extensions = []
 # To enable header editing (allows users to modify message headers via SIEVE):
 # enabled_extensions = ["fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex", "date", "index", "editheader", "mailbox", "subaddress", "encoded-character", "comparator-i;octet", "comparator-i;ascii-casemap", "comparator-i;ascii-numeric", "comparator-i;unicode-casemap", "body"]
 
+# Per-script execution budget (CPU/resource-exhaustion guard). This is also used as
+# the per-match soft-wait cap for :matches / :regex evaluation, so a large but
+# input-bounded body match completes within the budget instead of failing. Clamped to
+# [100ms, 60s]. Default: 2s.
+# max_execution_time = "2s"
+
 # IMPORTANT NOTES:
 # - Shared mailboxes are restricted to users within the same domain for security
 # - Creators automatically receive the default_rights on mailboxes they create

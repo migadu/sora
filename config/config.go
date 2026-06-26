@@ -972,6 +972,22 @@ type AdminCLIConfig struct {
 // SieveConfig holds Sieve script engine configuration
 type SieveConfig struct {
 	EnabledExtensions []string `toml:"enabled_extensions"` // List of enabled Sieve extensions (empty = all extensions enabled)
+	MaxExecutionTime  string   `toml:"max_execution_time"` // Per-script execution budget, also the per-match regex soft-wait cap (e.g. "2s"); default 2s
+}
+
+// GetMaxExecutionTime returns the per-script Sieve execution budget. This bounds total
+// script execution (CPU/resource-exhaustion guard) and is also used as the per-match
+// regex soft-wait cap. Default 2s; an empty or invalid value falls back to the default.
+func (s *SieveConfig) GetMaxExecutionTime() time.Duration {
+	const def = 2 * time.Second
+	if s.MaxExecutionTime == "" {
+		return def
+	}
+	d, err := helpers.ParseDuration(s.MaxExecutionTime)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
 }
 
 // AuthCacheConfig holds persistent authentication cache configuration.

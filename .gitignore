@@ -14,3 +14,7 @@ CLAUDE.md
 .claude/
 config-live.toml
 tasks/todo.md
+
+# Local multi-module dev bridge
+go.work
+go.work.sum

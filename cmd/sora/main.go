@@ -41,6 +41,7 @@ import (
 	"github.com/migadu/sora/server/pop3"
 	"github.com/migadu/sora/server/pop3proxy"
 	"github.com/migadu/sora/server/relayqueue"
+	"github.com/migadu/sora/server/sieveengine"
 	"github.com/migadu/sora/server/uploader"
 	mailapi "github.com/migadu/sora/server/userapi"
 	"github.com/migadu/sora/server/userapiproxy"
@@ -147,6 +148,10 @@ func main() {
 
 	// Apply the configured bcrypt cost (clamped) for password hashing/rehash.
 	db.SetBcryptCost(cfg.GetBcryptCost())
+
+	// Apply the configured Sieve script execution budget (also the per-match regex
+	// soft-wait cap). Clamped to a sane range inside the setter.
+	sieveengine.SetScriptExecutionTimeout(cfg.Sieve.GetMaxExecutionTime())
 
 	// Initialize logging with zap logger
 	logFile, err := logger.Initialize(cfg.Logging)

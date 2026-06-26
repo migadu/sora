@@ -25,6 +25,36 @@ const (
 	ActionVacation Action = "vacation"
 )
 
+// scriptExecutionTimeout bounds the total execution time of a single Sieve script
+// (CPU/resource-exhaustion guard). It is also passed to go-sieve as the per-match
+// regex soft-wait cap (Options.Interp.RegexLimits.MaxExecTime), so a large but
+// input-bounded body :matches/:regex completes within the script budget instead of
+// failing on go-sieve's tight 100ms default under load or race instrumentation.
+// Configurable via SetScriptExecutionTimeout (from [sieve] max_execution_time).
+var scriptExecutionTimeout = 2 * time.Second
+
+const (
+	minScriptExecutionTimeout = 100 * time.Millisecond
+	maxScriptExecutionTimeout = 60 * time.Second
+)
+
+// SetScriptExecutionTimeout overrides the Sieve script execution budget (and the
+// per-match regex soft-wait cap derived from it). The value is clamped to
+// [100ms, 60s]; a non-positive value leaves the current setting unchanged. Call once
+// at startup before serving.
+func SetScriptExecutionTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	if d < minScriptExecutionTimeout {
+		d = minScriptExecutionTimeout
+	}
+	if d > maxScriptExecutionTimeout {
+		d = maxScriptExecutionTimeout
+	}
+	scriptExecutionTimeout = d
+}
+
 // DefaultSieveExtensions is the safe subset of SIEVE extensions enabled by default.
 // Excludes security-sensitive extensions like editheader.
 // The canonical list is maintained in server/managesieve/capabilities.go
@@ -107,6 +137,10 @@ func NewSieveExecutorWithExtensions(scriptContent string, enabledExtensions []st
 	scriptReader := strings.NewReader(scriptContent)
 	options := sieve.DefaultOptions()
 	options.EnabledExtensions = enabledExtensions
+	// Raise the per-match regex soft-wait cap to the whole-script budget. The match
+	// input is already truncated to MaxInputLength, so a large body match is bounded;
+	// go-sieve's 100ms default can otherwise spuriously fail it under load or -race.
+	options.Interp.RegexLimits.MaxExecTime = scriptExecutionTimeout
 	script, err := sieve.Load(scriptReader, options)
 	if err != nil {
 		return nil, err
@@ -130,6 +164,10 @@ func NewSieveExecutorWithOracleAndExtensions(scriptContent string, AccountID int
 	scriptReader := strings.NewReader(scriptContent)
 	options := sieve.DefaultOptions()
 	options.EnabledExtensions = enabledExtensions
+	// Raise the per-match regex soft-wait cap to the whole-script budget. The match
+	// input is already truncated to MaxInputLength, so a large body match is bounded;
+	// go-sieve's 100ms default can otherwise spuriously fail it under load or -race.
+	options.Interp.RegexLimits.MaxExecTime = scriptExecutionTimeout
 	script, err := sieve.Load(scriptReader, options)
 	if err != nil {
 		return nil, err
@@ -183,7 +221,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 	}
 
 	// Limit execution time of the Sieve script to prevent CPU/resource exhaustion
-	timeout := 2 * time.Second
+	timeout := scriptExecutionTimeout
 	if deadline, ok := evalCtx.Deadline(); ok {
 		left := time.Until(deadline)
 		if left < timeout {
