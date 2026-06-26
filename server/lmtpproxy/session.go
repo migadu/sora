@@ -42,6 +42,7 @@ type Session struct {
 	routingMethod         string
 	sessionID             string // Proxy session ID for end-to-end tracing (also forwarded to the backend)
 	clientAddr            string // Cached client address to avoid race with connection close
+	clientHelo            string // Client's announced HELO/EHLO/LHLO name, forwarded to the backend via XCLIENT
 	releaseConn           func() // Connection limiter cleanup function
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
 	mu                    sync.Mutex
@@ -189,6 +190,10 @@ func (s *Session) handleConnection() {
 				s.sendResponse("501 5.5.4 Syntax error in parameters")
 				continue
 			}
+			// Remember the client's announced name so we can forward it to the backend via
+			// XCLIENT (HELO=...); without it the backend's Received: trace falls back to the
+			// proxy's own LHLO name. args[0] is a single tokenized field (no spaces/CRLF).
+			s.clientHelo = args[0]
 			if command == "EHLO" || command == "LHLO" {
 				// Send extended response
 				s.sendResponse(fmt.Sprintf("250-%s", s.server.hostname))

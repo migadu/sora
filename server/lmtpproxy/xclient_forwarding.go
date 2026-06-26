@@ -23,6 +23,13 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 	// Use ESMTP for PROTO parameter as per Postfix XCLIENT spec (valid values: SMTP, ESMTP)
 	forwardingParams.Protocol = "ESMTP"
 
+	// Forward the client's announced HELO/LHLO name so the backend's Received: trace can name
+	// the real upstream rather than this proxy. NewForwardingParams only fills in the client
+	// IP/port, never the HELO.
+	if s.clientHelo != "" {
+		forwardingParams.HELO = s.clientHelo
+	}
+
 	// Don't set ProxyTTL for LMTP XCLIENT since it's not commonly supported
 	// and causes "501 Bad command" errors with standard LMTP servers
 	forwardingParams.ProxyTTL = 0
