@@ -475,6 +475,17 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	clientIP, proxyIP := server.GetConnectionIPs(netConn, proxyInfo)
 	s.RemoteIP = clientIP
 	s.ProxyIP = proxyIP
+
+	// Re-apply any XCLIENT identity forwarded by a trusted front proxy. go-smtp records
+	// XCLIENT attributes only from XCLIENTTrustedNets peers and preserves them on the Conn
+	// across the mandatory post-XCLIENT session reset; the XCLIENT() hook, however, ran on
+	// the pre-reset session that was discarded. Applying them here rewrites RemoteIP to the
+	// real client and populates ForwardingParams (HELO/LOGIN/PROTO) on the session that
+	// actually delivers, so the Received: trace and logs name the client, not the proxy.
+	if xd := c.XCLIENTData(); len(xd) > 0 {
+		s.applyXCLIENTAttrs(xd)
+	}
+
 	s.Id = idgen.New()
 	s.HostName = b.hostname
 	s.ServerName = b.name

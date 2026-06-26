@@ -402,8 +402,16 @@ func (s *LMTPSession) Data(r io.Reader) error {
 		// Add our Received: trace for the LMTP delivery hop (the final hop, as an MDA such
 		// as Dovecot would add), then put Delivered-To on top so it is the first header of
 		// the delivered message.
+		//
+		// Prefer the forwarded HELO/IP of the real upstream client (carried over XCLIENT by a
+		// front proxy) so the trace names the original sender rather than the proxy. s.RemoteIP
+		// is already rewritten to the client IP by the XCLIENT/PROXY-protocol handlers; do the
+		// same for the HELO here, since s.conn.Hostname() only ever holds the proxy's LHLO name.
+		// Falls back to the connection's LHLO name for direct (non-proxied) deliveries.
 		helo := ""
-		if s.conn != nil {
+		if s.ForwardingParams != nil && s.ForwardingParams.HELO != "" {
+			helo = s.ForwardingParams.HELO
+		} else if s.conn != nil {
 			helo = s.conn.Hostname()
 		}
 		received := helpers.BuildReceivedHeader(

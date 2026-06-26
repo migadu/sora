@@ -20,6 +20,24 @@ func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) err
 		return fmt.Errorf("XCLIENT denied")
 	}
 
+	s.applyXCLIENTAttrs(attrs)
+
+	s.DebugLog("processed xclient attributes", "client_ip", s.ForwardingParams.OriginatingIP, "client_port", s.ForwardingParams.OriginatingPort, "protocol", s.ForwardingParams.Protocol, "helo", s.ForwardingParams.HELO, "login", s.ForwardingParams.Login)
+
+	return nil
+}
+
+// applyXCLIENTAttrs maps parsed XCLIENT attributes onto this session: it rewrites the real
+// client IP (ADDR), records the proxy's own IP, and captures HELO/LOGIN/PROTO for the
+// Received: trace and logging.
+//
+// It is shared by two callers. The XCLIENT() command hook runs on the pre-reset session that
+// go-smtp discards immediately afterwards (XCLIENT mandates a session reset), so those writes
+// never reach delivery. NewSession therefore re-applies the same attributes — which go-smtp
+// persists on the Conn across the reset, and only ever records from trusted proxies — onto the
+// fresh session that actually handles MAIL/RCPT/DATA. Without that second call the forwarded
+// client identity would be lost and the trace would name the proxy instead of the real client.
+func (s *LMTPSession) applyXCLIENTAttrs(attrs map[string]string) {
 	// Initialize forwarding parameters if not already present
 	if s.ForwardingParams == nil {
 		s.ForwardingParams = &server.ForwardingParams{
@@ -70,10 +88,6 @@ func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) err
 			s.ForwardingParams.Variables["xclient-"+strings.ToLower(name)] = value
 		}
 	}
-
-	s.DebugLog("processed xclient attributes", "client_ip", s.ForwardingParams.OriginatingIP, "client_port", s.ForwardingParams.OriginatingPort, "protocol", s.ForwardingParams.Protocol, "helo", s.ForwardingParams.HELO, "login", s.ForwardingParams.Login)
-
-	return nil
 }
 
 // isFromTrustedProxy reports whether the peer may override the real client IP via

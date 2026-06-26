@@ -20,7 +20,7 @@ import (
 // setupLMTPForDelivery brings up an LMTP server backed by a local-disk uploader (so the
 // stored message bytes can be read straight off disk) plus a fresh account. It returns
 // the account, the LMTP listen address, and the uploader temp dir.
-func setupLMTPForDelivery(t *testing.T) (common.TestAccount, string, string) {
+func setupLMTPForDelivery(t *testing.T, opts ...lmtpserver.LMTPServerOptions) (common.TestAccount, string, string) {
 	t.Helper()
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -36,10 +36,15 @@ func setupLMTPForDelivery(t *testing.T) (common.TestAccount, string, string) {
 		t.Fatalf("Failed to create uploader: %v", err)
 	}
 
+	var serverOpts lmtpserver.LMTPServerOptions
+	if len(opts) > 0 {
+		serverOpts = opts[0]
+	}
+
 	lmtpAddr := common.GetRandomAddress(t)
 	lmtpSrv, err := lmtpserver.New(
 		context.Background(), "test-lmtp", "localhost", lmtpAddr,
-		&storage.S3Storage{}, rdb, uploaderInstance, lmtpserver.LMTPServerOptions{},
+		&storage.S3Storage{}, rdb, uploaderInstance, serverOpts,
 	)
 	if err != nil {
 		t.Fatalf("Failed to create LMTP server: %v", err)
@@ -70,6 +75,55 @@ func deliverLMTPRaw(t *testing.T, lmtpAddr, from, rcpt, message string) string {
 	if _, err := c.ReadMultilineResponse(); err != nil {
 		t.Fatalf("LHLO response: %v", err)
 	}
+	return runLMTPMailData(t, c, from, rcpt, message)
+}
+
+// deliverLMTPRawXCLIENT mimics a front proxy: it greets, sends an XCLIENT command to forward
+// the real client's identity, handles the mandatory session reset (the server replies with a
+// fresh 220 greeting), re-greets, then runs the transaction. It returns the per-recipient
+// DATA response. xclientAttrs is the raw attribute string, e.g. "ADDR=203.0.113.9 HELO=...".
+func deliverLMTPRawXCLIENT(t *testing.T, lmtpAddr, from, rcpt, message, xclientAttrs string) string {
+	t.Helper()
+	c, err := NewLMTPClient(lmtpAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect to LMTP: %v", err)
+	}
+	defer c.Close()
+
+	if err := c.SendCommand("LHLO proxy.internal"); err != nil {
+		t.Fatalf("LHLO: %v", err)
+	}
+	if _, err := c.ReadMultilineResponse(); err != nil {
+		t.Fatalf("LHLO response: %v", err)
+	}
+
+	// XCLIENT: the server applies the forwarded attributes, resets the session, and replies
+	// with a new 220 greeting (no separate 250 OK), exactly like the real LMTP proxy expects.
+	if err := c.SendCommand("XCLIENT " + xclientAttrs); err != nil {
+		t.Fatalf("XCLIENT: %v", err)
+	}
+	greeting, err := c.ReadResponse()
+	if err != nil {
+		t.Fatalf("XCLIENT response: %v", err)
+	}
+	if !strings.HasPrefix(greeting, "220") {
+		t.Fatalf("expected 220 greeting after XCLIENT, got: %s", greeting)
+	}
+
+	// Client must re-issue LHLO after the reset (RFC/Postfix XCLIENT behavior).
+	if err := c.SendCommand("LHLO proxy.internal"); err != nil {
+		t.Fatalf("LHLO after XCLIENT: %v", err)
+	}
+	if _, err := c.ReadMultilineResponse(); err != nil {
+		t.Fatalf("LHLO-after-XCLIENT response: %v", err)
+	}
+	return runLMTPMailData(t, c, from, rcpt, message)
+}
+
+// runLMTPMailData runs the MAIL FROM / RCPT TO / DATA portion of a transaction on an already
+// greeted connection and returns the per-recipient response that follows DATA.
+func runLMTPMailData(t *testing.T, c *LMTPClient, from, rcpt, message string) string {
+	t.Helper()
 	if err := c.SendCommand(fmt.Sprintf("MAIL FROM:<%s>", from)); err != nil {
 		t.Fatalf("MAIL FROM: %v", err)
 	}
@@ -165,8 +219,10 @@ func TestLMTP_DeliveredToAndReceivedHeaders(t *testing.T) {
 		t.Errorf("Received: (%d) must come after Delivered-To: (%d)\n%s", rcvIdx, dtIdx, head(stored))
 	}
 
-	// 3. Received: content for this LMTP delivery hop.
+	// 3. Received: content for this LMTP delivery hop. Without any forwarded identity the
+	// from-clause falls back to the connection's LHLO name.
 	for _, want := range []string{
+		"from test.example.com",
 		"by localhost with LMTP",
 		"for <" + account.Email + ">",
 	} {
@@ -180,6 +236,50 @@ func TestLMTP_DeliveredToAndReceivedHeaders(t *testing.T) {
 		if !strings.Contains(stored, want) {
 			t.Errorf("original content missing %q", want)
 		}
+	}
+}
+
+// TestLMTP_ReceivedHeaderUsesForwardedClientIdentity verifies that when a trusted front
+// proxy forwards the real client's identity via XCLIENT, the delivered message's Received:
+// trace names the CLIENT (forwarded HELO + ADDR), not the proxy. This is the regression
+// guard for the bug where XCLIENT attributes set on the pre-reset session were discarded:
+// go-smtp resets the session after XCLIENT, so the attributes must be re-applied (from the
+// data it persists on the Conn) onto the fresh session that actually delivers.
+func TestLMTP_ReceivedHeaderUsesForwardedClientIdentity(t *testing.T) {
+	// Trust loopback so the XCLIENT source-IP override is honored (both go-smtp's
+	// XCLIENTTrustedNets and Sora's xclient trust derive from TrustedNetworks).
+	account, lmtpAddr, tempDir := setupLMTPForDelivery(t, lmtpserver.LMTPServerOptions{
+		TrustedNetworks: []string{"127.0.0.0/8", "::1/128"},
+	})
+
+	msg := strings.Join([]string{
+		"From: sender@example.com",
+		"To: " + account.Email,
+		"Subject: XCLIENT Trace Test",
+		"Message-ID: <xcl-" + fmt.Sprintf("%d", time.Now().UnixNano()) + "@example.com>",
+		"",
+		"Body behind a proxy.",
+	}, "\r\n")
+
+	const clientIP = "203.0.113.9"
+	const clientHELO = "upstream.example.net"
+	resp := deliverLMTPRawXCLIENT(t, lmtpAddr, "sender@example.com", account.Email, msg,
+		"ADDR="+clientIP+" HELO="+clientHELO+" PROTO=ESMTP")
+	if !strings.HasPrefix(resp, "250") {
+		t.Fatalf("expected 250 delivery, got: %s", resp)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	stored := readStoredMessage(t, tempDir)
+
+	// The Received: from-clause must reflect the forwarded client, not the (loopback) proxy.
+	want := fmt.Sprintf("from %s ([%s])", clientHELO, clientIP)
+	if !strings.Contains(stored, want) {
+		t.Errorf("Received: must name the forwarded client %q\n%s", want, head(stored))
+	}
+	// And must NOT leak the proxy's LHLO name into the trace.
+	if strings.Contains(stored, "from proxy.internal") {
+		t.Errorf("Received: leaked the proxy LHLO name instead of the forwarded client\n%s", head(stored))
 	}
 }
 
