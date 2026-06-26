@@ -2,6 +2,8 @@ package server
 
 import (
 	"net"
+
+	"github.com/migadu/sora/helpers"
 )
 
 // MasterSASLNetworkGate restricts which source networks may use master SASL
@@ -27,7 +29,7 @@ func NewMasterSASLNetworkGate(cidrs []string) (*MasterSASLNetworkGate, error) {
 	if len(cidrs) == 0 {
 		return &MasterSASLNetworkGate{}, nil
 	}
-	nets, err := ParseTrustedNetworks(cidrs)
+	nets, err := helpers.ParseTrustedNetworks(cidrs)
 	if err != nil {
 		return nil, err
 	}

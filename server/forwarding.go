@@ -6,6 +6,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+
+	"github.com/migadu/sora/helpers"
 )
 
 // ForwardingParams represents connection parameters that can be forwarded across protocols
@@ -363,41 +365,6 @@ func (fp *ForwardingParams) ValidateForwarding() error {
 	return nil
 }
 
-// ParseTrustedNetworks parses a slice of CIDR strings into a slice of *net.IPNet
-// Automatically adds /32 for IPv4 and /128 for IPv6 addresses without subnet notation
-func ParseTrustedNetworks(cidrs []string) ([]*net.IPNet, error) {
-	var networks []*net.IPNet
-	for _, cidr := range cidrs {
-		// Try parsing as CIDR first
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			// If CIDR parsing fails, try parsing as plain IP and add appropriate subnet
-			ip := net.ParseIP(cidr)
-			if ip == nil {
-				return nil, fmt.Errorf("invalid trusted network '%s': not a valid IP address or CIDR", cidr)
-			}
-
-			// Determine if IPv4 or IPv6 and add appropriate subnet
-			var cidrWithSubnet string
-			if ip.To4() != nil {
-				// IPv4 address
-				cidrWithSubnet = cidr + "/32"
-			} else {
-				// IPv6 address
-				cidrWithSubnet = cidr + "/128"
-			}
-
-			// Parse the corrected CIDR
-			_, network, err = net.ParseCIDR(cidrWithSubnet)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse corrected CIDR '%s': %w", cidrWithSubnet, err)
-			}
-		}
-		networks = append(networks, network)
-	}
-	return networks, nil
-}
-
 // IsTrustedForwarding checks if the connection is from a trusted proxy
 // This function should be used to validate forwarding parameters
 func IsTrustedForwarding(conn net.Conn, trustedProxies []string) bool {
@@ -421,18 +388,7 @@ func IsTrustedForwarding(conn net.Conn, trustedProxies []string) bool {
 		}
 	}
 
-	// Check against trusted proxy networks
-	for _, cidr := range trustedProxies {
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
-		if network.Contains(ip) {
-			return true
-		}
-	}
-
-	return false
+	return helpers.IPInNetworks(ip, trustedProxies)
 }
 
 // IsTrustedForwardingWithProxy checks if the connection is from a trusted proxy
@@ -441,22 +397,7 @@ func IsTrustedForwardingWithProxy(conn net.Conn, proxyIP string, trustedProxies 
 	// When PROXY protocol is used, check the proxy's IP (not the real client IP)
 	// The proxyIP contains the actual IP of the proxy server that sent the PROXY header
 	if proxyIP != "" {
-		ip := net.ParseIP(proxyIP)
-		if ip == nil {
-			return false
-		}
-
-		// Check against trusted proxy networks
-		for _, cidr := range trustedProxies {
-			_, network, err := net.ParseCIDR(cidr)
-			if err != nil {
-				continue
-			}
-			if network.Contains(ip) {
-				return true
-			}
-		}
-		return false
+		return helpers.IPInNetworks(net.ParseIP(proxyIP), trustedProxies)
 	}
 
 	// Fall back to checking the direct connection's remote address (no PROXY protocol)

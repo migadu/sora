@@ -16,6 +16,7 @@ import (
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
@@ -568,7 +569,7 @@ func getClientIP(r *http.Request) string {
 }
 
 func isIPAllowed(clientIP string, allowedHosts []string) bool {
-	networks, err := server.ParseTrustedNetworks(allowedHosts)
+	networks, err := helpers.ParseTrustedNetworks(allowedHosts)
 	if err != nil {
 		logger.Warn("userapi: failed to parse allowed hosts as CIDR, falling back to literal matching", "error", err)
 		for _, allowedHost := range allowedHosts {

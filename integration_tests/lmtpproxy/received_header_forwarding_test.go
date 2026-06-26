@@ -25,16 +25,64 @@ import (
 // Received: header naming the CLIENT (its announced LHLO name + IP), not the proxy. This
 // exercises the whole chain — proxy forwards HELO/ADDR via XCLIENT, the backend re-applies
 // the XCLIENT data onto the post-reset delivery session, and BuildReceivedHeader prefers the
-// forwarded HELO.
+// forwarded HELO. XCLIENT only (no PROXY protocol).
 func TestLMTPProxyForwardsClientIdentityToReceivedHeader(t *testing.T) {
+	stored := deliverThroughProxyAndReadStored(t, traceTestConfig{
+		backendAddr: "127.0.0.1:12431",
+		proxyAddr:   "127.0.0.1:12432",
+		backendOpts: lmtp.LMTPServerOptions{
+			TrustedNetworks: []string{"127.0.0.0/8", "::1/128"},
+		},
+		proxyOpts: lmtpproxy.ServerOptions{
+			TrustedProxies:   []string{"127.0.0.1/32"},
+			RemoteUseXCLIENT: true,
+		},
+	})
+	assertClientHELOInTrace(t, stored)
+}
+
+// TestLMTPProxyForwardsClientIdentityWithProxyProtocol replicates the production combination
+// that XCLIENT-only tests miss: the backend has proxy_protocol = true AND the proxy forwards
+// BOTH a PROXY protocol header (for the IP) and XCLIENT (for the HELO). The regression risk is
+// that PROXY-protocol handling interferes with XCLIENT trust/application and the HELO is lost
+// while the IP still survives — exactly the symptom seen in production.
+func TestLMTPProxyForwardsClientIdentityWithProxyProtocol(t *testing.T) {
+	stored := deliverThroughProxyAndReadStored(t, traceTestConfig{
+		backendAddr: "127.0.0.1:12433",
+		proxyAddr:   "127.0.0.1:12434",
+		backendOpts: lmtp.LMTPServerOptions{
+			TrustedNetworks:      []string{"127.0.0.0/8", "::1/128"},
+			ProxyProtocol:        true,
+			ProxyProtocolTimeout: "5s",
+		},
+		proxyOpts: lmtpproxy.ServerOptions{
+			TrustedProxies:         []string{"127.0.0.1/32"},
+			RemoteUseXCLIENT:       true,
+			RemoteUseProxyProtocol: true,
+		},
+	})
+	assertClientHELOInTrace(t, stored)
+}
+
+const traceClientHELO = "upstream.example.net"
+
+type traceTestConfig struct {
+	backendAddr string
+	proxyAddr   string
+	backendOpts lmtp.LMTPServerOptions
+	proxyOpts   lmtpproxy.ServerOptions
+}
+
+// deliverThroughProxyAndReadStored brings up a backend + proxy with the given options, delivers
+// one message announcing traceClientHELO, and returns the stored message bytes.
+func deliverThroughProxyAndReadStored(t *testing.T, cfg traceTestConfig) string {
+	t.Helper()
 	ctx := context.Background()
 
 	rdb := common.SetupTestDatabase(t)
 	testAccount := common.CreateTestAccount(t, rdb)
 
 	s3 := &storage.S3Storage{}
-
-	// Backend upload worker stages message bytes to disk; we read them back to inspect headers.
 	tempDir := t.TempDir()
 	uploadWorker, err := uploader.New(
 		ctx, tempDir, 10, 2, 3, 5*time.Second, 0, "test-backend", rdb, s3, nil, make(chan error, 1),
@@ -44,11 +92,7 @@ func TestLMTPProxyForwardsClientIdentityToReceivedHeader(t *testing.T) {
 	}
 	t.Cleanup(func() { uploadWorker.Stop() })
 
-	// Backend: trust loopback so it accepts the proxy's XCLIENT (and admits the connection).
-	backendAddr := "127.0.0.1:12431"
-	backendServer, err := lmtp.New(ctx, "test-backend", "storage.example", backendAddr, s3, rdb, uploadWorker, lmtp.LMTPServerOptions{
-		TrustedNetworks: []string{"127.0.0.0/8", "::1/128"},
-	})
+	backendServer, err := lmtp.New(ctx, "test-backend", "storage.example", cfg.backendAddr, s3, rdb, uploadWorker, cfg.backendOpts)
 	if err != nil {
 		t.Fatalf("Failed to create backend LMTP server: %v", err)
 	}
@@ -57,15 +101,10 @@ func TestLMTPProxyForwardsClientIdentityToReceivedHeader(t *testing.T) {
 	t.Cleanup(func() { backendServer.Close() })
 	time.Sleep(200 * time.Millisecond)
 
-	// Proxy: forward client info to the backend via XCLIENT.
-	proxyAddr := "127.0.0.1:12432"
-	proxy, err := lmtpproxy.New(ctx, rdb, "proxy.example", lmtpproxy.ServerOptions{
-		Name:             "test-proxy",
-		Addr:             proxyAddr,
-		RemoteAddrs:      []string{backendAddr},
-		TrustedProxies:   []string{"127.0.0.1/32"},
-		RemoteUseXCLIENT: true,
-	})
+	cfg.proxyOpts.Name = "test-proxy"
+	cfg.proxyOpts.Addr = cfg.proxyAddr
+	cfg.proxyOpts.RemoteAddrs = []string{cfg.backendAddr}
+	proxy, err := lmtpproxy.New(ctx, rdb, "proxy.example", cfg.proxyOpts)
 	if err != nil {
 		t.Fatalf("Failed to create LMTP proxy: %v", err)
 	}
@@ -77,9 +116,7 @@ func TestLMTPProxyForwardsClientIdentityToReceivedHeader(t *testing.T) {
 	t.Cleanup(func() { proxy.Stop() })
 	time.Sleep(200 * time.Millisecond)
 
-	const clientHELO = "upstream.example.net"
-
-	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+	conn, err := net.DialTimeout("tcp", cfg.proxyAddr, 5*time.Second)
 	if err != nil {
 		t.Fatalf("Failed to connect to proxy: %v", err)
 	}
@@ -106,7 +143,7 @@ func TestLMTPProxyForwardsClientIdentityToReceivedHeader(t *testing.T) {
 	mustRead("greeting")
 
 	// Client announces its own name — this is what must surface in the backend's trace.
-	mustWrite("LHLO " + clientHELO + "\r\n")
+	mustWrite("LHLO " + traceClientHELO + "\r\n")
 	for {
 		line := mustRead("LHLO")
 		if len(line) >= 4 && line[3] != '-' {
@@ -144,10 +181,14 @@ func TestLMTPProxyForwardsClientIdentityToReceivedHeader(t *testing.T) {
 
 	// Give the backend a moment to stage the message to disk.
 	time.Sleep(500 * time.Millisecond)
-	stored := readBackendStored(t, tempDir)
+	return readBackendStored(t, tempDir)
+}
 
-	// The Received: from-clause must name the client's announced HELO, not the proxy.
-	if want := "from " + clientHELO; !strings.Contains(stored, want) {
+// assertClientHELOInTrace verifies the stored message's Received: from-clause names the
+// client's announced HELO and not the proxy/backend identity.
+func assertClientHELOInTrace(t *testing.T, stored string) {
+	t.Helper()
+	if want := "from " + traceClientHELO; !strings.Contains(stored, want) {
 		t.Errorf("Received: must name the forwarded client HELO %q\n--- stored head ---\n%s", want, storedHead(stored))
 	}
 	for _, leak := range []string{"from proxy.example", "from storage.example", "from localhost"} {

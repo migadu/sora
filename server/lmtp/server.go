@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 
 	"github.com/emersion/go-smtp"
@@ -345,7 +346,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		}
 		logger.Info("LMTP: trusted_networks empty; accepting delivery from default private ranges (RFC1918+localhost). Set trusted_networks to restrict.", "name", name)
 	}
-	admissionNets, err := server.ParseTrustedNetworks(admissionProxies)
+	admissionNets, err := helpers.ParseTrustedNetworks(admissionProxies)
 	if err != nil {
 		// Log the error and use empty trusted networks to prevent server crash
 		logger.Debug("failed to parse trusted networks, connection admission disabled", "name", name, "error", err)
@@ -358,7 +359,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// and POP3 (server/pop3/xclient.go), which deny forwarding when the list is empty.
 	// Overriding the client IP is a higher privilege than connecting, so it must be granted
 	// explicitly. (security-audit M2)
-	xclientNets, err := server.ParseTrustedNetworks(options.TrustedNetworks)
+	xclientNets, err := helpers.ParseTrustedNetworks(options.TrustedNetworks)
 	if err != nil {
 		logger.Debug("failed to parse XCLIENT trusted networks, XCLIENT disabled", "name", name, "error", err)
 		xclientNets = []*net.IPNet{}

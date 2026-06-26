@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cluster"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 )
 
@@ -38,7 +39,7 @@ func NewConnectionLimiter(protocol string, maxConnections, maxPerIP int) *Connec
 
 // NewConnectionLimiterWithTrustedNets creates a new connection limiter with trusted networks
 func NewConnectionLimiterWithTrustedNets(protocol string, maxConnections, maxPerIP int, trustedProxies []string) *ConnectionLimiter {
-	trustedNets, err := ParseTrustedNetworks(trustedProxies)
+	trustedNets, err := helpers.ParseTrustedNetworks(trustedProxies)
 	if err != nil {
 		logger.Debug("Connection limiter: WARNING - failed to parse trusted networks", "protocol", protocol, "error", err)
 		trustedNets = []*net.IPNet{}
@@ -57,7 +58,7 @@ func NewConnectionLimiterWithTrustedNets(protocol string, maxConnections, maxPer
 
 // NewConnectionLimiterWithCluster creates a new connection limiter with cluster-wide per-IP tracking
 func NewConnectionLimiterWithCluster(protocol string, instanceID string, clusterMgr *cluster.Manager, maxConnections, maxPerIP int, trustedProxies []string) *ConnectionLimiter {
-	trustedNets, err := ParseTrustedNetworks(trustedProxies)
+	trustedNets, err := helpers.ParseTrustedNetworks(trustedProxies)
 	if err != nil {
 		logger.Debug("Connection limiter: WARNING - failed to parse trusted networks", "protocol", protocol, "error", err)
 		trustedNets = []*net.IPNet{}

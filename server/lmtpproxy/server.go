@@ -13,6 +13,7 @@ import (
 	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
@@ -180,7 +181,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Parse trusted networks for connection filtering
-	trustedNets, err := server.ParseTrustedNetworks(opts.TrustedProxies)
+	trustedNets, err := helpers.ParseTrustedNetworks(opts.TrustedProxies)
 	if err != nil {
 		// Log the error and use empty trusted networks to prevent server crash
 		logger.Debug("LMTP Proxy: WARNING - failed to parse trusted networks, proxy connections will be restricted", "error", err)

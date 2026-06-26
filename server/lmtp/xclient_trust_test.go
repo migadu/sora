@@ -4,13 +4,14 @@ import (
 	"net"
 	"testing"
 
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/server"
 )
 
 // mustParseNets parses CIDRs for tests, failing the test on error.
 func mustParseNets(t *testing.T, cidrs []string) []*net.IPNet {
 	t.Helper()
-	nets, err := server.ParseTrustedNetworks(cidrs)
+	nets, err := helpers.ParseTrustedNetworks(cidrs)
 	if err != nil {
 		t.Fatalf("ParseTrustedNetworks(%v): %v", cidrs, err)
 	}

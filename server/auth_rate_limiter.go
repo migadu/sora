@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -447,24 +448,9 @@ func (a *AuthRateLimiter) isRateLimitExempt(ipStr string) bool {
 	if len(a.exemptNetworks) == 0 {
 		return false
 	}
-
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-
-	// Check against the exempt networks
-	for _, cidr := range a.exemptNetworks {
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
-		if network.Contains(ip) {
-			return true
-		}
-	}
-
-	return false
+	// Shared check so exempt lists accept bare IPs (e.g. "10.0.0.1") as well as CIDRs,
+	// consistently with every other trust list (see IPInNetworks).
+	return helpers.IPInNetworks(net.ParseIP(ipStr), a.exemptNetworks)
 }
 
 // RecordAuthAttempt records an authentication attempt with fast blocking and delays

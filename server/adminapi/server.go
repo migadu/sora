@@ -22,6 +22,7 @@ import (
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/delivery"
@@ -558,24 +559,9 @@ func (s *Server) allowedHostsMiddleware(next http.Handler) http.Handler {
 
 		clientIP := getClientIP(r)
 
-		allowed := false
-		for _, allowedHost := range s.allowedHosts {
-			if allowedHost == clientIP {
-				allowed = true
-				break
-			}
-			// Check CIDR blocks
-			if strings.Contains(allowedHost, "/") {
-				if _, cidr, err := net.ParseCIDR(allowedHost); err == nil {
-					if ip := net.ParseIP(clientIP); ip != nil {
-						if cidr.Contains(ip) {
-							allowed = true
-							break
-						}
-					}
-				}
-			}
-		}
+		// Single shared check: allowedHosts entries may be CIDRs or bare IPs (incl. IPv6,
+		// matched by value rather than string form). See helpers.IPInNetworks.
+		allowed := helpers.IPInNetworks(net.ParseIP(clientIP), s.allowedHosts)
 
 		if !allowed {
 			s.writeError(w, http.StatusForbidden, "Host not allowed")

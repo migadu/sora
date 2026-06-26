@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/helpers"
 )
 
 // ErrNoProxyHeader is returned by ReadProxyHeader in optional mode when no PROXY header is found.
@@ -73,7 +74,7 @@ func NewProxyProtocolReader(protocol string, config ProxyProtocolConfig) (*Proxy
 	}
 
 	// Parse trusted proxy CIDR blocks
-	trustedNets, err := ParseTrustedNetworks(config.TrustedProxies)
+	trustedNets, err := helpers.ParseTrustedNetworks(config.TrustedProxies)
 	if err != nil {
 		// Log the error and use empty trusted networks to prevent server crash
 		logger.Debug("PROXY protocol: WARNING - failed to parse trusted networks, PROXY will be disabled", "protocol", protocol, "error", err)
