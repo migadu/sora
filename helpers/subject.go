@@ -2,7 +2,6 @@ package helpers
 
 import (
 	"strings"
-	"unicode"
 )
 
 // NormalizeSubjectForSort normalizes an email subject for SORT operations per RFC 5256.
@@ -109,9 +108,4 @@ func SanitizeSubjectForSort(subject string) string {
 
 	// Then normalize for sorting per RFC 5256
 	return NormalizeSubjectForSort(sanitized)
-}
-
-// isWhitespace checks if a rune is whitespace
-func isWhitespace(r rune) bool {
-	return unicode.IsSpace(r)
 }

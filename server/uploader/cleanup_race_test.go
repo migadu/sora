@@ -98,14 +98,6 @@ func (m *mockUploaderS3) ExistsWithRetry(ctx context.Context, key string) (bool,
 	return args.Bool(0), args.Error(1)
 }
 
-// --- mock cache (not used by cleanupOrphanedFiles) ---
-
-type mockUploaderCache struct{ mock.Mock }
-
-func (m *mockUploaderCache) MoveIn(srcPath, contentHash string) error {
-	return m.Called(srcPath, contentHash).Error(0)
-}
-
 // TestCleanupOrphanedFiles_RaceCondition_DeletesFileThatHasNoPendingUploadYet
 // is the reproducer for the stuck-upload bug.
 //

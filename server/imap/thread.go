@@ -126,7 +126,6 @@ type jwzNode struct {
 	id       uint32 // NumKind (UID or SeqNum)
 	children []*jwzNode
 	parent   *jwzNode
-	next     *jwzNode // For siblings
 }
 
 // threadReferences implements the REFERENCES threading algorithm (RFC 5256 section 2.2 / JWZ algorithm)

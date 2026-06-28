@@ -454,17 +454,3 @@ func (rd *ResilientDatabase) GetUserMailboxRightsWithRetry(ctx context.Context, 
 	}
 	return result.(string), nil
 }
-
-func (rd *ResilientDatabase) GetAccessibleMailboxesWithRetry(ctx context.Context, accountID int64) ([]*db.DBMailbox, error) {
-	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetAccessibleMailboxes(ctx, accountID)
-	}
-	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return []*db.DBMailbox{}, nil
-	}
-	return result.([]*db.DBMailbox), nil
-}

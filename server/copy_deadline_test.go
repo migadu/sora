@@ -10,28 +10,6 @@ import (
 	"time"
 )
 
-// slowWriter is a net.Conn that accepts writes very slowly (simulates slow client)
-type slowWriter struct {
-	net.Conn
-	writeDelay time.Duration
-	totalBytes int64
-}
-
-func (sw *slowWriter) Write(b []byte) (int, error) {
-	// Simulate slow write by delaying
-	time.Sleep(sw.writeDelay)
-	sw.totalBytes += int64(len(b))
-	return len(b), nil
-}
-
-func (sw *slowWriter) SetWriteDeadline(t time.Time) error {
-	// Track deadline but continue - we'll timeout based on our slow writes
-	if !t.IsZero() && time.Until(t) < 0 {
-		return &net.OpError{Op: "write", Err: &timeoutError{}}
-	}
-	return nil
-}
-
 type timeoutError struct{}
 
 func (e *timeoutError) Error() string   { return "i/o timeout" }

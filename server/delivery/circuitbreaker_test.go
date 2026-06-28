@@ -541,7 +541,6 @@ func TestCircuitBreaker_PermanentErrorsDoNotTrigger(t *testing.T) {
 
 // testLoggerWithFunc extended with custom function
 type testLoggerWithFunc struct {
-	testLogger
 	logFunc func(string)
 }
 

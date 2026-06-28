@@ -53,13 +53,6 @@ func (m *mockRelayHandler) SendToExternalRelay(from, to string, message []byte) 
 	return nil
 }
 
-func (m *mockRelayHandler) reset() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.messages = nil
-	m.currentFails = 0
-}
-
 func (m *mockRelayHandler) getMessageCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()

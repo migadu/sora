@@ -662,32 +662,6 @@ func (s *Server) extractAndValidateToken(r *http.Request) (*JWTClaims, error) {
 	return claims, nil
 }
 
-// handleProxyProtocol wraps connections with PROXY protocol support for HTTP
-// This is called via http.Server.ConnContext to read PROXY protocol headers
-func (s *Server) handleProxyProtocol(ctx context.Context, conn net.Conn) context.Context {
-	if s.proxyReader == nil {
-		return ctx
-	}
-
-	// Read PROXY protocol header
-	proxyInfo, wrappedConn, err := s.proxyReader.ReadProxyHeader(conn)
-	if err != nil {
-		logger.Error("PROXY protocol error", "proxy", s.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
-		// Close connection on error
-		conn.Close()
-		return ctx
-	}
-
-	// Store proxy info in context for later use in handlers
-	if proxyInfo != nil {
-		ctx = context.WithValue(ctx, "proxyInfo", proxyInfo)
-		// Also replace the connection with wrapped version
-		ctx = context.WithValue(ctx, "wrappedConn", wrappedConn)
-	}
-
-	return ctx
-}
-
 // getRealClientIP extracts the real client IP from request context (PROXY protocol) or request
 func (s *Server) getRealClientIP(r *http.Request) string {
 	// First check if we have PROXY protocol info in context

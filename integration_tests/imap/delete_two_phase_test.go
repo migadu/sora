@@ -293,8 +293,8 @@ func TestDelete_TwoPhase_RenameIntoDeletedName(t *testing.T) {
 }
 
 // TestDelete_TwoPhase_SharedMailboxHiddenFromGrantee verifies the shared-mailbox path:
-// a soft-deleted shared mailbox disappears from a grantee's LIST, which is served by the
-// stored get_accessible_mailboxes() function (patched in migration 000042).
+// a soft-deleted shared mailbox disappears from a grantee's LIST, which is served by
+// db.GetMailboxes (its inline CTE filters deleted_at).
 func TestDelete_TwoPhase_SharedMailboxHiddenFromGrantee(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -350,7 +350,7 @@ func TestDelete_TwoPhase_SharedMailboxHiddenFromGrantee(t *testing.T) {
 		t.Fatalf("owner delete shared: %v", err)
 	}
 
-	// Grantee must no longer see it (get_accessible_mailboxes filters deleted_at).
+	// Grantee must no longer see it (db.GetMailboxes CTE filters deleted_at).
 	after, err := cg.List("", shared, nil).Collect()
 	if err != nil {
 		t.Fatalf("grantee list (after): %v", err)
