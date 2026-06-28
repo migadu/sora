@@ -1,8 +1,6 @@
 package imap
 
 import (
-	"sort"
-
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/pkg/metrics"
@@ -46,43 +44,25 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 		}
 	}
 
-	// Middle phase: Get messages to expunge (outside lock)
-	// Use optimized function that only fetches UIDs and sequence numbers
+	// Middle phase: Get the \Deleted messages to expunge (outside lock).
+	// Only the UIDs are needed — sequence numbers for the EXPUNGE notifications
+	// are computed by the post-command poll (see the notification note below).
 	deletedMessages, err := s.server.rdb.GetDeletedMessageUIDsAndSeqsWithRetry(s.ctx, mailboxID)
 	if err != nil {
 		return s.internalError("failed to fetch deleted messages: %v", err)
 	}
 
-	var messagesToExpunge []struct {
-		uid imap.UID
-		seq uint32
-	}
-
-	if uidSet != nil {
-		for _, msg := range deletedMessages {
-			if uidSet.Contains(msg.UID) {
-				messagesToExpunge = append(messagesToExpunge, struct {
-					uid imap.UID
-					seq uint32
-				}{uid: msg.UID, seq: msg.Seq})
-			}
-		}
-	} else {
-		for _, msg := range deletedMessages {
-			messagesToExpunge = append(messagesToExpunge, struct {
-				uid imap.UID
-				seq uint32
-			}{uid: msg.UID, seq: msg.Seq})
-		}
-	}
-
-	if len(messagesToExpunge) == 0 {
-		return nil
-	}
-
 	var uidsToDelete []imap.UID
-	for _, m := range messagesToExpunge {
-		uidsToDelete = append(uidsToDelete, m.uid)
+	for _, msg := range deletedMessages {
+		// For UID EXPUNGE (RFC 4315), restrict to the requested UID set.
+		if uidSet != nil && !uidSet.Contains(msg.UID) {
+			continue
+		}
+		uidsToDelete = append(uidsToDelete, msg.UID)
+	}
+
+	if len(uidsToDelete) == 0 {
+		return nil
 	}
 
 	// Database operation - no lock needed
@@ -91,77 +71,35 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 		return s.internalError("failed to expunge messages: %v", err)
 	}
 
-	// Final phase: Update session state with simple write lock
-	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
-	if !acquired {
-		s.DebugLog("failed to acquire write lock")
-		return s.internalError("failed to acquire lock for expunge")
-	}
+	// Notification is handled entirely by the post-command poll, exactly like
+	// MOVE (see server/imap/move.go). go-imap calls conn.poll() before writing the
+	// tagged OK, which runs Sora's DB poll; that poll detects these soft-expunges,
+	// decrements currentNumMessages, queues the EXPUNGEs on the tracker (for this
+	// session AND every other session watching the mailbox), and flushes them —
+	// satisfying RFC 3501 §7.4.1 (EXPUNGE before tagged OK).
+	//
+	// We deliberately do NOT also emit notifications here. Previously this handler
+	// wrote EXPUNGEs directly (w.WriteExpunge) AND broadcast them via QueueExpunge
+	// (source=nil, which includes this very session). The post-command poll then
+	// re-discovered the same expunges (the modseq cursor is intentionally not
+	// advanced). The result was the issuing client receiving each EXPUNGE up to
+	// three times plus a spurious EXISTS from the double-decremented count — which
+	// made adjacent messages momentarily vanish (the duplicate EXPUNGE removed
+	// whatever shifted into that sequence number) and left blank phantom rows
+	// (the bogus EXISTS) until the client resynced. Relying solely on the poll, as
+	// MOVE does, emits each EXPUNGE exactly once with no phantom EXISTS.
 
-	// Verify mailbox still selected and tracker still valid
-	if s.selectedMailbox == nil || s.selectedMailbox.ID != mailboxID || s.mailboxTracker == nil {
-		release()
-		return nil
-	}
-
-	// Atomically subtract the number of expunged messages from the total count.
-	s.currentNumMessages.Add(^uint32(len(messagesToExpunge) - 1))
-
-	// NOTE: We intentionally do NOT advance currentHighestModSeq here.
-	// If we set it to newModSeq, we jump the poll cursor forward and skip any
-	// events from OTHER sessions that happened between the old modseq and newModSeq
-	// (e.g., deliveries, flag changes, or expunges by other sessions).
-	// Instead, we let Poll naturally discover ALL events. When Poll encounters
-	// this session's own expunge events, QueueExpunge will harmlessly panic
-	// (already processed), be recovered, and counted as skippedExpunges.
-
-	// Sort messages to expunge by sequence number in descending order.
-	// This ensures that when expunging multiple messages, we start with the
-	// highest sequence number and work downward, avoiding problems with shifting sequence numbers.
-	sort.Slice(messagesToExpunge, func(i, j int) bool {
-		return messagesToExpunge[i].seq > messagesToExpunge[j].seq
-	})
-
-	// Update the tracker inside the write lock so that currentNumMessages and the
-	// tracker's internal count stay in sync. If we released the lock first, a concurrent
-	// Poll could see currentNumMessages already decremented but the tracker still at the
-	// old count, causing a desync and unnecessary BYE disconnection.
-	for _, m := range messagesToExpunge {
-		if m.seq > 0 && s.mailboxTracker != nil {
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						s.WarnLog("tracker panic during expunge", "seq", m.seq, "error", r)
-					}
-				}()
-				s.mailboxTracker.QueueExpunge(m.seq)
-			}()
-		}
-	}
-
-	release()
-
-	// Send expunge notifications to the client (network I/O, outside the lock).
-	for _, m := range messagesToExpunge {
-		if m.seq > 0 {
-			if err := w.WriteExpunge(m.seq); err != nil {
-				s.DebugLog("error writing expunge", "seq", m.seq, "uid", m.uid, "error", err)
-				return s.internalError("failed to write expunge notification: %v", err)
-			}
-		}
-	}
-
-	s.DebugLog("expunge command processed", "count", len(messagesToExpunge))
+	s.DebugLog("expunge command processed", "count", len(uidsToDelete))
 
 	// Track domain and user command activity - EXPUNGE is database intensive!
-	if s.IMAPUser != nil && len(messagesToExpunge) > 0 {
+	if s.IMAPUser != nil && len(uidsToDelete) > 0 {
 		metrics.TrackDomainCommand("imap", s.IMAPUser.Address.Domain(), "EXPUNGE")
 		metrics.TrackUserActivity("imap", s.IMAPUser.Address.FullAddress(), "command", 1)
 		metrics.TrackDomainMessage("imap", s.IMAPUser.Address.Domain(), "deleted")
 	}
 
 	// Track for session summary
-	s.messagesExpunged.Add(uint32(len(messagesToExpunge)))
+	s.messagesExpunged.Add(uint32(len(uidsToDelete)))
 
 	return nil
 }
