@@ -326,6 +326,18 @@ func (rd *ResilientDatabase) DeleteMailboxWithRetry(ctx context.Context, mailbox
 	return err
 }
 
+// SoftDeleteMailboxWithRetry marks a mailbox deleted for two-phase deletion (the IMAP
+// DELETE path). Unlike DeleteMailboxWithRetry this is an O(1) single-row UPDATE, so it
+// uses the normal write timeout — the heavy per-message expunge + row removal is
+// deferred to the background cleaner (PurgeSoftDeletedMailboxes).
+func (rd *ResilientDatabase) SoftDeleteMailboxWithRetry(ctx context.Context, mailboxID int64, AccountID int64) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).SoftDeleteMailbox(ctx, tx, mailboxID, AccountID)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	return err
+}
+
 func (rd *ResilientDatabase) RenameMailboxWithRetry(ctx context.Context, mailboxID int64, AccountID int64, newName string, newParentID *int64) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RenameMailbox(ctx, tx, mailboxID, AccountID, newName, newParentID)

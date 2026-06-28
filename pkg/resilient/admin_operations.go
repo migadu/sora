@@ -272,6 +272,63 @@ func (rd *ResilientDatabase) CleanupSoftDeletedAccountsWithRetry(ctx context.Con
 	return result.(int64), nil
 }
 
+// ListSoftDeletedMailboxesWithRetry reads the next batch of tombstoned mailboxes to purge.
+func (rd *ResilientDatabase) ListSoftDeletedMailboxesWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.SoftDeletedMailbox, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).ListSoftDeletedMailboxes(ctx, gracePeriod, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.([]db.SoftDeletedMailbox), nil
+}
+
+// PurgeSoftDeletedMailboxesWithRetry hard-deletes a batch of two-phase-deleted mailboxes
+// (the IMAP DELETE path stamps deleted_at; this performs the deferred per-message expunge
+// + row removal). It reads the batch in one fast query, then hard-deletes each mailbox in
+// its OWN transaction via DeleteMailboxWithRetry.
+//
+// Per-mailbox transactions are essential. Batching many large mailboxes under a single
+// write deadline would roll the entire batch back on timeout and — because tombstones are
+// processed oldest-first — never make progress (a poison pill). Isolating each delete also
+// means one oversized/stuck mailbox is skipped and retried next tick instead of blocking
+// the rest of the batch. Returns the number purged this call.
+func (rd *ResilientDatabase) PurgeSoftDeletedMailboxesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
+	const batchLimit = 50
+
+	mailboxes, err := rd.ListSoftDeletedMailboxesWithRetry(ctx, gracePeriod, batchLimit)
+	if err != nil {
+		return 0, err
+	}
+
+	var purged int64
+	for _, m := range mailboxes {
+		if ctx.Err() != nil {
+			return purged, ctx.Err()
+		}
+		// DeleteMailboxWithRetry runs in its own transaction with the administrative
+		// timeout + write retries. The stored account_id is the owner, which DeleteMailbox
+		// gates on (the owner always holds the delete right, incl. for shared mailboxes).
+		if err := rd.DeleteMailboxWithRetry(ctx, m.ID, m.AccountID); err != nil {
+			if errors.Is(err, consts.ErrMailboxNotFound) {
+				// Already removed (e.g. by a concurrent account purge).
+				continue
+			}
+			// Don't let one stuck/oversized mailbox abort the batch; it remains a tombstone
+			// and is retried next cycle while the rest of the batch proceeds.
+			logger.Warn("Cleanup: failed to purge soft-deleted mailbox; will retry next cycle",
+				"component", "CLEANUP", "mailbox_id", m.ID, "error", err)
+			continue
+		}
+		purged++
+	}
+	return purged, nil
+}
+
 func (rd *ResilientDatabase) CleanupOldVacationResponsesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, true).CleanupOldVacationResponses(ctx, tx, gracePeriod)

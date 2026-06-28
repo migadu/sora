@@ -448,7 +448,7 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
+		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL AND mb.deleted_at IS NULL
 	`
 
 	msg := &DBMessage{}

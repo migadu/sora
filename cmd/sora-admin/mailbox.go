@@ -568,10 +568,10 @@ Examples:
 			fmt.Printf("Failed to find account: %v\n", err)
 			os.Exit(1)
 		}
-		query = `SELECT id, account_id, name FROM mailboxes WHERE account_id = $1 AND name ~ '&[A-Za-z0-9+,]+-' ORDER BY account_id, name`
+		query = `SELECT id, account_id, name FROM mailboxes WHERE account_id = $1 AND name ~ '&[A-Za-z0-9+,]+-' AND deleted_at IS NULL ORDER BY account_id, name`
 		args = []any{accountID}
 	} else {
-		query = `SELECT id, account_id, name FROM mailboxes WHERE name ~ '&[A-Za-z0-9+,]+-' ORDER BY account_id, name`
+		query = `SELECT id, account_id, name FROM mailboxes WHERE name ~ '&[A-Za-z0-9+,]+-' AND deleted_at IS NULL ORDER BY account_id, name`
 	}
 
 	db := rdb.GetOperationalDatabase()

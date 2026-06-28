@@ -36,6 +36,7 @@ type DatabaseManager interface {
 	ExpungeOldMessagesWithRetry(ctx context.Context, maxAge time.Duration) (int64, error)
 	CleanupFailedUploadsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupSoftDeletedAccountsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
+	PurgeSoftDeletedMailboxesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupOldVacationResponsesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupOldRedirectsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
@@ -239,6 +240,18 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		logger.Error("Cleanup: Failed to process soft-deleted accounts", "error", err)
 	} else if deletedAccountCount > 0 {
 		logger.Info("Cleanup: Processed soft-deleted accounts", "count", deletedAccountCount)
+	}
+
+	// --- Two-phase mailbox deletion: purge soft-deleted mailboxes ---
+	// IMAP DELETE only stamps mailboxes.deleted_at (O(1)) and returns; the heavy
+	// per-message expunge + row removal happens here, off the client command path.
+	// No grace period: unlike accounts there is no IMAP "undelete", and quota/restore
+	// availability should track the deletion as closely as the cleanup cadence allows,
+	// so tombstones are purged on the next tick.
+	if purgedMailboxCount, err := w.rdb.PurgeSoftDeletedMailboxesWithRetry(ctx, 0); err != nil {
+		logger.Error("Cleanup: Failed to purge soft-deleted mailboxes", "error", err)
+	} else if purgedMailboxCount > 0 {
+		logger.Info("Cleanup: Purged soft-deleted mailboxes", "count", purgedMailboxCount)
 	}
 
 	// Clean up old vacation responses.

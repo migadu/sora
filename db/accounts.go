@@ -616,9 +616,12 @@ func (db *Database) GetCredentialDetails(ctx context.Context, email string) (*Cr
 		SELECT c.address, c.primary_identity, c.created_at, c.updated_at,
 			   a.id, a.created_at, a.deleted_at,
 			   (SELECT COUNT(*) FROM credentials WHERE account_id = a.id) AS total_credentials,
-			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id) AS mailbox_count,
+			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id AND deleted_at IS NULL) AS mailbox_count,
 			   -- Live count (not the mailbox_stats cache) so per-account quota is always correct.
-			   COALESCE((SELECT COUNT(*) FROM messages WHERE account_id = a.id AND expunged_at IS NULL), 0) AS message_count
+			   -- Join mailboxes so messages in a soft-deleted (but not-yet-purged) mailbox are
+			   -- excluded immediately, not after the background sweep marks them expunged.
+			   COALESCE((SELECT COUNT(*) FROM messages m JOIN mailboxes mb ON mb.id = m.mailbox_id
+			             WHERE m.account_id = a.id AND m.expunged_at IS NULL AND mb.deleted_at IS NULL), 0) AS message_count
 		FROM credentials c
 		JOIN accounts a ON c.account_id = a.id
 		WHERE LOWER(c.address) = LOWER($1)
@@ -678,10 +681,14 @@ func (db *Database) GetAccountDetails(ctx context.Context, email string) (*Accou
 	var details AccountDetails
 	err = db.GetReadPool().QueryRow(ctx, `
 		SELECT a.id, a.created_at, a.deleted_at,
-			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id) AS mailbox_count,
+			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id AND deleted_at IS NULL) AS mailbox_count,
 			   -- Live count/size (not the mailbox_stats cache) so per-account quota is always correct.
-			   COALESCE((SELECT COUNT(*) FROM messages WHERE account_id = a.id AND expunged_at IS NULL), 0) AS message_count,
-			   COALESCE((SELECT SUM(size) FROM messages WHERE account_id = a.id AND expunged_at IS NULL), 0) AS storage_used
+			   -- Join mailboxes so messages in a soft-deleted (but not-yet-purged) mailbox are
+			   -- excluded immediately, not after the background sweep marks them expunged.
+			   COALESCE((SELECT COUNT(*) FROM messages m JOIN mailboxes mb ON mb.id = m.mailbox_id
+			             WHERE m.account_id = a.id AND m.expunged_at IS NULL AND mb.deleted_at IS NULL), 0) AS message_count,
+			   COALESCE((SELECT SUM(m.size) FROM messages m JOIN mailboxes mb ON mb.id = m.mailbox_id
+			             WHERE m.account_id = a.id AND m.expunged_at IS NULL AND mb.deleted_at IS NULL), 0) AS storage_used
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id
 		WHERE LOWER(c.address) = $1
@@ -793,6 +800,7 @@ func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) 
 				   COALESCE(SUM(ms.total_size), 0) as storage_used
 			FROM mailboxes mb
 			LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
+			WHERE mb.deleted_at IS NULL
 			GROUP BY mb.account_id
 		)
 		SELECT a.id,
@@ -848,6 +856,7 @@ func (db *Database) ListAccountsByDomain(ctx context.Context, domain string) ([]
 				   COALESCE(SUM(ms.total_size), 0) as storage_used
 			FROM mailboxes mb
 			LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
+			WHERE mb.deleted_at IS NULL
 			GROUP BY mb.account_id
 		)
 		SELECT a.id,

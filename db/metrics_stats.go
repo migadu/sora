@@ -35,26 +35,27 @@ func (d *Database) GetMetricsStats(ctx context.Context) (*MetricsStats, error) {
 		return nil, err
 	}
 
-	// Get total mailboxes (for non-deleted accounts)
-	// Note: mailboxes table doesn't have deleted_at column
+	// Get total mailboxes (live mailboxes of non-deleted accounts; exclude soft-deleted
+	// mailboxes pending two-phase purge).
 	err = pool.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM mailboxes m
 		INNER JOIN accounts a ON m.account_id = a.id
-		WHERE a.deleted_at IS NULL
+		WHERE a.deleted_at IS NULL AND m.deleted_at IS NULL
 	`).Scan(&stats.TotalMailboxes)
 	if err != nil {
 		return nil, err
 	}
 
-	// Get total messages (non-expunged, for non-deleted accounts)
+	// Get total messages (non-expunged, for non-deleted accounts; exclude soft-deleted
+	// mailboxes whose cached stats are pending two-phase purge).
 	// Use pre-aggregated mailbox_stats table instead of counting all messages
 	err = pool.QueryRow(ctx, `
 		SELECT COALESCE(SUM(ms.message_count), 0)
 		FROM mailbox_stats ms
 		INNER JOIN mailboxes m ON ms.mailbox_id = m.id
 		INNER JOIN accounts a ON m.account_id = a.id
-		WHERE a.deleted_at IS NULL
+		WHERE a.deleted_at IS NULL AND m.deleted_at IS NULL
 	`).Scan(&stats.TotalMessages)
 	if err != nil {
 		return nil, err

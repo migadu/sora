@@ -68,13 +68,16 @@ func (s *IMAPSession) Delete(mboxName string) error {
 		}
 	}
 
-	// Final phase: actual deletion - no locks needed as it's a DB operation
-	// Use mailbox.AccountID (the owner) not AccountID (the requester) for shared mailbox support
-	err = s.server.rdb.DeleteMailboxWithRetry(s.ctx, mailbox.ID, mailbox.AccountID)
+	// Final phase: two-phase deletion. Mark the mailbox deleted (O(1) single-row
+	// update) and return immediately; the background cleaner expunges its messages
+	// and removes the row. This keeps DELETE off the per-mailbox lock for the whole
+	// bulk expunge, which previously drove DELETE P99 to ~1 minute on large folders.
+	// Use mailbox.AccountID (the owner) not AccountID (the requester) for shared mailbox support.
+	err = s.server.rdb.SoftDeleteMailboxWithRetry(s.ctx, mailbox.ID, mailbox.AccountID)
 	if err != nil {
 		return s.internalError("failed to delete mailbox '%s': %v", mboxName, err)
 	}
 
-	s.DebugLog("mailbox deleted", "mailbox", mboxName)
+	s.DebugLog("mailbox soft-deleted (pending background purge)", "mailbox", mboxName)
 	return nil
 }

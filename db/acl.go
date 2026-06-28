@@ -99,7 +99,7 @@ func (db *Database) GrantMailboxAccessByIdentifier(ctx context.Context, ownerAcc
 	err = tx.QueryRow(ctx, `
 		SELECT id, COALESCE(is_shared, FALSE), owner_domain
 		FROM mailboxes
-		WHERE account_id = $1 AND LOWER(name) = LOWER($2)
+		WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
 	`, ownerAccountID, mailboxName).Scan(&mailboxID, &isShared, &ownerDomain)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -256,7 +256,7 @@ func (db *Database) GetUserMailboxRights(ctx context.Context, mailboxID, account
 	err := db.GetReadPool().QueryRow(ctx, `
 		SELECT (account_id = $1), owner_domain
 		FROM mailboxes
-		WHERE id = $2
+		WHERE id = $2 AND deleted_at IS NULL
 	`, accountID, mailboxID).Scan(&isOwner, &ownerDomain)
 	if err != nil {
 		if err == pgx.ErrNoRows {

@@ -522,6 +522,47 @@ func (d *Database) CleanupSoftDeletedAccounts(ctx context.Context, tx pgx.Tx, gr
 	return totalDeleted, nil
 }
 
+// SoftDeletedMailbox identifies a tombstoned mailbox awaiting background hard-deletion.
+type SoftDeletedMailbox struct {
+	ID        int64
+	AccountID int64 // owner; DeleteMailbox gates on this
+}
+
+// ListSoftDeletedMailboxes returns up to limit mailboxes the IMAP DELETE path marked
+// with deleted_at at least gracePeriod ago (two-phase mailbox deletion), oldest first.
+//
+// This is a fast, read-only query. The actual hard delete of each mailbox (the heavy
+// per-message expunge + row removal) is performed by the caller in a SEPARATE
+// transaction per mailbox — see ResilientDatabase.PurgeSoftDeletedMailboxesWithRetry.
+// Batching many large mailboxes into one transaction would risk exceeding the write
+// deadline and rolling back the whole batch every tick (a poison pill that never makes
+// progress, since tombstones are processed oldest-first).
+func (d *Database) ListSoftDeletedMailboxes(ctx context.Context, gracePeriod time.Duration, limit int) ([]SoftDeletedMailbox, error) {
+	threshold := time.Now().Add(-gracePeriod).UTC()
+
+	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT id, account_id
+		FROM mailboxes
+		WHERE deleted_at IS NOT NULL AND deleted_at < $1
+		ORDER BY deleted_at ASC
+		LIMIT $2
+	`, threshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query soft-deleted mailboxes: %w", err)
+	}
+	defer rows.Close()
+
+	var result []SoftDeletedMailbox
+	for rows.Next() {
+		var m SoftDeletedMailbox
+		if err := rows.Scan(&m.ID, &m.AccountID); err != nil {
+			return nil, fmt.Errorf("failed to scan soft-deleted mailbox: %w", err)
+		}
+		result = append(result, m)
+	}
+	return result, rows.Err()
+}
+
 // HardDeleteAccounts performs the first stage of permanent deletion for a batch of accounts.
 // It expunges all their messages and deletes associated data like mailboxes, sieve scripts, etc.
 // It does NOT delete the account or credential rows themselves, as they are needed for S3 cleanup.

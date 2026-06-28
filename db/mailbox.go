@@ -64,6 +64,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			SELECT id, name, uid_validity, path, subscribed, created_at, updated_at, account_id
 			FROM mailboxes
 			WHERE account_id = $1
+			  AND deleted_at IS NULL
 
 			UNION
 
@@ -74,6 +75,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			WHERE m.is_shared = TRUE
 			  AND acl.account_id = $1
 			  AND position('l' IN acl.rights) > 0
+			  AND m.deleted_at IS NULL
 
 			UNION
 
@@ -85,6 +87,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			  AND m.owner_domain = $2
 			  AND anyone_acl.identifier = 'anyone'
 			  AND position('l' IN anyone_acl.rights) > 0
+			  AND m.deleted_at IS NULL
 		)
 		SELECT
 			m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id,
@@ -95,7 +98,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			-- whose pattern is a column expression, so PostgreSQL could not use a prefix
 			-- index and seq-scanned the account's mailboxes once per row -- O(N^2), which
 			-- exceeded the read query_timeout for accounts with tens of thousands of mailboxes.
-			EXISTS(SELECT 1 FROM mailboxes child WHERE child.account_id = m.account_id AND LEFT(child.path, LENGTH(child.path) - 16) = m.path) AS has_children
+			EXISTS(SELECT 1 FROM mailboxes child WHERE child.account_id = m.account_id AND LEFT(child.path, LENGTH(child.path) - 16) = m.path AND child.deleted_at IS NULL) AS has_children
 		FROM accessible_mailboxes m
 		WHERE 1=1
 	`
@@ -140,7 +143,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 func (db *Database) GetMailboxesCount(ctx context.Context, AccountID int64) (int, error) {
 	var count int
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx,
-		"SELECT COUNT(*) FROM mailboxes WHERE account_id = $1",
+		"SELECT COUNT(*) FROM mailboxes WHERE account_id = $1 AND deleted_at IS NULL",
 		AccountID,
 	).Scan(&count)
 	if err != nil {
@@ -158,7 +161,7 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, AccountID i
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT id, name, uid_validity, path, subscribed, created_at, updated_at, account_id
 		FROM mailboxes
-		WHERE id = $1 AND account_id = $2
+		WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
 	`, mailboxID, AccountID).Scan(
 		&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID,
 	)
@@ -177,7 +180,7 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, AccountID i
 	// $2 is a bind parameter, so PostgreSQL treats `path LIKE $2 || '%'` as a constant
 	// prefix and uses idx_mailboxes_path_prefix (unlike the correlated form in GetMailboxes).
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%')
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%' AND deleted_at IS NULL)
 	`, mailbox.AccountID, mailbox.Path).Scan(&mailbox.HasChildren)
 	if err != nil {
 		logger.Error("Database: failed to check for children of mailbox", "mailbox_id", mailboxID, "err", err)
@@ -226,6 +229,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
 			FROM mailboxes m
 			WHERE m.account_id = $1 AND LOWER(m.name) = LOWER($2)
+			  AND m.deleted_at IS NULL
 
 			UNION ALL
 
@@ -233,11 +237,12 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
 			FROM mailbox_acls acl
 			JOIN mailboxes m ON m.id = acl.mailbox_id
-			WHERE acl.account_id = $1 
+			WHERE acl.account_id = $1
 			  AND position('l' IN acl.rights) > 0
 			  AND LOWER(m.name) = LOWER($2)
 			  AND m.account_id != $1
 			  AND COALESCE(m.is_shared, FALSE) = TRUE
+			  AND m.deleted_at IS NULL
 
 			UNION ALL
 
@@ -245,12 +250,13 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
 			FROM mailbox_acls anyone_acl
 			JOIN mailboxes m ON m.id = anyone_acl.mailbox_id
-			WHERE anyone_acl.identifier = 'anyone' 
+			WHERE anyone_acl.identifier = 'anyone'
 			  AND position('l' IN anyone_acl.rights) > 0
 			  AND LOWER(m.name) = LOWER($2)
 			  AND m.account_id != $1
 			  AND COALESCE(m.is_shared, FALSE) = TRUE
 			  AND m.owner_domain = $3
+			  AND m.deleted_at IS NULL
 		) sub
 		LIMIT 1
 	`, AccountID, name, ownerDomain).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
@@ -271,7 +277,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	// $2 is a bind parameter, so PostgreSQL treats `path LIKE $2 || '%'` as a constant
 	// prefix and uses idx_mailboxes_path_prefix (unlike the correlated form in GetMailboxes).
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%')
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16 AND path LIKE $2 || '%' AND deleted_at IS NULL)
 	`, accountID, mailbox.Path).Scan(&mailbox.HasChildren)
 	if err != nil {
 		logger.Error("Database: failed to check for children of mailbox", "name", name, "err", err)
@@ -339,7 +345,7 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	if parentID != nil {
 		// Fetch the parent mailbox to get its path
 		err := tx.QueryRow(ctx, `
-			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2
+			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
 		`, *parentID, AccountID).Scan(&parentPath)
 
 		if err != nil {
@@ -449,7 +455,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, Account
 	if parentID != nil {
 		// Fetch the parent mailbox to get its path
 		err := tx.QueryRow(ctx, `
-			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2
+			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
 		`, *parentID, AccountID).Scan(&parentPath)
 
 		if err != nil {
@@ -465,7 +471,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, Account
 	err := tx.QueryRow(ctx, `
 		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path)
 		VALUES ($1, $2, $3, $4, '')
-		ON CONFLICT (account_id, LOWER(name)) DO NOTHING
+		ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO NOTHING
 		RETURNING id
 	`, AccountID, name, int64(uidValidity), true).Scan(&mailboxID)
 
@@ -488,7 +494,7 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, Account
 		if err == pgx.ErrNoRows {
 			err := tx.QueryRow(ctx, `
 				SELECT id FROM mailboxes
-				WHERE account_id = $1 AND LOWER(name) = LOWER($2)
+				WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
 			`, AccountID, name).Scan(&mailboxID)
 
 			if err != nil {
@@ -512,6 +518,61 @@ func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, Account
 		}
 	}
 
+	return nil
+}
+
+// SoftDeleteMailbox marks a mailbox deleted (two-phase deletion) so the IMAP DELETE
+// command can return immediately instead of synchronously expunging every message
+// and rewriting their rows under the per-mailbox lock. Stamping deleted_at hides the
+// mailbox from every read path at once (they all filter deleted_at IS NULL); the
+// background cleaner later calls DeleteMailbox to do the heavy expunge + row removal.
+//
+// The caller (server/imap/delete.go) has already verified the mailbox exists, is not
+// a special mailbox, has no children, and that the user holds the 'x' (delete) right.
+// We re-lock and re-gate here (mirroring DeleteMailbox) so a concurrent
+// delivery/expunge/store on the same mailbox is serialized via the same mailbox-row
+// lock the other write paths take first (see lockMailboxStats). Because the name
+// uniqueness index is partial (WHERE deleted_at IS NULL), stamping deleted_at frees
+// the name for an immediate re-CREATE. If a child mailbox somehow appears after the
+// caller's leaf check, the cleaner's DeleteMailbox uses subtree (path LIKE) semantics
+// and removes it too, so no orphan survives.
+func (db *Database) SoftDeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64) error {
+	var isShared bool
+	err := tx.QueryRow(ctx, `
+		SELECT COALESCE(is_shared, FALSE)
+		FROM mailboxes
+		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE) AND deleted_at IS NULL
+		FOR UPDATE
+	`, mailboxID, AccountID).Scan(&isShared)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return consts.ErrMailboxNotFound
+		}
+		return fmt.Errorf("failed to lock mailbox %d for soft delete: %w", mailboxID, err)
+	}
+
+	// For shared mailboxes, enforce the ACL 'x' (delete) right, mirroring DeleteMailbox.
+	if isShared {
+		hasDeleteRight, err := db.CheckMailboxPermission(ctx, mailboxID, AccountID, ACLRightDelete)
+		if err != nil {
+			return fmt.Errorf("failed to check delete permission: %w", err)
+		}
+		if !hasDeleteRight {
+			return fmt.Errorf("permission denied: user does not have delete right on shared mailbox")
+		}
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE mailboxes SET deleted_at = now(), updated_at = now()
+		WHERE id = $1 AND deleted_at IS NULL
+	`, mailboxID)
+	if err != nil {
+		return fmt.Errorf("failed to soft delete mailbox %d: %w", mailboxID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Lost a race with a concurrent soft-delete of the same mailbox.
+		return consts.ErrMailboxNotFound
+	}
 	return nil
 }
 
@@ -617,7 +678,7 @@ func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, Accou
 	// This avoids 5 INSERT attempts on every LMTP delivery when mailboxes already exist
 	var inboxExists bool
 	err := tx.QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LOWER(name) = 'inbox')
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LOWER(name) = 'inbox' AND deleted_at IS NULL)
 	`, AccountID).Scan(&inboxExists)
 	if err != nil {
 		return fmt.Errorf("failed to check for INBOX existence: %w", err)
@@ -639,7 +700,7 @@ func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, Accou
 		// The DO UPDATE clause with a no-op is a common way to get RETURNING to work with conflicts.
 		err := tx.QueryRow(ctx, `
 			INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path) VALUES ($1, $2, $3, TRUE, '')
-			ON CONFLICT (account_id, LOWER(name)) DO UPDATE
+			ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO UPDATE
 			SET subscribed = TRUE -- Ensure default mailboxes are always subscribed
 			RETURNING id
 		`, AccountID, mailboxName, int64(uidValidity)).Scan(&mailboxID)
@@ -823,7 +884,7 @@ func (d *Database) GetMailboxMessageCountAndSizeSum(ctx context.Context, mailbox
 func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, subscribed bool) error {
 	// First, check if the mailbox exists and belongs to the user.
 	var mboxName string
-	err := tx.QueryRow(ctx, "SELECT name FROM mailboxes WHERE id = $1 AND account_id = $2", mailboxID, AccountID).Scan(&mboxName)
+	err := tx.QueryRow(ctx, "SELECT name FROM mailboxes WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL", mailboxID, AccountID).Scan(&mboxName)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return consts.ErrMailboxNotFound
@@ -872,7 +933,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	err := tx.QueryRow(ctx, `
 		SELECT COALESCE(is_shared, FALSE)
 		FROM mailboxes
-		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE)
+		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE) AND deleted_at IS NULL
 	`, mailboxID, AccountID).Scan(&isShared)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -897,7 +958,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// and prevent constraint violations from case-mismatched duplicates.
 	// Exclude the mailbox being renamed (id != $3) to allow case-only renames (e.g., "amazon" → "Amazon").
 	var existingID int64
-	err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND id != $3", AccountID, newName, mailboxID).Scan(&existingID)
+	err = tx.QueryRow(ctx, "SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND id != $3 AND deleted_at IS NULL", AccountID, newName, mailboxID).Scan(&existingID)
 	if err == nil {
 		// A mailbox with the new name was found.
 		return consts.ErrMailboxAlreadyExists
@@ -912,7 +973,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// Lock this row to prevent other operations on it.
 	var oldName, oldPath string
 	err = tx.QueryRow(ctx, `
-		SELECT name, path FROM mailboxes WHERE id = $1 AND account_id = $2 FOR UPDATE
+		SELECT name, path FROM mailboxes WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL FOR UPDATE
 	`, mailboxID, AccountID).Scan(&oldName, &oldPath)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -943,7 +1004,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	}
 
 	err = tx.QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND path LIKE $2 || '%' AND path != $2)
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND path LIKE $2 || '%' AND path != $2 AND deleted_at IS NULL)
 	`, ownerAccountID, oldPath).Scan(&hasChildren)
 	if err != nil {
 		logger.Error("Database: failed to check for children of mailbox", "mailbox_id", mailboxID, "err", err)
@@ -959,7 +1020,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		}
 
 		// Lock the parent row as well to prevent it from being deleted/moved during this transaction.
-		err = tx.QueryRow(ctx, "SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 FOR UPDATE", *newParentID, AccountID).Scan(&newParentPath)
+		err = tx.QueryRow(ctx, "SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL FOR UPDATE", *newParentID, AccountID).Scan(&newParentPath)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				logger.Error("Database: new parent mailbox not found for rename", "parent_id", *newParentID)
@@ -992,11 +1053,13 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			SELECT COUNT(*)
 			FROM mailboxes existing
 			WHERE existing.account_id = $1
+			  AND existing.deleted_at IS NULL
 			  AND EXISTS (
 				SELECT 1 FROM mailboxes child
 				WHERE child.account_id = $1
 				  AND child.path LIKE $2 || '%'
 				  AND child.path != $2
+				  AND child.deleted_at IS NULL
 				  AND existing.name = $3 || SUBSTRING(child.name FROM LENGTH($4) + 1)
 			  )
 		`, ownerAccountID, oldPath, newPrefix, oldPrefix).Scan(&conflictCount)
