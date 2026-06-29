@@ -59,10 +59,15 @@ debug = false                   # Enable SQL query logging. Useful for debugging
 query_timeout = "30s"           # Default timeout for all database queries (e.g., "30s", "1m").
 search_timeout = "1m"           # Specific timeout for complex search queries (e.g., "60s", "2m").
 write_timeout = "15s"           # Timeout for write operations (INSERT, UPDATE, DELETE).
-lock_timeout = "10s"            # Max time a statement waits for a row lock before failing with 55P03. Bounds tail
-                                # latency on contended mailboxes (MOVE/EXPUNGE/STORE take a per-mailbox row lock for
-                                # unseen_count maintenance) and frees the connection back to the pool instead of
+lock_timeout = "10s"            # Max time a write statement waits for a row lock before failing with 55P03. Applied
+                                # as a transaction-scoped SET LOCAL (safe under all PgBouncer pooling modes). Bounds
+                                # tail latency on contended mailboxes (MOVE/EXPUNGE/STORE take a per-mailbox row lock
+                                # for unseen_count maintenance) and frees the connection back to the pool instead of
                                 # parking it for the full write_timeout. Should be <= write_timeout. "0" disables.
+                                # Ops note: because this is SET LOCAL per transaction, no PgBouncer
+                                # ignore_startup_parameters change is needed. If you'd prefer zero per-transaction
+                                # overhead, set this to "0" and apply the bound globally on the database role instead:
+                                #   ALTER ROLE sora SET lock_timeout = '10s';
 migration_timeout = "2m"        # Timeout for auto-migrations at startup. When multiple instances start simultaneously,
                                 # one will run migrations while others wait. If timeout is reached, the instance will
                                 # verify migrations are complete before continuing. Default: "2m" (2 minutes).

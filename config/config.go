@@ -119,13 +119,16 @@ func (d *DatabaseConfig) GetWriteTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(d.WriteTimeout)
 }
 
-// GetLockTimeout parses the row-lock wait timeout. This is applied as the
-// PostgreSQL lock_timeout on every pooled connection, so a statement blocked
-// waiting for a row lock (e.g. the per-mailbox FOR UPDATE that MOVE/EXPUNGE/STORE
-// take for unseen_count maintenance) fails fast with SQLSTATE 55P03 instead of
-// parking on a connection for the full write_timeout. This bounds tail latency
-// and frees the connection back to the pool, preventing the contention spiral
-// where blocked writers starve the pool. "0" (or "0s") disables it.
+// GetLockTimeout parses the row-lock wait timeout. It is applied as a
+// transaction-scoped `SET LOCAL lock_timeout` at the start of every write
+// transaction (not as a connection/startup parameter, which PgBouncer rejects
+// with SQLSTATE 08P01). A statement blocked waiting for a row lock — e.g. the
+// per-mailbox FOR UPDATE that MOVE/EXPUNGE/STORE take for unseen_count
+// maintenance — then fails fast with SQLSTATE 55P03 instead of parking on a
+// connection for the full write_timeout. This bounds tail latency and frees the
+// connection back to the pool, preventing the contention spiral where blocked
+// writers starve the pool. Because it is SET LOCAL it is correct under every
+// PgBouncer pooling mode (session, transaction, statement). "0" disables it.
 func (d *DatabaseConfig) GetLockTimeout() (time.Duration, error) {
 	if d.LockTimeout == "" {
 		return 10 * time.Second, nil // Default: bound lock waits to 10s

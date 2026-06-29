@@ -158,6 +158,12 @@ type ResilientDatabase struct {
 	// Database configuration for timeouts
 	config *config.DatabaseConfig
 
+	// Precomputed "SET LOCAL lock_timeout = <ms>" statement issued at the start of
+	// every write transaction (empty when lock_timeout is disabled). Transaction-
+	// scoped so it is correct under every PgBouncer pooling mode. See
+	// executeWriteInTxWithRetry and DatabaseConfig.GetLockTimeout.
+	lockTimeoutStmt string
+
 	// Persistent authentication cache (optional, nil if disabled)
 	authCache authCacheInterface
 
@@ -334,11 +340,26 @@ func NewResilientDatabaseWithOptions(ctx context.Context, config *config.Databas
 		return nil, fmt.Errorf("failed to create failover manager: %w", err)
 	}
 
+	// Precompute the per-write-transaction lock_timeout statement once. A bad
+	// duration string falls back to the documented default rather than failing
+	// startup, matching the lenient handling of the other timeouts in withTimeout.
+	lockTimeout, ltErr := config.GetLockTimeout()
+	if ltErr != nil {
+		logger.Warn("Invalid lock_timeout, using default 10s", "error", ltErr)
+		lockTimeout = 10 * time.Second
+	}
+	lockTimeoutStmt := ""
+	if lockTimeout > 0 {
+		// SET does not accept bind parameters; the value is a trusted integer.
+		lockTimeoutStmt = fmt.Sprintf("SET LOCAL lock_timeout = %d", lockTimeout.Milliseconds())
+	}
+
 	rdb := &ResilientDatabase{
 		failoverManager: failoverManager,
 		queryBreaker:    circuitbreaker.NewCircuitBreaker(querySettings),
 		writeBreaker:    circuitbreaker.NewCircuitBreaker(writeSettings),
 		config:          config,
+		lockTimeoutStmt: lockTimeoutStmt,
 	}
 
 	// Start background health checking if enabled

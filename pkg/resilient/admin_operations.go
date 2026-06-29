@@ -464,6 +464,16 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 		defer cancel()
 
 		res, cbErr := rd.writeBreaker.Execute(func() (any, error) {
+			// Bound how long statements in this transaction wait for a row lock, so a
+			// blocked write fails fast with 55P03 instead of parking on a connection
+			// for the full write_timeout (which starves the pool). SET LOCAL is
+			// transaction-scoped, so it is correct under every PgBouncer pooling mode
+			// and reverts on commit/rollback. Empty when lock_timeout is disabled.
+			if rd.lockTimeoutStmt != "" {
+				if _, lerr := tx.Exec(opCtx, rd.lockTimeoutStmt); lerr != nil {
+					return nil, lerr
+				}
+			}
 			return op(opCtx, tx)
 		})
 		if cbErr != nil {
