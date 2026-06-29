@@ -444,6 +444,24 @@ func (rd *ResilientDatabase) CheckMailboxPermissionWithRetry(ctx context.Context
 	return result.(bool), nil
 }
 
+// CheckMoveRightsWithRetry evaluates the three ACL rights MOVE needs in a single
+// round trip (insert on destination; delete-msg + expunge on source).
+func (rd *ResilientDatabase) CheckMoveRightsWithRetry(ctx context.Context, srcMailboxID, destMailboxID, accountID int64) (canInsertDest, canDeleteSrc, canExpungeSrc bool, err error) {
+	op := func(ctx context.Context) (any, error) {
+		ci, cd, ce, opErr := rd.getOperationalDatabaseForOperation(ctx, false).CheckMoveRights(ctx, srcMailboxID, destMailboxID, accountID)
+		if opErr != nil {
+			return nil, opErr
+		}
+		return [3]bool{ci, cd, ce}, nil
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return false, false, false, err
+	}
+	r := result.([3]bool)
+	return r[0], r[1], r[2], nil
+}
+
 func (rd *ResilientDatabase) GetUserMailboxRightsWithRetry(ctx context.Context, mailboxID, accountID int64) (string, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetUserMailboxRights(ctx, mailboxID, accountID)

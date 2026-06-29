@@ -50,10 +50,12 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		}
 	}
 
-	// Check ACL permissions on destination - requires 'i' (insert) right
-	hasInsertRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, destMailbox.ID, s.AccountID(), 'i')
+	// Check ACL permissions in a single round trip: 'i' (insert) on the destination,
+	// plus 't' (delete-msg) and 'e' (expunge) on the source. The owner fast-path in
+	// has_mailbox_right() makes this cheap for the common same-owner move.
+	hasInsertRight, hasDeleteRight, hasExpungeRight, err := s.server.rdb.CheckMoveRightsWithRetry(s.ctx, selectedMailboxID, destMailbox.ID, s.AccountID())
 	if err != nil {
-		return s.internalError("failed to check insert permission on destination: %v", err)
+		return s.internalError("failed to check move permissions: %v", err)
 	}
 	if !hasInsertRight {
 		s.DebugLog("user does not have insert permission on destination mailbox", "mailbox", dest)
@@ -62,16 +64,6 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 			Code: imap.ResponseCodeNoPerm,
 			Text: "You do not have permission to move messages to this mailbox",
 		}
-	}
-
-	// Check ACL permissions on source - requires 't' (delete-msg) and 'e' (expunge) rights
-	hasDeleteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.AccountID(), 't')
-	if err != nil {
-		return s.internalError("failed to check delete permission on source: %v", err)
-	}
-	hasExpungeRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.AccountID(), 'e')
-	if err != nil {
-		return s.internalError("failed to check expunge permission on source: %v", err)
 	}
 	if !hasDeleteRight || !hasExpungeRight {
 		s.DebugLog("user does not have delete/expunge permission on source mailbox")

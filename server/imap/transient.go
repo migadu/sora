@@ -47,6 +47,12 @@ func isTransientError(err error) bool {
 		return true
 	}
 
+	// Row-lock wait timeout (lock_timeout fired): transient contention, the client
+	// should back off and retry rather than see a [SERVERBUG].
+	if errors.Is(err, db.ErrDBLockTimeout) {
+		return true
+	}
+
 	// Storage retrieval errors
 	if errors.Is(err, storage.ErrRetrieveFailed) ||
 		errors.Is(err, storage.ErrEmptyData) {

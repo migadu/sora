@@ -58,6 +58,7 @@ type DatabaseConfig struct {
 	QueryTimeout     string                  `toml:"query_timeout"`     // Default timeout for all database queries (default: "30s")
 	SearchTimeout    string                  `toml:"search_timeout"`    // Specific timeout for complex search queries (default: "60s")
 	WriteTimeout     string                  `toml:"write_timeout"`     // Timeout for write operations (default: "10s")
+	LockTimeout      string                  `toml:"lock_timeout"`      // Max time a statement waits for a row lock before failing (default: "10s"; "0" disables)
 	MigrationTimeout string                  `toml:"migration_timeout"` // Timeout for auto-migrations at startup (default: "2m")
 	FetchChunkSize   int                     `toml:"fetch_chunk_size"`  // Number of messages to fetch per chunk for large result sets (default: 5000)
 	Write            *DatabaseEndpointConfig `toml:"write"`             // Write database configuration
@@ -116,6 +117,20 @@ func (d *DatabaseConfig) GetWriteTimeout() (time.Duration, error) {
 		return 10 * time.Second, nil // Default 10 second timeout for write operations
 	}
 	return helpers.ParseDuration(d.WriteTimeout)
+}
+
+// GetLockTimeout parses the row-lock wait timeout. This is applied as the
+// PostgreSQL lock_timeout on every pooled connection, so a statement blocked
+// waiting for a row lock (e.g. the per-mailbox FOR UPDATE that MOVE/EXPUNGE/STORE
+// take for unseen_count maintenance) fails fast with SQLSTATE 55P03 instead of
+// parking on a connection for the full write_timeout. This bounds tail latency
+// and frees the connection back to the pool, preventing the contention spiral
+// where blocked writers starve the pool. "0" (or "0s") disables it.
+func (d *DatabaseConfig) GetLockTimeout() (time.Duration, error) {
+	if d.LockTimeout == "" {
+		return 10 * time.Second, nil // Default: bound lock waits to 10s
+	}
+	return helpers.ParseDuration(d.LockTimeout)
 }
 
 // GetMigrationTimeout parses the migration timeout duration

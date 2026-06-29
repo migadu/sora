@@ -3,6 +3,8 @@ package db
 import (
 	"errors"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Sentinel errors for database operations
@@ -33,6 +35,12 @@ var (
 
 	// Connection errors
 	ErrFailedToConnect = errors.New("failed to connect to database")
+
+	// ErrDBLockTimeout indicates a statement was canceled because it waited longer
+	// than lock_timeout for a row lock (PostgreSQL SQLSTATE 55P03). This is a
+	// transient contention condition, not a fault: the caller should back off and
+	// retry rather than treat it as a server bug.
+	ErrDBLockTimeout = errors.New("database lock wait timeout")
 )
 
 // ClassifyDBError inspects a raw database/pgx error and, if it matches a known
@@ -45,6 +53,16 @@ var (
 func ClassifyDBError(err error) error {
 	if err == nil {
 		return nil
+	}
+
+	// Prefer the SQLSTATE code when a structured pgx error is available: it is
+	// language/version independent, unlike the human-readable message text.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "55P03": // lock_not_available — lock_timeout elapsed
+			return errors.Join(ErrDBLockTimeout, err)
+		}
 	}
 
 	msg := err.Error()

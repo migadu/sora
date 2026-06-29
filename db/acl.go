@@ -233,6 +233,25 @@ func (db *Database) CheckMailboxPermission(ctx context.Context, mailboxID, accou
 	return hasRight, nil
 }
 
+// CheckMoveRights evaluates, in a single round trip, the ACL rights MOVE requires:
+// insert ('i') on the destination, plus delete-msg ('t') and expunge ('e') on the
+// source. has_mailbox_right() already short-circuits to TRUE for the mailbox owner
+// (the common case), so this is a single fast query that replaces three sequential
+// CheckMailboxPermission calls. When source and destination are the same mailbox the
+// caller passes equal ids; the function still returns all three booleans correctly.
+func (db *Database) CheckMoveRights(ctx context.Context, srcMailboxID, destMailboxID, accountID int64) (canInsertDest, canDeleteSrc, canExpungeSrc bool, err error) {
+	err = db.GetReadPool().QueryRow(ctx, `
+		SELECT
+			has_mailbox_right($1, $3, 'i'),
+			has_mailbox_right($2, $3, 't'),
+			has_mailbox_right($2, $3, 'e')
+	`, destMailboxID, srcMailboxID, accountID).Scan(&canInsertDest, &canDeleteSrc, &canExpungeSrc)
+	if err != nil {
+		return false, false, false, fmt.Errorf("failed to check move permissions: %w", err)
+	}
+	return canInsertDest, canDeleteSrc, canExpungeSrc, nil
+}
+
 // CheckMailboxPermissions checks if a user has all specified rights on a mailbox
 func (db *Database) CheckMailboxPermissions(ctx context.Context, mailboxID, accountID int64, rights string) (bool, error) {
 	for _, r := range rights {

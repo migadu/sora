@@ -693,9 +693,17 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 		poolType = dbConfig.PoolTypeOverride
 	}
 
+	// Resolve the row-lock wait timeout once; applied to every pooled connection
+	// so blocked lock waits fail fast (SQLSTATE 55P03) instead of holding a
+	// connection for the full write_timeout. See DatabaseConfig.GetLockTimeout.
+	lockTimeout, err := dbConfig.GetLockTimeout()
+	if err != nil {
+		return nil, fmt.Errorf("invalid lock_timeout: %w", err)
+	}
+
 	// Create write failover manager and pool
 	writeFailover := NewFailoverManager(dbConfig.Write, poolType)
-	writePool, err := createPoolFromEndpointWithFailover(ctx, dbConfig.Write, dbConfig.GetDebug(), poolType, writeFailover)
+	writePool, err := createPoolFromEndpointWithFailover(ctx, dbConfig.Write, dbConfig.GetDebug(), poolType, lockTimeout, writeFailover)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create %s pool: %w", poolType, err)
 	}
@@ -705,7 +713,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 	var readFailover *FailoverManager
 	if dbConfig.Read != nil {
 		readFailover = NewFailoverManager(dbConfig.Read, "read")
-		readPool, err = createPoolFromEndpointWithFailover(ctx, dbConfig.Read, dbConfig.GetDebug(), "read", readFailover)
+		readPool, err = createPoolFromEndpointWithFailover(ctx, dbConfig.Read, dbConfig.GetDebug(), "read", lockTimeout, readFailover)
 		if err != nil {
 			// If all read replicas are down, fall back to write pool instead of failing startup
 			logger.Warn("Database: failed to create read pool (all read replicas unreachable)", "err", err)
@@ -718,7 +726,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 		// This prevents read queries (UI/IMAP clients) from timing out due to connection pool starvation
 		// when heavy write operations (mass imports/deliveries) exhaust all connections.
 		readFailover = NewFailoverManager(dbConfig.Write, "read")
-		readPool, err = createPoolFromEndpointWithFailover(ctx, dbConfig.Write, dbConfig.GetDebug(), "read", readFailover)
+		readPool, err = createPoolFromEndpointWithFailover(ctx, dbConfig.Write, dbConfig.GetDebug(), "read", lockTimeout, readFailover)
 		if err != nil {
 			logger.Warn("Database: failed to create dedicated read pool", "err", err)
 			logger.Info("Database: falling back to shared write pool for read operations")
@@ -818,8 +826,10 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 	return db, nil
 }
 
-// createPoolFromEndpointWithFailover creates a connection pool with an existing failover manager
-func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.DatabaseEndpointConfig, logQueries bool, poolType string, failoverManager *FailoverManager) (*pgxpool.Pool, error) {
+// createPoolFromEndpointWithFailover creates a connection pool with an existing failover manager.
+// lockTimeout, when > 0, is applied as the PostgreSQL lock_timeout on every connection so a
+// statement blocked on a row lock fails fast (55P03) rather than holding the connection.
+func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.DatabaseEndpointConfig, logQueries bool, poolType string, lockTimeout time.Duration, failoverManager *FailoverManager) (*pgxpool.Pool, error) {
 	if len(endpoint.Hosts) == 0 {
 		return nil, fmt.Errorf("at least one host must be specified")
 	}
@@ -877,6 +887,18 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 			lastErr = fmt.Errorf("unable to parse connection string: %w", err)
 			failoverManager.MarkHostUnhealthy(selectedHost, lastErr)
 			continue
+		}
+
+		// Bound how long any statement waits for a row lock. Sent in the startup
+		// packet (lock_timeout is USERSET), so it applies to every query on the
+		// connection without an extra round trip. PostgreSQL reads a bare integer
+		// as milliseconds. Reads never take row locks, so this only ever fires on
+		// the write path; it converts an unbounded lock park into a fast 55P03.
+		if lockTimeout > 0 {
+			if config.ConnConfig.RuntimeParams == nil {
+				config.ConnConfig.RuntimeParams = make(map[string]string)
+			}
+			config.ConnConfig.RuntimeParams["lock_timeout"] = strconv.FormatInt(lockTimeout.Milliseconds(), 10)
 		}
 
 		if logQueries {
