@@ -126,6 +126,17 @@ func (rd *ResilientDatabase) GetAccountsByDomain(ctx context.Context, domain str
 	return result.([]db.AccountSummary), nil
 }
 
+func (rd *ResilientDatabase) GetAliasCredentialsByDomain(ctx context.Context, domain string) ([]string, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetAliasCredentialsByDomain(ctx, domain)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]string), nil
+}
+
 func (rd *ResilientDatabase) ListAccountsByDomainWithRetry(ctx context.Context, domain string) ([]db.AccountSummary, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).ListAccountsByDomain(ctx, domain)

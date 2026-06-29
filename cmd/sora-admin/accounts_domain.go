@@ -77,6 +77,34 @@ func purgeDomain(ctx context.Context, cfg AdminConfig, domain string) error {
 		successCount++
 	}
 
+	// Remove cross-domain aliases for this domain. Accounts whose PRIMARY identity is in the
+	// domain were purged above. Any credential still in this domain is a non-primary alias on
+	// an account whose primary lives elsewhere — without removal it keeps receiving mail for
+	// the (now decommissioned) domain. A credential address is a deliverable address, so this
+	// is required to fully offboard the domain.
+	aliasAddrs, err := rdb.GetAliasCredentialsByDomain(ctx, domain)
+	if err != nil {
+		return fmt.Errorf("failed to scan for cross-domain aliases: %w", err)
+	}
+
+	aliasDeleted := 0
+	aliasFailed := 0
+	if len(aliasAddrs) > 0 {
+		fmt.Printf("===================================================\n")
+		fmt.Printf("Cross-domain aliases in %s (on accounts kept alive)\n", domain)
+		fmt.Printf("===================================================\n\n")
+		for _, addr := range aliasAddrs {
+			if err := rdb.DeleteCredentialWithRetry(ctx, addr); err != nil {
+				fmt.Printf("[FAIL] %s: %v\n", addr, err)
+				aliasFailed++
+				continue
+			}
+			fmt.Printf("[OK] Removed alias: %s\n", addr)
+			aliasDeleted++
+		}
+		fmt.Printf("\n")
+	}
+
 	// Summary
 	fmt.Printf("===================================================\n")
 	fmt.Printf("SUMMARY\n")
@@ -85,9 +113,13 @@ func purgeDomain(ctx context.Context, cfg AdminConfig, domain string) error {
 	fmt.Printf("[OK] Purged:          %d\n", successCount)
 	fmt.Printf("[SKIP] Already purged:  %d\n", skippedCount)
 	fmt.Printf("[FAIL] Failed:          %d\n", failedCount)
+	fmt.Printf("[OK] Aliases removed: %d\n", aliasDeleted)
+	if aliasFailed > 0 {
+		fmt.Printf("[FAIL] Aliases failed:  %d\n", aliasFailed)
+	}
 
-	if failedCount > 0 {
-		return fmt.Errorf("%d account(s) failed to purge - re-run command to retry", failedCount)
+	if failedCount > 0 || aliasFailed > 0 {
+		return fmt.Errorf("%d account(s) and %d alias(es) failed to purge - re-run command to retry", failedCount, aliasFailed)
 	}
 
 	return nil

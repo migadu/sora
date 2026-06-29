@@ -156,6 +156,12 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 
 	// If this should be the new primary identity, unset the current primary
 	if req.IsPrimary {
+		// Guard: promoting a different-domain credential to primary on a populated account
+		// would split the account's message storage across two s3_domain prefixes.
+		if err = guardCrossDomainPrimaryChange(ctx, tx, req.AccountID, newAddress.Domain()); err != nil {
+			return err
+		}
+
 		_, err = tx.Exec(ctx,
 			"UPDATE credentials SET primary_identity = false WHERE account_id = $1 AND primary_identity = true",
 			req.AccountID)
@@ -242,6 +248,12 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 
 	// Begin transaction if we need to handle primary identity change
 	if req.MakePrimary {
+		// Guard: switching the primary to a different-domain credential on a populated
+		// account would split the account's message storage across two s3_domain prefixes.
+		if err = guardCrossDomainPrimaryChange(ctx, tx, accountID, address.Domain()); err != nil {
+			return err
+		}
+
 		// First, unset any existing primary identity for this account
 		_, err = tx.Exec(ctx,
 			"UPDATE credentials SET primary_identity = false WHERE account_id = $1 AND primary_identity = true",
@@ -352,7 +364,55 @@ func (db *Database) IsAddressOwnedByAccount(ctx context.Context, accountID int64
 var (
 	ErrCannotDeletePrimaryCredential = errors.New("cannot delete the primary credential. Use update-account to make another credential primary first")
 	ErrCannotDeleteLastCredential    = errors.New("cannot delete the last credential for an account. Use delete-account to remove the entire account")
+	// ErrCrossDomainPrimaryChange is returned when an operation would switch an account's
+	// primary identity to a different domain while the account already has messages. Message
+	// storage keys (s3_domain) are captured per-message from the then-current primary, so such
+	// a switch would split one account's objects across two S3 domain prefixes.
+	ErrCrossDomainPrimaryChange = errors.New("cannot change the primary identity to a different domain on an account that already has messages: this would split message storage across domains")
 )
+
+// accountHasMessages reports whether the account has any rows in the messages table.
+// Used to guard primary-domain changes that would split s3_domain on a populated account.
+func accountHasMessages(ctx context.Context, tx pgx.Tx, accountID int64) (bool, error) {
+	var exists bool
+	if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM messages WHERE account_id = $1)", accountID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check whether account %d has messages: %w", accountID, err)
+	}
+	return exists, nil
+}
+
+// getPrimaryDomainInTx returns the domain of the account's current primary identity.
+func getPrimaryDomainInTx(ctx context.Context, tx pgx.Tx, accountID int64) (string, error) {
+	var addr string
+	if err := tx.QueryRow(ctx, "SELECT address FROM credentials WHERE account_id = $1 AND primary_identity = TRUE", accountID).Scan(&addr); err != nil {
+		return "", fmt.Errorf("failed to resolve current primary identity for account %d: %w", accountID, err)
+	}
+	parsed, err := server.NewAddress(addr)
+	if err != nil {
+		return "", fmt.Errorf("invalid primary address %q in database: %w", addr, err)
+	}
+	return parsed.Domain(), nil
+}
+
+// guardCrossDomainPrimaryChange blocks switching an account's primary identity to newDomain
+// when newDomain differs from the current primary domain and the account already has messages.
+func guardCrossDomainPrimaryChange(ctx context.Context, tx pgx.Tx, accountID int64, newDomain string) error {
+	currentDomain, err := getPrimaryDomainInTx(ctx, tx, accountID)
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(currentDomain, newDomain) {
+		return nil
+	}
+	hasMessages, err := accountHasMessages(ctx, tx, accountID)
+	if err != nil {
+		return err
+	}
+	if hasMessages {
+		return ErrCrossDomainPrimaryChange
+	}
+	return nil
+}
 
 // DeleteCredential deletes a specific credential from an account
 func (db *Database) DeleteCredential(ctx context.Context, tx pgx.Tx, email string) error {
@@ -785,6 +845,37 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 	}
 
 	return accounts, rows.Err()
+}
+
+// GetAliasCredentialsByDomain returns the addresses of all NON-primary credentials whose
+// address is in the given domain, across active (non-deleted) accounts. Domain purge uses
+// this to find cross-domain aliases: addresses in the purged domain that hang off accounts
+// whose primary identity lives in a different domain (so the account is not itself purged).
+// Such aliases keep receiving mail for the purged domain unless explicitly removed.
+func (db *Database) GetAliasCredentialsByDomain(ctx context.Context, domain string) ([]string, error) {
+	rows, err := db.GetReadPool().Query(ctx, `
+		SELECT c.address
+		FROM credentials c
+		JOIN accounts a ON a.id = c.account_id
+		WHERE LOWER(c.address) LIKE '%' || '@' || LOWER($1)
+		  AND c.primary_identity = FALSE
+		  AND a.deleted_at IS NULL
+		ORDER BY c.address
+	`, domain)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query alias credentials by domain: %w", err)
+	}
+	defer rows.Close()
+
+	var addresses []string
+	for rows.Next() {
+		var address string
+		if err := rows.Scan(&address); err != nil {
+			return nil, fmt.Errorf("failed to scan alias credential: %w", err)
+		}
+		addresses = append(addresses, address)
+	}
+	return addresses, rows.Err()
 }
 
 // ListAccounts returns a summary of all accounts in the system
