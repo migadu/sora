@@ -889,16 +889,15 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 			continue
 		}
 
-		// Bound how long any statement waits for a row lock. Sent in the startup
-		// packet (lock_timeout is USERSET), so it applies to every query on the
-		// connection without an extra round trip. PostgreSQL reads a bare integer
-		// as milliseconds. Reads never take row locks, so this only ever fires on
-		// the write path; it converts an unbounded lock park into a fast 55P03.
+		// Bound how long any statement waits for a row lock. Because PgBouncer
+		// often rejects lock_timeout in the startup packet (SQLSTATE 08P01), we
+		// apply it via AfterConnect. This applies universally to every query on
+		// the pool, preventing bounded lock waits from starving connections.
 		if lockTimeout > 0 {
-			if config.ConnConfig.RuntimeParams == nil {
-				config.ConnConfig.RuntimeParams = make(map[string]string)
+			config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+				_, err := conn.Exec(ctx, "SELECT set_config('lock_timeout', $1, false)", fmt.Sprintf("%dms", lockTimeout.Milliseconds()))
+				return err
 			}
-			config.ConnConfig.RuntimeParams["lock_timeout"] = strconv.FormatInt(lockTimeout.Milliseconds(), 10)
 		}
 
 		if logQueries {
