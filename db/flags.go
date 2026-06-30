@@ -245,6 +245,47 @@ func (db *Database) getAllFlagsForMessage(ctx context.Context, tx pgx.Tx, messag
 	return allFlags, nil
 }
 
+// MaxCustomKeywordsPerMessage bounds how many custom keywords (IMAP keywords) a
+// single message may carry. It guards against unbounded keyword accumulation
+// from a buggy or hostile client bloating message_state.custom_flags and the
+// per-mailbox keyword registry. The same bound is enforced as a CHECK constraint
+// on message_state as a backstop. Lenient paths (deliveries, imports) silently
+// cap to this value to avoid bouncing; interactive paths (IMAP, API) reject
+// over-limit requests cleanly rather than failing with a constraint violation.
+// 50 is far above any realistic tagging scheme.
+const MaxCustomKeywordsPerMessage = 50
+
+// capCustomKeywords truncates kw to at most MaxCustomKeywordsPerMessage entries,
+// preserving order so already-present keywords (placed first by the caller) win
+// over overflow. Used only on the lenient INSERT paths — Sieve-set keywords on
+// delivery (imap4flags, RFC 5232) and bulk import — where silently dropping
+// surplus keywords is preferable to bouncing a delivery or aborting a migration.
+// The interactive paths (IMAP STORE/APPEND, User API) instead reject with a LIMIT
+// error — see DistinctKeywordCount. (LMTP itself carries no flags.)
+func capCustomKeywords(kw []string) []string {
+	if len(kw) > MaxCustomKeywordsPerMessage {
+		return kw[:MaxCustomKeywordsPerMessage]
+	}
+	return kw
+}
+
+// DistinctKeywordCount returns the number of distinct custom keywords in flags,
+// folding case per RFC 9051 §2.3.2 (so "Work" and "WORK" count once). System
+// flags (\Seen, …) are not keywords and are ignored. Interactive callers use it
+// to reject a STORE/APPEND that would exceed MaxCustomKeywordsPerMessage with a
+// LIMIT error (RFC 5530) instead of silently dropping keywords.
+func DistinctKeywordCount(flags []imap.Flag) int {
+	_, keywords := SplitFlags(flags)
+	if len(keywords) == 0 {
+		return 0
+	}
+	seen := make(map[string]struct{}, len(keywords))
+	for _, k := range keywords {
+		seen[foldKeyword(k)] = struct{}{}
+	}
+	return len(seen)
+}
+
 func (db *Database) SetMessageFlags(ctx context.Context, tx pgx.Tx, messageUID imap.UID, mailboxID int64, newFlags []imap.Flag) (updatedFlags []imap.Flag, modSeq int64, err error) {
 	start := time.Now()
 	defer func() {

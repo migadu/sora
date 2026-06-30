@@ -577,6 +577,14 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		customFlags = removeString(customFlags, canon)
 	}
 
+	// Reject rather than silently drop if the result would exceed what a single
+	// message may hold (see MaxCustomKeywordsPerMessage). customFlags is already
+	// case-folded and deduplicated by the add loop above, so its length is the
+	// distinct keyword count. The API surfaces this as HTTP 422.
+	if len(customFlags) > MaxCustomKeywordsPerMessage {
+		return consts.ErrTooManyKeywords
+	}
+
 	customFlagsJSON, _ := json.Marshal(customFlags)
 
 	// Update flags

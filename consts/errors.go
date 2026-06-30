@@ -14,6 +14,7 @@ var (
 	ErrMalformedMessage     = errors.New("malformed message")
 	ErrMessageNotAvailable  = errors.New("message not available")
 	ErrEmptyMessageID       = errors.New("empty message ID")
+	ErrTooManyKeywords      = errors.New("too many keywords on a message")
 	ErrAuthenticationFailed = errors.New("authentication failed")
 
 	ErrDBNotFound                = errors.New("not found")

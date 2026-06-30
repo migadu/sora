@@ -406,6 +406,9 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to canonicalize custom keywords for InsertMessage: %w", err)
 	}
+	// Degrade gracefully rather than failing the APPEND if it carries more
+	// keywords than a single message may hold (see MaxCustomKeywordsPerMessage).
+	customKeywordsToSet = capCustomKeywords(customKeywordsToSet)
 
 	var customKeywordsJSON []byte
 	if len(customKeywordsToSet) == 0 {
@@ -791,6 +794,9 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to canonicalize custom keywords for InsertMessage: %w", err)
 	}
+	// Degrade gracefully rather than failing the APPEND if it carries more
+	// keywords than a single message may hold (see MaxCustomKeywordsPerMessage).
+	customKeywordsToSet = capCustomKeywords(customKeywordsToSet)
 
 	var customKeywordsJSON []byte
 	if len(customKeywordsToSet) == 0 {
@@ -1061,6 +1067,9 @@ func (d *Database) InsertMessagesBatch(
 		systemFlagsToSet, customKeywordsToSet := SplitFlags(opt.Flags)
 		// Fold onto the batch's shared canonical map (RFC 9051 §2.3.2).
 		customKeywordsToSet = foldKeywordsWithMap(batchCanonical, customKeywordsToSet)
+		// Degrade gracefully rather than failing the import if a message carries
+		// more keywords than it may hold (see MaxCustomKeywordsPerMessage).
+		customKeywordsToSet = capCustomKeywords(customKeywordsToSet)
 		bitwiseFlags := FlagsToBitwise(systemFlagsToSet)
 
 		var customKeywordsJSON []byte

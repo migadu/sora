@@ -3,12 +3,14 @@ package userapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 
 	"github.com/migadu/sora/logger"
 
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 )
 
 // UpdateMessageRequest represents the request to update message flags
@@ -67,6 +69,11 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, consts.ErrDBNotFound) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
+			return
+		}
+		if errors.Is(err, consts.ErrTooManyKeywords) {
+			s.writeError(w, http.StatusUnprocessableEntity,
+				fmt.Sprintf("Too many keywords on a message (maximum %d)", db.MaxCustomKeywordsPerMessage))
 			return
 		}
 		logger.Warn("HTTP Mail API: Error updating message flags", "name", s.name, "error", err)

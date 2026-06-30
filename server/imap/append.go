@@ -313,6 +313,23 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	}
 	appendFlags := filterFlagsByRights(sanitizedFlags, appendRights)
 
+	// RFC 5530 [LIMIT]: reject an APPEND carrying more keywords than a single
+	// message may hold, rather than storing it and silently dropping the surplus.
+	// APPEND is all-or-nothing (no way to report a partial keyword set), so a
+	// clean rejection is preferable — the client still holds the source message.
+	// (Sieve-set keywords on delivery — imap4flags, RFC 5232 — take the lenient
+	// InsertMessage path, which clamps instead, so a runaway addflag can't bounce
+	// a delivery. LMTP itself carries no flags.)
+	if db.DistinctKeywordCount(appendFlags) > db.MaxCustomKeywordsPerMessage {
+		ierr := &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeLimit,
+			Text: fmt.Sprintf("Too many keywords on a message (maximum %d)", db.MaxCustomKeywordsPerMessage),
+		}
+		recordMetrics(ierr)
+		return nil, ierr
+	}
+
 	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(s.ctx,
 		&db.InsertMessageOptions{
 			AccountID:     destAccountID,

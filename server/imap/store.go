@@ -9,6 +9,18 @@ import (
 	"github.com/migadu/sora/helpers"
 )
 
+// keywordLimitExceededError is returned when a STORE would push a message past
+// the per-message keyword cap. RFC 5530's [LIMIT] is the response code for
+// exactly this ("the number of flags on a message"), so the client gets a
+// clear, standard signal rather than a silently-dropped keyword.
+func keywordLimitExceededError() *imap.Error {
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeLimit,
+		Text: fmt.Sprintf("Too many keywords on a message (maximum %d)", db.MaxCustomKeywordsPerMessage),
+	}
+}
+
 func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
 	// First, safely read session state with a single mutex acquisition
 	var selectedMailboxID int64
@@ -150,6 +162,29 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 		validUIDs = append(validUIDs, msg.UID)
 		seqMap[msg.UID] = msg.Seq
+
+		// RFC 5530 [LIMIT]: reject a STORE that would push this message past the
+		// per-message keyword cap, rather than silently dropping keywords (which
+		// would falsely report success). -FLAGS only removes keywords, so skip it.
+		// This runs before any write, so an over-limit STORE applies nothing.
+		var resulting []imap.Flag
+		switch sanitizedStoreFlags.Op {
+		case imap.StoreFlagsAdd:
+			resulting = make([]imap.Flag, 0, len(msg.CustomFlags)+len(sanitizedStoreFlags.Flags))
+			for _, cf := range msg.CustomFlags {
+				resulting = append(resulting, imap.Flag(cf))
+			}
+			resulting = append(resulting, sanitizedStoreFlags.Flags...)
+		case imap.StoreFlagsSet:
+			cur := db.BitwiseToFlags(msg.BitwiseFlags)
+			for _, cf := range msg.CustomFlags {
+				cur = append(cur, imap.Flag(cf))
+			}
+			resulting = replaceTargetFlags(cur, sanitizedStoreFlags.Flags, storeRights)
+		}
+		if db.DistinctKeywordCount(resulting) > db.MaxCustomKeywordsPerMessage {
+			return keywordLimitExceededError()
+		}
 	}
 
 	if len(validUIDs) > 0 {
