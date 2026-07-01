@@ -111,6 +111,17 @@ func (s *IMAPSession) GetCapabilities() imap.CapSet {
 	return s.server.caps
 }
 
+// condStoreEnabled reports whether it is correct to emit a MODSEQ data item in a
+// FETCH-style response for this session. Per RFC 7162 §3.2 that requires two things:
+// the client must have become CONDSTORE-aware on this connection (issued a
+// CONDSTORE-enabling command — tracked by go-imap), AND the session must still
+// advertise CONDSTORE (so a capability filter, e.g. for iOS, can suppress it
+// mid-connection). Emitting MODSEQ to a client that never enabled CONDSTORE breaks
+// strict parsers such as mbsync/isync.
+func (s *IMAPSession) condStoreEnabled() bool {
+	return s.conn != nil && s.conn.CondStoreEnabled() && s.GetCapabilities().Has(imap.CapCondStore)
+}
+
 // AdditionalCapabilities implements the imapserver.SessionAdditionalCaps interface.
 // It returns extra, non-standard capability tokens (configured via additional_caps)
 // that go-imap advertises verbatim in every CAPABILITY emission — including the

@@ -257,7 +257,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 				m := w.CreateMessage(modified.seq)
 				m.WriteFlags(modified.flags)
 				m.WriteUID(modified.uid)
-				if s.GetCapabilities().Has(imap.CapCondStore) {
+				if s.condStoreEnabled() {
 					m.WriteModSeq(uint64(modified.modSeq))
 				}
 				if err := m.Close(); err != nil {
@@ -294,8 +294,10 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 			m.WriteFlags(modified.flags)
 			m.WriteUID(modified.uid)
-			// CONDSTORE: Include MODSEQ in response if capability is enabled
-			if s.GetCapabilities().Has(imap.CapCondStore) {
+			// RFC 7162 §3.2: include MODSEQ in the STORE-triggered FETCH reply only
+			// when the client is CONDSTORE-aware (issued an enabling command) and the
+			// session still advertises CONDSTORE.
+			if s.condStoreEnabled() {
 				m.WriteModSeq(uint64(modified.modSeq))
 			}
 
