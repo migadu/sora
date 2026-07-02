@@ -54,19 +54,26 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 		nameToMailbox[mbox.Name] = mbox
 	}
 
+	// Shared-namespace root (e.g. "Shared" for prefix "Shared/"), used to mark that
+	// root \Noselect. Empty when shared mailboxes are disabled.
+	sharedNamespaceRoot := ""
+	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
+		sharedNamespaceRoot = strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, string(consts.MailboxDelimiter))
+	}
+
 	var l []imap.ListData
 	if options.SelectSubscribed {
 		// SUBSCRIBED selection (RFC 5258 §3.5), including RECURSIVEMATCH/CHILDINFO
 		// and non-existent subscribed names. LSUB arrives here too — the go-imap
 		// layer dispatches it as LIST (SUBSCRIBED RECURSIVEMATCH) and renders the
 		// CHILDINFO parents as \Noselect.
-		l = buildSubscribedList(ref, patterns, options, mboxes, subscribedSet, s.GetCapabilities())
+		l = buildSubscribedList(ref, patterns, options, mboxes, subscribedSet, s.GetCapabilities(), sharedNamespaceRoot)
 	} else {
 		for _, mbox := range mboxes {
 			if !matchesAnyPattern(mbox.Name, ref, patterns) {
 				continue
 			}
-			data := listMailbox(mbox, options, s.GetCapabilities())
+			data := listMailbox(mbox, options, s.GetCapabilities(), sharedNamespaceRoot)
 			if data != nil {
 				l = append(l, *data)
 			}
@@ -243,7 +250,7 @@ func hasSubscribedDescendant(lowerName, delim string, subscribedSet map[string]s
 // subscribedSet maps LOWER(name) -> stored spelling.
 func buildSubscribedList(ref string, patterns []string, options *imap.ListOptions,
 	mboxes []*db.DBMailbox, subscribedSet map[string]string,
-	serverCaps imap.CapSet) []imap.ListData {
+	serverCaps imap.CapSet, sharedNamespaceRoot string) []imap.ListData {
 
 	recursive := options.SelectRecursiveMatch
 	delim := string(consts.MailboxDelimiter)
@@ -292,7 +299,7 @@ func buildSubscribedList(ref string, patterns []string, options *imap.ListOption
 
 		var data imap.ListData
 		if m, ok := liveByLower[lname]; ok {
-			md := listMailbox(m, options, serverCaps)
+			md := listMailbox(m, options, serverCaps, sharedNamespaceRoot)
 			if md == nil {
 				continue // filtered out (e.g. SELECT SPECIAL-USE with no special-use)
 			}
@@ -323,12 +330,15 @@ func buildSubscribedList(ref string, patterns []string, options *imap.ListOption
 	return l
 }
 
-func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.CapSet) *imap.ListData {
+func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.CapSet, sharedNamespaceRoot string) *imap.ListData {
 	attributes := []imap.MailboxAttr{}
 
-	// Add \noselect for shared namespace root (e.g., "Shared" for prefix "Shared/")
-	// This prevents clients from trying to SELECT the namespace prefix itself
-	if mbox.Name == "Shared" && mbox.HasChildren {
+	// Add \Noselect for the shared-namespace root (e.g. "Shared" for prefix
+	// "Shared/", or the configured namespace_prefix). This prevents clients from
+	// trying to SELECT the namespace prefix itself. sharedNamespaceRoot is empty
+	// when shared mailboxes are disabled, so a personal folder that happens to be
+	// named like the prefix is not falsely marked \Noselect.
+	if sharedNamespaceRoot != "" && strings.EqualFold(mbox.Name, sharedNamespaceRoot) && mbox.HasChildren {
 		attributes = append(attributes, imap.MailboxAttrNoSelect)
 	}
 
