@@ -47,15 +47,6 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 	for _, n := range subNames {
 		subscribedSet[strings.ToLower(n)] = n
 	}
-	liveNames := make(map[string]bool, len(mboxes))
-	for _, mbox := range mboxes {
-		liveNames[strings.ToLower(mbox.Name)] = true
-	}
-
-	var parentFolders map[string]bool
-	if options.SelectSubscribed {
-		parentFolders = calculateParentFolders(mboxes)
-	}
 
 	// Build name -> DBMailbox mapping for batch STATUS lookups
 	nameToMailbox := make(map[string]*db.DBMailbox, len(mboxes))
@@ -64,64 +55,21 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 	}
 
 	var l []imap.ListData
-	for _, mbox := range mboxes {
-		// Check if mailbox matches any of the patterns
-		match := false
-		for _, pattern := range patterns {
-			if imapserver.MatchList(mbox.Name, consts.MailboxDelimiter, ref, pattern) {
-				match = true
-				break
-			}
-		}
-		if !match {
-			continue
-		}
-
-		// For LSUB, only include subscribed mailboxes or their parents
-		if options.SelectSubscribed {
-			if !mbox.Subscribed && !parentFolders[mbox.Name] {
-				continue
-			}
-		}
-
-		// Determine if the mailbox is a parent folder for LSUB response attributes.
-		// A folder is a "parent" if it's being listed as part of an LSUB response
-		// because it's an ancestor of a subscribed folder.
-		isParentForLsub := false
-		if parentFolders != nil {
-			isParentForLsub = parentFolders[mbox.Name]
-		}
-
-		data := listMailbox(mbox, options, s.GetCapabilities(), isParentForLsub)
-		if data != nil {
-			l = append(l, *data)
-		}
-	}
-
-	// RFC 3501 §6.3.6 / RFC 9051 §6.3.7: for LSUB / LIST (SUBSCRIBED), also report
-	// subscribed names that have no live mailbox (subscribed-then-deleted, or
-	// subscribed-before-created), flagged \NonExistent (which implies \NoSelect) so
-	// the client knows the mailbox is not selectable.
 	if options.SelectSubscribed {
-		for lname, name := range subscribedSet {
-			if liveNames[lname] {
-				continue // already listed above as a live mailbox
-			}
-			matched := false
-			for _, pattern := range patterns {
-				if imapserver.MatchList(name, consts.MailboxDelimiter, ref, pattern) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
+		// SUBSCRIBED selection (RFC 5258 §3.5), including RECURSIVEMATCH/CHILDINFO
+		// and non-existent subscribed names. LSUB arrives here too — the go-imap
+		// layer dispatches it as LIST (SUBSCRIBED RECURSIVEMATCH) and renders the
+		// CHILDINFO parents as \Noselect.
+		l = buildSubscribedList(ref, patterns, options, mboxes, subscribedSet, s.GetCapabilities())
+	} else {
+		for _, mbox := range mboxes {
+			if !matchesAnyPattern(mbox.Name, ref, patterns) {
 				continue
 			}
-			l = append(l, imap.ListData{
-				Mailbox: name,
-				Delim:   consts.MailboxDelimiter,
-				Attrs:   []imap.MailboxAttr{imap.MailboxAttrSubscribed, imap.MailboxAttrNonExistent},
-			})
+			data := listMailbox(mbox, options, s.GetCapabilities())
+			if data != nil {
+				l = append(l, *data)
+			}
 		}
 	}
 
@@ -253,38 +201,130 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 	return nil
 }
 
-// calculateParentFolders finds all parent folders of subscribed mailboxes.
-// This is used for LSUB command to include non-subscribed parent mailboxes
-// in the response, marking them as \Noselect.
-func calculateParentFolders(mboxes []*db.DBMailbox) map[string]bool {
-	subscribedMailboxes := make(map[string]bool)
-	for _, mbox := range mboxes {
-		if mbox.Subscribed {
-			subscribedMailboxes[mbox.Name] = true
+// matchesAnyPattern reports whether name matches any of the LIST patterns given
+// the reference name.
+func matchesAnyPattern(name, ref string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if imapserver.MatchList(name, consts.MailboxDelimiter, ref, pattern) {
+			return true
 		}
 	}
+	return false
+}
 
-	parentFolders := make(map[string]bool)
-	for subscribedName := range subscribedMailboxes {
-		parts := strings.Split(subscribedName, string(consts.MailboxDelimiter))
-		// Add all parent paths (e.g., for "A/B/C", add "A" and "A/B")
-		for i := 1; i < len(parts); i++ {
-			parentPath := strings.Join(parts[:i], string(consts.MailboxDelimiter))
-			if parentPath != "" {
-				parentFolders[parentPath] = true
+// hasSubscribedDescendant reports whether any subscribed name is a proper
+// descendant of lowerName (i.e. lives under "lowerName<delim>…"). The keys of
+// subscribedSet are already lower-cased, and lowerName must be lower-cased too.
+func hasSubscribedDescendant(lowerName, delim string, subscribedSet map[string]string) bool {
+	prefix := lowerName + delim
+	for s := range subscribedSet {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildSubscribedList implements the SUBSCRIBED selection option (RFC 5258 §3.5),
+// including RECURSIVEMATCH/CHILDINFO and subscriptions to non-existent names. It
+// returns, for names matching the pattern:
+//
+//   - every subscribed name (live → its real attributes; non-live →
+//     \NonExistent), flagged \Subscribed; and
+//   - when RECURSIVEMATCH is set, any name that is NOT itself subscribed but has
+//     a subscribed descendant, carrying a CHILDINFO (SUBSCRIBED) extended data
+//     item (plus \NonExistent when the name has no live mailbox). This is the
+//     "% wildcard returns the parent" case of RFC 3501 §6.3.9; the go-imap LSUB
+//     writer renders such CHILDINFO parents as \Noselect.
+//
+// Without RECURSIVEMATCH, only subscribed names are returned — plain
+// LIST (SUBSCRIBED) must NOT synthesize non-subscribed parents.
+//
+// subscribedSet maps LOWER(name) -> stored spelling.
+func buildSubscribedList(ref string, patterns []string, options *imap.ListOptions,
+	mboxes []*db.DBMailbox, subscribedSet map[string]string,
+	serverCaps imap.CapSet) []imap.ListData {
+
+	recursive := options.SelectRecursiveMatch
+	delim := string(consts.MailboxDelimiter)
+
+	liveByLower := make(map[string]*db.DBMailbox, len(mboxes))
+	for _, m := range mboxes {
+		liveByLower[strings.ToLower(m.Name)] = m
+	}
+
+	// Candidate universe, keyed by LOWER(name) -> display spelling: live
+	// mailboxes, subscribed names, and — for RECURSIVEMATCH — the ancestors of
+	// every subscribed name (so a non-existent parent of a subscribed child can
+	// still be reported with CHILDINFO).
+	candidates := make(map[string]string, len(mboxes)+len(subscribedSet))
+	for _, m := range mboxes {
+		candidates[strings.ToLower(m.Name)] = m.Name
+	}
+	for lname, disp := range subscribedSet {
+		if _, ok := candidates[lname]; !ok {
+			candidates[lname] = disp
+		}
+	}
+	if recursive {
+		for _, disp := range subscribedSet {
+			parts := strings.Split(disp, delim)
+			for i := 1; i < len(parts); i++ {
+				anc := strings.Join(parts[:i], delim)
+				la := strings.ToLower(anc)
+				if _, ok := candidates[la]; !ok {
+					candidates[la] = anc
+				}
 			}
 		}
 	}
-	return parentFolders
+
+	var l []imap.ListData
+	for lname, name := range candidates {
+		if !matchesAnyPattern(name, ref, patterns) {
+			continue
+		}
+		_, isSub := subscribedSet[lname]
+		hasSubChild := recursive && hasSubscribedDescendant(lname, delim, subscribedSet)
+		if !isSub && !hasSubChild {
+			continue // not subscribed and no subscribed descendant → not in SUBSCRIBED response
+		}
+
+		var data imap.ListData
+		if m, ok := liveByLower[lname]; ok {
+			md := listMailbox(m, options, serverCaps)
+			if md == nil {
+				continue // filtered out (e.g. SELECT SPECIAL-USE with no special-use)
+			}
+			data = *md
+			// listMailbox has already appended \Subscribed iff the mailbox is
+			// subscribed, which matches isSub.
+		} else {
+			// A subscribed-or-ancestor name with no live mailbox cannot carry a
+			// special-use attribute, so it is excluded from SELECT SPECIAL-USE.
+			if options.SelectSpecialUse {
+				continue
+			}
+			data = imap.ListData{
+				Mailbox: name,
+				Delim:   consts.MailboxDelimiter,
+				Attrs:   []imap.MailboxAttr{imap.MailboxAttrNonExistent},
+			}
+			if isSub {
+				data.Attrs = append(data.Attrs, imap.MailboxAttrSubscribed)
+			}
+		}
+
+		if hasSubChild {
+			data.ChildInfo = &imap.ListDataChildInfo{Subscribed: true}
+		}
+		l = append(l, data)
+	}
+	return l
 }
 
-func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.CapSet, isParentFolder bool) *imap.ListData {
+func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.CapSet) *imap.ListData {
 	attributes := []imap.MailboxAttr{}
-
-	// Add \noselect for parent folders that aren't directly subscribed
-	if isParentFolder && !mbox.Subscribed {
-		attributes = append(attributes, imap.MailboxAttrNoSelect)
-	}
 
 	// Add \noselect for shared namespace root (e.g., "Shared" for prefix "Shared/")
 	// This prevents clients from trying to SELECT the namespace prefix itself
