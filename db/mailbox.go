@@ -91,7 +91,15 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			  AND m.deleted_at IS NULL
 		)
 		SELECT
-			m.id, m.name, m.uid_validity, m.path, m.subscribed, COALESCE(m.special_use, '') AS special_use, m.created_at, m.updated_at, m.account_id,
+			m.id, m.name, m.uid_validity, m.path,
+			-- Subscription state from the name-based subscriptions table (migration
+			-- 000046) via a LEFT JOIN: the planner hashes this account's (small)
+			-- subscription set once and probes per mailbox, instead of running a
+			-- correlated per-row subplan — this scales to accounts with many
+			-- mailboxes. The (account_id, LOWER(mailbox_name)) unique index makes the
+			-- match at-most-one, so no rows are duplicated.
+			(subs.mailbox_name IS NOT NULL) AS subscribed,
+			COALESCE(m.special_use, '') AS special_use, m.created_at, m.updated_at, m.account_id,
 			-- has_children: does a direct child exist? The child's direct-parent path is
 			-- its path minus the final 16-char ancestor segment, matched by equality so the
 			-- expression index idx_mailboxes_account_parent_path (migration 000038) applies.
@@ -101,11 +109,12 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			-- exceeded the read query_timeout for accounts with tens of thousands of mailboxes.
 			EXISTS(SELECT 1 FROM mailboxes child WHERE child.account_id = m.account_id AND LEFT(child.path, LENGTH(child.path) - 16) = m.path AND child.deleted_at IS NULL) AS has_children
 		FROM accessible_mailboxes m
+		LEFT JOIN subscriptions subs ON subs.account_id = $1 AND LOWER(subs.mailbox_name) = LOWER(m.name)
 		WHERE 1=1
 	`
 
 	if subscribed {
-		query += " AND m.subscribed = TRUE"
+		query += " AND subs.mailbox_name IS NOT NULL"
 	}
 
 	// Add a consistent ordering
@@ -160,7 +169,9 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, AccountID i
 
 	// First, fetch the core mailbox details.
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT id, name, uid_validity, path, subscribed, COALESCE(special_use, ''), created_at, updated_at, account_id
+		SELECT id, name, uid_validity, path,
+			EXISTS(SELECT 1 FROM subscriptions s WHERE s.account_id = $2 AND LOWER(s.mailbox_name) = LOWER(mailboxes.name)) AS subscribed,
+			COALESCE(special_use, ''), created_at, updated_at, account_id
 		FROM mailboxes
 		WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
 	`, mailboxID, AccountID).Scan(
@@ -225,7 +236,9 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	// Use LOWER() on both sides to ensure consistent case-insensitive comparison
 	// regardless of database locale (C/POSIX locales don't lowercase non-ASCII in LOWER())
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT id, name, uid_validity, path, subscribed, COALESCE(special_use, ''), created_at, updated_at, account_id FROM (
+		SELECT id, name, uid_validity, path,
+			EXISTS(SELECT 1 FROM subscriptions s WHERE s.account_id = $1 AND LOWER(s.mailbox_name) = LOWER(sub.name)) AS subscribed,
+			COALESCE(special_use, ''), created_at, updated_at, account_id FROM (
 			-- 1) Owned by user
 			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
 			FROM mailboxes m
@@ -693,6 +706,18 @@ func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, Accou
 		if err != nil {
 			return fmt.Errorf("failed to update path for default mailbox '%s': %w", mailboxName, err)
 		}
+
+		// Default mailboxes are auto-subscribed. The subscriptions table (migration
+		// 000046) is the authoritative store, so record the subscription here for
+		// accounts provisioned after the migration (existing accounts were backfilled).
+		_, err = tx.Exec(ctx, `
+			INSERT INTO subscriptions (account_id, mailbox_name)
+			VALUES ($1, $2)
+			ON CONFLICT (account_id, LOWER(mailbox_name)) DO NOTHING
+		`, AccountID, mailboxName)
+		if err != nil {
+			return fmt.Errorf("failed to subscribe default mailbox '%s': %w", mailboxName, err)
+		}
 	}
 	return nil
 }
@@ -858,7 +883,12 @@ func (d *Database) GetMailboxMessageCountAndSizeSum(ctx context.Context, mailbox
 	return count, size, nil
 }
 
-// SetSubscribed updates the subscription status of a mailbox, but ignores unsubscribing for root folders.
+// SetMailboxSubscribed updates the subscription status of an existing mailbox by
+// ID. Subscriptions are stored in the name-based `subscriptions` table (migration
+// 000046) — this by-ID helper resolves the mailbox's name and writes there, so
+// non-IMAP callers (admin/user API, importer) stay consistent with LSUB/LIST
+// (SUBSCRIBED). Unsubscribing a default mailbox is ignored (defaults stay
+// permanently subscribed).
 func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, subscribed bool) error {
 	// First, check if the mailbox exists and belongs to the user.
 	var mboxName string
@@ -870,22 +900,20 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailbox
 		return fmt.Errorf("failed to fetch mailbox %d for subscription update: %w", mailboxID, err)
 	}
 
-	// Prevent subscription changes for default mailboxes.
-	for _, rootFolder := range consts.DefaultMailboxes {
-		if strings.EqualFold(mboxName, rootFolder) {
-			logger.Debug("Database: ignoring subscription status update for root folder", "mailbox", mboxName)
-			return nil
+	// Prevent unsubscribing default mailboxes (they stay permanently subscribed).
+	if !subscribed {
+		for _, rootFolder := range consts.DefaultMailboxes {
+			if strings.EqualFold(mboxName, rootFolder) {
+				logger.Debug("Database: ignoring unsubscribe for default mailbox", "mailbox", mboxName)
+				return nil
+			}
 		}
 	}
 
-	_, err = tx.Exec(ctx, `
-		UPDATE mailboxes SET subscribed = $1, updated_at = now() WHERE id = $2 AND account_id = $3
-	`, subscribed, mailboxID, AccountID)
-	if err != nil {
-		return fmt.Errorf("failed to update subscription status for mailbox %d: %w", mailboxID, err)
+	if subscribed {
+		return db.Subscribe(ctx, tx, AccountID, mboxName)
 	}
-
-	return nil
+	return db.Unsubscribe(ctx, tx, AccountID, mboxName)
 }
 
 func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64) error {
@@ -1112,6 +1140,15 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	`, ownerAccountID, newPath)
 	if err != nil {
 		return fmt.Errorf("failed to sync message mailbox_path after rename of mailbox %d: %w", mailboxID, err)
+	}
+
+	// Move the subscription (and its descendants) in the SAME transaction as the
+	// rename, so a crash can't leave the mailbox renamed but the subscription
+	// orphaned under the old name. Scoped to this account — the common personal
+	// rename (owner == subscriber) is fully atomic; moving every accessing user's
+	// subscription for a shared-mailbox rename is a separate concern.
+	if err := db.RenameSubscriptions(ctx, tx, AccountID, oldName, newName, string(consts.MailboxDelimiter)); err != nil {
+		return fmt.Errorf("failed to move subscriptions during rename of mailbox %d: %w", mailboxID, err)
 	}
 
 	return nil

@@ -1,24 +1,27 @@
 package imap
 
 import (
-	"errors"
+	"strings"
 
 	"github.com/migadu/sora/consts"
 )
 
-// Subscribe to a mailbox
+// Subscribe to a mailbox (RFC 3501 §6.3.6 / RFC 9051 §6.3.7). Subscriptions are
+// name-based and decoupled from mailbox existence: subscribing a name with no
+// mailbox is valid and persists, and the subscription survives the mailbox's
+// deletion.
 func (s *IMAPSession) Subscribe(mailboxName string) error {
 	return s.updateSubscriptionStatus(mailboxName, true)
 }
 
-// Unsubscribe from a mailbox
+// Unsubscribe from a mailbox.
 func (s *IMAPSession) Unsubscribe(mailboxName string) error {
 	return s.updateSubscriptionStatus(mailboxName, false)
 }
 
-// Helper function to handle both subscribe and unsubscribe logic
+// updateSubscriptionStatus handles both subscribe and unsubscribe against the
+// name-based subscription store.
 func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe bool) error {
-	// First phase: Read validation with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
 		s.InfoLog("failed to acquire read lock")
@@ -27,27 +30,26 @@ func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe boo
 	AccountID := s.AccountID()
 	release()
 
-	// Middle phase: Database operations outside lock
-	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, mailboxName)
-	if err != nil {
-		if err == consts.ErrMailboxNotFound {
-			s.InfoLog("mailbox does not exist", "mailbox", mailboxName)
-			return nil
+	// Default mailboxes are kept permanently subscribed: ignore an unsubscribe of
+	// a default name (preserves the prior SetMailboxSubscribed behavior). Subscribe
+	// of any name — including one with no mailbox — is always persisted.
+	if !subscribe {
+		for _, def := range consts.DefaultMailboxes {
+			if strings.EqualFold(mailboxName, def) {
+				s.DebugLog("ignoring unsubscribe for default mailbox", "mailbox", mailboxName)
+				return nil
+			}
 		}
-		return s.internalError("failed to fetch mailbox '%s': %v", mailboxName, err)
 	}
 
-	// Final phase: Update subscription - no locks needed as it's a DB operation
-	err = s.server.rdb.SetMailboxSubscribedWithRetry(s.ctx, mailbox.ID, AccountID, subscribe)
+	var err error
+	if subscribe {
+		err = s.server.rdb.SubscribeWithRetry(s.ctx, AccountID, mailboxName)
+	} else {
+		err = s.server.rdb.UnsubscribeWithRetry(s.ctx, AccountID, mailboxName)
+	}
 	if err != nil {
-		// The mailbox may have been deleted concurrently between the lookup
-		// above and this update (a benign TOCTOU race). Treat it the same as a
-		// missing mailbox rather than reporting a server bug.
-		if errors.Is(err, consts.ErrMailboxNotFound) {
-			s.InfoLog("mailbox removed during subscription update", "mailbox", mailboxName)
-			return nil
-		}
-		return s.internalError("failed to set subscription status for mailbox '%s': %v", mailboxName, err)
+		return s.internalError("failed to update subscription status for mailbox '%s': %v", mailboxName, err)
 	}
 
 	action := "subscribed"

@@ -1573,8 +1573,14 @@ func (rd *ResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Conte
 			return nil, fmt.Errorf("failed to fetch created mailbox '%s': %w", name, err)
 		}
 
-		// Ensure the mailbox is marked as subscribed, as expected by importer and LMTP create
-		_, err = tx.Exec(ctx, "UPDATE mailboxes SET subscribed = TRUE WHERE id = $1", mb.ID)
+		// Ensure the mailbox is subscribed, as expected by importer and LMTP create.
+		// Subscriptions are name-based (migration 000046), so record it there rather
+		// than on the vestigial mailboxes.subscribed column.
+		_, err = tx.Exec(ctx, `
+			INSERT INTO subscriptions (account_id, mailbox_name)
+			VALUES ($1, $2)
+			ON CONFLICT (account_id, LOWER(mailbox_name)) DO NOTHING
+		`, mb.AccountID, mb.Name)
 		if err != nil {
 			return nil, fmt.Errorf("failed to subscribe mailbox '%s': %w", name, err)
 		}

@@ -366,6 +366,41 @@ func (rd *ResilientDatabase) SetMailboxSubscribedWithRetry(ctx context.Context, 
 	return err
 }
 
+// SubscribeWithRetry records a name-based subscription (RFC 3501 §6.3.6),
+// decoupled from mailbox existence.
+func (rd *ResilientDatabase) SubscribeWithRetry(ctx context.Context, accountID int64, mailboxName string) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).Subscribe(ctx, tx, accountID, mailboxName)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	return err
+}
+
+// UnsubscribeWithRetry removes a name-based subscription (RFC 3501 §6.3.6).
+func (rd *ResilientDatabase) UnsubscribeWithRetry(ctx context.Context, accountID int64, mailboxName string) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).Unsubscribe(ctx, tx, accountID, mailboxName)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	return err
+}
+
+// GetSubscribedMailboxNamesWithRetry returns every subscribed name for the
+// account, including names with no live mailbox.
+func (rd *ResilientDatabase) GetSubscribedMailboxNamesWithRetry(ctx context.Context, accountID int64) ([]string, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetSubscribedMailboxNames(ctx, accountID)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.([]string), nil
+}
+
 // HasMailboxWithSpecialUseWithRetry reports whether the account already has a live
 // mailbox carrying the given special-use attribute (RFC 6154 §5 uniqueness check).
 func (rd *ResilientDatabase) HasMailboxWithSpecialUseWithRetry(ctx context.Context, accountID int64, attr string) (bool, error) {

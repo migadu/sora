@@ -51,7 +51,7 @@ func TestIMAP_RenameEmitsOldName(t *testing.T) {
 	if err := c.Create(oldName, nil).Wait(); err != nil {
 		t.Fatalf("CREATE %s failed: %v", oldName, err)
 	}
-	defer c.Delete(newName).Wait()
+	defer func() { c.Delete(newName).Wait() }()
 
 	if err := c.Rename(oldName, newName, nil).Wait(); err != nil {
 		t.Fatalf("RENAME failed: %v", err)
@@ -109,7 +109,7 @@ func TestIMAP_RenameInboxEmitsOldName(t *testing.T) {
 	}
 
 	const newName = "InboxArchive"
-	defer c.Delete(newName).Wait()
+	defer func() { c.Delete(newName).Wait() }()
 	if err := c.Rename("INBOX", newName, nil).Wait(); err != nil {
 		t.Fatalf("RENAME INBOX failed: %v", err)
 	}

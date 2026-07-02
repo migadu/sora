@@ -191,6 +191,10 @@ func (s *IMAPSession) Rename(w *imapserver.RenameWriter, existingName, newName s
 	s.DebugLog("mailbox renamed", "old_name", existingName, "new_name", newName)
 	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
 
+	// NOTE: the subscription follows the rename ATOMICALLY inside db.RenameMailbox
+	// (same transaction as the name update), so there is no separate call here — a
+	// crash can't leave the mailbox renamed but the subscription orphaned.
+
 	// RFC 9051 §6.3.6: announce the new name to IMAP4rev2 clients via an untagged
 	// LIST carrying the OLDNAME data item, before the tagged OK.
 	s.writeRenameOldName(w, existingName, newName)

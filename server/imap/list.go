@@ -34,6 +34,24 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 		return s.internalError("failed to fetch mailboxes: %v", err)
 	}
 
+	// Each mbox.Subscribed is already sourced from the name-based subscriptions
+	// table (migration 000046) by GetMailboxes. We additionally fetch the full
+	// subscribed-name set here so LSUB / LIST (SUBSCRIBED) can also report
+	// subscribed names that have NO live mailbox (RFC 3501 §6.3.6 / RFC 9051
+	// §6.3.7). subscribedSet maps LOWER(name) -> the stored spelling.
+	subNames, err := s.server.rdb.GetSubscribedMailboxNamesWithRetry(readCtx, s.AccountID())
+	if err != nil {
+		return s.internalError("failed to fetch subscriptions: %v", err)
+	}
+	subscribedSet := make(map[string]string, len(subNames))
+	for _, n := range subNames {
+		subscribedSet[strings.ToLower(n)] = n
+	}
+	liveNames := make(map[string]bool, len(mboxes))
+	for _, mbox := range mboxes {
+		liveNames[strings.ToLower(mbox.Name)] = true
+	}
+
 	var parentFolders map[string]bool
 	if options.SelectSubscribed {
 		parentFolders = calculateParentFolders(mboxes)
@@ -77,6 +95,33 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 		data := listMailbox(mbox, options, s.GetCapabilities(), isParentForLsub)
 		if data != nil {
 			l = append(l, *data)
+		}
+	}
+
+	// RFC 3501 §6.3.6 / RFC 9051 §6.3.7: for LSUB / LIST (SUBSCRIBED), also report
+	// subscribed names that have no live mailbox (subscribed-then-deleted, or
+	// subscribed-before-created), flagged \NonExistent (which implies \NoSelect) so
+	// the client knows the mailbox is not selectable.
+	if options.SelectSubscribed {
+		for lname, name := range subscribedSet {
+			if liveNames[lname] {
+				continue // already listed above as a live mailbox
+			}
+			matched := false
+			for _, pattern := range patterns {
+				if imapserver.MatchList(name, consts.MailboxDelimiter, ref, pattern) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			l = append(l, imap.ListData{
+				Mailbox: name,
+				Delim:   consts.MailboxDelimiter,
+				Attrs:   []imap.MailboxAttr{imap.MailboxAttrSubscribed, imap.MailboxAttrNonExistent},
+			})
 		}
 	}
 

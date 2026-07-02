@@ -40,17 +40,34 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 	// Check if we should filter by subscribed status
 	subscribedOnly := r.URL.Query().Get("subscribed") == "true"
 
-	// Get mailboxes from database
-	mailboxes, err := s.rdb.GetMailboxesForUserWithRetry(ctx, accountID, subscribedOnly)
+	// Get ALL mailboxes; subscription state is sourced from the name-based
+	// subscriptions table (migration 000046), not the vestigial mailboxes.subscribed
+	// column, so we filter locally rather than pushing subscribedOnly into the query.
+	mailboxes, err := s.rdb.GetMailboxesForUserWithRetry(ctx, accountID, false)
 	if err != nil {
 		logger.Warn("HTTP Mail API: Error retrieving mailboxes", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve mailboxes")
 		return
 	}
 
+	subNames, err := s.rdb.GetSubscribedMailboxNamesWithRetry(ctx, accountID)
+	if err != nil {
+		logger.Warn("HTTP Mail API: Error retrieving subscriptions", "name", s.name, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "Failed to retrieve subscriptions")
+		return
+	}
+	subscribedSet := make(map[string]bool, len(subNames))
+	for _, n := range subNames {
+		subscribedSet[strings.ToLower(n)] = true
+	}
+
 	// Convert to API response format with counts
 	mailboxInfos := make([]MailboxInfo, 0, len(mailboxes))
 	for _, mb := range mailboxes {
+		isSubscribed := subscribedSet[strings.ToLower(mb.Name)]
+		if subscribedOnly && !isSubscribed {
+			continue
+		}
 		// Get message counts
 		total, err := s.rdb.GetMessageCountForMailboxWithRetry(ctx, accountID, mb.Name)
 		if err != nil {
@@ -67,7 +84,7 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 		mailboxInfos = append(mailboxInfos, MailboxInfo{
 			Name:       mb.Name,
 			Path:       mb.Name, // Same as name for now
-			Subscribed: mb.Subscribed,
+			Subscribed: isSubscribed,
 			Total:      total,
 			Unseen:     unseen,
 			UIDNext:    0, // Will be populated when needed
