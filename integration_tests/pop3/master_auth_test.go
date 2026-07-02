@@ -87,6 +87,64 @@ func setupPOP3ServerWithMasterAuth(t *testing.T) (*common.TestServer, common.Tes
 	return ts, account
 }
 
+// TestPOP3_MasterUsernameNetworkGate covers M6: master-username auth is a
+// tenant-wide impersonation capability and must be restricted to
+// master_sasl_allowed_networks, exactly like master SASL. With correct master
+// credentials but from a source outside the allowed networks it must be rejected.
+func TestPOP3_MasterUsernameNetworkGate(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	address := common.GetRandomAddress(t)
+
+	server, err := pop3.New(
+		context.Background(), "test", "localhost", address,
+		&storage.S3Storage{}, rdb, nil, nil,
+		pop3.POP3ServerOptions{
+			InsecureAuth:       true,
+			Config:             &config.Config{},
+			MasterUsername:     masterUsername,
+			MasterPassword:     masterPassword,
+			MasterSASLUsername: masterSASLUsername,
+			MasterSASLPassword: masterSASLPassword,
+			// Allow only a network that does NOT include the loopback test client.
+			MasterSASLAllowedNetworks: []string{"10.0.0.0/8"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create POP3 server: %v", err)
+	}
+	errChan := make(chan error, 1)
+	go func() { server.Start(errChan) }()
+	time.Sleep(100 * time.Millisecond)
+	defer server.Close()
+
+	client, err := NewPOP3Client(address)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.SendCommand("USER " + account.Email + "@" + masterUsername); err != nil {
+		t.Fatalf("USER: %v", err)
+	}
+	if resp, err := client.ReadResponse(); err != nil || !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("USER should be accepted: %s (%v)", resp, err)
+	}
+	if err := client.SendCommand("PASS " + masterPassword); err != nil {
+		t.Fatalf("PASS: %v", err)
+	}
+	resp, err := client.ReadResponse()
+	if err != nil {
+		t.Fatalf("PASS read: %v", err)
+	}
+	if !strings.HasPrefix(resp, "-ERR") {
+		t.Fatalf("master-username auth from a non-allowed network must be rejected, got: %s", resp)
+	}
+	t.Logf("✓ master-username auth correctly gated by network: %s", strings.TrimSpace(resp))
+}
+
 // TestPOP3_MasterUsernameAuthentication tests USER/PASS with MasterUsername
 func TestPOP3_MasterUsernameAuthentication(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)

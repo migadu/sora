@@ -91,6 +91,115 @@ func TestPOP3ProxyInsecureAuthAutoEnabled(t *testing.T) {
 	t.Logf("✓ PASS not rejected for TLS (insecureAuth auto-enabled): %s", strings.TrimSpace(passResp))
 }
 
+// TestPOP3ProxyRejectsControlCharUsername covers L9: a NUL (or other control
+// char) in the username would add an extra field to the authz\0authn\0pass
+// master-SASL frame the proxy builds for the backend, so it is rejected at USER.
+func TestPOP3ProxyRejectsControlCharUsername(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb := common.SetupTestDatabase(t)
+	proxyAddr := common.GetRandomAddress(t)
+	proxy, err := pop3proxy.New(
+		context.Background(), "localhost", proxyAddr, rdb,
+		pop3proxy.POP3ProxyServerOptions{
+			Name:          "test-nul",
+			RemoteAddrs:   []string{"127.0.0.1:9999"},
+			InsecureAuth:  true,
+			MaxAuthErrors: 5,
+		},
+	)
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+	go func() { proxy.Start() }()
+	defer proxy.Stop()
+	time.Sleep(200 * time.Millisecond)
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadString('\n'); err != nil { // greeting
+		t.Fatalf("greeting: %v", err)
+	}
+
+	if _, err := conn.Write([]byte("USER a\x00b@example.com\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	resp, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.HasPrefix(resp, "-ERR") {
+		t.Fatalf("USER with a NUL must be rejected, got: %q", resp)
+	}
+}
+
+// TestPOP3ProxyCAPAAdvertisesTransactionCaps covers M5: the proxy answers CAPA
+// locally pre-auth and must advertise the transaction-phase capabilities the
+// backend honors (TOP/UIDL/PIPELINING/UTF8/LANG), so a client that caches this
+// CAPA does not conclude they are unsupported.
+func TestPOP3ProxyCAPAAdvertisesTransactionCaps(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb := common.SetupTestDatabase(t)
+	proxyAddr := common.GetRandomAddress(t)
+
+	proxy, err := pop3proxy.New(
+		context.Background(),
+		"localhost",
+		proxyAddr,
+		rdb,
+		pop3proxy.POP3ProxyServerOptions{
+			Name:          "test-capa",
+			RemoteAddrs:   []string{"127.0.0.1:9999"},
+			InsecureAuth:  true,
+			MaxAuthErrors: 5,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create POP3 proxy: %v", err)
+	}
+	go func() { proxy.Start() }()
+	defer proxy.Stop()
+	time.Sleep(200 * time.Millisecond)
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	if _, err := reader.ReadString('\n'); err != nil { // greeting
+		t.Fatalf("greeting read failed: %v", err)
+	}
+	fmt.Fprintf(conn, "CAPA\r\n")
+	status, err := reader.ReadString('\n')
+	if err != nil || !strings.HasPrefix(status, "+OK") {
+		t.Fatalf("CAPA status: %q err=%v", status, err)
+	}
+	caps := map[string]bool{}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading CAPA list: %v", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "." {
+			break
+		}
+		caps[strings.ToUpper(line)] = true
+	}
+	for _, want := range []string{"TOP", "UIDL", "PIPELINING", "UTF8", "LANG"} {
+		if !caps[want] {
+			t.Errorf("proxy CAPA missing %q; got %v", want, caps)
+		}
+	}
+}
+
 // TestPOP3ProxyInsecureAuthAutoEnabledAUTH is the SASL AUTH counterpart to the
 // PASS test above. It guards the H1 fix: the proxy AUTH handler now carries the
 // same TLS gate as PASS, and both must honor the insecure_auth auto-enable so a

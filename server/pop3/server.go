@@ -87,6 +87,7 @@ type POP3Server struct {
 	commandTimeout         time.Duration
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
+	maxMessageAge          time.Duration // Ephemeral-storage retention (cleanup max_age_restriction); 0 = keep forever. Drives the CAPA EXPIRE value.
 
 	// Connection tracking
 	connTracker *serverPkg.ConnectionTracker
@@ -235,6 +236,13 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		logger.Info("POP3: Using default idle timeout (RFC 1939 §3)", "name", name, "timeout", commandTimeout)
 	}
 
+	// Ephemeral-storage retention drives the CAPA EXPIRE value (RFC 2449 §5.1);
+	// 0 means messages are kept forever (EXPIRE NEVER).
+	var maxMessageAge time.Duration
+	if options.Config != nil {
+		maxMessageAge = options.Config.Cleanup.GetMaxAgeRestrictionWithDefault()
+	}
+
 	server := &POP3Server{
 		hostname:               hostname,
 		name:                   name,
@@ -260,6 +268,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
 		insecureAuth:           options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
 		minBytesPerMinute:      options.MinBytesPerMinute,
+		maxMessageAge:          maxMessageAge,
 		activeSessions:         make(map[*POP3Session]struct{}),
 	}
 

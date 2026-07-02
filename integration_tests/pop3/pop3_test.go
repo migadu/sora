@@ -387,16 +387,25 @@ func TestPOP3_CAPA(t *testing.T) {
 		t.Logf("  %s", cap)
 	}
 
-	// Check for required capabilities
-	hasUser := false
-	for _, cap := range capabilities {
-		if strings.ToUpper(cap) == "USER" {
-			hasUser = true
-			break
+	has := func(prefix string) bool {
+		for _, cap := range capabilities {
+			if strings.HasPrefix(strings.ToUpper(cap), prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	// USER is advertised because the test listener is plaintext (insecure_auth
+	// auto-enabled). PIPELINING is now advertised (L5); EXPIRE NEVER is correct
+	// with no max_age_restriction configured (M4).
+	for _, want := range []string{"TOP", "UIDL", "PIPELINING", "USER", "EXPIRE NEVER"} {
+		if !has(want) {
+			t.Errorf("CAPA missing expected capability %q; got %v", want, capabilities)
 		}
 	}
-	if !hasUser {
-		t.Log("Note: USER capability not explicitly listed (may be implicit)")
+	// LOGIN-DELAY was advertised but never enforced; it must no longer appear (L3).
+	if has("LOGIN-DELAY") {
+		t.Errorf("CAPA should not advertise unenforced LOGIN-DELAY; got %v", capabilities)
 	}
 }
 

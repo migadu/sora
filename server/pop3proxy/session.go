@@ -148,14 +148,23 @@ func (s *POP3ProxySession) handleConnection() {
 			// Advertising them on a plaintext connection where auth is refused
 			// misleads clients (RFC 2449 §6.3 / RFC 8314) and, for SASL, previously
 			// paired with the proxy actually accepting those credentials (H1).
+			// Advertise the transaction-phase capabilities the backend honors, so a
+			// client that caches this pre-auth CAPA does not wrongly conclude TOP/
+			// UIDL/UTF8/LANG are unavailable and degrade its behavior. EXPIRE is
+			// omitted because the proxy does not know the backend's retention.
 			authAllowed := s.server.insecureAuth || server.ConnIsTLS(s.clientConn)
 			writer.WriteString("+OK Capability list follows\r\n")
+			writer.WriteString("TOP\r\n")
+			writer.WriteString("UIDL\r\n")
+			writer.WriteString("PIPELINING\r\n")
 			if authAllowed {
 				writer.WriteString("USER\r\n")
 				writer.WriteString("SASL PLAIN\r\n")
 			}
 			writer.WriteString("RESP-CODES\r\n")
 			writer.WriteString("AUTH-RESP-CODE\r\n")
+			writer.WriteString("UTF8\r\n")
+			writer.WriteString("LANG\r\n")
 			writer.WriteString("IMPLEMENTATION Sora-POP3-Proxy\r\n")
 			writer.WriteString(".\r\n")
 			writer.Flush()
@@ -168,7 +177,18 @@ func (s *POP3ProxySession) handleConnection() {
 				continue
 			}
 			// Remove quotes if present for compatibility
-			s.username = server.UnquoteString(parts[1])
+			username := server.UnquoteString(parts[1])
+			// Reject control characters (NUL/CR/LF/…). A NUL in particular would add
+			// an extra field to the authz\0authn\0pass master-SASL frame the proxy
+			// builds to authenticate to the backend, desyncing the backend's parse
+			// (L9).
+			if strings.ContainsFunc(username, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+				if s.handleAuthError(writer, "-ERR Invalid username\r\n") {
+					return
+				}
+				continue
+			}
+			s.username = username
 			writer.WriteString("+OK User accepted\r\n")
 			writer.Flush()
 
@@ -297,13 +317,18 @@ func (s *POP3ProxySession) handleConnection() {
 				continue
 			}
 
-			// Decode base64
-			decoded, err := base64.StdEncoding.DecodeString(authData)
-			if err != nil {
-				if s.handleAuthError(writer, "-ERR Invalid authentication data\r\n") {
-					return
+			// Decode base64. RFC 4959 §3: a lone "=" is a present-but-empty initial
+			// response — treat it as empty rather than failing to decode "=".
+			decoded := []byte{}
+			if authData != "=" {
+				var derr error
+				decoded, derr = base64.StdEncoding.DecodeString(authData)
+				if derr != nil {
+					if s.handleAuthError(writer, "-ERR Invalid authentication data\r\n") {
+						return
+					}
+					continue
 				}
-				continue
 			}
 
 			// Parse SASL PLAIN format: [authz-id] \0 authn-id \0 password
@@ -1383,6 +1408,12 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 // that was buffered but not yet read.
 func (s *POP3ProxySession) copyReaderToConnWithDeadline(dst net.Conn, src *bufio.Reader, direction string) (int64, error) {
 	const writeDeadline = 30 * time.Second
+	// Generous backend read backstop: a steadily-streaming backend refreshes it
+	// every iteration, so it only trips on prolonged backend silence — e.g. a
+	// backend wedged mid-RETR that would otherwise block until the absolute
+	// session timeout. It is longer than the client-side idle timeout (which
+	// drops normal idle sessions first), so it never fires in normal use.
+	const backendReadDeadline = 30 * time.Minute
 	var totalBytes int64
 	buf := make([]byte, 32*1024)
 	nextDeadline := time.Now()
@@ -1392,6 +1423,12 @@ func (s *POP3ProxySession) copyReaderToConnWithDeadline(dst net.Conn, src *bufio
 		case <-s.ctx.Done():
 			return totalBytes, s.ctx.Err()
 		default:
+		}
+
+		if s.backendConn != nil {
+			if err := s.backendConn.SetReadDeadline(time.Now().Add(backendReadDeadline)); err != nil {
+				return totalBytes, fmt.Errorf("failed to set backend read deadline: %w", err)
+			}
 		}
 
 		nr, err := src.Read(buf)

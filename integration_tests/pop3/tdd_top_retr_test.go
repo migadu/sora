@@ -510,6 +510,174 @@ func TestTDD_DELE_DoubleDelete(t *testing.T) {
 	}
 }
 
+// TestTDD_DELE_QUIT_Expunges verifies the QUIT success path (guarding the M1
+// change): DELE then a clean QUIT returns +OK and the message is permanently
+// removed (RFC 1939 §6 UPDATE), so a reconnecting session no longer sees it.
+func TestTDD_DELE_QUIT_Expunges(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := SetupPOP3ServerWithUploader(t)
+	defer server.Close()
+
+	tddAppendMessage(t, server, account.Email, "From: a@b.com\r\nSubject: one\r\n\r\nbody one\r\n")
+	tddAppendMessage(t, server, account.Email, "From: a@b.com\r\nSubject: two\r\n\r\nbody two\r\n")
+
+	// Session 1: delete message 1 and QUIT cleanly.
+	conn, err := net.Dial("tcp", server.TestServer.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	reader, writer := loginClient(t, conn, account.Email, account.Password)
+
+	fmt.Fprintf(writer, "DELE 1\r\n")
+	writer.Flush()
+	if resp, _ := reader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+		conn.Close()
+		t.Fatalf("DELE 1 failed: %s", resp)
+	}
+	fmt.Fprintf(writer, "QUIT\r\n")
+	writer.Flush()
+	resp, _ := reader.ReadString('\n')
+	conn.Close()
+	if !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("QUIT after successful DELE should be +OK, got: %s", resp)
+	}
+
+	// Session 2: the deleted message must be permanently gone.
+	conn2, err := net.Dial("tcp", server.TestServer.Address)
+	if err != nil {
+		t.Fatalf("Failed to reconnect: %v", err)
+	}
+	defer conn2.Close()
+	reader2, writer2 := loginClient(t, conn2, account.Email, account.Password)
+	fmt.Fprintf(writer2, "STAT\r\n")
+	writer2.Flush()
+	resp, _ = reader2.ReadString('\n')
+	if !strings.HasPrefix(resp, "+OK 1 ") {
+		t.Errorf("after DELE+QUIT, STAT should report 1 remaining message, got: %s", resp)
+	}
+}
+
+// TestTDD_XCLIENT_RejectedAfterAuth covers the M7 fix: XCLIENT rewrites
+// security-relevant identity, so it must be refused once the session is
+// authenticated (the guard fires before the trust check, so no trusted-proxy
+// setup is needed to exercise it).
+func TestTDD_XCLIENT_RejectedAfterAuth(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := SetupPOP3ServerWithUploader(t)
+	defer server.Close()
+
+	conn, err := net.Dial("tcp", server.TestServer.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+	reader, writer := loginClient(t, conn, account.Email, account.Password)
+
+	fmt.Fprintf(writer, "XCLIENT ADDR=1.2.3.4\r\n")
+	writer.Flush()
+	resp, _ := reader.ReadString('\n')
+	if !strings.HasPrefix(resp, "-ERR") {
+		t.Fatalf("XCLIENT after authentication must be rejected, got: %s", resp)
+	}
+	if !strings.Contains(strings.ToLower(resp), "after authentication") {
+		t.Errorf("expected an 'after authentication' rejection, got: %s", resp)
+	}
+}
+
+// TestTDD_DoubleSpaceArg covers L8: a command with extra whitespace between it
+// and its argument ("LIST  1") must still parse the argument.
+func TestTDD_DoubleSpaceArg(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := SetupPOP3ServerWithUploader(t)
+	defer server.Close()
+	tddAppendMessage(t, server, account.Email, "From: a@b.com\r\nSubject: x\r\n\r\nbody\r\n")
+
+	conn, err := net.Dial("tcp", server.TestServer.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+	reader, writer := loginClient(t, conn, account.Email, account.Password)
+
+	fmt.Fprintf(writer, "LIST  1\r\n") // double space
+	writer.Flush()
+	resp, _ := reader.ReadString('\n')
+	if !strings.HasPrefix(resp, "+OK 1 ") {
+		t.Errorf("LIST with a double space should parse the argument, got: %s", resp)
+	}
+}
+
+// TestTDD_SASL_EmptyInitialResponse covers L7: RFC 4959 §3 makes a lone "=" a
+// present-but-empty initial response; it must be treated as empty (clean auth
+// failure) rather than rejected as invalid base64.
+func TestTDD_SASL_EmptyInitialResponse(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, _ := SetupPOP3ServerWithUploader(t)
+	defer server.Close()
+
+	conn, err := net.Dial("tcp", server.TestServer.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadString('\n'); err != nil { // greeting
+		t.Fatalf("greeting: %v", err)
+	}
+
+	fmt.Fprintf(conn, "AUTH PLAIN =\r\n")
+	resp, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.HasPrefix(resp, "-ERR") {
+		t.Fatalf("AUTH PLAIN = should fail auth, got: %s", resp)
+	}
+	if strings.Contains(resp, "Invalid authentication data") {
+		t.Errorf("AUTH PLAIN = should be treated as an empty IR, not invalid base64; got: %s", resp)
+	}
+}
+
+// TestTDD_LANG covers the L2 fix: RFC 6856 §3.3 requires a LANG-capable server
+// to accept the "i-default" tag, and rejections must not use a non-registered
+// [LANG] response code.
+func TestTDD_LANG(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := SetupPOP3ServerWithUploader(t)
+	defer server.Close()
+
+	conn, err := net.Dial("tcp", server.TestServer.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+	reader, writer := loginClient(t, conn, account.Email, account.Password)
+
+	for _, tag := range []string{"i-default", "en", "*"} {
+		fmt.Fprintf(writer, "LANG %s\r\n", tag)
+		writer.Flush()
+		if resp, _ := reader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+			t.Errorf("LANG %s should be accepted, got: %s", tag, resp)
+		}
+	}
+
+	// Unsupported tag → -ERR without the non-registered [LANG] response code.
+	fmt.Fprintf(writer, "LANG zz\r\n")
+	writer.Flush()
+	resp, _ := reader.ReadString('\n')
+	if !strings.HasPrefix(resp, "-ERR") {
+		t.Errorf("LANG zz should be rejected, got: %s", resp)
+	}
+	if strings.Contains(resp, "[LANG]") {
+		t.Errorf("-ERR should not use the non-registered [LANG] response code, got: %s", resp)
+	}
+}
+
 func TestTDD_AuthStateConstraints(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 

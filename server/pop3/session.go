@@ -48,6 +48,7 @@ type POP3Session struct {
 	errorsCount      int                // Number of errors encountered during the session
 	language         string             // Current language for responses (default "en")
 	utf8Mode         atomic.Bool        // UTF8 mode enabled for this session
+	xclientApplied   bool               // Whether a trusted XCLIENT has already been accepted (pre-auth, at most once)
 	releaseConn      func()             // Function to release connection from limiter
 	useMasterDB      atomic.Bool        // Pin session to master DB after a write to ensure consistency
 	startTime        time.Time
@@ -178,7 +179,11 @@ func (s *POP3Session) handleConnection() {
 			continue
 		}
 
-		parts := strings.Split(line, " ")
+		// Tokenize on runs of whitespace (strings.Fields, not Split) so a client
+		// that sends extra spaces between a command and its argument (e.g.
+		// "LIST  1") is parsed correctly rather than yielding an empty argument
+		// token (L8). Empty lines are already skipped above, so parts[0] is safe.
+		parts := strings.Fields(line)
 		cmd := strings.ToUpper(parts[0])
 
 		s.DebugLog("client command", "command", helpers.MaskSensitive(line, cmd, "PASS", "AUTH"))
@@ -212,8 +217,17 @@ func (s *POP3Session) handleConnection() {
 				writer.WriteString("USER\r\n")
 			}
 			writer.WriteString("RESP-CODES\r\n")
-			writer.WriteString("EXPIRE NEVER\r\n")
-			writer.WriteString(fmt.Sprintf("LOGIN-DELAY %d\r\n", int(Pop3ErrorDelay.Seconds())))
+			writer.WriteString("PIPELINING\r\n")
+			// EXPIRE reflects the actual retention policy (RFC 2449 §5.1): NEVER
+			// when messages are kept forever, otherwise the ephemeral-storage
+			// retention rounded down to whole days. Advertising NEVER while
+			// max_age_restriction silently expunges old mail would mislead clients
+			// that leave mail on the server.
+			if s.server.maxMessageAge <= 0 {
+				writer.WriteString("EXPIRE NEVER\r\n")
+			} else {
+				writer.WriteString(fmt.Sprintf("EXPIRE %d\r\n", int(s.server.maxMessageAge.Hours()/24)))
+			}
 			writer.WriteString("AUTH-RESP-CODE\r\n")
 			if authAllowed {
 				writer.WriteString("SASL PLAIN\r\n")
@@ -405,6 +419,21 @@ func (s *POP3Session) handleConnection() {
 			if len(s.server.masterUsername) > 0 && userAddress.HasSuffix() && checkMasterCredential(userAddress.Suffix(), s.server.masterUsername) {
 				// Suffix matches MasterUsername, authenticate with MasterPassword
 				if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+					// Network gate: master-username auth is a tenant-wide impersonation
+					// capability, exactly like master SASL — restrict it to the same
+					// allowed networks, anchored to the real socket peer so it cannot be
+					// forged via PROXY/XCLIENT forwarding.
+					if !s.server.masterSASLGate.Allowed((*s.conn).RemoteAddr()) {
+						s.WarnLog("master username credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString((*s.conn).RemoteAddr()))
+						if s.server.authLimiter != nil {
+							s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.BaseAddress(), false)
+						}
+						recordMetrics("failure")
+						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
+							return
+						}
+						continue
+					}
 					s.DebugLog("master username authentication successful", "base_address", userAddress.BaseAddress(), "master_username", userAddress.Suffix())
 					authSuccess = true
 					masterAuthUsed = true
@@ -1744,15 +1773,20 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			// Decode base64
-			decoded, err := base64.StdEncoding.DecodeString(authData)
-			if err != nil {
-				s.DebugLog("error decoding auth data", "error", err)
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR [AUTH] Invalid authentication data\r\n") {
-					return
+			// Decode base64. RFC 4959 §3: a lone "=" is a present-but-empty initial
+			// response — treat it as empty rather than trying (and failing) to
+			// base64-decode "=". Empty credentials then fail auth cleanly below.
+			decoded := []byte{}
+			if authData != "=" {
+				decoded, err = base64.StdEncoding.DecodeString(authData)
+				if err != nil {
+					s.DebugLog("error decoding auth data", "error", err)
+					recordMetrics("failure")
+					if s.handleClientError(writer, "-ERR [AUTH] Invalid authentication data\r\n") {
+						return
+					}
+					continue
 				}
-				continue
 			}
 
 			// Parse SASL PLAIN format: [authz-id] \0 authn-id \0 password
@@ -1782,6 +1816,17 @@ func (s *POP3Session) handleConnection() {
 			if parseErr == nil && len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername) {
 				// Suffix matches MasterUsername, authenticate with MasterPassword
 				if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+					// Network gate: master-username auth is a tenant-wide impersonation
+					// capability, exactly like master SASL — restrict it to the same
+					// allowed networks, anchored to the real socket peer.
+					if !s.server.masterSASLGate.Allowed((*s.conn).RemoteAddr()) {
+						s.WarnLog("master username credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString((*s.conn).RemoteAddr()))
+						recordMetrics("failure")
+						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
+							return
+						}
+						continue
+					}
 					// Determine target user to impersonate
 					targetUserToImpersonate := authzID
 					if targetUserToImpersonate == "" {
@@ -2075,14 +2120,17 @@ func (s *POP3Session) handleConnection() {
 				// LANG without arguments - list supported languages
 				writer.WriteString("+OK Language listing follows\r\n")
 				writer.WriteString("en English\r\n")
+				writer.WriteString("i-default Default\r\n")
 				writer.WriteString(".\r\n")
 			} else {
-				// LANG with language tag
+				// LANG with a language tag. Only English is available; RFC 6856 §3.3
+				// requires a LANG-capable server to also accept "i-default", and "*"
+				// requests the server's best match. ([LANG] is not a registered
+				// RFC 2449 response code, so a plain -ERR is used.)
 				langTag := strings.ToLower(parts[1])
 
-				// For now, we only support English
-				if langTag != "en" && langTag != "*" {
-					writer.WriteString("-ERR [LANG] Unsupported language\r\n")
+				if langTag != "en" && langTag != "*" && langTag != "i-default" {
+					writer.WriteString("-ERR Unsupported language\r\n")
 					writer.Flush()
 					recordMetrics("failure")
 					continue
@@ -2098,10 +2146,10 @@ func (s *POP3Session) handleConnection() {
 					continue
 				}
 
-				if langTag == "*" {
-					s.language = "en" // Default to English
+				if langTag == "i-default" {
+					s.language = "i-default"
 				} else {
-					s.language = langTag
+					s.language = "en" // "en" and "*" both select English
 				}
 				release()
 
@@ -2141,13 +2189,24 @@ func (s *POP3Session) handleConnection() {
 				return
 			}
 
+			// Whether the client marked anything for deletion this session. If it
+			// did but the UPDATE-state expunge cannot be committed (lock unavailable
+			// or DB error), RFC 1939 §6 requires reporting -ERR so the client is not
+			// told the maildrop was updated when it was not — otherwise "deleted"
+			// mail silently reappears on the next poll. (messagesDeleted counts only
+			// genuine first-time DELEs.)
+			hadDeletions := s.messagesDeleted > 0
+			commitOK := true
+
 			// Phase 1: Collect messages to expunge under a read lock.
 			var messagesToExpunge []db.POP3Message
 			var mailboxID int64
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
-				s.InfoLog("failed to acquire read lock, cannot expunge messages")
-				// Continue with QUIT, but don't expunge.
+				s.WarnLog("failed to acquire read lock at QUIT, cannot expunge deleted messages")
+				if hadDeletions {
+					commitOK = false
+				}
 			} else {
 				mailboxID = s.inboxMailboxID
 				for i, deleted := range s.deleted {
@@ -2175,7 +2234,8 @@ func (s *POP3Session) handleConnection() {
 				s.DebugLog("expunging messages", "count", len(expungeUIDs), "mailbox_id", mailboxID, "uids", expungeUIDs)
 				_, err = s.server.rdb.ExpungeMessageUIDsWithRetry(ctx, mailboxID, expungeUIDs...)
 				if err != nil {
-					s.DebugLog("error expunging messages", "mailbox_id", mailboxID, "error", err)
+					commitOK = false
+					s.WarnLog("error expunging messages at QUIT", "mailbox_id", mailboxID, "error", err)
 				} else {
 					s.DebugLog("successfully expunged messages", "count", len(expungeUIDs), "mailbox_id", mailboxID)
 					// Track for session summary
@@ -2186,6 +2246,15 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			userAddress = nil
+
+			// RFC 1939 §6: a failed UPDATE must be reported so the client knows the
+			// requested deletions were not applied.
+			if !commitOK {
+				writer.WriteString("-ERR [SYS/TEMP] some messages could not be removed; maildrop unchanged\r\n")
+				writer.Flush()
+				recordMetrics("failure")
+				return
+			}
 
 			writer.WriteString("+OK Goodbye\r\n")
 			writer.Flush()
@@ -2202,15 +2271,38 @@ func (s *POP3Session) handleConnection() {
 				metrics.CommandDuration.WithLabelValues("pop3", "XCLIENT").Observe(time.Since(start).Seconds())
 			}
 
+			// XCLIENT rewrites security-relevant identity (client IP, login, etc.),
+			// so it must only be honored pre-authentication and at most once per
+			// session. Post-auth it could rewrite an established session's
+			// attribution; a second one could feed its own client-supplied
+			// proxy-source-ip into the next trust check (M7).
+			if s.authenticated.Load() {
+				recordMetrics("failure")
+				if s.handleClientError(writer, "-ERR XCLIENT not allowed after authentication\r\n") {
+					return
+				}
+				continue
+			}
+			if s.xclientApplied {
+				recordMetrics("failure")
+				if s.handleClientError(writer, "-ERR XCLIENT already provided\r\n") {
+					return
+				}
+				continue
+			}
+
 			// Extract the arguments (everything after XCLIENT)
 			args := ""
 			if len(parts) > 1 {
 				args = strings.Join(parts[1:], " ")
 			}
 
-			s.handleXCLIENT(args, writer)
-
-			recordMetrics("success")
+			if s.handleXCLIENT(args, writer) {
+				s.xclientApplied = true
+				recordMetrics("success")
+			} else {
+				recordMetrics("failure")
+			}
 
 		case "LAST":
 			// LAST is an obsolete command from RFC 1081 (the original POP3),
