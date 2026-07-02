@@ -84,9 +84,9 @@ func TestSanitizeFlags(t *testing.T) {
 			expected: []imap.Flag{"$Valid", "$Another"},
 		},
 		{
-			name:     "Flags containing NIL as substring",
+			name:     "Flags containing NIL as substring are kept",
 			input:    []imap.Flag{"$Valid", "$NOTNIL", "$Another"},
-			expected: []imap.Flag{"$Valid", "$Another"}, // Should filter out because contains NIL
+			expected: []imap.Flag{"$Valid", "$NOTNIL", "$Another"}, // only the bare NIL/NULL tokens are dropped
 		},
 		{
 			name:     "System flags with NIL-like names",

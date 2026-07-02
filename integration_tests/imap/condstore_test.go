@@ -181,7 +181,8 @@ func TestIMAP_CondstoreFetch(t *testing.T) {
 	}
 
 	// Try to modify message 2 with UNCHANGEDSINCE using old modseq
-	// RFC 7162 §3.1.3: Server MUST return NO [MODIFIED <uid-set>] for failed preconditions
+	// RFC 7162 §3.1.3: server returns OK [MODIFIED <set>] for failed preconditions
+	// (the STORE succeeds for passing messages and skips the changed one).
 	t.Log("=== Test 5: STORE with UNCHANGEDSINCE (should return MODIFIED) ===")
 	storeCmd = c.Store(imap.SeqSetNum(2), &imap.StoreFlags{
 		Op:    imap.StoreFlagsAdd,
@@ -192,9 +193,10 @@ func TestIMAP_CondstoreFetch(t *testing.T) {
 
 	storeMsgs, err = storeCmd.Collect()
 	if err != nil {
-		// RFC 7162: Server returns NO [MODIFIED] — this is the correct behavior
-		t.Logf("✅ STORE UNCHANGEDSINCE correctly returned error: %v", err)
+		t.Logf("STORE UNCHANGEDSINCE returned error: %v", err)
 	} else if len(storeMsgs) == 0 {
+		// RFC 7162 §3.1.3: OK [MODIFIED] — the changed message is skipped (no FETCH).
+		// The go-imap client surfaces this as success with no FETCH data.
 		t.Log("✅ STORE UNCHANGEDSINCE correctly skipped message 2 (no FETCH response)")
 	} else {
 		t.Logf("⚠️  STORE UNCHANGEDSINCE returned %d messages (unexpected for failed conditional)", len(storeMsgs))

@@ -214,6 +214,9 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	}
 
 	s.selectedMailbox = mailbox
+	// RFC 3501 §6.3.2: remember whether the mailbox was opened with EXAMINE so
+	// mutating commands (STORE, EXPUNGE) can be rejected on a read-only selection.
+	s.selectedReadOnly.Store(isReadOnly)
 	s.mailboxTracker = imapserver.NewMailboxTracker(s.currentNumMessages.Load())
 	s.sessionTracker = s.mailboxTracker.NewSession()
 	s.savedSearchUIDs = nil // RFC 5182: the "$" saved result is reset on mailbox change

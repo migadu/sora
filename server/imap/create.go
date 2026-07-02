@@ -35,6 +35,20 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 		}
 	}
 
+	// RFC 3501 §6.3.3: a trailing hierarchy separator is an intent marker
+	// ("this mailbox may have inferiors"), not part of the stored name — so
+	// CREATE "foo/" creates the mailbox "foo". Trim it before the existence
+	// check, the shared-namespace check, and creation so the name is canonical.
+	name = strings.TrimRight(name, string(consts.MailboxDelimiter))
+	if name == "" {
+		s.DebugLog("rejecting empty mailbox name after trimming trailing separators")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeCannot,
+			Text: "Invalid mailbox name",
+		}
+	}
+
 	// Add config to context for shared mailbox detection
 	ctx := s.ctx
 	if s.server.config != nil {

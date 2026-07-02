@@ -3,95 +3,95 @@
 package imap_test
 
 import (
+	"bufio"
+	"fmt"
+	"net"
+	"strings"
 	"testing"
 
-	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
 )
 
-// TestSTORE_CONDSTORE_ModifiedResponse tests that STORE with UNCHANGEDSINCE
-// returns a NO [MODIFIED <uid-set>] response when the precondition fails.
-// RFC 7162 §3.1.3 requires this response.
+// TestSTORE_CONDSTORE_ModifiedResponse verifies that a STORE with a stale
+// UNCHANGEDSINCE returns a tagged OK [MODIFIED <set>] (RFC 7162 §3.1.3): the STORE
+// succeeds for the messages that pass and reports the ones it skipped because
+// their mod-sequence changed. (NO [MODIFIED] is reserved for the distinct case
+// where targeted messages no longer exist.) A UID STORE reports UIDs.
+//
+// Driven over the raw wire: the go-imap client doesn't surface the MODIFIED
+// response code on a tagged OK.
 func TestSTORE_CONDSTORE_ModifiedResponse(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	server, account := common.SetupIMAPServer(t)
 	defer server.Close()
 
-	// First client: append and modify message to establish a known MODSEQ
-	c1, err := imapclient.DialInsecure(server.Address, nil)
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	defer c1.Logout()
-
-	if err := c1.Login(account.Email, account.Password).Wait(); err != nil {
-		t.Fatalf("Login failed: %v", err)
-	}
-
-	// Append a message
-	msg := "From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: CONDSTORE Test\r\nDate: Thu, 01 Jan 2026 00:00:00 +0000\r\nMessage-ID: <condstore-test@example.com>\r\n\r\nTest body.\r\n"
-	appendCmd := c1.Append("INBOX", int64(len(msg)), nil)
-	if _, err := appendCmd.Write([]byte(msg)); err != nil {
-		t.Fatalf("Failed to write: %v", err)
-	}
-	if err := appendCmd.Close(); err != nil {
-		t.Fatalf("APPEND failed: %v", err)
-	}
-
-	// SELECT with CONDSTORE
-	selectData, err := c1.Select("INBOX", &imap.SelectOptions{}).Wait()
-	if err != nil {
-		t.Fatalf("SELECT failed: %v", err)
-	}
-	if selectData.NumMessages != 1 {
-		t.Fatalf("Expected 1 message, got %d", selectData.NumMessages)
-	}
-
-	// First STORE: set \Seen flag (this establishes a MODSEQ > 1)
-	storeCmd := c1.Store(imap.UIDSetNum(1), &imap.StoreFlags{
-		Op:    imap.StoreFlagsAdd,
-		Flags: []imap.Flag{imap.FlagSeen},
-	}, nil)
-	if err := storeCmd.Close(); err != nil {
-		t.Fatalf("First STORE failed: %v", err)
-	}
-	t.Log("First STORE succeeded (set \\Seen)")
-
-	// Second STORE: try with UNCHANGEDSINCE=1 (stale — message was modified above)
-	// This should fail with MODIFIED for UID 1
-	storeCmd2 := c1.Store(imap.UIDSetNum(1), &imap.StoreFlags{
-		Op:    imap.StoreFlagsAdd,
-		Flags: []imap.Flag{imap.FlagFlagged},
-	}, &imap.StoreOptions{
-		UnchangedSince: 1, // Stale MODSEQ — message has been modified
-	})
-	err = storeCmd2.Close()
-
-	// The server SHOULD return a NO [MODIFIED 1] or the store should indicate
-	// which UIDs were not modified. The error response should contain MODIFIED.
-	if err != nil {
-		t.Logf("STORE with stale UNCHANGEDSINCE returned error (expected): %v", err)
-		// Check if error mentions MODIFIED
-		errStr := err.Error()
-		if stringContains(errStr, "MODIFIED") || stringContains(errStr, "modified") {
-			t.Log("✓ Server correctly returned MODIFIED response code")
-		} else {
-			t.Errorf("Expected MODIFIED response code in error, got: %s", errStr)
+	// Append one message via the high-level client.
+	func() {
+		c, err := imapclient.DialInsecure(server.Address, nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
 		}
-	} else {
-		// If no error, the STORE may have silently skipped the message.
-		// RFC 7162 requires the server to report which UIDs were not modified.
-		t.Error("STORE with stale UNCHANGEDSINCE should return MODIFIED response, but succeeded silently")
-	}
-}
-
-func stringContains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
+		defer c.Logout()
+		if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+			t.Fatalf("login: %v", err)
 		}
+		msg := "From: sender@example.com\r\nTo: " + account.Email +
+			"\r\nSubject: CONDSTORE MODIFIED Test\r\n\r\nbody\r\n"
+		ac := c.Append("INBOX", int64(len(msg)), nil)
+		if _, err := ac.Write([]byte(msg)); err != nil {
+			t.Fatalf("append write: %v", err)
+		}
+		if err := ac.Close(); err != nil {
+			t.Fatalf("append close: %v", err)
+		}
+		if _, err := ac.Wait(); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}()
+
+	conn, err := net.Dial("tcp", server.Address)
+	if err != nil {
+		t.Fatalf("raw dial: %v", err)
 	}
-	return false
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	if _, err := r.ReadString('\n'); err != nil { // greeting
+		t.Fatalf("greeting: %v", err)
+	}
+	if _, err := fmt.Fprintf(conn, "a1 LOGIN \"%s\" \"%s\"\r\n", account.Email, account.Password); err != nil {
+		t.Fatalf("write LOGIN: %v", err)
+	}
+	if l := h3ReadTagged(t, r, "a1"); !strings.Contains(l, "OK") {
+		t.Fatalf("LOGIN not OK:\n%s", l)
+	}
+	if _, err := fmt.Fprintf(conn, "a2 SELECT INBOX (CONDSTORE)\r\n"); err != nil {
+		t.Fatalf("write SELECT: %v", err)
+	}
+	if l := h3ReadTagged(t, r, "a2"); !strings.Contains(l, "OK") {
+		t.Fatalf("SELECT (CONDSTORE) not OK:\n%s", l)
+	}
+	// Bump UID 1's mod-sequence so a subsequent UNCHANGEDSINCE 1 fails.
+	if _, err := fmt.Fprintf(conn, "a3 UID STORE 1 +FLAGS (\\Seen)\r\n"); err != nil {
+		t.Fatalf("write first STORE: %v", err)
+	}
+	if l := h3ReadTagged(t, r, "a3"); !strings.Contains(l, "OK") {
+		t.Fatalf("first STORE not OK:\n%s", l)
+	}
+	// Conditional UID STORE with a stale UNCHANGEDSINCE — the precondition fails.
+	if _, err := fmt.Fprintf(conn, "a4 UID STORE 1 (UNCHANGEDSINCE 1) +FLAGS (\\Flagged)\r\n"); err != nil {
+		t.Fatalf("write conditional STORE: %v", err)
+	}
+	resp := h3ReadTagged(t, r, "a4")
+	t.Logf("conditional STORE response:\n%s", strings.TrimRight(resp, "\r\n"))
+
+	// RFC 7162 §3.1.3: tagged OK (not NO), MODIFIED reporting the UID (UID STORE).
+	if !strings.Contains(resp, "a4 OK") {
+		t.Errorf("expected tagged OK for the failed-precondition STORE (RFC 7162 §3.1.3 — NO is only for "+
+			"messages that no longer exist); got:\n%s", resp)
+	}
+	if !strings.Contains(resp, "[MODIFIED 1]") {
+		t.Errorf("expected [MODIFIED 1] (UID) in the response; got:\n%s", resp)
+	}
 }

@@ -48,6 +48,18 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		}
 	}
 
+	// RFC 3501 §6.3.2: no changes to the selected mailbox are permitted when it
+	// was opened with EXAMINE (read-only).
+	if s.selectedReadOnly.Load() {
+		release()
+		s.DebugLog("store rejected: mailbox opened read-only (EXAMINE)")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCode("READ-ONLY"),
+			Text: "Mailbox is read-only (opened with EXAMINE)",
+		}
+	}
+
 	selectedMailboxID = s.selectedMailbox.ID
 	selectedMailboxOwnerID = s.selectedMailbox.AccountID
 
@@ -133,8 +145,11 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		}
 	}
 
-	// Track UIDs that fail the UNCHANGEDSINCE precondition (RFC 7162 §3.1.3)
+	// Track messages that fail the UNCHANGEDSINCE precondition (RFC 7162 §3.1.3).
+	// Both number spaces are collected so the MODIFIED response can use the same
+	// space as the command: sequence numbers for a sequence STORE, UIDs for UID STORE.
 	var failedUIDs imap.UIDSet
+	var failedSeqs imap.SeqSet
 
 	var validUIDs []imap.UID
 	seqMap := make(map[imap.UID]uint32)
@@ -156,6 +171,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 			if uint64(currentModSeq) > options.UnchangedSince {
 				s.DebugLog("CONDSTORE skipping message", "uid", msg.UID, "modseq", currentModSeq, "unchanged_since", options.UnchangedSince)
 				failedUIDs.AddNum(msg.UID)
+				failedSeqs.AddNum(msg.Seq)
 				continue
 			}
 		}
@@ -246,12 +262,18 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		}
 	}
 
-	// RFC 7162 §3.1.3: If any messages failed the UNCHANGEDSINCE check,
-	// return NO [MODIFIED <uid-set>] after sending FETCH responses for successful updates.
+	// RFC 7162 §3.1.3: report messages that failed the UNCHANGEDSINCE precondition
+	// in a MODIFIED response code, after the FETCH responses for the messages that
+	// DID update. The tagged response is OK, not NO: the STORE succeeded for the
+	// passing messages and merely skipped the ones whose mod-sequence changed (see
+	// the "d105 ... OK [MODIFIED 7,9]" example). NO [MODIFIED] is reserved for the
+	// distinct case where targeted messages no longer exist — which cannot happen
+	// here, since expunged messages are absent from GetMessagesByNumSet and never
+	// enter the failed set.
 	if len(failedUIDs) > 0 {
 		s.DebugLog("CONDSTORE: returning MODIFIED for failed UIDs", "uids", failedUIDs.String())
 
-		// Still send FETCH responses for successfully modified messages (before the NO)
+		// Still send FETCH responses for successfully modified messages (before the OK).
 		if !sanitizedStoreFlags.Silent {
 			for _, modified := range modifiedMessages {
 				m := w.CreateMessage(modified.seq)
@@ -266,9 +288,15 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 			}
 		}
 
+		// RFC 7162 §3.1.3: the MODIFIED set uses the command's number space —
+		// sequence numbers for a sequence-number STORE, UIDs for a UID STORE.
+		modifiedSet := failedUIDs.String()
+		if _, isSeqStore := numSet.(imap.SeqSet); isSeqStore {
+			modifiedSet = failedSeqs.String()
+		}
 		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCode(fmt.Sprintf("MODIFIED %s", failedUIDs.String())),
+			Type: imap.StatusResponseTypeOK,
+			Code: imap.ResponseCode(fmt.Sprintf("MODIFIED %s", modifiedSet)),
 			Text: "UNCHANGEDSINCE precondition failed for some messages",
 		}
 	}

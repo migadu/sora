@@ -212,7 +212,7 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 						"seq", update.SeqNum, "uid", update.UID, "panic", r)
 				}
 			}()
-			s.mailboxTracker.QueueExpunge(update.SeqNum)
+			s.mailboxTracker.QueueExpunge(update.SeqNum, update.UID)
 		}()
 		if panicked {
 			skippedExpunges++

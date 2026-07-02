@@ -279,8 +279,24 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 			if err != nil {
 				return fmt.Errorf("failed to delete metadata entry %q: %w", entryName, err)
 			}
+		} else if mailboxID == nil {
+			// Server-scope entry (mailbox_id IS NULL). NULLs are DISTINCT under
+			// the base UNIQUE constraint, so target the partial unique index
+			// metadata_unique_server_entry (account_id, entry_name) instead.
+			_, err := tx.Exec(ctx, `
+				INSERT INTO metadata (account_id, mailbox_id, entry_name, entry_value, updated_at)
+				VALUES ($1, NULL, $2, $3, NOW())
+				ON CONFLICT (account_id, entry_name) WHERE mailbox_id IS NULL
+				DO UPDATE SET
+					entry_value = EXCLUDED.entry_value,
+					updated_at = NOW()
+			`, accountID, entryName, *entryValue)
+			if err != nil {
+				return fmt.Errorf("failed to set server metadata entry %q: %w", entryName, err)
+			}
 		} else {
-			// Insert or update the entry
+			// Mailbox-scope entry: mailbox_id IS NOT NULL, so the base
+			// UNIQUE(account_id, mailbox_id, entry_name) constraint applies.
 			_, err := tx.Exec(ctx, `
 				INSERT INTO metadata (account_id, mailbox_id, entry_name, entry_value, updated_at)
 				VALUES ($1, $2, $3, $4, NOW())
@@ -288,7 +304,7 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 				DO UPDATE SET
 					entry_value = EXCLUDED.entry_value,
 					updated_at = NOW()
-			`, accountID, mailboxID, entryName, *entryValue)
+			`, accountID, *mailboxID, entryName, *entryValue)
 			if err != nil {
 				return fmt.Errorf("failed to set metadata entry %q: %w", entryName, err)
 			}

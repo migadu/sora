@@ -21,6 +21,17 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 			Text: "No mailbox selected",
 		}
 	}
+	// RFC 3501 §6.3.2: EXPUNGE mutates the mailbox and is not permitted on a
+	// mailbox opened read-only with EXAMINE.
+	if s.selectedReadOnly.Load() {
+		release()
+		s.DebugLog("expunge rejected: mailbox opened read-only (EXAMINE)")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCode("READ-ONLY"),
+			Text: "Mailbox is read-only (opened with EXAMINE)",
+		}
+	}
 	mailboxID := s.selectedMailbox.ID
 	AccountID := s.AccountID()
 	// RFC 5182: resolve a "$" marker (UID EXPUNGE $) to the saved search result.

@@ -372,17 +372,19 @@ func (db *Database) buildSortOrderClauseWithPrefix(sortCriteria []imap.SortCrite
 			// DISPLAYFROM: Use display name if available, fallback to email (RFC 5256)
 			orderField = fmt.Sprintf("COALESCE(%sfrom_name_sort, %sfrom_email_sort)", colPrefix, colPrefix)
 		case imap.SortKeyFrom:
-			// FROM: Use email address only
-			orderField = fmt.Sprintf("%sfrom_email_sort", colPrefix)
+			// FROM: sort by addr-mailbox (the local part) per RFC 5256 §3, not the
+			// full local@domain address. The stored column keeps the full email
+			// (DISPLAYFROM needs it); take the local part at sort time.
+			orderField = fmt.Sprintf("split_part(%sfrom_email_sort, '@', 1)", colPrefix)
 		case imap.SortKeyDisplayTo:
-			// DISPLAYTO: Use display name if available, fallback to email (RFC 5256)
+			// DISPLAYTO: Use display name if available, fallback to email (RFC 5957)
 			orderField = fmt.Sprintf("COALESCE(%sto_name_sort, %sto_email_sort)", colPrefix, colPrefix)
 		case imap.SortKeyTo:
-			// TO: Use email address only
-			orderField = fmt.Sprintf("%sto_email_sort", colPrefix)
+			// TO: sort by addr-mailbox (local part) per RFC 5256 §3.
+			orderField = fmt.Sprintf("split_part(%sto_email_sort, '@', 1)", colPrefix)
 		case imap.SortKeyCc:
-			// Use the pre-normalized sort column.
-			orderField = fmt.Sprintf("%scc_email_sort", colPrefix)
+			// CC: sort by addr-mailbox (local part) per RFC 5256 §3.
+			orderField = fmt.Sprintf("split_part(%scc_email_sort, '@', 1)", colPrefix)
 		default:
 			// If the sort key is not supported, default to uid
 			orderField = fmt.Sprintf("%suid", colPrefix)

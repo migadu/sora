@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
-	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 )
 
@@ -48,8 +48,12 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 
 		dbMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.AccountID(), mailbox)
 		if err != nil {
-			if err == pgx.ErrNoRows {
-				return nil, fmt.Errorf("mailbox not found: %s", mailbox)
+			if errors.Is(err, consts.ErrMailboxNotFound) {
+				return nil, &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeNonExistent,
+					Text: fmt.Sprintf("mailbox does not exist: %s", mailbox),
+				}
 			}
 			return nil, fmt.Errorf("failed to get mailbox: %w", err)
 		}
@@ -61,7 +65,10 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 		}
 		if !hasReadRight {
 			s.DebugLog("user does not have read permission", "mailbox", mailbox)
-			return nil, fmt.Errorf("you do not have permission to get metadata for this mailbox")
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Text: "you do not have permission to get metadata for this mailbox",
+			}
 		}
 
 		mailboxID = &dbMailbox.ID
@@ -115,8 +122,12 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 
 		dbMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.AccountID(), mailbox)
 		if err != nil {
-			if err == pgx.ErrNoRows {
-				return fmt.Errorf("mailbox not found: %s", mailbox)
+			if errors.Is(err, consts.ErrMailboxNotFound) {
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeNonExistent,
+					Text: fmt.Sprintf("mailbox does not exist: %s", mailbox),
+				}
 			}
 			return fmt.Errorf("failed to get mailbox: %w", err)
 		}
@@ -139,7 +150,10 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 			}
 			if !hasWriteRight {
 				s.DebugLog("user does not have write permission", "mailbox", mailbox)
-				return fmt.Errorf("you do not have permission to set shared metadata for this mailbox")
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Text: "you do not have permission to set shared metadata for this mailbox",
+				}
 			}
 		} else {
 			// For /private entries, just verify user has lookup permission (already verified by GetMailboxByName)
@@ -149,7 +163,10 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 			}
 			if !hasLookupRight {
 				s.DebugLog("user does not have lookup permission", "mailbox", mailbox)
-				return fmt.Errorf("you do not have permission to set metadata for this mailbox")
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Text: "you do not have permission to set metadata for this mailbox",
+				}
 			}
 		}
 

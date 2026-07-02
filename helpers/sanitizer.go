@@ -114,14 +114,13 @@ func SanitizeFlags(flags []imap.Flag) []imap.Flag {
 			continue
 		}
 
-		// Skip flags containing NIL (case-insensitive)
-		// This catches: NIL, $NIL, nil, $nil, etc.
-		if strings.Contains(flagUpper, "NIL") {
-			continue
-		}
-
-		// Skip flags containing NULL (case-insensitive)
-		if strings.Contains(flagUpper, "NULL") {
+		// Skip the IMAP NIL / NULL atoms (and their "$"-prefixed forms), which
+		// arise as parser artifacts (e.g. "Keyword used without being in FLAGS:
+		// NIL"). Match the whole token only — legitimate keywords that merely
+		// CONTAIN these substrings ("Nile", "nullable", "Manila", "$NOTNIL") are
+		// kept.
+		switch flagUpper {
+		case "NIL", "$NIL", "NULL", "$NULL":
 			continue
 		}
 

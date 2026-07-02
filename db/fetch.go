@@ -13,7 +13,13 @@ import (
 // BuildEnvelope efficiently constructs an IMAP envelope natively from a pre-fetched Message.
 func BuildEnvelope(msg *Message) (*imap.Envelope, error) {
 	var envelope imap.Envelope
-	envelope.Date = msg.InternalDate
+	// RFC 3501 §7.4.2 / RFC 9051 §7.5.2: the ENVELOPE date is the message's
+	// origination Date: header (SentDate), not the server's INTERNALDATE. Fall
+	// back to INTERNALDATE only when the message had no parseable Date: header.
+	envelope.Date = msg.SentDate
+	if envelope.Date.IsZero() {
+		envelope.Date = msg.InternalDate
+	}
 	envelope.Subject = msg.Subject
 	envelope.MessageID = msg.MessageID
 

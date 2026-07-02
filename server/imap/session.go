@@ -51,6 +51,7 @@ type IMAPSession struct {
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
 	useMasterDB           atomic.Bool // Pin session to master DB after a write to ensure consistency
+	selectedReadOnly      atomic.Bool // True when the selected mailbox was opened with EXAMINE (RFC 3501 §6.3.2)
 
 	// savedSearchUIDs holds the SEARCH RETURN (SAVE) result set referenced by
 	// "$" (RFC 5182 / RFC 9051 §6.4.4.1). It is per-session, scoped to the
@@ -407,6 +408,7 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 		s.sessionTracker.Close()
 	}
 	s.selectedMailbox = nil
+	s.selectedReadOnly.Store(false)
 	s.mailboxTracker = nil
 	s.sessionTracker = nil
 	s.currentHighestModSeq.Store(0)
