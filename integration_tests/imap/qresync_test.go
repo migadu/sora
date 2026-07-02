@@ -4,6 +4,7 @@ package imap_test
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -303,7 +304,22 @@ func TestIMAP_FetchVanished(t *testing.T) {
 	server, account := common.SetupIMAPServer(t)
 	defer server.Close()
 
-	c, err := imapclient.DialInsecure(server.Address, nil)
+	// Live VANISHED responses (RFC 7162 §3.2.10) — the non-EARLIER kind emitted
+	// during a UID FETCH — are delivered through the unilateral data handler, not
+	// through fetchCmd.Collect(). Register a handler to capture them for assertion.
+	var (
+		vanishedMu   sync.Mutex
+		vanishedUIDs imap.UIDSet
+	)
+	c, err := imapclient.DialInsecure(server.Address, &imapclient.Options{
+		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
+			Vanished: func(data *imap.VanishedData) {
+				vanishedMu.Lock()
+				vanishedUIDs = append(vanishedUIDs, data.UIDs...)
+				vanishedMu.Unlock()
+			},
+		},
+	})
 	if err != nil {
 		t.Fatalf("Failed to dial IMAP server: %v", err)
 	}
@@ -436,8 +452,27 @@ func TestIMAP_FetchVanished(t *testing.T) {
 		t.Errorf("❌ FETCH missing modified messages: UID2=%v, UID4=%v", foundUID2, foundUID4)
 	}
 
-	// TODO: Once we can access VANISHED response from go-imap, verify it contains UIDs 1 and 3
-	t.Log("⚠️  VANISHED response verification requires go-imap client extension")
+	// Verify the VANISHED response captured by the unilateral handler reports the
+	// expunged UIDs 1 and 3 (RFC 7162 §3.2.6). fetchCmd.Collect() only returns
+	// live messages; VANISHED arrives out-of-band via the handler registered above.
+	vanishedMu.Lock()
+	gotVanished := vanishedUIDs
+	vanishedMu.Unlock()
+
+	t.Logf("VANISHED reported UIDs: %v", gotVanished)
+	if !gotVanished.Contains(uids[0]) {
+		t.Errorf("❌ VANISHED missing expunged UID %d", uids[0])
+	}
+	if !gotVanished.Contains(uids[2]) {
+		t.Errorf("❌ VANISHED missing expunged UID %d", uids[2])
+	}
+	// The modified-but-live UIDs must NOT appear in VANISHED.
+	if gotVanished.Contains(uids[1]) || gotVanished.Contains(uids[3]) {
+		t.Errorf("❌ VANISHED wrongly reported a live UID: %v", gotVanished)
+	}
+	if gotVanished.Contains(uids[0]) && gotVanished.Contains(uids[2]) {
+		t.Log("✅ VANISHED reported expunged UIDs 1 and 3")
+	}
 
 	t.Log("✅ FETCH VANISHED test completed")
 }
