@@ -79,5 +79,6 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	}
 
 	s.DebugLog("mailbox soft-deleted (pending background purge)", "mailbox", mboxName)
+	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
 	return nil
 }

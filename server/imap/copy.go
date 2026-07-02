@@ -145,6 +145,13 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 		return nil, s.internalError("failed to copy messages: %v", err)
 	}
 
+	// Pin this session to the master DB (same rationale as APPEND, append.go).
+	// COPY writes into the destination mailbox; pinning gives read-your-writes so
+	// a subsequent SELECT/STATUS of the destination in this session (or a poll
+	// after copying into the currently-selected mailbox) reads the new messages
+	// from the master rather than a lagging read replica.
+	s.useMasterDB.Store(true)
+
 	// RFC 4314 §4: only flags the user has the right to set are stored on the newly
 	// created messages (\Seen↔'s', \Deleted↔'t', other flags↔'w'); a missing flag
 	// right must NOT fail the COPY. The owner holds every right, so this is a no-op

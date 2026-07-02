@@ -260,6 +260,11 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 			})
 			s.DebugLog("operation updated message", "uid", res.UID, "new_modseq", res.ModSeq)
 		}
+
+		// Pin this session to the master DB to ensure read-your-writes consistency
+		// so a subsequent FETCH or SEARCH in this session reads the new flags from
+		// the master rather than a lagging read replica.
+		s.useMasterDB.Store(true)
 	}
 
 	// RFC 7162 §3.1.3: report messages that failed the UNCHANGEDSINCE precondition

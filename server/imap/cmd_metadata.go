@@ -218,6 +218,7 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 		}
 	}
 
+	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
 	return nil
 }
 

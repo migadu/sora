@@ -144,6 +144,7 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 
 		s.DebugLog("INBOX renamed (RFC 3501): messages moved to new mailbox, INBOX preserved empty",
 			"new_name", newName)
+		s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
 		return nil
 	}
 
@@ -182,6 +183,7 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 	}
 
 	s.DebugLog("mailbox renamed", "old_name", existingName, "new_name", newName)
+	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
 	return nil
 }
 

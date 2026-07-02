@@ -82,6 +82,13 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 		return s.internalError("failed to expunge messages: %v", err)
 	}
 
+	// Pin this session to the master DB (same rationale as APPEND, append.go).
+	// Like MOVE, the RFC 3501 §7.4.1 EXPUNGE notifications are emitted entirely by
+	// the post-command poll (see the NOTE below), which reads from the pinned DB.
+	// Without the pin, a lagging read replica could compute that poll from stale
+	// data and drop the EXPUNGEs that must precede the tagged OK.
+	s.useMasterDB.Store(true)
+
 	// Notification is handled entirely by the post-command poll, exactly like
 	// MOVE (see server/imap/move.go). go-imap calls conn.poll() before writing the
 	// tagged OK, which runs Sora's DB poll; that poll detects these soft-expunges,

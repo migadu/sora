@@ -368,6 +368,7 @@ func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, m
 			return s.internalError("failed to revoke access: %v", err)
 		}
 		s.DebugLog("revoked all rights", "identifier", identifierStr, "mailbox", mailbox)
+		s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
 		return nil
 	}
 
@@ -378,6 +379,7 @@ func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, m
 	}
 
 	s.DebugLog("granted rights", "rights", finalRights, "identifier", identifierStr, "mailbox", mailbox)
+	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
 	return nil
 }
 

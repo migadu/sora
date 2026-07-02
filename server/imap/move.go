@@ -154,6 +154,14 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		return s.internalError("failed to move messages: %v", err)
 	}
 
+	// Pin this session to the master DB (same rationale as APPEND, append.go).
+	// MOVE's RFC 6851 §3.3 inline EXPUNGE notifications are emitted by the
+	// post-command poll (see the NOTE below), which reads from the pinned DB.
+	// Without the pin, a lagging read replica could compute that poll from stale
+	// data and drop the EXPUNGEs that must precede the tagged OK. Also gives
+	// read-your-writes for any subsequent command in this session.
+	s.useMasterDB.Store(true)
+
 	// Trigger spam training if configured and moving to/from Junk folder
 	if s.server.spamTraining != nil && len(messageUIDMap) > 0 {
 		s.triggerSpamTraining(s.ctx, destMailbox.ID, s.selectedMailbox.Name, dest, messageUIDMap)

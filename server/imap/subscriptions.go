@@ -55,6 +55,7 @@ func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe boo
 		action = "unsubscribed"
 	}
 	s.DebugLog("mailbox subscription changed", "mailbox", mailboxName, "action", action)
+	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
 
 	return nil
 }

@@ -223,6 +223,7 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 			return s.internalError("failed to create mailbox '%s': %v", name, err)
 		}
 		s.DebugLog("mailbox created with special-use", "mailbox", name, "special_use", specialUse)
+		s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
 		return nil
 	}
 
@@ -241,6 +242,7 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	}
 
 	s.DebugLog("mailbox created", "mailbox", name)
+	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
 	return nil
 }
 
