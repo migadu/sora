@@ -199,9 +199,9 @@ func (rd *ResilientDatabase) ListMessagesWithRetry(ctx context.Context, mailboxI
 // ListMessagesForPOP3WithRetry returns the lean POP3Message projection for the
 // mailbox. POP3 caches the whole list for the session, so the smaller per-message
 // footprint of db.POP3Message (vs db.Message) materially reduces session memory.
-func (rd *ResilientDatabase) ListMessagesForPOP3WithRetry(ctx context.Context, mailboxID int64) ([]db.POP3Message, error) {
+func (rd *ResilientDatabase) ListMessagesForPOP3WithRetry(ctx context.Context, mailboxID int64, limit int) ([]db.POP3Message, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).ListMessagesForPOP3(ctx, mailboxID)
+		return rd.getOperationalDatabaseForOperation(ctx, false).ListMessagesForPOP3(ctx, mailboxID, limit)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {

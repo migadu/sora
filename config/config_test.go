@@ -8,6 +8,22 @@ import (
 	"time"
 )
 
+// TestGetCommandTimeout_POP3RFCFloor guards the M3 fix: the default POP3 idle
+// (autologout) timeout must be at least 10 minutes per RFC 1939 §3.
+func TestGetCommandTimeout_POP3RFCFloor(t *testing.T) {
+	const rfcFloor = 10 * time.Minute
+	for _, typ := range []string{"pop3", "pop3_proxy"} {
+		s := ServerConfig{Type: typ}
+		got, err := s.GetCommandTimeout()
+		if err != nil {
+			t.Fatalf("%s: GetCommandTimeout returned error: %v", typ, err)
+		}
+		if got < rfcFloor {
+			t.Errorf("%s: default command timeout %v is below the RFC 1939 §3 10-minute floor", typ, got)
+		}
+	}
+}
+
 func TestRelayQueueConfig_CircuitBreakerDefaults(t *testing.T) {
 	cfg := RelayQueueConfig{}
 

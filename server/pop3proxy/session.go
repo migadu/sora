@@ -26,6 +26,7 @@ type POP3ProxySession struct {
 	clientConn            net.Conn
 	backendConn           net.Conn
 	backendReader         *bufio.Reader // Buffered reader from authentication phase
+	clientReader          *bufio.Reader // Buffered reader from the pre-auth phase; reused by the relay so a command pipelined with PASS/AUTH is not dropped
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	RemoteIP              string
@@ -90,6 +91,11 @@ func (s *POP3ProxySession) handleConnection() {
 	writer.Flush()
 
 	reader := bufio.NewReader(s.clientConn)
+	// Retain the pre-auth reader so the relay can keep reading from it. A client
+	// may pipeline its first transaction command in the same TCP segment as
+	// PASS/AUTH; that command lands in this reader's buffer and would be lost if
+	// the relay created a fresh reader over the raw connection (H6).
+	s.clientReader = reader
 
 	for {
 		// Set a read deadline for the client command to prevent idle connections.
@@ -136,10 +142,18 @@ func (s *POP3ProxySession) handleConnection() {
 
 		switch cmd {
 		case "CAPA":
-			// Return proxy capabilities before authentication
+			// Return proxy capabilities before authentication. Auth mechanisms
+			// (USER/PASS and SASL PLAIN) are only advertised when they can actually
+			// be used — over TLS, or when insecure_auth permits cleartext auth.
+			// Advertising them on a plaintext connection where auth is refused
+			// misleads clients (RFC 2449 §6.3 / RFC 8314) and, for SASL, previously
+			// paired with the proxy actually accepting those credentials (H1).
+			authAllowed := s.server.insecureAuth || server.ConnIsTLS(s.clientConn)
 			writer.WriteString("+OK Capability list follows\r\n")
-			writer.WriteString("USER\r\n")
-			writer.WriteString("SASL PLAIN\r\n")
+			if authAllowed {
+				writer.WriteString("USER\r\n")
+				writer.WriteString("SASL PLAIN\r\n")
+			}
 			writer.WriteString("RESP-CODES\r\n")
 			writer.WriteString("AUTH-RESP-CODE\r\n")
 			writer.WriteString("IMPLEMENTATION Sora-POP3-Proxy\r\n")
@@ -226,6 +240,17 @@ func (s *POP3ProxySession) handleConnection() {
 			return
 
 		case "AUTH":
+			// Check insecure_auth: reject SASL AUTH over non-TLS when insecure_auth
+			// is false. SASL PLAIN carries cleartext-equivalent credentials, so it
+			// must not be accepted before TLS (RFC 8314). Mirrors the PASS gate above
+			// and the backend AUTH gate; without this the proxy accepted plaintext
+			// credentials that PASS would have refused.
+			if !s.server.insecureAuth && !server.ConnIsTLS(s.clientConn) {
+				if s.handleAuthError(writer, "-ERR Authentication requires TLS connection\r\n") {
+					return
+				}
+				continue
+			}
 			authStart := time.Now()
 			if len(parts) < 2 {
 				if s.handleAuthError(writer, "-ERR Missing authentication mechanism\r\n") {
@@ -1269,7 +1294,12 @@ func isClosingError(err error) bool {
 
 // filteredCopyClientToBackend copies data from client to backend, filtering out empty commands
 func (s *POP3ProxySession) filteredCopyClientToBackend() {
-	reader := bufio.NewReader(s.clientConn)
+	// Reuse the pre-auth reader so any command the client pipelined with PASS/AUTH
+	// (already buffered during authentication) is forwarded rather than dropped.
+	reader := s.clientReader
+	if reader == nil {
+		reader = bufio.NewReader(s.clientConn)
+	}
 	writer := bufio.NewWriter(s.backendConn)
 	var totalBytesIn int64
 	defer func() {

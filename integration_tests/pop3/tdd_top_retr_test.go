@@ -354,6 +354,162 @@ func TestTDD_RETR(t *testing.T) {
 	}
 }
 
+// TestTDD_RETR_BareLFDotStuffing proves the C1 fix end-to-end: a body stored
+// with bare-LF line endings (common in imported/maildir mail) that contains a
+// line consisting solely of "." — the RFC 1939 §3 termination octet. Without
+// correct dot-stuffing plus CRLF normalization, that line is read by the client
+// as end-of-message and truncates the retrieval.
+func TestTDD_RETR_BareLFDotStuffing(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := SetupPOP3ServerWithUploader(t)
+	defer server.Close()
+
+	msgContent := "From: alice@example.com\nTo: bob@example.com\nSubject: Hi\n\nline before\n.\nline after\n"
+	tddAppendMessage(t, server, account.Email, msgContent)
+
+	conn, err := net.Dial("tcp", server.TestServer.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	reader, writer := loginClient(t, conn, account.Email, account.Password)
+
+	fmt.Fprintf(writer, "RETR 1\r\n")
+	writer.Flush()
+
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read RETR status: %v", err)
+	}
+	if !strings.HasPrefix(statusLine, "+OK") {
+		t.Fatalf("RETR failed: %s", statusLine)
+	}
+
+	multiLineContent := readEntireMultilineResponse(t, reader)
+
+	// Expected on-wire body: normalized to CRLF and the "." line byte-stuffed to "..".
+	expectedBody := "From: alice@example.com\r\nTo: bob@example.com\r\nSubject: Hi\r\n\r\nline before\r\n..\r\nline after\r\n"
+	expectedContent := expectedBody + ".\r\n"
+	if multiLineContent != expectedContent {
+		t.Errorf("Bare-LF RETR mismatch.\nExpected:\n%q\nGot:\n%q", expectedContent, multiLineContent)
+	}
+
+	// The announced octet count must equal the CRLF-normalized (unstuffed) body
+	// length so a byte-counting client reads exactly the right number of octets.
+	normalizedUnstuffed := strings.ReplaceAll(msgContent, "\n", "\r\n")
+	var octets int
+	if _, err := fmt.Sscanf(statusLine, "+OK %d octets", &octets); err != nil {
+		t.Fatalf("Failed to parse octet count from %q: %v", statusLine, err)
+	}
+	if octets != len(normalizedUnstuffed) {
+		t.Errorf("Announced octets = %d, want %d (CRLF-normalized unstuffed length)", octets, len(normalizedUnstuffed))
+	}
+}
+
+// TestTDD_STAT_SnapshotConsistency proves the H2 fix: STAT derives its count and
+// octet total from the session snapshot (the same source as LIST/UIDL/RETR),
+// excluding session-local deletions exactly once — not from live mailbox_stats.
+func TestTDD_STAT_SnapshotConsistency(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := SetupPOP3ServerWithUploader(t)
+	defer server.Close()
+
+	msg1 := "From: a@b.com\r\nSubject: one\r\n\r\nbody one\r\n"
+	msg2 := "From: a@b.com\r\nSubject: two\r\n\r\nbody two longer\r\n"
+	tddAppendMessage(t, server, account.Email, msg1)
+	tddAppendMessage(t, server, account.Email, msg2)
+
+	conn, err := net.Dial("tcp", server.TestServer.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	reader, writer := loginClient(t, conn, account.Email, account.Password)
+
+	// STAT reflects both messages and the snapshot octet total.
+	fmt.Fprintf(writer, "STAT\r\n")
+	writer.Flush()
+	resp, _ := reader.ReadString('\n')
+	var count int
+	var size int64
+	if _, err := fmt.Sscanf(resp, "+OK %d %d", &count, &size); err != nil {
+		t.Fatalf("failed to parse STAT %q: %v", resp, err)
+	}
+	if count != 2 {
+		t.Fatalf("STAT count = %d, want 2; resp=%q", count, resp)
+	}
+	if size != int64(len(msg1)+len(msg2)) {
+		t.Errorf("STAT size = %d, want %d (sum of stored sizes)", size, len(msg1)+len(msg2))
+	}
+
+	// After DELE 1, STAT must exclude it exactly once (count 1, size = msg2).
+	fmt.Fprintf(writer, "DELE 1\r\n")
+	writer.Flush()
+	if resp, _ = reader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("DELE 1 failed: %s", resp)
+	}
+	fmt.Fprintf(writer, "STAT\r\n")
+	writer.Flush()
+	resp, _ = reader.ReadString('\n')
+	if _, err := fmt.Sscanf(resp, "+OK %d %d", &count, &size); err != nil {
+		t.Fatalf("failed to parse STAT %q: %v", resp, err)
+	}
+	if count != 1 || size != int64(len(msg2)) {
+		t.Errorf("STAT after DELE = (%d, %d), want (1, %d); resp=%q", count, size, len(msg2), resp)
+	}
+}
+
+// TestTDD_DELE_DoubleDelete proves the H4 fix: a repeated DELE of an
+// already-deleted message must return "-ERR message N already deleted"
+// (RFC 1939 §5), not a second +OK.
+func TestTDD_DELE_DoubleDelete(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := SetupPOP3ServerWithUploader(t)
+	defer server.Close()
+
+	tddAppendMessage(t, server, account.Email, "From: a@b.com\r\nSubject: x\r\n\r\nbody\r\n")
+
+	conn, err := net.Dial("tcp", server.TestServer.Address)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	reader, writer := loginClient(t, conn, account.Email, account.Password)
+
+	// First DELE succeeds.
+	fmt.Fprintf(writer, "DELE 1\r\n")
+	writer.Flush()
+	resp, _ := reader.ReadString('\n')
+	if !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("first DELE should succeed, got: %s", resp)
+	}
+
+	// Second DELE of the same message must be rejected.
+	fmt.Fprintf(writer, "DELE 1\r\n")
+	writer.Flush()
+	resp, _ = reader.ReadString('\n')
+	if !strings.HasPrefix(resp, "-ERR") {
+		t.Fatalf("second DELE should return -ERR (already deleted), got: %s", resp)
+	}
+	if !strings.Contains(strings.ToLower(resp), "already deleted") {
+		t.Errorf("expected 'already deleted' in response, got: %s", resp)
+	}
+
+	// STAT must exclude the deleted message exactly once (no double-decrement).
+	fmt.Fprintf(writer, "STAT\r\n")
+	writer.Flush()
+	resp, _ = reader.ReadString('\n')
+	if !strings.HasPrefix(resp, "+OK 0 ") {
+		t.Errorf("STAT after DELE should report 0 messages, got: %s", resp)
+	}
+}
+
 func TestTDD_AuthStateConstraints(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 

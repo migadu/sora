@@ -61,12 +61,18 @@ type POP3Message struct {
 	IsUploaded  bool
 }
 
+// POP3MessageMinMemSize is the minimum heap cost of a cached POP3Message: the
+// fixed struct overhead with all variable-length string fields empty. It is the
+// per-message floor used to derive a pre-materialization row cap from a memory
+// budget (a mailbox with more than budget/POP3MessageMinMemSize messages cannot
+// fit even in the best case, so it can be rejected without loading the rest).
+const POP3MessageMinMemSize = 96 // struct fields + slice element + string headers
+
 // ApproxMemSize estimates the heap bytes retained by this cached entry, for
 // charging against the per-session memory limit. It counts a fixed struct
 // overhead plus the backing arrays of the variable-length string fields.
 func (m POP3Message) ApproxMemSize() int64 {
-	const structOverhead = 96 // struct fields + slice element + string headers
-	return int64(structOverhead + len(m.ContentHash) + len(m.S3Domain) + len(m.S3Localpart))
+	return int64(POP3MessageMinMemSize + len(m.ContentHash) + len(m.S3Domain) + len(m.S3Localpart))
 }
 
 // SearchMessageResult represents a lightweight slice of message metadata

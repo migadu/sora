@@ -103,6 +103,73 @@ func TestPOP3ProxyWithPROXYProtocol(t *testing.T) {
 	t.Log("✓ POP3 proxy with PROXY protocol test completed successfully")
 }
 
+// TestPOP3ProxyPipelinedCommandAfterPASS proves the H6 fix: a command the client
+// pipelines in the same write as PASS (buffered by the proxy during
+// authentication) is forwarded to the backend, not dropped at the auth→relay
+// handoff. If it were dropped, the STAT response below would never arrive.
+func TestPOP3ProxyPipelinedCommandAfterPASS(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			if strings.Contains(fmt.Sprintf("%v", r), "WaitGroup") {
+				t.Log("Ignoring WaitGroup race condition during test cleanup")
+				return
+			}
+			panic(r)
+		}
+	}()
+
+	common.SkipIfDatabaseUnavailable(t)
+
+	backendServer, account := common.SetupPOP3ServerWithPROXY(t)
+	defer backendServer.Close()
+
+	proxyAddress := common.GetRandomAddress(t)
+	proxy := setupPOP3ProxyWithPROXY(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address})
+	defer proxy.Close()
+
+	conn, err := net.Dial("tcp", proxyAddress)
+	if err != nil {
+		t.Fatalf("Failed to dial POP3 proxy: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+
+	// Greeting.
+	if line, _, err := reader.ReadLine(); err != nil || !strings.HasPrefix(string(line), "+OK") {
+		t.Fatalf("bad greeting: %q err=%v", line, err)
+	}
+
+	// USER first (consume its +OK) so the pipelined write below carries PASS + STAT.
+	fmt.Fprintf(conn, "USER %s\r\n", account.Email)
+	if line, _, err := reader.ReadLine(); err != nil || !strings.HasPrefix(string(line), "+OK") {
+		t.Fatalf("USER failed: %q err=%v", line, err)
+	}
+
+	// Pipeline PASS and STAT in a SINGLE write so STAT lands in the proxy's
+	// pre-auth read buffer while PASS is being processed.
+	if _, err := conn.Write([]byte(fmt.Sprintf("PASS %s\r\nSTAT\r\n", account.Password))); err != nil {
+		t.Fatalf("pipelined write failed: %v", err)
+	}
+
+	// PASS response.
+	if line, _, err := reader.ReadLine(); err != nil || !strings.HasPrefix(string(line), "+OK") {
+		t.Fatalf("PASS failed: %q err=%v", line, err)
+	}
+
+	// The pipelined STAT response must arrive. If the command were dropped at the
+	// auth→relay handoff, this read would block until the deadline.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	line, _, err := reader.ReadLine()
+	if err != nil {
+		t.Fatalf("pipelined STAT response not received (command dropped at auth→relay handoff?): %v", err)
+	}
+	if !strings.HasPrefix(string(line), "+OK") {
+		t.Fatalf("unexpected STAT response: %q", line)
+	}
+	t.Logf("✓ pipelined STAT after PASS forwarded to backend: %s", line)
+}
+
 // TestPOP3ProxyWithXCLIENT tests POP3 proxy using XCLIENT command for parameter forwarding
 func TestPOP3ProxyWithXCLIENT(t *testing.T) {
 	defer func() {

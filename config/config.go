@@ -1288,7 +1288,10 @@ func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
 	// Protocol-specific defaults
 	switch s.Type {
 	case "pop3", "pop3_proxy":
-		return 2 * time.Minute, nil // 2 minutes for POP3
+		// RFC 1939 §3: the POP3 autologout (inactivity) timer MUST be at least
+		// 10 minutes. This value is wired as the session idle timeout, so the
+		// default must not fall below that floor.
+		return 10 * time.Minute, nil
 	case "imap", "imap_proxy":
 		return 5 * time.Minute, nil // 5 minutes for IMAP
 	case "managesieve", "managesieve_proxy":

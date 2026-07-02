@@ -59,12 +59,14 @@ func buildSingleListResponse(messages []db.POP3Message, deleted map[int]bool, ms
 	return true, fmt.Sprintf("%d %d", msgNumber, messages[msgNumber-1].Size)
 }
 
-// computeDeletedStats returns the count and total size of messages marked as deleted
-// in the current session. This is used to adjust STAT results per RFC 1939 §5,
-// which requires STAT to reflect the current session state excluding DELE'd messages.
-func computeDeletedStats(messages []db.POP3Message, deleted map[int]bool) (count int, size int64) {
+// computeMaildropStats returns the count and total octet size of the messages in
+// the session snapshot that are NOT marked deleted. STAT reports the maildrop as
+// this session sees it — a fixed snapshot taken at first access (RFC 1939 §3, §5)
+// — so it is derived from the same slice LIST/UIDL/RETR use, never from live
+// database totals (which drift and would observe concurrent deliveries).
+func computeMaildropStats(messages []db.POP3Message, deleted map[int]bool) (count int, size int64) {
 	for i, msg := range messages {
-		if deleted[i] {
+		if !deleted[i] {
 			count++
 			size += int64(msg.Size)
 		}

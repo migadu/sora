@@ -355,9 +355,10 @@ func TestListResponseMessageNumbersAreOneIndexed(t *testing.T) {
 	}
 }
 
-// TestComputeDeletedStats verifies that deleted message count and size are
-// correctly computed for adjusting STAT results per RFC 1939 §5.
-func TestComputeDeletedStats(t *testing.T) {
+// TestComputeMaildropStats verifies that the non-deleted message count and size
+// (exactly what STAT reports) are correctly computed from the session snapshot,
+// excluding messages marked deleted this session per RFC 1939 §5.
+func TestComputeMaildropStats(t *testing.T) {
 	tests := []struct {
 		name          string
 		messages      []db.POP3Message
@@ -373,8 +374,8 @@ func TestComputeDeletedStats(t *testing.T) {
 				{Size: 300, UID: 3},
 			},
 			deleted:       map[int]bool{},
-			expectedCount: 0,
-			expectedSize:  0,
+			expectedCount: 3,
+			expectedSize:  600,
 		},
 		{
 			name: "one deletion",
@@ -384,8 +385,8 @@ func TestComputeDeletedStats(t *testing.T) {
 				{Size: 300, UID: 3},
 			},
 			deleted:       map[int]bool{1: true},
-			expectedCount: 1,
-			expectedSize:  200,
+			expectedCount: 2,
+			expectedSize:  400, // 100 + 300
 		},
 		{
 			name: "multiple deletions",
@@ -397,7 +398,7 @@ func TestComputeDeletedStats(t *testing.T) {
 			},
 			deleted:       map[int]bool{0: true, 2: true},
 			expectedCount: 2,
-			expectedSize:  400, // 100 + 300
+			expectedSize:  600, // 200 + 400
 		},
 		{
 			name: "all deleted",
@@ -406,8 +407,8 @@ func TestComputeDeletedStats(t *testing.T) {
 				{Size: 200, UID: 2},
 			},
 			deleted:       map[int]bool{0: true, 1: true},
-			expectedCount: 2,
-			expectedSize:  300,
+			expectedCount: 0,
+			expectedSize:  0,
 		},
 		{
 			name:          "empty mailbox",
@@ -427,7 +428,7 @@ func TestComputeDeletedStats(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			count, size := computeDeletedStats(tt.messages, tt.deleted)
+			count, size := computeMaildropStats(tt.messages, tt.deleted)
 			if count != tt.expectedCount {
 				t.Errorf("count: expected %d, got %d", tt.expectedCount, count)
 			}
@@ -435,34 +436,6 @@ func TestComputeDeletedStats(t *testing.T) {
 				t.Errorf("size: expected %d, got %d", tt.expectedSize, size)
 			}
 		})
-	}
-}
-
-// TestStatAdjustmentWithDeletions verifies the STAT adjustment logic:
-// the DB-reported count/size minus deleted messages' count/size.
-func TestStatAdjustmentWithDeletions(t *testing.T) {
-	messages := []db.POP3Message{
-		{Size: 100, UID: 1},
-		{Size: 200, UID: 2},
-		{Size: 300, UID: 3},
-	}
-
-	// DB reports total: 3 messages, 600 octets
-	dbCount := 3
-	dbSize := int64(600)
-
-	// Delete message 2 (index 1, size 200)
-	deleted := map[int]bool{1: true}
-	delCount, delSize := computeDeletedStats(messages, deleted)
-
-	adjustedCount := dbCount - delCount
-	adjustedSize := dbSize - delSize
-
-	if adjustedCount != 2 {
-		t.Errorf("adjusted count: expected 2, got %d", adjustedCount)
-	}
-	if adjustedSize != 400 {
-		t.Errorf("adjusted size: expected 400, got %d", adjustedSize)
 	}
 }
 

@@ -2,6 +2,7 @@ package pop3
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/base64"
@@ -93,6 +94,26 @@ func (s *POP3Session) setMessagesLocked(messages []db.POP3Message) error {
 	return nil
 }
 
+// pop3LoadLimit returns the maximum number of message rows to fetch when loading
+// the mailbox, so the transient slice is bounded by the session memory budget
+// BEFORE setMessagesLocked charges it. Using the per-message floor
+// (db.POP3MessageMinMemSize) means a mailbox with more rows than this cannot fit
+// even in the best case, so fetching only this many (setMessagesLocked then
+// rejects) avoids materializing a multi-GB slice for a huge mailbox. Returns 0
+// (unlimited) when no memory limit is configured. The +1 ensures a mailbox sitting
+// exactly at the boundary is still fetched and rejected rather than silently
+// truncated.
+func (s *POP3Session) pop3LoadLimit() int {
+	if s.memTracker == nil {
+		return 0
+	}
+	max := s.memTracker.MaxAllowed()
+	if max <= 0 {
+		return 0 // unlimited
+	}
+	return int(max/db.POP3MessageMinMemSize) + 1
+}
+
 func (s *POP3Session) handleConnection() {
 	defer s.cancel()
 
@@ -178,16 +199,25 @@ func (s *POP3Session) handleConnection() {
 				metrics.CommandDuration.WithLabelValues("pop3", "CAPA").Observe(time.Since(start).Seconds())
 			}
 
-			// CAPA command - list server capabilities
+			// CAPA command - list server capabilities. Auth mechanisms (USER/PASS
+			// and SASL PLAIN) are only advertised when they can actually be used —
+			// over TLS, or when insecure_auth permits cleartext auth. Advertising
+			// them on a plaintext connection where auth is refused misleads clients
+			// (RFC 2449 §6.3 / RFC 8314).
+			authAllowed := s.server.insecureAuth || server.ConnIsTLS(*s.conn)
 			writer.WriteString("+OK Capability list follows\r\n")
 			writer.WriteString("TOP\r\n")
 			writer.WriteString("UIDL\r\n")
-			writer.WriteString("USER\r\n")
+			if authAllowed {
+				writer.WriteString("USER\r\n")
+			}
 			writer.WriteString("RESP-CODES\r\n")
 			writer.WriteString("EXPIRE NEVER\r\n")
 			writer.WriteString(fmt.Sprintf("LOGIN-DELAY %d\r\n", int(Pop3ErrorDelay.Seconds())))
 			writer.WriteString("AUTH-RESP-CODE\r\n")
-			writer.WriteString("SASL PLAIN\r\n")
+			if authAllowed {
+				writer.WriteString("SASL PLAIN\r\n")
+			}
 			writer.WriteString("LANG\r\n")
 			writer.WriteString("UTF8\r\n")
 			writer.WriteString("IMPLEMENTATION Sora-POP3-Server\r\n")
@@ -578,13 +608,7 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
-			// Create a context for read operations that respects session pinning (atomic read, no lock needed)
-			readCtx := ctx
-			if s.useMasterDB.Load() {
-				readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-			}
-
-			// Acquire read lock to check inbox mailbox ID and compute deleted adjustments
+			// Acquire read lock to check loading needs
 			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 			if !acquired {
 				s.WarnLog("failed to acquire read lock within timeout")
@@ -593,33 +617,66 @@ func (s *POP3Session) handleConnection() {
 				recordMetrics("failure")
 				continue
 			}
-
 			mailboxID := s.inboxMailboxID
-			// RFC 1939 §5: STAT must exclude messages marked as deleted in this session.
-			// Compute the count and size of deleted messages to subtract from DB totals.
-			deletedCount, deletedSize := computeDeletedStats(s.messages, s.deleted)
+			needsLoading := (s.messages == nil)
 			release()
 
-			messagesCount, size, err := s.server.rdb.GetMailboxMessageCountAndSizeSumWithRetry(readCtx, mailboxID)
-			if err != nil {
-				s.DebugLog("stat error", "error", err)
-				writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
+			// Load the session snapshot if not yet loaded. STAT reports the
+			// maildrop as this session sees it, computed from the same fixed
+			// snapshot as LIST/UIDL/RETR — not from live DB totals, which drift
+			// (mailbox_stats) and would observe concurrent deliveries mid-session
+			// (RFC 1939 §3 requires a stable per-session maildrop view).
+			if needsLoading {
+				// Create a context for read operations that respects session pinning (atomic read, no lock needed)
+				readCtx := ctx
+				if s.useMasterDB.Load() {
+					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+				}
+
+				messages, err := s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
+				if err != nil {
+					s.DebugLog("stat error", "error", err)
+					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
+					writer.Flush()
+					recordMetrics("failure")
+					continue
+				}
+
+				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+				if !acquired {
+					s.WarnLog("failed to acquire write lock within timeout")
+					writer.WriteString("-ERR Server busy, please try again\r\n")
+					writer.Flush()
+					recordMetrics("failure")
+					continue
+				}
+				storeErr := s.setMessagesLocked(messages)
+				if storeErr == nil {
+					s.DebugLog("loaded messages from database", "count", len(messages), "mailbox_id", mailboxID)
+				}
+				release()
+				if storeErr != nil {
+					writer.WriteString("-ERR [SYS/TEMP] Mailbox too large to open in this session\r\n")
+					writer.Flush()
+					recordMetrics("failure")
+					continue
+				}
+			}
+
+			// Compute count/size from the snapshot, excluding session-local
+			// deletions (RFC 1939 §5).
+			acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
+			if !acquired {
+				s.WarnLog("failed to acquire read lock within timeout")
+				writer.WriteString("-ERR Server busy, please try again\r\n")
 				writer.Flush()
 				recordMetrics("failure")
 				continue
 			}
+			statCount, statSize := computeMaildropStats(s.messages, s.deleted)
+			release()
 
-			// Adjust for session-local deletions
-			adjustedCount := messagesCount - deletedCount
-			adjustedSize := size - deletedSize
-			if adjustedCount < 0 {
-				adjustedCount = 0
-			}
-			if adjustedSize < 0 {
-				adjustedSize = 0
-			}
-
-			writer.WriteString(fmt.Sprintf("+OK %d %d\r\n", adjustedCount, adjustedSize))
+			writer.WriteString(fmt.Sprintf("+OK %d %d\r\n", statCount, statSize))
 
 			recordMetrics("success")
 
@@ -671,7 +728,7 @@ func (s *POP3Session) handleConnection() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
 
-				messages, err := s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID)
+				messages, err := s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
 				if err != nil {
 					s.DebugLog("list error", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
@@ -818,7 +875,7 @@ func (s *POP3Session) handleConnection() {
 				if s.useMasterDB.Load() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
-				messages, err := s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID)
+				messages, err := s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
 				if err != nil {
 					s.DebugLog("uidl error", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
@@ -994,7 +1051,7 @@ func (s *POP3Session) handleConnection() {
 				if s.useMasterDB.Load() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
-				loadedMessages, err = s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID)
+				loadedMessages, err = s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
 				if err != nil {
 					s.DebugLog("top error", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
@@ -1236,7 +1293,7 @@ func (s *POP3Session) handleConnection() {
 				if s.useMasterDB.Load() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
-				loadedMessages, err = s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID)
+				loadedMessages, err = s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
 				if err != nil {
 					s.DebugLog("retr error", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
@@ -1353,15 +1410,24 @@ func (s *POP3Session) handleConnection() {
 				s.WarnLog("body size mismatch", "uid", msg.UID, "expected", msg.Size, "got", len(bodyData))
 			}
 
-			// Dot-stuff the message body per RFC 1939 to prevent premature termination
-			stuffedBody := dotStuffPOP3(string(bodyData))
-
+			// Stream the body to the client as a CRLF-normalized, dot-stuffed
+			// multiline response (RFC 1939 §3). Normalizing bare-LF (common in
+			// imported/maildir mail) keeps the framing well-formed and stops a lone
+			// "." line from being read as end-of-message. Streaming avoids buffering
+			// the whole stuffed message + a concatenation copy in memory. The
+			// announced octet count is the CRLF-normalized (unstuffed) length — the
+			// exact number of body octets the client reconstructs — so byte-counting
+			// clients stay in sync.
 			backendDuration = time.Since(retrieveStart).Seconds()
-			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", msg.Size))
-			if strings.HasSuffix(stuffedBody, "\r\n") {
-				writer.WriteString(stuffedBody + ".\r\n")
+			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", crlfNormalizedLen(bodyData)))
+			writeDotStuffedBody(writer, bodyData)
+			// Terminate with <CRLF>.<CRLF>. If the body already ended with a newline
+			// the stream ends in CRLF, so only ".CRLF" is needed; otherwise the
+			// terminator supplies the missing CRLF first.
+			if n := len(bodyData); n > 0 && bodyData[n-1] == '\n' {
+				writer.WriteString(".\r\n")
 			} else {
-				writer.WriteString(stuffedBody + "\r\n.\r\n")
+				writer.WriteString("\r\n.\r\n")
 			}
 			s.DebugLog("retrieved message", "uid", msg.UID)
 
@@ -1511,7 +1577,7 @@ func (s *POP3Session) handleConnection() {
 				if s.useMasterDB.Load() {
 					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 				}
-				loadedMessages, err = s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID)
+				loadedMessages, err = s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
 				if err != nil {
 					s.DebugLog("dele error", "error", err)
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
@@ -1560,6 +1626,20 @@ func (s *POP3Session) handleConnection() {
 				s.DebugLog("dele no such message", "msg_number", msgNumber)
 				recordMetrics("failure")
 				if s.handleClientError(writer, "-ERR No such message\r\n") {
+					return
+				}
+				continue
+			}
+
+			// Reject a repeat DELE of an already-marked message per RFC 1939 §5
+			// ("-ERR message N already deleted"). Without this the second DELE
+			// returned +OK and double-incremented the deleted counter, diverging
+			// the session summary from the actual expunge set.
+			if s.deleted[msgNumber-1] {
+				release()
+				s.DebugLog("dele already deleted", "msg_number", msgNumber)
+				recordMetrics("failure")
+				if s.handleClientError(writer, fmt.Sprintf("-ERR message %d already deleted\r\n", msgNumber)) {
 					return
 				}
 				continue
@@ -2580,20 +2660,70 @@ func checkMasterCredential(provided string, actual []byte) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), actual) == 1
 }
 
-// dotStuffPOP3 performs byte-stuffing per RFC 1939 Section 3.
-// Any line beginning with a termination octet (.) must be prepended with another dot.
-// This prevents premature message termination when the body contains lines starting with "."
-func dotStuffPOP3(data string) string {
-	// Fast path: if no dots at line start, return as-is
-	if !strings.Contains(data, "\r\n.") && !strings.HasPrefix(data, ".") {
-		return data
+// crlfNormalizedLen returns the byte length the body would have once every line
+// ending is normalized to CRLF, without allocating. This is the octet count RETR
+// announces (RFC 1939 §5) — the exact number of body octets a client reconstructs
+// after un-stuffing. It is len(body) plus one for each bare LF (an LF not preceded
+// by CR); lone CR bytes are not line terminators in POP3 and are left unchanged.
+func crlfNormalizedLen(body []byte) int {
+	n := len(body)
+	for i := 0; i < len(body); i++ {
+		if body[i] == '\n' && (i == 0 || body[i-1] != '\r') {
+			n++
+		}
 	}
+	return n
+}
 
+// writeDotStuffedBody streams a message body to w as a CRLF-normalized,
+// dot-stuffed POP3 payload (RFC 1939 §3), WITHOUT the trailing terminator. It
+// splits on LF, strips a trailing CR from each line, and byte-stuffs any leading
+// '.'. Writing straight into the buffered writer keeps peak memory at O(buffer
+// size) instead of allocating the whole stuffed message plus a concatenation
+// copy — important when many sessions RETR large messages concurrently. Because
+// it normalizes bare-LF (common in imported/maildir mail) it also prevents a
+// lone "." line from being read as the end-of-message terminator. Write errors
+// are recorded (stickily) by the bufio writer and surfaced at the next Flush,
+// matching how the surrounding command handlers treat writes.
+func writeDotStuffedBody(w *bufio.Writer, body []byte) {
+	for i := 0; i < len(body); {
+		j := bytes.IndexByte(body[i:], '\n')
+		terminated := j >= 0
+		var line []byte
+		if terminated {
+			line = body[i : i+j]
+			i += j + 1
+		} else {
+			line = body[i:]
+			i = len(body)
+		}
+		// Strip a trailing CR so an existing CRLF pair is not doubled on re-emit.
+		if n := len(line); n > 0 && line[n-1] == '\r' {
+			line = line[:n-1]
+		}
+		if len(line) > 0 && line[0] == '.' {
+			_ = w.WriteByte('.')
+		}
+		_, _ = w.Write(line)
+		if terminated {
+			_, _ = w.WriteString("\r\n")
+		}
+	}
+}
+
+// dotStuffPOP3 byte-stuffs any line beginning with the termination octet '.'
+// per RFC 1939 §3 and normalizes line endings to CRLF. It splits on LF (not
+// CRLF) and strips a trailing CR from each line, so stuffing is applied
+// correctly even when the stored body uses bare-LF or mixed endings — a
+// missing stuff on a bare-LF "." line would let a client read that line as the
+// end-of-message terminator and truncate the message.
+func dotStuffPOP3(data string) string {
 	var result strings.Builder
 	result.Grow(len(data) + 64) // Pre-allocate with some buffer for stuffing
 
-	lines := strings.Split(data, "\r\n")
+	lines := strings.Split(data, "\n")
 	for i, line := range lines {
+		line = strings.TrimSuffix(line, "\r")
 		if strings.HasPrefix(line, ".") {
 			result.WriteString(".")
 		}
