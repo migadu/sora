@@ -139,9 +139,9 @@ func (m *meteredSession) Delete(mboxName string) error {
 	return err
 }
 
-func (m *meteredSession) Rename(existingName, newName string, options *imap.RenameOptions) error {
+func (m *meteredSession) Rename(w *imapserver.RenameWriter, existingName, newName string, options *imap.RenameOptions) error {
 	start := time.Now()
-	err := m.IMAPSession.Rename(existingName, newName, options)
+	err := m.IMAPSession.Rename(w, existingName, newName, options)
 	m.recordCommand("RENAME", start, err)
 	return err
 }

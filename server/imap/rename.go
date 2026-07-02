@@ -6,11 +6,12 @@ import (
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 )
 
-func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameOptions) error {
+func (s *IMAPSession) Rename(w *imapserver.RenameWriter, existingName, newName string, options *imap.RenameOptions) error {
 	// First phase: Read validation with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
@@ -145,6 +146,11 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 		s.DebugLog("INBOX renamed (RFC 3501): messages moved to new mailbox, INBOX preserved empty",
 			"new_name", newName)
 		s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
+
+		// RFC 9051 §6.3.6: RENAME INBOX is still a RENAME as far as the client is
+		// concerned — the SHOULD-send-OLDNAME applies so a rev2 client learns where
+		// the old INBOX contents now live (a fresh empty INBOX is left behind).
+		s.writeRenameOldName(w, existingName, newName)
 		return nil
 	}
 
@@ -184,7 +190,28 @@ func (s *IMAPSession) Rename(existingName, newName string, options *imap.RenameO
 
 	s.DebugLog("mailbox renamed", "old_name", existingName, "new_name", newName)
 	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
+
+	// RFC 9051 §6.3.6: announce the new name to IMAP4rev2 clients via an untagged
+	// LIST carrying the OLDNAME data item, before the tagged OK.
+	s.writeRenameOldName(w, existingName, newName)
 	return nil
+}
+
+// writeRenameOldName sends the RFC 9051 §6.3.6 OLDNAME notification for a
+// successful RENAME: `* LIST () "<delim>" newName ("OLDNAME" (oldName))`.
+// WriteOldName is itself a no-op for non-IMAP4rev2 sessions. The rename is
+// already committed by the time we get here, so a failed write (typically a dead
+// connection) is logged rather than surfaced as a command error — returning NO
+// for a rename that actually happened would desync the client.
+func (s *IMAPSession) writeRenameOldName(w *imapserver.RenameWriter, oldName, newName string) {
+	if err := w.WriteOldName(&imap.ListData{
+		Mailbox: newName,
+		Delim:   consts.MailboxDelimiter,
+		OldName: oldName,
+	}); err != nil {
+		s.WarnLog("failed to write OLDNAME LIST response after RENAME",
+			"old_name", oldName, "new_name", newName, "error", err)
+	}
 }
 
 // resolveOrCreateParentPath returns the mailbox ID of newParentPath, auto-creating
