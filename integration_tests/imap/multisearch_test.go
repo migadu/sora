@@ -55,7 +55,7 @@ func TestIMAP_MultiSearch_Integration(t *testing.T) {
 		}
 	}
 
-	// 1. Basic MULTISEARCH across all mailboxes
+	// 1. Basic multi-mailbox ESEARCH: IN (mailboxes (INBOX Archive Trash)).
 	t.Run("CrossMailboxSearch", func(t *testing.T) {
 		opts := &imap.SearchOptions{
 			ReturnAll: true,
@@ -65,19 +65,29 @@ func TestIMAP_MultiSearch_Integration(t *testing.T) {
 			Header: []imap.SearchCriteriaHeaderField{{Key: "Subject", Value: "test message"}},
 		}
 
-		results, err := c.UIDMultiSearch(mailboxes, criteria, opts).Wait()
+		source := &imap.SearchSource{Mailboxes: mailboxes}
+		results, err := c.MultiSearch(source, criteria, opts).Wait()
 		if err != nil {
-			t.Fatalf("MULTISEARCH failed: %v", err)
+			t.Fatalf("ESEARCH failed: %v", err)
 		}
 
-		// With the go-imap client fix, it now returns the array of SearchData.
-		// We expect 3 mailboxes, so we should get 3 ESEARCH results.
+		// One ESEARCH response per matched mailbox — we expect all 3.
 		if len(results) != 3 {
 			t.Fatalf("Expected 3 SearchData results, got %d", len(results))
 		}
+		// RFC 7377 §2.1: each result must carry its Mailbox and (non-zero)
+		// UIDVALIDITY so the returned UIDs are unambiguous.
+		for _, r := range results {
+			if r.Mailbox == "" {
+				t.Errorf("result missing Mailbox: %+v", r)
+			}
+			if r.UIDValidity == 0 {
+				t.Errorf("result for %q missing UIDVALIDITY", r.Mailbox)
+			}
+		}
 	})
 
-	// 2. Test empty result suppression (RFC 7377)
+	// 2. Test empty result suppression (RFC 7377 §2.1).
 	t.Run("EmptyResultSuppression", func(t *testing.T) {
 		opts := &imap.SearchOptions{
 			ReturnAll: true,
@@ -88,9 +98,10 @@ func TestIMAP_MultiSearch_Integration(t *testing.T) {
 			Header: []imap.SearchCriteriaHeaderField{{Key: "Subject", Value: "test message INBOX"}},
 		}
 
-		results, err := c.UIDMultiSearch(mailboxes, criteria, opts).Wait()
+		source := &imap.SearchSource{Mailboxes: mailboxes}
+		results, err := c.MultiSearch(source, criteria, opts).Wait()
 		if err != nil {
-			t.Fatalf("MULTISEARCH failed: %v", err)
+			t.Fatalf("ESEARCH failed: %v", err)
 		}
 
 		if len(results) != 1 {

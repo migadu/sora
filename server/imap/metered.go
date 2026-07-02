@@ -232,9 +232,9 @@ func (m *meteredSession) Thread(numKind imapserver.NumKind, algorithm imap.Threa
 	return data, err
 }
 
-func (m *meteredSession) MultiSearch(numKind imapserver.NumKind, mailboxes []string, criteria *imap.SearchCriteria, options *imap.SearchOptions) ([]*imap.SearchData, error) {
+func (m *meteredSession) MultiSearch(source *imap.SearchSource, criteria *imap.SearchCriteria, options *imap.SearchOptions) ([]*imap.SearchData, error) {
 	start := time.Now()
-	data, err := m.IMAPSession.MultiSearch(numKind, mailboxes, criteria, options)
+	data, err := m.IMAPSession.MultiSearch(source, criteria, options)
 	m.recordCommand("MULTISEARCH", start, err)
 	return data, err
 }
