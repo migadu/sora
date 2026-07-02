@@ -6,10 +6,23 @@ import (
 	"strings"
 )
 
-// RFC 5322 compliant email validation regex
-// This allows for more valid email addresses than the previous regex
-const LocalPartRegex = `^(?i)(?:[a-z0-9!#$%&'*+=?^_\{\|\}~-])+(?:\.(?:[a-z0-9!#$%&'*+=?^_\{\|\}~-])+)*$`
+// RFC 5321/5322 compliant email validation regex (dot-string local part).
+// The character class is the full set of atext (RFC 5322 §3.2.3):
+//
+//	"!" "#" "$" "%" "&" "'" "*" "+" "-" "/" "=" "?" "^" "_" "`" "{" "|" "}" "~"
+//
+// plus ALPHA and DIGIT. In particular "/" and "`" (\x60) must be allowed:
+// many ESPs use base64/VERP-style reverse-paths (e.g. Constant Contact) whose
+// local part contains "/", and rejecting them bounces legitimate mail.
+const LocalPartRegex = `^(?i)(?:[a-z0-9!#$%&'*+/=?^_\x60\{\|\}~-])+(?:\.(?:[a-z0-9!#$%&'*+/=?^_\x60\{\|\}~-])+)*$`
 const DomainNameRegex = `^(?i)(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`
+
+// Precompiled once at package init — NewAddress is on the hot path for every
+// LMTP MAIL/RCPT, so avoid recompiling the regexes on each call.
+var (
+	localPartRe  = regexp.MustCompile(LocalPartRegex)
+	domainNameRe = regexp.MustCompile(DomainNameRegex)
+)
 
 // Length limits for email addresses
 // Note: RFC 5321 specifies 64 for local part, but SRS (Sender Rewriting Scheme)
@@ -164,7 +177,7 @@ func NewAddress(input string) (Address, error) {
 	}
 
 	// Validate local part format
-	if !regexp.MustCompile(LocalPartRegex).MatchString(localPart) {
+	if !localPartRe.MatchString(localPart) {
 		return Address{}, fmt.Errorf("unacceptable local part: '%s'", localPart)
 	}
 
@@ -174,7 +187,7 @@ func NewAddress(input string) (Address, error) {
 	}
 
 	// Validate domain format
-	if !regexp.MustCompile(DomainNameRegex).MatchString(domain) {
+	if !domainNameRe.MatchString(domain) {
 		return Address{}, fmt.Errorf("unacceptable domain: '%s'", domain)
 	}
 

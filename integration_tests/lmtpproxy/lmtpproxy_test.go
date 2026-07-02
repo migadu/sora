@@ -331,6 +331,128 @@ func TestLMTPProxyWithPROXYProtocol(t *testing.T) {
 	}
 }
 
+// TestLMTPProxy_NullSenderDelivery delivers a bounce-style message with a null
+// sender (MAIL FROM:<>) THROUGH the proxy, exercising the DATA pipe path.
+//
+// This reproduces the strela → sora:24 scenario where a bounce with an empty
+// reverse-path appeared to get stuck ("DATA final response: ... i/o timeout").
+// The read deadline before the final response is the key guard: if the proxy or
+// backend ever hangs on a null sender, this fails fast with a clear message
+// instead of blocking until the global test timeout — the same symptom strela
+// sees as an i/o timeout on the DATA final response.
+func TestLMTPProxy_NullSenderDelivery(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	backendServer, account := common.SetupLMTPServerWithPROXY(t)
+	defer backendServer.Close()
+
+	proxyAddress, proxyWrapper := setupLMTPProxyWithPROXY(t, backendServer.Address)
+	defer proxyWrapper.Close()
+
+	client, err := NewLMTPClient(proxyAddress)
+	if err != nil {
+		t.Fatalf("Failed to connect to LMTP proxy: %v", err)
+	}
+	defer client.Close()
+
+	// LHLO
+	if err := client.SendCommand("LHLO localhost"); err != nil {
+		t.Fatalf("Failed to send LHLO: %v", err)
+	}
+	if _, err := client.ReadMultilineResponse(); err != nil {
+		t.Fatalf("Failed to read LHLO response: %v", err)
+	}
+
+	// MAIL FROM:<> — null sender, per RFC 5321 used for bounces/DSNs
+	if err := client.SendCommand("MAIL FROM:<>"); err != nil {
+		t.Fatalf("Failed to send MAIL FROM: %v", err)
+	}
+	response, err := client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read MAIL FROM response: %v", err)
+	}
+	if !strings.HasPrefix(response, "250") {
+		t.Fatalf("Expected 250 to MAIL FROM:<> (null sender), got: %s", response)
+	}
+	t.Logf("✓ Null sender accepted by proxy: %s", response)
+
+	// RCPT TO
+	if err := client.SendCommand(fmt.Sprintf("RCPT TO:<%s>", account.Email)); err != nil {
+		t.Fatalf("Failed to send RCPT TO: %v", err)
+	}
+	response, err = client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read RCPT TO response: %v", err)
+	}
+	if !strings.HasPrefix(response, "250") {
+		t.Fatalf("Expected 250 to RCPT TO, got: %s", response)
+	}
+
+	// DATA
+	if err := client.SendCommand("DATA"); err != nil {
+		t.Fatalf("Failed to send DATA: %v", err)
+	}
+	response, err = client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read DATA response: %v", err)
+	}
+	if !strings.HasPrefix(response, "354") {
+		t.Fatalf("Expected 354 to DATA, got: %s", response)
+	}
+
+	// Typical bounce/DSN body, dot-terminated.
+	message := "From: MAILER-DAEMON@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Delivery Status Notification (Failure)\r\n" +
+		"Auto-Submitted: auto-replied\r\n" +
+		"Content-Type: multipart/report; report-type=delivery-status\r\n" +
+		"\r\n" +
+		"This is a delivery failure notification.\r\n" +
+		".\r\n"
+	if _, err := client.conn.Write([]byte(message)); err != nil {
+		t.Fatalf("Failed to send message data: %v", err)
+	}
+
+	// Guard against the reported hang: bound the wait for the final DATA
+	// response. A timeout here IS the bug (proxy/backend stuck on null sender).
+	if err := client.conn.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		t.Fatalf("Failed to set read deadline: %v", err)
+	}
+	response, err = client.ReadResponse()
+	if err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			t.Fatalf("HANG DETECTED: no DATA final response within 15s for null sender "+
+				"(reproduces strela 'DATA final response: ... i/o timeout'): %v", err)
+		}
+		t.Fatalf("Failed to read final response: %v", err)
+	}
+	_ = client.conn.SetReadDeadline(time.Time{}) // clear deadline
+	if !strings.HasPrefix(response, "250") {
+		t.Fatalf("Expected 250 after null-sender message data, got: %s", response)
+	}
+	t.Logf("✓ Null-sender bounce delivered through proxy: %s", response)
+
+	// Confirm the message actually landed in INBOX (delivery completed, not just ACKed).
+	backendServer.WaitForUploads(t)
+	ctx := context.Background()
+	accountID, err := backendServer.ResilientDB.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	if err != nil {
+		t.Fatalf("Failed to resolve account ID: %v", err)
+	}
+	inbox, err := backendServer.ResilientDB.GetMailboxByNameWithRetry(ctx, accountID, "INBOX")
+	if err != nil {
+		t.Fatalf("Failed to get INBOX: %v", err)
+	}
+	poll, err := backendServer.ResilientDB.PollMailboxWithRetry(ctx, inbox.ID, 0)
+	if err != nil {
+		t.Fatalf("Failed to poll INBOX: %v", err)
+	}
+	if poll.NumMessages != 1 {
+		t.Fatalf("Expected 1 message in INBOX after null-sender delivery, got: %d", poll.NumMessages)
+	}
+	t.Logf("✓ Null-sender message stored in INBOX (count=%d)", poll.NumMessages)
+}
+
 // TestLMTPProxyWithXCLIENT tests LMTP proxy using XCLIENT command forwarding
 func TestLMTPProxyWithXCLIENT(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)

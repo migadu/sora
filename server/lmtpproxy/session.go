@@ -250,17 +250,17 @@ func (s *Session) handleConnection() {
 
 			lookupStart := time.Now() // Start account lookup timing
 			if err := s.handleRecipient(to, lookupStart); err != nil {
-				s.DebugLog("Recipient rejected", "recipient", to, "error", err)
+				s.DebugLog("Recipient rejected", "to", to, "error", err)
 				// Check if error is due to server shutdown
 				if errors.Is(err, server.ErrServerShuttingDown) {
-					s.InfoLog("Recipient lookup failed due to server shutdown", "recipient", to)
+					s.InfoLog("Recipient lookup failed due to server shutdown", "to", to)
 					s.sendResponse("421 4.3.2 Service shutting down, please try again later")
 					return
 				}
 				// Check if error is a temporary service unavailability (remotelookup transient error)
 				if errors.Is(err, server.ErrAuthServiceUnavailable) {
 					s.InfoLog("rejecting recipient - remote lookup service temporarily unavailable",
-						"recipient", to,
+						"to", to,
 						"response", "451 4.4.3")
 					s.sendResponse("451 4.4.3 Service temporarily unavailable, please try again later")
 					continue
@@ -268,7 +268,7 @@ func (s *Session) handleConnection() {
 				// Check if error is user not found (permanent failure)
 				if errors.Is(err, server.ErrUserNotFound) {
 					s.InfoLog("rejecting recipient - user not found",
-						"recipient", to,
+						"to", to,
 						"response", "550 5.1.1")
 					s.sendResponse("550 5.1.1 User unknown")
 					continue
@@ -276,7 +276,7 @@ func (s *Session) handleConnection() {
 				// Check if user not found with tempfail response
 				if errors.Is(err, server.ErrUserNotFoundTempFail) {
 					s.InfoLog("tempfail recipient - user not found (tempfail configured)",
-						"recipient", to,
+						"to", to,
 						"response", "450 4.1.1")
 					s.sendResponse("450 4.1.1 User unknown (temporary failure)")
 					continue
@@ -284,7 +284,7 @@ func (s *Session) handleConnection() {
 				// Check if recipient address is syntactically invalid (permanent failure)
 				if errors.Is(err, server.ErrInvalidAddress) {
 					s.InfoLog("rejecting recipient - invalid address syntax",
-						"recipient", to,
+						"to", to,
 						"error", err.Error(),
 						"response", "550 5.1.3")
 					s.sendResponse("550 5.1.3 Bad destination mailbox address syntax")
@@ -294,7 +294,7 @@ func (s *Session) handleConnection() {
 				// If this is actually a permanent issue, it will keep failing on retry
 				// If it's transient (e.g., database timeout), sender can retry
 				s.InfoLog("rejecting recipient - unexpected lookup error, temporary failure",
-					"recipient", to,
+					"to", to,
 					"error", err.Error(),
 					"response", "451 4.3.0")
 				s.sendResponse("451 4.3.0 Temporary failure, please try again later")
@@ -312,7 +312,7 @@ func (s *Session) handleConnection() {
 			// Connect to backend if not already connected
 			if s.backendConn == nil {
 				if err := s.connectToBackend(); err != nil {
-					s.InfoLog("backend connection failed", "recipient", s.to, "error", err)
+					s.InfoLog("backend connection failed", "from", s.sender, "to", s.to, "error", err)
 					s.sendResponse("451 4.4.1 Backend connection failed")
 					// Do not return, continue loop to handle RSET or QUIT
 					continue
@@ -342,7 +342,7 @@ func (s *Session) handleConnection() {
 					// The client should retry this recipient in a separate transaction.
 					if targetAddr != "" && targetAddr != s.serverAddr {
 						s.InfoLog("rejecting recipient - routing mismatch (requires different backend)",
-							"recipient", s.to,
+							"to", s.to,
 							"current_backend", s.serverAddr,
 							"target_backend", targetAddr,
 							"method", routeResult.RoutingMethod)
@@ -354,10 +354,10 @@ func (s *Session) handleConnection() {
 
 			// Forward RCPT TO to backend
 			if s.backendConn != nil {
-				s.DebugLog("Forwarding RCPT TO to backend", "recipient", s.to, "account_id", s.accountID)
+				s.DebugLog("Forwarding RCPT TO to backend", "to", s.to, "account_id", s.accountID)
 				s.forwardRCPT(line)
 			} else {
-				s.WarnLog("Cannot forward RCPT - no backend connection", "recipient", s.to)
+				s.WarnLog("Cannot forward RCPT - no backend connection", "to", s.to)
 				s.sendResponse("451 4.4.1 Backend connection failed")
 			}
 			// Continue loop to handle subsequent RCPT TOs or DATA
@@ -667,7 +667,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	address, err := server.NewAddress(to)
 	if err != nil {
 		s.InfoLog("rejecting recipient - invalid address format",
-			"recipient", to,
+			"to", to,
 			"error", err.Error())
 		return fmt.Errorf("%w: %w", server.ErrInvalidAddress, err)
 	}
@@ -1290,8 +1290,8 @@ func (s *Session) forwardRCPT(command string) {
 		s.WarnLog("backend rejected recipient - data inconsistency detected, returning temporary failure",
 			"backend", s.serverAddr,
 			"method", s.routingMethod,
-			"sender", s.sender,
-			"recipient", s.to,
+			"from", s.sender,
+			"to", s.to,
 			"backend_response", trimmedResponse,
 			"returned_to_client", "451 4.3.0",
 			"issue", "remotelookup returned this backend but backend rejected user - check data consistency")
@@ -1314,7 +1314,7 @@ func (s *Session) forwardRCPT(command string) {
 		return
 	} else if strings.HasPrefix(trimmedResponse, "4") {
 		// Backend rejected with temporary error (4xx) - forward as-is
-		s.InfoLog("backend temporarily rejected recipient", "backend", s.serverAddr, "method", s.routingMethod, "sender", s.sender, "recipient", s.to, "response", trimmedResponse)
+		s.InfoLog("backend temporarily rejected recipient", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to, "response", trimmedResponse)
 		s.clientWriter.WriteString(response)
 		s.clientWriter.Flush()
 		return
@@ -1325,7 +1325,7 @@ func (s *Session) forwardRCPT(command string) {
 	s.clientWriter.Flush()
 
 	// Log routing decision at INFO level with sender, recipient, and routing method
-	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "sender", s.sender, "recipient", s.to)
+	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to)
 }
 
 // enterPipeMode enters the data piping mode for transfer of message content.
@@ -1492,7 +1492,7 @@ func (s *Session) close() {
 
 	// Log disconnection at INFO level
 	duration := time.Since(s.startTime).Round(time.Second)
-	s.InfoLog("disconnected", "duration", duration, "backend", s.serverAddr)
+	s.InfoLog("disconnected", "from", s.sender, "to", s.to, "duration", duration, "backend", s.serverAddr)
 
 	// Unregister connection SYNCHRONOUSLY to prevent leak
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits

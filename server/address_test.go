@@ -87,6 +87,30 @@ func TestAddressDetailParsing(t *testing.T) {
 			wantBaseAddress:   "user@example.com",
 		},
 		{
+			// Constant Contact and other ESPs use base64/VERP-style reverse-paths
+			// whose local part contains "/", "+" and "=". These are all valid RFC 5321
+			// atext and must be accepted, otherwise legitimate mail bounces.
+			name:              "base64/VERP local part with slash",
+			input:             "Ap+Iao+8tQk6GgWD4E/IMCg==_1140208144979_MPP2bPipEe2HevoWPpr49g==@in.constantcontact.com",
+			wantFullAddress:   "ap+iao+8tqk6ggwd4e/imcg==_1140208144979_mpp2bpipee2hevowppr49g==@in.constantcontact.com",
+			wantLocalPart:     "ap+iao+8tqk6ggwd4e/imcg==_1140208144979_mpp2bpipee2hevowppr49g==",
+			wantDomain:        "in.constantcontact.com",
+			wantDetail:        "iao+8tqk6ggwd4e/imcg==_1140208144979_mpp2bpipee2hevowppr49g==",
+			wantBaseLocalPart: "ap",
+			wantBaseAddress:   "ap@in.constantcontact.com",
+		},
+		{
+			// Backtick is atext (RFC 5322 §3.2.3) and must be accepted.
+			name:              "backtick in local part",
+			input:             "weird`name@example.com",
+			wantFullAddress:   "weird`name@example.com",
+			wantLocalPart:     "weird`name",
+			wantDomain:        "example.com",
+			wantDetail:        "",
+			wantBaseLocalPart: "weird`name",
+			wantBaseAddress:   "weird`name@example.com",
+		},
+		{
 			name:    "invalid address",
 			input:   "invalid-email",
 			wantErr: true,

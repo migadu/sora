@@ -259,9 +259,9 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 
 	// Log recipient acceptance with alias detection
 	if fullAddress != primaryAddr.FullAddress() {
-		s.DebugLog("recipient accepted", "recipient", fullAddress, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID)
+		s.DebugLog("recipient accepted", "to", fullAddress, "primary_address", primaryAddr.FullAddress(), "account_id", AccountID)
 	} else {
-		s.DebugLog("recipient accepted", "recipient", fullAddress, "account_id", AccountID)
+		s.DebugLog("recipient accepted", "to", fullAddress, "account_id", AccountID)
 	}
 	recordMetrics("success")
 	return nil
@@ -391,7 +391,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	if s.User != nil {
 		deliveredTo := s.User.Address.BaseAddress()
 		if helpers.IsRedirectLoop(helpers.HeaderGetter(messageContent.Header.Map()), deliveredTo) {
-			s.WarnLog("mail loop detected via Delivered-To, rejecting", "recipient", deliveredTo)
+			s.WarnLog("mail loop detected via Delivered-To, rejecting", "to", deliveredTo)
 			recordMetrics("failure")
 			return &smtp.SMTPError{
 				Code:         550,
