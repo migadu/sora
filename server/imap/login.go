@@ -12,7 +12,22 @@ import (
 	"github.com/migadu/sora/server"
 )
 
+// Login handles the IMAP LOGIN command. It always applies the authentication
+// gate (progressive delay + rate-limit check) before authenticating.
 func (s *IMAPSession) Login(address, password string) error {
+	return s.login(address, password, true)
+}
+
+// login authenticates address/password. applyGate controls whether the
+// progressive authentication delay and per-IP/username rate-limit check are
+// applied here.
+//
+// The LOGIN command passes applyGate=true. The SASL PLAIN handler (sasl.go)
+// passes applyGate=false for the regular-user path because it has ALREADY
+// applied the delay + rate-limit once for the AUTHENTICATE command. Without
+// this, AUTHENTICATE would apply both twice — roughly doubling auth latency and
+// double-counting against the rate limiter relative to LOGIN.
+func (s *IMAPSession) login(address, password string, applyGate bool) error {
 	authStart := time.Now()
 
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
@@ -39,55 +54,57 @@ func (s *IMAPSession) Login(address, password string) error {
 		}
 	}
 
-	// Apply progressive authentication delay BEFORE any other checks
-	// Create a fake net.Addr from the RemoteIP for delay calculation
-	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-LOGIN"); err != nil {
-		if errors.Is(err, server.ErrDelayQueueFull) {
-			// Delay queue full - reject immediately to prevent goroutine exhaustion
-			s.InfoLog("delay queue full, rejecting connection", "address", address)
+	if applyGate {
+		// Apply progressive authentication delay BEFORE any other checks
+		// Create a fake net.Addr from the RemoteIP for delay calculation
+		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+		if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-LOGIN"); err != nil {
+			if errors.Is(err, server.ErrDelayQueueFull) {
+				// Delay queue full - reject immediately to prevent goroutine exhaustion
+				s.InfoLog("delay queue full, rejecting connection", "address", address)
+				return &imap.Error{
+					Type: imap.StatusResponseTypeBye,
+					Code: imap.ResponseCodeAlert,
+					Text: "Too many concurrent authentication attempts. Please try again later.",
+				}
+			}
+			// Context cancelled or other error
 			return &imap.Error{
 				Type: imap.StatusResponseTypeBye,
-				Code: imap.ResponseCodeAlert,
-				Text: "Too many concurrent authentication attempts. Please try again later.",
+				Text: "Connection closed",
 			}
 		}
-		// Context cancelled or other error
-		return &imap.Error{
-			Type: imap.StatusResponseTypeBye,
-			Text: "Connection closed",
-		}
-	}
 
-	// Check authentication rate limiting after delay using proxy-aware method
-	if s.server.authLimiter != nil {
-		if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address); err != nil {
-			// Check if this is a rate limit error
-			var rateLimitErr *server.RateLimitError
-			if errors.As(err, &rateLimitErr) {
-				s.InfoLog("rate limit exceeded",
-					"address", address,
-					"reason", rateLimitErr.Reason,
-					"failure_count", rateLimitErr.FailureCount,
-					"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
+		// Check authentication rate limiting after delay using proxy-aware method
+		if s.server.authLimiter != nil {
+			if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address); err != nil {
+				// Check if this is a rate limit error
+				var rateLimitErr *server.RateLimitError
+				if errors.As(err, &rateLimitErr) {
+					s.InfoLog("rate limit exceeded",
+						"address", address,
+						"reason", rateLimitErr.Reason,
+						"failure_count", rateLimitErr.FailureCount,
+						"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
 
-				// Track rate limiting as a specific error type
-				metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
-			} else {
-				// Unknown rate limiting error (shouldn't happen, but handle gracefully)
-				s.DebugLog("rate limited", "error", err)
-				metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
-			}
+					// Track rate limiting as a specific error type
+					metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
+				} else {
+					// Unknown rate limiting error (shouldn't happen, but handle gracefully)
+					s.DebugLog("rate limited", "error", err)
+					metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "rate_limited", "client_error").Inc()
+				}
 
-			// Return the SAME response as a bad-credential failure (NO [AUTHENTICATIONFAILED],
-			// identical text to the regular-auth path below) instead of a distinct BYE/ALERT.
-			// A divergent rate-limit response is an oracle: it confirms a targeted account/IP is
-			// being limited, which on a shared egress IP signals a deliberate lockout. The block
-			// is still enforced — only its observable form is made indistinguishable. (security-audit M14)
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeAuthenticationFailed,
-				Text: "Invalid address or password",
+				// Return the SAME response as a bad-credential failure (NO [AUTHENTICATIONFAILED],
+				// identical text to the regular-auth path below) instead of a distinct BYE/ALERT.
+				// A divergent rate-limit response is an oracle: it confirms a targeted account/IP is
+				// being limited, which on a shared egress IP signals a deliberate lockout. The block
+				// is still enforced — only its observable form is made indistinguishable. (security-audit M14)
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeAuthenticationFailed,
+					Text: "Invalid address or password",
+				}
 			}
 		}
 	}

@@ -347,8 +347,12 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			}
 
 			// Authenticate as `username` (authentication-identity).
+			// Use the non-gating login variant: the progressive auth delay and
+			// rate-limit check were already applied once above for this
+			// AUTHENTICATE command (ApplyAuthenticationDelay + CanAttemptAuthWithProxy).
+			// Calling s.Login here would apply both a second time.
 			s.DebugLog("proceeding with regular authentication", "username", username)
-			return s.Login(username, password)
+			return s.login(username, password, false)
 		}), nil
 	default:
 		s.DebugLog("unsupported authentication mechanism", "mechanism", mechanism)

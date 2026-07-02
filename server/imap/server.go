@@ -342,10 +342,14 @@ type IMAPServerOptions struct {
 	ProxyProtocolTrustedProxies []string // CIDR blocks for PROXY protocol validation (defaults to trusted_networks if empty)
 	TrustedNetworks             []string // Global trusted networks for parameter forwarding
 	AuthRateLimit               serverPkg.AuthRateLimiterConfig
-	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
-	SearchRateLimitPerMin       int                       // Search rate limit (searches per minute, 0=disabled)
-	SearchRateLimitWindow       time.Duration             // Search rate limit time window
-	SessionMemoryLimit          int64                     // Per-session memory limit in bytes (0=unlimited)
+	// AuthLimiterOverride, when non-nil, is used as the session auth limiter
+	// instead of constructing one from AuthRateLimit. Dependency-injection seam
+	// (nil in all production paths); used by tests to observe gate invocations.
+	AuthLimiterOverride   serverPkg.AuthLimiter
+	LookupCache           *config.LookupCacheConfig // Authentication cache configuration
+	SearchRateLimitPerMin int                       // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitWindow time.Duration             // Search rate limit time window
+	SessionMemoryLimit    int64                     // Per-session memory limit in bytes (0=unlimited)
 	// Cache warmup configuration
 	EnableWarmup       bool
 	WarmupMessageCount int
@@ -418,9 +422,15 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		}
 	}
 
-	// Initialize authentication rate limiter with trusted networks
-	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("IMAP", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
-	serverPkg.RegisterRateLimiter("imap", name, authLimiter)
+	// Initialize authentication rate limiter with trusted networks.
+	// A non-nil AuthLimiterOverride (tests only) replaces the real limiter; the
+	// monitoring registry only accepts the concrete type, so skip it in that case.
+	var authLimiter serverPkg.AuthLimiter = options.AuthLimiterOverride
+	if authLimiter == nil {
+		concrete := serverPkg.NewAuthRateLimiterWithTrustedNetworks("IMAP", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
+		serverPkg.RegisterRateLimiter("imap", name, concrete)
+		authLimiter = concrete
+	}
 
 	// Initialize the master SASL network gate. Fail closed on a misconfigured
 	// allow-list rather than silently disabling the gate.
