@@ -206,59 +206,103 @@ func (db *Database) SetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 			}
 		}
 
-		// Count existing entries (excluding ones we're about to delete)
-		var currentCount int
-		var currentTotalSize int64
-		countQuery := `
-			SELECT COUNT(*), COALESCE(SUM(LENGTH(entry_value)), 0)
+		// Look up the CURRENT stored size of every entry named in this request
+		// (0 if absent) so overwrites and deletes are not miscounted against the
+		// limits. An overwrite of an existing entry is net-zero for the count and a
+		// size delta; deleting an existing entry frees a slot and its size. The
+		// previous code counted every non-nil request entry as a brand-new addition,
+		// so overwriting an entry at the limit was wrongly rejected as TOOMANY.
+		requestedNames := make([]string, 0, len(entries))
+		for entryName := range entries {
+			requestedNames = append(requestedNames, entryName)
+		}
+		existingSizes := make(map[string]int64, len(requestedNames))
+		existingRows, err := tx.Query(ctx, `
+			SELECT entry_name, COALESCE(LENGTH(entry_value), 0)
 			FROM metadata
 			WHERE account_id = $1
 			  AND mailbox_id IS NOT DISTINCT FROM $2
-		`
-		err := tx.QueryRow(ctx, countQuery, accountID, mailboxID).Scan(&currentCount, &currentTotalSize)
+			  AND entry_name = ANY($3)
+		`, accountID, mailboxID, requestedNames)
 		if err != nil {
-			return fmt.Errorf("failed to count existing metadata: %w", err)
+			return fmt.Errorf("failed to look up existing metadata: %w", err)
 		}
-
-		// Calculate new counts (account for deletions and additions)
-		newEntries := 0
-		newTotalSize := int64(0)
-		for _, entryValue := range entries {
-			if entryValue != nil {
-				newEntries++
-				newTotalSize += int64(len(*entryValue))
+		for existingRows.Next() {
+			var name string
+			var size int64
+			if err := existingRows.Scan(&name, &size); err != nil {
+				existingRows.Close()
+				return fmt.Errorf("failed to scan existing metadata: %w", err)
 			}
+			existingSizes[name] = size
+		}
+		existingRows.Close()
+		if err := existingRows.Err(); err != nil {
+			return fmt.Errorf("error iterating existing metadata: %w", err)
 		}
 
-		// Check entry count limit (if limits are set)
+		// Check entry count limit (if limits are set). Only genuinely new entries
+		// add to the count; deleting an existing entry frees a slot.
 		if limits.MaxEntriesPerMailbox > 0 || limits.MaxEntriesPerServer > 0 {
 			maxEntries := limits.MaxEntriesPerServer
 			if mailboxID != nil && limits.MaxEntriesPerMailbox > 0 {
 				maxEntries = limits.MaxEntriesPerMailbox
 			}
 
-			if maxEntries > 0 && currentCount+newEntries > maxEntries {
-				return &MetadataError{
-					Type:    MetadataErrTooMany,
-					Message: fmt.Sprintf("too many metadata entries (limit: %d)", maxEntries),
+			if maxEntries > 0 {
+				var currentCount int
+				if err := tx.QueryRow(ctx, `
+					SELECT COUNT(*)
+					FROM metadata
+					WHERE account_id = $1
+					  AND mailbox_id IS NOT DISTINCT FROM $2
+				`, accountID, mailboxID).Scan(&currentCount); err != nil {
+					return fmt.Errorf("failed to count existing metadata: %w", err)
+				}
+
+				additions, deletions := 0, 0
+				for entryName, entryValue := range entries {
+					_, present := existingSizes[entryName]
+					switch {
+					case entryValue != nil && !present:
+						additions++
+					case entryValue == nil && present:
+						deletions++
+					}
+				}
+
+				if currentCount+additions-deletions > maxEntries {
+					return &MetadataError{
+						Type:    MetadataErrTooMany,
+						Message: fmt.Sprintf("too many metadata entries (limit: %d)", maxEntries),
+					}
 				}
 			}
 		}
 
-		// Check total size limit (per account, across all mailboxes)
+		// Check total size limit (per account, across all mailboxes). Add each new
+		// value's size and subtract the old size of any entry being overwritten or
+		// deleted in this request, so an overwrite only counts its net delta.
 		if limits.MaxTotalSize > 0 {
 			var accountTotalSize int64
-			sizeQuery := `
+			if err := tx.QueryRow(ctx, `
 				SELECT COALESCE(SUM(LENGTH(entry_value)), 0)
 				FROM metadata
 				WHERE account_id = $1
-			`
-			err = tx.QueryRow(ctx, sizeQuery, accountID).Scan(&accountTotalSize)
-			if err != nil {
+			`, accountID).Scan(&accountTotalSize); err != nil {
 				return fmt.Errorf("failed to calculate total metadata size: %w", err)
 			}
 
-			if int(accountTotalSize+newTotalSize) > limits.MaxTotalSize {
+			sizeDelta := int64(0)
+			for entryName, entryValue := range entries {
+				newSize := int64(0)
+				if entryValue != nil {
+					newSize = int64(len(*entryValue))
+				}
+				sizeDelta += newSize - existingSizes[entryName] // existingSizes[name] is 0 if absent
+			}
+
+			if accountTotalSize+sizeDelta > int64(limits.MaxTotalSize) {
 				return &MetadataError{
 					Type:    MetadataErrQuotaExceeded,
 					Message: fmt.Sprintf("metadata quota exceeded (limit: %d bytes)", limits.MaxTotalSize),

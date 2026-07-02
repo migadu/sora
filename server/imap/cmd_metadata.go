@@ -27,12 +27,16 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 		}
 	}
 
-	// Validate entry names
-	for _, entry := range entries {
-		if err := validateMetadataEntry(entry); err != nil {
+	// Canonicalise (case-fold) and validate entry names. RFC 5464 §3.1 makes
+	// entry names case-insensitive, so we query using the canonical form.
+	canonEntries := make([]string, len(entries))
+	for i, entry := range entries {
+		canonEntries[i] = canonicalMetadataEntry(entry)
+		if err := validateMetadataEntry(canonEntries[i]); err != nil {
 			return nil, err
 		}
 	}
+	entries = canonEntries
 
 	var mailboxID *int64
 	var mailboxName string
@@ -94,20 +98,19 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 // If mailbox is empty string "", sets server metadata.
 // To remove an entry, set its value to nil.
 func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) error {
-	// Validate entry names and check permissions
-	for entryName := range entries {
-		if err := validateMetadataEntry(entryName); err != nil {
+	// Canonicalise (case-fold) entry names first so the case-insensitivity rule
+	// (RFC 5464 §3.1) is honoured for storage AND for the /private-vs-/shared
+	// scope classification below — otherwise a /SHARED/... spelling would be
+	// misclassified as private and skip the shared-scope 'w' ACL check.
+	canonEntries := make(map[string]*[]byte, len(entries))
+	for entryName, entryValue := range entries {
+		canonName := canonicalMetadataEntry(entryName)
+		if err := validateMetadataEntry(canonName); err != nil {
 			return err
 		}
-
-		// Check if entry is writable (entries under /shared/ require special permission)
-		if strings.HasPrefix(entryName, "/shared/") {
-			// For now, allow all /shared/ entries
-			// In a production system, you'd check user permissions here
-		} else if !strings.HasPrefix(entryName, "/private/") {
-			return fmt.Errorf("invalid metadata entry: must start with /private/ or /shared/")
-		}
+		canonEntries[canonName] = entryValue
 	}
+	entries = canonEntries
 
 	var mailboxID *int64
 
@@ -132,9 +135,10 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 			return fmt.Errorf("failed to get mailbox: %w", err)
 		}
 
-		// Check ACL permissions
-		// For /shared entries, requires 'w' (write) right
-		// For /private entries, requires 'l' (lookup) right (implicit - user can access mailbox)
+		// Check ACL permissions. Entries are already canonicalised (lower case),
+		// so this scope classification is case-insensitive:
+		//   - /shared entries require the 'w' (write) right
+		//   - /private entries require only 'l' (lookup); they are per-user data
 		needsWrite := false
 		for entryName := range entries {
 			if strings.HasPrefix(entryName, "/shared/") {
@@ -222,26 +226,46 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 	return nil
 }
 
-// validateMetadataEntry validates a metadata entry name according to RFC 5464.
-// Entry names must start with /private/ or /shared/ and contain valid characters.
+// canonicalMetadataEntry returns the canonical form of a metadata entry name.
+// RFC 5464 §3.1 states entry names are case-insensitive, so we fold to lower
+// case for storage, lookup, and /private-vs-/shared classification. Applying it
+// at the protocol boundary keeps the case-insensitivity invariant in one place
+// (and prevents a /SHARED/... spelling from evading the shared-scope ACL check).
+func canonicalMetadataEntry(entry string) string {
+	return strings.ToLower(entry)
+}
+
+// validateMetadataEntry validates a (canonicalised) metadata entry name per
+// RFC 5464 §3.1 / §4.2.1: entry names live under the /private or /shared
+// hierarchies and, being astrings, may contain any character EXCEPT "*", "%",
+// non-ASCII octets, and control characters. Pass the canonical form.
 func validateMetadataEntry(entry string) error {
 	if entry == "" {
-		return fmt.Errorf("metadata entry name cannot be empty")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeClientBug,
+			Text: "metadata entry name cannot be empty",
+		}
 	}
 
 	if !strings.HasPrefix(entry, "/private/") && !strings.HasPrefix(entry, "/shared/") {
-		return fmt.Errorf("metadata entry must start with /private/ or /shared/")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeClientBug,
+			Text: "metadata entry must start with /private/ or /shared/",
+		}
 	}
 
-	// Entry names should contain only valid characters
-	// RFC 5464 says: astring (any IMAP astring)
-	// We allow alphanumeric, slash, dash, underscore, dot
-	for _, ch := range entry {
-		if !((ch >= 'a' && ch <= 'z') ||
-			(ch >= 'A' && ch <= 'Z') ||
-			(ch >= '0' && ch <= '9') ||
-			ch == '/' || ch == '-' || ch == '_' || ch == '.') {
-			return fmt.Errorf("metadata entry contains invalid character: %c", ch)
+	// RFC 5464 forbids "*", "%", non-ASCII, and control characters (incl. DEL);
+	// everything else in the ASCII printable range is a valid entry-name octet.
+	for i := 0; i < len(entry); i++ {
+		ch := entry[i]
+		if ch < 0x20 || ch >= 0x7f || ch == '*' || ch == '%' {
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeClientBug,
+				Text: fmt.Sprintf("metadata entry contains invalid character: %q", string(ch)),
+			}
 		}
 	}
 
