@@ -223,7 +223,7 @@ func (exporter *Exporter) Run() error {
 
 	// Export Dovecot files if requested
 	if exporter.options.Dovecot {
-		if err := exporter.exportDovecotFiles(mailboxes); err != nil {
+		if err := exporter.exportDovecotFiles(accountID); err != nil {
 			logger.Info("Warning: Failed to export Dovecot files", "error", err)
 		}
 	}
@@ -750,9 +750,9 @@ func (exporter *Exporter) recordExport(contentHash, mailbox, filename, path stri
 }
 
 // exportDovecotFiles exports Dovecot-specific metadata files
-func (exporter *Exporter) exportDovecotFiles(mailboxes []*db.DBMailbox) error {
+func (exporter *Exporter) exportDovecotFiles(accountID int64) error {
 	// Export subscriptions file
-	if err := exporter.exportSubscriptions(mailboxes); err != nil {
+	if err := exporter.exportSubscriptions(accountID); err != nil {
 		return fmt.Errorf("failed to export subscriptions: %w", err)
 	}
 
@@ -761,18 +761,20 @@ func (exporter *Exporter) exportDovecotFiles(mailboxes []*db.DBMailbox) error {
 }
 
 // exportSubscriptions exports the Dovecot subscriptions file
-func (exporter *Exporter) exportSubscriptions(mailboxes []*db.DBMailbox) error {
+func (exporter *Exporter) exportSubscriptions(accountID int64) error {
 	subscriptionsPath := filepath.Join(exporter.maildirPath, "subscriptions")
 
-	var lines []string
-	lines = append(lines, "V\t2") // Dovecot v2 format
-
-	// Add subscribed mailboxes
-	for _, mbox := range mailboxes {
-		if mbox.Subscribed {
-			lines = append(lines, mbox.Name)
-		}
+	// Subscriptions are name-based and may reference folders that
+	// no longer exist, so export ALL subscribed names — not just the subset that
+	// still has a live mailbox — for a lossless Dovecot round-trip.
+	names, err := exporter.rdb.GetSubscribedMailboxNamesWithRetry(exporter.ctx, accountID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch subscriptions for export: %w", err)
 	}
+
+	lines := make([]string, 0, len(names)+1)
+	lines = append(lines, "V\t2") // Dovecot v2 format
+	lines = append(lines, names...)
 
 	content := strings.Join(lines, "\n") + "\n"
 	return os.WriteFile(subscriptionsPath, []byte(content), 0644)

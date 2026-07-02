@@ -61,7 +61,7 @@ type resilientDB interface {
 	CreateDefaultMailboxesWithRetry(ctx context.Context, accountID int64) error
 	GetMailboxByNameWithRetry(ctx context.Context, accountID int64, name string) (*db.DBMailbox, error)
 	CreateMailboxWithRetry(ctx context.Context, accountID int64, name string, parentID *int64) error
-	SetMailboxSubscribedWithRetry(ctx context.Context, mailboxID, accountID int64, subscribed bool) error
+	SubscribeWithRetry(ctx context.Context, accountID int64, mailboxName string) error
 	GetActiveScriptWithRetry(ctx context.Context, accountID int64) (*db.SieveScript, error)
 	GetScriptByNameWithRetry(ctx context.Context, name string, accountID int64) (*db.SieveScript, error)
 	UpdateScriptWithRetry(ctx context.Context, scriptID, accountID int64, name, content string) (*db.SieveScript, error)
@@ -562,15 +562,12 @@ func (i *Importer) processSubscriptions() error {
 			folderName = decoded
 		}
 
-		// Check if mailbox exists, create if needed (handles hierarchical setup automatically)
-		mailbox, err := i.rdb.GetOrCreateMailboxByNameWithRetry(i.ctx, user.AccountID(), folderName)
-		if err != nil {
-			logger.Info("Warning: Failed to get or create mailbox", "name", folderName, "error", err)
-			continue
-		}
-
-		// Subscribe the user to the folder
-		if err := i.rdb.SetMailboxSubscribedWithRetry(i.ctx, mailbox.ID, user.AccountID(), true); err != nil {
+		// Subscriptions are name-based (migration 000046), so record the subscription
+		// directly without materializing a mailbox. Dovecot permits subscriptions to
+		// folders that don't exist; the previous get-or-create created phantom empty
+		// mailboxes for those. Folders that DO exist are created by the folder-import
+		// pass, so this only records the name.
+		if err := i.rdb.SubscribeWithRetry(i.ctx, user.AccountID(), folderName); err != nil {
 			logger.Info("Warning: Failed to subscribe to mailbox", "name", folderName, "error", err)
 		} else {
 			logger.Info("Successfully subscribed to mailbox", "name", folderName)

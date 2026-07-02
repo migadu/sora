@@ -90,7 +90,7 @@ func (m *mockResilientDatabase) GetAccountIDByAddressWithRetry(ctx context.Conte
 func (m *mockResilientDatabase) CreateDefaultMailboxesWithRetry(ctx context.Context, accountID int64) error {
 	return nil
 }
-func (m *mockResilientDatabase) SetMailboxSubscribedWithRetry(ctx context.Context, mailboxID, accountID int64, subscribed bool) error {
+func (m *mockResilientDatabase) SubscribeWithRetry(ctx context.Context, accountID int64, mailboxName string) error {
 	return nil
 }
 func (m *mockResilientDatabase) GetActiveScriptWithRetry(ctx context.Context, accountID int64) (*db.SieveScript, error) {
