@@ -236,12 +236,36 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		`, accountID, mailboxPath).Scan(&mailboxID)
 
 		if err == pgx.ErrNoRows {
-			// Mailbox doesn't exist, create it
+			// Mailbox was deleted along with its messages; recreate it. Re-seed the
+			// RFC 6154 special-use attribute for a canonical top-level default name
+			// (consistent with CreateDefaultMailboxes / migration 000045), but ONLY
+			// if the attribute is not already held by another live mailbox — so a
+			// restore never violates the (account_id, special_use) unique index nor
+			// duplicates special-use. ON CONFLICT tolerates a concurrent recreate of
+			// the same name; the id is then re-fetched below.
 			err = tx.QueryRow(ctx, `
-				INSERT INTO mailboxes (account_id, name, uid_validity, created_at, updated_at, path)
-				VALUES ($1, $2, extract(epoch from now())::bigint, now(), now(), '')
+				INSERT INTO mailboxes (account_id, name, uid_validity, created_at, updated_at, path, special_use)
+				SELECT $1, $2, extract(epoch from now())::bigint, now(), now(), '',
+					CASE WHEN canon.su IS NOT NULL
+					          AND NOT EXISTS (SELECT 1 FROM mailboxes m2
+					                          WHERE m2.account_id = $1 AND m2.special_use = canon.su AND m2.deleted_at IS NULL)
+					     THEN canon.su END
+				FROM (SELECT CASE LOWER($2)
+					WHEN 'sent'    THEN '\Sent'
+					WHEN 'drafts'  THEN '\Drafts'
+					WHEN 'archive' THEN '\Archive'
+					WHEN 'junk'    THEN '\Junk'
+					WHEN 'trash'   THEN '\Trash'
+				END AS su) canon
+				ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO NOTHING
 				RETURNING id
 			`, accountID, mailboxPath).Scan(&mailboxID)
+			if err == pgx.ErrNoRows {
+				// Concurrent recreate won the race; fetch the existing row's id.
+				err = tx.QueryRow(ctx, `
+					SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
+				`, accountID, mailboxPath).Scan(&mailboxID)
+			}
 			if err != nil {
 				return 0, fmt.Errorf("failed to create mailbox %s: %w", mailboxPath, err)
 			}

@@ -316,6 +316,18 @@ func (rd *ResilientDatabase) CreateMailboxWithRetry(ctx context.Context, Account
 	return err
 }
 
+// CreateMailboxWithSpecialUseWithRetry creates a mailbox and assigns its RFC 6154
+// special-use attribute in a single transaction (atomic CREATE ... USE). The name
+// conflict (ErrDBUniqueViolation), invalid name (ErrMailboxInvalidName), and
+// duplicate special-use (ErrMailboxSpecialUseInUse) outcomes are terminal, not retried.
+func (rd *ResilientDatabase) CreateMailboxWithSpecialUseWithRetry(ctx context.Context, AccountID int64, name string, parentID *int64, specialUse string) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).CreateMailboxWithSpecialUse(ctx, tx, AccountID, name, parentID, specialUse)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op, consts.ErrDBUniqueViolation, consts.ErrMailboxInvalidName, consts.ErrMailboxSpecialUseInUse)
+	return err
+}
+
 func (rd *ResilientDatabase) DeleteMailboxWithRetry(ctx context.Context, mailboxID int64, AccountID int64) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).DeleteMailbox(ctx, tx, mailboxID, AccountID)
@@ -352,6 +364,19 @@ func (rd *ResilientDatabase) SetMailboxSubscribedWithRetry(ctx context.Context, 
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	return err
+}
+
+// HasMailboxWithSpecialUseWithRetry reports whether the account already has a live
+// mailbox carrying the given special-use attribute (RFC 6154 §5 uniqueness check).
+func (rd *ResilientDatabase) HasMailboxWithSpecialUseWithRetry(ctx context.Context, accountID int64, attr string) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).HasMailboxWithSpecialUse(ctx, accountID, attr)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
 }
 
 func (rd *ResilientDatabase) CountMessagesGreaterThanUIDWithRetry(ctx context.Context, mailboxID int64, minUID imap.UID) (uint32, error) {

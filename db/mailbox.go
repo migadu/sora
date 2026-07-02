@@ -26,6 +26,7 @@ type DBMailbox struct {
 	Subscribed  bool
 	HasChildren bool
 	Path        string // Hex-encoded path of ancestor IDs
+	SpecialUse  string // RFC 6154 special-use attribute (e.g. "\Sent"); empty if none
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
@@ -61,7 +62,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 	query := `
 		WITH accessible_mailboxes AS (
 			-- 1. All mailboxes owned by user (including shared mailboxes they created)
-			SELECT id, name, uid_validity, path, subscribed, created_at, updated_at, account_id
+			SELECT id, name, uid_validity, path, subscribed, special_use, created_at, updated_at, account_id
 			FROM mailboxes
 			WHERE account_id = $1
 			  AND deleted_at IS NULL
@@ -69,7 +70,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			UNION
 
 			-- 2. Shared mailboxes where user has direct ACL access (must have at least 'l' lookup right)
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
 			FROM mailboxes m
 			INNER JOIN mailbox_acls acl ON m.id = acl.mailbox_id
 			WHERE m.is_shared = TRUE
@@ -80,7 +81,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			UNION
 
 			-- 3. Shared mailboxes with "anyone" access (same domain, must have 'l' right)
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
 			FROM mailboxes m
 			INNER JOIN mailbox_acls anyone_acl ON m.id = anyone_acl.mailbox_id
 			WHERE m.is_shared = TRUE
@@ -90,7 +91,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			  AND m.deleted_at IS NULL
 		)
 		SELECT
-			m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id,
+			m.id, m.name, m.uid_validity, m.path, m.subscribed, COALESCE(m.special_use, '') AS special_use, m.created_at, m.updated_at, m.account_id,
 			-- has_children: does a direct child exist? The child's direct-parent path is
 			-- its path minus the final 16-char ancestor segment, matched by equality so the
 			-- expression index idx_mailboxes_account_parent_path (migration 000038) applies.
@@ -123,7 +124,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 		var mailbox DBMailbox
 		var uidValidityInt64 int64
 
-		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID, &mailbox.HasChildren); err != nil {
+		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID, &mailbox.HasChildren); err != nil {
 			return nil, err
 		}
 
@@ -159,11 +160,11 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, AccountID i
 
 	// First, fetch the core mailbox details.
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT id, name, uid_validity, path, subscribed, created_at, updated_at, account_id
+		SELECT id, name, uid_validity, path, subscribed, COALESCE(special_use, ''), created_at, updated_at, account_id
 		FROM mailboxes
 		WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
 	`, mailboxID, AccountID).Scan(
-		&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID,
+		&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID,
 	)
 
 	if err != nil {
@@ -224,9 +225,9 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	// Use LOWER() on both sides to ensure consistent case-insensitive comparison
 	// regardless of database locale (C/POSIX locales don't lowercase non-ASCII in LOWER())
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT id, name, uid_validity, path, subscribed, created_at, updated_at, account_id FROM (
+		SELECT id, name, uid_validity, path, subscribed, COALESCE(special_use, ''), created_at, updated_at, account_id FROM (
 			-- 1) Owned by user
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
 			FROM mailboxes m
 			WHERE m.account_id = $1 AND LOWER(m.name) = LOWER($2)
 			  AND m.deleted_at IS NULL
@@ -234,7 +235,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			UNION ALL
 
 			-- 2) Specifically shared to this user explicitly via ACL
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
 			FROM mailbox_acls acl
 			JOIN mailboxes m ON m.id = acl.mailbox_id
 			WHERE acl.account_id = $1
@@ -247,7 +248,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			UNION ALL
 
 			-- 3) Publicly shared within the same domain ('anyone' ACL)
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.created_at, m.updated_at, m.account_id
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
 			FROM mailbox_acls anyone_acl
 			JOIN mailboxes m ON m.id = anyone_acl.mailbox_id
 			WHERE anyone_acl.identifier = 'anyone'
@@ -259,7 +260,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			  AND m.deleted_at IS NULL
 		) sub
 		LIMIT 1
-	`, AccountID, name, ownerDomain).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
+	`, AccountID, name, ownerDomain).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -287,7 +288,22 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	return &mailbox, nil
 }
 
+// CreateMailbox creates a mailbox with no RFC 6154 special-use attribute.
 func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64) error {
+	return db.createMailbox(ctx, tx, AccountID, name, parentID, "")
+}
+
+// CreateMailboxWithSpecialUse creates a mailbox and assigns an RFC 6154 special-use
+// attribute in the same INSERT, so the operation is atomic: it can never leave a
+// mailbox without its attribute (and LIST never observes a transient attribute-less
+// state) if a later step fails. A duplicate attribute for the account surfaces as
+// consts.ErrMailboxSpecialUseInUse (mapped to NO [USEATTR] by the caller); a duplicate
+// name surfaces as consts.ErrDBUniqueViolation.
+func (db *Database) CreateMailboxWithSpecialUse(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64, specialUse string) error {
+	return db.createMailbox(ctx, tx, AccountID, name, parentID, specialUse)
+}
+
+func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64, specialUse string) error {
 	// Mailbox names are case-insensitive (Option A): the UNIQUE(account_id,
 	// LOWER(name)) index rejects any case-variant of an existing name. Folding
 	// INBOX additionally guarantees the reserved inbox is stored as the canonical
@@ -356,13 +372,20 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 		}
 	}
 
+	// Assign the special-use attribute in the same INSERT so the mailbox and its
+	// attribute are committed atomically (RFC 6154). NULL when none is requested.
+	var specialUseParam *string
+	if specialUse != "" {
+		specialUseParam = &specialUse
+	}
+
 	// Insert the mailbox with shared mailbox fields
 	var mailboxID int64
 	err := tx.QueryRow(ctx, `
-		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path, is_shared, owner_domain)
-		VALUES ($1, $2, $3, $4, '', $5, $6)
+		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path, is_shared, owner_domain, special_use)
+		VALUES ($1, $2, $3, $4, '', $5, $6, $7)
 		RETURNING id
-	`, AccountID, name, int64(uidValidity), false, isShared, ownerDomain).Scan(&mailboxID)
+	`, AccountID, name, int64(uidValidity), false, isShared, ownerDomain, specialUseParam).Scan(&mailboxID)
 
 	// Handle errors, including unique constraint and foreign key violations
 	if err != nil {
@@ -370,6 +393,12 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 		if pgErr, ok := err.(*pgconn.PgError); ok {
 			switch pgErr.Code {
 			case "23505": // Unique constraint violation
+				// Distinguish a duplicate special-use attribute (RFC 6154 §5) from a
+				// duplicate name so the caller can return NO [USEATTR] vs [ALREADYEXISTS].
+				if pgErr.ConstraintName == "mailboxes_account_special_use_unique" {
+					logger.Warn("Database: special-use attribute already assigned", "special_use", specialUse, "account_id", AccountID)
+					return consts.ErrMailboxSpecialUseInUse
+				}
 				logger.Warn("Database: mailbox already exists", "name", name, "account_id", AccountID)
 				return consts.ErrDBUniqueViolation
 			case "23503": // Foreign key violation
@@ -433,88 +462,6 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 				return fmt.Errorf("failed to set creator ACL for shared mailbox: %w", err)
 			}
 			logger.Info("Database: created shared mailbox", "name", name, "mailbox_id", mailboxID, "account_id", AccountID, "domain", *ownerDomain)
-		}
-	}
-
-	return nil
-}
-
-func (db *Database) CreateDefaultMailbox(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64) error {
-	// Validate mailbox name doesn't contain problematic characters
-	if strings.ContainsAny(name, "\t\r\n\x00") {
-		logger.Error("Database: attempted to create default mailbox with invalid characters", "name", name, "account_id", AccountID)
-		return consts.ErrMailboxInvalidName
-	}
-
-	// Start a transaction
-	// Use nanoseconds to significantly reduce the chance of collision on rapid creation.
-	uidValidity := uint32(time.Now().UnixNano())
-
-	// Determine the parent path if parentID is provided
-	var parentPath string
-	if parentID != nil {
-		// Fetch the parent mailbox to get its path
-		err := tx.QueryRow(ctx, `
-			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
-		`, *parentID, AccountID).Scan(&parentPath)
-
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return fmt.Errorf("failed to create default mailbox: parent mailbox with ID %d not found: %w", *parentID, consts.ErrMailboxNotFound)
-			}
-			return fmt.Errorf("failed to fetch parent mailbox for default creation: %w", err)
-		}
-	}
-
-	// Try to insert the mailbox into the database
-	var mailboxID int64
-	err := tx.QueryRow(ctx, `
-		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path)
-		VALUES ($1, $2, $3, $4, '')
-		ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO NOTHING
-		RETURNING id
-	`, AccountID, name, int64(uidValidity), true).Scan(&mailboxID)
-
-	// Handle errors, including unique constraint and foreign key violations
-	if err != nil {
-		// Use pgx/v5's pgconn.PgError for error handling
-		if pgErr, ok := err.(*pgconn.PgError); ok {
-			switch pgErr.Code {
-			case "23503": // Foreign key violation
-				if pgErr.ConstraintName == "mailboxes_account_id_fkey" {
-					logger.Error("Database: user does not exist", "account_id", AccountID)
-					return consts.ErrDBNotFound
-				}
-			}
-		}
-
-		// If the mailbox already exists (no rows returned), fetch its ID. The
-		// conflict may be on a different-case row (case-insensitive uniqueness),
-		// so match case-insensitively rather than on the exact spelling.
-		if err == pgx.ErrNoRows {
-			err := tx.QueryRow(ctx, `
-				SELECT id FROM mailboxes
-				WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
-			`, AccountID, name).Scan(&mailboxID)
-
-			if err != nil {
-				return fmt.Errorf("failed to get existing mailbox ID: %w", err)
-			}
-		} else {
-			return fmt.Errorf("failed to create mailbox: %w", err)
-		}
-	}
-
-	// Only update the path if we got a valid mailbox ID
-	if mailboxID > 0 {
-		// Update the path
-		mailboxPath := helpers.GetMailboxPath(parentPath, mailboxID)
-		_, err := tx.Exec(ctx, `
-			UPDATE mailboxes SET path = $1 WHERE id = $2 AND (path = '' OR path IS NULL)
-		`, mailboxPath, mailboxID)
-
-		if err != nil {
-			return fmt.Errorf("failed to update mailbox path: %w", err)
 		}
 	}
 
@@ -673,6 +620,19 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	return nil
 }
 
+// HasMailboxWithSpecialUse reports whether the account already has a live mailbox
+// carrying the given special-use attribute (RFC 6154 §5 uniqueness pre-check).
+func (db *Database) HasMailboxWithSpecialUse(ctx context.Context, accountID int64, attr string) (bool, error) {
+	var exists bool
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND special_use = $2 AND deleted_at IS NULL)
+	`, accountID, attr).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check special-use uniqueness: %w", err)
+	}
+	return exists, nil
+}
+
 func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, AccountID int64) error {
 	// OPTIMIZATION: Early exit if INBOX already exists
 	// This avoids 5 INSERT attempts on every LMTP delivery when mailboxes already exist
@@ -699,9 +659,27 @@ func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, Accou
 		// Use ON CONFLICT to handle existing mailboxes gracefully.
 		// The DO UPDATE clause with a no-op is a common way to get RETURNING to work with conflicts.
 		err := tx.QueryRow(ctx, `
-			INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path) VALUES ($1, $2, $3, TRUE, '')
+			INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path, special_use)
+			VALUES ($1, $2, $3, TRUE, '', CASE LOWER($2)
+				WHEN 'sent'    THEN '\Sent'
+				WHEN 'drafts'  THEN '\Drafts'
+				WHEN 'archive' THEN '\Archive'
+				WHEN 'junk'    THEN '\Junk'
+				WHEN 'trash'   THEN '\Trash'
+			END)
 			ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO UPDATE
-			SET subscribed = TRUE -- Ensure default mailboxes are always subscribed
+			SET subscribed = TRUE, -- Ensure default mailboxes are always subscribed
+			    -- Fill the special-use attribute if a pre-existing default row lacks
+			    -- one (partial provisioning); never clobber an explicitly-set value,
+			    -- and only when the attribute is not already held by another mailbox
+			    -- (so this cannot violate the (account_id, special_use) unique index).
+			    special_use = COALESCE(mailboxes.special_use,
+			        CASE WHEN EXCLUDED.special_use IS NULL
+			              OR NOT EXISTS (SELECT 1 FROM mailboxes m2
+			                             WHERE m2.account_id = mailboxes.account_id
+			                               AND m2.special_use = EXCLUDED.special_use
+			                               AND m2.deleted_at IS NULL)
+			             THEN EXCLUDED.special_use END)
 			RETURNING id
 		`, AccountID, mailboxName, int64(uidValidity)).Scan(&mailboxID)
 

@@ -255,36 +255,20 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 		}
 	}
 
-	isStandardSpecialMailbox := false
-	var specialUseAttributeIfApplicable imap.MailboxAttr
-	switch strings.ToUpper(mbox.Name) {
-	case "SENT":
-		isStandardSpecialMailbox = true
-		specialUseAttributeIfApplicable = imap.MailboxAttrSent
-	case "TRASH":
-		isStandardSpecialMailbox = true
-		specialUseAttributeIfApplicable = imap.MailboxAttrTrash
-	case "DRAFTS":
-		isStandardSpecialMailbox = true
-		specialUseAttributeIfApplicable = imap.MailboxAttrDrafts
-	case "ARCHIVE":
-		isStandardSpecialMailbox = true
-		specialUseAttributeIfApplicable = imap.MailboxAttrArchive
-	case "JUNK":
-		isStandardSpecialMailbox = true
-		specialUseAttributeIfApplicable = imap.MailboxAttrJunk
-	}
+	// RFC 6154 special-use is a persisted per-mailbox attribute (see the
+	// special_use column / migration 000045), not derived from the folder name.
+	// This makes it survive RENAME/localization and honors CREATE ... USE.
+	hasSpecialUse := mbox.SpecialUse != ""
 
-	// Default mailboxes should always be visible to IMAP clients, regardless of special-use flags
-	// Only filter out special-use mailboxes if the client specifically requests filtering
-
-	if options.SelectSpecialUse && !isStandardSpecialMailbox {
+	// SELECT (SPECIAL-USE): return only mailboxes that actually carry a
+	// special-use attribute.
+	if options.SelectSpecialUse && !hasSpecialUse {
 		return nil
 	}
 
-	if isStandardSpecialMailbox {
+	if hasSpecialUse {
 		if serverCaps.Has(imap.CapSpecialUse) || options.ReturnSpecialUse || options.SelectSpecialUse {
-			attributes = append(attributes, specialUseAttributeIfApplicable)
+			attributes = append(attributes, imap.MailboxAttr(mbox.SpecialUse))
 		}
 	}
 

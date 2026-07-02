@@ -13,6 +13,19 @@ import (
 
 // Create a new mailbox
 func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
+	// RFC 6154: validate any CREATE ... USE (...) request up front so an
+	// unsupported special-use is rejected with NO [USEATTR] before we create
+	// anything. Sora persists at most one attribute per mailbox.
+	var specialUse string
+	if options != nil && len(options.SpecialUse) > 0 {
+		var useErr *imap.Error
+		specialUse, useErr = validateSpecialUse(options.SpecialUse)
+		if useErr != nil {
+			s.DebugLog("rejecting CREATE with unsupported special-use", "attrs", options.SpecialUse)
+			return useErr
+		}
+	}
+
 	// First phase: validation and mailbox lookup using read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
 	if !acquired {
@@ -166,7 +179,53 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 		}
 	}
 
-	// Final phase: actual creation - no locks needed as it's a DB operation
+	// RFC 6154 §5: a special-use attribute identifies at most one mailbox. Reject
+	// up front if it is already in use, so we don't create the mailbox first. (The
+	// partial unique index is the race-proof backstop, handled after creation.)
+	if specialUse != "" {
+		inUse, uErr := s.server.rdb.HasMailboxWithSpecialUseWithRetry(ctx, AccountID, specialUse)
+		if uErr != nil {
+			return s.internalError("failed to check special-use uniqueness: %v", uErr)
+		}
+		if inUse {
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCode("USEATTR"),
+				Text: "Special-use attribute is already assigned to another mailbox",
+			}
+		}
+	}
+
+	// Final phase: actual creation - no locks needed as it's a DB operation.
+	// When a special-use attribute is requested, create the mailbox and assign the
+	// attribute in a single transaction so a failure can never leave a mailbox
+	// without its attribute (RFC 6154), and LIST never observes a transient
+	// attribute-less state. Auto-created parents above do not inherit it.
+	if specialUse != "" {
+		err = s.server.rdb.CreateMailboxWithSpecialUseWithRetry(ctx, AccountID, name, parentMailboxID, specialUse)
+		if err != nil {
+			if errors.Is(err, consts.ErrMailboxSpecialUseInUse) {
+				// Lost the race with the pre-check: another mailbox claimed the
+				// attribute concurrently (the partial unique index is the backstop).
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCode("USEATTR"),
+					Text: "Special-use attribute is already assigned to another mailbox",
+				}
+			}
+			if errors.Is(err, consts.ErrDBUniqueViolation) {
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeAlreadyExists,
+					Text: "Mailbox already exists",
+				}
+			}
+			return s.internalError("failed to create mailbox '%s': %v", name, err)
+		}
+		s.DebugLog("mailbox created with special-use", "mailbox", name, "special_use", specialUse)
+		return nil
+	}
+
 	err = s.server.rdb.CreateMailboxWithRetry(ctx, AccountID, name, parentMailboxID)
 	if err != nil {
 		// Handle race condition: another session may have created the same mailbox
@@ -183,4 +242,29 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 
 	s.DebugLog("mailbox created", "mailbox", name)
 	return nil
+}
+
+// validateSpecialUse checks a CREATE ... USE request. Sora supports exactly the
+// five RFC 6154 core attributes and stores at most one per mailbox. It returns
+// the single attribute to persist, or a *imap.Error carrying [USEATTR] when the
+// request is unsupported (an unknown attribute, or more than one).
+func validateSpecialUse(attrs []imap.MailboxAttr) (string, *imap.Error) {
+	if len(attrs) > 1 {
+		return "", &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCode("USEATTR"),
+			Text: "Only a single special-use attribute is supported per mailbox",
+		}
+	}
+	switch attrs[0] {
+	case imap.MailboxAttrSent, imap.MailboxAttrDrafts, imap.MailboxAttrArchive,
+		imap.MailboxAttrJunk, imap.MailboxAttrTrash:
+		return string(attrs[0]), nil
+	default:
+		return "", &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCode("USEATTR"),
+			Text: "Unsupported special-use attribute",
+		}
+	}
 }

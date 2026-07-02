@@ -108,11 +108,11 @@ func TestIMAP_SpecialUseAttributes(t *testing.T) {
 
 	// Define expected special use attributes for default mailboxes
 	expectedAttributes := map[string]imap.MailboxAttr{
-		"Sent":   imap.MailboxAttrSent,
-		"Drafts": imap.MailboxAttrDrafts,
-		"Trash":  imap.MailboxAttrTrash,
-		"Junk":   imap.MailboxAttrJunk,
-		// Archive behavior might vary, RFC 6154 defines \Archive
+		"Sent":    imap.MailboxAttrSent,
+		"Drafts":  imap.MailboxAttrDrafts,
+		"Trash":   imap.MailboxAttrTrash,
+		"Junk":    imap.MailboxAttrJunk,
+		"Archive": imap.MailboxAttrArchive,
 	}
 
 	// Check all mailboxes

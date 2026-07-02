@@ -568,6 +568,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			imap.CapSort:                      struct{}{},
 			imap.CapSortDisplay:               struct{}{},
 			imap.CapSpecialUse:                struct{}{},
+			imap.CapCreateSpecialUse:          struct{}{},
 			imap.CapListStatus:                struct{}{},
 			imap.CapStatusSize:                struct{}{},
 			imap.CapBinary:                    struct{}{},
