@@ -1094,6 +1094,17 @@ func (s *Session) connectToBackend() error {
 		s.DebugLog("Using global StartTLS settings")
 	}
 
+	// Set ServerName so tls.Client verifies the backend certificate hostname. Without it,
+	// DNSName is empty and Go verifies only the chain (not the host), so remote_tls_verify=true
+	// would still let any CA-valid cert MITM the proxy->backend leg. Derive it from the address
+	// we actually connected to (the configured backend hostname; both tls.Config values here are
+	// per-connection, safe to mutate).
+	if tlsConfig != nil && tlsConfig.ServerName == "" {
+		if host, _, splitErr := net.SplitHostPort(actualAddr); splitErr == nil && host != "" {
+			tlsConfig.ServerName = host
+		}
+	}
+
 	if shouldUseStartTLS && tlsConfig != nil {
 		s.DebugLog("Negotiating StartTLS with backend", "backend", actualAddr, "insecure_skip_verify", tlsConfig.InsecureSkipVerify)
 

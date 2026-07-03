@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 )
 
@@ -71,7 +72,7 @@ func msConnectAndAuth(t *testing.T, server *common.TestServer, account common.Te
 
 // TestCheckScriptLiteral exercises the CHECKSCRIPT literal-parsing dispatch path
 // over a real connection: non-synchronizing literal, synchronizing literal (with
-// "+" continuation), syntax rejection, and pre-read MAXSCRIPTSIZE rejection.
+// "+" continuation), syntax rejection, and pre-read QUOTA/MAXSIZE rejection.
 func TestCheckScriptLiteral(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	server, account := common.SetupManageSieveServer(t)
@@ -121,12 +122,12 @@ func TestCheckScriptLiteral(t *testing.T) {
 
 	t.Run("OversizeRejectedBeforeRead", func(t *testing.T) {
 		// Default maxScriptSize is 16KB; declare a larger literal. The server must
-		// reject with MAXSCRIPTSIZE WITHOUT reading the body, so we send no data.
+		// reject with QUOTA/MAXSIZE WITHOUT reading the body, so we send no data.
 		fmt.Fprint(w, "CHECKSCRIPT {20000+}\r\n")
 		w.Flush()
 		resp := msReadResp(t, conn, r)
-		if !strings.Contains(resp, "NO") || !strings.Contains(resp, "MAXSCRIPTSIZE") {
-			t.Errorf("expected NO (MAXSCRIPTSIZE), got: %q", resp)
+		if !strings.Contains(resp, "NO") || !strings.Contains(resp, "QUOTA/MAXSIZE") {
+			t.Errorf("expected NO (QUOTA/MAXSIZE), got: %q", resp)
 		}
 	})
 }
@@ -220,8 +221,52 @@ func TestHaveSpaceProtocol(t *testing.T) {
 		fmt.Fprint(w, "HAVESPACE \"draft\" 20000\r\n")
 		w.Flush()
 		resp := msReadResp(t, conn, r)
-		if !strings.Contains(resp, "NO") || !strings.Contains(resp, "MAXSCRIPTSIZE") {
-			t.Errorf("expected NO (MAXSCRIPTSIZE), got: %q", resp)
+		if !strings.Contains(resp, "NO") || !strings.Contains(resp, "QUOTA/MAXSIZE") {
+			t.Errorf("expected NO (QUOTA/MAXSIZE), got: %q", resp)
 		}
 	})
+}
+
+// TestHaveSpaceScriptCountQuota verifies HAVESPACE honors the per-account script-count
+// quota (RFC 5804 §2.5): a new name at the limit is refused with (QUOTA/MAXSCRIPTS), while
+// an existing name (a replacement, which does not grow the count) is still accepted.
+func TestHaveSpaceScriptCountQuota(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupManageSieveServer(t)
+	defer server.Close()
+
+	conn, r, w := msConnectAndAuth(t, server, account)
+	defer conn.Close()
+
+	put := func(name string) {
+		t.Helper()
+		body := "keep;"
+		fmt.Fprintf(w, "PUTSCRIPT \"%s\" {%d+}\r\n%s\r\n", name, len(body), body)
+		w.Flush()
+		if resp := strings.TrimSpace(msReadResp(t, conn, r)); !strings.HasPrefix(resp, "OK") {
+			t.Fatalf("PUTSCRIPT %q failed: %q", name, resp)
+		}
+	}
+
+	// Fill the account to the per-account script limit.
+	limit := db.MaxScriptsPerAccount()
+	for i := 0; i < limit; i++ {
+		put(fmt.Sprintf("script_%03d", i))
+	}
+
+	// A NEW script name is now refused with (QUOTA/MAXSCRIPTS).
+	fmt.Fprint(w, "HAVESPACE \"brand_new\" 10\r\n")
+	w.Flush()
+	resp := strings.TrimSpace(msReadResp(t, conn, r))
+	if !strings.HasPrefix(resp, "NO") || !strings.Contains(strings.ToUpper(resp), "QUOTA/MAXSCRIPTS") {
+		t.Errorf("expected NO (QUOTA/MAXSCRIPTS) for a new script at the limit, got: %q", resp)
+	}
+
+	// An EXISTING script name is a replacement and must still be accepted.
+	fmt.Fprint(w, "HAVESPACE \"script_000\" 10\r\n")
+	w.Flush()
+	resp = strings.TrimSpace(msReadResp(t, conn, r))
+	if !strings.HasPrefix(resp, "OK") {
+		t.Errorf("expected OK for HAVESPACE of an existing script (replacement) at the limit, got: %q", resp)
+	}
 }

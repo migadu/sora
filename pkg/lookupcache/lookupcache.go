@@ -256,13 +256,28 @@ func (c *LookupCache) SetFailure(address string, result int, password string) {
 	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
 }
 
-// Invalidate removes a specific entry from the cache (e.g., after password change)
+// Invalidate removes a specific entry from the cache (e.g., after password change).
+// Safe to call on a nil receiver (no-op when the cache is disabled).
 func (c *LookupCache) Invalidate(address string) {
+	if c == nil {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	delete(c.entries, address)
 	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+}
+
+// InvalidateUser removes the entry for a serverName/username pair, using the
+// same key derivation as Get/Set. Prefer this over Invalidate with a
+// hand-built key so key formats can never drift apart.
+// Safe to call on a nil receiver (no-op when the cache is disabled).
+func (c *LookupCache) InvalidateUser(serverName, username string) {
+	if c == nil {
+		return
+	}
+	c.Invalidate(makeKey(serverName, username))
 }
 
 // evictOldest removes the oldest entry from the cache
@@ -436,8 +451,12 @@ func roundToTwoDecimals(val float64) float64 {
 
 // Get retrieves a cached entry
 // serverName should be the unique server name (e.g., "imap-proxy-1", "imap-backend")
-// Returns the entry and whether it was found (and not expired)
+// Returns the entry and whether it was found (and not expired).
+// Safe to call on a nil receiver (always a miss when the cache is disabled).
 func (c *LookupCache) Get(serverName, username string) (*CacheEntry, bool) {
+	if c == nil {
+		return nil, false
+	}
 	key := makeKey(serverName, username)
 
 	c.mu.RLock()
@@ -466,8 +485,12 @@ func (c *LookupCache) Get(serverName, username string) (*CacheEntry, bool) {
 	return &entryCopy, true
 }
 
-// Set stores an entry in the cache
+// Set stores an entry in the cache.
+// Safe to call on a nil receiver (no-op when the cache is disabled).
 func (c *LookupCache) Set(serverName, username string, entry *CacheEntry) {
+	if c == nil {
+		return
+	}
 	key := makeKey(serverName, username)
 
 	c.mu.Lock()

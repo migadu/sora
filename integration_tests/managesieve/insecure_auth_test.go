@@ -134,6 +134,80 @@ func TestInsecureAuthDisabled(t *testing.T) {
 	t.Logf("✓ Authentication correctly rejected over non-TLS connection: %s", response)
 }
 
+// TestLoginRejectedOverInsecureConnection verifies the non-standard LOGIN command
+// honors the same transport-security gate as AUTHENTICATE (audit H2). With
+// insecure_auth=false and no active TLS, LOGIN must be refused before its plaintext
+// credentials are processed — otherwise it would bypass the STARTTLS requirement.
+func TestLoginRejectedOverInsecureConnection(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	address := common.GetRandomAddress(t)
+
+	server, err := managesieve.New(
+		context.Background(),
+		"test-login-insecure-gate",
+		"localhost",
+		address,
+		rdb,
+		managesieve.ManageSieveServerOptions{
+			InsecureAuth:        false, // secure by default
+			TLS:                 true,
+			TLSUseStartTLS:      true,
+			TLSCertFile:         "../../testdata/sora.crt",
+			TLSKeyFile:          "../../testdata/sora.key",
+			SupportedExtensions: []string{"fileinto", "vacation"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ManageSieve server: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() { server.Start(errChan) }()
+	defer server.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	conn, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatalf("Failed to connect to ManageSieve server: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	// Consume greeting up to OK.
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Failed to read greeting: %v", err)
+		}
+		if strings.HasPrefix(strings.TrimSpace(line), "OK") {
+			break
+		}
+	}
+
+	// LOGIN with cleartext credentials must be refused (not authenticated).
+	writer.WriteString(fmt.Sprintf("LOGIN \"%s\" \"%s\"\r\n", account.Email, account.Password))
+	writer.Flush()
+
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read LOGIN response: %v", err)
+	}
+	response = strings.TrimSpace(response)
+
+	if !strings.HasPrefix(response, "NO") {
+		t.Errorf("Expected NO for LOGIN over non-TLS with insecure_auth=false, got: %s", response)
+	}
+	if !strings.Contains(response, "insecure connection") && !strings.Contains(response, "STARTTLS") {
+		t.Errorf("Expected insecure-connection/STARTTLS error, got: %s", response)
+	}
+	t.Logf("✓ LOGIN correctly rejected over non-TLS connection: %s", response)
+}
+
 // TestInsecureAuthEnabled tests that authentication is allowed over non-TLS
 // connections when insecure_auth = true
 func TestInsecureAuthEnabled(t *testing.T) {

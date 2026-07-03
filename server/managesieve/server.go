@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -568,6 +569,14 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			// Ensure session is always removed from map, even if handleConnection panics
 			// or never completes. This prevents memory leaks in the activeSessions map.
 			defer s.removeSession(session)
+			// Recover from any panic in the session goroutine. Without this, a single
+			// malformed command would propagate an unrecovered panic and crash the entire
+			// (multi-protocol) server process, dropping every connection. Mirrors POP3.
+			defer func() {
+				if r := recover(); r != nil {
+					session.ErrorLog("session panic recovered", "panic", r, "stack", string(debug.Stack()))
+				}
+			}()
 			session.handleConnection()
 		}()
 	}

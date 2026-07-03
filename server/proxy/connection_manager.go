@@ -929,6 +929,13 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 			// Floor the proxy->backend leg at TLS 1.2 (avoid downgrade to 1.0/1.1).
 			MinVersion: tls.VersionTLS12,
 		}
+		// tls.Dial would infer ServerName from the dial target, but we dial the DNS-resolved
+		// IP (resolvedAddr), which would verify the cert against the IP rather than the
+		// configured backend hostname. Pin ServerName to the configured host so verification
+		// matches the cert's DNS SAN, consistent with the STARTTLS / proxy-protocol paths.
+		if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil && host != "" {
+			tlsConfig.ServerName = host
+		}
 		conn, err = tls.DialWithDialer(dialer, "tcp", resolvedAddr, tlsConfig)
 	} else {
 		// Plain connection (either no TLS, or TLS will be negotiated via StartTLS)
@@ -1062,7 +1069,15 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 			// Floor the proxy->backend leg at TLS 1.2 (avoid downgrade to 1.0/1.1).
 			MinVersion: tls.VersionTLS12,
 		}
-		logger.Debug("Starting TLS handshake", "addr", addr, "InsecureSkipVerify", !remoteTLSVerify)
+		// Verify the backend certificate against its configured hostname. tls.Client (unlike
+		// tls.Dial) does NOT infer ServerName, so without this it stays empty and Go verifies
+		// only the chain, not the host — remote_tls_verify=true would still let any CA-valid
+		// cert MITM the proxy->backend leg. Use `addr` (the configured backend address), not the
+		// DNS-resolved IP, so it matches the backend certificate's DNS SAN.
+		if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil && host != "" {
+			tlsConfig.ServerName = host
+		}
+		logger.Debug("Starting TLS handshake", "addr", addr, "InsecureSkipVerify", !remoteTLSVerify, "server_name", tlsConfig.ServerName)
 		tlsConn := tls.Client(conn, tlsConfig)
 
 		// Set a deadline for the TLS handshake

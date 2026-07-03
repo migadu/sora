@@ -235,12 +235,27 @@ func TestManageSieveScriptOperations(t *testing.T) {
 		t.Logf("GETSCRIPT response received: %s", strings.TrimSpace(response))
 	}
 
-	// Test 5: DELETESCRIPT - delete the script
+	// Test 5: DELETESCRIPT - deleting the ACTIVE script must be refused (RFC 5804 §2.10),
+	// then succeed once the script is deactivated.
 	t.Log("=== Testing DELETESCRIPT ===")
 	sendCommand(t, writer, "DELETESCRIPT \"vacation\"")
 	response = readSimpleResponse(t, reader)
+	if !strings.HasPrefix(strings.TrimSpace(response), "NO") {
+		t.Errorf("DELETESCRIPT of the active script should be refused, got: %s", response)
+	} else {
+		t.Logf("DELETESCRIPT correctly refused for active script: %s", strings.TrimSpace(response))
+	}
+
+	// Deactivate, then delete succeeds.
+	sendCommand(t, writer, "SETACTIVE \"\"")
+	response = readSimpleResponse(t, reader)
 	if !strings.Contains(response, "OK") {
-		t.Errorf("DELETESCRIPT failed: %s", response)
+		t.Errorf("SETACTIVE \"\" (deactivate) failed: %s", response)
+	}
+	sendCommand(t, writer, "DELETESCRIPT \"vacation\"")
+	response = readSimpleResponse(t, reader)
+	if !strings.Contains(response, "OK") {
+		t.Errorf("DELETESCRIPT failed after deactivation: %s", response)
 	} else {
 		t.Logf("DELETESCRIPT succeeded")
 	}
@@ -445,13 +460,17 @@ func readGetScriptResponse(t *testing.T, reader *bufio.Reader) string {
 			t.Fatalf("Failed to read script content: %v", err)
 		}
 
-		// Read the final OK response
-		finalLine, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("Failed to read final OK from GETSCRIPT: %v", err)
+		// The literal is terminated by CRLF (RFC 5804 §2.9/§4) before the OK/NO
+		// response line; skip the blank terminator line the way a real client does.
+		for {
+			finalLine, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("Failed to read final OK from GETSCRIPT: %v", err)
+			}
+			if trimmed := strings.TrimSpace(finalLine); trimmed != "" {
+				return trimmed
+			}
 		}
-
-		return strings.TrimSpace(finalLine)
 	}
 
 	// Unexpected format - could be an OK from a previous command
@@ -818,8 +837,13 @@ func TestManageSieveScriptNameWithSpaces(t *testing.T) {
 		t.Logf("Script with spaces is active: %s", listResponse)
 	}
 
-	// Test 6: DELETESCRIPT with script name containing spaces
+	// Test 6: DELETESCRIPT with script name containing spaces.
+	// Deactivate first — the active script cannot be deleted (RFC 5804 §2.10).
 	t.Log("=== Testing DELETESCRIPT with script name containing spaces ===")
+	sendCommand(t, writer, "SETACTIVE \"\"")
+	if resp := readSimpleResponse(t, reader); !strings.Contains(resp, "OK") {
+		t.Errorf("SETACTIVE \"\" (deactivate) should succeed: %s", resp)
+	}
 	sendCommand(t, writer, "DELETESCRIPT \"my vacation script\"")
 	response = readSimpleResponse(t, reader)
 	if !strings.Contains(response, "OK") {

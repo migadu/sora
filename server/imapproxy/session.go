@@ -50,6 +50,8 @@ type Session struct {
 	startTime             time.Time
 	releaseConn           func() // Connection limiter cleanup function
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
+	submittedUsername     string // Username exactly as submitted by the client (lookup-cache key)
+	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
 }
 
 // newSession creates a new IMAP proxy session.
@@ -156,6 +158,10 @@ func (s *Session) handleConnection() {
 				s.sendResponse("* BYE Idle timeout")
 				return
 			}
+			if errors.Is(err, server.ErrLineTooLong) {
+				s.sendResponse("* BYE Command line too long")
+				return
+			}
 			if err != io.EOF {
 				s.DebugLog("error reading from client", "error", err)
 			}
@@ -221,8 +227,8 @@ func (s *Session) handleConnection() {
 						continue
 					}
 
-					// Send continuation
-					s.sendResponse("+")
+					// Send continuation (RFC 9051: continue-req = "+" SP ...)
+					s.sendResponse("+ ")
 
 					// Read literal data
 					literalBuf := make([]byte, literalSize)
@@ -262,8 +268,8 @@ func (s *Session) handleConnection() {
 							continue
 						}
 
-						// Send continuation
-						s.sendResponse("+")
+						// Send continuation (RFC 9051: continue-req = "+" SP ...)
+						s.sendResponse("+ ")
 
 						// Read literal data
 						literalBuf := make([]byte, literalSize)
@@ -296,8 +302,8 @@ func (s *Session) handleConnection() {
 							continue
 						}
 
-						// Send continuation
-						s.sendResponse("+")
+						// Send continuation (RFC 9051: continue-req = "+" SP ...)
+						s.sendResponse("+ ")
 
 						// Read literal data
 						literalBuf := make([]byte, literalSize)
@@ -336,6 +342,15 @@ func (s *Session) handleConnection() {
 
 			if err := s.authenticateUser(username, password); err != nil {
 				s.DebugLog("authentication failed", "error", err)
+				// The rate limiter requests a disconnect via a BYE-typed error;
+				// honor it instead of letting the client keep hammering on the
+				// same connection.
+				var imapErr *imap.Error
+				if errors.As(err, &imapErr) && imapErr.Type == imap.StatusResponseTypeBye {
+					s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
+					s.sendResponse(fmt.Sprintf("* BYE [%s] %s", imapErr.Code, imapErr.Text))
+					return
+				}
 				// Check if error is due to server shutdown or temporary unavailability
 				if server.IsTemporaryAuthFailure(err) {
 					s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] %s", tag, err.Error()))
@@ -361,13 +376,20 @@ func (s *Session) handleConnection() {
 			}
 
 			if !s.postAuthenticationSetup(tag, authStart) {
-				// Backend connection failed - send BYE and close connection
-				s.sendResponse("* BYE Backend server unavailable, please try again")
+				// postAuthenticationSetup already sent the tagged error and final BYE
 				return
 			}
 			authenticated = true
 
 		case "AUTHENTICATE":
+			// Check insecure_auth: reject SASL PLAIN over non-TLS when insecure_auth
+			// is false (same gate as LOGIN; PLAIN carries cleartext credentials).
+			if !s.server.insecureAuth && !server.ConnIsTLS(s.clientConn) {
+				if s.handleAuthError(fmt.Sprintf("%s NO [PRIVACYREQUIRED] Authentication requires TLS connection", tag)) {
+					return
+				}
+				continue
+			}
 			authStart := time.Now()
 			if len(args) < 1 || strings.ToUpper(args[0]) != "PLAIN" {
 				if s.handleAuthError(fmt.Sprintf("%s NO AUTHENTICATE PLAIN is the only supported mechanism", tag)) {
@@ -382,7 +404,8 @@ func (s *Session) handleConnection() {
 				saslLine = server.UnquoteString(args[1])
 			} else {
 				// No initial response, send continuation request
-				s.sendResponse("+")
+				// (RFC 9051: continue-req = "+" SP ...)
+				s.sendResponse("+ ")
 
 				// Read SASL response from client
 				var err error
@@ -426,6 +449,15 @@ func (s *Session) handleConnection() {
 
 			if err := s.authenticateUser(authnID, password); err != nil {
 				s.DebugLog("authentication failed", "error", err)
+				// The rate limiter requests a disconnect via a BYE-typed error;
+				// honor it instead of letting the client keep hammering on the
+				// same connection.
+				var imapErr *imap.Error
+				if errors.As(err, &imapErr) && imapErr.Type == imap.StatusResponseTypeBye {
+					s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
+					s.sendResponse(fmt.Sprintf("* BYE [%s] %s", imapErr.Code, imapErr.Text))
+					return
+				}
 				// This is an actual authentication failure, not a protocol error.
 				// The rate limiter handles this, so we don't count it as a command error.
 				// Check if error is due to server shutdown or temporary unavailability
@@ -453,8 +485,7 @@ func (s *Session) handleConnection() {
 			}
 
 			if !s.postAuthenticationSetup(tag, authStart) {
-				// Backend connection failed - send BYE and close connection
-				s.sendResponse("* BYE Backend server unavailable, please try again")
+				// postAuthenticationSetup already sent the tagged error and final BYE
 				return
 			}
 			authenticated = true
@@ -586,6 +617,11 @@ func (s *Session) ErrorLog(msg string, keysAndValues ...any) {
 
 // authenticateUser authenticates the user against the database.
 func (s *Session) authenticateUser(username, password string) error {
+	// Remember the username exactly as submitted: the lookup cache is keyed on
+	// it (every Set below uses it), so invalidation must use the same value —
+	// not the resolved s.username, which can differ for token/master/+detail logins.
+	s.submittedUsername = username
+
 	// Set username early for logging - will be updated if remotelookup resolves to a different address
 	// Parse username to get base address (strip +detail for consistent logging)
 	if addr, err := server.NewAddress(username); err == nil {
@@ -697,17 +733,16 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Single consolidated log for authentication success
 				s.InfoLog("authentication successful", "cached", true, "method", "cache")
 
-				// Check if context is cancelled (server shutting down) before attempting backend connection
+				// Check if context is cancelled (server shutting down)
 				if err := s.ctx.Err(); err != nil {
-					s.WarnLog("context cancelled during cache hit, cannot connect to backend", "error", err)
+					s.WarnLog("context cancelled during cache hit", "error", err)
 					return server.ErrServerShuttingDown // Triggers UNAVAILABLE response instead of auth failed
 				}
 
-				// Connect to backend to set routing method and establish connection
-				if err := s.connectToBackend(); err != nil {
-					return fmt.Errorf("failed to connect to backend: %w", err)
-				}
-
+				// NOTE: the backend connection is established by
+				// postAuthenticationSetup (the single owner of connectToBackend).
+				// Connecting here as well used to open a second backend
+				// connection and leak the first one on every cache hit.
 				return nil
 			} else {
 				// Different password on positive entry - always revalidate
@@ -1082,12 +1117,17 @@ func (s *Session) authenticateUser(username, password string) error {
 		passwordHash = lookupcache.HashPassword(password)
 	}
 	s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-		AccountID:        accountID,
-		PasswordHash:     passwordHash,
-		ServerAddress:    "", // Will be populated by affinity/routing in next connection
-		Result:           lookupcache.AuthSuccess,
-		FromRemoteLookup: false,
-		IsNegative:       false,
+		AccountID:     accountID,
+		PasswordHash:  passwordHash,
+		ServerAddress: "", // Will be populated by affinity/routing in next connection
+		// Preserve the server-level ID-forwarding setting: cache hits rebuild
+		// routingInfo from this entry and postAuthenticationSetup reads
+		// RemoteUseIDCommand from routingInfo. Without this, ID forwarding
+		// (real client IP to the backend) silently turned off on cache hits.
+		RemoteUseIDCommand: s.server.remoteUseIDCommand,
+		Result:             lookupcache.AuthSuccess,
+		FromRemoteLookup:   false,
+		IsNegative:         false,
 	})
 
 	return nil
@@ -1197,12 +1237,21 @@ func (s *Session) connectToBackend() error {
 		return fmt.Errorf("failed to set read deadline for greeting: %w", err)
 	}
 
-	// Read greeting from backend
-	_, err = s.backendReader.ReadString('\n')
+	// Read greeting from backend (bounded so a misbehaving backend cannot
+	// balloon memory with a newline-less stream)
+	greeting, err := server.ReadBoundedLine(s.backendReader, 8192)
 	if err != nil {
 		s.backendConn.Close()
 		s.ErrorLog("Failed to read backend greeting", "backend", s.serverAddr, "error", err)
 		return fmt.Errorf("failed to read backend greeting: %w", err)
+	}
+	// Only an untagged OK greeting is usable: BYE means the backend refuses
+	// service, and PREAUTH would be an already-authenticated connection that
+	// cannot go through our AUTHENTICATE impersonation flow.
+	if !strings.HasPrefix(greeting, "* OK") {
+		s.backendConn.Close()
+		s.ErrorLog("Unexpected backend greeting", "backend", s.serverAddr, "greeting", strings.TrimRight(greeting, "\r\n"))
+		return fmt.Errorf("unexpected backend greeting: %s", strings.TrimRight(greeting, "\r\n"))
 	}
 
 	// Clear the read deadline after successful greeting
@@ -1241,11 +1290,25 @@ func (s *Session) authenticateToBackend() (string, error) {
 	s.backendWriter.Flush()
 	s.mu.Unlock()
 
-	// Read authentication response
-	response, err := s.backendReader.ReadString('\n')
-	if err != nil {
-		s.ErrorLog("Failed to read auth response from backend", "backend", s.serverAddr, "error", err)
-		return "", fmt.Errorf("%w: failed to read auth response: %w", server.ErrBackendAuthFailed, err)
+	// Read authentication response. The backend may emit untagged lines
+	// (e.g. "* CAPABILITY ...") before the tagged reply; skip them instead of
+	// misclassifying them as an auth failure. Reads are bounded so a
+	// misbehaving backend cannot balloon memory.
+	var response string
+	for i := 0; i < 32; i++ {
+		line, err := server.ReadBoundedLine(s.backendReader, 65536)
+		if err != nil {
+			s.ErrorLog("Failed to read auth response from backend", "backend", s.serverAddr, "error", err)
+			return "", fmt.Errorf("%w: failed to read auth response: %w", server.ErrBackendAuthFailed, err)
+		}
+		if strings.HasPrefix(line, "* ") {
+			continue // untagged response before the tagged reply
+		}
+		response = line
+		break
+	}
+	if response == "" {
+		return "", fmt.Errorf("%w: no tagged auth response from backend", server.ErrBackendAuthFailed)
 	}
 
 	// Clear the deadline after successful authentication
@@ -1268,7 +1331,11 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 	// Connect to backend
 	if err := s.connectToBackend(); err != nil {
 		s.ErrorLog("Failed to connect to backend", "error", err)
+		// Invalidate the cache so the next attempt re-resolves routing: a
+		// cached ServerAddress may be stale (e.g. account moved backends).
+		s.invalidateLookupCache("backend connect failure")
 		s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", clientTag))
+		s.sendResponse("* BYE Backend server unavailable, please try again")
 		return false
 	}
 
@@ -1295,11 +1362,7 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 		// CRITICAL: Invalidate cache on backend authentication failure
 		// This ensures the next request does fresh remotelookup/database lookup
 		// to pick up backend changes (e.g., domain moved to different server)
-		if s.server.lookupCache != nil && s.username != "" {
-			cacheKey := s.server.name + ":" + s.username
-			s.server.lookupCache.Invalidate(cacheKey)
-			s.DebugLog("invalidated cache due to backend auth failure", "cache_key", cacheKey)
-		}
+		s.invalidateLookupCache("backend auth failure")
 
 		// Check if this is a timeout or connection error (backend unavailable)
 		// rather than an actual authentication failure
@@ -1315,12 +1378,27 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 			s.backendReader = nil
 			s.backendWriter = nil
 		}
+		s.sendResponse("* BYE Backend server unavailable, please try again")
 		return false
 	}
 
-	// Register connection
+	// Register connection. The tracker only returns an error when a per-user
+	// or per-user-per-IP connection limit is exceeded, so enforce it here —
+	// the backend server does the same and replies NO [LIMIT].
 	if err := s.registerConnection(); err != nil {
-		s.InfoLog("rejected connection registration", "error", err)
+		s.InfoLog("connection rejected by connection tracker", "error", err)
+		// Mark as rejected so close() does not decrement a slot this session
+		// never held (which would erode the limit for the account).
+		s.connRejected = true
+		s.sendResponse(fmt.Sprintf("%s NO [LIMIT] Too many connections", clientTag))
+		s.sendResponse("* BYE Too many connections")
+		if s.backendConn != nil {
+			s.backendConn.Close()
+			s.backendConn = nil
+			s.backendReader = nil
+			s.backendWriter = nil
+		}
+		return false
 	}
 
 	// Log authentication at INFO level with all required fields
@@ -1342,6 +1420,54 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 	}
 	s.sendResponse(fmt.Sprintf("%s %s", clientTag, responsePayload))
 	return true
+}
+
+// invalidateLookupCache removes this session's lookup-cache entry so the next
+// attempt re-resolves authentication/routing. The cache is keyed on the
+// username exactly as the client submitted it (which may carry a token,
+// master suffix or +detail), NOT on the resolved s.username.
+func (s *Session) invalidateLookupCache(reason string) {
+	username := s.submittedUsername
+	if username == "" {
+		username = s.username
+	}
+	if username == "" {
+		return
+	}
+	s.server.lookupCache.InvalidateUser(s.server.name, username)
+	s.DebugLog("invalidated lookup cache", "reason", reason, "username", username)
+}
+
+// drainClientReaderToBackend forwards any bytes still buffered in the
+// pre-auth client reader to the backend. A client may pipeline its first
+// commands behind LOGIN/AUTHENTICATE in the same TCP segment; those bytes sit
+// in s.clientReader's buffer and would be silently dropped if proxying read
+// only from the raw connection.
+func (s *Session) drainClientReaderToBackend() (int64, error) {
+	if s.clientReader == nil {
+		return 0, nil
+	}
+	n := s.clientReader.Buffered()
+	if n == 0 {
+		return 0, nil
+	}
+	pipelined, err := s.clientReader.Peek(n)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.backendConn.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return 0, fmt.Errorf("failed to set write deadline: %w", err)
+	}
+	nw, werr := s.backendConn.Write(pipelined)
+	_ = s.backendConn.SetWriteDeadline(time.Time{})
+	if werr != nil {
+		return int64(nw), werr
+	}
+	if _, derr := s.clientReader.Discard(n); derr != nil {
+		return int64(nw), derr
+	}
+	s.DebugLog("forwarded pipelined client data to backend", "bytes", nw)
+	return int64(nw), nil
 }
 
 // startProxy starts bidirectional proxying between client and backend.
@@ -1390,7 +1516,15 @@ func (s *Session) startProxy() {
 				s.backendConn.Close()
 			}
 		}()
-		bytesIn, err := server.CopyWithDeadline(s.ctx, s.backendConn, s.clientConn, "client-to-backend")
+		// Forward any bytes the client pipelined behind its login command that
+		// are still buffered in the pre-auth reader; CopyWithDeadline reads
+		// from the raw conn and would otherwise silently drop them.
+		bytesIn, err := s.drainClientReaderToBackend()
+		if err == nil {
+			var copied int64
+			copied, err = server.CopyWithDeadline(s.ctx, s.backendConn, s.clientConn, "client-to-backend")
+			bytesIn += copied
+		}
 		s.DebugLog("Client-to-backend copy finished", "bytes", bytesIn, "error", err)
 		metrics.BytesThroughput.WithLabelValues("imap_proxy", "in").Add(float64(bytesIn))
 		if err != nil && !isClosingError(err) {
@@ -1492,7 +1626,9 @@ func (s *Session) close() {
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
 	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
-	if s.server.connTracker != nil {
+	// Skip unregister when registration was rejected; otherwise we would
+	// decrement a slot this session never held (limit erosion for the account).
+	if s.server.connTracker != nil && !s.connRejected {
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -1571,9 +1707,17 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 // that was buffered but not yet read.
 func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int64, error) {
 	const writeDeadline = 30 * time.Second
+	const readDeadline = 30 * time.Minute // Detect stale backends while supporting IMAP IDLE (29min, RFC 2177)
 	var totalBytes int64
 	buf := make([]byte, 32*1024)
 	nextDeadline := time.Now()
+
+	// Enable TCP keepalive on the backend connection to detect dead peers
+	// (mirrors CopyWithDeadline, which handles the client-to-backend side).
+	if tcpConn, ok := s.backendConn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(2 * time.Minute)
+	}
 
 	for {
 		select {
@@ -1581,6 +1725,11 @@ func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int
 			return totalBytes, s.ctx.Err()
 		default:
 		}
+
+		// Bound each read so a silently dead backend cannot pin this goroutine
+		// (and the whole session) forever when no absolute session timeout is
+		// configured. The reader wraps s.backendConn, so the deadline applies.
+		_ = s.backendConn.SetReadDeadline(time.Now().Add(readDeadline))
 
 		nr, err := src.Read(buf)
 		if nr > 0 {
@@ -1608,6 +1757,9 @@ func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int
 			}
 		}
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return totalBytes, fmt.Errorf("read timeout in backend-to-client after %v (connection appears stale): %w", readDeadline, err)
+			}
 			if err != io.EOF {
 				return totalBytes, err
 			}

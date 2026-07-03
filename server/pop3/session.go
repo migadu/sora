@@ -810,18 +810,17 @@ func (s *POP3Session) handleConnection() {
 				}
 
 				ok, line := buildSingleListResponse(s.messages, s.deleted, msgNumber)
+				// Capture under the lock: keeps all s.messages reads under the
+				// guard, consistent with every other access. (review R2)
+				messageCount := len(s.messages)
 				release()
 
 				if !ok {
 					recordMetrics("failure")
-					if msgNumber > len(s.messages) {
-						if s.handleClientError(writer, "-ERR No such message\r\n") {
-							return
-						}
+					if msgNumber > messageCount {
+						s.replyBenignError(writer, "-ERR No such message\r\n")
 					} else {
-						if s.handleClientError(writer, "-ERR Message is deleted\r\n") {
-							return
-						}
+						s.replyBenignError(writer, "-ERR Message is deleted\r\n")
 					}
 					continue
 				}
@@ -956,9 +955,7 @@ func (s *POP3Session) handleConnection() {
 				if msgNumber > len(s.messages) {
 					release()
 					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR No such message\r\n") {
-						return
-					}
+					s.replyBenignError(writer, "-ERR No such message\r\n")
 					continue
 				}
 
@@ -966,9 +963,7 @@ func (s *POP3Session) handleConnection() {
 				if s.deleted[msgNumber-1] {
 					release()
 					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR Message is deleted\r\n") {
-						return
-					}
+					s.replyBenignError(writer, "-ERR Message is deleted\r\n")
 					continue
 				}
 
@@ -1135,25 +1130,19 @@ func (s *POP3Session) handleConnection() {
 			// Phase 4: Handle message retrieval and response outside the lock.
 			if !msgFound {
 				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR No such message\r\n") {
-					return
-				}
+				s.replyBenignError(writer, "-ERR No such message\r\n")
 				continue
 			}
 
 			if isDeleted {
 				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Message is deleted\r\n") {
-					return
-				}
+				s.replyBenignError(writer, "-ERR Message is deleted\r\n")
 				continue
 			}
 
 			if msg.UID == 0 {
 				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR No such message\r\n") {
-					return
-				}
+				s.replyBenignError(writer, "-ERR No such message\r\n")
 				continue
 			}
 
@@ -1187,16 +1176,17 @@ func (s *POP3Session) handleConnection() {
 			// Find header/body separator
 			headerEndIndex := strings.Index(messageStr, "\n\n")
 			if headerEndIndex == -1 {
-				// Message has no body, just headers
-				// Convert back to CRLF for POP3 protocol
-				result := strings.ReplaceAll(messageStr, "\n", "\r\n")
-				// Dot-stuff per RFC 1939
-				stuffedResult := dotStuffPOP3(result)
-				writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", len(result)))
-				if strings.HasSuffix(stuffedResult, "\r\n") {
-					writer.WriteString(stuffedResult + ".\r\n")
+				// Message has no body, just headers. Stream the LF-normalized bytes
+				// as a CRLF, dot-stuffed payload via the shared RETR helpers instead
+				// of materializing CRLF-converted + stuffed + concatenated copies.
+				// (review R5)
+				resultBytes := []byte(messageStr)
+				writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", crlfNormalizedLen(resultBytes)))
+				writeDotStuffedBody(writer, resultBytes)
+				if n := len(resultBytes); n > 0 && resultBytes[n-1] == '\n' {
+					writer.WriteString(".\r\n")
 				} else {
-					writer.WriteString(stuffedResult + "\r\n.\r\n")
+					writer.WriteString("\r\n.\r\n")
 				}
 				s.DebugLog("retrieved headers for message", "uid", msg.UID)
 				// Free memory immediately after sending response
@@ -1235,18 +1225,21 @@ func (s *POP3Session) handleConnection() {
 				result = headers + "\n\n"
 			}
 
-			// Convert back to CRLF for POP3 protocol
-			result = strings.ReplaceAll(result, "\n", "\r\n")
-
-			// Dot-stuff per RFC 1939
-			stuffedResult := dotStuffPOP3(result)
+			// Stream the LF-normalized result as a CRLF, dot-stuffed payload via
+			// the shared RETR helpers (crlfNormalizedLen counts one extra octet
+			// per bare LF, so the announced count equals the previous
+			// ReplaceAll-to-CRLF length) instead of materializing the CRLF copy,
+			// the stuffed copy, and the terminator concatenation. bodyData and
+			// the two intermediate strings remain the peak. (review R5)
+			resultBytes := []byte(result)
 
 			backendDuration = time.Since(start).Seconds()
-			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", len(result)))
-			if strings.HasSuffix(stuffedResult, "\r\n") {
-				writer.WriteString(stuffedResult + ".\r\n")
+			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", crlfNormalizedLen(resultBytes)))
+			writeDotStuffedBody(writer, resultBytes)
+			if n := len(resultBytes); n > 0 && resultBytes[n-1] == '\n' {
+				writer.WriteString(".\r\n")
 			} else {
-				writer.WriteString(stuffedResult + "\r\n.\r\n")
+				writer.WriteString("\r\n.\r\n")
 			}
 			s.DebugLog("retrieved top lines of message", "lines", lines, "uid", msg.UID)
 
@@ -1374,25 +1367,19 @@ func (s *POP3Session) handleConnection() {
 			// Phase 4: Handle message retrieval and response outside the lock.
 			if !msgFound {
 				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR No such message\r\n") {
-					return
-				}
+				s.replyBenignError(writer, "-ERR No such message\r\n")
 				continue
 			}
 
 			if isDeleted {
 				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Message is deleted\r\n") {
-					return
-				}
+				s.replyBenignError(writer, "-ERR Message is deleted\r\n")
 				continue
 			}
 
 			if msg.UID == 0 {
 				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR No such message\r\n") {
-					return
-				}
+				s.replyBenignError(writer, "-ERR No such message\r\n")
 				continue
 			}
 
@@ -1428,9 +1415,9 @@ func (s *POP3Session) handleConnection() {
 					s.memTracker.Free(int64(len(bodyData)))
 				}
 				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Message body is empty\r\n") {
-					return
-				}
+				// Server-side data problem, not a client error — do not penalize
+				// the client for it. (review R4)
+				s.replyBenignError(writer, "-ERR Message body is empty\r\n")
 				continue
 			}
 
@@ -1448,7 +1435,8 @@ func (s *POP3Session) handleConnection() {
 			// exact number of body octets the client reconstructs — so byte-counting
 			// clients stay in sync.
 			backendDuration = time.Since(retrieveStart).Seconds()
-			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", crlfNormalizedLen(bodyData)))
+			announcedOctets := crlfNormalizedLen(bodyData)
+			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", announcedOctets))
 			writeDotStuffedBody(writer, bodyData)
 			// Terminate with <CRLF>.<CRLF>. If the body already ended with a newline
 			// the stream ends in CRLF, so only ".CRLF" is needed; otherwise the
@@ -1465,16 +1453,22 @@ func (s *POP3Session) handleConnection() {
 				s.memTracker.Free(int64(len(bodyData)))
 			}
 
-			// Track successful message retrieval
+			// Track successful message retrieval. Byte metrics use the announced
+			// (CRLF-normalized) octet count — the bytes actually reconstructed by
+			// the client — rather than the stored msg.Size, which undercounts for
+			// bare-LF bodies. Note: this deliberately counts reconstructed octets,
+			// NOT raw on-the-wire bytes — dot-stuffing bytes and the .CRLF
+			// terminator are excluded. A true wire-byte counter would have to be
+			// accumulated inside writeDotStuffedBody. (review R7)
 			metrics.MessageThroughput.WithLabelValues("pop3", "retrieved", "success").Inc()
-			metrics.BytesThroughput.WithLabelValues("pop3", "out").Add(float64(msg.Size))
+			metrics.BytesThroughput.WithLabelValues("pop3", "out").Add(float64(announcedOctets))
 			metrics.CriticalOperationDuration.WithLabelValues("pop3_retrieve").Observe(backendDuration)
 
 			// Track domain and user activity - RETR is bandwidth intensive!
 			if s.User != nil {
 				metrics.TrackDomainCommand("pop3", s.Domain(), "RETR")
 				metrics.TrackUserActivity("pop3", s.FullAddress(), "command", 1)
-				metrics.TrackDomainBytes("pop3", s.Domain(), "out", int64(msg.Size))
+				metrics.TrackDomainBytes("pop3", s.Domain(), "out", int64(announcedOctets))
 				metrics.TrackDomainMessage("pop3", s.Domain(), "fetched")
 			}
 
@@ -1643,9 +1637,7 @@ func (s *POP3Session) handleConnection() {
 				release()
 				s.DebugLog("dele no such message", "msg_number", msgNumber)
 				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR No such message\r\n") {
-					return
-				}
+				s.replyBenignError(writer, "-ERR No such message\r\n")
 				continue
 			}
 
@@ -1654,9 +1646,7 @@ func (s *POP3Session) handleConnection() {
 				release()
 				s.DebugLog("dele no such message", "msg_number", msgNumber)
 				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR No such message\r\n") {
-					return
-				}
+				s.replyBenignError(writer, "-ERR No such message\r\n")
 				continue
 			}
 
@@ -1668,9 +1658,7 @@ func (s *POP3Session) handleConnection() {
 				release()
 				s.DebugLog("dele already deleted", "msg_number", msgNumber)
 				recordMetrics("failure")
-				if s.handleClientError(writer, fmt.Sprintf("-ERR message %d already deleted\r\n", msgNumber)) {
-					return
-				}
+				s.replyBenignError(writer, fmt.Sprintf("-ERR message %d already deleted\r\n", msgNumber))
 				continue
 			}
 
@@ -1679,10 +1667,14 @@ func (s *POP3Session) handleConnection() {
 			// Track for session summary
 			s.messagesDeleted++
 
+			// Capture under the lock: keeps all s.deleted reads under the
+			// guard, consistent with every other access. (review R2)
+			totalDeleted := len(s.deleted)
+
 			release()
 
 			writer.WriteString("+OK Message deleted\r\n")
-			s.DebugLog("marked message for deletion", "msg_number", msgNumber, "uid", msg.UID, "mailbox_id", mailboxID, "total_deleted", len(s.deleted))
+			s.DebugLog("marked message for deletion", "msg_number", msgNumber, "uid", msg.UID, "mailbox_id", mailboxID, "total_deleted", totalDeleted)
 
 			metrics.MessageThroughput.WithLabelValues("pop3", "deleted", "success").Inc()
 
@@ -1711,11 +1703,18 @@ func (s *POP3Session) handleConnection() {
 				continue
 			}
 
+			// AUTH with no arguments: legacy RFC 1734-style probe for available
+			// mechanisms, which RFC 5034 §4 permits supporting for compatibility.
+			// Answer with the mechanism list instead of an error so probing
+			// clients don't stall. Mirrors CAPA's gating: mechanisms are listed
+			// only when auth is actually usable on this connection. (review M-c)
 			if len(parts) < 2 {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Missing authentication mechanism\r\n") {
-					return
+				writer.WriteString("+OK Supported authentication mechanisms\r\n")
+				if s.server.insecureAuth || server.ConnIsTLS(*s.conn) {
+					writer.WriteString("PLAIN\r\n")
 				}
+				writer.WriteString(".\r\n")
+				recordMetrics("success")
 				continue
 			}
 
@@ -2151,9 +2150,12 @@ func (s *POP3Session) handleConnection() {
 				} else {
 					s.language = "en" // "en" and "*" both select English
 				}
+				// Capture under the lock so s.language is not read after
+				// release(). (review R2)
+				newLang := s.language
 				release()
 
-				writer.WriteString(fmt.Sprintf("+OK Language changed to %s\r\n", s.language))
+				writer.WriteString(fmt.Sprintf("+OK Language changed to %s\r\n", newLang))
 			}
 			s.DebugLog("lang command executed", "current", currentLang)
 
@@ -2164,6 +2166,16 @@ func (s *POP3Session) handleConnection() {
 			recordMetrics := func(status string) {
 				metrics.CommandsTotal.WithLabelValues("pop3", "UTF8", status).Inc()
 				metrics.CommandDuration.WithLabelValues("pop3", "UTF8").Observe(time.Since(start).Seconds())
+			}
+
+			// RFC 6856 §2: the UTF8 command is only valid in the AUTHORIZATION
+			// state. Reject it after authentication. (review M-b)
+			if s.authenticated.Load() {
+				recordMetrics("failure")
+				if s.handleClientError(writer, "-ERR UTF8 only allowed before authentication\r\n") {
+					return
+				}
+				continue
 			}
 
 			// UTF8 command - enable UTF-8 mode (atomic write, no lock needed)
@@ -2217,16 +2229,16 @@ func (s *POP3Session) handleConnection() {
 				release()
 			}
 
-			// Phase 2: Perform cache and database operations outside the lock.
+			// Phase 2: Perform database operations outside the lock.
+			//
+			// Note: the local body cache is deliberately NOT purged here. Content is
+			// deduplicated by hash, so the same cache entry may still back other
+			// messages (same account, another mailbox, or another recipient), and a
+			// purge would also run before the expunge is known to have committed.
+			// Stale entries are reclaimed by the cache's own eviction. (review R3)
 			var expungeUIDs []imap.UID
 			for _, msg := range messagesToExpunge {
 				s.DebugLog("will expunge message", "uid", msg.UID)
-				// Delete from cache before expunging
-				if s.server.cache != nil {
-					if err := s.server.cache.Delete(msg.ContentHash); err != nil && !isNotExist(err) {
-						s.WarnLog("failed to delete message from cache", "content_hash", msg.ContentHash, "error", err)
-					}
-				}
 				expungeUIDs = append(expungeUIDs, msg.UID)
 			}
 
@@ -2343,8 +2355,16 @@ func (s *POP3Session) handleConnection() {
 	}
 }
 
-func isNotExist(err error) bool {
-	return err != nil && os.IsNotExist(err)
+// replyBenignError answers a well-formed command whose target simply does not
+// apply — e.g. LIST/UIDL/RETR/TOP/DELE addressing a message number past the end
+// of the maildrop, or one already marked deleted — with a plain -ERR. These
+// occur in legitimate client flows (PIPELINING is advertised, and probing
+// message numbers until -ERR is a normal pattern), so unlike handleClientError
+// they carry no anti-bruteforce sleep and do not count toward the
+// too-many-errors disconnect threshold. (review R4)
+func (s *POP3Session) replyBenignError(writer *bufio.Writer, errMsg string) {
+	writer.WriteString(errMsg)
+	writer.Flush()
 }
 
 func (s *POP3Session) handleClientError(writer *bufio.Writer, errMsg string) bool {
@@ -2358,9 +2378,12 @@ func (s *POP3Session) handleClientError(writer *bufio.Writer, errMsg string) boo
 	delay := time.Duration(s.errorsCount) * Pop3ErrorDelay
 	time.Sleep(delay)
 
-	// Replace [AUTH] with [LOGIN-DELAY n] where n is seconds until next attempt is allowed
-	errMsg = strings.Replace(errMsg, "[AUTH]", fmt.Sprintf("[LOGIN-DELAY %d]", int(delay.Seconds())), 1)
-
+	// Send the message as composed. In particular, [AUTH] must survive intact:
+	// CAPA advertises AUTH-RESP-CODE (RFC 3206), which promises clients the
+	// [AUTH] response code on credential failures. It was previously rewritten
+	// to [LOGIN-DELAY n] here, so the advertised code was never actually sent —
+	// and LOGIN-DELAY (RFC 2449 §8.1.1) is a login-frequency code for USER/PASS,
+	// not a generic error prefix. (review R1)
 	writer.WriteString(errMsg)
 	writer.Flush()
 	return false

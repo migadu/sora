@@ -73,8 +73,8 @@ func TestPutScriptOOMProtection(t *testing.T) {
 
 		t.Logf("Response: %s", line)
 
-		if !strings.Contains(line, "NO") || !strings.Contains(line, "MAXSCRIPTSIZE") {
-			t.Errorf("Expected NO (MAXSCRIPTSIZE) rejection, got: %s", line)
+		if !strings.Contains(line, "NO") || !strings.Contains(line, "QUOTA/MAXSIZE") {
+			t.Errorf("Expected NO (QUOTA/MAXSIZE) rejection, got: %s", line)
 		}
 	})
 
@@ -120,8 +120,8 @@ func TestPutScriptOOMProtection(t *testing.T) {
 			t.Fatalf("Failed to read response: %v", err)
 		}
 
-		if !strings.Contains(line, "NO") || !strings.Contains(line, "MAXSCRIPTSIZE") {
-			t.Errorf("Expected NO (MAXSCRIPTSIZE) rejection, got: %s", line)
+		if !strings.Contains(line, "NO") || !strings.Contains(line, "QUOTA/MAXSIZE") {
+			t.Errorf("Expected NO (QUOTA/MAXSIZE) rejection, got: %s", line)
 		}
 	})
 

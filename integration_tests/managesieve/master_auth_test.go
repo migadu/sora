@@ -452,3 +452,59 @@ func TestManageSieve_MasterAuthenticationMultipleAccounts(t *testing.T) {
 		t.Log("✓ Account2 LISTSCRIPTS successful")
 	})
 }
+
+// TestManageSieve_MasterSASLNetworkGate_AUTHENTICATE verifies that the
+// master_sasl_allowed_networks gate is enforced on the AUTHENTICATE path (audit H3),
+// not just LOGIN. A master-SASL impersonation from a source outside the allowed
+// networks must be rejected even with valid master credentials.
+func TestManageSieve_MasterSASLNetworkGate_AUTHENTICATE(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	address := common.GetRandomAddress(t)
+
+	// Restrict master SASL to a network that does NOT contain the loopback test peer.
+	server, err := managesieve.New(
+		context.Background(),
+		"test-mastersasl-gate",
+		"localhost",
+		address,
+		rdb,
+		managesieve.ManageSieveServerOptions{
+			Config:                    &config.Config{},
+			MasterSASLUsername:        masterSASLUsername,
+			MasterSASLPassword:        masterSASLPassword,
+			MasterSASLAllowedNetworks: []string{"10.0.0.0/8"}, // excludes 127.0.0.1
+			InsecureAuth:              true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create ManageSieve server: %v", err)
+	}
+	errChan := make(chan error, 1)
+	go func() { server.Start(errChan) }()
+	defer server.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	client, err := NewManageSieveClient(address)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer client.Close()
+
+	// Valid master-SASL credentials, but from a disallowed source network.
+	authString := account.Email + "\x00" + masterSASLUsername + "\x00" + masterSASLPassword
+	encoded := base64.StdEncoding.EncodeToString([]byte(authString))
+	if err := client.SendCommand(fmt.Sprintf("AUTHENTICATE \"PLAIN\" \"%s\"", encoded)); err != nil {
+		t.Fatalf("AUTHENTICATE command failed: %v", err)
+	}
+	response, err := client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read AUTHENTICATE response: %v", err)
+	}
+	if !strings.HasPrefix(response, "NO") {
+		t.Errorf("Expected NO (master SASL from disallowed network) on AUTHENTICATE, got: %s", response)
+	}
+	t.Logf("✓ AUTHENTICATE master SASL correctly gated by network: %s", response)
+}

@@ -13,7 +13,7 @@ vendor/
 CLAUDE.md
 .claude/
 config-live.toml
-tasks/todo.md
+tasks/
 
 # Local multi-module dev bridge
 go.work

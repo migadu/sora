@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/migadu/go-sieve"
 	"github.com/migadu/sora/consts"
@@ -55,6 +56,37 @@ func quoteSieveString(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, "\"", "\\\"")
 	return "\"" + s + "\""
+}
+
+// sanitizeResponseText neutralizes control characters (CR, LF, NUL and other C0/DEL
+// bytes) in server-supplied human-readable text — e.g. SIEVE validation errors that
+// echo attacker-controlled script tokens — so it cannot inject a forged response line
+// when embedded in a NO/OK response. Pair with quoteSieveString for RFC 5804 framing.
+func sanitizeResponseText(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
+// validateScriptName enforces basic ManageSieve script-name hygiene (RFC 5804 §1.6:
+// names are UTF-8 strings). Rejects empty names, invalid UTF-8, and control characters
+// (C0/DEL), which have no legitimate use and could corrupt logs or LIST/GETSCRIPT output.
+func validateScriptName(name string) error {
+	if name == "" {
+		return fmt.Errorf("script name cannot be empty")
+	}
+	if !utf8.ValidString(name) {
+		return fmt.Errorf("script name must be valid UTF-8")
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("script name must not contain control characters")
+		}
+	}
+	return nil
 }
 
 func (s *ManageSieveSession) sendCapabilities() {
@@ -184,6 +216,25 @@ func (s *ManageSieveSession) handleConnection() {
 			recordMetrics := func(status string) {
 				metrics.CommandsTotal.WithLabelValues("managesieve", "LOGIN", status).Inc()
 				metrics.CommandDuration.WithLabelValues("managesieve", "LOGIN").Observe(time.Since(start).Seconds())
+			}
+
+			// RFC 5804 state machine: reject re-authentication on an already
+			// authenticated connection (prevents authenticated-connection counter and
+			// termination-poller goroutine leaks; close cleans up only once).
+			if s.authenticated {
+				s.sendResponse("NO Already authenticated\r\n")
+				recordMetrics("failure")
+				continue
+			}
+
+			// Cleartext-auth gate: LOGIN carries the password as a plaintext command
+			// argument, so it MUST honor the same transport-security policy as
+			// AUTHENTICATE (handleAuthenticate). Without this, the non-standard LOGIN
+			// command would bypass the STARTTLS requirement AUTHENTICATE enforces.
+			if !s.isTLS && !s.server.insecureAuth {
+				s.sendResponse("NO Authentication not permitted on insecure connection. Use STARTTLS first.\r\n")
+				recordMetrics("failure")
+				continue
 			}
 
 			if len(parts) < 3 {
@@ -482,7 +533,7 @@ func (s *ManageSieveSession) handleConnection() {
 					continue
 				}
 				if length64 > s.server.maxScriptSize {
-					s.sendResponse(fmt.Sprintf("NO (MAXSCRIPTSIZE) Script size %d exceeds maximum allowed size %d\r\n", length64, s.server.maxScriptSize))
+					s.sendResponse(fmt.Sprintf("NO (QUOTA/MAXSIZE) \"Script size %d exceeds maximum allowed size %d\"\r\n", length64, s.server.maxScriptSize))
 					recordMetrics("failure")
 					continue
 				}
@@ -552,7 +603,7 @@ func (s *ManageSieveSession) handleConnection() {
 					continue
 				}
 				if length64 > s.server.maxScriptSize {
-					s.sendResponse(fmt.Sprintf("NO (MAXSCRIPTSIZE) Script size %d exceeds maximum allowed size %d\r\n", length64, s.server.maxScriptSize))
+					s.sendResponse(fmt.Sprintf("NO (QUOTA/MAXSIZE) \"Script size %d exceeds maximum allowed size %d\"\r\n", length64, s.server.maxScriptSize))
 					recordMetrics("failure")
 					continue
 				}
@@ -709,6 +760,14 @@ func (s *ManageSieveSession) handleConnection() {
 			}
 			if s.isTLS {
 				s.sendResponse("NO TLS already active\r\n")
+				recordMetrics("failure")
+				continue
+			}
+			// RFC 5804 §2.2: STARTTLS resets to the non-authenticated state and prior
+			// knowledge MUST be discarded. Rather than silently re-authenticate, reject
+			// STARTTLS once authenticated (real clients always negotiate TLS before auth).
+			if s.authenticated {
+				s.sendResponse("NO STARTTLS not permitted after authentication\r\n")
 				recordMetrics("failure")
 				continue
 			}
@@ -929,11 +988,19 @@ func (s *ManageSieveSession) handleGetScript(name string) bool {
 
 	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, accountID)
 	if err != nil {
-		s.sendResponse("NO No such script\r\n")
+		if err == consts.ErrDBNotFound {
+			s.sendResponse("NO (NONEXISTENT) \"Script does not exist\"\r\n")
+			return false
+		}
+		s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
 		return false
 	}
 	s.writer.WriteString(fmt.Sprintf("{%d}\r\n", len(script.Script)))
 	s.writer.WriteString(script.Script)
+	// RFC 5804 §2.9 / §4: the string literal is terminated by CRLF before the OK
+	// response line. Without this, the OK is glued to the last script octet and
+	// clients that re-sync on the literal's trailing CRLF desync.
+	s.writer.WriteString("\r\n")
 	s.writer.Flush()
 	s.sendResponse("OK\r\n")
 	return true
@@ -948,10 +1015,10 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 		return false
 	}
 
-	// Validate script name - must not be empty and should be a valid identifier
+	// Validate script name - non-empty, valid UTF-8, no control characters.
 	name = strings.TrimSpace(server.UnquoteString(name)) // Remove surrounding quotes and whitespace
-	if name == "" {
-		s.sendResponse("NO Script name cannot be empty\r\n")
+	if err := validateScriptName(name); err != nil {
+		s.sendResponse(fmt.Sprintf("NO %s\r\n", quoteSieveString(err.Error())))
 		return false
 	}
 
@@ -968,7 +1035,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 
 	// Phase 2: Validate and perform DB operations
 	if int64(len(content)) > s.server.maxScriptSize {
-		s.sendResponse(fmt.Sprintf("NO (MAXSCRIPTSIZE) Script size %d exceeds maximum allowed size %d\r\n", len(content), s.server.maxScriptSize))
+		s.sendResponse(fmt.Sprintf("NO (QUOTA/MAXSIZE) \"Script size %d exceeds maximum allowed size %d\"\r\n", len(content), s.server.maxScriptSize))
 		return false
 	}
 
@@ -979,7 +1046,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	options.EnabledExtensions = s.server.supportedExtensions
 	_, err := sieve.Load(scriptReader, options)
 	if err != nil {
-		s.sendResponse(fmt.Sprintf("NO Script validation failed: %v\r\n", err))
+		s.sendResponse(fmt.Sprintf("NO %s\r\n", quoteSieveString("Script validation failed: "+sanitizeResponseText(err.Error()))))
 		return false
 	}
 
@@ -1050,7 +1117,7 @@ func (s *ManageSieveSession) handleCheckScript(content string) bool {
 	}
 
 	if int64(len(content)) > s.server.maxScriptSize {
-		s.sendResponse(fmt.Sprintf("NO (MAXSCRIPTSIZE) Script size %d exceeds maximum allowed size %d\r\n", len(content), s.server.maxScriptSize))
+		s.sendResponse(fmt.Sprintf("NO (QUOTA/MAXSIZE) \"Script size %d exceeds maximum allowed size %d\"\r\n", len(content), s.server.maxScriptSize))
 		return false
 	}
 
@@ -1061,7 +1128,7 @@ func (s *ManageSieveSession) handleCheckScript(content string) bool {
 	options.EnabledExtensions = s.server.supportedExtensions
 	_, err := sieve.Load(scriptReader, options)
 	if err != nil {
-		s.sendResponse(fmt.Sprintf("NO Script validation failed: %v\r\n", err))
+		s.sendResponse(fmt.Sprintf("NO %s\r\n", quoteSieveString("Script validation failed: "+sanitizeResponseText(err.Error()))))
 		return false
 	}
 
@@ -1069,9 +1136,11 @@ func (s *ManageSieveSession) handleCheckScript(content string) bool {
 	return true
 }
 
-// handleHaveSpace implements RFC 5804 HAVESPACE. The script name is part of the
-// command syntax but unused here: capacity is governed solely by maxScriptSize.
-func (s *ManageSieveSession) handleHaveSpace(_ string, size int64) bool {
+// handleHaveSpace implements RFC 5804 §2.5 HAVESPACE: it reports whether a script of the
+// given name and size could be stored, without storing it. Capacity is bounded by the max
+// script size and the per-account script-count quota. The name is significant: a HAVESPACE
+// for an existing script is a replacement, which does not increase the script count.
+func (s *ManageSieveSession) handleHaveSpace(name string, size int64) bool {
 	// Check if the context is closing before proceeding.
 	if s.ctx.Err() != nil {
 		s.DebugLog("request aborted", "command", "HAVESPACE")
@@ -1080,8 +1149,49 @@ func (s *ManageSieveSession) handleHaveSpace(_ string, size int64) bool {
 	}
 
 	if size > s.server.maxScriptSize {
-		s.sendResponse(fmt.Sprintf("NO (MAXSCRIPTSIZE) Script size %d exceeds maximum allowed size %d\r\n", size, s.server.maxScriptSize))
+		s.sendResponse(fmt.Sprintf("NO (QUOTA/MAXSIZE) \"Script size %d exceeds maximum allowed size %d\"\r\n", size, s.server.maxScriptSize))
 		return false
+	}
+
+	// Script-count quota (RFC 5804 §2.5) requires DB access. HAVESPACE is advisory, so if
+	// the DB layer is unavailable we optimistically report space (only the size bound above
+	// applies). In production rdb is always set; this guard also keeps the handler usable
+	// from unit tests that construct a minimal session.
+	if s.server.rdb != nil {
+		// Read session state for the count-quota check (respecting session pinning).
+		acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+		if !acquired {
+			s.WarnLog("failed to acquire read lock", "command", "HAVESPACE")
+			s.sendResponse("NO Server busy, try again later\r\n")
+			return false
+		}
+		accountID := s.AccountID()
+		useMaster := s.useMasterDB
+		release()
+
+		readCtx := s.ctx
+		if useMaster {
+			readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		}
+
+		// A HAVESPACE for an existing script name is a replacement (count unchanged); a new
+		// name would create a script and so must stay within the per-account script limit.
+		scripts, err := s.server.rdb.GetUserScriptsWithRetry(readCtx, accountID)
+		if err != nil {
+			s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
+			return false
+		}
+		exists := false
+		for _, sc := range scripts {
+			if sc.Name == name {
+				exists = true
+				break
+			}
+		}
+		if !exists && len(scripts) >= db.MaxScriptsPerAccount() {
+			s.sendResponse("NO (QUOTA/MAXSCRIPTS) \"Maximum number of scripts reached\"\r\n")
+			return false
+		}
 	}
 
 	s.sendResponse("OK\r\n")
@@ -1096,8 +1206,13 @@ func (s *ManageSieveSession) handleRenameScript(oldName, newName string) bool {
 		return false
 	}
 
-	if oldName == "" || newName == "" {
+	if oldName == "" {
 		s.sendResponse("NO Script name cannot be empty\r\n")
+		return false
+	}
+	// The new name is being created; hold it to the same hygiene as PUTSCRIPT.
+	if err := validateScriptName(newName); err != nil {
+		s.sendResponse(fmt.Sprintf("NO %s\r\n", quoteSieveString(err.Error())))
 		return false
 	}
 
@@ -1193,7 +1308,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, accountID)
 	if err != nil {
 		if err == consts.ErrDBNotFound {
-			s.sendResponse("NO No such script\r\n")
+			s.sendResponse("NO (NONEXISTENT) \"Script does not exist\"\r\n")
 			return false
 		}
 		s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n")
@@ -1208,7 +1323,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	options.EnabledExtensions = s.server.supportedExtensions
 	_, err = sieve.Load(scriptReader, options)
 	if err != nil {
-		s.sendResponse(fmt.Sprintf("NO Script validation failed: %v\r\n", err))
+		s.sendResponse(fmt.Sprintf("NO %s\r\n", quoteSieveString("Script validation failed: "+sanitizeResponseText(err.Error()))))
 		return false
 	}
 
@@ -1266,10 +1381,17 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 	script, err := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, accountID)
 	if err != nil {
 		if err == consts.ErrDBNotFound {
-			s.sendResponse("NO No such script\r\n") // RFC uses NO for "No such script"
+			s.sendResponse("NO (NONEXISTENT) \"Script does not exist\"\r\n")
 			return false
 		}
 		s.sendResponse("NO (TRYLATER) \"Service temporarily unavailable\"\r\n") // RFC uses NO for server errors
+		return false
+	}
+
+	// RFC 5804 §2.10: the active script MUST NOT be deleted; the client must first
+	// deactivate it via SETACTIVE "". GetScriptByName populates script.Active.
+	if script.Active {
+		s.sendResponse("NO (ACTIVE) \"Cannot delete the active script; deactivate it first\"\r\n")
 		return false
 	}
 
@@ -1359,6 +1481,16 @@ func (s *ManageSieveSession) Close() error {
 }
 
 func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
+	// RFC 5804: AUTHENTICATE is only valid in the non-authenticated state. Rejecting
+	// re-authentication also prevents leaking the authenticated-connection counter and
+	// spawning a duplicate termination-poller goroutine (both would otherwise run again
+	// on a second success while close cleans up only once). Checked before the failure
+	// defer so a state-machine rejection isn't miscounted as an auth failure.
+	if s.authenticated {
+		s.sendResponse("NO Already authenticated\r\n")
+		return false
+	}
+
 	start := time.Now()
 	success := false
 	defer func() {
@@ -1488,8 +1620,37 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 
 	// 1. Check for Master Username Authentication (user@domain.com@MASTER_USERNAME)
 	if parseErr == nil && len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername) {
+		// Rate-limit the master-password check. The master password is a tenant-wide
+		// credential; mirror LOGIN's master path (which throttles before its master
+		// check) so it cannot be brute-forced unthrottled — the regular-auth block
+		// below is already rate-limited, this branch previously was not.
+		netConn := *s.conn
+		var proxyInfo *server.ProxyProtocolInfo
+		if s.ProxyIP != "" {
+			proxyInfo = &server.ProxyProtocolInfo{SrcIP: s.RemoteIP}
+		}
+		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+		if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-MASTER"); err != nil {
+			if errors.Is(err, server.ErrDelayQueueFull) {
+				s.sendResponse("NO Too many concurrent authentication attempts. Please try again later.\r\n")
+				return false
+			}
+			return false
+		}
+		if s.server.authLimiter != nil {
+			if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, authnParsed.BaseAddress()); err != nil {
+				s.DebugLog("rate limited", "error", err)
+				// Same response as bad credentials so rate-limit state isn't an oracle.
+				s.sendResponse("NO Authentication failed\r\n")
+				return false
+			}
+		}
+
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+			if s.server.authLimiter != nil {
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authnParsed.BaseAddress(), true)
+			}
 			// Determine target user to impersonate
 			targetUserToImpersonate := authzID
 			if targetUserToImpersonate == "" {
@@ -1517,7 +1678,11 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 			targetAddress = &address
 			impersonating = true
 		} else {
-			// Record failed master password authentication
+			// Record failed master password authentication (feeds progressive delay /
+			// blocking so the tenant-wide master password can't be brute-forced).
+			if s.server.authLimiter != nil {
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authnParsed.BaseAddress(), false)
+			}
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
 
 			// Master username suffix was provided but master password was wrong - fail immediately
@@ -1528,8 +1693,18 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 
 	// 2. Check for Master SASL Authentication (traditional)
 	if !impersonating && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
-		// Check if this is a master SASL login
-		if authnID == string(s.server.masterSASLUsername) && password == string(s.server.masterSASLPassword) {
+		// Check if this is a master SASL login (constant-time comparison to avoid a
+		// timing side-channel on the tenant-wide master credentials).
+		if checkMasterCredential(authnID, s.server.masterSASLUsername) && checkMasterCredential(password, s.server.masterSASLPassword) {
+			// Network gate: master SASL is a tenant-wide impersonation capability.
+			// Anchored to the real socket peer (cannot be forged via PROXY/XCLIENT
+			// forwarding). Mirrors the LOGIN master-SASL path so AUTHENTICATE cannot be
+			// used to bypass master_sasl_allowed_networks.
+			if !s.server.masterSASLGate.Allowed((*s.conn).RemoteAddr()) {
+				s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString((*s.conn).RemoteAddr()))
+				s.sendResponse("NO Authentication failed\r\n")
+				return false
+			}
 			// Master SASL authentication successful
 			if authzID == "" {
 				s.DebugLog("master sasl authentication successful but no authorization identity", "authn_id", authnID)

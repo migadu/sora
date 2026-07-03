@@ -49,7 +49,9 @@ type Session struct {
 	startTime             time.Time
 	releaseConn           func() // Connection limiter cleanup function
 	proxyInfo             *server.ProxyProtocolInfo
-	gracefulShutdown      bool // Set during server shutdown to prevent copy goroutine from closing clientConn
+	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
+	submittedUsername     string // Username exactly as submitted by the client (lookup-cache key)
+	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
 }
 
 // newSession creates a new ManageSieve proxy session.
@@ -284,6 +286,15 @@ func (s *Session) handleConnection() {
 			authStart := time.Now() // Start authentication timing
 			if err := s.authenticateUser(authnID, password, authStart); err != nil {
 				s.DebugLog("authentication failed", "error", err)
+				// Rate limiter blocked the attempt: reply with the same line as
+				// a bad password (indistinguishable) but drop the connection
+				// instead of letting the client keep hammering it.
+				var rateLimitErr *server.RateLimitError
+				if errors.As(err, &rateLimitErr) {
+					s.sendResponse(`NO "Authentication failed"`)
+					s.InfoLog("dropping connection - rate limited")
+					return
+				}
 				// This is an actual authentication failure, not a protocol error.
 				// The rate limiter handles this, so we don't count it as a command error.
 				// Check if error is due to server shutdown or temporary unavailability
@@ -308,9 +319,16 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// Register connection
+			// Register connection. The tracker only returns an error when a
+			// per-user or per-user-per-IP connection limit is exceeded, so
+			// enforce it (this runs before the OK is sent).
 			if err := s.registerConnection(); err != nil {
-				s.DebugLog("failed to register connection", "error", err)
+				s.InfoLog("connection rejected by connection tracker", "error", err)
+				// Mark as rejected so close() does not decrement a slot this
+				// session never held (which would erode the account's limit).
+				s.connRejected = true
+				s.sendResponse(`NO (TRYLATER) "Too many connections"`)
+				return
 			}
 
 			// Set username on client connection for timeout logging
@@ -365,6 +383,16 @@ func (s *Session) handleConnection() {
 					return
 				}
 				continue
+			}
+
+			// RFC 5804 §2.2 / RFC 3207: reject and close if the client pipelined any data
+			// after STARTTLS before the handshake — buffered plaintext may be a MITM
+			// command-injection attempt. Mirrors the backend server (managesieve session.go).
+			// Checked BEFORE the OK so a stuffed connection never begins negotiation.
+			if s.clientReader.Buffered() > 0 {
+				s.WarnLog("STARTTLS rejected: client sent data before TLS handshake")
+				s.sendResponse(`NO "Pipelined data after STARTTLS is not allowed"`)
+				return
 			}
 
 			// Send OK response
@@ -522,6 +550,11 @@ func (s *Session) ErrorLog(msg string, keyvals ...any) {
 
 // authenticateUser authenticates the user against the database.
 func (s *Session) authenticateUser(username, password string, authStart time.Time) error {
+	// Remember the username exactly as submitted: the lookup cache is keyed on
+	// it (every Set below uses it), so invalidation must use the same value —
+	// not the resolved s.username, which can differ for token/master/+detail logins.
+	s.submittedUsername = username
+
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
 	// Empty passwords are never valid under any condition
 	if password == "" {
@@ -1069,6 +1102,15 @@ func (s *Session) sendCapabilities() error {
 }
 
 // connectToBackendAndAuth connects to backend and authenticates.
+// backendHandshakeTimeout returns a read timeout for the backend greeting/STARTTLS/auth
+// reads, falling back to 30s when no backend connect timeout is configured.
+func backendHandshakeTimeout(connectTimeout time.Duration) time.Duration {
+	if connectTimeout <= 0 {
+		return 30 * time.Second
+	}
+	return connectTimeout
+}
+
 func (s *Session) connectToBackendAndAuth() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                   s.ctx,
@@ -1108,7 +1150,12 @@ func (s *Session) connectToBackendAndAuth() error {
 	)
 	if err != nil {
 		metrics.ProxyBackendConnections.WithLabelValues("managesieve", "failure").Inc()
-		return fmt.Errorf("failed to connect to backend: %w", err)
+		// Invalidate the cache so the next attempt re-resolves routing: a
+		// cached ServerAddress may be stale (e.g. account moved backends).
+		s.invalidateLookupCache("backend connect failure")
+		// Wrap with the sentinel so the client sees (UNAVAILABLE) instead of a
+		// generic "Backend server error".
+		return fmt.Errorf("%w: failed to connect to backend: %w", server.ErrBackendConnectionFailed, err)
 	}
 	if isRemoteLookupRoute && actualAddr != preferredAddr {
 		// The remotelookup route specified a server, but we connected to a different one.
@@ -1116,7 +1163,8 @@ func (s *Session) connectToBackendAndAuth() error {
 		// For remotelookup routes, this is a hard failure.
 		conn.Close()
 		metrics.ProxyBackendConnections.WithLabelValues("managesieve", "failure").Inc()
-		return fmt.Errorf("remotelookup route to %s failed, and fallback is disabled for remotelookup routes", preferredAddr)
+		s.invalidateLookupCache("remotelookup route unavailable")
+		return fmt.Errorf("%w: remotelookup route to %s failed, and fallback is disabled for remotelookup routes", server.ErrBackendConnectionFailed, preferredAddr)
 	}
 
 	metrics.ProxyBackendConnections.WithLabelValues("managesieve", "success").Inc()
@@ -1140,8 +1188,16 @@ func (s *Session) connectToBackendAndAuth() error {
 	// Read backend greeting and capabilities
 	backendReader := bufio.NewReader(s.backendConn)
 	backendWriter := bufio.NewWriter(s.backendConn)
+	// Bound every backend read during the greeting/STARTTLS/auth handshake so a silent
+	// or half-open backend can't hang the client connection indefinitely (M6). Refreshed
+	// per phase and cleared after auth (authenticateToBackend) before the relay phase,
+	// which manages its own lifecycle.
+	backendIOTimeout := backendHandshakeTimeout(s.server.connManager.GetConnectTimeout())
+	s.backendConn.SetReadDeadline(time.Now().Add(backendIOTimeout))
 	for {
-		line, err := backendReader.ReadString('\n')
+		// Bounded: a misbehaving backend must not be able to grow the buffer
+		// without limit with a newline-less stream inside the deadline window.
+		line, err := server.ReadBoundedLine(backendReader, 8192)
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: failed to read backend greeting: %w", server.ErrBackendConnectionFailed, err)
@@ -1174,6 +1230,17 @@ func (s *Session) connectToBackendAndAuth() error {
 		s.DebugLog("Using global StartTLS settings")
 	}
 
+	// Set ServerName so tls.Client verifies the backend certificate hostname. Without
+	// it, DNSName is empty and Go verifies only the chain (not the host), so
+	// remote_tls_verify=true would still let any CA-valid cert MITM the proxy->backend
+	// leg. Derive it from the address we actually connected to (preserves the configured
+	// backend hostname; both tls.Config values here are per-connection, safe to mutate).
+	if tlsConfig != nil && tlsConfig.ServerName == "" {
+		if host, _, splitErr := net.SplitHostPort(actualAddr); splitErr == nil && host != "" {
+			tlsConfig.ServerName = host
+		}
+	}
+
 	if shouldUseStartTLS && tlsConfig != nil {
 		s.DebugLog("Negotiating StartTLS with backend", "backend", actualAddr, "insecure_skip_verify", tlsConfig.InsecureSkipVerify)
 
@@ -1185,8 +1252,8 @@ func (s *Session) connectToBackendAndAuth() error {
 		}
 		backendWriter.Flush()
 
-		// Read STARTTLS response
-		response, err := backendReader.ReadString('\n')
+		// Read STARTTLS response (bounded)
+		response, err := server.ReadBoundedLine(backendReader, 8192)
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: failed to read STARTTLS response: %w", server.ErrBackendConnectionFailed, err)
@@ -1210,9 +1277,12 @@ func (s *Session) connectToBackendAndAuth() error {
 		backendReader = bufio.NewReader(s.backendConn)
 		backendWriter = bufio.NewWriter(s.backendConn)
 
-		// Read backend capabilities sent automatically after STARTTLS
+		// Refresh the read deadline for the post-STARTTLS capability read (M6).
+		s.backendConn.SetReadDeadline(time.Now().Add(backendIOTimeout))
+
+		// Read backend capabilities sent automatically after STARTTLS (bounded)
 		for {
-			line, err := backendReader.ReadString('\n')
+			line, err := server.ReadBoundedLine(backendReader, 8192)
 			if err != nil {
 				s.backendConn.Close()
 				return fmt.Errorf("%w: failed to read backend capabilities after STARTTLS: %w", server.ErrBackendConnectionFailed, err)
@@ -1250,15 +1320,14 @@ func (s *Session) authenticateToBackend() error {
 	}
 	backendWriter.Flush()
 
-	// Read authentication response
-	response, err := backendReader.ReadString('\n')
+	// Bound the backend auth-response read; cleared on success before the relay phase (M6).
+	s.backendConn.SetReadDeadline(time.Now().Add(backendHandshakeTimeout(s.server.connManager.GetConnectTimeout())))
+
+	// Read authentication response (bounded)
+	response, err := server.ReadBoundedLine(backendReader, 8192)
 	if err != nil {
 		// CRITICAL: Invalidate cache on backend authentication failure
-		if s.server.lookupCache != nil && s.username != "" {
-			cacheKey := s.server.name + ":" + s.username
-			s.server.lookupCache.Invalidate(cacheKey)
-			s.DebugLog("invalidated cache due to backend auth read error", "cache_key", cacheKey)
-		}
+		s.invalidateLookupCache("backend auth read error")
 		return fmt.Errorf("%w: failed to read auth response: %w", server.ErrBackendAuthFailed, err)
 	}
 
@@ -1268,17 +1337,64 @@ func (s *Session) authenticateToBackend() error {
 		// CRITICAL: Invalidate cache on backend authentication failure
 		// This ensures the next request does fresh remotelookup/database lookup
 		// to pick up backend changes (e.g., domain moved to different server)
-		if s.server.lookupCache != nil && s.username != "" {
-			cacheKey := s.server.name + ":" + s.username
-			s.server.lookupCache.Invalidate(cacheKey)
-			s.DebugLog("invalidated cache due to backend auth rejection", "cache_key", cacheKey, "response", strings.TrimSpace(response))
-		}
+		s.invalidateLookupCache("backend auth rejection")
 		return fmt.Errorf("%w: %s", server.ErrBackendAuthFailed, strings.TrimSpace(response))
 	}
+
+	// Clear the handshake read deadline so the relay phase (startProxy) is unbounded (M6).
+	s.backendConn.SetReadDeadline(time.Time{})
 
 	s.DebugLog("Backend authentication successful")
 
 	return nil
+}
+
+// invalidateLookupCache removes this session's lookup-cache entry so the next
+// attempt re-resolves authentication/routing. The cache is keyed on the
+// username exactly as the client submitted it (which may carry a token,
+// master suffix or +detail), NOT on the resolved s.username.
+func (s *Session) invalidateLookupCache(reason string) {
+	username := s.submittedUsername
+	if username == "" {
+		username = s.username
+	}
+	if username == "" {
+		return
+	}
+	s.server.lookupCache.InvalidateUser(s.server.name, username)
+	s.DebugLog("invalidated lookup cache", "reason", reason, "username", username)
+}
+
+// drainClientReaderToBackend forwards any bytes still buffered in the
+// pre-auth client reader to the backend. A client may pipeline its first
+// commands behind AUTHENTICATE in the same TCP segment; those bytes sit in
+// s.clientReader's buffer and would be silently dropped if proxying read only
+// from the raw connection.
+func (s *Session) drainClientReaderToBackend() (int64, error) {
+	if s.clientReader == nil {
+		return 0, nil
+	}
+	n := s.clientReader.Buffered()
+	if n == 0 {
+		return 0, nil
+	}
+	pipelined, err := s.clientReader.Peek(n)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.backendConn.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return 0, fmt.Errorf("failed to set write deadline: %w", err)
+	}
+	nw, werr := s.backendConn.Write(pipelined)
+	_ = s.backendConn.SetWriteDeadline(time.Time{})
+	if werr != nil {
+		return int64(nw), werr
+	}
+	if _, derr := s.clientReader.Discard(n); derr != nil {
+		return int64(nw), derr
+	}
+	s.DebugLog("forwarded pipelined client data to backend", "bytes", nw)
+	return int64(nw), nil
 }
 
 // startProxy starts bidirectional proxying between client and backend.
@@ -1321,7 +1437,15 @@ func (s *Session) startProxy() {
 				s.backendConn.Close()
 			}
 		}()
-		bytesIn, err := server.CopyWithDeadline(s.ctx, s.backendConn, s.clientConn, "client-to-backend")
+		// Forward any bytes the client pipelined behind AUTHENTICATE that are
+		// still buffered in the pre-auth reader; CopyWithDeadline reads from
+		// the raw conn and would otherwise silently drop them.
+		bytesIn, err := s.drainClientReaderToBackend()
+		if err == nil {
+			var copied int64
+			copied, err = server.CopyWithDeadline(s.ctx, s.backendConn, s.clientConn, "client-to-backend")
+			bytesIn += copied
+		}
 		metrics.BytesThroughput.WithLabelValues("managesieve_proxy", "in").Add(float64(bytesIn))
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("Error copying from client to backend", "error", err)
@@ -1418,7 +1542,9 @@ func (s *Session) close() {
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
 	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
-	if s.server.connTracker != nil {
+	// Skip unregister when registration was rejected; otherwise we would
+	// decrement a slot this session never held (limit erosion for the account).
+	if s.server.connTracker != nil && !s.connRejected {
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -1490,9 +1616,17 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 // that was buffered but not yet read.
 func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int64, error) {
 	const writeDeadline = 30 * time.Second
+	const readDeadline = 30 * time.Minute // Detect stale backends without disturbing normal sessions
 	var totalBytes int64
 	buf := make([]byte, 32*1024)
 	nextDeadline := time.Now()
+
+	// Enable TCP keepalive on the backend connection to detect dead peers
+	// (mirrors CopyWithDeadline, which handles the client-to-backend side).
+	if tcpConn, ok := s.backendConn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(2 * time.Minute)
+	}
 
 	for {
 		select {
@@ -1500,6 +1634,11 @@ func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int
 			return totalBytes, s.ctx.Err()
 		default:
 		}
+
+		// Bound each read so a silently dead backend cannot pin this goroutine
+		// (and the whole session) forever when no absolute session timeout is
+		// configured. The reader wraps s.backendConn, so the deadline applies.
+		_ = s.backendConn.SetReadDeadline(time.Now().Add(readDeadline))
 
 		nr, err := src.Read(buf)
 		if nr > 0 {
@@ -1527,6 +1666,9 @@ func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int
 			}
 		}
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return totalBytes, fmt.Errorf("read timeout in backend-to-client after %v (connection appears stale): %w", readDeadline, err)
+			}
 			if err != io.EOF {
 				return totalBytes, err
 			}

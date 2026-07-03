@@ -43,7 +43,9 @@ type POP3ProxySession struct {
 	startTime             time.Time
 	releaseConn           func() // Connection limiter cleanup function
 	proxyInfo             *server.ProxyProtocolInfo
-	gracefulShutdown      bool // Set during server shutdown to prevent copy goroutine from closing clientConn
+	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
+	submittedUsername     string // Username exactly as submitted by the client (lookup-cache key)
+	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
 }
 
 func (s *POP3ProxySession) handleConnection() {
@@ -217,6 +219,16 @@ func (s *POP3ProxySession) handleConnection() {
 			password := server.UnquoteString(parts[1])
 
 			if err := s.authenticate(s.username, password); err != nil {
+				// Rate limiter blocked the attempt: reply with the same line as
+				// a bad password (indistinguishable, cf. backend M14) but drop
+				// the connection instead of letting the client keep hammering.
+				var rateLimitErr *server.RateLimitError
+				if errors.As(err, &rateLimitErr) {
+					writer.WriteString("-ERR Authentication failed\r\n")
+					writer.Flush()
+					s.InfoLog("dropping connection - rate limited")
+					return
+				}
 				// Check if error is due to server shutdown or temporary unavailability
 				if server.IsTemporaryAuthFailure(err) {
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
@@ -230,6 +242,20 @@ func (s *POP3ProxySession) handleConnection() {
 				writer.Flush()
 				s.DebugLog("Authentication failed", "error", err)
 				continue
+			}
+
+			// Register connection BEFORE confirming success: the tracker only
+			// errors when a per-user or per-user-per-IP connection limit is
+			// exceeded, and once "+OK" is on the wire a rejection can no longer
+			// be signalled to the client.
+			if err := s.registerConnection(); err != nil {
+				s.InfoLog("connection rejected by connection tracker", "error", err)
+				// Mark as rejected so close() does not decrement a slot this
+				// session never held (which would erode the account's limit).
+				s.connRejected = true
+				writer.WriteString("-ERR [SYS/TEMP] Too many connections\r\n")
+				writer.Flush()
+				return
 			}
 
 			writer.WriteString("+OK Authentication successful\r\n")
@@ -248,11 +274,6 @@ func (s *POP3ProxySession) handleConnection() {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 					s.WarnLog("Failed to clear read deadline", "error", err)
 				}
-			}
-
-			// Register connection
-			if err := s.registerConnection(); err != nil {
-				s.InfoLog("rejected connection registration", "error", err)
 			}
 
 			// Start proxying
@@ -354,6 +375,16 @@ func (s *POP3ProxySession) handleConnection() {
 			}
 
 			if err := s.authenticate(authnID, password); err != nil {
+				// Rate limiter blocked the attempt: reply with the same line as
+				// a bad password (indistinguishable, cf. backend M14) but drop
+				// the connection instead of letting the client keep hammering.
+				var rateLimitErr *server.RateLimitError
+				if errors.As(err, &rateLimitErr) {
+					writer.WriteString("-ERR Authentication failed\r\n")
+					writer.Flush()
+					s.InfoLog("dropping connection - rate limited")
+					return
+				}
 				// Check if error is due to server shutdown or temporary unavailability
 				if server.IsTemporaryAuthFailure(err) {
 					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
@@ -368,6 +399,20 @@ func (s *POP3ProxySession) handleConnection() {
 				writer.Flush()
 				s.DebugLog("SASL authentication failed", "error", err)
 				continue
+			}
+
+			// Register connection BEFORE confirming success: the tracker only
+			// errors when a per-user or per-user-per-IP connection limit is
+			// exceeded, and once "+OK" is on the wire a rejection can no longer
+			// be signalled to the client.
+			if err := s.registerConnection(); err != nil {
+				s.InfoLog("connection rejected by connection tracker", "error", err)
+				// Mark as rejected so close() does not decrement a slot this
+				// session never held (which would erode the account's limit).
+				s.connRejected = true
+				writer.WriteString("-ERR [SYS/TEMP] Too many connections\r\n")
+				writer.Flush()
+				return
 			}
 
 			writer.WriteString("+OK Authentication successful\r\n")
@@ -386,11 +431,6 @@ func (s *POP3ProxySession) handleConnection() {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 					s.WarnLog("Failed to clear read deadline", "error", err)
 				}
-			}
-
-			// Register connection
-			if err := s.registerConnection(); err != nil {
-				s.InfoLog("rejected connection registration", "error", err)
 			}
 
 			// Start proxying
@@ -462,6 +502,11 @@ func (s *POP3ProxySession) ErrorLog(msg string, keysAndValues ...any) {
 }
 
 func (s *POP3ProxySession) authenticate(username, password string) error {
+	// Remember the username exactly as submitted: the lookup cache is keyed on
+	// it (every Set below uses it), so invalidation must use the same value —
+	// not the resolved s.username, which can differ for token/master/+detail logins.
+	s.submittedUsername = username
+
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
 	// Empty passwords are never valid under any condition
 	if password == "" {
@@ -1007,7 +1052,12 @@ func (s *POP3ProxySession) connectToBackend() error {
 	if err != nil {
 		s.DebugLog("Failed to connect to backend", "error", err, "addr", preferredAddr)
 		metrics.ProxyBackendConnections.WithLabelValues("pop3", "failure").Inc()
-		return fmt.Errorf("failed to connect to backend: %w", err)
+		// Invalidate the cache so the next attempt re-resolves routing: a
+		// cached ServerAddress may be stale (e.g. account moved backends).
+		s.invalidateLookupCache("backend connect failure")
+		// Wrap with the sentinel so the client sees "[SYS/TEMP] Backend server
+		// temporarily unavailable" instead of "Authentication failed".
+		return fmt.Errorf("%w: failed to connect to backend: %w", server.ErrBackendConnectionFailed, err)
 	}
 	if isRemoteLookupRoute && actualAddr != preferredAddr {
 		// The remotelookup route specified a server, but we connected to a different one.
@@ -1015,7 +1065,8 @@ func (s *POP3ProxySession) connectToBackend() error {
 		// For remotelookup routes, this is a hard failure.
 		backendConn.Close()
 		metrics.ProxyBackendConnections.WithLabelValues("pop3", "failure").Inc()
-		return fmt.Errorf("remotelookup route to %s failed, and fallback is disabled for remotelookup routes", preferredAddr)
+		s.invalidateLookupCache("remotelookup route unavailable")
+		return fmt.Errorf("%w: remotelookup route to %s failed, and fallback is disabled for remotelookup routes", server.ErrBackendConnectionFailed, preferredAddr)
 	}
 
 	metrics.ProxyBackendConnections.WithLabelValues("pop3", "success").Inc()
@@ -1037,12 +1088,23 @@ func (s *POP3ProxySession) connectToBackend() error {
 		}, actualAddr, routeResult.RoutingMethod == "affinity")
 	}
 
-	// Read backend greeting
+	// Read backend greeting. Bounded, and with a read deadline so a backend
+	// that accepts TCP but never speaks cannot hang authentication (the client
+	// is blocked waiting for its PASS/AUTH reply while we wait here).
+	greetingTimeout := s.server.connManager.GetConnectTimeout()
+	if err := s.backendConn.SetReadDeadline(time.Now().Add(greetingTimeout)); err != nil {
+		s.backendConn.Close()
+		return fmt.Errorf("%w: failed to set greeting read deadline: %w", server.ErrBackendConnectionFailed, err)
+	}
 	backendReader := bufio.NewReader(s.backendConn)
-	greeting, err := backendReader.ReadString('\n')
+	greeting, err := server.ReadBoundedLine(backendReader, 1024)
 	if err != nil {
 		s.backendConn.Close()
 		return fmt.Errorf("%w: failed to read backend greeting: %w", server.ErrBackendConnectionFailed, err)
+	}
+	if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
+		s.backendConn.Close()
+		return fmt.Errorf("%w: failed to clear greeting read deadline: %w", server.ErrBackendConnectionFailed, err)
 	}
 
 	if !strings.HasPrefix(greeting, "+OK") {
@@ -1069,7 +1131,13 @@ func (s *POP3ProxySession) connectToBackend() error {
 		}
 	}
 
-	// Authenticate to backend using master SASL credentials via AUTH PLAIN
+	// Authenticate to backend using master SASL credentials via AUTH PLAIN.
+	// Bound the whole exchange with a deadline so a backend that wedges after
+	// the greeting cannot hang the session (mirrors the IMAP proxy).
+	if err := s.backendConn.SetDeadline(time.Now().Add(greetingTimeout)); err != nil {
+		s.backendConn.Close()
+		return fmt.Errorf("%w: failed to set auth deadline: %w", server.ErrBackendAuthFailed, err)
+	}
 	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, s.server.masterSASLUsername, s.server.masterSASLPassword)
 	encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
@@ -1082,17 +1150,13 @@ func (s *POP3ProxySession) connectToBackend() error {
 		return fmt.Errorf("%w: failed to flush AUTH PLAIN to backend: %w", server.ErrBackendAuthFailed, err)
 	}
 
-	// Read auth response
-	authResp, err := backendReader.ReadString('\n')
+	// Read auth response (bounded)
+	authResp, err := server.ReadBoundedLine(backendReader, 1024)
 	if err != nil {
 		s.backendConn.Close()
 		// CRITICAL: Invalidate cache on backend authentication failure
 		// This ensures the next request does fresh remotelookup/database lookup
-		if s.server.lookupCache != nil && s.username != "" {
-			cacheKey := s.server.name + ":" + s.username
-			s.server.lookupCache.Invalidate(cacheKey)
-			s.DebugLog("invalidated cache due to backend auth read error", "cache_key", cacheKey)
-		}
+		s.invalidateLookupCache("backend auth read error")
 		return fmt.Errorf("%w: failed to read auth response: %w", server.ErrBackendAuthFailed, err)
 	}
 
@@ -1101,17 +1165,35 @@ func (s *POP3ProxySession) connectToBackend() error {
 		// CRITICAL: Invalidate cache on backend authentication failure
 		// This ensures the next request does fresh remotelookup/database lookup
 		// to pick up backend changes (e.g., domain moved to different server)
-		if s.server.lookupCache != nil && s.username != "" {
-			cacheKey := s.server.name + ":" + s.username
-			s.server.lookupCache.Invalidate(cacheKey)
-			s.DebugLog("invalidated cache due to backend auth rejection", "cache_key", cacheKey, "response", strings.TrimSpace(authResp))
-		}
+		s.invalidateLookupCache("backend auth rejection")
 		return fmt.Errorf("%w: %s", server.ErrBackendAuthFailed, strings.TrimSpace(authResp))
+	}
+
+	// Clear the auth deadline; the relay phase manages its own deadlines.
+	if err := s.backendConn.SetDeadline(time.Time{}); err != nil {
+		s.backendConn.Close()
+		return fmt.Errorf("%w: failed to clear auth deadline: %w", server.ErrBackendAuthFailed, err)
 	}
 
 	s.DebugLog("Authenticated to backend")
 
 	return nil
+}
+
+// invalidateLookupCache removes this session's lookup-cache entry so the next
+// attempt re-resolves authentication/routing. The cache is keyed on the
+// username exactly as the client submitted it (which may carry a token,
+// master suffix or +detail), NOT on the resolved s.username.
+func (s *POP3ProxySession) invalidateLookupCache(reason string) {
+	username := s.submittedUsername
+	if username == "" {
+		username = s.username
+	}
+	if username == "" {
+		return
+	}
+	s.server.lookupCache.InvalidateUser(s.server.name, username)
+	s.DebugLog("invalidated lookup cache", "reason", reason, "username", username)
 }
 
 func (s *POP3ProxySession) startProxying() {
@@ -1249,7 +1331,9 @@ func (s *POP3ProxySession) close() {
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
 	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
-	if s.server.connTracker != nil {
+	// Skip unregister when registration was rejected; otherwise we would
+	// decrement a slot this session never held (limit erosion for the account).
+	if s.server.connTracker != nil && !s.connRejected {
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -1336,18 +1420,45 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 	const writeDeadline = 30 * time.Second
 
 	for {
-		// Set a read deadline to prevent idle authenticated connections.
-		if s.server.authIdleTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
+		// Idle control for the authenticated phase. command_timeout is the
+		// post-auth idle knob (it also drives the SoraConn idle checker);
+		// auth_idle_timeout is the pre-auth knob (2m default) and is only used
+		// as a fallback so idle protection is never silently lost. RFC 1939
+		// recommends an autologout timer of at least 10 minutes, which the
+		// short pre-auth timeout would violate here.
+		idleTimeout := s.server.commandTimeout
+		if idleTimeout <= 0 {
+			idleTimeout = s.server.authIdleTimeout
+		}
+		if idleTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
 				s.WarnLog("Failed to set read deadline", "error", err)
 				return
 			}
 		}
 
-		line, err := reader.ReadString('\n')
+		// Bounded read: POP3 commands are tiny (RFC 1939 caps request lines at
+		// 512 octets); an unbounded ReadString would let an authenticated
+		// client grow the buffer without limit with a newline-less stream.
+		line, err := server.ReadBoundedLine(reader, 4096)
 		if err != nil {
+			if err == server.ErrLineTooLong {
+				// net.Conn writes are whole-write atomic, so writing directly to
+				// clientConn cannot byte-interleave with the backend-to-client copy.
+				_, _ = s.clientConn.Write([]byte("-ERR Line too long, closing connection\r\n"))
+				s.WarnLog("relay line too long, closing connection")
+				return
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				s.DebugLog("Idle timeout for authenticated user, closing connection")
+				// Account the idle timeout: this relay read deadline uses command_timeout,
+				// the same value that drives the SoraConn idle checker, so it pre-empts the
+				// checker for authenticated sessions. Without incrementing here, the
+				// ConnectionTimeoutsTotal{type="idle"} counter would never move post-auth.
+				metrics.ConnectionTimeoutsTotal.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "idle").Inc()
+				// Mirror the SoraConn OnTimeout notice so the client sees a reason
+				// (whole-write atomic, so it cannot interleave with the backend->client copy).
+				_, _ = s.clientConn.Write([]byte("-ERR [IN-USE] Idle timeout, please reconnect\r\n"))
 				return
 			}
 			if err != io.EOF && !isClosingError(err) {
@@ -1418,6 +1529,13 @@ func (s *POP3ProxySession) copyReaderToConnWithDeadline(dst net.Conn, src *bufio
 	buf := make([]byte, 32*1024)
 	nextDeadline := time.Now()
 
+	// Enable TCP keepalive on the backend connection to detect dead peers
+	// (mirrors CopyWithDeadline and the IMAP proxy's backend-to-client copy).
+	if tcpConn, ok := s.backendConn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(2 * time.Minute)
+	}
+
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -1457,6 +1575,9 @@ func (s *POP3ProxySession) copyReaderToConnWithDeadline(dst net.Conn, src *bufio
 			}
 		}
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return totalBytes, fmt.Errorf("read timeout in %s after %v (connection appears stale): %w", direction, backendReadDeadline, err)
+			}
 			if err != io.EOF {
 				return totalBytes, err
 			}

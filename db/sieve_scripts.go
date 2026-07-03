@@ -82,6 +82,11 @@ func (db *Database) GetScriptByName(ctx context.Context, name string, AccountID 
 // PUTSCRIPT/PUT with distinct names. Updates to existing scripts are unaffected.
 const maxScriptsPerAccount = 100
 
+// MaxScriptsPerAccount returns the per-account Sieve script limit enforced by
+// CreateScript, so callers (e.g. ManageSieve HAVESPACE) can report it without
+// attempting a create.
+func MaxScriptsPerAccount() int { return maxScriptsPerAccount }
+
 // ErrSieveScriptLimitReached is returned by CreateScript when the account already has
 // maxScriptsPerAccount scripts. It is a permanent condition (not transient), so callers
 // can map it to a permanent protocol error rather than a retryable one.

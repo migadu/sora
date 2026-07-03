@@ -203,6 +203,15 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		}
 	}
 
+	// Default the backend connect timeout when unset, matching the IMAP/LMTP/ManageSieve
+	// proxies. This value also bounds the backend greeting/auth read deadlines, so a 0
+	// must not leak through: net.Dialer treats Timeout=0 as "no timeout", but a read
+	// deadline of time.Now().Add(0) expires immediately (backend greeting i/o timeout).
+	connectTimeout := options.ConnectTimeout
+	if connectTimeout == 0 {
+		connectTimeout = 10 * time.Second
+	}
+
 	// Create connection manager with routing
 	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(
 		options.RemoteAddrs,
@@ -211,7 +220,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		false,
 		options.RemoteTLSVerify,
 		options.RemoteUseProxyProtocol,
-		options.ConnectTimeout,
+		connectTimeout,
 		routingLookup,
 		options.Name,
 		!options.EnableBackendHealthCheck,

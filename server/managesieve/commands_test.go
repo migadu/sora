@@ -48,13 +48,13 @@ func TestHandleCheckScript(t *testing.T) {
 			name:         "Invalid script syntax",
 			content:      "invalid_command;",
 			wantSuccess:  false,
-			wantResponse: "NO Script validation failed",
+			wantResponse: "NO \"Script validation failed",
 		},
 		{
 			name:         "Script exceeding size limit",
 			content:      strings.Repeat("a", 2000),
 			wantSuccess:  false,
-			wantResponse: "NO (MAXSCRIPTSIZE)",
+			wantResponse: "NO (QUOTA/MAXSIZE)",
 		},
 	}
 
@@ -112,7 +112,7 @@ func TestHandleHaveSpace(t *testing.T) {
 			name:         "Exceeds limit",
 			size:         2048,
 			wantSuccess:  false,
-			wantResponse: "NO (MAXSCRIPTSIZE)",
+			wantResponse: "NO (QUOTA/MAXSIZE)",
 		},
 	}
 
