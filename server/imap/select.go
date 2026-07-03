@@ -11,10 +11,10 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 )
 
-func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*imap.SelectData, error) {
+func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap.SelectOptions) (*imap.SelectData, error) {
 	s.DebugLog("attempting to select mailbox", "mailbox", mboxName)
 
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		s.DebugLog("request aborted before selecting mailbox", "mailbox", mboxName)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed"}
 	}
@@ -34,7 +34,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	}
 
 	// Phase 1: Read session state with read lock
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire read lock within timeout")
 		return nil, &imap.Error{
@@ -47,9 +47,9 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	release()
 
 	// Create a context that signals to use the master DB if the session is pinned.
-	readCtx := s.ctx
+	readCtx := ctx
 	if s.useMasterDB.Load() {
-		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
 	// Phase 2: Database operations outside lock
@@ -95,7 +95,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	}
 
 	// First, acquire the read lock once to read necessary session state
-	acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire second read lock within timeout")
 		return nil, &imap.Error{
@@ -110,7 +110,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	// Store the highest UID from previous selection to calculate recent messages
 	uidToCompareAgainst := s.lastHighestUID
 	// Check if the context is already cancelled before proceeding with DB operations
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		release()
 		s.DebugLog("context already cancelled before selecting mailbox", "mailbox", mboxName)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
@@ -159,7 +159,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	}
 
 	// Acquire the lock once after all DB operations to update session state
-	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock within timeout")
 		return nil, &imap.Error{
@@ -171,7 +171,7 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	defer release()
 
 	// Check again if the context was cancelled during DB operations
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		s.DebugLog("request aborted during mailbox selection, aborting state update", "mailbox", mboxName)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
 	}
@@ -343,14 +343,14 @@ func (s *IMAPSession) Select(mboxName string, options *imap.SelectOptions) (*ima
 	return selectData, nil
 }
 
-func (s *IMAPSession) Unselect() error {
+func (s *IMAPSession) Unselect(ctx context.Context) error {
 	// If the session is closing, don't try to unselect.
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		s.DebugLog("session context is cancelled, skipping unselect")
 		return nil
 	}
 
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock within timeout")
 		return &imap.Error{

@@ -1,15 +1,16 @@
 package imap
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
 )
 
-func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*imap.StatusData, error) {
+func (s *IMAPSession) Status(ctx context.Context, mboxName string, options *imap.StatusOptions) (*imap.StatusData, error) {
 	// First phase: Read validation with read lock
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire read lock")
 		return nil, s.internalError("failed to acquire lock for status")
@@ -18,7 +19,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 	release()
 
 	// Middle phase: Database operations outside lock
-	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, mboxName)
+	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.DebugLog("mailbox does not exist", "mailbox", mboxName)
@@ -32,7 +33,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 	}
 
 	// Check ACL permissions - requires 'r' (read) right
-	hasReadRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, mailbox.ID, AccountID, 'r')
+	hasReadRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, mailbox.ID, AccountID, 'r')
 	if err != nil {
 		return nil, s.internalError("failed to check read permission: %v", err)
 	}
@@ -45,7 +46,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 		}
 	}
 
-	summary, err := s.server.rdb.GetMailboxSummaryWithRetry(s.ctx, mailbox.ID)
+	summary, err := s.server.rdb.GetMailboxSummaryWithRetry(ctx, mailbox.ID)
 	if err != nil {
 		return nil, s.internalError("failed to get mailbox summary for '%s': %v", mboxName, err)
 	}
@@ -81,7 +82,7 @@ func (s *IMAPSession) Status(mboxName string, options *imap.StatusOptions) (*ima
 		unseenCount := summary.UnseenCount
 		if unseenCount < 0 {
 			s.WarnLog("negative unseen_count detected, recomputing", "mailbox", mboxName, "unseen_count", unseenCount)
-			if repaired, rErr := s.server.rdb.RecomputeMailboxUnseenWithRetry(s.ctx, mailbox.ID); rErr != nil {
+			if repaired, rErr := s.server.rdb.RecomputeMailboxUnseenWithRetry(ctx, mailbox.ID); rErr != nil {
 				s.WarnLog("failed to recompute unseen_count, clamping to 0", "mailbox", mboxName, "err", rErr)
 				unseenCount = 0
 			} else {

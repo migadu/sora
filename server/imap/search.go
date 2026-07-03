@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/emersion/go-imap/v2"
@@ -8,10 +9,10 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 )
 
-func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
+func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
 	// Check search rate limit first (before any expensive operations)
 	if s.server.searchRateLimiter != nil && s.IMAPUser != nil {
-		if err := s.server.searchRateLimiter.CanSearch(s.ctx, s.IMAPUser.AccountID()); err != nil {
+		if err := s.server.searchRateLimiter.CanSearch(ctx, s.IMAPUser.AccountID()); err != nil {
 			// Rate limiter already logs with suppression, no need to log here
 			// metrics already incremented by rate limiter
 			return nil, &imap.Error{
@@ -33,13 +34,13 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 	var currentNumMessages uint32
 
 	// If the session is closing, don't try to search.
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		s.DebugLog("session context is cancelled, skipping search")
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed"}
 	}
 
 	// Acquire read mutex to safely read session state
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire read lock within timeout")
 		return nil, &imap.Error{
@@ -76,7 +77,7 @@ func (s *IMAPSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCr
 
 	// The configured search_timeout is now automatically applied by the resilient DB layer.
 	// SEARCH only returns UIDs, so we can use a high limit (0 = use default MaxSearchResults)
-	messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(s.ctx, selectedMailboxID, criteria, 0)
+	messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(ctx, selectedMailboxID, criteria, 0)
 	if err != nil {
 		// The resilient layer already logs retry attempts. We just log the final error.
 		s.DebugLog("[SEARCH] final error after retries", "error", err)
@@ -340,7 +341,7 @@ func (s *IMAPSession) decodeSearchCriteria(criteria *imap.SearchCriteria) *imap.
 		return criteria
 	}
 
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire read lock for decodeSearchCriteria within timeout")
 		// Return unmodified criteria if we can't acquire the lock

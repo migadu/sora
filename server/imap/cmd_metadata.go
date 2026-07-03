@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,7 +13,7 @@ import (
 
 // GetMetadata implements the GETMETADATA command (RFC 5464).
 // If mailbox is empty string "", retrieves server metadata.
-func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *imap.GetMetadataOptions) (*imap.GetMetadataData, error) {
+func (s *IMAPSession) GetMetadata(ctx context.Context, mailbox string, entries []string, options *imap.GetMetadataOptions) (*imap.GetMetadataData, error) {
 	s.DebugLog("GETMETADATA command", "mailbox", mailbox, "entries", entries)
 
 	// RFC 5464 does not support wildcard mailbox names in GETMETADATA
@@ -43,14 +44,14 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 
 	// If mailbox is specified, look it up
 	if mailbox != "" {
-		acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+		acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 		if !acquired {
 			s.DebugLog("failed to acquire read lock")
 			return nil, fmt.Errorf("failed to acquire session lock")
 		}
 		defer release()
 
-		dbMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.AccountID(), mailbox)
+		dbMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, s.AccountID(), mailbox)
 		if err != nil {
 			if errors.Is(err, consts.ErrMailboxNotFound) {
 				return nil, &imap.Error{
@@ -63,7 +64,7 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 		}
 
 		// Check ACL permissions - requires 'r' (read) right for mailbox metadata
-		hasReadRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, dbMailbox.ID, s.AccountID(), 'r')
+		hasReadRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, dbMailbox.ID, s.AccountID(), 'r')
 		if err != nil {
 			return nil, fmt.Errorf("failed to check read permission: %w", err)
 		}
@@ -80,7 +81,7 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 	}
 
 	// Fetch metadata from database
-	result, err := s.server.rdb.GetMetadataWithRetry(s.ctx, s.AccountID(), mailboxID, entries, options)
+	result, err := s.server.rdb.GetMetadataWithRetry(ctx, s.AccountID(), mailboxID, entries, options)
 	if err != nil {
 		s.DebugLog("failed to get metadata", "error", err)
 		return nil, &imap.Error{
@@ -97,7 +98,7 @@ func (s *IMAPSession) GetMetadata(mailbox string, entries []string, options *ima
 // SetMetadata implements the SETMETADATA command (RFC 5464).
 // If mailbox is empty string "", sets server metadata.
 // To remove an entry, set its value to nil.
-func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) error {
+func (s *IMAPSession) SetMetadata(ctx context.Context, mailbox string, entries map[string]*[]byte) error {
 	// Canonicalise (case-fold) entry names first so the case-insensitivity rule
 	// (RFC 5464 §3.1) is honoured for storage AND for the /private-vs-/shared
 	// scope classification below — otherwise a /SHARED/... spelling would be
@@ -116,14 +117,14 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 
 	// If mailbox is specified, look it up
 	if mailbox != "" {
-		acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+		acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 		if !acquired {
 			s.DebugLog("failed to acquire read lock")
 			return fmt.Errorf("failed to acquire session lock")
 		}
 		defer release()
 
-		dbMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.AccountID(), mailbox)
+		dbMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, s.AccountID(), mailbox)
 		if err != nil {
 			if errors.Is(err, consts.ErrMailboxNotFound) {
 				return &imap.Error{
@@ -148,7 +149,7 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 		}
 
 		if needsWrite {
-			hasWriteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, dbMailbox.ID, s.AccountID(), 'w')
+			hasWriteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, dbMailbox.ID, s.AccountID(), 'w')
 			if err != nil {
 				return fmt.Errorf("failed to check write permission: %w", err)
 			}
@@ -161,7 +162,7 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 			}
 		} else {
 			// For /private entries, just verify user has lookup permission (already verified by GetMailboxByName)
-			hasLookupRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, dbMailbox.ID, s.AccountID(), 'l')
+			hasLookupRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, dbMailbox.ID, s.AccountID(), 'l')
 			if err != nil {
 				return fmt.Errorf("failed to check lookup permission: %w", err)
 			}
@@ -186,7 +187,7 @@ func (s *IMAPSession) SetMetadata(mailbox string, entries map[string]*[]byte) er
 	}
 
 	// Set metadata in database with limit enforcement
-	err := s.server.rdb.SetMetadataWithRetry(s.ctx, s.AccountID(), mailboxID, entries, limits)
+	err := s.server.rdb.SetMetadataWithRetry(ctx, s.AccountID(), mailboxID, entries, limits)
 	if err != nil {
 		// Check if it's a metadata-specific error
 		var metaErr *db.MetadataError

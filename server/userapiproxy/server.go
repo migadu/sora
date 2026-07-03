@@ -427,15 +427,15 @@ func (s *Server) setupHandler() http.Handler {
 			}
 
 			// Get backend for this user
-			backendAddr, err := s.getBackendForUser(claims.Email, claims.AccountID)
+			backendAddr, err := s.getBackendForUser(r.Context(), claims.Email, claims.AccountID)
 			if err != nil {
 				logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "user", claims.Email, "error", err)
 				http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 				return
 			}
 
-			// Proxy authenticated request with user headers
-			s.proxyRequest(w, r, backendAddr, &claims.Email, &claims.AccountID)
+			// Proxy authenticated request to the user's backend
+			s.proxyRequest(w, r, backendAddr)
 			return
 		}
 
@@ -449,14 +449,15 @@ func (s *Server) setupHandler() http.Handler {
 			return
 		}
 
-		// Proxy unauthenticated request (no user headers)
-		s.proxyRequest(w, r, backendAddr, nil, nil)
+		// Proxy unauthenticated request
+		s.proxyRequest(w, r, backendAddr)
 	})
 }
 
-// getBackendForUser determines the backend server for a user using cache, affinity and remotelookup
-func (s *Server) getBackendForUser(email string, accountID int64) (string, error) {
-	ctx := context.Background()
+// getBackendForUser determines the backend server for a user using cache, affinity and remotelookup.
+// ctx should be the request context so a hung remotelookup cannot outlive the request;
+// it is additionally bounded by the remotelookup timeout below.
+func (s *Server) getBackendForUser(ctx context.Context, email string, accountID int64) (string, error) {
 
 	// 1. Check lookup cache first (if enabled)
 	if s.lookupCache != nil {
@@ -505,8 +506,14 @@ func (s *Server) getBackendForUser(email string, accountID int64) (string, error
 
 	// 3. Use remotelookup if configured
 	if s.routingLookup != nil {
+		// Bound the lookup: previously this used context.Background() with no
+		// timeout, so a hung remotelookup service blocked the request handler
+		// until (and unless) the HTTP client's own timeout fired.
+		lookupCtx, lookupCancel := context.WithTimeout(ctx, s.connManager.GetRemoteLookupTimeout())
+		defer lookupCancel()
+
 		// Use routeOnly=true since user is already authenticated via JWT
-		routingInfo, _, err := s.routingLookup.LookupUserRouteWithOptions(ctx, email, "", true)
+		routingInfo, _, err := s.routingLookup.LookupUserRouteWithOptions(lookupCtx, email, "", true)
 		if err != nil {
 			logger.Warn("User API Proxy: RemoteLookup failed", "name", s.name, "user", email, "error", err)
 			// Fall through to consistent hash
@@ -564,7 +571,7 @@ func (s *Server) getBackendForUser(email string, accountID int64) (string, error
 }
 
 // proxyRequest proxies the request to the backend
-func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, backendAddr string, userEmail *string, accountID *int64) {
+func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, backendAddr string) {
 	// Create reverse proxy to backend
 	scheme := "http"
 	if s.connManager.IsRemoteTLS() {
@@ -582,10 +589,14 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, backendAdd
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = s.transport
 
-	// Modify request
+	// Modify request. Capture the original Host BEFORE overwriting r.Host:
+	// the Host of an incoming request lives in r.Host, not in r.Header
+	// ("Host" is never present in r.Header), so the previous
+	// r.Header.Get("Host") always produced an empty X-Forwarded-Host.
+	originalHost := r.Host
 	r.URL.Host = target.Host
 	r.URL.Scheme = target.Scheme
-	r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
+	r.Header.Set("X-Forwarded-Host", originalHost)
 	r.Host = target.Host
 
 	// Get real client IP (from PROXY protocol or RemoteAddr)
@@ -662,16 +673,10 @@ func (s *Server) extractAndValidateToken(r *http.Request) (*JWTClaims, error) {
 	return claims, nil
 }
 
-// getRealClientIP extracts the real client IP from request context (PROXY protocol) or request
+// getRealClientIP extracts the real client IP from the request.
+// When PROXY protocol is enabled, proxyProtocolConn overrides RemoteAddr()
+// with the real client address, so r.RemoteAddr already carries it here.
 func (s *Server) getRealClientIP(r *http.Request) string {
-	// First check if we have PROXY protocol info in context
-	if proxyInfo, ok := r.Context().Value("proxyInfo").(*server.ProxyProtocolInfo); ok && proxyInfo != nil {
-		if proxyInfo.SrcIP != "" {
-			return proxyInfo.SrcIP
-		}
-	}
-
-	// Fall back to RemoteAddr (r.RemoteAddr is already a string)
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		// If splitting fails, return as-is

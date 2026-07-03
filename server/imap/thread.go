@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -13,10 +14,10 @@ import (
 
 var _ imapserver.SessionThread = (*IMAPSession)(nil)
 
-func (s *IMAPSession) Thread(numKind imapserver.NumKind, algorithm imap.ThreadAlgorithm, charset string, criteria *imap.SearchCriteria) ([]imap.ThreadData, error) {
+func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, algorithm imap.ThreadAlgorithm, charset string, criteria *imap.SearchCriteria) ([]imap.ThreadData, error) {
 	// THREAD is a full search; share the per-account SEARCH rate limiter.
 	if s.server.searchRateLimiter != nil && s.IMAPUser != nil {
-		if err := s.server.searchRateLimiter.CanSearch(s.ctx, s.IMAPUser.AccountID()); err != nil {
+		if err := s.server.searchRateLimiter.CanSearch(ctx, s.IMAPUser.AccountID()); err != nil {
 			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: err.Error()}
 		}
 	}
@@ -34,7 +35,7 @@ func (s *IMAPSession) Thread(numKind imapserver.NumKind, algorithm imap.ThreadAl
 	}
 
 	includeSubject := algorithm == imap.ThreadReferences || algorithm == imap.ThreadOrderedSubject
-	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(s.ctx, s.selectedMailbox.ID, criteria, includeSubject)
+	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, s.selectedMailbox.ID, criteria, includeSubject)
 	if err != nil {
 		s.ErrorLog("failed to fetch messages for threading", "err", err)
 		return nil, fmt.Errorf("failed to fetch messages for threading: %w", err)

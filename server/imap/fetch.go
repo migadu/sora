@@ -2,6 +2,7 @@ package imap
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -89,7 +90,7 @@ func safeExtractBinarySectionSize(bodyData []byte, section *imap.FetchItemBinary
 	return imapserver.ExtractBinarySectionSize(bytes.NewReader(bodyData), section)
 }
 
-func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
+func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
 	start := time.Now()
 	// recordMetrics records throughput + latency, classifying the status the same
 	// way the meteredSession wrapper does (success / client_error / server_error)
@@ -105,7 +106,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	var sessionTrackerSnapshot *imapserver.SessionTracker
 	var decodedNumSet imap.NumSet
 
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire read lock within timeout")
 		imapErr := &imap.Error{
@@ -146,7 +147,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	if s.GetCapabilities().Has(imap.CapQResync) && options.Vanished && options.ChangedSince > 0 {
 		s.DebugLog("FETCH with VANISHED modifier", "changed_since", options.ChangedSince)
 
-		vanishedUIDs, err := s.server.rdb.GetVanishedUIDsForFetchWithRetry(s.ctx, selectedMailboxID, options.ChangedSince)
+		vanishedUIDs, err := s.server.rdb.GetVanishedUIDsForFetchWithRetry(ctx, selectedMailboxID, options.ChangedSince)
 		if err != nil {
 			s.WarnLog("failed to retrieve vanished UIDs", "error", err)
 			// Don't fail the FETCH - just continue without VANISHED response
@@ -209,7 +210,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 	// only shared-mailbox grantees incur the permission check. Fail closed (suppress the
 	// implicit \Seen) if the check itself errors.
 	if markSeen && selectedMailboxOwnerID != s.AccountID() {
-		hasSeen, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, selectedMailboxID, s.AccountID(), db.ACLRightSeen)
+		hasSeen, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, selectedMailboxID, s.AccountID(), db.ACLRightSeen)
 		if err != nil {
 			s.WarnLog("failed to check 's' right for implicit \\Seen; suppressing", "error", err)
 			markSeen = false
@@ -277,7 +278,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 			}
 
 			if len(uidsToMarkSeen) > 0 {
-				_, err := s.server.rdb.AddMessageFlagsBatchWithRetry(s.ctx, uidsToMarkSeen, selectedMailboxID, []imap.Flag{imap.FlagSeen})
+				_, err := s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, uidsToMarkSeen, selectedMailboxID, []imap.Flag{imap.FlagSeen})
 				if err != nil {
 					s.DebugLog("failed to batch mark messages as seen", "error", err)
 				} else {
@@ -305,7 +306,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 			if s.IMAPUser != nil {
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
-			if err := s.writeMessageFetchData(w, &msg, options, selectedMailboxID); err != nil {
+			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID); err != nil {
 				writeErr = err
 				return err
 			}
@@ -313,7 +314,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 		return nil
 	}
 
-	err := s.server.rdb.StreamMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet, cb, needsBodyStructure)
+	err := s.server.rdb.StreamMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet, cb, needsBodyStructure)
 	if writeErr != nil {
 		// Bypass explicit metric tracking for socket disconnections, identically to pre-streaming behavior
 		return writeErr
@@ -333,7 +334,7 @@ func (s *IMAPSession) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, optio
 }
 
 // writeMessageFetchData handles writing all FETCH data items for a single message.
-func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64) error {
+func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64) error {
 	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
 
 	// ARCHITECTURE DECISION: Use database sequence numbers directly, not sessionTracker.EncodeSeqNum().
@@ -397,7 +398,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 			bs = msg.BodyStructure
 		} else {
 			var err error
-			bs, err = s.server.rdb.GetMessageBodyStructureWithRetry(s.ctx, msg.UID, selectedMailboxID)
+			bs, err = s.server.rdb.GetMessageBodyStructureWithRetry(ctx, msg.UID, selectedMailboxID)
 			if err != nil {
 				s.WarnLog("failed to fetch body structure, using fallback", "uid", msg.UID, "error", err)
 				fallback := &imap.BodyStructureSinglePart{
@@ -434,14 +435,14 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 
 	if len(options.BodySection) > 0 || len(options.BinarySection) > 0 || len(options.BinarySectionSize) > 0 {
 		if len(options.BodySection) > 0 {
-			if err := s.handleBodySections(m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+			if err := s.handleBodySections(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
 				return err
 			}
 		}
 
 		if len(options.BinarySection) > 0 {
 			if s.GetCapabilities().Has(imap.CapBinary) {
-				if err := s.handleBinarySections(m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+				if err := s.handleBinarySections(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
 					return err
 				}
 			} else {
@@ -451,7 +452,7 @@ func (s *IMAPSession) writeMessageFetchData(w *imapserver.FetchWriter, msg *db.M
 
 		if len(options.BinarySectionSize) > 0 {
 			if s.GetCapabilities().Has(imap.CapBinary) {
-				if err := s.handleBinarySectionSize(m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+				if err := s.handleBinarySectionSize(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
 					return err
 				}
 			} else {
@@ -554,10 +555,10 @@ func (s *IMAPSession) writeBodyStructure(m *imapserver.FetchResponseWriter, body
 	return nil
 }
 
-func (s *IMAPSession) ensureBodyDataLoaded(msg *db.Message, bodyData *[]byte, bodyDataFetched *bool) error {
+func (s *IMAPSession) ensureBodyDataLoaded(ctx context.Context, msg *db.Message, bodyData *[]byte, bodyDataFetched *bool) error {
 	if !*bodyDataFetched {
 		var fetchErr error
-		*bodyData, fetchErr = s.getMessageBody(msg)
+		*bodyData, fetchErr = s.getMessageBody(ctx, msg)
 		*bodyDataFetched = true // Mark as fetched even if error or nil data, to prevent re-fetching.
 		if fetchErr != nil {
 			s.DebugLog("failed to get message body", "uid", msg.UID, "error", fetchErr)
@@ -567,8 +568,8 @@ func (s *IMAPSession) ensureBodyDataLoaded(msg *db.Message, bodyData *[]byte, bo
 	return nil
 }
 
-func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
-	if err := s.ensureBodyDataLoaded(msg, bodyData, bodyDataFetched); err != nil {
+func (s *IMAPSession) handleBinarySections(ctx context.Context, w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
+	if err := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); err != nil {
 		// Transient: body staged for upload but not yet retrievable from this node.
 		// Ask the client to retry instead of returning an empty section.
 		if errors.Is(err, errBodyTransientlyUnavailable) {
@@ -598,8 +599,8 @@ func (s *IMAPSession) handleBinarySections(w *imapserver.FetchResponseWriter, bo
 	return nil
 }
 
-func (s *IMAPSession) handleBinarySectionSize(w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
-	if err := s.ensureBodyDataLoaded(msg, bodyData, bodyDataFetched); err != nil {
+func (s *IMAPSession) handleBinarySectionSize(ctx context.Context, w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
+	if err := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); err != nil {
 		// Transient: body staged for upload but not yet retrievable from this node.
 		// Ask the client to retry instead of reporting a zero size.
 		if errors.Is(err, errBodyTransientlyUnavailable) {
@@ -619,11 +620,11 @@ func (s *IMAPSession) handleBinarySectionSize(w *imapserver.FetchResponseWriter,
 	return nil
 }
 
-func (s *IMAPSession) handleBodySections(w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
+func (s *IMAPSession) handleBodySections(ctx context.Context, w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
 	for _, section := range options.BodySection {
 		var sectionContent []byte
 
-		if loadErr := s.ensureBodyDataLoaded(msg, bodyData, bodyDataFetched); loadErr != nil {
+		if loadErr := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); loadErr != nil {
 			// Transient: the body is staged for upload but not yet retrievable from
 			// this node (read-before-upload race, or cross-node staging). Fail the
 			// FETCH with NO [UNAVAILABLE] so the client retries instead of receiving
@@ -682,7 +683,7 @@ func (s *IMAPSession) transientBodyUnavailable(uid imap.UID, cause error) *imap.
 	return imapErr
 }
 
-func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
+func (s *IMAPSession) getMessageBody(ctx context.Context, msg *db.Message) ([]byte, error) {
 	// Pre-read guard: refuse a body that can't fit the session budget BEFORE pulling it
 	// into memory. The post-read Allocate() below can only detect the overrun once the
 	// body is already resident — too late to prevent the OOM. msg.Size is the stored
@@ -692,7 +693,7 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 		return nil, fmt.Errorf("session memory limit exceeded: message size %d bytes exceeds available budget", msg.Size)
 	}
 
-	data, err := s.loadMessageBody(msg)
+	data, err := s.loadMessageBody(ctx, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -722,7 +723,7 @@ func (s *IMAPSession) getMessageBody(msg *db.Message) ([]byte, error) {
 // been marked uploaded) it returns errBodyTransientlyUnavailable so the FETCH handler answers
 // NO [UNAVAILABLE] and the client retries; otherwise the content is genuinely gone and
 // a generic retrieve error is returned so the handler degrades to an empty body.
-func (s *IMAPSession) loadMessageBody(msg *db.Message) ([]byte, error) {
+func (s *IMAPSession) loadMessageBody(ctx context.Context, msg *db.Message) ([]byte, error) {
 	if msg.IsUploaded {
 		// Try cache first (nil-safe: cache is optional and not configured in tests).
 		if s.server.cache != nil {
@@ -741,7 +742,7 @@ func (s *IMAPSession) loadMessageBody(msg *db.Message) ([]byte, error) {
 
 		// Fallback to S3.
 		s.DebugLog("cache miss, fetching from S3", "uid", msg.UID, "content_hash", msg.ContentHash)
-		data, err := s.fetchBodyFromS3(msg)
+		data, err := s.fetchBodyFromS3(ctx, msg)
 		if err != nil {
 			// S3 is unavailable — fall back to the local staging file if the uploader
 			// still has it.  This covers test environments (where S3 is a no-op stub)
@@ -798,7 +799,7 @@ func (s *IMAPSession) loadMessageBody(msg *db.Message) ([]byte, error) {
 	// exists, or it was already uploaded elsewhere. We only wait-and-retry S3 when it is:
 	// there is no point sleeping for a body that is never coming, and gating the wait this
 	// way keeps a bulk FETCH over abandoned uploads from paying the delay on every message.
-	pending := s.bodyUploadStillPending(msg)
+	pending := s.bodyUploadStillPending(ctx, msg)
 
 	if msg.S3Domain != "" && msg.S3Localpart != "" {
 		attempts := 1
@@ -806,7 +807,7 @@ func (s *IMAPSession) loadMessageBody(msg *db.Message) ([]byte, error) {
 			attempts = bodyFetchRetryAttempts
 		}
 		for attempt := 0; attempt < attempts; attempt++ {
-			s3Data, s3Err := s.fetchBodyFromS3(msg)
+			s3Data, s3Err := s.fetchBodyFromS3(ctx, msg)
 			if s3Err == nil {
 				s.DebugLog("local staging file missing, served from S3", "uid", msg.UID, "attempt", attempt)
 				return s3Data, nil
@@ -821,8 +822,8 @@ func (s *IMAPSession) loadMessageBody(msg *db.Message) ([]byte, error) {
 			if attempt < attempts-1 {
 				select {
 				case <-time.After(bodyFetchRetryDelay):
-				case <-s.ctx.Done():
-					return nil, s.ctx.Err()
+				case <-ctx.Done():
+					return nil, ctx.Err()
 				}
 			}
 		}
@@ -843,8 +844,8 @@ func (s *IMAPSession) loadMessageBody(msg *db.Message) ([]byte, error) {
 // read-before-upload race from genuine, permanent content loss. On a DB error it returns
 // true (conservative: a client retry is safer than handing back an empty body that the
 // client may treat as the real, empty message).
-func (s *IMAPSession) bodyUploadStillPending(msg *db.Message) bool {
-	pending, err := s.server.rdb.PendingUploadExistsWithRetry(s.ctx, msg.ContentHash, msg.AccountID)
+func (s *IMAPSession) bodyUploadStillPending(ctx context.Context, msg *db.Message) bool {
+	pending, err := s.server.rdb.PendingUploadExistsWithRetry(ctx, msg.ContentHash, msg.AccountID)
 	if err != nil {
 		s.WarnLog("could not check pending-upload status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
 		return true
@@ -855,7 +856,7 @@ func (s *IMAPSession) bodyUploadStillPending(msg *db.Message) bool {
 	// No pending upload: the body may have just been uploaded (uploaded flipped to true
 	// between our in-memory snapshot and now). If so it's transient — a retry should
 	// serve it from S3 via the uploaded path.
-	uploaded, err := s.server.rdb.IsContentHashUploadedWithRetry(s.ctx, msg.ContentHash, msg.AccountID)
+	uploaded, err := s.server.rdb.IsContentHashUploadedWithRetry(ctx, msg.ContentHash, msg.AccountID)
 	if err != nil {
 		s.WarnLog("could not check uploaded status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
 		return true
@@ -867,7 +868,7 @@ func (s *IMAPSession) bodyUploadStillPending(msg *db.Message) bool {
 // stored on the message record (which guard against the user's primary address
 // changing after the message was stored). It validates the payload is non-empty
 // and warms the local cache on success.
-func (s *IMAPSession) fetchBodyFromS3(msg *db.Message) ([]byte, error) {
+func (s *IMAPSession) fetchBodyFromS3(ctx context.Context, msg *db.Message) ([]byte, error) {
 	if msg.S3Domain == "" || msg.S3Localpart == "" {
 		return nil, fmt.Errorf("message UID %d is missing S3 key information", msg.UID)
 	}
@@ -883,7 +884,7 @@ func (s *IMAPSession) fetchBodyFromS3(msg *db.Message) ([]byte, error) {
 				s3GetErr = fmt.Errorf("S3 get panicked: %v", r)
 			}
 		}()
-		reader, s3GetErr = s.server.s3.GetWithRetry(s.server.appCtx, s3Key)
+		reader, s3GetErr = s.server.s3.GetWithRetry(ctx, s3Key)
 	}()
 	if s3GetErr != nil {
 		s.DebugLog("S3 GetWithRetry failed", "uid", msg.UID, "s3_key", s3Key, "error", s3GetErr)

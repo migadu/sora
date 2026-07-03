@@ -32,10 +32,24 @@ func NewMutexTimeoutHelper(mutex *sync.RWMutex, ctx context.Context, name string
 // AcquireReadLockWithTimeout attempts to acquire a read lock with a timeout.
 // It returns true if the lock was successfully acquired, false otherwise.
 // The caller MUST call the returned release function to unlock the mutex.
-func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout() (bool, func()) {
+//
+// The cmdCtx parameter is the context for the current command/operation.
+// The lock attempt is cancelled by whichever fires first: the command context,
+// the session context (h.ctx), or the MutexTimeout.
+func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout(cmdCtx context.Context) (bool, func()) {
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(h.ctx, MutexTimeout)
+	// Merge session and command contexts: cancel on whichever fires first.
+	merged, mergedCancel := context.WithCancel(cmdCtx)
+	go func() {
+		select {
+		case <-h.ctx.Done():
+			mergedCancel()
+		case <-merged.Done():
+		}
+	}()
+	ctx, cancel := context.WithTimeout(merged, MutexTimeout)
 	defer cancel()
+	defer mergedCancel()
 
 	lockChan := make(chan struct{}, 1)
 	go func() {
@@ -63,10 +77,24 @@ func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout() (bool, func()) {
 // AcquireWriteLockWithTimeout attempts to acquire a write lock with a timeout.
 // It returns true if the lock was successfully acquired, false otherwise.
 // The caller MUST call the returned release function to unlock the mutex.
-func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout() (bool, func()) {
+//
+// The cmdCtx parameter is the context for the current command/operation.
+// The lock attempt is cancelled by whichever fires first: the command context,
+// the session context (h.ctx), or the MutexTimeout.
+func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout(cmdCtx context.Context) (bool, func()) {
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(h.ctx, MutexTimeout)
+	// Merge session and command contexts: cancel on whichever fires first.
+	merged, mergedCancel := context.WithCancel(cmdCtx)
+	go func() {
+		select {
+		case <-h.ctx.Done():
+			mergedCancel()
+		case <-merged.Done():
+		}
+	}()
+	ctx, cancel := context.WithTimeout(merged, MutexTimeout)
 	defer cancel()
+	defer mergedCancel()
 
 	lockChan := make(chan struct{}, 1)
 	go func() {

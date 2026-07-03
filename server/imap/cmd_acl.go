@@ -57,11 +57,11 @@ func prepareACLIdentifier(identifier imap.RightsIdentifier) error {
 // RFC 4314 Section 3.7 - MYRIGHTS command
 //
 // This command does not require any special permissions.
-func (s *IMAPSession) MyRights(mailbox string) (*imap.MyRightsData, error) {
+func (s *IMAPSession) MyRights(ctx context.Context, mailbox string) (*imap.MyRightsData, error) {
 	s.DebugLog("MYRIGHTS command", "mailbox", mailbox)
 
 	// Get user ID
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -73,9 +73,9 @@ func (s *IMAPSession) MyRights(mailbox string) (*imap.MyRightsData, error) {
 	release()
 
 	// Create context for database operations
-	readCtx := s.ctx
+	readCtx := ctx
 	if s.useMasterDB.Load() {
-		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
 	// Get mailbox
@@ -112,11 +112,11 @@ func (s *IMAPSession) MyRights(mailbox string) (*imap.MyRightsData, error) {
 // RFC 4314 Section 3.3 - GETACL command
 //
 // The user must have the 'a' (administer) right on the mailbox (RFC 4314 §3.3).
-func (s *IMAPSession) GetACL(mailbox string) (*imap.GetACLData, error) {
+func (s *IMAPSession) GetACL(ctx context.Context, mailbox string) (*imap.GetACLData, error) {
 	s.DebugLog("GETACL command", "mailbox", mailbox)
 
 	// Get user ID
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -128,9 +128,9 @@ func (s *IMAPSession) GetACL(mailbox string) (*imap.GetACLData, error) {
 	release()
 
 	// Create context for database operations
-	readCtx := s.ctx
+	readCtx := ctx
 	if s.useMasterDB.Load() {
-		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
 	// Get mailbox
@@ -216,7 +216,7 @@ func (s *IMAPSession) GetACL(mailbox string) (*imap.GetACLData, error) {
 // RFC 4314 Section 3.1 - SETACL command
 //
 // The user must have the 'a' (admin) right on the mailbox.
-func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, modification imap.RightModification, rights imap.RightSet) error {
+func (s *IMAPSession) SetACL(ctx context.Context, mailbox string, identifier imap.RightsIdentifier, modification imap.RightModification, rights imap.RightSet) error {
 	s.DebugLog("SETACL command", "mailbox", mailbox, "identifier", identifier, "modification", modification, "rights", rights)
 
 	// RFC 4314 §3: prepare the identifier; an empty/invalid identifier MUST be
@@ -250,7 +250,7 @@ func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, m
 	}
 
 	// Get user ID
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -262,9 +262,9 @@ func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, m
 	release()
 
 	// Create context for database operations
-	writeCtx := s.ctx
+	writeCtx := ctx
 	if s.useMasterDB.Load() {
-		writeCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		writeCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
 	// Get mailbox
@@ -388,18 +388,18 @@ func (s *IMAPSession) SetACL(mailbox string, identifier imap.RightsIdentifier, m
 //
 // This is equivalent to SetACL with RightModificationReplace and empty rights.
 // The user must have the 'a' (admin) right on the mailbox.
-func (s *IMAPSession) DeleteACL(mailbox string, identifier imap.RightsIdentifier) error {
+func (s *IMAPSession) DeleteACL(ctx context.Context, mailbox string, identifier imap.RightsIdentifier) error {
 	s.DebugLog("DELETEACL command", "mailbox", mailbox, "identifier", identifier)
 
 	// Use SetACL with empty rights and replace modification
-	return s.SetACL(mailbox, identifier, imap.RightModificationReplace, imap.RightSet{})
+	return s.SetACL(ctx, mailbox, identifier, imap.RightModificationReplace, imap.RightSet{})
 }
 
 // ListRights lists the rights that can be granted to an identifier on a mailbox.
 // RFC 4314 Section 3.5 - LISTRIGHTS command
 //
 // The user must have the 'a' (admin) right on the mailbox.
-func (s *IMAPSession) ListRights(mailbox string, identifier imap.RightsIdentifier) (*imap.ListRightsData, error) {
+func (s *IMAPSession) ListRights(ctx context.Context, mailbox string, identifier imap.RightsIdentifier) (*imap.ListRightsData, error) {
 	s.DebugLog("LISTRIGHTS command", "mailbox", mailbox, "identifier", identifier)
 
 	// RFC 4314 §3: an empty/invalid identifier MUST be refused with a BAD response.
@@ -412,7 +412,7 @@ func (s *IMAPSession) ListRights(mailbox string, identifier imap.RightsIdentifie
 	}
 
 	// Get user ID
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -424,9 +424,9 @@ func (s *IMAPSession) ListRights(mailbox string, identifier imap.RightsIdentifie
 	release()
 
 	// Create context for database operations
-	readCtx := s.ctx
+	readCtx := ctx
 	if s.useMasterDB.Load() {
-		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
 	// Get mailbox

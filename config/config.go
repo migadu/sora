@@ -822,10 +822,25 @@ type ServerLimitsConfig struct {
 
 // ServerTimeoutsConfig holds timeout settings for a server
 type ServerTimeoutsConfig struct {
-	CommandTimeout         string `toml:"command_timeout,omitempty"`          // Maximum idle time before disconnection (default: protocol-specific)
-	AbsoluteSessionTimeout string `toml:"absolute_session_timeout,omitempty"` // Maximum total session duration (default: 24h)
-	MinBytesPerMinute      int64  `toml:"min_bytes_per_minute,omitempty"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
-	SchedulerShardCount    int    `toml:"scheduler_shard_count,omitempty"`    // Number of timeout scheduler shards (default: 0 = runtime.NumCPU(), -1 = runtime.NumCPU()/2 for physical cores)
+	CommandTimeout         string                 `toml:"command_timeout,omitempty"`          // Maximum idle time before disconnection (default: protocol-specific)
+	AbsoluteSessionTimeout string                 `toml:"absolute_session_timeout,omitempty"` // Maximum total session duration (default: 24h)
+	MinBytesPerMinute      int64                  `toml:"min_bytes_per_minute,omitempty"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
+	SchedulerShardCount    int                    `toml:"scheduler_shard_count,omitempty"`    // Number of timeout scheduler shards (default: 0 = runtime.NumCPU(), -1 = runtime.NumCPU()/2 for physical cores)
+	IMAPCommandTimeouts    *CommandTimeoutsConfig `toml:"imap_command_timeouts,omitempty"`    // Per-command hard execution timeouts (IMAP only)
+}
+
+// CommandTimeoutsConfig holds per-command hard timeout limits for expensive IMAP
+// commands. All values are duration strings (e.g. "30s", "2m"). Omitted fields
+// use generous defaults that act as safety nets against runaway queries.
+type CommandTimeoutsConfig struct {
+	Search      string `toml:"search,omitempty"`       // SEARCH timeout (default: "30s")
+	Sort        string `toml:"sort,omitempty"`         // SORT timeout (default: "30s")
+	Thread      string `toml:"thread,omitempty"`       // THREAD timeout (default: "30s")
+	MultiSearch string `toml:"multi_search,omitempty"` // MULTISEARCH timeout (default: "30s")
+	Fetch       string `toml:"fetch,omitempty"`        // FETCH timeout (default: "30s")
+	Store       string `toml:"store,omitempty"`        // STORE timeout (default: "15s")
+	Copy        string `toml:"copy,omitempty"`         // COPY timeout (default: "30s")
+	Move        string `toml:"move,omitempty"`         // MOVE timeout (default: "30s")
 }
 
 // ServerConfig represents a single server instance
@@ -1307,6 +1322,45 @@ func (s *ServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
 		return helpers.ParseDuration(s.Timeouts.AbsoluteSessionTimeout)
 	}
 	return 24 * time.Hour, nil // Default: 24 hours for all protocols
+}
+
+// GetCommandTimeoutsOverrides returns a map of command name to timeout duration
+// for any command timeouts explicitly configured in the TOML. Only non-empty
+// fields are returned; the caller is responsible for merging with defaults.
+func (s *ServerConfig) GetCommandTimeoutsOverrides() (map[string]time.Duration, error) {
+	if s.Timeouts == nil || s.Timeouts.IMAPCommandTimeouts == nil {
+		return nil, nil
+	}
+
+	ct := s.Timeouts.IMAPCommandTimeouts
+	overrides := make(map[string]time.Duration)
+
+	fields := []struct {
+		name  string
+		value string
+	}{
+		{"search", ct.Search},
+		{"sort", ct.Sort},
+		{"thread", ct.Thread},
+		{"multi_search", ct.MultiSearch},
+		{"fetch", ct.Fetch},
+		{"store", ct.Store},
+		{"copy", ct.Copy},
+		{"move", ct.Move},
+	}
+
+	for _, f := range fields {
+		if f.value == "" {
+			continue
+		}
+		d, err := helpers.ParseDuration(f.value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid command timeout %q for %s: %w", f.value, f.name, err)
+		}
+		overrides[f.name] = d
+	}
+
+	return overrides, nil
 }
 
 // GetSearchRateLimitPerMin returns search rate limit per minute

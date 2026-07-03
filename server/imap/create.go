@@ -12,7 +12,7 @@ import (
 )
 
 // Create a new mailbox
-func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
+func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.CreateOptions) error {
 	// RFC 6154: validate any CREATE ... USE (...) request up front so an
 	// unsupported special-use is rejected with NO [USEATTR] before we create
 	// anything. Sora persists at most one attribute per mailbox.
@@ -27,7 +27,7 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	}
 
 	// First phase: validation and mailbox lookup using read lock
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire read lock")
 		return s.internalError("failed to acquire lock for create")
@@ -63,7 +63,6 @@ func (s *IMAPSession) Create(name string, options *imap.CreateOptions) error {
 	}
 
 	// Add config to context for shared mailbox detection
-	ctx := s.ctx
 	if s.server.config != nil {
 		ctx = context.WithValue(ctx, consts.ConfigContextKey, s.server.config)
 	}

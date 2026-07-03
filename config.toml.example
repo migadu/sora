@@ -1048,6 +1048,18 @@ timeouts.command_timeout = "5m"             # Maximum idle time before disconnec
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration regardless of activity (e.g., "24h", default: 24 hours)
 timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
+# Per-command hard execution timeouts (IMAP only). These are safety nets that
+# abort runaway commands — normal operations complete far below these limits.
+# Omitted fields use the defaults shown below. Set to "0" to disable a timeout.
+# timeouts.imap_command_timeouts.search       = "30s"  # SEARCH (default: 30s)
+# timeouts.imap_command_timeouts.sort         = "30s"  # SORT (default: 30s)
+# timeouts.imap_command_timeouts.thread       = "30s"  # THREAD (default: 30s)
+# timeouts.imap_command_timeouts.multi_search = "30s"  # MULTISEARCH (default: 30s)
+# timeouts.imap_command_timeouts.fetch        = "30s"  # FETCH (default: 30s)
+# timeouts.imap_command_timeouts.store        = "15s"  # STORE (default: 15s)
+# timeouts.imap_command_timeouts.copy         = "30s"  # COPY (default: 30s)
+# timeouts.imap_command_timeouts.move         = "30s"  # MOVE (default: 30s)
+
 # --- AUTHENTICATION RATE LIMITING ---
 # Two-tier blocking system protects shared IPs while catching distributed attacks
 # Use dotted notation for nested config within [[server]] array element

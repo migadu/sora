@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"strings"
 
 	"github.com/migadu/sora/consts"
@@ -10,19 +11,19 @@ import (
 // name-based and decoupled from mailbox existence: subscribing a name with no
 // mailbox is valid and persists, and the subscription survives the mailbox's
 // deletion.
-func (s *IMAPSession) Subscribe(mailboxName string) error {
-	return s.updateSubscriptionStatus(mailboxName, true)
+func (s *IMAPSession) Subscribe(ctx context.Context, mailboxName string) error {
+	return s.updateSubscriptionStatus(ctx, mailboxName, true)
 }
 
 // Unsubscribe from a mailbox.
-func (s *IMAPSession) Unsubscribe(mailboxName string) error {
-	return s.updateSubscriptionStatus(mailboxName, false)
+func (s *IMAPSession) Unsubscribe(ctx context.Context, mailboxName string) error {
+	return s.updateSubscriptionStatus(ctx, mailboxName, false)
 }
 
 // updateSubscriptionStatus handles both subscribe and unsubscribe against the
 // name-based subscription store.
-func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe bool) error {
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+func (s *IMAPSession) updateSubscriptionStatus(ctx context.Context, mailboxName string, subscribe bool) error {
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.InfoLog("failed to acquire read lock")
 		return s.internalError("failed to acquire lock for subscription update")
@@ -44,9 +45,9 @@ func (s *IMAPSession) updateSubscriptionStatus(mailboxName string, subscribe boo
 
 	var err error
 	if subscribe {
-		err = s.server.rdb.SubscribeWithRetry(s.ctx, AccountID, mailboxName)
+		err = s.server.rdb.SubscribeWithRetry(ctx, AccountID, mailboxName)
 	} else {
-		err = s.server.rdb.UnsubscribeWithRetry(s.ctx, AccountID, mailboxName)
+		err = s.server.rdb.UnsubscribeWithRetry(ctx, AccountID, mailboxName)
 	}
 	if err != nil {
 		return s.internalError("failed to update subscription status for mailbox '%s': %v", mailboxName, err)

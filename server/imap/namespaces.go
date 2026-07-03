@@ -1,11 +1,13 @@
 package imap
 
 import (
+	"context"
+
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
 )
 
-func (s *IMAPSession) Namespace() (*imap.NamespaceData, error) {
+func (s *IMAPSession) Namespace(ctx context.Context) (*imap.NamespaceData, error) {
 	data := &imap.NamespaceData{
 		Personal: []imap.NamespaceDescriptor{
 			{

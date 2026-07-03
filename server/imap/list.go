@@ -12,7 +12,7 @@ import (
 	"github.com/migadu/sora/db"
 )
 
-func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
+func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
 	// If no patterns, just return a simple response without any database operations
 	if len(patterns) == 0 {
 		return w.WriteList(&imap.ListData{
@@ -22,9 +22,9 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 	}
 
 	// Create a context that signals to use the master DB if the session is pinned.
-	readCtx := s.ctx
+	readCtx := ctx
 	if s.useMasterDB.Load() {
-		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
 	// Database operations should be done outside of lock
@@ -160,7 +160,7 @@ func (s *IMAPSession) List(w *imapserver.ListWriter, ref string, patterns []stri
 						unseenCount := summary.UnseenCount
 						if unseenCount < 0 {
 							s.WarnLog("negative unseen_count detected in LIST, recomputing", "mailbox", mbox.Name, "unseen_count", unseenCount)
-							if repaired, rErr := s.server.rdb.RecomputeMailboxUnseenWithRetry(s.ctx, mbox.ID); rErr != nil {
+							if repaired, rErr := s.server.rdb.RecomputeMailboxUnseenWithRetry(ctx, mbox.ID); rErr != nil {
 								s.WarnLog("failed to recompute unseen_count in LIST, clamping to 0", "mailbox", mbox.Name, "err", rErr)
 								unseenCount = 0
 							} else {

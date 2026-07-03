@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -10,9 +11,9 @@ import (
 	"github.com/migadu/sora/helpers"
 )
 
-func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData, error) {
+func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName string) (*imap.CopyData, error) {
 	// First phase: Read session state with read lock
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire read lock within timeout")
 		return nil, &imap.Error{
@@ -40,7 +41,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	decodedNumSet := s.decodeNumSet(numSet)
 
 	// Middle phase: Database operations outside lock
-	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, mboxName)
+	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.DebugLog("copy failed: destination mailbox does not exist", "mailbox", mboxName)
@@ -56,7 +57,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	// RFC 4314 §4: COPY requires the 'i' (insert) right on the destination. We fetch
 	// the user's full rights here so the same value can drive per-flag filtering of
 	// the copied messages below (the owner holds every right).
-	destRights, err := s.userRightsForMailbox(s.ctx, destMailbox.ID, destMailbox.AccountID)
+	destRights, err := s.userRightsForMailbox(ctx, destMailbox.ID, destMailbox.AccountID)
 	if err != nil {
 		return nil, s.internalError("failed to check destination permissions: %v", err)
 	}
@@ -70,7 +71,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	}
 
 	// Get the messages to determine their UIDs
-	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return nil, s.internalError("failed to retrieve messages for copy: %v", err)
 	}
@@ -89,7 +90,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	destS3Domain := s.Session.User.Domain()
 	destS3Localpart := s.Session.User.LocalPart()
 	if destMailbox.AccountID != s.AccountID() {
-		domain, localpart, err := s.server.rdb.ResolveAccountS3Owner(s.ctx, destMailbox.AccountID)
+		domain, localpart, err := s.server.rdb.ResolveAccountS3Owner(ctx, destMailbox.AccountID)
 		if err != nil {
 			return nil, s.internalError("failed to resolve owner for destination mailbox: %v", err)
 		}
@@ -108,12 +109,12 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 			// (skip if the owner already has it, e.g. via dedup).
 			sourceKey := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
 			destKey := helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash)
-			exists, err := s.server.s3.ExistsWithRetry(s.ctx, destKey)
+			exists, err := s.server.s3.ExistsWithRetry(ctx, destKey)
 			if err != nil {
 				s.WarnLog("failed to check if S3 object exists at destination", "destKey", destKey, "error", err)
 			}
 			if !exists {
-				if err := s.server.s3.CopyWithRetry(s.ctx, sourceKey, destKey); err != nil {
+				if err := s.server.s3.CopyWithRetry(ctx, sourceKey, destKey); err != nil {
 					return nil, s.internalError("failed to copy S3 object for message: %v", err)
 				}
 			}
@@ -133,7 +134,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 	}
 
 	// Perform the batch copy operation
-	uidMap, err := s.server.rdb.CopyMessagesWithRetry(s.ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname)
+	uidMap, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname)
 	if err != nil {
 		// Return proper IMAP NO for user errors instead of [SERVERBUG]
 		if strings.Contains(err.Error(), "source and destination mailboxes cannot be the same") {
@@ -175,7 +176,7 @@ func (s *IMAPSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData,
 			}
 		}
 		for f, uids := range stripUIDsByFlag {
-			if _, rmErr := s.server.rdb.RemoveMessageFlagsBatchWithRetry(s.ctx, uids, destMailbox.ID, []imap.Flag{f}); rmErr != nil {
+			if _, rmErr := s.server.rdb.RemoveMessageFlagsBatchWithRetry(ctx, uids, destMailbox.ID, []imap.Flag{f}); rmErr != nil {
 				// The copy already succeeded; log and continue rather than fail it.
 				s.WarnLog("failed to strip flag the user cannot set on COPY", "flag", string(f), "error", rmErr)
 			}

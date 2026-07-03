@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/emersion/go-imap/v2"
@@ -8,13 +9,13 @@ import (
 	"github.com/migadu/sora/helpers"
 )
 
-func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest string) error {
+func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet imap.NumSet, dest string) error {
 	// First, safely read necessary session state
 	var selectedMailboxID int64
 	var decodedNumSet imap.NumSet
 
 	// Acquire read mutex to safely read session state
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire read lock within timeout")
 		return &imap.Error{
@@ -40,7 +41,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	release() // Release read lock
 
 	// Perform database operations outside of lock
-	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, s.AccountID(), dest)
+	destMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, s.AccountID(), dest)
 	if err != nil {
 		s.DebugLog("destination mailbox not found", "mailbox", dest, "error", err)
 		return &imap.Error{
@@ -53,7 +54,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	// Check ACL permissions in a single round trip: 'i' (insert) on the destination,
 	// plus 't' (delete-msg) and 'e' (expunge) on the source. The owner fast-path in
 	// has_mailbox_right() makes this cheap for the common same-owner move.
-	hasInsertRight, hasDeleteRight, hasExpungeRight, err := s.server.rdb.CheckMoveRightsWithRetry(s.ctx, selectedMailboxID, destMailbox.ID, s.AccountID())
+	hasInsertRight, hasDeleteRight, hasExpungeRight, err := s.server.rdb.CheckMoveRightsWithRetry(ctx, selectedMailboxID, destMailbox.ID, s.AccountID())
 	if err != nil {
 		return s.internalError("failed to check move permissions: %v", err)
 	}
@@ -75,7 +76,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	}
 
 	// Check if the context is still valid before proceeding
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		s.DebugLog("request aborted before message retrieval")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -83,7 +84,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		}
 	}
 
-	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
 	}
@@ -97,7 +98,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	destS3Domain := s.Session.User.Domain()
 	destS3Localpart := s.Session.User.LocalPart()
 	if destMailbox.AccountID != s.AccountID() {
-		domain, localpart, err := s.server.rdb.ResolveAccountS3Owner(s.ctx, destMailbox.AccountID)
+		domain, localpart, err := s.server.rdb.ResolveAccountS3Owner(ctx, destMailbox.AccountID)
 		if err != nil {
 			return s.internalError("failed to resolve owner for destination mailbox: %v", err)
 		}
@@ -116,12 +117,12 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 			// (skip if the owner already has it, e.g. via dedup).
 			sourceKey := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
 			destKey := helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash)
-			exists, err := s.server.s3.ExistsWithRetry(s.ctx, destKey)
+			exists, err := s.server.s3.ExistsWithRetry(ctx, destKey)
 			if err != nil {
 				s.WarnLog("failed to check if S3 object exists at destination", "destKey", destKey, "error", err)
 			}
 			if !exists {
-				if err := s.server.s3.CopyWithRetry(s.ctx, sourceKey, destKey); err != nil {
+				if err := s.server.s3.CopyWithRetry(ctx, sourceKey, destKey); err != nil {
 					return s.internalError("failed to copy S3 object for message: %v", err)
 				}
 			}
@@ -141,7 +142,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 	}
 
 	// Check if the context is still valid before attempting the move
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		s.DebugLog("request aborted before moving messages")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -149,7 +150,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 		}
 	}
 
-	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(s.ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname)
+	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname)
 	if err != nil {
 		return s.internalError("failed to move messages: %v", err)
 	}
@@ -164,7 +165,7 @@ func (s *IMAPSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest st
 
 	// Trigger spam training if configured and moving to/from Junk folder
 	if s.server.spamTraining != nil && len(messageUIDMap) > 0 {
-		s.triggerSpamTraining(s.ctx, destMailbox.ID, s.selectedMailbox.Name, dest, messageUIDMap)
+		s.triggerSpamTraining(ctx, destMailbox.ID, s.selectedMailbox.Name, dest, messageUIDMap)
 	}
 
 	var mappedSourceUIDs []imap.UID

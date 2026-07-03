@@ -14,8 +14,8 @@ import (
 
 // Login handles the IMAP LOGIN command. It always applies the authentication
 // gate (progressive delay + rate-limit check) before authenticating.
-func (s *IMAPSession) Login(address, password string) error {
-	return s.login(address, password, true)
+func (s *IMAPSession) Login(ctx context.Context, address, password string) error {
+	return s.login(ctx, address, password, true)
 }
 
 // login authenticates address/password. applyGate controls whether the
@@ -27,7 +27,7 @@ func (s *IMAPSession) Login(address, password string) error {
 // applied the delay + rate-limit once for the AUTHENTICATE command. Without
 // this, AUTHENTICATE would apply both twice — roughly doubling auth latency and
 // double-counting against the rate limiter relative to LOGIN.
-func (s *IMAPSession) login(address, password string, applyGate bool) error {
+func (s *IMAPSession) login(ctx context.Context, address, password string, applyGate bool) error {
 	authStart := time.Now()
 
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
@@ -58,7 +58,7 @@ func (s *IMAPSession) login(address, password string, applyGate bool) error {
 		// Apply progressive authentication delay BEFORE any other checks
 		// Create a fake net.Addr from the RemoteIP for delay calculation
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-		if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-LOGIN"); err != nil {
+		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "IMAP-LOGIN"); err != nil {
 			if errors.Is(err, server.ErrDelayQueueFull) {
 				// Delay queue full - reject immediately to prevent goroutine exhaustion
 				s.InfoLog("delay queue full, rejecting connection", "address", address)
@@ -77,7 +77,7 @@ func (s *IMAPSession) login(address, password string, applyGate bool) error {
 
 		// Check authentication rate limiting after delay using proxy-aware method
 		if s.server.authLimiter != nil {
-			if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address); err != nil {
+			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, address); err != nil {
 				// Check if this is a rate limit error
 				var rateLimitErr *server.RateLimitError
 				if errors.As(err, &rateLimitErr) {
@@ -128,14 +128,14 @@ func (s *IMAPSession) login(address, password string, applyGate bool) error {
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
 			// Use base address (without suffix) to get account
-			AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, addressParsed.BaseAddress())
+			AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, addressParsed.BaseAddress())
 			if err != nil {
 				return err
 			}
 
 			// Get primary email address for this account
 			// User.Address should always be the primary address (not the login address with suffix)
-			primaryAddr, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, AccountID)
+			primaryAddr, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(ctx, AccountID)
 			if err != nil {
 				return s.internalError("failed to get primary email: %v", err)
 			}
@@ -162,7 +162,7 @@ func (s *IMAPSession) login(address, password string, applyGate bool) error {
 
 			// Record successful authentication
 			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressParsed.BaseAddress(), true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, addressParsed.BaseAddress(), true)
 			}
 
 			// Register connection for tracking
@@ -196,7 +196,7 @@ func (s *IMAPSession) login(address, password string, applyGate bool) error {
 		// Record failed master password authentication
 		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 		if s.server.authLimiter != nil {
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressParsed.BaseAddress(), false)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, addressParsed.BaseAddress(), false)
 		}
 
 		// Master username suffix was provided but master password was wrong - fail immediately
@@ -214,7 +214,7 @@ func (s *IMAPSession) login(address, password string, applyGate bool) error {
 	s.DebugLog("authentication attempt", "address", addressParsed.BaseAddress())
 
 	// Use base address (without +detail and without suffix) for authentication
-	AccountID, err := s.server.Authenticate(s.ctx, addressParsed.BaseAddress(), password)
+	AccountID, err := s.server.Authenticate(ctx, addressParsed.BaseAddress(), password)
 	if err != nil {
 		s.DebugLog("authentication failed", "error", err)
 
@@ -232,7 +232,7 @@ func (s *IMAPSession) login(address, password string, applyGate bool) error {
 		// Record failed authentication
 		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 		if s.server.authLimiter != nil {
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressParsed.BaseAddress(), false)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, addressParsed.BaseAddress(), false)
 		}
 
 		return &imap.Error{
@@ -243,14 +243,14 @@ func (s *IMAPSession) login(address, password string, applyGate bool) error {
 	}
 
 	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
-	err = s.server.rdb.CreateDefaultMailboxesWithRetry(s.ctx, AccountID)
+	err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, AccountID)
 	if err != nil {
 		return s.internalError("failed to create default mailboxes: %v", err)
 	}
 
 	// Get primary email address for this account
 	// User.Address should always be the primary address (not the login address with +alias)
-	primaryAddr, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, AccountID)
+	primaryAddr, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(ctx, AccountID)
 	if err != nil {
 		return s.internalError("failed to get primary email: %v", err)
 	}
@@ -281,7 +281,7 @@ func (s *IMAPSession) login(address, password string, applyGate bool) error {
 
 	// Record successful authentication
 	if s.server.authLimiter != nil {
-		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, addressParsed.BaseAddress(), true)
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, addressParsed.BaseAddress(), true)
 	}
 
 	// Register connection for tracking

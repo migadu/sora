@@ -518,7 +518,7 @@ func (s *IMAPSession) decodeNumSet(numSet imap.NumSet) imap.NumSet {
 		return numSet
 	}
 
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire read lock for decodeNumSet within timeout")
 		// Return unmodified set if we can't acquire the lock

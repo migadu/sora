@@ -102,7 +102,7 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 	}
 
 	// Acquire write lock to update sender
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "MAIL")
 		recordMetrics("failure")
@@ -225,7 +225,7 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	}
 
 	// Acquire write lock to update User
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "RCPT")
 		recordMetrics("failure")
@@ -276,7 +276,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	}
 
 	// Acquire write lock for accessing session state and potentially updating it (useMasterDB)
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "DATA")
 		recordMetrics("failure")
@@ -878,7 +878,7 @@ func (s *LMTPSession) Reset() {
 	}
 
 	// Acquire write lock to reset session state
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "RESET")
 		recordMetrics("failure")
@@ -902,7 +902,7 @@ func (s *LMTPSession) Logout() error {
 	}
 
 	// Acquire write lock for logout operations
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "LOGOUT")
 		// Continue with logout even if we can't get the lock

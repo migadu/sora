@@ -1,14 +1,16 @@
 package imap
 
 import (
+	"context"
+
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
-func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) error {
+func (s *IMAPSession) Expunge(ctx context.Context, w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) error {
 	// First phase: Read session state with simple read lock
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire read lock")
 		return s.internalError("failed to acquire lock for expunge")
@@ -42,7 +44,7 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	release()
 
 	// Check ACL permissions - requires 'e' (expunge) right
-	hasExpungeRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, mailboxID, AccountID, 'e')
+	hasExpungeRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, mailboxID, AccountID, 'e')
 	if err != nil {
 		return s.internalError("failed to check expunge permission: %v", err)
 	}
@@ -58,7 +60,7 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	// Middle phase: Get the \Deleted messages to expunge (outside lock).
 	// Only the UIDs are needed — sequence numbers for the EXPUNGE notifications
 	// are computed by the post-command poll (see the notification note below).
-	deletedMessages, err := s.server.rdb.GetDeletedMessageUIDsAndSeqsWithRetry(s.ctx, mailboxID)
+	deletedMessages, err := s.server.rdb.GetDeletedMessageUIDsAndSeqsWithRetry(ctx, mailboxID)
 	if err != nil {
 		return s.internalError("failed to fetch deleted messages: %v", err)
 	}
@@ -77,7 +79,7 @@ func (s *IMAPSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) 
 	}
 
 	// Database operation - no lock needed
-	_, err = s.server.rdb.ExpungeMessageUIDsWithRetry(s.ctx, mailboxID, uidsToDelete...)
+	_, err = s.server.rdb.ExpungeMessageUIDsWithRetry(ctx, mailboxID, uidsToDelete...)
 	if err != nil {
 		return s.internalError("failed to expunge messages: %v", err)
 	}

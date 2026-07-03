@@ -1,16 +1,18 @@
 package imap
 
 import (
+	"context"
+
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 )
 
 // Sort implements the SORT extension (RFC 5256), SORT=DISPLAY extension (RFC 5957),
 // and ESORT extension (RFC 5267). It returns sorted message data according to the provided criteria.
-func (s *IMAPSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortCriterion, charset string, searchCriteria *imap.SearchCriteria, options *imap.SortOptions) (*imap.SortData, error) {
+func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sortCriteria []imap.SortCriterion, charset string, searchCriteria *imap.SearchCriteria, options *imap.SortOptions) (*imap.SortData, error) {
 	// SORT is a full search; share the per-account SEARCH rate limiter.
 	if s.server.searchRateLimiter != nil && s.IMAPUser != nil {
-		if err := s.server.searchRateLimiter.CanSearch(s.ctx, s.IMAPUser.AccountID()); err != nil {
+		if err := s.server.searchRateLimiter.CanSearch(ctx, s.IMAPUser.AccountID()); err != nil {
 			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: err.Error()}
 		}
 	}
@@ -28,7 +30,7 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortC
 	}
 
 	// Acquire a read lock to safely get a snapshot of the session tracker.
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.InfoLog("failed to acquire read lock for session tracker")
 		return nil, s.internalError("failed to acquire lock for sort")
@@ -46,13 +48,13 @@ func (s *IMAPSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortC
 	}
 
 	// Check for context cancellation before database query
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		return nil, s.internalError("request aborted")
 	}
 
 	// Pass both search criteria and sort criteria to the database layer
 	// SORT only returns UIDs, so we can use a high limit (0 = use default MaxSearchResults)
-	messages, err := s.server.rdb.SearchMessagesSortedWithRetry(s.ctx, selectedMailboxID, searchCriteria, sortCriteria, 0)
+	messages, err := s.server.rdb.SearchMessagesSortedWithRetry(ctx, selectedMailboxID, searchCriteria, sortCriteria, 0)
 	if err != nil {
 		return nil, s.internalError("failed to sort messages: %v", err)
 	}

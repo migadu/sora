@@ -1262,6 +1262,13 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
+	// Parse per-command timeout overrides (nil if not configured)
+	commandTimeoutOverrides, err := serverConfig.GetCommandTimeoutsOverrides()
+	if err != nil {
+		logger.Warn("IMAP: Invalid command timeout override - ignoring", "name", serverConfig.Name, "error", err)
+		commandTimeoutOverrides = nil
+	}
+
 	s, err := imap.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance,
 		imap.IMAPServerOptions{
 			Debug:                        serverConfig.Debug,
@@ -1289,6 +1296,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			SessionMemoryLimit:           sessionMemoryLimit,
 			AuthIdleTimeout:              authIdleTimeout,
 			CommandTimeout:               commandTimeout,
+			CommandTimeoutOverrides:      commandTimeoutOverrides,
 			AbsoluteSessionTimeout:       absoluteSessionTimeout,
 			MinBytesPerMinute:            serverConfig.GetMinBytesPerMinute(),
 			EnableWarmup:                 deps.config.LocalCache.EnableWarmup,

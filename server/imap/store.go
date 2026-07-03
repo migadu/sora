@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/emersion/go-imap/v2"
@@ -21,14 +22,14 @@ func keywordLimitExceededError() *imap.Error {
 	}
 }
 
-func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
+func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
 	// First, safely read session state with a single mutex acquisition
 	var selectedMailboxID int64
 	var selectedMailboxOwnerID int64
 	var decodedNumSet imap.NumSet
 
 	// Acquire read mutex to safely read session state
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire read lock within timeout")
 		return &imap.Error{
@@ -83,7 +84,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 
 	// RFC 4314 §4: STORE requires 's' to modify \Seen, 't' for \Deleted, and 'w'
 	// for all other flags. Fetch the user's rights once (owner fast-path).
-	storeRights, err := s.userRightsForMailbox(s.ctx, selectedMailboxID, selectedMailboxOwnerID)
+	storeRights, err := s.userRightsForMailbox(ctx, selectedMailboxID, selectedMailboxOwnerID)
 	if err != nil {
 		return s.internalError("failed to get user rights for mailbox: %v", err)
 	}
@@ -110,7 +111,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	// The apply step below preserves the current value of each non-modifiable flag.
 
 	// Perform database operations outside of lock
-	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
+	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
 		return s.internalError("failed to retrieve messages: %v", err)
 	}
@@ -122,7 +123,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		if _, isSeqSet := numSet.(imap.SeqSet); isSeqSet {
 			// Re-decode and re-fetch to ensure consistency
 			decodedNumSet = s.decodeNumSet(numSet) // This will re-lock, but it's a rare case
-			messages, err = s.server.rdb.GetMessagesByNumSetWithRetry(s.ctx, selectedMailboxID, decodedNumSet)
+			messages, err = s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
 			if err != nil {
 				return s.internalError("failed to retrieve messages: %v", err)
 			}
@@ -137,7 +138,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	}
 
 	// Check if the context is still valid before proceeding with flag updates
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		s.DebugLog("request aborted before flag updates")
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -207,9 +208,9 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 		var batchResults []db.BatchFlagUpdateResult
 		switch sanitizedStoreFlags.Op {
 		case imap.StoreFlagsAdd:
-			batchResults, err = s.server.rdb.AddMessageFlagsBatchWithRetry(s.ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
+			batchResults, err = s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
 		case imap.StoreFlagsDel:
-			batchResults, err = s.server.rdb.RemoveMessageFlagsBatchWithRetry(s.ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
+			batchResults, err = s.server.rdb.RemoveMessageFlagsBatchWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
 		case imap.StoreFlagsSet:
 			// RFC 4314 §4: a replace must not modify flags the user lacks rights for.
 			// Per message, compute the target = requested values for modifiable flags
@@ -234,7 +235,7 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 			}
 			for key, uids := range groupUIDs {
 				var res []db.BatchFlagUpdateResult
-				res, err = s.server.rdb.SetMessageFlagsBatchWithRetry(s.ctx, uids, selectedMailboxID, groupFlags[key])
+				res, err = s.server.rdb.SetMessageFlagsBatchWithRetry(ctx, uids, selectedMailboxID, groupFlags[key])
 				if err != nil {
 					break
 				}
@@ -307,13 +308,13 @@ func (s *IMAPSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags
 	}
 
 	// Before responding with fetches, check if context is still valid
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		s.DebugLog("request aborted after flag updates, response will be incomplete")
 		return nil
 	}
 
 	// Re-acquire read mutex to access session tracker for encoding sequence numbers in the response
-	acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire second read lock within timeout")
 		return nil // Continue without sending responses since we already updated the flags

@@ -10,15 +10,15 @@ import (
 	"github.com/migadu/sora/db"
 )
 
-func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
+func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allowExpunge bool) error {
 	// If the session is closing, don't try to poll.
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		s.DebugLog("session context is cancelled, skipping poll")
 		return nil
 	}
 
 	// First phase: Read state with read lock
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire read lock within timeout")
 		return &imap.Error{
@@ -37,9 +37,9 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 	release()
 
 	// Create a context that signals to use the master DB if the session is pinned.
-	readCtx := s.ctx
+	readCtx := ctx
 	if s.useMasterDB.Load() {
-		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
 	poll, err := s.server.rdb.PollMailboxWithRetry(readCtx, mailboxID, highestModSeqToPollFrom)
@@ -49,7 +49,7 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		if errors.Is(err, db.ErrMailboxNotFound) {
 			s.WarnLog("selected mailbox was deleted, clearing selection", "mailbox_id", mailboxID)
 			// Acquire write lock to safely clear state
-			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
 			if acquired {
 				s.clearSelectedMailboxStateLocked()
 				release()
@@ -66,7 +66,7 @@ func (s *IMAPSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error 
 		return s.internalError("failed to poll mailbox: %v", err)
 	}
 
-	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire write lock within timeout")
 		return &imap.Error{

@@ -565,7 +565,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire write lock to update session state
-			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog(" failed to acquire write lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -638,7 +638,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire read lock to check loading needs
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -671,7 +671,7 @@ func (s *POP3Session) handleConnection() {
 					continue
 				}
 
-				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 				if !acquired {
 					s.WarnLog("failed to acquire write lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -694,7 +694,7 @@ func (s *POP3Session) handleConnection() {
 
 			// Compute count/size from the snapshot, excluding session-local
 			// deletions (RFC 1939 §5).
-			acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
+			acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -737,7 +737,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire read lock to check loading needs
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -767,7 +767,7 @@ func (s *POP3Session) handleConnection() {
 				}
 
 				// Acquire write lock to update session state
-				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 				if !acquired {
 					s.WarnLog("failed to acquire write lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -800,7 +800,7 @@ func (s *POP3Session) handleConnection() {
 				}
 
 				// Acquire read lock to access messages
-				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
+				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 				if !acquired {
 					s.WarnLog("failed to acquire read lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -830,7 +830,7 @@ func (s *POP3Session) handleConnection() {
 			} else {
 				// LIST without arguments - list all messages
 				// Acquire read lock to access messages and deleted status
-				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
+				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 				if !acquired {
 					s.WarnLog("failed to acquire read lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -885,7 +885,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire read lock to check loading needs
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -913,7 +913,7 @@ func (s *POP3Session) handleConnection() {
 				}
 
 				// Acquire write lock to update session state
-				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 				if !acquired {
 					s.WarnLog("failed to acquire write lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -943,7 +943,7 @@ func (s *POP3Session) handleConnection() {
 				}
 
 				// Acquire read lock to access messages
-				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
+				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 				if !acquired {
 					s.WarnLog("failed to acquire read lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -975,7 +975,7 @@ func (s *POP3Session) handleConnection() {
 			} else {
 				// UIDL without arguments - list all messages
 				// Acquire read lock to access messages and deleted status
-				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
+				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 				if !acquired {
 					s.WarnLog("failed to acquire read lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -1055,7 +1055,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Phase 1: Read session state to determine if messages need loading.
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -1092,9 +1092,9 @@ func (s *POP3Session) handleConnection() {
 
 			// Use a write lock if we need to update the messages slice.
 			if needsLoading {
-				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 			} else {
-				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
+				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 			}
 
 			if !acquired {
@@ -1295,7 +1295,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Phase 1: Read session state to determine if messages need loading.
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -1331,9 +1331,9 @@ func (s *POP3Session) handleConnection() {
 			var msgFound = false
 
 			if needsLoading {
-				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 			} else {
-				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout()
+				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 			}
 
 			if !acquired {
@@ -1521,7 +1521,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire write lock to update deleted map
-			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire write lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -1580,7 +1580,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Phase 1: Read session state to determine if messages need loading.
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire read lock for dele command")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -1611,7 +1611,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Phase 3: Acquire write lock to update session state.
-			acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+			acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire write lock for dele command")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -2040,7 +2040,7 @@ func (s *POP3Session) handleConnection() {
 			}
 
 			// Acquire write lock to update session state
-			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire write lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -2104,7 +2104,7 @@ func (s *POP3Session) handleConnection() {
 
 			// LANG command - set or query language
 			// Acquire read lock to access current language
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire read lock within timeout")
 				writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -2136,7 +2136,7 @@ func (s *POP3Session) handleConnection() {
 				}
 
 				// Acquire write lock to update language
-				acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+				acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 				if !acquired {
 					s.WarnLog("failed to acquire write lock within timeout")
 					writer.WriteString("-ERR Server busy, please try again\r\n")
@@ -2213,7 +2213,7 @@ func (s *POP3Session) handleConnection() {
 			// Phase 1: Collect messages to expunge under a read lock.
 			var messagesToExpunge []db.POP3Message
 			var mailboxID int64
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire read lock at QUIT, cannot expunge deleted messages")
 				if hadDeletions {
@@ -2464,7 +2464,7 @@ func (s *POP3Session) closeWithoutLock() error {
 }
 
 func (s *POP3Session) Close() error {
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock within timeout")
 		// Still close the connection even if we can't acquire the lock

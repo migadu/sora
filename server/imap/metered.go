@@ -118,176 +118,190 @@ func commandStatus(err error) string {
 
 // --- Authenticated state ---
 
-func (m *meteredSession) Select(mboxName string, options *imap.SelectOptions) (*imap.SelectData, error) {
+func (m *meteredSession) Select(ctx context.Context, mboxName string, options *imap.SelectOptions) (*imap.SelectData, error) {
 	start := time.Now()
-	data, err := m.IMAPSession.Select(mboxName, options)
+	data, err := m.IMAPSession.Select(ctx, mboxName, options)
 	m.recordCommand("SELECT", start, err)
 	return data, err
 }
 
-func (m *meteredSession) Create(name string, options *imap.CreateOptions) error {
+func (m *meteredSession) Create(ctx context.Context, name string, options *imap.CreateOptions) error {
 	start := time.Now()
-	err := m.IMAPSession.Create(name, options)
+	err := m.IMAPSession.Create(ctx, name, options)
 	m.recordCommand("CREATE", start, err)
 	return err
 }
 
-func (m *meteredSession) Delete(mboxName string) error {
+func (m *meteredSession) Delete(ctx context.Context, mboxName string) error {
 	start := time.Now()
-	err := m.IMAPSession.Delete(mboxName)
+	err := m.IMAPSession.Delete(ctx, mboxName)
 	m.recordCommand("DELETE", start, err)
 	return err
 }
 
-func (m *meteredSession) Rename(w *imapserver.RenameWriter, existingName, newName string, options *imap.RenameOptions) error {
+func (m *meteredSession) Rename(ctx context.Context, w *imapserver.RenameWriter, existingName, newName string, options *imap.RenameOptions) error {
 	start := time.Now()
-	err := m.IMAPSession.Rename(w, existingName, newName, options)
+	err := m.IMAPSession.Rename(ctx, w, existingName, newName, options)
 	m.recordCommand("RENAME", start, err)
 	return err
 }
 
-func (m *meteredSession) Subscribe(mailboxName string) error {
+func (m *meteredSession) Subscribe(ctx context.Context, mailboxName string) error {
 	start := time.Now()
-	err := m.IMAPSession.Subscribe(mailboxName)
+	err := m.IMAPSession.Subscribe(ctx, mailboxName)
 	m.recordCommand("SUBSCRIBE", start, err)
 	return err
 }
 
-func (m *meteredSession) Unsubscribe(mailboxName string) error {
+func (m *meteredSession) Unsubscribe(ctx context.Context, mailboxName string) error {
 	start := time.Now()
-	err := m.IMAPSession.Unsubscribe(mailboxName)
+	err := m.IMAPSession.Unsubscribe(ctx, mailboxName)
 	m.recordCommand("UNSUBSCRIBE", start, err)
 	return err
 }
 
-func (m *meteredSession) List(w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
+func (m *meteredSession) List(ctx context.Context, w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
 	start := time.Now()
-	err := m.IMAPSession.List(w, ref, patterns, options)
+	err := m.IMAPSession.List(ctx, w, ref, patterns, options)
 	m.recordCommand("LIST", start, err)
 	return err
 }
 
-func (m *meteredSession) Status(mboxName string, options *imap.StatusOptions) (*imap.StatusData, error) {
+func (m *meteredSession) Status(ctx context.Context, mboxName string, options *imap.StatusOptions) (*imap.StatusData, error) {
 	start := time.Now()
-	data, err := m.IMAPSession.Status(mboxName, options)
+	data, err := m.IMAPSession.Status(ctx, mboxName, options)
 	m.recordCommand("STATUS", start, err)
 	return data, err
 }
 
-func (m *meteredSession) Namespace() (*imap.NamespaceData, error) {
+func (m *meteredSession) Namespace(ctx context.Context) (*imap.NamespaceData, error) {
 	start := time.Now()
-	data, err := m.IMAPSession.Namespace()
+	data, err := m.IMAPSession.Namespace(ctx)
 	m.recordCommand("NAMESPACE", start, err)
 	return data, err
 }
 
 // --- Selected state ---
 
-func (m *meteredSession) Expunge(w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) error {
+func (m *meteredSession) Expunge(ctx context.Context, w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) error {
 	start := time.Now()
-	err := m.IMAPSession.Expunge(w, uidSet)
+	err := m.IMAPSession.Expunge(ctx, w, uidSet)
 	m.recordCommand("EXPUNGE", start, err)
 	return err
 }
 
-func (m *meteredSession) Search(numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
+func (m *meteredSession) Search(ctx context.Context, numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "SEARCH", m.server.commandTimeouts)
+	defer cancel()
 	start := time.Now()
-	data, err := m.IMAPSession.Search(numKind, criteria, options)
+	data, err := m.IMAPSession.Search(ctx, numKind, criteria, options)
 	m.recordCommand("SEARCH", start, err)
 	return data, err
 }
 
-func (m *meteredSession) Sort(numKind imapserver.NumKind, sortCriteria []imap.SortCriterion, charset string, searchCriteria *imap.SearchCriteria, options *imap.SortOptions) (*imap.SortData, error) {
+func (m *meteredSession) Sort(ctx context.Context, numKind imapserver.NumKind, sortCriteria []imap.SortCriterion, charset string, searchCriteria *imap.SearchCriteria, options *imap.SortOptions) (*imap.SortData, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "SORT", m.server.commandTimeouts)
+	defer cancel()
 	start := time.Now()
-	data, err := m.IMAPSession.Sort(numKind, sortCriteria, charset, searchCriteria, options)
+	data, err := m.IMAPSession.Sort(ctx, numKind, sortCriteria, charset, searchCriteria, options)
 	m.recordCommand("SORT", start, err)
 	return data, err
 }
 
-func (m *meteredSession) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
+func (m *meteredSession) Store(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
+	ctx, cancel := applyCommandTimeout(ctx, "STORE", m.server.commandTimeouts)
+	defer cancel()
 	start := time.Now()
-	err := m.IMAPSession.Store(w, numSet, flags, options)
+	err := m.IMAPSession.Store(ctx, w, numSet, flags, options)
 	m.recordCommand("STORE", start, err)
 	return err
 }
 
-func (m *meteredSession) Copy(numSet imap.NumSet, mboxName string) (*imap.CopyData, error) {
+func (m *meteredSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName string) (*imap.CopyData, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "COPY", m.server.commandTimeouts)
+	defer cancel()
 	start := time.Now()
-	data, err := m.IMAPSession.Copy(numSet, mboxName)
+	data, err := m.IMAPSession.Copy(ctx, numSet, mboxName)
 	m.recordCommand("COPY", start, err)
 	return data, err
 }
 
-func (m *meteredSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest string) error {
+func (m *meteredSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet imap.NumSet, dest string) error {
+	ctx, cancel := applyCommandTimeout(ctx, "MOVE", m.server.commandTimeouts)
+	defer cancel()
 	start := time.Now()
-	err := m.IMAPSession.Move(w, numSet, dest)
+	err := m.IMAPSession.Move(ctx, w, numSet, dest)
 	m.recordCommand("MOVE", start, err)
 	return err
 }
 
-func (m *meteredSession) Thread(numKind imapserver.NumKind, algorithm imap.ThreadAlgorithm, charset string, criteria *imap.SearchCriteria) ([]imap.ThreadData, error) {
+func (m *meteredSession) Thread(ctx context.Context, numKind imapserver.NumKind, algorithm imap.ThreadAlgorithm, charset string, criteria *imap.SearchCriteria) ([]imap.ThreadData, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "THREAD", m.server.commandTimeouts)
+	defer cancel()
 	start := time.Now()
-	data, err := m.IMAPSession.Thread(numKind, algorithm, charset, criteria)
+	data, err := m.IMAPSession.Thread(ctx, numKind, algorithm, charset, criteria)
 	m.recordCommand("THREAD", start, err)
 	return data, err
 }
 
-func (m *meteredSession) MultiSearch(source *imap.SearchSource, criteria *imap.SearchCriteria, options *imap.SearchOptions) ([]*imap.SearchData, error) {
+func (m *meteredSession) MultiSearch(ctx context.Context, source *imap.SearchSource, criteria *imap.SearchCriteria, options *imap.SearchOptions) ([]*imap.SearchData, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "MULTISEARCH", m.server.commandTimeouts)
+	defer cancel()
 	start := time.Now()
-	data, err := m.IMAPSession.MultiSearch(source, criteria, options)
+	data, err := m.IMAPSession.MultiSearch(ctx, source, criteria, options)
 	m.recordCommand("MULTISEARCH", start, err)
 	return data, err
 }
 
 // --- METADATA (RFC 5464) ---
 
-func (m *meteredSession) GetMetadata(mailbox string, entries []string, options *imap.GetMetadataOptions) (*imap.GetMetadataData, error) {
+func (m *meteredSession) GetMetadata(ctx context.Context, mailbox string, entries []string, options *imap.GetMetadataOptions) (*imap.GetMetadataData, error) {
 	start := time.Now()
-	data, err := m.IMAPSession.GetMetadata(mailbox, entries, options)
+	data, err := m.IMAPSession.GetMetadata(ctx, mailbox, entries, options)
 	m.recordCommand("GETMETADATA", start, err)
 	return data, err
 }
 
-func (m *meteredSession) SetMetadata(mailbox string, entries map[string]*[]byte) error {
+func (m *meteredSession) SetMetadata(ctx context.Context, mailbox string, entries map[string]*[]byte) error {
 	start := time.Now()
-	err := m.IMAPSession.SetMetadata(mailbox, entries)
+	err := m.IMAPSession.SetMetadata(ctx, mailbox, entries)
 	m.recordCommand("SETMETADATA", start, err)
 	return err
 }
 
 // --- ACL (RFC 4314) ---
 
-func (m *meteredSession) GetACL(mailbox string) (*imap.GetACLData, error) {
+func (m *meteredSession) GetACL(ctx context.Context, mailbox string) (*imap.GetACLData, error) {
 	start := time.Now()
-	data, err := m.IMAPSession.GetACL(mailbox)
+	data, err := m.IMAPSession.GetACL(ctx, mailbox)
 	m.recordCommand("GETACL", start, err)
 	return data, err
 }
 
-func (m *meteredSession) SetACL(mailbox string, identifier imap.RightsIdentifier, modification imap.RightModification, rights imap.RightSet) error {
+func (m *meteredSession) SetACL(ctx context.Context, mailbox string, identifier imap.RightsIdentifier, modification imap.RightModification, rights imap.RightSet) error {
 	start := time.Now()
-	err := m.IMAPSession.SetACL(mailbox, identifier, modification, rights)
+	err := m.IMAPSession.SetACL(ctx, mailbox, identifier, modification, rights)
 	m.recordCommand("SETACL", start, err)
 	return err
 }
 
-func (m *meteredSession) DeleteACL(mailbox string, identifier imap.RightsIdentifier) error {
+func (m *meteredSession) DeleteACL(ctx context.Context, mailbox string, identifier imap.RightsIdentifier) error {
 	start := time.Now()
-	err := m.IMAPSession.DeleteACL(mailbox, identifier)
+	err := m.IMAPSession.DeleteACL(ctx, mailbox, identifier)
 	m.recordCommand("DELETEACL", start, err)
 	return err
 }
 
-func (m *meteredSession) ListRights(mailbox string, identifier imap.RightsIdentifier) (*imap.ListRightsData, error) {
+func (m *meteredSession) ListRights(ctx context.Context, mailbox string, identifier imap.RightsIdentifier) (*imap.ListRightsData, error) {
 	start := time.Now()
-	data, err := m.IMAPSession.ListRights(mailbox, identifier)
+	data, err := m.IMAPSession.ListRights(ctx, mailbox, identifier)
 	m.recordCommand("LISTRIGHTS", start, err)
 	return data, err
 }
 
-func (m *meteredSession) MyRights(mailbox string) (*imap.MyRightsData, error) {
+func (m *meteredSession) MyRights(ctx context.Context, mailbox string) (*imap.MyRightsData, error) {
 	start := time.Now()
-	data, err := m.IMAPSession.MyRights(mailbox)
+	data, err := m.IMAPSession.MyRights(ctx, mailbox)
 	m.recordCommand("MYRIGHTS", start, err)
 	return data, err
 }

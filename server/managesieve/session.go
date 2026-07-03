@@ -90,7 +90,7 @@ func validateScriptName(name string) error {
 }
 
 func (s *ManageSieveSession) sendCapabilities() {
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire read lock", "operation", "sendCapabilities")
 		// Send minimal capabilities if lock fails
@@ -398,7 +398,7 @@ func (s *ManageSieveSession) handleConnection() {
 			}
 
 			// Acquire write lock for updating session authentication state
-			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire write lock", "command", "LOGIN")
 				s.sendResponse("NO Server busy, try again later\r\n")
@@ -799,7 +799,7 @@ func (s *ManageSieveSession) handleConnection() {
 			}
 
 			// Acquire write lock for updating connection state
-			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 			if !acquired {
 				s.WarnLog("failed to acquire write lock", "command", "STARTTLS")
 				s.sendResponse("NO Server busy, try again later\r\n")
@@ -917,7 +917,7 @@ func (s *ManageSieveSession) handleListScripts() bool {
 
 	// Acquire a read lock only to get the necessary session state.
 	// A write lock is not needed for a read-only command.
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire read lock", "command", "LISTSCRIPTS")
 		s.sendResponse("NO Server busy, try again later\r\n")
@@ -969,7 +969,7 @@ func (s *ManageSieveSession) handleGetScript(name string) bool {
 	name = strings.TrimSpace(server.UnquoteString(name))
 
 	// Acquire a read lock only to get the necessary session state.
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire read lock", "command", "GETSCRIPT")
 		s.sendResponse("NO Server busy, try again later\r\n")
@@ -1023,7 +1023,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	}
 
 	// Phase 1: Read session state
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire read lock", "command", "PUTSCRIPT")
 		s.sendResponse("NO Server busy, try again later\r\n")
@@ -1087,7 +1087,7 @@ func (s *ManageSieveSession) handlePutScript(name, content string) bool {
 	}
 
 	// Phase 3: Update session state
-	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "PUTSCRIPT", "purpose", "pin_session")
 	} else {
@@ -1159,7 +1159,7 @@ func (s *ManageSieveSession) handleHaveSpace(name string, size int64) bool {
 	// from unit tests that construct a minimal session.
 	if s.server.rdb != nil {
 		// Read session state for the count-quota check (respecting session pinning).
-		acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+		acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 		if !acquired {
 			s.WarnLog("failed to acquire read lock", "command", "HAVESPACE")
 			s.sendResponse("NO Server busy, try again later\r\n")
@@ -1217,7 +1217,7 @@ func (s *ManageSieveSession) handleRenameScript(oldName, newName string) bool {
 	}
 
 	// Read session state
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire read lock", "command", "RENAMESCRIPT")
 		s.sendResponse("NO Server busy, try again later\r\n")
@@ -1233,7 +1233,7 @@ func (s *ManageSieveSession) handleRenameScript(oldName, newName string) bool {
 	switch {
 	case err == nil:
 		// Pin session to master so subsequent reads in this session see the rename.
-		acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+		acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 		if !acquired {
 			s.WarnLog("failed to acquire write lock", "command", "RENAMESCRIPT", "purpose", "pin_session")
 		} else {
@@ -1267,7 +1267,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	name = strings.TrimSpace(server.UnquoteString(name))
 
 	// Phase 1: Read session state
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire read lock", "command", "SETACTIVE")
 		s.sendResponse("NO Server busy, try again later\r\n")
@@ -1286,7 +1286,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 		}
 
 		// Phase 3: Update session state
-		acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+		acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 		if !acquired {
 			s.WarnLog("failed to acquire write lock", "command", "SETACTIVE", "purpose", "pin_session")
 		} else {
@@ -1334,7 +1334,7 @@ func (s *ManageSieveSession) handleSetActive(name string) bool {
 	}
 
 	// Phase 3: Update session state
-	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "SETACTIVE", "purpose", "pin_session")
 	} else {
@@ -1362,7 +1362,7 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 	name = strings.TrimSpace(server.UnquoteString(name))
 
 	// Phase 1: Read session state
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire read lock", "command", "DELETESCRIPT")
 		s.sendResponse("NO Server busy, try again later\r\n")
@@ -1402,7 +1402,7 @@ func (s *ManageSieveSession) handleDeleteScript(name string) bool {
 	}
 
 	// Phase 3: Update session state
-	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "DELETESCRIPT", "purpose", "pin_session")
 	} else {
@@ -1469,7 +1469,7 @@ func (s *ManageSieveSession) Close() error {
 		return s.closeWithoutLock()
 	default:
 		// Acquire write lock for cleanup
-		acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+		acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 		if !acquired {
 			s.InfoLog("failed to acquire write lock within timeout", "operation", "close")
 			// Continue with close even if we can't get the lock
@@ -1816,7 +1816,7 @@ func (s *ManageSieveSession) handleAuthenticate(parts []string) bool {
 	}
 
 	// Acquire write lock for updating session authentication state
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "AUTHENTICATE")
 		s.sendResponse("NO Server busy, try again later\r\n")

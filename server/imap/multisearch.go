@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -15,9 +16,9 @@ import (
 // ACL-checked set of mailboxes and UID-search each. ESEARCH always reports UIDs
 // (sequence numbers are meaningless for unselected mailboxes), and every result
 // carries its Mailbox + UIDValidity so returned UIDs are unambiguous.
-func (s *IMAPSession) MultiSearch(source *imap.SearchSource, criteria *imap.SearchCriteria, options *imap.SearchOptions) ([]*imap.SearchData, error) {
+func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource, criteria *imap.SearchCriteria, options *imap.SearchOptions) ([]*imap.SearchData, error) {
 	if s.server.searchRateLimiter != nil && s.IMAPUser != nil {
-		if err := s.server.searchRateLimiter.CanSearch(s.ctx, s.IMAPUser.AccountID()); err != nil {
+		if err := s.server.searchRateLimiter.CanSearch(ctx, s.IMAPUser.AccountID()); err != nil {
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Text: err.Error(),
@@ -25,7 +26,7 @@ func (s *IMAPSession) MultiSearch(source *imap.SearchSource, criteria *imap.Sear
 		}
 	}
 
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		s.DebugLog("session context is cancelled, skipping multisearch")
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed"}
 	}
@@ -40,7 +41,7 @@ func (s *IMAPSession) MultiSearch(source *imap.SearchSource, criteria *imap.Sear
 	// Fetch all mailboxes visible to the account (owned + shared). Each mailbox's
 	// Subscribed flag is already sourced from the name-based subscriptions table
 	// for this accessing user (migration 000046).
-	allMailboxes, err := s.server.rdb.GetMailboxesWithRetry(s.ctx, accountID, false)
+	allMailboxes, err := s.server.rdb.GetMailboxesWithRetry(ctx, accountID, false)
 	if err != nil {
 		s.DebugLog("[MULTISEARCH] failed to fetch mailboxes", "error", err)
 		return nil, s.internalError("failed to retrieve mailboxes: %v", err)
@@ -61,7 +62,7 @@ func (s *IMAPSession) MultiSearch(source *imap.SearchSource, criteria *imap.Sear
 		// shared mailboxes that are visible with only the 'l' (lookup) right, and
 		// scope verbs may resolve to them; skip any the user cannot read so ESEARCH
 		// cannot leak message UIDs/counts from them.
-		hasRead, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, mbox.ID, accountID, 'r')
+		hasRead, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, mbox.ID, accountID, 'r')
 		if err != nil {
 			return nil, s.internalError("failed to check read permission for %s: %v", mbox.Name, err)
 		}
@@ -69,7 +70,7 @@ func (s *IMAPSession) MultiSearch(source *imap.SearchSource, criteria *imap.Sear
 			continue
 		}
 
-		messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(s.ctx, mbox.ID, criteria, 0)
+		messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(ctx, mbox.ID, criteria, 0)
 		if err != nil {
 			s.DebugLog("[MULTISEARCH] final error after retries", "mailbox", mbox.Name, "error", err)
 			s.classifyAndTrackError("MULTISEARCH", err, nil)

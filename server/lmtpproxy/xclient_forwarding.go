@@ -70,8 +70,9 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 		}
 	}()
 
-	// Read backend response (we expect "250 OK" or similar)
-	response, err := reader.ReadString('\n')
+	// Read backend response (we expect "250 OK" or similar).
+	// Bounded so a misbehaving backend cannot grow memory without limit.
+	response, err := server.ReadBoundedLine(reader, 4096)
 	if err != nil {
 		return fmt.Errorf("failed to read XCLIENT response: %v", err)
 	}
@@ -93,17 +94,23 @@ func (s *Session) sendForwardingParametersToBackend(writer *bufio.Writer, reader
 			return fmt.Errorf("failed to flush LHLO after XCLIENT: %v", err)
 		}
 
-		// Read LHLO response lines until we get the final one (without "-")
-		for {
-			lhloResponse, err := reader.ReadString('\n')
+		// Read LHLO response lines until we get the final one (without "-").
+		// Bounded line length and line count; the read deadline set above still applies.
+		for lines := 0; ; lines++ {
+			if lines >= maxLHLOResponseLines {
+				return fmt.Errorf("backend LHLO response after XCLIENT exceeded %d lines", maxLHLOResponseLines)
+			}
+			lhloResponse, err := server.ReadBoundedLine(reader, 4096)
 			if err != nil {
 				return fmt.Errorf("failed to read LHLO response after XCLIENT: %v", err)
 			}
 			lhloResponse = strings.TrimRight(lhloResponse, "\r\n")
 			s.DebugLog("backend LHLO after XCLIENT", "response", lhloResponse)
 
-			// Check if this is the final response line (doesn't have "-" after status code)
-			if len(lhloResponse) >= 3 && lhloResponse[3] != '-' {
+			// A line is a continuation only if it explicitly has '-' after the
+			// status code; everything else (including short lines like "250",
+			// which previously caused an index-out-of-range panic here) is final.
+			if len(lhloResponse) < 4 || lhloResponse[3] != '-' {
 				break
 			}
 		}

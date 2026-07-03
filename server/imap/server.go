@@ -311,8 +311,9 @@ type IMAPServer struct {
 	// Command timeout and throughput enforcement
 	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	commandTimeout         time.Duration
-	absoluteSessionTimeout time.Duration // Maximum total session duration
-	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
+	commandTimeouts        *CommandTimeouts // Per-command hard execution timeouts (nil = use defaults)
+	absoluteSessionTimeout time.Duration    // Maximum total session duration
+	minBytesPerMinute      int64            // Minimum throughput to prevent slowloris (0 = disabled)
 
 	// Active connection tracking for graceful shutdown
 	activeConnsMutex sync.RWMutex
@@ -377,10 +378,11 @@ type IMAPServerOptions struct {
 	MetadataMaxEntriesPerServer  int
 	MetadataMaxTotalSize         int
 	// Command timeout and throughput enforcement
-	AuthIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
-	CommandTimeout         time.Duration // Maximum idle time before disconnection
-	AbsoluteSessionTimeout time.Duration // Maximum total session duration (0 = use default 30m)
-	MinBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
+	AuthIdleTimeout         time.Duration            // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	CommandTimeout          time.Duration            // Maximum idle time before disconnection
+	CommandTimeoutOverrides map[string]time.Duration // Per-command hard execution timeouts (overrides defaults)
+	AbsoluteSessionTimeout  time.Duration            // Maximum total session duration (0 = use default 30m)
+	MinBytesPerMinute       int64                    // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
 	// Auth security
 	InsecureAuth bool // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
 	// Full config for shared mailboxes and other features
@@ -600,9 +602,15 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		masterSASLGate:         masterSASLGate,
 		authIdleTimeout:        options.AuthIdleTimeout,
 		commandTimeout:         options.CommandTimeout,
+		commandTimeouts:        defaultCommandTimeouts(),
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
 		minBytesPerMinute:      options.MinBytesPerMinute,
 		activeConns:            make(map[*imapserver.Conn]struct{}),
+	}
+
+	// Apply operator-configured per-command timeout overrides on top of defaults.
+	if len(options.CommandTimeoutOverrides) > 0 {
+		s.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
 	// Pre-compile regex patterns for capability filters for performance and correctness

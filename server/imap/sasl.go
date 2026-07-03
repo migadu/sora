@@ -351,8 +351,11 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			// rate-limit check were already applied once above for this
 			// AUTHENTICATE command (ApplyAuthenticationDelay + CanAttemptAuthWithProxy).
 			// Calling s.Login here would apply both a second time.
+			// The SASL server callback (go-sasl's Next) carries no per-command
+			// context, so use the session context here — it is the best available
+			// signal for the AUTHENTICATE path.
 			s.DebugLog("proceeding with regular authentication", "username", username)
-			return s.login(username, password, false)
+			return s.login(s.ctx, username, password, false)
 		}), nil
 	default:
 		s.DebugLog("unsupported authentication mechanism", "mechanism", mechanism)

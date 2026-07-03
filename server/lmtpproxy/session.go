@@ -94,14 +94,21 @@ func (s *Session) handleConnection() {
 	defer metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy", s.server.name, s.server.hostname).Dec()
 
 	// Ensure connections are closed when context is cancelled (e.g. by absolute timeout or server shutdown)
-	// This serves as a fail-safe to unblock reads that don't inherently respect context cancellation
+	// This serves as a fail-safe to unblock reads that don't inherently respect context cancellation.
+	// IMPORTANT: The backend connection must be closed here too. Before this, a backend that
+	// hung during the handshake or a RCPT/DATA response read kept the session goroutine blocked
+	// forever: the absolute session timeout only closed the client connection, which does not
+	// unblock a read on the backend connection.
 	go func() {
 		<-s.ctx.Done()
-		// Force close connection to unblock any pending Read calls
+		// Force close connections to unblock any pending Read calls
 		// Use mutex to ensure safe access consistent with close()
 		s.mu.Lock()
 		if s.clientConn != nil {
 			s.clientConn.Close()
+		}
+		if s.backendConn != nil {
+			s.backendConn.Close()
 		}
 		s.mu.Unlock()
 	}()
@@ -313,6 +320,12 @@ func (s *Session) handleConnection() {
 			if s.backendConn == nil {
 				if err := s.connectToBackend(); err != nil {
 					s.InfoLog("backend connection failed", "from", s.sender, "to", s.to, "error", err)
+					// NOTE: we deliberately do NOT invalidate the lookup cache here.
+					// The cache exists to protect remotelookup; invalidating on
+					// connect failure would hammer remotelookup with one query per
+					// delivery attempt for the whole duration of a backend outage.
+					// Routing is revalidated via positive-TTL expiry instead (see
+					// integration_tests/lmtpproxy/backend_rejection_cache_test.go).
 					s.sendResponse("451 4.4.1 Backend connection failed")
 					// Do not return, continue loop to handle RSET or QUIT
 					continue
@@ -380,8 +393,9 @@ func (s *Session) handleConnection() {
 			}
 			s.backendWriter.Flush()
 
-			// Read DATA response
-			response, err := s.backendReader.ReadString('\n')
+			// Read DATA response (bounded, with read deadline so a hung backend
+			// cannot block the session forever)
+			response, err := s.readBackendLine()
 			if err != nil {
 				s.DebugLog("Failed to read DATA response", "error", err)
 				s.sendResponse("451 4.4.2 Backend error")
@@ -1038,11 +1052,16 @@ func (s *Session) connectToBackend() error {
 		}, actualAddr, routeResult.RoutingMethod == "affinity")
 	}
 
-	// Read greeting from backend
-	_, err = s.backendReader.ReadString('\n')
+	// Read greeting from backend (bounded, with read deadline: a backend that
+	// accepts TCP but never sends its greeting must not hang the session)
+	greeting, err := s.readBackendLine()
 	if err != nil {
 		s.backendConn.Close()
 		return fmt.Errorf("failed to read backend greeting: %w", err)
+	}
+	if !strings.HasPrefix(greeting, "220") {
+		s.backendConn.Close()
+		return fmt.Errorf("unexpected backend greeting: %q", strings.TrimSpace(greeting))
 	}
 
 	// Send LHLO to backend
@@ -1054,9 +1073,14 @@ func (s *Session) connectToBackend() error {
 	}
 	s.backendWriter.Flush()
 
-	// Read LHLO response
-	for {
-		response, err := s.backendReader.ReadString('\n')
+	// Read LHLO response (bounded lines and line count so a misbehaving backend
+	// cannot keep us in this loop or grow memory without limit)
+	for lines := 0; ; lines++ {
+		if lines >= maxLHLOResponseLines {
+			s.backendConn.Close()
+			return fmt.Errorf("backend LHLO response exceeded %d lines", maxLHLOResponseLines)
+		}
+		response, err := s.readBackendLine()
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("failed to read LHLO response: %w", err)
@@ -1116,8 +1140,8 @@ func (s *Session) connectToBackend() error {
 		}
 		s.backendWriter.Flush()
 
-		// Read STARTTLS response
-		response, err := s.backendReader.ReadString('\n')
+		// Read STARTTLS response (bounded, with read deadline)
+		response, err := s.readBackendLine()
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("failed to read STARTTLS response: %w", err)
@@ -1150,9 +1174,13 @@ func (s *Session) connectToBackend() error {
 		}
 		s.backendWriter.Flush()
 
-		// Read LHLO response again
-		for {
-			response, err := s.backendReader.ReadString('\n')
+		// Read LHLO response again (bounded lines and line count)
+		for lines := 0; ; lines++ {
+			if lines >= maxLHLOResponseLines {
+				s.backendConn.Close()
+				return fmt.Errorf("backend LHLO response after STARTTLS exceeded %d lines", maxLHLOResponseLines)
+			}
+			response, err := s.readBackendLine()
 			if err != nil {
 				s.backendConn.Close()
 				return fmt.Errorf("failed to read LHLO response after STARTTLS: %w", err)
@@ -1201,8 +1229,8 @@ func (s *Session) connectToBackend() error {
 		}
 		s.backendWriter.Flush()
 
-		// Read MAIL FROM response
-		response, err := s.backendReader.ReadString('\n')
+		// Read MAIL FROM response (bounded, with read deadline)
+		response, err := s.readBackendLine()
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("failed to read MAIL FROM response: %w", err)
@@ -1217,6 +1245,46 @@ func (s *Session) connectToBackend() error {
 	}
 
 	return nil
+}
+
+// backendResponseLineMax bounds a single backend response line during the
+// handshake and per-command phases. RFC 5321 reply lines are far below this.
+const backendResponseLineMax = 4096
+
+// maxLHLOResponseLines bounds multiline LHLO responses so a misbehaving
+// backend cannot keep the proxy in the reply loop forever.
+const maxLHLOResponseLines = 64
+
+// readBackendLine reads one bounded response line from the backend with a
+// read deadline (the backend connect timeout). The deadline is cleared after
+// the read so later phases (the relay loop manages its own deadlines) are
+// unaffected. Without this, a backend that accepted the connection but then
+// went silent kept the session goroutine blocked forever.
+func (s *Session) readBackendLine() (string, error) {
+	timeout := s.server.connManager.GetConnectTimeout()
+	if timeout > 0 {
+		if err := s.backendConn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return "", fmt.Errorf("failed to set backend read deadline: %w", err)
+		}
+		defer func() {
+			if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
+				s.DebugLog("failed to clear backend read deadline", "error", err)
+			}
+		}()
+	}
+	return server.ReadBoundedLine(s.backendReader, backendResponseLineMax)
+}
+
+// invalidateLookupCache removes the cached routing entry for the originally
+// submitted recipient address. The cache key must be the SUBMITTED address
+// (s.originalAddress), not the resolved one (s.username), because that is the
+// key handleRecipient used for Set.
+func (s *Session) invalidateLookupCache(reason string) {
+	if s.server.lookupCache == nil || s.originalAddress == "" {
+		return
+	}
+	s.server.lookupCache.InvalidateUser(s.server.name, s.originalAddress)
+	s.InfoLog("invalidated lookup cache entry", "reason", reason, "address", s.originalAddress, "backend", s.serverAddr)
 }
 
 // forwardRCPT sends the RCPT TO command to backend and handles response interception
@@ -1279,8 +1347,8 @@ func (s *Session) forwardRCPT(command string) {
 	}
 	s.backendWriter.Flush()
 
-	// Read the backend's response to RCPT TO
-	response, err := s.backendReader.ReadString('\n')
+	// Read the backend's response to RCPT TO (bounded, with read deadline)
+	response, err := s.readBackendLine()
 	if err != nil {
 		s.DebugLog("Failed to read RCPT TO response", "error", err)
 		s.sendResponse("451 4.4.2 Backend error")
@@ -1307,18 +1375,11 @@ func (s *Session) forwardRCPT(command string) {
 			"returned_to_client", "451 4.3.0",
 			"issue", "remotelookup returned this backend but backend rejected user - check data consistency")
 
-		// Invalidate cache entry to force fresh lookup on next attempt
-		// This prevents repeated routing to the wrong backend
-		// Use originalAddress as cache key (same key used when entry was created)
-		if s.originalAddress != "" {
-			// Construct cache key: "serverName:username" (or just "username" if serverName is empty)
-			cacheKey := s.originalAddress
-			if s.server.name != "" {
-				cacheKey = fmt.Sprintf("%s:%s", s.server.name, s.originalAddress)
-			}
-			s.server.lookupCache.Invalidate(cacheKey)
-			s.InfoLog("invalidated cache entry due to backend rejection", "cache_key", cacheKey, "username", s.username, "backend", s.serverAddr)
-		}
+		// Invalidate cache entry to force fresh lookup on next attempt.
+		// This prevents repeated routing to the wrong backend. InvalidateUser
+		// derives the key exactly like Get/Set did (submitted address), so the
+		// key formats can never drift apart.
+		s.invalidateLookupCache("backend rejected recipient")
 
 		// Override the backend's 5xx response with our own 4xx to allow retry
 		s.sendResponse("451 4.3.0 Backend configuration issue, please try again later")
@@ -1450,40 +1511,58 @@ func (s *Session) proxyClientToBackend() {
 		// Record total bytes when the copy loop exits
 		metrics.BytesThroughput.WithLabelValues("lmtp_proxy", "in").Add(float64(totalBytesIn))
 	}()
+	// Best-effort: never exit with forwarded-but-unflushed bytes in the writer.
+	defer s.backendWriter.Flush()
 
 	for {
 		// Set a read deadline to prevent idle connections between commands.
-		if s.server.authIdleTimeout > 0 {
+		// Only when the next ReadSlice will actually hit the connection:
+		// buffered data is served without blocking, and SetReadDeadline can
+		// fail once the connection is torn down, which must not discard data
+		// we already received from the client.
+		if s.server.authIdleTimeout > 0 && s.clientReader.Buffered() == 0 {
 			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
 				s.DebugLog("Failed to set read deadline", "error", err)
 				return
 			}
 		}
 
-		line, err := s.clientReader.ReadString('\n')
+		// ReadSlice (not ReadString) so an oversized line - e.g. a huge DATA
+		// line without CRLF - is forwarded in buffer-sized chunks instead of
+		// being accumulated in memory in its entirety.
+		line, err := s.clientReader.ReadSlice('\n')
+		if len(line) > 0 {
+			// Forward the chunk to the backend
+			n, werr := s.backendWriter.Write(line)
+			totalBytesIn += int64(n)
+			if werr != nil {
+				if !isClosingError(werr) {
+					s.DebugLog("Error writing to backend", "error", werr)
+				}
+				return
+			}
+			// Flush only once the client buffer is drained: this forwards
+			// promptly but avoids one syscall per message line during DATA.
+			if s.clientReader.Buffered() == 0 {
+				if ferr := s.backendWriter.Flush(); ferr != nil {
+					if !isClosingError(ferr) {
+						s.DebugLog("Error flushing to backend", "error", ferr)
+					}
+					return
+				}
+			}
+		}
 		if err != nil {
+			if err == bufio.ErrBufferFull {
+				// Long line: the chunk was already forwarded above; keep reading.
+				continue
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				s.DebugLog("Idle timeout - closing connection")
 				return
 			}
 			if !isClosingError(err) {
 				s.DebugLog("Error reading from client", "error", err)
-			}
-			return
-		}
-
-		// Forward the command to backend
-		n, err := s.backendWriter.WriteString(line)
-		totalBytesIn += int64(n)
-		if err != nil {
-			if !isClosingError(err) {
-				s.DebugLog("Error writing to backend", "error", err)
-			}
-			return
-		}
-		if err := s.backendWriter.Flush(); err != nil {
-			if !isClosingError(err) {
-				s.DebugLog("Error flushing to backend", "error", err)
 			}
 			return
 		}
@@ -1518,13 +1597,15 @@ func (s *Session) close() {
 		// LMTP sessions can contain multiple RCPTs; s.accountID is overwritten per RCPT.
 		// If we were to unregister only s.accountID (the *last* RCPT), we would leak the
 		// original registered user forever.
-		accountIDs := make([]int64, 0, 1)
+		// IMPORTANT: only unregister what we actually registered. There is
+		// deliberately NO fallback to s.accountID here: handleRecipient sets
+		// s.accountID even when registerConnection was never called (e.g. the
+		// backend connect failed) or was rejected by a limit. Unregistering an
+		// account that was never registered decrements connection counts owned
+		// by the user's OTHER live sessions, eroding per-user limits.
+		accountIDs := make([]int64, 0, len(s.registeredAccountIDs))
 		for id := range s.registeredAccountIDs {
 			accountIDs = append(accountIDs, id)
-		}
-		if len(accountIDs) == 0 {
-			// Backward compatibility / defensive: if we never tracked registrations, fall back.
-			accountIDs = append(accountIDs, s.accountID)
 		}
 
 		for _, id := range accountIDs {

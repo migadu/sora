@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -8,9 +9,9 @@ import (
 	"github.com/migadu/sora/consts"
 )
 
-func (s *IMAPSession) Delete(mboxName string) error {
+func (s *IMAPSession) Delete(ctx context.Context, mboxName string) error {
 	// First phase: Read-only validation with read lock
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire read lock")
 		return s.internalError("failed to acquire lock for delete")
@@ -31,7 +32,7 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	}
 
 	// Middle phase: Database operations outside lock
-	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(s.ctx, AccountID, mboxName)
+	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, mboxName)
 	if err != nil {
 		if err == consts.ErrMailboxNotFound {
 			s.DebugLog("mailbox not found", "mailbox", mboxName)
@@ -45,7 +46,7 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	}
 
 	// Check ACL permissions - requires 'x' (delete) right
-	hasDeleteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(s.ctx, mailbox.ID, AccountID, 'x')
+	hasDeleteRight, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, mailbox.ID, AccountID, 'x')
 	if err != nil {
 		return s.internalError("failed to check delete permission: %v", err)
 	}
@@ -73,7 +74,7 @@ func (s *IMAPSession) Delete(mboxName string) error {
 	// and removes the row. This keeps DELETE off the per-mailbox lock for the whole
 	// bulk expunge, which previously drove DELETE P99 to ~1 minute on large folders.
 	// Use mailbox.AccountID (the owner) not AccountID (the requester) for shared mailbox support.
-	err = s.server.rdb.SoftDeleteMailboxWithRetry(s.ctx, mailbox.ID, mailbox.AccountID)
+	err = s.server.rdb.SoftDeleteMailboxWithRetry(ctx, mailbox.ID, mailbox.AccountID)
 	if err != nil {
 		return s.internalError("failed to delete mailbox '%s': %v", mboxName, err)
 	}

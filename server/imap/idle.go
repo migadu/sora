@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"context"
 	"net"
 	"time"
 
@@ -11,7 +12,7 @@ import (
 
 var idlePollInterval = 15 * time.Second
 
-func (s *IMAPSession) Idle(w *imapserver.UpdateWriter, done <-chan struct{}) error {
+func (s *IMAPSession) Idle(ctx context.Context, w *imapserver.UpdateWriter, done <-chan struct{}) error {
 	s.InfoLog("client entered IDLE mode")
 
 	metrics.IMAPIdleConnections.Inc()
@@ -41,7 +42,7 @@ func (s *IMAPSession) Idle(w *imapserver.UpdateWriter, done <-chan struct{}) err
 	}
 
 	for {
-		if stop, err := s.idleLoop(w, done); err != nil {
+		if stop, err := s.idleLoop(ctx, w, done); err != nil {
 			return err
 		} else if stop {
 			return nil
@@ -49,14 +50,18 @@ func (s *IMAPSession) Idle(w *imapserver.UpdateWriter, done <-chan struct{}) err
 	}
 }
 
-func (s *IMAPSession) idleLoop(w *imapserver.UpdateWriter, done <-chan struct{}) (stop bool, err error) {
+func (s *IMAPSession) idleLoop(ctx context.Context, w *imapserver.UpdateWriter, done <-chan struct{}) (stop bool, err error) {
 	timer := time.NewTimer(idlePollInterval)
 	defer timer.Stop()
 
 	select {
 	case <-timer.C:
-		return false, s.Poll(w, true)
+		return false, s.Poll(ctx, w, true)
 	case <-done:
+		return true, nil
+	case <-ctx.Done():
+		// Connection torn down (client disconnect or server shutdown): stop
+		// IDLE promptly instead of waiting out the poll interval.
 		return true, nil
 	}
 }

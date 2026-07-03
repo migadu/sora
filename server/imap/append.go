@@ -55,7 +55,7 @@ func extractBodyStructureSafe(data []byte) imap.BodyStructure {
 	}
 }
 
-func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
+func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
 	start := time.Now()
 	// recordMetrics records throughput + latency, classifying the status the same
 	// way the meteredSession wrapper does (success / client_error / server_error)
@@ -66,9 +66,9 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	}
 
 	// Create a context that signals to use the master DB if the session is pinned.
-	readCtx := s.ctx
+	readCtx := ctx
 	if s.useMasterDB.Load() {
-		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
 	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, s.AccountID(), mboxName)
@@ -330,7 +330,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 		return nil, ierr
 	}
 
-	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(s.ctx,
+	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
 			AccountID:     destAccountID,
 			MailboxID:     mailbox.ID,
@@ -395,7 +395,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 
 	// Before updating the session state, check if the context is still valid
 	// and then update the session state under mutex protection
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		s.DebugLog("request aborted after message insertion")
 		// We've already inserted the message successfully, so still return success
 		recordMetrics(nil)
@@ -413,7 +413,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	s.server.uploader.NotifyUploadQueued()
 
 	// Update the session's message count and notify the tracker if needed
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout()
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
 	if !acquired {
 		s.DebugLog("failed to acquire write lock within timeout")
 		recordMetrics(nil)
@@ -428,7 +428,7 @@ func (s *IMAPSession) Append(mboxName string, r imap.LiteralReader, options *ima
 	s.useMasterDB.Store(true)
 
 	// After re-acquiring the lock, check again if the context is still valid
-	if s.ctx.Err() != nil {
+	if ctx.Err() != nil {
 		s.DebugLog("request aborted during mutex acquisition")
 		recordMetrics(nil)
 		return &imap.AppendData{
