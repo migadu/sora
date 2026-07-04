@@ -10,29 +10,32 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/migadu/go-managesieve/managesieve"
+	"github.com/migadu/go-managesieve/managesieveserver"
 	"github.com/migadu/sora/consts"
-	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/server/idgen"
-	"github.com/migadu/sora/server/managesieve"
 	"github.com/migadu/sora/server/proxy"
 )
 
-// Session represents a ManageSieve proxy session.
+// Session represents a ManageSieve proxy session. The go-managesieve library
+// owns the client-facing pre-authentication protocol (greeting, CAPABILITY,
+// STARTTLS, AUTHENTICATE wire framing, error budget); this session
+// authenticates the user (cache/remotelookup/master/DB), dials and
+// authenticates the backend, then hijacks the raw client socket and relays
+// bytes bidirectionally.
 type Session struct {
 	server                *Server
+	msConn                *managesieveserver.Conn // library connection (Hijack seam)
 	clientConn            net.Conn
 	backendConn           net.Conn
 	backendReader         *bufio.Reader // Buffered reader from authentication phase
-	clientReader          *bufio.Reader
-	clientWriter          *bufio.Writer
+	clientReader          *bufio.Reader // Hijacked reader holding any pipelined client bytes
 	username              string
 	accountID             int64
 	isRemoteLookupAccount bool
@@ -41,11 +44,9 @@ type Session struct {
 	serverAddr            string
 	sessionID             string // Proxy session ID for end-to-end tracing
 	clientAddr            string // Cached client address to avoid race with connection close
-	isTLS                 bool   // Whether the client connection is over TLS
 	mu                    sync.Mutex
 	ctx                   context.Context
 	cancel                context.CancelFunc
-	errorCount            int
 	startTime             time.Time
 	releaseConn           func() // Connection limiter cleanup function
 	proxyInfo             *server.ProxyProtocolInfo
@@ -54,466 +55,139 @@ type Session struct {
 	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
 }
 
-// newSession creates a new ManageSieve proxy session.
-func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *Session {
-	sessionCtx, sessionCancel := context.WithCancel(s.ctx)
-	// Detect implicit TLS from the listener configuration rather than a
-	// `conn.(*tls.Conn)` type assertion: the listener wraps the real *tls.Conn
-	// (SoraTLSConn), so the assertion always fails and would reject auth over a
-	// secure channel when insecure_auth=false. Mirrors the non-proxy ManageSieve
-	// server. STARTTLS connections start plain and flip isTLS=true after upgrade.
-	isTLS := s.tls && !s.tlsUseStartTLS
+var _ managesieveserver.Session = (*Session)(nil)
 
-	// Determine client address (use PROXY protocol info if available)
-	clientAddr := server.GetAddrString(conn.RemoteAddr())
-	if proxyInfo != nil && proxyInfo.SrcIP != "" {
-		clientAddr = proxyInfo.SrcIP
-	}
-
-	return &Session{
-		server:       s,
-		clientConn:   conn,
-		clientReader: bufio.NewReader(conn),
-		clientWriter: bufio.NewWriter(conn),
-		clientAddr:   clientAddr, // Use real client IP from PROXY protocol or connection
-		isTLS:        isTLS,
-		ctx:          sessionCtx,
-		cancel:       sessionCancel,
-		errorCount:   0,
-		startTime:    time.Now(),
-		proxyInfo:    proxyInfo,
-		// Generate the session id once, up front, so every log line carries it.
-		sessionID: idgen.New(),
-	}
+// Close implements managesieveserver.Session; the library calls it exactly
+// once at teardown (including after a hijacked relay finishes).
+func (s *Session) Close() error {
+	s.close()
+	s.cancel()
+	return nil
 }
 
-// handleConnection handles the proxy session.
-func (s *Session) handleConnection() {
-	defer s.cancel()
-	defer s.close()
-
-	// Ensure connections are closed when context is cancelled (e.g. by absolute timeout or server shutdown)
-	// This serves as a fail-safe to unblock reads that don't inherently respect context cancellation
-	go func() {
-		<-s.ctx.Done()
-		// Force close connection to unblock any pending Read calls
-		// Use mutex to ensure safe access consistent with close()
-		s.mu.Lock()
-		if s.clientConn != nil {
-			s.clientConn.Close()
+// AuthenticatePlain implements managesieveserver.Session. The library has
+// already handled the SASL PLAIN wire exchange and the TLS/re-auth gates.
+// On success the client socket is hijacked and the relay runs synchronously
+// (the library's command loop is parked in this call until the relay
+// finishes; returning triggers session teardown).
+//
+// The authorization identity is deliberately ignored (pre-migration parity):
+// impersonation is only meaningful on the backend, where the proxy
+// re-authenticates with master SASL credentials.
+func (s *Session) AuthenticatePlain(_ context.Context, _, username, password string) error {
+	authStart := time.Now()
+	if err := s.authenticateUser(username, password, authStart); err != nil {
+		s.DebugLog("authentication failed", "error", err)
+		// Rate limiter blocked the attempt: reply with the same line as a bad
+		// password (indistinguishable — a distinguishable throttle reply is an
+		// oracle for credential stuffers) but drop the connection instead of
+		// letting the client keep hammering it.
+		var rateLimitErr *server.RateLimitError
+		if errors.As(err, &rateLimitErr) {
+			return &managesieveserver.Error{Message: `"Authentication failed"`, Close: true}
 		}
-		s.mu.Unlock()
-	}()
-
-	// Enforce absolute session timeout to prevent hung sessions from leaking
-	if s.server.absoluteSessionTimeout > 0 {
-		timeout := time.AfterFunc(s.server.absoluteSessionTimeout, func() {
-			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.server.absoluteSessionTimeout)
-			s.cancel() // Force cancel context to unblock any stuck I/O
-		})
-		defer timeout.Stop()
+		// Check if error is due to server shutdown or temporary unavailability
+		if server.IsTemporaryAuthFailure(err) {
+			return &managesieveserver.Error{Code: "UNAVAILABLE", Message: "Service temporarily unavailable, please try again later"}
+		}
+		return &managesieveserver.Error{Message: `"Authentication failed"`}
 	}
 
-	s.InfoLog("connected")
-
-	// Complete the deferred TLS handshake (implicit-TLS listeners). The helper
-	// walks the Unwrap() chain, so the handshake runs through the PROXY conn
-	// and consumes any ClientHello bytes buffered alongside the PROXY header.
-	// Failure is a silent close: no plaintext banner onto a broken TLS stream.
-	if _, err := server.PerformDeferredTLSHandshake(s.clientConn); err != nil {
-		s.DebugLog("TLS handshake failed", "error", err)
-		return
+	// Connect to backend and authenticate
+	backendConnStart := time.Now()
+	if err := s.connectToBackendAndAuth(); err != nil {
+		s.DebugLog("backend connection/auth failed", "error", err)
+		if server.IsTemporaryAuthFailure(err) || server.IsBackendError(err) {
+			return &managesieveserver.Error{Code: "UNAVAILABLE", Message: "Backend server temporarily unavailable"}
+		}
+		return &managesieveserver.Error{Message: `"Backend server error"`}
 	}
 
-	// Send initial greeting with capabilities
-	if err := s.sendGreeting(); err != nil {
-		s.DebugLog("failed to send greeting", "error", err)
-		return
+	// Register connection. The tracker only returns an error when a per-user
+	// or per-user-per-IP connection limit is exceeded, so enforce it (this
+	// runs before the OK is sent). Session teardown (close) will close the
+	// backend connection.
+	if err := s.registerConnection(); err != nil {
+		s.InfoLog("connection rejected by connection tracker", "error", err)
+		// Mark as rejected so close() does not decrement a slot this session
+		// never held (which would erode the account's limit).
+		s.connRejected = true
+		return &managesieveserver.Error{Code: "TRYLATER", Message: "Too many connections", Close: true}
 	}
 
-	// Handle authentication phase
-	authenticated := false
-	for !authenticated {
-		// Set a read deadline for the client command to prevent idle connections.
-		if s.server.authIdleTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
-				s.DebugLog("failed to set read deadline", "error", err)
-				return
-			}
+	clientConn, clientReader, err := s.msConn.Hijack()
+	if err != nil {
+		// The library still owns the client connection; close only what we
+		// own and let the normal teardown (Session.Close) do the rest.
+		if s.backendConn != nil {
+			s.backendConn.Close()
 		}
-
-		// Read command from client
-		line, err := server.ReadBoundedLine(s.clientReader, 8192) // ManageSieve line limit
-		if err != nil {
-			if err == server.ErrLineTooLong {
-				s.sendResponse(`NO "Command line too long"`)
-				s.clientWriter.Flush()
-				s.WarnLog("line too long, closing connection")
-				return
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				s.DebugLog("client timed out waiting for command")
-				s.sendResponse(`NO "Idle timeout"`)
-				return
-			}
-			if err != io.EOF {
-				s.DebugLog("error reading from client", "error", err)
-			}
-			return
-		}
-
-		line = strings.TrimRight(line, "\r\n")
-
-		// Use the shared command parser. ManageSieve commands do not have tags.
-		_, command, args, err := server.ParseLine(line, false)
-		if err != nil {
-			if s.handleAuthError(fmt.Sprintf(`NO "%s"`, err.Error())) {
-				return
-			}
-			continue
-		}
-
-		if command == "" { // Empty line
-			continue
-		}
-
-		s.DebugLog("client command", "command", helpers.MaskSensitive(line, command, "AUTHENTICATE", "LOGIN"))
-		switch command {
-		case "AUTHENTICATE":
-			s.DebugLog("AUTHENTICATE command", "args_len", len(args))
-			// NOTE: do not log raw AUTHENTICATE args — for SASL PLAIN with an
-			// inline initial response, args holds the client's base64 credentials.
-			// The masked command log above already covers this.
-
-			// Check if authentication is allowed over non-TLS connection
-			if !s.isTLS && !s.server.insecureAuth {
-				if s.handleAuthError(`NO "Authentication not permitted on insecure connection. Use STARTTLS first."`) {
-					return
-				}
-				continue
-			}
-
-			if len(args) < 1 || strings.ToUpper(server.UnquoteString(args[0])) != "PLAIN" {
-				if s.handleAuthError(`NO "AUTHENTICATE PLAIN is the only supported mechanism"`) {
-					return
-				}
-				continue
-			}
-
-			// Check if initial response is included
-			var saslLine string
-			if len(args) >= 2 {
-				// Initial response provided (either quoted string or literal)
-				s.DebugLog("AUTHENTICATE using initial response")
-				arg1 := args[1]
-
-				// Check if it's a literal string {number+} or {number}
-				if strings.HasPrefix(arg1, "{") && (strings.HasSuffix(arg1, "}") || strings.HasSuffix(arg1, "+}")) {
-					// Literal string - need to read the specified number of bytes
-					literalStr := strings.TrimPrefix(arg1, "{")
-					literalStr = strings.TrimSuffix(literalStr, "}")
-					literalStr = strings.TrimSuffix(literalStr, "+")
-
-					literalSize64, err := strconv.ParseInt(literalStr, 10, 64)
-					if err != nil || literalSize64 < 0 || literalSize64 > 8192 {
-						if s.handleAuthError(`NO "Invalid literal size"`) {
-							return
-						}
-						continue
-					}
-					literalSize := int(literalSize64)
-
-					s.DebugLog("AUTHENTICATE reading literal", "bytes", literalSize)
-
-					// Read the literal data
-					literalData := make([]byte, literalSize)
-					_, err = io.ReadFull(s.clientReader, literalData)
-					if err != nil {
-						s.DebugLog("error reading literal data", "error", err)
-						return
-					}
-
-					// Read the trailing CRLF after literal
-					server.ReadBoundedLine(s.clientReader, 1024) // bound trailing CRLF drain
-
-					saslLine = string(literalData)
-				} else {
-					// Quoted string
-					saslLine = server.UnquoteString(arg1)
-				}
-			} else {
-				s.DebugLog("AUTHENTICATE sending continuation")
-				// Send continuation and wait for response
-				s.sendContinuation()
-
-				// Read SASL response
-				saslLine, err = server.ReadBoundedLine(s.clientReader, 8192) // bound pre-auth SASL response
-				if err != nil {
-					s.DebugLog("error reading SASL response", "error", err)
-					return
-				}
-				// The response to a continuation can also be a quoted string.
-				saslLine = server.UnquoteString(strings.TrimRight(saslLine, "\r\n"))
-			}
-
-			// Handle cancellation
-			if saslLine == "*" {
-				// Client-side cancellation is not an error we should count.
-				s.sendResponse(`NO "Authentication cancelled"`)
-				continue
-			}
-
-			// Decode SASL PLAIN
-			decoded, err := base64.StdEncoding.DecodeString(saslLine)
-			if err != nil {
-				if s.handleAuthError(`NO "Invalid base64 encoding"`) {
-					return
-				}
-				continue
-			}
-
-			parts := strings.Split(string(decoded), "\x00")
-			if len(parts) != 3 {
-				if s.handleAuthError(`NO "Invalid SASL PLAIN response"`) {
-					return
-				}
-				continue
-			}
-
-			// authzID := parts[0] // Not used in proxy
-			authnID := parts[1]
-			password := parts[2]
-
-			authStart := time.Now() // Start authentication timing
-			if err := s.authenticateUser(authnID, password, authStart); err != nil {
-				s.DebugLog("authentication failed", "error", err)
-				// Rate limiter blocked the attempt: reply with the same line as
-				// a bad password (indistinguishable) but drop the connection
-				// instead of letting the client keep hammering it.
-				var rateLimitErr *server.RateLimitError
-				if errors.As(err, &rateLimitErr) {
-					s.sendResponse(`NO "Authentication failed"`)
-					s.InfoLog("dropping connection - rate limited")
-					return
-				}
-				// This is an actual authentication failure, not a protocol error.
-				// The rate limiter handles this, so we don't count it as a command error.
-				// Check if error is due to server shutdown or temporary unavailability
-				if server.IsTemporaryAuthFailure(err) {
-					s.sendResponse(`NO (UNAVAILABLE) "Service temporarily unavailable, please try again later"`)
-				} else {
-					s.sendResponse(`NO "Authentication failed"`)
-				}
-				continue
-			}
-
-			// Connect to backend and authenticate
-			backendConnStart := time.Now()
-			if err := s.connectToBackendAndAuth(); err != nil {
-				s.DebugLog("backend connection/auth failed", "error", err)
-				// Check if this is a timeout or connection error (backend unavailable)
-				if server.IsTemporaryAuthFailure(err) || server.IsBackendError(err) {
-					s.sendResponse(`NO (UNAVAILABLE) "Backend server temporarily unavailable"`)
-				} else {
-					s.sendResponse(`NO "Backend server error"`)
-				}
-				continue
-			}
-
-			// Register connection. The tracker only returns an error when a
-			// per-user or per-user-per-IP connection limit is exceeded, so
-			// enforce it (this runs before the OK is sent).
-			if err := s.registerConnection(); err != nil {
-				s.InfoLog("connection rejected by connection tracker", "error", err)
-				// Mark as rejected so close() does not decrement a slot this
-				// session never held (which would erode the account's limit).
-				s.connRejected = true
-				s.sendResponse(`NO (TRYLATER) "Too many connections"`)
-				return
-			}
-
-			// Set username on client connection for timeout logging
-			if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
-				soraConn.SetUsername(s.username)
-			}
-
-			// Log backend authentication with total duration
-			backendDuration := time.Since(backendConnStart)
-			s.InfoLog("authentication complete",
-				"address", s.username,
-				"backend", s.serverAddr,
-				"routing", s.routingMethod,
-				"duration", fmt.Sprintf("%.3fs", backendDuration.Seconds()))
-
-			s.sendResponse(`OK "Authenticated"`)
-			authenticated = true
-
-		case "LOGOUT":
-			s.sendResponse(`OK "Bye"`)
-			return
-
-		case "NOOP":
-			// Handle NOOP with optional tag argument (e.g., NOOP "STARTTLS-RESYNC-CAPA")
-			// sieve-connect uses this to verify capabilities were received
-			if len(args) > 0 {
-				tag := server.UnquoteString(args[0])
-				s.sendResponse(fmt.Sprintf(`OK (TAG "%s") "Done"`, tag))
-			} else {
-				s.sendResponse(`OK "NOOP completed"`)
-			}
-
-		case "CAPABILITY":
-			// Re-send capabilities as per RFC 5804
-			if err := s.sendCapabilities(); err != nil {
-				s.DebugLog("error sending capabilities", "error", err)
-				return
-			}
-
-		case "STARTTLS":
-			// Check if STARTTLS is enabled
-			if !s.server.tls || !s.server.tlsUseStartTLS {
-				if s.handleAuthError(`NO "STARTTLS not available"`) {
-					return
-				}
-				continue
-			}
-
-			// Check if already using TLS
-			if s.isTLS {
-				if s.handleAuthError(`NO "Already using TLS"`) {
-					return
-				}
-				continue
-			}
-
-			// RFC 5804 §2.2 / RFC 3207: reject and close if the client pipelined any data
-			// after STARTTLS before the handshake — buffered plaintext may be a MITM
-			// command-injection attempt. Mirrors the backend server (managesieve session.go).
-			// Checked BEFORE the OK so a stuffed connection never begins negotiation.
-			if s.clientReader.Buffered() > 0 {
-				s.WarnLog("STARTTLS rejected: client sent data before TLS handshake")
-				s.sendResponse(`NO "Pipelined data after STARTTLS is not allowed"`)
-				return
-			}
-
-			// Send OK response
-			if err := s.sendResponse(`OK "Begin TLS negotiation now"`); err != nil {
-				s.DebugLog("failed to send STARTTLS response", "error", err)
-				return
-			}
-
-			// Load TLS config: Use global TLS manager config if available, otherwise load from files
-			var tlsConfig *tls.Config
-			if s.server.tlsConfig != nil {
-				// Use global TLS manager (e.g., Let's Encrypt autocert)
-				// Don't clone - use directly like the non-proxy ManageSieve server does
-				tlsConfig = s.server.tlsConfig
-			} else if s.server.tlsCertFile != "" && s.server.tlsKeyFile != "" {
-				// Load from cert files
-				cert, err := tls.LoadX509KeyPair(s.server.tlsCertFile, s.server.tlsKeyFile)
-				if err != nil {
-					s.DebugLog("failed to load TLS certificate", "error", err)
-					return
-				}
-
-				tlsConfig = &tls.Config{
-					MinVersion:    tls.VersionTLS12,
-					Certificates:  []tls.Certificate{cert},
-					ClientAuth:    tls.NoClientCert,
-					Renegotiation: tls.RenegotiateNever,
-				}
-				if s.server.tlsVerify {
-					tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-				}
-			} else {
-				s.DebugLog("STARTTLS config error")
-				if s.handleAuthError(`NO "STARTTLS configuration error"`) {
-					return
-				}
-				continue
-			}
-
-			// Upgrade connection to TLS
-			tlsConn := tls.Server(s.clientConn, tlsConfig)
-			if err := tlsConn.Handshake(); err != nil {
-				s.DebugLog("TLS handshake failed", "error", err)
-				return
-			}
-
-			// Update session with TLS connection
-			s.clientConn = tlsConn
-			s.clientReader = bufio.NewReader(tlsConn)
-			s.clientWriter = bufio.NewWriter(tlsConn)
-			s.isTLS = true
-
-			s.DebugLog("STARTTLS negotiation successful")
-
-			// Re-send greeting with updated capabilities (now with SASL mechanisms available)
-			if err := s.sendGreeting(); err != nil {
-				s.DebugLog("failed to send greeting after STARTTLS", "error", err)
-				return
-			}
-
-			// Continue to next command after STARTTLS
-			continue
-
-		default:
-			if s.handleAuthError(`NO "Command not supported before authentication"`) {
-				return
-			}
-			continue
-		}
+		s.WarnLog("failed to hijack client connection", "error", err)
+		return &managesieveserver.Error{Code: "TRYLATER", Message: "Service temporarily unavailable", Close: true}
 	}
 
-	// Clear the read deadline once authenticated. ManageSieve is transactional,
-	// but we'll follow the IMAP proxy pattern. The backend is expected to handle
-	// its own connection lifetime.
+	// The hijacked conn is the live client transport (the TLS conn after a
+	// STARTTLS upgrade). Republish it so the relay, shutdown broadcast, and
+	// loggers write to the right layer.
+	s.mu.Lock()
+	s.clientConn = clientConn
+	s.mu.Unlock()
+	s.clientReader = clientReader
+
+	// Set username on client connection for timeout logging
+	if soraConn, ok := clientConn.(interface{ SetUsername(string) }); ok {
+		soraConn.SetUsername(s.username)
+	}
+
+	// Success response — exact bytes as before the library migration.
+	writer := bufio.NewWriter(clientConn)
+	writer.WriteString("OK \"Authenticated\"\r\n")
+	writer.Flush()
+
+	// Log backend authentication with total duration
+	backendDuration := time.Since(backendConnStart)
+	s.InfoLog("authentication complete",
+		"address", s.username,
+		"backend", s.serverAddr,
+		"routing", s.routingMethod,
+		"duration", fmt.Sprintf("%.3fs", backendDuration.Seconds()))
+
+	// Clear the read deadline before the relay phase, which sets its own.
 	if s.server.authIdleTimeout > 0 {
-		if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
+		if err := clientConn.SetReadDeadline(time.Time{}); err != nil {
 			s.DebugLog("failed to clear read deadline", "error", err)
 		}
 	}
 
-	// Start proxying only if backend connection was successful
-	if s.backendConn != nil {
-		s.DebugLog("starting proxy")
-		s.startProxy()
-	} else {
-		s.DebugLog("cannot start proxy - no backend connection")
-	}
+	// Run the relay synchronously: returning ends the library's command loop
+	// and triggers teardown, so the relay must complete first.
+	s.startProxy()
+	return nil
 }
 
-// handleAuthError increments the error count, sends an error response, and
-// returns true if the connection should be dropped.
-func (s *Session) handleAuthError(response string) bool {
-	s.errorCount++
-	s.sendResponse(response)
-	if s.errorCount >= s.server.maxAuthErrors {
-		s.WarnLog("too many auth errors - dropping connection")
-		// Send a final error message before closing.
-		s.sendResponse(`NO "Too many invalid commands"`)
-		return true
-	}
-	return false
-}
+// The authenticated-state script methods are unreachable: AuthenticatePlain
+// hijacks the connection on success, so the library never dispatches script
+// commands to this session.
 
-// sendResponse sends a response to the client.
-func (s *Session) sendResponse(response string) error {
-	_, err := s.clientWriter.WriteString(response + "\r\n")
-	if err != nil {
-		return err
-	}
-	return s.clientWriter.Flush()
+func (s *Session) ListScripts(context.Context) ([]managesieve.ScriptInfo, error) {
+	return nil, errors.New("not implemented")
 }
-
-// sendContinuation sends a ManageSieve continuation response.
-func (s *Session) sendContinuation() error {
-	// RFC 5804: server MUST respond with a "go-ahead" that is an empty string literal.
-	_, err := s.clientWriter.WriteString("\"\"\r\n")
-	if err != nil {
-		return err
-	}
-	return s.clientWriter.Flush()
+func (s *Session) GetScript(context.Context, string) (string, error) {
+	return "", errors.New("not implemented")
+}
+func (s *Session) PutScript(context.Context, string, string) (bool, error) {
+	return false, errors.New("not implemented")
+}
+func (s *Session) CheckScript(context.Context, string) (string, error) {
+	return "", errors.New("not implemented")
+}
+func (s *Session) SetActive(context.Context, string) error    { return errors.New("not implemented") }
+func (s *Session) DeleteScript(context.Context, string) error { return errors.New("not implemented") }
+func (s *Session) RenameScript(context.Context, string, string) error {
+	return errors.New("not implemented")
+}
+func (s *Session) HaveSpace(context.Context, string, int64) error {
+	return errors.New("not implemented")
 }
 
 // InfoLog logs at INFO level with session context
@@ -1044,59 +718,6 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			FromRemoteLookup: false,
 			IsNegative:       false,
 		})
-	}
-
-	return nil
-}
-
-// sendGreeting sends the initial ManageSieve greeting with capabilities.
-func (s *Session) sendGreeting() error {
-	return s.sendCapabilities()
-}
-
-// sendCapabilities sends ManageSieve capabilities.
-func (s *Session) sendCapabilities() error {
-	// Send a minimal set of capabilities for the proxy
-	if _, err := s.clientWriter.WriteString(`"IMPLEMENTATION" "Sora ManageSieve Proxy"` + "\r\n"); err != nil {
-		return fmt.Errorf("failed to write IMPLEMENTATION: %w", err)
-	}
-
-	// Build SIEVE capabilities: builtin + configured extensions (from managesieve package)
-	capabilities := managesieve.GetSieveCapabilities(s.server.supportedExtensions)
-	capabilitiesStr := strings.Join(capabilities, " ")
-	if _, err := s.clientWriter.WriteString(fmt.Sprintf(`"SIEVE" "%s"`, capabilitiesStr) + "\r\n"); err != nil {
-		return fmt.Errorf("failed to write SIEVE: %w", err)
-	}
-
-	// Check if we're on a TLS connection (implicit TLS or post-STARTTLS).
-	isSecure := s.isTLS
-
-	// Advertise STARTTLS if configured and not already using TLS
-	if s.server.tls && s.server.tlsUseStartTLS && !isSecure {
-		// Before STARTTLS: Don't advertise SASL mechanisms (RFC 5804 security requirement)
-		if _, err := s.clientWriter.WriteString(`"SASL" ""` + "\r\n"); err != nil {
-			return fmt.Errorf("failed to write SASL: %w", err)
-		}
-		if _, err := s.clientWriter.WriteString(`"STARTTLS"` + "\r\n"); err != nil {
-			return fmt.Errorf("failed to write STARTTLS: %w", err)
-		}
-	} else {
-		// After STARTTLS or on implicit TLS: Advertise available SASL mechanisms
-		if _, err := s.clientWriter.WriteString(`"SASL" "PLAIN"` + "\r\n"); err != nil {
-			return fmt.Errorf("failed to write SASL: %w", err)
-		}
-	}
-
-	if _, err := s.clientWriter.WriteString(`"VERSION" "1.0"` + "\r\n"); err != nil {
-		return fmt.Errorf("failed to write VERSION: %w", err)
-	}
-
-	if _, err := s.clientWriter.WriteString(`OK "ManageSieve proxy ready"` + "\r\n"); err != nil {
-		return fmt.Errorf("failed to write OK: %w", err)
-	}
-
-	if err := s.clientWriter.Flush(); err != nil {
-		return fmt.Errorf("failed to flush: %w", err)
 	}
 
 	return nil

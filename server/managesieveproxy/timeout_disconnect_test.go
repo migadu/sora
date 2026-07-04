@@ -92,15 +92,17 @@ func TestIdleTimeoutSendsBye(t *testing.T) {
 		t.Fatalf("Failed to read BYE: %v", err)
 	}
 
-	// Verify BYE message (RFC 5804)
+	// Verify BYE message (RFC 5804). Either the SoraConn timeout checker
+	// ("Idle timeout") or the go-managesieve idle deadline ("timed out due to
+	// inactivity") may fire first; both are BYE (TRYLATER).
 	if !strings.HasPrefix(bye, "BYE") {
 		t.Errorf("Expected BYE response, got: %s", bye)
 	}
 	if !strings.Contains(bye, "TRYLATER") {
 		t.Errorf("Expected TRYLATER in BYE message, got: %s", bye)
 	}
-	if !strings.Contains(bye, "Idle timeout") {
-		t.Errorf("Expected 'Idle timeout' in BYE message, got: %s", bye)
+	if !strings.Contains(bye, "Idle timeout") && !strings.Contains(bye, "timed out") {
+		t.Errorf("Expected idle-timeout text in BYE message, got: %s", bye)
 	}
 
 	t.Logf("✓ Received expected BYE message: %s", strings.TrimSpace(bye))
@@ -293,8 +295,8 @@ func TestAuthIdleTimeoutDuringPreAuth(t *testing.T) {
 	// Auth idle timeout should trigger (2 seconds + buffer)
 	time.Sleep(3 * time.Second)
 
-	// Read timeout message from server
-	// ManageSieve proxy sends NO "Idle timeout" (simpler than full BYE TRYLATER)
+	// Read timeout message from server. The go-managesieve library answers
+	// pre-auth idle expiry with BYE (TRYLATER), same as the backend.
 	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 	msg, err := reader.ReadString('\n')
 	if err != nil {
@@ -305,8 +307,8 @@ func TestAuthIdleTimeoutDuringPreAuth(t *testing.T) {
 	if !strings.HasPrefix(msg, "NO") && !strings.HasPrefix(msg, "BYE") {
 		t.Errorf("Expected NO or BYE response, got: %s", msg)
 	}
-	if !strings.Contains(msg, "Idle timeout") {
-		t.Errorf("Expected 'Idle timeout' in message, got: %s", msg)
+	if !strings.Contains(msg, "timed out") && !strings.Contains(msg, "Idle timeout") {
+		t.Errorf("Expected idle-timeout message, got: %s", msg)
 	}
 
 	t.Logf("✓ Connection timed out during pre-auth idle as expected: %s", strings.TrimSpace(msg))

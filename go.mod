@@ -19,6 +19,7 @@ require (
 	github.com/hashicorp/memberlist v0.5.3
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/k3a/html2text v1.2.1
+	github.com/migadu/go-managesieve v0.1.0
 	github.com/migadu/go-pop3 v0.1.2
 	github.com/migadu/go-sieve v1.1.0
 	github.com/prometheus/client_golang v1.23.2
@@ -89,4 +90,4 @@ require (
 	rsc.io/binaryregexp v0.2.0 // indirect
 )
 
-replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20260703110527-fde7c6da4cf3
+replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20260704211128-a7064d5cd672

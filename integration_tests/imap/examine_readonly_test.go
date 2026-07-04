@@ -82,3 +82,101 @@ func TestIMAP_Examine_ReadOnly_RejectsStore(t *testing.T) {
 		t.Logf("STORE correctly rejected after EXAMINE: %v", storeErr)
 	}
 }
+
+// TestIMAP_Examine_Close_Succeeds is a regression test for a bug reported by a
+// JavaMail user: CLOSE after EXAMINE returned
+//
+//	NO [READ-ONLY] Mailbox is read-only (opened with EXAMINE)
+//
+// RFC 3501 §6.4.2: "No messages are removed, and no error is given, if the
+// mailbox is selected by an EXAMINE command or is otherwise selected
+// read-only." CLOSE must return tagged OK, skip the implicit expunge, and
+// return the connection to the authenticated state.
+//
+// The failure came from go-imap's CLOSE handler unconditionally invoking the
+// session Expunge hook, which (correctly) rejects expunge on a read-only
+// mailbox; the fork now records the read-only selection on the connection and
+// skips the expunge attempt for CLOSE.
+func TestIMAP_Examine_Close_Succeeds(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("login failed: %v", err)
+	}
+
+	// APPEND two messages so we can prove CLOSE after EXAMINE removes nothing.
+	for i := 0; i < 2; i++ {
+		msg := "From: sender@example.com\r\n" +
+			"To: " + account.Email + "\r\n" +
+			"Subject: Examine Close Test\r\n" +
+			"\r\n" +
+			"body\r\n"
+		appendCmd := c.Append("INBOX", int64(len(msg)), nil)
+		if _, err := appendCmd.Write([]byte(msg)); err != nil {
+			t.Fatalf("APPEND write failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("APPEND close failed: %v", err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("APPEND failed: %v", err)
+		}
+	}
+
+	// Flag a message \Deleted in a read-write session, then leave it pending:
+	// re-selecting with EXAMINE implicitly unselects without expunging.
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	if _, err := c.Store(imap.SeqSetNum(1), &imap.StoreFlags{
+		Op:    imap.StoreFlagsAdd,
+		Flags: []imap.Flag{imap.FlagDeleted},
+	}, nil).Collect(); err != nil {
+		t.Fatalf("STORE \\Deleted failed: %v", err)
+	}
+
+	sd, err := c.Select("INBOX", &imap.SelectOptions{ReadOnly: true}).Wait()
+	if err != nil {
+		t.Fatalf("EXAMINE failed: %v", err)
+	}
+	if !sd.ReadOnly {
+		t.Errorf("EXAMINE should report READ-ONLY on the tagged OK, got READ-WRITE")
+	}
+
+	// The reported bug: CLOSE after EXAMINE answered tagged NO [READ-ONLY].
+	if err := c.UnselectAndExpunge().Wait(); err != nil {
+		t.Fatalf("REGRESSION: CLOSE after EXAMINE failed, RFC 3501 §6.4.2 requires "+
+			"tagged OK with no expunge: %v", err)
+	}
+
+	// The connection must be back in the authenticated state and the
+	// \Deleted message must still exist (read-only CLOSE removes nothing).
+	sd, err = c.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("SELECT after CLOSE failed (connection state desync?): %v", err)
+	}
+	if sd.NumMessages != 2 {
+		t.Errorf("CLOSE after EXAMINE expunged messages: NumMessages = %d, want 2", sd.NumMessages)
+	}
+
+	// Sanity check the counterpart: CLOSE on a read-write SELECT does expunge.
+	if err := c.UnselectAndExpunge().Wait(); err != nil {
+		t.Fatalf("CLOSE after SELECT failed: %v", err)
+	}
+	sd, err = c.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	if sd.NumMessages != 1 {
+		t.Errorf("CLOSE after SELECT should have expunged the \\Deleted message: NumMessages = %d, want 1", sd.NumMessages)
+	}
+}

@@ -1,70 +1,37 @@
-// Package managesieve implements a ManageSieve server for SIEVE script management.
+// Package managesieve implements sora's ManageSieve backend on top of the
+// github.com/migadu/go-managesieve library.
 //
-// ManageSieve (RFC 5804) allows clients to upload, download, activate,
-// and manage SIEVE filtering scripts on the server. This package provides:
-//   - RFC 5804 ManageSieve protocol
-//   - SIEVE script validation
-//   - TLS/STARTTLS support
-//   - SASL authentication
-//   - Script activation/deactivation
-//   - UTF-8 support
+// The library (managesieveserver) owns the RFC 5804 wire protocol: command
+// parsing, quoted strings and {N}/{N+} literals, SASL PLAIN framing,
+// STARTTLS, the state machine, response formatting, and abuse controls
+// (line/literal bounds, timeouts, MaxErrors). This package is the adapter
+// that supplies sora's business logic behind the library's Session
+// interface:
 //
-// # ManageSieve Protocol
+//   - Authentication: PostgreSQL credentials with bcrypt verification and
+//     rehashing, lookup-cache acceleration, master-username and master-SASL
+//     impersonation (network-gated), and auth rate limiting with progressive
+//     delays.
+//   - Script storage: per-account scripts in PostgreSQL via the resilient
+//     database layer, with master-DB session pinning after writes.
+//   - SIEVE validation: scripts are validated with github.com/migadu/go-sieve
+//     against the configured supported_extensions on PUTSCRIPT, CHECKSCRIPT,
+//     and SETACTIVE.
+//   - Quotas: max_script_size (enforced by the library, including
+//     reject-before-read of oversized literals) and the per-account
+//     script-count limit.
+//   - Operations: connection limiting, PROXY protocol, implicit TLS with
+//     deferred handshakes, connection tracking with kick support, Prometheus
+//     metrics, graceful shutdown, and SIGHUP config reload (the library
+//     server is rebuilt and swapped atomically).
 //
-// ManageSieve is a protocol for remotely managing SIEVE scripts.
-// Users can upload filtering rules without direct server access.
-//
-// # Starting a ManageSieve Server
-//
-//	cfg := &config.ManageSieveConfig{
-//		Addr: ":4190",
-//		MaxConnections: 100,
-//	}
-//	srv, err := managesieve.NewServer(cfg, db)
-//	if err != nil {
-//		log.Fatal(err)
-//	}
-//
-//	go srv.ListenAndServe(ctx)
-//
-// # Supported Commands
-//
-//   - AUTHENTICATE: Authenticate user
-//   - STARTTLS: Upgrade to TLS
-//   - CAPABILITY: List server capabilities
-//   - HAVESPACE: Check script size limits
-//   - PUTSCRIPT: Upload a script
-//   - LISTSCRIPTS: List available scripts
-//   - SETACTIVE: Activate a script
-//   - GETSCRIPT: Download a script
-//   - DELETESCRIPT: Remove a script
-//   - RENAMESCRIPT: Rename a script
-//   - CHECKSCRIPT: Validate script syntax
-//
-// # SIEVE Script Validation
-//
-// All uploaded scripts are validated before storage to prevent
-// syntax errors during message delivery. Invalid scripts are
-// rejected with detailed error messages.
+// The wiring mirrors server/pop3: ManageSieveServer builds a
+// managesieveserver.Server via buildLibServer, the accept loop hands
+// connections to ServeConn, and the NewSession callback runs the limiter,
+// completes any deferred TLS handshake, and constructs a ManageSieveSession.
 //
 // # Integration with LMTP
 //
-// When a message is delivered via LMTP, the active SIEVE script
-// (if any) is executed. The script can:
-//   - File messages into specific folders (fileinto)
-//   - Reject messages (reject)
-//   - Send vacation responses (vacation)
-//   - Discard messages (discard)
-//
-// # Example SIEVE Script
-//
-//	require ["fileinto", "vacation"];
-//
-//	# File work emails
-//	if address :is "from" "boss@work.com" {
-//	    fileinto "Work";
-//	}
-//
-//	# Vacation response
-//	vacation :days 7 "I'm on vacation until next week";
+// When a message is delivered via LMTP, the active SIEVE script (if any) is
+// executed by server/sieveengine. This package only manages the scripts.
 package managesieve

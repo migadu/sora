@@ -1,23 +1,23 @@
 package managesieve
 
 import (
-	"bufio"
-	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/migadu/go-managesieve/managesieveserver"
 	"github.com/migadu/sora/server"
 )
 
-func TestHandleCheckScript(t *testing.T) {
+// TestCheckScript exercises sora's go-sieve validation seam: the wire
+// protocol (literals, size bounds) is the library's job, while validation
+// failures must render as a quoted "Script validation failed: ..." message.
+func TestCheckScript(t *testing.T) {
 	addr, err := server.NewAddress("test@example.com")
 	if err != nil {
 		t.Fatalf("NewAddress failed: %v", err)
 	}
-
-	var buf bytes.Buffer
-	writer := bufio.NewWriter(&buf)
 
 	session := &ManageSieveSession{
 		Session: server.Session{
@@ -25,64 +25,47 @@ func TestHandleCheckScript(t *testing.T) {
 		},
 		authenticated: true,
 		ctx:           context.Background(),
-		writer:        writer,
 		server: &ManageSieveServer{
 			maxScriptSize:       1024,
 			supportedExtensions: []string{"fileinto"},
 		},
 	}
 
-	tests := []struct {
-		name         string
-		content      string
-		wantSuccess  bool
-		wantResponse string
-	}{
-		{
-			name:         "Valid script",
-			content:      "keep;",
-			wantSuccess:  true,
-			wantResponse: "OK\r\n",
-		},
-		{
-			name:         "Invalid script syntax",
-			content:      "invalid_command;",
-			wantSuccess:  false,
-			wantResponse: "NO \"Script validation failed",
-		},
-		{
-			name:         "Script exceeding size limit",
-			content:      strings.Repeat("a", 2000),
-			wantSuccess:  false,
-			wantResponse: "NO (QUOTA/MAXSIZE)",
-		},
+	// Valid script passes with no warnings.
+	warnings, err := session.CheckScript(context.Background(), "keep;")
+	if err != nil || warnings != "" {
+		t.Errorf("CheckScript(valid) = %q, %v; want \"\", nil", warnings, err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			buf.Reset()
-			got := session.handleCheckScript(tt.content)
-			writer.Flush()
+	// Extension enabled in supportedExtensions is accepted.
+	if _, err := session.CheckScript(context.Background(), "require \"fileinto\";\nfileinto \"Spam\";"); err != nil {
+		t.Errorf("CheckScript(fileinto) = %v; want nil", err)
+	}
 
-			if got != tt.wantSuccess {
-				t.Errorf("handleCheckScript() = %v, want %v", got, tt.wantSuccess)
-			}
-			resp := buf.String()
-			if !strings.Contains(resp, tt.wantResponse) {
-				t.Errorf("Response = %q, want it to contain %q", resp, tt.wantResponse)
-			}
-		})
+	// Invalid syntax renders a quoted, response-splitting-safe *Error.
+	_, err = session.CheckScript(context.Background(), "invalid_command;")
+	var merr *managesieveserver.Error
+	if !errors.As(err, &merr) {
+		t.Fatalf("CheckScript(invalid) error type = %T, want *managesieveserver.Error", err)
+	}
+	if merr.Code != "" || !strings.HasPrefix(merr.Message, `"Script validation failed:`) {
+		t.Errorf("CheckScript(invalid) = code %q message %q", merr.Code, merr.Message)
+	}
+
+	// Extension NOT in supportedExtensions is rejected.
+	if _, err := session.CheckScript(context.Background(), "require \"vacation\";\nkeep;"); err == nil {
+		t.Error("CheckScript(unsupported extension) = nil, want validation error")
 	}
 }
 
-func TestHandleHaveSpace(t *testing.T) {
+// TestHaveSpaceAdvisoryWithoutDB verifies HAVESPACE stays advisory when the
+// DB layer is unavailable (unit-test construction): only the library-side
+// size bound applies, so the session reports space optimistically.
+func TestHaveSpaceAdvisoryWithoutDB(t *testing.T) {
 	addr, err := server.NewAddress("test@example.com")
 	if err != nil {
 		t.Fatalf("NewAddress failed: %v", err)
 	}
-
-	var buf bytes.Buffer
-	writer := bufio.NewWriter(&buf)
 
 	session := &ManageSieveSession{
 		Session: server.Session{
@@ -90,45 +73,12 @@ func TestHandleHaveSpace(t *testing.T) {
 		},
 		authenticated: true,
 		ctx:           context.Background(),
-		writer:        writer,
 		server: &ManageSieveServer{
 			maxScriptSize: 1024,
 		},
 	}
 
-	tests := []struct {
-		name         string
-		size         int64
-		wantSuccess  bool
-		wantResponse string
-	}{
-		{
-			name:         "Within limit",
-			size:         512,
-			wantSuccess:  true,
-			wantResponse: "OK\r\n",
-		},
-		{
-			name:         "Exceeds limit",
-			size:         2048,
-			wantSuccess:  false,
-			wantResponse: "NO (QUOTA/MAXSIZE)",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			buf.Reset()
-			got := session.handleHaveSpace("myscript", tt.size)
-			writer.Flush()
-
-			if got != tt.wantSuccess {
-				t.Errorf("handleHaveSpace() = %v, want %v", got, tt.wantSuccess)
-			}
-			resp := buf.String()
-			if !strings.Contains(resp, tt.wantResponse) {
-				t.Errorf("Response = %q, want it to contain %q", resp, tt.wantResponse)
-			}
-		})
+	if err := session.HaveSpace(context.Background(), "myscript", 512); err != nil {
+		t.Errorf("HaveSpace without DB = %v, want nil (advisory)", err)
 	}
 }

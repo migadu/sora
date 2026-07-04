@@ -5,18 +5,22 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/migadu/sora/logger"
 
+	"github.com/migadu/go-managesieve/managesieve"
+	"github.com/migadu/go-managesieve/managesieveserver"
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
-	"github.com/migadu/sora/server/managesieve"
+	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -81,6 +85,11 @@ type Server struct {
 
 	// Startup throttle to prevent thundering herd on restart
 	startupThrottleUntil time.Time
+
+	// msLibServer is the go-managesieve protocol server. It is swapped
+	// atomically on SIGHUP so reloaded settings apply to new connections
+	// (existing connections keep the snapshot they were accepted with).
+	msLibServer atomic.Pointer[managesieveserver.Server]
 }
 
 // ServerOptions holds options for creating a new ManageSieve proxy server.
@@ -369,7 +378,113 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		return nil, fmt.Errorf("TLS enabled for ManageSieve proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", opts.Name)
 	}
 
+	s.msLibServer.Store(s.buildLibServer())
+
 	return s, nil
+}
+
+// buildLibServer constructs the go-managesieve protocol server from the
+// current runtime settings. It is called at startup and again from
+// ReloadConfig so SIGHUP-reloaded settings apply to new connections.
+func (s *Server) buildLibServer() *managesieveserver.Server {
+	maxErrors := s.maxAuthErrors
+	if maxErrors <= 0 {
+		maxErrors = 10
+	}
+
+	// STARTTLS upgrades are the library's job only on plaintext listeners;
+	// implicit-TLS listeners keep TLS outside the library (SoraTLSListener +
+	// deferred handshake).
+	var startTLSConfig *tls.Config
+	if s.tls && s.tlsUseStartTLS {
+		startTLSConfig = s.tlsConfig
+	}
+
+	opts := managesieveserver.Options{
+		TLSConfig:              startTLSConfig,
+		Implementation:         "Sora ManageSieve Proxy",
+		Greeting:               `"ManageSieve proxy ready"`,
+		GreetingStartTLSHint:   false, // pre-migration parity: the proxy greeting carried no (STARTTLS) hint
+		SieveExtensions:        managesieve.GetSieveCapabilities(s.supportedExtensions),
+		MaxLineLength:          8192,
+		IdleTimeout:            s.commandTimeout,
+		AuthIdleTimeout:        s.authIdleTimeout,
+		AbsoluteSessionTimeout: s.absoluteSessionTimeout,
+		InsecureAuth:           s.insecureAuth,
+		MaxErrors:              maxErrors,
+		// Pre-migration parity: failed logins never counted toward the auth
+		// error budget on the proxy — the auth rate limiter handles
+		// brute-force across connections, so a user who mistypes a password
+		// must not be disconnected.
+		AuthFailuresExemptFromMaxErrors: true,
+		StrictSessionErrors:             true, // Session errors are *managesieveserver.Error; mask anything else
+		NewSession: func(c *managesieveserver.Conn) (managesieveserver.Session, error) {
+			netConn := c.NetConn()
+			proxyInfo := server.GetProxyProtocolInfo(netConn)
+
+			var releaseConn func()
+			var err error
+			if s.limiter != nil {
+				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), "")
+				if err != nil {
+					// DELIBERATE silent close, no banner: matches the previous
+					// accept-loop rejection (drop before any greeting), and a
+					// "too many connections" banner would tell a flooder
+					// exactly when the limiter engages.
+					return nil, fmt.Errorf("%w: %w", managesieveserver.ErrSilentReject, err)
+				}
+			}
+
+			// Implicit-TLS listeners (SoraTLSListener) defer the TLS
+			// handshake; the library never triggers it, so complete it here —
+			// after the limiter and before the greeting is written. Also
+			// captures JA4 and registers the timeout checker for TLS conns.
+			if didTLS, err := server.PerformDeferredTLSHandshake(netConn); err != nil {
+				if releaseConn != nil {
+					releaseConn()
+				}
+				logger.Debug("ManageSieve Proxy: TLS handshake failed", "proxy", s.name, "remote", server.GetAddrString(netConn.RemoteAddr()), "error", err)
+				return nil, fmt.Errorf("%w: TLS handshake: %w", managesieveserver.ErrSilentReject, err)
+			} else if didTLS {
+				c.SetTLS(true)
+			}
+
+			// Count the connection only once it is past every rejection
+			// point, so the decrements in the session close path always
+			// balance.
+			metrics.ConnectionsTotal.WithLabelValues("managesieve_proxy", s.name, s.hostname).Inc()
+			metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy", s.name, s.hostname).Inc()
+
+			sessionCtx, sessionCancel := context.WithCancel(s.ctx)
+
+			// Determine client address (use PROXY protocol info if available)
+			clientAddr := server.GetAddrString(netConn.RemoteAddr())
+			if proxyInfo != nil && proxyInfo.SrcIP != "" {
+				clientAddr = proxyInfo.SrcIP
+			}
+
+			session := &Session{
+				server:      s,
+				msConn:      c,
+				clientConn:  netConn,
+				clientAddr:  clientAddr,
+				ctx:         sessionCtx,
+				cancel:      sessionCancel,
+				startTime:   time.Now(),
+				releaseConn: releaseConn,
+				proxyInfo:   proxyInfo,
+				// Generate the session id once, up front, so every log line
+				// carries it.
+				sessionID: idgen.New(),
+			}
+
+			session.InfoLog("connected")
+			s.addSession(session)
+			return session, nil
+		},
+	}
+
+	return managesieveserver.New(opts)
 }
 
 // Start starts the ManageSieve proxy server.
@@ -502,55 +617,21 @@ func (s *Server) acceptConnections() error {
 			}
 		}
 
-		// Check connection limits before processing
-		var releaseConn func()
-		if s.limiter != nil {
-			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), "")
-			if err != nil {
-				logger.Debug("ManageSieve Proxy: Connection rejected", "name", s.name, "error", err)
-				conn.Close()
-				continue // Try to accept the next connection
-			}
-		}
-
-		// PROXY protocol handling happens inside the listener chain (the
-		// header must be read from the raw stream BEFORE the TLS wrapper);
-		// discover the PROXY info via the wrapper-chain walk. This runs
-		// BEFORE the deferred TLS handshake in handleConnection.
-		proxyInfo := server.GetProxyProtocolInfo(conn)
+		// Connection limiting, TLS handshake completion, counters, and
+		// session construction all happen in the library's NewSession
+		// callback (see buildLibServer), so rejected connections never
+		// inflate the gauges. PROXY protocol info is discovered there via
+		// the wrapper-chain walk.
 
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-
-			// Track proxy connection
-			metrics.ConnectionsTotal.WithLabelValues("managesieve_proxy", s.name, s.hostname).Inc()
-			metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy", s.name, s.hostname).Inc()
-
-			session := newSession(s, conn, proxyInfo)
-			session.releaseConn = releaseConn // Set cleanup function on session
-			s.addSession(session)
-
-			// CRITICAL: Panic recovery MUST call removeSession to prevent leak
 			defer func() {
 				if r := recover(); r != nil {
-					session.DebugLog("session panic recovered", "panic", r)
-					// Clean up session from active tracking
-					s.removeSession(session)
-					// Decrement metrics
-					metrics.ConnectionsCurrent.WithLabelValues("managesieve_proxy", s.name, s.hostname).Dec()
-					// Close connection
-					conn.Close()
-					// Ensure connection limiter is released on panic
-					if releaseConn != nil {
-						releaseConn()
-					}
+					logger.Error("ManageSieve Proxy: panic in connection handler", "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
-
-			// Note: releaseConn is called in session.close(), which is deferred in handleConnection()
-			// This ensures cleanup happens when the session ends, not when the goroutine exits
-			session.handleConnection()
+			s.msLibServer.Load().ServeConn(conn)
 		}()
 	}
 }
@@ -771,6 +852,9 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	}
 
 	if len(reloaded) > 0 {
+		// Rebuild the library server so new connections pick up the reloaded
+		// settings; existing connections keep their snapshot.
+		s.msLibServer.Store(s.buildLibServer())
 		logger.Info("ManageSieve proxy config reloaded", "name", s.name, "updated", reloaded)
 	}
 	return nil
