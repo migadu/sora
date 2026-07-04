@@ -58,8 +58,10 @@ func (s *POP3ProxySession) sendForwardingParametersToBackend(writer *bufio.Write
 		}
 	}()
 
-	// Read backend response (we expect "+OK XCLIENT parameters accepted")
-	response, err := reader.ReadString('\n')
+	// Read backend response (we expect "+OK XCLIENT parameters accepted").
+	// Bounded like the greeting/auth reads: the backend is trusted, but a
+	// wedged or misrouted peer must not grow the buffer without limit.
+	response, err := server.ReadBoundedLine(reader, 1024)
 	if err != nil {
 		return fmt.Errorf("failed to read XCLIENT response: %v", err)
 	}

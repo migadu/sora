@@ -1,44 +1,39 @@
 package pop3
 
 import (
-	"bufio"
 	"net"
 
 	"github.com/migadu/sora/server"
 )
 
-// handleXCLIENT handles the POP3 XCLIENT command for Dovecot-style parameter forwarding
-// This is a custom extension that follows Dovecot's XCLIENT specification
-// It needs to be called from the main command loop with writer available
-// It returns true only when the parameters were accepted, so the caller can mark
-// XCLIENT as applied (at most once per session).
-func (s *POP3Session) handleXCLIENT(args string, writer *bufio.Writer) bool {
+// handleXCLIENT handles the POP3 XCLIENT command for Dovecot-style parameter
+// forwarding. This is a custom extension that follows Dovecot's XCLIENT
+// specification. It returns whether the parameters were accepted together with
+// the response message to send; the caller writes the +OK/-ERR line and marks
+// XCLIENT as applied (at most once per session) on success.
+func (s *POP3Session) handleXCLIENT(args string) (bool, string) {
 	// Check if connection is from trusted proxy
 	if !s.isFromTrustedProxy() {
-		writer.WriteString("-ERR Connection not from trusted proxy\r\n")
-		return false
+		return false, "Connection not from trusted proxy"
 	}
 
 	// Parse XCLIENT parameters
 	forwardingParams, err := server.ParsePOP3XCLIENT(args)
 	if err != nil {
-		writer.WriteString("-ERR Invalid XCLIENT parameters\r\n")
 		s.DebugLog("failed to parse xclient parameters", "error", err)
-		return false
+		return false, "Invalid XCLIENT parameters"
 	}
 
 	// Validate parameters
 	if err := forwardingParams.ValidateForwarding(); err != nil {
-		writer.WriteString("-ERR Invalid forwarding parameters\r\n")
 		s.DebugLog("invalid xclient parameters", "error", err)
-		return false
+		return false, "Invalid forwarding parameters"
 	}
 
 	// Check TTL to prevent loops
 	if !forwardingParams.DecrementTTL() {
-		writer.WriteString("-ERR Proxy TTL expired\r\n")
 		s.DebugLog("xclient ttl expired, possible forwarding loop")
-		return false
+		return false, "Proxy TTL expired"
 	}
 
 	// Store forwarding parameters in session
@@ -60,8 +55,7 @@ func (s *POP3Session) handleXCLIENT(args string, writer *bufio.Writer) bool {
 
 	s.DebugLog("processed xclient forwarding parameters", "client_ip", forwardingParams.OriginatingIP, "client_port", forwardingParams.OriginatingPort, "session_id", forwardingParams.SessionID, "ttl", forwardingParams.ProxyTTL, "variables_count", len(forwardingParams.Variables))
 
-	writer.WriteString("+OK XCLIENT parameters accepted\r\n")
-	return true
+	return true, "XCLIENT parameters accepted"
 }
 
 // isFromTrustedProxy checks if the connection is from a trusted network that can send forwarding parameters
@@ -83,7 +77,6 @@ func (s *POP3Session) isFromTrustedProxy() bool {
 	}
 
 	// Fall back to checking the direct connection's remote address (no PROXY protocol)
-	conn := *s.conn
-	remoteAddr := conn.RemoteAddr()
+	remoteAddr := s.conn.RemoteAddr()
 	return s.server.limiter.IsTrustedConnection(remoteAddr)
 }

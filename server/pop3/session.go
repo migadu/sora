@@ -1,11 +1,9 @@
 package pop3
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/subtle"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +23,9 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
+
+	"github.com/migadu/go-pop3/pop3"
+	"github.com/migadu/go-pop3/pop3server"
 )
 
 const Pop3MaxErrorsAllowed = 3                  // Maximum number of errors tolerated before the connection is terminated
@@ -32,10 +33,20 @@ const Pop3ErrorDelay = 3 * time.Second          // Wait for this many seconds be
 const Pop3DefaultIdleTimeout = 10 * time.Minute // RFC 1939 §3: auto-logout timer MUST be at least 10 minutes
 const Pop3MaxLineLength = 1024                  // RFC 1939 §3: commands and responses limited to 512 octets (use 1024 for safety)
 
+// Compile-time checks: the library discovers optional capabilities (SASL, LANG,
+// UTF8) via type assertions, so a signature drift would silently drop the
+// capability instead of failing the build.
+var (
+	_ pop3server.Session     = (*POP3Session)(nil)
+	_ pop3server.SessionSASL = (*POP3Session)(nil)
+	_ pop3server.SessionLang = (*POP3Session)(nil)
+	_ pop3server.SessionUTF8 = (*POP3Session)(nil)
+)
+
 type POP3Session struct {
 	server.Session
 	server           *POP3Server
-	conn             *net.Conn    // Connection to the client
+	conn             net.Conn     // Connection to the client
 	mutex            sync.RWMutex // Mutex for protecting session state
 	mutexHelper      *server.MutexTimeoutHelper
 	authenticated    atomic.Bool        // Flag to indicate if the user has been authenticated
@@ -58,6 +69,27 @@ type POP3Session struct {
 	messagesRetrieved int // Messages retrieved with RETR
 	messagesDeleted   int // Messages marked for deletion with DELE
 	messagesExpunged  int // Messages actually expunged on QUIT
+}
+
+// Wire errors returned to clients. Using *pop3server.Error keeps the POP3
+// response code explicit and guarantees no internal error text (DB drivers,
+// S3 keys) reaches the wire; StrictSessionErrors masks anything else.
+var (
+	errNoSuchMessage   = &pop3server.Error{Message: "No such message"}
+	errMessageDeleted  = &pop3server.Error{Message: "Message already deleted"}
+	errMsgNotAvailable = &pop3server.Error{Message: "Message not available"}
+	errEmptyBody       = &pop3server.Error{Message: "Message body is empty"}
+	errAuthFailed      = &pop3server.Error{Code: "AUTH", Message: "Authentication failed"}
+	errTempUnavailable = &pop3server.Error{Code: "SYS/TEMP", Message: "Service temporarily unavailable, please try again later"}
+	errBodyRetryLater  = &pop3server.Error{Code: "SYS/TEMP", Message: "Message temporarily unavailable, please try again later"}
+	errServerBusy      = &pop3server.Error{Code: "SYS/TEMP", Message: "Server busy, please try again"}
+	errMailboxTooBig   = &pop3server.Error{Code: "SYS/TEMP", Message: "Mailbox too large to open in this session"}
+	errBodyTooBig      = &pop3server.Error{Code: "SYS/TEMP", Message: "Message too large to retrieve in this session"}
+)
+
+// pop3AuthError builds an [AUTH]-coded response error (RFC 3206).
+func pop3AuthError(msg string) *pop3server.Error {
+	return &pop3server.Error{Code: "AUTH", Message: msg}
 }
 
 // errPOP3MailboxTooLarge indicates the INBOX listing would exceed the session
@@ -115,2278 +147,586 @@ func (s *POP3Session) pop3LoadLimit() int {
 	return int(max/db.POP3MessageMinMemSize) + 1
 }
 
-func (s *POP3Session) handleConnection() {
-	defer s.cancel()
+func (s *POP3Session) loadMessagesIfNeeded(ctx context.Context) error {
+	s.mutex.RLock()
+	needsLoading := (s.messages == nil)
+	mailboxID := s.inboxMailboxID
+	s.mutex.RUnlock()
 
-	defer s.Close()
+	if !needsLoading {
+		return nil
+	}
 
-	// Perform TLS handshake if this is a TLS connection
-	if tlsConn, ok := (*s.conn).(interface{ PerformHandshake() error }); ok {
-		if err := tlsConn.PerformHandshake(); err != nil {
-			s.WarnLog("tls handshake failed", "error", err)
-			return
+	readCtx := ctx
+	if s.useMasterDB.Load() {
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
+
+	messages, err := s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
+	if err != nil {
+		s.WarnLog("failed to load INBOX listing", "mailbox_id", mailboxID, "error", err)
+		return errTempUnavailable
+	}
+
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
+	if !acquired {
+		return errServerBusy
+	}
+	defer release()
+
+	// Double check under write lock
+	if s.messages != nil {
+		return nil
+	}
+
+	if err := s.setMessagesLocked(messages); err != nil {
+		if errors.Is(err, errPOP3MailboxTooLarge) {
+			return errMailboxTooBig
+		}
+		return errTempUnavailable
+	}
+	return nil
+}
+
+func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, password string, isSASL bool) (int64, error) {
+	// Apply progressive authentication delay BEFORE any other checks
+	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
+	delayType := "POP3-PASS"
+	if isSASL {
+		delayType = "POP3-SASL"
+	}
+	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, delayType); err != nil {
+		if errors.Is(err, server.ErrDelayQueueFull) {
+			s.InfoLog("delay queue full, rejecting connection", "username", username)
+			return 0, &pop3server.Error{Code: "IN-USE", Message: "Too many concurrent authentication attempts. Please try again later."}
+		}
+		return 0, err
+	}
+
+	netConn := s.conn
+	var proxyInfo *server.ProxyProtocolInfo
+	if s.ProxyIP != "" {
+		proxyInfo = &server.ProxyProtocolInfo{
+			SrcIP: s.RemoteIP,
 		}
 	}
 
-	reader := bufio.NewReader(*s.conn)
-	writer := bufio.NewWriter(*s.conn)
+	// Check authentication rate limiting after delay. Keyed on the raw submitted
+	// username: a master SASL username is an opaque credential that need not be
+	// an email address, so this runs before any address parsing.
+	if s.server.authLimiter != nil {
+		if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, username); err != nil {
+			var rateLimitErr *server.RateLimitError
+			if errors.As(err, &rateLimitErr) {
+				s.InfoLog("rate limit exceeded",
+					"username", username,
+					"reason", rateLimitErr.Reason,
+					"failure_count", rateLimitErr.FailureCount,
+					"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
+			} else {
+				s.DebugLog("rate limited", "error", err)
+			}
+			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "rate_limited").Inc()
+			return 0, errAuthFailed
+		}
+	}
 
-	writer.WriteString("+OK POP3 server ready\r\n")
-	writer.Flush()
-
-	s.InfoLog("connected")
-
-	ctx := s.ctx
+	authSuccess := false
+	masterAuthUsed := false
+	var accountID int64
 	var userAddress *server.Address
 
-	for {
-		// Set idle timeout for reading command
-		// During pre-auth phase: use auth_idle_timeout (if configured), otherwise use command_timeout
-		// After authentication: use command_timeout
-		if !s.authenticated.Load() && s.server.authIdleTimeout > 0 {
-			(*s.conn).SetReadDeadline(time.Now().Add(s.server.authIdleTimeout))
-		} else if s.server.commandTimeout > 0 {
-			(*s.conn).SetReadDeadline(time.Now().Add(s.server.commandTimeout))
-		} else {
-			(*s.conn).SetReadDeadline(time.Time{}) // No timeout
+	// Master SASL password authentication. Checked on the RAW username before any
+	// address parsing: the master SASL username (e.g. "proxyuser") is not
+	// necessarily an email address; only the impersonation target must parse.
+	if len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 &&
+		checkMasterCredential(username, s.server.masterSASLUsername) && checkMasterCredential(password, s.server.masterSASLPassword) {
+		if !s.server.masterSASLGate.Allowed(netConn.RemoteAddr()) {
+			s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
+			return 0, errAuthFailed
 		}
+		if identity == "" {
+			return 0, pop3AuthError("Master SASL login requires an authorization identity.")
+		}
+		s.DebugLog("master sasl password authentication successful", "base_address", identity)
 
-		line, err := server.ReadBoundedLine(reader, Pop3MaxLineLength)
+		targetAddr, err := server.NewAddress(identity)
 		if err != nil {
-			if err == server.ErrLineTooLong {
-				writer.WriteString("-ERR Line too long\r\n")
-				writer.Flush()
-				s.WarnLog("line too long, closing connection")
-				return
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				writer.WriteString("-ERR Connection timed out due to inactivity\r\n")
-				writer.Flush()
-				s.WarnLog("connection timed out without quit, messages not expunged")
-			} else if err == io.EOF {
-				// Client closed connection without QUIT
-				s.WarnLog("client dropped connection without quit, messages not expunged")
-			} else {
-				s.DebugLog("read error", "error", err)
-			}
-			return
+			return 0, pop3AuthError("Invalid impersonation target user format")
 		}
 
-		line = strings.TrimSpace(line)
-
-		// Skip empty commands
-		if line == "" {
-			continue
-		}
-
-		// Tokenize on runs of whitespace (strings.Fields, not Split) so a client
-		// that sends extra spaces between a command and its argument (e.g.
-		// "LIST  1") is parsed correctly rather than yielding an empty argument
-		// token (L8). Empty lines are already skipped above, so parts[0] is safe.
-		parts := strings.Fields(line)
-		cmd := strings.ToUpper(parts[0])
-
-		s.DebugLog("client command", "command", helpers.MaskSensitive(line, cmd, "PASS", "AUTH"))
-
-		// Set command execution deadline
-		// Clear any previous deadline, then set command timeout
-		commandDeadline := time.Time{} // Zero time means no deadline
-		if s.server.commandTimeout > 0 {
-			commandDeadline = time.Now().Add(s.server.commandTimeout)
-		}
-		(*s.conn).SetDeadline(commandDeadline)
-
-		switch cmd {
-		case "CAPA":
-			start := time.Now()
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "CAPA", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "CAPA").Observe(time.Since(start).Seconds())
-			}
-
-			// CAPA command - list server capabilities. Auth mechanisms (USER/PASS
-			// and SASL PLAIN) are only advertised when they can actually be used —
-			// over TLS, or when insecure_auth permits cleartext auth. Advertising
-			// them on a plaintext connection where auth is refused misleads clients
-			// (RFC 2449 §6.3 / RFC 8314).
-			authAllowed := s.server.insecureAuth || server.ConnIsTLS(*s.conn)
-			writer.WriteString("+OK Capability list follows\r\n")
-			writer.WriteString("TOP\r\n")
-			writer.WriteString("UIDL\r\n")
-			if authAllowed {
-				writer.WriteString("USER\r\n")
-			}
-			writer.WriteString("RESP-CODES\r\n")
-			writer.WriteString("PIPELINING\r\n")
-			// EXPIRE reflects the actual retention policy (RFC 2449 §5.1): NEVER
-			// when messages are kept forever, otherwise the ephemeral-storage
-			// retention rounded down to whole days. Advertising NEVER while
-			// max_age_restriction silently expunges old mail would mislead clients
-			// that leave mail on the server.
-			if s.server.maxMessageAge <= 0 {
-				writer.WriteString("EXPIRE NEVER\r\n")
-			} else {
-				writer.WriteString(fmt.Sprintf("EXPIRE %d\r\n", int(s.server.maxMessageAge.Hours()/24)))
-			}
-			writer.WriteString("AUTH-RESP-CODE\r\n")
-			if authAllowed {
-				writer.WriteString("SASL PLAIN\r\n")
-			}
-			writer.WriteString("LANG\r\n")
-			writer.WriteString("UTF8\r\n")
-			writer.WriteString("IMPLEMENTATION Sora-POP3-Server\r\n")
-			writer.WriteString(".\r\n")
-
-			recordMetrics("success")
-
-		case "USER":
-			start := time.Now()
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "USER", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "USER").Observe(time.Since(start).Seconds())
-			}
-
-			// Check context before processing command
-			if s.ctx.Err() != nil {
-				s.WarnLog("request aborted, aborting user command")
-				recordMetrics("failure")
-				return
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Already authenticated\r\n") {
-					// Close the connection if too many errors are encountered
-					return
-				}
-				continue
-			}
-
-			// USER requires an argument; reject a missing one rather than indexing
-			// parts[1] and panicking (RFC 1939: USER name).
-			if len(parts) < 2 {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Missing username\r\n") {
-					return
-				}
-				continue
-			}
-
-			// We will only accept email addresses as address
-			// Remove quotes if present for compatibility
-			username := server.UnquoteString(parts[1])
-			newUserAddress, err := server.NewAddress(username)
-			if err != nil {
-				s.DebugLog("invalid username format", "error", err)
-				recordMetrics("failure")
-				if s.handleClientError(writer, fmt.Sprintf("-ERR %s\r\n", err.Error())) {
-					return
-				}
-				continue
-			}
-			userAddress = &newUserAddress
-			writer.WriteString("+OK User accepted\r\n")
-
-			recordMetrics("success")
-
-		case "PASS":
-			start := time.Now()
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "PASS", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "PASS").Observe(time.Since(start).Seconds())
-			}
-
-			// Check context before processing command
-			if s.ctx.Err() != nil {
-				s.WarnLog("request aborted, aborting pass command")
-				recordMetrics("failure")
-				return
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Already authenticated\r\n") {
-					return
-				}
-				continue
-			}
-
-			if userAddress == nil {
-				s.DebugLog("pass without user")
-				writer.WriteString("-ERR Must provide USER first\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-
-			// Check insecure_auth: reject PASS over non-TLS when insecure_auth is false
-			if !s.server.insecureAuth && !server.ConnIsTLS(*s.conn) {
-				s.DebugLog("authentication rejected - TLS required", "address", userAddress.FullAddress())
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Authentication requires TLS connection\r\n") {
-					return
-				}
-				continue
-			}
-
-			s.DebugLog("authentication attempt", "address", userAddress.FullAddress())
-
-			// PASS requires an argument; reject a missing one rather than indexing
-			// parts[1] and panicking (RFC 1939: PASS string).
-			if len(parts) < 2 {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Missing password\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Remove quotes from password if present for compatibility
-			password := server.UnquoteString(parts[1])
-
-			// Reject empty passwords immediately - no rate limiting needed
-			// Empty passwords are never valid under any condition
-			if password == "" {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Authentication failed\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Get connection and proxy info for rate limiting
-			netConn := *s.conn
-			var proxyInfo *server.ProxyProtocolInfo
-			if s.ProxyIP != "" {
-				proxyInfo = &server.ProxyProtocolInfo{
-					SrcIP: s.RemoteIP,
-				}
-			}
-
-			// Apply progressive authentication delay BEFORE any other checks
-			remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-			if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-PASS"); err != nil {
-				if errors.Is(err, server.ErrDelayQueueFull) {
-					// Delay queue full - reject immediately to prevent goroutine exhaustion
-					s.InfoLog("delay queue full, rejecting connection", "address", userAddress.FullAddress())
-					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR [IN-USE] Too many concurrent authentication attempts. Please try again later.\r\n") {
-						return
-					}
-					continue
-				}
-				// Context cancelled or other error - close connection
-				return
-			}
-
-			// Check authentication rate limiting after delay
+		accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, targetAddr.BaseAddress())
+		if err != nil {
+			s.DebugLog("failed to get account id for master user", "base_address", targetAddr.BaseAddress(), "error", err)
 			if s.server.authLimiter != nil {
-				if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress()); err != nil {
-					// Check if this is a rate limit error
-					var rateLimitErr *server.RateLimitError
-					if errors.As(err, &rateLimitErr) {
-						s.InfoLog("rate limit exceeded",
-							"address", userAddress.FullAddress(),
-							"reason", rateLimitErr.Reason,
-							"failure_count", rateLimitErr.FailureCount,
-							"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
-
-						// Track rate limiting
-						metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "rate_limited").Inc()
-					} else {
-						s.DebugLog("[PASS] rate limited", "error", err)
-						metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "rate_limited").Inc()
-					}
-
-					recordMetrics("failure")
-					// Same response as a bad-credential failure (the [AUTH] line below) instead of a
-					// distinct [LOGIN-DELAY], so the rate-limit state isn't an observable oracle that
-					// confirms a targeted account/IP is being limited. (security-audit M14)
-					if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-						return
-					}
-					continue
-				}
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, targetAddr.BaseAddress(), false)
 			}
+			return 0, errAuthFailed
+		}
+		authSuccess = true
+		masterAuthUsed = true
+		// The session belongs to the impersonated account, not the master credential.
+		userAddress = &targetAddr
+	}
 
-			// Master username authentication: user@domain.com@MASTER_USERNAME
-			// Check if suffix matches configured MasterUsername
-			authSuccess := false
-			masterAuthUsed := false
-			var accountID int64
-			if len(s.server.masterUsername) > 0 && userAddress.HasSuffix() && checkMasterCredential(userAddress.Suffix(), s.server.masterUsername) {
-				// Suffix matches MasterUsername, authenticate with MasterPassword
-				if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-					// Network gate: master-username auth is a tenant-wide impersonation
-					// capability, exactly like master SASL — restrict it to the same
-					// allowed networks, anchored to the real socket peer so it cannot be
-					// forged via PROXY/XCLIENT forwarding.
-					if !s.server.masterSASLGate.Allowed((*s.conn).RemoteAddr()) {
-						s.WarnLog("master username credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString((*s.conn).RemoteAddr()))
-						if s.server.authLimiter != nil {
-							s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.BaseAddress(), false)
-						}
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-							return
-						}
-						continue
-					}
-					s.DebugLog("master username authentication successful", "base_address", userAddress.BaseAddress(), "master_username", userAddress.Suffix())
-					authSuccess = true
-					masterAuthUsed = true
-					// Use base address (without suffix) to get account
-					accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, userAddress.BaseAddress())
-					if err != nil {
-						s.DebugLog("failed to get account id for user", "base_address", userAddress.BaseAddress(), "error", err)
-						// Record failed attempt
-						if s.server.authLimiter != nil {
-							s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.BaseAddress(), false)
-						}
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-							s.DebugLog("authentication failed")
-							return
-						}
-						continue
-					}
-				} else {
-					// Record failed master password authentication
-					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
+	if !authSuccess {
+		newUserAddress, err := server.NewAddress(username)
+		if err != nil {
+			s.DebugLog("invalid username format", "error", err)
+			return 0, pop3AuthError("Invalid username format")
+		}
+		userAddress = &newUserAddress
+
+		// Master username authentication: user@domain.com@MASTER_USERNAME
+		if len(s.server.masterUsername) > 0 && userAddress.HasSuffix() && checkMasterCredential(userAddress.Suffix(), s.server.masterUsername) {
+			if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
+				if !s.server.masterSASLGate.Allowed(netConn.RemoteAddr()) {
+					s.WarnLog("master username credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
 					if s.server.authLimiter != nil {
 						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.BaseAddress(), false)
 					}
-
-					// Master username suffix was provided but master password was wrong - fail immediately
-					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR [AUTH] Invalid master credentials\r\n") {
-						s.DebugLog("authentication failed, invalid master credentials")
-						return
-					}
-					continue
+					return 0, errAuthFailed
 				}
-			}
+				s.DebugLog("master username authentication successful", "base_address", userAddress.BaseAddress(), "master_username", userAddress.Suffix())
 
-			// Try master SASL password authentication (traditional)
-			if !authSuccess && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
-				if checkMasterCredential(userAddress.BaseAddress(), s.server.masterSASLUsername) && checkMasterCredential(password, s.server.masterSASLPassword) {
-					// Network gate: master SASL is a tenant-wide impersonation capability.
-					// Anchored to the real socket peer (cannot be forged via PROXY/XCLIENT forwarding).
-					if !s.server.masterSASLGate.Allowed((*s.conn).RemoteAddr()) {
-						s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString((*s.conn).RemoteAddr()))
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-							return
-						}
-						continue
-					}
-					s.DebugLog("master sasl password authentication successful", "base_address", userAddress.BaseAddress())
-					authSuccess = true
-					masterAuthUsed = true
-					// For master password, we need to get the user ID
-					accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, userAddress.BaseAddress())
-					if err != nil {
-						s.DebugLog("failed to get account id for master user", "base_address", userAddress.BaseAddress(), "error", err)
-						// Record failed attempt
-						if s.server.authLimiter != nil {
-							s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.BaseAddress(), false)
-						}
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-							s.DebugLog("authentication failed")
-							return
-						}
-						continue
-					}
+				targetUser := identity
+				if targetUser == "" {
+					targetUser = userAddress.BaseAddress()
 				}
-			}
-
-			// If master password didn't work, try regular authentication
-			if !authSuccess {
-				// Use base address (without +detail) for authentication
-				accountID, err = s.server.Authenticate(ctx, userAddress.BaseAddress(), password)
+				targetAddr, err := server.NewAddress(targetUser)
 				if err != nil {
-					// Check if error is due to context cancellation (server shutdown)
-					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-						s.InfoLog("authentication cancelled due to server shutdown")
-						metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n") {
-							return
-						}
-						continue
-					}
+					return 0, pop3AuthError("Invalid impersonation target user format")
+				}
 
-					// Record failed attempt
+				accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, targetAddr.BaseAddress())
+				if err != nil {
+					s.DebugLog("failed to get account id for user", "base_address", targetAddr.BaseAddress(), "error", err)
 					if s.server.authLimiter != nil {
-						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress(), false)
+						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, targetAddr.BaseAddress(), false)
 					}
-					// Track failed authentication
-					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
-					metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
-					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-						s.DebugLog("authentication failed")
-						return
-					}
-					continue
+					return 0, errAuthFailed
 				}
 				authSuccess = true
+				masterAuthUsed = true
+				userAddress = &targetAddr
+			} else {
+				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
+				if s.server.authLimiter != nil {
+					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.BaseAddress(), false)
+				}
+				return 0, pop3AuthError("Invalid master credentials")
+			}
+		}
+	}
+
+	// Regular authentication
+	if !authSuccess {
+		if identity != "" && identity != username {
+			return 0, pop3AuthError("Proxy authentication requires master credentials")
+		}
+
+		var err error
+		accountID, err = s.server.Authenticate(ctx, userAddress.BaseAddress(), password)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.InfoLog("authentication cancelled due to server shutdown")
+				return 0, errTempUnavailable
 			}
 
-			// Record successful attempt
 			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress(), true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress(), false)
 			}
-
-			// This is a potential write operation.
-			// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
-			err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID)
-			if err != nil {
-				s.DebugLog("error creating default mailboxes", "error", err)
-				writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-			// Create a context that signals to the DB layer to use the master connection.
-			// We will set useMasterDB later under the write lock.
-			readCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
-
-			inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, accountID, consts.MailboxInbox)
-			if err != nil {
-				s.DebugLog("error getting inbox", "error", err)
-				writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-
-			// Acquire write lock to update session state
-			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog(" failed to acquire write lock within timeout")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-
-			s.inboxMailboxID = inboxMailboxID.ID
-			s.User = server.NewUser(*userAddress, accountID) // Initialize User for connection tracking
-			s.deleted = make(map[int]bool)                   // Initialize deletion map on authentication
-			s.useMasterDB.Store(true)                        // Pin session to master DB after a write to ensure consistency
-			release()
-
-			s.server.authenticatedConnections.Add(1)
-
-			// Log authentication success
-			// Note: Regular auth via Authenticate() already logs in server.go with cached/method
-			// For master password auth, we log here with method=master
-			if masterAuthUsed {
-				duration := time.Since(start)
-				s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-			}
-
-			// Track successful authentication
-			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
-			metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
-
-			// IMPORTANT: Set authenticated flag AFTER incrementing both counters to prevent race condition
-			// If session closes between counter increments and flag setting, cleanup won't decrement
-			s.authenticated.Store(true)
-
-			// Track domain and user connection activity
-			if s.User != nil {
-				metrics.TrackDomainConnection("pop3", s.Domain())
-				metrics.TrackUserActivity("pop3", s.FullAddress(), "connection", 1)
-			}
-
-			// Register connection for tracking
-			s.registerConnection(userAddress.FullAddress())
-
-			// Start termination poller to check for kick commands
-			s.startTerminationPoller()
-
-			writer.WriteString("+OK Password accepted\r\n")
-
-			recordMetrics("success")
-
-		case "STAT":
-			start := time.Now()
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "STAT", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "STAT").Observe(time.Since(start).Seconds())
-			}
-
-			// Check context before processing command
-			if s.ctx.Err() != nil {
-				s.WarnLog("request aborted, aborting stat command")
-				recordMetrics("failure")
-				return
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if !s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Acquire read lock to check loading needs
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog("failed to acquire read lock within timeout")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-			mailboxID := s.inboxMailboxID
-			needsLoading := (s.messages == nil)
-			release()
-
-			// Load the session snapshot if not yet loaded. STAT reports the
-			// maildrop as this session sees it, computed from the same fixed
-			// snapshot as LIST/UIDL/RETR — not from live DB totals, which drift
-			// (mailbox_stats) and would observe concurrent deliveries mid-session
-			// (RFC 1939 §3 requires a stable per-session maildrop view).
-			if needsLoading {
-				// Create a context for read operations that respects session pinning (atomic read, no lock needed)
-				readCtx := ctx
-				if s.useMasterDB.Load() {
-					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-				}
-
-				messages, err := s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
-				if err != nil {
-					s.DebugLog("stat error", "error", err)
-					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-
-				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-				if !acquired {
-					s.WarnLog("failed to acquire write lock within timeout")
-					writer.WriteString("-ERR Server busy, please try again\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-				storeErr := s.setMessagesLocked(messages)
-				if storeErr == nil {
-					s.DebugLog("loaded messages from database", "count", len(messages), "mailbox_id", mailboxID)
-				}
-				release()
-				if storeErr != nil {
-					writer.WriteString("-ERR [SYS/TEMP] Mailbox too large to open in this session\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-			}
-
-			// Compute count/size from the snapshot, excluding session-local
-			// deletions (RFC 1939 §5).
-			acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog("failed to acquire read lock within timeout")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-			statCount, statSize := computeMaildropStats(s.messages, s.deleted)
-			release()
-
-			writer.WriteString(fmt.Sprintf("+OK %d %d\r\n", statCount, statSize))
-
-			recordMetrics("success")
-
-		case "LIST":
-			start := time.Now()
-			var backendDuration float64
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "LIST", status).Inc()
-				if backendDuration == 0 {
-					backendDuration = time.Since(start).Seconds()
-				}
-				metrics.CommandDuration.WithLabelValues("pop3", "LIST").Observe(backendDuration)
-			}
-
-			// Check context before processing command
-			if s.ctx.Err() != nil {
-				s.WarnLog("request aborted, aborting list command")
-				recordMetrics("failure")
-				return
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if !s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Acquire read lock to check loading needs
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog("failed to acquire read lock within timeout")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-			mailboxID := s.inboxMailboxID
-			needsLoading := (s.messages == nil)
-			release()
-
-			// Load messages if not yet loaded
-			if needsLoading {
-				// Create a context for read operations that respects session pinning (atomic read, no lock needed)
-				readCtx := ctx
-				if s.useMasterDB.Load() {
-					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-				}
-
-				messages, err := s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
-				if err != nil {
-					s.DebugLog("list error", "error", err)
-					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-
-				// Acquire write lock to update session state
-				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-				if !acquired {
-					s.WarnLog("failed to acquire write lock within timeout")
-					writer.WriteString("-ERR Server busy, please try again\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-				storeErr := s.setMessagesLocked(messages)
-				if storeErr == nil {
-					s.DebugLog("loaded messages from database", "count", len(messages), "mailbox_id", mailboxID)
-				}
-				release()
-				if storeErr != nil {
-					writer.WriteString("-ERR [SYS/TEMP] Mailbox too large to open in this session\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-			}
-
-			// Handle LIST with message number argument (RFC 1939 §5)
-			if len(parts) > 1 {
-				msgNumber, err := strconv.Atoi(parts[1])
-				if err != nil || msgNumber < 1 {
-					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR Invalid message number\r\n") {
-						return
-					}
-					continue
-				}
-
-				// Acquire read lock to access messages
-				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-				if !acquired {
-					s.WarnLog("failed to acquire read lock within timeout")
-					writer.WriteString("-ERR Server busy, please try again\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-
-				ok, line := buildSingleListResponse(s.messages, s.deleted, msgNumber)
-				// Capture under the lock: keeps all s.messages reads under the
-				// guard, consistent with every other access. (review R2)
-				messageCount := len(s.messages)
-				release()
-
-				if !ok {
-					recordMetrics("failure")
-					if msgNumber > messageCount {
-						s.replyBenignError(writer, "-ERR No such message\r\n")
-					} else {
-						s.replyBenignError(writer, "-ERR Message is deleted\r\n")
-					}
-					continue
-				}
-
-				backendDuration = time.Since(start).Seconds()
-				writer.WriteString(fmt.Sprintf("+OK %s\r\n", line))
-			} else {
-				// LIST without arguments - list all messages
-				// Acquire read lock to access messages and deleted status
-				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-				if !acquired {
-					s.WarnLog("failed to acquire read lock within timeout")
-					writer.WriteString("-ERR Server busy, please try again\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-
-				// Build response lines preserving original message numbers (RFC 1939 §5).
-				responseLines := buildListResponseLines(s.messages, s.deleted)
-				nonDeletedCount := countNonDeletedMessages(s.messages, s.deleted)
-				release() // Release lock before I/O.
-
-				// Build and send response outside the lock.
-				backendDuration = time.Since(start).Seconds()
-
-				writer.WriteString(fmt.Sprintf("+OK %d messages\r\n", nonDeletedCount))
-				for _, line := range responseLines {
-					writer.WriteString(line + "\r\n")
-				}
-				writer.WriteString(".\r\n")
-			}
-			s.DebugLog("list command executed")
-
-			recordMetrics("success")
-
-		case "UIDL":
-			start := time.Now()
-			var backendDuration float64
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "UIDL", status).Inc()
-				if backendDuration == 0 {
-					backendDuration = time.Since(start).Seconds()
-				}
-				metrics.CommandDuration.WithLabelValues("pop3", "UIDL").Observe(backendDuration)
-			}
-
-			// Check context before processing command
-			if s.ctx.Err() != nil {
-				s.WarnLog("request aborted, aborting uidl command")
-				recordMetrics("failure")
-				return
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if !s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Acquire read lock to check loading needs
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog("failed to acquire read lock within timeout")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-			mailboxID := s.inboxMailboxID
-			needsLoading := (s.messages == nil)
-			release()
-
-			if needsLoading {
-				// Create a context for read operations that respects session pinning (atomic read, no lock needed)
-				readCtx := ctx
-				if s.useMasterDB.Load() {
-					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-				}
-				messages, err := s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
-				if err != nil {
-					s.DebugLog("uidl error", "error", err)
-					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-
-				// Acquire write lock to update session state
-				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-				if !acquired {
-					s.WarnLog("failed to acquire write lock within timeout")
-					writer.WriteString("-ERR Server busy, please try again\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-				storeErr := s.setMessagesLocked(messages)
-				release()
-				if storeErr != nil {
-					writer.WriteString("-ERR [SYS/TEMP] Mailbox too large to open in this session\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-			}
-
-			// Handle UIDL with message number argument
-			if len(parts) > 1 {
-				msgNumber, err := strconv.Atoi(parts[1])
-				if err != nil || msgNumber < 1 {
-					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR Invalid message number\r\n") {
-						return
-					}
-					continue
-				}
-
-				// Acquire read lock to access messages
-				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-				if !acquired {
-					s.WarnLog("failed to acquire read lock within timeout")
-					writer.WriteString("-ERR Server busy, please try again\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-
-				if msgNumber > len(s.messages) {
-					release()
-					recordMetrics("failure")
-					s.replyBenignError(writer, "-ERR No such message\r\n")
-					continue
-				}
-
-				msg := s.messages[msgNumber-1]
-				if s.deleted[msgNumber-1] {
-					release()
-					recordMetrics("failure")
-					s.replyBenignError(writer, "-ERR Message is deleted\r\n")
-					continue
-				}
-
-				// Use UID as the unique identifier (more reliable than ContentHash)
-				release()
-
-				backendDuration = time.Since(start).Seconds()
-				writer.WriteString(fmt.Sprintf("+OK %d %d\r\n", msgNumber, msg.UID))
-			} else {
-				// UIDL without arguments - list all messages
-				// Acquire read lock to access messages and deleted status
-				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-				if !acquired {
-					s.WarnLog("failed to acquire read lock within timeout")
-					writer.WriteString("-ERR Server busy, please try again\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-
-				// Build response lines preserving original message numbers (RFC 1939 §5).
-				responseLines := buildUIDLResponseLines(s.messages, s.deleted)
-				nonDeletedCount := countNonDeletedMessages(s.messages, s.deleted)
-				release() // Release lock before I/O.
-
-				// Phase 4: Build and send response outside the lock.
-				backendDuration = time.Since(start).Seconds()
-				writer.WriteString(fmt.Sprintf("+OK %d messages\r\n", nonDeletedCount))
-				for _, line := range responseLines {
-					writer.WriteString(line + "\r\n")
-				}
-				writer.WriteString(".\r\n")
-			}
-			s.DebugLog("uidl command executed")
-
-			recordMetrics("success")
-
-		case "TOP":
-			start := time.Now()
-			var backendDuration float64
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "TOP", status).Inc()
-				if backendDuration == 0 {
-					backendDuration = time.Since(start).Seconds()
-				}
-				metrics.CommandDuration.WithLabelValues("pop3", "TOP").Observe(backendDuration)
-			}
-
-			// Check context before processing command
-			if s.ctx.Err() != nil {
-				s.WarnLog("request aborted, aborting top command")
-				recordMetrics("failure")
-				return
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if !s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
-					return
-				}
-				continue
-			}
-
-			if len(parts) < 3 {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Missing message number or lines parameter\r\n") {
-					return
-				}
-				continue
-			}
-
-			msgNumber, err := strconv.Atoi(parts[1])
-			if err != nil || msgNumber < 1 {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Invalid message number\r\n") {
-					return
-				}
-				continue
-			}
-
-			lines, err := strconv.Atoi(parts[2])
-			if err != nil || lines < 0 {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Invalid lines parameter\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Phase 1: Read session state to determine if messages need loading.
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog("failed to acquire read lock within timeout")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-			mailboxID := s.inboxMailboxID
-			needsLoading := (s.messages == nil)
-			release()
-
-			// Phase 2: Load messages if needed (outside of any lock).
-			var loadedMessages []db.POP3Message
-			if needsLoading {
-				// Create a context for read operations that respects session pinning (atomic read, no lock needed)
-				readCtx := ctx
-				if s.useMasterDB.Load() {
-					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-				}
-				loadedMessages, err = s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
-				if err != nil {
-					s.DebugLog("top error", "error", err)
-					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-			}
-
-			// Phase 3: Acquire lock to check message state and get a copy of the message.
-			var msg db.POP3Message
-			var isDeleted bool
-			var msgFound = false
-
-			// Use a write lock if we need to update the messages slice.
-			if needsLoading {
-				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-			} else {
-				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-			}
-
-			if !acquired {
-				s.WarnLog("failed to acquire lock for top command")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-
-			// If we loaded messages, update the session state.
-			if needsLoading {
-				if storeErr := s.setMessagesLocked(loadedMessages); storeErr != nil {
-					release()
-					writer.WriteString("-ERR [SYS/TEMP] Mailbox too large to open in this session\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-				s.DebugLog("loaded messages from database", "count", len(s.messages), "mailbox_id", mailboxID)
-			}
-
-			// Now check message bounds and status under the lock.
-			if msgNumber > len(s.messages) {
-				// msgFound remains false
-			} else {
-				msg = s.messages[msgNumber-1]
-				isDeleted = s.deleted[msgNumber-1]
-				msgFound = true
-			}
-			release() // Release the lock before I/O.
-
-			// Phase 4: Handle message retrieval and response outside the lock.
-			if !msgFound {
-				recordMetrics("failure")
-				s.replyBenignError(writer, "-ERR No such message\r\n")
-				continue
-			}
-
-			if isDeleted {
-				recordMetrics("failure")
-				s.replyBenignError(writer, "-ERR Message is deleted\r\n")
-				continue
-			}
-
-			if msg.UID == 0 {
-				recordMetrics("failure")
-				s.replyBenignError(writer, "-ERR No such message\r\n")
-				continue
-			}
-
-			s.DebugLog("fetching message headers", "uid", msg.UID)
-			bodyData, err := s.getMessageBody(&msg)
-			if err != nil {
-				if err == consts.ErrMessageNotAvailable {
-					writer.WriteString("-ERR Message not available\r\n")
-				} else if errors.Is(err, errBodyTransientlyUnavailable) {
-					s.WarnLog("TOP: message body temporarily unavailable, asking client to retry", "uid", msg.UID, "error", err)
-					writer.WriteString("-ERR [SYS/TEMP] Message temporarily unavailable, please try again later\r\n")
-				} else {
-					s.DebugLog("top internal error", "error", err)
-					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-				}
-				writer.Flush()
-				// A transient "retry later" is not a server failure; bucket it separately
-				// so the failure metric reflects only genuine failures.
-				if errors.Is(err, errBodyTransientlyUnavailable) {
-					recordMetrics("unavailable")
-				} else {
-					recordMetrics("failure")
-				}
-				continue
-			}
-
-			// Normalize line endings for consistent processing
-			messageStr := string(bodyData)
-			messageStr = strings.ReplaceAll(messageStr, "\r\n", "\n") // Normalize to LF
-
-			// Find header/body separator
-			headerEndIndex := strings.Index(messageStr, "\n\n")
-			if headerEndIndex == -1 {
-				// Message has no body, just headers. Stream the LF-normalized bytes
-				// as a CRLF, dot-stuffed payload via the shared RETR helpers instead
-				// of materializing CRLF-converted + stuffed + concatenated copies.
-				// (review R5)
-				resultBytes := []byte(messageStr)
-				writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", crlfNormalizedLen(resultBytes)))
-				writeDotStuffedBody(writer, resultBytes)
-				if n := len(resultBytes); n > 0 && resultBytes[n-1] == '\n' {
-					writer.WriteString(".\r\n")
-				} else {
-					writer.WriteString("\r\n.\r\n")
-				}
-				s.DebugLog("retrieved headers for message", "uid", msg.UID)
-				// Free memory immediately after sending response
-				if s.memTracker != nil && bodyData != nil {
-					s.memTracker.Free(int64(len(bodyData)))
-				}
-				recordMetrics("success")
-				continue
-			}
-
-			// Extract headers
-			headers := messageStr[:headerEndIndex]
-
-			// Extract body lines if requested
-			var result string
-			if lines > 0 {
-				bodyStart := headerEndIndex + 2 // Skip \n\n
-				if bodyStart < len(messageStr) {
-					bodyPart := messageStr[bodyStart:]
-					bodyLines := strings.Split(bodyPart, "\n")
-
-					// Take only the requested number of lines
-					numLines := lines
-					if numLines > len(bodyLines) {
-						numLines = len(bodyLines)
-					}
-
-					selectedLines := bodyLines[:numLines]
-					bodySnippet := strings.Join(selectedLines, "\n")
-
-					result = headers + "\n\n" + bodySnippet
-				} else {
-					result = headers + "\n\n"
-				}
-			} else {
-				result = headers + "\n\n"
-			}
-
-			// Stream the LF-normalized result as a CRLF, dot-stuffed payload via
-			// the shared RETR helpers (crlfNormalizedLen counts one extra octet
-			// per bare LF, so the announced count equals the previous
-			// ReplaceAll-to-CRLF length) instead of materializing the CRLF copy,
-			// the stuffed copy, and the terminator concatenation. bodyData and
-			// the two intermediate strings remain the peak. (review R5)
-			resultBytes := []byte(result)
-
-			backendDuration = time.Since(start).Seconds()
-			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", crlfNormalizedLen(resultBytes)))
-			writeDotStuffedBody(writer, resultBytes)
-			if n := len(resultBytes); n > 0 && resultBytes[n-1] == '\n' {
-				writer.WriteString(".\r\n")
-			} else {
-				writer.WriteString("\r\n.\r\n")
-			}
-			s.DebugLog("retrieved top lines of message", "lines", lines, "uid", msg.UID)
-
-			// Free memory immediately after sending response
-			if s.memTracker != nil && bodyData != nil {
-				s.memTracker.Free(int64(len(bodyData)))
-			}
-
-			recordMetrics("success")
-
-		case "RETR":
-			retrieveStart := time.Now()
-			var backendDuration float64
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "RETR", status).Inc()
-				if backendDuration == 0 {
-					backendDuration = time.Since(retrieveStart).Seconds()
-				}
-				metrics.CommandDuration.WithLabelValues("pop3", "RETR").Observe(backendDuration)
-			}
-
-			// Check context before processing command
-			if s.ctx.Err() != nil {
-				s.WarnLog("request aborted, aborting retr command")
-				recordMetrics("failure")
-				return
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if !s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
-					return
-				}
-				continue
-			}
-
-			if len(parts) < 2 {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Missing message number\r\n") {
-					return
-				}
-				continue
-			}
-
-			msgNumber, err := strconv.Atoi(parts[1])
-			if err != nil || msgNumber < 1 {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Invalid message number\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Phase 1: Read session state to determine if messages need loading.
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog("failed to acquire read lock within timeout")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-			mailboxID := s.inboxMailboxID
-			needsLoading := (s.messages == nil)
-			release()
-
-			// Phase 2: Load messages if needed (outside of any lock).
-			var loadedMessages []db.POP3Message
-			if needsLoading {
-				// Create a context for read operations that respects session pinning (atomic read, no lock needed)
-				readCtx := ctx
-				if s.useMasterDB.Load() {
-					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-				}
-				loadedMessages, err = s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
-				if err != nil {
-					s.DebugLog("retr error", "error", err)
-					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-			}
-
-			// Phase 3: Acquire lock to check message state and get a copy of the message.
-			var msg db.POP3Message
-			var isDeleted bool
-			var msgFound = false
-
-			if needsLoading {
-				acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-			} else {
-				acquired, release = s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-			}
-
-			if !acquired {
-				s.WarnLog("failed to acquire lock for retr command")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-
-			if needsLoading {
-				if storeErr := s.setMessagesLocked(loadedMessages); storeErr != nil {
-					release()
-					writer.WriteString("-ERR [SYS/TEMP] Mailbox too large to open in this session\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-				s.DebugLog("loaded messages from database", "count", len(s.messages), "mailbox_id", mailboxID)
-			}
-
-			if msgNumber > len(s.messages) {
-				// msgFound remains false
-			} else {
-				msg = s.messages[msgNumber-1]
-				isDeleted = s.deleted[msgNumber-1]
-				msgFound = true
-			}
-			release() // Release lock before I/O.
-
-			// Phase 4: Handle message retrieval and response outside the lock.
-			if !msgFound {
-				recordMetrics("failure")
-				s.replyBenignError(writer, "-ERR No such message\r\n")
-				continue
-			}
-
-			if isDeleted {
-				recordMetrics("failure")
-				s.replyBenignError(writer, "-ERR Message is deleted\r\n")
-				continue
-			}
-
-			if msg.UID == 0 {
-				recordMetrics("failure")
-				s.replyBenignError(writer, "-ERR No such message\r\n")
-				continue
-			}
-
-			s.DebugLog("fetching message body", "uid", msg.UID)
-			bodyData, err := s.getMessageBody(&msg)
-			if err != nil {
-				if err == consts.ErrMessageNotAvailable {
-					writer.WriteString("-ERR Message not available\r\n")
-				} else if errors.Is(err, errBodyTransientlyUnavailable) {
-					s.WarnLog("RETR: message body temporarily unavailable, asking client to retry", "uid", msg.UID, "error", err)
-					writer.WriteString("-ERR [SYS/TEMP] Message temporarily unavailable, please try again later\r\n")
-				} else {
-					s.DebugLog("retr internal error", "error", err)
-					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-				}
-				writer.Flush()
-				// A transient "retry later" is not a server failure; bucket it separately
-				// so the failure metric reflects only genuine failures.
-				if errors.Is(err, errBodyTransientlyUnavailable) {
-					recordMetrics("unavailable")
-				} else {
-					recordMetrics("failure")
-				}
-				continue
-			}
-			s.DebugLog("retrieved message body", "uid", msg.UID)
-
-			// Validate body data to prevent empty line protocol violations
-			if len(bodyData) == 0 {
-				s.WarnLog("empty message body", "uid", msg.UID, "expected_size", msg.Size)
-				// Free memory before error handling
-				if s.memTracker != nil {
-					s.memTracker.Free(int64(len(bodyData)))
-				}
-				recordMetrics("failure")
-				// Server-side data problem, not a client error — do not penalize
-				// the client for it. (review R4)
-				s.replyBenignError(writer, "-ERR Message body is empty\r\n")
-				continue
-			}
-
-			// Warn if body size mismatch indicates corruption or incomplete fetch
-			if len(bodyData) != msg.Size {
-				s.WarnLog("body size mismatch", "uid", msg.UID, "expected", msg.Size, "got", len(bodyData))
-			}
-
-			// Stream the body to the client as a CRLF-normalized, dot-stuffed
-			// multiline response (RFC 1939 §3). Normalizing bare-LF (common in
-			// imported/maildir mail) keeps the framing well-formed and stops a lone
-			// "." line from being read as end-of-message. Streaming avoids buffering
-			// the whole stuffed message + a concatenation copy in memory. The
-			// announced octet count is the CRLF-normalized (unstuffed) length — the
-			// exact number of body octets the client reconstructs — so byte-counting
-			// clients stay in sync.
-			backendDuration = time.Since(retrieveStart).Seconds()
-			announcedOctets := crlfNormalizedLen(bodyData)
-			writer.WriteString(fmt.Sprintf("+OK %d octets\r\n", announcedOctets))
-			writeDotStuffedBody(writer, bodyData)
-			// Terminate with <CRLF>.<CRLF>. If the body already ended with a newline
-			// the stream ends in CRLF, so only ".CRLF" is needed; otherwise the
-			// terminator supplies the missing CRLF first.
-			if n := len(bodyData); n > 0 && bodyData[n-1] == '\n' {
-				writer.WriteString(".\r\n")
-			} else {
-				writer.WriteString("\r\n.\r\n")
-			}
-			s.DebugLog("retrieved message", "uid", msg.UID)
-
-			// Free memory immediately after sending response
-			if s.memTracker != nil && bodyData != nil {
-				s.memTracker.Free(int64(len(bodyData)))
-			}
-
-			// Track successful message retrieval. Byte metrics use the announced
-			// (CRLF-normalized) octet count — the bytes actually reconstructed by
-			// the client — rather than the stored msg.Size, which undercounts for
-			// bare-LF bodies. Note: this deliberately counts reconstructed octets,
-			// NOT raw on-the-wire bytes — dot-stuffing bytes and the .CRLF
-			// terminator are excluded. A true wire-byte counter would have to be
-			// accumulated inside writeDotStuffedBody. (review R7)
-			metrics.MessageThroughput.WithLabelValues("pop3", "retrieved", "success").Inc()
-			metrics.BytesThroughput.WithLabelValues("pop3", "out").Add(float64(announcedOctets))
-			metrics.CriticalOperationDuration.WithLabelValues("pop3_retrieve").Observe(backendDuration)
-
-			// Track domain and user activity - RETR is bandwidth intensive!
-			if s.User != nil {
-				metrics.TrackDomainCommand("pop3", s.Domain(), "RETR")
-				metrics.TrackUserActivity("pop3", s.FullAddress(), "command", 1)
-				metrics.TrackDomainBytes("pop3", s.Domain(), "out", int64(announcedOctets))
-				metrics.TrackDomainMessage("pop3", s.Domain(), "fetched")
-			}
-
-			// Track for session summary
-			s.messagesRetrieved++
-
-			recordMetrics("success")
-
-		case "NOOP":
-			start := time.Now()
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "NOOP", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "NOOP").Observe(time.Since(start).Seconds())
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if !s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
-					return
-				}
-				continue
-			}
-
-			writer.WriteString("+OK\r\n")
-
-			recordMetrics("success")
-
-		case "RSET":
-			start := time.Now()
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "RSET", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "RSET").Observe(time.Since(start).Seconds())
-			}
-
-			// Check context before processing command
-			if s.ctx.Err() != nil {
-				s.WarnLog("request aborted, aborting rset command")
-				recordMetrics("failure")
-				return
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if !s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Acquire write lock to update deleted map
-			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog("failed to acquire write lock within timeout")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-			s.deleted = make(map[int]bool)
-			release()
-
-			writer.WriteString("+OK\r\n")
-			s.DebugLog("deleted messages reset")
-
-			recordMetrics("success")
-
-		case "DELE":
-			start := time.Now()
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "DELE", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "DELE").Observe(time.Since(start).Seconds())
-			}
-
-			// Check context before processing command
-			if s.ctx.Err() != nil {
-				s.WarnLog("request aborted, aborting dele command")
-				recordMetrics("failure")
-				return
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if !s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Not authenticated\r\n") {
-					return
-				}
-				continue
-			}
-
-			if len(parts) < 2 {
-				s.DebugLog("missing message number")
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Missing message number\r\n") {
-					return
-				}
-				continue
-			}
-
-			msgNumber, err := strconv.Atoi(parts[1])
-			if err != nil || msgNumber < 1 {
-				s.DebugLog("dele invalid message number", "error", err)
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Invalid message number\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Phase 1: Read session state to determine if messages need loading.
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog("failed to acquire read lock for dele command")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-			needsLoading := (s.messages == nil)
-			mailboxID := s.inboxMailboxID
-			release()
-
-			// Phase 2: Load messages if needed (outside of any lock).
-			var loadedMessages []db.POP3Message
-			if needsLoading {
-				// Create a context for read operations that respects session pinning (atomic read, no lock needed)
-				readCtx := ctx
-				if s.useMasterDB.Load() {
-					readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-				}
-				loadedMessages, err = s.server.rdb.ListMessagesForPOP3WithRetry(readCtx, mailboxID, s.pop3LoadLimit())
-				if err != nil {
-					s.DebugLog("dele error", "error", err)
-					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-			}
-
-			// Phase 3: Acquire write lock to update session state.
-			acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog("failed to acquire write lock for dele command")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-
-			// If we loaded messages, update the session state.
-			if needsLoading {
-				if storeErr := s.setMessagesLocked(loadedMessages); storeErr != nil {
-					release()
-					writer.WriteString("-ERR [SYS/TEMP] Mailbox too large to open in this session\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-				s.DebugLog("loaded messages from database", "count", len(s.messages), "mailbox_id", mailboxID)
-			}
-
-			// Validate message bounds and perform deletion
-			if msgNumber > len(s.messages) {
-				release()
-				s.DebugLog("dele no such message", "msg_number", msgNumber)
-				recordMetrics("failure")
-				s.replyBenignError(writer, "-ERR No such message\r\n")
-				continue
-			}
-
-			msg := s.messages[msgNumber-1]
-			if msg.UID == 0 {
-				release()
-				s.DebugLog("dele no such message", "msg_number", msgNumber)
-				recordMetrics("failure")
-				s.replyBenignError(writer, "-ERR No such message\r\n")
-				continue
-			}
-
-			// Reject a repeat DELE of an already-marked message per RFC 1939 §5
-			// ("-ERR message N already deleted"). Without this the second DELE
-			// returned +OK and double-incremented the deleted counter, diverging
-			// the session summary from the actual expunge set.
-			if s.deleted[msgNumber-1] {
-				release()
-				s.DebugLog("dele already deleted", "msg_number", msgNumber)
-				recordMetrics("failure")
-				s.replyBenignError(writer, fmt.Sprintf("-ERR message %d already deleted\r\n", msgNumber))
-				continue
-			}
-
-			s.deleted[msgNumber-1] = true
-
-			// Track for session summary
-			s.messagesDeleted++
-
-			// Capture under the lock: keeps all s.deleted reads under the
-			// guard, consistent with every other access. (review R2)
-			totalDeleted := len(s.deleted)
-
-			release()
-
-			writer.WriteString("+OK Message deleted\r\n")
-			s.DebugLog("marked message for deletion", "msg_number", msgNumber, "uid", msg.UID, "mailbox_id", mailboxID, "total_deleted", totalDeleted)
-
-			metrics.MessageThroughput.WithLabelValues("pop3", "deleted", "success").Inc()
-
-			recordMetrics("success")
-
-		case "AUTH":
-			start := time.Now()
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "AUTH", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "AUTH").Observe(time.Since(start).Seconds())
-			}
-
-			// Check context before processing command
-			if s.ctx.Err() != nil {
-				s.WarnLog("request aborted, aborting auth command")
-				recordMetrics("failure")
-				return
-			}
-
-			// Check authentication state (atomic read, no lock needed)
-			if s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Already authenticated\r\n") {
-					return
-				}
-				continue
-			}
-
-			// AUTH with no arguments: legacy RFC 1734-style probe for available
-			// mechanisms, which RFC 5034 §4 permits supporting for compatibility.
-			// Answer with the mechanism list instead of an error so probing
-			// clients don't stall. Mirrors CAPA's gating: mechanisms are listed
-			// only when auth is actually usable on this connection. (review M-c)
-			if len(parts) < 2 {
-				writer.WriteString("+OK Supported authentication mechanisms\r\n")
-				if s.server.insecureAuth || server.ConnIsTLS(*s.conn) {
-					writer.WriteString("PLAIN\r\n")
-				}
-				writer.WriteString(".\r\n")
-				recordMetrics("success")
-				continue
-			}
-
-			// Remove quotes from mechanism if present for compatibility
-			mechanism := server.UnquoteString(parts[1])
-			mechanism = strings.ToUpper(mechanism)
-			if mechanism != "PLAIN" {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Unsupported authentication mechanism\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Check insecure_auth: reject AUTH over non-TLS when insecure_auth is false
-			if !s.server.insecureAuth && !server.ConnIsTLS(*s.conn) {
-				s.DebugLog("AUTH PLAIN rejected - TLS required")
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR Authentication requires TLS connection\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Check if initial response is provided
-			var authData string
-			if len(parts) > 2 {
-				// Initial response provided - remove quotes if present
-				authData = server.UnquoteString(parts[2])
-			} else {
-				// Request the authentication data
-				writer.WriteString("+ \r\n")
-				writer.Flush()
-
-				// Read the authentication data (bounded to avoid a pre-auth memory blow-up)
-				authLine, err := server.ReadBoundedLine(reader, Pop3MaxLineLength)
-				if err != nil {
-					s.DebugLog("error reading auth data", "error", err)
-					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR Authentication failed\r\n") {
-						return
-					}
-					continue
-				}
-				authData = strings.TrimSpace(authLine)
-				// Remove quotes if present in continuation response
-				authData = server.UnquoteString(authData)
-			}
-
-			// Check for cancellation
-			if authData == "*" {
-				writer.WriteString("-ERR Authentication cancelled\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-
-			// Decode base64. RFC 4959 §3: a lone "=" is a present-but-empty initial
-			// response — treat it as empty rather than trying (and failing) to
-			// base64-decode "=". Empty credentials then fail auth cleanly below.
-			decoded := []byte{}
-			if authData != "=" {
-				decoded, err = base64.StdEncoding.DecodeString(authData)
-				if err != nil {
-					s.DebugLog("error decoding auth data", "error", err)
-					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR [AUTH] Invalid authentication data\r\n") {
-						return
-					}
-					continue
-				}
-			}
-
-			// Parse SASL PLAIN format: [authz-id] \0 authn-id \0 password
-			parts := strings.Split(string(decoded), "\x00")
-			if len(parts) != 3 {
-				s.DebugLog("invalid sasl plain format")
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR [AUTH] Invalid authentication format\r\n") {
-					return
-				}
-				continue
-			}
-
-			authzID := parts[0]  // Authorization identity (who to act as)
-			authnID := parts[1]  // Authentication identity (who is authenticating)
-			password := parts[2] // Password
-
-			s.DebugLog("sasl plain authentication", "authz_id", authzID, "authn_id", authnID)
-
-			// Parse authentication-identity to check for suffix (master username or remotelookup token)
-			authnParsed, parseErr := server.NewAddress(authnID)
-
-			var accountID int64
-			var impersonating bool
-
-			// 1. Check for Master Username Authentication (user@domain.com@MASTER_USERNAME)
-			if parseErr == nil && len(s.server.masterUsername) > 0 && authnParsed.HasSuffix() && checkMasterCredential(authnParsed.Suffix(), s.server.masterUsername) {
-				// Suffix matches MasterUsername, authenticate with MasterPassword
-				if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-					// Network gate: master-username auth is a tenant-wide impersonation
-					// capability, exactly like master SASL — restrict it to the same
-					// allowed networks, anchored to the real socket peer.
-					if !s.server.masterSASLGate.Allowed((*s.conn).RemoteAddr()) {
-						s.WarnLog("master username credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString((*s.conn).RemoteAddr()))
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-							return
-						}
-						continue
-					}
-					// Determine target user to impersonate
-					targetUserToImpersonate := authzID
-					if targetUserToImpersonate == "" {
-						// No authorization identity provided, use base address from authnID
-						targetUserToImpersonate = authnParsed.BaseAddress()
-					}
-
-					s.DebugLog("master username authenticated, attempting impersonation", "master_username", authnParsed.Suffix(), "target_user", targetUserToImpersonate)
-
-					// Parse target user address
-					address, err := server.NewAddress(targetUserToImpersonate)
-					if err != nil {
-						s.DebugLog("failed to parse impersonation target user", "target_user", targetUserToImpersonate, "error", err)
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [AUTH] Invalid impersonation target user format\r\n") {
-							return
-						}
-						continue
-					}
-
-					accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
-					if err != nil {
-						s.DebugLog("failed to get account id for impersonation target user", "target_user", targetUserToImpersonate, "error", err)
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [AUTH] Impersonation target user not found\r\n") {
-							return
-						}
-						continue
-					}
-
-					impersonating = true
-				} else {
-					// Record failed master password authentication
-					metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
-
-					// Master username suffix was provided but master password was wrong - fail immediately
-					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR [AUTH] Invalid master credentials\r\n") {
-						s.DebugLog("authentication failed, invalid master credentials")
-						return
-					}
-					continue
-				}
-			}
-
-			// 2. Check for Master SASL Authentication (traditional)
-			if !impersonating && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
-				// Check if this is a master SASL login
-				if checkMasterCredential(authnID, s.server.masterSASLUsername) && checkMasterCredential(password, s.server.masterSASLPassword) {
-					// Network gate: master SASL is a tenant-wide impersonation capability.
-					// Anchored to the real socket peer (cannot be forged via PROXY/XCLIENT forwarding).
-					if !s.server.masterSASLGate.Allowed((*s.conn).RemoteAddr()) {
-						s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString((*s.conn).RemoteAddr()))
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-							return
-						}
-						continue
-					}
-					// Master SASL authentication successful
-					if authzID == "" {
-						s.DebugLog("master sasl authentication successful but no authorization identity provided", "authn_id", authnID)
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [AUTH] Master SASL login requires an authorization identity.\r\n") {
-							return
-						}
-						continue
-					}
-
-					s.DebugLog("master sasl user authenticated, attempting impersonation", "authn_id", authnID, "authz_id", authzID)
-
-					// Log in as the authzID without a password check
-					address, err := server.NewAddress(authzID)
-					if err != nil {
-						s.DebugLog("failed to parse impersonation target user", "authz_id", authzID, "error", err)
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [AUTH] Invalid impersonation target user format\r\n") {
-							return
-						}
-						continue
-					}
-
-					accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
-					if err != nil {
-						s.DebugLog("failed to get account id for impersonation target user", "authz_id", authzID, "error", err)
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [AUTH] Impersonation target user not found\r\n") {
-							return
-						}
-						continue
-					}
-
-					impersonating = true
-				}
-			}
-
-			// If not using master SASL, perform regular authentication
-			if !impersonating {
-				// For regular POP3, we don't support proxy authentication
-				if authzID != "" && authzID != authnID {
-					s.DebugLog("proxy authentication requires master credentials", "authz_id", authzID, "authn_id", authnID)
-					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR [AUTH] Proxy authentication requires master_sasl_username and master_sasl_password to be configured\r\n") {
-						return
-					}
-					continue
-				}
-
-				// Authenticate the user
-				address, err := server.NewAddress(authnID)
-				if err != nil {
-					s.DebugLog("invalid address format", "error", err)
-					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR [AUTH] Invalid username format\r\n") {
-						return
-					}
-					continue
-				}
-
-				s.DebugLog("authentication attempt", "address", address.FullAddress())
-
-				// Get connection and proxy info for rate limiting
-				netConn := *s.conn
-				var proxyInfo *server.ProxyProtocolInfo
-				if s.ProxyIP != "" {
-					proxyInfo = &server.ProxyProtocolInfo{
-						SrcIP: s.RemoteIP,
-					}
-				}
-
-				// Apply progressive authentication delay BEFORE any other checks
-				remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-				if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "POP3-SASL"); err != nil {
-					if errors.Is(err, server.ErrDelayQueueFull) {
-						// Delay queue full - reject immediately to prevent goroutine exhaustion
-						s.InfoLog("delay queue full, rejecting connection", "address", address.FullAddress())
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [IN-USE] Too many concurrent authentication attempts. Please try again later.\r\n") {
-							return
-						}
-						continue
-					}
-					// Context cancelled or other error - close connection
-					return
-				}
-
-				// Check authentication rate limiting after delay
-				if s.server.authLimiter != nil {
-					if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
-						s.DebugLog("sasl plain rate limited", "error", err)
-						recordMetrics("failure")
-						// Same response as a bad-credential failure (the [AUTH] line below) so the
-						// rate-limit state isn't an observable oracle. (security-audit M14)
-						if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-							return
-						}
-						continue
-					}
-				}
-
-				accountID, err = s.server.Authenticate(ctx, address.BaseAddress(), password)
-				if err != nil {
-					// Check if error is due to context cancellation (server shutdown)
-					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-						s.InfoLog("sasl authentication cancelled due to server shutdown")
-						recordMetrics("failure")
-						if s.handleClientError(writer, "-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n") {
-							return
-						}
-						continue
-					}
-
-					// Record failed attempt
-					if s.server.authLimiter != nil {
-						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.FullAddress(), false)
-					}
-					recordMetrics("failure")
-					if s.handleClientError(writer, "-ERR [AUTH] Authentication failed\r\n") {
-						s.DebugLog("authentication failed")
-						return
-					}
-					continue
-				}
-
-				// Record successful attempt
-				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.FullAddress(), true)
-				}
-			}
-
-			// This is a potential write operation.
-			// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
-			err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID)
-			if err != nil {
-				s.DebugLog("error creating default mailboxes", "error", err)
-				writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-			// Create a context that signals to the DB layer to use the master connection.
-			// We will set useMasterDB later under the write lock.
-			readCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
-
-			inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, accountID, consts.MailboxInbox)
-			if err != nil {
-				s.DebugLog("error getting inbox", "error", err)
-				writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-
-			// Acquire write lock to update session state
-			acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog("failed to acquire write lock within timeout")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-
-			s.inboxMailboxID = inboxMailboxID.ID
-			// Initialize User for connection tracking - will use correct email below
-			// For impersonation: authzID, otherwise: authnID
-			var userEmail string
-			if impersonating {
-				userEmail = authzID
-			} else {
-				userEmail = authnID
-			}
-			userAddr, _ := server.NewAddress(userEmail)
-			s.User = server.NewUser(userAddr, accountID)
-			s.deleted = make(map[int]bool) // Initialize deletion map on authentication
-			s.useMasterDB.Store(true)      // Pin session to master DB after a write to ensure consistency
-			release()
-
-			s.server.authenticatedConnections.Add(1)
-
-			// Log authentication success with standardized format
-			// Note: Regular auth via Authenticate() already logs in server.go with cached/method
-			// For master SASL auth, we log here with method=master
-			if impersonating {
-				duration := time.Since(start)
-				s.InfoLog("authentication successful", "address", authzID, "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-			}
-
-			// Track successful authentication - MUST be before setting authenticated flag
-			metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
-			metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
-
-			// IMPORTANT: Set authenticated flag AFTER incrementing both counters to prevent race condition
-			s.authenticated.Store(true)
-
-			// Register connection for tracking
-			if impersonating {
-				s.registerConnection(authzID)
-			} else {
-				s.registerConnection(authnID)
-			}
-
-			// Start termination poller to check for kick commands
-			s.startTerminationPoller()
-
-			writer.WriteString("+OK Authentication successful\r\n")
-
-			recordMetrics("success")
-
-		case "LANG":
-			start := time.Now()
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "LANG", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "LANG").Observe(time.Since(start).Seconds())
-			}
-
-			// LANG command - set or query language
-			// Acquire read lock to access current language
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog("failed to acquire read lock within timeout")
-				writer.WriteString("-ERR Server busy, please try again\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				continue
-			}
-			currentLang := s.language
-			release()
-
-			if len(parts) == 1 {
-				// LANG without arguments - list supported languages
-				writer.WriteString("+OK Language listing follows\r\n")
-				writer.WriteString("en English\r\n")
-				writer.WriteString("i-default Default\r\n")
-				writer.WriteString(".\r\n")
-			} else {
-				// LANG with a language tag. Only English is available; RFC 6856 §3.3
-				// requires a LANG-capable server to also accept "i-default", and "*"
-				// requests the server's best match. ([LANG] is not a registered
-				// RFC 2449 response code, so a plain -ERR is used.)
-				langTag := strings.ToLower(parts[1])
-
-				if langTag != "en" && langTag != "*" && langTag != "i-default" {
-					writer.WriteString("-ERR Unsupported language\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-
-				// Acquire write lock to update language
-				acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-				if !acquired {
-					s.WarnLog("failed to acquire write lock within timeout")
-					writer.WriteString("-ERR Server busy, please try again\r\n")
-					writer.Flush()
-					recordMetrics("failure")
-					continue
-				}
-
-				if langTag == "i-default" {
-					s.language = "i-default"
-				} else {
-					s.language = "en" // "en" and "*" both select English
-				}
-				// Capture under the lock so s.language is not read after
-				// release(). (review R2)
-				newLang := s.language
-				release()
-
-				writer.WriteString(fmt.Sprintf("+OK Language changed to %s\r\n", newLang))
-			}
-			s.DebugLog("lang command executed", "current", currentLang)
-
-			recordMetrics("success")
-
-		case "UTF8":
-			start := time.Now()
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "UTF8", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "UTF8").Observe(time.Since(start).Seconds())
-			}
-
-			// RFC 6856 §2: the UTF8 command is only valid in the AUTHORIZATION
-			// state. Reject it after authentication. (review M-b)
-			if s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR UTF8 only allowed before authentication\r\n") {
-					return
-				}
-				continue
-			}
-
-			// UTF8 command - enable UTF-8 mode (atomic write, no lock needed)
-			s.utf8Mode.Store(true)
-
-			writer.WriteString("+OK UTF8 enabled\r\n")
-			s.DebugLog("utf8 mode enabled")
-
-			recordMetrics("success")
-
-		case "QUIT":
-			start := time.Now()
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "QUIT", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "QUIT").Observe(time.Since(start).Seconds())
-			}
-
-			s.DebugLog("quit command received, starting message expunge process")
-			// Check context before processing command
-			if s.ctx.Err() != nil {
-				s.WarnLog("request aborted, aborting quit command")
-				recordMetrics("failure")
-				return
-			}
-
-			// Whether the client marked anything for deletion this session. If it
-			// did but the UPDATE-state expunge cannot be committed (lock unavailable
-			// or DB error), RFC 1939 §6 requires reporting -ERR so the client is not
-			// told the maildrop was updated when it was not — otherwise "deleted"
-			// mail silently reappears on the next poll. (messagesDeleted counts only
-			// genuine first-time DELEs.)
-			hadDeletions := s.messagesDeleted > 0
-			commitOK := true
-
-			// Phase 1: Collect messages to expunge under a read lock.
-			var messagesToExpunge []db.POP3Message
-			var mailboxID int64
-			acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
-			if !acquired {
-				s.WarnLog("failed to acquire read lock at QUIT, cannot expunge deleted messages")
-				if hadDeletions {
-					commitOK = false
-				}
-			} else {
-				mailboxID = s.inboxMailboxID
-				for i, deleted := range s.deleted {
-					if deleted && i < len(s.messages) {
-						messagesToExpunge = append(messagesToExpunge, s.messages[i])
-					}
-				}
-				release()
-			}
-
-			// Phase 2: Perform database operations outside the lock.
-			//
-			// Note: the local body cache is deliberately NOT purged here. Content is
-			// deduplicated by hash, so the same cache entry may still back other
-			// messages (same account, another mailbox, or another recipient), and a
-			// purge would also run before the expunge is known to have committed.
-			// Stale entries are reclaimed by the cache's own eviction. (review R3)
-			var expungeUIDs []imap.UID
-			for _, msg := range messagesToExpunge {
-				s.DebugLog("will expunge message", "uid", msg.UID)
-				expungeUIDs = append(expungeUIDs, msg.UID)
-			}
-
-			if len(expungeUIDs) > 0 {
-				s.DebugLog("expunging messages", "count", len(expungeUIDs), "mailbox_id", mailboxID, "uids", expungeUIDs)
-				_, err = s.server.rdb.ExpungeMessageUIDsWithRetry(ctx, mailboxID, expungeUIDs...)
-				if err != nil {
-					commitOK = false
-					s.WarnLog("error expunging messages at QUIT", "mailbox_id", mailboxID, "error", err)
-				} else {
-					s.DebugLog("successfully expunged messages", "count", len(expungeUIDs), "mailbox_id", mailboxID)
-					// Track for session summary
-					s.messagesExpunged = len(expungeUIDs)
-				}
-			} else {
-				s.DebugLog("no messages to expunge", "mailbox_id", mailboxID)
-			}
-
-			userAddress = nil
-
-			// RFC 1939 §6: a failed UPDATE must be reported so the client knows the
-			// requested deletions were not applied.
-			if !commitOK {
-				writer.WriteString("-ERR [SYS/TEMP] some messages could not be removed; maildrop unchanged\r\n")
-				writer.Flush()
-				recordMetrics("failure")
-				return
-			}
-
-			writer.WriteString("+OK Goodbye\r\n")
-			writer.Flush()
-
-			recordMetrics("success")
-			// Return and let defer s.Close() handle cleanup
-			return
-
-		case "XCLIENT":
-			// XCLIENT command for Dovecot-style parameter forwarding
-			start := time.Now()
-			recordMetrics := func(status string) {
-				metrics.CommandsTotal.WithLabelValues("pop3", "XCLIENT", status).Inc()
-				metrics.CommandDuration.WithLabelValues("pop3", "XCLIENT").Observe(time.Since(start).Seconds())
-			}
-
-			// XCLIENT rewrites security-relevant identity (client IP, login, etc.),
-			// so it must only be honored pre-authentication and at most once per
-			// session. Post-auth it could rewrite an established session's
-			// attribution; a second one could feed its own client-supplied
-			// proxy-source-ip into the next trust check (M7).
-			if s.authenticated.Load() {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR XCLIENT not allowed after authentication\r\n") {
-					return
-				}
-				continue
-			}
-			if s.xclientApplied {
-				recordMetrics("failure")
-				if s.handleClientError(writer, "-ERR XCLIENT already provided\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Extract the arguments (everything after XCLIENT)
-			args := ""
-			if len(parts) > 1 {
-				args = strings.Join(parts[1:], " ")
-			}
-
-			if s.handleXCLIENT(args, writer) {
-				s.xclientApplied = true
-				recordMetrics("success")
-			} else {
-				recordMetrics("failure")
-			}
-
-		case "LAST":
-			// LAST is an obsolete command from RFC 1081 (the original POP3),
-			// removed in RFC 1939. Some legacy clients still probe for it.
-			// Reject it like any unsupported command so the client falls back
-			// to UIDL/STAT, but log at debug level since it is a known
-			// obsolete command rather than garbage/probing traffic.
-			metrics.CommandsTotal.WithLabelValues("pop3", "LAST", "failure").Inc()
-			writer.WriteString("-ERR LAST is obsolete (RFC 1939)\r\n")
-			s.DebugLog("rejected obsolete command", "command", cmd)
-
-		default:
-			metrics.CommandsTotal.WithLabelValues("pop3", "UNKNOWN", "failure").Inc()
-			fmt.Fprintf(writer, "-ERR Unknown command: %s\r\n", cmd)
-			s.WarnLog("unknown command", "command", cmd, "line", helpers.MaskSensitive(line, cmd, "PASS", "AUTH"))
+			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
+			return 0, errAuthFailed
 		}
+		authSuccess = true
+	}
 
-		// Flush response and check for timeout
-		if err := writer.Flush(); err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				s.WarnLog("command timeout", "command", cmd, "timeout", s.server.commandTimeout)
+	// Record successful attempt
+	if s.server.authLimiter != nil {
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, userAddress.FullAddress(), true)
+	}
 
-				// Track timeout event in metrics
-				metrics.CommandTimeoutsTotal.WithLabelValues("pop3", cmd).Inc()
+	// Ensure default mailboxes exist
+	if err := s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID); err != nil {
+		s.DebugLog("error creating default mailboxes", "error", err)
+		return 0, errTempUnavailable
+	}
 
-				// Try to send error message if possible
-				(*s.conn).SetDeadline(time.Now().Add(5 * time.Second)) // Brief window to send error
-				writer.WriteString(fmt.Sprintf("-ERR Command %s exceeded timeout\r\n", cmd))
-				writer.Flush()
-				return
-			}
-			s.DebugLog("error flushing response", "command", cmd, "error", err)
-			return
+	// Get INBOX mailbox ID
+	readCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
+	inboxMailboxID, err := s.server.rdb.GetMailboxByNameWithRetry(readCtx, accountID, consts.MailboxInbox)
+	if err != nil {
+		s.DebugLog("error getting inbox", "error", err)
+		return 0, errTempUnavailable
+	}
+
+	// Setup session state
+	s.mutex.Lock()
+	s.inboxMailboxID = inboxMailboxID.ID
+	s.User = server.NewUser(*userAddress, accountID)
+	s.deleted = make(map[int]bool)
+	s.useMasterDB.Store(true)
+	s.mutex.Unlock()
+
+	s.server.authenticatedConnections.Add(1)
+
+	if masterAuthUsed {
+		s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master")
+	}
+
+	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
+	s.authenticated.Store(true)
+
+	// Register connection
+	s.registerConnection(userAddress.FullAddress())
+	s.startTerminationPoller()
+
+	return accountID, nil
+}
+
+func (s *POP3Session) Login(ctx context.Context, username, password string) error {
+	_, err := s.authenticateUser(ctx, "", username, password, false)
+	return err
+}
+
+func (s *POP3Session) AuthenticatePlain(ctx context.Context, identity, username, password string) error {
+	_, err := s.authenticateUser(ctx, identity, username, password, true)
+	return err
+}
+
+func (s *POP3Session) AuthenticateMechanisms() []string {
+	return []string{"PLAIN"}
+}
+
+func (s *POP3Session) Stat(ctx context.Context) (int, int64, error) {
+	if err := s.loadMessagesIfNeeded(ctx); err != nil {
+		return 0, 0, err
+	}
+
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	count, size := computeMaildropStats(s.messages, s.deleted)
+	return count, size, nil
+}
+
+func (s *POP3Session) List(ctx context.Context, msg int) ([]pop3.MessageInfo, error) {
+	if err := s.loadMessagesIfNeeded(ctx); err != nil {
+		return nil, err
+	}
+
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	if msg > 0 {
+		if msg > len(s.messages) || s.deleted[msg-1] {
+			return nil, errNoSuchMessage
 		}
+		return []pop3.MessageInfo{
+			{Num: msg, Size: int64(s.messages[msg-1].Size)},
+		}, nil
+	}
 
-		// Clear deadline after successful command completion
-		(*s.conn).SetDeadline(time.Time{})
+	var infos []pop3.MessageInfo
+	for i, m := range s.messages {
+		if !s.deleted[i] {
+			infos = append(infos, pop3.MessageInfo{
+				Num:  i + 1,
+				Size: int64(m.Size),
+			})
+		}
+	}
+	return infos, nil
+}
+
+func (s *POP3Session) Uidl(ctx context.Context, msg int) ([]pop3.MessageUidl, error) {
+	if err := s.loadMessagesIfNeeded(ctx); err != nil {
+		return nil, err
+	}
+
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	if msg > 0 {
+		if msg > len(s.messages) || s.deleted[msg-1] {
+			return nil, errNoSuchMessage
+		}
+		return []pop3.MessageUidl{
+			{Num: msg, UniqueID: strconv.FormatInt(int64(s.messages[msg-1].UID), 10)},
+		}, nil
+	}
+
+	var uids []pop3.MessageUidl
+	for i, m := range s.messages {
+		if !s.deleted[i] {
+			uids = append(uids, pop3.MessageUidl{
+				Num:      i + 1,
+				UniqueID: strconv.FormatInt(int64(m.UID), 10),
+			})
+		}
+	}
+	return uids, nil
+}
+
+func (s *POP3Session) Retr(ctx context.Context, msgNum int) (io.ReadCloser, error) {
+	if err := s.loadMessagesIfNeeded(ctx); err != nil {
+		return nil, err
+	}
+
+	s.mutex.RLock()
+	if msgNum > len(s.messages) || s.deleted[msgNum-1] {
+		s.mutex.RUnlock()
+		return nil, errNoSuchMessage
+	}
+	msg := s.messages[msgNum-1]
+	s.mutex.RUnlock()
+
+	if msg.UID == 0 {
+		return nil, errNoSuchMessage
+	}
+
+	s.DebugLog("fetching message body", "uid", msg.UID)
+	retrieveStart := time.Now()
+	bodyData, err := s.getMessageBody(&msg)
+	if err != nil {
+		if err == consts.ErrMessageNotAvailable {
+			return nil, errMsgNotAvailable
+		} else if errors.Is(err, errBodyTransientlyUnavailable) {
+			return nil, errBodyRetryLater
+		}
+		var perr *pop3server.Error
+		if errors.As(err, &perr) {
+			return nil, perr
+		}
+		return nil, errTempUnavailable
+	}
+
+	s.DebugLog("retrieved message body", "uid", msg.UID)
+	if len(bodyData) == 0 {
+		s.freeBodyMem(int64(len(bodyData)))
+		return nil, errEmptyBody
+	}
+
+	// Byte metrics use the announced (CRLF-normalized) octet count — the bytes
+	// the client reconstructs — rather than the stored msg.Size, which
+	// undercounts for bare-LF bodies. Dot-stuffing bytes and the .CRLF
+	// terminator (added by the library) are deliberately excluded.
+	announcedOctets := crlfNormalizedLen(bodyData)
+	metrics.MessageThroughput.WithLabelValues("pop3", "retrieved", "success").Inc()
+	metrics.BytesThroughput.WithLabelValues("pop3", "out").Add(float64(announcedOctets))
+	metrics.CriticalOperationDuration.WithLabelValues("pop3_retrieve").Observe(time.Since(retrieveStart).Seconds())
+	if s.User != nil {
+		metrics.TrackDomainCommand("pop3", s.Domain(), "RETR")
+		metrics.TrackUserActivity("pop3", s.FullAddress(), "command", 1)
+		metrics.TrackDomainBytes("pop3", s.Domain(), "out", int64(announcedOctets))
+		metrics.TrackDomainMessage("pop3", s.Domain(), "fetched")
+	}
+
+	s.messagesRetrieved++
+	body := &freeOnCloseBody{
+		Reader: bytes.NewReader(bodyData),
+		free:   func() { s.freeBodyMem(int64(len(bodyData))) },
+	}
+	return pop3server.SizedBody(body, int64(announcedOctets)), nil
+}
+
+// freeOnCloseBody releases the session memory charged for a fetched body once
+// the library has finished streaming it to the client. Without this, every
+// RETR/TOP would accumulate against the session memory budget until QUIT.
+type freeOnCloseBody struct {
+	io.Reader
+	free func()
+	once sync.Once
+}
+
+func (b *freeOnCloseBody) Close() error {
+	b.once.Do(b.free)
+	return nil
+}
+
+// freeBodyMem returns a body-sized allocation to the session memory tracker.
+func (s *POP3Session) freeBodyMem(n int64) {
+	if s.memTracker != nil && n > 0 {
+		s.memTracker.Free(n)
 	}
 }
 
-// replyBenignError answers a well-formed command whose target simply does not
-// apply — e.g. LIST/UIDL/RETR/TOP/DELE addressing a message number past the end
-// of the maildrop, or one already marked deleted — with a plain -ERR. These
-// occur in legitimate client flows (PIPELINING is advertised, and probing
-// message numbers until -ERR is a normal pattern), so unlike handleClientError
-// they carry no anti-bruteforce sleep and do not count toward the
-// too-many-errors disconnect threshold. (review R4)
-func (s *POP3Session) replyBenignError(writer *bufio.Writer, errMsg string) {
-	writer.WriteString(errMsg)
-	writer.Flush()
+func (s *POP3Session) Top(ctx context.Context, msgNum int, lines int) (io.ReadCloser, error) {
+	if err := s.loadMessagesIfNeeded(ctx); err != nil {
+		return nil, err
+	}
+
+	s.mutex.RLock()
+	if msgNum > len(s.messages) || s.deleted[msgNum-1] {
+		s.mutex.RUnlock()
+		return nil, errNoSuchMessage
+	}
+	msg := s.messages[msgNum-1]
+	s.mutex.RUnlock()
+
+	if msg.UID == 0 {
+		return nil, errNoSuchMessage
+	}
+
+	bodyData, err := s.getMessageBody(&msg)
+	if err != nil {
+		if err == consts.ErrMessageNotAvailable {
+			return nil, errMsgNotAvailable
+		} else if errors.Is(err, errBodyTransientlyUnavailable) {
+			return nil, errBodyRetryLater
+		}
+		var perr *pop3server.Error
+		if errors.As(err, &perr) {
+			return nil, perr
+		}
+		return nil, errTempUnavailable
+	}
+
+	truncated := truncateToTop(bodyData, lines)
+	// The memory tracker charge covers the full body fetched by getMessageBody,
+	// so the release on Close must match it, not the truncated slice.
+	return &freeOnCloseBody{
+		Reader: bytes.NewReader(truncated),
+		free:   func() { s.freeBodyMem(int64(len(bodyData))) },
+	}, nil
 }
 
-func (s *POP3Session) handleClientError(writer *bufio.Writer, errMsg string) bool {
-	s.errorsCount++
-	if s.errorsCount > Pop3MaxErrorsAllowed {
-		writer.WriteString("-ERR Too many errors, closing connection\r\n")
-		writer.Flush()
-		return true
-	}
-	// Make a delay to prevent brute force attacks
-	delay := time.Duration(s.errorsCount) * Pop3ErrorDelay
-	time.Sleep(delay)
+func truncateToTop(bodyData []byte, lines int) []byte {
+	messageStr := string(bodyData)
+	messageStr = strings.ReplaceAll(messageStr, "\r\n", "\n")
 
-	// Send the message as composed. In particular, [AUTH] must survive intact:
-	// CAPA advertises AUTH-RESP-CODE (RFC 3206), which promises clients the
-	// [AUTH] response code on credential failures. It was previously rewritten
-	// to [LOGIN-DELAY n] here, so the advertised code was never actually sent —
-	// and LOGIN-DELAY (RFC 2449 §8.1.1) is a login-frequency code for USER/PASS,
-	// not a generic error prefix. (review R1)
-	writer.WriteString(errMsg)
-	writer.Flush()
-	return false
+	headerEndIndex := strings.Index(messageStr, "\n\n")
+	if headerEndIndex == -1 {
+		return []byte(messageStr)
+	}
+
+	headers := messageStr[:headerEndIndex]
+	if lines == 0 {
+		return []byte(headers + "\n\n")
+	}
+
+	bodyStart := headerEndIndex + 2
+	if bodyStart >= len(messageStr) {
+		return []byte(headers + "\n\n")
+	}
+
+	bodyPart := messageStr[bodyStart:]
+	bodyLines := strings.Split(bodyPart, "\n")
+
+	numLines := lines
+	if numLines > len(bodyLines) {
+		numLines = len(bodyLines)
+	}
+
+	selectedLines := bodyLines[:numLines]
+	bodySnippet := strings.Join(selectedLines, "\n")
+
+	return []byte(headers + "\n\n" + bodySnippet)
+}
+
+func (s *POP3Session) Dele(ctx context.Context, msg int) error {
+	if err := s.loadMessagesIfNeeded(ctx); err != nil {
+		return err
+	}
+
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if msg < 1 || msg > len(s.messages) {
+		return errNoSuchMessage
+	}
+	if s.deleted[msg-1] {
+		return errMessageDeleted
+	}
+
+	s.deleted[msg-1] = true
+	s.messagesDeleted++
+	metrics.MessageThroughput.WithLabelValues("pop3", "deleted", "success").Inc()
+	return nil
+}
+
+func (s *POP3Session) Rset(ctx context.Context) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	for k := range s.deleted {
+		delete(s.deleted, k)
+	}
+	s.messagesDeleted = 0
+	return nil
+}
+
+func (s *POP3Session) Noop(ctx context.Context) error {
+	return nil
+}
+
+func (s *POP3Session) Quit(ctx context.Context) (int, error) {
+	commitOK := true
+
+	s.mutex.RLock()
+	mailboxID := s.inboxMailboxID
+	var messagesToExpunge []db.POP3Message
+	for i, deleted := range s.deleted {
+		if deleted && i < len(s.messages) {
+			messagesToExpunge = append(messagesToExpunge, s.messages[i])
+		}
+	}
+	s.mutex.RUnlock()
+
+	var expungeUIDs []imap.UID
+	for _, msg := range messagesToExpunge {
+		s.DebugLog("will expunge message", "uid", msg.UID)
+		expungeUIDs = append(expungeUIDs, msg.UID)
+	}
+
+	if len(expungeUIDs) > 0 {
+		s.DebugLog("expunging messages", "count", len(expungeUIDs), "mailbox_id", mailboxID, "uids", expungeUIDs)
+		_, err := s.server.rdb.ExpungeMessageUIDsWithRetry(ctx, mailboxID, expungeUIDs...)
+		if err != nil {
+			commitOK = false
+			s.WarnLog("error expunging messages at QUIT", "mailbox_id", mailboxID, "error", err)
+		} else {
+			s.DebugLog("successfully expunged messages", "count", len(expungeUIDs), "mailbox_id", mailboxID)
+			s.messagesExpunged = len(expungeUIDs)
+		}
+	}
+
+	if !commitOK {
+		return 0, &pop3server.Error{Code: "SYS/TEMP", Message: "some messages could not be removed; maildrop unchanged"}
+	}
+
+	return s.messagesExpunged, nil
+}
+
+func (s *POP3Session) SetLanguage(ctx context.Context, lang string) (string, error) {
+	langTag := strings.ToLower(lang)
+	if langTag != "en" && langTag != "*" && langTag != "i-default" {
+		return "", &pop3server.Error{Message: "Unsupported language"}
+	}
+
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if langTag == "i-default" {
+		s.language = "i-default"
+	} else {
+		s.language = "en"
+	}
+	return s.language, nil
+}
+
+func (s *POP3Session) ListLanguages(ctx context.Context) ([]pop3server.LanguageInfo, error) {
+	return []pop3server.LanguageInfo{
+		{Tag: "en", Description: "English"},
+		{Tag: "i-default", Description: "Default"},
+	}, nil
+}
+
+func (s *POP3Session) EnableUTF8(ctx context.Context) error {
+	s.utf8Mode.Store(true)
+	s.DebugLog("utf8 mode enabled")
+	return nil
 }
 
 func (s *POP3Session) closeWithoutLock() error {
@@ -2417,7 +757,9 @@ func (s *POP3Session) closeWithoutLock() error {
 	// Prometheus metrics - connection closed
 	metrics.ConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Dec()
 
-	(*s.conn).Close()
+	if s.conn != nil {
+		s.conn.Close()
+	}
 
 	// Remove session from active tracking
 	s.server.removeSession(s)
@@ -2510,7 +852,8 @@ func (s *POP3Session) getMessageBody(msg *db.POP3Message) ([]byte, error) {
 	// metadata size, so this bounds the single allocation. (security-audit M13)
 	if s.memTracker != nil && msg.Size > 0 && !s.memTracker.CanAllocate(int64(msg.Size)) {
 		metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
-		return nil, fmt.Errorf("session memory limit exceeded: message size %d bytes exceeds available budget", msg.Size)
+		s.WarnLog("session memory limit exceeded", "uid", msg.UID, "size", msg.Size)
+		return nil, errBodyTooBig
 	}
 
 	data, err := s.loadMessageBody(msg)
@@ -2522,7 +865,8 @@ func (s *POP3Session) getMessageBody(msg *db.POP3Message) ([]byte, error) {
 	if s.memTracker != nil {
 		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
 			metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
-			return nil, fmt.Errorf("session memory limit exceeded: %v", allocErr)
+			s.WarnLog("session memory limit exceeded", "uid", msg.UID, "size", len(data), "error", allocErr)
+			return nil, errBodyTooBig
 		}
 	}
 	return data, nil
@@ -2723,7 +1067,7 @@ func (s *POP3Session) registerConnection(email string) {
 		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString((*s.conn).RemoteAddr())
+		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "POP3", clientAddr); err != nil {
 			s.InfoLog("rejected connection registration", "error", err)
@@ -2739,7 +1083,7 @@ func (s *POP3Session) unregisterConnection() {
 		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString((*s.conn).RemoteAddr())
+		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
 
 		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "POP3", clientAddr); err != nil {
 			s.DebugLog("failed to unregister connection", "error", err)
@@ -2764,7 +1108,7 @@ func (s *POP3Session) startTerminationPoller() {
 		case <-kickChan:
 			// Kick notification received - close connection
 			s.InfoLog("connection kicked, disconnecting user")
-			(*s.conn).Close()
+			s.conn.Close()
 		case <-s.ctx.Done():
 			// Session ended normally
 		}
@@ -2788,65 +1132,4 @@ func crlfNormalizedLen(body []byte) int {
 		}
 	}
 	return n
-}
-
-// writeDotStuffedBody streams a message body to w as a CRLF-normalized,
-// dot-stuffed POP3 payload (RFC 1939 §3), WITHOUT the trailing terminator. It
-// splits on LF, strips a trailing CR from each line, and byte-stuffs any leading
-// '.'. Writing straight into the buffered writer keeps peak memory at O(buffer
-// size) instead of allocating the whole stuffed message plus a concatenation
-// copy — important when many sessions RETR large messages concurrently. Because
-// it normalizes bare-LF (common in imported/maildir mail) it also prevents a
-// lone "." line from being read as the end-of-message terminator. Write errors
-// are recorded (stickily) by the bufio writer and surfaced at the next Flush,
-// matching how the surrounding command handlers treat writes.
-func writeDotStuffedBody(w *bufio.Writer, body []byte) {
-	for i := 0; i < len(body); {
-		j := bytes.IndexByte(body[i:], '\n')
-		terminated := j >= 0
-		var line []byte
-		if terminated {
-			line = body[i : i+j]
-			i += j + 1
-		} else {
-			line = body[i:]
-			i = len(body)
-		}
-		// Strip a trailing CR so an existing CRLF pair is not doubled on re-emit.
-		if n := len(line); n > 0 && line[n-1] == '\r' {
-			line = line[:n-1]
-		}
-		if len(line) > 0 && line[0] == '.' {
-			_ = w.WriteByte('.')
-		}
-		_, _ = w.Write(line)
-		if terminated {
-			_, _ = w.WriteString("\r\n")
-		}
-	}
-}
-
-// dotStuffPOP3 byte-stuffs any line beginning with the termination octet '.'
-// per RFC 1939 §3 and normalizes line endings to CRLF. It splits on LF (not
-// CRLF) and strips a trailing CR from each line, so stuffing is applied
-// correctly even when the stored body uses bare-LF or mixed endings — a
-// missing stuff on a bare-LF "." line would let a client read that line as the
-// end-of-message terminator and truncate the message.
-func dotStuffPOP3(data string) string {
-	var result strings.Builder
-	result.Grow(len(data) + 64) // Pre-allocate with some buffer for stuffing
-
-	lines := strings.Split(data, "\n")
-	for i, line := range lines {
-		line = strings.TrimSuffix(line, "\r")
-		if strings.HasPrefix(line, ".") {
-			result.WriteString(".")
-		}
-		result.WriteString(line)
-		if i < len(lines)-1 {
-			result.WriteString("\r\n")
-		}
-	}
-
-	return result.String()
 }

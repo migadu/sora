@@ -7,8 +7,10 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/migadu/sora/logger"
@@ -22,6 +24,9 @@ import (
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/idgen"
 	"github.com/migadu/sora/server/proxy"
+
+	"github.com/migadu/go-pop3/pop3"
+	"github.com/migadu/go-pop3/pop3server"
 )
 
 type POP3ProxyServer struct {
@@ -78,6 +83,10 @@ type POP3ProxyServer struct {
 
 	// Startup throttle to prevent thundering herd on restart
 	startupThrottleUntil time.Time
+
+	// The library server is rebuilt (for new connections only) when runtime
+	// settings change on SIGHUP; existing connections keep their snapshot.
+	pop3libServer atomic.Pointer[pop3server.Server]
 }
 
 // maskingWriter wraps an io.Writer to mask sensitive information in POP3 commands
@@ -336,7 +345,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		logger.Info("POP3 Proxy: Lookup cache disabled", "name", options.Name)
 	}
 
-	server := &POP3ProxyServer{
+	srv := &POP3ProxyServer{
 		name:                       options.Name,
 		hostname:                   hostname,
 		addr:                       addr,
@@ -385,7 +394,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 			clientAuth = tls.RequireAndVerifyClientCert
 		}
 
-		server.tlsConfig = &tls.Config{
+		srv.tlsConfig = &tls.Config{
 			Certificates:             []tls.Certificate{cert},
 			MinVersion:               tls.VersionTLS12,
 			ClientAuth:               clientAuth,
@@ -396,14 +405,98 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		}
 	} else if options.TLS && options.TLSConfig != nil {
 		// Scenario 2: Global TLS manager
-		server.tlsConfig = options.TLSConfig
+		srv.tlsConfig = options.TLSConfig
 	} else if options.TLS {
 		// TLS enabled but no cert files and no global TLS config provided
 		serverCancel()
 		return nil, fmt.Errorf("TLS enabled for POP3 proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", options.Name)
 	}
 
-	return server, nil
+	srv.pop3libServer.Store(srv.buildLibServer())
+
+	return srv, nil
+}
+
+// buildLibServer constructs the go-pop3 protocol server from the current
+// runtime settings. It is called at startup and again from ReloadConfig so
+// SIGHUP-reloaded settings apply to new connections (existing connections keep
+// the snapshot they were accepted with).
+func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
+	// Build capabilities
+	var caps []pop3.Capability
+	caps = append(caps, pop3.Capability{Name: "AUTH-RESP-CODE"})
+	caps = append(caps, pop3.Capability{Name: "IMPLEMENTATION", Params: []string{"Sora-POP3-Proxy"}})
+
+	maxErrors := s.maxAuthErrors
+	if maxErrors <= 0 {
+		maxErrors = 10
+	}
+
+	opts := pop3server.Options{
+		TLSConfig:              s.tlsConfig,
+		IdleTimeout:            s.commandTimeout,
+		AuthIdleTimeout:        s.authIdleTimeout,
+		AbsoluteSessionTimeout: s.absoluteSessionTimeout,
+		CommandTimeout:         s.commandTimeout,
+		InsecureAuth:           s.insecureAuth,
+		MaxLineLength:          1024,
+		MaxErrors:              maxErrors,
+		StrictSessionErrors:    true, // Session errors are *pop3server.Error; mask anything else
+		Caps:                   caps,
+		Greeting:               "Sora-POP3-Proxy ready",
+		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
+			netConn := c.NetConn()
+			var proxyInfo *server.ProxyProtocolInfo
+			currentConn := netConn
+			for currentConn != nil {
+				if proxyConn, ok := currentConn.(*proxyProtocolConn); ok {
+					proxyInfo = proxyConn.GetProxyInfo()
+					break
+				}
+				if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
+					currentConn = wrapper.Unwrap()
+				} else {
+					break
+				}
+			}
+
+			var releaseConn func()
+			var err error
+			if s.limiter != nil {
+				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), "")
+				if err != nil {
+					// Silent close, no banner: matches the previous accept-loop
+					// rejection so limited peers learn nothing.
+					return nil, fmt.Errorf("%w: %w", pop3server.ErrSilentReject, err)
+				}
+			}
+
+			sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
+
+			session := &POP3ProxySession{
+				server:      s,
+				clientConn:  netConn,
+				ctx:         sessionCtx,
+				cancel:      sessionCancel,
+				releaseConn: releaseConn,
+				proxyInfo:   proxyInfo,
+				sessionID:   idgen.New(),
+				pop3Conn:    c,
+				startTime:   time.Now(),
+			}
+
+			if proxyInfo != nil && proxyInfo.SrcIP != "" {
+				session.RemoteIP = proxyInfo.SrcIP
+			} else {
+				session.RemoteIP = server.GetAddrString(netConn.RemoteAddr())
+			}
+
+			s.addSession(session)
+			return session, nil
+		},
+	}
+
+	return pop3server.New(opts)
 }
 
 func (s *POP3ProxyServer) Start() error {
@@ -495,17 +588,6 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 			continue // Continue accepting other connections
 		}
 
-		// Check connection limits before processing
-		var releaseConn func()
-		if s.limiter != nil {
-			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), "")
-			if err != nil {
-				logger.Debug("POP3 Proxy: Connection rejected", "proxy", s.name, "error", err)
-				conn.Close()
-				continue // Try to accept the next connection
-			}
-		}
-
 		// Read PROXY protocol header if enabled
 		var proxyInfo *server.ProxyProtocolInfo
 		var wrappedConn net.Conn
@@ -515,70 +597,27 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 			if err != nil {
 				logger.Error("PROXY protocol error", "proxy", s.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
 				conn.Close()
-				if releaseConn != nil {
-					releaseConn()
-				}
 				continue // Try to accept the next connection
 			}
-			conn = wrappedConn // Use wrapped connection that has buffered reader
-		}
-
-		// Create a new context for this session that inherits from app context
-		sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
-
-		session := &POP3ProxySession{
-			server:      s,
-			clientConn:  conn,
-			ctx:         sessionCtx,
-			cancel:      sessionCancel,
-			releaseConn: releaseConn, // Set cleanup function on session
-			proxyInfo:   proxyInfo,
-			// Generate the session id once, up front, so every log line carries it.
-			// It's also forwarded to the backend (XCLIENT), logged there as proxy_session.
-			sessionID: idgen.New(),
-		}
-
-		// Use real client IP from PROXY protocol if available
-		if proxyInfo != nil && proxyInfo.SrcIP != "" {
-			session.RemoteIP = proxyInfo.SrcIP
-		} else {
-			session.RemoteIP = server.GetAddrString(conn.RemoteAddr())
-		}
-		if s.debug {
-			logger.Debug("POP3 proxy: New connection", "proxy", s.name, "remote", session.RemoteIP)
+			conn = &proxyProtocolConn{
+				Conn:      wrappedConn,
+				proxyInfo: proxyInfo,
+			}
 		}
 
 		// Track proxy connection
 		metrics.ConnectionsTotal.WithLabelValues("pop3_proxy", s.name, s.hostname).Inc()
 		metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy", s.name, s.hostname).Inc()
 
-		// Track session for graceful shutdown
-		s.addSession(session)
-
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-
-			// CRITICAL: Panic recovery MUST call removeSession to prevent leak
 			defer func() {
 				if r := recover(); r != nil {
-					session.DebugLog("session panic recovered", "panic", r)
-					// Clean up session from active tracking
-					s.removeSession(session)
-					// Decrement metrics
-					metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy", s.name, s.hostname).Dec()
-					// Close connection
-					conn.Close()
-					// Ensure connection limiter is released on panic
-					if releaseConn != nil {
-						releaseConn()
-					}
+					logger.Error("POP3 Proxy: panic in connection handler", "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
-
-			// Note: releaseConn is called in session.close(), which is deferred in handleConnection()
-			// This ensures cleanup happens when the session ends, not when the goroutine exits
-			session.handleConnection()
+			s.pop3libServer.Load().ServeConn(conn)
 		}()
 	}
 }
@@ -799,6 +838,9 @@ func (s *POP3ProxyServer) ReloadConfig(cfg config.ServerConfig) error {
 	}
 
 	if len(reloaded) > 0 {
+		// Rebuild the protocol server so new connections pick up the reloaded
+		// settings; existing connections keep the snapshot they started with.
+		s.pop3libServer.Store(s.buildLibServer())
 		logger.Info("POP3 proxy config reloaded", "name", s.name, "updated", reloaded)
 	}
 	return nil
@@ -807,4 +849,17 @@ func (s *POP3ProxyServer) ReloadConfig(cfg config.ServerConfig) error {
 // GetLimiter returns the connection limiter for testing purposes
 func (s *POP3ProxyServer) GetLimiter() *server.ConnectionLimiter {
 	return s.limiter
+}
+
+type proxyProtocolConn struct {
+	net.Conn
+	proxyInfo *server.ProxyProtocolInfo
+}
+
+func (c *proxyProtocolConn) GetProxyInfo() *server.ProxyProtocolInfo {
+	return c.proxyInfo
+}
+
+func (c *proxyProtocolConn) Unwrap() net.Conn {
+	return c.Conn
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,9 @@ import (
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/migadu/go-pop3/pop3"
+	"github.com/migadu/go-pop3/pop3server"
 )
 
 // getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
@@ -84,7 +88,8 @@ type POP3Server struct {
 
 	// Command timeout and throughput enforcement
 	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
-	commandTimeout         time.Duration
+	commandTimeout         time.Duration // Idle timeout (defaulted to Pop3DefaultIdleTimeout when unset)
+	libCommandTimeout      time.Duration // Per-command execution timeout passed to the library (raw config value, 0 = disabled)
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
 	maxMessageAge          time.Duration // Ephemeral-storage retention (cleanup max_age_restriction); 0 = keep forever. Drives the CAPA EXPIRE value.
@@ -99,6 +104,10 @@ type POP3Server struct {
 	activeSessionsMutex sync.RWMutex
 	activeSessions      map[*POP3Session]struct{}
 	sessionsWg          sync.WaitGroup // Tracks active sessions for graceful drain
+
+	// The library server is rebuilt (for new connections only) when runtime
+	// settings change on SIGHUP; existing connections keep their snapshot.
+	pop3libServer atomic.Pointer[pop3server.Server]
 }
 
 type POP3ServerOptions struct {
@@ -274,6 +283,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		sessionMemoryLimit:     options.SessionMemoryLimit,
 		authIdleTimeout:        options.AuthIdleTimeout,
 		commandTimeout:         commandTimeout,
+		libCommandTimeout:      options.CommandTimeout,
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
 		insecureAuth:           insecureAuth, // Auto-enabled when TLS not configured (warned above)
 		minBytesPerMinute:      options.MinBytesPerMinute,
@@ -366,7 +376,132 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		logger.Debug("POP3: Local connection tracking disabled", "name", name)
 	}
 
+	server.pop3libServer.Store(server.buildLibServer())
+
 	return server, nil
+}
+
+// buildLibServer constructs the go-pop3 protocol server from the current
+// runtime settings. It is called at startup and again from ReloadConfig so
+// SIGHUP-reloaded timeouts apply to new connections (existing connections keep
+// the snapshot they were accepted with).
+func (s *POP3Server) buildLibServer() *pop3server.Server {
+	// Build custom capabilities based on config. Ephemeral-storage retention
+	// drives the CAPA EXPIRE value (RFC 2449 §5.1).
+	var caps []pop3.Capability
+	if s.maxMessageAge <= 0 {
+		caps = append(caps, pop3.Capability{Name: "EXPIRE", Params: []string{"NEVER"}})
+	} else {
+		caps = append(caps, pop3.Capability{Name: "EXPIRE", Params: []string{strconv.Itoa(int(s.maxMessageAge.Hours() / 24))}})
+	}
+	caps = append(caps, pop3.Capability{Name: "AUTH-RESP-CODE"})
+	caps = append(caps, pop3.Capability{Name: "IMPLEMENTATION", Params: []string{"Sora-POP3-Server"}})
+
+	opts := pop3server.Options{
+		TLSConfig:              s.tlsConfig,
+		IdleTimeout:            s.commandTimeout,
+		AuthIdleTimeout:        s.authIdleTimeout,
+		AbsoluteSessionTimeout: s.absoluteSessionTimeout,
+		CommandTimeout:         s.libCommandTimeout,
+		InsecureAuth:           s.insecureAuth,
+		MaxLineLength:          Pop3MaxLineLength,
+		MaxErrors:              Pop3MaxErrorsAllowed,
+		ErrorDelay:             Pop3ErrorDelay,
+		StrictSessionErrors:    true, // Session errors are *pop3server.Error; mask anything else (DB/S3 text must not reach clients)
+		Caps:                   caps,
+		Greeting:               "Sora-POP3-Server ready",
+		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
+			// Connection limiting check
+			netConn := c.NetConn()
+			var proxyInfo *serverPkg.ProxyProtocolInfo
+			currentConn := netConn
+			for currentConn != nil {
+				if proxyConn, ok := currentConn.(*proxyProtocolConn); ok {
+					proxyInfo = proxyConn.GetProxyInfo()
+					break
+				}
+				if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
+					currentConn = wrapper.Unwrap()
+				} else {
+					break
+				}
+			}
+
+			clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
+
+			// Limiter checks. Silent close, no banner: matches the previous
+			// accept-loop rejection so limited peers learn nothing.
+			releaseConn, err := s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), clientIP)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %w", pop3server.ErrSilentReject, err)
+			}
+
+			sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
+			memTracker := serverPkg.NewSessionMemoryTracker(s.sessionMemoryLimit)
+
+			session := &POP3Session{
+				server:      s,
+				conn:        netConn,
+				deleted:     make(map[int]bool),
+				ctx:         sessionCtx,
+				cancel:      sessionCancel,
+				language:    "en",
+				releaseConn: releaseConn,
+				startTime:   time.Now(),
+				memTracker:  memTracker,
+			}
+			session.RemoteIP = clientIP
+			session.ProxyIP = proxyIP
+			session.Protocol = "POP3"
+			session.ServerName = s.name
+			session.Id = idgen.New()
+			session.HostName = s.hostname
+			session.Stats = s
+			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "POP3", session.InfoLog)
+
+			session.DebugLog("new connection")
+			s.addSession(session)
+
+			return session, nil
+		},
+		UnknownCommandHandler: func(ctx context.Context, c *pop3server.Conn, cmd string, args []string) (handled, close bool) {
+			if cmd != "XCLIENT" {
+				return false, false
+			}
+			session, ok := c.Session().(*POP3Session)
+			if !ok {
+				return false, false
+			}
+			// XCLIENT command for Dovecot-style parameter forwarding
+			if session.authenticated.Load() {
+				c.Err("[AUTH] XCLIENT not allowed after authentication")
+				return true, true
+			}
+			if session.xclientApplied {
+				c.Err("[AUTH] XCLIENT already provided")
+				return true, true
+			}
+
+			ok, msg := session.handleXCLIENT(strings.Join(args, " "))
+			if ok {
+				session.xclientApplied = true
+				c.OK(msg)
+			} else {
+				c.Err(msg)
+			}
+			return true, false
+		},
+		OnCommand: func(cmd string, dur time.Duration, err error) {
+			status := "success"
+			if err != nil {
+				status = "failure"
+			}
+			metrics.CommandsTotal.WithLabelValues("pop3", cmd, status).Inc()
+			metrics.CommandDuration.WithLabelValues("pop3", cmd).Observe(dur.Seconds())
+		},
+	}
+
+	return pop3server.New(opts)
 }
 
 func (s *POP3Server) Start(errChan chan error) {
@@ -471,7 +606,7 @@ func (s *POP3Server) Start(errChan chan error) {
 			// Check if this is a PROXY protocol error (connection-specific, not fatal)
 			if errors.Is(err, errProxyProtocol) {
 				logger.Debug("POP3: rejecting connection", "name", s.name, "error", err)
-				continue // Continue accepting other connections
+				continue
 			}
 
 			// Check if the error is due to the listener being closed (graceful shutdown)
@@ -486,97 +621,21 @@ func (s *POP3Server) Start(errChan chan error) {
 			}
 		}
 
-		// Extract real client IP and proxy IP from PROXY protocol if available for connection limiting
-		var proxyInfoForLimiting *serverPkg.ProxyProtocolInfo
-		var realClientIP string
-		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
-			proxyInfoForLimiting = proxyConn.GetProxyInfo()
-			if proxyInfoForLimiting != nil && proxyInfoForLimiting.SrcIP != "" {
-				realClientIP = proxyInfoForLimiting.SrcIP
-			}
-		}
-
-		// Check connection limits with PROXY protocol support
-		releaseConn, err := s.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
-		if err != nil {
-			logger.Debug("POP3: Connection rejected", "name", s.name, "error", err)
-			conn.Close()
-			continue
-		}
-
-		// Create a new context for this session that inherits from app context
-		sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
-
 		s.totalConnections.Add(1)
 
 		// Prometheus metrics - connection established
 		metrics.ConnectionsTotal.WithLabelValues("pop3", s.name, s.hostname).Inc()
 		metrics.ConnectionsCurrent.WithLabelValues("pop3", s.name, s.hostname).Inc()
 
-		// Initialize memory tracker with configured limit
-		memTracker := serverPkg.NewSessionMemoryTracker(s.sessionMemoryLimit)
-
-		session := &POP3Session{
-			server:      s,
-			conn:        &conn,
-			deleted:     make(map[int]bool),
-			ctx:         sessionCtx,
-			cancel:      sessionCancel,
-			language:    "en", // Default language
-			releaseConn: releaseConn,
-			startTime:   time.Now(),
-			memTracker:  memTracker,
-		}
-
-		// Extract real client IP and proxy IP from PROXY protocol if available
-		// Need to unwrap connection layers to get to proxyProtocolConn
-		var proxyInfo *serverPkg.ProxyProtocolInfo
-		currentConn := conn
-		for currentConn != nil {
-			if proxyConn, ok := currentConn.(*proxyProtocolConn); ok {
-				proxyInfo = proxyConn.GetProxyInfo()
-				break
-			}
-			// Try to unwrap the connection
-			if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
-				currentConn = wrapper.Unwrap()
-			} else {
-				break
-			}
-		}
-
-		clientIP, proxyIP := serverPkg.GetConnectionIPs(conn, proxyInfo)
-		session.RemoteIP = clientIP
-		session.ProxyIP = proxyIP
-		session.Protocol = "POP3"
-		session.ServerName = s.name
-		session.Id = idgen.New()
-		session.HostName = s.hostname
-		session.Stats = s
-		session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "POP3", session.InfoLog)
-
-		session.DebugLog("new connection")
-
-		// Track session for graceful shutdown
-		s.addSession(session)
-
-		// Track session in WaitGroup for graceful drain
 		s.sessionsWg.Add(1)
-
 		go func() {
 			defer s.sessionsWg.Done()
-			// Ensure session is always removed from map, even if handleConnection panics
-			// or never completes. This prevents memory leaks in the activeSessions map.
-			defer s.removeSession(session)
-			// Recover from any panic in the session goroutine. Without this, a single
-			// malformed command (e.g. a missing argument) would propagate an unrecovered
-			// panic and crash the entire server process, dropping every connection.
 			defer func() {
 				if r := recover(); r != nil {
-					session.ErrorLog("session panic recovered", "panic", r, "stack", string(debug.Stack()))
+					logger.Error("POP3: panic in connection handler", "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
-			session.handleConnection()
+			s.pop3libServer.Load().ServeConn(conn)
 		}()
 	}
 }
@@ -655,8 +714,8 @@ func (s *POP3Server) sendGracefulShutdownMessage() {
 
 	// Send shutdown message to all active connections
 	for _, session := range activeSessions {
-		if session.conn != nil && *session.conn != nil {
-			writer := bufio.NewWriter(*session.conn)
+		if session.conn != nil {
+			writer := bufio.NewWriter(session.conn)
 			// POP3 doesn't have a specific "server shutting down" response code
 			// But we can send a polite message before disconnection
 			writer.WriteString("-ERR Server shutting down, please reconnect\r\n")
@@ -669,8 +728,8 @@ func (s *POP3Server) sendGracefulShutdownMessage() {
 
 	// Close connections to unblock any sessions blocked on reads
 	for _, session := range activeSessions {
-		if session.conn != nil && *session.conn != nil {
-			(*session.conn).Close()
+		if session.conn != nil {
+			session.conn.Close()
 		}
 	}
 
@@ -784,6 +843,7 @@ func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 
 	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != s.commandTimeout {
 		s.commandTimeout = timeout
+		s.libCommandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
 	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != s.absoluteSessionTimeout {
@@ -814,6 +874,9 @@ func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 	}
 
 	if len(reloaded) > 0 {
+		// Rebuild the protocol server so new connections pick up the reloaded
+		// settings; existing connections keep the snapshot they started with.
+		s.pop3libServer.Store(s.buildLibServer())
 		logger.Info("POP3 config reloaded", "name", s.name, "updated", reloaded)
 	}
 	return nil

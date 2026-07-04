@@ -14,11 +14,22 @@ import (
 	"time"
 
 	"github.com/migadu/sora/consts"
-	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
+
+	"github.com/migadu/go-pop3/pop3"
+	"github.com/migadu/go-pop3/pop3server"
+)
+
+// Compile-time checks: the library discovers SASL support via type assertion,
+// so a signature drift would silently disable AUTH instead of failing the build.
+var (
+	_ pop3server.Session     = (*POP3ProxySession)(nil)
+	_ pop3server.SessionSASL = (*POP3ProxySession)(nil)
+	_ pop3server.SessionLang = (*POP3ProxySession)(nil)
+	_ pop3server.SessionUTF8 = (*POP3ProxySession)(nil)
 )
 
 type POP3ProxySession struct {
@@ -46,425 +57,8 @@ type POP3ProxySession struct {
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
 	submittedUsername     string // Username exactly as submitted by the client (lookup-cache key)
 	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
-}
-
-func (s *POP3ProxySession) handleConnection() {
-	defer s.cancel()
-	defer s.close()
-
-	// Ensure connections are closed when context is cancelled (e.g. by absolute timeout or server shutdown)
-	// This serves as a fail-safe to unblock reads that don't inherently respect context cancellation
-	go func() {
-		<-s.ctx.Done()
-		// Force close connection to unblock any pending Read calls
-		// Use mutex to ensure safe access consistent with close()
-		s.mutex.Lock()
-		if s.clientConn != nil {
-			s.clientConn.Close()
-		}
-		s.mutex.Unlock()
-	}()
-
-	s.startTime = time.Now()
-
-	// Enforce absolute session timeout to prevent hung sessions from leaking
-	if s.server.absoluteSessionTimeout > 0 {
-		timeout := time.AfterFunc(s.server.absoluteSessionTimeout, func() {
-			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.server.absoluteSessionTimeout)
-			s.cancel() // Force cancel context to unblock any stuck I/O
-		})
-		defer timeout.Stop()
-	}
-
-	// Log connection at INFO level
-	s.InfoLog("connected")
-
-	// Perform TLS handshake if this is a TLS connection
-	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
-		if err := tlsConn.PerformHandshake(); err != nil {
-			s.WarnLog("TLS handshake failed", "error", err)
-			return
-		}
-	}
-
-	// Send initial greeting to client
-	writer := bufio.NewWriter(s.clientConn)
-	writer.WriteString("+OK POP3 proxy ready\r\n")
-	writer.Flush()
-
-	reader := bufio.NewReader(s.clientConn)
-	// Retain the pre-auth reader so the relay can keep reading from it. A client
-	// may pipeline its first transaction command in the same TCP segment as
-	// PASS/AUTH; that command lands in this reader's buffer and would be lost if
-	// the relay created a fresh reader over the raw connection (H6).
-	s.clientReader = reader
-
-	for {
-		// Set a read deadline for the client command to prevent idle connections.
-		if s.server.authIdleTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
-				s.WarnLog("Failed to set read deadline", "error", err)
-				return
-			}
-		}
-
-		line, err := server.ReadBoundedLine(reader, 1024) // POP3 line limit per RFC 1939
-		if err != nil {
-			if err == server.ErrLineTooLong {
-				writer.WriteString("-ERR Line too long\r\n")
-				writer.Flush()
-				s.WarnLog("line too long, closing connection")
-				return
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				s.DebugLog("Client timed out waiting for command")
-				writer.WriteString("-ERR Idle timeout, closing connection\r\n")
-				writer.Flush()
-				return
-			}
-			if err == io.EOF {
-				s.DebugLog("Client dropped connection")
-			} else {
-				s.WarnLog("Client read error", "error", err)
-			}
-			return
-		}
-
-		line = strings.TrimSpace(line)
-
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
-			continue // Ignore empty lines
-		}
-		cmd := strings.ToUpper(parts[0])
-
-		// Log the client command, masking credentials (PASS/AUTH) so a cleartext
-		// password never reaches the debug log.
-		s.DebugLog("client command", "line", helpers.MaskSensitive(line, cmd, "PASS", "AUTH"))
-
-		switch cmd {
-		case "CAPA":
-			// Return proxy capabilities before authentication. Auth mechanisms
-			// (USER/PASS and SASL PLAIN) are only advertised when they can actually
-			// be used — over TLS, or when insecure_auth permits cleartext auth.
-			// Advertising them on a plaintext connection where auth is refused
-			// misleads clients (RFC 2449 §6.3 / RFC 8314) and, for SASL, previously
-			// paired with the proxy actually accepting those credentials (H1).
-			// Advertise the transaction-phase capabilities the backend honors, so a
-			// client that caches this pre-auth CAPA does not wrongly conclude TOP/
-			// UIDL/UTF8/LANG are unavailable and degrade its behavior. EXPIRE is
-			// omitted because the proxy does not know the backend's retention.
-			authAllowed := s.server.insecureAuth || server.ConnIsTLS(s.clientConn)
-			writer.WriteString("+OK Capability list follows\r\n")
-			writer.WriteString("TOP\r\n")
-			writer.WriteString("UIDL\r\n")
-			writer.WriteString("PIPELINING\r\n")
-			if authAllowed {
-				writer.WriteString("USER\r\n")
-				writer.WriteString("SASL PLAIN\r\n")
-			}
-			writer.WriteString("RESP-CODES\r\n")
-			writer.WriteString("AUTH-RESP-CODE\r\n")
-			writer.WriteString("UTF8\r\n")
-			writer.WriteString("LANG\r\n")
-			writer.WriteString("IMPLEMENTATION Sora-POP3-Proxy\r\n")
-			writer.WriteString(".\r\n")
-			writer.Flush()
-
-		case "USER":
-			if len(parts) < 2 {
-				if s.handleAuthError(writer, "-ERR Missing username\r\n") {
-					return
-				}
-				continue
-			}
-			// Remove quotes if present for compatibility
-			username := server.UnquoteString(parts[1])
-			// Reject control characters (NUL/CR/LF/…). A NUL in particular would add
-			// an extra field to the authz\0authn\0pass master-SASL frame the proxy
-			// builds to authenticate to the backend, desyncing the backend's parse
-			// (L9).
-			if strings.ContainsFunc(username, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
-				if s.handleAuthError(writer, "-ERR Invalid username\r\n") {
-					return
-				}
-				continue
-			}
-			s.username = username
-			writer.WriteString("+OK User accepted\r\n")
-			writer.Flush()
-
-		case "PASS":
-			// Check insecure_auth: reject PASS over non-TLS when insecure_auth is false
-			if !s.server.insecureAuth && !server.ConnIsTLS(s.clientConn) {
-				if s.handleAuthError(writer, "-ERR Authentication requires TLS connection\r\n") {
-					return
-				}
-				continue
-			}
-			authStart := time.Now()
-			if s.username == "" {
-				if s.handleAuthError(writer, "-ERR Must provide USER first\r\n") {
-					return
-				}
-				continue
-			}
-			if len(parts) < 2 {
-				if s.handleAuthError(writer, "-ERR Missing password\r\n") {
-					return
-				}
-				continue
-			}
-			// Remove quotes if present for compatibility
-			password := server.UnquoteString(parts[1])
-
-			if err := s.authenticate(s.username, password); err != nil {
-				// Rate limiter blocked the attempt: reply with the same line as
-				// a bad password (indistinguishable, cf. backend M14) but drop
-				// the connection instead of letting the client keep hammering.
-				var rateLimitErr *server.RateLimitError
-				if errors.As(err, &rateLimitErr) {
-					writer.WriteString("-ERR Authentication failed\r\n")
-					writer.Flush()
-					s.InfoLog("dropping connection - rate limited")
-					return
-				}
-				// Check if error is due to server shutdown or temporary unavailability
-				if server.IsTemporaryAuthFailure(err) {
-					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-				} else if server.IsBackendError(err) {
-					// Backend connection or authentication issues
-					writer.WriteString("-ERR [SYS/TEMP] Backend server temporarily unavailable\r\n")
-				} else {
-					// Actual authentication failure (wrong password, etc.)
-					writer.WriteString("-ERR Authentication failed\r\n")
-				}
-				writer.Flush()
-				s.DebugLog("Authentication failed", "error", err)
-				continue
-			}
-
-			// Register connection BEFORE confirming success: the tracker only
-			// errors when a per-user or per-user-per-IP connection limit is
-			// exceeded, and once "+OK" is on the wire a rejection can no longer
-			// be signalled to the client.
-			if err := s.registerConnection(); err != nil {
-				s.InfoLog("connection rejected by connection tracker", "error", err)
-				// Mark as rejected so close() does not decrement a slot this
-				// session never held (which would erode the account's limit).
-				s.connRejected = true
-				writer.WriteString("-ERR [SYS/TEMP] Too many connections\r\n")
-				writer.Flush()
-				return
-			}
-
-			writer.WriteString("+OK Authentication successful\r\n")
-			writer.Flush()
-
-			// Log authentication at INFO level with all required fields
-			duration := time.Since(authStart)
-			s.InfoLog("authentication complete",
-				"address", s.username,
-				"backend", s.serverAddr,
-				"routing", s.routingMethod,
-				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-
-			// Clear the read deadline before moving to the proxying phase, which sets its own.
-			if s.server.authIdleTimeout > 0 {
-				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
-					s.WarnLog("Failed to clear read deadline", "error", err)
-				}
-			}
-
-			// Start proxying
-			s.startProxying()
-			return
-
-		case "AUTH":
-			// Check insecure_auth: reject SASL AUTH over non-TLS when insecure_auth
-			// is false. SASL PLAIN carries cleartext-equivalent credentials, so it
-			// must not be accepted before TLS (RFC 8314). Mirrors the PASS gate above
-			// and the backend AUTH gate; without this the proxy accepted plaintext
-			// credentials that PASS would have refused.
-			if !s.server.insecureAuth && !server.ConnIsTLS(s.clientConn) {
-				if s.handleAuthError(writer, "-ERR Authentication requires TLS connection\r\n") {
-					return
-				}
-				continue
-			}
-			authStart := time.Now()
-			if len(parts) < 2 {
-				if s.handleAuthError(writer, "-ERR Missing authentication mechanism\r\n") {
-					return
-				}
-				continue
-			}
-
-			// Remove quotes from mechanism if present for compatibility
-			mechanism := server.UnquoteString(parts[1])
-			mechanism = strings.ToUpper(mechanism)
-			if mechanism != "PLAIN" {
-				if s.handleAuthError(writer, "-ERR Unsupported authentication mechanism\r\n") {
-					return
-				}
-				continue
-			}
-
-			var authData string
-			if len(parts) > 2 {
-				// Initial response provided - remove quotes if present
-				authData = server.UnquoteString(parts[2])
-			} else {
-				// Request the authentication data
-				writer.WriteString("+ \r\n")
-				writer.Flush()
-
-				// Read the authentication data
-				authLine, err := server.ReadBoundedLine(reader, 1024) // bound pre-auth SASL response
-				if err != nil {
-					writer.WriteString("-ERR Authentication failed\r\n")
-					writer.Flush()
-					continue
-				}
-				authData = strings.TrimSpace(authLine)
-				// Remove quotes if present in continuation response
-				authData = server.UnquoteString(authData)
-			}
-
-			// Check for cancellation
-			if authData == "*" {
-				writer.WriteString("-ERR Authentication cancelled\r\n")
-				writer.Flush()
-				continue
-			}
-
-			// Decode base64. RFC 4959 §3: a lone "=" is a present-but-empty initial
-			// response — treat it as empty rather than failing to decode "=".
-			decoded := []byte{}
-			if authData != "=" {
-				var derr error
-				decoded, derr = base64.StdEncoding.DecodeString(authData)
-				if derr != nil {
-					if s.handleAuthError(writer, "-ERR Invalid authentication data\r\n") {
-						return
-					}
-					continue
-				}
-			}
-
-			// Parse SASL PLAIN format: [authz-id] \0 authn-id \0 password
-			authParts := strings.Split(string(decoded), "\x00")
-			if len(authParts) != 3 {
-				if s.handleAuthError(writer, "-ERR Invalid authentication format\r\n") {
-					return
-				}
-				continue
-			}
-
-			authzID := authParts[0]
-			authnID := authParts[1]
-			password := authParts[2]
-
-			// For proxy, we expect authzID to be empty or same as authnID
-			// Authorization identity is handled by master SASL on the backend
-			if authzID != "" && authzID != authnID {
-				if s.handleAuthError(writer, "-ERR Authorization identity not supported on proxy (configure master SASL on backend)\r\n") {
-					return
-				}
-				continue
-			}
-
-			if err := s.authenticate(authnID, password); err != nil {
-				// Rate limiter blocked the attempt: reply with the same line as
-				// a bad password (indistinguishable, cf. backend M14) but drop
-				// the connection instead of letting the client keep hammering.
-				var rateLimitErr *server.RateLimitError
-				if errors.As(err, &rateLimitErr) {
-					writer.WriteString("-ERR Authentication failed\r\n")
-					writer.Flush()
-					s.InfoLog("dropping connection - rate limited")
-					return
-				}
-				// Check if error is due to server shutdown or temporary unavailability
-				if server.IsTemporaryAuthFailure(err) {
-					writer.WriteString("-ERR [SYS/TEMP] Service temporarily unavailable, please try again later\r\n")
-				} else if server.IsBackendError(err) {
-					// Backend connection or authentication issues
-					s.WarnLog("Backend error during SASL authentication", "error", err)
-					writer.WriteString("-ERR [SYS/TEMP] Backend server temporarily unavailable\r\n")
-				} else {
-					// Actual authentication failure (wrong password, etc.)
-					writer.WriteString("-ERR Authentication failed\r\n")
-				}
-				writer.Flush()
-				s.DebugLog("SASL authentication failed", "error", err)
-				continue
-			}
-
-			// Register connection BEFORE confirming success: the tracker only
-			// errors when a per-user or per-user-per-IP connection limit is
-			// exceeded, and once "+OK" is on the wire a rejection can no longer
-			// be signalled to the client.
-			if err := s.registerConnection(); err != nil {
-				s.InfoLog("connection rejected by connection tracker", "error", err)
-				// Mark as rejected so close() does not decrement a slot this
-				// session never held (which would erode the account's limit).
-				s.connRejected = true
-				writer.WriteString("-ERR [SYS/TEMP] Too many connections\r\n")
-				writer.Flush()
-				return
-			}
-
-			writer.WriteString("+OK Authentication successful\r\n")
-			writer.Flush()
-
-			// Log authentication at INFO level with all required fields
-			duration := time.Since(authStart)
-			s.InfoLog("authenticated via SASL PLAIN",
-				"address", s.username,
-				"backend", s.serverAddr,
-				"routing", s.routingMethod,
-				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-
-			// Clear the read deadline before moving to the proxying phase, which sets its own.
-			if s.server.authIdleTimeout > 0 {
-				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
-					s.WarnLog("Failed to clear read deadline", "error", err)
-				}
-			}
-
-			// Start proxying
-			s.startProxying()
-			return
-
-		case "QUIT":
-			writer.WriteString("+OK Goodbye\r\n")
-			writer.Flush()
-			return
-
-		default:
-			if s.handleAuthError(writer, "-ERR Command not available before authentication\r\n") {
-				return
-			}
-			continue
-		}
-	}
-}
-
-// handleAuthError increments the error count, sends an error response, and
-// returns true if the connection should be dropped.
-func (s *POP3ProxySession) handleAuthError(writer *bufio.Writer, response string) bool {
-	s.errorCount++
-	writer.WriteString(response)
-	writer.Flush()
-	if s.errorCount >= s.server.maxAuthErrors {
-		s.DebugLog("Too many authentication errors, dropping connection")
-		// Send a final error message before closing.
-		writer.WriteString("-ERR Too many invalid commands, closing connection\r\n")
-		writer.Flush()
-		return true
-	}
-	return false
+	closed                bool   // Guards close() against double teardown (guarded by mutex)
+	pop3Conn              *pop3server.Conn
 }
 
 // InfoLog logs a client command with password masking if debug is enabled.
@@ -1305,10 +899,23 @@ func (s *POP3ProxySession) startProxying() {
 	s.DebugLog("Copy goroutines finished - startProxying() returning")
 }
 
-// close closes all connections and unregisters from tracking.
+// close closes all connections and unregisters from tracking. It is idempotent:
+// teardown can be reached both from the library's Session.Close and from error
+// paths during authentication.
 func (s *POP3ProxySession) close() {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
+	if s.closed {
+		return
+	}
+	s.closed = true
+
+	// Cancel the session context so any helper goroutines (activity updater,
+	// context-cancellation watchdog in startProxying) terminate with the session.
+	if s.cancel != nil {
+		s.cancel()
+	}
 
 	// Remove session from active tracking
 	s.server.removeSession(s)
@@ -1588,4 +1195,149 @@ func (s *POP3ProxySession) copyReaderToConnWithDeadline(dst net.Conn, src *bufio
 
 func checkMasterCredential(provided string, actual []byte) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), actual) == 1
+}
+
+// Implement pop3server.Session and related interfaces
+
+func (s *POP3ProxySession) Close() error {
+	s.close()
+	return nil
+}
+
+func (s *POP3ProxySession) Login(ctx context.Context, username, password string) error {
+	s.username = username
+	if err := s.authenticate(username, password); err != nil {
+		var rateLimitErr *server.RateLimitError
+		if errors.As(err, &rateLimitErr) {
+			return &pop3server.Error{Code: "AUTH", Message: "Authentication failed", Close: true}
+		}
+		if server.IsTemporaryAuthFailure(err) {
+			return &pop3server.Error{Code: "SYS/TEMP", Message: "Service temporarily unavailable, please try again later"}
+		}
+		if server.IsBackendError(err) {
+			return &pop3server.Error{Code: "SYS/TEMP", Message: "Backend server temporarily unavailable"}
+		}
+		return &pop3server.Error{Code: "AUTH", Message: "Authentication failed"}
+	}
+
+	if err := s.registerConnection(); err != nil {
+		s.InfoLog("connection rejected by connection tracker", "error", err)
+		s.connRejected = true
+		return &pop3server.Error{Code: "SYS/TEMP", Message: "Too many connections", Close: true}
+	}
+
+	clientConn, clientReader, err := s.pop3Conn.Hijack()
+	if err != nil {
+		// The library still owns the client connection; close only what we own
+		// and let the normal teardown (Session.Close) do the rest.
+		if s.backendConn != nil {
+			s.backendConn.Close()
+		}
+		s.WarnLog("failed to hijack client connection", "error", err)
+		return &pop3server.Error{Code: "SYS/TEMP", Message: "Service temporarily unavailable, please try again later", Close: true}
+	}
+
+	s.clientConn = clientConn
+	s.clientReader = clientReader
+
+	// Write "+OK Authentication successful" response to client
+	writer := bufio.NewWriter(clientConn)
+	writer.WriteString("+OK Authentication successful\r\n")
+	writer.Flush()
+
+	s.authenticated = true
+
+	// Clear the read deadline before moving to the proxying phase, which sets its own.
+	if s.server.authIdleTimeout > 0 {
+		if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
+			s.WarnLog("Failed to clear read deadline", "error", err)
+		}
+	}
+
+	// Run the relay synchronously: the library's command loop is parked in this
+	// call until the relay finishes, and returning triggers session teardown
+	// (Session.Close closes both connections and releases the limiter slot), so
+	// the relay must complete first.
+	s.startProxying()
+
+	return nil
+}
+
+func (s *POP3ProxySession) AuthenticatePlain(ctx context.Context, identity, username, password string) error {
+	// The proxy performs no impersonation of its own: an authorization identity
+	// is only meaningful on the backend, where the proxy re-authenticates with
+	// master SASL credentials. Reject mismatched identities rather than silently
+	// dropping them (same policy as the previous implementation).
+	if identity != "" && identity != username {
+		return &pop3server.Error{Code: "AUTH", Message: "Authorization identity not supported on proxy (configure master SASL on backend)"}
+	}
+	return s.Login(ctx, username, password)
+}
+
+func (s *POP3ProxySession) AuthenticateMechanisms() []string {
+	return []string{"PLAIN"}
+}
+
+// The proxy advertises LANG/UTF8 in its pre-auth CAPA because the sora
+// backends honor them: a client that caches this CAPA must not conclude they
+// are unsupported. The commands themselves are AUTHORIZATION-state (RFC 6856)
+// and are answered locally; after authentication the connection is a raw relay
+// and the backend answers everything.
+
+func (s *POP3ProxySession) EnableUTF8(ctx context.Context) error {
+	return nil
+}
+
+func (s *POP3ProxySession) SetLanguage(ctx context.Context, lang string) (string, error) {
+	langTag := strings.ToLower(lang)
+	if langTag != "en" && langTag != "*" && langTag != "i-default" {
+		return "", &pop3server.Error{Message: "Unsupported language"}
+	}
+	if langTag == "i-default" {
+		return "i-default", nil
+	}
+	return "en", nil
+}
+
+func (s *POP3ProxySession) ListLanguages(ctx context.Context) ([]pop3server.LanguageInfo, error) {
+	return []pop3server.LanguageInfo{
+		{Tag: "en", Description: "English"},
+		{Tag: "i-default", Description: "Default"},
+	}, nil
+}
+
+func (s *POP3ProxySession) Stat(ctx context.Context) (int, int64, error) {
+	return 0, 0, errors.New("not implemented")
+}
+
+func (s *POP3ProxySession) List(ctx context.Context, msg int) ([]pop3.MessageInfo, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *POP3ProxySession) Uidl(ctx context.Context, msg int) ([]pop3.MessageUidl, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *POP3ProxySession) Retr(ctx context.Context, msgNum int) (io.ReadCloser, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *POP3ProxySession) Top(ctx context.Context, msgNum int, lines int) (io.ReadCloser, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *POP3ProxySession) Dele(ctx context.Context, msgNum int) error {
+	return errors.New("not implemented")
+}
+
+func (s *POP3ProxySession) Rset(ctx context.Context) error {
+	return errors.New("not implemented")
+}
+
+func (s *POP3ProxySession) Noop(ctx context.Context) error {
+	return errors.New("not implemented")
+}
+
+func (s *POP3ProxySession) Quit(ctx context.Context) (int, error) {
+	return 0, errors.New("not implemented")
 }
