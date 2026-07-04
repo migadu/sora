@@ -3,6 +3,7 @@ package pop3proxy
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,9 +31,17 @@ func TestConnectToBackendNoGreetingTimesOut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	defer ln.Close()
-	var held []net.Conn
+	// held is appended to by the accept goroutine and drained by the deferred
+	// cleanup on the test goroutine; the mutex synchronizes them, and closing
+	// the listener first stops the accept loop before the drain.
+	var (
+		heldMu sync.Mutex
+		held   []net.Conn
+	)
 	defer func() {
+		ln.Close()
+		heldMu.Lock()
+		defer heldMu.Unlock()
 		for _, c := range held {
 			c.Close()
 		}
@@ -43,7 +52,9 @@ func TestConnectToBackendNoGreetingTimesOut(t *testing.T) {
 			if err != nil {
 				return
 			}
+			heldMu.Lock()
 			held = append(held, c) // hold, never write
+			heldMu.Unlock()
 		}
 	}()
 

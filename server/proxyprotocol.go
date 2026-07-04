@@ -582,6 +582,11 @@ func (c *proxyProtocolConn) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
+// Unwrap keeps the wrapper chain walkable down to the raw socket.
+func (c *proxyProtocolConn) Unwrap() net.Conn {
+	return c.Conn
+}
+
 // GetRealClientIP returns the real client IP from PROXY protocol info, or falls back to connection IP
 func GetRealClientIP(conn net.Conn, proxyInfo *ProxyProtocolInfo) string {
 	if proxyInfo != nil && proxyInfo.SrcIP != "" {

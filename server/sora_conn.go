@@ -710,6 +710,68 @@ func NewSoraTLSConn(tcpConn net.Conn, tlsConfig *tls.Config, connConfig SoraConn
 	}
 }
 
+// PerformDeferredTLSHandshake completes the deferred TLS handshake on a
+// connection accepted from a SoraTLSListener, walking the Unwrap() chain so
+// wrappers such as PROXY-protocol conns don't hide the SoraTLSConn. It
+// returns (false, nil) when the chain has no deferred handshake (plaintext
+// listener). It must be called before any other Read/Write on the connection.
+func PerformDeferredTLSHandshake(conn net.Conn) (bool, error) {
+	for conn != nil {
+		if hs, ok := conn.(interface{ PerformHandshake() error }); ok {
+			return true, hs.PerformHandshake()
+		}
+		w, ok := conn.(interface{ Unwrap() net.Conn })
+		if !ok {
+			return false, nil
+		}
+		conn = w.Unwrap()
+	}
+	return false, nil
+}
+
+// ErrTLSHandshakeNotPerformed is returned by SoraTLSConn.Read/Write when
+// protocol code attempts connection I/O before the deferred TLS handshake has
+// been triggered. See requireHandshake.
+var ErrTLSHandshakeNotPerformed = errors.New("deferred TLS handshake not performed before connection I/O")
+
+// Read refuses I/O until the deferred TLS handshake has been attempted.
+func (c *SoraTLSConn) Read(b []byte) (int, error) {
+	if err := c.requireHandshake("read"); err != nil {
+		return 0, err
+	}
+	return c.SoraConn.Read(b)
+}
+
+// Write refuses I/O until the deferred TLS handshake has been attempted.
+func (c *SoraTLSConn) Write(b []byte) (int, error) {
+	if err := c.requireHandshake("write"); err != nil {
+		return 0, err
+	}
+	return c.SoraConn.Write(b)
+}
+
+// requireHandshake is a fail-loud guard against the listener-composition bug
+// where the deferred handshake is never triggered (e.g. a wrapper hides the
+// SoraTLSConn from a `conn.(interface{ PerformHandshake() error })` assertion)
+// and the server would otherwise write its greeting in PLAINTEXT on a TLS
+// port. That failure mode is silent from the server's perspective — clients
+// just hang waiting for a ServerHello — so instead of degrading, refuse the
+// I/O and log an error naming the missing call. After a failed handshake the
+// cached handshake error is returned (never plaintext onto a broken stream).
+//
+// Callers that block here while another goroutine runs PerformHandshake
+// simply serialize behind handshakeMutex and proceed once it finishes.
+func (c *SoraTLSConn) requireHandshake(op string) error {
+	c.handshakeMutex.Lock()
+	defer c.handshakeMutex.Unlock()
+	if !c.handshakeComplete {
+		logger.Error("TLS listener: connection I/O before deferred TLS handshake - refusing (call server.PerformDeferredTLSHandshake before any read/write)",
+			"proto", c.connConfig.Protocol, "op", op, "remote", c.SoraConn.remoteAddr)
+		return ErrTLSHandshakeNotPerformed
+	}
+	return c.handshakeErr
+}
+
 // PerformHandshake performs the TLS handshake with timeout and JA4 capture.
 // This method is idempotent and thread-safe - calling it multiple times is safe.
 // Must be called before any Read/Write operations.
@@ -894,4 +956,11 @@ type bufferedConn struct {
 // Read reads from the buffered reader first, then from the underlying connection
 func (bc *bufferedConn) Read(b []byte) (int, error) {
 	return bc.reader.Read(b)
+}
+
+// Unwrap keeps the wrapper chain walkable (e.g. tls.Conn.NetConn() returns a
+// bufferedConn when the plaintext probe peeked bytes; PROXY-info discovery
+// must be able to continue through it to the ProxyProtocolConn underneath).
+func (bc *bufferedConn) Unwrap() net.Conn {
+	return bc.Conn
 }

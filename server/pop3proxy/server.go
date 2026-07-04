@@ -3,6 +3,7 @@ package pop3proxy
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -147,6 +148,7 @@ type POP3ProxyServerOptions struct {
 	RemotePort               int // Default port for backends if not in address
 	RemoteTLS                bool
 	RemoteTLSVerify          bool
+	RemoteTLSCAFile          string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
 	RemoteUseProxyProtocol   bool
 	MasterUsername           string
 	MasterPassword           string
@@ -244,6 +246,29 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 
 	// SSRF defense: when enabled, refuse remote-lookup backends not in the configured pool.
 	connManager.SetRestrictRemoteLookupToPool(options.RemoteLookup != nil && options.RemoteLookup.RestrictToPool)
+
+	// Custom CA for backend certificate verification (private-CA or
+	// self-signed backends): keeps remote_tls_verify usable instead of
+	// forcing it off.
+	if options.RemoteTLSCAFile != "" {
+		pem, err := os.ReadFile(options.RemoteTLSCAFile)
+		if err != nil {
+			if routingLookup != nil {
+				routingLookup.Close()
+			}
+			serverCancel()
+			return nil, fmt.Errorf("failed to read remote_tls_ca_file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			if routingLookup != nil {
+				routingLookup.Close()
+			}
+			serverCancel()
+			return nil, fmt.Errorf("remote_tls_ca_file %q contains no usable certificates", options.RemoteTLSCAFile)
+		}
+		connManager.SetRemoteTLSRootCAs(pool)
+	}
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {
@@ -441,35 +466,51 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 		InsecureAuth:           s.insecureAuth,
 		MaxLineLength:          1024,
 		MaxErrors:              maxErrors,
-		StrictSessionErrors:    true, // Session errors are *pop3server.Error; mask anything else
-		Caps:                   caps,
-		Greeting:               "Sora-POP3-Proxy ready",
+		// Pre-migration parity: failed logins never counted toward the
+		// (default 2) error budget on the proxy — the auth rate limiter
+		// handles brute-force across connections, so a user who mistypes a
+		// password twice must not be disconnected.
+		AuthFailuresExemptFromMaxErrors: true,
+		StrictSessionErrors:             true, // Session errors are *pop3server.Error; mask anything else
+		Caps:                            caps,
+		Greeting:                        "Sora-POP3-Proxy ready",
 		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
 			netConn := c.NetConn()
-			var proxyInfo *server.ProxyProtocolInfo
-			currentConn := netConn
-			for currentConn != nil {
-				if proxyConn, ok := currentConn.(*proxyProtocolConn); ok {
-					proxyInfo = proxyConn.GetProxyInfo()
-					break
-				}
-				if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
-					currentConn = wrapper.Unwrap()
-				} else {
-					break
-				}
-			}
+			proxyInfo := server.GetProxyProtocolInfo(netConn)
 
 			var releaseConn func()
 			var err error
 			if s.limiter != nil {
 				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), "")
 				if err != nil {
-					// Silent close, no banner: matches the previous accept-loop
-					// rejection so limited peers learn nothing.
+					// DELIBERATE silent close, no banner: matches the previous
+					// accept-loop rejection (drop before any greeting), and an
+					// "-ERR too many connections" banner would tell a flooder
+					// exactly when the limiter engages so they can pace under
+					// it. Test-enforced (connection-limit tests assert the
+					// rejected socket never sees "+OK") — do not add a banner.
 					return nil, fmt.Errorf("%w: %w", pop3server.ErrSilentReject, err)
 				}
 			}
+
+			// Implicit-TLS listeners (SoraTLSListener) defer the TLS handshake;
+			// the library never triggers it, so complete it here — after the
+			// limiter and before the greeting is written. Also captures JA4 and
+			// registers the connection timeout checker for TLS connections.
+			if didTLS, err := server.PerformDeferredTLSHandshake(netConn); err != nil {
+				if releaseConn != nil {
+					releaseConn()
+				}
+				logger.Debug("POP3 Proxy: TLS handshake failed", "proxy", s.name, "remote", server.GetAddrString(netConn.RemoteAddr()), "error", err)
+				return nil, fmt.Errorf("%w: TLS handshake: %w", pop3server.ErrSilentReject, err)
+			} else if didTLS {
+				c.SetTLS(true)
+			}
+
+			// Count the connection only once it is past every rejection point,
+			// so the decrements in the session close path always balance.
+			metrics.ConnectionsTotal.WithLabelValues("pop3_proxy", s.name, s.hostname).Inc()
+			metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy", s.name, s.hostname).Inc()
 
 			sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
@@ -491,6 +532,7 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 				session.RemoteIP = server.GetAddrString(netConn.RemoteAddr())
 			}
 
+			session.InfoLog("connected")
 			s.addSession(session)
 			return session, nil
 		},
@@ -537,12 +579,21 @@ func (s *POP3ProxyServer) Start() error {
 	}
 	logger.Debug("POP3 Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
 
+	// The PROXY protocol header travels in plaintext AHEAD of the TLS
+	// ClientHello, so the header reader must sit between the TCP socket and
+	// the TLS layer: the header is read from the raw stream, and the deferred
+	// TLS handshake then reads THROUGH the PROXY conn, consuming any
+	// ClientHello bytes its bufio buffered alongside the header. Wrapping in
+	// the other order makes the handshake read the raw socket and miss those
+	// bytes (broken PROXY+TLS combo).
+	base := server.WrapProxyProtocol(tcpListener, s.proxyReader, "POP3-PROXY")
+
 	if s.tlsConfig != nil {
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
-		listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
+		listener = server.NewSoraTLSListener(base, s.tlsConfig, connConfig)
 	} else {
 		// Use SoraListener for non-TLS with timeout protection
-		listener = server.NewSoraListener(tcpListener, connConfig)
+		listener = server.NewSoraListener(base, connConfig)
 	}
 	defer listener.Close()
 
@@ -588,26 +639,14 @@ func (s *POP3ProxyServer) acceptConnections(listener net.Listener) error {
 			continue // Continue accepting other connections
 		}
 
-		// Read PROXY protocol header if enabled
-		var proxyInfo *server.ProxyProtocolInfo
-		var wrappedConn net.Conn
-		if s.proxyReader != nil {
-			var err error
-			proxyInfo, wrappedConn, err = s.proxyReader.ReadProxyHeader(conn)
-			if err != nil {
-				logger.Error("PROXY protocol error", "proxy", s.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
-				conn.Close()
-				continue // Try to accept the next connection
-			}
-			conn = &proxyProtocolConn{
-				Conn:      wrappedConn,
-				proxyInfo: proxyInfo,
-			}
-		}
+		// PROXY protocol handling happens inside the listener chain (the
+		// header must be read from the raw stream BEFORE the TLS wrapper);
+		// NewSession discovers the proxyProtocolConn via the Unwrap walk.
 
-		// Track proxy connection
-		metrics.ConnectionsTotal.WithLabelValues("pop3_proxy", s.name, s.hostname).Inc()
-		metrics.ConnectionsCurrent.WithLabelValues("pop3_proxy", s.name, s.hostname).Inc()
+		// Connection counters are incremented in NewSession once the
+		// connection is past the limiter and TLS handshake, so rejected
+		// connections never inflate the gauges (they have no session to
+		// decrement them).
 
 		s.wg.Add(1)
 		go func() {
@@ -657,6 +696,14 @@ func (s *POP3ProxyServer) Stop() error {
 
 	if s.cancel != nil {
 		s.cancel()
+	}
+
+	// Also cancel the library-side connection contexts so in-flight pre-auth
+	// work aborts instead of running to its own timeout. Sessions accepted
+	// under a pre-SIGHUP snapshot are not covered here, but the shutdown
+	// broadcast above already closed their sockets.
+	if lib := s.pop3libServer.Load(); lib != nil {
+		lib.Close()
 	}
 
 	done := make(chan struct{})
@@ -849,17 +896,4 @@ func (s *POP3ProxyServer) ReloadConfig(cfg config.ServerConfig) error {
 // GetLimiter returns the connection limiter for testing purposes
 func (s *POP3ProxyServer) GetLimiter() *server.ConnectionLimiter {
 	return s.limiter
-}
-
-type proxyProtocolConn struct {
-	net.Conn
-	proxyInfo *server.ProxyProtocolInfo
-}
-
-func (c *proxyProtocolConn) GetProxyInfo() *server.ProxyProtocolInfo {
-	return c.proxyInfo
-}
-
-func (c *proxyProtocolConn) Unwrap() net.Conn {
-	return c.Conn
 }

@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -44,6 +45,7 @@ type ConnectionManager struct {
 	remoteTLS              bool
 	remoteTLSUseStartTLS   bool // Use STARTTLS for backend connections (only relevant if remoteTLS is true)
 	remoteTLSVerify        bool
+	remoteTLSRootCAs       *x509.CertPool // When non-nil, replaces the system roots for backend certificate verification (private-CA / self-signed backends)
 	remoteUseProxyProtocol bool
 	connectTimeout         time.Duration
 
@@ -654,14 +656,25 @@ func (cm *ConnectionManager) GetRemoteLookupTimeout() time.Duration {
 	return 10 * time.Second // Fallback default
 }
 
-// GetTLSConfig returns the TLS configuration for remote connections
-// Used for StartTLS negotiation at the protocol layer
-func (cm *ConnectionManager) GetTLSConfig() *tls.Config {
-	if !cm.remoteTLS {
-		return nil
-	}
+// SetRemoteTLSRootCAs replaces the system roots used to verify backend
+// certificates when remote_tls_verify is enabled. Use it for backends whose
+// certificates are issued by a private CA (or are self-signed): put the CA
+// (or the certificate itself) in the pool instead of disabling verification.
+// Must be called before the manager starts dialing backends.
+func (cm *ConnectionManager) SetRemoteTLSRootCAs(pool *x509.CertPool) {
+	cm.remoteTLSRootCAs = pool
+}
+
+// backendTLSConfig builds the client TLS config for the proxy->backend leg.
+// Shared by the implicit-TLS dial paths and the STARTTLS upgrade path so the
+// hardening choices (no client certs, no renegotiation, TLS 1.2 floor, custom
+// roots) stay in one place. verify is a parameter because remote-lookup
+// routing can override remote_tls_verify per connection.
+func (cm *ConnectionManager) backendTLSConfig(verify bool) *tls.Config {
 	return &tls.Config{
-		InsecureSkipVerify: !cm.remoteTLSVerify,
+		InsecureSkipVerify: !verify,
+		// nil means system roots; ignored entirely when verification is off.
+		RootCAs: cm.remoteTLSRootCAs,
 		// Explicitly set empty certificates to prevent automatic client certificate presentation
 		Certificates: []tls.Certificate{},
 		// Disable client certificate authentication
@@ -673,6 +686,15 @@ func (cm *ConnectionManager) GetTLSConfig() *tls.Config {
 		// Floor the proxy->backend leg at TLS 1.2 (avoid downgrade to 1.0/1.1).
 		MinVersion: tls.VersionTLS12,
 	}
+}
+
+// GetTLSConfig returns the TLS configuration for remote connections
+// Used for StartTLS negotiation at the protocol layer
+func (cm *ConnectionManager) GetTLSConfig() *tls.Config {
+	if !cm.remoteTLS {
+		return nil
+	}
+	return cm.backendTLSConfig(cm.remoteTLSVerify)
 }
 
 // IsRemoteStartTLS returns whether remote connections should use StartTLS
@@ -916,19 +938,7 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 	// Only use implicit TLS if remoteTLS is enabled AND StartTLS is not being used
 	// When StartTLS is enabled, the protocol layer will handle the TLS upgrade
 	if cm.remoteTLS && !cm.remoteTLSUseStartTLS {
-		tlsConfig := &tls.Config{
-			InsecureSkipVerify: !cm.remoteTLSVerify,
-			// Explicitly set empty certificates to prevent automatic client certificate presentation
-			Certificates: []tls.Certificate{},
-			// Disable client certificate authentication
-			GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
-				return nil, nil
-			},
-			// Disable renegotiation (not supported in TLS 1.3, causes errors)
-			Renegotiation: tls.RenegotiateNever,
-			// Floor the proxy->backend leg at TLS 1.2 (avoid downgrade to 1.0/1.1).
-			MinVersion: tls.VersionTLS12,
-		}
+		tlsConfig := cm.backendTLSConfig(cm.remoteTLSVerify)
 		// tls.Dial would infer ServerName from the dial target, but we dial the DNS-resolved
 		// IP (resolvedAddr), which would verify the cert against the IP rather than the
 		// configured backend hostname. Pin ServerName to the configured host so verification
@@ -1056,19 +1066,7 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// Now establish TLS if required (only for implicit TLS, not StartTLS)
 	// When StartTLS is enabled, the protocol layer will handle TLS upgrade
 	if remoteTLS && !remoteTLSUseStartTLS {
-		tlsConfig := &tls.Config{
-			InsecureSkipVerify: !remoteTLSVerify,
-			// Explicitly set empty certificates to prevent automatic client certificate presentation
-			Certificates: []tls.Certificate{},
-			// Disable client certificate authentication
-			GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
-				return nil, nil
-			},
-			// Disable renegotiation (not supported in TLS 1.3, causes errors)
-			Renegotiation: tls.RenegotiateNever,
-			// Floor the proxy->backend leg at TLS 1.2 (avoid downgrade to 1.0/1.1).
-			MinVersion: tls.VersionTLS12,
-		}
+		tlsConfig := cm.backendTLSConfig(remoteTLSVerify)
 		// Verify the backend certificate against its configured hostname. tls.Client (unlike
 		// tls.Dial) does NOT infer ServerName, so without this it stays empty and Go verifies
 		// only the chain, not the host — remote_tls_verify=true would still let any CA-valid

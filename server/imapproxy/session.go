@@ -17,7 +17,6 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
-	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
@@ -58,20 +57,12 @@ type Session struct {
 func newSession(s *Server, conn net.Conn) *Session {
 	sessionCtx, sessionCancel := context.WithCancel(s.ctx)
 
-	// Read PROXY protocol header if enabled
-	var proxyInfo *server.ProxyProtocolInfo
-	var wrappedConn net.Conn
-	if s.proxyReader != nil {
-		var err error
-		proxyInfo, wrappedConn, err = s.proxyReader.ReadProxyHeader(conn)
-		if err != nil {
-			logger.Error("PROXY protocol error", "proxy", s.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
-			sessionCancel()
-			conn.Close()
-			return nil
-		}
-		conn = wrappedConn // Use wrapped connection that has buffered reader
-	}
+	// PROXY protocol handling happens inside the listener chain (the header
+	// must be read from the raw stream BEFORE the TLS wrapper); discover the
+	// PROXY info via the wrapper-chain walk. This runs BEFORE the deferred
+	// TLS handshake in handleConnection, where gating on the client IP needs
+	// it.
+	proxyInfo := server.GetProxyProtocolInfo(conn)
 
 	// Determine real client address (from PROXY header or direct connection)
 	clientAddr := server.GetRealClientIP(conn, proxyInfo)
@@ -124,12 +115,13 @@ func (s *Session) handleConnection() {
 
 	s.InfoLog("connected")
 
-	// Perform TLS handshake if this is a TLS connection
-	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
-		if err := tlsConn.PerformHandshake(); err != nil {
-			s.WarnLog("TLS handshake failed", "error", err)
-			return
-		}
+	// Complete the deferred TLS handshake (implicit-TLS listeners). The helper
+	// walks the Unwrap() chain, so the handshake runs through the PROXY conn
+	// and consumes any ClientHello bytes buffered alongside the PROXY header.
+	// Failure is a silent close: no plaintext banner onto a broken TLS stream.
+	if _, err := server.PerformDeferredTLSHandshake(s.clientConn); err != nil {
+		s.WarnLog("TLS handshake failed", "error", err)
+		return
 	}
 
 	// Send greeting

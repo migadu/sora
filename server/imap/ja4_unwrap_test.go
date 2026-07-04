@@ -20,6 +20,13 @@ func (m *mockConn) RemoteAddr() net.Addr {
 func (m *mockConn) Read(b []byte) (n int, err error)  { return 0, nil }
 func (m *mockConn) Write(b []byte) (n int, err error) { return len(b), nil }
 
+// testUnwrapConn is a minimal Unwrap-able wrapper for chain-walk tests.
+type testUnwrapConn struct {
+	net.Conn
+}
+
+func (c *testUnwrapConn) Unwrap() net.Conn { return c.Conn }
+
 // TestSoraConnJA4Access tests that SoraConn provides direct access to JA4 fingerprint
 func TestSoraConnJA4Access(t *testing.T) {
 	baseConn := &mockConn{}
@@ -60,11 +67,9 @@ func TestSoraConnWithWrappers(t *testing.T) {
 	soraConn := serverPkg.NewSoraConn(baseConn, connConfig)
 	soraConn.SetJA4Fingerprint("t13d1516h2_8daaf6152771_b0da82dd1658")
 
-	// Wrap SoraConn with PROXY protocol and connection limiting
-	proxyWrapped := &proxyProtocolConn{
-		Conn:      soraConn,
-		proxyInfo: nil,
-	}
+	// Wrap SoraConn with an Unwrap-able wrapper (stand-in for the shared
+	// server.ProxyProtocolConn) and connection limiting
+	proxyWrapped := &testUnwrapConn{Conn: soraConn}
 
 	limitingWrapped := &connectionLimitingConn{
 		Conn:        proxyWrapped,

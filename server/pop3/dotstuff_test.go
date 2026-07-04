@@ -20,6 +20,12 @@ func TestCrlfNormalizedLen(t *testing.T) {
 		{"no terminator", "abc", 3},
 		{"empty", "", 0},
 		{"blank line separator bare LF", "H: v\n\nbody", len("H: v\r\n\r\nbody")},
+		// Lone CRs are content, not line endings: the library streams them
+		// verbatim (pop3server TestDotStuffWriter_BareCRContent /
+		// TestDotStuffWriter_OctetInvariant pin the writer side), so they
+		// add nothing to the announced count.
+		{"bare CR mid-line", "a\rb\r\n", 5},
+		{"bare CR then bare LF", "a\rb\n", 5},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

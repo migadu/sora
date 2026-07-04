@@ -3,7 +3,6 @@ package lmtp
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -59,14 +58,15 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 
-		// Extract real client IP and proxy info if this is a PROXY protocol connection
+		// Extract real client IP and proxy info if this is a PROXY protocol
+		// connection. The PROXY conn sits INSIDE the TLS layer (the header is
+		// read from the raw stream before any TLS processing), so on
+		// implicit-TLS listeners the accepted conn is a *tls.Conn; the walk
+		// traverses it via NetConn(), which never triggers the handshake.
 		var realClientIP string
-		var proxyInfo *server.ProxyProtocolInfo
-		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
-			proxyInfo = proxyConn.GetProxyInfo()
-			if proxyInfo != nil && proxyInfo.SrcIP != "" {
-				realClientIP = proxyInfo.SrcIP
-			}
+		proxyInfo := server.GetProxyProtocolInfo(conn)
+		if proxyInfo != nil && proxyInfo.SrcIP != "" {
+			realClientIP = proxyInfo.SrcIP
 		}
 
 		// Check connection limits with PROXY protocol support
@@ -95,7 +95,7 @@ type connectionLimitingConn struct {
 	closed      bool
 }
 
-// GetProxyInfo implements the same interface as proxyProtocolConn
+// GetProxyInfo implements the same interface as server.ProxyProtocolConn
 func (c *connectionLimitingConn) GetProxyInfo() *server.ProxyProtocolInfo {
 	return c.proxyInfo
 }
@@ -450,28 +450,11 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		startTime: time.Now(),
 	}
 
-	// Extract real client IP and proxy IP from PROXY protocol if available
-	// Need to unwrap connection layers to get to proxyProtocolConn
+	// Extract real client IP and proxy IP from PROXY protocol if available.
+	// The walk accepts any layer exposing GetProxyInfo(), so it is satisfied
+	// by connectionLimitingConn (which cached the info at accept time).
 	netConn := c.Conn()
-	var proxyInfo *server.ProxyProtocolInfo
-	currentConn := netConn
-	for currentConn != nil {
-		if proxyConn, ok := currentConn.(*proxyProtocolConn); ok {
-			proxyInfo = proxyConn.GetProxyInfo()
-			break
-		} else if limitingConn, ok := currentConn.(*connectionLimitingConn); ok {
-			if limitingInfo := limitingConn.GetProxyInfo(); limitingInfo != nil {
-				proxyInfo = limitingInfo
-				break
-			}
-		}
-		// Try to unwrap the connection
-		if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
-			currentConn = wrapper.Unwrap()
-		} else {
-			break
-		}
-	}
+	proxyInfo := server.GetProxyProtocolInfo(netConn)
 
 	clientIP, proxyIP := server.GetConnectionIPs(netConn, proxyInfo)
 	s.RemoteIP = clientIP
@@ -523,24 +506,27 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	}
 	logger.Debug("using custom listen backlog", "server", b.name, "backlog", b.listenBacklog)
 
+	// The PROXY protocol header travels in plaintext AHEAD of the TLS
+	// ClientHello, so the header reader must sit between the TCP socket and
+	// the TLS layer: the header is read from the raw stream, and crypto/tls
+	// then handshakes lazily THROUGH the PROXY conn on first I/O, consuming
+	// any ClientHello bytes its bufio buffered alongside the header. Wrapping
+	// in the other order makes the eager TLS conn handshake against the
+	// plaintext "PROXY ..." line and fail on every connection. STARTTLS mode
+	// (b.server.TLSConfig set) is unaffected: TLS is negotiated in-protocol,
+	// long after the header.
+	base := server.WrapProxyProtocol(tcpListener, b.proxyReader, "LMTP")
+
 	// Only use a TLS listener if we're not using StartTLS and TLS is enabled
 	if b.tlsConfig != nil && b.server.TLSConfig == nil {
-		// Implicit TLS - wrap TCP listener with TLS
-		listener = tls.NewListener(tcpListener, b.tlsConfig)
+		// Implicit TLS - wrap PROXY-aware listener with TLS
+		listener = tls.NewListener(base, b.tlsConfig)
 		logger.Info("lmtp server listening with tls", "name", b.name, "addr", b.server.Addr)
 	} else {
-		listener = tcpListener
+		listener = base
 		logger.Info("lmtp server listening", "name", b.name, "addr", b.server.Addr, "tls", false)
 	}
 	defer listener.Close()
-
-	// Wrap listener with PROXY protocol support if enabled
-	if b.proxyReader != nil {
-		listener = &proxyProtocolListener{
-			Listener:    listener,
-			proxyReader: b.proxyReader,
-		}
-	}
 
 	// Wrap listener with connection limiting
 	limitedListener := &connectionLimitingListener{
@@ -603,57 +589,6 @@ func (b *LMTPServerBackend) GetActiveConnections() int64 {
 // For LMTP, all connections are considered authenticated
 func (b *LMTPServerBackend) GetAuthenticatedConnections() int64 {
 	return 0
-}
-
-// proxyProtocolListener wraps a listener to handle PROXY protocol
-type proxyProtocolListener struct {
-	net.Listener
-	proxyReader *server.ProxyProtocolReader
-}
-
-func (l *proxyProtocolListener) Accept() (net.Conn, error) {
-	for {
-		conn, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-
-		// Try to read PROXY protocol header
-		proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
-		if err == nil {
-			// PROXY header found and parsed successfully.
-			return &proxyProtocolConn{
-				Conn:      wrappedConn,
-				proxyInfo: proxyInfo,
-			}, nil
-		}
-
-		// An error occurred. Check if we are in "optional" mode and the error is simply that no PROXY header was present.
-		// This requires the underlying ProxyProtocolReader to be updated to return a specific error (e.g., server.ErrNoProxyHeader)
-		// and to not consume bytes from the connection if no header is found.
-		if l.proxyReader.IsOptionalMode() && errors.Is(err, server.ErrNoProxyHeader) {
-			// Note: We don't have access to server name in this listener, use generic LMTP
-			logger.Debug("no proxy protocol header - treating as direct", "remote_addr", conn.RemoteAddr())
-			// The wrappedConn should be the original connection, possibly with a buffered reader.
-			return wrappedConn, nil
-		}
-
-		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
-		conn.Close()
-		// Note: We don't have access to server name in this listener, use generic LMTP
-		logger.Debug("proxy protocol error - rejecting", "remote_addr", conn.RemoteAddr(), "error", err)
-		continue
-	}
-}
-
-// proxyProtocolConn wraps a connection with PROXY protocol information
-type proxyProtocolConn struct {
-	net.Conn
-	proxyInfo *server.ProxyProtocolInfo
-}
-
-func (c *proxyProtocolConn) GetProxyInfo() *server.ProxyProtocolInfo {
-	return c.proxyInfo
 }
 
 // monitorActiveConnections periodically logs active connection count for monitoring

@@ -25,6 +25,16 @@ import (
 
 // Compile-time checks: the library discovers SASL support via type assertion,
 // so a signature drift would silently disable AUTH instead of failing the build.
+//
+// DELIBERATE: the proxy implements SessionLang/SessionUTF8 itself, which makes
+// the library advertise LANG and UTF8 in the PRE-AUTH CAPA even though the
+// proxy is "just" a relay. RFC 6856 confines both commands to the
+// AUTHORIZATION state — before login, when no backend connection exists yet —
+// so if the proxy didn't speak them, no client could ever negotiate UTF8
+// through it (clients only send what CAPA advertises, and post-auth is too
+// late). A pre-auth UTF8 is mirrored to the backend right after connecting
+// (see utf8Requested). Do not "clean up" these interfaces; the pre-auth CAPA
+// set is pinned by integration_tests/pop3proxy/insecure_auth_test.go.
 var (
 	_ pop3server.Session     = (*POP3ProxySession)(nil)
 	_ pop3server.SessionSASL = (*POP3ProxySession)(nil)
@@ -50,12 +60,12 @@ type POP3ProxySession struct {
 	sessionID             string // Proxy session ID for end-to-end tracing (also forwarded to the backend)
 	authenticated         bool
 	mutex                 sync.Mutex
-	errorCount            int
 	startTime             time.Time
 	releaseConn           func() // Connection limiter cleanup function
 	proxyInfo             *server.ProxyProtocolInfo
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
 	submittedUsername     string // Username exactly as submitted by the client (lookup-cache key)
+	utf8Requested         bool   // Client enabled UTF8 pre-auth; mirrored to the backend before AUTH (RFC 6856)
 	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
 	closed                bool   // Guards close() against double teardown (guarded by mutex)
 	pop3Conn              *pop3server.Conn
@@ -725,6 +735,33 @@ func (s *POP3ProxySession) connectToBackend() error {
 		}
 	}
 
+	// Mirror a pre-auth UTF8 request on the backend leg: RFC 6856 requires
+	// UTF8 before authentication, and the client was already told +OK.
+	if s.utf8Requested {
+		if err := s.backendConn.SetDeadline(time.Now().Add(greetingTimeout)); err != nil {
+			s.backendConn.Close()
+			return fmt.Errorf("%w: failed to set UTF8 deadline: %w", server.ErrBackendConnectionFailed, err)
+		}
+		if _, err := backendWriter.WriteString("UTF8\r\n"); err != nil {
+			s.backendConn.Close()
+			return fmt.Errorf("%w: failed to send UTF8 to backend: %w", server.ErrBackendConnectionFailed, err)
+		}
+		if err := backendWriter.Flush(); err != nil {
+			s.backendConn.Close()
+			return fmt.Errorf("%w: failed to flush UTF8 to backend: %w", server.ErrBackendConnectionFailed, err)
+		}
+		resp, err := server.ReadBoundedLine(backendReader, 1024)
+		if err != nil {
+			s.backendConn.Close()
+			return fmt.Errorf("%w: failed to read UTF8 response: %w", server.ErrBackendConnectionFailed, err)
+		}
+		if !strings.HasPrefix(resp, "+OK") {
+			// Best-effort: pre-migration code never forwarded UTF8, so a
+			// backend without UTF8 support degrades exactly as it did before.
+			s.WarnLog("backend rejected UTF8 mode; continuing without it", "response", strings.TrimSpace(resp))
+		}
+	}
+
 	// Authenticate to backend using master SASL credentials via AUTH PLAIN.
 	// Bound the whole exchange with a deadline so a backend that wedges after
 	// the greeting cannot hang the session (mirrors the IMAP proxy).
@@ -1205,10 +1242,28 @@ func (s *POP3ProxySession) Close() error {
 }
 
 func (s *POP3ProxySession) Login(ctx context.Context, username, password string) error {
+	// Legacy compatibility (pre-migration parity): USER/PASS arguments wrapped
+	// in double quotes are unquoted. SASL fields come from base64 and were
+	// never unquoted.
+	username = server.UnquoteString(username)
+	password = server.UnquoteString(password)
+	return s.doLogin(ctx, username, password)
+}
+
+func (s *POP3ProxySession) doLogin(ctx context.Context, username, password string) error {
+	authStart := time.Now()
 	s.username = username
 	if err := s.authenticate(username, password); err != nil {
 		var rateLimitErr *server.RateLimitError
 		if errors.As(err, &rateLimitErr) {
+			// DELIBERATE: byte-identical to the bad-password reply below —
+			// a distinguishable throttle reply ([LOGIN-DELAY], "too many
+			// attempts") is an oracle that lets credential-stuffers detect
+			// when the limiter engages, pace just under it, and separate
+			// "throttled, untested" from "tested and wrong". RFC 3206 [AUTH]
+			// is the code for rejected auth; [LOGIN-DELAY] would imply valid
+			// credentials. Only Close differs: drop the connection to shed
+			// load, the text must not change.
 			return &pop3server.Error{Code: "AUTH", Message: "Authentication failed", Close: true}
 		}
 		if server.IsTemporaryAuthFailure(err) {
@@ -1247,6 +1302,12 @@ func (s *POP3ProxySession) Login(ctx context.Context, username, password string)
 
 	s.authenticated = true
 
+	s.InfoLog("authentication complete",
+		"address", s.username,
+		"backend", s.serverAddr,
+		"routing", s.routingMethod,
+		"duration", fmt.Sprintf("%.3fs", time.Since(authStart).Seconds()))
+
 	// Clear the read deadline before moving to the proxying phase, which sets its own.
 	if s.server.authIdleTimeout > 0 {
 		if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
@@ -1271,7 +1332,7 @@ func (s *POP3ProxySession) AuthenticatePlain(ctx context.Context, identity, user
 	if identity != "" && identity != username {
 		return &pop3server.Error{Code: "AUTH", Message: "Authorization identity not supported on proxy (configure master SASL on backend)"}
 	}
-	return s.Login(ctx, username, password)
+	return s.doLogin(ctx, username, password)
 }
 
 func (s *POP3ProxySession) AuthenticateMechanisms() []string {
@@ -1285,6 +1346,10 @@ func (s *POP3ProxySession) AuthenticateMechanisms() []string {
 // and the backend answers everything.
 
 func (s *POP3ProxySession) EnableUTF8(ctx context.Context) error {
+	// Remember the request so connectToBackend can mirror it on the backend
+	// leg: RFC 6856 requires UTF8 before authentication to take effect, and
+	// the backend session must be in the same mode as the client believes.
+	s.utf8Requested = true
 	return nil
 }
 

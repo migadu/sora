@@ -89,14 +89,15 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 
-		// Extract real client IP and proxy info if this is a PROXY protocol connection
+		// Extract real client IP and proxy info if this is a PROXY protocol
+		// connection. The PROXY conn sits INSIDE the TLS layer (the header is
+		// read from the raw stream before the handshake), so this walks the
+		// wrapper chain — BEFORE the deferred TLS handshake below, because
+		// anything gating on the real client IP must not wait for it.
 		var realClientIP string
-		var proxyInfo *serverPkg.ProxyProtocolInfo
-		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
-			proxyInfo = proxyConn.GetProxyInfo()
-			if proxyInfo != nil && proxyInfo.SrcIP != "" {
-				realClientIP = proxyInfo.SrcIP
-			}
+		proxyInfo := serverPkg.GetProxyProtocolInfo(conn)
+		if proxyInfo != nil && proxyInfo.SrcIP != "" {
+			realClientIP = proxyInfo.SrcIP
 		}
 
 		// Check connection limits with PROXY protocol support
@@ -124,15 +125,17 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 			continue // Try to accept the next connection
 		}
 
-		// Perform TLS handshake if this is a TLS connection (before any I/O)
-		// Must happen before go-imap library starts reading from the connection
-		if tlsConn, ok := conn.(interface{ PerformHandshake() error }); ok {
-			if err := tlsConn.PerformHandshake(); err != nil {
-				logger.Debug("IMAP: TLS handshake failed", "name", l.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
-				releaseConn() // Release the connection limit
-				conn.Close()
-				continue // Try to accept the next connection
-			}
+		// Complete the deferred TLS handshake (before any I/O, and before the
+		// go-imap library starts reading from the connection). The helper walks
+		// the Unwrap() chain, so the handshake runs through the PROXY conn and
+		// consumes any ClientHello bytes buffered alongside the PROXY header.
+		// Failure is a silent close: no plaintext banner onto a broken TLS
+		// stream, and the limiter slot is released.
+		if _, err := serverPkg.PerformDeferredTLSHandshake(conn); err != nil {
+			logger.Debug("IMAP: TLS handshake failed", "name", l.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
+			releaseConn() // Release the connection limit
+			conn.Close()
+			continue // Try to accept the next connection
 		}
 
 		// Wrap the connection to ensure cleanup on close and preserve PROXY info
@@ -153,7 +156,7 @@ type connectionLimitingConn struct {
 	closed      bool
 }
 
-// GetProxyInfo implements the same interface as proxyProtocolConn
+// GetProxyInfo implements the same interface as server.ProxyProtocolConn
 func (c *connectionLimitingConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
 	return c.proxyInfo
 }
@@ -867,27 +870,11 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	}
 	session.sessionCaps.Store(initialCaps)
 
-	// Extract real client IP and proxy IP from PROXY protocol if available
-	// Need to unwrap connection layers to get to proxyProtocolConn
-	var proxyInfo *serverPkg.ProxyProtocolInfo
-	currentConn := netConn
-	for currentConn != nil {
-		if proxyConn, ok := currentConn.(*proxyProtocolConn); ok {
-			proxyInfo = proxyConn.GetProxyInfo()
-			break
-		} else if limitingConn, ok := currentConn.(*connectionLimitingConn); ok {
-			if limitingInfo := limitingConn.GetProxyInfo(); limitingInfo != nil {
-				proxyInfo = limitingInfo
-				break
-			}
-		}
-		// Try to unwrap the connection
-		if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
-			currentConn = wrapper.Unwrap()
-		} else {
-			break
-		}
-	}
+	// Extract real client IP and proxy IP from PROXY protocol if available.
+	// The walk accepts any layer exposing GetProxyInfo(), so it is satisfied
+	// by connectionLimitingConn (which cached the info pre-handshake) even
+	// after the handshake severed the deeper chain.
+	proxyInfo := serverPkg.GetProxyProtocolInfo(netConn)
 
 	// Check for JA4 fingerprint from PROXY v2 TLV (highest priority)
 	var proxyJA4Fingerprint string
@@ -896,22 +883,18 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		logger.Debug("IMAP: Received JA4 fingerprint from PROXY v2 TLV", "name", s.name, "ja4", proxyJA4Fingerprint)
 	}
 
-	// Extract JA4 fingerprint if this is a JA4-enabled TLS connection
-	// Need to unwrap connection layers to get to the underlying JA4 connection
+	// Extract JA4 fingerprint if this is a JA4-enabled TLS connection.
+	// Every wrapper in the chain implements Unwrap(), so a plain walk finds
+	// the SoraConn underneath.
 	var ja4Conn interface{ GetJA4Fingerprint() (string, error) }
-	currentConn = netConn
+	currentConn := netConn
 	for currentConn != nil {
 		if jc, ok := currentConn.(interface{ GetJA4Fingerprint() (string, error) }); ok {
 			ja4Conn = jc
 			break
 		}
-		// Try to unwrap by checking for common wrapper patterns
 		if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
 			currentConn = wrapper.Unwrap()
-		} else if proxy, ok := currentConn.(*proxyProtocolConn); ok {
-			currentConn = proxy.Conn
-		} else if limiting, ok := currentConn.(*connectionLimitingConn); ok {
-			currentConn = limiting.Conn
 		} else {
 			break
 		}
@@ -1034,31 +1017,33 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		},
 	}
 
-	if s.tlsConfig != nil {
-		// Create base TCP listener with custom backlog
-		tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", imapAddr, s.listenBacklog)
-		if err != nil {
-			return fmt.Errorf("failed to create TCP listener: %w", err)
-		}
-		logger.Debug("IMAP: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
+	// Create base TCP listener with custom backlog
+	tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", imapAddr, s.listenBacklog)
+	if err != nil {
+		return fmt.Errorf("failed to create TCP listener: %w", err)
+	}
+	logger.Debug("IMAP: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
 
+	// The PROXY protocol header travels in plaintext AHEAD of the TLS
+	// ClientHello, so the header reader must sit between the TCP socket and
+	// the TLS layer: the header is read from the raw stream, and the deferred
+	// TLS handshake then reads THROUGH the PROXY conn, consuming any
+	// ClientHello bytes its bufio buffered alongside the header. Wrapping in
+	// the other order makes the handshake read the raw socket and miss those
+	// bytes (broken PROXY+TLS combo).
+	base := serverPkg.WrapProxyProtocol(tcpListener, s.proxyReader, "IMAP")
+
+	if s.tlsConfig != nil {
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
-		listener = serverPkg.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
+		listener = serverPkg.NewSoraTLSListener(base, s.tlsConfig, connConfig)
 		if connConfig.EnableTimeoutChecker {
 			logger.Info("IMAP server listening with TLS", "name", s.name, "addr", imapAddr, "ja4", true, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
 		} else {
 			logger.Info("IMAP server listening with TLS", "name", s.name, "addr", imapAddr, "ja4", true)
 		}
 	} else {
-		// Create base TCP listener with custom backlog
-		tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", imapAddr, s.listenBacklog)
-		if err != nil {
-			return fmt.Errorf("failed to create listener: %w", err)
-		}
-		logger.Debug("IMAP: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
-
 		// Use SoraListener for non-TLS with timeout protection
-		listener = serverPkg.NewSoraListener(tcpListener, connConfig)
+		listener = serverPkg.NewSoraListener(base, connConfig)
 		if connConfig.EnableTimeoutChecker {
 			logger.Info("IMAP server listening", "name", s.name, "addr", imapAddr, "tls", false, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
 		} else {
@@ -1066,17 +1051,6 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 		}
 	}
 	defer listener.Close()
-	defer func() {
-		_ = listener.Close()
-	}()
-
-	// Wrap listener with PROXY protocol support if enabled
-	if s.proxyReader != nil {
-		listener = &proxyProtocolListener{
-			Listener:    listener,
-			proxyReader: s.proxyReader,
-		}
-	}
 
 	// Wrap listener with connection limiting, rate limiting, and startup throttling
 	limitedListener := &connectionLimitingListener{
@@ -1228,62 +1202,6 @@ func (s *IMAPServer) GetTotalConnections() int64 {
 // GetAuthenticatedConnections returns the current authenticated connection count
 func (s *IMAPServer) GetAuthenticatedConnections() int64 {
 	return s.authenticatedConnections.Load()
-}
-
-// proxyProtocolListener wraps a listener to handle PROXY protocol
-type proxyProtocolListener struct {
-	net.Listener
-	proxyReader *serverPkg.ProxyProtocolReader
-}
-
-func (l *proxyProtocolListener) Accept() (net.Conn, error) {
-	for {
-		conn, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-
-		// Try to read PROXY protocol header
-		proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
-		if err == nil {
-			// PROXY header found and parsed successfully.
-			return &proxyProtocolConn{
-				Conn:      wrappedConn,
-				proxyInfo: proxyInfo,
-			}, nil
-		}
-
-		// An error occurred. Check if we are in "optional" mode and the error is simply that no PROXY header was present.
-		// This requires the underlying ProxyProtocolReader to be updated to return a specific error (e.g., serverPkg.ErrNoProxyHeader)
-		// and to not consume bytes from the connection if no header is found.
-		if l.proxyReader.IsOptionalMode() && errors.Is(err, serverPkg.ErrNoProxyHeader) {
-			// Note: We don't have access to server name in this listener, use generic IMAP
-			logger.Debug("IMAP: No PROXY protocol header, treating as direct connection in optional mode", "remote", server.GetAddrString(conn.RemoteAddr()))
-			// The wrappedConn should be the original connection, possibly with a buffered reader.
-			return wrappedConn, nil
-		}
-
-		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
-		conn.Close()
-		// Note: We don't have access to server name in this listener, use generic IMAP
-		logger.Debug("IMAP: PROXY protocol error, rejecting connection", "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
-		continue
-	}
-}
-
-// proxyProtocolConn wraps a connection with PROXY protocol information
-type proxyProtocolConn struct {
-	net.Conn
-	proxyInfo *serverPkg.ProxyProtocolInfo
-}
-
-func (c *proxyProtocolConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
-	return c.proxyInfo
-}
-
-// Unwrap returns the underlying connection for connection unwrapping
-func (c *proxyProtocolConn) Unwrap() net.Conn {
-	return c.Conn
 }
 
 // warmupStateFile is the filename for persisting warmup timestamps across restarts.

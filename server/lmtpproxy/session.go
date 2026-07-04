@@ -128,12 +128,13 @@ func (s *Session) handleConnection() {
 	// Register this session for graceful shutdown tracking
 	s.server.registerSession(s)
 
-	// Perform TLS handshake if this is a TLS connection
-	if tlsConn, ok := s.clientConn.(interface{ PerformHandshake() error }); ok {
-		if err := tlsConn.PerformHandshake(); err != nil {
-			s.DebugLog("TLS handshake failed", "error", err)
-			return
-		}
+	// Complete the deferred TLS handshake (implicit-TLS listeners). The helper
+	// walks the Unwrap() chain, so the handshake runs through the PROXY conn
+	// and consumes any ClientHello bytes buffered alongside the PROXY header.
+	// Failure is a silent close: no plaintext banner onto a broken TLS stream.
+	if _, err := server.PerformDeferredTLSHandshake(s.clientConn); err != nil {
+		s.DebugLog("TLS handshake failed", "error", err)
+		return
 	}
 
 	// Send greeting

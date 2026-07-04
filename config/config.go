@@ -898,6 +898,7 @@ type ServerConfig struct {
 	RemoteTLS              bool     `toml:"remote_tls,omitempty"`
 	RemoteTLSUseStartTLS   bool     `toml:"remote_tls_use_starttls,omitempty"` // Use STARTTLS for backend connections
 	RemoteTLSVerify        bool     `toml:"remote_tls_verify,omitempty"`
+	RemoteTLSCAFile        string   `toml:"remote_tls_ca_file,omitempty"` // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
 	RemoteUseProxyProtocol bool     `toml:"remote_use_proxy_protocol,omitempty"`
 	RemoteUseIDCommand     bool     `toml:"remote_use_id_command,omitempty"`
 	RemoteUseXCLIENT       bool     `toml:"remote_use_xclient,omitempty"`

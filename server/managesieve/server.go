@@ -398,18 +398,28 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		},
 	}
 
+	// Create TCP listener with custom backlog
+	tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create TCP listener: %w", err)
+		return
+	}
+	logger.Debug("ManageSieve: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
+
+	// The PROXY protocol header travels in plaintext AHEAD of the TLS
+	// ClientHello, so the header reader must sit between the TCP socket and
+	// the TLS layer: the header is read from the raw stream, and the deferred
+	// TLS handshake then reads THROUGH the PROXY conn, consuming any
+	// ClientHello bytes its bufio buffered alongside the header. Wrapping in
+	// the other order makes the handshake read the raw socket and miss those
+	// bytes (broken PROXY+TLS combo). STARTTLS listeners are unaffected (TLS
+	// is negotiated in-protocol, long after the header).
+	base := serverPkg.WrapProxyProtocol(tcpListener, s.proxyReader, "ManageSieve")
+
 	isImplicitTLS := s.tlsConfig != nil && !s.useStartTLS
 	// Only use a TLS listener if we're not using StartTLS and TLS is enabled
 	if isImplicitTLS {
-		// Implicit TLS - create TCP listener with custom backlog
-		tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-		if err != nil {
-			errChan <- fmt.Errorf("failed to create TCP listener: %w", err)
-			return
-		}
-		logger.Debug("ManageSieve: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
-
-		listener = serverPkg.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
+		listener = serverPkg.NewSoraTLSListener(base, s.tlsConfig, connConfig)
 		if connConfig.EnableTimeoutChecker {
 			logger.Info("ManageSieve server listening with TLS", "name", s.name, "addr", s.addr, "idle_timeout",
 				s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
@@ -417,15 +427,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			logger.Info("ManageSieve server listening with TLS", "name", s.name, "addr", s.addr)
 		}
 	} else {
-		// Create TCP listener with custom backlog
-		tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-		if err != nil {
-			errChan <- fmt.Errorf("failed to create listener: %w", err)
-			return
-		}
-		logger.Debug("ManageSieve: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
-
-		listener = serverPkg.NewSoraListener(tcpListener, connConfig)
+		listener = serverPkg.NewSoraListener(base, connConfig)
 		if connConfig.EnableTimeoutChecker {
 			logger.Info("ManageSieve server listening", "name", s.name, "addr", s.addr, "tls", false, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
 		} else {
@@ -433,14 +435,6 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		}
 	}
 	defer listener.Close()
-
-	// Wrap listener with PROXY protocol support if enabled
-	if s.proxyReader != nil {
-		listener = &proxyProtocolListener{
-			Listener:    listener,
-			proxyReader: s.proxyReader,
-		}
-	}
 
 	// Use a goroutine to monitor application context cancellation
 	go func() {
@@ -464,12 +458,6 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 
 		conn, err := listener.Accept()
 		if err != nil {
-			// Check if this is a PROXY protocol error (connection-specific, not fatal)
-			if errors.Is(err, errProxyProtocol) {
-				logger.Debug("ManageSieve: rejecting connection", "name", s.name, "error", err)
-				continue // Continue accepting other connections
-			}
-
 			// Check if the error is due to the listener being closed (graceful shutdown)
 			select {
 			case <-s.appCtx.Done():
@@ -482,14 +470,13 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			}
 		}
 
-		// Extract real client IP and proxy IP from PROXY protocol if available for connection limiting
-		var proxyInfoForLimiting *serverPkg.ProxyProtocolInfo
+		// Extract real client IP from PROXY protocol if available for
+		// connection limiting. The PROXY conn sits INSIDE the TLS layer (the
+		// header is read from the raw stream before the handshake); this runs
+		// before the deferred TLS handshake in handleConnection.
 		var realClientIP string
-		if proxyConn, ok := conn.(*proxyProtocolConn); ok {
-			proxyInfoForLimiting = proxyConn.GetProxyInfo()
-			if proxyInfoForLimiting != nil && proxyInfoForLimiting.SrcIP != "" {
-				realClientIP = proxyInfoForLimiting.SrcIP
-			}
+		if info := serverPkg.GetProxyProtocolInfo(conn); info != nil && info.SrcIP != "" {
+			realClientIP = info.SrcIP
 		}
 
 		// Check connection limits with PROXY protocol support
@@ -522,21 +509,7 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 		}
 
 		// Extract real client IP and proxy IP from PROXY protocol if available
-		// Need to unwrap connection layers to get to proxyProtocolConn
-		var proxyInfo *serverPkg.ProxyProtocolInfo
-		currentConn := conn
-		for currentConn != nil {
-			if proxyConn, ok := currentConn.(*proxyProtocolConn); ok {
-				proxyInfo = proxyConn.GetProxyInfo()
-				break
-			}
-			// Try to unwrap the connection
-			if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
-				currentConn = wrapper.Unwrap()
-			} else {
-				break
-			}
-		}
+		proxyInfo := serverPkg.GetProxyProtocolInfo(conn)
 
 		clientIP, proxyIP := serverPkg.GetConnectionIPs(conn, proxyInfo)
 		session.RemoteIP = clientIP
@@ -685,59 +658,6 @@ func (s *ManageSieveServer) GetTotalConnections() int64 {
 // GetAuthenticatedConnections returns the current authenticated connection count
 func (s *ManageSieveServer) GetAuthenticatedConnections() int64 {
 	return s.authenticatedConnections.Load()
-}
-
-var errProxyProtocol = errors.New("PROXY protocol error")
-
-// proxyProtocolListener wraps a listener to handle PROXY protocol
-type proxyProtocolListener struct {
-	net.Listener
-	proxyReader *serverPkg.ProxyProtocolReader
-}
-
-func (l *proxyProtocolListener) Accept() (net.Conn, error) {
-	for {
-		conn, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-
-		// Try to read PROXY protocol header
-		proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
-		if err == nil {
-			// PROXY header found and parsed successfully.
-			return &proxyProtocolConn{
-				Conn:      wrappedConn,
-				proxyInfo: proxyInfo,
-			}, nil
-		}
-
-		// An error occurred. Check if we are in "optional" mode and the error is simply that no PROXY header was present.
-		// This requires the underlying ProxyProtocolReader to be updated to return a specific error (e.g., serverPkg.ErrNoProxyHeader)
-		// and to not consume bytes from the connection if no header is found.
-		if l.proxyReader.IsOptionalMode() && errors.Is(err, serverPkg.ErrNoProxyHeader) {
-			// Note: We don't have access to server name in this listener, use generic ManageSieve
-			logger.Debug("ManageSieve: No PROXY protocol header - treating as direct", "remote", serverPkg.GetAddrString(conn.RemoteAddr()))
-			// The wrappedConn should be the original connection, possibly with a buffered reader.
-			return wrappedConn, nil
-		}
-
-		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
-		conn.Close()
-		// Note: We don't have access to server name in this listener, use generic ManageSieve
-		logger.Debug("ManageSieve: PROXY protocol error - rejecting", "remote", serverPkg.GetAddrString(conn.RemoteAddr()), "error", err)
-		continue
-	}
-}
-
-// proxyProtocolConn wraps a connection with PROXY protocol information
-type proxyProtocolConn struct {
-	net.Conn
-	proxyInfo *serverPkg.ProxyProtocolInfo
-}
-
-func (c *proxyProtocolConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
-	return c.proxyInfo
 }
 
 // monitorActiveSessions periodically logs active session count for monitoring

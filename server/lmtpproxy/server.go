@@ -361,7 +361,7 @@ func (s *Server) Start() error {
 		}
 		logger.Debug("LMTP Proxy: Using listen backlog with per-server TLS (implicit)", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraTLSListener for implicit TLS with JA4 capture
-		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
+		s.listener = server.NewSoraTLSListener(s.wrapProxyProtocol(tcpListener), s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
 	} else if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
 		// Scenario 2: Global TLS manager (implicit TLS)
@@ -374,7 +374,7 @@ func (s *Server) Start() error {
 		}
 		logger.Debug("LMTP Proxy: Using listen backlog with global TLS manager (implicit)", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraTLSListener with global TLS config for implicit TLS
-		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
+		s.listener = server.NewSoraTLSListener(s.wrapProxyProtocol(tcpListener), s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
 	} else if s.tls && s.tlsUseStartTLS {
 		// Scenario 3: STARTTLS mode - plain listener, TLS upgrade happens in session
@@ -387,7 +387,7 @@ func (s *Server) Start() error {
 		}
 		logger.Debug("LMTP Proxy: Using listen backlog with STARTTLS mode", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use plain SoraListener - TLS upgrade handled in session after STARTTLS command
-		s.listener = server.NewSoraListener(tcpListener, connConfig)
+		s.listener = server.NewSoraListener(s.wrapProxyProtocol(tcpListener), connConfig)
 		s.listenerMu.Unlock()
 	} else if s.tls {
 		// TLS enabled but no cert files and no global TLS config provided
@@ -404,7 +404,7 @@ func (s *Server) Start() error {
 		}
 		logger.Debug("LMTP Proxy: Using listen backlog (no TLS)", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraListener for non-TLS
-		s.listener = server.NewSoraListener(tcpListener, connConfig)
+		s.listener = server.NewSoraListener(s.wrapProxyProtocol(tcpListener), connConfig)
 		s.listenerMu.Unlock()
 	}
 
@@ -497,22 +497,11 @@ func (s *Server) acceptConnections() error {
 			}
 		}
 
-		// Read PROXY protocol header if enabled
-		var proxyInfo *server.ProxyProtocolInfo
-		var wrappedConn net.Conn
-		if s.proxyReader != nil {
-			var err error
-			proxyInfo, wrappedConn, err = s.proxyReader.ReadProxyHeader(conn)
-			if err != nil {
-				logger.Error("PROXY protocol error", "proxy", s.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
-				conn.Close()
-				if releaseConn != nil {
-					releaseConn()
-				}
-				continue // Try to accept the next connection
-			}
-			conn = wrappedConn // Use wrapped connection that has buffered reader
-		}
+		// PROXY protocol handling happens inside the listener chain (the
+		// header must be read from the raw stream BEFORE the TLS wrapper);
+		// discover the PROXY info via the wrapper-chain walk. This runs
+		// BEFORE the deferred TLS handshake in handleConnection.
+		proxyInfo := server.GetProxyProtocolInfo(conn)
 
 		s.wg.Add(1)
 		go func() {
@@ -748,4 +737,12 @@ func (s *Server) monitorActiveSessions() {
 			return
 		}
 	}
+}
+
+// wrapProxyProtocol inserts the PROXY protocol listener between the TCP
+// socket and the TLS layer when PROXY support is enabled — see
+// server.ProxyProtocolListener for the composition rule. STARTTLS listeners
+// are unaffected (TLS is negotiated in-protocol, long after the header).
+func (s *Server) wrapProxyProtocol(l net.Listener) net.Listener {
+	return server.WrapProxyProtocol(l, s.proxyReader, "LMTP-PROXY")
 }

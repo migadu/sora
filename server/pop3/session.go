@@ -28,7 +28,7 @@ import (
 	"github.com/migadu/go-pop3/pop3server"
 )
 
-const Pop3MaxErrorsAllowed = 3                  // Maximum number of errors tolerated before the connection is terminated
+const Pop3MaxErrorsAllowed = 4                  // Disconnect when the error count reaches this; pre-migration parity (old code closed on the 4th error)
 const Pop3ErrorDelay = 3 * time.Second          // Wait for this many seconds before allowing another command
 const Pop3DefaultIdleTimeout = 10 * time.Minute // RFC 1939 §3: auto-logout timer MUST be at least 10 minutes
 const Pop3MaxLineLength = 1024                  // RFC 1939 §3: commands and responses limited to 512 octets (use 1024 for safety)
@@ -56,7 +56,6 @@ type POP3Session struct {
 	inboxMailboxID   int64              // POP3 suppots only INBOX
 	ctx              context.Context    // Context for this session
 	cancel           context.CancelFunc // Function to cancel the session's context
-	errorsCount      int                // Number of errors encountered during the session
 	language         string             // Current language for responses (default "en")
 	utf8Mode         atomic.Bool        // UTF8 mode enabled for this session
 	xclientApplied   bool               // Whether a trusted XCLIENT has already been accepted (pre-auth, at most once)
@@ -75,10 +74,23 @@ type POP3Session struct {
 // response code explicit and guarantees no internal error text (DB drivers,
 // S3 keys) reaches the wire; StrictSessionErrors masks anything else.
 var (
-	errNoSuchMessage   = &pop3server.Error{Message: "No such message"}
+	errNoSuchMessage = &pop3server.Error{Message: "No such message"}
+	// A second DELE on the same message must be -ERR (a pre-migration bug
+	// replied +OK) and the wording must keep the phrase "already deleted" —
+	// RFC 1939's canonical DELE example replies "-ERR message 2 already
+	// deleted" and clients/scripts match on it. Pinned by
+	// integration_tests/pop3/tdd_top_retr_test.go.
 	errMessageDeleted  = &pop3server.Error{Message: "Message already deleted"}
 	errMsgNotAvailable = &pop3server.Error{Message: "Message not available"}
 	errEmptyBody       = &pop3server.Error{Message: "Message body is empty"}
+	// errAuthFailed is the single reply for EVERY authentication rejection —
+	// wrong password, unknown user, AND rate-limited attempts (see the
+	// authLimiter check in authenticate). Keeping them byte-identical is
+	// deliberate: a distinguishable throttle reply ([LOGIN-DELAY], "too many
+	// attempts") is an oracle that lets credential-stuffers detect when the
+	// limiter engages, pace just under it, and separate "throttled, untested"
+	// from "tested and wrong". RFC 3206 [AUTH] is the code for rejected
+	// authentication; [LOGIN-DELAY] would imply the credentials were valid.
 	errAuthFailed      = &pop3server.Error{Code: "AUTH", Message: "Authentication failed"}
 	errTempUnavailable = &pop3server.Error{Code: "SYS/TEMP", Message: "Service temporarily unavailable, please try again later"}
 	errBodyRetryLater  = &pop3server.Error{Code: "SYS/TEMP", Message: "Message temporarily unavailable, please try again later"}
@@ -189,6 +201,19 @@ func (s *POP3Session) loadMessagesIfNeeded(ctx context.Context) error {
 }
 
 func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, password string, isSASL bool) (int64, error) {
+	start := time.Now()
+	defer func() {
+		metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
+	}()
+
+	// Legacy compatibility (pre-migration parity): USER/PASS arguments wrapped
+	// in double quotes are unquoted. SASL fields come from base64 and were
+	// never unquoted.
+	if !isSASL {
+		username = server.UnquoteString(username)
+		password = server.UnquoteString(password)
+	}
+
 	// Apply progressive authentication delay BEFORE any other checks
 	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 	delayType := "POP3-PASS"
@@ -227,6 +252,8 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 				s.DebugLog("rate limited", "error", err)
 			}
 			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "rate_limited").Inc()
+			// Reply exactly like a bad password (see errAuthFailed): a
+			// distinguishable throttle reply would be a brute-force oracle.
 			return 0, errAuthFailed
 		}
 	}
@@ -372,11 +399,15 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	s.server.authenticatedConnections.Add(1)
 
 	if masterAuthUsed {
-		s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master")
+		s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", time.Since(start).Seconds()))
 	}
 
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
 	s.authenticated.Store(true)
+
+	// Track domain and user connection activity
+	metrics.TrackDomainConnection("pop3", s.Domain())
+	metrics.TrackUserActivity("pop3", s.FullAddress(), "connection", 1)
 
 	// Register connection
 	s.registerConnection(userAddress.FullAddress())
@@ -638,6 +669,11 @@ func (s *POP3Session) Dele(ctx context.Context, msg int) error {
 	}
 	if s.deleted[msg-1] {
 		return errMessageDeleted
+	}
+	// A zero UID is a placeholder row that must never reach ExpungeMessageUIDs
+	// (it would expunge nothing or the wrong message).
+	if s.messages[msg-1].UID == 0 {
+		return errNoSuchMessage
 	}
 
 	s.deleted[msg-1] = true

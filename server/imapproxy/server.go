@@ -471,7 +471,7 @@ func (s *Server) Start() error {
 				_, _ = fmt.Fprint(conn, message)
 			},
 		}
-		s.listener = server.NewSoraTLSListener(tcpListener, tlsConfig, connConfig)
+		s.listener = server.NewSoraTLSListener(s.wrapProxyProtocol(tcpListener), tlsConfig, connConfig)
 		s.listenerMu.Unlock()
 	} else if s.tls && s.tlsConfig != nil {
 		// Scenario 2: Global TLS manager
@@ -508,7 +508,7 @@ func (s *Server) Start() error {
 				_, _ = fmt.Fprint(conn, message)
 			},
 		}
-		s.listener = server.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
+		s.listener = server.NewSoraTLSListener(s.wrapProxyProtocol(tcpListener), s.tlsConfig, connConfig)
 		s.listenerMu.Unlock()
 	} else if s.tls {
 		// TLS enabled but no cert files and no global TLS config provided
@@ -549,7 +549,7 @@ func (s *Server) Start() error {
 				_, _ = fmt.Fprint(conn, message)
 			},
 		}
-		s.listener = server.NewSoraListener(tcpListener, connConfig)
+		s.listener = server.NewSoraListener(s.wrapProxyProtocol(tcpListener), connConfig)
 		s.listenerMu.Unlock()
 	}
 
@@ -886,4 +886,11 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 // GetLimiter returns the connection limiter for testing purposes
 func (s *Server) GetLimiter() *server.ConnectionLimiter {
 	return s.limiter
+}
+
+// wrapProxyProtocol inserts the PROXY protocol listener between the TCP
+// socket and the TLS layer when PROXY support is enabled — see
+// server.ProxyProtocolListener for the composition rule.
+func (s *Server) wrapProxyProtocol(l net.Listener) net.Listener {
+	return server.WrapProxyProtocol(l, s.proxyReader, "IMAP-PROXY")
 }

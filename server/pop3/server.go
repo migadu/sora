@@ -381,6 +381,15 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	return server, nil
 }
 
+// knownCommands is the closed set of POP3 verbs used as Prometheus label
+// values; anything else is recorded as "UNKNOWN" to keep cardinality bounded.
+var knownCommands = map[string]bool{
+	"USER": true, "PASS": true, "APOP": true, "AUTH": true, "CAPA": true,
+	"STLS": true, "STAT": true, "LIST": true, "UIDL": true, "RETR": true,
+	"TOP": true, "DELE": true, "NOOP": true, "RSET": true, "QUIT": true,
+	"UTF8": true, "LANG": true, "LAST": true, "XCLIENT": true,
+}
+
 // buildLibServer constructs the go-pop3 protocol server from the current
 // runtime settings. It is called at startup and again from ReloadConfig so
 // SIGHUP-reloaded timeouts apply to new connections (existing connections keep
@@ -413,28 +422,40 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
 			// Connection limiting check
 			netConn := c.NetConn()
-			var proxyInfo *serverPkg.ProxyProtocolInfo
-			currentConn := netConn
-			for currentConn != nil {
-				if proxyConn, ok := currentConn.(*proxyProtocolConn); ok {
-					proxyInfo = proxyConn.GetProxyInfo()
-					break
-				}
-				if wrapper, ok := currentConn.(interface{ Unwrap() net.Conn }); ok {
-					currentConn = wrapper.Unwrap()
-				} else {
-					break
-				}
-			}
+			proxyInfo := serverPkg.GetProxyProtocolInfo(netConn)
 
 			clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
 
-			// Limiter checks. Silent close, no banner: matches the previous
-			// accept-loop rejection so limited peers learn nothing.
+			// Limiter checks. DELIBERATE silent close, no banner: matches the
+			// previous accept-loop rejection (drop before any greeting), and
+			// an "-ERR too many connections" banner would tell a flooder
+			// exactly when the limiter engages so they can pace under it.
+			// Test-enforced (connection-limit tests assert the rejected
+			// socket never sees "+OK") — do not add a banner.
 			releaseConn, err := s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), clientIP)
 			if err != nil {
 				return nil, fmt.Errorf("%w: %w", pop3server.ErrSilentReject, err)
 			}
+
+			// Implicit-TLS listeners (SoraTLSListener) defer the TLS handshake
+			// so a PROXY header can be read in plaintext first; the library
+			// never triggers it, so complete it here — after the limiter
+			// (rejected peers never cost a handshake) and before the greeting
+			// is written. This also captures JA4 and registers the connection
+			// timeout checker for TLS connections.
+			if didTLS, err := serverPkg.PerformDeferredTLSHandshake(netConn); err != nil {
+				releaseConn()
+				logger.Debug("POP3: TLS handshake failed", "name", s.name, "remote", serverPkg.GetAddrString(netConn.RemoteAddr()), "error", err)
+				return nil, fmt.Errorf("%w: TLS handshake: %w", pop3server.ErrSilentReject, err)
+			} else if didTLS {
+				c.SetTLS(true)
+			}
+
+			// Count the connection only once it is past every rejection point,
+			// so the decrements in the session close path always balance.
+			s.totalConnections.Add(1)
+			metrics.ConnectionsTotal.WithLabelValues("pop3", s.name, s.hostname).Inc()
+			metrics.ConnectionsCurrent.WithLabelValues("pop3", s.name, s.hostname).Inc()
 
 			sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 			memTracker := serverPkg.NewSessionMemoryTracker(s.sessionMemoryLimit)
@@ -459,7 +480,7 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 			session.Stats = s
 			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "POP3", session.InfoLog)
 
-			session.DebugLog("new connection")
+			session.InfoLog("connected")
 			s.addSession(session)
 
 			return session, nil
@@ -492,6 +513,12 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 			return true, false
 		},
 		OnCommand: func(cmd string, dur time.Duration, err error) {
+			// The verb comes straight off the client line; bound the metric
+			// label set to known commands so clients cannot mint unbounded
+			// Prometheus label values.
+			if !knownCommands[cmd] {
+				cmd = "UNKNOWN"
+			}
 			status := "success"
 			if err != nil {
 				status = "failure"
@@ -536,35 +563,35 @@ func (s *POP3Server) Start(errChan chan error) {
 		},
 	}
 
-	if s.tlsConfig != nil {
-		// Create base TCP listener with custom backlog
-		tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-		if err != nil {
-			s.cancel()
-			errChan <- fmt.Errorf("failed to create TCP listener: %w", err)
-			return
-		}
-		logger.Debug("POP3: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
+	// Create base TCP listener with custom backlog
+	tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
+	if err != nil {
+		s.cancel()
+		errChan <- fmt.Errorf("failed to create TCP listener: %w", err)
+		return
+	}
+	logger.Debug("POP3: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
 
+	// The PROXY protocol header travels in plaintext AHEAD of the TLS
+	// ClientHello, so the header reader must sit between the TCP socket and
+	// the TLS layer: the header is read from the raw stream, and the deferred
+	// TLS handshake then reads THROUGH the PROXY conn, consuming any
+	// ClientHello bytes its bufio buffered alongside the header. Wrapping in
+	// the other order makes the handshake read the raw socket and miss those
+	// bytes (broken PROXY+TLS combo).
+	base := serverPkg.WrapProxyProtocol(tcpListener, s.proxyReader, "POP3")
+
+	if s.tlsConfig != nil {
 		// Use SoraTLSListener for TLS with timeout protection
-		listener = serverPkg.NewSoraTLSListener(tcpListener, s.tlsConfig, connConfig)
+		listener = serverPkg.NewSoraTLSListener(base, s.tlsConfig, connConfig)
 		if connConfig.EnableTimeoutChecker {
 			logger.Info("POP3 server listening with TLS", "name", s.name, "addr", s.addr, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
 		} else {
 			logger.Info("POP3 server listening with TLS", "name", s.name, "addr", s.addr)
 		}
 	} else {
-		// Create base TCP listener with custom backlog
-		tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-		if err != nil {
-			s.cancel()
-			errChan <- fmt.Errorf("failed to create listener: %w", err)
-			return
-		}
-		logger.Debug("POP3: Using custom listen backlog", "server", s.name, "backlog", s.listenBacklog)
-
 		// Use SoraListener for non-TLS with timeout protection
-		listener = serverPkg.NewSoraListener(tcpListener, connConfig)
+		listener = serverPkg.NewSoraListener(base, connConfig)
 		if connConfig.EnableTimeoutChecker {
 			logger.Info("POP3 server listening", "name", s.name, "addr", s.addr, "tls", false, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
 		} else {
@@ -572,14 +599,6 @@ func (s *POP3Server) Start(errChan chan error) {
 		}
 	}
 	defer listener.Close()
-
-	// Wrap listener with PROXY protocol support if enabled
-	if s.proxyReader != nil {
-		listener = &proxyProtocolListener{
-			Listener:    listener,
-			proxyReader: s.proxyReader,
-		}
-	}
 
 	// Use a goroutine to monitor application context cancellation
 	go func() {
@@ -603,12 +622,6 @@ func (s *POP3Server) Start(errChan chan error) {
 
 		conn, err := listener.Accept()
 		if err != nil {
-			// Check if this is a PROXY protocol error (connection-specific, not fatal)
-			if errors.Is(err, errProxyProtocol) {
-				logger.Debug("POP3: rejecting connection", "name", s.name, "error", err)
-				continue
-			}
-
 			// Check if the error is due to the listener being closed (graceful shutdown)
 			select {
 			case <-s.appCtx.Done():
@@ -621,11 +634,10 @@ func (s *POP3Server) Start(errChan chan error) {
 			}
 		}
 
-		s.totalConnections.Add(1)
-
-		// Prometheus metrics - connection established
-		metrics.ConnectionsTotal.WithLabelValues("pop3", s.name, s.hostname).Inc()
-		metrics.ConnectionsCurrent.WithLabelValues("pop3", s.name, s.hostname).Inc()
+		// Connection counters are incremented in NewSession once the
+		// connection is past the limiter and TLS handshake, so rejected
+		// connections never inflate the gauges (they have no session to
+		// decrement them).
 
 		s.sessionsWg.Add(1)
 		go func() {
@@ -661,6 +673,15 @@ func (s *POP3Server) Close() {
 	// This will propagate to all session contexts
 	if s.cancel != nil {
 		s.cancel()
+	}
+
+	// Also cancel the library-side connection contexts so in-flight
+	// per-command work (DB/S3 calls, error delays) aborts instead of running
+	// to its own timeout. Sessions accepted under a pre-SIGHUP snapshot are
+	// not covered here, but the shutdown broadcast above already closed their
+	// sockets.
+	if lib := s.pop3libServer.Load(); lib != nil {
+		lib.Close()
 	}
 
 	// Step 3: Wait for active sessions to finish gracefully (with timeout)
@@ -746,64 +767,6 @@ func (s *POP3Server) GetAuthenticatedConnections() int64 {
 	return s.authenticatedConnections.Load()
 }
 
-var errProxyProtocol = errors.New("PROXY protocol error")
-
-// proxyProtocolListener wraps a listener to handle PROXY protocol
-type proxyProtocolListener struct {
-	net.Listener
-	proxyReader *serverPkg.ProxyProtocolReader
-}
-
-func (l *proxyProtocolListener) Accept() (net.Conn, error) {
-	for {
-		conn, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-
-		// Try to read PROXY protocol header
-		proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
-		if err == nil {
-			// PROXY header found and parsed successfully.
-			return &proxyProtocolConn{
-				Conn:      wrappedConn,
-				proxyInfo: proxyInfo,
-			}, nil
-		}
-
-		// An error occurred. Check if we are in "optional" mode and the error is simply that no PROXY header was present.
-		// This requires the underlying ProxyProtocolReader to be updated to return a specific error (e.g., serverPkg.ErrNoProxyHeader)
-		// and to not consume bytes from the connection if no header is found.
-		if l.proxyReader.IsOptionalMode() && errors.Is(err, serverPkg.ErrNoProxyHeader) {
-			// Note: We don't have access to server name in this listener, use generic POP3
-			logger.Debug("POP3: No PROXY protocol header - treating as direct", "remote", serverPkg.GetAddrString(conn.RemoteAddr()))
-			// The wrappedConn should be the original connection, possibly with a buffered reader.
-			return wrappedConn, nil
-		}
-
-		// For all other errors (e.g., malformed header), or if in "required" mode, reject the connection.
-		conn.Close()
-		// Note: We don't have access to server name in this listener, use generic POP3
-		logger.Debug("POP3: PROXY protocol error - rejecting", "remote", serverPkg.GetAddrString(conn.RemoteAddr()), "error", err)
-		continue
-	}
-}
-
-// proxyProtocolConn wraps a connection with PROXY protocol information
-type proxyProtocolConn struct {
-	net.Conn
-	proxyInfo *serverPkg.ProxyProtocolInfo
-}
-
-func (c *proxyProtocolConn) GetProxyInfo() *serverPkg.ProxyProtocolInfo {
-	return c.proxyInfo
-}
-
-// Unwrap returns the underlying connection for connection unwrapping
-func (c *proxyProtocolConn) Unwrap() net.Conn {
-	return c.Conn
-}
-
 // monitorActiveSessions periodically logs active session count for monitoring
 func (s *POP3Server) monitorActiveSessions() {
 	// Log every 5 minutes (similar to connection tracker cleanup interval)
@@ -841,9 +804,15 @@ func (s *POP3Server) GetLimiter() *serverPkg.ConnectionLimiter {
 func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != s.commandTimeout {
-		s.commandTimeout = timeout
+	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != s.libCommandTimeout {
+		// Mirror construction: the raw value feeds the per-command execution
+		// timeout (0 = disabled) while the idle timeout keeps the RFC 1939 §3
+		// 10-minute floor.
 		s.libCommandTimeout = timeout
+		if timeout == 0 {
+			timeout = Pop3DefaultIdleTimeout
+		}
+		s.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
 	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != s.absoluteSessionTimeout {
