@@ -4,6 +4,7 @@
 package relay_test
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -61,17 +62,17 @@ func (s *testSMTPSession) AuthPlain(username, password string) error {
 	return nil
 }
 
-func (s *testSMTPSession) Mail(from string, opts *smtp.MailOptions) error {
+func (s *testSMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
 	s.from = from
 	return nil
 }
 
-func (s *testSMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
+func (s *testSMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
 	s.to = append(s.to, to)
 	return nil
 }
 
-func (s *testSMTPSession) Data(r io.Reader) error {
+func (s *testSMTPSession) Data(ctx context.Context, r io.Reader) error {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err

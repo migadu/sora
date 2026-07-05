@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -201,9 +202,9 @@ func GenerateSHA512HashHex(password string) string {
 // read concurrently.
 var BcryptCost = 12
 
-// SetBcryptCost sets the bcrypt cost (clamped to [10,14]) and regenerates the timing
-// dummy hash so DummyVerifyPassword keeps matching real-verify timing. Call once at
-// startup, before serving.
+// SetBcryptCost sets the bcrypt cost (clamped to [10,14]). Call once at
+// startup, before serving. The timing dummy hash used by DummyVerifyPassword
+// tracks the current cost automatically (see dummyHashForCurrentCost).
 func SetBcryptCost(cost int) {
 	if cost < 10 {
 		cost = 10
@@ -212,9 +213,6 @@ func SetBcryptCost(cost int) {
 		cost = 14
 	}
 	BcryptCost = cost
-	if h, err := bcrypt.GenerateFromPassword([]byte("sora-timing-equalization-placeholder"), BcryptCost); err == nil {
-		dummyBcryptHash = h
-	}
 }
 
 // GenerateBcryptHash creates a new bcrypt hash with the BLF-CRYPT prefix
@@ -288,22 +286,35 @@ func VerifyPassword(hashedPassword, password string) error {
 	}
 }
 
-// dummyBcryptHash is a fixed, valid bcrypt hash at the current default cost. It is never
-// a real credential — it exists only to burn the same CPU as a genuine password
-// verification on auth paths that would otherwise short-circuit (account not found).
-var dummyBcryptHash []byte
+// dummyHash caches a valid bcrypt hash at dummyHashCost. It is never a real
+// credential — it exists only to burn the same CPU as a genuine password
+// verification on auth paths that would otherwise short-circuit (account not
+// found). Generated lazily so it always tracks the current BcryptCost, no
+// matter when or how the cost was set (SetBcryptCost at startup, or a test
+// assigning BcryptCost directly in its own package init).
+var (
+	dummyHashMu   sync.Mutex
+	dummyHashCost int // 0 = not yet generated
+	dummyHash     []byte
+)
 
-func init() {
-	// Generated once at startup so the cost always tracks BcryptCost (rather than
-	// drifting if the bcrypt default changes). The one-time cost is negligible.
-	if h, err := bcrypt.GenerateFromPassword([]byte("sora-timing-equalization-placeholder"), BcryptCost); err == nil {
-		dummyBcryptHash = h
-	} else {
-		// Defensive: GenerateFromPassword effectively never fails. Fall back to a known
-		// valid cost-10 hash so DummyVerifyPassword still performs real bcrypt work
-		// (a malformed hash would return instantly and defeat timing equalization).
-		dummyBcryptHash = []byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy")
+// dummyHashForCurrentCost returns a valid bcrypt hash at the current
+// BcryptCost, regenerating the cached one when the cost changes.
+func dummyHashForCurrentCost() []byte {
+	dummyHashMu.Lock()
+	defer dummyHashMu.Unlock()
+	if dummyHashCost != BcryptCost {
+		if h, err := bcrypt.GenerateFromPassword([]byte("sora-timing-equalization-placeholder"), BcryptCost); err == nil {
+			dummyHash = h
+		} else {
+			// Defensive: GenerateFromPassword effectively never fails. Fall back to a known
+			// valid cost-10 hash so DummyVerifyPassword still performs real bcrypt work
+			// (a malformed hash would return instantly and defeat timing equalization).
+			dummyHash = []byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy")
+		}
+		dummyHashCost = BcryptCost
 	}
+	return dummyHash
 }
 
 // DummyVerifyPassword performs a constant-cost bcrypt comparison that always fails.
@@ -312,7 +323,7 @@ func init() {
 // a non-existent account returns measurably faster than an existing one, giving an
 // attacker a user-enumeration timing oracle. (security-audit M14)
 func DummyVerifyPassword(password string) {
-	_ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(password))
+	_ = bcrypt.CompareHashAndPassword(dummyHashForCurrentCost(), []byte(password))
 }
 
 // needsRehash checks if a bcrypt hash needs to be rehashed with the current default cost

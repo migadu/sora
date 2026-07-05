@@ -15,6 +15,7 @@ import (
 	"github.com/migadu/go-sieve"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
@@ -62,8 +63,10 @@ var (
 // AuthenticatePlain implements the SASL PLAIN authentication business logic.
 // The library has already handled the wire exchange (literal/continuation
 // framing, base64, NUL splitting, empty-password cheap reject) and the
-// transport-security and re-authentication gates.
-func (s *ManageSieveSession) AuthenticatePlain(_ context.Context, authzID, authnID, password string) error {
+// transport-security and re-authentication gates. ctx is the library's
+// per-command context: it aborts delay waits and DB calls promptly when the
+// connection or server goes away mid-command.
+func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, authnID, password string) error {
 	start := time.Now()
 	success := false
 	defer func() {
@@ -91,7 +94,7 @@ func (s *ManageSieveSession) AuthenticatePlain(_ context.Context, authzID, authn
 		netConn := s.conn
 		proxyInfo := s.proxyInfo()
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-		if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-MASTER"); err != nil {
+		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-MASTER"); err != nil {
 			if errors.Is(err, server.ErrDelayQueueFull) {
 				return errDelayQueueFul
 			}
@@ -99,7 +102,7 @@ func (s *ManageSieveSession) AuthenticatePlain(_ context.Context, authzID, authn
 			return &managesieveserver.Error{Message: "Authentication failed", Close: true}
 		}
 		if s.server.authLimiter != nil {
-			if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, authnParsed.BaseAddress()); err != nil {
+			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, authnParsed.BaseAddress()); err != nil {
 				s.DebugLog("rate limited", "error", err)
 				// Same response as bad credentials so rate-limit state isn't an oracle.
 				return errAuthFailed
@@ -109,7 +112,7 @@ func (s *ManageSieveSession) AuthenticatePlain(_ context.Context, authzID, authn
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
 			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authnParsed.BaseAddress(), true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authnParsed.BaseAddress(), true)
 			}
 			// Determine target user to impersonate
 			targetUserToImpersonate := authzID
@@ -126,7 +129,7 @@ func (s *ManageSieveSession) AuthenticatePlain(_ context.Context, authzID, authn
 				return &managesieveserver.Error{Message: "Invalid impersonation target user format"}
 			}
 
-			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
+			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
 			if err != nil {
 				s.WarnLog("failed to get account id for impersonation target", "target_user", targetUserToImpersonate, "error", err)
 				return &managesieveserver.Error{Message: "Impersonation target user not found"}
@@ -139,7 +142,7 @@ func (s *ManageSieveSession) AuthenticatePlain(_ context.Context, authzID, authn
 			// delay / blocking so the tenant-wide master password can't be
 			// brute-forced).
 			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authnParsed.BaseAddress(), false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authnParsed.BaseAddress(), false)
 			}
 			// Master username suffix was provided but master password was wrong - fail immediately
 			return &managesieveserver.Error{Message: "Invalid master credentials"}
@@ -175,7 +178,7 @@ func (s *ManageSieveSession) AuthenticatePlain(_ context.Context, authzID, authn
 			// Resolve the account by the base address (stripping any +detail
 			// or @suffix), consistent with the master-username path above and
 			// the IMAP/POP3 backends.
-			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
+			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
 			if err != nil {
 				s.WarnLog("failed to get account id for impersonation target", "target_user", authzID, "error", err)
 				return &managesieveserver.Error{Message: "Impersonation target user not found"}
@@ -207,7 +210,7 @@ func (s *ManageSieveSession) AuthenticatePlain(_ context.Context, authzID, authn
 
 		// Apply progressive authentication delay BEFORE any other checks
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-		if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-SASL"); err != nil {
+		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-SASL"); err != nil {
 			if errors.Is(err, server.ErrDelayQueueFull) {
 				// Delay queue full - reject immediately to prevent goroutine exhaustion
 				s.InfoLog("delay queue full, rejecting connection", "address", address.FullAddress())
@@ -219,7 +222,7 @@ func (s *ManageSieveSession) AuthenticatePlain(_ context.Context, authzID, authn
 
 		// Check authentication rate limiting after delay
 		if s.server.authLimiter != nil {
-			if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
+			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
 				s.DebugLog("rate limited", "error", err)
 				// Same response as a bad-credential failure so the rate-limit
 				// state isn't an observable oracle. (security-audit M14)
@@ -227,10 +230,10 @@ func (s *ManageSieveSession) AuthenticatePlain(_ context.Context, authzID, authn
 			}
 		}
 
-		accountID, err = s.server.Authenticate(s.ctx, address.BaseAddress(), password)
+		accountID, err = s.server.Authenticate(ctx, address.BaseAddress(), password)
 		if err != nil {
 			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.FullAddress(), false)
 			}
 			s.DebugLog("authentication failed")
 			return errAuthFailed
@@ -238,13 +241,13 @@ func (s *ManageSieveSession) AuthenticatePlain(_ context.Context, authzID, authn
 
 		// Record successful attempt
 		if s.server.authLimiter != nil {
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), true)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.FullAddress(), true)
 		}
 
 		targetAddress = &address
 	}
 
-	if err := s.completeAuthentication(*targetAddress, accountID, impersonating, start); err != nil {
+	if err := s.completeAuthentication(ctx, *targetAddress, accountID, impersonating, start); err != nil {
 		return err
 	}
 	success = true
@@ -253,8 +256,8 @@ func (s *ManageSieveSession) AuthenticatePlain(_ context.Context, authzID, authn
 
 // Login implements the non-standard LOGIN verb the backend has historically
 // accepted. The library has already handled unquoting and the TLS and
-// re-authentication gates.
-func (s *ManageSieveSession) Login(_ context.Context, username, password string) error {
+// re-authentication gates. ctx is the library's per-command context.
+func (s *ManageSieveSession) Login(ctx context.Context, username, password string) error {
 	start := time.Now()
 
 	address, err := server.NewAddress(username)
@@ -268,7 +271,7 @@ func (s *ManageSieveSession) Login(_ context.Context, username, password string)
 
 	// Apply progressive authentication delay BEFORE any other checks
 	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-LOGIN"); err != nil {
+	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-LOGIN"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			s.InfoLog("delay queue full, rejecting connection", "username", username)
@@ -280,7 +283,7 @@ func (s *ManageSieveSession) Login(_ context.Context, username, password string)
 
 	// Check authentication rate limiting after delay
 	if s.server.authLimiter != nil {
-		if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
+		if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, address.FullAddress()); err != nil {
 			var rateLimitErr *server.RateLimitError
 			if errors.As(err, &rateLimitErr) {
 				s.InfoLog("rate limit exceeded",
@@ -308,11 +311,11 @@ func (s *ManageSieveSession) Login(_ context.Context, username, password string)
 			authSuccess = true
 			masterAuthUsed = true
 			// Use base address (without suffix) to get account
-			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
+			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
 			if err != nil {
 				s.WarnLog("failed to get account id", "address", address.BaseAddress(), "error", err)
 				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.BaseAddress(), false)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.BaseAddress(), false)
 				}
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
 				return errAuthFailed
@@ -321,7 +324,7 @@ func (s *ManageSieveSession) Login(_ context.Context, username, password string)
 			// Record failed master password authentication
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
 			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.BaseAddress(), false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.BaseAddress(), false)
 			}
 			// Master username suffix was provided but master password was wrong - fail immediately
 			return &managesieveserver.Error{Message: "Invalid master credentials"}
@@ -341,11 +344,11 @@ func (s *ManageSieveSession) Login(_ context.Context, username, password string)
 			s.DebugLog("master sasl password authentication successful", "address", address.BaseAddress())
 			authSuccess = true
 			masterAuthUsed = true
-			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
+			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
 			if err != nil {
 				s.WarnLog("failed to get account id for master user", "address", address.BaseAddress(), "error", err)
 				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.BaseAddress(), false)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.BaseAddress(), false)
 				}
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
 				return errAuthFailed
@@ -355,10 +358,10 @@ func (s *ManageSieveSession) Login(_ context.Context, username, password string)
 
 	// If master password didn't work, try regular authentication
 	if !authSuccess {
-		accountID, err = s.server.Authenticate(s.ctx, address.BaseAddress(), password)
+		accountID, err = s.server.Authenticate(ctx, address.BaseAddress(), password)
 		if err != nil {
 			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.FullAddress(), false)
 			}
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
 			return errAuthFailed
@@ -367,24 +370,25 @@ func (s *ManageSieveSession) Login(_ context.Context, username, password string)
 
 	// Record successful attempt
 	if s.server.authLimiter != nil {
-		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, address.FullAddress(), true)
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, address.FullAddress(), true)
 	}
 
-	return s.completeAuthentication(address, accountID, masterAuthUsed, start)
+	return s.completeAuthentication(ctx, address, accountID, masterAuthUsed, start)
 }
 
 // completeAuthentication updates session state, counters, metrics, and
 // connection tracking after a successful credential check. Shared by
-// AuthenticatePlain and Login.
-func (s *ManageSieveSession) completeAuthentication(address server.Address, accountID int64, masterAuthUsed bool, start time.Time) error {
-	// Check if the context was cancelled during authentication logic
-	if s.ctx.Err() != nil {
+// AuthenticatePlain and Login. ctx is the per-command context; state that
+// outlives the command (the termination poller) stays on the session context.
+func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address server.Address, accountID int64, masterAuthUsed bool, start time.Time) error {
+	// Check if the command or session was cancelled during authentication logic
+	if ctx.Err() != nil || s.ctx.Err() != nil {
 		s.DebugLog("request aborted, aborting session update")
 		return errSessionClosed
 	}
 
 	// Acquire write lock for updating session authentication state
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "operation", "authenticate")
 		return errServerBusy
@@ -414,7 +418,7 @@ func (s *ManageSieveSession) completeAuthentication(address server.Address, acco
 	s.authenticated = true
 
 	// Register connection for tracking
-	s.registerConnection(address.FullAddress())
+	s.registerConnection(ctx, address.FullAddress())
 
 	// Start termination poller to check for kick commands
 	s.startTerminationPoller()
@@ -440,13 +444,17 @@ func (s *ManageSieveSession) proxyInfo() *server.ProxyProtocolInfo {
 // --- Script operations ---
 
 // sessionState snapshots the account and master-DB pin under the read lock,
-// returning a context that respects the session's master-DB pinning.
-func (s *ManageSieveSession) sessionState(command string) (accountID int64, readCtx context.Context, err error) {
-	if s.ctx.Err() != nil {
+// deriving from the library's per-command ctx a context that respects the
+// session's master-DB pinning. Basing everything on the command context means
+// blocked lock waits and DB calls abort promptly when the connection or
+// server goes away mid-command (the mutex helper additionally merges in the
+// session context).
+func (s *ManageSieveSession) sessionState(ctx context.Context, command string) (accountID int64, readCtx context.Context, err error) {
+	if ctx.Err() != nil || s.ctx.Err() != nil {
 		s.DebugLog("request aborted", "command", command)
 		return 0, nil, errSessionClosed
 	}
-	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire read lock", "command", command)
 		return 0, nil, errServerBusy
@@ -455,15 +463,20 @@ func (s *ManageSieveSession) sessionState(command string) (accountID int64, read
 	useMaster := s.useMasterDB
 	release()
 
-	readCtx = s.ctx
+	readCtx = ctx
 	if useMaster {
-		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 	return accountID, readCtx, nil
 }
 
 // pinToMasterDB pins the session to the master DB after a write so subsequent
-// reads in this session observe it (read replicas may lag).
+// reads in this session observe it (read replicas may lag). It deliberately
+// uses the session context, NOT the per-command context: a write that commits
+// just under the command deadline must still pin, or the command replies OK
+// while the next read silently hits a lagging replica (read-your-writes lost).
+// The flag set is a microsecond operation; the lock helper merges the session
+// context so teardown still aborts the wait.
 func (s *ManageSieveSession) pinToMasterDB(command string) {
 	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	if !acquired {
@@ -489,8 +502,10 @@ func (s *ManageSieveSession) validateSieveScript(content string) error {
 }
 
 // ListScripts implements managesieveserver.Session.
-func (s *ManageSieveSession) ListScripts(_ context.Context) ([]msieve.ScriptInfo, error) {
-	accountID, readCtx, err := s.sessionState("LISTSCRIPTS")
+func (s *ManageSieveSession) ListScripts(ctx context.Context) ([]msieve.ScriptInfo, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "LISTSCRIPTS", s.server.commandTimeouts)
+	defer cancel()
+	accountID, readCtx, err := s.sessionState(ctx, "LISTSCRIPTS")
 	if err != nil {
 		return nil, err
 	}
@@ -508,8 +523,10 @@ func (s *ManageSieveSession) ListScripts(_ context.Context) ([]msieve.ScriptInfo
 }
 
 // GetScript implements managesieveserver.Session.
-func (s *ManageSieveSession) GetScript(_ context.Context, name string) (string, error) {
-	accountID, readCtx, err := s.sessionState("GETSCRIPT")
+func (s *ManageSieveSession) GetScript(ctx context.Context, name string) (string, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "GETSCRIPT", s.server.commandTimeouts)
+	defer cancel()
+	accountID, readCtx, err := s.sessionState(ctx, "GETSCRIPT")
 	if err != nil {
 		return "", err
 	}
@@ -527,9 +544,11 @@ func (s *ManageSieveSession) GetScript(_ context.Context, name string) (string, 
 // PutScript implements managesieveserver.Session. The library has validated
 // the name and enforced the size bound; this validates the Sieve content and
 // stores it.
-func (s *ManageSieveSession) PutScript(_ context.Context, name, content string) (bool, error) {
+func (s *ManageSieveSession) PutScript(ctx context.Context, name, content string) (bool, error) {
 	start := time.Now()
-	accountID, readCtx, err := s.sessionState("PUTSCRIPT")
+	ctx, cancel := applyCommandTimeout(ctx, "PUTSCRIPT", s.server.commandTimeouts)
+	defer cancel()
+	accountID, readCtx, err := s.sessionState(ctx, "PUTSCRIPT")
 	if err != nil {
 		return false, err
 	}
@@ -545,12 +564,12 @@ func (s *ManageSieveSession) PutScript(_ context.Context, name, content string) 
 
 	updated := false
 	if script != nil {
-		if _, err := s.server.rdb.UpdateScriptWithRetry(s.ctx, script.ID, accountID, name, content); err != nil {
+		if _, err := s.server.rdb.UpdateScriptWithRetry(ctx, script.ID, accountID, name, content); err != nil {
 			return false, errTryLater
 		}
 		updated = true
 	} else {
-		if _, err := s.server.rdb.CreateScriptWithRetry(s.ctx, accountID, name, content); err != nil {
+		if _, err := s.server.rdb.CreateScriptWithRetry(ctx, accountID, name, content); err != nil {
 			if errors.Is(err, db.ErrSieveScriptLimitReached) {
 				return false, &managesieveserver.Error{Code: "QUOTA/MAXSCRIPTS", Message: "Too many scripts for this account"}
 			}
@@ -574,8 +593,10 @@ func (s *ManageSieveSession) PutScript(_ context.Context, name, content string) 
 
 // CheckScript implements managesieveserver.Session. Validation only; sora
 // emits no warnings.
-func (s *ManageSieveSession) CheckScript(_ context.Context, content string) (string, error) {
-	if s.ctx.Err() != nil {
+func (s *ManageSieveSession) CheckScript(ctx context.Context, content string) (string, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "CHECKSCRIPT", s.server.commandTimeouts)
+	defer cancel()
+	if ctx.Err() != nil || s.ctx.Err() != nil {
 		s.DebugLog("request aborted", "command", "CHECKSCRIPT")
 		return "", errSessionClosed
 	}
@@ -587,15 +608,17 @@ func (s *ManageSieveSession) CheckScript(_ context.Context, content string) (str
 
 // SetActive implements managesieveserver.Session. An empty name deactivates
 // all scripts (RFC 5804 §2.8); activation re-validates the stored script.
-func (s *ManageSieveSession) SetActive(_ context.Context, name string) error {
+func (s *ManageSieveSession) SetActive(ctx context.Context, name string) error {
 	start := time.Now()
-	accountID, readCtx, err := s.sessionState("SETACTIVE")
+	ctx, cancel := applyCommandTimeout(ctx, "SETACTIVE", s.server.commandTimeouts)
+	defer cancel()
+	accountID, readCtx, err := s.sessionState(ctx, "SETACTIVE")
 	if err != nil {
 		return err
 	}
 
 	if name == "" {
-		if err := s.server.rdb.DeactivateAllScriptsWithRetry(s.ctx, accountID); err != nil {
+		if err := s.server.rdb.DeactivateAllScriptsWithRetry(ctx, accountID); err != nil {
 			return errTryLater
 		}
 		s.pinToMasterDB("SETACTIVE")
@@ -616,7 +639,7 @@ func (s *ManageSieveSession) SetActive(_ context.Context, name string) error {
 		return err
 	}
 
-	if err := s.server.rdb.SetScriptActiveWithRetry(s.ctx, script.ID, accountID, true); err != nil {
+	if err := s.server.rdb.SetScriptActiveWithRetry(ctx, script.ID, accountID, true); err != nil {
 		return errTryLater
 	}
 
@@ -630,8 +653,10 @@ func (s *ManageSieveSession) SetActive(_ context.Context, name string) error {
 
 // DeleteScript implements managesieveserver.Session. The active script is
 // protected (RFC 5804 §2.10).
-func (s *ManageSieveSession) DeleteScript(_ context.Context, name string) error {
-	accountID, readCtx, err := s.sessionState("DELETESCRIPT")
+func (s *ManageSieveSession) DeleteScript(ctx context.Context, name string) error {
+	ctx, cancel := applyCommandTimeout(ctx, "DELETESCRIPT", s.server.commandTimeouts)
+	defer cancel()
+	accountID, readCtx, err := s.sessionState(ctx, "DELETESCRIPT")
 	if err != nil {
 		return err
 	}
@@ -650,7 +675,7 @@ func (s *ManageSieveSession) DeleteScript(_ context.Context, name string) error 
 		return &managesieveserver.Error{Code: "ACTIVE", Message: "Cannot delete the active script; deactivate it first"}
 	}
 
-	if err := s.server.rdb.DeleteScriptByIDWithRetry(s.ctx, script.ID, accountID); err != nil {
+	if err := s.server.rdb.DeleteScriptByIDWithRetry(ctx, script.ID, accountID); err != nil {
 		return errTryLater
 	}
 
@@ -662,13 +687,15 @@ func (s *ManageSieveSession) DeleteScript(_ context.Context, name string) error 
 // atomic UPDATE: the UNIQUE (account_id, name) constraint resolves new-name
 // collisions, so there is no read-then-write (TOCTOU) window and no exposure
 // to read-replica lag. The script's active state is preserved.
-func (s *ManageSieveSession) RenameScript(_ context.Context, oldName, newName string) error {
-	accountID, _, err := s.sessionState("RENAMESCRIPT")
+func (s *ManageSieveSession) RenameScript(ctx context.Context, oldName, newName string) error {
+	ctx, cancel := applyCommandTimeout(ctx, "RENAMESCRIPT", s.server.commandTimeouts)
+	defer cancel()
+	accountID, _, err := s.sessionState(ctx, "RENAMESCRIPT")
 	if err != nil {
 		return err
 	}
 
-	renameErr := s.server.rdb.RenameScriptWithRetry(s.ctx, accountID, oldName, newName)
+	renameErr := s.server.rdb.RenameScriptWithRetry(ctx, accountID, oldName, newName)
 	switch {
 	case renameErr == nil:
 		s.pinToMasterDB("RENAMESCRIPT")
@@ -686,7 +713,7 @@ func (s *ManageSieveSession) RenameScript(_ context.Context, oldName, newName st
 // has already rejected sizes above max_script_size; this enforces the
 // per-account script-count quota. The name is significant: a HAVESPACE for an
 // existing script is a replacement, which does not increase the script count.
-func (s *ManageSieveSession) HaveSpace(_ context.Context, name string, _ int64) error {
+func (s *ManageSieveSession) HaveSpace(ctx context.Context, name string, _ int64) error {
 	// HAVESPACE is advisory; if the DB layer is unavailable we optimistically
 	// report space (only the size bound applies). In production rdb is always
 	// set; this guard also keeps the handler usable from unit tests that
@@ -695,7 +722,9 @@ func (s *ManageSieveSession) HaveSpace(_ context.Context, name string, _ int64) 
 		return nil
 	}
 
-	accountID, readCtx, err := s.sessionState("HAVESPACE")
+	ctx, cancel := applyCommandTimeout(ctx, "HAVESPACE", s.server.commandTimeouts)
+	defer cancel()
+	accountID, readCtx, err := s.sessionState(ctx, "HAVESPACE")
 	if err != nil {
 		return err
 	}
@@ -789,12 +818,14 @@ func (s *ManageSieveSession) Close() error {
 	}
 }
 
-// registerConnection registers the connection in the connection tracker
-func (s *ManageSieveSession) registerConnection(email string) {
+// registerConnection registers the connection in the connection tracker.
+// It runs synchronously within the authenticating command, so it is bounded
+// by the per-command context (plus the query timeout).
+func (s *ManageSieveSession) registerConnection(ctx context.Context, email string) {
 	if s.server.connTracker != nil && s.User != nil {
 		// Use configured database query timeout for connection tracking (database INSERT)
 		queryTimeout := s.server.rdb.GetQueryTimeout()
-		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
+		ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 		defer cancel()
 
 		clientAddr := server.GetAddrString(s.conn.RemoteAddr())
@@ -827,18 +858,30 @@ func (s *ManageSieveSession) startTerminationPoller() {
 		return
 	}
 
+	// Capture everything the poller goroutine needs up front: the session
+	// teardown nils s.User (which AccountID/InfoLog read) unsynchronized
+	// with this goroutine. s.conn is set once at construction, so the
+	// captured conn is safe to close from here.
+	accountID := s.AccountID()
+	user := s.FullAddress()
+	sessionID := s.Id
+	conn := s.conn
+
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(s.AccountID())
+	kickChan := s.server.connTracker.RegisterSession(accountID)
 
 	go func() {
 		// Unregister when done
-		defer s.server.connTracker.UnregisterSession(s.AccountID(), kickChan)
+		defer s.server.connTracker.UnregisterSession(accountID, kickChan)
 
 		select {
 		case <-kickChan:
-			// Kick notification received - close connection
-			s.InfoLog("connection kicked, disconnecting")
-			s.conn.Close()
+			// Kick notification received - close connection. Log with the
+			// captured identity; s.InfoLog would re-read session fields that
+			// a concurrent teardown may be nilling.
+			logger.Info("connection kicked, disconnecting",
+				"protocol", s.Protocol, "user", user, "account_id", accountID, "session", sessionID)
+			conn.Close()
 		case <-s.ctx.Done():
 			// Session ended normally
 		}

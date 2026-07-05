@@ -136,6 +136,9 @@ type LMTPServerBackend struct {
 	redirectRateWindow time.Duration
 	maxRedirectHops    int
 
+	// Per-command hard execution timeouts (nil = use defaults)
+	commandTimeouts *CommandTimeouts
+
 	// Connection counters
 	totalConnections  atomic.Int64
 	activeConnections atomic.Int64
@@ -191,6 +194,8 @@ type LMTPServerOptions struct {
 	RedirectRateLimit           int
 	RedirectRateWindow          time.Duration
 	MaxRedirectHops             int
+	CommandTimeoutOverrides     map[string]time.Duration // Per-command hard execution timeouts (overrides defaults)
+	IdleTimeout                 time.Duration            // Maximum idle time between commands (0 = default 5m); enforced by go-smtp with a 421 notice
 }
 
 func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Storage, rdb *resilient.ResilientDatabase, uploadWorker *uploader.UploadWorker, options LMTPServerOptions) (*LMTPServerBackend, error) {
@@ -238,6 +243,12 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		redirectRateLimit:  options.RedirectRateLimit,
 		redirectRateWindow: options.RedirectRateWindow,
 		maxRedirectHops:    options.MaxRedirectHops,
+		commandTimeouts:    defaultCommandTimeouts(),
+	}
+
+	// Apply operator overrides for per-command execution timeouts
+	if len(options.CommandTimeoutOverrides) > 0 {
+		backend.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
 	// Create connection limiter with trusted networks from proxy configuration.
@@ -313,6 +324,11 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	s := smtp.NewServer(backend)
 	s.Addr = addr
 	s.Domain = hostname
+	// Seed every connection's context (smtp.Conn.Context) from the application
+	// context: go-smtp cancels the derived context when the client disconnects,
+	// the connection ends, or the server shuts down, and BaseContext adds app
+	// shutdown on top. Sessions derive their context from it in NewSession.
+	s.BaseContext = func(net.Listener) context.Context { return appCtx }
 	s.AllowInsecureAuth = options.InsecureAuth
 	s.LMTP = true
 	s.MaxRecipients = 1 // Enforce single recipient per LMTP transaction.
@@ -321,9 +337,19 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// so the MTA sends each recipient in a separate transaction.
 
 	// Bound idle/slow connections so a held connection cannot pin a goroutine
-	// indefinitely (slowloris). Generous values: legit transactions finish in seconds.
+	// indefinitely (slowloris). Generous values: legit transactions finish in
+	// seconds. go-smtp is the single idle owner (it writes the 421 4.4.2
+	// notice); its hook below is the only place LMTP timeout disconnects are
+	// counted — do NOT add a SoraConn idle checker on top (two owners of the
+	// same timer race each other and can duplicate the notice).
 	s.ReadTimeout = 5 * time.Minute
+	if options.IdleTimeout > 0 {
+		s.ReadTimeout = options.IdleTimeout
+	}
 	s.WriteTimeout = 2 * time.Minute
+	s.OnTimeout = func() {
+		metrics.ConnectionTimeoutsTotal.WithLabelValues("lmtp", name, hostname, "idle").Inc()
+	}
 
 	// Configure XCLIENT support (always enabled)
 	s.EnableXCLIENT = true
@@ -431,8 +457,13 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		return nil, fmt.Errorf("LMTP connections only allowed from trusted networks")
 	}
 
-	// Connection limits are now handled at the listener level
-	sessionCtx, sessionCancel := context.WithCancel(b.appCtx)
+	// Connection limits are now handled at the listener level.
+	// Derive the session context from the connection's context: go-smtp cancels
+	// it when the client disconnects or the server shuts down (it inherits app
+	// shutdown via Server.BaseContext), so long-running delivery work — DB
+	// inserts, Sieve evaluation, S3 staging — aborts once the client can no
+	// longer observe the result.
+	sessionCtx, sessionCancel := context.WithCancel(c.Context())
 
 	// Increment connection counters (in LMTP all connections are considered authenticated)
 	b.totalConnections.Add(1)

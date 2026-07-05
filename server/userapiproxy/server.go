@@ -391,13 +391,14 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to create listener: %w", err)
 	}
 
-	// Wrap listener with PROXY protocol support if enabled
-	if s.proxyReader != nil {
-		listener = &proxyProtocolListener{
-			Listener:    listener,
-			proxyReader: s.proxyReader,
-		}
-	}
+	// Wrap listener with PROXY protocol support if enabled. The shared
+	// listener parses headers per-connection off the accept path and never
+	// surfaces per-connection PROXY errors to http.Server.Serve (the old
+	// inline listener returned them, and net/http treats non-temporary
+	// Accept errors as fatal — one malformed header killed the listener).
+	// The HTTP variant makes RemoteAddr() report the forwarded client IP,
+	// which is what allowed_hosts and rate limiting read via r.RemoteAddr.
+	listener = server.WrapProxyProtocolHTTP(listener, s.proxyReader, "USER-API-PROXY")
 
 	// Start serving
 	if s.tls {
@@ -674,7 +675,7 @@ func (s *Server) extractAndValidateToken(r *http.Request) (*JWTClaims, error) {
 }
 
 // getRealClientIP extracts the real client IP from the request.
-// When PROXY protocol is enabled, proxyProtocolConn overrides RemoteAddr()
+// When PROXY protocol is enabled, the shared HTTP PROXY listener conn overrides RemoteAddr()
 // with the real client address, so r.RemoteAddr already carries it here.
 func (s *Server) getRealClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -760,56 +761,4 @@ func (s *Server) Stop() error {
 	}
 
 	return nil
-}
-
-// proxyProtocolListener wraps a net.Listener to read PROXY protocol headers
-type proxyProtocolListener struct {
-	net.Listener
-	proxyReader *server.ProxyProtocolReader
-}
-
-// Accept wraps the underlying Accept to read PROXY protocol headers
-func (l *proxyProtocolListener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-
-	// Read PROXY protocol header (this validates the connection is from trusted proxy)
-	proxyInfo, wrappedConn, err := l.proxyReader.ReadProxyHeader(conn)
-	if err != nil {
-		// Log with original connection's remote address (the proxy's IP)
-		logger.Error("PROXY protocol error", "proxy", "userapi_proxy", "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
-		conn.Close()
-		return nil, err
-	}
-
-	// Only wrap if we got proxy info - this preserves the real client IP in RemoteAddr()
-	if proxyInfo != nil && proxyInfo.SrcIP != "" {
-		return &proxyProtocolConn{
-			Conn:      wrappedConn,
-			proxyInfo: proxyInfo,
-		}, nil
-	}
-
-	// No proxy info, return wrapped connection as-is
-	return wrappedConn, nil
-}
-
-// proxyProtocolConn wraps a net.Conn to carry PROXY protocol info
-type proxyProtocolConn struct {
-	net.Conn
-	proxyInfo *server.ProxyProtocolInfo
-}
-
-// RemoteAddr returns the real client address from PROXY protocol if available
-func (c *proxyProtocolConn) RemoteAddr() net.Addr {
-	if c.proxyInfo != nil && c.proxyInfo.SrcIP != "" {
-		// Return a custom address with the real client IP
-		return &net.TCPAddr{
-			IP:   net.ParseIP(c.proxyInfo.SrcIP),
-			Port: c.proxyInfo.SrcPort,
-		}
-	}
-	return c.Conn.RemoteAddr()
 }

@@ -634,11 +634,11 @@ func (am *AffinityManager) broadcastRoutine() {
 		case <-ticker.C:
 			// Trigger broadcast by checking queue
 			am.queueMu.Lock()
-			hasEvents := len(am.broadcastQueue) > 0
+			queuedEvents := len(am.broadcastQueue)
 			am.queueMu.Unlock()
 
-			if hasEvents {
-				logger.Debug("Affinity: Triggering broadcast", "queued_events", len(am.broadcastQueue))
+			if queuedEvents > 0 {
+				logger.Debug("Affinity: Triggering broadcast", "queued_events", queuedEvents)
 			}
 
 		case <-am.stopBroadcast:

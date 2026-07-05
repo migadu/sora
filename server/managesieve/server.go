@@ -88,8 +88,9 @@ type ManageSieveServer struct {
 	// Command timeout and throughput enforcement
 	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	commandTimeout         time.Duration
-	absoluteSessionTimeout time.Duration // Maximum total session duration
-	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
+	commandTimeouts        *CommandTimeouts // Per-command hard execution timeouts (nil = use defaults)
+	absoluteSessionTimeout time.Duration    // Maximum total session duration
+	minBytesPerMinute      int64            // Minimum throughput to prevent slowloris (0 = disabled)
 
 	// Connection tracking
 	connTracker *serverPkg.ConnectionTracker
@@ -137,6 +138,7 @@ type ManageSieveServerOptions struct {
 	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
 	AuthIdleTimeout             time.Duration             // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	CommandTimeout              time.Duration             // Maximum idle time before disconnection
+	CommandTimeoutOverrides     map[string]time.Duration  // Per-command hard execution timeouts (overrides defaults)
 	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = use default 30m)
 	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
 	Config                      *config.Config            // Full config for shared settings like connection tracking timeouts
@@ -276,9 +278,15 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		lookupCache:            lookupCache,
 		authIdleTimeout:        options.AuthIdleTimeout,
 		commandTimeout:         options.CommandTimeout,
+		commandTimeouts:        defaultCommandTimeouts(),
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
 		minBytesPerMinute:      options.MinBytesPerMinute,
 		activeSessions:         make(map[*ManageSieveSession]struct{}),
+	}
+
+	// Apply operator overrides for per-command execution timeouts
+	if len(options.CommandTimeoutOverrides) > 0 {
+		serverInstance.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
 	// Use all supported extensions by default if none are configured
@@ -420,7 +428,17 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 		AbsoluteSessionTimeout: s.absoluteSessionTimeout,
 		InsecureAuth:           s.insecureAuth,
 		MaxErrors:              10,
-		StrictSessionErrors:    true, // Session errors are *managesieveserver.Error; mask anything else (DB error text must not reach clients)
+		// The library owns the idle and absolute-session timers (the SoraConn
+		// checker must not duplicate them — see the SoraConnConfig in Start),
+		// so timeout disconnects are counted from its hook.
+		OnTimeout: func(kind string) {
+			reason := "idle"
+			if kind == managesieveserver.TimeoutAbsolute {
+				reason = "session_max"
+			}
+			metrics.ConnectionTimeoutsTotal.WithLabelValues("managesieve", s.name, s.hostname, reason).Inc()
+		},
+		StrictSessionErrors: true, // Session errors are *managesieveserver.Error; mask anything else (DB error text must not reach clients)
 		NewSession: func(c *managesieveserver.Conn) (managesieveserver.Session, error) {
 			netConn := c.NetConn()
 			proxyInfo := serverPkg.GetProxyProtocolInfo(netConn)
@@ -507,30 +525,27 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 	var listener net.Listener
 
 	// Configure SoraConn with timeout protection
+	// Configure SoraConn with timeout protection. The idle and absolute-
+	// session timers are owned by the go-managesieve library: it clears the
+	// deadline during command execution, distinguishes the two cases in its
+	// BYE notice, and reports disconnects through the OnTimeout hook wired in
+	// the library options above. Arming the checker here with the same knobs
+	// raced the library and could send the client a duplicate BYE, so only
+	// the throughput check — which the library does not provide — stays at
+	// this layer.
 	connConfig := serverPkg.SoraConnConfig{
 		Protocol:             "managesieve",
 		ServerName:           s.name,
 		Hostname:             s.hostname,
-		IdleTimeout:          s.commandTimeout,
-		AbsoluteTimeout:      s.absoluteSessionTimeout,
 		MinBytesPerMinute:    s.minBytesPerMinute,
-		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+		EnableTimeoutChecker: s.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
-			// Send BYE message before closing due to timeout (RFC 5804 Section 1.3)
-			// Use TRYLATER response code to indicate temporary condition
-			var message string
-			switch reason {
-			case "idle":
-				message = "BYE (TRYLATER) \"Idle timeout, please reconnect\"\r\n"
-			case "slow_throughput":
+			// Best-effort BYE before closing (RFC 5804 Section 1.3); TRYLATER
+			// indicates a temporary condition.
+			message := "BYE (TRYLATER) \"Connection timeout, please reconnect\"\r\n"
+			if reason == "slow_throughput" {
 				message = "BYE (TRYLATER) \"Connection too slow, please reconnect\"\r\n"
-			case "session_max":
-				message = "BYE (TRYLATER) \"Maximum session duration exceeded, please reconnect\"\r\n"
-			default:
-				message = "BYE (TRYLATER) \"Connection timeout, please reconnect\"\r\n"
 			}
-			// Write BYE - ignore errors as connection may already be broken
-			// This is best-effort to inform the client
 			_, _ = fmt.Fprint(conn, message)
 		},
 	}

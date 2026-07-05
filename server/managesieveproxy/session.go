@@ -33,7 +33,7 @@ type Session struct {
 	server                *Server
 	msConn                *managesieveserver.Conn // library connection (Hijack seam)
 	clientConn            net.Conn
-	backendConn           net.Conn
+	backendConn           net.Conn      // Reassigned on backend connect/STARTTLS; writes must hold mu (sendGracefulShutdownBye reads it from the Stop goroutine)
 	backendReader         *bufio.Reader // Buffered reader from authentication phase
 	clientReader          *bufio.Reader // Hijacked reader holding any pipelined client bytes
 	username              string
@@ -790,7 +790,9 @@ func (s *Session) connectToBackendAndAuth() error {
 	}
 
 	metrics.ProxyBackendConnections.WithLabelValues("managesieve", "success").Inc()
+	s.mu.Lock()
 	s.backendConn = conn
+	s.mu.Unlock()
 	s.serverAddr = actualAddr
 
 	// Record successful connection for future affinity
@@ -895,9 +897,11 @@ func (s *Session) connectToBackendAndAuth() error {
 		}
 
 		s.DebugLog("StartTLS negotiation successful with backend", "backend", actualAddr)
+		s.mu.Lock()
 		s.backendConn = tlsConn
-		backendReader = bufio.NewReader(s.backendConn)
-		backendWriter = bufio.NewWriter(s.backendConn)
+		s.mu.Unlock()
+		backendReader = bufio.NewReader(tlsConn)
+		backendWriter = bufio.NewWriter(tlsConn)
 
 		// Refresh the read deadline for the post-STARTTLS capability read (M6).
 		s.backendConn.SetReadDeadline(time.Now().Add(backendIOTimeout))
@@ -1221,10 +1225,19 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 	for {
 		select {
 		case <-kickChan:
-			// Kick notification received - close connections
+			// Kick notification received - close connections. Snapshot the
+			// conns under the session mutex: conn writes hold it, and either
+			// conn may legitimately be nil here.
 			s.InfoLog("connection kicked")
-			s.clientConn.Close()
-			s.backendConn.Close()
+			s.mu.Lock()
+			clientConn, backendConn := s.clientConn, s.backendConn
+			s.mu.Unlock()
+			if clientConn != nil {
+				clientConn.Close()
+			}
+			if backendConn != nil {
+				backendConn.Close()
+			}
 			return
 		case <-ctx.Done():
 			return

@@ -28,7 +28,7 @@ import (
 type Session struct {
 	server                *Server
 	clientConn            net.Conn
-	backendConn           net.Conn
+	backendConn           net.Conn // Reassigned on backend connect/error; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
 	backendReader         *bufio.Reader
 	backendWriter         *bufio.Writer
 	clientReader          *bufio.Reader
@@ -1202,10 +1202,12 @@ func (s *Session) connectToBackend() error {
 	// Track backend connection success
 	metrics.ProxyBackendConnections.WithLabelValues("imap", "success").Inc()
 
+	s.mu.Lock()
 	s.backendConn = backendConn
+	s.backendReader = bufio.NewReader(backendConn)
+	s.backendWriter = bufio.NewWriter(backendConn)
+	s.mu.Unlock()
 	s.serverAddr = actualAddr
-	s.backendReader = bufio.NewReader(s.backendConn)
-	s.backendWriter = bufio.NewWriter(s.backendConn)
 
 	// Record successful connection for future affinity if enabled
 	// Auth-only remotelookup users (IsRemoteLookupAccount=true but ServerAddress="") should get affinity
@@ -1364,12 +1366,14 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 			s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server authentication failed", clientTag))
 		}
 		// Close the backend connection since authentication failed
+		s.mu.Lock()
 		if s.backendConn != nil {
 			s.backendConn.Close()
 			s.backendConn = nil
 			s.backendReader = nil
 			s.backendWriter = nil
 		}
+		s.mu.Unlock()
 		s.sendResponse("* BYE Backend server unavailable, please try again")
 		return false
 	}
@@ -1384,12 +1388,14 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 		s.connRejected = true
 		s.sendResponse(fmt.Sprintf("%s NO [LIMIT] Too many connections", clientTag))
 		s.sendResponse("* BYE Too many connections")
+		s.mu.Lock()
 		if s.backendConn != nil {
 			s.backendConn.Close()
 			s.backendConn = nil
 			s.backendReader = nil
 			s.backendWriter = nil
 		}
+		s.mu.Unlock()
 		return false
 	}
 
@@ -1682,10 +1688,20 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 	for {
 		select {
 		case <-kickChan:
-			// Kick notification received - close connections
+			// Kick notification received - close connections. Snapshot the
+			// conns under the session mutex: the command loop reassigns and
+			// nils backendConn on backend errors (those writes hold mu), and
+			// either conn may legitimately be nil here.
 			s.InfoLog("connection kicked - disconnecting user")
-			s.clientConn.Close()
-			s.backendConn.Close()
+			s.mu.Lock()
+			clientConn, backendConn := s.clientConn, s.backendConn
+			s.mu.Unlock()
+			if clientConn != nil {
+				clientConn.Close()
+			}
+			if backendConn != nil {
+				backendConn.Close()
+			}
 			return
 		case <-ctx.Done():
 			return

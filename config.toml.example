@@ -1045,6 +1045,11 @@ limits.max_auth_errors = 2               # Maximum authentication errors before 
 # --- TIMEOUT CONFIGURATION ---
 # Multi-layered timeout protection against various DoS attacks
 timeouts.command_timeout = "5m"             # Maximum idle time before disconnection (e.g., "5m", default: 5 minutes for IMAP)
+                                            # Values >= 35m are capped for IMAP: the protocol library closes idle
+                                            # authenticated connections silently at its own 35m read deadline.
+                                            # Clients sitting in IDLE are exempt from this timer: the server sends
+                                            # "* OK Still here" keepalives every 2 minutes (RFC 2177 allows 29
+                                            # minutes of client silence during IDLE).
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration regardless of activity (e.g., "24h", default: 24 hours)
 timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
 
@@ -1173,6 +1178,17 @@ proxy_protocol_timeout = "5s"
 # Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
 max_message_size = "50mb"     # Maximum message size (default: 50MB, 0 = unlimited)
 
+# --- PER-COMMAND EXECUTION TIMEOUTS (optional) ---
+# Hard caps on server-side work, mirroring imap_command_timeouts. On expiry
+# the command answers 4xx and the upstream MTA queues and retries — mail is
+# never lost. The DATA cap covers only the delivery pipeline (SIEVE, spool,
+# DB insert); wire reception from a slow MTA is governed by the read timeout,
+# not this cap. "0" disables a specific cap.
+# timeouts.lmtp_command_timeouts.rcpt = "10s"  # RCPT (default: 10s, recipient validation)
+# timeouts.lmtp_command_timeouts.data = "60s"  # DATA processing (default: 60s — generous: a cap firing
+                                               # after the DB commit but before the 250 reply means the
+                                               # MTA redelivers, relying on dedup to absorb the duplicate)
+
 # NOTE: External relay for Sieve redirect/vacation is configured globally in [relay] section above
 
 
@@ -1206,6 +1222,22 @@ timeouts.command_timeout = "10m"            # Maximum idle time before disconnec
                                             # RFC 1939 requires auto-logout timer of at least 10 minutes.
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24 hours)
 timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
+
+# --- PER-COMMAND EXECUTION TIMEOUTS (optional) ---
+# Hard caps on a single command's server-side execution (maildrop load, body
+# fetch from cache/S3, expunge write), mirroring imap_command_timeouts. A
+# command exceeding its cap gets an -ERR and its in-flight work is cancelled,
+# instead of wedging the session. RETR/TOP cover only loading the body — the
+# already-loaded message streams to the client off the clock. Defaults are
+# safety nets; "0" disables a specific cap. USER/PASS/APOP/AUTH are not
+# covered (they are paced by auth_rate_limit delays).
+# timeouts.pop3_command_timeouts.stat = "10s"  # STAT (default: 10s)
+# timeouts.pop3_command_timeouts.list = "10s"  # LIST (default: 10s)
+# timeouts.pop3_command_timeouts.uidl = "10s"  # UIDL (default: 10s)
+# timeouts.pop3_command_timeouts.retr = "30s"  # RETR (default: 30s, S3 body fetch on cache miss)
+# timeouts.pop3_command_timeouts.top  = "30s"  # TOP (default: 30s, S3 body fetch on cache miss)
+# timeouts.pop3_command_timeouts.dele = "10s"  # DELE (default: 10s)
+# timeouts.pop3_command_timeouts.quit = "15s"  # QUIT (default: 15s, UPDATE-phase expunge)
 
 
 # MANAGESIEVE SERVER EXAMPLE
@@ -1242,6 +1274,21 @@ proxy_protocol_timeout = "5s"
 timeouts.command_timeout = "3m"             # Maximum idle time before disconnection (default: 3 minutes for ManageSieve)
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24 hours)
 timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slowloris attacks (bytes/min, 0 = disabled, 512 recommended)
+
+# --- PER-COMMAND EXECUTION TIMEOUTS (optional) ---
+# Hard caps on a single command's execution (lock acquisition, go-sieve
+# validation, DB calls), mirroring imap_command_timeouts. A command exceeding
+# its cap gets a NO and its in-flight work is cancelled, instead of wedging the
+# session. Defaults are generous safety nets; "0" disables a specific cap.
+# AUTHENTICATE is not covered (it is paced by auth_rate_limit delays).
+# timeouts.managesieve_command_timeouts.listscripts  = "10s"  # LISTSCRIPTS (default: 10s)
+# timeouts.managesieve_command_timeouts.getscript    = "10s"  # GETSCRIPT (default: 10s)
+# timeouts.managesieve_command_timeouts.putscript    = "10s"  # PUTSCRIPT (default: 10s)
+# timeouts.managesieve_command_timeouts.checkscript  = "10s"  # CHECKSCRIPT (default: 10s)
+# timeouts.managesieve_command_timeouts.setactive    = "10s"  # SETACTIVE (default: 10s)
+# timeouts.managesieve_command_timeouts.deletescript = "10s"  # DELETESCRIPT (default: 10s)
+# timeouts.managesieve_command_timeouts.renamescript = "10s"  # RENAMESCRIPT (default: 10s)
+# timeouts.managesieve_command_timeouts.havespace    = "10s"  # HAVESPACE (default: 10s)
 
 
 # IMAP PROXY EXAMPLE

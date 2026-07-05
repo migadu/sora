@@ -16,7 +16,9 @@ func listUidlSession(messages []db.POP3Message, deleted map[int]bool) *POP3Sessi
 	if deleted == nil {
 		deleted = make(map[int]bool)
 	}
-	return &POP3Session{messages: messages, deleted: deleted}
+	// The session methods dereference s.server for the per-command timeouts;
+	// nil commandTimeouts means no deadline is applied.
+	return &POP3Session{messages: messages, deleted: deleted, server: &POP3Server{}}
 }
 
 // RFC 1939 stable numbering: DELE must not renumber the remaining messages —

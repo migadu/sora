@@ -6,6 +6,7 @@
 	integration-tests-pop3-connection-limits integration-tests-managesieve-connection-limits \
 	integration-tests-proxy-connection-limits integration-tests-adminapi integration-tests-userapi \
 	integration-tests-config integration-tests-sora-admin integration-tests-relay \
+	integration-tests-quick integration-tests-imap-quick integration-tests-race integration-tests-quick-race \
 	performance-tests performance-tests-short
 
 # Binary names - can be overridden by environment variables
@@ -64,13 +65,18 @@ tests-race:
 	go test -v -race ./...
 
 # Helper variables for integration tests
-TEST_TIMEOUT = 20m
-TEST_FLAGS = -v -tags=integration -count=1 -timeout=$(TEST_TIMEOUT)
+# Set RACE=1 to run any integration test target under the race detector,
+# e.g. `make integration-tests-imap RACE=1`. The timeout is raised because
+# race-instrumented binaries run considerably slower.
+RACE ?=
+RACE_FLAG = $(if $(RACE),-race,)
+TEST_TIMEOUT = $(if $(RACE),40m,20m)
+TEST_FLAGS = -v -tags=integration -count=1 -timeout=$(TEST_TIMEOUT) $(RACE_FLAG)
 # Slowloris timing tests live in their own package (integration_tests/imap_slowloris)
 # so they don't share the imap package's timeout budget. The two tests use real
 # wall-clock sleeps (~7m + ~9.5m run serially), so they get a larger timeout.
-SLOWLORIS_TIMEOUT = 25m
-SLOWLORIS_FLAGS = -v -tags=integration -count=1 -timeout=$(SLOWLORIS_TIMEOUT)
+SLOWLORIS_TIMEOUT = $(if $(RACE),35m,25m)
+SLOWLORIS_FLAGS = -v -tags=integration -count=1 -timeout=$(SLOWLORIS_TIMEOUT) $(RACE_FLAG)
 DB_NAME = sora_test_db
 DB_USER = postgres
 DB_HOST = localhost
@@ -97,6 +103,13 @@ integration-tests-quick: integration-tests-imap-quick integration-tests-lmtp int
 	integration-tests-pop3-connection-limits integration-tests-managesieve-connection-limits \
 	integration-tests-proxy-connection-limits integration-tests-adminapi integration-tests-userapi \
 	integration-tests-config integration-tests-sora-admin integration-tests-relay
+
+# Race-detector variants of the aggregate targets
+integration-tests-race:
+	@$(MAKE) integration-tests RACE=1
+
+integration-tests-quick-race:
+	@$(MAKE) integration-tests-quick RACE=1
 
 # Core protocol integration tests
 integration-tests-imap: reset-test-db build-test-sora-admin
@@ -240,6 +253,11 @@ help:
 	@echo "  performance-tests-short - Run quick performance validation tests"
 	@echo "  integration-tests       - Run all integration tests (requires PostgreSQL)"
 	@echo "  integration-tests-quick - Run integration tests, skip long tests (e.g., slowloris)"
+	@echo "  integration-tests-race       - Run all integration tests with the race detector"
+	@echo "  integration-tests-quick-race - Run quick integration tests with the race detector"
+	@echo ""
+	@echo "  Any integration test target also accepts RACE=1 to enable the race"
+	@echo "  detector, e.g. 'make integration-tests-imap RACE=1'"
 	@echo ""
 	@echo "Core protocol integration tests:"
 	@echo "  integration-tests-imap          - IMAP protocol tests"

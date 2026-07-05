@@ -16,6 +16,7 @@ import (
 	_ "github.com/emersion/go-message/charset"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
@@ -597,18 +598,31 @@ func (s *IMAPSession) startTerminationPoller() {
 		return
 	}
 
+	// Capture everything the poller goroutine needs up front: Close() nils
+	// s.IMAPUser/s.User under s.mutex, and the poller runs unsynchronized
+	// with teardown — reading them later (s.AccountID(), s.InfoLog's user
+	// fields) races with those writes. s.conn is set once at construction,
+	// so the captured net.Conn is safe to close from here.
+	accountID := s.AccountID()
+	user := s.FullAddress()
+	sessionID := s.Id
+	netConn := s.conn.NetConn()
+
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(s.AccountID())
+	kickChan := s.server.connTracker.RegisterSession(accountID)
 
 	go func() {
 		// Unregister when done
-		defer s.server.connTracker.UnregisterSession(s.AccountID(), kickChan)
+		defer s.server.connTracker.UnregisterSession(accountID, kickChan)
 
 		select {
 		case <-kickChan:
-			// Kick notification received - close connection
-			s.InfoLog("connection kicked, disconnecting user")
-			s.conn.NetConn().Close()
+			// Kick notification received - close connection. Log with the
+			// captured identity; s.InfoLog would re-read session fields that
+			// a concurrent Close may be nilling.
+			logger.Info("connection kicked, disconnecting user",
+				"protocol", s.Protocol, "user", user, "account_id", accountID, "session", sessionID)
+			netConn.Close()
 		case <-s.ctx.Done():
 			// Session ended normally
 		}

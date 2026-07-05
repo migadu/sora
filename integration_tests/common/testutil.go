@@ -28,7 +28,24 @@ import (
 	"github.com/migadu/sora/server/pop3"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
+	"golang.org/x/crypto/bcrypt"
 )
+
+// init lowers the bcrypt cost for every account created by integration tests
+// to bcrypt.MinCost. Production-cost hashing (cost 12: ~250ms per hash/verify,
+// ~2s under the race detector) dominates suite wall time — every protocol
+// login pays it — and blows the short protocol timeouts in the timeout-trigger
+// tests (POP3 TestCommandTimeout*, IMAP TestIdleTimeoutTrigger, imapproxy
+// revalidation/PROXY tests), making them flaky under -race. The cost factor is
+// embedded in each generated hash, so VerifyPassword follows automatically
+// wherever the account authenticates (backends, proxies, auth caches), and
+// db's timing-equalization dummy hash (DummyVerifyPassword, the account-not-
+// found path) is generated lazily against the current BcryptCost, so
+// negative-auth tests speed up too. This package is test-only; production
+// keeps the config-driven SetBcryptCost (clamped to [10,14]).
+func init() {
+	db.BcryptCost = bcrypt.MinCost
+}
 
 // ScriptedS3 is a minimal S3 GetObject emulator for fetch-path tests. It returns a real
 // NoSuchKey 404 — which the AWS SDK deserializes into the same typed *types.NoSuchKey that
@@ -868,6 +885,18 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 
 func SetupLMTPServer(t *testing.T) (*TestServer, TestAccount) {
 	t.Helper()
+	return setupLMTPServerWithOptions(t, lmtp.LMTPServerOptions{})
+}
+
+// SetupLMTPServerWithIdleTimeout sets up an LMTP server with a short idle
+// timeout (go-smtp ReadTimeout) for timeout behavior tests.
+func SetupLMTPServerWithIdleTimeout(t *testing.T, idleTimeout time.Duration) (*TestServer, TestAccount) {
+	t.Helper()
+	return setupLMTPServerWithOptions(t, lmtp.LMTPServerOptions{IdleTimeout: idleTimeout})
+}
+
+func setupLMTPServerWithOptions(t *testing.T, options lmtp.LMTPServerOptions) (*TestServer, TestAccount) {
+	t.Helper()
 
 	rdb := SetupTestDatabase(t)
 	account := CreateTestAccount(t, rdb)
@@ -913,7 +942,7 @@ func SetupLMTPServer(t *testing.T) (*TestServer, TestAccount) {
 		s3Storage,
 		rdb,
 		uploadWorker,
-		lmtp.LMTPServerOptions{},
+		options,
 	)
 	if err != nil {
 		t.Fatalf("Failed to create LMTP server: %v", err)

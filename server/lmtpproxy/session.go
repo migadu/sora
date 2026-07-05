@@ -23,8 +23,8 @@ import (
 // Session represents an LMTP proxy session.
 type Session struct {
 	server                *Server
-	clientConn            net.Conn
-	backendConn           net.Conn
+	clientConn            net.Conn // Reassigned on STARTTLS; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
+	backendConn           net.Conn // Reassigned on backend connect/STARTTLS/error; writes must hold mu (same reason)
 	backendReader         *bufio.Reader
 	backendWriter         *bufio.Writer
 	clientReader          *bufio.Reader
@@ -389,7 +389,9 @@ func (s *Session) handleConnection() {
 				s.sendResponse("451 4.4.2 Backend error")
 				// Connection likely dead, close it?
 				s.backendConn.Close()
+				s.mu.Lock()
 				s.backendConn = nil
+				s.mu.Unlock()
 				continue
 			}
 			s.backendWriter.Flush()
@@ -401,7 +403,9 @@ func (s *Session) handleConnection() {
 				s.DebugLog("Failed to read DATA response", "error", err)
 				s.sendResponse("451 4.4.2 Backend error")
 				s.backendConn.Close()
+				s.mu.Lock()
 				s.backendConn = nil
+				s.mu.Unlock()
 				continue
 			}
 
@@ -477,9 +481,11 @@ func (s *Session) handleConnection() {
 			}
 
 			// Update session with TLS connection
+			s.mu.Lock()
 			s.clientConn = tlsConn
 			s.clientReader = bufio.NewReader(tlsConn)
 			s.clientWriter = bufio.NewWriter(tlsConn)
+			s.mu.Unlock()
 
 			s.DebugLog("STARTTLS negotiation successful")
 
@@ -1023,10 +1029,12 @@ func (s *Session) connectToBackend() error {
 
 	// Track backend connection success
 	metrics.ProxyBackendConnections.WithLabelValues("lmtp", "success").Inc()
+	s.mu.Lock()
 	s.backendConn = backendConn
+	s.backendReader = bufio.NewReader(backendConn)
+	s.backendWriter = bufio.NewWriter(backendConn)
+	s.mu.Unlock()
 	s.serverAddr = actualAddr
-	s.backendReader = bufio.NewReader(s.backendConn)
-	s.backendWriter = bufio.NewWriter(s.backendConn)
 
 	// Enable TCP keepalive on backend connection to detect dead connections
 	// This helps detect network partitions and stale connections without waiting for read timeout
@@ -1162,9 +1170,11 @@ func (s *Session) connectToBackend() error {
 		}
 
 		s.DebugLog("StartTLS negotiation successful with backend", "backend", actualAddr)
+		s.mu.Lock()
 		s.backendConn = tlsConn
 		s.backendReader = bufio.NewReader(tlsConn)
 		s.backendWriter = bufio.NewWriter(tlsConn)
+		s.mu.Unlock()
 
 		// After STARTTLS, we need to send LHLO again
 		lhloCmd := fmt.Sprintf("LHLO %s\r\n", s.server.hostname)
@@ -1343,7 +1353,9 @@ func (s *Session) forwardRCPT(command string) {
 		s.sendResponse("451 4.4.2 Backend error")
 		// Connection issues should probably close the backend connection but let client decide next step
 		s.backendConn.Close()
+		s.mu.Lock()
 		s.backendConn = nil
+		s.mu.Unlock()
 		return
 	}
 	s.backendWriter.Flush()
@@ -1354,7 +1366,9 @@ func (s *Session) forwardRCPT(command string) {
 		s.DebugLog("Failed to read RCPT TO response", "error", err)
 		s.sendResponse("451 4.4.2 Backend error")
 		s.backendConn.Close()
+		s.mu.Lock()
 		s.backendConn = nil
+		s.mu.Unlock()
 		return
 	}
 	s.DebugLog("Backend RCPT TO response", "response", strings.TrimSpace(response))
@@ -1671,10 +1685,20 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 	for {
 		select {
 		case <-kickChan:
-			// Kick notification received - close connections
+			// Kick notification received - close connections. Snapshot the
+			// conns under the session mutex: the command loop reassigns and
+			// nils backendConn on backend errors and STARTTLS (those writes
+			// hold mu), and backendConn may legitimately be nil here.
 			s.InfoLog("connection kicked")
-			s.clientConn.Close()
-			s.backendConn.Close()
+			s.mu.Lock()
+			clientConn, backendConn := s.clientConn, s.backendConn
+			s.mu.Unlock()
+			if clientConn != nil {
+				clientConn.Close()
+			}
+			if backendConn != nil {
+				backendConn.Close()
+			}
 			return
 		case <-ctx.Done():
 			return

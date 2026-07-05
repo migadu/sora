@@ -181,3 +181,100 @@ func TestIMAPImplicitTLSWithProxyProtocol(t *testing.T) {
 		}
 	})
 }
+
+// TestIMAPTLSSlowClientNoAcceptBlocking pins the IMAP-specific accept-path
+// fix: the deferred TLS handshake runs in go-imap's per-connection goroutine
+// (newSession), NOT in connectionLimitingListener.Accept. Before the fix a
+// single client that connected and never sent its ClientHello held the
+// accept loop for the full handshake deadline (~10s), stalling every other
+// client — the same serial-accept collapse class as the 2026-07-05 incident.
+// With the fix, a well-behaved TLS client logs in immediately while the
+// silent one is still burning its handshake deadline.
+func TestIMAPTLSSlowClientNoAcceptBlocking(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	addr := common.GetRandomAddress(t)
+	certFile, keyFile, certPool := common.GenerateTestTLSCert(t, nil, nil)
+
+	tempDir, err := os.MkdirTemp("", "sora-test-upload-tls-slow-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	errCh := make(chan error, 1)
+	uploadWorker, err := uploader.New(
+		context.Background(),
+		tempDir, 10, 1, 3, time.Second, 0, "test-instance",
+		rdb, &storage.S3Storage{}, nil, errCh,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create upload worker: %v", err)
+	}
+
+	server, err := imap.New(
+		context.Background(),
+		"test-tls-slow-client",
+		"localhost",
+		addr,
+		&storage.S3Storage{},
+		rdb,
+		uploadWorker,
+		nil,
+		imap.IMAPServerOptions{
+			TLS:          true,
+			TLSCertFile:  certFile,
+			TLSKeyFile:   keyFile,
+			InsecureAuth: false,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create IMAP server with TLS: %v", err)
+	}
+	go func() {
+		if err := server.Serve(addr); err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Logf("IMAP server error: %v", err)
+		}
+	}()
+	defer server.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	// Slow client: TCP connect, never send a ClientHello. Its handshake
+	// burns the 10s deadline in its own goroutine.
+	slow, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("slow dial failed: %v", err)
+	}
+	defer slow.Close()
+	time.Sleep(200 * time.Millisecond) // let the server accept it and park in the handshake
+
+	// Well-behaved client: full TLS login must complete promptly.
+	start := time.Now()
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr,
+		&tls.Config{RootCAs: certPool})
+	if err != nil {
+		t.Fatalf("TLS dial while slow client pending failed: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	reader := bufio.NewReader(conn)
+
+	if greeting, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(greeting, "* OK") {
+		t.Fatalf("greeting while slow client pending: %q, %v", greeting, err)
+	}
+	fmt.Fprintf(conn, "a1 LOGIN \"%s\" \"%s\"\r\n", account.Email, account.Password)
+	if resp := readTaggedResponse(t, reader, "a1"); !strings.HasPrefix(resp, "a1 OK") {
+		t.Fatalf("LOGIN while slow client pending failed: %q", resp)
+	}
+	elapsed := time.Since(start)
+	fmt.Fprintf(conn, "a2 LOGOUT\r\n")
+
+	// Pre-fix the slow client held the accept loop for its ~10s handshake
+	// deadline; post-fix the good client is untouched by it.
+	if elapsed > 5*time.Second {
+		t.Errorf("TLS login took %v while a silent client was pending; handshake is back in the accept path", elapsed)
+	}
+	t.Logf("✓ full TLS login in %v while a silent TLS client was mid-handshake", elapsed)
+}

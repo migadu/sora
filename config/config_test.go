@@ -292,3 +292,93 @@ func TestDatabaseEndpointConfig_HostsWithPorts(t *testing.T) {
 		})
 	}
 }
+
+// TestGetManageSieveCommandTimeoutsOverrides covers the per-command execution
+// timeout block for ManageSieve: absent config, explicit overrides (with "0"
+// meaning disabled), and invalid durations.
+func TestGetManageSieveCommandTimeoutsOverrides(t *testing.T) {
+	s := ServerConfig{Type: "managesieve"}
+
+	if got, err := s.GetManageSieveCommandTimeoutsOverrides(); err != nil || got != nil {
+		t.Errorf("unset: got (%v, %v), want (nil, nil)", got, err)
+	}
+
+	s.Timeouts = &ServerTimeoutsConfig{
+		ManageSieveCommandTimeouts: &ManageSieveCommandTimeoutsConfig{
+			GetScript: "10s",
+			PutScript: "0", // explicit disable
+		},
+	}
+	got, err := s.GetManageSieveCommandTimeoutsOverrides()
+	if err != nil {
+		t.Fatalf("overrides: unexpected error: %v", err)
+	}
+	if len(got) != 2 || got["getscript"] != 10*time.Second || got["putscript"] != 0 {
+		t.Errorf("overrides: got %v, want {getscript: 10s, putscript: 0}", got)
+	}
+
+	s.Timeouts.ManageSieveCommandTimeouts.CheckScript = "not-a-duration"
+	if _, err := s.GetManageSieveCommandTimeoutsOverrides(); err == nil {
+		t.Error("invalid duration: expected error, got nil")
+	}
+}
+
+// TestGetPOP3CommandTimeoutsOverrides covers the per-command execution
+// timeout block for POP3: absent config, explicit overrides (with "0" meaning
+// disabled), and invalid durations.
+func TestGetPOP3CommandTimeoutsOverrides(t *testing.T) {
+	s := ServerConfig{Type: "pop3"}
+
+	if got, err := s.GetPOP3CommandTimeoutsOverrides(); err != nil || got != nil {
+		t.Errorf("unset: got (%v, %v), want (nil, nil)", got, err)
+	}
+
+	s.Timeouts = &ServerTimeoutsConfig{
+		POP3CommandTimeouts: &POP3CommandTimeoutsConfig{
+			Retr: "1m",
+			Quit: "0", // explicit disable
+		},
+	}
+	got, err := s.GetPOP3CommandTimeoutsOverrides()
+	if err != nil {
+		t.Fatalf("overrides: unexpected error: %v", err)
+	}
+	if len(got) != 2 || got["retr"] != time.Minute || got["quit"] != 0 {
+		t.Errorf("overrides: got %v, want {retr: 1m, quit: 0}", got)
+	}
+
+	s.Timeouts.POP3CommandTimeouts.Stat = "not-a-duration"
+	if _, err := s.GetPOP3CommandTimeoutsOverrides(); err == nil {
+		t.Error("invalid duration: expected error, got nil")
+	}
+}
+
+// TestGetLMTPCommandTimeoutsOverrides covers the per-command execution
+// timeout block for LMTP: absent config, explicit overrides (with "0" meaning
+// disabled), and invalid durations.
+func TestGetLMTPCommandTimeoutsOverrides(t *testing.T) {
+	s := ServerConfig{Type: "lmtp"}
+
+	if got, err := s.GetLMTPCommandTimeoutsOverrides(); err != nil || got != nil {
+		t.Errorf("unset: got (%v, %v), want (nil, nil)", got, err)
+	}
+
+	s.Timeouts = &ServerTimeoutsConfig{
+		LMTPCommandTimeouts: &LMTPCommandTimeoutsConfig{
+			Data: "2m",
+			Rcpt: "0", // explicit disable
+		},
+	}
+	got, err := s.GetLMTPCommandTimeoutsOverrides()
+	if err != nil {
+		t.Fatalf("overrides: unexpected error: %v", err)
+	}
+	if len(got) != 2 || got["data"] != 2*time.Minute || got["rcpt"] != 0 {
+		t.Errorf("overrides: got %v, want {data: 2m, rcpt: 0}", got)
+	}
+
+	s.Timeouts.LMTPCommandTimeouts.Data = "not-a-duration"
+	if _, err := s.GetLMTPCommandTimeoutsOverrides(); err == nil {
+		t.Error("invalid duration: expected error, got nil")
+	}
+}

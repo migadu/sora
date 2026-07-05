@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,34 +20,45 @@ import (
 	"github.com/migadu/sora/server/imapproxy"
 )
 
-// LogCapture helps capture log output for verification
+// LogCapture helps capture log output for verification. It guards the buffer
+// with a mutex: background server goroutines keep logging while the test
+// reads the captured output.
 type LogCapture struct {
 	original *os.File
-	buffer   *bytes.Buffer
+	mu       sync.Mutex
+	buffer   bytes.Buffer
 }
 
 // NewLogCapture creates a new log capture that redirects standard log output to a buffer
 func NewLogCapture() *LogCapture {
 	lc := &LogCapture{
 		original: os.Stderr,
-		buffer:   &bytes.Buffer{},
 	}
 
 	// Redirect log output to our buffer
-	log.SetOutput(lc.buffer)
+	log.SetOutput(lc)
 	return lc
+}
+
+func (lc *LogCapture) Write(p []byte) (int, error) {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return lc.buffer.Write(p)
 }
 
 // Stop restores the original log output and returns captured logs
 func (lc *LogCapture) Stop() string {
 	log.SetOutput(lc.original)
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
 	return lc.buffer.String()
 }
 
 // ContainsProxyLog checks if the captured logs contain proxy= entries
 func (lc *LogCapture) ContainsProxyLog() bool {
-	logs := lc.buffer.String()
-	return strings.Contains(logs, "proxy=")
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return strings.Contains(lc.buffer.String(), "proxy=")
 }
 
 // TestIMAPProxyWithPROXYProtocol tests IMAP proxy using PROXY protocol for backend communication

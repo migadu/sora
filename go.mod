@@ -19,9 +19,9 @@ require (
 	github.com/hashicorp/memberlist v0.5.3
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/k3a/html2text v1.2.1
-	github.com/migadu/go-managesieve v0.1.0
-	github.com/migadu/go-pop3 v0.1.2
-	github.com/migadu/go-sieve v1.1.0
+	github.com/migadu/go-managesieve v0.1.1
+	github.com/migadu/go-pop3 v0.1.3
+	github.com/migadu/go-sieve v1.1.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/stretchr/testify v1.11.1
@@ -33,9 +33,9 @@ require (
 	modernc.org/sqlite v1.39.0
 )
 
-replace github.com/emersion/go-smtp => github.com/dejanstrbac/go-smtp v0.0.0-20260313205502-a1dea4f0d630
+replace github.com/emersion/go-smtp => github.com/migadu/go-smtp v0.0.0-20260705231539-0ef684185ca4
 
-replace github.com/emersion/go-message => github.com/migadu/go-message v0.0.0-20251204083122-d583d81190da
+replace github.com/emersion/go-message => github.com/migadu/go-message v0.0.0-20260705121217-8814c0e56d68
 
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect
@@ -90,4 +90,4 @@ require (
 	rsc.io/binaryregexp v0.2.0 // indirect
 )
 
-replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20260704211128-a7064d5cd672
+replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20260705230833-16878ed2ebee

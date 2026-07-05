@@ -44,8 +44,8 @@ var (
 
 type POP3ProxySession struct {
 	server                *POP3ProxyServer
-	clientConn            net.Conn
-	backendConn           net.Conn
+	clientConn            net.Conn      // Reassigned on hijack; writes must hold mutex (sendGracefulShutdownMessage reads it from the Stop goroutine)
+	backendConn           net.Conn      // Assigned in connectToBackend; writes must hold mutex (same reason)
 	backendReader         *bufio.Reader // Buffered reader from authentication phase
 	clientReader          *bufio.Reader // Buffered reader from the pre-auth phase; reused by the relay so a command pipelined with PASS/AUTH is not dropped
 	ctx                   context.Context
@@ -674,7 +674,9 @@ func (s *POP3ProxySession) connectToBackend() error {
 	}
 
 	metrics.ProxyBackendConnections.WithLabelValues("pop3", "success").Inc()
+	s.mutex.Lock()
 	s.backendConn = backendConn
+	s.mutex.Unlock()
 	s.serverAddr = actualAddr
 	s.DebugLog("Backend connection established in connectToBackend()", "backend", actualAddr)
 
@@ -1030,10 +1032,19 @@ func (s *POP3ProxySession) updateActivityPeriodically(ctx context.Context) {
 	for {
 		select {
 		case <-kickChan:
-			// Kick notification received - close connections
-			s.InfoLog("connection kicked - disconnecting", "backend", s.serverAddr)
-			s.clientConn.Close()
-			s.backendConn.Close()
+			// Kick notification received - close connections. Snapshot the
+			// conns (and the backend address for the log) under the session
+			// mutex: conn writes hold it, and either conn may be nil here.
+			s.mutex.Lock()
+			clientConn, backendConn, serverAddr := s.clientConn, s.backendConn, s.serverAddr
+			s.mutex.Unlock()
+			s.InfoLog("connection kicked - disconnecting", "backend", serverAddr)
+			if clientConn != nil {
+				clientConn.Close()
+			}
+			if backendConn != nil {
+				backendConn.Close()
+			}
 			return
 		case <-ctx.Done():
 			return
@@ -1064,18 +1075,26 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 	const writeDeadline = 30 * time.Second
 
 	for {
-		// Idle control for the authenticated phase. command_timeout is the
-		// post-auth idle knob (it also drives the SoraConn idle checker);
-		// auth_idle_timeout is the pre-auth knob (2m default) and is only used
-		// as a fallback so idle protection is never silently lost. RFC 1939
-		// recommends an autologout timer of at least 10 minutes, which the
-		// short pre-auth timeout would violate here.
-		idleTimeout := s.server.commandTimeout
-		if idleTimeout <= 0 {
-			idleTimeout = s.server.authIdleTimeout
+		// Idle control for the authenticated phase. When command_timeout is
+		// set it arms the SoraConn idle checker, which owns idle enforcement:
+		// it tracks activity in both directions (an in-flight backend->client
+		// response keeps the session alive), emits the idle metric and the
+		// [IN-USE] notice, and closes the connection, which unblocks the read
+		// below. Arming this deadline with the same value raced the checker
+		// and could deliver the notice twice, so it is only a stale-connection
+		// backstop well past the knob (the role CopyWithDeadline plays on the
+		// other proxies). Without command_timeout the checker is idle-blind,
+		// so fall back to enforcing auth_idle_timeout (the pre-auth knob, 2m
+		// default) right here rather than silently losing idle protection.
+		// RFC 1939 recommends an autologout timer of at least 10 minutes,
+		// which that short pre-auth timeout would violate.
+		checkerOwnsIdle := s.server.commandTimeout > 0
+		readDeadline := s.server.authIdleTimeout
+		if checkerOwnsIdle {
+			readDeadline = max(2*s.server.commandTimeout, 30*time.Minute)
 		}
-		if idleTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
+		if readDeadline > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
 				s.WarnLog("Failed to set read deadline", "error", err)
 				return
 			}
@@ -1094,14 +1113,21 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 				return
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if checkerOwnsIdle {
+					// Backstop expiry: the idle checker kept the session alive
+					// (two-way activity, e.g. a long download) yet the client
+					// sent no command for the whole window. Close without a
+					// notice — one written here could land inside an in-flight
+					// backend->client response.
+					s.InfoLog("Client sent no command for the relay backstop window, closing connection", "backstop", readDeadline)
+					return
+				}
 				s.DebugLog("Idle timeout for authenticated user, closing connection")
-				// Account the idle timeout: this relay read deadline uses command_timeout,
-				// the same value that drives the SoraConn idle checker, so it pre-empts the
-				// checker for authenticated sessions. Without incrementing here, the
-				// ConnectionTimeoutsTotal{type="idle"} counter would never move post-auth.
+				// The idle checker is disarmed without command_timeout, so this
+				// deadline is the idle enforcement: account the timeout and give
+				// the client a reason (whole-write atomic, so it cannot
+				// byte-interleave with the backend->client copy).
 				metrics.ConnectionTimeoutsTotal.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "idle").Inc()
-				// Mirror the SoraConn OnTimeout notice so the client sees a reason
-				// (whole-write atomic, so it cannot interleave with the backend->client copy).
 				_, _ = s.clientConn.Write([]byte("-ERR [IN-USE] Idle timeout, please reconnect\r\n"))
 				return
 			}
@@ -1292,8 +1318,10 @@ func (s *POP3ProxySession) doLogin(ctx context.Context, username, password strin
 		return &pop3server.Error{Code: "SYS/TEMP", Message: "Service temporarily unavailable, please try again later", Close: true}
 	}
 
+	s.mutex.Lock()
 	s.clientConn = clientConn
 	s.clientReader = clientReader
+	s.mutex.Unlock()
 
 	// Write "+OK Authentication successful" response to client
 	writer := bufio.NewWriter(clientConn)

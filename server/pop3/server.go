@@ -87,12 +87,13 @@ type POP3Server struct {
 	sessionMemoryLimit int64
 
 	// Command timeout and throughput enforcement
-	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
-	commandTimeout         time.Duration // Idle timeout (defaulted to Pop3DefaultIdleTimeout when unset)
-	libCommandTimeout      time.Duration // Per-command execution timeout passed to the library (raw config value, 0 = disabled)
-	absoluteSessionTimeout time.Duration // Maximum total session duration
-	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
-	maxMessageAge          time.Duration // Ephemeral-storage retention (cleanup max_age_restriction); 0 = keep forever. Drives the CAPA EXPIRE value.
+	authIdleTimeout        time.Duration    // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	commandTimeout         time.Duration    // Idle timeout (defaulted to Pop3DefaultIdleTimeout when unset)
+	libCommandTimeout      time.Duration    // Per-command execution timeout passed to the library (raw config value, 0 = disabled)
+	commandTimeouts        *CommandTimeouts // Per-command hard execution timeouts (nil = use defaults)
+	absoluteSessionTimeout time.Duration    // Maximum total session duration
+	minBytesPerMinute      int64            // Minimum throughput to prevent slowloris (0 = disabled)
+	maxMessageAge          time.Duration    // Ephemeral-storage retention (cleanup max_age_restriction); 0 = keep forever. Drives the CAPA EXPIRE value.
 
 	// Connection tracking
 	connTracker *serverPkg.ConnectionTracker
@@ -135,6 +136,7 @@ type POP3ServerOptions struct {
 	SessionMemoryLimit          int64                     // Memory limit per session in bytes
 	AuthIdleTimeout             time.Duration             // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	CommandTimeout              time.Duration             // Maximum idle time before disconnection
+	CommandTimeoutOverrides     map[string]time.Duration  // Per-command hard execution timeouts (overrides defaults)
 	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = use default 30m)
 	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
 	InsecureAuth                bool                      // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
@@ -284,11 +286,17 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		authIdleTimeout:        options.AuthIdleTimeout,
 		commandTimeout:         commandTimeout,
 		libCommandTimeout:      options.CommandTimeout,
+		commandTimeouts:        defaultCommandTimeouts(),
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
 		insecureAuth:           insecureAuth, // Auto-enabled when TLS not configured (warned above)
 		minBytesPerMinute:      options.MinBytesPerMinute,
 		maxMessageAge:          maxMessageAge,
 		activeSessions:         make(map[*POP3Session]struct{}),
+	}
+
+	// Apply operator overrides for per-command execution timeouts
+	if len(options.CommandTimeoutOverrides) > 0 {
+		server.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
 	// Create connection limiter with trusted networks from server configuration
@@ -412,13 +420,23 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 		AuthIdleTimeout:        s.authIdleTimeout,
 		AbsoluteSessionTimeout: s.absoluteSessionTimeout,
 		CommandTimeout:         s.libCommandTimeout,
-		InsecureAuth:           s.insecureAuth,
-		MaxLineLength:          Pop3MaxLineLength,
-		MaxErrors:              Pop3MaxErrorsAllowed,
-		ErrorDelay:             Pop3ErrorDelay,
-		StrictSessionErrors:    true, // Session errors are *pop3server.Error; mask anything else (DB/S3 text must not reach clients)
-		Caps:                   caps,
-		Greeting:               "Sora-POP3-Server ready",
+		// The library owns the idle and absolute-session timers (the SoraConn
+		// checker must not duplicate them — see the SoraConnConfig in Start),
+		// so timeout disconnects are counted from its hook.
+		OnTimeout: func(kind string) {
+			reason := "idle"
+			if kind == pop3server.TimeoutAbsolute {
+				reason = "session_max"
+			}
+			metrics.ConnectionTimeoutsTotal.WithLabelValues("pop3", s.name, s.hostname, reason).Inc()
+		},
+		InsecureAuth:        s.insecureAuth,
+		MaxLineLength:       Pop3MaxLineLength,
+		MaxErrors:           Pop3MaxErrorsAllowed,
+		ErrorDelay:          Pop3ErrorDelay,
+		StrictSessionErrors: true, // Session errors are *pop3server.Error; mask anything else (DB/S3 text must not reach clients)
+		Caps:                caps,
+		Greeting:            "Sora-POP3-Server ready",
 		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
 			// Connection limiting check
 			netConn := c.NetConn()
@@ -534,31 +552,27 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 func (s *POP3Server) Start(errChan chan error) {
 	var listener net.Listener
 
-	// Configure SoraConn with timeout protection
+	// Configure SoraConn with timeout protection. The idle and absolute-
+	// session timers are owned by the go-pop3 library: it clears the read
+	// deadline during command execution (so a streamed RETR is never on the
+	// idle clock), distinguishes the two cases in its notice, and reports
+	// disconnects through the OnTimeout hook wired in buildLibServer. Arming
+	// the checker here with the same knobs raced the library and could send
+	// the client a duplicate "-ERR" notice, so only the throughput check —
+	// which the library does not provide — stays at this layer.
 	connConfig := serverPkg.SoraConnConfig{
 		Protocol:             "pop3",
 		ServerName:           s.name,
 		Hostname:             s.hostname,
-		IdleTimeout:          s.commandTimeout,
-		AbsoluteTimeout:      s.absoluteSessionTimeout,
 		MinBytesPerMinute:    s.minBytesPerMinute,
-		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+		EnableTimeoutChecker: s.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
-			// Send POP3 error message before closing due to timeout
-			// RFC 1939 doesn't define specific timeout response codes, but [IN-USE] is commonly used
-			var message string
-			switch reason {
-			case "idle":
-				message = "-ERR [IN-USE] Idle timeout, please reconnect\r\n"
-			case "slow_throughput":
+			// Best-effort notice before closing; RFC 1939 doesn't define
+			// timeout response codes, but [IN-USE] is commonly used.
+			message := "-ERR [IN-USE] Connection timeout, please reconnect\r\n"
+			if reason == "slow_throughput" {
 				message = "-ERR [IN-USE] Connection too slow, please reconnect\r\n"
-			case "session_max":
-				message = "-ERR [IN-USE] Maximum session duration exceeded, please reconnect\r\n"
-			default:
-				message = "-ERR [IN-USE] Connection timeout, please reconnect\r\n"
 			}
-			// Write error message - ignore errors as connection may already be broken
-			// This is best-effort to inform the client
 			_, _ = fmt.Fprint(conn, message)
 		},
 	}

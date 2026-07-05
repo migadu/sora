@@ -249,3 +249,117 @@ func TestAbsoluteSessionTimeoutConfiguration(t *testing.T) {
 	t.Log("   - Shared timeout mechanism with idle timeout (TestIdleTimeoutTrigger)")
 	t.Log("   - Log output showing session_max value")
 }
+
+// TestIdleKeepaliveSurvivesIdleTimeout verifies that a client sitting in IDLE
+// is NOT disconnected by command_timeout: the server sends untagged
+// "* OK Still here" keepalives (every 2m, or half the knob when it is
+// shorter), which refresh the SoraConn activity clock. RFC 2177 allows the
+// client to stay silent for up to 29 minutes during IDLE, so killing IDLE
+// sessions at command_timeout was a protocol violation and reconnect churn.
+func TestIdleKeepaliveSurvivesIdleTimeout(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	// 2-second idle knob: keepalives arrive every ~1 second during IDLE.
+	server, account := common.SetupIMAPServerWithTimeout(t, 2*time.Second)
+
+	conn, err := net.DialTimeout("tcp", server.Address, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect to IMAP server: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+
+	greeting, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read greeting: %v", err)
+	}
+	if !strings.HasPrefix(greeting, "* OK") {
+		t.Fatalf("Invalid greeting: %s", greeting)
+	}
+
+	fmt.Fprintf(conn, "a001 LOGIN %s %s\r\n", account.Email, account.Password)
+	loginResp, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read LOGIN response: %v", err)
+	}
+	if !strings.HasPrefix(loginResp, "a001 OK") {
+		t.Fatalf("LOGIN failed: %s", loginResp)
+	}
+
+	fmt.Fprintf(conn, "a002 SELECT INBOX\r\n")
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Failed to read SELECT response: %v", err)
+		}
+		if strings.HasPrefix(line, "a002 OK") {
+			break
+		}
+		if strings.HasPrefix(line, "a002 ") {
+			t.Fatalf("SELECT INBOX failed: %s", line)
+		}
+	}
+
+	fmt.Fprintf(conn, "a003 IDLE\r\n")
+	cont, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("Failed to read IDLE continuation: %v", err)
+	}
+	if !strings.HasPrefix(cont, "+") {
+		t.Fatalf("Expected IDLE continuation, got: %s", cont)
+	}
+	t.Logf("Entered IDLE, staying silent for 5s (idle knob is 2s)...")
+
+	// Stay silent well past the idle knob. The session must survive, fed by
+	// keepalives; a BYE or connection close here is the regression.
+	stillHere := 0
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				break // end of observation window
+			}
+			t.Fatalf("Connection died during IDLE: %v", err)
+		}
+		if strings.Contains(line, "BYE") {
+			t.Fatalf("Server sent BYE during IDLE: %s", line)
+		}
+		if strings.Contains(line, "Still here") {
+			stillHere++
+		}
+	}
+	if stillHere == 0 {
+		t.Fatal("Expected at least one '* OK Still here' keepalive during IDLE")
+	}
+	t.Logf("✅ Received %d keepalive(s) during 5s of silent IDLE", stillHere)
+
+	// The session must still be fully functional: end IDLE and run a command.
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprintf(conn, "DONE\r\n")
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Failed to read IDLE completion: %v", err)
+		}
+		if strings.HasPrefix(line, "a003 OK") {
+			break
+		}
+		if strings.HasPrefix(line, "a003 ") {
+			t.Fatalf("IDLE completion failed: %s", line)
+		}
+	}
+
+	fmt.Fprintf(conn, "a004 NOOP\r\n")
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Failed to read NOOP response after IDLE: %v", err)
+		}
+		if strings.HasPrefix(line, "a004 OK") {
+			break
+		}
+	}
+	t.Logf("✅ Session fully functional after surviving IDLE past the idle knob")
+}

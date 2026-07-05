@@ -19,6 +19,7 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
@@ -431,6 +432,8 @@ func (s *POP3Session) AuthenticateMechanisms() []string {
 }
 
 func (s *POP3Session) Stat(ctx context.Context) (int, int64, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "STAT", s.server.commandTimeouts)
+	defer cancel()
 	if err := s.loadMessagesIfNeeded(ctx); err != nil {
 		return 0, 0, err
 	}
@@ -443,6 +446,8 @@ func (s *POP3Session) Stat(ctx context.Context) (int, int64, error) {
 }
 
 func (s *POP3Session) List(ctx context.Context, msg int) ([]pop3.MessageInfo, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "LIST", s.server.commandTimeouts)
+	defer cancel()
 	if err := s.loadMessagesIfNeeded(ctx); err != nil {
 		return nil, err
 	}
@@ -472,6 +477,8 @@ func (s *POP3Session) List(ctx context.Context, msg int) ([]pop3.MessageInfo, er
 }
 
 func (s *POP3Session) Uidl(ctx context.Context, msg int) ([]pop3.MessageUidl, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "UIDL", s.server.commandTimeouts)
+	defer cancel()
 	if err := s.loadMessagesIfNeeded(ctx); err != nil {
 		return nil, err
 	}
@@ -501,6 +508,11 @@ func (s *POP3Session) Uidl(ctx context.Context, msg int) ([]pop3.MessageUidl, er
 }
 
 func (s *POP3Session) Retr(ctx context.Context, msgNum int) (io.ReadCloser, error) {
+	// The timeout covers only the server-side body load (cache/S3/DB): the
+	// returned reader is over an in-memory buffer, so streaming to a slow
+	// client is never on this clock.
+	ctx, cancel := applyCommandTimeout(ctx, "RETR", s.server.commandTimeouts)
+	defer cancel()
 	if err := s.loadMessagesIfNeeded(ctx); err != nil {
 		return nil, err
 	}
@@ -519,7 +531,7 @@ func (s *POP3Session) Retr(ctx context.Context, msgNum int) (io.ReadCloser, erro
 
 	s.DebugLog("fetching message body", "uid", msg.UID)
 	retrieveStart := time.Now()
-	bodyData, err := s.getMessageBody(&msg)
+	bodyData, err := s.getMessageBody(ctx, &msg)
 	if err != nil {
 		if err == consts.ErrMessageNotAvailable {
 			return nil, errMsgNotAvailable
@@ -584,6 +596,8 @@ func (s *POP3Session) freeBodyMem(n int64) {
 }
 
 func (s *POP3Session) Top(ctx context.Context, msgNum int, lines int) (io.ReadCloser, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "TOP", s.server.commandTimeouts)
+	defer cancel()
 	if err := s.loadMessagesIfNeeded(ctx); err != nil {
 		return nil, err
 	}
@@ -600,7 +614,7 @@ func (s *POP3Session) Top(ctx context.Context, msgNum int, lines int) (io.ReadCl
 		return nil, errNoSuchMessage
 	}
 
-	bodyData, err := s.getMessageBody(&msg)
+	bodyData, err := s.getMessageBody(ctx, &msg)
 	if err != nil {
 		if err == consts.ErrMessageNotAvailable {
 			return nil, errMsgNotAvailable
@@ -657,6 +671,8 @@ func truncateToTop(bodyData []byte, lines int) []byte {
 }
 
 func (s *POP3Session) Dele(ctx context.Context, msg int) error {
+	ctx, cancel := applyCommandTimeout(ctx, "DELE", s.server.commandTimeouts)
+	defer cancel()
 	if err := s.loadMessagesIfNeeded(ctx); err != nil {
 		return err
 	}
@@ -698,6 +714,8 @@ func (s *POP3Session) Noop(ctx context.Context) error {
 }
 
 func (s *POP3Session) Quit(ctx context.Context) (int, error) {
+	ctx, cancel := applyCommandTimeout(ctx, "QUIT", s.server.commandTimeouts)
+	defer cancel()
 	commitOK := true
 
 	s.mutex.RLock()
@@ -876,8 +894,8 @@ const (
 	pop3BodyFetchRetryDelay    = 500 * time.Millisecond
 )
 
-func (s *POP3Session) getMessageBody(msg *db.POP3Message) ([]byte, error) {
-	if s.ctx.Err() != nil {
+func (s *POP3Session) getMessageBody(ctx context.Context, msg *db.POP3Message) ([]byte, error) {
+	if ctx.Err() != nil {
 		s.DebugLog("request aborted, aborting message body fetch")
 		return nil, fmt.Errorf("request aborted")
 	}
@@ -892,7 +910,7 @@ func (s *POP3Session) getMessageBody(msg *db.POP3Message) ([]byte, error) {
 		return nil, errBodyTooBig
 	}
 
-	data, err := s.loadMessageBody(msg)
+	data, err := s.loadMessageBody(ctx, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -912,7 +930,7 @@ func (s *POP3Session) getMessageBody(msg *db.POP3Message) ([]byte, error) {
 // Preference order:
 //   - uploaded messages:     local cache → S3 → local staging disk (S3 outage)
 //   - not-yet-uploaded msgs: local staging disk → S3 (cross-node / late-upload race)
-func (s *POP3Session) loadMessageBody(msg *db.POP3Message) ([]byte, error) {
+func (s *POP3Session) loadMessageBody(ctx context.Context, msg *db.POP3Message) ([]byte, error) {
 	if msg.IsUploaded {
 		// Try cache first (nil-safe: cache is optional and not configured in tests).
 		if s.server.cache != nil {
@@ -929,7 +947,7 @@ func (s *POP3Session) loadMessageBody(msg *db.POP3Message) ([]byte, error) {
 
 		// Fallback to S3
 		s.DebugLog("cache miss - fetching from S3", "uid", msg.UID, "hash", msg.ContentHash)
-		data, err := s.fetchBodyFromS3(msg)
+		data, err := s.fetchBodyFromS3(ctx, msg)
 		if err != nil {
 			// S3 is unavailable — fall back to the local staging file if the uploader
 			// still has it. This covers test environments (where S3 is a no-op stub)
@@ -987,7 +1005,7 @@ func (s *POP3Session) loadMessageBody(msg *db.POP3Message) ([]byte, error) {
 	//
 	// Decide up front whether the body is still expected to arrive. We only wait-and-retry
 	// S3 when it is: there is no point sleeping for a body that is never coming.
-	pending := s.bodyUploadStillPending(msg)
+	pending := s.bodyUploadStillPending(ctx, msg)
 
 	if msg.S3Domain != "" && msg.S3Localpart != "" {
 		attempts := 1
@@ -995,7 +1013,7 @@ func (s *POP3Session) loadMessageBody(msg *db.POP3Message) ([]byte, error) {
 			attempts = pop3BodyFetchRetryAttempts
 		}
 		for attempt := 0; attempt < attempts; attempt++ {
-			s3Data, s3Err := s.fetchBodyFromS3(msg)
+			s3Data, s3Err := s.fetchBodyFromS3(ctx, msg)
 			if s3Err == nil {
 				s.DebugLog("local staging file missing, served from S3", "uid", msg.UID, "attempt", attempt)
 				return s3Data, nil
@@ -1010,8 +1028,8 @@ func (s *POP3Session) loadMessageBody(msg *db.POP3Message) ([]byte, error) {
 			if attempt < attempts-1 {
 				select {
 				case <-time.After(pop3BodyFetchRetryDelay):
-				case <-s.ctx.Done():
-					return nil, s.ctx.Err()
+				case <-ctx.Done():
+					return nil, ctx.Err()
 				}
 			}
 		}
@@ -1034,8 +1052,8 @@ func (s *POP3Session) loadMessageBody(msg *db.POP3Message) ([]byte, error) {
 // uploaded (so a retry should find it in S3). It distinguishes the transient
 // read-before-upload race from genuine, permanent content loss. On a DB error it returns
 // true (conservative: a client retry is safer than reporting the message permanently gone).
-func (s *POP3Session) bodyUploadStillPending(msg *db.POP3Message) bool {
-	pending, err := s.server.rdb.PendingUploadExistsWithRetry(s.ctx, msg.ContentHash, msg.AccountID)
+func (s *POP3Session) bodyUploadStillPending(ctx context.Context, msg *db.POP3Message) bool {
+	pending, err := s.server.rdb.PendingUploadExistsWithRetry(ctx, msg.ContentHash, msg.AccountID)
 	if err != nil {
 		s.WarnLog("could not check pending-upload status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
 		return true
@@ -1043,7 +1061,7 @@ func (s *POP3Session) bodyUploadStillPending(msg *db.POP3Message) bool {
 	if pending {
 		return true
 	}
-	uploaded, err := s.server.rdb.IsContentHashUploadedWithRetry(s.ctx, msg.ContentHash, msg.AccountID)
+	uploaded, err := s.server.rdb.IsContentHashUploadedWithRetry(ctx, msg.ContentHash, msg.AccountID)
 	if err != nil {
 		s.WarnLog("could not check uploaded status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
 		return true
@@ -1053,8 +1071,10 @@ func (s *POP3Session) bodyUploadStillPending(msg *db.POP3Message) bool {
 
 // fetchBodyFromS3 retrieves a message body from S3 using the key components
 // stored on the message record. It validates the payload is non-empty and warms
-// the local cache on success.
-func (s *POP3Session) fetchBodyFromS3(msg *db.POP3Message) ([]byte, error) {
+// the local cache on success. ctx bounds the S3 fetch: it carries the RETR/TOP
+// per-command deadline and is cancelled on client disconnect, so a wedged S3
+// endpoint cannot hold the session goroutine past the cap.
+func (s *POP3Session) fetchBodyFromS3(ctx context.Context, msg *db.POP3Message) ([]byte, error) {
 	if msg.S3Domain == "" || msg.S3Localpart == "" {
 		return nil, fmt.Errorf("message UID %d is missing S3 key information", msg.UID)
 	}
@@ -1070,7 +1090,7 @@ func (s *POP3Session) fetchBodyFromS3(msg *db.POP3Message) ([]byte, error) {
 				s3GetErr = fmt.Errorf("S3 get panicked: %v", r)
 			}
 		}()
-		reader, s3GetErr = s.server.s3.GetWithRetry(s.server.appCtx, s3Key)
+		reader, s3GetErr = s.server.s3.GetWithRetry(ctx, s3Key)
 	}()
 	if s3GetErr != nil {
 		s.DebugLog("S3 GetWithRetry failed", "uid", msg.UID, "s3_key", s3Key, "error", s3GetErr)
@@ -1133,18 +1153,30 @@ func (s *POP3Session) startTerminationPoller() {
 		return
 	}
 
+	// Capture everything the poller goroutine needs up front: the session
+	// teardown nils s.User (which AccountID/InfoLog read) unsynchronized
+	// with this goroutine. s.conn is set once at construction, so the
+	// captured conn is safe to close from here.
+	accountID := s.AccountID()
+	user := s.FullAddress()
+	sessionID := s.Id
+	conn := s.conn
+
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(s.AccountID())
+	kickChan := s.server.connTracker.RegisterSession(accountID)
 
 	go func() {
 		// Unregister when done
-		defer s.server.connTracker.UnregisterSession(s.AccountID(), kickChan)
+		defer s.server.connTracker.UnregisterSession(accountID, kickChan)
 
 		select {
 		case <-kickChan:
-			// Kick notification received - close connection
-			s.InfoLog("connection kicked, disconnecting user")
-			s.conn.Close()
+			// Kick notification received - close connection. Log with the
+			// captured identity; s.InfoLog would re-read session fields that
+			// a concurrent teardown may be nilling.
+			logger.Info("connection kicked, disconnecting user",
+				"protocol", s.Protocol, "user", user, "account_id", accountID, "session", sessionID)
+			conn.Close()
 		case <-s.ctx.Done():
 			// Session ended normally
 		}

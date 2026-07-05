@@ -822,11 +822,14 @@ type ServerLimitsConfig struct {
 
 // ServerTimeoutsConfig holds timeout settings for a server
 type ServerTimeoutsConfig struct {
-	CommandTimeout         string                 `toml:"command_timeout,omitempty"`          // Maximum idle time before disconnection (default: protocol-specific)
-	AbsoluteSessionTimeout string                 `toml:"absolute_session_timeout,omitempty"` // Maximum total session duration (default: 24h)
-	MinBytesPerMinute      int64                  `toml:"min_bytes_per_minute,omitempty"`     // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
-	SchedulerShardCount    int                    `toml:"scheduler_shard_count,omitempty"`    // Number of timeout scheduler shards (default: 0 = runtime.NumCPU(), -1 = runtime.NumCPU()/2 for physical cores)
-	IMAPCommandTimeouts    *CommandTimeoutsConfig `toml:"imap_command_timeouts,omitempty"`    // Per-command hard execution timeouts (IMAP only)
+	CommandTimeout             string                            `toml:"command_timeout,omitempty"`              // Maximum idle time before disconnection (default: protocol-specific)
+	AbsoluteSessionTimeout     string                            `toml:"absolute_session_timeout,omitempty"`     // Maximum total session duration (default: 24h)
+	MinBytesPerMinute          int64                             `toml:"min_bytes_per_minute,omitempty"`         // Minimum throughput to prevent slowloris (default: 0 = disabled, recommended: 512 bytes/min)
+	SchedulerShardCount        int                               `toml:"scheduler_shard_count,omitempty"`        // Number of timeout scheduler shards (default: 0 = runtime.NumCPU(), -1 = runtime.NumCPU()/2 for physical cores)
+	IMAPCommandTimeouts        *CommandTimeoutsConfig            `toml:"imap_command_timeouts,omitempty"`        // Per-command hard execution timeouts (IMAP only)
+	ManageSieveCommandTimeouts *ManageSieveCommandTimeoutsConfig `toml:"managesieve_command_timeouts,omitempty"` // Per-command hard execution timeouts (ManageSieve only)
+	POP3CommandTimeouts        *POP3CommandTimeoutsConfig        `toml:"pop3_command_timeouts,omitempty"`        // Per-command hard execution timeouts (POP3 only)
+	LMTPCommandTimeouts        *LMTPCommandTimeoutsConfig        `toml:"lmtp_command_timeouts,omitempty"`        // Per-command hard execution timeouts (LMTP only)
 }
 
 // CommandTimeoutsConfig holds per-command hard timeout limits for expensive IMAP
@@ -841,6 +844,54 @@ type CommandTimeoutsConfig struct {
 	Store       string `toml:"store,omitempty"`        // STORE timeout (default: "15s")
 	Copy        string `toml:"copy,omitempty"`         // COPY timeout (default: "30s")
 	Move        string `toml:"move,omitempty"`         // MOVE timeout (default: "30s")
+}
+
+// ManageSieveCommandTimeoutsConfig holds per-command hard timeout limits for
+// ManageSieve script operations, mirroring the IMAP command timeouts. All
+// values are duration strings (e.g. "30s", "2m"); "0" disables the timeout for
+// that command. Omitted fields use generous defaults that act as safety nets
+// against a wedged backend (slow database, stuck lock). AUTHENTICATE is
+// deliberately not covered: it is paced by the progressive auth delay
+// (auth_rate_limit), which a hard cap would fight.
+type ManageSieveCommandTimeoutsConfig struct {
+	ListScripts  string `toml:"listscripts,omitempty"`  // LISTSCRIPTS timeout (default: "10s")
+	GetScript    string `toml:"getscript,omitempty"`    // GETSCRIPT timeout (default: "10s")
+	PutScript    string `toml:"putscript,omitempty"`    // PUTSCRIPT timeout (default: "10s")
+	CheckScript  string `toml:"checkscript,omitempty"`  // CHECKSCRIPT timeout (default: "10s")
+	SetActive    string `toml:"setactive,omitempty"`    // SETACTIVE timeout (default: "10s")
+	DeleteScript string `toml:"deletescript,omitempty"` // DELETESCRIPT timeout (default: "10s")
+	RenameScript string `toml:"renamescript,omitempty"` // RENAMESCRIPT timeout (default: "10s")
+	HaveSpace    string `toml:"havespace,omitempty"`    // HAVESPACE timeout (default: "10s")
+}
+
+// POP3CommandTimeoutsConfig holds per-command hard timeout limits for POP3
+// maildrop operations, mirroring the IMAP and ManageSieve command timeouts.
+// All values are duration strings (e.g. "10s", "1m"); "0" disables the timeout
+// for that command. RETR/TOP get more generous defaults because they fetch the
+// message body from cache/S3 (like IMAP FETCH); the timeout covers only the
+// server-side load, not streaming the body to the client. USER/PASS/APOP/AUTH
+// are deliberately not covered: they are paced by the progressive auth delay
+// (auth_rate_limit), which a hard cap would fight.
+type POP3CommandTimeoutsConfig struct {
+	Stat string `toml:"stat,omitempty"` // STAT timeout (default: "10s")
+	List string `toml:"list,omitempty"` // LIST timeout (default: "10s")
+	Uidl string `toml:"uidl,omitempty"` // UIDL timeout (default: "10s")
+	Retr string `toml:"retr,omitempty"` // RETR timeout (default: "30s")
+	Top  string `toml:"top,omitempty"`  // TOP timeout (default: "30s")
+	Dele string `toml:"dele,omitempty"` // DELE timeout (default: "10s")
+	Quit string `toml:"quit,omitempty"` // QUIT timeout — UPDATE-phase expunge (default: "15s")
+}
+
+// LMTPCommandTimeoutsConfig holds per-command hard timeout limits for the two
+// LMTP phases that do real server-side work. All values are duration strings
+// (e.g. "10s", "1m"); "0" disables the timeout for that command. A timeout
+// surfaces as a 4xx temporary failure, so the upstream MTA queues and retries.
+// The DATA cap covers only the delivery pipeline (SIEVE, spool, DB insert) —
+// wire reception from a slow MTA is governed by the server read timeout, not
+// this cap.
+type LMTPCommandTimeoutsConfig struct {
+	Rcpt string `toml:"rcpt,omitempty"` // RCPT timeout (default: "10s")
+	Data string `toml:"data,omitempty"` // DATA processing timeout (default: "60s")
 }
 
 // ServerConfig represents a single server instance
@@ -1357,6 +1408,119 @@ func (s *ServerConfig) GetCommandTimeoutsOverrides() (map[string]time.Duration, 
 		d, err := helpers.ParseDuration(f.value)
 		if err != nil {
 			return nil, fmt.Errorf("invalid command timeout %q for %s: %w", f.value, f.name, err)
+		}
+		overrides[f.name] = d
+	}
+
+	return overrides, nil
+}
+
+// GetManageSieveCommandTimeoutsOverrides returns a map of command name to
+// timeout duration for any ManageSieve command timeouts explicitly configured
+// in the TOML. Only non-empty fields are returned; the caller is responsible
+// for merging with defaults. Mirrors GetCommandTimeoutsOverrides (IMAP).
+func (s *ServerConfig) GetManageSieveCommandTimeoutsOverrides() (map[string]time.Duration, error) {
+	if s.Timeouts == nil || s.Timeouts.ManageSieveCommandTimeouts == nil {
+		return nil, nil
+	}
+
+	ct := s.Timeouts.ManageSieveCommandTimeouts
+	overrides := make(map[string]time.Duration)
+
+	fields := []struct {
+		name  string
+		value string
+	}{
+		{"listscripts", ct.ListScripts},
+		{"getscript", ct.GetScript},
+		{"putscript", ct.PutScript},
+		{"checkscript", ct.CheckScript},
+		{"setactive", ct.SetActive},
+		{"deletescript", ct.DeleteScript},
+		{"renamescript", ct.RenameScript},
+		{"havespace", ct.HaveSpace},
+	}
+
+	for _, f := range fields {
+		if f.value == "" {
+			continue
+		}
+		d, err := helpers.ParseDuration(f.value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ManageSieve command timeout %q for %s: %w", f.value, f.name, err)
+		}
+		overrides[f.name] = d
+	}
+
+	return overrides, nil
+}
+
+// GetPOP3CommandTimeoutsOverrides returns a map of command name to timeout
+// duration for any POP3 command timeouts explicitly configured in the TOML.
+// Only non-empty fields are returned; the caller is responsible for merging
+// with defaults. Mirrors GetCommandTimeoutsOverrides (IMAP).
+func (s *ServerConfig) GetPOP3CommandTimeoutsOverrides() (map[string]time.Duration, error) {
+	if s.Timeouts == nil || s.Timeouts.POP3CommandTimeouts == nil {
+		return nil, nil
+	}
+
+	ct := s.Timeouts.POP3CommandTimeouts
+	overrides := make(map[string]time.Duration)
+
+	fields := []struct {
+		name  string
+		value string
+	}{
+		{"stat", ct.Stat},
+		{"list", ct.List},
+		{"uidl", ct.Uidl},
+		{"retr", ct.Retr},
+		{"top", ct.Top},
+		{"dele", ct.Dele},
+		{"quit", ct.Quit},
+	}
+
+	for _, f := range fields {
+		if f.value == "" {
+			continue
+		}
+		d, err := helpers.ParseDuration(f.value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid POP3 command timeout %q for %s: %w", f.value, f.name, err)
+		}
+		overrides[f.name] = d
+	}
+
+	return overrides, nil
+}
+
+// GetLMTPCommandTimeoutsOverrides returns a map of command name to timeout
+// duration for any LMTP command timeouts explicitly configured in the TOML.
+// Only non-empty fields are returned; the caller is responsible for merging
+// with defaults. Mirrors GetCommandTimeoutsOverrides (IMAP).
+func (s *ServerConfig) GetLMTPCommandTimeoutsOverrides() (map[string]time.Duration, error) {
+	if s.Timeouts == nil || s.Timeouts.LMTPCommandTimeouts == nil {
+		return nil, nil
+	}
+
+	ct := s.Timeouts.LMTPCommandTimeouts
+	overrides := make(map[string]time.Duration)
+
+	fields := []struct {
+		name  string
+		value string
+	}{
+		{"rcpt", ct.Rcpt},
+		{"data", ct.Data},
+	}
+
+	for _, f := range fields {
+		if f.value == "" {
+			continue
+		}
+		d, err := helpers.ParseDuration(f.value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid LMTP command timeout %q for %s: %w", f.value, f.name, err)
 		}
 		overrides[f.name] = d
 	}

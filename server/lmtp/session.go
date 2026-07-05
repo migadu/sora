@@ -69,7 +69,7 @@ type LMTPSession struct {
 	startTime     time.Time
 }
 
-func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
+func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
 	start := time.Now()
 	recordMetrics := func(status string) {
 		metrics.CommandsTotal.WithLabelValues("lmtp", "MAIL", status).Inc()
@@ -102,7 +102,7 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 	}
 
 	// Acquire write lock to update sender
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "MAIL")
 		recordMetrics("failure")
@@ -120,7 +120,7 @@ func (s *LMTPSession) Mail(from string, opts *smtp.MailOptions) error {
 	return nil
 }
 
-func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
+func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
 	start := time.Now()
 	recordMetrics := func(status string) {
 		metrics.CommandsTotal.WithLabelValues("lmtp", "RCPT", status).Inc()
@@ -154,10 +154,15 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	}
 
 	s.DebugLog("looking up user id", "address", lookupAddress)
+	// Cap the recipient validation work on top of the library's per-command
+	// context (cancelled on client disconnect and server shutdown).
+	ctx, cancel := applyCommandTimeout(ctx, "RCPT", s.backend.commandTimeouts)
+	defer cancel()
+
 	// Create a context for read operations that respects session pinning
-	readCtx := s.ctx
+	readCtx := ctx
 	if s.useMasterDB {
-		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
 	// Look up account ID by credential address (excluding deleted accounts)
@@ -183,14 +188,23 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 		}
 	}
 
-	// This is a potential write operation, so it must use the main context.
-	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist. Use the resilient method.
-	err = s.backend.rdb.CreateDefaultMailboxesWithRetry(s.ctx, AccountID)
+	// This is a potential write operation, so it must not carry the read
+	// (master-DB pinning) value. Ensure default mailboxes exist.
+	err = s.backend.rdb.CreateDefaultMailboxesWithRetry(ctx, AccountID)
 	if err != nil {
-		// Check if error is due to context cancellation (server shutdown)
+		// Context error: distinguish the RCPT execution cap firing on a
+		// healthy-but-slow server from client disconnect / server shutdown.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			s.InfoLog("mailbox creation cancelled due to server shutdown")
 			recordMetrics("failure")
+			if commandTimedOut(ctx) {
+				s.WarnLog("mailbox creation timed out", "cap", "rcpt")
+				return &smtp.SMTPError{
+					Code:         451,
+					EnhancedCode: smtp.EnhancedCode{4, 4, 3},
+					Message:      "Recipient validation timed out, please try again later",
+				}
+			}
+			s.InfoLog("mailbox creation cancelled due to server shutdown")
 			return &smtp.SMTPError{
 				Code:         421,
 				EnhancedCode: smtp.EnhancedCode{4, 2, 1},
@@ -205,10 +219,18 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	// User.Address should always be the primary address (not the recipient with +alias)
 	primaryAddr, err := s.backend.rdb.GetPrimaryEmailForAccountWithRetry(readCtx, AccountID)
 	if err != nil {
-		// Check if error is due to context cancellation (server shutdown)
+		// Context error: RCPT cap timeout vs disconnect/shutdown (see above).
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			s.InfoLog("primary email fetch cancelled due to server shutdown")
 			recordMetrics("failure")
+			if commandTimedOut(ctx) {
+				s.WarnLog("primary email fetch timed out", "cap", "rcpt")
+				return &smtp.SMTPError{
+					Code:         451,
+					EnhancedCode: smtp.EnhancedCode{4, 4, 3},
+					Message:      "Recipient validation timed out, please try again later",
+				}
+			}
+			s.InfoLog("primary email fetch cancelled due to server shutdown")
 			return &smtp.SMTPError{
 				Code:         421,
 				EnhancedCode: smtp.EnhancedCode{4, 2, 1},
@@ -225,7 +247,7 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	}
 
 	// Acquire write lock to update User
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "RCPT")
 		recordMetrics("failure")
@@ -267,7 +289,7 @@ func (s *LMTPSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	return nil
 }
 
-func (s *LMTPSession) Data(r io.Reader) error {
+func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Prometheus metrics - start delivery timing
 	start := time.Now()
 	recordMetrics := func(status string) {
@@ -276,7 +298,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	}
 
 	// Acquire write lock for accessing session state and potentially updating it (useMasterDB)
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "DATA")
 		recordMetrics("failure")
@@ -332,6 +354,14 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	// Reset the metric timer NOW. Network transmission from a slow MTA
 	// can artificially inflate backend processing latency metrics.
 	start = time.Now()
+
+	// Cap the delivery pipeline (SIEVE, spool, DB insert) from this point for
+	// the same reason: the body read above is client-paced wire I/O already
+	// governed by the server ReadTimeout and must not consume the execution
+	// budget. On expiry the pipeline aborts with a 4xx and the upstream MTA
+	// requeues the message.
+	ctx, cancel := applyCommandTimeout(ctx, "DATA", s.backend.commandTimeouts)
+	defer cancel()
 
 	// Check if message exceeds configured limit
 	// LimitReader allows reading limitToUse+1 bytes to detect oversized messages
@@ -477,9 +507,9 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	// so that the stored file has the modified headers
 
 	// Create a context for read operations that respects session pinning
-	readCtx := s.ctx
+	readCtx := ctx
 	if s.useMasterDB {
-		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
 	activeScript, err := s.backend.rdb.GetActiveScriptWithRetry(readCtx, s.AccountID())
@@ -520,7 +550,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			}
 		}
 
-		defaultResult, defaultEvalErr := s.backend.defaultSieveExecutor.Evaluate(s.ctx, sieveCtx)
+		defaultResult, defaultEvalErr := s.backend.defaultSieveExecutor.Evaluate(ctx, sieveCtx)
 		if defaultEvalErr != nil {
 			metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
 			s.WarnLog("default sieve script evaluation error", "error", defaultEvalErr)
@@ -569,7 +599,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			s.WarnLog("failed to get/create sieve executor", "error", userScriptErr)
 			// Keep the result from the default script
 		} else {
-			userResult, userEvalErr := userSieveExecutor.Evaluate(s.ctx, sieveCtx)
+			userResult, userEvalErr := userSieveExecutor.Evaluate(ctx, sieveCtx)
 			if userEvalErr != nil {
 				metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
 				s.WarnLog("user sieve script evaluation error", "error", userEvalErr)
@@ -710,7 +740,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			s.InfoLog("sieve fileinto :copy - saving to both mailbox and inbox", "mailbox", mailboxName)
 
 			// First save to the specified mailbox (with :create if specified)
-			err := s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
+			err := s.saveMessageToMailbox(ctx, mailboxName, fullMessageBytes, contentHash,
 				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, result.CreateMailbox, sieveFlags)
 			if err != nil {
 				// Allow duplicates (message already in target mailbox)
@@ -725,7 +755,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			s.DebugLog("saving copy to inbox due to :copy modifier")
 
 			// Call saveMessageToMailbox again for INBOX (no :create for INBOX - it always exists)
-			err = s.saveMessageToMailbox(consts.MailboxInbox, fullMessageBytes, contentHash,
+			err = s.saveMessageToMailbox(ctx, consts.MailboxInbox, fullMessageBytes, contentHash,
 				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, false, sieveFlags)
 			if err != nil {
 				// Allow duplicates (message already in INBOX)
@@ -782,7 +812,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 
 	case sieveengine.ActionVacation:
 		// Handle vacation response
-		err := s.handleVacationResponse(result, messageContent)
+		err := s.handleVacationResponse(ctx, result, messageContent)
 		if err != nil {
 			s.DebugLog("error handling vacation response", "error", err)
 			// Continue processing even if vacation response fails
@@ -798,7 +828,7 @@ func (s *LMTPSession) Data(r io.Reader) error {
 	// Save the message to the determined mailbox (either the specified one or INBOX)
 	// For fileinto actions without :copy, pass the :create flag if specified
 	createMailbox := result.Action == sieveengine.ActionFileInto && result.CreateMailbox
-	err = s.saveMessageToMailbox(mailboxName, fullMessageBytes, contentHash,
+	err = s.saveMessageToMailbox(ctx, mailboxName, fullMessageBytes, contentHash,
 		subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, createMailbox, sieveFlags)
 	if err != nil {
 		// Handle duplicate messages (acceptable in LMTP - return success)
@@ -820,18 +850,30 @@ func (s *LMTPSession) Data(r io.Reader) error {
 			// Fall through to success path below (don't return error)
 			// This ensures the message is accepted by LMTP even if it's a duplicate
 		} else {
-			// Check if error is due to context cancellation (server shutdown)
+			// Context error: DATA cap timeout vs disconnect/shutdown. In both
+			// cases DO NOT delete the file. Even though we wrote it, there's a
+			// race window where another concurrent delivery might have seen the
+			// file exists and decided not to write it (but might still be trying
+			// to create a DB record) — and on a timeout the transaction may have
+			// silently committed (commit ambiguity), in which case the upload
+			// worker still needs the file. Cleanup is the uploader's
+			// cleanupOrphanedFiles job either way.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				s.InfoLog("message save cancelled due to server shutdown")
-				// During shutdown, DO NOT delete the file. Even though we wrote it, there's a race
-				// window where another concurrent delivery might have seen the file exists and
-				// decided not to write it (but might still be trying to create a DB record).
-				// The file will be cleaned up by the uploader's cleanupOrphanedFiles job.
 				if filePath != nil {
-					s.DebugLog("keeping file for cleanup job due to shutdown", "content_hash", contentHash)
+					s.DebugLog("keeping file for cleanup job after cancellation", "content_hash", contentHash)
 				}
-				metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "shutdown").Inc()
 				recordMetrics("failure")
+				if commandTimedOut(ctx) {
+					s.WarnLog("message save timed out", "cap", "data")
+					metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "timeout").Inc()
+					return &smtp.SMTPError{
+						Code:         451,
+						EnhancedCode: smtp.EnhancedCode{4, 3, 0},
+						Message:      "Message processing timed out, please try again later",
+					}
+				}
+				s.InfoLog("message save cancelled due to server shutdown")
+				metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "shutdown").Inc()
 				return &smtp.SMTPError{
 					Code:         421,
 					EnhancedCode: smtp.EnhancedCode{4, 2, 1},
@@ -969,7 +1011,7 @@ func (s *LMTPSession) notifyRelayWorker() {
 // ":from" ownership constraint, RFC 2047 subject encoding, and message construction
 // all live there. The send decision and per-sender rate-limiting are handled upstream
 // by the Sieve engine's VacationOracle.
-func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, originalMessage *message.Entity) error {
+func (s *LMTPSession) handleVacationResponse(ctx context.Context, result sieveengine.Result, originalMessage *message.Entity) error {
 	handler := &delivery.StandardVacationHandler{
 		Hostname:       s.HostName,
 		RelayQueue:     s.backend.relayQueue,
@@ -977,22 +1019,22 @@ func (s *LMTPSession) handleVacationResponse(result sieveengine.Result, original
 		IsOwnedAddress: s.backend.rdb.IsAddressOwnedByAccountWithRetry,
 		RelayNotify:    s.notifyRelayWorker,
 	}
-	return handler.HandleVacationResponse(s.ctx, s.AccountID(), result, s.sender, &s.User.Address, originalMessage)
+	return handler.HandleVacationResponse(ctx, s.AccountID(), result, s.sender, &s.User.Address, originalMessage)
 }
 
 // saveMessageToMailbox saves a message to the specified mailbox.
 // flags carries any keywords/flags set by the Sieve script (imap4flags, RFC 5232);
 // they are stored on the message (InsertMessage folds keyword case per RFC 9051 §2.3.2).
-func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
+func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName string,
 	fullMessageBytes []byte, contentHash string, subject string, messageID string,
 	sentDate time.Time, inReplyTo []string, references []string, bodyStructure *imap.BodyStructure,
 	plaintextBody *string, recipients []helpers.Recipient, createMailbox bool,
 	flags []imap.Flag) error {
 
 	// Create a context for read operations that respects session pinning
-	readCtx := s.ctx
+	readCtx := ctx
 	if s.useMasterDB {
-		readCtx = context.WithValue(s.ctx, consts.UseMasterDBKey, true)
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
 	// If :create flag is set, use GetOrCreateMailboxByNameWithRetry
@@ -1000,7 +1042,7 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 	var err error
 	if createMailbox {
 		s.DebugLog("creating mailbox if it doesn't exist", "mailbox", mailboxName)
-		mailbox, err = s.backend.rdb.GetOrCreateMailboxByNameWithRetry(s.ctx, s.AccountID(), mailboxName)
+		mailbox, err = s.backend.rdb.GetOrCreateMailboxByNameWithRetry(ctx, s.AccountID(), mailboxName)
 		if err != nil {
 			return fmt.Errorf("failed to get or create mailbox '%s': %v", mailboxName, err)
 		}
@@ -1064,7 +1106,7 @@ func (s *LMTPSession) saveMessageToMailbox(mailboxName string,
 	size := int64(len(fullMessageBytes))
 
 	// No need to query - it's already cached in the session
-	_, messageUID, err := s.backend.rdb.InsertMessageWithRetry(s.ctx,
+	_, messageUID, err := s.backend.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
 			AccountID:     destAccountID,
 			MailboxID:     mailbox.ID,

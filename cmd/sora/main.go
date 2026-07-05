@@ -1373,29 +1373,36 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		redirectRateWindow = time.Hour
 	}
 
+	lmtpCommandTimeoutOverrides, err := serverConfig.GetLMTPCommandTimeoutsOverrides()
+	if err != nil {
+		logger.Warn("LMTP: Invalid lmtp_command_timeouts - using defaults", "name", serverConfig.Name, "error", err)
+		lmtpCommandTimeoutOverrides = nil
+	}
+
 	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
-		RelayQueue:           deps.relayQueue,  // Global relay queue
-		RelayWorker:          deps.relayWorker, // Global relay worker for immediate processing
-		TLSVerify:            serverConfig.TLSVerify,
-		TLS:                  serverConfig.TLS,
-		TLSCertFile:          serverConfig.TLSCertFile,
-		TLSKeyFile:           serverConfig.TLSKeyFile,
-		TLSUseStartTLS:       serverConfig.TLSUseStartTLS,
-		TLSConfig:            tlsConfig,
-		Debug:                serverConfig.Debug,
-		MaxConnections:       serverConfig.MaxConnections,
-		MaxConnectionsPerIP:  serverConfig.MaxConnectionsPerIP,
-		ListenBacklog:        serverConfig.ListenBacklog,
-		ProxyProtocol:        serverConfig.ProxyProtocol,
-		ProxyProtocolTimeout: proxyProtocolTimeout,
-		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
-		MaxMessageSize:       maxMessageSize,
-		FTSRetention:         deps.ftsRetention,
-		SieveExtensions:      deps.config.Sieve.EnabledExtensions,
-		InsecureAuth:         serverConfig.InsecureAuth || !serverConfig.TLS, // Default true when TLS not enabled (LMTP behind trusted network)
-		RedirectRateLimit:    serverConfig.GetRedirectRateLimit(),
-		RedirectRateWindow:   redirectRateWindow,
-		MaxRedirectHops:      serverConfig.GetMaxRedirectHops(),
+		RelayQueue:              deps.relayQueue,  // Global relay queue
+		RelayWorker:             deps.relayWorker, // Global relay worker for immediate processing
+		TLSVerify:               serverConfig.TLSVerify,
+		TLS:                     serverConfig.TLS,
+		TLSCertFile:             serverConfig.TLSCertFile,
+		TLSKeyFile:              serverConfig.TLSKeyFile,
+		TLSUseStartTLS:          serverConfig.TLSUseStartTLS,
+		TLSConfig:               tlsConfig,
+		Debug:                   serverConfig.Debug,
+		MaxConnections:          serverConfig.MaxConnections,
+		MaxConnectionsPerIP:     serverConfig.MaxConnectionsPerIP,
+		ListenBacklog:           serverConfig.ListenBacklog,
+		ProxyProtocol:           serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:    proxyProtocolTimeout,
+		TrustedNetworks:         deps.config.Servers.TrustedNetworks,
+		MaxMessageSize:          maxMessageSize,
+		FTSRetention:            deps.ftsRetention,
+		SieveExtensions:         deps.config.Sieve.EnabledExtensions,
+		InsecureAuth:            serverConfig.InsecureAuth || !serverConfig.TLS, // Default true when TLS not enabled (LMTP behind trusted network)
+		RedirectRateLimit:       serverConfig.GetRedirectRateLimit(),
+		RedirectRateWindow:      redirectRateWindow,
+		MaxRedirectHops:         serverConfig.GetMaxRedirectHops(),
+		CommandTimeoutOverrides: lmtpCommandTimeoutOverrides,
 	})
 
 	if err != nil {
@@ -1448,6 +1455,12 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		commandTimeout = 2 * time.Minute
 	}
 
+	pop3CommandTimeoutOverrides, err := serverConfig.GetPOP3CommandTimeoutsOverrides()
+	if err != nil {
+		logger.Warn("POP3: Invalid pop3_command_timeouts - using defaults", "name", serverConfig.Name, "error", err)
+		pop3CommandTimeoutOverrides = nil
+	}
+
 	// Parse absolute session timeout
 	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
 	if err != nil {
@@ -1477,6 +1490,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		SessionMemoryLimit:        sessionMemoryLimit,
 		AuthIdleTimeout:           authIdleTimeout,
 		CommandTimeout:            commandTimeout,
+		CommandTimeoutOverrides:   pop3CommandTimeoutOverrides,
 		AbsoluteSessionTimeout:    absoluteSessionTimeout,
 		MinBytesPerMinute:         serverConfig.GetMinBytesPerMinute(),
 		InsecureAuth:              serverConfig.InsecureAuth || !serverConfig.TLS, // Default true when TLS not enabled (backend behind proxy)
@@ -1539,6 +1553,12 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		commandTimeout = 3 * time.Minute
 	}
 
+	msCommandTimeoutOverrides, err := serverConfig.GetManageSieveCommandTimeoutsOverrides()
+	if err != nil {
+		logger.Warn("ManageSieve: Invalid managesieve_command_timeouts - using defaults", "name", serverConfig.Name, "error", err)
+		msCommandTimeoutOverrides = nil
+	}
+
 	// Parse absolute session timeout
 	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
 	if err != nil {
@@ -1580,6 +1600,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 		LookupCache:               serverConfig.LookupCache,
 		AuthIdleTimeout:           authIdleTimeout,
 		CommandTimeout:            commandTimeout,
+		CommandTimeoutOverrides:   msCommandTimeoutOverrides,
 		AbsoluteSessionTimeout:    absoluteSessionTimeout,
 		MinBytesPerMinute:         serverConfig.GetMinBytesPerMinute(),
 		Config:                    &deps.config,

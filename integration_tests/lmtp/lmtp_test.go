@@ -11,40 +11,48 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
 )
 
-// LogCapture captures log output for verification
+// LogCapture captures log output for verification. It guards the buffer with
+// a mutex: background server goroutines (e.g. the uploader worker) keep
+// logging while the test reads the captured output.
 type LogCapture struct {
-	buffer *bytes.Buffer
-	writer io.Writer
+	mu     sync.Mutex
+	buffer bytes.Buffer
 	oldLog *log.Logger
 	oldOut io.Writer
 }
 
 func NewLogCapture() *LogCapture {
-	buffer := &bytes.Buffer{}
-	writer := io.MultiWriter(os.Stderr, buffer)
-
 	// Save old settings
 	oldOut := log.Writer()
 	oldLog := log.New(oldOut, "", log.LstdFlags)
 
-	// Set new logger to capture output
-	log.SetOutput(writer)
-
-	return &LogCapture{
-		buffer: buffer,
-		writer: writer,
+	lc := &LogCapture{
 		oldLog: oldLog,
 		oldOut: oldOut,
 	}
+
+	// Set new logger to capture output
+	log.SetOutput(io.MultiWriter(os.Stderr, lc))
+
+	return lc
+}
+
+func (lc *LogCapture) Write(p []byte) (int, error) {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return lc.buffer.Write(p)
 }
 
 func (lc *LogCapture) GetOutput() string {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
 	return lc.buffer.String()
 }
 

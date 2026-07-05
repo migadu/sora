@@ -125,18 +125,11 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 			continue // Try to accept the next connection
 		}
 
-		// Complete the deferred TLS handshake (before any I/O, and before the
-		// go-imap library starts reading from the connection). The helper walks
-		// the Unwrap() chain, so the handshake runs through the PROXY conn and
-		// consumes any ClientHello bytes buffered alongside the PROXY header.
-		// Failure is a silent close: no plaintext banner onto a broken TLS
-		// stream, and the limiter slot is released.
-		if _, err := serverPkg.PerformDeferredTLSHandshake(conn); err != nil {
-			logger.Debug("IMAP: TLS handshake failed", "name", l.name, "remote", server.GetAddrString(conn.RemoteAddr()), "error", err)
-			releaseConn() // Release the connection limit
-			conn.Close()
-			continue // Try to accept the next connection
-		}
+		// The deferred TLS handshake is NOT performed here: it runs in
+		// newSession, inside go-imap's per-connection goroutine. Handshaking
+		// in this accept loop would serialize it — one slow TLS client (up
+		// to the 10s handshake deadline) would stall every other client's
+		// accept.
 
 		// Wrap the connection to ensure cleanup on close and preserve PROXY info
 		return &connectionLimitingConn{
@@ -791,6 +784,14 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("imap").Set(s.commandTimeout.Seconds())
 	}
 
+	// go-imap arms its own hardcoded 35-minute read deadline on authenticated
+	// connections (RFC 3501 §5.4 autologout floor + margin) and closes
+	// silently — no BYE, no timeout metric — when it expires. A knob at or
+	// above that value is therefore silently capped by the library.
+	if s.commandTimeout >= 35*time.Minute {
+		logger.Warn("IMAP: command_timeout is at or above the protocol library's 35m read deadline; idle sessions will be closed silently at 35m instead", "name", s.name, "command_timeout", s.commandTimeout)
+	}
+
 	// Initialize local connection tracking (no gossip, just local tracking)
 	// This enables per-user connection limits and kick functionality on backend servers
 	if options.MaxConnectionsPerUser > 0 {
@@ -830,8 +831,29 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 }
 
 func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
-	// TLS handshake is now performed in connectionLimitingListener.Accept()
-	// Connection limits are now handled at the listener level
+	// Complete the deferred TLS handshake here, in go-imap's per-connection
+	// goroutine — NOT in the accept loop, where one slow TLS client would
+	// serialize behind the handshake deadline and stall every other client.
+	// The helper walks the Unwrap() chain, so the handshake runs through the
+	// PROXY conn and consumes any ClientHello bytes buffered alongside the
+	// PROXY header. On failure go-imap tears the connection down (releasing
+	// the limiter slot via connectionLimitingConn.Close); the SoraTLSConn
+	// guard refuses any plaintext write onto the broken stream, and the
+	// counters below are never incremented for rejected connections.
+	if _, err := serverPkg.PerformDeferredTLSHandshake(conn.NetConn()); err != nil {
+		logger.Debug("IMAP: TLS handshake failed", "name", s.name, "remote", serverPkg.GetAddrString(conn.NetConn().RemoteAddr()), "error", err)
+		// Silent close (limiter slot released via connectionLimitingConn).
+		// The BYE-typed error keeps go-imap from logging every scanner's
+		// failed handshake; its BYE write attempt fails on the closed conn
+		// and is suppressed as a connection-closed error.
+		conn.NetConn().Close()
+		return nil, nil, &imap.Error{
+			Type: imap.StatusResponseTypeBye,
+			Text: "TLS handshake failed",
+		}
+	}
+
+	// Connection limits are handled at the listener level
 	sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
 	// Prometheus metrics - connection established

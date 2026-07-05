@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // TestIdleTimeoutSendsBye verifies that idle timeout sends BYE message
@@ -44,6 +46,10 @@ func TestIdleTimeoutSendsBye(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create ManageSieve server: %v", err)
 	}
+
+	// Record initial idle timeout count (the library's OnTimeout hook is the
+	// single metric emitter now).
+	initialIdleTimeouts := testutil.ToFloat64(metrics.ConnectionTimeoutsTotal.WithLabelValues("managesieve", "test", "localhost", "idle"))
 
 	// Start server in background
 	errChan := make(chan error, 1)
@@ -81,15 +87,33 @@ func TestIdleTimeoutSendsBye(t *testing.T) {
 		t.Fatalf("Failed to read BYE: %v", err)
 	}
 
-	// Verify BYE message contains expected text
+	// The go-managesieve library is the single owner of the idle timer (the
+	// SoraConn checker no longer arms it), so the BYE wording is
+	// deterministic and exactly one notice may arrive.
 	if !strings.Contains(bye, "BYE") {
 		t.Errorf("Expected BYE response, got: %s", bye)
 	}
-	if !strings.Contains(bye, "timed out") {
-		t.Errorf("Expected 'timed out' in BYE message, got: %s", bye)
+	if !strings.Contains(bye, "timed out due to inactivity") {
+		t.Errorf("Expected the library's inactivity BYE message, got: %s", bye)
 	}
 
 	t.Logf("✓ Received expected BYE message: %s", strings.TrimSpace(bye))
+
+	// The connection must now be closed with nothing else buffered: a second
+	// line here means two timeout owners both wrote a notice (the regression
+	// this test pins down).
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	extra, err := reader.ReadString('\n')
+	if err == nil {
+		t.Errorf("Expected connection closed after the BYE, but read another line: %q", extra)
+	}
+
+	// The idle metric must count this disconnect exactly once.
+	time.Sleep(500 * time.Millisecond) // Give metrics time to update
+	newIdleTimeouts := testutil.ToFloat64(metrics.ConnectionTimeoutsTotal.WithLabelValues("managesieve", "test", "localhost", "idle"))
+	if delta := newIdleTimeouts - initialIdleTimeouts; delta != 1 {
+		t.Errorf("Expected idle timeout count to increase by exactly 1, got %+.0f (%.0f → %.0f)", delta, initialIdleTimeouts, newIdleTimeouts)
+	}
 }
 
 // TestSessionMaxTimeoutSendsBye verifies that session max timeout sends BYE message

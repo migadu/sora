@@ -18,6 +18,13 @@ import (
 // ErrNoProxyHeader is returned by ReadProxyHeader in optional mode when no PROXY header is found.
 var ErrNoProxyHeader = errors.New("no PROXY protocol header found")
 
+// ErrUntrustedProxySource is returned by ReadProxyHeader when the connection
+// peer is not in the trusted-proxies list. Callers use it to log untrusted
+// rejections (scanner noise) at a lower level than header failures from
+// TRUSTED peers, which indicate a misconfigured proxy fleet (a peer that
+// should send PROXY headers but doesn't).
+var ErrUntrustedProxySource = errors.New("PROXY protocol connection from untrusted source")
+
 // ProxyProtocolConfig is an alias for config.ProxyProtocolConfig for compatibility
 type ProxyProtocolConfig = config.ProxyProtocolConfig
 
@@ -150,7 +157,7 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 		// This is a critical security boundary.
 		remoteAddrStr := GetAddrString(conn.RemoteAddr())
 		logger.Debug("PROXY protocol: REJECTING untrusted connection", "remote", remoteAddrStr)
-		return nil, conn, fmt.Errorf("connection from untrusted source %s", remoteAddrStr)
+		return nil, conn, fmt.Errorf("%w: %s", ErrUntrustedProxySource, remoteAddrStr)
 	}
 	logger.Debug("PROXY protocol: Processing connection from trusted proxy", "remote", GetAddrString(conn.RemoteAddr()))
 

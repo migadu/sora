@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,23 +35,29 @@ func (w *LMTPProxyWrapper) Close() error {
 	return nil
 }
 
-// LogCapture captures log output for verification
+// LogCapture captures log output for verification. It guards the buffer with
+// a mutex: background server goroutines (uploader worker, health checks) keep
+// logging while the test reads the captured output.
 type LogCapture struct {
-	buffer         *bytes.Buffer
-	writer         io.Writer
+	mu             sync.Mutex
+	buffer         bytes.Buffer
 	oldLog         *log.Logger
 	oldOut         io.Writer
 	oldSlogHandler *slog.Logger
 }
 
 func NewLogCapture() *LogCapture {
-	buffer := &bytes.Buffer{}
-	writer := io.MultiWriter(os.Stderr, buffer)
-
 	// Save old settings
 	oldOut := log.Writer()
 	oldLog := log.New(oldOut, "", log.LstdFlags)
 	oldSlogHandler := slog.Default()
+
+	lc := &LogCapture{
+		oldLog:         oldLog,
+		oldOut:         oldOut,
+		oldSlogHandler: oldSlogHandler,
+	}
+	writer := io.MultiWriter(os.Stderr, lc)
 
 	// Set new logger to capture output
 	log.SetOutput(writer)
@@ -62,16 +69,18 @@ func NewLogCapture() *LogCapture {
 	newLogger := slog.New(handler)
 	slog.SetDefault(newLogger)
 
-	return &LogCapture{
-		buffer:         buffer,
-		writer:         writer,
-		oldLog:         oldLog,
-		oldOut:         oldOut,
-		oldSlogHandler: oldSlogHandler,
-	}
+	return lc
+}
+
+func (lc *LogCapture) Write(p []byte) (int, error) {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return lc.buffer.Write(p)
 }
 
 func (lc *LogCapture) GetOutput() string {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
 	return lc.buffer.String()
 }
 

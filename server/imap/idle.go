@@ -12,6 +12,14 @@ import (
 
 var idlePollInterval = 15 * time.Second
 
+// idleKeepaliveInterval is how often an untagged "* OK Still here" is sent to
+// a client sitting in IDLE (Dovecot parity: imap_idle_notify_interval, 2m).
+// The write keeps NAT mappings alive and refreshes the SoraConn activity
+// clock, so the idle checker (command_timeout) never disconnects a client
+// that is legitimately silent in IDLE — RFC 2177 allows up to 29 minutes of
+// client silence, and RFC 3501 §5.4 puts the autologout floor at 30 minutes.
+var idleKeepaliveInterval = 2 * time.Minute
+
 func (s *IMAPSession) Idle(ctx context.Context, w *imapserver.UpdateWriter, done <-chan struct{}) error {
 	s.InfoLog("client entered IDLE mode")
 
@@ -41,22 +49,47 @@ func (s *IMAPSession) Idle(ctx context.Context, w *imapserver.UpdateWriter, done
 		}
 	}
 
+	// Keepalive cadence must beat the idle checker: with a command_timeout
+	// shorter than the 2m default (tests use seconds), send at half the knob
+	// so the activity clock is always refreshed in time.
+	keepalive := idleKeepaliveInterval
+	if ct := s.server.commandTimeout; ct > 0 && ct/2 < keepalive {
+		keepalive = ct / 2
+	}
+
+	nextPoll := time.Now().Add(idlePollInterval)
+	nextKeepalive := time.Now().Add(keepalive)
 	for {
-		if stop, err := s.idleLoop(ctx, w, done); err != nil {
+		next := nextPoll
+		if nextKeepalive.Before(next) {
+			next = nextKeepalive
+		}
+		if stop, err := s.idleWait(ctx, time.Until(next), done); err != nil || stop {
 			return err
-		} else if stop {
-			return nil
+		}
+
+		if !time.Now().Before(nextKeepalive) {
+			if err := w.WriteOK("Still here"); err != nil {
+				return err
+			}
+			nextKeepalive = time.Now().Add(keepalive)
+		}
+		if !time.Now().Before(nextPoll) {
+			if err := s.Poll(ctx, w, true); err != nil {
+				return err
+			}
+			nextPoll = time.Now().Add(idlePollInterval)
 		}
 	}
 }
 
-func (s *IMAPSession) idleLoop(ctx context.Context, w *imapserver.UpdateWriter, done <-chan struct{}) (stop bool, err error) {
-	timer := time.NewTimer(idlePollInterval)
+func (s *IMAPSession) idleWait(ctx context.Context, d time.Duration, done <-chan struct{}) (stop bool, err error) {
+	timer := time.NewTimer(d)
 	defer timer.Stop()
 
 	select {
 	case <-timer.C:
-		return false, s.Poll(ctx, w, true)
+		return false, nil
 	case <-done:
 		return true, nil
 	case <-ctx.Done():

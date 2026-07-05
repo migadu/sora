@@ -7,21 +7,36 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// TestDummyBcryptHash_Valid asserts the package-level dummy hash is a real bcrypt hash at
-// the current default cost. If it were malformed, CompareHashAndPassword would return
+// TestDummyBcryptHash_Valid asserts the dummy hash is a real bcrypt hash at the
+// current default cost, and that it tracks BcryptCost changes (it is generated
+// lazily so a test package assigning BcryptCost in its own init still gets a
+// matching dummy). If it were malformed, CompareHashAndPassword would return
 // instantly without doing bcrypt work, silently defeating timing equalization. (M14)
 func TestDummyBcryptHash_Valid(t *testing.T) {
-	cost, err := bcrypt.Cost(dummyBcryptHash)
+	dummy := dummyHashForCurrentCost()
+	cost, err := bcrypt.Cost(dummy)
 	if err != nil {
-		t.Fatalf("dummyBcryptHash is not a valid bcrypt hash: %v", err)
+		t.Fatalf("dummy hash is not a valid bcrypt hash: %v", err)
 	}
 	if cost != BcryptCost {
-		t.Fatalf("dummyBcryptHash cost = %d, want configured BcryptCost %d (timing must match real verifications)", cost, BcryptCost)
+		t.Fatalf("dummy hash cost = %d, want configured BcryptCost %d (timing must match real verifications)", cost, BcryptCost)
 	}
 
 	// It must never accidentally match a password.
-	if err := bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte("any-password")); err == nil {
-		t.Fatal("dummyBcryptHash unexpectedly matched a password")
+	if err := bcrypt.CompareHashAndPassword(dummy, []byte("any-password")); err == nil {
+		t.Fatal("dummy hash unexpectedly matched a password")
+	}
+
+	// The cache must regenerate when the cost changes, so DummyVerifyPassword
+	// always burns the same CPU as a real verification at the active cost.
+	origCost := BcryptCost
+	defer func() {
+		BcryptCost = origCost
+		dummyHashForCurrentCost() // restore the cached hash for other tests
+	}()
+	BcryptCost = bcrypt.MinCost
+	if cost, err := bcrypt.Cost(dummyHashForCurrentCost()); err != nil || cost != bcrypt.MinCost {
+		t.Fatalf("dummy hash did not track cost change: cost=%d err=%v, want %d", cost, err, bcrypt.MinCost)
 	}
 }
 
