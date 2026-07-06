@@ -70,6 +70,7 @@ type UserRoutingInfo struct {
 	RemoteUseProxyProtocol bool     // Use PROXY protocol for backend connection
 	RemoteUseIDCommand     bool     // Use IMAP ID command (IMAP only)
 	RemoteUseXCLIENT       bool     // Use XCLIENT command (POP3/LMTP)
+	RemoteUseUTF8          bool     // Backend supports POP3 UTF8 (RFC 6856); mirror a client's pre-auth UTF8 to it (POP3 only)
 	ClientConn             net.Conn // Client connection (for extracting JA4 fingerprint)
 	ProxySessionID         string   // Proxy session ID for end-to-end tracing
 }

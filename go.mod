@@ -20,7 +20,7 @@ require (
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/k3a/html2text v1.2.1
 	github.com/migadu/go-managesieve v0.1.1
-	github.com/migadu/go-pop3 v0.1.3
+	github.com/migadu/go-pop3 v0.1.4
 	github.com/migadu/go-sieve v1.1.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2

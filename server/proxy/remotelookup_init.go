@@ -149,6 +149,7 @@ func InitializeRemoteLookup(protocol string, cfg *config.RemoteLookupConfig) (Us
 		cfg.RemoteUseProxyProtocol,
 		cfg.RemoteUseIDCommand,
 		cfg.RemoteUseXCLIENT,
+		cfg.RemoteUseUTF8,
 		cbSettings,
 		transportSettings,
 	)

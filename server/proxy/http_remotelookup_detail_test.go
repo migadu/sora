@@ -90,6 +90,7 @@ func TestHTTPRemoteLookupDetailStripping(t *testing.T) {
 				false, // remoteUseProxyProtocol
 				false, // remoteUseIDCommand
 				false, // remoteUseXCLIENT
+				false, // remoteUseUTF8
 				nil,   // circuit breaker settings
 				nil,   // transport settings
 			)
@@ -158,7 +159,7 @@ func TestHTTPRemoteLookupURLEncoding(t *testing.T) {
 				5*time.Second,
 				"test-token",
 				143,
-				false, false, false, false, false, false,
+				false, false, false, false, false, false, false,
 				nil, nil,
 			)
 

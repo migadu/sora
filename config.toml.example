@@ -1521,6 +1521,13 @@ lookup_local_users = true             # Check local DB when remote returns 404/3
                                       #   - lookup_local_users=true  → Authentication rejected ✗
                                       #   - lookup_local_users=false → Authentication rejected ✗
                                       #
+# remote_use_utf8 = false             # POP3 ONLY: lookup-routed backends support the UTF8 command (RFC 6856).
+                                      # Controls whether the POP3 proxy mirrors a client's pre-auth UTF8 to
+                                      # backends returned by this lookup (it does NOT affect the proxy's CAPA
+                                      # advertisement — that is decided pre-auth by the pop3_proxy server's own
+                                      # remote_use_utf8, before the route is known). Keep false for Dovecot
+                                      # backends; they reject the command. Default: false.
+
 # user_not_found_response = "reject"  # LMTP ONLY: Response when user not found and lookup_local_users=false
                                       # Controls SMTP response code when remote_lookup returns 404 (user not found)
                                       # and lookup_local_users=false (no database fallback)
@@ -1752,6 +1759,13 @@ remote_tls_verify = true              # Verify backend server TLS certificates
 # remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots. POP3 proxy only for now.
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
+remote_use_utf8 = false               # Advertise UTF8/LANG (RFC 6856) in the proxy's pre-auth CAPA and mirror
+                                      # a client's UTF8 to remote_addrs pool backends. CAPA is answered BEFORE
+                                      # the user is routed, so enable ONLY when EVERY reachable backend (pool
+                                      # AND remote_lookup routes) is sora. Classic Outlook sends UTF8 *after*
+                                      # login whenever CAPA advertises it; a backend without RFC 6856 support
+                                      # (e.g. Dovecot) replies "-ERR Unknown command" and Outlook aborts the
+                                      # whole download (0x800CCC90). Default: false (safe).
 remote_health_checks = true           # Enable backend health tracking (default: true)
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---

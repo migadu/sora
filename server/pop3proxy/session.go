@@ -26,15 +26,18 @@ import (
 // Compile-time checks: the library discovers SASL support via type assertion,
 // so a signature drift would silently disable AUTH instead of failing the build.
 //
-// DELIBERATE: the proxy implements SessionLang/SessionUTF8 itself, which makes
-// the library advertise LANG and UTF8 in the PRE-AUTH CAPA even though the
-// proxy is "just" a relay. RFC 6856 confines both commands to the
-// AUTHORIZATION state — before login, when no backend connection exists yet —
-// so if the proxy didn't speak them, no client could ever negotiate UTF8
-// through it (clients only send what CAPA advertises, and post-auth is too
-// late). A pre-auth UTF8 is mirrored to the backend right after connecting
-// (see utf8Requested). Do not "clean up" these interfaces; the pre-auth CAPA
-// set is pinned by integration_tests/pop3proxy/insecure_auth_test.go.
+// DELIBERATE: the proxy implements SessionLang/SessionUTF8 so a client that
+// sends UTF8/LANG pre-auth gets a correct answer, and a pre-auth UTF8 is
+// mirrored to UTF8-capable backends right after connecting (see
+// utf8Requested/mirrorUTF8 in connectToBackend). Whether the capabilities
+// are ADVERTISED in CAPA is a separate, config-gated decision
+// (remote_use_utf8 → SuppressedCaps in buildLibServer, default hidden):
+// classic Outlook responds to a UTF8 advert by sending the command *after*
+// PASS, when the connection is already a raw relay — a Dovecot backend then
+// answers "-ERR Unknown command: UTF8" and Outlook aborts the whole download
+// with 0x800CCC90 (prod incident 2026-07-06). Keep the interfaces (blind
+// pre-auth UTF8 must still work); the default CAPA set is pinned by
+// integration_tests/pop3proxy/insecure_auth_test.go.
 var (
 	_ pop3server.Session     = (*POP3ProxySession)(nil)
 	_ pop3server.SessionSASL = (*POP3ProxySession)(nil)
@@ -738,8 +741,18 @@ func (s *POP3ProxySession) connectToBackend() error {
 	}
 
 	// Mirror a pre-auth UTF8 request on the backend leg: RFC 6856 requires
-	// UTF8 before authentication, and the client was already told +OK.
-	if s.utf8Requested {
+	// UTF8 before authentication, and the client was already told +OK. Only
+	// backends that implement RFC 6856 get the mirror — the route decides
+	// (remote_use_utf8 in [server.remote_lookup] for lookup-routed backends,
+	// the proxy server's remote_use_utf8 for pool backends), same pattern as
+	// useXCLIENT above. Skipping the mirror is the designed degradation for
+	// non-sora backends (Dovecot): the session simply stays in ASCII mode,
+	// exactly as it did pre-migration.
+	mirrorUTF8 := s.server.remoteUseUTF8
+	if s.routingInfo != nil {
+		mirrorUTF8 = s.routingInfo.RemoteUseUTF8
+	}
+	if s.utf8Requested && mirrorUTF8 {
 		if err := s.backendConn.SetDeadline(time.Now().Add(greetingTimeout)); err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: failed to set UTF8 deadline: %w", server.ErrBackendConnectionFailed, err)
@@ -1367,10 +1380,10 @@ func (s *POP3ProxySession) AuthenticateMechanisms() []string {
 	return []string{"PLAIN"}
 }
 
-// The proxy advertises LANG/UTF8 in its pre-auth CAPA because the sora
-// backends honor them: a client that caches this CAPA must not conclude they
-// are unsupported. The commands themselves are AUTHORIZATION-state (RFC 6856)
-// and are answered locally; after authentication the connection is a raw relay
+// The proxy answers LANG/UTF8 locally pre-auth; whether they are advertised
+// in CAPA is gated by remote_use_utf8 (default: hidden) — see the comment on
+// the interface assertions at the top of this file for the Outlook incident
+// behind that default. After authentication the connection is a raw relay
 // and the backend answers everything.
 
 func (s *POP3ProxySession) EnableUTF8(ctx context.Context) error {

@@ -609,6 +609,7 @@ type RemoteLookupConfig struct {
 	RemoteUseProxyProtocol bool   `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
 	RemoteUseIDCommand     bool   `toml:"remote_use_id_command"`     // Use IMAP ID command (IMAP only)
 	RemoteUseXCLIENT       bool   `toml:"remote_use_xclient"`        // Use XCLIENT command (POP3/LMTP)
+	RemoteUseUTF8          bool   `toml:"remote_use_utf8"`           // Lookup-routed backends support POP3 UTF8/RFC 6856 (mirror client's pre-auth UTF8 to them). Keep false for Dovecot backends. (POP3 only)
 
 	// RestrictToPool, when true, refuses a backend address returned by the remote-lookup
 	// API unless it is in the configured pool (remote_addrs); routing then falls back to
@@ -953,6 +954,7 @@ type ServerConfig struct {
 	RemoteUseProxyProtocol bool     `toml:"remote_use_proxy_protocol,omitempty"`
 	RemoteUseIDCommand     bool     `toml:"remote_use_id_command,omitempty"`
 	RemoteUseXCLIENT       bool     `toml:"remote_use_xclient,omitempty"`
+	RemoteUseUTF8          bool     `toml:"remote_use_utf8,omitempty"` // POP3 proxy only: advertise UTF8/LANG in pre-auth CAPA and mirror UTF8 to pool backends. Enable ONLY when every backend is sora: classic Outlook sends UTF8 post-auth when advertised, and non-sora backends reject it fatally (0x800CCC90).
 	ConnectTimeout         string   `toml:"connect_timeout,omitempty"`
 	AuthIdleTimeout        string   `toml:"auth_idle_timeout,omitempty"`
 	EnableAffinity         bool     `toml:"enable_affinity,omitempty"`

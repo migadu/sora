@@ -54,6 +54,7 @@ type POP3ProxyServer struct {
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput
 	remoteUseXCLIENT       bool          // Whether backend supports XCLIENT command for forwarding
+	remoteUseUTF8          bool          // Whether pool backends support POP3 UTF8; gates CAPA advertisement and the pre-auth UTF8 mirror
 
 	// Connection limiting
 	limiter *server.ConnectionLimiter
@@ -165,6 +166,7 @@ type POP3ProxyServerOptions struct {
 	RemoteLookup             *config.RemoteLookupConfig
 	TrustedProxies           []string // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT         bool     // Whether backend supports XCLIENT command for forwarding
+	RemoteUseUTF8            bool     // Whether pool backends support POP3 UTF8 (RFC 6856): advertise UTF8/LANG in CAPA and mirror UTF8 to them. Enable ONLY when every backend is sora (see buildLibServer).
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
@@ -391,6 +393,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		absoluteSessionTimeout:     options.AbsoluteSessionTimeout,
 		minBytesPerMinute:          options.MinBytesPerMinute,
 		remoteUseXCLIENT:           options.RemoteUseXCLIENT,
+		remoteUseUTF8:              options.RemoteUseUTF8,
 		limiter:                    limiter,
 		lookupCache:                lookupCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
@@ -457,6 +460,22 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 		maxErrors = 10
 	}
 
+	// The CAPA response is sent PRE-AUTH, before the user — and therefore the
+	// backend — is known, so advertising UTF8/LANG can only be a fleet-wide
+	// statement. Classic Outlook reacts to a UTF8 advert by sending the
+	// command *after* PASS, when the connection is a raw relay; a backend
+	// that does not implement RFC 6856 (e.g. Dovecot) answers "-ERR Unknown
+	// command: UTF8" and Outlook aborts the whole download with 0x800CCC90
+	// Advertise only when remote_use_utf8 is set on this server, i.e. the
+	// operator asserts that EVERY reachable backend
+	// (remote_addrs pool AND remote-lookup routes) honors UTF8. The commands
+	// themselves always work pre-auth regardless (answered locally, mirrored
+	// per-route in connectToBackend).
+	var suppressedCaps []string
+	if !s.remoteUseUTF8 {
+		suppressedCaps = []string{"UTF8", "LANG"}
+	}
+
 	opts := pop3server.Options{
 		TLSConfig:              s.tlsConfig,
 		IdleTimeout:            s.commandTimeout,
@@ -474,6 +493,7 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 		StrictSessionErrors:             true, // Session errors are *pop3server.Error; mask anything else
 		Caps:                            caps,
 		Greeting:                        "Sora-POP3-Proxy ready",
+		SuppressedCaps:                  suppressedCaps,
 		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
 			netConn := c.NetConn()
 			proxyInfo := server.GetProxyProtocolInfo(netConn)

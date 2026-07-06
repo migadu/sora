@@ -137,10 +137,14 @@ func TestPOP3ProxyRejectsControlCharUsername(t *testing.T) {
 	}
 }
 
-// TestPOP3ProxyCAPAAdvertisesTransactionCaps covers M5: the proxy answers CAPA
-// locally pre-auth and must advertise the transaction-phase capabilities the
-// backend honors (TOP/UIDL/PIPELINING/UTF8/LANG), so a client that caches this
-// CAPA does not conclude they are unsupported.
+// TestPOP3ProxyCAPAAdvertisesTransactionCaps pins the proxy's pre-auth CAPA
+// set: the transaction-phase capabilities every backend honors
+// (TOP/UIDL/PIPELINING) must be advertised, while UTF8 and LANG must NOT be.
+// Classic Outlook reacts to a UTF8 advert by sending the command after PASS —
+// through the raw relay a Dovecot backend answers "-ERR Unknown command:
+// UTF8" and Outlook aborts the download with 0x800CCC90 (prod incident
+// 2026-07-06). The commands themselves still work pre-auth (answered locally,
+// UTF8 mirrored to the backend); only the advertisement is suppressed.
 func TestPOP3ProxyCAPAAdvertisesTransactionCaps(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -193,9 +197,16 @@ func TestPOP3ProxyCAPAAdvertisesTransactionCaps(t *testing.T) {
 		}
 		caps[strings.ToUpper(line)] = true
 	}
-	for _, want := range []string{"TOP", "UIDL", "PIPELINING", "UTF8", "LANG"} {
+	for _, want := range []string{"TOP", "UIDL", "PIPELINING"} {
 		if !caps[want] {
 			t.Errorf("proxy CAPA missing %q; got %v", want, caps)
+		}
+	}
+	// UTF8/LANG must stay hidden: advertising them makes classic Outlook send
+	// UTF8 post-auth, which non-sora backends reject fatally (see test doc).
+	for _, banned := range []string{"UTF8", "LANG"} {
+		if caps[banned] {
+			t.Errorf("proxy CAPA must not advertise %q (Outlook post-auth UTF8 incident); got %v", banned, caps)
 		}
 	}
 }

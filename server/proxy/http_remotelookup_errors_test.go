@@ -171,6 +171,7 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 				false, // remoteUseProxyProtocol
 				false, // remoteUseIDCommand
 				false, // remoteUseXCLIENT
+				false, // remoteUseUTF8
 				nil,   // circuit breaker settings (use defaults)
 				nil,   // transport settings (use defaults)
 			)
@@ -220,6 +221,7 @@ func TestHTTPRemoteLookupNetworkError(t *testing.T) {
 		false, // remoteUseProxyProtocol
 		false, // remoteUseIDCommand
 		false, // remoteUseXCLIENT
+		false, // remoteUseUTF8
 		nil,   // circuit breaker settings (use defaults)
 		nil,   // transport settings (use defaults)
 	)
@@ -266,6 +268,7 @@ func TestHTTPRemoteLookupCircuitBreaker(t *testing.T) {
 		false, // remoteUseProxyProtocol
 		false, // remoteUseIDCommand
 		false, // remoteUseXCLIENT
+		false, // remoteUseUTF8
 		nil,   // circuit breaker settings (use defaults)
 		nil,   // transport settings (use defaults)
 	)
@@ -350,6 +353,7 @@ func TestHTTPRemoteLookupCircuitBreakerHalfOpen(t *testing.T) {
 		false, // remoteUseProxyProtocol
 		false, // remoteUseIDCommand
 		false, // remoteUseXCLIENT
+		false, // remoteUseUTF8
 		nil,   // circuit breaker settings (use defaults)
 		nil,   // transport settings (use defaults)
 	)
@@ -406,6 +410,7 @@ func TestHTTPRemoteLookupInvalidEmail(t *testing.T) {
 		false, // remoteUseProxyProtocol
 		false, // remoteUseIDCommand
 		false, // remoteUseXCLIENT
+		false, // remoteUseUTF8
 		nil,   // circuit breaker settings (use defaults)
 		nil,   // transport settings (use defaults)
 	)
@@ -515,6 +520,7 @@ func TestHTTPRemoteLookupInvalidEmail(t *testing.T) {
 			false, // remoteUseProxyProtocol
 			false, // remoteUseIDCommand
 			false, // remoteUseXCLIENT
+			false, // remoteUseUTF8
 			nil,   // circuit breaker settings (use defaults)
 			nil,   // transport settings (use defaults)
 		)

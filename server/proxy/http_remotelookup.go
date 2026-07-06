@@ -58,6 +58,7 @@ type HTTPRemoteLookupClient struct {
 	remoteUseProxyProtocol bool
 	remoteUseIDCommand     bool
 	remoteUseXCLIENT       bool
+	remoteUseUTF8          bool          // Lookup-routed backends support POP3 UTF8 (RFC 6856)
 	dialTimeout            time.Duration // Stored for timeout calculation
 	tlsHandshakeTimeout    time.Duration // Stored for timeout calculation
 }
@@ -105,6 +106,7 @@ func NewHTTPRemoteLookupClient(
 	remoteUseProxyProtocol bool,
 	remoteUseIDCommand bool,
 	remoteUseXCLIENT bool,
+	remoteUseUTF8 bool,
 	cbSettings *CircuitBreakerSettings,
 	transportSettings *TransportSettings,
 ) *HTTPRemoteLookupClient {
@@ -211,6 +213,7 @@ func NewHTTPRemoteLookupClient(
 		remoteUseProxyProtocol: remoteUseProxyProtocol,
 		remoteUseIDCommand:     remoteUseIDCommand,
 		remoteUseXCLIENT:       remoteUseXCLIENT,
+		remoteUseUTF8:          remoteUseUTF8,
 		dialTimeout:            transportSettings.DialTimeout,
 		tlsHandshakeTimeout:    transportSettings.TLSHandshakeTimeout,
 	}
@@ -477,6 +480,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 		RemoteUseProxyProtocol: c.remoteUseProxyProtocol,
 		RemoteUseIDCommand:     c.remoteUseIDCommand,
 		RemoteUseXCLIENT:       c.remoteUseXCLIENT,
+		RemoteUseUTF8:          c.remoteUseUTF8,
 	}
 
 	// Log success (no caching - handled at ConnectionManager level)
