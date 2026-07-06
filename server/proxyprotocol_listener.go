@@ -70,14 +70,22 @@ type ProxyProtocolListener struct {
 // NewProxyProtocolListener wraps l so Accept returns connections with their
 // PROXY header already consumed. protocol is used only for log lines.
 func NewProxyProtocolListener(l net.Listener, reader *ProxyProtocolReader, protocol string) *ProxyProtocolListener {
+	return newProxyProtocolListener(l, reader, protocol, false)
+}
+
+// newProxyProtocolListener sets all fields — including clientAddrOverride,
+// which parser goroutines read — BEFORE spawning the accept pump, so the
+// goroutine-creation happens-before edge publishes them safely.
+func newProxyProtocolListener(l net.Listener, reader *ProxyProtocolReader, protocol string, clientAddrOverride bool) *ProxyProtocolListener {
 	pl := &ProxyProtocolListener{
-		Listener: l,
-		reader:   reader,
-		protocol: protocol,
-		ready:    make(chan net.Conn),
-		errCh:    make(chan error),
-		closed:   make(chan struct{}),
-		sem:      make(chan struct{}, maxConcurrentHeaderReads),
+		Listener:           l,
+		reader:             reader,
+		protocol:           protocol,
+		clientAddrOverride: clientAddrOverride,
+		ready:              make(chan net.Conn),
+		errCh:              make(chan error),
+		closed:             make(chan struct{}),
+		sem:                make(chan struct{}, maxConcurrentHeaderReads),
 	}
 	go pl.acceptPump()
 	return pl
@@ -106,9 +114,7 @@ func WrapProxyProtocolHTTP(l net.Listener, reader *ProxyProtocolReader, protocol
 	if reader == nil {
 		return l
 	}
-	pl := NewProxyProtocolListener(l, reader, protocol)
-	pl.clientAddrOverride = true
-	return pl
+	return newProxyProtocolListener(l, reader, protocol, true)
 }
 
 // acceptPump owns the underlying Accept loop: it accepts raw connections and
