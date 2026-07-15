@@ -58,6 +58,7 @@ type ValidationError struct {
 	Field   string
 	Message string
 	Value   any
+	IsLimit bool
 }
 
 func (e *ValidationError) Error() string {
@@ -144,7 +145,7 @@ func (v *SearchCriteriaValidator) validateNode(criteria *imap.SearchCriteria, re
 	// drive unbounded recursion through the SQL builder and IMAP decoder.
 	if depth > v.MaxNestingDepth {
 		if !result.HasErrorsForField("depth") {
-			result.addError("depth", fmt.Sprintf("search criteria nesting too deep (max depth: %d)", v.MaxNestingDepth), depth)
+			result.addErrorWithLimit("depth", fmt.Sprintf("search criteria nesting too deep (max depth: %d)", v.MaxNestingDepth), depth, true)
 		}
 		return 0
 	}
@@ -154,7 +155,7 @@ func (v *SearchCriteriaValidator) validateNode(criteria *imap.SearchCriteria, re
 	*nodeCount++
 	if *nodeCount > v.MaxTotalNodes {
 		if !result.HasErrorsForField("nodes") {
-			result.addError("nodes", fmt.Sprintf("search criteria too complex: more than %d clauses", v.MaxTotalNodes), *nodeCount)
+			result.addErrorWithLimit("nodes", fmt.Sprintf("search criteria too complex: more than %d clauses", v.MaxTotalNodes), *nodeCount, true)
 		}
 		return 0
 	}
@@ -165,19 +166,22 @@ func (v *SearchCriteriaValidator) validateNode(criteria *imap.SearchCriteria, re
 
 	// Validate sequence number ranges
 	if err := v.validateSeqSets(criteria.SeqNum, "SeqNum"); err != nil {
-		result.addError(fieldPrefix+"SeqNum", err.Error(), criteria.SeqNum)
+		isLimit := strings.Contains(err.Error(), "too many")
+		result.addErrorWithLimit(fieldPrefix+"SeqNum", err.Error(), criteria.SeqNum, isLimit)
 	}
 	complexityScore += len(criteria.SeqNum) * 2 // Sequence searches are moderately complex
 
 	// Validate UID ranges
 	if err := v.validateUIDSets(criteria.UID, "UID"); err != nil {
-		result.addError(fieldPrefix+"UID", err.Error(), criteria.UID)
+		isLimit := strings.Contains(err.Error(), "too many")
+		result.addErrorWithLimit(fieldPrefix+"UID", err.Error(), criteria.UID, isLimit)
 	}
 	complexityScore += len(criteria.UID)
 
 	// Validate date ranges
 	if err := v.validateDateRanges(criteria); err != nil {
-		result.addError(fieldPrefix+"dates", err.Error(), nil)
+		isLimit := strings.Contains(err.Error(), "too large")
+		result.addErrorWithLimit(fieldPrefix+"dates", err.Error(), nil, isLimit)
 	}
 
 	// Validate size filters
@@ -188,27 +192,30 @@ func (v *SearchCriteriaValidator) validateNode(criteria *imap.SearchCriteria, re
 
 	// Validate text search terms
 	if err := v.validateTextTerms(criteria.Body, "Body"); err != nil {
-		result.addError(fieldPrefix+"Body", err.Error(), criteria.Body)
+		isLimit := strings.Contains(err.Error(), "too many") || strings.Contains(err.Error(), "too long")
+		result.addErrorWithLimit(fieldPrefix+"Body", err.Error(), criteria.Body, isLimit)
 	}
 	termCount += len(criteria.Body)
 	complexityScore += len(criteria.Body) * 3 // Text search is expensive
 
 	if err := v.validateTextTerms(criteria.Text, "Text"); err != nil {
-		result.addError(fieldPrefix+"Text", err.Error(), criteria.Text)
+		isLimit := strings.Contains(err.Error(), "too many") || strings.Contains(err.Error(), "too long")
+		result.addErrorWithLimit(fieldPrefix+"Text", err.Error(), criteria.Text, isLimit)
 	}
 	termCount += len(criteria.Text)
 	complexityScore += len(criteria.Text) * 4 // Text search in headers+body is very expensive
 
 	// Validate flags
 	if len(criteria.Flag)+len(criteria.NotFlag) > v.MaxFlagFilters {
-		result.addError(fieldPrefix+"flags", fmt.Sprintf("too many flag filters: %d (max: %d)",
-			len(criteria.Flag)+len(criteria.NotFlag), v.MaxFlagFilters), nil)
+		result.addErrorWithLimit(fieldPrefix+"flags", fmt.Sprintf("too many flag filters: %d (max: %d)",
+			len(criteria.Flag)+len(criteria.NotFlag), v.MaxFlagFilters), nil, true)
 	}
 
 	// Validate headers
 	for i, header := range criteria.Header {
 		if err := v.validateHeader(header); err != nil {
-			result.addError(fmt.Sprintf("%sHeader[%d]", fieldPrefix, i), err.Error(), header)
+			isLimit := strings.Contains(err.Error(), "too long")
+			result.addErrorWithLimit(fmt.Sprintf("%sHeader[%d]", fieldPrefix, i), err.Error(), header, isLimit)
 		}
 		termCount++
 	}
@@ -216,8 +223,8 @@ func (v *SearchCriteriaValidator) validateNode(criteria *imap.SearchCriteria, re
 
 	// Check total term count for this node
 	if termCount > v.MaxSearchTerms {
-		result.addError(fieldPrefix+"total", fmt.Sprintf("too many search terms: %d (max: %d)",
-			termCount, v.MaxSearchTerms), termCount)
+		result.addErrorWithLimit(fieldPrefix+"total", fmt.Sprintf("too many search terms: %d (max: %d)",
+			termCount, v.MaxSearchTerms), termCount, true)
 	}
 
 	// Validate recursive criteria (NOT, OR)
@@ -327,9 +334,6 @@ func (v *SearchCriteriaValidator) validateHeader(header imap.SearchCriteriaHeade
 	}
 
 	// Validate header value
-	if len(header.Value) == 0 {
-		return fmt.Errorf("header value cannot be empty for field: %s", header.Key)
-	}
 	if len(header.Value) > v.MaxSearchTermLength {
 		return fmt.Errorf("header value too long: %d characters (max: %d)",
 			len(header.Value), v.MaxSearchTermLength)
@@ -374,11 +378,16 @@ func (v *SearchCriteriaValidator) calculateComplexity(score int, criteria *imap.
 
 // Helper methods for ValidationResult
 func (r *ValidationResult) addError(field, message string, value any) {
+	r.addErrorWithLimit(field, message, value, false)
+}
+
+func (r *ValidationResult) addErrorWithLimit(field, message string, value any, isLimit bool) {
 	r.Valid = false
 	r.Errors = append(r.Errors, &ValidationError{
 		Field:   field,
 		Message: message,
 		Value:   value,
+		IsLimit: isLimit,
 	})
 }
 

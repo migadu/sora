@@ -16,7 +16,7 @@ func deepNotCriteria(depth int) *imap.SearchCriteria {
 	return c
 }
 
-func TestValidateSearchCriteria_RejectsDeepNestingWithBad(t *testing.T) {
+func TestValidateSearchCriteria_RejectsDeepNestingWithNo(t *testing.T) {
 	// A zero-value session is sufficient: validateSearchCriteria only logs and increments
 	// a metric on rejection (both nil-safe on the embedded server.Session).
 	s := &IMAPSession{}
@@ -30,12 +30,15 @@ func TestValidateSearchCriteria_RejectsDeepNestingWithBad(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *imap.Error, got %T (%v)", err, err)
 	}
-	if imapErr.Type != imap.StatusResponseTypeBad {
-		t.Errorf("expected BAD response, got %v", imapErr.Type)
+	if imapErr.Type != imap.StatusResponseTypeNo {
+		t.Errorf("expected NO response, got %v", imapErr.Type)
+	}
+	if imapErr.Code != imap.ResponseCode("SERVERLIMIT") {
+		t.Errorf("expected SERVERLIMIT code, got %v", imapErr.Code)
 	}
 }
 
-func TestValidateSearchCriteria_RejectsWideFanOutWithBad(t *testing.T) {
+func TestValidateSearchCriteria_RejectsWideFanOutWithNo(t *testing.T) {
 	s := &IMAPSession{}
 
 	wide := &imap.SearchCriteria{}
@@ -50,8 +53,10 @@ func TestValidateSearchCriteria_RejectsWideFanOutWithBad(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected wide fan-out search criteria to be rejected")
 	}
-	if imapErr, ok := err.(*imap.Error); !ok || imapErr.Type != imap.StatusResponseTypeBad {
-		t.Fatalf("expected BAD *imap.Error, got %T (%v)", err, err)
+	if imapErr, ok := err.(*imap.Error); !ok || imapErr.Type != imap.StatusResponseTypeNo {
+		t.Fatalf("expected NO *imap.Error, got %T (%v)", err, err)
+	} else if imapErr.Code != imap.ResponseCode("SERVERLIMIT") {
+		t.Errorf("expected SERVERLIMIT code, got %v", imapErr.Code)
 	}
 }
 

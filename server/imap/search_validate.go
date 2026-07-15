@@ -19,7 +19,7 @@ import (
 var searchCriteriaValidator = db.NewSearchCriteriaValidator()
 
 // validateSearchCriteria runs the shared validator over an incoming criteria tree and
-// returns a protocol-level BAD error (RFC 9051 §6.4.4) if it is too complex/deep to
+// returns a protocol-level error if it is too complex/deep to
 // process safely. It returns nil when the criteria is acceptable.
 //
 // command is the IMAP command being handled (e.g. "SEARCH", "SORT", "THREAD",
@@ -34,16 +34,32 @@ func (s *IMAPSession) validateSearchCriteria(command string, criteria *imap.Sear
 		return nil
 	}
 
+	var firstErr *db.ValidationError
 	// Log the specific reason for debugging; keep the client-facing text generic so the
 	// response is not an oracle for probing the validator's limits.
 	if err := result.GetFirstError(); err != nil {
+		if valErr, ok := err.(*db.ValidationError); ok {
+			firstErr = valErr
+		}
 		s.DebugLog("rejecting search criteria", "command", command, "reason", err.Error())
 	}
-	metrics.ProtocolErrors.WithLabelValues("imap", command, "criteria_rejected", "client_error").Inc()
+	errorLabel := "client_error"
+	if firstErr != nil && firstErr.IsLimit {
+		errorLabel = "server_limit"
+	}
+	metrics.ProtocolErrors.WithLabelValues("imap", command, "criteria_rejected", errorLabel).Inc()
+
+	if firstErr != nil && firstErr.IsLimit {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCode("SERVERLIMIT"),
+			Text: "Search criteria too complex",
+		}
+	}
 
 	return &imap.Error{
 		Type: imap.StatusResponseTypeBad,
 		Code: imap.ResponseCodeClientBug,
-		Text: "Search criteria too complex",
+		Text: "Search criteria invalid",
 	}
 }

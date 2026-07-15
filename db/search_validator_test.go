@@ -312,11 +312,11 @@ func TestValidateHeaders(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name: "empty header value",
+			name: "empty header value (now valid)",
 			headers: []imap.SearchCriteriaHeaderField{
 				{Key: "subject", Value: ""},
 			},
-			expectError: true,
+			expectError: false,
 		},
 		{
 			name: "header value too long",
@@ -560,7 +560,7 @@ func TestValidateNestedCriteria(t *testing.T) {
 			name: "invalid NOT criteria",
 			criteria: &imap.SearchCriteria{
 				Not: []imap.SearchCriteria{
-					{Header: []imap.SearchCriteriaHeaderField{{Key: "subject", Value: ""}}}, // Empty value is invalid
+					{Header: []imap.SearchCriteriaHeaderField{{Key: "", Value: "test"}}}, // Empty key is invalid
 				},
 			},
 			expectError: true,
