@@ -200,6 +200,34 @@ func (rd *ResilientDatabase) CreateDefaultMailboxesWithRetry(ctx context.Context
 	return err
 }
 
+func (rd *ResilientDatabase) PollMailboxStatsWithRetry(ctx context.Context, mailboxIDs []int64, sinceModSeq uint64) ([]db.MailboxStatsRow, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).PollMailboxStats(ctx, mailboxIDs, sinceModSeq)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.([]db.MailboxStatsRow), nil
+}
+
+func (rd *ResilientDatabase) GetMailboxesStatsWithRetry(ctx context.Context, mailboxIDs []int64) ([]db.MailboxStatsRow, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetMailboxesStats(ctx, mailboxIDs)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.([]db.MailboxStatsRow), nil
+}
+
 func (rd *ResilientDatabase) PollMailboxWithRetry(ctx context.Context, mailboxID int64, sinceModSeq uint64) (*db.MailboxPoll, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).PollMailbox(ctx, mailboxID, sinceModSeq)
