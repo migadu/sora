@@ -214,6 +214,20 @@ func (rd *ResilientDatabase) PollMailboxStatsWithRetry(ctx context.Context, mail
 	return result.([]db.MailboxStatsRow), nil
 }
 
+func (rd *ResilientDatabase) GetMailboxNotifySnapshotWithRetry(ctx context.Context, accountID int64) ([]db.NotifyMailbox, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetMailboxNotifySnapshot(ctx, accountID)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.([]db.NotifyMailbox), nil
+}
+
 func (rd *ResilientDatabase) GetMailboxesStatsWithRetry(ctx context.Context, mailboxIDs []int64) ([]db.MailboxStatsRow, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetMailboxesStats(ctx, mailboxIDs)

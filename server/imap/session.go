@@ -67,6 +67,11 @@ type IMAPSession struct {
 	notifyMutex sync.Mutex
 	notifyWatch *notifyWatch
 
+	// idling is true while the client is in an IDLE command. The NOTIFY pump
+	// reads it to release SELECTED-DELAYED expunges, since IDLE is a delayed-
+	// expunge sync point (RFC 5465 §6.1.2).
+	idling atomic.Bool
+
 	// Memory tracking
 	memTracker *server.SessionMemoryTracker
 

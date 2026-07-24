@@ -25,7 +25,20 @@ var notifyPollInterval = idlePollInterval
 // tick observes more changed mailboxes than this, the watch is dropped with
 // an untagged OK [NOTIFICATIONOVERFLOW], as sanctioned by RFC 5465 §5.8, and
 // the client is expected to re-sync and re-issue NOTIFY.
-const notifyMaxChangedMailboxes = 100
+var notifyMaxChangedMailboxes = 100
+
+// SetNotifyMaxChangedMailboxesForTests overrides the per-tick overflow cap so
+// tests can exercise the NOTIFICATIONOVERFLOW path without churning hundreds of
+// mailboxes. It must not be called outside tests.
+func SetNotifyMaxChangedMailboxesForTests(n int) {
+	notifyMaxChangedMailboxes = n
+}
+
+// notifyMaxFetchPerTick bounds the number of MessageNew fetch-atts responses
+// emitted for the selected mailbox in a single pump tick, so a bulk delivery
+// cannot turn one iteration into an unbounded FETCH. The remainder is
+// delivered on subsequent ticks.
+const notifyMaxFetchPerTick = 64
 
 // SetNotifyPollIntervalForTests overrides the NOTIFY watch cadence. It exists
 // so integration tests can observe asynchronous notifications without waiting
@@ -64,10 +77,16 @@ type notifyWatch struct {
 	selected *imap.NotifyItem
 	delayed  bool
 
-	// accountModSeq is the monotonic fan-in cursor over the account's
-	// mailbox_stats. Comparable across mailboxes because modseqs come from
-	// the global messages_modseq sequence.
-	accountModSeq uint64
+	// statusMarks holds a per-mailbox high-water modseq for the STATUS fan-in:
+	// mailbox M is reported only when its highest_modseq exceeds statusMarks[M].
+	// A single account-wide cursor is unsound because global-sequence modseqs
+	// are not commit-ordered across mailboxes — a busier mailbox committing a
+	// higher modseq first would advance a shared cursor past a slower
+	// mailbox's still-unreported lower-modseq change, suppressing it until that
+	// mailbox's next change. A mailbox entering the matched set is initialized
+	// to its current modseq (no STATUS for history that predates the watch's
+	// interest in it), and marks for mailboxes that leave the set are dropped.
+	statusMarks map[int64]uint64
 
 	// snapshot is the previous tick's view of the account's mailboxes,
 	// diffed to detect MailboxName and SubscriptionChange events.
@@ -304,7 +323,10 @@ func (s *IMAPSession) SetNotify(ctx context.Context, options *imap.NotifyOptions
 		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
-	selectedID := s.currentSelectedMailboxID()
+	// If the session lock is momentarily contended, treat as "none selected"
+	// for bootstrap: the first tick sees the real selection as a switch and
+	// rebinds the fetch high-water mark, so nothing is lost.
+	selectedID, _ := s.currentSelectedMailboxID()
 	watch.selectedMailboxID = selectedID
 
 	// Bootstrap the watch: the account snapshot (specifier matching and
@@ -330,15 +352,18 @@ func (s *IMAPSession) SetNotify(ctx context.Context, options *imap.NotifyOptions
 		if err != nil {
 			return s.internalError("failed to bootstrap NOTIFY watch: %v", err)
 		}
+		watch.statusMarks = make(map[int64]uint64, len(bootstrapIDs))
 		sharedRoot := s.sharedNamespaceRoot()
 		for _, row := range rows {
-			if row.HighestModSeq > watch.accountModSeq {
-				watch.accountModSeq = row.HighestModSeq
-			}
 			if row.MailboxID == selectedID {
 				watch.nextFetchUID = imap.UID(row.HighestUID + 1)
 				continue
 			}
+			// Seed the per-mailbox mark at the current modseq so only changes
+			// after NOTIFY SET are reported. The initial STATUS responses of
+			// NOTIFY SET STATUS (RFC 5465 §3.1) are absolute snapshots and are
+			// sent here regardless.
+			watch.statusMarks[row.MailboxID] = row.HighestModSeq
 			if options.Status {
 				entry, ok := watch.snapshot[row.MailboxID]
 				if !ok {
@@ -414,7 +439,13 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	}
 
-	selectedID := s.currentSelectedMailboxID()
+	selectedID, ok := s.currentSelectedMailboxID()
+	if !ok {
+		// Could not read the selected mailbox (session lock contended). Skip
+		// this tick rather than misread it as "nothing selected"; retry next
+		// tick.
+		return false, nil
+	}
 	if selectedID != watch.selectedMailboxID {
 		// The client selected another mailbox: rebind the MessageNew
 		// fetch-atts high-water mark so only messages arriving from now on
@@ -432,11 +463,35 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 	}
 
 	// Selected mailbox: reuse the regular poll pipeline (tracker, desync
-	// protection, CONDSTORE handling). SELECTED-DELAYED defers expunges to
-	// the next command sync point (RFC 5465 §6.1.2); plain SELECTED delivers
-	// immediately unless an expunge-unsafe command is in progress.
+	// protection, CONDSTORE handling) to deliver EXISTS/EXPUNGE/flag updates,
+	// then the MessageNew fetch attributes.
 	if selectedID != 0 && watch.hasSelectedMessageEvents() {
-		allowExpunge := !watch.delayed && w.ExpungeAllowed()
+		wantFetch := watch.selected != nil && watch.selected.MessageNewFetch != nil
+
+		// Capture the fetch-atts upper bound BEFORE delivering EXISTS. The
+		// EXISTS that s.Poll delivers is read from the database at a point at
+		// or after this read, so it is guaranteed to announce every UID up to
+		// fetchUpto — satisfying RFC 5465 §5.2 (EXISTS precedes the FETCH).
+		// Reading it after s.Poll (as the fan-in did) could pick up a message
+		// delivered between the two reads whose EXISTS was not sent, producing
+		// a FETCH for a message the client has not been told exists.
+		var fetchUpto imap.UID
+		if wantFetch {
+			if rows, statErr := s.server.rdb.GetMailboxesStatsWithRetry(readCtx, []int64{selectedID}); statErr == nil && len(rows) == 1 {
+				fetchUpto = imap.UID(rows[0].HighestUID)
+			}
+		}
+		hasNewToFetch := wantFetch && watch.nextFetchUID != 0 && fetchUpto >= watch.nextFetchUID
+
+		// SELECTED-DELAYED defers expunges to a sync point (RFC 5465 §6.1.2).
+		// IDLE is such a sync point, so release them while idling. Also release
+		// them when there are new messages whose fetch-atts we must deliver:
+		// §6.1.2 permits a SELECTED-DELAYED server to return expunges early
+		// (MAY), and holding them here would withhold the new-message EXISTS
+		// behind a queued expunge, blocking the FETCH. w.ExpungeAllowed() still
+		// forbids expunges while an expunge-unsafe command is mid-flight.
+		allowExpunge := (!watch.delayed || s.idling.Load() || hasNewToFetch) && w.ExpungeAllowed()
+		polled := true
 		if err := s.Poll(ctx, w, allowExpunge); err != nil {
 			var imapErr *imap.Error
 			if errors.As(err, &imapErr) && imapErr.Type == imap.StatusResponseTypeBye {
@@ -450,10 +505,20 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 			// Transient failure (e.g. database hiccup): keep the watch, try
 			// again next tick.
 			s.WarnLog("NOTIFY: selected mailbox poll failed", "error", err)
+			polled = false
+		}
+
+		// Deliver fetch-atts only when the EXISTS was actually delivered: the
+		// poll succeeded and was not withheld (allowExpunge). Otherwise defer
+		// to a later tick, leaving nextFetchUID unadvanced so nothing is lost.
+		if wantFetch && polled && allowExpunge {
+			if err := s.notifyFetchNewMessages(ctx, watch, fetchUpto, w); err != nil {
+				return false, err
+			}
 		}
 	}
 
-	if !watch.wantsNonSelectedItems() && (watch.selected == nil || watch.selected.MessageNewFetch == nil) {
+	if !watch.wantsNonSelectedItems() {
 		return false, nil
 	}
 
@@ -472,6 +537,16 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 			return false, nil
 		}
 
+		// Guard against a read-pool failover to a more-lagged replica, whose
+		// sharply smaller view would otherwise be diffed into a storm of false
+		// deletions (and, next tick, false creations). Skip the whole tick and
+		// keep the prior snapshot/marks; retry next tick.
+		if watch.snapshot != nil && notifySnapshotLooksStale(watch.snapshot, snapshot) {
+			s.WarnLog("NOTIFY: account snapshot shrank sharply, likely replica lag; skipping tick",
+				"prev", len(watch.snapshot), "cur", len(snapshot))
+			return false, nil
+		}
+
 		if watch.wantsTreeEvents() {
 			if err := s.notifyDiffSnapshots(watch, snapshot, sharedRoot, w); err != nil {
 				return false, err
@@ -480,27 +555,87 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 		watch.snapshot = snapshot
 	}
 
-	// Fan-in: one mailbox_stats poll over the matched set detects message
-	// events in non-selected mailboxes; the selected mailbox rides along for
-	// the fetch-atts high-water mark.
-	pollIDs := matchedIDs
-	if selectedID != 0 && watch.selected != nil && watch.selected.MessageNewFetch != nil {
-		pollIDs = append(append([]int64{}, matchedIDs...), selectedID)
+	// Fan-in: detect message events in non-selected matched mailboxes and
+	// report them as STATUS. The selected mailbox is deliberately excluded —
+	// its changes flow through the tracker (EXISTS/EXPUNGE/FETCH) above, never
+	// STATUS, and it must not pollute the per-mailbox marks.
+	if watch.statusMarks == nil {
+		watch.statusMarks = make(map[int64]uint64)
 	}
-	if len(pollIDs) == 0 {
+	if len(matchedIDs) == 0 {
+		// No matched mailbox this tick: forget all marks so a mailbox that
+		// re-enters the set later is re-initialized to its then-current state.
+		if len(watch.statusMarks) > 0 {
+			watch.statusMarks = make(map[int64]uint64)
+		}
 		return false, nil
 	}
-	rows, err := s.server.rdb.PollMailboxStatsWithRetry(readCtx, pollIDs, watch.accountModSeq)
+
+	// Initialize marks for mailboxes newly entering the matched set (created,
+	// renamed into a SUBTREE, newly subscribed, or the just-unselected
+	// mailbox) to their current modseq, so their pre-watch history is not
+	// re-reported as STATUS. Drop marks for mailboxes that left the set.
+	matchedSet := make(map[int64]struct{}, len(matchedIDs))
+	var uninitialized []int64
+	for _, id := range matchedIDs {
+		matchedSet[id] = struct{}{}
+		if _, ok := watch.statusMarks[id]; !ok {
+			uninitialized = append(uninitialized, id)
+		}
+	}
+	for id := range watch.statusMarks {
+		if _, ok := matchedSet[id]; !ok {
+			delete(watch.statusMarks, id)
+		}
+	}
+	if len(uninitialized) > 0 {
+		initRows, initErr := s.server.rdb.GetMailboxesStatsWithRetry(readCtx, uninitialized)
+		if initErr != nil {
+			s.WarnLog("NOTIFY: mailbox stats init failed", "error", initErr)
+			return false, nil
+		}
+		for _, r := range initRows {
+			watch.statusMarks[r.MailboxID] = r.HighestModSeq
+		}
+		// A mailbox that vanished before its init read still needs a mark so
+		// it is not re-initialized every tick until it leaves the set.
+		for _, id := range uninitialized {
+			if _, ok := watch.statusMarks[id]; !ok {
+				watch.statusMarks[id] = 0
+			}
+		}
+	}
+
+	// Poll from the lowest mark across the matched set, then filter each row
+	// against that mailbox's own mark. This reports every mailbox exactly once
+	// per change without a shared cursor skipping any (see statusMarks).
+	floor := uint64(0)
+	haveFloor := false
+	for _, id := range matchedIDs {
+		m := watch.statusMarks[id]
+		if !haveFloor || m < floor {
+			floor, haveFloor = m, true
+		}
+	}
+	rows, err := s.server.rdb.PollMailboxStatsWithRetry(readCtx, matchedIDs, floor)
 	if err != nil {
 		s.WarnLog("NOTIFY: mailbox stats poll failed", "error", err)
 		return false, nil
 	}
 
-	if len(rows) > notifyMaxChangedMailboxes {
+	// Keep only rows that advanced past their own mailbox's mark.
+	changed := rows[:0]
+	for _, row := range rows {
+		if row.HighestModSeq > watch.statusMarks[row.MailboxID] {
+			changed = append(changed, row)
+		}
+	}
+
+	if len(changed) > notifyMaxChangedMailboxes {
 		// RFC 5465 §5.8: tell the client and behave as if NOTIFY NONE was
 		// received. The library treats NotifyPoll returning as the pump
 		// ending; the watch state is cleared here.
-		s.WarnLog("NOTIFY: notification overflow, dropping watch", "changed_mailboxes", len(rows))
+		s.WarnLog("NOTIFY: notification overflow, dropping watch", "changed_mailboxes", len(changed))
 		metrics.IMAPNotifyOverflows.Inc()
 		s.notifyMutex.Lock()
 		s.notifyWatch = nil
@@ -509,17 +644,8 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 	}
 
 	condStore := w.CondStoreEnabled()
-	for _, row := range rows {
-		if row.HighestModSeq > watch.accountModSeq {
-			watch.accountModSeq = row.HighestModSeq
-		}
-
-		if row.MailboxID == selectedID {
-			if err := s.notifyFetchNewMessages(ctx, watch, row, w); err != nil {
-				return false, err
-			}
-			continue
-		}
+	for _, row := range changed {
+		watch.statusMarks[row.MailboxID] = row.HighestModSeq
 
 		entry, ok := snapshot[row.MailboxID]
 		if !ok {
@@ -539,11 +665,20 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 }
 
 // notifySnapshotAndMatches loads the account's current mailboxes and returns
-// the snapshot plus the IDs of non-selected mailboxes with message events
-// enabled (the fan-in set). GetMailboxes already enforces RFC 4314 lookup
-// rights on shared mailboxes, satisfying RFC 5465 §3.1's access requirement.
+// the snapshot (used for tree-event diffing, which needs only the RFC 4314 'l'
+// lookup right that GetMailboxes already enforces) plus the IDs of
+// non-selected mailboxes whose message events the client requested — the
+// STATUS fan-in set.
+//
+// Message events additionally require the 'r' (read) right on the mailbox
+// (RFC 5465 §5): a shared mailbox the user can LIST ('l') but not read must
+// not disclose message counts via NOTIFY STATUS. Owned mailboxes
+// (AccountID == the session's account) always have full rights; shared
+// mailboxes accessed via ACL are checked for 'r' and dropped from the fan-in
+// if it is absent.
 func (s *IMAPSession) notifySnapshotAndMatches(ctx context.Context, watch *notifyWatch, selectedID int64) (map[int64]notifySnapshotEntry, []int64, error) {
-	mboxes, err := s.server.rdb.GetMailboxesWithRetry(ctx, s.AccountID(), false)
+	accountID := s.AccountID()
+	mboxes, err := s.server.rdb.GetMailboxNotifySnapshotWithRetry(ctx, accountID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -561,9 +696,23 @@ func (s *IMAPSession) notifySnapshotAndMatches(ctx context.Context, watch *notif
 			continue
 		}
 		events := watch.eventsForMailbox(m.Name, m.Subscribed, sharedRoot)
-		if events[imap.NotifyEventMessageNew] || events[imap.NotifyEventMessageExpunge] || events[imap.NotifyEventFlagChange] {
-			matchedIDs = append(matchedIDs, m.ID)
+		if !(events[imap.NotifyEventMessageNew] || events[imap.NotifyEventMessageExpunge] || events[imap.NotifyEventFlagChange]) {
+			continue
 		}
+		if m.OwnerID != accountID {
+			// Shared mailbox accessed via ACL: message events need the 'r'
+			// right (RFC 5465 §5), which is stronger than the 'l' right
+			// the snapshot query verified.
+			hasRead, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, m.ID, accountID, db.ACLRightRead)
+			if err != nil {
+				s.WarnLog("NOTIFY: read-right check failed, excluding shared mailbox from STATUS fan-in", "mailbox_id", m.ID, "error", err)
+				continue
+			}
+			if !hasRead {
+				continue
+			}
+		}
+		matchedIDs = append(matchedIDs, m.ID)
 	}
 	return snapshot, matchedIDs, nil
 }
@@ -580,8 +729,19 @@ type notifyTreeEvent struct {
 // diffNotifySnapshots compares two account snapshots and returns the
 // mailbox-tree changes between them: creations, deletions, renames (same ID,
 // new name) and subscription flips.
+//
+// Deletions are emitted before creations/renames so that a delete+recreate of
+// a same-named mailbox within one tick (distinct IDs: the old ID vanishes, a
+// new ID appears under the same name) leaves the client with the mailbox
+// present. Emitting the create-then-delete order would leave it believing the
+// name no longer exists.
 func diffNotifySnapshots(prev, cur map[int64]notifySnapshotEntry) []notifyTreeEvent {
 	var events []notifyTreeEvent
+	for id, old := range prev {
+		if _, exists := cur[id]; !exists {
+			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: old.name, deleted: true, entry: old})
+		}
+	}
 	for id, entry := range cur {
 		old, existed := prev[id]
 		switch {
@@ -593,12 +753,17 @@ func diffNotifySnapshots(prev, cur map[int64]notifySnapshotEntry) []notifyTreeEv
 			events = append(events, notifyTreeEvent{event: imap.NotifyEventSubscriptionChange, name: entry.name, entry: entry})
 		}
 	}
-	for id, old := range prev {
-		if _, exists := cur[id]; !exists {
-			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: old.name, deleted: true, entry: old})
-		}
-	}
 	return events
+}
+
+// notifySnapshotLooksStale reports whether cur is a sharply smaller view of the
+// account than prev — the signature of a read-pool failover to a more-lagged
+// replica rather than a real bulk deletion. Used to suppress a whole fan-in
+// tick so it does not emit a storm of false \NonExistent (then, next tick,
+// false creation) LIST events. Genuine bulk deletes beyond the threshold are
+// reported when the client next re-LISTs.
+func notifySnapshotLooksStale(prev, cur map[int64]notifySnapshotEntry) bool {
+	return len(prev) >= 4 && len(cur)*2 < len(prev)
 }
 
 // notifyDiffSnapshots emits LIST responses for mailbox-tree changes since the
@@ -637,29 +802,41 @@ func (s *IMAPSession) notifyDiffSnapshots(watch *notifyWatch, cur map[int64]noti
 }
 
 // notifyFetchNewMessages honors the MessageNew fetch-atts of the selected
-// mailbox (RFC 5465 §5.2): after the poll pipeline announced new messages
-// with EXISTS, send a FETCH response with the requested items for each new
-// UID, through the regular FETCH machinery.
-func (s *IMAPSession) notifyFetchNewMessages(ctx context.Context, watch *notifyWatch, row db.MailboxStatsRow, w *imapserver.UpdateWriter) error {
+// mailbox (RFC 5465 §5.2): for messages up to fetchUpto whose EXISTS the
+// caller has already delivered, send a FETCH response with the requested
+// items through the regular FETCH machinery. The caller guarantees fetchUpto
+// was read no later than the delivered EXISTS, so every fetched UID is already
+// announced.
+func (s *IMAPSession) notifyFetchNewMessages(ctx context.Context, watch *notifyWatch, fetchUpto imap.UID, w *imapserver.UpdateWriter) error {
 	if watch.selected == nil || watch.selected.MessageNewFetch == nil || !watch.hasSelectedMessageEvents() {
 		return nil
 	}
 	if watch.nextFetchUID == 0 {
 		// High-water mark not initialized (bootstrap or rebind failure):
-		// initialize from this row and skip, so history is not replayed.
-		watch.nextFetchUID = imap.UID(row.HighestUID + 1)
+		// initialize forward so history is not replayed.
+		watch.nextFetchUID = fetchUpto + 1
 		return nil
 	}
-	if imap.UID(row.HighestUID) < watch.nextFetchUID {
-		return nil
+	if fetchUpto < watch.nextFetchUID {
+		return nil // nothing new
+	}
+
+	// Bound the per-tick fetch: a bulk delivery of many messages must not turn
+	// one pump iteration into an unbounded FETCH (potentially with body
+	// sections backed by object storage). The remainder is delivered on
+	// subsequent ticks. STATUS bursts are capped separately by
+	// notifyMaxChangedMailboxes.
+	upper := fetchUpto
+	if uint64(upper)-uint64(watch.nextFetchUID)+1 > notifyMaxFetchPerTick {
+		upper = watch.nextFetchUID + imap.UID(notifyMaxFetchPerTick) - 1
 	}
 
 	var uidSet imap.UIDSet
-	uidSet.AddRange(watch.nextFetchUID, imap.UID(row.HighestUID))
+	uidSet.AddRange(watch.nextFetchUID, upper)
 
 	// Advance before writing: a delivery failure tears the connection down,
 	// and this avoids duplicate FETCHes on partial failure.
-	watch.nextFetchUID = imap.UID(row.HighestUID + 1)
+	watch.nextFetchUID = upper + 1
 
 	options := *watch.selected.MessageNewFetch
 	options.UID = true
@@ -672,15 +849,18 @@ func (s *IMAPSession) notifyFetchNewMessages(ctx context.Context, watch *notifyW
 }
 
 // currentSelectedMailboxID reads the selected mailbox ID under the session
-// lock (0 when nothing is selected).
-func (s *IMAPSession) currentSelectedMailboxID() int64 {
+// lock. ok is false if the lock could not be acquired within the timeout — the
+// caller must not treat that as "nothing selected" (id 0), which would falsely
+// look like a mailbox switch and reset watch state; it should retry later.
+// When ok is true, id is 0 iff no mailbox is selected.
+func (s *IMAPSession) currentSelectedMailboxID() (id int64, ok bool) {
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(s.ctx)
 	if !acquired {
-		return 0
+		return 0, false
 	}
 	defer release()
 	if s.selectedMailbox == nil {
-		return 0
+		return 0, true
 	}
-	return s.selectedMailbox.ID
+	return s.selectedMailbox.ID, true
 }

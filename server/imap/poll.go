@@ -81,6 +81,21 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		return nil
 	}
 
+	// Concurrency guard: the NOTIFY pump runs Poll concurrently with the
+	// per-command Poll. Both may read the same cursor under the read lock,
+	// fetch the same delta from the database, and reach here. Whoever takes
+	// the write lock second would re-apply updates the first already
+	// delivered — duplicate QueueExpunge (shifting the tracker's sequence
+	// numbers) and duplicate unsolicited responses. If the cursor advanced
+	// while we were unlocked, another Poll already handled this window; drop
+	// our now-stale delta. The cursor is monotonic (never regresses), so an
+	// inequality is a sufficient and safe check.
+	if s.currentHighestModSeq.Load() != highestModSeqToPollFrom {
+		release()
+		s.DebugLog("skipping stale concurrent poll", "polled_from", highestModSeqToPollFrom, "current", s.currentHighestModSeq.Load())
+		return nil
+	}
+
 	// Determine the highest MODSEQ from the updates processed in this poll.
 	// Start with the MODSEQ we polled from, in case no updates are found.
 	maxModSeqInThisPoll := highestModSeqToPollFrom

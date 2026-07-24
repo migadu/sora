@@ -26,6 +26,11 @@ func (s *IMAPSession) Idle(ctx context.Context, w *imapserver.UpdateWriter, done
 	metrics.IMAPIdleConnections.Inc()
 	defer metrics.IMAPIdleConnections.Dec()
 
+	// Mark the session as idling so the NOTIFY pump releases SELECTED-DELAYED
+	// expunges: IDLE is a delayed-expunge sync point (RFC 5465 §6.1.2).
+	s.idling.Store(true)
+	defer s.idling.Store(false)
+
 	// Suspend throughput checking when entering IDLE
 	// IDLE is expected to have minimal traffic (just periodic "still here" responses)
 	// and legitimate clients may stay idle for 29 minutes waiting for new mail.
