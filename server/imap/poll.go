@@ -91,9 +91,16 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 			}
 		}
 		s.currentHighestModSeq.Store(maxModSeqInThisPoll)
-	} else {
+	} else if poll.ModSeq > highestModSeqToPollFrom {
 		// If there were no specific message updates, update to the global current_modseq
 		// to ensure the session eventually catches up if the mailbox is truly idle.
+		//
+		// The cursor must never move backwards: with multiple read replicas at
+		// different lag, a poll answered by a laggier replica can report a
+		// HIGHESTMODSEQ below the session cursor. Storing it would replay
+		// updates the client already saw on the next poll — duplicate
+		// unsolicited FETCHes at best, re-queued EXPUNGEs tripping the
+		// desync-BYE path at worst.
 		s.currentHighestModSeq.Store(poll.ModSeq)
 	}
 
