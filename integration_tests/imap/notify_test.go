@@ -390,6 +390,75 @@ func TestNotifyBadEvent(t *testing.T) {
 	}
 }
 
+// TestNotifyMultiNode is the flagship multi-node scenario: two independent
+// sora IMAP instances backed by the same database (their own connection pools,
+// no shared Go state). A NOTIFY session on node B must observe changes made
+// through node A — delivery to a non-selected mailbox as STATUS and to the
+// selected mailbox as EXISTS — proving that cross-node propagation flows purely
+// through the shared database, as the polling design intends.
+func TestNotifyMultiNode(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	nodeA, account := common.SetupIMAPServer(t)
+	defer nodeA.Close()
+	nodeB := common.SetupSecondIMAPNode(t)
+	defer nodeB.Close()
+
+	// Watcher on node B, watching the selected mailbox and all personal
+	// mailboxes for message events.
+	rec := newNotifyRecorder()
+	watcher := notifyLoginAndSelect(t, nodeB.Address, account, rec.options(), "INBOX")
+	defer watcher.Logout()
+
+	if !watcher.Caps().Has(imap.CapNotify) {
+		t.Fatal("NOTIFY capability not advertised on node B")
+	}
+
+	cmd, err := watcher.Notify(&imap.NotifyOptions{
+		Items: []imap.NotifyItem{
+			{
+				MailboxSpec: imap.NotifyMailboxSpecSelected,
+				Events:      []imap.NotifyEvent{imap.NotifyEventMessageNew, imap.NotifyEventMessageExpunge},
+			},
+			{
+				MailboxSpec: imap.NotifyMailboxSpecPersonal,
+				Events:      []imap.NotifyEvent{imap.NotifyEventMessageNew, imap.NotifyEventMessageExpunge},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Notify() = %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("Notify().Wait() = %v", err)
+	}
+
+	// Deliverer on node A.
+	deliverer := notifyLoginAndSelect(t, nodeA.Address, account, nil, "")
+	defer deliverer.Logout()
+
+	// Delivery to a non-selected mailbox through node A → STATUS on node B.
+	if err := deliverer.Create("CrossNode", nil).Wait(); err != nil {
+		t.Fatalf("Create(CrossNode) = %v", err)
+	}
+	notifyAppend(t, deliverer, "CrossNode")
+	data := rec.waitStatus(t, "CrossNode", 15*time.Second)
+	if data.NumMessages == nil || *data.NumMessages != 1 {
+		t.Errorf("cross-node STATUS NumMessages = %v, want 1", data.NumMessages)
+	}
+
+	// Delivery to the selected mailbox through node A → EXISTS on node B.
+	notifyAppend(t, deliverer, "INBOX")
+	select {
+	case n := <-rec.exists:
+		if n < 1 {
+			t.Errorf("cross-node EXISTS = %v, want >= 1", n)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("timeout waiting for cross-node EXISTS on the selected mailbox")
+	}
+}
+
 // TestNotifyOverflow verifies that when a single tick observes more changed
 // mailboxes than the cap, the watch is dropped with NOTIFICATIONOVERFLOW
 // (RFC 5465 §5.8) and the connection stays usable afterwards.

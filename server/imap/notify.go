@@ -571,16 +571,17 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 		return false, nil
 	}
 
-	// Initialize marks for mailboxes newly entering the matched set (created,
-	// renamed into a SUBTREE, newly subscribed, or the just-unselected
-	// mailbox) to their current modseq, so their pre-watch history is not
-	// re-reported as STATUS. Drop marks for mailboxes that left the set.
+	// Split the matched set into mailboxes already tracked (a mark from a prior
+	// tick) and mailboxes newly entering the set this tick. Drop marks for
+	// mailboxes that left the set.
 	matchedSet := make(map[int64]struct{}, len(matchedIDs))
-	var uninitialized []int64
+	var knownIDs, newIDs []int64
 	for _, id := range matchedIDs {
 		matchedSet[id] = struct{}{}
-		if _, ok := watch.statusMarks[id]; !ok {
-			uninitialized = append(uninitialized, id)
+		if _, ok := watch.statusMarks[id]; ok {
+			knownIDs = append(knownIDs, id)
+		} else {
+			newIDs = append(newIDs, id)
 		}
 	}
 	for id := range watch.statusMarks {
@@ -588,46 +589,61 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 			delete(watch.statusMarks, id)
 		}
 	}
-	if len(uninitialized) > 0 {
-		initRows, initErr := s.server.rdb.GetMailboxesStatsWithRetry(readCtx, uninitialized)
+
+	var changed []db.MailboxStatsRow
+
+	// Newly-matched mailboxes: a mailbox that enters the set after the watch was
+	// installed represents activity the client has not heard about — a mailbox
+	// created after NOTIFY SET (report it), or a pre-existing one re-entering the
+	// set, e.g. after UNSELECT (a single absolute STATUS is harmless). Report
+	// those with any message activity once (highest_modseq > 0), and mark every
+	// new mailbox at its current modseq so it is not re-reported next tick. This
+	// differs from the SetNotify bootstrap, which seeds marks silently because
+	// pre-watch state is not "new".
+	if len(newIDs) > 0 {
+		initRows, initErr := s.server.rdb.GetMailboxesStatsWithRetry(readCtx, newIDs)
 		if initErr != nil {
 			s.WarnLog("NOTIFY: mailbox stats init failed", "error", initErr)
 			return false, nil
 		}
+		seen := make(map[int64]struct{}, len(initRows))
 		for _, r := range initRows {
 			watch.statusMarks[r.MailboxID] = r.HighestModSeq
+			seen[r.MailboxID] = struct{}{}
+			if r.HighestModSeq > 0 {
+				changed = append(changed, r)
+			}
 		}
-		// A mailbox that vanished before its init read still needs a mark so
-		// it is not re-initialized every tick until it leaves the set.
-		for _, id := range uninitialized {
-			if _, ok := watch.statusMarks[id]; !ok {
+		// A mailbox that vanished before its init read still needs a mark so it
+		// is not treated as new every tick until it leaves the set.
+		for _, id := range newIDs {
+			if _, ok := seen[id]; !ok {
 				watch.statusMarks[id] = 0
 			}
 		}
 	}
 
-	// Poll from the lowest mark across the matched set, then filter each row
-	// against that mailbox's own mark. This reports every mailbox exactly once
-	// per change without a shared cursor skipping any (see statusMarks).
-	floor := uint64(0)
-	haveFloor := false
-	for _, id := range matchedIDs {
-		m := watch.statusMarks[id]
-		if !haveFloor || m < floor {
-			floor, haveFloor = m, true
+	// Known mailboxes: poll from the lowest of their marks, then keep each row
+	// that advanced past its own mailbox's mark. This reports every mailbox
+	// exactly once per change without a shared cursor skipping any (see
+	// statusMarks), and keeps the query floor high so a single new mailbox does
+	// not force a full-history scan of the whole matched set.
+	if len(knownIDs) > 0 {
+		floor := watch.statusMarks[knownIDs[0]]
+		for _, id := range knownIDs[1:] {
+			if m := watch.statusMarks[id]; m < floor {
+				floor = m
+			}
 		}
-	}
-	rows, err := s.server.rdb.PollMailboxStatsWithRetry(readCtx, matchedIDs, floor)
-	if err != nil {
-		s.WarnLog("NOTIFY: mailbox stats poll failed", "error", err)
-		return false, nil
-	}
-
-	// Keep only rows that advanced past their own mailbox's mark.
-	changed := rows[:0]
-	for _, row := range rows {
-		if row.HighestModSeq > watch.statusMarks[row.MailboxID] {
-			changed = append(changed, row)
+		rows, err := s.server.rdb.PollMailboxStatsWithRetry(readCtx, knownIDs, floor)
+		if err != nil {
+			s.WarnLog("NOTIFY: mailbox stats poll failed", "error", err)
+			return false, nil
+		}
+		for _, row := range rows {
+			if row.HighestModSeq > watch.statusMarks[row.MailboxID] {
+				changed = append(changed, row)
+			}
 		}
 	}
 
