@@ -58,6 +58,7 @@ var (
 	_ imapserver.SessionThread         = (*meteredSession)(nil)
 	_ imapserver.SessionMultiSearch    = (*meteredSession)(nil)
 	_ imapserver.SessionID             = (*meteredSession)(nil)
+	_ imapserver.SessionNotify         = (*meteredSession)(nil)
 )
 
 // newMeteredSession wraps an IMAP session for command metric collection.
@@ -251,6 +252,18 @@ func (m *meteredSession) MultiSearch(ctx context.Context, source *imap.SearchSou
 	data, err := m.IMAPSession.MultiSearch(ctx, source, criteria, options)
 	m.recordCommand("MULTISEARCH", start, err)
 	return data, err
+}
+
+// --- NOTIFY (RFC 5465) ---
+
+// SetNotify is the synchronous part of the NOTIFY command (watch
+// installation and initial STATUS responses); NotifyPoll is deliberately not
+// timed — like Idle, it is a long-lived pump, not a client command.
+func (m *meteredSession) SetNotify(ctx context.Context, options *imap.NotifyOptions, w *imapserver.UpdateWriter) error {
+	start := time.Now()
+	err := m.IMAPSession.SetNotify(ctx, options, w)
+	m.recordCommand("NOTIFY", start, err)
+	return err
 }
 
 // --- METADATA (RFC 5464) ---

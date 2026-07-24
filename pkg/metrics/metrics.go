@@ -289,6 +289,28 @@ var (
 		},
 	)
 
+	IMAPNotifySessions = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_imap_notify_sessions_current",
+			Help: "Current number of IMAP sessions with an active NOTIFY (RFC 5465) watch",
+		},
+	)
+
+	IMAPNotifyEventsSent = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_imap_notify_events_sent_total",
+			Help: "Total NOTIFY notifications delivered, by response type",
+		},
+		[]string{"type"}, // status, list, fetch
+	)
+
+	IMAPNotifyOverflows = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_imap_notify_overflow_total",
+			Help: "Total NOTIFY watches dropped with NOTIFICATIONOVERFLOW",
+		},
+	)
+
 	// ManageSieve-specific
 	ManageSieveScriptsUploaded = promauto.NewCounter(
 		prometheus.CounterOpts{

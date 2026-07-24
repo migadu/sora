@@ -60,6 +60,13 @@ type IMAPSession struct {
 	// never persisted. Guarded by s.mutex; reset on every mailbox change.
 	savedSearchUIDs imap.UIDSet
 
+	// NOTIFY (RFC 5465) watch state. notifyMutex guards the pointer swap:
+	// SetNotify/Close write it on the command goroutine, NotifyPoll reads it
+	// on the pump goroutine (the library stops the pump before SetNotify
+	// runs, so the watch internals are only ever touched by one goroutine).
+	notifyMutex sync.Mutex
+	notifyWatch *notifyWatch
+
 	// Memory tracking
 	memTracker *server.SessionMemoryTracker
 
@@ -339,6 +346,12 @@ func (s *IMAPSession) Close() error {
 	if s.conn != nil {
 		s.server.untrackConnection(s.conn)
 	}
+
+	// Drop the NOTIFY watch (the pump goroutine is already stopped by the
+	// library before the session is closed).
+	s.notifyMutex.Lock()
+	s.notifyWatch = nil
+	s.notifyMutex.Unlock()
 
 	// Release connection from limiter
 	if s.releaseConn != nil {

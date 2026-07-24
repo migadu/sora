@@ -582,6 +582,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			imap.CapBinary:                    struct{}{},
 			imap.CapCondStore:                 struct{}{},
 			imap.CapQResync:                   struct{}{},
+			imap.CapNotify:                    struct{}{},
 			imap.CapChildren:                  struct{}{},
 			imap.CapID:                        struct{}{},
 			imap.CapNamespace:                 struct{}{},

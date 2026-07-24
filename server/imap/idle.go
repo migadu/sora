@@ -75,8 +75,15 @@ func (s *IMAPSession) Idle(ctx context.Context, w *imapserver.UpdateWriter, done
 			nextKeepalive = time.Now().Add(keepalive)
 		}
 		if !time.Now().Before(nextPoll) {
-			if err := s.Poll(ctx, w, true); err != nil {
-				return err
+			// While a NOTIFY watch is active, the notify pump is the single
+			// event source: it polls per the client's NOTIFY filters
+			// (RFC 5465 §3.1 — no SELECTED specifier means no message events
+			// for the selected mailbox, which classic IDLE polling would
+			// violate). IDLE then only keeps the connection alive.
+			if !s.notifyWatchActive() {
+				if err := s.Poll(ctx, w, true); err != nil {
+					return err
+				}
 			}
 			nextPoll = time.Now().Add(idlePollInterval)
 		}
