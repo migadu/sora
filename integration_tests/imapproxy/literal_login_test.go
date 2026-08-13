@@ -257,6 +257,100 @@ func TestIMAPProxyLiteralLoginEdgeCases(t *testing.T) {
 	}
 }
 
+// TestIMAPProxyNonSyncLiteralLogin tests LOGIN with non-synchronizing literals
+// ({size+}, RFC 7888 LITERAL+), which are base functionality in IMAP4rev2
+// (RFC 9051 §4.3) — the proxy advertises IMAP4rev2, so rev2 clients (e.g. the
+// August 2026 "new Outlook" rollout) send these without waiting for a
+// continuation. The whole command arrives in a single write; the proxy must
+// not send "+ " and must not misparse the literal data as commands.
+func TestIMAPProxyNonSyncLiteralLogin(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	backendServer, account := common.SetupIMAPServerWithPROXY(t)
+	defer backendServer.Close()
+
+	proxyAddress := common.GetRandomAddress(t)
+	proxy := setupIMAPProxyWithPROXY(t, backendServer.ResilientDB, proxyAddress, []string{backendServer.Address})
+	defer proxy.Close()
+
+	time.Sleep(300 * time.Millisecond)
+
+	email := account.Email
+	password := account.Password
+
+	testCases := []struct {
+		name    string
+		payload string
+	}{
+		{
+			// The new-Outlook shape: everything in one write, no waiting.
+			name: "both_nonsync_single_write",
+			payload: fmt.Sprintf("A001 LOGIN {%d+}\r\n%s {%d+}\r\n%s\r\n",
+				len(email), email, len(password), password),
+		},
+		{
+			name: "username_nonsync_password_quoted",
+			payload: fmt.Sprintf("A001 LOGIN {%d+}\r\n%s \"%s\"\r\n",
+				len(email), email, escapeForIMAP(password)),
+		},
+		{
+			name: "username_quoted_password_nonsync",
+			payload: fmt.Sprintf("A001 LOGIN \"%s\" {%d+}\r\n%s\r\n",
+				email, len(password), password),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, err := net.Dial("tcp", proxyAddress)
+			if err != nil {
+				t.Fatalf("Failed to connect: %v", err)
+			}
+			defer conn.Close()
+			conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+			reader := bufio.NewReader(conn)
+			greeting, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("Failed to read greeting: %v", err)
+			}
+			if !strings.HasPrefix(greeting, "* OK") {
+				t.Fatalf("Invalid greeting: %s", greeting)
+			}
+
+			// Send the entire command at once — a non-sync literal client
+			// does not wait for continuations.
+			if _, err := conn.Write([]byte(tc.payload)); err != nil {
+				t.Fatalf("Failed to send LOGIN: %v", err)
+			}
+
+			var responses []string
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					t.Fatalf("Failed to read response (got so far: %v): %v", responses, err)
+				}
+				responses = append(responses, line)
+				if strings.HasPrefix(line, "+") {
+					t.Errorf("Server sent continuation for non-synchronizing literal: %s", strings.TrimSpace(line))
+				}
+				if strings.HasPrefix(line, "A001 ") {
+					break
+				}
+				if len(responses) > 10 {
+					t.Fatalf("Too many response lines: %v", responses)
+				}
+			}
+
+			final := responses[len(responses)-1]
+			if !strings.Contains(final, "A001 OK") {
+				t.Fatalf("Non-sync literal login failed: %s (all: %v)", strings.TrimSpace(final), responses)
+			}
+			t.Logf("✓ Non-sync literal login succeeded: %s", strings.TrimSpace(final))
+		})
+	}
+}
+
 // escapeForIMAP escapes special characters for IMAP quoted strings per RFC 3501.
 // Backslashes and double-quotes must be escaped.
 func escapeForIMAP(s string) string {

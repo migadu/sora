@@ -375,10 +375,11 @@ func TestParseLineUnquoteStringIntegration(t *testing.T) {
 
 func TestParseLiteral(t *testing.T) {
 	tests := []struct {
-		name    string
-		input   string
-		want    int
-		wantErr bool
+		name        string
+		input       string
+		want        int
+		wantNonSync bool
+		wantErr     bool
 	}{
 		{
 			name:    "valid literal",
@@ -397,6 +398,38 @@ func TestParseLiteral(t *testing.T) {
 			input:   "{12345}",
 			want:    12345,
 			wantErr: false,
+		},
+		{
+			name:        "non-synchronizing literal (LITERAL+/IMAP4rev2)",
+			input:       "{10+}",
+			want:        10,
+			wantNonSync: true,
+			wantErr:     false,
+		},
+		{
+			name:        "non-synchronizing literal zero",
+			input:       "{0+}",
+			want:        0,
+			wantNonSync: true,
+			wantErr:     false,
+		},
+		{
+			name:    "invalid - plus only",
+			input:   "{+}",
+			want:    0,
+			wantErr: true,
+		},
+		{
+			name:    "invalid - double plus",
+			input:   "{10++}",
+			want:    0,
+			wantErr: true,
+		},
+		{
+			name:    "invalid - plus before size",
+			input:   "{+10}",
+			want:    0,
+			wantErr: true,
 		},
 		{
 			name:    "invalid - no braces",
@@ -438,13 +471,16 @@ func TestParseLiteral(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseLiteral(tt.input)
+			got, nonSync, err := ParseLiteral(tt.input)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ParseLiteral() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if got != tt.want {
 				t.Errorf("ParseLiteral() = %v, want %v", got, tt.want)
+			}
+			if nonSync != tt.wantNonSync {
+				t.Errorf("ParseLiteral() nonSync = %v, want %v", nonSync, tt.wantNonSync)
 			}
 		})
 	}
