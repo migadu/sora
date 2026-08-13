@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/server/idgen"
 )
 
 // ConnectionEventType represents the type of connection event
@@ -33,14 +35,12 @@ const (
 const (
 	// Default maximum size of event queue before we start dropping old events
 	defaultMaxEventQueueSize = 50000
-
-	// How often to broadcast full state snapshot for reconciliation
-	stateSnapshotInterval = 60 * time.Second
 )
 
 // ConnectionEvent represents a cluster-wide connection event
 type ConnectionEvent struct {
 	Type       ConnectionEventType `json:"type"`
+	EventID    string              `json:"event_id"` // Unique per event, for duplicate suppression
 	AccountID  int64               `json:"account_id"`
 	Username   string              `json:"username"`    // For debugging/logging
 	Protocol   string              `json:"protocol"`    // "IMAP", "POP3", "ManageSieve"
@@ -49,14 +49,18 @@ type ConnectionEvent struct {
 	NodeID     string              `json:"node_id"`
 	InstanceID string              `json:"instance_id"` // Unique instance identifier
 
-	// For state snapshots
+	// For state snapshots. A snapshot event without a payload is a liveness
+	// heartbeat: full state travels over push/pull, and older builds decode the
+	// empty payload as "nothing to reconcile".
 	StateSnapshot *ConnectionStateSnapshot `json:"state_snapshot,omitempty"`
 }
 
 // ConnectionStateSnapshot represents a full connection state for reconciliation
 type ConnectionStateSnapshot struct {
-	InstanceID  string                       `json:"instance_id"`
-	Timestamp   time.Time                    `json:"timestamp"`
+	InstanceID string    `json:"instance_id"`
+	Protocol   string    `json:"protocol"` // Which tracker the state belongs to
+	Timestamp  time.Time `json:"timestamp"`
+
 	Connections map[int64]UserConnectionData `json:"connections"` // accountID -> connection data
 }
 
@@ -111,26 +115,39 @@ type ConnectionTracker struct {
 	maxEventQueueSize          int  // Maximum events in broadcast queue
 	snapshotOnly               bool // If true, only broadcast state snapshots (no individual register/unregister)
 
-	// Broadcast queue for outgoing events
-	broadcastQueue []ConnectionEvent
-	queueMu        sync.Mutex
+	// Outgoing gossip, in three tiers drained in this order: the liveness
+	// heartbeat, which peers purge this instance's counts without; kicks, which
+	// nothing repairs once dropped; and ordinary register/unregister traffic,
+	// which the next push/pull repairs.
+	queue          *gossipQueue
+	criticalQueue  *gossipQueue
+	heartbeatQueue *gossipQueue
 
 	// Instance tracking for stall detection
 	instanceLastSeen map[string]time.Time
+
+	// Duplicate suppression for received events
+	dedup gossipDedup
+
+	// Decrements delivered ahead of the increment they cancel (guarded by mu)
+	deferred deferredDecrements
 
 	// Cleanup counter for periodic memory reporting
 	cleanupCounter uint64
 
 	// Shutdown
-	stopBroadcast     chan struct{}
-	stopCleanup       chan struct{}
-	stopStateSnapshot chan struct{}
-	stopOnce          sync.Once
+	stopBroadcast chan struct{}
+	stopCleanup   chan struct{}
+	stopOnce      sync.Once
 }
 
-// LookupCacheInvalidator interface for invalidating cache entries
+// LookupCacheInvalidator drops a proxy's cached auth and routing entry for one
+// user. Entries are keyed by the name of the server the session is on, which
+// the cache derives itself: a tracker that built the key would have to
+// reproduce a format it does not own, and a key that does not match exactly
+// invalidates nothing.
 type LookupCacheInvalidator interface {
-	Invalidate(key string)
+	InvalidateUser(serverName, username string)
 }
 
 // NewConnectionTracker creates a new connection tracker.
@@ -155,11 +172,13 @@ func NewConnectionTracker(name, serverName, hostname string, instanceID string, 
 		maxEventQueueSize:          maxEventQueueSize,
 		snapshotOnly:               snapshotOnly,
 		kickSessions:               make(map[int64][]chan struct{}),
-		broadcastQueue:             make([]ConnectionEvent, 0, 100),
+		queue:                      newGossipQueue("connection:"+name, clusterMgr, maxEventQueueSize),
+		criticalQueue:              newCriticalGossipQueue("connection-kick:"+name, clusterMgr, maxCriticalQueued),
+		heartbeatQueue:             newGossipQueue("connection-heartbeat:"+name, clusterMgr, maxHeartbeatQueued),
+		deferred:                   deferredDecrements{kind: "connection:" + name},
 		instanceLastSeen:           make(map[string]time.Time),
 		stopBroadcast:              make(chan struct{}),
 		stopCleanup:                make(chan struct{}),
-		stopStateSnapshot:          make(chan struct{}),
 	}
 
 	if clusterMgr != nil {
@@ -167,12 +186,15 @@ func NewConnectionTracker(name, serverName, hostname string, instanceID string, 
 		logger.Debug("Gossip tracker: Registering handlers with cluster manager", "name", name)
 		clusterMgr.RegisterConnectionHandler(ct.HandleClusterEvent)
 		clusterMgr.RegisterConnectionBroadcaster(ct.GetBroadcasts)
+		// The registration name only has to be unique on this node: push/pull
+		// state is dispatched by kind and each tracker decides from the
+		// protocol inside the payload whether the state is its own.
+		clusterMgr.RegisterStateProvider(cluster.StateKindConnection, instanceID, ct.localState, ct.mergeRemoteState)
 		logger.Debug("Gossip tracker: Handlers registered successfully", "name", name)
 
 		// Start background routines
-		go ct.broadcastRoutine()
+		go ct.heartbeatRoutine()
 		go ct.cleanupRoutine()
-		go ct.stateSnapshotRoutine()
 
 		mode := "full"
 		if snapshotOnly {
@@ -211,6 +233,24 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 		return nil // Disabled
 	}
 
+	event, err := ct.registerLocked(accountID, username, protocol, clientAddr)
+	if err != nil {
+		return err
+	}
+
+	// Encoding happens outside the tracker lock: every accept on this listener
+	// serialises on it, and gob encoding an event is orders of magnitude more
+	// work than the bookkeeping it protects.
+	if event != nil {
+		ct.queueEvent(*event)
+	}
+
+	return nil
+}
+
+// registerLocked does the tracker's own bookkeeping for a new connection and
+// returns the event to gossip, if any.
+func (ct *ConnectionTracker) registerLocked(accountID int64, username, protocol, clientAddr string) (*ConnectionEvent, error) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
 
@@ -244,28 +284,19 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 
 	if ct.maxConnectionsPerUser > 0 && checkCount >= ct.maxConnectionsPerUser {
 		logger.Info("Connection tracker: Maximum connections per user reached", "tracker", ct.trackerType(), "protocol", protocol, "username", username, "account_id", accountID, "current", checkCount, "max", ct.maxConnectionsPerUser, "scope", scope, "client_addr", clientAddr)
-		return fmt.Errorf("user %s has reached maximum connections (%d/%d %s)",
+		return nil, fmt.Errorf("user %s has reached maximum connections (%d/%d %s)",
 			username, checkCount, ct.maxConnectionsPerUser, scope)
 	}
 
 	// Check per-user-per-IP limit (cluster-wide via gossip)
 	if ct.maxConnectionsPerUserPerIP > 0 && clientAddr != "" {
-		// Extract IP from clientAddr (format is usually "IP:port")
-		clientIP := clientAddr
-		if idx := len(clientAddr) - 1; idx >= 0 {
-			for i := idx; i >= 0; i-- {
-				if clientAddr[i] == ':' {
-					clientIP = clientAddr[:i]
-					break
-				}
-			}
-		}
+		clientIP := clientIPOf(clientAddr)
 
 		// Get cluster-wide count for this IP by summing across all instances
 		ipCount := info.GetClusterWideIPCount(clientIP)
 		if ipCount >= ct.maxConnectionsPerUserPerIP {
 			logger.Info("Connection tracker: Maximum connections per user per IP reached", "tracker", ct.trackerType(), "protocol", protocol, "username", username, "account_id", accountID, "ip", clientIP, "current", ipCount, "max", ct.maxConnectionsPerUserPerIP, "client_addr", clientAddr)
-			return fmt.Errorf("user %s has reached maximum connections from IP %s (%d/%d)",
+			return nil, fmt.Errorf("user %s has reached maximum connections from IP %s (%d/%d)",
 				username, clientIP, ipCount, ct.maxConnectionsPerUserPerIP)
 		}
 	}
@@ -273,16 +304,8 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 	// Increment connection count for this instance
 	info.LastUpdate = time.Now()
 
-	// Extract IP from clientAddr (we always track per-IP, even if limiting is disabled)
-	clientIP := clientAddr
-	if idx := len(clientAddr) - 1; idx >= 0 {
-		for i := idx; i >= 0; i-- {
-			if clientAddr[i] == ':' {
-				clientIP = clientAddr[:i]
-				break
-			}
-		}
-	}
+	// We always track per-IP, even if limiting is disabled.
+	clientIP := clientIPOf(clientAddr)
 
 	// Initialize nested map if needed
 	if info.PerIPCountByInstance[ct.instanceID] == nil {
@@ -293,20 +316,20 @@ func (ct *ConnectionTracker) RegisterConnection(ctx context.Context, accountID i
 	logger.Debug("Connection tracker: Registered", "name", ct.name, "type", ct.trackerType(), "user", username, "local", info.GetLocalCount(ct.instanceID), "total", info.GetTotalCount())
 
 	// Broadcast to cluster (only in cluster mode and if not snapshot-only mode)
-	if ct.clusterManager != nil && !ct.snapshotOnly {
-		ct.queueEvent(ConnectionEvent{
-			Type:       ConnectionEventRegister,
-			AccountID:  accountID,
-			Username:   username,
-			Protocol:   protocol,
-			ClientAddr: clientAddr,
-			Timestamp:  time.Now(),
-			NodeID:     ct.clusterManager.GetNodeID(),
-			InstanceID: ct.instanceID,
-		})
+	if ct.clusterManager == nil || ct.snapshotOnly {
+		return nil, nil
 	}
 
-	return nil
+	return &ConnectionEvent{
+		Type:       ConnectionEventRegister,
+		AccountID:  accountID,
+		Username:   username,
+		Protocol:   protocol,
+		ClientAddr: clientAddr,
+		Timestamp:  time.Now(),
+		NodeID:     ct.clusterManager.GetNodeID(),
+		InstanceID: ct.instanceID,
+	}, nil
 }
 
 // UnregisterConnection unregisters a connection and broadcasts to cluster
@@ -315,6 +338,17 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 		return nil // Disabled
 	}
 
+	// Encoding happens outside the tracker lock, as in RegisterConnection.
+	if event := ct.unregisterLocked(accountID, protocol, clientAddr); event != nil {
+		ct.queueEvent(*event)
+	}
+
+	return nil
+}
+
+// unregisterLocked does the tracker's own bookkeeping for a closed connection
+// and returns the event to gossip, if any.
+func (ct *ConnectionTracker) unregisterLocked(accountID int64, protocol, clientAddr string) *ConnectionEvent {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
 
@@ -325,16 +359,7 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 	}
 
 	// Decrement connection count for this instance
-	// Extract IP from clientAddr
-	clientIP := clientAddr
-	if idx := len(clientAddr) - 1; idx >= 0 {
-		for i := idx; i >= 0; i-- {
-			if clientAddr[i] == ':' {
-				clientIP = clientAddr[:i]
-				break
-			}
-		}
-	}
+	clientIP := clientIPOf(clientAddr)
 
 	if perIPMap := info.PerIPCountByInstance[ct.instanceID]; perIPMap != nil {
 		if count := perIPMap[clientIP]; count > 0 {
@@ -371,20 +396,29 @@ func (ct *ConnectionTracker) UnregisterConnection(ctx context.Context, accountID
 	}
 
 	// Broadcast to cluster (only in cluster mode and if not snapshot-only mode)
-	if ct.clusterManager != nil && !ct.snapshotOnly {
-		ct.queueEvent(ConnectionEvent{
-			Type:       ConnectionEventUnregister,
-			AccountID:  accountID,
-			Username:   info.Username,
-			Protocol:   protocol,
-			ClientAddr: clientAddr,
-			Timestamp:  time.Now(),
-			NodeID:     ct.clusterManager.GetNodeID(),
-			InstanceID: ct.instanceID,
-		})
+	if ct.clusterManager == nil || ct.snapshotOnly {
+		return nil
 	}
 
-	return nil
+	return &ConnectionEvent{
+		Type:       ConnectionEventUnregister,
+		AccountID:  accountID,
+		Username:   info.Username,
+		Protocol:   protocol,
+		ClientAddr: clientAddr,
+		Timestamp:  time.Now(),
+		NodeID:     ct.clusterManager.GetNodeID(),
+		InstanceID: ct.instanceID,
+	}
+}
+
+// clientIPOf strips the port from a "host:port" client address. An address
+// without a port is already an IP.
+func clientIPOf(clientAddr string) string {
+	if idx := strings.LastIndexByte(clientAddr, ':'); idx >= 0 {
+		return clientAddr[:idx]
+	}
+	return clientAddr
 }
 
 // getClusterWideIPCount calculates the cluster-wide connection count for a specific IP
@@ -508,9 +542,8 @@ func (ct *ConnectionTracker) GetUniqueUserCount() int {
 	return count
 }
 
-// KickUser kicks a user's connections.
-// In cluster mode, broadcasts kick event via gossip.
-// In local mode, directly closes all sessions for the user.
+// KickUser kicks a user's connections: the ones this node holds directly, and
+// in cluster mode the ones its peers hold by broadcasting a kick event.
 func (ct *ConnectionTracker) KickUser(accountID int64, protocol string) error {
 	if ct == nil {
 		return fmt.Errorf("connection tracker not initialized")
@@ -528,42 +561,76 @@ func (ct *ConnectionTracker) KickUser(accountID int64, protocol string) error {
 		// Cluster mode: broadcast kick event via gossip
 		logger.Info("Gossip tracker: Broadcasting kick", "name", ct.name, "account_id", accountID, "protocol", protocol)
 
-		ct.queueEvent(ConnectionEvent{
+		// The event is tagged with this tracker's own protocol, which is what
+		// receivers filter on. Callers name the tracker however they index it -
+		// the admin API passes "IMAP-host-listener" - and a name that is not
+		// exactly ct.name would be discarded by every peer.
+		encoded := ct.queueEvent(ConnectionEvent{
 			Type:       ConnectionEventKick,
 			AccountID:  accountID,
 			Username:   username,
-			Protocol:   protocol,
+			Protocol:   ct.name,
 			Timestamp:  time.Now(),
 			NodeID:     ct.clusterManager.GetNodeID(),
 			InstanceID: ct.instanceID,
 		})
-	} else {
-		// Local mode: directly kick sessions on this server
-		logger.Info("LocalTracker: Kicking local sessions", "protocol", ct.name,
-			"account_id", accountID, "target_protocol", protocol)
 
-		ct.kickSessionsMu.Lock()
-		sessions := ct.kickSessions[accountID]
-		if len(sessions) > 0 {
-			// Close all kick channels for this user
-			for _, ch := range sessions {
-				select {
-				case <-ch:
-					// Already closed
-				default:
-					close(ch)
-				}
-			}
-			delete(ct.kickSessions, accountID)
-			logger.Info("LocalTracker: Kicked local sessions", "protocol", ct.name,
-				"count", len(sessions), "account_id", accountID)
-		} else {
-			logger.Debug("Local tracker: No active sessions to kick", "name", ct.name, "account_id", accountID)
+		// Gossip retires a broadcast after a bounded number of transmissions
+		// with no acknowledgement, so a given peer can miss it. A kick is an
+		// operator-rate event, so it is also sent to every current member over
+		// TCP; the gossip copy remains as the backstop for peers that were
+		// unreachable or that join while the send is in flight.
+		if encoded != nil {
+			go func() {
+				delivered, failed := ct.clusterManager.SendConnectionEventReliable(encoded)
+				logger.Info("Gossip tracker: Kick delivered to members", "name", ct.name,
+					"account_id", accountID, "delivered", delivered, "failed", failed)
+			}()
 		}
-		ct.kickSessionsMu.Unlock()
+	}
+
+	// The kick is applied here whatever the mode. No path back into the cluster
+	// reaches this node: the reliable fan-out skips self, gossip does not loop a
+	// broadcast back, and HandleClusterEvent discards events from this instance -
+	// so without this the node the operator issued the kick from is the one node
+	// that never kicks.
+	if kicked := ct.applyKick(accountID, username); kicked > 0 {
+		logger.Info("Connection tracker: Kicked local sessions", "tracker", ct.trackerType(), "protocol", ct.name,
+			"count", kicked, "account_id", accountID, "target_protocol", protocol)
+	} else {
+		logger.Debug("Connection tracker: No local sessions to kick", "tracker", ct.trackerType(), "name", ct.name, "account_id", accountID)
 	}
 
 	return nil
+}
+
+// applyKick closes every session this node holds for an account and drops the
+// cached routing and auth entry held for the address the connection was
+// registered under, so that a reconnect is looked up afresh. It reports how
+// many sessions there were. Both steps are idempotent - a channel that is
+// already closed is left alone - so a node may reach this both from the kick it
+// issued and from a peer's copy of the same event.
+func (ct *ConnectionTracker) applyKick(accountID int64, username string) int {
+	if ct.lookupCache != nil && username != "" {
+		ct.lookupCache.InvalidateUser(ct.serverName, username)
+		logger.Debug("Connection tracker: Invalidated cache on kick", "name", ct.name, "server", ct.serverName, "user", username, "account_id", accountID)
+	}
+
+	ct.kickSessionsMu.Lock()
+	defer ct.kickSessionsMu.Unlock()
+
+	sessions := ct.kickSessions[accountID]
+	for _, ch := range sessions {
+		select {
+		case <-ch:
+			// Already closed
+		default:
+			close(ch)
+		}
+	}
+	delete(ct.kickSessions, accountID)
+
+	return len(sessions)
 }
 
 // RegisterSession registers a session for kick notifications
@@ -611,130 +678,45 @@ func (ct *ConnectionTracker) UnregisterSession(accountID int64, ch <-chan struct
 	}
 }
 
-// queueEvent adds an event to the broadcast queue with bounded size.
-// Prioritizes kick events - they are never dropped to ensure security.
-func (ct *ConnectionTracker) queueEvent(event ConnectionEvent) {
-	ct.queueMu.Lock()
-	defer ct.queueMu.Unlock()
-
-	// If queue is full, drop oldest non-critical events
-	if len(ct.broadcastQueue) >= ct.maxEventQueueSize {
-		// Try to drop non-kick events (Register/Unregister/StateSnapshot)
-		// Kick events are critical for security and must not be dropped
-		dropCount := ct.maxEventQueueSize / 10
-		droppedEvents := ct.dropNonCriticalEvents(dropCount)
-
-		if droppedEvents > 0 {
-			logger.Warn("Gossip tracker: Event queue overflow - dropped non-critical events",
-				"name", ct.name, "current", len(ct.broadcastQueue),
-				"max", ct.maxEventQueueSize, "dropped", droppedEvents)
-		} else {
-			// Queue is full of critical events (kicks) - cannot drop
-			// This is a serious situation but we must preserve kick events
-			logger.Error("Gossip tracker: Event queue overflow with critical events - cannot drop",
-				"name", ct.name, "current", len(ct.broadcastQueue),
-				"max", ct.maxEventQueueSize, "event_type", event.Type,
-				"recommendation", "Increase maxEventQueueSize or investigate gossip performance")
-
-			// For kick events, we MUST queue them even if over limit (security critical)
-			// For other events when queue is all kicks, drop the new event
-			if event.Type != ConnectionEventKick {
-				logger.Warn("Gossip tracker: Dropping new non-critical event due to critical queue overflow",
-					"name", ct.name, "event_type", event.Type)
-				return // Don't queue this event
-			}
-			// Allow kick event to be queued even over limit
-		}
+// queueEvent encodes an event, hands it to the tier it belongs to and returns
+// the encoded message. Ordinary events can be resent or repaired by the next
+// push/pull; a lost kick cannot; and a heartbeat is worth nothing if a backlog
+// of either can keep it off the wire - it exists to keep peers from purging
+// this instance precisely while that backlog is deep.
+func (ct *ConnectionTracker) queueEvent(event ConnectionEvent) []byte {
+	if event.EventID == "" {
+		event.EventID = idgen.New()
 	}
 
-	ct.broadcastQueue = append(ct.broadcastQueue, event)
-}
-
-// dropNonCriticalEvents removes up to maxDrop non-critical events from the queue.
-// Returns the number of events actually dropped.
-// Critical events (ConnectionEventKick) are never dropped.
-func (ct *ConnectionTracker) dropNonCriticalEvents(maxDrop int) int {
-	dropped := 0
-	writeIdx := 0
-
-	// Single pass: iterate through queue, keep kicks, drop others until maxDrop reached
-	for readIdx := 0; readIdx < len(ct.broadcastQueue); readIdx++ {
-		event := ct.broadcastQueue[readIdx]
-
-		// Always keep kick events (critical)
-		if event.Type == ConnectionEventKick {
-			if writeIdx != readIdx {
-				ct.broadcastQueue[writeIdx] = event
-			}
-			writeIdx++
-			continue
-		}
-
-		// For non-critical events: keep if we haven't dropped enough yet
-		if dropped < maxDrop {
-			// Drop this non-critical event
-			dropped++
-			switch event.Type {
-			case ConnectionEventRegister:
-				logger.Debug("Gossip tracker: Dropped register event", "name", ct.name, "user", event.Username)
-			case ConnectionEventUnregister:
-				logger.Debug("Gossip tracker: Dropped unregister event", "name", ct.name, "user", event.Username)
-			case ConnectionEventStateSnapshot:
-				logger.Debug("Gossip tracker: Dropped state snapshot", "name", ct.name)
-			}
-		} else {
-			// Keep this event (already dropped enough)
-			if writeIdx != readIdx {
-				ct.broadcastQueue[writeIdx] = event
-			}
-			writeIdx++
-		}
-	}
-
-	// Truncate queue to new size
-	ct.broadcastQueue = ct.broadcastQueue[:writeIdx]
-	return dropped
-}
-
-// GetBroadcasts returns events to broadcast (called by cluster manager)
-func (ct *ConnectionTracker) GetBroadcasts(overhead, limit int) [][]byte {
-	ct.queueMu.Lock()
-	defer ct.queueMu.Unlock()
-
-	queueLen := len(ct.broadcastQueue)
-	if queueLen == 0 {
+	encoded, err := encodeConnectionEvent(event)
+	if err != nil {
+		logger.Warn("Gossip tracker: Failed to encode event", "name", ct.name, "type", event.Type, "error", err)
 		return nil
 	}
 
-	logger.Debug("Gossip tracker: GetBroadcasts called", "name", ct.name, "queue_len", queueLen, "overhead", overhead, "limit", limit)
-
-	broadcasts := make([][]byte, 0, len(ct.broadcastQueue))
-	totalSize := 0
-
-	for i := 0; i < len(ct.broadcastQueue); i++ {
-		encoded, err := encodeConnectionEvent(ct.broadcastQueue[i])
-		if err != nil {
-			logger.Warn("Gossip tracker: Failed to encode event", "name", ct.name, "error", err)
-			continue
-		}
-
-		// Check if adding this message would exceed the limit
-		msgSize := overhead + len(encoded)
-		if totalSize+msgSize > limit && len(broadcasts) > 0 {
-			// Keep remaining events for next broadcast
-			ct.broadcastQueue = ct.broadcastQueue[i:]
-			logger.Debug("Gossip tracker: GetBroadcasts limit reached", "name", ct.name, "returned", len(broadcasts), "queued", len(ct.broadcastQueue))
-			return broadcasts
-		}
-
-		broadcasts = append(broadcasts, encoded)
-		totalSize += msgSize
+	switch {
+	case isHeartbeat(event):
+		ct.heartbeatQueue.enqueue(encoded)
+	case event.Type == ConnectionEventKick:
+		ct.criticalQueue.enqueue(encoded)
+	default:
+		ct.queue.enqueue(encoded)
 	}
 
-	// All events broadcasted, clear queue
-	ct.broadcastQueue = ct.broadcastQueue[:0]
-	logger.Debug("Gossip tracker: GetBroadcasts queue emptied", "name", ct.name, "messages", len(broadcasts))
-	return broadcasts
+	return encoded
+}
+
+// isHeartbeat reports whether an event is a bare liveness assertion rather than
+// a snapshot carrying state.
+func isHeartbeat(event ConnectionEvent) bool {
+	return event.Type == ConnectionEventStateSnapshot && event.StateSnapshot == nil
+}
+
+// GetBroadcasts returns events to broadcast (called by cluster manager).
+// memberlist calls this once per gossip target, so an event stays queued until
+// it has been transmitted often enough to have reached the cluster.
+func (ct *ConnectionTracker) GetBroadcasts(overhead, limit int) [][]byte {
+	return drainTiers(ct.heartbeatQueue, ct.criticalQueue, ct.queue, overhead, limit)
 }
 
 // HandleClusterEvent processes a connection event from another node
@@ -755,6 +737,14 @@ func (ct *ConnectionTracker) HandleClusterEvent(data []byte) {
 		return
 	}
 
+	// CRITICAL: Filter events by protocol to prevent cross-protocol contamination
+	// All connection trackers receive all gossip events, but each should only process its own protocol
+	// Without this check, IMAP events get counted in LMTP tracker, causing massive ghost connection leaks
+	if event.Protocol != "" && event.Protocol != ct.name {
+		logger.Debug("Gossip tracker: Ignoring event for different protocol", "tracker_protocol", ct.name, "event_protocol", event.Protocol, "event_type", event.Type)
+		return
+	}
+
 	// Update last seen time for this instance
 	ct.mu.Lock()
 	if ct.instanceLastSeen == nil {
@@ -765,16 +755,15 @@ func (ct *ConnectionTracker) HandleClusterEvent(data []byte) {
 
 	// Check if event is too old (prevent replays after network partition)
 	age := time.Since(event.Timestamp)
-	if age > 5*time.Minute {
+	if age > staleEventThreshold {
 		logger.Debug("Gossip tracker: Ignoring stale event", "name", ct.name, "node_id", event.NodeID, "age", age)
 		return
 	}
 
-	// CRITICAL: Filter events by protocol to prevent cross-protocol contamination
-	// All connection trackers receive all gossip events, but each should only process its own protocol
-	// Without this check, IMAP events get counted in LMTP tracker, causing massive ghost connection leaks
-	if event.Protocol != "" && event.Protocol != ct.name {
-		logger.Debug("Gossip tracker: Ignoring event for different protocol", "tracker_protocol", ct.name, "event_protocol", event.Protocol, "event_type", event.Type)
+	// Gossip delivery is at-least-once: register and unregister move a counter,
+	// so a retransmitted copy must not be applied twice.
+	if ct.dedup.seenBefore(event.EventID) {
+		logger.Debug("Gossip tracker: Ignoring duplicate event", "name", ct.name, "type", event.Type, "event_id", event.EventID)
 		return
 	}
 
@@ -786,16 +775,39 @@ func (ct *ConnectionTracker) HandleClusterEvent(data []byte) {
 	case ConnectionEventKick:
 		ct.handleKick(event)
 	case ConnectionEventStateSnapshot:
-		ct.reconcileState(event.StateSnapshot)
+		// A payload-less snapshot is a heartbeat; recording the instance as
+		// seen above is all it is for. Snapshots with a payload come from a
+		// node that still gossips full state instead of using push/pull.
+		if event.StateSnapshot != nil {
+			ct.reconcileState(event.StateSnapshot)
+		}
 	default:
 		logger.Warn("Gossip tracker: Unknown event type", "name", ct.name, "type", event.Type)
 	}
+}
+
+// connectionCounterKey identifies the counter a register/unregister pair moves.
+// Both events of a pair come from the same instance, so timestamps taken from
+// this key's clock are comparable.
+func connectionCounterKey(instanceID string, accountID int64, clientIP string) string {
+	return fmt.Sprintf("%s|%d|%s", instanceID, accountID, clientIP)
 }
 
 // handleRegister processes a register event from another node
 func (ct *ConnectionTracker) handleRegister(event ConnectionEvent) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
+
+	// An unregister for this connection may have been delivered first; the two
+	// then cancel and neither is applied.
+	if event.ClientAddr != "" {
+		key := connectionCounterKey(event.InstanceID, event.AccountID, clientIPOf(event.ClientAddr))
+		if ct.deferred.consume(key, event.Timestamp) {
+			logger.Debug("Gossip tracker: Register cancelled by an earlier-delivered unregister",
+				"name", ct.name, "user", event.Username, "instance", event.InstanceID)
+			return
+		}
+	}
 
 	info, exists := ct.connections[event.AccountID]
 	if !exists {
@@ -814,16 +826,7 @@ func (ct *ConnectionTracker) handleRegister(event ConnectionEvent) {
 
 	// Increment per-IP count for the remote instance (cluster-wide tracking via gossip)
 	if event.ClientAddr != "" {
-		// Extract IP from clientAddr
-		clientIP := event.ClientAddr
-		if idx := len(event.ClientAddr) - 1; idx >= 0 {
-			for i := idx; i >= 0; i-- {
-				if event.ClientAddr[i] == ':' {
-					clientIP = event.ClientAddr[:i]
-					break
-				}
-			}
-		}
+		clientIP := clientIPOf(event.ClientAddr)
 
 		// Initialize nested map if needed
 		if info.PerIPCountByInstance[event.InstanceID] == nil {
@@ -840,36 +843,31 @@ func (ct *ConnectionTracker) handleUnregister(event ConnectionEvent) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
 
+	clientIP := clientIPOf(event.ClientAddr)
 	info, exists := ct.connections[event.AccountID]
+
+	// Nothing to subtract from: either the account is unknown here or this
+	// instance holds no count for the IP. The register may simply be delivered
+	// later, so the decrement is held until it shows up rather than dropped.
+	if event.ClientAddr != "" && (!exists || info.PerIPCountByInstance[event.InstanceID][clientIP] <= 0) {
+		ct.deferred.hold(connectionCounterKey(event.InstanceID, event.AccountID, clientIP), event.Timestamp)
+		return
+	}
 	if !exists {
-		return // Unknown user, ignore
+		return // Unknown user and no IP to attribute, ignore
 	}
 
 	// Decrement per-IP count for the remote instance (cluster-wide tracking via gossip)
 	if event.ClientAddr != "" {
-		// Extract IP from clientAddr
-		clientIP := event.ClientAddr
-		if idx := len(event.ClientAddr) - 1; idx >= 0 {
-			for i := idx; i >= 0; i-- {
-				if event.ClientAddr[i] == ':' {
-					clientIP = event.ClientAddr[:i]
-					break
-				}
-			}
+		perIPMap := info.PerIPCountByInstance[event.InstanceID]
+		perIPMap[clientIP]--
+		// Clean up zero counts
+		if perIPMap[clientIP] == 0 {
+			delete(perIPMap, clientIP)
 		}
-
-		if perIPMap := info.PerIPCountByInstance[event.InstanceID]; perIPMap != nil {
-			if count := perIPMap[clientIP]; count > 0 {
-				perIPMap[clientIP] = count - 1
-				// Clean up zero counts
-				if perIPMap[clientIP] == 0 {
-					delete(perIPMap, clientIP)
-				}
-				// Clean up empty instance map
-				if len(perIPMap) == 0 {
-					delete(info.PerIPCountByInstance, event.InstanceID)
-				}
-			}
+		// Clean up empty instance map
+		if len(perIPMap) == 0 {
+			delete(info.PerIPCountByInstance, event.InstanceID)
 		}
 	}
 
@@ -887,57 +885,42 @@ func (ct *ConnectionTracker) handleUnregister(event ConnectionEvent) {
 func (ct *ConnectionTracker) handleKick(event ConnectionEvent) {
 	logger.Info("Gossip tracker: Received kick", "name", ct.name, "account_id", event.AccountID, "protocol", event.Protocol, "from_node", event.NodeID)
 
-	// CRITICAL: Invalidate cache for this user
-	// This ensures that when they reconnect, they get fresh routing/auth info
-	// Especially important if user was kicked due to backend changes
-	if ct.lookupCache != nil && event.Username != "" {
-		cacheKey := ct.name + ":" + event.Username
-		ct.lookupCache.Invalidate(cacheKey)
-		logger.Debug("Gossip tracker: Invalidated cache on kick", "name", ct.name, "cache_key", cacheKey, "account_id", event.AccountID)
-	}
+	kicked := ct.applyKick(event.AccountID, event.Username)
 
-	// Notify all sessions for this user
-	ct.kickSessionsMu.Lock()
-	defer ct.kickSessionsMu.Unlock()
-
-	sessions := ct.kickSessions[event.AccountID]
-	logger.Debug("Gossip tracker: Looking for sessions to kick", "name", ct.name, "account_id", event.AccountID, "registered_sessions", len(sessions), "total_registered_account_ids", len(ct.kickSessions))
-	for _, ch := range sessions {
-		select {
-		case <-ch:
-			// Already closed
-		default:
-			close(ch)
-		}
-	}
-
-	// Clear the sessions list
-	delete(ct.kickSessions, event.AccountID)
-
-	logger.Info("Gossip tracker: Notified sessions", "name", ct.name, "session_count", len(sessions), "account_id", event.AccountID)
+	logger.Info("Gossip tracker: Notified sessions", "name", ct.name, "session_count", kicked, "account_id", event.AccountID)
 }
 
-// broadcastRoutine periodically triggers broadcasts
-func (ct *ConnectionTracker) broadcastRoutine() {
-	ticker := time.NewTicker(100 * time.Millisecond)
+// heartbeatRoutine re-asserts that this instance is alive. Peers retire the
+// counts of an instance they stop hearing from (see cleanup), and an instance
+// holding only idle sessions produces no other gossip: push/pull would refresh
+// it eventually, but it pairs with one random peer per round, so in a cluster
+// of a dozen nodes a given peer is not reached reliably within the threshold.
+func (ct *ConnectionTracker) heartbeatRoutine() {
+	ticker := time.NewTicker(gossipHeartbeatInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			ct.queueMu.Lock()
-			hasEvents := len(ct.broadcastQueue) > 0
-			ct.queueMu.Unlock()
-
-			if hasEvents {
-				// Cluster manager will call GetBroadcasts()
-				logger.Debug("Gossip tracker: Broadcasting queued events", "name", ct.name, "count", len(ct.broadcastQueue))
-			}
+			ct.queueHeartbeat()
 
 		case <-ct.stopBroadcast:
 			return
 		}
 	}
+}
+
+// queueHeartbeat gossips proof that this instance is alive. It is a state
+// snapshot event with no state: the counts themselves travel over push/pull,
+// and a build that predates that still decodes this as "nothing to reconcile".
+func (ct *ConnectionTracker) queueHeartbeat() {
+	ct.queueEvent(ConnectionEvent{
+		Type:       ConnectionEventStateSnapshot,
+		Protocol:   ct.name,
+		Timestamp:  time.Now(),
+		NodeID:     ct.clusterManager.GetNodeID(),
+		InstanceID: ct.instanceID,
+	})
 }
 
 // cleanupRoutine periodically cleans up stale connection entries
@@ -977,7 +960,6 @@ func (ct *ConnectionTracker) cleanup() {
 
 	// 1) Purge instance maps for instances that appear offline/partitioned.
 	//    This is the only place where we remove non-local connection counts.
-	staleInstanceThreshold := 5 * time.Minute // generous for 60s snapshot interval + jitter
 	for instanceID, lastSeen := range ct.instanceLastSeen {
 		if now.Sub(lastSeen) <= staleInstanceThreshold {
 			continue
@@ -996,7 +978,10 @@ func (ct *ConnectionTracker) cleanup() {
 		delete(ct.instanceLastSeen, instanceID)
 	}
 
-	// 2) Remove invalid counts and empty maps.
+	// 2) Forget decrements whose register never arrived.
+	ct.deferred.prune(gossipDedupWindow)
+
+	// 3) Remove invalid counts and empty maps.
 	for accountID, info := range ct.connections {
 		if info.PerIPCountByInstance != nil {
 			for instanceID, perIPMap := range info.PerIPCountByInstance {
@@ -1013,14 +998,14 @@ func (ct *ConnectionTracker) cleanup() {
 			}
 		}
 
-		// 3) Remove user entries if no counts remain.
+		// 4) Remove user entries if no counts remain.
 		if info.GetTotalCount() <= 0 {
 			delete(ct.connections, accountID)
 			cleanedUsers++
 		}
 	}
 
-	// 4) Metrics.
+	// 5) Metrics.
 	totalUsers := len(ct.connections)
 	totalInstanceIDs := 0
 	totalIPs := 0
@@ -1040,9 +1025,7 @@ func (ct *ConnectionTracker) cleanup() {
 	metrics.ConnectionTrackerInstanceIDs.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(totalInstanceIDs))
 	metrics.ConnectionTrackerIPs.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(totalIPs))
 
-	ct.queueMu.Lock()
-	queueSize := len(ct.broadcastQueue)
-	ct.queueMu.Unlock()
+	queueSize := ct.queue.numQueued() + ct.criticalQueue.numQueued() + ct.heartbeatQueue.numQueued()
 	metrics.ConnectionTrackerBroadcastQueue.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(queueSize))
 
 	// Log memory usage stats every 10 cleanup cycles (~10 minutes with 1m cleanup interval)
@@ -1066,34 +1049,17 @@ func max(a, b int) int {
 	return b
 }
 
-// stateSnapshotRoutine periodically broadcasts full state for reconciliation
-func (ct *ConnectionTracker) stateSnapshotRoutine() {
-	ticker := time.NewTicker(stateSnapshotInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			ct.broadcastStateSnapshot()
-
-		case <-ct.stopStateSnapshot:
-			return
-		}
-	}
-}
-
-// broadcastStateSnapshot creates and broadcasts a full state snapshot
-func (ct *ConnectionTracker) broadcastStateSnapshot() {
+// stateSnapshot builds this instance's authoritative connection state.
+// Only this instance's per-IP counts are included: every other instance is
+// authoritative for its own.
+func (ct *ConnectionTracker) stateSnapshot() *ConnectionStateSnapshot {
 	ct.mu.RLock()
 	defer ct.mu.RUnlock()
-
-	if len(ct.connections) == 0 {
-		return // Nothing to broadcast
-	}
 
 	// Build snapshot of connections
 	snapshot := &ConnectionStateSnapshot{
 		InstanceID:  ct.instanceID,
+		Protocol:    ct.name,
 		Timestamp:   time.Now(),
 		Connections: make(map[int64]UserConnectionData, len(ct.connections)),
 	}
@@ -1122,21 +1088,37 @@ func (ct *ConnectionTracker) broadcastStateSnapshot() {
 		}
 	}
 
-	if len(snapshot.Connections) == 0 {
-		return // Nothing meaningful to broadcast
+	return snapshot
+}
+
+// localState encodes this instance's connection state for a memberlist
+// push/pull exchange. Full state is exchanged over push/pull rather than
+// gossip because it outgrows the gossip datagram budget at a few dozen
+// connections, while push/pull runs over TCP. An empty snapshot is still sent:
+// it tells peers to retire the connections this instance no longer holds.
+func (ct *ConnectionTracker) localState() []byte {
+	snapshot := ct.stateSnapshot()
+
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(snapshot); err != nil {
+		logger.Warn("Gossip tracker: Failed to encode state snapshot", "name", ct.name, "error", err)
+		return nil
 	}
 
-	logger.Info("GossipTracker: Broadcasting state snapshot", "protocol", ct.name,
-		"users", len(snapshot.Connections), "instance", ct.instanceID)
+	logger.Debug("GossipTracker: Sending state snapshot", "protocol", ct.name,
+		"users", len(snapshot.Connections), "instance", ct.instanceID, "bytes", buf.Len())
+	return buf.Bytes()
+}
 
-	// Queue the snapshot event
-	ct.queueEvent(ConnectionEvent{
-		Type:          ConnectionEventStateSnapshot,
-		Protocol:      ct.name, // CRITICAL: Set protocol so receiving trackers can filter
-		Timestamp:     snapshot.Timestamp,
-		InstanceID:    ct.instanceID,
-		StateSnapshot: snapshot,
-	})
+// mergeRemoteState applies a peer's connection state received over push/pull
+func (ct *ConnectionTracker) mergeRemoteState(data []byte) {
+	var snapshot ConnectionStateSnapshot
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&snapshot); err != nil {
+		logger.Warn("Gossip tracker: Failed to decode remote state", "name", ct.name, "error", err)
+		return
+	}
+
+	ct.reconcileState(&snapshot)
 }
 
 // reconcileState merges a remote state snapshot with local state
@@ -1151,15 +1133,31 @@ func (ct *ConnectionTracker) reconcileState(snapshot *ConnectionStateSnapshot) {
 		return
 	}
 
+	// Push/pull hands every connection-state payload to every connection
+	// tracker on this node, because the name it was registered under is only
+	// unique on the node that produced it. The protocol inside the payload is
+	// what says whose state it is; a snapshot that does not name one comes from
+	// a build that predates the field and is taken as addressed to us.
+	if snapshot.Protocol != "" && snapshot.Protocol != ct.name {
+		return
+	}
+
 	// Check if snapshot is too old (prevent stale reconciliation)
 	age := time.Since(snapshot.Timestamp)
-	if age > 5*time.Minute {
+	if age > staleEventThreshold {
 		logger.Debug("Gossip tracker: Ignoring stale state snapshot", "name", ct.name, "instance", snapshot.InstanceID, "age", age)
 		return
 	}
 
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
+
+	// Receiving a snapshot is proof the instance is alive, whether it arrived
+	// over gossip or push/pull.
+	if ct.instanceLastSeen == nil {
+		ct.instanceLastSeen = make(map[string]time.Time)
+	}
+	ct.instanceLastSeen[snapshot.InstanceID] = time.Now()
 
 	reconciledCount := 0
 	addedCount := 0
@@ -1243,9 +1241,6 @@ func (ct *ConnectionTracker) Stop() {
 	ct.stopOnce.Do(func() {
 		close(ct.stopBroadcast)
 		close(ct.stopCleanup)
-		if ct.clusterManager != nil {
-			close(ct.stopStateSnapshot)
-		}
 	})
 }
 
@@ -1272,9 +1267,7 @@ func (ct *ConnectionTracker) GetStats(ctx context.Context) map[string]any {
 	ct.mu.RUnlock()
 
 	// Get broadcast queue size
-	ct.queueMu.Lock()
-	queueSize := len(ct.broadcastQueue)
-	ct.queueMu.Unlock()
+	queueSize := ct.queue.numQueued() + ct.criticalQueue.numQueued() + ct.heartbeatQueue.numQueued()
 
 	stats := map[string]any{
 		"protocol":          ct.name,
@@ -1286,8 +1279,8 @@ func (ct *ConnectionTracker) GetStats(ctx context.Context) map[string]any {
 			"instance_ids":        totalInstanceIDs,
 			"tracked_ips":         totalIPs,
 			"broadcast_queue":     queueSize,
-			"broadcast_queue_max": 10000,
-			"queue_utilization":   float64(queueSize) / 10000.0 * 100,
+			"broadcast_queue_max": ct.maxEventQueueSize,
+			"queue_utilization":   float64(queueSize) / float64(ct.maxEventQueueSize) * 100,
 			"avg_instances_per_user": func() float64 {
 				if totalUsers > 0 {
 					return float64(totalInstanceIDs) / float64(totalUsers)

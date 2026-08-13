@@ -222,10 +222,13 @@ func (mw *maskingWriter) Write(p []byte) (n int, err error) {
 }
 
 type IMAPServer struct {
-	addr               string
-	name               string
-	rdb                *resilient.ResilientDatabase
-	hostname           string
+	addr     string
+	name     string
+	rdb      *resilient.ResilientDatabase
+	hostname string
+	// instanceID keys the upload lease (pending_uploads.instance_id). Distinct from
+	// hostname, which is the SMTP-visible name; see config.NodeIdentity.
+	instanceID         string
 	s3                 *resilient.ResilientS3Storage
 	server             *imapserver.Server
 	uploader           *uploader.UploadWorker
@@ -273,6 +276,10 @@ type IMAPServer struct {
 	// Session memory limit
 	sessionMemoryLimit int64
 
+	// Node-wide total of body-section bytes retained by sessions for <offset.size>
+	// chunk fetches (see body_section_cache.go).
+	bodySectionCacheBytes atomic.Int64
+
 	// PROXY protocol support
 	proxyReader *serverPkg.ProxyProtocolReader
 
@@ -289,7 +296,11 @@ type IMAPServer struct {
 	warmupWg            sync.WaitGroup // Tracks active warmup workers for graceful shutdown
 	warmupStopOnce      sync.Once      // Ensures warmup channel is closed only once
 	lastWarmupTimes     sync.Map       // map[int64]time.Time - tracks last warmup time per user
-	mailboxRecentUIDs   sync.Map       // map[int64]imap.UID - tracks the highest UID at last read-write SELECT per mailbox (server-wide, not per-session). Used to compute NumRecent across sessions per RFC 3501 §2.3.2. In-memory only: resets on restart.
+
+	// Highest UID at the last read-write SELECT per mailbox (server-wide, not
+	// per-session). Used to compute NumRecent across sessions per RFC 3501 §2.3.2.
+	// In-memory and bounded: entries are evicted on restart and under pressure.
+	mailboxRecentUIDs recentUIDTracker
 
 	// Client capability filtering
 	capFilters []ClientCapabilityFilter
@@ -318,6 +329,8 @@ type IMAPServer struct {
 }
 
 type IMAPServerOptions struct {
+	// InstanceID is the upload-lease key. Empty falls back to the hostname argument.
+	InstanceID                  string
 	Debug                       bool
 	TLS                         bool
 	TLSCertFile                 string
@@ -531,6 +544,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 	s := &IMAPServer{
 		hostname:                     hostname,
+		instanceID:                   imapInstanceIDOrHostname(options.InstanceID, hostname),
 		name:                         name,
 		appCtx:                       appCtx,
 		addr:                         imapAddr,
@@ -1851,4 +1865,13 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 	}
 
 	return accountID, nil
+}
+
+// imapInstanceIDOrHostname resolves the upload-lease identity, defaulting to the
+// SMTP-visible hostname so a caller that predates the split stays self-consistent.
+func imapInstanceIDOrHostname(instanceID, hostname string) string {
+	if instanceID != "" {
+		return instanceID
+	}
+	return hostname
 }

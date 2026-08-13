@@ -12,6 +12,7 @@ import (
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/server/idgen"
 )
 
 // AffinityEventType represents the type of affinity event
@@ -28,9 +29,13 @@ const (
 	AffinityEventDelete AffinityEventType = "AFFINITY_DELETE"
 )
 
+// maxAffinityEventQueueSize bounds the outgoing gossip queue
+const maxAffinityEventQueueSize = 5000
+
 // AffinityEvent represents a cluster-wide affinity event
 type AffinityEvent struct {
 	Type       AffinityEventType `json:"type"`
+	EventID    string            `json:"event_id"` // Unique per event, for duplicate suppression
 	Username   string            `json:"username"`
 	Backend    string            `json:"backend"`     // New backend address
 	OldBackend string            `json:"old_backend"` // Previous backend (for UPDATE events)
@@ -72,14 +77,20 @@ type AffinityManager struct {
 	defaultTTL      time.Duration
 	cleanupInterval time.Duration
 
-	// Broadcast queue for outgoing events
-	broadcastQueue []AffinityEvent
-	queueMu        sync.Mutex
+	// Outgoing gossip
+	queue *gossipQueue
+
+	// Duplicate suppression for received events
+	dedup gossipDedup
+
+	// When each key was last deleted, so that a SET delivered after the DELETE
+	// that removes it is recognised as the older event. Affinity has no
+	// push/pull provider, so a resurrected entry would never be repaired.
+	tombstones gossipTombstones
 
 	// Shutdown
-	stopCleanup   chan struct{}
-	stopBroadcast chan struct{}
-	wg            sync.WaitGroup // Tracks pending async goroutines
+	stopCleanup chan struct{}
+	wg          sync.WaitGroup // Tracks pending async goroutines
 
 	// Cleanup counter for periodic memory reporting
 	cleanupCounter uint64
@@ -105,9 +116,8 @@ func NewAffinityManager(clusterMgr *cluster.Manager, enabled bool, ttl, cleanupI
 		enabled:         enabled,
 		defaultTTL:      ttl,
 		cleanupInterval: cleanupInterval,
-		broadcastQueue:  make([]AffinityEvent, 0, 100),
+		queue:           newGossipQueue("affinity", clusterMgr, maxAffinityEventQueueSize),
 		stopCleanup:     make(chan struct{}),
-		stopBroadcast:   make(chan struct{}),
 	}
 
 	// Register with cluster manager
@@ -116,7 +126,6 @@ func NewAffinityManager(clusterMgr *cluster.Manager, enabled bool, ttl, cleanupI
 
 	// Start background routines
 	go am.cleanupRoutine()
-	go am.broadcastRoutine()
 
 	logger.Debug("Affinity: Initialized gossip affinity", "ttl", ttl, "cleanup", cleanupInterval)
 
@@ -353,9 +362,11 @@ func (am *AffinityManager) DeleteBackend(username, protocol string) {
 	defer am.mu.Unlock()
 
 	key := fmt.Sprintf("%s:%s", username, protocol)
+	now := time.Now()
 
 	// Remove from local map
 	delete(am.affinityMap, key)
+	am.tombstones.mark(key, now)
 
 	logger.Debug("Affinity: Deleted affinity", "user", username, "protocol", protocol)
 
@@ -364,7 +375,7 @@ func (am *AffinityManager) DeleteBackend(username, protocol string) {
 		Type:      AffinityEventDelete,
 		Username:  username,
 		Protocol:  protocol,
-		Timestamp: time.Now(),
+		Timestamp: now,
 		NodeID:    am.clusterManager.GetNodeID(),
 	})
 
@@ -372,58 +383,26 @@ func (am *AffinityManager) DeleteBackend(username, protocol string) {
 	am.persistDeleteAsync(username, protocol)
 }
 
-// queueEvent adds an event to the broadcast queue
+// queueEvent encodes an event and hands it to the gossip queue
 func (am *AffinityManager) queueEvent(event AffinityEvent) {
-	am.queueMu.Lock()
-	defer am.queueMu.Unlock()
-
-	// Enforce reasonable size limit to prevent unbounded growth
-	const maxQueueSize = 5000
-	if len(am.broadcastQueue) >= maxQueueSize {
-		// Drop oldest 10% of events when queue is full
-		dropCount := maxQueueSize / 10
-		logger.Warn("Affinity manager: Broadcast queue overflow - dropping oldest events",
-			"current", len(am.broadcastQueue), "max", maxQueueSize, "dropping", dropCount)
-		am.broadcastQueue = am.broadcastQueue[dropCount:]
+	if event.EventID == "" {
+		event.EventID = idgen.New()
 	}
 
-	am.broadcastQueue = append(am.broadcastQueue, event)
+	encoded, err := encodeAffinityEvent(event)
+	if err != nil {
+		logger.Warn("Affinity: Failed to encode affinity event", "type", event.Type, "error", err)
+		return
+	}
+
+	am.queue.enqueue(encoded)
 }
 
-// GetBroadcasts returns events to broadcast (called by cluster manager)
+// GetBroadcasts returns events to broadcast (called by cluster manager).
+// memberlist calls this once per gossip target, so an event stays queued until
+// it has been transmitted often enough to have reached the cluster.
 func (am *AffinityManager) GetBroadcasts(overhead, limit int) [][]byte {
-	am.queueMu.Lock()
-	defer am.queueMu.Unlock()
-
-	if len(am.broadcastQueue) == 0 {
-		return nil
-	}
-
-	broadcasts := make([][]byte, 0, len(am.broadcastQueue))
-	totalSize := 0
-
-	for i := 0; i < len(am.broadcastQueue); i++ {
-		encoded, err := encodeAffinityEvent(am.broadcastQueue[i])
-		if err != nil {
-			logger.Warn("Affinity: Failed to encode affinity event", "error", err)
-			continue
-		}
-
-		// Check if adding this message would exceed the limit
-		msgSize := overhead + len(encoded)
-		if totalSize+msgSize > limit && len(broadcasts) > 0 {
-			// Keep remaining events for next broadcast
-			am.broadcastQueue = am.broadcastQueue[i:]
-			return broadcasts
-		}
-
-		broadcasts = append(broadcasts, encoded)
-		totalSize += msgSize
-	}
-
-	// All events broadcasted, clear queue
-	am.broadcastQueue = am.broadcastQueue[:0]
-	return broadcasts
+	return am.queue.GetBroadcasts(overhead, limit)
 }
 
 // HandleClusterEvent processes an affinity event from another node
@@ -444,8 +423,15 @@ func (am *AffinityManager) HandleClusterEvent(data []byte) {
 
 	// Check if event is too old (prevent replays after network partition)
 	age := time.Since(event.Timestamp)
-	if age > 5*time.Minute {
+	if age > staleEventThreshold {
 		logger.Debug("Affinity: Ignoring stale event", "node_id", event.NodeID, "age", age)
+		return
+	}
+
+	// Gossip delivery is at-least-once: applying a retransmitted copy costs a
+	// redundant write-through to the persistent store on every one.
+	if am.dedup.seenBefore(event.EventID) {
+		logger.Debug("Affinity: Ignoring duplicate event", "type", event.Type, "event_id", event.EventID)
 		return
 	}
 
@@ -468,6 +454,13 @@ func (am *AffinityManager) handleAffinitySet(event AffinityEvent) {
 
 	key := fmt.Sprintf("%s:%s", event.Username, event.Protocol)
 
+	// A delete for this key may have been delivered first, in which case this
+	// SET is the older event and applying it would resurrect the affinity.
+	if am.tombstones.removedSince(key, event.Timestamp) {
+		logger.Debug("Affinity: Ignoring SET superseded by a delete", "user", event.Username, "node", event.NodeID)
+		return
+	}
+
 	// Check if we already have affinity for this user
 	existing, exists := am.affinityMap[key]
 	if exists {
@@ -476,6 +469,9 @@ func (am *AffinityManager) handleAffinitySet(event AffinityEvent) {
 			logger.Info("Affinity: Ignoring older SET", "user", event.Username, "node", event.NodeID,
 				"existing_backend", existing.Backend, "existing_node", existing.NodeID, "event_backend", event.Backend)
 			return
+		}
+		if existing.Backend == event.Backend && existing.AssignedAt.Equal(event.Timestamp) {
+			return // Already applied; nothing to write through
 		}
 		logger.Info("Affinity: Overwriting existing affinity", "user", event.Username,
 			"old_backend", existing.Backend, "new_backend", event.Backend,
@@ -505,6 +501,13 @@ func (am *AffinityManager) handleAffinityUpdate(event AffinityEvent) {
 
 	key := fmt.Sprintf("%s:%s", event.Username, event.Protocol)
 
+	// A delete for this key may have been delivered first, in which case this
+	// UPDATE is the older event and applying it would resurrect the affinity.
+	if am.tombstones.removedSince(key, event.Timestamp) {
+		logger.Debug("Affinity: Ignoring UPDATE superseded by a delete", "user", event.Username, "from_node", event.NodeID)
+		return
+	}
+
 	// Check if we have existing affinity
 	existing, exists := am.affinityMap[key]
 	if exists {
@@ -512,6 +515,9 @@ func (am *AffinityManager) handleAffinityUpdate(event AffinityEvent) {
 		if existing.AssignedAt.After(event.Timestamp) {
 			logger.Debug("Affinity: Ignoring older UPDATE", "user", event.Username, "from_node", event.NodeID)
 			return
+		}
+		if existing.Backend == event.Backend && existing.AssignedAt.Equal(event.Timestamp) {
+			return // Already applied; nothing to write through
 		}
 
 		logger.Info("Affinity: Received cluster update", "user", event.Username,
@@ -541,13 +547,26 @@ func (am *AffinityManager) handleAffinityDelete(event AffinityEvent) {
 
 	key := fmt.Sprintf("%s:%s", event.Username, event.Protocol)
 
-	if _, exists := am.affinityMap[key]; exists {
-		delete(am.affinityMap, key)
-		logger.Debug("Affinity: Applied cluster delete", "user", event.Username, "protocol", event.Protocol, "from_node", event.NodeID)
+	// Record the removal before deciding whether it applies here: a SET for
+	// this key delivered after this event is the older of the two, whether or
+	// not we currently hold an entry to remove.
+	am.tombstones.mark(key, event.Timestamp)
 
-		// Persist deletion to disk
-		am.persistDeleteAsync(event.Username, event.Protocol)
+	existing, exists := am.affinityMap[key]
+	if !exists {
+		return
 	}
+	if existing.AssignedAt.After(event.Timestamp) {
+		logger.Debug("Affinity: Ignoring delete older than the affinity it removes",
+			"user", event.Username, "protocol", event.Protocol, "from_node", event.NodeID)
+		return
+	}
+
+	delete(am.affinityMap, key)
+	logger.Debug("Affinity: Applied cluster delete", "user", event.Username, "protocol", event.Protocol, "from_node", event.NodeID)
+
+	// Persist deletion to disk
+	am.persistDeleteAsync(event.Username, event.Protocol)
 }
 
 // cleanupRoutine periodically removes expired affinities
@@ -598,9 +617,7 @@ func (am *AffinityManager) cleanup() {
 	}
 
 	// Get broadcast queue size for memory reporting and metrics
-	am.queueMu.Lock()
-	queueSize := len(am.broadcastQueue)
-	am.queueMu.Unlock()
+	queueSize := am.queue.numQueued()
 
 	// Update Prometheus metrics every cleanup cycle
 	metrics.AffinityManagerEntries.Set(float64(len(am.affinityMap)))
@@ -612,7 +629,7 @@ func (am *AffinityManager) cleanup() {
 		logger.Info("Affinity manager stats",
 			"total_entries", len(am.affinityMap),
 			"broadcast_queue_size", queueSize,
-			"broadcast_queue_limit", 5000,
+			"broadcast_queue_limit", maxAffinityEventQueueSize,
 			"removed_this_cycle", removed)
 	}
 }
@@ -624,36 +641,12 @@ func (am *AffinityManager) GetAffinityCount() int {
 	return len(am.affinityMap)
 }
 
-// broadcastRoutine periodically triggers broadcasts
-func (am *AffinityManager) broadcastRoutine() {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			// Trigger broadcast by checking queue
-			am.queueMu.Lock()
-			queuedEvents := len(am.broadcastQueue)
-			am.queueMu.Unlock()
-
-			if queuedEvents > 0 {
-				logger.Debug("Affinity: Triggering broadcast", "queued_events", queuedEvents)
-			}
-
-		case <-am.stopBroadcast:
-			return
-		}
-	}
-}
-
 // Stop stops the affinity manager and closes the persistent store
 func (am *AffinityManager) Stop() {
 	if am == nil {
 		return
 	}
 	close(am.stopCleanup)
-	close(am.stopBroadcast)
 
 	// Wait for any pending async writes to finish
 	am.wg.Wait()
@@ -682,9 +675,7 @@ func (am *AffinityManager) GetStats(ctx context.Context) map[string]any {
 	am.mu.RUnlock()
 
 	// Get broadcast queue size
-	am.queueMu.Lock()
-	queueSize := len(am.broadcastQueue)
-	am.queueMu.Unlock()
+	queueSize := am.queue.numQueued()
 
 	stats := map[string]any{
 		"enabled":          am.enabled,

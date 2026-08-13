@@ -47,7 +47,10 @@ const (
 // safeExtractBodySection wraps imapserver.ExtractBodySection with panic recovery.
 // For BODY[] requests on malformed messages, returns the full body data.
 // This follows the email server principle: store and return what you have, let the client handle parsing.
-func safeExtractBodySection(bodyData []byte, section *imap.FetchItemBodySection) []byte {
+//
+// The second result is false when the returned slice is bodyData itself rather than a
+// fresh buffer, so the caller neither charges nor retains it a second time.
+func safeExtractBodySection(bodyData []byte, section *imap.FetchItemBodySection) (content []byte, copied bool) {
 	// Capture panics from the MIME parser
 	defer func() {
 		if recover() != nil {
@@ -62,10 +65,38 @@ func safeExtractBodySection(bodyData []byte, section *imap.FetchItemBodySection)
 	// it means MIME parsing failed silently. Return the raw body so clients can see the content.
 	// For other sections (BODY[TEXT], BODY[1], etc.), empty is valid (part doesn't exist).
 	if len(result) == 0 && len(section.Part) == 0 && section.Specifier == imap.PartSpecifierNone && len(bodyData) > 0 {
-		return bodyData
+		return bodyData, false
 	}
 
-	return result
+	return result, true
+}
+
+// sectionWithoutPartial returns the section with its <offset.size> slice removed, so the
+// whole section is extracted once and the slice applied afterwards.
+func sectionWithoutPartial(section *imap.FetchItemBodySection) *imap.FetchItemBodySection {
+	if section.Partial == nil {
+		return section
+	}
+	full := *section
+	full.Partial = nil
+	return &full
+}
+
+// applyPartial slices out the client's <offset.size> request, mirroring what
+// imapserver.ExtractBodySection does with a Partial. Offset and Size come off the wire,
+// so the end bound also has to survive an addition that wraps.
+func applyPartial(b []byte, partial *imap.SectionPartial) []byte {
+	if partial == nil {
+		return b
+	}
+	if partial.Offset < 0 || partial.Offset > int64(len(b)) {
+		return nil
+	}
+	end := partial.Offset + partial.Size
+	if end < partial.Offset || end > int64(len(b)) {
+		end = int64(len(b))
+	}
+	return b[partial.Offset:end]
 }
 
 // safeExtractBinarySection wraps imapserver.ExtractBinarySection with panic recovery.
@@ -583,12 +614,20 @@ func (s *IMAPSession) handleBinarySections(ctx context.Context, w *imapserver.Fe
 
 	for _, section := range options.BinarySection {
 		var buf []byte
+		var charged int64
 		if *bodyData != nil {
 			buf = safeExtractBinarySection(*bodyData, section)
+			var ok bool
+			if charged, ok = s.chargeSectionCopy(len(buf)); !ok {
+				return s.sectionMemoryUnavailable(msg.UID, len(buf))
+			}
 		}
 		wc := w.WriteBinarySection(section, int64(len(buf)))
 		_, writeErr := wc.Write(buf)
 		closeErr := wc.Close()
+		if charged > 0 {
+			s.memTracker.Free(charged)
+		}
 		if writeErr != nil {
 			return writeErr
 		}
@@ -620,9 +659,27 @@ func (s *IMAPSession) handleBinarySectionSize(ctx context.Context, w *imapserver
 	return nil
 }
 
-func (s *IMAPSession) handleBodySections(ctx context.Context, w *imapserver.FetchResponseWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
+// bodySectionWriter is the part of *imapserver.FetchResponseWriter that the body
+// section handler uses.
+type bodySectionWriter interface {
+	WriteBodySection(section *imap.FetchItemBodySection, size int64) io.WriteCloser
+}
+
+func (s *IMAPSession) handleBodySections(ctx context.Context, w bodySectionWriter, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) error {
 	for _, section := range options.BodySection {
-		var sectionContent []byte
+		// Sequential <offset.size> chunking of one section: answer from the section this
+		// session already extracted instead of reloading and re-extracting the message
+		// for every chunk.
+		var cacheKey string
+		if section.Partial != nil {
+			cacheKey = bodySectionCacheKey(msg.ContentHash, section)
+			if retained := s.cachedBodySection(cacheKey); retained != nil {
+				if err := writeBodySectionData(w, section, applyPartial(retained, section.Partial)); err != nil {
+					return err
+				}
+				continue
+			}
+		}
 
 		if loadErr := s.ensureBodyDataLoaded(ctx, msg, bodyData, bodyDataFetched); loadErr != nil {
 			// Transient: the body is staged for upload but not yet retrievable from
@@ -639,30 +696,84 @@ func (s *IMAPSession) handleBodySections(ctx context.Context, w *imapserver.Fetc
 			s.WarnLog("failed to load message body, returning empty body section", "uid", msg.UID, "error", loadErr)
 		}
 
+		var sectionContent []byte
+		var charged int64
 		if *bodyData != nil { // Only extract if bodyData was successfully loaded
 			// Extract section. If MIME parsing fails/panics, safeExtractBodySection handles it gracefully.
 			// We return whatever the extractor gives us - email servers should be transparent conduits.
-			sectionContent = safeExtractBodySection(*bodyData, section)
+			// The whole section is extracted even for a chunk request, so the chunks that
+			// follow can be served from it.
+			full, copied := safeExtractBodySection(*bodyData, sectionWithoutPartial(section))
+			if copied {
+				var ok bool
+				if charged, ok = s.chargeSectionCopy(len(full)); !ok {
+					return s.sectionMemoryUnavailable(msg.UID, len(full))
+				}
+			}
+			sectionContent = applyPartial(full, section.Partial)
+			if copied && section.Partial != nil && s.retainBodySection(cacheKey, full) {
+				charged = 0 // the retained section carries the charge now
+			}
 		} else {
 			s.DebugLog("body data is nil, returning empty", "uid", msg.UID)
 			// sectionContent remains nil, will be set to []byte{} below
 		}
 
-		if sectionContent == nil { // Ensure not nil for WriteBodySection
-			sectionContent = []byte{}
+		err := writeBodySectionData(w, section, sectionContent)
+		if charged > 0 {
+			s.memTracker.Free(charged)
 		}
-
-		wc := w.WriteBodySection(section, int64(len(sectionContent))) // section is *FetchItemBodySection
-		_, writeErr := wc.Write(sectionContent)
-		closeErr := wc.Close()
-		if writeErr != nil {
-			return writeErr
-		}
-		if closeErr != nil {
-			return closeErr
+		if err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// writeBodySectionData writes one BODY[...] data item.
+func writeBodySectionData(w bodySectionWriter, section *imap.FetchItemBodySection, content []byte) error {
+	if content == nil { // Ensure not nil for WriteBodySection
+		content = []byte{}
+	}
+	wc := w.WriteBodySection(section, int64(len(content))) // section is *FetchItemBodySection
+	_, writeErr := wc.Write(content)
+	closeErr := wc.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
+// chargeSectionCopy accounts the extractor's copy of a section against the session
+// budget for as long as the copy is held: the copy is a second full-size buffer next to
+// the message body it was extracted from, so a budget that ignores it under-reports the
+// real peak by roughly half. It returns the bytes charged (0 when there is no tracker)
+// and false when the budget cannot take the copy.
+func (s *IMAPSession) chargeSectionCopy(n int) (int64, bool) {
+	if s.memTracker == nil || n <= 0 {
+		return 0, true
+	}
+	if !s.memoryAvailable(int64(n)) || s.memTracker.Allocate(int64(n)) != nil {
+		return 0, false
+	}
+	return int64(n), true
+}
+
+// sectionMemoryUnavailable answers a section the session budget cannot hold with
+// NO [UNAVAILABLE] rather than an empty literal: an empty body section is
+// indistinguishable from a genuinely empty message to the client, which may act on it
+// destructively (see errBodyTransientlyUnavailable).
+func (s *IMAPSession) sectionMemoryUnavailable(uid imap.UID, n int) *imap.Error {
+	s.WarnLog("session memory limit exceeded serving a message section", "uid", uid, "bytes", n,
+		"limit", s.memTracker.MaxAllowed())
+	metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+	imapErr := &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeUnavailable,
+		Text: "Message too large for the session memory limit",
+	}
+	metrics.CommandsTotal.WithLabelValues("imap", "FETCH", commandStatus(imapErr)).Inc()
+	return imapErr
 }
 
 // transientBodyUnavailable records the event and returns the IMAP error used when a
@@ -688,7 +799,7 @@ func (s *IMAPSession) getMessageBody(ctx context.Context, msg *db.Message) ([]by
 	// into memory. The post-read Allocate() below can only detect the overrun once the
 	// body is already resident — too late to prevent the OOM. msg.Size is the stored
 	// metadata size, so this bounds the single allocation. (security-audit M13)
-	if s.memTracker != nil && msg.Size > 0 && !s.memTracker.CanAllocate(int64(msg.Size)) {
+	if msg.Size > 0 && !s.memoryAvailable(int64(msg.Size)) {
 		metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
 		return nil, fmt.Errorf("session memory limit exceeded: message size %d bytes exceeds available budget", msg.Size)
 	}

@@ -108,6 +108,10 @@ func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval ti
 	return cache
 }
 
+// verifyPassword is a seam so tests can drive the verification step; production
+// always uses db.VerifyPassword (bcrypt/SSHA512).
+var verifyPassword = db.VerifyPassword
+
 // HashPassword creates a SHA-256 hash of the password for cache comparison.
 // This is used to detect password changes without storing plaintext passwords in the cache.
 func HashPassword(password string) string {
@@ -131,10 +135,20 @@ func (e *CacheEntry) IsOld(duration time.Duration) bool {
 //
 // Uses password-aware revalidation to detect password changes while preventing rapid brute force attempts
 func (c *LookupCache) Authenticate(address, password string) (accountID int64, found bool, err error) {
+	// Copy the entry and release the lock before doing any expensive work, the same
+	// way Get/GetOrFetch do. Password verification below is bcrypt (~180ms at cost
+	// 12); holding the read lock across it makes every cache write wait it out, and
+	// Go's RWMutex parks new readers behind a waiting writer - convoying the whole
+	// auth path on exactly the reconnect storm this cache exists to absorb.
 	c.mu.RLock()
-	entry, exists := c.entries[address]
+	cached, exists := c.entries[address]
+	var entry CacheEntry
+	if exists {
+		entry = *cached
+	}
+	c.mu.RUnlock()
+
 	if !exists {
-		c.mu.RUnlock()
 		atomic.AddUint64(&c.misses, 1)
 		metrics.LookupCacheMissesTotal.Inc()
 		return 0, false, nil
@@ -142,7 +156,6 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 
 	// Check if expired
 	if time.Now().After(entry.ExpiresAt) {
-		c.mu.RUnlock()
 		atomic.AddUint64(&c.misses, 1)
 		metrics.LookupCacheMissesTotal.Inc()
 		return 0, false, nil
@@ -162,7 +175,6 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 
 	// Handle negative cache entries (failed authentication)
 	if entry.Result != AuthSuccess {
-		c.mu.RUnlock()
 		// ALWAYS allow revalidation for negative entries, regardless of password match
 		// This is critical because:
 		// 1. User might not have existed when first cached, but could be created later
@@ -178,27 +190,23 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 		// Same password - check if entry is old enough to require revalidation
 		if entry.IsOld(c.positiveRevalidationWindow) {
 			// Entry is old - revalidate with database to detect password changes
-			c.mu.RUnlock()
 			logger.Debug("Auth cache: positive entry revalidation needed (entry too old)", "address", address, "age", time.Since(entry.CreatedAt))
 			return 0, false, nil
 		}
 
 		// Entry is fresh - verify against cached bcrypt hash and return success
-		if err := db.VerifyPassword(entry.HashedPassword, password); err != nil {
+		if err := verifyPassword(entry.HashedPassword, password); err != nil {
 			// Bcrypt verification failed even though password hash matched
 			// This shouldn't happen, but handle it by invalidating the cache
-			c.mu.RUnlock()
 			c.Invalidate(address)
 			return 0, false, nil
 		}
-		c.mu.RUnlock()
 		return entry.AccountID, true, nil
 	} else {
 		// Different password on positive entry - ALWAYS allow revalidation
 		// User might have changed their password, or they're trying a wrong password.
 		// Either way, we need to check with the database to verify.
 		// Brute force protection is handled by protocol-level rate limiting, not by the cache.
-		c.mu.RUnlock()
 		logger.Debug("Auth cache: positive entry revalidation allowed (different password)", "address", address, "age", time.Since(entry.CreatedAt))
 		return 0, false, nil
 	}

@@ -23,6 +23,10 @@ var idleKeepaliveInterval = 2 * time.Minute
 func (s *IMAPSession) Idle(ctx context.Context, w *imapserver.UpdateWriter, done <-chan struct{}) error {
 	s.InfoLog("client entered IDLE mode")
 
+	// A client that goes idle is done chunking through a body section; nothing retained
+	// for the next chunk should survive into a wait that can last half an hour.
+	s.releaseBodySectionCache()
+
 	metrics.IMAPIdleConnections.Inc()
 	defer metrics.IMAPIdleConnections.Dec()
 

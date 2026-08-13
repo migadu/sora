@@ -110,6 +110,12 @@ type ManageSieveServer struct {
 }
 
 type ManageSieveServerOptions struct {
+	// AuthLimiterOverride, when non-nil, is used as the session auth limiter
+	// instead of constructing one from AuthRateLimit. Dependency-injection seam
+	// (nil in all production paths); used by tests to observe what the auth paths
+	// record, which is otherwise unobservable from the wire because blocked and
+	// failed replies are deliberately byte-identical.
+	AuthLimiterOverride         serverPkg.AuthLimiter
 	InsecureAuth                bool
 	Debug                       bool
 	TLS                         bool
@@ -183,8 +189,14 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
-	serverPkg.RegisterRateLimiter("managesieve", name, authLimiter)
+	// A non-nil AuthLimiterOverride (tests only) replaces the real limiter; the
+	// monitoring registry only accepts the concrete type, so skip it in that case.
+	var authLimiter serverPkg.AuthLimiter = options.AuthLimiterOverride
+	if authLimiter == nil {
+		concrete := serverPkg.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
+		serverPkg.RegisterRateLimiter("managesieve", name, concrete)
+		authLimiter = concrete
+	}
 
 	// Initialize the master SASL network gate. Fail closed on a misconfigured
 	// allow-list rather than silently disabling the gate.

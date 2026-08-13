@@ -210,20 +210,40 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 
 	if !columnExists {
 		logger.Info("Migrating SQLite database: adding s3_uploaded columns")
-		_, err = sqliteDB.Exec(`ALTER TABLE messages ADD COLUMN s3_uploaded INTEGER DEFAULT 1`)
+		// DEFAULT 0 must match the fresh schema above: a column default added here is
+		// permanent for this database file, and scanMaildir inserts newly discovered
+		// files without naming s3_uploaded. A default of 1 would make every file found
+		// by a later scan born "already uploaded", invisible to the import (which
+		// selects WHERE s3_uploaded = 0) and to orphan recovery, which runs before the
+		// scan. Pre-existing rows are marked below instead, once.
+		// All three statements commit together. Splitting the column default from the
+		// backfill means a crash between them is not resumable: the next run sees the
+		// column present, skips this whole block, and every legacy row stays at the new
+		// default of 0 forever - re-importing the entire maildir on every subsequent run.
+		// SQLite runs DDL inside transactions, so one transaction covers the lot.
+		migrationTx, err := sqliteDB.Begin()
 		if err != nil {
+			return nil, fmt.Errorf("failed to begin SQLite migration: %w", err)
+		}
+		defer migrationTx.Rollback()
+
+		if _, err = migrationTx.Exec(`ALTER TABLE messages ADD COLUMN s3_uploaded INTEGER DEFAULT 0`); err != nil {
 			return nil, fmt.Errorf("failed to add s3_uploaded column: %w", err)
 		}
 
-		_, err = sqliteDB.Exec(`ALTER TABLE messages ADD COLUMN s3_uploaded_at TIMESTAMP`)
-		if err != nil {
+		if _, err = migrationTx.Exec(`ALTER TABLE messages ADD COLUMN s3_uploaded_at TIMESTAMP`); err != nil {
 			return nil, fmt.Errorf("failed to add s3_uploaded_at column: %w", err)
 		}
 
-		// Mark all existing messages as uploaded (they were in old DB, so they're on S3)
-		_, err = sqliteDB.Exec(`UPDATE messages SET s3_uploaded_at = CURRENT_TIMESTAMP WHERE s3_uploaded_at IS NULL`)
-		if err != nil {
+		// Assume the rows that already existed are on S3. recoverOrphanedSQLiteState
+		// re-checks every one of them against PostgreSQL on this same run and resets
+		// the ones that never landed, so a wrong assumption here self-corrects.
+		if _, err = migrationTx.Exec(`UPDATE messages SET s3_uploaded = 1, s3_uploaded_at = CURRENT_TIMESTAMP`); err != nil {
 			return nil, fmt.Errorf("failed to mark existing messages as uploaded: %w", err)
+		}
+
+		if err = migrationTx.Commit(); err != nil {
+			return nil, fmt.Errorf("failed to commit SQLite migration: %w", err)
 		}
 
 		logger.Info("SQLite database migration completed successfully - all existing messages marked as uploaded")
@@ -294,6 +314,10 @@ func (i *Importer) Close() error {
 	return nil
 }
 
+// recoveryHashBatchSize is how many cached hashes are checked against
+// PostgreSQL per round trip during orphan recovery.
+const recoveryHashBatchSize = 500
+
 // recoverOrphanedSQLiteState checks for messages marked as uploaded in SQLite
 // but not actually present in PostgreSQL. This can happen if:
 // 1. PostgreSQL commit failed after SQLite update (rare but possible)
@@ -316,34 +340,49 @@ func (i *Importer) recoverOrphanedSQLiteState() error {
 		return fmt.Errorf("failed to get account: %w", err)
 	}
 
-	// Query SQLite for messages marked as uploaded
-	rows, err := i.sqliteDB.Query("SELECT hash FROM messages WHERE s3_uploaded = 1 LIMIT 1000")
+	// Query SQLite for ALL messages marked as uploaded. Any row left marked
+	// uploaded is skipped forever by incremental imports, so the check must not
+	// be bounded. The cursor is drained before touching PostgreSQL because the
+	// SQLite pool holds a single connection.
+	rows, err := i.sqliteDB.Query("SELECT hash FROM messages WHERE s3_uploaded = 1")
 	if err != nil {
 		return fmt.Errorf("failed to query SQLite: %w", err)
 	}
-	defer rows.Close()
 
-	var orphanedHashes []string
+	var uploadedHashes []string
 	for rows.Next() {
 		var hash string
 		if err := rows.Scan(&hash); err != nil {
 			continue
 		}
+		uploadedHashes = append(uploadedHashes, hash)
+	}
+	rows.Close() // CRITICAL: Close rows to release SQLite connection
 
-		// Check if this message exists in PostgreSQL
-		var exists bool
-		err = i.rdb.QueryRowWithRetry(i.ctx,
-			"SELECT EXISTS(SELECT 1 FROM messages WHERE account_id = $1 AND content_hash = $2 AND expunged_at IS NULL)",
-			accountID, hash).Scan(&exists)
+	// Check existence in PostgreSQL in batches (one round trip per batch)
+	var orphanedHashes []string
+	for start := 0; start < len(uploadedHashes); start += recoveryHashBatchSize {
+		end := start + recoveryHashBatchSize
+		if end > len(uploadedHashes) {
+			end = len(uploadedHashes)
+		}
+		chunk := uploadedHashes[start:end]
+
+		var missing []string
+		err = i.rdb.QueryRowWithRetry(i.ctx, `
+			SELECT COALESCE(ARRAY_AGG(h), '{}')
+			FROM UNNEST($2::text[]) AS h
+			WHERE NOT EXISTS (
+				SELECT 1 FROM messages
+				WHERE account_id = $1 AND content_hash = h AND expunged_at IS NULL
+			)`, accountID, chunk).Scan(&missing)
 
 		if err != nil {
-			logger.Warn("Failed to check message existence", "hash", hash[:12], "error", err)
+			logger.Warn("Failed to check message existence", "count", len(chunk), "error", err)
 			continue
 		}
 
-		if !exists {
-			orphanedHashes = append(orphanedHashes, hash)
-		}
+		orphanedHashes = append(orphanedHashes, missing...)
 	}
 
 	if len(orphanedHashes) > 0 {
@@ -364,7 +403,7 @@ func (i *Importer) recoverOrphanedSQLiteState() error {
 
 		for _, hash := range orphanedHashes {
 			if _, err := stmt.Exec(hash); err != nil {
-				logger.Warn("Failed to reset orphaned hash", "hash", hash[:12], "error", err)
+				logger.Warn("Failed to reset orphaned hash", "hash", shortHash(hash), "error", err)
 			}
 		}
 
@@ -845,7 +884,7 @@ func (i *Importer) performDryRun() error {
 		fmt.Printf("      Date: %s | Size: %s | Hash: %s\n",
 			dateStr,
 			formatImportSize(size),
-			hash[:12]+"...")
+			shortHash(hash)+"...")
 		fmt.Printf("      Action: %s: %s\n", action, reason)
 
 		// Show flags if preserve-flags is enabled
@@ -1790,7 +1829,7 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 
 // insertBatchToDB inserts all uploaded messages in a batch
 // It groups messages by mailbox and uses the highly-optimized InsertMessagesFromImporterBatchWithRetry
-func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
+func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, error) {
 	// Get user info once
 	address, err := server.NewAddress(i.email)
 	if err != nil {
@@ -1803,7 +1842,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 	}
 	user := server.NewUser(address, accountID)
 
-	var successHashes []string
+	var successHashes []markedMessage
 
 	// Group messages by mailbox to take advantage of batch inserts
 	type groupedMsg struct {
@@ -1854,7 +1893,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 
 	const maxBatchSize = 500
 
-	for _, group := range mailboxGroups {
+	for mailboxName, group := range mailboxGroups {
 		for idx := 0; idx < len(group); idx += maxBatchSize {
 			end := idx + maxBatchSize
 			if end > len(group) {
@@ -1886,7 +1925,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 							atomic.AddInt64(&i.failedMessages, 1)
 							continue
 						}
-						successHashes = append(successHashes, gm.hash)
+						successHashes = append(successHashes, markedMessage{hash: gm.hash, mailbox: mailboxName})
 					}
 					continue
 				}
@@ -1899,8 +1938,11 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 				continue
 			}
 
-			// Add successfully inserted hashes to successHashes
-			successHashes = append(successHashes, insertedHashesBatch...)
+			// Add successfully inserted hashes to successHashes, tagged with the mailbox
+			// this group belongs to so the cache row for this copy is the one marked.
+			for _, hash := range insertedHashesBatch {
+				successHashes = append(successHashes, markedMessage{hash: hash, mailbox: mailboxName})
+			}
 
 			// Calculate skipped messages (deduplicated by the database)
 			skipped := len(chunk) - len(insertedHashesBatch)
@@ -1915,7 +1957,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]string, error) {
 
 // insertBatchToDBWithTransaction inserts all uploaded messages in a SINGLE transaction
 // This is faster (20x) but less resilient - if one message fails, entire batch rolls back
-func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]string, error) {
+func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]markedMessage, error) {
 	// Get user info once
 	address, err := server.NewAddress(i.email)
 	if err != nil {
@@ -1928,7 +1970,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]str
 	}
 	user := server.NewUser(address, accountID)
 
-	var successHashes []string
+	var successHashes []markedMessage
 
 	// Begin a single transaction for the entire batch
 	tx, err := i.rdb.BeginTxWithRetry(i.ctx, pgx.TxOptions{})
@@ -1994,7 +2036,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]str
 			hash:      up.msg.hash,
 			mailboxID: mailbox.ID,
 		})
-		successHashes = append(successHashes, up.msg.hash)
+		successHashes = append(successHashes, markedMessage{hash: up.msg.hash, mailbox: up.msg.mailbox})
 	}
 
 	// Commit the PostgreSQL transaction first
@@ -2058,7 +2100,7 @@ func (i *Importer) rollbackBatchFromPostgreSQL(accountID int64, successList []st
 			}
 			// Real error - log but continue trying others
 			logger.Error("Failed to delete message during rollback compensation",
-				"hash", item.hash[:12], "mailbox_id", item.mailboxID, "error", err)
+				"hash", shortHash(item.hash), "mailbox_id", item.mailboxID, "error", err)
 			failedCount++
 			continue
 		}
@@ -2076,12 +2118,29 @@ func (i *Importer) rollbackBatchFromPostgreSQL(accountID int64, successList []st
 
 // markBatchInS QLite marks messages as uploaded in SQLite cache
 // Called AFTER PostgreSQL commit in batch mode
-func (i *Importer) markBatchInSQLite(hashes []string) error {
-	if len(hashes) == 0 {
+// shortHash abbreviates a content hash for logging. It is length-safe: these strings
+// reach the log from error paths, and a panic while reporting an error loses the error.
+func shortHash(hash string) string {
+	if len(hash) <= 12 {
+		return hash
+	}
+	return hash[:12]
+}
+
+// markedMessage identifies one cached row to mark imported. The SQLite cache is keyed
+// UNIQUE(hash, mailbox), so the mailbox is part of the identity: the same content can be
+// filed in several mailboxes and each copy needs its own PostgreSQL row.
+type markedMessage struct {
+	hash    string
+	mailbox string
+}
+
+func (i *Importer) markBatchInSQLite(marked []markedMessage) error {
+	if len(marked) == 0 {
 		return nil
 	}
 
-	logger.Info("Marking batch in SQLite", "count", len(hashes))
+	logger.Info("Marking batch in SQLite", "count", len(marked))
 
 	// Create a context with timeout to prevent hanging
 	ctx, cancel := context.WithTimeout(i.ctx, 30*time.Second)
@@ -2103,10 +2162,13 @@ func (i *Importer) markBatchInSQLite(hashes []string) error {
 
 		logger.Info("SQLite transaction started")
 
+		// Scoped to (hash, mailbox): s3_uploaded is what an incremental import filters
+		// on, so marking by hash alone would hide every other mailbox's copy of this
+		// content from the next run even though it was never imported.
 		stmt, err := tx.Prepare(`
 			UPDATE messages
 			SET s3_uploaded = 1, s3_uploaded_at = ?
-			WHERE hash = ?
+			WHERE hash = ? AND mailbox = ?
 		`)
 		if err != nil {
 			done <- result{err: fmt.Errorf("failed to prepare SQLite statement: %w", err)}
@@ -2117,13 +2179,14 @@ func (i *Importer) markBatchInSQLite(hashes []string) error {
 		logger.Info("SQLite statement prepared, executing updates")
 
 		now := time.Now()
-		for idx, hash := range hashes {
-			if _, err := stmt.Exec(now, hash); err != nil {
-				done <- result{err: fmt.Errorf("failed to update SQLite for hash %s: %w", hash[:12], err)}
+		for idx, m := range marked {
+			if _, err := stmt.Exec(now, m.hash, m.mailbox); err != nil {
+				done <- result{err: fmt.Errorf("failed to update SQLite for hash %s in %s: %w",
+					shortHash(m.hash), m.mailbox, err)}
 				return
 			}
 			if (idx+1)%5 == 0 {
-				logger.Info("SQLite update progress", "completed", idx+1, "total", len(hashes))
+				logger.Info("SQLite update progress", "completed", idx+1, "total", len(marked))
 			}
 		}
 
@@ -2167,7 +2230,7 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 	logger.Info("Starting DB insert phase", "count", len(uploaded))
 
 	// Phase 2: DB inserts (strategy depends on BatchTransactionMode flag)
-	var successHashes []string
+	var successHashes []markedMessage
 	var err error
 
 	if i.options.BatchTransactionMode {

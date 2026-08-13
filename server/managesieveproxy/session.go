@@ -236,13 +236,35 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		return consts.ErrAuthenticationFailed
 	}
 
+	// Rate-limit key for this attempt. Canonicalised from the submitted username so
+	// that the CanAttemptAuth* check and every RecordAuthAttempt* call below use the
+	// SAME key. Checking the raw string while recording a mix of raw username,
+	// base address and resolved email let an attacker vary the case or the +detail
+	// to sidestep Tier 1 entirely, and landed the recorded block on the canonical
+	// address of the victim.
+	//
+	// WithMaster, because this proxy also accepts the "user@domain.com@MASTERUSER"
+	// master form and validates the master password itself (see below). That form
+	// canonicalises to the TARGET's address, so keying on it charged an arbitrary
+	// account for an attempt that merely named it - a lockout primitive needing only
+	// the master USERNAME - and handed every master-password guess a fresh Tier-1
+	// bucket by varying the target, leaving the proxy's tenant-wide password unmetered.
+	// Decided here, from the raw identity, so check site and record sites cannot drift.
+	authKey := server.AuthRateLimitKeyWithMaster(username, s.server.masterUsername)
+
 	// Use configured remotelookup timeout instead of hardcoded value
 	authTimeout := s.server.connManager.GetRemoteLookupTimeout()
 	ctx, cancel := context.WithTimeout(s.ctx, authTimeout)
 	defer cancel()
 
 	// Apply progressive authentication delay BEFORE any other checks
-	remoteAddr := s.clientConn.RemoteAddr()
+	// Keyed on the REAL client IP, resolved exactly like the recording path
+	// (RecordAuthAttemptWithProxy -> GetConnectionIPs). clientConn.RemoteAddr() is
+	// the upstream load balancer whenever this proxy sits behind haproxy/nginx/NLB,
+	// and the load balancer never accumulates failures — so keying the delay on it
+	// meant the delay never fired in exactly the deployment proxies exist for.
+	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
+	remoteAddr := &server.StringAddr{Addr: realClientIP}
 	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-PROXY"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
@@ -319,7 +341,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					}
 
 					// Track successful authentication using resolved email
-					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, s.username, true)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
 					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "success").Inc()
 					if addr, err := server.NewAddress(s.username); err == nil {
 						metrics.TrackDomainConnection("managesieve_proxy", addr.Domain())
@@ -358,7 +380,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	}
 
 	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods
-	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, username); err != nil {
+	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey); err != nil {
 		// Check if this is a rate limit error
 		var rateLimitErr *server.RateLimitError
 		if errors.As(err, &rateLimitErr) {
@@ -396,7 +418,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			// Suffix matches master username - validate master password locally
 			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
 				// Wrong master password - fail immediately
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, parsedAddr.BaseAddress(), false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return consts.ErrAuthenticationFailed
 			}
@@ -445,7 +467,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			if errors.Is(err, proxy.ErrRemoteLookupInvalidResponse) {
 				// Invalid response from remotelookup (malformed 2xx) - this is a server bug, fail hard
 				s.WarnLog("remotelookup invalid response - server bug", "error", err)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return fmt.Errorf("remotelookup server error: invalid response")
 			}
@@ -462,7 +484,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				// These are service availability issues, not "user not found" cases
 				s.DebugLog("remotelookup transient error - service unavailable", "error", err)
 				metrics.RemoteLookupResult.WithLabelValues("managesieve", "transient_error_rejected").Inc()
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return fmt.Errorf("remotelookup service unavailable")
 			} else {
@@ -518,7 +540,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				}
 
 				// Use resolvedEmail for rate limiting (not submitted username with token)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, resolvedEmail, true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "success").Inc()
 
 				// For metrics, use resolvedEmail for accurate tracking
@@ -563,7 +585,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					})
 				}
 
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 
 				// Single consolidated log for authentication failure
@@ -586,7 +608,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				} else {
 					s.InfoLog("User not found in remotelookup, local lookup disabled - rejecting")
 					metrics.RemoteLookupResult.WithLabelValues("managesieve", "user_not_found_rejected").Inc()
-					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 					return consts.ErrAuthenticationFailed
 				}
@@ -625,7 +647,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				return server.ErrServerShuttingDown
 			}
 
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, address.BaseAddress(), false)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 			return fmt.Errorf("account not found: %w", err)
 		}
@@ -677,7 +699,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				s.InfoLog("authentication failed", "reason", reason, "cached", false, "method", "main_db")
 			}
 
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 			return fmt.Errorf("%w: %w", consts.ErrAuthenticationFailed, err)
 		}
@@ -685,8 +707,15 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 	s.accountID = accountID
 	s.isRemoteLookupAccount = false
+	// A session that reaches DetermineRoute with no routing info has the routing lookup
+	// run for it, which for a user the lookup 404'd moments ago is a second round trip to
+	// the same answer. A lookup-cache hit for this user rebuilds exactly this from the
+	// entry written below, so give the uncached login the same starting point.
+	s.routingInfo = &proxy.UserRoutingInfo{
+		AccountID: accountID,
+	}
 	s.username = address.BaseAddress() // Set username for backend impersonation (without +detail)
-	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, true)
+	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
 	metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "success").Inc()
 	metrics.TrackDomainConnection("managesieve_proxy", address.Domain())
 	metrics.TrackUserActivity("managesieve_proxy", address.FullAddress(), "connection", 1)
@@ -758,9 +787,10 @@ func (s *Session) connectToBackendAndAuth() error {
 	// Track which routing method was used for this connection.
 	metrics.ProxyRoutingMethod.WithLabelValues("managesieve", routeResult.RoutingMethod).Inc()
 
-	// Use configured backend connection timeout instead of hardcoded value
-	connectTimeout := s.server.connManager.GetConnectTimeout()
-	connectCtx, connectCancel := context.WithTimeout(s.ctx, connectTimeout)
+	// Budget for the whole connect-with-fallback, not for a single dial: connect_timeout
+	// alone would be spent by a black-holed preferred backend, leaving every round-robin
+	// fallback dial to fail instantly on an already-expired context.
+	connectCtx, connectCancel := context.WithTimeout(s.ctx, s.server.connManager.ConnectBudget())
 	defer connectCancel()
 
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())

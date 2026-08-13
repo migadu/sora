@@ -29,9 +29,24 @@ func (m *mockDatabase) ExpungeOldMessagesWithRetry(ctx context.Context, maxAge t
 	args := m.Called(ctx, maxAge)
 	return args.Get(0).(int64), args.Error(1)
 }
-func (m *mockDatabase) CleanupFailedUploadsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
+func (m *mockDatabase) CleanupFailedUploadsWithRetry(ctx context.Context, gracePeriod time.Duration, _ int, _ time.Duration) (int64, error) {
 	args := m.Called(ctx, gracePeriod)
 	return args.Get(0).(int64), args.Error(1)
+}
+
+// GetStrandedUploadInstancesWithRetry is reporting-only. Tests that care about the
+// report program it explicitly; the orchestration tests get an empty report without
+// having to declare an expectation for it.
+func (m *mockDatabase) GetStrandedUploadInstancesWithRetry(ctx context.Context, maxAttempts int, livenessThreshold time.Duration) ([]db.StrandedUploadInstance, error) {
+	for _, c := range m.ExpectedCalls {
+		if c.Method != "GetStrandedUploadInstancesWithRetry" {
+			continue
+		}
+		args := m.Called(ctx, maxAttempts, livenessThreshold)
+		instances, _ := args.Get(0).([]db.StrandedUploadInstance)
+		return instances, args.Error(1)
+	}
+	return nil, nil
 }
 func (m *mockDatabase) CleanupSoftDeletedAccountsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
 	args := m.Called(ctx, gracePeriod)
@@ -57,9 +72,13 @@ func (m *mockDatabase) GetUserScopedObjectsForCleanupWithRetry(ctx context.Conte
 	args := m.Called(ctx, gracePeriod, limit)
 	return args.Get(0).([]db.UserScopedObjectForCleanup), args.Error(1)
 }
-func (m *mockDatabase) ExecuteS3DeleteTxWithRetry(ctx context.Context, accountID int64, contentHash string, gracePeriod time.Duration, s3DeleteFunc func() error) (bool, error) {
-	args := m.Called(ctx, accountID, contentHash, gracePeriod, s3DeleteFunc)
-	return args.Bool(0), args.Error(1)
+func (m *mockDatabase) ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(orphans []db.UserScopedObjectForCleanup) error) error {
+	args := m.Called(ctx, objects, gracePeriod)
+	orphans, _ := args.Get(0).([]db.UserScopedObjectForCleanup)
+	if err := args.Error(1); err != nil {
+		return err
+	}
+	return fn(orphans)
 }
 func (m *mockDatabase) DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error) {
 	args := m.Called(ctx, objects)
@@ -103,9 +122,10 @@ func (m *mockS3) IsHealthy() bool {
 	return m.healthy
 }
 
-func (m *mockS3) DeleteWithRetry(ctx context.Context, key string) error {
-	args := m.Called(ctx, key)
-	return args.Error(0)
+func (m *mockS3) DeleteBulkWithRetry(ctx context.Context, keys []string) map[string]error {
+	args := m.Called(ctx, keys)
+	failures, _ := args.Get(0).(map[string]error)
+	return failures
 }
 
 type mockCache struct {
@@ -159,14 +179,13 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 	}
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, gracePeriod, db.BATCH_PURGE_SIZE).Return(userScopedCandidates, nil).Once()
 
-	// hash1: ExecuteS3DeleteTxWithRetry acquires lock, confirms orphan, deletes S3 → success
-	mockDB.On("ExecuteS3DeleteTxWithRetry", ctx, int64(0), "hash1", gracePeriod, mock.AnythingOfType("func() error")).
-		Return(true, nil).Once()
-
-	// hash2-not-found: ExecuteS3DeleteTxWithRetry acquires lock, confirms orphan, calls s3DeleteFunc → S3 returns 404
-	// → the real implementation catches 404 internally and returns (true, nil)
-	mockDB.On("ExecuteS3DeleteTxWithRetry", ctx, int64(0), "hash2-not-found", gracePeriod, mock.AnythingOfType("func() error")).
-		Return(true, nil).Once()
+	// Both candidates are still orphans under their advisory locks, and both bodies are
+	// removed in a single DeleteObjects request (a key that is already gone counts as
+	// deleted — DeleteObjects is idempotent).
+	mockDB.On("ExecuteWithLockedS3Orphans", ctx, userScopedCandidates, gracePeriod).
+		Return(userScopedCandidates, nil).Once()
+	mockS3.On("DeleteBulkWithRetry", ctx, []string{"example.com/user1/hash1", "example.com/user2/hash2-not-found"}).
+		Return(map[string]error(nil)).Once()
 
 	mockDB.On("DeleteExpungedMessagesByS3KeyPartsBatchWithRetry", ctx, userScopedCandidates).Return(int64(2), nil).Once()
 
@@ -269,9 +288,10 @@ func TestCleanupWorker_RunOnce_S3DeleteFails(t *testing.T) {
 	s3Err := errors.New("s3 is down")
 	candidates := []db.UserScopedObjectForCleanup{{ContentHash: "hash1", S3Domain: "d", S3Localpart: "l"}}
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return(candidates, nil).Once()
-	// ExecuteS3DeleteTxWithRetry returns the S3 error (not a 404, so not handled internally)
-	mockDB.On("ExecuteS3DeleteTxWithRetry", ctx, mock.Anything, "hash1", mock.Anything, mock.AnythingOfType("func() error")).
-		Return(false, s3Err).Once()
+	// The object is still an orphan, but S3 refuses to delete it.
+	mockDB.On("ExecuteWithLockedS3Orphans", ctx, candidates, mock.Anything).Return(candidates, nil).Once()
+	mockS3.On("DeleteBulkWithRetry", ctx, []string{"d/l/hash1"}).
+		Return(map[string]error{"d/l/hash1": s3Err}).Once()
 
 	// DB batch delete should not be called for the failed S3 key
 

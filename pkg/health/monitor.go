@@ -20,6 +20,52 @@ const (
 	StatusUnreachable ComponentStatus = "unreachable"
 )
 
+const (
+	// Consecutive failed checks that mark a component unhealthy, matching the
+	// backend threshold used by the proxy connection manager.
+	unhealthyConsecutiveFailures = 3
+	// Failure rate over the recent window that marks a component unhealthy when
+	// failures are intermittent rather than consecutive.
+	unhealthyFailureRate = 0.5
+	recentOutcomeWindow  = 10
+)
+
+// failureWindow is a ring of the most recent check outcomes.
+type failureWindow struct {
+	outcomes [recentOutcomeWindow]bool
+	next     int
+	size     int
+	failures int
+}
+
+func (w *failureWindow) record(failed bool) {
+	if w.outcomes[w.next] {
+		w.failures--
+	}
+	w.outcomes[w.next] = failed
+	if failed {
+		w.failures++
+	}
+	w.next = (w.next + 1) % len(w.outcomes)
+	if w.size < len(w.outcomes) {
+		w.size++
+	}
+}
+
+func (w *failureWindow) rate() float64 {
+	if w.size == 0 {
+		return 0
+	}
+	return float64(w.failures) / float64(w.size)
+}
+
+// sustained reports whether a full window fails at or above rate. A partial
+// window never qualifies; early failures are covered by the consecutive
+// failure threshold instead.
+func (w *failureWindow) sustained(rate float64) bool {
+	return w.size == len(w.outcomes) && w.rate() >= rate
+}
+
 type HealthCheck struct {
 	Name     string
 	Check    func(ctx context.Context) error
@@ -35,6 +81,12 @@ type HealthCheck struct {
 	Status     ComponentStatus
 	CheckCount int
 	FailCount  int
+
+	// CheckCount and FailCount are lifetime totals reported to operators; the
+	// status is derived from these recent-outcome fields instead.
+	consecutiveFails int
+	recent           failureWindow
+	everSucceeded    bool
 }
 
 type HealthMonitor struct {
@@ -147,28 +199,37 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 	check.mu.Lock()
 	check.CheckCount++
 	check.LastCheck = time.Now()
+	check.recent.record(err != nil)
 	previousStatus := check.Status
 	isFirstCheck := check.CheckCount == 1
 
 	if err != nil {
 		check.FailCount++
+		check.consecutiveFails++
 		check.LastError = err
 
-		failureRate := float64(check.FailCount) / float64(check.CheckCount)
-
-		// If failure rate is high, mark as unhealthy. Otherwise, a single
-		// failure will result in a 'degraded' state.
-		if failureRate >= 0.5 {
+		// A run of failures, or a persistently failing window, means the
+		// component is down. Anything less is a blip. A component that has
+		// never once succeeded has no healthy history to call a blip against,
+		// so it escalates on its first failure.
+		if !check.everSucceeded || check.consecutiveFails >= unhealthyConsecutiveFailures || check.recent.sustained(unhealthyFailureRate) {
 			check.Status = StatusUnhealthy
 		} else {
 			check.Status = StatusDegraded
 		}
 
-		logger.Warn("Health check failed", "check", check.Name, "error", err, "status", check.Status, "failure_rate", failureRate)
+		logger.Warn("Health check failed", "check", check.Name, "error", err, "status", check.Status, "failure_rate", check.recent.rate(), "consecutive_failures", check.consecutiveFails)
 	} else {
 		check.LastError = nil
-		// A successful check transitions the state back to healthy.
-		check.Status = StatusHealthy
+		check.consecutiveFails = 0
+		check.everSucceeded = true
+		// A successful check clears the state, but recent failures hold the
+		// component degraded until they age out of the window.
+		if check.recent.sustained(unhealthyFailureRate) {
+			check.Status = StatusDegraded
+		} else {
+			check.Status = StatusHealthy
+		}
 	}
 
 	currentStatus := check.Status

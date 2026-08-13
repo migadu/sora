@@ -9,7 +9,7 @@ package uploader
 //  2. The DB transaction (InsertMessage + pending_uploads INSERT) is still in-flight.
 //  3. cleanupOrphanedFiles() fires (e.g., on the 5-minute tick).
 //  4. The file is old enough to pass the grace-period check (or clock skew bypassed it).
-//  5. PendingUploadExistsWithRetry() returns false — the record isn't visible yet.
+//  5. The orphan lookup reports no pending_upload row — it isn't visible yet.
 //  6. The file is deleted by cleanupOrphanedFiles().
 //  7. The DB transaction commits: pending_upload record now exists, but the file is gone.
 //  8. Every subsequent upload attempt fails with "no such file or directory".
@@ -23,11 +23,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/migadu/sora/db"
-	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/helpers"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -36,6 +37,54 @@ import (
 
 type mockUploaderDB struct {
 	mock.Mock
+
+	// pendingUploads is the set of content hashes with a pending_uploads row, per
+	// account. The batched lookup answers from it and counts its own round-trips so
+	// a test can assert what a cleanup scan costs the database.
+	mu             sync.Mutex
+	pendingUploads map[int64]map[string]bool
+	batchLookups   int
+	batchErr       error
+}
+
+func (m *mockUploaderDB) ExistingPendingUploads(ctx context.Context, accountID int64, contentHashes []string) (map[string]struct{}, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.batchLookups++
+	if m.batchErr != nil {
+		return nil, m.batchErr
+	}
+
+	existing := make(map[string]struct{}, len(contentHashes))
+	for _, hash := range contentHashes {
+		if m.pendingUploads[accountID][hash] {
+			existing[hash] = struct{}{}
+		}
+	}
+	return existing, nil
+}
+
+// setPendingUpload records a committed pending_uploads row for a staged file.
+func (m *mockUploaderDB) setPendingUpload(accountID int64, contentHash string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.pendingUploads == nil {
+		m.pendingUploads = make(map[int64]map[string]bool)
+	}
+	if m.pendingUploads[accountID] == nil {
+		m.pendingUploads[accountID] = make(map[string]bool)
+	}
+	m.pendingUploads[accountID][contentHash] = true
+}
+
+// lookups counts the database round-trips the cleanup scan made to decide whether
+// staged files are orphaned.
+func (m *mockUploaderDB) lookups() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.batchLookups
 }
 
 func (m *mockUploaderDB) AcquireAndLeasePendingUploadsWithRetry(ctx context.Context, instanceID string, batchSize int, retryInterval time.Duration, maxAttempts int) ([]db.PendingUpload, error) {
@@ -50,13 +99,9 @@ func (m *mockUploaderDB) MarkUploadAttemptWithRetry(ctx context.Context, content
 	args := m.Called(ctx, contentHash, accountID)
 	return args.Error(0)
 }
-func (m *mockUploaderDB) GetPrimaryEmailForAccountWithRetry(ctx context.Context, accountID int64) (server.Address, error) {
-	args := m.Called(ctx, accountID)
-	return args.Get(0).(server.Address), args.Error(1)
-}
-func (m *mockUploaderDB) IsContentHashUploadedWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
+func (m *mockUploaderDB) PendingUploadKeys(ctx context.Context, contentHash string, accountID int64) ([]string, error) {
 	args := m.Called(ctx, contentHash, accountID)
-	return args.Bool(0), args.Error(1)
+	return args.Get(0).([]string), args.Error(1)
 }
 func (m *mockUploaderDB) ExecuteWithS3ObjectSessionLock(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error {
 	args := m.Called(ctx, contentHash, accountID, executionFunc)
@@ -72,10 +117,6 @@ func (m *mockUploaderDB) CompleteS3UploadWithRetry(ctx context.Context, contentH
 	args := m.Called(ctx, contentHash, accountID)
 	return args.Error(0)
 }
-func (m *mockUploaderDB) PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
-	args := m.Called(ctx, contentHash, accountID)
-	return args.Bool(0), args.Error(1)
-}
 func (m *mockUploaderDB) GetUploaderStatsWithRetry(ctx context.Context, maxAttempts int) (*db.UploaderStats, error) {
 	args := m.Called(ctx, maxAttempts)
 	return args.Get(0).(*db.UploaderStats), args.Error(1)
@@ -83,6 +124,18 @@ func (m *mockUploaderDB) GetUploaderStatsWithRetry(ctx context.Context, maxAttem
 func (m *mockUploaderDB) GetFailedUploadsWithRetry(ctx context.Context, maxAttempts int, limit int) ([]db.PendingUpload, error) {
 	args := m.Called(ctx, maxAttempts, limit)
 	return args.Get(0).([]db.PendingUpload), args.Error(1)
+}
+
+// The backlog measurement is reporting-only; these tests exercise the upload/cleanup
+// paths, so answer with an empty queue rather than requiring a per-test expectation.
+func (m *mockUploaderDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error) {
+	return UploadBacklog{}, nil
+}
+
+// The heartbeat is fire-and-forget liveness bookkeeping; these tests exercise the
+// upload/cleanup paths, so record it without requiring a per-test expectation.
+func (m *mockUploaderDB) RecordInstanceHeartbeatWithRetry(ctx context.Context, instanceID string) error {
+	return nil
 }
 
 // --- mock S3 (not used by cleanupOrphanedFiles, but needed to construct UploadWorker) ---
@@ -102,7 +155,7 @@ func (m *mockUploaderS3) ExistsWithRetry(ctx context.Context, key string) (bool,
 // is the reproducer for the stuck-upload bug.
 //
 // It FAILS on the current code because cleanupOrphanedFiles() deletes the upload
-// file when PendingUploadExistsWithRetry() returns false, even though the DB
+// file when the orphan lookup reports no pending_uploads row, even though the DB
 // record may simply not have been committed yet at the time of the check.
 //
 // Expected (correct) behaviour: the file MUST NOT be deleted solely because the
@@ -136,12 +189,10 @@ func TestCleanupOrphanedFiles_RaceCondition_DeletesFileThatHasNoPendingUploadYet
 	backdated := time.Now().Add(-15 * time.Minute)
 	require.NoError(t, os.Chtimes(filePath, backdated, backdated))
 
-	// Simulate the race window: the DB transaction has not committed yet, so
-	// PendingUploadExists returns false.  In production this happened because
+	// Simulate the race window: the DB transaction has not committed yet, so the
+	// orphan lookup does not see the row.  In production this happened because
 	// the large (8.4 MB) InsertMessage transaction took long enough for the
 	// cleanup ticker to fire in between StoreLocally() and the COMMIT.
-	mockDB.On("PendingUploadExistsWithRetry", mock.Anything, contentHash, accountID).
-		Return(false, nil)
 
 	ctx := context.Background()
 	err := worker.cleanupOrphanedFiles(ctx)
@@ -201,8 +252,6 @@ func TestCleanupOrphanedFiles_SafelyDeletesTrulyOrphanedFile(t *testing.T) {
 	require.NoError(t, os.Chtimes(filePath, veryOld, veryOld))
 
 	// No pending_upload record exists (truly orphaned).
-	mockDB.On("PendingUploadExistsWithRetry", mock.Anything, contentHash, accountID).
-		Return(false, nil)
 
 	ctx := context.Background()
 	err := worker.cleanupOrphanedFiles(ctx)
@@ -227,7 +276,7 @@ func TestCleanupOrphanedFiles_SafelyDeletesTrulyOrphanedFile(t *testing.T) {
 //     cleanupOrphanedFiles deletes it on a subsequent tick now that the file is
 //     considered processed.
 //  5. On every subsequent uploader cycle:
-//     a) IsContentHashUploadedWithRetry → false (messages.uploaded still FALSE)
+//     a) PendingUploadKeys → the recorded key (messages.uploaded still FALSE)
 //     b) os.ReadFile(filePath) → "no such file or directory"
 //     c) [OLD CODE] MarkUploadAttemptWithRetry is called → attempts++
 //     d) After 5 attempts the record is "failed" with S3 status = ✓ EXISTS
@@ -262,11 +311,10 @@ func TestProcessSingleUpload_S3ExistsButLocalFileMissing_SelfHeals(t *testing.T)
 	// successful S3 PUT, or by cleanupOrphanedFiles, or by the cache move.
 	// The file is gone; S3 still has the content.
 
-	// DB: messages are NOT yet marked as uploaded (CompleteS3Upload never ran).
-	mockDB.On("GetPrimaryEmailForAccountWithRetry", mock.Anything, accountID).
-		Return(serverAddress(t, "user@somedomain.com"), nil)
-	mockDB.On("IsContentHashUploadedWithRetry", mock.Anything, contentHash, accountID).
-		Return(false, nil)
+	// DB: messages are NOT yet marked as uploaded (CompleteS3Upload never ran), so the
+	// key they recorded is still waiting for its object.
+	mockDB.On("PendingUploadKeys", mock.Anything, contentHash, accountID).
+		Return([]string{helpers.NewS3Key("somedomain.com", "user", contentHash)}, nil)
 
 	// Since we mock S3 existence as true, ExistsWithRetry returns true, but we actually
 	// DO need to simulate the execution of ExecuteWithS3ObjectSessionLock since the uploader runs it.
@@ -319,16 +367,6 @@ func TestProcessSingleUpload_S3ExistsButLocalFileMissing_SelfHeals(t *testing.T)
 	}
 }
 
-// serverAddress is a small helper to parse an email address for use in tests.
-func serverAddress(t *testing.T, addr string) server.Address {
-	t.Helper()
-	a, err := server.NewAddress(addr)
-	if err != nil {
-		t.Fatalf("serverAddress(%q): %v", addr, err)
-	}
-	return a
-}
-
 // TestCleanupOrphanedFiles_LargeBacklog_DoesNotDeleteQueuedUploads answers the question:
 // "could this happen when there are many upload entries so the cleanup runs before
 // they finish?"
@@ -348,8 +386,8 @@ func serverAddress(t *testing.T, addr string) server.Address {
 // The only true concurrency is between StoreLocally() (called from LMTP handler
 // goroutines) and the cleanup ticker. But for files whose pending_upload records
 // are already committed in the database, cleanup will see them via
-// PendingUploadExistsWithRetry and leave them untouched regardless of how large
-// the backlog is or how long the uploader takes.
+// the orphan lookup and leave them untouched regardless of how large the backlog
+// is or how long the uploader takes.
 //
 // The dangerous window is ONLY: file written on disk → DB transaction not yet
 // committed. That window is eliminated by the 1-hour grace period.
@@ -394,8 +432,7 @@ func TestCleanupOrphanedFiles_LargeBacklog_DoesNotDeleteQueuedUploads(t *testing
 		// CRITICAL: each file has its pending_upload record committed in the DB.
 		// This is the normal case — LMTP committed the transaction successfully.
 		// The uploader just hasn't gotten to these uploads yet (large backlog).
-		mockDB.On("PendingUploadExistsWithRetry", mock.Anything, f.hash, f.accountID).
-			Return(true, nil)
+		mockDB.setPendingUpload(f.accountID, f.hash)
 	}
 
 	ctx := context.Background()
@@ -414,8 +451,10 @@ func TestCleanupOrphanedFiles_LargeBacklog_DoesNotDeleteQueuedUploads(t *testing
 				"hash=%s account=%d", f.hash[:16], f.accountID)
 	}
 
-	// Every file should have been checked against the database.
-	mockDB.AssertNumberOfCalls(t, "PendingUploadExistsWithRetry", len(files))
+	// Every file should have been checked against the database, in a single query:
+	// they all belong to the same account.
+	require.Equal(t, 1, mockDB.lookups(),
+		"Expected the whole backlog to be resolved in one query")
 }
 
 // TestCleanupOrphanedFiles_SkipsFilesWithinGracePeriod verifies that files
@@ -438,8 +477,8 @@ func TestCleanupOrphanedFiles_SkipsFilesWithinGracePeriod(t *testing.T) {
 	// mtime is NOW — definitely within any grace period
 
 	// DB should never even be consulted for recent files.
-	// If PendingUploadExistsWithRetry is called for a file this fresh, that itself
-	// is a bug (unnecessary DB round-trip, and may return a false negative).
+	// A lookup for a file this fresh is itself a bug (unnecessary DB round-trip,
+	// and it may return a false negative).
 
 	ctx := context.Background()
 	err := worker.cleanupOrphanedFiles(ctx)
@@ -448,6 +487,6 @@ func TestCleanupOrphanedFiles_SkipsFilesWithinGracePeriod(t *testing.T) {
 	_, statErr := os.Stat(filePath)
 	require.NoError(t, statErr, "File within grace period must not be deleted")
 
-	mockDB.AssertNotCalled(t, "PendingUploadExistsWithRetry",
-		mock.Anything, mock.Anything, mock.Anything)
+	require.Zero(t, mockDB.lookups(),
+		"Expected no database lookup for a file inside the grace period")
 }

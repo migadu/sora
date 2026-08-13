@@ -6,15 +6,53 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/gob"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/memberlist"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
+)
+
+const (
+	// defaultRetransmitMult and defaultUDPBufferSize mirror
+	// memberlist.DefaultLANConfig() and are used when no memberlist instance is
+	// attached yet.
+	defaultRetransmitMult = 4
+	defaultUDPBufferSize  = 1400
+
+	// broadcastFrameOverhead is everything memberlist wraps around one user
+	// broadcast inside a datagram: compound header (2), AES encryption (29),
+	// compound message length prefix plus user-message type byte (3), and this
+	// package's own subsystem marker (2).
+	broadcastFrameOverhead = 2 + 29 + 3 + 2
+
+	// pushPullInterval is how often memberlist runs a full-state exchange with
+	// one random peer. Subsystems repair missed events over that exchange, so
+	// the value is pinned here rather than inherited from memberlist's defaults.
+	pushPullInterval = 30 * time.Second
+
+	// handlerQueueDepth is how many gossip payloads may wait for one handler.
+	// A payload never exceeds a datagram, so a full queue costs well under a
+	// megabyte.
+	handlerQueueDepth = 256
+
+	// dropLogInterval bounds how often a saturated handler queue logs, so a
+	// burst that overruns a handler does not also flood the log.
+	dropLogInterval = 10 * time.Second
+)
+
+// Message type markers prefixed to every gossip broadcast.
+var (
+	markerRateLimit  = [2]byte{'R', 'L'}
+	markerAffinity   = [2]byte{'A', 'F'}
+	markerConnection = [2]byte{'C', 'N'}
+	markerIPLimit    = [2]byte{'I', 'P'}
 )
 
 // Manager handles cluster coordination and leader election
@@ -25,42 +63,159 @@ type Manager struct {
 	nodeID                string
 	isLeader              bool
 	leaderID              string
+	retransmitMult        int
+	udpBufferSize         int
 	mu                    sync.RWMutex
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	leaderChangeCallbacks []func(isLeader bool, newLeaderID string)
 	callbackMu            sync.RWMutex
 
+	// Full-state exchange over push/pull
+	stateProviders map[string]stateProvider
+	stateMu        sync.RWMutex
+
 	// Rate limit event handling
-	rateLimitHandlers   []func([]byte)
+	rateLimitHandlers   []*handlerQueue
 	rateLimitMu         sync.RWMutex
 	rateLimitBroadcasts []func(int, int) [][]byte
 	broadcastMu         sync.RWMutex
 
 	// Affinity event handling
-	affinityHandlers    []func([]byte)
+	affinityHandlers    []*handlerQueue
 	affinityMu          sync.RWMutex
 	affinityBroadcasts  []func(int, int) [][]byte
 	affinityBroadcastMu sync.RWMutex
 
 	// Connection tracking event handling
-	connectionHandlers    []func([]byte)
+	connectionHandlers    []*handlerQueue
 	connectionMu          sync.RWMutex
 	connectionBroadcasts  []func(int, int) [][]byte
 	connectionBroadcastMu sync.RWMutex
 
 	// Per-IP connection limit event handling
-	ipLimitHandlers    []func([]byte)
+	ipLimitHandlers    []*handlerQueue
 	ipLimitMu          sync.RWMutex
 	ipLimitBroadcasts  []func(int, int) [][]byte
 	ipLimitBroadcastMu sync.RWMutex
 }
 
+// handlerQueue delivers gossip payloads to one registered handler from a single
+// worker goroutine. memberlist calls NotifyMsg on its packet receive loop, and
+// the connection and IP handlers serialize on a tracker mutex that the accept
+// path also takes, so delivery must neither block the caller nor spawn per
+// message - gossip volume would otherwise turn handler contention into
+// unbounded goroutine and buffer growth. Events that arrive with the queue full
+// are dropped and counted.
+type handlerQueue struct {
+	kind        string
+	handler     func([]byte)
+	events      chan []byte
+	dropped     atomic.Uint64
+	lastDropLog atomic.Int64
+}
+
+func newHandlerQueue(ctx context.Context, kind string, handler func([]byte)) *handlerQueue {
+	q := &handlerQueue{
+		kind:    kind,
+		handler: handler,
+		events:  make(chan []byte, handlerQueueDepth),
+	}
+	go q.run(ctx)
+	return q
+}
+
+func (q *handlerQueue) run(ctx context.Context) {
+	var done <-chan struct{}
+	if ctx != nil {
+		done = ctx.Done()
+	}
+
+	for {
+		select {
+		case data := <-q.events:
+			q.invoke(data)
+		case <-done:
+			return
+		}
+	}
+}
+
+func (q *handlerQueue) invoke(data []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in gossip handler", "kind", q.kind, "error", fmt.Errorf("%v", r))
+		}
+	}()
+	q.handler(data)
+}
+
+// deliver queues one payload, or drops it if the handler has fallen behind
+func (q *handlerQueue) deliver(data []byte) {
+	select {
+	case q.events <- data:
+	default:
+		q.recordDrop()
+	}
+}
+
+func (q *handlerQueue) recordDrop() {
+	total := q.dropped.Add(1)
+
+	now := time.Now().UnixNano()
+	last := q.lastDropLog.Load()
+	if now-last < int64(dropLogInterval) || !q.lastDropLog.CompareAndSwap(last, now) {
+		return
+	}
+
+	logger.Warn("Cluster: Gossip handler queue full, dropping events", "kind", q.kind, "capacity", cap(q.events), "dropped_total", total)
+}
+
+// deliverGossip hands one received payload to every handler of a subsystem
+func deliverGossip(queues []*handlerQueue, data []byte) {
+	if len(queues) == 0 {
+		return
+	}
+
+	// memberlist reuses the receive buffer once NotifyMsg returns, and a queued
+	// event outlives that call.
+	payload := make([]byte, len(data))
+	copy(payload, data)
+
+	for _, q := range queues {
+		q.deliver(payload)
+	}
+}
+
 // clusterDelegate implements memberlist.Delegate for custom cluster behavior
 type clusterDelegate struct {
-	meta     []byte
-	manager  *Manager
-	metaLock sync.RWMutex
+	meta          []byte
+	manager       *Manager
+	metaLock      sync.RWMutex
+	broadcastTurn atomic.Uint64
+}
+
+// Kinds of subsystem state exchanged over push/pull. A kind groups the
+// providers that speak the same payload format, whatever the node they run on.
+const (
+	StateKindConnection = "connection"
+	StateKindIPLimit    = "ip-limit"
+)
+
+// stateProvider exchanges one subsystem's full state during a push/pull round
+type stateProvider struct {
+	kind  string
+	local func() []byte
+	merge func([]byte)
+}
+
+// stateEntry is one provider's full state on the push/pull wire. The name it
+// travels under is only unique on the node that produced it - two nodes name
+// their listeners differently - so the receiver dispatches on Kind and each
+// subsystem decides from the payload whether the state is addressed to it.
+type stateEntry struct {
+	Kind string
+	Data []byte
 }
 
 // New creates a new cluster manager
@@ -100,6 +255,9 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	// Configure memberlist
 	mlConfig := memberlist.DefaultLANConfig()
 	mlConfig.Name = nodeID
+	mlConfig.PushPullInterval = pushPullInterval
+	m.retransmitMult = mlConfig.RetransmitMult
+	m.udpBufferSize = mlConfig.UDPBufferSize
 
 	bindAddr := cfg.GetBindAddr()
 	bindPort := cfg.GetBindPort()
@@ -350,41 +508,16 @@ func (m *Manager) OnLeaderChange(callback func(isLeader bool, newLeaderID string
 func (m *Manager) RegisterRateLimitHandler(handler func([]byte)) {
 	m.rateLimitMu.Lock()
 	defer m.rateLimitMu.Unlock()
-	m.rateLimitHandlers = append(m.rateLimitHandlers, handler)
+	m.rateLimitHandlers = append(m.rateLimitHandlers, newHandlerQueue(m.ctx, "rate-limit", handler))
 }
 
-// notifyRateLimitHandlers calls all registered rate limit handlers
+// notifyRateLimitHandlers queues an event for all registered rate limit handlers
 func (m *Manager) notifyRateLimitHandlers(data []byte) {
 	m.rateLimitMu.RLock()
-	handlers := make([]func([]byte), len(m.rateLimitHandlers))
-	copy(handlers, m.rateLimitHandlers)
+	queues := m.rateLimitHandlers
 	m.rateLimitMu.RUnlock()
 
-	// Call handlers asynchronously to avoid blocking gossip receive
-	// Use timeout to prevent goroutine leaks from blocked handlers
-	for _, handler := range handlers {
-		go func(h func([]byte)) {
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				defer func() {
-					if r := recover(); r != nil {
-						logger.Error("Panic in rate limit handler", "error", fmt.Errorf("%v", r))
-					}
-				}()
-				h(data)
-			}()
-
-			select {
-			case <-done:
-				// Handler completed successfully
-			case <-time.After(5 * time.Second):
-				logger.Warn("Cluster: Rate limit handler timed out after 5s")
-			case <-m.ctx.Done():
-				// Manager shutting down
-			}
-		}(handler)
-	}
+	deliverGossip(queues, data)
 }
 
 // RegisterRateLimitBroadcaster registers a callback to generate rate limit broadcasts
@@ -398,41 +531,16 @@ func (m *Manager) RegisterRateLimitBroadcaster(broadcaster func(int, int) [][]by
 func (m *Manager) RegisterAffinityHandler(handler func([]byte)) {
 	m.affinityMu.Lock()
 	defer m.affinityMu.Unlock()
-	m.affinityHandlers = append(m.affinityHandlers, handler)
+	m.affinityHandlers = append(m.affinityHandlers, newHandlerQueue(m.ctx, "affinity", handler))
 }
 
-// notifyAffinityHandlers calls all registered affinity handlers
+// notifyAffinityHandlers queues an event for all registered affinity handlers
 func (m *Manager) notifyAffinityHandlers(data []byte) {
 	m.affinityMu.RLock()
-	handlers := make([]func([]byte), len(m.affinityHandlers))
-	copy(handlers, m.affinityHandlers)
+	queues := m.affinityHandlers
 	m.affinityMu.RUnlock()
 
-	// Call handlers asynchronously to avoid blocking gossip receive
-	// Use timeout to prevent goroutine leaks from blocked handlers
-	for _, handler := range handlers {
-		go func(h func([]byte)) {
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				defer func() {
-					if r := recover(); r != nil {
-						logger.Error("Panic in affinity handler", "error", fmt.Errorf("%v", r))
-					}
-				}()
-				h(data)
-			}()
-
-			select {
-			case <-done:
-				// Handler completed successfully
-			case <-time.After(5 * time.Second):
-				logger.Warn("Cluster: Affinity handler timed out after 5s")
-			case <-m.ctx.Done():
-				// Manager shutting down
-			}
-		}(handler)
-	}
+	deliverGossip(queues, data)
 }
 
 // RegisterAffinityBroadcaster registers a callback to generate affinity broadcasts
@@ -446,45 +554,19 @@ func (m *Manager) RegisterAffinityBroadcaster(broadcaster func(int, int) [][]byt
 func (m *Manager) RegisterConnectionHandler(handler func([]byte)) {
 	m.connectionMu.Lock()
 	defer m.connectionMu.Unlock()
-	m.connectionHandlers = append(m.connectionHandlers, handler)
+	m.connectionHandlers = append(m.connectionHandlers, newHandlerQueue(m.ctx, "connection", handler))
 	logger.Info("Cluster: RegisterConnectionHandler", "handlers", len(m.connectionHandlers))
 }
 
-// notifyConnectionHandlers calls all registered connection handlers
+// notifyConnectionHandlers queues an event for all registered connection handlers
 func (m *Manager) notifyConnectionHandlers(data []byte) {
 	m.connectionMu.RLock()
-	handlers := make([]func([]byte), len(m.connectionHandlers))
-	copy(handlers, m.connectionHandlers)
-	handlerCount := len(m.connectionHandlers)
+	queues := m.connectionHandlers
 	m.connectionMu.RUnlock()
 
-	logger.Debug("Cluster: Notifying connection handlers", "handlers", handlerCount, "data_len", len(data))
+	logger.Debug("Cluster: Notifying connection handlers", "handlers", len(queues), "data_len", len(data))
 
-	// Call handlers asynchronously to avoid blocking gossip receive
-	// Use timeout to prevent goroutine leaks from blocked handlers
-	for _, handler := range handlers {
-		go func(h func([]byte)) {
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				defer func() {
-					if r := recover(); r != nil {
-						logger.Error("Panic in connection handler", "error", fmt.Errorf("%v", r))
-					}
-				}()
-				h(data)
-			}()
-
-			select {
-			case <-done:
-				// Handler completed successfully
-			case <-time.After(5 * time.Second):
-				logger.Warn("Cluster: Connection handler timed out after 5s")
-			case <-m.ctx.Done():
-				// Manager shutting down
-			}
-		}(handler)
-	}
+	deliverGossip(queues, data)
 }
 
 // RegisterConnectionBroadcaster registers a callback to generate connection broadcasts
@@ -495,33 +577,28 @@ func (m *Manager) RegisterConnectionBroadcaster(broadcaster func(int, int) [][]b
 	logger.Debug("Cluster: RegisterConnectionBroadcaster", "count", len(m.connectionBroadcasts))
 }
 
-// getConnectionBroadcasts collects broadcasts from all registered connection broadcasters
-func (m *Manager) getConnectionBroadcasts(overhead, limit int) [][]byte {
-	m.connectionBroadcastMu.RLock()
-	broadcasters := make([]func(int, int) [][]byte, len(m.connectionBroadcasts))
-	copy(broadcasters, m.connectionBroadcasts)
-	broadcasterCount := len(m.connectionBroadcasts)
-	m.connectionBroadcastMu.RUnlock()
-
-	logger.Debug("Cluster: getConnectionBroadcasts called", "broadcasters", broadcasterCount)
-
+// collectBroadcasts gathers messages from the given broadcast sources, tags each
+// with its subsystem marker and enforces the byte budget memberlist handed us.
+// memberlist does not re-check what a delegate returns, so a message that cannot
+// fit the budget is dropped here rather than handed to the UDP transport.
+func collectBroadcasts(kind string, marker [2]byte, broadcasters []func(int, int) [][]byte, overhead, limit int) [][]byte {
 	var allBroadcasts [][]byte
 	totalSize := 0
 
-	for idx, broadcaster := range broadcasters {
-		broadcasts := broadcaster(overhead, limit-totalSize)
-		logger.Debug("Cluster: Broadcaster returned messages", "idx", idx, "count", len(broadcasts))
-		for _, msg := range broadcasts {
-			// Add 'CN' magic marker to identify connection messages
-			marked := make([]byte, len(msg)+2)
-			marked[0] = 0x43 // 'C'
-			marked[1] = 0x4E // 'N'
-			copy(marked[2:], msg)
+	for _, broadcaster := range broadcasters {
+		// Sources budget for the marker prepended below.
+		for _, msg := range broadcaster(overhead+len(marker), limit-totalSize) {
+			marked := make([]byte, 0, len(marker)+len(msg))
+			marked = append(marked, marker[:]...)
+			marked = append(marked, msg...)
 
 			msgSize := overhead + len(marked)
-			if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
-				logger.Debug("Cluster: Connection broadcast limit reached", "count", len(allBroadcasts))
-				return allBroadcasts
+			if msgSize > limit {
+				logger.Warn("Cluster: Dropping oversized gossip message", "kind", kind, "size", msgSize, "limit", limit)
+				continue
+			}
+			if totalSize+msgSize > limit {
+				continue
 			}
 
 			allBroadcasts = append(allBroadcasts, marked)
@@ -529,8 +606,20 @@ func (m *Manager) getConnectionBroadcasts(overhead, limit int) [][]byte {
 		}
 	}
 
-	logger.Debug("Cluster: getConnectionBroadcasts returning messages", "total", len(allBroadcasts))
+	if len(allBroadcasts) > 0 {
+		logger.Debug("Cluster: Collected gossip broadcasts", "kind", kind, "messages", len(allBroadcasts), "bytes", totalSize)
+	}
 	return allBroadcasts
+}
+
+// getConnectionBroadcasts collects broadcasts from all registered connection broadcasters
+func (m *Manager) getConnectionBroadcasts(overhead, limit int) [][]byte {
+	m.connectionBroadcastMu.RLock()
+	broadcasters := make([]func(int, int) [][]byte, len(m.connectionBroadcasts))
+	copy(broadcasters, m.connectionBroadcasts)
+	m.connectionBroadcastMu.RUnlock()
+
+	return collectBroadcasts("connection", markerConnection, broadcasters, overhead, limit)
 }
 
 // getAffinityBroadcasts collects broadcasts from all registered affinity broadcasters
@@ -540,29 +629,7 @@ func (m *Manager) getAffinityBroadcasts(overhead, limit int) [][]byte {
 	copy(broadcasters, m.affinityBroadcasts)
 	m.affinityBroadcastMu.RUnlock()
 
-	var allBroadcasts [][]byte
-	totalSize := 0
-
-	for _, broadcaster := range broadcasters {
-		broadcasts := broadcaster(overhead, limit-totalSize)
-		for _, msg := range broadcasts {
-			// Add 'AF' magic marker to identify affinity messages
-			marked := make([]byte, len(msg)+2)
-			marked[0] = 0x41 // 'A'
-			marked[1] = 0x46 // 'F'
-			copy(marked[2:], msg)
-
-			msgSize := overhead + len(marked)
-			if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
-				return allBroadcasts
-			}
-
-			allBroadcasts = append(allBroadcasts, marked)
-			totalSize += msgSize
-		}
-	}
-
-	return allBroadcasts
+	return collectBroadcasts("affinity", markerAffinity, broadcasters, overhead, limit)
 }
 
 // getRateLimitBroadcasts collects broadcasts from all registered broadcasters
@@ -572,29 +639,7 @@ func (m *Manager) getRateLimitBroadcasts(overhead, limit int) [][]byte {
 	copy(broadcasters, m.rateLimitBroadcasts)
 	m.broadcastMu.RUnlock()
 
-	var allBroadcasts [][]byte
-	totalSize := 0
-
-	for _, broadcaster := range broadcasters {
-		broadcasts := broadcaster(overhead, limit-totalSize)
-		for _, msg := range broadcasts {
-			// Add 'RL' magic marker to identify rate limit messages
-			marked := make([]byte, len(msg)+2)
-			marked[0] = 0x52 // 'R'
-			marked[1] = 0x4C // 'L'
-			copy(marked[2:], msg)
-
-			msgSize := overhead + len(marked)
-			if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
-				return allBroadcasts
-			}
-
-			allBroadcasts = append(allBroadcasts, marked)
-			totalSize += msgSize
-		}
-	}
-
-	return allBroadcasts
+	return collectBroadcasts("rate-limit", markerRateLimit, broadcasters, overhead, limit)
 }
 
 // notifyLeaderChange calls all registered callbacks when leadership changes
@@ -647,12 +692,41 @@ func (m *Manager) GetLeaderID() string {
 
 // GetNodeID returns this node's ID
 func (m *Manager) GetNodeID() string {
+	if m == nil {
+		return ""
+	}
 	return m.nodeID
 }
 
 // GetMemberCount returns the number of nodes in the cluster
 func (m *Manager) GetMemberCount() int {
+	if m == nil || m.memberlist == nil {
+		return 1
+	}
 	return m.memberlist.NumMembers()
+}
+
+// RetransmitMult returns the multiplier memberlist uses to decide how often a
+// broadcast is retransmitted. Broadcast sources feed it to their own
+// memberlist.TransmitLimitedQueue so that retransmission is counted by
+// memberlist's formula rather than a copy of it.
+func (m *Manager) RetransmitMult() int {
+	if m == nil || m.retransmitMult <= 0 {
+		return defaultRetransmitMult
+	}
+	return m.retransmitMult
+}
+
+// MaxBroadcastSize returns the largest message a broadcast source may queue. A
+// message that never fits a datagram is never transmitted, and a broadcast is
+// only retired once it has been transmitted, so an oversized message would sit
+// in the queue forever. Sources reject it at the point where it is produced.
+func (m *Manager) MaxBroadcastSize() int {
+	size := defaultUDPBufferSize
+	if m != nil && m.udpBufferSize > 0 {
+		size = m.udpBufferSize
+	}
+	return size - broadcastFrameOverhead
 }
 
 // GetMembers returns information about all cluster members
@@ -669,44 +743,75 @@ func (m *Manager) GetMembers() []MemberInfo {
 	return result
 }
 
+// SendConnectionEventReliable delivers one connection event to every other
+// member over TCP, outside the gossip epidemic, and reports how many peers took
+// it. Gossip retires a broadcast after a bounded number of transmissions with
+// no acknowledgement, which is the right trade for per-connection traffic but
+// not for a kick: an operator issues those one at a time, so a connection per
+// peer is affordable, and a peer that misses a kick keeps a session alive that
+// was supposed to be closed cluster-wide.
+func (m *Manager) SendConnectionEventReliable(msg []byte) (delivered, failed int) {
+	if m == nil || m.memberlist == nil {
+		return 0, 0
+	}
+
+	framed := make([]byte, 0, len(markerConnection)+len(msg))
+	framed = append(framed, markerConnection[:]...)
+	framed = append(framed, msg...)
+
+	return fanOutReliable(m.memberlist.Members(), m.nodeID, m.memberlist.SendReliable, framed)
+}
+
+// fanOutReliable sends msg to every member but self, in parallel, and counts
+// the outcomes. A failure is logged and reported rather than retried: the
+// caller keeps the message queued for gossip as a backstop.
+func fanOutReliable(members []*memberlist.Node, self string, send func(*memberlist.Node, []byte) error, msg []byte) (delivered, failed int) {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, member := range members {
+		if member.Name == self {
+			continue
+		}
+
+		wg.Add(1)
+		go func(node *memberlist.Node) {
+			defer wg.Done()
+
+			err := send(node, msg)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				failed++
+				logger.Warn("Cluster: Reliable send to member failed", "node", node.Name, "error", err)
+				return
+			}
+			delivered++
+		}(member)
+	}
+
+	wg.Wait()
+	return delivered, failed
+}
+
 // RegisterIPLimitHandler registers a callback to handle per-IP limit events from the cluster
 func (m *Manager) RegisterIPLimitHandler(handler func([]byte)) {
 	m.ipLimitMu.Lock()
 	defer m.ipLimitMu.Unlock()
-	m.ipLimitHandlers = append(m.ipLimitHandlers, handler)
+	m.ipLimitHandlers = append(m.ipLimitHandlers, newHandlerQueue(m.ctx, "ip-limit", handler))
 	logger.Info("Cluster: RegisterIPLimitHandler", "handlers", len(m.ipLimitHandlers))
 }
 
-// notifyIPLimitHandlers calls all registered IP limit handlers
+// notifyIPLimitHandlers queues an event for all registered IP limit handlers
 func (m *Manager) notifyIPLimitHandlers(data []byte) {
 	m.ipLimitMu.RLock()
-	handlers := make([]func([]byte), len(m.ipLimitHandlers))
-	copy(handlers, m.ipLimitHandlers)
-	handlerCount := len(m.ipLimitHandlers)
+	queues := m.ipLimitHandlers
 	m.ipLimitMu.RUnlock()
 
-	logger.Debug("Cluster: Notifying IP limit handlers", "handlers", handlerCount, "data_len", len(data))
+	logger.Debug("Cluster: Notifying IP limit handlers", "handlers", len(queues), "data_len", len(data))
 
-	// Call handlers asynchronously to avoid blocking gossip receive
-	// Use timeout to prevent goroutine leaks from blocked handlers
-	for _, handler := range handlers {
-		go func(h func([]byte)) {
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				h(data)
-			}()
-
-			select {
-			case <-done:
-				// Handler completed successfully
-			case <-time.After(5 * time.Second):
-				logger.Warn("Cluster: IP limit handler timed out after 5s")
-			case <-m.ctx.Done():
-				// Manager shutting down
-			}
-		}(handler)
-	}
+	deliverGossip(queues, data)
 }
 
 // RegisterIPLimitBroadcaster registers a callback to generate per-IP limit broadcasts
@@ -722,37 +827,115 @@ func (m *Manager) getIPLimitBroadcasts(overhead, limit int) [][]byte {
 	m.ipLimitBroadcastMu.RLock()
 	broadcasters := make([]func(int, int) [][]byte, len(m.ipLimitBroadcasts))
 	copy(broadcasters, m.ipLimitBroadcasts)
-	broadcasterCount := len(m.ipLimitBroadcasts)
 	m.ipLimitBroadcastMu.RUnlock()
 
-	logger.Debug("Cluster: getIPLimitBroadcasts called", "broadcasters", broadcasterCount)
+	return collectBroadcasts("ip-limit", markerIPLimit, broadcasters, overhead, limit)
+}
 
-	var allBroadcasts [][]byte
-	totalSize := 0
+// RegisterStateProvider registers a subsystem's full-state exchange with
+// memberlist push/pull. Unlike gossip broadcasts, push/pull runs over TCP, so
+// the payload is not bound by the UDP datagram budget.
+//
+// kind says which providers can merge this payload and must be the same on
+// every node. name only distinguishes the providers of one kind within this
+// node - the instance ID of the listener is the natural choice - and never has
+// to agree with anything a peer chose, because the receiver dispatches on kind
+// and the payload itself identifies whose state it carries.
+func (m *Manager) RegisterStateProvider(kind, name string, local func() []byte, merge func([]byte)) {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
 
-	for idx, broadcaster := range broadcasters {
-		broadcasts := broadcaster(overhead, limit-totalSize)
-		logger.Debug("Cluster: IP limit broadcaster returned messages", "idx", idx, "count", len(broadcasts))
-		for _, msg := range broadcasts {
-			// Add 'IP' magic marker to identify per-IP limit messages
-			marked := make([]byte, len(msg)+2)
-			marked[0] = 0x49 // 'I'
-			marked[1] = 0x50 // 'P'
-			copy(marked[2:], msg)
-
-			msgSize := overhead + len(marked)
-			if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
-				logger.Debug("Cluster: IP limit broadcast limit reached", "count", len(allBroadcasts))
-				return allBroadcasts
-			}
-
-			allBroadcasts = append(allBroadcasts, marked)
-			totalSize += msgSize
-		}
+	if m.stateProviders == nil {
+		m.stateProviders = make(map[string]stateProvider)
 	}
 
-	logger.Debug("Cluster: getIPLimitBroadcasts returning messages", "total", len(allBroadcasts))
-	return allBroadcasts
+	registered := kind + ":" + name
+	for i := 2; ; i++ {
+		if _, taken := m.stateProviders[registered]; !taken {
+			break
+		}
+		registered = fmt.Sprintf("%s:%s#%d", kind, name, i)
+	}
+
+	m.stateProviders[registered] = stateProvider{kind: kind, local: local, merge: merge}
+	logger.Debug("Cluster: RegisterStateProvider", "kind", kind, "name", registered, "count", len(m.stateProviders))
+}
+
+// snapshotStateProviders returns a copy of the registered providers
+func (m *Manager) snapshotStateProviders() map[string]stateProvider {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+
+	providers := make(map[string]stateProvider, len(m.stateProviders))
+	for name, provider := range m.stateProviders {
+		providers[name] = provider
+	}
+	return providers
+}
+
+// localState collects the full state of every registered subsystem for a
+// push/pull exchange with a peer
+func (m *Manager) localState() []byte {
+	providers := m.snapshotStateProviders()
+	if len(providers) == 0 {
+		return nil
+	}
+
+	state := make(map[string]stateEntry, len(providers))
+	for name, provider := range providers {
+		if data := provider.local(); len(data) > 0 {
+			state[name] = stateEntry{Kind: provider.kind, Data: data}
+		}
+	}
+	if len(state) == 0 {
+		return nil
+	}
+
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(state); err != nil {
+		logger.Warn("Cluster: Failed to encode local state", "error", err)
+		return nil
+	}
+
+	logger.Debug("Cluster: Sending local state", "subsystems", len(state), "bytes", buf.Len())
+	return buf.Bytes()
+}
+
+// mergeRemoteState hands a peer's push/pull state to the matching subsystems
+func (m *Manager) mergeRemoteState(buf []byte) {
+	if len(buf) == 0 {
+		return
+	}
+
+	var state map[string]stateEntry
+	if err := gob.NewDecoder(bytes.NewReader(buf)).Decode(&state); err != nil {
+		logger.Warn("Cluster: Failed to decode remote state", "error", err, "len", len(buf))
+		return
+	}
+
+	providers := m.snapshotStateProviders()
+	for remoteName, entry := range state {
+		merged := 0
+		for name, provider := range providers {
+			if provider.kind != entry.Kind {
+				continue
+			}
+			merged++
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						logger.Error("Panic in state merge", "name", name, "error", fmt.Errorf("%v", r))
+					}
+				}()
+				provider.merge(entry.Data)
+			}()
+		}
+
+		if merged == 0 {
+			logger.Debug("Cluster: No state provider registered for remote state", "kind", entry.Kind, "remote_name", remoteName)
+		}
+	}
 }
 
 // MemberInfo holds information about a cluster member
@@ -838,62 +1021,42 @@ func (d *clusterDelegate) NotifyMsg(msg []byte) {
 func (d *clusterDelegate) GetBroadcasts(overhead, limit int) [][]byte {
 	logger.Debug("Cluster: GetBroadcasts called by memberlist", "overhead", overhead, "limit", limit)
 
-	// Collect broadcasts from all registered broadcasters
+	collectors := []func(int, int) [][]byte{
+		d.manager.getRateLimitBroadcasts,
+		d.manager.getAffinityBroadcasts,
+		d.manager.getConnectionBroadcasts,
+		d.manager.getIPLimitBroadcasts,
+	}
+
+	// A datagram holds only a couple of events, so with a fixed collector order
+	// a busy subsystem would take the whole budget on every call and the others
+	// would never gossip at all. Rotating which one is asked first gives each
+	// the full budget on every fourth call.
+	first := int(d.broadcastTurn.Add(1) % uint64(len(collectors)))
+
 	var allBroadcasts [][]byte
 	totalSize := 0
 
-	// Get rate limit broadcasts
-	rateLimitBroadcasts := d.manager.getRateLimitBroadcasts(overhead, limit-totalSize)
-	for _, msg := range rateLimitBroadcasts {
-		msgSize := overhead + len(msg)
-		if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
-			return allBroadcasts
+	for i := range collectors {
+		// Each collector already enforces the budget it is given; this only
+		// keeps the running total across subsystems.
+		for _, msg := range collectors[(first+i)%len(collectors)](overhead, limit-totalSize) {
+			msgSize := overhead + len(msg)
+			if totalSize+msgSize > limit {
+				continue
+			}
+			allBroadcasts = append(allBroadcasts, msg)
+			totalSize += msgSize
 		}
-		allBroadcasts = append(allBroadcasts, msg)
-		totalSize += msgSize
-	}
-
-	// Get affinity broadcasts
-	affinityBroadcasts := d.manager.getAffinityBroadcasts(overhead, limit-totalSize)
-	for _, msg := range affinityBroadcasts {
-		msgSize := overhead + len(msg)
-		if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
-			return allBroadcasts
-		}
-		allBroadcasts = append(allBroadcasts, msg)
-		totalSize += msgSize
-	}
-
-	// Get connection broadcasts
-	connectionBroadcasts := d.manager.getConnectionBroadcasts(overhead, limit-totalSize)
-	for _, msg := range connectionBroadcasts {
-		msgSize := overhead + len(msg)
-		if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
-			return allBroadcasts
-		}
-		allBroadcasts = append(allBroadcasts, msg)
-		totalSize += msgSize
-	}
-
-	// Get per-IP limit broadcasts
-	ipLimitBroadcasts := d.manager.getIPLimitBroadcasts(overhead, limit-totalSize)
-	for _, msg := range ipLimitBroadcasts {
-		msgSize := overhead + len(msg)
-		if totalSize+msgSize > limit && len(allBroadcasts) > 0 {
-			return allBroadcasts
-		}
-		allBroadcasts = append(allBroadcasts, msg)
-		totalSize += msgSize
 	}
 
 	return allBroadcasts
 }
 
 func (d *clusterDelegate) LocalState(join bool) []byte {
-	// Return local state (not used for basic leader election)
-	return nil
+	return d.manager.localState()
 }
 
 func (d *clusterDelegate) MergeRemoteState(buf []byte, join bool) {
-	// Merge remote state (not used for basic leader election)
+	d.manager.mergeRemoteState(buf)
 }

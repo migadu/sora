@@ -22,8 +22,10 @@ type RelayQueue interface {
 	MarkPermanentFailure(messageID string, errorMsg string) error
 	Release(messageID string) error
 	GetStats() (pending, processing, failed int, err error)
+	FailedSummary() (FailedQueueSummary, error)
 	RecoverOrphanedMessages() (int, error)
 	CleanupOldFailedMessages(retentionPeriod time.Duration) (int, error)
+	CleanupOrphans() (int, error)
 }
 
 // RelayHandler defines the interface for relay handler operations.
@@ -176,7 +178,7 @@ func (w *Worker) run(ctx context.Context) {
 	}
 
 	// Run initial cleanup
-	w.cleanupOldFailedMessages()
+	w.runCleanup()
 
 	// Process immediately on start
 	w.processQueue(ctx)
@@ -201,7 +203,7 @@ func (w *Worker) run(ctx context.Context) {
 			}
 		case <-cleanupTicker.C:
 			logger.Info("Relay: cleanup tick")
-			w.cleanupOldFailedMessages()
+			w.runCleanup()
 		case <-cbCheckTicker.C:
 			// Check if circuit breaker is in HALF-OPEN state (ready for recovery attempts)
 			// This proactively triggers delivery attempts when circuit breaker recovers
@@ -294,20 +296,52 @@ func (w *Worker) processQueue(ctx context.Context) error {
 	// Wait for all concurrent deliveries to complete
 	wg.Wait()
 
-	// Update metrics and log
-	if processed > 0 {
-		pending, processing, failed, err := w.queue.GetStats()
-		if err == nil {
-			metrics.RelayQueueDepth.WithLabelValues("pending").Set(float64(pending))
-			metrics.RelayQueueDepth.WithLabelValues("processing").Set(float64(processing))
-			metrics.RelayQueueDepth.WithLabelValues("failed").Set(float64(failed))
-
-			logger.Info("Relay: Processed messages", "count", processed,
-				"pending", pending, "processing", processing, "failed", failed)
-		}
+	pending, processing, failed, ok := w.publishQueueDepth()
+	if ok && processed > 0 {
+		logger.Info("Relay: Processed messages", "count", processed,
+			"pending", pending, "processing", processing, "failed", failed)
 	}
 
 	return nil
+}
+
+// publishQueueDepth republishes the queue depth gauges. They are the alerting signal
+// for a backed-up or failed queue, so they are refreshed on every cycle: the failed
+// count matters most once the pending queue has drained and nothing is being
+// processed any more.
+func (w *Worker) publishQueueDepth() (pending, processing, failed int, ok bool) {
+	pending, processing, failed, err := w.queue.GetStats()
+	if err != nil {
+		logger.Error("Relay: Failed to read queue stats", "error", err)
+		return 0, 0, 0, false
+	}
+
+	metrics.RelayQueueDepth.WithLabelValues("pending").Set(float64(pending))
+	metrics.RelayQueueDepth.WithLabelValues("processing").Set(float64(processing))
+	metrics.RelayQueueDepth.WithLabelValues("failed").Set(float64(failed))
+
+	return pending, processing, failed, true
+}
+
+// reportFailedQueue names what the relay has given up on. Permanently failed mail is
+// only recoverable by hand (sora-admin relay list/show/requeue) and is deleted for
+// good once failedRetention expires - and for a Sieve redirect without :copy no other
+// copy exists - so a non-empty failed queue is warned about on every maintenance pass
+// rather than left to a counter nobody reads.
+func (w *Worker) reportFailedQueue() {
+	summary, err := w.queue.FailedSummary()
+	if err != nil {
+		logger.Error("Relay: Failed to summarize failed queue", "error", err)
+		return
+	}
+	if summary.Count == 0 {
+		return
+	}
+
+	logger.Warn("Relay: Permanently failed messages waiting in the failed queue - recover with sora-admin relay requeue",
+		"count", summary.Count, "oldest_age", summary.OldestAge.Round(time.Second),
+		"oldest_id", summary.OldestID, "oldest_to", summary.OldestTo,
+		"last_error", summary.LastError, "retention", w.failedRetention)
 }
 
 // processMessage attempts to deliver a single message via the relay handler.
@@ -414,14 +448,20 @@ func (w *Worker) GetStats() (pending, processing, failed int, err error) {
 	return w.queue.GetStats()
 }
 
-// cleanupOldFailedMessages performs cleanup of old failed messages
-func (w *Worker) cleanupOldFailedMessages() {
-	cleaned, err := w.queue.CleanupOldFailedMessages(w.failedRetention)
-	if err != nil {
+// runCleanup performs periodic queue maintenance: retention of old failed messages
+// and reclamation of crash debris left in the pending directory.
+func (w *Worker) runCleanup() {
+	if cleaned, err := w.queue.CleanupOldFailedMessages(w.failedRetention); err != nil {
 		logger.Error("Relay: Failed to cleanup old failed messages", "error", err)
-		return
-	}
-	if cleaned > 0 {
+	} else if cleaned > 0 {
 		logger.Info("Relay: Cleaned up old failed messages", "count", cleaned, "retention", w.failedRetention)
 	}
+
+	if removed, err := w.queue.CleanupOrphans(); err != nil {
+		logger.Error("Relay: Failed to cleanup orphaned queue files", "error", err)
+	} else if removed > 0 {
+		logger.Info("Relay: Cleaned up orphaned queue files", "count", removed)
+	}
+
+	w.reportFailedQueue()
 }

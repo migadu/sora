@@ -302,6 +302,9 @@ func handleImportS3(ctx context.Context) {
 		ImportDelay:       *importDelay,
 		ContinuationToken: *continuationToken,
 		Workers:           *workers,
+		// Resolved the same way the server on this host resolves it, so a row this
+		// import leaves in pending_uploads is owned by an instance that still exists.
+		InstanceID: globalConfig.InstanceID(),
 	}
 
 	importer, err := NewS3Importer(rdb, s3, options)

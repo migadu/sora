@@ -312,10 +312,15 @@ func TestListAccounts(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Test 1: List accounts before creating any
-	accounts, err := db.ListAccounts(ctx)
+	// Test 1: ListAccounts works on the current (shared) DB. We deliberately do NOT
+	// pin the total count: sora_test_db is shared across test packages and never
+	// truncated, and `go test ./...` runs packages concurrently, so another package
+	// can create or delete an account between listings. Asserting initialCount+3 here
+	// was racy — a concurrent insert made the total off by one ("should have N, has
+	// N+1"). The invariant this test actually checks is that every account it creates
+	// appears in the result.
+	_, err := db.ListAccounts(ctx)
 	assert.NoError(t, err)
-	initialCount := len(accounts)
 
 	// Test 2: Create a few accounts (each with unique email)
 	tx, err := db.GetWritePool().Begin(ctx)
@@ -342,10 +347,9 @@ func TestListAccounts(t *testing.T) {
 	err = tx.Commit(ctx)
 	require.NoError(t, err)
 
-	// Test 3: List accounts after creating some
-	accounts, err = db.ListAccounts(ctx)
+	// Test 3: List accounts after creating some; every created account must be present.
+	accounts, err := db.ListAccounts(ctx)
 	assert.NoError(t, err)
-	assert.Len(t, accounts, initialCount+3)
 
 	// Find our test accounts in the list
 	var foundAccounts int

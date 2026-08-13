@@ -2,52 +2,19 @@ package resilient
 
 import (
 	"context"
-	"errors"
 	"time"
 
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/db"
 )
 
 // --- Cleanup Worker Wrappers ---
 
-func (rd *ResilientDatabase) ExecuteS3DeleteTxWithRetry(ctx context.Context, accountID int64, contentHash string, gracePeriod time.Duration, s3DeleteFunc func() error) (bool, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		// Acquire transaction-level lock
-		lockErr := rd.getOperationalDatabaseForOperation(ctx, true).AcquireS3ObjectLock(ctx, tx, accountID, contentHash)
-		if lockErr != nil {
-			return false, lockErr
-		}
-
-		// Double-check if object is still an orphan
-		isOrphan, orphanErr := rd.getOperationalDatabaseForOperation(ctx, true).IsS3ObjectOrphan(ctx, tx, accountID, contentHash, gracePeriod)
-		if orphanErr != nil {
-			return false, orphanErr
-		}
-
-		if !isOrphan {
-			return false, nil // Skip S3 deletion!
-		}
-
-		// Execute S3 deletion
-		s3Err := s3DeleteFunc()
-		if s3Err != nil {
-			var awsErr *awshttp.ResponseError
-			if errors.As(s3Err, &awsErr) && awsErr.HTTPStatusCode() == 404 {
-				return true, nil // Object already deleted, safe to treat as success & clean up DB
-			}
-			return false, s3Err
-		}
-
-		return true, nil
-	}
-
-	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
-	if err != nil {
-		return false, err
-	}
-	return result.(bool), nil
+// ExecuteWithLockedS3Orphans holds the per-object advisory locks for objects and runs
+// fn with the subset that is still orphaned. Deliberately not wrapped in a retry: fn
+// performs the S3 deletion, which a database-level retry would replay.
+func (rd *ResilientDatabase) ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(orphans []db.UserScopedObjectForCleanup) error) error {
+	return rd.getOperationalDatabaseForOperation(ctx, true).ExecuteWithLockedS3Orphans(ctx, objects, gracePeriod, fn)
 }
 
 func (rd *ResilientDatabase) AcquireCleanupLockWithRetry(ctx context.Context) (bool, error) {
@@ -70,6 +37,20 @@ func (rd *ResilientDatabase) ReleaseCleanupLockWithRetry(ctx context.Context) er
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	return err
+}
+
+func (rd *ResilientDatabase) GetStrandedUploadInstancesWithRetry(ctx context.Context, maxAttempts int, livenessThreshold time.Duration) ([]db.StrandedUploadInstance, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetStrandedUploadInstances(ctx, maxAttempts, livenessThreshold)
+	}
+	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.([]db.StrandedUploadInstance), nil
 }
 
 func (rd *ResilientDatabase) ExpungeOldMessagesWithRetry(ctx context.Context, maxAge time.Duration) (int64, error) {

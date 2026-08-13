@@ -231,6 +231,20 @@ disable_tls = false                             # Disable TLS for S3 endpoint (w
 debug = false                                   # Enable detailed S3 request/response tracing (impacts performance)
 # access_key = ""                               # AWS/S3 access key (optional - uses IAM credentials chain if omitted)
 # secret_key = ""                               # AWS/S3 secret key (optional - uses IAM credentials chain if omitted)
+# server_side_encryption = "AES256"             # Encryption asked of the store on every certificate write. Default: "AES256".
+                                                # Every object here is private key material (each certificate PEM bundle ends with
+                                                # its private key, and "acme_account+key" is the ACME account key), so protection
+                                                # at rest is not left to a bucket default nobody enforces.
+                                                #   "AES256"  - the store manages the keys (AWS SSE-S3, Backblaze B2 SSE-B2, ...)
+                                                #   "aws:kms" - requires server_side_encryption_kms_key_id below
+                                                #   ""        - send no encryption header at all
+                                                # Set "" for S3-compatible stores that reject the header (e.g. MinIO with no KMS
+                                                # configured): such a store fails EVERY certificate write, and in a cluster only
+                                                # the leader then holds the certificate - on its local fallback disk - so every
+                                                # other node fails TLS handshakes for a certificate it can never read.
+                                                # Existing objects are unaffected either way: these modes are transparent on read,
+                                                # and objects already in the bucket are re-encrypted only when renewal rewrites them.
+# server_side_encryption_kms_key_id = ""        # KMS key id, required by (and only used with) server_side_encryption = "aws:kms"
 # This prevents server crashes due to filesystem permission issues.
 #
 # When to disable fallback (enable_fallback = false):
@@ -301,8 +315,14 @@ debug = false                                   # Enable detailed S3 request/res
 # - Automatic renewal (certificates renewed 30 days before expiration by default, configurable via renew_before)
 # - Hot reload (new certificates automatically loaded on next TLS handshake - no restart needed)
 # - Multi-instance support (multiple Sora instances share certificates via S3)
+# - Split-brain safe issuance: only one node in the cluster runs an ACME order for a given
+#   domain, fenced on a database lock rather than on gossip leadership. Leader election has
+#   no quorum, so a network partition elects a leader on BOTH sides; without the fence each
+#   would order the same certificate, race for the HTTP-01 challenge, and the node that is
+#   not answering port 80 would fail validation against the 5-per-hostname-per-hour limit.
+#   Nodes with no database configured (proxy-only) fall back to leadership alone.
 # - Zero-downtime renewal (renewals happen in background during TLS handshakes)
-# - Server-side encryption (certificates encrypted at rest with AES256)
+# - Server-side encryption (certificates encrypted at rest with AES256; configurable, see s3 section below)
 # - File fallback (local filesystem cache when S3 is unavailable - automatic recovery)
 # - Cost: ~$0.001/month for S3 storage
 #
@@ -369,7 +389,19 @@ addr = "10.10.10.40:7946"                       # Gossip bind address - MUST be 
 # If addr="10.10.10.40", this port will be appended to create "10.10.10.40:7946".
 port = 7946                                     # Gossip port (default: 7946)
 
-node_id = ""                                    # Unique node ID (default: hostname)
+node_id = ""                                    # Unique node ID (default: hostname). Also this node's instance ID,
+                                                # applied even when cluster mode is disabled.
+                                                # INTERNAL ONLY — never appears on the wire. The SMTP-visible name (the
+                                                # "by" host of Received:, the Message-ID domain of vacation replies, and
+                                                # the protocol greetings) comes from the machine's hostname and is NOT
+                                                # affected by node_id. Give the host an FQDN; setting node_id to one
+                                                # does not help. A non-FQDN mail hostname is warned about at startup.
+                                                # WARNING: the instance ID is the lease key for pending_uploads — a queued
+                                                # message body lives on the local disk of the node that accepted it, so only
+                                                # that instance can upload it. Renaming a node abandons its queued rows: no
+                                                # instance claims them and the cleaner deletes them once they pass
+                                                # uploader.cleanup_grace_period. Before changing this, stop delivery to the
+                                                # node and wait until it owns no pending_uploads rows.
 peers = []                                      # Initial seed nodes for cluster discovery (e.g., ["node-1.example.com:7946", "node-2.example.com:7946"])
                                                 # IMPORTANT: Do NOT include this node's own node_id in the peers list!
                                                 # Only list OTHER nodes in the cluster. Self-references will be filtered out
@@ -533,6 +565,16 @@ warmup_interval = "24h"       # Minimum time between warmups for the same user. 
 
 [uploader]
 path = "/sora/uploads"    # Filesystem path for staging uploads (temporary storage before S3).
+# instance_id = ""            # Upload lease identity written to pending_uploads.instance_id and
+                              # instance_heartbeats.instance_id. Default: this host's hostname —
+                              # the same value earlier releases stamped, so upgrades are
+                              # lease-continuous. Deliberately independent of cluster.node_id
+                              # (renaming the gossip node must not strand queued uploads). Set it
+                              # explicitly when running several sora instances on one host (each
+                              # needs its own), or to pin the identity across a planned hostname
+                              # change. WARNING: changing the resolved value strands queued
+                              # uploads — stop delivery and drain pending_uploads for the old id
+                              # before restarting under a new one.
 batch_size = 20               # Number of messages batched together per upload operation.
 concurrency = 10              # Number of concurrent upload workers.
 max_attempts = 5              # Maximum retry attempts for failed uploads.
@@ -552,6 +594,14 @@ max_age_restriction = ""          # Max message age before auto-expungement. Emp
 fts_retention = ""                # How long to keep FTS search vectors (text_body_tsv). Empty = keep forever (default).
                                   # WARNING: Setting this removes search capability for old messages. Use with caution.
 health_status_retention = "30d"   # How long to retain health status history in the database.
+instance_liveness_threshold = "7d" # How long an uploader instance must be silent before it counts as gone.
+                                  # A pending upload can only be performed by the instance that created it
+                                  # (the message body is a file on that node's local disk), so messages whose
+                                  # upload never finished are reaped only once their owning instance either
+                                  # gave up (uploader.max_attempts) or stopped its heartbeat for this long.
+                                  # Keep it well above any reboot/maintenance window: reaping a node that is
+                                  # merely rebooting deletes mail whose only copy is on its disk. An instance
+                                  # that never heartbeats at all is treated as alive (never reaped).
 
 # EXTERNAL RELAY CONFIGURATION
 # =============================================================================
@@ -900,6 +950,12 @@ master_sasl_password = ""     # Password for master_sasl_username.
 # are unaffected by this list. Empty = disabled (any source accepted — legacy behavior;
 # a startup WARNING is logged when master SASL is set without this gate).
 master_sasl_allowed_networks = []   # e.g. ["10.0.0.0/24", "192.168.1.10"]
+# Master SASL requires a SASL authorization identity (the user to impersonate).
+# A submission without one is NOT a master login: it is handled as an ordinary
+# login by that username and answered exactly like any other bad credential, so
+# the reply cannot be used to test master passwords. A proxy that forgets the
+# target user therefore just fails to authenticate — look for the "master SASL
+# password presented without an authorization identity" WARNING in the log.
 
 # --- TLS/SSL CONFIGURATION ---
 # TWO OPTIONS:
@@ -1323,6 +1379,12 @@ remote_use_id_command = false         # Send IMAP ID command to backends
 remote_health_checks = true           # Enable backend health tracking (default: true)
                                       # When false, all backends are always considered healthy.
                                       # Disable only for debugging or when backends have external health monitoring.
+remote_dns_refresh = "5m"             # How often to re-resolve the hostnames in remote_addrs, so a backend
+                                      # that changes address (rolling replacement, container reschedule,
+                                      # DNS failover) is picked up without a restart. Resolution happens in
+                                      # the background; logins never wait on DNS. "0" pins the pool to the
+                                      # addresses resolved at startup. A name that stops resolving always
+                                      # keeps its last known addresses.
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
 # Enable PROXY protocol v2 support for incoming connections from HAProxy, nginx, or other load balancers.
@@ -1767,6 +1829,8 @@ remote_use_utf8 = false               # Advertise UTF8/LANG (RFC 6856) in the pr
                                       # (e.g. Dovecot) replies "-ERR Unknown command" and Outlook aborts the
                                       # whole download (0x800CCC90). Default: false (safe).
 remote_health_checks = true           # Enable backend health tracking (default: true)
+remote_dns_refresh = "5m"             # Backend hostname re-resolution interval; "0" pins the pool to the
+                                      # addresses resolved at startup. See the IMAP proxy example above.
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
 # Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
@@ -1821,6 +1885,8 @@ remote_tls_use_starttls = false       # Use STARTTLS for backend connections (re
 remote_tls_verify = true              # Verify backend server TLS certificates
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_health_checks = true           # Enable backend health tracking (default: true)
+remote_dns_refresh = "5m"             # Backend hostname re-resolution interval; "0" pins the pool to the
+                                      # addresses resolved at startup. See the IMAP proxy example above.
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
 # Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
@@ -1877,6 +1943,8 @@ remote_tls_verify = true              # Verify backend server TLS certificates
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
 remote_health_checks = true           # Enable backend health tracking (default: true)
+remote_dns_refresh = "5m"             # Backend hostname re-resolution interval; "0" pins the pool to the
+                                      # addresses resolved at startup. See the IMAP proxy example above.
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
 # Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.

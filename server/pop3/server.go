@@ -112,6 +112,12 @@ type POP3Server struct {
 }
 
 type POP3ServerOptions struct {
+	// AuthLimiterOverride, when non-nil, is used as the session auth limiter
+	// instead of constructing one from AuthRateLimit. Dependency-injection seam
+	// (nil in all production paths); used by tests to observe what the auth paths
+	// record, which is otherwise unobservable from the wire because blocked and
+	// failed replies are deliberately byte-identical.
+	AuthLimiterOverride         serverPkg.AuthLimiter
 	Debug                       bool
 	TLS                         bool
 	TLSCertFile                 string
@@ -172,8 +178,14 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("POP3", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
-	serverPkg.RegisterRateLimiter("pop3", name, authLimiter)
+	// A non-nil AuthLimiterOverride (tests only) replaces the real limiter; the
+	// monitoring registry only accepts the concrete type, so skip it in that case.
+	var authLimiter serverPkg.AuthLimiter = options.AuthLimiterOverride
+	if authLimiter == nil {
+		concrete := serverPkg.NewAuthRateLimiterWithTrustedNetworks("POP3", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
+		serverPkg.RegisterRateLimiter("pop3", name, concrete)
+		authLimiter = concrete
+	}
 
 	// Initialize the master SASL network gate. Fail closed on a misconfigured
 	// allow-list rather than silently disabling the gate.

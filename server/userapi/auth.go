@@ -78,6 +78,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	clientIP := getClientIP(r)
 	remoteAddr := &server.StringAddr{Addr: clientIP}
 
+	// Rate-limit key for this attempt. Canonicalised from the submitted email so
+	// that the check and every RecordAuthAttempt call below use the SAME key. The
+	// credential lookup is case-insensitive, so keying on the raw string let an
+	// attacker flip the case on each attempt and never trip Tier 1.
+	authKey := server.AuthRateLimitKey(req.Email)
+
 	// Reject empty passwords immediately
 	if req.Password == "" {
 		s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
@@ -108,7 +114,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			// Cached failure (same wrong password)
 			logger.Debug("User API: Cache hit - authentication failed", "name", s.name, "email", req.Email)
 			if s.authLimiter != nil {
-				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, false)
+				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
 			}
 			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
 			return
@@ -118,7 +124,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			logger.Debug("User API: Cache hit - using cached auth", "name", s.name, "email", req.Email, "account_id", cachedAccountID)
 			accountID = cachedAccountID
 			if s.authLimiter != nil {
-				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, true)
+				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, true)
 			}
 			// Skip database lookup - use cached account ID
 			goto generateToken
@@ -129,7 +135,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Check authentication rate limiting (after cache check to avoid delays for cached hits)
 	if s.authLimiter != nil {
-		if err := s.authLimiter.CanAttemptAuth(ctx, remoteAddr, req.Email); err != nil {
+		if err := s.authLimiter.CanAttemptAuth(ctx, remoteAddr, authKey); err != nil {
 			// Return the SAME response as a bad-credential failure (401 "Invalid credentials")
 			// rather than a distinct 429. A divergent rate-limit response lets an attacker tell
 			// "this account/IP is being limited" apart from "wrong password", and on a shared
@@ -157,7 +163,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			}
 			// Record failed attempt
 			if s.authLimiter != nil {
-				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, false)
+				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
 			}
 			// Don't reveal whether user exists or not
 			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
@@ -176,7 +182,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		// Record failed attempt
 		if s.authLimiter != nil {
-			s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, false)
+			s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
 		}
 		s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
 		return
@@ -189,7 +195,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Record successful attempt
 	if s.authLimiter != nil {
-		s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, req.Email, true)
+		s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, true)
 	}
 
 generateToken:

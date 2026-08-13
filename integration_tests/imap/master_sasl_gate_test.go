@@ -16,6 +16,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
@@ -25,7 +26,24 @@ import (
 // master SASL credentials and a master_sasl_allowed_networks gate. TrustedNetworks
 // always trusts localhost so the IMAP ID forwarding path is honored — this lets the
 // "not forwardable" test forge an x-originating-ip and prove the gate ignores it.
-func setupIMAPServerWithMasterSASLGate(t *testing.T, allowedNetworks []string) (*common.TestServer, common.TestAccount) {
+// setupIMAPServerWithMasterSASLGateAndLimiter is the gate harness with an injected
+// AuthLimiter, so a test can observe what the auth paths record rather than inferring it
+// from a downstream block that may not be wired in this configuration.
+func setupIMAPServerWithMasterSASLGateAndLimiter(t *testing.T, allowedNetworks []string, limiter server.AuthLimiter) (*common.TestServer, common.TestAccount) {
+	t.Helper()
+	return setupIMAPGate(t, allowedNetworks, server.AuthRateLimiterConfig{Enabled: false}, limiter)
+}
+
+func setupIMAPServerWithMasterSASLGate(t *testing.T, allowedNetworks []string, rateLimit ...server.AuthRateLimiterConfig) (*common.TestServer, common.TestAccount) {
+	t.Helper()
+	limiter := server.AuthRateLimiterConfig{Enabled: false}
+	if len(rateLimit) > 0 {
+		limiter = rateLimit[0]
+	}
+	return setupIMAPGate(t, allowedNetworks, limiter, nil)
+}
+
+func setupIMAPGate(t *testing.T, allowedNetworks []string, limiter server.AuthRateLimiterConfig, override server.AuthLimiter) (*common.TestServer, common.TestAccount) {
 	t.Helper()
 
 	rdb := common.SetupTestDatabase(t)
@@ -64,6 +82,8 @@ func setupIMAPServerWithMasterSASLGate(t *testing.T, allowedNetworks []string) (
 			MasterSASLUsername:        []byte(masterSASLUsername),
 			MasterSASLPassword:        []byte(masterSASLPassword),
 			MasterSASLAllowedNetworks: allowedNetworks,
+			AuthRateLimit:             limiter,
+			AuthLimiterOverride:       override,
 		},
 	)
 	if err != nil {

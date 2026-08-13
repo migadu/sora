@@ -118,7 +118,11 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 
 	if !columnExists {
 		logger.Info("Migrating SQLite database: adding s3_uploaded columns")
-		_, err = db.Exec(`ALTER TABLE messages ADD COLUMN s3_uploaded INTEGER DEFAULT 1`)
+		// DEFAULT 0 must match the fresh schema above. This is the same database file the
+		// importer uses, and a column default added here is permanent for it: a default of
+		// 1 would make every file a later import scan discovers born "already uploaded"
+		// and so invisible to that import. Pre-existing rows are marked below instead.
+		_, err = db.Exec(`ALTER TABLE messages ADD COLUMN s3_uploaded INTEGER DEFAULT 0`)
 		if err != nil {
 			return nil, fmt.Errorf("failed to add s3_uploaded column: %w", err)
 		}
@@ -129,7 +133,7 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		}
 
 		// Mark all existing messages as uploaded (they were in old DB, so they're on S3)
-		_, err = db.Exec(`UPDATE messages SET s3_uploaded_at = CURRENT_TIMESTAMP WHERE s3_uploaded_at IS NULL`)
+		_, err = db.Exec(`UPDATE messages SET s3_uploaded = 1, s3_uploaded_at = CURRENT_TIMESTAMP`)
 		if err != nil {
 			return nil, fmt.Errorf("failed to mark existing messages as uploaded: %w", err)
 		}

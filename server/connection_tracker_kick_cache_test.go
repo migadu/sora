@@ -5,72 +5,92 @@ import (
 	"time"
 )
 
-// mockLookupCache implements LookupCacheInvalidator for testing
-type mockLookupCache struct {
+// fakeLookupCache stands in for pkg/lookupcache.LookupCache, which this package
+// cannot import because lookupcache imports it. It mirrors both entry points of
+// the real cache, and derives keys exactly as lookupcache.makeKey does, so a
+// tracker that invalidates by a key of its own making is caught here.
+type fakeLookupCache struct {
+	entries         map[string]struct{}
 	invalidatedKeys []string
 }
 
-func (m *mockLookupCache) Invalidate(key string) {
-	m.invalidatedKeys = append(m.invalidatedKeys, key)
+func newFakeLookupCache(keys ...string) *fakeLookupCache {
+	c := &fakeLookupCache{entries: make(map[string]struct{}, len(keys))}
+	for _, key := range keys {
+		c.entries[key] = struct{}{}
+	}
+	return c
 }
 
-// TestKickInvalidatesCache verifies that kick events invalidate the cache
-func TestKickInvalidatesCache(t *testing.T) {
-	// Create a connection tracker without cluster (local mode for testing)
-	tracker := NewConnectionTracker("test-protocol", "", "", "test-instance", nil, 0, 0, 100, false)
+func (f *fakeLookupCache) Invalidate(key string) {
+	f.invalidatedKeys = append(f.invalidatedKeys, key)
+	delete(f.entries, key)
+}
 
-	// Create a mock cache
-	mockCache := &mockLookupCache{
-		invalidatedKeys: []string{},
+func (f *fakeLookupCache) InvalidateUser(serverName, username string) {
+	f.Invalidate(lookupCacheKey(serverName, username))
+}
+
+func (f *fakeLookupCache) has(key string) bool {
+	_, ok := f.entries[key]
+	return ok
+}
+
+// lookupCacheKey is lookupcache.makeKey.
+func lookupCacheKey(serverName, username string) string {
+	if serverName == "" {
+		return username
 	}
+	return serverName + ":" + username
+}
 
-	// Set the lookup cache
-	tracker.SetLookupCache(mockCache)
+// The proxies key their lookup cache by the name of the server the session is
+// on, not by the protocol: an entry written by the IMAP proxy named
+// "imap-proxy-1" lives under "imap-proxy-1:user@example.com".
+const (
+	kickCacheProtocol   = "IMAP"
+	kickCacheServerName = "imap-proxy-1"
+)
 
-	// Simulate a kick event
-	kickEvent := ConnectionEvent{
+// TestKickInvalidatesCache verifies that a kick drops the entry the proxy
+// cached for that user, so that the reconnect is looked up afresh.
+func TestKickInvalidatesCache(t *testing.T) {
+	tracker := NewConnectionTracker(kickCacheProtocol, kickCacheServerName, "", "test-instance", nil, 0, 0, 100, false)
+
+	cachedKey := lookupCacheKey(kickCacheServerName, "user@example.com")
+	cache := newFakeLookupCache(cachedKey)
+	tracker.SetLookupCache(cache)
+
+	tracker.handleKick(ConnectionEvent{
 		Type:      ConnectionEventKick,
 		AccountID: 12345,
 		Username:  "user@example.com",
-		Protocol:  "IMAP",
+		Protocol:  kickCacheProtocol,
 		NodeID:    "node-1",
 		Timestamp: time.Now(),
+	})
+
+	if cache.has(cachedKey) {
+		t.Errorf("kicked user keeps a cached lookup entry: %q survived, invalidated %q instead - "+
+			"the kicked session reconnects on stale routing and auth", cachedKey, cache.invalidatedKeys)
 	}
-
-	// Process the kick event
-	tracker.handleKick(kickEvent)
-
-	// Verify cache was invalidated
-	if len(mockCache.invalidatedKeys) != 1 {
-		t.Errorf("Expected 1 cache invalidation, got %d", len(mockCache.invalidatedKeys))
-	}
-
-	expectedKey := "test-protocol:user@example.com"
-	if len(mockCache.invalidatedKeys) > 0 && mockCache.invalidatedKeys[0] != expectedKey {
-		t.Errorf("Expected cache key %s, got %s", expectedKey, mockCache.invalidatedKeys[0])
-	}
-
-	t.Logf("✓ Kick event invalidated cache: %s", expectedKey)
 }
 
 // TestKickWithoutCacheDoesNotPanic verifies that kick works without a cache
 func TestKickWithoutCacheDoesNotPanic(t *testing.T) {
-	// Create a connection tracker without cache
-	tracker := NewConnectionTracker("test-protocol", "", "", "test-instance", nil, 0, 0, 100, false)
+	tracker := NewConnectionTracker(kickCacheProtocol, kickCacheServerName, "", "test-instance", nil, 0, 0, 100, false)
 
 	// Do NOT set lookup cache
 
-	// Simulate a kick event
 	kickEvent := ConnectionEvent{
 		Type:      ConnectionEventKick,
 		AccountID: 12345,
 		Username:  "user@example.com",
-		Protocol:  "IMAP",
+		Protocol:  kickCacheProtocol,
 		NodeID:    "node-1",
 		Timestamp: time.Now(),
 	}
 
-	// Process the kick event - should not panic
 	defer func() {
 		if r := recover(); r != nil {
 			t.Errorf("Kick panicked without cache: %v", r)
@@ -78,49 +98,36 @@ func TestKickWithoutCacheDoesNotPanic(t *testing.T) {
 	}()
 
 	tracker.handleKick(kickEvent)
-	t.Log("✓ Kick without cache did not panic")
 }
 
 // TestKickWithEmptyUsernameDoesNotInvalidate verifies that kick events
 // without username don't attempt cache invalidation
 func TestKickWithEmptyUsernameDoesNotInvalidate(t *testing.T) {
-	tracker := NewConnectionTracker("test-protocol", "", "", "test-instance", nil, 0, 0, 100, false)
+	tracker := NewConnectionTracker(kickCacheProtocol, kickCacheServerName, "", "test-instance", nil, 0, 0, 100, false)
 
-	mockCache := &mockLookupCache{
-		invalidatedKeys: []string{},
-	}
-	tracker.SetLookupCache(mockCache)
+	cache := newFakeLookupCache()
+	tracker.SetLookupCache(cache)
 
-	// Kick event with empty username
 	kickEvent := ConnectionEvent{
 		Type:      ConnectionEventKick,
 		AccountID: 12345,
 		Username:  "", // Empty username
-		Protocol:  "IMAP",
+		Protocol:  kickCacheProtocol,
 		NodeID:    "node-1",
 		Timestamp: time.Now(),
 	}
 
 	tracker.handleKick(kickEvent)
 
-	// Verify cache was NOT invalidated
-	if len(mockCache.invalidatedKeys) != 0 {
-		t.Errorf("Expected 0 cache invalidations, got %d", len(mockCache.invalidatedKeys))
+	if len(cache.invalidatedKeys) != 0 {
+		t.Errorf("Expected 0 cache invalidations, got %d", len(cache.invalidatedKeys))
 	}
-
-	t.Log("✓ Kick with empty username did not invalidate cache")
 }
 
 // TestMultipleKicksInvalidateMultipleCaches tests kicking multiple users
 func TestMultipleKicksInvalidateMultipleCaches(t *testing.T) {
-	tracker := NewConnectionTracker("test-protocol", "", "", "test-instance", nil, 0, 0, 100, false)
+	tracker := NewConnectionTracker(kickCacheProtocol, kickCacheServerName, "", "test-instance", nil, 0, 0, 100, false)
 
-	mockCache := &mockLookupCache{
-		invalidatedKeys: []string{},
-	}
-	tracker.SetLookupCache(mockCache)
-
-	// Kick multiple users
 	users := []struct {
 		accountID int64
 		username  string
@@ -130,30 +137,26 @@ func TestMultipleKicksInvalidateMultipleCaches(t *testing.T) {
 		{11111, "user3@example.com"},
 	}
 
+	cache := newFakeLookupCache()
 	for _, user := range users {
-		kickEvent := ConnectionEvent{
+		cache.entries[lookupCacheKey(kickCacheServerName, user.username)] = struct{}{}
+	}
+	tracker.SetLookupCache(cache)
+
+	for _, user := range users {
+		tracker.handleKick(ConnectionEvent{
 			Type:      ConnectionEventKick,
 			AccountID: user.accountID,
 			Username:  user.username,
-			Protocol:  "IMAP",
+			Protocol:  kickCacheProtocol,
 			NodeID:    "node-1",
 			Timestamp: time.Now(),
-		}
-		tracker.handleKick(kickEvent)
+		})
 	}
 
-	// Verify all caches were invalidated
-	if len(mockCache.invalidatedKeys) != len(users) {
-		t.Errorf("Expected %d cache invalidations, got %d", len(users), len(mockCache.invalidatedKeys))
-	}
-
-	// Verify correct keys
-	for i, user := range users {
-		expectedKey := "test-protocol:" + user.username
-		if i < len(mockCache.invalidatedKeys) && mockCache.invalidatedKeys[i] != expectedKey {
-			t.Errorf("Expected cache key %s, got %s", expectedKey, mockCache.invalidatedKeys[i])
+	for _, user := range users {
+		if key := lookupCacheKey(kickCacheServerName, user.username); cache.has(key) {
+			t.Errorf("kicked user keeps a cached lookup entry: %q survived", key)
 		}
 	}
-
-	t.Logf("✓ Multiple kicks invalidated %d caches", len(mockCache.invalidatedKeys))
 }

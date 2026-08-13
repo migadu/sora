@@ -233,6 +233,7 @@ func (db *Database) streamMessagesByUIDSetChunked(ctx context.Context, mailboxID
 	metrics.MessageFetchChunked.WithLabelValues("uid_set").Inc()
 
 	var lastUID int64
+	var lastSeq uint32
 	chunkCount := 0
 
 	defer func() {
@@ -271,6 +272,9 @@ func (db *Database) streamMessagesByUIDSetChunked(ctx context.Context, mailboxID
 			break
 		}
 
+		// The previous chunk's last message anchors this one: every UID here is above it.
+		anchorUID, anchorSeq := uint32(lastUID), lastSeq
+
 		lastUID = int64(messages[len(messages)-1].UID)
 		chunkCount++
 
@@ -279,9 +283,10 @@ func (db *Database) streamMessagesByUIDSetChunked(ctx context.Context, mailboxID
 			return fmt.Errorf("chunked fetch cancelled: %w", ctx.Err())
 		}
 
-		if err := db.HydrateMessageSequences(ctx, mailboxID, messages); err != nil {
+		if err := db.hydrateChunkSequences(ctx, mailboxID, messages, anchorUID, anchorSeq); err != nil {
 			return err
 		}
+		lastSeq = messages[len(messages)-1].Seq
 
 		if err := cb(messages); err != nil {
 			return err
@@ -370,6 +375,7 @@ func (db *Database) streamMessagesBySeqSetChunked(ctx context.Context, mailboxID
 	metrics.MessageFetchChunked.WithLabelValues("seq_set").Inc()
 
 	var lastUID int64
+	var lastSeq uint32
 	chunkCount := 0
 
 	defer func() {
@@ -409,6 +415,9 @@ func (db *Database) streamMessagesBySeqSetChunked(ctx context.Context, mailboxID
 			break
 		}
 
+		// The previous chunk's last message anchors this one: every UID here is above it.
+		anchorUID, anchorSeq := uint32(lastUID), lastSeq
+
 		lastUID = int64(messages[len(messages)-1].UID)
 		chunkCount++
 
@@ -417,9 +426,10 @@ func (db *Database) streamMessagesBySeqSetChunked(ctx context.Context, mailboxID
 			return fmt.Errorf("chunked fetch cancelled: %w", ctx.Err())
 		}
 
-		if err := db.HydrateMessageSequences(ctx, mailboxID, messages); err != nil {
+		if err := db.hydrateChunkSequences(ctx, mailboxID, messages, anchorUID, anchorSeq); err != nil {
 			return err
 		}
+		lastSeq = messages[len(messages)-1].Seq
 
 		if err := cb(messages); err != nil {
 			return err
@@ -786,6 +796,63 @@ func (db *Database) HydrateSearchMessageSequences(ctx context.Context, mailboxID
 	)
 }
 
+// hydrateChunkSequences assigns sequence numbers to one chunk of a chunked scan.
+// anchorSeq is the sequence number of anchorUID, the last message of the preceding
+// chunk; it is 0 for the first chunk, which has nothing to count from and so falls back
+// to a full hydration.
+//
+// A sequence number is a rank, so deriving one always means counting the live messages
+// that precede it. Counting from the start of the mailbox for every chunk makes a
+// whole-mailbox fetch O(N^2/chunk). Counting from the previous chunk instead confines
+// each scan to the UIDs that chunk spans: the windows are disjoint, so the chunks
+// together cost a single pass over the mailbox.
+//
+// Carrying the anchor forward also keeps one FETCH response internally consistent. A
+// concurrent expunge no longer renumbers the chunks still to come, which is what
+// RFC 3501 §7.4.1 requires when it forbids reporting expunges during a fetch.
+func (db *Database) hydrateChunkSequences(ctx context.Context, mailboxID int64, messages []Message, anchorUID, anchorSeq uint32) error {
+	if anchorSeq == 0 {
+		return db.HydrateMessageSequences(ctx, mailboxID, messages)
+	}
+
+	wanted := make(map[uint32]*Message, len(messages))
+	var maxUID uint32
+	for i := range messages {
+		uid := uint32(messages[i].UID)
+		if uid > maxUID {
+			maxUID = uid
+		}
+		wanted[uid] = &messages[i]
+	}
+
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT m.uid, $2::bigint + ROW_NUMBER() OVER(ORDER BY m.uid)
+		FROM messages m
+		WHERE m.mailbox_id = $1
+		  AND m.expunged_at IS NULL
+		  AND m.uid > $3
+		  AND m.uid <= $4
+	`, mailboxID, int64(anchorSeq), int64(anchorUID), int64(maxUID))
+	if err != nil {
+		return fmt.Errorf("failed to query sequence window after uid %d: %w", anchorUID, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var uid, seq int64
+		if err := rows.Scan(&uid, &seq); err != nil {
+			return fmt.Errorf("failed to scan sequence window: %w", err)
+		}
+		// The window also covers messages this chunk did not ask for; they are only
+		// here to be counted.
+		if msg, ok := wanted[uint32(uid)]; ok {
+			msg.Seq = uint32(seq)
+		}
+	}
+
+	return rows.Err()
+}
+
 func hydrateSequencesCore[T any](
 	ctx context.Context,
 	db *Database,
@@ -914,4 +981,24 @@ func hydrateSequencesCore[T any](
 	}
 
 	return rows.Err()
+}
+
+// CountMessageIDsPresent returns how many of the given message ids currently exist in the
+// messages table. It backs the resolution of an ambiguous COPY commit: the copied rows
+// carry BIGSERIAL primary keys, which are present if and only if the inserting transaction
+// committed and are never reissued to a concurrent writer, so the count answers "did that
+// copy land?" exactly. Callers compare the count against len(ids): equal means committed,
+// zero means rolled back (the INSERT is atomic, so a partial count cannot occur for a
+// single copy operation).
+func (db *Database) CountMessageIDsPresent(ctx context.Context, ids []int64) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	var count int
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx,
+		`SELECT count(*) FROM messages WHERE id = ANY($1)`, ids).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count message ids: %w", err)
+	}
+	return count, nil
 }

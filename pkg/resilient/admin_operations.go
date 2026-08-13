@@ -3,6 +3,7 @@ package resilient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -183,9 +184,9 @@ func (rd *ResilientDatabase) RestoreAccountWithRetry(ctx context.Context, email 
 	return err
 }
 
-func (rd *ResilientDatabase) CleanupFailedUploadsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
+func (rd *ResilientDatabase) CleanupFailedUploadsWithRetry(ctx context.Context, gracePeriod time.Duration, maxAttempts int, instanceLiveness time.Duration) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).CleanupFailedUploads(ctx, tx, gracePeriod)
+		return rd.getOperationalDatabaseForOperation(ctx, true).CleanupFailedUploads(ctx, tx, gracePeriod, maxAttempts, instanceLiveness)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	if err != nil {
@@ -451,6 +452,11 @@ func (rd *ResilientDatabase) FinalizeAccountDeletionsWithRetry(ctx context.Conte
 
 // --- Resilient Execution Helpers ---
 
+// ErrCommitOutcomeUnknown reports that a transaction's COMMIT failed without a
+// definite answer from the server, so the transaction may or may not have been
+// applied. Callers must not assume either outcome; the write is not retried.
+var ErrCommitOutcomeUnknown = errors.New("database commit outcome unknown")
+
 // executeWriteInTxWithRetry provides a generic wrapper for executing a write operation within a resilient, retriable transaction.
 func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context, tx pgx.Tx) (any, error), nonRetryableErrors ...error) (any, error) {
 	var result any
@@ -543,11 +549,17 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 			return retry.Stop(ctx.Err())
 		}
 
+		// A failed Commit is an ambiguous outcome, not a failed write: the COMMIT may
+		// already have been applied server-side and only its acknowledgement lost (a
+		// pooler severing an in-flight COMMIT, a read deadline). Re-running the closure
+		// would then apply it a second time — CopyMessages, which allocates a fresh UID
+		// range and has no idempotency guard, would duplicate every message it copied.
+		// No error class here is safe to retry, including the ones isRetryableError
+		// accepts elsewhere.
 		if err := tx.Commit(ctx); err != nil {
-			if rd.isRetryableError(err) {
-				return err
-			}
-			return retry.Stop(err)
+			logger.Warn("Write transaction commit failed, outcome unknown", "component", "RESILIENT-FAILOVER",
+				"operation", config.OperationName, "error", err)
+			return retry.Stop(fmt.Errorf("%w: %w", ErrCommitOutcomeUnknown, err))
 		}
 
 		result = res

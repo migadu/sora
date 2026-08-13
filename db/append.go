@@ -28,10 +28,17 @@ func truncateHash(hash string) string {
 
 // CopyMessages copies multiple messages from a source mailbox to a destination mailbox within a given transaction.
 // It returns a map of old UIDs to new UIDs.
-func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, error) {
+// CopyMessages copies the given source UIDs into destMailboxID within the caller's
+// transaction. It returns the source→destination UID map AND the BIGSERIAL primary keys
+// of the newly inserted rows. Those ids are the copy's proof of commit: they exist if and
+// only if this transaction committed, and PostgreSQL never reissues a serial value, so a
+// caller that loses the COMMIT acknowledgement (ErrCommitOutcomeUnknown) can read them back
+// to learn — exactly, and immune to concurrency — whether the copy actually landed. See
+// server/imap/copy.go for that resolution.
+func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, []int64, error) {
 	messageUIDMap := make(map[imap.UID]imap.UID)
 	if srcMailboxID == destMailboxID {
-		return nil, fmt.Errorf("source and destination mailboxes cannot be the same")
+		return nil, nil, fmt.Errorf("source and destination mailboxes cannot be the same")
 	}
 
 	// The caller is responsible for beginning and committing/rolling back the transaction.
@@ -39,7 +46,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	// Get the source message IDs and UIDs
 	rows, err := tx.Query(ctx, `SELECT id, uid FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid`, srcMailboxID, uids)
 	if err != nil {
-		return nil, consts.ErrInternalError
+		return nil, nil, consts.ErrInternalError
 	}
 	defer rows.Close()
 
@@ -49,17 +56,17 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		var messageID int64
 		var sourceUID imap.UID
 		if err := rows.Scan(&messageID, &sourceUID); err != nil {
-			return nil, fmt.Errorf("failed to scan message ID and UID: %w", err)
+			return nil, nil, fmt.Errorf("failed to scan message ID and UID: %w", err)
 		}
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
 	}
 	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating through source messages: %w", err)
+		return nil, nil, fmt.Errorf("error iterating through source messages: %w", err)
 	}
 
 	if len(messageIDs) == 0 {
-		return messageUIDMap, nil // No messages to copy
+		return messageUIDMap, nil, nil // No messages to copy
 	}
 
 	// Atomically increment highest_uid for the number of messages being copied.
@@ -67,7 +74,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	numToCopy := int64(len(messageIDs))
 	err = tx.QueryRow(ctx, `UPDATE mailboxes SET highest_uid = highest_uid + $1 WHERE id = $2 RETURNING highest_uid`, numToCopy, destMailboxID).Scan(&newHighestUID)
 	if err != nil {
-		return nil, consts.ErrDBUpdateFailed
+		return nil, nil, consts.ErrDBUpdateFailed
 	}
 
 	// Calculate the new UIDs for the copied messages.
@@ -82,7 +89,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	// Fetch destination mailbox name within the same transaction
 	var destMailboxName string
 	if err := tx.QueryRow(ctx, "SELECT name FROM mailboxes WHERE id = $1", destMailboxID).Scan(&destMailboxName); err != nil {
-		return nil, fmt.Errorf("failed to get destination mailbox name: %w", err)
+		return nil, nil, fmt.Errorf("failed to get destination mailbox name: %w", err)
 	}
 
 	// Keyword identity is case-insensitive (RFC 9051 §2.3.2): fold each copied
@@ -90,13 +97,18 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	// destination never ends up reporting two cases of the same keyword.
 	customFlagsCanon, err := db.canonicalizeMovedCustomFlags(ctx, tx, destMailboxID, messageIDs)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	// Batch insert the copied messages.
+	// Batch insert the copied messages and their state in one round trip. The
+	// message_state INSERT is a data-modifying CTE, which PostgreSQL executes to
+	// completion exactly once regardless of whether the primary query reads its
+	// output, so the top-level SELECT can return the new message ids while the state
+	// rows are still written. Those ids are the copy's commit proof (see the doc
+	// comment above).
 	// RFC 3501 §2.3.2: \Recent is a session flag and must NOT be stored
 	// persistently.  Preserve only the source message's existing flags.
-	_, err = tx.Exec(ctx, `
+	insRows, err := tx.Query(ctx, `
 		WITH src_data AS (
 			SELECT
 				m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
@@ -128,15 +140,32 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				new_uid
 			FROM src_data
 			RETURNING id, uid
+		),
+		state_inserted AS (
+			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
+			SELECT i.id, $1, ms.flags, s.custom_flags_canon, NOW(), nextval('messages_modseq')
+			FROM inserted i
+			JOIN src_data s ON s.new_uid = i.uid
+			JOIN message_state ms ON ms.message_id = s.original_id
+			RETURNING message_id
 		)
-		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-		SELECT i.id, $1, ms.flags, s.custom_flags_canon, NOW(), nextval('messages_modseq')
-		FROM inserted i
-		JOIN src_data s ON s.new_uid = i.uid
-		JOIN message_state ms ON ms.message_id = s.original_id
+		SELECT id FROM inserted ORDER BY uid
 	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart)
 	if err != nil {
-		return nil, fmt.Errorf("failed to batch copy messages: %w", err)
+		return nil, nil, fmt.Errorf("failed to batch copy messages: %w", err)
+	}
+	var newMessageIDs []int64
+	for insRows.Next() {
+		var id int64
+		if err := insRows.Scan(&id); err != nil {
+			insRows.Close()
+			return nil, nil, fmt.Errorf("failed to scan new message id: %w", err)
+		}
+		newMessageIDs = append(newMessageIDs, id)
+	}
+	insRows.Close()
+	if err := insRows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("error iterating new message ids: %w", err)
 	}
 
 	// Re-stage uploads for any copied rows whose body is not yet in S3, so the
@@ -147,10 +176,10 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	// ON CONFLICT makes this a no-op for same-account copies, where the source's
 	// pending_upload already covers (content_hash, account_id).
 	if err := db.restagePendingUploads(ctx, tx, destMailboxID, newUIDs, instanceID); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return messageUIDMap, nil
+	return messageUIDMap, newMessageIDs, nil
 }
 
 // restagePendingUploads ensures every just-inserted, not-yet-uploaded message in
@@ -183,7 +212,11 @@ type InsertMessageOptions struct {
 	S3Domain    string
 	S3Localpart string
 	ContentHash string
-	MessageID   string
+	// DeliveryHash identifies the upstream submission: the hash of the message bytes
+	// as received, before any local trace stamping. Empty on non-MTA paths (IMAP
+	// APPEND, importer, User API), which disables the retry-duplicate check below.
+	DeliveryHash string
+	MessageID    string
 	// CustomFlags are handled by splitting options.Flags in InsertMessage
 	Flags                []imap.Flag
 	InternalDate         time.Time
@@ -198,6 +231,17 @@ type InsertMessageOptions struct {
 	PreservedUID         *uint32       // Optional: preserved UID from import
 	PreservedUIDValidity *uint32       // Optional: preserved UIDVALIDITY from import
 	FTSRetention         time.Duration // Optional: skip creating messages_fts entirely for messages older than this
+}
+
+// shouldStageFTS reports whether a messages_fts row is worth creating. A zero
+// retention means FTS data is kept indefinitely, so everything is staged. A
+// message already past the retention window is skipped: the row would only add
+// immediate work for the cleanup worker.
+func shouldStageFTS(retention time.Duration, sentDate, now time.Time) bool {
+	if retention == 0 || sentDate.IsZero() {
+		return true
+	}
+	return !sentDate.Before(now.Add(-retention))
 }
 
 func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
@@ -346,6 +390,27 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	}
 	// err == pgx.ErrNoRows means no exact duplicate found, continue with insert
 
+	// An MTA redelivery of the same queue entry. The check above cannot see one: the
+	// delivering session stamps its own per-attempt trace header before content_hash is
+	// computed, and a message with no Message-ID gets a fresh synthetic one per attempt.
+	if options.DeliveryHash != "" {
+		err = tx.QueryRow(ctx, `
+			SELECT uid FROM messages
+			WHERE mailbox_id = $1
+			AND delivery_hash = $2
+			AND expunged_at IS NULL
+			LIMIT 1`,
+			options.MailboxID, options.DeliveryHash).Scan(&existingUID)
+
+		if err == nil {
+			logger.Info("Database: duplicate delivery detected, skipping insert", "message_id", saneMessageID, "delivery_hash", options.DeliveryHash, "mailbox_id", options.MailboxID, "existing_uid", existingUID)
+			return 0, existingUID, consts.ErrMessageExists
+		} else if err != pgx.ErrNoRows {
+			logger.Error("Database: failed to check for duplicate delivery", "err", err)
+			return 0, 0, consts.ErrDBQueryFailed
+		}
+	}
+
 	// Sanitize recipients defensively before JSON marshaling.
 	// json.Marshal encodes NULL bytes as \u0000, which PostgreSQL JSONB rejects (SQLSTATE 22P05).
 	saneRecipients := make([]helpers.Recipient, len(options.Recipients))
@@ -431,12 +496,17 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
 
+	var deliveryHash *string
+	if options.DeliveryHash != "" {
+		deliveryHash = &options.DeliveryHash
+	}
+
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
 			INSERT INTO messages
-				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, "references", body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, delivery_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, "references", body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
 			VALUES
-				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @in_reply_to, @references, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort)
+				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @delivery_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @in_reply_to, @references, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort)
 			RETURNING id
 		)
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -451,6 +521,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		"uid":             uidToUse,
 		"message_id":      saneMessageID,
 		"content_hash":    options.ContentHash,
+		"delivery_hash":   deliveryHash,
 		"flags":           bitwiseFlags,
 		"custom_flags":    customKeywordsJSON,
 		"internal_date":   options.InternalDate,
@@ -533,11 +604,21 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		logger.Info("Database: message marked as uploaded via content deduplication",
 			"content_hash", truncateHash(options.ContentHash), "account_id", upload.AccountID)
 	} else {
-		// Content not yet uploaded - create pending_upload
+		// Content not yet uploaded - create pending_upload.
+		//
+		// An existing row is re-armed rather than left alone: this delivery has just
+		// written a fresh spool file on this instance, so the body is here again even if
+		// an earlier copy's file went missing and the uploader exhausted the row's
+		// attempts (ExhaustUploadAttempts). Without the reset, AcquireAndLeasePendingUploads
+		// — which requires attempts < maxAttempts and instance_id = its own — would never
+		// lease the row again, and CleanupFailedUploads would eventually delete this
+		// message. Clearing last_attempt makes it leasable on the next worker tick; the
+		// owning instance's heartbeat carries the liveness signal the cleaner reaps by.
 		_, err = tx.Exec(ctx, `
 			INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
 			VALUES ($1, $2, $3, $4, $5)
-			ON CONFLICT (content_hash, account_id) DO NOTHING`,
+			ON CONFLICT (content_hash, account_id) DO UPDATE
+			SET attempts = 0, instance_id = EXCLUDED.instance_id, last_attempt = NULL`,
 			upload.InstanceID,
 			upload.ContentHash,
 			upload.Size,
@@ -557,10 +638,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	// are secured. This safely enqueues the raw payloads for the background daemon
 	// to asynchronously perform the expensive to_tsvector() conversion. If this fails, the message is still
 	// delivered and uploaded to S3 — it just won't be FTS-searchable.
-	//
-	// Skip messages_fts entirely when the message is already past the FTS retention
-	// window. Creating the row would only add immediate work for the cleanup worker.
-	if options.FTSRetention == 0 || options.SentDate.IsZero() || !options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
+	if shouldStageFTS(options.FTSRetention, options.SentDate, time.Now()) {
 		// Decide what to store in messages_fts.
 		// Skip very large bodies (>64KB) — the full content is always available in S3.
 		// text_body is staged in messages_fts, then processed by fts_worker.
@@ -884,9 +962,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		return 0, 0, consts.ErrDBInsertFailed
 	}
 
-	// Skip messages_fts entirely when the message is already past the FTS retention
-	// window. Creating the row would only add immediate work for the cleanup worker.
-	if options.FTSRetention == 0 || options.SentDate.IsZero() || !options.SentDate.Before(time.Now().Add(-options.FTSRetention)) {
+	if shouldStageFTS(options.FTSRetention, options.SentDate, time.Now()) {
 		// Decide what to store in messages_fts.
 		// Skip very large bodies (>64KB) — the full content is always available in S3.
 		const maxStoredBodySize = 64 * 1024 // 64 KB
@@ -1235,6 +1311,10 @@ func (d *Database) InsertMessagesBatch(
 	// 6. Execute Inserts via pgx.Batch
 	batch := &pgx.Batch{}
 
+	// The queue loop below and the result loop that follows it must reach identical
+	// staging decisions, so both evaluate the retention window against this instant.
+	ftsNow := time.Now()
+
 	for _, p := range uniqueProcessed {
 		uploaded := isImporter || uploadedHashesSet[p.Opt.ContentHash]
 
@@ -1261,13 +1341,11 @@ func (d *Database) InsertMessagesBatch(
 			batch.Queue(`
 				INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
 				VALUES ($1, $2, $3, NOW(), $4)
-				ON CONFLICT (content_hash) DO NOTHING
+				ON CONFLICT (content_hash, account_id) DO NOTHING
 			`, p.Upload.InstanceID, p.Upload.ContentHash, p.Upload.Size, p.Upload.AccountID)
 		}
 
-		if p.Opt.FTSRetention == 0 || !p.Opt.SentDate.IsZero() && p.Opt.SentDate.Before(time.Now().Add(-p.Opt.FTSRetention)) {
-			// Skip FTS
-		} else {
+		if shouldStageFTS(p.Opt.FTSRetention, p.Opt.SentDate, ftsNow) {
 			const maxStoredBodySize = 64 * 1024 // 64 KB
 			var textBodyArg any = p.SanePlaintextBody
 
@@ -1321,9 +1399,7 @@ func (d *Database) InsertMessagesBatch(
 			}
 		}
 
-		if p.Opt.FTSRetention == 0 || !p.Opt.SentDate.IsZero() && p.Opt.SentDate.Before(time.Now().Add(-p.Opt.FTSRetention)) {
-			// Skip FTS
-		} else {
+		if shouldStageFTS(p.Opt.FTSRetention, p.Opt.SentDate, ftsNow) {
 			textBodyStr, _ := p.SanePlaintextBody, false
 			if len(p.SanePlaintextBody) > 64*1024 {
 				textBodyStr = "..." // Mocked just to check if we queued it

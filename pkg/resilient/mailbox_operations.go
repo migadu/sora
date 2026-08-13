@@ -2,6 +2,7 @@ package resilient
 
 import (
 	"context"
+	"errors"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
@@ -297,15 +298,56 @@ func (rd *ResilientDatabase) ResolveAccountS3Owner(ctx context.Context, accountI
 
 // --- Mailbox Management Wrappers ---
 
-func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, error) {
+// CopyMessagesWithRetry copies messages and returns the source→destination UID map plus
+// the BIGSERIAL ids of the newly inserted rows.
+//
+// The ids matter on exactly one error: ErrCommitOutcomeUnknown, where the COMMIT may or
+// may not have applied. The wrapper discards the transaction's return value in that case,
+// so the ids and UID map are captured by side effect into these local variables during the
+// (single) transaction attempt — a commit failure is never retried, so the capture reflects
+// the one attempt that reached commit. They are returned alongside the ambiguous error so
+// the caller (server/imap/copy.go) can read the ids back and learn, exactly and immune to
+// concurrency, whether the copy landed. On any other error the transaction definitely did
+// not commit, so nil is returned.
+func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, []int64, error) {
+	var capturedUIDMap map[imap.UID]imap.UID
+	var capturedIDs []int64
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).CopyMessages(ctx, tx, uids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID)
+		uidMap, ids, err := rd.getOperationalDatabaseForOperation(ctx, true).CopyMessages(ctx, tx, uids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID)
+		if err != nil {
+			return nil, err
+		}
+		capturedUIDMap = uidMap
+		capturedIDs = ids
+		return uidMap, nil
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, ErrCommitOutcomeUnknown) {
+			// Hand back the in-flight capture so the caller can resolve the ambiguity.
+			return capturedUIDMap, capturedIDs, err
+		}
+		return nil, nil, err
 	}
-	return result.(map[imap.UID]imap.UID), nil
+	return result.(map[imap.UID]imap.UID), capturedIDs, nil
+}
+
+// CopiedMessagesCommittedWithRetry reports whether a copy whose COMMIT acknowledgement was
+// lost actually landed, by checking whether its BIGSERIAL row ids are present. It returns
+// true only when every id exists (the copy committed), so a caller that answers OK on true
+// can never confirm a copy that rolled back. An empty id set is treated as not committed.
+func (rd *ResilientDatabase) CopiedMessagesCommittedWithRetry(ctx context.Context, ids []int64) (bool, error) {
+	if len(ids) == 0 {
+		return false, nil
+	}
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).CountMessageIDsPresent(ctx, ids)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(int) == len(ids), nil
 }
 
 func (rd *ResilientDatabase) CreateMailboxWithRetry(ctx context.Context, AccountID int64, name string, parentID *int64) error {
