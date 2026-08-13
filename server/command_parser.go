@@ -127,21 +127,35 @@ func UnquoteString(str string) string {
 	return result.String()
 }
 
-// ParseLiteral parses an IMAP literal string {size} and returns the size.
+// ParseLiteral parses an IMAP literal string {size} or {size+} and returns
+// the size plus whether the literal is non-synchronizing. Non-synchronizing
+// literals ({size+}, RFC 7888 LITERAL+) are base functionality in IMAP4rev2
+// (RFC 9051 §4.3): the client sends the literal data immediately without
+// waiting for a continuation response, so callers must NOT send one.
 // Returns error if the format is invalid or size is negative.
-func ParseLiteral(str string) (int, error) {
+func ParseLiteral(str string) (size int, nonSync bool, err error) {
 	if !strings.HasPrefix(str, "{") || !strings.HasSuffix(str, "}") {
-		return 0, fmt.Errorf("not a literal")
+		return 0, false, fmt.Errorf("not a literal")
 	}
 
 	sizeStr := str[1 : len(str)-1]
-	size, err := strconv.Atoi(sizeStr)
-	if err != nil {
-		return 0, fmt.Errorf("invalid literal size: %w", err)
+	if strings.HasSuffix(sizeStr, "+") {
+		nonSync = true
+		sizeStr = sizeStr[:len(sizeStr)-1]
 	}
-	if size < 0 {
-		return 0, fmt.Errorf("negative literal size")
+	// RFC grammar allows digits only (Atoi would also accept a leading sign)
+	if sizeStr == "" {
+		return 0, false, fmt.Errorf("empty literal size")
+	}
+	for _, c := range sizeStr {
+		if c < '0' || c > '9' {
+			return 0, false, fmt.Errorf("invalid literal size: %q", sizeStr)
+		}
+	}
+	size, err = strconv.Atoi(sizeStr)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid literal size: %w", err)
 	}
 
-	return size, nil
+	return size, nonSync, nil
 }

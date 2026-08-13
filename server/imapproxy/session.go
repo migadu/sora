@@ -211,7 +211,7 @@ func (s *Session) handleConnection() {
 
 				// Check if username is a literal
 				if strings.HasPrefix(args[0], "{") && strings.HasSuffix(args[0], "}") {
-					literalSize, err := server.ParseLiteral(args[0])
+					literalSize, nonSync, err := server.ParseLiteral(args[0])
 					if err != nil || literalSize > 8192 {
 						if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in username", tag)) {
 							return
@@ -219,8 +219,11 @@ func (s *Session) handleConnection() {
 						continue
 					}
 
-					// Send continuation (RFC 9051: continue-req = "+" SP ...)
-					s.sendResponse("+ ")
+					// Send continuation (RFC 9051: continue-req = "+" SP ...) only for
+					// synchronizing literals; for {N+} the data is already in flight.
+					if !nonSync {
+						s.sendResponse("+ ")
+					}
 
 					// Read literal data
 					literalBuf := make([]byte, literalSize)
@@ -252,7 +255,7 @@ func (s *Session) handleConnection() {
 
 					// Check if password is a literal
 					if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
-						literalSize, err := server.ParseLiteral(line)
+						literalSize, nonSync, err := server.ParseLiteral(line)
 						if err != nil || literalSize > 8192 {
 							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
 								return
@@ -260,8 +263,11 @@ func (s *Session) handleConnection() {
 							continue
 						}
 
-						// Send continuation (RFC 9051: continue-req = "+" SP ...)
-						s.sendResponse("+ ")
+						// Send continuation (RFC 9051: continue-req = "+" SP ...) only for
+						// synchronizing literals; for {N+} the data is already in flight.
+						if !nonSync {
+							s.sendResponse("+ ")
+						}
 
 						// Read literal data
 						literalBuf := make([]byte, literalSize)
@@ -286,7 +292,7 @@ func (s *Session) handleConnection() {
 
 					// Check if password is a literal (username was not)
 					if strings.HasPrefix(args[1], "{") && strings.HasSuffix(args[1], "}") {
-						literalSize, err := server.ParseLiteral(args[1])
+						literalSize, nonSync, err := server.ParseLiteral(args[1])
 						if err != nil || literalSize > 8192 {
 							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
 								return
@@ -294,8 +300,11 @@ func (s *Session) handleConnection() {
 							continue
 						}
 
-						// Send continuation (RFC 9051: continue-req = "+" SP ...)
-						s.sendResponse("+ ")
+						// Send continuation (RFC 9051: continue-req = "+" SP ...) only for
+						// synchronizing literals; for {N+} the data is already in flight.
+						if !nonSync {
+							s.sendResponse("+ ")
+						}
 
 						// Read literal data
 						literalBuf := make([]byte, literalSize)
