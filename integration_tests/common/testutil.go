@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -2316,3 +2318,110 @@ func DialLMTP(address string) (net.Conn, error) {
 
 	return conn, nil
 }
+
+var (
+	soraAdminBinaryOnce sync.Once
+	soraAdminBinaryPath string
+)
+
+// FindRepoRoot walks up the directory tree looking for go.mod to locate the repository root.
+func FindRepoRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return "", fmt.Errorf("go.mod not found in any parent directory")
+}
+
+// GetTestConfigPath returns the absolute path to config-test.toml.
+func GetTestConfigPath(t testing.TB) string {
+	if t != nil {
+		t.Helper()
+	}
+	repoRoot, err := FindRepoRoot()
+	if err != nil {
+		if t != nil {
+			t.Fatalf("Failed to locate repo root: %v", err)
+		}
+		panic(err)
+	}
+	configPath := filepath.Join(repoRoot, "config-test.toml")
+	if _, err := os.Stat(configPath); err != nil {
+		if t != nil {
+			t.Fatalf("config-test.toml not found at %s: %v", configPath, err)
+		}
+		panic(err)
+	}
+	return configPath
+}
+
+// GetSoraAdminBinary returns the absolute path to the sora-admin binary used by
+// tests that exec the CLI directly.
+//
+// The binary is always rebuilt from the current working tree (a no-op rebuild
+// costs ~0.3s thanks to the build cache) so tests can never silently run against
+// a stale binary left over from another branch. Set SORA_ADMIN_BIN to point at a
+// prebuilt binary instead.
+func GetSoraAdminBinary(t testing.TB) string {
+	if t != nil {
+		t.Helper()
+	}
+	soraAdminBinaryOnce.Do(func() {
+		if envBin := os.Getenv("SORA_ADMIN_BIN"); envBin != "" {
+			if _, err := os.Stat(envBin); err == nil {
+				soraAdminBinaryPath = envBin
+				return
+			}
+		}
+
+		repoRoot, err := FindRepoRoot()
+		if err != nil {
+			if t != nil {
+				t.Fatalf("Failed to locate repo root for sora-admin: %v", err)
+			}
+			panic(err)
+		}
+
+		// Build to a process-private path, then rename into place: several test
+		// packages may run concurrently, and rename is atomic (a binary already
+		// executing keeps its own inode).
+		targetBin := filepath.Join(repoRoot, "integration_tests", "sora-admin")
+		tmpBin := fmt.Sprintf("%s.build-%d", targetBin, os.Getpid())
+		cmd := exec.Command("go", "build", "-o", tmpBin, "./cmd/sora-admin")
+		cmd.Dir = repoRoot
+		if out, err := cmd.CombinedOutput(); err != nil {
+			os.Remove(tmpBin)
+			if t != nil {
+				t.Fatalf("Failed to build sora-admin at %s: %v\nOutput: %s", targetBin, err, string(out))
+			}
+			panic(fmt.Sprintf("Failed to build sora-admin: %v: %s", err, string(out)))
+		}
+		if err := os.Rename(tmpBin, targetBin); err != nil {
+			os.Remove(tmpBin)
+			if t != nil {
+				t.Fatalf("Failed to install sora-admin at %s: %v", targetBin, err)
+			}
+			panic(fmt.Sprintf("Failed to install sora-admin at %s: %v", targetBin, err))
+		}
+		soraAdminBinaryPath = targetBin
+	})
+
+	if soraAdminBinaryPath == "" {
+		if t != nil {
+			t.Fatalf("sora-admin binary not available")
+		}
+		panic("sora-admin binary not available")
+	}
+	return soraAdminBinaryPath
+}
+
