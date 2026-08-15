@@ -81,6 +81,21 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		return nil
 	}
 
+	// Concurrency guard: the NOTIFY pump runs Poll concurrently with the
+	// per-command Poll. Both may read the same cursor under the read lock,
+	// fetch the same delta from the database, and reach here. Whoever takes
+	// the write lock second would re-apply updates the first already
+	// delivered — duplicate QueueExpunge (shifting the tracker's sequence
+	// numbers) and duplicate unsolicited responses. If the cursor advanced
+	// while we were unlocked, another Poll already handled this window; drop
+	// our now-stale delta. The cursor is monotonic (never regresses), so an
+	// inequality is a sufficient and safe check.
+	if s.currentHighestModSeq.Load() != highestModSeqToPollFrom {
+		release()
+		s.DebugLog("skipping stale concurrent poll", "polled_from", highestModSeqToPollFrom, "current", s.currentHighestModSeq.Load())
+		return nil
+	}
+
 	// Determine the highest MODSEQ from the updates processed in this poll.
 	// Start with the MODSEQ we polled from, in case no updates are found.
 	maxModSeqInThisPoll := highestModSeqToPollFrom
@@ -91,9 +106,16 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 			}
 		}
 		s.currentHighestModSeq.Store(maxModSeqInThisPoll)
-	} else {
+	} else if poll.ModSeq > highestModSeqToPollFrom {
 		// If there were no specific message updates, update to the global current_modseq
 		// to ensure the session eventually catches up if the mailbox is truly idle.
+		//
+		// The cursor must never move backwards: with multiple read replicas at
+		// different lag, a poll answered by a laggier replica can report a
+		// HIGHESTMODSEQ below the session cursor. Storing it would replay
+		// updates the client already saw on the next poll — duplicate
+		// unsolicited FETCHes at best, re-queued EXPUNGEs tripping the
+		// desync-BYE path at worst.
 		s.currentHighestModSeq.Store(poll.ModSeq)
 	}
 

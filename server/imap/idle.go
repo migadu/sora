@@ -30,6 +30,11 @@ func (s *IMAPSession) Idle(ctx context.Context, w *imapserver.UpdateWriter, done
 	metrics.IMAPIdleConnections.Inc()
 	defer metrics.IMAPIdleConnections.Dec()
 
+	// Mark the session as idling so the NOTIFY pump releases SELECTED-DELAYED
+	// expunges: IDLE is a delayed-expunge sync point (RFC 5465 §6.1.2).
+	s.idling.Store(true)
+	defer s.idling.Store(false)
+
 	// Suspend throughput checking when entering IDLE
 	// IDLE is expected to have minimal traffic (just periodic "still here" responses)
 	// and legitimate clients may stay idle for 29 minutes waiting for new mail.
@@ -79,8 +84,15 @@ func (s *IMAPSession) Idle(ctx context.Context, w *imapserver.UpdateWriter, done
 			nextKeepalive = time.Now().Add(keepalive)
 		}
 		if !time.Now().Before(nextPoll) {
-			if err := s.Poll(ctx, w, true); err != nil {
-				return err
+			// While a NOTIFY watch is active, the notify pump is the single
+			// event source: it polls per the client's NOTIFY filters
+			// (RFC 5465 §3.1 — no SELECTED specifier means no message events
+			// for the selected mailbox, which classic IDLE polling would
+			// violate). IDLE then only keeps the connection alive.
+			if !s.notifyWatchActive() {
+				if err := s.Poll(ctx, w, true); err != nil {
+					return err
+				}
 			}
 			nextPoll = time.Now().Add(idlePollInterval)
 		}

@@ -327,6 +327,31 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 
 	rdb := SetupTestDatabase(t)
 	account := CreateTestAccount(t, rdb)
+	return setupIMAPServerWith(t, rdb, "localhost"), account
+}
+
+// SetupSecondIMAPNode starts an additional, independent IMAP server instance
+// backed by its own database connection pool pointing at the SAME database as
+// an existing node. It is a faithful in-process simulation of a second sora
+// node in a shared-database deployment: the two servers share no Go-level
+// state, so anything one observes about the other propagates only through the
+// database. Use it with an account created against the first node to exercise
+// cross-node behavior (e.g. an APPEND on node A observed by a NOTIFY session on
+// node B). The instance uses a distinct hostname so its upload worker does not
+// contend with the first node's for pending_uploads rows.
+func SetupSecondIMAPNode(t *testing.T) *TestServer {
+	t.Helper()
+	rdb := SetupTestDatabase(t)
+	return setupIMAPServerWith(t, rdb, "localhost-node2")
+}
+
+// setupIMAPServerWith builds and starts an IMAP server bound to a fresh address
+// using the given database and a hostname/instance identity. The hostname is
+// used both for imap.New and for the upload worker's instanceID, which must
+// match so the worker claims the pending_uploads rows this node writes.
+func setupIMAPServerWith(t *testing.T, rdb *resilient.ResilientDatabase, hostname string) *TestServer {
+	t.Helper()
+
 	address := GetRandomAddress(t)
 
 	// Create a temporary directory for the uploader
@@ -343,8 +368,8 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 	// query paths filter on m.uploaded = true; without a working upload path,
 	// freshly-APPENDed messages would be invisible to FETCH.
 	//
-	// IMPORTANT: instanceID must match the IMAP server's hostname ("localhost")
-	// because pending_uploads.instance_id is set to the server's hostname, and
+	// IMPORTANT: instanceID must match the IMAP server's hostname because
+	// pending_uploads.instance_id is set to the server's hostname, and
 	// AcquireAndLeasePendingUploads queries WHERE instance_id = $1.
 	uploadWorker, err := uploader.NewWithS3Interface(
 		tempDir,     // path
@@ -353,7 +378,7 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 		3,           // maxAttempts
 		time.Second, // retryInterval
 		0,           // maxStagingSize
-		"localhost", // instanceID — must match imap.New hostname arg
+		hostname,    // instanceID — must match imap.New hostname arg
 		rdb,         // database
 		&NoopUploaderS3{},
 		&NoopUploaderCache{}, // keeps local file on disk so getMessageBody can fall back to disk when S3 unavailable
@@ -389,7 +414,7 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 	server, err := imap.New(
 		context.Background(),
 		"test",
-		"localhost",
+		hostname,
 		address,
 		&storage.S3Storage{},
 		rdb,
@@ -436,7 +461,7 @@ func SetupIMAPServer(t *testing.T) (*TestServer, TestAccount) {
 		ResilientDB:  rdb,
 		uploadWorker: uploadWorker,
 		UploadPath:   tempDir,
-	}, account
+	}
 }
 
 // SetupIMAPServerWithRealS3 creates an IMAP server backed by an in-memory FakeS3
