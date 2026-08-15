@@ -497,7 +497,7 @@ func (s *Session) handleConnection() {
 			return
 
 		case "CAPABILITY":
-			s.sendResponse("* CAPABILITY IMAP4rev2 IMAP4rev1 AUTH=PLAIN LOGIN" + s.server.additionalCapsSuffix)
+			s.sendResponse("* CAPABILITY " + PreAuthCapabilities + s.server.additionalCapsSuffix)
 			s.sendResponse(fmt.Sprintf("%s OK CAPABILITY completed", tag))
 
 		case "ID":
@@ -558,12 +558,37 @@ func (s *Session) handleAuthError(response string) bool {
 	return false
 }
 
+// PreAuthCapabilities is the capability list the proxy advertises before
+// authentication, in the greeting and in response to CAPABILITY. It is the
+// single source of truth for both so they cannot drift.
+//
+// Every token here is a promise the pre-auth loop actually keeps:
+//   - IMAP4rev2/IMAP4rev1: rev2 clients (Outlook) send {N+} literals as
+//     baseline behavior; the pre-auth parser accepts them (LOGIN, ID).
+//   - SASL-IR (RFC 4959): AUTHENTICATE PLAIN <initial-response> is accepted;
+//     advertising it saves compliant clients a round trip.
+//   - LITERAL- (RFC 7888): non-synchronizing literals up to 4096 bytes. The
+//     pre-auth path bounds literals at 8 KiB, so LITERAL+ (any size) would be
+//     a promise it cannot keep — a client streaming a large {N+} literal would
+//     get BAD after the bytes are already in flight and desynchronize.
+//     Credentials and ID values fit comfortably; larger literals fall back to
+//     synchronizing form, which is handled with a continuation.
+//   - AUTH=PLAIN: the only SASL mechanism the proxy accepts. Do NOT list
+//     mechanisms the loop rejects — a bare "LOGIN" token used to sit here; it
+//     is not a capability (RFC 3501 signals LOGIN support by the ABSENCE of
+//     LOGINDISABLED) and read as AUTH=LOGIN it advertised a mechanism that
+//     AUTHENTICATE refused.
+//
+// Post-auth the session is a raw relay and the backend's real capabilities
+// take over. TestIMAPProxyGreetingCapabilities pins this list.
+const PreAuthCapabilities = "IMAP4rev2 IMAP4rev1 SASL-IR LITERAL- AUTH=PLAIN"
+
 // sendGreeting sends the IMAP greeting.
 func (s *Session) sendGreeting() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	greeting := "* OK [CAPABILITY IMAP4rev2 IMAP4rev1 AUTH=PLAIN LOGIN" + s.server.additionalCapsSuffix + "] Proxy Ready\r\n"
+	greeting := "* OK [CAPABILITY " + PreAuthCapabilities + s.server.additionalCapsSuffix + "] Proxy Ready\r\n"
 	_, err := s.clientWriter.WriteString(greeting)
 	if err != nil {
 		return err
