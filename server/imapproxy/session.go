@@ -501,6 +501,18 @@ func (s *Session) handleConnection() {
 			s.sendResponse(fmt.Sprintf("%s OK CAPABILITY completed", tag))
 
 		case "ID":
+			// The ID argument list may carry string literals (RFC 2971 allows
+			// nstring values; IMAP4rev2 clients such as Outlook send them as
+			// non-synchronizing {N+} literals). ParseLine only sees the first
+			// physical line, so drain any literal continuation lines here —
+			// otherwise the literal payload is read back as commands and burns
+			// the pre-auth error budget before LOGIN is ever reached.
+			if err := s.drainLiterals(args); err != nil {
+				if s.handleAuthError(fmt.Sprintf("%s BAD %s", tag, err.Error())) {
+					return
+				}
+				continue
+			}
 			idName := s.server.idName
 			if idName == "" {
 				idName = "Sora"
@@ -542,6 +554,47 @@ func (s *Session) handleConnection() {
 	// Start proxying (at this point backend connection must be successful)
 	s.DebugLog("starting proxy for user")
 	s.startProxy()
+}
+
+// drainLiterals consumes the literal payloads announced by a pre-auth command
+// whose arguments the proxy does not need to inspect (ID). Only the LAST token
+// of a physical line can be a literal announcement; after the literal bytes,
+// the client sends the rest of the command on a fresh line, which may itself
+// end in another literal. For synchronizing literals ({N}) the proxy must send
+// a continuation before the client transmits; for {N+} the data is already in
+// flight. Each literal is bounded to keep the pre-auth path memory-safe.
+func (s *Session) drainLiterals(args []string) error {
+	const maxPreAuthLiteral = 8192
+	for len(args) > 0 {
+		last := args[len(args)-1]
+		if !strings.HasPrefix(last, "{") || !strings.HasSuffix(last, "}") {
+			return nil
+		}
+		size, nonSync, err := server.ParseLiteral(last)
+		if err != nil || size > maxPreAuthLiteral {
+			return fmt.Errorf("Invalid literal")
+		}
+		if !nonSync {
+			s.sendResponse("+ ")
+		}
+		if _, err := io.ReadFull(s.clientReader, make([]byte, size)); err != nil {
+			return fmt.Errorf("Failed to read literal")
+		}
+		// Rest of the command line after the literal (may end in another literal).
+		rest, err := server.ReadBoundedLine(s.clientReader, 65536)
+		if err != nil {
+			return fmt.Errorf("Failed to read command continuation")
+		}
+		rest = strings.TrimSpace(strings.TrimRight(rest, "\r\n"))
+		if rest == "" {
+			return nil
+		}
+		_, _, args, err = server.ParseLine("x CMD "+rest, true)
+		if err != nil {
+			return fmt.Errorf("Malformed command continuation")
+		}
+	}
+	return nil
 }
 
 // handleAuthError increments the error count, sends an error response, and
