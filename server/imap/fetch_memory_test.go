@@ -246,3 +246,26 @@ func TestFetch_PartialOfMalformedBodyIsSliced(t *testing.T) {
 		t.Errorf("partial of malformed body = %q, want %q", got, want)
 	}
 }
+
+// TestFetch_FullBodyOfMalformedMessageIsVerbatim guards the same fallback for a
+// BODY[] with no <offset.size>: the MIME parser tolerates a malformed header block
+// and hands back only the "\r\n" that terminates an empty header, so a fallback
+// keyed on an empty extraction would silently serve 2 bytes for the whole message.
+func TestFetch_FullBodyOfMalformedMessageIsVerbatim(t *testing.T) {
+	body := []byte("this is not a message")
+
+	s, tracker := newFetchTestSession(0)
+	w := &fakeBodySectionWriter{tracker: tracker}
+	bodyData := body
+	bodyFetched := true
+	if err := s.handleBodySections(context.Background(), w, &bodyData, &bodyFetched,
+		&imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{{}}}, fetchTestMessage(body)); err != nil {
+		t.Fatalf("handleBodySections: %v", err)
+	}
+	if len(w.sections) != 1 {
+		t.Fatalf("expected 1 written section, got %d", len(w.sections))
+	}
+	if got := w.sections[0].data; !bytes.Equal(got, body) {
+		t.Errorf("BODY[] of malformed message = %q, want the message verbatim %q", got, body)
+	}
+}

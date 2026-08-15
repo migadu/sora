@@ -58,17 +58,21 @@ func safeExtractBodySection(bodyData []byte, section *imap.FetchItemBodySection)
 		}
 	}()
 
-	// Try to extract the requested section
-	result := imapserver.ExtractBodySection(bytes.NewReader(bodyData), section)
-
-	// For BODY[] (full message), if extraction returns empty but we have body data,
-	// it means MIME parsing failed silently. Return the raw body so clients can see the content.
-	// For other sections (BODY[TEXT], BODY[1], etc.), empty is valid (part doesn't exist).
-	if len(result) == 0 && len(section.Part) == 0 && section.Specifier == imap.PartSpecifierNone && len(bodyData) > 0 {
+	// BODY[] is the message verbatim (RFC 3501 6.4.5), so answer it from the stored
+	// bytes rather than from the MIME parser. Round-tripping a well-formed message
+	// through the parser reproduces it exactly, but on a message the parser cannot
+	// read the trip only loses data: it now tolerates a malformed header block and
+	// returns just the "\r\n" header terminator, which no longer looks empty to a
+	// len(result) == 0 fallback. Serving the raw bytes also keeps the literal length
+	// in step with the size reported elsewhere.
+	if len(bodyData) > 0 && len(section.Part) == 0 && section.Specifier == imap.PartSpecifierNone &&
+		len(section.HeaderFields) == 0 && len(section.HeaderFieldsNot) == 0 {
 		return bodyData, false
 	}
 
-	return result, true
+	// Try to extract the requested section. For sections other than BODY[]
+	// (BODY[TEXT], BODY[1], ...), empty is a valid answer: the part does not exist.
+	return imapserver.ExtractBodySection(bytes.NewReader(bodyData), section), true
 }
 
 // sectionWithoutPartial returns the section with its <offset.size> slice removed, so the
