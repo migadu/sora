@@ -161,7 +161,8 @@ type POP3ProxyServerOptions struct {
 	AbsoluteSessionTimeout   time.Duration // Maximum total session duration
 	MinBytesPerMinute        int64         // Minimum throughput
 	EnableAffinity           bool
-	EnableBackendHealthCheck bool // Enable backend health checking (default: true)
+	EnableBackendHealthCheck bool           // Enable backend health checking (default: true)
+	RemoteDNSRefresh         *time.Duration // Backend DNS re-resolution interval; nil = default, 0 = pin to the startup resolution
 	AuthRateLimit            server.AuthRateLimiterConfig
 	RemoteLookup             *config.RemoteLookupConfig
 	TrustedProxies           []string // CIDR blocks for trusted proxies that can forward parameters
@@ -248,6 +249,12 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 
 	// SSRF defense: when enabled, refuse remote-lookup backends not in the configured pool.
 	connManager.SetRestrictRemoteLookupToPool(options.RemoteLookup != nil && options.RemoteLookup.RestrictToPool)
+
+	// Backend hostnames are re-resolved periodically so an address change is picked
+	// up without a restart; remote_dns_refresh tunes or disables that.
+	if options.RemoteDNSRefresh != nil {
+		connManager.SetResolveRefreshInterval(*options.RemoteDNSRefresh)
+	}
 
 	// Custom CA for backend certificate verification (private-CA or
 	// self-signed backends): keeps remote_tls_verify usable instead of

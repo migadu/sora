@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/logger"
 )
 
@@ -12,11 +11,11 @@ import (
 // It ensures HTTP-01 challenges work across all cluster nodes, not just the leader
 type ClusterHTTPHandler struct {
 	autocertHandler http.Handler
-	clusterManager  *cluster.Manager
+	clusterManager  clusterCoordinator
 }
 
 // NewClusterHTTPHandler creates a cluster-aware HTTP-01 challenge handler
-func NewClusterHTTPHandler(autocertHandler http.Handler, clusterMgr *cluster.Manager) http.Handler {
+func NewClusterHTTPHandler(autocertHandler http.Handler, clusterMgr clusterCoordinator) http.Handler {
 	if clusterMgr == nil {
 		// No cluster, return autocert handler as-is
 		return autocertHandler

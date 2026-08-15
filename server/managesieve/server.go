@@ -110,6 +110,12 @@ type ManageSieveServer struct {
 }
 
 type ManageSieveServerOptions struct {
+	// AuthLimiterOverride, when non-nil, is used as the session auth limiter
+	// instead of constructing one from AuthRateLimit. Dependency-injection seam
+	// (nil in all production paths); used by tests to observe what the auth paths
+	// record, which is otherwise unobservable from the wire because blocked and
+	// failed replies are deliberately byte-identical.
+	AuthLimiterOverride         serverPkg.AuthLimiter
 	InsecureAuth                bool
 	Debug                       bool
 	TLS                         bool
@@ -183,8 +189,14 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	}
 
 	// Initialize authentication rate limiter with trusted networks
-	authLimiter := serverPkg.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
-	serverPkg.RegisterRateLimiter("managesieve", name, authLimiter)
+	// A non-nil AuthLimiterOverride (tests only) replaces the real limiter; the
+	// monitoring registry only accepts the concrete type, so skip it in that case.
+	var authLimiter serverPkg.AuthLimiter = options.AuthLimiterOverride
+	if authLimiter == nil {
+		concrete := serverPkg.NewAuthRateLimiterWithTrustedNetworks("ManageSieve", name, hostname, options.AuthRateLimit, options.TrustedNetworks)
+		serverPkg.RegisterRateLimiter("managesieve", name, concrete)
+		authLimiter = concrete
+	}
 
 	// Initialize the master SASL network gate. Fail closed on a misconfigured
 	// allow-list rather than silently disabling the gate.
@@ -342,8 +354,8 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		}
 
 		if !options.TLSVerify {
-			serverInstance.tlsConfig.InsecureSkipVerify = true
-			logger.Debug("ManageSieve: WARNING - TLS certificate verification disabled", "name", name)
+			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
+			logger.Debug("ManageSieve: WARNING - Client TLS certificate verification not enforced", "name", name)
 		}
 	} else if options.TLS && options.TLSConfig != nil {
 		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
@@ -878,7 +890,7 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 		// Cache negative result if enabled (user not found)
 		if s.lookupCache != nil {
 			// AuthUserNotFound = 1 (from lookupcache package)
-			s.lookupCache.SetFailure(address, 1, password)
+			s.lookupCache.SetFailure(address, 1)
 		}
 		logger.Info("authentication failed", "address", address, "reason", "user_not_found", "cached", false, "method", "main_db")
 		return 0, err
@@ -889,7 +901,7 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 		// Cache negative result for invalid password if enabled
 		if s.lookupCache != nil {
 			// AuthInvalidPassword = 2 (from lookupcache package)
-			s.lookupCache.SetFailure(address, 2, password)
+			s.lookupCache.SetFailure(address, 2)
 		}
 		logger.Info("authentication failed", "address", address, "reason", "invalid_password", "cached", false, "method", "main_db")
 		return 0, err

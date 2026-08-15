@@ -60,10 +60,13 @@ func TestSharedMailboxE2E(t *testing.T) {
 	})
 
 	// Test 2: Grant ACL via sora-admin command
+	soraAdminBin := common.GetSoraAdminBinary(t)
+	configPath := common.GetTestConfigPath(t)
+
 	t.Run("GrantACLViaSoraAdmin", func(t *testing.T) {
 		// Run sora-admin acl grant command
-		cmd := exec.Command("../../sora-admin",
-			"--config", "../../config-test.toml",
+		cmd := exec.Command(soraAdminBin,
+			"--config", configPath,
 			"acl", "grant",
 			"--email", owner.Email,
 			"--mailbox", sharedMailboxName,
@@ -82,8 +85,8 @@ func TestSharedMailboxE2E(t *testing.T) {
 
 	// Test 3: List ACL via sora-admin command
 	t.Run("ListACLViaSoraAdmin", func(t *testing.T) {
-		cmd := exec.Command("../../sora-admin",
-			"--config", "../../config-test.toml",
+		cmd := exec.Command(soraAdminBin,
+			"--config", configPath,
 			"acl", "list",
 			"--email", owner.Email,
 			"--mailbox", sharedMailboxName,
@@ -125,8 +128,8 @@ func TestSharedMailboxE2E(t *testing.T) {
 
 	// Test 5: Revoke ACL via sora-admin command
 	t.Run("RevokeACLViaSoraAdmin", func(t *testing.T) {
-		cmd := exec.Command("../../sora-admin",
-			"--config", "../../config-test.toml",
+		cmd := exec.Command(soraAdminBin,
+			"--config", configPath,
 			"acl", "revoke",
 			"--email", owner.Email,
 			"--mailbox", sharedMailboxName,
@@ -245,8 +248,11 @@ func TestSharedMailboxConfigPropagation(t *testing.T) {
 
 // TestSoraAdminACLWithoutConfigFails tests that sora-admin fails gracefully if config is missing
 func TestSoraAdminACLWithoutConfigFails(t *testing.T) {
+	soraAdminBin := common.GetSoraAdminBinary(t)
+	configPath := common.GetTestConfigPath(t)
+
 	t.Run("GrantWithoutConfig", func(t *testing.T) {
-		cmd := exec.Command("../../sora-admin",
+		cmd := exec.Command(soraAdminBin,
 			"--config", "/nonexistent/config.toml",
 			"acl", "grant",
 			"--email", "owner@example.com",
@@ -265,8 +271,8 @@ func TestSoraAdminACLWithoutConfigFails(t *testing.T) {
 	})
 
 	t.Run("GrantWithMissingParameters", func(t *testing.T) {
-		cmd := exec.Command("../../sora-admin",
-			"--config", "../../config-test.toml",
+		cmd := exec.Command(soraAdminBin,
+			"--config", configPath,
 			"acl", "grant",
 			// Missing required parameters
 		)

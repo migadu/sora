@@ -409,6 +409,12 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		return s.InternalError("failed to parse message: %v", err)
 	}
 
+	// Identity of the upstream queue entry, used to absorb an MTA retry of a delivery
+	// whose 250 was lost. MUST be taken over the bytes exactly as received: the trace
+	// headers stamped below carry a per-attempt id and timestamp, so anything hashed
+	// after them (content_hash included) differs on every attempt.
+	deliveryHash := helpers.HashContent(fullMessageBytes)
+
 	// Mail-loop detection + Delivered-To stamping (Postfix-style). If this message is in
 	// a Sora redirect loop (our X-Sora-Loop marker present AND a Delivered-To for this
 	// recipient), it has looped back to us — reject it instead of delivering (and possibly
@@ -583,22 +589,21 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// If user has an active script, run it and let it override the resultAction
 	if err == nil && activeScript != nil {
 		s.InfoLog("using user sieve script", "name", activeScript.Name, "script_id", activeScript.ID, "updated_at", activeScript.UpdatedAt.Format(time.RFC3339))
-		// Try to get the user script from cache or create and cache it with metadata validation
-		userSieveExecutor, userScriptErr := s.backend.sieveCache.GetOrCreateWithMetadata(
-			activeScript.Script,
-			activeScript.ID,
-			activeScript.UpdatedAt,
-			s.AccountID(),
-			sieveVacOracle,
-			sieveVacOracle,
-			s.backend.redirectRateLimit,
-			s.backend.redirectRateWindow,
-			s.backend.maxRedirectHops,
-		)
+		// Reuse the compiled script if this version has been parsed before; the executor
+		// binding it to this account and its oracles is cheap and must not be shared.
+		compiled, userScriptErr := sieveengine.SharedScriptCache().GetOrCompile(activeScript.Script, s.backend.sieveExtensions)
 		if userScriptErr != nil {
 			s.WarnLog("failed to get/create sieve executor", "error", userScriptErr)
 			// Keep the result from the default script
 		} else {
+			userSieveExecutor := compiled.NewExecutor(
+				s.AccountID(),
+				sieveVacOracle,
+				sieveVacOracle,
+				s.backend.redirectRateLimit,
+				s.backend.redirectRateWindow,
+				s.backend.maxRedirectHops,
+			)
 			userResult, userEvalErr := userSieveExecutor.Evaluate(ctx, sieveCtx)
 			if userEvalErr != nil {
 				metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
@@ -740,7 +745,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			s.InfoLog("sieve fileinto :copy - saving to both mailbox and inbox", "mailbox", mailboxName)
 
 			// First save to the specified mailbox (with :create if specified)
-			err := s.saveMessageToMailbox(ctx, mailboxName, fullMessageBytes, contentHash,
+			err := s.saveMessageToMailbox(ctx, mailboxName, fullMessageBytes, contentHash, deliveryHash,
 				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, result.CreateMailbox, sieveFlags)
 			if err != nil {
 				// Allow duplicates (message already in target mailbox)
@@ -755,7 +760,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			s.DebugLog("saving copy to inbox due to :copy modifier")
 
 			// Call saveMessageToMailbox again for INBOX (no :create for INBOX - it always exists)
-			err = s.saveMessageToMailbox(ctx, consts.MailboxInbox, fullMessageBytes, contentHash,
+			err = s.saveMessageToMailbox(ctx, consts.MailboxInbox, fullMessageBytes, contentHash, deliveryHash,
 				subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, false, sieveFlags)
 			if err != nil {
 				// Allow duplicates (message already in INBOX)
@@ -828,7 +833,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Save the message to the determined mailbox (either the specified one or INBOX)
 	// For fileinto actions without :copy, pass the :create flag if specified
 	createMailbox := result.Action == sieveengine.ActionFileInto && result.CreateMailbox
-	err = s.saveMessageToMailbox(ctx, mailboxName, fullMessageBytes, contentHash,
+	err = s.saveMessageToMailbox(ctx, mailboxName, fullMessageBytes, contentHash, deliveryHash,
 		subject, messageID, sentDate, inReplyTo, references, bodyStructure, plaintextBody, recipients, createMailbox, sieveFlags)
 	if err != nil {
 		// Handle duplicate messages (acceptable in LMTP - return success)
@@ -1026,7 +1031,7 @@ func (s *LMTPSession) handleVacationResponse(ctx context.Context, result sieveen
 // flags carries any keywords/flags set by the Sieve script (imap4flags, RFC 5232);
 // they are stored on the message (InsertMessage folds keyword case per RFC 9051 §2.3.2).
 func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName string,
-	fullMessageBytes []byte, contentHash string, subject string, messageID string,
+	fullMessageBytes []byte, contentHash string, deliveryHash string, subject string, messageID string,
 	sentDate time.Time, inReplyTo []string, references []string, bodyStructure *imap.BodyStructure,
 	plaintextBody *string, recipients []helpers.Recipient, createMailbox bool,
 	flags []imap.Flag) error {
@@ -1114,6 +1119,7 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 			S3Localpart:   destS3Localpart,
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
+			DeliveryHash:  deliveryHash,
 			MessageID:     messageID,
 			InternalDate:  time.Now(),
 			Size:          size,
@@ -1129,7 +1135,7 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 		},
 		db.PendingUpload{
 			ContentHash: contentHash,
-			InstanceID:  s.backend.hostname,
+			InstanceID:  s.backend.instanceID,
 			Size:        size,
 			AccountID:   destAccountID,
 		})

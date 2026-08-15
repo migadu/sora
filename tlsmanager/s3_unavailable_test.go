@@ -5,6 +5,7 @@ package tlsmanager
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -140,8 +141,11 @@ func TestS3RecoveryAfterTransientError(t *testing.T) {
 	t.Log("Step 3: S3 has transient error on cert2")
 	s3Cache.setError(context.DeadlineExceeded)
 	_, err = cache.Get(ctx, "cert2.example.com")
-	if err != autocert.ErrCacheMiss {
-		t.Fatalf("Expected cache miss due to S3 error, got: %v", err)
+	if err == nil {
+		t.Fatal("Expected an error due to S3 failure, got nil")
+	}
+	if errors.Is(err, autocert.ErrCacheMiss) {
+		t.Fatalf("Expected S3 failure to surface as an error, got: %v", err)
 	}
 
 	// This marks S3 as unavailable

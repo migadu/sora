@@ -1,8 +1,8 @@
 package uploader
 
 import (
-	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -16,13 +16,13 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
 )
 
@@ -41,13 +41,119 @@ type UploaderDB interface {
 	// permanently-lost upload (file missing AND not in S3) so it moves to the failed
 	// list without cycling through every remaining retry slot.
 	ExhaustUploadAttemptsWithRetry(ctx context.Context, contentHash string, accountID int64, maxAttempts int) error
-	GetPrimaryEmailForAccountWithRetry(ctx context.Context, accountID int64) (server.Address, error)
-	IsContentHashUploadedWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error)
+	// PendingUploadKeys returns the S3 keys that still have to be written before the
+	// account's message rows for this content hash may be marked uploaded.
+	PendingUploadKeys(ctx context.Context, contentHash string, accountID int64) ([]string, error)
 	ExecuteWithS3ObjectSessionLock(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error
 	CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64) error
-	PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error)
+	// ExistingPendingUploads returns the subset of contentHashes that still have a
+	// pending_uploads row for the account. The cleanup scan asks per batch rather than
+	// per file: the staging tree is largest during an S3 outage or a stranded backlog,
+	// which is exactly when the database is already carrying the queue.
+	ExistingPendingUploads(ctx context.Context, accountID int64, contentHashes []string) (map[string]struct{}, error)
 	GetUploaderStatsWithRetry(ctx context.Context, maxAttempts int) (*db.UploaderStats, error)
 	GetFailedUploadsWithRetry(ctx context.Context, maxAttempts int, limit int) ([]db.PendingUpload, error)
+	// PendingUploadBacklog reports the retryable uploads this instance owns. Scoped to
+	// the instance because a pending upload is leased only by its creator (the body is
+	// a file on that node's disk), so this is the queue this worker alone can drain.
+	PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error)
+	// RecordInstanceHeartbeatWithRetry proves this instance still exists. Pending
+	// uploads are leased only by their creating instance, so the cleaner reaps an
+	// unfinished upload once its owner stops beating (db.CleanupFailedUploads).
+	RecordInstanceHeartbeatWithRetry(ctx context.Context, instanceID string) error
+}
+
+// UploadBacklog is the state of one instance's retryable pending uploads, i.e. the
+// ones still waiting for S3 rather than written off as failed.
+type UploadBacklog struct {
+	Count  int64
+	Bytes  int64
+	Oldest time.Time // zero when Count is 0
+}
+
+// resilientUploaderDB adapts the resilient database to UploaderDB, adding the
+// batched orphan lookup the cleanup scan needs.
+type resilientUploaderDB struct {
+	*resilient.ResilientDatabase
+}
+
+// PendingUploadBacklog measures the queue this instance still has to write. Served by
+// idx_pending_uploads_instance_id_created_at, so the MIN is an index lookup.
+func (d resilientUploaderDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error) {
+	var backlog UploadBacklog
+	var oldest sql.NullTime
+	err := d.QueryRowWithRetry(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(size), 0), MIN(created_at)
+		FROM pending_uploads
+		WHERE instance_id = $1 AND attempts < $2
+	`, instanceID, maxAttempts).Scan(&backlog.Count, &backlog.Bytes, &oldest)
+	if err != nil {
+		return UploadBacklog{}, fmt.Errorf("failed to measure pending upload backlog of instance %s: %w", instanceID, err)
+	}
+	if oldest.Valid {
+		backlog.Oldest = oldest.Time
+	}
+	return backlog, nil
+}
+
+func (d resilientUploaderDB) ExistingPendingUploads(ctx context.Context, accountID int64, contentHashes []string) (map[string]struct{}, error) {
+	rows, err := d.QueryWithRetry(ctx, `
+		SELECT content_hash FROM pending_uploads WHERE account_id = $1 AND content_hash = ANY($2)
+	`, accountID, contentHashes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pending uploads for account %d: %w", accountID, err)
+	}
+	defer rows.Close()
+
+	existing := make(map[string]struct{}, len(contentHashes))
+	for rows.Next() {
+		var contentHash string
+		if err := rows.Scan(&contentHash); err != nil {
+			return nil, fmt.Errorf("failed to scan pending upload hash: %w", err)
+		}
+		existing[contentHash] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to list pending uploads for account %d: %w", accountID, err)
+	}
+	return existing, nil
+}
+
+// PendingUploadKeys builds the keys from the s3_domain/s3_localpart recorded on each
+// message row at insert time, which is what every reader uses to build its GET key.
+// One (content_hash, account_id) pair can span several keys — the pair is unique in
+// pending_uploads, while the rows behind it were keyed from whatever the account's
+// primary address was when each was inserted — and CompleteS3Upload marks all of them
+// uploaded, so each key that has no object yet must be written. A key is left out once
+// a non-expunged row carries it as uploaded: its object is already in S3.
+//
+// Pinned to the master because the message rows and the pending_uploads row commit in
+// one transaction: a lagging replica could answer "no keys", which the caller reads as
+// "nothing left to write" and would finalize an upload that never happened.
+func (d resilientUploaderDB) PendingUploadKeys(ctx context.Context, contentHash string, accountID int64) ([]string, error) {
+	rows, err := d.QueryWithRetry(context.WithValue(ctx, consts.UseMasterDBKey, true), `
+		SELECT s3_domain, s3_localpart FROM messages
+		WHERE content_hash = $1 AND account_id = $2
+		GROUP BY s3_domain, s3_localpart
+		HAVING bool_or(NOT uploaded) AND NOT bool_or(uploaded AND expunged_at IS NULL)
+	`, contentHash, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve storage keys for hash %s of account %d: %w", contentHash, accountID, err)
+	}
+	defer rows.Close()
+
+	var keys []string
+	for rows.Next() {
+		var domain, localpart string
+		if err := rows.Scan(&domain, &localpart); err != nil {
+			return nil, fmt.Errorf("failed to scan storage key parts: %w", err)
+		}
+		keys = append(keys, helpers.NewS3Key(domain, localpart, contentHash))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to resolve storage keys for hash %s of account %d: %w", contentHash, accountID, err)
+	}
+	return keys, nil
 }
 
 // UploaderS3 defines the S3 storage operations needed by the uploader worker.
@@ -88,6 +194,9 @@ type UploadWorker struct {
 
 	maxStagingSize     int64
 	currentStagingSize int64 // Atomic tracker for the global staging queue size
+	// lastStallReport is when the current stall episode was last reported, in Unix
+	// nanoseconds; 0 means no episode is in progress. Atomic, like currentStagingSize.
+	lastStallReport int64
 }
 
 // syncBool is a goroutine-safe boolean flag backed by a sync.Mutex.
@@ -145,7 +254,7 @@ func NewWithS3Interface(path string, batchSize int, concurrency int, maxAttempts
 func newWithS3Interface(path string, batchSize int, concurrency int, maxAttempts int, retryInterval time.Duration, maxStagingSize int64, instanceID string, rdb *resilient.ResilientDatabase, s3 UploaderS3, uploaderCache UploaderCache, errCh chan<- error) (*UploadWorker, error) {
 	notifyCh := make(chan struct{}, 1)
 	return &UploadWorker{
-		rdb:            rdb,
+		rdb:            resilientUploaderDB{rdb},
 		s3:             s3,
 		cache:          uploaderCache,
 		errCh:          errCh,
@@ -191,10 +300,24 @@ func (w *UploadWorker) run(ctx context.Context) {
 	cleanupTicker := time.NewTicker(5 * time.Minute)
 	defer cleanupTicker.Stop()
 
+	heartbeatTicker := time.NewTicker(instanceHeartbeatInterval)
+	defer heartbeatTicker.Stop()
+
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	logger.Info("Uploader: worker processing every 10s, cleanup and monitoring every 5min")
+
+	// Beat before the first upload: the spool files this instance is about to own
+	// may only be reaped once it is known to have stopped beating.
+	w.recordHeartbeat(ctx)
+
+	// Learn the staging total before any delivery is admitted: it is cached in memory,
+	// so after a restart the guard would otherwise report an empty spool until the
+	// first monitor tick, whatever is already on disk.
+	if err := w.monitorStuckUploads(ctx); err != nil {
+		logger.Error("Uploader: Monitor error", "error", err)
+	}
 
 	// Process immediately on start
 	w.processQueue(ctx)
@@ -222,10 +345,30 @@ func (w *UploadWorker) run(ctx context.Context) {
 			if err := w.cleanupOrphanedFiles(ctx); err != nil {
 				logger.Error("Uploader: Cleanup error", "error", err)
 			}
+		case <-heartbeatTicker.C:
+			w.recordHeartbeat(ctx)
 		case <-w.notifyCh:
 			logger.Info("Uploader: worker notified")
 			_ = w.processQueue(ctx)
 		}
+	}
+}
+
+// instanceHeartbeatInterval is how often this instance proves it still exists.
+// It must stay far below cleanup.instance_liveness_threshold so that a database
+// hiccup, or a few missed beats, can never make a live instance look decommissioned
+// and get its unuploaded messages reaped.
+const instanceHeartbeatInterval = time.Minute
+
+// recordHeartbeat publishes this instance's liveness. A failure is logged and
+// otherwise ignored: the next beat overwrites it, and the cleaner only acts after
+// instanceLiveness worth of consecutive silence.
+func (w *UploadWorker) recordHeartbeat(ctx context.Context) {
+	if err := w.rdb.RecordInstanceHeartbeatWithRetry(ctx, w.instanceID); err != nil {
+		if ctx.Err() != nil {
+			return // shutting down
+		}
+		logger.Warn("Uploader: Failed to record instance heartbeat", "instance_id", w.instanceID, "error", err)
 	}
 }
 
@@ -351,35 +494,25 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 
 	logger.Info("Uploader: Uploading hash", "hash", upload.ContentHash, "account_id", upload.AccountID)
 
-	// Get primary address to construct S3 path
-	address, err := w.rdb.GetPrimaryEmailForAccountWithRetry(ctx, upload.AccountID)
+	// The keys come from the message rows, not from the account's current primary
+	// address: readers build their GET key from the s3_domain/s3_localpart each row
+	// recorded at insert time, so a primary address changed while this upload sat in
+	// the queue must not move the object.
+	keys, err := w.rdb.PendingUploadKeys(ctx, upload.ContentHash, upload.AccountID)
 	if err != nil {
-		logger.Error("Uploader: Failed to get primary address for account", "account_id", upload.AccountID, "error", err)
+		logger.Error("Uploader: Failed to resolve storage keys for upload", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after email lookup failure", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
+			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after key lookup failure", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 		}
 		return
 	}
-
-	s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), upload.ContentHash)
 
 	filePath := w.FilePath(upload.ContentHash, upload.AccountID)
 
-	// Check if this content hash is already marked as uploaded by another worker for this user
-	isUploaded, err := w.rdb.IsContentHashUploadedWithRetry(ctx, upload.ContentHash, upload.AccountID)
-	if err != nil {
-		logger.Error("Uploader: Failed to check if content hash is already uploaded", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
-		// Mark attempt and let it be retried
-		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
-			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after upload check failure", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
-		}
-		return
-	}
-
-	if isUploaded {
+	if len(keys) == 0 {
 		logger.Info("Uploader: Content hash already uploaded - skipping S3 upload", "hash", upload.ContentHash, "account_id", upload.AccountID)
-		// Content is already in S3. Mark this specific message instance as uploaded
-		// and delete the pending upload record.
+		// Every key these rows point at already holds the content, so finalizing only
+		// clears the leftover pending_uploads record.
 		err := w.rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID)
 		if err != nil {
 			logger.Warn("Uploader: Failed to finalize S3 upload - keeping local file for retry", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
@@ -395,7 +528,12 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		return // Done with this upload record
 	}
 
-	data, err := os.ReadFile(filePath)
+	// Stream the body off the disk it already sits on rather than reading it whole:
+	// `concurrency` uploads run at once, so a buffered body costs concurrency x message
+	// size of RAM on exactly the nodes that are busiest. Nothing here needs the bytes
+	// resident - the size guard stats, the S3 seam takes an io.Reader, and the cache
+	// moves the file by path.
+	file, err := os.Open(filePath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			// Unexpected error (e.g. permissions) - not a missing-file situation.
@@ -421,13 +559,25 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		logger.Warn("Uploader: Local file missing -> checking S3 for existing content",
 			"hash", upload.ContentHash, "account_id", upload.AccountID, "path", filePath)
 
-		s3Exists, statErr := w.s3.ExistsWithRetry(ctx, s3Key)
-		if statErr != nil {
-			// S3 is unreachable - don't count as a permanent failure.
-			logger.Warn("Uploader: Could not check S3 existence after missing file",
-				"hash", upload.ContentHash, "account_id", upload.AccountID, "error", statErr)
-			// Do NOT increment attempts: the content may be in S3; we'll retry next cycle.
-			return
+		// Every key has to be there: finalizing marks all the rows behind this upload
+		// uploaded, so one key still missing its object leaves those messages readable
+		// as nothing at all, with no local copy left to write from.
+		s3Exists := true
+		for _, key := range keys {
+			exists, statErr := w.s3.ExistsWithRetry(ctx, key)
+			if statErr != nil {
+				// S3 is unreachable - don't count as a permanent failure.
+				logger.Warn("Uploader: Could not check S3 existence after missing file",
+					"hash", upload.ContentHash, "account_id", upload.AccountID, "key", key, "error", statErr)
+				// Do NOT increment attempts: the content may be in S3; we'll retry next cycle.
+				return
+			}
+			if !exists {
+				logger.Warn("Uploader: Local file missing and key absent from S3",
+					"hash", upload.ContentHash, "account_id", upload.AccountID, "key", key)
+				s3Exists = false
+				break
+			}
 		}
 
 		if s3Exists {
@@ -473,16 +623,26 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 			"path", filePath, "account_id", upload.AccountID, "error", err)
 		return
 	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		logger.Error("Uploader: Could not stat file", "path", filePath, "account_id", upload.AccountID, "error", err)
+		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
+			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after file stat failure", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
+		}
+		return
+	}
 
 	// Validate data integrity before uploading to S3.
 	// The TOCTOU race that caused empty uploads has been fixed (file existence
 	// check before StoreLocally), but this guard catches any other corruption
 	// scenario (disk errors, unknown bugs) to prevent uploading garbage to S3
 	// and marking the message as uploaded when the content is wrong.
-	if int64(len(data)) != upload.Size {
+	if info.Size() != upload.Size {
 		logger.Error("Uploader: CRITICAL - File size mismatch, refusing to upload corrupted data",
 			"hash", upload.ContentHash, "account_id", upload.AccountID,
-			"file_size", len(data), "expected_size", upload.Size, "path", filePath)
+			"file_size", info.Size(), "expected_size", upload.Size, "path", filePath)
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
 			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt after size mismatch",
 				"hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
@@ -504,10 +664,16 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		default:
 		}
 
-		// Run S3 PUT
-		s3Err := w.s3.PutWithRetry(ctx, s3Key, bytes.NewReader(data), upload.Size)
-		if s3Err != nil {
-			return s3Err
+		// Run S3 PUT, once per key the message rows point at. Every key gets the whole
+		// body, so rewind between them: the resilient layer rewinds only around its own
+		// retries of a single PUT.
+		for _, key := range keys {
+			if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
+				return fmt.Errorf("failed to rewind %s for upload: %w", filePath, seekErr)
+			}
+			if s3Err := w.s3.PutWithRetry(ctx, key, file, upload.Size); s3Err != nil {
+				return s3Err
+			}
 		}
 
 		// Finalize the upload in the database.
@@ -541,7 +707,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		} else {
 			logger.Warn("Uploader: Transient error during S3 upload/DB finalization - NOT counting toward max_attempts", "hash", upload.ContentHash, "account_id", upload.AccountID)
 		}
-		logger.Error("Uploader: Upload or finalize failed", "hash", upload.ContentHash, "account_id", upload.AccountID, "key", s3Key, "error", err)
+		logger.Error("Uploader: Upload or finalize failed", "hash", upload.ContentHash, "account_id", upload.AccountID, "keys", strings.Join(keys, " "), "error", err)
 
 		// Track upload failure
 		metrics.UploadWorkerJobs.WithLabelValues("failure").Inc()
@@ -561,6 +727,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 				// Log is inside RemoveLocalFile
 			}
 		} else {
+			w.addStagingSize(-upload.Size)
 			logger.Info("Uploader: Moved hash to cache after upload", "hash", upload.ContentHash)
 		}
 	} else {
@@ -624,6 +791,10 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 		return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
+	// Bytes already accounted for at this path: an overwrite replaces them rather
+	// than adding to the spool.
+	previousSize := fileSize(path)
+
 	// Write file with fsync to ensure durability before the DB transaction commits.
 	// Without fsync, a crash could leave the DB referencing a file that never made it to disk.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
@@ -649,7 +820,18 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 		// Non-fatal: the file data is already synced, directory entry may survive without this
 	}
 
+	w.addStagingSize(int64(len(data)) - previousSize)
+
 	return &path, nil
+}
+
+// fileSize returns the size of a file, or 0 if it cannot be stat'ed.
+func fileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 // syncDir fsyncs a directory to ensure new file entries are durable.
@@ -698,9 +880,11 @@ func (w *UploadWorker) isTransientS3Error(err error) bool {
 }
 
 func (w *UploadWorker) RemoveLocalFile(path string) error {
+	size := fileSize(path)
 	if err := os.Remove(path); err != nil {
 		logger.Warn("Uploader: Uploaded but could not delete file", "path", path, "error", err)
 	} else {
+		w.addStagingSize(-size)
 		stopAt, _ := filepath.Abs(w.path)
 		removeEmptyParents(path, stopAt)
 	}
@@ -710,6 +894,8 @@ func (w *UploadWorker) RemoveLocalFile(path string) error {
 // monitorStuckUploads checks for uploads that have exceeded max attempts and logs warnings.
 // This provides visibility into failed uploads that need manual intervention.
 func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
+	sizeBeforeQuery := atomic.LoadInt64(&w.currentStagingSize)
+
 	stats, err := w.rdb.GetUploaderStatsWithRetry(ctx, w.maxAttempts)
 	if err != nil {
 		return fmt.Errorf("failed to get uploader stats: %w", err)
@@ -719,8 +905,22 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 	metrics.QueueDepth.WithLabelValues("s3_upload_pending").Set(float64(stats.TotalPending))
 	metrics.QueueDepth.WithLabelValues("s3_upload_failed").Set(float64(stats.FailedUploads))
 
-	// Update atomic cache for the staging limit guard
-	atomic.StoreInt64(&w.currentStagingSize, stats.TotalPendingSize)
+	// Re-base the staging limit guard on THIS instance's staged bytes. stats is
+	// cluster-wide (GetUploaderStats has no instance filter), and max_staging_size
+	// guards this node's own staging directory: rebasing from the cluster total would
+	// make one node's backlog reject deliveries on every node, however empty its disk.
+	// Applied as a delta so that messages staged while the query was in flight - which
+	// the snapshot predates - are not dropped from the count.
+	backlog, backlogErr := w.rdb.PendingUploadBacklog(ctx, w.instanceID, w.maxAttempts)
+	if backlogErr != nil {
+		if ctx.Err() != nil {
+			return nil // shutting down
+		}
+		// Leave the counter alone rather than rebasing from a number that is not ours.
+		logger.Error("UploaderMonitor: Failed to measure pending upload backlog", "instance_id", w.instanceID, "error", backlogErr)
+	} else {
+		w.addStagingSize(backlog.Bytes - sizeBeforeQuery)
+	}
 
 	// Log summary
 	if stats.TotalPending > 0 || stats.FailedUploads > 0 {
@@ -743,7 +943,76 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 		}
 	}
 
+	if backlogErr == nil {
+		w.reportStalledBacklog(backlog)
+	}
+
 	return nil
+}
+
+// uploadStallThreshold is how old this instance's oldest unwritten upload has to get
+// before the queue counts as stalled rather than busy. Attempts alone cannot express
+// this state: transient S3 errors are deliberately not counted toward max_attempts
+// (see processSingleUpload), so a revoked credential or a wedged endpoint produces a
+// backlog that grows old with attempts pinned at 0 and stays invisible to the
+// failed-upload alert above. An upload still queued an hour later has, at any sane
+// retry_interval, not been progressing through retries at all.
+const uploadStallThreshold = time.Hour
+
+// uploadStallReportInterval bounds how often one stall episode is reported. The monitor
+// ticks every 5 minutes and an outage lasts hours, so a per-tick warning would bury
+// itself; the queue-status line at INFO still carries the per-tick detail.
+const uploadStallReportInterval = time.Hour
+
+// reportStalledBacklog warns about pending uploads that are simply old, whatever their
+// attempt count. Age is the signal that matters because age is what the reaper acts on:
+// these bodies exist only as files on this instance's disk, and db.CleanupFailedUploads
+// deletes their messages once this instance stops looking alive.
+//
+// Scoped to this instance, which owns every upload it reports - the cluster-wide view of
+// backlogs whose owner is already gone belongs to cleaner.reportStrandedInstances.
+func (w *UploadWorker) reportStalledBacklog(backlog UploadBacklog) {
+	// Publish the age unconditionally, before any threshold. The log warning below fires
+	// once an hour at most, which is a poor thing to alert on; this gauge is the surface
+	// an operator can actually put a rule against, and it has to keep reporting 0 while
+	// the queue is healthy or a stale value would read as a stall forever.
+	var oldestAge float64
+	if backlog.Count > 0 && !backlog.Oldest.IsZero() {
+		oldestAge = time.Since(backlog.Oldest).Seconds()
+	}
+	metrics.QueueProcessingLag.WithLabelValues("s3_upload").Set(oldestAge)
+
+	if backlog.Count == 0 || backlog.Oldest.IsZero() || time.Since(backlog.Oldest) < uploadStallThreshold {
+		// Drained, or still moving: the next episode is news again.
+		atomic.StoreInt64(&w.lastStallReport, 0)
+		return
+	}
+
+	if last := atomic.LoadInt64(&w.lastStallReport); last != 0 && time.Since(time.Unix(0, last)) < uploadStallReportInterval {
+		return
+	}
+	atomic.StoreInt64(&w.lastStallReport, time.Now().UnixNano())
+
+	logger.Warn("UploaderMonitor: ALERT - pending uploads are not reaching S3",
+		"instance_id", w.instanceID,
+		"oldest_age", time.Since(backlog.Oldest).Round(time.Minute),
+		"pending", backlog.Count,
+		"pending_bytes", backlog.Bytes,
+		"hint", "transient S3 errors do not count toward max_attempts, so this backlog never appears in the failed-upload alert; these message bodies exist only on this instance's disk")
+}
+
+// addStagingSize applies a local write or removal to the cached staging size, so the
+// limit guard reflects what happened since the last authoritative refresh in
+// monitorStuckUploads rather than a value that is up to one monitor interval stale.
+func (w *UploadWorker) addStagingSize(delta int64) {
+	if delta == 0 {
+		return
+	}
+	if size := atomic.AddInt64(&w.currentStagingSize, delta); size < 0 {
+		// Removing files this process never counted - orphans left by a previous run -
+		// can drive the running total below zero.
+		atomic.CompareAndSwapInt64(&w.currentStagingSize, size, 0)
+	}
 }
 
 // IsStagingLimitExceeded checks if the total staging size across the system
@@ -772,6 +1041,18 @@ func removeEmptyParents(path, stopAt string) {
 	}
 }
 
+// stagedFile is a file in the staging tree that the cleanup scan has yet to resolve
+// against the pending_uploads table.
+type stagedFile struct {
+	path        string
+	contentHash string
+	size        int64
+}
+
+// orphanLookupBatchSize bounds both the number of hashes in one orphan lookup and
+// how many candidates the cleanup scan holds in memory at a time.
+const orphanLookupBatchSize = 500
+
 // cleanupOrphanedFiles removes local files that no longer have a corresponding pending upload record.
 // This handles cases where:
 // - System crashes before pending upload was created
@@ -790,9 +1071,9 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 	// the pending_upload record has either committed (making the record visible)
 	// or rolled back (making the file truly orphaned) before we ever consult the
 	// database.  10 minutes was too short: a large-message InsertMessage
-	// transaction could still be in-flight when the cleanup ticker fired,
-	// causing PendingUploadExistsWithRetry() to return false for a record that
-	// was about to commit.  The uploader then found "no such file or directory"
+	// transaction could still be in-flight when the cleanup ticker fired, so the
+	// orphan lookup did not see a record that was about to commit.  The uploader
+	// then found "no such file or directory"
 	// on every retry and the message was permanently lost (see incident
 	// upload id=6197517, account=22385, hash=66e220f4…).
 	gracePeriod := w.cleanupGracePeriod
@@ -803,6 +1084,43 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 
 	var filesChecked, filesRemoved int64
 	var totalSize int64
+
+	stopAt, _ := filepath.Abs(w.path)
+
+	// Candidate files grouped by account, resolved one batch at a time. A lookup
+	// failure leaves its whole group on disk: an unanswered query is not evidence
+	// that the message was already uploaded.
+	batch := make(map[int64][]stagedFile)
+	batched := 0
+	removeOrphans := func(candidates map[int64][]stagedFile) {
+		for accountID, files := range candidates {
+			hashes := make([]string, 0, len(files))
+			for _, file := range files {
+				hashes = append(hashes, file.contentHash)
+			}
+
+			existing, err := w.rdb.ExistingPendingUploads(ctx, accountID, hashes)
+			if err != nil {
+				logger.Warn("UploaderCleanup: Failed to check pending uploads", "account_id", accountID, "files", len(files), "error", err)
+				continue
+			}
+
+			for _, file := range files {
+				if _, stillQueued := existing[file.contentHash]; stillQueued {
+					continue
+				}
+				if removeErr := os.Remove(file.path); removeErr != nil {
+					logger.Warn("UploaderCleanup: Failed to remove orphaned file", "path", file.path, "error", removeErr)
+					continue
+				}
+				filesRemoved++
+				totalSize += file.size
+				w.addStagingSize(-file.size)
+				logger.Info("UploaderCleanup: Removed orphaned file", "hash", file.contentHash, "account_id", accountID, "size", file.size)
+				removeEmptyParents(file.path, stopAt)
+			}
+		}
+	}
 
 	// Walk the upload directory tree
 	err := filepath.Walk(w.path, func(path string, info os.FileInfo, err error) error {
@@ -869,35 +1187,26 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 			} else {
 				filesRemoved++
 				totalSize += info.Size()
+				w.addStagingSize(-info.Size())
 				logger.Info("UploaderCleanup: Removed invalid file", "path", path)
 			}
 			return nil
 		}
 
-		// Check if pending upload exists in database
-		exists, err := w.rdb.PendingUploadExistsWithRetry(ctx, contentHash, accountID)
-		if err != nil {
-			logger.Warn("UploaderCleanup: Failed to check pending upload", "hash", contentHash, "account_id", accountID, "error", err)
-			return nil // Don't delete if we can't verify
-		}
-
-		if !exists {
-			// File is orphaned - no pending upload record exists
-			if removeErr := os.Remove(path); removeErr != nil {
-				logger.Warn("UploaderCleanup: Failed to remove orphaned file", "path", path, "error", removeErr)
-			} else {
-				filesRemoved++
-				totalSize += info.Size()
-				logger.Info("UploaderCleanup: Removed orphaned file", "hash", contentHash, "account_id", accountID, "size", info.Size())
-
-				// Try to remove empty parent directories
-				stopAt, _ := filepath.Abs(w.path)
-				removeEmptyParents(path, stopAt)
-			}
+		batch[accountID] = append(batch[accountID], stagedFile{path: path, contentHash: contentHash, size: info.Size()})
+		batched++
+		if batched >= orphanLookupBatchSize {
+			removeOrphans(batch)
+			batch = make(map[int64][]stagedFile)
+			batched = 0
 		}
 
 		return nil
 	})
+
+	if err == nil {
+		removeOrphans(batch)
+	}
 
 	duration := time.Since(start)
 

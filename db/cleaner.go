@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/migadu/sora/logger"
 )
 
@@ -103,41 +104,236 @@ func (d *Database) IsS3ObjectOrphan(ctx context.Context, tx pgx.Tx, accountID in
 	return isOrphan, err
 }
 
+// s3ObjectLockTimeout bounds acquiring the dedicated connection and taking the
+// per-object advisory locks on it. The locks themselves are never waited for.
+const s3ObjectLockTimeout = 30 * time.Second
+
+// ExecuteWithLockedS3Orphans runs fn with the subset of objects that are still orphans,
+// while holding their per-object advisory locks on one dedicated session connection.
+//
+// It is the same lock the uploader holds across its S3 PUT and the DB finalization
+// (GetS3ObjectLockID, see resilient.ExecuteWithS3ObjectSessionLock), so holding it
+// across the orphan re-check and the caller's S3 DELETE is what stops a delete from
+// racing an upload of the same body. The lock is session-scoped rather than
+// transaction-scoped precisely so the caller's S3 round trip — and the retry backoff
+// hiding inside it — does not run inside an open write transaction, pinning a pool
+// connection and its locks for the length of a network operation.
+//
+// Locks are taken with pg_try_advisory_lock and an object whose lock is held is left
+// out of this cycle: a held lock means an uploader is writing that body right now, so
+// it is not an orphan at all. Never waiting also means this cannot deadlock against the
+// uploader, whatever order the batch happens to be in.
+func (d *Database) ExecuteWithLockedS3Orphans(ctx context.Context, objects []UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(orphans []UserScopedObjectForCleanup) error) error {
+	if len(objects) == 0 {
+		return nil
+	}
+
+	lockCtx, cancel := context.WithTimeout(ctx, s3ObjectLockTimeout)
+	defer cancel()
+
+	conn, err := d.GetWritePool().Acquire(lockCtx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire connection for S3 object locks: %w", err)
+	}
+	defer conn.Release()
+
+	lockIDs := make([]int64, len(objects))
+	for i, o := range objects {
+		lockIDs[i] = GetS3ObjectLockID(o.AccountID, o.ContentHash)
+	}
+
+	rows, err := conn.Query(lockCtx, `SELECT pg_try_advisory_lock(id) FROM unnest($1::bigint[]) AS t(id)`, lockIDs)
+	if err != nil {
+		return fmt.Errorf("failed to lock S3 objects for cleanup: %w", err)
+	}
+	acquired, err := pgx.CollectRows(rows, pgx.RowTo[bool])
+	if err != nil {
+		return fmt.Errorf("failed to lock S3 objects for cleanup: %w", err)
+	}
+	if len(acquired) != len(objects) {
+		return fmt.Errorf("failed to lock S3 objects for cleanup: got %d lock results for %d objects", len(acquired), len(objects))
+	}
+
+	// unnest preserves array order, so acquired[i] belongs to objects[i]. The same body
+	// can appear twice under two addresses; that stacks the advisory lock, so every id
+	// is released exactly as many times as it was taken.
+	locked := make([]UserScopedObjectForCleanup, 0, len(objects))
+	heldIDs := make([]int64, 0, len(objects))
+	for i, ok := range acquired {
+		if ok {
+			locked = append(locked, objects[i])
+			heldIDs = append(heldIDs, lockIDs[i])
+		}
+	}
+	defer func() {
+		// Detached context: the unlock must fire even if the caller's context expired.
+		if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock(id) FROM unnest($1::bigint[]) AS t(id)`, heldIDs); err != nil {
+			// A session that may still hold these locks must not go back into the pool,
+			// or those objects would be skipped by every future cleanup cycle.
+			logger.Error("failed to release S3 object locks - discarding connection", "count", len(heldIDs), "err", err)
+			conn.Conn().Close(context.Background())
+		}
+	}()
+
+	orphans, err := d.filterS3Orphans(lockCtx, conn, locked, gracePeriod)
+	if err != nil {
+		return err
+	}
+
+	return fn(orphans)
+}
+
+// filterS3Orphans returns the objects that are still orphans: no active message, none
+// expunged within the grace period, and no pending upload. It is the batched form of
+// IsS3ObjectOrphan and runs on the connection that holds the locks, so it reads the
+// primary — a lagging replica could report a body as unreferenced after a new message
+// already claimed it.
+func (d *Database) filterS3Orphans(ctx context.Context, conn *pgxpool.Conn, objects []UserScopedObjectForCleanup, gracePeriod time.Duration) ([]UserScopedObjectForCleanup, error) {
+	if len(objects) == 0 {
+		return nil, nil
+	}
+
+	threshold := time.Now().Add(-gracePeriod).UTC()
+
+	accountIDs := make([]int64, len(objects))
+	contentHashes := make([]string, len(objects))
+	for i, o := range objects {
+		accountIDs[i] = o.AccountID
+		contentHashes[i] = o.ContentHash
+	}
+
+	rows, err := conn.Query(ctx, `
+		SELECT DISTINCT c.account_id, c.content_hash
+		FROM unnest($1::bigint[], $2::text[]) AS c(account_id, content_hash)
+		WHERE NOT EXISTS (
+			SELECT 1 FROM messages m
+			WHERE m.account_id = c.account_id
+			  AND m.content_hash = c.content_hash
+			  AND (m.expunged_at IS NULL OR m.expunged_at >= $3)
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM pending_uploads pu
+			WHERE pu.account_id = c.account_id
+			  AND pu.content_hash = c.content_hash
+		)
+	`, accountIDs, contentHashes, threshold)
+	if err != nil {
+		return nil, fmt.Errorf("failed to confirm S3 object orphans: %w", err)
+	}
+
+	type accountHash struct {
+		accountID int64
+		hash      string
+	}
+	confirmed := make(map[accountHash]struct{}, len(objects))
+	for rows.Next() {
+		var key accountHash
+		if err := rows.Scan(&key.accountID, &key.hash); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("failed to scan confirmed S3 object orphan: %w", err)
+		}
+		confirmed[key] = struct{}{}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to confirm S3 object orphans: %w", err)
+	}
+
+	orphans := make([]UserScopedObjectForCleanup, 0, len(confirmed))
+	for _, o := range objects {
+		if _, ok := confirmed[accountHash{accountID: o.AccountID, hash: o.ContentHash}]; ok {
+			orphans = append(orphans, o)
+		}
+	}
+	return orphans, nil
+}
+
 // ExpungeOldMessages marks messages older than the specified duration as expunged
 // This enables automatic cleanup of old messages based on age restriction
+//
+// Each call is capped at BATCH_PURGE_SIZE messages so the transaction — and the set of
+// mailbox rows it locks — stays bounded. A backlog larger than the cap must be drained
+// by the caller over successive calls; a single unbounded statement can exceed the write
+// deadline and roll back, making no progress on any cycle.
+//
+// It returns how many candidates the batch claimed, NOT how many rows the UPDATE
+// changed. A concurrent EXPUNGE or MOVE can take a row out from under the batch, and a
+// caller that read the resulting short batch as "the backlog is drained" would abandon
+// its drain loop after one batch.
 func (d *Database) ExpungeOldMessages(ctx context.Context, tx pgx.Tx, olderThan time.Duration) (int64, error) {
 	threshold := time.Now().Add(-olderThan).UTC()
 
-	// Lock the affected mailbox rows (ascending id) before the bulk expunge, so the
+	rows, err := tx.Query(ctx, `
+		SELECT id, mailbox_id FROM messages
+		WHERE created_at < $1 AND expunged_at IS NULL
+		ORDER BY created_at
+		LIMIT $2
+	`, threshold, BATCH_PURGE_SIZE)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list old messages for expunge: %w", err)
+	}
+
+	var messageIDs []int64
+	var candidateMailboxIDs []*int64
+	mailboxSet := make(map[int64]struct{})
+	for rows.Next() {
+		var messageID int64
+		var mailboxID *int64
+		if err := rows.Scan(&messageID, &mailboxID); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("failed to scan old message for expunge: %w", err)
+		}
+		messageIDs = append(messageIDs, messageID)
+		candidateMailboxIDs = append(candidateMailboxIDs, mailboxID)
+		if mailboxID != nil {
+			mailboxSet[*mailboxID] = struct{}{}
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("failed to list old messages for expunge: %w", err)
+	}
+
+	if len(messageIDs) == 0 {
+		return 0, nil
+	}
+
+	// Lock the affected mailbox rows (ascending id) before the batch expunge, so the
 	// stats triggers serialize against concurrent STORE/EXPUNGE/MOVE on those
 	// mailboxes (see lockMailboxStats) and unseen_count cannot drift. Acquiring the
 	// mailbox rows first preserves the global lock order (mailbox row → message rows
 	// → mailbox_stats via trigger), so this stays deadlock-free against every other
-	// path. This is a cross-mailbox bulk op that can lock many rows, but it runs only
-	// in the cleaner under the cleanup lock when max_age_restriction is configured.
-	if _, err := tx.Exec(ctx, `
-		SELECT id FROM mailboxes
-		WHERE id IN (
-			SELECT DISTINCT mailbox_id FROM messages
-			WHERE created_at < $1 AND expunged_at IS NULL AND mailbox_id IS NOT NULL
-		)
-		ORDER BY id
-		FOR UPDATE
-	`, threshold); err != nil {
-		return 0, fmt.Errorf("failed to lock mailboxes for age-based expunge: %w", err)
+	// path.
+	if len(mailboxSet) > 0 {
+		mailboxIDs := make([]int64, 0, len(mailboxSet))
+		for mailboxID := range mailboxSet {
+			mailboxIDs = append(mailboxIDs, mailboxID)
+		}
+		sort.Slice(mailboxIDs, func(i, j int) bool { return mailboxIDs[i] < mailboxIDs[j] })
+
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM mailboxes WHERE id = ANY($1) ORDER BY id FOR UPDATE`, mailboxIDs); err != nil {
+			return 0, fmt.Errorf("failed to lock mailboxes for age-based expunge: %w", err)
+		}
 	}
 
-	result, err := tx.Exec(ctx, `
-		UPDATE messages
+	// Expunge only the candidates still sitting in the mailbox that was locked above:
+	// mailbox_id can change under us between the candidate SELECT and here (restore, or
+	// the ON DELETE SET NULL of a mailbox removal), and expunging a relocated row would
+	// run its stats trigger against a mailbox this transaction does not hold. Such a row
+	// is left to the next batch, which locks its new mailbox; grabbing that mailbox now
+	// would take locks out of ascending id order and could deadlock.
+	if _, err := tx.Exec(ctx, `
+		UPDATE messages m
 		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
-		WHERE created_at < $1 AND expunged_at IS NULL
-	`, threshold)
-
-	if err != nil {
+		FROM unnest($1::bigint[], $2::bigint[]) AS c(id, mailbox_id)
+		WHERE m.id = c.id
+		  AND m.expunged_at IS NULL
+		  AND m.mailbox_id IS NOT DISTINCT FROM c.mailbox_id
+	`, messageIDs, candidateMailboxIDs); err != nil {
 		return 0, fmt.Errorf("failed to expunge old messages: %w", err)
 	}
 
-	return result.RowsAffected(), nil
+	return int64(len(messageIDs)), nil
 }
 
 // GetUserScopedObjectsForCleanup identifies (AccountID, ContentHash) pairs where all messages
@@ -321,32 +517,83 @@ func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, tx pgx.Tx,
 }
 
 // CleanupFailedUploads deletes message rows and their corresponding pending_uploads
-// that are older than the grace period and were never successfully uploaded to S3.
+// once nothing can ever upload their bodies any more.
 // This prevents orphaned message metadata from accumulating due to persistent upload failures.
-func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePeriod time.Duration) (int64, error) {
+//
+// Age alone must never be the criterion: the uploader deliberately does not count
+// transient S3 errors toward maxAttempts (see server/uploader/worker.go), so during a
+// prolonged outage perfectly deliverable messages stay old with their attempts untouched.
+//
+// Attempts alone are not a criterion either: a pending upload is leased only by the
+// instance that created it (AcquireAndLeasePendingUploads filters on instance_id,
+// because the body is a file on that node's local disk), so once that instance is
+// decommissioned or renamed nothing increments its attempts ever again.
+//
+// What separates recoverable from lost is whether the node holding the bytes still
+// exists, so a message past the grace period is reaped only when no pending upload
+// can still deliver it, i.e. every pending_uploads row for it either
+//   - has exhausted its attempts, or
+//   - belongs to an instance that is provably gone (no heartbeat and no lease within
+//     instanceLiveness — see the instance_heartbeats table), or
+//   - does not exist at all (e.g. HardDeleteAccounts removed it).
+//
+// Uncertainty is never enough: an instance with no heartbeat row and no lease at all
+// (a build predating instance_heartbeats, an instance not yet started) counts as
+// alive, because over-reaping loses mail permanently while under-reaping costs disk.
+func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePeriod time.Duration, maxAttempts int, instanceLiveness time.Duration) (int64, error) {
+	if maxAttempts <= 0 {
+		return 0, fmt.Errorf("failed to cleanup failed uploads: max attempts must be positive, got %d", maxAttempts)
+	}
+	if instanceLiveness <= 0 {
+		return 0, fmt.Errorf("failed to cleanup failed uploads: instance liveness threshold must be positive, got %s", instanceLiveness)
+	}
+
 	threshold := time.Now().Add(-gracePeriod).UTC()
 
-	// This single query uses a Common Table Expression (CTE) to perform both deletions
-	// in one atomic operation, which is more efficient than two separate queries.
-	// 1. The `deleted_messages` CTE deletes old, non-uploaded messages and returns their keys.
+	// This single query uses a Common Table Expression (CTE) to perform the deletions
+	// in one atomic operation, which is more efficient than separate queries.
+	// 1. The `deleted_messages` CTE deletes old, non-uploaded messages that no pending
+	//    upload will retry any more, and returns their keys.
 	// 2. The `deleted_pending` CTE then uses these keys to remove the corresponding
 	//    entries from `pending_uploads`.
+	// 3. The `deleted_instances` CTE retires heartbeat rows of long-gone instances, but
+	//    only while they own no pending upload at all: as long as one exists, that row
+	//    is the evidence that permits reaping it. CTEs see the pre-statement snapshot,
+	//    so rows deleted above still count here and are retired a cycle later.
 	// The final SELECT returns the count of messages that were deleted.
+	//
+	// GREATEST ignores NULLs in PostgreSQL, so it yields the most recent evidence that
+	// the owning instance existed, and NULL only when there is no evidence at all. That
+	// evidence is written with the database clock (heartbeats and leases both use now()),
+	// so the liveness cutoff is derived from now() too rather than from this node's clock.
 	query := `
 		WITH deleted_messages AS (
-			DELETE FROM messages
-			WHERE uploaded = FALSE AND created_at < $1
-			RETURNING content_hash, account_id
+			DELETE FROM messages m
+			WHERE m.uploaded = FALSE AND m.created_at < $1
+			  AND NOT EXISTS (
+				SELECT 1 FROM pending_uploads pu
+				LEFT JOIN instance_heartbeats ih ON ih.instance_id = pu.instance_id
+				WHERE pu.content_hash = m.content_hash AND pu.account_id = m.account_id
+				  AND pu.attempts < $2
+				  AND (GREATEST(ih.last_seen, pu.last_attempt) IS NULL
+				       OR GREATEST(ih.last_seen, pu.last_attempt) > now() - $3::interval)
+			  )
+			RETURNING m.content_hash, m.account_id
 		),
 		deleted_pending AS (
 			DELETE FROM pending_uploads pu
 			WHERE (pu.content_hash, pu.account_id) IN (SELECT content_hash, account_id FROM deleted_messages)
+		),
+		deleted_instances AS (
+			DELETE FROM instance_heartbeats ih
+			WHERE ih.last_seen < now() - $3::interval
+			  AND NOT EXISTS (SELECT 1 FROM pending_uploads pu WHERE pu.instance_id = ih.instance_id)
 		)
 		SELECT count(*) FROM deleted_messages
 	`
 
 	var deletedCount int64
-	err := tx.QueryRow(ctx, query, threshold).Scan(&deletedCount)
+	err := tx.QueryRow(ctx, query, threshold, maxAttempts, instanceLiveness).Scan(&deletedCount)
 	if err != nil {
 		return 0, fmt.Errorf("failed to cleanup failed uploads: %w", err)
 	}
@@ -458,11 +705,22 @@ func (d *Database) GetUnusedFTSHashes(ctx context.Context, limit int) ([]string,
 }
 
 // DeleteMessagesFTSByHashBatch deletes multiple rows from the messages_fts table.
+//
+// Each hash is re-validated inside the deleting transaction, the way the S3 orphan
+// path re-checks with IsS3ObjectOrphan. The caller's list comes from GetUnusedFTSHashes,
+// a read-pool scan allowed to run for tens of seconds, and delivery reuses an existing
+// row for a hash it re-delivers (INSERT ... ON CONFLICT (content_hash) DO NOTHING), so a
+// hash that was unreferenced when it was scanned can carry a live message by now.
+// Deleting it would leave that message unsearchable forever, with no error anywhere.
 func (d *Database) DeleteMessagesFTSByHashBatch(ctx context.Context, tx pgx.Tx, contentHashes []string) (int64, error) {
 	if len(contentHashes) == 0 {
 		return 0, nil
 	}
-	tag, err := tx.Exec(ctx, `DELETE FROM messages_fts WHERE content_hash = ANY($1)`, contentHashes)
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM messages_fts f
+		WHERE f.content_hash = ANY($1)
+		  AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.content_hash = f.content_hash)
+	`, contentHashes)
 	if err != nil {
 		return 0, fmt.Errorf("failed to batch delete from messages_fts: %w", err)
 	}

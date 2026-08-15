@@ -27,21 +27,134 @@ var ErrHostNotAllowed = errors.New("host not allowed")
 // This is often a transient error (S3 down, ACME rate limit, network issues) and should not crash the server
 var ErrCertificateUnavailable = errors.New("certificate unavailable")
 
+// clusterCoordinator is the part of the cluster manager the TLS manager depends on:
+// which node is the leader, and therefore which node may issue certificates.
+type clusterCoordinator interface {
+	IsLeader() bool
+	GetNodeID() string
+	GetLeaderID() string
+	OnLeaderChange(callback func(isLeader bool, newLeaderID string))
+}
+
 // Manager handles TLS certificate management for Sora.
 // It supports both file-based certificates and automatic Let's Encrypt certificates.
 type Manager struct {
 	config         config.TLSConfig
 	autocertMgr    *autocert.Manager
 	tlsConfig      *tls.Config
-	clusterManager *cluster.Manager
+	clusterManager clusterCoordinator   // nil outside cluster mode
 	stopCertSync   chan struct{}        // Signal to stop certificate sync worker
 	rateLimitMap   map[string]time.Time // Track rate-limited domains and their retry-after times
 	rateLimitMu    sync.RWMutex         // Protect rateLimitMap
+	issuanceWait   time.Duration        // How long a handshake waits for a certificate issued elsewhere
+	issuancePoll   time.Duration        // Interval between shared-cache reads during that wait
+
+	// issuanceFence is the authority on which node orders a certificate, when one is
+	// available. Gossip leadership alone is not an authority: electLeader picks the
+	// smallest node id among the members THIS node can see, with no quorum, so a network
+	// partition elects a leader on both sides and each believes it is the only one.
+	certFence      CertificateFence
+	claimMu        sync.Mutex
+	issuanceClaims map[string]func(context.Context) // domain -> release, for claims held here
+}
+
+// CertificateFence is a store that cannot be partitioned into two writable copies, used
+// to decide which node runs an ACME order. Implemented over the database.
+type CertificateFence interface {
+	// TryHoldIssuance claims the right to order a certificate for domain. It returns the
+	// release for a granted claim, and a nil release when another node already holds it.
+	TryHoldIssuance(ctx context.Context, domain string, ttl time.Duration) (release func(context.Context), err error)
+}
+
+const (
+	// issuanceClaimTTL bounds a claim whose holder died mid-order. It has to exceed a
+	// whole ACME exchange - order, challenge, validation, finalize - or the claim lapses
+	// while its holder is still working and a second node starts a duplicate order.
+	issuanceClaimTTL = 10 * time.Minute
+	// issuanceFenceTimeout bounds the fence query itself. A TLS handshake is waiting on
+	// it, so it must fail fast rather than hold the handshake open.
+	issuanceFenceTimeout = 3 * time.Second
+)
+
+// SetCertificateFence installs the cluster-wide issuance fence. It must be called before
+// the first TLS handshake; a nil fence leaves gossip leadership as the only gate, which is
+// all a node without a database can do.
+func (m *Manager) SetCertificateFence(fence CertificateFence) {
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+	m.certFence = fence
+}
+
+// holdIssuance reports whether this node may order a certificate for domain, taking the
+// cluster-wide claim if one is available.
+func (m *Manager) holdIssuance(domain string) error {
+	if m.certFence == nil {
+		// No shared store - a proxy-only node has no database. Gossip leadership is then
+		// the only fence there is, which is the behavior this deployment already had.
+		return nil
+	}
+
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+
+	// Re-entrant: concurrent handshakes for one domain all reach here, and the second
+	// must not read this node's own claim as somebody else's.
+	if _, held := m.issuanceClaims[domain]; held {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), issuanceFenceTimeout)
+	defer cancel()
+
+	release, err := m.certFence.TryHoldIssuance(ctx, domain, issuanceClaimTTL)
+	if err != nil {
+		// The fence is unreachable. Allow the order: an expired certificate takes the
+		// whole node's TLS down, while the worst case here is a duplicate order that
+		// costs rate-limit budget. Availability is the right side to fail to.
+		logger.Warn("TLS: Certificate issuance fence unavailable - ordering without it",
+			"domain", domain, "error", err)
+		return nil
+	}
+	if release == nil {
+		logger.Info("TLS: Another node is ordering this certificate", "domain", domain)
+		return fmt.Errorf("%w: %s (claimed by another node)", errIssuanceDeferred, domain)
+	}
+
+	if m.issuanceClaims == nil {
+		m.issuanceClaims = make(map[string]func(context.Context))
+	}
+	m.issuanceClaims[domain] = release
+	return nil
+}
+
+// releaseIssuance gives up this node's claim once the order has produced a certificate,
+// so a renewal does not have to wait out issuanceClaimTTL.
+func (m *Manager) releaseIssuance(domain string) {
+	m.claimMu.Lock()
+	release, held := m.issuanceClaims[domain]
+	delete(m.issuanceClaims, domain)
+	m.claimMu.Unlock()
+
+	if !held {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), issuanceFenceTimeout)
+	defer cancel()
+	release(ctx)
 }
 
 // New creates a new TLS manager based on the provided configuration.
 // If clusterMgr is provided, only the cluster leader will request new certificates.
 func New(cfg config.TLSConfig, clusterMgr *cluster.Manager) (*Manager, error) {
+	// A nil *cluster.Manager must not be passed on as a non-nil interface value: every
+	// cluster-mode decision tests the coordinator against nil.
+	if clusterMgr == nil {
+		return newManager(cfg, nil)
+	}
+	return newManager(cfg, clusterMgr)
+}
+
+func newManager(cfg config.TLSConfig, clusterMgr clusterCoordinator) (*Manager, error) {
 	if !cfg.Enabled {
 		return nil, fmt.Errorf("TLS is not enabled in configuration")
 	}
@@ -51,6 +164,8 @@ func New(cfg config.TLSConfig, clusterMgr *cluster.Manager) (*Manager, error) {
 		clusterManager: clusterMgr,
 		stopCertSync:   make(chan struct{}),
 		rateLimitMap:   make(map[string]time.Time),
+		issuanceWait:   defaultIssuanceWait,
+		issuancePoll:   defaultIssuancePoll,
 	}
 
 	// Log cluster integration status
@@ -76,6 +191,21 @@ func New(cfg config.TLSConfig, clusterMgr *cluster.Manager) (*Manager, error) {
 	return m, nil
 }
 
+// applicationProtocols are the protocols Sora itself serves, in the order the server
+// prefers them. Go picks the first entry the client also offers, so anything appended
+// after these can only be chosen by a client that offers nothing else.
+var applicationProtocols = []string{"imap", "pop3", "sieve", "lmtp", "http/1.1", "h2"}
+
+// acmeCapableProtocols is applicationProtocols with acme.ALPNProto last, for the
+// listeners that may have to answer a tls-alpn-01 validation. Last is what keeps it
+// safe: an ACME validator offers acme-tls/1 alone, while a mail client that offers
+// "imap" gets "imap" because the server's preference is consulted in order.
+func acmeCapableProtocols() []string {
+	protocols := make([]string, 0, len(applicationProtocols)+1)
+	protocols = append(protocols, applicationProtocols...)
+	return append(protocols, acme.ALPNProto)
+}
+
 // initFileProvider initializes TLS with certificate files
 func (m *Manager) initFileProvider() error {
 	if m.config.CertFile == "" || m.config.KeyFile == "" {
@@ -90,12 +220,31 @@ func (m *Manager) initFileProvider() error {
 	m.tlsConfig = &tls.Config{
 		Certificates:  []tls.Certificate{cert},
 		MinVersion:    tls.VersionTLS12,
-		NextProtos:    []string{"imap", "pop3", "sieve", "lmtp", "http/1.1", "h2"},
+		NextProtos:    applicationProtocols,
 		Renegotiation: tls.RenegotiateNever,
 	}
 
 	logger.Info("Loaded TLS certificate from files", "cert", m.config.CertFile, "key", m.config.KeyFile)
 	return nil
+}
+
+// DefaultFallbackDir is where certificates are mirrored locally when fallback_dir is unset.
+const DefaultFallbackDir = "/var/lib/sora/certs"
+
+// resolveFallbackDir returns the directory that mirrors the S3 certificate cache locally,
+// or "" when the operator has explicitly disabled the mirror.
+//
+// Only an explicit enable_fallback = false disables it. An absent key means enabled: S3-only
+// mode puts an S3 GET on every TLS handshake and fails handshakes for certificates that
+// exist whenever S3 is unavailable, so it must be chosen, never inherited from a zero value.
+func resolveFallbackDir(leCfg *config.TLSLetsEncryptConfig) string {
+	if leCfg.EnableFallback != nil && !*leCfg.EnableFallback {
+		return ""
+	}
+	if leCfg.FallbackDir != "" {
+		return leCfg.FallbackDir
+	}
+	return DefaultFallbackDir
 }
 
 // initLetsEncryptProvider initializes autocert for automatic certificate management
@@ -119,51 +268,27 @@ func (m *Manager) initLetsEncryptProvider() error {
 	}
 
 	// Initialize S3 cache
-	s3cache, err := NewS3Cache(leCfg.S3)
+	s3cache, err := NewS3Cache(leCfg.S3, encryptionOptions(leCfg.S3)...)
 	if err != nil {
 		return fmt.Errorf("failed to initialize S3 cache: %w", err)
 	}
 
-	// Wrap S3 cache with fallback to local filesystem for resilience (if enabled)
+	// Mirror the S3 cache on local disk. NewFallbackCache returns an S3-only cache if the
+	// directory cannot be created, so a permission problem degrades instead of crashing.
 	var cache autocert.Cache = s3cache
-
-	// EnableFallback defaults to true if not explicitly set to false
-	enableFallback := leCfg.EnableFallback
-	if !enableFallback {
-		// Check if it was explicitly set - if EnableFallback is false and FallbackDir is empty,
-		// assume user wants fallback disabled. Otherwise, enable by default.
-		if leCfg.FallbackDir == "" {
-			// Not explicitly configured either way - enable by default
-			enableFallback = true
-		}
-	} else {
-		enableFallback = true
-	}
-
-	if enableFallback {
-		fallbackDir := leCfg.FallbackDir
-		if fallbackDir == "" {
-			fallbackDir = "/var/lib/sora/certs" // Default fallback directory
-		}
-
-		// NewFallbackCache will return S3-only cache if fallback dir cannot be created
-		// This prevents server crashes due to permission issues
-		fallbackCache, err := NewFallbackCache(s3cache, fallbackDir)
+	if fallbackDir := resolveFallbackDir(leCfg); fallbackDir != "" {
+		cache, err = NewFallbackCache(s3cache, fallbackDir)
 		if err != nil {
 			return fmt.Errorf("failed to initialize fallback cache: %w", err)
 		}
-		cache = fallbackCache
-		// Note: Success message logged inside NewFallbackCache (or warning if fallback disabled)
 	} else {
-		logger.Info("Certificate fallback cache disabled - using S3 only")
-		cache = s3cache
+		logger.Warn("TLS: Certificate fallback cache explicitly disabled - serving from S3 only; handshakes will fail while S3 is unavailable")
 	}
 
 	// Wrap cache with cluster-aware wrapper if cluster is enabled
 	var finalCache autocert.Cache = cache
 	if m.clusterManager != nil {
-		clusterCache := NewClusterAwareCache(cache, m.clusterManager)
-		finalCache = NewFailoverAwareCache(clusterCache)
+		finalCache = NewClusterAwareCache(cache, m.clusterManager)
 		logger.Info("Cluster-aware certificate cache enabled - only leader can request certificates", "leader",
 			m.clusterManager.GetLeaderID())
 
@@ -176,6 +301,10 @@ func (m *Manager) initLetsEncryptProvider() error {
 			}
 		})
 	}
+
+	// The gate is autocert's view of the cache and must stay outermost: it answers the
+	// read autocert makes immediately before it orders a certificate.
+	finalCache = newIssuanceGate(finalCache, m)
 
 	// Parse renewal window if specified
 	var renewBefore time.Duration
@@ -191,15 +320,17 @@ func (m *Manager) initLetsEncryptProvider() error {
 	}
 
 	// Create autocert manager
+	hostAllowed := autocert.HostWhitelist(leCfg.Domains...)
 	m.autocertMgr = &autocert.Manager{
 		Prompt:      autocert.AcceptTOS,
 		Email:       leCfg.Email,
-		HostPolicy:  autocert.HostWhitelist(leCfg.Domains...),
+		HostPolicy:  hostAllowed,
 		Cache:       finalCache,
 		RenewBefore: renewBefore, // 0 = default 30 days
 		// Use Let's Encrypt production directory by default
 		Client: &acme.Client{
 			DirectoryURL: "https://acme-v02.api.letsencrypt.org/directory",
+			HTTPClient:   &http.Client{Transport: &issuanceFence{manager: m, base: http.DefaultTransport}},
 		},
 	}
 
@@ -232,63 +363,25 @@ func (m *Manager) initLetsEncryptProvider() error {
 			serverName = strings.ToLower(serverName)
 
 			// Check if the server name matches our configured domains using the HostPolicy
-			if err := m.autocertMgr.HostPolicy(nil, serverName); err != nil {
+			if err := hostAllowed(context.Background(), serverName); err != nil {
 				logger.Info("TLS: Rejected certificate request for unconfigured domain", "domain", serverName, "error", err)
 				return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
-			}
-
-			// Check if certificate exists in cache BEFORE checking rate limits
-			// Rationale: Even if we're rate-limited, we should serve existing certificates from cache/S3
-			// Rate limiting only applies to NEW certificate requests
-			ctx := context.Background()
-			_, cacheErr := m.autocertMgr.Cache.Get(ctx, serverName)
-
-			// If certificate exists in cache, proceed to serve it (skip rate limit check)
-			if cacheErr == nil {
-				logger.Debug("TLS: Serving certificate from cache", "domain", serverName)
-			} else if cacheErr == autocert.ErrCacheMiss {
-				// Certificate not in cache - check if we're rate-limited before requesting new one
-				if isRateLimited, retryAfter := m.isRateLimited(serverName); isRateLimited {
-					logger.Warn("TLS: Domain is rate-limited, cannot request new certificate",
-						"domain", serverName, "retry_after", retryAfter)
-					return nil, fmt.Errorf("%w for %s: rate limited until %v",
-						ErrCertificateUnavailable, serverName, retryAfter)
-				}
-				logger.Info("TLS: Certificate not in cache - requesting NEW certificate from Let's Encrypt", "domain", serverName)
-			} else {
-				// Cache error (not a miss) - log but try to proceed anyway
-				logger.Info("TLS: Cache check failed - attempting certificate retrieval", "domain", serverName, "error", cacheErr)
 			}
 
 			// Create a modified ClientHelloInfo with the resolved server name
 			modifiedHello := *hello
 			modifiedHello.ServerName = serverName
 
+			// Everything below is autocert's: it answers from memory, then from the shared
+			// cache, and reaches Let's Encrypt only past the issuance gate. Reading the cache
+			// here as well would put an S3 GET on every handshake for a certificate autocert
+			// already holds.
 			cert, err := baseTLSConfig.GetCertificate(&modifiedHello)
+			if errors.Is(err, errIssuanceDeferred) {
+				cert, err = m.awaitIssuedCertificate(&modifiedHello, baseTLSConfig.GetCertificate, err)
+			}
 			if err != nil {
-				// Check if this is a rate limit error from Let's Encrypt
-				errStr := err.Error()
-				if strings.Contains(errStr, "429") && strings.Contains(errStr, "rateLimited") {
-					// Parse retry-after time from error message
-					// Example: "retry after 2026-01-25 12:42:05 UTC: see https://..."
-					retryAfter := time.Now().Add(24 * time.Hour) // Default: retry after 24 hours
-					if strings.Contains(errStr, "retry after") {
-						// Try to parse the retry time from the error message
-						parts := strings.Split(errStr, "retry after ")
-						if len(parts) > 1 {
-							// Split on ": " to get just the timestamp
-							timeParts := strings.SplitN(parts[1], ": ", 2)
-							if len(timeParts) > 0 {
-								timeStr := strings.TrimSpace(timeParts[0])
-								if parsedTime, parseErr := time.Parse("2006-01-02 15:04:05 MST", timeStr); parseErr == nil {
-									retryAfter = parsedTime
-									logger.Info("TLS: Parsed rate limit retry-after time", "domain", serverName, "retry_after", retryAfter)
-								}
-							}
-						}
-					}
-					m.markRateLimited(serverName, retryAfter)
-				}
+				m.noteRateLimitError(serverName, err)
 
 				// Certificate retrieval failures are often transient (S3 down, ACME rate limits, network issues)
 				// Wrap as ErrCertificateUnavailable so the server logs but doesn't crash
@@ -300,15 +393,16 @@ func (m *Manager) initLetsEncryptProvider() error {
 			// Clear rate limit on successful certificate retrieval
 			m.clearRateLimit(serverName)
 
-			if cacheErr == autocert.ErrCacheMiss {
-				logger.Info("TLS: NEW certificate successfully obtained from Let's Encrypt", "domain", serverName)
-			} else {
-				logger.Debug("TLS: Certificate provided for domain", "domain", serverName)
-			}
+			logger.Debug("TLS: Certificate provided for domain", "domain", serverName)
 			return cert, nil
 		},
-		MinVersion:    tls.VersionTLS12,
-		NextProtos:    []string{"imap", "pop3", "sieve", "lmtp", "http/1.1", "h2"},
+		MinVersion: tls.VersionTLS12,
+		// acme.ALPNProto is advertised last so only an ACME validator, which offers it
+		// alone, can negotiate it. autocert tries tls-alpn-01 first on a fresh order and
+		// there is no way to take it out of its challenge list, so a config that cannot
+		// negotiate acme-tls/1 spends an extra order and a failed validation, against
+		// Let's Encrypt's 5 failures per hostname per hour, on every issuance.
+		NextProtos:    acmeCapableProtocols(),
 		Renegotiation: tls.RenegotiateNever,
 	}
 
@@ -427,6 +521,36 @@ func (m *Manager) isRateLimited(domain string) (bool, time.Time) {
 	}
 
 	return true, retryAfter
+}
+
+// noteRateLimitError records the retry-after time carried by a Let's Encrypt 429, so the
+// issuance gate stops ordering for that domain until it passes. Other errors are ignored.
+func (m *Manager) noteRateLimitError(domain string, err error) {
+	errStr := err.Error()
+	if !strings.Contains(errStr, "429") || !strings.Contains(errStr, "rateLimited") {
+		return
+	}
+
+	// Parse retry-after time from error message
+	// Example: "retry after 2026-01-25 12:42:05 UTC: see https://..."
+	retryAfter := time.Now().Add(24 * time.Hour) // Default: retry after 24 hours
+	if strings.Contains(errStr, "retry after") {
+		// Try to parse the retry time from the error message
+		parts := strings.Split(errStr, "retry after ")
+		if len(parts) > 1 {
+			// Split on ": " to get just the timestamp
+			timeParts := strings.SplitN(parts[1], ": ", 2)
+			if len(timeParts) > 0 {
+				timeStr := strings.TrimSpace(timeParts[0])
+				if parsedTime, parseErr := time.Parse("2006-01-02 15:04:05 MST", timeStr); parseErr == nil {
+					retryAfter = parsedTime
+					logger.Info("TLS: Parsed rate limit retry-after time", "domain", domain, "retry_after", retryAfter)
+				}
+			}
+		}
+	}
+
+	m.markRateLimited(domain, retryAfter)
 }
 
 // markRateLimited records that a domain is rate-limited until the specified time

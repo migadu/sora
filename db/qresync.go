@@ -26,7 +26,7 @@ func (d *Database) GetVanishedUIDs(ctx context.Context, mailboxID int64, sinceMo
 		ORDER BY uid
 	`
 
-	rows, err := d.GetReadPool().Query(ctx, query, mailboxID, sinceModSeq, untilModSeq)
+	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, sinceModSeq, untilModSeq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query vanished UIDs: %w", err)
 	}
@@ -85,7 +85,7 @@ func (d *Database) GetMessagesChangedSince(ctx context.Context, mailboxID int64,
 		ORDER BY m.uid
 	`
 
-	rows, err := d.GetReadPool().Query(ctx, query, mailboxID, sinceModSeq)
+	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, sinceModSeq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query changed messages: %w", err)
 	}
@@ -159,7 +159,7 @@ func (d *Database) GetVanishedUIDsForFetch(ctx context.Context, mailboxID int64,
 		ORDER BY uid
 	`
 
-	rows, err := d.GetReadPool().Query(ctx, query, mailboxID, sinceModSeq)
+	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, sinceModSeq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query vanished UIDs for fetch: %w", err)
 	}
@@ -190,7 +190,7 @@ func (d *Database) GetVanishedUIDsForFetchWithRetry(ctx context.Context, mailbox
 // RFC 7162 §3.2.5: If UIDVALIDITY changes, client must discard cached state.
 func (d *Database) ValidateQResyncUIDValidity(ctx context.Context, mailboxID int64, clientUIDValidity uint32) (bool, error) {
 	var currentUIDValidity uint32
-	err := d.GetReadPool().QueryRow(ctx, `
+	err := d.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT uid_validity
 		FROM mailboxes
 		WHERE id = $1
@@ -242,7 +242,7 @@ func (d *Database) GetActiveUIDsInSet(ctx context.Context, mailboxID int64, uidS
 		ORDER BY uid
 	`, whereClause)
 
-	rows, err := d.GetReadPool().Query(ctx, query, args...)
+	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active UIDs in set: %w", err)
 	}

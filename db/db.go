@@ -131,29 +131,37 @@ type Database struct {
 	lockConn                     *pgxpool.Conn    // Connection holding the advisory lock
 	uidValidityMismatchLoggedMap sync.Map         // Tracks mailbox IDs that have already logged UIDVALIDITY mismatch (mailboxID -> bool)
 	AccountDomainCache           sync.Map         // Cache for account_id -> domain string
-	mailboxMutexes               sync.Map         // Cache for per-mailbox locks to prevent connection starvation (mailboxID -> *sync.Mutex)
-	fetchChunkSize               int              // Number of messages to fetch per chunk for large result sets
+	// Striped locks preventing connection starvation, indexed by mailbox ID (see LockMailbox).
+	mailboxMutexes [mailboxLockStripes]sync.Mutex
+	fetchChunkSize int // Number of messages to fetch per chunk for large result sets
 }
 
-var (
-	mailboxLockWaitDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "sora_go_mailbox_lock_wait_seconds",
-		Help:    "Time spent waiting for Go-level mailbox mutex",
-		Buckets: []float64{0.001, 0.01, 0.1, 0.5, 1, 5},
-	}, []string{"mailbox_id"})
-)
+// mailboxLockStripes is the size of the per-mailbox mutex table. A mailbox always
+// maps to the same stripe, so per-mailbox exclusion holds; unrelated mailboxes
+// sharing a stripe only serialize with each other, which the lock tolerates.
+const mailboxLockStripes = 1024
+
+var mailboxLockWaitDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "sora_go_mailbox_lock_wait_seconds",
+	Help:    "Time spent waiting for Go-level mailbox mutex",
+	Buckets: []float64{0.001, 0.01, 0.1, 0.5, 1, 5},
+})
+
+func (db *Database) mailboxMutex(mailboxID int64) *sync.Mutex {
+	return &db.mailboxMutexes[uint64(mailboxID)%mailboxLockStripes]
+}
 
 // LockMailbox acquires an in-memory mutex for a specific mailbox.
 // This prevents connection pool starvation during mass concurrent inserts to the same mailbox,
 // by serializing the workers in Go memory BEFORE they acquire a database connection.
+// Callers must not hold a second mailbox lock while calling this: two mailboxes can
+// share a stripe.
 // Returns an unlock function to be called in a defer statement.
 func (db *Database) LockMailbox(mailboxID int64) func() {
 	start := time.Now()
-	v, _ := db.mailboxMutexes.LoadOrStore(mailboxID, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
+	mu := db.mailboxMutex(mailboxID)
 	mu.Lock()
-	duration := time.Since(start).Seconds()
-	mailboxLockWaitDuration.WithLabelValues(fmt.Sprintf("%d", mailboxID)).Observe(duration)
+	mailboxLockWaitDuration.Observe(time.Since(start).Seconds())
 	return func() { mu.Unlock() }
 }
 

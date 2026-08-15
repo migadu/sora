@@ -288,11 +288,48 @@ func (rs *ResilientS3Storage) CopyWithRetry(ctx context.Context, sourcePath, des
 	return err
 }
 
-// IsHealthy returns true if S3 circuit breakers are not open (S3 is reachable).
-// Used by the cleaner to skip destructive operations when S3 is down.
+// s3HealthProbeKey is never written by Sora, so a stat of it reaches the bucket and
+// comes back 404 without mutating anything — a liveness signal safe to issue through
+// any of the breakers, including the delete one.
+const s3HealthProbeKey = ".sora-health-probe"
+
+// IsHealthy returns true if S3 is reachable through every circuit breaker.
+// Used by the cleaner to skip destructive operations when S3 is down, so the delete
+// breaker must be consulted too: the cleaner's only S3 traffic is object deletion.
+//
+// A half-open breaker is resolved here instead of being assumed either way. Circuit
+// breakers only leave half-open on a successful request, and the cleaner's wrapper can
+// go days without issuing one (Phase 1 finds no delete candidates), so treating
+// half-open as unhealthy would keep the DB-only cleanup phases disabled long after S3
+// recovered, while treating it as healthy would re-enable destructive cleanup on an
+// unconfirmed recovery.
 func (rs *ResilientS3Storage) IsHealthy() bool {
-	return rs.putBreaker.State() != circuitbreaker.StateOpen &&
-		rs.getBreaker.State() != circuitbreaker.StateOpen
+	for _, breaker := range []*circuitbreaker.CircuitBreaker{rs.putBreaker, rs.getBreaker, rs.deleteBreaker} {
+		switch breaker.State() {
+		case circuitbreaker.StateClosed:
+		case circuitbreaker.StateHalfOpen:
+			if !rs.probeLiveness(breaker) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// probeLiveness drives one read-only request through breaker so that a half-open
+// breaker reaches a verdict: success closes it, failure reopens it for another timeout.
+func (rs *ResilientS3Storage) probeLiveness(breaker *circuitbreaker.CircuitBreaker) bool {
+	_, err := breaker.Execute(func() (any, error) {
+		_, _, err := rs.storage.Exists(s3HealthProbeKey)
+		return nil, err
+	})
+	if err != nil {
+		logger.Warn("S3 liveness probe failed", "breaker", breaker.Name(), "error", err)
+		return false
+	}
+	return true
 }
 
 func (rs *ResilientS3Storage) DeleteWithRetry(ctx context.Context, key string) error {
@@ -310,6 +347,85 @@ func (rs *ResilientS3Storage) DeleteWithRetry(ctx context.Context, key string) e
 	}
 	_, err := rs.executeS3OperationWithRetry(ctx, rs.deleteBreaker, config, rs.isRetryableError, op, key, "DELETE")
 	return err
+}
+
+// DeleteBulkWithRetry removes up to 1000 keys in a single S3 DeleteObjects request and
+// returns the per-key failures (nil when every key is gone). Only the keys that failed
+// are re-issued on a retry, so a partial failure never re-sends keys already deleted.
+//
+// Failures are reported per key rather than normalised away: the caller deletes the
+// database rows of exactly the keys that came back clean, and treating an unrecognised
+// per-key error as success would strand the body in the bucket with nothing left
+// pointing at it. Routed through the delete breaker like DeleteWithRetry, so an outage
+// during bulk deletion trips it and IsHealthy sees it.
+func (rs *ResilientS3Storage) DeleteBulkWithRetry(ctx context.Context, keys []string) map[string]error {
+	// S3's DeleteObjects caps a request at 1000 keys and the storage layer silently
+	// drops the overflow, which would look like success to the caller. Split here so
+	// that can never happen, whatever the caller passes.
+	const maxKeysPerRequest = 1000
+
+	var failures map[string]error
+	for start := 0; start < len(keys); start += maxKeysPerRequest {
+		batch := keys[start:min(start+maxKeysPerRequest, len(keys))]
+		for key, err := range rs.deleteBulkBatch(ctx, batch) {
+			if failures == nil {
+				failures = make(map[string]error)
+			}
+			failures[key] = err
+		}
+	}
+	return failures
+}
+
+// deleteBulkBatch deletes one DeleteObjects-sized batch of keys.
+func (rs *ResilientS3Storage) deleteBulkBatch(ctx context.Context, keys []string) map[string]error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	config := retry.BackoffConfig{
+		InitialInterval: 1 * time.Second,
+		MaxInterval:     15 * time.Second,
+		Multiplier:      2.0,
+		Jitter:          true,
+		MaxRetries:      3,
+		OperationName:   "s3_delete_bulk",
+	}
+
+	remaining := keys
+	var failures map[string]error
+	op := func() (any, error) {
+		errs := rs.storage.DeleteBulk(remaining)
+		failures = errs
+		if len(errs) == 0 {
+			return nil, nil
+		}
+		// Narrow the batch to what still failed, and surface one of the errors so the
+		// retry and the breaker can classify the outcome.
+		var firstErr error
+		next := make([]string, 0, len(errs))
+		for _, key := range remaining {
+			err, failed := errs[key]
+			if !failed {
+				continue
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			next = append(next, key)
+		}
+		remaining = next
+		return nil, firstErr
+	}
+	_, err := rs.executeS3OperationWithRetry(ctx, rs.deleteBreaker, config, rs.isRetryableError, op, fmt.Sprintf("%d keys", len(keys)), "DELETE_BULK")
+	if err != nil && len(failures) == 0 {
+		// The breaker rejected the call outright, so nothing was attempted.
+		failures = make(map[string]error, len(remaining))
+		for _, key := range remaining {
+			failures[key] = err
+		}
+	}
+	return failures
 }
 
 func (rs *ResilientS3Storage) PutObjectWithRetry(ctx context.Context, key string, reader io.Reader, objectSize int64) (*s3.PutObjectOutput, error) {

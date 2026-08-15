@@ -94,7 +94,8 @@ type ServerOptions struct {
 	ConnectTimeout           time.Duration
 	AuthIdleTimeout          time.Duration
 	EnableAffinity           bool
-	EnableBackendHealthCheck bool // Enable backend health checking (default: true)
+	EnableBackendHealthCheck bool           // Enable backend health checking (default: true)
+	RemoteDNSRefresh         *time.Duration // Backend DNS re-resolution interval; nil = default, 0 = pin to the startup resolution
 	RemoteLookup             *config.RemoteLookupConfig
 	TrustedProxies           []string      // CIDR blocks for trusted proxies that can forward parameters
 	RemoteUseXCLIENT         bool          // Whether backend supports XCLIENT command for forwarding
@@ -174,6 +175,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 
 	// SSRF defense: when enabled, refuse remote-lookup backends not in the configured pool.
 	connManager.SetRestrictRemoteLookupToPool(opts.RemoteLookup != nil && opts.RemoteLookup.RestrictToPool)
+
+	// Backend hostnames are re-resolved periodically so an address change is picked
+	// up without a restart; remote_dns_refresh tunes or disables that.
+	if opts.RemoteDNSRefresh != nil {
+		connManager.SetResolveRefreshInterval(*opts.RemoteDNSRefresh)
+	}
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {

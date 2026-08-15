@@ -217,13 +217,7 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 
 	// If encryption is enabled, encrypt the data before uploading
 	if s.Encrypt {
-		data, err := io.ReadAll(body)
-		if err != nil {
-			metrics.StorageOperationErrors.WithLabelValues("PUT", "read_error").Inc()
-			return fmt.Errorf("failed to read data for encryption: %w", err)
-		}
-
-		encryptedData, err := s.encryptData(data)
+		encryptedData, err := s.encryptFrom(body, size)
 		if err != nil {
 			metrics.StorageOperationErrors.WithLabelValues("PUT", "encryption_error").Inc()
 			return fmt.Errorf("failed to encrypt data: %w", err)
@@ -262,16 +256,25 @@ func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
 	return err
 }
 
-// encryptData encrypts data using AES-256-GCM
-func (s *S3Storage) encryptData(plaintext []byte) ([]byte, error) {
-	// Create a new AES cipher block using the key
+// newGCM builds the AEAD used for client-side encryption.
+//
+// The stored layout is `nonce || GCM(plaintext || tag)` and is FROZEN: deployments hold
+// large numbers of objects written this way, so any change here has to keep reading and
+// writing exactly these bytes. See storage/encryption_inplace_test.go, which pins both
+// directions against a copy of the original implementation.
+func (s *S3Storage) newGCM() (cipher.AEAD, error) {
 	block, err := aes.NewCipher(s.EncryptionKey)
 	if err != nil {
 		return nil, err
 	}
+	return cipher.NewGCM(block)
+}
 
-	// Create a new GCM cipher mode
-	gcm, err := cipher.NewGCM(block)
+// encryptData encrypts data using AES-256-GCM. The caller's slice is left untouched, so
+// this necessarily holds the plaintext and the ciphertext at once; prefer encryptFrom when
+// the body is a reader of known length.
+func (s *S3Storage) encryptData(plaintext []byte) ([]byte, error) {
+	gcm, err := s.newGCM()
 	if err != nil {
 		return nil, err
 	}
@@ -287,16 +290,77 @@ func (s *S3Storage) encryptData(plaintext []byte) ([]byte, error) {
 	return ciphertext, nil
 }
 
-// decryptData decrypts data using AES-256-GCM
-func (s *S3Storage) decryptData(ciphertext []byte) ([]byte, error) {
-	// Create a new AES cipher block using the key
-	block, err := aes.NewCipher(s.EncryptionKey)
+// encryptFrom reads size bytes from body and returns them encrypted, in ONE allocation.
+//
+// The read-then-encrypt shape it replaces cost about 3x the message size per upload:
+// io.ReadAll grows its buffer by doubling, and Seal then allocated the ciphertext
+// separately, leaving plaintext and ciphertext resident together. Multiplied by the
+// uploader's default concurrency of 20 that dominated the process footprint, and it
+// cancelled out the uploader's switch to streaming the body from disk.
+//
+// Here the output buffer is allocated once at its final length, the body is read into the
+// region after the nonce, and Seal writes over that same region: crypto/cipher permits an
+// exactly-overlapping destination, which is why the seal target starts at the first
+// plaintext byte rather than at the start of the buffer.
+//
+// The produced bytes are identical in layout to encryptData's - this is an allocation
+// change, not a format change.
+func (s *S3Storage) encryptFrom(body io.Reader, size int64) ([]byte, error) {
+	gcm, err := s.newGCM()
 	if err != nil {
 		return nil, err
 	}
 
-	// Create a new GCM cipher mode
-	gcm, err := cipher.NewGCM(block)
+	// A caller that does not know the length still has to work; fall back to the
+	// two-buffer path rather than guessing.
+	if size < 0 {
+		data, err := io.ReadAll(body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read data for encryption: %w", err)
+		}
+		return s.encryptData(data)
+	}
+
+	nonceSize := gcm.NonceSize()
+	buf := make([]byte, nonceSize+int(size), nonceSize+int(size)+gcm.Overhead())
+
+	nonce := make([]byte, nonceSize)
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, err
+	}
+	copy(buf[:nonceSize], nonce)
+
+	if _, err := io.ReadFull(body, buf[nonceSize:]); err != nil {
+		return nil, fmt.Errorf("failed to read %d bytes for encryption: %w", size, err)
+	}
+
+	// A body longer than its declared size would be silently truncated into the object,
+	// and the truncation would only surface later as a content-hash mismatch on read.
+	var extra [1]byte
+	if n, err := body.Read(extra[:]); n > 0 || (err != nil && err != io.EOF) {
+		if n > 0 {
+			return nil, fmt.Errorf("body is longer than the declared size of %d bytes", size)
+		}
+		return nil, fmt.Errorf("failed to confirm end of body: %w", err)
+	}
+
+	// Seal over the plaintext in place. dst is buf[:nonceSize] so the appended ciphertext
+	// begins exactly where the plaintext begins - an exact overlap, which is allowed;
+	// any other offset would panic with "invalid buffer overlap".
+	return gcm.Seal(buf[:nonceSize], nonce, buf[nonceSize:], nil), nil
+}
+
+// decryptData decrypts data using AES-256-GCM.
+//
+// It CONSUMES its argument: the plaintext is written over the ciphertext in place, so the
+// caller must not read ciphertext afterwards and must not pass a buffer it shares. That
+// buys the read path the same saving as encryptFrom - one buffer instead of the ciphertext
+// and the plaintext together - and both call sites own their buffer outright.
+//
+// Authentication is unaffected: Open still verifies the tag over the whole message before
+// returning, and returns an error without exposing a plaintext if it fails.
+func (s *S3Storage) decryptData(ciphertext []byte) ([]byte, error) {
+	gcm, err := s.newGCM()
 	if err != nil {
 		return nil, err
 	}
@@ -305,10 +369,14 @@ func (s *S3Storage) decryptData(ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) < gcm.NonceSize() {
 		return nil, fmt.Errorf("ciphertext too short")
 	}
-	nonce, ciphertext := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
+	nonceSize := gcm.NonceSize()
+	nonce := make([]byte, nonceSize)
+	copy(nonce, ciphertext[:nonceSize])
+	body := ciphertext[nonceSize:]
 
-	// Decrypt the data
-	return gcm.Open(nil, nonce, ciphertext, nil)
+	// dst starts at the first ciphertext byte, an exact overlap, so the plaintext is
+	// written over the body as it is decrypted.
+	return gcm.Open(body[:0], nonce, body, nil)
 }
 
 func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
@@ -468,7 +536,6 @@ func (s *S3Storage) DeleteBulk(keys []string) map[string]error {
 	if err != nil {
 		// Entire operation failed
 		logger.Error("STORAGE: Bulk delete failed", "count", len(keys), "error", err)
-		metrics.S3OperationsTotal.WithLabelValues("DELETE_BULK", "error").Inc()
 
 		// Return error for all keys
 		errors := make(map[string]error)
@@ -478,7 +545,10 @@ func (s *S3Storage) DeleteBulk(keys []string) map[string]error {
 		return errors
 	}
 
-	// Check for partial failures
+	// Check for partial failures.
+	// sora_s3_operations_total (the error-rate counter) is recorded once per logical
+	// operation by the resilient layer (resilient.RecordS3Operation) after retries
+	// settle, not per attempt here — same as Delete.
 	errors := make(map[string]error)
 	if len(output.Errors) > 0 {
 		for _, deleteError := range output.Errors {
@@ -488,9 +558,6 @@ func (s *S3Storage) DeleteBulk(keys []string) map[string]error {
 			errors[key] = fmt.Errorf("S3 delete error: %s - %s", code, message)
 			logger.Warn("STORAGE: Failed to delete object in bulk operation", "key", key, "code", code, "message", message)
 		}
-		metrics.S3OperationsTotal.WithLabelValues("DELETE_BULK", "partial").Inc()
-	} else {
-		metrics.S3OperationsTotal.WithLabelValues("DELETE_BULK", "success").Inc()
 	}
 
 	successCount := len(keys) - len(errors)

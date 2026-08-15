@@ -56,6 +56,14 @@ func (rd *ResilientDatabase) AcquireAndLeasePendingUploadsWithRetry(ctx context.
 	return result.([]db.PendingUpload), nil
 }
 
+func (rd *ResilientDatabase) RecordInstanceHeartbeatWithRetry(ctx context.Context, instanceID string) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RecordInstanceHeartbeat(ctx, tx, instanceID)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+	return err
+}
+
 func (rd *ResilientDatabase) MarkUploadAttemptWithRetry(ctx context.Context, contentHash string, accountID int64) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).MarkUploadAttempt(ctx, tx, contentHash, accountID)

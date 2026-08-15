@@ -264,6 +264,7 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 		RDB:          s.rdb,
 		Uploader:     s.uploader,
 		Hostname:     s.hostname,
+		InstanceID:   s.instanceID,
 		FTSRetention: s.ftsRetention,
 		MetricsLabel: "http_delivery",
 		Logger:       logger,
@@ -277,6 +278,7 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 		RedirectRateLimit:  s.redirectRateLimit,
 		RedirectRateWindow: s.redirectRateWindow,
 		MaxRedirectHops:    s.maxRedirectHops,
+		SieveExtensions:    s.sieveExtensions,
 	}
 
 	deliveryCtx.SieveExecutor = sieveExecutor

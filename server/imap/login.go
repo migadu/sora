@@ -12,6 +12,18 @@ import (
 	"github.com/migadu/sora/server"
 )
 
+// authFailedError is the ONE bad-credential reply. Every path that must be
+// indistinguishable from a wrong password returns this rather than a hand-written
+// copy: a copy drifts from the original and re-creates, inverted, the very oracle
+// it was written to close.
+func authFailedError() *imap.Error {
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeAuthenticationFailed,
+		Text: "Invalid address or password",
+	}
+}
+
 // Login handles the IMAP LOGIN command. It always applies the authentication
 // gate (progressive delay + rate-limit check) before authenticating.
 func (s *IMAPSession) Login(ctx context.Context, address, password string) error {
@@ -54,6 +66,16 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		}
 	}
 
+	// Rate-limit key for this attempt. Canonicalised from the submitted address so
+	// that the check below and every RecordAuthAttempt* call in this function use
+	// the SAME key. Checking the raw string while recording the parsed address let
+	// an attacker vary the case or the +detail to sidestep Tier 1 entirely, while
+	// the resulting block landed on the victim's canonical address. The master form
+	// "user@domain.com@MASTERUSER" canonicalises to the TARGET's address, so it is
+	// keyed on the master credential instead (AuthRateLimitKeyWithMaster) — an
+	// attempt at the master password must never charge the account it named.
+	authKey := server.AuthRateLimitKeyWithMaster(address, s.server.masterUsername)
+
 	if applyGate {
 		// Apply progressive authentication delay BEFORE any other checks
 		// Create a fake net.Addr from the RemoteIP for delay calculation
@@ -77,7 +99,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 
 		// Check authentication rate limiting after delay using proxy-aware method
 		if s.server.authLimiter != nil {
-			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, address); err != nil {
+			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, authKey); err != nil {
 				// Check if this is a rate limit error
 				var rateLimitErr *server.RateLimitError
 				if errors.As(err, &rateLimitErr) {
@@ -100,11 +122,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 				// A divergent rate-limit response is an oracle: it confirms a targeted account/IP is
 				// being limited, which on a shared egress IP signals a deliberate lockout. The block
 				// is still enforced — only its observable form is made indistinguishable. (security-audit M14)
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeAuthenticationFailed,
-					Text: "Invalid address or password",
-				}
+				return authFailedError()
 			}
 		}
 	}
@@ -115,6 +133,13 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		s.DebugLog("failed to parse address", "error", err)
 		// Track invalid address format as client error
 		metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "invalid_address", "client_error").Inc()
+		// Record it: an unparseable address was an unmetered authentication
+		// attempt, and it is the path a non-address master SASL username takes
+		// when it falls through to here (sasl.go section 2), which must be
+		// accounted for exactly like any other failed attempt.
+		if s.server.authLimiter != nil {
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+		}
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAuthenticationFailed,
@@ -162,7 +187,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 
 			// Record successful authentication
 			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, addressParsed.BaseAddress(), true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, true)
 			}
 
 			// Register connection for tracking
@@ -196,15 +221,16 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		// Record failed master password authentication
 		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 		if s.server.authLimiter != nil {
-			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, addressParsed.BaseAddress(), false)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 		}
 
-		// Master username suffix was provided but master password was wrong - fail immediately
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeAuthenticationFailed,
-			Text: "Invalid master credentials",
-		}
+		// Master username suffix matched but the password was wrong. Answer exactly like
+		// any other bad credential: a distinct "Invalid master credentials" reply is
+		// reachable with only the master USERNAME (no secret), so it confirms the
+		// configured master username to anyone who can reach the port - the precondition
+		// for every other master-form attack. The reason is kept for the operator at WARN.
+		s.WarnLog("master username authentication failed (invalid master password)")
+		return authFailedError()
 	}
 
 	// Regular authentication - use the already parsed address
@@ -232,14 +258,10 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		// Record failed authentication
 		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 		if s.server.authLimiter != nil {
-			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, addressParsed.BaseAddress(), false)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 		}
 
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeAuthenticationFailed,
-			Text: "Invalid address or password",
-		}
+		return authFailedError()
 	}
 
 	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
@@ -281,7 +303,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 
 	// Record successful authentication
 	if s.server.authLimiter != nil {
-		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, addressParsed.BaseAddress(), true)
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, true)
 	}
 
 	// Register connection for tracking

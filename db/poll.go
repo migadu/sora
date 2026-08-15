@@ -28,27 +28,50 @@ type MailboxPoll struct {
 	ModSeq      uint64
 }
 
+// pollMailboxStateQuery is the single statement a poll that finds nothing changed
+// issues. It must stay a single-row read: Poll runs after every IMAP command and every
+// 15 seconds per IDLE session, so anything here that scales with the mailbox turns an
+// idle fleet into O(sessions x mailbox_size) continuous load.
+const pollMailboxStateQuery = `
+	SELECT
+		COALESCE(ms.highest_modseq, 0) AS highest_modseq,
+		ms.message_count,
+		mb.highest_uid
+	FROM mailboxes mb
+	LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
+	WHERE mb.id = $1
+`
+
+// pollMailboxActiveCountQuery counts the messages a client can see, for the polls that
+// have changes to report.
+const pollMailboxActiveCountQuery = `SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL`
+
 func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSeq uint64) (*MailboxPoll, error) {
 	// OPTIMIZATION: Early exit if modseq hasn't changed
 	// This avoids expensive window functions when mailbox is idle
 	var currentModSeq uint64
-	var messageCount int
+	var cachedMessageCount sql.NullInt32
 	var uidNext uint32
-	err := db.GetReadPool().QueryRow(ctx, `
-		SELECT
-			COALESCE(ms.highest_modseq, 0) AS highest_modseq,
-			(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL) AS message_count,
-			mb.highest_uid
-		FROM mailboxes mb
-		LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
-		WHERE mb.id = $1
-	`, mailboxID).Scan(&currentModSeq, &messageCount, &uidNext)
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, pollMailboxStateQuery, mailboxID).Scan(&currentModSeq, &cachedMessageCount, &uidNext)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Mailbox was deleted while session was active
 			return nil, ErrMailboxNotFound
 		}
 		return nil, fmt.Errorf("failed to get mailbox stats: %w", err)
+	}
+
+	// The count is measured live whenever this poll has changes to report. A poll that
+	// reports nothing takes the cached counter instead: mailbox_stats.message_count is
+	// written by the same trigger statement that advances highest_modseq, so while the
+	// modseq stands still that counter stands still too, and it is the very value SELECT
+	// seeded the session's message count from (GetMailboxSummary). A missing stats row is
+	// the state the cache is known to get wrong, so it falls back to counting.
+	messageCount := int(cachedMessageCount.Int32)
+	if currentModSeq > sinceModSeq || !cachedMessageCount.Valid {
+		if err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, pollMailboxActiveCountQuery, mailboxID).Scan(&messageCount); err != nil {
+			return nil, fmt.Errorf("failed to count active messages: %w", err)
+		}
 	}
 
 	// If modseq hasn't changed, return early with no updates
@@ -62,7 +85,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 
 	// Phase 1: Fetch Raw Changes
 	// Instead of a massive CTE pipeline, we directly pull exactly the messages that changed.
-	rows, err := db.GetReadPool().Query(ctx, `
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
 		SELECT uid, expunged_at, flags, custom_flags, created, updated, expunged FROM (
 			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq as created, ms.updated_modseq as updated, m.expunged_modseq as expunged
 			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
@@ -201,7 +224,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			}
 		}
 
-		br := db.GetReadPool().SendBatch(ctx, batch)
+		br := db.GetReadPoolWithContext(ctx).SendBatch(ctx, batch)
 		for i := range rawUpdates {
 			var seq uint32
 			if err := br.QueryRow().Scan(&seq); err != nil {
@@ -222,7 +245,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		seqMap := make(map[uint32]uint32, len(rawUpdates))
 
 		// OPTIMIZATION: Using expunged_at IS NULL matches the active partial covering index.
-		seqRows, err := db.GetReadPool().Query(ctx, `
+		seqRows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
 			SELECT uid, expunged_modseq
 			FROM messages
 			WHERE mailbox_id = $1 AND (expunged_at IS NULL OR (expunged_modseq > $2 AND created_modseq <= $2))

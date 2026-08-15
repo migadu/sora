@@ -5,6 +5,7 @@ package imap_slowloris_test
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -366,42 +367,39 @@ func TestSlowlorisIdleSuspension(t *testing.T) {
 	idleDuration := 3*time.Minute + 10*time.Second
 	t.Logf("Staying in IDLE for %.0f seconds...", idleDuration.Seconds())
 
-	// Set a deadline to detect if server closes connection
-	conn.SetReadDeadline(time.Now().Add(idleDuration + 5*time.Second))
-
-	// Create a channel to track if we get disconnected
-	disconnectChan := make(chan error, 1)
-	go func() {
-		// Try to read from connection - should NOT receive anything (except maybe EXISTS/RECENT)
-		buf := make([]byte, 1)
-		_, err := conn.Read(buf)
-		disconnectChan <- err
-	}()
-
-	// Wait for IDLE duration
-	select {
-	case err := <-disconnectChan:
-		if err != nil {
-			// Connection closed - this is BAD (fix didn't work)
+	// Read until the deadline expires. The server sends periodic untagged
+	// "* OK Still here" keepalives during IDLE, so reaching the deadline is the
+	// success condition and any other read error means it closed the connection.
+	conn.SetReadDeadline(time.Now().Add(idleDuration))
+	for {
+		if _, err := reader.ReadString('\n'); err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				break
+			}
 			t.Fatalf("❌ FAILED: Disconnected during IDLE at T+%.1fs\n"+
 				"   Throughput checking was NOT suspended!\n"+
 				"   Error: %v\n"+
 				"   This means the fix is not working correctly.",
 				time.Since(sessionStart).Seconds(), err)
 		}
-	case <-time.After(idleDuration):
-		// Successfully stayed in IDLE for full duration
-		t.Logf("✅ SUCCESS: Stayed in IDLE for %.0f seconds at T+%.1fs",
-			idleDuration.Seconds(), time.Since(sessionStart).Seconds())
-		t.Logf("   Throughput checking was properly suspended!")
 	}
+	t.Logf("✅ SUCCESS: Stayed in IDLE for %.0f seconds at T+%.1fs",
+		idleDuration.Seconds(), time.Since(sessionStart).Seconds())
+	t.Logf("   Throughput checking was properly suspended!")
 
 	// Exit IDLE
 	fmt.Fprintf(conn, "DONE\r\n")
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	resp, err = reader.ReadString('\n')
-	if err != nil {
-		t.Fatalf("Failed to exit IDLE: %v", err)
+	// Drain any keepalives still queued ahead of the tagged completion.
+	for {
+		resp, err = reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Failed to exit IDLE: %v", err)
+		}
+		if strings.HasPrefix(resp, tag+" ") {
+			break
+		}
 	}
 	if !strings.Contains(resp, "OK") || !strings.Contains(resp, "IDLE") {
 		t.Fatalf("IDLE exit failed: %s", resp)

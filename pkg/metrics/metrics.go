@@ -107,14 +107,14 @@ var (
 	MailboxesTotal = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "sora_mailboxes_total",
-			Help: "Total number of mailboxes",
+			Help: "Approximate total number of mailboxes (planner row estimate, includes mailboxes pending purge)",
 		},
 	)
 
 	AccountsTotal = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "sora_accounts_total",
-			Help: "Total number of accounts",
+			Help: "Approximate total number of accounts (planner row estimate, includes accounts pending purge)",
 		},
 	)
 
@@ -286,6 +286,28 @@ var (
 		prometheus.GaugeOpts{
 			Name: "sora_imap_idle_connections_current",
 			Help: "Current number of IMAP connections in IDLE state",
+		},
+	)
+
+	IMAPNotifySessions = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_imap_notify_sessions_current",
+			Help: "Current number of IMAP sessions with an active NOTIFY (RFC 5465) watch",
+		},
+	)
+
+	IMAPNotifyEventsSent = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_imap_notify_events_sent_total",
+			Help: "Total NOTIFY notifications delivered, by response type",
+		},
+		[]string{"type"}, // status, list, fetch
+	)
+
+	IMAPNotifyOverflows = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_imap_notify_overflow_total",
+			Help: "Total NOTIFY watches dropped with NOTIFICATIONOVERFLOW",
 		},
 	)
 

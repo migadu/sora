@@ -132,8 +132,10 @@ func TestIMAP_MaildirImport_UIDStability(t *testing.T) {
 }
 
 func runSoraAdminImportMaildir(ctx context.Context, email, maildirPath string) error {
-	cmd := exec.CommandContext(ctx, "../../integration_tests/sora-admin",
-		"--config", "../../config-test.toml",
+	soraAdminBin := common.GetSoraAdminBinary(nil)
+	configPath := common.GetTestConfigPath(nil)
+	cmd := exec.CommandContext(ctx, soraAdminBin,
+		"--config", configPath,
 		"import", "maildir",
 		"--email", email,
 		"--maildir-path", maildirPath,

@@ -715,15 +715,38 @@ func (s *Session) authenticateUser(username, password string) error {
 		return consts.ErrAuthenticationFailed
 	}
 
+	// Rate-limit key for this attempt. Canonicalised from the submitted username so
+	// that the CanAttemptAuth* check and every RecordAuthAttempt* call below use the
+	// SAME key. Checking the raw string while recording a mix of raw username,
+	// base address and resolved email let an attacker vary the case or the +detail
+	// to sidestep Tier 1 entirely, and landed the recorded block on the canonical
+	// address of the victim.
+	//
+	// WithMaster, because this proxy also accepts the "user@domain.com@MASTERUSER"
+	// master form and validates the master password itself (see below). That form
+	// canonicalises to the TARGET's address, so keying on it charged an arbitrary
+	// account for an attempt that merely named it - a lockout primitive needing only
+	// the master USERNAME - and handed every master-password guess a fresh Tier-1
+	// bucket by varying the target, leaving the proxy's tenant-wide password unmetered.
+	// Decided here, from the raw identity, so check site and record sites cannot drift.
+	authKey := server.AuthRateLimitKeyWithMaster(username, s.server.masterUsername)
+
 	// Use configured remotelookup timeout instead of hardcoded value
 	// This allows slow networks enough time for initial TLS handshake while reusing connections
 	authTimeout := s.server.connManager.GetRemoteLookupTimeout()
 	ctx, cancel := context.WithTimeout(s.ctx, authTimeout)
 	defer cancel()
 
-	// Apply progressive authentication delay BEFORE any other checks
+	// Apply progressive authentication delay BEFORE any other checks.
+	// Keyed on the REAL client IP, resolved exactly like the recording path
+	// (RecordAuthAttemptWithProxy -> GetConnectionIPs). clientConn.RemoteAddr() is
+	// the upstream load balancer whenever this proxy sits behind haproxy/nginx/NLB,
+	// and the load balancer never accumulates failures — so keying the delay on it
+	// meant the delay never fired in exactly the deployment proxies exist for.
 	remoteAddr := s.clientConn.RemoteAddr()
-	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "IMAP-PROXY"); err != nil {
+	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
+	delayAddr := &server.StringAddr{Addr: realClientIP}
+	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, delayAddr, "IMAP-PROXY"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			s.InfoLog("delay queue full, rejecting connection", "username", username)
@@ -736,13 +759,10 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Check cache first (before rate limiter to avoid delays for cached successful auth)
 	// Use server name as cache key to avoid collisions between different proxies/servers
 	if cached, found := s.server.lookupCache.Get(s.server.name, username); found {
-		// Hash the password (never empty - validated at function start)
-		passwordHash := lookupcache.HashPassword(password)
-
-		// Check password hash match
-		// Note: cached.PasswordHash should also never be empty, but we check defensively
-		// in case of cache corruption or edge cases
-		passwordMatches := (cached.PasswordHash != "" && cached.PasswordHash == passwordHash)
+		// Does this login use the same password the entry was cached with?
+		// Constant-time, and false for an entry that carries no digest (cache
+		// corruption, or a negative entry written by a path that has no password).
+		passwordMatches := cached.PasswordDigest.Matches(password)
 
 		if cached.IsNegative {
 			// Negative cache entry - authentication previously failed
@@ -753,7 +773,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// by rate limiting, not by extending cache TTL.
 				s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
 				metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return consts.ErrAuthenticationFailed
 			} else {
@@ -795,7 +815,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				}
 
 				// Use actual username (resolved email) for rate limiting and metrics
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, s.username, true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
 
 				// Track domain and user activity using resolved email
@@ -834,7 +854,7 @@ func (s *Session) authenticateUser(username, password string) error {
 					// Entry is fresh - likely wrong password attempt
 					s.DebugLog("cache hit - wrong password on fresh positive entry", "username", username)
 					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive_wrong_pw").Inc()
-					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 					metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 					return consts.ErrAuthenticationFailed
 				}
@@ -846,7 +866,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	}
 
 	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods
-	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, username); err != nil {
+	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey); err != nil {
 		// Check if this is a rate limit error
 		var rateLimitErr *server.RateLimitError
 		if errors.As(err, &rateLimitErr) {
@@ -889,7 +909,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			// Suffix matches master username - validate master password locally
 			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
 				// Wrong master password - fail immediately
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, parsedAddr.BaseAddress(), false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return consts.ErrAuthenticationFailed
 			}
@@ -936,7 +956,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			if errors.Is(err, proxy.ErrRemoteLookupInvalidResponse) {
 				// Invalid response from remotelookup (malformed 2xx) - this is a server bug, fail hard
 				s.ErrorLog("remotelookup returned invalid response - server bug", "error", err)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return fmt.Errorf("remotelookup server error: invalid response")
 			}
@@ -953,7 +973,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// These are service availability issues, not "user not found" cases
 				s.WarnLog("remotelookup transient error - service unavailable", "error", err)
 				metrics.RemoteLookupResult.WithLabelValues("imap", "transient_error_rejected").Inc()
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 				return fmt.Errorf("remotelookup service unavailable")
 			} else {
@@ -982,7 +1002,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				s.username = resolvedEmail // Use for backend impersonation
 
 				// Use resolvedEmail for rate limiting and metrics (the actual user)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, resolvedEmail, true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
 
 				// For metrics, use resolvedEmail for accurate tracking
@@ -995,13 +1015,9 @@ func (s *Session) authenticateUser(username, password string) error {
 				// CRITICAL: Cache key is submitted username (e.g., "user@TOKEN")
 				// BUT store ActualEmail so cache hits can use the resolved address
 				// This allows token-based auth to work correctly on cache hits
-				passwordHash := ""
-				if password != "" {
-					passwordHash = lookupcache.HashPassword(password)
-				}
 				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 					AccountID:              routingInfo.AccountID,
-					PasswordHash:           passwordHash,
+					PasswordDigest:         lookupcache.NewPasswordDigest(password),
 					ActualEmail:            resolvedEmail, // Store resolved email for cache hits
 					ServerAddress:          routingInfo.ServerAddress,
 					RemoteTLS:              routingInfo.RemoteTLS,
@@ -1030,20 +1046,16 @@ func (s *Session) authenticateUser(username, password string) error {
 				if masterAuthValidated {
 					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "user", username)
 				}
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 
 				// Cache negative result (failed authentication) WITH password hash
 				// This allows us to detect repeated wrong passwords vs different wrong passwords
-				// Always hash password, even for master auth, to prevent cache bypass
-				passwordHash := ""
-				if password != "" {
-					passwordHash = lookupcache.HashPassword(password)
-				}
+				// Always digest the password, even for master auth, to prevent cache bypass
 				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-					PasswordHash: passwordHash,
-					Result:       lookupcache.AuthFailed,
-					IsNegative:   true,
+					PasswordDigest: lookupcache.NewPasswordDigest(password),
+					Result:         lookupcache.AuthFailed,
+					IsNegative:     true,
 				})
 
 				// Single consolidated log for authentication failure
@@ -1066,7 +1078,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				} else {
 					s.InfoLog("user not found in remotelookup, local lookup disabled - rejecting")
 					metrics.RemoteLookupResult.WithLabelValues("imap", "user_not_found_rejected").Inc()
-					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 					metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 					return consts.ErrAuthenticationFailed
 				}
@@ -1105,7 +1117,7 @@ func (s *Session) authenticateUser(username, password string) error {
 			}
 
 			s.InfoLog("master auth failed - account not found", "user", address.BaseAddress(), "error", err)
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, address.BaseAddress(), false)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 			return fmt.Errorf("account not found: %w", err)
 		}
@@ -1123,7 +1135,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				return server.ErrServerShuttingDown
 			}
 
-			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, false)
+			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 
 			// Only cache definitive authentication failures, NOT transient errors
@@ -1144,15 +1156,11 @@ func (s *Session) authenticateUser(username, password string) error {
 			if isDefinitiveFailure {
 				s.DebugLog("caching definitive auth failure", "username", username)
 				// Cache WITH password hash to detect repeated wrong passwords
-				// Always hash password, even for master auth, to prevent cache bypass
-				passwordHash := ""
-				if password != "" {
-					passwordHash = lookupcache.HashPassword(password)
-				}
+				// Always digest the password, even for master auth, to prevent cache bypass
 				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-					PasswordHash: passwordHash,
-					Result:       lookupcache.AuthFailed,
-					IsNegative:   true,
+					PasswordDigest: lookupcache.NewPasswordDigest(password),
+					Result:         lookupcache.AuthFailed,
+					IsNegative:     true,
 				})
 
 				// Single consolidated log for authentication failure
@@ -1169,10 +1177,18 @@ func (s *Session) authenticateUser(username, password string) error {
 
 	s.accountID = accountID
 	s.isRemoteLookupAccount = false
+	// A session that reaches DetermineRoute with no routing info has the routing lookup
+	// run for it, which for a user the lookup 404'd moments ago is a second round trip to
+	// the same answer. A lookup-cache hit for this user rebuilds exactly this from the
+	// entry written below, so give the uncached login the same starting point.
+	s.routingInfo = &proxy.UserRoutingInfo{
+		AccountID:          accountID,
+		RemoteUseIDCommand: s.server.remoteUseIDCommand,
+	}
 	// Set username to base address (without master username suffix or +detail)
 	// This is what gets sent to the backend for impersonation
 	s.username = address.BaseAddress()
-	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, username, true)
+	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
 
 	// Track successful authentication.
 	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
@@ -1190,15 +1206,11 @@ func (s *Session) authenticateUser(username, password string) error {
 
 	// Cache successful DB authentication
 	// ServerAddress will be determined later by DetermineRoute in connectToBackend
-	// Always hash password, even for master auth, to prevent cache bypass
-	passwordHash := ""
-	if password != "" {
-		passwordHash = lookupcache.HashPassword(password)
-	}
+	// Always digest the password, even for master auth, to prevent cache bypass
 	s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-		AccountID:     accountID,
-		PasswordHash:  passwordHash,
-		ServerAddress: "", // Will be populated by affinity/routing in next connection
+		AccountID:      accountID,
+		PasswordDigest: lookupcache.NewPasswordDigest(password),
+		ServerAddress:  "", // Will be populated by affinity/routing in next connection
 		// Preserve the server-level ID-forwarding setting: cache hits rebuild
 		// routingInfo from this entry and postAuthenticationSetup reads
 		// RemoteUseIDCommand from routingInfo. Without this, ID forwarding
@@ -1239,9 +1251,10 @@ func (s *Session) connectToBackend() error {
 	// Track which routing method was used for this connection.
 	metrics.ProxyRoutingMethod.WithLabelValues("imap", routeResult.RoutingMethod).Inc()
 
-	// Use configured backend connection timeout instead of hardcoded value
-	connectTimeout := s.server.connManager.GetConnectTimeout()
-	connectCtx, connectCancel := context.WithTimeout(s.ctx, connectTimeout)
+	// Budget for the whole connect-with-fallback, not for a single dial: connect_timeout
+	// alone would be spent by a black-holed preferred backend, leaving every round-robin
+	// fallback dial to fail instantly on an already-expired context.
+	connectCtx, connectCancel := context.WithTimeout(s.ctx, s.server.connManager.ConnectBudget())
 	defer connectCancel()
 
 	// Ensure routing info has client connection for JA4 fingerprint extraction

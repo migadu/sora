@@ -4,9 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,6 +60,21 @@ type ConnectionManager struct {
 	backendHealth            map[string]*BackendHealth // Pool backends (from remote_addrs config)
 	remoteLookupHealth       map[string]*BackendHealth // Dynamic backends from remote_lookup (not in pool)
 	enableBackendHealthCheck bool                      // If true, backend health checks are enabled (default: true)
+	// resolvedHosts is, per configured address, the pool entries its last successful
+	// resolution produced, so a failed re-resolution can keep them. Guarded by healthMu.
+	resolvedHosts map[string][]string
+
+	// resolvedAt is when the pool was last resolved (UnixNano, 0 = never), and resolving
+	// is held for the duration of a re-resolution so that concurrent logins cost one DNS
+	// lookup between them rather than one each.
+	resolvedAt atomic.Int64
+	resolving  atomic.Bool
+
+	// resolveRefresh is how long a resolved pool is used before a routing decision
+	// re-resolves it; <= 0 pins the pool to the startup resolution. Set via
+	// SetResolveRefreshInterval, which callers run once at startup (before serving),
+	// after which it is read-only and needs no lock.
+	resolveRefresh time.Duration
 
 	// User routing lookup
 	routingLookup UserRoutingLookup
@@ -172,6 +187,7 @@ func NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(remoteAddrs []stri
 		remoteLookupHealth:       make(map[string]*BackendHealth), // Dynamic remote lookup backends
 		routingLookup:            routingLookup,
 		enableBackendHealthCheck: !disableHealthCheck,
+		resolveRefresh:           DefaultResolveRefreshInterval,
 	}
 
 	logger.Debug("Connection manager: Initialized consistent hash ring", "prefix", cm.logPrefix(), "backends", len(normalizedAddrs))
@@ -231,7 +247,16 @@ func (cm *ConnectionManager) HasBackend(backend string) bool {
 // Automatically excludes unhealthy backends and tries the next one in the ring
 // Returns empty string if all backends are unhealthy
 func (cm *ConnectionManager) GetBackendByConsistentHash(username string) string {
-	if cm.consistentHash == nil {
+	cm.refreshResolvedAddrsIfStale()
+
+	// Snapshot the ring and the pool size: a re-resolution replaces both, and the
+	// health checks below take the write lock, so this cannot hold the read lock.
+	cm.healthMu.RLock()
+	ring := cm.consistentHash
+	poolSize := len(cm.remoteAddrs)
+	cm.healthMu.RUnlock()
+
+	if ring == nil {
 		return ""
 	}
 
@@ -239,8 +264,8 @@ func (cm *ConnectionManager) GetBackendByConsistentHash(username string) string 
 	exclude := make(map[string]bool)
 
 	// Try up to len(remoteAddrs) times (all backends)
-	for i := 0; i < len(cm.remoteAddrs); i++ {
-		backend := cm.consistentHash.GetBackendWithExclusions(username, exclude)
+	for i := 0; i < poolSize; i++ {
+		backend := ring.GetBackendWithExclusions(username, exclude)
 		if backend == "" {
 			// No more backends available
 			logger.Debug("ConnectionManager: Consistent hash returned no backend", "username", username, "iteration", i)
@@ -260,7 +285,7 @@ func (cm *ConnectionManager) GetBackendByConsistentHash(username string) string 
 	}
 
 	// All backends unhealthy - log diagnostics
-	logger.Warn("ConnectionManager: All consistent hash backends unhealthy", "username", username, "pool_size", len(cm.remoteAddrs))
+	logger.Warn("ConnectionManager: All consistent hash backends unhealthy", "username", username, "pool_size", poolSize)
 	cm.healthMu.RLock()
 	for addr, health := range cm.backendHealth {
 		logger.Debug("ConnectionManager: Backend health status", "backend", addr, "healthy", health.IsHealthy, "consecutive_fails", health.ConsecutiveFails, "last_failure", health.LastFailure)
@@ -268,6 +293,38 @@ func (cm *ConnectionManager) GetBackendByConsistentHash(username string) string 
 	cm.healthMu.RUnlock()
 
 	return ""
+}
+
+// backendRecoveryInterval is how long a backend stays quarantined after being marked
+// unhealthy before health checks let traffic try it again.
+const backendRecoveryInterval = 1 * time.Minute
+
+// healthWithAutoRecovery reads the health entry for a backend and applies the
+// auto-recovery transition, all inside one critical section on the write lock: the
+// BackendHealth fields are mutated by the Record* methods under that same lock, and
+// ResolveAddresses replaces the maps wholesale, so the entry that gets recovered has to be
+// the one currently in the map.
+func (cm *ConnectionManager) healthWithAutoRecovery(backend string, remoteLookup, missingIsHealthy bool) (healthy, recovered bool) {
+	cm.healthMu.Lock()
+	defer cm.healthMu.Unlock()
+
+	entries := cm.backendHealth
+	if remoteLookup {
+		entries = cm.remoteLookupHealth
+	}
+
+	health, exists := entries[backend]
+	if !exists {
+		return missingIsHealthy, false
+	}
+
+	if !health.IsHealthy && time.Since(health.LastFailure) > backendRecoveryInterval {
+		health.IsHealthy = true
+		health.ConsecutiveFails = 0
+		recovered = true
+	}
+
+	return health.IsHealthy, recovered
 }
 
 // IsBackendHealthy checks if a backend is healthy based on detailed health tracking
@@ -279,26 +336,12 @@ func (cm *ConnectionManager) IsBackendHealthy(backend string) bool {
 		return true
 	}
 
-	cm.healthMu.RLock()
-	health, exists := cm.backendHealth[backend]
-	cm.healthMu.RUnlock()
-
-	if !exists {
-		// Backend not in our list, assume unhealthy
-		return false
-	}
-
-	// Check if backend should auto-recover (1 minute since last failure)
-	if !health.IsHealthy && time.Since(health.LastFailure) > 1*time.Minute {
-		cm.healthMu.Lock()
-		health.IsHealthy = true
-		health.ConsecutiveFails = 0 // Reset consecutive failures
-		cm.healthMu.Unlock()
+	healthy, recovered := cm.healthWithAutoRecovery(backend, false /* remoteLookup */, false /* not in our list, assume unhealthy */)
+	if recovered {
 		logger.Info("ConnectionManager: Auto-recovered backend after 1 minute", "backend", backend)
-		return true
 	}
 
-	return health.IsHealthy
+	return healthy
 }
 
 // IsBackendHealthyForAffinity checks if a backend is healthy WITHOUT auto-recovery.
@@ -336,26 +379,12 @@ func (cm *ConnectionManager) IsRemoteLookupBackendHealthy(backend string) bool {
 		return true
 	}
 
-	cm.healthMu.RLock()
-	health, exists := cm.remoteLookupHealth[backend]
-	cm.healthMu.RUnlock()
-
-	if !exists {
-		// Unknown remote lookup backend, assume healthy (allow first attempt)
-		return true
-	}
-
-	// Check if backend should auto-recover (1 minute since last failure)
-	if !health.IsHealthy && time.Since(health.LastFailure) > 1*time.Minute {
-		cm.healthMu.Lock()
-		health.IsHealthy = true
-		health.ConsecutiveFails = 0 // Reset consecutive failures
-		cm.healthMu.Unlock()
+	healthy, recovered := cm.healthWithAutoRecovery(backend, true /* remoteLookup */, true /* unknown backend, assume healthy to allow a first attempt */)
+	if recovered {
 		logger.Info("ConnectionManager: Remote lookup backend auto-recovered after 1 minute", "backend", backend)
-		return true
 	}
 
-	return health.IsHealthy
+	return healthy
 }
 
 // BackendHealthInfo represents the health status of a single backend for external reporting
@@ -388,7 +417,7 @@ func (cm *ConnectionManager) HasHealthyPoolBackends() bool {
 			return true
 		}
 		// Also check auto-recovery (1 minute since last failure)
-		if time.Since(health.LastFailure) > 1*time.Minute {
+		if time.Since(health.LastFailure) > backendRecoveryInterval {
 			return true
 		}
 	}
@@ -704,6 +733,8 @@ func (cm *ConnectionManager) IsRemoteStartTLS() bool {
 
 // ConnectWithProxy attempts to connect to a remote server and sends PROXY protocol header
 func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (net.Conn, string, error) {
+	cm.refreshResolvedAddrsIfStale()
+
 	if preferredAddr != "" {
 		conn, addr, err, fallback := cm.tryPreferredAddress(ctx, preferredAddr, clientIP, clientPort, serverIP, serverPort, routingInfo)
 		if !fallback {
@@ -737,13 +768,13 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 			return conn, addr, nil
 		}
 
-		// Record failure in health tracking only if the context is not done AND
-		// the error is not context-related.
-		// If ctx.Err() != nil OR the error contains context errors, the failure is due to
-		// timeout/cancellation, not backend health.
-		// Examples: slow remote_lookup consuming deadline, client disconnect, global timeout.
-		// This prevents healthy backends from being marked unhealthy due to external factors.
-		if ctx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		// Record failure in health tracking only if the caller's context is still live.
+		// ctx.Err() is the only usable discriminator: a dial that exhausted its own
+		// connect_timeout — the black-holed backend case — also reports as
+		// context.DeadlineExceeded, so the error identity cannot tell a dead backend
+		// apart from a caller-side timeout or cancellation (slow remote_lookup consuming
+		// the deadline, client disconnect, global timeout).
+		if ctx.Err() == nil {
 			cm.RecordConnectionFailure(addr)
 		}
 		logger.Warn("Failed to connect to backend (round-robin)", "addr", addr, "error", err, "ctx_err", ctx.Err(), "server", cm.serverName)
@@ -809,20 +840,16 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 
 	// Connection failed. Mark it as unhealthy if it's in our managed list.
 	if isInList {
-		// Only record failure if context is not canceled/expired AND error is not context-related.
-		// If ctx.Err() != nil OR the error contains context errors, the failure is due to
-		// timeout/cancellation, not backend health.
-		// Examples: slow remote_lookup consuming deadline, client disconnect, global timeout.
-		// This prevents healthy backends from being marked unhealthy due to external factors.
-		if ctx.Err() == nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		// Only record failure if the caller's context is still live. Same discriminator as
+		// the round-robin path: a dial that exhausted its own connect_timeout reports as
+		// context.DeadlineExceeded even though ctx never expired, so only ctx.Err() tells a
+		// dead backend apart from a caller-side timeout or cancellation.
+		if ctx.Err() == nil {
 			cm.RecordConnectionFailure(preferredAddr)
 		}
 		logger.Warn("Failed to connect to preferred backend", "addr", preferredAddr, "error", err, "is_remotelookup", isRemoteLookupRoute, "ctx_err", ctx.Err(), "server", cm.serverName)
 	} else if isRemoteLookupRoute {
-		// Track remote lookup backend failure (not in pool)
-		// Only record failure if context is not canceled/expired
-		// NOTE: We check ctx.Err() only, NOT errors.Is(err, context.DeadlineExceeded) because
-		// dialer timeouts wrap as DeadlineExceeded even when ctx is not expired
+		// Track remote lookup backend failure (not in pool), same discriminator as above.
 		if ctx.Err() == nil {
 			cm.RecordRemoteLookupFailure(preferredAddr)
 		}
@@ -841,60 +868,123 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 	return nil, "", err, true // Fallback
 }
 
-// ResolveAddresses resolves hostnames to IP addresses, expanding the address list
+// ResolveAddresses resolves the configured backend names to IP addresses and installs
+// the result as the pool. Callers run this once at startup; the pool is re-resolved from
+// then on by refreshResolvedAddrsIfStale.
 func (cm *ConnectionManager) ResolveAddresses() error {
-	logger.Info("ConnectionManager: Starting address resolution", "server", cm.serverName, "current_backends", len(cm.remoteAddrs))
+	logger.Info("ConnectionManager: Starting address resolution", "server", cm.serverName, "configured_backends", len(cm.configuredAddrs))
+	cm.resolveAddresses()
+	return nil
+}
 
-	var resolvedAddrs []string
-	newBackendHealth := make(map[string]*BackendHealth)
+// DefaultResolveRefreshInterval is how long a resolved pool is used before the next
+// routing decision re-resolves it, unless SetResolveRefreshInterval overrides it.
+// net.LookupIP does not report the TTL of the records it answered from, so this stands
+// in for it.
+const DefaultResolveRefreshInterval = 5 * time.Minute
 
-	for _, addr := range cm.remoteAddrs {
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			// If no port specified, assume it's just a host
-			host = addr
-			port = ""
+// SetResolveRefreshInterval overrides how long a resolved backend pool is used before a
+// routing decision re-resolves it. An interval of 0 (or less) pins the pool to the
+// addresses resolved at startup, which is the behavior to fall back to if periodic
+// re-resolution ever misbehaves in a deployment. Must be called before the manager
+// starts routing.
+func (cm *ConnectionManager) SetResolveRefreshInterval(d time.Duration) {
+	cm.resolveRefresh = d
+}
+
+// refreshResolvedAddrsIfStale re-resolves the pool in the background once the current
+// answer has aged past the resolve refresh interval, so a backend that changes address
+// is picked up without a restart. The caller routes on the addresses already in hand: a
+// DNS lookup must not sit in the path of a login. A manager whose pool was never resolved
+// (nothing called ResolveAddresses) is left alone — its pool is the configured one, which
+// the per-dial resolveAddress still resolves.
+//
+// A pool entry that disappears takes the affinity pointing at it with it: DetermineRoute
+// drops an affinity whose backend is no longer in the pool and routes the user afresh.
+// Established sessions are untouched; they hold a connection, not an address.
+func (cm *ConnectionManager) refreshResolvedAddrsIfStale() {
+	if cm.resolveRefresh <= 0 {
+		return
+	}
+	last := cm.resolvedAt.Load()
+	if last == 0 || time.Since(time.Unix(0, last)) < cm.resolveRefresh {
+		return
+	}
+	if !cm.resolving.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer cm.resolving.Store(false)
+		cm.resolveAddresses()
+	}()
+}
+
+// resolveAddresses resolves configuredAddrs — never the pool a previous resolution
+// produced, which holds IP literals a lookup hands back unchanged — and installs the
+// result.
+func (cm *ConnectionManager) resolveAddresses() {
+	cm.healthMu.RLock()
+	previous := cm.resolvedHosts
+	cm.healthMu.RUnlock()
+
+	resolvedAddrs := make([]string, 0, len(cm.configuredAddrs))
+	resolvedHosts := make(map[string][]string, len(cm.configuredAddrs))
+	seen := make(map[string]bool, len(cm.configuredAddrs))
+
+	for _, addr := range cm.configuredAddrs {
+		entries := resolvePoolEntries(addr, previous[addr])
+		if entries == nil {
+			// The name did not resolve. Keep the answer that last worked rather than
+			// dropping the backend out of the pool over a transient SERVFAIL.
+			entries = previous[addr]
+			if entries == nil {
+				entries = []string{addr}
+			}
+			logger.Warn("ConnectionManager: Backend name did not resolve - keeping last known addresses", "server", cm.serverName, "backend", addr, "addresses", entries)
 		}
 
-		// Try to resolve the host
-		ips, err := net.LookupIP(host)
-		if err != nil {
-			// If resolution fails, keep the original address
-			resolvedAddrs = append(resolvedAddrs, addr)
-			cm.healthMu.RLock()
-			if health, ok := cm.backendHealth[addr]; ok {
-				newBackendHealth[addr] = health
+		resolvedHosts[addr] = entries
+		for _, entry := range entries {
+			if seen[entry] {
+				continue
 			}
-			cm.healthMu.RUnlock()
-			continue
-		}
-
-		// Add all resolved IPs
-		for _, ip := range ips {
-			var resolvedAddr string
-			if port != "" {
-				resolvedAddr = net.JoinHostPort(ip.String(), port)
-			} else {
-				resolvedAddr = ip.String()
-			}
-			resolvedAddrs = append(resolvedAddrs, resolvedAddr)
-
-			// Preserve health status if we had it
-			cm.healthMu.RLock()
-			if health, ok := cm.backendHealth[resolvedAddr]; ok {
-				newBackendHealth[resolvedAddr] = health
-			} else {
-				newBackendHealth[resolvedAddr] = &BackendHealth{
-					IsHealthy:   true,
-					LastSuccess: time.Now(),
-				}
-			}
-			cm.healthMu.RUnlock()
+			seen[entry] = true
+			resolvedAddrs = append(resolvedAddrs, entry)
 		}
 	}
 
+	cm.installResolvedAddrs(resolvedAddrs, resolvedHosts)
+}
+
+// installResolvedAddrs makes a resolution result the pool, rebuilding the health map and
+// the hash ring around it. Health is carried over per address, so a backend that survives
+// a re-resolution keeps the failures recorded against it.
+func (cm *ConnectionManager) installResolvedAddrs(resolvedAddrs []string, resolvedHosts map[string][]string) {
 	cm.healthMu.Lock()
-	oldBackendCount := len(cm.backendHealth)
+	defer cm.healthMu.Unlock()
+	defer cm.resolvedAt.Store(time.Now().UnixNano())
+
+	cm.resolvedHosts = resolvedHosts
+
+	if slices.Equal(cm.remoteAddrs, resolvedAddrs) {
+		logger.Debug("ConnectionManager: Address resolution unchanged", "server", cm.serverName, "backends", len(resolvedAddrs))
+		return
+	}
+
+	newBackendHealth := make(map[string]*BackendHealth, len(resolvedAddrs))
+	for _, addr := range resolvedAddrs {
+		if health, ok := cm.backendHealth[addr]; ok {
+			newBackendHealth[addr] = health
+			continue
+		}
+		newBackendHealth[addr] = &BackendHealth{
+			IsHealthy:   true,
+			LastSuccess: time.Now(),
+		}
+	}
+
+	logger.Info("ConnectionManager: Backend pool resolved", "server", cm.serverName, "previous", cm.remoteAddrs, "resolved", resolvedAddrs)
+
 	cm.remoteAddrs = resolvedAddrs
 	cm.backendHealth = newBackendHealth
 
@@ -902,22 +992,117 @@ func (cm *ConnectionManager) ResolveAddresses() error {
 	// This is critical: if we don't update the ring, it will contain old hostnames
 	// while backendHealth contains IP addresses, causing IsBackendHealthy() to fail
 	if cm.consistentHash != nil {
-		cm.consistentHash = NewConsistentHash(150)
+		ring := NewConsistentHash(150)
 		for _, addr := range resolvedAddrs {
-			cm.consistentHash.AddBackend(addr)
+			ring.AddBackend(addr)
 		}
-		logger.Info("ConnectionManager: Rebuilt consistent hash ring after address resolution", "server", cm.serverName, "backends", len(resolvedAddrs), "previous_health_entries", oldBackendCount)
+		cm.consistentHash = ring
+	}
+}
+
+// resolvePoolEntries resolves one configured backend address into the pool entries it
+// contributes, or nil if the name does not resolve.
+//
+// Every address of one family is kept: several A records under one name are that many
+// distinct machines, and each has to be its own pool member. Only one family is kept,
+// though — the A and AAAA records of one name are two routes to the SAME machine, and
+// admitting both would give it two health entries and twice its share of the hash ring.
+//
+// Which family, on a first resolution, is the one net.LookupIP ranks first: RFC 6724
+// ordering against this host's own source addresses, i.e. the address a dial of the name
+// would pick, so the pool entry is reachable from here. That ordering depends on host
+// state, so it is decided ONCE per name and then pinned: previous holds the entries the
+// last resolution produced, and as long as the name still answers with that family, the
+// family is kept. Without the pin a change in this host's connectivity would flip every
+// dual-stack name to the other family at once, replacing the whole pool and rehashing
+// every user off their backend.
+//
+// The pin is per host, so two proxies with different connectivity can still settle on
+// different families for the same dual-stack name and build different hash rings. That
+// is logged below; prefer single-family names for backends behind a clustered proxy.
+// pinnedFamilyIsIPv4 reports the family a previous resolution settled on for a name.
+// Entries are host:port or bare IPs; anything unparseable means there is nothing to pin.
+func pinnedFamilyIsIPv4(previous []string) (isIPv4 bool, ok bool) {
+	for _, entry := range previous {
+		host := entry
+		if h, _, err := net.SplitHostPort(entry); err == nil {
+			host = h
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			return ip.To4() != nil, true
+		}
+	}
+	return false, false
+}
+
+func anyOfFamily(ips []net.IP, isIPv4 bool) bool {
+	for _, ip := range ips {
+		if (ip.To4() != nil) == isIPv4 {
+			return true
+		}
+	}
+	return false
+}
+
+func hasBothFamilies(ips []net.IP) bool {
+	return anyOfFamily(ips, true) && anyOfFamily(ips, false)
+}
+
+func familyName(isIPv4 bool) string {
+	if isIPv4 {
+		return "ipv4"
+	}
+	return "ipv6"
+}
+
+func resolvePoolEntries(addr string, previous []string) []string {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
 	}
 
-	// Log the new health map for debugging
-	logger.Info("ConnectionManager: Address resolution complete", "server", cm.serverName, "resolved_backends", len(resolvedAddrs))
-	for addr, health := range newBackendHealth {
-		logger.Debug("ConnectionManager: Backend after resolution", "server", cm.serverName, "backend", addr, "healthy", health.IsHealthy)
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return nil
+	}
+	return resolvePoolEntriesFrom(addr, previous, ips)
+}
+
+// resolvePoolEntriesFrom is the pure half of resolvePoolEntries: the family choice and
+// the entry list, given an already-resolved address set.
+func resolvePoolEntriesFrom(addr string, previous []string, ips []net.IP) []string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		// If no port specified, assume it's just a host
+		port = ""
 	}
 
-	cm.healthMu.Unlock()
+	preferIPv4 := ips[0].To4() != nil
+	if pinned, ok := pinnedFamilyIsIPv4(previous); ok && anyOfFamily(ips, pinned) {
+		preferIPv4 = pinned
+	} else if hasBothFamilies(ips) {
+		logger.Warn("ConnectionManager: Backend name is dual-stack - keeping one address family",
+			"backend", addr, "family", familyName(preferIPv4),
+			"detail", "the family is chosen per proxy host, so proxies with different connectivity can route this backend differently")
+	}
 
-	return nil
+	var entries []string
+	for _, ip := range ips {
+		if (ip.To4() != nil) != preferIPv4 {
+			continue
+		}
+		if port == "" {
+			entries = append(entries, ip.String())
+			continue
+		}
+		entries = append(entries, net.JoinHostPort(ip.String(), port))
+	}
+
+	// A server that rotates a name's records answers in a different order every time;
+	// sorting keeps a re-resolution that found nothing new from reading as a pool change.
+	slices.Sort(entries)
+
+	return entries
 }
 
 func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, error) {
@@ -1214,15 +1399,7 @@ func (cm *ConnectionManager) writeProxyV2HeaderWithTLVs(conn net.Conn, clientIP 
 // ConnectToSpecificWithContext attempts to connect to a specific server address with proper context propagation
 func (cm *ConnectionManager) ConnectToSpecificWithContext(ctx context.Context, addr string) (net.Conn, error) {
 	// Check if the address is in our list
-	found := false
-	for _, remoteAddr := range cm.remoteAddrs {
-		if remoteAddr == addr {
-			found = true
-			break
-		}
-	}
-
-	if !found {
+	if !cm.HasBackend(addr) {
 		return nil, fmt.Errorf("address %s not in remote addresses list", addr)
 	}
 
@@ -1242,6 +1419,38 @@ func (cm *ConnectionManager) IsRemoteTLSVerifyEnabled() bool {
 // GetConnectTimeout returns the configured connection timeout
 func (cm *ConnectionManager) GetConnectTimeout() time.Duration {
 	return cm.connectTimeout
+}
+
+const (
+	// maxConnectAttempts caps how many dials one ConnectWithProxy call is given budget
+	// for, so a broadly dead pool cannot stretch a single login to len(pool) x connect_timeout.
+	maxConnectAttempts = 3
+
+	// defaultConnectBudgetPerDial bounds a manager configured without a connect timeout,
+	// where net.Dialer imposes no per-dial limit of its own.
+	defaultConnectBudgetPerDial = 30 * time.Second
+)
+
+// ConnectBudget returns the overall deadline a caller should put around one
+// ConnectWithProxy call. connect_timeout is a per-dial budget (net.Dialer.Timeout) and
+// ConnectWithProxy dials the preferred backend and then falls back through the pool, so a
+// deadline of one connect_timeout lets a black-holed backend spend the whole budget and
+// leaves every fallback dial to fail instantly on an already-expired context.
+func (cm *ConnectionManager) ConnectBudget() time.Duration {
+	perDial := cm.connectTimeout
+	if perDial <= 0 {
+		perDial = defaultConnectBudgetPerDial
+	}
+
+	cm.healthMu.RLock()
+	attempts := len(cm.remoteAddrs) + 1 // preferred dial plus one round-robin dial per backend
+	cm.healthMu.RUnlock()
+
+	if attempts > maxConnectAttempts {
+		attempts = maxConnectAttempts
+	}
+
+	return perDial * time.Duration(attempts)
 }
 
 // HasRouting returns true if a user routing lookup is configured.

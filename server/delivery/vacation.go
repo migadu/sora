@@ -197,6 +197,18 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 	}
 	w.Close()
 
+	// Consume the RFC 5230 :days window for this sender now: the checks above have
+	// passed and the reply is about to be handed off. It has to happen before the
+	// handoff, not after — a record lost between the two would let a redelivery of
+	// this same message produce a second reply. A record that cannot be written
+	// blocks the reply rather than risking an unbounded series of them.
+	if result.RecordVacationSent != nil {
+		if err := result.RecordVacationSent(ctx); err != nil {
+			h.log("[VACATION] not sending: %v", err)
+			return err
+		}
+	}
+
 	// Send via external relay or queue
 	if h.RelayQueue != nil {
 		// Queue for background delivery with retry

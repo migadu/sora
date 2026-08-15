@@ -31,8 +31,8 @@ type FallbackCache struct {
 func NewFallbackCache(s3Cache autocert.Cache, fallbackDir string) (autocert.Cache, error) {
 	// Try to ensure fallback directory exists
 	if err := os.MkdirAll(fallbackDir, 0700); err != nil {
-		logger.Warn("Cannot create fallback directory - fallback cache disabled, using S3-only", "dir", fallbackDir, "error", err)
-		logger.Warn("Certificates will only be stored in S3. If S3 becomes unavailable, certificate operations will fail.")
+		logger.Error("Cannot create certificate fallback directory - degrading to S3-only: every TLS handshake reads from S3, and while S3 is unavailable handshakes fail for certificates that already exist",
+			"dir", fallbackDir, "error", err)
 		// Return S3-only cache instead of failing
 		return s3Cache, nil
 	}
@@ -155,17 +155,14 @@ func (fc *FallbackCache) Get(ctx context.Context, name string) ([]byte, error) {
 			return nil, autocert.ErrCacheMiss
 		}
 
-		// S3 error (timeout or other error) - mark as unavailable and return cache miss
-		// This allows autocert to continue operating using the local cache.
-		// If a certificate exists in S3 but we can't fetch it due to S3 issues,
-		// autocert will attempt to issue a new one. The local fallback cache will
-		// prevent the server from completely failing during S3 outages.
+		// S3 error (timeout or other error) - mark as unavailable and surface the error.
+		// A failing backend is not evidence that the certificate is absent: reported as a
+		// cache miss it makes autocert order a certificate that may already exist in S3,
+		// and such orders are doomed cluster-wide while burning Let's Encrypt rate limits.
 		logger.Warn("FallbackCache: S3 Get failed (marking S3 unavailable)", "name", name, "error", err)
 		fc.markS3Unavailable()
 
-		// Return cache miss instead of the S3 error to prevent blocking TLS handshakes
-		// autocert will handle the cache miss appropriately
-		return nil, autocert.ErrCacheMiss
+		return nil, fmt.Errorf("certificate cache read failed for %s: %w", name, err)
 	}
 
 	// Shouldn't reach here, but just in case

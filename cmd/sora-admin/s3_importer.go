@@ -41,6 +41,11 @@ type S3ImporterOptions struct {
 	ImportDelay       time.Duration // Delay between imports to control rate
 	ContinuationToken string        // S3 continuation token to resume from
 	Workers           int           // Number of concurrent workers
+	// InstanceID is the identity written to pending_uploads.instance_id, resolved by
+	// config.Config.InstanceID so it matches what the server on this host writes. It is
+	// a lease key: a row left behind under an id no running instance answers to is
+	// reaped by the cleaner along with its message.
+	InstanceID string
 }
 
 // S3Importer handles the S3 import process
@@ -541,7 +546,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	}
 
 	// Insert message into database
-	hostname, _ := os.Hostname()
+	hostname := si.options.InstanceID
 	msgID, uid, err := si.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
 			AccountID:     user.AccountID(),

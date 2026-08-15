@@ -41,24 +41,27 @@ func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []stri
 
 // Server represents the HTTP API server
 type Server struct {
-	name               string
-	addr               string
-	apiKey             string
-	allowedHosts       []string
-	rdb                *resilient.ResilientDatabase
-	cache              *cache.Cache
-	uploader           *uploader.UploadWorker
-	storage            *storage.S3Storage
-	relayQueue         delivery.RelayQueue // Global relay queue for mail delivery
-	maxMessageSize     int64               // Max accepted mail-injection body size (bytes); 0 -> default
-	maxConnections     int                 // Max concurrent connections; 0 -> unlimited
-	server             *http.Server
-	tls                bool
-	tlsConfig          *tls.Config // TLS config from manager (takes precedence) or nil
-	tlsCertFile        string
-	tlsKeyFile         string
-	tlsVerify          bool
-	hostname           string
+	name           string
+	addr           string
+	apiKey         string
+	allowedHosts   []string
+	rdb            *resilient.ResilientDatabase
+	cache          *cache.Cache
+	uploader       *uploader.UploadWorker
+	storage        *storage.S3Storage
+	relayQueue     delivery.RelayQueue // Global relay queue for mail delivery
+	maxMessageSize int64               // Max accepted mail-injection body size (bytes); 0 -> default
+	maxConnections int                 // Max concurrent connections; 0 -> unlimited
+	server         *http.Server
+	tls            bool
+	tlsConfig      *tls.Config // TLS config from manager (takes precedence) or nil
+	tlsCertFile    string
+	tlsKeyFile     string
+	tlsVerify      bool
+	hostname       string
+	// instanceID is the upload-lease key (pending_uploads.instance_id), distinct from
+	// hostname, which is the SMTP-visible name stamped into Received headers.
+	instanceID         string
 	ftsRetention       time.Duration
 	affinityManager    AffinityManager
 	validBackends      map[string][]string
@@ -69,6 +72,7 @@ type Server struct {
 	redirectRateLimit  int                                  // Max redirects per account
 	redirectRateWindow time.Duration                        // Window for redirect limit
 	maxRedirectHops    int                                  // Max redirect hops per message (mail-loop backstop)
+	sieveExtensions    []string                             // [sieve] enabled_extensions, shared with the LMTP path
 }
 
 // ServerOptions holds configuration options for the HTTP API server
@@ -89,6 +93,7 @@ type ServerOptions struct {
 	TLSKeyFile         string
 	TLSVerify          bool
 	Hostname           string
+	InstanceID         string
 	FTSRetention       time.Duration
 	AffinityManager    AffinityManager
 	ValidBackends      map[string][]string                  // Map of protocol -> valid backend addresses
@@ -98,6 +103,7 @@ type ServerOptions struct {
 	RedirectRateLimit  int
 	RedirectRateWindow time.Duration
 	MaxRedirectHops    int
+	SieveExtensions    []string // [sieve] enabled_extensions (empty = default set)
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol               bool     // Enable PROXY protocol support for incoming connections
@@ -210,6 +216,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		tlsKeyFile:         options.TLSKeyFile,
 		tlsVerify:          options.TLSVerify,
 		hostname:           options.Hostname,
+		instanceID:         options.InstanceID,
 		ftsRetention:       options.FTSRetention,
 		affinityManager:    options.AffinityManager,
 		validBackends:      options.ValidBackends,
@@ -220,6 +227,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		redirectRateLimit:  options.RedirectRateLimit,
 		redirectRateWindow: options.RedirectRateWindow,
 		maxRedirectHops:    options.MaxRedirectHops,
+		sieveExtensions:    options.SieveExtensions,
 	}
 
 	return s, nil

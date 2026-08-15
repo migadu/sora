@@ -283,6 +283,86 @@ func (db *Database) GetFailedUploadsWithEmail(ctx context.Context, maxAttempts i
 	return uploads, nil
 }
 
+// RecordInstanceHeartbeat marks this instance as alive right now.
+//
+// The heartbeat is the liveness signal db.CleanupFailedUploads uses to decide whether
+// an unfinished upload is still recoverable: only the instance that created a
+// pending_upload can perform it (the body is on that node's local disk), so a
+// still-beating owner means "do not reap", and an owner that stopped beating for
+// longer than the liveness threshold means "the disk holding those bytes is gone".
+func (db *Database) RecordInstanceHeartbeat(ctx context.Context, tx pgx.Tx, instanceID string) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO instance_heartbeats (instance_id, last_seen)
+		VALUES ($1, now())
+		ON CONFLICT (instance_id) DO UPDATE SET last_seen = now()
+	`, instanceID)
+	if err != nil {
+		return fmt.Errorf("failed to record heartbeat for instance %s: %w", instanceID, err)
+	}
+	return nil
+}
+
+// StrandedUploadInstance describes an instance_id that still owns retryable pending
+// uploads (attempts < maxAttempts) but has shown no sign of life within the liveness
+// threshold. Their uploads make no progress and are invisible to the failed-upload
+// alerting, which only counts attempts >= maxAttempts.
+type StrandedUploadInstance struct {
+	InstanceID    string
+	PendingCount  int64
+	PendingBytes  int64
+	OldestPending time.Time
+	// LastSeen is the instance's last heartbeat; invalid means it never recorded one,
+	// which makes its liveness UNKNOWN rather than dead, so none of its uploads are reaped.
+	LastSeen sql.NullTime
+	// LastLease is the most recent lease it took on any of its own uploads. It is
+	// evidence of life even from a build that predates the heartbeat table.
+	LastLease sql.NullTime
+}
+
+// GetStrandedUploadInstances returns the instances whose retryable uploads are not
+// making progress because the owning instance shows no sign of life. Reported so an
+// operator learns both that mail is about to be dropped (dead instance) and that a
+// backlog can never be reaped (unknown liveness).
+func (db *Database) GetStrandedUploadInstances(ctx context.Context, maxAttempts int, livenessThreshold time.Duration) ([]StrandedUploadInstance, error) {
+	// Report only the worst offenders: instance ids are per host and churn with
+	// container lifecycles, so the list is unbounded in principle.
+	const maxReported = 20
+
+	// Same rule as db.CleanupFailedUploads, against the database clock that wrote the
+	// heartbeats and leases: the most recent evidence of life decides, and no evidence
+	// at all means unknown rather than gone.
+	rows, err := db.GetReadPool().Query(ctx, `
+		SELECT pu.instance_id, COUNT(*), COALESCE(SUM(pu.size), 0), MIN(pu.created_at),
+		       ih.last_seen, MAX(pu.last_attempt)
+		FROM pending_uploads pu
+		LEFT JOIN instance_heartbeats ih ON ih.instance_id = pu.instance_id
+		WHERE pu.attempts < $1
+		GROUP BY pu.instance_id, ih.last_seen
+		HAVING GREATEST(ih.last_seen, MAX(pu.last_attempt)) IS NULL
+		    OR GREATEST(ih.last_seen, MAX(pu.last_attempt)) < now() - $2::interval
+		ORDER BY COUNT(*) DESC
+		LIMIT $3
+	`, maxAttempts, livenessThreshold, maxReported)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query stranded upload instances: %w", err)
+	}
+	defer rows.Close()
+
+	var result []StrandedUploadInstance
+	for rows.Next() {
+		var s StrandedUploadInstance
+		if err := rows.Scan(&s.InstanceID, &s.PendingCount, &s.PendingBytes, &s.OldestPending, &s.LastSeen, &s.LastLease); err != nil {
+			return nil, fmt.Errorf("failed to scan stranded upload instance: %w", err)
+		}
+		result = append(result, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating stranded upload instances: %w", err)
+	}
+
+	return result, nil
+}
+
 // ExhaustUploadAttempts sets the attempt count to maxAttempts for the given upload,
 // immediately marking it as permanently failed without cycling through retries one by one.
 // Use this when the content is confirmed permanently lost (file missing AND not in S3).

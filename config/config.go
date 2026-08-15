@@ -272,6 +272,14 @@ type TLSLetsEncryptS3Config struct {
 	Debug      bool   `toml:"debug"`       // Enable detailed S3 request/response tracing
 	AccessKey  string `toml:"access_key"`  // AWS credentials (optional, uses default chain)
 	SecretKey  string `toml:"secret_key"`  // AWS credentials (optional)
+	// ServerSideEncryption is the encryption asked of the store on every certificate
+	// write: "AES256" for the store's own key management, "aws:kms" with a key id, or
+	// "" for no encryption header at all. Pointer so an absent key (keep the default,
+	// AES256) is distinguishable from an explicit "" (send no header), which is what a
+	// store that rejects the header needs.
+	ServerSideEncryption *string `toml:"server_side_encryption"`
+	// ServerSideEncryptionKMSKeyID is the key id required by "aws:kms".
+	ServerSideEncryptionKMSKeyID string `toml:"server_side_encryption_kms_key_id"`
 }
 
 // TLSLetsEncryptConfig holds Let's Encrypt automatic certificate management configuration
@@ -282,7 +290,7 @@ type TLSLetsEncryptConfig struct {
 	StorageProvider string                 `toml:"storage_provider"` // Certificate storage backend (currently only "s3")
 	S3              TLSLetsEncryptS3Config `toml:"s3"`               // S3 storage configuration
 	RenewBefore     string                 `toml:"renew_before"`     // Renew certificates this duration before expiry (e.g., "720h" = 30 days). Default: 30 days
-	EnableFallback  bool                   `toml:"enable_fallback"`  // Enable local filesystem fallback when S3 is unavailable (default: true)
+	EnableFallback  *bool                  `toml:"enable_fallback"`  // Enable local filesystem fallback when S3 is unavailable (default: true). Pointer so an absent key is distinguishable from an explicit false.
 	FallbackDir     string                 `toml:"fallback_dir"`     // Local directory for certificate fallback when S3 is unavailable (default: "/var/lib/sora/certs")
 	SyncInterval    string                 `toml:"sync_interval"`    // Interval to check S3 for certificate updates (e.g., "5m"). Default: 5m. Set to "0" to disable periodic sync.
 }
@@ -303,6 +311,10 @@ type CleanupConfig struct {
 	MaxAgeRestriction     string `toml:"max_age_restriction"`
 	FTSRetention          string `toml:"fts_retention"` // How long to keep the messages_fts row (FTS vectors + raw headers)
 	HealthStatusRetention string `toml:"health_status_retention"`
+	// InstanceLivenessThreshold is how long an uploader instance must be silent
+	// (no heartbeat, no lease on its own uploads) before the cleaner treats it as
+	// gone and reaps the unuploaded messages whose bodies only existed on its disk.
+	InstanceLivenessThreshold string `toml:"instance_liveness_threshold"`
 }
 
 // GetGracePeriod parses the grace period duration
@@ -343,6 +355,17 @@ func (c *CleanupConfig) GetHealthStatusRetention() (time.Duration, error) {
 		return 30 * 24 * time.Hour, nil // 30 days default
 	}
 	return helpers.ParseDuration(c.HealthStatusRetention)
+}
+
+// GetInstanceLivenessThreshold parses the instance liveness threshold.
+// The default is deliberately long: a shorter value than a plausible maintenance
+// window would let a node that is merely rebooting be mistaken for a decommissioned
+// one, and reaping mail whose only copy is on that node's disk is unrecoverable.
+func (c *CleanupConfig) GetInstanceLivenessThreshold() (time.Duration, error) {
+	if c.InstanceLivenessThreshold == "" {
+		return 7 * 24 * time.Hour, nil // 7 days default
+	}
+	return helpers.ParseDuration(c.InstanceLivenessThreshold)
 }
 
 // LocalCacheConfig holds local disk cache configuration.
@@ -412,8 +435,17 @@ func (c *LocalCacheConfig) GetOrphanCleanupAge() (time.Duration, error) {
 
 // UploaderConfig holds upload worker configuration.
 type UploaderConfig struct {
-	Path               string `toml:"path"`
-	BatchSize          int    `toml:"batch_size"`
+	Path      string `toml:"path"`
+	BatchSize int    `toml:"batch_size"`
+	// InstanceID is the identity this node writes into pending_uploads.instance_id and
+	// instance_heartbeats.instance_id — the upload lease key. Default: the OS hostname.
+	// It is deliberately NOT cluster.node_id: the lease key names whoever owns the staged
+	// message bodies on this node's local disk, and must survive gossip renames. Set it
+	// explicitly when running multiple sora instances on one host (each needs its own),
+	// or to keep the lease identity stable across a planned hostname change. WARNING:
+	// changing the resolved value strands queued uploads — drain first (see
+	// config.Config.InstanceID).
+	InstanceID         string `toml:"instance_id"`
 	Concurrency        int    `toml:"concurrency"`
 	MaxAttempts        int    `toml:"max_attempts"`
 	RetryInterval      string `toml:"retry_interval"`
@@ -959,6 +991,12 @@ type ServerConfig struct {
 	AuthIdleTimeout        string   `toml:"auth_idle_timeout,omitempty"`
 	EnableAffinity         bool     `toml:"enable_affinity,omitempty"`
 	RemoteHealthChecks     *bool    `toml:"remote_health_checks,omitempty"` // Enable backend health checking (default: true)
+	// RemoteDNSRefresh is how often the proxy re-resolves the hostnames in remote_addrs,
+	// so a backend that changes address (rolling replacement, container reschedule, DNS
+	// failover) is picked up without a restart. Empty = 5m. "0" pins the pool to the
+	// addresses resolved at startup. A name that stops resolving always keeps its last
+	// known addresses, whatever this is set to.
+	RemoteDNSRefresh string `toml:"remote_dns_refresh,omitempty"`
 
 	// HTTP API specific
 	APIKey       string   `toml:"api_key,omitempty"`
@@ -1052,7 +1090,7 @@ type SharedMailboxesConfig struct {
 type AdminCLIConfig struct {
 	Addr               string `toml:"addr"`                 // HTTP Admin API endpoint address
 	APIKey             string `toml:"api_key"`              // API key for authentication
-	InsecureSkipVerify *bool  `toml:"insecure_skip_verify"` // Skip TLS verification (default: true)
+	InsecureSkipVerify *bool  `toml:"insecure_skip_verify"` // Skip TLS verification (default: auto; true for loopback, false for remote)
 	ImportMessageLimit string `toml:"import_message_limit"` // Maximum message size for import operations (e.g., "50mb")
 }
 
@@ -1291,6 +1329,23 @@ func (s *ServerConfig) GetConnectTimeout() (time.Duration, error) {
 		return 30 * time.Second, nil
 	}
 	return helpers.ParseDuration(s.ConnectTimeout)
+}
+
+// GetRemoteDNSRefresh returns the configured backend DNS re-resolution interval, or nil
+// when the server does not configure one and the connection manager's default applies.
+// An explicit "0" is returned as such and disables re-resolution.
+func (s *ServerConfig) GetRemoteDNSRefresh() (*time.Duration, error) {
+	if s.RemoteDNSRefresh == "" {
+		return nil, nil
+	}
+	d, err := helpers.ParseDuration(s.RemoteDNSRefresh)
+	if err != nil {
+		return nil, err
+	}
+	if d < 0 {
+		return nil, fmt.Errorf("remote_dns_refresh must not be negative, got %q", s.RemoteDNSRefresh)
+	}
+	return &d, nil
 }
 
 func (s *ServerConfig) GetAuthIdleTimeout() (time.Duration, error) {
@@ -1691,6 +1746,20 @@ func (c *CleanupConfig) GetHealthStatusRetentionWithDefault() time.Duration {
 	return retention
 }
 
+func (c *CleanupConfig) GetInstanceLivenessThresholdWithDefault() time.Duration {
+	threshold, err := c.GetInstanceLivenessThreshold()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cleanup instance_liveness_threshold: %v, using default (7 days)", err)
+		return 7 * 24 * time.Hour
+	}
+	if threshold <= 0 {
+		// Non-positive would mean "every instance is dead", i.e. reaping on age alone.
+		log.Printf("WARNING: cleanup instance_liveness_threshold must be positive, got %s, using default (7 days)", threshold)
+		return 7 * 24 * time.Hour
+	}
+	return threshold
+}
+
 func (c *LocalCacheConfig) GetCapacityWithDefault() int64 {
 	capacity, err := c.GetCapacity()
 	if err != nil {
@@ -1911,6 +1980,9 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.TLSUseStartTLS {
 			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to protocol servers (IMAP, POP3, LMTP, ManageSieve)", s.Name, s.Type)
+		}
+		if s.Type == "metrics" && s.TLS {
+			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)
 		}
 	}
 }

@@ -3,8 +3,10 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1002,4 +1004,196 @@ func TestGetBackendHealthStatusesIncludesBothPoolAndRemoteLookup(t *testing.T) {
 			}
 		}
 	}
+}
+
+// blackHoledPoolManager returns a manager whose single pool backend is listening but
+// whose every dial times out inside net.Dialer: a 1ns connect timeout reproduces the
+// black-holed backend (SYNs dropped, no RST) without needing an unroutable address or
+// any sleeping, and it does so while the caller's context stays live.
+func blackHoledPoolManager(t *testing.T) (*ConnectionManager, string) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	backendAddr := ln.Addr().String()
+	cm, err := NewConnectionManager([]string{backendAddr}, 0, false, false, false, 1*time.Nanosecond)
+	if err != nil {
+		t.Fatalf("Failed to create connection manager: %v", err)
+	}
+	return cm, backendAddr
+}
+
+func poolHealthSnapshot(t *testing.T, cm *ConnectionManager, backend string) BackendHealth {
+	t.Helper()
+
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+
+	health, ok := cm.backendHealth[backend]
+	if !ok {
+		t.Fatalf("no health entry for pool backend %s", backend)
+	}
+	return *health
+}
+
+// TestDialTimeoutMarksPoolBackendUnhealthy covers the round-robin path: a dial that
+// timed out while the caller's context is still live is a backend problem and must
+// count towards the unhealthy threshold.
+func TestDialTimeoutMarksPoolBackendUnhealthy(t *testing.T) {
+	cm, backendAddr := blackHoledPoolManager(t)
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		conn, _, err := cm.ConnectWithProxy(ctx, "", "", 0, "", 0, nil)
+		if conn != nil {
+			conn.Close()
+		}
+		if err == nil {
+			t.Fatalf("attempt %d: expected the dial to time out", i)
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("attempt %d: caller context must stay live for this test to exercise a backend timeout", i)
+		}
+	}
+
+	health := poolHealthSnapshot(t, cm, backendAddr)
+	if health.FailureCount != 3 || health.ConsecutiveFails != 3 {
+		t.Errorf("dial timeouts with a live caller context were not recorded as backend failures: FailureCount=%d ConsecutiveFails=%d, want 3/3", health.FailureCount, health.ConsecutiveFails)
+	}
+	if cm.IsBackendHealthy(backendAddr) {
+		t.Error("backend still reported healthy after 3 dial timeouts")
+	}
+	if backend := cm.GetBackendByConsistentHash("user@example.com"); backend != "" {
+		t.Errorf("consistent hash still routes users to %q after 3 dial timeouts", backend)
+	}
+}
+
+// TestDialTimeoutMarksPreferredPoolBackendUnhealthy covers the preferred/affinity path.
+// Until the backend is marked unhealthy, resolveAffinityRoute never deletes the stale
+// affinity, so users keep being sent back to the dead backend.
+func TestDialTimeoutMarksPreferredPoolBackendUnhealthy(t *testing.T) {
+	cm, backendAddr := blackHoledPoolManager(t)
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		conn, _, err, _ := cm.tryPreferredAddress(ctx, backendAddr, "", 0, "", 0, nil)
+		if conn != nil {
+			conn.Close()
+		}
+		if err == nil {
+			t.Fatalf("attempt %d: expected the dial to time out", i)
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("attempt %d: caller context must stay live for this test to exercise a backend timeout", i)
+		}
+	}
+
+	health := poolHealthSnapshot(t, cm, backendAddr)
+	if health.FailureCount != 3 || health.ConsecutiveFails != 3 {
+		t.Errorf("preferred-address dial timeouts with a live caller context were not recorded as backend failures: FailureCount=%d ConsecutiveFails=%d, want 3/3", health.FailureCount, health.ConsecutiveFails)
+	}
+	if cm.IsBackendHealthy(backendAddr) {
+		t.Error("preferred backend still reported healthy after 3 dial timeouts")
+	}
+	if cm.IsBackendHealthyForAffinity(backendAddr) {
+		t.Error("preferred backend still healthy for affinity after 3 dial timeouts, so stale affinities are never cleaned")
+	}
+}
+
+// TestConnectBudgetCoversFallbackDials pins the deadline the proxies put around one
+// ConnectWithProxy call. connect_timeout is a per-dial budget, so an overall deadline
+// equal to it lets a black-holed preferred backend consume everything and every
+// round-robin fallback dial then fails instantly on an already-expired context.
+func TestConnectBudgetCoversFallbackDials(t *testing.T) {
+	const perDial = 2 * time.Second
+	backends := []string{"127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"}
+
+	cm, err := NewConnectionManager(backends, 0, false, false, false, perDial)
+	if err != nil {
+		t.Fatalf("Failed to create connection manager: %v", err)
+	}
+
+	budget := cm.ConnectBudget()
+	if budget <= perDial {
+		t.Errorf("ConnectBudget()=%v does not exceed the per-dial connect timeout %v: fallback dials would start on an expired context", budget, perDial)
+	}
+	if worstCase := perDial * time.Duration(len(backends)+1); budget > worstCase {
+		t.Errorf("ConnectBudget()=%v exceeds %v, the worst case of the preferred dial plus one dial per backend", budget, worstCase)
+	}
+
+	// A large pool must not stretch a single login to poolSize * connect_timeout.
+	bigPool := make([]string, 20)
+	for i := range bigPool {
+		bigPool[i] = net.JoinHostPort("127.0.0.1", fmt.Sprint(10000+i))
+	}
+	cmBig, err := NewConnectionManager(bigPool, 0, false, false, false, perDial)
+	if err != nil {
+		t.Fatalf("Failed to create connection manager: %v", err)
+	}
+	if budget := cmBig.ConnectBudget(); budget > perDial*maxConnectAttempts {
+		t.Errorf("ConnectBudget()=%v for a %d-backend pool, want at most %v", budget, len(bigPool), perDial*maxConnectAttempts)
+	}
+
+	// context.WithTimeout(ctx, 0) is already expired, so an unset connect timeout must
+	// still yield a usable deadline instead of failing every dial immediately.
+	cmZero, err := NewConnectionManager([]string{"127.0.0.1:1"}, 0, false, false, false, 0)
+	if err != nil {
+		t.Fatalf("Failed to create connection manager: %v", err)
+	}
+	if budget := cmZero.ConnectBudget(); budget <= 0 {
+		t.Errorf("ConnectBudget()=%v with no configured connect timeout, want a positive deadline", budget)
+	}
+}
+
+// TestBackendHealthReadsAreSynchronized fails under -race if the health accessors read
+// BackendHealth fields outside the lock that the recorders mutate them under.
+func TestBackendHealthReadsAreSynchronized(t *testing.T) {
+	const poolBackend = "127.0.0.1:1"
+	const remoteLookupBackend = "192.0.2.1:143"
+
+	cm, err := NewConnectionManager([]string{poolBackend}, 0, false, false, false, time.Second)
+	if err != nil {
+		t.Fatalf("Failed to create connection manager: %v", err)
+	}
+
+	cm.healthMu.Lock()
+	cm.remoteLookupHealth[remoteLookupBackend] = &BackendHealth{IsHealthy: true, LastSuccess: time.Now()}
+	cm.healthMu.Unlock()
+
+	const iterations = 2000
+	var wg sync.WaitGroup
+	wg.Add(4)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			cm.RecordConnectionFailure(poolBackend)
+			cm.RecordConnectionSuccess(poolBackend)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			cm.IsBackendHealthy(poolBackend)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			cm.RecordRemoteLookupFailure(remoteLookupBackend)
+			cm.RecordRemoteLookupSuccess(remoteLookupBackend)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			cm.IsRemoteLookupBackendHealthy(remoteLookupBackend)
+		}
+	}()
+
+	wg.Wait()
 }

@@ -28,16 +28,35 @@ import (
 
 // DeliveryContext contains the context for message delivery operations.
 type DeliveryContext struct {
-	Ctx           context.Context
-	RDB           *resilient.ResilientDatabase
-	Uploader      *uploader.UploadWorker
-	Hostname      string
+	Ctx      context.Context
+	RDB      *resilient.ResilientDatabase
+	Uploader *uploader.UploadWorker
+	// Hostname is this node's SMTP-visible name. It is published: the "by" clause of the
+	// Received header this delivery stamps, and the domain of vacation Message-IDs.
+	Hostname string
+	// InstanceID is the upload-lease key written to pending_uploads.instance_id. It is
+	// internal and must match what the upload worker heartbeats, or the cleaner reaps this
+	// delivery's body before it reaches S3. Empty falls back to Hostname, which is what
+	// callers that never split the two identities effectively used.
+	InstanceID    string
 	ExternalRelay string
 	FTSRetention  time.Duration
 	MetricsLabel  string // "lmtp" or "http_delivery"
 	SieveExecutor SieveExecutor
 	Logger        Logger
 	OwnerResolver *resilient.OwnerResolver
+}
+
+// uploadInstanceID is the identity this delivery stamps on the pending_uploads row it
+// creates. It falls back to Hostname so that a caller which has only ever had one name
+// keeps the behaviour it had before the two were separated - the failure mode of getting
+// this wrong is the cleaner deleting a message body that never reached S3, so the fallback
+// is a value that is at least self-consistent for a single-node deployment.
+func (d *DeliveryContext) uploadInstanceID() string {
+	if d.InstanceID != "" {
+		return d.InstanceID
+	}
+	return d.Hostname
 }
 
 // Logger interface for logging delivery operations.
@@ -63,6 +82,9 @@ type RecipientInfo struct {
 	PreservedUID    *uint32         // Optional: preserved UID for migration
 	PreservedUIDVal *uint32         // Optional: preserved UIDVALIDITY for migration
 	TargetMailbox   string          // Optional: target mailbox (bypasses Sieve)
+	// DeliveryHash identifies the upstream submission (see db.InsertMessageOptions).
+	// Set by DeliverMessage from the bytes as received; callers leave it empty.
+	DeliveryHash string
 }
 
 // DeliverMessage is the main entry point for message delivery.
@@ -97,6 +119,12 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			result.ErrorMessage = "routing loop detected (Delivered-To)"
 			return result, fmt.Errorf("mail loop detected for %s", deliveredTo)
 		}
+		// Identity of the upstream submission, used to absorb a retry of a delivery whose
+		// acknowledgement was lost. MUST be taken over the bytes exactly as received: the
+		// trace stamped below carries a per-attempt id and timestamp, so anything hashed
+		// after it (content_hash included) differs on every attempt.
+		recipient.DeliveryHash = helpers.HashContent(messageBytes)
+
 		// Add our Received: trace for this delivery hop, then Delivered-To on top.
 		received := helpers.BuildReceivedHeader("", d.Hostname, "HTTP", deliveredTo, idgen.New(), time.Now().Format(time.RFC1123Z))
 		messageBytes = helpers.PrependRawHeader(messageBytes, received)
@@ -105,6 +133,61 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			result.ErrorMessage = fmt.Sprintf("Invalid RFC822 message after Delivered-To/Received: %v", err)
 			return result, err
 		}
+	}
+
+	// Extract plaintext body for FTS (also the body the Sieve evaluation sees)
+	plaintextBody, err := helpers.ExtractPlaintextBody(messageEntity)
+	if err != nil {
+		emptyBody := ""
+		plaintextBody = &emptyBody
+	}
+
+	// Safety guard: Reject if global staging limit is exceeded. Checked before Sieve runs,
+	// so a rejected delivery cannot have redirected or auto-replied first.
+	if d.Uploader.IsStagingLimitExceeded(int64(len(messageBytes))) {
+		d.Logger.Log("Rejecting delivery due to upload staging size limit exceeded")
+		result.ErrorMessage = "Insufficient system storage (staging limit reached)"
+		return result, fmt.Errorf("staging limit exceeded")
+	}
+
+	// Determine target mailbox. Sieve runs BEFORE the message is hashed and stored, as it
+	// does in the LMTP path: an editheader script rewrites the headers, and content_hash
+	// (the S3 object key, cache key and upload-dedup key) must describe the bytes that are
+	// actually stored.
+	var mailboxName string
+	var copyMailbox string     // Sieve `fileinto :copy` target, saved once the body is staged
+	var sieveFlags []imap.Flag // flags set by the Sieve script (imap4flags, RFC 5232)
+
+	if recipient.TargetMailbox != "" {
+		// Use explicit target mailbox (bypasses Sieve - for migrations)
+		mailboxName = recipient.TargetMailbox
+	} else {
+		// Execute Sieve scripts
+		outcome, err := d.SieveExecutor.ExecuteSieve(
+			d.Ctx,
+			recipient,
+			messageEntity,
+			plaintextBody,
+			messageBytes,
+		)
+		if err != nil {
+			result.ErrorMessage = fmt.Sprintf("Sieve execution error: %v", err)
+			return result, err
+		}
+
+		if outcome.Discarded {
+			result.Discarded = true
+			result.Success = true
+			return result, nil
+		}
+
+		mailboxName = outcome.MailboxName
+		copyMailbox = outcome.CopyMailbox
+		sieveFlags = outcome.Flags
+		// Adopt any header edits the script made (RFC 5293) before anything is derived
+		// from the message.
+		messageBytes = outcome.MessageBytes
+		messageEntity = outcome.MessageEntity
 	}
 
 	// Parse message metadata
@@ -121,13 +204,6 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 	// Calculate content hash
 	contentHash := helpers.HashContent(messageBytes)
-
-	// Extract plaintext body for FTS
-	plaintextBody, err := helpers.ExtractPlaintextBody(messageEntity)
-	if err != nil {
-		emptyBody := ""
-		plaintextBody = &emptyBody
-	}
 
 	// Extract body structure
 	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(messageBytes))
@@ -152,17 +228,10 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
 
 	// Store message locally for background upload to S3
+	// This happens AFTER Sieve processing and header edits, so we store the modified message
 	// Check if file already exists to prevent race condition:
 	// If a duplicate arrives while uploader is processing the first copy,
 	// we don't want to overwrite/delete the file the uploader is reading.
-
-	// Safety guard: Reject if global staging limit is exceeded
-	if d.Uploader.IsStagingLimitExceeded(int64(len(messageBytes))) {
-		d.Logger.Log("Rejecting delivery due to upload staging size limit exceeded")
-		result.ErrorMessage = "Insufficient system storage (staging limit reached)"
-		return result, fmt.Errorf("staging limit exceeded")
-	}
-
 	expectedPath := d.Uploader.FilePath(contentHash, recipient.AccountID)
 	var filePath *string
 	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
@@ -184,33 +253,16 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		return result, fmt.Errorf("failed to check file existence: %w", err)
 	}
 
-	// Determine target mailbox
-	var mailboxName string
-	var discarded bool
-	var sieveFlags []imap.Flag // flags set by the Sieve script (imap4flags, RFC 5232)
-
-	if recipient.TargetMailbox != "" {
-		// Use explicit target mailbox (bypasses Sieve - for migrations)
-		mailboxName = recipient.TargetMailbox
-		discarded = false
-	} else {
-		// Execute Sieve scripts
-		mailboxName, discarded, sieveFlags, err = d.SieveExecutor.ExecuteSieve(
-			d.Ctx,
-			recipient,
-			messageEntity,
-			plaintextBody,
-			messageBytes,
-		)
-		if err != nil {
-			result.ErrorMessage = fmt.Sprintf("Sieve execution error: %v", err)
+	// Sieve `fileinto :copy`: save the second copy now that the body is on disk, so its
+	// pending_uploads row can never name a file that is not staged yet - the uploader
+	// treats a missing local file as permanently lost content.
+	if copyMailbox != "" {
+		err := d.SaveMessageToMailbox(d.Ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, sieveFlags)
+		// A duplicate copy is an accepted delivery, as it is in LMTP: the copy is
+		// already in the mailbox, so a resubmission must not fail the delivery.
+		if err != nil && !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
+			result.ErrorMessage = fmt.Sprintf("Failed to save Sieve :copy to %s: %v", copyMailbox, err)
 			return result, err
-		}
-
-		if discarded {
-			result.Discarded = true
-			result.Success = true
-			return result, nil
 		}
 	}
 
@@ -234,6 +286,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			S3Localpart:          destS3Localpart,
 			MailboxName:          mailbox.Name,
 			ContentHash:          contentHash,
+			DeliveryHash:         recipient.DeliveryHash,
 			MessageID:            messageID,
 			InternalDate:         time.Now(),
 			Size:                 size,
@@ -251,7 +304,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		},
 		db.PendingUpload{
 			ContentHash: contentHash,
-			InstanceID:  d.Hostname,
+			InstanceID:  d.uploadInstanceID(),
 			Size:        size,
 			AccountID:   destAccountID,
 		})
@@ -273,9 +326,18 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			if filePath != nil {
 				d.Logger.Log("Duplicate message detected, keeping file for potential pending upload: %s", contentHash)
 			}
-			result.ErrorMessage = "Message already exists"
+			// A duplicate is an accepted delivery, as it is in LMTP: the message is
+			// already in the mailbox, so a resubmission must not be reported as a
+			// delivery failure.
+			//
+			// InsertMessage returns the existing row's UID alongside the duplicate
+			// error, except on a unique-constraint violation: that aborts the
+			// transaction before the row can be looked up, leaving the UID at 0.
+			result.Success = true
+			result.MailboxName = mailbox.Name
+			result.MessageUID = uint32(messageUID)
 			// Don't notify uploader for duplicates
-			return result, err
+			return result, nil
 		}
 		// DO NOT delete the local file on non-duplicate errors.
 		//
@@ -465,6 +527,7 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 			S3Localpart:   destS3Localpart,
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
+			DeliveryHash:  recipient.DeliveryHash,
 			MessageID:     messageID,
 			InternalDate:  time.Now(),
 			Size:          size,
@@ -480,7 +543,7 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 		},
 		db.PendingUpload{
 			ContentHash: contentHash,
-			InstanceID:  d.Hostname,
+			InstanceID:  d.uploadInstanceID(),
 			Size:        size,
 			AccountID:   destAccountID,
 		})

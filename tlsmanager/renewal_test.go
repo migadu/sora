@@ -299,17 +299,20 @@ func TestS3FailureScenario(t *testing.T) {
 		t.Fatalf("Failed to clear local cache: %v", err)
 	}
 
-	// Try to get certificate - should get ErrCacheMiss (not the S3 error)
-	// This is the fix we implemented
+	// Try to get certificate - the S3 failure must surface as an error, not as a cache
+	// miss, or autocert orders a new certificate for one that already exists in S3
 	data3, err := fallback.Get(ctx, domain)
-	if err != autocert.ErrCacheMiss {
-		t.Errorf("Expected ErrCacheMiss when S3 fails, got: %v", err)
+	if err == nil {
+		t.Error("Expected an error when S3 fails, got nil")
+	}
+	if errors.Is(err, autocert.ErrCacheMiss) {
+		t.Errorf("Expected S3 failure to surface as an error, got: %v", err)
 	}
 	if data3 != nil {
-		t.Error("Expected nil data on cache miss")
+		t.Error("Expected nil data on S3 failure")
 	}
 
-	t.Logf("Step 4: S3 failure correctly treated as cache miss (prevents autocert from retrying)")
+	t.Logf("Step 4: S3 failure correctly reported as an error (prevents autocert from issuing)")
 
 	// Wait for async goroutines to complete
 	time.Sleep(100 * time.Millisecond)
@@ -358,16 +361,19 @@ func TestS3SlowResponseWithTimeout(t *testing.T) {
 		t.Errorf("Expected timeout around 5 seconds, took %v", elapsed)
 	}
 
-	// Should get context deadline exceeded error, which gets converted to ErrCacheMiss
-	if err != autocert.ErrCacheMiss {
-		t.Errorf("Expected ErrCacheMiss on S3 timeout, got: %v", err)
+	// A timeout is a backend failure, not evidence that the certificate is absent
+	if err == nil {
+		t.Error("Expected an error on S3 timeout, got nil")
+	}
+	if errors.Is(err, autocert.ErrCacheMiss) {
+		t.Errorf("Expected S3 timeout to surface as an error, got: %v", err)
 	}
 
 	if data != nil {
 		t.Error("Expected nil data on timeout")
 	}
 
-	t.Logf("Step 2: S3 Get timed out after %v (correctly treated as cache miss)", elapsed)
+	t.Logf("Step 2: S3 Get timed out after %v (correctly reported as an error)", elapsed)
 }
 
 // TestRateLimitErrorDetection tests that rate limit errors are properly detected and tracked
