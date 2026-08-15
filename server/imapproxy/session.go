@@ -681,13 +681,10 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Check cache first (before rate limiter to avoid delays for cached successful auth)
 	// Use server name as cache key to avoid collisions between different proxies/servers
 	if cached, found := s.server.lookupCache.Get(s.server.name, username); found {
-		// Hash the password (never empty - validated at function start)
-		passwordHash := lookupcache.HashPassword(password)
-
-		// Check password hash match
-		// Note: cached.PasswordHash should also never be empty, but we check defensively
-		// in case of cache corruption or edge cases
-		passwordMatches := (cached.PasswordHash != "" && cached.PasswordHash == passwordHash)
+		// Does this login use the same password the entry was cached with?
+		// Constant-time, and false for an entry that carries no digest (cache
+		// corruption, or a negative entry written by a path that has no password).
+		passwordMatches := cached.PasswordDigest.Matches(password)
 
 		if cached.IsNegative {
 			// Negative cache entry - authentication previously failed
@@ -940,13 +937,9 @@ func (s *Session) authenticateUser(username, password string) error {
 				// CRITICAL: Cache key is submitted username (e.g., "user@TOKEN")
 				// BUT store ActualEmail so cache hits can use the resolved address
 				// This allows token-based auth to work correctly on cache hits
-				passwordHash := ""
-				if password != "" {
-					passwordHash = lookupcache.HashPassword(password)
-				}
 				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 					AccountID:              routingInfo.AccountID,
-					PasswordHash:           passwordHash,
+					PasswordDigest:         lookupcache.NewPasswordDigest(password),
 					ActualEmail:            resolvedEmail, // Store resolved email for cache hits
 					ServerAddress:          routingInfo.ServerAddress,
 					RemoteTLS:              routingInfo.RemoteTLS,
@@ -980,15 +973,11 @@ func (s *Session) authenticateUser(username, password string) error {
 
 				// Cache negative result (failed authentication) WITH password hash
 				// This allows us to detect repeated wrong passwords vs different wrong passwords
-				// Always hash password, even for master auth, to prevent cache bypass
-				passwordHash := ""
-				if password != "" {
-					passwordHash = lookupcache.HashPassword(password)
-				}
+				// Always digest the password, even for master auth, to prevent cache bypass
 				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-					PasswordHash: passwordHash,
-					Result:       lookupcache.AuthFailed,
-					IsNegative:   true,
+					PasswordDigest: lookupcache.NewPasswordDigest(password),
+					Result:         lookupcache.AuthFailed,
+					IsNegative:     true,
 				})
 
 				// Single consolidated log for authentication failure
@@ -1089,15 +1078,11 @@ func (s *Session) authenticateUser(username, password string) error {
 			if isDefinitiveFailure {
 				s.DebugLog("caching definitive auth failure", "username", username)
 				// Cache WITH password hash to detect repeated wrong passwords
-				// Always hash password, even for master auth, to prevent cache bypass
-				passwordHash := ""
-				if password != "" {
-					passwordHash = lookupcache.HashPassword(password)
-				}
+				// Always digest the password, even for master auth, to prevent cache bypass
 				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-					PasswordHash: passwordHash,
-					Result:       lookupcache.AuthFailed,
-					IsNegative:   true,
+					PasswordDigest: lookupcache.NewPasswordDigest(password),
+					Result:         lookupcache.AuthFailed,
+					IsNegative:     true,
 				})
 
 				// Single consolidated log for authentication failure
@@ -1143,15 +1128,11 @@ func (s *Session) authenticateUser(username, password string) error {
 
 	// Cache successful DB authentication
 	// ServerAddress will be determined later by DetermineRoute in connectToBackend
-	// Always hash password, even for master auth, to prevent cache bypass
-	passwordHash := ""
-	if password != "" {
-		passwordHash = lookupcache.HashPassword(password)
-	}
+	// Always digest the password, even for master auth, to prevent cache bypass
 	s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-		AccountID:     accountID,
-		PasswordHash:  passwordHash,
-		ServerAddress: "", // Will be populated by affinity/routing in next connection
+		AccountID:      accountID,
+		PasswordDigest: lookupcache.NewPasswordDigest(password),
+		ServerAddress:  "", // Will be populated by affinity/routing in next connection
 		// Preserve the server-level ID-forwarding setting: cache hits rebuild
 		// routingInfo from this entry and postAuthenticationSetup reads
 		// RemoteUseIDCommand from routingInfo. Without this, ID forwarding

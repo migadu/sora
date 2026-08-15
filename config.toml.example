@@ -1980,6 +1980,19 @@ type = "metrics"
 name = "prometheus-metrics"
 addr = ":9090"
 path = "/metrics"             # HTTP endpoint path for metrics.
+
+# --- ACCESS CONTROL ---
+# The metrics endpoint has NO access control unless configured here, and it exposes
+# per-domain (and, with enable_user_metrics, per-user) activity plus a detailed view of
+# internal state. Bind it to a private interface and restrict it on any untrusted network.
+# Both controls are optional and enforced independently: set both and a scrape must come
+# from an allowed host AND present the token.
+allowed_hosts = []            # IP/CIDR allow-list, e.g. ["10.0.0.0/8", "192.0.2.7"]. Empty = any host.
+                              # Matched against the peer address; X-Forwarded-For is never trusted.
+api_key = ""                  # Require "Authorization: Bearer <key>" on each scrape. Empty = no token.
+                              # NOTE: metrics are always served over plain HTTP (tls is ignored here),
+                              # so terminate TLS in front if the token crosses an untrusted network.
+
 enable_domain_metrics = true
 enable_user_metrics = false  # CAUTION: high cardinality, for small deployments only.
 user_metrics_threshold = 1000

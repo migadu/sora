@@ -922,7 +922,7 @@ func (s *POP3Server) Authenticate(ctx context.Context, address, password string)
 		// Cache negative result if enabled (user not found)
 		if s.lookupCache != nil {
 			// AuthUserNotFound = 1 (from lookupcache package)
-			s.lookupCache.SetFailure(address, 1, password)
+			s.lookupCache.SetFailure(address, 1)
 		}
 		logger.Info("authentication failed", "address", address, "reason", "user_not_found", "cached", false, "method", "main_db")
 		return 0, err
@@ -933,7 +933,7 @@ func (s *POP3Server) Authenticate(ctx context.Context, address, password string)
 		// Cache negative result for invalid password if enabled
 		if s.lookupCache != nil {
 			// AuthInvalidPassword = 2 (from lookupcache package)
-			s.lookupCache.SetFailure(address, 2, password)
+			s.lookupCache.SetFailure(address, 2)
 		}
 		logger.Info("authentication failed", "address", address, "reason", "invalid_password", "cached", false, "method", "main_db")
 		return 0, err

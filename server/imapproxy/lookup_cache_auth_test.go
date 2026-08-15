@@ -36,9 +36,9 @@ func TestCacheHitDoesNotDialBackend(t *testing.T) {
 
 	// Pre-populate a positive cache entry (as a previous successful DB auth would)
 	cache.Set("test", "user@example.com", &lookupcache.CacheEntry{
-		AccountID:    42,
-		PasswordHash: lookupcache.HashPassword("secret"),
-		Result:       lookupcache.AuthSuccess,
+		AccountID:      42,
+		PasswordDigest: lookupcache.NewPasswordDigest("secret"),
+		Result:         lookupcache.AuthSuccess,
 	})
 
 	client, remote := net.Pipe()

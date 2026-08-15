@@ -74,7 +74,7 @@ func TestLookupCache_FailureCache(t *testing.T) {
 	address := "nonexistent@example.com"
 
 	// Cache a failure (user not found)
-	cache.SetFailure(address, int(AuthUserNotFound), "anypassword")
+	cache.SetFailure(address, int(AuthUserNotFound))
 
 	// Verify it's cached
 	_, _, size, _ := cache.GetStats()
@@ -403,7 +403,7 @@ func TestLookupCache_NegativeCacheAllowsRevalidation(t *testing.T) {
 	password := "wrongpassword"
 
 	// Simulate a failed authentication - cache negative result
-	cache.SetFailure(address, int(AuthUserNotFound), password)
+	cache.SetFailure(address, int(AuthUserNotFound))
 
 	// Retry with same password - should ALWAYS allow revalidation
 	// This is critical because:

@@ -27,7 +27,7 @@ func TestProxyMethods_GetSetRefresh(t *testing.T) {
 	testEntry := &CacheEntry{
 		AccountID:              123,
 		HashedPassword:         "hashed123",
-		PasswordHash:           HashPassword("password123"),
+		PasswordDigest:         NewPasswordDigest("password123"),
 		ServerAddress:          "backend1.example.com:993",
 		RemoteTLS:              true,
 		RemoteTLSUseStartTLS:   false,
@@ -102,7 +102,7 @@ func TestProxyMethods_GetSetRefresh(t *testing.T) {
 	backendEntry := &CacheEntry{
 		AccountID:      456,
 		HashedPassword: "hashed456",
-		PasswordHash:   HashPassword("password456"),
+		PasswordDigest: NewPasswordDigest("password456"),
 		Result:         AuthSuccess,
 		CreatedAt:      time.Now(),
 		ExpiresAt:      time.Now().Add(5 * time.Minute),
@@ -130,7 +130,7 @@ func TestProxyMethods_ExpiredEntry(t *testing.T) {
 	entry := &CacheEntry{
 		AccountID:      789,
 		HashedPassword: "hash789",
-		PasswordHash:   HashPassword("pass789"),
+		PasswordDigest: NewPasswordDigest("pass789"),
 		Result:         AuthSuccess,
 		CreatedAt:      time.Now(),
 		ExpiresAt:      time.Now().Add(50 * time.Millisecond),
@@ -167,7 +167,7 @@ func TestProxyMethods_NegativeCache(t *testing.T) {
 	negativeEntry := &CacheEntry{
 		AccountID:      0,
 		HashedPassword: "",
-		PasswordHash:   HashPassword("wrongpass"),
+		PasswordDigest: NewPasswordDigest("wrongpass"),
 		Result:         AuthUserNotFound,
 		CreatedAt:      time.Now(),
 		ExpiresAt:      time.Now().Add(1 * time.Minute),
@@ -199,7 +199,7 @@ func TestClear(t *testing.T) {
 		entry := &CacheEntry{
 			AccountID:      int64(i),
 			HashedPassword: "hash",
-			PasswordHash:   HashPassword("pass"),
+			PasswordDigest: NewPasswordDigest("pass"),
 			Result:         AuthSuccess,
 			CreatedAt:      time.Now(),
 			ExpiresAt:      time.Now().Add(5 * time.Minute),
@@ -265,41 +265,8 @@ func TestMakeKey(t *testing.T) {
 	}
 }
 
-// TestHashPassword tests HashPassword edge cases
-func TestHashPassword(t *testing.T) {
-	// Empty password
-	hash1 := HashPassword("")
-	if hash1 != "" {
-		t.Error("Expected empty string for empty password")
-	}
-
-	// Same password should produce same hash
-	hash2 := HashPassword("testpass123")
-	hash3 := HashPassword("testpass123")
-	if hash2 != hash3 {
-		t.Error("Same password should produce same hash")
-	}
-
-	// Different passwords should produce different hashes
-	hash4 := HashPassword("different")
-	if hash2 == hash4 {
-		t.Error("Different passwords should produce different hashes")
-	}
-
-	// Hash should be deterministic and 64 characters (SHA-256 hex)
-	if len(hash2) != 64 {
-		t.Errorf("Expected 64 character hash, got %d", len(hash2))
-	}
-
-	// Unicode/special characters
-	hash5 := HashPassword("пароль中文🔐")
-	if hash5 == "" {
-		t.Error("Expected non-empty hash for unicode password")
-	}
-	if len(hash5) != 64 { // SHA-256 produces 64 hex characters
-		t.Errorf("Expected 64 character hex string, got %d", len(hash5))
-	}
-}
+// Password digest behaviour (the replacement for the old HashPassword) is
+// covered in digest_test.go.
 
 // TestProxyMethods_MaxSizeEviction tests that Set respects max size
 func TestProxyMethods_MaxSizeEviction(t *testing.T) {
@@ -312,7 +279,7 @@ func TestProxyMethods_MaxSizeEviction(t *testing.T) {
 		entry := &CacheEntry{
 			AccountID:      int64(i),
 			HashedPassword: "hash",
-			PasswordHash:   HashPassword("pass"),
+			PasswordDigest: NewPasswordDigest("pass"),
 			Result:         AuthSuccess,
 			CreatedAt:      time.Now(),
 			ExpiresAt:      time.Now().Add(5 * time.Minute),
@@ -331,7 +298,7 @@ func TestProxyMethods_MaxSizeEviction(t *testing.T) {
 	entry := &CacheEntry{
 		AccountID:      999,
 		HashedPassword: "hash999",
-		PasswordHash:   HashPassword("pass999"),
+		PasswordDigest: NewPasswordDigest("pass999"),
 		Result:         AuthSuccess,
 		CreatedAt:      time.Now(),
 		ExpiresAt:      time.Now().Add(5 * time.Minute),
@@ -371,7 +338,7 @@ func TestRefresh_TTLExtension(t *testing.T) {
 	entry := &CacheEntry{
 		AccountID:      123,
 		HashedPassword: "hash",
-		PasswordHash:   HashPassword("pass"),
+		PasswordDigest: NewPasswordDigest("pass"),
 		Result:         AuthSuccess,
 		CreatedAt:      time.Now(),
 		ExpiresAt:      time.Now().Add(positiveTTL),
@@ -401,7 +368,7 @@ func TestRefresh_TTLExtension(t *testing.T) {
 	negativeEntry := &CacheEntry{
 		AccountID:      0,
 		HashedPassword: "",
-		PasswordHash:   HashPassword("wrong"),
+		PasswordDigest: NewPasswordDigest("wrong"),
 		Result:         AuthFailed,
 		CreatedAt:      time.Now(),
 		ExpiresAt:      time.Now().Add(negativeTTL),

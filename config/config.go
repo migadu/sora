@@ -1090,7 +1090,7 @@ type SharedMailboxesConfig struct {
 type AdminCLIConfig struct {
 	Addr               string `toml:"addr"`                 // HTTP Admin API endpoint address
 	APIKey             string `toml:"api_key"`              // API key for authentication
-	InsecureSkipVerify *bool  `toml:"insecure_skip_verify"` // Skip TLS verification (default: true)
+	InsecureSkipVerify *bool  `toml:"insecure_skip_verify"` // Skip TLS verification (default: auto; true for loopback, false for remote)
 	ImportMessageLimit string `toml:"import_message_limit"` // Maximum message size for import operations (e.g., "50mb")
 }
 
@@ -1980,6 +1980,9 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.TLSUseStartTLS {
 			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to protocol servers (IMAP, POP3, LMTP, ManageSieve)", s.Name, s.Type)
+		}
+		if s.Type == "metrics" && s.TLS {
+			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)
 		}
 	}
 }

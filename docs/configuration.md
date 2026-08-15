@@ -157,6 +157,27 @@ min_bytes_per_minute = 512
 *   `[servers.metrics]`: Enable and configure the Prometheus metrics endpoint.
 *   `[servers.http_api]`: Enable and configure the administrative REST API. Requires setting a secure `api_key`.
 
+#### Restricting the metrics endpoint
+
+The metrics endpoint is served without access control unless you configure one. It exposes per-domain (and, with `enable_user_metrics`, per-user) activity along with a detailed view of internal state, so restrict it on any network that is not fully trusted:
+
+*   `allowed_hosts`: IP/CIDR allow-list, matched against the connecting peer address. Forwarded headers (`X-Forwarded-For`, `X-Real-IP`) are ignored — they are attacker-controlled and the metrics listener does not parse PROXY protocol.
+*   `api_key`: requires `Authorization: Bearer <key>` on every scrape, compared in constant time.
+
+Both are optional and enforced independently — set both and a scrape must come from an allowed host *and* present the token.
+
+```toml
+[[server]]
+type = "metrics"
+name = "prometheus-metrics"
+addr = "10.0.0.5:9090"                  # Bind to a private interface, not 0.0.0.0
+path = "/metrics"
+allowed_hosts = ["10.0.0.0/8"]          # Prometheus scrapers only
+api_key = "your-metrics-scrape-key"     # Optional bearer token
+```
+
+Prometheus sends the token with `authorization: {type: Bearer, credentials: <key>}` in the scrape config. The endpoint is always plain HTTP (`tls` is ignored on a metrics server, and warned about at startup) — terminate TLS in front of it if a token has to cross an untrusted network. Sora logs a warning at startup if a metrics listener with neither control is bound to a publicly reachable address.
+
 ### `[cluster]`
 
 Enables gossip-based clustering for TLS certificate management, rate limiting synchronization, and connection tracking.

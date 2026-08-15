@@ -279,13 +279,10 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// Use server name as cache key to avoid collisions between different proxies/servers
 	if s.server.lookupCache != nil {
 		if cached, found := s.server.lookupCache.Get(s.server.name, username); found {
-			// Hash the password (never empty - validated at function start)
-			passwordHash := lookupcache.HashPassword(password)
-
-			// Check password hash match
-			// Note: cached.PasswordHash should also never be empty, but we check defensively
-			// in case of cache corruption or edge cases
-			passwordMatches := (cached.PasswordHash != "" && cached.PasswordHash == passwordHash)
+			// Does this login use the same password the entry was cached with?
+			// Constant-time, and false for an entry that carries no digest (cache
+			// corruption, or a negative entry written by a path that has no password).
+			passwordMatches := cached.PasswordDigest.Matches(password)
 
 			if cached.IsNegative {
 				// Negative cache entry - authentication previously failed
@@ -518,15 +515,11 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				// Cache successful authentication with routing info
 				// CRITICAL: Cache key is submitted username (e.g., "user@TOKEN")
 				// BUT store ActualEmail so cache hits can use the resolved address
-				// Always hash password, even for master auth, to prevent cache bypass
+				// Always digest the password, even for master auth, to prevent cache bypass
 				if s.server.lookupCache != nil {
-					passwordHash := ""
-					if password != "" {
-						passwordHash = lookupcache.HashPassword(password)
-					}
 					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 						AccountID:              routingInfo.AccountID,
-						PasswordHash:           passwordHash,
+						PasswordDigest:         lookupcache.NewPasswordDigest(password),
 						ActualEmail:            resolvedEmail, // Store resolved email for cache hits
 						ServerAddress:          routingInfo.ServerAddress,
 						RemoteTLS:              routingInfo.RemoteTLS,
@@ -574,14 +567,10 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 				// Cache negative result (wrong password)
 				if s.server.lookupCache != nil {
-					passwordHash := ""
-					if password != "" {
-						passwordHash = lookupcache.HashPassword(password)
-					}
 					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-						PasswordHash: passwordHash,
-						Result:       lookupcache.AuthFailed,
-						IsNegative:   true,
+						PasswordDigest: lookupcache.NewPasswordDigest(password),
+						Result:         lookupcache.AuthFailed,
+						IsNegative:     true,
 					})
 				}
 
@@ -681,14 +670,10 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 			if isDefinitiveFailure {
 				if s.server.lookupCache != nil {
-					passwordHash := ""
-					if password != "" {
-						passwordHash = lookupcache.HashPassword(password)
-					}
 					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-						PasswordHash: passwordHash,
-						Result:       lookupcache.AuthFailed,
-						IsNegative:   true,
+						PasswordDigest: lookupcache.NewPasswordDigest(password),
+						Result:         lookupcache.AuthFailed,
+						IsNegative:     true,
 					})
 				}
 				// Single consolidated log for authentication failure
@@ -735,13 +720,9 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 	// Cache successful authentication (main DB)
 	if s.server.lookupCache != nil {
-		passwordHash := ""
-		if password != "" {
-			passwordHash = lookupcache.HashPassword(password)
-		}
 		s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
 			AccountID:        accountID,
-			PasswordHash:     passwordHash,
+			PasswordDigest:   lookupcache.NewPasswordDigest(password),
 			ServerAddress:    "", // Will be populated by affinity/routing in next connection
 			Result:           lookupcache.AuthSuccess,
 			FromRemoteLookup: false,

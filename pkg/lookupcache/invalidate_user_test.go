@@ -39,9 +39,9 @@ func TestInvalidateUserKeyParity(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c.Set(tc.serverName, tc.username, &CacheEntry{
-				AccountID:    42,
-				PasswordHash: HashPassword("secret"),
-				Result:       AuthSuccess,
+				AccountID:      42,
+				PasswordDigest: NewPasswordDigest("secret"),
+				Result:         AuthSuccess,
 			})
 			if _, found := c.Get(tc.serverName, tc.username); !found {
 				t.Fatal("entry not found immediately after Set")

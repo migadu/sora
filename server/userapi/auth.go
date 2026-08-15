@@ -159,7 +159,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			db.DummyVerifyPassword(req.Password)
 			// Cache negative result if cache enabled (result=1 for user not found)
 			if s.authCache != nil {
-				s.authCache.SetFailure(req.Email, 1, req.Password)
+				s.authCache.SetFailure(req.Email, 1)
 			}
 			// Record failed attempt
 			if s.authLimiter != nil {
@@ -178,7 +178,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if err := db.VerifyPassword(hashedPassword, req.Password); err != nil {
 		// Cache negative result if cache enabled (result=2 for invalid password)
 		if s.authCache != nil {
-			s.authCache.SetFailure(req.Email, 2, req.Password)
+			s.authCache.SetFailure(req.Email, 2)
 		}
 		// Record failed attempt
 		if s.authLimiter != nil {

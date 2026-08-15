@@ -316,8 +316,8 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		}
 
 		if !options.TLSVerify {
-			backend.tlsConfig.InsecureSkipVerify = true
-			logger.Debug("tls certificate verification disabled", "name", name)
+			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
+			logger.Debug("LMTP: WARNING - Client TLS certificate verification not enforced", "name", name)
 		}
 	} else if options.TLS && options.TLSConfig != nil {
 		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)

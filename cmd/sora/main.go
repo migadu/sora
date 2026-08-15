@@ -1185,6 +1185,15 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 				logger.Warn("plaintext authentication is allowed without TLS on a publicly reachable address; configure TLS or set insecure_auth=false",
 					"type", server.Type, "name", server.Name, "addr", server.Addr)
 			}
+		case "metrics":
+			// The metrics endpoint exposes per-domain (optionally per-user) activity
+			// and a detailed view of internal state, and it has no access control
+			// unless one is configured. Same reachability test as above, so the usual
+			// private-network scrape stays quiet.
+			if len(server.AllowedHosts) == 0 && server.APIKey == "" && helpers.BindIsPubliclyReachable(server.Addr) {
+				logger.Warn("metrics endpoint is served without access control on a publicly reachable address; set allowed_hosts and/or api_key",
+					"type", server.Type, "name", server.Name, "addr", server.Addr)
+			}
 		}
 
 		switch server.Type {
@@ -1714,7 +1723,7 @@ func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, se
 	defer deps.serverManager.Done()
 
 	mux := http.NewServeMux()
-	mux.Handle(serverConfig.Path, promhttp.Handler())
+	mux.Handle(serverConfig.Path, metricsAccessGuard(serverConfig.AllowedHosts, serverConfig.APIKey, promhttp.Handler()))
 
 	server := &http.Server{
 		Addr:    serverConfig.Addr,
