@@ -119,42 +119,24 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		s.currentHighestModSeq.Store(poll.ModSeq)
 	}
 
-	// First, check for state desync and update message count if needed
+	// A count increase is deliberately NOT queued here: it is queued by the final
+	// reconciliation below, after the expunges. Ordering is load-bearing twice over.
+	//
+	// On the wire, RFC 3501 §7.4.1 bars EXPUNGE responses from FETCH/STORE/SEARCH, so
+	// those commands poll with allowExpunge=false and SessionTracker.Poll emits the
+	// leading non-expunge updates and stops at the first queued expunge. Queueing
+	// EXISTS first therefore ships `* N EXISTS` while `* n EXPUNGE` stays behind, and
+	// the client applies a larger total to a sequence space it was never told changed —
+	// a silent seqnum desync that only heals on some later NOOP.
+	//
+	// In the tracker, db.PollMailbox numbers expunges in the client's *pre-poll* view
+	// (created_modseq <= sinceModSeq), so those sequence numbers are only meaningful
+	// while the count still excludes the messages appended in this same window.
+	//
+	// The EXISTS is deferred, never dropped: the reconciliation below always queues it,
+	// and it reaches the client on the next expunge-permitting poll (NOOP/IDLE/CHECK).
 	currentCount := s.currentNumMessages.Load()
-	if poll.NumMessages > currentCount {
-		// New messages arrived
-		s.DebugLog("updating message count", "old_count", currentCount, "new_count", poll.NumMessages)
-
-		// Protect against panic if tracker.numMessages > poll.NumMessages due to race
-		// This can happen if there's a desync between currentNumMessages and tracker's internal count
-		panicOccurred := false
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					panicOccurred = true
-					s.WarnLog("tracker desync detected - cannot update message count",
-						"error", r,
-						"old_count", currentCount,
-						"new_count", poll.NumMessages,
-						"mailbox_id", mailboxID)
-				}
-			}()
-			s.mailboxTracker.QueueNumMessages(poll.NumMessages)
-		}()
-
-		// If we couldn't update the tracker due to desync, the only safe option
-		// is to disconnect this session to force a fresh SELECT and rebuild tracker state
-		if panicOccurred {
-			s.WarnLog("forcing disconnection due to tracker desync")
-			release()
-			return &imap.Error{
-				Type: imap.StatusResponseTypeBye,
-				Code: imap.ResponseCodeUnavailable,
-				Text: "Mailbox state changed externally, please reconnect",
-			}
-		}
-		s.currentNumMessages.Store(poll.NumMessages)
-	} else if poll.NumMessages < currentCount {
+	if poll.NumMessages < currentCount {
 		// Database has fewer messages - check if there are expunge updates to explain it
 		hasExpungeUpdates := false
 		for _, update := range poll.Updates {

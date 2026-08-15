@@ -26,7 +26,7 @@ func TestThunderingHerdPrevention(t *testing.T) {
 		return &CacheEntry{
 			AccountID:      123,
 			HashedPassword: "hash123",
-			PasswordHash:   HashPassword("password123"),
+			PasswordDigest: NewPasswordDigest("password123"),
 			Result:         AuthSuccess,
 			CreatedAt:      time.Now(),
 			ExpiresAt:      time.Now().Add(5 * time.Minute),
@@ -118,7 +118,7 @@ func TestThunderingHerdPreventionMultipleKeys(t *testing.T) {
 					return &CacheEntry{
 						AccountID:      int64(100 + keyIdx),
 						HashedPassword: "hash" + user,
-						PasswordHash:   HashPassword("password"),
+						PasswordDigest: NewPasswordDigest("password"),
 						Result:         AuthSuccess,
 						CreatedAt:      time.Now(),
 						ExpiresAt:      time.Now().Add(5 * time.Minute),
@@ -217,7 +217,7 @@ func TestCacheHitDoesNotUseSingleflight(t *testing.T) {
 		return &CacheEntry{
 			AccountID:      456,
 			HashedPassword: "hash456",
-			PasswordHash:   HashPassword("password456"),
+			PasswordDigest: NewPasswordDigest("password456"),
 			Result:         AuthSuccess,
 			CreatedAt:      time.Now(),
 			ExpiresAt:      time.Now().Add(5 * time.Minute),

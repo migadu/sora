@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 )
 
@@ -12,6 +13,7 @@ import (
 type ConsistentHash struct {
 	ring         map[uint64]string // hash → backend address
 	sortedHashes []uint64          // sorted hash values
+	backends     []string          // backend addresses, kept sorted
 	virtualNodes int               // number of virtual nodes per backend
 	mu           sync.RWMutex
 }
@@ -26,6 +28,7 @@ func NewConsistentHash(virtualNodes int) *ConsistentHash {
 	return &ConsistentHash{
 		ring:         make(map[uint64]string),
 		sortedHashes: make([]uint64, 0),
+		backends:     make([]string, 0),
 		virtualNodes: virtualNodes,
 	}
 }
@@ -35,15 +38,16 @@ func (ch *ConsistentHash) AddBackend(backend string) {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 
-	for i := 0; i < ch.virtualNodes; i++ {
-		hash := ch.hash(backend, i)
-		ch.ring[hash] = backend
-		ch.sortedHashes = append(ch.sortedHashes, hash)
+	idx := sort.SearchStrings(ch.backends, backend)
+	if idx < len(ch.backends) && ch.backends[idx] == backend {
+		return
 	}
 
-	sort.Slice(ch.sortedHashes, func(i, j int) bool {
-		return ch.sortedHashes[i] < ch.sortedHashes[j]
-	})
+	ch.backends = append(ch.backends, "")
+	copy(ch.backends[idx+1:], ch.backends[idx:])
+	ch.backends[idx] = backend
+
+	ch.rebuild()
 }
 
 // RemoveBackend removes a backend from the hash ring
@@ -51,15 +55,35 @@ func (ch *ConsistentHash) RemoveBackend(backend string) {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 
-	for i := 0; i < ch.virtualNodes; i++ {
-		hash := ch.hash(backend, i)
-		delete(ch.ring, hash)
+	idx := sort.SearchStrings(ch.backends, backend)
+	if idx >= len(ch.backends) || ch.backends[idx] != backend {
+		return
 	}
 
-	// Rebuild sorted hashes
-	ch.sortedHashes = make([]uint64, 0, len(ch.ring))
-	for hash := range ch.ring {
-		ch.sortedHashes = append(ch.sortedHashes, hash)
+	ch.backends = append(ch.backends[:idx], ch.backends[idx+1:]...)
+
+	ch.rebuild()
+}
+
+// rebuild recomputes the ring from the current backend set. Placement depends only on
+// that set, never on the order AddBackend/RemoveBackend was called in, so every proxy
+// derives the same ring from the same pool across restarts.
+func (ch *ConsistentHash) rebuild() {
+	ch.ring = make(map[uint64]string, len(ch.backends)*ch.virtualNodes)
+	ch.sortedHashes = make([]uint64, 0, len(ch.backends)*ch.virtualNodes)
+
+	occurrences := make(map[string]int, len(ch.backends))
+
+	for _, backend := range ch.backends {
+		host := backendHost(backend)
+		occurrence := occurrences[host]
+		occurrences[host]++
+
+		for i := 0; i < ch.virtualNodes; i++ {
+			hash := ch.hash(backend, occurrence, i)
+			ch.ring[hash] = backend
+			ch.sortedHashes = append(ch.sortedHashes, hash)
+		}
 	}
 
 	sort.Slice(ch.sortedHashes, func(i, j int) bool {
@@ -128,17 +152,18 @@ func (ch *ConsistentHash) GetAllBackends() []string {
 	ch.mu.RLock()
 	defer ch.mu.RUnlock()
 
-	seen := make(map[string]bool)
-	backends := make([]string, 0)
-
-	for _, backend := range ch.ring {
-		if !seen[backend] {
-			seen[backend] = true
-			backends = append(backends, backend)
-		}
-	}
+	backends := make([]string, len(ch.backends))
+	copy(backends, ch.backends)
 
 	return backends
+}
+
+// backendHost strips the port from a backend address, if it has one
+func backendHost(backend string) string {
+	if host, _, err := net.SplitHostPort(backend); err == nil {
+		return host
+	}
+	return backend
 }
 
 // hash generates a hash for a backend and virtual node index.
@@ -146,11 +171,12 @@ func (ch *ConsistentHash) GetAllBackends() []string {
 // LMTP :24, etc.) produce identical ring positions for the same backend machines.
 // This ensures cross-protocol cache locality: the same user maps to the same machine
 // regardless of which protocol proxy handles the connection.
-func (ch *ConsistentHash) hash(backend string, vnodeIndex int) uint64 {
-	// Extract hostname only — ignore port for consistent cross-protocol hashing
-	hashKey := backend
-	if host, _, err := net.SplitHostPort(backend); err == nil {
-		hashKey = host
+// occurrence separates several backends sharing one host; occurrence 0 hashes by the
+// bare hostname, so a host running a single instance keeps that cross-protocol position.
+func (ch *ConsistentHash) hash(backend string, occurrence, vnodeIndex int) uint64 {
+	hashKey := backendHost(backend)
+	if occurrence > 0 {
+		hashKey += "#" + strconv.Itoa(occurrence)
 	}
 
 	h := sha256.New()
@@ -174,9 +200,5 @@ func (ch *ConsistentHash) Size() int {
 	ch.mu.RLock()
 	defer ch.mu.RUnlock()
 
-	seen := make(map[string]bool)
-	for _, backend := range ch.ring {
-		seen[backend] = true
-	}
-	return len(seen)
+	return len(ch.backends)
 }

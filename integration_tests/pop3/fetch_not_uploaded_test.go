@@ -177,6 +177,11 @@ func setupPOP3RaceServerWithS3(t *testing.T, s3Storage *storage.S3Storage) (*TDD
 		t.Fatalf("baseServer.Server is not *pop3.POP3Server")
 	}
 
+	// Bind a FRESH port rather than reusing the one just closed: Close() returns before
+	// its accept loop releases the socket, so an immediate rebind intermittently fails
+	// with "address already in use". See SetupPOP3ServerWithUploader for the measurement.
+	baseServer.Address = common.GetRandomAddress(t)
+
 	tempDir, err := os.MkdirTemp("", "sora-pop3-race-upload-*")
 	if err != nil {
 		baseServer.Close()
@@ -227,7 +232,9 @@ func setupPOP3RaceServerWithS3(t *testing.T, s3Storage *storage.S3Storage) (*TDD
 	go func() {
 		server.Start(errChan)
 	}()
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the listener rather than sleeping: a bind failure otherwise goes to a
+	// channel nobody reads and surfaces as an unattributed "connection refused".
+	waitForPOP3Listener(t, baseServer.Address, errChan)
 
 	baseServer.Server = server
 

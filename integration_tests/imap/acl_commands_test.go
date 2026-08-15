@@ -197,6 +197,15 @@ func TestACL_STORE_Permission(t *testing.T) {
 		t.Fatalf("Failed to add 's' right: %v", err)
 	}
 
+	// Re-SELECT to pick up the new rights. A mailbox opened while the user held no
+	// write right is selected READ-ONLY (RFC 4314 §5.2), and that state belongs to
+	// the selection, not to the current ACL: RFC 3501 §6.3.1 fixes it for as long as
+	// the mailbox stays selected, so mutating commands keep being refused on this
+	// selection however the rights change underneath it.
+	if _, err := c2.Select(sharedMailbox, nil).Wait(); err != nil {
+		t.Fatalf("Failed to re-SELECT after the ACL change: %v", err)
+	}
+
 	storeCmd = c2.Store(imap.SeqSetNum(1), &imap.StoreFlags{
 		Op:    imap.StoreFlagsAdd,
 		Flags: []imap.Flag{imap.FlagSeen},

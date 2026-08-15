@@ -117,9 +117,12 @@ func (c *connectionLimitingConn) Close() error {
 }
 
 type LMTPServerBackend struct {
-	addr           string
-	name           string
-	hostname       string
+	addr     string
+	name     string
+	hostname string
+	// instanceID keys the upload lease (pending_uploads.instance_id). Distinct from
+	// hostname, which is published in the Received header this server stamps.
+	instanceID     string
 	rdb            *resilient.ResilientDatabase
 	s3             *storage.S3Storage
 	uploader       *uploader.UploadWorker
@@ -157,8 +160,9 @@ type LMTPServerBackend struct {
 	// Fails closed: empty = trust nobody (no RFC1918 default), unlike trustedNetworks. (M2)
 	xclientTrustedNets []*net.IPNet
 
-	// Sieve script caching
-	sieveCache           *SieveScriptCache
+	// Sieve extensions enabled for user scripts, and the default script (parsed once at
+	// startup). User scripts are compiled through sieveengine.SharedScriptCache().
+	sieveExtensions      []string
 	defaultSieveExecutor sieveengine.Executor
 
 	// PROXY protocol support
@@ -171,6 +175,9 @@ type RelayWorkerNotifier interface {
 }
 
 type LMTPServerOptions struct {
+	// InstanceID is the upload-lease key. Empty falls back to the hostname argument,
+	// which is what every caller used before the two identities were separated.
+	InstanceID                  string
 	RelayQueue                  delivery.RelayQueue // Global relay queue for Sieve redirect/vacation
 	RelayWorker                 RelayWorkerNotifier // Optional: notifies worker for immediate processing
 	Debug                       bool
@@ -231,6 +238,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		name:               name,
 		appCtx:             appCtx,
 		hostname:           hostname,
+		instanceID:         instanceIDOrHostname(options.InstanceID, hostname),
 		rdb:                rdb,
 		s3:                 s3,
 		uploader:           uploadWorker,
@@ -272,17 +280,15 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		backend.listenBacklog = 1024 // Default backlog
 	}
 
-	// Initialize Sieve script cache with a reasonable default size and TTL
-	// 5 minute TTL ensures cross-server updates are picked up relatively quickly
-	backend.sieveCache = NewSieveScriptCache(100, 5*time.Minute, options.SieveExtensions)
+	// Sieve extensions for both the default script and the users' scripts (or the
+	// default set if not configured)
+	backend.sieveExtensions = options.SieveExtensions
+	if len(backend.sieveExtensions) == 0 {
+		backend.sieveExtensions = sieveengine.DefaultSieveExtensions
+	}
 
 	// Parse and cache the default Sieve script at startup
-	// Use the same extensions as configured for user scripts (or all if not specified)
-	defaultExtensions := options.SieveExtensions
-	if len(defaultExtensions) == 0 {
-		defaultExtensions = sieveengine.DefaultSieveExtensions
-	}
-	defaultExecutor, err := sieveengine.NewSieveExecutorWithExtensions(defaultSieveScript, defaultExtensions)
+	defaultExecutor, err := sieveengine.NewSieveExecutorWithExtensions(defaultSieveScript, backend.sieveExtensions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse default Sieve script: %w", err)
 	}
@@ -310,8 +316,8 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		}
 
 		if !options.TLSVerify {
-			backend.tlsConfig.InsecureSkipVerify = true
-			logger.Debug("tls certificate verification disabled", "name", name)
+			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
+			logger.Debug("LMTP: WARNING - Client TLS certificate verification not enforced", "name", name)
 		}
 	} else if options.TLS && options.TLSConfig != nil {
 		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
@@ -649,4 +655,15 @@ func (b *LMTPServerBackend) monitorActiveConnections() {
 // GetLimiter returns the connection limiter for testing purposes
 func (b *LMTPServerBackend) GetLimiter() *server.ConnectionLimiter {
 	return b.limiter
+}
+
+// instanceIDOrHostname resolves the upload-lease identity, defaulting to the SMTP-visible
+// hostname. The fallback exists so that a caller which never learned about the split keeps
+// a self-consistent identity rather than writing an empty instance_id, which no upload
+// worker would ever claim.
+func instanceIDOrHostname(instanceID, hostname string) string {
+	if instanceID != "" {
+		return instanceID
+	}
+	return hostname
 }

@@ -199,7 +199,52 @@ func TestExpungeOldMessages(t *testing.T) {
 	t.Logf("Successfully tested ExpungeOldMessages with email: %s", testEmail)
 }
 
-// TestCleanupFailedUploads tests cleanup of messages that failed to upload to S3
+// TestExpungeOldMessagesDetachedFromMailbox covers the candidate that has no mailbox to
+// lock: messages.mailbox_id is ON DELETE SET NULL, so a message whose mailbox was hard
+// deleted is still an over-age candidate and must still be expunged.
+func TestExpungeOldMessagesDetachedFromMailbox(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, _, accountID, _ := setupCleanerTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	detachedHash := fmt.Sprintf("detached_expunge_%d", time.Now().UnixNano())
+
+	_, err := db.GetWritePool().Exec(ctx, `
+		INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size,
+		                      uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json,
+		                      created_modseq, created_at)
+		VALUES ($1, NULL, 1, $2, now(), now(), 100, TRUE, 'domain', 'part', $3, 'body', '[]',
+		        nextval('messages_modseq'), now() - interval '72 hours')
+	`, accountID, detachedHash, "msgid-"+detachedHash)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = db.GetWritePool().Exec(context.Background(),
+			`DELETE FROM messages WHERE content_hash = $1`, detachedHash)
+	})
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(context.Background())
+
+	claimed, err := db.ExpungeOldMessages(ctx, tx, 48*time.Hour)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit(ctx))
+	require.Positive(t, claimed)
+
+	var expungedAt *time.Time
+	require.NoError(t, db.GetReadPool().QueryRow(ctx,
+		`SELECT expunged_at FROM messages WHERE content_hash = $1`, detachedHash).Scan(&expungedAt))
+	assert.NotNil(t, expungedAt, "a detached over-age message must still be expunged")
+}
+
+// TestCleanupFailedUploads tests cleanup of messages that failed to upload to S3.
+// A message is only reaped when it is BOTH older than the grace period AND its upload
+// has exhausted max_attempts: the uploader leaves attempts untouched for transient S3
+// errors, so an old row with attempts left is still deliverable and must survive.
 func TestCleanupFailedUploads(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -211,63 +256,66 @@ func TestCleanupFailedUploads(t *testing.T) {
 	ctx := context.Background()
 	testTimestamp := time.Now().UnixNano()
 
+	const maxAttempts = 20
+
 	// Setup: Create failed upload scenarios
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
 
-	// Create old failed upload (should be cleaned up)
-	oldFailedHash := fmt.Sprintf("old_failed_%d", testTimestamp)
-	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
-		VALUES ($1, 'failed upload content', to_tsvector('english', 'failed upload content'))
-	`, oldFailedHash)
-	require.NoError(t, err)
+	// attempts < 0 inserts no pending_uploads row at all
+	insertFailedUpload := func(hash string, uid int, createdAt time.Time, attempts int) {
+		t.Helper()
 
-	oldCreatedAt := time.Now().Add(-25 * time.Hour) // 25 hours old
-	_, err = tx.Exec(ctx, `
-		WITH inserted AS (
-				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
-		VALUES ($1, $2, 200, $3, $4, $4, 100, FALSE, 'domain', 'part', 'msgid200', 'body', '[]', 200, $5)
-				RETURNING id, mailbox_id
-			)
-			INSERT INTO message_state (message_id, mailbox_id, flags)
-			SELECT id, mailbox_id, 0 FROM inserted
-	`, accountID, mailboxID, oldFailedHash, time.Now(), oldCreatedAt)
-	require.NoError(t, err)
+		_, err := tx.Exec(ctx, `
+			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
+			VALUES ($1, 'failed upload content', to_tsvector('english', 'failed upload content'))
+		`, hash)
+		require.NoError(t, err)
 
-	// Add to pending uploads
-	_, err = tx.Exec(ctx, `
-		INSERT INTO pending_uploads (account_id, content_hash, size, instance_id)
-		VALUES ($1, $2, 100, 'test-instance')
-	`, accountID, oldFailedHash)
-	require.NoError(t, err)
+		_, err = tx.Exec(ctx, `
+			WITH inserted AS (
+					INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
+			VALUES ($1, $2, $3, $4, $5, $5, 100, FALSE, 'domain', 'part', $6, 'body', '[]', $3, $7)
+					RETURNING id, mailbox_id
+				)
+				INSERT INTO message_state (message_id, mailbox_id, flags)
+				SELECT id, mailbox_id, 0 FROM inserted
+		`, accountID, mailboxID, uid, hash, time.Now(), fmt.Sprintf("msgid%d", uid), createdAt)
+		require.NoError(t, err)
 
-	// Create recent failed upload (should NOT be cleaned up)
-	recentFailedHash := fmt.Sprintf("recent_failed_%d", testTimestamp)
-	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
-		VALUES ($1, 'recent failed content', to_tsvector('english', 'recent failed content'))
-	`, recentFailedHash)
-	require.NoError(t, err)
+		if attempts < 0 {
+			return
+		}
 
+		// A per-run instance_id keeps this test's liveness verdict independent of
+		// heartbeat rows left behind by other tests in the shared database.
+		_, err = tx.Exec(ctx, `
+			INSERT INTO pending_uploads (account_id, content_hash, size, instance_id, attempts)
+			VALUES ($1, $2, 100, $4, $3)
+		`, accountID, hash, attempts, fmt.Sprintf("test-instance-%d", testTimestamp))
+		require.NoError(t, err)
+	}
+
+	oldCreatedAt := time.Now().Add(-25 * time.Hour)   // 25 hours old
 	recentCreatedAt := time.Now().Add(-5 * time.Hour) // 5 hours old
-	_, err = tx.Exec(ctx, `
-		WITH inserted AS (
-				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
-		VALUES ($1, $2, 201, $3, $4, $4, 100, FALSE, 'domain', 'part', 'msgid201', 'body', '[]', 201, $5)
-				RETURNING id, mailbox_id
-			)
-			INSERT INTO message_state (message_id, mailbox_id, flags)
-			SELECT id, mailbox_id, 0 FROM inserted
-	`, accountID, mailboxID, recentFailedHash, time.Now(), recentCreatedAt)
-	require.NoError(t, err)
 
-	_, err = tx.Exec(ctx, `
-		INSERT INTO pending_uploads (account_id, content_hash, size, instance_id)
-		VALUES ($1, $2, 100, 'test-instance')
-	`, accountID, recentFailedHash)
-	require.NoError(t, err)
+	// Old upload that was given up on (should be cleaned up)
+	oldFailedHash := fmt.Sprintf("old_failed_%d", testTimestamp)
+	insertFailedUpload(oldFailedHash, 200, oldCreatedAt, maxAttempts)
+
+	// Recent upload that was given up on (should NOT be cleaned up: still in grace period)
+	recentFailedHash := fmt.Sprintf("recent_failed_%d", testTimestamp)
+	insertFailedUpload(recentFailedHash, 201, recentCreatedAt, maxAttempts)
+
+	// Old upload still being retried (should NOT be cleaned up: recoverable once S3 returns)
+	oldRetryingHash := fmt.Sprintf("old_retrying_%d", testTimestamp)
+	insertFailedUpload(oldRetryingHash, 202, oldCreatedAt, 0)
+
+	// Old message left without any pending upload, as HardDeleteAccounts leaves them:
+	// nothing will ever upload it, so it must be cleaned up
+	oldUnqueuedHash := fmt.Sprintf("old_unqueued_%d", testTimestamp)
+	insertFailedUpload(oldUnqueuedHash, 203, oldCreatedAt, -1)
 
 	err = tx.Commit(ctx)
 	require.NoError(t, err)
@@ -277,7 +325,7 @@ func TestCleanupFailedUploads(t *testing.T) {
 	require.NoError(t, err)
 	defer tx2.Rollback(ctx)
 
-	cleaned, err := db.CleanupFailedUploads(ctx, tx2, 24*time.Hour)
+	cleaned, err := db.CleanupFailedUploads(ctx, tx2, 24*time.Hour, maxAttempts, time.Hour)
 	require.NoError(t, err)
 
 	err = tx2.Commit(ctx)
@@ -285,17 +333,43 @@ func TestCleanupFailedUploads(t *testing.T) {
 
 	t.Logf("Cleaned up %d failed uploads", cleaned)
 
-	// Verify old failed upload was removed
-	var oldExists int
-	err = db.GetReadPool().QueryRow(ctx, "SELECT COUNT(*) FROM messages WHERE content_hash = $1", oldFailedHash).Scan(&oldExists)
-	require.NoError(t, err)
-	assert.Equal(t, 0, oldExists, "Old failed upload should be removed")
+	countMessages := func(hash string) int {
+		t.Helper()
+		var n int
+		require.NoError(t, db.GetReadPool().QueryRow(ctx,
+			"SELECT COUNT(*) FROM messages WHERE content_hash = $1", hash).Scan(&n))
+		return n
+	}
+	countPending := func(hash string) int {
+		t.Helper()
+		var n int
+		require.NoError(t, db.GetReadPool().QueryRow(ctx,
+			"SELECT COUNT(*) FROM pending_uploads WHERE content_hash = $1", hash).Scan(&n))
+		return n
+	}
+
+	// Verify old exhausted upload was removed, together with its pending_uploads row
+	assert.Equal(t, 0, countMessages(oldFailedHash), "Old exhausted upload should be removed")
+	assert.Equal(t, 0, countPending(oldFailedHash), "Old exhausted pending upload should be removed")
 
 	// Verify recent failed upload still exists
-	var recentExists int
-	err = db.GetReadPool().QueryRow(ctx, "SELECT COUNT(*) FROM messages WHERE content_hash = $1", recentFailedHash).Scan(&recentExists)
+	assert.Equal(t, 1, countMessages(recentFailedHash), "Recent failed upload should still exist")
+	assert.Equal(t, 1, countPending(recentFailedHash), "Recent pending upload should still exist")
+
+	// Verify old upload with attempts left still exists
+	assert.Equal(t, 1, countMessages(oldRetryingHash), "Old upload with attempts left should still exist")
+	assert.Equal(t, 1, countPending(oldRetryingHash), "Old pending upload with attempts left should still exist")
+
+	// Verify old message without a pending upload was removed
+	assert.Equal(t, 0, countMessages(oldUnqueuedHash), "Old message with no pending upload should be removed")
+
+	// A non-positive max attempts would degenerate into deleting on age alone
+	tx3, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 1, recentExists, "Recent failed upload should still exist")
+	defer tx3.Rollback(ctx)
+
+	_, err = db.CleanupFailedUploads(ctx, tx3, 24*time.Hour, 0, time.Hour)
+	require.Error(t, err, "cleanup must refuse to run without a positive max attempts")
 
 	t.Logf("Successfully tested CleanupFailedUploads with email: %s", testEmail)
 }

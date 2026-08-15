@@ -81,21 +81,26 @@ func (sm *serverManager) Wait() {
 
 // serverDependencies encapsulates all shared services and dependencies needed by servers
 type serverDependencies struct {
-	storage               *storage.S3Storage
-	resilientDB           *resilient.ResilientDatabase
-	uploadWorker          *uploader.UploadWorker
-	cacheInstance         *cache.Cache
-	cleanupWorker         *cleaner.CleanupWorker
-	ftsWorker             *fts.Worker
-	relayQueue            *relayqueue.DiskQueue
-	relayWorker           *relayqueue.Worker
-	healthIntegration     *health.HealthIntegration
-	metricsCollector      *metrics.Collector
-	clusterManager        *cluster.Manager
-	tlsManager            *tlsmanager.Manager
-	affinityManager       *server.AffinityManager
-	spamTrainingClient    *spamtraining.Client // Spam filter training client (optional)
-	hostname              string
+	storage            *storage.S3Storage
+	resilientDB        *resilient.ResilientDatabase
+	uploadWorker       *uploader.UploadWorker
+	cacheInstance      *cache.Cache
+	cleanupWorker      *cleaner.CleanupWorker
+	ftsWorker          *fts.Worker
+	relayQueue         *relayqueue.DiskQueue
+	relayWorker        *relayqueue.Worker
+	healthIntegration  *health.HealthIntegration
+	metricsCollector   *metrics.Collector
+	clusterManager     *cluster.Manager
+	tlsManager         *tlsmanager.Manager
+	affinityManager    *server.AffinityManager
+	spamTrainingClient *spamtraining.Client // Spam filter training client (optional)
+	// hostname is this node's SMTP-visible name: greetings, the "by" host of the Received
+	// header, the domain of vacation Message-IDs, and metrics labels. Never the lease key.
+	hostname string
+	// instanceID is the upload-lease key written to pending_uploads.instance_id and
+	// instance_heartbeats.instance_id. Internal; never appears on the wire to a client.
+	instanceID            string
 	ftsRetention          time.Duration
 	config                config.Config
 	serverManager         *serverManager
@@ -508,9 +513,62 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	logger.Info("Found configured servers", "count", len(allServers))
 }
 
+// logInstanceIdentity records both of this node's resolved names once at startup. An
+// operator needs the instance id to read the cleanup worker's stranded-instance warnings,
+// which name the owner of unuploaded mail by exactly that string; and needs the mail
+// hostname because it is what other mail systems see.
+func logInstanceIdentity(identity config.NodeIdentity) {
+	osHostname, err := os.Hostname()
+
+	// Warn only about the identity that is actually unsafe. A node_id that differs from
+	// the hostname is the normal, intended configuration, so it must not warn on every
+	// boot; an id that no live instance owns is instead reported - by name, and only when
+	// one really exists - by the cleanup worker (cleaner.reportStrandedInstances).
+	if identity.InstanceID == config.FallbackInstanceID {
+		logger.Warn("Instance ID could not be derived from the host - using the fallback identity. "+
+			"Set cluster.node_id to a unique name per node: a shared instance id makes two nodes claim "+
+			"each other's pending uploads, whose message bodies only exist on the node that queued them",
+			"instance_id", identity.InstanceID, "error", err)
+	} else {
+		source := "hostname"
+		if identity.InstanceID != osHostname {
+			source = "cluster.node_id"
+		}
+		logger.Info("Resolved instance ID", "instance_id", identity.InstanceID, "source", source,
+			"note", "owner of this node's pending_uploads and instance_heartbeats rows; drain the upload queue before changing it")
+	}
+
+	// The mail hostname is not internal: it is the "by" host of the Received header stamped
+	// on every delivery, and the domain of the Message-ID on vacation auto-replies. Both are
+	// supposed to be fully qualified (RFC 5321 4.4), and a Message-ID whose domain does not
+	// resolve is a spam signal on a message the user did not choose to send. Note that
+	// cluster.node_id does NOT fix this - the mail hostname is taken from the host itself,
+	// so the remedy is to give the machine a fully-qualified name.
+	if !strings.Contains(identity.MailHostname, ".") {
+		logger.Warn("Mail hostname is not fully qualified - it appears in the Received header of every "+
+			"delivery and in the Message-ID of vacation auto-replies. Give this host an FQDN",
+			"mail_hostname", identity.MailHostname)
+	}
+	logger.Info("Resolved mail hostname", "mail_hostname", identity.MailHostname,
+		"note", "SMTP-visible name of this node: protocol greetings, Received 'by' host, vacation Message-ID domain")
+}
+
 // initializeServices initializes all core services (S3, database, cache, workers) if storage services are needed
 func initializeServices(ctx context.Context, cfg config.Config, errorHandler *errors.ErrorHandler) (*serverDependencies, error) {
-	hostname, _ := os.Hostname()
+	// This node's two names, resolved together so they cannot drift apart.
+	//
+	// instanceID is written to pending_uploads.instance_id (by the IMAP/LMTP/delivery
+	// append paths) and to instance_heartbeats.instance_id (by the upload worker); those
+	// two must agree or the cleaner reaps unuploaded mail owned by an instance that looks
+	// dead. See config.Config.InstanceID for the WARNING about changing it on a node with
+	// queued uploads.
+	//
+	// hostname is the SMTP-visible name and goes everywhere else. Keeping cluster.node_id
+	// out of it is deliberate: node_id is an internal label, and it was reaching the
+	// Received header of every delivery and the Message-ID of every vacation reply.
+	identity := cfg.NodeIdentity()
+	hostname, instanceID := identity.MailHostname, identity.InstanceID
+	logInstanceIdentity(identity)
 
 	// Determine if any mail storage services are enabled
 	allServers := cfg.GetAllServers()
@@ -555,6 +613,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	deps := &serverDependencies{
 		hostname:           hostname,
+		instanceID:         instanceID,
 		config:             cfg,
 		serverManager:      &serverManager{}, // Initialize server manager for coordinated shutdown
 		connectionTrackers: make(map[string]*server.ConnectionTracker),
@@ -733,10 +792,12 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 				case <-ctx.Done():
 					return
 				case <-metricsTicker.C:
-					metrics := deps.cacheInstance.GetMetrics(hostname)
+					metrics := deps.cacheInstance.GetMetrics(instanceID)
 					uptimeSeconds := int64(time.Since(metrics.StartTime).Seconds())
 
-					if err := deps.resilientDB.StoreCacheMetricsWithRetry(ctx, hostname, hostname, metrics.Hits, metrics.Misses, uptimeSeconds); err != nil {
+					// The cache_metrics row is keyed per instance and labelled with the host
+					// it runs on - the two columns exist precisely because they differ.
+					if err := deps.resilientDB.StoreCacheMetricsWithRetry(ctx, instanceID, hostname, metrics.Hits, metrics.Misses, uptimeSeconds); err != nil {
 						logger.Info("Cache: Failed to store metrics", "error", err)
 					}
 				case <-cleanupTicker.C:
@@ -756,9 +817,10 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		ftsRetention := cfg.Cleanup.GetFTSRetentionWithDefault()
 		deps.ftsRetention = ftsRetention
 		healthStatusRetention := cfg.Cleanup.GetHealthStatusRetentionWithDefault()
+		instanceLiveness := cfg.Cleanup.GetInstanceLivenessThresholdWithDefault()
 
 		cleanupErrChan := make(chan error, 1)
-		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, cleanupErrChan)
+		deps.cleanupWorker = cleaner.New(deps.resilientDB, deps.storage, deps.cacheInstance, wakeInterval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, cfg.Uploader.MaxAttempts, instanceLiveness, cleanupErrChan)
 		deps.ftsWorker = fts.NewWorker(deps.resilientDB)
 
 		// Start error listener for cleanup worker
@@ -786,7 +848,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			errorHandler.FatalError("parse uploader max_staging_size", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
-		deps.uploadWorker, err = uploader.New(ctx, cfg.Uploader.Path, cfg.Uploader.BatchSize, cfg.Uploader.Concurrency, cfg.Uploader.MaxAttempts, retryInterval, maxStagingSize, hostname, deps.resilientDB, deps.storage, deps.cacheInstance, uploadErrChan)
+		deps.uploadWorker, err = uploader.New(ctx, cfg.Uploader.Path, cfg.Uploader.BatchSize, cfg.Uploader.Concurrency, cfg.Uploader.MaxAttempts, retryInterval, maxStagingSize, instanceID, deps.resilientDB, deps.storage, deps.cacheInstance, uploadErrChan)
 		if err != nil {
 			errorHandler.FatalError("create upload worker", err)
 			os.Exit(errorHandler.WaitForExit())
@@ -1023,6 +1085,15 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			errorHandler.FatalError("initialize TLS manager", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
+		// Fence ACME issuance on the database when there is one. Gossip leadership alone
+		// is not a fence: cluster.electLeader has no quorum, so a network partition
+		// elects a leader on each side and both would order the same certificate.
+		if deps.resilientDB != nil {
+			deps.tlsManager.SetCertificateFence(certificateIssuanceFence{rdb: deps.resilientDB})
+			logger.Info("TLS certificate issuance fenced on the database")
+		} else {
+			logger.Info("TLS certificate issuance fenced on cluster leadership only - no database configured")
+		}
 		logger.Info("TLS manager initialized successfully")
 	}
 
@@ -1112,6 +1183,15 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 		case "imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy":
 			if (server.InsecureAuth || !server.TLS) && helpers.BindIsPubliclyReachable(server.Addr) {
 				logger.Warn("plaintext authentication is allowed without TLS on a publicly reachable address; configure TLS or set insecure_auth=false",
+					"type", server.Type, "name", server.Name, "addr", server.Addr)
+			}
+		case "metrics":
+			// The metrics endpoint exposes per-domain (optionally per-user) activity
+			// and a detailed view of internal state, and it has no access control
+			// unless one is configured. Same reachability test as above, so the usual
+			// private-network scrape stays quiet.
+			if len(server.AllowedHosts) == 0 && server.APIKey == "" && helpers.BindIsPubliclyReachable(server.Addr) {
+				logger.Warn("metrics endpoint is served without access control on a publicly reachable address; set allowed_hosts and/or api_key",
 					"type", server.Type, "name", server.Name, "addr", server.Addr)
 			}
 		}
@@ -1271,6 +1351,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 
 	s, err := imap.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance,
 		imap.IMAPServerOptions{
+			InstanceID:                   deps.instanceID,
 			Debug:                        serverConfig.Debug,
 			TLS:                          serverConfig.TLS,
 			TLSCertFile:                  serverConfig.TLSCertFile,
@@ -1380,6 +1461,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 	}
 
 	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
+		InstanceID:              deps.instanceID,
 		RelayQueue:              deps.relayQueue,  // Global relay queue
 		RelayWorker:             deps.relayWorker, // Global relay worker for immediate processing
 		TLSVerify:               serverConfig.TLSVerify,
@@ -1641,7 +1723,7 @@ func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, se
 	defer deps.serverManager.Done()
 
 	mux := http.NewServeMux()
-	mux.Handle(serverConfig.Path, promhttp.Handler())
+	mux.Handle(serverConfig.Path, metricsAccessGuard(serverConfig.AllowedHosts, serverConfig.APIKey, promhttp.Handler()))
 
 	server := &http.Server{
 		Addr:    serverConfig.Addr,
@@ -1673,6 +1755,10 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	defer deps.serverManager.Done()
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
+	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
+	if err != nil {
+		logger.Warn("IMAP proxy: invalid remote_dns_refresh - using default", "name", serverConfig.Name, "error", err)
+	}
 	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
 	authRateLimit := server.DefaultAuthRateLimiterConfig()
@@ -1726,6 +1812,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseIDCommand:       serverConfig.RemoteUseIDCommand,
 		ConnectTimeout:           connectTimeout,
+		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
 		CommandTimeout:           commandTimeout,
 		AbsoluteSessionTimeout:   absoluteSessionTimeout,
@@ -1801,6 +1888,10 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	defer deps.serverManager.Done()
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
+	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
+	if err != nil {
+		logger.Warn("POP3 proxy: invalid remote_dns_refresh - using default", "name", serverConfig.Name, "error", err)
+	}
 	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
 	authRateLimit := server.DefaultAuthRateLimiterConfig()
@@ -1855,6 +1946,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseXCLIENT:         serverConfig.RemoteUseXCLIENT,
 		RemoteUseUTF8:            serverConfig.RemoteUseUTF8,
 		ConnectTimeout:           connectTimeout,
+		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
 		CommandTimeout:           commandTimeout,
 		AbsoluteSessionTimeout:   absoluteSessionTimeout,
@@ -1923,6 +2015,10 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	defer deps.serverManager.Done()
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
+	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
+	if err != nil {
+		logger.Warn("ManageSieve proxy: invalid remote_dns_refresh - using default", "name", serverConfig.Name, "error", err)
+	}
 	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
 	authRateLimit := server.DefaultAuthRateLimiterConfig()
@@ -1978,6 +2074,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		ConnectTimeout:           connectTimeout,
+		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
 		CommandTimeout:           commandTimeout,
 		AbsoluteSessionTimeout:   absoluteSessionTimeout,
@@ -2058,6 +2155,10 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
+	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
+	if err != nil {
+		logger.Warn("LMTP proxy: invalid remote_dns_refresh - using default", "name", serverConfig.Name, "error", err)
+	}
 	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 	maxMessageSize := serverConfig.GetMaxMessageSizeWithDefault()
 
@@ -2105,6 +2206,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:         serverConfig.RemoteUseXCLIENT,
 		ConnectTimeout:           connectTimeout,
+		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
 		AbsoluteSessionTimeout:   absoluteSessionTimeout,
 		EnableAffinity:           serverConfig.EnableAffinity,
@@ -2173,6 +2275,20 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		return
 	}
 
+	options := buildAdminAPIServerOptions(deps, serverConfig)
+
+	srv := adminapi.Start(ctx, deps.resilientDB, options, errChan)
+	if srv != nil {
+		deps.registerServer(serverConfig.Name, srv)
+	}
+}
+
+// buildAdminAPIServerOptions maps the running config onto the Admin API server options.
+// Split out of the start path so the config -> options threading is exercised on its own:
+// several of these are the only line connecting a config section to a behaviour (for
+// instance SieveExtensions, which decides what a user's Sieve script compiles against in
+// the /admin/mail/deliver path).
+func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.ServerConfig) adminapi.ServerOptions {
 	// Collect valid backends from all configured proxy servers ([[server]] entries).
 	validBackends := make(map[string][]string)
 	proxyProtocolByType := map[string]string{
@@ -2204,7 +2320,7 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		redirectRateWindow = time.Hour
 	}
 
-	options := adminapi.ServerOptions{
+	return adminapi.ServerOptions{
 		Name:               serverConfig.Name,
 		Addr:               serverConfig.Addr,
 		APIKey:             serverConfig.APIKey,
@@ -2221,6 +2337,7 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		TLSKeyFile:         serverConfig.TLSKeyFile,
 		TLSVerify:          serverConfig.TLSVerify,
 		Hostname:           deps.hostname,
+		InstanceID:         deps.instanceID,
 		FTSRetention:       deps.ftsRetention,
 		AffinityManager:    deps.affinityManager,
 		ValidBackends:      validBackends,
@@ -2230,11 +2347,7 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 		RedirectRateLimit:  serverConfig.GetRedirectRateLimit(),
 		RedirectRateWindow: redirectRateWindow,
 		MaxRedirectHops:    serverConfig.GetMaxRedirectHops(),
-	}
-
-	srv := adminapi.Start(ctx, deps.resilientDB, options, errChan)
-	if srv != nil {
-		deps.registerServer(serverConfig.Name, srv)
+		SieveExtensions:    deps.config.Sieve.EnabledExtensions,
 	}
 }
 
@@ -2312,6 +2425,10 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 	}
 
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
+	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
+	if err != nil {
+		logger.Warn("User API proxy: invalid remote_dns_refresh - using default", "name", serverConfig.Name, "error", err)
+	}
 
 	remotePort, err := serverConfig.GetRemotePort()
 	if err != nil {
@@ -2341,6 +2458,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		RemoteTLS:                serverConfig.RemoteTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
 		ConnectTimeout:           connectTimeout,
+		RemoteDNSRefresh:         remoteDNSRefresh,
 		EnableBackendHealthCheck: serverConfig.GetRemoteHealthChecks(),
 		MaxConnections:           serverConfig.MaxConnections,
 		MaxConnectionsPerIP:      serverConfig.MaxConnectionsPerIP,

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/logger"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -13,15 +12,19 @@ import (
 // to write new certificates. All nodes can read certificates from the cache.
 type ClusterAwareCache struct {
 	underlying     autocert.Cache
-	clusterManager *cluster.Manager
+	clusterManager clusterCoordinator
 }
 
 // NewClusterAwareCache creates a new cluster-aware certificate cache
-func NewClusterAwareCache(cache autocert.Cache, clusterMgr *cluster.Manager) *ClusterAwareCache {
+func NewClusterAwareCache(cache autocert.Cache, clusterMgr clusterCoordinator) *ClusterAwareCache {
 	return &ClusterAwareCache{
 		underlying:     cache,
 		clusterManager: clusterMgr,
 	}
+}
+
+func (c *ClusterAwareCache) unwrap() autocert.Cache {
+	return c.underlying
 }
 
 // Get retrieves a certificate from the cache (all nodes can read)

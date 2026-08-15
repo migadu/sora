@@ -44,6 +44,18 @@ type AdminConfig struct {
 	HTTPAPIKey                string                       `toml:"http_api_key"`                  // HTTP API key for authentication
 	HTTPAPIInsecureSkipVerify bool                         `toml:"http_api_insecure_skip_verify"` // Skip TLS cert verification. Default: auto (loopback addr -> skip; remote -> verify).
 	Relay                     config.RelayConfig           `toml:"relay"`
+	// Cluster is decoded for display commands (config show masks its secret_key). It
+	// plays no part in instance identity: the upload lease key comes from
+	// uploader.instance_id, deliberately decoupled from the gossip node name.
+	Cluster config.ClusterConfig `toml:"cluster"`
+}
+
+// InstanceID returns the identity this host writes into pending_uploads.instance_id,
+// resolved exactly as the server resolves it. See config.ResolveInstanceID - the value
+// is a lease key, and a row written under an id no running instance answers to is
+// eventually reaped together with its message.
+func (c *AdminConfig) InstanceID() string {
+	return config.ResolveInstanceID(c.Uploader.InstanceID)
 }
 
 // GetImportMessageLimit returns the import message size limit with proper fallback logic
@@ -117,6 +129,9 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	cfg.HTTPAPIAddr = fullCfg.AdminCLI.Addr
 	cfg.HTTPAPIKey = fullCfg.AdminCLI.APIKey
 	cfg.Relay = fullCfg.Relay
+	// Needed for node_id: it resolves the instance identity this host writes into
+	// pending_uploads.instance_id, and an import must use the same one the server does.
+	cfg.Cluster = fullCfg.Cluster
 
 	// Default: verify the Admin API server's TLS certificate. Skip verification
 	// automatically only for loopback addresses (local admin use with self-signed

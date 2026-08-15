@@ -495,6 +495,14 @@ vacation :days 7 :subject "Away" "I'm away";
 		t.Errorf("First evaluation: Expected action %s, got %s", ActionVacation, result1.Action)
 	}
 
+	// The window is consumed by the delivery path once the reply is handed off.
+	if result1.RecordVacationSent == nil {
+		t.Fatalf("First evaluation: expected a recorder for the sent reply")
+	}
+	if err := result1.RecordVacationSent(context.Background()); err != nil {
+		t.Fatalf("Failed to record vacation response: %v", err)
+	}
+
 	// Second evaluation immediately after - should NOT trigger vacation (rate limited)
 	// Need to create new executor instance to simulate new message evaluation
 	executor2, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, 0, enabledExtensions)
@@ -510,6 +518,46 @@ vacation :days 7 :subject "Away" "I'm away";
 	// Should fall back to implicit keep (vacation blocked by rate limit)
 	if result2.Action != ActionKeep {
 		t.Errorf("Second evaluation: Expected action %s (vacation rate limited), got %s", ActionKeep, result2.Action)
+	}
+}
+
+// TestVacationWindowNotConsumedByEvaluation guards the split between deciding to reply
+// and committing the :days window: the delivery path still applies the RFC 5230 §4.5
+// suppression rules after evaluation and may drop the reply, so an evaluation on its
+// own must leave the window open for the next message from that sender.
+func TestVacationWindowNotConsumedByEvaluation(t *testing.T) {
+	script := `
+require "vacation";
+vacation :days 7 :subject "Away" "I'm away";
+`
+
+	oracle := newMockVacationOracle()
+	enabledExtensions := []string{"vacation"}
+	ctx := Context{
+		EnvelopeFrom: "sender@example.com",
+		EnvelopeTo:   "recipient@example.com",
+		Header:       map[string][]string{"From": {"sender@example.com"}},
+		Body:         "Test body",
+	}
+
+	for i := 1; i <= 2; i++ {
+		executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, 0, enabledExtensions)
+		if err != nil {
+			t.Fatalf("Evaluation %d: failed to create executor: %v", i, err)
+		}
+		result, err := executor.Evaluate(context.Background(), ctx)
+		if err != nil {
+			t.Fatalf("Evaluation %d: failed to evaluate script: %v", i, err)
+		}
+		if result.Action != ActionVacation {
+			t.Fatalf("Evaluation %d: expected action %s, got %s", i, ActionVacation, result.Action)
+		}
+		if result.RecordVacationSent == nil {
+			t.Fatalf("Evaluation %d: expected a recorder to commit the window with", i)
+		}
+	}
+	if len(oracle.responses) != 0 {
+		t.Errorf("evaluation must not consume the per-sender window, oracle recorded %d response(s)", len(oracle.responses))
 	}
 }
 

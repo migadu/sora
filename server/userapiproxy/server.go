@@ -90,6 +90,7 @@ type ServerOptions struct {
 	RemoteTLSVerify          bool
 	ConnectTimeout           time.Duration
 	EnableBackendHealthCheck bool                       // Enable backend health checking (default: true)
+	RemoteDNSRefresh         *time.Duration             // Backend DNS re-resolution interval; nil = default, 0 = pin to the startup resolution
 	MaxConnections           int                        // Maximum total connections per instance (0 = unlimited, local only)
 	MaxConnectionsPerIP      int                        // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
 	TrustedNetworks          []string                   // CIDR blocks for trusted networks that bypass per-IP limits
@@ -165,6 +166,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 
 	// SSRF defense: when enabled, refuse remote-lookup backends not in the configured pool.
 	connManager.SetRestrictRemoteLookupToPool(opts.RemoteLookup != nil && opts.RemoteLookup.RestrictToPool)
+
+	// Backend hostnames are re-resolved periodically so an address change is picked
+	// up without a restart; remote_dns_refresh tunes or disables that.
+	if opts.RemoteDNSRefresh != nil {
+		connManager.SetResolveRefreshInterval(*opts.RemoteDNSRefresh)
+	}
 
 	// Resolve addresses to expand hostnames to IPs
 	if err := connManager.ResolveAddresses(); err != nil {

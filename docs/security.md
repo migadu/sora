@@ -26,6 +26,8 @@ Always use TLS to encrypt communications between clients, proxies, and servers.
 
 *   **Master Users**: The `master_username` and `master_password` settings in the protocol server sections allow a special user to log in as any other user. This is primarily intended for proxy-to-backend authentication and administrative access. **Protect these credentials carefully.**
 
+*   **Lookup Cache**: Backends and proxies keep verified logins in a short-lived in-memory cache (`lookup_cache`) so a reconnect storm does not become a database round trip per login. An entry holds the credential hash it was verified against (bcrypt/SSHA512, exactly as stored in the database) plus a *keyed, salted digest* of the password, used only to tell "same password as last time" from "different password". That digest carries a per-entry random salt and a process-random HMAC key that is never persisted or logged, so it cannot be attacked with precomputed tables and does not reveal password reuse across accounts. Plaintext passwords are never cached, and negative (failed-login) entries record no password material at all.
+
 ## Authentication Rate Limiting
 
 To protect against brute-force password attacks, Sora has a built-in rate limiter. You can enable it in each protocol's configuration:
@@ -41,6 +43,10 @@ ip_window_duration = "15m"
 This system tracks failed login attempts per IP and per username, introducing progressive delays and temporary blocks to thwart attackers.
 
 **Security Note**: The rate limiter implements a "fail-closed" security policy. If the database becomes unavailable, authentication attempts will be denied to prevent attackers from bypassing rate limiting by causing database errors. The rate limiter will automatically retry database access after the configured `db_error_threshold` period (default: 1 minute).
+
+## Metrics Endpoint
+
+The Prometheus endpoint (`type = "metrics"`) is served **without access control unless you configure one**, and it exposes per-domain (and, with `enable_user_metrics`, per-user) activity alongside a detailed view of internal state. Bind it to a private interface, and on any network that is not fully trusted restrict it with `allowed_hosts` (IP/CIDR allow-list, matched against the peer address — forwarded headers are never trusted) and/or `api_key` (a `Authorization: Bearer <key>` token, compared in constant time). Both may be set, in which case both must be satisfied. Sora warns at startup if a metrics listener with neither control is bound to a publicly reachable address. See [configuration.md](configuration.md#restricting-the-metrics-endpoint) for examples.
 
 ## PROXY Protocol
 

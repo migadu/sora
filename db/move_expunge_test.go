@@ -359,7 +359,7 @@ func TestCopyMessagesAdvanced(t *testing.T) {
 	defer tx.Rollback(ctx)
 
 	uids := []imap.UID{messageUID}
-	_, err = db.CopyMessages(ctx, tx, &uids, srcMailboxID, srcMailboxID, accountID, "example.com", "user", "")
+	_, _, err = db.CopyMessages(ctx, tx, &uids, srcMailboxID, srcMailboxID, accountID, "example.com", "user", "")
 	assert.Error(t, err) // Should fail - same source and destination
 
 	tx.Rollback(ctx)
@@ -373,7 +373,7 @@ func TestCopyMessagesAdvanced(t *testing.T) {
 	srcMsgCountBefore, _, srcSizeBefore := getMoveExpungeMailboxStats(t, db, ctx, srcMailboxID)
 	destMsgCountBefore, _, destSizeBefore := getMoveExpungeMailboxStats(t, db, ctx, destMailboxID)
 
-	uidMapping, err := db.CopyMessages(ctx, tx2, &uids, srcMailboxID, destMailboxID, accountID, "example.com", "user", "")
+	uidMapping, _, err := db.CopyMessages(ctx, tx2, &uids, srcMailboxID, destMailboxID, accountID, "example.com", "user", "")
 	assert.NoError(t, err)
 	assert.NotEmpty(t, uidMapping)
 	assert.Contains(t, uidMapping, messageUID)

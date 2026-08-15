@@ -13,9 +13,11 @@ import (
 )
 
 // TestIMAP_SearchCriteriaComplexityLimits proves end-to-end that the server rejects
-// pathologically deep or wide SEARCH criteria with a tagged BAD response (instead of
-// recursing unbounded through the SQL builder / criteria decoder), while still accepting
-// ordinary shallow criteria.
+// pathologically deep or wide SEARCH criteria (instead of recursing unbounded through the
+// SQL builder / criteria decoder), while still accepting ordinary shallow criteria.
+//
+// Exceeding a limit is reported as NO [SERVERLIMIT], which is distinct from the
+// BAD [CLIENTBUG] used for criteria that are actually malformed.
 func TestIMAP_SearchCriteriaComplexityLimits(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -47,8 +49,8 @@ func TestIMAP_SearchCriteriaComplexityLimits(t *testing.T) {
 		t.Fatalf("SELECT INBOX: %v", err)
 	}
 
-	// readTaggedResult sends a command and returns the status word ("OK"/"NO"/"BAD")
-	// from its tagged response, draining any untagged lines in between.
+	// readTaggedResult sends a command and returns its full tagged response line,
+	// draining any untagged lines in between.
 	readTaggedResult := func(tag, command string) string {
 		fmt.Fprintf(conn, "%s %s\r\n", tag, command)
 		for {
@@ -57,51 +59,60 @@ func TestIMAP_SearchCriteriaComplexityLimits(t *testing.T) {
 				t.Fatalf("reading response for %s: %v", tag, err)
 			}
 			if strings.HasPrefix(line, tag+" ") {
-				fields := strings.Fields(line)
-				if len(fields) < 2 {
-					t.Fatalf("malformed tagged response: %q", line)
-				}
-				return fields[1]
+				return strings.TrimSpace(line)
 			}
 		}
 	}
 
-	t.Run("DeeplyNestedNotIsRejected", func(t *testing.T) {
-		// 40 levels of nested NOT exceeds the 30-level depth cap → BAD.
-		deep := strings.Repeat("NOT ", 40) + "ALL"
-		if got := readTaggedResult("A010", "SEARCH "+deep); got != "BAD" {
-			t.Errorf("expected BAD for deeply nested SEARCH, got %s", got)
+	assertOverLimit := func(t *testing.T, tag, command string) {
+		t.Helper()
+		got := readTaggedResult(tag, command)
+		if !strings.HasPrefix(got, tag+" NO ") || !strings.Contains(got, "[SERVERLIMIT]") {
+			t.Errorf("expected %s NO [SERVERLIMIT], got %q", tag, got)
 		}
+	}
+
+	assertAccepted := func(t *testing.T, tag, command string) {
+		t.Helper()
+		got := readTaggedResult(tag, command)
+		if !strings.HasPrefix(got, tag+" OK") {
+			t.Errorf("expected %s OK, got %q", tag, got)
+		}
+	}
+
+	t.Run("DeeplyNestedNotIsRejected", func(t *testing.T) {
+		// 40 levels of nested NOT exceeds the 30-level depth cap.
+		assertOverLimit(t, "A010", "SEARCH "+strings.Repeat("NOT ", 40)+"ALL")
 	})
 
 	t.Run("WideFanOutIsRejected", func(t *testing.T) {
-		// 300 sibling OR pairs (~600 nodes) exceeds the 256-node cap → BAD.
+		// 300 sibling OR pairs (~600 nodes) exceeds the 256-node cap.
 		wide := strings.TrimSpace(strings.Repeat("OR SEEN ANSWERED ", 300))
-		if got := readTaggedResult("A011", "SEARCH "+wide); got != "BAD" {
-			t.Errorf("expected BAD for wide fan-out SEARCH, got %s", got)
-		}
+		assertOverLimit(t, "A011", "SEARCH "+wide)
 	})
 
 	t.Run("ShallowNestingIsAccepted", func(t *testing.T) {
-		// A couple of NOT levels is well within limits → OK.
-		if got := readTaggedResult("A012", "SEARCH NOT NOT ALL"); got != "OK" {
-			t.Errorf("expected OK for shallow nested SEARCH, got %s", got)
-		}
+		// A couple of NOT levels is well within limits.
+		assertAccepted(t, "A012", "SEARCH NOT NOT ALL")
 	})
 
 	t.Run("ShallowSortIsAccepted", func(t *testing.T) {
 		// Control: confirms SORT is supported, so the rejection below is attributable to
 		// the validator rather than an unsupported command.
-		if got := readTaggedResult("A013", "SORT (DATE) UTF-8 ALL"); got != "OK" {
-			t.Errorf("expected OK for shallow SORT, got %s", got)
-		}
+		assertAccepted(t, "A013", "SORT (DATE) UTF-8 ALL")
 	})
 
 	t.Run("DeeplyNestedSortIsRejected", func(t *testing.T) {
 		// SORT funnels through the same shared validator.
-		deep := strings.Repeat("NOT ", 40) + "ALL"
-		if got := readTaggedResult("A014", "SORT (DATE) UTF-8 "+deep); got != "BAD" {
-			t.Errorf("expected BAD for deeply nested SORT, got %s", got)
+		assertOverLimit(t, "A014", "SORT (DATE) UTF-8 "+strings.Repeat("NOT ", 40)+"ALL")
+	})
+
+	t.Run("MalformedCriteriaIsClientBug", func(t *testing.T) {
+		// A limit rejection must stay distinguishable from a genuinely invalid criteria,
+		// which is the distinction SERVERLIMIT exists to draw.
+		got := readTaggedResult("A015", "SEARCH NOT")
+		if !strings.HasPrefix(got, "A015 BAD") {
+			t.Errorf("expected A015 BAD for malformed criteria, got %q", got)
 		}
 	})
 }

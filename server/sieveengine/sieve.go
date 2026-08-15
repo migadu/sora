@@ -82,6 +82,14 @@ type Result struct {
 	CreateMailbox  bool              // RFC5490 - :create modifier (mailbox extension)
 	HeaderEdits    []HeaderEdit      // RFC5293 - editheader extension (addheader/deleteheader)
 	Additional     map[string]string // future-proofing
+
+	// RecordVacationSent commits the RFC 5230 :days window for this sender. It is
+	// non-nil only for ActionVacation with a VacationOracle configured, and the
+	// delivery path must call it immediately before handing the reply to the relay:
+	// the mandatory §4.5 suppression checks run there and may still decide not to
+	// reply, while recording after the handoff would let a redelivery of the same
+	// message produce a second reply.
+	RecordVacationSent func(ctx context.Context) error
 }
 
 type Context struct {
@@ -133,25 +141,12 @@ func NewSieveExecutor(scriptContent string) (Executor, error) {
 // NewSieveExecutorWithExtensions creates a new SieveExecutor with the given script content and enabled extensions.
 // If enabledExtensions is nil, all extensions are allowed
 func NewSieveExecutorWithExtensions(scriptContent string, enabledExtensions []string) (Executor, error) {
-	// Load the script
-	scriptReader := strings.NewReader(scriptContent)
-	options := sieve.DefaultOptions()
-	options.EnabledExtensions = enabledExtensions
-	// Raise the per-match regex soft-wait cap to the whole-script budget. The match
-	// input is already truncated to MaxInputLength, so a large body match is bounded;
-	// go-sieve's 100ms default can otherwise spuriously fail it under load or -race.
-	options.Interp.RegexLimits.MaxExecTime = scriptExecutionTimeout
-	script, err := sieve.Load(scriptReader, options)
+	compiled, err := CompileScript(scriptContent, enabledExtensions)
 	if err != nil {
 		return nil, err
 	}
-
-	policy := &SievePolicy{} // Basic policy, no oracle, no AccountID by default.
-
-	return &SieveExecutor{
-		script: script,
-		policy: policy,
-	}, nil
+	// Basic policy, no oracle, no AccountID by default.
+	return &SieveExecutor{script: compiled.script, policy: &SievePolicy{}}, nil
 }
 
 // NewSieveExecutorWithOracle creates a new SieveExecutor with the given script content, AccountID, and oracles.
@@ -161,31 +156,50 @@ func NewSieveExecutorWithOracle(scriptContent string, AccountID int64, vacOracle
 
 // NewSieveExecutorWithOracleAndExtensions creates a new SieveExecutor with the given script content, AccountID, oracles, and enabled extensions.
 func NewSieveExecutorWithOracleAndExtensions(scriptContent string, AccountID int64, vacOracle VacationOracle, redirectOracle RedirectOracle, redirectRateLimit int, redirectRateWindow time.Duration, maxRedirectHops int, enabledExtensions []string) (Executor, error) {
-	scriptReader := strings.NewReader(scriptContent)
+	compiled, err := CompileScript(scriptContent, enabledExtensions)
+	if err != nil {
+		return nil, err
+	}
+	return compiled.NewExecutor(AccountID, vacOracle, redirectOracle, redirectRateLimit, redirectRateWindow, maxRedirectHops), nil
+}
+
+// CompiledScript is a parsed Sieve script, the expensive half of an evaluation. It is
+// immutable, so a single copy can back any number of concurrent evaluations for the
+// account that owns the script; see ScriptCache.
+type CompiledScript struct {
+	script *sieve.Script
+}
+
+// CompileScript parses and compiles script content with the given extensions enabled.
+// If enabledExtensions is nil, all extensions are allowed.
+func CompileScript(scriptContent string, enabledExtensions []string) (*CompiledScript, error) {
 	options := sieve.DefaultOptions()
 	options.EnabledExtensions = enabledExtensions
 	// Raise the per-match regex soft-wait cap to the whole-script budget. The match
 	// input is already truncated to MaxInputLength, so a large body match is bounded;
 	// go-sieve's 100ms default can otherwise spuriously fail it under load or -race.
 	options.Interp.RegexLimits.MaxExecTime = scriptExecutionTimeout
-	script, err := sieve.Load(scriptReader, options)
+	script, err := sieve.Load(strings.NewReader(scriptContent), options)
 	if err != nil {
 		return nil, err
 	}
+	return &CompiledScript{script: script}, nil
+}
 
-	policy := &SievePolicy{
-		AccountID:          AccountID,
-		vacationOracle:     vacOracle,
-		redirectOracle:     redirectOracle,
-		redirectRateLimit:  redirectRateLimit,
-		redirectRateWindow: redirectRateWindow,
-		maxRedirectHops:    maxRedirectHops,
-	}
-
+// NewExecutor binds a compiled script to an account and its oracles. It is cheap:
+// the returned Executor shares the compiled script and only carries per-account policy.
+func (c *CompiledScript) NewExecutor(AccountID int64, vacOracle VacationOracle, redirectOracle RedirectOracle, redirectRateLimit int, redirectRateWindow time.Duration, maxRedirectHops int) Executor {
 	return &SieveExecutor{
-		script: script,
-		policy: policy,
-	}, nil
+		script: c.script,
+		policy: &SievePolicy{
+			AccountID:          AccountID,
+			vacationOracle:     vacOracle,
+			redirectOracle:     redirectOracle,
+			redirectRateLimit:  redirectRateLimit,
+			redirectRateWindow: redirectRateWindow,
+			maxRedirectHops:    maxRedirectHops,
+		},
+	}
 }
 
 // Evaluate evaluates the Sieve script with the given context
@@ -217,6 +231,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		redirectOracle:     e.policy.redirectOracle,
 		redirectRateLimit:  e.policy.redirectRateLimit,
 		redirectRateWindow: e.policy.redirectRateWindow,
+		maxRedirectHops:    e.policy.maxRedirectHops,
 		vacationResponses:  make(map[string]time.Time),
 	}
 
@@ -313,9 +328,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 				result.VacationSubj = vacation.Subject
 				result.VacationMsg = vacation.Body
 				result.VacationIsMime = vacation.IsMime
-
-				// Record that we sent the vacation response
-				_ = execPolicy.SendVacationResponse(timeoutCtx, data, sender, vacation.From, vacation.Subject, vacation.Body, vacation.IsMime)
+				result.RecordVacationSent = execPolicy.vacationRecorder(sender, vacation.Handle)
 			}
 			break // Only process the first vacation response
 		}
@@ -345,13 +358,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 
 // SievePolicy implements the PolicyReader interface
 type SievePolicy struct {
-	vacationResponses  map[string]time.Time
-	lastVacationFrom   string
-	lastVacationSubj   string
-	lastVacationMsg    string
-	lastVacationIsMime bool
-	lastVacationHandle string // Stores the handle of the currently allowed vacation
-	vacationTriggered  bool
+	vacationResponses map[string]time.Time
 
 	AccountID      int64
 	vacationOracle VacationOracle
@@ -441,30 +448,25 @@ func (p *SievePolicy) VacationResponseAllowed(ctx context.Context, d *interp.Run
 	}
 	p.vacationResponses[inMemoryKey] = time.Now()
 
-	// Store the handle for which the response is allowed, so SendVacationResponse can use it.
-	p.lastVacationHandle = handle
-
 	return true, nil
 }
 
-// SendVacationResponse is called by the Sieve interpreter if VacationResponseAllowed returned true.
-// `recipient` is the address to send the vacation message TO (i.e., the original sender).
-func (p *SievePolicy) SendVacationResponse(ctx context.Context, d *interp.RuntimeData,
-	recipient, from, subject, body string, isMime bool) error {
-
-	// Store the vacation response details
-	p.lastVacationFrom = from
-	p.lastVacationSubj = subject
-	p.lastVacationMsg = body
-	p.lastVacationIsMime = isMime
-	p.vacationTriggered = true
-
-	if p.vacationOracle != nil {
-		if err := p.vacationOracle.RecordVacationResponseSent(ctx, p.AccountID, recipient, p.lastVacationHandle); err != nil {
+// vacationRecorder returns the deferred commit of the persistent :days window for
+// `originalSender`, or nil when there is no oracle (the in-memory fallback tracking
+// lives and dies with a single evaluation). The returned function takes its own
+// context: it runs on the delivery path, after this evaluation's budget has expired.
+func (p *SievePolicy) vacationRecorder(originalSender, handle string) func(context.Context) error {
+	oracle := p.vacationOracle
+	if oracle == nil {
+		return nil
+	}
+	accountID := p.AccountID
+	return func(ctx context.Context) error {
+		if err := oracle.RecordVacationResponseSent(ctx, accountID, originalSender, handle); err != nil {
 			return fmt.Errorf("failed to record vacation response sent via oracle: %w", err)
 		}
+		return nil
 	}
-	return nil
 }
 
 // SieveEnvelope implements the Envelope interface

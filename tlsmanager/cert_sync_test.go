@@ -174,19 +174,15 @@ func TestExtractFallbackCache(t *testing.T) {
 		t.Errorf("Failed to extract FallbackCache from ClusterAwareCache")
 	}
 
-	// Test wrapped in FailoverAwareCache
-	failoverCache := &FailoverAwareCache{
-		underlying: fallbackCache,
-	}
-	result = extractFallbackCache(failoverCache)
+	// Test wrapped in the issuance gate
+	gated := newIssuanceGate(fallbackCache, &Manager{})
+	result = extractFallbackCache(gated)
 	if result != fallbackCache {
-		t.Errorf("Failed to extract FallbackCache from FailoverAwareCache")
+		t.Errorf("Failed to extract FallbackCache from issuanceGate")
 	}
 
-	// Test double-wrapped (FailoverAwareCache -> ClusterAwareCache -> FallbackCache)
-	doubleWrapped := &FailoverAwareCache{
-		underlying: clusterCache,
-	}
+	// Test double-wrapped (issuanceGate -> ClusterAwareCache -> FallbackCache)
+	doubleWrapped := newIssuanceGate(clusterCache, &Manager{})
 	result = extractFallbackCache(doubleWrapped)
 	if result != fallbackCache {
 		t.Errorf("Failed to extract FallbackCache from double-wrapped cache")

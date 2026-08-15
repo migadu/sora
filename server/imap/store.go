@@ -157,7 +157,12 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 
 	for _, msg := range messages {
 		// CONDSTORE functionality - only process if capability is enabled
-		if s.GetCapabilities().Has(imap.CapCondStore) && options != nil && options.UnchangedSince > 0 {
+		// UnchangedSinceSet, not a non-zero value, is what marks the modifier as
+		// present: RFC 7162 §3.1.3.1 gives "UNCHANGEDSINCE 0" the opposite meaning
+		// to an absent modifier -- it is the probe that must fail for every message
+		// -- so reading it as absent would modify exactly the messages the client
+		// asked never to touch.
+		if s.GetCapabilities().Has(imap.CapCondStore) && options != nil && options.UnchangedSinceSet {
 			var currentModSeq int64
 			currentModSeq = msg.CreatedModSeq
 

@@ -71,35 +71,23 @@ func shouldUpdateCertificate(localInfo, s3Info *CertificateInfo) bool {
 	return false
 }
 
+// cacheWrapper is implemented by the cache layers in this package that wrap another cache
+type cacheWrapper interface {
+	unwrap() autocert.Cache
+}
+
 // extractFallbackCache unwraps cache layers to find the FallbackCache
 func extractFallbackCache(cache autocert.Cache) *FallbackCache {
-	// Direct check
-	if fc, ok := cache.(*FallbackCache); ok {
-		return fc
-	}
-
-	// Check through FailoverAwareCache wrapper
-	if failoverCache, ok := cache.(*FailoverAwareCache); ok {
-		// Check if underlying is ClusterAwareCache
-		if clusterCache, ok := failoverCache.underlying.(*ClusterAwareCache); ok {
-			if fc, ok := clusterCache.underlying.(*FallbackCache); ok {
-				return fc
-			}
-		}
-		// Check if underlying is directly FallbackCache
-		if fc, ok := failoverCache.underlying.(*FallbackCache); ok {
-			return fc
+	for {
+		switch c := cache.(type) {
+		case *FallbackCache:
+			return c
+		case cacheWrapper:
+			cache = c.unwrap()
+		default:
+			return nil
 		}
 	}
-
-	// Check through ClusterAwareCache wrapper (without FailoverAwareCache)
-	if clusterCache, ok := cache.(*ClusterAwareCache); ok {
-		if fc, ok := clusterCache.underlying.(*FallbackCache); ok {
-			return fc
-		}
-	}
-
-	return nil
 }
 
 // syncCertificateFromS3 checks if a certificate needs updating from S3 and updates if needed

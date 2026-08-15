@@ -73,7 +73,7 @@ func TestCrossAccountMessageOwnership(t *testing.T) {
 	uids := []imap.UID{imap.UID(srcUID)}
 
 	// Copy from A to B using resilient operations
-	uidMap, err := rdb.CopyMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, domainB, localB, "test-instance")
+	uidMap, _, err := rdb.CopyMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, domainB, localB, "test-instance")
 	require.NoError(t, err)
 	require.Len(t, uidMap, 1)
 

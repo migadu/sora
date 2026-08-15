@@ -23,7 +23,10 @@ import (
 // uploader (+ storage + hostname) so /admin/mail/deliver actually stores the message —
 // which the default harness does not — letting us assert on the stored bytes. It returns
 // the server and the uploader temp dir.
-func setupHTTPAPIServerWithUploader(t *testing.T) (*HTTPAPITestServer, string) {
+//
+// sieveExtensions, when given, goes through ServerOptions exactly as cmd/sora passes
+// [sieve] enabled_extensions, so the delivery path compiles user scripts with it.
+func setupHTTPAPIServerWithUploader(t *testing.T, sieveExtensions ...string) (*HTTPAPITestServer, string) {
 	t.Helper()
 
 	rdb := common.SetupTestDatabase(t)
@@ -46,14 +49,15 @@ func setupHTTPAPIServerWithUploader(t *testing.T) (*HTTPAPITestServer, string) {
 
 	addr := common.GetRandomAddress(t)
 	options := adminapi.ServerOptions{
-		Addr:         addr,
-		APIKey:       testAPIKey,
-		AllowedHosts: []string{},
-		Cache:        testCache,
-		Uploader:     uploaderInstance,
-		Storage:      &storage.S3Storage{},
-		Hostname:     "admin.test",
-		TLS:          false,
+		Addr:            addr,
+		APIKey:          testAPIKey,
+		AllowedHosts:    []string{},
+		Cache:           testCache,
+		Uploader:        uploaderInstance,
+		Storage:         &storage.S3Storage{},
+		Hostname:        "admin.test",
+		TLS:             false,
+		SieveExtensions: sieveExtensions,
 	}
 
 	server, err := adminapi.New(rdb, options)

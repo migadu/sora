@@ -142,8 +142,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		// reported ALL messages as recent for any new session) and is correct for
 		// single-node deployments.  The state is in-memory and resets on restart;
 		// true cross-node \Recent tracking would require a persistent store.
-		if lastSeenRaw, ok := s.server.mailboxRecentUIDs.Load(mailbox.ID); ok {
-			lastSeenUID := lastSeenRaw.(imap.UID)
+		if lastSeenUID, ok := s.server.mailboxRecentUIDs.Load(mailbox.ID); ok {
 			count, dbErr := s.server.rdb.CountMessagesGreaterThanUIDWithRetry(readCtx, mailbox.ID, lastSeenUID)
 			if dbErr != nil {
 				s.DebugLog("error counting recent messages from server-wide UID, defaulting to total", "uid", lastSeenUID, "mailbox_id", mailbox.ID, "error", dbErr)

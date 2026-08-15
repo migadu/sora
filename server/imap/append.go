@@ -55,6 +55,58 @@ func extractBodyStructureSafe(data []byte) imap.BodyStructure {
 	}
 }
 
+// errAppendLiteralTooLarge marks an APPEND refused because the literal does not fit the
+// session memory budget. Distinct from a network read failure: the literal is never read.
+var errAppendLiteralTooLarge = errors.New("append literal exceeds the session memory budget")
+
+// readAppendLiteral reads the APPEND literal into memory. It returns the bytes read
+// (partial on error, so the caller can report how far the client got) and a release
+// function the caller must call once it is done with them.
+//
+// The literal's declared size is charged to the session memory tracker BEFORE the read:
+// the bytes stay resident for the whole network transfer, which for a slow client is by
+// far the longest part of the command, so a budget charged afterwards would never see
+// the memory that is actually at risk.
+func (s *IMAPSession) readAppendLiteral(r imap.LiteralReader) ([]byte, func(), error) {
+	var reserved int64
+	release := func() {
+		if reserved > 0 {
+			s.memTracker.Free(reserved)
+		}
+	}
+
+	if s.memTracker != nil && r.Size() > 0 {
+		if !s.memoryAvailable(r.Size()) {
+			return nil, release, fmt.Errorf("%w: %d bytes", errAppendLiteralTooLarge, r.Size())
+		}
+		if err := s.memTracker.Allocate(r.Size()); err != nil {
+			return nil, release, fmt.Errorf("%w: %v", errAppendLiteralTooLarge, err)
+		}
+		reserved = r.Size()
+	}
+
+	var buf bytes.Buffer
+	_, err := io.Copy(&buf, r)
+	data := buf.Bytes()
+
+	// Settle the reservation against what actually arrived: a short read, or a literal
+	// whose size the client did not declare.
+	if s.memTracker != nil {
+		actual := int64(len(data))
+		switch {
+		case actual > reserved:
+			if allocErr := s.memTracker.Allocate(actual - reserved); allocErr == nil {
+				reserved = actual
+			}
+		case actual < reserved:
+			s.memTracker.Free(reserved - actual)
+			reserved = actual
+		}
+	}
+
+	return data, release, err
+}
+
 func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
 	start := time.Now()
 	// recordMetrics records throughput + latency, classifying the status the same
@@ -116,11 +168,24 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	// See: imapserver/append.go in github.com/migadu/go-imap
 
 	// Read the entire message into a buffer
-	var buf bytes.Buffer
-	if _, err = io.Copy(&buf, r); err != nil {
+	fullMessageBytes, releaseLiteral, err := s.readAppendLiteral(r)
+	defer releaseLiteral()
+	if errors.Is(err, errAppendLiteralTooLarge) {
+		s.WarnLog("rejecting APPEND that does not fit the session memory budget", "error", err)
+		metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+		imapErr := &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeUnavailable,
+			Text: "Session memory limit reached, please try again later",
+		}
+		s.classifyAndTrackError("APPEND", nil, imapErr)
+		recordMetrics(imapErr)
+		return nil, imapErr
+	}
+	if err != nil {
 		// Network read errors during APPEND are typically a client disconnect,
 		// read timeout, or connection reset mid-transmission.
-		s.WarnLog("failed to read message data from network", "error", err, "bytes_read", buf.Len())
+		s.WarnLog("failed to read message data from network", "error", err, "bytes_read", len(fullMessageBytes))
 
 		// Record the metric here (network_error / network_timeout, both client_error).
 		// We do NOT call recordMetrics() so slow-client socket timeouts don't skew P99.
@@ -148,9 +213,6 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	// can take 20+ seconds for a large payload, which artificially inflates
 	// backend processing latency metrics.
 	start = time.Now()
-
-	// Use the full message bytes as received for hashing, size, and header extraction.
-	fullMessageBytes := buf.Bytes()
 
 	// Reject empty messages — a valid RFC 5322 message always has headers.
 	// A 0-byte literal can occur from buggy clients or truncated connections
@@ -226,7 +288,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	}
 
 	// Extract body structure with panic recovery for malformed messages
-	bodyStructure := extractBodyStructureSafe(buf.Bytes())
+	bodyStructure := extractBodyStructureSafe(fullMessageBytes)
 
 	// Store message locally for background upload to S3
 	// Check if file already exists to prevent race condition:
@@ -352,7 +414,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 			FTSRetention:  s.server.ftsRetention,
 		},
 		db.PendingUpload{
-			InstanceID:  s.server.hostname,
+			InstanceID:  s.server.instanceID,
 			ContentHash: contentHash,
 			Size:        size,
 			AccountID:   destAccountID,
@@ -456,7 +518,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	if s.IMAPUser != nil {
 		metrics.TrackDomainCommand("imap", s.IMAPUser.Address.Domain(), "APPEND")
 		metrics.TrackUserActivity("imap", s.IMAPUser.Address.FullAddress(), "command", 1)
-		metrics.TrackDomainBytes("imap", s.IMAPUser.Address.Domain(), "in", int64(buf.Len()))
+		metrics.TrackDomainBytes("imap", s.IMAPUser.Address.Domain(), "in", size)
 		metrics.TrackDomainMessage("imap", s.IMAPUser.Address.Domain(), "appended")
 	}
 

@@ -38,7 +38,7 @@ func TestBackendAuthFailureInvalidatesCache(t *testing.T) {
 		ServerAddress:    "57.128.127.128:993", // Old backend
 		FromRemoteLookup: true,
 		Result:           lookupcache.AuthSuccess,
-		PasswordHash:     "cached_hash",
+		PasswordDigest:   lookupcache.NewPasswordDigest("cached_password"),
 	}
 	cache.Set(serverName, username, entry)
 
@@ -78,7 +78,7 @@ func TestBackendAuthFailureInvalidatesCache(t *testing.T) {
 		ServerAddress:    "141.94.162.186:993", // New backend
 		FromRemoteLookup: true,
 		Result:           lookupcache.AuthSuccess,
-		PasswordHash:     "new_hash",
+		PasswordDigest:   lookupcache.NewPasswordDigest("new_password"),
 	}
 	cache.Set(serverName, username, newEntry)
 

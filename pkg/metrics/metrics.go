@@ -107,14 +107,14 @@ var (
 	MailboxesTotal = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "sora_mailboxes_total",
-			Help: "Total number of mailboxes",
+			Help: "Approximate total number of mailboxes (planner row estimate, includes mailboxes pending purge)",
 		},
 	)
 
 	AccountsTotal = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "sora_accounts_total",
-			Help: "Total number of accounts",
+			Help: "Approximate total number of accounts (planner row estimate, includes accounts pending purge)",
 		},
 	)
 

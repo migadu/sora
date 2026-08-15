@@ -79,6 +79,7 @@ These two components work together to provide high-performance mail delivery and
     *   `enable_warmup`: If `true`, Sora will proactively fetch recent messages for a user's `INBOX` upon login, making the initial client experience much faster.
 *   `[uploader]`: Configures the background service that moves messages to S3.
     *   `path`: A temporary staging directory where incoming messages are stored before being uploaded.
+    *   `instance_id`: The upload lease identity this node writes into `pending_uploads.instance_id` and `instance_heartbeats.instance_id` (default: the host's hostname, which is what earlier releases stamped — upgrades are lease-continuous). A pending upload can only be completed by the instance that staged it, because the message body is a file on that node's local disk, so this value must be unique per sora instance and stable across restarts. It is deliberately independent of `cluster.node_id`: renaming the gossip node must not strand queued uploads. Set it explicitly when running several sora instances on one host, or to pin the identity across a planned hostname change. **Changing the resolved value strands queued uploads** — stop delivery and let `pending_uploads` drain for the old id before restarting under a new one (the cleanup worker warns about any leftover owner by name).
     *   `concurrency`: The number of parallel workers uploading to S3.
 
 ### `[cleanup]`
@@ -88,6 +89,7 @@ This configures the background janitorial service.
 *   `grace_period`: How long to wait before permanently deleting a message that a user has expunged (e.g., `"14d"`). This acts as a recovery window.
 *   `max_age_restriction`: Automatically expunge messages older than this duration (e.g., `"365d"`). Leave empty to disable.
 *   `fts_retention`: How long to keep the `messages_fts` row — which contains the FTS search vector (`text_body_tsv`) (default: empty — keep indefinitely). When this period expires the entire row is deleted and FTS search stops working for that message. Note: `text_body` is never persisted — it is cleared after the FTS vector is computed by the background worker.
+*   `instance_liveness_threshold`: How long an uploader instance may stay silent before it is considered gone (default: `"7d"`). A pending upload can only be performed by the instance that created it, because the message body is a file on that node's local disk, so an unfinished upload is reaped only once its owner either gave up (`uploader.max_attempts`) or stopped heartbeating for this long. Each uploader refreshes `instance_heartbeats` every minute. Keep this comfortably above any reboot or maintenance window — reaping a node that is merely rebooting deletes mail whose only copy is on its disk. An instance that has never recorded a heartbeat counts as alive, so its backlog is never reaped; the cleanup worker logs a WARN for both cases.
 
 ### `[servers.*]`
 
@@ -125,6 +127,7 @@ Sora can also act as a proxy to load balance connections to other Sora backend s
 *   `start`: Enables the proxy server.
 *   `addr`: The public-facing address the proxy listens on.
 *   `remote_addrs`: A list of backend Sora server addresses.
+*   `remote_dns_refresh`: How often hostnames in `remote_addrs` are re-resolved (default: `"5m"`). A backend that changes address — rolling replacement, container reschedule, DNS failover — is picked up without restarting the proxy. Resolution runs in the background, so no login ever waits on DNS, and a name that stops resolving keeps its last known addresses rather than dropping out of the pool. Set to `"0"` to pin the pool to the addresses resolved at startup.
 *   `enable_affinity`: Enables sticky sessions, ensuring a user is consistently routed to the same backend server.
 *   `remote_lookup`: An advanced feature for database-driven user routing. When enabled, the proxy queries a database to determine which backend server a user should be routed to. This is powerful for sharded or geo-distributed architectures.
 
@@ -154,6 +157,27 @@ min_bytes_per_minute = 512
 *   `[servers.metrics]`: Enable and configure the Prometheus metrics endpoint.
 *   `[servers.http_api]`: Enable and configure the administrative REST API. Requires setting a secure `api_key`.
 
+#### Restricting the metrics endpoint
+
+The metrics endpoint is served without access control unless you configure one. It exposes per-domain (and, with `enable_user_metrics`, per-user) activity along with a detailed view of internal state, so restrict it on any network that is not fully trusted:
+
+*   `allowed_hosts`: IP/CIDR allow-list, matched against the connecting peer address. Forwarded headers (`X-Forwarded-For`, `X-Real-IP`) are ignored — they are attacker-controlled and the metrics listener does not parse PROXY protocol.
+*   `api_key`: requires `Authorization: Bearer <key>` on every scrape, compared in constant time.
+
+Both are optional and enforced independently — set both and a scrape must come from an allowed host *and* present the token.
+
+```toml
+[[server]]
+type = "metrics"
+name = "prometheus-metrics"
+addr = "10.0.0.5:9090"                  # Bind to a private interface, not 0.0.0.0
+path = "/metrics"
+allowed_hosts = ["10.0.0.0/8"]          # Prometheus scrapers only
+api_key = "your-metrics-scrape-key"     # Optional bearer token
+```
+
+Prometheus sends the token with `authorization: {type: Bearer, credentials: <key>}` in the scrape config. The endpoint is always plain HTTP (`tls` is ignored on a metrics server, and warned about at startup) — terminate TLS in front of it if a token has to cross an untrusted network. Sora logs a warning at startup if a metrics listener with neither control is bound to a publicly reachable address.
+
 ### `[cluster]`
 
 Enables gossip-based clustering for TLS certificate management, rate limiting synchronization, and connection tracking.
@@ -161,7 +185,12 @@ Enables gossip-based clustering for TLS certificate management, rate limiting sy
 *   `enabled`: Set to `true` to enable cluster mode.
 *   `addr`: **REQUIRED** - Specific IP address (with optional port) to bind for cluster communication. **MUST** be a real IP address reachable from other cluster nodes. **CANNOT** use `0.0.0.0`, `localhost`, `127.0.0.1`, `::`, or `::1`. Examples: `"10.10.10.40:7946"` or `"10.10.10.40"` (uses `port` field if port not specified).
 *   `port`: Port for gossip protocol (default: `7946`). Only used if `addr` does not include a port.
-*   `node_id`: Unique identifier for this node (e.g., `"node-1"`).
+*   `node_id`: Unique identifier for this node (e.g., `"node-1"`). Defaults to the machine's hostname. This is also the node's **instance ID**, which is applied whether or not cluster mode is enabled.
+
+    `node_id` is internal and never appears on the wire. The name other mail systems see — the `by` host of the `Received:` header stamped on every delivery, the domain of the `Message-ID` on vacation auto-replies, and the protocol greetings — is taken from the machine's own hostname and is **not** affected by `node_id`. Those headers are supposed to be fully qualified (RFC 5321 §4.4), and a `Message-ID` in a domain that does not resolve is a spam signal on a reply the user did not choose to send, so give the host an FQDN; setting `node_id` to one does not help. The server logs a warning at startup if the resolved mail hostname is not fully qualified.
+
+    > **WARNING — changing `node_id` on a node with queued uploads loses mail.** The instance ID is the lease key for `pending_uploads`: a queued message body is a file on the local disk of the node that accepted it, so only that instance can upload it, and the cleaner deletes an unuploaded message once its owning instance stops sending heartbeats. Rows already queued keep the old ID, so after a rename nobody claims them and they are eventually reaped. To rename a node safely: stop accepting mail on it, wait until it has no rows left in `pending_uploads` (`sora-admin uploader status`), then restart under the new `node_id`. The cleanup worker logs a warning naming any instance ID that still owns uploads but is no longer alive.
+
 *   `peers`: List of other cluster nodes (e.g., `["10.10.10.41:7946", "10.10.10.42:7946"]`). **Do NOT include this node's address** - only list OTHER nodes in the cluster.
 *   `secret_key`: 32-byte base64-encoded key for encrypting cluster communication. Generate with: `openssl rand -base64 32`
 

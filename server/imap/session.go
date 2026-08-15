@@ -75,6 +75,11 @@ type IMAPSession struct {
 	// Memory tracking
 	memTracker *server.SessionMemoryTracker
 
+	// Body section retained for <offset.size> chunk fetches (see body_section_cache.go).
+	bodySectionCacheMu   sync.Mutex
+	bodySectionCacheKey  string
+	bodySectionCacheData []byte
+
 	// Session statistics for summary logging
 	messagesAppended atomic.Uint32
 	messagesExpunged atomic.Uint32
@@ -426,6 +431,7 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	if s.sessionTracker != nil {
 		s.sessionTracker.Close()
 	}
+	s.releaseBodySectionCache()
 	s.selectedMailbox = nil
 	s.selectedReadOnly.Store(false)
 	s.mailboxTracker = nil

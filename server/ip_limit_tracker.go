@@ -8,6 +8,7 @@ import (
 
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/server/idgen"
 )
 
 // IPLimitEventType represents the type of IP limit event
@@ -24,31 +25,30 @@ const (
 	IPLimitEventStateSnapshot IPLimitEventType = "IP_STATE_SNAPSHOT"
 )
 
-const (
-	// Default maximum size of IP event queue before we start dropping old events
-	defaultMaxIPEventQueueSize = 10000
-
-	// How often to broadcast full state snapshot for reconciliation
-	ipStateSnapshotInterval = 60 * time.Second
-)
+// Default maximum size of IP event queue before we start dropping old events
+const defaultMaxIPEventQueueSize = 10000
 
 // IPLimitEvent represents a cluster-wide per-IP connection event
 type IPLimitEvent struct {
 	Type       IPLimitEventType `json:"type"`
+	EventID    string           `json:"event_id"` // Unique per event, for duplicate suppression
 	IP         string           `json:"ip"`       // The IP address
 	Protocol   string           `json:"protocol"` // "IMAP", "POP3", etc.
 	Timestamp  time.Time        `json:"timestamp"`
 	NodeID     string           `json:"node_id"`
 	InstanceID string           `json:"instance_id"` // Unique instance identifier
 
-	// For state snapshots
+	// For state snapshots. This tracker only ever sends payload-less snapshots
+	// as liveness heartbeats; full state travels over push/pull.
 	StateSnapshot *IPLimitStateSnapshot `json:"state_snapshot,omitempty"`
 }
 
 // IPLimitStateSnapshot represents a full per-IP connection state for reconciliation
 type IPLimitStateSnapshot struct {
-	InstanceID  string                      `json:"instance_id"`
-	Timestamp   time.Time                   `json:"timestamp"`
+	InstanceID string    `json:"instance_id"`
+	Protocol   string    `json:"protocol"` // Which tracker the state belongs to
+	Timestamp  time.Time `json:"timestamp"`
+
 	Connections map[string]IPConnectionData `json:"connections"` // IP -> connection data
 }
 
@@ -60,13 +60,31 @@ type IPConnectionData struct {
 	LastUpdate     time.Time      `json:"last_update"`
 }
 
-// IPConnectionInfo tracks connection information for a specific IP
+// IPConnectionInfo tracks connection information for a specific IP.
+// LocalInstances is the only authoritative state: TotalCount and LocalCount are
+// derived from it by recalculate so the three can never drift apart.
 type IPConnectionInfo struct {
 	IP             string
 	TotalCount     int // Cluster-wide count (eventually consistent)
 	LocalCount     int // This instance's count
 	LastUpdate     time.Time
 	LocalInstances map[string]int // instanceID -> count on that instance
+}
+
+// recalculate derives the denormalized counters from the per-instance counts
+// and drops instances that no longer hold connections.
+func (info *IPConnectionInfo) recalculate(localInstanceID string) {
+	total := 0
+	for instanceID, count := range info.LocalInstances {
+		if count <= 0 {
+			delete(info.LocalInstances, instanceID)
+			continue
+		}
+		total += count
+	}
+
+	info.TotalCount = total
+	info.LocalCount = info.LocalInstances[localInstanceID]
 }
 
 // IPLimitTracker manages per-IP connection tracking using gossip protocol
@@ -79,21 +97,33 @@ type IPLimitTracker struct {
 	connections map[string]*IPConnectionInfo // IP -> info
 	mu          sync.RWMutex
 
+	// Instance tracking for liveness detection
+	instanceLastSeen map[string]time.Time
+
+	// Duplicate suppression for received events
+	dedup gossipDedup
+
+	// Decrements delivered ahead of the increment they cancel (guarded by mu)
+	deferred deferredDecrements
+
 	// Configuration
 	maxEventQueueSize int // Maximum events in broadcast queue
 
-	// Broadcast queue for outgoing events
-	broadcastQueue []IPLimitEvent
-	queueMu        sync.Mutex
+	// Outgoing gossip. The liveness heartbeat uses a queue of its own that is
+	// drained first: it is the smallest message the tracker produces, so under
+	// msgLen-descending transmit order it would otherwise lose to every
+	// ordinary event - exactly while a deep backlog is the reason peers most
+	// need proof this instance is alive.
+	queue          *gossipQueue
+	heartbeatQueue *gossipQueue
 
 	// Cleanup counter for periodic memory reporting
 	cleanupCounter uint64
 
 	// Shutdown
-	stopBroadcast     chan struct{}
-	stopCleanup       chan struct{}
-	stopStateSnapshot chan struct{}
-	stopOnce          sync.Once
+	stopBroadcast chan struct{}
+	stopCleanup   chan struct{}
+	stopOnce      sync.Once
 }
 
 // NewIPLimitTracker creates a new IP limit tracker.
@@ -110,11 +140,13 @@ func NewIPLimitTracker(protocol string, instanceID string, clusterMgr *cluster.M
 		instanceID:        instanceID,
 		clusterManager:    clusterMgr,
 		connections:       make(map[string]*IPConnectionInfo),
+		instanceLastSeen:  make(map[string]time.Time),
 		maxEventQueueSize: maxEventQueueSize,
-		broadcastQueue:    make([]IPLimitEvent, 0, 100),
+		queue:             newGossipQueue("ip-limit:"+protocol, clusterMgr, maxEventQueueSize),
+		heartbeatQueue:    newGossipQueue("ip-limit-heartbeat:"+protocol, clusterMgr, maxHeartbeatQueued),
+		deferred:          deferredDecrements{kind: "ip-limit:" + protocol},
 		stopBroadcast:     make(chan struct{}),
 		stopCleanup:       make(chan struct{}),
-		stopStateSnapshot: make(chan struct{}),
 	}
 
 	if clusterMgr != nil {
@@ -122,19 +154,43 @@ func NewIPLimitTracker(protocol string, instanceID string, clusterMgr *cluster.M
 		logger.Debug("IP limit tracker: Registering handlers with cluster manager", "protocol", protocol)
 		clusterMgr.RegisterIPLimitHandler(tracker.HandleClusterEvent)
 		clusterMgr.RegisterIPLimitBroadcaster(tracker.GetBroadcasts)
+		// The registration name only has to be unique on this node: push/pull
+		// state is dispatched by kind and each tracker decides from the
+		// protocol inside the payload whether the state is its own.
+		clusterMgr.RegisterStateProvider(cluster.StateKindIPLimit, instanceID, tracker.localState, tracker.mergeRemoteState)
 		logger.Debug("IP limit tracker: Handlers registered successfully", "protocol", protocol)
 
 		// Start background routines
-		go tracker.broadcastRoutine()
+		go tracker.heartbeatRoutine()
 		go tracker.cleanupRoutine()
-		go tracker.stateSnapshotRoutine()
 	}
 
 	return tracker
 }
 
+// markInstanceSeen records that an instance is still gossiping. Callers must
+// hold t.mu.
+func (t *IPLimitTracker) markInstanceSeen(instanceID string) {
+	if instanceID == "" || instanceID == t.instanceID {
+		return
+	}
+	if t.instanceLastSeen == nil {
+		t.instanceLastSeen = make(map[string]time.Time)
+	}
+	t.instanceLastSeen[instanceID] = time.Now()
+}
+
 // IncrementIP increments the connection count for an IP
 func (t *IPLimitTracker) IncrementIP(ip string) {
+	// Encoding happens outside the tracker lock: every accept on this listener
+	// serialises on it, and gob encoding an event is orders of magnitude more
+	// work than the bookkeeping it protects.
+	if event := t.incrementLocked(ip); event != nil {
+		t.queueEvent(*event)
+	}
+}
+
+func (t *IPLimitTracker) incrementLocked(ip string) *IPLimitEvent {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -142,8 +198,6 @@ func (t *IPLimitTracker) IncrementIP(ip string) {
 	if !exists {
 		info = &IPConnectionInfo{
 			IP:             ip,
-			TotalCount:     0,
-			LocalCount:     0,
 			LastUpdate:     time.Now(),
 			LocalInstances: make(map[string]int),
 		}
@@ -151,57 +205,50 @@ func (t *IPLimitTracker) IncrementIP(ip string) {
 	}
 
 	// Increment counts
-	info.LocalCount++
-	info.TotalCount++
-	info.LastUpdate = time.Now()
 	info.LocalInstances[t.instanceID]++
+	info.LastUpdate = time.Now()
+	info.recalculate(t.instanceID)
 
 	// Broadcast event (if in cluster mode)
-	if t.clusterManager != nil {
-		event := IPLimitEvent{
-			Type:       IPLimitEventIncrement,
-			IP:         ip,
-			Protocol:   t.protocol,
-			Timestamp:  time.Now(),
-			NodeID:     t.clusterManager.GetNodeID(),
-			InstanceID: t.instanceID,
-		}
-		t.queueEvent(event)
+	if t.clusterManager == nil {
+		return nil
+	}
+
+	return &IPLimitEvent{
+		Type:       IPLimitEventIncrement,
+		IP:         ip,
+		Protocol:   t.protocol,
+		Timestamp:  time.Now(),
+		NodeID:     t.clusterManager.GetNodeID(),
+		InstanceID: t.instanceID,
 	}
 }
 
 // DecrementIP decrements the connection count for an IP
 func (t *IPLimitTracker) DecrementIP(ip string) {
+	// Encoding happens outside the tracker lock, as in IncrementIP.
+	if event := t.decrementLocked(ip); event != nil {
+		t.queueEvent(*event)
+	}
+}
+
+func (t *IPLimitTracker) decrementLocked(ip string) *IPLimitEvent {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	info, exists := t.connections[ip]
 	if !exists {
-		return // Nothing to decrement
+		return nil // Nothing to decrement
 	}
 
 	// Only decrement if we actually own connections for this IP
 	if info.LocalCount == 0 {
-		return // Don't decrement connections we don't own
+		return nil // Don't decrement connections we don't own
 	}
 
-	// Decrement local count
-	info.LocalCount--
-
-	// Decrement total count (we own this connection)
-	if info.TotalCount > 0 {
-		info.TotalCount--
-	}
+	info.LocalInstances[t.instanceID]--
 	info.LastUpdate = time.Now()
-
-	// Decrement instance count
-	if count := info.LocalInstances[t.instanceID]; count > 0 {
-		info.LocalInstances[t.instanceID] = count - 1
-		// Clean up zero counts
-		if info.LocalInstances[t.instanceID] == 0 {
-			delete(info.LocalInstances, t.instanceID)
-		}
-	}
+	info.recalculate(t.instanceID)
 
 	// Clean up IP entry if no connections remain
 	if info.TotalCount == 0 && len(info.LocalInstances) == 0 {
@@ -209,16 +256,17 @@ func (t *IPLimitTracker) DecrementIP(ip string) {
 	}
 
 	// Broadcast event (if in cluster mode)
-	if t.clusterManager != nil {
-		event := IPLimitEvent{
-			Type:       IPLimitEventDecrement,
-			IP:         ip,
-			Protocol:   t.protocol,
-			Timestamp:  time.Now(),
-			NodeID:     t.clusterManager.GetNodeID(),
-			InstanceID: t.instanceID,
-		}
-		t.queueEvent(event)
+	if t.clusterManager == nil {
+		return nil
+	}
+
+	return &IPLimitEvent{
+		Type:       IPLimitEventDecrement,
+		IP:         ip,
+		Protocol:   t.protocol,
+		Timestamp:  time.Now(),
+		NodeID:     t.clusterManager.GetNodeID(),
+		InstanceID: t.instanceID,
 	}
 }
 
@@ -233,56 +281,43 @@ func (t *IPLimitTracker) GetIPCount(ip string) int {
 	return 0
 }
 
-// queueEvent adds an event to the broadcast queue
+// queueEvent encodes an event and hands it to the right gossip queue. A
+// payload-less snapshot is a liveness heartbeat and goes to the queue that is
+// drained first; everything else is a counter delta that the next push/pull
+// can repair.
 func (t *IPLimitTracker) queueEvent(event IPLimitEvent) {
-	t.queueMu.Lock()
-	defer t.queueMu.Unlock()
-
-	// Add event to queue
-	t.broadcastQueue = append(t.broadcastQueue, event)
-
-	// Limit queue size to prevent unbounded memory growth
-	if len(t.broadcastQueue) > t.maxEventQueueSize {
-		// Drop oldest events
-		dropped := len(t.broadcastQueue) - t.maxEventQueueSize
-		t.broadcastQueue = t.broadcastQueue[dropped:]
-		logger.Warn("IP limit tracker: Dropped old events from broadcast queue", "protocol", t.protocol, "dropped", dropped)
+	if event.EventID == "" {
+		event.EventID = idgen.New()
 	}
+
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(event); err != nil {
+		logger.Warn("IP limit tracker: Failed to encode event", "protocol", t.protocol, "type", event.Type, "error", err)
+		return
+	}
+
+	if event.Type == IPLimitEventStateSnapshot && event.StateSnapshot == nil {
+		t.heartbeatQueue.enqueue(buf.Bytes())
+		return
+	}
+
+	t.queue.enqueue(buf.Bytes())
 }
 
-// GetBroadcasts returns pending broadcasts for gossip (called by cluster manager)
+// GetBroadcasts returns pending broadcasts for gossip (called by cluster
+// manager). memberlist calls this once per gossip target, so an event stays
+// queued until it has been transmitted often enough to have reached the cluster.
 func (t *IPLimitTracker) GetBroadcasts(overhead, limit int) [][]byte {
-	t.queueMu.Lock()
-	defer t.queueMu.Unlock()
+	return drainTiers(t.heartbeatQueue, nil, t.queue, overhead, limit)
+}
 
-	var broadcasts [][]byte
-	totalSize := 0
-
-	// Process events from queue
-	for len(t.broadcastQueue) > 0 {
-		event := t.broadcastQueue[0]
-
-		// Encode event
-		var buf bytes.Buffer
-		enc := gob.NewEncoder(&buf)
-		if err := enc.Encode(event); err != nil {
-			logger.Warn("IP limit tracker: Failed to encode event", "protocol", t.protocol, "error", err)
-			t.broadcastQueue = t.broadcastQueue[1:] // Skip this event
-			continue
-		}
-
-		msgSize := overhead + buf.Len()
-		if totalSize+msgSize > limit && len(broadcasts) > 0 {
-			// Reached size limit, keep remaining events for next broadcast
-			break
-		}
-
-		broadcasts = append(broadcasts, buf.Bytes())
-		totalSize += msgSize
-		t.broadcastQueue = t.broadcastQueue[1:]
+// decodeIPLimitEvent decodes an event from bytes using gob
+func decodeIPLimitEvent(data []byte) (IPLimitEvent, error) {
+	var event IPLimitEvent
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&event); err != nil {
+		return event, err
 	}
-
-	return broadcasts
+	return event, nil
 }
 
 // HandleClusterEvent processes incoming events from other cluster nodes
@@ -300,14 +335,51 @@ func (t *IPLimitTracker) HandleClusterEvent(data []byte) {
 		return
 	}
 
+	// Every tracker receives every per-IP event, but counts are per protocol:
+	// without this filter an IMAP connection would be counted against the POP3
+	// limit and never retired by the POP3 owner's state.
+	if event.Protocol != "" && event.Protocol != t.protocol {
+		return
+	}
+
+	// Gossip delivery is at-least-once: increment and decrement move a counter,
+	// so a retransmitted copy must not be applied twice.
+	if t.dedup.seenBefore(event.EventID) {
+		return
+	}
+
 	switch event.Type {
 	case IPLimitEventIncrement:
 		t.handleRemoteIncrement(&event)
 	case IPLimitEventDecrement:
 		t.handleRemoteDecrement(&event)
 	case IPLimitEventStateSnapshot:
-		t.handleStateSnapshot(&event)
+		// A payload-less snapshot is a liveness heartbeat. A snapshot that does
+		// carry state comes from a node old enough to still gossip full state,
+		// and those events have no Protocol, so they reach every protocol's
+		// tracker and cannot be attributed to one: applying them would let one
+		// protocol's counts overwrite another's. Liveness is all we take.
+		t.handleHeartbeat(&event)
 	}
+}
+
+// handleHeartbeat records that the sending instance is still alive
+func (t *IPLimitTracker) handleHeartbeat(event *IPLimitEvent) {
+	if event.StateSnapshot != nil {
+		logger.Debug("IP limit tracker: Ignoring gossiped full state (pre-push/pull node)",
+			"protocol", t.protocol, "instance", event.InstanceID)
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.markInstanceSeen(event.InstanceID)
+}
+
+// ipCounterKey identifies the counter an increment/decrement pair moves. Both
+// events of a pair come from the same instance, so timestamps taken from this
+// key's clock are comparable.
+func ipCounterKey(instanceID, ip string) string {
+	return instanceID + "|" + ip
 }
 
 // handleRemoteIncrement processes an increment event from another node
@@ -315,22 +387,27 @@ func (t *IPLimitTracker) handleRemoteIncrement(event *IPLimitEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	t.markInstanceSeen(event.InstanceID)
+
+	// A decrement for this connection may have been delivered first; the two
+	// then cancel and neither is applied.
+	if t.deferred.consume(ipCounterKey(event.InstanceID, event.IP), event.Timestamp) {
+		return
+	}
+
 	info, exists := t.connections[event.IP]
 	if !exists {
 		info = &IPConnectionInfo{
 			IP:             event.IP,
-			TotalCount:     0,
-			LocalCount:     0,
 			LastUpdate:     time.Now(),
 			LocalInstances: make(map[string]int),
 		}
 		t.connections[event.IP] = info
 	}
 
-	// Increment cluster-wide count
-	info.TotalCount++
-	info.LastUpdate = event.Timestamp
 	info.LocalInstances[event.InstanceID]++
+	info.LastUpdate = event.Timestamp
+	info.recalculate(t.instanceID)
 }
 
 // handleRemoteDecrement processes a decrement event from another node
@@ -338,23 +415,20 @@ func (t *IPLimitTracker) handleRemoteDecrement(event *IPLimitEvent) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	t.markInstanceSeen(event.InstanceID)
+
+	// Nothing to subtract from: the increment may simply be delivered later, so
+	// the decrement is held until it shows up rather than dropped, which would
+	// leave the increment as a phantom connection against the per-IP limit.
 	info, exists := t.connections[event.IP]
-	if !exists {
-		return // Nothing to decrement
+	if !exists || info.LocalInstances[event.InstanceID] <= 0 {
+		t.deferred.hold(ipCounterKey(event.InstanceID, event.IP), event.Timestamp)
+		return
 	}
 
-	// Decrement cluster-wide count
-	if info.TotalCount > 0 {
-		info.TotalCount--
-	}
+	info.LocalInstances[event.InstanceID]--
 	info.LastUpdate = event.Timestamp
-
-	if count := info.LocalInstances[event.InstanceID]; count > 0 {
-		info.LocalInstances[event.InstanceID] = count - 1
-		if info.LocalInstances[event.InstanceID] == 0 {
-			delete(info.LocalInstances, event.InstanceID)
-		}
-	}
+	info.recalculate(t.instanceID)
 
 	// Clean up if no connections remain
 	if info.TotalCount == 0 && len(info.LocalInstances) == 0 {
@@ -362,62 +436,174 @@ func (t *IPLimitTracker) handleRemoteDecrement(event *IPLimitEvent) {
 	}
 }
 
-// handleStateSnapshot processes a full state snapshot from another node
-func (t *IPLimitTracker) handleStateSnapshot(event *IPLimitEvent) {
-	if event.StateSnapshot == nil {
+// reconcileState applies a peer's authoritative per-IP state. A snapshot only
+// carries the counts the sending instance owns: every other instance is
+// authoritative for its own, and an IP the snapshot does not mention is one the
+// sender no longer holds connections from.
+func (t *IPLimitTracker) reconcileState(snapshot *IPLimitStateSnapshot) {
+	if snapshot == nil || snapshot.InstanceID == "" || snapshot.InstanceID == t.instanceID {
+		return
+	}
+
+	// Push/pull hands every per-IP payload to every IP tracker on this node,
+	// because the name it was registered under is only unique on the node that
+	// produced it. The protocol inside the payload is what says whose state it
+	// is; a snapshot that does not name one comes from a build that predates
+	// the field and is taken as addressed to us.
+	if snapshot.Protocol != "" && snapshot.Protocol != t.protocol {
+		return
+	}
+
+	if age := time.Since(snapshot.Timestamp); age > staleEventThreshold {
+		logger.Debug("IP limit tracker: Ignoring stale state snapshot", "protocol", t.protocol,
+			"instance", snapshot.InstanceID, "age", age)
 		return
 	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	snapshot := event.StateSnapshot
+	t.markInstanceSeen(snapshot.InstanceID)
 
-	// Merge remote state
+	removed := 0
+	updated := 0
+
+	// Retire counts the sender no longer reports.
+	for ip, info := range t.connections {
+		if _, stillHeld := snapshot.Connections[ip]; stillHeld {
+			continue
+		}
+		if _, attributed := info.LocalInstances[snapshot.InstanceID]; !attributed {
+			continue
+		}
+
+		delete(info.LocalInstances, snapshot.InstanceID)
+		info.recalculate(t.instanceID)
+		removed++
+
+		if info.TotalCount == 0 && len(info.LocalInstances) == 0 {
+			delete(t.connections, ip)
+		}
+	}
+
+	// Replace the sender's counts with the authoritative ones.
 	for ip, remoteData := range snapshot.Connections {
+		count := remoteData.LocalInstances[snapshot.InstanceID]
+
 		info, exists := t.connections[ip]
 		if !exists {
+			if count <= 0 {
+				continue
+			}
 			info = &IPConnectionInfo{
 				IP:             ip,
-				TotalCount:     0,
-				LocalCount:     0,
-				LastUpdate:     time.Now(),
+				LastUpdate:     remoteData.LastUpdate,
 				LocalInstances: make(map[string]int),
 			}
 			t.connections[ip] = info
 		}
 
-		// Merge instance counts from remote snapshot
-		for instanceID, count := range remoteData.LocalInstances {
-			if instanceID == t.instanceID {
-				continue // Don't override our own count
-			}
-			info.LocalInstances[instanceID] = count
+		info.LocalInstances[snapshot.InstanceID] = count
+		if remoteData.LastUpdate.After(info.LastUpdate) {
+			info.LastUpdate = remoteData.LastUpdate
 		}
+		info.recalculate(t.instanceID)
+		updated++
 
-		// Recalculate total from all instances
-		total := 0
-		for _, count := range info.LocalInstances {
-			total += count
+		if info.TotalCount == 0 && len(info.LocalInstances) == 0 {
+			delete(t.connections, ip)
 		}
-		info.TotalCount = total
-		info.LastUpdate = remoteData.LastUpdate
+	}
+
+	if removed > 0 || updated > 0 {
+		logger.Debug("IP limit tracker: Reconciled state", "protocol", t.protocol,
+			"instance", snapshot.InstanceID, "updated", updated, "removed", removed)
 	}
 }
 
-// broadcastRoutine periodically processes the broadcast queue
-func (t *IPLimitTracker) broadcastRoutine() {
-	ticker := time.NewTicker(100 * time.Millisecond)
+// stateSnapshot builds this instance's authoritative per-IP state
+func (t *IPLimitTracker) stateSnapshot() *IPLimitStateSnapshot {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	now := time.Now()
+	connections := make(map[string]IPConnectionData, len(t.connections))
+	for ip, info := range t.connections {
+		count := info.LocalInstances[t.instanceID]
+		if count <= 0 {
+			continue
+		}
+
+		connections[ip] = IPConnectionData{
+			IP:             ip,
+			LocalInstances: map[string]int{t.instanceID: count},
+			TotalCount:     count,
+			LastUpdate:     now,
+		}
+	}
+
+	return &IPLimitStateSnapshot{
+		InstanceID:  t.instanceID,
+		Protocol:    t.protocol,
+		Timestamp:   now,
+		Connections: connections,
+	}
+}
+
+// localState encodes this instance's per-IP state for a memberlist push/pull
+// exchange. Full state is exchanged over push/pull rather than gossip because
+// it outgrows the gossip datagram budget, while push/pull runs over TCP.
+// An empty snapshot is still sent: it tells peers to retire our old counts.
+func (t *IPLimitTracker) localState() []byte {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(t.stateSnapshot()); err != nil {
+		logger.Warn("IP limit tracker: Failed to encode state snapshot", "protocol", t.protocol, "error", err)
+		return nil
+	}
+	return buf.Bytes()
+}
+
+// mergeRemoteState applies a peer's per-IP state received over push/pull
+func (t *IPLimitTracker) mergeRemoteState(data []byte) {
+	var snapshot IPLimitStateSnapshot
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&snapshot); err != nil {
+		logger.Warn("IP limit tracker: Failed to decode remote state", "protocol", t.protocol, "error", err)
+		return
+	}
+
+	t.reconcileState(&snapshot)
+}
+
+// heartbeatRoutine re-asserts that this instance is alive. Peers retire the
+// counts of an instance they stop hearing from (see performCleanup), and an
+// instance whose connections are all idle produces no other gossip: push/pull
+// would refresh it eventually, but it pairs with one random peer per round, so
+// in a cluster of a dozen nodes a given peer is not reached reliably within the
+// staleness threshold.
+func (t *IPLimitTracker) heartbeatRoutine() {
+	ticker := time.NewTicker(gossipHeartbeatInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			// Queue is processed via GetBroadcasts callback from memberlist
+			t.queueHeartbeat()
 		case <-t.stopBroadcast:
 			return
 		}
 	}
+}
+
+// queueHeartbeat gossips proof that this instance is alive. It is a state
+// snapshot event with no state: the counts themselves travel over push/pull.
+func (t *IPLimitTracker) queueHeartbeat() {
+	t.queueEvent(IPLimitEvent{
+		Type:       IPLimitEventStateSnapshot,
+		Protocol:   t.protocol,
+		Timestamp:  time.Now(),
+		NodeID:     t.clusterManager.GetNodeID(),
+		InstanceID: t.instanceID,
+	})
 }
 
 // cleanupRoutine periodically cleans up stale connection data
@@ -440,26 +626,52 @@ func (t *IPLimitTracker) performCleanup() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	now := time.Now()
 	cleaned := 0
+	purged := 0
+
+	// Counts are only ever retired by their owner, so an owner that stopped
+	// heartbeating takes its counts with it: its connections died with the
+	// instance and nothing else will retire them. Counts this instance owns are
+	// authoritative for as long as the connection is open and never age out.
+	alive := func(instanceID string) bool {
+		if instanceID == t.instanceID {
+			return true
+		}
+		lastSeen, known := t.instanceLastSeen[instanceID]
+		return known && now.Sub(lastSeen) <= staleInstanceThreshold
+	}
+
+	// Forget decrements whose increment never arrived.
+	t.deferred.prune(gossipDedupWindow)
+
 	for ip, info := range t.connections {
-		// FIRST: Clean up zero-count instance entries
-		// This must happen before checking if the IP should be removed
-		for instanceID, count := range info.LocalInstances {
-			if count <= 0 {
-				delete(info.LocalInstances, instanceID)
+		for instanceID := range info.LocalInstances {
+			if alive(instanceID) {
+				continue
 			}
+			delete(info.LocalInstances, instanceID)
+			purged++
 		}
 
-		// SECOND: Clean up IPs with no connections
-		// After removing zero-count instances, check if IP should be removed
+		// Drop zero counts, then IPs with nothing left.
+		info.recalculate(t.instanceID)
 		if info.TotalCount == 0 && len(info.LocalInstances) == 0 {
 			delete(t.connections, ip)
 			cleaned++
 		}
 	}
 
-	if cleaned > 0 {
-		logger.Debug("IP limit tracker: Cleaned up stale IPs", "protocol", t.protocol, "count", cleaned)
+	for instanceID, lastSeen := range t.instanceLastSeen {
+		if now.Sub(lastSeen) > staleInstanceThreshold {
+			logger.Info("IP limit tracker: Purging stale instance data", "protocol", t.protocol,
+				"instance", instanceID, "age", now.Sub(lastSeen))
+			delete(t.instanceLastSeen, instanceID)
+		}
+	}
+
+	if cleaned > 0 || purged > 0 {
+		logger.Debug("IP limit tracker: Cleaned up stale IPs", "protocol", t.protocol, "ips", cleaned, "instances", purged)
 	}
 
 	// Log memory usage stats every 10 cleanup cycles (~50 minutes with 5min cleanup interval)
@@ -479,78 +691,12 @@ func (t *IPLimitTracker) performCleanup() {
 	}
 }
 
-// stateSnapshotRoutine periodically broadcasts full state snapshots
-func (t *IPLimitTracker) stateSnapshotRoutine() {
-	ticker := time.NewTicker(ipStateSnapshotInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			t.broadcastStateSnapshot()
-		case <-t.stopStateSnapshot:
-			return
-		}
-	}
-}
-
-// broadcastStateSnapshot sends a full state snapshot to the cluster
-func (t *IPLimitTracker) broadcastStateSnapshot() {
-	t.mu.RLock()
-
-	// Build snapshot
-	connections := make(map[string]IPConnectionData)
-	for ip, info := range t.connections {
-		if info.TotalCount == 0 {
-			continue // Skip empty entries
-		}
-
-		// Copy instance counts
-		localInstances := make(map[string]int)
-		for instanceID, count := range info.LocalInstances {
-			if count > 0 {
-				localInstances[instanceID] = count
-			}
-		}
-
-		connections[ip] = IPConnectionData{
-			IP:             ip,
-			LocalInstances: localInstances,
-			TotalCount:     info.TotalCount,
-			LastUpdate:     info.LastUpdate,
-		}
-	}
-	t.mu.RUnlock()
-
-	if len(connections) == 0 {
-		return // Nothing to broadcast
-	}
-
-	snapshot := IPLimitStateSnapshot{
-		InstanceID:  t.instanceID,
-		Timestamp:   time.Now(),
-		Connections: connections,
-	}
-
-	event := IPLimitEvent{
-		Type:          IPLimitEventStateSnapshot,
-		Timestamp:     time.Now(),
-		NodeID:        t.clusterManager.GetNodeID(),
-		InstanceID:    t.instanceID,
-		StateSnapshot: &snapshot,
-	}
-
-	t.queueEvent(event)
-	logger.Debug("IP limit tracker: Queued state snapshot", "protocol", t.protocol, "ips", len(connections))
-}
-
 // Stop shuts down the IP limit tracker
 func (t *IPLimitTracker) Stop() {
 	t.stopOnce.Do(func() {
 		if t.clusterManager != nil {
 			close(t.stopBroadcast)
 			close(t.stopCleanup)
-			close(t.stopStateSnapshot)
 		}
 	})
 }

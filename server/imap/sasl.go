@@ -61,21 +61,25 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 				}
 			}
 
+			// Rate-limit key for this AUTHENTICATE command. Derived from the
+			// AUTHENTICATION identity (the credential actually being verified), never
+			// from the authorization identity: the latter is the account being
+			// impersonated, so keying on it would make a failed master credential land
+			// a block on the victim. A master SASL username is not an address and
+			// keeps a stable key of its own; the master form
+			// "user@domain.com@MASTERUSER" carries the target INSIDE the
+			// authentication identity and canonicalises to it, so it is keyed on the
+			// master credential instead (AuthRateLimitKeyWithMaster). Must match every
+			// RecordAuthAttempt* key used below.
+			authKey := server.AuthRateLimitKeyWithMaster(username, s.server.masterUsername)
+
 			// Check authentication rate limiting after delay
 			if s.server.authLimiter != nil {
-				targetUser := username
-				if identity != "" {
-					targetUser = identity // Use authorization identity if provided
-				}
-				if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, targetUser); err != nil {
+				if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, netConn, proxyInfo, authKey); err != nil {
 					s.DebugLog("SASL PLAIN rate limited", "error", err)
 					// Same response as a bad-credential failure (matches Login below) so the
 					// rate-limit state isn't an observable oracle. (security-audit M14)
-					return &imap.Error{
-						Type: imap.StatusResponseTypeNo,
-						Code: imap.ResponseCodeAuthenticationFailed,
-						Text: "Invalid address or password",
-					}
+					return authFailedError()
 				}
 			}
 
@@ -100,19 +104,23 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// Parse target user address
 					address, err := server.NewAddress(targetUserToImpersonate)
 					if err != nil {
-						s.DebugLog("failed to parse impersonation target user", "target_user", targetUserToImpersonate, "error", err)
+						// A rejected impersonation target is answered exactly like a bad
+						// credential, and recorded exactly like one. This site is reachable
+						// ONLY with the correct master password, so a distinguishable reply
+						// — or a failure the master credential is not charged for, which
+						// diverges from a wrong password at the block threshold — confirms a
+						// guessed tenant-wide password without completing an authentication.
+						// The real reason stays in the log for the operator.
+						s.WarnLog("impersonation target rejected (address not in the correct format)", "target_user", targetUserToImpersonate, "error", err)
 						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-						return &imap.Error{
-							Type: imap.StatusResponseTypeNo,
-							Code: imap.ResponseCodeAuthorizationFailed,
-							Text: "Impersonation target user address is not in the correct format.",
+						if s.server.authLimiter != nil {
+							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
 						}
+						return authFailedError()
 					}
 
 					AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
-						s.DebugLog("failed to get account ID for impersonation target", "target_user", targetUserToImpersonate, "error", err)
-
 						// Check if error is due to context cancellation (server shutdown)
 						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 							s.InfoLog("master username auth cancelled due to server shutdown")
@@ -123,12 +131,13 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 							}
 						}
 
+						// Same reply and same accounting as a bad credential (see above).
+						s.WarnLog("impersonation target rejected (account not found)", "target_user", targetUserToImpersonate, "error", err)
 						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-						return &imap.Error{
-							Type: imap.StatusResponseTypeNo,
-							Code: imap.ResponseCodeAuthorizationFailed,
-							Text: "Impersonation target user account not found.",
+						if s.server.authLimiter != nil {
+							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
 						}
+						return authFailedError()
 					}
 
 					// Get primary email address for this account
@@ -175,6 +184,13 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 							Text: "Maximum connections reached",
 						}
 					}
+
+					// Start termination poller to check for kick commands. Required on
+					// every authenticated path: it is the only delivery path for kicks,
+					// and imapproxy authenticates to its backends with exactly this
+					// master AUTHENTICATE, so without it proxied backend sessions are
+					// tracked but unkickable.
+					s.startTerminationPoller()
 
 					// Trigger cache warmup for the authenticated user (if configured)
 					s.triggerCacheWarmup()
@@ -193,19 +209,22 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 				// Record failed master password authentication
 				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, usernameParsed.BaseAddress(), false)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
 				}
 
-				// Master username suffix was provided but master password was wrong - fail immediately
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeAuthenticationFailed,
-					Text: "Invalid master credentials",
-				}
+				// Answer exactly like any other bad credential: a distinct reply is
+				// reachable with only the master USERNAME and confirms it to an
+				// attacker (see login.go). Reason kept for the operator at WARN.
+				s.WarnLog("master username authentication failed (invalid master password)")
+				return authFailedError()
 			}
 
 			// 2. Check for Master SASL Authentication (traditional SASL proxy authentication)
-			if len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
+			// Only ever a master login when the client asked to act as somebody: the
+			// authorization identity IS the impersonation target. A submission without
+			// one cannot be a master login, so it is not answered from here at all —
+			// see the no-authorization-identity note below.
+			if identity != "" && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
 				// Check if the provided authentication identity and password match the server's master SASL credentials
 				if checkMasterCredential(username, s.server.masterSASLUsername) &&
 					checkMasterCredential(password, s.server.masterSASLPassword) {
@@ -217,24 +236,21 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					if !s.server.masterSASLGate.Allowed(netConn.RemoteAddr()) {
 						s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
 						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-						return &imap.Error{
-							Type: imap.StatusResponseTypeNo,
-							Code: imap.ResponseCodeAuthenticationFailed,
-							Text: "Authentication failed",
+						// Recorded and answered exactly like a wrong master password.
+						// This site is reachable ONLY with the CORRECT one, so anything
+						// that distinguishes it — a different reply, or a failure the
+						// credential is not charged for, which diverges at the block
+						// threshold — confirms a guessed tenant-wide password to a peer
+						// that is not even allowed to use it. The reason stays in the log.
+						if s.server.authLimiter != nil {
+							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
 						}
+						return authFailedError()
 					}
 
-					// Master SASL credentials match. The user to log in as is the authorization-identity.
+					// Master SASL credentials match. The user to log in as is the
+					// authorization-identity, which is non-empty here by construction.
 					targetUserToImpersonate := identity
-					if targetUserToImpersonate == "" {
-						s.DebugLog("master SASL authentication successful but no authorization identity provided", "username", username)
-						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-						return &imap.Error{
-							Type: imap.StatusResponseTypeNo,
-							Code: imap.ResponseCodeAuthorizationFailed,
-							Text: "Master SASL login requires an authorization identity (target user to impersonate).",
-						}
-					}
 
 					s.DebugLog("master SASL user authenticated, attempting to impersonate", "username", username, "target_user", targetUserToImpersonate)
 
@@ -242,19 +258,18 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// For master impersonation, we directly establish the session for them.
 					address, err := server.NewAddress(targetUserToImpersonate)
 					if err != nil {
-						s.DebugLog("failed to parse impersonation target user", "target_user", targetUserToImpersonate, "error", err)
+						// Same reply and same accounting as a bad credential: see the
+						// master-username path above.
+						s.WarnLog("impersonation target rejected (address not in the correct format)", "target_user", targetUserToImpersonate, "error", err)
 						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-						return &imap.Error{
-							Type: imap.StatusResponseTypeNo,
-							Code: imap.ResponseCodeAuthorizationFailed,
-							Text: "Impersonation target user address is not in the correct format.",
+						if s.server.authLimiter != nil {
+							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
 						}
+						return authFailedError()
 					}
 
 					AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
-						s.DebugLog("failed to get account ID for impersonation target", "target_user", targetUserToImpersonate, "error", err)
-
 						// Check if error is due to context cancellation (server shutdown)
 						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 							s.InfoLog("master SASL auth cancelled due to server shutdown")
@@ -265,12 +280,13 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 							}
 						}
 
+						// Same reply and same accounting as a bad credential (see above).
+						s.WarnLog("impersonation target rejected (account not found)", "target_user", targetUserToImpersonate, "error", err)
 						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-						return &imap.Error{
-							Type: imap.StatusResponseTypeNo,
-							Code: imap.ResponseCodeAuthorizationFailed, // Target user does not exist
-							Text: "Impersonation target user account not found.",
+						if s.server.authLimiter != nil {
+							s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
 						}
+						return authFailedError()
 					}
 
 					// Get primary email address for this account
@@ -318,6 +334,13 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						}
 					}
 
+					// Start termination poller to check for kick commands. Required on
+					// every authenticated path: it is the only delivery path for kicks,
+					// and imapproxy authenticates to its backends with exactly this
+					// master AUTHENTICATE, so without it proxied backend sessions are
+					// tracked but unkickable.
+					s.startTerminationPoller()
+
 					// Trigger cache warmup for the authenticated user (if configured)
 					s.triggerCacheWarmup()
 
@@ -330,7 +353,53 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					}
 
 					return nil
+				} else if checkMasterCredential(username, s.server.masterSASLUsername) && identity != username {
+					// The authentication identity IS the master SASL username, a
+					// DIFFERENT user was named as the impersonation target, but the
+					// password is wrong. This must
+					// be recorded as an authentication failure and must not fall through
+					// to regular authentication: master SASL is a tenant-wide
+					// impersonation capability, and the regular path records nothing for
+					// it (the master SASL username is not an address), which left the
+					// credential brute-forceable at connection rate. Recorded under
+					// authKey — the master username's own bucket — so the impersonation
+					// target is not locked out.
+					//
+					// The identity != username guard keeps this off an ordinary login:
+					// RFC 4616 lets a client send an authorization identity equal to the
+					// authentication identity to mean "no impersonation", and several SASL
+					// libraries always fill the field in. For an account whose address
+					// happens to be the master SASL username, answering that from here
+					// would refuse its own password forever. Such a submission falls
+					// through to regular authentication instead, which records its own
+					// failure under the same authKey — so a master-password guess dressed
+					// up as a self-login is still metered, just not privileged.
+					s.WarnLog("master SASL authentication failed (invalid password)", "peer", server.GetAddrString(netConn.RemoteAddr()))
+					metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
+					if s.server.authLimiter != nil {
+						s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
+					}
+					// Same response as any other bad credential: a distinct one would
+					// confirm the master SASL username to an attacker.
+					return authFailedError()
 				}
+			}
+
+			// Master SASL credentials submitted WITHOUT an authorization identity.
+			// There is nothing to impersonate, so this is not a master login and must
+			// not be answered differently from any other login by that username: the
+			// old "requires an authorization identity" reply was reachable only with
+			// the CORRECT master password, so anyone who could reach the port could
+			// confirm a guessed tenant-wide password without completing an
+			// authentication. It falls through to regular authentication instead —
+			// same reply, same rate-limit accounting, whatever the password — which
+			// also lets an account whose address happens to be the master SASL
+			// username log in with its own password. Logged for the operator
+			// debugging a proxy that forgot to send the target user.
+			if identity == "" && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 &&
+				checkMasterCredential(username, s.server.masterSASLUsername) &&
+				checkMasterCredential(password, s.server.masterSASLPassword) {
+				s.WarnLog("master SASL password presented without an authorization identity; not a master login, falling through to regular authentication", "peer", server.GetAddrString(netConn.RemoteAddr()))
 			}
 
 			// 3. Regular User Authentication

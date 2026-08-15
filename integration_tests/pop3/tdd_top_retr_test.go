@@ -42,18 +42,58 @@ func (s *TDDTestServer) Close() {
 	}
 }
 
+// waitForPOP3Listener blocks until addr accepts a TCP connection, the server reports a
+// startup error, or the deadline passes. It exists because this package rebinds a port it
+// has just closed, which is not instantaneous.
+func waitForPOP3Listener(t *testing.T, addr string, errChan <-chan error) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Fatalf("POP3 server failed to start on %s: %v", addr, err)
+			}
+		default:
+		}
+
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("POP3 server never started listening on %s: %v", addr, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func SetupPOP3ServerWithUploader(t *testing.T) (*TDDTestServer, common.TestAccount) {
 	t.Helper()
 
 	// 1. Set up the baseline POP3 server (sets up DB and account)
 	baseServer, account := common.SetupPOP3Server(t)
 
-	// Close the baseline POP3 server so we can listen on the same port
+	// Close the baseline POP3 server. Only its database and account are wanted here; the
+	// listener is replaced by the uploader-backed server built below.
 	if basePOP3, ok := baseServer.Server.(*pop3.POP3Server); ok {
 		basePOP3.Close()
 	} else {
 		t.Fatalf("baseServer.Server is not *pop3.POP3Server")
 	}
+
+	// Bind a FRESH port rather than reusing the one just closed. Close() returns before
+	// its accept loop has actually released the socket, so an immediate rebind loses the
+	// race often enough to matter: measured at 2 failures in 8 runs of this group, each
+	// time a different test, surfacing as "address already in use" (or, before the startup
+	// check below existed, as an unattributed "connection refused" in whichever test drew
+	// the short straw). Reusing the address bought nothing - the baseline listener is
+	// discarded either way - so the race is removed rather than waited out. Every test in
+	// this file reaches the server through TestServer.Address, so repointing it is enough.
+	listenAddr := common.GetRandomAddress(t)
+	baseServer.Address = listenAddr
 
 	// 2. Create the temporary directory for the uploader
 	tempDir, err := os.MkdirTemp("", "sora-pop3-tdd-upload-*")
@@ -116,7 +156,13 @@ func SetupPOP3ServerWithUploader(t *testing.T) (*TDDTestServer, common.TestAccou
 		server.Start(errChan)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	// This harness closes the baseline server and rebinds ITS port, so the listener may
+	// not be up when the old one has not finished releasing the address. A fixed sleep
+	// made that a coin flip: Start's bind error went to errChan, which nobody read, and
+	// the test dialled a dead port and reported "connection refused" - a failure that
+	// looks like a protocol bug and reproduces in nobody's isolated re-run. Wait for the
+	// port to actually accept, and surface a bind failure as itself.
+	waitForPOP3Listener(t, baseServer.Address, errChan)
 
 	// Replace the server instance in baseServer
 	baseServer.Server = server
