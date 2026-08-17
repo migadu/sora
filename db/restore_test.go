@@ -1248,3 +1248,68 @@ func TestDeleteMailbox_FullRestoreFlow(t *testing.T) {
 
 	t.Logf("Complete: Delete → List → Restore flow successful")
 }
+
+// TestRestoreMessages_DuplicateTombstonesSameMailbox covers two expunged rows with the SAME
+// Message-ID in the SAME mailbox restored in one batch (e.g. a message moved
+// INBOX→Trash→INBOX→Trash leaves two INBOX tombstones). Restoring the first must not
+// break restoring (or skipping) the second: the batch must complete without error and
+// leave exactly one live copy in the mailbox.
+func TestRestoreMessages_DuplicateTombstonesSameMailbox(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, testEmail, inboxID, _ := setupRestoreTestDatabase(t)
+	ctx := context.Background()
+
+	const dupMessageID = "<dup-tombstone@example.com>"
+
+	firstID := insertTestMessage(t, db, accountID, inboxID, "INBOX", "Copy 1", dupMessageID)
+	var firstUID int64
+	err := db.GetReadPool().QueryRow(ctx, "SELECT uid FROM messages WHERE id = $1", firstID).Scan(&firstUID)
+	require.NoError(t, err)
+	expungeMessage(t, db, inboxID, imap.UID(firstUID))
+
+	secondID := insertTestMessage(t, db, accountID, inboxID, "INBOX", "Copy 2", dupMessageID)
+	var secondUID int64
+	err = db.GetReadPool().QueryRow(ctx, "SELECT uid FROM messages WHERE id = $1", secondID).Scan(&secondUID)
+	require.NoError(t, err)
+	expungeMessage(t, db, inboxID, imap.UID(secondUID))
+
+	// Both are tombstones in INBOX with the same Message-ID.
+	var tombstones int
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND message_id = $2 AND expunged_at IS NOT NULL",
+		inboxID, dupMessageID).Scan(&tombstones)
+	require.NoError(t, err)
+	require.Equal(t, 2, tombstones)
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	restored, err := db.RestoreMessages(ctx, tx, RestoreMessagesParams{
+		Email:      testEmail,
+		MessageIDs: []int64{firstID, secondID},
+	})
+	require.NoError(t, err, "restoring two tombstones of the same Message-ID in one batch must not fail")
+	require.NoError(t, tx.Commit(ctx))
+
+	assert.Equal(t, int64(1), restored, "exactly one copy should be restored; the duplicate is skipped")
+
+	var live int
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND message_id = $2 AND expunged_at IS NULL",
+		inboxID, dupMessageID).Scan(&live)
+	require.NoError(t, err)
+	assert.Equal(t, 1, live, "exactly one live copy of the Message-ID in INBOX after restore")
+
+	// The restore must not hard-delete rows: the second tombstone stays for the cleaner
+	// (it is the cleaner, not restore, that owns physical deletion + S3 orphan checks).
+	var total int
+	err = db.GetReadPool().QueryRow(ctx,
+		"SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND message_id = $2",
+		inboxID, dupMessageID).Scan(&total)
+	require.NoError(t, err)
+	assert.Equal(t, 2, total, "restore must not physically delete the other tombstone")
+}

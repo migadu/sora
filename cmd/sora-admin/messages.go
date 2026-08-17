@@ -132,6 +132,11 @@ This command restores deleted (expunged) messages back to their original mailbox
 If the original mailbox no longer exists, it will be recreated. Messages are
 assigned new UIDs in their target mailboxes.
 
+Large restores are processed in chunks, each committed separately. If the run
+fails part-way, the messages restored so far are kept and the error says how
+many; simply re-run the same command to restore the remainder (messages that
+are already back in their mailbox are skipped, never duplicated).
+
 You can restore messages by:
   - Specific message IDs (--ids)
   - All messages from a mailbox (--mailbox)
@@ -406,9 +411,14 @@ func restoreMessages(ctx context.Context, cfg AdminConfig, email string, mailbox
 		}
 	}
 
-	// Perform restoration
+	// Perform restoration. Restores run in chunks, each in its own transaction, so a
+	// failure part-way leaves the already-restored messages in place; re-running the same
+	// command restores the remainder (already-live messages are skipped).
 	count, err := rdb.RestoreMessagesWithRetry(ctx, params)
 	if err != nil {
+		if count > 0 {
+			return fmt.Errorf("%w; the %d restored message(s) are kept — re-run the same command to restore the rest", err, count)
+		}
 		return err
 	}
 

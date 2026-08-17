@@ -1307,6 +1307,10 @@ paths:
 
         At least one criterion must be provided. Restored messages will be assigned new UIDs but preserve all other metadata and flags.
         If the original mailbox was deleted, it will be automatically recreated.
+
+        Large restores are processed in chunks, each committed in its own transaction. If the operation fails part-way,
+        the messages restored so far are kept and the error message states how many; repeating the same request restores
+        the remainder (messages that are already live in their target mailbox are skipped, never duplicated).
       parameters:
         - name: email
           in: path

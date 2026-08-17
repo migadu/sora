@@ -2,10 +2,12 @@ package resilient
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/logger"
 )
 
 // --- Flag Management Wrappers ---
@@ -271,13 +273,56 @@ func (rd *ResilientDatabase) ListDeletedMessagesWithRetry(ctx context.Context, p
 	return result.([]db.DeletedMessage), nil
 }
 
+// restoreChunkSize bounds how many messages a single restore transaction touches.
+// Each message costs several sequential statements plus statement-level stats
+// triggers, and the transaction holds the target mailbox row lock (highest_uid bump)
+// until it commits — so a chunk must comfortably fit one admin timeout AND keep the
+// user's live IMAP writes on that mailbox from stalling for long. Committed chunks stay
+// committed if a later one fails; re-running the same restore is safe because rows that
+// are already live are skipped.
+const restoreChunkSize = 100
+
+// RestoreMessagesWithRetry restores the expunged messages matching params.
+//
+// The candidate ids are resolved first (one read), then restored in chunks of
+// restoreChunkSize, each in its own transaction with its own timeout and retries. A
+// restore of weeks of deletions is therefore never bounded by a single write_timeout,
+// and a failure late in the run does not roll back the messages already restored.
+// The returned count is the number of messages restored so far, also when err != nil.
 func (rd *ResilientDatabase) RestoreMessagesWithRetry(ctx context.Context, params db.RestoreMessagesParams) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).RestoreMessages(ctx, tx, params)
+	return rd.restoreMessagesChunked(ctx, params, restoreChunkSize)
+}
+
+func (rd *ResilientDatabase) restoreMessagesChunked(ctx context.Context, params db.RestoreMessagesParams, chunkSize int) (int64, error) {
+	listOp := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetRestorableMessageIDs(ctx, params)
 	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	listed, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, listOp, db.ErrAccountNotFound)
 	if err != nil {
 		return 0, err
 	}
-	return result.(int64), nil
+	ids, _ := listed.([]int64)
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	var restored int64
+	for start := 0; start < len(ids); start += chunkSize {
+		end := min(start+chunkSize, len(ids))
+		chunk := db.RestoreMessagesParams{Email: params.Email, MessageIDs: ids[start:end]}
+
+		op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+			return rd.getOperationalDatabaseForOperation(ctx, true).RestoreMessages(ctx, tx, chunk)
+		}
+		result, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+		if err != nil {
+			return restored, fmt.Errorf("restore stopped at candidates %d-%d of %d after restoring %d message(s): %w",
+				start+1, end, len(ids), restored, err)
+		}
+		n, _ := result.(int64)
+		restored += n
+		logger.Info("Database: restore progress", "component", "RESILIENT-FAILOVER",
+			"email", params.Email, "processed", end, "total", len(ids), "restored", restored)
+	}
+	return restored, nil
 }

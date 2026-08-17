@@ -2424,4 +2424,3 @@ func GetSoraAdminBinary(t testing.TB) string {
 	}
 	return soraAdminBinaryPath
 }
-

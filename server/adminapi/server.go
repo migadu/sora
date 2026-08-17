@@ -1905,14 +1905,19 @@ func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Restore messages
+	// Restore messages. Chunked: a failure part-way leaves already-restored chunks
+	// committed; the caller can simply repeat the request to restore the remainder.
 	count, err := s.rdb.RestoreMessagesWithRetry(ctx, params)
 	if err != nil {
 		if errors.Is(err, db.ErrAccountNotFound) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
 		}
-		logger.Warn("HTTP API: Error restoring messages", "name", s.name, "error", err)
+		logger.Warn("HTTP API: Error restoring messages", "name", s.name, "restored", count, "error", err)
+		if count > 0 {
+			s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Error restoring messages: %d message(s) restored before the failure; repeat the request to restore the rest", count))
+			return
+		}
 		s.writeError(w, http.StatusInternalServerError, "Error restoring messages")
 		return
 	}
