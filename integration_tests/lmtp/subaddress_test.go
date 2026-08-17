@@ -102,6 +102,7 @@ if envelope :matches :detail "To" "*" {
 	go func() {
 		lmtpSrv.Start(lmtpErrChan)
 	}()
+	waitForLMTPListener(t, lmtpAddr, lmtpErrChan)
 
 	// Test multiple subaddresses
 	testCases := []struct {

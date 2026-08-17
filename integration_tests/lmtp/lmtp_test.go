@@ -60,6 +60,41 @@ func (lc *LogCapture) Close() {
 	log.SetOutput(lc.oldOut)
 }
 
+// waitForLMTPListener blocks until the LMTP server started via Start(errChan)
+// is actually accepting on addr, or fails the test if Start reported a bind
+// error or the listener never came up.
+//
+// Start binds its listener inside the goroutine the tests spawn it in, so a
+// client that dials immediately races the bind and gets "connection refused"
+// on a loaded machine (3/25 reproductions under full CPU load, always on the
+// first subtest, never in an isolated re-run). Sibling tests paper over this
+// with fixed sleeps; poll the port instead so readiness is observed, not
+// guessed, and surface a bind failure as itself rather than as a dead port.
+func waitForLMTPListener(t *testing.T, addr string, errChan <-chan error) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case err := <-errChan:
+			if err != nil {
+				t.Fatalf("LMTP server failed to start on %s: %v", addr, err)
+			}
+		default:
+		}
+
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("LMTP server never started listening on %s: %v", addr, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // LMTPClient provides a simple LMTP client for testing
 type LMTPClient struct {
 	conn   net.Conn
