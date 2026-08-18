@@ -231,8 +231,8 @@ build-linux-musl:
 
 # Cross-compile for FreeBSD
 build-freebsd:
-	GOARCH=amd64 GOOS=freebsd go build $(LDFLAGS) -o $(SORA_FREEBSD_BINARY) ./cmd/sora
-	GOARCH=amd64 GOOS=freebsd go build $(LDFLAGS) -o $(SORA_ADMIN_FREEBSD_BINARY) ./cmd/sora-admin
+	CGO_ENABLED=0 GOARCH=amd64 GOOS=freebsd go build $(LDFLAGS) -o $(SORA_FREEBSD_BINARY) ./cmd/sora
+	CGO_ENABLED=0 GOARCH=amd64 GOOS=freebsd go build $(LDFLAGS) -o $(SORA_ADMIN_FREEBSD_BINARY) ./cmd/sora-admin
 
 # Help target
 help:
