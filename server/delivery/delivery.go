@@ -219,6 +219,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			Subtype:  "plain",
 			Size:     uint32(len(messageBytes)),
 			Extended: &imap.BodyStructureSinglePartExt{}, // Always populate Extended to match imapserver.ExtractBodyStructure behavior
+			Text:     &imap.BodyStructureText{},          // body-fld-lines is mandatory for a text part
 		}
 		var fallbackBS imap.BodyStructure = fallback
 		bodyStructure = &fallbackBS

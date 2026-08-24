@@ -23,6 +23,7 @@ func SerializeBodyStructureGob(bs *imap.BodyStructure) ([]byte, error) {
 			Type:    "text",
 			Subtype: "plain",
 			Size:    0,
+			Text:    &imap.BodyStructureText{}, // body-fld-lines is mandatory for a text part
 		}
 		var defaultBS imap.BodyStructure = defaultBodyStructure
 		bs = &defaultBS

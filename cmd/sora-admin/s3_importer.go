@@ -526,6 +526,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			Type:    "text",
 			Subtype: "plain",
 			Size:    uint32(len(content)),
+			Text:    &imap.BodyStructureText{}, // body-fld-lines is mandatory for a text part
 		}
 		bodyStructure = fallback
 	}

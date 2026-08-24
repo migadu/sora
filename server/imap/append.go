@@ -41,6 +41,7 @@ func extractBodyStructureSafe(data []byte) imap.BodyStructure {
 				Subtype:  "plain",
 				Params:   map[string]string{"charset": "utf-8"},
 				Extended: &imap.BodyStructureSinglePartExt{}, // Always populate Extended to match imapserver.ExtractBodyStructure behavior
+				Text:     &imap.BodyStructureText{},          // body-fld-lines is mandatory for a text part
 			}
 		}
 		return bs
@@ -52,6 +53,7 @@ func extractBodyStructureSafe(data []byte) imap.BodyStructure {
 		Subtype:  "plain",
 		Params:   map[string]string{"charset": "utf-8"},
 		Extended: &imap.BodyStructureSinglePartExt{}, // Always populate Extended to match imapserver.ExtractBodyStructure behavior
+		Text:     &imap.BodyStructureText{},          // body-fld-lines is mandatory for a text part
 	}
 }
 
