@@ -441,6 +441,7 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 					Subtype:  "plain",
 					Size:     uint32(msg.Size),
 					Extended: &imap.BodyStructureSinglePartExt{},
+					Text:     &imap.BodyStructureText{}, // body-fld-lines is mandatory for a text part
 				}
 				var fallbackBS imap.BodyStructure = fallback
 				bs = &fallbackBS

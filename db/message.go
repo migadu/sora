@@ -616,6 +616,7 @@ func deserializeBodyStructure(data []byte, msgSize int, accountID, mailboxID int
 		Subtype:  "plain",
 		Size:     uint32(msgSize),
 		Extended: &imap.BodyStructureSinglePartExt{},
+		Text:     &imap.BodyStructureText{}, // body-fld-lines is mandatory for a text part
 	}
 	var bs imap.BodyStructure = defaultBS
 	return &bs

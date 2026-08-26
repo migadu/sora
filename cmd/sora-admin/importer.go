@@ -1650,6 +1650,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 			Type:    "text",
 			Subtype: "plain",
 			Size:    uint32(len(content)),
+			Text:    &imap.BodyStructureText{}, // body-fld-lines is mandatory for a text part
 		}
 		bodyStructure = fallback
 	}
