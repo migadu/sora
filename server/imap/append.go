@@ -22,39 +22,48 @@ import (
 	_ "github.com/emersion/go-message/charset"
 )
 
-// extractBodyStructureSafe wraps imapserver.ExtractBodyStructure with panic recovery and validation.
-// Returns a default body structure if extraction fails or structure is invalid (e.g., multipart with no children).
-func extractBodyStructureSafe(data []byte) imap.BodyStructure {
-	defer func() {
-		if r := recover(); r != nil {
-			// Panic during body structure extraction, will use default below
-		}
-	}()
-
-	bs := imapserver.ExtractBodyStructure(bytes.NewReader(data))
-	if bs != nil {
-		// Validate the extracted body structure
-		if err := helpers.ValidateBodyStructure(&bs); err != nil {
-			// Invalid structure (e.g., multipart with no children), use default
-			return &imap.BodyStructureSinglePart{
-				Type:     "text",
-				Subtype:  "plain",
-				Params:   map[string]string{"charset": "utf-8"},
-				Extended: &imap.BodyStructureSinglePartExt{}, // Always populate Extended to match imapserver.ExtractBodyStructure behavior
-				Text:     &imap.BodyStructureText{},          // body-fld-lines is mandatory for a text part
-			}
-		}
-		return bs
-	}
-
-	// Return default body structure for corrupted messages
+// fallbackBodyStructure is the body structure served for a message whose real
+// one could not be produced. Extended is always populated to match
+// imapserver.ExtractBodyStructure behavior, and Text because body-fld-lines is
+// mandatory for a text part -- omitting it makes FETCH emit a body structure
+// that clients reject outright, failing the whole response.
+func fallbackBodyStructure() imap.BodyStructure {
 	return &imap.BodyStructureSinglePart{
 		Type:     "text",
 		Subtype:  "plain",
 		Params:   map[string]string{"charset": "utf-8"},
-		Extended: &imap.BodyStructureSinglePartExt{}, // Always populate Extended to match imapserver.ExtractBodyStructure behavior
-		Text:     &imap.BodyStructureText{},          // body-fld-lines is mandatory for a text part
+		Extended: &imap.BodyStructureSinglePartExt{},
+		Text:     &imap.BodyStructureText{},
 	}
+}
+
+// extractBodyStructure is imapserver.ExtractBodyStructure, indirected so that
+// tests can exercise the panic path below.
+var extractBodyStructure = imapserver.ExtractBodyStructure
+
+// extractBodyStructureSafe wraps imapserver.ExtractBodyStructure with panic recovery and validation.
+// Returns a default body structure if extraction fails or structure is invalid (e.g., multipart with no children).
+// The result is never nil: callers store it and later serialize it, and a nil
+// body structure panics the FETCH write path.
+func extractBodyStructureSafe(data []byte) (result imap.BodyStructure) {
+	// Named result: a bare recover() leaves an unnamed result at its zero value,
+	// so a panic here would have returned the nil this function exists to avoid.
+	defer func() {
+		if r := recover(); r != nil {
+			result = fallbackBodyStructure()
+		}
+	}()
+
+	bs := extractBodyStructure(bytes.NewReader(data))
+	if bs == nil {
+		// Corrupted message.
+		return fallbackBodyStructure()
+	}
+	if err := helpers.ValidateBodyStructure(&bs); err != nil {
+		// Invalid structure (e.g., multipart with no children), use default
+		return fallbackBodyStructure()
+	}
+	return bs
 }
 
 // errAppendLiteralTooLarge marks an APPEND refused because the literal does not fit the

@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"io"
 	"testing"
 
 	"github.com/emersion/go-imap/v2"
@@ -66,4 +67,35 @@ func TestExtractBodyStructureSafeLineCount(t *testing.T) {
 			assertTextPartsHaveLineCount(t, bs)
 		})
 	}
+}
+
+// TestExtractBodyStructureSafePanic covers the panic path: the recovery exists
+// so that a message that blows up the MIME parser still gets a body structure.
+// A bare recover() in a function with an unnamed result cannot set one, so this
+// used to hand callers the nil that the FETCH write path panics on.
+func TestExtractBodyStructureSafePanic(t *testing.T) {
+	orig := extractBodyStructure
+	extractBodyStructure = func(io.Reader) imap.BodyStructure {
+		panic("malformed message")
+	}
+	defer func() { extractBodyStructure = orig }()
+
+	bs := extractBodyStructureSafe([]byte("whatever"))
+	if bs == nil {
+		t.Fatal("extractBodyStructureSafe() = nil, want the fallback structure")
+	}
+	assertTextPartsHaveLineCount(t, bs)
+}
+
+// TestExtractBodyStructureSafeNil covers a backend returning no structure at all.
+func TestExtractBodyStructureSafeNil(t *testing.T) {
+	orig := extractBodyStructure
+	extractBodyStructure = func(io.Reader) imap.BodyStructure { return nil }
+	defer func() { extractBodyStructure = orig }()
+
+	bs := extractBodyStructureSafe([]byte("whatever"))
+	if bs == nil {
+		t.Fatal("extractBodyStructureSafe() = nil, want the fallback structure")
+	}
+	assertTextPartsHaveLineCount(t, bs)
 }
