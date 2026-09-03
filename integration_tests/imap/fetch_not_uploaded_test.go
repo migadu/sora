@@ -208,6 +208,178 @@ func findSingleStagedFile(t *testing.T, root string) (path, contentHash string) 
 	return found[0], filepath.Base(found[0])
 }
 
+// TestIMAP_FetchUploadedBodyS3Slow: a provider that accepts connections but never
+// answers must cost a FETCH at most one S3 operation timeout before the client gets
+// NO [UNAVAILABLE], not one per retry. The fake S3 here is built with a 10s timeout, and
+// the resilient layer retries a GET four more times with backoff, so the unbounded read
+// took close to a minute — Apple Mail reports "server not responding" long before that.
+func TestIMAP_FetchUploadedBodyS3Slow(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account, fake := common.SetupIMAPServerWithRealS3(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	msg := "From: sender@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Uploaded, provider hangs\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123Z) + "\r\n" +
+		"\r\n" +
+		"Body that lives in S3 behind a provider that stopped answering.\r\n"
+
+	uid := appendMessage(t, c, msg)
+	server.WaitForUploads(t) // uploaded=true
+	// The harness uploads synchronously and keeps no local cache, so the body now
+	// exists only in the fake S3.
+	if fake.ObjectCount() == 0 {
+		t.Fatalf("expected the appended body to be uploaded to the fake S3")
+	}
+
+	fake.HangGets(true)
+	defer fake.HangGets(false)
+
+	bodySection := &imap.FetchItemBodySection{Peek: true}
+	start := time.Now()
+	_, err = c.Fetch(imap.UIDSetNum(uid), &imap.FetchOptions{
+		UID:         true,
+		BodySection: []*imap.FetchItemBodySection{bodySection},
+	}).Collect()
+	elapsed := time.Since(start)
+
+	var imapErr *imap.Error
+	if !errors.As(err, &imapErr) || imapErr.Code != imap.ResponseCodeUnavailable {
+		t.Fatalf("expected NO [UNAVAILABLE] while the provider hangs, got %v", err)
+	}
+	// One 10s operation timeout, plus slack; the unbounded read needed ~57s.
+	if elapsed > 20*time.Second {
+		t.Fatalf("FETCH against a hanging provider took %s; must be bounded by one S3 operation timeout", elapsed)
+	}
+
+	// The provider recovers: the same FETCH now serves the body.
+	fake.HangGets(false)
+	msgs, err := c.Fetch(imap.UIDSetNum(uid), &imap.FetchOptions{
+		UID:         true,
+		BodySection: []*imap.FetchItemBodySection{bodySection},
+	}).Collect()
+	if err != nil {
+		t.Fatalf("FETCH after the provider recovered failed: %v", err)
+	}
+	if len(msgs) != 1 || len(msgs[0].FindBodySection(bodySection)) == 0 {
+		t.Fatalf("expected the body once the provider answers again")
+	}
+}
+
+// TestIMAP_FetchAbandonedUploadBody covers the row the upload worker has given up on:
+// attempts >= max_attempts. Such a row is never leased again, so it is not "still on its
+// way" — FETCH must degrade to an empty body exactly as it does when no row exists,
+// instead of NO [UNAVAILABLE]. A client that is told to retry a body that will never
+// arrive retries forever; iOS Mail batches body fetches, so that one NO aborted the sync
+// of the whole mailbox on every attempt for two weeks in August 2026.
+func TestIMAP_FetchAbandonedUploadBody(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServerForUploadRace(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	msg := "From: sender@example.com\r\n" +
+		"To: " + account.Email + "\r\n" +
+		"Subject: Abandoned upload\r\n" +
+		"Date: " + time.Now().Format(time.RFC1123Z) + "\r\n" +
+		"\r\n" +
+		"The uploader gave up on this body.\r\n"
+
+	uid := appendMessage(t, c, msg)
+
+	stagedPath, contentHash := findSingleStagedFile(t, server.UploadPath)
+	if err := os.Remove(stagedPath); err != nil {
+		t.Fatalf("failed to remove staged file %s: %v", stagedPath, err)
+	}
+	accountID, err := server.ResilientDB.GetAccountIDByEmailWithRetry(context.Background(), account.Email)
+	if err != nil {
+		t.Fatalf("failed to look up account id: %v", err)
+	}
+
+	bodySection := &imap.FetchItemBodySection{Peek: true}
+	maxAttempts := server.UploadMaxAttempts()
+	if maxAttempts < 2 {
+		t.Fatalf("harness upload worker must have max_attempts >= 2, got %d", maxAttempts)
+	}
+
+	// One attempt short of the limit: the worker will lease it again, so retry is honest.
+	setPendingUploadAttempts(t, server, contentHash, accountID, maxAttempts-1)
+	_, err = c.Fetch(imap.UIDSetNum(uid), &imap.FetchOptions{
+		UID:         true,
+		BodySection: []*imap.FetchItemBodySection{bodySection},
+	}).Collect()
+	var imapErr *imap.Error
+	if !errors.As(err, &imapErr) || imapErr.Code != imap.ResponseCodeUnavailable {
+		t.Fatalf("expected NO [UNAVAILABLE] while the row is still retryable, got %v", err)
+	}
+
+	// At the limit: parked. The body is not coming; degrade instead of promising a retry.
+	setPendingUploadAttempts(t, server, contentHash, accountID, maxAttempts)
+	msgs, err := c.Fetch(imap.UIDSetNum(uid), &imap.FetchOptions{
+		UID:         true,
+		BodySection: []*imap.FetchItemBodySection{bodySection},
+	}).Collect()
+	if err != nil {
+		t.Fatalf("expected graceful empty-body FETCH for an abandoned upload, got error: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+	if body := msgs[0].FindBodySection(bodySection); len(body) != 0 {
+		t.Fatalf("expected empty body for an abandoned upload, got %d bytes", len(body))
+	}
+}
+
+// setPendingUploadAttempts sets the attempt counter of the pending_uploads row for
+// (contentHash, accountID), simulating a worker that has retried it that many times.
+func setPendingUploadAttempts(t *testing.T, server *common.TestServer, contentHash string, accountID int64, attempts int) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := server.ResilientDB.BeginTxWithRetry(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `UPDATE pending_uploads SET attempts = $3 WHERE content_hash = $1 AND account_id = $2`, contentHash, accountID, attempts)
+	if err != nil {
+		t.Fatalf("set pending_upload attempts: %v", err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("expected one pending_uploads row for %s/%d, updated %d", contentHash, accountID, tag.RowsAffected())
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
 // deletePendingUploadOnly removes the pending_uploads record for (contentHash, accountID)
 // while leaving the message row intact (still uploaded=false), simulating a body whose
 // upload was abandoned and whose content is genuinely lost.

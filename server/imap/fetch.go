@@ -955,13 +955,19 @@ func (s *IMAPSession) loadMessageBody(ctx context.Context, msg *db.Message) ([]b
 }
 
 // bodyUploadStillPending reports whether the system still intends to make this body
-// available — i.e. a pending_upload record exists, or the message has since been marked
-// uploaded (so a retry should find it in S3). It distinguishes the transient
-// read-before-upload race from genuine, permanent content loss. On a DB error it returns
-// true (conservative: a client retry is safer than handing back an empty body that the
-// client may treat as the real, empty message).
+// available — i.e. a pending_upload record exists that the upload worker will still
+// lease (attempts below max_attempts), or the message has since been marked uploaded (so
+// a retry should find it in S3). It distinguishes the transient read-before-upload race
+// from genuine, permanent content loss. On a DB error it returns true (conservative: a
+// client retry is safer than handing back an empty body that the client may treat as
+// the real, empty message).
+//
+// A row the worker has given up on does NOT count as pending: it is never leased again
+// and will be reaped, so "please retry" would be a promise nobody keeps. iOS Mail
+// batches body fetches, and one such NO aborts the whole batch, every sync, forever —
+// "Cannot Get Mail" for the mailbox because of one lost body.
 func (s *IMAPSession) bodyUploadStillPending(ctx context.Context, msg *db.Message) bool {
-	pending, err := s.server.rdb.PendingUploadExistsWithRetry(ctx, msg.ContentHash, msg.AccountID)
+	pending, err := s.server.rdb.PendingUploadRetryableWithRetry(ctx, msg.ContentHash, msg.AccountID, s.server.uploader.MaxAttempts())
 	if err != nil {
 		s.WarnLog("could not check pending-upload status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
 		return true
@@ -989,6 +995,15 @@ func (s *IMAPSession) fetchBodyFromS3(ctx context.Context, msg *db.Message) ([]b
 		return nil, fmt.Errorf("message UID %d is missing S3 key information", msg.UID)
 	}
 	s3Key := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
+
+	// One body fetch gets one operation timeout, retries and body read included. The
+	// resilient layer retries a GET up to four times with backoff and each attempt may
+	// run to the S3 timeout, so an unbounded read against a hanging provider held a
+	// FETCH for minutes — long past the point where Apple Mail reports the server as
+	// not responding. The bound turns that into a prompt NO [UNAVAILABLE] the client
+	// can act on, and honoring ctx means a client that hangs up ends the read at once.
+	ctx, cancel := context.WithTimeout(ctx, s.server.s3.OperationTimeout())
+	defer cancel()
 
 	// Guard against a nil-client panic (e.g. test stubs using &storage.S3Storage{})
 	// so it becomes an error rather than killing the connection goroutine.

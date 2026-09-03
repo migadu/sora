@@ -49,8 +49,8 @@ func insertDeliveredMessage(t *testing.T, db *Database, accountID, mailboxID int
 // TestInsertMessageReArmsExhaustedPendingUpload proves that a fresh delivery revives an
 // upload that an earlier copy gave up on.
 //
-// The uploader exhausts a pending upload (ExhaustUploadAttempts sets attempts =
-// maxAttempts) when its spool file is gone AND S3 does not have the object. A later
+// The uploader parks a pending upload (attempts reaches maxAttempts, one per lease)
+// when its spool file is gone AND S3 does not have the object. A later
 // delivery of the same (content_hash, account_id) writes a brand-new spool file on this
 // node, which is proof that the bytes are here again — but InsertMessage's
 // ON CONFLICT (content_hash, account_id) DO NOTHING leaves attempts at maxAttempts, and
@@ -80,11 +80,13 @@ func TestInsertMessageReArmsExhaustedPendingUpload(t *testing.T) {
 	// First delivery: creates the pending upload.
 	insertDeliveredMessage(t, db, accountID, mailboxID, mailboxName, contentHash, instanceID, 1)
 
-	// The uploader finds the spool file missing and S3 without the object, so it gives
-	// up on this upload for good.
+	// The uploader finds the spool file missing and S3 without the object on
+	// maxAttempts consecutive leases, so it gives up on this upload for good.
 	exhaustTx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
-	require.NoError(t, db.ExhaustUploadAttempts(ctx, exhaustTx, contentHash, accountID, maxAttempts))
+	for i := 0; i < maxAttempts; i++ {
+		require.NoError(t, db.MarkUploadAttempt(ctx, exhaustTx, contentHash, accountID))
+	}
 	require.NoError(t, exhaustTx.Commit(ctx))
 
 	var attempts int
@@ -156,7 +158,9 @@ func TestInsertMessageReArmKeepsCleanupRulesIntact(t *testing.T) {
 
 	exhaustTx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
-	require.NoError(t, db.ExhaustUploadAttempts(ctx, exhaustTx, contentHash, accountID, maxAttempts))
+	for i := 0; i < maxAttempts; i++ {
+		require.NoError(t, db.MarkUploadAttempt(ctx, exhaustTx, contentHash, accountID))
+	}
 	require.NoError(t, exhaustTx.Commit(ctx))
 
 	insertDeliveredMessage(t, db, accountID, mailboxID, mailboxName, contentHash, instanceID, 2)

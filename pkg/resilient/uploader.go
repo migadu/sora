@@ -83,12 +83,15 @@ func (rd *ResilientDatabase) IsContentHashUploadedWithRetry(ctx context.Context,
 	return result.(bool), nil
 }
 
-func (rd *ResilientDatabase) ExhaustUploadAttemptsWithRetry(ctx context.Context, contentHash string, accountID int64, maxAttempts int) error {
+func (rd *ResilientDatabase) ResetUploadAttemptsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(ctx, true).ExhaustUploadAttempts(ctx, tx, contentHash, accountID, maxAttempts)
+		return rd.getOperationalDatabaseForOperation(ctx, true).ResetUploadAttempts(ctx, tx, contentHash, accountID)
 	}
-	_, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
-	return err
+	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
 }
 
 func (rd *ResilientDatabase) DeleteFailedUploadWithRetry(ctx context.Context, contentHash string, accountID int64) (int64, error) {
@@ -105,6 +108,17 @@ func (rd *ResilientDatabase) DeleteFailedUploadWithRetry(ctx context.Context, co
 func (rd *ResilientDatabase) PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).PendingUploadExists(ctx, contentHash, accountID)
+	}
+	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
+func (rd *ResilientDatabase) PendingUploadRetryableWithRetry(ctx context.Context, contentHash string, accountID int64, maxAttempts int) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).PendingUploadRetryable(ctx, contentHash, accountID, maxAttempts)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
 	if err != nil {

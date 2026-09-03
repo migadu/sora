@@ -98,6 +98,21 @@ func (db *Database) MarkUploadAttempt(ctx context.Context, tx pgx.Tx, contentHas
 	return err
 }
 
+// ResetUploadAttempts re-arms a pending upload the worker has given up on: attempts back
+// to zero and the lease cleared, so the owning instance leases it again on its next tick.
+// Used by sora-admin once the body turns out to be intact on that instance's disk.
+// Returns whether a row was re-armed.
+func (db *Database) ResetUploadAttempts(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64) (bool, error) {
+	tag, err := tx.Exec(ctx, `
+		UPDATE pending_uploads
+		SET attempts = 0, last_attempt = NULL
+		WHERE content_hash = $1 AND account_id = $2`, contentHash, accountID)
+	if err != nil {
+		return false, fmt.Errorf("failed to reset upload attempts (hash=%s, account=%d): %w", contentHash, accountID, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // CompleteS3Upload marks all messages with the given content hash as uploaded
 // and deletes the specific pending upload record.
 // Called by an upload worker after successfully uploading the content hash.
@@ -363,18 +378,6 @@ func (db *Database) GetStrandedUploadInstances(ctx context.Context, maxAttempts 
 	return result, nil
 }
 
-// ExhaustUploadAttempts sets the attempt count to maxAttempts for the given upload,
-// immediately marking it as permanently failed without cycling through retries one by one.
-// Use this when the content is confirmed permanently lost (file missing AND not in S3).
-func (d *Database) ExhaustUploadAttempts(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, maxAttempts int) error {
-	_, err := tx.Exec(ctx, `
-		UPDATE pending_uploads
-		SET attempts = $3, last_attempt = now()
-		WHERE content_hash = $1 AND account_id = $2`,
-		contentHash, accountID, maxAttempts)
-	return err
-}
-
 // DeleteFailedUpload deletes the pending_uploads record and any unuploaded message rows
 // for the given content hash + account. Used by the admin tool to clean up entries where
 // the content is permanently lost ([FAIL] MISSING in S3 and no local file).
@@ -410,4 +413,26 @@ func (db *Database) PendingUploadExists(ctx context.Context, contentHash string,
 		return false, fmt.Errorf("failed to check if pending upload exists for content hash %s, account %d: %w", contentHash, accountID, err)
 	}
 	return exists, nil
+}
+
+// PendingUploadRetryable reports whether a pending upload for (contentHash, accountID)
+// exists that the upload worker will still lease, i.e. one with attempts below
+// maxAttempts. Readers use it to tell a body that is still on its way ("retry later")
+// from one the worker has given up on: a row at or past maxAttempts is never leased
+// again (AcquireAndLeasePendingUploads) and is eventually reaped by
+// CleanupFailedUploads, so telling a client to retry it would be telling it to retry
+// forever — which is what an IMAP client that batches body fetches turns into
+// "cannot get mail" for the whole mailbox.
+func (db *Database) PendingUploadRetryable(ctx context.Context, contentHash string, accountID int64, maxAttempts int) (bool, error) {
+	var retryable bool
+	err := db.GetReadPool().QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pending_uploads
+			WHERE content_hash = $1 AND account_id = $2 AND attempts < $3
+		)
+	`, contentHash, accountID, maxAttempts).Scan(&retryable)
+	if err != nil {
+		return false, fmt.Errorf("failed to check if pending upload is retryable for content hash %s, account %d: %w", contentHash, accountID, err)
+	}
+	return retryable, nil
 }

@@ -205,6 +205,72 @@ func TestMarkUploadAttempt(t *testing.T) {
 	assert.WithinDuration(t, time.Now(), lastAttempt, 5*time.Second)
 }
 
+// TestPendingUploadRetryable pins the reader-side distinction between a body still on
+// its way (a row the worker will lease again) and one the worker has given up on.
+func TestPendingUploadRetryable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	db := setupUploadWorkerTest(t)
+
+	ctx := context.Background()
+	testEmail := fmt.Sprintf("test_retryable_%d@example.com", time.Now().UnixNano())
+	accountID := createTestAccount(t, db, testEmail, "password")
+	const maxAttempts = 5
+
+	createPendingUpload(t, db, accountID, "instance", "retryable-hash", maxAttempts-1, time.Now(), 1024)
+	createPendingUpload(t, db, accountID, "instance", "parked-hash", maxAttempts, time.Now(), 1024)
+
+	retryable, err := db.PendingUploadRetryable(ctx, "retryable-hash", accountID, maxAttempts)
+	require.NoError(t, err)
+	assert.True(t, retryable, "one attempt short of the limit is still on its way")
+
+	retryable, err = db.PendingUploadRetryable(ctx, "parked-hash", accountID, maxAttempts)
+	require.NoError(t, err)
+	assert.False(t, retryable, "at the limit the worker never leases it again")
+
+	exists, err := db.PendingUploadExists(ctx, "parked-hash", accountID)
+	require.NoError(t, err)
+	assert.True(t, exists, "the parked row still exists; only its retryability is gone")
+
+	retryable, err = db.PendingUploadRetryable(ctx, "no-such-hash", accountID, maxAttempts)
+	require.NoError(t, err)
+	assert.False(t, retryable)
+}
+
+func TestResetUploadAttempts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	db := setupUploadWorkerTest(t)
+
+	ctx := context.Background()
+	testEmail := fmt.Sprintf("test_reset_%d@example.com", time.Now().UnixNano())
+	accountID := createTestAccount(t, db, testEmail, "password")
+	uploadID := createPendingUpload(t, db, accountID, "instance", "reset-hash", 20, time.Now(), 1024)
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	rearmed, err := db.ResetUploadAttempts(ctx, tx, "reset-hash", accountID)
+	require.NoError(t, err)
+	assert.True(t, rearmed)
+
+	rearmed, err = db.ResetUploadAttempts(ctx, tx, "no-such-hash", accountID)
+	require.NoError(t, err)
+	assert.False(t, rearmed, "nothing to re-arm")
+
+	require.NoError(t, tx.Commit(ctx))
+
+	var attempts int
+	var lastAttempt sql.NullTime
+	err = db.GetReadPool().QueryRow(ctx, "SELECT attempts, last_attempt FROM pending_uploads WHERE id = $1", uploadID).Scan(&attempts, &lastAttempt)
+	require.NoError(t, err)
+	assert.Equal(t, 0, attempts)
+	assert.False(t, lastAttempt.Valid, "lease cleared so the worker picks it up on its next tick")
+}
+
 func TestCompleteS3Upload(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
