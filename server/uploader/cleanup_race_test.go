@@ -91,10 +91,6 @@ func (m *mockUploaderDB) AcquireAndLeasePendingUploadsWithRetry(ctx context.Cont
 	args := m.Called(ctx, instanceID, batchSize, retryInterval, maxAttempts)
 	return args.Get(0).([]db.PendingUpload), args.Error(1)
 }
-func (m *mockUploaderDB) ExhaustUploadAttemptsWithRetry(ctx context.Context, contentHash string, accountID int64, maxAttempts int) error {
-	return nil
-}
-
 func (m *mockUploaderDB) MarkUploadAttemptWithRetry(ctx context.Context, contentHash string, accountID int64) error {
 	args := m.Called(ctx, contentHash, accountID)
 	return args.Error(0)

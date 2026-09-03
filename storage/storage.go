@@ -379,9 +379,19 @@ func (s *S3Storage) decryptData(ciphertext []byte) ([]byte, error) {
 	return gcm.Open(body[:0], nonce, body, nil)
 }
 
+// Get fetches an object with no caller context: the read is bounded only by the
+// configured operation timeout. Interactive readers use GetContext so a client that
+// gives up, or a deadline they set, ends the request.
 func (s *S3Storage) Get(key string) (io.ReadCloser, error) {
+	return s.GetContext(context.Background(), key)
+}
+
+// GetContext fetches an object within the caller's context and the configured
+// operation timeout, whichever ends first. The context stays attached to the streamed
+// body until the returned reader is closed.
+func (s *S3Storage) GetContext(ctx context.Context, key string) (io.ReadCloser, error) {
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), s.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
 
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(s.BucketName),

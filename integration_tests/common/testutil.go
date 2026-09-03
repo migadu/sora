@@ -148,6 +148,15 @@ type TestServer struct {
 	UploadPath   string                 // local staging dir; set by setups that need to manipulate staged files
 }
 
+// UploadMaxAttempts is the attempts value at which this server's upload worker parks a
+// pending upload, for tests that simulate a worker that has given up.
+func (ts *TestServer) UploadMaxAttempts() int {
+	if ts.uploadWorker == nil {
+		return 0
+	}
+	return ts.uploadWorker.MaxAttempts()
+}
+
 // WaitForUploads blocks until all pending uploads for this test server have
 // been processed and messages are marked uploaded=true in the database.
 // Call this between an APPEND and a subsequent FETCH in tests to ensure the

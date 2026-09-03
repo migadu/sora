@@ -29,9 +29,19 @@ import (
 // exercise the real upload → S3 → fetch and cross-account server-side-copy paths
 // end to end without an external S3/minio dependency.
 type FakeS3 struct {
-	server  *httptest.Server
-	mu      sync.Mutex
-	objects map[string][]byte
+	server   *httptest.Server
+	mu       sync.Mutex
+	objects  map[string][]byte
+	hangGets bool // when set, GET holds the connection open until the client gives up
+}
+
+// HangGets makes every GET block until the requesting client disconnects, simulating a
+// provider that accepts connections but never answers. Existence checks and writes
+// keep working. Pass false to restore normal service.
+func (f *FakeS3) HangGets(hang bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hangGets = hang
 }
 
 // NewFakeS3 starts an in-memory S3 server and returns it. Call Close (or rely on
@@ -104,7 +114,12 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		f.mu.Lock()
 		data, ok := f.objects[key]
+		hang := f.hangGets
 		f.mu.Unlock()
+		if hang {
+			<-r.Context().Done()
+			return
+		}
 		if !ok {
 			writeS3Error(w, http.StatusNotFound, "NoSuchKey", key)
 			return

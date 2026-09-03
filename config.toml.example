@@ -577,8 +577,14 @@ path = "/sora/uploads"    # Filesystem path for staging uploads (temporary stora
                               # before restarting under a new one.
 batch_size = 20               # Number of messages batched together per upload operation.
 concurrency = 10              # Number of concurrent upload workers.
-max_attempts = 5              # Maximum retry attempts for failed uploads.
-retry_interval = "30s"        # Initial delay between retry attempts (exponential backoff is applied).
+max_attempts = 5              # Attempts after which an upload is parked ("failed", needs sora-admin uploader resolve).
+                              # Only evidence about the content counts: an empty or size-mismatched staging file,
+                              # or a file missing while S3 reports the object absent. Provider errors (any HTTP
+                              # status, including 4xx) and database errors never count — the body is intact on
+                              # disk and the upload is simply retried.
+retry_interval = "30s"        # Delay before a failed upload is leased again. When every upload in a cycle fails
+                              # (provider or database outage) the worker backs off exponentially from this value,
+                              # doubling per failed cycle up to 10 minutes, and resumes on the first success.
 cleanup_grace_period = "1h"   # Minimum age of a local upload file before cleanup considers it.
 max_staging_size = "100gb"    # Maximum size of the global upload staging queue (e.g. "100gb"). If set and exceeded, new appends are rejected.
 

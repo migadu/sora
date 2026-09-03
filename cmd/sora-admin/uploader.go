@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
 
@@ -97,10 +98,15 @@ Options:
   --limit int   Maximum number of failed uploads to process (default: 100)
 
 Actions taken per upload:
-  [OK] EXISTS in S3  → CompleteS3Upload: marks messages as uploaded=TRUE, removes pending record.
-                    Users regain access to their messages immediately.
-  [FAIL] MISSING in S3 → DeleteFailedUpload: removes undeliverable message rows and pending record.
-                    Content was never stored in S3; the message is permanently lost.
+  [REPAIR] EXISTS in S3        → CompleteS3Upload: marks messages as uploaded=TRUE, removes pending record.
+                               Users regain access to their messages immediately.
+  [REARM]  body intact here    → ResetUploadAttempts: the staging file is still on this host, so the
+                               upload was parked by something other than lost content; the uploader
+                               on this host retries it on its next tick.
+  [SKIP]   owned by other host → nothing: that host's spool may still hold the body. Run resolve there.
+  [SKIP]   file size differs   → nothing: inspect manually.
+  [DELETE] MISSING everywhere  → DeleteFailedUpload: removes undeliverable message rows and pending record.
+                               Content is in neither S3 nor this host's spool; the message is lost.
 
 Examples:
   sora-admin uploader resolve --dry-run
@@ -162,7 +168,12 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 		fmt.Println("DRY RUN - no changes will be made.")
 	}
 
-	var resolved, deleted, skipped int
+	// Resolve runs on one host, so only that host's spool can be inspected. A parked
+	// upload whose body is still in the spool (a provider fault, not lost content —
+	// see uploader.processSingleUpload) must be re-armed, never deleted with its message.
+	localInstance := cfg.InstanceID()
+
+	var resolved, rearmed, deleted, skipped int
 
 	for _, upload := range failedUploads {
 		if upload.AccountEmail == "" {
@@ -186,7 +197,9 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 			continue
 		}
 
-		if exists {
+		staged := stagedBodyState(uploader.StagingFilePath(cfg.Uploader.Path, upload.ContentHash, upload.AccountID), upload.Size)
+		switch decideResolve(exists, upload.InstanceID == localInstance, staged) {
+		case resolveRepair:
 			// Content is in S3 - mark messages as uploaded=TRUE, remove pending record.
 			fmt.Printf("  [REPAIR] id=%-10d account=%-8d hash=%.16s... [OK] EXISTS in S3 → CompleteS3Upload\n",
 				upload.ID, upload.AccountID, upload.ContentHash)
@@ -198,9 +211,28 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 				}
 			}
 			resolved++
-		} else {
-			// Content is NOT in S3 - the message was never delivered. Clean up.
-			fmt.Printf("  [DELETE] id=%-10d account=%-8d hash=%.16s... [FAIL] MISSING in S3 → DeleteFailedUpload\n",
+		case resolveRearm:
+			fmt.Printf("  [REARM]  id=%-10d account=%-8d hash=%.16s... body intact in %s → ResetUploadAttempts\n",
+				upload.ID, upload.AccountID, upload.ContentHash, cfg.Uploader.Path)
+			if !dryRun {
+				if _, err := rdb.ResetUploadAttemptsWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
+					fmt.Printf("            ERROR: %v\n", err)
+					skipped++
+					continue
+				}
+			}
+			rearmed++
+		case resolveSkipRemote:
+			fmt.Printf("  [SKIP]   id=%-10d account=%-8d hash=%.16s... owned by %s — run resolve on that host\n",
+				upload.ID, upload.AccountID, upload.ContentHash, upload.InstanceID)
+			skipped++
+		case resolveSkipSizeMismatch:
+			fmt.Printf("  [SKIP]   id=%-10d account=%-8d hash=%.16s... staged file size differs from the row (%d bytes expected) — inspect manually\n",
+				upload.ID, upload.AccountID, upload.ContentHash, upload.Size)
+			skipped++
+		case resolveDelete:
+			// Content is in neither S3 nor this host's spool - the message is lost. Clean up.
+			fmt.Printf("  [DELETE] id=%-10d account=%-8d hash=%.16s... [FAIL] MISSING in S3 and in spool → DeleteFailedUpload\n",
 				upload.ID, upload.AccountID, upload.ContentHash)
 			if !dryRun {
 				n, err := rdb.DeleteFailedUploadWithRetry(ctx, upload.ContentHash, upload.AccountID)
@@ -215,7 +247,7 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 		}
 	}
 
-	fmt.Printf("\nSummary: %d repaired ([OK] EXISTS), %d deleted ([FAIL] MISSING), %d skipped\n", resolved, deleted, skipped)
+	fmt.Printf("\nSummary: %d repaired ([OK] EXISTS), %d re-armed (body intact here), %d deleted ([FAIL] MISSING), %d skipped\n", resolved, rearmed, deleted, skipped)
 	if dryRun {
 		fmt.Println("(dry run - run without --dry-run to apply changes)")
 	}
@@ -370,4 +402,57 @@ func showUploaderStatus(ctx context.Context, cfg AdminConfig, showFailed bool, f
 	}
 
 	return nil
+}
+
+// resolveOutcome is what `uploader resolve` does with one parked upload.
+type resolveOutcome int
+
+const (
+	resolveRepair           resolveOutcome = iota // object in S3: finalize the row
+	resolveRearm                                  // body intact in this host's spool: let the uploader retry
+	resolveSkipRemote                             // owned by another host whose spool cannot be seen from here
+	resolveSkipSizeMismatch                       // a file is here but disagrees with the row: a human decides
+	resolveDelete                                 // in neither S3 nor this host's spool: the content is lost
+)
+
+// stagedBody is what this host's spool holds for an upload.
+type stagedBody int
+
+const (
+	stagedAbsent       stagedBody = iota
+	stagedIntact                  // present with exactly the row's size
+	stagedSizeMismatch            // present with a different size
+)
+
+// stagedBodyState inspects the spool file for an upload.
+func stagedBodyState(path string, expectedSize int64) stagedBody {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return stagedAbsent
+	}
+	if info.Size() != expectedSize {
+		return stagedSizeMismatch
+	}
+	return stagedIntact
+}
+
+// decideResolve picks the action for one parked upload. Deletion is the last resort and
+// is only reached for an upload this host owns whose body is provably in neither place:
+// a row owned by another host is never deleted from here, because that host's spool —
+// which this host cannot see — may still hold the body.
+func decideResolve(inS3 bool, ownedHere bool, staged stagedBody) resolveOutcome {
+	if inS3 {
+		return resolveRepair
+	}
+	if !ownedHere {
+		return resolveSkipRemote
+	}
+	switch staged {
+	case stagedIntact:
+		return resolveRearm
+	case stagedSizeMismatch:
+		return resolveSkipSizeMismatch
+	default:
+		return resolveDelete
+	}
 }

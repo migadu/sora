@@ -608,8 +608,8 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		//
 		// An existing row is re-armed rather than left alone: this delivery has just
 		// written a fresh spool file on this instance, so the body is here again even if
-		// an earlier copy's file went missing and the uploader exhausted the row's
-		// attempts (ExhaustUploadAttempts). Without the reset, AcquireAndLeasePendingUploads
+		// an earlier copy's file went missing and the uploader used up the row's
+		// attempts (one per lease, see processSingleUpload). Without the reset, AcquireAndLeasePendingUploads
 		// — which requires attempts < maxAttempts and instance_id = its own — would never
 		// lease the row again, and CleanupFailedUploads would eventually delete this
 		// message. Clearing last_attempt makes it leasable on the next worker tick; the

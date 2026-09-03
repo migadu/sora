@@ -99,6 +99,17 @@ func NewResilientS3Storage(s3storage *storage.S3Storage) *ResilientS3Storage {
 	}
 }
 
+// OperationTimeout is the configured per-request S3 timeout, or a 30 second default
+// when the wrapped storage carries none (test stubs). Readers use it as the budget for
+// one body fetch, retries included: a provider that hangs costs a client at most one
+// request's worth of waiting, not one per retry.
+func (rs *ResilientS3Storage) OperationTimeout() time.Duration {
+	if rs.storage != nil && rs.storage.Timeout > 0 {
+		return rs.storage.Timeout
+	}
+	return 30 * time.Second
+}
+
 func (rs *ResilientS3Storage) GetStorage() *storage.S3Storage {
 	return rs.storage
 }
@@ -236,7 +247,10 @@ func (rs *ResilientS3Storage) GetWithRetry(ctx context.Context, key string) (io.
 	}
 
 	op := func() (any, error) {
-		return rs.storage.Get(key)
+		// The caller's context reaches the HTTP request itself: an IMAP client that
+		// hangs up, or a deadline set by the reader, ends an attempt in flight instead
+		// of letting it run to the full operation timeout on a dead connection.
+		return rs.storage.GetContext(ctx, key)
 	}
 	result, err := rs.executeS3OperationWithRetry(ctx, rs.getBreaker, config, rs.isRetryableGetError, op, key, "GET")
 	if err != nil {

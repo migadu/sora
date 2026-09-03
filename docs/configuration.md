@@ -388,6 +388,30 @@ reason = "iOS Mail client with known IDLE issues"
 2. **Health checks:** Use `sora-admin health` or the HTTP API for health monitoring.
 3. **Log aggregation:** Configure structured logging and aggregate with your logging system.
 4. **Alert on failures:** Monitor authentication failures, connection limits, circuit breaker trips.
+5. **Alert on the upload queue, not on its log line.** The uploader logs `UploaderMonitor: ALERT` every 5 minutes while uploads are parked, but a warning in a log file is easy to route away and forget. Alert on the state instead:
+
+   ```yaml
+   groups:
+     - name: sora-uploader
+       rules:
+         # Uploads the worker has given up on (attempts >= uploader.max_attempts). Their
+         # bodies are unreadable from every node but the one that staged them, and the
+         # cleaner deletes the messages once they pass cleanup.grace_period.
+         - alert: SoraUploadsParked
+           expr: max(sora_queue_depth{queue_type="s3_upload_failed"}) > 0
+           for: 10m
+           labels: {severity: critical}
+           annotations:
+             summary: "{{ $value }} uploads parked — run `sora-admin uploader resolve --dry-run` on each node"
+         # The oldest upload still waiting for S3, per node. An hour means the provider
+         # or the database has been refusing this node's uploads for an hour.
+         - alert: SoraUploadBacklogStalled
+           expr: max by (instance) (sora_queue_processing_lag_seconds{queue_type="s3_upload"}) > 3600
+           for: 15m
+           labels: {severity: warning}
+           annotations:
+             summary: "oldest pending upload on {{ $labels.instance }} is {{ $value | humanizeDuration }} old"
+   ```
 
 ## Example Configurations
 
