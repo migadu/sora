@@ -240,6 +240,7 @@ func TestIMAP_FetchUploadedBodyS3Slow(t *testing.T) {
 		"Body that lives in S3 behind a provider that stopped answering.\r\n"
 
 	uid := appendMessage(t, c, msg)
+	server.WaitForUploads(t) // uploaded=true
 	// The harness uploads synchronously and keeps no local cache, so the body now
 	// exists only in the fake S3.
 	if fake.ObjectCount() == 0 {

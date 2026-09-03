@@ -207,6 +207,25 @@ type UploadWorker struct {
 	backoffFailures int
 }
 
+// uploadOutcome classifies what one lease of a pending upload achieved.
+type uploadOutcome int
+
+const (
+	// uploadDone: the body is in S3 and the row is finalized (or already was).
+	uploadDone uploadOutcome = iota
+	// uploadRetryLater: the provider, the database or this node's disk did not
+	// cooperate. Nothing is known about the content; the attempt is not counted. This
+	// is the only outcome that says something about the path to storage, so it is the
+	// only one that ends a pass early or drives the cycle-level backoff.
+	uploadRetryLater
+	// uploadContentProblem: the content itself is wrong or gone — an invalid row, an
+	// empty or size-mismatched file, or a file missing while S3 reports the object
+	// absent. One attempt is counted. It says nothing about storage: a queue whose
+	// head is full of rows with lost bodies must not stall the fresh rows behind them,
+	// nor make the worker back off from a provider that is perfectly healthy.
+	uploadContentProblem
+)
+
 // uploadBackoffMax caps the cycle-level backoff. It bounds how long the worker can
 // stay idle after a provider or database outage ends: at most this long after the first
 // PUT would have succeeded again, the next cycle runs and drains the backlog.
@@ -428,8 +447,11 @@ func (w *UploadWorker) EnableSyncUpload() {
 func (w *UploadWorker) NotifyUploadQueued() {
 	if w.syncUpload.Load() {
 		// Synchronous mode (tests): process the queue inline so the caller
-		// can safely FETCH the message immediately after APPEND.
-		_ = w.processQueue(context.Background())
+		// can safely FETCH the message immediately after APPEND. Bypasses the
+		// cycle-level backoff, which exists to spare a broken provider in
+		// production; a test that asks for the queue to be processed must see
+		// every row processed.
+		_ = w.processPendingUploads(context.Background())
 		return
 	}
 	select {
@@ -444,22 +466,24 @@ func (w *UploadWorker) NotifyUploadQueued() {
 // need uploads to complete (and messages to be marked uploaded=true in the DB)
 // before issuing a FETCH command.  It must not be called in production code paths.
 func (w *UploadWorker) DrainSync(ctx context.Context) error {
-	return w.processQueue(ctx)
-}
-
-func (w *UploadWorker) processQueue(ctx context.Context) error {
+	// Bypasses the cycle-level backoff for the same reason as sync-upload mode.
 	return w.processPendingUploads(ctx)
 }
 
-func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
+// processQueue is what the ticker and the notify channel run: one pass over the queue,
+// unless the worker is backing off after a cycle the provider or database turned away.
+func (w *UploadWorker) processQueue(ctx context.Context) error {
 	if until, _ := w.backoffState(); time.Now().Before(until) {
 		logger.Debug("Uploader: cycle skipped, backing off after failed cycle", "until", until)
 		return nil
 	}
+	return w.processPendingUploads(ctx)
+}
 
+func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 	sem := make(chan struct{}, w.concurrency)
 	var wg sync.WaitGroup
-	var succeeded, failed atomic.Int64
+	var done, retryLater atomic.Int64
 
 	for {
 		uploads, err := w.rdb.AcquireAndLeasePendingUploadsWithRetry(ctx, w.instanceID, w.batchSize, w.retryInterval, w.maxAttempts)
@@ -492,29 +516,34 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 				go func(upload db.PendingUpload) {
 					defer wg.Done()
 					defer func() { <-sem }()
-					if w.processSingleUpload(ctx, upload) {
-						succeeded.Add(1)
-					} else {
-						failed.Add(1)
+					switch w.processSingleUpload(ctx, upload) {
+					case uploadDone:
+						done.Add(1)
+					case uploadRetryLater:
+						retryLater.Add(1)
 					}
 				}(upload)
 			}
 		}
 		wg.Wait()
 
-		// Nothing in this batch went through: the rest of the queue will not fare
-		// better right now. Stop the pass here so one broken cycle costs one batch of
-		// requests, not the whole backlog, and let the backoff decide when to look again.
-		if failed.Load() > 0 && succeeded.Load() == 0 {
+		// The provider or the database turned uploads away and none went through:
+		// the rest of the queue will not fare better right now. Stop the pass here so
+		// one broken cycle costs one batch of requests, not the whole backlog, and let
+		// the backoff decide when to look again. Rows with lost bodies do not count:
+		// they say nothing about storage, and the fresh rows queued behind them must
+		// still be reached in this pass.
+		if retryLater.Load() > 0 && done.Load() == 0 {
 			break
 		}
 	}
-	w.noteCycleOutcome(succeeded.Load(), failed.Load())
+	w.noteCycleOutcome(done.Load(), retryLater.Load())
 	return nil
 }
 
-// processSingleUpload runs one leased upload to completion and reports whether the body
-// is now in S3 (true) or the row has to be leased again (false).
+// processSingleUpload runs one leased upload to completion and reports what happened:
+// the body is in S3 (uploadDone), storage or the database did not cooperate
+// (uploadRetryLater), or the content itself is wrong or gone (uploadContentProblem).
 //
 // Attempts are counted (MarkUploadAttempt) only for evidence about the content itself:
 // an invalid row, an empty or size-mismatched file, or a file that is missing while S3
@@ -523,14 +552,14 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 // 40 minutes once parked 4161 intact bodies at max_attempts, unreadable from any other
 // node for two weeks. Such rows are simply leased again after retry_interval, and the
 // cycle-level backoff (noteCycleOutcome) keeps a broken provider from being hammered.
-func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.PendingUpload) bool {
+func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.PendingUpload) uploadOutcome {
 	// Early validation of upload data
 	if !isValidContentHash(upload.ContentHash) {
 		logger.Error("Uploader: Invalid content hash in upload record", "hash", upload.ContentHash, "account_id", upload.AccountID)
 		if err := w.rdb.MarkUploadAttemptWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
 			logger.Error("Uploader: CRITICAL - Failed to mark upload attempt for invalid hash", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 		}
-		return false
+		return uploadContentProblem
 	}
 
 	logger.Info("Uploader: Uploading hash", "hash", upload.ContentHash, "account_id", upload.AccountID)
@@ -543,7 +572,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	if err != nil {
 		// A database error; the row is leased again after retry_interval, uncounted.
 		logger.Error("Uploader: Failed to resolve storage keys for upload", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
-		return false
+		return uploadRetryLater
 	}
 
 	filePath := w.FilePath(upload.ContentHash, upload.AccountID)
@@ -555,7 +584,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		err := w.rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID)
 		if err != nil {
 			logger.Warn("Uploader: Failed to finalize S3 upload - keeping local file for retry", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
-			return false
+			return uploadRetryLater
 		}
 		// Only delete after successful DB update
 		logger.Info("Uploader: Upload completed (already uploaded hash)", "hash", upload.ContentHash, "account_id", upload.AccountID)
@@ -564,7 +593,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		if err := w.RemoveLocalFile(filePath); err != nil {
 			// Log is inside RemoveLocalFile
 		}
-		return true // Done with this upload record
+		return uploadDone // Done with this upload record
 	}
 
 	// Stream the body off the disk it already sits on rather than reading it whole:
@@ -579,7 +608,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 			// cannot read it right now. Not evidence about the content: leased again,
 			// uncounted, and the stall monitor reports it if it persists.
 			logger.Error("Uploader: Could not read file", "path", filePath, "account_id", upload.AccountID, "error", err)
-			return false
+			return uploadRetryLater
 		}
 
 		// Local file is missing (ENOENT). This can happen when:
@@ -608,7 +637,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 				logger.Warn("Uploader: Could not check S3 existence after missing file",
 					"hash", upload.ContentHash, "account_id", upload.AccountID, "key", key, "error", statErr)
 				// Do NOT increment attempts: the content may be in S3; we'll retry next cycle.
-				return false
+				return uploadRetryLater
 			}
 			if !exists {
 				logger.Warn("Uploader: Local file missing and key absent from S3",
@@ -640,12 +669,12 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 			if err != nil {
 				logger.Error("Uploader: CRITICAL - Failed to complete upload after S3 existence recovery",
 					"hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
-				return false // Retry next cycle; do NOT increment attempts
+				return uploadRetryLater // Retry next cycle; do NOT increment attempts
 			}
 			logger.Info("Uploader: Upload self-healed via S3 existence check",
 				"hash", upload.ContentHash, "account_id", upload.AccountID)
 			metrics.UploadWorkerJobs.WithLabelValues("success").Inc()
-			return true
+			return uploadDone
 		}
 
 		// File missing AND S3 says it does not have it: the only evidence of permanent
@@ -660,7 +689,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		}
 		logger.Error("Uploader: Could not read file and S3 has no object - counting attempt",
 			"path", filePath, "account_id", upload.AccountID, "attempts", upload.Attempts+1, "max_attempts", w.maxAttempts, "error", err)
-		return false
+		return uploadContentProblem
 	}
 	defer file.Close()
 
@@ -668,7 +697,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	if err != nil {
 		// Same as a failed open: a local I/O problem, not evidence about the content.
 		logger.Error("Uploader: Could not stat file", "path", filePath, "account_id", upload.AccountID, "error", err)
-		return false
+		return uploadRetryLater
 	}
 
 	// Validate data integrity before uploading to S3.
@@ -685,7 +714,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 				"hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 		}
 		metrics.UploadWorkerJobs.WithLabelValues("failure").Inc()
-		return false
+		return uploadContentProblem
 	}
 
 	// Attempt to upload to S3 using session-level advisory lock instead of transaction-level.
@@ -749,7 +778,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		metrics.UploadWorkerDuration.Observe(time.Since(start).Seconds())
 
 		// IMPORTANT: We do not retry here, the retry loop will pick it up later from pending_uploads
-		return false
+		return uploadRetryLater
 	}
 
 	// Move the uploaded file to the global cache (if a cache is configured).
@@ -777,7 +806,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	metrics.UploadWorkerDuration.Observe(time.Since(start).Seconds())
 
 	logger.Info("Uploader: Upload completed", "hash", upload.ContentHash, "account_id", upload.AccountID)
-	return true
+	return uploadDone
 }
 
 // reportError sends an error to the error channel if configured, otherwise logs it
@@ -834,11 +863,12 @@ func (w *UploadWorker) setBackoffForTest(until time.Time, failures int) {
 
 // noteCycleOutcome adjusts the cycle-level backoff from what one cycle achieved.
 //
-// A cycle in which every upload failed means the path to storage, or the database
-// behind it, is broken for everyone; no single row is at fault. Leasing a thousand rows
-// every retry_interval against a provider that rejects all of them only multiplies the
-// outage, so the worker idles for retry_interval, doubling per consecutive such cycle up
-// to uploadBackoffMax. One success proves the path works again and clears it.
+// A cycle in which the provider or the database turned every upload away means the
+// path to storage is broken for everyone; no single row is at fault. Leasing a thousand
+// rows every retry_interval against a provider that rejects all of them only multiplies
+// the outage, so the worker idles for retry_interval, doubling per consecutive such cycle
+// up to uploadBackoffMax. One success proves the path works again and clears it. Rows
+// whose content is gone are not failures in this sense (see uploadContentProblem).
 func (w *UploadWorker) noteCycleOutcome(succeeded, failed int64) {
 	w.backoffMu.Lock()
 	defer w.backoffMu.Unlock()
@@ -863,7 +893,7 @@ func (w *UploadWorker) noteCycleOutcome(succeeded, failed int64) {
 		delay = uploadBackoffMax
 	}
 	w.backoffUntil = time.Now().Add(delay)
-	logger.Warn("Uploader: every upload in this cycle failed; backing off",
+	logger.Warn("Uploader: storage turned away every upload in this cycle; backing off",
 		"failed", failed, "consecutive_failed_cycles", w.backoffFailures, "retry_in", delay)
 }
 

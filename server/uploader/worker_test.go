@@ -373,8 +373,8 @@ func TestProcessSingleUpload(t *testing.T) {
 			return nil
 		}
 
-		ok := worker.processSingleUpload(context.Background(), baseUpload)
-		assert.False(t, ok)
+		outcome := worker.processSingleUpload(context.Background(), baseUpload)
+		assert.Equal(t, uploadRetryLater, outcome)
 		assert.False(t, markedAttempt.Load(), "a database error says nothing about the content; the row must stay retryable")
 	})
 
@@ -421,8 +421,8 @@ func TestProcessSingleUpload(t *testing.T) {
 			return false, nil // S3 doesn't have it either
 		}
 
-		ok := worker.processSingleUpload(context.Background(), baseUpload)
-		assert.False(t, ok)
+		outcome := worker.processSingleUpload(context.Background(), baseUpload)
+		assert.Equal(t, uploadContentProblem, outcome, "lost content is the row's problem, not storage's")
 		assert.Equal(t, int32(1), marked.Load(), "exactly one attempt is counted per missing+absent observation")
 	})
 
@@ -468,9 +468,9 @@ func TestProcessSingleUpload(t *testing.T) {
 			return nil
 		}
 
-		ok := worker.processSingleUpload(context.Background(), baseUpload)
+		outcome := worker.processSingleUpload(context.Background(), baseUpload)
 
-		assert.False(t, ok)
+		assert.Equal(t, uploadRetryLater, outcome)
 		assert.False(t, markedAttempt.Load(), "a provider rejection must not park an intact file")
 		_, err := os.Stat(filePath)
 		assert.NoError(t, err, "local file should NOT be removed if S3 upload fails")
@@ -587,10 +587,10 @@ func TestProcessPendingUploads(t *testing.T) {
 		err := worker.processPendingUploads(context.Background())
 		require.NoError(t, err)
 
-		// The loop was entered. Neither processed upload has a local file and the mock S3
-		// reports nothing, so the batch fails as a whole and the pass ends there (an
-		// all-failed batch is not followed by another lease; see processPendingUploads).
-		assert.Equal(t, 1, callCount, "an all-failed batch ends the pass after one lease")
+		// The loop was entered and, although neither processed upload has a local file
+		// (content problems, one attempt each), the pass went on to lease again: lost
+		// bodies must not stall the queue behind them.
+		assert.Equal(t, 2, callCount, "AcquireAndLeasePendingUploadsWithRetry should be called twice")
 
 		// We expect 2 uploads to be processed (the one with 3 attempts should be skipped).
 		assert.Equal(t, int32(2), processedCount.Load(), "should have processed 2 out of 3 uploads")
@@ -644,18 +644,63 @@ func TestProcessPendingUploads(t *testing.T) {
 		assert.Equal(t, 1, failures)
 		assert.WithinDuration(t, time.Now().Add(30*time.Second), until, 5*time.Second, "first backoff is one retry_interval")
 
-		// While backing off, a cycle does not even touch the database.
+		// While backing off, a ticker-driven cycle does not even touch the database.
 		batchesLeft.Store(1)
-		require.NoError(t, worker.processPendingUploads(context.Background()))
+		require.NoError(t, worker.processQueue(context.Background()))
 		assert.Equal(t, int32(1), acquires.Load(), "no lease while backing off")
+
+		// A drain (sync-upload mode, DrainSync) is not gated: a test that asks for the
+		// queue to be processed must see every row processed.
+		require.NoError(t, worker.DrainSync(context.Background()))
+		assert.Equal(t, int32(2), acquires.Load(), "DrainSync leases despite the backoff")
 
 		// A second all-failed cycle doubles the delay.
 		worker.setBackoffForTest(time.Time{}, 1)
+		batchesLeft.Store(1)
 		require.NoError(t, worker.processPendingUploads(context.Background()))
-		assert.Equal(t, int32(2), acquires.Load())
+		assert.Equal(t, int32(3), acquires.Load())
 		until, failures = worker.backoffState()
 		assert.Equal(t, 2, failures)
 		assert.WithinDuration(t, time.Now().Add(60*time.Second), until, 5*time.Second)
+	})
+
+	// The shared integration database keeps pending rows of finished tests whose spool
+	// files are gone. Ordered oldest first and leased ten at a time, they fill the head
+	// of every pass; a fresh APPEND behind them was left un-uploaded when such a batch
+	// counted as "every upload failed". Lost content is not a storage failure.
+	t.Run("rows with lost bodies neither end the pass nor arm the backoff", func(t *testing.T) {
+		worker, rdb, s3, cache, _ := setupTestWorker(t)
+		good := "b3a8e0e1f9ab1bfe3a36f231f676f7e08a43ac7f0b6a53873b52444d67707d01"
+		goodPath := worker.FilePath(good, 100)
+		require.NoError(t, os.MkdirAll(filepath.Dir(goodPath), 0755))
+		require.NoError(t, os.WriteFile(goodPath, []byte("test data"), 0644))
+
+		var acquires atomic.Int32
+		rdb.AcquireAndLeasePendingUploadsWithRetryFunc = func(ctx context.Context, instanceID string, batchSize int, retryInterval time.Duration, maxAttempts int) ([]db.PendingUpload, error) {
+			switch acquires.Add(1) {
+			case 1: // stale rows: no spool file, and S3 (mock) reports absent
+				return []db.PendingUpload{
+					{ID: 1, AccountID: 200, ContentHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Size: 9},
+					{ID: 2, AccountID: 201, ContentHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Size: 9},
+				}, nil
+			case 2: // the fresh row behind them
+				return []db.PendingUpload{{ID: 3, AccountID: 100, ContentHash: good, Size: 9}}, nil
+			}
+			return nil, nil
+		}
+		var uploaded atomic.Bool
+		s3.PutWithRetryFunc = func(ctx context.Context, key string, reader io.Reader, size int64) error {
+			uploaded.Store(true)
+			return nil
+		}
+		cache.MoveInFunc = func(srcPath, contentHash string) error { return os.Remove(srcPath) }
+
+		require.NoError(t, worker.processPendingUploads(context.Background()))
+		assert.Equal(t, int32(3), acquires.Load(), "the pass continued past the stale batch")
+		assert.True(t, uploaded.Load(), "the fresh row was uploaded in the same pass")
+		until, failures := worker.backoffState()
+		assert.Equal(t, 0, failures)
+		assert.True(t, until.IsZero(), "lost bodies do not arm the backoff")
 	})
 
 	t.Run("backoff is capped and cleared by the first success", func(t *testing.T) {
