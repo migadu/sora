@@ -176,38 +176,62 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 	var resolved, rearmed, deleted, skipped int
 
 	for _, upload := range failedUploads {
-		if upload.AccountEmail == "" {
-			fmt.Printf("  [SKIP]   id=%-10d hash=%.16s... (no account email found)\n", upload.ID, upload.ContentHash)
+		// The keys come from the message rows, not from the account's current primary
+		// address: one upload can stand behind rows keyed under different addresses
+		// (the primary at the time each was written, or the address an import ran
+		// under), and each key is judged on its own object. Keys whose object exists
+		// are finalized right away; the spool decision below sees only the residue.
+		keys, err := rdb.PendingUploadKeysWithRetry(ctx, upload.ContentHash, upload.AccountID)
+		if err != nil {
+			fmt.Printf("  [ERROR]  id=%-10d hash=%.16s... could not resolve storage keys: %v\n", upload.ID, upload.ContentHash, err)
 			skipped++
 			continue
 		}
-
-		parts := strings.Split(upload.AccountEmail, "@")
-		if len(parts) != 2 {
-			fmt.Printf("  [SKIP]   id=%-10d hash=%.16s... (malformed email: %s)\n", upload.ID, upload.ContentHash, upload.AccountEmail)
+		var present, missing []string
+		checkFailed := false
+		for _, key := range keys {
+			exists, _, checkErr := s3Storage.Exists(key)
+			if checkErr != nil {
+				fmt.Printf("  [ERROR]  id=%-10d hash=%.16s... S3 check failed for %s: %v\n", upload.ID, upload.ContentHash, key, checkErr)
+				checkFailed = true
+				break
+			}
+			if exists {
+				present = append(present, key)
+			} else {
+				missing = append(missing, key)
+			}
+		}
+		if checkFailed {
 			skipped++
 			continue
 		}
-
-		s3Key := fmt.Sprintf("%s/%s/%s", parts[1], parts[0], upload.ContentHash)
-		exists, _, checkErr := s3Storage.Exists(s3Key)
-		if checkErr != nil {
-			fmt.Printf("  [ERROR]  id=%-10d hash=%.16s... S3 check failed: %v\n", upload.ID, upload.ContentHash, checkErr)
-			skipped++
-			continue
-		}
-
-		staged := stagedBodyState(uploader.StagingFilePath(cfg.Uploader.Path, upload.ContentHash, upload.AccountID), upload.Size)
-		switch decideResolve(exists, upload.InstanceID == localInstance, staged) {
-		case resolveRepair:
-			// Content is in S3 - mark messages as uploaded=TRUE, remove pending record.
-			fmt.Printf("  [REPAIR] id=%-10d account=%-8d hash=%.16s... [OK] EXISTS in S3 → CompleteS3Upload\n",
-				upload.ID, upload.AccountID, upload.ContentHash)
+		if len(present) > 0 {
+			fmt.Printf("  [REPAIR] id=%-10d account=%-8d hash=%.16s... [OK] EXISTS in S3 under %s → CompleteS3Upload\n",
+				upload.ID, upload.AccountID, upload.ContentHash, strings.Join(present, " "))
 			if !dryRun {
-				if err := rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID); err != nil {
+				if err := rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID, present); err != nil {
 					fmt.Printf("            ERROR: %v\n", err)
 					skipped++
 					continue
+				}
+			}
+		}
+
+		staged := stagedBodyState(uploader.StagingFilePath(cfg.Uploader.Path, upload.ContentHash, upload.AccountID), upload.Size)
+		switch decideResolve(len(missing) == 0, upload.InstanceID == localInstance, staged) {
+		case resolveRepair:
+			// Every key this upload still had to write has its object, or nothing was
+			// left to write: finalize what remains and clear the pending row.
+			if len(present) == 0 {
+				fmt.Printf("  [REPAIR] id=%-10d account=%-8d hash=%.16s... nothing left to write → CompleteS3Upload\n",
+					upload.ID, upload.AccountID, upload.ContentHash)
+				if !dryRun {
+					if err := rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID, nil); err != nil {
+						fmt.Printf("            ERROR: %v\n", err)
+						skipped++
+						continue
+					}
 				}
 			}
 			resolved++

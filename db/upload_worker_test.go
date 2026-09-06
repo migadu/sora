@@ -302,7 +302,7 @@ func TestCompleteS3Upload(t *testing.T) {
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
 
-	err = db.CompleteS3Upload(ctx, tx, contentHash, accountID)
+	err = db.CompleteS3Upload(ctx, tx, contentHash, accountID, []string{"domain/localpart/" + contentHash})
 	require.NoError(t, err)
 
 	err = tx.Commit(ctx)
@@ -351,19 +351,19 @@ func TestIsContentHashUploaded(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("is uploaded", func(t *testing.T) {
-		uploaded, err := db.IsContentHashUploaded(ctx, hashUploaded, accountID)
+		uploaded, err := db.IsContentHashUploaded(ctx, hashUploaded, accountID, "d", "l")
 		require.NoError(t, err)
 		assert.True(t, uploaded)
 	})
 
 	t.Run("is not uploaded", func(t *testing.T) {
-		uploaded, err := db.IsContentHashUploaded(ctx, hashNotUploaded, accountID)
+		uploaded, err := db.IsContentHashUploaded(ctx, hashNotUploaded, accountID, "d", "l")
 		require.NoError(t, err)
 		assert.False(t, uploaded)
 	})
 
 	t.Run("does not exist", func(t *testing.T) {
-		uploaded, err := db.IsContentHashUploaded(ctx, hashNonExistent, accountID)
+		uploaded, err := db.IsContentHashUploaded(ctx, hashNonExistent, accountID, "d", "l")
 		require.NoError(t, err)
 		assert.False(t, uploaded)
 	})
@@ -371,7 +371,7 @@ func TestIsContentHashUploaded(t *testing.T) {
 	t.Run("wrong account", func(t *testing.T) {
 		otherTestEmail := fmt.Sprintf("test_isuploaded_other_%d@example.com", time.Now().UnixNano())
 		otherAccountID := createTestAccount(t, db, otherTestEmail, "password")
-		uploaded, err := db.IsContentHashUploaded(ctx, hashUploaded, otherAccountID)
+		uploaded, err := db.IsContentHashUploaded(ctx, hashUploaded, otherAccountID, "d", "l")
 		require.NoError(t, err)
 		assert.False(t, uploaded)
 	})

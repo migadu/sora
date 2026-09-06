@@ -417,9 +417,10 @@ func (rd *ResilientDatabase) DeleteMessagesFTSByHashBatchWithRetry(ctx context.C
 	return result.(int64), nil
 }
 
-func (rd *ResilientDatabase) GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, batchSize int) ([]int64, error) {
+func (rd *ResilientDatabase) GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, batchSize int, gracePeriod time.Duration) ([]int64, error) {
+	deletedBefore := time.Now().Add(-gracePeriod)
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetDanglingAccountsForFinalDeletion(ctx, batchSize)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetDanglingAccountsForFinalDeletion(ctx, batchSize, deletedBefore)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
 	if err != nil {

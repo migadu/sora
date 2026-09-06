@@ -151,6 +151,11 @@ type ResilientDatabase struct {
 	// Runtime failover support
 	failoverManager *RuntimeFailoverManager
 
+	// cleanupLockConn holds the session-level cleanup advisory lock for the duration
+	// of a cleanup cycle (AcquireCleanupLockWithRetry / ReleaseCleanupLockWithRetry).
+	cleanupLockMu   sync.Mutex
+	cleanupLockConn *pgxpool.Conn
+
 	// Circuit breakers (per-operation type)
 	queryBreaker *circuitbreaker.CircuitBreaker
 	writeBreaker *circuitbreaker.CircuitBreaker
@@ -779,9 +784,9 @@ func (rd *ResilientDatabase) DeleteMessageByHashAndMailboxWithRetry(ctx context.
 	return result.(int64), nil
 }
 
-func (rd *ResilientDatabase) CompleteS3UploadWithRetry(ctx context.Context, hash string, accountID int64) error {
+func (rd *ResilientDatabase) CompleteS3UploadWithRetry(ctx context.Context, hash string, accountID int64, writtenKeys []string) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(ctx, true).CompleteS3Upload(ctx, tx, hash, accountID)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).CompleteS3Upload(ctx, tx, hash, accountID, writtenKeys)
 	}
 	_, err := rd.executeWriteInTxWithRetry(ctx, importExportRetryConfig, timeoutWrite, op)
 	return err

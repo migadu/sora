@@ -194,6 +194,12 @@ func (rd *ResilientDatabase) GetActiveAccountIDByAddressWithRetry(ctx context.Co
 }
 
 func (rd *ResilientDatabase) CreateDefaultMailboxesWithRetry(ctx context.Context, AccountID int64) error {
+	// Every RCPT, login and API delivery calls this; for every account but a brand-new
+	// one the mailboxes exist. Answer that from a single read before paying for a
+	// write transaction (BEGIN + SET LOCAL + EXISTS + COMMIT on the write pool).
+	if has, err := rd.getOperationalDatabaseForOperation(ctx, false).HasInbox(ctx, AccountID); err == nil && has {
+		return nil
+	}
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).CreateDefaultMailboxes(ctx, tx, AccountID)
 	}

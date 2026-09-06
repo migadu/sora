@@ -1153,3 +1153,19 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 
 	return nil
 }
+
+// HasInbox reports whether the account has a live INBOX. It is the cheap read that
+// lets a delivery path skip CreateDefaultMailboxes' write transaction (BEGIN, SET LOCAL,
+// EXISTS, COMMIT on the write pool) on every RCPT/login for an account that has long
+// had its mailboxes — which is every delivery but the first. A stale replica answering
+// "no" only costs the write transaction it would have cost anyway.
+func (db *Database) HasInbox(ctx context.Context, accountID int64) (bool, error) {
+	var exists bool
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM mailboxes WHERE account_id = $1 AND LOWER(name) = 'inbox' AND deleted_at IS NULL)
+	`, accountID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check for INBOX existence: %w", err)
+	}
+	return exists, nil
+}

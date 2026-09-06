@@ -11,6 +11,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
@@ -847,8 +848,12 @@ func (s *IMAPSession) loadMessageBody(ctx context.Context, msg *db.Message) ([]b
 				// Validate cached data is not empty — a 0-byte cache file would
 				// otherwise be served as a "hit", returning an empty body to the
 				// client.  Fall through to S3 so the real content can be fetched.
-				if len(cacheData) == 0 {
-					s.WarnLog("cache contains empty body, falling through to S3", "uid", msg.UID, "content_hash", msg.ContentHash)
+				if !bodySizeMatches(cacheData, msg.Size) {
+					// A 0-byte or truncated cache file (a crash mid-write, a disk that
+					// filled up) must not be served as the message: S3 is the authority.
+					s.WarnLog("cache body size disagrees with the message, falling through to S3",
+						"uid", msg.UID, "content_hash", msg.ContentHash, "cached", len(cacheData), "expected", msg.Size)
+					s.server.cache.Delete(msg.ContentHash)
 				} else {
 					s.DebugLog("cache hit", "uid", msg.UID)
 					return cacheData, nil
@@ -865,7 +870,7 @@ func (s *IMAPSession) loadMessageBody(ctx context.Context, msg *db.Message) ([]b
 			// and transient S3 outages where the upload worker has not yet run.
 			if s.server.uploader != nil {
 				filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-				if diskData, diskErr := os.ReadFile(filePath); diskErr == nil && len(diskData) > 0 {
+				if diskData, diskErr := os.ReadFile(filePath); diskErr == nil && bodySizeMatches(diskData, msg.Size) {
 					s.DebugLog("S3 unavailable, served from local disk", "uid", msg.UID)
 					return diskData, nil
 				}
@@ -882,7 +887,7 @@ func (s *IMAPSession) loadMessageBody(ctx context.Context, msg *db.Message) ([]b
 			// conditions (empty/0-byte object, missing S3 key, read error) are NOT
 			// ErrRetrieveFailed and must NOT be reported transient, or the client would
 			// retry forever instead of degrading to an empty body.
-			if errors.Is(err, storage.ErrRetrieveFailed) && !resilient.IsNotFoundError(err) {
+			if errors.Is(err, storage.ErrRetrieveFailed) && !resilient.IsNotFoundError(err) && !errors.Is(err, storage.ErrCorruptObject) {
 				return nil, fmt.Errorf("message UID %d: %w (S3 unavailable): %v", msg.UID, errBodyTransientlyUnavailable, err)
 			}
 			// Permanent. A NoSuchKey on an uploaded message is genuine content loss worth
@@ -903,7 +908,7 @@ func (s *IMAPSession) loadMessageBody(ctx context.Context, msg *db.Message) ([]b
 	}
 	s.DebugLog("fetching not yet uploaded message from disk", "uid", msg.UID)
 	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-	if data, diskErr := os.ReadFile(filePath); diskErr == nil && len(data) > 0 {
+	if data, diskErr := os.ReadFile(filePath); diskErr == nil && bodySizeMatches(data, msg.Size) {
 		return data, nil
 	}
 
@@ -967,6 +972,10 @@ func (s *IMAPSession) loadMessageBody(ctx context.Context, msg *db.Message) ([]b
 // batches body fetches, and one such NO aborts the whole batch, every sync, forever —
 // "Cannot Get Mail" for the mailbox because of one lost body.
 func (s *IMAPSession) bodyUploadStillPending(ctx context.Context, msg *db.Message) bool {
+	// Read the master: the pending row and the message row committed together, and a
+	// replica that has not caught up would answer "no pending upload" for a body that is
+	// on its way — turning "retry later" into "the body is gone" (an empty body).
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	pending, err := s.server.rdb.PendingUploadRetryableWithRetry(ctx, msg.ContentHash, msg.AccountID, s.server.uploader.MaxAttempts())
 	if err != nil {
 		s.WarnLog("could not check pending-upload status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
@@ -978,7 +987,7 @@ func (s *IMAPSession) bodyUploadStillPending(ctx context.Context, msg *db.Messag
 	// No pending upload: the body may have just been uploaded (uploaded flipped to true
 	// between our in-memory snapshot and now). If so it's transient — a retry should
 	// serve it from S3 via the uploaded path.
-	uploaded, err := s.server.rdb.IsContentHashUploadedWithRetry(ctx, msg.ContentHash, msg.AccountID)
+	uploaded, err := s.server.rdb.IsContentHashUploadedWithRetry(ctx, msg.ContentHash, msg.AccountID, msg.S3Domain, msg.S3Localpart)
 	if err != nil {
 		s.WarnLog("could not check uploaded status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
 		return true

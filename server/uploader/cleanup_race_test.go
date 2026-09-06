@@ -109,8 +109,8 @@ func (m *mockUploaderDB) ExecuteWithS3ObjectSessionLock(ctx context.Context, con
 	}
 	return args.Error(1)
 }
-func (m *mockUploaderDB) CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64) error {
-	args := m.Called(ctx, contentHash, accountID)
+func (m *mockUploaderDB) CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64, writtenKeys []string) error {
+	args := m.Called(ctx, contentHash, accountID, writtenKeys)
 	return args.Error(0)
 }
 func (m *mockUploaderDB) GetUploaderStatsWithRetry(ctx context.Context, maxAttempts int) (*db.UploaderStats, error) {
@@ -323,7 +323,7 @@ func TestProcessSingleUpload_S3ExistsButLocalFileMissing_SelfHeals(t *testing.T)
 
 	// We expect the self-heal path to call CompleteS3UploadWithRetry, NOT MarkUploadAttemptWithRetry.
 	var completeCalled bool
-	mockDB.On("CompleteS3UploadWithRetry", mock.Anything, contentHash, accountID).
+	mockDB.On("CompleteS3UploadWithRetry", mock.Anything, contentHash, accountID, mock.Anything).
 		Run(func(args mock.Arguments) { completeCalled = true }).
 		Return(nil)
 

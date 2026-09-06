@@ -241,7 +241,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		return 0, err
 	}
 
-	query, args := restoreCandidatesQuery(accountID, params, "id, mailbox_path, mailbox_id, message_id")
+	query, args := restoreCandidatesQuery(accountID, params, "id, mailbox_path, mailbox_id, message_id, content_hash")
 	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query messages for restoration: %w", err)
@@ -254,6 +254,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		mailboxPath string
 		mailboxID   *int64
 		messageID   string
+		contentHash string // for the per-object lock shared with the cleaner
 	}
 
 	var messagesToRestore []msgToRestore
@@ -262,7 +263,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	for rows.Next() {
 		var msg msgToRestore
 		var mailboxPath *string
-		err := rows.Scan(&msg.id, &mailboxPath, &msg.mailboxID, &msg.messageID)
+		err := rows.Scan(&msg.id, &mailboxPath, &msg.mailboxID, &msg.messageID, &msg.contentHash)
 		if err != nil {
 			return 0, fmt.Errorf("failed to scan message for restoration: %w", err)
 		}
@@ -357,6 +358,14 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		// in a previous chunk. The row itself may have vanished since the candidate list was
 		// built (already restored by a concurrent run, or purged by the cleaner); that is a
 		// skip, not an error, so a restore is always safe to re-run.
+		// Hold the object's lock while the row comes back to life: the cleaner takes
+		// the same lock (session try-lock) around "confirm orphan → delete object",
+		// so a restore can no longer slip between its check and its delete and leave a
+		// live row whose object is gone.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", GetS3ObjectLockID(accountID, msg.contentHash)); err != nil {
+			return 0, fmt.Errorf("failed to lock object for message %d: %w", msg.id, err)
+		}
+
 		var restorable bool
 		var existingCount int
 		err := tx.QueryRow(ctx, `

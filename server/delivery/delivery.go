@@ -235,8 +235,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// we don't want to overwrite/delete the file the uploader is reading.
 	expectedPath := d.Uploader.FilePath(contentHash, recipient.AccountID)
 	var filePath *string
-	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
-		// File doesn't exist, safe to write
+	if info, err := os.Stat(expectedPath); os.IsNotExist(err) || (err == nil && info.Size() != int64(len(messageBytes))) {
+		// File doesn't exist, or exists with the wrong size (a leftover that never
+		// finished): (re)write it atomically.
 		filePath, err = d.Uploader.StoreLocally(contentHash, recipient.AccountID, messageBytes)
 		if err != nil {
 			result.ErrorMessage = fmt.Sprintf("Failed to save message to disk: %v", err)
@@ -244,9 +245,14 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		}
 		d.Logger.Log("Message accepted locally, file written: %s", *filePath)
 	} else if err == nil {
-		// File already exists (likely being processed by uploader or concurrent duplicate delivery)
-		// Don't overwrite it, and don't set filePath so we won't try to delete it later
+		// File already exists with the right size (being processed by the uploader, or a
+		// concurrent duplicate delivery). Don't overwrite it, and don't set filePath so we
+		// won't try to delete it later. Touch it so the orphan sweep's grace period
+		// counts from now: this delivery's pending upload has not been committed yet.
 		filePath = nil
+		if terr := os.Chtimes(expectedPath, time.Now(), time.Now()); terr != nil {
+			d.Logger.Log("Could not refresh staged file mtime %s: %v", expectedPath, terr)
+		}
 		d.Logger.Log("Message file already exists, skipping write (concurrent delivery): %s", expectedPath)
 	} else {
 		// Stat error (permission issue, etc.)

@@ -53,6 +53,12 @@ func NewResilientS3Storage(s3storage *storage.S3Storage) *ResilientS3Storage {
 			return true
 		}
 
+		// A corrupt object (decryption failed) is about the bytes stored, not about
+		// the service: it must not open the breaker for everyone else.
+		if errors.Is(err, storage.ErrCorruptObject) {
+			return true
+		}
+
 		// Use proper AWS SDK error typing for S3 client errors (4xx).
 		// These are data/config issues, not S3 infrastructure failures.
 		var httpErr *awshttp.ResponseError
@@ -278,7 +284,7 @@ func (rs *ResilientS3Storage) PutWithRetry(ctx context.Context, key string, body
 				return nil, fmt.Errorf("failed to rewind reader for S3 put retry: %w", err)
 			}
 		}
-		return nil, rs.storage.Put(key, body, size)
+		return nil, rs.storage.PutContext(ctx, key, body, size)
 	}
 	_, err := rs.executeS3OperationWithRetry(ctx, rs.putBreaker, config, rs.isRetryableError, op, key, "PUT")
 	return err
@@ -295,7 +301,7 @@ func (rs *ResilientS3Storage) CopyWithRetry(ctx context.Context, sourcePath, des
 	}
 
 	op := func() (any, error) {
-		return nil, rs.storage.Copy(sourcePath, destPath)
+		return nil, rs.storage.CopyContext(ctx, sourcePath, destPath)
 	}
 	// Copy behaves somewhat like a Put in terms of failure modes and resource usage
 	_, err := rs.executeS3OperationWithRetry(ctx, rs.putBreaker, config, rs.isRetryableError, op, destPath, "COPY")
@@ -357,7 +363,7 @@ func (rs *ResilientS3Storage) DeleteWithRetry(ctx context.Context, key string) e
 	}
 
 	op := func() (any, error) {
-		return nil, rs.storage.Delete(key)
+		return nil, rs.storage.DeleteContext(ctx, key)
 	}
 	_, err := rs.executeS3OperationWithRetry(ctx, rs.deleteBreaker, config, rs.isRetryableError, op, key, "DELETE")
 	return err
@@ -409,7 +415,7 @@ func (rs *ResilientS3Storage) deleteBulkBatch(ctx context.Context, keys []string
 	remaining := keys
 	var failures map[string]error
 	op := func() (any, error) {
-		errs := rs.storage.DeleteBulk(remaining)
+		errs := rs.storage.DeleteBulkContext(ctx, remaining)
 		failures = errs
 		if len(errs) == 0 {
 			return nil, nil

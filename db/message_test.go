@@ -907,8 +907,13 @@ func TestInsertMessageFromImporter_DuplicateExpungedUID(t *testing.T) {
 	_, _, err = db.InsertMessageFromImporter(ctx, tx3, options2)
 
 	require.Error(t, err, "Second insert using an already-used UID must fail constraint")
-	require.ErrorIs(t, err, consts.ErrDBUniqueViolation,
-		"Expected ErrDBUniqueViolation so importer cleanly skips, but got a hard error")
+	// A taken UID is reported as ErrUIDConflict — distinct from ErrDBUniqueViolation,
+	// which callers treat as "this message is already there" and skip. Here the message
+	// was NOT stored, so the importer must record it as failed, not as a duplicate.
+	require.ErrorIs(t, err, consts.ErrUIDConflict,
+		"Expected ErrUIDConflict (reported as a failed import), but got a hard error")
+	require.NotErrorIs(t, err, consts.ErrDBUniqueViolation,
+		"a UID conflict must not look like a duplicate message the importer may skip")
 
 	// The defer tx3.Rollback(ctx) will handle cleaning up the aborted transaction.
 }

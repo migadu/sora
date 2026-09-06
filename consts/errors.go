@@ -18,8 +18,13 @@ var (
 	ErrTooManyKeywords        = errors.New("too many keywords on a message")
 	ErrAuthenticationFailed   = errors.New("authentication failed")
 
-	ErrDBNotFound                = errors.New("not found")
-	ErrDBUniqueViolation         = errors.New("unique violation")
+	ErrDBNotFound        = errors.New("not found")
+	ErrDBUniqueViolation = errors.New("unique violation")
+	// ErrUIDConflict is a unique violation on (mailbox_id, uid): a caller asked for a UID
+	// that the mailbox already has (preserve-uids import onto a mailbox that moved on).
+	// Distinct from ErrDBUniqueViolation because it is NOT "this message is already
+	// there": the message was not stored and must be reported, not counted as a skip.
+	ErrUIDConflict               = errors.New("uid conflict")
 	ErrDBCommitTransactionFailed = errors.New("commit failed")
 	ErrDBBeginTransactionFailed  = errors.New("start transaction failed")
 	ErrDBQueryFailed             = errors.New("query failed")

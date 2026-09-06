@@ -964,6 +964,13 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 				logger.Info("Relay handler configured: type=http", "url", cfg.Relay.HTTPURL, "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
 			}
 
+			if relayHandler == nil {
+				// The queue exists but nothing would ever drain it: every Sieve redirect
+				// would be 250-accepted into pending/ and sit there forever. Refuse to
+				// start rather than accept mail into a dead end.
+				errorHandler.FatalError("configure relay", fmt.Errorf("unsupported [relay] type %q: expected \"smtp\" or \"http\"", cfg.Relay.Type))
+			}
+
 			if relayHandler != nil {
 				batchSize := cfg.Relay.Queue.BatchSize
 				if batchSize <= 0 {
@@ -2396,6 +2403,7 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		AllowedHosts:                serverConfig.AllowedHosts,
 		Storage:                     deps.storage,
 		Cache:                       deps.cacheInstance,
+		Uploader:                    deps.uploadWorker, // spool reads + pending-upload state for bodies not yet in S3
 		AuthRateLimit:               authRateLimit,
 		LookupCache:                 serverConfig.LookupCache,
 		TLS:                         serverConfig.TLS,

@@ -3,6 +3,7 @@ package imap
 import (
 	"context"
 	"errors"
+	"syscall"
 
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/circuitbreaker"
@@ -23,6 +24,11 @@ import (
 // This function lives in server/imap (rather than server/) to avoid import cycles,
 // since the server package cannot import db.
 func isTransientError(err error) bool {
+	// A full or read-only spool disk is a condition the operator will clear; the
+	// client should retry later ([UNAVAILABLE]), not be told the server is broken.
+	if err != nil && (errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS)) {
+		return true
+	}
 	if err == nil {
 		return false
 	}

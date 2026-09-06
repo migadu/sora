@@ -11,6 +11,7 @@ import (
 	"github.com/emersion/go-message"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/sieveengine"
@@ -213,8 +214,12 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 				// Queue for background delivery with retry
 				err := s.RelayQueue.Enqueue(recipient.FromAddress.FullAddress(), result.RedirectTo, "redirect", relayBytes)
 				if err != nil {
-					// Failed to enqueue, log error but don't fail delivery
+					// Failed to enqueue: keep the message in INBOX rather than fail the
+					// delivery, but say so where an operator will see it — the user's
+					// redirect silently did not happen.
 					s.DeliveryCtx.Logger.Log("Failed to enqueue redirect message: %v", err)
+					logger.Warn("Sieve redirect could not be queued; message kept in INBOX instead",
+						"account_id", recipient.AccountID, "redirect_to", result.RedirectTo, "error", err)
 				} else if !result.Copy {
 					// Successfully queued for redirect without copy
 					outcome.MailboxName = ""

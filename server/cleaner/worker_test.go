@@ -96,8 +96,8 @@ func (m *mockDatabase) DeleteMessagesFTSByHashBatchWithRetry(ctx context.Context
 	args := m.Called(ctx, hashes)
 	return args.Get(0).(int64), args.Error(1)
 }
-func (m *mockDatabase) GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, limit int) ([]int64, error) {
-	args := m.Called(ctx, limit)
+func (m *mockDatabase) GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, limit int, gracePeriod time.Duration) ([]int64, error) {
+	args := m.Called(ctx, limit, gracePeriod)
 	return args.Get(0).([]int64), args.Error(1)
 }
 func (m *mockDatabase) FinalizeAccountDeletionsWithRetry(ctx context.Context, accountIDs []int64) (int64, error) {
@@ -198,7 +198,7 @@ func TestCleanupWorker_RunOnce_HappyPath(t *testing.T) {
 
 	// Phase 3: Final account deletion
 	danglingAccounts := []int64{101, 102}
-	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, db.BATCH_PURGE_SIZE).Return(danglingAccounts, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, db.BATCH_PURGE_SIZE, mock.Anything).Return(danglingAccounts, nil).Once()
 	mockDB.On("FinalizeAccountDeletionsWithRetry", ctx, danglingAccounts).Return(int64(2), nil).Once()
 
 	// --- Run test ---
@@ -297,7 +297,7 @@ func TestCleanupWorker_RunOnce_S3DeleteFails(t *testing.T) {
 
 	// The rest of the cleanup should proceed
 	mockDB.On("GetUnusedFTSHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
-	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
 
@@ -328,7 +328,7 @@ func TestCleanupWorker_RunOnce_NoOp(t *testing.T) {
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
 	mockDB.On("GetUnusedFTSHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
-	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
 
@@ -369,7 +369,7 @@ func TestCleanupWorker_RunOnce_VectorPruning(t *testing.T) {
 	mockDB.On("PruneOldMessageVectorsWithRetry", ctx, ftsRetention).Return(int64(5), nil).Once()
 
 	mockDB.On("GetUnusedFTSHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
-	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
 
@@ -405,7 +405,7 @@ func TestCleanupWorker_RunOnce_NoFTSPruningWhenBothZero(t *testing.T) {
 	// (no On() setup means test will fail if they're called)
 
 	mockDB.On("GetUnusedFTSHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
-	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
 
@@ -442,7 +442,7 @@ func TestCleanupWorker_RunOnce_NoFTSRetention(t *testing.T) {
 	// Vector pruning should NOT be called (ftsRetention = 0)
 
 	mockDB.On("GetUnusedFTSHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
-	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
 
@@ -481,7 +481,7 @@ func TestCleanupWorker_RunOnce_SkipsFailedUploadCleanupWhenS3Unhealthy(t *testin
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
 	mockDB.On("GetUnusedFTSHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
-	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
 
@@ -522,7 +522,7 @@ func TestCleanupWorker_RunOnce_VectorOnlyPruning(t *testing.T) {
 	mockDB.On("PruneOldMessageVectorsWithRetry", ctx, ftsRetention).Return(int64(8), nil).Once()
 
 	mockDB.On("GetUnusedFTSHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
-	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	err := worker.runOnce(ctx)
 

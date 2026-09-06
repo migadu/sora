@@ -2,11 +2,11 @@ package lmtpproxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"strings"
 	"sync"
@@ -57,6 +57,15 @@ type Session struct {
 	// IMPORTANT: s.accountID is overwritten per RCPT; if we only unregister the last one,
 	// earlier recipients would leak connection counts permanently.
 	registeredAccountIDs map[int64]struct{}
+
+	// Per-transaction state. The backend's view of a transaction must stay the MTA's:
+	// acceptedRcpts counts the recipients the backend accepted (2xx to RCPT), which is
+	// also how many end-of-data replies it will send; txPoisoned is set once the backend
+	// connection is lost after such an acceptance — from then on every RCPT and DATA of
+	// this transaction answers 451 so the MTA retries the whole message, until MAIL,
+	// RSET or QUIT (see loseBackend).
+	acceptedRcpts int
+	txPoisoned    bool
 }
 
 // newSession creates a new LMTP proxy session.
@@ -232,8 +241,24 @@ func (s *Session) handleConnection() {
 			}
 			// Note: extractAddress can return an empty string for a null sender "<>", which is valid.
 			sender := s.extractAddress(fromParam)
+			// A new transaction: whatever became of the previous one is over.
+			s.resetTransaction()
 			s.sender = sender
 			s.mailFromReceived = true
+			// A connected backend must learn the new sender too (RFC 5321 §4.1.1.2: MAIL
+			// after a completed or reset transaction), or it would deliver with the
+			// previous transaction's Return-Path. Its answer is the answer; a backend
+			// lost here is harmless — the next RCPT reconnects and re-sends MAIL FROM.
+			if s.backendConn != nil {
+				if reply, ok := s.forwardSimpleCommand(fmt.Sprintf("MAIL FROM:<%s>", sender)); ok {
+					if !strings.HasPrefix(reply, "2") {
+						s.mailFromReceived = false
+					}
+					s.clientWriter.WriteString(reply)
+					s.clientWriter.Flush()
+					continue
+				}
+			}
 			s.sendResponse("250 2.1.0 Ok")
 
 		case "RCPT":
@@ -255,6 +280,14 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			s.DebugLog("Extracted recipient address", "to", to)
+
+			// The backend was lost after it accepted a recipient of this transaction:
+			// the MTA must retry the whole message (451). Never 503 — it would bounce
+			// the accepted recipients — and never a silent reconnect (see loseBackend).
+			if s.txPoisoned || (s.backendConn == nil && s.acceptedRcpts > 0) {
+				s.sendResponse("451 4.4.2 Backend connection lost, please retry the transaction")
+				continue
+			}
 
 			lookupStart := time.Now() // Start account lookup timing
 			if err := s.handleRecipient(to, lookupStart); err != nil {
@@ -377,54 +410,37 @@ func (s *Session) handleConnection() {
 			// Continue loop to handle subsequent RCPT TOs or DATA
 
 		case "DATA":
+			// A backend lost after it accepted a recipient: retry the whole message
+			// (451), never 503 — the MTA would bounce the accepted recipients.
+			if s.txPoisoned || (s.backendConn == nil && s.acceptedRcpts > 0) {
+				s.sendResponse("451 4.4.2 Backend connection lost, please retry the transaction")
+				continue
+			}
 			if s.backendConn == nil {
 				s.sendResponse("503 5.5.1 Bad sequence of commands (not connected to backend)")
 				continue
 			}
 
-			// Send DATA to backend
-			_, err := s.backendWriter.WriteString("DATA\r\n")
-			if err != nil {
-				s.DebugLog("Failed to send DATA to backend", "error", err)
+			// The backend's answer to DATA is relayed as-is (a hung backend is bounded by
+			// readBackendLine's deadline); a backend that fails here is dropped.
+			reply, ok := s.forwardSimpleCommand("DATA")
+			if !ok {
 				s.sendResponse("451 4.4.2 Backend error")
-				// Connection likely dead, close it?
-				s.backendConn.Close()
-				s.mu.Lock()
-				s.backendConn = nil
-				s.mu.Unlock()
 				continue
 			}
-			s.backendWriter.Flush()
-
-			// Read DATA response (bounded, with read deadline so a hung backend
-			// cannot block the session forever)
-			response, err := s.readBackendLine()
-			if err != nil {
-				s.DebugLog("Failed to read DATA response", "error", err)
-				s.sendResponse("451 4.4.2 Backend error")
-				s.backendConn.Close()
-				s.mu.Lock()
-				s.backendConn = nil
-				s.mu.Unlock()
-				continue
-			}
-
-			// Check response
-			if !strings.HasPrefix(response, "354") {
-				// Backend rejected DATA
-				s.clientWriter.WriteString(response)
-				s.clientWriter.Flush()
-				continue
-			}
-
-			// Backend accepted DATA (354), forward to client
-			s.clientWriter.WriteString(response)
+			s.clientWriter.WriteString(reply)
 			s.clientWriter.Flush()
+			if !strings.HasPrefix(reply, "354") {
+				continue // backend declined DATA; its answer was relayed
+			}
 
-			// Enter pipe mode for data transfer
-			s.DebugLog("Entering pipe mode for DATA transfer")
-			s.enterPipeMode()
-			return
+			// Relay the body and the per-recipient end-of-data replies inline, then
+			// carry on with the next command on this connection: Postfix reuses LMTP
+			// connections, and every transaction on one must be routed like the first.
+			if !s.relayMessageData() {
+				return
+			}
+			s.resetTransaction()
 
 		case "STARTTLS":
 			// Check if STARTTLS is enabled
@@ -493,9 +509,15 @@ func (s *Session) handleConnection() {
 			// Continue to next iteration to wait for new EHLO/LHLO
 
 		case "RSET":
-			s.sender = ""
-			s.to = ""
-			s.mailFromReceived = false
+			s.resetTransaction()
+			// The backend holds the transaction too (sender, accepted recipients): reset
+			// it as well, or the next MAIL/RCPT would land on stale state there. A
+			// backend lost here is harmless — the next RCPT reconnects.
+			if s.backendConn != nil {
+				if _, ok := s.forwardSimpleCommand("RSET"); !ok {
+					s.DebugLog("backend lost on RSET; the next recipient reconnects")
+				}
+			}
 			s.sendResponse("250 2.0.0 Ok")
 
 		case "NOOP":
@@ -724,7 +746,10 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				"method", "cache",
 				"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
-			return server.ErrUserNotFound
+			// The same decision a fresh miss makes (tempfail configured, or no
+			// healthy backend to verify against) — a cache hit must not bounce
+			// where the miss would have deferred.
+			return s.userNotFoundError()
 		} else {
 			// User found - use cached routing info
 			metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
@@ -1351,11 +1376,7 @@ func (s *Session) forwardRCPT(command string) {
 	if err != nil {
 		s.DebugLog("Failed to send RCPT TO", "error", err)
 		s.sendResponse("451 4.4.2 Backend error")
-		// Connection issues should probably close the backend connection but let client decide next step
-		s.backendConn.Close()
-		s.mu.Lock()
-		s.backendConn = nil
-		s.mu.Unlock()
+		s.loseBackend() // poisons the transaction if a recipient was already accepted
 		return
 	}
 	s.backendWriter.Flush()
@@ -1365,10 +1386,7 @@ func (s *Session) forwardRCPT(command string) {
 	if err != nil {
 		s.DebugLog("Failed to read RCPT TO response", "error", err)
 		s.sendResponse("451 4.4.2 Backend error")
-		s.backendConn.Close()
-		s.mu.Lock()
-		s.backendConn = nil
-		s.mu.Unlock()
+		s.loseBackend()
 		return
 	}
 	s.DebugLog("Backend RCPT TO response", "response", strings.TrimSpace(response))
@@ -1407,181 +1425,14 @@ func (s *Session) forwardRCPT(command string) {
 		return
 	}
 
-	// Backend accepted (2xx) - forward response to client
+	// Backend accepted (2xx) - forward response to client. From here on this
+	// transaction is the backend's: a lost backend can no longer be replaced.
+	s.acceptedRcpts++
 	s.clientWriter.WriteString(response)
 	s.clientWriter.Flush()
 
 	// Log routing decision at INFO level with sender, recipient, and routing method
 	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to)
-}
-
-// enterPipeMode enters the data piping mode for transfer of message content.
-func (s *Session) enterPipeMode() {
-	if s.backendConn == nil {
-		s.DebugLog("Backend connection not established, cannot enter pipe mode")
-		return
-	}
-
-	var wg sync.WaitGroup
-
-	s.DebugLog("Created waitgroup")
-
-	// Start activity updater
-	activityCtx, activityCancel := context.WithCancel(s.ctx)
-	defer activityCancel()
-	s.DebugLog("Starting activity updater")
-	go s.updateActivityPeriodically(activityCtx)
-
-	// Client to backend
-	wg.Add(1)
-	s.DebugLog("Starting client-to-backend copy goroutine")
-	go func() {
-		defer wg.Done()
-		// If this copy returns, it means the client has closed the connection or there was an error.
-		// We use half-close (CloseWrite) to signal EOF to the backend while allowing the backend
-		// to finish sending its response. This prevents "broken pipe" errors on QUIT.
-		// The backend-to-client goroutine will fully close the connection when it's done reading.
-		defer func() {
-			// Try to half-close the connection (shutdown writes, keep reads open)
-			// This works for both *net.TCPConn and *tls.Conn (Go 1.23+)
-			if closeWriter, ok := s.backendConn.(interface{ CloseWrite() error }); ok {
-				if err := closeWriter.CloseWrite(); err != nil {
-					s.DebugLog("Failed to half-close backend connection", "error", err)
-				}
-			} else {
-				// Fallback for connections that don't support half-close
-				s.backendConn.Close()
-			}
-		}()
-		s.proxyClientToBackend()
-		s.DebugLog("Client-to-backend copy goroutine exiting")
-	}()
-
-	// Backend to client
-	wg.Add(1)
-	s.DebugLog("Starting backend-to-client copy goroutine")
-	go func() {
-		defer wg.Done()
-		// If this copy returns, it means the backend has closed the connection or there was an error.
-		// We close the client connection to unblock the client-to-backend copy operation.
-		// The backend connection is NOT closed here — it is closed after wg.Wait() to avoid
-		// racing with the client-to-backend goroutine's CloseWrite (which would cause "broken pipe"
-		// on the storage backend). The full backendConn.Close() happens after both goroutines exit.
-		defer func() {
-			s.mu.Lock()
-			if !s.gracefulShutdown {
-				s.clientConn.Close()
-			}
-			s.mu.Unlock()
-		}()
-		var bytesOut int64
-		var err error
-		// Use the buffered reader from authentication phase to avoid losing buffered data
-		if s.backendReader != nil {
-			// Copy from buffered reader with deadline protection
-			bytesOut, err = s.copyBufferedReaderToConn(s.clientConn, s.backendReader)
-		} else {
-			// Fallback to direct copy if no buffered reader (shouldn't happen in normal flow)
-			bytesOut, err = server.CopyWithDeadline(s.ctx, s.clientConn, s.backendConn, "backend-to-client")
-		}
-		metrics.BytesThroughput.WithLabelValues("lmtp_proxy", "out").Add(float64(bytesOut))
-		if err != nil && !isClosingError(err) {
-			s.DebugLog("Error copying from backend to client", "error", err)
-		}
-		s.DebugLog("Backend-to-client copy goroutine exiting")
-	}()
-
-	// Context cancellation handler - ensures connections are closed when context is cancelled
-	// This unblocks the copy goroutines if they're stuck in blocked Read() calls
-	// NOTE: This is NOT part of the waitgroup to avoid circular dependency where:
-	//   - wg.Wait() waits for this goroutine
-	//   - this goroutine waits for ctx.Done()
-	//   - ctx.Done() fires when handleConnection() returns
-	//   - handleConnection() can't return because it's blocked in wg.Wait()
-	s.DebugLog("Starting context cancellation handler goroutine")
-	go func() {
-		s.DebugLog("Context cancellation handler waiting for ctx.Done()")
-		<-s.ctx.Done()
-		s.DebugLog("Context cancelled - closing connections")
-		s.clientConn.Close()
-		s.backendConn.Close()
-		s.DebugLog("Context cancellation handler goroutine exiting")
-	}()
-
-	s.DebugLog("Waiting for copy goroutines to finish")
-	wg.Wait()
-	// Full close of backend connection after both goroutines have exited.
-	// This ensures the client-to-backend goroutine's CloseWrite() has time to signal
-	// EOF to the backend before the connection is fully torn down, preventing
-	// "broken pipe" errors on the storage backend.
-	s.backendConn.Close()
-	s.DebugLog("Copy goroutines finished - enterPipeMode() returning")
-}
-
-// proxyClientToBackend handles copying data from the client to the backend,
-// applying an idle timeout between commands.
-func (s *Session) proxyClientToBackend() {
-	var totalBytesIn int64
-	defer func() {
-		// Record total bytes when the copy loop exits
-		metrics.BytesThroughput.WithLabelValues("lmtp_proxy", "in").Add(float64(totalBytesIn))
-	}()
-	// Best-effort: never exit with forwarded-but-unflushed bytes in the writer.
-	defer s.backendWriter.Flush()
-
-	for {
-		// Set a read deadline to prevent idle connections between commands.
-		// Only when the next ReadSlice will actually hit the connection:
-		// buffered data is served without blocking, and SetReadDeadline can
-		// fail once the connection is torn down, which must not discard data
-		// we already received from the client.
-		if s.server.authIdleTimeout > 0 && s.clientReader.Buffered() == 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
-				s.DebugLog("Failed to set read deadline", "error", err)
-				return
-			}
-		}
-
-		// ReadSlice (not ReadString) so an oversized line - e.g. a huge DATA
-		// line without CRLF - is forwarded in buffer-sized chunks instead of
-		// being accumulated in memory in its entirety.
-		line, err := s.clientReader.ReadSlice('\n')
-		if len(line) > 0 {
-			// Forward the chunk to the backend
-			n, werr := s.backendWriter.Write(line)
-			totalBytesIn += int64(n)
-			if werr != nil {
-				if !isClosingError(werr) {
-					s.DebugLog("Error writing to backend", "error", werr)
-				}
-				return
-			}
-			// Flush only once the client buffer is drained: this forwards
-			// promptly but avoids one syscall per message line during DATA.
-			if s.clientReader.Buffered() == 0 {
-				if ferr := s.backendWriter.Flush(); ferr != nil {
-					if !isClosingError(ferr) {
-						s.DebugLog("Error flushing to backend", "error", ferr)
-					}
-					return
-				}
-			}
-		}
-		if err != nil {
-			if err == bufio.ErrBufferFull {
-				// Long line: the chunk was already forwarded above; keep reading.
-				continue
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				s.DebugLog("Idle timeout - closing connection")
-				return
-			}
-			if !isClosingError(err) {
-				s.DebugLog("Error reading from client", "error", err)
-			}
-			return
-		}
-	}
 }
 
 // close closes all connections.
@@ -1706,80 +1557,6 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 	}
 }
 
-// copyBufferedReaderToConn copies data from a buffered reader to a connection with write deadline protection.
-// This is used for backend-to-client copying when the backend connection has a buffered reader
-// from the authentication phase. We must read from the buffered reader to avoid losing any data
-// that was buffered but not yet read.
-func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int64, error) {
-	const writeDeadline = 30 * time.Second
-	const readDeadline = 5 * time.Minute // Detect stale backend connections during data transfer
-	var totalBytes int64
-	buf := make([]byte, 32*1024)
-	nextDeadline := time.Now()
-
-	// Get the underlying connection to set read deadline
-	// The buffered reader wraps s.backendConn, but we need to access the conn itself
-	var srcConn net.Conn
-	if s.backendConn != nil {
-		srcConn = s.backendConn
-	}
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return totalBytes, s.ctx.Err()
-		default:
-		}
-
-		// Set read deadline on backend connection to detect stale connections
-		// This prevents goroutines from hanging indefinitely when backend stops responding
-		// 5 minutes is generous for LMTP data transfer while still detecting hung connections
-		if srcConn != nil {
-			if err := srcConn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
-				s.DebugLog("Failed to set read deadline on backend", "error", err)
-				// Continue anyway - this is not fatal
-			}
-		}
-
-		nr, err := src.Read(buf)
-		if nr > 0 {
-			// Only update write deadline once per second to reduce syscall frequency
-			now := time.Now()
-			if now.After(nextDeadline) {
-				if err := dst.SetWriteDeadline(now.Add(writeDeadline)); err != nil {
-					return totalBytes, fmt.Errorf("failed to set write deadline: %w", err)
-				}
-				nextDeadline = now.Add(time.Second)
-			}
-
-			nw, ew := dst.Write(buf[0:nr])
-			if nw > 0 {
-				totalBytes += int64(nw)
-			}
-			if ew != nil {
-				if netErr, ok := ew.(net.Error); ok && netErr.Timeout() {
-					return totalBytes, fmt.Errorf("write timeout in backend-to-client: %w", ew)
-				}
-				return totalBytes, ew
-			}
-			if nr != nw {
-				return totalBytes, io.ErrShortWrite
-			}
-		}
-		if err != nil {
-			// Check if this is a read timeout error (stale backend connection)
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				s.InfoLog("Backend read timeout during data transfer - connection appears stale", "duration", readDeadline)
-				return totalBytes, fmt.Errorf("backend read timeout after %v: %w", readDeadline, err)
-			}
-			if err != io.EOF {
-				return totalBytes, err
-			}
-			return totalBytes, nil
-		}
-	}
-}
-
 func isClosingError(err error) bool {
 	return server.IsConnectionError(err)
 }
@@ -1803,4 +1580,220 @@ func findParameter(args []string, prefix string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// --- Transaction state (the backend's view of a transaction must stay the MTA's view) ---
+
+// resetTransaction forgets the current mail transaction: on MAIL (a new one), RSET, and
+// after the end-of-data replies were relayed.
+func (s *Session) resetTransaction() {
+	s.sender = ""
+	s.to = ""
+	s.mailFromReceived = false
+	s.acceptedRcpts = 0
+	s.txPoisoned = false
+}
+
+// loseBackend drops the backend connection. If the backend had already accepted a
+// recipient of the current transaction, the transaction is poisoned: the MTA believes
+// those recipients are accepted, so every further RCPT and DATA must answer 451 (retry
+// the whole message) — never 503, which makes the MTA bounce the accepted recipients,
+// and never a silent reconnect, after which a fresh backend would only know the later
+// recipients and its single end-of-data reply would be attributed to the wrong one.
+func (s *Session) loseBackend() {
+	s.mu.Lock()
+	if s.backendConn != nil {
+		s.backendConn.Close()
+		s.backendConn = nil
+	}
+	s.mu.Unlock()
+	if s.acceptedRcpts > 0 {
+		s.txPoisoned = true
+	}
+}
+
+// forwardSimpleCommand sends one command line to the backend and returns its (single
+// or multi-line) reply verbatim, CRLF included. ok is false when the backend connection
+// failed, in which case it has been dropped (loseBackend) and nothing was relayed.
+func (s *Session) forwardSimpleCommand(command string) (reply string, ok bool) {
+	if s.backendConn == nil {
+		return "", false
+	}
+	if _, err := s.backendWriter.WriteString(command + "\r\n"); err != nil {
+		s.DebugLog("failed to send command to backend", "command", command, "error", err)
+		s.loseBackend()
+		return "", false
+	}
+	if err := s.backendWriter.Flush(); err != nil {
+		s.DebugLog("failed to flush command to backend", "command", command, "error", err)
+		s.loseBackend()
+		return "", false
+	}
+	var b strings.Builder
+	for lines := 0; lines < maxLHLOResponseLines; lines++ {
+		line, err := s.readBackendLine()
+		if err != nil {
+			s.DebugLog("failed to read backend reply", "command", command, "error", err)
+			s.loseBackend()
+			return "", false
+		}
+		b.WriteString(line)
+		if len(line) < 4 || line[3] != '-' {
+			return b.String(), true
+		}
+	}
+	s.DebugLog("backend reply exceeded the line limit", "command", command)
+	s.loseBackend()
+	return "", false
+}
+
+// userNotFoundError is the error for a recipient known not to exist, whether the
+// knowledge is fresh or cached. It re-runs the decision the fresh lookup makes, so a
+// negative-cache hit can neither turn a configured tempfail into a bounce nor bypass the
+// all-backends-down guard (a proxy that cannot verify anything must not bounce).
+func (s *Session) userNotFoundError() error {
+	if !s.server.connManager.HasHealthyPoolBackends() {
+		return server.ErrUserNotFoundTempFail
+	}
+	if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.GetUserNotFoundResponse() == "tempfail" {
+		return server.ErrUserNotFoundTempFail
+	}
+	return server.ErrUserNotFound
+}
+
+// Deadlines for the inline message relay.
+const (
+	// relayBackendWriteDeadline bounds each write of body data to the backend, so a
+	// backend that stops draining its socket cannot hold the session goroutine and its
+	// connection slot until the absolute session timeout.
+	relayBackendWriteDeadline = 30 * time.Second
+	// relayEndOfDataTimeout bounds the wait for the backend's end-of-data replies. It
+	// must outlive the backend's own DATA processing cap (60 s) by a wide margin: a
+	// proxy that gives up first leaves the backend free to commit a message the MTA is
+	// told nothing about, which the MTA then re-sends.
+	relayEndOfDataTimeout = 5 * time.Minute
+)
+
+// relayMessageData relays one DATA body from the client to the backend, then the
+// backend's end-of-data replies — one final reply line per accepted recipient (RFC 2033
+// §4.2) — back to the client, and reports whether the session may continue with the
+// next command. It runs inline in the session goroutine and stops exactly at the
+// end-of-data marker, so anything the client pipelined after it (the next MAIL FROM)
+// stays in clientReader for the command loop: the connection is never a raw pipe, and
+// every later transaction on it is routed like the first.
+//
+// false means the session must end. The proxy never synthesizes an end-of-data reply:
+// when the backend closes or times out first, whatever it sent is relayed and the client
+// connection is dropped, so the MTA defers and retries (the backend deduplicates a
+// message it did commit).
+func (s *Session) relayMessageData() bool {
+	var bytesIn, bytesOut int64
+	defer func() {
+		metrics.BytesThroughput.WithLabelValues("lmtp_proxy", "in").Add(float64(bytesIn))
+		metrics.BytesThroughput.WithLabelValues("lmtp_proxy", "out").Add(float64(bytesOut))
+	}()
+
+	// The end-of-data marker is what the backend's DATA reader (go-smtp) recognizes as
+	// one: a line that is exactly ".\r\n", read at the start of a line whose predecessor
+	// ended in "\r\n". A chunk of an over-long line is never at the start of a line, and
+	// a bare-LF predecessor leaves the backend inside the body — mirror both, or the
+	// proxy and the backend would disagree about where the message ends.
+	atLineStart, prevCRLF := true, true
+	crlf := []byte("\r\n")
+	for {
+		// Idle deadline only when the next read will hit the wire.
+		if s.server.authIdleTimeout > 0 && s.clientReader.Buffered() == 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
+				s.DebugLog("failed to set read deadline during DATA", "error", err)
+				s.loseBackend()
+				return false
+			}
+		}
+		// ReadSlice (not ReadString) so an oversized line is forwarded in buffer-sized
+		// chunks instead of being accumulated in memory in its entirety.
+		line, err := s.clientReader.ReadSlice('\n')
+		full := err == nil
+		if len(line) > 0 {
+			end := full && atLineStart && prevCRLF && len(line) == 3 && line[0] == '.' && line[1] == '\r' && line[2] == '\n'
+			if derr := s.backendConn.SetWriteDeadline(time.Now().Add(relayBackendWriteDeadline)); derr != nil {
+				s.DebugLog("failed to set backend write deadline", "error", derr)
+				s.loseBackend()
+				return false
+			}
+			n, werr := s.backendWriter.Write(line)
+			bytesIn += int64(n)
+			if werr == nil && (end || s.clientReader.Buffered() == 0) {
+				// Flush once the client buffer is drained (or at the end): prompt, but not
+				// one syscall per body line.
+				werr = s.backendWriter.Flush()
+			}
+			if werr != nil {
+				if !isClosingError(werr) {
+					s.InfoLog("backend connection failed during DATA", "error", werr)
+				}
+				s.loseBackend()
+				return false
+			}
+			if end {
+				break
+			}
+			atLineStart = full
+			prevCRLF = full && bytes.HasSuffix(line, crlf)
+		}
+		if err != nil {
+			if err == bufio.ErrBufferFull {
+				continue // long line: the chunk was forwarded; keep reading
+			}
+			// The client is gone (or idle) before the end of the message. Drop the
+			// backend connection outright rather than half-closing it: its DATA reader
+			// must see the connection fail, not a truncated body it could commit.
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				s.DebugLog("idle timeout during DATA")
+			} else if !isClosingError(err) {
+				s.DebugLog("error reading from client during DATA", "error", err)
+			}
+			s.loseBackend()
+			return false
+		}
+	}
+	if err := s.backendConn.SetWriteDeadline(time.Time{}); err != nil {
+		s.DebugLog("failed to clear backend write deadline", "error", err)
+	}
+
+	// End-of-data replies: the backend sends one final reply line per recipient it
+	// accepted (that is what acceptedRcpts counts). Relay each line as it arrives,
+	// continuation lines included; count only final lines.
+	want := s.acceptedRcpts
+	if err := s.backendConn.SetReadDeadline(time.Now().Add(relayEndOfDataTimeout)); err != nil {
+		s.DebugLog("failed to set backend read deadline for end-of-data replies", "error", err)
+		s.loseBackend()
+		return false
+	}
+	defer func() {
+		if s.backendConn != nil {
+			_ = s.backendConn.SetReadDeadline(time.Time{})
+		}
+	}()
+	for got := 0; got < want; {
+		reply, err := server.ReadBoundedLine(s.backendReader, backendResponseLineMax)
+		if len(reply) > 0 {
+			n, _ := s.clientWriter.WriteString(reply)
+			bytesOut += int64(n)
+			if ferr := s.clientWriter.Flush(); ferr != nil {
+				s.DebugLog("client gone while relaying end-of-data replies", "error", ferr)
+				s.loseBackend()
+				return false
+			}
+		}
+		if err != nil {
+			s.InfoLog("backend closed or timed out before all end-of-data replies were relayed",
+				"expected", want, "relayed", got, "error", err)
+			s.loseBackend()
+			return false
+		}
+		if len(reply) >= 4 && reply[3] != '-' {
+			got++
+		}
+	}
+	return true
 }

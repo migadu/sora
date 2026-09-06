@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,9 +17,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cache"
-	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
-	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
@@ -45,7 +44,10 @@ type UploaderDB interface {
 	// account's message rows for this content hash may be marked uploaded.
 	PendingUploadKeys(ctx context.Context, contentHash string, accountID int64) ([]string, error)
 	ExecuteWithS3ObjectSessionLock(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error
-	CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64) error
+	// CompleteS3UploadWithRetry finalizes the rows whose key is in writtenKeys (or
+	// already has a live uploaded sibling) and drops the pending row once nothing is
+	// left to write. writtenKeys are full S3 keys (domain/localpart/hash).
+	CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64, writtenKeys []string) error
 	// ExistingPendingUploads returns the subset of contentHashes that still have a
 	// pending_uploads row for the account. The cleanup scan asks per batch rather than
 	// per file: the staging tree is largest during an S3 outage or a stranded backlog,
@@ -131,29 +133,7 @@ func (d resilientUploaderDB) ExistingPendingUploads(ctx context.Context, account
 // one transaction: a lagging replica could answer "no keys", which the caller reads as
 // "nothing left to write" and would finalize an upload that never happened.
 func (d resilientUploaderDB) PendingUploadKeys(ctx context.Context, contentHash string, accountID int64) ([]string, error) {
-	rows, err := d.QueryWithRetry(context.WithValue(ctx, consts.UseMasterDBKey, true), `
-		SELECT s3_domain, s3_localpart FROM messages
-		WHERE content_hash = $1 AND account_id = $2
-		GROUP BY s3_domain, s3_localpart
-		HAVING bool_or(NOT uploaded) AND NOT bool_or(uploaded AND expunged_at IS NULL)
-	`, contentHash, accountID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve storage keys for hash %s of account %d: %w", contentHash, accountID, err)
-	}
-	defer rows.Close()
-
-	var keys []string
-	for rows.Next() {
-		var domain, localpart string
-		if err := rows.Scan(&domain, &localpart); err != nil {
-			return nil, fmt.Errorf("failed to scan storage key parts: %w", err)
-		}
-		keys = append(keys, helpers.NewS3Key(domain, localpart, contentHash))
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to resolve storage keys for hash %s of account %d: %w", contentHash, accountID, err)
-	}
-	return keys, nil
+	return d.PendingUploadKeysWithRetry(ctx, contentHash, accountID)
 }
 
 // UploaderS3 defines the S3 storage operations needed by the uploader worker.
@@ -230,6 +210,10 @@ const (
 // stay idle after a provider or database outage ends: at most this long after the first
 // PUT would have succeeded again, the next cycle runs and drains the backlog.
 const uploadBackoffMax = 10 * time.Minute
+
+// uploadBackoffJitter is the most that is added on top of a backoff delay so that
+// nodes backing off together do not retry in lockstep.
+const uploadBackoffJitter = 4 * time.Second
 
 // syncBool is a goroutine-safe boolean flag backed by a sync.Mutex.
 // We avoid sync/atomic.Bool to prevent a formatter-induced import cycle:
@@ -488,6 +472,7 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 	for {
 		uploads, err := w.rdb.AcquireAndLeasePendingUploadsWithRetry(ctx, w.instanceID, w.batchSize, w.retryInterval, w.maxAttempts)
 		if err != nil {
+			wg.Wait()
 			return fmt.Errorf("failed to list pending uploads: %w", err)
 		}
 
@@ -499,6 +484,11 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 			break
 		}
 
+		// Uploads of this lease, waited on only while the pass is still probing (see
+		// below); in-flight work is otherwise bounded by the semaphore alone, so the
+		// next lease is taken while this one is still uploading and one slow body no
+		// longer holds up everything leased with it.
+		var batch sync.WaitGroup
 		for _, upload := range uploads {
 			// Check if this upload has exceeded max attempts before processing
 			if upload.Attempts >= w.maxAttempts {
@@ -513,8 +503,10 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 				return nil
 			case sem <- struct{}{}:
 				wg.Add(1)
+				batch.Add(1)
 				go func(upload db.PendingUpload) {
 					defer wg.Done()
+					defer batch.Done()
 					defer func() { <-sem }()
 					switch w.processSingleUpload(ctx, upload) {
 					case uploadDone:
@@ -525,18 +517,24 @@ func (w *UploadWorker) processPendingUploads(ctx context.Context) error {
 				}(upload)
 			}
 		}
-		wg.Wait()
 
-		// The provider or the database turned uploads away and none went through:
-		// the rest of the queue will not fare better right now. Stop the pass here so
+		// Until something has gone through, each lease is a probe: wait for it, and if
+		// the provider or the database turned every upload away, stop the pass here so
 		// one broken cycle costs one batch of requests, not the whole backlog, and let
 		// the backoff decide when to look again. Rows with lost bodies do not count:
 		// they say nothing about storage, and the fresh rows queued behind them must
-		// still be reached in this pass.
-		if retryLater.Load() > 0 && done.Load() == 0 {
-			break
+		// still be reached in this pass. Once uploads are landing, lease ahead: the
+		// semaphore keeps `concurrency` bodies in flight regardless of batch boundaries.
+		if done.Load() == 0 {
+			batch.Wait()
+			if retryLater.Load() > 0 && done.Load() == 0 {
+				break
+			}
 		}
+		// Lease again until the queue answers empty: rows leased in this pass are
+		// excluded by their fresh last_attempt, so each lease is new work.
 	}
+	wg.Wait()
 	w.noteCycleOutcome(done.Load(), retryLater.Load())
 	return nil
 }
@@ -581,7 +579,9 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		logger.Info("Uploader: Content hash already uploaded - skipping S3 upload", "hash", upload.ContentHash, "account_id", upload.AccountID)
 		// Every key these rows point at already holds the content, so finalizing only
 		// clears the leftover pending_uploads record.
-		err := w.rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID)
+		// Nothing was written here: every remaining unuploaded row has a live sibling
+		// under its own key, and finalize marks them from that.
+		err := w.rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID, nil)
 		if err != nil {
 			logger.Warn("Uploader: Failed to finalize S3 upload - keeping local file for retry", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 			return uploadRetryLater
@@ -663,7 +663,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 					logger.Info("Uploader: Using background context for self-heal DB finalization during shutdown", "hash", upload.ContentHash)
 				}
 
-				return w.rdb.CompleteS3UploadWithRetry(dbCtx, upload.ContentHash, upload.AccountID)
+				return w.rdb.CompleteS3UploadWithRetry(dbCtx, upload.ContentHash, upload.AccountID, keys)
 			})
 
 			if err != nil {
@@ -757,7 +757,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 			logger.Info("Uploader: Using background context for DB finalization during shutdown", "hash", upload.ContentHash)
 		}
 
-		return w.rdb.CompleteS3UploadWithRetry(dbCtx, upload.ContentHash, upload.AccountID)
+		return w.rdb.CompleteS3UploadWithRetry(dbCtx, upload.ContentHash, upload.AccountID, keys)
 	})
 
 	if err != nil {
@@ -892,6 +892,10 @@ func (w *UploadWorker) noteCycleOutcome(succeeded, failed int64) {
 	if delay > uploadBackoffMax {
 		delay = uploadBackoffMax
 	}
+	// A few seconds of jitter: nodes that hit the same outage together must not all
+	// wake and hammer the provider in the same second when it comes back. Kept small
+	// so the doubling schedule stays what the operator configured.
+	delay += time.Duration(rand.Int64N(int64(uploadBackoffJitter)))
 	w.backoffUntil = time.Now().Add(delay)
 	logger.Warn("Uploader: storage turned away every upload in this cycle; backing off",
 		"failed", failed, "consecutive_failed_cycles", w.backoffFailures, "retry_in", delay)
@@ -923,23 +927,34 @@ func (w *UploadWorker) StoreLocally(contentHash string, accountID int64, data []
 	// than adding to the spool.
 	previousSize := fileSize(path)
 
-	// Write file with fsync to ensure durability before the DB transaction commits.
-	// Without fsync, a crash could leave the DB referencing a file that never made it to disk.
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	// Write to a temporary name, fsync, then rename into place. The final path is
+	// only ever a complete, durable file: a crash mid-write leaves a stray .tmp that
+	// nobody reads (and the orphan sweep removes), never a truncated body that a later
+	// delivery of the same bytes would adopt ("file exists, skip write") and a reader
+	// would serve. The rename also keeps a concurrent reader or uploader on the old
+	// inode, so a rewrite never changes bytes under an open descriptor.
+	tmpPath := path + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create file %s: %w", path, err)
+		return nil, fmt.Errorf("failed to create file %s: %w", tmpPath, err)
 	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
-		os.Remove(path) // Clean up partial write
-		return nil, fmt.Errorf("failed to write file %s: %w", path, err)
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("failed to write file %s: %w", tmpPath, err)
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("failed to fsync file %s: %w", path, err)
+		os.Remove(tmpPath) // an unsynced file must not be left where "exists" means "staged"
+		return nil, fmt.Errorf("failed to fsync file %s: %w", tmpPath, err)
 	}
 	if err := f.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close file %s: %w", path, err)
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("failed to close file %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("failed to move %s into place: %w", tmpPath, err)
 	}
 
 	// Fsync the parent directory to ensure the directory entry is durable.

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,11 +52,17 @@ type Exporter struct {
 	exportedMessages int64
 	skippedMessages  int64
 	failedMessages   int64
+	failedMailboxes  int64
 	startTime        time.Time
 	mu               sync.Mutex
 
 	// UID mappings per mailbox for dovecot-uidlist generation
 	uidMappings map[string][]UIDFileMapping // mailbox name -> UID mappings
+
+	// keywordIndex is each mailbox's custom-keyword numbering (keyword -> 0..25), the
+	// content of the dovecot-keywords file written for that folder; filenames carry the
+	// matching a-z letters (prepareKeywords / buildMaildirFlags).
+	keywordIndex map[string]map[string]int
 }
 
 // NewExporter creates a new Exporter instance.
@@ -148,17 +155,18 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	}
 
 	exporter := &Exporter{
-		ctx:         ctx,
-		maildirPath: maildirPath,
-		email:       email,
-		jobs:        jobs,
-		db:          db,
-		dbPath:      dbPath,
-		rdb:         rdb,
-		s3:          s3,
-		options:     options,
-		startTime:   time.Now(),
-		uidMappings: make(map[string][]UIDFileMapping),
+		ctx:          ctx,
+		maildirPath:  maildirPath,
+		email:        email,
+		jobs:         jobs,
+		db:           db,
+		dbPath:       dbPath,
+		rdb:          rdb,
+		s3:           s3,
+		options:      options,
+		startTime:    time.Now(),
+		uidMappings:  make(map[string][]UIDFileMapping),
+		keywordIndex: make(map[string]map[string]int),
 	}
 
 	return exporter, nil
@@ -220,8 +228,9 @@ func (exporter *Exporter) Run() error {
 	for _, mbox := range mailboxes {
 		logger.Info("Exporting mailbox", "name", mbox.Name)
 		if err := exporter.exportMailbox(exporter.ctx, mbox); err != nil {
-			logger.Info("Failed to export mailbox", "name", mbox.Name, "error", err)
-			// Continue with other mailboxes
+			logger.Warn("Failed to export mailbox", "name", mbox.Name, "error", err)
+			atomic.AddInt64(&exporter.failedMailboxes, 1)
+			// Continue with other mailboxes; the run still ends with an error.
 		}
 	}
 
@@ -239,7 +248,17 @@ func (exporter *Exporter) Run() error {
 		}
 	}
 
-	return exporter.printSummary()
+	if err := exporter.printSummary(); err != nil {
+		return err
+	}
+	// An export that lost anything must not exit 0: an operator scripting a migration
+	// reads the exit code, not the log.
+	failedMsgs := atomic.LoadInt64(&exporter.failedMessages)
+	failedMboxes := atomic.LoadInt64(&exporter.failedMailboxes)
+	if failedMsgs > 0 || failedMboxes > 0 {
+		return fmt.Errorf("export incomplete: %d message(s) and %d mailbox(es) failed", failedMsgs, failedMboxes)
+	}
+	return nil
 }
 
 // performDryRun analyzes what would be exported without making changes
@@ -327,7 +346,7 @@ func (exporter *Exporter) performDryRun(ctx context.Context, AccountID int64, ma
 			fmt.Printf("      Date: %s | Size: %s | Flags: %s\n",
 				msg.InternalDate.Format("2006-01-02 15:04"),
 				formatSize(msg.Size),
-				exporter.buildMaildirFlags(&msg))
+				exporter.buildMaildirFlags(&msg, mbox.Name))
 			fmt.Printf("      Action: %s: %s\n", action, reason)
 
 			// Show first few custom flags if any
@@ -465,12 +484,11 @@ func (exporter *Exporter) exportMailbox(ctx context.Context, mailbox *db.DBMailb
 		return fmt.Errorf("failed to get mailbox summary: %w", err)
 	}
 
-	if summary.NumMessages == 0 {
-		logger.Info("No messages in mailbox", "name", mailbox.Name)
-		return nil
-	}
-
-	logger.Info("Found messages in mailbox", "count", summary.NumMessages, "name", mailbox.Name)
+	// The summary's count is the cached mailbox_stats.message_count, which is known to
+	// drift. It is only an estimate for progress reporting here: the messages are
+	// listed live below, so a mailbox whose cached count is wrong (0 included) is
+	// still exported in full.
+	logger.Info("Exporting mailbox", "estimated_count", summary.NumMessages, "name", mailbox.Name)
 	atomic.AddInt64(&exporter.totalMessages, int64(summary.NumMessages))
 
 	// Get all messages in the mailbox using a full sequence set
@@ -479,6 +497,14 @@ func (exporter *Exporter) exportMailbox(ctx context.Context, mailbox *db.DBMailb
 	messages, err := exporter.rdb.GetMessagesByNumSetWithRetry(ctx, mailbox.ID, seqSet)
 	if err != nil {
 		return fmt.Errorf("failed to get messages: %w", err)
+	}
+
+	// Custom keywords travel in the filenames as a-z letters that index this folder's
+	// dovecot-keywords file, so the numbering must exist before any filename is built.
+	if exporter.options.Dovecot {
+		if err := exporter.prepareKeywords(mailbox.Name, messages); err != nil {
+			return fmt.Errorf("failed to write dovecot-keywords: %w", err)
+		}
 	}
 
 	// Process messages in parallel
@@ -605,7 +631,7 @@ func (exporter *Exporter) exportMessage(msg *db.Message, mailboxName string) err
 		}
 	} else {
 		// Generate new filename
-		filename = exporter.generateMaildirFilename(msg)
+		filename = exporter.generateMaildirFilename(msg, mailboxName)
 	}
 
 	// Determine target directory (containment-checked against the export root)
@@ -625,8 +651,10 @@ func (exporter *Exporter) exportMessage(msg *db.Message, mailboxName string) err
 		}
 	}
 
-	// Write message to file
-	if err := os.WriteFile(targetPath, content, 0644); err != nil {
+	// Write the message the maildir way: into tmp/, fsync, then rename into place. A
+	// crash or a full disk must never leave a truncated file where a maildir reader
+	// (Dovecot, or a re-import) would take it for the message.
+	if err := writeMaildirFile(targetPath, content); err != nil {
 		return fmt.Errorf("failed to write message file: %w", err)
 	}
 
@@ -667,7 +695,7 @@ func (exporter *Exporter) exportMessage(msg *db.Message, mailboxName string) err
 }
 
 // generateMaildirFilename generates a maildir-compatible filename for a message
-func (exporter *Exporter) generateMaildirFilename(msg *db.Message) string {
+func (exporter *Exporter) generateMaildirFilename(msg *db.Message, mailboxName string) string {
 	// Basic maildir filename format: timestamp.unique_id.hostname:2,flags
 	timestamp := msg.InternalDate.Unix()
 	uniqueID := fmt.Sprintf("M%dP%d", timestamp, msg.UID)
@@ -677,13 +705,16 @@ func (exporter *Exporter) generateMaildirFilename(msg *db.Message) string {
 	}
 
 	// Build flags string
-	flagStr := exporter.buildMaildirFlags(msg)
+	flagStr := exporter.buildMaildirFlags(msg, mailboxName)
 
 	return fmt.Sprintf("%d.%s.%s:2,%s", timestamp, uniqueID, hostname, flagStr)
 }
 
-// buildMaildirFlags converts IMAP flags to maildir flag characters
-func (exporter *Exporter) buildMaildirFlags(msg *db.Message) string {
+// buildMaildirFlags converts IMAP flags to maildir info characters: the system flags
+// (D=Draft F=Flagged R=Answered S=Seen T=Trashed/\Deleted, as the importer reads them)
+// plus one a-z letter per custom keyword, indexing the mailbox's dovecot-keywords
+// numbering (prepareKeywords).
+func (exporter *Exporter) buildMaildirFlags(msg *db.Message, mailboxName string) string {
 	var flags []byte
 
 	// Convert system flags from bitwise representation
@@ -701,6 +732,17 @@ func (exporter *Exporter) buildMaildirFlags(msg *db.Message) string {
 		case imap.FlagDeleted:
 			flags = append(flags, 'T')
 			// Note: \Recent flag is not stored in maildir filenames
+		}
+	}
+
+	// Custom keywords: only those the folder's numbering knows (beyond 26 they were
+	// dropped with a warning in prepareKeywords).
+	exporter.mu.Lock()
+	index := exporter.keywordIndex[mailboxName]
+	exporter.mu.Unlock()
+	for _, keyword := range msg.CustomFlags {
+		if idx, ok := index[keyword]; ok {
+			flags = append(flags, byte('a'+idx))
 		}
 	}
 
@@ -846,15 +888,23 @@ func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) err
 			logger.Info("Warning: No UIDVALIDITY found - using generated value", "mailbox", mailboxName, "uidvalidity", uidValidity)
 		}
 
-		// Create DovecotUIDList from mappings
-		uidList := CreateDovecotUIDListFromMessages(uidValidity, mappings)
-
 		// Determine maildir path for this mailbox (containment-checked)
 		maildirPath, err := exporter.mailboxDir(mailboxName)
 		if err != nil {
 			logger.Info("Warning: Skipping dovecot-uidlist for unsafe mailbox name", "mailbox", mailboxName, "error", err)
 			continue
 		}
+
+		// This run only recorded the messages it wrote. An earlier export of the same
+		// maildir left a dovecot-uidlist naming everything it wrote then, and those files
+		// are still here (they were skipped as already exported, not re-recorded).
+		// Rewriting the file with only this run's delta would make Dovecot reassign
+		// UIDs to every other message, so merge: keep the existing entries whose file
+		// still exists, and let this run's entries win for the UIDs it wrote.
+		mappings = mergeUIDMappings(maildirPath, mappings)
+
+		// Create DovecotUIDList from mappings
+		uidList := CreateDovecotUIDListFromMessages(uidValidity, mappings)
 
 		// Write dovecot-uidlist file
 		if err := WriteDovecotUIDList(maildirPath, uidList); err != nil {
@@ -866,4 +916,169 @@ func (exporter *Exporter) generateDovecotUIDLists(mailboxes []*db.DBMailbox) err
 	}
 
 	return nil
+}
+
+// writeMaildirFile stores content at targetPath (a file under a maildir's cur/ or new/)
+// the way maildir requires: written to the maildir's tmp/ directory, fsync'd, then
+// renamed into place, with the containing directory fsync'd afterwards. A reader of the
+// maildir (Dovecot, or a re-import) therefore never sees a partially written message,
+// and a crash or a full disk leaves at most a stray file in tmp/, which maildir readers
+// ignore.
+func writeMaildirFile(targetPath string, content []byte) error {
+	targetDir := filepath.Dir(targetPath)
+	tmpDir := filepath.Join(filepath.Dir(targetDir), "tmp")
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		return fmt.Errorf("failed to create maildir tmp directory: %w", err)
+	}
+	tmpPath := filepath.Join(tmpDir, filepath.Base(targetPath))
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(content); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to fsync message file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	// Make the rename durable: fsync the directory that now holds the entry.
+	if dir, err := os.Open(targetDir); err == nil {
+		_ = dir.Sync()
+		dir.Close()
+	}
+	return nil
+}
+
+// maxMaildirKeywords is how many custom keywords a maildir folder can name: the info
+// part of a filename has the 26 letters a-z for them (Dovecot's own limit).
+const maxMaildirKeywords = 26
+
+// prepareKeywords numbers the custom keywords used in a mailbox and writes the
+// folder's dovecot-keywords file ("<index> <keyword>" per line), so the a-z letters
+// buildMaildirFlags puts into filenames mean the same thing to Dovecot and to a
+// re-import. Keywords are numbered in sorted order, deterministically, so repeated
+// exports of the same mailbox produce the same file. An existing file's numbering is
+// kept for the keywords it already names, so an incremental export does not renumber
+// files written by an earlier run.
+func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Message) error {
+	seen := make(map[string]struct{})
+	for i := range messages {
+		for _, kw := range messages[i].CustomFlags {
+			seen[kw] = struct{}{}
+		}
+	}
+
+	dir, err := exporter.mailboxDir(mailboxName)
+	if err != nil {
+		return err
+	}
+	keywordsPath := filepath.Join(dir, "dovecot-keywords")
+
+	index := make(map[string]int)
+	used := make(map[int]bool)
+	if existing, err := parseKeywordsFile(keywordsPath); err == nil {
+		for idx, kw := range existing {
+			if idx >= 0 && idx < maxMaildirKeywords {
+				index[kw] = idx
+				used[idx] = true
+			}
+		}
+	}
+
+	names := make([]string, 0, len(seen))
+	for kw := range seen {
+		if _, known := index[kw]; !known {
+			names = append(names, kw)
+		}
+	}
+	sort.Strings(names)
+	next := 0
+	for _, kw := range names {
+		for next < maxMaildirKeywords && used[next] {
+			next++
+		}
+		if next >= maxMaildirKeywords {
+			logger.Warn("Mailbox has more custom keywords than maildir can name; the rest are not exported",
+				"mailbox", mailboxName, "limit", maxMaildirKeywords, "dropped", kw)
+			continue
+		}
+		index[kw] = next
+		used[next] = true
+		next++
+	}
+
+	exporter.mu.Lock()
+	exporter.keywordIndex[mailboxName] = index
+	exporter.mu.Unlock()
+
+	if len(index) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	byIndex := make([]string, maxMaildirKeywords)
+	for kw, idx := range index {
+		byIndex[idx] = kw
+	}
+	var b strings.Builder
+	for idx, kw := range byIndex {
+		if kw != "" {
+			fmt.Fprintf(&b, "%d %s\n", idx, kw)
+		}
+	}
+	return os.WriteFile(keywordsPath, []byte(b.String()), 0644)
+}
+
+// mergeUIDMappings merges this run's UID → filename mappings with the dovecot-uidlist
+// already present in maildirPath (if any). Entries from the existing file are kept when
+// their file still exists in cur/ or new/ (matched on the base filename, ignoring the
+// ":2,flags" info part) and no entry of this run uses the same UID or filename.
+func mergeUIDMappings(maildirPath string, current []UIDFileMapping) []UIDFileMapping {
+	existing, err := ParseDovecotUIDList(maildirPath)
+	if err != nil || existing == nil || len(existing.UIDMappings) == 0 {
+		return current
+	}
+	usedUID := make(map[uint32]bool, len(current))
+	usedFile := make(map[string]bool, len(current))
+	for _, m := range current {
+		usedUID[m.UID] = true
+		usedFile[m.Filename] = true
+	}
+	present := make(map[string]bool)
+	for _, sub := range []string{"cur", "new"} {
+		entries, err := os.ReadDir(filepath.Join(maildirPath, sub))
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if i := strings.LastIndex(name, ":"); i > 0 {
+				name = name[:i]
+			}
+			present[name] = true
+		}
+	}
+	merged := make([]UIDFileMapping, 0, len(current)+len(existing.UIDMappings))
+	for filename, uid := range existing.UIDMappings {
+		if usedUID[uid] || usedFile[filename] || !present[filename] {
+			continue
+		}
+		merged = append(merged, UIDFileMapping{UID: uid, Filename: filename})
+	}
+	merged = append(merged, current...)
+	sort.Slice(merged, func(a, b int) bool { return merged[a].UID < merged[b].UID })
+	return merged
 }

@@ -65,7 +65,10 @@ type DatabaseManager interface {
 	PruneOldMessageVectorsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUnusedFTSHashesWithRetry(ctx context.Context, limit int) ([]string, error)
 	DeleteMessagesFTSByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error)
-	GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, limit int) ([]int64, error)
+	// GetDanglingAccountsForFinalDeletionWithRetry lists soft-deleted accounts with no
+	// message rows left whose deletion is older than gracePeriod — the same grace the
+	// hard-delete phase honours, so an empty account can still be restored in time.
+	GetDanglingAccountsForFinalDeletionWithRetry(ctx context.Context, limit int, gracePeriod time.Duration) ([]int64, error)
 	FinalizeAccountDeletionsWithRetry(ctx context.Context, accountIDs []int64) (int64, error)
 	ReconcileNegativeMailboxStatsWithRetry(ctx context.Context) (int64, error)
 }
@@ -544,7 +547,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// --- Phase 3: Final account deletion ---
 	// After all associated data (S3 objects, messages, etc.) has been cleaned up,
 	// we can now safely delete the 'accounts' row itself.
-	danglingAccounts, err := w.rdb.GetDanglingAccountsForFinalDeletionWithRetry(ctx, db.BATCH_PURGE_SIZE)
+	danglingAccounts, err := w.rdb.GetDanglingAccountsForFinalDeletionWithRetry(ctx, db.BATCH_PURGE_SIZE, w.gracePeriod)
 	if err != nil {
 		logger.Error("Cleanup: Failed to list dangling accounts for final deletion", "error", err)
 		return fmt.Errorf("failed to list dangling accounts for final deletion: %w", err)

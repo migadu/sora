@@ -110,7 +110,7 @@ func TestProcessSingleUpload_WritesEveryRecordedKey(t *testing.T) {
 	}
 
 	var completed bool
-	rdb.CompleteS3UploadWithRetryFunc = func(ctx context.Context, contentHash string, accountID int64) error {
+	rdb.CompleteS3UploadWithRetryFunc = func(ctx context.Context, contentHash string, accountID int64, writtenKeys []string) error {
 		completed = true
 		return nil
 	}
@@ -139,7 +139,7 @@ func TestProcessSingleUpload_MissingLocalFileNeedsEveryKeyInS3(t *testing.T) {
 	}
 
 	var completed bool
-	rdb.CompleteS3UploadWithRetryFunc = func(ctx context.Context, contentHash string, accountID int64) error {
+	rdb.CompleteS3UploadWithRetryFunc = func(ctx context.Context, contentHash string, accountID int64, writtenKeys []string) error {
 		completed = true
 		return nil
 	}
@@ -168,7 +168,7 @@ func TestProcessSingleUpload_NoKeysNeedWriting(t *testing.T) {
 	}
 
 	var completed bool
-	rdb.CompleteS3UploadWithRetryFunc = func(ctx context.Context, contentHash string, accountID int64) error {
+	rdb.CompleteS3UploadWithRetryFunc = func(ctx context.Context, contentHash string, accountID int64, writtenKeys []string) error {
 		completed = true
 		return nil
 	}

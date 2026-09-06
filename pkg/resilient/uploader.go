@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 )
 
@@ -72,15 +73,34 @@ func (rd *ResilientDatabase) MarkUploadAttemptWithRetry(ctx context.Context, con
 	return err
 }
 
-func (rd *ResilientDatabase) IsContentHashUploadedWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
+func (rd *ResilientDatabase) IsContentHashUploadedWithRetry(ctx context.Context, contentHash string, accountID int64, s3Domain, s3Localpart string) (bool, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).IsContentHashUploaded(ctx, contentHash, accountID)
+		return rd.getOperationalDatabaseForOperation(ctx, false).IsContentHashUploaded(ctx, contentHash, accountID, s3Domain, s3Localpart)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
 	if err != nil {
 		return false, err
 	}
 	return result.(bool), nil
+}
+
+// PendingUploadKeysWithRetry lists the S3 keys still to be written for an upload. It is
+// pinned to the master: the message rows and the pending_uploads row commit in one
+// transaction, and a lagging replica answering "no keys" would be read by the uploader
+// as "nothing left to write" — finalizing an upload that never happened.
+func (rd *ResilientDatabase) PendingUploadKeysWithRetry(ctx context.Context, contentHash string, accountID int64) ([]string, error) {
+	masterCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).PendingUploadKeys(ctx, contentHash, accountID)
+	}
+	result, err := rd.executeReadWithRetry(masterCtx, cleanupRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.([]string), nil
 }
 
 func (rd *ResilientDatabase) ResetUploadAttemptsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {

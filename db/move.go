@@ -173,6 +173,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					m.body_structure, m.recipients_json,
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort,
 					m.id AS original_id,
+					m.account_id AS src_account_id, m.s3_domain AS src_s3_domain, m.s3_localpart AS src_s3_localpart,
 					d.new_uid,
 					d.custom_flags_canon
 				FROM messages m
@@ -189,7 +190,12 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 				SELECT
 					$6 AS account_id, content_hash, uploaded, message_id, in_reply_to,
 					subject, sent_date, internal_date, size,
-					body_structure, recipients_json, $7 AS s3_domain, $8 AS s3_localpart,
+					body_structure, recipients_json,
+					-- Same-account moves keep the source row's S3 key (the object lives there);
+					-- only a move into another account's mailbox is re-keyed to the owner,
+					-- whose copy of the object the caller has made first (server/imap/move.go).
+					CASE WHEN src_account_id = $6 THEN src_s3_domain ELSE $7 END AS s3_domain,
+					CASE WHEN src_account_id = $6 THEN src_s3_localpart ELSE $8 END AS s3_localpart,
 					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
 					$1 AS mailbox_id,
 					$2 AS mailbox_path,

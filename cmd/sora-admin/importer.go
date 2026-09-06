@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/bzip2"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -101,6 +102,7 @@ type messageMetadata struct {
 	subject              string
 	plaintextBody        string
 	sentDate             time.Time
+	internalDate         time.Time // arrival time: maildir filename timestamp / file mtime
 	inReplyTo            []string
 	references           []string
 	bodyStructure        *imap.BodyStructure
@@ -138,6 +140,10 @@ type Importer struct {
 
 	// Dovecot keyword mapping: ID -> keyword name
 	dovecotKeywords map[int]string
+	// folderKeywords caches each folder's own dovecot-keywords map by folder directory
+	// (see keywordsForMessagePath); dovecotKeywords above is the root (INBOX) one.
+	folderKeywords   map[string]map[int]string
+	folderKeywordsMu sync.Mutex
 
 	// Dovecot UID lists: mailbox path -> UID list
 	dovecotUIDLists map[string]*DovecotUIDList
@@ -273,6 +279,7 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		options:         options,
 		startTime:       time.Now(),
 		dovecotKeywords: make(map[int]string),
+		folderKeywords:  make(map[string]map[int]string),
 		dovecotUIDLists: make(map[string]*DovecotUIDList),
 		mailboxCache:    make(map[string]*db.DBMailbox),
 		batchSize:       batchSize,
@@ -704,35 +711,12 @@ func (i *Importer) parseDovecotKeywords() error {
 
 	logger.Info("Parsing Dovecot keywords", "path", keywordsPath)
 
-	content, err := os.ReadFile(keywordsPath)
+	keywords, err := parseKeywordsFile(keywordsPath)
 	if err != nil {
-		return fmt.Errorf("failed to read dovecot-keywords file: %w", err)
+		return err
 	}
-
-	lines := strings.Split(string(content), "\n")
 	keywordCount := 0
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		// Parse format: "ID keyword_name"
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) != 2 {
-			logger.Info("Warning: Skipping malformed dovecot-keywords line", "line", line)
-			continue
-		}
-
-		// Parse the ID
-		id, err := strconv.Atoi(parts[0])
-		if err != nil {
-			logger.Info("Warning: Invalid keyword ID in line", "line", line)
-			continue
-		}
-
-		keyword := parts[1]
+	for id, keyword := range keywords {
 		i.dovecotKeywords[id] = keyword
 		keywordCount++
 	}
@@ -1068,6 +1052,13 @@ func (i *Importer) resolveMailboxName(path string) (string, error) {
 
 // parseMaildirFlags extracts IMAP flags from a maildir filename.
 func (i *Importer) parseMaildirFlags(filename string) []imap.Flag {
+	return i.parseMaildirFlagsWith(filename, i.dovecotKeywords)
+}
+
+// parseMaildirFlagsWith is parseMaildirFlags with an explicit keyword map: the a-z
+// keyword letters in a maildir filename are indexes into the dovecot-keywords file OF
+// THAT FOLDER, and every folder has its own file and numbering (keywordsForMessagePath).
+func (i *Importer) parseMaildirFlagsWith(filename string, keywords map[int]string) []imap.Flag {
 	var flags []imap.Flag
 
 	// Maildir flags are after the colon, e.g., "1234567890.M123P456.hostname:2,FS"
@@ -1081,15 +1072,19 @@ func (i *Importer) parseMaildirFlags(filename string) []imap.Flag {
 				flags = append(flags, imap.FlagSeen)
 			case 'R':
 				flags = append(flags, imap.FlagAnswered)
+			// Maildir info flags (cr.yp.to/proto/maildir.html, and what this tool's
+			// exporter writes): D = Draft, T = Trashed (\Deleted). These were once
+			// swapped, which turned every imported Dovecot draft into a \Deleted
+			// message that the user's next EXPUNGE destroyed.
 			case 'D':
-				flags = append(flags, imap.FlagDeleted)
-			case 'T':
 				flags = append(flags, imap.FlagDraft)
+			case 'T':
+				flags = append(flags, imap.FlagDeleted)
 			default:
 				// Handle Dovecot custom keywords (a-z represent keyword IDs 0-25)
 				if char >= 'a' && char <= 'z' {
 					keywordID := int(char - 'a')
-					if keywordName, exists := i.dovecotKeywords[keywordID]; exists {
+					if keywordName, exists := keywords[keywordID]; exists {
 						// Add custom keyword as IMAP flag
 						flags = append(flags, imap.Flag(keywordName))
 					} else {
@@ -1166,12 +1161,18 @@ func (i *Importer) isMessageAlreadyImported(hash string, mailboxID int64) (bool,
 
 // isMaildirFolder checks if a directory is a valid maildir folder.
 func isMaildirFolder(path string) bool {
-	// Check if the directory contains 'cur', 'new', and 'tmp' subdirectories
+	// A maildir folder is one that holds messages: cur/ or new/. tmp/ is where a
+	// writer stages files and is routinely absent from copies (rsync --exclude tmp,
+	// backups); requiring it silently skipped whole folders of mail.
 	_, errCur := os.Stat(filepath.Join(path, "cur"))
 	_, errNew := os.Stat(filepath.Join(path, "new"))
-	_, errTmp := os.Stat(filepath.Join(path, "tmp"))
-
-	return !os.IsNotExist(errCur) && !os.IsNotExist(errNew) && !os.IsNotExist(errTmp)
+	if os.IsNotExist(errCur) && os.IsNotExist(errNew) {
+		return false
+	}
+	if _, errTmp := os.Stat(filepath.Join(path, "tmp")); os.IsNotExist(errTmp) {
+		logger.Info("Maildir folder has no tmp/ directory; importing it anyway", "path", path)
+	}
+	return true
 }
 
 // fileToProcess is a struct to send file info to worker goroutines for processing.
@@ -1226,16 +1227,21 @@ func (i *Importer) scanMaildir() error {
 			defer wg.Done()
 			for file := range filesToProcess {
 				// Use streaming hash function
+				// Every file the scan drops is reported by path at the end: a message that
+				// never reaches the cache is otherwise invisible to every later count.
 				hash, size, err := hashFile(file.path)
 				if err != nil {
-					logger.Info("Failed to hash file", "path", file.path, "error", err)
+					logger.Warn("Failed to hash file", "path", file.path, "error", err)
+					i.recordFailedPath(file.path, fmt.Sprintf("read/hash error: %v", err))
+					atomic.AddInt64(&i.failedMessages, 1)
 					continue
 				}
 
 				// Validate message
 				if err := i.validateMessage(size); err != nil {
-					logger.Info("Invalid message", "path", file.path, "error", err)
-					atomic.AddInt64(&i.skippedMessages, 1)
+					logger.Warn("Invalid message", "path", file.path, "error", err)
+					i.recordFailedPath(file.path, fmt.Sprintf("invalid message: %v", err))
+					atomic.AddInt64(&i.failedMessages, 1)
 					continue
 				}
 
@@ -1245,7 +1251,9 @@ func (i *Importer) scanMaildir() error {
 				_, err = i.sqliteDB.Exec("INSERT OR IGNORE INTO messages (path, filename, hash, size, mailbox) VALUES (?, ?, ?, ?, ?)",
 					file.path, file.filename, hash, size, file.mailboxName)
 				if err != nil {
-					logger.Info("Failed to insert message into sqlite db", "error", err)
+					logger.Warn("Failed to insert message into sqlite db", "path", file.path, "error", err)
+					i.recordFailedPath(file.path, fmt.Sprintf("cache insert error: %v", err))
+					atomic.AddInt64(&i.failedMessages, 1)
 					continue
 				}
 			}
@@ -1603,6 +1611,29 @@ func decompressIfNeeded(content []byte) ([]byte, error) {
 		return decompressed, nil
 	}
 
+	// bzip2 (Dovecot zlib plugin with bz2): "BZh" + block size digit.
+	if len(content) >= 4 && content[0] == 'B' && content[1] == 'Z' && content[2] == 'h' && content[3] >= '1' && content[3] <= '9' {
+		const maxDecompressedSize = 256 << 20
+		decompressed, err := io.ReadAll(io.LimitReader(bzip2.NewReader(bytes.NewReader(content)), maxDecompressedSize+1))
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress bzip2 content: %w", err)
+		}
+		if len(decompressed) > maxDecompressedSize {
+			return nil, fmt.Errorf("decompressed bzip2 content exceeds %d bytes", maxDecompressedSize)
+		}
+		return decompressed, nil
+	}
+
+	// Compressions this tool cannot read must fail loudly: hashing and uploading the
+	// compressed bytes as if they were the message would store garbage under a valid-
+	// looking hash (Dovecot's zlib plugin also writes zstd and lz4).
+	if len(content) >= 4 && content[0] == 0x28 && content[1] == 0xb5 && content[2] == 0x2f && content[3] == 0xfd {
+		return nil, fmt.Errorf("zstd-compressed maildir file is not supported; decompress it first")
+	}
+	if len(content) >= 4 && content[0] == 0x04 && content[1] == 0x22 && content[2] == 0x4d && content[3] == 0x18 {
+		return nil, fmt.Errorf("lz4-compressed maildir file is not supported; decompress it first")
+	}
+
 	// Content is not gzipped, return as-is
 	return content, nil
 }
@@ -1666,7 +1697,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 	// Flags
 	var flags []imap.Flag
 	if i.options.PreserveFlags {
-		flags = i.parseMaildirFlags(filename)
+		flags = i.parseMaildirFlagsWith(filename, i.keywordsForMessagePath(path))
 	} else {
 		// \Recent must not be persisted; return no flags by default.
 		flags = nil
@@ -1696,6 +1727,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		subject:              subject,
 		plaintextBody:        plaintextBody,
 		sentDate:             sentDate,
+		internalDate:         maildirInternalDate(filename, path, sentDate),
 		inReplyTo:            inReplyTo,
 		references:           references,
 		bodyStructure:        &bodyStructure,
@@ -1761,6 +1793,26 @@ func (i *Importer) uploadBatchToS3(batch []msgInfo) []uploadedMsg {
 				i.recordFailedPath(msg.path, fmt.Sprintf("decompression error: %v", err))
 				atomic.AddInt64(&i.failedMessages, 1)
 				return
+			}
+
+			// The hash in the SQLite cache was computed at scan time — possibly by an
+			// earlier run, since the scan keeps the first row for a (filename, mailbox).
+			// The bytes about to be uploaded are what counts: they name the S3 key and
+			// the content_hash of the database row. If the file changed in place under
+			// the same name, uploading the new bytes under the old hash would overwrite
+			// the object an existing row references, with no signal anywhere.
+			if got := hashBytes(content); got != msg.hash {
+				logger.Warn("File content changed since the scan; using its current hash",
+					"path", msg.path, "scanned_hash", msg.hash, "current_hash", got)
+				if _, uerr := i.sqliteDB.Exec("UPDATE messages SET hash = ?, size = ?, s3_uploaded = 0 WHERE path = ? AND mailbox = ?",
+					got, len(content), msg.path, msg.mailbox); uerr != nil {
+					logger.Warn("Failed to update the cached hash", "path", msg.path, "error", uerr)
+					i.recordFailedPath(msg.path, fmt.Sprintf("content changed since scan and the cache could not be updated: %v", uerr))
+					atomic.AddInt64(&i.failedMessages, 1)
+					return
+				}
+				msg.hash = got
+				msg.size = int64(len(content))
 			}
 
 			// Check for cancellation after I/O
@@ -1873,7 +1925,7 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 			ContentHash:          up.msg.hash,
 			MessageID:            up.metadata.messageID,
 			Flags:                up.metadata.flags,
-			InternalDate:         up.metadata.sentDate,
+			InternalDate:         up.metadata.internalDate,
 			Size:                 int64(len(up.content)),
 			Subject:              up.metadata.subject,
 			PlaintextBody:        up.metadata.plaintextBody,
@@ -1909,14 +1961,25 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 
 			_, _, insertedHashesBatch, err := i.rdb.InsertMessagesFromImporterBatchWithRetry(i.ctx, opts)
 			if err != nil {
-				if errors.Is(err, consts.ErrDBUniqueViolation) {
-					// The entire batch failed due to a unique constraint violation that wasn't caught by deduplication.
-					// This shouldn't happen with the new deduplication logic unless there's a race condition.
-					// We fall back to processing them one by one.
-					logger.Debug("Batch insert failed with unique violation, falling back to individual inserts", "mailbox_id", opts[0].MailboxID, "chunk_size", len(chunk))
+				{
+					// The batch failed as a whole — a unique violation the dedup did not
+					// catch, or one message that could not be prepared (the batch refuses
+					// to drop it silently). Either way the batch says nothing about which
+					// message is at fault, so fall back to inserting them one by one: the
+					// per-message path reports each duplicate, UID conflict or failure
+					// by path instead of writing off the chunk.
+					logger.Info("Batch insert failed, falling back to individual inserts", "mailbox_id", opts[0].MailboxID, "chunk_size", len(chunk), "error", err)
 					for _, gm := range chunk {
 						_, _, indErr := i.rdb.InsertMessageFromImporterWithRetry(i.ctx, gm.opt)
 						if indErr != nil {
+							if errors.Is(indErr, consts.ErrUIDConflict) {
+								// The preserved UID is already taken in the target mailbox: the
+								// message was NOT stored. A "skip" would hide a lost message.
+								logger.Error("Preserved UID already in use, message not imported", "path", gm.path, "hash", gm.hash)
+								i.recordFailedPath(gm.path, "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)")
+								atomic.AddInt64(&i.failedMessages, 1)
+								continue
+							}
 							if errors.Is(indErr, consts.ErrDBUniqueViolation) {
 								atomic.AddInt64(&i.skippedMessages, 1)
 								continue
@@ -1930,13 +1993,6 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 					}
 					continue
 				}
-				// Unrecoverable batch error
-				logger.Error("DB batch insert failed", "mailbox_id", opts[0].MailboxID, "error", err)
-				for _, gm := range chunk {
-					i.recordFailedPath(gm.path, fmt.Sprintf("db batch insert error: %v", err))
-				}
-				atomic.AddInt64(&i.failedMessages, int64(len(chunk)))
-				continue
 			}
 
 			// Add successfully inserted hashes to successHashes, tagged with the mailbox
@@ -2007,7 +2063,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 			ContentHash:          up.msg.hash,
 			MessageID:            up.metadata.messageID,
 			Flags:                up.metadata.flags,
-			InternalDate:         up.metadata.sentDate,
+			InternalDate:         up.metadata.internalDate,
 			Size:                 int64(len(up.content)),
 			Subject:              up.metadata.subject,
 			PlaintextBody:        up.metadata.plaintextBody,
@@ -2021,6 +2077,15 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 		})
 
 		if err != nil {
+			if errors.Is(err, consts.ErrUIDConflict) {
+				// The preserved UID is already taken in the target mailbox: this message
+				// was NOT stored. Report it as failed (never as a dedup skip) and go on
+				// with the batch.
+				logger.Error("Preserved UID already in use, message not imported", "path", up.msg.path, "hash", up.msg.hash)
+				i.recordFailedPath(up.msg.path, "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)")
+				atomic.AddInt64(&i.failedMessages, 1)
+				continue
+			}
 			if errors.Is(err, consts.ErrDBUniqueViolation) {
 				// Message already exists - skip but continue processing batch
 				atomic.AddInt64(&i.skippedMessages, 1)
@@ -2467,4 +2532,89 @@ func (i *Importer) getProgressPrefix() string {
 	percentage := float64(processed) * 100.0 / float64(total)
 
 	return fmt.Sprintf("[%d/%d %.1f%%]", processed, total, percentage)
+}
+
+// hashBytes is hashFile for bytes already in memory: the same SHA-256 hex digest over
+// the (decompressed) message content.
+func hashBytes(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
+}
+
+// parseKeywordsFile reads one dovecot-keywords file ("<index> <keyword>" per line,
+// index 0-25 ↔ letters a-z in maildir filenames). Malformed lines are skipped.
+func parseKeywordsFile(path string) (map[int]string, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read dovecot-keywords file: %w", err)
+	}
+	keywords := make(map[int]string)
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) != 2 {
+			logger.Info("Warning: Skipping malformed dovecot-keywords line", "path", path, "line", line)
+			continue
+		}
+		id, err := strconv.Atoi(parts[0])
+		if err != nil {
+			logger.Info("Warning: Invalid keyword ID in line", "path", path, "line", line)
+			continue
+		}
+		keywords[id] = parts[1]
+	}
+	return keywords, nil
+}
+
+// keywordsForMessagePath returns the keyword map that applies to a message file:
+// Dovecot keeps a dovecot-keywords file PER FOLDER, each with its own index → name
+// numbering, so the letters in a file under .Sent/cur/ mean whatever .Sent/dovecot-
+// keywords says — not what the root file says. A folder without its own file falls
+// back to the root map (INBOX's), which is also what a single-folder maildir has.
+// Results are cached per folder directory; safe for the parallel workers.
+func (i *Importer) keywordsForMessagePath(path string) map[int]string {
+	// path is <folder>/{cur,new}/<file>
+	dir := filepath.Dir(filepath.Dir(path))
+	i.folderKeywordsMu.Lock()
+	defer i.folderKeywordsMu.Unlock()
+	if kws, ok := i.folderKeywords[dir]; ok {
+		return kws
+	}
+	keywordsPath := filepath.Join(dir, "dovecot-keywords")
+	kws := i.dovecotKeywords
+	if dir != filepath.Clean(i.maildirPath) {
+		if _, err := os.Stat(keywordsPath); err == nil {
+			parsed, perr := parseKeywordsFile(keywordsPath)
+			if perr != nil {
+				logger.Warn("Failed to parse folder dovecot-keywords, using the root map", "path", keywordsPath, "error", perr)
+			} else {
+				kws = parsed
+				logger.Info("Loaded folder dovecot-keywords", "path", keywordsPath, "count", len(parsed))
+			}
+		}
+	}
+	i.folderKeywords[dir] = kws
+	return kws
+}
+
+// maildirInternalDate is the IMAP INTERNALDATE for an imported maildir file: the time
+// the message arrived, which maildir records as the leading Unix timestamp of the
+// filename (what Dovecot and the exporter here write) and, failing that, as the file's
+// modification time. The Date: header (sentDate) is the sender's clock, not arrival;
+// using it as INTERNALDATE altered the arrival time of every imported message and
+// re-stamped mtimes on export.
+func maildirInternalDate(filename, path string, sentDate time.Time) time.Time {
+	base := filepath.Base(filename)
+	if dot := strings.IndexByte(base, '.'); dot > 0 {
+		if secs, err := strconv.ParseInt(base[:dot], 10, 64); err == nil && secs > 0 {
+			return time.Unix(secs, 0)
+		}
+	}
+	if info, err := os.Stat(path); err == nil && !info.ModTime().IsZero() {
+		return info.ModTime()
+	}
+	return sentDate
 }

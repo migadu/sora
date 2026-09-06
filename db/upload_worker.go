@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/helpers"
 )
 
 type PendingUpload struct {
@@ -113,24 +114,56 @@ func (db *Database) ResetUploadAttempts(ctx context.Context, tx pgx.Tx, contentH
 	return tag.RowsAffected() > 0, nil
 }
 
-// CompleteS3Upload marks all messages with the given content hash as uploaded
-// and deletes the specific pending upload record.
-// Called by an upload worker after successfully uploading the content hash.
-func (db *Database) CompleteS3Upload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64) error {
-	// Only mark messages for the specific account as uploaded.
+// CompleteS3Upload finalizes an upload for (contentHash, accountID) after the objects
+// under writtenKeys (full S3 keys, domain/localpart/hash) have been stored.
+//
+// A row is marked uploaded only when its own key now has an object: either the key is
+// in writtenKeys, or a live (non-expunged) uploaded row already carries the same key —
+// the object exists by the invariant every writer keeps (readers build the GET key from
+// the row, so "uploaded" must never be true for a key nothing was written under). Rows
+// under a key that is in neither set stay uploaded=FALSE, and the pending row is
+// deleted only once no unuploaded row is left for the pair; otherwise it stays, and the
+// next lease writes the keys still missing (PendingUploadKeys lists exactly those).
+//
+// The "same key already live" clause is what keeps the pending row from being leased
+// forever: a delivery whose dedup ran before an in-flight upload finalized re-arms the
+// pending row, the next lease finds no key left to write (PendingUploadKeys excludes a
+// key that has a live uploaded row) and calls this with no writtenKeys — the clause
+// then marks that row from the sibling that proves the object.
+func (db *Database) CompleteS3Upload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, writtenKeys []string) error {
+	if writtenKeys == nil {
+		writtenKeys = []string{}
+	}
 	_, err := tx.Exec(ctx, `
-		UPDATE messages 
+		UPDATE messages m
 		SET uploaded = TRUE
-		WHERE content_hash = $1 AND account_id = $2 AND uploaded = FALSE
-	`, contentHash, accountID)
+		WHERE m.content_hash = $1 AND m.account_id = $2 AND m.uploaded = FALSE
+		  AND (
+			(m.s3_domain || '/' || m.s3_localpart || '/' || m.content_hash) = ANY($3::text[])
+			OR EXISTS (
+				SELECT 1 FROM messages u
+				WHERE u.content_hash = m.content_hash
+				  AND u.account_id = m.account_id
+				  AND u.s3_domain = m.s3_domain
+				  AND u.s3_localpart = m.s3_localpart
+				  AND u.uploaded = TRUE
+				  AND u.expunged_at IS NULL
+			)
+		  )
+	`, contentHash, accountID, writtenKeys)
 	if err != nil {
 		return err
 	}
 
-	// Delete the specific pending upload for this account.
+	// The pending row goes only when nothing is left to write for this pair. The check
+	// runs after the UPDATE in the same transaction, so it sees the rows just marked.
 	_, err = tx.Exec(ctx, `
-		DELETE FROM pending_uploads 
+		DELETE FROM pending_uploads
 		WHERE content_hash = $1 AND account_id = $2
+		  AND NOT EXISTS (
+			SELECT 1 FROM messages
+			WHERE content_hash = $1 AND account_id = $2 AND uploaded = FALSE
+		  )
 	`, contentHash, accountID)
 	if err != nil {
 		return err
@@ -139,19 +172,66 @@ func (db *Database) CompleteS3Upload(ctx context.Context, tx pgx.Tx, contentHash
 	return nil
 }
 
-// IsContentHashUploaded checks if any non-expunged message with the given content hash
-// is already marked as uploaded.  This is used by the upload worker to avoid redundant
-// S3 uploads.
+// PendingUploadKeys returns the S3 keys that still have to be written before the
+// account's message rows for this content hash may be marked uploaded. The keys are
+// built from the s3_domain/s3_localpart recorded on each message row at insert time,
+// which is what every reader uses to build its GET key. One (content_hash, account_id)
+// pair can span several keys: the pair is unique in pending_uploads, while the rows
+// behind it were keyed from whatever the account's primary address was when each was
+// inserted. A key is left out once a non-expunged row carries it as uploaded: its object
+// is already in S3, and CompleteS3Upload marks the remaining rows under it from that.
+//
+// Callers that need read-your-writes (the uploader: the message rows and the
+// pending_uploads row commit in one transaction, and a lagging replica answering "no
+// keys" would finalize an upload that never happened) pin the context to the master.
+func (db *Database) PendingUploadKeys(ctx context.Context, contentHash string, accountID int64) ([]string, error) {
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT s3_domain, s3_localpart FROM messages
+		WHERE content_hash = $1 AND account_id = $2
+		GROUP BY s3_domain, s3_localpart
+		HAVING bool_or(NOT uploaded) AND NOT bool_or(uploaded AND expunged_at IS NULL)
+	`, contentHash, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve storage keys for hash %s of account %d: %w", contentHash, accountID, err)
+	}
+	defer rows.Close()
+
+	var keys []string
+	for rows.Next() {
+		var domain, localpart string
+		if err := rows.Scan(&domain, &localpart); err != nil {
+			return nil, fmt.Errorf("failed to scan storage key parts: %w", err)
+		}
+		keys = append(keys, helpers.NewS3Key(domain, localpart, contentHash))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to resolve storage keys for hash %s of account %d: %w", contentHash, accountID, err)
+	}
+	return keys, nil
+}
+
+// IsContentHashUploaded reports whether a non-expunged message of this account carries
+// the given content hash as uploaded UNDER THE GIVEN KEY (s3_domain/s3_localpart).
+// Readers use it to tell "the body is on its way, retry" from "the body is gone": the
+// question is whether a retry of THIS row's key would find an object, so only a row
+// with the same key is evidence. Rows under another key are not — one account's rows
+// can carry different keys (the primary address at the time each was written, or the
+// address an import ran under).
 //
 // IMPORTANT: Only considers non-expunged messages.  Expunged messages may be pending
 // S3 cleanup by the cleaner.  If we consider them "uploaded", the worker skips the
 // upload, then the cleaner deletes the S3 object, leaving new messages that reference
 // a non-existent object (404 NoSuchKey on fetch).
-func (db *Database) IsContentHashUploaded(ctx context.Context, contentHash string, accountID int64) (bool, error) {
+func (db *Database) IsContentHashUploaded(ctx context.Context, contentHash string, accountID int64, s3Domain, s3Localpart string) (bool, error) {
 	var uploaded bool
-	err := db.GetReadPool().QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM messages WHERE content_hash = $1 AND account_id = $2 AND uploaded = TRUE AND expunged_at IS NULL)
-	`, contentHash, accountID).Scan(&uploaded)
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM messages
+			WHERE content_hash = $1 AND account_id = $2
+			  AND s3_domain = $3 AND s3_localpart = $4
+			  AND uploaded = TRUE AND expunged_at IS NULL
+		)
+	`, contentHash, accountID, s3Domain, s3Localpart).Scan(&uploaded)
 	if err != nil {
 		return false, fmt.Errorf("failed to check if content hash %s for account %d is uploaded: %w", contentHash, accountID, err)
 	}
@@ -406,7 +486,7 @@ func (d *Database) DeleteFailedUpload(ctx context.Context, tx pgx.Tx, contentHas
 // This is used by the cleanup job to determine if a local file is orphaned.
 func (db *Database) PendingUploadExists(ctx context.Context, contentHash string, accountID int64) (bool, error) {
 	var exists bool
-	err := db.GetReadPool().QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT EXISTS (SELECT 1 FROM pending_uploads WHERE content_hash = $1 AND account_id = $2)
 	`, contentHash, accountID).Scan(&exists)
 	if err != nil {
@@ -425,7 +505,7 @@ func (db *Database) PendingUploadExists(ctx context.Context, contentHash string,
 // "cannot get mail" for the whole mailbox.
 func (db *Database) PendingUploadRetryable(ctx context.Context, contentHash string, accountID int64, maxAttempts int) (bool, error) {
 	var retryable bool
-	err := db.GetReadPool().QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM pending_uploads
 			WHERE content_hash = $1 AND account_id = $2 AND attempts < $3

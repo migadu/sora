@@ -363,27 +363,30 @@ func TestMailboxPurge(t *testing.T) {
 
 	t.Logf("✅ Purge completed successfully")
 
-	// Verify messages are deleted from database
-	messagesAfter, err := rdb.GetMessagesForMailboxAndChildren(ctx, accountID, mbox.ID, mbox.Path)
-	if err != nil {
-		t.Fatalf("Failed to get messages after purge: %v", err)
+	// Purge is two-phase: every message row is now expunged (invisible to clients), and
+	// the objects are left for the cleaner, which reclaims them after the grace period
+	// only once nothing else references them. Deleting the objects here would have
+	// taken the body of any copy of these messages in another folder.
+	var live, expunged int
+	if err := rdb.GetOperationalDatabase().GetWritePool().QueryRow(ctx,
+		`SELECT COUNT(*) FILTER (WHERE expunged_at IS NULL), COUNT(*) FILTER (WHERE expunged_at IS NOT NULL)
+		 FROM messages WHERE account_id = $1`, accountID).Scan(&live, &expunged); err != nil {
+		t.Fatalf("Failed to count messages after purge: %v", err)
+	}
+	if live != 0 || expunged != messageCount {
+		t.Fatalf("Expected 0 live and %d expunged messages after purge, got live=%d expunged=%d", messageCount, live, expunged)
 	}
 
-	if len(messagesAfter) != 0 {
-		t.Fatalf("Expected 0 messages after purge, got %d", len(messagesAfter))
-	}
-
-	// Verify S3 objects are deleted
+	// Verify S3 objects are still present (the cleaner, not the purge, deletes them)
 	for i := 0; i < messageCount; i++ {
 		contentHash := fmt.Sprintf("hash-%d", i)
 		s3Key := helpers.NewS3Key(domain, localpart, contentHash)
-		_, err := s3Mock.Get(s3Key)
-		if err == nil {
-			t.Fatalf("S3 object should be deleted after purge: %s", s3Key)
+		if _, err := s3Mock.Get(s3Key); err != nil {
+			t.Fatalf("S3 object must survive the purge for the cleaner to reclaim: %s (%v)", s3Key, err)
 		}
 	}
 
-	t.Logf("✅ Verified all S3 objects are deleted after purge")
+	t.Logf("✅ Verified messages are expunged and objects left for the cleaner")
 
 	// Delete the mailboxes to clean up
 	err = rdb.DeleteMailboxWithRetry(ctx, childMbox.ID, accountID)

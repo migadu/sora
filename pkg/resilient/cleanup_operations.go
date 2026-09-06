@@ -2,6 +2,7 @@ package resilient
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -17,25 +18,55 @@ func (rd *ResilientDatabase) ExecuteWithLockedS3Orphans(ctx context.Context, obj
 	return rd.getOperationalDatabaseForOperation(ctx, true).ExecuteWithLockedS3Orphans(ctx, objects, gracePeriod, fn)
 }
 
+// AcquireCleanupLockWithRetry takes the cluster-wide cleanup lock for the duration of a
+// cleanup cycle, or reports false when another node holds it.
+//
+// It is a SESSION-level advisory lock on a dedicated connection, held until
+// ReleaseCleanupLockWithRetry. It was once a transaction-level lock taken inside a
+// wrapper that committed immediately — released before the cycle even started, so every
+// node ran the full cycle every wake (N× the candidate scans, lock_timeout noise from
+// contending on the same mailbox rows, duplicated reaping work). The dedicated connection
+// is the same pattern the per-object S3 lock uses (ExecuteWithS3ObjectSessionLock).
 func (rd *ResilientDatabase) AcquireCleanupLockWithRetry(ctx context.Context) (bool, error) {
-	// Transaction-scoped advisory lock - use executeWriteInTxWithRetry
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).AcquireCleanupLock(ctx, tx)
+	rd.cleanupLockMu.Lock()
+	defer rd.cleanupLockMu.Unlock()
+	if rd.cleanupLockConn != nil {
+		return false, fmt.Errorf("cleanup lock is already held by this process")
 	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+
+	pool := rd.getOperationalDatabaseForOperation(ctx, true).GetWritePool()
+	lockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	conn, err := pool.Acquire(lockCtx)
 	if err != nil {
 		return false, err
 	}
-	return result.(bool), nil
+	var acquired bool
+	if err := conn.QueryRow(lockCtx, "SELECT pg_try_advisory_lock($1)", db.CLEANUP_ADVISORY_LOCK_ID).Scan(&acquired); err != nil {
+		conn.Release()
+		return false, fmt.Errorf("failed to try the cleanup advisory lock: %w", err)
+	}
+	if !acquired {
+		conn.Release()
+		return false, nil
+	}
+	rd.cleanupLockConn = conn
+	return true, nil
 }
 
+// ReleaseCleanupLockWithRetry releases the cleanup lock taken by
+// AcquireCleanupLockWithRetry and returns its connection to the pool. It uses a
+// detached context so the unlock happens even when the cycle's context is gone.
 func (rd *ResilientDatabase) ReleaseCleanupLockWithRetry(ctx context.Context) error {
-	// Transaction-scoped locks auto-release on commit/rollback - this is a no-op
-	// Kept for API compatibility
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(ctx, true).ReleaseCleanupLock(ctx, tx)
+	rd.cleanupLockMu.Lock()
+	conn := rd.cleanupLockConn
+	rd.cleanupLockConn = nil
+	rd.cleanupLockMu.Unlock()
+	if conn == nil {
+		return nil
 	}
-	_, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+	defer conn.Release()
+	_, err := conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", db.CLEANUP_ADVISORY_LOCK_ID)
 	return err
 }
 
@@ -98,4 +129,16 @@ func (rd *ResilientDatabase) PurgeCredentialsForAccount(ctx context.Context, acc
 
 func (rd *ResilientDatabase) PurgeAccount(ctx context.Context, accountID int64) error {
 	return rd.getOperationalDatabaseForOperation(ctx, true).PurgeAccount(ctx, accountID)
+}
+
+// ExpungeMessagesByIDsWithRetry marks message rows expunged for the cleaner to reclaim.
+func (rd *ResilientDatabase) ExpungeMessagesByIDsWithRetry(ctx context.Context, messageIDs []int64) (int64, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).ExpungeMessagesByIDs(ctx, tx, messageIDs)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
 }

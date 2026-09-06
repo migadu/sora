@@ -1027,8 +1027,11 @@ func (s *POP3Session) loadMessageBody(ctx context.Context, msg *db.POP3Message) 
 		if s.server.cache != nil {
 			if cacheData, cacheErr := s.server.cache.Get(msg.ContentHash); cacheErr == nil && cacheData != nil {
 				// Validate cached data is not empty
-				if len(cacheData) == 0 {
-					s.WarnLog("cache contains empty body, falling through to S3", "uid", msg.UID, "content_hash", msg.ContentHash)
+				if !bodySizeMatches(cacheData, msg.Size) {
+					// A 0-byte or truncated cache file must not be served: S3 is the authority.
+					s.WarnLog("cache body size disagrees with the message, falling through to S3",
+						"uid", msg.UID, "content_hash", msg.ContentHash, "cached", len(cacheData), "expected", msg.Size)
+					s.server.cache.Delete(msg.ContentHash)
 				} else {
 					s.DebugLog("cache hit", "uid", msg.UID)
 					return cacheData, nil
@@ -1045,7 +1048,7 @@ func (s *POP3Session) loadMessageBody(ctx context.Context, msg *db.POP3Message) 
 			// and transient S3 outages where the upload worker has not yet run.
 			if s.server.uploader != nil {
 				filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-				if diskData, diskErr := os.ReadFile(filePath); diskErr == nil && len(diskData) > 0 {
+				if diskData, diskErr := os.ReadFile(filePath); diskErr == nil && bodySizeMatches(diskData, msg.Size) {
 					s.DebugLog("S3 unavailable, served from local disk", "uid", msg.UID)
 					return diskData, nil
 				}
@@ -1062,7 +1065,7 @@ func (s *POP3Session) loadMessageBody(ctx context.Context, msg *db.POP3Message) 
 			// conditions (empty/0-byte object, missing S3 key, read error) are NOT
 			// ErrRetrieveFailed and must NOT be reported transient, or the client would
 			// retry forever instead of getting -ERR Message not available.
-			if errors.Is(err, storage.ErrRetrieveFailed) && !resilient.IsNotFoundError(err) {
+			if errors.Is(err, storage.ErrRetrieveFailed) && !resilient.IsNotFoundError(err) && !errors.Is(err, storage.ErrCorruptObject) {
 				return nil, fmt.Errorf("message UID %d: %w (S3 unavailable): %v", msg.UID, errBodyTransientlyUnavailable, err)
 			}
 			// Permanent. A NoSuchKey on an uploaded message is genuine content loss worth
@@ -1084,7 +1087,7 @@ func (s *POP3Session) loadMessageBody(ctx context.Context, msg *db.POP3Message) 
 	}
 	s.DebugLog("fetching not yet uploaded message from disk", "uid", msg.UID)
 	filePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-	if data, diskErr := os.ReadFile(filePath); diskErr == nil && len(data) > 0 {
+	if data, diskErr := os.ReadFile(filePath); diskErr == nil && bodySizeMatches(data, msg.Size) {
 		return data, nil
 	}
 
@@ -1147,6 +1150,9 @@ func (s *POP3Session) loadMessageBody(ctx context.Context, msg *db.POP3Message) 
 // has given up on is not pending: it is never leased again, so "try again later" would
 // never come true (see the IMAP twin in server/imap/fetch.go).
 func (s *POP3Session) bodyUploadStillPending(ctx context.Context, msg *db.POP3Message) bool {
+	// Read the master (see the IMAP twin): a lagging replica must not turn "retry later"
+	// into "-ERR Message not available".
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	pending, err := s.server.rdb.PendingUploadRetryableWithRetry(ctx, msg.ContentHash, msg.AccountID, s.server.uploader.MaxAttempts())
 	if err != nil {
 		s.WarnLog("could not check pending-upload status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
@@ -1155,7 +1161,7 @@ func (s *POP3Session) bodyUploadStillPending(ctx context.Context, msg *db.POP3Me
 	if pending {
 		return true
 	}
-	uploaded, err := s.server.rdb.IsContentHashUploadedWithRetry(ctx, msg.ContentHash, msg.AccountID)
+	uploaded, err := s.server.rdb.IsContentHashUploadedWithRetry(ctx, msg.ContentHash, msg.AccountID, msg.S3Domain, msg.S3Localpart)
 	if err != nil {
 		s.WarnLog("could not check uploaded status; treating body as transiently unavailable", "uid", msg.UID, "error", err)
 		return true

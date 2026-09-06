@@ -7,7 +7,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
@@ -196,7 +195,7 @@ func handleMailboxDelete(ctx context.Context) {
 	email := fs.String("email", "", "Email address of the account (required)")
 	mailbox := fs.String("mailbox", "", "Mailbox name/path to delete (required)")
 	confirm := fs.Bool("confirm", false, "Confirm deletion without interactive prompt (required)")
-	purge := fs.Bool("purge", false, "Purge all messages from S3 and database immediately (no grace period)")
+	purge := fs.Bool("purge", false, "Expunge all messages in the mailbox and its children (the cleaner reclaims rows and objects after the grace period)")
 
 	fs.Usage = func() {
 		fmt.Printf(`Delete a mailbox
@@ -209,13 +208,15 @@ Options:
   --email EMAIL       Email address of the account (required)
   --mailbox MAILBOX   Mailbox name/path to delete (required)
   --confirm           Confirm deletion (required for safety)
-  --purge             Purge all messages from S3 and database immediately without grace period
+  --purge             Expunge every message in the mailbox and its children first. Rows and S3
+                      objects are then reclaimed by the cleaner after the grace period, once
+                      nothing else (a copy in another folder) references each object.
 
 Examples:
   # Delete mailbox (messages enter grace period for cleanup)
   sora-admin mailbox delete --config config.toml --email user@example.com --mailbox "OldFolder" --confirm
 
-  # Delete mailbox and purge all messages immediately from S3 and database
+  # Delete mailbox and expunge all its messages right away
   sora-admin mailbox delete --config config.toml --email user@example.com --mailbox "OldFolder" --confirm --purge
 `)
 	}
@@ -799,51 +800,24 @@ func purgeMailboxMessages(ctx context.Context, rdb *resilient.ResilientDatabase,
 
 	fmt.Printf("Found %d messages to purge\n", len(messages))
 
-	// Track unique S3 objects to delete (deduplicated by content hash)
-	s3ObjectsToDelete := make(map[string]db.UserScopedObjectForCleanup)
+	// Two-phase deletion, like EXPUNGE: mark the rows expunged and let the cleaner
+	// reclaim rows and objects after the grace period, under its per-object lock and
+	// only once nothing else references each object. This tool used to delete the
+	// objects itself, keyed by (account, hash): a message COPY'd into another folder
+	// shares that object, and the copy was left pointing at nothing.
 	messageIDs := make([]int64, 0, len(messages))
-
 	for _, msg := range messages {
-		messageIDs = append(messageIDs, msg.ID)
-
-		// Track unique S3 objects by user-scoped key (AccountID + ContentHash)
-		key := fmt.Sprintf("%d:%s", msg.AccountID, msg.ContentHash)
-		if _, exists := s3ObjectsToDelete[key]; !exists {
-			s3ObjectsToDelete[key] = db.UserScopedObjectForCleanup{
-				AccountID:   msg.AccountID,
-				ContentHash: msg.ContentHash,
-				S3Domain:    msg.S3Domain,
-				S3Localpart: msg.S3Localpart,
-			}
-		}
+		messageIDs = append(messageIDs, msg.ID) // rows already expunged are left as they are
 	}
+	_ = s3Storage // objects are reclaimed by the cleaner, not here
 
-	fmt.Printf("Deleting %d unique S3 objects...\n", len(s3ObjectsToDelete))
-
-	// Delete from S3 first (before database, so if S3 fails we don't lose track of objects)
-	deletedCount := 0
-	failedCount := 0
-	for _, obj := range s3ObjectsToDelete {
-		s3Key := helpers.NewS3Key(obj.S3Domain, obj.S3Localpart, obj.ContentHash)
-		err := s3Storage.Delete(s3Key)
-		if err != nil {
-			fmt.Printf("Warning: Failed to delete S3 object %s: %v\n", s3Key, err)
-			failedCount++
-		} else {
-			deletedCount++
-		}
-	}
-
-	fmt.Printf("Deleted %d S3 objects (%d failed)\n", deletedCount, failedCount)
-
-	// Now delete from database - delete messages directly (hard delete)
-	fmt.Printf("Deleting %d messages from database...\n", len(messageIDs))
-	deletedFromDB, err := rdb.PurgeMessagesByIDs(ctx, messageIDs)
+	fmt.Printf("Expunging %d messages (objects are reclaimed by the cleaner after the grace period)...\n", len(messageIDs))
+	expunged, err := rdb.ExpungeMessagesByIDsWithRetry(ctx, messageIDs)
 	if err != nil {
-		return fmt.Errorf("failed to purge messages from database: %w", err)
+		return fmt.Errorf("failed to expunge messages: %w", err)
 	}
 
-	fmt.Printf("Purged %d messages from database\n", deletedFromDB)
+	fmt.Printf("Expunged %d messages\n", expunged)
 
 	return nil
 }

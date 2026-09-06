@@ -35,6 +35,11 @@ type RecipientStatus struct {
 	Email    string `json:"email"`
 	Accepted bool   `json:"accepted"`
 	Error    string `json:"error,omitempty"`
+	// Transient is set when the failure is the server's (database, storage, a commit
+	// whose outcome is unknown) rather than the request's: the message may be
+	// delivered on a retry — or may already be stored — so the caller must retry, not
+	// drop it. Drives the 503-vs-400 choice for a single-recipient request.
+	Transient bool `json:"transient,omitempty"`
 }
 
 // DeliverMailResponse represents the HTTP response for mail delivery
@@ -97,7 +102,12 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 			file, err := r.MultipartForm.File["message"][0].Open()
 			if err == nil {
 				defer file.Close()
-				msgBytes, _ := io.ReadAll(file)
+				msgBytes, readErr := io.ReadAll(file)
+				if readErr != nil {
+					// A truncated upload must not be delivered as if it were the message.
+					s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read uploaded message: %v", readErr))
+					return
+				}
 				req.Message = string(msgBytes)
 			}
 		}
@@ -217,8 +227,16 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	statusCode := http.StatusOK
 	if !response.Success {
 		if len(response.Recipients) == 1 {
-			// Single recipient failure - return 4xx/5xx
-			statusCode = http.StatusBadRequest
+			// Single recipient failure: 400 only when the request itself is wrong
+			// (unknown or malformed recipient). A server-side failure is 503 with a
+			// Retry-After, so an injector that honours status codes retries instead of
+			// bouncing a message that may be stored or storable.
+			if response.Recipients[0].Transient {
+				statusCode = http.StatusServiceUnavailable
+				w.Header().Set("Retry-After", "30")
+			} else {
+				statusCode = http.StatusBadRequest
+			}
 		} else {
 			// Multiple recipients with partial failure - return 207 Multi-Status
 			statusCode = http.StatusMultiStatus
@@ -290,6 +308,9 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 	if err != nil {
 		logger.Log("recipient lookup failed: %v", err)
 		status.Error = err.Error()
+		// An unknown or malformed recipient is the request's fault; anything else
+		// (database error, mailbox setup) is ours and worth a retry.
+		status.Transient = !strings.Contains(err.Error(), "recipient not found") && !strings.Contains(err.Error(), "invalid recipient address")
 		return status
 	}
 
@@ -312,6 +333,11 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 	if err != nil {
 		logger.Log("delivery failed: %v", err)
 		status.Error = result.ErrorMessage
+		// Storage, the database, the staging limit, or a commit whose outcome is
+		// unknown: the message may land on a retry (or already has, and the retry is
+		// absorbed by the delivery-hash check). Never a 4xx the injector would honour
+		// by dropping the message.
+		status.Transient = true
 		return status
 	}
 

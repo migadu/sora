@@ -580,7 +580,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	}
 
 	// Since the content already exists in S3, mark the upload as complete
-	err = si.rdb.CompleteS3UploadWithRetry(ctx, contentHash, user.AccountID())
+	err = si.rdb.CompleteS3UploadWithRetry(ctx, contentHash, user.AccountID(), []string{helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)})
 	if err != nil {
 		return fmt.Errorf("failed to mark S3 upload as complete: %w", err)
 	}

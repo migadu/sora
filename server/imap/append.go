@@ -341,8 +341,10 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 
 	expectedPath := s.server.uploader.FilePath(contentHash, destAccountID)
 	var filePath *string
-	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
-		// File doesn't exist, safe to write
+	if info, err := os.Stat(expectedPath); os.IsNotExist(err) || (err == nil && info.Size() != int64(len(fullMessageBytes))) {
+		// File doesn't exist, or exists with the wrong size (a leftover that never
+		// finished): (re)write it. StoreLocally renames a complete file into place, so
+		// an uploader reading the old one keeps its inode.
 		filePath, err = s.server.uploader.StoreLocally(contentHash, destAccountID, fullMessageBytes)
 		if err != nil {
 			ierr := s.internalError("failed to save message to disk: %v", err)
@@ -351,9 +353,14 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		}
 		s.DebugLog("message accepted locally", "path", *filePath)
 	} else if err == nil {
-		// File already exists (likely being processed by uploader or concurrent duplicate APPEND)
-		// Don't overwrite it, and don't set filePath so we won't try to delete it later
+		// File already exists with the right size (being processed by the uploader, or a
+		// concurrent duplicate APPEND). Don't overwrite it, and don't set filePath so we
+		// won't try to delete it later. Touch it so the orphan sweep's grace period
+		// counts from now: this row's pending upload has not been committed yet.
 		filePath = nil
+		if terr := os.Chtimes(expectedPath, time.Now(), time.Now()); terr != nil {
+			s.DebugLog("could not refresh staged file mtime", "path", expectedPath, "error", terr)
+		}
 		s.DebugLog("message file already exists, skipping write (concurrent APPEND)", "path", expectedPath)
 	} else {
 		// Stat error (permission issue, etc.)

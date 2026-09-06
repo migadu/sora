@@ -165,6 +165,15 @@ func purgeAccountWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilien
 		s3Storage = realS3
 	}
 
+	// Step 0: Take the account out of service first. Until it is marked deleted, mail
+	// keeps arriving (LMTP) and users keep logging in, and the purge below would chase
+	// live rows forever (see the stall guard in the batch loop).
+	if err := rdb.DeleteAccountWithRetry(ctx, email); err != nil {
+		fmt.Printf("Warning: could not mark the account deleted before purging (%v); continuing\n", err)
+	} else {
+		fmt.Printf("[OK] Account marked deleted (no more deliveries or logins)\n")
+	}
+
 	// Step 1: Mark all messages as expunged (atomic, idempotent)
 	// We do this first so we can safely delete them.
 	// Even if this returns 0 (already expunged), we proceed to check for any remaining S3 objects.
@@ -248,6 +257,14 @@ func purgeAccountWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilien
 			}
 			totalDBDeletes += deleted
 			fmt.Printf("    [OK] Deleted %d S3 objects and %d DB records this batch\n", len(successfulDeletes), deleted)
+			if deleted == 0 {
+				// The objects are gone but no row went with them: these rows are not
+				// expunged (mail arriving into the account while it is being purged, or
+				// a replica serving stale rows). Looping would re-fetch and re-delete the
+				// same keys forever. Stop; a re-run after the account is disabled
+				// finishes the job.
+				return fmt.Errorf("purge stalled: %d S3 objects deleted but no database rows removed — the account still receives mail or the read replica lags; disable the account and re-run", len(successfulDeletes))
+			}
 		} else if failedDeletes > 0 && len(batch) > 0 {
 			// If we found objects but failed to delete ANY of them, we are stuck.
 			// The next iteration will find the same objects.

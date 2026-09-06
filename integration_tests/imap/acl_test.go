@@ -595,6 +595,11 @@ func TestACL_CrossDomainDenied(t *testing.T) {
 // TestACL_CompatibilityRights verifies RFC 4314 Section 2.1.1 (Obsolete Rights) compatibility.
 // If a client sets 'c' or 'd', they must be expanded.
 // When returning rights, the server must inject 'c' and 'd' back if the corresponding standard rights are set.
+//
+// RFC 4314 §2.1.1 describes two server families; go-imap (like Dovecot, and
+// Cyrus by default) is the first: 'c' is 'k'+'x' and 'd' is 't'+'e'. So the
+// obsolete 'c' delegates creating AND deleting mailboxes, while 'd' delegates
+// deleting and expunging messages and never the mailbox itself.
 func TestACL_CompatibilityRights(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -631,30 +636,66 @@ func TestACL_CompatibilityRights(t *testing.T) {
 	}
 	defer func() { c1.Delete(sharedMailbox).Wait() }()
 
-	// Grant user2 compatibility rights "c" and "d" along with "lrswi"
-	err = c1.SetACL(sharedMailbox, imap.RightsIdentifier(email2), imap.RightModificationReplace, imap.RightSet("lrswicd")).Wait()
-	if err != nil {
-		t.Fatalf("SETACL command failed with compatibility rights: %v", err)
-	}
-
-	// GETACL - should show 'c' and 'd' mapped back, plus their standard expansions 'k' and 'xte'
-	getACLData, err := c1.GetACL(sharedMailbox).Wait()
-	if err != nil {
-		t.Fatalf("GETACL command failed: %v", err)
-	}
-
-	user2Rights, foundUser2 := getACLData.Rights[imap.RightsIdentifier(email2)]
-	if !foundUser2 {
-		t.Fatalf("User2 not found in ACL response")
-	}
-	rightsStr := user2Rights.String()
-
-	// We expect 'k' (from 'c'), 'x', 't', 'e' (from 'd'), plus 'c' and 'd' for compatibility.
-	for _, r := range "lrswikxtecd" {
-		if !strings.ContainsRune(rightsStr, r) {
-			t.Errorf("Expected right %c to be present in returned rights %q", r, rightsStr)
+	// setAndGet replaces user2's rights and returns what GETACL reports back.
+	setAndGet := func(t *testing.T, rights string) string {
+		t.Helper()
+		err := c1.SetACL(sharedMailbox, imap.RightsIdentifier(email2), imap.RightModificationReplace, imap.RightSet(rights)).Wait()
+		if err != nil {
+			t.Fatalf("SETACL %q failed: %v", rights, err)
 		}
+		getACLData, err := c1.GetACL(sharedMailbox).Wait()
+		if err != nil {
+			t.Fatalf("GETACL command failed: %v", err)
+		}
+		user2Rights, foundUser2 := getACLData.Rights[imap.RightsIdentifier(email2)]
+		if !foundUser2 {
+			t.Fatalf("User2 not found in ACL response")
+		}
+		return user2Rights.String()
 	}
 
-	t.Logf("✓ Compatibility rights 'c' and 'd' successfully set, expanded, and serialized: %s", rightsStr)
+	// The RFC's own example shape: 'c' and 'd' together. Expect 'k' and 'x'
+	// (from 'c'), 't' and 'e' (from 'd'), plus 'c' and 'd' re-injected.
+	t.Run("CAndD", func(t *testing.T) {
+		rightsStr := setAndGet(t, "lrswicd")
+		for _, r := range "lrswikxtecd" {
+			if !strings.ContainsRune(rightsStr, r) {
+				t.Errorf("Expected right %c to be present in returned rights %q", r, rightsStr)
+			}
+		}
+		t.Logf("✓ Compatibility rights 'c' and 'd' set, expanded, and serialized: %s", rightsStr)
+	})
+
+	// 'd' alone must not hand out mailbox deletion, and with neither 'k' nor
+	// 'x' held the server must not re-inject 'c' either.
+	t.Run("DAlone", func(t *testing.T) {
+		rightsStr := setAndGet(t, "lrd")
+		for _, r := range "lrted" {
+			if !strings.ContainsRune(rightsStr, r) {
+				t.Errorf("Expected right %c to be present in returned rights %q", r, rightsStr)
+			}
+		}
+		for _, r := range "xc" {
+			if strings.ContainsRune(rightsStr, r) {
+				t.Errorf("Right %c must not be granted by 'd' alone, got rights %q", r, rightsStr)
+			}
+		}
+		t.Logf("✓ 'd' alone delegates messages only: %s", rightsStr)
+	})
+
+	// 'c' alone grants both create and delete mailbox, and no message rights.
+	t.Run("CAlone", func(t *testing.T) {
+		rightsStr := setAndGet(t, "lrc")
+		for _, r := range "lrkxc" {
+			if !strings.ContainsRune(rightsStr, r) {
+				t.Errorf("Expected right %c to be present in returned rights %q", r, rightsStr)
+			}
+		}
+		for _, r := range "ted" {
+			if strings.ContainsRune(rightsStr, r) {
+				t.Errorf("Right %c must not be granted by 'c' alone, got rights %q", r, rightsStr)
+			}
+		}
+		t.Logf("✓ 'c' alone delegates mailboxes only: %s", rightsStr)
+	})
 }

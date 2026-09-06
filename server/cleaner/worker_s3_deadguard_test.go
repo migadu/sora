@@ -81,7 +81,7 @@ func TestCleanupWorker_S3HealthGuardIsDeadCode(t *testing.T) {
 	mockDB.On("CleanupOldHealthStatusesWithRetry", ctx, mock.Anything).Return(int64(0), nil).Once()
 	mockDB.On("GetUserScopedObjectsForCleanupWithRetry", ctx, mock.Anything, mock.Anything).Return([]db.UserScopedObjectForCleanup{}, nil).Once()
 	mockDB.On("GetUnusedFTSHashesWithRetry", ctx, mock.Anything).Return([]string{}, nil).Once()
-	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything).Return([]int64{}, nil).Once()
+	mockDB.On("GetDanglingAccountsForFinalDeletionWithRetry", ctx, mock.Anything, mock.Anything).Return([]int64{}, nil).Once()
 
 	require.NoError(t, worker.runOnce(ctx))
 

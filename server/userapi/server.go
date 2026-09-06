@@ -20,6 +20,7 @@ import (
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
 
@@ -35,6 +36,8 @@ type Server struct {
 	allowedHosts               []string
 	rdb                        *resilient.ResilientDatabase
 	storage                    *storage.S3Storage
+	rs3                        *resilient.ResilientS3Storage // storage behind retries + breaker; nil when storage is
+	uploader                   *uploader.UploadWorker
 	cache                      *cache.Cache
 	authCache                  *lookupcache.LookupCache
 	positiveRevalidationWindow time.Duration
@@ -50,16 +53,20 @@ type Server struct {
 
 // ServerOptions holds configuration options for the HTTP Mail API server
 type ServerOptions struct {
-	Name                        string
-	Addr                        string
-	JWTSecret                   string
-	TokenDuration               time.Duration
-	TokenIssuer                 string
-	MaxConnections              int // Max concurrent connections; 0 -> unlimited
-	AllowedOrigins              []string
-	AllowedHosts                []string
-	Storage                     *storage.S3Storage
-	Cache                       *cache.Cache
+	Name           string
+	Addr           string
+	JWTSecret      string
+	TokenDuration  time.Duration
+	TokenIssuer    string
+	MaxConnections int // Max concurrent connections; 0 -> unlimited
+	AllowedOrigins []string
+	AllowedHosts   []string
+	Storage        *storage.S3Storage
+	Cache          *cache.Cache
+	// Uploader is this node's upload worker: bodies not yet in S3 are read from its
+	// staging spool, and its max_attempts tells a body still on its way from one the
+	// worker has given up on (see loadMessageBody). Optional.
+	Uploader                    *uploader.UploadWorker
 	AuthRateLimit               server.AuthRateLimiterConfig
 	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
 	TLS                         bool
@@ -191,7 +198,9 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		allowedHosts:               options.AllowedHosts,
 		rdb:                        rdb,
 		storage:                    options.Storage,
+		rs3:                        newResilientStorage(options.Storage),
 		cache:                      options.Cache,
+		uploader:                   options.Uploader,
 		authCache:                  authCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		authLimiter:                authLimiter,

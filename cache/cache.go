@@ -377,19 +377,33 @@ func (c *Cache) copyAndRemove(src, dst string) error {
 	}
 	defer sourceFile.Close()
 
-	destFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	// Copy to a temporary name and rename: by the time MoveIn runs, the message row
+	// is already marked uploaded, so a reader may open dst at any moment and must
+	// never see it half-written.
+	tmp := dst + ".tmp." + fmt.Sprintf("%d", time.Now().UnixNano())
+	destFile, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create destination file for copy: %w", err)
 	}
-	defer destFile.Close()
-
 	if _, err := io.Copy(destFile, sourceFile); err != nil {
-		os.Remove(dst) // clean up partial file
+		destFile.Close()
+		os.Remove(tmp)
 		return fmt.Errorf("failed to copy file contents: %w", err)
 	}
-
-	destFile.Close()
+	if err := destFile.Sync(); err != nil {
+		destFile.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("failed to fsync copied file: %w", err)
+	}
+	if err := destFile.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
 	sourceFile.Close()
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("failed to move copied file into place: %w", err)
+	}
 
 	_ = os.Remove(src)
 	return nil
@@ -449,6 +463,11 @@ func (c *Cache) Put(contentHash string, data []byte) error {
 	_, err = file.Write(data)
 	if err != nil {
 		return fmt.Errorf("failed to write cache file: %w", err)
+	}
+	// Sync before the rename: a rename without it can, after a crash, leave the final
+	// name pointing at a truncated file, which a reader would serve as the message.
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("failed to fsync cache file: %w", err)
 	}
 	file.Close()
 

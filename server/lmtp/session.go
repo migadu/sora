@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/emersion/go-message"
@@ -167,6 +168,12 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 
 	// Look up account ID by credential address (excluding deleted accounts)
 	AccountID, err := s.backend.rdb.GetActiveAccountIDByAddressWithRetry(readCtx, lookupAddress)
+	if err != nil && errors.Is(err, consts.ErrUserNotFound) && !s.useMasterDB {
+		// "No such user" is a permanent 550 that makes the sender bounce the message,
+		// so it must not be the word of a read replica that has not yet seen the
+		// account. Confirm on the master before bouncing.
+		AccountID, err = s.backend.rdb.GetActiveAccountIDByAddressWithRetry(context.WithValue(ctx, consts.UseMasterDBKey, true), lookupAddress)
+	}
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			// User not found or account deleted - permanent failure
@@ -704,18 +711,34 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	expectedPath := s.backend.uploader.FilePath(contentHash, s.AccountID())
 	var filePath *string
-	if _, err := os.Stat(expectedPath); os.IsNotExist(err) {
-		// File doesn't exist, safe to write
+	if info, err := os.Stat(expectedPath); os.IsNotExist(err) || (err == nil && info.Size() != int64(len(fullMessageBytes))) {
+		// File doesn't exist, or exists with the wrong size (a leftover that never
+		// finished): (re)write it atomically.
 		filePath, err = s.backend.uploader.StoreLocally(contentHash, s.AccountID(), fullMessageBytes)
 		if err != nil {
 			recordMetrics("failure")
+			if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
+				// The spool disk is full or read-only: RFC 3463 4.3.1 "mail system full" is
+				// the reply MTAs understand as "back off, storage", not a server error.
+				s.WarnLog("spool disk cannot take the message", "error", err)
+				return &smtp.SMTPError{
+					Code:         452,
+					EnhancedCode: smtp.EnhancedCode{4, 3, 1},
+					Message:      "Insufficient system storage, please try again later",
+				}
+			}
 			return s.InternalError("failed to save message to disk: %v", err)
 		}
 		s.DebugLog("message accepted locally", "path", *filePath)
 	} else if err == nil {
-		// File already exists (likely being processed by uploader or concurrent duplicate delivery)
-		// Don't overwrite it, and don't set filePath so we won't try to delete it later
+		// File already exists with the right size (being processed by the uploader, or a
+		// concurrent duplicate delivery). Don't overwrite it, and don't set filePath so we
+		// won't try to delete it later. Touch it so the orphan sweep's grace period
+		// counts from now: this delivery's pending upload has not been committed yet.
 		filePath = nil
+		if terr := os.Chtimes(expectedPath, time.Now(), time.Now()); terr != nil {
+			s.DebugLog("could not refresh staged file mtime", "path", expectedPath, "error", terr)
+		}
 		s.DebugLog("message file already exists, skipping write (concurrent delivery)", "path", expectedPath)
 	} else {
 		// Stat error (permission issue, etc.)
@@ -985,12 +1008,17 @@ func (s *LMTPSession) Logout() error {
 	}
 }
 
+// InternalError is the reply for a server-side failure while handling ONE message: a
+// database or spool error, a body that could not be parsed. It is 451 4.3.0, a temporary
+// per-message failure, so the MTA defers this message and carries on with the next on
+// the same connection. It was once 421 4.4.2, which tears the connection down and makes
+// the MTA reconnect for every queued message during any database hiccup.
 func (s *LMTPSession) InternalError(format string, a ...any) error {
 	errorMsg := fmt.Sprintf(format, a...)
 	s.InfoLog("internal error", "message", errorMsg)
 	return &smtp.SMTPError{
-		Code:         421,
-		EnhancedCode: smtp.EnhancedCode{4, 4, 2},
+		Code:         451,
+		EnhancedCode: smtp.EnhancedCode{4, 3, 0},
 		Message:      errorMsg,
 	}
 }

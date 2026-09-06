@@ -116,6 +116,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				m.body_structure, m.recipients_json,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort,
 				m.id AS original_id,
+				m.account_id AS src_account_id, m.s3_domain AS src_s3_domain, m.s3_localpart AS src_s3_localpart,
 				d.new_uid,
 				d.custom_flags_canon
 			FROM messages m
@@ -132,7 +133,14 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 			SELECT
 				$6 AS account_id, content_hash, uploaded, message_id, in_reply_to,
 				subject, sent_date, internal_date, size,
-				body_structure, recipients_json, $7 AS s3_domain, $8 AS s3_localpart,
+				body_structure, recipients_json,
+				-- The S3 key is per row: the body lives under whatever the account's primary
+				-- address was when the source row was written, and readers build their GET
+				-- key from the row. A same-account copy keeps that key; only a copy into
+				-- another account's mailbox is re-keyed to the owner (the caller has copied
+				-- the object under the owner's key first, see server/imap/copy.go).
+				CASE WHEN src_account_id = $6 THEN src_s3_domain ELSE $7 END AS s3_domain,
+				CASE WHEN src_account_id = $6 THEN src_s3_localpart ELSE $8 END AS s3_localpart,
 				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort,
 				$1 AS mailbox_id,
 				$2 AS mailbox_path,
@@ -267,8 +275,11 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	saneMailboxName := helpers.SanitizeUTF8(options.MailboxName)
 
 	if saneMessageID == "" {
-		logger.Info("Database: messageID is empty after sanitization, generating a new one without modifying the message")
-		// Generate a new message ID if not provided
+		logger.Info("Database: messageID is empty after sanitization, generating a synthetic one without modifying the message")
+		// A message without a Message-ID gets a fresh synthetic one per insert: on this
+		// live path (IMAP APPEND) two identical appends are two messages, as clients
+		// expect. Delivery retries are absorbed by delivery_hash, and the importer uses
+		// a content-derived id (InsertMessageFromImporter) so re-runs do not duplicate.
 		saneMessageID = fmt.Sprintf("<%d@%s>", time.Now().UnixNano(), saneMailboxName)
 	}
 
@@ -542,10 +553,16 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 
 	if err != nil {
 		// Check for a unique constraint violation
+		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" && pgErr.ConstraintName == "idx_messages_mailbox_id_uid" {
+			// A preserved UID the mailbox already uses: this message was NOT stored.
+			// Distinct from the "already there" unique violations below, which a caller
+			// may legitimately count as a duplicate and skip.
+			logger.Error("Database: uid conflict, returning error to caller", "message_id", saneMessageID, "mailbox_id", options.MailboxID)
+			return 0, 0, consts.ErrUIDConflict
+		}
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" &&
 			(pgErr.ConstraintName == "messages_message_id_mailbox_id_key" ||
-				pgErr.ConstraintName == "messages_message_id_mailbox_id_active_idx" ||
-				pgErr.ConstraintName == "idx_messages_mailbox_id_uid") {
+				pgErr.ConstraintName == "messages_message_id_mailbox_id_active_idx") {
 			// Unique constraint violation on message_id - message already exists in this mailbox.
 			// The transaction is now in an aborted state and must be rolled back.
 			// We cannot query for the existing message within this transaction.
@@ -567,8 +584,16 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		return 0, 0, consts.ErrDBInsertFailed
 	}
 
-	// Check if content is already uploaded for this account (content deduplication).
-	// If so, mark this message as uploaded immediately without creating a pending_upload.
+	// Check if content is already uploaded for this account UNDER THIS ROW'S KEY (content
+	// deduplication). If so, mark this message as uploaded immediately without creating
+	// a pending_upload.
+	//
+	// The key matters: readers build their GET key from the row's own s3_domain/
+	// s3_localpart, and one account's rows can carry different keys (the primary address
+	// at the time each was written, or the address an import ran under). An uploaded row
+	// under another key proves nothing about this key — deduping against it would mark
+	// this row uploaded with no object behind it (404 NoSuchKey on fetch, served as an
+	// empty body).
 	//
 	// IMPORTANT: Only consider non-expunged messages. Expunged messages may be pending
 	// S3 cleanup — if we dedup against them, the new message gets marked uploaded=TRUE
@@ -580,11 +605,13 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			SELECT 1 FROM messages
 			WHERE content_hash = $1
 			  AND account_id = $2
+			  AND s3_domain = $3
+			  AND s3_localpart = $4
 			  AND uploaded = TRUE
 			  AND expunged_at IS NULL
 			LIMIT 1
 		)
-	`, options.ContentHash, upload.AccountID).Scan(&alreadyUploaded)
+	`, options.ContentHash, upload.AccountID, options.S3Domain, options.S3Localpart).Scan(&alreadyUploaded)
 	if err != nil {
 		logger.Error("Database: failed to check if content already uploaded", "content_hash", upload.ContentHash, "err", err)
 		return 0, 0, consts.ErrDBQueryFailed
@@ -688,9 +715,12 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	saneMailboxName := helpers.SanitizeUTF8(options.MailboxName)
 
 	if saneMessageID == "" {
-		logger.Info("Database: messageID is empty after sanitization, generating a new one without modifying the message")
-		// Generate a new message ID if not provided
-		saneMessageID = fmt.Sprintf("<%d@%s>", time.Now().UnixNano(), saneMailboxName)
+		logger.Info("Database: messageID is empty after sanitization, generating a synthetic one without modifying the message")
+		// A message without a Message-ID gets a synthetic one derived from its content
+		// hash, so the SAME bytes always get the SAME id: the (message_id, content_hash)
+		// duplicate check then still recognizes a re-import or a retried delivery. A
+		// fresh id per attempt made every such message a new one on every run.
+		saneMessageID = syntheticMessageID(options.ContentHash, saneMailboxName)
 	}
 
 	bodyStructureData, err := helpers.SerializeBodyStructureGob(options.BodyStructure)
@@ -937,10 +967,16 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 
 	if err != nil {
 		// Check for a unique constraint violation
+		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" && pgErr.ConstraintName == "idx_messages_mailbox_id_uid" {
+			// A preserved UID the mailbox already uses: this message was NOT stored.
+			// Distinct from the "already there" unique violations below, which a caller
+			// may legitimately count as a duplicate and skip.
+			logger.Error("Database: uid conflict, returning error to caller", "message_id", saneMessageID, "mailbox_id", options.MailboxID)
+			return 0, 0, consts.ErrUIDConflict
+		}
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" &&
 			(pgErr.ConstraintName == "messages_message_id_mailbox_id_key" ||
-				pgErr.ConstraintName == "messages_message_id_mailbox_id_active_idx" ||
-				pgErr.ConstraintName == "idx_messages_mailbox_id_uid") {
+				pgErr.ConstraintName == "messages_message_id_mailbox_id_active_idx") {
 			// Unique constraint violation on message_id - message already exists in this mailbox.
 			// The transaction is now in an aborted state and must be rolled back.
 			// We cannot query for the existing message within this transaction.
@@ -1083,13 +1119,18 @@ func (d *Database) InsertMessagesBatch(
 		saneMessageID := helpers.SanitizeUTF8(opt.MessageID)
 		saneMailboxName := helpers.SanitizeUTF8(opt.MailboxName)
 		if saneMessageID == "" {
-			saneMessageID = fmt.Sprintf("<%d@%s>", time.Now().UnixNano()+int64(i), saneMailboxName)
+			// Deterministic (see InsertMessage): identical bytes get the identical id.
+			saneMessageID = syntheticMessageID(opt.ContentHash, saneMailboxName)
 		}
 
+		// A message that cannot be prepared fails the batch rather than being dropped:
+		// the caller only learns of it through the error (it then retries the batch one
+		// message at a time, where the failure is reported per message). Silently
+		// skipping it here made the caller count it as a duplicate.
 		bodyStructureData, err := helpers.SerializeBodyStructureGob(opt.BodyStructure)
 		if err != nil {
-			logger.Error("Database: failed to serialize BodyStructure in batch", "err", err)
-			continue // Skip this message, but process others
+			logger.Error("Database: failed to serialize BodyStructure in batch", "content_hash", truncateHash(opt.ContentHash), "err", err)
+			return nil, nil, nil, fmt.Errorf("failed to serialize body structure for message %s: %w", truncateHash(opt.ContentHash), err)
 		}
 
 		if opt.InternalDate.IsZero() {
@@ -1107,8 +1148,8 @@ func (d *Database) InsertMessagesBatch(
 
 		recipientsJSON, err := json.Marshal(saneRecipients)
 		if err != nil {
-			logger.Error("Database: failed to marshal recipients in batch", "err", err)
-			continue
+			logger.Error("Database: failed to marshal recipients in batch", "content_hash", truncateHash(opt.ContentHash), "err", err)
+			return nil, nil, nil, fmt.Errorf("failed to marshal recipients for message %s: %w", truncateHash(opt.ContentHash), err)
 		}
 
 		subjectSort := helpers.SanitizeSubjectForSort(opt.Subject)
@@ -1154,8 +1195,8 @@ func (d *Database) InsertMessagesBatch(
 		} else {
 			customKeywordsJSON, err = json.Marshal(customKeywordsToSet)
 			if err != nil {
-				logger.Error("Database: failed to marshal custom keywords in batch", "err", err)
-				continue
+				logger.Error("Database: failed to marshal custom keywords in batch", "content_hash", truncateHash(opt.ContentHash), "err", err)
+				return nil, nil, nil, fmt.Errorf("failed to marshal custom keywords for message %s: %w", truncateHash(opt.ContentHash), err)
 			}
 		}
 
@@ -1237,16 +1278,19 @@ func (d *Database) InsertMessagesBatch(
 		for _, p := range uniqueProcessed {
 			uHashes = append(uHashes, p.Opt.ContentHash)
 		}
+		// Keyed by the full S3 key, not the bare hash: a row is "already uploaded" only
+		// if an uploaded row exists under the SAME s3_domain/s3_localpart (see the
+		// single-message dedup in InsertMessage for why).
 		uRows, err := tx.Query(ctx, `
-			SELECT DISTINCT content_hash FROM messages
+			SELECT DISTINCT content_hash, s3_domain, s3_localpart FROM messages
 			WHERE account_id = $1 AND uploaded = TRUE AND content_hash = ANY($2) AND expunged_at IS NULL
 		`, accountID, uHashes)
 		if err == nil {
 			defer uRows.Close()
 			for uRows.Next() {
-				var hash string
-				if err := uRows.Scan(&hash); err == nil {
-					uploadedHashesSet[hash] = true
+				var hash, domain, localpart string
+				if err := uRows.Scan(&hash, &domain, &localpart); err == nil {
+					uploadedHashesSet[helpers.NewS3Key(domain, localpart, hash)] = true
 				}
 			}
 		}
@@ -1316,7 +1360,7 @@ func (d *Database) InsertMessagesBatch(
 	ftsNow := time.Now()
 
 	for _, p := range uniqueProcessed {
-		uploaded := isImporter || uploadedHashesSet[p.Opt.ContentHash]
+		uploaded := isImporter || uploadedHashesSet[helpers.NewS3Key(p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.ContentHash)]
 
 		batch.Queue(`
 			WITH inserted AS (
@@ -1391,7 +1435,7 @@ func (d *Database) InsertMessagesBatch(
 		insertedUIDs = append(insertedUIDs, p.AssignedUID)
 		insertedHashes = append(insertedHashes, p.Opt.ContentHash)
 
-		uploaded := isImporter || uploadedHashesSet[p.Opt.ContentHash]
+		uploaded := isImporter || uploadedHashesSet[helpers.NewS3Key(p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.ContentHash)]
 		if !uploaded && p.Upload != nil {
 			_, err = br.Exec() // pending_uploads
 			if err != nil {
@@ -1419,4 +1463,17 @@ func (d *Database) InsertMessagesBatch(
 // InsertMessageFromImporterBatch is a wrapper for InsertMessagesBatch tailored for sora-admin import
 func (d *Database) InsertMessagesFromImporterBatch(ctx context.Context, tx pgx.Tx, options []*InsertMessageOptions) ([]int64, []int64, []string, error) {
 	return d.InsertMessagesBatch(ctx, tx, options, nil)
+}
+
+// syntheticMessageID is the Message-ID stored for a message that has none. It is a
+// pure function of the content hash so that the same bytes always get the same id:
+// duplicate detection on (message_id, content_hash) then keeps working for re-imports
+// and retried deliveries, which a per-attempt id (a timestamp) silently defeated —
+// every run inserted such messages again. The mailbox name only serves as a readable
+// domain part.
+func syntheticMessageID(contentHash, mailboxName string) string {
+	if contentHash == "" {
+		contentHash = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("<%s@%s.synthetic.invalid>", contentHash, mailboxName)
 }

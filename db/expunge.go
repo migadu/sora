@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -56,4 +57,25 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID
 
 	logger.Info("Database: successfully expunged messages", "count", rowsAffected, "mailbox_id", mailboxID, "modseq", currentModSeq)
 	return currentModSeq, nil
+}
+
+// ExpungeMessagesByIDs marks the given message rows expunged (two-phase deletion): the
+// rows stay until the cleaner, after the grace period and under its per-object lock,
+// confirms that nothing else references each S3 object and deletes both. Admin tools
+// that want a mailbox emptied use this rather than deleting objects themselves: a
+// message COPY'd into another folder shares the object, and deleting it directly took
+// the other folder's copy with it. Returns how many rows were newly expunged.
+func (db *Database) ExpungeMessagesByIDs(ctx context.Context, tx pgx.Tx, messageIDs []int64) (int64, error) {
+	if len(messageIDs) == 0 {
+		return 0, nil
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE messages
+		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
+		WHERE id = ANY($1) AND expunged_at IS NULL
+	`, messageIDs)
+	if err != nil {
+		return 0, fmt.Errorf("failed to expunge messages by id: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }

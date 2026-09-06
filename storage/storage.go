@@ -180,8 +180,8 @@ func (s *S3Storage) EnableEncryption(encryptionKey string) error {
 }
 
 // Exists checks if an object with the given key exists in the bucket.
-func (s *S3Storage) Exists(key string) (bool, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), s.Timeout)
+func (s *S3Storage) ExistsContext(ctx context.Context, key string) (bool, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
 
 	input := &s3.HeadObjectInput{
@@ -210,9 +210,9 @@ func (s *S3Storage) Exists(key string) (bool, string, error) {
 	return false, "", fmt.Errorf("failed to stat object %s: %w", key, err)
 }
 
-func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
+func (s *S3Storage) PutContext(ctx context.Context, key string, body io.Reader, size int64) error {
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), s.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
 
 	// If encryption is enabled, encrypt the data before uploading
@@ -430,7 +430,7 @@ func (s *S3Storage) GetContext(ctx context.Context, key string) (io.ReadCloser, 
 		if err != nil {
 			metrics.S3OperationDuration.WithLabelValues("GET").Observe(time.Since(start).Seconds())
 			logger.Error("Storage: Decryption failed", "key", key, "encrypted_size", len(encryptedData), "error", err)
-			return nil, fmt.Errorf("failed to decrypt data: %w", err)
+			return nil, fmt.Errorf("%w: failed to decrypt data: %v", ErrCorruptObject, err)
 		}
 
 		if len(decryptedData) == 0 {
@@ -465,9 +465,9 @@ func (r *cancelOnCloseReader) Close() error {
 	return err
 }
 
-func (s *S3Storage) Delete(key string) error {
+func (s *S3Storage) DeleteContext(ctx context.Context, key string) error {
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), s.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
 
 	input := &s3.DeleteObjectInput{
@@ -509,9 +509,9 @@ func (s *S3Storage) Delete(key string) error {
 // DeleteBulk deletes multiple objects in a single S3 API call (up to 1000 objects)
 // Returns a map of key -> error for any objects that failed to delete
 // S3's DeleteObjects API is idempotent - deleting non-existent objects succeeds
-func (s *S3Storage) DeleteBulk(keys []string) map[string]error {
+func (s *S3Storage) DeleteBulkContext(ctx context.Context, keys []string) map[string]error {
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), s.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
 
 	if len(keys) == 0 {
@@ -605,8 +605,8 @@ func contains(s, substr string) bool {
 	return bytes.Contains([]byte(s), []byte(substr))
 }
 
-func (s *S3Storage) Copy(sourcePath, destPath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), s.Timeout)
+func (s *S3Storage) CopyContext(ctx context.Context, sourcePath, destPath string) error {
+	ctx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
 
 	// If encryption is enabled, we need to download, decrypt, and re-upload
@@ -695,4 +695,29 @@ func (s *S3Storage) ListObjects(ctx context.Context, prefix string, recursive bo
 	}()
 
 	return objectCh, errCh
+}
+
+// Context-free variants. Each is bounded only by the configured operation timeout;
+// callers with a request or command context (readers, the uploader, the cleaner) use
+// the *Context form so that a client that gives up, a deadline, or a shutdown ends the
+// request instead of letting it run to the timeout on its own.
+
+func (s *S3Storage) Exists(key string) (bool, string, error) {
+	return s.ExistsContext(context.Background(), key)
+}
+
+func (s *S3Storage) Put(key string, body io.Reader, size int64) error {
+	return s.PutContext(context.Background(), key, body, size)
+}
+
+func (s *S3Storage) Delete(key string) error {
+	return s.DeleteContext(context.Background(), key)
+}
+
+func (s *S3Storage) DeleteBulk(keys []string) map[string]error {
+	return s.DeleteBulkContext(context.Background(), keys)
+}
+
+func (s *S3Storage) Copy(sourcePath, destPath string) error {
+	return s.CopyContext(context.Background(), sourcePath, destPath)
 }

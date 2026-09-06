@@ -11,8 +11,6 @@ import (
 	"strconv"
 
 	"github.com/migadu/sora/consts"
-	"github.com/migadu/sora/helpers"
-	"github.com/migadu/sora/pkg/resilient"
 )
 
 // handleGetMessage retrieves a message in JSON format
@@ -79,60 +77,11 @@ func (s *Server) handleGetMessageBody(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if storage and cache are available
-	if s.storage == nil {
-		s.writeError(w, http.StatusServiceUnavailable, "Storage not configured")
+	// Resolve the body like IMAP/POP3 do (see loadMessageBody).
+	bodyData, status, err := s.loadMessageBody(ctx, message)
+	if status != bodyAvailable {
+		s.writeBodyUnavailable(w, status, err, messageID)
 		return
-	}
-
-	// Retrieve message body from cache or S3
-	var bodyData []byte
-
-	// Try cache first if available
-	if s.cache != nil {
-		bodyData, err = s.cache.Get(message.ContentHash)
-		if err != nil {
-			logger.Debug("HTTP Mail API: Cache miss", "name", s.name, "message_id", messageID, "error", err)
-		}
-	}
-
-	// Fallback to S3 if not in cache
-	if bodyData == nil {
-		// Validate S3 key components before attempting fetch
-		if message.S3Domain == "" || message.S3Localpart == "" || message.ContentHash == "" {
-			logger.Warn("HTTP Mail API: Message missing S3 key information (may be pending upload)",
-				"name", s.name, "message_id", messageID,
-				"has_domain", message.S3Domain != "",
-				"has_localpart", message.S3Localpart != "",
-				"has_hash", message.ContentHash != "")
-			s.writeError(w, http.StatusServiceUnavailable, "Message body not yet available")
-			return
-		}
-
-		s3Key := helpers.NewS3Key(message.S3Domain, message.S3Localpart, message.ContentHash)
-		reader, err := s.storage.Get(s3Key)
-		// Direct (non-retrying) S3 get: record one outcome for the error-rate metric.
-		resilient.RecordS3Operation("GET", err)
-		if err != nil {
-			logger.Warn("HTTP Mail API: Error retrieving message body from S3", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to retrieve message body")
-			return
-		}
-		defer reader.Close()
-
-		bodyData, err = io.ReadAll(reader)
-		if err != nil {
-			logger.Warn("HTTP Mail API: Error reading message body from S3", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to read message body")
-			return
-		}
-
-		// Store in cache for future requests
-		if s.cache != nil {
-			if err := s.cache.Put(message.ContentHash, bodyData); err != nil {
-				logger.Warn("HTTP Mail API: Failed to cache message body", "name", s.name, "error", err)
-			}
-		}
 	}
 
 	// Parse the RFC822 message
@@ -194,60 +143,12 @@ func (s *Server) handleGetMessageRaw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if storage is available
-	if s.storage == nil {
-		s.writeError(w, http.StatusServiceUnavailable, "Storage not configured")
+	// Resolve the body like IMAP/POP3 do: cache, S3 (retried, breaker-guarded), this
+	// node's staging spool, and the pending-upload state for a body still on its way.
+	bodyData, status, err := s.loadMessageBody(ctx, message)
+	if status != bodyAvailable {
+		s.writeBodyUnavailable(w, status, err, messageID)
 		return
-	}
-
-	// Retrieve message body from cache or S3
-	var bodyData []byte
-
-	// Try cache first if available
-	if s.cache != nil {
-		bodyData, err = s.cache.Get(message.ContentHash)
-		if err != nil {
-			logger.Debug("HTTP Mail API: Cache miss", "name", s.name, "message_id", messageID, "error", err)
-		}
-	}
-
-	// Fallback to S3 if not in cache
-	if bodyData == nil {
-		// Validate S3 key components before attempting fetch
-		if message.S3Domain == "" || message.S3Localpart == "" || message.ContentHash == "" {
-			logger.Warn("HTTP Mail API: Message missing S3 key information (may be pending upload)",
-				"name", s.name, "message_id", messageID,
-				"has_domain", message.S3Domain != "",
-				"has_localpart", message.S3Localpart != "",
-				"has_hash", message.ContentHash != "")
-			s.writeError(w, http.StatusServiceUnavailable, "Message not yet available")
-			return
-		}
-
-		s3Key := helpers.NewS3Key(message.S3Domain, message.S3Localpart, message.ContentHash)
-		reader, err := s.storage.Get(s3Key)
-		// Direct (non-retrying) S3 get: record one outcome for the error-rate metric.
-		resilient.RecordS3Operation("GET", err)
-		if err != nil {
-			logger.Warn("HTTP Mail API: Error retrieving message from S3", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to retrieve message")
-			return
-		}
-		defer reader.Close()
-
-		bodyData, err = io.ReadAll(reader)
-		if err != nil {
-			logger.Warn("HTTP Mail API: Error reading message from S3", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to read message")
-			return
-		}
-
-		// Store in cache for future requests
-		if s.cache != nil {
-			if err := s.cache.Put(message.ContentHash, bodyData); err != nil {
-				logger.Warn("HTTP Mail API: Failed to cache message", "name", s.name, "error", err)
-			}
-		}
 	}
 
 	// Return the raw RFC822 message

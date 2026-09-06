@@ -14,6 +14,7 @@ import (
 
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/resilient"
@@ -201,7 +202,10 @@ func TestIMAPBackendLookupCache_PasswordChange(t *testing.T) {
 
 	// Change password in database
 	t.Run("ChangePassword", func(t *testing.T) {
-		newPasswordHash, err := bcrypt.GenerateFromPassword([]byte("newpassword"), bcrypt.DefaultCost)
+		// Hash at the server's own cost: a lower-cost hash makes the next successful
+		// DB auth queue an async rehash, which invalidates the cache entry right after
+		// it was populated and races the cache-hit assertion below.
+		newPasswordHash, err := bcrypt.GenerateFromPassword([]byte("newpassword"), db.BcryptCost)
 		if err != nil {
 			t.Fatalf("Failed to hash new password: %v", err)
 		}

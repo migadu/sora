@@ -893,14 +893,18 @@ func (d *Database) HardDeleteAccounts(ctx context.Context, tx pgx.Tx, accountIDs
 // GetDanglingAccountsForFinalDeletion finds accounts that are marked as deleted and have no
 // messages left. Once all messages (and their corresponding S3 objects) are cleaned up,
 // the account's master record is safe to be permanently removed.
-func (d *Database) GetDanglingAccountsForFinalDeletion(ctx context.Context, limit int) ([]int64, error) {
+func (d *Database) GetDanglingAccountsForFinalDeletion(ctx context.Context, limit int, deletedBefore time.Time) ([]int64, error) {
+	// deletedBefore keeps the grace period: an account with no messages (never used,
+	// or already fully reaped) used to be finalized on the very next tick, so `accounts
+	// restore` could not undo a mistaken delete of an empty account.
 	rows, err := d.GetReadPool().Query(ctx, `
 		SELECT a.id
 		FROM accounts a
 		WHERE a.deleted_at IS NOT NULL
+		AND a.deleted_at < $2
 		AND NOT EXISTS (SELECT 1 FROM messages WHERE account_id = a.id)
 		LIMIT $1
-	`, limit)
+	`, limit, deletedBefore)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query for dangling accounts: %w", err)
 	}
@@ -924,15 +928,39 @@ func (d *Database) FinalizeAccountDeletions(ctx context.Context, tx pgx.Tx, acco
 		return 0, nil
 	}
 
+	// Lock the rows and re-check they are still soft-deleted: `accounts restore` may
+	// have run between the (read-pool) scan and now, and a restored account must not
+	// be finalized. Only the ids that pass go on.
+	rows, err := tx.Query(ctx, "SELECT id FROM accounts WHERE id = ANY($1) AND deleted_at IS NOT NULL FOR UPDATE", accountIDs)
+	if err != nil {
+		return 0, fmt.Errorf("failed to lock accounts for finalization: %w", err)
+	}
+	var confirmed []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("failed to scan account id for finalization: %w", err)
+		}
+		confirmed = append(confirmed, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("failed to read accounts for finalization: %w", err)
+	}
+	if len(confirmed) == 0 {
+		return 0, nil
+	}
+
 	// First, delete credentials associated with the accounts.
-	_, err := tx.Exec(ctx, "DELETE FROM credentials WHERE account_id = ANY($1)", accountIDs)
+	_, err = tx.Exec(ctx, "DELETE FROM credentials WHERE account_id = ANY($1)", confirmed)
 	if err != nil {
 		return 0, fmt.Errorf("failed to batch delete credentials during finalization: %w", err)
 	}
 
 	// Finally, delete the accounts themselves.
 	// The ON DELETE RESTRICT on messages provides a final safety check.
-	result, err := tx.Exec(ctx, "DELETE FROM accounts WHERE id = ANY($1)", accountIDs)
+	result, err := tx.Exec(ctx, "DELETE FROM accounts WHERE id = ANY($1) AND deleted_at IS NOT NULL", confirmed)
 	if err != nil {
 		return 0, fmt.Errorf("failed to finalize batch deletion of accounts: %w", err)
 	}

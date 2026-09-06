@@ -35,6 +35,8 @@ type DBMessage struct {
 	Recipients   []string  `json:"recipients,omitempty"`
 	ContentHash  string    `json:"content_hash"`
 	S3Domain     string    `json:"-"`
+	AccountID    int64     `json:"-"` // owner of the row (the pending-upload key, with ContentHash)
+	Uploaded     bool      `json:"-"` // body is in S3 under S3Domain/S3Localpart/ContentHash
 	S3Localpart  string    `json:"-"`
 }
 
@@ -444,7 +446,7 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 			m.id, m.uid, m.mailbox_id, COALESCE(m.subject, ''), m.sent_date, m.internal_date,
 			m.size, COALESCE(ms.flags, 0), ms.custom_flags, m.message_id, COALESCE(m.in_reply_to, ''), COALESCE(m."references", ''),
 			m.recipients_json, m.content_hash, ms.flags_changed_at, m.s3_domain, m.s3_localpart,
-			mb.name as mailbox_path
+			mb.name as mailbox_path, m.account_id, m.uploaded
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
@@ -462,6 +464,7 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 		&msg.InternalDate, &msg.Size, &flagsBitmask, &customFlagsJSON,
 		&msg.MessageID, &msg.InReplyTo, &msg.References, &recipientsJSON, &msg.ContentHash,
 		&flagsChangedAt, &msg.S3Domain, &msg.S3Localpart, &msg.MailboxPath,
+		&msg.AccountID, &msg.Uploaded,
 	)
 
 	if err != nil {

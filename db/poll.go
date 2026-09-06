@@ -179,15 +179,24 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	// For dense updates, we fall back to a single sequential stream to avoid O(K*N) Postgres load.
 
 	if len(rawUpdates) <= 50 {
+		// The totals the backward counts subtract from are computed ONCE per poll: the
+		// live active count is already in hand (messageCount above), and the client's
+		// pre-poll total is one query. They used to be re-evaluated inside every queued
+		// statement — a full-mailbox COUNT(*) per updated message, so a STORE over 50
+		// recent messages in a 100k mailbox cost every session's next poll ~50 index
+		// scans. Every statement of a batch gets its own READ COMMITTED snapshot anyway,
+		// so hoisting the totals adds no inconsistency the batch did not already have.
+		var clientTotal int
+		clientTotalKnown := false
 		batch := &pgx.Batch{}
 		for _, u := range rawUpdates {
 			if !u.IsExpunge {
 				if uint32(u.UID) > (uidNext / 2) {
 					// Count backwards: TotalActive - COUNT(Active > Target)
 					batch.Queue(`
-						SELECT (SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL) - COUNT(*)::int FROM messages
+						SELECT $3::int - COUNT(*)::int FROM messages
 						WHERE mailbox_id = $1 AND expunged_at IS NULL AND uid > $2
-					`, mailboxID, u.UID)
+					`, mailboxID, u.UID, messageCount)
 				} else {
 					// Count forwards: COUNT(Active <= Target)
 					batch.Queue(`
@@ -205,14 +214,21 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 					// create+expunge-in-window phantoms) out of the count.
 					// ClientTotal = ClientKnownActive + ClientKnownExpungedSince
 					// SeqNum = ClientTotal - COUNT(ClientView AND uid > Target)
+					if !clientTotalKnown {
+						if err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+							SELECT COUNT(*)::int FROM messages
+							WHERE mailbox_id = $1 AND created_modseq <= $2
+							  AND (expunged_at IS NULL OR expunged_modseq > $2)
+						`, mailboxID, sinceModSeq).Scan(&clientTotal); err != nil {
+							return nil, fmt.Errorf("failed to count the client's pre-poll view: %w", err)
+						}
+						clientTotalKnown = true
+					}
 					batch.Queue(`
-						SELECT (
-							(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND created_modseq <= $2 AND expunged_at IS NULL) +
-							(SELECT COUNT(*)::int FROM messages WHERE mailbox_id = $1 AND created_modseq <= $2 AND expunged_at IS NOT NULL AND expunged_modseq > $2)
-						) - COUNT(*)::int
+						SELECT $4::int - COUNT(*)::int
 						FROM messages
 						WHERE mailbox_id = $1 AND created_modseq <= $2 AND (expunged_at IS NULL OR expunged_modseq > $2) AND uid > $3
-					`, mailboxID, sinceModSeq, u.UID)
+					`, mailboxID, sinceModSeq, u.UID, clientTotal)
 				} else {
 					// Expunged forward count: client-view messages (created at/before sinceModSeq,
 					// not yet acked as expunged) with uid <= target.
