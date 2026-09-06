@@ -107,7 +107,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	// the existence check and the copy, and the new message row would point at nothing
 	// (the 404 NoSuchKey hazard the APPEND dedup and IsContentHashUploaded describe).
 	ensureDestObject := func(contentHash, sourceKey, destKey string) error {
-		return s.server.rdb.ExecuteWithS3ObjectSessionLock(ctx, contentHash, destMailbox.AccountID, func() error {
+		return s.server.rdb.ExecuteWithS3ObjectLock(ctx, contentHash, destMailbox.AccountID, func(ctx context.Context) error {
 			exists, err := s.server.s3.ExistsWithRetry(ctx, destKey)
 			if err != nil {
 				s.WarnLog("failed to check if S3 object exists at destination", "destKey", destKey, "error", err)

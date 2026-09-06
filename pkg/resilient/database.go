@@ -151,10 +151,10 @@ type ResilientDatabase struct {
 	// Runtime failover support
 	failoverManager *RuntimeFailoverManager
 
-	// cleanupLockConn holds the session-level cleanup advisory lock for the duration
-	// of a cleanup cycle (AcquireCleanupLockWithRetry / ReleaseCleanupLockWithRetry).
-	cleanupLockMu   sync.Mutex
-	cleanupLockConn *pgxpool.Conn
+	// cleanupLock holds the cluster-wide cleanup advisory lock for the duration of a
+	// cleanup cycle (AcquireCleanupLockWithRetry / ReleaseCleanupLockWithRetry).
+	cleanupLockMu sync.Mutex
+	cleanupLock   *db.AdvisoryLockTx
 
 	// Circuit breakers (per-operation type)
 	queryBreaker *circuitbreaker.CircuitBreaker
@@ -740,6 +740,10 @@ func (rd *ResilientDatabase) Close() {
 		rd.failoverManager.healthCheckWg.Wait()
 		logger.Info("All background goroutines finished", "component", "RESILIENT-FAILOVER")
 
+		// A cleanup cycle still holding its lock has a pooled connection checked out, and
+		// pgxpool.Close waits for every checked-out connection: release it first.
+		_ = rd.ReleaseCleanupLockWithRetry(context.Background())
+
 		// Close all managed pools
 		for _, pool := range rd.failoverManager.writePools {
 			pool.database.Close()
@@ -834,7 +838,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 
 			logger.Info("Creating write pool", "component", "RESILIENT-FAILOVER", "host", host, "index", i, "total", len(config.Write.Hosts))
 
-			pool, err := createDatabasePool(ctx, host, config.Write, config.GetDebug(), "write", runMigrations && isFirstPool, isFirstPool)
+			pool, err := createDatabasePool(ctx, host, config.Write, config.GetDebug(), "write", runMigrations && isFirstPool)
 			if err != nil {
 				logger.Error("Failed to create write pool for host", "component", "RESILIENT-FAILOVER", "host", host, "error", err)
 				continue
@@ -871,8 +875,8 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 		// Attempt all connections in parallel to minimize startup time
 		for _, host := range config.Read.Hosts {
 			go func(h string) {
-				// Never run migrations or acquire lock for read pools.
-				pool, err := createDatabasePool(ctx, h, config.Read, config.GetDebug(), "read", false, false)
+				// Never run migrations for read pools.
+				pool, err := createDatabasePool(ctx, h, config.Read, config.GetDebug(), "read", false)
 				resultChan <- poolResult{host: h, pool: pool, err: err}
 			}(host)
 		}
@@ -941,7 +945,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 }
 
 // createDatabasePool creates a single database connection pool
-func createDatabasePool(ctx context.Context, host string, endpointConfig *config.DatabaseEndpointConfig, logQueries bool, poolType string, runMigrations bool, acquireLock bool) (*db.Database, error) {
+func createDatabasePool(ctx context.Context, host string, endpointConfig *config.DatabaseEndpointConfig, logQueries bool, poolType string, runMigrations bool) (*db.Database, error) {
 	// Create a temporary config for this single host
 	// Note: We use Write endpoint config even for read pools because db.NewDatabaseFromConfig
 	// expects Write to be populated. The actual pool type is tracked by the poolType parameter.
@@ -962,7 +966,7 @@ func createDatabasePool(ctx context.Context, host string, endpointConfig *config
 		PoolTypeOverride: poolType, // Pass the actual pool type for logging
 	}
 
-	database, err := db.NewDatabaseFromConfig(ctx, tempConfig, runMigrations, acquireLock)
+	database, err := db.NewDatabaseFromConfig(ctx, tempConfig, runMigrations)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create %s database pool for %s: %w", poolType, host, err)
 	}
@@ -1299,7 +1303,7 @@ func (rd *ResilientDatabase) attemptReconnectFailedReplicas(ctx context.Context)
 		// Attempt reconnection
 		logger.Info("Attempting to reconnect to read replica", "component", "RESILIENT-FAILOVER", "host", replica.host, "attempt", attemptCount+1)
 
-		pool, err := createDatabasePool(ctx, replica.host, replica.endpointConfig, rd.config.GetDebug(), "read", false, false)
+		pool, err := createDatabasePool(ctx, replica.host, replica.endpointConfig, rd.config.GetDebug(), "read", false)
 
 		replica.mu.Lock()
 		replica.lastAttempt = time.Now()

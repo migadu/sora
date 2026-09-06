@@ -40,17 +40,24 @@ func nullableTime(t time.Time) *time.Time {
 	return &t
 }
 
-// lockHolderState returns the state of the backend holding the session-level advisory
-// lock for lockID, e.g. "idle" or "idle in transaction".
-func lockHolderState(t *testing.T, database *Database, lockID int64) (string, bool) {
+// lockHolder describes the backend holding the advisory lock for a lock id, as
+// pg_stat_activity sees it.
+type lockHolder struct {
+	state   string // e.g. "idle" or "idle in transaction"
+	hasXID  bool   // backend_xid IS NOT NULL: the transaction has written something
+	hasXmin bool   // backend_xmin IS NOT NULL: the backend pins a snapshot, holding back VACUUM
+}
+
+// findLockHolder returns the backend holding the advisory lock for lockID, if any.
+func findLockHolder(t *testing.T, database *Database, lockID int64) (lockHolder, bool) {
 	t.Helper()
 
 	classID := int64(uint64(lockID) >> 32)
 	objID := int64(uint32(uint64(lockID)))
 
-	var state string
+	var holder lockHolder
 	err := database.GetWritePool().QueryRow(context.Background(), `
-		SELECT a.state
+		SELECT a.state, a.backend_xid IS NOT NULL, a.backend_xmin IS NOT NULL
 		FROM pg_locks l
 		JOIN pg_stat_activity a ON a.pid = l.pid
 		WHERE l.locktype = 'advisory'
@@ -58,11 +65,11 @@ func lockHolderState(t *testing.T, database *Database, lockID int64) (string, bo
 		  AND l.objid = $2::bigint::oid
 		  AND l.objsubid = 1
 		  AND l.granted
-	`, classID, objID).Scan(&state)
+	`, classID, objID).Scan(&holder.state, &holder.hasXID, &holder.hasXmin)
 	if err != nil {
-		return "", false
+		return lockHolder{}, false
 	}
-	return state, true
+	return holder, true
 }
 
 // tryLockFromOtherSession reports whether another session can take the object lock,
@@ -91,8 +98,10 @@ func tryLockFromOtherSession(t *testing.T, database *Database, lockID int64) boo
 //     inside the grace period, or a pending upload all disqualify a body),
 //   - the per-object advisory lock — the one the uploader takes around its PUT — is
 //     held for the whole callback and released afterwards,
-//   - the locking session has NO transaction open while the callback runs, so the S3
-//     round trip inside it cannot pin a write transaction,
+//   - the locks are held by an open, otherwise idle, read-only transaction — the one
+//     thing a transaction-pooling proxy cannot move to another backend — that holds
+//     neither an xid nor a snapshot, so the S3 round trip inside the callback holds
+//     back nothing on the database side,
 //   - a body whose lock is already held (an upload in flight) is skipped rather than
 //     deleted.
 func TestExecuteWithLockedS3Orphans(t *testing.T) {
@@ -143,14 +152,15 @@ func TestExecuteWithLockedS3Orphans(t *testing.T) {
 	orphanLockID := GetS3ObjectLockID(accountID, orphanHash)
 
 	var seen []string
-	var holderState string
+	var holder lockHolder
 	var holderFound, lockedDuringCallback bool
-	err = database.ExecuteWithLockedS3Orphans(ctx, candidates, gracePeriod, func(orphans []UserScopedObjectForCleanup) error {
+	err = database.ExecuteWithLockedS3Orphans(ctx, candidates, gracePeriod, func(guarded context.Context, orphans []UserScopedObjectForCleanup) error {
+		require.NoError(t, guarded.Err(), "the guarded context must be live while the locks are held")
 		for _, o := range orphans {
 			seen = append(seen, o.ContentHash)
 		}
 		lockedDuringCallback = !tryLockFromOtherSession(t, database, orphanLockID)
-		holderState, holderFound = lockHolderState(t, database, orphanLockID)
+		holder, holderFound = findLockHolder(t, database, orphanLockID)
 		return nil
 	})
 	require.NoError(t, err)
@@ -164,8 +174,10 @@ func TestExecuteWithLockedS3Orphans(t *testing.T) {
 		"only the body with no live, recently expunged or pending reference may be deleted")
 	assert.True(t, lockedDuringCallback,
 		"the object lock must be held for the whole callback, so an upload cannot race the delete")
-	assert.NotEqual(t, "idle in transaction", holderState,
-		"the S3 delete must not run inside an open write transaction")
+	assert.Equal(t, "idle in transaction", holder.state,
+		"the locks must be held by an open transaction, which is what pins them to one backend through a transaction pooler")
+	assert.False(t, holder.hasXID, "the lock transaction must not have written anything")
+	assert.False(t, holder.hasXmin, "the lock transaction must not pin a snapshot while the S3 round trip runs")
 	assert.True(t, tryLockFromOtherSession(t, database, orphanLockID),
 		"the object lock must be released once the callback returns")
 }

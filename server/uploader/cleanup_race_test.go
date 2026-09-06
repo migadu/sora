@@ -99,10 +99,10 @@ func (m *mockUploaderDB) PendingUploadKeys(ctx context.Context, contentHash stri
 	args := m.Called(ctx, contentHash, accountID)
 	return args.Get(0).([]string), args.Error(1)
 }
-func (m *mockUploaderDB) ExecuteWithS3ObjectSessionLock(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error {
+func (m *mockUploaderDB) ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error {
 	args := m.Called(ctx, contentHash, accountID, executionFunc)
 	if args.Bool(0) {
-		err := executionFunc()
+		err := executionFunc(ctx)
 		if err != nil {
 			return err
 		}
@@ -313,8 +313,8 @@ func TestProcessSingleUpload_S3ExistsButLocalFileMissing_SelfHeals(t *testing.T)
 		Return([]string{helpers.NewS3Key("somedomain.com", "user", contentHash)}, nil)
 
 	// Since we mock S3 existence as true, ExistsWithRetry returns true, but we actually
-	// DO need to simulate the execution of ExecuteWithS3ObjectSessionLock since the uploader runs it.
-	mockDB.On("ExecuteWithS3ObjectSessionLock", mock.Anything, contentHash, accountID, mock.Anything).
+	// DO need to simulate the execution of ExecuteWithS3ObjectLock since the uploader runs it.
+	mockDB.On("ExecuteWithS3ObjectLock", mock.Anything, contentHash, accountID, mock.Anything).
 		Return(true, nil)
 
 	// S3: object already exists (the first uploader attempt PUT it there).

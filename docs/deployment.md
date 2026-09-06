@@ -102,3 +102,25 @@ You will have two different `config.toml` files: one for your proxy nodes and on
 *   Configure the `master_sasl_username` and `master_sasl_password` in the `[servers.imap]` (and other protocols) section to match what the proxy is configured to use.
 *   For improved performance, configure `[database.read]` to point to PostgreSQL read-replicas.
 
+
+## Connection Poolers (PgBouncer)
+
+Sora works behind PgBouncer in any pooling mode, including transaction pooling. Nothing session-scoped is relied on: statement and lock timeouts are applied with `SET LOCAL`, and every advisory lock is transaction-scoped (`pg_advisory_xact_lock`), held in a dedicated transaction that stays open exactly as long as the lock is needed.
+
+Some of those locks span an S3 round trip, so they keep one pooled connection (one server connection behind the pooler) checked out while that round trip runs:
+
+- the uploader's per-object lock: one per in-flight upload, up to `[uploader] concurrency` per node;
+- the cleaner: two on the node running a cycle, the cycle lock for the whole cycle plus the per-batch lock during each S3 delete;
+- IMAP COPY between accounts: one per copy in flight, held across the S3 existence check and copy.
+
+Size the pooler's pool for the write user with that in mind:
+
+```
+pool_size >= nodes × uploader.concurrency + 2 + headroom for interactive writes and cross-account copies
+```
+
+A pool sized only for short IMAP/LMTP transactions queues mail delivery behind slow S3 transfers, most visibly during an S3 outage when uploads sit in retry. Lower `concurrency` or raise the pool.
+
+Sora keeps a held lock transaction alive with a statement at least every minute, so PostgreSQL's `idle_in_transaction_session_timeout` must be well above that. A shorter setting kills the lock holder mid-transfer; the transfer is then abandoned and retried, not lost.
+
+Session-level advisory locks (`pg_advisory_lock`) must never be introduced: through a transaction pooler the lock and its unlock land on different backends, the lock strands until the pooler retires that backend, and enough stranded locks fill PostgreSQL's shared lock table, at which point every session fails with `out of shared memory` (SQLSTATE 53200). A source-scan test (`db.TestNoSessionLevelAdvisoryLocksInProductionCode`) enforces this.

@@ -43,7 +43,11 @@ type UploaderDB interface {
 	// PendingUploadKeys returns the S3 keys that still have to be written before the
 	// account's message rows for this content hash may be marked uploaded.
 	PendingUploadKeys(ctx context.Context, contentHash string, accountID int64) ([]string, error)
-	ExecuteWithS3ObjectSessionLock(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error
+	// ExecuteWithS3ObjectLock runs executionFunc while holding the per-object lock the
+	// cleaner's S3 deletion also takes, so a PUT and a DELETE of the same body never
+	// interleave. The lock costs one pooled connection for the duration of executionFunc,
+	// whose context is cancelled if the lock is lost meanwhile.
+	ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error
 	// CompleteS3UploadWithRetry finalizes the rows whose key is in writtenKeys (or
 	// already has a live uploaded sibling) and drops the pending row once nothing is
 	// left to write. writtenKeys are full S3 keys (domain/localpart/hash).
@@ -653,7 +657,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 			logger.Info("Uploader: Local file missing but content found in S3 - self-healing upload",
 				"hash", upload.ContentHash, "account_id", upload.AccountID)
 
-			err = w.rdb.ExecuteWithS3ObjectSessionLock(ctx, upload.ContentHash, upload.AccountID, func() error {
+			err = w.rdb.ExecuteWithS3ObjectLock(ctx, upload.ContentHash, upload.AccountID, func(ctx context.Context) error {
 				// Use detached background context during shutdown to ensure state consistency
 				dbCtx := ctx
 				if ctx.Err() != nil {
@@ -722,7 +726,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	start := time.Now()
 	var shutdownRequested bool
 
-	err = w.rdb.ExecuteWithS3ObjectSessionLock(ctx, upload.ContentHash, upload.AccountID, func() error {
+	err = w.rdb.ExecuteWithS3ObjectLock(ctx, upload.ContentHash, upload.AccountID, func(ctx context.Context) error {
 		// Capture if shutdown is requested during our execution
 		select {
 		case <-ctx.Done():

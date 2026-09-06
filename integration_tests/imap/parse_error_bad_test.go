@@ -65,6 +65,9 @@ func TestIMAP_MalformedCommandIsBad(t *testing.T) {
 		{"unquoted search term", "A003", `SEARCH HEADER Subject fileinto test`},
 		// Not modified UTF-7.
 		{"invalid mailbox name", "A004", `SELECT "&"`},
+		// A literal size beyond the decoder's sanity bound, refused before any
+		// continuation request.
+		{"oversized literal announcement", "A005", `SELECT {99999999999}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := tagged(tc.tag, tc.cmd)
@@ -78,7 +81,7 @@ func TestIMAP_MalformedCommandIsBad(t *testing.T) {
 	}
 
 	// Control: the well-formed spelling of the same search is accepted.
-	if got := tagged("A005", `SEARCH HEADER Subject "fileinto test"`); !strings.HasPrefix(got, "A005 OK") {
-		t.Errorf("well-formed search: want A005 OK, got %q", got)
+	if got := tagged("A006", `SEARCH HEADER Subject "fileinto test"`); !strings.HasPrefix(got, "A006 OK") {
+		t.Errorf("well-formed search: want A006 OK, got %q", got)
 	}
 }

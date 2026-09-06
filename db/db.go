@@ -27,7 +27,7 @@
 //			Name: "sora_mail_db",
 //		},
 //	}
-//	db, err := NewDatabaseFromConfig(ctx, cfg, true, false)
+//	db, err := NewDatabaseFromConfig(ctx, cfg, true)
 //
 // # Message Operations
 //
@@ -75,7 +75,6 @@ import (
 	pgxv5 "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // For database/sql compatibility
 	"github.com/migadu/sora/config"
@@ -128,7 +127,6 @@ type Database struct {
 	ReadPool                     *pgxpool.Pool    // Read operations pool
 	WriteFailover                *FailoverManager // Failover manager for write operations
 	ReadFailover                 *FailoverManager // Failover manager for read operations
-	lockConn                     *pgxpool.Conn    // Connection holding the advisory lock
 	uidValidityMismatchLoggedMap sync.Map         // Tracks mailbox IDs that have already logged UIDVALIDITY mismatch (mailboxID -> bool)
 	AccountDomainCache           sync.Map         // Cache for account_id -> domain string
 	// Striped locks preventing connection starvation, indexed by mailbox ID (see LockMailbox).
@@ -189,45 +187,6 @@ func (db *Database) GetAccountDomain(ctx context.Context, accountID int64) (stri
 }
 
 func (db *Database) Close() {
-	// Release the advisory lock first, while the connection is still valid.
-	if db.lockConn != nil {
-		// We use a background context with a timeout because the main application
-		// context might have been cancelled during shutdown.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		// Check if the connection is still valid before trying to unlock
-		// This prevents nil pointer dereference if the pool was already closed
-		if db.lockConn.Conn() != nil {
-			var unlocked bool
-			err := db.lockConn.QueryRow(ctx, "SELECT pg_advisory_unlock_shared($1)", consts.SoraAdvisoryLockID).Scan(&unlocked)
-			if err != nil {
-				// Check if this is a connection termination error (expected during shutdown)
-				var pgErr *pgconn.PgError
-				if errors.As(err, &pgErr) && pgErr.Code == "57P01" {
-					// 57P01 = admin_shutdown - connection terminated by administrator
-					// This is expected during graceful shutdown, lock is auto-released
-					logger.Info("Database: advisory lock auto-released (connection terminated during shutdown)")
-				} else {
-					logger.Warn("Database: failed to explicitly release advisory lock (lock may have been auto-released)", "err", err)
-				}
-			} else if unlocked {
-				logger.Info("Database: released shared database advisory lock")
-			} else {
-				logger.Info("Database: advisory lock was not held at time of release (likely auto-released on connection close)")
-			}
-		} else {
-			logger.Info("Database: connection already closed, advisory lock auto-released")
-		}
-
-		// IMPORTANT: Release the connection back to the pool BEFORE closing the pool.
-		// If we use defer, this won't happen until the function exits, causing WritePool.Close()
-		// to hang waiting for this connection to be released.
-		db.lockConn.Release()
-		db.lockConn = nil
-	}
-
-	// Now, close the connection pools.
 	if db.WritePool != nil {
 		db.WritePool.Close()
 	}
@@ -297,29 +256,25 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 	// Only the leader executes migrations. Other instances wait for the leader to finish.
 	// By handling this ourselves, we avoid blocking inside golang-migrate and we don't
 	// put artificial timeouts on the instance that is actively doing work.
-	var isMigrationLeader bool
-
-	// We use the main WritePool to acquire a session-level lock.
-	// The lock will be tied to this specific connection.
-	leaderConn, err := db.WritePool.Acquire(ctx)
+	//
+	// The leader lock is held in an AdvisoryLockTx for as long as the migrations run:
+	// transaction-scoped, so a transaction-pooling proxy cannot strand it on a backend
+	// the release never reaches, and kept alive, so a migration that outlasts
+	// idle_in_transaction_session_timeout does not hand leadership to a second instance
+	// mid-run.
+	leaderLock, err := db.BeginAdvisoryLockTx(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to acquire connection for migration leader election: %w", err)
 	}
+	defer leaderLock.Release()
 
-	var leaderConnReleased bool
-	defer func() {
-		if !leaderConnReleased {
-			if isMigrationLeader {
-				leaderConn.QueryRow(context.Background(), "SELECT pg_advisory_unlock($1)", consts.SoraMigrationLeaderLockID).Scan(nil)
-			}
-			leaderConn.Release()
-			leaderConnReleased = true
-		}
-	}()
-
-	err = leaderConn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", consts.SoraMigrationLeaderLockID).Scan(&isMigrationLeader)
+	isMigrationLeader, err := leaderLock.TryLock(ctx, consts.SoraMigrationLeaderLockID)
 	if err != nil {
 		return fmt.Errorf("failed to try acquiring migration leader lock: %w", err)
+	}
+	if !isMigrationLeader {
+		// Nothing to hold while waiting for the leader; give the connection back now.
+		leaderLock.Release()
 	}
 
 	// FAST PATH: Check current database version BEFORE setting up migration infrastructure.
@@ -451,13 +406,7 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 		return nil
 	}
 
-	// WE ARE NOT THE LEADER.
-	// We release the pooled connection immediately.
-	if !leaderConnReleased {
-		leaderConn.Release()
-		leaderConnReleased = true
-	}
-
+	// WE ARE NOT THE LEADER (the lock transaction was released above).
 	// Wait for the leader to finish.
 	// Since we know another instance is currently migrating, we don't start
 	// any golang-migrate infrastructure which is prone to stalling and deadlocks.
@@ -690,7 +639,7 @@ func (db *Database) checkHostHealth(ctx context.Context, fm *FailoverManager, ho
 }
 
 // NewDatabaseFromConfig creates a new database connection with read/write split configuration
-func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig, runMigrations bool, acquireLock bool) (*Database, error) {
+func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig, runMigrations bool) (*Database, error) {
 	if dbConfig.Write == nil {
 		return nil, fmt.Errorf("write database configuration is required")
 	}
@@ -755,74 +704,6 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 		}
 	}
 
-	if acquireLock {
-		// Acquire and hold an advisory lock to signal that the server is running.
-		logger.Info("Database: attempting to acquire connection from pool for advisory lock", "total", db.WritePool.Stat().TotalConns(), "idle", db.WritePool.Stat().IdleConns(), "acquired", db.WritePool.Stat().AcquiredConns(), "max", db.WritePool.Stat().MaxConns())
-
-		// Use a timeout context for connection acquisition to prevent infinite blocking
-		// if the pool is exhausted or the database is under heavy load during startup
-		acquireCtx, acquireCancel := context.WithTimeout(ctx, 30*time.Second)
-		defer acquireCancel()
-
-		lockConn, err := db.WritePool.Acquire(acquireCtx)
-		if err != nil {
-			db.Close()
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("timeout acquiring connection for advisory lock after 30s (pool may be exhausted or database overloaded): pool stats: total=%d idle=%d acquired=%d max=%d",
-					db.WritePool.Stat().TotalConns(), db.WritePool.Stat().IdleConns(),
-					db.WritePool.Stat().AcquiredConns(), db.WritePool.Stat().MaxConns())
-			}
-			return nil, fmt.Errorf("failed to acquire connection for advisory lock: %w", err)
-		}
-		logger.Info("Database: connection acquired from pool for advisory lock attempt")
-
-		// Use a shared advisory lock. This allows multiple sora instances to run concurrently.
-		// IMPORTANT: pg_try_advisory_lock_shared() returns immediately - it does NOT block.
-		// It returns false ONLY if an EXCLUSIVE lock is held (e.g., by sora-admin migrate).
-		// Multiple instances can hold shared locks simultaneously without any conflict.
-		var lockAcquired bool
-		maxRetries := 30                     // More attempts in case of transient exclusive locks
-		retryDelay := 100 * time.Millisecond // Start with shorter delay
-
-		for attempt := 0; attempt < maxRetries; attempt++ {
-			if attempt > 0 {
-				// Add jitter to prevent thundering herd when multiple instances restart simultaneously
-				jitter := time.Duration(attempt*10) * time.Millisecond
-				actualDelay := retryDelay + jitter
-
-				logger.Info("Database: retrying advisory lock acquisition (previous attempt returned false - exclusive lock held)", "attempt", attempt+1, "max_retries", maxRetries, "delay", actualDelay)
-				time.Sleep(actualDelay)
-
-				// Slower exponential backoff for shared locks (1.5x instead of 2x)
-				retryDelay = time.Duration(float64(retryDelay) * 1.5)
-				if retryDelay > 2*time.Second {
-					retryDelay = 2 * time.Second // Lower cap since shared locks don't conflict
-				}
-			}
-
-			err = lockConn.QueryRow(ctx, "SELECT pg_try_advisory_lock_shared($1)", consts.SoraAdvisoryLockID).Scan(&lockAcquired)
-			if err != nil {
-				lockConn.Release()
-				db.Close()
-				return nil, fmt.Errorf("failed to execute advisory lock query: %w", err)
-			}
-
-			if lockAcquired {
-				logger.Info("Database: acquired shared database advisory lock", "lock_id", consts.SoraAdvisoryLockID)
-				db.lockConn = lockConn // Store the *pgxpool.Conn
-				break
-			}
-
-			// Lock not acquired means an exclusive lock is currently held
-			logger.Warn("Database: shared advisory lock not available - exclusive lock held by another process (possibly sora-admin migrate)", "attempt", attempt+1, "max_retries", maxRetries)
-		}
-
-		if !lockAcquired {
-			lockConn.Release()
-			db.Close()
-			return nil, fmt.Errorf("could not acquire shared database lock (ID: %d) after %d attempts. An exclusive lock is being held (possibly by sora-admin migrate or another admin tool)", consts.SoraAdvisoryLockID, maxRetries)
-		}
-	}
 	return db, nil
 }
 

@@ -14,60 +14,59 @@ import (
 // ExecuteWithLockedS3Orphans holds the per-object advisory locks for objects and runs
 // fn with the subset that is still orphaned. Deliberately not wrapped in a retry: fn
 // performs the S3 deletion, which a database-level retry would replay.
-func (rd *ResilientDatabase) ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(orphans []db.UserScopedObjectForCleanup) error) error {
+func (rd *ResilientDatabase) ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error {
 	return rd.getOperationalDatabaseForOperation(ctx, true).ExecuteWithLockedS3Orphans(ctx, objects, gracePeriod, fn)
 }
 
 // AcquireCleanupLockWithRetry takes the cluster-wide cleanup lock for the duration of a
 // cleanup cycle, or reports false when another node holds it.
 //
-// It is a SESSION-level advisory lock on a dedicated connection, held until
-// ReleaseCleanupLockWithRetry. It was once a transaction-level lock taken inside a
-// wrapper that committed immediately — released before the cycle even started, so every
-// node ran the full cycle every wake (N× the candidate scans, lock_timeout noise from
-// contending on the same mailbox rows, duplicated reaping work). The dedicated connection
-// is the same pattern the per-object S3 lock uses (ExecuteWithS3ObjectSessionLock).
+// It is held in a db.AdvisoryLockTx until ReleaseCleanupLockWithRetry: transaction-
+// scoped, in a dedicated transaction that stays open (and is kept alive) for the whole
+// cycle. It was once a transaction-level lock taken inside a wrapper that committed
+// immediately — released before the cycle even started, so every node ran the full
+// cycle every wake (N× the candidate scans, lock_timeout noise from contending on the
+// same mailbox rows, duplicated reaping work) — and then a session-level lock on a
+// pooled connection, which a transaction-pooling proxy strands on a backend the unlock
+// never reaches (see db.AdvisoryLockTx).
 func (rd *ResilientDatabase) AcquireCleanupLockWithRetry(ctx context.Context) (bool, error) {
 	rd.cleanupLockMu.Lock()
 	defer rd.cleanupLockMu.Unlock()
-	if rd.cleanupLockConn != nil {
+	if rd.cleanupLock != nil {
 		return false, fmt.Errorf("cleanup lock is already held by this process")
 	}
 
-	pool := rd.getOperationalDatabaseForOperation(ctx, true).GetWritePool()
 	lockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	conn, err := pool.Acquire(lockCtx)
+	lock, err := rd.getOperationalDatabaseForOperation(ctx, true).BeginAdvisoryLockTx(lockCtx)
 	if err != nil {
 		return false, err
 	}
-	var acquired bool
-	if err := conn.QueryRow(lockCtx, "SELECT pg_try_advisory_lock($1)", db.CLEANUP_ADVISORY_LOCK_ID).Scan(&acquired); err != nil {
-		conn.Release()
+	acquired, err := lock.TryLock(lockCtx, db.CLEANUP_ADVISORY_LOCK_ID)
+	if err != nil {
+		lock.Release()
 		return false, fmt.Errorf("failed to try the cleanup advisory lock: %w", err)
 	}
 	if !acquired {
-		conn.Release()
+		lock.Release()
 		return false, nil
 	}
-	rd.cleanupLockConn = conn
+	rd.cleanupLock = lock
 	return true, nil
 }
 
 // ReleaseCleanupLockWithRetry releases the cleanup lock taken by
-// AcquireCleanupLockWithRetry and returns its connection to the pool. It uses a
-// detached context so the unlock happens even when the cycle's context is gone.
+// AcquireCleanupLockWithRetry and returns its connection to the pool. The release runs
+// on a detached context, so it happens even when the cycle's context is gone.
 func (rd *ResilientDatabase) ReleaseCleanupLockWithRetry(ctx context.Context) error {
 	rd.cleanupLockMu.Lock()
-	conn := rd.cleanupLockConn
-	rd.cleanupLockConn = nil
+	lock := rd.cleanupLock
+	rd.cleanupLock = nil
 	rd.cleanupLockMu.Unlock()
-	if conn == nil {
-		return nil
+	if lock != nil {
+		lock.Release()
 	}
-	defer conn.Release()
-	_, err := conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", db.CLEANUP_ADVISORY_LOCK_ID)
-	return err
+	return nil
 }
 
 func (rd *ResilientDatabase) GetStrandedUploadInstancesWithRetry(ctx context.Context, maxAttempts int, livenessThreshold time.Duration) ([]db.StrandedUploadInstance, error) {

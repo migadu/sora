@@ -35,7 +35,7 @@ func setupTestDatabaseWithMaxConns(t testing.TB, maxConns int) *Database {
 		},
 	}
 
-	database, err := NewDatabaseFromConfig(ctx, dbConfig, true, true)
+	database, err := NewDatabaseFromConfig(ctx, dbConfig, true)
 	require.NoError(t, err)
 
 	return database

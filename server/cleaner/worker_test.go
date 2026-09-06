@@ -72,13 +72,13 @@ func (m *mockDatabase) GetUserScopedObjectsForCleanupWithRetry(ctx context.Conte
 	args := m.Called(ctx, gracePeriod, limit)
 	return args.Get(0).([]db.UserScopedObjectForCleanup), args.Error(1)
 }
-func (m *mockDatabase) ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(orphans []db.UserScopedObjectForCleanup) error) error {
+func (m *mockDatabase) ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error {
 	args := m.Called(ctx, objects, gracePeriod)
 	orphans, _ := args.Get(0).([]db.UserScopedObjectForCleanup)
 	if err := args.Error(1); err != nil {
 		return err
 	}
-	return fn(orphans)
+	return fn(ctx, orphans)
 }
 func (m *mockDatabase) DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error) {
 	args := m.Called(ctx, objects)

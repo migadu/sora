@@ -23,7 +23,7 @@ type mockDB struct {
 	AcquireAndLeasePendingUploadsWithRetryFunc func(ctx context.Context, instanceID string, batchSize int, retryInterval time.Duration, maxAttempts int) ([]db.PendingUpload, error)
 	MarkUploadAttemptWithRetryFunc             func(ctx context.Context, contentHash string, accountID int64) error
 	PendingUploadKeysFunc                      func(ctx context.Context, contentHash string, accountID int64) ([]string, error)
-	ExecuteWithS3ObjectSessionLockFunc         func(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error
+	ExecuteWithS3ObjectLockFunc                func(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error
 	CompleteS3UploadWithRetryFunc              func(ctx context.Context, contentHash string, accountID int64, writtenKeys []string) error
 	ExistingPendingUploadsFunc                 func(ctx context.Context, accountID int64, contentHashes []string) (map[string]struct{}, error)
 	GetFailedUploadsWithRetryFunc              func(ctx context.Context, maxAttempts int, limit int) ([]db.PendingUpload, error)
@@ -53,12 +53,12 @@ func (m *mockDB) CompleteS3UploadWithRetry(ctx context.Context, contentHash stri
 	return m.CompleteS3UploadWithRetryFunc(ctx, contentHash, accountID, writtenKeys)
 }
 
-func (m *mockDB) ExecuteWithS3ObjectSessionLock(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error {
-	if m.ExecuteWithS3ObjectSessionLockFunc != nil {
-		return m.ExecuteWithS3ObjectSessionLockFunc(ctx, contentHash, accountID, executionFunc)
+func (m *mockDB) ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error {
+	if m.ExecuteWithS3ObjectLockFunc != nil {
+		return m.ExecuteWithS3ObjectLockFunc(ctx, contentHash, accountID, executionFunc)
 	}
 	// Fallback behavior: just execute the operation
-	err := executionFunc()
+	err := executionFunc(ctx)
 	if err != nil {
 		return err
 	}

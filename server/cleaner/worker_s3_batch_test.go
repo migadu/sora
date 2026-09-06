@@ -18,8 +18,9 @@ import (
 //   - ExecuteS3DeleteTxWithRetry invokes the caller's S3 delete from inside an open
 //     write transaction (pkg/resilient/cleanup_operations.go runs s3DeleteFunc between
 //     BEGIN and COMMIT), so the probe marks a transaction open around it.
-//   - ExecuteWithLockedS3Orphans holds only the per-object advisory locks on a
-//     dedicated session, with no transaction open while the callback runs.
+//   - ExecuteWithLockedS3Orphans holds only the per-object advisory locks, in a
+//     dedicated lock transaction (db.AdvisoryLockTx) that idles while the callback
+//     runs and holds no write transaction, xid or snapshot.
 //
 // Everything else is delegated to the testify mockDatabase from worker_test.go.
 type s3ProbeDatabase struct {
@@ -38,9 +39,9 @@ func (d *s3ProbeDatabase) holdingLocks() bool {
 	return d.locksHeld > 0
 }
 
-func (d *s3ProbeDatabase) ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(orphans []db.UserScopedObjectForCleanup) error) error {
-	// Models the real contract: the per-object advisory locks are held on a dedicated
-	// session for the duration of fn, and no transaction is open while it runs.
+func (d *s3ProbeDatabase) ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error {
+	// Models the real contract: the per-object advisory locks are held in a dedicated
+	// lock transaction for the duration of fn, and no write transaction is open.
 	d.mu.Lock()
 	d.locksHeld++
 	d.mu.Unlock()
@@ -49,7 +50,7 @@ func (d *s3ProbeDatabase) ExecuteWithLockedS3Orphans(ctx context.Context, object
 		d.locksHeld--
 		d.mu.Unlock()
 	}()
-	return fn(objects)
+	return fn(ctx, objects)
 }
 
 func (d *s3ProbeDatabase) DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error) {
@@ -95,10 +96,10 @@ func (s *s3ProbeStorage) DeleteBulkWithRetry(ctx context.Context, keys []string)
 // TestCleanupWorker_S3DeletesAreBatchedAndOutsideTransactions pins the two properties
 // the cleaner's S3 deletion path must have:
 //
-//  1. Every S3 delete happens inside the advisory-lock window, on a dedicated session
-//     with no transaction open. The lock is what keeps the delete from racing an
-//     uploader PUT for the same object; holding it via a transaction instead would park
-//     a pool connection and its locks for the length of a network round trip.
+//  1. Every S3 delete happens inside the advisory-lock window, in a dedicated lock
+//     transaction with no write transaction open. The lock is what keeps the delete
+//     from racing an uploader PUT for the same object; the lock transaction pins one
+//     pool connection for the round trip, but no write, xid or snapshot.
 //  2. A batch of candidates costs one S3 request, not one request per object.
 //
 // The lock-window assertion is checked against the callback the cleaner actually uses,

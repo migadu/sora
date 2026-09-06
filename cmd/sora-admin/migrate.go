@@ -146,10 +146,9 @@ func handleMigrateVersion(ctx context.Context) {
 	}
 	fs.Parse(os.Args[3:])
 
-	// Query schema_migrations directly instead of using golang-migrate's m.Version(),
-	// which acquires an exclusive advisory lock. This allows checking the version
-	// while sora instances are running (they hold shared advisory locks that would
-	// block an exclusive lock acquisition).
+	// Query schema_migrations directly instead of going through golang-migrate, whose
+	// driver takes its own advisory lock. Checking the version must stay a plain read
+	// that is safe while sora instances are running.
 	dbCfg := globalConfig.Database.Write
 	if dbCfg == nil || len(dbCfg.Hosts) == 0 {
 		logger.Fatalf("Write database configuration is missing or has no hosts")

@@ -2,6 +2,7 @@ package resilient
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -11,36 +12,43 @@ import (
 
 // --- Uploader Worker Wrappers ---
 
-// ExecuteWithS3ObjectSessionLock uses a session-level advisory lock via a dedicated DB connection.
-// This allows the lock (and execution) to happen safely over long-running operations (like S3 transfers)
-// without holding open a PostgreSQL transaction, entirely avoiding database bloat and vacuum blockages.
-func (rd *ResilientDatabase) ExecuteWithS3ObjectSessionLock(ctx context.Context, contentHash string, accountID int64, executionFunc func() error) error {
-	pool := rd.getOperationalDatabaseForOperation(ctx, true).GetWritePool()
-
-	// Use a 30s timeout purely for acquiring the connection and the lock
+// ExecuteWithS3ObjectLock runs executionFunc while holding the per-object advisory lock
+// that the cleaner's S3 deletion takes as well (db.GetS3ObjectLockID). The lock is held
+// in a db.AdvisoryLockTx for exactly the duration of executionFunc: transaction-scoped,
+// so it is released with its backend whatever pooler the write pool goes through, and
+// held in a transaction that is otherwise idle and read-only, so the S3 transfer inside
+// executionFunc pins one pooled connection but no write transaction, snapshot or xid.
+// It waits for a current holder (a cleaner batch confirming this object is an orphan)
+// for at most 30 seconds.
+//
+// executionFunc runs under a context that is cancelled if the lock is lost meanwhile
+// (the backend died, a failover, a failed keepalive), so the S3 transfer stops rather
+// than finishing unprotected; a loss noticed only after it returned is reported as an
+// error.
+func (rd *ResilientDatabase) ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error {
+	// Bounds acquiring the connection and waiting for the lock, not executionFunc.
 	lockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	conn, err := pool.Acquire(lockCtx)
+	lock, err := rd.getOperationalDatabaseForOperation(ctx, true).BeginAdvisoryLockTx(lockCtx)
 	if err != nil {
 		return err
 	}
-	defer conn.Release()
+	defer lock.Release()
 
-	lockID := db.GetS3ObjectLockID(accountID, contentHash)
-	_, err = conn.Exec(lockCtx, "SELECT pg_advisory_lock($1)", lockID)
-	if err != nil {
+	if err := lock.Lock(lockCtx, db.GetS3ObjectLockID(accountID, contentHash)); err != nil {
 		return err // Could not acquire lock or context was canceled
 	}
 
-	defer func() {
-		// Use a detached background context to absolutely guarantee the unlock fires
-		// even if the incoming context is canceled or expired.
-		_, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", lockID)
-	}()
-
-	// Execute the operation
-	return executionFunc()
+	guarded, done := lock.Guard(ctx)
+	defer done()
+	if err := executionFunc(guarded); err != nil {
+		return err
+	}
+	if err := lock.Err(); err != nil {
+		return fmt.Errorf("S3 object lock was lost while the guarded work ran: %w", err)
+	}
+	return nil
 }
 
 func (rd *ResilientDatabase) AcquireAndLeasePendingUploadsWithRetry(ctx context.Context, instanceId string, limit int, retryInterval time.Duration, maxAttempts int) ([]db.PendingUpload, error) {

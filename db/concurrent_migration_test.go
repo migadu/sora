@@ -51,7 +51,7 @@ func resetMigrationState(t *testing.T, targetVersion int) {
 	// migrate() timeout. Using setupTestDatabase / NewDatabaseFromConfig with
 	// runMigrations=true would hit the dirty-state guard and fail before we
 	// can clean anything up.
-	database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(), false, false)
+	database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(), false)
 	if err != nil {
 		t.Fatalf("resetMigrationState: connect to DB: %v", err)
 	}
@@ -415,7 +415,7 @@ func TestMigrateTimeoutCoversWithInstance(t *testing.T) {
 	resetMigrationState(t, 11)
 	t.Cleanup(func() { resetMigrationState(t, 11) })
 
-	db, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(), false, false)
+	db, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(), false)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -501,7 +501,7 @@ func TestNewDatabaseFromConfigConcurrentIdempotent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-gate
-			db, err := NewDatabaseFromConfig(context.Background(), makeTestDBConfig(), true, false)
+			db, err := NewDatabaseFromConfig(context.Background(), makeTestDBConfig(), true)
 			results[i] = result{db: db, err: err}
 		}()
 	}

@@ -60,7 +60,9 @@ type DatabaseManager interface {
 	CleanupOldRedirectsWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error)
 	CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
-	ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(orphans []db.UserScopedObjectForCleanup) error) error
+	// ExecuteWithLockedS3Orphans runs fn with the objects that are still orphans while
+	// holding their per-object locks; fn's context is cancelled if the locks are lost.
+	ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error
 	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
 	PruneOldMessageVectorsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUnusedFTSHashesWithRetry(ctx context.Context, limit int) ([]string, error)
@@ -256,7 +258,7 @@ func (w *CleanupWorker) deleteS3Objects(ctx context.Context, candidates []db.Use
 		// The advisory locks are held for the whole callback: the orphan re-check, the
 		// S3 delete and the row delete all see the same "nothing references this body"
 		// verdict, and an uploader cannot slip a PUT in between.
-		err := w.rdb.ExecuteWithLockedS3Orphans(ctx, batch, w.gracePeriod, func(orphans []db.UserScopedObjectForCleanup) error {
+		err := w.rdb.ExecuteWithLockedS3Orphans(ctx, batch, w.gracePeriod, func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error {
 			if skipped := len(batch) - len(orphans); skipped > 0 {
 				logger.Info("Cleanup: objects are no longer orphans or are being uploaded, skipping S3 deletion", "count", skipped)
 			}

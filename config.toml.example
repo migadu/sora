@@ -68,7 +68,13 @@ lock_timeout = "10s"            # Max time a write statement waits for a row loc
                                 # ignore_startup_parameters change is needed. If you'd prefer zero per-transaction
                                 # overhead, set this to "0" and apply the bound globally on the database role instead:
                                 #   ALTER ROLE sora SET lock_timeout = '10s';
-migration_timeout = "2m"        # Timeout for auto-migrations at startup. When multiple instances start simultaneously,
+                                # Sora keeps no session state on its connections: timeouts are SET LOCAL and every
+                                # advisory lock is transaction-scoped, so any PgBouncer pool_mode works. Locks that
+                                # span an S3 round trip (uploader, cleaner, cross-account IMAP COPY) hold their
+                                # transaction open for its duration and keep it alive at least every minute, so
+                                # idle_in_transaction_session_timeout must be well above that. See [uploader]
+                                # concurrency for sizing a pooler's pool.
+migration_timeout = "2m"      # Timeout for auto-migrations at startup. When multiple instances start simultaneously,
                                 # one will run migrations while others wait. If timeout is reached, the instance will
                                 # verify migrations are complete before continuing. Default: "2m" (2 minutes).
 
@@ -576,7 +582,11 @@ path = "/sora/uploads"    # Filesystem path for staging uploads (temporary stora
                               # uploads — stop delivery and drain pending_uploads for the old id
                               # before restarting under a new one.
 batch_size = 20               # Number of messages batched together per upload operation.
-concurrency = 10              # Number of concurrent upload workers.
+concurrency = 10              # Number of concurrent upload workers. Each in-flight upload holds one database
+                              # connection (one server connection behind a pooler such as PgBouncer) for the
+                              # duration of its S3 transfer, so size the pooler's pool for at least
+                              # nodes x concurrency + 2 (the cleaner's cycle and batch locks) on top of
+                              # interactive traffic, including cross-account IMAP COPY.
 max_attempts = 5              # Attempts after which an upload is parked ("failed", needs sora-admin uploader resolve).
                               # Only evidence about the content counts: an empty or size-mismatched staging file,
                               # or a file missing while S3 reports the object absent. Provider errors (any HTTP

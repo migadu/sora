@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/migadu/sora/logger"
 )
 
@@ -104,26 +103,33 @@ func (d *Database) IsS3ObjectOrphan(ctx context.Context, tx pgx.Tx, accountID in
 	return isOrphan, err
 }
 
-// s3ObjectLockTimeout bounds acquiring the dedicated connection and taking the
-// per-object advisory locks on it. The locks themselves are never waited for.
+// s3ObjectLockTimeout bounds opening the lock transaction and taking the per-object
+// advisory locks in it, and separately the orphan re-check that follows. The locks
+// themselves are never waited for.
 const s3ObjectLockTimeout = 30 * time.Second
 
 // ExecuteWithLockedS3Orphans runs fn with the subset of objects that are still orphans,
-// while holding their per-object advisory locks on one dedicated session connection.
+// while holding their per-object advisory locks in one dedicated lock transaction.
 //
 // It is the same lock the uploader holds across its S3 PUT and the DB finalization
-// (GetS3ObjectLockID, see resilient.ExecuteWithS3ObjectSessionLock), so holding it
-// across the orphan re-check and the caller's S3 DELETE is what stops a delete from
-// racing an upload of the same body. The lock is session-scoped rather than
-// transaction-scoped precisely so the caller's S3 round trip — and the retry backoff
-// hiding inside it — does not run inside an open write transaction, pinning a pool
-// connection and its locks for the length of a network operation.
+// (GetS3ObjectLockID, see resilient.ExecuteWithS3ObjectLock), so holding it across the
+// orphan re-check and the caller's S3 DELETE is what stops a delete from racing an
+// upload of the same body. The locks live in an AdvisoryLockTx: transaction-scoped, so
+// they cannot outlive their backend whatever pooler sits between Sora and PostgreSQL,
+// and held in a transaction that is otherwise idle and read-only, so the caller's S3
+// round trip — and the retry backoff hiding inside it — pins one pooled connection but
+// no write transaction, snapshot or xid.
 //
-// Locks are taken with pg_try_advisory_lock and an object whose lock is held is left
-// out of this cycle: a held lock means an uploader is writing that body right now, so
-// it is not an orphan at all. Never waiting also means this cannot deadlock against the
-// uploader, whatever order the batch happens to be in.
-func (d *Database) ExecuteWithLockedS3Orphans(ctx context.Context, objects []UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(orphans []UserScopedObjectForCleanup) error) error {
+// Locks are try-locks, and an object whose lock is held is left out of this cycle: a
+// held lock means an uploader is writing that body right now, so it is not an orphan at
+// all. Never waiting also means this cannot deadlock against the uploader, whatever
+// order the batch happens to be in.
+//
+// fn runs under a context that is cancelled if the locks are lost meanwhile (the
+// backend died, a failover, a failed keepalive), so its S3 delete stops rather than
+// landing after a fresh upload of the same body; a loss noticed only after fn returned
+// is reported as an error.
+func (d *Database) ExecuteWithLockedS3Orphans(ctx context.Context, objects []UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []UserScopedObjectForCleanup) error) error {
 	if len(objects) == 0 {
 		return nil
 	}
@@ -131,64 +137,61 @@ func (d *Database) ExecuteWithLockedS3Orphans(ctx context.Context, objects []Use
 	lockCtx, cancel := context.WithTimeout(ctx, s3ObjectLockTimeout)
 	defer cancel()
 
-	conn, err := d.GetWritePool().Acquire(lockCtx)
+	locks, err := d.BeginAdvisoryLockTx(lockCtx)
 	if err != nil {
-		return fmt.Errorf("failed to acquire connection for S3 object locks: %w", err)
+		return fmt.Errorf("failed to lock S3 objects for cleanup: %w", err)
 	}
-	defer conn.Release()
+	// Ends the transaction, and with it every lock, however fn returns.
+	defer locks.Release()
 
 	lockIDs := make([]int64, len(objects))
 	for i, o := range objects {
 		lockIDs[i] = GetS3ObjectLockID(o.AccountID, o.ContentHash)
 	}
-
-	rows, err := conn.Query(lockCtx, `SELECT pg_try_advisory_lock(id) FROM unnest($1::bigint[]) AS t(id)`, lockIDs)
+	acquired, err := locks.TryLockAll(lockCtx, lockIDs)
 	if err != nil {
 		return fmt.Errorf("failed to lock S3 objects for cleanup: %w", err)
 	}
-	acquired, err := pgx.CollectRows(rows, pgx.RowTo[bool])
-	if err != nil {
-		return fmt.Errorf("failed to lock S3 objects for cleanup: %w", err)
-	}
-	if len(acquired) != len(objects) {
-		return fmt.Errorf("failed to lock S3 objects for cleanup: got %d lock results for %d objects", len(acquired), len(objects))
-	}
 
-	// unnest preserves array order, so acquired[i] belongs to objects[i]. The same body
-	// can appear twice under two addresses; that stacks the advisory lock, so every id
-	// is released exactly as many times as it was taken.
+	// unnest preserves array order, so acquired[i] belongs to objects[i].
 	locked := make([]UserScopedObjectForCleanup, 0, len(objects))
-	heldIDs := make([]int64, 0, len(objects))
 	for i, ok := range acquired {
 		if ok {
 			locked = append(locked, objects[i])
-			heldIDs = append(heldIDs, lockIDs[i])
 		}
 	}
-	defer func() {
-		// Detached context: the unlock must fire even if the caller's context expired.
-		if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock(id) FROM unnest($1::bigint[]) AS t(id)`, heldIDs); err != nil {
-			// A session that may still hold these locks must not go back into the pool,
-			// or those objects would be skipped by every future cleanup cycle.
-			logger.Error("failed to release S3 object locks - discarding connection", "count", len(heldIDs), "err", err)
-			conn.Conn().Close(context.Background())
-		}
-	}()
 
-	orphans, err := d.filterS3Orphans(lockCtx, conn, locked, gracePeriod)
-	if err != nil {
+	// The re-check runs on the lock transaction itself: it reads the primary, and its
+	// success is the proof that the locks are still held as fn starts. It gets its own
+	// budget rather than what acquiring the locks left of lockCtx.
+	filterCtx, cancelFilter := context.WithTimeout(ctx, s3ObjectLockTimeout)
+	defer cancelFilter()
+	var orphans []UserScopedObjectForCleanup
+	if err := locks.run(filterCtx, func(ctx context.Context, tx pgx.Tx) error {
+		var filterErr error
+		orphans, filterErr = d.filterS3Orphans(ctx, tx, locked, gracePeriod)
+		return filterErr
+	}); err != nil {
 		return err
 	}
 
-	return fn(orphans)
+	guarded, done := locks.Guard(ctx)
+	defer done()
+	if err := fn(guarded, orphans); err != nil {
+		return err
+	}
+	if err := locks.Err(); err != nil {
+		return fmt.Errorf("S3 object locks were lost while the cleanup batch ran: %w", err)
+	}
+	return nil
 }
 
 // filterS3Orphans returns the objects that are still orphans: no active message, none
 // expunged within the grace period, and no pending upload. It is the batched form of
-// IsS3ObjectOrphan and runs on the connection that holds the locks, so it reads the
+// IsS3ObjectOrphan and runs on the transaction that holds the locks, so it reads the
 // primary — a lagging replica could report a body as unreferenced after a new message
 // already claimed it.
-func (d *Database) filterS3Orphans(ctx context.Context, conn *pgxpool.Conn, objects []UserScopedObjectForCleanup, gracePeriod time.Duration) ([]UserScopedObjectForCleanup, error) {
+func (d *Database) filterS3Orphans(ctx context.Context, tx pgx.Tx, objects []UserScopedObjectForCleanup, gracePeriod time.Duration) ([]UserScopedObjectForCleanup, error) {
 	if len(objects) == 0 {
 		return nil, nil
 	}
@@ -202,7 +205,9 @@ func (d *Database) filterS3Orphans(ctx context.Context, conn *pgxpool.Conn, obje
 		contentHashes[i] = o.ContentHash
 	}
 
-	rows, err := conn.Query(ctx, `
+	// Simple protocol: on the lock transaction no portal, and so no snapshot, may
+	// outlive this statement (see AdvisoryLockTx).
+	rows, err := tx.Query(ctx, `
 		SELECT DISTINCT c.account_id, c.content_hash
 		FROM unnest($1::bigint[], $2::text[]) AS c(account_id, content_hash)
 		WHERE NOT EXISTS (
