@@ -877,6 +877,7 @@ type CommandTimeoutsConfig struct {
 	Store       string `toml:"store,omitempty"`        // STORE timeout (default: "15s")
 	Copy        string `toml:"copy,omitempty"`         // COPY timeout (default: "30s")
 	Move        string `toml:"move,omitempty"`         // MOVE timeout (default: "30s")
+	Rename      string `toml:"rename,omitempty"`       // RENAME timeout (default: "60s")
 }
 
 // ManageSieveCommandTimeoutsConfig holds per-command hard timeout limits for
@@ -1456,6 +1457,7 @@ func (s *ServerConfig) GetCommandTimeoutsOverrides() (map[string]time.Duration, 
 		{"store", ct.Store},
 		{"copy", ct.Copy},
 		{"move", ct.Move},
+		{"rename", ct.Rename},
 	}
 
 	for _, f := range fields {

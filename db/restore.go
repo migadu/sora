@@ -15,7 +15,7 @@ type DeletedMessage struct {
 	ID           int64
 	UID          int64
 	ContentHash  string
-	MailboxPath  string
+	MailboxPath  string // effective mailbox name: the live mailbox's current name, or the stored string for an orphan
 	MailboxID    *int64 // nil if mailbox was deleted
 	Subject      string
 	MessageID    string
@@ -33,6 +33,23 @@ type ListDeletedMessagesParams struct {
 	Limit       int
 }
 
+// effectiveMailboxName is the SQL expression for "where this expunged message lived".
+//
+// While the mailbox still exists, its CURRENT name is the truth, so a rename does not
+// have to rewrite messages.mailbox_path for every message it owns (that rewrite was a
+// non-HOT update of every row, propagating into all 30 indexes on messages — seconds of
+// work and gigabytes of WAL for a large mailbox, all while holding the mailboxes row
+// lock that every delivery needs).
+//
+// The denormalized string is the fallback for orphans only: messages.mailbox_id is
+// ON DELETE SET NULL, so once a mailbox is hard-deleted the string is the sole surviving
+// record of where its messages were. DeleteMailbox stamps it (for live AND already-expunged
+// rows) immediately before deleting the mailbox rows, which is the moment it starts to matter.
+//
+// The join deliberately does not filter on mb.deleted_at: a soft-deleted mailbox still
+// names where the message lived, and its rows are hard-deleted (and stamped) by the purge.
+const effectiveMailboxName = `COALESCE(mb.name, m.mailbox_path)`
+
 // ListDeletedMessages returns messages that have been deleted (expunged)
 // matching the given criteria
 func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMessagesParams) ([]DeletedMessage, error) {
@@ -47,7 +64,7 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 			m.id,
 			m.uid,
 			m.content_hash,
-			m.mailbox_path,
+			` + effectiveMailboxName + `,
 			m.mailbox_id,
 			m.subject,
 			m.message_id,
@@ -55,6 +72,7 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 			m.expunged_at,
 			m.size
 		FROM messages m
+		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
 		WHERE m.account_id = $1
 		  AND m.expunged_at IS NOT NULL
 	`
@@ -63,7 +81,10 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 	argPos := 2
 
 	if params.MailboxPath != nil {
-		query += fmt.Sprintf(" AND m.mailbox_path = $%d", argPos)
+		// Match the mailbox the row belongs to NOW, and case-insensitively: mailbox names
+		// are case-insensitively unique (migration 000041) and the restore path resolves
+		// them with LOWER(), so a byte-exact filter here only ever hid rows.
+		query += fmt.Sprintf(" AND LOWER(%s) = LOWER($%d)", effectiveMailboxName, argPos)
 		args = append(args, *params.MailboxPath)
 		argPos++
 	}
@@ -154,44 +175,47 @@ func restoreAccountID(ctx context.Context, q rowQuerier, email string) (int64, e
 
 // restoreCandidatesQuery builds the SELECT that identifies the expunged rows matching
 // params (the same predicate for listing and for restoring). Rows are ordered by
-// (mailbox_path, internal_date, id) so restored messages receive new UIDs in arrival
-// order per mailbox — deterministic regardless of physical row order or batching.
+// (effective mailbox name, internal_date, id) so restored messages receive new UIDs in
+// arrival order per mailbox — deterministic regardless of physical row order or batching.
+// Callers pass columns qualified with the m/mb aliases (see effectiveMailboxName).
 func restoreCandidatesQuery(accountID int64, params RestoreMessagesParams, columns string) (string, []any) {
 	query := `
 		SELECT ` + columns + `
-		FROM messages
-		WHERE account_id = $1
-		  AND expunged_at IS NOT NULL
+		FROM messages m
+		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
+		WHERE m.account_id = $1
+		  AND m.expunged_at IS NOT NULL
 	`
 	args := []any{accountID}
 	argPos := 2
 
 	if len(params.MessageIDs) > 0 {
-		query += fmt.Sprintf(" AND id = ANY($%d::bigint[])", argPos)
+		query += fmt.Sprintf(" AND m.id = ANY($%d::bigint[])", argPos)
 		args = append(args, params.MessageIDs)
 		argPos++
 	} else {
 		// If no specific message IDs, use other filters
 		if params.MailboxPath != nil {
-			query += fmt.Sprintf(" AND mailbox_path = $%d", argPos)
+			// Effective name, case-insensitively — see ListDeletedMessages.
+			query += fmt.Sprintf(" AND LOWER(%s) = LOWER($%d)", effectiveMailboxName, argPos)
 			args = append(args, *params.MailboxPath)
 			argPos++
 		}
 
 		if params.Since != nil {
-			query += fmt.Sprintf(" AND expunged_at >= $%d", argPos)
+			query += fmt.Sprintf(" AND m.expunged_at >= $%d", argPos)
 			args = append(args, *params.Since)
 			argPos++
 		}
 
 		if params.Until != nil {
-			query += fmt.Sprintf(" AND expunged_at <= $%d", argPos)
+			query += fmt.Sprintf(" AND m.expunged_at <= $%d", argPos)
 			args = append(args, *params.Until)
 			argPos++
 		}
 	}
 
-	query += " ORDER BY mailbox_path, internal_date, id"
+	query += " ORDER BY " + effectiveMailboxName + ", m.internal_date, m.id"
 	return query, args
 }
 
@@ -206,7 +230,7 @@ func (d *Database) GetRestorableMessageIDs(ctx context.Context, params RestoreMe
 		return nil, err
 	}
 
-	query, args := restoreCandidatesQuery(accountID, params, "id")
+	query, args := restoreCandidatesQuery(accountID, params, "m.id")
 	rows, err := pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query messages for restoration: %w", err)
@@ -241,7 +265,8 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		return 0, err
 	}
 
-	query, args := restoreCandidatesQuery(accountID, params, "id, mailbox_path, mailbox_id, message_id, content_hash")
+	query, args := restoreCandidatesQuery(accountID, params,
+		"m.id, "+effectiveMailboxName+", m.message_id, m.content_hash")
 	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query messages for restoration: %w", err)
@@ -251,30 +276,30 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	// Collect messages and their target mailboxes
 	type msgToRestore struct {
 		id          int64
-		mailboxPath string
-		mailboxID   *int64
+		mailboxName string // effective name: live mailbox's current name, else the stored string
 		messageID   string
 		contentHash string // for the per-object lock shared with the cleaner
 	}
 
 	var messagesToRestore []msgToRestore
-	mailboxPaths := make(map[string]bool)
+	mailboxNames := make(map[string]bool)
 
 	for rows.Next() {
 		var msg msgToRestore
-		var mailboxPath *string
-		err := rows.Scan(&msg.id, &mailboxPath, &msg.mailboxID, &msg.messageID, &msg.contentHash)
+		var mailboxName *string
+		err := rows.Scan(&msg.id, &mailboxName, &msg.messageID, &msg.contentHash)
 		if err != nil {
 			return 0, fmt.Errorf("failed to scan message for restoration: %w", err)
 		}
-		if mailboxPath == nil {
-			// mailbox_path is what routes a tombstone back to its mailbox; without it there
-			// is no sane target. Fail loudly (naming the row) rather than guess.
-			return 0, fmt.Errorf("message %d has no recorded mailbox path and cannot be restored", msg.id)
+		if mailboxName == nil {
+			// The row has no mailbox (hard-deleted, mailbox_id nulled by the FK) AND no
+			// recorded mailbox_path, so there is no sane target. Fail loudly (naming the
+			// row) rather than guess.
+			return 0, fmt.Errorf("message %d has no mailbox and no recorded mailbox path and cannot be restored", msg.id)
 		}
-		msg.mailboxPath = *mailboxPath
+		msg.mailboxName = *mailboxName
 		messagesToRestore = append(messagesToRestore, msg)
-		mailboxPaths[msg.mailboxPath] = true
+		mailboxNames[msg.mailboxName] = true
 	}
 
 	if err := rows.Err(); err != nil {
@@ -287,12 +312,12 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 
 	// Ensure all required mailboxes exist, create them if they don't
 	mailboxIDMap := make(map[string]int64)
-	for mailboxPath := range mailboxPaths {
+	for mailboxName := range mailboxNames {
 		var mailboxID int64
 		err := tx.QueryRow(ctx, `
 			SELECT id FROM mailboxes
 			WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
-		`, accountID, mailboxPath).Scan(&mailboxID)
+		`, accountID, mailboxName).Scan(&mailboxID)
 
 		if err == pgx.ErrNoRows {
 			// Mailbox was deleted along with its messages; recreate it. Re-seed the
@@ -318,15 +343,15 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 				END AS su) canon
 				ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO NOTHING
 				RETURNING id
-			`, accountID, mailboxPath).Scan(&mailboxID)
+			`, accountID, mailboxName).Scan(&mailboxID)
 			if err == pgx.ErrNoRows {
 				// Concurrent recreate won the race; fetch the existing row's id.
 				err = tx.QueryRow(ctx, `
 					SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
-				`, accountID, mailboxPath).Scan(&mailboxID)
+				`, accountID, mailboxName).Scan(&mailboxID)
 			}
 			if err != nil {
-				return 0, fmt.Errorf("failed to create mailbox %s: %w", mailboxPath, err)
+				return 0, fmt.Errorf("failed to create mailbox %s: %w", mailboxName, err)
 			}
 
 			// Update the path now that we have the mailbox ID
@@ -336,20 +361,20 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 				UPDATE mailboxes SET path = $1 WHERE id = $2
 			`, computedPath, mailboxID)
 			if err != nil {
-				return 0, fmt.Errorf("failed to update path for mailbox %s: %w", mailboxPath, err)
+				return 0, fmt.Errorf("failed to update path for mailbox %s: %w", mailboxName, err)
 			}
 		} else if err != nil {
-			return 0, fmt.Errorf("failed to check mailbox %s: %w", mailboxPath, err)
+			return 0, fmt.Errorf("failed to check mailbox %s: %w", mailboxName, err)
 		}
 
-		mailboxIDMap[mailboxPath] = mailboxID
+		mailboxIDMap[mailboxName] = mailboxID
 	}
 
 	// Restore messages by clearing expunged_at and updating mailbox_id
 	var restoredCount int64
 	var skippedCount int64
 	for _, msg := range messagesToRestore {
-		targetMailboxID := mailboxIDMap[msg.mailboxPath]
+		targetMailboxID := mailboxIDMap[msg.mailboxName]
 
 		// Re-check the row under this transaction, and look for a live copy of the same
 		// Message-ID in the TARGET mailbox. It is valid to have the same Message-ID in
@@ -378,14 +403,14 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		}
 
 		if !restorable {
-			logger.Info("Database: skipping message restoration: message no longer expunged or already removed", "id", msg.id, "mailbox_path", msg.mailboxPath)
+			logger.Info("Database: skipping message restoration: message no longer expunged or already removed", "id", msg.id, "mailbox", msg.mailboxName)
 			skippedCount++
 			continue
 		}
 
 		if existingCount > 0 {
 			// A non-expunged copy already exists in the target mailbox, skip restoration
-			logger.Info("Database: skipping message restoration: message already exists in target mailbox", "id", msg.id, "mailbox_path", msg.mailboxPath)
+			logger.Info("Database: skipping message restoration: message already exists in target mailbox", "id", msg.id, "mailbox", msg.mailboxName)
 			skippedCount++
 			continue
 		}

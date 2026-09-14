@@ -150,8 +150,10 @@ func TestRestoreMessagesWithRetry_PartialProgressSurvivesFailure(t *testing.T) {
 
 	since := time.Now().Add(-time.Minute)
 
-	// Two restorable tombstones, then one that cannot be restored: a row without a
-	// recorded mailbox_path (sorts last, so it lands in the final chunk on its own).
+	// Two restorable tombstones, then one that cannot be restored: an orphan with neither
+	// a mailbox nor a recorded mailbox_path (sorts last, so it lands in the final chunk on
+	// its own). Both halves are needed — a row that still has its mailbox is restorable
+	// from the mailbox's current name however stale the string is (see effectiveMailboxName).
 	var uids []imap.UID
 	var poisonID int64
 	for i := 0; i < 3; i++ {
@@ -164,12 +166,13 @@ func TestRestoreMessagesWithRetry_PartialProgressSurvivesFailure(t *testing.T) {
 	for _, uid := range uids {
 		expungeFixture(t, rdb, inbox.ID, uid)
 	}
-	_, err = rdb.GetDatabase().GetWritePool().Exec(ctx, "UPDATE messages SET mailbox_path = NULL WHERE id = $1", poisonID)
+	_, err = rdb.GetDatabase().GetWritePool().Exec(ctx,
+		"UPDATE messages SET mailbox_path = NULL, mailbox_id = NULL WHERE id = $1", poisonID)
 	require.NoError(t, err)
 
 	restored, err := rdb.RestoreMessagesChunkedForTest(ctx, db.RestoreMessagesParams{Email: account.Email, Since: &since}, 1)
 	require.Error(t, err, "the unrestorable row must surface as an error")
-	assert.Contains(t, err.Error(), fmt.Sprintf("message %d has no recorded mailbox path", poisonID))
+	assert.Contains(t, err.Error(), fmt.Sprintf("message %d has no mailbox and no recorded mailbox path", poisonID))
 	assert.Contains(t, err.Error(), "restore stopped at candidates 3-3 of 3 after restoring 2")
 	assert.Equal(t, int64(2), restored, "count reports the messages restored before the failure")
 	assert.Equal(t, 2, liveCount(t, rdb, inbox.ID), "chunks committed before the failure stay restored")

@@ -612,6 +612,30 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		return consts.ErrInternalError
 	}
 
+	// Rows that were ALREADY expunged get the same stamp — path only, never a second
+	// expunge (that would rewrite their expunged_at/modseq and move the tombstone).
+	// This is the last moment the name is knowable: the DELETE below nulls mailbox_id
+	// (ON DELETE SET NULL) and leaves mailbox_path as the only record of where the
+	// message lived. RENAME deliberately does not maintain that string for live
+	// mailboxes (see RenameMailbox), so without this an older tombstone would restore
+	// under a pre-rename name. IS DISTINCT FROM keeps it to the rows that actually
+	// changed: nothing at all for a mailbox that was never renamed, and never the rows
+	// the statement above just expunged (it stamped them with the same name).
+	_, err = tx.Exec(ctx, `
+		UPDATE messages m
+		SET mailbox_path = mb.name
+		FROM mailboxes mb
+		WHERE m.mailbox_id = mb.id
+		  AND mb.account_id = $1
+		  AND (mb.id = $2 OR mb.path LIKE $3 || '/%')
+		  AND m.expunged_at IS NOT NULL
+		  AND m.mailbox_path IS DISTINCT FROM mb.name
+	`, AccountID, mailboxID, mboxPath)
+	if err != nil {
+		logger.Error("Database: failed to refresh mailbox path on expunged messages", "mailbox_id", mailboxID, "err", err)
+		return consts.ErrInternalError
+	}
+
 	// Delete the mailbox and all its children in one query using path-based approach
 	result, err := tx.Exec(ctx, `
 		DELETE FROM mailboxes
@@ -1118,29 +1142,23 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 
 	}
 
-	// Keep the denormalized messages.mailbox_path in sync with the new name(s).
-	// This column stores the mailbox NAME and is used by RestoreMessages to route
-	// expunged messages back to a mailbox by that name; leaving it pointing at the
-	// pre-rename name would resurrect a mailbox under the old name on restore.
-	// After the updates above, the renamed mailbox and all of its descendants are
-	// exactly the mailboxes whose path is prefixed by newPath (true for both a
-	// simple rename, where newPath == oldPath, and a move, where descendant paths
-	// were re-prefixed to newPath), so set each affected message's mailbox_path to
-	// its mailbox's current name. Expunged rows are included on purpose — they are
-	// precisely what RestoreMessages reads. Only mailbox_path changes, so the
-	// per-statement stats trigger (which keys on mailbox_id/expunged_at) is a no-op.
-	_, err = tx.Exec(ctx, `
-		UPDATE messages m
-		SET mailbox_path = mb.name
-		FROM mailboxes mb
-		WHERE m.mailbox_id = mb.id
-		  AND mb.account_id = $1
-		  AND mb.path LIKE $2 || '%'
-		  AND m.mailbox_path IS DISTINCT FROM mb.name
-	`, ownerAccountID, newPath)
-	if err != nil {
-		return fmt.Errorf("failed to sync message mailbox_path after rename of mailbox %d: %w", mailboxID, err)
-	}
+	// NOTE: the denormalized messages.mailbox_path is deliberately NOT re-synced here.
+	//
+	// It used to be: one UPDATE over every message of the renamed subtree (expunged rows
+	// included). Nothing indexes mailbox_path, but nothing makes those updates HOT either
+	// — the rows do not fit back in their pages — so every row took a new entry in all ~30
+	// indexes on messages, 7 of them GIN. Measured on a 105k-message mailbox: 37s
+	// and 2.2 GB of WAL for one rename, with the mailboxes row lock held throughout, which
+	// is the row every delivery needs (see lockMailboxStats and the highest_uid UPDATE in
+	// InsertMessage) — so deliveries into the mailbox did not just wait, they failed at
+	// lock_timeout.
+	//
+	// The column only has to be right for rows whose mailbox is GONE: mailbox_id is
+	// ON DELETE SET NULL, so it is the sole record of where an orphan lived. DeleteMailbox
+	// stamps it (live and already-expunged rows) immediately before deleting the mailbox,
+	// and RestoreMessages prefers the mailbox's current name via mailbox_id, falling back
+	// to the string only for orphans (see effectiveMailboxName in restore.go). A stale
+	// mailbox_path on a row whose mailbox still exists is therefore never read.
 
 	// Move the subscription (and its descendants) in the SAME transaction as the
 	// rename, so a crash can't leave the mailbox renamed but the subscription

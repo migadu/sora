@@ -104,3 +104,35 @@ func TestCommandTimeout_ExistingDeadlineShorterThanCommand(t *testing.T) {
 		t.Fatalf("expected deadline to be the parent's tighter deadline (~50ms remaining), got %v remaining", remaining)
 	}
 }
+
+// TestCommandTimeout_EnforcedOnRename pins the RENAME cap. RENAME had no per-command
+// deadline at all, so a rename that blocked (or, before the mailbox_path fix, rewrote
+// every message row in the mailbox) ran until the session itself went away.
+func TestCommandTimeout_EnforcedOnRename(t *testing.T) {
+	timeouts := CommandTimeouts{Rename: 50 * time.Millisecond}
+
+	cmdCtx, cancel := applyCommandTimeout(context.Background(), "RENAME", &timeouts)
+	defer cancel()
+
+	if _, ok := cmdCtx.Deadline(); !ok {
+		t.Fatal("expected RENAME to get a deadline")
+	}
+
+	select {
+	case <-cmdCtx.Done():
+	case <-time.After(1 * time.Second):
+		t.Fatal("RENAME timeout was not enforced within 1s")
+	}
+
+	if cmdCtx.Err() != context.DeadlineExceeded {
+		t.Fatalf("expected context.DeadlineExceeded, got %v", cmdCtx.Err())
+	}
+}
+
+// TestDefaultCommandTimeouts_CoversRename guards the default: a zero value means "no
+// cap at all", which is what RENAME used to have.
+func TestDefaultCommandTimeouts_CoversRename(t *testing.T) {
+	if got := DefaultCommandTimeouts().Rename; got <= 0 {
+		t.Fatalf("RENAME must have a default timeout, got %v", got)
+	}
+}

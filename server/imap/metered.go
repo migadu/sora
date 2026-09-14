@@ -141,6 +141,8 @@ func (m *meteredSession) Delete(ctx context.Context, mboxName string) error {
 }
 
 func (m *meteredSession) Rename(ctx context.Context, w *imapserver.RenameWriter, existingName, newName string, options *imap.RenameOptions) error {
+	ctx, cancel := applyCommandTimeout(ctx, "RENAME", m.server.commandTimeouts)
+	defer cancel()
 	start := time.Now()
 	err := m.IMAPSession.Rename(ctx, w, existingName, newName, options)
 	m.recordCommand("RENAME", start, err)

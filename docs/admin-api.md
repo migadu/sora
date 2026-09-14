@@ -837,7 +837,9 @@ Restore soft-deleted messages within the grace period.
 List messages that have been soft-deleted and can be restored.
 
 **Query Parameters:**
-- `mailbox=INBOX` - Filter by mailbox
+- `mailbox=INBOX` - Filter by mailbox: matched case-insensitively against the mailbox the
+  message belongs to now (its current name after any rename), or against the name recorded
+  at deletion time when the mailbox itself is gone
 - `since=2024-01-01T00:00:00Z` - Messages deleted after this time
 - `until=2024-01-31T23:59:59Z` - Messages deleted before this time
 - `limit=100` - Maximum messages to return

@@ -1136,6 +1136,7 @@ timeouts.min_bytes_per_minute = 512         # Minimum throughput to prevent slow
 # timeouts.imap_command_timeouts.store        = "15s"  # STORE (default: 15s)
 # timeouts.imap_command_timeouts.copy         = "30s"  # COPY (default: 30s)
 # timeouts.imap_command_timeouts.move         = "30s"  # MOVE (default: 30s)
+# timeouts.imap_command_timeouts.rename       = "60s"  # RENAME (default: 60s — RENAME INBOX moves every message)
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Two-tier blocking system protects shared IPs while catching distributed attacks
