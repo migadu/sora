@@ -133,8 +133,8 @@ func TestFTSBatchInsertSkipsIndexUnderDefaultConfig(t *testing.T) {
 	}
 
 	search := func(token string) int {
-		results, err := database.SearchMessagesWithCriteria(ctx, mailboxID,
-			&imap.SearchCriteria{Body: []string{token}}, 0)
+		results, err := database.SearchMessagesWithCriteria(ctx, mailboxID, accountID,
+			&imap.SearchCriteria{Body: []string{token}}, 0, 0)
 		require.NoError(t, err)
 		return len(results)
 	}

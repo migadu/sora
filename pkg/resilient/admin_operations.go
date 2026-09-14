@@ -397,20 +397,33 @@ func (rd *ResilientDatabase) PruneOldMessageVectorsWithRetry(ctx context.Context
 	}
 	return result.(int64), nil
 }
-func (rd *ResilientDatabase) GetUnusedFTSHashesWithRetry(ctx context.Context, batchSize int) ([]string, error) {
+func (rd *ResilientDatabase) GetUnusedFTSKeysWithRetry(ctx context.Context, batchSize int) ([]db.FTSKey, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetUnusedFTSHashes(ctx, batchSize)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetUnusedFTSKeys(ctx, batchSize)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutSearch, op)
 	if err != nil {
 		return nil, err
 	}
-	return result.([]string), nil
+	return result.([]db.FTSKey), nil
 }
 
-func (rd *ResilientDatabase) DeleteMessagesFTSByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error) {
+func (rd *ResilientDatabase) DeleteMessagesFTSByKeyBatchWithRetry(ctx context.Context, keys []db.FTSKey) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).DeleteMessagesFTSByHashBatch(ctx, tx, hashes)
+		return rd.getOperationalDatabaseForOperation(ctx, true).DeleteMessagesFTSByKeyBatch(ctx, tx, keys)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
+}
+
+// DeleteFTSRowsForAccountWithRetry removes one account's FTS rows in one bounded batch.
+// Callers loop until it returns 0.
+func (rd *ResilientDatabase) DeleteFTSRowsForAccountWithRetry(ctx context.Context, accountID int64, limit int) (int64, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).DeleteFTSRowsForAccount(ctx, tx, accountID, limit)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	if err != nil {

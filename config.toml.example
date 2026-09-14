@@ -608,6 +608,8 @@ grace_period = "14d"              # Recovery window for accidentally deleted mes
 wake_interval = "1h"              # How often the cleanup worker runs.
 max_age_restriction = ""          # Max message age before auto-expungement. Empty = no limit. e.g., "90d", "365d".
 fts_retention = ""                # How long to keep FTS search vectors (text_body_tsv). Empty = keep forever (default).
+                                  # NOTE: one row per (body, account), so at a given retention the
+                                  # prune volume scales with how widely bodies are shared.
                                   # WARNING: Setting this removes search capability for old messages. Use with caution.
 health_status_retention = "30d"   # How long to retain health status history in the database.
 instance_liveness_threshold = "7d" # How long an uploader instance must be silent before it counts as gone.

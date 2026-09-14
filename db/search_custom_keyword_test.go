@@ -52,7 +52,7 @@ func TestSearchCustomKeyword(t *testing.T) {
 		criteria := &imap.SearchCriteria{
 			Flag: []imap.Flag{"WAREHOUSING"},
 		}
-		messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
+		messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 		assert.NoError(t, err)
 		assert.Len(t, messages, 1)
 		if len(messages) == 1 {
@@ -64,7 +64,7 @@ func TestSearchCustomKeyword(t *testing.T) {
 		criteria := &imap.SearchCriteria{
 			Flag: []imap.Flag{"warehousing"},
 		}
-		messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
+		messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 		assert.NoError(t, err)
 		assert.Len(t, messages, 1)
 		if len(messages) == 1 {
@@ -76,7 +76,7 @@ func TestSearchCustomKeyword(t *testing.T) {
 		criteria := &imap.SearchCriteria{
 			Flag: []imap.Flag{"nonexistent"},
 		}
-		messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
+		messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 		assert.NoError(t, err)
 		assert.Empty(t, messages)
 	})
@@ -85,7 +85,7 @@ func TestSearchCustomKeyword(t *testing.T) {
 		criteria := &imap.SearchCriteria{
 			NotFlag: []imap.Flag{"nonexistent"},
 		}
-		messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
+		messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 		assert.NoError(t, err)
 		assert.Len(t, messages, 1)
 	})
@@ -94,7 +94,7 @@ func TestSearchCustomKeyword(t *testing.T) {
 		criteria := &imap.SearchCriteria{
 			NotFlag: []imap.Flag{"warehousing"},
 		}
-		messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, criteria, 0)
+		messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 		assert.NoError(t, err)
 		assert.Empty(t, messages)
 	})

@@ -984,30 +984,30 @@ func TestPruneOldMessageVectors(t *testing.T) {
 
 	const retention = 365 * 24 * time.Hour // 1 year
 
-	// --- Setup: insert three messages_fts rows with different sent_dates ---
+	// --- Setup: insert three messages_fts_v2 rows with different sent_dates ---
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
 
 	// Old: sent 2 years ago — should be pruned.
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, sent_date)
-		VALUES ($1, $2, $3)
-	`, oldHash, "old message body", time.Now().Add(-2*365*24*time.Hour))
+		INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, sent_date)
+		VALUES ($1, $4, $2, $3)
+	`, oldHash, "old message body", time.Now().Add(-2*365*24*time.Hour), accountID)
 	require.NoError(t, err)
 
 	// Recent: sent 6 months ago — should survive.
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, sent_date)
-		VALUES ($1, $2, $3)
-	`, recentHash, "recent message body", time.Now().Add(-180*24*time.Hour))
+		INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, sent_date)
+		VALUES ($1, $4, $2, $3)
+	`, recentHash, "recent message body", time.Now().Add(-180*24*time.Hour), accountID)
 	require.NoError(t, err)
 
 	// No sent_date — should survive (NULL < anything is always false in SQL).
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, sent_date)
-		VALUES ($1, $2, NULL)
-	`, nullDateHash, "undated message body")
+		INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, sent_date)
+		VALUES ($1, $3, $2, NULL)
+	`, nullDateHash, "undated message body", accountID)
 	require.NoError(t, err)
 
 	// Insert a messages row for each — realistic setup (without message_state since we're only testing FTS pruning).
@@ -1056,7 +1056,7 @@ func TestPruneOldMessageVectors(t *testing.T) {
 		var r mcRow
 		require.NoError(t, db.GetReadPool().QueryRow(ctx, `
 			SELECT text_body, text_body_tsv::text
-			FROM messages_fts WHERE content_hash = $1
+			FROM messages_fts_v2 WHERE content_hash = $1
 		`, hash).Scan(&r.TextBody, &r.TextBodyTSV))
 		return r
 	}
@@ -1082,7 +1082,7 @@ func TestPruneOldMessageVectors(t *testing.T) {
 		t.Helper()
 		var n int
 		require.NoError(t, db.GetReadPool().QueryRow(ctx,
-			"SELECT COUNT(*) FROM messages_fts WHERE content_hash = $1", hash).Scan(&n))
+			"SELECT COUNT(*) FROM messages_fts_v2 WHERE content_hash = $1", hash).Scan(&n))
 		return n
 	}
 	countMsg := func(hash string) int {
@@ -1095,13 +1095,13 @@ func TestPruneOldMessageVectors(t *testing.T) {
 	}
 
 	// Old messages_fts row must be gone.
-	assert.Equal(t, 0, countMC(oldHash), "old messages_fts row must be pruned")
+	assert.Equal(t, 0, countMC(oldHash), "old messages_fts_v2 row must be pruned")
 
 	// Recent and null-dated rows must be untouched.
-	assert.Equal(t, 1, countMC(recentHash), "recent messages_fts row must survive")
-	assert.Equal(t, 1, countMC(nullDateHash), "null-dated messages_fts row must survive")
+	assert.Equal(t, 1, countMC(recentHash), "recent messages_fts_v2 row must survive")
+	assert.Equal(t, 1, countMC(nullDateHash), "null-dated messages_fts_v2 row must survive")
 
-	// Prune only touches messages_fts — the messages rows must remain for all three.
+	// Prune only touches messages_fts_v2 — the messages rows must remain for all three.
 	for _, hash := range []string{oldHash, recentHash, nullDateHash} {
 		assert.Equal(t, 1, countMsg(hash), "messages row must be untouched by vector pruning: hash=%s", hash)
 	}

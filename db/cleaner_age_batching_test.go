@@ -158,10 +158,10 @@ func TestAGE1_ExpungeOldMessages_IsUnbatched(t *testing.T) {
 	// --- Control: the sibling cleaner path, same workload, is capped ---------
 	for i := 0; i < total; i++ {
 		_, err := database.GetWritePool().Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body_tsv, sent_date)
-			VALUES ('age1_' || $1 || '_fts_' || $2, to_tsvector('english', 'x'), now() - $3::interval)
-			ON CONFLICT (content_hash) DO NOTHING
-		`, tag, fmt.Sprintf("%d", i), ageTestMessageAge)
+			INSERT INTO messages_fts_v2 (content_hash, account_id, text_body_tsv, sent_date)
+			VALUES ('age1_' || $1 || '_fts_' || $2, $4, to_tsvector('english', 'x'), now() - $3::interval)
+			ON CONFLICT (content_hash, account_id) DO NOTHING
+		`, tag, fmt.Sprintf("%d", i), ageTestMessageAge, accountID)
 		require.NoError(t, err)
 	}
 

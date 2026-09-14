@@ -65,8 +65,9 @@ type DatabaseManager interface {
 	ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error
 	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
 	PruneOldMessageVectorsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
-	GetUnusedFTSHashesWithRetry(ctx context.Context, limit int) ([]string, error)
-	DeleteMessagesFTSByHashBatchWithRetry(ctx context.Context, hashes []string) (int64, error)
+	GetUnusedFTSKeysWithRetry(ctx context.Context, limit int) ([]db.FTSKey, error)
+	DeleteMessagesFTSByKeyBatchWithRetry(ctx context.Context, keys []db.FTSKey) (int64, error)
+	DeleteFTSRowsForAccountWithRetry(ctx context.Context, accountID int64, limit int) (int64, error)
 	// GetDanglingAccountsForFinalDeletionWithRetry lists soft-deleted accounts with no
 	// message rows left whose deletion is older than gracePeriod — the same grace the
 	// hard-delete phase honours, so an empty account can still be restored in time.
@@ -498,7 +499,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	}
 
 	// --- Phase 2a: FTS Vector & Queue Pruning ---
-	// This phase deletes exclusively from messages_fts rows whose fts_retention has expired,
+	// This phase deletes exclusively from messages_fts_v2 rows whose fts_retention has expired,
 	// removing the FTS search vectors to strictly reclaim database storage bloat.
 	if w.ftsRetention > 0 {
 		// Process in batches of 1000, up to 10 times per loop to keep transactions tiny.
@@ -511,7 +512,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 
 			if prunedVectorsCount > 0 {
 				ftsPrunedCount += prunedVectorsCount
-				logger.Info("Cleanup: Pruned expired FTS indexes deeply from messages_fts table", "count", prunedVectorsCount, "age", w.ftsRetention)
+				logger.Info("Cleanup: Pruned expired FTS indexes deeply from messages_fts_v2 table", "count", prunedVectorsCount, "age", w.ftsRetention)
 				if prunedVectorsCount < 1000 {
 					break
 				}
@@ -524,23 +525,23 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 			}
 		}
 	}
-	// --- Phase 2b: Global resource cleanup (messages_fts orphan sweep) ---
+	// --- Phase 2b: Global resource cleanup (messages_fts_v2 orphan sweep) ---
 	// If a user permanently deletes an email (S3 object deleted), their FTS vector
-	// is orphaned in messages_fts. The vector TTL (Phase 2a) eventually kills it,
+	// is orphaned in messages_fts_v2. The vector TTL (Phase 2a) eventually kills it,
 	// but sweeping guarantees we don't leak vectors infinitely if fts_retention = 0.
-	orphanHashes, err := w.rdb.GetUnusedFTSHashesWithRetry(ctx, db.BATCH_PURGE_SIZE)
+	orphanKeys, err := w.rdb.GetUnusedFTSKeysWithRetry(ctx, db.BATCH_PURGE_SIZE)
 	if err != nil {
-		logger.Error("Cleanup: Failed to list unused FTS hashes for global cleanup", "error", err)
-		return fmt.Errorf("failed to list unused FTS hashes for global cleanup: %w", err)
+		logger.Error("Cleanup: Failed to list unused FTS keys for global cleanup", "error", err)
+		return fmt.Errorf("failed to list unused FTS keys for global cleanup: %w", err)
 	}
 
-	orphanHashCount = int64(len(orphanHashes))
-	if len(orphanHashes) > 0 {
-		logger.Info("Cleanup: Found orphaned FTS vectors for global cleanup", "count", len(orphanHashes))
+	orphanHashCount = int64(len(orphanKeys))
+	if len(orphanKeys) > 0 {
+		logger.Info("Cleanup: Found orphaned FTS vectors for global cleanup", "count", len(orphanKeys))
 
-		deletedCount, err := w.rdb.DeleteMessagesFTSByHashBatchWithRetry(ctx, orphanHashes)
+		deletedCount, err := w.rdb.DeleteMessagesFTSByKeyBatchWithRetry(ctx, orphanKeys)
 		if err != nil {
-			logger.Error("Cleanup: Failed to batch delete from messages_fts - will be retried on next run", "error", err)
+			logger.Error("Cleanup: Failed to batch delete from messages_fts_v2 - will be retried on next run", "error", err)
 		} else if deletedCount > 0 {
 			logger.Info("Cleanup: Deleted orphaned FTS vectors", "count", deletedCount)
 		}
@@ -558,6 +559,29 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	finalizedAccountCount = int64(len(danglingAccounts))
 	if len(danglingAccounts) > 0 {
 		logger.Info("Cleanup: Found dangling accounts for final deletion", "count", len(danglingAccounts))
+
+		// Drain each account's FTS rows in bounded batches BEFORE finalization. An account
+		// has one FTS row per distinct body it held, so a single unbounded DELETE inside
+		// the finalize transaction could be millions of rows and a correspondingly long
+		// lock. FinalizeAccountDeletions still issues the same DELETE as a safety net; by
+		// then it is a no-op.
+		for _, accountID := range danglingAccounts {
+			for {
+				deleted, err := w.rdb.DeleteFTSRowsForAccountWithRetry(ctx, accountID, db.BATCH_PURGE_SIZE)
+				if err != nil {
+					logger.Error("Cleanup: Failed to delete FTS rows for account", "account_id", accountID, "error", err)
+					break
+				}
+				if deleted == 0 {
+					break
+				}
+				ftsPrunedCount += deleted
+				if ctx.Err() != nil {
+					break
+				}
+			}
+		}
+
 		deletedCount, err := w.rdb.FinalizeAccountDeletionsWithRetry(ctx, danglingAccounts)
 		if err != nil {
 			logger.Error("Cleanup: Failed to finalize deletion of account batch", "error", err)

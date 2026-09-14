@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 )
 
@@ -98,6 +99,7 @@ func (w *Worker) processBatch(ctx context.Context) {
 			break
 		}
 
+		metrics.FTSRowsIndexed.Add(float64(processed))
 		logger.Info("FTS Worker: generated vectors for messages batch", "count", processed)
 
 		// Keep looping immediately if we processed a full batch,

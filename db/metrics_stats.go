@@ -17,7 +17,14 @@ type MetricsStats struct {
 	TotalAccounts  int64
 	TotalMailboxes int64
 	TotalMessages  int64
-	Timestamp      time.Time
+	// FTSRows is the approximate number of per-account full-text search rows, and
+	// FTSQueueDepth the number of them still waiting for a search vector. A queue depth
+	// that does not return to zero between collection cycles means newly delivered mail
+	// is not searchable, which is otherwise invisible: a search over unindexed mail just
+	// returns fewer results and raises nothing.
+	FTSRows       int64
+	FTSQueueDepth int64
+	Timestamp     time.Time
 }
 
 const (
@@ -26,6 +33,7 @@ const (
 	// below.
 	accountsRowEstimateQuery  = `SELECT reltuples::bigint FROM pg_class WHERE oid = to_regclass('accounts')`
 	mailboxesRowEstimateQuery = `SELECT reltuples::bigint FROM pg_class WHERE oid = to_regclass('mailboxes')`
+	ftsRowEstimateQuery       = `SELECT reltuples::bigint FROM pg_class WHERE oid = to_regclass('messages_fts_v2')`
 
 	// Exact counts, used only while an estimate is unavailable.
 
@@ -44,6 +52,13 @@ const (
 		INNER JOIN accounts a ON m.account_id = a.id
 		WHERE a.deleted_at IS NULL AND m.deleted_at IS NULL
 	`
+
+	// Exact count of per-account FTS rows, used only while the estimate is unavailable.
+	ftsRowsCountQuery = `SELECT COUNT(*) FROM messages_fts_v2`
+
+	// Rows still waiting for a vector. Served by idx_messages_fts_v2_queue, a partial
+	// index over exactly this set, so it stays cheap however large the table grows.
+	ftsQueueDepthQuery = `SELECT COUNT(*) FROM messages_fts_v2 WHERE text_body_tsv IS NULL`
 
 	// Total messages (non-expunged, for non-deleted accounts; exclude soft-deleted
 	// mailboxes whose cached stats are pending two-phase purge).
@@ -81,6 +96,16 @@ func (d *Database) GetMetricsStats(ctx context.Context) (*MetricsStats, error) {
 	}
 
 	err = pool.QueryRow(ctx, messagesCountQuery).Scan(&stats.TotalMessages)
+	if err != nil {
+		return nil, err
+	}
+
+	stats.FTSRows, err = rowCount(ctx, pool, ftsRowEstimateQuery, ftsRowsCountQuery)
+	if err != nil {
+		return nil, err
+	}
+
+	err = pool.QueryRow(ctx, ftsQueueDepthQuery).Scan(&stats.FTSQueueDepth)
 	if err != nil {
 		return nil, err
 	}

@@ -20,6 +20,8 @@ func (rdb *ResilientDatabase) GetMetricsStatsWithRetry(ctx context.Context) (*me
 			TotalAccounts:  dbStats.TotalAccounts,
 			TotalMailboxes: dbStats.TotalMailboxes,
 			TotalMessages:  dbStats.TotalMessages,
+			FTSRows:        dbStats.FTSRows,
+			FTSQueueDepth:  dbStats.FTSQueueDepth,
 		}, nil
 	}
 

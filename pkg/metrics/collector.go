@@ -12,6 +12,8 @@ type MetricsStats struct {
 	TotalAccounts  int64
 	TotalMailboxes int64
 	TotalMessages  int64
+	FTSRows        int64
+	FTSQueueDepth  int64
 }
 
 // StatsProvider is an interface for retrieving metrics statistics
@@ -99,9 +101,12 @@ func (c *Collector) collect(ctx context.Context) {
 	// Update Prometheus gauges
 	AccountsTotal.Set(float64(stats.TotalAccounts))
 	MailboxesTotal.Set(float64(stats.TotalMailboxes))
+	FTSRowsTotal.Set(float64(stats.FTSRows))
+	FTSQueueDepth.Set(float64(stats.FTSQueueDepth))
 
 	logger.Info("MetricsCollector: updated DB metrics", "accounts", stats.TotalAccounts,
-		"mailboxes", stats.TotalMailboxes, "messages", stats.TotalMessages)
+		"mailboxes", stats.TotalMailboxes, "messages", stats.TotalMessages,
+		"fts_rows", stats.FTSRows, "fts_queue_depth", stats.FTSQueueDepth)
 
 	// Update cache metrics if cache provider is available
 	if c.cacheProvider != nil {

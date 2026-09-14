@@ -16,7 +16,7 @@ It provides enterprise-grade email infrastructure with modern storage backends, 
 - **HTTP API** for administration and monitoring
 
 ### Storage Architecture
-- **PostgreSQL** for metadata with full-text search (pg_trgm)
+- **PostgreSQL** for metadata with full-text search (pg_trgm, btree_gin)
 - **S3-compatible** object storage for message bodies with content deduplication
 - **Local cache** for frequently accessed messages, providing read-level deduplication
 - **Configurable retention** with grace periods and ephemeral storage
@@ -72,7 +72,8 @@ Sora is designed for:
 ## Requirements
 
 - Go 1.24+
-- PostgreSQL 14+ with pg_trgm extension
+- PostgreSQL 14+ with the pg_trgm and btree_gin extensions (both ship with contrib and are
+  trusted, so no superuser is needed)
 - S3-compatible object storage (MinIO, AWS S3, etc.)
 - Port 7946 (for cluster gossip protocol, optional)
 - Port 80 (for Let's Encrypt HTTP-01 challenges, optional)

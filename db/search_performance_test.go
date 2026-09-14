@@ -184,10 +184,10 @@ func (pts *PerformanceTestSuite) createMessageBatch(ctx context.Context, tx pgx.
 
 		// Insert message content for full-text search — async worker handles FTS vector generation
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body)
-			VALUES ($1, $2)
-			ON CONFLICT (content_hash) DO NOTHING`,
-			contentHash, body)
+			INSERT INTO messages_fts_v2 (content_hash, account_id, text_body)
+			VALUES ($1, $3, $2)
+			ON CONFLICT (content_hash, account_id) DO NOTHING`,
+			contentHash, body, pts.accountID)
 		if err != nil {
 			return fmt.Errorf("failed to insert message content %d: %w", i, err)
 		}
@@ -446,7 +446,7 @@ func TestSearchPerformance(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				start := time.Now()
-				messages, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, tc.criteria, 0)
+				messages, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, tc.criteria, 0, 0)
 				elapsed := time.Since(start)
 
 				assert.NoError(t, err)
@@ -487,7 +487,7 @@ func TestSearchPerformance(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				memStats := CaptureMemoryStats(func() {
 					start := time.Now()
-					messages, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, tc.criteria, 0)
+					messages, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, tc.criteria, 0, 0)
 					elapsed := time.Since(start)
 
 					assert.NoError(t, err)
@@ -531,7 +531,7 @@ func TestSearchPerformance(t *testing.T) {
 		for _, sc := range sortCriteria {
 			t.Run(sc.name, func(t *testing.T) {
 				start := time.Now()
-				messages, err := pts.db.GetMessagesSorted(ctx, pts.mailboxID, criteria, sc.sort, 0)
+				messages, err := pts.db.GetMessagesSorted(ctx, pts.mailboxID, pts.accountID, criteria, sc.sort, 0, 0)
 				elapsed := time.Since(start)
 
 				assert.NoError(t, err)
@@ -551,7 +551,7 @@ func TestSearchPerformance(t *testing.T) {
 			// Search that should return many results
 			criteria := &imap.SearchCriteria{} // Empty criteria = all messages
 
-			messages, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, criteria, 0)
+			messages, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, criteria, 0, 0)
 			assert.NoError(t, err)
 
 			if len(messages) >= MaxSearchResults {
@@ -572,7 +572,7 @@ func TestSearchPerformance(t *testing.T) {
 			}
 			sortCriteria := []imap.SortCriterion{{Key: imap.SortKeyFrom, Reverse: false}}
 
-			messages, err := pts.db.GetMessagesSorted(ctx, pts.mailboxID, criteria, sortCriteria, 0)
+			messages, err := pts.db.GetMessagesSorted(ctx, pts.mailboxID, pts.accountID, criteria, sortCriteria, 0, 0)
 			assert.NoError(t, err)
 
 			if len(messages) >= MaxComplexSortResults {
@@ -595,7 +595,7 @@ func TestSearchPerformance(t *testing.T) {
 				criteria := &imap.SearchCriteria{
 					Body: []string{fmt.Sprintf("term%d", i)},
 				}
-				_, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, criteria, 0)
+				_, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, criteria, 0, 0)
 				assert.NoError(t, err)
 			}
 		})
@@ -662,7 +662,7 @@ func BenchmarkSearchOperations(b *testing.B) {
 		criteria := &imap.SearchCriteria{UID: []imap.UIDSet{{imap.UIDRange{Start: 1, Stop: 100}}}}
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			_, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, criteria, 0)
+			_, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, criteria, 0, 0)
 			if err != nil {
 				b.Fatalf("Search failed: %v", err)
 			}
@@ -673,7 +673,7 @@ func BenchmarkSearchOperations(b *testing.B) {
 		criteria := &imap.SearchCriteria{Body: []string{"quarterly"}}
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			_, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, criteria, 0)
+			_, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, criteria, 0, 0)
 			if err != nil {
 				b.Fatalf("Search failed: %v", err)
 			}
@@ -685,7 +685,7 @@ func BenchmarkSearchOperations(b *testing.B) {
 		sortCriteria := []imap.SortCriterion{{Key: imap.SortKeySubject, Reverse: false}}
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			_, err := pts.db.GetMessagesSorted(ctx, pts.mailboxID, criteria, sortCriteria, 0)
+			_, err := pts.db.GetMessagesSorted(ctx, pts.mailboxID, pts.accountID, criteria, sortCriteria, 0, 0)
 			if err != nil {
 				b.Fatalf("Sort failed: %v", err)
 			}
