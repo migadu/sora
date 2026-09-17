@@ -13,13 +13,14 @@ import (
 // ThreadMessageResult represents the lightweight metadata needed to run
 // the ORDEREDSUBJECT and REFERENCES threading algorithms in memory.
 type ThreadMessageResult struct {
-	UID         imap.UID
-	MessageID   string
-	InReplyTo   string
-	References  string
-	SubjectSort string
-	SentDate    time.Time
-	Seq         uint32
+	UID          imap.UID
+	MessageID    string
+	InReplyTo    string
+	References   string
+	SubjectSort  string
+	SentDate     time.Time
+	InternalDate time.Time // arrival; THREAD=REFS orders threads by it
+	Seq          uint32
 }
 
 // ThreadMaxMessages defines the hard cap for how many messages we will thread at once to prevent OOM/CPU spikes.
@@ -55,7 +56,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64
 			WHERE mailbox_id = @mailbox_id AND expunged_at IS NULL
 		),
 		latest_msgs AS (
-			SELECT m.uid, m.message_id, m.in_reply_to, m."references", %s, m.sent_date
+			SELECT m.uid, m.message_id, m.in_reply_to, m."references", %s, m.sent_date, m.internal_date
 			FROM messages m
 			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 			LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
@@ -65,7 +66,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64
 			ORDER BY m.uid DESC
 			LIMIT %d
 		)
-		SELECT l.uid, l.message_id, l.in_reply_to, l."references", %s, l.sent_date, seq.seqnum
+		SELECT l.uid, l.message_id, l.in_reply_to, l."references", %s, l.sent_date, l.internal_date, seq.seqnum
 		FROM latest_msgs l
 		JOIN seq ON l.uid = seq.uid
 		ORDER BY l.uid ASC
@@ -91,7 +92,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64
 		var msgID, inReplyTo, references, subjectSort *string
 		var sentDate *time.Time
 
-		if err := rows.Scan(&msg.UID, &msgID, &inReplyTo, &references, &subjectSort, &sentDate, &msg.Seq); err != nil {
+		if err := rows.Scan(&msg.UID, &msgID, &inReplyTo, &references, &subjectSort, &sentDate, &msg.InternalDate, &msg.Seq); err != nil {
 			return nil, fmt.Errorf("failed to scan thread message: %w", err)
 		}
 

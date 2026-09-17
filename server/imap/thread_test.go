@@ -178,7 +178,8 @@ func TestThreadReferences_OwnReferencesOverrideAnotherMessagesGuess(t *testing.T
 		{UID: 4, Seq: 4, MessageID: "d@x", References: "a@x", SentDate: now.Add(-2 * time.Hour)},
 	}
 
-	result := session.threadReferences(imapserver.NumKindUID, messages, true)
+	// No subjects, so REFERENCES groups nothing by subject and orders by sent date.
+	result := session.threadReferences(imapserver.NumKindUID, messages, false)
 
 	assert.Len(t, result, 2)
 	assert.Equal(t, []uint32{1, 4, 3}, result[0].Chain)
@@ -200,7 +201,8 @@ func TestThreadReferences_EveryMessageAppears(t *testing.T) {
 		{UID: 5, Seq: 5, MessageID: "e@x", References: "a@x", SentDate: now},
 	}
 
-	result := session.threadReferences(imapserver.NumKindUID, messages, true)
+	// No subjects, so REFERENCES groups nothing by subject and orders by sent date.
+	result := session.threadReferences(imapserver.NumKindUID, messages, false)
 
 	assert.Len(t, result, 3)
 	assert.Equal(t, []uint32{1}, result[0].Chain)
@@ -227,6 +229,54 @@ func TestThreadReferences_ReferenceLoop(t *testing.T) {
 
 	assert.Len(t, result, 1)
 	assert.Equal(t, []uint32{2, 1}, result[0].Chain)
+}
+
+func TestThreadRefs_OrdersThreadsByLatestArrival(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+	at := func(d time.Duration) time.Time { return now.Add(d) }
+
+	// A thread started long ago that got a reply last, an unrelated message in
+	// between, and two answers to a message this mailbox does not have.
+	messages := []db.ThreadMessageResult{
+		{UID: 1, Seq: 1, MessageID: "a@x", SubjectSort: "a", SentDate: at(-5 * time.Hour), InternalDate: at(-5 * time.Hour)},
+		{UID: 2, Seq: 2, MessageID: "b@x", SubjectSort: "b", SentDate: at(-4 * time.Hour), InternalDate: at(-4 * time.Hour)},
+		{UID: 3, Seq: 3, MessageID: "c@x", SubjectSort: "c", References: "z@x", SentDate: at(-3 * time.Hour), InternalDate: at(-3 * time.Hour)},
+		{UID: 4, Seq: 4, MessageID: "d@x", SubjectSort: "d", References: "z@x", SentDate: at(-2 * time.Hour), InternalDate: at(-2 * time.Hour)},
+		{UID: 5, Seq: 5, MessageID: "e@x", SubjectSort: "e", References: "a@x", SentDate: at(-6 * time.Hour), InternalDate: at(-1 * time.Hour)},
+	}
+
+	// REFS: by the latest arrival in each thread, so the thread that just got
+	// mail is last, even though that mail says it was sent first.
+	refs := session.threadReferences(imapserver.NumKindUID, messages, true)
+	if assert.Len(t, refs, 3) {
+		assert.Equal(t, []uint32{2}, refs[0].Chain)
+		assert.Empty(t, refs[1].Chain)
+		if assert.Len(t, refs[1].SubThreads, 2) {
+			assert.Equal(t, []uint32{3}, refs[1].SubThreads[0].Chain)
+			assert.Equal(t, []uint32{4}, refs[1].SubThreads[1].Chain)
+		}
+		assert.Equal(t, []uint32{1, 5}, refs[2].Chain)
+	}
+
+	// REFERENCES: by the earliest sent date in each thread.
+	references := session.threadReferences(imapserver.NumKindUID, messages, false)
+	if assert.Len(t, references, 3) {
+		assert.Equal(t, []uint32{1, 5}, references[0].Chain)
+		assert.Equal(t, []uint32{2}, references[1].Chain)
+		assert.Len(t, references[2].SubThreads, 2)
+	}
+
+	// Threads whose latest mail arrived at the same time: the later message wins.
+	same := []db.ThreadMessageResult{
+		{UID: 7, Seq: 1, MessageID: "p@x", InternalDate: now},
+		{UID: 9, Seq: 2, MessageID: "q@x", InternalDate: now},
+	}
+	tied := session.threadReferences(imapserver.NumKindUID, same, true)
+	if assert.Len(t, tied, 2) {
+		assert.Equal(t, []uint32{7}, tied[0].Chain)
+		assert.Equal(t, []uint32{9}, tied[1].Chain)
+	}
 }
 
 func TestExtractIDs(t *testing.T) {

@@ -132,7 +132,9 @@ type jwzNode struct {
 }
 
 // threadReferences implements the REFERENCES threading algorithm (RFC 5256 section 2.2 / JWZ algorithm)
-func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db.ThreadMessageResult, skipSubjectGrouping bool) []imap.ThreadData {
+// or, with refs set, THREAD=REFS (draft-ietf-morg-inthread section 4): the same
+// linking, no grouping by subject, and threads ordered by their latest arrival.
+func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db.ThreadMessageResult, refs bool) []imap.ThreadData {
 	// 1. Link messages by their references (RFC 5256 section 2.2, step 1).
 	idTable := make(map[string]*jwzNode)
 	byID := func(id string) *jwzNode {
@@ -213,11 +215,17 @@ func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db
 	}
 	rootNodes = pruned
 
-	// 4. Order the threads by date before grouping them by subject.
-	sortByEarliest(rootNodes)
+	// 4. Order the threads: REFERENCES by the sent date of each thread's first
+	// message, REFS by the latest INTERNALDATE in each thread, so that the thread
+	// that received mail last comes last.
+	if refs {
+		sortByLatestArrival(rootNodes)
+	} else {
+		sortByEarliest(rootNodes)
+	}
 
-	// 5. Subject Grouping (RFC 5256 JWZ algorithm phase 5)
-	if !skipSubjectGrouping {
+	// 5. Subject Grouping (RFC 5256 JWZ algorithm phase 5); REFS ignores Subject.
+	if !refs {
 		subjectTable := make(map[string]*jwzNode)
 
 		for _, root := range rootNodes {
@@ -290,10 +298,10 @@ func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db
 			}
 		}
 		rootNodes = newRoots
-	}
 
-	// 6. Sort root nodes
-	sortByEarliest(rootNodes)
+		// 6. Grouping made new roots: order them again.
+		sortByEarliest(rootNodes)
+	}
 
 	// 7. Build the ThreadData structure
 	var result []imap.ThreadData
@@ -414,6 +422,35 @@ func getEarliestDate(node *jwzNode) time.Time {
 		}
 	}
 	return earliest
+}
+
+// sortByLatestArrival orders nodes by the latest INTERNALDATE in each subtree,
+// then by the highest message number in it.
+func sortByLatestArrival(nodes []*jwzNode) {
+	sort.Slice(nodes, func(i, j int) bool {
+		dateI, idI := getLatestArrival(nodes[i])
+		dateJ, idJ := getLatestArrival(nodes[j])
+		if !dateI.Equal(dateJ) {
+			return dateI.Before(dateJ)
+		}
+		return idI < idJ
+	})
+}
+
+// getLatestArrival returns the latest INTERNALDATE in node's subtree and the
+// highest message number in it.
+func getLatestArrival(node *jwzNode) (latest time.Time, id uint32) {
+	if node.msg != nil {
+		latest, id = node.msg.InternalDate, node.id
+	}
+	for _, child := range node.children {
+		childLatest, childID := getLatestArrival(child)
+		if childLatest.After(latest) {
+			latest = childLatest
+		}
+		id = max(id, childID)
+	}
+	return latest, id
 }
 
 func getEarliestID(node *jwzNode) uint32 {

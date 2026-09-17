@@ -3,6 +3,7 @@
 package imap_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -305,5 +306,75 @@ func TestIMAP_Thread_EveryAlgorithmAdvertised(t *testing.T) {
 		if !found {
 			t.Errorf("THREAD=%s not advertised; advertised: %v", want, advertised)
 		}
+	}
+}
+
+// TestIMAP_Thread_RefsOrdersByLatestArrival: under REFS a thread moves to the
+// end when mail arrives in it, whatever the message says its sent date is;
+// REFERENCES keeps ordering threads by their first message.
+func TestIMAP_Thread_RefsOrdersByLatestArrival(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// APPEND's date-time is the INTERNALDATE; Date: is the sent date.
+	now := time.Now()
+	for i, m := range []struct {
+		body    string
+		arrived time.Time
+	}{
+		{"Message-ID: <old@example.com>\r\nDate: " + now.Add(-5*time.Hour).Format(time.RFC1123Z) +
+			"\r\nSubject: Old question\r\n\r\nAsked long ago", now.Add(-5 * time.Hour)},
+		{"Message-ID: <other@example.com>\r\nDate: " + now.Add(-4*time.Hour).Format(time.RFC1123Z) +
+			"\r\nSubject: Unrelated\r\n\r\nIn between", now.Add(-4 * time.Hour)},
+		{"Message-ID: <late@example.com>\r\nIn-Reply-To: <old@example.com>\r\nReferences: <old@example.com>\r\nDate: " +
+			now.Add(-4*time.Hour).Format(time.RFC1123Z) + "\r\nSubject: Late answer\r\n\r\nArrived just now", now.Add(-time.Minute)},
+	} {
+		appendCmd := c.Append("INBOX", int64(len(m.body)), &imap.AppendOptions{Time: m.arrived})
+		if _, err := appendCmd.Write([]byte(m.body)); err != nil {
+			t.Fatalf("Append write failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("Append close failed: %v", err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("Append %d failed: %v", i+1, err)
+		}
+	}
+
+	thread := func(alg imap.ThreadAlgorithm) []imap.ThreadData {
+		t.Helper()
+		res, err := c.UIDThread(&imapclient.ThreadOptions{Algorithm: alg, SearchCriteria: &imap.SearchCriteria{}}).Wait()
+		if err != nil {
+			t.Fatalf("UID THREAD %s failed: %v", alg, err)
+		}
+		if len(res) != 2 {
+			t.Fatalf("UID THREAD %s: expected 2 threads, got %+v", alg, res)
+		}
+		return res
+	}
+	chains := func(res []imap.ThreadData) string {
+		return fmt.Sprint(res[0].Chain, res[1].Chain)
+	}
+
+	if got, want := chains(thread(imap.ThreadRefs)), "[2] [1 3]"; got != want {
+		t.Errorf("REFS order = %s, want %s: the thread that just received mail must come last", got, want)
+	}
+	if got, want := chains(thread(imap.ThreadReferences)), "[1 3] [2]"; got != want {
+		t.Errorf("REFERENCES order = %s, want %s", got, want)
 	}
 }
