@@ -193,7 +193,9 @@ curl http://localhost:8080/admin/accounts/user@example.com \
 
 **Endpoint:** `PUT /admin/accounts/{email}`
 
-Update the password for a specific credential.
+Update the password for a specific credential. The old password stops working at once: the
+account's cached logins are dropped on this node's servers and their cluster peers. Open
+sessions are not ended.
 
 **Request Body:**
 ```json
@@ -231,6 +233,8 @@ curl -X PUT http://localhost:8080/admin/accounts/user@example.com \
 **Endpoint:** `DELETE /admin/accounts/{email}`
 
 Soft delete an account. The account is marked as deleted but data is retained during the grace period.
+Its open sessions are ended and its cached logins dropped, on this node's servers and their
+cluster peers, as `POST /admin/connections/kick` does.
 
 **Response:** `200 OK`
 ```json
@@ -352,7 +356,9 @@ Retrieve detailed information about a specific credential and its associated acc
 
 **Endpoint:** `DELETE /admin/credentials/{email}`
 
-Delete a specific credential. Cannot delete primary or last remaining credential.
+Delete a specific credential. Cannot delete primary or last remaining credential. The address
+stops signing in at once: the account's cached logins are dropped on this node's servers and
+their cluster peers.
 
 **Response:** `200 OK`
 ```json
