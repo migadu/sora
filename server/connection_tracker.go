@@ -28,6 +28,10 @@ const (
 	// ConnectionEventKick indicates a user should be kicked
 	ConnectionEventKick ConnectionEventType = "CONN_KICK"
 
+	// ConnectionEventForgetLogins indicates a user's cached logins must be dropped,
+	// their sessions left alone (a password changed or a credential was removed)
+	ConnectionEventForgetLogins ConnectionEventType = "CONN_FORGET_LOGINS"
+
 	// ConnectionEventStateSnapshot indicates a full state snapshot for reconciliation
 	ConnectionEventStateSnapshot ConnectionEventType = "CONN_STATE_SNAPSHOT"
 )
@@ -106,8 +110,8 @@ type ConnectionTracker struct {
 	kickSessions   map[int64][]chan struct{} // accountID -> channels to notify
 	kickSessionsMu sync.RWMutex
 
-	// Cache invalidation (optional, for proxies)
-	lookupCache LookupCacheInvalidator // Interface for invalidating auth/routing cache on kick
+	// Cache invalidation (optional): the lookup cache of the server this tracker serves
+	lookupCache LookupCacheInvalidator // Interface for invalidating auth/routing cache on kick or forgotten logins
 
 	// Configuration
 	maxConnectionsPerUser      int  // Cluster-wide limit per user (0 = unlimited)
@@ -116,9 +120,9 @@ type ConnectionTracker struct {
 	snapshotOnly               bool // If true, only broadcast state snapshots (no individual register/unregister)
 
 	// Outgoing gossip, in three tiers drained in this order: the liveness
-	// heartbeat, which peers purge this instance's counts without; kicks, which
-	// nothing repairs once dropped; and ordinary register/unregister traffic,
-	// which the next push/pull repairs.
+	// heartbeat, which peers purge this instance's counts without; kicks and
+	// forgotten logins, which nothing repairs once dropped; and ordinary
+	// register/unregister traffic, which the next push/pull repairs.
 	queue          *gossipQueue
 	criticalQueue  *gossipQueue
 	heartbeatQueue *gossipQueue
@@ -141,13 +145,18 @@ type ConnectionTracker struct {
 	stopOnce      sync.Once
 }
 
-// LookupCacheInvalidator drops a proxy's cached auth and routing entry for one
-// user. Entries are keyed by the name of the server the session is on, which
-// the cache derives itself: a tracker that built the key would have to
-// reproduce a format it does not own, and a key that does not match exactly
-// invalidates nothing.
+// LookupCacheInvalidator drops a server's cached auth and routing entries.
+// Entries are keyed by the name of the server the session is on, which the
+// cache derives itself: a tracker that built the key would have to reproduce a
+// format it does not own, and a key that does not match exactly invalidates
+// nothing.
 type LookupCacheInvalidator interface {
+	// InvalidateUser drops the entry a proxy cached for one submitted username.
 	InvalidateUser(serverName, username string)
+	// InvalidateAccount drops every entry that lets the account sign in, under
+	// any address and key: all a tracker can name when it knows no username
+	// (no session here), or when the address a backend cached is another alias.
+	InvalidateAccount(accountID int64)
 }
 
 // NewConnectionTracker creates a new connection tracker.
@@ -557,37 +566,7 @@ func (ct *ConnectionTracker) KickUser(accountID int64, protocol string) error {
 	}
 	ct.mu.RUnlock()
 
-	if ct.clusterManager != nil {
-		// Cluster mode: broadcast kick event via gossip
-		logger.Info("Gossip tracker: Broadcasting kick", "name", ct.name, "account_id", accountID, "protocol", protocol)
-
-		// The event is tagged with this tracker's own protocol, which is what
-		// receivers filter on. Callers name the tracker however they index it -
-		// the admin API passes "IMAP-host-listener" - and a name that is not
-		// exactly ct.name would be discarded by every peer.
-		encoded := ct.queueEvent(ConnectionEvent{
-			Type:       ConnectionEventKick,
-			AccountID:  accountID,
-			Username:   username,
-			Protocol:   ct.name,
-			Timestamp:  time.Now(),
-			NodeID:     ct.clusterManager.GetNodeID(),
-			InstanceID: ct.instanceID,
-		})
-
-		// Gossip retires a broadcast after a bounded number of transmissions
-		// with no acknowledgement, so a given peer can miss it. A kick is an
-		// operator-rate event, so it is also sent to every current member over
-		// TCP; the gossip copy remains as the backstop for peers that were
-		// unreachable or that join while the send is in flight.
-		if encoded != nil {
-			go func() {
-				delivered, failed := ct.clusterManager.SendConnectionEventReliable(encoded)
-				logger.Info("Gossip tracker: Kick delivered to members", "name", ct.name,
-					"account_id", accountID, "delivered", delivered, "failed", failed)
-			}()
-		}
-	}
+	ct.broadcastAccountEvent(ConnectionEventKick, accountID, username)
 
 	// The kick is applied here whatever the mode. No path back into the cluster
 	// reaches this node: the reliable fan-out skips self, gossip does not loop a
@@ -604,17 +583,79 @@ func (ct *ConnectionTracker) KickUser(accountID int64, protocol string) error {
 	return nil
 }
 
-// applyKick closes every session this node holds for an account and drops the
-// cached routing and auth entry held for the address the connection was
-// registered under, so that a reconnect is looked up afresh. It reports how
-// many sessions there were. Both steps are idempotent - a channel that is
-// already closed is left alone - so a node may reach this both from the kick it
-// issued and from a peer's copy of the same event.
-func (ct *ConnectionTracker) applyKick(accountID int64, username string) int {
-	if ct.lookupCache != nil && username != "" {
-		ct.lookupCache.InvalidateUser(ct.serverName, username)
-		logger.Debug("Connection tracker: Invalidated cache on kick", "name", ct.name, "server", ct.serverName, "user", username, "account_id", accountID)
+// ForgetLogins drops the account's cached logins on this node and, in cluster
+// mode, on its peers, and leaves its sessions alone: after a password change or
+// a removed credential, the next login has to be checked against the database.
+// username is the address that changed, if known; the account's entries under
+// every other address are dropped as well.
+func (ct *ConnectionTracker) ForgetLogins(accountID int64, username string) error {
+	if ct == nil {
+		return fmt.Errorf("connection tracker not initialized")
 	}
+
+	ct.broadcastAccountEvent(ConnectionEventForgetLogins, accountID, username)
+	// Applied here as well, for the reasons KickUser gives.
+	ct.forgetLogins(accountID, username)
+	return nil
+}
+
+// broadcastAccountEvent sends a kick or forget-logins event for an account to
+// every peer. It does nothing outside cluster mode.
+func (ct *ConnectionTracker) broadcastAccountEvent(eventType ConnectionEventType, accountID int64, username string) {
+	if ct.clusterManager == nil {
+		return
+	}
+	logger.Info("Gossip tracker: Broadcasting account event", "name", ct.name, "type", eventType, "account_id", accountID)
+
+	// The event is tagged with this tracker's own protocol, which is what
+	// receivers filter on. Callers name the tracker however they index it -
+	// the admin API passes "IMAP-host-listener" - and a name that is not
+	// exactly ct.name would be discarded by every peer.
+	encoded := ct.queueEvent(ConnectionEvent{
+		Type:       eventType,
+		AccountID:  accountID,
+		Username:   username,
+		Protocol:   ct.name,
+		Timestamp:  time.Now(),
+		NodeID:     ct.clusterManager.GetNodeID(),
+		InstanceID: ct.instanceID,
+	})
+
+	// Gossip retires a broadcast after a bounded number of transmissions
+	// with no acknowledgement, so a given peer can miss it. These are
+	// operator-rate events, so each is also sent to every current member over
+	// TCP; the gossip copy remains as the backstop for peers that were
+	// unreachable or that join while the send is in flight.
+	if encoded != nil {
+		go func() {
+			delivered, failed := ct.clusterManager.SendConnectionEventReliable(encoded)
+			logger.Info("Gossip tracker: Account event delivered to members", "name", ct.name,
+				"type", eventType, "account_id", accountID, "delivered", delivered, "failed", failed)
+		}()
+	}
+}
+
+// forgetLogins drops the cached routing and auth entries that let the account
+// sign in: the one for the address given (a proxy keys it by the username the
+// client submitted) and every other one the account has.
+func (ct *ConnectionTracker) forgetLogins(accountID int64, username string) {
+	if ct.lookupCache == nil {
+		return
+	}
+	if username != "" {
+		ct.lookupCache.InvalidateUser(ct.serverName, username)
+	}
+	ct.lookupCache.InvalidateAccount(accountID)
+	logger.Debug("Connection tracker: Invalidated cached logins", "name", ct.name, "server", ct.serverName, "user", username, "account_id", accountID)
+}
+
+// applyKick closes every session this node holds for an account and drops the
+// account's cached routing and auth entries, so that a reconnect is looked up
+// afresh. It reports how many sessions there were. Both steps are idempotent - a
+// channel that is already closed is left alone - so a node may reach this both
+// from the kick it issued and from a peer's copy of the same event.
+func (ct *ConnectionTracker) applyKick(accountID int64, username string) int {
+	ct.forgetLogins(accountID, username)
 
 	ct.kickSessionsMu.Lock()
 	defer ct.kickSessionsMu.Unlock()
@@ -697,7 +738,7 @@ func (ct *ConnectionTracker) queueEvent(event ConnectionEvent) []byte {
 	switch {
 	case isHeartbeat(event):
 		ct.heartbeatQueue.enqueue(encoded)
-	case event.Type == ConnectionEventKick:
+	case event.Type == ConnectionEventKick || event.Type == ConnectionEventForgetLogins:
 		ct.criticalQueue.enqueue(encoded)
 	default:
 		ct.queue.enqueue(encoded)
@@ -774,6 +815,9 @@ func (ct *ConnectionTracker) HandleClusterEvent(data []byte) {
 		ct.handleUnregister(event)
 	case ConnectionEventKick:
 		ct.handleKick(event)
+	case ConnectionEventForgetLogins:
+		logger.Info("Gossip tracker: Received forget-logins", "name", ct.name, "account_id", event.AccountID, "from_node", event.NodeID)
+		ct.forgetLogins(event.AccountID, event.Username)
 	case ConnectionEventStateSnapshot:
 		// A payload-less snapshot is a heartbeat; recording the instance as
 		// seen above is all it is for. Snapshots with a payload come from a

@@ -1018,6 +1018,9 @@ paths:
         - Use `password_hash` for pre-computed hashes (bcrypt, SSHA512, SHA512)
         
         **Note**: You cannot specify both `password` and `password_hash` in the same request.
+
+        The old password stops working at once: cached logins for the account are dropped
+        on this node's servers and their cluster peers. Open sessions are not ended.
       parameters:
         - name: email
           in: path
@@ -1084,7 +1087,7 @@ paths:
       tags:
         - Account Management
       summary: Delete an account (soft delete)
-      description: Soft deletes an account, marking it as deleted but preserving data for the grace period. The account can be restored during this time.
+      description: Soft deletes an account, marking it as deleted but preserving data for the grace period. The account can be restored during this time. Its open sessions are ended and its cached logins dropped, on this node's servers and their cluster peers, as `/admin/connections/kick` does.
       parameters:
         - name: email
           in: path
@@ -1512,6 +1515,7 @@ paths:
       description: >
         Deletes a specific credential (email/password combination) from an account.
         This operation will fail if you attempt to delete the primary credential or the last remaining credential for an account.
+        The address stops signing in at once: cached logins for the account are dropped on this node's servers and their cluster peers.
       parameters:
         - name: email
           in: path

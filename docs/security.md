@@ -95,10 +95,10 @@ search_rate_limit_window = "1m" # Time window for rate limiting
 ```
 
 When a user exceeds the limit, they receive a clear error message indicating how long to wait before trying again. The rate limiter:
-- Tracks searches per user (not per IP)
+- Tracks searches per user (not per IP), counting SEARCH, SORT, THREAD and MULTISEARCH alike
 - Uses a sliding time window
 - Automatically cleans up inactive user tracking
-- Is disabled by default (set `search_rate_limit_per_min` to enable)
+- Is on by default at 60 searches per minute (set `search_rate_limit_per_min = 0` to disable it)
 
 ### Session Memory Limits
 

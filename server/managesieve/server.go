@@ -301,10 +301,12 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		serverInstance.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
-	// Use all supported extensions by default if none are configured
+	// Unconfigured, offer the default set: the one delivery compiles scripts with
+	// (sieveengine.DefaultSieveExtensions). Offering more would let a user activate
+	// a script that delivery cannot compile, and then skips without a word.
 	if len(serverInstance.supportedExtensions) == 0 {
-		serverInstance.supportedExtensions = SupportedExtensions
-		logger.Debug("ManageSieve: No supported_extensions configured - using all available", "name", name, "extensions", SupportedExtensions)
+		serverInstance.supportedExtensions = DefaultEnabledExtensions
+		logger.Debug("ManageSieve: No supported_extensions configured - using the default set", "name", name, "extensions", DefaultEnabledExtensions)
 	}
 
 	// Create connection limiter with trusted networks from server configuration
@@ -658,6 +660,11 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 // SetConnTracker sets the connection tracker for this server
 func (s *ManageSieveServer) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 	s.connTracker = tracker
+	// A kick, or logins forgotten after an account change, must reach this
+	// server's cached logins too, or they keep signing the account in.
+	if tracker != nil && s.lookupCache != nil {
+		tracker.SetLookupCache(s.lookupCache)
+	}
 }
 
 func (s *ManageSieveServer) Close() {

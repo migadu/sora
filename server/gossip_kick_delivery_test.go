@@ -95,3 +95,57 @@ func TestKickClosesSessionsOnTheIssuingNode(t *testing.T) {
 		t.Fatal("a session on the node that issued the kick was never closed")
 	}
 }
+
+// TestForgetLoginsReachesAPeer is the cluster path for a changed password: the
+// peer drops the account's cached logins, and its sessions carry on.
+func TestForgetLoginsReachesAPeer(t *testing.T) {
+	const accountID int64 = 42
+
+	clusterA, err := newKickTestCluster("forget-node-1", 25950, nil)
+	if err != nil {
+		t.Fatalf("create cluster A: %v", err)
+	}
+	defer clusterA.Shutdown()
+
+	clusterB, err := newKickTestCluster("forget-node-2", 25951, []string{"127.0.0.1:25950"})
+	if err != nil {
+		t.Fatalf("create cluster B: %v", err)
+	}
+	defer clusterB.Shutdown()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for clusterA.GetMemberCount() < 2 || clusterB.GetMemberCount() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("cluster did not form: A=%d B=%d members", clusterA.GetMemberCount(), clusterB.GetMemberCount())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	trackerA := NewConnectionTracker("IMAP", "listener-a", "host-a", "host-a-listener-a", clusterA, 0, 0, 100, false)
+	defer trackerA.Stop()
+	trackerB := NewConnectionTracker("IMAP", "listener-b", "host-b", "host-b-listener-b", clusterB, 0, 0, 100, false)
+	defer trackerB.Stop()
+
+	cachedKey := lookupCacheKey("listener-b", "alias@example.com")
+	cache := newFakeLookupCache()
+	cache.add(cachedKey, accountID)
+	trackerB.SetLookupCache(cache)
+	session := trackerB.RegisterSession(accountID)
+
+	if err := trackerA.ForgetLogins(accountID, "user@example.com"); err != nil {
+		t.Fatalf("ForgetLogins: %v", err)
+	}
+
+	deadline = time.Now().Add(10 * time.Second)
+	for cache.has(cachedKey) {
+		if time.Now().After(deadline) {
+			t.Fatal("the peer kept the account's cached login")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	select {
+	case <-session:
+		t.Error("forgetting logins ended a session on the peer")
+	default:
+	}
+}

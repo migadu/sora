@@ -277,6 +277,26 @@ func (c *LookupCache) InvalidateUser(serverName, username string) {
 	c.Invalidate(makeKey(serverName, username))
 }
 
+// InvalidateAccount removes every entry that lets accountID sign in, under any
+// address and whatever the key format (backend or proxy), so that a deleted
+// account, credential or password stops working at once. Negative entries name
+// no account and are left alone: they never let anyone in.
+// Safe to call on a nil receiver (no-op when the cache is disabled).
+func (c *LookupCache) InvalidateAccount(accountID int64) {
+	if c == nil || accountID == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for key, entry := range c.entries {
+		if !entry.IsNegative && entry.AccountID == accountID {
+			delete(c.entries, key)
+		}
+	}
+	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+}
+
 // evictOldest removes the oldest entry from the cache
 // Caller must hold the write lock
 func (c *LookupCache) evictOldest() {

@@ -2,13 +2,16 @@ package managesieve
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/migadu/sora/pkg/resilient"
 )
 
 // TestDefaultExtensions verifies that when no supported_extensions are configured,
-// all extensions from SupportedExtensions are used by default.
+// the default set is used: the one delivery (LMTP, the Admin API) compiles scripts
+// with, so ManageSieve never accepts a script that delivery then cannot run.
+// editheader is not in it.
 func TestDefaultExtensions(t *testing.T) {
 	// Create a minimal server with no supported_extensions configured
 	options := ManageSieveServerOptions{
@@ -31,21 +34,16 @@ func TestDefaultExtensions(t *testing.T) {
 	}
 	defer server.Close()
 
-	// Verify that supportedExtensions contains all SupportedExtensions
-	if len(server.supportedExtensions) != len(SupportedExtensions) {
-		t.Errorf("Expected %d default extensions, got %d", len(SupportedExtensions), len(server.supportedExtensions))
+	if !slices.Equal(server.supportedExtensions, DefaultEnabledExtensions) {
+		t.Errorf("default extensions = %v, want delivery's default set %v", server.supportedExtensions, DefaultEnabledExtensions)
 	}
 
-	// Verify each extension from SupportedExtensions is present
 	extensionMap := make(map[string]bool)
 	for _, ext := range server.supportedExtensions {
 		extensionMap[ext] = true
 	}
-
-	for _, expectedExt := range SupportedExtensions {
-		if !extensionMap[expectedExt] {
-			t.Errorf("Expected extension %q not found in default extensions", expectedExt)
-		}
+	if extensionMap["editheader"] {
+		t.Error("editheader is enabled by default; it must be opted into via [sieve] enabled_extensions")
 	}
 
 	// Verify all extensions listed in config.toml.example are present
@@ -132,8 +130,7 @@ func TestEmptyExtensionsArray(t *testing.T) {
 	}
 	defer server.Close()
 
-	// Verify that supportedExtensions contains all SupportedExtensions
-	if len(server.supportedExtensions) != len(SupportedExtensions) {
-		t.Errorf("Expected %d default extensions for empty array, got %d", len(SupportedExtensions), len(server.supportedExtensions))
+	if !slices.Equal(server.supportedExtensions, DefaultEnabledExtensions) {
+		t.Errorf("default extensions for empty array = %v, want %v", server.supportedExtensions, DefaultEnabledExtensions)
 	}
 }

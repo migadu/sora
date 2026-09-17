@@ -844,7 +844,7 @@ func (c *RemoteLookupConfig) GetRemotePort() (int, error) {
 
 // ServerLimitsConfig holds resource limits for a server
 type ServerLimitsConfig struct {
-	SearchRateLimitPerMin int    `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled)
+	SearchRateLimitPerMin *int   `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled, default: 60)
 	SearchRateLimitWindow string `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
 	RedirectRateLimit     *int   `toml:"redirect_rate_limit,omitempty"`       // Redirect rate limit (per account across the window, 0=unlimited, default: 100)
 	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (default: 1h)
@@ -1097,7 +1097,7 @@ type AdminCLIConfig struct {
 
 // SieveConfig holds Sieve script engine configuration
 type SieveConfig struct {
-	EnabledExtensions []string `toml:"enabled_extensions"` // List of enabled Sieve extensions (empty = all extensions enabled)
+	EnabledExtensions []string `toml:"enabled_extensions"` // List of enabled Sieve extensions (empty = the default set, without editheader)
 	MaxExecutionTime  string   `toml:"max_execution_time"` // Per-script execution budget, also the per-match regex soft-wait cap (e.g. "2s"); default 2s
 }
 
@@ -1588,9 +1588,10 @@ func (s *ServerConfig) GetLMTPCommandTimeoutsOverrides() (map[string]time.Durati
 }
 
 // GetSearchRateLimitPerMin returns search rate limit per minute
+// (0 or less disables the limit; unset gets the default).
 func (s *ServerConfig) GetSearchRateLimitPerMin() int {
-	if s.Limits != nil && s.Limits.SearchRateLimitPerMin > 0 {
-		return s.Limits.SearchRateLimitPerMin
+	if s.Limits != nil && s.Limits.SearchRateLimitPerMin != nil {
+		return *s.Limits.SearchRateLimitPerMin
 	}
 	return 60 // Default: 60 searches per minute (iOS Mail does 10-15 searches when switching mailboxes)
 }

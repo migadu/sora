@@ -207,3 +207,103 @@ func TestIMAP_Thread_Integration(t *testing.T) {
 		}
 	})
 }
+
+// TestIMAP_Thread_ReferencesHeaders threads messages the way mail clients write
+// them: a References line naming the whole ancestry, a parent that is not in the
+// mailbox (the user's own reply, filed in Sent), and a message with no Message-ID.
+func TestIMAP_Thread_ReferencesHeaders(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("Select INBOX failed: %v", err)
+	}
+
+	// Subjects differ throughout, so only the references can join UIDs 1-3.
+	start := time.Now().Add(-4 * time.Hour)
+	for i, body := range []string{
+		"Message-ID: <q@example.com>\r\nSubject: Question\r\n\r\nAsking",
+		"Message-ID: <r2@example.com>\r\nIn-Reply-To: <mine@example.com>\r\n" +
+			"References: <q@example.com> <mine@example.com>\r\nSubject: Answer\r\n\r\nAnswering the reply in Sent",
+		"Message-ID: <r3@example.com>\r\nIn-Reply-To: <r2@example.com>\r\n" +
+			"References: <q@example.com>\r\n <mine@example.com> <r2@example.com>\r\nSubject: Something else\r\n\r\nFolded References",
+		"Subject: No id\r\n\r\nNo Message-ID at all",
+	} {
+		appendCmd := c.Append("INBOX", int64(len(body)), &imap.AppendOptions{Time: start.Add(time.Duration(i) * time.Hour)})
+		if _, err := appendCmd.Write([]byte(body)); err != nil {
+			t.Fatalf("Append write failed: %v", err)
+		}
+		if err := appendCmd.Close(); err != nil {
+			t.Fatalf("Append close failed: %v", err)
+		}
+		if _, err := appendCmd.Wait(); err != nil {
+			t.Fatalf("Append %d failed: %v", i+1, err)
+		}
+	}
+
+	for _, alg := range []imap.ThreadAlgorithm{imap.ThreadReferences, imap.ThreadRefs} {
+		t.Run(string(alg), func(t *testing.T) {
+			res, err := c.UIDThread(&imapclient.ThreadOptions{
+				Algorithm:      alg,
+				SearchCriteria: &imap.SearchCriteria{},
+			}).Wait()
+			if err != nil {
+				t.Fatalf("UID THREAD %s failed: %v", alg, err)
+			}
+			if len(res) != 2 {
+				t.Fatalf("Expected 2 threads, got %d: %+v", len(res), res)
+			}
+			if got := res[0].Chain; len(got) != 3 || got[0] != 1 || got[1] != 2 || got[2] != 3 {
+				t.Errorf("Expected first thread [1 2 3], got %+v", res[0])
+			}
+			if got := res[1].Chain; len(got) != 1 || got[0] != 4 {
+				t.Errorf("Expected second thread [4], got %+v", res[1])
+			}
+		})
+	}
+}
+
+// TestIMAP_Thread_EveryAlgorithmAdvertised checks that each algorithm THREAD
+// accepts is in CAPABILITY: a client only uses the ones it is offered.
+func TestIMAP_Thread_EveryAlgorithmAdvertised(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("Failed to dial IMAP server: %v", err)
+	}
+	defer c.Logout()
+
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("Login failed: %v", err)
+	}
+	caps, err := c.Capability().Wait()
+	if err != nil {
+		t.Fatalf("CAPABILITY failed: %v", err)
+	}
+
+	advertised := caps.ThreadAlgorithms()
+	for _, want := range []imap.ThreadAlgorithm{imap.ThreadOrderedSubject, imap.ThreadReferences, imap.ThreadRefs} {
+		found := false
+		for _, alg := range advertised {
+			found = found || alg == want
+		}
+		if !found {
+			t.Errorf("THREAD=%s not advertised; advertised: %v", want, advertised)
+		}
+	}
+}

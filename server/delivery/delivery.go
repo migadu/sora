@@ -135,9 +135,11 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		}
 	}
 
-	// Extract plaintext body for FTS (also the body the Sieve evaluation sees)
+	// Extract plaintext body for FTS (also the body the Sieve evaluation sees). A
+	// message with no text/plain or text/html part (attachment only) yields no text
+	// and no error; it is delivered with an empty body, as LMTP and APPEND do.
 	plaintextBody, err := helpers.ExtractPlaintextBody(messageEntity)
-	if err != nil {
+	if err != nil || plaintextBody == nil {
 		emptyBody := ""
 		plaintextBody = &emptyBody
 	}

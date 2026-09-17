@@ -345,10 +345,11 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		proxyReader:                proxyReader,
 	}
 
-	// Use all supported extensions by default if none are configured
+	// Unconfigured, advertise the default set, which is what an unconfigured backend
+	// accepts, not extensions it will refuse.
 	if len(s.supportedExtensions) == 0 {
-		s.supportedExtensions = managesieve.SupportedExtensions
-		logger.Debug("ManageSieve Proxy: No supported_extensions configured - using all available", "name", opts.Name, "extensions", managesieve.SupportedExtensions)
+		s.supportedExtensions = managesieve.DefaultEnabledExtensions
+		logger.Debug("ManageSieve Proxy: No supported_extensions configured - using the default set", "name", opts.Name, "extensions", managesieve.DefaultEnabledExtensions)
 	}
 
 	// Setup TLS config: Support both implicit TLS and STARTTLS

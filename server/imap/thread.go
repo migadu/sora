@@ -3,9 +3,11 @@ package imap
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
@@ -131,107 +133,88 @@ type jwzNode struct {
 
 // threadReferences implements the REFERENCES threading algorithm (RFC 5256 section 2.2 / JWZ algorithm)
 func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db.ThreadMessageResult, skipSubjectGrouping bool) []imap.ThreadData {
-	// The JWZ algorithm:
-	// 1. Group by Message-ID
+	// 1. Link messages by their references (RFC 5256 section 2.2, step 1).
 	idTable := make(map[string]*jwzNode)
+	byID := func(id string) *jwzNode {
+		node, ok := idTable[id]
+		if !ok {
+			node = &jwzNode{} // a dummy until a message with this id turns up
+			idTable[id] = node
+		}
+		return node
+	}
 
-	// Pre-populate nodes for all matching messages
+	// Every message gets a node of its own. A Message-ID names the node of the first
+	// message carrying it (messages is in UID order, so sequence order); a message
+	// without one, or repeating one an earlier message holds, keeps a node no
+	// reference reaches, which is what the RFC's "unique Message ID" amounts to.
+	nodes := make([]*jwzNode, len(messages))
 	for i := range messages {
-		msg := &messages[i]
-		node := &jwzNode{
-			msg: msg,
-			id:  s.getMessageID(numKind, *msg),
+		node := &jwzNode{}
+		if ids := extractIDs(messages[i].MessageID); len(ids) == 1 {
+			if named := byID(ids[0]); named.msg == nil {
+				node = named
+			}
+		}
+		node.msg = &messages[i]
+		node.id = s.getMessageID(numKind, messages[i])
+		nodes[i] = node
+	}
+
+	for i, node := range nodes {
+		// 1.A: chain the references, each the parent of the next. A link already
+		// made stays (a References line may have been cut short), and no link may
+		// close a loop.
+		var parent *jwzNode
+		for _, ref := range messageReferences(&messages[i]) {
+			next := byID(ref)
+			if parent != nil && next.parent == nil && !isAncestor(next, parent) {
+				linkChild(parent, next)
+			}
+			parent = next
 		}
 
-		msgID := msg.MessageID
-		if msgID != "" {
-			if existing, ok := idTable[msgID]; ok {
-				// If a node already exists, we prefer the one with the actual message over a dummy node.
-				if existing.msg == nil {
-					existing.msg = msg
-					existing.id = node.id
-				}
-				node = existing
-			} else {
-				idTable[msgID] = node
-			}
+		// 1.B: the last reference is this message's parent, whatever another
+		// message's references implied.
+		if node.parent != nil {
+			unlinkChild(node)
+		}
+		if parent != nil && !isAncestor(node, parent) {
+			linkChild(parent, node)
 		}
 	}
 
-	// 2. Link messages via In-Reply-To and References
-	for i := range messages {
-		msg := &messages[i]
-		if msg.InReplyTo == "" && msg.References == "" {
-			continue
-		}
-
-		// For true JWZ, we process the full References header first, followed by In-Reply-To.
-		chain := strings.TrimSpace(msg.References + " " + msg.InReplyTo)
-		refs := extractIDs(chain)
-
-		if len(refs) == 0 {
-			continue
-		}
-
-		var parentNode *jwzNode
-		for _, ref := range refs {
-			if existing, ok := idTable[ref]; ok {
-				parentNode = existing
-			} else {
-				// Create dummy node
-				dummy := &jwzNode{}
-				idTable[ref] = dummy
-				parentNode = dummy
-			}
-		}
-
-		childMsgID := msg.MessageID
-		var childNode *jwzNode
-		if childMsgID != "" {
-			childNode = idTable[childMsgID]
-		} else {
-			// Find it by linear search since it lacks a message ID
-			for _, n := range idTable {
-				if n.msg != nil && n.id == s.getMessageID(numKind, *msg) {
-					childNode = n
-					break
-				}
-			}
-		}
-
-		if childNode != nil && parentNode != nil && childNode.parent == nil {
-			// Detect loops
-			if !isAncestor(childNode, parentNode) {
-				childNode.parent = parentNode
-				parentNode.children = append(parentNode.children, childNode)
-			}
-		}
-	}
-
-	// 3. Find root nodes (those without parents)
+	// 2. The threads start at the nodes without a parent.
 	var rootNodes []*jwzNode
-	for _, node := range idTable {
+	for _, node := range nodes {
 		if node.parent == nil {
 			rootNodes = append(rootNodes, node)
 		}
 	}
-
-	// 4. Prune dummy nodes
-	for i := 0; i < len(rootNodes); i++ {
-		root := rootNodes[i]
-		if root.msg == nil {
-			if len(root.children) == 0 {
-				continue
-			} else if len(root.children) == 1 {
-				// Promote child
-				child := root.children[0]
-				child.parent = nil
-				rootNodes[i] = child
-			} else {
-				// Keep dummy node as root with multiple children
-			}
+	for _, node := range idTable {
+		if node.parent == nil && node.msg == nil {
+			rootNodes = append(rootNodes, node)
 		}
 	}
+
+	// 3. Prune dummy nodes: one without children goes, one with children gives way
+	// to them, except that a dummy at the top keeps several children together.
+	pruned := rootNodes[:0]
+	for _, root := range rootNodes {
+		pruneDummies(root)
+		switch {
+		case root.msg != nil || len(root.children) > 1:
+			pruned = append(pruned, root)
+		case len(root.children) == 1:
+			child := root.children[0]
+			child.parent = nil
+			pruned = append(pruned, child)
+		}
+	}
+	rootNodes = pruned
+
+	// 4. Order the threads by date before grouping them by subject.
+	sortByEarliest(rootNodes)
 
 	// 5. Subject Grouping (RFC 5256 JWZ algorithm phase 5)
 	if !skipSubjectGrouping {
@@ -310,17 +293,9 @@ func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db
 	}
 
 	// 6. Sort root nodes
-	sort.Slice(rootNodes, func(i, j int) bool {
-		dateI := getEarliestDate(rootNodes[i])
-		dateJ := getEarliestDate(rootNodes[j])
-		if !dateI.Equal(dateJ) {
-			return dateI.Before(dateJ)
-		}
-		// Fallback to sort by ID
-		return getEarliestID(rootNodes[i]) < getEarliestID(rootNodes[j])
-	})
+	sortByEarliest(rootNodes)
 
-	// 6. Build the ThreadData structure
+	// 7. Build the ThreadData structure
 	var result []imap.ThreadData
 	for _, root := range rootNodes {
 		if td := buildThreadData(root); td != nil {
@@ -361,22 +336,67 @@ func isAncestor(child, parent *jwzNode) bool {
 	return false
 }
 
-func extractIDs(s string) []string {
-	var ids []string
-	start := -1
-	for i, c := range s {
-		if c == '<' {
-			start = i
-		} else if c == '>' && start != -1 {
-			ids = append(ids, s[start:i+1])
-			start = -1
+func linkChild(parent, child *jwzNode) {
+	child.parent = parent
+	parent.children = append(parent.children, child)
+}
+
+func unlinkChild(child *jwzNode) {
+	child.parent.children = slices.DeleteFunc(child.parent.children, func(n *jwzNode) bool { return n == child })
+	child.parent = nil
+}
+
+// pruneDummies replaces every dummy below node with that dummy's children (RFC 5256
+// section 2.2, step 3), so that afterwards every node below node is a message.
+func pruneDummies(node *jwzNode) {
+	children := make([]*jwzNode, 0, len(node.children))
+	for _, child := range node.children {
+		pruneDummies(child)
+		if child.msg != nil {
+			children = append(children, child)
+			continue
 		}
+		for _, grandchild := range child.children {
+			grandchild.parent = node
+		}
+		children = append(children, child.children...)
 	}
-	if len(ids) == 0 && strings.TrimSpace(s) != "" {
-		// Just take the string if it doesn't have brackets
-		return []string{strings.TrimSpace(s)}
+	node.children = children
+}
+
+// messageReferences returns the ids RFC 5256 threads a message by: those in its
+// References, or failing that the first one in its In-Reply-To.
+func messageReferences(msg *db.ThreadMessageResult) []string {
+	if refs := extractIDs(msg.References); len(refs) > 0 {
+		return refs
 	}
-	return ids
+	if refs := extractIDs(msg.InReplyTo); len(refs) > 0 {
+		return refs[:1]
+	}
+	return nil
+}
+
+// extractIDs splits a stored Message-ID, In-Reply-To or References value into
+// message ids. The messages table holds them without angle brackets, several
+// joined by a space (db.InsertMessage); a bracketed value splits the same way, and
+// every id comes back bare, so ids from the three columns compare equal.
+func extractIDs(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		return r == '<' || r == '>' || unicode.IsSpace(r)
+	})
+}
+
+// sortByEarliest orders nodes by the earliest sent date in each subtree, then by
+// the lowest message number in it.
+func sortByEarliest(nodes []*jwzNode) {
+	sort.Slice(nodes, func(i, j int) bool {
+		dateI := getEarliestDate(nodes[i])
+		dateJ := getEarliestDate(nodes[j])
+		if !dateI.Equal(dateJ) {
+			return dateI.Before(dateJ)
+		}
+		return getEarliestID(nodes[i]) < getEarliestID(nodes[j])
+	})
 }
 
 func getEarliestDate(node *jwzNode) time.Time {
@@ -431,15 +451,7 @@ func buildThreadData(node *jwzNode) *imap.ThreadData {
 
 	// Add subthreads if there are multiple branches
 	if curr != nil && len(curr.children) > 1 {
-		// Sort children by date
-		sort.Slice(curr.children, func(i, j int) bool {
-			dateI := getEarliestDate(curr.children[i])
-			dateJ := getEarliestDate(curr.children[j])
-			if !dateI.Equal(dateJ) {
-				return dateI.Before(dateJ)
-			}
-			return getEarliestID(curr.children[i]) < getEarliestID(curr.children[j])
-		})
+		sortByEarliest(curr.children)
 
 		for _, child := range curr.children {
 			if sub := buildThreadData(child); sub != nil {

@@ -896,6 +896,9 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The old password stops working now, not when a cached login expires.
+	s.forgetAccountLogins(s.trackedAccountID(ctx, email), email)
+
 	s.writeJSON(w, http.StatusOK, map[string]string{
 		"message": "Account updated successfully",
 	})
@@ -906,6 +909,7 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	email := extractLastPathSegment(r.URL.Path)
 	ctx := r.Context()
 
+	accountID := s.trackedAccountID(ctx, email)
 	err := s.rdb.DeleteAccountWithRetry(ctx, email)
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
@@ -921,6 +925,10 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// A deleted account is signed out everywhere, and cannot sign back in from a
+	// cached login.
+	s.endAccountSessions(accountID, email)
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":   email,
@@ -1071,6 +1079,8 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 	email := extractLastPathSegment(r.URL.Path)
 	ctx := r.Context()
 
+	// Resolved first: once the credential is gone, the address names no account.
+	accountID := s.trackedAccountID(ctx, email)
 	err := s.rdb.DeleteCredentialWithRetry(ctx, email)
 	if err != nil {
 		// Check for specific user-facing errors from the DB layer
@@ -1089,10 +1099,65 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// The address stops signing in now, not when a cached login expires.
+	s.forgetAccountLogins(accountID, email)
+
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"email":   email,
 		"message": "Credential deleted successfully",
 	})
+}
+
+// trackedAccountID resolves the account an account change applies to, for
+// endAccountSessions and forgetAccountLogins. It is zero when this node has no
+// servers to tell, or when the address names no account.
+func (s *Server) trackedAccountID(ctx context.Context, address string) int64 {
+	if len(s.connectionTrackers) == 0 {
+		return 0
+	}
+	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, address)
+	if err != nil {
+		if !errors.Is(err, consts.ErrUserNotFound) {
+			logger.Warn("HTTP API: Cannot resolve account; its sessions and cached logins are left as they are",
+				"name", s.name, "email", address, "error", err)
+		}
+		return 0
+	}
+	return accountID
+}
+
+// endAccountSessions closes the account's sessions on this node's servers and,
+// through the trackers that gossip, on their cluster peers. A kick also drops the
+// account's cached logins.
+func (s *Server) endAccountSessions(accountID int64, address string) {
+	if accountID == 0 {
+		return
+	}
+	for key, tracker := range s.connectionTrackers {
+		if tracker == nil {
+			continue
+		}
+		if err := tracker.KickUser(accountID, key); err != nil {
+			logger.Warn("HTTP API: Error ending sessions", "name", s.name, "email", address, "tracker", key, "error", err)
+		}
+	}
+}
+
+// forgetAccountLogins drops the account's cached logins on this node's servers
+// and, through the trackers that gossip, on their cluster peers, so that its next
+// login is checked against the database. Its sessions are left alone.
+func (s *Server) forgetAccountLogins(accountID int64, address string) {
+	if accountID == 0 {
+		return
+	}
+	for key, tracker := range s.connectionTrackers {
+		if tracker == nil {
+			continue
+		}
+		if err := tracker.ForgetLogins(accountID, address); err != nil {
+			logger.Warn("HTTP API: Error dropping cached logins", "name", s.name, "email", address, "tracker", key, "error", err)
+		}
+	}
 }
 
 // extractProtocolFromKey extracts the protocol name from a tracker key.

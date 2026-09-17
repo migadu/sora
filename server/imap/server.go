@@ -1115,6 +1115,11 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 // SetConnTracker sets the connection tracker for this server
 func (s *IMAPServer) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 	s.connTracker = tracker
+	// A kick, or logins forgotten after an account change, must reach this
+	// server's cached logins too, or they keep signing the account in.
+	if tracker != nil && s.lookupCache != nil {
+		tracker.SetLookupCache(s.lookupCache)
+	}
 }
 
 func (s *IMAPServer) Close() {

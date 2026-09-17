@@ -105,3 +105,141 @@ func TestThreadReferences_SubjectGrouping(t *testing.T) {
 	resultRefs := session.threadReferences(imapserver.NumKindUID, messages, true)
 	assert.Len(t, resultRefs, 4, "REFS should not group by subject, leaving 4 isolated root nodes")
 }
+
+// The ids below are written the way the messages table holds them: without angle
+// brackets, several ids joined by a space (db.InsertMessage).
+
+func TestThreadReferences_StoredIDsLinkReplies(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+
+	// Subjects differ, so only the references can put these in one thread.
+	messages := []db.ThreadMessageResult{
+		{UID: 1, Seq: 1, MessageID: "a@x", SubjectSort: "question", SentDate: now.Add(-3 * time.Hour)},
+		{UID: 2, Seq: 2, MessageID: "b@x", References: "a@x", InReplyTo: "a@x", SubjectSort: "answer", SentDate: now.Add(-2 * time.Hour)},
+		{UID: 3, Seq: 3, MessageID: "c@x", References: "a@x b@x", InReplyTo: "b@x", SubjectSort: "follow-up", SentDate: now.Add(-1 * time.Hour)},
+	}
+
+	for _, skipSubjectGrouping := range []bool{false, true} {
+		result := session.threadReferences(imapserver.NumKindUID, messages, skipSubjectGrouping)
+		assert.Len(t, result, 1, "skipSubjectGrouping=%v", skipSubjectGrouping)
+		assert.Equal(t, []uint32{1, 2, 3}, result[0].Chain, "skipSubjectGrouping=%v", skipSubjectGrouping)
+	}
+}
+
+func TestThreadReferences_ParentInAnotherMailbox(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+
+	// b@x, the user's own reply, is in Sent. Both answers to it still belong under a@x.
+	messages := []db.ThreadMessageResult{
+		{UID: 1, Seq: 1, MessageID: "a@x", SentDate: now.Add(-3 * time.Hour)},
+		{UID: 2, Seq: 2, MessageID: "c@x", References: "a@x b@x", InReplyTo: "b@x", SentDate: now.Add(-2 * time.Hour)},
+		{UID: 3, Seq: 3, MessageID: "d@x", References: "a@x b@x", InReplyTo: "b@x", SentDate: now.Add(-1 * time.Hour)},
+	}
+
+	result := session.threadReferences(imapserver.NumKindUID, messages, true)
+
+	assert.Len(t, result, 1)
+	assert.Equal(t, []uint32{1}, result[0].Chain)
+	if assert.Len(t, result[0].SubThreads, 2) {
+		assert.Equal(t, []uint32{2}, result[0].SubThreads[0].Chain)
+		assert.Equal(t, []uint32{3}, result[0].SubThreads[1].Chain)
+	}
+}
+
+func TestThreadReferences_InReplyToWithoutReferences(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+
+	// Only the first In-Reply-To id counts (RFC 5256 section 2.2).
+	messages := []db.ThreadMessageResult{
+		{UID: 1, Seq: 1, MessageID: "a@x", SentDate: now.Add(-2 * time.Hour)},
+		{UID: 2, Seq: 2, MessageID: "b@x", InReplyTo: "a@x z@x", SentDate: now.Add(-1 * time.Hour)},
+	}
+
+	result := session.threadReferences(imapserver.NumKindUID, messages, true)
+
+	assert.Len(t, result, 1)
+	assert.Equal(t, []uint32{1, 2}, result[0].Chain)
+}
+
+func TestThreadReferences_OwnReferencesOverrideAnotherMessagesGuess(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+
+	// c@x's References name d@x right after b@x, which suggests b@x is d@x's parent.
+	// d@x's own References say a@x is (c@x's line may have been cut short), and a
+	// message's own references win.
+	messages := []db.ThreadMessageResult{
+		{UID: 1, Seq: 1, MessageID: "a@x", SentDate: now.Add(-4 * time.Hour)},
+		{UID: 2, Seq: 2, MessageID: "b@x", SentDate: now.Add(-3 * time.Hour)},
+		{UID: 3, Seq: 3, MessageID: "c@x", References: "b@x d@x", SentDate: now.Add(-1 * time.Hour)},
+		{UID: 4, Seq: 4, MessageID: "d@x", References: "a@x", SentDate: now.Add(-2 * time.Hour)},
+	}
+
+	result := session.threadReferences(imapserver.NumKindUID, messages, true)
+
+	assert.Len(t, result, 2)
+	assert.Equal(t, []uint32{1, 4, 3}, result[0].Chain)
+	assert.Equal(t, []uint32{2}, result[1].Chain)
+}
+
+func TestThreadReferences_EveryMessageAppears(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+
+	// A message with no Message-ID, or with one an earlier message already has, is
+	// still threaded (RFC 5256 gives it a unique id), and references to the id reach
+	// the first message that has it.
+	messages := []db.ThreadMessageResult{
+		{UID: 1, Seq: 1, MessageID: "a@x", SentDate: now.Add(-4 * time.Hour)},
+		{UID: 2, Seq: 2, References: "a@x", SentDate: now.Add(-3 * time.Hour)},
+		{UID: 3, Seq: 3, MessageID: "a@x", SentDate: now.Add(-2 * time.Hour)},
+		{UID: 4, Seq: 4, SentDate: now.Add(-1 * time.Hour)},
+		{UID: 5, Seq: 5, MessageID: "e@x", References: "a@x", SentDate: now},
+	}
+
+	result := session.threadReferences(imapserver.NumKindUID, messages, true)
+
+	assert.Len(t, result, 3)
+	assert.Equal(t, []uint32{1}, result[0].Chain)
+	if assert.Len(t, result[0].SubThreads, 2) {
+		assert.Equal(t, []uint32{2}, result[0].SubThreads[0].Chain)
+		assert.Equal(t, []uint32{5}, result[0].SubThreads[1].Chain)
+	}
+	assert.Equal(t, []uint32{3}, result[1].Chain)
+	assert.Equal(t, []uint32{4}, result[2].Chain)
+}
+
+func TestThreadReferences_ReferenceLoop(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+
+	// Each claims to answer the other. No link may close the loop, and neither
+	// message may be lost.
+	messages := []db.ThreadMessageResult{
+		{UID: 1, Seq: 1, MessageID: "a@x", References: "b@x", SentDate: now.Add(-2 * time.Hour)},
+		{UID: 2, Seq: 2, MessageID: "b@x", References: "a@x", SentDate: now.Add(-1 * time.Hour)},
+	}
+
+	result := session.threadReferences(imapserver.NumKindUID, messages, true)
+
+	assert.Len(t, result, 1)
+	assert.Equal(t, []uint32{2, 1}, result[0].Chain)
+}
+
+func TestExtractIDs(t *testing.T) {
+	cases := map[string][]string{
+		"":                  {},
+		"  ":                {},
+		"a@x":               {"a@x"},
+		"a@x b@x":           {"a@x", "b@x"},
+		"  a@x \t b@x\r\n ": {"a@x", "b@x"},
+		"<a@x> <b@x>":       {"a@x", "b@x"},
+		"<a@x><b@x>":        {"a@x", "b@x"},
+	}
+	for in, want := range cases {
+		assert.Equal(t, want, extractIDs(in), "extractIDs(%q)", in)
+	}
+}
