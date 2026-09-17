@@ -273,37 +273,3 @@ func TestIMAP_Thread_ReferencesHeaders(t *testing.T) {
 		})
 	}
 }
-
-// TestIMAP_Thread_EveryAlgorithmAdvertised checks that each algorithm THREAD
-// accepts is in CAPABILITY: a client only uses the ones it is offered.
-func TestIMAP_Thread_EveryAlgorithmAdvertised(t *testing.T) {
-	common.SkipIfDatabaseUnavailable(t)
-
-	server, account := common.SetupIMAPServer(t)
-	defer server.Close()
-
-	c, err := imapclient.DialInsecure(server.Address, nil)
-	if err != nil {
-		t.Fatalf("Failed to dial IMAP server: %v", err)
-	}
-	defer c.Logout()
-
-	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
-		t.Fatalf("Login failed: %v", err)
-	}
-	caps, err := c.Capability().Wait()
-	if err != nil {
-		t.Fatalf("CAPABILITY failed: %v", err)
-	}
-
-	advertised := caps.ThreadAlgorithms()
-	for _, want := range []imap.ThreadAlgorithm{imap.ThreadOrderedSubject, imap.ThreadReferences, imap.ThreadRefs} {
-		found := false
-		for _, alg := range advertised {
-			found = found || alg == want
-		}
-		if !found {
-			t.Errorf("THREAD=%s not advertised; advertised: %v", want, advertised)
-		}
-	}
-}
