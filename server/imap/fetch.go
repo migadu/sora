@@ -127,6 +127,11 @@ func safeExtractBinarySectionSize(bodyData []byte, section *imap.FetchItemBinary
 }
 
 func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
+	// FETCH is not wrapped by meteredSession (it self-instruments below), so the
+	// per-command cap is applied here. It is zero by default — see CommandTimeouts.Fetch.
+	ctx, cancelCommandTimeout := applyCommandTimeout(ctx, "FETCH", s.server.commandTimeouts)
+	defer cancelCommandTimeout()
+
 	start := time.Now()
 	// recordMetrics records throughput + latency, classifying the status the same
 	// way the meteredSession wrapper does (success / client_error / server_error)

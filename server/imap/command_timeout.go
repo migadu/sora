@@ -18,7 +18,7 @@ type CommandTimeouts struct {
 	Sort        time.Duration // SORT, default 30s
 	Thread      time.Duration // THREAD, default 30s
 	MultiSearch time.Duration // MULTISEARCH, default 30s
-	Fetch       time.Duration // FETCH, default 30s (large body downloads)
+	Fetch       time.Duration // FETCH, default 0 = uncapped (a slow client's large download must be allowed to finish)
 	Store       time.Duration // STORE, default 15s
 	Copy        time.Duration // COPY, default 30s (may involve S3 copies)
 	Move        time.Duration // MOVE, default 30s (may involve S3 copies)
@@ -34,10 +34,14 @@ func DefaultCommandTimeouts() CommandTimeouts {
 		Sort:        30 * time.Second,
 		Thread:      30 * time.Second,
 		MultiSearch: 30 * time.Second,
-		Fetch:       30 * time.Second,
-		Store:       15 * time.Second,
-		Copy:        30 * time.Second,
-		Move:        30 * time.Second,
+		// FETCH is deliberately uncapped by default: its duration is dominated by how
+		// fast the CLIENT reads a large body, not by server work, so any cap here is a
+		// cap on slow connections. Operators who would rather bound it can set one; the
+		// S3 fetch underneath is already bounded by its own operation timeout.
+		Fetch: 0,
+		Store: 15 * time.Second,
+		Copy:  30 * time.Second,
+		Move:  30 * time.Second,
 		// A plain RENAME is a handful of mailbox rows. RENAME INBOX is not: RFC 3501
 		// §6.3.5 makes it move every message out of INBOX, and that move is retried on
 		// deadlock, so the cap has to clear a full retry sequence (5 attempts bounded by

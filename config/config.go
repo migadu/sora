@@ -873,7 +873,7 @@ type CommandTimeoutsConfig struct {
 	Sort        string `toml:"sort,omitempty"`         // SORT timeout (default: "30s")
 	Thread      string `toml:"thread,omitempty"`       // THREAD timeout (default: "30s")
 	MultiSearch string `toml:"multi_search,omitempty"` // MULTISEARCH timeout (default: "30s")
-	Fetch       string `toml:"fetch,omitempty"`        // FETCH timeout (default: "30s")
+	Fetch       string `toml:"fetch,omitempty"`        // FETCH timeout (default: "0" = uncapped)
 	Store       string `toml:"store,omitempty"`        // STORE timeout (default: "15s")
 	Copy        string `toml:"copy,omitempty"`         // COPY timeout (default: "30s")
 	Move        string `toml:"move,omitempty"`         // MOVE timeout (default: "30s")
