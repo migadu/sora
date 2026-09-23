@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -750,10 +752,27 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	// Flags set by the Sieve script via imap4flags (RFC 5232: setflag/addflag/
 	// removeflag). The Sieve engine resolves them into result.Flags; apply them to
-	// every locally stored copy. Sanitize to drop NIL/empty values.
-	sieveFlags := helpers.SanitizeFlags(helpers.StringsToFlags(result.Flags))
+	// every locally stored copy. Sanitize to drop NIL/empty values and anything
+	// that is not a valid IMAP flag-keyword -- a Sieve script is the one flag
+	// source that never passes an IMAP parser, so this is where an unencodable
+	// keyword would otherwise enter the system.
+	rawSieveFlags := helpers.StringsToFlags(result.Flags)
+	sieveFlags := helpers.SanitizeFlags(rawSieveFlags)
 	if len(sieveFlags) > 0 {
 		s.InfoLog("sieve set flags on message", "flags", result.Flags)
+	}
+	// Dropping a flag silently would leave the user's script looking like it
+	// worked; name the rejected keywords so support can point at the line.
+	if dropped := len(rawSieveFlags) - len(sieveFlags); dropped > 0 {
+		rejected := make([]string, 0, dropped)
+		for _, f := range rawSieveFlags {
+			if !slices.Contains(sieveFlags, f) {
+				rejected = append(rejected, string(f))
+			}
+		}
+		s.WarnLog("sieve set invalid IMAP keywords, dropped",
+			"flags", strings.Join(rejected, ","),
+			"reason", "not a valid IMAP flag-keyword (RFC 9051 §9: ASCII atom, no specials)")
 	}
 
 	switch result.Action {

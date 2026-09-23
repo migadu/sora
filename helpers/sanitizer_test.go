@@ -326,3 +326,83 @@ func TestSanitizeUTF8ForFTS(t *testing.T) {
 		})
 	}
 }
+
+// TestIsValidFlagName pins the RFC 9051 §9 flag grammar. The same table is
+// checked against the SQL predicate in migration 000050, which must classify
+// every case identically -- the migration cleans up exactly what this check now
+// refuses to let in.
+func TestIsValidFlagName(t *testing.T) {
+	tests := []struct {
+		flag  string
+		valid bool
+		why   string
+	}{
+		// Keywords that are plain atoms.
+		{"Work", true, "ordinary keyword"},
+		{"$Junk", true, "conventional $-prefixed keyword"},
+		{"ok}brace", true, "} is not an atom-special, only { is"},
+		{"-_.~|^`+!#$&'<=>?@[:;,/", true, "every remaining printable ASCII atom char"},
+
+		// System flags and flag-perm.
+		{"\\Seen", true, "system flag"},
+		{"\\*", true, "flag-perm wildcard, advertised in PERMANENTFLAGS"},
+		{"\\Some-Extension", true, "flag-extension is a backslash plus an atom"},
+
+		// The production incident: non-ASCII cannot be an atom, so it cannot be
+		// encoded in any IMAP response.
+		{"НЕОБРАБОТЕНО", false, "Cyrillic keyword from the Sieve addflag incident"},
+		{"Ünicode", false, "any non-ASCII byte"},
+		{"Р", false, "Cyrillic whose UTF-8 bytes would slip a byte-wise control check"},
+
+		// atom-specials.
+		{"a b", false, "SP"},
+		{"has(paren", false, "("},
+		{"has)paren", false, ")"},
+		{"has{brace", false, "{"},
+		{"pct%", false, "% is a list-wildcard"},
+		{"star*", false, "* is a list-wildcard"},
+		{"quote\"", false, "DQUOTE is a quoted-special"},
+		{"bracket]", false, "] is a resp-special"},
+
+		// Control characters and degenerate values.
+		{"tab\tchar", false, "CTL"},
+		{"nul\x00byte", false, "NUL"},
+		{"", false, "empty"},
+		{"\\", false, "a lone backslash has no atom after it"},
+		{"mid\\slash", false, "backslash is only legal as the flag-extension prefix"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.flag, func(t *testing.T) {
+			if got := IsValidFlagName(imap.Flag(tc.flag)); got != tc.valid {
+				t.Errorf("IsValidFlagName(%q) = %v, want %v (%s)", tc.flag, got, tc.valid, tc.why)
+			}
+		})
+	}
+}
+
+// TestSanitizeFlagsDropsUnencodableKeywords is the unit-level guard for the
+// incident: a Sieve script set a Cyrillic keyword, it reached the mailbox
+// keyword registry, and SELECT of that mailbox hung for every client from then
+// on. SanitizeFlags sits on both the ingest and the read-back paths, so it has
+// to drop the value in both directions.
+func TestSanitizeFlagsDropsUnencodableKeywords(t *testing.T) {
+	in := []imap.Flag{
+		imap.Flag("\\Seen"),
+		imap.Flag("НЕОБРАБОТЕНО"),
+		imap.Flag("Work"),
+		imap.Flag("bad tag"),
+		imap.Flag("$Junk"),
+	}
+	got := SanitizeFlags(in)
+
+	want := []imap.Flag{imap.Flag("\\Seen"), imap.Flag("Work"), imap.Flag("$Junk")}
+	if len(got) != len(want) {
+		t.Fatalf("SanitizeFlags(%v) = %v, want %v", in, got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("SanitizeFlags(%v) = %v, want %v", in, got, want)
+		}
+	}
+}

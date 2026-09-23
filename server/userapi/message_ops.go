@@ -9,8 +9,10 @@ import (
 
 	"github.com/migadu/sora/logger"
 
+	imap "github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 )
 
 // UpdateMessageRequest represents the request to update message flags
@@ -69,6 +71,12 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, consts.ErrDBNotFound) {
 			s.writeError(w, http.StatusNotFound, "Message not found")
+			return
+		}
+		// Backstop: the loop above already rejected these, so reaching this means
+		// a caller path that skipped validation. Still answer 400, not 500.
+		if errors.Is(err, consts.ErrInvalidFlag) {
+			s.writeError(w, http.StatusBadRequest, "Invalid flag")
 			return
 		}
 		if errors.Is(err, consts.ErrTooManyKeywords) {
@@ -134,7 +142,14 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// isValidFlag checks if a flag name is valid
+// isValidFlag checks if a flag name is valid.
+//
+// System flags are restricted to the set this API lets a client set. Keywords
+// must be valid IMAP flag-keywords (RFC 9051 §9): the API is a write path into
+// the same mailbox an IMAP client reads, so a keyword that cannot be encoded as
+// an atom -- non-ASCII, but equally a space or a "]" or "%" -- would wedge
+// SELECT of that mailbox for every IMAP client. Defer to the shared check rather
+// than keeping a second, looser copy of the rule here.
 func isValidFlag(flag string) bool {
 	// System flags start with backslash
 	if len(flag) > 0 && flag[0] == '\\' {
@@ -149,17 +164,5 @@ func isValidFlag(flag string) bool {
 		return validSystemFlags[flag]
 	}
 
-	// Custom flags can be any non-empty string without special characters
-	if len(flag) == 0 {
-		return false
-	}
-
-	// Custom flags should not contain certain characters
-	for _, c := range flag {
-		if c < 0x20 || c > 0x7E || c == '\\' || c == '"' || c == '(' || c == ')' || c == '{' {
-			return false
-		}
-	}
-
-	return true
+	return helpers.IsValidFlagName(imap.Flag(flag))
 }

@@ -16,6 +16,7 @@ var (
 	ErrMessageNotAvailable    = errors.New("message not available")
 	ErrEmptyMessageID         = errors.New("empty message ID")
 	ErrTooManyKeywords        = errors.New("too many keywords on a message")
+	ErrInvalidFlag            = errors.New("not a valid IMAP flag")
 	ErrAuthenticationFailed   = errors.New("authentication failed")
 
 	ErrDBNotFound        = errors.New("not found")
