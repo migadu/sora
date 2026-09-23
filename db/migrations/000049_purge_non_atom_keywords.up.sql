@@ -39,9 +39,49 @@ CREATE OR REPLACE FUNCTION sora_is_valid_imap_keyword(kw text) RETURNS boolean A
        AND kw !~ '[()\{%*"\\\]]';
 $$ LANGUAGE sql IMMUTABLE;
 
--- 1. The per-mailbox keyword registry. This is the one that wedges SELECT, so it
---    is cleaned first: it makes affected mailboxes openable even on a node that
---    has not yet picked up the new binary.
+-- 1. The messages. Poisoned rows are found through the registry rather than by
+--    scanning message_state: the registry is union-only, so every keyword ever
+--    set on a message in a mailbox is in that mailbox's registry (MOVE and COPY
+--    union into the destination's as well). That makes it an exact index of the
+--    mailboxes worth visiting, and the per-mailbox b-tree from migration 000039
+--    serves the rest, so this touches a handful of mailboxes instead of the whole
+--    table. ARRAY(subquery) is evaluated once, ahead of the scan, which keeps the
+--    planner on the index whatever it guesses about the jsonb predicate.
+--
+--    This step must run before the registry is cleaned, since the registry is
+--    what locates the rows. Soft-deleted (expunged) rows are covered on purpose:
+--    `messages restore` or a MOVE would otherwise carry the keyword back into a
+--    cleaned registry through the stats trigger.
+--
+--    A row whose mailbox registry never recorded the keyword (a NULL cache that
+--    predates migration 000024's backfill) is not visited. That is harmless: the
+--    application filters these keywords on every read path, so this migration is
+--    hygiene, not what makes an affected mailbox usable again.
+UPDATE message_state ms
+SET custom_flags = (
+        SELECT COALESCE(jsonb_agg(flag ORDER BY flag), '[]'::jsonb)
+        FROM jsonb_array_elements_text(ms.custom_flags) AS elem(flag)
+        WHERE sora_is_valid_imap_keyword(flag)
+    )
+WHERE ms.mailbox_id = ANY (ARRAY(
+        SELECT mstats.mailbox_id
+        FROM mailbox_stats mstats
+        WHERE mstats.custom_flags_cache IS NOT NULL
+          AND EXISTS (
+                SELECT 1 FROM jsonb_array_elements_text(mstats.custom_flags_cache) AS elem(flag)
+                WHERE left(flag, 1) <> '\' AND NOT sora_is_valid_imap_keyword(flag)
+            )
+    ))
+  AND ms.custom_flags IS NOT NULL
+  AND ms.custom_flags <> '[]'::jsonb
+  AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements_text(ms.custom_flags) AS elem(flag)
+        WHERE NOT sora_is_valid_imap_keyword(flag)
+    );
+
+-- 2. The per-mailbox keyword registry -- the one SELECT advertises. One row per
+--    mailbox, so a plain pass is cheap. System flags (leading backslash) are
+--    kept as they are.
 UPDATE mailbox_stats
 SET custom_flags_cache = (
         SELECT COALESCE(jsonb_agg(flag ORDER BY flag), '[]'::jsonb)
@@ -53,23 +93,6 @@ WHERE custom_flags_cache IS NOT NULL
   AND EXISTS (
         SELECT 1 FROM jsonb_array_elements_text(custom_flags_cache) AS elem(flag)
         WHERE left(flag, 1) <> '\' AND NOT sora_is_valid_imap_keyword(flag)
-    );
-
--- 2. The messages themselves. Soft-deleted (expunged) rows are included on
---    purpose: they still carry the keyword, and `messages restore` or a MOVE
---    would otherwise feed it straight back into a cleaned registry through the
---    stats trigger's UPDATE branch.
-UPDATE message_state
-SET custom_flags = (
-        SELECT COALESCE(jsonb_agg(flag ORDER BY flag), '[]'::jsonb)
-        FROM jsonb_array_elements_text(custom_flags) AS elem(flag)
-        WHERE sora_is_valid_imap_keyword(flag)
-    )
-WHERE custom_flags IS NOT NULL
-  AND custom_flags <> '[]'::jsonb
-  AND EXISTS (
-        SELECT 1 FROM jsonb_array_elements_text(custom_flags) AS elem(flag)
-        WHERE NOT sora_is_valid_imap_keyword(flag)
     );
 
 DROP FUNCTION sora_is_valid_imap_keyword(text);
