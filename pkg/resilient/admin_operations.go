@@ -307,8 +307,10 @@ func (rd *ResilientDatabase) ListSoftDeletedMailboxesWithRetry(ctx context.Conte
 // Per-mailbox transactions are essential. Batching many large mailboxes under a single
 // write deadline would roll the entire batch back on timeout and — because tombstones are
 // processed oldest-first — never make progress (a poison pill). Isolating each delete also
-// means one oversized/stuck mailbox is skipped and retried next tick instead of blocking
-// the rest of the batch. Returns the number purged this call.
+// means one stuck mailbox is skipped and retried next tick instead of blocking the rest of
+// the batch; and since each delete is itself a series of committed steps (see
+// DeleteMailboxWithRetry), a mailbox too large to finish in one cycle resumes in the next
+// rather than starting over. Returns the number purged this call.
 func (rd *ResilientDatabase) PurgeSoftDeletedMailboxesWithRetry(ctx context.Context, gracePeriod time.Duration) (int64, error) {
 	const batchLimit = 50
 

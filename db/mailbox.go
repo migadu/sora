@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -536,80 +535,120 @@ func (db *Database) SoftDeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID 
 	return nil
 }
 
-// DeleteMailbox deletes a mailbox for a specific user by id
+// DeleteMailbox hard-deletes a mailbox inside the caller's single transaction, expunging
+// every message it still holds. The work is proportional to the mailbox's size, so this
+// form is only safe where no deadline can be exceeded; the cleaner drives PurgeMailboxStep
+// in bounded transactions instead (see ResilientDatabase.DeleteMailboxWithRetry), and
+// interactive callers soft-delete.
 func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64) error {
+	for {
+		done, err := db.PurgeMailboxStep(ctx, tx, mailboxID, AccountID, 0)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+	}
+}
+
+// PurgeMailboxStep performs ONE bounded step of the hard delete of a mailbox, and reports
+// whether the mailbox is now gone.
+//
+// A step does the first of these that still has work, at most limit rows of it: expunge
+// live messages, stamp already-expunged rows with the mailbox name, drop the mailbox's
+// message_state rows, detach the messages (mailbox_id = NULL) — and once none of them
+// does, remove the mailbox row and report done. limit <= 0 means unlimited, which is what
+// the single-transaction DeleteMailbox wrapper uses.
+//
+// The last two steps are what the foreign keys would otherwise do in one shot when the
+// mailbox row is deleted: message_state.mailbox_id is ON DELETE CASCADE and
+// messages.mailbox_id is ON DELETE SET NULL, so `DELETE FROM mailboxes` alone rewrites
+// every message row and deletes every state row of the mailbox — the single statement
+// that actually blew the deadline on a large mailbox. Doing that work in bounded batches
+// first leaves the DELETE with nothing to cascade.
+//
+// Stepping exists because the old all-in-one transaction was O(messages) — 16s for 100k
+// messages, 32s for 200k, measured — against a fixed administrative deadline. Past
+// roughly 280k messages the purge could never finish inside it, and since it rolled back
+// whole, that mailbox became a permanent poison pill: retried every cleaner cycle, never
+// progressing, its messages and S3 objects never freed. Each step now commits on its own,
+// so progress is durable and any mailbox drains in a bounded number of bounded steps.
+//
+// Every step re-acquires the mailbox's row lock and re-checks, so the final removal cannot
+// race a message arriving between steps: the DELETE only happens in a step that found no
+// live messages while holding that lock.
+//
+// Scope is this mailbox alone. The predicate here used to read
+// "id = $2 OR path LIKE $3 || '/%'", but paths are 16-character hex ids concatenated with
+// no separator (see helpers.GetMailboxPath), so the second half never matched anything and
+// children were never included. Rather than quietly start hard-deleting live child
+// mailboxes, the clause is gone: the sweep lists every tombstone and purges each one, so a
+// subtree that was marked deleted is still fully removed, one mailbox at a time.
+func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, limit int) (bool, error) {
 	// Check if user has delete permission (ACL 'x' right) for shared mailboxes
 	// For personal mailboxes, ownership is sufficient
-	var mboxPath string
 	var isShared bool
 	err := tx.QueryRow(ctx, `
-		SELECT path, COALESCE(is_shared, FALSE)
+		SELECT COALESCE(is_shared, FALSE)
 		FROM mailboxes
 		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE)
-	`, mailboxID, AccountID).Scan(&mboxPath, &isShared)
+	`, mailboxID, AccountID).Scan(&isShared)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return consts.ErrMailboxNotFound
+			return false, consts.ErrMailboxNotFound
 		}
-		return fmt.Errorf("failed to fetch mailbox for deletion: %w", err)
+		return false, fmt.Errorf("failed to fetch mailbox for deletion: %w", err)
 	}
 
 	// If it's a shared mailbox, check ACL permissions
 	if isShared {
 		hasDeleteRight, err := db.CheckMailboxPermission(ctx, mailboxID, AccountID, ACLRightDelete)
 		if err != nil {
-			return fmt.Errorf("failed to check delete permission: %w", err)
+			return false, fmt.Errorf("failed to check delete permission: %w", err)
 		}
 		if !hasDeleteRight {
-			return fmt.Errorf("permission denied: user does not have delete right on shared mailbox")
+			return false, fmt.Errorf("permission denied: user does not have delete right on shared mailbox")
 		}
 	}
 
-	// Find all mailboxes that will be deleted (the target and its children)
-	// to acquire locks in a consistent order and prevent deadlocks.
-	var mailboxesToDelete []int64
-	rows, err := tx.Query(ctx, `SELECT id FROM mailboxes WHERE account_id = $1 AND (id = $2 OR path LIKE $3 || '/%')`, AccountID, mailboxID, mboxPath)
-	if err != nil {
-		return fmt.Errorf("failed to query mailboxes for deletion lock: %w", err)
-	}
-	mailboxesToDelete, err = pgx.CollectRows(rows, pgx.RowTo[int64])
-	if err != nil {
-		// pgx.CollectRows closes the rows, so we don't need to defer rows.Close()
-		return fmt.Errorf("failed to collect mailboxes for deletion lock: %w", err)
-	}
-
-	// Sort the IDs to ensure a consistent lock acquisition order across all transactions.
-	sort.Slice(mailboxesToDelete, func(i, j int) bool { return mailboxesToDelete[i] < mailboxesToDelete[j] })
-
-	// Lock the mailbox rows (ascending id, deterministic) before marking their
-	// messages expunged. This serializes against concurrent EXPUNGE/STORE/MOVE on
-	// the same mailboxes (which lock the mailbox row first too — see
-	// lockMailboxStats), keeping unseen_count maintenance race-free, and replaces
+	// Lock the mailbox row before marking its messages expunged. This serializes against
+	// concurrent EXPUNGE/STORE/MOVE on the mailbox (which lock the mailbox row first too —
+	// see lockMailboxStats), keeping unseen_count maintenance race-free, and replaces
 	// the previous pg_advisory lock to avoid the global advisory-keyspace collision.
-	if len(mailboxesToDelete) > 0 {
-		if _, err := tx.Exec(ctx, "SELECT 1 FROM mailboxes WHERE id = ANY($1) ORDER BY id FOR UPDATE", mailboxesToDelete); err != nil {
-			return fmt.Errorf("failed to acquire locks for mailbox deletion: %w", err)
-		}
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM mailboxes WHERE id = $1 FOR UPDATE", mailboxID); err != nil {
+		return false, fmt.Errorf("failed to acquire lock for mailbox deletion: %w", err)
 	}
 
-	// Before deleting the mailboxes, update all messages within them (the one
-	// being deleted and all its children) to preserve their mailbox path and mark as expunged.
-	// This is crucial for restoring messages later.
-	// This single UPDATE using a JOIN is much more efficient than looping.
-	_, err = tx.Exec(ctx, `
+	// LIMIT NULL is "no limit" in PostgreSQL, so one statement serves both the bounded
+	// and the unlimited caller.
+	var limitArg any
+	if limit > 0 {
+		limitArg = limit
+	}
+
+	// Expunge a bounded slice of the messages still live in the mailbox, preserving their
+	// mailbox path as we go. This is crucial for restoring messages later.
+	expunged, err := tx.Exec(ctx, `
 		UPDATE messages m
 		SET mailbox_path = mb.name,
 		    expunged_at = now(),
 		    expunged_modseq = nextval('messages_modseq')
 		FROM mailboxes mb
 		WHERE m.mailbox_id = mb.id
-		  AND mb.account_id = $1
-		  AND (mb.id = $2 OR mb.path LIKE $3 || '/%')
-		  AND m.expunged_at IS NULL
-	`, AccountID, mailboxID, mboxPath)
+		  AND m.id IN (
+			SELECT id FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			LIMIT $2
+		  )
+	`, mailboxID, limitArg)
 	if err != nil {
-		logger.Error("Database: failed to set path and mark messages as expunged for mailbox and children", "mailbox_id", mailboxID, "err", err)
-		return consts.ErrInternalError
+		logger.Error("Database: failed to set path and mark messages as expunged", "mailbox_id", mailboxID, "err", err)
+		return false, consts.ErrInternalError
+	}
+	if expunged.RowsAffected() > 0 {
+		// More may remain; the caller commits this step and comes back.
+		return false, nil
 	}
 
 	// Rows that were ALREADY expunged get the same stamp — path only, never a second
@@ -621,40 +660,77 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// under a pre-rename name. IS DISTINCT FROM keeps it to the rows that actually
 	// changed: nothing at all for a mailbox that was never renamed, and never the rows
 	// the statement above just expunged (it stamped them with the same name).
-	_, err = tx.Exec(ctx, `
+	stamped, err := tx.Exec(ctx, `
 		UPDATE messages m
 		SET mailbox_path = mb.name
 		FROM mailboxes mb
 		WHERE m.mailbox_id = mb.id
-		  AND mb.account_id = $1
-		  AND (mb.id = $2 OR mb.path LIKE $3 || '/%')
-		  AND m.expunged_at IS NOT NULL
-		  AND m.mailbox_path IS DISTINCT FROM mb.name
-	`, AccountID, mailboxID, mboxPath)
+		  AND m.id IN (
+			SELECT msg.id FROM messages msg
+			JOIN mailboxes mbx ON mbx.id = msg.mailbox_id
+			WHERE msg.mailbox_id = $1
+			  AND msg.expunged_at IS NOT NULL
+			  AND msg.mailbox_path IS DISTINCT FROM mbx.name
+			LIMIT $2
+		  )
+	`, mailboxID, limitArg)
 	if err != nil {
 		logger.Error("Database: failed to refresh mailbox path on expunged messages", "mailbox_id", mailboxID, "err", err)
-		return consts.ErrInternalError
+		return false, consts.ErrInternalError
+	}
+	if stamped.RowsAffected() > 0 {
+		return false, nil
 	}
 
-	// Delete the mailbox and all its children in one query using path-based approach
-	result, err := tx.Exec(ctx, `
-		DELETE FROM mailboxes
-		WHERE account_id = $1 AND (id = $2 OR path LIKE $3 || '/%')
-	`, AccountID, mailboxID, mboxPath)
-
+	// Drop the mailbox's message_state rows in bounded batches — exactly what the
+	// ON DELETE CASCADE would do, but without doing all of it in one statement.
+	detachedState, err := tx.Exec(ctx, `
+		DELETE FROM message_state
+		WHERE message_id IN (
+			SELECT message_id FROM message_state WHERE mailbox_id = $1 LIMIT $2
+		)
+	`, mailboxID, limitArg)
 	if err != nil {
-		logger.Error("Database: failed to delete mailbox and children", "mailbox_id", mailboxID, "err", err)
-		return consts.ErrInternalError
+		logger.Error("Database: failed to delete message state for mailbox", "mailbox_id", mailboxID, "err", err)
+		return false, consts.ErrInternalError
+	}
+	if detachedState.RowsAffected() > 0 {
+		return false, nil
+	}
+
+	// Detach the messages in bounded batches — exactly what the ON DELETE SET NULL would
+	// do. mailbox_path (stamped above) is what restore routes by from here on.
+	detached, err := tx.Exec(ctx, `
+		UPDATE messages SET mailbox_id = NULL
+		WHERE id IN (
+			SELECT id FROM messages WHERE mailbox_id = $1 LIMIT $2
+		)
+	`, mailboxID, limitArg)
+	if err != nil {
+		logger.Error("Database: failed to detach messages from mailbox", "mailbox_id", mailboxID, "err", err)
+		return false, consts.ErrInternalError
+	}
+	if detached.RowsAffected() > 0 {
+		return false, nil
+	}
+
+	// Nothing live is left and every tombstone carries its final name, so the mailbox row
+	// can go. We still hold its lock from this step, which is what makes the checks above
+	// binding: a message cannot appear between them and the DELETE.
+	result, err := tx.Exec(ctx, `DELETE FROM mailboxes WHERE id = $1`, mailboxID)
+	if err != nil {
+		logger.Error("Database: failed to delete mailbox", "mailbox_id", mailboxID, "err", err)
+		return false, consts.ErrInternalError
 	}
 
 	rowsAffected := result.RowsAffected()
 	if rowsAffected == 0 {
 		// This should not happen if the initial SELECT succeeded, but it's a good safeguard.
 		logger.Error("Database: mailbox not found for deletion during final delete step", "mailbox_id", mailboxID)
-		return consts.ErrMailboxNotFound
+		return false, consts.ErrMailboxNotFound
 	}
 
-	return nil
+	return true, nil
 }
 
 // HasMailboxWithSpecialUse reports whether the account already has a live mailbox
