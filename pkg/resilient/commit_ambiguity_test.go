@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -85,8 +86,33 @@ func testDatabaseConfig() *config.DatabaseConfig {
 	}
 }
 
+var (
+	migrateOnce sync.Once
+	migrateErr  error
+)
+
+// migrateTestDatabase brings the schema up to date once per test binary. These
+// tests open raw pools rather than going through a db.Database, so without it
+// they fail with "relation does not exist" on a freshly created database. A
+// migration failure is fatal, not a skip, so a broken schema can't pass as "ok".
+func migrateTestDatabase(t *testing.T, cfg *config.DatabaseConfig) {
+	t.Helper()
+	migrateOnce.Do(func() {
+		database, err := db.NewDatabaseFromConfig(context.Background(), cfg, true)
+		if err != nil {
+			migrateErr = err
+			return
+		}
+		database.Close()
+	})
+	if migrateErr != nil {
+		t.Fatalf("migrate test database: %v", migrateErr)
+	}
+}
+
 func newTestPool(t *testing.T, cfg *config.DatabaseConfig, dial func(ctx context.Context, network, addr string) (net.Conn, error)) *pgxpool.Pool {
 	t.Helper()
+	migrateTestDatabase(t, cfg)
 	endpoint := cfg.Write
 	poolCfg, err := pgxpool.ParseConfig(fmt.Sprintf("postgres://%s@%s:%s/%s?sslmode=disable",
 		endpoint.User, endpoint.Hosts[0], endpoint.Port, endpoint.Name))

@@ -22,6 +22,7 @@ import (
 	"database/sql"
 	"errors"
 	"io/fs"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +30,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx driver for database/sql
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
@@ -51,7 +53,7 @@ func resetMigrationState(t *testing.T, targetVersion int) {
 	// migrate() timeout. Using setupTestDatabase / NewDatabaseFromConfig with
 	// runMigrations=true would hit the dirty-state guard and fail before we
 	// can clean anything up.
-	database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(), false)
+	database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(t), false)
 	if err != nil {
 		t.Fatalf("resetMigrationState: connect to DB: %v", err)
 	}
@@ -77,7 +79,7 @@ func resetMigrationState(t *testing.T, targetVersion int) {
 	// We open a direct sql.DB here since migrate.NewWithInstance takes sqlDB
 	// but the driver name is pgx. Actually, we can just use the target
 	// URL directly.
-	m, err := migrate.NewWithSourceInstance("iofs", sourceDriver, "postgres://postgres:password@localhost:5432/sora_test_db?sslmode=disable")
+	m, err := migrate.NewWithSourceInstance("iofs", sourceDriver, migrationTestConnStr(t))
 	if err != nil {
 		t.Fatalf("failed to create migrate instance: %v", err)
 	}
@@ -109,7 +111,7 @@ func resetMigrationState(t *testing.T, targetVersion int) {
 //   - MaxOpenConns(1) forces all calls onto the same connection
 //   - pg_advisory_unlock returns true
 func TestMigrationAdvisoryLockSingleConn(t *testing.T) {
-	const connStr = "postgres://postgres:password@localhost:5432/sora_test_db?sslmode=disable"
+	connStr := migrationTestConnStr(t)
 	const lockID = int64(0x736f7261) // arbitrary test-only ID — "sora" in hex
 
 	ctx := context.Background()
@@ -278,15 +280,15 @@ func TestMigrationAdvisoryLockSingleConn(t *testing.T) {
 // externally for a few seconds before releasing it, forcing the migration
 // goroutine to queue behind it.
 func TestMigrationDeadlineDoesNotDeadlock(t *testing.T) {
-	const connStr = "postgres://postgres:password@localhost:5432/sora_test_db?sslmode=disable"
+	connStr := migrationTestConnStr(t)
 
 	ctx := context.Background()
 
 	// Open the reference connection and compute the advisory lock ID that
-	// golang-migrate would use for "sora_test_db". golang-migrate computes:
+	// golang-migrate would use for the test database. golang-migrate computes:
 	//   crc32.ChecksumIEEE(dbName) XOR crc32.ChecksumIEEE(statementTimeout)
 	// StatementTimeout defaults to "", and crc32("") == 0, so:
-	//   lockID = crc32.ChecksumIEEE("sora_test_db")
+	//   lockID = crc32.ChecksumIEEE(dbName)
 	//
 	// Rather than importing hash/crc32 here we just hold the real lock
 	// using pg_advisory_lock (blocking) to simulate another server running.
@@ -368,7 +370,7 @@ func TestMigrationDeadlineDoesNotDeadlock(t *testing.T) {
 //
 // This test reproduces the scenario:
 //   - An external connection holds the exact advisory lock that golang-migrate
-//     uses for "sora_test_db" (computed with the same crc32 formula).
+//     uses for the test database (computed with the same crc32 formula).
 //   - migrate() is called with a short timeout (2s) — shorter than the lock
 //     hold duration (4s) — so the timeout fires while WithInstance is blocked.
 //   - With the fix (everything inside the goroutine), migrateCtx fires, the
@@ -392,7 +394,7 @@ func TestMigrateTimeoutCoversWithInstance(t *testing.T) {
 	//   - Polling path starts. pollCtx expires. migrate() returns an error at
 	//     roughly (migrationTimeout + pollDeadline) = 2s + 6s = 8s.
 	//   - migrate() returned — it did not hang. Test hits the <-done case → PASS.
-	const connStr = "postgres://postgres:password@localhost:5432/sora_test_db?sslmode=disable"
+	connStr := migrationTestConnStr(t)
 	const (
 		migrationTimeout = 2 * time.Second
 		overallDeadline  = 15 * time.Second // fix returns at ~8s; bug hangs forever
@@ -415,7 +417,7 @@ func TestMigrateTimeoutCoversWithInstance(t *testing.T) {
 	resetMigrationState(t, 11)
 	t.Cleanup(func() { resetMigrationState(t, 11) })
 
-	db, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(), false)
+	db, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(t), false)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -461,16 +463,67 @@ func TestMigrateTimeoutCoversWithInstance(t *testing.T) {
 	}
 }
 
-// makeTestDBConfig is a helper that returns a DatabaseConfig pointing at the
-// local test database (same values as config-test.toml).
-func makeTestDBConfig() *config.DatabaseConfig {
+// These tests drop the whole public schema and leave the database at migration 11,
+// so they run in a database of their own, never the shared test database: there
+// they rolled every other package's schema back mid-run and left it behind for the
+// next run. PostgreSQL advisory locks are per-database too, so the migration lock
+// these tests hold can't stall anyone else's migrations either.
+func migrationTestDBName() string {
+	base := os.Getenv("SORA_TEST_DB_NAME")
+	if base == "" {
+		base = "sora_test_db"
+	}
+	return base + "_migrations"
+}
+
+var (
+	migrationTestDBOnce sync.Once
+	migrationTestDBErr  error
+)
+
+// ensureMigrationTestDB creates the dedicated database on first use.
+func ensureMigrationTestDB(t *testing.T) {
+	t.Helper()
+	migrationTestDBOnce.Do(func() {
+		admin, err := sql.Open("pgx", "postgres://postgres:password@localhost:5432/postgres?sslmode=disable")
+		if err != nil {
+			migrationTestDBErr = err
+			return
+		}
+		defer admin.Close()
+		name := migrationTestDBName()
+		var exists bool
+		if err := admin.QueryRow("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", name).Scan(&exists); err != nil {
+			migrationTestDBErr = err
+			return
+		}
+		if !exists {
+			_, migrationTestDBErr = admin.Exec("CREATE DATABASE " + pgx.Identifier{name}.Sanitize())
+		}
+	})
+	if migrationTestDBErr != nil {
+		t.Fatalf("create migration test database %s: %v", migrationTestDBName(), migrationTestDBErr)
+	}
+}
+
+func migrationTestConnStr(t *testing.T) string {
+	t.Helper()
+	ensureMigrationTestDB(t)
+	return "postgres://postgres:password@localhost:5432/" + migrationTestDBName() + "?sslmode=disable"
+}
+
+// makeTestDBConfig returns a DatabaseConfig pointing at the dedicated migration
+// test database (credentials as in config-test.toml).
+func makeTestDBConfig(t *testing.T) *config.DatabaseConfig {
+	t.Helper()
+	ensureMigrationTestDB(t)
 	return &config.DatabaseConfig{
 		Write: &config.DatabaseEndpointConfig{
 			Hosts:    []string{"localhost"},
 			Port:     5432,
 			User:     "postgres",
 			Password: "password",
-			Name:     "sora_test_db",
+			Name:     migrationTestDBName(),
 			TLSMode:  false,
 		},
 	}
@@ -501,7 +554,7 @@ func TestNewDatabaseFromConfigConcurrentIdempotent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-gate
-			db, err := NewDatabaseFromConfig(context.Background(), makeTestDBConfig(), true)
+			db, err := NewDatabaseFromConfig(context.Background(), makeTestDBConfig(t), true)
 			results[i] = result{db: db, err: err}
 		}()
 	}
