@@ -1,6 +1,7 @@
 package helpers
 
 import (
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -88,15 +89,84 @@ func StringsToFlags(names []string) []imap.Flag {
 	return flags
 }
 
-// SanitizeFlags removes invalid flag values that could cause IMAP protocol errors.
-// This prevents issues like NIL appearing as a flag, which triggers errors:
-// "Keyword used without being in FLAGS: NIL"
+// IsValidFlagName reports whether f is a syntactically valid IMAP flag, i.e.
+// matches flag / flag-keyword / flag-extension from RFC 9051 §9 (Formal Syntax):
+//
+//	flag           = "\\Answered" / ... / flag-keyword / flag-extension
+//	flag-extension = "\\" atom
+//	flag-keyword   = "$MDNSent" / ... / atom
+//	atom           = 1*ATOM-CHAR
+//	ATOM-CHAR      = <any CHAR except atom-specials>
+//	atom-specials  = "(" / ")" / "{" / SP / CTL / list-wildcards
+//	                 / quoted-specials / resp-specials
+//
+// CHAR is %x01-7F (RFC 5234), so a flag is ASCII by construction: a keyword
+// holding non-ASCII bytes cannot be encoded as an atom and therefore cannot be
+// put on the wire at all. "\\*" (flag-perm) is accepted because SELECT
+// advertises it in PERMANENTFLAGS.
+//
+// This is the server's half of an invariant the wire encoder enforces on the way
+// out: go-imap's Encoder.Flag rejects an invalid flag and, because encoder errors
+// are sticky, abandons the response mid-list -- leaving the untagged line
+// unterminated and unflushed, so the client waits forever for a tagged reply.
+// A single such keyword reaching a mailbox's keyword registry therefore makes
+// SELECT/EXAMINE of that mailbox hang for every client, permanently. Rejecting
+// the value here, at the point it enters the system, is what keeps that
+// unreachable.
+func IsValidFlagName(f imap.Flag) bool {
+	s := string(f)
+	if s == "" {
+		return false
+	}
+	if s == "\\*" {
+		return true
+	}
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '\\' {
+			// A backslash is legal only as the flag-extension prefix.
+			if i != 0 {
+				return false
+			}
+			continue
+		}
+		if !isAtomChar(ch) {
+			return false
+		}
+	}
+	// A lone "\" is not a flag: flag-extension requires an atom after it.
+	return s != "\\"
+}
+
+// isAtomChar reports whether ch is an ATOM-CHAR (RFC 9051 §9). Note the
+// range is ASCII-only; every byte with the high bit set is rejected, which is
+// what keeps non-ASCII keywords out.
+func isAtomChar(ch byte) bool {
+	if ch < 0x21 || ch > 0x7E { // CTL, SP and anything non-ASCII
+		return false
+	}
+	switch ch {
+	case '(', ')', '{', '%', '*', '"', '\\', ']':
+		return false
+	}
+	return true
+}
+
+// SanitizeFlags removes flag values that would break the IMAP protocol if they
+// were stored or advertised.
 //
 // Filters out:
-// - Flags containing "NIL" (case-insensitive) - e.g., "$NIL", "nil", "NIL"
-// - Flags containing "NULL" (case-insensitive) - e.g., "$NULL", "null"
-// - Empty string flags
-// - Flags with only whitespace
+//   - The IMAP NIL / NULL atoms (whole-token match), which are parser artifacts
+//   - Empty or whitespace-only flags
+//   - Anything that is not a syntactically valid flag (IsValidFlagName): most
+//     importantly keywords holding non-ASCII characters, which no IMAP response
+//     can encode
+//
+// It sits on both the ingest paths (Sieve imap4flags, IMAP STORE/APPEND) and the
+// paths that read keywords back out for a client, so an invalid keyword that
+// predates this check is dropped on read as well as refused on write -- a
+// mailbox poisoned by an earlier release heals itself the next time it is
+// opened, without a data migration.
 //
 // Returns a new slice with only valid flags.
 func SanitizeFlags(flags []imap.Flag) []imap.Flag {
@@ -124,11 +194,35 @@ func SanitizeFlags(flags []imap.Flag) []imap.Flag {
 			continue
 		}
 
+		// Drop anything that is not encodable as an IMAP flag. Without this a
+		// keyword such as a Cyrillic Sieve addflag value reaches the mailbox
+		// keyword registry and wedges SELECT for good; see IsValidFlagName.
+		if !IsValidFlagName(flag) {
+			continue
+		}
+
 		// Flag is valid, keep it
 		sanitized = append(sanitized, flag)
 	}
 
 	return sanitized
+}
+
+// DroppedFlags returns the flags in raw that SanitizeFlags(raw) removed, as
+// strings, for logging. Sieve imap4flags is the one flag source that never
+// passes an IMAP parser, so a dropped keyword there is a user's script line
+// that silently did nothing; callers log these so support can point at it.
+func DroppedFlags(raw, kept []imap.Flag) []string {
+	if len(raw) == len(kept) {
+		return nil
+	}
+	dropped := make([]string, 0, len(raw)-len(kept))
+	for _, f := range raw {
+		if !slices.Contains(kept, f) {
+			dropped = append(dropped, string(f))
+		}
+	}
+	return dropped
 }
 
 // RemoveLongTokens drops any continuous sequence of non-whitespace characters longer than maxTokenLen.

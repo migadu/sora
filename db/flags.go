@@ -27,9 +27,19 @@ func SplitFlags(flags []imap.Flag) (systemFlags []imap.Flag, customKeywords []st
 		if strings.HasPrefix(flagStr, "\\") {
 			systemFlags = append(systemFlags, f)
 		} else if flagStr != "" { // Ensure not to add empty strings as keywords
-			// Per RFC 3501: "A keyword is an atom that does not begin with "\".
-			// Keywords MUST NOT contain control characters or non-ASCII characters.
-			// We assume valid keywords are passed from the IMAP layer.
+			// Per RFC 9051 §9, a keyword is an atom, so it is ASCII and excludes
+			// the atom-specials. This used to merely assume the IMAP layer had
+			// already checked that -- but Sieve imap4flags (`addflag`) reaches
+			// here without going through any IMAP parser, so a script could
+			// persist a keyword that no IMAP response can encode. One such
+			// keyword in a mailbox's registry wedges SELECT for that mailbox
+			// permanently (see helpers.IsValidFlagName). Enforce it here, at the
+			// single chokepoint every write path funnels through, rather than
+			// trusting callers.
+			if !helpers.IsValidFlagName(f) {
+				log.Printf("Database: custom keyword %q is not a valid IMAP flag-keyword, skipping.", flagStr)
+				continue
+			}
 			if len(flagStr) > FlagsMaxKeywordLength {
 				log.Printf("Database: custom keyword '%s' exceeds maximum length of %d, skipping.", flagStr, FlagsMaxKeywordLength)
 				continue // Skip this keyword

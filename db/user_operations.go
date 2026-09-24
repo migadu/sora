@@ -9,8 +9,10 @@ import (
 	"strings"
 	"time"
 
+	imap "github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/helpers"
 )
 
 // DBMessage represents a simplified message structure for API responses
@@ -556,6 +558,15 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		if strings.HasPrefix(flag, "\\") {
 			newFlags |= stringFlagToBitwise(flag)
 			continue
+		}
+		// This path builds custom_flags directly instead of going through
+		// SplitFlags, so it needs its own guard: a keyword that is not an IMAP
+		// atom cannot be encoded in a FLAGS response and would wedge SELECT of
+		// this mailbox for every IMAP client (see helpers.IsValidFlagName). The
+		// User API rejects these at the HTTP layer with 400; refuse them here
+		// too rather than relying on the caller having checked.
+		if !helpers.IsValidFlagName(imap.Flag(flag)) {
+			return consts.ErrInvalidFlag
 		}
 		canon, ok := canonical[foldKeyword(flag)]
 		if !ok {

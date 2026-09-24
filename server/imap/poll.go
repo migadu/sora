@@ -8,6 +8,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 )
 
 func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allowExpunge bool) error {
@@ -357,6 +358,10 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		for _, customFlag := range update.CustomFlags {
 			allFlags = append(allFlags, imap.Flag(customFlag))
 		}
+		// Same filter FETCH and SELECT apply: a stored keyword that is not an
+		// IMAP atom cannot be encoded, and an unsolicited FETCH carrying one
+		// aborts the write and drops the session (helpers.IsValidFlagName).
+		allFlags = helpers.SanitizeFlags(allFlags)
 		// Pass the change's modseq so CONDSTORE-aware sessions receive MODSEQ in the
 		// unsolicited FETCH response (RFC 7162 §3.2); the writer omits it otherwise.
 		s.mailboxTracker.QueueMessageFlags(update.SeqNum, update.UID, allFlags, update.EffectiveModSeq, nil)
