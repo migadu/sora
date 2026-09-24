@@ -427,15 +427,20 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 			return 0, fmt.Errorf("failed to get next UID for mailbox: %w", err)
 		}
 
-		// Restore the message and clear the \Deleted flag
-		// FlagDeleted = 8 (bit 3), so we use bitwise AND with NOT 8 to clear it
+		// Restore the message's state and clear the \Deleted flag (FlagDeleted = 8,
+		// bit 3). An upsert, not an UPDATE: the row is missing for any message whose
+		// mailbox was purged by an older build (the FK cascade deleted it), and a bare
+		// UPDATE then matched nothing and reported success — leaving a live message with
+		// no state row, on which every later STORE silently did nothing. With nothing
+		// left to recover, such a message comes back unread and keyword-less.
 		_, err = tx.Exec(ctx, `
-			UPDATE message_state
-			SET mailbox_id = $2,
-			    flags = flags & ~8,
-			    flags_changed_at = now(),
-			    updated_modseq = nextval('messages_modseq')
-			WHERE message_id = $1
+			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
+			VALUES ($1, $2, 0, '[]'::jsonb, now(), nextval('messages_modseq'))
+			ON CONFLICT (message_id) DO UPDATE
+			SET mailbox_id = EXCLUDED.mailbox_id,
+			    flags = message_state.flags & ~8,
+			    flags_changed_at = EXCLUDED.flags_changed_at,
+			    updated_modseq = EXCLUDED.updated_modseq
 		`, msg.id, targetMailboxID)
 		if err != nil {
 			return 0, fmt.Errorf("failed to restore message_state for message %d: %w", msg.id, err)

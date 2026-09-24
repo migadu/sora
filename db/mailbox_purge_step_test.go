@@ -203,3 +203,73 @@ func TestDeleteMailboxForUserSoftDeletes(t *testing.T) {
 		"SELECT expunged_at FROM messages WHERE id = $1", childMsg).Scan(&expungedAt))
 	assert.Nil(t, expungedAt, "a child mailbox's messages are not touched")
 }
+
+// A message restored after its mailbox was purged must come back with a
+// message_state row — and, where the purge kept it, with its original flags.
+//
+// The purge used to delete the mailbox's message_state rows (it was what the
+// ON DELETE CASCADE on message_state.mailbox_id did, before and after the purge
+// was split into steps), and RestoreMessages only ever UPDATEd that row. So a
+// restored message came back live with no state row at all: it read as unread
+// with no keywords, every STORE on it updated nothing and reported success, and
+// COPY/MOVE — which copy state with an inner join — propagated the gap.
+func TestRestoreAfterPurgeKeepsMessageState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, email, _, _ := setupRestoreTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	mailbox := createPurgeTestMailbox(t, db, accountID, "Kept")
+	kept := insertTestMessage(t, db, accountID, mailbox, "Kept", "kept", fmt.Sprintf("<kept-%d@example.com>", time.Now().UnixNano()))
+	legacy := insertTestMessage(t, db, accountID, mailbox, "Kept", "legacy", fmt.Sprintf("<legacy-%d@example.com>", time.Now().UnixNano()))
+
+	// \Seen plus a keyword on the first; the second will lose its row the way
+	// messages purged by older builds already have.
+	_, err := db.GetWritePool().Exec(ctx,
+		`UPDATE message_state SET flags = 1, custom_flags = '["$Important"]'::jsonb WHERE message_id = $1`, kept)
+	require.NoError(t, err)
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, db.DeleteMailbox(ctx, tx, mailbox, accountID))
+	require.NoError(t, tx.Commit(ctx))
+
+	_, err = db.GetWritePool().Exec(ctx, `DELETE FROM message_state WHERE message_id = $1`, legacy)
+	require.NoError(t, err)
+
+	tx, err = db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	restored, err := db.RestoreMessages(ctx, tx, RestoreMessagesParams{Email: email, MessageIDs: []int64{kept, legacy}})
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit(ctx))
+	require.Equal(t, int64(2), restored)
+
+	type state struct {
+		mailboxID   int64
+		msgMailbox  int64
+		flags       int
+		customFlags string
+	}
+	read := func(id int64) state {
+		t.Helper()
+		var s state
+		err := db.GetReadPool().QueryRow(ctx, `
+			SELECT ms.mailbox_id, m.mailbox_id, ms.flags, ms.custom_flags::text
+			FROM messages m JOIN message_state ms ON ms.message_id = m.id
+			WHERE m.id = $1 AND m.expunged_at IS NULL`, id).Scan(&s.mailboxID, &s.msgMailbox, &s.flags, &s.customFlags)
+		require.NoError(t, err, "restored message %d must be live and have a message_state row", id)
+		return s
+	}
+
+	k := read(kept)
+	assert.Equal(t, k.msgMailbox, k.mailboxID, "state row must follow the message into its restored mailbox")
+	assert.Equal(t, 1, k.flags, "the purge must keep the state row, so \\Seen survives the round trip")
+	assert.Equal(t, `["$Important"]`, k.customFlags, "keywords survive the round trip too")
+
+	l := read(legacy)
+	assert.Equal(t, l.msgMailbox, l.mailboxID, "a state row lost to an older purge is recreated on restore")
+	assert.Equal(t, 0, l.flags, "with no state to recover, the message comes back unread")
+}

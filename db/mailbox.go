@@ -556,7 +556,7 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 // whether the mailbox is now gone.
 //
 // A step does the first of these that still has work, at most limit rows of it: expunge
-// live messages, stamp already-expunged rows with the mailbox name, drop the mailbox's
+// live messages, stamp already-expunged rows with the mailbox name, detach the mailbox's
 // message_state rows, detach the messages (mailbox_id = NULL) — and once none of them
 // does, remove the mailbox row and report done. limit <= 0 means unlimited, which is what
 // the single-transaction DeleteMailbox wrapper uses.
@@ -566,7 +566,8 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 // messages.mailbox_id is ON DELETE SET NULL, so `DELETE FROM mailboxes` alone rewrites
 // every message row and deletes every state row of the mailbox — the single statement
 // that actually blew the deadline on a large mailbox. Doing that work in bounded batches
-// first leaves the DELETE with nothing to cascade.
+// first leaves the DELETE with nothing to cascade. (The state rows are detached rather
+// than deleted, which the cascade could not do; see below.)
 //
 // Stepping exists because the old all-in-one transaction was O(messages) — 16s for 100k
 // messages, 32s for 200k, measured — against a fixed administrative deadline. Past
@@ -682,16 +683,22 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 		return false, nil
 	}
 
-	// Drop the mailbox's message_state rows in bounded batches — exactly what the
-	// ON DELETE CASCADE would do, but without doing all of it in one statement.
+	// Detach the mailbox's message_state rows in bounded batches, so the DELETE below
+	// has nothing to cascade into. They are detached (mailbox_id = NULL), not deleted:
+	// the ON DELETE CASCADE used to delete them, and RestoreMessages only UPDATEs this
+	// row, so a message restored after a purge came back with no state at all — unread,
+	// keyword-less, and every STORE on it silently updating nothing. Kept, its flags
+	// survive the round trip; the row still goes when the message row itself is reaped
+	// (message_state.message_id is ON DELETE CASCADE). The stats triggers skip rows
+	// whose mailbox_id is NULL, and these messages are all expunged by now anyway.
 	detachedState, err := tx.Exec(ctx, `
-		DELETE FROM message_state
+		UPDATE message_state SET mailbox_id = NULL
 		WHERE message_id IN (
 			SELECT message_id FROM message_state WHERE mailbox_id = $1 LIMIT $2
 		)
 	`, mailboxID, limitArg)
 	if err != nil {
-		logger.Error("Database: failed to delete message state for mailbox", "mailbox_id", mailboxID, "err", err)
+		logger.Error("Database: failed to detach message state from mailbox", "mailbox_id", mailboxID, "err", err)
 		return false, consts.ErrInternalError
 	}
 	if detachedState.RowsAffected() > 0 {
