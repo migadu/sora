@@ -342,6 +342,52 @@ func TestRestoreAfterPurgeKeepsMessageState(t *testing.T) {
 	assert.Equal(t, int64(1), cachedUnseen, "mailbox_stats.unseen_count must match authoritative unseen count (1), not 2")
 }
 
+// Deleting a mailbox must be refused if ANY live descendant exists in its subtree,
+// not only an immediate direct child. A database that previously suffered from the
+// parent delete bug may have an active grandchild whose direct parent was tombstoned;
+// deleting the root would strand that grandchild with a dead path prefix.
+func TestDeleteMailboxWithActiveGrandchildrenIsRefused(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, _, _, _ := setupRestoreTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	parent := createPurgeTestMailbox(t, db, accountID, "Tree")
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, db.CreateMailbox(ctx, tx, accountID, "Tree/Branch", &parent))
+	require.NoError(t, tx.Commit(ctx))
+
+	branch, err := db.GetMailboxByName(ctx, accountID, "Tree/Branch")
+	require.NoError(t, err)
+
+	tx, err = db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, db.CreateMailbox(ctx, tx, accountID, "Tree/Branch/Leaf", &branch.ID))
+	require.NoError(t, tx.Commit(ctx))
+
+	// Simulate a legacy state: direct child was tombstoned by an older build,
+	// but the grandchild remains live.
+	_, err = db.GetWritePool().Exec(ctx, `UPDATE mailboxes SET deleted_at = now() WHERE id = $1`, branch.ID)
+	require.NoError(t, err)
+
+	// HasChildren (direct children) misses the grandchild; the descendant check that
+	// sora-admin runs before --purge must not.
+	tree, err := db.GetMailboxByName(ctx, accountID, "Tree")
+	require.NoError(t, err)
+	assert.False(t, tree.HasChildren, "precondition: the only direct child is tombstoned")
+	hasDescendants, err := db.HasLiveDescendants(ctx, accountID, tree.Path)
+	require.NoError(t, err)
+	assert.True(t, hasDescendants, "the live grandchild must count as a descendant")
+
+	// Attempting to delete the root must be refused because an active descendant exists.
+	err = db.DeleteMailboxForUser(ctx, accountID, "Tree")
+	require.ErrorIs(t, err, consts.ErrMailboxHasChildren, "deleting a parent with an active grandchild must be refused")
+}
+
 // A restored child mailbox must be linked under its parent, not recreated at the root.
 // The name carries the delimiter, so LIST still showed "Parent/Child", but the tree
 // is path-based: at the root the parent lost \HasChildren, RENAME of the parent no

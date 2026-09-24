@@ -531,17 +531,13 @@ func (db *Database) SoftDeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID 
 		}
 	}
 
-	// Paths are 16-hex-character ids concatenated with no separator, so a direct child is
-	// exactly one id longer than this path and starts with it (same test as HasChildren).
-	var hasChildren bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS(SELECT 1 FROM mailboxes
-		              WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16
-		                AND path LIKE $2 || '%' AND deleted_at IS NULL)
-	`, ownerAccountID, mboxPath).Scan(&hasChildren); err != nil {
+	// Any live descendant refuses the delete, not only a direct child: an earlier build
+	// could tombstone an intermediate mailbox and leave its children live.
+	hasDescendants, err := hasLiveDescendants(ctx, tx, ownerAccountID, mboxPath)
+	if err != nil {
 		return fmt.Errorf("failed to check children of mailbox %d: %w", mailboxID, err)
 	}
-	if hasChildren {
+	if hasDescendants {
 		return consts.ErrMailboxHasChildren
 	}
 
@@ -574,6 +570,27 @@ func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			return nil
 		}
 	}
+}
+
+// hasLiveDescendants reports whether any live mailbox sits anywhere below path.
+// Paths are 16-hex-character ids concatenated with no separator, so a descendant's
+// path starts with this path and is longer than it. Unlike HasChildren (direct
+// children only), this also sees a live grandchild whose intermediate mailbox an
+// earlier build tombstoned.
+func hasLiveDescendants(ctx context.Context, q rowQuerier, accountID int64, path string) (bool, error) {
+	var exists bool
+	err := q.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM mailboxes
+		              WHERE account_id = $1 AND LENGTH(path) > LENGTH($2)
+		                AND path LIKE $2 || '%' AND deleted_at IS NULL)
+	`, accountID, path).Scan(&exists)
+	return exists, err
+}
+
+// HasLiveDescendants is hasLiveDescendants on the read pool, for callers that must
+// refuse before doing irreversible work (sora-admin mailbox delete --purge).
+func (db *Database) HasLiveDescendants(ctx context.Context, accountID int64, path string) (bool, error) {
+	return hasLiveDescendants(ctx, db.GetReadPoolWithContext(ctx), accountID, path)
 }
 
 // PurgeMailboxStep performs ONE bounded step of the hard delete of a mailbox, and reports

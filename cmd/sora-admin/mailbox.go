@@ -267,7 +267,14 @@ Examples:
 		fmt.Printf("Failed to find mailbox '%s': %v\n", *mailbox, err)
 		os.Exit(1)
 	}
-	if target.HasChildren {
+	// Any live descendant, not only a direct child (HasChildren): the purge also reaches
+	// a live grandchild under a mailbox an earlier build tombstoned.
+	hasDescendants, err := rdb.HasLiveDescendantsWithRetry(ctx, target.AccountID, target.Path)
+	if err != nil {
+		fmt.Printf("Failed to check child mailboxes of '%s': %v\n", *mailbox, err)
+		os.Exit(1)
+	}
+	if hasDescendants {
 		fmt.Printf("Mailbox '%s' has child mailboxes; delete them first\n", *mailbox)
 		os.Exit(1)
 	}

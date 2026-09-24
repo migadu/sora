@@ -25,6 +25,18 @@ func (rd *ResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, Acco
 	return result.(*db.DBMailbox), nil
 }
 
+// HasLiveDescendantsWithRetry reports whether any live mailbox sits below the given path.
+func (rd *ResilientDatabase) HasLiveDescendantsWithRetry(ctx context.Context, accountID int64, path string) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).HasLiveDescendants(ctx, accountID, path)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
 func (rd *ResilientDatabase) InsertMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload) (messageID int64, uid int64, err error) {
 	// Lock the mailbox at the Go level to prevent connection pool starvation during mass concurrent inserts.
 	unlock := rd.getOperationalDatabaseForOperation(ctx, true).LockMailbox(options.MailboxID)
