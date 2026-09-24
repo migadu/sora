@@ -845,20 +845,28 @@ List messages that have been soft-deleted and can be restored.
 - `limit=100` - Maximum messages to return
 
 **Response:** `200 OK`
+
+Message fields use Go field names (`ID`, `MailboxPath`, …), not snake_case: the endpoint
+encodes the database struct directly. `MailboxID` is `null` once the mailbox itself has been
+deleted, and `MailboxPath` is then the name recorded at deletion time. A message with neither
+(it can be restored by nothing but its id, which then fails) is listed with an empty
+`MailboxPath`, and criteria-based restores skip it.
+
 ```json
 {
+  "email": "user@example.com",
   "messages": [
     {
-      "id": 12345,
-      "uid": 42,
-      "content_hash": "blake3_abc123...",
-      "mailbox_path": "INBOX",
-      "mailbox_id": 5,
-      "subject": "Important Email",
-      "message_id": "<abc@example.com>",
-      "internal_date": "2024-01-15T10:30:00Z",
-      "expunged_at": "2024-01-20T14:00:00Z",
-      "size": 4096
+      "ID": 12345,
+      "UID": 42,
+      "ContentHash": "blake3_abc123...",
+      "MailboxPath": "INBOX",
+      "MailboxID": 5,
+      "Subject": "Important Email",
+      "MessageID": "<abc@example.com>",
+      "InternalDate": "2024-01-15T10:30:00Z",
+      "ExpungedAt": "2024-01-20T14:00:00Z",
+      "Size": 4096
     }
   ],
   "total": 1
