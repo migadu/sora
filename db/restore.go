@@ -64,7 +64,7 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 			m.id,
 			m.uid,
 			m.content_hash,
-			` + effectiveMailboxName + `,
+			COALESCE(` + effectiveMailboxName + `, ''),
 			m.mailbox_id,
 			m.subject,
 			m.message_id,
@@ -154,6 +154,11 @@ type rowQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+// rowsQuerier is the multi-row counterpart of rowQuerier.
+type rowsQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
 // restoreAccountID resolves the live account behind an address for restore operations.
 func restoreAccountID(ctx context.Context, q rowQuerier, email string) (int64, error) {
 	var accountID int64
@@ -173,14 +178,10 @@ func restoreAccountID(ctx context.Context, q rowQuerier, email string) (int64, e
 	return accountID, nil
 }
 
-// restoreCandidatesQuery builds the SELECT that identifies the expunged rows matching
-// params (the same predicate for listing and for restoring). Rows are ordered by
-// (effective mailbox name, internal_date, id) so restored messages receive new UIDs in
-// arrival order per mailbox — deterministic regardless of physical row order or batching.
-// Callers pass columns qualified with the m/mb aliases (see effectiveMailboxName).
-func restoreCandidatesQuery(accountID int64, params RestoreMessagesParams, columns string) (string, []any) {
+// restoreFilters returns the FROM/WHERE shared by every restore query for params, and
+// its arguments. Columns and aliases follow effectiveMailboxName (m, mb).
+func restoreFilters(accountID int64, params RestoreMessagesParams) (string, []any) {
 	query := `
-		SELECT ` + columns + `
 		FROM messages m
 		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
 		WHERE m.account_id = $1
@@ -214,9 +215,60 @@ func restoreCandidatesQuery(accountID int64, params RestoreMessagesParams, colum
 			argPos++
 		}
 	}
+	return query, args
+}
 
+// restoreCandidatesQuery builds the SELECT that identifies the expunged rows matching
+// params (the same predicate for listing and for restoring). Rows are ordered by
+// (effective mailbox name, internal_date, id) so restored messages receive new UIDs in
+// arrival order per mailbox — deterministic regardless of physical row order or batching.
+// Callers pass columns qualified with the m/mb aliases (see effectiveMailboxName).
+//
+// A criteria-based restore (mailbox / since / until) leaves out rows that can be routed
+// nowhere — no live mailbox and no recorded mailbox_path — just as it skips candidates
+// that were already restored or purged. Left in, such a row sorted last (NULL), took the
+// final chunk down with it, and kept every real message in that chunk unrestorable on
+// every re-run. See warnUnroutableCandidates. When the admin names the ids explicitly,
+// the row stays in and RestoreMessages fails loudly on it.
+func restoreCandidatesQuery(accountID int64, params RestoreMessagesParams, columns string) (string, []any) {
+	filters, args := restoreFilters(accountID, params)
+	query := `SELECT ` + columns + filters
+	if len(params.MessageIDs) == 0 {
+		query += " AND " + effectiveMailboxName + " IS NOT NULL"
+	}
 	query += " ORDER BY " + effectiveMailboxName + ", m.internal_date, m.id"
 	return query, args
+}
+
+// maxUnroutableIDsLogged caps how many skipped ids one warning names.
+const maxUnroutableIDsLogged = 50
+
+// warnUnroutableCandidates logs, at WARN and by id, the rows a criteria-based restore
+// matched but left out because they can be routed nowhere, so an operator can find them
+// (they are listed with an empty mailbox) and decide what to do. No-op for id restores.
+func warnUnroutableCandidates(ctx context.Context, q rowsQuerier, accountID int64, params RestoreMessagesParams) error {
+	if len(params.MessageIDs) > 0 {
+		return nil
+	}
+	filters, args := restoreFilters(accountID, params)
+	rows, err := q.Query(ctx, `SELECT m.id`+filters+" AND "+effectiveMailboxName+" IS NULL ORDER BY m.id", args...)
+	if err != nil {
+		return fmt.Errorf("failed to query unroutable restore candidates: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return fmt.Errorf("failed to collect unroutable restore candidates: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	named := ids
+	if len(named) > maxUnroutableIDsLogged {
+		named = named[:maxUnroutableIDsLogged]
+	}
+	logger.Warn("Database: restore skipped messages with no mailbox and no recorded mailbox path; name them with explicit ids to see the error",
+		"account_id", accountID, "count", len(ids), "message_ids", named)
+	return nil
 }
 
 // GetRestorableMessageIDs returns the ids of the expunged messages that RestoreMessages
@@ -227,6 +279,10 @@ func (d *Database) GetRestorableMessageIDs(ctx context.Context, params RestoreMe
 	pool := d.GetReadPoolWithContext(ctx)
 	accountID, err := restoreAccountID(ctx, pool, params.Email)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := warnUnroutableCandidates(ctx, pool, accountID, params); err != nil {
 		return nil, err
 	}
 
@@ -262,6 +318,10 @@ func (d *Database) GetRestorableMessageIDs(ctx context.Context, params RestoreMe
 func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params RestoreMessagesParams) (int64, error) {
 	accountID, err := restoreAccountID(ctx, tx, params.Email)
 	if err != nil {
+		return 0, err
+	}
+
+	if err := warnUnroutableCandidates(ctx, tx, accountID, params); err != nil {
 		return 0, err
 	}
 
