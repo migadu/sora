@@ -495,6 +495,16 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		logger.Info("Database: skipped restoring messages that already exist in target mailboxes or are no longer expunged", "count", skippedCount)
 	}
 
+	// Recompute unseen_count for every touched target mailbox. The database trigger on
+	// messages joins on ms.mailbox_id = o.mailbox_id, which cannot match for an orphan
+	// (o.mailbox_id IS NULL) or cross-mailbox restore, treating every restored message
+	// as an unseen arrival and drifting unseen_count up by 1 per \Seen message.
+	for _, targetMailboxID := range mailboxIDMap {
+		if _, err := d.RecomputeMailboxUnseen(ctx, tx, targetMailboxID); err != nil {
+			return 0, fmt.Errorf("failed to recompute unseen count for mailbox %d: %w", targetMailboxID, err)
+		}
+	}
+
 	return restoredCount, nil
 }
 

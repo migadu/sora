@@ -335,6 +335,11 @@ func TestRestoreAfterPurgeKeepsMessageState(t *testing.T) {
 	l := read(legacy)
 	assert.Equal(t, l.msgMailbox, l.mailboxID, "a state row lost to an older purge is recreated on restore")
 	assert.Equal(t, 0, l.flags, "with no state to recover, the message comes back unread")
+
+	var cachedUnseen int64
+	require.NoError(t, db.GetReadPool().QueryRow(ctx,
+		`SELECT unseen_count FROM mailbox_stats WHERE mailbox_id = $1`, k.mailboxID).Scan(&cachedUnseen))
+	assert.Equal(t, int64(1), cachedUnseen, "mailbox_stats.unseen_count must match authoritative unseen count (1), not 2")
 }
 
 // A restored child mailbox must be linked under its parent, not recreated at the root.
