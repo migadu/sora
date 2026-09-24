@@ -388,6 +388,30 @@ func TestDeleteMailboxWithActiveGrandchildrenIsRefused(t *testing.T) {
 	require.ErrorIs(t, err, consts.ErrMailboxHasChildren, "deleting a parent with an active grandchild must be refused")
 }
 
+// Creating a mailbox with a trailing hierarchy separator (e.g. "Folder/Sub/") must
+// canonicalize to the name without it, matching RFC 3501 §6.3.3 and avoiding dead
+// mailboxes with trailing slashes in the database.
+func TestCreateMailboxForUser_CanonicalizesTrailingSeparators(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, _, _, _ := setupRestoreTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	require.NoError(t, db.CreateMailboxForUser(ctx, accountID, "Folder/Sub/"))
+
+	mb, err := db.GetMailboxByName(ctx, accountID, "Folder/Sub")
+	require.NoError(t, err, "mailbox must be accessible under canonical name without trailing slash")
+	assert.Equal(t, "Folder/Sub", mb.Name)
+
+	var count int
+	require.NoError(t, db.GetReadPool().QueryRow(ctx,
+		`SELECT count(*) FROM mailboxes WHERE account_id = $1 AND name = 'Folder/Sub/'`, accountID).Scan(&count))
+	assert.Equal(t, 0, count, "mailbox must not be stored with a trailing delimiter")
+}
+
 // A restored child mailbox must be linked under its parent, not recreated at the root.
 // The name carries the delimiter, so LIST still showed "Parent/Child", but the tree
 // is path-based: at the root the parent lost \HasChildren, RENAME of the parent no

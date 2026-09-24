@@ -277,6 +277,21 @@ func TestMailboxOperations(t *testing.T) {
 		t.Log("Successfully created mailbox")
 	})
 
+	t.Run("CreateMailbox_CanonicalizesTrailingSeparators", func(t *testing.T) {
+		name := fmt.Sprintf("Trailing-%d", time.Now().UnixNano())
+		resp := tc.makeRequest(t, "POST", "/user/mailboxes", map[string]string{"name": name + "/"})
+		if resp.StatusCode != http.StatusCreated {
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("Expected 201 creating %s/, got %d: %s", name, resp.StatusCode, string(body))
+		}
+		var result map[string]any
+		parseJSON(t, resp, &result)
+		if result["name"] != name {
+			t.Fatalf("Expected canonical name '%s', got %v", name, result["name"])
+		}
+	})
+
 	t.Run("DeleteMailbox_RefusesParentWithChildren", func(t *testing.T) {
 		// A hierarchical name is linked under its (auto-created) parent, so deleting the
 		// parent while the child exists is refused with 409, as IMAP DELETE refuses it.

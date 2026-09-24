@@ -624,11 +624,18 @@ func (db *Database) CreateMailboxForUser(ctx context.Context, accountID int64, m
 	}
 	defer tx.Rollback(context.Background())
 
+	// RFC 3501 §6.3.3: trim trailing hierarchy delimiters so "Folder/Sub/" creates
+	// "Folder/Sub" rather than storing a trailing separator.
+	delim := string(consts.MailboxDelimiter)
+	mailboxPath = strings.TrimRight(mailboxPath, delim)
+	if mailboxPath == "" {
+		return consts.ErrMailboxInvalidName
+	}
+
 	// Link the mailbox under its parent, creating any missing ancestor first, as IMAP
 	// CREATE and GetOrCreateMailboxByName do. Creating it with no parent (as this did)
 	// put "Parent/Child" at the root: the parent never reported \HasChildren, the child
 	// did not follow the parent's RENAME, and the delete gate could not see it.
-	delim := string(consts.MailboxDelimiter)
 	parts := strings.Split(mailboxPath, delim)
 	var parentID *int64
 	for i := 1; i < len(parts); i++ {
