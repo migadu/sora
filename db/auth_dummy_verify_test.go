@@ -46,35 +46,52 @@ func TestDummyBcryptHash_Valid(t *testing.T) {
 // against a genuine bcrypt verification at the same default cost and require the two
 // durations to land in the same ballpark.
 func TestDummyVerifyPassword_Equalizes(t *testing.T) {
+	// Cost 10 keeps each verify in the tens of milliseconds: long enough that scheduler
+	// noise is small next to it, and not MinCost, which the integration build sets
+	// globally and where one verify is under a millisecond.
+	pinBcryptCost(t, 10)
+
 	realHash, err := bcrypt.GenerateFromPassword([]byte("the-real-password"), BcryptCost)
 	if err != nil {
 		t.Fatalf("failed to generate real hash: %v", err)
 	}
 
-	// Warm up so neither side pays a one-time cost in the measured run.
+	// Warm up so neither side pays a one-time cost (including the lazy dummy hash).
 	_ = bcrypt.CompareHashAndPassword(realHash, []byte("wrong"))
 	DummyVerifyPassword("wrong")
 
-	const reps = 5
-	timeIt := func(fn func()) time.Duration {
-		start := time.Now()
+	// Interleave the two sides and keep each one's fastest run, so both are exposed to
+	// the same conditions and load (which only ever adds time) is filtered out as far
+	// as a wall clock allows. On an oversubscribed machine a whole run can still be
+	// time-sliced, so a divergent round is retried: a real regression (a no-op dummy,
+	// or a dummy at the wrong cost) diverges in every round, while noise does not.
+	const rounds, reps = 5, 5
+	var realDur, dummyDur time.Duration
+	var ratio float64
+	for round := 0; round < rounds; round++ {
+		realDur, dummyDur = time.Duration(1<<62), time.Duration(1<<62)
 		for i := 0; i < reps; i++ {
-			fn()
+			start := time.Now()
+			_ = bcrypt.CompareHashAndPassword(realHash, []byte("wrong-password"))
+			realDur = min(realDur, time.Since(start))
+
+			start = time.Now()
+			DummyVerifyPassword("wrong-password")
+			dummyDur = min(dummyDur, time.Since(start))
 		}
-		return time.Since(start) / reps
-	}
 
-	realDur := timeIt(func() { _ = bcrypt.CompareHashAndPassword(realHash, []byte("wrong-password")) })
-	dummyDur := timeIt(func() { DummyVerifyPassword("wrong-password") })
+		// The dummy path must do genuine bcrypt work, not a no-op (a string compare is
+		// sub-µs). Load can only make it slower, so this needs no retry.
+		if dummyDur < time.Millisecond {
+			t.Fatalf("DummyVerifyPassword too fast (%v); it is not doing real bcrypt work", dummyDur)
+		}
 
-	// The dummy path must do genuine bcrypt work, not a no-op (a string compare is sub-µs).
-	if dummyDur < time.Millisecond {
-		t.Fatalf("DummyVerifyPassword too fast (%v); it is not doing real bcrypt work", dummyDur)
+		// Same cost ⇒ same order of magnitude.
+		ratio = float64(dummyDur) / float64(realDur)
+		if ratio >= 0.5 && ratio <= 2.0 {
+			return
+		}
+		t.Logf("round %d: dummy=%v real=%v ratio=%.2f, retrying", round+1, dummyDur, realDur, ratio)
 	}
-
-	// Same cost ⇒ same order of magnitude. Allow a wide band to stay non-flaky on shared CI.
-	ratio := float64(dummyDur) / float64(realDur)
-	if ratio < 0.5 || ratio > 2.0 {
-		t.Fatalf("dummy vs real verification timing diverges: dummy=%v real=%v ratio=%.2f (want 0.5–2.0)", dummyDur, realDur, ratio)
-	}
+	t.Fatalf("dummy vs real verification timing diverges in all %d rounds: dummy=%v real=%v ratio=%.2f (want 0.5–2.0)", rounds, dummyDur, realDur, ratio)
 }
