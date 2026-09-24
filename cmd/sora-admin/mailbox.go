@@ -208,9 +208,12 @@ Options:
   --email EMAIL       Email address of the account (required)
   --mailbox MAILBOX   Mailbox name/path to delete (required)
   --confirm           Confirm deletion (required for safety)
-  --purge             Expunge every message in the mailbox and its children first. Rows and S3
-                      objects are then reclaimed by the cleaner after the grace period, once
-                      nothing else (a copy in another folder) references each object.
+  --purge             Expunge every message in the mailbox first. Rows and S3 objects are then
+                      reclaimed by the cleaner after the grace period, once nothing else (a copy
+                      in another folder) references each object.
+
+A mailbox that still has child mailboxes is refused (nothing is purged); delete the
+children first, as IMAP DELETE requires.
 
 Examples:
   # Delete mailbox (messages enter grace period for cleanup)
@@ -255,9 +258,23 @@ Examples:
 		os.Exit(1)
 	}
 
+	// Refuse a mailbox with children BEFORE --purge touches anything. The delete below
+	// refuses it anyway (ErrMailboxHasChildren), but the purge matches the whole subtree,
+	// so running it first would expunge every child folder's messages and then leave
+	// those folders in place, emptied.
+	target, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, *mailbox)
+	if err != nil {
+		fmt.Printf("Failed to find mailbox '%s': %v\n", *mailbox, err)
+		os.Exit(1)
+	}
+	if target.HasChildren {
+		fmt.Printf("Mailbox '%s' has child mailboxes; delete them first\n", *mailbox)
+		os.Exit(1)
+	}
+
 	// If purge flag is set, purge all messages from S3 and database
 	if *purge {
-		fmt.Printf("Purging all messages from mailbox '%s' and its children...\n", *mailbox)
+		fmt.Printf("Purging all messages from mailbox '%s'...\n", *mailbox)
 
 		// Initialize S3 storage
 		useSSL := !globalConfig.S3.DisableTLS

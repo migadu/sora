@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/consts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -149,12 +150,8 @@ func createPurgeTestMailbox(t *testing.T, db *Database, accountID int64, name st
 // DELETE /user/mailboxes/{name} (and `sora-admin mailbox delete`) used to hard-delete
 // inline: one transaction that expunged and rewrote every message row of the mailbox,
 // holding the row lock a delivery has to wait behind, and growing with the mailbox until
-// it outran the request's own deadline.
-//
-// It now does what IMAP DELETE does — stamp deleted_at and leave the per-message work to
-// the cleaner — without changing what the caller observes: the named mailbox disappears
-// at once, and a child mailbox is left alone (deleting a parent has never removed its
-// children; the path-prefix clause that claimed to could not match, see PurgeMailboxStep).
+// it outran the request's own deadline. It now does what IMAP DELETE does — stamp
+// deleted_at and leave the per-message work to the cleaner.
 func TestDeleteMailboxForUserSoftDeletes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -164,44 +161,110 @@ func TestDeleteMailboxForUserSoftDeletes(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 
-	parent := createPurgeTestMailbox(t, db, accountID, "Project")
-	tx, err := db.GetWritePool().Begin(ctx)
-	require.NoError(t, err)
-	require.NoError(t, db.CreateMailbox(ctx, tx, accountID, "Project/Notes", &parent))
-	require.NoError(t, tx.Commit(ctx))
-	child, err := db.GetMailboxByName(ctx, accountID, "Project/Notes")
-	require.NoError(t, err)
-
-	parentMsg := insertTestMessage(t, db, accountID, parent, "Project", "p", fmt.Sprintf("<p-%d@example.com>", time.Now().UnixNano()))
-	childMsg := insertTestMessage(t, db, accountID, child.ID, "Project/Notes", "c", fmt.Sprintf("<c-%d@example.com>", time.Now().UnixNano()))
+	mailbox := createPurgeTestMailbox(t, db, accountID, "Project")
+	msg := insertTestMessage(t, db, accountID, mailbox, "Project", "p", fmt.Sprintf("<p-%d@example.com>", time.Now().UnixNano()))
 
 	require.NoError(t, db.DeleteMailboxForUser(ctx, accountID, "Project"))
 
-	_, err = db.GetMailboxByName(ctx, accountID, "Project")
+	_, err := db.GetMailboxByName(ctx, accountID, "Project")
 	assert.Error(t, err, "the deleted mailbox must be invisible immediately")
 
 	// No per-message work happened in the request itself.
 	var expungedAt *time.Time
 	require.NoError(t, db.GetReadPool().QueryRow(ctx,
-		"SELECT expunged_at FROM messages WHERE id = $1", parentMsg).Scan(&expungedAt))
+		"SELECT expunged_at FROM messages WHERE id = $1", msg).Scan(&expungedAt))
 	assert.Nil(t, expungedAt, "the interactive delete must not expunge messages inline")
 
 	// The cleaner finishes the job.
-	drainPurgeUntilGone(t, db, ctx, parent)
+	drainPurgeUntilGone(t, db, ctx, mailbox)
 
 	var path string
 	require.NoError(t, db.GetReadPool().QueryRow(ctx,
-		"SELECT mailbox_path, expunged_at FROM messages WHERE id = $1", parentMsg).Scan(&path, &expungedAt))
+		"SELECT mailbox_path, expunged_at FROM messages WHERE id = $1", msg).Scan(&path, &expungedAt))
 	assert.Equal(t, "Project", path)
 	assert.NotNil(t, expungedAt, "the sweep expunges what the interactive delete deferred")
+}
 
-	// The child is untouched throughout — unchanged from the synchronous implementation.
-	stillThere, err := db.GetMailboxByName(ctx, accountID, "Project/Notes")
-	require.NoError(t, err, "deleting a parent must not take its children")
-	assert.Equal(t, child.ID, stillThere.ID)
-	require.NoError(t, db.GetReadPool().QueryRow(ctx,
-		"SELECT expunged_at FROM messages WHERE id = $1", childMsg).Scan(&expungedAt))
-	assert.Nil(t, expungedAt, "a child mailbox's messages are not touched")
+// Deleting a mailbox that still has children is refused on every path, as IMAP DELETE
+// already refused it (RFC 3501 §6.3.4). The User API used to tombstone the parent and
+// leave its children live, pointing at a path prefix the cleaner then purged: the
+// children lost \HasChildren on their parent, stopped following its RENAME, and could
+// no longer be relinked by a restore.
+func TestDeleteMailboxWithChildrenIsRefused(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, _, _, _ := setupRestoreTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	parent := createPurgeTestMailbox(t, db, accountID, "Clients")
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, db.CreateMailbox(ctx, tx, accountID, "Clients/Acme", &parent))
+	require.NoError(t, tx.Commit(ctx))
+
+	err = db.DeleteMailboxForUser(ctx, accountID, "Clients")
+	require.ErrorIs(t, err, consts.ErrMailboxHasChildren)
+	_, err = db.GetMailboxByName(ctx, accountID, "Clients")
+	require.NoError(t, err, "a refused delete must leave the parent in place")
+
+	// Leaf first, then the parent: both succeed.
+	require.NoError(t, db.DeleteMailboxForUser(ctx, accountID, "Clients/Acme"))
+	require.NoError(t, db.DeleteMailboxForUser(ctx, accountID, "Clients"))
+}
+
+// The child check must hold against a child created concurrently, not just one that
+// already exists: the check and the create otherwise race, and the loser is a live
+// child under a tombstoned parent. createMailbox takes FOR KEY SHARE on the parent and
+// SoftDeleteMailbox takes FOR UPDATE on it, so whichever commits first decides.
+func TestSoftDeleteWaitsForConcurrentChildCreate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, _, _, _ := setupRestoreTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	parent := createPurgeTestMailbox(t, db, accountID, "Racing")
+
+	// A child create is in flight (uncommitted) when the parent's delete starts.
+	createTx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer createTx.Rollback(context.Background())
+	require.NoError(t, db.CreateMailbox(ctx, createTx, accountID, "Racing/Child", &parent))
+
+	result := make(chan error, 1)
+	go func() {
+		tx, err := db.GetWritePool().Begin(ctx)
+		if err != nil {
+			result <- err
+			return
+		}
+		defer tx.Rollback(context.Background())
+		if err := db.SoftDeleteMailbox(ctx, tx, parent, accountID); err != nil {
+			result <- err
+			return
+		}
+		result <- tx.Commit(ctx)
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("the parent's delete must wait for the in-flight child create, got %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	require.NoError(t, createTx.Commit(ctx))
+
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, consts.ErrMailboxHasChildren, "once the child exists the delete must be refused")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the parent's delete never resumed")
+	}
 }
 
 // A message restored after its mailbox was purged must come back with a

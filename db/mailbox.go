@@ -371,9 +371,13 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	// Determine the parent path if parentID is provided
 	var parentPath string
 	if parentID != nil {
-		// Fetch the parent mailbox to get its path
+		// Fetch the parent mailbox to get its path. FOR KEY SHARE holds the parent in
+		// place until this child is committed: it conflicts with SoftDeleteMailbox's FOR
+		// UPDATE (so the parent's delete sees this child, or this create sees the parent
+		// gone), but not with the highest_uid UPDATE every delivery into the parent takes.
 		err := tx.QueryRow(ctx, `
 			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
+			FOR KEY SHARE
 		`, *parentID, AccountID).Scan(&parentPath)
 
 		if err != nil {
@@ -486,23 +490,29 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 // mailbox from every read path at once (they all filter deleted_at IS NULL); the
 // background cleaner later calls DeleteMailbox to do the heavy expunge + row removal.
 //
-// The caller (server/imap/delete.go) has already verified the mailbox exists, is not
-// a special mailbox, has no children, and that the user holds the 'x' (delete) right.
-// We re-lock and re-gate here (mirroring DeleteMailbox) so a concurrent
-// delivery/expunge/store on the same mailbox is serialized via the same mailbox-row
-// lock the other write paths take first (see lockMailboxStats). Because the name
-// uniqueness index is partial (WHERE deleted_at IS NULL), stamping deleted_at frees
-// the name for an immediate re-CREATE. If a child mailbox somehow appears after the
-// caller's leaf check, the cleaner's DeleteMailbox uses subtree (path LIKE) semantics
-// and removes it too, so no orphan survives.
+// Callers are the IMAP DELETE path and DeleteMailboxForUser (User API, sora-admin).
+// We lock and gate here so a concurrent delivery/expunge/store on the same mailbox is
+// serialized via the same mailbox-row lock the other write paths take first (see
+// lockMailboxStats). Because the name uniqueness index is partial (WHERE deleted_at IS
+// NULL), stamping deleted_at frees the name for an immediate re-CREATE.
+//
+// A mailbox with live children is refused with ErrMailboxHasChildren (RFC 3501 §6.3.4),
+// and the refusal is enforced here, under the row lock, not only by callers: nothing
+// else would ever remove those children. The cleaner purges exactly the tombstoned
+// mailbox (see PurgeMailboxStep), so a child left under a tombstoned parent would stay
+// live with a path pointing at a row that no longer exists. createMailbox takes FOR
+// KEY SHARE on the parent, which conflicts with the FOR UPDATE below, so a child
+// created concurrently is either visible to the check or finds its parent gone.
 func (db *Database) SoftDeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64) error {
 	var isShared bool
+	var ownerAccountID int64
+	var mboxPath string
 	err := tx.QueryRow(ctx, `
-		SELECT COALESCE(is_shared, FALSE)
+		SELECT COALESCE(is_shared, FALSE), account_id, path
 		FROM mailboxes
 		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE) AND deleted_at IS NULL
 		FOR UPDATE
-	`, mailboxID, AccountID).Scan(&isShared)
+	`, mailboxID, AccountID).Scan(&isShared, &ownerAccountID, &mboxPath)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return consts.ErrMailboxNotFound
@@ -519,6 +529,20 @@ func (db *Database) SoftDeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID 
 		if !hasDeleteRight {
 			return fmt.Errorf("permission denied: user does not have delete right on shared mailbox")
 		}
+	}
+
+	// Paths are 16-hex-character ids concatenated with no separator, so a direct child is
+	// exactly one id longer than this path and starts with it (same test as HasChildren).
+	var hasChildren bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM mailboxes
+		              WHERE account_id = $1 AND LENGTH(path) = LENGTH($2) + 16
+		                AND path LIKE $2 || '%' AND deleted_at IS NULL)
+	`, ownerAccountID, mboxPath).Scan(&hasChildren); err != nil {
+		return fmt.Errorf("failed to check children of mailbox %d: %w", mailboxID, err)
+	}
+	if hasChildren {
+		return consts.ErrMailboxHasChildren
 	}
 
 	tag, err := tx.Exec(ctx, `

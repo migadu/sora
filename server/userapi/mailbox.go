@@ -172,6 +172,10 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
+		if errors.Is(err, consts.ErrMailboxHasChildren) {
+			s.writeError(w, http.StatusConflict, "Mailbox has child mailboxes; delete them first")
+			return
+		}
 		logger.Warn("HTTP Mail API: Error deleting mailbox", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to delete mailbox")
 		return

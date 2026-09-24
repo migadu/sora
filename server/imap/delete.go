@@ -2,6 +2,7 @@ package imap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -75,6 +76,13 @@ func (s *IMAPSession) Delete(ctx context.Context, mboxName string) error {
 	// bulk expunge, which previously drove DELETE P99 to ~1 minute on large folders.
 	// Use mailbox.AccountID (the owner) not AccountID (the requester) for shared mailbox support.
 	err = s.server.rdb.SoftDeleteMailboxWithRetry(ctx, mailbox.ID, mailbox.AccountID)
+	if errors.Is(err, consts.ErrMailboxHasChildren) {
+		// A child was created after the pre-check above; the transaction caught it.
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: fmt.Sprintf("Mailbox '%s' has children and cannot be deleted.", mboxName),
+		}
+	}
 	if err != nil {
 		return s.internalError("failed to delete mailbox '%s': %v", mboxName, err)
 	}
