@@ -284,7 +284,13 @@ curl -X POST http://localhost:8081/user/mailboxes \
 
 **Endpoint:** `DELETE /user/mailboxes/{name}`
 
-Delete a mailbox. **INBOX cannot be deleted.**
+Delete a mailbox. **INBOX cannot be deleted**, and neither can a mailbox that still has child
+mailboxes (`409 Conflict`) — delete the children first, as IMAP `DELETE` requires.
+
+The mailbox disappears immediately and its name is free to reuse at once. Its messages are
+expunged by the background cleaner rather than inside the request, so the call returns in
+the same time whether the mailbox held ten messages or a million. Until the cleaner runs,
+those messages are still restorable with `sora-admin messages restore`.
 
 **Response:** `200 OK`
 ```json

@@ -4,6 +4,7 @@ import "errors"
 
 var (
 	ErrMailboxNotFound        = errors.New("mailbox not found")
+	ErrMailboxHasChildren     = errors.New("mailbox has child mailboxes")
 	ErrMailboxInvalidName     = errors.New("invalid mailbox name")
 	ErrMailboxAlreadyExists   = errors.New("mailbox already exists")
 	ErrMailboxSpecialUseInUse = errors.New("special-use attribute already assigned")

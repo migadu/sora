@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
@@ -269,23 +268,7 @@ func verifyExistingMarkedAsUploaded(t *testing.T, maildirPath string) {
 
 func setupMigrationTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 	t.Helper()
-
-	cfg := &config.DatabaseConfig{
-		Write: &config.DatabaseEndpointConfig{
-			Hosts:    []string{"localhost"},
-			Port:     "5432",
-			User:     "postgres",
-			Name:     "sora_mail_db",
-			Password: "",
-		},
-	}
-
-	rdb, err := resilient.NewResilientDatabase(context.Background(), cfg, true, true)
-	if err != nil {
-		t.Skipf("Failed to connect to test database: %v", err)
-	}
-
-	return rdb
+	return openAdminTestDatabase(t)
 }
 
 func createMigrationTestAccount(t *testing.T, rdb *resilient.ResilientDatabase, email, password string) {

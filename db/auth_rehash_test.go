@@ -11,7 +11,19 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// pinBcryptCost sets BcryptCost for the duration of a test. Under the integration
+// tag this package imports integration_tests/common, whose init lowers BcryptCost
+// to bcrypt.MinCost; a test that reasons about "lower than the configured cost"
+// must not inherit that.
+func pinBcryptCost(t *testing.T, cost int) {
+	t.Helper()
+	orig := BcryptCost
+	BcryptCost = cost
+	t.Cleanup(func() { BcryptCost = orig })
+}
+
 func TestNeedsRehash(t *testing.T) {
+	pinBcryptCost(t, 12)
 	// Test cases for different cost bcrypt hashes
 	tests := []struct {
 		name        string
@@ -108,6 +120,7 @@ func TestNeedsRehash(t *testing.T) {
 // Test the needsRehash function directly without mocking the database
 
 func TestRehashOperation(t *testing.T) {
+	pinBcryptCost(t, 12)
 	// Test the password rehashing directly
 	password := "testPassword123"
 

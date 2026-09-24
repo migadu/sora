@@ -42,7 +42,7 @@ func handleListDeletedMessages(ctx context.Context) {
 	fs := flag.NewFlagSet("messages list-deleted", flag.ExitOnError)
 
 	email := fs.String("email", "", "Email address of the account (required)")
-	mailbox := fs.String("mailbox", "", "Filter by mailbox path (optional)")
+	mailbox := fs.String("mailbox", "", "Filter by mailbox name, case-insensitive (optional)")
 	since := fs.String("since", "", "Show messages deleted since this date (YYYY-MM-DD or RFC3339)")
 	until := fs.String("until", "", "Show messages deleted until this date (YYYY-MM-DD or RFC3339)")
 	limit := fs.Int("limit", 100, "Maximum number of messages to show")
@@ -119,7 +119,7 @@ func handleRestoreMessages(ctx context.Context) {
 	fs := flag.NewFlagSet("messages restore", flag.ExitOnError)
 
 	email := fs.String("email", "", "Email address of the account (required)")
-	mailbox := fs.String("mailbox", "", "Restore all deleted messages from this mailbox")
+	mailbox := fs.String("mailbox", "", "Restore all deleted messages from this mailbox (name, case-insensitive)")
 	ids := fs.String("ids", "", "Comma-separated list of message IDs to restore")
 	since := fs.String("since", "", "Restore messages deleted since this date (YYYY-MM-DD or RFC3339)")
 	until := fs.String("until", "", "Restore messages deleted until this date (YYYY-MM-DD or RFC3339)")

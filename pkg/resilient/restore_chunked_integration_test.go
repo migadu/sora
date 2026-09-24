@@ -150,8 +150,10 @@ func TestRestoreMessagesWithRetry_PartialProgressSurvivesFailure(t *testing.T) {
 
 	since := time.Now().Add(-time.Minute)
 
-	// Two restorable tombstones, then one that cannot be restored: a row without a
-	// recorded mailbox_path (sorts last, so it lands in the final chunk on its own).
+	// Two restorable tombstones, then one that cannot be restored: an orphan with neither
+	// a mailbox nor a recorded mailbox_path (sorts last, so it lands in the final chunk on
+	// its own). Both halves are needed — a row that still has its mailbox is restorable
+	// from the mailbox's current name however stale the string is (see effectiveMailboxName).
 	var uids []imap.UID
 	var poisonID int64
 	for i := 0; i < 3; i++ {
@@ -164,12 +166,18 @@ func TestRestoreMessagesWithRetry_PartialProgressSurvivesFailure(t *testing.T) {
 	for _, uid := range uids {
 		expungeFixture(t, rdb, inbox.ID, uid)
 	}
-	_, err = rdb.GetDatabase().GetWritePool().Exec(ctx, "UPDATE messages SET mailbox_path = NULL WHERE id = $1", poisonID)
+	_, err = rdb.GetDatabase().GetWritePool().Exec(ctx,
+		"UPDATE messages SET mailbox_path = NULL, mailbox_id = NULL WHERE id = $1", poisonID)
 	require.NoError(t, err)
 
-	restored, err := rdb.RestoreMessagesChunkedForTest(ctx, db.RestoreMessagesParams{Email: account.Email, Since: &since}, 1)
+	// Name every id explicitly: an admin who asks for this exact row gets the loud
+	// failure. (A criteria-based restore skips it instead — see
+	// TestRestoreMessagesWithRetry_CriteriaSkipsUnroutableRows.)
+	allIDs, err := rdb.GetDatabase().GetRestorableMessageIDs(ctx, db.RestoreMessagesParams{Email: account.Email, Since: &since})
+	require.NoError(t, err)
+	restored, err := rdb.RestoreMessagesChunkedForTest(ctx, db.RestoreMessagesParams{Email: account.Email, MessageIDs: append(allIDs, poisonID)}, 1)
 	require.Error(t, err, "the unrestorable row must surface as an error")
-	assert.Contains(t, err.Error(), fmt.Sprintf("message %d has no recorded mailbox path", poisonID))
+	assert.Contains(t, err.Error(), fmt.Sprintf("message %d has no mailbox and no recorded mailbox path", poisonID))
 	assert.Contains(t, err.Error(), "restore stopped at candidates 3-3 of 3 after restoring 2")
 	assert.Equal(t, int64(2), restored, "count reports the messages restored before the failure")
 	assert.Equal(t, 2, liveCount(t, rdb, inbox.ID), "chunks committed before the failure stay restored")
@@ -221,4 +229,63 @@ func TestRestoreMessagesWithRetry_NotBoundedByWriteTimeout(t *testing.T) {
 	require.NoError(t, err, "a large restore must not be bounded by a single write_timeout")
 	assert.Equal(t, int64(n), restored)
 	assert.Equal(t, n, liveCount(t, rdb, inbox.ID))
+}
+
+// A row with no mailbox and no recorded mailbox_path cannot be routed anywhere. It used
+// to abort the restore: candidates are ordered by mailbox name, NULLs sort last, so the
+// row landed in the final chunk, that chunk rolled back, and up to a chunk's worth of
+// real messages alongside it stayed unrestorable on every re-run for as long as the row
+// existed. A criteria-based restore now skips it (logged by id at WARN), exactly as it
+// skips candidates that were already restored or purged; the listing still shows it,
+// with an empty mailbox, so an admin can see it and name it explicitly.
+func TestRestoreMessagesWithRetry_CriteriaSkipsUnroutableRows(t *testing.T) {
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	ctx := context.Background()
+
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+	inbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, "INBOX")
+	require.NoError(t, err)
+
+	since := time.Now().Add(-time.Minute)
+
+	var uids []imap.UID
+	var poisonID int64
+	for i := 0; i < 3; i++ {
+		id, uid := restoreFixture(t, rdb, accountID, inbox.ID, "INBOX", fmt.Sprintf("<skip-%d-%d@example.com>", i, time.Now().UnixNano()))
+		uids = append(uids, uid)
+		if i == 2 {
+			poisonID = id
+		}
+	}
+	for _, uid := range uids {
+		expungeFixture(t, rdb, inbox.ID, uid)
+	}
+	_, err = rdb.GetDatabase().GetWritePool().Exec(ctx,
+		"UPDATE messages SET mailbox_path = NULL, mailbox_id = NULL WHERE id = $1", poisonID)
+	require.NoError(t, err)
+
+	// The listing must not fail on the row; it shows it with an empty mailbox.
+	listed, err := rdb.GetDatabase().ListDeletedMessages(ctx, db.ListDeletedMessagesParams{Email: account.Email, Since: &since})
+	require.NoError(t, err, "one unroutable row must not break the listing for the whole account")
+	var sawPoison bool
+	for _, m := range listed {
+		if m.ID == poisonID {
+			sawPoison = true
+			assert.Equal(t, "", m.MailboxPath)
+		}
+	}
+	assert.True(t, sawPoison, "the unroutable row must stay visible in the listing")
+
+	// Chunk size 1, so the poison row would have had a chunk of its own last.
+	restored, err := rdb.RestoreMessagesChunkedForTest(ctx, db.RestoreMessagesParams{Email: account.Email, Since: &since}, 1)
+	require.NoError(t, err, "a criteria-based restore must skip the unroutable row, not stop on it")
+	assert.Equal(t, int64(2), restored)
+	assert.Equal(t, 2, liveCount(t, rdb, inbox.ID))
+
+	var stillExpunged bool
+	require.NoError(t, rdb.GetDatabase().GetReadPool().QueryRow(ctx,
+		"SELECT expunged_at IS NOT NULL FROM messages WHERE id = $1", poisonID).Scan(&stillExpunged))
+	assert.True(t, stillExpunged, "the skipped row is left exactly as it was")
 }

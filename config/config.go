@@ -873,10 +873,11 @@ type CommandTimeoutsConfig struct {
 	Sort        string `toml:"sort,omitempty"`         // SORT timeout (default: "30s")
 	Thread      string `toml:"thread,omitempty"`       // THREAD timeout (default: "30s")
 	MultiSearch string `toml:"multi_search,omitempty"` // MULTISEARCH timeout (default: "30s")
-	Fetch       string `toml:"fetch,omitempty"`        // FETCH timeout (default: "30s")
+	Fetch       string `toml:"fetch,omitempty"`        // FETCH timeout (default: "0" = uncapped)
 	Store       string `toml:"store,omitempty"`        // STORE timeout (default: "15s")
 	Copy        string `toml:"copy,omitempty"`         // COPY timeout (default: "30s")
 	Move        string `toml:"move,omitempty"`         // MOVE timeout (default: "30s")
+	Rename      string `toml:"rename,omitempty"`       // RENAME timeout (default: "60s")
 }
 
 // ManageSieveCommandTimeoutsConfig holds per-command hard timeout limits for
@@ -1456,6 +1457,7 @@ func (s *ServerConfig) GetCommandTimeoutsOverrides() (map[string]time.Duration, 
 		{"store", ct.Store},
 		{"copy", ct.Copy},
 		{"move", ct.Move},
+		{"rename", ct.Rename},
 	}
 
 	for _, f := range fields {

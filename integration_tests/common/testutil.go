@@ -1072,13 +1072,20 @@ func SkipIfDatabaseUnavailable(t *testing.T) {
 		t.Skip("Integration tests disabled via SKIP_INTEGRATION_TESTS=1")
 	}
 
-	// Try to connect to the database to see if it's available
+	// Probe the database SetupTestDatabase uses, without migrating it. This used to
+	// open sora_mail_db, the development database, with migrations on, so every
+	// integration run migrated the dev database to whatever branch was checked out,
+	// and a failure there skipped tests whose own database was fine.
+	dbName := os.Getenv("SORA_TEST_DB_NAME")
+	if dbName == "" {
+		dbName = "sora_test_db"
+	}
 	cfg := &config.DatabaseConfig{
 		Write: &config.DatabaseEndpointConfig{
 			Hosts:    []string{"localhost"},
 			Port:     "5432",
 			User:     "postgres",
-			Name:     "sora_mail_db",
+			Name:     dbName,
 			Password: "",
 		},
 	}
@@ -1086,7 +1093,7 @@ func SkipIfDatabaseUnavailable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rdb, err := resilient.NewResilientDatabase(ctx, cfg, true, true)
+	rdb, err := resilient.NewResilientDatabase(ctx, cfg, false, false)
 	if err != nil {
 		t.Skipf("Database unavailable, skipping integration test: %v", err)
 	}

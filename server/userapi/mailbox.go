@@ -124,11 +124,16 @@ func (s *Server) handleCreateMailbox(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	canonicalName := strings.TrimRight(req.Name, string(consts.MailboxDelimiter))
 
 	// Create mailbox
-	if err := s.rdb.CreateMailboxForUserWithRetry(ctx, accountID, req.Name); err != nil {
+	if err := s.rdb.CreateMailboxForUserWithRetry(ctx, accountID, canonicalName); err != nil {
 		if errors.Is(err, consts.ErrDBUniqueViolation) {
 			s.writeError(w, http.StatusConflict, "Mailbox already exists")
+			return
+		}
+		if errors.Is(err, consts.ErrMailboxInvalidName) {
+			s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 			return
 		}
 		logger.Warn("HTTP Mail API: Error creating mailbox", "name", s.name, "error", err)
@@ -138,7 +143,7 @@ func (s *Server) handleCreateMailbox(w http.ResponseWriter, r *http.Request) {
 
 	s.writeJSON(w, http.StatusCreated, map[string]any{
 		"message": "Mailbox created successfully",
-		"name":    req.Name,
+		"name":    canonicalName,
 	})
 }
 
@@ -170,6 +175,10 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 	if err := s.rdb.DeleteMailboxForUserWithRetry(ctx, accountID, name); err != nil {
 		if errors.Is(err, consts.ErrMailboxNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
+			return
+		}
+		if errors.Is(err, consts.ErrMailboxHasChildren) {
+			s.writeError(w, http.StatusConflict, "Mailbox has child mailboxes; delete them first")
 			return
 		}
 		logger.Warn("HTTP Mail API: Error deleting mailbox", "name", s.name, "error", err)

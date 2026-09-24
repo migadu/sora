@@ -425,27 +425,7 @@ func setupPurgeTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 	if os.Getenv("SKIP_DB_TESTS") == "true" {
 		t.Skip("Skipping database tests")
 	}
-
-	ctx := context.Background()
-
-	cfg := &config.DatabaseConfig{
-		Write: &config.DatabaseEndpointConfig{
-			Hosts:    []string{"localhost"},
-			Port:     "5432",
-			User:     "postgres",
-			Name:     "sora_mail_db",
-			Password: "",
-		},
-	}
-
-	// Setup database connection with migrations enabled
-	ctx = context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, cfg, false, true)
-	if err != nil {
-		t.Skipf("Failed to connect to test database: %v", err)
-	}
-
-	return rdb
+	return openAdminTestDatabase(t)
 }
 
 // createPurgeTestS3Storage creates a file-based S3 mock for testing
@@ -470,15 +450,7 @@ func createPurgeTestConfig(t *testing.T) AdminConfig {
 	t.Helper()
 
 	return AdminConfig{
-		Database: config.DatabaseConfig{
-			Write: &config.DatabaseEndpointConfig{
-				Hosts:    []string{"localhost"},
-				Port:     "5432",
-				User:     "postgres",
-				Name:     "sora_mail_db",
-				Password: "",
-			},
-		},
+		Database: *adminTestDBConfig(t),
 		S3: config.S3Config{
 			Endpoint:   "localhost:9000",
 			AccessKey:  "minioadmin",

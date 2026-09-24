@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
@@ -266,44 +265,7 @@ func verifySQLiteCache(t *testing.T, maildirPath string, expectedTotal, expected
 
 func setupCacheTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 	t.Helper()
-
-	cfg := &config.DatabaseConfig{
-		Write: &config.DatabaseEndpointConfig{
-			Hosts:    []string{"localhost"},
-			Port:     "5432",
-			User:     "postgres",
-			Name:     "sora_mail_db",
-			Password: "",
-		},
-	}
-
-	// Reset database schema for clean test
-	rdb, err := resilient.NewResilientDatabase(context.Background(), cfg, true, true)
-	if err != nil {
-		t.Skipf("Failed to connect to test database: %v", err)
-	}
-
-	ctx := context.Background()
-	_, err = rdb.ExecWithRetry(ctx, `
-		DROP SCHEMA public CASCADE;
-		CREATE SCHEMA public;
-		GRANT ALL ON SCHEMA public TO postgres;
-		GRANT ALL ON SCHEMA public TO public;
-	`)
-	if err != nil {
-		t.Fatalf("Failed to reset database schema: %v", err)
-	}
-
-	rdb.Close()
-
-	// Recreate connection to trigger migrations
-	rdb, err = resilient.NewResilientDatabase(context.Background(), cfg, true, true)
-	if err != nil {
-		t.Fatalf("Failed to recreate database connection: %v", err)
-	}
-
-	t.Log("Database setup completed with fresh schema")
-	return rdb
+	return setupTestDatabase(t)
 }
 
 func createCacheTestAccount(t *testing.T, rdb *resilient.ResilientDatabase, email, password string) {

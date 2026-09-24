@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -372,9 +371,13 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	// Determine the parent path if parentID is provided
 	var parentPath string
 	if parentID != nil {
-		// Fetch the parent mailbox to get its path
+		// Fetch the parent mailbox to get its path. FOR KEY SHARE holds the parent in
+		// place until this child is committed: it conflicts with SoftDeleteMailbox's FOR
+		// UPDATE (so the parent's delete sees this child, or this create sees the parent
+		// gone), but not with the highest_uid UPDATE every delivery into the parent takes.
 		err := tx.QueryRow(ctx, `
 			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
+			FOR KEY SHARE
 		`, *parentID, AccountID).Scan(&parentPath)
 
 		if err != nil {
@@ -487,23 +490,29 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 // mailbox from every read path at once (they all filter deleted_at IS NULL); the
 // background cleaner later calls DeleteMailbox to do the heavy expunge + row removal.
 //
-// The caller (server/imap/delete.go) has already verified the mailbox exists, is not
-// a special mailbox, has no children, and that the user holds the 'x' (delete) right.
-// We re-lock and re-gate here (mirroring DeleteMailbox) so a concurrent
-// delivery/expunge/store on the same mailbox is serialized via the same mailbox-row
-// lock the other write paths take first (see lockMailboxStats). Because the name
-// uniqueness index is partial (WHERE deleted_at IS NULL), stamping deleted_at frees
-// the name for an immediate re-CREATE. If a child mailbox somehow appears after the
-// caller's leaf check, the cleaner's DeleteMailbox uses subtree (path LIKE) semantics
-// and removes it too, so no orphan survives.
+// Callers are the IMAP DELETE path and DeleteMailboxForUser (User API, sora-admin).
+// We lock and gate here so a concurrent delivery/expunge/store on the same mailbox is
+// serialized via the same mailbox-row lock the other write paths take first (see
+// lockMailboxStats). Because the name uniqueness index is partial (WHERE deleted_at IS
+// NULL), stamping deleted_at frees the name for an immediate re-CREATE.
+//
+// A mailbox with live children is refused with ErrMailboxHasChildren (RFC 3501 §6.3.4),
+// and the refusal is enforced here, under the row lock, not only by callers: nothing
+// else would ever remove those children. The cleaner purges exactly the tombstoned
+// mailbox (see PurgeMailboxStep), so a child left under a tombstoned parent would stay
+// live with a path pointing at a row that no longer exists. createMailbox takes FOR
+// KEY SHARE on the parent, which conflicts with the FOR UPDATE below, so a child
+// created concurrently is either visible to the check or finds its parent gone.
 func (db *Database) SoftDeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64) error {
 	var isShared bool
+	var ownerAccountID int64
+	var mboxPath string
 	err := tx.QueryRow(ctx, `
-		SELECT COALESCE(is_shared, FALSE)
+		SELECT COALESCE(is_shared, FALSE), account_id, path
 		FROM mailboxes
 		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE) AND deleted_at IS NULL
 		FOR UPDATE
-	`, mailboxID, AccountID).Scan(&isShared)
+	`, mailboxID, AccountID).Scan(&isShared, &ownerAccountID, &mboxPath)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return consts.ErrMailboxNotFound
@@ -522,6 +531,16 @@ func (db *Database) SoftDeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID 
 		}
 	}
 
+	// Any live descendant refuses the delete, not only a direct child: an earlier build
+	// could tombstone an intermediate mailbox and leave its children live.
+	hasDescendants, err := hasLiveDescendants(ctx, tx, ownerAccountID, mboxPath)
+	if err != nil {
+		return fmt.Errorf("failed to check children of mailbox %d: %w", mailboxID, err)
+	}
+	if hasDescendants {
+		return consts.ErrMailboxHasChildren
+	}
+
 	tag, err := tx.Exec(ctx, `
 		UPDATE mailboxes SET deleted_at = now(), updated_at = now()
 		WHERE id = $1 AND deleted_at IS NULL
@@ -536,101 +555,230 @@ func (db *Database) SoftDeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID 
 	return nil
 }
 
-// DeleteMailbox deletes a mailbox for a specific user by id
+// DeleteMailbox hard-deletes a mailbox inside the caller's single transaction, expunging
+// every message it still holds. The work is proportional to the mailbox's size, so this
+// form is only safe where no deadline can be exceeded; the cleaner drives PurgeMailboxStep
+// in bounded transactions instead (see ResilientDatabase.DeleteMailboxWithRetry), and
+// interactive callers soft-delete.
 func (db *Database) DeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64) error {
+	for {
+		done, err := db.PurgeMailboxStep(ctx, tx, mailboxID, AccountID, 0)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+	}
+}
+
+// hasLiveDescendants reports whether any live mailbox sits anywhere below path.
+// Paths are 16-hex-character ids concatenated with no separator, so a descendant's
+// path starts with this path and is longer than it. Unlike HasChildren (direct
+// children only), this also sees a live grandchild whose intermediate mailbox an
+// earlier build tombstoned.
+func hasLiveDescendants(ctx context.Context, q rowQuerier, accountID int64, path string) (bool, error) {
+	var exists bool
+	err := q.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM mailboxes
+		              WHERE account_id = $1 AND LENGTH(path) > LENGTH($2)
+		                AND path LIKE $2 || '%' AND deleted_at IS NULL)
+	`, accountID, path).Scan(&exists)
+	return exists, err
+}
+
+// HasLiveDescendants is hasLiveDescendants on the read pool, for callers that must
+// refuse before doing irreversible work (sora-admin mailbox delete --purge).
+func (db *Database) HasLiveDescendants(ctx context.Context, accountID int64, path string) (bool, error) {
+	return hasLiveDescendants(ctx, db.GetReadPoolWithContext(ctx), accountID, path)
+}
+
+// PurgeMailboxStep performs ONE bounded step of the hard delete of a mailbox, and reports
+// whether the mailbox is now gone.
+//
+// A step does the first of these that still has work, at most limit rows of it: expunge
+// live messages, stamp already-expunged rows with the mailbox name, detach the mailbox's
+// message_state rows, detach the messages (mailbox_id = NULL) — and once none of them
+// does, remove the mailbox row and report done. limit <= 0 means unlimited, which is what
+// the single-transaction DeleteMailbox wrapper uses.
+//
+// The last two steps are what the foreign keys would otherwise do in one shot when the
+// mailbox row is deleted: message_state.mailbox_id is ON DELETE CASCADE and
+// messages.mailbox_id is ON DELETE SET NULL, so `DELETE FROM mailboxes` alone rewrites
+// every message row and deletes every state row of the mailbox — the single statement
+// that actually blew the deadline on a large mailbox. Doing that work in bounded batches
+// first leaves the DELETE with nothing to cascade. (The state rows are detached rather
+// than deleted, which the cascade could not do; see below.)
+//
+// Stepping exists because the old all-in-one transaction was O(messages) — 16s for 100k
+// messages, 32s for 200k, measured — against a fixed administrative deadline. Past
+// roughly 280k messages the purge could never finish inside it, and since it rolled back
+// whole, that mailbox became a permanent poison pill: retried every cleaner cycle, never
+// progressing, its messages and S3 objects never freed. Each step now commits on its own,
+// so progress is durable and any mailbox drains in a bounded number of bounded steps.
+//
+// Every step re-acquires the mailbox's row lock and re-checks, so the final removal cannot
+// race a message arriving between steps: the DELETE only happens in a step that found no
+// live messages while holding that lock.
+//
+// Scope is this mailbox alone. The predicate here used to read
+// "id = $2 OR path LIKE $3 || '/%'", but paths are 16-character hex ids concatenated with
+// no separator (see helpers.GetMailboxPath), so the second half never matched anything and
+// children were never included. Rather than quietly start hard-deleting live child
+// mailboxes, the clause is gone: the sweep lists every tombstone and purges each one, so a
+// subtree that was marked deleted is still fully removed, one mailbox at a time.
+func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, limit int) (bool, error) {
 	// Check if user has delete permission (ACL 'x' right) for shared mailboxes
 	// For personal mailboxes, ownership is sufficient
-	var mboxPath string
 	var isShared bool
 	err := tx.QueryRow(ctx, `
-		SELECT path, COALESCE(is_shared, FALSE)
+		SELECT COALESCE(is_shared, FALSE)
 		FROM mailboxes
 		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE)
-	`, mailboxID, AccountID).Scan(&mboxPath, &isShared)
+	`, mailboxID, AccountID).Scan(&isShared)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return consts.ErrMailboxNotFound
+			return false, consts.ErrMailboxNotFound
 		}
-		return fmt.Errorf("failed to fetch mailbox for deletion: %w", err)
+		return false, fmt.Errorf("failed to fetch mailbox for deletion: %w", err)
 	}
 
 	// If it's a shared mailbox, check ACL permissions
 	if isShared {
 		hasDeleteRight, err := db.CheckMailboxPermission(ctx, mailboxID, AccountID, ACLRightDelete)
 		if err != nil {
-			return fmt.Errorf("failed to check delete permission: %w", err)
+			return false, fmt.Errorf("failed to check delete permission: %w", err)
 		}
 		if !hasDeleteRight {
-			return fmt.Errorf("permission denied: user does not have delete right on shared mailbox")
+			return false, fmt.Errorf("permission denied: user does not have delete right on shared mailbox")
 		}
 	}
 
-	// Find all mailboxes that will be deleted (the target and its children)
-	// to acquire locks in a consistent order and prevent deadlocks.
-	var mailboxesToDelete []int64
-	rows, err := tx.Query(ctx, `SELECT id FROM mailboxes WHERE account_id = $1 AND (id = $2 OR path LIKE $3 || '/%')`, AccountID, mailboxID, mboxPath)
-	if err != nil {
-		return fmt.Errorf("failed to query mailboxes for deletion lock: %w", err)
-	}
-	mailboxesToDelete, err = pgx.CollectRows(rows, pgx.RowTo[int64])
-	if err != nil {
-		// pgx.CollectRows closes the rows, so we don't need to defer rows.Close()
-		return fmt.Errorf("failed to collect mailboxes for deletion lock: %w", err)
-	}
-
-	// Sort the IDs to ensure a consistent lock acquisition order across all transactions.
-	sort.Slice(mailboxesToDelete, func(i, j int) bool { return mailboxesToDelete[i] < mailboxesToDelete[j] })
-
-	// Lock the mailbox rows (ascending id, deterministic) before marking their
-	// messages expunged. This serializes against concurrent EXPUNGE/STORE/MOVE on
-	// the same mailboxes (which lock the mailbox row first too — see
-	// lockMailboxStats), keeping unseen_count maintenance race-free, and replaces
+	// Lock the mailbox row before marking its messages expunged. This serializes against
+	// concurrent EXPUNGE/STORE/MOVE on the mailbox (which lock the mailbox row first too —
+	// see lockMailboxStats), keeping unseen_count maintenance race-free, and replaces
 	// the previous pg_advisory lock to avoid the global advisory-keyspace collision.
-	if len(mailboxesToDelete) > 0 {
-		if _, err := tx.Exec(ctx, "SELECT 1 FROM mailboxes WHERE id = ANY($1) ORDER BY id FOR UPDATE", mailboxesToDelete); err != nil {
-			return fmt.Errorf("failed to acquire locks for mailbox deletion: %w", err)
-		}
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM mailboxes WHERE id = $1 FOR UPDATE", mailboxID); err != nil {
+		return false, fmt.Errorf("failed to acquire lock for mailbox deletion: %w", err)
 	}
 
-	// Before deleting the mailboxes, update all messages within them (the one
-	// being deleted and all its children) to preserve their mailbox path and mark as expunged.
-	// This is crucial for restoring messages later.
-	// This single UPDATE using a JOIN is much more efficient than looping.
-	_, err = tx.Exec(ctx, `
+	// LIMIT NULL is "no limit" in PostgreSQL, so one statement serves both the bounded
+	// and the unlimited caller.
+	var limitArg any
+	if limit > 0 {
+		limitArg = limit
+	}
+
+	// Expunge a bounded slice of the messages still live in the mailbox, preserving their
+	// mailbox path as we go. This is crucial for restoring messages later.
+	expunged, err := tx.Exec(ctx, `
 		UPDATE messages m
 		SET mailbox_path = mb.name,
 		    expunged_at = now(),
 		    expunged_modseq = nextval('messages_modseq')
 		FROM mailboxes mb
 		WHERE m.mailbox_id = mb.id
-		  AND mb.account_id = $1
-		  AND (mb.id = $2 OR mb.path LIKE $3 || '/%')
-		  AND m.expunged_at IS NULL
-	`, AccountID, mailboxID, mboxPath)
+		  AND m.id IN (
+			SELECT id FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			LIMIT $2
+		  )
+	`, mailboxID, limitArg)
 	if err != nil {
-		logger.Error("Database: failed to set path and mark messages as expunged for mailbox and children", "mailbox_id", mailboxID, "err", err)
-		return consts.ErrInternalError
+		logger.Error("Database: failed to set path and mark messages as expunged", "mailbox_id", mailboxID, "err", err)
+		return false, consts.ErrInternalError
+	}
+	if expunged.RowsAffected() > 0 {
+		// More may remain; the caller commits this step and comes back.
+		return false, nil
 	}
 
-	// Delete the mailbox and all its children in one query using path-based approach
-	result, err := tx.Exec(ctx, `
-		DELETE FROM mailboxes
-		WHERE account_id = $1 AND (id = $2 OR path LIKE $3 || '/%')
-	`, AccountID, mailboxID, mboxPath)
-
+	// Rows that were ALREADY expunged get the same stamp — path only, never a second
+	// expunge (that would rewrite their expunged_at/modseq and move the tombstone).
+	// This is the last moment the name is knowable: the DELETE below nulls mailbox_id
+	// (ON DELETE SET NULL) and leaves mailbox_path as the only record of where the
+	// message lived. RENAME deliberately does not maintain that string for live
+	// mailboxes (see RenameMailbox), so without this an older tombstone would restore
+	// under a pre-rename name. IS DISTINCT FROM keeps it to the rows that actually
+	// changed: nothing at all for a mailbox that was never renamed, and never the rows
+	// the statement above just expunged (it stamped them with the same name).
+	stamped, err := tx.Exec(ctx, `
+		UPDATE messages m
+		SET mailbox_path = mb.name
+		FROM mailboxes mb
+		WHERE m.mailbox_id = mb.id
+		  AND m.id IN (
+			SELECT msg.id FROM messages msg
+			JOIN mailboxes mbx ON mbx.id = msg.mailbox_id
+			WHERE msg.mailbox_id = $1
+			  AND msg.expunged_at IS NOT NULL
+			  AND msg.mailbox_path IS DISTINCT FROM mbx.name
+			LIMIT $2
+		  )
+	`, mailboxID, limitArg)
 	if err != nil {
-		logger.Error("Database: failed to delete mailbox and children", "mailbox_id", mailboxID, "err", err)
-		return consts.ErrInternalError
+		logger.Error("Database: failed to refresh mailbox path on expunged messages", "mailbox_id", mailboxID, "err", err)
+		return false, consts.ErrInternalError
+	}
+	if stamped.RowsAffected() > 0 {
+		return false, nil
+	}
+
+	// Detach the mailbox's message_state rows in bounded batches, so the DELETE below
+	// has nothing to cascade into. They are detached (mailbox_id = NULL), not deleted:
+	// the ON DELETE CASCADE used to delete them, and RestoreMessages only UPDATEs this
+	// row, so a message restored after a purge came back with no state at all — unread,
+	// keyword-less, and every STORE on it silently updating nothing. Kept, its flags
+	// survive the round trip; the row still goes when the message row itself is reaped
+	// (message_state.message_id is ON DELETE CASCADE). The stats triggers skip rows
+	// whose mailbox_id is NULL, and these messages are all expunged by now anyway.
+	detachedState, err := tx.Exec(ctx, `
+		UPDATE message_state SET mailbox_id = NULL
+		WHERE message_id IN (
+			SELECT message_id FROM message_state WHERE mailbox_id = $1 LIMIT $2
+		)
+	`, mailboxID, limitArg)
+	if err != nil {
+		logger.Error("Database: failed to detach message state from mailbox", "mailbox_id", mailboxID, "err", err)
+		return false, consts.ErrInternalError
+	}
+	if detachedState.RowsAffected() > 0 {
+		return false, nil
+	}
+
+	// Detach the messages in bounded batches — exactly what the ON DELETE SET NULL would
+	// do. mailbox_path (stamped above) is what restore routes by from here on.
+	detached, err := tx.Exec(ctx, `
+		UPDATE messages SET mailbox_id = NULL
+		WHERE id IN (
+			SELECT id FROM messages WHERE mailbox_id = $1 LIMIT $2
+		)
+	`, mailboxID, limitArg)
+	if err != nil {
+		logger.Error("Database: failed to detach messages from mailbox", "mailbox_id", mailboxID, "err", err)
+		return false, consts.ErrInternalError
+	}
+	if detached.RowsAffected() > 0 {
+		return false, nil
+	}
+
+	// Nothing live is left and every tombstone carries its final name, so the mailbox row
+	// can go. We still hold its lock from this step, which is what makes the checks above
+	// binding: a message cannot appear between them and the DELETE.
+	result, err := tx.Exec(ctx, `DELETE FROM mailboxes WHERE id = $1`, mailboxID)
+	if err != nil {
+		logger.Error("Database: failed to delete mailbox", "mailbox_id", mailboxID, "err", err)
+		return false, consts.ErrInternalError
 	}
 
 	rowsAffected := result.RowsAffected()
 	if rowsAffected == 0 {
 		// This should not happen if the initial SELECT succeeded, but it's a good safeguard.
 		logger.Error("Database: mailbox not found for deletion during final delete step", "mailbox_id", mailboxID)
-		return consts.ErrMailboxNotFound
+		return false, consts.ErrMailboxNotFound
 	}
 
-	return nil
+	return true, nil
 }
 
 // HasMailboxWithSpecialUse reports whether the account already has a live mailbox
@@ -1118,29 +1266,23 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 
 	}
 
-	// Keep the denormalized messages.mailbox_path in sync with the new name(s).
-	// This column stores the mailbox NAME and is used by RestoreMessages to route
-	// expunged messages back to a mailbox by that name; leaving it pointing at the
-	// pre-rename name would resurrect a mailbox under the old name on restore.
-	// After the updates above, the renamed mailbox and all of its descendants are
-	// exactly the mailboxes whose path is prefixed by newPath (true for both a
-	// simple rename, where newPath == oldPath, and a move, where descendant paths
-	// were re-prefixed to newPath), so set each affected message's mailbox_path to
-	// its mailbox's current name. Expunged rows are included on purpose — they are
-	// precisely what RestoreMessages reads. Only mailbox_path changes, so the
-	// per-statement stats trigger (which keys on mailbox_id/expunged_at) is a no-op.
-	_, err = tx.Exec(ctx, `
-		UPDATE messages m
-		SET mailbox_path = mb.name
-		FROM mailboxes mb
-		WHERE m.mailbox_id = mb.id
-		  AND mb.account_id = $1
-		  AND mb.path LIKE $2 || '%'
-		  AND m.mailbox_path IS DISTINCT FROM mb.name
-	`, ownerAccountID, newPath)
-	if err != nil {
-		return fmt.Errorf("failed to sync message mailbox_path after rename of mailbox %d: %w", mailboxID, err)
-	}
+	// NOTE: the denormalized messages.mailbox_path is deliberately NOT re-synced here.
+	//
+	// It used to be: one UPDATE over every message of the renamed subtree (expunged rows
+	// included). Nothing indexes mailbox_path, but nothing makes those updates HOT either
+	// — the rows do not fit back in their pages — so every row took a new entry in all ~30
+	// indexes on messages, 7 of them GIN. Measured on a 105k-message mailbox: 37s
+	// and 2.2 GB of WAL for one rename, with the mailboxes row lock held throughout, which
+	// is the row every delivery needs (see lockMailboxStats and the highest_uid UPDATE in
+	// InsertMessage) — so deliveries into the mailbox did not just wait, they failed at
+	// lock_timeout.
+	//
+	// The column only has to be right for rows whose mailbox is GONE: mailbox_id is
+	// ON DELETE SET NULL, so it is the sole record of where an orphan lived. DeleteMailbox
+	// stamps it (live and already-expunged rows) immediately before deleting the mailbox,
+	// and RestoreMessages prefers the mailbox's current name via mailbox_id, falling back
+	// to the string only for orphans (see effectiveMailboxName in restore.go). A stale
+	// mailbox_path on a row whose mailbox still exists is therefore never read.
 
 	// Move the subscription (and its descendants) in the SAME transaction as the
 	// rename, so a crash can't leave the mailbox renamed but the subscription

@@ -498,50 +498,56 @@ components:
 
     DeletedMessage:
       type: object
-      description: "Information about a deleted message that can be restored."
+      description: >-
+        Information about a deleted message that can be restored. Field names are the Go
+        struct's (ID, MailboxPath, ...), not snake_case: the endpoint encodes db.DeletedMessage
+        directly.
       properties:
-        id:
+        ID:
           type: integer
           format: int64
           example: 12345
           description: "Unique message ID"
-        uid:
+        UID:
           type: integer
           format: int64
           example: 42
           description: "IMAP UID (will change if restored)"
-        content_hash:
+        ContentHash:
           type: string
           example: "blake3_abc123..."
           description: "BLAKE3 hash of message content"
-        mailbox_path:
+        MailboxPath:
           type: string
           example: "INBOX/Archive"
-          description: "Original mailbox path"
-        mailbox_id:
+          description: >-
+            Mailbox the message belongs to: its current name while the mailbox exists, else the
+            name recorded when it was deleted. Empty when neither is known; criteria-based
+            restores skip such messages.
+        MailboxID:
           type: integer
           format: int64
           nullable: true
           example: 5
           description: "Mailbox ID (null if mailbox was deleted)"
-        subject:
+        Subject:
           type: string
           example: "Meeting notes"
-        message_id:
+        MessageID:
           type: string
           example: "<abc@example.com>"
           description: "RFC822 Message-ID header"
-        internal_date:
+        InternalDate:
           type: string
           format: date-time
           example: "2023-06-15T10:30:00Z"
           description: "IMAP internal date"
-        expunged_at:
+        ExpungedAt:
           type: string
           format: date-time
           example: "2023-06-20T14:00:00Z"
           description: "When the message was deleted"
-        size:
+        Size:
           type: integer
           example: 4096
           description: "Message size in bytes"
@@ -549,6 +555,9 @@ components:
     ListDeletedMessagesResponse:
       type: object
       properties:
+        email:
+          type: string
+          example: "user@example.com"
         messages:
           type: array
           items:
@@ -1248,27 +1257,28 @@ paths:
                 success:
                   summary: Successful response with deleted messages
                   value:
+                    email: "user@example.com"
                     messages:
-                      - id: 12345
-                        uid: 42
-                        content_hash: "blake3_abc123..."
-                        mailbox_path: "INBOX/Archive"
-                        mailbox_id: 5
-                        subject: "Meeting notes"
-                        message_id: "<abc@example.com>"
-                        internal_date: "2023-06-15T10:30:00Z"
-                        expunged_at: "2023-06-20T14:00:00Z"
-                        size: 4096
-                      - id: 12346
-                        uid: 43
-                        content_hash: "blake3_def456..."
-                        mailbox_path: "INBOX"
-                        mailbox_id: null
-                        subject: "Old email"
-                        message_id: "<def@example.com>"
-                        internal_date: "2023-06-10T08:15:00Z"
-                        expunged_at: "2023-06-21T09:00:00Z"
-                        size: 2048
+                      - ID: 12345
+                        UID: 42
+                        ContentHash: "blake3_abc123..."
+                        MailboxPath: "INBOX/Archive"
+                        MailboxID: 5
+                        Subject: "Meeting notes"
+                        MessageID: "<abc@example.com>"
+                        InternalDate: "2023-06-15T10:30:00Z"
+                        ExpungedAt: "2023-06-20T14:00:00Z"
+                        Size: 4096
+                      - ID: 12346
+                        UID: 43
+                        ContentHash: "blake3_def456..."
+                        MailboxPath: "INBOX"
+                        MailboxID: null
+                        Subject: "Old email"
+                        MessageID: "<def@example.com>"
+                        InternalDate: "2023-06-10T08:15:00Z"
+                        ExpungedAt: "2023-06-21T09:00:00Z"
+                        Size: 2048
                     total: 2
         '400':
           description: Invalid request parameters.

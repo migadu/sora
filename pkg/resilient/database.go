@@ -210,6 +210,7 @@ func isQuerySuccessful(err error) bool {
 	// Business logic errors that should NOT trip the circuit breaker.
 	if errors.Is(err, consts.ErrUserNotFound) ||
 		errors.Is(err, consts.ErrMailboxNotFound) ||
+		errors.Is(err, consts.ErrMailboxHasChildren) ||
 		errors.Is(err, consts.ErrMessageNotAvailable) ||
 		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
 		errors.Is(err, consts.ErrAccountAlreadyExists) ||
@@ -235,6 +236,7 @@ func isWriteSuccessful(err error) bool {
 	}
 	if errors.Is(err, consts.ErrUserNotFound) ||
 		errors.Is(err, consts.ErrMailboxNotFound) ||
+		errors.Is(err, consts.ErrMailboxHasChildren) ||
 		errors.Is(err, consts.ErrMessageNotAvailable) ||
 		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
 		errors.Is(err, consts.ErrAccountAlreadyExists) ||
@@ -527,6 +529,7 @@ func (rd *ResilientDatabase) isBusinessLogicError(err error) bool {
 	// Check against all business logic errors that are treated as success by circuit breaker
 	return errors.Is(err, consts.ErrUserNotFound) ||
 		errors.Is(err, consts.ErrMailboxNotFound) ||
+		errors.Is(err, consts.ErrMailboxHasChildren) ||
 		errors.Is(err, consts.ErrMessageNotAvailable) ||
 		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
 		errors.Is(err, consts.ErrAccountAlreadyExists) ||

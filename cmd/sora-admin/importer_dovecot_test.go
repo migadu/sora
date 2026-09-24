@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
-	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
@@ -518,96 +517,6 @@ func TestImporter_PendingUploads(t *testing.T) {
 	t.Logf("✅ - Message inserted into database correctly")
 	t.Logf("✅ - Message correctly marked as not uploaded")
 	t.Logf("✅ - Database insertion with PendingUpload functionality verified")
-}
-
-// setupTestDatabase creates a test database connection
-func setupTestDatabase(t *testing.T) *resilient.ResilientDatabase {
-	t.Helper()
-
-	cfg := &config.DatabaseConfig{
-		Write: &config.DatabaseEndpointConfig{
-			Hosts:    []string{"localhost"},
-			Port:     "5432",
-			User:     "postgres",
-			Name:     "sora_mail_db",
-			Password: "",
-		},
-	}
-
-	rdb, err := resilient.NewResilientDatabase(context.Background(), cfg, true, true)
-	if err != nil {
-		t.Skipf("Failed to connect to test database: %v", err)
-	}
-
-	// Run migrations equivalent to "sora-admin migrate up"
-	err = runMigrations(t, rdb)
-	if err != nil {
-		t.Fatalf("Failed to run database migrations: %v", err)
-	}
-
-	return rdb
-}
-
-// runMigrations runs database migrations (equivalent to sora-admin migrate up)
-func runMigrations(t *testing.T, rdb *resilient.ResilientDatabase) error {
-	t.Helper()
-
-	ctx := context.Background()
-
-	// The migrations are automatically run when creating the resilient database
-	// But let's ensure we have a clean slate by resetting the database first
-
-	// Drop all tables to start fresh
-	_, err := rdb.ExecWithRetry(ctx, `
-		DROP SCHEMA public CASCADE;
-		CREATE SCHEMA public;
-		GRANT ALL ON SCHEMA public TO postgres;
-		GRANT ALL ON SCHEMA public TO public;
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to reset database schema: %w", err)
-	}
-
-	t.Log("Reset database schema for clean test environment")
-
-	// Close the database connection
-	rdb.Close()
-
-	// Recreate the database connection to trigger fresh migrations
-	cfg := &config.DatabaseConfig{
-		Write: &config.DatabaseEndpointConfig{
-			Hosts:    []string{"localhost"},
-			Port:     "5432",
-			User:     "postgres",
-			Name:     "sora_mail_db",
-			Password: "",
-		},
-	}
-
-	newRdb, err := resilient.NewResilientDatabase(context.Background(), cfg, true, true)
-	if err != nil {
-		return fmt.Errorf("failed to recreate database connection: %w", err)
-	}
-
-	// Replace the old rdb pointer with the new one
-	*rdb = *newRdb
-
-	// Also clear any test data from previous runs
-	_, err = rdb.ExecWithRetry(context.Background(), `
-		DELETE FROM pending_uploads;
-		DELETE FROM message_flags;
-		DELETE FROM messages;
-		DELETE FROM mailboxes WHERE name != 'INBOX' AND name != 'Sent' AND name != 'Drafts' AND name != 'Trash' AND name != 'Junk';
-		DELETE FROM credentials;
-		DELETE FROM accounts;
-		DELETE FROM sieve_scripts;
-	`)
-	if err != nil {
-		t.Logf("Warning: Failed to clean test data: %v", err)
-	}
-
-	t.Log("Database migrations completed successfully")
-	return nil
 }
 
 // setupTestS3Storage creates a test S3 storage (dummy instance for test mode)

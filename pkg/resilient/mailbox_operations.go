@@ -25,6 +25,18 @@ func (rd *ResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, Acco
 	return result.(*db.DBMailbox), nil
 }
 
+// HasLiveDescendantsWithRetry reports whether any live mailbox sits below the given path.
+func (rd *ResilientDatabase) HasLiveDescendantsWithRetry(ctx context.Context, accountID int64, path string) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).HasLiveDescendants(ctx, accountID, path)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
 func (rd *ResilientDatabase) InsertMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload) (messageID int64, uid int64, err error) {
 	// Lock the mailbox at the Go level to prevent connection pool starvation during mass concurrent inserts.
 	unlock := rd.getOperationalDatabaseForOperation(ctx, true).LockMailbox(options.MailboxID)
@@ -418,14 +430,49 @@ func (rd *ResilientDatabase) CreateMailboxWithSpecialUseWithRetry(ctx context.Co
 	return err
 }
 
+// mailboxPurgeBatchSize bounds how many message rows one hard-delete transaction
+// rewrites. Every row is a non-HOT update that propagates into all ~30 indexes on
+// messages, so cost is flatly proportional to the batch: ~0.16ms per row measured,
+// i.e. well under a second per batch, which also caps how long the mailbox's row lock
+// is held at a time.
+const mailboxPurgeBatchSize = 1000
+
+// DeleteMailboxWithRetry hard-deletes a mailbox — the deferred half of two-phase
+// deletion, driven by the cleaner.
+//
+// The work is spread over bounded transactions (see db.PurgeMailboxStep) instead of one
+// transaction sized by the mailbox. The single transaction was O(messages) against a
+// fixed administrative deadline — 16s for 100k messages, 32s for 200k — so beyond roughly
+// 280k messages it could never commit, and because it rolled back whole, that mailbox was
+// retried every cycle forever with its messages and S3 objects never freed. Committed
+// steps now stay committed, so each cycle makes progress even if it is interrupted.
 func (rd *ResilientDatabase) DeleteMailboxWithRetry(ctx context.Context, mailboxID int64, AccountID int64) error {
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(ctx, true).DeleteMailbox(ctx, tx, mailboxID, AccountID)
+	return rd.purgeMailboxChunked(ctx, mailboxID, AccountID, mailboxPurgeBatchSize)
+}
+
+func (rd *ResilientDatabase) purgeMailboxChunked(ctx context.Context, mailboxID int64, AccountID int64, batchSize int) error {
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		var done bool
+		op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+			stepDone, err := rd.getOperationalDatabaseForOperation(ctx, true).PurgeMailboxStep(ctx, tx, mailboxID, AccountID, batchSize)
+			done = stepDone
+			return nil, err
+		}
+		// Each step is bounded, so the normal write timeout is the right budget — the
+		// administrative one existed only to accommodate the unbounded transaction.
+		if _, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op, consts.ErrMailboxNotFound); err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		// A step that is not done always changed rows, so this loop cannot spin: it
+		// terminates when the mailbox runs out of messages, or when ctx is cancelled.
 	}
-	// Deleting a mailbox is a bulk operation that cleans up thousands of messages and triggers sequence updates.
-	// Treat it with administrative timeouts rather than tight 15s write timeouts.
-	_, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutAdmin, op)
-	return err
 }
 
 // SoftDeleteMailboxWithRetry marks a mailbox deleted for two-phase deletion (the IMAP

@@ -624,7 +624,42 @@ func (db *Database) CreateMailboxForUser(ctx context.Context, accountID int64, m
 	}
 	defer tx.Rollback(context.Background())
 
-	err = db.CreateMailbox(ctx, tx, accountID, mailboxPath, nil)
+	// RFC 3501 §6.3.3: trim trailing hierarchy delimiters so "Folder/Sub/" creates
+	// "Folder/Sub" rather than storing a trailing separator.
+	delim := string(consts.MailboxDelimiter)
+	mailboxPath = strings.TrimRight(mailboxPath, delim)
+	if mailboxPath == "" {
+		return consts.ErrMailboxInvalidName
+	}
+
+	// Link the mailbox under its parent, creating any missing ancestor first, as IMAP
+	// CREATE and GetOrCreateMailboxByName do. Creating it with no parent (as this did)
+	// put "Parent/Child" at the root: the parent never reported \HasChildren, the child
+	// did not follow the parent's RENAME, and the delete gate could not see it.
+	parts := strings.Split(mailboxPath, delim)
+	var parentID *int64
+	for i := 1; i < len(parts); i++ {
+		ancestor := strings.Join(parts[:i], delim)
+		var id int64
+		err := tx.QueryRow(ctx, `
+			SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
+		`, accountID, ancestor).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if err := db.CreateMailbox(ctx, tx, accountID, ancestor, parentID); err != nil &&
+				!errors.Is(err, consts.ErrDBUniqueViolation) && !errors.Is(err, consts.ErrMailboxAlreadyExists) {
+				return fmt.Errorf("failed to create parent mailbox '%s': %w", ancestor, err)
+			}
+			err = tx.QueryRow(ctx, `
+				SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
+			`, accountID, ancestor).Scan(&id)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to resolve parent mailbox '%s': %w", ancestor, err)
+		}
+		parentID = &id
+	}
+
+	err = db.CreateMailbox(ctx, tx, accountID, mailboxPath, parentID)
 	if err != nil {
 		return err
 	}
@@ -650,7 +685,11 @@ func (db *Database) DeleteMailboxForUser(ctx context.Context, accountID int64, m
 	}
 	defer tx.Rollback(context.Background())
 
-	err = db.DeleteMailbox(ctx, tx, mailbox.ID, accountID)
+	// Two-phase deletion, as the IMAP DELETE path does: stamp deleted_at (one row) and
+	// leave the per-message expunge to the cleaner. Hard-deleting inline made this request
+	// proportional to the mailbox's size — 16s for 100k messages, 32s for 200k, measured —
+	// while holding the mailbox row lock every delivery into it needs.
+	err = db.SoftDeleteMailbox(ctx, tx, mailbox.ID, accountID)
 	if err != nil {
 		return err
 	}
