@@ -8,6 +8,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/helpers"
 )
 
 // GetVanishedUIDs returns UIDs that were expunged between sinceModSeq and untilModSeq.
@@ -113,6 +114,10 @@ func (d *Database) GetMessagesChangedSince(ctx context.Context, mailboxID int64,
 			for _, customFlag := range customFlags {
 				msg.Flags = append(msg.Flags, imap.Flag(customFlag))
 			}
+			// These flags go straight into the SELECT response. Drop any stored
+			// keyword that is not an IMAP atom: it cannot be encoded, and one in
+			// this list aborts the SELECT (helpers.IsValidFlagName).
+			msg.Flags = helpers.SanitizeFlags(msg.Flags)
 		}
 
 		messages = append(messages, msg)

@@ -427,3 +427,110 @@ func TestMigration049PurgesNonAtomKeywords(t *testing.T) {
 		t.Errorf("the migration rewrote the registry of a mailbox with no invalid keywords")
 	}
 }
+
+// TestIMAP_PoisonKeywordDoesNotWedgeQresyncSelect covers the third way a stored
+// keyword reaches a client: SELECT ... (QRESYNC (...)) reports every message
+// changed since the client's modseq as a FETCH inside the SELECT response. That
+// list is built in db.GetMessagesChangedSince, separately from FETCH and poll,
+// so it needs the same filter.
+func TestIMAP_PoisonKeywordDoesNotWedgeQresyncSelect(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+	ctx := context.Background()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	literal := "From: a@example.com\r\nTo: b@example.com\r\nSubject: hi\r\n\r\nbody\r\n"
+	app := c.Append("INBOX", int64(len(literal)), nil)
+	if _, err := app.Write([]byte(literal)); err != nil {
+		t.Fatalf("APPEND write: %v", err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatalf("APPEND close: %v", err)
+	}
+	if _, err := app.Wait(); err != nil {
+		t.Fatalf("APPEND: %v", err)
+	}
+	sel, err := c.Select("INBOX", nil).Wait()
+	if err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+	uidValidity := sel.UIDValidity
+	c.Logout()
+
+	accountID, err := server.ResilientDB.GetDatabase().GetAccountIDByAddress(ctx, account.Email)
+	if err != nil {
+		t.Fatalf("resolving account id: %v", err)
+	}
+	// Bump updated_modseq so the message counts as changed since modseq 1.
+	if _, err := server.ResilientDB.GetDatabase().GetWritePool().Exec(ctx, `
+		UPDATE message_state ms
+		SET custom_flags = $1::jsonb, updated_modseq = nextval('messages_modseq')
+		FROM mailboxes mb
+		WHERE mb.id = ms.mailbox_id AND mb.account_id = $2 AND lower(mb.name) = 'inbox'`,
+		fmt.Sprintf(`[%q, "Work"]`, poisonKeyword), accountID); err != nil {
+		t.Fatalf("poisoning message_state: %v", err)
+	}
+
+	conn, err := net.Dial("tcp", server.Address)
+	if err != nil {
+		t.Fatalf("raw dial: %v", err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+	if _, err := br.ReadString('\n'); err != nil {
+		t.Fatalf("greeting: %v", err)
+	}
+	fmt.Fprintf(conn, "a1 LOGIN %s %s\r\n", account.Email, account.Password)
+	if err := readTaggedWithin(t, conn, br, "a1", 10*time.Second); err != nil {
+		t.Fatalf("raw LOGIN: %v", err)
+	}
+	fmt.Fprintf(conn, "a2 ENABLE QRESYNC\r\n")
+	if err := readTaggedWithin(t, conn, br, "a2", 10*time.Second); err != nil {
+		t.Fatalf("ENABLE QRESYNC: %v", err)
+	}
+
+	// Read the SELECT response by hand so we can check the modified-message
+	// FETCH was actually emitted -- otherwise this is not exercising the path.
+	fmt.Fprintf(conn, "a3 SELECT INBOX (QRESYNC (%d 1))\r\n", uidValidity)
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	sawModified := false
+	for {
+		line, err := br.ReadString('\n')
+		if line != "" {
+			t.Logf("S: %q", strings.TrimRight(line, "\r\n"))
+		}
+		if err != nil {
+			t.Fatalf("QRESYNC SELECT never completed: %v\n"+
+				"the modified-message FETCH carried the non-atom keyword %q and aborted the response",
+				err, poisonKeyword)
+		}
+		if strings.HasPrefix(line, "* 1 FETCH") {
+			sawModified = true
+			if strings.Contains(line, poisonKeyword) {
+				t.Errorf("QRESYNC FETCH carried the invalid keyword: %q", line)
+			}
+			if !strings.Contains(line, "Work") {
+				t.Errorf("QRESYNC FETCH dropped the valid keyword too: %q", line)
+			}
+		}
+		if strings.HasPrefix(line, "a3 ") {
+			if !strings.HasPrefix(line, "a3 OK") {
+				t.Fatalf("QRESYNC SELECT failed: %q", line)
+			}
+			break
+		}
+	}
+	if !sawModified {
+		t.Fatalf("precondition failed: QRESYNC SELECT reported no modified message, so the filtered path was not exercised")
+	}
+}

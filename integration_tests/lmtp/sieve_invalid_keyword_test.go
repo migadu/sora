@@ -46,11 +46,13 @@ func TestLMTP_SieveInvalidKeywordIsDropped(t *testing.T) {
 		t.Fatalf("Failed to get account ID: %v", err)
 	}
 
-	// The keyword from the incident, plus keywords exercising the other
-	// atom-specials a script could reach for, plus one that must survive.
+	// The keyword from the incident, plus two single-token keywords holding
+	// atom-specials, plus one that must survive. A space cannot be tested here:
+	// RFC 5232 §2 makes a space-separated string a list of flags, so
+	// "bad tag" would be the two valid flags "bad" and "tag".
 	sieveScript := `require ["imap4flags"];
 addflag "НЕОБРАБОТЕНО";
-addflag "bad tag";
+addflag "bad%tag";
 addflag "bad]bracket";
 addflag "Work";
 keep;
@@ -154,7 +156,7 @@ keep;
 		t.Fatalf("failed to unmarshal custom_flags %q: %v", string(customFlagsJSON), err)
 	}
 
-	for _, bad := range []string{"НЕОБРАБОТЕНО", "bad tag", "bad]bracket"} {
+	for _, bad := range []string{"НЕОБРАБОТЕНО", "bad%tag", "bad]bracket"} {
 		for _, got := range customFlags {
 			if strings.EqualFold(got, bad) {
 				t.Errorf("keyword %q is not a valid IMAP flag-keyword but was stored; "+

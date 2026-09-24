@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -176,8 +177,16 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	}
 
 	// Flags set by the Sieve script via imap4flags (RFC 5232). Applied to every
-	// locally stored copy of the message.
-	outcome.Flags = helpers.SanitizeFlags(helpers.StringsToFlags(result.Flags))
+	// locally stored copy of the message. Keywords that are not valid IMAP atoms
+	// are dropped -- stored, they would wedge SELECT of the mailbox -- and named
+	// in the log, as the LMTP path does, since the user's script line silently
+	// did nothing.
+	rawFlags := helpers.StringsToFlags(result.Flags)
+	outcome.Flags = helpers.SanitizeFlags(rawFlags)
+	if rejected := helpers.DroppedFlags(rawFlags, outcome.Flags); len(rejected) > 0 {
+		s.DeliveryCtx.Logger.Log("Sieve set invalid IMAP keywords, dropped: %s (not a valid IMAP flag-keyword, RFC 9051 §9)",
+			strings.Join(rejected, ","))
+	}
 
 	// Process result
 	switch result.Action {

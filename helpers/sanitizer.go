@@ -1,6 +1,7 @@
 package helpers
 
 import (
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -205,6 +206,23 @@ func SanitizeFlags(flags []imap.Flag) []imap.Flag {
 	}
 
 	return sanitized
+}
+
+// DroppedFlags returns the flags in raw that SanitizeFlags(raw) removed, as
+// strings, for logging. Sieve imap4flags is the one flag source that never
+// passes an IMAP parser, so a dropped keyword there is a user's script line
+// that silently did nothing; callers log these so support can point at it.
+func DroppedFlags(raw, kept []imap.Flag) []string {
+	if len(raw) == len(kept) {
+		return nil
+	}
+	dropped := make([]string, 0, len(raw)-len(kept))
+	for _, f := range raw {
+		if !slices.Contains(kept, f) {
+			dropped = append(dropped, string(f))
+		}
+	}
+	return dropped
 }
 
 // RemoveLongTokens drops any continuous sequence of non-whitespace characters longer than maxTokenLen.

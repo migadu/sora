@@ -328,7 +328,7 @@ func TestSanitizeUTF8ForFTS(t *testing.T) {
 }
 
 // TestIsValidFlagName pins the RFC 9051 §9 flag grammar. The same table is
-// checked against the SQL predicate in migration 000050, which must classify
+// checked against the SQL predicate in migration 000049, which must classify
 // every case identically -- the migration cleans up exactly what this check now
 // refuses to let in.
 func TestIsValidFlagName(t *testing.T) {
@@ -404,5 +404,21 @@ func TestSanitizeFlagsDropsUnencodableKeywords(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("SanitizeFlags(%v) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+// TestDroppedFlags checks the report the Sieve delivery paths log: exactly the
+// flags SanitizeFlags removed, in input order, and nothing when none were.
+func TestDroppedFlags(t *testing.T) {
+	raw := []imap.Flag{"\\Seen", "НЕОБРАБОТЕНО", "Work", "bad%tag", "$Junk"}
+	got := DroppedFlags(raw, SanitizeFlags(raw))
+	want := []string{"НЕОБРАБОТЕНО", "bad%tag"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("DroppedFlags = %q, want %q", got, want)
+	}
+
+	clean := []imap.Flag{"\\Seen", "Work"}
+	if got := DroppedFlags(clean, SanitizeFlags(clean)); got != nil {
+		t.Fatalf("DroppedFlags on an all-valid list = %q, want nil", got)
 	}
 }

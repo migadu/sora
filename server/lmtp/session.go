@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -763,13 +762,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	}
 	// Dropping a flag silently would leave the user's script looking like it
 	// worked; name the rejected keywords so support can point at the line.
-	if dropped := len(rawSieveFlags) - len(sieveFlags); dropped > 0 {
-		rejected := make([]string, 0, dropped)
-		for _, f := range rawSieveFlags {
-			if !slices.Contains(sieveFlags, f) {
-				rejected = append(rejected, string(f))
-			}
-		}
+	if rejected := helpers.DroppedFlags(rawSieveFlags, sieveFlags); len(rejected) > 0 {
 		s.WarnLog("sieve set invalid IMAP keywords, dropped",
 			"flags", strings.Join(rejected, ","),
 			"reason", "not a valid IMAP flag-keyword (RFC 9051 §9: ASCII atom, no specials)")
