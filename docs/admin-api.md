@@ -246,6 +246,38 @@ curl -X DELETE http://localhost:8080/admin/accounts/user@example.com \
   -H "Authorization: Bearer your-api-key"
 ```
 
+#### Delete Account (Purge)
+
+**Endpoint:** `DELETE /admin/accounts/{email}?purge=true`
+
+Permanently delete an account and all of its data — messages, S3 objects, mailboxes and credentials — with no grace period. This is irreversible: the account cannot be recovered with `/restore`. Equivalent to `sora-admin accounts delete --email <email> --confirm --purge`.
+
+The account does not need to be soft-deleted first. Purging a large mailbox can take a while, since every S3 object is deleted in batches; keep the client timeout generous.
+
+**Response:** `200 OK`
+```json
+{
+  "email": "user@example.com",
+  "messages_expunged": 1420,
+  "s3_objects_deleted": 1418,
+  "messages_deleted": 1420,
+  "message": "Account purged successfully. All data (messages, mailboxes, credentials) has been permanently deleted."
+}
+```
+
+Like the CLI, this does not terminate the account's active sessions. Use `POST /admin/connections/kick` (or `sora-admin connections kick --user <email>`) if you need existing connections dropped.
+
+**Errors:**
+- `404 Not Found` — no account with that address
+- `503 Service Unavailable` — the server has no object storage configured, so S3 data cannot be removed
+- `500 Internal Server Error` — purge failed partway; data may be partially deleted. The operation is resumable, so retrying continues where it stopped.
+
+**Example:**
+```bash
+curl -X DELETE "http://localhost:8080/admin/accounts/user@example.com?purge=true" \
+  -H "Authorization: Bearer your-api-key"
+```
+
 #### Restore Deleted Account
 
 **Endpoint:** `POST /admin/accounts/{email}/restore`
