@@ -624,7 +624,35 @@ func (db *Database) CreateMailboxForUser(ctx context.Context, accountID int64, m
 	}
 	defer tx.Rollback(context.Background())
 
-	err = db.CreateMailbox(ctx, tx, accountID, mailboxPath, nil)
+	// Link the mailbox under its parent, creating any missing ancestor first, as IMAP
+	// CREATE and GetOrCreateMailboxByName do. Creating it with no parent (as this did)
+	// put "Parent/Child" at the root: the parent never reported \HasChildren, the child
+	// did not follow the parent's RENAME, and the delete gate could not see it.
+	delim := string(consts.MailboxDelimiter)
+	parts := strings.Split(mailboxPath, delim)
+	var parentID *int64
+	for i := 1; i < len(parts); i++ {
+		ancestor := strings.Join(parts[:i], delim)
+		var id int64
+		err := tx.QueryRow(ctx, `
+			SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
+		`, accountID, ancestor).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if err := db.CreateMailbox(ctx, tx, accountID, ancestor, parentID); err != nil &&
+				!errors.Is(err, consts.ErrDBUniqueViolation) && !errors.Is(err, consts.ErrMailboxAlreadyExists) {
+				return fmt.Errorf("failed to create parent mailbox '%s': %w", ancestor, err)
+			}
+			err = tx.QueryRow(ctx, `
+				SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
+			`, accountID, ancestor).Scan(&id)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to resolve parent mailbox '%s': %w", ancestor, err)
+		}
+		parentID = &id
+	}
+
+	err = db.CreateMailbox(ctx, tx, accountID, mailboxPath, parentID)
 	if err != nil {
 		return err
 	}

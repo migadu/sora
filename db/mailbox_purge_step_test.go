@@ -411,3 +411,40 @@ func TestRestoreRelinksRecreatedChildUnderParent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, root.Path, 16, "the top of the chain is recreated at the root")
 }
+
+// POST /user/mailboxes with a hierarchical name used to create the mailbox at the root,
+// unlinked (CreateMailbox with no parent) and without creating a missing parent — so
+// the parent never reported \HasChildren, the child did not follow the parent's RENAME,
+// and the child gate on delete could not see it. IMAP CREATE and
+// GetOrCreateMailboxByName already linked and auto-created parents; this matches them.
+func TestCreateMailboxForUserLinksUnderParent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, _, _, _ := setupRestoreTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	// The parent does not exist yet: it is created, and the child linked under it.
+	require.NoError(t, db.CreateMailboxForUser(ctx, accountID, "Proj/Sub/Deep"))
+
+	proj, err := db.GetMailboxByName(ctx, accountID, "Proj")
+	require.NoError(t, err, "a missing parent is created, as IMAP CREATE does")
+	sub, err := db.GetMailboxByName(ctx, accountID, "Proj/Sub")
+	require.NoError(t, err)
+	deep, err := db.GetMailboxByName(ctx, accountID, "Proj/Sub/Deep")
+	require.NoError(t, err)
+
+	assert.Len(t, proj.Path, 16)
+	assert.Equal(t, proj.Path, sub.Path[:len(proj.Path)], "Proj/Sub must sit under Proj")
+	assert.Len(t, sub.Path, 32)
+	assert.Equal(t, sub.Path, deep.Path[:len(sub.Path)], "Proj/Sub/Deep must sit under Proj/Sub")
+	assert.True(t, proj.HasChildren)
+
+	// Which is what lets the delete gate protect a hierarchy made through the API.
+	require.ErrorIs(t, db.DeleteMailboxForUser(ctx, accountID, "Proj"), consts.ErrMailboxHasChildren)
+
+	// Creating an existing name is still refused.
+	assert.Error(t, db.CreateMailboxForUser(ctx, accountID, "Proj/Sub"))
+}

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -274,6 +275,39 @@ func TestMailboxOperations(t *testing.T) {
 		}
 
 		t.Log("Successfully created mailbox")
+	})
+
+	t.Run("DeleteMailbox_RefusesParentWithChildren", func(t *testing.T) {
+		// A hierarchical name is linked under its (auto-created) parent, so deleting the
+		// parent while the child exists is refused with 409, as IMAP DELETE refuses it.
+		parent := fmt.Sprintf("ApiParent-%d", time.Now().UnixNano())
+		child := parent + "/Child"
+
+		resp := tc.makeRequest(t, "POST", "/user/mailboxes", map[string]string{"name": child})
+		if resp.StatusCode != http.StatusCreated {
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("Expected 201 creating %s, got %d: %s", child, resp.StatusCode, string(body))
+		}
+		resp.Body.Close()
+
+		resp = tc.makeRequest(t, "DELETE", "/user/mailboxes/"+url.PathEscape(parent), nil)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("Expected 409 deleting a parent with children, got %d", resp.StatusCode)
+		}
+
+		resp = tc.makeRequest(t, "DELETE", "/user/mailboxes/"+url.PathEscape(child), nil)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected 200 deleting the child, got %d", resp.StatusCode)
+		}
+
+		resp = tc.makeRequest(t, "DELETE", "/user/mailboxes/"+url.PathEscape(parent), nil)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected 200 deleting the parent once it is a leaf, got %d", resp.StatusCode)
+		}
 	})
 
 	t.Run("DeleteMailbox_ProtectINBOX", func(t *testing.T) {
