@@ -336,3 +336,78 @@ func TestRestoreAfterPurgeKeepsMessageState(t *testing.T) {
 	assert.Equal(t, l.msgMailbox, l.mailboxID, "a state row lost to an older purge is recreated on restore")
 	assert.Equal(t, 0, l.flags, "with no state to recover, the message comes back unread")
 }
+
+// A restored child mailbox must be linked under its parent, not recreated at the root.
+// The name carries the delimiter, so LIST still showed "Parent/Child", but the tree
+// is path-based: at the root the parent lost \HasChildren, RENAME of the parent no
+// longer carried the child, and a later DELETE of the parent succeeded and stranded it.
+func TestRestoreRelinksRecreatedChildUnderParent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, email, _, _ := setupRestoreTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	create := func(name string, parent *int64) int64 {
+		t.Helper()
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		require.NoError(t, db.CreateMailbox(ctx, tx, accountID, name, parent))
+		require.NoError(t, tx.Commit(ctx))
+		mb, err := db.GetMailboxByName(ctx, accountID, name)
+		require.NoError(t, err)
+		return mb.ID
+	}
+	hardDelete := func(id int64) {
+		t.Helper()
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		require.NoError(t, db.DeleteMailbox(ctx, tx, id, accountID))
+		require.NoError(t, tx.Commit(ctx))
+	}
+	restore := func(ids ...int64) {
+		t.Helper()
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		n, err := db.RestoreMessages(ctx, tx, RestoreMessagesParams{Email: email, MessageIDs: ids})
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+		require.Equal(t, int64(len(ids)), n)
+	}
+	assertChildOf := func(child, parent string) {
+		t.Helper()
+		c, err := db.GetMailboxByName(ctx, accountID, child)
+		require.NoError(t, err, "%s must exist after restore", child)
+		p, err := db.GetMailboxByName(ctx, accountID, parent)
+		require.NoError(t, err, "%s must exist after restore", parent)
+		require.Len(t, c.Path, len(p.Path)+16, "%s must sit one level under %s", child, parent)
+		assert.Equal(t, p.Path, c.Path[:len(p.Path)], "%s's path must extend %s's", child, parent)
+		assert.True(t, p.HasChildren, "%s must report \\HasChildren again", parent)
+	}
+
+	// The parent is still there: the child is relinked under it.
+	dept := create("Dept", nil)
+	team := create("Dept/Team", &dept)
+	teamMsg := insertTestMessage(t, db, accountID, team, "Dept/Team", "t", fmt.Sprintf("<team-%d@example.com>", time.Now().UnixNano()))
+	hardDelete(team)
+	restore(teamMsg)
+	assertChildOf("Dept/Team", "Dept")
+
+	// The whole chain is gone: every missing ancestor is recreated, top down.
+	org := create("Org", nil)
+	unit := create("Org/Unit", &org)
+	squad := create("Org/Unit/Squad", &unit)
+	squadMsg := insertTestMessage(t, db, accountID, squad, "Org/Unit/Squad", "s", fmt.Sprintf("<squad-%d@example.com>", time.Now().UnixNano()))
+	hardDelete(squad)
+	hardDelete(unit)
+	hardDelete(org)
+	restore(squadMsg)
+	assertChildOf("Org/Unit/Squad", "Org/Unit")
+	assertChildOf("Org/Unit", "Org")
+
+	root, err := db.GetMailboxByName(ctx, accountID, "Org")
+	require.NoError(t, err)
+	assert.Len(t, root.Path, 16, "the top of the chain is recreated at the root")
+}

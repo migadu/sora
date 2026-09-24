@@ -3,9 +3,12 @@ package db
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 )
@@ -370,63 +373,29 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		return 0, nil
 	}
 
-	// Ensure all required mailboxes exist, create them if they don't
-	mailboxIDMap := make(map[string]int64)
-	for mailboxName := range mailboxNames {
-		var mailboxID int64
-		err := tx.QueryRow(ctx, `
-			SELECT id FROM mailboxes
-			WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
-		`, accountID, mailboxName).Scan(&mailboxID)
-
-		if err == pgx.ErrNoRows {
-			// Mailbox was deleted along with its messages; recreate it. Re-seed the
-			// RFC 6154 special-use attribute for a canonical top-level default name
-			// (consistent with CreateDefaultMailboxes / migration 000045), but ONLY
-			// if the attribute is not already held by another live mailbox — so a
-			// restore never violates the (account_id, special_use) unique index nor
-			// duplicates special-use. ON CONFLICT tolerates a concurrent recreate of
-			// the same name; the id is then re-fetched below.
-			err = tx.QueryRow(ctx, `
-				INSERT INTO mailboxes (account_id, name, uid_validity, created_at, updated_at, path, special_use)
-				SELECT $1, $2, extract(epoch from now())::bigint, now(), now(), '',
-					CASE WHEN canon.su IS NOT NULL
-					          AND NOT EXISTS (SELECT 1 FROM mailboxes m2
-					                          WHERE m2.account_id = $1 AND m2.special_use = canon.su AND m2.deleted_at IS NULL)
-					     THEN canon.su END
-				FROM (SELECT CASE LOWER($2)
-					WHEN 'sent'    THEN '\Sent'
-					WHEN 'drafts'  THEN '\Drafts'
-					WHEN 'archive' THEN '\Archive'
-					WHEN 'junk'    THEN '\Junk'
-					WHEN 'trash'   THEN '\Trash'
-				END AS su) canon
-				ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO NOTHING
-				RETURNING id
-			`, accountID, mailboxName).Scan(&mailboxID)
-			if err == pgx.ErrNoRows {
-				// Concurrent recreate won the race; fetch the existing row's id.
-				err = tx.QueryRow(ctx, `
-					SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
-				`, accountID, mailboxName).Scan(&mailboxID)
-			}
-			if err != nil {
-				return 0, fmt.Errorf("failed to create mailbox %s: %w", mailboxName, err)
-			}
-
-			// Update the path now that we have the mailbox ID
-			// This prevents the mailbox from being left with an empty path
-			computedPath := helpers.GetMailboxPath("", mailboxID) // Root-level mailbox
-			_, err = tx.Exec(ctx, `
-				UPDATE mailboxes SET path = $1 WHERE id = $2
-			`, computedPath, mailboxID)
-			if err != nil {
-				return 0, fmt.Errorf("failed to update path for mailbox %s: %w", mailboxName, err)
-			}
-		} else if err != nil {
-			return 0, fmt.Errorf("failed to check mailbox %s: %w", mailboxName, err)
+	// Ensure all required mailboxes exist, recreating any that were deleted. Shallow
+	// names first, so a run's work is deterministic (map iteration is random);
+	// restoreMailbox recreates missing ancestors itself, so correctness does not depend
+	// on this order.
+	names := make([]string, 0, len(mailboxNames))
+	for name := range mailboxNames {
+		names = append(names, name)
+	}
+	delim := string(consts.MailboxDelimiter)
+	sort.Slice(names, func(i, j int) bool {
+		di, dj := strings.Count(names[i], delim), strings.Count(names[j], delim)
+		if di != dj {
+			return di < dj
 		}
+		return names[i] < names[j]
+	})
 
+	mailboxIDMap := make(map[string]int64)
+	for _, mailboxName := range names {
+		mailboxID, _, err := restoreMailbox(ctx, tx, accountID, mailboxName, false)
+		if err != nil {
+			return 0, err
+		}
 		mailboxIDMap[mailboxName] = mailboxID
 	}
 
@@ -527,4 +496,80 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	}
 
 	return restoredCount, nil
+}
+
+// restoreMailbox returns the id and path of the live mailbox called name, recreating it
+// if it was deleted — linked under its parent, which is itself recreated first if it is
+// gone too. A recreated "Parent/Child" used to land at the root: the name still showed
+// the hierarchy in LIST, but the tree is path-based, so the parent lost \HasChildren,
+// RENAME of the parent stopped carrying the child, and a later DELETE of the parent
+// succeeded and stranded it.
+//
+// asParent takes FOR KEY SHARE on an existing mailbox that is about to receive a
+// recreated child — the same lock createMailbox takes — so the parent cannot be
+// soft-deleted underneath the child (see SoftDeleteMailbox).
+func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string, asParent bool) (int64, string, error) {
+	lookup := `SELECT id, path FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL`
+	if asParent {
+		lookup += ` FOR KEY SHARE`
+	}
+	var mailboxID int64
+	var path string
+	err := tx.QueryRow(ctx, lookup, accountID, name).Scan(&mailboxID, &path)
+	if err == nil {
+		return mailboxID, path, nil
+	}
+	if err != pgx.ErrNoRows {
+		return 0, "", fmt.Errorf("failed to check mailbox %s: %w", name, err)
+	}
+
+	// Gone: recreate its parent first, so this one can be linked under it.
+	var parentPath string
+	if i := strings.LastIndex(name, string(consts.MailboxDelimiter)); i > 0 {
+		if _, parentPath, err = restoreMailbox(ctx, tx, accountID, name[:i], true); err != nil {
+			return 0, "", err
+		}
+	}
+
+	// Re-seed the RFC 6154 special-use attribute for a canonical top-level default name
+	// (consistent with CreateDefaultMailboxes / migration 000045), but ONLY if the
+	// attribute is not already held by another live mailbox — so a restore never
+	// violates the (account_id, special_use) unique index nor duplicates special-use.
+	// ON CONFLICT tolerates a concurrent recreate of the same name; its row is then
+	// re-read below.
+	err = tx.QueryRow(ctx, `
+		INSERT INTO mailboxes (account_id, name, uid_validity, created_at, updated_at, path, special_use)
+		SELECT $1, $2, extract(epoch from now())::bigint, now(), now(), '',
+			CASE WHEN canon.su IS NOT NULL
+			          AND NOT EXISTS (SELECT 1 FROM mailboxes m2
+			                          WHERE m2.account_id = $1 AND m2.special_use = canon.su AND m2.deleted_at IS NULL)
+			     THEN canon.su END
+		FROM (SELECT CASE LOWER($2)
+			WHEN 'sent'    THEN '\Sent'
+			WHEN 'drafts'  THEN '\Drafts'
+			WHEN 'archive' THEN '\Archive'
+			WHEN 'junk'    THEN '\Junk'
+			WHEN 'trash'   THEN '\Trash'
+		END AS su) canon
+		ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO NOTHING
+		RETURNING id
+	`, accountID, name).Scan(&mailboxID)
+	if err == pgx.ErrNoRows {
+		// Concurrent recreate won the race; use its row as it is.
+		err = tx.QueryRow(ctx, lookup, accountID, name).Scan(&mailboxID, &path)
+		if err != nil {
+			return 0, "", fmt.Errorf("failed to create mailbox %s: %w", name, err)
+		}
+		return mailboxID, path, nil
+	}
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to create mailbox %s: %w", name, err)
+	}
+
+	// The path needs the id, so it is set once the row exists.
+	path = helpers.GetMailboxPath(parentPath, mailboxID)
+	if _, err := tx.Exec(ctx, `UPDATE mailboxes SET path = $1 WHERE id = $2`, path, mailboxID); err != nil {
+		return 0, "", fmt.Errorf("failed to update path for mailbox %s: %w", name, err)
+	}
+	return mailboxID, path, nil
 }
