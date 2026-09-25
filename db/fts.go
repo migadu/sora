@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -114,9 +115,24 @@ func (d *Database) ProcessFTSBatch(ctx context.Context, tx pgx.Tx, limit int) (i
 	// batches sharing several hashes cannot take those shared rows in opposite orders.
 	sort.Strings(order)
 
+	// Time budget. Each hash costs several round trips (savepoint, tokenise, dual-write,
+	// fan-out), so a full batch can outlast the caller's deadline; when it did, the whole
+	// transaction rolled back and the same FIFO rows were polled again, forever. Stop
+	// starting new hashes once two thirds of the remaining time is spent and commit what is
+	// done: rows polled but not reached are released at commit and polled again next batch.
+	outOfTime := func() bool { return false }
+	if deadline, ok := ctx.Deadline(); ok {
+		stopAt := time.Now().Add(time.Until(deadline) * 2 / 3)
+		outOfTime = func() bool { return time.Now().After(stopAt) }
+	}
+
 	resolved := 0
 	var noText []string
 	for _, hash := range order {
+		if outOfTime() {
+			logger.Info("FTS: batch time budget spent, committing partial progress", "resolved", resolved)
+			return resolved, nil
+		}
 		item := anchor[hash]
 		if item.TextBody == "" {
 			// This hash's text lives on some other row (or nowhere at all). Classified
@@ -133,7 +149,7 @@ func (d *Database) ProcessFTSBatch(ctx context.Context, tx pgx.Tx, limit int) (i
 		resolved += n
 	}
 
-	n, err := d.resolveTextlessHashes(ctx, tx, noText)
+	n, err := d.resolveTextlessHashes(ctx, tx, noText, outOfTime)
 	if err != nil {
 		return resolved, err
 	}
@@ -335,7 +351,7 @@ func (d *Database) fanOutVector(ctx context.Context, tx pgx.Tx, hash string) (in
 //     here would blank out a message that was always perfectly indexable;
 //   - neither -> poison with an empty vector, so the queue drains instead of looping on a
 //     row nothing can ever resolve.
-func (d *Database) resolveTextlessHashes(ctx context.Context, tx pgx.Tx, hashes []string) (int, error) {
+func (d *Database) resolveTextlessHashes(ctx context.Context, tx pgx.Tx, hashes []string, outOfTime func() bool) (int, error) {
 	if len(hashes) == 0 {
 		return 0, nil
 	}
@@ -381,6 +397,9 @@ func (d *Database) resolveTextlessHashes(ctx context.Context, tx pgx.Tx, hashes 
 
 	resolved := 0
 	for _, hash := range copyable {
+		if outOfTime() {
+			return resolved, nil
+		}
 		n, err := d.fanOutVector(ctx, tx, hash)
 		if err != nil {
 			return resolved, err
@@ -389,6 +408,9 @@ func (d *Database) resolveTextlessHashes(ctx context.Context, tx pgx.Tx, hashes 
 	}
 
 	for _, hash := range pending {
+		if outOfTime() {
+			return resolved, nil
+		}
 		n, err := d.indexHash(ctx, tx, hash, func() (int, error) {
 			n, _, err := d.tokenizeFromPendingText(ctx, tx, hash)
 			return n, err

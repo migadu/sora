@@ -23,10 +23,13 @@ type Worker struct {
 
 func NewWorker(rdb *resilient.ResilientDatabase) *Worker {
 	return &Worker{
-		rdb:       rdb,
-		stopCh:    make(chan struct{}),
-		interval:  30 * time.Second,
-		batchSize: 5000,
+		rdb:      rdb,
+		stopCh:   make(chan struct{}),
+		interval: 30 * time.Second,
+		// Bounded by time as well (ProcessFTSBatch commits partial progress before the
+		// 30 s batch deadline), but each hash costs several round trips through pgbouncer,
+		// so a smaller batch keeps a slow tick from spending the budget on one statement.
+		batchSize: 1000,
 	}
 }
 
