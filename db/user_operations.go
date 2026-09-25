@@ -264,7 +264,13 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			mb.name as mailbox_path
 		FROM messages m
 		JOIN mailboxes mb ON m.mailbox_id = mb.id
-		LEFT JOIN messages_fts mf ON m.content_hash = mf.content_hash
+		-- Account-scoped in the JOIN ON clause, never in WHERE: this is a LEFT JOIN whose
+		-- FTS predicate sits inside an OR with header LIKE predicates, so a WHERE-side
+		-- account qual would drop every message that has no FTS row (bodies over 64KB are
+		-- never staged, empty bodies are skipped, retention prunes old rows) even when its
+		-- subject or sender matched.
+		LEFT JOIN messages_fts_v2 mf
+		       ON mf.content_hash = m.content_hash AND mf.account_id = $4
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
 		AND (
@@ -274,14 +280,18 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			OR m.to_email_sort LIKE LOWER($2)
 			OR m.to_name_sort LIKE LOWER($2)
 			OR m.cc_email_sort LIKE LOWER($2)
-			OR mf.text_body_tsv @@ plainto_tsquery($3)
+			-- 'simple' matches how the vector was built (db/fts.go). Without it this used
+			-- default_text_search_config, so on a stemming configuration a search for
+			-- "running" looked up the lexeme "run" and never matched.
+			-- The IS NOT NULL is required for the PARTIAL composite GIN to be usable.
+			OR (mf.text_body_tsv IS NOT NULL AND mf.text_body_tsv @@ plainto_tsquery('simple', $3))
 		)
 		ORDER BY m.internal_date DESC
 		LIMIT 100
 	`
 
 	searchPattern := "%" + query + "%"
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, searchQuery, mailbox.ID, searchPattern, query)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, searchQuery, mailbox.ID, searchPattern, query, mailbox.AccountID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search messages: %w", err)
 	}

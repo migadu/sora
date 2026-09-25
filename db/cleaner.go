@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/logger"
 )
 
@@ -606,53 +607,134 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 	return deletedCount, nil
 }
 
-// PruneOldMessageVectors deletes messages_fts rows whose fts_retention has expired.
-// Each row holds the FTS search vector (text_body_tsv).
+// FTSKey identifies one messages_fts_v2 row: a body, and the account that holds it.
+//
+// The v2 table has one row per (content_hash, account_id) rather than one per hash, so
+// every cleanup path that used to speak in hashes now speaks in pairs. That also makes
+// cleanup finer-grained than it was: when one account stops referencing a shared body, its
+// vector goes, while the accounts still holding that body keep theirs.
+type FTSKey struct {
+	ContentHash string
+	AccountID   int64
+}
+
+// PruneOldMessageVectors deletes messages_fts_v2 rows whose fts_retention has expired.
+// Each row holds the FTS search vector (text_body_tsv) for one account's copy of a body.
 //
 // The DELETE uses a CTE with LIMIT to cap each invocation at maxPruneRows rows,
 // preventing long-held locks and WAL bloat if fts_retention is shortened dramatically.
 // The cleanup worker calls this periodically; remaining rows are pruned on the next cycle.
 //
-// The range scan uses the idx_messages_fts_sent_date partial index (WHERE sent_date
+// The range scan uses the idx_messages_fts_v2_sent_date partial index (WHERE sent_date
 // IS NOT NULL), so pre-existing rows with NULL sent_date are never selected.
+//
+// NOTE ON THROUGHPUT: v2 holds one row per account rather than per hash, so at a given
+// retention the steady-state delete volume is multiplied by the deduplication ratio. If
+// fts_retention is set on a deployment where bodies are widely shared, the per-cycle budget
+// in server/cleaner/worker.go has to grow with it or pruning falls behind.
 func (d *Database) PruneOldMessageVectors(ctx context.Context, tx pgx.Tx, retention time.Duration) (int64, error) {
 	const maxPruneRows = 1_000
 
 	tag, err := tx.Exec(ctx, `
 		WITH expired AS (
-			SELECT content_hash FROM messages_fts
+			SELECT ctid FROM messages_fts_v2
+			WHERE sent_date < (now() - $1::interval)
+			ORDER BY sent_date
+			FOR UPDATE SKIP LOCKED
+			LIMIT $2
+		)
+		DELETE FROM messages_fts_v2
+		WHERE ctid IN (SELECT ctid FROM expired)
+	`, retention, maxPruneRows)
+	if err != nil {
+		return 0, fmt.Errorf("failed to prune old message vectors: %w", err)
+	}
+
+	// Retention applies to the shared messages_fts rows too while they are dual-written.
+	// Otherwise the table grows through the whole soak, and a cross-account COPY -- whose
+	// fan-out falls back to messages_fts for a vector -- would bring a pruned body back
+	// into messages_fts_v2.
+	if _, err := tx.Exec(ctx, `
+		WITH expired AS (
+			SELECT ctid FROM messages_fts
 			WHERE sent_date < (now() - $1::interval)
 			ORDER BY sent_date
 			FOR UPDATE SKIP LOCKED
 			LIMIT $2
 		)
 		DELETE FROM messages_fts
-		WHERE content_hash IN (SELECT content_hash FROM expired)
-	`, retention, maxPruneRows)
-	if err != nil {
-		return 0, fmt.Errorf("failed to prune old message vectors: %w", err)
+		WHERE ctid IN (SELECT ctid FROM expired)
+	`, retention, maxPruneRows); err != nil {
+		return 0, fmt.Errorf("failed to prune old shared message vectors: %w", err)
 	}
 
 	return tag.RowsAffected(), nil
 }
 
-// GetUnusedFTSHashes finds content_hash values in messages_fts that are no longer referenced
-// by any message row at all. These are candidates for early cleanup even before TTL expires.
+// DeleteFTSRowsForAccount removes one account's FTS rows in bounded batches, returning the
+// number deleted so the caller can loop until it reports zero.
 //
-// Uses a bounded scan-window approach to limit query duration.
-func (d *Database) GetUnusedFTSHashes(ctx context.Context, limit int) ([]string, error) {
+// Account deletion previously had no way to reach this data at all: the rows were only ever
+// reclaimed by the orphan sweep, which has to scan the whole table to find them. The
+// per-account index makes the direct delete possible.
+func (d *Database) DeleteFTSRowsForAccount(ctx context.Context, tx pgx.Tx, accountID int64, limit int) (int64, error) {
+	tag, err := tx.Exec(ctx, `
+		WITH doomed AS (
+			SELECT ctid FROM messages_fts_v2
+			WHERE account_id = $1
+			ORDER BY content_hash
+			FOR UPDATE SKIP LOCKED
+			LIMIT $2
+		)
+		DELETE FROM messages_fts_v2
+		WHERE ctid IN (SELECT ctid FROM doomed)
+	`, accountID, limit)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete fts rows for account %d: %w", accountID, err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// ftsKeyReferencedSQL is the SQL predicate "some messages row still needs the FTS row
+// (hash, account)". A messages_fts_v2 row belongs to the OWNER of the mailbox a message is in,
+// because that is the account every search scopes to (a shared mailbox is searched through its
+// owner). messages.account_id says the same thing for everything delivered since shared
+// mailbox ownership landed (June 2026), but before that a message added to a shared mailbox by
+// someone else carried that person's id. Both keys count as referenced: the first test stays
+// index-only for the common case, and the second keeps the owner-keyed row of such a legacy
+// message from being swept as an orphan.
+func ftsKeyReferencedSQL(hash, account string) string {
+	return fmt.Sprintf(`(EXISTS (SELECT 1 FROM messages m
+		        WHERE m.content_hash = %[1]s AND m.account_id = %[2]s)
+		 OR EXISTS (SELECT 1 FROM messages m JOIN mailboxes mb ON mb.id = m.mailbox_id
+		        WHERE m.content_hash = %[1]s AND mb.account_id = %[2]s))`, hash, account)
+}
+
+// GetUnusedFTSKeys finds (content_hash, account_id) pairs in messages_fts_v2 that are no
+// longer referenced by any message row for that account. These are candidates for early
+// cleanup even before TTL expires.
+//
+// The orphan test deliberately counts EXPUNGED rows too, matching the pre-v2 behaviour: a
+// message sitting in the two-phase deletion window still has a messages row, and
+// `sora-admin messages restore` can bring it back without recreating FTS data. Treating an
+// expunged row as absent here would make restored mail permanently unsearchable.
+//
+// Uses a bounded scan-window approach to limit query duration. The window walks the primary
+// key, which leads with content_hash, so the cursor is the (hash, account) pair.
+func (d *Database) GetUnusedFTSKeys(ctx context.Context, limit int) ([]FTSKey, error) {
 	const scanWindowSize = 5000
 	const maxBatches = 200
 	const maxRunDuration = 30 * time.Second
 
-	var allHashes []string
-	var lastHash string
+	var allKeys []FTSKey
+	lastHash := ""
+	var lastAccount int64
 	runDeadline := time.Now().Add(maxRunDuration)
 
-	for batch := 0; batch < maxBatches && len(allHashes) < limit; batch++ {
+	for batch := 0; batch < maxBatches && len(allKeys) < limit; batch++ {
 		if time.Now().After(runDeadline) {
-			logger.Info("GetUnusedFTSHashes: reached time limit, returning partial results",
-				"found", len(allHashes), "requested", limit, "batches", batch)
+			logger.Info("GetUnusedFTSKeys: reached time limit, returning partial results",
+				"found", len(allKeys), "requested", limit, "batches", batch)
 			break
 		}
 		if ctx.Err() != nil {
@@ -661,72 +743,143 @@ func (d *Database) GetUnusedFTSHashes(ctx context.Context, limit int) ([]string,
 
 		query := `
 			WITH scan_window AS (
-				SELECT mc.content_hash
-				FROM messages_fts mc
-				WHERE mc.content_hash > $1
-				ORDER BY mc.content_hash
-				LIMIT $2
+				SELECT v.content_hash, v.account_id
+				FROM messages_fts_v2 v
+				WHERE (v.content_hash, v.account_id) > ($1, $2)
+				ORDER BY v.content_hash, v.account_id
+				LIMIT $3
 			)
-			SELECT
-				COALESCE((SELECT MAX(content_hash) FROM scan_window), '') AS window_end,
-				ARRAY(
-					SELECT sw.content_hash
-					FROM scan_window sw
-					LEFT JOIN LATERAL (
-						SELECT 1 as found
-						FROM messages m
-						WHERE m.content_hash = sw.content_hash
-						LIMIT 1
-					) active_msg ON true
-					WHERE active_msg.found IS NULL
-				) AS orphan_hashes
+			SELECT sw.content_hash, sw.account_id,
+			       NOT ` + ftsKeyReferencedSQL("sw.content_hash", "sw.account_id") + ` AS orphan
+			FROM scan_window sw
+			ORDER BY sw.content_hash, sw.account_id
 		`
 
-		var windowEnd string
-		var batchHashes []string
-		err := d.GetReadPool().QueryRow(ctx, query, lastHash, scanWindowSize).Scan(&windowEnd, &batchHashes)
+		rows, err := d.GetReadPool().Query(ctx, query, lastHash, lastAccount, scanWindowSize)
 		if err != nil {
-			return nil, fmt.Errorf("failed to query unused FTS hashes: %w", err)
+			return nil, fmt.Errorf("failed to query unused FTS keys: %w", err)
 		}
 
-		if windowEnd == "" {
-			break
-		}
-
-		lastHash = windowEnd
-
-		if len(batchHashes) > 0 {
-			remaining := limit - len(allHashes)
-			if len(batchHashes) > remaining {
-				batchHashes = batchHashes[:remaining]
+		scanned := 0
+		for rows.Next() {
+			var key FTSKey
+			var orphan bool
+			if err := rows.Scan(&key.ContentHash, &key.AccountID, &orphan); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("failed to scan unused FTS keys: %w", err)
 			}
-			allHashes = append(allHashes, batchHashes...)
+			scanned++
+			lastHash, lastAccount = key.ContentHash, key.AccountID
+			if orphan && len(allKeys) < limit {
+				allKeys = append(allKeys, key)
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read unused FTS keys: %w", err)
+		}
+
+		if scanned == 0 {
+			break
 		}
 
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	return allHashes, nil
+	return allKeys, nil
 }
 
-// DeleteMessagesFTSByHashBatch deletes multiple rows from the messages_fts table.
+// DeleteMessagesFTSByKeyBatch deletes multiple rows from the messages_fts_v2 table.
 //
-// Each hash is re-validated inside the deleting transaction, the way the S3 orphan
-// path re-checks with IsS3ObjectOrphan. The caller's list comes from GetUnusedFTSHashes,
-// a read-pool scan allowed to run for tens of seconds, and delivery reuses an existing
-// row for a hash it re-delivers (INSERT ... ON CONFLICT (content_hash) DO NOTHING), so a
-// hash that was unreferenced when it was scanned can carry a live message by now.
-// Deleting it would leave that message unsearchable forever, with no error anywhere.
-func (d *Database) DeleteMessagesFTSByHashBatch(ctx context.Context, tx pgx.Tx, contentHashes []string) (int64, error) {
-	if len(contentHashes) == 0 {
+// Each key is re-validated inside the deleting transaction, the way the S3 orphan path
+// re-checks with IsS3ObjectOrphan. The caller's list comes from GetUnusedFTSKeys, a
+// read-pool scan allowed to run for tens of seconds, and delivery reuses an existing row
+// for a pair it re-delivers (INSERT ... ON CONFLICT DO NOTHING), so a pair that was
+// unreferenced when it was scanned can carry a live message by now. Deleting it would
+// leave that message unsearchable forever, with no error anywhere.
+//
+// To prevent race conditions with concurrent deliveries, the sweep coordinates via
+// transaction-scoped advisory locks:
+//  1. Statement 1 attempts to acquire an exclusive advisory lock (pg_try_advisory_xact_lock)
+//     per content_hash and locks the candidate rows (FOR UPDATE OF v SKIP LOCKED). If a
+//     delivery transaction is currently staging that hash, it holds a shared advisory lock,
+//     so the sweep skips it.
+//  2. Statement 2 runs in a new statement snapshot, re-checks ftsKeyReferencedSQL, and
+//     deletes unreferenced rows. Any delivery arriving after statement 1 waits on the
+//     shared advisory lock until this transaction commits, ensuring its subsequent v2
+//     insert snapshot sees the deletion and inserts fresh.
+//
+// NOTE ON LOCK TABLE CAPACITY: The sweep holds up to len(keys) (capped at BATCH_PURGE_SIZE=1000)
+// exclusive advisory locks in this short transaction. The shared lock table holds
+// max_locks_per_transaction x (max_connections + max_prepared_transactions) entries for the
+// whole server (about 25,600 on production), and running out fails unrelated queries with
+// "out of shared memory", so do not raise this batch size without checking that budget.
+func (d *Database) DeleteMessagesFTSByKeyBatch(ctx context.Context, tx pgx.Tx, keys []FTSKey) (int64, error) {
+	if len(keys) == 0 {
 		return 0, nil
 	}
-	tag, err := tx.Exec(ctx, `
-		DELETE FROM messages_fts f
-		WHERE f.content_hash = ANY($1)
-		  AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.content_hash = f.content_hash)
-	`, contentHashes)
+	hashes := make([]string, len(keys))
+	accounts := make([]int64, len(keys))
+	for i, k := range keys {
+		hashes[i] = k.ContentHash
+		accounts[i] = k.AccountID
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT d.content_hash, d.account_id
+		FROM unnest($1::text[], $2::bigint[]) AS d(content_hash, account_id)
+		JOIN messages_fts_v2 v
+		  ON v.content_hash = d.content_hash AND v.account_id = d.account_id
+		WHERE pg_try_advisory_xact_lock($3, hashtext(d.content_hash))
+		ORDER BY v.content_hash, v.account_id
+		FOR UPDATE OF v SKIP LOCKED
+	`, hashes, accounts, consts.SoraFTSOrphanSweepLockClassID)
 	if err != nil {
+		return 0, fmt.Errorf("failed to lock candidate keys for fts orphan deletion: %w", err)
+	}
+
+	var lockedHashes []string
+	var lockedAccounts []int64
+	for rows.Next() {
+		var h string
+		var a int64
+		if err := rows.Scan(&h, &a); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("failed to scan locked fts candidate keys: %w", err)
+		}
+		lockedHashes = append(lockedHashes, h)
+		lockedAccounts = append(lockedAccounts, a)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, fmt.Errorf("failed to read locked fts candidate keys: %w", err)
+	}
+
+	if len(lockedHashes) == 0 {
+		return 0, nil
+	}
+
+	tag, err := tx.Exec(ctx, `
+		DELETE FROM messages_fts_v2 f
+		USING unnest($1::text[], $2::bigint[]) AS d(content_hash, account_id)
+		WHERE f.content_hash = d.content_hash AND f.account_id = d.account_id
+		  AND NOT `+ftsKeyReferencedSQL("f.content_hash", "f.account_id")+`
+	`, lockedHashes, lockedAccounts)
+	if err != nil {
+		return 0, fmt.Errorf("failed to batch delete from messages_fts_v2: %w", err)
+	}
+
+	// The shared messages_fts row of a hash goes once no message in any account references
+	// it -- the rule this sweep applied to that table before messages_fts_v2 existed. The
+	// table is still dual-written through the soak (so a rollback needs no data work), and
+	// without this it would only ever grow until migration 000051 drops it.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM messages_fts f
+		WHERE f.content_hash = ANY($1::text[])
+		  AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.content_hash = f.content_hash)
+	`, lockedHashes); err != nil {
 		return 0, fmt.Errorf("failed to batch delete from messages_fts: %w", err)
 	}
 	return tag.RowsAffected(), nil
@@ -961,6 +1114,17 @@ func (d *Database) FinalizeAccountDeletions(ctx context.Context, tx pgx.Tx, acco
 	_, err = tx.Exec(ctx, "DELETE FROM credentials WHERE account_id = ANY($1)", confirmed)
 	if err != nil {
 		return 0, fmt.Errorf("failed to batch delete credentials during finalization: %w", err)
+	}
+
+	// The account's FTS rows. By this point every messages row of the account is gone
+	// (the DELETE below is guarded by ON DELETE RESTRICT on messages), so these pairs are
+	// orphans by definition and deleting them here needs no re-validation.
+	//
+	// The orphan sweep would eventually find them anyway, but only by scanning the whole
+	// table in bounded windows, so on a large deployment they would linger for many cycles.
+	// This is bounded work on an index the account leads.
+	if _, err = tx.Exec(ctx, "DELETE FROM messages_fts_v2 WHERE account_id = ANY($1)", confirmed); err != nil {
+		return 0, fmt.Errorf("failed to batch delete fts rows during finalization: %w", err)
 	}
 
 	// Finally, delete the accounts themselves.

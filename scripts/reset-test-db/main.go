@@ -51,9 +51,11 @@ func main() {
 		FROM pg_stat_activity 
 		WHERE datname = $1 AND pid <> pg_backend_pid();`, dbName)
 
-	// Drop pg_trgm first to allow public schema to be dropped
+	// Drop the extensions first to allow the public schema to be dropped. btree_gin backs
+	// the multicolumn GIN on messages_fts_v2 (account_id, text_body_tsv).
 	queries := []string{
 		"DROP EXTENSION IF EXISTS pg_trgm CASCADE;",
+		"DROP EXTENSION IF EXISTS btree_gin CASCADE;",
 		"DROP SCHEMA public CASCADE;",
 		"CREATE SCHEMA public;",
 		fmt.Sprintf("GRANT ALL ON SCHEMA public TO %s;", user),

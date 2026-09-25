@@ -28,7 +28,7 @@ const ThreadMaxMessages = 5000
 
 // GetMessagesForThreading executes a query to retrieve threading metadata for all matching messages.
 // It leverages idx_messages_mailbox_dates_uid for high performance index-only scans.
-func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, includeSubject bool) ([]ThreadMessageResult, error) {
+func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, includeSubject bool) ([]ThreadMessageResult, error) {
 	// Fold custom keywords in the criteria onto the mailbox's canonical case so
 	// THREAD ... KEYWORD <name> matches case-insensitively (RFC 9051 §2.3.2),
 	// mirroring the SEARCH executors.
@@ -42,6 +42,9 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64
 	}
 
 	whereArgs["mailbox_id"] = mailboxID
+	// The FTS join is account-scoped (see ftsScopedJoin): THREAD joins messages_fts_v2
+	// unconditionally, including for THREAD ALL, so this argument is always required.
+	whereArgs["accountID"] = accountID
 
 	subjectSelect1 := `'' AS subject_sort`
 	subjectSelect2 := `l.subject_sort`
@@ -59,7 +62,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID int64
 			SELECT m.uid, m.message_id, m.in_reply_to, m."references", %s, m.sent_date, m.internal_date
 			FROM messages m
 			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-			LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+			`+ftsScopedJoin+`
 			WHERE m.mailbox_id = @mailbox_id
 			  AND m.expunged_at IS NULL
 			  AND %s

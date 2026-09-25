@@ -37,7 +37,11 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 	}
 
 	includeSubject := algorithm == imap.ThreadReferences || algorithm == imap.ThreadOrderedSubject
-	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, s.selectedMailbox.ID, criteria, includeSubject)
+	// The FTS scope is the mailbox OWNER, which for a shared mailbox is not the session
+	// account: messages.account_id always carries the owner (server/imap/copy.go passes
+	// destMailbox.AccountID, LMTP and delivery resolve the owner likewise). Passing the
+	// session account here would make every shared-mailbox body search return nothing.
+	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, s.selectedMailbox.ID, s.selectedMailbox.AccountID, criteria, includeSubject)
 	if err != nil {
 		s.ErrorLog("failed to fetch messages for threading", "err", err)
 		return nil, fmt.Errorf("failed to fetch messages for threading: %w", err)

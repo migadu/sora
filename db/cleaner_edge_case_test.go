@@ -203,10 +203,12 @@ func TestPruneWithSKIPLOCKED(t *testing.T) {
 		contentHashes = append(contentHashes, contentHash)
 
 		// Insert message content
+		// Prune operates on the per-account table (migration 000050), so the fixture must
+		// seed that one.
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, sent_date, created_at)
-			VALUES ($1, $2, to_tsvector('english', $2), $3, NOW())
-		`, contentHash, testBody, oldSentDate)
+			INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, text_body_tsv, sent_date, created_at)
+			VALUES ($1, $4, $2, to_tsvector('english', $2), $3, NOW())
+		`, contentHash, testBody, oldSentDate, accountID)
 		require.NoError(t, err)
 
 		// Insert old message
@@ -235,7 +237,7 @@ func TestPruneWithSKIPLOCKED(t *testing.T) {
 	var lockedHashes []string
 	rows, err := txLongRunning.Query(ctx, `
 		SELECT content_hash 
-		FROM messages_fts 
+		FROM messages_fts_v2 
 		WHERE content_hash = ANY($1)
 		ORDER BY content_hash
 		LIMIT 5
@@ -358,10 +360,12 @@ func TestPruneConcurrentWorkers(t *testing.T) {
 		contentHash := fmt.Sprintf("concurrent_%s_%d_%d", t.Name(), testTimestamp, i)
 
 		// Insert message content
+		// Prune operates on the per-account table (migration 000050), so the fixture must
+		// seed that one.
 		_, err = tx.Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, sent_date, created_at)
-			VALUES ($1, $2, to_tsvector('english', $2), $3, NOW())
-		`, contentHash, testBody, oldSentDate)
+			INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, text_body_tsv, sent_date, created_at)
+			VALUES ($1, $4, $2, to_tsvector('english', $2), $3, NOW())
+		`, contentHash, testBody, oldSentDate, accountID)
 		require.NoError(t, err)
 
 		// Insert old message
@@ -440,7 +444,7 @@ func TestPruneConcurrentWorkers(t *testing.T) {
 		contentHash := fmt.Sprintf("concurrent_%s_%d_%d", t.Name(), testTimestamp, i)
 		var body *string
 		err = db.GetReadPool().QueryRow(ctx,
-			"SELECT text_body FROM messages_fts WHERE content_hash = $1",
+			"SELECT text_body FROM messages_fts_v2 WHERE content_hash = $1",
 			contentHash).Scan(&body)
 		if err == nil && body != nil {
 			unprunedCount++
@@ -508,9 +512,9 @@ func TestCleanupLock_NoDeadlockWithUserQueries(t *testing.T) {
 	oldSentDate := time.Now().Add(-48 * time.Hour)
 
 	_, err = txData.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv, sent_date)
-		VALUES ($1, $2, to_tsvector('english', $2), $3)
-	`, contentHash, testBody, oldSentDate)
+		INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, text_body_tsv, sent_date)
+		VALUES ($1, $4, $2, to_tsvector('english', $2), $3)
+	`, contentHash, testBody, oldSentDate, accountID)
 	require.NoError(t, err)
 
 	_, err = txData.Exec(ctx, `
@@ -542,7 +546,7 @@ func TestCleanupLock_NoDeadlockWithUserQueries(t *testing.T) {
 		// Note: text_body is always NULL after async FTS processing, so we read content_hash
 		var hash string
 		err = txUser.QueryRow(ctx,
-			"SELECT content_hash FROM messages_fts WHERE content_hash = $1 FOR SHARE",
+			"SELECT content_hash FROM messages_fts_v2 WHERE content_hash = $1 FOR SHARE",
 			contentHash).Scan(&hash)
 		if err != nil {
 			t.Logf("User query: SELECT failed: %v", err)

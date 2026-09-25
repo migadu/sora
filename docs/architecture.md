@@ -47,7 +47,7 @@ The following diagram illustrates the typical flow of data in a Sora deployment.
 
 ### Data Storage
 
-*   **PostgreSQL Database**: The source of truth for all metadata. It stores accounts, credentials, mailboxes, message flags, and full-text search indexes. Sora requires the `pg_trgm` extension for efficient text searching. The system is designed to work with a primary (write) database and multiple read-replicas for scaling read-heavy workloads.
+*   **PostgreSQL Database**: The source of truth for all metadata. It stores accounts, credentials, mailboxes, message flags, and full-text search indexes. Sora requires the `pg_trgm` extension for efficient text searching, and `btree_gin` for the multicolumn GIN index that scopes body search to one account instead of scanning the whole corpus. The system is designed to work with a primary (write) database and multiple read-replicas for scaling read-heavy workloads.
 *   **S3-Compatible Object Storage**: The primary backend for storing raw email content (`.eml` files). This allows storage to scale independently of the rest of the system. Sora supports client-side encryption to secure message bodies before they are sent to S3.
 
 #### Advanced Performance Features

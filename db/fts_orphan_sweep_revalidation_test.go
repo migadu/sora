@@ -13,7 +13,7 @@ import (
 // TestDeleteMessagesFTSByHashBatchRevalidatesReferences reproduces the interleaving
 // the FTS orphan sweep is exposed to.
 //
-// Phase 2b of the cleanup worker builds its list with GetUnusedFTSHashes on the READ
+// Phase 2b of the cleanup worker builds its list with GetUnusedFTSKeys on the READ
 // pool, a scan that is allowed to run for up to 30 seconds, and then deletes that list
 // in a separate transaction. Delivery inserts into messages_fts with
 // ON CONFLICT (content_hash) DO NOTHING (db/append.go), so a message delivered in that
@@ -40,16 +40,16 @@ func TestDeleteMessagesFTSByHashBatchRevalidatesReferences(t *testing.T) {
 
 	for _, hash := range []string{orphanHash, revivedHash} {
 		_, err := db.GetWritePool().Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
-			VALUES ($1, 'needle', to_tsvector('simple', 'needle'))
-		`, hash)
+			INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, text_body_tsv)
+			VALUES ($1, $2, 'needle', to_tsvector('simple', 'needle'))
+		`, hash, accountID)
 		require.NoError(t, err)
 	}
 
-	// The sweep's candidate list: at this instant neither hash is referenced by any
-	// message row, which is precisely what GetUnusedFTSHashes reports.
-	sweptHashes := []string{orphanHash, revivedHash}
-	for _, hash := range sweptHashes {
+	// The sweep's candidate list: at this instant neither pair is referenced by any
+	// message row, which is precisely what GetUnusedFTSKeys reports.
+	sweptKeys := []FTSKey{{ContentHash: orphanHash, AccountID: accountID}, {ContentHash: revivedHash, AccountID: accountID}}
+	for _, hash := range []string{orphanHash, revivedHash} {
 		var referenced int
 		require.NoError(t, db.GetReadPool().QueryRow(ctx,
 			`SELECT COUNT(*) FROM messages WHERE content_hash = $1`, hash).Scan(&referenced))
@@ -75,10 +75,10 @@ func TestDeleteMessagesFTSByHashBatchRevalidatesReferences(t *testing.T) {
 	`, accountID, mailboxID, revivedHash, fmt.Sprintf("<msgid_%s@example.com>", revivedHash))
 	require.NoError(t, err)
 	_, err = deliverTx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, sent_date)
-		VALUES ($1, 'needle', now())
-		ON CONFLICT (content_hash) DO NOTHING
-	`, revivedHash)
+		INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, sent_date)
+		VALUES ($1, $2, 'needle', now())
+		ON CONFLICT (content_hash, account_id) DO NOTHING
+	`, revivedHash, accountID)
 	require.NoError(t, err)
 	require.NoError(t, deliverTx.Commit(ctx))
 
@@ -86,28 +86,29 @@ func TestDeleteMessagesFTSByHashBatchRevalidatesReferences(t *testing.T) {
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
-	deleted, err := db.DeleteMessagesFTSByHashBatch(ctx, tx, sweptHashes)
+	deleted, err := db.DeleteMessagesFTSByKeyBatch(ctx, tx, sweptKeys)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
-	t.Logf("DeleteMessagesFTSByHashBatch reported %d row(s) deleted", deleted)
+	t.Logf("DeleteMessagesFTSByKeyBatch reported %d row(s) deleted", deleted)
 
 	exists := func(hash string) bool {
 		var n int
 		require.NoError(t, db.GetReadPool().QueryRow(ctx,
-			`SELECT COUNT(*) FROM messages_fts WHERE content_hash = $1`, hash).Scan(&n))
+			`SELECT COUNT(*) FROM messages_fts_v2 WHERE content_hash = $1 AND account_id = $2`,
+			hash, accountID).Scan(&n))
 		return n == 1
 	}
 
 	// CONTRAST (expected to hold): a hash that is still unreferenced is swept.
 	assert.False(t, exists(orphanHash),
-		"a genuinely unreferenced messages_fts row must still be deleted — this is the sweep's purpose")
+		"a genuinely unreferenced messages_fts_v2 row must still be deleted — this is the sweep's purpose")
 
 	// THE ASSERTION: the hash that gained a message between scan and delete must survive.
 	assert.True(t, exists(revivedHash),
-		"SILENT SEARCHABILITY LOSS: the messages_fts row for a hash that gained a live message "+
-			"between the GetUnusedFTSHashes scan and the delete was removed. The DELETE is a bare "+
+		"SILENT SEARCHABILITY LOSS: the messages_fts_v2 row for a hash that gained a live message "+
+			"between the GetUnusedFTSKeys scan and the delete was removed. The DELETE is a bare "+
 			"'WHERE content_hash = ANY($1)' with no re-check that each hash is still unreferenced, "+
-			"so the delivered message keeps a messages_fts-less content_hash forever and is never "+
+			"so the delivered message keeps a messages_fts_v2-less content_hash forever and is never "+
 			"searchable again — with no error on any path.")
 
 	assert.EqualValues(t, 1, deleted,

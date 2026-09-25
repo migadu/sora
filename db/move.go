@@ -225,6 +225,9 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	if err := db.restagePendingUploads(ctx, tx, destMailboxID, newUIDs, instanceID); err != nil {
 		return nil, err
 	}
+	if err := db.restageFTS(ctx, tx, destMailboxID, newUIDs); err != nil {
+		return nil, err
+	}
 
 	// Mark the original messages as expunged in the source mailbox
 	// (unless we already did this above for same-mailbox moves)

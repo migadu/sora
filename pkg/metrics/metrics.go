@@ -118,6 +118,32 @@ var (
 		},
 	)
 
+	// Full-text search indexing. There was previously no visibility into the FTS pipeline
+	// at all, which matters more now that messages_fts_v2 holds one row per account rather
+	// than one per body: the worker's write volume scales with how widely bodies are shared,
+	// and a worker that falls behind makes newly delivered mail silently unsearchable
+	// (searches simply return fewer results -- no error is raised anywhere).
+	FTSQueueDepth = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_fts_queue_depth",
+			Help: "Rows staged for full-text indexing that have no search vector yet",
+		},
+	)
+
+	FTSRowsTotal = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_fts_rows_total",
+			Help: "Approximate total number of per-account full-text search rows (planner row estimate)",
+		},
+	)
+
+	FTSRowsIndexed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_fts_rows_indexed_total",
+			Help: "Rows given a search vector by the FTS worker, including vectors copied to sibling accounts",
+		},
+	)
+
 	LargeBodyStorageSkipped = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "sora_large_body_storage_skipped_total",

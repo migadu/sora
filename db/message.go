@@ -752,7 +752,7 @@ func (db *Database) GetRecentMessagesForWarmup(ctx context.Context, AccountID in
 		// Get the most recent messages. Use SearchMessagesWithCriteria to trigger the
 		// fast-path ORDER BY uid DESC which operates in O(1) via indices, instead of
 		// forcing a massive in-memory ordering on internal_date.
-		messages, err := db.SearchMessagesWithCriteria(ctx, mailbox.ID, criteria, messageCount)
+		messages, err := db.SearchMessagesWithCriteria(ctx, mailbox.ID, mailbox.AccountID, criteria, messageCount, 0)
 		if err != nil {
 
 			log.Printf("WarmUp: failed to get recent messages for mailbox '%s': %v", mailboxName, err)

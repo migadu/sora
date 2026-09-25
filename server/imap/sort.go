@@ -40,7 +40,15 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 		release()
 		return nil, s.internalError("no mailbox selected for sort")
 	}
+	// The FTS scope is the mailbox OWNER, which for a shared mailbox is not the session
+	// account: messages.account_id always carries the owner (server/imap/copy.go passes
+	// destMailbox.AccountID, LMTP and delivery resolve the owner likewise). Passing the
+	// session account here would make every shared-mailbox body search return nothing.
 	selectedMailboxID := s.selectedMailbox.ID
+	selectedMailboxOwnerID := s.selectedMailbox.AccountID
+	// Mailbox size selects the search query shape (see db.ftsCTEThreshold). Only the order
+	// of magnitude matters, so the session's cached count is good enough.
+	mailboxMessageCount := int(s.currentNumMessages.Load())
 	release()
 
 	if sessionTrackerSnapshot == nil {
@@ -54,7 +62,7 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 
 	// Pass both search criteria and sort criteria to the database layer
 	// SORT only returns UIDs, so we can use a high limit (0 = use default MaxSearchResults)
-	messages, err := s.server.rdb.SearchMessagesSortedWithRetry(ctx, selectedMailboxID, searchCriteria, sortCriteria, 0)
+	messages, err := s.server.rdb.SearchMessagesSortedWithRetry(ctx, selectedMailboxID, selectedMailboxOwnerID, searchCriteria, sortCriteria, 0, mailboxMessageCount)
 	if err != nil {
 		return nil, s.internalError("failed to sort messages: %v", err)
 	}

@@ -6,7 +6,7 @@ This guide covers common scenarios for deploying Sora.
 
 Before deploying Sora, you will need:
 
-1.  **A PostgreSQL Server**: Version 9.6 or newer. The `pg_trgm` extension must be enabled on the database (`CREATE EXTENSION IF NOT EXISTS pg_trgm;`).
+1.  **A PostgreSQL Server**: Version 9.6 or newer. The `pg_trgm` and `btree_gin` extensions must be enabled on the database (`CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin;`). Both ship with contrib and are trusted, so the database owner can install them without superuser rights.
 2.  **S3-Compatible Object Storage**: An S3 bucket from a provider like AWS, or a self-hosted solution like MinIO.
 3.  **A Mail Transfer Agent (MTA)**: Such as Postfix or Exim, to handle SMTP and deliver mail to Sora via LMTP.
 

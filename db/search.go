@@ -643,7 +643,7 @@ const (
 // deduped CTE alias f (and is where "0 as seqnum" lives). All non-Text criteria are
 // built once and replicated into both branches so combined searches (TEXT +
 // flags/dates/etc.) stay correct.
-func (db *Database) buildTextUnionQuery(criteria *imap.SearchCriteria, mailboxID int64, branchSelect, sortColumns, outerSelect, orderByClause string, resultLimit int, paramCounter *int) (string, pgx.NamedArgs, error) {
+func (db *Database) buildTextUnionQuery(criteria *imap.SearchCriteria, mailboxID, accountID int64, branchSelect, sortColumns, outerSelect, orderByClause string, resultLimit int, paramCounter *int) (string, pgx.NamedArgs, error) {
 	// Base (non-Text) conditions, replicated into both branches. A shallow copy with
 	// Text cleared is sufficient: buildSearchCriteriaWithPrefix only reads the criteria.
 	base := *criteria
@@ -670,6 +670,7 @@ func (db *Database) buildTextUnionQuery(criteria *imap.SearchCriteria, mailboxID
 	outerOrder = strings.ReplaceAll(outerOrder, "m.", "f.")
 
 	args["mailboxID"] = mailboxID
+	args["accountID"] = accountID
 
 	limitClause := ""
 	if resultLimit > 0 {
@@ -685,7 +686,7 @@ func (db *Database) buildTextUnionQuery(criteria *imap.SearchCriteria, mailboxID
 			UNION
 			SELECT %[1]s, %[2]s
 			FROM messages m
-			LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+			`+ftsScopedJoin+`
 			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%[3]s) AND (%[5]s)
 		)
@@ -697,6 +698,167 @@ func (db *Database) buildTextUnionQuery(criteria *imap.SearchCriteria, mailboxID
 
 	return query, args, nil
 }
+
+// Projections shared by the two query-shape rewrites (TEXT UNION and the large-mailbox
+// FTS prefilter). Both wrap the messages/message_state scan in a CTE and project from it,
+// so they need the same pair of column lists; keeping one copy stops them drifting.
+//
+// Each *_sort column must appear EXACTLY ONCE across (branch select + sort columns) or the
+// CTE gets a duplicate column. The light branch omits internal_date/sent_date/size from its
+// data set, so textUnionSortColumnsLight carries them instead.
+const (
+	ftsFullBranchSelect = `m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
+			m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq,
+			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json`
+	ftsFullOuterSelect = `f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
+			f.internal_date, f.size, f.created_modseq, f.updated_modseq, f.expunged_modseq,
+			0 as seqnum,
+			f.flags_changed_at, f.subject, f.sent_date, f.message_id, f.in_reply_to, f.recipients_json`
+	ftsLightBranchSelect = `m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq`
+	ftsLightOuterSelect  = `f.id, f.uid, f.mailbox_id, f.content_hash, f.created_modseq, f.updated_modseq, f.expunged_modseq, 0 as seqnum`
+)
+
+// ftsCTEThreshold is the mailbox size at which a body search switches from probing the FTS
+// table once per message to evaluating the account's match set once, up front.
+//
+// Neither shape wins everywhere, and the gap is large in both directions. Measured
+// 2026-09-07 on a 1M-body corpus (tasks/fts-per-account-composite-gin.md 5.5), in buffers:
+//
+//	mailbox 20,000 msgs, common term:  per-message probe 80,418   prefilter 15,517
+//	mailbox    525 msgs, common term:  per-message probe     98   prefilter 15,105
+//
+// The crossover sits roughly where the mailbox's size approaches the account's matching-row
+// count. PostgreSQL cannot find it on its own: it does not cost TOAST detoasting inside a
+// filter, so it reliably picks the per-message probe -- which is the same plan shape that
+// measured 24 s on a large mailbox before this work (see canUseTextUnion).
+//
+// Only the order of magnitude matters, so a stale cached message count is a fine input, and
+// a caller that has no count at all (User API, MULTISEARCH) passes 0 and gets the probe.
+const ftsCTEThreshold = 10000
+
+// ftsPrefilterTerm returns the single top-level full-text term of a search, if it has
+// exactly one and that term is not buried inside an OR/NOT subtree.
+//
+// The prefilter turns the FTS predicate into an INNER join against a materialised match
+// set, which is only equivalent to the original when the term is a required AND factor. A
+// term inside OR/NOT is not, and a second term would need a second match set, so both are
+// rejected -- the same conservatism canUseTextUnion applies.
+func ftsPrefilterTerm(c *imap.SearchCriteria) (term string, ok bool) {
+	if c == nil || hasNestedFTS(c) {
+		return "", false
+	}
+	switch {
+	case len(c.Body) == 1 && len(c.Text) == 0:
+		return c.Body[0], true
+	default:
+		return "", false
+	}
+}
+
+// canUseFTSPrefilter reports whether a search should be rewritten to evaluate its body term
+// once, account-scoped, instead of probing per message. See ftsCTEThreshold.
+func (db *Database) canUseFTSPrefilter(criteria *imap.SearchCriteria, needsSeqNumSearch bool, orderByClause string, mailboxMessageCount int) bool {
+	if needsSeqNumSearch || mailboxMessageCount < ftsCTEThreshold {
+		return false
+	}
+	if strings.Contains(strings.ToLower(orderByClause), "seqnum") {
+		return false
+	}
+	_, ok := ftsPrefilterTerm(criteria)
+	return ok
+}
+
+// ftsPrefilterCTE is the account-scoped match set. MATERIALIZED is load-bearing: without it
+// PostgreSQL inlines the subquery and is free to fall back to the per-message probe this
+// rewrite exists to avoid.
+const ftsPrefilterCTE = `fts_hits AS MATERIALIZED (
+			SELECT content_hash
+			FROM messages_fts_v2
+			WHERE account_id = @accountID
+			  AND text_body_tsv IS NOT NULL
+			  AND text_body_tsv @@ plainto_tsquery('simple', @%s)
+		)`
+
+// buildFTSPrefilterQuery builds the large-mailbox form of a single-BODY-term search: the
+// account's matching hashes are computed once and joined to the mailbox, rather than the
+// mailbox being scanned and the FTS table probed per row.
+//
+// Every non-FTS criterion is built as usual and applied to the messages side, so combined
+// searches (BODY + flags/dates/etc.) stay correct.
+func (db *Database) buildFTSPrefilterQuery(criteria *imap.SearchCriteria, mailboxID, accountID int64, innerSelect, outerSelect, orderByClause string, resultLimit int, paramCounter *int) (string, pgx.NamedArgs, error) {
+	term, ok := ftsPrefilterTerm(criteria)
+	if !ok {
+		return "", nil, fmt.Errorf("buildFTSPrefilterQuery: criteria are not prefilter-eligible")
+	}
+
+	// A shallow copy with the FTS term cleared is enough: buildSearchCriteriaWithPrefix
+	// only reads the criteria.
+	base := *criteria
+	base.Body = nil
+	baseCond, args, err := db.buildSearchCriteriaWithPrefix(&base, paramPrefix, paramCounter, "m")
+	if err != nil {
+		return "", nil, err
+	}
+
+	*paramCounter++
+	tsParam := fmt.Sprintf("%s%d", paramPrefix, *paramCounter)
+	args[tsParam] = term
+	args["mailboxID"] = mailboxID
+	args["accountID"] = accountID
+
+	if orderByClause == "" {
+		orderByClause = "ORDER BY m.uid DESC"
+	}
+	innerOrder := orderByClause
+	if db.needsIndexScanBiasBuster(criteria) {
+		innerOrder = strings.ReplaceAll(orderByClause, "ORDER BY m.uid", "ORDER BY m.uid + 0")
+		if innerOrder == orderByClause {
+			innerOrder = strings.ReplaceAll(orderByClause, "ORDER BY uid", "ORDER BY uid + 0")
+		}
+	}
+	outerOrder := strings.ReplaceAll(orderByClause, "m.", "f.")
+
+	limitClause := ""
+	if resultLimit > 0 {
+		limitClause = fmt.Sprintf("LIMIT %d", resultLimit)
+	}
+
+	query := fmt.Sprintf(`
+		WITH `+ftsPrefilterCTE+`,
+		filtered_messages AS (
+			SELECT %s
+			FROM messages m
+			JOIN fts_hits ON fts_hits.content_hash = m.content_hash
+			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
+			%s
+			%s
+		)
+		SELECT %s
+		FROM filtered_messages f
+		%s`, tsParam, innerSelect, baseCond, innerOrder, limitClause, outerSelect, outerOrder)
+
+	return query, args, nil
+}
+
+// ftsScopedJoin is the only correct way to bring messages_fts_v2 into a search query.
+//
+// The account scope MUST sit in the JOIN ON clause and never in the WHERE clause. These
+// queries LEFT JOIN the FTS table, and several do so unconditionally: THREAD joins it for
+// every search including THREAD ALL, and the User API mailbox search ORs the FTS predicate
+// with header LIKE predicates. A WHERE-side "mc.account_id = @accountID" is NULL for a
+// message that has no FTS row at all, which silently degrades the LEFT JOIN to an inner
+// join and drops that message from the result.
+//
+// Messages with no FTS row are ordinary, not exceptional: bodies over 64 KB are never
+// staged, empty bodies are skipped, and PruneOldMessageVectors deletes rows once
+// fts_retention expires. A negated FTS criterion (NOT BODY "x") is TRUE for exactly those
+// messages, so the WHERE placement would also discard every true negative.
+//
+// The scope is written as a constant rather than as "mc.account_id = m.account_id" because
+// the composite GIN on (account_id, text_body_tsv) needs a constant to build a scan key
+// from; an equality with another column is not one.
+const ftsScopedJoin = `LEFT JOIN messages_fts_v2 mc ON mc.content_hash = m.content_hash AND mc.account_id = @accountID`
 
 // paramPrefix is the named-argument prefix used across the search query builders.
 const paramPrefix = "p"
@@ -729,7 +891,7 @@ func resolveResultLimit(explicitLimit int, isSearchAll, isComplexQuery bool, ord
 
 // getMessagesQueryExecutor is a helper function to execute the message retrieval query,
 // handling both default and custom sorting with optimized query selection.
-func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, orderByClause string, limit int) ([]Message, error) {
+func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, orderByClause string, limit, mailboxMessageCount int) ([]Message, error) {
 	if err := db.canonicalizeSearchCriteriaKeywords(ctx, nil, mailboxID, criteria); err != nil {
 		return nil, err
 	}
@@ -849,6 +1011,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			return nil, err
 		}
 		whereArgs["mailboxID"] = mailboxID
+		whereArgs["accountID"] = accountID
 
 		// For simple queries, ensure ORDER BY uses "m." prefix
 		if orderByClause == "" {
@@ -908,18 +1071,20 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 		// header branch (trigram indexes on messages) UNION an indexable body branch
 		// (FTS GIN on messages_fts), avoiding the full-mailbox-scan + per-row probe the
 		// combined OR forces on large mailboxes. See canUseTextUnion.
-		const branchSelect = `m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
-			m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json`
-		const outerSelect = `f.id, f.account_id, f.uid, f.mailbox_id, f.content_hash, f.s3_domain, f.s3_localpart, f.uploaded, f.flags, f.custom_flags,
-			f.internal_date, f.size, f.created_modseq, f.updated_modseq, f.expunged_modseq,
-			0 as seqnum,
-			f.flags_changed_at, f.subject, f.sent_date, f.message_id, f.in_reply_to, f.recipients_json`
-		finalQueryString, whereArgs, err = db.buildTextUnionQuery(criteria, mailboxID, branchSelect, textUnionSortColumnsFull, outerSelect, orderByClause, resultLimit, &paramCounter)
+		finalQueryString, whereArgs, err = db.buildTextUnionQuery(criteria, mailboxID, accountID, ftsFullBranchSelect, textUnionSortColumnsFull, ftsFullOuterSelect, orderByClause, resultLimit, &paramCounter)
 		if err != nil {
 			return nil, err
 		}
 		metricsLabel = "search_messages_complex_text_union"
+
+	} else if db.canUseFTSPrefilter(criteria, needsSeqNumSearch, orderByClause, mailboxMessageCount) {
+		// LARGE-MAILBOX path: evaluate the account's body matches once instead of probing
+		// the FTS table per message. See ftsCTEThreshold for the measured crossover.
+		finalQueryString, whereArgs, err = db.buildFTSPrefilterQuery(criteria, mailboxID, accountID, ftsFullBranchSelect+", "+textUnionSortColumnsFull, ftsFullOuterSelect, orderByClause, resultLimit, &paramCounter)
+		if err != nil {
+			return nil, err
+		}
+		metricsLabel = "search_messages_complex_prefilter"
 
 	} else if !needsSeqNumSearch {
 		// Modern Complex path: We need FTS or JSONB generic headers, BUT we do NOT need SeqNum filtering.
@@ -929,6 +1094,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			return nil, err
 		}
 		whereArgs["mailboxID"] = mailboxID
+		whereArgs["accountID"] = accountID
 
 		if orderByClause == "" {
 			orderByClause = "ORDER BY m.uid DESC"
@@ -944,7 +1110,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 					ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json,
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
 				FROM messages m
-				LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+				` + ftsScopedJoin + `
 				LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 				%s
@@ -983,6 +1149,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			return nil, err
 		}
 		whereArgs["mailboxID"] = mailboxID
+		whereArgs["accountID"] = accountID
 
 		if orderByClause == "" {
 			// The legacy CTE path's outer query joins message_seqs (seq.uid) and
@@ -1005,7 +1172,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
 		FROM message_seqs seq
 		INNER JOIN messages m ON m.id = seq.id
-		LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+		` + ftsScopedJoin + `
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id`
 
 		innerOrderByClause := orderByClause
@@ -1068,8 +1235,8 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID int6
 	return messages, nil
 }
 
-func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, limit int) ([]Message, error) {
-	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, "", limit) // Empty string triggers default sort
+func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, limit, mailboxMessageCount int) ([]Message, error) {
+	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, accountID, criteria, "", limit, mailboxMessageCount) // Empty string triggers default sort
 	if err != nil {
 		return nil, fmt.Errorf("GetMessagesWithCriteria: %w", err)
 	}
@@ -1077,15 +1244,15 @@ func (db *Database) GetMessagesWithCriteria(ctx context.Context, mailboxID int64
 }
 
 // GetMessagesSorted retrieves messages that match the search criteria, sorted according to the provided sort criteria
-func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit int) ([]Message, error) {
+func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit, mailboxMessageCount int) ([]Message, error) {
 	// Every query path in getMessagesQueryExecutor aliases the messages table as
-	// "m". The complex paths additionally LEFT JOIN messages_fts (which also has a
+	// "m". The complex paths additionally LEFT JOIN messages_fts_v2 (which also has a
 	// sent_date column) and the seqnum CTE joins message_seqs (which also has uid),
 	// so an unqualified ORDER BY column would be ambiguous (SQLSTATE 42702). Always
 	// qualify sort columns with "m.".
 	orderBy := db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
 
-	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, criteria, orderBy, limit)
+	messages, err := db.getMessagesQueryExecutor(ctx, mailboxID, accountID, criteria, orderBy, limit, mailboxMessageCount)
 	if err != nil {
 		// The error from getMessagesQueryExecutor will be wrapped here
 		return nil, fmt.Errorf("GetMessagesSorted: %w", err)
@@ -1093,7 +1260,7 @@ func (db *Database) GetMessagesSorted(ctx context.Context, mailboxID int64, crit
 	return messages, nil
 }
 
-func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, orderByClause string, limit int) ([]SearchMessageResult, error) {
+func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, orderByClause string, limit, mailboxMessageCount int) ([]SearchMessageResult, error) {
 	if err := db.canonicalizeSearchCriteriaKeywords(ctx, nil, mailboxID, criteria); err != nil {
 		return nil, err
 	}
@@ -1213,6 +1380,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 			return nil, err
 		}
 		whereArgs["mailboxID"] = mailboxID
+		whereArgs["accountID"] = accountID
 
 		// For simple queries, ensure ORDER BY uses "m." prefix
 		if orderByClause == "" {
@@ -1259,13 +1427,19 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 	} else if db.canUseTextUnion(criteria, needsSeqNumSearch, orderByClause) {
 		// TEXT UNION path (lightweight columns): see canUseTextUnion and the matching
 		// branch in getMessagesQueryExecutor.
-		const branchSelect = `m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq`
-		const outerSelect = `f.id, f.uid, f.mailbox_id, f.content_hash, f.created_modseq, f.updated_modseq, f.expunged_modseq, 0 as seqnum`
-		finalQueryString, whereArgs, err = db.buildTextUnionQuery(criteria, mailboxID, branchSelect, textUnionSortColumnsLight, outerSelect, orderByClause, resultLimit, &paramCounter)
+		finalQueryString, whereArgs, err = db.buildTextUnionQuery(criteria, mailboxID, accountID, ftsLightBranchSelect, textUnionSortColumnsLight, ftsLightOuterSelect, orderByClause, resultLimit, &paramCounter)
 		if err != nil {
 			return nil, err
 		}
 		metricsLabel = "search_messages_complex_text_union"
+
+	} else if db.canUseFTSPrefilter(criteria, needsSeqNumSearch, orderByClause, mailboxMessageCount) {
+		// LARGE-MAILBOX path: see ftsCTEThreshold.
+		finalQueryString, whereArgs, err = db.buildFTSPrefilterQuery(criteria, mailboxID, accountID, ftsLightBranchSelect+", "+textUnionSortColumnsLight, ftsLightOuterSelect, orderByClause, resultLimit, &paramCounter)
+		if err != nil {
+			return nil, err
+		}
+		metricsLabel = "search_messages_complex_prefilter"
 
 	} else if !needsSeqNumSearch {
 		// Modern Complex path: We need FTS or JSONB generic headers, BUT we do NOT need SeqNum filtering.
@@ -1275,6 +1449,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 			return nil, err
 		}
 		whereArgs["mailboxID"] = mailboxID
+		whereArgs["accountID"] = accountID
 
 		if orderByClause == "" {
 			orderByClause = "ORDER BY m.uid DESC"
@@ -1286,7 +1461,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 				SELECT
 					m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum
 				FROM messages m
-				LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+				` + ftsScopedJoin + `
 				LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 				%s
@@ -1308,7 +1483,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 				SELECT
 					m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum
 				FROM messages m
-				LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+				` + ftsScopedJoin + `
 				LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 				%s`
@@ -1323,6 +1498,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 			return nil, err
 		}
 		whereArgs["mailboxID"] = mailboxID
+		whereArgs["accountID"] = accountID
 
 		if orderByClause == "" {
 			// The legacy CTE path's outer query joins message_seqs (seq.uid) and
@@ -1343,7 +1519,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 			m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq, seq.seqnum
 		FROM message_seqs seq
 		INNER JOIN messages m ON m.id = seq.id
-		LEFT JOIN messages_fts mc ON m.content_hash = mc.content_hash
+		` + ftsScopedJoin + `
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id`
 
 		innerOrderByClause := orderByClause
@@ -1407,8 +1583,8 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 }
 
 // SearchMessagesWithCriteria retrieves only lightweight message metadata needed for IMAP SEARCH requests.
-func (db *Database) SearchMessagesWithCriteria(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, limit int) ([]SearchMessageResult, error) {
-	messages, err := db.getSearchMessagesQueryExecutor(ctx, mailboxID, criteria, "", limit) // Empty string triggers default sort
+func (db *Database) SearchMessagesWithCriteria(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, limit, mailboxMessageCount int) ([]SearchMessageResult, error) {
+	messages, err := db.getSearchMessagesQueryExecutor(ctx, mailboxID, accountID, criteria, "", limit, mailboxMessageCount) // Empty string triggers default sort
 	if err != nil {
 		return nil, fmt.Errorf("SearchMessagesWithCriteria: %w", err)
 	}
@@ -1416,15 +1592,15 @@ func (db *Database) SearchMessagesWithCriteria(ctx context.Context, mailboxID in
 }
 
 // SearchMessagesSorted retrieves lightweight message metadata that matches the search criteria, sorted.
-func (db *Database) SearchMessagesSorted(ctx context.Context, mailboxID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit int) ([]SearchMessageResult, error) {
+func (db *Database) SearchMessagesSorted(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit, mailboxMessageCount int) ([]SearchMessageResult, error) {
 	// Every query path in getSearchMessagesQueryExecutor aliases the messages table
-	// as "m". The complex paths additionally LEFT JOIN messages_fts (which also has
+	// as "m". The complex paths additionally LEFT JOIN messages_fts_v2 (which also has
 	// a sent_date column) and the seqnum CTE joins message_seqs (which also has
 	// uid), so an unqualified ORDER BY column would be ambiguous (SQLSTATE 42702).
 	// Always qualify sort columns with "m.".
 	orderBy := db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
 
-	messages, err := db.getSearchMessagesQueryExecutor(ctx, mailboxID, criteria, orderBy, limit)
+	messages, err := db.getSearchMessagesQueryExecutor(ctx, mailboxID, accountID, criteria, orderBy, limit, mailboxMessageCount)
 	if err != nil {
 		return nil, fmt.Errorf("SearchMessagesSorted: %w", err)
 	}

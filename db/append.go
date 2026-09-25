@@ -186,6 +186,9 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	if err := db.restagePendingUploads(ctx, tx, destMailboxID, newUIDs, instanceID); err != nil {
 		return nil, nil, err
 	}
+	if err := db.restageFTS(ctx, tx, destMailboxID, newUIDs); err != nil {
+		return nil, nil, err
+	}
 
 	return messageUIDMap, newMessageIDs, nil
 }
@@ -209,6 +212,57 @@ func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailbo
 		instanceID, mailboxID, newUIDs)
 	if err != nil {
 		return fmt.Errorf("failed to re-stage pending uploads: %w", err)
+	}
+	return nil
+}
+
+// restageFTS ensures every just-inserted message in (mailboxID, newUIDs) has a per-account
+// FTS row under its own account, so it is searchable by body for its new owner.
+//
+// This is the search-side analogue of restagePendingUploads. messages_fts_v2 is keyed by
+// (content_hash, account_id), so a cross-account COPY or MOVE lands a message under an
+// account that has no row for that body: without this it would be silently unsearchable in
+// the destination, exactly as it would be unreadable without the pending_upload re-stage.
+// Same-account copies and every same-account move already have the row, and the ON CONFLICT
+// makes those a no-op.
+//
+// The new rows carry no text: the body was staged (or already indexed) when the source
+// message was delivered, so the FTS worker fills these by copying the finished vector from
+// a sibling rather than tokenising anything again. The EXISTS guard keeps us from creating
+// rows for a body that was never indexed at all -- over 64KB, empty, or already pruned --
+// which would otherwise be queued forever and then poisoned.
+func (db *Database) restageFTS(ctx context.Context, tx pgx.Tx, mailboxID int64, newUIDs []int64) error {
+	if len(newUIDs) == 0 {
+		return nil
+	}
+	// Acquire shared advisory locks on all distinct content_hashes for these messages
+	// so any concurrent orphan sweep for these hashes either skips them (if restage
+	// arrived first) or restage waits for the sweep to commit (if sweep arrived first)
+	// so the v2 insert's statement snapshot sees the deletion and inserts fresh.
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock_shared($1, hashtext(m.content_hash))
+		FROM (
+			SELECT DISTINCT m.content_hash
+			FROM messages m
+			WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.expunged_at IS NULL
+		) m`,
+		consts.SoraFTSOrphanSweepLockClassID, mailboxID, newUIDs); err != nil {
+		return fmt.Errorf("failed to acquire shared advisory lock for fts restage: %w", err)
+	}
+
+	_, err := tx.Exec(ctx, `
+		INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, sent_date)
+		SELECT DISTINCT m.content_hash, m.account_id, NULL, m.sent_date
+		FROM messages m
+		WHERE m.mailbox_id = $1 AND m.uid = ANY($2) AND m.expunged_at IS NULL
+		  AND (
+		      EXISTS (SELECT 1 FROM messages_fts_v2 s WHERE s.content_hash = m.content_hash)
+		      OR EXISTS (SELECT 1 FROM messages_fts f WHERE f.content_hash = m.content_hash)
+		  )
+		ON CONFLICT (content_hash, account_id) DO NOTHING`,
+		mailboxID, newUIDs)
+	if err != nil {
+		return fmt.Errorf("failed to re-stage fts rows: %w", err)
 	}
 	return nil
 }
@@ -250,6 +304,96 @@ func shouldStageFTS(retention time.Duration, sentDate, now time.Time) bool {
 		return true
 	}
 	return !sentDate.Before(now.Add(-retention))
+}
+
+// FTS staging SQL, shared by every insert path so the three call sites cannot drift.
+//
+// Two rows are written per staged message, and they are not redundant:
+//
+//	ftsStageV1SQL  the hash-keyed messages_fts row, exactly as before this change. It stays
+//	               dual-written until migration 000051 retires that table, so rolling this
+//	               release back needs no data work. That matters more than usual here:
+//	               text_body is nulled the moment its vector is computed (db/fts.go), so the
+//	               tsvector is the ONLY copy of that data and cannot be recomputed without
+//	               re-fetching and re-parsing every body from S3.
+//
+//	ftsStageV2SQL  the per-account messages_fts_v2 row that the composite GIN indexes. This
+//	               is what lets a body search be scoped to one account instead of scanning
+//	               the whole corpus.
+//
+// The v2 statement decides IN SQL whether to carry the body text, so it costs one round trip
+// rather than two. It runs inside the transaction that already holds the mailbox row lock,
+// where every extra round trip serializes deliveries to that mailbox. If a sibling row for
+// this hash already carries a computed vector, the worker copies that vector and staging the
+// text again is pure waste: a newsletter delivered to 10k accounts would otherwise stage
+// 10k copies of the same 64 KB body.
+const (
+	ftsStageV1SQL = `
+		INSERT INTO messages_fts (content_hash, text_body, sent_date)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (content_hash) DO NOTHING`
+
+	// Every parameter is cast explicitly. In "INSERT ... SELECT $1, $2" PostgreSQL cannot
+	// infer a parameter's type from the target column, so $1 would be deduced as text in
+	// the select list and as varchar from its comparison inside the EXISTS -- "inconsistent
+	// types deduced for parameter $1", which fails the statement at prepare time.
+	ftsStageV2SQL = `
+		INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, sent_date)
+		SELECT $1::varchar(64), $2::bigint,
+		       CASE WHEN EXISTS (
+		           SELECT 1 FROM messages_fts_v2 s
+		           WHERE s.content_hash = $1::varchar(64) AND s.text_body_tsv IS NOT NULL
+		       ) THEN NULL ELSE $3::text END,
+		       $4::timestamptz
+		ON CONFLICT (content_hash, account_id) DO NOTHING`
+)
+
+// stageFTS writes both FTS staging rows for a freshly inserted message.
+//
+// Best-effort by design: if this fails the message is still delivered and uploaded, it is
+// merely unsearchable by body, so each write sits in its own savepoint and neither can fail
+// the caller.
+//
+// The two savepoints are deliberately INDEPENDENT. Rolling the v1 write back because the v2
+// write failed would defeat the entire point of dual-writing: v1 exists so that this release
+// can be rolled back without touching data that cannot be regenerated. A v2 problem must
+// therefore cost us v2 only, and leave the fallback intact.
+func stageFTS(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, textBody any, sentDate time.Time) {
+	stage := func(name string, fn func() error) {
+		savepoint := "fts_" + name
+		if _, err := tx.Exec(ctx, "SAVEPOINT "+savepoint); err != nil {
+			logger.Warn("Database: failed to create savepoint for fts insert", "savepoint", savepoint, "err", err)
+			return
+		}
+		if err := fn(); err != nil {
+			tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepoint)
+			logger.Warn("Database: failed to insert message fts payload (non-fatal, message will be unsearchable)",
+				"table", name, "content_hash", truncateHash(contentHash), "account_id", accountID, "err", err)
+			return
+		}
+		tx.Exec(ctx, "RELEASE SAVEPOINT "+savepoint)
+	}
+
+	stage("v1", func() error {
+		_, err := tx.Exec(ctx, ftsStageV1SQL, contentHash, textBody, sentDate)
+		return err
+	})
+
+	stage("v2", func() error {
+		// Acquire shared advisory lock on the content_hash as its own statement BEFORE
+		// the v2 insert. Any concurrent orphan sweep on this hash either skips it (if
+		// delivery holds the lock first) or delivery waits for the sweep to commit (if
+		// sweep holds it first), ensuring the v2 insert statement's snapshot is taken
+		// AFTER the sweep's deletion and inserts the row fresh.
+		// Runs inside the "v2" savepoint so that a lock error/timeout never aborts the
+		// enclosing delivery transaction.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock_shared($1, hashtext($2))",
+			consts.SoraFTSOrphanSweepLockClassID, contentHash); err != nil {
+			return fmt.Errorf("shared advisory lock: %w", err)
+		}
+		_, err := tx.Exec(ctx, ftsStageV2SQL, contentHash, accountID, textBody, sentDate)
+		return err
+	})
 }
 
 func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
@@ -685,23 +829,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 
 		textBodyStr, _ := textBodyArg.(string)
 		if textBodyStr != "" {
-			_, saveErr := tx.Exec(ctx, "SAVEPOINT fts_insert")
-			if saveErr == nil {
-				_, err = tx.Exec(ctx, `
-					INSERT INTO messages_fts (content_hash, text_body, sent_date)
-					VALUES ($1, $2, $3)
-					ON CONFLICT (content_hash) DO NOTHING
-				`, options.ContentHash, textBodyArg, options.SentDate)
-				if err != nil {
-					tx.Exec(ctx, "ROLLBACK TO SAVEPOINT fts_insert")
-					logger.Warn("Database: failed to insert message fts payload (non-fatal, message will be unsearchable)",
-						"content_hash", truncateHash(options.ContentHash), "err", err)
-				} else {
-					tx.Exec(ctx, "RELEASE SAVEPOINT fts_insert")
-				}
-			} else {
-				logger.Warn("Database: failed to create savepoint for fts_insert", "err", saveErr)
-			}
+			stageFTS(ctx, tx, options.ContentHash, options.AccountID, textBodyArg, options.SentDate)
 		}
 	}
 
@@ -1019,23 +1147,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		// expected for old/large messages and is handled gracefully downstream (unsearchable).
 		textBodyStr, _ := textBodyArg.(string)
 		if textBodyStr != "" {
-			_, saveErr := tx.Exec(ctx, "SAVEPOINT fts_insert")
-			if saveErr == nil {
-				_, err = tx.Exec(ctx, `
-					INSERT INTO messages_fts (content_hash, text_body, sent_date)
-					VALUES ($1, $2, $3)
-					ON CONFLICT (content_hash) DO NOTHING
-				`, options.ContentHash, textBodyArg, options.SentDate)
-				if err != nil {
-					tx.Exec(ctx, "ROLLBACK TO SAVEPOINT fts_insert")
-					logger.Warn("Database: failed to insert message fts payload (non-fatal, message will be unsearchable)",
-						"content_hash", truncateHash(options.ContentHash), "err", err)
-				} else {
-					tx.Exec(ctx, "RELEASE SAVEPOINT fts_insert")
-				}
-			} else {
-				logger.Warn("Database: failed to create savepoint for fts_insert", "err", saveErr)
-			}
+			stageFTS(ctx, tx, options.ContentHash, options.AccountID, textBodyArg, options.SentDate)
 		}
 	}
 
@@ -1358,6 +1470,8 @@ func (d *Database) InsertMessagesBatch(
 	// The queue loop below and the result loop that follows it must reach identical
 	// staging decisions, so both evaluate the retention window against this instant.
 	ftsNow := time.Now()
+	var ftsHashesToLock []string
+	ftsHashesSeen := make(map[string]struct{})
 
 	for _, p := range uniqueProcessed {
 		uploaded := isImporter || uploadedHashesSet[helpers.NewS3Key(p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.ContentHash)]
@@ -1404,12 +1518,22 @@ func (d *Database) InsertMessagesBatch(
 
 			textBodyStr, _ := textBodyArg.(string)
 			if textBodyStr != "" {
-				batch.Queue(`
-					INSERT INTO messages_fts (content_hash, text_body, sent_date)
-					VALUES ($1, $2, $3)
-					ON CONFLICT (content_hash) DO NOTHING
-				`, p.Opt.ContentHash, textBodyArg, p.Opt.SentDate)
+				if _, seen := ftsHashesSeen[p.Opt.ContentHash]; !seen {
+					ftsHashesSeen[p.Opt.ContentHash] = struct{}{}
+					ftsHashesToLock = append(ftsHashesToLock, p.Opt.ContentHash)
+				}
+				batch.Queue(ftsStageV1SQL, p.Opt.ContentHash, textBodyArg, p.Opt.SentDate)
+				batch.Queue(ftsStageV2SQL, p.Opt.ContentHash, p.Opt.AccountID, textBodyArg, p.Opt.SentDate)
 			}
+		}
+	}
+
+	if len(ftsHashesToLock) > 0 {
+		if _, err := tx.Exec(ctx, `
+			SELECT pg_advisory_xact_lock_shared($1, hashtext(h))
+			FROM unnest($2::text[]) h`,
+			consts.SoraFTSOrphanSweepLockClassID, ftsHashesToLock); err != nil {
+			return nil, nil, nil, fmt.Errorf("InsertMessagesBatch: failed to acquire shared advisory lock for fts: %w", err)
 		}
 	}
 
@@ -1449,9 +1573,17 @@ func (d *Database) InsertMessagesBatch(
 				textBodyStr = "..." // Mocked just to check if we queued it
 			}
 			if textBodyStr != "" {
+				// Two statements were queued per staged message (see stageFTS): the
+				// hash-keyed v1 row and the per-account v2 row. Both results must be
+				// drained here or every later result in the batch is read against the
+				// wrong statement.
 				_, err = br.Exec() // messages_fts
 				if err != nil {
 					return nil, nil, nil, fmt.Errorf("InsertMessagesBatch: failed messages_fts: %w", err)
+				}
+				_, err = br.Exec() // messages_fts_v2
+				if err != nil {
+					return nil, nil, nil, fmt.Errorf("InsertMessagesBatch: failed messages_fts_v2: %w", err)
 				}
 			}
 		}
