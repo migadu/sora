@@ -1,4 +1,4 @@
--- Backfill messages_fts_v2 from messages_fts. See tasks/fts-per-account-composite-gin.md.
+-- Backfill messages_fts_v2 from messages_fts. Runbook: docs/fts-v2-rollout.md.
 --
 -- WHY THIS IS A DATA MIGRATION AND NOT A CACHE REBUILD
 --   text_body is nulled the moment its vector is computed (db/fts.go), so the tsvector in
@@ -12,10 +12,14 @@
 --   COMMIT between batches, which a transaction pooler will not carry correctly.
 --
 --   Recency-first, so the mail users actually search becomes searchable first and an aborted
---   run still leaves the useful part done:
+--   run still leaves the useful part done. Run EACH CALL AS ITS OWN STATEMENT -- one
+--   `psql -c` per CALL, or one per line in an interactive session. Several CALLs in a single
+--   `psql -c "...; ..."` run as one implicit transaction, and the procedures' COMMITs then
+--   fail with "invalid transaction termination":
 --     CALL fts_v2_backfill_recent(interval '24 months', 5000, 200);  -- newest first
 --     CALL fts_v2_backfill_rest(5000, 200);                          -- everything older
 --     CALL fts_v2_catchup(0);                                        -- pairs missed in flight
+--   Later catch-up passes resume from the id the previous pass prints, not from 0.
 --
 --   Every procedure is resumable: re-running continues from where it stopped, and running one
 --   twice is a no-op. Progress is RAISE NOTICE'd per batch.
@@ -205,9 +209,20 @@ END $$;
 -- Run it after the backfill, after the index build, immediately before the deploy, and then
 -- in a loop during the rolling deploy until it reports 0 twice in a row (old binaries write
 -- only messages_fts, so they keep producing work until the last node has rolled).
+--
+-- Each pass ends by printing the id the next pass should start from: the highest id it saw,
+-- minus p_resume_margin, because ids are allocated at INSERT but become visible at COMMIT,
+-- so a slow transaction can commit a row below max(id) after this pass read it. Starting
+-- every pass from 0 instead rescans the whole table each time. It sleeps only after a step
+-- that inserted something, so an empty range is not paced like a busy one.
 -- ---------------------------------------------------------------------------------------
+-- An earlier version of this script defined a 3-argument catch-up. CREATE OR REPLACE with a
+-- different argument list adds an overload instead of replacing it, which makes a 3-argument
+-- CALL ambiguous, so drop it first.
+DROP PROCEDURE IF EXISTS fts_v2_catchup(bigint, int, int);
 CREATE OR REPLACE PROCEDURE fts_v2_catchup(
-    p_from_id bigint DEFAULT 0, p_batch int DEFAULT 20000, p_sleep_ms int DEFAULT 200
+    p_from_id bigint DEFAULT 0, p_batch int DEFAULT 20000, p_sleep_ms int DEFAULT 200,
+    p_resume_margin bigint DEFAULT 100000
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_id bigint := p_from_id;
@@ -239,10 +254,11 @@ BEGIN
         COMMIT;
         IF v_ins > 0 THEN
             RAISE NOTICE 'catchup: +% rows up to id %, total %', v_ins, v_id, v_total;
+            PERFORM pg_sleep(p_sleep_ms / 1000.0);
         END IF;
-        PERFORM pg_sleep(p_sleep_ms / 1000.0);
     END LOOP;
-    RAISE NOTICE 'catchup: done, % rows up to id %', v_total, v_max;
+    RAISE NOTICE 'catchup: done, % rows up to id %. Next pass: CALL fts_v2_catchup(%);',
+        v_total, v_max, GREATEST(v_max - p_resume_margin, 0);
 END $$;
 
 -- ---------------------------------------------------------------------------------------
