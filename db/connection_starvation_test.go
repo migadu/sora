@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +23,12 @@ func setupTestDatabaseWithMaxConns(t testing.TB, maxConns int) *Database {
 	var cfg TestConfig
 	_, err = toml.DecodeFile(configPath, &cfg)
 	require.NoError(t, err, "Failed to load test config")
+	// SORA_TEST_DB_NAME overrides the database, as it does for the other test packages,
+	// so a branch whose migrations differ from main can run against its own database
+	// instead of migrating the shared one.
+	if name := os.Getenv("SORA_TEST_DB_NAME"); name != "" {
+		cfg.Database.Write.Name = name
+	}
 
 	dbConfig := &config.DatabaseConfig{
 		Write: &config.DatabaseEndpointConfig{
