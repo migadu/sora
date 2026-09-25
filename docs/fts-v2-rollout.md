@@ -10,8 +10,8 @@ before the new binary serves traffic**.
 | Installation | What happens |
 |---|---|
 | Fresh install | Nothing to do. The migration creates an empty table and its indexes. |
-| `messages_fts` up to 250,000 rows (dev, test, small installs) | Nothing to do. The migration populates `messages_fts_v2` itself. |
-| `messages_fts` over 250,000 rows | **Follow this runbook.** The migration refuses to run against an empty `messages_fts_v2`, because applying it would leave body search empty for all existing mail. |
+| `messages_fts` up to 25,000 rows (dev, test, small installs) | Nothing to do. The migration populates `messages_fts_v2` itself. |
+| `messages_fts` over 25,000 rows | **Follow this runbook.** The migration refuses to run until the backfill below has completed (it checks `fts_v2_backfill_state`), because applying it earlier would leave body search missing existing mail. |
 
 Why the data matters: `text_body` is nulled the moment its vector is computed, so the tsvector in
 `messages_fts` is the **only** copy of the searchable text. It cannot be rebuilt without re-fetching
@@ -56,7 +56,8 @@ and re-parsing every body from S3. Treat both tables as data, not as a cache.
 
 3. **Backfill, newest mail first.** Each procedure is resumable and idempotent, and prints its
    progress. Start with `(5000, 200)` (batch size, sleep in ms) and raise the sleep the moment
-   replica lag grows.
+   replica lag grows. Each records its completion in `fts_v2_backfill_state`; `rest` starts
+   below the date range `recent` already covered.
 
    ```sql
    CALL fts_v2_backfill_recent(interval '24 months', 5000, 200);
@@ -65,8 +66,11 @@ and re-parsing every body from S3. Treat both tables as data, not as a cache.
    CALL fts_v2_backfill_rest(5000, 200);
    ```
 
-4. **Catch up** on pairs delivered while the backfill ran. The first pass starts from 0. Each pass
-   ends by printing the id to start the next one from; use it, instead of rescanning from 0.
+4. **Catch up** on pairs delivered while the backfill ran. The first pass starts from 0: besides
+   covering mail delivered during the backfill, it is what keys older shared-mailbox mail on
+   the mailbox owner (the backfill itself keys on `messages.account_id`, which keeps it an
+   index-only scan). Each pass ends by printing the id to start the next one from; use it,
+   instead of rescanning from 0.
 
    ```sql
    CALL fts_v2_catchup(0);
@@ -90,14 +94,23 @@ and re-parsing every body from S3. Treat both tables as data, not as a cache.
 7. **Catch up again** from the id the last pass printed, then **verify**:
 
    ```sql
-   SELECT * FROM fts_v2_verification;   -- missing_pairs must be ~0
+   SELECT * FROM fts_v2_verification();   -- recent_missing_pairs ~0, rest_done = true
    ```
+
+   It only checks the newest million messages (pass a different count as its argument), and
+   table sizes are planner estimates: a full count would be one long query holding a snapshot
+   on the primary right before the deploy. Full coverage is shown by the catch-up reporting 0
+   rows twice in a row.
 
    Confirm all replicas have caught up and carry the table and index. A replica without the table
    fails every search with `relation "messages_fts_v2" does not exist`.
 
-8. **Deploy the new binary** (rolling). Migration 000050 finds everything in place and only checks
-   its shape.
+8. **Deploy the new binary** (rolling). Migration 000050 finds the backfill recorded and the
+   indexes present, checks their shape, and takes no lock that could queue behind the catch-up.
+
+   Deliberately backfilling only recent mail (older mail stays unsearchable by body) is allowed,
+   but must be recorded before the deploy, or the migration refuses:
+   `INSERT INTO fts_v2_backfill_state (step) VALUES ('accept_partial');`
 
 9. **Keep running the catch-up during the rollout** until it reports 0 rows twice in a row. Old
    nodes write only `messages_fts`, so they keep producing work until the last one has rolled.
