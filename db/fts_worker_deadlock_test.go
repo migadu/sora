@@ -18,14 +18,10 @@ import (
 // its own row, updates the shared messages_fts row, and fans the vector out to every sibling
 // with a NULL vector -- which includes the row the OTHER worker holds.
 //
-// A waits for a row B holds; B waits for a row (or the shared messages_fts row) A holds.
-// PostgreSQL detects the cycle after deadlock_timeout and aborts one transaction: that
-// worker's whole batch (up to 5000 rows) rolls back and it backs off 5 s before retrying.
-// For a mass mailing this repeats across nodes until one wins.
-//
-// This test documents the hazard by reproducing it: exactly one of the two must fail with
-// SQLSTATE 40P01. The fix is FOR UPDATE SKIP LOCKED on the fan-out's target selection, so a
-// worker never waits on a row another worker holds; once that lands, invert this test.
+// Before the fan-out, the shared-row update and the poison took their targets FOR UPDATE
+// SKIP LOCKED, A waited for the row B held and B for the row A held: PostgreSQL aborted one
+// of them with 40P01, and ProcessFTSBatch then POISONED that body (see
+// TestFTSLockConflictNeverPoisonsGoodBody). Neither worker may wait on the other now.
 func TestFTSWorkerFanOutDeadlock(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -104,12 +100,114 @@ func TestFTSWorkerFanOutDeadlock(t *testing.T) {
 		}
 	}
 
-	// The only two possible outcomes are "one deadlocked, one won" (the hazard) or "both
-	// completed" (the SKIP LOCKED fix in place). Assert the current, unfixed behaviour so
-	// the fix is forced to flip this assertion deliberately.
-	require.Equal(t, 1, deadlocks,
-		"expected exactly one worker to be aborted with 40P01: two workers fanning out the same "+
-			"hash block on each other's polled rows. If both completed, the fan-out no longer waits "+
-			"on locked rows and this test should assert successes == 2 instead.")
-	require.Equal(t, 1, successes)
+	// "One deadlocked, one won" was the hazard; with SKIP LOCKED both complete.
+	require.Equal(t, 0, deadlocks, "two workers fanning out the same hash must not wait on each other's polled rows")
+	require.Equal(t, 2, successes)
+}
+
+// A worker that hits a lock conflict must never poison the body it was indexing.
+//
+// Worker B has polled one row of a body and is mid-batch. Worker A runs a real batch on
+// another row of the same body. Before the fix, A's fan-out waited for B's row, hit its lock
+// timeout, and ProcessFTSBatch treated that like an untokenisable payload: it wrote an empty
+// vector into every row of the hash, v1 included, and nulled the text. The body was then
+// unsearchable in every account, permanently. A lock conflict now either never happens (the
+// fan-out skips rows another worker holds) or fails the batch, which is retried.
+func TestFTSLockConflictNeverPoisonsGoodBody(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, _, accountID, _ := setupCleanerTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	hash := fmt.Sprintf("lockpoison_%d", time.Now().UnixNano())
+	a1, a2 := accountID, accountID+3_100_000
+
+	_, err := db.GetWritePool().Exec(ctx,
+		`INSERT INTO messages_fts (content_hash, text_body, sent_date) VALUES ($1, 'quarterly report attached', now())`, hash)
+	require.NoError(t, err)
+	// a1 is older, so a FIFO poll of one row takes it.
+	for i, acct := range []int64{a1, a2} {
+		_, err := db.GetWritePool().Exec(ctx, `
+			INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, sent_date, created_at)
+			VALUES ($1, $2, 'quarterly report attached', now(), now() - make_interval(secs => $3))`,
+			hash, acct, 10-i)
+		require.NoError(t, err)
+	}
+	t.Cleanup(func() {
+		db.GetWritePool().Exec(context.Background(), `DELETE FROM messages_fts_v2 WHERE content_hash = $1`, hash)
+		db.GetWritePool().Exec(context.Background(), `DELETE FROM messages_fts WHERE content_hash = $1`, hash)
+	})
+
+	// Worker B holds a2, and lets go shortly after A's lock timeout would fire.
+	txB, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	_, err = txB.Exec(ctx, `SELECT 1 FROM messages_fts_v2 WHERE content_hash = $1 AND account_id = $2 FOR UPDATE`, hash, a2)
+	require.NoError(t, err)
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(450 * time.Millisecond)
+		txB.Rollback(context.Background())
+		close(released)
+	}()
+
+	// Worker A: a real batch of one row, with a short lock timeout so any wait surfaces fast.
+	txA, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	_, err = txA.Exec(ctx, `SET LOCAL lock_timeout = '300ms'`)
+	require.NoError(t, err)
+	if _, err := db.ProcessFTSBatch(ctx, txA, 1); err != nil {
+		t.Logf("worker A's batch failed (acceptable, it is retried): %v", err)
+		require.NoError(t, txA.Rollback(ctx))
+	} else {
+		require.NoError(t, txA.Commit(ctx))
+	}
+	<-released
+
+	// Later batches resolve whatever is left.
+	for i := 0; i < 5; i++ {
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		n, err := db.ProcessFTSBatch(ctx, tx, 100)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+		if n == 0 {
+			break
+		}
+	}
+
+	rows, err := db.GetWritePool().Query(ctx, `
+		SELECT 'v2:' || account_id, COALESCE(length(text_body_tsv), -1) FROM messages_fts_v2 WHERE content_hash = $1
+		UNION ALL
+		SELECT 'v1', COALESCE(length(text_body_tsv), -1) FROM messages_fts WHERE content_hash = $1`, hash)
+	require.NoError(t, err)
+	defer rows.Close()
+	seen := 0
+	for rows.Next() {
+		var who string
+		var lexemes int
+		require.NoError(t, rows.Scan(&who, &lexemes))
+		seen++
+		require.Greater(t, lexemes, 0, "%s: a good body was poisoned (empty vector) or never indexed (%d)", who, lexemes)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, 3, seen)
+}
+
+// Only a payload PostgreSQL cannot tokenise may be poisoned.
+func TestIsFTSDataError(t *testing.T) {
+	for code, want := range map[string]bool{
+		"22P05": true,  // invalid byte sequence
+		"22021": true,  // character not in repertoire
+		"54000": true,  // string is too long for tsvector
+		"40P01": false, // deadlock
+		"55P03": false, // lock not available (lock_timeout)
+		"57014": false, // query canceled (statement_timeout)
+		"08006": false, // connection failure
+	} {
+		require.Equal(t, want, isFTSDataError(fmt.Errorf("wrapped: %w", &pgconn.PgError{Code: code})), code)
+	}
+	require.False(t, isFTSDataError(context.DeadlineExceeded))
 }

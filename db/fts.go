@@ -2,9 +2,13 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 )
@@ -105,6 +109,11 @@ func (d *Database) ProcessFTSBatch(ctx context.Context, tx pgx.Tx, limit int) (i
 		}
 	}
 
+	// Lock order. Two workers can hold different rows of the same hash, and each touches
+	// the one shared messages_fts row per hash. Walking hashes in a fixed order means two
+	// batches sharing several hashes cannot take those shared rows in opposite orders.
+	sort.Strings(order)
+
 	resolved := 0
 	var noText []string
 	for _, hash := range order {
@@ -127,6 +136,14 @@ func (d *Database) ProcessFTSBatch(ctx context.Context, tx pgx.Tx, limit int) (i
 		if err != nil {
 			if _, rerr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT fts_hash"); rerr != nil {
 				return resolved, fmt.Errorf("failed to roll back savepoint for %s: %w", item.Hash, rerr)
+			}
+			// Only a payload PostgreSQL cannot tokenise is poison. Anything else -- a
+			// deadlock, a lock or statement timeout, a dropped connection, a cancelled
+			// context -- says nothing about the body, and poisoning it would be permanent
+			// data loss: the text is nulled here, so the vector could never be rebuilt.
+			// Fail the batch instead; it rolls back and the rows are polled again.
+			if !isFTSDataError(err) {
+				return resolved, fmt.Errorf("failed to index %s: %w", item.Hash, err)
 			}
 			logger.Error("FTS: failed to index content_hash, marking poison", "hash", item.Hash, "err", err)
 			if perr := d.poisonFTSHashes(ctx, tx, []string{item.Hash}); perr != nil {
@@ -172,12 +189,18 @@ func (d *Database) tokenizeAndFanOut(ctx context.Context, tx pgx.Tx, item ftsQue
 
 	// Dual-write the shared table by COPYING the vector we just computed, never by
 	// tokenising again. Retired with messages_fts in migration 000051.
+	//
+	// SKIP LOCKED: the shared row may be held by another worker handling the same hash (or
+	// by an old-binary worker during a rolling deploy), which is writing the same vector.
+	// Waiting would only risk a deadlock or a lock timeout.
 	if _, err := tx.Exec(ctx, `
 		UPDATE messages_fts f
 		SET text_body_tsv = v.text_body_tsv, text_body = NULL
 		FROM messages_fts_v2 v
-		WHERE f.content_hash = $1 AND v.content_hash = $1 AND v.account_id = $2
-		  AND f.text_body_tsv IS NULL AND v.text_body_tsv IS NOT NULL
+		WHERE f.ctid IN (SELECT ctid FROM messages_fts
+		                 WHERE content_hash = $1 AND text_body_tsv IS NULL
+		                 FOR UPDATE SKIP LOCKED)
+		  AND v.content_hash = $1 AND v.account_id = $2 AND v.text_body_tsv IS NOT NULL
 	`, item.Hash, item.AccountID); err != nil {
 		return resolved, fmt.Errorf("dual-write messages_fts: %w", err)
 	}
@@ -200,11 +223,17 @@ func (d *Database) fanOutVector(ctx context.Context, tx pgx.Tx, hash string) (in
 		// afterwards (by a cross-account COPY, say) would otherwise sit queued forever --
 		// it carries no text of its own to tokenise and no v2 sibling to copy from. The two
 		// vectors are identical by construction, so which one wins is immaterial.
+		//
+		// Targets are taken FOR UPDATE SKIP LOCKED. A queued row that another worker has
+		// polled belongs to that worker, which resolves it itself; waiting for it instead is
+		// how two workers fanning out the same hash deadlocked (each waiting for the row the
+		// other polled). A non-empty source vector is preferred over a poisoned '' one.
 		tag, err := tx.Exec(ctx, `
 			WITH src AS (
 				SELECT COALESCE(
 					(SELECT v.text_body_tsv FROM messages_fts_v2 v
-					  WHERE v.content_hash = $1 AND v.text_body_tsv IS NOT NULL LIMIT 1),
+					  WHERE v.content_hash = $1 AND v.text_body_tsv IS NOT NULL
+					  ORDER BY length(v.text_body_tsv) = 0 LIMIT 1),
 					(SELECT f.text_body_tsv FROM messages_fts f
 					  WHERE f.content_hash = $1 AND f.text_body_tsv IS NOT NULL LIMIT 1)
 				) AS tsv
@@ -212,6 +241,7 @@ func (d *Database) fanOutVector(ctx context.Context, tx pgx.Tx, hash string) (in
 				SELECT ctid FROM messages_fts_v2
 				WHERE content_hash = $1 AND text_body_tsv IS NULL
 				LIMIT $2
+				FOR UPDATE SKIP LOCKED
 			)
 			UPDATE messages_fts_v2 t
 			SET text_body_tsv = (SELECT tsv FROM src), text_body = NULL
@@ -308,19 +338,37 @@ func (d *Database) resolveTextlessHashes(ctx context.Context, tx pgx.Tx, hashes 
 
 // poisonFTSHashes marks a hash unsearchable-but-done in both tables, so the queue drains.
 func (d *Database) poisonFTSHashes(ctx context.Context, tx pgx.Tx, hashes []string) error {
+	// SKIP LOCKED for the same reason as the fan-out: a row another worker holds is that
+	// worker's to resolve, and waiting for it is how batches deadlock.
 	if _, err := tx.Exec(ctx, `
 		UPDATE messages_fts_v2
 		SET text_body_tsv = ''::tsvector, text_body = NULL
-		WHERE content_hash = ANY($1) AND text_body_tsv IS NULL
+		WHERE ctid IN (SELECT ctid FROM messages_fts_v2
+		               WHERE content_hash = ANY($1) AND text_body_tsv IS NULL
+		               FOR UPDATE SKIP LOCKED)
 	`, hashes); err != nil {
 		return fmt.Errorf("failed to poison messages_fts_v2 rows: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE messages_fts
 		SET text_body_tsv = ''::tsvector, text_body = NULL
-		WHERE content_hash = ANY($1) AND text_body_tsv IS NULL
+		WHERE ctid IN (SELECT ctid FROM messages_fts
+		               WHERE content_hash = ANY($1) AND text_body_tsv IS NULL
+		               FOR UPDATE SKIP LOCKED)
 	`, hashes); err != nil {
 		return fmt.Errorf("failed to poison messages_fts rows: %w", err)
 	}
 	return nil
+}
+
+// isFTSDataError reports whether err means the body itself cannot be tokenised: a data
+// exception (class 22, e.g. 22P05 invalid byte sequence) or a program limit (class 54, e.g.
+// 54000 "string is too long for tsvector"). Only those justify poisoning, because only
+// those would fail again on every retry.
+func isFTSDataError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return strings.HasPrefix(pgErr.Code, "22") || strings.HasPrefix(pgErr.Code, "54")
 }
