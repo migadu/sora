@@ -682,13 +682,13 @@ func (db *Database) buildTextUnionQuery(criteria *imap.SearchCriteria, mailboxID
 			SELECT %[1]s, %[2]s
 			FROM messages m
 			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-			WHERE m.mailbox_id = @mailboxID AND m.account_id = @accountID AND m.expunged_at IS NULL AND (%[3]s) AND (%[4]s)
+			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%[3]s) AND (%[4]s)
 			UNION
 			SELECT %[1]s, %[2]s
 			FROM messages m
 			`+ftsScopedJoin+`
 			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-			WHERE m.mailbox_id = @mailboxID AND m.account_id = @accountID AND m.expunged_at IS NULL AND (%[3]s) AND (%[5]s)
+			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%[3]s) AND (%[5]s)
 		)
 		SELECT %[6]s
 		FROM matched f
@@ -830,7 +830,7 @@ func (db *Database) buildFTSPrefilterQuery(criteria *imap.SearchCriteria, mailbo
 			FROM messages m
 			JOIN fts_hits ON fts_hits.content_hash = m.content_hash
 			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-			WHERE m.mailbox_id = @mailboxID AND m.account_id = @accountID AND m.expunged_at IS NULL AND (%s)
+			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 			%s
 			%s
 		)
@@ -1112,7 +1112,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID, acc
 				FROM messages m
 				` + ftsScopedJoin + `
 				LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-				WHERE m.mailbox_id = @mailboxID AND m.account_id = @accountID AND m.expunged_at IS NULL AND (%s)
+				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 				%s
 				LIMIT %d
 			)
@@ -1164,7 +1164,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID, acc
 				m.id, m.uid,
 				ROW_NUMBER() OVER(ORDER BY uid) as seqnum
 			FROM messages m
-			WHERE m.mailbox_id = @mailboxID AND m.account_id = @accountID AND m.expunged_at IS NULL
+			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL
 		)
 		SELECT 
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded, COALESCE(ms.flags, 0) as flags, COALESCE(ms.custom_flags, '[]'::jsonb) as custom_flags,
@@ -1463,7 +1463,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 				FROM messages m
 				` + ftsScopedJoin + `
 				LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-				WHERE m.mailbox_id = @mailboxID AND m.account_id = @accountID AND m.expunged_at IS NULL AND (%s)
+				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 				%s
 				LIMIT %d`
 
@@ -1485,7 +1485,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 				FROM messages m
 				` + ftsScopedJoin + `
 				LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-				WHERE m.mailbox_id = @mailboxID AND m.account_id = @accountID AND m.expunged_at IS NULL AND (%s)
+				WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL AND (%s)
 				%s`
 			finalQueryString = fmt.Sprintf(noLimitTemplate, whereCondition, innerOrderByClause)
 		}
@@ -1513,7 +1513,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 				m.id, m.uid,
 				ROW_NUMBER() OVER(ORDER BY uid) as seqnum
 			FROM messages m
-			WHERE m.mailbox_id = @mailboxID AND m.account_id = @accountID AND m.expunged_at IS NULL
+			WHERE m.mailbox_id = @mailboxID AND m.expunged_at IS NULL
 		)
 		SELECT 
 			m.id, m.uid, m.mailbox_id, m.content_hash, m.created_modseq, ms.updated_modseq, m.expunged_modseq, seq.seqnum

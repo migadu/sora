@@ -676,6 +676,21 @@ func (d *Database) DeleteFTSRowsForAccount(ctx context.Context, tx pgx.Tx, accou
 	return tag.RowsAffected(), nil
 }
 
+// ftsKeyReferencedSQL is the SQL predicate "some messages row still needs the FTS row
+// (hash, account)". A messages_fts_v2 row belongs to the OWNER of the mailbox a message is in,
+// because that is the account every search scopes to (a shared mailbox is searched through its
+// owner). messages.account_id says the same thing for everything delivered since shared
+// mailbox ownership landed (June 2026), but before that a message added to a shared mailbox by
+// someone else carried that person's id. Both keys count as referenced: the first test stays
+// index-only for the common case, and the second keeps the owner-keyed row of such a legacy
+// message from being swept as an orphan.
+func ftsKeyReferencedSQL(hash, account string) string {
+	return fmt.Sprintf(`(EXISTS (SELECT 1 FROM messages m
+		        WHERE m.content_hash = %[1]s AND m.account_id = %[2]s)
+		 OR EXISTS (SELECT 1 FROM messages m JOIN mailboxes mb ON mb.id = m.mailbox_id
+		        WHERE m.content_hash = %[1]s AND mb.account_id = %[2]s))`, hash, account)
+}
+
 // GetUnusedFTSKeys finds (content_hash, account_id) pairs in messages_fts_v2 that are no
 // longer referenced by any message row for that account. These are candidates for early
 // cleanup even before TTL expires.
@@ -716,10 +731,7 @@ func (d *Database) GetUnusedFTSKeys(ctx context.Context, limit int) ([]FTSKey, e
 				LIMIT $3
 			)
 			SELECT sw.content_hash, sw.account_id,
-			       NOT EXISTS (
-			           SELECT 1 FROM messages m
-			           WHERE m.content_hash = sw.content_hash AND m.account_id = sw.account_id
-			       ) AS orphan
+			       NOT ` + ftsKeyReferencedSQL("sw.content_hash", "sw.account_id") + ` AS orphan
 			FROM scan_window sw
 			ORDER BY sw.content_hash, sw.account_id
 		`
@@ -793,10 +805,7 @@ func (d *Database) DeleteMessagesFTSByKeyBatch(ctx context.Context, tx pgx.Tx, k
 		)
 		DELETE FROM messages_fts_v2 f
 		WHERE f.ctid IN (SELECT ctid FROM candidate)
-		  AND NOT EXISTS (
-		      SELECT 1 FROM messages m
-		      WHERE m.content_hash = f.content_hash AND m.account_id = f.account_id
-		  )
+		  AND NOT `+ftsKeyReferencedSQL("f.content_hash", "f.account_id")+`
 	`, hashes, accounts)
 	if err != nil {
 		return 0, fmt.Errorf("failed to batch delete from messages_fts_v2: %w", err)

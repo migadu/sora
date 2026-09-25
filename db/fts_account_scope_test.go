@@ -172,7 +172,10 @@ func TestBuildFTSPrefilterQuerySQL(t *testing.T) {
 	assert.Contains(t, query, "text_body_tsv IS NOT NULL",
 		"required for the PARTIAL composite GIN to be usable")
 	assert.Contains(t, query, "JOIN fts_hits ON fts_hits.content_hash = m.content_hash")
-	assert.Contains(t, query, "m.mailbox_id = @mailboxID AND m.account_id = @accountID")
+	assert.Contains(t, query, "m.mailbox_id = @mailboxID")
+	assert.NotContains(t, query, "m.account_id = @accountID",
+		"messages must not be filtered on account_id: pre-June shared-mailbox mail carries the "+
+			"appender's id, and mailbox_id already scopes the query (TestLegacySharedMailboxMessagesStaySearchable)")
 	assert.NotContains(t, query, ftsScopedJoin,
 		"the prefilter form replaces the per-message join; having both would evaluate the term twice")
 

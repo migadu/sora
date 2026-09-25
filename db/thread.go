@@ -64,7 +64,6 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 			`+ftsScopedJoin+`
 			WHERE m.mailbox_id = @mailbox_id
-			  AND m.account_id = @accountID
 			  AND m.expunged_at IS NULL
 			  AND %s
 			ORDER BY m.uid DESC

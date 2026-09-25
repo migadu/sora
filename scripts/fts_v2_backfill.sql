@@ -37,10 +37,16 @@
 -- with no messages row is a legitimate candidate that yields zero pairs, and "loop until a
 -- batch inserts nothing" would spin on it forever.
 --
--- Drives from messages_fts (small) and enumerates owners with an index-only scan on the
--- existing idx_messages_content_hash_account_id (content_hash, account_id). The DISTINCT is
--- on account_id alone inside the LATERAL: never DISTINCT over the row, because text_body_tsv
--- is TOASTed and sorting it would dominate the whole job.
+-- Drives from messages_fts (small) and enumerates owners through the existing
+-- idx_messages_content_hash_account_id (content_hash, account_id). The DISTINCT is on the
+-- account alone inside the LATERAL: never DISTINCT over the row, because text_body_tsv is
+-- TOASTed and sorting it would dominate the whole job.
+--
+-- The account is the OWNER of the message's mailbox, because that is the account a search
+-- scopes to (a shared mailbox is searched through its owner). messages.account_id is the
+-- same thing for mail delivered since June 2026, but before that a message added to a shared
+-- mailbox by someone else carried that person's id; keying on it would leave such messages
+-- unsearchable by body. Messages whose mailbox is gone fall back to messages.account_id.
 --
 -- No expunged_at filter, deliberately. The orphan sweep counts ANY messages row including
 -- expunged ones (db/cleaner.go), and `sora-admin messages restore` un-expunges rows without
@@ -79,7 +85,9 @@ BEGIN
     SELECT b.content_hash, p.account_id, b.text_body, b.text_body_tsv, b.sent_date, b.created_at
     FROM fts_v2_batch b
     CROSS JOIN LATERAL (
-        SELECT DISTINCT m.account_id FROM messages m WHERE m.content_hash = b.content_hash
+        SELECT DISTINCT COALESCE(mb.account_id, m.account_id) AS account_id
+        FROM messages m LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
+        WHERE m.content_hash = b.content_hash
     ) p
     ON CONFLICT (content_hash, account_id) DO NOTHING;
     GET DIAGNOSTICS v_ins = ROW_COUNT;
@@ -115,7 +123,9 @@ BEGIN
     SELECT b.content_hash, p.account_id, b.text_body, b.text_body_tsv, NULL, b.created_at
     FROM fts_v2_batch_nd b
     CROSS JOIN LATERAL (
-        SELECT DISTINCT m.account_id FROM messages m WHERE m.content_hash = b.content_hash
+        SELECT DISTINCT COALESCE(mb.account_id, m.account_id) AS account_id
+        FROM messages m LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
+        WHERE m.content_hash = b.content_hash
     ) p
     ON CONFLICT (content_hash, account_id) DO NOTHING;
     GET DIAGNOSTICS v_ins = ROW_COUNT;
@@ -208,12 +218,14 @@ BEGIN
     -- COALESCE so an empty messages table reports "up to id 0" rather than NULL.
     SELECT COALESCE(max(id), 0) INTO v_max FROM messages;
     WHILE v_id < v_max LOOP
-        WITH missing AS (
-            SELECT DISTINCT m.content_hash, m.account_id
-            FROM messages m
+        WITH want AS (
+            SELECT DISTINCT m.content_hash, COALESCE(mb.account_id, m.account_id) AS account_id
+            FROM messages m LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
             WHERE m.id > v_id AND m.id <= v_id + p_batch
-              AND NOT EXISTS (SELECT 1 FROM messages_fts_v2 v
-                              WHERE v.content_hash = m.content_hash AND v.account_id = m.account_id)
+        ), missing AS (
+            SELECT w.content_hash, w.account_id FROM want w
+            WHERE NOT EXISTS (SELECT 1 FROM messages_fts_v2 v
+                              WHERE v.content_hash = w.content_hash AND v.account_id = w.account_id)
         )
         INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, text_body_tsv, sent_date, created_at)
         SELECT x.content_hash, x.account_id, f.text_body, f.text_body_tsv, f.sent_date, f.created_at
@@ -244,8 +256,9 @@ SELECT
     (SELECT count(*) FROM messages_fts_v2
       WHERE text_body_tsv IS NULL AND created_at < now() - interval '10 min')  AS v2_queue_backlog,
     (SELECT count(*) FROM (
-        SELECT DISTINCT m.content_hash, m.account_id
+        SELECT DISTINCT m.content_hash, COALESCE(mb.account_id, m.account_id) AS account_id
         FROM messages m JOIN messages_fts f ON f.content_hash = m.content_hash
+        LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
      ) want
      WHERE NOT EXISTS (SELECT 1 FROM messages_fts_v2 v
                        WHERE v.content_hash = want.content_hash AND v.account_id = want.account_id))
