@@ -650,6 +650,24 @@ func (d *Database) PruneOldMessageVectors(ctx context.Context, tx pgx.Tx, retent
 		return 0, fmt.Errorf("failed to prune old message vectors: %w", err)
 	}
 
+	// Retention applies to the shared messages_fts rows too while they are dual-written.
+	// Otherwise the table grows through the whole soak, and a cross-account COPY -- whose
+	// fan-out falls back to messages_fts for a vector -- would bring a pruned body back
+	// into messages_fts_v2.
+	if _, err := tx.Exec(ctx, `
+		WITH expired AS (
+			SELECT ctid FROM messages_fts
+			WHERE sent_date < (now() - $1::interval)
+			ORDER BY sent_date
+			FOR UPDATE SKIP LOCKED
+			LIMIT $2
+		)
+		DELETE FROM messages_fts
+		WHERE ctid IN (SELECT ctid FROM expired)
+	`, retention, maxPruneRows); err != nil {
+		return 0, fmt.Errorf("failed to prune old shared message vectors: %w", err)
+	}
+
 	return tag.RowsAffected(), nil
 }
 
@@ -851,6 +869,18 @@ func (d *Database) DeleteMessagesFTSByKeyBatch(ctx context.Context, tx pgx.Tx, k
 	`, lockedHashes, lockedAccounts)
 	if err != nil {
 		return 0, fmt.Errorf("failed to batch delete from messages_fts_v2: %w", err)
+	}
+
+	// The shared messages_fts row of a hash goes once no message in any account references
+	// it -- the rule this sweep applied to that table before messages_fts_v2 existed. The
+	// table is still dual-written through the soak (so a rollback needs no data work), and
+	// without this it would only ever grow until migration 000051 drops it.
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM messages_fts f
+		WHERE f.content_hash = ANY($1::text[])
+		  AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.content_hash = f.content_hash)
+	`, lockedHashes); err != nil {
+		return 0, fmt.Errorf("failed to batch delete from messages_fts: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }
