@@ -20,7 +20,7 @@ func TestFTSSharedTableStillCleanedDuringSoak(t *testing.T) {
 	}
 
 	db, _, accountID, mailboxID := setupCleanerTestDatabase(t)
-	defer db.Close()
+	t.Cleanup(db.Close) // registered first, so it runs after every other cleanup
 	ctx := context.Background()
 	ts := time.Now().UnixNano()
 

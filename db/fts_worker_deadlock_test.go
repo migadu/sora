@@ -28,7 +28,7 @@ func TestFTSWorkerFanOutDeadlock(t *testing.T) {
 	}
 
 	db, _, accountID, _ := setupCleanerTestDatabase(t)
-	defer db.Close()
+	t.Cleanup(db.Close) // registered first, so it runs after every other cleanup
 
 	ctx := context.Background()
 	hash := fmt.Sprintf("deadlock_%d", time.Now().UnixNano())
@@ -119,7 +119,7 @@ func TestFTSLockConflictNeverPoisonsGoodBody(t *testing.T) {
 	}
 
 	db, _, accountID, _ := setupCleanerTestDatabase(t)
-	defer db.Close()
+	t.Cleanup(db.Close) // registered first, so it runs after every other cleanup
 
 	ctx := context.Background()
 	hash := fmt.Sprintf("lockpoison_%d", time.Now().UnixNano())

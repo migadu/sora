@@ -17,7 +17,7 @@ func TestFTSTextlessRowsResolveFromPendingText(t *testing.T) {
 	}
 
 	db, _, accountID, _ := setupCleanerTestDatabase(t)
-	defer db.Close()
+	t.Cleanup(db.Close) // registered first, so it runs after every other cleanup
 	ctx := context.Background()
 
 	// Rows are dated far in the past so a FIFO poll of the queue takes them first.

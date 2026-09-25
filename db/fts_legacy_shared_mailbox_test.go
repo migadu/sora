@@ -29,7 +29,7 @@ func TestLegacySharedMailboxMessagesStaySearchable(t *testing.T) {
 	}
 
 	db, _, ownerID, mailboxID := setupCleanerTestDatabase(t)
-	defer db.Close()
+	t.Cleanup(db.Close) // registered first, so it runs after every other cleanup
 
 	ctx := context.Background()
 	ts := time.Now().UnixNano()

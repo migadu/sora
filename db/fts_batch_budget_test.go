@@ -19,7 +19,7 @@ func TestFTSBatchCommitsPartialProgressBeforeDeadline(t *testing.T) {
 	}
 
 	db, _, accountID, _ := setupCleanerTestDatabase(t)
-	defer db.Close()
+	t.Cleanup(db.Close) // registered first, so it runs after every other cleanup
 	ctx := context.Background()
 
 	// An interrupted earlier run leaves its rows at the head of the queue, where this batch
