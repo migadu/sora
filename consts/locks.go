@@ -12,3 +12,7 @@ const SoraAdvisoryLockID = 42734581 // A randomly chosen integer
 // exclusively meant for deterministic migration leader election on startup. It is
 // taken transaction-scoped inside a db.AdvisoryLockTx.
 const SoraMigrationLeaderLockID = SoraAdvisoryLockID + 1
+
+// SoraFTSOrphanSweepLockClassID is the class ID used for transaction-scoped advisory locks
+// coordinating FTS delivery staging (shared) and orphan sweep deletion (exclusive).
+const SoraFTSOrphanSweepLockClassID = int32(0x46545332) // "FTS2" in hex = 1179997490

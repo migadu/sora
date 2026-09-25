@@ -235,6 +235,21 @@ func (db *Database) restageFTS(ctx context.Context, tx pgx.Tx, mailboxID int64, 
 	if len(newUIDs) == 0 {
 		return nil
 	}
+	// Acquire shared advisory locks on all distinct content_hashes for these messages
+	// so any concurrent orphan sweep for these hashes either skips them (if restage
+	// arrived first) or restage waits for the sweep to commit (if sweep arrived first)
+	// so the v2 insert's statement snapshot sees the deletion and inserts fresh.
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock_shared($1, hashtext(m.content_hash))
+		FROM (
+			SELECT DISTINCT m.content_hash
+			FROM messages m
+			WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.expunged_at IS NULL
+		) m`,
+		consts.SoraFTSOrphanSweepLockClassID, mailboxID, newUIDs); err != nil {
+		return fmt.Errorf("failed to acquire shared advisory lock for fts restage: %w", err)
+	}
+
 	_, err := tx.Exec(ctx, `
 		INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, sent_date)
 		SELECT DISTINCT m.content_hash, m.account_id, NULL, m.sent_date
@@ -344,13 +359,13 @@ const (
 // can be rolled back without touching data that cannot be regenerated. A v2 problem must
 // therefore cost us v2 only, and leave the fallback intact.
 func stageFTS(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, textBody any, sentDate time.Time) {
-	stage := func(name, query string, args ...any) {
+	stage := func(name string, fn func() error) {
 		savepoint := "fts_" + name
 		if _, err := tx.Exec(ctx, "SAVEPOINT "+savepoint); err != nil {
 			logger.Warn("Database: failed to create savepoint for fts insert", "savepoint", savepoint, "err", err)
 			return
 		}
-		if _, err := tx.Exec(ctx, query, args...); err != nil {
+		if err := fn(); err != nil {
 			tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepoint)
 			logger.Warn("Database: failed to insert message fts payload (non-fatal, message will be unsearchable)",
 				"table", name, "content_hash", truncateHash(contentHash), "account_id", accountID, "err", err)
@@ -359,8 +374,26 @@ func stageFTS(ctx context.Context, tx pgx.Tx, contentHash string, accountID int6
 		tx.Exec(ctx, "RELEASE SAVEPOINT "+savepoint)
 	}
 
-	stage("v1", ftsStageV1SQL, contentHash, textBody, sentDate)
-	stage("v2", ftsStageV2SQL, contentHash, accountID, textBody, sentDate)
+	stage("v1", func() error {
+		_, err := tx.Exec(ctx, ftsStageV1SQL, contentHash, textBody, sentDate)
+		return err
+	})
+
+	stage("v2", func() error {
+		// Acquire shared advisory lock on the content_hash as its own statement BEFORE
+		// the v2 insert. Any concurrent orphan sweep on this hash either skips it (if
+		// delivery holds the lock first) or delivery waits for the sweep to commit (if
+		// sweep holds it first), ensuring the v2 insert statement's snapshot is taken
+		// AFTER the sweep's deletion and inserts the row fresh.
+		// Runs inside the "v2" savepoint so that a lock error/timeout never aborts the
+		// enclosing delivery transaction.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock_shared($1, hashtext($2))",
+			consts.SoraFTSOrphanSweepLockClassID, contentHash); err != nil {
+			return fmt.Errorf("shared advisory lock: %w", err)
+		}
+		_, err := tx.Exec(ctx, ftsStageV2SQL, contentHash, accountID, textBody, sentDate)
+		return err
+	})
 }
 
 func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
@@ -1437,6 +1470,8 @@ func (d *Database) InsertMessagesBatch(
 	// The queue loop below and the result loop that follows it must reach identical
 	// staging decisions, so both evaluate the retention window against this instant.
 	ftsNow := time.Now()
+	var ftsHashesToLock []string
+	ftsHashesSeen := make(map[string]struct{})
 
 	for _, p := range uniqueProcessed {
 		uploaded := isImporter || uploadedHashesSet[helpers.NewS3Key(p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.ContentHash)]
@@ -1483,9 +1518,22 @@ func (d *Database) InsertMessagesBatch(
 
 			textBodyStr, _ := textBodyArg.(string)
 			if textBodyStr != "" {
+				if _, seen := ftsHashesSeen[p.Opt.ContentHash]; !seen {
+					ftsHashesSeen[p.Opt.ContentHash] = struct{}{}
+					ftsHashesToLock = append(ftsHashesToLock, p.Opt.ContentHash)
+				}
 				batch.Queue(ftsStageV1SQL, p.Opt.ContentHash, textBodyArg, p.Opt.SentDate)
 				batch.Queue(ftsStageV2SQL, p.Opt.ContentHash, p.Opt.AccountID, textBodyArg, p.Opt.SentDate)
 			}
+		}
+	}
+
+	if len(ftsHashesToLock) > 0 {
+		if _, err := tx.Exec(ctx, `
+			SELECT pg_advisory_xact_lock_shared($1, hashtext(h))
+			FROM unnest($2::text[]) h`,
+			consts.SoraFTSOrphanSweepLockClassID, ftsHashesToLock); err != nil {
+			return nil, nil, nil, fmt.Errorf("InsertMessagesBatch: failed to acquire shared advisory lock for fts: %w", err)
 		}
 	}
 

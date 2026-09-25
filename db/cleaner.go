@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/logger"
 )
 
@@ -780,10 +781,22 @@ func (d *Database) GetUnusedFTSKeys(ctx context.Context, limit int) ([]FTSKey, e
 // unreferenced when it was scanned can carry a live message by now. Deleting it would
 // leave that message unsearchable forever, with no error anywhere.
 //
-// The candidate rows are locked BEFORE the re-validation runs, so a delivery committing
-// between the check and the delete cannot slip through the gap: it either commits first and
-// the NOT EXISTS sees it, or it waits behind our lock and finds the row gone, which its
-// ON CONFLICT insert then recreates.
+// To prevent race conditions with concurrent deliveries, the sweep coordinates via
+// transaction-scoped advisory locks:
+//  1. Statement 1 attempts to acquire an exclusive advisory lock (pg_try_advisory_xact_lock)
+//     per content_hash and locks the candidate rows (FOR UPDATE OF v SKIP LOCKED). If a
+//     delivery transaction is currently staging that hash, it holds a shared advisory lock,
+//     so the sweep skips it.
+//  2. Statement 2 runs in a new statement snapshot, re-checks ftsKeyReferencedSQL, and
+//     deletes unreferenced rows. Any delivery arriving after statement 1 waits on the
+//     shared advisory lock until this transaction commits, ensuring its subsequent v2
+//     insert snapshot sees the deletion and inserts fresh.
+//
+// NOTE ON LOCK TABLE CAPACITY: The sweep holds up to len(keys) (capped at BATCH_PURGE_SIZE=1000)
+// exclusive advisory locks in this short transaction. The shared lock table holds
+// max_locks_per_transaction x (max_connections + max_prepared_transactions) entries for the
+// whole server (about 25,600 on production), and running out fails unrelated queries with
+// "out of shared memory", so do not raise this batch size without checking that budget.
 func (d *Database) DeleteMessagesFTSByKeyBatch(ctx context.Context, tx pgx.Tx, keys []FTSKey) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
@@ -794,19 +807,48 @@ func (d *Database) DeleteMessagesFTSByKeyBatch(ctx context.Context, tx pgx.Tx, k
 		hashes[i] = k.ContentHash
 		accounts[i] = k.AccountID
 	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT d.content_hash, d.account_id
+		FROM unnest($1::text[], $2::bigint[]) AS d(content_hash, account_id)
+		JOIN messages_fts_v2 v
+		  ON v.content_hash = d.content_hash AND v.account_id = d.account_id
+		WHERE pg_try_advisory_xact_lock($3, hashtext(d.content_hash))
+		ORDER BY v.content_hash, v.account_id
+		FOR UPDATE OF v SKIP LOCKED
+	`, hashes, accounts, consts.SoraFTSOrphanSweepLockClassID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to lock candidate keys for fts orphan deletion: %w", err)
+	}
+
+	var lockedHashes []string
+	var lockedAccounts []int64
+	for rows.Next() {
+		var h string
+		var a int64
+		if err := rows.Scan(&h, &a); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("failed to scan locked fts candidate keys: %w", err)
+		}
+		lockedHashes = append(lockedHashes, h)
+		lockedAccounts = append(lockedAccounts, a)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, fmt.Errorf("failed to read locked fts candidate keys: %w", err)
+	}
+
+	if len(lockedHashes) == 0 {
+		return 0, nil
+	}
+
 	tag, err := tx.Exec(ctx, `
-		WITH candidate AS (
-			SELECT v.ctid
-			FROM messages_fts_v2 v
-			JOIN unnest($1::text[], $2::bigint[]) AS d(content_hash, account_id)
-			  ON v.content_hash = d.content_hash AND v.account_id = d.account_id
-			ORDER BY v.content_hash, v.account_id
-			FOR UPDATE OF v
-		)
 		DELETE FROM messages_fts_v2 f
-		WHERE f.ctid IN (SELECT ctid FROM candidate)
+		USING unnest($1::text[], $2::bigint[]) AS d(content_hash, account_id)
+		WHERE f.content_hash = d.content_hash AND f.account_id = d.account_id
 		  AND NOT `+ftsKeyReferencedSQL("f.content_hash", "f.account_id")+`
-	`, hashes, accounts)
+	`, lockedHashes, lockedAccounts)
 	if err != nil {
 		return 0, fmt.Errorf("failed to batch delete from messages_fts_v2: %w", err)
 	}
