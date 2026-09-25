@@ -83,42 +83,40 @@ CREATE OR REPLACE FUNCTION fts_v2_backfill_batch(
     p_hi timestamptz DEFAULT NULL
 ) RETURNS TABLE (inserted bigint, hashes bigint, next_date timestamptz, next_hash varchar(64))
 LANGUAGE plpgsql AS $$
-DECLARE
-    v_ins bigint;
-    v_hashes bigint;
-    v_date timestamptz;
-    v_hash varchar(64);
 BEGIN
-    CREATE TEMP TABLE IF NOT EXISTS fts_v2_batch (
-        content_hash varchar(64), text_body text, text_body_tsv tsvector,
-        sent_date timestamptz, created_at timestamptz
-    ) ON COMMIT DROP;
-    DELETE FROM fts_v2_batch;
-
-    INSERT INTO fts_v2_batch
-    SELECT f.content_hash, f.text_body, f.text_body_tsv, f.sent_date, f.created_at
-    FROM messages_fts f
-    WHERE f.sent_date IS NOT NULL
-      AND f.sent_date > p_lo
-      AND (p_hi IS NULL OR f.sent_date <= p_hi)
-      AND (p_cur_date IS NULL OR (f.sent_date, f.content_hash) < (p_cur_date, p_cur_hash))
-    ORDER BY f.sent_date DESC, f.content_hash DESC
-    LIMIT p_batch;
-
-    SELECT count(*) INTO v_hashes FROM fts_v2_batch;
-    SELECT b.sent_date, b.content_hash INTO v_date, v_hash
-    FROM fts_v2_batch b ORDER BY b.sent_date ASC, b.content_hash ASC LIMIT 1;
-
-    INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, text_body_tsv, sent_date, created_at)
-    SELECT b.content_hash, p.account_id, b.text_body, b.text_body_tsv, b.sent_date, b.created_at
-    FROM fts_v2_batch b
-    CROSS JOIN LATERAL (
-        SELECT DISTINCT m.account_id FROM messages m WHERE m.content_hash = b.content_hash
-    ) p
-    ON CONFLICT (content_hash, account_id) DO NOTHING;
-    GET DIAGNOSTICS v_ins = ROW_COUNT;
-
-    RETURN QUERY SELECT v_ins, v_hashes, v_date, v_hash;
+    -- One statement, no temp table. A temp table created and dropped per batch is a catalog
+    -- change each time -- WAL-logged and replicated -- thousands of times over a backfill.
+    -- The MATERIALIZED CTE holds only the batch's keys (two small columns); the insert reads
+    -- each vector once, by primary key, and the count and cursor come from the keys alone.
+    RETURN QUERY
+    WITH batch AS MATERIALIZED (
+        SELECT f.content_hash, f.sent_date
+        FROM messages_fts f
+        WHERE f.sent_date IS NOT NULL
+          AND f.sent_date > p_lo
+          AND (p_hi IS NULL OR f.sent_date <= p_hi)
+          AND (p_cur_date IS NULL OR (f.sent_date, f.content_hash) < (p_cur_date, p_cur_hash))
+        ORDER BY f.sent_date DESC, f.content_hash DESC
+        LIMIT p_batch
+    ), ins AS (
+        INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, text_body_tsv, sent_date, created_at)
+        SELECT f.content_hash, p.account_id, f.text_body, f.text_body_tsv, f.sent_date, f.created_at
+        FROM batch b
+        JOIN messages_fts f ON f.content_hash = b.content_hash
+        CROSS JOIN LATERAL (
+            SELECT DISTINCT m.account_id FROM messages m WHERE m.content_hash = b.content_hash
+        ) p
+        ON CONFLICT (content_hash, account_id) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM ins),
+           (SELECT count(*) FROM batch),
+           c.sent_date, c.content_hash
+    FROM (SELECT 1) AS one
+    LEFT JOIN LATERAL (
+        SELECT b.sent_date, b.content_hash FROM batch b
+        ORDER BY b.sent_date ASC, b.content_hash ASC LIMIT 1
+    ) c ON true;
 END $$;
 
 -- Rows with a NULL sent_date, paginated by content_hash. The retention prune deliberately
@@ -128,33 +126,29 @@ CREATE OR REPLACE FUNCTION fts_v2_backfill_batch_nulldate(
     p_cur_hash varchar(64), p_batch int
 ) RETURNS TABLE (inserted bigint, hashes bigint, next_hash varchar(64))
 LANGUAGE plpgsql AS $$
-DECLARE
-    v_ins bigint; v_hashes bigint; v_hash varchar(64);
 BEGIN
-    CREATE TEMP TABLE IF NOT EXISTS fts_v2_batch_nd (
-        content_hash varchar(64), text_body text, text_body_tsv tsvector, created_at timestamptz
-    ) ON COMMIT DROP;
-    DELETE FROM fts_v2_batch_nd;
-
-    INSERT INTO fts_v2_batch_nd
-    SELECT f.content_hash, f.text_body, f.text_body_tsv, f.created_at
-    FROM messages_fts f
-    WHERE f.sent_date IS NULL AND (p_cur_hash IS NULL OR f.content_hash > p_cur_hash)
-    ORDER BY f.content_hash ASC
-    LIMIT p_batch;
-
-    SELECT count(*), max(content_hash) INTO v_hashes, v_hash FROM fts_v2_batch_nd;
-
-    INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, text_body_tsv, sent_date, created_at)
-    SELECT b.content_hash, p.account_id, b.text_body, b.text_body_tsv, NULL, b.created_at
-    FROM fts_v2_batch_nd b
-    CROSS JOIN LATERAL (
-        SELECT DISTINCT m.account_id FROM messages m WHERE m.content_hash = b.content_hash
-    ) p
-    ON CONFLICT (content_hash, account_id) DO NOTHING;
-    GET DIAGNOSTICS v_ins = ROW_COUNT;
-
-    RETURN QUERY SELECT v_ins, v_hashes, v_hash;
+    -- Same single-statement shape as fts_v2_backfill_batch, for the same reason.
+    RETURN QUERY
+    WITH batch AS MATERIALIZED (
+        SELECT f.content_hash
+        FROM messages_fts f
+        WHERE f.sent_date IS NULL AND (p_cur_hash IS NULL OR f.content_hash > p_cur_hash)
+        ORDER BY f.content_hash ASC
+        LIMIT p_batch
+    ), ins AS (
+        INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, text_body_tsv, sent_date, created_at)
+        SELECT f.content_hash, p.account_id, f.text_body, f.text_body_tsv, NULL, f.created_at
+        FROM batch b
+        JOIN messages_fts f ON f.content_hash = b.content_hash
+        CROSS JOIN LATERAL (
+            SELECT DISTINCT m.account_id FROM messages m WHERE m.content_hash = b.content_hash
+        ) p
+        ON CONFLICT (content_hash, account_id) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM ins),
+           (SELECT count(*) FROM batch),
+           (SELECT max(b.content_hash) FROM batch b)::varchar(64);
 END $$;
 
 -- ---------------------------------------------------------------------------------------
