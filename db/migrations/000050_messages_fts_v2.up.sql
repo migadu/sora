@@ -87,66 +87,90 @@ CREATE TABLE IF NOT EXISTS messages_fts_v2 (
 );
 
 -- Population. The new binary answers every body search from this table alone, so applying
--- this migration to a database whose messages_fts holds vectors, and leaving this table
--- empty, would make body search return nothing for all existing mail -- silently.
+-- this migration to a database whose messages_fts holds vectors while this table is empty or
+-- only partly filled would make body search miss existing mail -- silently.
 --
---   - Already populated (the out-of-band backfill ran): nothing to do.
---   - Empty, and messages_fts is small (dev, tests, small installs): populate it here, before
---     the GIN below exists, so the bulk insert does not pay per-row GIN maintenance.
---   - Empty, and messages_fts is large: refuse. Copying hundreds of millions of rows inside
---     a startup migration would blow the migration timeout on every node; that is what the
---     out-of-band backfill is for.
+--   - messages_fts holds at most 25,000 rows (dev, tests, small installs): populate here. The
+--     insert is idempotent, so it also fills the gaps of a partial copy. It runs before the
+--     GIN below exists, so it does not pay per-row GIN maintenance. 25,000 keeps it to
+--     seconds: 250,000 took 90 s on a laptop, against the 2-minute migration_timeout.
+--   - Larger: the out-of-band backfill must have completed. scripts/fts_v2_backfill.sql records
+--     that in fts_v2_backfill_state ('rest'), or an operator recorded 'accept_partial' after
+--     deliberately backfilling only recent mail. Anything else is refused: a table that is
+--     merely non-empty may hold one interrupted pass.
 --
--- The pair logic mirrors scripts/fts_v2_backfill.sql: one row per (hash, mailbox owner), no
+-- The pair logic mirrors the backfill's catch-up: one row per (hash, mailbox owner), no
 -- expunged_at filter (restore relies on the row), falling back to messages.account_id for a
 -- message whose mailbox is gone. Queued v1 rows copy their text for the worker to tokenise.
 DO $$
 DECLARE
     v1_rows bigint;
+    backfilled boolean := false;
 BEGIN
-    IF EXISTS (SELECT 1 FROM messages_fts_v2) THEN
+    SELECT count(*) INTO v1_rows FROM (SELECT 1 FROM messages_fts LIMIT 25001) s;
+
+    IF v1_rows <= 25000 THEN
+        INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, text_body_tsv, sent_date, created_at)
+        SELECT f.content_hash, p.account_id, f.text_body, f.text_body_tsv, f.sent_date, f.created_at
+        FROM messages_fts f
+        CROSS JOIN LATERAL (
+            SELECT DISTINCT COALESCE(mb.account_id, m.account_id) AS account_id
+            FROM messages m LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
+            WHERE m.content_hash = f.content_hash
+        ) p
+        ON CONFLICT (content_hash, account_id) DO NOTHING;
         RETURN;
-    END IF;
-    SELECT count(*) INTO v1_rows FROM (SELECT 1 FROM messages_fts LIMIT 250001) s;
-    IF v1_rows = 0 THEN
-        RETURN;
-    END IF;
-    IF v1_rows > 250000 THEN
-        RAISE EXCEPTION 'messages_fts_v2 is empty but messages_fts has more than 250000 rows. Run the out-of-band backfill first (docs/fts-v2-rollout.md): applying this migration now would leave body search empty for all existing mail.';
     END IF;
 
-    INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, text_body_tsv, sent_date, created_at)
-    SELECT f.content_hash, p.account_id, f.text_body, f.text_body_tsv, f.sent_date, f.created_at
-    FROM messages_fts f
-    CROSS JOIN LATERAL (
-        SELECT DISTINCT COALESCE(mb.account_id, m.account_id) AS account_id
-        FROM messages m LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
-        WHERE m.content_hash = f.content_hash
-    ) p
-    ON CONFLICT (content_hash, account_id) DO NOTHING;
+    IF to_regclass('fts_v2_backfill_state') IS NOT NULL THEN
+        SELECT EXISTS (SELECT 1 FROM fts_v2_backfill_state WHERE step IN ('rest', 'accept_partial'))
+          INTO backfilled;
+    END IF;
+    IF NOT backfilled THEN
+        RAISE EXCEPTION 'messages_fts has more than 25000 rows and the out-of-band backfill has not completed (no ''rest'' or ''accept_partial'' in fts_v2_backfill_state). Run it first (docs/fts-v2-rollout.md): applying this migration now would leave body search missing existing mail.';
+    END IF;
 END $$;
 
--- The search index. See the PARTIAL note above.
-CREATE INDEX IF NOT EXISTS idx_messages_fts_v2_account_tsv ON messages_fts_v2
-    USING gin (account_id, text_body_tsv) WHERE text_body_tsv IS NOT NULL;
+-- Indexes. On production they already exist (built out-of-band, see the runbook), and a
+-- plain CREATE INDEX IF NOT EXISTS still takes a ShareLock on the table before noticing, and
+-- ALTER INDEX ... SET takes an AccessExclusiveLock on the index, so either would queue
+-- behind a running catch-up. Each statement therefore runs only when there is work to do.
+DO $$
+BEGIN
+    -- The search index. See the PARTIAL note above.
+    IF to_regclass('idx_messages_fts_v2_account_tsv') IS NULL THEN
+        CREATE INDEX idx_messages_fts_v2_account_tsv ON messages_fts_v2
+            USING gin (account_id, text_body_tsv) WHERE text_body_tsv IS NOT NULL;
+    END IF;
 
--- fastupdate off, matching migrations 000020 / 000033 / 000034: the pending list turns a
--- predictable per-insert cost into an unpredictable flush on whichever transaction happens
--- to cross gin_pending_list_limit.
-ALTER INDEX idx_messages_fts_v2_account_tsv SET (fastupdate = off);
+    -- fastupdate off, matching migrations 000020 / 000033 / 000034: the pending list turns a
+    -- predictable per-insert cost into an unpredictable flush on whichever transaction
+    -- happens to cross gin_pending_list_limit.
+    IF NOT EXISTS (SELECT 1 FROM pg_class
+                   WHERE oid = 'idx_messages_fts_v2_account_tsv'::regclass
+                     AND 'fastupdate=off' = ANY (COALESCE(reloptions, '{}'))) THEN
+        ALTER INDEX idx_messages_fts_v2_account_tsv SET (fastupdate = off);
+    END IF;
 
--- Batched per-account purge (account delete, purge-domain). Without it those deletes have no
--- access path but a full scan, since the PK leads with content_hash.
-CREATE INDEX IF NOT EXISTS idx_messages_fts_v2_account_id ON messages_fts_v2 (account_id);
+    -- Batched per-account purge (account delete, purge-domain). Without it those deletes have
+    -- no access path but a full scan, since the PK leads with content_hash.
+    IF to_regclass('idx_messages_fts_v2_account_id') IS NULL THEN
+        CREATE INDEX idx_messages_fts_v2_account_id ON messages_fts_v2 (account_id);
+    END IF;
 
--- The FTS worker's queue.
-CREATE INDEX IF NOT EXISTS idx_messages_fts_v2_queue ON messages_fts_v2 (created_at)
-    WHERE text_body_tsv IS NULL;
+    -- The FTS worker's queue.
+    IF to_regclass('idx_messages_fts_v2_queue') IS NULL THEN
+        CREATE INDEX idx_messages_fts_v2_queue ON messages_fts_v2 (created_at)
+            WHERE text_body_tsv IS NULL;
+    END IF;
 
--- Retention pruning range scan, mirroring idx_messages_fts_sent_date: rows with a NULL
--- sent_date are deliberately never selected for pruning.
-CREATE INDEX IF NOT EXISTS idx_messages_fts_v2_sent_date ON messages_fts_v2 (sent_date)
-    WHERE sent_date IS NOT NULL;
+    -- Retention pruning range scan, mirroring idx_messages_fts_sent_date: rows with a NULL
+    -- sent_date are deliberately never selected for pruning.
+    IF to_regclass('idx_messages_fts_v2_sent_date') IS NULL THEN
+        CREATE INDEX idx_messages_fts_v2_sent_date ON messages_fts_v2 (sent_date)
+            WHERE sent_date IS NOT NULL;
+    END IF;
+END $$;
 
 -- Shape guard. Everything above is IF NOT EXISTS, which silently accepts a pre-existing
 -- table created out-of-band with a DIFFERENT shape -- a divergent PK column order or a
@@ -186,3 +210,52 @@ BEGIN
             gin_def;
     END IF;
 END $$;
+
+-- Re-apply migration 000049 (purge non-atom IMAP keywords). This migration was numbered 000049
+-- on its branch before #84 took that number, so a database that ran the branch recorded
+-- version 49 without ever running the purge, and golang-migrate would never run it there.
+-- The purge is idempotent and only touches mailboxes whose keyword registry still holds an
+-- invalid keyword, so on every other database it reads mailbox_stats once and changes
+-- nothing. See 000049 for the reasoning.
+CREATE OR REPLACE FUNCTION sora_is_valid_imap_keyword(kw text) RETURNS boolean AS $$
+    SELECT kw <> ''
+       AND kw ~ '^[\x21-\x7e]+$'
+       AND kw !~ '[()\{%*"\\\]]';
+$$ LANGUAGE sql IMMUTABLE;
+
+UPDATE message_state ms
+SET custom_flags = (
+        SELECT COALESCE(jsonb_agg(flag ORDER BY flag), '[]'::jsonb)
+        FROM jsonb_array_elements_text(ms.custom_flags) AS elem(flag)
+        WHERE sora_is_valid_imap_keyword(flag)
+    )
+WHERE ms.mailbox_id = ANY (ARRAY(
+        SELECT mstats.mailbox_id
+        FROM mailbox_stats mstats
+        WHERE mstats.custom_flags_cache IS NOT NULL
+          AND EXISTS (
+                SELECT 1 FROM jsonb_array_elements_text(mstats.custom_flags_cache) AS elem(flag)
+                WHERE left(flag, 1) <> '\' AND NOT sora_is_valid_imap_keyword(flag)
+            )
+    ))
+  AND ms.custom_flags IS NOT NULL
+  AND ms.custom_flags <> '[]'::jsonb
+  AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements_text(ms.custom_flags) AS elem(flag)
+        WHERE NOT sora_is_valid_imap_keyword(flag)
+    );
+
+UPDATE mailbox_stats
+SET custom_flags_cache = (
+        SELECT COALESCE(jsonb_agg(flag ORDER BY flag), '[]'::jsonb)
+        FROM jsonb_array_elements_text(custom_flags_cache) AS elem(flag)
+        WHERE left(flag, 1) = '\' OR sora_is_valid_imap_keyword(flag)
+    ),
+    updated_at = now()
+WHERE custom_flags_cache IS NOT NULL
+  AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements_text(custom_flags_cache) AS elem(flag)
+        WHERE left(flag, 1) <> '\' AND NOT sora_is_valid_imap_keyword(flag)
+    );
+
+DROP FUNCTION sora_is_valid_imap_keyword(text);
