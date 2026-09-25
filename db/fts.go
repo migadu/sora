@@ -124,36 +124,11 @@ func (d *Database) ProcessFTSBatch(ctx context.Context, tx pgx.Tx, limit int) (i
 			noText = append(noText, hash)
 			continue
 		}
-		// Each hash is tokenised inside its own savepoint. Without one, a single bad
-		// payload -- to_tsvector raises 22P05 "invalid byte sequence" on some inputs, which
-		// is exactly why migrations 000016/000017 exist -- aborts the whole transaction, and
-		// then the poison UPDATE meant to drain that row fails too with "current
-		// transaction is aborted". The queue would stall on that row forever.
-		if _, err := tx.Exec(ctx, "SAVEPOINT fts_hash"); err != nil {
-			return resolved, fmt.Errorf("failed to create savepoint for %s: %w", item.Hash, err)
-		}
-		n, err := d.tokenizeAndFanOut(ctx, tx, item)
+		n, err := d.indexHash(ctx, tx, hash, func() (int, error) {
+			return d.tokenizeAndFanOut(ctx, tx, item)
+		})
 		if err != nil {
-			if _, rerr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT fts_hash"); rerr != nil {
-				return resolved, fmt.Errorf("failed to roll back savepoint for %s: %w", item.Hash, rerr)
-			}
-			// Only a payload PostgreSQL cannot tokenise is poison. Anything else -- a
-			// deadlock, a lock or statement timeout, a dropped connection, a cancelled
-			// context -- says nothing about the body, and poisoning it would be permanent
-			// data loss: the text is nulled here, so the vector could never be rebuilt.
-			// Fail the batch instead; it rolls back and the rows are polled again.
-			if !isFTSDataError(err) {
-				return resolved, fmt.Errorf("failed to index %s: %w", item.Hash, err)
-			}
-			logger.Error("FTS: failed to index content_hash, marking poison", "hash", item.Hash, "err", err)
-			if perr := d.poisonFTSHashes(ctx, tx, []string{item.Hash}); perr != nil {
-				return resolved, fmt.Errorf("failed to poison %s: %w", item.Hash, perr)
-			}
-			resolved++
-			continue
-		}
-		if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT fts_hash"); err != nil {
-			return resolved, fmt.Errorf("failed to release savepoint for %s: %w", item.Hash, err)
+			return resolved, err
 		}
 		resolved += n
 	}
@@ -165,6 +140,93 @@ func (d *Database) ProcessFTSBatch(ctx context.Context, tx pgx.Tx, limit int) (i
 	resolved += n
 
 	return resolved, nil
+}
+
+// indexHash runs fn, which indexes one hash, inside its own savepoint.
+//
+// Without a savepoint a single bad payload -- to_tsvector raises 22P05 "invalid byte
+// sequence" on some inputs, which is exactly why migrations 000016/000017 exist -- aborts the
+// whole transaction, and then the poison UPDATE meant to drain that row fails too with
+// "current transaction is aborted". The queue would stall on that row forever.
+//
+// Only a payload PostgreSQL cannot tokenise is poison. Anything else -- a deadlock, a lock or
+// statement timeout, a dropped connection, a cancelled context -- says nothing about the body,
+// and poisoning it would be permanent data loss: the text is nulled when a vector is written,
+// so the vector could never be rebuilt. Such an error fails the batch instead; it rolls back
+// and the rows are polled again.
+func (d *Database) indexHash(ctx context.Context, tx pgx.Tx, hash string, fn func() (int, error)) (int, error) {
+	if _, err := tx.Exec(ctx, "SAVEPOINT fts_hash"); err != nil {
+		return 0, fmt.Errorf("failed to create savepoint for %s: %w", hash, err)
+	}
+	n, err := fn()
+	if err == nil {
+		if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT fts_hash"); err != nil {
+			return 0, fmt.Errorf("failed to release savepoint for %s: %w", hash, err)
+		}
+		return n, nil
+	}
+	if _, rerr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT fts_hash"); rerr != nil {
+		return 0, fmt.Errorf("failed to roll back savepoint for %s: %w", hash, rerr)
+	}
+	if !isFTSDataError(err) {
+		return 0, fmt.Errorf("failed to index %s: %w", hash, err)
+	}
+	logger.Error("FTS: failed to index content_hash, marking poison", "hash", hash, "err", err)
+	if perr := d.poisonFTSHashes(ctx, tx, []string{hash}); perr != nil {
+		return 0, fmt.Errorf("failed to poison %s: %w", hash, perr)
+	}
+	return 1, nil
+}
+
+// tokenizeFromPendingText indexes a hash whose polled rows carry no text, from whichever
+// row of that hash still holds pending text and is not locked by another worker: a v2 row
+// first, else the shared messages_fts row. It reports found=false when every such row is
+// held by another worker, which is then resolving the hash itself.
+//
+// Tokenising here, instead of leaving the textless rows queued until that text row's own
+// turn, matters twice over. The text may exist ONLY in messages_fts -- delivered by an
+// old-binary node during a rolling deploy, or its v2 stage failed -- and nothing polls that
+// table any more, so the rows would wait forever. And the queue is FIFO: textless rows that
+// sort ahead of their text row can fill a whole batch, which then resolves nothing, and the
+// worker stops for the tick with newer mail waiting behind them.
+func (d *Database) tokenizeFromPendingText(ctx context.Context, tx pgx.Tx, hash string) (int, bool, error) {
+	var item ftsQueueItem
+	err := tx.QueryRow(ctx, `
+		SELECT account_id, text_body FROM messages_fts_v2
+		WHERE content_hash = $1 AND text_body_tsv IS NULL AND text_body IS NOT NULL
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED
+	`, hash).Scan(&item.AccountID, &item.TextBody)
+	if err == nil {
+		item.Hash = hash
+		n, err := d.tokenizeAndFanOut(ctx, tx, item)
+		return n, true, err
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, fmt.Errorf("find pending v2 text for %s: %w", hash, err)
+	}
+
+	var text string
+	err = tx.QueryRow(ctx, `
+		SELECT text_body FROM messages_fts
+		WHERE content_hash = $1 AND text_body_tsv IS NULL AND text_body IS NOT NULL
+		FOR UPDATE SKIP LOCKED
+	`, hash).Scan(&text)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("find pending v1 text for %s: %w", hash, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE messages_fts
+		SET text_body_tsv = strip(to_tsvector('simple', $1)), text_body = NULL
+		WHERE content_hash = $2
+	`, helpers.RemoveLongTokens(text, 100), hash); err != nil {
+		return 0, true, fmt.Errorf("tokenize v1 text: %w", err)
+	}
+	n, err := d.fanOutVector(ctx, tx, hash)
+	return n, true, err
 }
 
 // tokenizeAndFanOut computes the vector for one hash exactly once and then propagates it:
@@ -267,9 +329,10 @@ func (d *Database) fanOutVector(ctx context.Context, tx pgx.Tx, hash string) (in
 // resolve:
 //
 //   - a sibling already carries a computed vector (in either table) -> copy it;
-//   - no vector yet, but a sibling still carries pending text -> LEAVE QUEUED, because that
-//     text is about to be tokenised by this or another worker. Poisoning here would blank
-//     out a message that was always perfectly indexable;
+//   - no vector yet, but a sibling still carries pending text (in either table) -> tokenise
+//     that text now and fan out (tokenizeFromPendingText), or leave the rows queued if every
+//     such sibling is held by another worker, which is indexing the hash itself. Poisoning
+//     here would blank out a message that was always perfectly indexable;
 //   - neither -> poison with an empty vector, so the queue drains instead of looping on a
 //     row nothing can ever resolve.
 func (d *Database) resolveTextlessHashes(ctx context.Context, tx pgx.Tx, hashes []string) (int, error) {
@@ -293,7 +356,7 @@ func (d *Database) resolveTextlessHashes(ctx context.Context, tx pgx.Tx, hashes 
 		return 0, fmt.Errorf("failed to classify textless fts hashes: %w", err)
 	}
 
-	var copyable, poison []string
+	var copyable, pending, poison []string
 	for rows.Next() {
 		var hash string
 		var hasVector, hasText bool
@@ -305,7 +368,7 @@ func (d *Database) resolveTextlessHashes(ctx context.Context, tx pgx.Tx, hashes 
 		case hasVector:
 			copyable = append(copyable, hash)
 		case hasText:
-			// leave queued on purpose
+			pending = append(pending, hash)
 		default:
 			poison = append(poison, hash)
 		}
@@ -319,6 +382,17 @@ func (d *Database) resolveTextlessHashes(ctx context.Context, tx pgx.Tx, hashes 
 	resolved := 0
 	for _, hash := range copyable {
 		n, err := d.fanOutVector(ctx, tx, hash)
+		if err != nil {
+			return resolved, err
+		}
+		resolved += n
+	}
+
+	for _, hash := range pending {
+		n, err := d.indexHash(ctx, tx, hash, func() (int, error) {
+			n, _, err := d.tokenizeFromPendingText(ctx, tx, hash)
+			return n, err
+		})
 		if err != nil {
 			return resolved, err
 		}
