@@ -145,8 +145,10 @@ func TestListSoftDeletedAccountsForHardDeleteSkipsAlreadyHardDeleted(t *testing.
 }
 
 // A large account is hard-deleted in bounded steps that each commit, so it drains within
-// the write deadline however big it is, and progress survives an interrupted cycle. The
-// step must also stop cold if the account was restored since it was listed.
+// the write deadline however big it is, and progress survives an interrupted cycle. Every
+// statement is bounded, the mailbox row removal included (its cascades used to rewrite
+// every message row of the mailbox in one go). The step must also stop cold if the
+// account was restored since it was listed.
 func TestHardDeleteAccountStepIsBoundedAndHonoursRestore(t *testing.T) {
 	if testing.Short() {
 		t.Skip("database integration test")
@@ -158,17 +160,12 @@ func TestHardDeleteAccountStepIsBoundedAndHonoursRestore(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		insertTestMessage(t, db, accountID, mailboxID, "INBOX", fmt.Sprintf("Message %d", i), fmt.Sprintf("<step-%d-%d@example.com>", accountID, i))
 	}
-	liveMessages := func() int {
-		var n int
-		require.NoError(t, db.GetWritePool().QueryRow(ctx,
-			`SELECT count(*) FROM messages WHERE account_id = $1 AND expunged_at IS NULL`, accountID).Scan(&n))
-		return n
-	}
-	mailboxes := func() int {
-		var n int
-		require.NoError(t, db.GetWritePool().QueryRow(ctx,
-			`SELECT count(*) FROM mailboxes WHERE account_id = $1`, accountID).Scan(&n))
-		return n
+	counts := func() (live, attached, mailboxes int) {
+		require.NoError(t, db.GetWritePool().QueryRow(ctx, `
+			SELECT (SELECT count(*) FROM messages WHERE account_id = $1 AND expunged_at IS NULL),
+			       (SELECT count(*) FROM messages WHERE account_id = $1 AND mailbox_id IS NOT NULL),
+			       (SELECT count(*) FROM mailboxes WHERE account_id = $1)`, accountID).Scan(&live, &attached, &mailboxes))
+		return
 	}
 	step := func(limit int) bool {
 		tx, err := db.GetWritePool().Begin(ctx)
@@ -182,32 +179,46 @@ func TestHardDeleteAccountStepIsBoundedAndHonoursRestore(t *testing.T) {
 
 	// Not soft-deleted: the step refuses to touch anything and reports done.
 	require.True(t, step(2))
-	require.Equal(t, 5, liveMessages(), "a live account is never hard-deleted")
-	require.Equal(t, 1, mailboxes())
+	live, _, mailboxes := counts()
+	require.Equal(t, 5, live, "a live account is never hard-deleted")
+	require.Equal(t, 1, mailboxes)
 
 	_, err := db.GetWritePool().Exec(ctx, `UPDATE accounts SET deleted_at = now() WHERE id = $1`, accountID)
 	require.NoError(t, err)
 
-	// Soft-deleted: each step expunges at most limit messages and commits.
+	// Soft-deleted: a step expunges at most limit messages and commits.
 	require.False(t, step(2))
-	require.Equal(t, 3, liveMessages(), "a step expunges at most limit messages")
-	require.Equal(t, 1, mailboxes(), "mailboxes stay until every message is expunged")
+	live, _, mailboxes = counts()
+	require.Equal(t, 3, live, "a step expunges at most limit messages")
+	require.Equal(t, 1, mailboxes, "the mailbox stays until every message is expunged and detached")
 
 	// Restored between steps: the next step stops with what is left intact.
 	_, err = db.GetWritePool().Exec(ctx, `UPDATE accounts SET deleted_at = NULL WHERE id = $1`, accountID)
 	require.NoError(t, err)
 	require.True(t, step(2))
-	require.Equal(t, 3, liveMessages(), "a restored account keeps its remaining messages")
-	require.Equal(t, 1, mailboxes())
+	live, _, mailboxes = counts()
+	require.Equal(t, 3, live, "a restored account keeps its remaining messages")
+	require.Equal(t, 1, mailboxes)
 
-	// Soft-deleted again: the remaining steps drain it and the last one removes the mailboxes.
+	// Soft-deleted again: bounded steps drain it. Each one changes at most limit rows of
+	// one kind (expunge, detach state, detach messages) or removes the emptied mailbox.
 	_, err = db.GetWritePool().Exec(ctx, `UPDATE accounts SET deleted_at = now() WHERE id = $1`, accountID)
 	require.NoError(t, err)
-	require.False(t, step(2))
-	require.False(t, step(2))
-	require.Equal(t, 0, liveMessages())
-	require.True(t, step(2), "the step after the last expunge deletes the dependents")
-	require.Equal(t, 0, mailboxes())
+	prevLive, prevAttached, _ := counts()
+	steps := 0
+	for !step(2) {
+		steps++
+		require.Less(t, steps, 20, "the hard delete must terminate")
+		live, attached, _ := counts()
+		require.LessOrEqual(t, prevLive-live, 2, "a step expunges at most limit messages")
+		require.LessOrEqual(t, prevAttached-attached, 2, "a step detaches at most limit messages")
+		prevLive, prevAttached = live, attached
+	}
+	require.GreaterOrEqual(t, steps, 4, "5 messages at limit 2 cannot drain in fewer steps")
+	live, attached, mailboxes := counts()
+	require.Equal(t, 0, live)
+	require.Equal(t, 0, attached, "every tombstone is detached before the mailbox row goes")
+	require.Equal(t, 0, mailboxes)
 	require.True(t, step(2), "an account with nothing left is done")
 }
 

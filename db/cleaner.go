@@ -985,16 +985,24 @@ func (d *Database) HardDeleteAccounts(ctx context.Context, tx pgx.Tx, accountIDs
 	return deleteAccountDependents(ctx, tx, accountIDs)
 }
 
-// HardDeleteAccountStep is one bounded step of the hard delete of a soft-deleted account:
-// expunge up to limit of its live messages and, once none is left, delete its mailboxes,
-// sieve scripts, vacation responses and pending uploads and report done. Each step
-// commits on its own, so a large account drains in a bounded number of bounded steps and
-// progress is durable; the account is safe to leave between steps because nothing can
-// log in to or deliver into a soft-deleted account.
+// HardDeleteAccountStep is one bounded step of the hard delete of a soft-deleted account.
+// It purges the account's mailboxes one at a time through PurgeMailboxStep, whose every
+// statement is bounded by limit (expunge, tombstone path stamp, message_state detach,
+// message detach, then the row), and once no mailbox is left expunges any message the
+// account still holds elsewhere (a legacy row in someone else's shared mailbox), also
+// bounded, before deleting the remaining dependents and reporting done. Each step commits
+// on its own, so a large account drains in a bounded number of bounded steps and progress
+// is durable; the account is safe to leave between steps because nothing can log in to or
+// deliver into a soft-deleted account.
+//
+// The account-wide `DELETE FROM mailboxes` this replaced was O(messages) however few were
+// live: messages.mailbox_id is ON DELETE SET NULL and message_state.mailbox_id is ON DELETE
+// CASCADE, so deleting the row rewrote every message row of the mailbox, expunged or not,
+// in one statement, which is what blew the write deadline on a big mailbox in production.
 //
 // Every step locks the accounts row and re-checks that it is still soft-deleted, so an
 // `accounts restore` that ran since the caller's (read-pool) listing stops the hard delete
-// before it touches a message; that step reports done with nothing changed. limit <= 0
+// before it touches another row; that step reports done with nothing changed. limit <= 0
 // means unlimited.
 func (d *Database) HardDeleteAccountStep(ctx context.Context, tx pgx.Tx, accountID int64, limit int) (bool, error) {
 	var softDeleted bool
@@ -1009,13 +1017,27 @@ func (d *Database) HardDeleteAccountStep(ctx context.Context, tx pgx.Tx, account
 		return true, nil
 	}
 
-	if err := lockAccountMailboxes(ctx, tx, []int64{accountID}); err != nil {
-		return false, err
+	// Deepest mailbox first, so a parent never outlives its children.
+	var mailboxID int64
+	err = tx.QueryRow(ctx, `
+		SELECT id FROM mailboxes WHERE account_id = $1
+		ORDER BY length(path) DESC, id
+		LIMIT 1
+	`, accountID).Scan(&mailboxID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("failed to pick a mailbox of account %d for hard deletion: %w", accountID, err)
+	}
+	if err == nil {
+		// The owner always holds the delete right, shared or not. Whether this step
+		// expunged, detached or removed the mailbox, more steps may be needed.
+		if _, err := d.PurgeMailboxStep(ctx, tx, mailboxID, accountID, limit); err != nil {
+			return false, fmt.Errorf("failed to purge mailbox %d of account %d: %w", mailboxID, accountID, err)
+		}
+		return false, nil
 	}
 
 	// LIMIT NULL is "no limit" in PostgreSQL, so one statement serves both the bounded
-	// and the unlimited caller. Expunge before deleting mailboxes, for the reason given
-	// in HardDeleteAccounts.
+	// and the unlimited caller.
 	var limitArg any
 	if limit > 0 {
 		limitArg = limit
@@ -1033,7 +1055,6 @@ func (d *Database) HardDeleteAccountStep(ctx context.Context, tx pgx.Tx, account
 		return false, fmt.Errorf("failed to expunge messages of account %d: %w", accountID, err)
 	}
 	if expunged.RowsAffected() > 0 {
-		// More may remain; the caller commits this step and comes back.
 		return false, nil
 	}
 
