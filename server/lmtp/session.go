@@ -69,6 +69,60 @@ type LMTPSession struct {
 	releaseConn   func() // Function to release connection from limiter
 	useMasterDB   bool   // Pin session to master DB after a write to ensure consistency
 	startTime     time.Time
+	traceID       string // X-Mizu-Trace-ID of the message in this transaction; "" until DATA has parsed it
+}
+
+// mizuTraceIDHeader is set by mizu, the SMTP front end, on every message it
+// accepts. The same id is logged as trace_id by mizu, the queue and outbound
+// delivery, so logging it here joins a delivery to the rest of its path.
+const mizuTraceIDHeader = "X-Mizu-Trace-ID"
+
+// traceIDFromHeader returns the header value if it looks like a trace id
+// (1-64 of [A-Za-z0-9._-]; mizu writes 16 hex characters), else "". The header
+// arrives with the message, so anything else is not logged.
+func traceIDFromHeader(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || len(v) > 64 {
+		return ""
+	}
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+		default:
+			return ""
+		}
+	}
+	return v
+}
+
+// withTrace adds trace_id while the current message's trace id is known.
+func (s *LMTPSession) withTrace(keysAndValues []any) []any {
+	if s.traceID == "" {
+		return keysAndValues
+	}
+	out := make([]any, 0, len(keysAndValues)+2)
+	out = append(out, keysAndValues...)
+	return append(out, "trace_id", s.traceID)
+}
+
+// The LMTP session's log methods shadow server.Session's so that every line
+// about a message, including rejections and internal errors, carries its
+// trace_id once DATA has parsed the header.
+
+func (s *LMTPSession) InfoLog(msg string, keysAndValues ...any) {
+	s.Session.InfoLog(msg, s.withTrace(keysAndValues)...)
+}
+
+func (s *LMTPSession) DebugLog(msg string, keysAndValues ...any) {
+	s.Session.DebugLog(msg, s.withTrace(keysAndValues)...)
+}
+
+func (s *LMTPSession) WarnLog(msg string, keysAndValues ...any) {
+	s.Session.WarnLog(msg, s.withTrace(keysAndValues)...)
+}
+
+func (s *LMTPSession) ErrorLog(msg string, keysAndValues ...any) {
+	s.Session.ErrorLog(msg, s.withTrace(keysAndValues)...)
 }
 
 func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
@@ -318,6 +372,10 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	}
 	defer release()
 
+	// Never carry the previous message's trace id into this one, even if this
+	// DATA fails before its header is parsed.
+	s.traceID = ""
+
 	// Check if we have a valid sender and recipient
 	if s.sender == nil || s.User == nil {
 		s.WarnLog("data command without valid sender or recipient")
@@ -418,6 +476,10 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		recordMetrics("failure")
 		return s.InternalError("failed to parse message: %v", err)
 	}
+	// From here on every log line about this message carries its trace_id.
+	// Header.Get returns the first occurrence: mizu prepends its headers, so
+	// that is the most recent mizu hop's id.
+	s.traceID = traceIDFromHeader(messageContent.Header.Get(mizuTraceIDHeader))
 
 	// Identity of the upstream queue entry, used to absorb an MTA retry of a delivery
 	// whose 250 was lost. MUST be taken over the bytes exactly as received: the trace
@@ -972,6 +1034,7 @@ func (s *LMTPSession) Reset() {
 
 	s.User = nil
 	s.sender = nil
+	s.traceID = ""
 
 	s.DebugLog("session reset")
 	recordMetrics("success")
