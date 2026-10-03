@@ -24,6 +24,30 @@ func TestGetCommandTimeout_POP3RFCFloor(t *testing.T) {
 	}
 }
 
+// TestGetCommandTimeout_IMAPRFCFloor: the default IMAP idle (autologout)
+// timeout must be at least 30 minutes per RFC 3501 §5.4, and must stay below
+// the IMAP library's hardcoded 35-minute read deadline, which would otherwise
+// close idle sessions silently before the BYE-sending timer fires. The old
+// 5-minute default cut every client that polls without IDLE at a 10 or 15
+// minute interval (Outlook, Thunderbird, iOS fetch) once per interval.
+func TestGetCommandTimeout_IMAPRFCFloor(t *testing.T) {
+	const rfcFloor = 30 * time.Minute
+	const libraryCap = 35 * time.Minute
+	for _, typ := range []string{"imap", "imap_proxy"} {
+		s := ServerConfig{Type: typ}
+		got, err := s.GetCommandTimeout()
+		if err != nil {
+			t.Fatalf("%s: GetCommandTimeout returned error: %v", typ, err)
+		}
+		if got < rfcFloor {
+			t.Errorf("%s: default command timeout %v is below the RFC 3501 §5.4 30-minute floor", typ, got)
+		}
+		if got >= libraryCap {
+			t.Errorf("%s: default command timeout %v is at or above the library's 35m read deadline", typ, got)
+		}
+	}
+}
+
 func TestRelayQueueConfig_CircuitBreakerDefaults(t *testing.T) {
 	cfg := RelayQueueConfig{}
 

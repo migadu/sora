@@ -1418,7 +1418,14 @@ func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
 		// default must not fall below that floor.
 		return 10 * time.Minute, nil
 	case "imap", "imap_proxy":
-		return 5 * time.Minute, nil // 5 minutes for IMAP
+		// RFC 3501 §5.4: an IMAP inactivity autologout timer MUST be at least
+		// 30 minutes. Clients that poll without IDLE (Outlook, Thunderbird,
+		// iOS fetch) assume it and sit quiet for 10-15 minutes between checks;
+		// the old 5-minute default closed each of them once per interval.
+		// Must stay below the IMAP library's hardcoded 35-minute read deadline,
+		// which would otherwise close idle sessions silently before this timer
+		// gets to send its BYE.
+		return 30 * time.Minute, nil
 	case "managesieve", "managesieve_proxy":
 		return 3 * time.Minute, nil // 3 minutes for ManageSieve
 	default:

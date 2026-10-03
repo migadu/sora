@@ -1119,7 +1119,7 @@ limits.max_auth_errors = 2               # Maximum authentication errors before 
 
 # --- TIMEOUT CONFIGURATION ---
 # Multi-layered timeout protection against various DoS attacks
-timeouts.command_timeout = "5m"             # Maximum idle time before disconnection (e.g., "5m", default: 5 minutes for IMAP)
+timeouts.command_timeout = "30m"            # Maximum idle time before disconnection (default: 30 minutes for IMAP, the RFC 3501 §5.4 floor)
                                             # Values >= 35m are capped for IMAP: the protocol library closes idle
                                             # authenticated connections silently at its own 35m read deadline.
                                             # Clients sitting in IDLE are exempt from this timer: the server sends
