@@ -80,7 +80,9 @@ import (
 	"log/syslog"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/migadu/sora/config"
 )
@@ -93,6 +95,55 @@ var syslogLineSanitizer = strings.NewReplacer("\n", "\\n", "\r", "\\r")
 
 func sanitizeSyslogLine(s string) string {
 	return syslogLineSanitizer.Replace(s)
+}
+
+// formatSyslogMessage renders a record for the syslog writer as
+// "<message> key=value ...", handler attrs first, then the record's own.
+// Values are rendered the way slog.TextHandler renders them, so the attribute
+// part is valid logfmt and a parser (e.g. VictoriaLogs' unpack_logfmt) splits it
+// into the right fields: error=connection refused would otherwise become
+// error=connection plus a stray key "refused". CR/LF are collapsed afterwards to
+// prevent log forging.
+func formatSyslogMessage(r slog.Record, handlerAttrs []slog.Attr) string {
+	var b strings.Builder
+	b.WriteString(r.Message)
+	writeAttr := func(a slog.Attr) {
+		b.WriteByte(' ')
+		b.WriteString(a.Key)
+		b.WriteByte('=')
+		b.WriteString(formatAttrValue(a.Value))
+	}
+	for _, a := range handlerAttrs {
+		writeAttr(a)
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		writeAttr(a)
+		return true
+	})
+	return sanitizeSyslogLine(b.String())
+}
+
+// formatAttrValue returns the value bare when it is a single logfmt token, and
+// quoted (strconv.Quote) when it is empty or contains whitespace, '=', '"' or a
+// non-printable character, matching slog.TextHandler.
+func formatAttrValue(v slog.Value) string {
+	s := v.Resolve().String()
+	if needsQuoting(s) {
+		return strconv.Quote(s)
+	}
+	return s
+}
+
+func needsQuoting(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, r := range s {
+		if r == '=' || r == '"' || unicode.IsSpace(r) || !unicode.IsPrint(r) {
+			return true
+		}
+	}
+	return false
 }
 
 var (
@@ -122,28 +173,7 @@ func (h *syslogHandler) Enabled(_ context.Context, level slog.Level) bool {
 }
 
 func (h *syslogHandler) Handle(_ context.Context, r slog.Record) error {
-	msg := r.Message
-
-	// Add attributes as key=value pairs
-	if len(h.attrs) > 0 || r.NumAttrs() > 0 {
-		var attrPairs []string
-		for _, a := range h.attrs {
-			attrPairs = append(attrPairs, fmt.Sprintf("%s=%v", a.Key, a.Value.Any()))
-		}
-		r.Attrs(func(a slog.Attr) bool {
-			attrPairs = append(attrPairs, fmt.Sprintf("%s=%v", a.Key, a.Value.Any()))
-			return true
-		})
-		if len(attrPairs) > 0 {
-			// Join attributes with spaces
-			for _, attr := range attrPairs {
-				msg = msg + " " + attr
-			}
-		}
-	}
-
-	// Collapse CR/LF (message + attrs) to prevent log forging.
-	msg = sanitizeSyslogLine(msg)
+	msg := formatSyslogMessage(r, h.attrs)
 
 	switch r.Level {
 	case slog.LevelDebug:
