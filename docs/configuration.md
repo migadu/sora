@@ -106,7 +106,7 @@ Each protocol (IMAP, LMTP, POP3, ManageSieve) has its own configuration table.
 
 All protocol servers support multi-layered timeout protection to defend against various denial-of-service attacks:
 
-*   `command_timeout`: Maximum idle time before closing an inactive connection (default: `"5m"`). This protects against clients that connect but never send commands.
+*   `command_timeout`: Maximum idle time before closing an inactive connection (default: `"30m"` for IMAP, the RFC 3501 §5.4 autologout floor; `"10m"` for POP3 per RFC 1939 §3; `"3m"` for ManageSieve). This protects against clients that connect but never send commands. For IMAP keep it under `"35m"`, the protocol library's own read deadline.
 *   `absolute_session_timeout`: Maximum total session duration regardless of activity (default: `"30m"`). This ensures connections don't stay open indefinitely.
 *   `min_bytes_per_minute`: Slowloris guard (default: `0`, disabled; `512` recommended). A session is closed after two consecutive one-minute windows in which the client sent fewer bytes than this **and no command completed** (the server produced no output). It starts two minutes after the handshake. A client that completes a small command every few seconds (a NOOP poll) is never affected however little it transfers, and a silent session is governed by `command_timeout` instead. IMAP IDLE suspends the check.
 
@@ -115,7 +115,7 @@ Example:
 [servers.imap]
 start = true
 addr = ":143"
-command_timeout = "5m"              # Close after 5 minutes of inactivity
+command_timeout = "30m"             # Close after 30 minutes of inactivity (RFC 3501 §5.4 floor)
 absolute_session_timeout = "30m"    # Maximum session duration
 min_bytes_per_minute = 512          # Require at least 512 bytes/min throughput
 ```
@@ -135,7 +135,7 @@ Sora can also act as a proxy to load balance connections to other Sora backend s
 
 Proxy servers also support the same multi-layered timeout protection as direct protocol servers:
 
-*   `command_timeout`: Maximum idle time before closing an inactive connection (default: `"5m"`).
+*   `command_timeout`: Maximum idle time before closing an inactive connection (same per-protocol defaults as the backends: `"30m"` for IMAP, `"10m"` for POP3, `"3m"` for ManageSieve).
 *   `absolute_session_timeout`: Maximum total session duration (default: `"30m"`).
 *   `min_bytes_per_minute`: Slowloris guard, same semantics as for backends (default: `0`, disabled).
 

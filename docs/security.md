@@ -162,7 +162,7 @@ All protocol servers (IMAP, POP3, ManageSieve, LMTP) and their proxy variants im
 #### Three-Layer Timeout Protection
 
 1. **Idle Timeout** (`command_timeout`): Closes connections that have no activity for the specified duration
-   - Default: `"5m"` (5 minutes)
+   - Default: `"30m"` for IMAP (RFC 3501 §5.4 autologout floor; keep below the library's 35m read deadline), `"10m"` for POP3 (RFC 1939 §3), `"3m"` for ManageSieve
    - Protects against: Clients that connect but never send commands
    - Triggered when: No read or write operations occur within the timeout period
 
@@ -183,7 +183,7 @@ All protocol servers (IMAP, POP3, ManageSieve, LMTP) and their proxy variants im
 [servers.imap]
 start = true
 addr = ":143"
-command_timeout = "5m"              # Close after 5 minutes of inactivity
+command_timeout = "30m"             # Close after 30 minutes of inactivity (RFC 3501 §5.4 floor)
 absolute_session_timeout = "30m"    # Maximum 30-minute sessions
 min_bytes_per_minute = 512          # Require at least 512 bytes/min throughput
 
@@ -198,7 +198,7 @@ min_bytes_per_minute = 512
 
 #### Important Considerations
 
-- **Set to `0`**: Uses default values (5m idle, 30m session); for `min_bytes_per_minute`, `0` disables the guard
+- **Set to `0`**: Uses default values (per-protocol idle timeout, 30m session); for `min_bytes_per_minute`, `0` disables the guard
 - **Set to `-1`**: Disables that specific protection (not recommended for production)
 - **Proxy timeout coordination**: When using proxies with backends that have PROXY protocol enabled, ensure the proxy's `command_timeout` is **longer** than the backend's `proxy_protocol_timeout` (typically 5s) to prevent the proxy from timing out while waiting for backend PROXY protocol negotiation
 
