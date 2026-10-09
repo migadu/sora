@@ -814,6 +814,10 @@ dropped), or the default set when none is configured; it is the same list the Ma
 backend advertises (a ManageSieve proxy advertises its own `supported_extensions`). `max_redirects` is how many `redirect` actions one script may execute for a
 message.
 
+`reject` and `ereject` (RFC 5429) compile and run, but Sora delivers both as a discard:
+the message is dropped and the sender receives no bounce, DSN or MDN. Scripts that
+need the sender told should use `vacation` or a client-side rule instead.
+
 **Response:** `200 OK`
 ```json
 {
@@ -840,7 +844,9 @@ message.
     "body",
     "mime",
     "foreverypart",
-    "extracttext"
+    "extracttext",
+    "reject",
+    "ereject"
   ],
   "notify_methods": [],
   "max_redirects": 5,

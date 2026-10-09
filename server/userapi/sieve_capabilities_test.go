@@ -40,12 +40,12 @@ func TestGetCapabilitiesReportsTheCompiledSet(t *testing.T) {
 		if !slices.Equal(got, sieveengine.DefaultSieveExtensions) {
 			t.Fatalf("got %v, want the default set %v", got, sieveengine.DefaultSieveExtensions)
 		}
-		for _, ext := range []string{"mime", "foreverypart", "extracttext"} {
+		for _, ext := range []string{"mime", "foreverypart", "extracttext", "reject", "ereject"} {
 			if !slices.Contains(got, ext) {
 				t.Errorf("default set lacks %q", ext)
 			}
 		}
-		if slices.Contains(got, "reject") || slices.Contains(got, "editheader") {
+		if slices.Contains(got, "editheader") {
 			t.Errorf("claims an extension delivery does not compile by default: %v", got)
 		}
 	})

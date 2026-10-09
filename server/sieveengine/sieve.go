@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/emersion/go-message"
 	msieve "github.com/migadu/go-managesieve/managesieve"
@@ -123,6 +124,14 @@ type Result struct {
 	CreateMailbox  bool              // RFC5490 - :create modifier (mailbox extension)
 	HeaderEdits    []HeaderEdit      // RFC5293 - editheader extension (addheader/deleteheader)
 	Additional     map[string]string // future-proofing
+
+	// Rejected marks an ActionDiscard that came from an RFC 5429 reject or
+	// ereject (RejectExtended). Delivery treats it as any other discard: the
+	// message is dropped and no bounce, DSN or MDN is sent. RejectReason is the
+	// script's reason after variable expansion, kept for the log.
+	Rejected       bool
+	RejectExtended bool
+	RejectReason   string
 
 	// RecordVacationSent commits the RFC 5230 :days window for this sender. It is
 	// non-nil only for ActionVacation with a VacationOracle configured, and the
@@ -366,6 +375,11 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		// Handle discard action
 		// This includes both explicit discard commands and scripts with no keep action
 		result.Action = ActionDiscard
+		// reject/ereject cancel the implicit keep too; go-sieve has already
+		// refused a reject next to keep, fileinto, redirect or vacation.
+		result.Rejected = data.Rejected
+		result.RejectExtended = data.RejectExtended
+		result.RejectReason = data.RejectReason
 	} else if vacationTriggered {
 		// Process vacation responses
 		// Per RFC 5230, vacation is an implicit keep, so we only reach here if ImplicitKeep is still true
@@ -667,4 +681,26 @@ func ApplyHeaderEdits(messageBytes []byte, edits []HeaderEdit) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// maxLoggedRejectReason bounds the reject reason in a log line. The reason is
+// script-controlled and, through variables, can carry message content.
+const maxLoggedRejectReason = 256
+
+// RejectLogFields names the action ("reject" or "ereject") and gives its
+// reason cut to maxLoggedRejectReason bytes on a rune boundary, for a log line.
+func (r Result) RejectLogFields() (action, reason string) {
+	action = "reject"
+	if r.RejectExtended {
+		action = "ereject"
+	}
+	reason = r.RejectReason
+	if len(reason) > maxLoggedRejectReason {
+		cut := maxLoggedRejectReason
+		for cut > 0 && !utf8.RuneStart(reason[cut]) {
+			cut--
+		}
+		reason = reason[:cut] + "..."
+	}
+	return action, reason
 }

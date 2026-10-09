@@ -58,6 +58,33 @@ func TestCheckScript(t *testing.T) {
 	}
 }
 
+// TestCheckScriptAcceptsRejectByDefault: scripts that require reject or
+// ereject (RFC 5429) are stored under the default extension set. Delivery
+// treats both as discard.
+func TestCheckScriptAcceptsRejectByDefault(t *testing.T) {
+	addr, err := server.NewAddress("test@example.com")
+	if err != nil {
+		t.Fatalf("NewAddress failed: %v", err)
+	}
+	session := &ManageSieveSession{
+		Session:       server.Session{User: server.NewUser(addr, 123)},
+		authenticated: true,
+		ctx:           context.Background(),
+		server: &ManageSieveServer{
+			maxScriptSize:       1024,
+			supportedExtensions: DefaultEnabledExtensions,
+		},
+	}
+	for _, script := range []string{
+		"require [\"fileinto\", \"reject\"];\nif header :contains \"subject\" \"ads\" { reject \"no\"; stop; }\nfileinto \"Junk\";",
+		"require \"ereject\";\nereject \"no\";",
+	} {
+		if _, err := session.CheckScript(context.Background(), script); err != nil {
+			t.Errorf("CheckScript(%q) = %v; want nil", script, err)
+		}
+	}
+}
+
 // TestHaveSpaceAdvisoryWithoutDB verifies HAVESPACE stays advisory when the
 // DB layer is unavailable (unit-test construction): only the library-side
 // size bound applies, so the session reports space optimistically.

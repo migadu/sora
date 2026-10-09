@@ -66,6 +66,8 @@ func TestDefaultExtensions(t *testing.T) {
 		"mime",
 		"foreverypart",
 		"extracttext",
+		"reject",
+		"ereject",
 	}
 
 	for _, expectedExt := range configExampleExtensions {
