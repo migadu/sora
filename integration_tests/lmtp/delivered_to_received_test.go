@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/pkg/resilient"
 	lmtpserver "github.com/migadu/sora/server/lmtp"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
@@ -26,6 +27,14 @@ func setupLMTPForDelivery(t *testing.T, opts ...lmtpserver.LMTPServerOptions) (c
 
 	rdb := common.SetupTestDatabase(t)
 	account := common.CreateTestAccount(t, rdb)
+	lmtpAddr, tempDir := startLMTPForDelivery(t, rdb, opts...)
+	return account, lmtpAddr, tempDir
+}
+
+// startLMTPForDelivery is the server half of setupLMTPForDelivery, for tests that create
+// their own account on rdb. It returns the LMTP listen address and the uploader temp dir.
+func startLMTPForDelivery(t *testing.T, rdb *resilient.ResilientDatabase, opts ...lmtpserver.LMTPServerOptions) (string, string) {
+	t.Helper()
 
 	tempDir := t.TempDir()
 	uploaderInstance, err := uploader.NewWithS3Interface(
@@ -55,7 +64,7 @@ func setupLMTPForDelivery(t *testing.T, opts ...lmtpserver.LMTPServerOptions) (c
 	go func() { lmtpSrv.Start(errChan) }()
 	time.Sleep(200 * time.Millisecond)
 
-	return account, lmtpAddr, tempDir
+	return lmtpAddr, tempDir
 }
 
 // deliverLMTPRaw runs one LMTP transaction and returns the per-recipient response that
