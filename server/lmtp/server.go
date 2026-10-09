@@ -361,6 +361,12 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// Enable custom RCPT TO parameters like XRCPTFORWARD
 	s.EnableRCPTExtensions = true
 
+	// SMTPUTF8 (RFC 6531): advertise the extension and accept its MAIL parameter, so an
+	// internationalized envelope (non-ASCII local part, U-label domain) is delivered
+	// instead of bounced with a syntax error. server.NewAddress validates the UTF-8 of
+	// every address; go-smtp only parses the delimiters around it.
+	s.EnableSMTPUTF8 = true
+
 	// Connection admission (NewSession): LMTP is internal-only, so when trusted_networks
 	// is unset we default to private networks. This gate intentionally keeps the RFC1918
 	// default — emptying the list must NOT silently reject all delivery.

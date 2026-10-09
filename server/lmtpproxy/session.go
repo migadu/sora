@@ -66,6 +66,14 @@ type Session struct {
 	// RSET or QUIT (see loseBackend).
 	acceptedRcpts int
 	txPoisoned    bool
+
+	// smtputf8 marks the current transaction as internationalized (RFC 6531): the MTA
+	// gave the SMTPUTF8 MAIL parameter, or sent a non-ASCII address without it. Cleared
+	// with the rest of the transaction state.
+	smtputf8 bool
+	// backendSMTPUTF8 records whether the connected backend advertised SMTPUTF8 in its
+	// LHLO reply; the parameter is forwarded only to a backend that did (backendMailFrom).
+	backendSMTPUTF8 bool
 }
 
 // newSession creates a new LMTP proxy session.
@@ -228,6 +236,7 @@ func (s *Session) handleConnection() {
 				}
 				s.sendResponse("250-ENHANCEDSTATUSCODES")
 				s.sendResponse("250-8BITMIME")
+				s.sendResponse("250-SMTPUTF8")
 				s.sendResponse("250 DSN")
 			} else {
 				s.sendResponse(fmt.Sprintf("250 %s", s.server.hostname))
@@ -245,12 +254,13 @@ func (s *Session) handleConnection() {
 			s.resetTransaction()
 			s.sender = sender
 			s.mailFromReceived = true
+			s.smtputf8 = hasSMTPUTF8Param(args) || !server.IsASCII(sender)
 			// A connected backend must learn the new sender too (RFC 5321 §4.1.1.2: MAIL
 			// after a completed or reset transaction), or it would deliver with the
 			// previous transaction's Return-Path. Its answer is the answer; a backend
 			// lost here is harmless — the next RCPT reconnects and re-sends MAIL FROM.
 			if s.backendConn != nil {
-				if reply, ok := s.forwardSimpleCommand(fmt.Sprintf("MAIL FROM:<%s>", sender)); ok {
+				if reply, ok := s.forwardSimpleCommand(s.backendMailFrom()); ok {
 					if !strings.HasPrefix(reply, "2") {
 						s.mailFromReceived = false
 					}
@@ -280,6 +290,9 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			s.DebugLog("Extracted recipient address", "to", to)
+			if !server.IsASCII(to) {
+				s.smtputf8 = true
+			}
 
 			// The backend was lost after it accepted a recipient of this transaction:
 			// the MTA must retry the whole message (451). Never 503 — it would bounce
@@ -1109,6 +1122,7 @@ func (s *Session) connectToBackend() error {
 
 	// Read LHLO response (bounded lines and line count so a misbehaving backend
 	// cannot keep us in this loop or grow memory without limit)
+	s.backendSMTPUTF8 = false
 	for lines := 0; ; lines++ {
 		if lines >= maxLHLOResponseLines {
 			s.backendConn.Close()
@@ -1121,6 +1135,9 @@ func (s *Session) connectToBackend() error {
 		}
 
 		s.DebugLog("Backend LHLO response", "response", strings.TrimRight(response, "\r"))
+		if isSMTPUTF8Capability(response) {
+			s.backendSMTPUTF8 = true
+		}
 
 		// Check if this is the last line (no hyphen after status code)
 		if len(response) >= 4 && response[3] != '-' {
@@ -1211,6 +1228,7 @@ func (s *Session) connectToBackend() error {
 		s.backendWriter.Flush()
 
 		// Read LHLO response again (bounded lines and line count)
+		s.backendSMTPUTF8 = false
 		for lines := 0; ; lines++ {
 			if lines >= maxLHLOResponseLines {
 				s.backendConn.Close()
@@ -1223,6 +1241,9 @@ func (s *Session) connectToBackend() error {
 			}
 
 			s.DebugLog("Backend LHLO response after STARTTLS", "response", strings.TrimRight(response, "\r"))
+			if isSMTPUTF8Capability(response) {
+				s.backendSMTPUTF8 = true
+			}
 
 			// Check if this is the last line
 			if len(response) >= 4 && response[3] != '-' {
@@ -1257,7 +1278,7 @@ func (s *Session) connectToBackend() error {
 
 	// Send MAIL FROM to backend
 	if s.mailFromReceived {
-		mailCmd := fmt.Sprintf("MAIL FROM:<%s>\r\n", s.sender)
+		mailCmd := s.backendMailFrom() + "\r\n"
 		_, err = s.backendWriter.WriteString(mailCmd)
 		if err != nil {
 			s.backendConn.Close()
@@ -1582,6 +1603,36 @@ func findParameter(args []string, prefix string) (string, bool) {
 	return "", false
 }
 
+// hasSMTPUTF8Param reports whether the MAIL FROM arguments carry the SMTPUTF8 parameter
+// (RFC 6531 §3.4; it takes no value).
+func hasSMTPUTF8Param(args []string) bool {
+	for _, arg := range args {
+		if strings.EqualFold(arg, "SMTPUTF8") {
+			return true
+		}
+	}
+	return false
+}
+
+// isSMTPUTF8Capability reports whether an LHLO reply line ("250-SMTPUTF8" or
+// "250 SMTPUTF8") advertises the extension.
+func isSMTPUTF8Capability(line string) bool {
+	return len(line) > 4 && strings.EqualFold(strings.TrimSpace(line[4:]), "SMTPUTF8")
+}
+
+// backendMailFrom is the MAIL command sent to the backend for the current transaction.
+// The SMTPUTF8 parameter goes with it only when the backend advertised the extension
+// (RFC 6531 §3.2): a backend without it gets the plain command and, if the envelope is
+// in fact non-ASCII, decides for itself — sora backends accept it — which is what keeps
+// a mixed-version deployment delivering while the backends are upgraded.
+func (s *Session) backendMailFrom() string {
+	cmd := "MAIL FROM:<" + s.sender + ">"
+	if s.smtputf8 && s.backendSMTPUTF8 {
+		cmd += " SMTPUTF8"
+	}
+	return cmd
+}
+
 // --- Transaction state (the backend's view of a transaction must stay the MTA's view) ---
 
 // resetTransaction forgets the current mail transaction: on MAIL (a new one), RSET, and
@@ -1592,6 +1643,7 @@ func (s *Session) resetTransaction() {
 	s.mailFromReceived = false
 	s.acceptedRcpts = 0
 	s.txPoisoned = false
+	s.smtputf8 = false
 }
 
 // loseBackend drops the backend connection. If the backend had already accepted a

@@ -13,6 +13,7 @@ import (
 	soralogger "github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/server"
 )
 
 // RelayError wraps an error with information about whether it's permanent or temporary.
@@ -175,7 +176,10 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 		}
 	}
 
-	if relayErr = c.Mail(from, nil); relayErr != nil {
+	// RFC 6531 §3.2: a non-ASCII envelope needs the SMTPUTF8 parameter. go-smtp adds it
+	// when the relay advertised the extension and refuses to send the transaction otherwise.
+	mailOpts := &smtp.MailOptions{UTF8: !server.IsASCII(from) || !server.IsASCII(to)}
+	if relayErr = c.Mail(from, mailOpts); relayErr != nil {
 		// Classify SMTP error (5xx = permanent, 4xx = temporary)
 		return &RelayError{Err: relayErr, Permanent: IsPermanentError(relayErr)}
 	}

@@ -4,17 +4,26 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
+
+	"golang.org/x/net/idna"
 )
 
-// RFC 5321/5322 compliant email validation regex (dot-string local part).
-// The character class is the full set of atext (RFC 5322 §3.2.3):
+// atextClass is the body of a character class matching one atext character of a
+// dot-string local part. It is the full ASCII set of RFC 5322 §3.2.3:
 //
 //	"!" "#" "$" "%" "&" "'" "*" "+" "-" "/" "=" "?" "^" "_" "`" "{" "|" "}" "~"
 //
-// plus ALPHA and DIGIT. In particular "/" and "`" (\x60) must be allowed:
-// many ESPs use base64/VERP-style reverse-paths (e.g. Constant Contact) whose
-// local part contains "/", and rejecting them bounces legitimate mail.
-const LocalPartRegex = `^(?i)(?:[a-z0-9!#$%&'*+/=?^_\x60\{\|\}~-])+(?:\.(?:[a-z0-9!#$%&'*+/=?^_\x60\{\|\}~-])+)*$`
+// plus ALPHA and DIGIT — in particular "/" and "`" (\x60) must be allowed: many ESPs use
+// base64/VERP-style reverse-paths (e.g. Constant Contact) whose local part contains "/",
+// and rejecting them bounces legitimate mail — extended with UTF8-non-ascii as RFC 6531
+// §3.3 does (SMTPUTF8): every non-ASCII code point is atext, while the ASCII graphics and
+// controls RFC 5321 excludes stay excluded. NewAddress rejects malformed UTF-8 before the
+// regex runs; Go's regexp would otherwise match the replacement rune for each bad byte.
+const atextClass = `a-z0-9!#$%&'*+/=?^_\x60\{\|\}~\x{80}-\x{10FFFF}-`
+
+// LocalPartRegex is the RFC 5321 Dot-string with the RFC 6531 atext extension.
+const LocalPartRegex = `^(?i)(?:[` + atextClass + `])+(?:\.(?:[` + atextClass + `])+)*$`
 const DomainNameRegex = `^(?i)(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`
 
 // Precompiled once at package init — NewAddress is on the hot path for every
@@ -121,6 +130,12 @@ func NewAddress(input string) (Address, error) {
 	// Normalize: trim (but don't lowercase yet - need to preserve suffix case)
 	input = strings.TrimSpace(input)
 
+	// RFC 6531 admits UTF-8 and nothing else beyond ASCII; checked before anything
+	// else because strings.ToLower rewrites invalid bytes.
+	if !utf8.ValidString(input) {
+		return Address{}, fmt.Errorf("address is not valid UTF-8: %q", input)
+	}
+
 	// Check for internal whitespace (after trimming)
 	if strings.ContainsAny(input, " \t\n\r") {
 		return Address{}, fmt.Errorf("address contains whitespace: '%s'", input)
@@ -181,6 +196,17 @@ func NewAddress(input string) (Address, error) {
 		return Address{}, fmt.Errorf("unacceptable local part: '%s'", localPart)
 	}
 
+	// RFC 6531 §3.2: an internationalized domain name (U-label) is looked up and stored in
+	// its A-label form, so fold it here; everything past this point sees an ASCII domain.
+	// The ASCII path is untouched: IDNA mapping applies only to a domain that needs it.
+	if !IsASCII(domain) {
+		ascii, err := idna.Lookup.ToASCII(domain)
+		if err != nil {
+			return Address{}, fmt.Errorf("unacceptable domain: '%s': %w", domain, err)
+		}
+		domain = ascii
+	}
+
 	// Validate domain length (RFC 5321)
 	if len(domain) > MaxDomainLength {
 		return Address{}, fmt.Errorf("domain exceeds maximum length of %d characters: '%s'", MaxDomainLength, domain)
@@ -203,7 +229,9 @@ func NewAddress(input string) (Address, error) {
 		detail = localPart[plusIndex+1:]
 	}
 
-	// Reconstruct full address with lowercased email part and case-preserved suffix
+	// Reconstruct full address with lowercased email part (and the domain in its
+	// A-label form) and case-preserved suffix
+	emailPart = localPart + "@" + domain
 	var fullAddr string
 	if suffix != "" {
 		fullAddr = emailPart + "@" + suffix
@@ -218,4 +246,15 @@ func NewAddress(input string) (Address, error) {
 		detail:      detail,
 		suffix:      suffix,
 	}, nil
+}
+
+// IsASCII reports whether s consists of 7-bit characters only. An envelope address that
+// is not ASCII makes the mail transaction an internationalized one (RFC 6531).
+func IsASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
 }

@@ -70,6 +70,12 @@ type LMTPSession struct {
 	useMasterDB   bool   // Pin session to master DB after a write to ensure consistency
 	startTime     time.Time
 	traceID       string // X-Mizu-Trace-ID of the message in this transaction; "" until DATA has parsed it
+
+	// smtputf8 marks an internationalized transaction (RFC 6531): the client gave the
+	// SMTPUTF8 MAIL parameter, or a non-ASCII address was accepted without it (an MTA
+	// that does not negotiate the extension still gets its mail delivered, as with
+	// Postfix strict_smtputf8=no). It selects the UTF8LMTP keyword of the Received: trace.
+	smtputf8 bool
 }
 
 // mizuTraceIDHeader is set by mizu, the SMTP front end, on every message it
@@ -171,6 +177,7 @@ func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOpti
 	defer release()
 
 	s.sender = &fromAddress
+	s.smtputf8 = (opts != nil && opts.UTF8) || !server.IsASCII(from)
 
 	recordMetrics("success")
 	return nil
@@ -321,6 +328,9 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 	}
 	defer release()
 	s.User = server.NewUser(primaryAddr, AccountID) // Always use primary address
+	if !server.IsASCII(to) {
+		s.smtputf8 = true
+	}
 
 	// Construct envelope recipient address for Sieve:
 	// - If original recipient has +detail, preserve it but use primary address domain
@@ -522,9 +532,14 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		} else if s.conn != nil {
 			helo = s.conn.Hostname()
 		}
+		// RFC 6531 §3.7.3: the trace of an internationalized transaction names UTF8LMTP.
+		withProtocol := "LMTP"
+		if s.smtputf8 {
+			withProtocol = "UTF8LMTP"
+		}
 		received := helpers.BuildReceivedHeader(
 			helpers.ReceivedFrom(helo, s.RemoteIP),
-			s.backend.hostname, "LMTP", deliveredTo, idgen.New(), time.Now().Format(time.RFC1123Z))
+			s.backend.hostname, withProtocol, deliveredTo, idgen.New(), time.Now().Format(time.RFC1123Z))
 		fullMessageBytes = helpers.PrependRawHeader(fullMessageBytes, received)
 		fullMessageBytes = helpers.PrependHeaderLine(fullMessageBytes, helpers.DeliveredToHeader, deliveredTo)
 		if messageContent, err = server.ParseMessage(bytes.NewReader(fullMessageBytes)); err != nil {
@@ -1037,6 +1052,7 @@ func (s *LMTPSession) Reset() {
 	s.User = nil
 	s.sender = nil
 	s.traceID = ""
+	s.smtputf8 = false
 
 	s.DebugLog("session reset")
 	recordMetrics("success")
