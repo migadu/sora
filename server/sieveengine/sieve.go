@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/mail"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
@@ -320,7 +321,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 	if err := timeoutCtx.Err(); err != nil {
 		return Result{Action: ActionKeep}, err
 	}
-	err := e.script.Execute(timeoutCtx, data) // Pass the evaluation context
+	err := runScript(timeoutCtx, e.script, data)
 	if err != nil {
 		return Result{Action: ActionKeep}, err
 	}
@@ -704,3 +705,30 @@ func (r Result) RejectLogFields() (action, reason string) {
 	}
 	return action, reason
 }
+
+// scriptRunner is what runScript needs of a compiled script; *sieve.Script
+// satisfies it, and a test can stand in a script that panics.
+type scriptRunner interface {
+	Execute(ctx context.Context, d *interp.RuntimeData) error
+}
+
+// runScript executes a script and turns a panic in the interpreter into an
+// evaluation error, so delivery keeps the message as it does for any other
+// Sieve error. Without this the panic would unwind through the LMTP command
+// handler, which answers 421 and closes the connection, and the MTA would
+// retry the same message into the same panic until it expired and bounced.
+func runScript(ctx context.Context, script scriptRunner, data *interp.RuntimeData) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			if len(stack) > maxPanicStackBytes {
+				stack = stack[:maxPanicStackBytes]
+			}
+			err = fmt.Errorf("sieve script panicked: %v\n%s", r, stack)
+		}
+	}()
+	return script.Execute(ctx, data)
+}
+
+// maxPanicStackBytes bounds the stack kept in a script panic's error.
+const maxPanicStackBytes = 4096
