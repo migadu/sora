@@ -192,6 +192,10 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	// Process result
 	switch result.Action {
 	case sieveengine.ActionDiscard:
+		if result.Rejected {
+			action, reason := result.RejectLogFields()
+			s.DeliveryCtx.Logger.Log("Sieve %s treated as discard, no bounce sent: %q", action, reason)
+		}
 		outcome.MailboxName = ""
 		outcome.Discarded = true
 		return outcome, nil

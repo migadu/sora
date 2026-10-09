@@ -639,19 +639,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			// Set the result from the default script
 			result = defaultResult
 
-			// Log more details about the action
-			switch result.Action {
-			case sieveengine.ActionFileInto:
-				s.InfoLog("default sieve fileinto", "mailbox", result.Mailbox, "copy", result.Copy, "create", result.CreateMailbox)
-			case sieveengine.ActionRedirect:
-				s.InfoLog("default sieve redirect", "redirect_to", result.RedirectTo, "copy", result.Copy)
-			case sieveengine.ActionDiscard:
-				s.InfoLog("default sieve discard")
-			case sieveengine.ActionVacation:
-				s.InfoLog("default sieve vacation response triggered")
-			case sieveengine.ActionKeep:
-				s.InfoLog("default sieve keep")
-			}
+			s.logSieveAction("default", result)
 		}
 	} else {
 		s.DebugLog("no default sieve executor available")
@@ -694,19 +682,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 					// User script has an explicit action, override the default
 					result = userResult
 
-					// Log more details about the action
-					switch result.Action {
-					case sieveengine.ActionFileInto:
-						s.InfoLog("user sieve fileinto", "mailbox", result.Mailbox, "copy", result.Copy, "create", result.CreateMailbox)
-					case sieveengine.ActionRedirect:
-						s.InfoLog("user sieve redirect", "redirect_to", result.RedirectTo, "copy", result.Copy)
-					case sieveengine.ActionDiscard:
-						s.InfoLog("user sieve discard")
-					case sieveengine.ActionVacation:
-						s.InfoLog("user sieve vacation response triggered")
-					case sieveengine.ActionKeep:
-						s.InfoLog("user sieve explicit keep")
-					}
+					s.logSieveAction("user", result)
 				}
 			}
 		}
@@ -716,6 +692,16 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		} else {
 			s.DebugLog("no active script found, using default script result")
 		}
+	}
+
+	// A discard, which an RFC 5429 reject is delivered as, stores nothing: decide
+	// it before header edits and before the body is staged for upload, where the
+	// abandoned file would sit until the orphan sweep and count against the
+	// staging limit.
+	if result.Action == sieveengine.ActionDiscard {
+		s.InfoLog("sieve message discarded")
+		recordMetrics("success")
+		return nil
 	}
 
 	// Apply header edits if any (RFC 5293 - editheader extension)
@@ -833,11 +819,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	}
 
 	switch result.Action {
-	case sieveengine.ActionDiscard:
-		s.InfoLog("sieve message discarded")
-		recordMetrics("success")
-		return nil
-
 	case sieveengine.ActionFileInto:
 		mailboxName = result.Mailbox
 		if result.Copy {
@@ -1014,6 +995,27 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	recordMetrics("success")
 	return nil
+}
+
+// logSieveAction records what the default or the user script decided.
+func (s *LMTPSession) logSieveAction(source string, result sieveengine.Result) {
+	switch result.Action {
+	case sieveengine.ActionFileInto:
+		s.InfoLog(source+" sieve fileinto", "mailbox", result.Mailbox, "copy", result.Copy, "create", result.CreateMailbox)
+	case sieveengine.ActionRedirect:
+		s.InfoLog(source+" sieve redirect", "redirect_to", result.RedirectTo, "copy", result.Copy)
+	case sieveengine.ActionDiscard:
+		if result.Rejected {
+			action, reason := result.RejectLogFields()
+			s.InfoLog(source+" sieve "+action+", discarded without a bounce", "reason", reason)
+		} else {
+			s.InfoLog(source + " sieve discard")
+		}
+	case sieveengine.ActionVacation:
+		s.InfoLog(source + " sieve vacation response triggered")
+	case sieveengine.ActionKeep:
+		s.InfoLog(source + " sieve keep")
+	}
 }
 
 func (s *LMTPSession) Reset() {

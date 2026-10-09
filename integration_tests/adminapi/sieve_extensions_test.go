@@ -4,11 +4,13 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/server/sieveengine"
 )
@@ -61,6 +63,9 @@ func deliverMessageWithScript(t *testing.T, server *HTTPAPITestServer, script, m
 		WHERE m.account_id = $1 AND m.expunged_at IS NULL
 		ORDER BY m.id DESC LIMIT 1
 	`, accountID).Scan(&mailboxName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "" // discarded
+	}
 	if err != nil {
 		t.Fatalf("delivered message row: %v", err)
 	}

@@ -53,7 +53,7 @@
 //   - redirect: Forward to another address
 //   - keep: Keep in INBOX (default)
 //   - discard: Delete message
-//   - reject: Reject with error message
+//   - reject, ereject: RFC 5429; treated as discard, so no bounce is ever sent
 //   - stop: Stop script execution
 //   - vacation: Send auto-reply
 //

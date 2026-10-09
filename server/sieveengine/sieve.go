@@ -5,9 +5,11 @@ import (
 	"context"
 	"fmt"
 	"net/mail"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/emersion/go-message"
 	msieve "github.com/migadu/go-managesieve/managesieve"
@@ -123,6 +125,14 @@ type Result struct {
 	CreateMailbox  bool              // RFC5490 - :create modifier (mailbox extension)
 	HeaderEdits    []HeaderEdit      // RFC5293 - editheader extension (addheader/deleteheader)
 	Additional     map[string]string // future-proofing
+
+	// Rejected marks an ActionDiscard that came from an RFC 5429 reject or
+	// ereject (RejectExtended). Delivery treats it as any other discard: the
+	// message is dropped and no bounce, DSN or MDN is sent. RejectReason is the
+	// script's reason after variable expansion, kept for the log.
+	Rejected       bool
+	RejectExtended bool
+	RejectReason   string
 
 	// RecordVacationSent commits the RFC 5230 :days window for this sender. It is
 	// non-nil only for ActionVacation with a VacationOracle configured, and the
@@ -311,7 +321,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 	if err := timeoutCtx.Err(); err != nil {
 		return Result{Action: ActionKeep}, err
 	}
-	err := e.script.Execute(timeoutCtx, data) // Pass the evaluation context
+	err := runScript(timeoutCtx, e.script, data)
 	if err != nil {
 		return Result{Action: ActionKeep}, err
 	}
@@ -366,6 +376,11 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		// Handle discard action
 		// This includes both explicit discard commands and scripts with no keep action
 		result.Action = ActionDiscard
+		// reject/ereject cancel the implicit keep too; go-sieve has already
+		// refused a reject next to keep, fileinto, redirect or vacation.
+		result.Rejected = data.Rejected
+		result.RejectExtended = data.RejectExtended
+		result.RejectReason = data.RejectReason
 	} else if vacationTriggered {
 		// Process vacation responses
 		// Per RFC 5230, vacation is an implicit keep, so we only reach here if ImplicitKeep is still true
@@ -668,3 +683,52 @@ func ApplyHeaderEdits(messageBytes []byte, edits []HeaderEdit) ([]byte, error) {
 
 	return buf.Bytes(), nil
 }
+
+// maxLoggedRejectReason bounds the reject reason in a log line. The reason is
+// script-controlled and, through variables, can carry message content.
+const maxLoggedRejectReason = 256
+
+// RejectLogFields names the action ("reject" or "ereject") and gives its
+// reason cut to maxLoggedRejectReason bytes on a rune boundary, for a log line.
+func (r Result) RejectLogFields() (action, reason string) {
+	action = "reject"
+	if r.RejectExtended {
+		action = "ereject"
+	}
+	reason = r.RejectReason
+	if len(reason) > maxLoggedRejectReason {
+		cut := maxLoggedRejectReason
+		for cut > 0 && !utf8.RuneStart(reason[cut]) {
+			cut--
+		}
+		reason = reason[:cut] + "..."
+	}
+	return action, reason
+}
+
+// scriptRunner is what runScript needs of a compiled script; *sieve.Script
+// satisfies it, and a test can stand in a script that panics.
+type scriptRunner interface {
+	Execute(ctx context.Context, d *interp.RuntimeData) error
+}
+
+// runScript executes a script and turns a panic in the interpreter into an
+// evaluation error, so delivery keeps the message as it does for any other
+// Sieve error. Without this the panic would unwind through the LMTP command
+// handler, which answers 421 and closes the connection, and the MTA would
+// retry the same message into the same panic until it expired and bounced.
+func runScript(ctx context.Context, script scriptRunner, data *interp.RuntimeData) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			if len(stack) > maxPanicStackBytes {
+				stack = stack[:maxPanicStackBytes]
+			}
+			err = fmt.Errorf("sieve script panicked: %v\n%s", r, stack)
+		}
+	}()
+	return script.Execute(ctx, data)
+}
+
+// maxPanicStackBytes bounds the stack kept in a script panic's error.
+const maxPanicStackBytes = 4096

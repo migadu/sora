@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/pkg/resilient"
 )
 
 // TestLMTP_SieveBodyAndSizeSeeTheStoredMessage pins what the Sieve body (RFC 5173) and
@@ -47,10 +48,29 @@ func TestLMTP_SieveBodyAndSizeSeeTheStoredMessage(t *testing.T) {
 				t.Fatalf("delivery not accepted: %s", resp)
 			}
 
+			if tc.Mailbox == "" {
+				if n := countForAccount(t, rdb, accountID); n != 0 {
+					t.Errorf("script %q: want the message discarded, found %d stored (INBOX holds %d)",
+						tc.Script, n, countInMailbox(t, rdb, accountID, "INBOX"))
+				}
+				return
+			}
 			if n := countInMailbox(t, rdb, accountID, tc.Mailbox); n != 1 {
 				t.Errorf("script %q: want the message in %s, found %d there (INBOX holds %d)",
 					tc.Script, tc.Mailbox, n, countInMailbox(t, rdb, accountID, "INBOX"))
 			}
 		})
 	}
+}
+
+// countForAccount counts the stored, unexpunged messages of an account in any mailbox.
+func countForAccount(t *testing.T, rdb *resilient.ResilientDatabase, accountID int64) int {
+	t.Helper()
+	var n int
+	if err := rdb.QueryRowWithRetry(context.Background(),
+		`SELECT COUNT(*) FROM messages WHERE account_id = $1 AND expunged_at IS NULL`, accountID,
+	).Scan(&n); err != nil {
+		t.Fatalf("count messages: %v", err)
+	}
+	return n
 }

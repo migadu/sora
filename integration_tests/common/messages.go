@@ -58,7 +58,7 @@ type SieveRawMessageCase struct {
 	Name    string
 	Script  string
 	Message func(to, subject string) string
-	Mailbox string // where the delivery must land
+	Mailbox string // where the delivery must land; "" means nowhere (discarded)
 }
 
 // SieveRawMessageCases is shared by every ingress path, so LMTP and Admin API delivery
@@ -89,6 +89,14 @@ func SieveRawMessageCases() []SieveRawMessageCase {
 			Script:  `require ["body", "fileinto"]; if body :content "application/pdf" :contains "" { fileinto "Archive"; }`,
 			Message: invoice,
 			Mailbox: "Archive",
+		},
+		{
+			// RFC 5429 reject is delivered as a discard, with no bounce; the rest of
+			// the script compiles and runs (a script requiring reject used to fail whole).
+			Name:    "reject discards without a bounce",
+			Script:  `require ["fileinto", "reject"]; if size :over 100K { reject "too big"; stop; } fileinto "Archive";`,
+			Message: invoice,
+			Mailbox: "",
 		},
 		{
 			Name:    "size counts the attachment",
