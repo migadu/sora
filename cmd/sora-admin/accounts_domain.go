@@ -6,9 +6,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/migadu/sora/db"
-	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server/cleaner"
 	"github.com/migadu/sora/storage"
 )
 
@@ -22,6 +21,12 @@ func purgeDomain(ctx context.Context, cfg AdminConfig, domain string) error {
 	}
 	defer rdb.Close()
 
+	return purgeDomainWithStorage(ctx, cfg, rdb, domain, nil)
+}
+
+// purgeDomainWithStorage is purgeDomain on a given database and storage. If s3Storage is
+// nil, each account's purge creates it from cfg.
+func purgeDomainWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilient.ResilientDatabase, domain string, s3Storage objectStorage) error {
 	fmt.Printf("Scanning for accounts in domain: %s\n\n", domain)
 
 	// Get all accounts for this domain
@@ -66,7 +71,7 @@ func purgeDomain(ctx context.Context, cfg AdminConfig, domain string) error {
 		}
 
 		// Purge this account (reuse the purge logic)
-		err = purgeAccount(ctx, cfg, rdb, acct.AccountID, acct.PrimaryEmail)
+		err = purgeAccountWithStorage(ctx, cfg, rdb, acct.AccountID, acct.PrimaryEmail, s3Storage)
 		if err != nil {
 			fmt.Printf("[FAIL] Failed to purge account: %v\n\n", err)
 			failedCount++
@@ -130,167 +135,84 @@ func purgeAccount(ctx context.Context, cfg AdminConfig, rdb *resilient.Resilient
 	return purgeAccountWithStorage(ctx, cfg, rdb, accountID, email, nil)
 }
 
-// purgeAccountWithStorage purges a single account with optional pre-configured storage
-// If s3Storage is nil, it will be created from cfg
+// purgeAccountWithStorage purges a single account with the server's own purge (see
+// cleaner.PurgeAccount): it takes the account out of service, then deletes its
+// mailboxes, messages, S3 objects, search index, credentials and the account itself. A
+// failure leaves the account out of service with its address, and running the command
+// again resumes it. If s3Storage is nil, it is created from cfg.
 func purgeAccountWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilient.ResilientDatabase, accountID int64, email string, s3Storage objectStorage) error {
 	fmt.Printf("Purging all data for account: %s\n", email)
 
-	// Initialize S3 storage if not provided
 	if s3Storage == nil {
-		useSSL := !cfg.S3.DisableTLS
-		s3Timeout, err := cfg.S3.GetTimeout()
+		realS3, err := newPurgeStorage(cfg)
 		if err != nil {
-			return fmt.Errorf("failed to parse S3 timeout: %w", err)
+			return err
 		}
-		realS3, err := storage.New(
-			cfg.S3.Endpoint,
-			cfg.S3.AccessKey,
-			cfg.S3.SecretKey,
-			cfg.S3.Bucket,
-			useSSL,
-			false, // debug mode
-			s3Timeout,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to initialize S3 storage: %w", err)
-		}
-
-		// Enable encryption if configured
-		if cfg.S3.Encrypt {
-			if err := realS3.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
-				return fmt.Errorf("failed to enable S3 encryption: %w", err)
-			}
-		}
-
 		s3Storage = realS3
 	}
 
-	// Step 0: Take the account out of service first. Until it is marked deleted, mail
-	// keeps arriving (LMTP) and users keep logging in, and the purge below would chase
-	// live rows forever (see the stall guard in the batch loop).
-	if err := rdb.DeleteAccountWithRetry(ctx, email); err != nil {
-		fmt.Printf("Warning: could not mark the account deleted before purging (%v); continuing\n", err)
-	} else {
-		fmt.Printf("[OK] Account marked deleted (no more deliveries or logins)\n")
-	}
-
-	// Step 1: Mark all messages as expunged (atomic, idempotent)
-	// We do this first so we can safely delete them.
-	// Even if this returns 0 (already expunged), we proceed to check for any remaining S3 objects.
-	fmt.Printf("Step 1: Marking messages as expunged...\n")
-	expungedCount, err := rdb.ExpungeAllMessagesForAccount(ctx, accountID)
+	disabledID, err := cleaner.DisableAccount(ctx, rdb, email)
 	if err != nil {
-		return fmt.Errorf("failed to expunge messages: %w", err)
+		return fmt.Errorf("failed to take the account out of service: %w", err)
 	}
-	fmt.Printf("[OK] Marked %d messages as expunged (or already expunged)\n", expungedCount)
-
-	// Step 2: Delete S3 objects and clean up DB
-	// We iterate in batches: Fetch -> Delete S3 -> Delete DB
-	fmt.Printf("\nStep 2: Deleting S3 objects and database records...\n")
-
-	totalS3Deletes := 0
-	totalDBDeletes := int64(0)
-	const batchSize = 1000
-
-	for {
-		// Fetch batch of uploaded objects
-		// We use GetAllUploadedObjectsForAccount which filters by uploaded=TRUE.
-		// Since we delete records in each iteration, this acts as pagination.
-		batch, err := rdb.GetAllUploadedObjectsForAccount(ctx, accountID, batchSize)
-		if err != nil {
-			return fmt.Errorf("failed to scan S3 objects: %w", err)
-		}
-
-		if len(batch) == 0 {
-			break
-		}
-
-		fmt.Printf("  Processing batch of %d objects...\n", len(batch))
-
-		// Build S3 keys
-		s3Keys := make([]string, 0, len(batch))
-		keyToCandidate := make(map[string]db.UserScopedObjectForCleanup, len(batch))
-		for _, candidate := range batch {
-			s3Key := helpers.NewS3Key(candidate.S3Domain, candidate.S3Localpart, candidate.ContentHash)
-			s3Keys = append(s3Keys, s3Key)
-			keyToCandidate[s3Key] = candidate
-		}
-
-		// Delete from S3
-		var successfulDeletes []db.UserScopedObjectForCleanup
-		var failedDeletes int
-
-		if realS3, ok := s3Storage.(*storage.S3Storage); ok {
-			// Bulk delete
-			errors := realS3.DeleteBulk(s3Keys)
-			for _, s3Key := range s3Keys {
-				if err, failed := errors[s3Key]; failed {
-					fmt.Printf("    Warning: Failed to delete %s: %v\n", s3Key, err)
-					failedDeletes++
-				} else {
-					successfulDeletes = append(successfulDeletes, keyToCandidate[s3Key])
-					fmt.Printf("    Deleted S3 key: %s\n", s3Key)
-				}
-			}
-		} else {
-			// One-by-one
-			for _, s3Key := range s3Keys {
-				err := s3Storage.Delete(s3Key)
-				if err != nil {
-					fmt.Printf("    Warning: Failed to delete %s: %v\n", s3Key, err)
-					failedDeletes++
-				} else {
-					successfulDeletes = append(successfulDeletes, keyToCandidate[s3Key])
-					fmt.Printf("    Deleted S3 key: %s\n", s3Key)
-				}
-			}
-		}
-
-		// Update stats
-		totalS3Deletes += len(successfulDeletes)
-
-		// Delete from DB (only successful S3 deletions)
-		if len(successfulDeletes) > 0 {
-			deleted, err := rdb.DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx, successfulDeletes)
-			if err != nil {
-				return fmt.Errorf("failed to delete messages from DB: %w", err)
-			}
-			totalDBDeletes += deleted
-			fmt.Printf("    [OK] Deleted %d S3 objects and %d DB records this batch\n", len(successfulDeletes), deleted)
-			if deleted == 0 {
-				// The objects are gone but no row went with them: these rows are not
-				// expunged (mail arriving into the account while it is being purged, or
-				// a replica serving stale rows). Looping would re-fetch and re-delete the
-				// same keys forever. Stop; a re-run after the account is disabled
-				// finishes the job.
-				return fmt.Errorf("purge stalled: %d S3 objects deleted but no database rows removed — the account still receives mail or the read replica lags; disable the account and re-run", len(successfulDeletes))
-			}
-		} else if failedDeletes > 0 && len(batch) > 0 {
-			// If we found objects but failed to delete ANY of them, we are stuck.
-			// The next iteration will find the same objects.
-			return fmt.Errorf("failed to delete any S3 objects in current batch (%d failed). Aborting to prevent infinite loop", failedDeletes)
-		}
+	if disabledID != accountID {
+		return fmt.Errorf("%s belongs to account %d, not %d; nothing was purged", email, disabledID, accountID)
 	}
+	fmt.Printf("[OK] Account out of service (no new logins or deliveries); sessions already open stay until kicked: sora-admin connections kick --user %s\n", email)
 
-	fmt.Printf("\n[OK] Successfully cleaned up %d S3 objects and %d message records\n", totalS3Deletes, totalDBDeletes)
-
-	// Step 3: Delete mailboxes, credentials, account
-	fmt.Printf("\nStep 3: Removing account data...\n")
-
-	if err := rdb.PurgeMailboxesForAccount(ctx, accountID); err != nil {
-		return fmt.Errorf("failed to purge mailboxes: %w", err)
+	stats, err := cleaner.PurgeAccount(ctx, rdb, purgeDeleter(s3Storage), accountID)
+	fmt.Printf("Deleted %d S3 objects and %d message records\n", stats.S3Objects, stats.Messages)
+	if err != nil {
+		return fmt.Errorf("purge incomplete (the account stays out of service; run the command again to finish): %w", err)
 	}
-	fmt.Printf("[OK] Deleted mailboxes\n")
-
-	if err := rdb.PurgeCredentialsForAccount(ctx, accountID); err != nil {
-		return fmt.Errorf("failed to purge credentials: %w", err)
-	}
-	fmt.Printf("[OK] Deleted credentials\n")
-
-	if err := rdb.PurgeAccount(ctx, accountID); err != nil {
-		return fmt.Errorf("failed to purge account: %w", err)
-	}
-	fmt.Printf("[OK] Deleted account\n")
-
+	fmt.Printf("[OK] Account, mailboxes, messages and credentials deleted\n")
 	return nil
+}
+
+// newPurgeStorage creates the S3 client a purge deletes bodies with, from cfg.
+func newPurgeStorage(cfg AdminConfig) (objectStorage, error) {
+	s3Timeout, err := cfg.S3.GetTimeout()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse S3 timeout: %w", err)
+	}
+	realS3, err := storage.New(
+		cfg.S3.Endpoint,
+		cfg.S3.AccessKey,
+		cfg.S3.SecretKey,
+		cfg.S3.Bucket,
+		!cfg.S3.DisableTLS,
+		false, // debug mode
+		s3Timeout,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize S3 storage: %w", err)
+	}
+	if cfg.S3.Encrypt {
+		if err := realS3.EnableEncryption(cfg.S3.EncryptionKey); err != nil {
+			return nil, fmt.Errorf("failed to enable S3 encryption: %w", err)
+		}
+	}
+	return realS3, nil
+}
+
+// purgeDeleter adapts the admin tool's storage to the purge: the real S3 client deletes
+// in bulk through the same resilient wrapper the server uses; anything else (a test
+// double) one key at a time.
+func purgeDeleter(st objectStorage) cleaner.S3BulkDeleter {
+	if realS3, ok := st.(*storage.S3Storage); ok {
+		return resilient.NewResilientS3Storage(realS3)
+	}
+	return keyByKeyDeleter{st}
+}
+
+type keyByKeyDeleter struct{ st objectStorage }
+
+func (d keyByKeyDeleter) DeleteBulkWithRetry(_ context.Context, keys []string) map[string]error {
+	failed := make(map[string]error)
+	for _, key := range keys {
+		if err := d.st.Delete(key); err != nil {
+			failed[key] = err
+		}
+	}
+	return failed
 }

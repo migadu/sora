@@ -310,6 +310,43 @@ func (rd *ResilientDatabase) CleanupSoftDeletedAccountsWithRetry(ctx context.Con
 	return done, nil
 }
 
+// HardDeleteAccountWithRetry runs the hard delete of one soft-deleted account to the end,
+// in bounded steps that each commit on their own (see db.HardDeleteAccountStep). An
+// account that is not soft-deleted is left untouched.
+func (rd *ResilientDatabase) HardDeleteAccountWithRetry(ctx context.Context, accountID int64) error {
+	return rd.hardDeleteAccountChunked(ctx, accountID, mailboxPurgeBatchSize)
+}
+
+// GetPurgeableObjectsForAccountWithRetry lists S3 keys of the account's expunged rows,
+// whatever their upload state (see db.GetPurgeableObjectsForAccount).
+func (rd *ResilientDatabase) GetPurgeableObjectsForAccountWithRetry(ctx context.Context, accountID int64, limit int) ([]db.UserScopedObjectForCleanup, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetPurgeableObjectsForAccount(ctx, accountID, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	objects, _ := result.([]db.UserScopedObjectForCleanup)
+	return objects, nil
+}
+
+// GetAccountDeletionStateWithRetry reports whether the account row exists and whether it
+// is soft-deleted.
+func (rd *ResilientDatabase) GetAccountDeletionStateWithRetry(ctx context.Context, accountID int64) (exists, softDeleted bool, err error) {
+	type state struct{ exists, softDeleted bool }
+	op := func(ctx context.Context) (any, error) {
+		exists, softDeleted, err := rd.getOperationalDatabaseForOperation(ctx, false).GetAccountDeletionState(ctx, accountID)
+		return state{exists, softDeleted}, err
+	}
+	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
+	if err != nil {
+		return false, false, err
+	}
+	st := result.(state)
+	return st.exists, st.softDeleted, nil
+}
+
 func (rd *ResilientDatabase) hardDeleteAccountChunked(ctx context.Context, accountID int64, batchSize int) error {
 	for {
 		if ctx.Err() != nil {

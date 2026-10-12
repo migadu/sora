@@ -110,26 +110,6 @@ func (rd *ResilientDatabase) ExpungeAllMessagesForAccount(ctx context.Context, a
 	return rd.getOperationalDatabaseForOperation(ctx, true).ExpungeAllMessagesForAccount(ctx, accountID)
 }
 
-func (rd *ResilientDatabase) GetUserScopedObjectsForAccount(ctx context.Context, accountID int64, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error) {
-	return rd.getOperationalDatabaseForOperation(ctx, false).GetUserScopedObjectsForAccount(ctx, accountID, gracePeriod, limit)
-}
-
-func (rd *ResilientDatabase) GetAllUploadedObjectsForAccount(ctx context.Context, accountID int64, limit int) ([]db.UserScopedObjectForCleanup, error) {
-	return rd.getOperationalDatabaseForOperation(ctx, false).GetAllUploadedObjectsForAccount(ctx, accountID, limit)
-}
-
-func (rd *ResilientDatabase) PurgeMailboxesForAccount(ctx context.Context, accountID int64) error {
-	return rd.getOperationalDatabaseForOperation(ctx, true).PurgeMailboxesForAccount(ctx, accountID)
-}
-
-func (rd *ResilientDatabase) PurgeCredentialsForAccount(ctx context.Context, accountID int64) error {
-	return rd.getOperationalDatabaseForOperation(ctx, true).PurgeCredentialsForAccount(ctx, accountID)
-}
-
-func (rd *ResilientDatabase) PurgeAccount(ctx context.Context, accountID int64) error {
-	return rd.getOperationalDatabaseForOperation(ctx, true).PurgeAccount(ctx, accountID)
-}
-
 // ExpungeMessagesByIDsWithRetry marks message rows expunged for the cleaner to reclaim.
 func (rd *ResilientDatabase) ExpungeMessagesByIDsWithRetry(ctx context.Context, messageIDs []int64) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {

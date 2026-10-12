@@ -28,7 +28,7 @@ type accountLoginsStack struct {
 	imapAddr string
 }
 
-func setupAccountLoginsStack(t *testing.T) *accountLoginsStack {
+func setupAccountLoginsStack(t *testing.T, opts ...func(*adminapi.ServerOptions)) *accountLoginsStack {
 	t.Helper()
 
 	rdb := common.SetupTestDatabase(t)
@@ -51,14 +51,15 @@ func setupAccountLoginsStack(t *testing.T) *accountLoginsStack {
 		imapSrv.Close()
 	})
 
-	api := startAdminAPI(t, rdb, map[string]*serverPkg.ConnectionTracker{"IMAP-imap-logins": tracker})
+	api := startAdminAPI(t, rdb, map[string]*serverPkg.ConnectionTracker{"IMAP-imap-logins": tracker}, opts...)
 	t.Cleanup(api.Close)
 	time.Sleep(100 * time.Millisecond)
 
 	return &accountLoginsStack{api: api, imapAddr: imapAddr}
 }
 
-func startAdminAPI(t *testing.T, rdb *resilient.ResilientDatabase, trackers map[string]*serverPkg.ConnectionTracker) *HTTPAPITestServer {
+// startAdminAPI starts the Admin API on rdb; opts adjust its options before it starts.
+func startAdminAPI(t *testing.T, rdb *resilient.ResilientDatabase, trackers map[string]*serverPkg.ConnectionTracker, opts ...func(*adminapi.ServerOptions)) *HTTPAPITestServer {
 	t.Helper()
 
 	options := adminapi.ServerOptions{
@@ -66,6 +67,9 @@ func startAdminAPI(t *testing.T, rdb *resilient.ResilientDatabase, trackers map[
 		APIKey:             testAPIKey,
 		AllowedHosts:       []string{},
 		ConnectionTrackers: trackers,
+	}
+	for _, opt := range opts {
+		opt(&options)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	errChan := make(chan error, 1)

@@ -240,14 +240,35 @@ func (w *CleanupWorker) reportStrandedInstances(ctx context.Context) {
 
 // deleteS3Objects removes the S3 bodies of candidates and then the message rows that
 // referenced them, in batches. It returns how many bodies are gone from S3.
+func (w *CleanupWorker) deleteS3Objects(ctx context.Context, candidates []db.UserScopedObjectForCleanup) (int, error) {
+	deleted, _, err := reapS3Objects(ctx, w.rdb, w.s3, w.gracePeriod, candidates)
+	return deleted, err
+}
+
+// s3ObjectReaper is the database side of reapS3Objects.
+type s3ObjectReaper interface {
+	ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error
+	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
+}
+
+// S3BulkDeleter deletes objects by key and reports the keys it could not delete.
+type S3BulkDeleter interface {
+	DeleteBulkWithRetry(ctx context.Context, keys []string) map[string]error
+}
+
+// reapS3Objects removes the S3 bodies of candidates and then the expunged message rows
+// that referenced them, in batches, holding each body's advisory lock throughout. It
+// returns how many bodies are gone from S3 and how many rows went with them. It is the
+// cleaner's S3 phase, and the account purge's.
 //
 // Ordering is deliberate and unchanged: the S3 object goes first and the rows follow.
 // If the process dies in between, the rows are expunged rows nothing can read, the next
 // cycle lists them again and re-issues a delete for an object that is already gone
 // (DeleteObjects treats that as success), and the rows are removed then. The reverse
 // order would strand the body in the bucket with nothing left pointing at it.
-func (w *CleanupWorker) deleteS3Objects(ctx context.Context, candidates []db.UserScopedObjectForCleanup) (int, error) {
+func reapS3Objects(ctx context.Context, rdb s3ObjectReaper, s3 S3BulkDeleter, gracePeriod time.Duration, candidates []db.UserScopedObjectForCleanup) (int, int64, error) {
 	deleted := 0
+	var rowsDeleted int64
 
 	batch := make([]db.UserScopedObjectForCleanup, 0, s3DeleteBatchSize)
 	// flush reports whether the phase can continue; a failure to take the locks (or to
@@ -259,7 +280,7 @@ func (w *CleanupWorker) deleteS3Objects(ctx context.Context, candidates []db.Use
 		// The advisory locks are held for the whole callback: the orphan re-check, the
 		// S3 delete and the row delete all see the same "nothing references this body"
 		// verdict, and an uploader cannot slip a PUT in between.
-		err := w.rdb.ExecuteWithLockedS3Orphans(ctx, batch, w.gracePeriod, func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error {
+		err := rdb.ExecuteWithLockedS3Orphans(ctx, batch, gracePeriod, func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error {
 			if skipped := len(batch) - len(orphans); skipped > 0 {
 				logger.Info("Cleanup: objects are no longer orphans or are being uploaded, skipping S3 deletion", "count", skipped)
 			}
@@ -275,7 +296,7 @@ func (w *CleanupWorker) deleteS3Objects(ctx context.Context, candidates []db.Use
 				byKey[key] = orphan
 			}
 
-			failures := w.s3.DeleteBulkWithRetry(ctx, keys)
+			failures := s3.DeleteBulkWithRetry(ctx, keys)
 			gone := make([]db.UserScopedObjectForCleanup, 0, len(keys))
 			for _, key := range keys {
 				if err, failed := failures[key]; failed {
@@ -288,12 +309,13 @@ func (w *CleanupWorker) deleteS3Objects(ctx context.Context, candidates []db.Use
 				return nil
 			}
 
-			deletedCount, err := w.rdb.DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx, gone)
+			deletedCount, err := rdb.DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx, gone)
 			if err != nil {
 				// The bodies are gone; their rows are picked up again next cycle.
 				logger.Error("Cleanup: Failed to batch delete DB message rows", "error", err)
 			} else {
 				logger.Info("Cleanup: Successfully cleaned up user-scoped message rows", "count", deletedCount)
+				rowsDeleted += deletedCount
 			}
 			deleted += len(gone)
 			return nil
@@ -317,18 +339,18 @@ func (w *CleanupWorker) deleteS3Objects(ctx context.Context, candidates []db.Use
 		select {
 		case <-ctx.Done():
 			logger.Info("Cleanup: request aborted during S3 cleanup")
-			return deleted, fmt.Errorf("request aborted during S3 cleanup")
+			return deleted, rowsDeleted, fmt.Errorf("request aborted during S3 cleanup")
 		default:
 		}
 
 		batch = append(batch, candidate)
 		if len(batch) == s3DeleteBatchSize && !flush() {
-			return deleted, nil
+			return deleted, rowsDeleted, nil
 		}
 	}
 
 	flush()
-	return deleted, nil
+	return deleted, rowsDeleted, nil
 }
 
 func (w *CleanupWorker) runOnce(ctx context.Context) error {
@@ -565,19 +587,10 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		// lock. FinalizeAccountDeletions still issues the same DELETE as a safety net; by
 		// then it is a no-op.
 		for _, accountID := range danglingAccounts {
-			for {
-				deleted, err := w.rdb.DeleteFTSRowsForAccountWithRetry(ctx, accountID, db.BATCH_PURGE_SIZE)
-				if err != nil {
-					logger.Error("Cleanup: Failed to delete FTS rows for account", "account_id", accountID, "error", err)
-					break
-				}
-				if deleted == 0 {
-					break
-				}
-				ftsPrunedCount += deleted
-				if ctx.Err() != nil {
-					break
-				}
+			deleted, err := drainAccountFTS(ctx, w.rdb, accountID)
+			ftsPrunedCount += deleted
+			if err != nil && ctx.Err() == nil {
+				logger.Error("Cleanup: Failed to delete FTS rows for account", "account_id", accountID, "error", err)
 			}
 		}
 

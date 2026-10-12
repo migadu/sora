@@ -910,6 +910,11 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	email := extractLastPathSegment(r.URL.Path)
 	ctx := r.Context()
 
+	if r.URL.Query().Get("purge") == "true" {
+		s.handlePurgeAccount(w, r, email)
+		return
+	}
+
 	accountID := s.trackedAccountID(ctx, email)
 	err := s.rdb.DeleteAccountWithRetry(ctx, email)
 	if err != nil {
@@ -2028,7 +2033,7 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 				"POST /admin/accounts",
 				"GET /admin/accounts/{email}",
 				"PUT /admin/accounts/{email}",
-				"DELETE /admin/accounts/{email}",
+				"DELETE /admin/accounts/{email} (soft delete; ?purge=true deletes permanently, now)",
 				"POST /admin/accounts/{email}/restore",
 				"GET /admin/accounts/{email}/exists",
 				"POST /admin/accounts/{email}/credentials",

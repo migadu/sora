@@ -1338,145 +1338,51 @@ func (d *Database) ExpungeAllMessagesForAccount(ctx context.Context, accountID i
 	return result.RowsAffected(), nil
 }
 
-// GetUserScopedObjectsForAccount retrieves all expunged messages for a specific account
-// Use gracePeriod=0 for immediate cleanup (admin purge), >0 for normal cleanup worker
+// GetPurgeableObjectsForAccount returns up to limit S3 keys of the account's expunged
+// message rows, whatever their upload state: an account purge removes the bodies the
+// uploader wrote and, idempotently, the keys of bodies that never got there (or got there
+// without the row being marked), then the rows themselves. Live rows are left out; a purge
+// expunges before it lists, and a row that is live by then is not the purge's to delete.
 //
-// SAFETY: This function is account-isolated by design:
-// - Filters by account_id in WHERE clause
-// - Returns only S3 objects for messages belonging to the specified account
-// - Safe to delete returned S3 objects without affecting other accounts because:
-//  1. Email addresses are globally unique (UNIQUE INDEX on credentials.address)
-//  2. S3 keys = <s3_domain>/<s3_localpart>/<content_hash> = <email_domain>/<email_localpart>/<hash>
-//  3. Different accounts → different email addresses → different S3 paths
-//  4. Even if same content_hash, different email → different S3 object
-func (d *Database) GetUserScopedObjectsForAccount(ctx context.Context, accountID int64, gracePeriod time.Duration, limit int) ([]UserScopedObjectForCleanup, error) {
-	threshold := time.Now().Add(-gracePeriod).UTC()
-	rows, err := d.GetReadPool().Query(ctx, `
-		SELECT account_id, s3_domain, s3_localpart, content_hash
-		FROM messages
-		WHERE account_id = $1
-		GROUP BY account_id, s3_domain, s3_localpart, content_hash
-		HAVING bool_and(uploaded = TRUE AND expunged_at IS NOT NULL AND expunged_at < $2)
-		LIMIT $3;
-	`, accountID, threshold, limit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query for user-scoped objects for account cleanup: %w", err)
-	}
-	defer rows.Close()
-
-	var result []UserScopedObjectForCleanup
-	for rows.Next() {
-		var candidate UserScopedObjectForCleanup
-		if err := rows.Scan(&candidate.AccountID, &candidate.S3Domain, &candidate.S3Localpart, &candidate.ContentHash); err != nil {
-			return nil, fmt.Errorf("failed to scan user-scoped object for cleanup: %w", err)
-		}
-		result = append(result, candidate)
-	}
-	return result, rows.Err()
-}
-
-// GetAllUploadedObjectsForAccount retrieves ALL uploaded S3 objects for a specific account
-// regardless of expunge status. Used for account purging when messages might already be deleted from DB.
+// SAFETY: the keys are the account's own. An S3 key is <s3_domain>/<s3_localpart>/<hash>,
+// taken from the address the message was stored under, and addresses are unique across
+// accounts, so another account's body under the same hash has a different key.
 //
-// SAFETY: This function is account-isolated by design (same guarantees as GetUserScopedObjectsForAccount)
-func (d *Database) GetAllUploadedObjectsForAccount(ctx context.Context, accountID int64, limit int) ([]UserScopedObjectForCleanup, error) {
-	rows, err := d.GetReadPool().Query(ctx, `
-		SELECT account_id, s3_domain, s3_localpart, content_hash
+// It reads the pool the context selects; the purge pins it to the primary, since a lagging
+// replica would hand back keys whose rows it already deleted.
+func (d *Database) GetPurgeableObjectsForAccount(ctx context.Context, accountID int64, limit int) ([]UserScopedObjectForCleanup, error) {
+	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT DISTINCT account_id, s3_domain, s3_localpart, content_hash
 		FROM messages
-		WHERE account_id = $1 AND uploaded = TRUE
-		GROUP BY account_id, s3_domain, s3_localpart, content_hash
-		LIMIT $2;
+		WHERE account_id = $1 AND expunged_at IS NOT NULL
+		LIMIT $2
 	`, accountID, limit)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query for all uploaded objects for account: %w", err)
+		return nil, fmt.Errorf("failed to list purgeable objects of account %d: %w", accountID, err)
 	}
 	defer rows.Close()
 
 	var result []UserScopedObjectForCleanup
 	for rows.Next() {
-		var candidate UserScopedObjectForCleanup
-		if err := rows.Scan(&candidate.AccountID, &candidate.S3Domain, &candidate.S3Localpart, &candidate.ContentHash); err != nil {
-			return nil, fmt.Errorf("failed to scan uploaded object for cleanup: %w", err)
+		var o UserScopedObjectForCleanup
+		if err := rows.Scan(&o.AccountID, &o.S3Domain, &o.S3Localpart, &o.ContentHash); err != nil {
+			return nil, fmt.Errorf("failed to scan purgeable object of account %d: %w", accountID, err)
 		}
-		result = append(result, candidate)
+		result = append(result, o)
 	}
 	return result, rows.Err()
 }
 
-// PurgeMailboxesForAccount permanently deletes all mailboxes for an account
-// This is a hard delete used by the admin tool for immediate account purging
-func (d *Database) PurgeMailboxesForAccount(ctx context.Context, accountID int64) error {
-	tx, err := d.GetWritePool().Begin(ctx)
+// GetAccountDeletionState reports whether the account row exists and, if so, whether it
+// is soft-deleted. It reads the pool the context selects.
+func (d *Database) GetAccountDeletionState(ctx context.Context, accountID int64) (exists, softDeleted bool, err error) {
+	err = d.GetReadPoolWithContext(ctx).QueryRow(ctx,
+		`SELECT deleted_at IS NOT NULL FROM accounts WHERE id = $1`, accountID).Scan(&softDeleted)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, false, nil
+	}
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return false, false, fmt.Errorf("failed to read deletion state of account %d: %w", accountID, err)
 	}
-	defer tx.Rollback(context.Background())
-
-	// Expunge any still-active messages before deleting their mailboxes. The
-	// messages.mailbox_id FK is ON DELETE SET NULL, and the maintain_mailbox_stats_messages
-	// trigger UPSERTs a mailbox_stats row for an active message detached that way; if the
-	// mailbox row is already deleted, that UPSERT violates mailbox_stats_mailbox_id_fkey.
-	// Callers (e.g. domain purge) normally expunge first, so this is usually a no-op, but
-	// it keeps this hard-delete helper self-safe against a bare DELETE FROM mailboxes.
-	if _, err = tx.Exec(ctx, `
-		UPDATE messages
-		SET expunged_at = now(), expunged_modseq = nextval('messages_modseq')
-		WHERE account_id = $1 AND expunged_at IS NULL
-	`, accountID); err != nil {
-		return fmt.Errorf("failed to expunge messages before purging mailboxes: %w", err)
-	}
-
-	_, err = tx.Exec(ctx, `DELETE FROM mailboxes WHERE account_id = $1`, accountID)
-	if err != nil {
-		return fmt.Errorf("failed to purge mailboxes: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit purge transaction: %w", err)
-	}
-
-	return nil
-}
-
-// PurgeCredentialsForAccount permanently deletes all credentials for an account
-// This is a hard delete used by the admin tool for immediate account purging
-func (d *Database) PurgeCredentialsForAccount(ctx context.Context, accountID int64) error {
-	tx, err := d.GetWritePool().Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback(context.Background())
-
-	_, err = tx.Exec(ctx, `DELETE FROM credentials WHERE account_id = $1`, accountID)
-	if err != nil {
-		return fmt.Errorf("failed to purge credentials: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit purge transaction: %w", err)
-	}
-
-	return nil
-}
-
-// PurgeAccount permanently deletes an account
-// This is a hard delete used by the admin tool for immediate account purging
-// Note: All associated data (messages, mailboxes, credentials) should be deleted first
-func (d *Database) PurgeAccount(ctx context.Context, accountID int64) error {
-	tx, err := d.GetWritePool().Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback(context.Background())
-
-	_, err = tx.Exec(ctx, `DELETE FROM accounts WHERE id = $1`, accountID)
-	if err != nil {
-		return fmt.Errorf("failed to purge account: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit purge transaction: %w", err)
-	}
-
-	return nil
+	return true, softDeleted, nil
 }
