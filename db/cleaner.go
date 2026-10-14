@@ -1312,37 +1312,17 @@ func (d *Database) GetMessagesForAccount(ctx context.Context, accountID int64) (
 	return scanMessages(rows, false)
 }
 
-// ExpungeAllMessagesForAccount marks all messages for an account as expunged
-// This is the first step in account deletion - marks messages for cleanup
-// The actual deletion from S3 and DB happens via GetUserScopedObjectsForCleanup
-func (d *Database) ExpungeAllMessagesForAccount(ctx context.Context, accountID int64) (int64, error) {
-	tx, err := d.GetWritePool().Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback(context.Background())
-
-	result, err := tx.Exec(ctx, `
-		UPDATE messages
-		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
-		WHERE account_id = $1 AND expunged_at IS NULL
-	`, accountID)
-	if err != nil {
-		return 0, fmt.Errorf("failed to expunge messages: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("failed to commit expunge transaction: %w", err)
-	}
-
-	return result.RowsAffected(), nil
-}
-
 // GetPurgeableObjectsForAccount returns up to limit S3 keys of the account's expunged
-// message rows, whatever their upload state: an account purge removes the bodies the
-// uploader wrote and, idempotently, the keys of bodies that never got there (or got there
-// without the row being marked), then the rows themselves. Live rows are left out; a purge
-// expunges before it lists, and a row that is live by then is not the purge's to delete.
+// message rows after cursor (in (s3_domain, s3_localpart, content_hash) order; a zero
+// cursor starts from the beginning), whatever their upload state: an account purge removes
+// the bodies the uploader wrote and, idempotently, the keys of bodies that never got there
+// (or got there without the row being marked), then the rows themselves. Live rows are left
+// out; a purge expunges before it lists, and a row that is live by then is not the purge's
+// to delete.
+//
+// Walking by key cursor visits each key at most once per pass even when some keys are
+// skipped (an upload holds the lock, or S3 refused the delete) and their rows stay in
+// messages until the next pass.
 //
 // SAFETY: the keys are the account's own. An S3 key is <s3_domain>/<s3_localpart>/<hash>,
 // taken from the address the message was stored under, and addresses are unique across
@@ -1350,13 +1330,15 @@ func (d *Database) ExpungeAllMessagesForAccount(ctx context.Context, accountID i
 //
 // It reads the pool the context selects; the purge pins it to the primary, since a lagging
 // replica would hand back keys whose rows it already deleted.
-func (d *Database) GetPurgeableObjectsForAccount(ctx context.Context, accountID int64, limit int) ([]UserScopedObjectForCleanup, error) {
+func (d *Database) GetPurgeableObjectsForAccount(ctx context.Context, accountID int64, after UserScopedObjectForCleanup, limit int) ([]UserScopedObjectForCleanup, error) {
 	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, `
 		SELECT DISTINCT account_id, s3_domain, s3_localpart, content_hash
 		FROM messages
 		WHERE account_id = $1 AND expunged_at IS NOT NULL
-		LIMIT $2
-	`, accountID, limit)
+		  AND (s3_domain, s3_localpart, content_hash) > ($2, $3, $4)
+		ORDER BY s3_domain, s3_localpart, content_hash
+		LIMIT $5
+	`, accountID, after.S3Domain, after.S3Localpart, after.ContentHash, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list purgeable objects of account %d: %w", accountID, err)
 	}

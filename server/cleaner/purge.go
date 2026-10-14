@@ -60,7 +60,7 @@ type AccountDisabler interface {
 type AccountPurgeDatabase interface {
 	s3ObjectReaper
 	HardDeleteAccountWithRetry(ctx context.Context, accountID int64) error
-	GetPurgeableObjectsForAccountWithRetry(ctx context.Context, accountID int64, limit int) ([]db.UserScopedObjectForCleanup, error)
+	GetPurgeableObjectsForAccountWithRetry(ctx context.Context, accountID int64, after db.UserScopedObjectForCleanup, limit int) ([]db.UserScopedObjectForCleanup, error)
 	DeleteFTSRowsForAccountWithRetry(ctx context.Context, accountID int64, limit int) (int64, error)
 	FinalizeAccountDeletionsWithRetry(ctx context.Context, accountIDs []int64) (int64, error)
 	GetAccountDeletionStateWithRetry(ctx context.Context, accountID int64) (exists, softDeleted bool, err error)
@@ -76,9 +76,13 @@ type PurgeStats struct {
 // can no longer sign in or be delivered to, and returns its id. An account that is
 // already soft-deleted is fine. An unknown address returns consts.ErrUserNotFound.
 //
+// It resolves the address on the primary, so a lagging read replica cannot hide a just-
+// created account or return the id of an earlier account that held the same address.
+//
 // It does not end the account's open sessions; a caller that can reach them (the Admin
 // API, through its connection trackers) does that next.
 func DisableAccount(ctx context.Context, rdb AccountDisabler, email string) (int64, error) {
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, email)
 	if err != nil {
 		return 0, err
@@ -144,14 +148,16 @@ func PurgeAccount(ctx context.Context, rdb AccountPurgeDatabase, s3 S3BulkDelete
 	}
 }
 
-// purgeAccountObjects deletes the S3 keys of the account's expunged rows and the rows,
-// until none are left or a round makes no progress. Each round that goes on has deleted
-// rows, and only rows this purge already expunged are listed, so it cannot spin; what a
-// round could not delete (a body whose upload holds its lock, a key S3 refused) is left
-// for the next pass.
+// purgeAccountObjects walks the S3 keys of the account's expunged rows in key order and
+// deletes the objects and the rows. Walking by cursor visits each key at most once per
+// pass even when some keys are skipped (a body whose upload holds its lock, a key S3
+// refused) and their rows remain in messages; those are retried on the next pass after
+// purgeRetryDelay. A round that deletes no rows at all stops the pass early rather than
+// keep calling a broken S3 across the rest of the account.
 func purgeAccountObjects(ctx context.Context, rdb AccountPurgeDatabase, s3 S3BulkDeleter, accountID int64, stats *PurgeStats) error {
+	var after db.UserScopedObjectForCleanup
 	for {
-		candidates, err := rdb.GetPurgeableObjectsForAccountWithRetry(ctx, accountID, purgeObjectBatch)
+		candidates, err := rdb.GetPurgeableObjectsForAccountWithRetry(ctx, accountID, after, purgeObjectBatch)
 		if err != nil {
 			return fmt.Errorf("failed to list the account's S3 objects: %w", err)
 		}
@@ -164,9 +170,10 @@ func purgeAccountObjects(ctx context.Context, rdb AccountPurgeDatabase, s3 S3Bul
 		if err != nil {
 			return fmt.Errorf("failed to delete the account's S3 objects: %w", err)
 		}
-		if rows == 0 {
+		if len(candidates) < purgeObjectBatch || rows == 0 {
 			return nil
 		}
+		after = candidates[len(candidates)-1]
 	}
 }
 

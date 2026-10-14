@@ -317,11 +317,11 @@ func (rd *ResilientDatabase) HardDeleteAccountWithRetry(ctx context.Context, acc
 	return rd.hardDeleteAccountChunked(ctx, accountID, mailboxPurgeBatchSize)
 }
 
-// GetPurgeableObjectsForAccountWithRetry lists S3 keys of the account's expunged rows,
-// whatever their upload state (see db.GetPurgeableObjectsForAccount).
-func (rd *ResilientDatabase) GetPurgeableObjectsForAccountWithRetry(ctx context.Context, accountID int64, limit int) ([]db.UserScopedObjectForCleanup, error) {
+// GetPurgeableObjectsForAccountWithRetry lists S3 keys of the account's expunged rows
+// after the given cursor, whatever their upload state (see db.GetPurgeableObjectsForAccount).
+func (rd *ResilientDatabase) GetPurgeableObjectsForAccountWithRetry(ctx context.Context, accountID int64, after db.UserScopedObjectForCleanup, limit int) ([]db.UserScopedObjectForCleanup, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetPurgeableObjectsForAccount(ctx, accountID, limit)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetPurgeableObjectsForAccount(ctx, accountID, after, limit)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
 	if err != nil {

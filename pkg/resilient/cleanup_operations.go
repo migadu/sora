@@ -106,10 +106,6 @@ func (rd *ResilientDatabase) GetMessagesForAccount(ctx context.Context, accountI
 	return rd.getOperationalDatabaseForOperation(ctx, false).GetMessagesForAccount(ctx, accountID)
 }
 
-func (rd *ResilientDatabase) ExpungeAllMessagesForAccount(ctx context.Context, accountID int64) (int64, error) {
-	return rd.getOperationalDatabaseForOperation(ctx, true).ExpungeAllMessagesForAccount(ctx, accountID)
-}
-
 // ExpungeMessagesByIDsWithRetry marks message rows expunged for the cleaner to reclaim.
 func (rd *ResilientDatabase) ExpungeMessagesByIDsWithRetry(ctx context.Context, messageIDs []int64) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {

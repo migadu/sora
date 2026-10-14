@@ -16,6 +16,7 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server/cleaner"
 	"github.com/migadu/sora/testutils"
 	"github.com/stretchr/testify/require"
 )
@@ -110,15 +111,16 @@ func TestAccountPurgeResumability(t *testing.T) {
 	messageCount := 5
 	createPurgeTestMessages(t, ctx, rdb, s3Storage, accountID, email, messageCount)
 
-	// Step 1: Mark all messages as expunged (simulating partial purge)
-	expungedCount, err := rdb.ExpungeAllMessagesForAccount(ctx, accountID)
+	// Step 1: Disable the account and run the mailbox/message hard-delete phase
+	// (simulating a purge interrupted before S3 cleanup)
+	_, err = cleaner.DisableAccount(ctx, rdb, email)
 	require.NoError(t, err)
-	require.Equal(t, int64(messageCount), expungedCount)
+	err = rdb.HardDeleteAccountWithRetry(ctx, accountID)
+	require.NoError(t, err)
 
-	// Verify messages still exist in DB (but marked as expunged)
-	messages, err := rdb.GetMessagesForAccount(ctx, accountID)
-	require.NoError(t, err)
-	require.Len(t, messages, messageCount, "Messages should still exist after marking as expunged")
+	// Verify messages still exist in DB (but marked as expunged and detached)
+	require.Equal(t, messageCount, countAccountRows(t, ctx, rdb, "messages", accountID), "Messages should still exist after marking as expunged")
+	require.Equal(t, 0, countAccountRows(t, ctx, rdb, "mailboxes", accountID), "Mailboxes should be removed by HardDeleteAccountWithRetry")
 
 	// Verify S3 objects still exist before resume
 	s3CountBefore := countS3ObjectsForAccount(t, s3Storage, email)
