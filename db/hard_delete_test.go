@@ -54,29 +54,7 @@ func TestHardDeleteAccounts_WithActiveMessages(t *testing.T) {
 	assertAccountFullyDetached(t, db, ctx, accountID)
 }
 
-// TestPurgeMailboxesForAccount_WithActiveMessages guards the hard-delete helper used by the
-// admin domain-purge path. Its normal caller expunges first, but the helper must be self-safe
-// against a bare DELETE FROM mailboxes when active messages are present.
-func TestPurgeMailboxesForAccount_WithActiveMessages(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping database integration test in short mode")
-	}
-
-	db, accountID, _, inboxID, _ := setupRestoreTestDatabase(t)
-	defer db.Close()
-
-	ctx := context.Background()
-
-	insertTestMessage(t, db, accountID, inboxID, "INBOX", "Message 1", "<p1@example.com>")
-	insertTestMessage(t, db, accountID, inboxID, "INBOX", "Message 2", "<p2@example.com>")
-
-	require.NoError(t, db.PurgeMailboxesForAccount(ctx, accountID),
-		"PurgeMailboxesForAccount must expunge active messages before deleting mailboxes (no FK violation)")
-
-	assertAccountFullyDetached(t, db, ctx, accountID)
-}
-
-// assertAccountFullyDetached verifies the post-conditions shared by both hard-delete paths:
+// assertAccountFullyDetached verifies the post-conditions of the hard delete:
 // all mailboxes removed, all messages expunged and detached (kept for the later S3 cleanup
 // phase), and mailbox_stats rows gone via cascade.
 func assertAccountFullyDetached(t *testing.T, db *Database, ctx context.Context, accountID int64) {

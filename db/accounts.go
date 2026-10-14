@@ -803,8 +803,10 @@ type AccountSummary struct {
 	CreatedAt       string `json:"created_at"`
 }
 
-// GetAccountsByDomain returns a simplified list of accounts for a given domain
-// Used by the purge-domain command to iterate through accounts
+// GetAccountsByDomain returns a simplified list of the accounts whose primary address is
+// in domain, soft-deleted ones included. It is what the purge-domain command iterates
+// through, and a purge that failed leaves its account soft-deleted: leaving those out would
+// make a re-run skip exactly the accounts it has to finish.
 func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]AccountSummary, error) {
 	query := `
 		SELECT a.id,
@@ -816,7 +818,6 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id AND c.primary_identity = TRUE
 		WHERE LOWER(c.address) LIKE '%' || '@' || LOWER($1)
-		  AND a.deleted_at IS NULL
 		ORDER BY c.address
 	`
 

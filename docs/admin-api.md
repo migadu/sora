@@ -250,6 +250,44 @@ curl -X DELETE http://localhost:8080/admin/accounts/user@example.com \
   -H "Authorization: Bearer your-api-key"
 ```
 
+#### Delete Account (Purge)
+
+**Endpoint:** `DELETE /admin/accounts/{email}?purge=true`
+
+Permanently delete an account and everything it holds now, with no grace period: its mailboxes,
+messages and their S3 objects, search index, Sieve scripts, credentials and the account itself.
+It cannot be undone with `/restore`. Equivalent to `sora-admin accounts delete --email <email> --confirm --purge`,
+and the same code as the cleaner's own deletion of soft-deleted accounts.
+
+The account is taken out of service first (soft-deleted, so it can no longer sign in or receive
+mail), and its open sessions are ended and its cached logins dropped, as for a soft delete.
+An account that is already soft-deleted can be purged too; that skips the rest of its grace period.
+
+Purging a large account can take a while. The purge carries on if the client disconnects or the
+request times out.
+
+**Response:** `200 OK`
+```json
+{
+  "email": "user@example.com",
+  "s3_objects_deleted": 1420,
+  "messages_deleted": 1420,
+  "message": "Account purged. All of its data has been permanently deleted."
+}
+```
+
+**Errors:**
+- `404 Not Found`: no account has that address
+- `503 Service Unavailable`: the server has no object storage configured, so S3 data cannot be removed; the account is left as it was
+- `409 Conflict`: the account was restored while it was being purged
+- `500 Internal Server Error`: the purge stopped partway, for example because S3 refused deletes or an upload of one of the account's messages was in flight. The account stays out of service and keeps its address. Repeat the request to finish; if nobody does, the cleaner finishes the account after its grace period.
+
+**Example:**
+```bash
+curl -X DELETE "http://localhost:8080/admin/accounts/user@example.com?purge=true" \
+  -H "Authorization: Bearer your-api-key"
+```
+
 #### Restore Deleted Account
 
 **Endpoint:** `POST /admin/accounts/{email}/restore`
