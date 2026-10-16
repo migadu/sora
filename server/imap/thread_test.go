@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/db"
 	"github.com/stretchr/testify/assert"
@@ -291,5 +292,36 @@ func TestExtractIDs(t *testing.T) {
 	}
 	for in, want := range cases {
 		assert.Equal(t, want, extractIDs(in), "extractIDs(%q)", in)
+	}
+}
+
+// TestThreadOrderedSubject_TieBreakWithoutSeq: for UID THREAD the database leaves
+// Seq at 0, so messages with the same base subject and sent date must still come
+// out in mailbox (UID) order, not in whatever order an unstable sort leaves them.
+func TestThreadOrderedSubject_TieBreakWithoutSeq(t *testing.T) {
+	session := &IMAPSession{}
+	sent := time.Now().Truncate(time.Second)
+
+	for run := 0; run < 50; run++ {
+		var messages []db.ThreadMessageResult
+		for uid := 40; uid >= 1; uid-- {
+			messages = append(messages, db.ThreadMessageResult{UID: imap.UID(uid), SubjectSort: "same", SentDate: sent})
+		}
+
+		result := session.threadOrderedSubject(imapserver.NumKindUID, messages)
+
+		assert.Len(t, result, 1)
+		var got []uint32
+		for _, td := range result {
+			got = append(got, td.Chain...)
+			for _, sub := range td.SubThreads {
+				got = append(got, sub.Chain...)
+			}
+		}
+		for i := 1; i < len(got); i++ {
+			if got[i-1] > got[i] {
+				t.Fatalf("run %d: messages out of UID order: %v", run, got)
+			}
+		}
 	}
 }

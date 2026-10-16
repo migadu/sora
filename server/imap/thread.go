@@ -80,7 +80,8 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 
 // threadOrderedSubject implements the ORDEREDSUBJECT threading algorithm (RFC 5256 section 2.1)
 func (s *IMAPSession) threadOrderedSubject(numKind imapserver.NumKind, messages []db.ThreadMessageResult) []imap.ThreadData {
-	// 1. Sort messages by subject, then by sent date, then by sequence number
+	// 1. Sort messages by subject, then by sent date, then by mailbox order. UID
+	// order is sequence order, and UID is always set; Seq is 0 for UID THREAD.
 	sort.Slice(messages, func(i, j int) bool {
 		if messages[i].SubjectSort != messages[j].SubjectSort {
 			return messages[i].SubjectSort < messages[j].SubjectSort
@@ -88,7 +89,7 @@ func (s *IMAPSession) threadOrderedSubject(numKind imapserver.NumKind, messages 
 		if !messages[i].SentDate.Equal(messages[j].SentDate) {
 			return messages[i].SentDate.Before(messages[j].SentDate)
 		}
-		return messages[i].Seq < messages[j].Seq
+		return messages[i].UID < messages[j].UID
 	})
 
 	var result []imap.ThreadData
