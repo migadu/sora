@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/migadu/sora/db"
 	"github.com/stretchr/testify/assert"
@@ -30,6 +31,33 @@ func TestThreadOrderedSubject(t *testing.T) {
 	assert.Equal(t, []uint32{1, 3}, result[0].Chain, "Should group by subject and order by sent date")
 	assert.Equal(t, []uint32{2}, result[1].Chain)
 	assert.Equal(t, []uint32{4}, result[2].Chain)
+}
+
+// TestThreadOrderedSubject_Shape pins the tree RFC 5256 section 3 gives an
+// ORDEREDSUBJECT thread: the first message at the root, the second its child,
+// and every later message a sibling of the second ("there are no
+// grandchildren"). Two messages are a chain, (194 195) in the RFC's example;
+// more are (174 (175)(176)(178)(181)(180)).
+func TestThreadOrderedSubject_Shape(t *testing.T) {
+	session := &IMAPSession{}
+
+	now := time.Now()
+	messages := []db.ThreadMessageResult{
+		{UID: 1, Seq: 1, SubjectSort: "hello", SentDate: now.Add(-4 * time.Hour)},
+		{UID: 2, Seq: 2, SubjectSort: "hello", SentDate: now.Add(-3 * time.Hour)},
+		{UID: 3, Seq: 3, SubjectSort: "hello", SentDate: now.Add(-2 * time.Hour)},
+		{UID: 4, Seq: 4, SubjectSort: "world", SentDate: now.Add(-1 * time.Hour)},
+		{UID: 5, Seq: 5, SubjectSort: "world", SentDate: now},
+		{UID: 6, Seq: 6, SubjectSort: "hello", SentDate: now.Add(-30 * time.Minute)},
+	}
+
+	result := session.threadOrderedSubject(imapserver.NumKindUID, messages)
+
+	want := []imap.ThreadData{
+		{Chain: []uint32{1}, SubThreads: []imap.ThreadData{{Chain: []uint32{2}}, {Chain: []uint32{3}}, {Chain: []uint32{6}}}},
+		{Chain: []uint32{4, 5}},
+	}
+	assert.Equal(t, want, result)
 }
 
 func TestThreadReferences(t *testing.T) {

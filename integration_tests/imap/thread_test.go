@@ -4,6 +4,7 @@ package imap_test
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -93,13 +94,12 @@ func TestIMAP_Thread_Integration(t *testing.T) {
 			t.Fatalf("Expected 2 threads, got %d", len(res))
 		}
 
-		// First thread should be the "Test Thread" (UIDs 1, 2, 3) AND 5 (since it shares the subject)
-		if len(res[0].Chain) != 4 {
-			t.Errorf("Expected first thread to have 4 messages in chain, got %d", len(res[0].Chain))
-		} else {
-			if res[0].Chain[0] != 1 || res[0].Chain[1] != 2 || res[0].Chain[2] != 3 || res[0].Chain[3] != 5 {
-				t.Errorf("Expected chain [1 2 3 5], got %v", res[0].Chain)
-			}
+		// First thread is "Test Thread": UIDs 1, 2, 3 and 5 share the base
+		// subject. RFC 5256 section 3 puts the first message at the root and
+		// every other one directly under it: (1 (2)(3)(5)).
+		want := imap.ThreadData{Chain: []uint32{1}, SubThreads: []imap.ThreadData{{Chain: []uint32{2}}, {Chain: []uint32{3}}, {Chain: []uint32{5}}}}
+		if !reflect.DeepEqual(res[0], want) {
+			t.Errorf("Expected first thread %+v, got %+v", want, res[0])
 		}
 
 		// Second thread should be "Unrelated" (UID 4)
