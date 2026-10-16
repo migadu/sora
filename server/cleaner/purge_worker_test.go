@@ -17,6 +17,7 @@ type fakePurgeWorkerDB struct {
 	fakePurgeObjectDB
 	due       []int64
 	held      map[int64]bool  // claimed by "another node"
+	lockErr   map[int64]error // taking the lock itself fails (pool timeout, DB down)
 	failing   map[int64]error // purge fails with this error
 	restored  map[int64]bool  // not soft-deleted any more
 	claims    []int64
@@ -28,7 +29,7 @@ type fakePurgeWorkerDB struct {
 }
 
 func newFakePurgeWorkerDB(due ...int64) *fakePurgeWorkerDB {
-	return &fakePurgeWorkerDB{due: due, held: map[int64]bool{}, failing: map[int64]error{}, restored: map[int64]bool{}, finalized: map[int64]bool{}}
+	return &fakePurgeWorkerDB{due: due, held: map[int64]bool{}, lockErr: map[int64]error{}, failing: map[int64]error{}, restored: map[int64]bool{}, finalized: map[int64]bool{}}
 }
 
 func (f *fakePurgeWorkerDB) ListAccountsForPurgeWithRetry(context.Context, int) ([]int64, error) {
@@ -36,6 +37,9 @@ func (f *fakePurgeWorkerDB) ListAccountsForPurgeWithRetry(context.Context, int) 
 }
 
 func (f *fakePurgeWorkerDB) ExecuteWithAccountPurgeLock(ctx context.Context, accountID int64, fn func(ctx context.Context) error) (bool, error) {
+	if err := f.lockErr[accountID]; err != nil {
+		return false, err
+	}
 	if f.held[accountID] {
 		return false, nil
 	}
@@ -145,3 +149,17 @@ func TestPurgeWorker_WakeIsNonBlockingAndCoalesces(t *testing.T) {
 }
 
 var _ = db.AccountPurgeLockID // the claim's lock id lives in db; see ExecuteWithAccountPurgeLock
+
+// Failing to take the lock (a pool timeout, the database away for a moment) says nothing
+// about the account: it must not be backed off for it, and the cycle goes on.
+func TestPurgeWorker_RunOnce_LockErrorIsNotTheAccountsFailure(t *testing.T) {
+	rdb := newFakePurgeWorkerDB(1, 2)
+	rdb.lockErr[1] = errors.New("pool timeout")
+	w := newPurgeWorker(rdb, okBulkDeleter{}, time.Minute)
+
+	purged, err := w.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 1, purged, "the cycle goes on to the next account")
+	require.Empty(t, rdb.failures, "a failure to take the lock must not back the account off")
+	require.Equal(t, []int64{2}, rdb.purged)
+}

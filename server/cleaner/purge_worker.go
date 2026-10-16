@@ -185,6 +185,13 @@ func (w *PurgeWorker) RunOnce(ctx context.Context) (int, error) {
 		case err == nil && !claimed:
 			logger.Info("Purge: account is being purged by another node, skipping", "account_id", accountID)
 			continue
+		case !claimed:
+			// The lock could not be taken (a pool timeout, the database away for a
+			// moment): nothing about the account, so no backoff. The next cycle tries again.
+			if ctx.Err() == nil {
+				logger.Warn("Purge: could not take the account's lock; left for the next cycle", "account_id", accountID, "error", err)
+			}
+			continue
 		case errors.Is(err, ErrAccountInService):
 			// Restored between the poll and the claim; the restore cleared its mark.
 			logger.Info("Purge: account was restored, not purged", "account_id", accountID)
