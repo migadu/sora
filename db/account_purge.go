@@ -83,12 +83,18 @@ func (db *Database) ListAccountsForPurge(ctx context.Context, limit int) ([]int6
 // run: base doubled per attempt so far, capped at max, on the database clock. It returns
 // that time. An account that is no longer marked (restored, or purged by another node
 // meanwhile) is left alone and the zero time is returned.
+//
+// The exponent is clamped before the multiplication: LEAST evaluates both arguments, and
+// base * 2^attempts outgrows an interval (64-bit microseconds) after a few dozen attempts
+// of a purge that keeps failing; from then on every attempt would error here instead of
+// backing off, and the worker would retry the account every poll. 2^20 minutes is two
+// years, past any cap worth setting.
 func (db *Database) RecordAccountPurgeFailure(ctx context.Context, tx pgx.Tx, accountID int64, base, max time.Duration) (time.Time, error) {
 	var next *time.Time
 	err := tx.QueryRow(ctx, `
 		UPDATE accounts
 		SET purge_attempts = purge_attempts + 1,
-		    purge_next_attempt_at = now() + LEAST($3::interval, $2::interval * power(2, purge_attempts))
+		    purge_next_attempt_at = now() + LEAST($3::interval, $2::interval * power(2, LEAST(purge_attempts, 20)))
 		WHERE id = $1 AND purge_requested_at IS NOT NULL
 		RETURNING purge_next_attempt_at
 	`, accountID, base, max).Scan(&next)

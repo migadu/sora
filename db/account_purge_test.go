@@ -246,3 +246,27 @@ func TestExecuteWithAccountPurgeLock_SecondCallerNotClaimed(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, claimed)
 }
+
+// A purge that keeps failing must not break the backoff arithmetic: PostgreSQL evaluates
+// both arguments of LEAST, and 1m * 2^38 does not fit an interval, so once an account has
+// failed often enough every further attempt would error instead of backing off.
+func TestRecordAccountPurgeFailure_ManyAttemptsDoNotOverflow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("database test")
+	}
+	db, accountID, email, _, _ := setupRestoreTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+	inTx(t, db, func(tx pgx.Tx) {
+		_, _, err := db.RequestAccountPurge(ctx, tx, email)
+		require.NoError(t, err)
+	})
+	_, err := db.GetWritePool().Exec(ctx, `UPDATE accounts SET purge_attempts = 40 WHERE id = $1`, accountID)
+	require.NoError(t, err)
+
+	inTx(t, db, func(tx pgx.Tx) {
+		next, err := db.RecordAccountPurgeFailure(ctx, tx, accountID, time.Minute, time.Hour)
+		require.NoError(t, err, "attempt 41 must still record a backoff")
+		require.WithinDuration(t, time.Now().Add(time.Hour), next, 15*time.Second)
+	})
+}
