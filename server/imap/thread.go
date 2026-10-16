@@ -80,30 +80,36 @@ func (s *IMAPSession) threadOrderedSubject(numKind imapserver.NumKind, messages 
 		return messages[i].Seq < messages[j].Seq
 	})
 
-	var result []imap.ThreadData
-	var currentThread *imap.ThreadData
+	// Split the sorted messages into threads of the same base subject.
+	var threads [][]uint32
 	var currentSubject string
-
 	for _, msg := range messages {
 		id := s.getMessageID(numKind, msg)
-
-		if currentThread == nil || msg.SubjectSort != currentSubject || msg.SubjectSort == "" {
-			// Start a new thread
-			if currentThread != nil {
-				result = append(result, *currentThread)
-			}
-			currentThread = &imap.ThreadData{
-				Chain: []uint32{id},
-			}
+		if len(threads) == 0 || msg.SubjectSort != currentSubject || msg.SubjectSort == "" {
+			threads = append(threads, []uint32{id})
 			currentSubject = msg.SubjectSort
 		} else {
-			// Add to current thread
-			currentThread.Chain = append(currentThread.Chain, id)
+			threads[len(threads)-1] = append(threads[len(threads)-1], id)
 		}
 	}
 
-	if currentThread != nil {
-		result = append(result, *currentThread)
+	// RFC 5256 section 3: "The second message of a thread is the child of the
+	// first message, and subsequent messages of the thread are siblings of the
+	// second message and hence children of the message at the root. Hence,
+	// there are no grandchildren in ORDEREDSUBJECT threading." Two messages
+	// are a chain, (194 195) in the RFC's example; three or more are the first
+	// with the rest as its children, (174 (175)(176)(178)(181)(180)), since a
+	// nested group needs at least two members.
+	result := make([]imap.ThreadData, 0, len(threads))
+	for _, ids := range threads {
+		td := imap.ThreadData{Chain: ids}
+		if len(ids) > 2 {
+			td.Chain = ids[:1]
+			for _, id := range ids[1:] {
+				td.SubThreads = append(td.SubThreads, imap.ThreadData{Chain: []uint32{id}})
+			}
+		}
+		result = append(result, td)
 	}
 
 	// 2. Sort the final threads by the sent date of the first message in the thread
