@@ -73,9 +73,21 @@ func TestMessagesWithoutFTSRowStayVisible(t *testing.T) {
 	}
 
 	t.Run("THREAD ALL returns messages with no FTS row", func(t *testing.T) {
-		// THREAD joins the FTS table unconditionally, so this is the query most exposed to
-		// a WHERE-side account scope.
-		msgs, err := db.GetMessagesForThreading(ctx, mailboxID, accountID, &imap.SearchCriteria{}, true)
+		msgs, err := db.GetMessagesForThreading(ctx, mailboxID, accountID, &imap.SearchCriteria{}, true, true)
+		require.NoError(t, err)
+		found := map[imap.UID]bool{}
+		for _, m := range msgs {
+			found[m.UID] = true
+		}
+		assert.True(t, found[9101], "the indexed message must be threaded")
+		assert.True(t, found[9102], "SILENT LOSS: a message with no messages_fts_v2 row vanished from THREAD ALL")
+	})
+
+	t.Run("THREAD with a body key returns messages with no FTS row", func(t *testing.T) {
+		// A BODY key brings the FTS table into the THREAD query. NOT BODY of a term no
+		// message contains is true of every message, the one without an FTS row included.
+		msgs, err := db.GetMessagesForThreading(ctx, mailboxID, accountID,
+			&imap.SearchCriteria{Not: []imap.SearchCriteria{{Body: []string{"zzqxnomatch"}}}}, true, false)
 		require.NoError(t, err)
 		found := map[imap.UID]bool{}
 		for _, m := range msgs {
@@ -83,7 +95,7 @@ func TestMessagesWithoutFTSRowStayVisible(t *testing.T) {
 		}
 		assert.True(t, found[9101], "the indexed message must be threaded")
 		assert.True(t, found[9102],
-			"SILENT LOSS: a message with no messages_fts_v2 row vanished from THREAD ALL, which "+
+			"SILENT LOSS: a message with no messages_fts_v2 row vanished from THREAD NOT BODY, which "+
 				"is what happens when the account scope is moved from the JOIN ON clause into WHERE")
 	})
 

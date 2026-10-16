@@ -83,7 +83,7 @@ func TestLegacySharedMailboxMessagesStaySearchable(t *testing.T) {
 	}
 
 	t.Run("THREAD ALL", func(t *testing.T) {
-		msgs, err := db.GetMessagesForThreading(ctx, mailboxID, ownerID, &imap.SearchCriteria{}, true)
+		msgs, err := db.GetMessagesForThreading(ctx, mailboxID, ownerID, &imap.SearchCriteria{}, true, true)
 		require.NoError(t, err)
 		found := map[imap.UID]bool{}
 		for _, m := range msgs {

@@ -2,6 +2,7 @@ package imap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -41,7 +42,17 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 	// account: messages.account_id always carries the owner (server/imap/copy.go passes
 	// destMailbox.AccountID, LMTP and delivery resolve the owner likewise). Passing the
 	// session account here would make every shared-mailbox body search return nothing.
-	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, s.selectedMailbox.ID, s.selectedMailbox.AccountID, criteria, includeSubject)
+	withSeqNums := numKind == imapserver.NumKindSeq
+	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, s.selectedMailbox.ID, s.selectedMailbox.AccountID, criteria, includeSubject, withSeqNums)
+	if errors.Is(err, db.ErrThreadTooManyMessages) {
+		// RFC 5530 section 3, LIMIT: "The operation ran up against an
+		// implementation limit of some kind".
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeLimit,
+			Text: fmt.Sprintf("THREAD matches more than %d messages, narrow the search", db.ThreadMaxMessages),
+		}
+	}
 	if err != nil {
 		s.ErrorLog("failed to fetch messages for threading", "err", err)
 		return nil, fmt.Errorf("failed to fetch messages for threading: %w", err)
@@ -69,7 +80,8 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 
 // threadOrderedSubject implements the ORDEREDSUBJECT threading algorithm (RFC 5256 section 2.1)
 func (s *IMAPSession) threadOrderedSubject(numKind imapserver.NumKind, messages []db.ThreadMessageResult) []imap.ThreadData {
-	// 1. Sort messages by subject, then by sent date, then by sequence number
+	// 1. Sort messages by subject, then by sent date, then by mailbox order. UID
+	// order is sequence order, and UID is always set; Seq is 0 for UID THREAD.
 	sort.Slice(messages, func(i, j int) bool {
 		if messages[i].SubjectSort != messages[j].SubjectSort {
 			return messages[i].SubjectSort < messages[j].SubjectSort
@@ -77,7 +89,7 @@ func (s *IMAPSession) threadOrderedSubject(numKind imapserver.NumKind, messages 
 		if !messages[i].SentDate.Equal(messages[j].SentDate) {
 			return messages[i].SentDate.Before(messages[j].SentDate)
 		}
-		return messages[i].Seq < messages[j].Seq
+		return messages[i].UID < messages[j].UID
 	})
 
 	// Split the sorted messages into threads of the same base subject.
