@@ -16,7 +16,6 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/server/cleaner"
 	"github.com/migadu/sora/testutils"
 	"github.com/stretchr/testify/require"
 )
@@ -111,9 +110,9 @@ func TestAccountPurgeResumability(t *testing.T) {
 	messageCount := 5
 	createPurgeTestMessages(t, ctx, rdb, s3Storage, accountID, email, messageCount)
 
-	// Step 1: Disable the account and run the mailbox/message hard-delete phase
-	// (simulating a purge interrupted before S3 cleanup)
-	_, err = cleaner.DisableAccount(ctx, rdb, email)
+	// Step 1: Take the account out of service and run the mailbox/message hard-delete
+	// phase (simulating a purge interrupted before S3 cleanup)
+	_, _, err = rdb.RequestAccountPurgeWithRetry(ctx, email)
 	require.NoError(t, err)
 	err = rdb.HardDeleteAccountWithRetry(ctx, accountID)
 	require.NoError(t, err)

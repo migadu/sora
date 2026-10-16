@@ -87,6 +87,7 @@ type serverDependencies struct {
 	uploadWorker       *uploader.UploadWorker
 	cacheInstance      *cache.Cache
 	cleanupWorker      *cleaner.CleanupWorker
+	purgeWorker        *cleaner.PurgeWorker // performs requested account purges; only where there is object storage
 	ftsWorker          *fts.Worker
 	relayQueue         *relayqueue.DiskQueue
 	relayWorker        *relayqueue.Worker
@@ -238,6 +239,9 @@ func main() {
 	}
 	if deps.cleanupWorker != nil {
 		defer deps.cleanupWorker.Stop()
+	}
+	if deps.purgeWorker != nil {
+		defer deps.purgeWorker.Stop()
 	}
 	if deps.ftsWorker != nil {
 		defer deps.ftsWorker.Stop()
@@ -845,6 +849,14 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		// Start cleanup worker
 		if err := deps.cleanupWorker.Start(ctx); err != nil {
 			errorHandler.FatalError("start cleanup worker", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+
+		// The purge worker performs account purges requested through the Admin API on
+		// any node; it runs here because this node has object storage.
+		deps.purgeWorker = cleaner.NewPurgeWorker(deps.resilientDB, deps.storage, cfg.Cleanup.GetPurgePollIntervalWithDefault())
+		if err := deps.purgeWorker.Start(ctx); err != nil {
+			errorHandler.FatalError("start purge worker", err)
 			os.Exit(errorHandler.WaitForExit())
 		}
 
@@ -2343,6 +2355,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		Cache:              deps.cacheInstance,
 		Uploader:           deps.uploadWorker,
 		Storage:            deps.storage,
+		PurgeWorker:        deps.purgeWorker,
 		RelayQueue:         deps.relayQueue, // Global relay queue
 		MaxMessageSize:     serverConfig.GetMaxMessageSizeWithDefault(),
 		MaxConnections:     serverConfig.MaxConnections,

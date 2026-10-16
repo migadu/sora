@@ -151,19 +151,21 @@ func purgeAccountWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilien
 		s3Storage = realS3
 	}
 
-	disabledID, err := cleaner.DisableAccount(ctx, rdb, email)
+	// The same mark the Admin API sets: if this run does not finish, a purge worker on
+	// a node with object storage does, and the request is visible meanwhile.
+	markedID, _, err := rdb.RequestAccountPurgeWithRetry(ctx, email)
 	if err != nil {
 		return fmt.Errorf("failed to take the account out of service: %w", err)
 	}
-	if disabledID != accountID {
-		return fmt.Errorf("%s belongs to account %d, not %d; nothing was purged", email, disabledID, accountID)
+	if markedID != accountID {
+		return fmt.Errorf("%s belongs to account %d, not %d; nothing was purged", email, markedID, accountID)
 	}
-	fmt.Printf("[OK] Account out of service (no new logins or deliveries); sessions already open stay until kicked: sora-admin connections kick --user %s\n", email)
+	fmt.Printf("[OK] Account out of service and marked for purging (no new logins or deliveries); sessions already open stay until kicked: sora-admin connections kick --user %s\n", email)
 
 	stats, err := cleaner.PurgeAccount(ctx, rdb, purgeDeleter(s3Storage), accountID)
 	fmt.Printf("Deleted %d S3 objects and %d message records\n", stats.S3Objects, stats.Messages)
 	if err != nil {
-		return fmt.Errorf("purge incomplete (the account stays out of service; run the command again to finish): %w", err)
+		return fmt.Errorf("purge incomplete (the account stays out of service and marked; the server's purge worker finishes it, or run the command again): %w", err)
 	}
 	fmt.Printf("[OK] Account, mailboxes, messages and credentials deleted\n")
 	return nil

@@ -349,8 +349,8 @@ During the grace period, the account can be restored using the 'accounts restore
 
 Use the --purge flag to immediately delete all data (messages from S3, mailboxes,
 credentials) without any grace period. This action is irreversible. The account is
-taken out of service first; if the purge stops partway, it stays out of service, and
-running the command again finishes it.
+taken out of service and marked for purging first; if the purge stops partway, it stays
+out of service, and the server's purge worker (or running the command again) finishes it.
 
 Usage:
   sora-admin accounts delete [options]

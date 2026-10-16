@@ -92,9 +92,10 @@ func TestAccountPurgeFailureLeavesAccountRetryable(t *testing.T) {
 	stillThere, err := rdb.GetAccountIDByEmailWithRetry(ctx, email)
 	require.NoError(t, err, "a failed purge must leave the account findable by its address")
 	require.Equal(t, accountID, stillThere)
-	var deleted bool
-	require.NoError(t, rdb.QueryRowWithRetry(ctx, `SELECT deleted_at IS NOT NULL FROM accounts WHERE id = $1`, accountID).Scan(&deleted))
+	var deleted, marked bool
+	require.NoError(t, rdb.QueryRowWithRetry(ctx, `SELECT deleted_at IS NOT NULL, purge_requested_at IS NOT NULL FROM accounts WHERE id = $1`, accountID).Scan(&deleted, &marked))
 	require.True(t, deleted, "a failed purge must leave the account out of service")
+	require.True(t, marked, "a failed purge must leave the account marked, so the server's purge worker finishes it")
 
 	require.NoError(t, purgeAccountWithStorage(ctx, cfg, rdb, accountID, email, s3Storage))
 	requireAccountGone(t, ctx, rdb, accountID, email)

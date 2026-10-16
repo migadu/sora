@@ -6,37 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/stretchr/testify/require"
 )
-
-type fakeDisabler struct {
-	accountID   int64
-	deleteErr   error
-	lookupOnPri bool
-}
-
-func (f *fakeDisabler) GetAccountIDByEmailWithRetry(ctx context.Context, _ string) (int64, error) {
-	f.lookupOnPri, _ = ctx.Value(consts.UseMasterDBKey).(bool)
-	return f.accountID, nil
-}
-
-func (f *fakeDisabler) DeleteAccountWithRetry(_ context.Context, _ string) error {
-	return f.deleteErr
-}
-
-// TestDisableAccount_ReadsPrimary ensures DisableAccount pins its address lookup to the
-// primary so a lagging read replica cannot hide a just-created account or return the id
-// of an earlier account that held the same address, and accepts an account that is
-// already soft-deleted.
-func TestDisableAccount_ReadsPrimary(t *testing.T) {
-	d := &fakeDisabler{accountID: 42, deleteErr: db.ErrAccountAlreadyDeleted}
-	id, err := DisableAccount(context.Background(), d, "user@example.com")
-	require.NoError(t, err)
-	require.Equal(t, int64(42), id)
-	require.True(t, d.lookupOnPri, "DisableAccount must resolve the address on the primary")
-}
 
 type fakePurgeObjectDB struct {
 	batches [][]db.UserScopedObjectForCleanup
