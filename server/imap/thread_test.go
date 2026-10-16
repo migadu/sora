@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -323,5 +324,57 @@ func TestThreadOrderedSubject_TieBreakWithoutSeq(t *testing.T) {
 				t.Fatalf("run %d: messages out of UID order: %v", run, got)
 			}
 		}
+	}
+}
+
+// TestThreadUIDResultIgnoresSeq: for UID THREAD the database does not compute
+// sequence numbers and leaves Seq at 0 (db.GetMessagesForThreading), so no
+// algorithm may let Seq decide a UID THREAD result. Each algorithm runs on the
+// same messages with real sequence numbers and with Seq zeroed, and the two
+// results must match. The messages include ties on subject and sent date, so a
+// tie-break on Seq shows up, and arrive in reverse UID order, so a result cannot
+// pass by keeping the input order.
+func TestThreadUIDResultIgnoresSeq(t *testing.T) {
+	session := &IMAPSession{}
+	sent := time.Now().Truncate(time.Second)
+
+	var messages []db.ThreadMessageResult
+	for uid := 30; uid >= 1; uid-- {
+		msg := db.ThreadMessageResult{
+			UID:          imap.UID(uid),
+			Seq:          uint32(uid),
+			MessageID:    fmt.Sprintf("m%d@example.com", uid),
+			SubjectSort:  fmt.Sprintf("subject %d", uid%3),
+			SentDate:     sent.Add(time.Duration(uid%2) * time.Hour),
+			InternalDate: sent,
+		}
+		if uid%5 != 0 {
+			msg.References = fmt.Sprintf("m%d@example.com", uid-uid%5)
+		}
+		messages = append(messages, msg)
+	}
+
+	run := func(alg imap.ThreadAlgorithm, zeroSeq bool) []imap.ThreadData {
+		in := make([]db.ThreadMessageResult, len(messages))
+		copy(in, messages)
+		if zeroSeq {
+			for i := range in {
+				in[i].Seq = 0
+			}
+		}
+		switch alg {
+		case imap.ThreadOrderedSubject:
+			return session.threadOrderedSubject(imapserver.NumKindUID, in)
+		case imap.ThreadRefs:
+			return session.threadReferences(imapserver.NumKindUID, in, true)
+		default:
+			return session.threadReferences(imapserver.NumKindUID, in, false)
+		}
+	}
+
+	for _, alg := range []imap.ThreadAlgorithm{imap.ThreadOrderedSubject, imap.ThreadReferences, imap.ThreadRefs} {
+		t.Run(string(alg), func(t *testing.T) {
+			assert.Equal(t, run(alg, false), run(alg, true), "UID THREAD %s result depends on Seq", alg)
+		})
 	}
 }
