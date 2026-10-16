@@ -2,6 +2,7 @@ package imap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -41,7 +42,17 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 	// account: messages.account_id always carries the owner (server/imap/copy.go passes
 	// destMailbox.AccountID, LMTP and delivery resolve the owner likewise). Passing the
 	// session account here would make every shared-mailbox body search return nothing.
-	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, s.selectedMailbox.ID, s.selectedMailbox.AccountID, criteria, includeSubject)
+	withSeqNums := numKind == imapserver.NumKindSeq
+	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, s.selectedMailbox.ID, s.selectedMailbox.AccountID, criteria, includeSubject, withSeqNums)
+	if errors.Is(err, db.ErrThreadTooManyMessages) {
+		// RFC 5530 section 3, LIMIT: "The operation ran up against an
+		// implementation limit of some kind".
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeLimit,
+			Text: fmt.Sprintf("THREAD matches more than %d messages, narrow the search", db.ThreadMaxMessages),
+		}
+	}
 	if err != nil {
 		s.ErrorLog("failed to fetch messages for threading", "err", err)
 		return nil, fmt.Errorf("failed to fetch messages for threading: %w", err)

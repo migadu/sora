@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -23,16 +24,34 @@ type ThreadMessageResult struct {
 	Seq          uint32
 }
 
-// ThreadMaxMessages defines the hard cap for how many messages we will thread at once to prevent OOM/CPU spikes.
-const ThreadMaxMessages = 5000
+// ThreadMaxMessages is the most messages one THREAD command threads. A search
+// matching more is refused with ErrThreadTooManyMessages rather than threaded in
+// part: a client such as Roundcube shows the THREAD result as the message list, so
+// a partial result would present the rest of the folder as gone.
+//
+// Threading is in memory and cheap (about 18 ms and 27 MB for 50,000 messages);
+// the cap bounds the rows one command pulls from the database. It is a variable
+// only so tests can lower it.
+var ThreadMaxMessages = 50000
 
-// GetMessagesForThreading executes a query to retrieve threading metadata for all matching messages.
-// It leverages idx_messages_mailbox_dates_uid for high performance index-only scans.
-func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, includeSubject bool) ([]ThreadMessageResult, error) {
+// ErrThreadTooManyMessages is returned when a THREAD search matches more than
+// ThreadMaxMessages messages.
+var ErrThreadTooManyMessages = errors.New("THREAD search matches too many messages")
+
+// GetMessagesForThreading returns the threading metadata of the messages in a
+// mailbox that match criteria, in UID order. withSeqNums fills in each message's
+// sequence number, which only THREAD (not UID THREAD) needs and which costs a
+// ROW_NUMBER() over the whole mailbox; otherwise Seq is 0.
+func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, includeSubject, withSeqNums bool) ([]ThreadMessageResult, error) {
 	// Fold custom keywords in the criteria onto the mailbox's canonical case so
 	// THREAD ... KEYWORD <name> matches case-insensitively (RFC 9051 §2.3.2),
 	// mirroring the SEARCH executors.
 	if err := db.canonicalizeSearchCriteriaKeywords(ctx, nil, mailboxID, criteria); err != nil {
+		return nil, err
+	}
+	// A sequence-set search key compiles to a seqnum column the query does not
+	// have; name the same messages by UID instead, as SEARCH does.
+	if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, criteria); err != nil {
 		return nil, err
 	}
 	paramCounter := 0
@@ -40,40 +59,46 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 	if err != nil {
 		return nil, fmt.Errorf("failed to build search criteria for threading: %w", err)
 	}
-
 	whereArgs["mailbox_id"] = mailboxID
-	// The FTS join is account-scoped (see ftsScopedJoin): THREAD joins messages_fts_v2
-	// unconditionally, including for THREAD ALL, so this argument is always required.
 	whereArgs["accountID"] = accountID
 
-	subjectSelect1 := `'' AS subject_sort`
-	subjectSelect2 := `l.subject_sort`
+	subjectSelect := `'' AS subject_sort`
 	if includeSubject {
-		subjectSelect1 = `m.subject_sort`
+		subjectSelect = `m.subject_sort`
 	}
 
-	finalQueryString := fmt.Sprintf(`
-		WITH seq AS (
-			SELECT uid, ROW_NUMBER() OVER(ORDER BY uid ASC) as seqnum
-			FROM messages 
+	// The FTS table is joined only for a BODY or TEXT key: one probe per message
+	// otherwise buys nothing. When joined, it is account-scoped (see ftsScopedJoin).
+	ftsJoin := ""
+	if criteriaContainsFTS(criteria) {
+		ftsJoin = ftsScopedJoin
+	}
+
+	seqCTE, seqJoin, seqSelect := "", "", "0"
+	if withSeqNums {
+		seqCTE = `WITH seq AS (
+			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
+			FROM messages
 			WHERE mailbox_id = @mailbox_id AND expunged_at IS NULL
-		),
-		latest_msgs AS (
-			SELECT m.uid, m.message_id, m.in_reply_to, m."references", %s, m.sent_date, m.internal_date
-			FROM messages m
-			LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
-			`+ftsScopedJoin+`
-			WHERE m.mailbox_id = @mailbox_id
-			  AND m.expunged_at IS NULL
-			  AND %s
-			ORDER BY m.uid DESC
-			LIMIT %d
-		)
-		SELECT l.uid, l.message_id, l.in_reply_to, l."references", %s, l.sent_date, l.internal_date, seq.seqnum
-		FROM latest_msgs l
-		JOIN seq ON l.uid = seq.uid
-		ORDER BY l.uid ASC
-	`, subjectSelect1, whereClause, ThreadMaxMessages, subjectSelect2)
+		)`
+		seqJoin = "JOIN seq ON seq.uid = m.uid"
+		seqSelect = "seq.seqnum"
+	}
+
+	// One row past the cap tells a search that is too large from one that is not.
+	finalQueryString := fmt.Sprintf(`
+		%s
+		SELECT m.uid, m.message_id, m.in_reply_to, m."references", %s, m.sent_date, m.internal_date, %s
+		FROM messages m
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+		%s
+		%s
+		WHERE m.mailbox_id = @mailbox_id
+		  AND m.expunged_at IS NULL
+		  AND %s
+		ORDER BY m.uid
+		LIMIT %d
+	`, seqCTE, subjectSelect, seqSelect, ftsJoin, seqJoin, whereClause, ThreadMaxMessages+1)
 
 	start := time.Now()
 	rows, err := db.ReadPool.Query(ctx, finalQueryString, whereArgs)
@@ -116,6 +141,10 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 		}
 
 		messages = append(messages, msg)
+		if len(messages) > ThreadMaxMessages {
+			metrics.DBQueriesTotal.WithLabelValues("search_thread", "too_many", "read").Inc()
+			return nil, ErrThreadTooManyMessages
+		}
 	}
 
 	if err := rows.Err(); err != nil {

@@ -987,6 +987,61 @@ func resolveResultLimit(explicitLimit int, isSearchAll, isComplexQuery bool, ord
 	return MaxSearchResults // 100k for simple queries - reasonable for IMAP clients
 }
 
+// mapSeqNumCriteriaToUID rewrites every sequence-set search key in c, nested ones
+// included, into the UID set those sequence numbers name now, so a query can filter on
+// m.uid instead of materialising ROW_NUMBER() over the whole mailbox.
+func (db *Database) mapSeqNumCriteriaToUID(ctx context.Context, mailboxID int64, c *imap.SearchCriteria) error {
+	if c == nil {
+		return nil
+	}
+	if len(c.SeqNum) > 0 {
+		for _, seqSet := range c.SeqNum {
+			var mappedUIDSet imap.UIDSet
+			for _, seqRange := range seqSet {
+				startUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Start)
+				if err != nil {
+					continue // Out of bounds or invalid
+				}
+
+				uidRange := imap.UIDRange{Start: startUID}
+				if seqRange.Stop == 0 {
+					uidRange.Stop = 0
+				} else {
+					stopUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Stop)
+					if err != nil {
+						uidRange.Stop = 0 // Cap to highest
+					} else {
+						uidRange.Start = min(startUID, stopUID)
+						uidRange.Stop = max(startUID, stopUID)
+					}
+				}
+				mappedUIDSet = append(mappedUIDSet, uidRange)
+			}
+			if len(mappedUIDSet) > 0 {
+				c.UID = append(c.UID, mappedUIDSet)
+			} else if len(seqSet) > 0 {
+				c.UID = append(c.UID, []imap.UIDRange{{Start: 0, Stop: 0}})
+			}
+		}
+		// Clear the SeqNum criteria since we moved them to UID
+		c.SeqNum = nil
+	}
+	for i := range c.Not {
+		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, &c.Not[i]); err != nil {
+			return err
+		}
+	}
+	for i := range c.Or {
+		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, &c.Or[i][0]); err != nil {
+			return err
+		}
+		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, &c.Or[i][1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // getMessagesQueryExecutor is a helper function to execute the message retrieval query,
 // handling both default and custom sorting with optimized query selection.
 func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, orderByClause string, limit, mailboxMessageCount int) ([]Message, error) {
@@ -1038,60 +1093,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID, acc
 	if needsSeqNumSearch && !strings.Contains(strings.ToLower(orderByClause), "seqnum") {
 		// If we only need seqnum for WHERE filtering, we can map the SeqSets to UIDSets
 		// and completely bypass the catastrophic ROW_NUMBER() materialization!
-		var mapSeqToUID func(*imap.SearchCriteria) error
-		mapSeqToUID = func(c *imap.SearchCriteria) error {
-			if c == nil {
-				return nil
-			}
-			if len(c.SeqNum) > 0 {
-				for _, seqSet := range c.SeqNum {
-					var mappedUIDSet imap.UIDSet
-					for _, seqRange := range seqSet {
-						startUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Start)
-						if err != nil {
-							continue // Out of bounds or invalid
-						}
-
-						uidRange := imap.UIDRange{Start: startUID}
-						if seqRange.Stop == 0 {
-							uidRange.Stop = 0
-						} else {
-							stopUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Stop)
-							if err != nil {
-								uidRange.Stop = 0 // Cap to highest
-							} else {
-								uidRange.Start = min(startUID, stopUID)
-								uidRange.Stop = max(startUID, stopUID)
-							}
-						}
-						mappedUIDSet = append(mappedUIDSet, uidRange)
-					}
-					if len(mappedUIDSet) > 0 {
-						c.UID = append(c.UID, mappedUIDSet)
-					} else if len(seqSet) > 0 {
-						c.UID = append(c.UID, []imap.UIDRange{{Start: 0, Stop: 0}})
-					}
-				}
-				// Clear the SeqNum criteria since we moved them to UID
-				c.SeqNum = nil
-			}
-			for i := range c.Not {
-				if err := mapSeqToUID(&c.Not[i]); err != nil {
-					return err
-				}
-			}
-			for i := range c.Or {
-				if err := mapSeqToUID(&c.Or[i][0]); err != nil {
-					return err
-				}
-				if err := mapSeqToUID(&c.Or[i][1]); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-
-		if err := mapSeqToUID(criteria); err == nil {
+		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, criteria); err == nil {
 			needsSeqNumSearch = false
 			isComplexQuery = db.needsComplexQuery(criteria, orderByClause)
 		}
