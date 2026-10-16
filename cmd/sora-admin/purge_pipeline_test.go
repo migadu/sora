@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/stretchr/testify/require"
@@ -208,4 +209,82 @@ func TestDomainPurgeResumesAccountLeftOutOfService(t *testing.T) {
 		requireAccountGone(t, ctx, rdb, ids[i], email)
 		require.Equal(t, 0, countS3ObjectsForAccount(t, s3Storage, email), "S3 objects left for %s", email)
 	}
+}
+
+// TestAccountPurgeWaitsForServerPurgeWorker: once the account is marked, a server's purge
+// worker may already be purging it and hold its lock. The command must not run a second
+// purge alongside; it waits for the worker and reports the outcome.
+func TestAccountPurgeWaitsForServerPurgeWorker(t *testing.T) {
+	ctx := context.Background()
+	rdb := setupPurgeTestDatabase(t)
+	defer rdb.Close()
+	s3Storage := createPurgeTestS3Storage(t)
+	cfg := createPurgeTestConfig(t)
+
+	email := fmt.Sprintf("test-purge-held-%d@example.com", time.Now().UnixNano())
+	createPurgeTestAccount(t, rdb, email, "password123")
+	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, email)
+	require.NoError(t, err)
+	createPurgeTestMessages(t, ctx, rdb, s3Storage, accountID, email, 2)
+
+	// What a purge worker mid-purge looks like from outside: the account's lock is held.
+	tx, err := rdb.BeginTxWithRetry(ctx, pgx.TxOptions{})
+	require.NoError(t, err)
+	_, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, db.AccountPurgeLockID(accountID))
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() { done <- purgeAccountWithStorage(ctx, cfg, rdb, accountID, email, s3Storage) }()
+	select {
+	case err := <-done:
+		_ = tx.Rollback(ctx)
+		t.Fatalf("the command returned (%v) while a purge worker held the account", err)
+	case <-time.After(2 * time.Second):
+	}
+	require.Equal(t, 1, countAccountRows(t, ctx, rdb, "accounts", accountID), "the command purged the account under the worker's lock")
+
+	require.NoError(t, tx.Rollback(ctx))
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the command did not finish once the lock was released")
+	}
+	requireAccountGone(t, ctx, rdb, accountID, email)
+}
+
+// TestAccountPurgeFollowsTheAddress: the address decides which account is purged. If the
+// id the caller resolved earlier no longer matches (the address moved to another account
+// in between), the account behind the address is the one taken out of service and purged,
+// and the account the stale id named is left alone.
+func TestAccountPurgeFollowsTheAddress(t *testing.T) {
+	ctx := context.Background()
+	rdb := setupPurgeTestDatabase(t)
+	defer rdb.Close()
+	s3Storage := createPurgeTestS3Storage(t)
+	cfg := createPurgeTestConfig(t)
+
+	stamp := time.Now().UnixNano()
+	emailA := fmt.Sprintf("test-purge-stale-a-%d@example.com", stamp)
+	emailB := fmt.Sprintf("test-purge-stale-b-%d@example.com", stamp)
+	alias := fmt.Sprintf("test-purge-stale-x-%d@example.com", stamp)
+	createPurgeTestAccount(t, rdb, emailA, "password123")
+	createPurgeTestAccount(t, rdb, emailB, "password123")
+	idA, err := rdb.GetAccountIDByEmailWithRetry(ctx, emailA)
+	require.NoError(t, err)
+	idB, err := rdb.GetAccountIDByEmailWithRetry(ctx, emailB)
+	require.NoError(t, err)
+	createPurgeTestMessages(t, ctx, rdb, s3Storage, idB, emailB, 2)
+
+	// The alias was A's when the caller resolved it, and B's by the time the purge ran.
+	require.NoError(t, rdb.AddCredentialWithRetry(ctx, db.AddCredentialRequest{AccountID: idA, NewEmail: alias, NewPassword: "password123", NewHashType: "bcrypt"}))
+	_, err = rdb.ExecWithRetry(ctx, `UPDATE credentials SET account_id = $1 WHERE LOWER(address) = LOWER($2)`, idB, alias)
+	require.NoError(t, err)
+
+	require.NoError(t, purgeAccountWithStorage(ctx, cfg, rdb, idA, alias, s3Storage))
+
+	requireAccountGone(t, ctx, rdb, idB, emailB)
+	var deletedA bool
+	require.NoError(t, rdb.QueryRowWithRetry(ctx, `SELECT deleted_at IS NOT NULL FROM accounts WHERE id = $1`, idA).Scan(&deletedA))
+	require.False(t, deletedA, "the account the stale id named must be left in service")
 }
