@@ -208,8 +208,9 @@ func TestPendingAccountPurges_CountsAndAges(t *testing.T) {
 	count, oldest, err := db.PendingAccountPurges(ctx)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, count, before+1)
+	// The oldest age is over the whole shared test database, where earlier tests leave
+	// marks nothing purges, so only its sign is known.
 	require.GreaterOrEqual(t, oldest, time.Duration(0))
-	require.Less(t, oldest, time.Minute)
 
 	details, err := db.GetAccountDetails(ctx, email)
 	require.NoError(t, err)
