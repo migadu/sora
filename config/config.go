@@ -315,6 +315,17 @@ type CleanupConfig struct {
 	// (no heartbeat, no lease on its own uploads) before the cleaner treats it as
 	// gone and reaps the unuploaded messages whose bodies only existed on its disk.
 	InstanceLivenessThreshold string `toml:"instance_liveness_threshold"`
+	// PurgePollInterval is how often the purge worker (on nodes with object storage)
+	// looks for accounts marked for purging.
+	PurgePollInterval string `toml:"purge_poll_interval"`
+}
+
+// GetPurgePollInterval parses the purge worker's poll interval.
+func (c *CleanupConfig) GetPurgePollInterval() (time.Duration, error) {
+	if c.PurgePollInterval == "" {
+		return 30 * time.Second, nil
+	}
+	return helpers.ParseDuration(c.PurgePollInterval)
 }
 
 // GetGracePeriod parses the grace period duration
@@ -1718,6 +1729,15 @@ func (c *CleanupConfig) GetGracePeriodWithDefault() time.Duration {
 		return 14 * 24 * time.Hour
 	}
 	return period
+}
+
+func (c *CleanupConfig) GetPurgePollIntervalWithDefault() time.Duration {
+	interval, err := c.GetPurgePollInterval()
+	if err != nil {
+		log.Printf("WARNING: Failed to parse cleanup purge_poll_interval: %v, using default (30s)", err)
+		return 30 * time.Second
+	}
+	return interval
 }
 
 func (c *CleanupConfig) GetWakeIntervalWithDefault() time.Duration {

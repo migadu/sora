@@ -4,7 +4,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server/cleaner"
@@ -151,23 +153,72 @@ func purgeAccountWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilien
 		s3Storage = realS3
 	}
 
-	disabledID, err := cleaner.DisableAccount(ctx, rdb, email)
+	// The same mark the Admin API sets: if this run does not finish, a purge worker on
+	// a node with object storage does, and the request is visible meanwhile.
+	markedID, _, err := rdb.RequestAccountPurgeWithRetry(ctx, email)
 	if err != nil {
 		return fmt.Errorf("failed to take the account out of service: %w", err)
 	}
-	if disabledID != accountID {
-		return fmt.Errorf("%s belongs to account %d, not %d; nothing was purged", email, disabledID, accountID)
+	if markedID != accountID {
+		// The address decides: it is what the operator named, and the account behind it is
+		// the one now out of service. The id the caller resolved earlier is stale (the
+		// address moved to another account in between); that account is left alone.
+		fmt.Printf("Note: %s now belongs to account %d (it was looked up as %d); the account behind the address is purged\n", email, markedID, accountID)
+		accountID = markedID
 	}
-	fmt.Printf("[OK] Account out of service (no new logins or deliveries); sessions already open stay until kicked: sora-admin connections kick --user %s\n", email)
+	fmt.Printf("[OK] Account out of service and marked for purging (no new logins or deliveries); sessions already open stay until kicked: sora-admin connections kick --user %s\n", email)
 
-	stats, err := cleaner.PurgeAccount(ctx, rdb, purgeDeleter(s3Storage), accountID)
+	// Under the same lock a server's purge worker takes, so the two never purge the same
+	// account at once. If a worker already holds it, it is already doing this job: wait for
+	// it rather than run alongside, and report what it did.
+	deleter := purgeDeleter(s3Storage)
+	var stats cleaner.PurgeStats
+	var purgeErr error
+	waiting := false
+	for {
+		claimed, err := rdb.ExecuteWithAccountPurgeLock(ctx, accountID, func(ctx context.Context) error {
+			stats, purgeErr = cleaner.PurgeAccount(ctx, rdb, deleter, accountID)
+			return purgeErr
+		})
+		if claimed || err != nil {
+			if err != nil && purgeErr == nil {
+				return fmt.Errorf("failed to lock the account for purging: %w", err)
+			}
+			break
+		}
+		if !waiting {
+			fmt.Printf("A server's purge worker is purging this account; waiting for it...\n")
+			waiting = true
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(purgeWaitPoll):
+		}
+		exists, _, err := rdb.GetAccountDeletionStateWithRetry(ctx, accountID)
+		if err != nil {
+			return fmt.Errorf("failed to check on the account while waiting for the purge worker: %w", err)
+		}
+		if !exists {
+			fmt.Printf("[OK] Account purged by the server's purge worker\n")
+			return nil
+		}
+	}
+
 	fmt.Printf("Deleted %d S3 objects and %d message records\n", stats.S3Objects, stats.Messages)
-	if err != nil {
-		return fmt.Errorf("purge incomplete (the account stays out of service; run the command again to finish): %w", err)
+	if errors.Is(purgeErr, cleaner.ErrAccountInService) {
+		return fmt.Errorf("the account was restored while it was being purged; nothing more was deleted")
+	}
+	if purgeErr != nil {
+		return fmt.Errorf("purge incomplete (the account stays out of service and marked; the server's purge worker finishes it, or run the command again): %w", purgeErr)
 	}
 	fmt.Printf("[OK] Account, mailboxes, messages and credentials deleted\n")
 	return nil
 }
+
+// purgeWaitPoll is how often the command checks on an account a server's purge worker is
+// purging, while it waits for that worker to finish.
+const purgeWaitPoll = 2 * time.Second
 
 // newPurgeStorage creates the S3 client a purge deletes bodies with, from cfg.
 func newPurgeStorage(cfg AdminConfig) (objectStorage, error) {

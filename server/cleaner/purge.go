@@ -50,12 +50,6 @@ const (
 	purgeGracePeriod = -24 * time.Hour
 )
 
-// AccountDisabler is what DisableAccount needs from the database.
-type AccountDisabler interface {
-	GetAccountIDByEmailWithRetry(ctx context.Context, email string) (int64, error)
-	DeleteAccountWithRetry(ctx context.Context, email string) error
-}
-
 // AccountPurgeDatabase is what PurgeAccount needs from the database.
 type AccountPurgeDatabase interface {
 	s3ObjectReaper
@@ -72,30 +66,9 @@ type PurgeStats struct {
 	Messages  int64 // message rows deleted
 }
 
-// DisableAccount takes the account behind email out of service by soft-deleting it, so it
-// can no longer sign in or be delivered to, and returns its id. An account that is
-// already soft-deleted is fine. An unknown address returns consts.ErrUserNotFound.
-//
-// It resolves the address on the primary, so a lagging read replica cannot hide a just-
-// created account or return the id of an earlier account that held the same address.
-//
-// It does not end the account's open sessions; a caller that can reach them (the Admin
-// API, through its connection trackers) does that next.
-func DisableAccount(ctx context.Context, rdb AccountDisabler, email string) (int64, error) {
-	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, email)
-	if err != nil {
-		return 0, err
-	}
-	if err := rdb.DeleteAccountWithRetry(ctx, email); err != nil && !errors.Is(err, db.ErrAccountAlreadyDeleted) {
-		return 0, fmt.Errorf("failed to take account out of service: %w", err)
-	}
-	return accountID, nil
-}
-
 // PurgeAccount permanently deletes a soft-deleted account and everything it holds: its
 // mailboxes and messages, their S3 bodies, its search vectors, its credentials and the
-// account row. Call DisableAccount first.
+// account row. The account must be out of service first (db.RequestAccountPurge).
 //
 // Each pass runs the whole pipeline; a pass that cannot finalize the account (something
 // is still there) is followed by another after a pause, up to purgeMaxPasses. Every
@@ -203,6 +176,5 @@ func drainAccountFTS(ctx context.Context, rdb ftsDrainer, accountID int64) (int6
 // The production types satisfy the purge's interfaces.
 var (
 	_ AccountPurgeDatabase = (*resilient.ResilientDatabase)(nil)
-	_ AccountDisabler      = (*resilient.ResilientDatabase)(nil)
 	_ S3BulkDeleter        = (*resilient.ResilientS3Storage)(nil)
 )

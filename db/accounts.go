@@ -613,10 +613,15 @@ func (db *Database) RestoreAccount(ctx context.Context, tx pgx.Tx, email string)
 		return ErrAccountNotDeleted
 	}
 
-	// Restore the account by clearing deleted_at
+	// Restore the account by clearing deleted_at. A pending purge request goes with it:
+	// the purge worker never touches an account in service, and the mark must not
+	// outlive the deletion it belonged to.
 	result, err := tx.Exec(ctx, `
-		UPDATE accounts 
-		SET deleted_at = NULL 
+		UPDATE accounts
+		SET deleted_at = NULL,
+		    purge_requested_at = NULL,
+		    purge_attempts = 0,
+		    purge_next_attempt_at = NULL
 		WHERE id = $1 AND deleted_at IS NOT NULL
 	`, accountID)
 	if err != nil {
@@ -717,15 +722,18 @@ type AccountCredentialDetails struct {
 
 // AccountDetails holds comprehensive information about an account.
 type AccountDetails struct {
-	ID           int64                      `json:"account_id"`
-	CreatedAt    time.Time                  `json:"created_at"`
-	DeletedAt    *time.Time                 `json:"deleted_at,omitempty"`
-	PrimaryEmail string                     `json:"primary_email"`
-	Status       string                     `json:"status"`
-	Credentials  []AccountCredentialDetails `json:"credentials"`
-	MailboxCount int64                      `json:"mailbox_count"`
-	MessageCount int64                      `json:"message_count"`
-	StorageUsed  int64                      `json:"storage_used"`
+	ID        int64      `json:"account_id"`
+	CreatedAt time.Time  `json:"created_at"`
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+	// PurgeRequestedAt is set while a requested purge is pending; the purge worker on a
+	// node with object storage removes the account, and this with it.
+	PurgeRequestedAt *time.Time                 `json:"purge_requested_at,omitempty"`
+	PrimaryEmail     string                     `json:"primary_email"`
+	Status           string                     `json:"status"`
+	Credentials      []AccountCredentialDetails `json:"credentials"`
+	MailboxCount     int64                      `json:"mailbox_count"`
+	MessageCount     int64                      `json:"message_count"`
+	StorageUsed      int64                      `json:"storage_used"`
 }
 
 // GetAccountDetails retrieves comprehensive details for an account by any associated email.
@@ -740,7 +748,7 @@ func (db *Database) GetAccountDetails(ctx context.Context, email string) (*Accou
 	// This combines fetching the account and its statistics in one query.
 	var details AccountDetails
 	err = db.GetReadPool().QueryRow(ctx, `
-		SELECT a.id, a.created_at, a.deleted_at,
+		SELECT a.id, a.created_at, a.deleted_at, a.purge_requested_at,
 			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id AND deleted_at IS NULL) AS mailbox_count,
 			   -- Live count/size (not the mailbox_stats cache) so per-account quota is always correct.
 			   -- Join mailboxes so messages in a soft-deleted (but not-yet-purged) mailbox are
@@ -752,7 +760,7 @@ func (db *Database) GetAccountDetails(ctx context.Context, email string) (*Accou
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id
 		WHERE LOWER(c.address) = $1
-	`, normalizedEmail).Scan(&details.ID, &details.CreatedAt, &details.DeletedAt, &details.MailboxCount, &details.MessageCount, &details.StorageUsed)
+	`, normalizedEmail).Scan(&details.ID, &details.CreatedAt, &details.DeletedAt, &details.PurgeRequestedAt, &details.MailboxCount, &details.MessageCount, &details.StorageUsed)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

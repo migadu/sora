@@ -118,6 +118,31 @@ var (
 		},
 	)
 
+	// Account purges. A purge is requested on any node and performed by the purge worker
+	// of a node with object storage; the mark sits in the database in between. A growing
+	// age of the oldest pending request means nothing is picking purges up.
+	AccountPurgesPending = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_account_purges_pending",
+			Help: "Accounts marked for purging that no purge worker has finished yet",
+		},
+	)
+
+	AccountPurgeOldestPendingSeconds = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_account_purge_oldest_pending_seconds",
+			Help: "Age of the oldest pending account purge request, 0 when there is none",
+		},
+	)
+
+	AccountPurgesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_account_purges_total",
+			Help: "Account purge attempts by the purge worker, by result",
+		},
+		[]string{"result"},
+	)
+
 	// Full-text search indexing. There was previously no visibility into the FTS pipeline
 	// at all, which matters more now that messages_fts_v2 holds one row per account rather
 	// than one per body: the worker's write volume scales with how widely bodies are shared,

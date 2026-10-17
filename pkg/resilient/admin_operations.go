@@ -184,6 +184,76 @@ func (rd *ResilientDatabase) RestoreAccountWithRetry(ctx context.Context, email 
 	return err
 }
 
+// RequestAccountPurgeWithRetry marks the account for purging and takes it out of service
+// (see db.RequestAccountPurge), returning its id.
+func (rd *ResilientDatabase) RequestAccountPurgeWithRetry(ctx context.Context, email string) (int64, time.Time, error) {
+	type request struct {
+		id          int64
+		requestedAt time.Time
+	}
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		id, requestedAt, err := rd.getOperationalDatabaseForOperation(ctx, true).RequestAccountPurge(ctx, tx, email)
+		return request{id, requestedAt}, err
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op, consts.ErrUserNotFound)
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	r := result.(request)
+	return r.id, r.requestedAt, nil
+}
+
+// ListAccountsForPurgeWithRetry lists accounts whose requested purge is due.
+func (rd *ResilientDatabase) ListAccountsForPurgeWithRetry(ctx context.Context, limit int) ([]int64, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).ListAccountsForPurge(ctx, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	ids, _ := result.([]int64)
+	return ids, nil
+}
+
+// RecordAccountPurgeFailureWithRetry counts a failed purge attempt and backs the account
+// off (see db.RecordAccountPurgeFailure).
+func (rd *ResilientDatabase) RecordAccountPurgeFailureWithRetry(ctx context.Context, accountID int64, base, max time.Duration) (time.Time, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).RecordAccountPurgeFailure(ctx, tx, accountID, base, max)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return result.(time.Time), nil
+}
+
+// PendingAccountPurgesWithRetry reports the pending purge requests: how many, and the
+// age of the oldest.
+func (rd *ResilientDatabase) PendingAccountPurgesWithRetry(ctx context.Context) (int64, time.Duration, error) {
+	type pending struct {
+		count  int64
+		oldest time.Duration
+	}
+	op := func(ctx context.Context) (any, error) {
+		count, oldest, err := rd.getOperationalDatabaseForOperation(ctx, false).PendingAccountPurges(ctx)
+		return pending{count, oldest}, err
+	}
+	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
+	if err != nil {
+		return 0, 0, err
+	}
+	p := result.(pending)
+	return p.count, p.oldest, nil
+}
+
+// ExecuteWithAccountPurgeLock runs fn under the account's purge lock, or reports false
+// when another node holds it (see db.ExecuteWithAccountPurgeLock).
+func (rd *ResilientDatabase) ExecuteWithAccountPurgeLock(ctx context.Context, accountID int64, fn func(ctx context.Context) error) (bool, error) {
+	return rd.getOperationalDatabaseForOperation(ctx, true).ExecuteWithAccountPurgeLock(ctx, accountID, fn)
+}
+
 func (rd *ResilientDatabase) CleanupFailedUploadsWithRetry(ctx context.Context, gracePeriod time.Duration, maxAttempts int, instanceLiveness time.Duration) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, true).CleanupFailedUploads(ctx, tx, gracePeriod, maxAttempts, instanceLiveness)

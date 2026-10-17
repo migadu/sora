@@ -25,6 +25,7 @@ import (
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/cleaner"
 	"github.com/migadu/sora/server/delivery"
 	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/sieveengine"
@@ -50,9 +51,10 @@ type Server struct {
 	cache          *cache.Cache
 	uploader       *uploader.UploadWorker
 	storage        *storage.S3Storage
-	relayQueue     delivery.RelayQueue // Global relay queue for mail delivery
-	maxMessageSize int64               // Max accepted mail-injection body size (bytes); 0 -> default
-	maxConnections int                 // Max concurrent connections; 0 -> unlimited
+	purgeWorker    *cleaner.PurgeWorker // this node's purge worker, nil on a node without object storage
+	relayQueue     delivery.RelayQueue  // Global relay queue for mail delivery
+	maxMessageSize int64                // Max accepted mail-injection body size (bytes); 0 -> default
+	maxConnections int                  // Max concurrent connections; 0 -> unlimited
 	server         *http.Server
 	tls            bool
 	tlsConfig      *tls.Config // TLS config from manager (takes precedence) or nil
@@ -85,9 +87,10 @@ type ServerOptions struct {
 	Cache              *cache.Cache
 	Uploader           *uploader.UploadWorker
 	Storage            *storage.S3Storage
-	RelayQueue         delivery.RelayQueue // Global relay queue for mail delivery
-	MaxMessageSize     int64               // Max accepted mail-injection body size (bytes); 0 -> 50MB default
-	MaxConnections     int                 // Max concurrent connections; 0 -> unlimited
+	PurgeWorker        *cleaner.PurgeWorker // woken when a purge is requested on this node; nil without object storage
+	RelayQueue         delivery.RelayQueue  // Global relay queue for mail delivery
+	MaxMessageSize     int64                // Max accepted mail-injection body size (bytes); 0 -> 50MB default
+	MaxConnections     int                  // Max concurrent connections; 0 -> unlimited
 	TLS                bool
 	TLSConfig          *tls.Config // TLS config from manager (takes precedence over cert files)
 	TLSCertFile        string
@@ -208,6 +211,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		cache:              options.Cache,
 		uploader:           options.Uploader,
 		storage:            options.Storage,
+		purgeWorker:        options.PurgeWorker,
 		relayQueue:         options.RelayQueue,
 		maxMessageSize:     options.MaxMessageSize,
 		maxConnections:     options.MaxConnections,
@@ -2033,7 +2037,7 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 				"POST /admin/accounts",
 				"GET /admin/accounts/{email}",
 				"PUT /admin/accounts/{email}",
-				"DELETE /admin/accounts/{email} (soft delete; ?purge=true deletes permanently, now)",
+				"DELETE /admin/accounts/{email} (soft delete; ?purge=true requests permanent deletion now)",
 				"POST /admin/accounts/{email}/restore",
 				"GET /admin/accounts/{email}/exists",
 				"POST /admin/accounts/{email}/credentials",

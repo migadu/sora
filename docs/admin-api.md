@@ -254,37 +254,46 @@ curl -X DELETE http://localhost:8080/admin/accounts/user@example.com \
 
 **Endpoint:** `DELETE /admin/accounts/{email}?purge=true`
 
-Permanently delete an account and everything it holds now, with no grace period: its mailboxes,
-messages and their S3 objects, search index, Sieve scripts, credentials and the account itself.
-It cannot be undone with `/restore`. Equivalent to `sora-admin accounts delete --email <email> --confirm --purge`,
-and the same code as the cleaner's own deletion of soft-deleted accounts.
+Request the permanent deletion of an account and everything it holds, now, with no grace
+period: its mailboxes, messages and their S3 objects, search index, Sieve scripts, credentials
+and the account itself. Equivalent to `sora-admin accounts delete --email <email> --confirm --purge`.
 
-The account is taken out of service first (soft-deleted, so it can no longer sign in or receive
-mail), and its open sessions are ended and its cached logins dropped, as for a soft delete.
-An account that is already soft-deleted can be purged too; that skips the rest of its grace period.
+The request is served on any node, a proxy without object storage included. It takes the
+account out of service (soft-deleted, so it can no longer sign in or receive mail), ends its open
+sessions and drops its cached logins as a soft delete does, marks it for purging and returns
+`202 Accepted`. The deletion itself is done by the purge worker that runs on every node with
+object storage: it polls for marked accounts (`[cleanup] purge_poll_interval`, default 30s),
+claims each so that only one node works on it, and runs the purge. A purge that fails (S3
+refusing deletes, an upload of one of the account's messages in flight) is retried with a
+per-account backoff; repeating the request resets the backoff. An account that is already
+soft-deleted can be requested too; that skips the rest of its grace period.
 
-Purging a large account can take a while. The purge carries on if the client disconnects or the
-request times out.
+While the purge is pending, `GET /admin/accounts/{email}` shows `purge_requested_at`; once the
+account is gone it answers `404`. `POST /admin/accounts/{email}/restore` before the worker gets
+to it cancels the purge. The pending count and the age of the oldest request are exported as
+`sora_account_purges_pending` and `sora_account_purge_oldest_pending_seconds`; an age that keeps
+growing means no purge worker is running. Even then the account stays soft-deleted and is removed
+by the cleaner after the grace period.
 
-**Response:** `200 OK`
+**Response:** `202 Accepted`
 ```json
 {
   "email": "user@example.com",
-  "s3_objects_deleted": 1420,
-  "messages_deleted": 1420,
-  "message": "Account purged. All of its data has been permanently deleted."
+  "purge_requested_at": "2026-10-17T09:12:44.120Z",
+  "message": "Account is out of service and marked for purging; a purge worker on a node with object storage deletes it. GET /admin/accounts/{email} shows purge_requested_at until the account is gone."
 }
 ```
 
 **Errors:**
 - `404 Not Found`: no account has that address
-- `503 Service Unavailable`: the server has no object storage configured, so S3 data cannot be removed; the account is left as it was
-- `409 Conflict`: the account was restored while it was being purged
-- `500 Internal Server Error`: the purge stopped partway, for example because S3 refused deletes or an upload of one of the account's messages was in flight. The account stays out of service and keeps its address. Repeat the request to finish; if nobody does, the cleaner finishes the account after its grace period.
 
 **Example:**
 ```bash
 curl -X DELETE "http://localhost:8080/admin/accounts/user@example.com?purge=true" \
+  -H "Authorization: Bearer your-api-key"
+
+# then, until it answers 404:
+curl http://localhost:8080/admin/accounts/user@example.com \
   -H "Authorization: Bearer your-api-key"
 ```
 
