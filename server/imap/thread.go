@@ -18,16 +18,17 @@ import (
 var _ imapserver.SessionThread = (*IMAPSession)(nil)
 
 func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, algorithm imap.ThreadAlgorithm, charset string, criteria *imap.SearchCriteria) ([]imap.ThreadData, error) {
-	// THREAD is a full search; share the per-account SEARCH rate limiter.
-	if s.server.searchRateLimiter != nil && s.IMAPUser != nil {
-		if err := s.server.searchRateLimiter.CanSearch(ctx, s.IMAPUser.AccountID()); err != nil {
-			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: err.Error()}
-		}
-	}
-
 	// Reject pathologically complex/deep criteria before building a query.
 	if err := s.validateSearchCriteria("THREAD", criteria); err != nil {
 		return nil, err
+	}
+
+	// THREAD shares the SEARCH rate limit; threading a few UIDs is free, threading
+	// the mailbox is not (see search_rate_limit.go).
+	if scanCharged(criteria) {
+		if err := s.chargeSearch(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	if s.selectedMailbox == nil {

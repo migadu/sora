@@ -90,13 +90,19 @@ Sora includes per-user search rate limiting to prevent DoS attacks via excessive
 
 ```toml
 [servers.imap]
-search_rate_limit_per_min = 10  # Maximum searches per minute (0 = disabled)
+search_rate_limit_per_min = 10  # Searches per window (0 = disabled)
 search_rate_limit_window = "1m" # Time window for rate limiting
+search_rate_limit_burst = 30    # Searches allowed back to back (default: search_rate_limit_per_min)
 ```
 
-When a user exceeds the limit, they receive a clear error message indicating how long to wait before trying again. The rate limiter:
-- Tracks searches per user (not per IP), counting SEARCH, SORT, THREAD and MULTISEARCH alike
-- Uses a sliding time window
+The limit charges the searches that are expensive, not every command that is a search. Clients navigate with SEARCH, SORT and THREAD, and those commands run on indexed metadata:
+- **Charged:** SEARCH whose criteria match on message content anywhere, under NOT and OR included: BODY, TEXT, FROM, TO, CC, BCC, SUBJECT or any other HEADER; SORT and THREAD over the whole mailbox, or a UID or sequence set of more than 1000 messages; multi-mailbox ESEARCH (RFC 7377), which runs one search per mailbox in scope
+- **Free:** criteria made only of UID or sequence sets, flags and keywords, dates, sizes and MODSEQ, such as the unread and flagged searches iOS Mail sends on every mailbox switch, or a SORT or THREAD of one page's UIDs
+
+The rate limiter:
+- Tracks searches per user (not per IP), across all of the user's connections
+- Uses a token bucket: it holds `search_rate_limit_burst` searches and refills continuously at `search_rate_limit_per_min` per `search_rate_limit_window`. With the default burst it allows every sequence the earlier sliding window allowed, at the same sustained rate, and a burst followed by idle time is no longer refused for a whole window
+- Refuses with `NO [LIMIT]` (RFC 5530), saying how long to wait, so that clients can tell throttling from failure
 - Automatically cleans up inactive user tracking
 - Is on by default at 60 searches per minute (set `search_rate_limit_per_min = 0` to disable it)
 
