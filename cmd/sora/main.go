@@ -1401,6 +1401,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			LookupCache:                  serverConfig.LookupCache,
 			SearchRateLimitPerMin:        serverConfig.GetSearchRateLimitPerMin(),
 			SearchRateLimitWindow:        searchRateLimitWindow,
+			SearchRateLimitBurst:         serverConfig.GetSearchRateLimitBurst(),
 			SessionMemoryLimit:           sessionMemoryLimit,
 			AuthIdleTimeout:              authIdleTimeout,
 			CommandTimeout:               commandTimeout,
