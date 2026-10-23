@@ -548,3 +548,224 @@ func TestLeaseIsExclusiveAcrossReArmedDeliveries(t *testing.T) {
 	_, pending = leaseUntil(t, database, pendingID)
 	assert.False(t, pending, "B's finalize takes the row with it")
 }
+
+// Every path that finalizes or deletes a pending row must leave a row another upload holds
+// a live lease on: that row is all that keeps a purge away from a body still being
+// written, and the account, with its address, must not be finalized under it.
+
+// The reviewed hazard: `sora-admin uploader resolve` works from a snapshot of parked
+// uploads and does S3 round trips before it acts. A fresh delivery of the body re-arms the
+// row meanwhile, and the worker leases it and starts writing; the resolver then finds an
+// object under the key (an earlier partial upload) and finalizes the legacy way. It may
+// mark the rows from that object, but it must not drop the row, or a purge would take the
+// body and its rows while the write was still on its way.
+func TestLegacyFinalizeLeavesALiveLease(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	database, email, accountID, mailboxID := setupCleanerTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+	hash := fmt.Sprintf("legacy_finalize_%d", time.Now().UnixNano())
+	instance := fmt.Sprintf("legacy-finalize-%d", time.Now().UnixNano())
+	key := "example.com/rearm/" + hash
+
+	// A legacy finalize still drops a row whose lease ran out: nobody is writing under it.
+	hash2 := fmt.Sprintf("legacy_finalize_lapsed_%d", time.Now().UnixNano())
+	insertKeyedMessage(t, database, accountID, mailboxID, 900, hash2, "user", false, time.Time{})
+	lapsedID := createPendingUpload(t, database, accountID, instance, hash2, 0, time.Time{}, 100)
+	leaseRow(t, database, lapsedID, accountID, hash2, gateTestOwner)
+	expireLease(t, database, lapsedID)
+	tx, err := database.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	require.NoError(t, database.CompleteS3Upload(ctx, tx, hash2, accountID, []string{"example.com/user/" + hash2}))
+	require.NoError(t, tx.Commit(ctx))
+	_, pending := leaseUntil(t, database, lapsedID)
+	assert.False(t, pending, "a lapsed lease protects nothing")
+
+	insertDeliveredMessage(t, database, accountID, mailboxID, "INBOX", hash, instance, 1)
+	_, err = database.GetWritePool().Exec(ctx,
+		`UPDATE pending_uploads SET attempts = 5 WHERE account_id = $1 AND content_hash = $2`, accountID, hash)
+	require.NoError(t, err)
+	failed, err := database.GetFailedUploadsWithEmail(ctx, 5, 1000)
+	require.NoError(t, err)
+	var pendingID int64
+	for _, upload := range failed {
+		if upload.AccountID == accountID && upload.ContentHash == hash {
+			pendingID = upload.ID
+		}
+	}
+	require.NotZero(t, pendingID, "the resolver's snapshot holds the parked upload")
+
+	insertDeliveredMessage(t, database, accountID, mailboxID, "INBOX", hash, instance, 2)
+	leaseRow(t, database, pendingID, accountID, hash, gateTestOwner)
+
+	tx, err = database.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	require.NoError(t, database.CompleteS3Upload(ctx, tx, hash, accountID, []string{key}))
+	require.NoError(t, tx.Commit(ctx))
+	assert.Equal(t, gateTestOwner, leaseOwner(t, database, pendingID), "a legacy finalize must leave a row an upload is writing under")
+
+	tx, err = database.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	require.NoError(t, database.DeleteAccount(ctx, tx, email))
+	require.NoError(t, database.HardDeleteAccounts(ctx, tx, []int64{accountID}))
+	require.NoError(t, tx.Commit(ctx))
+	err = database.ExecuteWithLockedS3Orphans(ctx,
+		[]UserScopedObjectForCleanup{{AccountID: accountID, ContentHash: hash, S3Domain: "example.com", S3Localpart: "rearm"}},
+		-time.Hour, func(_ context.Context, orphans []UserScopedObjectForCleanup) error {
+			assert.Empty(t, orphans, "a purge must not take a body whose upload is still writing")
+			return nil
+		})
+	require.NoError(t, err)
+
+	// The owner lands and finalizes; then, and only then, the row goes.
+	tx, err = database.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	require.NoError(t, database.CompleteLeasedS3Upload(ctx, tx, pendingID, gateTestOwner, hash, accountID, []string{key}))
+	require.NoError(t, tx.Commit(ctx))
+	_, pending = leaseUntil(t, database, pendingID)
+	assert.False(t, pending)
+}
+
+// The resolver's [DELETE] branch removes a parked upload whose body is lost, with its
+// unuploaded message rows. A row re-armed by a fresh delivery while the resolver was
+// checking S3 is not lost any more — its rows include the new message — and a leased row
+// is being written; neither may go.
+func TestDeleteFailedUploadSparesARearmedOrLeasedRow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	database, _, accountID, mailboxID := setupCleanerTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+	const maxAttempts = 5
+	suffix := time.Now().UnixNano()
+
+	rows := func(hash string) (pending, messages int) {
+		t.Helper()
+		require.NoError(t, database.GetWritePool().QueryRow(ctx, `
+			SELECT (SELECT count(*) FROM pending_uploads WHERE account_id = $1 AND content_hash = $2),
+			       (SELECT count(*) FROM messages WHERE account_id = $1 AND content_hash = $2)
+		`, accountID, hash).Scan(&pending, &messages))
+		return pending, messages
+	}
+	deleteFailed := func(hash string) int64 {
+		t.Helper()
+		tx, err := database.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		n, err := database.DeleteFailedUpload(ctx, tx, hash, accountID, maxAttempts)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+		return n
+	}
+	parked := func(tag string, uid int) (string, int64) {
+		t.Helper()
+		hash := fmt.Sprintf("failed_%s_%d", tag, suffix)
+		insertKeyedMessage(t, database, accountID, mailboxID, uid, hash, "user", false, time.Time{})
+		return hash, createPendingUpload(t, database, accountID, "failed-instance", hash, maxAttempts, time.Time{}, 100)
+	}
+
+	rearmed, rearmedID := parked("rearmed", 950)
+	_, err := database.GetWritePool().Exec(ctx, `UPDATE pending_uploads SET attempts = 0 WHERE id = $1`, rearmedID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, deleteFailed(rearmed))
+	pending, messages := rows(rearmed)
+	assert.Equal(t, 1, pending, "a re-armed row is not the resolver's to delete")
+	assert.Equal(t, 1, messages)
+
+	leased, leasedID := parked("leased", 951)
+	_, err = database.GetWritePool().Exec(ctx,
+		`UPDATE pending_uploads SET lease_until = now() + interval '1 minute', lease_owner = 'writer' WHERE id = $1`, leasedID)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, deleteFailed(leased))
+	pending, messages = rows(leased)
+	assert.Equal(t, 1, pending, "a row an upload is writing under must not go")
+	assert.Equal(t, 1, messages)
+
+	lost, _ := parked("lost", 952)
+	assert.EqualValues(t, 1, deleteFailed(lost))
+	pending, messages = rows(lost)
+	assert.Equal(t, 0, pending, "a parked, unleased row whose body is lost goes, with its rows")
+	assert.Equal(t, 0, messages)
+}
+
+// The failed-upload reaper deletes old unuploaded messages that no pending upload can
+// still deliver. A live lease means an upload is delivering it right now, whatever the
+// row's attempts or its instance's heartbeat say.
+func TestFailedUploadReaperSparesALiveLease(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	database, _, accountID, mailboxID := setupCleanerTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+	const maxAttempts = 5
+	hash := fmt.Sprintf("reaper_lease_%d", time.Now().UnixNano())
+	insertKeyedMessage(t, database, accountID, mailboxID, 960, hash, "user", false, time.Time{})
+	_, err := database.GetWritePool().Exec(ctx,
+		`UPDATE messages SET created_at = now() - interval '25 hours' WHERE account_id = $1 AND content_hash = $2`, accountID, hash)
+	require.NoError(t, err)
+	pendingID := createPendingUpload(t, database, accountID, "reaper-instance", hash, maxAttempts, time.Time{}, 100)
+	_, err = database.GetWritePool().Exec(ctx,
+		`UPDATE pending_uploads SET lease_until = now() + interval '1 minute', lease_owner = 'writer' WHERE id = $1`, pendingID)
+	require.NoError(t, err)
+
+	// Each run is rolled back: the reaper is global, and the shared database is not
+	// this test's to clean.
+	survives := func() bool {
+		t.Helper()
+		tx, err := database.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		_, err = database.CleanupFailedUploads(ctx, tx, 24*time.Hour, maxAttempts, time.Hour)
+		require.NoError(t, err)
+		var n int
+		require.NoError(t, tx.QueryRow(ctx,
+			`SELECT count(*) FROM messages WHERE account_id = $1 AND content_hash = $2`, accountID, hash).Scan(&n))
+		return n == 1
+	}
+	assert.True(t, survives(), "a message whose upload holds a live lease must not be reaped")
+	expireLease(t, database, pendingID)
+	assert.False(t, survives(), "without the lease the parked upload is reaped as before")
+}
+
+// An account is not finalized, and its address not released, while an upload of its mail
+// holds a live lease — even with no message rows left, since the pending row cascades with
+// the account and would vanish from under the write.
+func TestAccountIsNotFinalizedUnderALiveLease(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	database, email, accountID, _ := setupCleanerTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+	hash := fmt.Sprintf("finalize_lease_%d", time.Now().UnixNano())
+	pendingID := createPendingUpload(t, database, accountID, "finalize-instance", hash, 0, time.Time{}, 100)
+	leaseRow(t, database, pendingID, accountID, hash, gateTestOwner)
+
+	tx, err := database.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	require.NoError(t, database.DeleteAccount(ctx, tx, email))
+	require.NoError(t, database.HardDeleteAccounts(ctx, tx, []int64{accountID}))
+	require.NoError(t, tx.Commit(ctx))
+	finalize := func() int64 {
+		t.Helper()
+		tx, err := database.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		n, err := database.FinalizeAccountDeletions(ctx, tx, []int64{accountID})
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+		return n
+	}
+	assert.EqualValues(t, 0, finalize(), "the account must outlive an upload in flight")
+	expireLease(t, database, pendingID)
+	assert.EqualValues(t, 1, finalize())
+}

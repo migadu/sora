@@ -131,6 +131,10 @@ func (db *Database) ResetUploadAttempts(ctx context.Context, tx pgx.Tx, contentH
 // deleted only once no unuploaded row is left for the pair; otherwise it stays, and the
 // next lease writes the keys still missing (PendingUploadKeys lists exactly those).
 //
+// The pending row of an upload in flight (a live lease) is never deleted here; see
+// dropFinishedPendingUpload. Marking rows from writtenKeys is still right: those objects
+// exist, and the in-flight upload only writes the same bytes again.
+//
 // The "same key already live" clause is what keeps the pending row from being leased
 // forever: a delivery whose dedup ran before an in-flight upload finalized re-arms the
 // pending row, the next lease finds no key left to write (PendingUploadKeys excludes a
@@ -213,10 +217,16 @@ func markS3Uploaded(ctx context.Context, tx pgx.Tx, contentHash string, accountI
 // dropFinishedPendingUpload deletes the pair's pending row once nothing is left to write
 // for it. It runs after markS3Uploaded in the same transaction, so it sees the rows just
 // marked.
+//
+// A row with a live lease is left: an upload is writing under it (see PassS3WriteGate),
+// and the row is all that keeps a purge away from that body until the write lands. The
+// lease's owner deletes it when it finalizes. The leased finalize ends its own lease
+// before it gets here, so this only ever spares someone else's.
 func dropFinishedPendingUpload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64) error {
 	_, err := tx.Exec(ctx, `
 		DELETE FROM pending_uploads
 		WHERE content_hash = $1 AND account_id = $2
+		  AND (lease_until IS NULL OR lease_until < now())
 		  AND NOT EXISTS (
 			SELECT 1 FROM messages
 			WHERE content_hash = $1 AND account_id = $2 AND uploaded = FALSE
@@ -618,20 +628,30 @@ func (db *Database) GetStrandedUploadInstances(ctx context.Context, maxAttempts 
 // for the given content hash + account. Used by the admin tool to clean up entries where
 // the content is permanently lost ([FAIL] MISSING in S3 and no local file).
 // Returns the number of message rows that were deleted.
-func (d *Database) DeleteFailedUpload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64) (int64, error) {
+//
+// The tool decides from a snapshot of failed uploads, then spends S3 round trips checking
+// each, so by the time it deletes, a fresh delivery of the same body may have re-armed the
+// row (attempts back to zero) and an upload may be writing under its lease. Such a row is
+// no longer the tool's: it is deleted only while it is still parked (attempts at least
+// maxAttempts) and nobody holds a live lease on it, and the message rows go only with it.
+// Otherwise nothing is deleted and 0 is returned.
+func (d *Database) DeleteFailedUpload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, maxAttempts int) (int64, error) {
 	var deleted int64
 	err := tx.QueryRow(ctx, `
-		WITH deleted_messages AS (
-			DELETE FROM messages
-			WHERE content_hash = $1 AND account_id = $2 AND uploaded = FALSE
+		WITH deleted_pending AS (
+			DELETE FROM pending_uploads
+			WHERE content_hash = $1 AND account_id = $2 AND attempts >= $3
+			  AND (lease_until IS NULL OR lease_until < now())
 			RETURNING id
 		),
-		deleted_pending AS (
-			DELETE FROM pending_uploads
-			WHERE content_hash = $1 AND account_id = $2
+		deleted_messages AS (
+			DELETE FROM messages
+			WHERE content_hash = $1 AND account_id = $2 AND uploaded = FALSE
+			  AND EXISTS (SELECT 1 FROM deleted_pending)
+			RETURNING id
 		)
 		SELECT count(*) FROM deleted_messages
-	`, contentHash, accountID).Scan(&deleted)
+	`, contentHash, accountID, maxAttempts).Scan(&deleted)
 	if err != nil {
 		return 0, fmt.Errorf("failed to delete failed upload (hash=%s, account=%d): %w", contentHash, accountID, err)
 	}

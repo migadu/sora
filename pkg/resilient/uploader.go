@@ -172,9 +172,12 @@ func (rd *ResilientDatabase) ResetUploadAttemptsWithRetry(ctx context.Context, c
 	return result.(bool), nil
 }
 
-func (rd *ResilientDatabase) DeleteFailedUploadWithRetry(ctx context.Context, contentHash string, accountID int64) (int64, error) {
+// DeleteFailedUploadWithRetry deletes a parked upload whose body is lost, and its unuploaded
+// message rows, unless the row was re-armed or is leased meanwhile (see
+// db.DeleteFailedUpload).
+func (rd *ResilientDatabase) DeleteFailedUploadWithRetry(ctx context.Context, contentHash string, accountID int64, maxAttempts int) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).DeleteFailedUpload(ctx, tx, contentHash, accountID)
+		return rd.getOperationalDatabaseForOperation(ctx, true).DeleteFailedUpload(ctx, tx, contentHash, accountID, maxAttempts)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	if err != nil {

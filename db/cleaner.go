@@ -540,7 +540,9 @@ func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, tx pgx.Tx,
 //
 // What separates recoverable from lost is whether the node holding the bytes still
 // exists, so a message past the grace period is reaped only when no pending upload
-// can still deliver it, i.e. every pending_uploads row for it either
+// can still deliver it: none is leased to an upload in flight right now (lease_until in
+// the future, see PassS3WriteGate), whatever its attempts and instance say, and every
+// pending_uploads row for it either
 //   - has exhausted its attempts, or
 //   - belongs to an instance that is provably gone (no heartbeat and no lease within
 //     instanceLiveness — see the instance_heartbeats table), or
@@ -583,9 +585,10 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 				SELECT 1 FROM pending_uploads pu
 				LEFT JOIN instance_heartbeats ih ON ih.instance_id = pu.instance_id
 				WHERE pu.content_hash = m.content_hash AND pu.account_id = m.account_id
-				  AND pu.attempts < $2
-				  AND (GREATEST(ih.last_seen, pu.last_attempt) IS NULL
-				       OR GREATEST(ih.last_seen, pu.last_attempt) > now() - $3::interval)
+				  AND (pu.lease_until > now()
+				       OR (pu.attempts < $2
+				           AND (GREATEST(ih.last_seen, pu.last_attempt) IS NULL
+				                OR GREATEST(ih.last_seen, pu.last_attempt) > now() - $3::interval)))
 			  )
 			RETURNING m.content_hash, m.account_id
 		),
@@ -1124,13 +1127,20 @@ func deleteAccountDependents(ctx context.Context, tx pgx.Tx, accountIDs []int64)
 // the usual way to get here: it has no messages, but keeps its mailboxes until
 // HardDeleteAccounts runs.
 //
+// No pending upload of the account may hold a live lease either. pending_uploads cascades
+// with the account, so finalizing would delete the row an upload in flight is writing
+// under, and give up the account's address while the write can still land; such a write
+// would stay in S3 under the address, with nothing pointing at it, or come to sit under a
+// new account that takes the address over.
+//
 // Every query that decides finalization uses this one predicate: the candidate scan on
 // the read pool, the FTS drain and the finalize itself on the primary, so they cannot
 // disagree.
 func accountFinalizableSQL(alias string) string {
 	return alias + `.deleted_at IS NOT NULL
 		AND NOT EXISTS (SELECT 1 FROM messages WHERE account_id = ` + alias + `.id)
-		AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE account_id = ` + alias + `.id)`
+		AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE account_id = ` + alias + `.id)
+		AND NOT EXISTS (SELECT 1 FROM pending_uploads WHERE account_id = ` + alias + `.id AND lease_until > now())`
 }
 
 // GetDanglingAccountsForFinalDeletion finds accounts that are marked as deleted and have no
