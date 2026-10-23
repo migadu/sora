@@ -147,13 +147,13 @@ func TestQResyncHonoursMasterDBPin(t *testing.T) {
 	require.Equal(t, 0, replicaExpunged, "harness broken: replica snapshot should hold no expunged messages")
 
 	// ---- control 3: a context-aware read path DOES honour the pin ------
-	// getUIDBySeqNum (db/message.go) uses GetReadPoolWithContext, so with the
+	// uidsBySeqNum (db/search.go) uses GetReadPoolWithContext, so with the
 	// same wiring and the same pinned context it sees the master's messages:
 	// the master's active set is 201, 203, 204 while the replica's is 201-203.
-	uid, err := split.getUIDBySeqNum(pinnedCtx, mailboxID, 3)
+	uidBySeq, err := split.uidsBySeqNum(pinnedCtx, mailboxID, []int64{3})
 	require.NoError(t, err,
 		"harness broken: a GetReadPoolWithContext-based read should have found the master's messages")
-	require.EqualValues(t, 204, uid,
+	require.EqualValues(t, 204, uidBySeq[3],
 		"harness broken: pinned read should return the master's third active UID")
 
 	// ---- control 4: unpinned QRESYNC reads see the stale replica -------

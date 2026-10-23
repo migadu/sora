@@ -1041,6 +1041,38 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 	return uidBySeq, rows.Err()
 }
 
+// appendSeqSetNums appends the sequence numbers set names as range ends; "*" is not one.
+func appendSeqSetNums(seqNums []int64, set imap.SeqSet) []int64 {
+	for _, r := range set {
+		for _, n := range []uint32{r.Start, r.Stop} {
+			if n != 0 {
+				seqNums = append(seqNums, int64(n))
+			}
+		}
+	}
+	return seqNums
+}
+
+// seqSetToUIDSet maps set to the UID set it names according to uidBySeq (see
+// uidsBySeqNum): a range starting past the last message is dropped, one ending past it
+// runs to the last message ("*"), and the ends of a range may come in either order.
+func seqSetToUIDSet(set imap.SeqSet, uidBySeq map[uint32]imap.UID) imap.UIDSet {
+	var uidSet imap.UIDSet
+	for _, seqRange := range set {
+		startUID, ok := uidBySeq[seqRange.Start]
+		if !ok {
+			continue // Out of bounds or invalid
+		}
+		uidRange := imap.UIDRange{Start: startUID} // Stop 0 is "*"
+		if stopUID, ok := uidBySeq[seqRange.Stop]; ok {
+			uidRange.Start = min(startUID, stopUID)
+			uidRange.Stop = max(startUID, stopUID)
+		}
+		uidSet = append(uidSet, uidRange)
+	}
+	return uidSet
+}
+
 // collectSeqNums appends every sequence number c's sequence sets name as a range end,
 // nested criteria included; "*" is not one.
 func collectSeqNums(c *imap.SearchCriteria, seqNums *[]int64) {
@@ -1048,13 +1080,7 @@ func collectSeqNums(c *imap.SearchCriteria, seqNums *[]int64) {
 		return
 	}
 	for _, seqSet := range c.SeqNum {
-		for _, r := range seqSet {
-			for _, n := range []uint32{r.Start, r.Stop} {
-				if n != 0 {
-					*seqNums = append(*seqNums, int64(n))
-				}
-			}
-		}
+		*seqNums = appendSeqSetNums(*seqNums, seqSet)
 	}
 	for i := range c.Not {
 		collectSeqNums(&c.Not[i], seqNums)
@@ -1066,29 +1092,14 @@ func collectSeqNums(c *imap.SearchCriteria, seqNums *[]int64) {
 }
 
 // rewriteSeqNumCriteria replaces c's sequence sets, nested ones included, with the UID
-// sets they name according to uidBySeq. A range starting past the last message is
-// dropped, one ending past it runs to the last message, and a set naming no message at
+// sets they name according to uidBySeq (see seqSetToUIDSet). A set naming no message at
 // all becomes UID 0, which matches nothing.
 func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID) {
 	if c == nil {
 		return
 	}
 	for _, seqSet := range c.SeqNum {
-		var mappedUIDSet imap.UIDSet
-		for _, seqRange := range seqSet {
-			startUID, ok := uidBySeq[seqRange.Start]
-			if !ok {
-				continue // Out of bounds or invalid
-			}
-
-			uidRange := imap.UIDRange{Start: startUID} // Stop 0 is "*"
-			if stopUID, ok := uidBySeq[seqRange.Stop]; ok && seqRange.Stop != 0 {
-				uidRange.Start = min(startUID, stopUID)
-				uidRange.Stop = max(startUID, stopUID)
-			}
-			mappedUIDSet = append(mappedUIDSet, uidRange)
-		}
-		if len(mappedUIDSet) > 0 {
+		if mappedUIDSet := seqSetToUIDSet(seqSet, uidBySeq); len(mappedUIDSet) > 0 {
 			c.UID = append(c.UID, mappedUIDSet)
 		} else if len(seqSet) > 0 {
 			c.UID = append(c.UID, []imap.UIDRange{{Start: 0, Stop: 0}})

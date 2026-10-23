@@ -206,23 +206,7 @@ func (db *Database) streamMessagesByUIDSet(ctx context.Context, mailboxID int64,
 		bsColInner = "m.body_structure, "
 	}
 
-	// Consolidate all UID ranges into a single WHERE clause to avoid executing hundreds
-	// of individual database queries for fragmented fetches (e.g. Apple Mail).
-	var conditions []string
-	var args []any
-	args = append(args, mailboxID)
-
-	for _, uidRange := range uidSet {
-		if uidRange.Stop == imap.UID(0) {
-			args = append(args, int64(uidRange.Start))
-			conditions = append(conditions, fmt.Sprintf("m.uid >= $%d", len(args)))
-		} else {
-			args = append(args, int64(uidRange.Start), int64(uidRange.Stop))
-			conditions = append(conditions, fmt.Sprintf("(m.uid >= $%d AND m.uid <= $%d)", len(args)-1, len(args)))
-		}
-	}
-
-	whereClause := strings.Join(conditions, " OR ")
+	whereClause, args := uidSetCondition(mailboxID, uidSet)
 
 	// Large result sets are chunked to prevent RAM spikes. We do not cap max results for streams.
 	logger.Debug("Database: Streaming UID fetch", "mailbox_id", mailboxID, "chunk_size", db.fetchChunkSize)
@@ -300,18 +284,22 @@ func (db *Database) streamMessagesByUIDSetChunked(ctx context.Context, mailboxID
 	return nil
 }
 
-func (db *Database) getUIDBySeqNum(ctx context.Context, mailboxID int64, seqNum uint32) (imap.UID, error) {
-	if seqNum == 0 {
-		return 0, fmt.Errorf("invalid sequence number 0")
+// uidSetCondition returns the condition on m.uid that selects uidSet's messages, as one
+// WHERE clause however fragmented the set (e.g. Apple Mail), and its arguments, which
+// start with mailboxID as $1.
+func uidSetCondition(mailboxID int64, uidSet imap.UIDSet) (string, []any) {
+	var conditions []string
+	args := []any{mailboxID}
+	for _, uidRange := range uidSet {
+		if uidRange.Stop == imap.UID(0) {
+			args = append(args, int64(uidRange.Start))
+			conditions = append(conditions, fmt.Sprintf("m.uid >= $%d", len(args)))
+		} else {
+			args = append(args, int64(uidRange.Start), int64(uidRange.Stop))
+			conditions = append(conditions, fmt.Sprintf("(m.uid >= $%d AND m.uid <= $%d)", len(args)-1, len(args)))
+		}
 	}
-	var uid uint32
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT uid FROM messages 
-		WHERE mailbox_id = $1 AND expunged_at IS NULL 
-		ORDER BY uid ASC 
-		OFFSET $2 LIMIT 1
-	`, mailboxID, seqNum-1).Scan(&uid)
-	return imap.UID(uid), err
+	return strings.Join(conditions, " OR "), args
 }
 
 func (db *Database) streamMessagesBySeqSet(ctx context.Context, mailboxID int64, seqSet imap.SeqSet, cb MessageStreamCallback, includeBodyStructure bool) error {
@@ -328,43 +316,24 @@ func (db *Database) streamMessagesBySeqSet(ctx context.Context, mailboxID int64,
 		bsColInner = "m.body_structure, "
 	}
 
-	// Map sequence ranges to UID ranges to prevent O(N) ROW_NUMBER() CTE scans
-	var conditions []string
-	var args []any
-	args = append(args, mailboxID)
-
-	for _, seqRange := range seqSet {
-		startUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Start)
-		if err != nil {
-			// If we fail to resolve Start (e.g. out of bounds), skip this range
-			continue
-		}
-
-		if seqRange.Stop == 0 {
-			args = append(args, int64(startUID))
-			conditions = append(conditions, fmt.Sprintf("m.uid >= $%d", len(args)))
-		} else {
-			stopUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Stop)
-			if err != nil {
-				// Stop is out of bounds, meaning we fetch up to the highest message we have
-				args = append(args, int64(startUID))
-				conditions = append(conditions, fmt.Sprintf("m.uid >= $%d", len(args)))
-			} else {
-				// Safely ensure min/max alignment in case of reverse sequence bounds requested by client
-				minUid := min(startUID, stopUID)
-				maxUid := max(startUID, stopUID)
-				args = append(args, int64(minUid), int64(maxUid))
-				conditions = append(conditions, fmt.Sprintf("(m.uid >= $%d AND m.uid <= $%d)", len(args)-1, len(args)))
-			}
-		}
+	// Map the set to the UIDs it names now, every sequence number in one statement
+	// (uidsBySeqNum), so that a FETCH naming many sequence numbers costs one pass over
+	// the mailbox rather than two index scans into it per range (#111).
+	seqNums := appendSeqSetNums(nil, seqSet)
+	if len(seqNums) == 0 {
+		return nil
 	}
-
-	if len(conditions) == 0 {
+	uidBySeq, err := db.uidsBySeqNum(ctx, mailboxID, seqNums)
+	if err != nil {
+		return err
+	}
+	uidSet := seqSetToUIDSet(seqSet, uidBySeq)
+	if len(uidSet) == 0 {
 		// No valid sequences requested
 		return nil
 	}
 
-	whereClause := strings.Join(conditions, " OR ")
+	whereClause, args := uidSetCondition(mailboxID, uidSet)
 
 	// Large result sets are chunked to prevent RAM spikes. We do not cap max results for streams.
 	logger.Debug("Database: Streaming Seq fetch", "mailbox_id", mailboxID, "chunk_size", db.fetchChunkSize)

@@ -170,12 +170,12 @@ func TestPollMailboxHonoursMasterDBPin(t *testing.T) {
 	require.Equal(t, 0, replicaCount, "harness broken: replica snapshot should hold no messages")
 
 	// ---- control 3: a context-aware read path DOES honour the pin ------
-	// getUIDBySeqNum (db/message.go) uses GetReadPoolWithContext, so with the
+	// uidsBySeqNum (db/search.go) uses GetReadPoolWithContext, so with the
 	// same wiring and the same pinned context it sees the master's messages.
-	uid, err := split.getUIDBySeqNum(pinnedCtx, mailboxID, 1)
+	uidBySeq, err := split.uidsBySeqNum(pinnedCtx, mailboxID, []int64{1})
 	require.NoError(t, err,
 		"harness broken: a GetReadPoolWithContext-based read should have found the master's messages")
-	require.EqualValues(t, 101, uid,
+	require.EqualValues(t, 101, uidBySeq[1],
 		"harness broken: pinned read should return the master's first UID")
 
 	// ---- control 4: unpinned PollMailbox sees the stale replica --------
