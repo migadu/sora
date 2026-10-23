@@ -113,13 +113,18 @@ func (m *mockUploaderDB) CompleteLeasedS3UploadWithRetry(ctx context.Context, pe
 	args := m.Called(ctx, pendingID, contentHash, accountID, writtenKeys)
 	return args.Error(0)
 }
-func (m *mockUploaderDB) PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash string) (db.S3WriteGate, error) {
-	args := m.Called(ctx, pendingID, accountID, contentHash)
+func (m *mockUploaderDB) PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash string, ttl time.Duration) (db.S3WriteGate, error) {
+	args := m.Called(ctx, pendingID, accountID, contentHash, ttl)
 	return args.Get(0).(db.S3WriteGate), args.Error(1)
 }
-func (m *mockUploaderDB) UnreferencedS3KeysWithRetry(ctx context.Context, contentHash string, keys []string) ([]string, error) {
-	args := m.Called(ctx, contentHash, keys)
-	return args.Get(0).([]string), args.Error(1)
+
+// The lease heartbeat is bookkeeping these tests do not exercise: it holds, and a release
+// succeeds, without a per-test expectation.
+func (m *mockUploaderDB) RenewPendingUploadLeaseWithRetry(ctx context.Context, pendingID int64, ttl time.Duration) (bool, error) {
+	return true, nil
+}
+func (m *mockUploaderDB) ReleasePendingUploadLeaseWithRetry(ctx context.Context, pendingID int64) error {
+	return nil
 }
 func (m *mockUploaderDB) GetUploaderStatsWithRetry(ctx context.Context, maxAttempts int) (*db.UploaderStats, error) {
 	args := m.Called(ctx, maxAttempts)
@@ -153,10 +158,6 @@ func (m *mockUploaderS3) PutWithRetry(ctx context.Context, key string, reader io
 func (m *mockUploaderS3) ExistsWithRetry(ctx context.Context, key string) (bool, error) {
 	args := m.Called(ctx, key)
 	return args.Bool(0), args.Error(1)
-}
-
-func (m *mockUploaderS3) DeleteWithRetry(ctx context.Context, key string) error {
-	return m.Called(ctx, key).Error(0)
 }
 
 // TestCleanupOrphanedFiles_RaceCondition_DeletesFileThatHasNoPendingUploadYet
@@ -325,7 +326,7 @@ func TestProcessSingleUpload_S3ExistsButLocalFileMissing_SelfHeals(t *testing.T)
 		Return([]string{helpers.NewS3Key("somedomain.com", "user", contentHash)}, nil)
 
 	// Nothing is deleting the body, and the pending row still stands.
-	mockDB.On("PassS3WriteGateWithRetry", mock.Anything, int64(6257780), accountID, contentHash).
+	mockDB.On("PassS3WriteGateWithRetry", mock.Anything, int64(6257780), accountID, contentHash, uploadLeaseTTL).
 		Return(db.S3WriteOpen, nil)
 
 	// S3: object already exists (the first uploader attempt PUT it there).

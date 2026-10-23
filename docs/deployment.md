@@ -110,10 +110,9 @@ Sora works behind PgBouncer in any pooling mode, including transaction pooling. 
 Some of those locks span an S3 round trip, so they keep one pooled connection (one server connection behind the pooler) checked out while that round trip runs:
 
 - the cleaner: two on the node running a cycle, the cycle lock for the whole cycle plus the per-batch lock during each S3 delete;
-- IMAP COPY between accounts: one per copy in flight, held across the S3 existence check and copy;
-- the uploader, only when an upload is abandoned in flight (the account was purged while its body was being written): one while it removes what it wrote.
+- IMAP COPY between accounts: one per copy in flight, held across the S3 existence check and copy.
 
-An ordinary upload holds no lock across its transfer. Before writing it takes and at once releases the per-object lock in a single statement, which orders the write after any delete of the same body already under way; every later delete sees the upload's pending row and leaves the body alone. An upload therefore uses a pooled connection only for its few short statements, and `[uploader] concurrency` is bounded by S3, not by the pool.
+An upload holds no lock across its transfer. Before writing it takes and at once releases the per-object lock in a single statement, which orders the write after any delete of the same body already under way; every later delete sees the upload's pending row and leaves the body alone. The same statement leases that row to the upload (`pending_uploads.lease_until`, renewed while the transfer runs), and nothing deletes a leased row but the upload's own finalize: account deletion and purge wait for it. An upload therefore uses a pooled connection only for its few short statements, and `[uploader] concurrency` is bounded by S3, not by the pool.
 
 Size the pooler's pool for the write user with that in mind:
 

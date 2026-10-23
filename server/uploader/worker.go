@@ -46,24 +46,23 @@ type UploaderDB interface {
 	// PassS3WriteGateWithRetry is asked before anything about an upload touches S3. It
 	// takes and at once releases the per-object lock every S3 deleter holds, so a delete
 	// already under way makes it answer busy, and any later deleter sees the pending row
-	// and leaves the body be (db.PassS3WriteGate). It also reports a leased row that is
-	// already gone. It costs one statement and holds nothing across the transfer.
-	PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash string) (db.S3WriteGate, error)
+	// and leaves the body be; an open gate leases the row to the upload for ttl, so that
+	// nothing deletes it while the body is in flight (db.PassS3WriteGate). It also reports
+	// a row that is already gone. It costs one statement and holds nothing across the
+	// transfer.
+	PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash string, ttl time.Duration) (db.S3WriteGate, error)
+	// RenewPendingUploadLeaseWithRetry extends the lease of an upload in flight to now +
+	// ttl; false means its pending row is gone.
+	RenewPendingUploadLeaseWithRetry(ctx context.Context, pendingID int64, ttl time.Duration) (bool, error)
+	// ReleasePendingUploadLeaseWithRetry ends the lease of an upload that did not finish.
+	ReleasePendingUploadLeaseWithRetry(ctx context.Context, pendingID int64) error
 	// CompleteLeasedS3UploadWithRetry finalizes the rows whose key is in writtenKeys (or
 	// already has a live uploaded sibling) and drops the pending row once nothing is
 	// left to write — provided the pending row leased as pendingID still exists, since
 	// only that row kept deleters away from the objects; db.ErrPendingUploadGone, with
-	// nothing changed, otherwise. writtenKeys are full S3 keys (domain/localpart/hash).
+	// nothing changed, otherwise. It ends the lease. writtenKeys are full S3 keys
+	// (domain/localpart/hash).
 	CompleteLeasedS3UploadWithRetry(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error
-	// ExecuteWithS3ObjectLock runs executionFunc while holding the per-object lock the
-	// cleaner's S3 deletion also takes, at the cost of one pooled connection for its
-	// duration; its context is cancelled if the lock is lost meanwhile. Only an abandoned
-	// upload takes it, to delete what it wrote (discardAbandonedUpload).
-	ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error
-	// UnreferencedS3KeysWithRetry returns those of keys that no message row of any
-	// account references (uploaded, or with a pending upload queued), read on the
-	// primary.
-	UnreferencedS3KeysWithRetry(ctx context.Context, contentHash string, keys []string) ([]string, error)
 	// ExistingPendingUploads returns the subset of contentHashes that still have a
 	// pending_uploads row for the account. The cleanup scan asks per batch rather than
 	// per file: the staging tree is largest during an S3 outage or a stranded backlog,
@@ -159,8 +158,6 @@ type UploaderS3 interface {
 	// Used to self-heal uploads whose local file is missing but whose content
 	// was already stored in S3 by a prior attempt.
 	ExistsWithRetry(ctx context.Context, key string) (bool, error)
-	// DeleteWithRetry removes an object an abandoned upload wrote and nothing references.
-	DeleteWithRetry(ctx context.Context, key string) error
 }
 
 // UploaderCache defines the cache operations needed by the uploader worker.
@@ -225,7 +222,7 @@ const (
 	// uploadSkipped: nothing was asked of storage and nothing was learned about the
 	// content. Either something holds the body's lock right now — a delete, restore or
 	// cross-account copy of the same body; the row is leased again after retry_interval —
-	// or the pending row is gone (the account was purged, the upload reaped) and nothing
+	// or the pending row is gone (the account was deleted, the upload reaped) and nothing
 	// is left to upload.
 	uploadSkipped
 )
@@ -626,12 +623,12 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		return uploadDone // Done with this upload record
 	}
 
-	// Pass the write gate before anything below touches S3. No lock is held across the
-	// transfer, which would pin one pooled connection per upload in flight: the gate
-	// orders this upload after any delete of the same body already under way, and every
-	// later deleter sees the pending row and leaves the body be. Only the row, so only
-	// while it stands, which the finalize checks again.
-	switch gate, err := w.rdb.PassS3WriteGateWithRetry(ctx, upload.ID, upload.AccountID, upload.ContentHash); {
+	// Pass the write gate before anything below touches S3, and hold the lease it grants
+	// until the finalize. No lock is held across the transfer, which would pin one pooled
+	// connection per upload in flight: the gate orders this upload after any delete of the
+	// same body already under way, every later deleter sees the pending row and leaves the
+	// body be, and the lease keeps anything from deleting that row meanwhile.
+	switch gate, err := w.rdb.PassS3WriteGateWithRetry(ctx, upload.ID, upload.AccountID, upload.ContentHash, uploadLeaseTTL); {
 	case err != nil:
 		logger.Error("Uploader: Failed to pass the write gate", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 		return uploadRetryLater
@@ -640,9 +637,16 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		return uploadSkipped
 	case gate == db.S3WriteAbandoned:
 		// The staging file goes with the orphan sweep (cleanupOrphanedFiles).
-		logger.Info("Uploader: Pending upload is gone (account purged or upload reaped); nothing to upload", "hash", upload.ContentHash, "account_id", upload.AccountID)
+		logger.Info("Uploader: Pending upload is gone (account deleted or upload reaped); nothing to upload", "hash", upload.ContentHash, "account_id", upload.AccountID)
 		return uploadSkipped
 	}
+
+	// Everything from here to the finalize talks to S3 under the lease's context, which is
+	// cancelled if the lease is lost. Every way out that does not finalize ends the lease,
+	// so a failed upload does not hold up the deletion of its account.
+	lease := w.holdLease(ctx, upload)
+	finalized := false
+	defer func() { lease.end(ctx, finalized) }()
 
 	// Stream the body off the disk it already sits on rather than reading it whole:
 	// `concurrency` uploads run at once, so a buffered body costs concurrency x message
@@ -679,7 +683,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		// as nothing at all, with no local copy left to write from.
 		s3Exists := true
 		for _, key := range keys {
-			exists, statErr := w.s3.ExistsWithRetry(ctx, key)
+			exists, statErr := w.s3.ExistsWithRetry(lease.ctx, key)
 			if statErr != nil {
 				// S3 is unreachable - don't count as a permanent failure.
 				logger.Warn("Uploader: Could not check S3 existence after missing file",
@@ -701,13 +705,9 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 			logger.Info("Uploader: Local file missing but content found in S3 - self-healing upload",
 				"hash", upload.ContentHash, "account_id", upload.AccountID)
 
-			dbCtx, cancel := finalizeContext(ctx, upload.ContentHash)
-			err = w.rdb.CompleteLeasedS3UploadWithRetry(dbCtx, upload.ID, upload.ContentHash, upload.AccountID, keys)
-			cancel()
+			err = w.finalize(ctx, lease, upload, keys)
 			if errors.Is(err, db.ErrPendingUploadGone) {
-				// Purged or reaped since the gate. Nothing will finalize these objects
-				// now, and a key no row carries any more is listed by no cleaner pass.
-				w.discardAbandonedUpload(ctx, upload, keys)
+				finalized = true
 				return uploadSkipped
 			}
 			if err != nil {
@@ -715,6 +715,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 					"hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 				return uploadRetryLater // Retry next cycle; do NOT increment attempts
 			}
+			finalized = true
 			logger.Info("Uploader: Upload self-healed via S3 existence check",
 				"hash", upload.ContentHash, "account_id", upload.AccountID)
 			metrics.UploadWorkerJobs.WithLabelValues("success").Inc()
@@ -766,31 +767,30 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	// Run S3 PUT, once per key the message rows point at, then finalize. Every key gets
 	// the whole body, so rewind between them: the resilient layer rewinds only around its
 	// own retries of a single PUT. No lock is held across the transfer; the gate above
-	// already ordered these writes after any delete of the same body.
+	// already ordered these writes after any delete of the same body, and the lease keeps
+	// the pending row, and so every deleter, in place until the finalize.
 	writeAndFinalize := func() error {
 		for _, key := range keys {
 			if _, err := file.Seek(0, io.SeekStart); err != nil {
 				return fmt.Errorf("failed to rewind %s for upload: %w", filePath, err)
 			}
-			if err := w.s3.PutWithRetry(ctx, key, file, upload.Size); err != nil {
+			if err := w.s3.PutWithRetry(lease.ctx, key, file, upload.Size); err != nil {
+				if lost := lease.stop(); errors.Is(lost, errLeaseGone) {
+					return fmt.Errorf("%w: %w", db.ErrPendingUploadGone, lost)
+				}
 				return err
 			}
 		}
 		// Finalize before the local source file goes.
-		dbCtx, cancel := finalizeContext(ctx, upload.ContentHash)
-		defer cancel()
-		return w.rdb.CompleteLeasedS3UploadWithRetry(dbCtx, upload.ID, upload.ContentHash, upload.AccountID, keys)
+		return w.finalize(ctx, lease, upload, keys)
 	}
 	err = writeAndFinalize()
 
 	if errors.Is(err, db.ErrPendingUploadGone) {
-		// The account was purged, or the upload reaped, while the body was in flight. The
-		// purge may already have deleted these keys and their rows, in which case what was
-		// just written would stay in S3 with nothing pointing at it.
-		w.discardAbandonedUpload(ctx, upload, keys)
-		metrics.S3UploadAttempts.WithLabelValues("success").Inc()
+		// Logged where it was found. Nothing is left to retry: the row is gone.
+		finalized = true
 		metrics.UploadWorkerDuration.Observe(time.Since(start).Seconds())
-		return uploadDone // storage took the writes; the cycle backoff must hear that
+		return uploadSkipped
 	}
 	if err != nil {
 		// Never counted toward max_attempts, whatever the error looks like. The body on
@@ -812,6 +812,8 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		// IMPORTANT: We do not retry here, the retry loop will pick it up later from pending_uploads
 		return uploadRetryLater
 	}
+
+	finalized = true
 
 	// Move the uploaded file to the global cache (if a cache is configured).
 	// If the move fails, or no cache is present, delete the local file.
@@ -853,51 +855,133 @@ func finalizeContext(ctx context.Context, contentHash string) (context.Context, 
 	return context.WithTimeout(context.Background(), 30*time.Second)
 }
 
-// discardAbandonedUpload removes objects an upload is responsible for after the pending
-// row it leased went away under it: the account was purged, or the upload reaped, while
-// the body was in flight. Account deletion drops pending rows before its S3 phase, so the
-// purge may already have deleted these keys and the rows that carried them; nothing
-// finalizes or lists such an object again, and this is the one place left to remove it.
+// finalize ends the heartbeat and marks the upload done in the database: the rows whose
+// keys were written, and the pending row with them once nothing is left to write.
 //
-// It does what every deleter does, under the object's lock: re-check, then delete. A key
-// is kept while any row of any account still references it — uploaded, so readers need
-// it and the cleaner lists it once expunged, or with a pending upload of the body still
-// queued (db.UnreferencedS3Keys). Rows this abandoned upload leaves behind are neither:
-// the leased finalize rolled back rather than mark them, and CleanupFailedUploads reaps
-// them without touching S3, so the object is removed here or never. A failure leaves
-// objects nothing references; they are logged with their keys for an operator.
-func (w *UploadWorker) discardAbandonedUpload(ctx context.Context, upload db.PendingUpload, keys []string) {
-	ctx, cancel := finalizeContext(ctx, upload.ContentHash)
+// A db.ErrPendingUploadGone means the row the lease protected went away while the body
+// was in flight — the lease ran out because it could not be renewed, or something deleted
+// the row regardless. Every deleter may have been past these keys by then, so what was
+// written can be left in S3 with nothing pointing at it; it is logged with the keys for an
+// operator rather than deleted here, since nothing would make such a delete durable.
+func (w *UploadWorker) finalize(ctx context.Context, lease *uploadLease, upload db.PendingUpload, keys []string) error {
+	lost := lease.stop()
+	dbCtx, cancel := finalizeContext(ctx, upload.ContentHash)
 	defer cancel()
+	err := w.rdb.CompleteLeasedS3UploadWithRetry(dbCtx, upload.ID, upload.ContentHash, upload.AccountID, keys)
+	if errors.Is(err, db.ErrPendingUploadGone) {
+		logger.Error("Uploader: Pending upload went away while it was in flight; its objects may be left in S3 with nothing pointing at them",
+			"hash", upload.ContentHash, "account_id", upload.AccountID, "keys", strings.Join(keys, " "), "lease", lost)
+	}
+	return err
+}
 
-	var removed []string
-	err := w.rdb.ExecuteWithS3ObjectLock(ctx, upload.ContentHash, upload.AccountID, func(ctx context.Context) error {
-		unreferenced, err := w.rdb.UnreferencedS3KeysWithRetry(ctx, upload.ContentHash, keys)
-		if err != nil {
-			return err
-		}
-		for _, key := range unreferenced {
-			if err := w.s3.DeleteWithRetry(ctx, key); err != nil {
-				return fmt.Errorf("failed to delete %s: %w", key, err)
+// uploadLeaseTTL is how long a pending row stays leased to an upload past its last
+// renewal (pending_uploads.lease_until). Account deletion leaves a leased row alone, so
+// this bounds how long a crashed or stalled upload can hold up the deletion of its
+// account, and how long after the last renewal a transfer may still be running safely.
+// A variable so tests can shorten it.
+var uploadLeaseTTL = 2 * time.Minute
+
+// uploadLeaseRenewInterval is how often an upload in flight renews its lease. Each renewal
+// is one attempt bounded by a third of it, and the transfer is stopped once renewals have
+// failed for uploadLeaseTTL less two intervals, so it stops before the lease can run out.
+// A variable so tests can shorten it.
+var uploadLeaseRenewInterval = 30 * time.Second
+
+var (
+	// errLeaseGone: a renewal found the pending row gone.
+	errLeaseGone = errors.New("the pending upload row is gone")
+	// errLeaseLapsing: renewals kept failing, and the lease would run out before the next.
+	errLeaseLapsing = errors.New("the pending upload lease could not be renewed in time")
+)
+
+// uploadLease keeps the pending row of an upload in flight leased to it while the
+// transfer runs: see db.PassS3WriteGate for why the row must stand until the finalize.
+type uploadLease struct {
+	ctx      context.Context // the S3 work runs under it; cancelled when the lease is lost
+	cancel   context.CancelCauseFunc
+	stopCh   chan struct{}
+	stopped  chan struct{}
+	stopOnce sync.Once
+	lost     error // errLeaseGone or errLeaseLapsing, set by stop
+
+	w      *UploadWorker
+	upload db.PendingUpload
+}
+
+// holdLease starts renewing the lease the gate granted, every uploadLeaseRenewInterval,
+// until stop. If a renewal finds the row gone, or renewals fail for so long that the lease
+// may run out, the lease's context is cancelled and the transfer stops rather than land
+// unprotected.
+func (w *UploadWorker) holdLease(ctx context.Context, upload db.PendingUpload) *uploadLease {
+	leaseCtx, cancel := context.WithCancelCause(ctx)
+	l := &uploadLease{ctx: leaseCtx, cancel: cancel, stopCh: make(chan struct{}), stopped: make(chan struct{}), w: w, upload: upload}
+	go func() {
+		defer close(l.stopped)
+		ticker := time.NewTicker(uploadLeaseRenewInterval)
+		defer ticker.Stop()
+		renewed := time.Now()
+		for {
+			select {
+			case <-l.stopCh:
+				return
+			case <-leaseCtx.Done():
+				return
+			case <-ticker.C:
 			}
-			removed = append(removed, key)
+			renewCtx, cancelRenew := context.WithTimeout(leaseCtx, uploadLeaseRenewInterval/3)
+			held, err := w.rdb.RenewPendingUploadLeaseWithRetry(renewCtx, upload.ID, uploadLeaseTTL)
+			cancelRenew()
+			switch {
+			case err == nil && held:
+				renewed = time.Now()
+			case err == nil:
+				logger.Warn("Uploader: Pending upload went away while its body was in flight; stopping the transfer",
+					"hash", upload.ContentHash, "account_id", upload.AccountID)
+				cancel(errLeaseGone)
+				return
+			case time.Since(renewed) >= uploadLeaseTTL-2*uploadLeaseRenewInterval:
+				logger.Warn("Uploader: Could not renew the upload lease in time; stopping the transfer",
+					"hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
+				cancel(fmt.Errorf("%w: %v", errLeaseLapsing, err))
+				return
+			case leaseCtx.Err() == nil:
+				logger.Warn("Uploader: Failed to renew the upload lease; will try again",
+					"hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
+			}
 		}
-		return nil
+	}()
+	return l
+}
+
+// stop ends the renewals and reports whether the lease was lost while they ran. It waits
+// for a renewal in progress, so no renewal can observe the finalize deleting the row.
+func (l *uploadLease) stop() error {
+	l.stopOnce.Do(func() {
+		close(l.stopCh)
+		<-l.stopped
+		if cause := context.Cause(l.ctx); errors.Is(cause, errLeaseGone) || errors.Is(cause, errLeaseLapsing) {
+			l.lost = cause
+		}
+		l.cancel(nil)
 	})
-	if err != nil {
-		logger.Error("Uploader: Could not remove the objects of an abandoned upload; they may stay in S3 with nothing referencing them",
-			"hash", upload.ContentHash, "account_id", upload.AccountID, "keys", strings.Join(keys, " "), "removed", strings.Join(removed, " "), "error", err)
+	return l.lost
+}
+
+// end stops the lease and, unless the upload was finalized (which ends the lease with the
+// row) or the row is gone, releases it, so that a failed upload does not hold up the
+// deletion of its account until the lease runs out. A failed release only means waiting
+// for that.
+func (l *uploadLease) end(ctx context.Context, finalized bool) {
+	if errors.Is(l.stop(), errLeaseGone) || finalized {
 		return
 	}
-	if len(removed) == 0 {
-		// Every key is still carried by a row: most often a second lease of the same row
-		// (its upload outlived retry_interval) whose twin finalized first.
-		logger.Info("Uploader: Pending upload was finalized or removed elsewhere while in flight; every key is still referenced",
-			"hash", upload.ContentHash, "account_id", upload.AccountID)
-		return
+	ctx, cancel := finalizeContext(ctx, l.upload.ContentHash)
+	defer cancel()
+	if err := l.w.rdb.ReleasePendingUploadLeaseWithRetry(ctx, l.upload.ID); err != nil {
+		logger.Warn("Uploader: Failed to release the upload lease; it runs out on its own",
+			"hash", l.upload.ContentHash, "account_id", l.upload.AccountID, "ttl", uploadLeaseTTL, "error", err)
 	}
-	logger.Info("Uploader: Upload abandoned in flight (account purged or upload reaped); removed the objects nothing references",
-		"hash", upload.ContentHash, "account_id", upload.AccountID, "removed", strings.Join(removed, " "))
 }
 
 // reportError sends an error to the error channel if configured, otherwise logs it

@@ -27,28 +27,11 @@ const (
 	keyTestAccountID = int64(4711)
 )
 
-// recordingS3 records the keys a worker writes and deletes, and answers existence from a
-// fixed set.
+// recordingS3 records the keys a worker writes and answers existence from a fixed set.
 type recordingS3 struct {
 	mu      sync.Mutex
 	puts    []string
-	deletes []string
 	present map[string]bool
-}
-
-func (s *recordingS3) DeleteWithRetry(ctx context.Context, key string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.deletes = append(s.deletes, key)
-	return nil
-}
-
-func (s *recordingS3) deletedKeys() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	keys := append([]string(nil), s.deletes...)
-	sort.Strings(keys)
-	return keys
 }
 
 func (s *recordingS3) PutWithRetry(ctx context.Context, key string, reader io.Reader, size int64) error {

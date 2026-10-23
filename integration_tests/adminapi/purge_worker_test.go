@@ -189,7 +189,8 @@ func TestPurgeWorker_SkipsAccountClaimedElsewhere(t *testing.T) {
 
 // Something holding a body's lock (a restore, a cross-account COPY) makes the purge leave
 // that body, fail the pass and back off; once the holder is done the next attempt finishes.
-// An upload in flight holds no lock: see TestPurgeWorker_UploadInFlightLeavesNothingBehind.
+// An upload in flight holds no lock; its leased pending row holds the purge up instead:
+// see TestPurgeWorker_WaitsForAnUploadInFlight.
 func TestPurgeWorker_LockedBodyIsRetried(t *testing.T) {
 	s := setupPurgeStack(t)
 	email, accountID := s.newMailAccount(t, "worker-upload", "worker-pass-6")

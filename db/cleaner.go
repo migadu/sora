@@ -126,8 +126,7 @@ const s3ObjectLockTimeout = 30 * time.Second
 // no write transaction, snapshot or xid.
 //
 // Locks are try-locks, and an object whose lock is held is left out of this cycle: a
-// held lock means the body is being restored, copied, or cleaned up after an abandoned
-// upload right now. Never waiting also means this cannot deadlock against another
+// held lock means the body is being restored or copied right now. Never waiting also means this cannot deadlock against another
 // holder, whatever order the batch happens to be in.
 //
 // fn runs under a context that is cancelled if the locks are lost meanwhile (the
@@ -1093,6 +1092,12 @@ func lockAccountMailboxes(ctx context.Context, tx pgx.Tx, accountIDs []int64) er
 
 // deleteAccountDependents removes what the accounts row must be free of before it can be
 // finalized, mailboxes last. Every message of the accounts must already be expunged.
+//
+// A pending upload whose body is in flight (a lease, see PassS3WriteGate) is left: it is
+// the only thing keeping the S3 phase away from a body being written without a lock. The
+// S3 phase skips that body and its rows stay, so the account is not finalized yet; once
+// the upload finalizes, the next pass deletes the body like any other. Unleased pending
+// rows go, and their bodies are never uploaded.
 func deleteAccountDependents(ctx context.Context, tx pgx.Tx, accountIDs []int64) error {
 	batchOps := []struct {
 		tableName string
@@ -1100,7 +1105,7 @@ func deleteAccountDependents(ctx context.Context, tx pgx.Tx, accountIDs []int64)
 	}{
 		{"vacation_responses", "DELETE FROM vacation_responses WHERE account_id = ANY($1)"},
 		{"sieve_scripts", "DELETE FROM sieve_scripts WHERE account_id = ANY($1)"},
-		{"pending_uploads", "DELETE FROM pending_uploads WHERE account_id = ANY($1)"},
+		{"pending_uploads", "DELETE FROM pending_uploads WHERE account_id = ANY($1) AND (lease_until IS NULL OR lease_until < now())"},
 		{"mailboxes", "DELETE FROM mailboxes WHERE account_id = ANY($1)"},
 	}
 	for _, op := range batchOps {

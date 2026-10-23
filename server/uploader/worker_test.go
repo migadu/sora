@@ -23,9 +23,9 @@ type mockDB struct {
 	AcquireAndLeasePendingUploadsWithRetryFunc func(ctx context.Context, instanceID string, batchSize int, retryInterval time.Duration, maxAttempts int) ([]db.PendingUpload, error)
 	MarkUploadAttemptWithRetryFunc             func(ctx context.Context, contentHash string, accountID int64) error
 	PendingUploadKeysFunc                      func(ctx context.Context, contentHash string, accountID int64) ([]string, error)
-	PassS3WriteGateFunc                        func(ctx context.Context, pendingID, accountID int64, contentHash string) (db.S3WriteGate, error)
-	ExecuteWithS3ObjectLockFunc                func(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error
-	UnreferencedS3KeysFunc                     func(ctx context.Context, contentHash string, keys []string) ([]string, error)
+	PassS3WriteGateFunc                        func(ctx context.Context, pendingID, accountID int64, contentHash string, ttl time.Duration) (db.S3WriteGate, error)
+	RenewPendingUploadLeaseFunc                func(ctx context.Context, pendingID int64, ttl time.Duration) (bool, error)
+	ReleasePendingUploadLeaseFunc              func(ctx context.Context, pendingID int64) error
 	CompleteLeasedS3UploadWithRetryFunc        func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error
 	ExistingPendingUploadsFunc                 func(ctx context.Context, accountID int64, contentHashes []string) (map[string]struct{}, error)
 	GetFailedUploadsWithRetryFunc              func(ctx context.Context, maxAttempts int, limit int) ([]db.PendingUpload, error)
@@ -56,29 +56,26 @@ func (m *mockDB) CompleteLeasedS3UploadWithRetry(ctx context.Context, pendingID 
 }
 
 // PassS3WriteGateWithRetry opens the gate unless a test scripts otherwise.
-func (m *mockDB) PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash string) (db.S3WriteGate, error) {
+func (m *mockDB) PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash string, ttl time.Duration) (db.S3WriteGate, error) {
 	if m.PassS3WriteGateFunc != nil {
-		return m.PassS3WriteGateFunc(ctx, pendingID, accountID, contentHash)
+		return m.PassS3WriteGateFunc(ctx, pendingID, accountID, contentHash, ttl)
 	}
 	return db.S3WriteOpen, nil
 }
 
-// ExecuteWithS3ObjectLock runs the callback as if the lock were free, unless a test
-// scripts otherwise.
-func (m *mockDB) ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error {
-	if m.ExecuteWithS3ObjectLockFunc != nil {
-		return m.ExecuteWithS3ObjectLockFunc(ctx, contentHash, accountID, executionFunc)
+// RenewPendingUploadLeaseWithRetry keeps the lease unless a test scripts otherwise.
+func (m *mockDB) RenewPendingUploadLeaseWithRetry(ctx context.Context, pendingID int64, ttl time.Duration) (bool, error) {
+	if m.RenewPendingUploadLeaseFunc != nil {
+		return m.RenewPendingUploadLeaseFunc(ctx, pendingID, ttl)
 	}
-	return executionFunc(ctx)
+	return true, nil
 }
 
-// UnreferencedS3KeysWithRetry reports every key as referenced unless a test scripts
-// otherwise, so nothing is discarded by accident.
-func (m *mockDB) UnreferencedS3KeysWithRetry(ctx context.Context, contentHash string, keys []string) ([]string, error) {
-	if m.UnreferencedS3KeysFunc != nil {
-		return m.UnreferencedS3KeysFunc(ctx, contentHash, keys)
+func (m *mockDB) ReleasePendingUploadLeaseWithRetry(ctx context.Context, pendingID int64) error {
+	if m.ReleasePendingUploadLeaseFunc != nil {
+		return m.ReleasePendingUploadLeaseFunc(ctx, pendingID)
 	}
-	return nil, nil
+	return nil
 }
 
 func (m *mockDB) ExistingPendingUploads(ctx context.Context, accountID int64, contentHashes []string) (map[string]struct{}, error) {
@@ -113,14 +110,6 @@ func (m *mockDB) RecordInstanceHeartbeatWithRetry(ctx context.Context, instanceI
 type mockS3 struct {
 	PutWithRetryFunc    func(ctx context.Context, key string, reader io.Reader, size int64) error
 	ExistsWithRetryFunc func(ctx context.Context, key string) (bool, error)
-	DeleteWithRetryFunc func(ctx context.Context, key string) error
-}
-
-func (m *mockS3) DeleteWithRetry(ctx context.Context, key string) error {
-	if m.DeleteWithRetryFunc != nil {
-		return m.DeleteWithRetryFunc(ctx, key)
-	}
-	return nil
 }
 
 func (m *mockS3) PutWithRetry(ctx context.Context, key string, reader io.Reader, size int64) error {
