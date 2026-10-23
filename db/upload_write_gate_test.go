@@ -207,15 +207,31 @@ func TestUnreferencedS3Keys(t *testing.T) {
 	otherMailbox := createTestMailbox(t, database, otherAccount, "INBOX")
 
 	hash := fmt.Sprintf("unref_%d", time.Now().UnixNano())
-	insertKeyedMessage(t, database, accountID, mailboxID, 500, hash, "expunged", false, time.Now().Add(-48*time.Hour))
+	longAgo := time.Now().Add(-48 * time.Hour)
+	// The state an abandoned upload leaves: expunged, never marked uploaded (the leased
+	// finalize rolled back), no pending row. The background cleaner lists only uploaded
+	// rows and CleanupFailedUploads reaps this one without touching S3, so nothing would
+	// ever delete the object if this row counted.
+	insertKeyedMessage(t, database, accountID, mailboxID, 500, hash, "dead", false, longAgo)
+	// Expunged but uploaded: the cleaner lists it and deletes the object itself.
+	insertKeyedMessage(t, database, accountID, mailboxID, 501, hash, "listed", true, longAgo)
+	// Another account's live uploaded row: a reader relies on the object.
 	insertKeyedMessage(t, database, otherAccount, otherMailbox, 1, hash, "other", true, time.Time{})
 
 	keys := []string{
-		"example.com/expunged/" + hash, // an expunged row still carries it: the cleaner will list it
-		"example.com/other/" + hash,    // another account's row carries it
-		"example.com/nobody/" + hash,   // nothing carries it
+		"example.com/dead/" + hash,
+		"example.com/listed/" + hash,
+		"example.com/other/" + hash,
+		"example.com/nobody/" + hash, // nothing carries it
 	}
 	unreferenced, err := database.UnreferencedS3Keys(ctx, hash, keys)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"example.com/dead/" + hash, "example.com/nobody/" + hash}, unreferenced)
+
+	// A pending upload of the body makes every row of its account a reference: that
+	// upload will write the key, and no deleter may remove a body with a pending row.
+	createPendingUpload(t, database, accountID, "gate-instance", hash, 0, time.Time{}, 100)
+	unreferenced, err = database.UnreferencedS3Keys(ctx, hash, keys)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"example.com/nobody/" + hash}, unreferenced)
 }

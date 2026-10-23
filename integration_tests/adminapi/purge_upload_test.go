@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -32,16 +33,19 @@ func (g *gatedUploaderS3) PutWithRetry(ctx context.Context, key string, r io.Rea
 	return g.ResilientS3Storage.PutWithRetry(ctx, key, r, size)
 }
 
-// An upload holds no lock across its transfer, so a purge that runs while a body is in
-// flight deletes the account's rows and keys without waiting for it, and the write lands
-// afterwards. The uploader learns at the finalize that the pending row it leased is gone
-// and removes what it wrote: nothing of the account may be left, in the database or in S3.
-func TestPurgeWorker_UploadInFlightLeavesNothingBehind(t *testing.T) {
-	s := setupPurgeStack(t)
-	email, accountID := s.newMailAccount(t, "worker-flight", "worker-pass-8")
-	s.addMessage(t, accountID, email, "settled", true)
-	ctx := context.Background()
+// uploadInFlight is a delivered body whose upload is held mid-PUT.
+type uploadInFlight struct {
+	key      string
+	release  func()
+	finished chan struct{}
+	drainErr error
+}
 
+// startUploadInFlight delivers one body to the account's INBOX and starts a real upload
+// worker on it, returning once the PUT has begun and is being held.
+func (s *purgeStack) startUploadInFlight(t *testing.T, accountID int64, email string) *uploadInFlight {
+	t.Helper()
+	ctx := context.Background()
 	gated := &gatedUploaderS3{
 		ResilientS3Storage: resilient.NewResilientS3Storage(s.st),
 		started:            make(chan struct{}),
@@ -55,8 +59,7 @@ func TestPurgeWorker_UploadInFlightLeavesNothingBehind(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A delivery stages a body and queues its upload.
-	body := []byte("Subject: in flight\r\n\r\nbody in flight")
+	body := []byte("Subject: in flight\r\n\r\nbody in flight " + email)
 	sum := sha256.Sum256(body)
 	hash := hex.EncodeToString(sum[:])
 	if _, err := worker.StoreLocally(hash, accountID, body); err != nil {
@@ -77,18 +80,21 @@ func TestPurgeWorker_UploadInFlightLeavesNothingBehind(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	finished := make(chan struct{})
-	var drainErr error
+	u := &uploadInFlight{
+		key:      domain + "/" + local + "/" + hash,
+		release:  sync.OnceFunc(func() { close(gated.release) }),
+		finished: make(chan struct{}),
+	}
 	go func() {
-		defer close(finished)
-		drainErr = worker.DrainSync(ctx)
+		defer close(u.finished)
+		u.drainErr = worker.DrainSync(ctx)
 	}()
-	release := sync.OnceFunc(func() { close(gated.release) })
-	// Whatever happens below, let the upload finish before the stack closes the database.
+	// Whatever happens in the test, let the upload finish before the stack closes the
+	// database.
 	t.Cleanup(func() {
-		release()
+		u.release()
 		select {
-		case <-finished:
+		case <-u.finished:
 		case <-time.After(30 * time.Second):
 		}
 	})
@@ -97,6 +103,32 @@ func TestPurgeWorker_UploadInFlightLeavesNothingBehind(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the upload never reached S3")
 	}
+	return u
+}
+
+// finish lets the held PUT land and waits for the upload to finalize.
+func (u *uploadInFlight) finish(t *testing.T) {
+	t.Helper()
+	u.release()
+	select {
+	case <-u.finished:
+		if u.drainErr != nil {
+			t.Fatalf("drain: %v", u.drainErr)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the upload did not finish")
+	}
+}
+
+// An upload holds no lock across its transfer, so a purge that runs while a body is in
+// flight deletes the account's rows and keys without waiting for it, and the write lands
+// afterwards. The uploader learns at the finalize that the pending row it leased is gone
+// and removes what it wrote: nothing of the account may be left, in the database or in S3.
+func TestPurgeWorker_UploadInFlightLeavesNothingBehind(t *testing.T) {
+	s := setupPurgeStack(t)
+	email, accountID := s.newMailAccount(t, "worker-flight", "worker-pass-8")
+	s.addMessage(t, accountID, email, "settled", true)
+	upload := s.startUploadInFlight(t, accountID, email)
 
 	// The purge runs to the end while the body is in flight: nothing holds its lock.
 	s.requestPurge(t, email)
@@ -105,14 +137,33 @@ func TestPurgeWorker_UploadInFlightLeavesNothingBehind(t *testing.T) {
 		t.Fatal("the purge waited on the upload in flight instead of finishing")
 	}
 
-	release()
-	select {
-	case <-finished:
-		if drainErr != nil {
-			t.Fatalf("drain: %v", drainErr)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("the upload did not finish")
-	}
+	upload.finish(t)
 	s.requireGone(t, accountID, email)
+}
+
+// The background cleaner hard-deletes an account soft-deleted past its grace period in
+// steps: messages expunged, then mailboxes and pending uploads removed, and only later the
+// S3 phase, which lists uploaded rows only. If an upload is mid-PUT when the pending row
+// goes, its rows are still there at the finalize — expunged, never marked uploaded,
+// with no pending row — and CleanupFailedUploads will reap them without touching S3. Such
+// rows must not count as references: the uploader removes the object itself, or nothing
+// ever will.
+func TestHardDelete_UploadInFlightRemovesWhatItWrote(t *testing.T) {
+	s := setupPurgeStack(t)
+	email, accountID := s.newMailAccount(t, "hard-flight", "worker-pass-9")
+	upload := s.startUploadInFlight(t, accountID, email)
+
+	// Soft-delete, then run the background cleaner's hard delete of the account.
+	s.request(t, "DELETE", "/admin/accounts/"+email, nil, http.StatusOK)
+	if err := s.rdb.HardDeleteAccountWithRetry(context.Background(), accountID); err != nil {
+		t.Fatalf("hard delete: %v", err)
+	}
+	if n := s.count(t, "pending_uploads", accountID); n != 0 {
+		t.Fatalf("the hard delete left %d pending uploads", n)
+	}
+
+	upload.finish(t)
+	if keys := s.s3.Keys(upload.key); len(keys) != 0 {
+		t.Errorf("the body of an abandoned upload was left in S3 with only reapable rows pointing at it: %v", keys)
+	}
 }

@@ -266,16 +266,30 @@ func (db *Database) PassS3WriteGate(ctx context.Context, pendingID, accountID in
 }
 
 // UnreferencedS3Keys returns those of keys (full S3 keys of contentHash) that no message
-// row carries — of any account, expunged or not. Such an object is reachable by nothing:
-// no reader builds its key, and no cleaner pass or purge will ever list it. The uploader
-// asks after the pending row it leased went away while it was writing, holding the
-// object's lock, before it deletes what it wrote.
+// row of any account references. A row references its key while something will still
+// read or clean up the object for it:
+//   - it is uploaded: readers fetch it, and once it is expunged the cleaner lists it
+//     (GetUserScopedObjectsForCleanup lists only uploaded rows) and deletes the object;
+//   - or its account still has a pending upload of the body: that upload will write the
+//     key and finalize the row, and every deleter refuses a body with a pending row.
+//
+// A row that is neither is dead weight: nothing writes or reads its key any more, and
+// CleanupFailedUploads deletes such rows without touching S3. It is exactly the state an
+// abandoned upload leaves behind, since the leased finalize rolls back instead of marking
+// rows uploaded, so counting it as a reference would strand the object once the cleaner
+// reaps the row. The uploader asks after the pending row it leased went away while it was
+// writing, holding the object's lock, before it deletes what it wrote.
 //
 // It reads the pool the context selects; the uploader pins it to the primary, since a
 // lagging replica could miss a row that was just delivered.
 func (db *Database) UnreferencedS3Keys(ctx context.Context, contentHash string, keys []string) ([]string, error) {
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
-		SELECT DISTINCT s3_domain, s3_localpart FROM messages WHERE content_hash = $1
+		SELECT DISTINCT m.s3_domain, m.s3_localpart FROM messages m
+		WHERE m.content_hash = $1
+		  AND (m.uploaded OR EXISTS (
+			SELECT 1 FROM pending_uploads pu
+			WHERE pu.account_id = m.account_id AND pu.content_hash = m.content_hash
+		  ))
 	`, contentHash)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list the keys of hash %s: %w", contentHash, err)

@@ -61,7 +61,8 @@ type UploaderDB interface {
 	// upload takes it, to delete what it wrote (discardAbandonedUpload).
 	ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error
 	// UnreferencedS3KeysWithRetry returns those of keys that no message row of any
-	// account carries, read on the primary.
+	// account references (uploaded, or with a pending upload queued), read on the
+	// primary.
 	UnreferencedS3KeysWithRetry(ctx context.Context, contentHash string, keys []string) ([]string, error)
 	// ExistingPendingUploads returns the subset of contentHashes that still have a
 	// pending_uploads row for the account. The cleanup scan asks per batch rather than
@@ -858,11 +859,13 @@ func finalizeContext(ctx context.Context, contentHash string) (context.Context, 
 // purge may already have deleted these keys and the rows that carried them; nothing
 // finalizes or lists such an object again, and this is the one place left to remove it.
 //
-// It does what every deleter does, under the object's lock: re-check, then delete. The
-// re-check is stricter than the cleaner's — a key is removed only when no message row of
-// any account carries it, expunged or not — so an object a row still points at is left to
-// the cleaner, which will list it. A failure leaves objects nothing references; they are
-// logged with their keys for an operator.
+// It does what every deleter does, under the object's lock: re-check, then delete. A key
+// is kept while any row of any account still references it — uploaded, so readers need
+// it and the cleaner lists it once expunged, or with a pending upload of the body still
+// queued (db.UnreferencedS3Keys). Rows this abandoned upload leaves behind are neither:
+// the leased finalize rolled back rather than mark them, and CleanupFailedUploads reaps
+// them without touching S3, so the object is removed here or never. A failure leaves
+// objects nothing references; they are logged with their keys for an operator.
 func (w *UploadWorker) discardAbandonedUpload(ctx context.Context, upload db.PendingUpload, keys []string) {
 	ctx, cancel := finalizeContext(ctx, upload.ContentHash)
 	defer cancel()

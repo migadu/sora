@@ -139,7 +139,7 @@ func (rd *ResilientDatabase) CompleteLeasedS3UploadWithRetry(ctx context.Context
 	return err
 }
 
-// UnreferencedS3KeysWithRetry returns the keys no message row carries (see
+// UnreferencedS3KeysWithRetry returns the keys no message row references (see
 // db.UnreferencedS3Keys). Pinned to the master: a lagging replica could miss the row of
 // a delivery that just claimed the key, and the caller deletes what this returns.
 func (rd *ResilientDatabase) UnreferencedS3KeysWithRetry(ctx context.Context, contentHash string, keys []string) ([]string, error) {

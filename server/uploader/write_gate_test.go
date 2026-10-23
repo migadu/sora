@@ -175,7 +175,7 @@ func TestProcessSingleUpload_PendingRowGoneMidFlightDiscardsWhatNothingReference
 		defer mu.Unlock()
 		assert.True(t, inLock, "the re-check must run under the object lock, like every deleter's")
 		assert.ElementsMatch(t, []string{purged, stillListed}, keys, "every key this upload wrote is checked")
-		// An expunged row still carries stillListed, so the cleaner will list it.
+		// An uploaded row still carries stillListed: the cleaner lists it once expunged.
 		return []string{purged}, nil
 	}
 	var deleted []string
