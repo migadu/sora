@@ -17,7 +17,7 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 
 	// SORT shares the SEARCH rate limit; sorting a page's UIDs is free, sorting the
 	// mailbox is not (see search_rate_limit.go).
-	if scanCharged(searchCriteria) {
+	if sortCharged(searchCriteria) {
 		if err := s.chargeSearch(ctx); err != nil {
 			return nil, err
 		}

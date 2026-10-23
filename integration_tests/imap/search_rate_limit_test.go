@@ -13,10 +13,11 @@ import (
 
 // TestIMAP_SearchRateLimit_ChargesByCost checks over the wire which commands the
 // search rate limit charges. With a budget of two searches, the commands a client
-// navigates with (a SEARCH by UID set or flag, a SORT or THREAD of one page's UIDs)
-// run any number of times, before and after the budget is spent; content searches
-// and whole-mailbox SORT and THREAD spend it, and are then refused with
-// NO [LIMIT] (RFC 5530) saying how long to wait.
+// navigates with (a SEARCH by UID set, sequence set or flag, a SORT or UID THREAD
+// of one page's UIDs) run any number of times, before and after the budget is
+// spent; content searches, whole-mailbox SORT and THREAD, and THREAD answered in
+// sequence numbers spend it, and are then refused with NO [LIMIT] (RFC 5530)
+// saying how long to wait.
 func TestIMAP_SearchRateLimit_ChargesByCost(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -37,9 +38,12 @@ func TestIMAP_SearchRateLimit_ChargesByCost(t *testing.T) {
 
 	free := []string{
 		"UID SEARCH UID 1:3",
+		"SEARCH 1:3",
+		"UID SEARCH 1,3",
 		"SEARCH UNSEEN",
 		"UID SEARCH SINCE 1-Jan-2020 LARGER 1 NOT KEYWORD $Junk",
 		"UID SORT (REVERSE DATE) UTF-8 UID 1:3",
+		"SORT (REVERSE DATE) UTF-8 UID 1:3",
 		"UID THREAD REFS UTF-8 UID 1:3",
 	}
 	tag := 0
@@ -65,6 +69,11 @@ func TestIMAP_SearchRateLimit_ChargesByCost(t *testing.T) {
 		`SEARCH OR SEEN NOT SUBJECT "Rate"`,
 		"UID SORT (DATE) UTF-8 UID 1:4294967295",
 		"UID THREAD REFS UTF-8 UID 1:*",
+		// Numbered by ranking every message in the mailbox, however few it names.
+		"THREAD REFS UTF-8 UID 3",
+		// A sequence set is mapped to UIDs by ranking the mailbox, so it confines nothing.
+		"UID THREAD REFS UTF-8 1:3",
+		"UID SORT (DATE) UTF-8 2",
 		"ESEARCH IN (personal) RETURN (ALL) UNSEEN",
 	}
 	for i, cmd := range refused {

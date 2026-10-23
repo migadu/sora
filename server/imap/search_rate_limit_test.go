@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapserver"
 )
 
 func uidRange(start, stop imap.UID) imap.UIDSet {
@@ -25,7 +26,7 @@ func TestSearchRateLimitCharges(t *testing.T) {
 		name         string
 		criteria     *imap.SearchCriteria
 		search       bool // SEARCH is charged
-		sortOrThread bool // SORT and THREAD are charged
+		sortOrThread bool // SORT and UID THREAD are charged; THREAD always is
 	}{
 		{"ALL", &imap.SearchCriteria{}, false, true},
 		{"nil criteria", nil, false, true},
@@ -39,7 +40,8 @@ func TestSearchRateLimitCharges(t *testing.T) {
 		{"one page of UIDs", &imap.SearchCriteria{UID: []imap.UIDSet{{
 			imap.UIDRange{Start: 3, Stop: 3}, imap.UIDRange{Start: 9, Stop: 40}, imap.UIDRange{Start: 77, Stop: 80},
 		}}}, false, false},
-		{"sequence range", &imap.SearchCriteria{SeqNum: []imap.SeqSet{seqRange(1, 500)}}, false, false},
+		{"sequence range", &imap.SearchCriteria{SeqNum: []imap.SeqSet{seqRange(1, 500)}}, false, true},
+		{"one sequence number", &imap.SearchCriteria{SeqNum: []imap.SeqSet{seqRange(20000, 20000)}}, false, true},
 		{"reversed range", &imap.SearchCriteria{UID: []imap.UIDSet{uidRange(500, 1)}}, false, false},
 		{"set at the limit", &imap.SearchCriteria{UID: []imap.UIDSet{uidRange(1, confinedMaxMessages)}}, false, false},
 		{"set over the limit", &imap.SearchCriteria{UID: []imap.UIDSet{uidRange(1, confinedMaxMessages+1)}}, false, true},
@@ -76,8 +78,15 @@ func TestSearchRateLimitCharges(t *testing.T) {
 			if got := criteriaMatchesContent(tc.criteria); got != tc.search {
 				t.Errorf("SEARCH charged = %v, want %v", got, tc.search)
 			}
-			if got := scanCharged(tc.criteria); got != tc.sortOrThread {
-				t.Errorf("SORT/THREAD charged = %v, want %v", got, tc.sortOrThread)
+			if got := sortCharged(tc.criteria); got != tc.sortOrThread {
+				t.Errorf("SORT charged = %v, want %v", got, tc.sortOrThread)
+			}
+			if got := threadCharged(imapserver.NumKindUID, tc.criteria); got != tc.sortOrThread {
+				t.Errorf("UID THREAD charged = %v, want %v", got, tc.sortOrThread)
+			}
+			// THREAD numbers its result by ranking the whole mailbox.
+			if !threadCharged(imapserver.NumKindSeq, tc.criteria) {
+				t.Errorf("THREAD in sequence numbers should always be charged")
 			}
 		})
 	}

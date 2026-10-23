@@ -23,9 +23,10 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 		return nil, err
 	}
 
-	// THREAD shares the SEARCH rate limit; threading a few UIDs is free, threading
-	// the mailbox is not (see search_rate_limit.go).
-	if scanCharged(criteria) {
+	// THREAD shares the SEARCH rate limit; threading a few UIDs by UID is free,
+	// threading the mailbox or numbering the result against it is not (see
+	// search_rate_limit.go).
+	if threadCharged(numKind, criteria) {
 		if err := s.chargeSearch(ctx); err != nil {
 			return nil, err
 		}

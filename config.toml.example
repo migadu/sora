@@ -1107,9 +1107,10 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # --- RESOURCE LIMITS ---
 # Search rate limiting - prevent DoS attacks via excessive search queries (IMAP only)
 # Only expensive searches are charged: SEARCH matching on message content (BODY, TEXT, FROM,
-# SUBJECT or any other HEADER), SORT and THREAD over more than 1000 messages, and multi-mailbox
-# ESEARCH. Searches by UID or sequence set, flags, dates or sizes (what iOS Mail sends when
-# switching mailboxes, what webmail navigates with) are free. A refused command gets NO [LIMIT].
+# SUBJECT or any other HEADER), SORT and THREAD not confined by a UID set to 1000 messages, THREAD
+# answered in sequence numbers, and multi-mailbox ESEARCH. Searches by UID or sequence set, flags,
+# dates or sizes (what iOS Mail sends when switching mailboxes, what webmail navigates with) are
+# free. A refused command gets NO [LIMIT].
 # Each account has a bucket of search_rate_limit_burst searches, refilled continuously at
 # search_rate_limit_per_min per search_rate_limit_window.
 limits.search_rate_limit_per_min = 60    # Searches per window per user (default: 60, set to 0 to disable).

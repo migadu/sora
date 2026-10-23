@@ -96,8 +96,8 @@ search_rate_limit_burst = 30    # Searches allowed back to back (default: search
 ```
 
 The limit charges the searches that are expensive, not every command that is a search. Clients navigate with SEARCH, SORT and THREAD, and those commands run on indexed metadata:
-- **Charged:** SEARCH whose criteria match on message content anywhere, under NOT and OR included: BODY, TEXT, FROM, TO, CC, BCC, SUBJECT or any other HEADER; SORT and THREAD over the whole mailbox, or a UID or sequence set of more than 1000 messages; multi-mailbox ESEARCH (RFC 7377), which runs one search per mailbox in scope
-- **Free:** criteria made only of UID or sequence sets, flags and keywords, dates, sizes and MODSEQ, such as the unread and flagged searches iOS Mail sends on every mailbox switch, or a SORT or THREAD of one page's UIDs
+- **Charged:** SEARCH whose criteria match on message content anywhere, under NOT and OR included: BODY, TEXT, FROM, TO, CC, BCC, SUBJECT or any other HEADER; SORT and THREAD unless a UID set confines them to at most 1000 messages (a sequence set does not: it is mapped to UIDs by ranking the mailbox); THREAD answered in sequence numbers, which ranks every message in the mailbox to number its result; multi-mailbox ESEARCH (RFC 7377), which runs one search per mailbox in scope
+- **Free:** criteria made only of UID or sequence sets, flags and keywords, dates, sizes and MODSEQ, such as the unread and flagged searches iOS Mail sends on every mailbox switch, or a SORT or UID THREAD of one page's UIDs
 
 The rate limiter:
 - Tracks searches per user (not per IP), across all of the user's connections
