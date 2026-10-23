@@ -29,6 +29,17 @@ var writeRetryConfig = retry.BackoffConfig{
 	OperationName:   "db_write",
 }
 
+// leaseRetryConfig is a single attempt. The upload lease heartbeat is its own retry loop,
+// and a renewal sitting out a backoff could outlast the tick it belongs to and let the
+// lease run out before the heartbeat noticed.
+var leaseRetryConfig = retry.BackoffConfig{
+	InitialInterval: time.Second,
+	MaxInterval:     time.Second,
+	Multiplier:      1,
+	MaxRetries:      0,
+	OperationName:   "db_upload_lease",
+}
+
 // cleanupRetryConfig provides a default retry strategy for background cleanup tasks.
 var cleanupRetryConfig = retry.BackoffConfig{
 	InitialInterval: 1 * time.Second,

@@ -13,8 +13,10 @@ import (
 // --- Uploader Worker Wrappers ---
 
 // ExecuteWithS3ObjectLock runs executionFunc while holding the per-object advisory lock
-// that the cleaner's S3 deletion takes as well (db.GetS3ObjectLockID). The lock is held
-// in a db.AdvisoryLockTx for exactly the duration of executionFunc: transaction-scoped,
+// that the cleaner's S3 deletion takes as well (db.GetS3ObjectLockID). Cross-account IMAP
+// COPY holds it around its server-side copy; an upload only passes db.PassS3WriteGate and
+// holds nothing across its transfer. The lock is held in a db.AdvisoryLockTx for exactly
+// the duration of executionFunc: transaction-scoped,
 // so it is released with its backend whatever pooler the write pool goes through, and
 // held in a transaction that is otherwise idle and read-only, so the S3 transfer inside
 // executionFunc pins one pooled connection but no write transaction, snapshot or xid.
@@ -111,6 +113,54 @@ func (rd *ResilientDatabase) PendingUploadKeysWithRetry(ctx context.Context, con
 	return result.([]string), nil
 }
 
+// PassS3WriteGateWithRetry asks whether an upload may write its objects now and, if so,
+// leases its pending row to owner alone for ttl (see db.PassS3WriteGate). The gate reads
+// and locks on the primary, where every deleter takes the same per-object lock.
+func (rd *ResilientDatabase) PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash, owner string, ttl time.Duration) (db.S3WriteGate, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).PassS3WriteGate(ctx, pendingID, accountID, contentHash, owner, ttl)
+	}
+	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
+	if err != nil {
+		return db.S3WriteBusy, err
+	}
+	return result.(db.S3WriteGate), nil
+}
+
+// RenewPendingUploadLeaseWithRetry extends owner's lease of an upload in flight; false
+// means its pending row is gone or leased to someone else (see db.RenewPendingUploadLease).
+func (rd *ResilientDatabase) RenewPendingUploadLeaseWithRetry(ctx context.Context, pendingID int64, owner string, ttl time.Duration) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).RenewPendingUploadLease(ctx, pendingID, owner, ttl)
+	}
+	result, err := rd.executeReadWithRetry(ctx, leaseRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
+// ReleasePendingUploadLeaseWithRetry ends owner's lease of an upload that did not finish
+// (see db.ReleasePendingUploadLease).
+func (rd *ResilientDatabase) ReleasePendingUploadLeaseWithRetry(ctx context.Context, pendingID int64, owner string) error {
+	op := func(ctx context.Context) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).ReleasePendingUploadLease(ctx, pendingID, owner)
+	}
+	_, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+	return err
+}
+
+// CompleteLeasedS3UploadWithRetry finalizes an upload whose pending row is still leased
+// to owner, and returns db.ErrUploadLeaseLost, with nothing changed, when it is not (see
+// db.CompleteLeasedS3Upload).
+func (rd *ResilientDatabase) CompleteLeasedS3UploadWithRetry(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).CompleteLeasedS3Upload(ctx, tx, pendingID, owner, contentHash, accountID, writtenKeys)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, importExportRetryConfig, timeoutWrite, op, db.ErrUploadLeaseLost)
+	return err
+}
+
 func (rd *ResilientDatabase) ResetUploadAttemptsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, true).ResetUploadAttempts(ctx, tx, contentHash, accountID)
@@ -122,9 +172,12 @@ func (rd *ResilientDatabase) ResetUploadAttemptsWithRetry(ctx context.Context, c
 	return result.(bool), nil
 }
 
-func (rd *ResilientDatabase) DeleteFailedUploadWithRetry(ctx context.Context, contentHash string, accountID int64) (int64, error) {
+// DeleteFailedUploadWithRetry deletes a parked upload whose body is lost, and its unuploaded
+// message rows, unless the row was re-armed or is leased meanwhile (see
+// db.DeleteFailedUpload).
+func (rd *ResilientDatabase) DeleteFailedUploadWithRetry(ctx context.Context, contentHash string, accountID int64, maxAttempts int) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).DeleteFailedUpload(ctx, tx, contentHash, accountID)
+		return rd.getOperationalDatabaseForOperation(ctx, true).DeleteFailedUpload(ctx, tx, contentHash, accountID, maxAttempts)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	if err != nil {

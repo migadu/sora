@@ -279,7 +279,7 @@ func reapS3Objects(ctx context.Context, rdb s3ObjectReaper, s3 S3BulkDeleter, gr
 		}
 		// The advisory locks are held for the whole callback: the orphan re-check, the
 		// S3 delete and the row delete all see the same "nothing references this body"
-		// verdict, and an uploader cannot slip a PUT in between.
+		// verdict, and no upload of the body passes its write gate in between.
 		err := rdb.ExecuteWithLockedS3Orphans(ctx, batch, gracePeriod, func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error {
 			if skipped := len(batch) - len(orphans); skipped > 0 {
 				logger.Info("Cleanup: objects are no longer orphans or are being uploaded, skipping S3 deletion", "count", skipped)

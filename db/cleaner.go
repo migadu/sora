@@ -113,19 +113,21 @@ const s3ObjectLockTimeout = 30 * time.Second
 // ExecuteWithLockedS3Orphans runs fn with the subset of objects that are still orphans,
 // while holding their per-object advisory locks in one dedicated lock transaction.
 //
-// It is the same lock the uploader holds across its S3 PUT and the DB finalization
-// (GetS3ObjectLockID, see resilient.ExecuteWithS3ObjectLock), so holding it across the
-// orphan re-check and the caller's S3 DELETE is what stops a delete from racing an
-// upload of the same body. The locks live in an AdvisoryLockTx: transaction-scoped, so
+// It is the lock the uploader's write gate takes and releases before an upload writes
+// (GetS3ObjectLockID, see PassS3WriteGate), so holding it across the orphan re-check and
+// the caller's S3 DELETE is what orders a delete confirmed before an upload's pending row
+// existed ahead of that upload's write. Uploads that passed the gate earlier are kept out
+// by the re-check itself: it refuses any body with a pending upload row, and an upload
+// holds no lock while it writes. Restore and cross-account COPY take the same lock.
+// The locks live in an AdvisoryLockTx: transaction-scoped, so
 // they cannot outlive their backend whatever pooler sits between Sora and PostgreSQL,
 // and held in a transaction that is otherwise idle and read-only, so the caller's S3
 // round trip — and the retry backoff hiding inside it — pins one pooled connection but
 // no write transaction, snapshot or xid.
 //
 // Locks are try-locks, and an object whose lock is held is left out of this cycle: a
-// held lock means an uploader is writing that body right now, so it is not an orphan at
-// all. Never waiting also means this cannot deadlock against the uploader, whatever
-// order the batch happens to be in.
+// held lock means the body is being restored or copied right now. Never waiting also means this cannot deadlock against another
+// holder, whatever order the batch happens to be in.
 //
 // fn runs under a context that is cancelled if the locks are lost meanwhile (the
 // backend died, a failover, a failed keepalive), so its S3 delete stops rather than
@@ -538,7 +540,9 @@ func (d *Database) DeleteMessageByHashAndMailbox(ctx context.Context, tx pgx.Tx,
 //
 // What separates recoverable from lost is whether the node holding the bytes still
 // exists, so a message past the grace period is reaped only when no pending upload
-// can still deliver it, i.e. every pending_uploads row for it either
+// can still deliver it: none is leased to an upload in flight right now (lease_until in
+// the future, see PassS3WriteGate), whatever its attempts and instance say, and every
+// pending_uploads row for it either
 //   - has exhausted its attempts, or
 //   - belongs to an instance that is provably gone (no heartbeat and no lease within
 //     instanceLiveness — see the instance_heartbeats table), or
@@ -581,9 +585,10 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 				SELECT 1 FROM pending_uploads pu
 				LEFT JOIN instance_heartbeats ih ON ih.instance_id = pu.instance_id
 				WHERE pu.content_hash = m.content_hash AND pu.account_id = m.account_id
-				  AND pu.attempts < $2
-				  AND (GREATEST(ih.last_seen, pu.last_attempt) IS NULL
-				       OR GREATEST(ih.last_seen, pu.last_attempt) > now() - $3::interval)
+				  AND (pu.lease_until > now()
+				       OR (pu.attempts < $2
+				           AND (GREATEST(ih.last_seen, pu.last_attempt) IS NULL
+				                OR GREATEST(ih.last_seen, pu.last_attempt) > now() - $3::interval)))
 			  )
 			RETURNING m.content_hash, m.account_id
 		),
@@ -1090,6 +1095,12 @@ func lockAccountMailboxes(ctx context.Context, tx pgx.Tx, accountIDs []int64) er
 
 // deleteAccountDependents removes what the accounts row must be free of before it can be
 // finalized, mailboxes last. Every message of the accounts must already be expunged.
+//
+// A pending upload whose body is in flight (a lease, see PassS3WriteGate) is left: it is
+// the only thing keeping the S3 phase away from a body being written without a lock. The
+// S3 phase skips that body and its rows stay, so the account is not finalized yet; once
+// the upload finalizes, the next pass deletes the body like any other. Unleased pending
+// rows go, and their bodies are never uploaded.
 func deleteAccountDependents(ctx context.Context, tx pgx.Tx, accountIDs []int64) error {
 	batchOps := []struct {
 		tableName string
@@ -1097,7 +1108,7 @@ func deleteAccountDependents(ctx context.Context, tx pgx.Tx, accountIDs []int64)
 	}{
 		{"vacation_responses", "DELETE FROM vacation_responses WHERE account_id = ANY($1)"},
 		{"sieve_scripts", "DELETE FROM sieve_scripts WHERE account_id = ANY($1)"},
-		{"pending_uploads", "DELETE FROM pending_uploads WHERE account_id = ANY($1)"},
+		{"pending_uploads", "DELETE FROM pending_uploads WHERE account_id = ANY($1) AND (lease_until IS NULL OR lease_until < now())"},
 		{"mailboxes", "DELETE FROM mailboxes WHERE account_id = ANY($1)"},
 	}
 	for _, op := range batchOps {
@@ -1116,13 +1127,20 @@ func deleteAccountDependents(ctx context.Context, tx pgx.Tx, accountIDs []int64)
 // the usual way to get here: it has no messages, but keeps its mailboxes until
 // HardDeleteAccounts runs.
 //
+// No pending upload of the account may hold a live lease either. pending_uploads cascades
+// with the account, so finalizing would delete the row an upload in flight is writing
+// under, and give up the account's address while the write can still land; such a write
+// would stay in S3 under the address, with nothing pointing at it, or come to sit under a
+// new account that takes the address over.
+//
 // Every query that decides finalization uses this one predicate: the candidate scan on
 // the read pool, the FTS drain and the finalize itself on the primary, so they cannot
 // disagree.
 func accountFinalizableSQL(alias string) string {
 	return alias + `.deleted_at IS NOT NULL
 		AND NOT EXISTS (SELECT 1 FROM messages WHERE account_id = ` + alias + `.id)
-		AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE account_id = ` + alias + `.id)`
+		AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE account_id = ` + alias + `.id)
+		AND NOT EXISTS (SELECT 1 FROM pending_uploads WHERE account_id = ` + alias + `.id AND lease_until > now())`
 }
 
 // GetDanglingAccountsForFinalDeletion finds accounts that are marked as deleted and have no
@@ -1321,7 +1339,7 @@ func (d *Database) GetMessagesForAccount(ctx context.Context, accountID int64) (
 // to delete.
 //
 // Walking by key cursor visits each key at most once per pass even when some keys are
-// skipped (an upload holds the lock, or S3 refused the delete) and their rows stay in
+// skipped (something holds the body's lock, or S3 refused the delete) and their rows stay in
 // messages until the next pass.
 //
 // SAFETY: the keys are the account's own. An S3 key is <s3_domain>/<s3_localpart>/<hash>,

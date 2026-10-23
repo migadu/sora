@@ -108,6 +108,10 @@ Actions taken per upload:
   [DELETE] MISSING everywhere  → DeleteFailedUpload: removes undeliverable message rows and pending record.
                                Content is in neither S3 nor this host's spool; the message is lost.
 
+  An upload a fresh delivery re-armed, or one being written right now, while resolve was checking
+  S3 is no longer resolve's: [DELETE] leaves it (0 rows deleted), and [REPAIR] marks the messages
+  whose objects exist but leaves the pending record to the upload in flight.
+
 Examples:
   sora-admin uploader resolve --dry-run
   sora-admin uploader resolve
@@ -259,12 +263,14 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 			fmt.Printf("  [DELETE] id=%-10d account=%-8d hash=%.16s... [FAIL] MISSING in S3 and in spool → DeleteFailedUpload\n",
 				upload.ID, upload.AccountID, upload.ContentHash)
 			if !dryRun {
-				n, err := rdb.DeleteFailedUploadWithRetry(ctx, upload.ContentHash, upload.AccountID)
+				n, err := rdb.DeleteFailedUploadWithRetry(ctx, upload.ContentHash, upload.AccountID, cfg.Uploader.MaxAttempts)
 				if err != nil {
 					fmt.Printf("            ERROR: %v\n", err)
 					skipped++
 					continue
 				}
+				// 0 also when the row was re-armed by a fresh delivery, or an upload
+				// leased it, while this run was checking S3: it is not lost any more.
 				fmt.Printf("            Deleted %d message row(s)\n", n)
 			}
 			deleted++

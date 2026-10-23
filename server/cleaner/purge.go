@@ -6,8 +6,16 @@ package cleaner
 //
 // A purge is the cleaner's own pipeline for soft-deleted accounts, run for one account
 // now instead of after the grace period: the bounded hard delete of its mailboxes and
-// messages, the S3 phase under the uploader's per-object locks, the FTS drain, and the
-// finalize that deletes the credentials and the account row together in one transaction.
+// messages, the S3 phase under the per-object locks, the FTS drain, and the finalize that
+// deletes the credentials and the account row together in one transaction.
+//
+// A purge waits for an upload in flight. The upload holds no lock while it writes; its
+// pending row, leased to it from the write gate to the finalize (db.PassS3WriteGate), is
+// what keeps the purge away: the hard delete leaves a leased row, the S3 phase skips a body
+// that has a pending row, so its rows, and the account with its address, remain and the
+// pass fails. Once the upload has finalized, the next run deletes the body like any other.
+// Pending rows of uploads not in flight go with the mailboxes, and those bodies are never
+// uploaded.
 // Sharing it is the point: the purge inherits every fix those steps received, and there is
 // no second copy of the deletion order to keep in step.
 //
@@ -33,9 +41,10 @@ var ErrAccountInService = errors.New("account is in service: it was restored, or
 
 const (
 	// purgeMaxPasses bounds how often a purge runs the whole pipeline again when the
-	// account still holds rows at the end of a pass: a body whose upload is in flight
-	// holds its lock, S3 refused a delete, or a delivery that passed its recipient check
-	// just before the account went out of service landed afterwards.
+	// account still holds rows at the end of a pass: an upload of a body is in flight,
+	// something held a body's lock (a restore or cross-account COPY of it), S3 refused a
+	// delete, or a delivery that passed its recipient check just before the account went
+	// out of service landed afterwards.
 	purgeMaxPasses = 5
 	// purgeRetryDelay is the pause before the second pass, doubled before each further one.
 	purgeRetryDelay = 250 * time.Millisecond
@@ -109,7 +118,7 @@ func PurgeAccount(ctx context.Context, rdb AccountPurgeDatabase, s3 S3BulkDelete
 			return stats, ErrAccountInService
 		}
 		if pass == purgeMaxPasses {
-			return stats, fmt.Errorf("account still holds data after %d passes (an upload in flight, S3 refusing deletes, or mail still arriving); it stays out of service, and running the purge again, or the cleaner after its grace period, finishes it", pass)
+			return stats, fmt.Errorf("account still holds data after %d passes (an upload in flight, a body locked by a restore or copy, S3 refusing deletes, or mail still arriving); it stays out of service, and running the purge again, or the cleaner after its grace period, finishes it", pass)
 		}
 		logger.Info("Purge: account still holds data, running another pass", "account_id", accountID, "pass", pass, "delay", delay)
 		select {
@@ -123,7 +132,7 @@ func PurgeAccount(ctx context.Context, rdb AccountPurgeDatabase, s3 S3BulkDelete
 
 // purgeAccountObjects walks the S3 keys of the account's expunged rows in key order and
 // deletes the objects and the rows. Walking by cursor visits each key at most once per
-// pass even when some keys are skipped (a body whose upload holds its lock, a key S3
+// pass even when some keys are skipped (a body being uploaded or locked, a key S3
 // refused) and their rows remain in messages; those are retried on the next pass after
 // purgeRetryDelay. A round that deletes no rows at all stops the pass early rather than
 // keep calling a broken S3 across the rest of the account.
