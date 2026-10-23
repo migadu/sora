@@ -691,8 +691,11 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				// If user script returns implicit keep (ActionKeep), preserve the default script's action
 				// Otherwise, the user script overrides the default
 				if userResult.Action == sieveengine.ActionKeep && result.Action != sieveengine.ActionKeep {
-					s.InfoLog("user sieve implicit keep - preserving default script action", "default_action", result.Action)
-					// Keep the default script result (don't override)
+					s.InfoLog("user sieve implicit keep - preserving default script action", "default_action", result.Action, "vacation", userResult.Vacation != nil)
+					// Keep the default script's action, and still send the user's vacation
+					// reply: it is no action on the message, and goes out whatever happens
+					// to it (RFC 5230 §4.7).
+					result.Vacation = userResult.Vacation
 				} else {
 					// User script has an explicit action, override the default
 					result = userResult
@@ -707,16 +710,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		} else {
 			s.DebugLog("no active script found, using default script result")
 		}
-	}
-
-	// A discard, which an RFC 5429 reject is delivered as, stores nothing: decide
-	// it before header edits and before the body is staged for upload, where the
-	// abandoned file would sit until the orphan sweep and count against the
-	// staging limit.
-	if result.Action == sieveengine.ActionDiscard {
-		s.InfoLog("sieve message discarded")
-		recordMetrics("success")
-		return nil
 	}
 
 	// Apply header edits if any (RFC 5293 - editheader extension)
@@ -756,6 +749,25 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				s.DebugLog("message headers updated after edits", "content_hash", contentHash)
 			}
 		}
+	}
+
+	// The vacation reply goes out whatever happens to the message (RFC 5230 §4.7),
+	// a discarded one included, and after the header edits, which it has to see
+	// (RFC 5293 §7).
+	if result.Vacation != nil {
+		if err := s.handleVacationResponse(ctx, *result.Vacation, messageContent); err != nil {
+			s.DebugLog("error handling vacation response", "error", err)
+			// Continue processing even if vacation response fails
+		}
+	}
+
+	// A discard, which an RFC 5429 reject is delivered as, stores nothing: decide
+	// it before the body is staged for upload, where the abandoned file would sit
+	// until the orphan sweep and count against the staging limit.
+	if result.Action == sieveengine.ActionDiscard {
+		s.InfoLog("sieve message discarded")
+		recordMetrics("success")
+		return nil
 	}
 
 	// Store message locally for background upload to S3
@@ -910,16 +922,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		// Or if :copy is specified
 		mailboxName = consts.MailboxInbox
 
-	case sieveengine.ActionVacation:
-		// Handle vacation response
-		err := s.handleVacationResponse(ctx, result, messageContent)
-		if err != nil {
-			s.DebugLog("error handling vacation response", "error", err)
-			// Continue processing even if vacation response fails
-		}
-		// Store the original message in INBOX
-		mailboxName = consts.MailboxInbox
-
 	default:
 		s.DebugLog("sieve keep action")
 		mailboxName = consts.MailboxInbox
@@ -1026,10 +1028,11 @@ func (s *LMTPSession) logSieveAction(source string, result sieveengine.Result) {
 		} else {
 			s.InfoLog(source + " sieve discard")
 		}
-	case sieveengine.ActionVacation:
-		s.InfoLog(source + " sieve vacation response triggered")
 	case sieveengine.ActionKeep:
 		s.InfoLog(source + " sieve keep")
+	}
+	if result.Vacation != nil {
+		s.InfoLog(source + " sieve vacation response triggered")
 	}
 }
 
@@ -1139,7 +1142,7 @@ func (s *LMTPSession) notifyRelayWorker() {
 // ":from" ownership constraint, RFC 2047 subject encoding, and message construction
 // all live there. The send decision and per-sender rate-limiting are handled upstream
 // by the Sieve engine's VacationOracle.
-func (s *LMTPSession) handleVacationResponse(ctx context.Context, result sieveengine.Result, originalMessage *message.Entity) error {
+func (s *LMTPSession) handleVacationResponse(ctx context.Context, reply sieveengine.VacationReply, originalMessage *message.Entity) error {
 	handler := &delivery.StandardVacationHandler{
 		Hostname:       s.HostName,
 		RelayQueue:     s.backend.relayQueue,
@@ -1147,7 +1150,7 @@ func (s *LMTPSession) handleVacationResponse(ctx context.Context, result sieveen
 		IsOwnedAddress: s.backend.rdb.IsAddressOwnedByAccountWithRetry,
 		RelayNotify:    s.notifyRelayWorker,
 	}
-	return handler.HandleVacationResponse(ctx, s.AccountID(), result, s.sender, &s.User.Address, originalMessage)
+	return handler.HandleVacationResponse(ctx, s.AccountID(), reply, s.sender, &s.User.Address, originalMessage)
 }
 
 // saveMessageToMailbox saves a message to the specified mailbox.

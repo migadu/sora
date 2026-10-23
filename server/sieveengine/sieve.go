@@ -25,7 +25,6 @@ const (
 	ActionDiscard  Action = "discard"
 	ActionFileInto Action = "fileinto"
 	ActionRedirect Action = "redirect"
-	ActionVacation Action = "vacation"
 )
 
 // scriptExecutionTimeout bounds the total execution time of a single Sieve script
@@ -113,18 +112,20 @@ type HeaderEdit struct {
 }
 
 type Result struct {
-	Action         Action
-	Mailbox        string            // used for fileinto
-	RedirectTo     string            // used for redirect
-	Flags          []string          // flags to add to the message
-	VacationFrom   string            // used for vacation - from address
-	VacationSubj   string            // used for vacation - subject
-	VacationMsg    string            // used for vacation - message body
-	VacationIsMime bool              // used for vacation - is MIME message
-	Copy           bool              // RFC3894 - :copy modifier for redirect and fileinto
-	CreateMailbox  bool              // RFC5490 - :create modifier (mailbox extension)
-	HeaderEdits    []HeaderEdit      // RFC5293 - editheader extension (addheader/deleteheader)
-	Additional     map[string]string // future-proofing
+	Action        Action
+	Mailbox       string            // used for fileinto
+	RedirectTo    string            // used for redirect
+	Flags         []string          // flags to add to the message
+	Copy          bool              // RFC3894 - :copy modifier for redirect and fileinto
+	CreateMailbox bool              // RFC5490 - :create modifier (mailbox extension)
+	HeaderEdits   []HeaderEdit      // RFC5293 - editheader extension (addheader/deleteheader)
+	Additional    map[string]string // future-proofing
+
+	// Vacation is the auto-reply the script's vacation action asks for, or nil. It is
+	// not an Action: RFC 5230 §4.7 says "Vacation does not affect Sieve's implicit keep
+	// action" and makes it compatible with keep, fileinto, redirect and discard, so
+	// delivery sends it alongside Action, whatever that is.
+	Vacation *VacationReply
 
 	// Rejected marks an ActionDiscard that came from an RFC 5429 reject or
 	// ereject (RejectExtended). Delivery treats it as any other discard: the
@@ -133,14 +134,22 @@ type Result struct {
 	Rejected       bool
 	RejectExtended bool
 	RejectReason   string
+}
 
-	// RecordVacationSent commits the RFC 5230 :days window for this sender. It is
-	// non-nil only for ActionVacation with a VacationOracle configured, and the
-	// delivery path must call it immediately before handing the reply to the relay:
-	// the mandatory §4.5 suppression checks run there and may still decide not to
-	// reply, while recording after the handoff would let a redelivery of the same
-	// message produce a second reply.
-	RecordVacationSent func(ctx context.Context) error
+// VacationReply is an RFC 5230 auto-reply a script decided to send, its :days window
+// for this sender already checked.
+type VacationReply struct {
+	From    string // the :from address; delivery uses it only if the account owns it
+	Subject string
+	Body    string // the reason
+	IsMime  bool
+
+	// RecordSent commits the :days window for this sender. It is nil without a
+	// VacationOracle, and the delivery path must call it immediately before handing
+	// the reply to the relay: the mandatory §4.5 suppression checks run there and may
+	// still decide not to reply, while recording after the handoff would let a
+	// redelivery of the same message produce a second reply.
+	RecordSent func(ctx context.Context) error
 }
 
 type Context struct {
@@ -336,11 +345,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		Flags:      make([]string, 0),
 	}
 
-	// Check if vacation response was triggered
-	// The go-sieve library stores vacation responses in data.VacationResponses
-	vacationTriggered := len(data.VacationResponses) > 0
-
-	// Handle fileinto action (takes precedence over vacation)
+	// Handle fileinto action
 	if len(data.Mailboxes) > 0 {
 		// Use the first mailbox (we could support multiple mailboxes in the future)
 		result.Action = ActionFileInto
@@ -363,7 +368,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 			}
 		}
 	} else if len(data.RedirectAddr) > 0 {
-		// Handle redirect action (takes precedence over vacation)
+		// Handle redirect action
 		// Use the first redirect address (we could support multiple redirects in the future)
 		result.Action = ActionRedirect
 		result.RedirectTo = data.RedirectAddr[0]
@@ -381,30 +386,27 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		result.Rejected = data.Rejected
 		result.RejectExtended = data.RejectExtended
 		result.RejectReason = data.RejectReason
-	} else if vacationTriggered {
-		// Process vacation responses
-		// Per RFC 5230, vacation is an implicit keep, so we only reach here if ImplicitKeep is still true
-		// (fileinto/redirect/discard are handled above and cancel the implicit keep)
-		// Get the first vacation response (there should only be one per evaluation)
-		for sender, vacation := range data.VacationResponses {
-			// Check with the policy/oracle if we should send this vacation response
-			duration := time.Duration(vacation.Days) * 24 * time.Hour
-			allowed, err := execPolicy.VacationResponseAllowed(timeoutCtx, data, sender, vacation.Handle, duration)
-			if err != nil {
-				// Log error but don't fail the message delivery
-				continue
-			}
+	}
 
-			if allowed {
-				result.Action = ActionVacation
-				result.VacationFrom = vacation.From
-				result.VacationSubj = vacation.Subject
-				result.VacationMsg = vacation.Body
-				result.VacationIsMime = vacation.IsMime
-				result.RecordVacationSent = execPolicy.vacationRecorder(sender, vacation.Handle)
-			}
-			break // Only process the first vacation response
+	// The vacation reply is decided apart from the action above: it neither depends
+	// on nor changes what happens to the message (RFC 5230 §4.7). go-sieve keys
+	// VacationResponses by the envelope sender, so there is at most one, and it has
+	// already refused a vacation next to reject.
+	for sender, vacation := range data.VacationResponses {
+		duration := time.Duration(vacation.Days) * 24 * time.Hour
+		allowed, err := execPolicy.VacationResponseAllowed(timeoutCtx, data, sender, vacation.Handle, duration)
+		if err != nil || !allowed {
+			// An oracle error must not fail the delivery; it costs this one reply.
+			break
 		}
+		result.Vacation = &VacationReply{
+			From:       vacation.From,
+			Subject:    vacation.Subject,
+			Body:       vacation.Body,
+			IsMime:     vacation.IsMime,
+			RecordSent: execPolicy.vacationRecorder(sender, vacation.Handle),
+		}
+		break
 	}
 
 	// Handle flags

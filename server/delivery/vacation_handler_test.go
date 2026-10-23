@@ -55,14 +55,14 @@ func TestHandleVacationResponse(t *testing.T) {
 			IsOwnedAddress: ownsJane,
 			RelayNotify:    func() { notified = true },
 		}
-		result := sieveengine.Result{
-			VacationFrom: owner,
-			VacationSubj: "Réponse: Out of Office",
-			VacationMsg:  "I am away.",
+		reply := sieveengine.VacationReply{
+			From:    owner,
+			Subject: "Réponse: Out of Office",
+			Body:    "I am away.",
 		}
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "To": owner, "Message-ID": "<orig@external.com>"})
 
-		if err := h.HandleVacationResponse(context.Background(), 1, result, sender, toAddress, orig); err != nil {
+		if err := h.HandleVacationResponse(context.Background(), 1, reply, sender, toAddress, orig); err != nil {
 			t.Fatalf("HandleVacationResponse: %v", err)
 		}
 		if len(rq.calls) != 1 {
@@ -112,10 +112,10 @@ func TestHandleVacationResponse(t *testing.T) {
 	t.Run("unowned :from falls back to default From (no spoofing)", func(t *testing.T) {
 		rq := &captureRelayQueue{}
 		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
-		result := sieveengine.Result{VacationFrom: "ceo@victim.com", VacationMsg: "away"}
+		reply := sieveengine.VacationReply{From: "ceo@victim.com", Body: "away"}
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "To": owner})
 
-		if err := h.HandleVacationResponse(context.Background(), 1, result, sender, toAddress, orig); err != nil {
+		if err := h.HandleVacationResponse(context.Background(), 1, reply, sender, toAddress, orig); err != nil {
 			t.Fatalf("HandleVacationResponse: %v", err)
 		}
 		if len(rq.calls) != 1 {
@@ -129,11 +129,11 @@ func TestHandleVacationResponse(t *testing.T) {
 	t.Run("RFC 5230 §4.5: account in Cc only -> reply", func(t *testing.T) {
 		rq := &captureRelayQueue{}
 		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
-		result := sieveengine.Result{VacationMsg: "away"}
+		reply := sieveengine.VacationReply{Body: "away"}
 		// Owner not in To, but present in Cc — still a personal message.
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "To": "team@example.com", "Cc": owner})
 
-		if err := h.HandleVacationResponse(context.Background(), 1, result, sender, toAddress, orig); err != nil {
+		if err := h.HandleVacationResponse(context.Background(), 1, reply, sender, toAddress, orig); err != nil {
 			t.Fatalf("HandleVacationResponse: %v", err)
 		}
 		if len(rq.calls) != 1 {
@@ -144,12 +144,12 @@ func TestHandleVacationResponse(t *testing.T) {
 	t.Run("RFC 5230 §4.5: plus-addressed recipient counts -> reply", func(t *testing.T) {
 		rq := &captureRelayQueue{}
 		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
-		result := sieveengine.Result{VacationMsg: "away"}
+		reply := sieveengine.VacationReply{Body: "away"}
 		// ownsJane only owns the base address; the To carries a +detail recipient, which
 		// must still be recognized as personal mail after base-address normalization.
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "To": "jane+newsletter@example.com"})
 
-		if err := h.HandleVacationResponse(context.Background(), 1, result, sender, toAddress, orig); err != nil {
+		if err := h.HandleVacationResponse(context.Background(), 1, reply, sender, toAddress, orig); err != nil {
 			t.Fatalf("HandleVacationResponse: %v", err)
 		}
 		if len(rq.calls) != 1 {
@@ -160,12 +160,12 @@ func TestHandleVacationResponse(t *testing.T) {
 	t.Run("RFC 5230 §4.5: account not in To/Cc -> no reply (backscatter)", func(t *testing.T) {
 		rq := &captureRelayQueue{}
 		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
-		result := sieveengine.Result{VacationMsg: "away"}
+		reply := sieveengine.VacationReply{Body: "away"}
 		// Delivered to the account (Bcc / alias expansion), but the account's address
 		// appears in neither To nor Cc — auto-replying here is backscatter.
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "To": "list@example.com"})
 
-		if err := h.HandleVacationResponse(context.Background(), 1, result, sender, toAddress, orig); err != nil {
+		if err := h.HandleVacationResponse(context.Background(), 1, reply, sender, toAddress, orig); err != nil {
 			t.Fatalf("HandleVacationResponse: %v", err)
 		}
 		if len(rq.calls) != 0 {
@@ -176,10 +176,10 @@ func TestHandleVacationResponse(t *testing.T) {
 	t.Run("RFC 5230 suppression: Auto-Submitted original -> no reply", func(t *testing.T) {
 		rq := &captureRelayQueue{}
 		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
-		result := sieveengine.Result{VacationMsg: "away"}
+		reply := sieveengine.VacationReply{Body: "away"}
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "Auto-Submitted": "auto-replied"})
 
-		if err := h.HandleVacationResponse(context.Background(), 1, result, sender, toAddress, orig); err != nil {
+		if err := h.HandleVacationResponse(context.Background(), 1, reply, sender, toAddress, orig); err != nil {
 			t.Fatalf("HandleVacationResponse: %v", err)
 		}
 		if len(rq.calls) != 0 {

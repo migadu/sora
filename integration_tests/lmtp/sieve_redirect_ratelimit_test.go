@@ -142,7 +142,8 @@ func startTestLMTPServerWithRedirect(t *testing.T, rdb *resilient.ResilientDatab
 		t.Fatalf("lmtp new: %v", err)
 	}
 	t.Cleanup(func() { srv.Close() })
-	go srv.Start(make(chan error, 1))
-	time.Sleep(200 * time.Millisecond)
+	errChan := make(chan error, 1)
+	go srv.Start(errChan)
+	waitForLMTPListener(t, addr, errChan)
 	return addr
 }

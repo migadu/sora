@@ -189,6 +189,12 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 			strings.Join(rejected, ","))
 	}
 
+	// The vacation reply goes out whatever happens to the message (RFC 5230 §4.7), and
+	// after the header edits, which it has to see (RFC 5293 §7).
+	if result.Vacation != nil && s.VacationHandler != nil && recipient.FromAddress != nil {
+		_ = s.VacationHandler.HandleVacationResponse(ctx, recipient.AccountID, *result.Vacation, recipient.FromAddress, recipient.Address, outcome.MessageEntity)
+	}
+
 	// Process result
 	switch result.Action {
 	case sieveengine.ActionDiscard:
@@ -243,13 +249,6 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 			}
 		}
 		// Fallback or copy: deliver to INBOX
-		outcome.MailboxName = consts.MailboxInbox
-
-	case sieveengine.ActionVacation:
-		// Handle vacation response
-		if s.VacationHandler != nil && recipient.FromAddress != nil {
-			_ = s.VacationHandler.HandleVacationResponse(ctx, recipient.AccountID, result, recipient.FromAddress, recipient.Address, outcome.MessageEntity)
-		}
 		outcome.MailboxName = consts.MailboxInbox
 
 	default:
