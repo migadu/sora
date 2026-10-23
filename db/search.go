@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -990,56 +991,118 @@ func resolveResultLimit(explicitLimit int, isSearchAll, isComplexQuery bool, ord
 // mapSeqNumCriteriaToUID rewrites every sequence-set search key in c, nested ones
 // included, into the UID set those sequence numbers name now, so a query can filter on
 // m.uid instead of materialising ROW_NUMBER() over the whole mailbox.
+//
+// Every sequence number in the tree is resolved by one statement, which ranks the
+// mailbox only as far as the largest of them. Resolving each range on its own took two
+// index scans into the mailbox per range, so a search naming a few hundred sequence
+// numbers read millions of rows. c is left as it was if the statement fails.
 func (db *Database) mapSeqNumCriteriaToUID(ctx context.Context, mailboxID int64, c *imap.SearchCriteria) error {
-	if c == nil {
-		return nil
+	var seqNums []int64
+	collectSeqNums(c, &seqNums)
+	uidBySeq := map[uint32]imap.UID{}
+	if len(seqNums) > 0 {
+		var err error
+		if uidBySeq, err = db.uidsBySeqNum(ctx, mailboxID, seqNums); err != nil {
+			return err
+		}
 	}
-	if len(c.SeqNum) > 0 {
-		for _, seqSet := range c.SeqNum {
-			var mappedUIDSet imap.UIDSet
-			for _, seqRange := range seqSet {
-				startUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Start)
-				if err != nil {
-					continue // Out of bounds or invalid
-				}
+	rewriteSeqNumCriteria(c, uidBySeq)
+	return nil
+}
 
-				uidRange := imap.UIDRange{Start: startUID}
-				if seqRange.Stop == 0 {
-					uidRange.Stop = 0
-				} else {
-					stopUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Stop)
-					if err != nil {
-						uidRange.Stop = 0 // Cap to highest
-					} else {
-						uidRange.Start = min(startUID, stopUID)
-						uidRange.Stop = max(startUID, stopUID)
-					}
+// uidsBySeqNum returns the UID at each of the given sequence numbers. A sequence number
+// past the last message is missing from the result.
+func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums []int64) (map[uint32]imap.UID, error) {
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT ranked.seqnum, ranked.uid
+		FROM (
+			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
+			FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			ORDER BY uid
+			LIMIT $2
+		) ranked
+		WHERE ranked.seqnum = ANY($3)
+	`, mailboxID, slices.Max(seqNums), seqNums)
+	if err != nil {
+		return nil, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
+	}
+	defer rows.Close()
+
+	uidBySeq := make(map[uint32]imap.UID, len(seqNums))
+	for rows.Next() {
+		var seq int64
+		var uid int64
+		if err := rows.Scan(&seq, &uid); err != nil {
+			return nil, fmt.Errorf("failed to scan sequence number mapping: %w", err)
+		}
+		uidBySeq[uint32(seq)] = imap.UID(uid)
+	}
+	return uidBySeq, rows.Err()
+}
+
+// collectSeqNums appends every sequence number c's sequence sets name as a range end,
+// nested criteria included; "*" is not one.
+func collectSeqNums(c *imap.SearchCriteria, seqNums *[]int64) {
+	if c == nil {
+		return
+	}
+	for _, seqSet := range c.SeqNum {
+		for _, r := range seqSet {
+			for _, n := range []uint32{r.Start, r.Stop} {
+				if n != 0 {
+					*seqNums = append(*seqNums, int64(n))
 				}
-				mappedUIDSet = append(mappedUIDSet, uidRange)
-			}
-			if len(mappedUIDSet) > 0 {
-				c.UID = append(c.UID, mappedUIDSet)
-			} else if len(seqSet) > 0 {
-				c.UID = append(c.UID, []imap.UIDRange{{Start: 0, Stop: 0}})
 			}
 		}
-		// Clear the SeqNum criteria since we moved them to UID
-		c.SeqNum = nil
 	}
 	for i := range c.Not {
-		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, &c.Not[i]); err != nil {
-			return err
-		}
+		collectSeqNums(&c.Not[i], seqNums)
 	}
 	for i := range c.Or {
-		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, &c.Or[i][0]); err != nil {
-			return err
+		collectSeqNums(&c.Or[i][0], seqNums)
+		collectSeqNums(&c.Or[i][1], seqNums)
+	}
+}
+
+// rewriteSeqNumCriteria replaces c's sequence sets, nested ones included, with the UID
+// sets they name according to uidBySeq. A range starting past the last message is
+// dropped, one ending past it runs to the last message, and a set naming no message at
+// all becomes UID 0, which matches nothing.
+func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID) {
+	if c == nil {
+		return
+	}
+	for _, seqSet := range c.SeqNum {
+		var mappedUIDSet imap.UIDSet
+		for _, seqRange := range seqSet {
+			startUID, ok := uidBySeq[seqRange.Start]
+			if !ok {
+				continue // Out of bounds or invalid
+			}
+
+			uidRange := imap.UIDRange{Start: startUID} // Stop 0 is "*"
+			if stopUID, ok := uidBySeq[seqRange.Stop]; ok && seqRange.Stop != 0 {
+				uidRange.Start = min(startUID, stopUID)
+				uidRange.Stop = max(startUID, stopUID)
+			}
+			mappedUIDSet = append(mappedUIDSet, uidRange)
 		}
-		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, &c.Or[i][1]); err != nil {
-			return err
+		if len(mappedUIDSet) > 0 {
+			c.UID = append(c.UID, mappedUIDSet)
+		} else if len(seqSet) > 0 {
+			c.UID = append(c.UID, []imap.UIDRange{{Start: 0, Stop: 0}})
 		}
 	}
-	return nil
+	// Clear the SeqNum criteria since we moved them to UID
+	c.SeqNum = nil
+	for i := range c.Not {
+		rewriteSeqNumCriteria(&c.Not[i], uidBySeq)
+	}
+	for i := range c.Or {
+		rewriteSeqNumCriteria(&c.Or[i][0], uidBySeq)
+		rewriteSeqNumCriteria(&c.Or[i][1], uidBySeq)
+	}
 }
 
 // getMessagesQueryExecutor is a helper function to execute the message retrieval query,
@@ -1413,60 +1476,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 	if needsSeqNumSearch && !strings.Contains(strings.ToLower(orderByClause), "seqnum") {
 		// If we only need seqnum for WHERE filtering, we can map the SeqSets to UIDSets
 		// and completely bypass the catastrophic ROW_NUMBER() materialization!
-		var mapSeqToUID func(*imap.SearchCriteria) error
-		mapSeqToUID = func(c *imap.SearchCriteria) error {
-			if c == nil {
-				return nil
-			}
-			if len(c.SeqNum) > 0 {
-				for _, seqSet := range c.SeqNum {
-					var mappedUIDSet imap.UIDSet
-					for _, seqRange := range seqSet {
-						startUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Start)
-						if err != nil {
-							continue // Out of bounds or invalid
-						}
-
-						uidRange := imap.UIDRange{Start: startUID}
-						if seqRange.Stop == 0 {
-							uidRange.Stop = 0
-						} else {
-							stopUID, err := db.getUIDBySeqNum(ctx, mailboxID, seqRange.Stop)
-							if err != nil {
-								uidRange.Stop = 0 // Cap to highest
-							} else {
-								uidRange.Start = min(startUID, stopUID)
-								uidRange.Stop = max(startUID, stopUID)
-							}
-						}
-						mappedUIDSet = append(mappedUIDSet, uidRange)
-					}
-					if len(mappedUIDSet) > 0 {
-						c.UID = append(c.UID, mappedUIDSet)
-					} else if len(seqSet) > 0 {
-						c.UID = append(c.UID, []imap.UIDRange{{Start: 0, Stop: 0}})
-					}
-				}
-				// Clear the SeqNum criteria since we moved them to UID
-				c.SeqNum = nil
-			}
-			for i := range c.Not {
-				if err := mapSeqToUID(&c.Not[i]); err != nil {
-					return err
-				}
-			}
-			for i := range c.Or {
-				if err := mapSeqToUID(&c.Or[i][0]); err != nil {
-					return err
-				}
-				if err := mapSeqToUID(&c.Or[i][1]); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-
-		if err := mapSeqToUID(criteria); err == nil {
+		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, criteria); err == nil {
 			needsSeqNumSearch = false
 			isComplexQuery = db.needsComplexQuery(criteria, orderByClause)
 		}
