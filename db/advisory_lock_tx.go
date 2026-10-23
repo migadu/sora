@@ -71,7 +71,10 @@ var advisoryLockStatementTimeout = 5 * time.Second
 // What the transaction does hold is one pooled connection — one backend behind a pooler
 // — for as long as the locks are held. That is the honest cost of mutual exclusion
 // across an S3 round trip; callers bound it with their contexts, and operators size
-// pooler pools for it (see config.toml.example, [uploader] concurrency).
+// pooler pools for it (see docs/deployment.md, "Connection Poolers"). A caller that only
+// needs to order itself after a holder, not exclude others for a while, should not pay
+// it: the uploader takes the lock in a single autocommit statement instead
+// (PassS3WriteGate).
 //
 // pgx connections are not safe for concurrent use, so every statement on the
 // transaction, including the keepalive, is serialized by mu. Any statement error aborts

@@ -109,9 +109,17 @@ func (m *mockUploaderDB) ExecuteWithS3ObjectLock(ctx context.Context, contentHas
 	}
 	return args.Error(1)
 }
-func (m *mockUploaderDB) CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64, writtenKeys []string) error {
-	args := m.Called(ctx, contentHash, accountID, writtenKeys)
+func (m *mockUploaderDB) CompleteLeasedS3UploadWithRetry(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+	args := m.Called(ctx, pendingID, contentHash, accountID, writtenKeys)
 	return args.Error(0)
+}
+func (m *mockUploaderDB) PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash string) (db.S3WriteGate, error) {
+	args := m.Called(ctx, pendingID, accountID, contentHash)
+	return args.Get(0).(db.S3WriteGate), args.Error(1)
+}
+func (m *mockUploaderDB) UnreferencedS3KeysWithRetry(ctx context.Context, contentHash string, keys []string) ([]string, error) {
+	args := m.Called(ctx, contentHash, keys)
+	return args.Get(0).([]string), args.Error(1)
 }
 func (m *mockUploaderDB) GetUploaderStatsWithRetry(ctx context.Context, maxAttempts int) (*db.UploaderStats, error) {
 	args := m.Called(ctx, maxAttempts)
@@ -145,6 +153,10 @@ func (m *mockUploaderS3) PutWithRetry(ctx context.Context, key string, reader io
 func (m *mockUploaderS3) ExistsWithRetry(ctx context.Context, key string) (bool, error) {
 	args := m.Called(ctx, key)
 	return args.Bool(0), args.Error(1)
+}
+
+func (m *mockUploaderS3) DeleteWithRetry(ctx context.Context, key string) error {
+	return m.Called(ctx, key).Error(0)
 }
 
 // TestCleanupOrphanedFiles_RaceCondition_DeletesFileThatHasNoPendingUploadYet
@@ -312,10 +324,9 @@ func TestProcessSingleUpload_S3ExistsButLocalFileMissing_SelfHeals(t *testing.T)
 	mockDB.On("PendingUploadKeys", mock.Anything, contentHash, accountID).
 		Return([]string{helpers.NewS3Key("somedomain.com", "user", contentHash)}, nil)
 
-	// Since we mock S3 existence as true, ExistsWithRetry returns true, but we actually
-	// DO need to simulate the execution of ExecuteWithS3ObjectLock since the uploader runs it.
-	mockDB.On("ExecuteWithS3ObjectLock", mock.Anything, contentHash, accountID, mock.Anything).
-		Return(true, nil)
+	// Nothing is deleting the body, and the pending row still stands.
+	mockDB.On("PassS3WriteGateWithRetry", mock.Anything, int64(6257780), accountID, contentHash).
+		Return(db.S3WriteOpen, nil)
 
 	// S3: object already exists (the first uploader attempt PUT it there).
 	mockS3.On("ExistsWithRetry", mock.Anything, mock.AnythingOfType("string")).
@@ -323,7 +334,7 @@ func TestProcessSingleUpload_S3ExistsButLocalFileMissing_SelfHeals(t *testing.T)
 
 	// We expect the self-heal path to call CompleteS3UploadWithRetry, NOT MarkUploadAttemptWithRetry.
 	var completeCalled bool
-	mockDB.On("CompleteS3UploadWithRetry", mock.Anything, contentHash, accountID, mock.Anything).
+	mockDB.On("CompleteLeasedS3UploadWithRetry", mock.Anything, int64(6257780), contentHash, accountID, mock.Anything).
 		Run(func(args mock.Arguments) { completeCalled = true }).
 		Return(nil)
 

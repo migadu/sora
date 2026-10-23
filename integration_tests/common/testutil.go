@@ -131,6 +131,10 @@ func (n *NoopUploaderS3) ExistsWithRetry(_ context.Context, _ string) (bool, err
 	return false, nil
 }
 
+func (n *NoopUploaderS3) DeleteWithRetry(_ context.Context, _ string) error {
+	return nil
+}
+
 // NoopUploaderCache is a no-op cache used in integration tests.
 // MoveIn deliberately does nothing, which leaves the local file on disk.
 // This is required so that after the no-op S3 upload the IMAP server can

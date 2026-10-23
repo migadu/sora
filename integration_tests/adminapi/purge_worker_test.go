@@ -187,9 +187,10 @@ func TestPurgeWorker_SkipsAccountClaimedElsewhere(t *testing.T) {
 	s.requireGone(t, accountID, email)
 }
 
-// An upload in flight holds the body's lock, so the purge leaves that body, fails the
-// pass and backs off; once the upload is done the next attempt finishes.
-func TestPurgeWorker_UploadInFlightIsRetried(t *testing.T) {
+// Something holding a body's lock (a restore, a cross-account COPY) makes the purge leave
+// that body, fail the pass and back off; once the holder is done the next attempt finishes.
+// An upload in flight holds no lock: see TestPurgeWorker_UploadInFlightLeavesNothingBehind.
+func TestPurgeWorker_LockedBodyIsRetried(t *testing.T) {
 	s := setupPurgeStack(t)
 	email, accountID := s.newMailAccount(t, "worker-upload", "worker-pass-6")
 	s.addMessage(t, accountID, email, "free", true)
@@ -207,7 +208,7 @@ func TestPurgeWorker_UploadInFlightIsRetried(t *testing.T) {
 	}
 	s.runWorker(t)
 	if len(s.s3.Keys(lockedKey)) != 1 {
-		t.Error("the purge deleted a body while its upload held the lock")
+		t.Error("the purge deleted a body while something held its lock")
 	}
 	s.requireRetryable(t, accountID, email)
 	if err := tx.Rollback(ctx); err != nil {

@@ -113,19 +113,22 @@ const s3ObjectLockTimeout = 30 * time.Second
 // ExecuteWithLockedS3Orphans runs fn with the subset of objects that are still orphans,
 // while holding their per-object advisory locks in one dedicated lock transaction.
 //
-// It is the same lock the uploader holds across its S3 PUT and the DB finalization
-// (GetS3ObjectLockID, see resilient.ExecuteWithS3ObjectLock), so holding it across the
-// orphan re-check and the caller's S3 DELETE is what stops a delete from racing an
-// upload of the same body. The locks live in an AdvisoryLockTx: transaction-scoped, so
+// It is the lock the uploader's write gate takes and releases before an upload writes
+// (GetS3ObjectLockID, see PassS3WriteGate), so holding it across the orphan re-check and
+// the caller's S3 DELETE is what orders a delete confirmed before an upload's pending row
+// existed ahead of that upload's write. Uploads that passed the gate earlier are kept out
+// by the re-check itself: it refuses any body with a pending upload row, and an upload
+// holds no lock while it writes. Restore and cross-account COPY take the same lock.
+// The locks live in an AdvisoryLockTx: transaction-scoped, so
 // they cannot outlive their backend whatever pooler sits between Sora and PostgreSQL,
 // and held in a transaction that is otherwise idle and read-only, so the caller's S3
 // round trip — and the retry backoff hiding inside it — pins one pooled connection but
 // no write transaction, snapshot or xid.
 //
 // Locks are try-locks, and an object whose lock is held is left out of this cycle: a
-// held lock means an uploader is writing that body right now, so it is not an orphan at
-// all. Never waiting also means this cannot deadlock against the uploader, whatever
-// order the batch happens to be in.
+// held lock means the body is being restored, copied, or cleaned up after an abandoned
+// upload right now. Never waiting also means this cannot deadlock against another
+// holder, whatever order the batch happens to be in.
 //
 // fn runs under a context that is cancelled if the locks are lost meanwhile (the
 // backend died, a failover, a failed keepalive), so its S3 delete stops rather than
@@ -1321,7 +1324,7 @@ func (d *Database) GetMessagesForAccount(ctx context.Context, accountID int64) (
 // to delete.
 //
 // Walking by key cursor visits each key at most once per pass even when some keys are
-// skipped (an upload holds the lock, or S3 refused the delete) and their rows stay in
+// skipped (something holds the body's lock, or S3 refused the delete) and their rows stay in
 // messages until the next pass.
 //
 // SAFETY: the keys are the account's own. An S3 key is <s3_domain>/<s3_localpart>/<hash>,

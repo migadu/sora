@@ -13,8 +13,11 @@ import (
 // --- Uploader Worker Wrappers ---
 
 // ExecuteWithS3ObjectLock runs executionFunc while holding the per-object advisory lock
-// that the cleaner's S3 deletion takes as well (db.GetS3ObjectLockID). The lock is held
-// in a db.AdvisoryLockTx for exactly the duration of executionFunc: transaction-scoped,
+// that the cleaner's S3 deletion takes as well (db.GetS3ObjectLockID). Cross-account IMAP
+// COPY holds it around its server-side copy, and the uploader around removing what an
+// abandoned upload wrote; an ordinary upload only passes db.PassS3WriteGate and holds
+// nothing across its transfer. The lock is held in a db.AdvisoryLockTx for exactly the
+// duration of executionFunc: transaction-scoped,
 // so it is released with its backend whatever pooler the write pool goes through, and
 // held in a transaction that is otherwise idle and read-only, so the S3 transfer inside
 // executionFunc pins one pooled connection but no write transaction, snapshot or xid.
@@ -100,6 +103,49 @@ func (rd *ResilientDatabase) PendingUploadKeysWithRetry(ctx context.Context, con
 	masterCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, true).PendingUploadKeys(ctx, contentHash, accountID)
+	}
+	result, err := rd.executeReadWithRetry(masterCtx, cleanupRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	return result.([]string), nil
+}
+
+// PassS3WriteGateWithRetry asks whether an upload may write its objects now (see
+// db.PassS3WriteGate). The gate reads and locks on the primary, where every deleter
+// takes the same per-object lock.
+func (rd *ResilientDatabase) PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash string) (db.S3WriteGate, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).PassS3WriteGate(ctx, pendingID, accountID, contentHash)
+	}
+	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
+	if err != nil {
+		return db.S3WriteBusy, err
+	}
+	return result.(db.S3WriteGate), nil
+}
+
+// CompleteLeasedS3UploadWithRetry finalizes an upload whose leased pending row still
+// exists, and returns db.ErrPendingUploadGone, with nothing changed, when it does not
+// (see db.CompleteLeasedS3Upload).
+func (rd *ResilientDatabase) CompleteLeasedS3UploadWithRetry(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).CompleteLeasedS3Upload(ctx, tx, pendingID, contentHash, accountID, writtenKeys)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, importExportRetryConfig, timeoutWrite, op, db.ErrPendingUploadGone)
+	return err
+}
+
+// UnreferencedS3KeysWithRetry returns the keys no message row carries (see
+// db.UnreferencedS3Keys). Pinned to the master: a lagging replica could miss the row of
+// a delivery that just claimed the key, and the caller deletes what this returns.
+func (rd *ResilientDatabase) UnreferencedS3KeysWithRetry(ctx context.Context, contentHash string, keys []string) ([]string, error) {
+	masterCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).UnreferencedS3Keys(ctx, contentHash, keys)
 	}
 	result, err := rd.executeReadWithRetry(masterCtx, cleanupRetryConfig, timeoutRead, op)
 	if err != nil {

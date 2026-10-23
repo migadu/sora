@@ -3,10 +3,12 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 )
 
@@ -131,6 +133,47 @@ func (db *Database) ResetUploadAttempts(ctx context.Context, tx pgx.Tx, contentH
 // key that has a live uploaded row) and calls this with no writtenKeys — the clause
 // then marks that row from the sibling that proves the object.
 func (db *Database) CompleteS3Upload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, writtenKeys []string) error {
+	if err := markS3Uploaded(ctx, tx, contentHash, accountID, writtenKeys); err != nil {
+		return err
+	}
+	return dropFinishedPendingUpload(ctx, tx, contentHash, accountID)
+}
+
+// ErrPendingUploadGone reports that the pending_uploads row an upload leased was deleted
+// before the upload finalized: the account was purged, or the upload reaped. It wraps
+// consts.ErrDBNotFound, so it is an answer, not a database failure.
+var ErrPendingUploadGone = fmt.Errorf("pending upload is gone: %w", consts.ErrDBNotFound)
+
+// CompleteLeasedS3Upload is CompleteS3Upload for the uploader, which writes its objects
+// without holding their lock (see PassS3WriteGate). It finalizes only if the pending row
+// the upload leased, identified by pendingID, still exists, and returns
+// ErrPendingUploadGone otherwise; the caller must then roll back, so that the rows it
+// marked are not left claiming objects nothing protected.
+//
+// While the row stands, no deleter can have removed the objects since the gate: every
+// orphan re-check since then saw the row. Row ids come from a sequence and are never
+// reused, so finding the same id proves the row stood the whole time, not merely that a
+// later delivery of the same body re-created one. The row is locked after the messages
+// are marked — the order CompleteS3Upload has always taken these locks in — and held to
+// commit, so it cannot go between the check and the commit.
+func (db *Database) CompleteLeasedS3Upload(ctx context.Context, tx pgx.Tx, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+	if err := markS3Uploaded(ctx, tx, contentHash, accountID, writtenKeys); err != nil {
+		return err
+	}
+	var found int
+	err := tx.QueryRow(ctx, `SELECT 1 FROM pending_uploads WHERE id = $1 FOR UPDATE`, pendingID).Scan(&found)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrPendingUploadGone
+	}
+	if err != nil {
+		return fmt.Errorf("failed to lock pending upload %d: %w", pendingID, err)
+	}
+	return dropFinishedPendingUpload(ctx, tx, contentHash, accountID)
+}
+
+// markS3Uploaded marks the account's rows of contentHash uploaded whose key now has an
+// object; see CompleteS3Upload.
+func markS3Uploaded(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, writtenKeys []string) error {
 	if writtenKeys == nil {
 		writtenKeys = []string{}
 	}
@@ -151,13 +194,14 @@ func (db *Database) CompleteS3Upload(ctx context.Context, tx pgx.Tx, contentHash
 			)
 		  )
 	`, contentHash, accountID, writtenKeys)
-	if err != nil {
-		return err
-	}
+	return err
+}
 
-	// The pending row goes only when nothing is left to write for this pair. The check
-	// runs after the UPDATE in the same transaction, so it sees the rows just marked.
-	_, err = tx.Exec(ctx, `
+// dropFinishedPendingUpload deletes the pair's pending row once nothing is left to write
+// for it. It runs after markS3Uploaded in the same transaction, so it sees the rows just
+// marked.
+func dropFinishedPendingUpload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64) error {
+	_, err := tx.Exec(ctx, `
 		DELETE FROM pending_uploads
 		WHERE content_hash = $1 AND account_id = $2
 		  AND NOT EXISTS (
@@ -165,11 +209,98 @@ func (db *Database) CompleteS3Upload(ctx context.Context, tx pgx.Tx, contentHash
 			WHERE content_hash = $1 AND account_id = $2 AND uploaded = FALSE
 		  )
 	`, contentHash, accountID)
+	return err
+}
+
+// S3WriteGate is what PassS3WriteGate found when an upload asked to write its objects.
+type S3WriteGate int
+
+const (
+	// S3WriteOpen: no deleter holds the object, and the leased pending row still stands.
+	S3WriteOpen S3WriteGate = iota
+	// S3WriteBusy: something holds the object's lock right now — the cleaner or a purge
+	// confirming the body is an orphan and deleting it, a restore, a cross-account COPY.
+	S3WriteBusy
+	// S3WriteAbandoned: the leased pending row is gone (the account was purged, or the
+	// upload reaped), so nothing would finalize what the upload wrote.
+	S3WriteAbandoned
+)
+
+// PassS3WriteGate is what lets the uploader write a body without holding its lock across
+// the transfer, which pinned one pooled connection per upload in flight.
+//
+// Every S3 delete (the cleaner's and the purge's) runs "lock, confirm the body is an
+// orphan, delete" under the per-object lock, and the orphan re-check (filterS3Orphans)
+// refuses any body that still has a pending_uploads row. A pending upload's row exists
+// from the delivery that staged it until the uploader finalizes it, so a deleter whose
+// re-check runs while the row exists never touches the body. The only delete that can
+// still land on an upload is one whose re-check ran before the row existed, and that
+// deleter holds the lock until its delete is done. Taking the lock once, after the row
+// exists and before the first write, therefore orders the write after every delete that
+// could remove it:
+//   - a deleter holding the lock makes the gate answer S3WriteBusy, and the upload is
+//     leased again after retry_interval, when that delete is over;
+//   - a deleter taking the lock afterwards sees the pending row and leaves the body be.
+//
+// That holds only while the row stands, so the gate also reports a row already gone, and
+// the finalize checks it again (CompleteLeasedS3Upload).
+//
+// One autocommit statement: the transaction-scoped try-lock is released when the
+// statement's implicit transaction ends, so the gate costs one round trip and pins
+// nothing behind any pooler. It never waits.
+func (db *Database) PassS3WriteGate(ctx context.Context, pendingID, accountID int64, contentHash string) (S3WriteGate, error) {
+	var acquired, pending bool
+	err := db.GetWritePool().QueryRow(ctx, `
+		SELECT pg_try_advisory_xact_lock($1), EXISTS (SELECT 1 FROM pending_uploads WHERE id = $2)
+	`, GetS3ObjectLockID(accountID, contentHash), pendingID).Scan(&acquired, &pending)
 	if err != nil {
-		return err
+		return S3WriteBusy, fmt.Errorf("failed to pass the write gate for hash %s of account %d: %w", contentHash, accountID, err)
+	}
+	switch {
+	case !acquired:
+		return S3WriteBusy, nil
+	case !pending:
+		return S3WriteAbandoned, nil
+	}
+	return S3WriteOpen, nil
+}
+
+// UnreferencedS3Keys returns those of keys (full S3 keys of contentHash) that no message
+// row carries — of any account, expunged or not. Such an object is reachable by nothing:
+// no reader builds its key, and no cleaner pass or purge will ever list it. The uploader
+// asks after the pending row it leased went away while it was writing, holding the
+// object's lock, before it deletes what it wrote.
+//
+// It reads the pool the context selects; the uploader pins it to the primary, since a
+// lagging replica could miss a row that was just delivered.
+func (db *Database) UnreferencedS3Keys(ctx context.Context, contentHash string, keys []string) ([]string, error) {
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT DISTINCT s3_domain, s3_localpart FROM messages WHERE content_hash = $1
+	`, contentHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list the keys of hash %s: %w", contentHash, err)
+	}
+	defer rows.Close()
+
+	referenced := make(map[string]struct{})
+	for rows.Next() {
+		var domain, localpart string
+		if err := rows.Scan(&domain, &localpart); err != nil {
+			return nil, fmt.Errorf("failed to scan storage key parts: %w", err)
+		}
+		referenced[helpers.NewS3Key(domain, localpart, contentHash)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to list the keys of hash %s: %w", contentHash, err)
 	}
 
-	return nil
+	var unreferenced []string
+	for _, key := range keys {
+		if _, ok := referenced[key]; !ok {
+			unreferenced = append(unreferenced, key)
+		}
+	}
+	return unreferenced, nil
 }
 
 // PendingUploadKeys returns the S3 keys that still have to be written before the

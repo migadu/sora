@@ -43,15 +43,26 @@ type UploaderDB interface {
 	// PendingUploadKeys returns the S3 keys that still have to be written before the
 	// account's message rows for this content hash may be marked uploaded.
 	PendingUploadKeys(ctx context.Context, contentHash string, accountID int64) ([]string, error)
-	// ExecuteWithS3ObjectLock runs executionFunc while holding the per-object lock the
-	// cleaner's S3 deletion also takes, so a PUT and a DELETE of the same body never
-	// interleave. The lock costs one pooled connection for the duration of executionFunc,
-	// whose context is cancelled if the lock is lost meanwhile.
-	ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error
-	// CompleteS3UploadWithRetry finalizes the rows whose key is in writtenKeys (or
+	// PassS3WriteGateWithRetry is asked before anything about an upload touches S3. It
+	// takes and at once releases the per-object lock every S3 deleter holds, so a delete
+	// already under way makes it answer busy, and any later deleter sees the pending row
+	// and leaves the body be (db.PassS3WriteGate). It also reports a leased row that is
+	// already gone. It costs one statement and holds nothing across the transfer.
+	PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash string) (db.S3WriteGate, error)
+	// CompleteLeasedS3UploadWithRetry finalizes the rows whose key is in writtenKeys (or
 	// already has a live uploaded sibling) and drops the pending row once nothing is
-	// left to write. writtenKeys are full S3 keys (domain/localpart/hash).
-	CompleteS3UploadWithRetry(ctx context.Context, contentHash string, accountID int64, writtenKeys []string) error
+	// left to write — provided the pending row leased as pendingID still exists, since
+	// only that row kept deleters away from the objects; db.ErrPendingUploadGone, with
+	// nothing changed, otherwise. writtenKeys are full S3 keys (domain/localpart/hash).
+	CompleteLeasedS3UploadWithRetry(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error
+	// ExecuteWithS3ObjectLock runs executionFunc while holding the per-object lock the
+	// cleaner's S3 deletion also takes, at the cost of one pooled connection for its
+	// duration; its context is cancelled if the lock is lost meanwhile. Only an abandoned
+	// upload takes it, to delete what it wrote (discardAbandonedUpload).
+	ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error
+	// UnreferencedS3KeysWithRetry returns those of keys that no message row of any
+	// account carries, read on the primary.
+	UnreferencedS3KeysWithRetry(ctx context.Context, contentHash string, keys []string) ([]string, error)
 	// ExistingPendingUploads returns the subset of contentHashes that still have a
 	// pending_uploads row for the account. The cleanup scan asks per batch rather than
 	// per file: the staging tree is largest during an S3 outage or a stranded backlog,
@@ -147,6 +158,8 @@ type UploaderS3 interface {
 	// Used to self-heal uploads whose local file is missing but whose content
 	// was already stored in S3 by a prior attempt.
 	ExistsWithRetry(ctx context.Context, key string) (bool, error)
+	// DeleteWithRetry removes an object an abandoned upload wrote and nothing references.
+	DeleteWithRetry(ctx context.Context, key string) error
 }
 
 // UploaderCache defines the cache operations needed by the uploader worker.
@@ -208,6 +221,12 @@ const (
 	// head is full of rows with lost bodies must not stall the fresh rows behind them,
 	// nor make the worker back off from a provider that is perfectly healthy.
 	uploadContentProblem
+	// uploadSkipped: nothing was asked of storage and nothing was learned about the
+	// content. Either something holds the body's lock right now — a delete, restore or
+	// cross-account copy of the same body; the row is leased again after retry_interval —
+	// or the pending row is gone (the account was purged, the upload reaped) and nothing
+	// is left to upload.
+	uploadSkipped
 )
 
 // uploadBackoffMax caps the cycle-level backoff. It bounds how long the worker can
@@ -585,7 +604,13 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		// clears the leftover pending_uploads record.
 		// Nothing was written here: every remaining unuploaded row has a live sibling
 		// under its own key, and finalize marks them from that.
-		err := w.rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID, nil)
+		err := w.rdb.CompleteLeasedS3UploadWithRetry(ctx, upload.ID, upload.ContentHash, upload.AccountID, nil)
+		if errors.Is(err, db.ErrPendingUploadGone) {
+			// Purged or reaped meanwhile; nothing was written, so nothing is left to do.
+			// The staging file goes with the orphan sweep (cleanupOrphanedFiles).
+			logger.Info("Uploader: Pending upload is gone, nothing to finalize", "hash", upload.ContentHash, "account_id", upload.AccountID)
+			return uploadSkipped
+		}
 		if err != nil {
 			logger.Warn("Uploader: Failed to finalize S3 upload - keeping local file for retry", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
 			return uploadRetryLater
@@ -598,6 +623,24 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 			// Log is inside RemoveLocalFile
 		}
 		return uploadDone // Done with this upload record
+	}
+
+	// Pass the write gate before anything below touches S3. No lock is held across the
+	// transfer, which would pin one pooled connection per upload in flight: the gate
+	// orders this upload after any delete of the same body already under way, and every
+	// later deleter sees the pending row and leaves the body be. Only the row, so only
+	// while it stands, which the finalize checks again.
+	switch gate, err := w.rdb.PassS3WriteGateWithRetry(ctx, upload.ID, upload.AccountID, upload.ContentHash); {
+	case err != nil:
+		logger.Error("Uploader: Failed to pass the write gate", "hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
+		return uploadRetryLater
+	case gate == db.S3WriteBusy:
+		logger.Info("Uploader: Body is being deleted, restored or copied right now; upload deferred", "hash", upload.ContentHash, "account_id", upload.AccountID)
+		return uploadSkipped
+	case gate == db.S3WriteAbandoned:
+		// The staging file goes with the orphan sweep (cleanupOrphanedFiles).
+		logger.Info("Uploader: Pending upload is gone (account purged or upload reaped); nothing to upload", "hash", upload.ContentHash, "account_id", upload.AccountID)
+		return uploadSkipped
 	}
 
 	// Stream the body off the disk it already sits on rather than reading it whole:
@@ -657,19 +700,15 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 			logger.Info("Uploader: Local file missing but content found in S3 - self-healing upload",
 				"hash", upload.ContentHash, "account_id", upload.AccountID)
 
-			err = w.rdb.ExecuteWithS3ObjectLock(ctx, upload.ContentHash, upload.AccountID, func(ctx context.Context) error {
-				// Use detached background context during shutdown to ensure state consistency
-				dbCtx := ctx
-				if ctx.Err() != nil {
-					var cancel context.CancelFunc
-					dbCtx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-					defer cancel()
-					logger.Info("Uploader: Using background context for self-heal DB finalization during shutdown", "hash", upload.ContentHash)
-				}
-
-				return w.rdb.CompleteS3UploadWithRetry(dbCtx, upload.ContentHash, upload.AccountID, keys)
-			})
-
+			dbCtx, cancel := finalizeContext(ctx, upload.ContentHash)
+			err = w.rdb.CompleteLeasedS3UploadWithRetry(dbCtx, upload.ID, upload.ContentHash, upload.AccountID, keys)
+			cancel()
+			if errors.Is(err, db.ErrPendingUploadGone) {
+				// Purged or reaped since the gate. Nothing will finalize these objects
+				// now, and a key no row carries any more is listed by no cleaner pass.
+				w.discardAbandonedUpload(ctx, upload, keys)
+				return uploadSkipped
+			}
 			if err != nil {
 				logger.Error("Uploader: CRITICAL - Failed to complete upload after S3 existence recovery",
 					"hash", upload.ContentHash, "account_id", upload.AccountID, "error", err)
@@ -721,49 +760,37 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		return uploadContentProblem
 	}
 
-	// Attempt to upload to S3 using session-level advisory lock instead of transaction-level.
-	// This ensures we do not execute long-running I/O within a single open Postgres transaction.
 	start := time.Now()
-	var shutdownRequested bool
 
-	err = w.rdb.ExecuteWithS3ObjectLock(ctx, upload.ContentHash, upload.AccountID, func(ctx context.Context) error {
-		// Capture if shutdown is requested during our execution
-		select {
-		case <-ctx.Done():
-			shutdownRequested = true
-		default:
-		}
-
-		// Run S3 PUT, once per key the message rows point at. Every key gets the whole
-		// body, so rewind between them: the resilient layer rewinds only around its own
-		// retries of a single PUT.
+	// Run S3 PUT, once per key the message rows point at, then finalize. Every key gets
+	// the whole body, so rewind between them: the resilient layer rewinds only around its
+	// own retries of a single PUT. No lock is held across the transfer; the gate above
+	// already ordered these writes after any delete of the same body.
+	writeAndFinalize := func() error {
 		for _, key := range keys {
-			if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
-				return fmt.Errorf("failed to rewind %s for upload: %w", filePath, seekErr)
+			if _, err := file.Seek(0, io.SeekStart); err != nil {
+				return fmt.Errorf("failed to rewind %s for upload: %w", filePath, err)
 			}
-			if s3Err := w.s3.PutWithRetry(ctx, key, file, upload.Size); s3Err != nil {
-				return s3Err
+			if err := w.s3.PutWithRetry(ctx, key, file, upload.Size); err != nil {
+				return err
 			}
 		}
+		// Finalize before the local source file goes.
+		dbCtx, cancel := finalizeContext(ctx, upload.ContentHash)
+		defer cancel()
+		return w.rdb.CompleteLeasedS3UploadWithRetry(dbCtx, upload.ID, upload.ContentHash, upload.AccountID, keys)
+	}
+	err = writeAndFinalize()
 
-		// Finalize the upload in the database.
-		// It's critical to do this *before* removing the local source file.
-		//
-		// During shutdown, use a background context with a timeout to ensure the database
-		// update completes even though the main context is canceled. This prevents the
-		// "context canceled" error that leaves uploads in an inconsistent state (uploaded
-		// to S3 but not marked complete in the database).
-		dbCtx := ctx
-		if shutdownRequested || ctx.Err() != nil {
-			var cancel context.CancelFunc
-			dbCtx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			logger.Info("Uploader: Using background context for DB finalization during shutdown", "hash", upload.ContentHash)
-		}
-
-		return w.rdb.CompleteS3UploadWithRetry(dbCtx, upload.ContentHash, upload.AccountID, keys)
-	})
-
+	if errors.Is(err, db.ErrPendingUploadGone) {
+		// The account was purged, or the upload reaped, while the body was in flight. The
+		// purge may already have deleted these keys and their rows, in which case what was
+		// just written would stay in S3 with nothing pointing at it.
+		w.discardAbandonedUpload(ctx, upload, keys)
+		metrics.S3UploadAttempts.WithLabelValues("success").Inc()
+		metrics.UploadWorkerDuration.Observe(time.Since(start).Seconds())
+		return uploadDone // storage took the writes; the cycle backoff must hear that
+	}
 	if err != nil {
 		// Never counted toward max_attempts, whatever the error looks like. The body on
 		// disk is intact and S3 or the database simply did not take it this time; a
@@ -811,6 +838,63 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 
 	logger.Info("Uploader: Upload completed", "hash", upload.ContentHash, "account_id", upload.AccountID)
 	return uploadDone
+}
+
+// finalizeContext is the context database work after an S3 write runs under: ctx, or,
+// once shutdown has cancelled it, a short detached one. Objects already written must not
+// be left behind as an upload that never finished — in S3, unmarked in the database —
+// because the process is going down.
+func finalizeContext(ctx context.Context, contentHash string) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	logger.Info("Uploader: Using background context for DB finalization during shutdown", "hash", contentHash)
+	return context.WithTimeout(context.Background(), 30*time.Second)
+}
+
+// discardAbandonedUpload removes objects an upload is responsible for after the pending
+// row it leased went away under it: the account was purged, or the upload reaped, while
+// the body was in flight. Account deletion drops pending rows before its S3 phase, so the
+// purge may already have deleted these keys and the rows that carried them; nothing
+// finalizes or lists such an object again, and this is the one place left to remove it.
+//
+// It does what every deleter does, under the object's lock: re-check, then delete. The
+// re-check is stricter than the cleaner's — a key is removed only when no message row of
+// any account carries it, expunged or not — so an object a row still points at is left to
+// the cleaner, which will list it. A failure leaves objects nothing references; they are
+// logged with their keys for an operator.
+func (w *UploadWorker) discardAbandonedUpload(ctx context.Context, upload db.PendingUpload, keys []string) {
+	ctx, cancel := finalizeContext(ctx, upload.ContentHash)
+	defer cancel()
+
+	var removed []string
+	err := w.rdb.ExecuteWithS3ObjectLock(ctx, upload.ContentHash, upload.AccountID, func(ctx context.Context) error {
+		unreferenced, err := w.rdb.UnreferencedS3KeysWithRetry(ctx, upload.ContentHash, keys)
+		if err != nil {
+			return err
+		}
+		for _, key := range unreferenced {
+			if err := w.s3.DeleteWithRetry(ctx, key); err != nil {
+				return fmt.Errorf("failed to delete %s: %w", key, err)
+			}
+			removed = append(removed, key)
+		}
+		return nil
+	})
+	if err != nil {
+		logger.Error("Uploader: Could not remove the objects of an abandoned upload; they may stay in S3 with nothing referencing them",
+			"hash", upload.ContentHash, "account_id", upload.AccountID, "keys", strings.Join(keys, " "), "removed", strings.Join(removed, " "), "error", err)
+		return
+	}
+	if len(removed) == 0 {
+		// Every key is still carried by a row: most often a second lease of the same row
+		// (its upload outlived retry_interval) whose twin finalized first.
+		logger.Info("Uploader: Pending upload was finalized or removed elsewhere while in flight; every key is still referenced",
+			"hash", upload.ContentHash, "account_id", upload.AccountID)
+		return
+	}
+	logger.Info("Uploader: Upload abandoned in flight (account purged or upload reaped); removed the objects nothing references",
+		"hash", upload.ContentHash, "account_id", upload.AccountID, "removed", strings.Join(removed, " "))
 }
 
 // reportError sends an error to the error channel if configured, otherwise logs it

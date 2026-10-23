@@ -96,13 +96,13 @@ func tryLockFromOtherSession(t *testing.T, database *Database, lockID int64) boo
 //
 //   - only genuine orphans reach the callback (an active message, a message expunged
 //     inside the grace period, or a pending upload all disqualify a body),
-//   - the per-object advisory lock — the one the uploader takes around its PUT — is
+//   - the per-object advisory lock — the one the uploader's write gate takes — is
 //     held for the whole callback and released afterwards,
 //   - the locks are held by an open, otherwise idle, read-only transaction — the one
 //     thing a transaction-pooling proxy cannot move to another backend — that holds
 //     neither an xid nor a snapshot, so the S3 round trip inside the callback holds
 //     back nothing on the database side,
-//   - a body whose lock is already held (an upload in flight) is skipped rather than
+//   - a body whose lock is already held (a restore or cross-account COPY) is skipped rather than
 //     deleted.
 func TestExecuteWithLockedS3Orphans(t *testing.T) {
 	if testing.Short() {
@@ -120,14 +120,14 @@ func TestExecuteWithLockedS3Orphans(t *testing.T) {
 	activeHash := fmt.Sprintf("s3lock_active_%d", suffix)
 	recentHash := fmt.Sprintf("s3lock_recent_%d", suffix)
 	pendingHash := fmt.Sprintf("s3lock_pending_%d", suffix)
-	uploadingHash := fmt.Sprintf("s3lock_uploading_%d", suffix)
+	lockedHash := fmt.Sprintf("s3lock_locked_%d", suffix)
 
 	longAgo := time.Now().Add(-24 * time.Hour)
 	insertCleanupMessage(t, database, accountID, mailboxID, 200, orphanHash, longAgo)
 	insertCleanupMessage(t, database, accountID, mailboxID, 201, activeHash, time.Time{})
 	insertCleanupMessage(t, database, accountID, mailboxID, 202, recentHash, time.Now().Add(-time.Minute))
 	insertCleanupMessage(t, database, accountID, mailboxID, 203, pendingHash, longAgo)
-	insertCleanupMessage(t, database, accountID, mailboxID, 204, uploadingHash, longAgo)
+	insertCleanupMessage(t, database, accountID, mailboxID, 204, lockedHash, longAgo)
 
 	_, err := database.GetWritePool().Exec(ctx, `
 		INSERT INTO pending_uploads (account_id, instance_id, content_hash, size)
@@ -136,17 +136,17 @@ func TestExecuteWithLockedS3Orphans(t *testing.T) {
 	require.NoError(t, err)
 
 	candidates := make([]UserScopedObjectForCleanup, 0, 5)
-	for _, hash := range []string{orphanHash, activeHash, recentHash, pendingHash, uploadingHash} {
+	for _, hash := range []string{orphanHash, activeHash, recentHash, pendingHash, lockedHash} {
 		candidates = append(candidates, UserScopedObjectForCleanup{
 			AccountID: accountID, ContentHash: hash, S3Domain: "example.com", S3Localpart: "user",
 		})
 	}
 
-	// An uploader is mid-PUT for uploadingHash: it holds the object lock on its own session.
-	uploaderConn, err := database.GetWritePool().Acquire(ctx)
+	// Something (a restore, a cross-account COPY) holds the object lock for lockedHash on its own session.
+	holderConn, err := database.GetWritePool().Acquire(ctx)
 	require.NoError(t, err)
-	uploadingLockID := GetS3ObjectLockID(accountID, uploadingHash)
-	_, err = uploaderConn.Exec(ctx, "SELECT pg_advisory_lock($1)", uploadingLockID)
+	lockedLockID := GetS3ObjectLockID(accountID, lockedHash)
+	_, err = holderConn.Exec(ctx, "SELECT pg_advisory_lock($1)", lockedLockID)
 	require.NoError(t, err)
 
 	orphanLockID := GetS3ObjectLockID(accountID, orphanHash)
@@ -166,9 +166,9 @@ func TestExecuteWithLockedS3Orphans(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, holderFound, "the backend holding the object lock must be visible in pg_locks")
 
-	_, err = uploaderConn.Exec(ctx, "SELECT pg_advisory_unlock($1)", uploadingLockID)
+	_, err = holderConn.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockedLockID)
 	require.NoError(t, err)
-	uploaderConn.Release()
+	holderConn.Release()
 
 	assert.Equal(t, []string{orphanHash}, seen,
 		"only the body with no live, recently expunged or pending reference may be deleted")
