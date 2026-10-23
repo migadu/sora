@@ -17,15 +17,6 @@ import (
 // (sequence numbers are meaningless for unselected mailboxes), and every result
 // carries its Mailbox + UIDValidity so returned UIDs are unambiguous.
 func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource, criteria *imap.SearchCriteria, options *imap.SearchOptions) ([]*imap.SearchData, error) {
-	if s.server.searchRateLimiter != nil && s.IMAPUser != nil {
-		if err := s.server.searchRateLimiter.CanSearch(ctx, s.IMAPUser.AccountID()); err != nil {
-			return nil, &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Text: err.Error(),
-			}
-		}
-	}
-
 	if ctx.Err() != nil {
 		s.DebugLog("session context is cancelled, skipping multisearch")
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed"}
@@ -33,6 +24,12 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 
 	// Reject pathologically complex/deep criteria before decoding or building a query.
 	if err := s.validateSearchCriteria("MULTISEARCH", criteria); err != nil {
+		return nil, err
+	}
+
+	// A multi-mailbox search runs one search per mailbox in scope, so it is always
+	// charged to the SEARCH rate limit, whatever its criteria.
+	if err := s.chargeSearch(ctx); err != nil {
 		return nil, err
 	}
 

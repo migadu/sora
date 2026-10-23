@@ -359,6 +359,7 @@ type IMAPServerOptions struct {
 	LookupCache           *config.LookupCacheConfig // Authentication cache configuration
 	SearchRateLimitPerMin int                       // Search rate limit (searches per minute, 0=disabled)
 	SearchRateLimitWindow time.Duration             // Search rate limit time window
+	SearchRateLimitBurst  int                       // Searches allowed back to back (0=SearchRateLimitPerMin)
 	SessionMemoryLimit    int64                     // Per-session memory limit in bytes (0=unlimited)
 	// Cache warmup configuration
 	EnableWarmup       bool
@@ -454,7 +455,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	}
 
 	// Initialize search rate limiter
-	searchRateLimiter := serverPkg.NewSearchRateLimiter("IMAP", options.SearchRateLimitPerMin, options.SearchRateLimitWindow)
+	searchRateLimiter := serverPkg.NewSearchRateLimiter("IMAP", options.SearchRateLimitPerMin, options.SearchRateLimitWindow, options.SearchRateLimitBurst)
 
 	// Initialize authentication cache from config
 	// Default to enabled if not explicitly configured

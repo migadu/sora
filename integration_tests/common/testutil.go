@@ -189,6 +189,9 @@ type IMAPServerOpts struct {
 	SpamTrainingCircuitThreshold  int
 	SpamTrainingCircuitTimeout    string
 	SpamTrainingCircuitMaxRequest int
+	SearchRateLimitPerMin         int
+	SearchRateLimitWindow         time.Duration
+	SearchRateLimitBurst          int
 }
 
 func (ts *TestServer) Close() {
@@ -789,6 +792,9 @@ func SetupIMAPServerForUploadRaceWithS3(t *testing.T, s3Storage *storage.S3Stora
 // SetupIMAPServerWithOptions creates an IMAP server with custom options (e.g., spam training)
 func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer, TestAccount) {
 	t.Helper()
+	if opts == nil {
+		opts = &IMAPServerOpts{}
+	}
 
 	rdb := SetupTestDatabase(t)
 	account := CreateTestAccount(t, rdb)
@@ -878,9 +884,12 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 		uploadWorker, // properly initialized UploadWorker
 		nil,          // cache.Cache
 		imap.IMAPServerOptions{
-			InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
-			Config:       testConfig,
-			SpamTraining: spamTrainingClient,
+			InsecureAuth:          true, // Allow PLAIN auth (no TLS in tests)
+			Config:                testConfig,
+			SpamTraining:          spamTrainingClient,
+			SearchRateLimitPerMin: opts.SearchRateLimitPerMin,
+			SearchRateLimitWindow: opts.SearchRateLimitWindow,
+			SearchRateLimitBurst:  opts.SearchRateLimitBurst,
 		},
 	)
 	if err != nil {

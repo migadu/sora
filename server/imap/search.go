@@ -10,23 +10,19 @@ import (
 )
 
 func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
-	// Check search rate limit first (before any expensive operations)
-	if s.server.searchRateLimiter != nil && s.IMAPUser != nil {
-		if err := s.server.searchRateLimiter.CanSearch(ctx, s.IMAPUser.AccountID()); err != nil {
-			// Rate limiter already logs with suppression, no need to log here
-			// metrics already incremented by rate limiter
-			return nil, &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Text: err.Error(),
-			}
-		}
-	}
-
 	// Reject pathologically complex/deep criteria before decoding or building a query.
 	// A deeply nested or very wide criteria tree would otherwise recurse unbounded and
 	// generate an unusable SQL clause (see validateSearchCriteria).
 	if err := s.validateSearchCriteria("SEARCH", criteria); err != nil {
 		return nil, err
+	}
+
+	// Charge a search on message content to the search rate limit, before any
+	// expensive operation; one on metadata alone is free (see search_rate_limit.go).
+	if criteriaMatchesContent(criteria) {
+		if err := s.chargeSearch(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	// First safely read and decode session state

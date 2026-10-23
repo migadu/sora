@@ -11,36 +11,63 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 )
 
-// SearchRateLimiter provides per-user rate limiting for search operations
-// to prevent DoS attacks via excessive search queries
+// SearchRateLimiter caps how many expensive searches an account may run, to
+// prevent DoS attacks via excessive search queries. Each account has a token
+// bucket holding up to burst searches, refilled at perWindow searches per window.
+// A sustained client is held to that rate, exactly as a sliding window would hold
+// it, but a burst followed by idle time is not refused: the bucket refills
+// continuously rather than all at once when the oldest search leaves the window.
+//
+// Which commands are searches is up to the caller, which knows their criteria;
+// CanSearch takes one search from the bucket.
 type SearchRateLimiter struct {
-	mu              sync.RWMutex
-	userSearches    map[int64]*UserSearchTracker
-	maxPerMinute    int
-	window          time.Duration
+	mu        sync.Mutex
+	buckets   map[int64]*searchBucket
+	perWindow int
+	window    time.Duration
+	burst     int
+	// interval is the time a bucket takes to earn back one search, and capacity
+	// the time it takes to fill from empty.
+	interval        time.Duration
+	capacity        time.Duration
+	now             func() time.Time
 	cleanupInterval time.Duration
 	stopCleanup     chan struct{}
 	protocol        string
 }
 
-// UserSearchTracker tracks search operations for a single user
-type UserSearchTracker struct {
-	searches      []time.Time
-	lastActivity  time.Time
+// searchBucket is one account's token bucket, kept as the time at which it will
+// be full again: each search moves that time one interval later, and a search
+// that would move it more than the bucket's capacity past now is refused.
+type searchBucket struct {
+	full          time.Time
 	lastLoggedAt  time.Time // Last time we logged a rate limit event
 	suppressCount int       // Count of suppressed log messages since last log
 }
 
-// NewSearchRateLimiter creates a new search rate limiter
-func NewSearchRateLimiter(protocol string, maxPerMinute int, window time.Duration) *SearchRateLimiter {
-	if maxPerMinute <= 0 {
+// NewSearchRateLimiter creates a search rate limiter allowing perWindow searches
+// per window, of which up to burst may run back to back (burst <= 0 means
+// perWindow). It returns nil, which allows every search, when perWindow <= 0.
+func NewSearchRateLimiter(protocol string, perWindow int, window time.Duration, burst int) *SearchRateLimiter {
+	if perWindow <= 0 {
 		return nil // Disabled
 	}
+	if window <= 0 {
+		window = time.Minute
+	}
+	if burst <= 0 {
+		burst = perWindow
+	}
 
+	interval := window / time.Duration(perWindow)
 	limiter := &SearchRateLimiter{
-		userSearches:    make(map[int64]*UserSearchTracker),
-		maxPerMinute:    maxPerMinute,
+		buckets:         make(map[int64]*searchBucket),
+		perWindow:       perWindow,
 		window:          window,
+		burst:           burst,
+		interval:        interval,
+		capacity:        interval * time.Duration(burst),
+		now:             time.Now,
 		cleanupInterval: 5 * time.Minute,
 		stopCleanup:     make(chan struct{}),
 		protocol:        protocol,
@@ -49,12 +76,13 @@ func NewSearchRateLimiter(protocol string, maxPerMinute int, window time.Duratio
 	// Start cleanup goroutine
 	go limiter.cleanupRoutine()
 
-	logger.Debug("Search rate limiter: Initialized", "protocol", protocol, "max", maxPerMinute, "window", window)
+	logger.Debug("Search rate limiter: Initialized", "protocol", protocol, "max", perWindow, "window", window, "burst", burst)
 
 	return limiter
 }
 
-// CanSearch checks if a user can perform a search operation
+// CanSearch takes one search from the account's bucket, or returns an error
+// saying how long to wait if the bucket is empty.
 func (s *SearchRateLimiter) CanSearch(ctx context.Context, accountID int64) error {
 	if s == nil {
 		return nil // Disabled
@@ -63,83 +91,59 @@ func (s *SearchRateLimiter) CanSearch(ctx context.Context, accountID int64) erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tracker, exists := s.userSearches[accountID]
+	now := s.now()
+	bucket, exists := s.buckets[accountID]
 	if !exists {
-		tracker = &UserSearchTracker{
-			searches:     make([]time.Time, 0, s.maxPerMinute),
-			lastActivity: time.Now(),
-		}
-		s.userSearches[accountID] = tracker
+		bucket = &searchBucket{full: now}
+		s.buckets[accountID] = bucket
 	}
 
-	now := time.Now()
-	tracker.lastActivity = now
-	cutoff := now.Add(-s.window)
-
-	// Remove searches outside the time window
-	validSearches := tracker.searches[:0]
-	for _, t := range tracker.searches {
-		if t.After(cutoff) {
-			validSearches = append(validSearches, t)
-		}
+	full := bucket.full
+	if full.Before(now) {
+		full = now
 	}
-	tracker.searches = validSearches
+	full = full.Add(s.interval)
 
-	// Check if limit exceeded
-	if len(tracker.searches) >= s.maxPerMinute {
-		// Record rate limit event
-		metrics.ProtocolErrors.WithLabelValues(s.protocol, "SEARCH", "rate_limited", "client_error").Inc()
+	retryAfter := full.Sub(now) - s.capacity
+	if retryAfter <= 0 {
+		bucket.full = full
+		return nil
+	}
 
-		oldestSearch := tracker.searches[0]
-		retryAfter := oldestSearch.Add(s.window).Sub(now)
+	// Record rate limit event
+	metrics.ProtocolErrors.WithLabelValues(s.protocol, "SEARCH", "rate_limited", "client_error").Inc()
 
-		// Log suppression: only log once per minute per user to prevent spam
-		// iOS Mail and other aggressive clients may retry dozens of times per second
-		logSuppressWindow := time.Minute
-		shouldLog := tracker.lastLoggedAt.IsZero() || now.Sub(tracker.lastLoggedAt) >= logSuppressWindow
+	// Log suppression: only log once per minute per user to prevent spam
+	// iOS Mail and other aggressive clients may retry dozens of times per second
+	logSuppressWindow := time.Minute
+	shouldLog := bucket.lastLoggedAt.IsZero() || now.Sub(bucket.lastLoggedAt) >= logSuppressWindow
 
-		if shouldLog {
-			if tracker.suppressCount > 0 {
-				logger.Debug("Search rate limiter: Rate limit exceeded",
-					"protocol", s.protocol,
-					"account", accountID,
-					"searches", len(tracker.searches),
-					"window", s.window,
-					"retry_after", retryAfter,
-					"suppressed_logs", tracker.suppressCount)
-			} else {
-				logger.Debug("Search rate limiter: Rate limit exceeded",
-					"protocol", s.protocol,
-					"account", accountID,
-					"searches", len(tracker.searches),
-					"window", s.window,
-					"retry_after", retryAfter)
-			}
-			tracker.lastLoggedAt = now
-			tracker.suppressCount = 0
+	if shouldLog {
+		if bucket.suppressCount > 0 {
+			logger.Debug("Search rate limiter: Rate limit exceeded",
+				"protocol", s.protocol,
+				"account", accountID,
+				"burst", s.burst,
+				"window", s.window,
+				"retry_after", retryAfter,
+				"suppressed_logs", bucket.suppressCount)
 		} else {
-			tracker.suppressCount++
+			logger.Debug("Search rate limiter: Rate limit exceeded",
+				"protocol", s.protocol,
+				"account", accountID,
+				"burst", s.burst,
+				"window", s.window,
+				"retry_after", retryAfter)
 		}
-
-		return fmt.Errorf("search rate limit exceeded: %d searches in %v, please wait %v before trying again",
-			len(tracker.searches), s.window, retryAfter.Round(time.Second))
+		bucket.lastLoggedAt = now
+		bucket.suppressCount = 0
+	} else {
+		bucket.suppressCount++
 	}
 
-	// Record this search
-	tracker.searches = append(tracker.searches, now)
-
-	return nil
-}
-
-// RecordSearch records a search operation (called after successful search)
-// This is optional - CanSearch already records the attempt
-func (s *SearchRateLimiter) RecordSearch(accountID int64) {
-	if s == nil {
-		return
-	}
-
-	// Update metrics
-	metrics.CommandsTotal.WithLabelValues(s.protocol, "SEARCH", "success").Inc()
+	// Round up, so that a client waiting as told finds a search available.
+	return fmt.Errorf("search rate limit exceeded: %d searches per %v, please wait %v before trying again",
+		s.perWindow, s.window, (retryAfter + time.Second - 1).Truncate(time.Second))
 }
 
 // GetStats returns statistics about the search rate limiter
@@ -148,40 +152,28 @@ func (s *SearchRateLimiter) GetStats() map[string]any {
 		return map[string]any{"enabled": false}
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	totalUsers := len(s.userSearches)
-	activeUsers := 0
-	totalSearches := 0
-
-	now := time.Now()
-	cutoff := now.Add(-s.window)
-
-	for _, tracker := range s.userSearches {
-		recentSearches := 0
-		for _, t := range tracker.searches {
-			if t.After(cutoff) {
-				recentSearches++
-			}
-		}
-		if recentSearches > 0 {
-			activeUsers++
-			totalSearches += recentSearches
+	now := s.now()
+	draining := 0
+	for _, bucket := range s.buckets {
+		if bucket.full.After(now) {
+			draining++
 		}
 	}
 
 	return map[string]any{
 		"enabled":              true,
-		"max_searches_per_min": s.maxPerMinute,
+		"max_searches_per_min": s.perWindow,
 		"window":               s.window.String(),
-		"tracked_users":        totalUsers,
-		"active_users":         activeUsers,
-		"total_searches":       totalSearches,
+		"burst":                s.burst,
+		"tracked_users":        len(s.buckets),
+		"active_users":         draining,
 	}
 }
 
-// cleanupRoutine periodically removes inactive user trackers
+// cleanupRoutine periodically removes buckets that have refilled
 func (s *SearchRateLimiter) cleanupRoutine() {
 	ticker := time.NewTicker(s.cleanupInterval)
 	defer ticker.Stop()
@@ -196,18 +188,18 @@ func (s *SearchRateLimiter) cleanupRoutine() {
 	}
 }
 
-// cleanup removes trackers for users who haven't searched recently
+// cleanup removes the buckets that are full again: a full bucket is what an
+// account without one starts with.
 func (s *SearchRateLimiter) cleanup() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := time.Now()
-	inactivityThreshold := 30 * time.Minute
+	now := s.now()
 	removed := 0
 
-	for accountID, tracker := range s.userSearches {
-		if now.Sub(tracker.lastActivity) > inactivityThreshold {
-			delete(s.userSearches, accountID)
+	for accountID, bucket := range s.buckets {
+		if !bucket.full.After(now) {
+			delete(s.buckets, accountID)
 			removed++
 		}
 	}

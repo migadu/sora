@@ -1106,10 +1106,16 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 
 # --- RESOURCE LIMITS ---
 # Search rate limiting - prevent DoS attacks via excessive search queries (IMAP only)
-# NOTE: iOS Mail performs 10-15 searches when switching mailboxes (checking unread, flagged, recent messages).
-#       Set to at least 60/min to avoid rate limiting legitimate client behavior.
-limits.search_rate_limit_per_min = 60    # Maximum searches per minute per user (default: 60, set to 0 to disable).
+# Only expensive searches are charged: SEARCH matching on message content (BODY, TEXT, FROM,
+# SUBJECT or any other HEADER), SORT and THREAD not confined by a UID set to 1000 messages, THREAD
+# answered in sequence numbers, and multi-mailbox ESEARCH. Searches by UID or sequence set, flags,
+# dates or sizes (what iOS Mail sends when switching mailboxes, what webmail navigates with) are
+# free. A refused command gets NO [LIMIT].
+# Each account has a bucket of search_rate_limit_burst searches, refilled continuously at
+# search_rate_limit_per_min per search_rate_limit_window.
+limits.search_rate_limit_per_min = 60    # Searches per window per user (default: 60, set to 0 to disable).
 limits.search_rate_limit_window = "1m"   # Time window for search rate limiting (default: "1m").
+# limits.search_rate_limit_burst = 60    # Searches allowed back to back (default: search_rate_limit_per_min).
 limits.redirect_rate_limit = 100         # Maximum SIEVE redirects per user (default: 100, set to 0 to disable).
 limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h").
 limits.max_redirect_hops = 2             # Max times one message may be redirected before suppression — mail-loop
