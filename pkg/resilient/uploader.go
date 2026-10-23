@@ -114,11 +114,11 @@ func (rd *ResilientDatabase) PendingUploadKeysWithRetry(ctx context.Context, con
 }
 
 // PassS3WriteGateWithRetry asks whether an upload may write its objects now and, if so,
-// leases its pending row to it for ttl (see db.PassS3WriteGate). The gate reads and locks
-// on the primary, where every deleter takes the same per-object lock.
-func (rd *ResilientDatabase) PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash string, ttl time.Duration) (db.S3WriteGate, error) {
+// leases its pending row to owner alone for ttl (see db.PassS3WriteGate). The gate reads
+// and locks on the primary, where every deleter takes the same per-object lock.
+func (rd *ResilientDatabase) PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash, owner string, ttl time.Duration) (db.S3WriteGate, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).PassS3WriteGate(ctx, pendingID, accountID, contentHash, ttl)
+		return rd.getOperationalDatabaseForOperation(ctx, true).PassS3WriteGate(ctx, pendingID, accountID, contentHash, owner, ttl)
 	}
 	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
 	if err != nil {
@@ -127,11 +127,11 @@ func (rd *ResilientDatabase) PassS3WriteGateWithRetry(ctx context.Context, pendi
 	return result.(db.S3WriteGate), nil
 }
 
-// RenewPendingUploadLeaseWithRetry extends the lease of an upload in flight; false means
-// its pending row is gone (see db.RenewPendingUploadLease).
-func (rd *ResilientDatabase) RenewPendingUploadLeaseWithRetry(ctx context.Context, pendingID int64, ttl time.Duration) (bool, error) {
+// RenewPendingUploadLeaseWithRetry extends owner's lease of an upload in flight; false
+// means its pending row is gone or leased to someone else (see db.RenewPendingUploadLease).
+func (rd *ResilientDatabase) RenewPendingUploadLeaseWithRetry(ctx context.Context, pendingID int64, owner string, ttl time.Duration) (bool, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).RenewPendingUploadLease(ctx, pendingID, ttl)
+		return rd.getOperationalDatabaseForOperation(ctx, true).RenewPendingUploadLease(ctx, pendingID, owner, ttl)
 	}
 	result, err := rd.executeReadWithRetry(ctx, leaseRetryConfig, timeoutWrite, op)
 	if err != nil {
@@ -140,24 +140,24 @@ func (rd *ResilientDatabase) RenewPendingUploadLeaseWithRetry(ctx context.Contex
 	return result.(bool), nil
 }
 
-// ReleasePendingUploadLeaseWithRetry ends the lease of an upload that did not finish (see
-// db.ReleasePendingUploadLease).
-func (rd *ResilientDatabase) ReleasePendingUploadLeaseWithRetry(ctx context.Context, pendingID int64) error {
+// ReleasePendingUploadLeaseWithRetry ends owner's lease of an upload that did not finish
+// (see db.ReleasePendingUploadLease).
+func (rd *ResilientDatabase) ReleasePendingUploadLeaseWithRetry(ctx context.Context, pendingID int64, owner string) error {
 	op := func(ctx context.Context) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(ctx, true).ReleasePendingUploadLease(ctx, pendingID)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).ReleasePendingUploadLease(ctx, pendingID, owner)
 	}
 	_, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	return err
 }
 
-// CompleteLeasedS3UploadWithRetry finalizes an upload whose leased pending row still
-// exists, and returns db.ErrPendingUploadGone, with nothing changed, when it does not
-// (see db.CompleteLeasedS3Upload).
-func (rd *ResilientDatabase) CompleteLeasedS3UploadWithRetry(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+// CompleteLeasedS3UploadWithRetry finalizes an upload whose pending row is still leased
+// to owner, and returns db.ErrUploadLeaseLost, with nothing changed, when it is not (see
+// db.CompleteLeasedS3Upload).
+func (rd *ResilientDatabase) CompleteLeasedS3UploadWithRetry(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(ctx, true).CompleteLeasedS3Upload(ctx, tx, pendingID, contentHash, accountID, writtenKeys)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).CompleteLeasedS3Upload(ctx, tx, pendingID, owner, contentHash, accountID, writtenKeys)
 	}
-	_, err := rd.executeWriteInTxWithRetry(ctx, importExportRetryConfig, timeoutWrite, op, db.ErrPendingUploadGone)
+	_, err := rd.executeWriteInTxWithRetry(ctx, importExportRetryConfig, timeoutWrite, op, db.ErrUploadLeaseLost)
 	return err
 }
 

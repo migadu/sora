@@ -37,9 +37,22 @@ type gatedUploaderS3 struct {
 	release     chan struct{} // PUTs wait for this to close
 	startedOnce sync.Once
 	fail        func(key string) bool
+
+	mu   sync.Mutex
+	puts []string // every key a PUT was started for
+}
+
+// putKeys is every key a PUT was started for, in order.
+func (g *gatedUploaderS3) putKeys() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.puts...)
 }
 
 func (g *gatedUploaderS3) PutWithRetry(ctx context.Context, key string, r io.Reader, size int64) error {
+	g.mu.Lock()
+	g.puts = append(g.puts, key)
+	g.mu.Unlock()
 	g.startedOnce.Do(func() { close(g.started) })
 	<-g.release
 	if g.fail != nil && g.fail(key) {
@@ -285,4 +298,131 @@ func TestPurgeWorker_RemovesWhatAPartlyFailedUploadWrote(t *testing.T) {
 			t.Errorf("%s was left in S3", key)
 		}
 	}
+}
+
+// Two nodes can hold the same pending row: node A's batch leases it while the task waits
+// for a free upload slot, and a second delivery of the body on node B re-arms the row for
+// B, whose worker leases it and starts writing. When A's task gets its slot, B's lease must
+// turn it away — A must neither write the body nor finalize and drop the row under B — and
+// a purge must keep waiting for B, so that B's write cannot land after the purge and stay
+// in S3 with nothing pointing at it.
+func TestTwoNodesNeverUploadTheSameRowAtOnce(t *testing.T) {
+	s := setupPurgeStack(t)
+	email, accountID := s.newMailAccount(t, "two-nodes", "worker-pass-12")
+	ctx := context.Background()
+	mailbox, err := s.rdb.GetMailboxByNameWithRetry(ctx, accountID, "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, domain, _ := strings.Cut(email, "@")
+	suffix := time.Now().UnixNano()
+
+	newNode := func(name string) (*uploader.UploadWorker, *gatedUploaderS3, string) {
+		gated := &gatedUploaderS3{
+			ResilientS3Storage: resilient.NewResilientS3Storage(s.st),
+			started:            make(chan struct{}),
+			release:            make(chan struct{}),
+		}
+		instanceID := fmt.Sprintf("%s-%d", name, suffix)
+		// concurrency 1: a node's second task waits for its first to finish.
+		w, err := uploader.NewWithS3Interface(t.TempDir(), 10, 1, 5, 30*time.Second, 0, instanceID, s.rdb, gated, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w, gated, instanceID
+	}
+	deliver := func(w *uploader.UploadWorker, instanceID, tag string, body []byte) string {
+		sum := sha256.Sum256(body)
+		hash := hex.EncodeToString(sum[:])
+		if _, err := w.StoreLocally(hash, accountID, body); err != nil {
+			t.Fatal(err)
+		}
+		var bs imap.BodyStructure = &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain"}
+		if _, _, err := s.rdb.InsertMessageWithRetry(ctx, &db.InsertMessageOptions{
+			AccountID: accountID, MailboxID: mailbox.ID, MailboxName: "INBOX",
+			S3Domain: domain, S3Localpart: local, ContentHash: hash,
+			MessageID: fmt.Sprintf("<%s-%d@example.com>", tag, suffix), InternalDate: time.Now(),
+			Size: int64(len(body)), PlaintextBody: tag, BodyStructure: &bs,
+		}, db.PendingUpload{InstanceID: instanceID, ContentHash: hash, Size: int64(len(body)), AccountID: accountID}); err != nil {
+			t.Fatal(err)
+		}
+		return domain + "/" + local + "/" + hash
+	}
+	// drain runs one node's queue; wait returns its error once it has finished.
+	drain := func(w *uploader.UploadWorker, gated *gatedUploaderS3) (wait func() error) {
+		finished := make(chan struct{})
+		var drainErr error
+		go func() {
+			defer close(finished)
+			drainErr = w.DrainSync(ctx)
+		}()
+		t.Cleanup(func() {
+			select {
+			case <-gated.release:
+			default:
+				close(gated.release)
+			}
+			select {
+			case <-finished:
+			case <-time.After(30 * time.Second):
+			}
+		})
+		return func() error {
+			select {
+			case <-finished:
+				return drainErr
+			case <-time.After(30 * time.Second):
+				return errors.New("the node's uploads did not finish")
+			}
+		}
+	}
+	waitFor := func(ch <-chan struct{}, what string) {
+		select {
+		case <-ch:
+		case <-time.After(30 * time.Second):
+			t.Fatal(what)
+		}
+	}
+
+	// Node A queues two bodies; the second, shared one waits behind the first's PUT.
+	nodeA, s3A, instanceA := newNode("node-a")
+	firstKey := deliver(nodeA, instanceA, "first", []byte("Subject: first\r\n\r\nfirst body"))
+	shared := []byte("Subject: shared\r\n\r\nshared body")
+	sharedKey := deliver(nodeA, instanceA, "shared-a", shared)
+	doneA := drain(nodeA, s3A)
+	waitFor(s3A.started, "node A never started its first upload")
+
+	// The shared body arrives again on node B, which re-arms the row and starts writing.
+	nodeB, s3B, instanceB := newNode("node-b")
+	deliver(nodeB, instanceB, "shared-b", shared)
+	doneB := drain(nodeB, s3B)
+	waitFor(s3B.started, "node B never started its upload")
+
+	// A's first upload lands; its task for the shared row now reaches the gate.
+	close(s3A.release)
+	if err := doneA(); err != nil {
+		t.Fatalf("node A: %v", err)
+	}
+	if got := s3A.putKeys(); len(got) != 1 || got[0] != firstKey {
+		t.Fatalf("node A wrote %v; it must not write the body node B holds the lease on", got)
+	}
+	if n := s.count(t, "pending_uploads", accountID); n != 1 {
+		t.Fatalf("%d pending rows left; node A must not finalize the row node B is writing under", n)
+	}
+
+	// A purge while B is mid-PUT waits for it.
+	s.requestPurge(t, email)
+	s.runWorker(t)
+	s.requireRetryable(t, accountID, email)
+
+	close(s3B.release)
+	if err := doneB(); err != nil {
+		t.Fatalf("node B: %v", err)
+	}
+	if len(s.s3.Keys(sharedKey)) != 1 {
+		t.Fatal("node B's write did not land")
+	}
+	s.requestPurge(t, email)
+	s.runWorker(t)
+	s.requireGone(t, accountID, email)
 }

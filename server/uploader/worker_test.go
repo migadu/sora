@@ -23,10 +23,10 @@ type mockDB struct {
 	AcquireAndLeasePendingUploadsWithRetryFunc func(ctx context.Context, instanceID string, batchSize int, retryInterval time.Duration, maxAttempts int) ([]db.PendingUpload, error)
 	MarkUploadAttemptWithRetryFunc             func(ctx context.Context, contentHash string, accountID int64) error
 	PendingUploadKeysFunc                      func(ctx context.Context, contentHash string, accountID int64) ([]string, error)
-	PassS3WriteGateFunc                        func(ctx context.Context, pendingID, accountID int64, contentHash string, ttl time.Duration) (db.S3WriteGate, error)
-	RenewPendingUploadLeaseFunc                func(ctx context.Context, pendingID int64, ttl time.Duration) (bool, error)
-	ReleasePendingUploadLeaseFunc              func(ctx context.Context, pendingID int64) error
-	CompleteLeasedS3UploadWithRetryFunc        func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error
+	PassS3WriteGateFunc                        func(ctx context.Context, pendingID, accountID int64, contentHash, owner string, ttl time.Duration) (db.S3WriteGate, error)
+	RenewPendingUploadLeaseFunc                func(ctx context.Context, pendingID int64, owner string, ttl time.Duration) (bool, error)
+	ReleasePendingUploadLeaseFunc              func(ctx context.Context, pendingID int64, owner string) error
+	CompleteLeasedS3UploadWithRetryFunc        func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error
 	ExistingPendingUploadsFunc                 func(ctx context.Context, accountID int64, contentHashes []string) (map[string]struct{}, error)
 	GetFailedUploadsWithRetryFunc              func(ctx context.Context, maxAttempts int, limit int) ([]db.PendingUpload, error)
 	GetUploaderStatsWithRetryFunc              func(ctx context.Context, maxAttempts int) (*db.UploaderStats, error)
@@ -51,29 +51,29 @@ func (m *mockDB) PendingUploadKeys(ctx context.Context, contentHash string, acco
 	return []string{helpers.NewS3Key("example.com", "user", contentHash)}, nil
 }
 
-func (m *mockDB) CompleteLeasedS3UploadWithRetry(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
-	return m.CompleteLeasedS3UploadWithRetryFunc(ctx, pendingID, contentHash, accountID, writtenKeys)
+func (m *mockDB) CompleteLeasedS3UploadWithRetry(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
+	return m.CompleteLeasedS3UploadWithRetryFunc(ctx, pendingID, owner, contentHash, accountID, writtenKeys)
 }
 
 // PassS3WriteGateWithRetry opens the gate unless a test scripts otherwise.
-func (m *mockDB) PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash string, ttl time.Duration) (db.S3WriteGate, error) {
+func (m *mockDB) PassS3WriteGateWithRetry(ctx context.Context, pendingID, accountID int64, contentHash, owner string, ttl time.Duration) (db.S3WriteGate, error) {
 	if m.PassS3WriteGateFunc != nil {
-		return m.PassS3WriteGateFunc(ctx, pendingID, accountID, contentHash, ttl)
+		return m.PassS3WriteGateFunc(ctx, pendingID, accountID, contentHash, owner, ttl)
 	}
 	return db.S3WriteOpen, nil
 }
 
 // RenewPendingUploadLeaseWithRetry keeps the lease unless a test scripts otherwise.
-func (m *mockDB) RenewPendingUploadLeaseWithRetry(ctx context.Context, pendingID int64, ttl time.Duration) (bool, error) {
+func (m *mockDB) RenewPendingUploadLeaseWithRetry(ctx context.Context, pendingID int64, owner string, ttl time.Duration) (bool, error) {
 	if m.RenewPendingUploadLeaseFunc != nil {
-		return m.RenewPendingUploadLeaseFunc(ctx, pendingID, ttl)
+		return m.RenewPendingUploadLeaseFunc(ctx, pendingID, owner, ttl)
 	}
 	return true, nil
 }
 
-func (m *mockDB) ReleasePendingUploadLeaseWithRetry(ctx context.Context, pendingID int64) error {
+func (m *mockDB) ReleasePendingUploadLeaseWithRetry(ctx context.Context, pendingID int64, owner string) error {
 	if m.ReleasePendingUploadLeaseFunc != nil {
-		return m.ReleasePendingUploadLeaseFunc(ctx, pendingID)
+		return m.ReleasePendingUploadLeaseFunc(ctx, pendingID, owner)
 	}
 	return nil
 }
@@ -143,7 +143,7 @@ func setupTestWorker(t *testing.T) (*UploadWorker, *mockDB, *mockS3, *mockCache,
 	rdb.MarkUploadAttemptWithRetryFunc = func(ctx context.Context, contentHash string, accountID int64) error {
 		return nil
 	}
-	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 		return nil
 	}
 
@@ -336,7 +336,7 @@ func TestProcessSingleUpload(t *testing.T) {
 			assert.Equal(t, expectedKey, key)
 			return nil
 		}
-		rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+		rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 			completed.Store(true)
 			return nil
 		}
@@ -397,7 +397,7 @@ func TestProcessSingleUpload(t *testing.T) {
 		rdb.PendingUploadKeysFunc = func(ctx context.Context, contentHash string, accountID int64) ([]string, error) {
 			return nil, nil
 		}
-		rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+		rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 			completed.Store(true)
 			return nil
 		}
@@ -447,7 +447,7 @@ func TestProcessSingleUpload(t *testing.T) {
 			markedAttempt.Store(true)
 			return nil
 		}
-		rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+		rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 			completed.Store(true)
 			return nil
 		}
@@ -490,7 +490,7 @@ func TestProcessSingleUpload(t *testing.T) {
 		worker, rdb, _, _, _ := setupTestWorker(t)
 		filePath := createLocalFile(t, worker)
 
-		rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+		rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 			return errors.New("db is down")
 		}
 
@@ -793,7 +793,7 @@ func TestProcessSingleUpload_ShutdownDuringFinalization(t *testing.T) {
 	// Track if DB finalization was attempted and succeeded
 	dbFinalizationAttempted := false
 	dbFinalizationSucceeded := false
-	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 		dbFinalizationAttempted = true
 		// Verify we're using a background context (not canceled)
 		select {

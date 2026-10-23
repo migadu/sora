@@ -21,7 +21,10 @@ import (
 // the one it leased (CompleteLeasedS3Upload). These tests pin each part against a live
 // database.
 
-const gateTestLease = time.Minute
+const (
+	gateTestLease = time.Minute
+	gateTestOwner = "gate-test-owner"
+)
 
 // leaseUntil reads a pending row's lease; ok is false when the row is gone.
 func leaseUntil(t *testing.T, database *Database, pendingID int64) (lease *time.Time, ok bool) {
@@ -33,6 +36,34 @@ func leaseUntil(t *testing.T, database *Database, pendingID int64) (lease *time.
 	}
 	require.NoError(t, err)
 	return lease, true
+}
+
+// leaseOwner reads who holds a pending row's lease ("" when nobody does).
+func leaseOwner(t *testing.T, database *Database, pendingID int64) string {
+	t.Helper()
+	var owner *string
+	require.NoError(t, database.GetWritePool().QueryRow(context.Background(),
+		`SELECT lease_owner FROM pending_uploads WHERE id = $1 AND lease_until > now()`, pendingID).Scan(&owner))
+	if owner == nil {
+		return ""
+	}
+	return *owner
+}
+
+// leaseRow passes the write gate for owner, which must open.
+func leaseRow(t *testing.T, database *Database, pendingID, accountID int64, hash, owner string) {
+	t.Helper()
+	gate, err := database.PassS3WriteGate(context.Background(), pendingID, accountID, hash, owner, gateTestLease)
+	require.NoError(t, err)
+	require.Equal(t, S3WriteOpen, gate)
+}
+
+// expireLease makes a row's lease run out, as if its owner had stalled past it.
+func expireLease(t *testing.T, database *Database, pendingID int64) {
+	t.Helper()
+	_, err := database.GetWritePool().Exec(context.Background(),
+		`UPDATE pending_uploads SET lease_until = now() - interval '1 second' WHERE id = $1`, pendingID)
+	require.NoError(t, err)
 }
 
 // insertKeyedMessage inserts one INBOX message row stored under example.com/<localpart>.
@@ -63,7 +94,7 @@ func TestPassS3WriteGate(t *testing.T) {
 	pendingID := createPendingUpload(t, database, accountID, "gate-instance", hash, 0, time.Time{}, 100)
 	lockID := GetS3ObjectLockID(accountID, hash)
 
-	gate, err := database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestLease)
+	gate, err := database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestOwner, gateTestLease)
 	require.NoError(t, err)
 	assert.Equal(t, S3WriteOpen, gate, "nothing holds the body and its row stands")
 	_, held := findLockHolder(t, database, lockID)
@@ -71,7 +102,7 @@ func TestPassS3WriteGate(t *testing.T) {
 	lease, _ := leaseUntil(t, database, pendingID)
 	require.NotNil(t, lease, "an open gate leases the row to the upload")
 	assert.WithinDuration(t, time.Now().Add(gateTestLease), *lease, 10*time.Second)
-	require.NoError(t, database.ReleasePendingUploadLease(ctx, pendingID))
+	require.NoError(t, database.ReleasePendingUploadLease(ctx, pendingID, gateTestOwner))
 
 	// A deleter (or a restore, or a cross-account COPY) holds the object lock.
 	holder, err := database.GetWritePool().Begin(ctx)
@@ -79,7 +110,7 @@ func TestPassS3WriteGate(t *testing.T) {
 	_, err = holder.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", lockID)
 	require.NoError(t, err)
 	started := time.Now()
-	gate, err = database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestLease)
+	gate, err = database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestOwner, gateTestLease)
 	require.NoError(t, err)
 	assert.Equal(t, S3WriteBusy, gate, "a write must not start while a delete of the same body may be under way")
 	assert.Less(t, time.Since(started), 2*time.Second, "the gate never waits for a holder")
@@ -87,16 +118,28 @@ func TestPassS3WriteGate(t *testing.T) {
 	assert.Nil(t, lease, "a closed gate grants no lease: nothing is in flight")
 	require.NoError(t, holder.Rollback(ctx))
 
-	gate, err = database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestLease)
+	gate, err = database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestOwner, gateTestLease)
 	require.NoError(t, err)
 	assert.Equal(t, S3WriteOpen, gate, "the gate opens once the holder is done")
+
+	// The lease is exclusive: another upload of the row is turned away while it is live,
+	// and may take it only once it has run out.
+	gate, err = database.PassS3WriteGate(ctx, pendingID, accountID, hash, "another-owner", gateTestLease)
+	require.NoError(t, err)
+	assert.Equal(t, S3WriteBusy, gate, "a second upload must not write under a live lease")
+	assert.Equal(t, gateTestOwner, leaseOwner(t, database, pendingID), "and must not take the lease over")
+	expireLease(t, database, pendingID)
+	gate, err = database.PassS3WriteGate(ctx, pendingID, accountID, hash, "another-owner", gateTestLease)
+	require.NoError(t, err)
+	assert.Equal(t, S3WriteOpen, gate, "a lease that ran out protects nothing")
+	assert.Equal(t, "another-owner", leaseOwner(t, database, pendingID))
 
 	// The leased row goes (a purge), and a later delivery of the same body stages a new
 	// one. The lease is still over: only the row it leased kept deleters away.
 	_, err = database.GetWritePool().Exec(ctx, `DELETE FROM pending_uploads WHERE id = $1`, pendingID)
 	require.NoError(t, err)
 	createPendingUpload(t, database, accountID, "gate-instance", hash, 0, time.Time{}, 100)
-	gate, err = database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestLease)
+	gate, err = database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestOwner, gateTestLease)
 	require.NoError(t, err)
 	assert.Equal(t, S3WriteAbandoned, gate)
 }
@@ -112,21 +155,33 @@ func TestPendingUploadLeaseRenewAndRelease(t *testing.T) {
 	hash := fmt.Sprintf("lease_%d", time.Now().UnixNano())
 	pendingID := createPendingUpload(t, database, accountID, "gate-instance", hash, 0, time.Time{}, 100)
 
-	held, err := database.RenewPendingUploadLease(ctx, pendingID, gateTestLease)
+	held, err := database.RenewPendingUploadLease(ctx, pendingID, gateTestOwner, gateTestLease)
 	require.NoError(t, err)
-	assert.True(t, held)
+	assert.False(t, held, "a lease nobody was granted cannot be renewed into existence")
+
+	leaseRow(t, database, pendingID, accountID, hash, gateTestOwner)
+	expireLease(t, database, pendingID)
+	held, err = database.RenewPendingUploadLease(ctx, pendingID, gateTestOwner, gateTestLease)
+	require.NoError(t, err)
+	assert.True(t, held, "a lease that ran out is still its owner's while nobody took it")
 	lease, _ := leaseUntil(t, database, pendingID)
 	require.NotNil(t, lease)
 	assert.WithinDuration(t, time.Now().Add(gateTestLease), *lease, 10*time.Second)
 
-	require.NoError(t, database.ReleasePendingUploadLease(ctx, pendingID))
+	held, err = database.RenewPendingUploadLease(ctx, pendingID, "another-owner", gateTestLease)
+	require.NoError(t, err)
+	assert.False(t, held, "only the owner renews")
+	require.NoError(t, database.ReleasePendingUploadLease(ctx, pendingID, "another-owner"))
+	assert.Equal(t, gateTestOwner, leaseOwner(t, database, pendingID), "only the owner releases")
+
+	require.NoError(t, database.ReleasePendingUploadLease(ctx, pendingID, gateTestOwner))
 	lease, ok := leaseUntil(t, database, pendingID)
 	require.True(t, ok, "a released row stays, to be leased again")
 	assert.Nil(t, lease)
 
 	_, err = database.GetWritePool().Exec(ctx, `DELETE FROM pending_uploads WHERE id = $1`, pendingID)
 	require.NoError(t, err)
-	held, err = database.RenewPendingUploadLease(ctx, pendingID, gateTestLease)
+	held, err = database.RenewPendingUploadLease(ctx, pendingID, gateTestOwner, gateTestLease)
 	require.NoError(t, err)
 	assert.False(t, held, "a renewal reports a row that is gone")
 }
@@ -154,7 +209,7 @@ func TestLeasedPendingRowIsLeftAlone(t *testing.T) {
 	lapsedID := createPendingUpload(t, database, accountID, instance, lapsed, 0, time.Time{}, 100)
 	queuedID := createPendingUpload(t, database, accountID, instance, queued, 0, time.Time{}, 100)
 
-	gate, err := database.PassS3WriteGate(ctx, inFlightID, accountID, inFlight, gateTestLease)
+	gate, err := database.PassS3WriteGate(ctx, inFlightID, accountID, inFlight, gateTestOwner, gateTestLease)
 	require.NoError(t, err)
 	require.Equal(t, S3WriteOpen, gate)
 	_, err = database.GetWritePool().Exec(ctx, `UPDATE pending_uploads SET lease_until = now() - interval '1 second' WHERE id = $1`, lapsedID)
@@ -207,7 +262,7 @@ func TestAddressStaysTakenWhileAnUploadIsInFlight(t *testing.T) {
 	local, _, _ := strings.Cut(email, "@")
 	insertKeyedMessage(t, database, accountID, mailboxID, 100, hash, local, false, time.Time{})
 	pendingID := createPendingUpload(t, database, accountID, "old-instance", hash, 0, time.Time{}, 100)
-	gate, err := database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestLease)
+	gate, err := database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestOwner, gateTestLease)
 	require.NoError(t, err)
 	require.Equal(t, S3WriteOpen, gate)
 
@@ -241,7 +296,7 @@ func TestAddressStaysTakenWhileAnUploadIsInFlight(t *testing.T) {
 	tx, err = database.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
-	require.NoError(t, database.CompleteLeasedS3Upload(ctx, tx, pendingID, hash, accountID, []string{"example.com/" + local + "/" + hash}))
+	require.NoError(t, database.CompleteLeasedS3Upload(ctx, tx, pendingID, gateTestOwner, hash, accountID, []string{"example.com/" + local + "/" + hash}))
 	require.NoError(t, tx.Commit(ctx))
 	err = database.ExecuteWithLockedS3Orphans(ctx, candidates, purgeGrace, func(_ context.Context, orphans []UserScopedObjectForCleanup) error {
 		require.Len(t, orphans, 1, "once the upload has finalized the body is the purge's to delete")
@@ -279,7 +334,7 @@ func TestS3WriteGateKeepsDeletersAwayFromAnUploadInFlight(t *testing.T) {
 	err := database.ExecuteWithLockedS3Orphans(ctx, candidates, gracePeriod, func(_ context.Context, orphans []UserScopedObjectForCleanup) error {
 		require.Len(t, orphans, 1, "with no pending row yet the body is an orphan")
 		pendingID = createPendingUpload(t, database, accountID, "gate-instance", hash, 0, time.Time{}, 100)
-		gate, err := database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestLease)
+		gate, err := database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestOwner, gateTestLease)
 		require.NoError(t, err)
 		assert.Equal(t, S3WriteBusy, gate, "an upload must not write while a delete confirmed before its row existed is under way")
 		return nil
@@ -287,7 +342,7 @@ func TestS3WriteGateKeepsDeletersAwayFromAnUploadInFlight(t *testing.T) {
 	require.NoError(t, err)
 
 	// 2. Once that delete is done the gate opens, and the upload writes holding nothing.
-	gate, err := database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestLease)
+	gate, err := database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestOwner, gateTestLease)
 	require.NoError(t, err)
 	require.Equal(t, S3WriteOpen, gate)
 
@@ -303,7 +358,7 @@ func TestS3WriteGateKeepsDeletersAwayFromAnUploadInFlight(t *testing.T) {
 	tx, err := database.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
-	require.NoError(t, database.CompleteLeasedS3Upload(ctx, tx, pendingID, hash, accountID, []string{"example.com/user/" + hash}))
+	require.NoError(t, database.CompleteLeasedS3Upload(ctx, tx, pendingID, gateTestOwner, hash, accountID, []string{"example.com/user/" + hash}))
 	require.NoError(t, tx.Commit(ctx))
 	var left int
 	require.NoError(t, database.GetWritePool().QueryRow(ctx, `SELECT count(*) FROM pending_uploads WHERE id = $1`, pendingID).Scan(&left))
@@ -338,11 +393,12 @@ func TestCompleteLeasedS3Upload(t *testing.T) {
 		hash := fmt.Sprintf("leased_ok_%d", suffix)
 		insertKeyedMessage(t, database, accountID, mailboxID, 400, hash, "user", false, time.Time{})
 		pendingID := createPendingUpload(t, database, accountID, "gate-instance", hash, 0, time.Time{}, 100)
+		leaseRow(t, database, pendingID, accountID, hash, gateTestOwner)
 
 		tx, err := database.GetWritePool().Begin(ctx)
 		require.NoError(t, err)
 		defer tx.Rollback(ctx)
-		require.NoError(t, database.CompleteLeasedS3Upload(ctx, tx, pendingID, hash, accountID, []string{"example.com/user/" + hash}))
+		require.NoError(t, database.CompleteLeasedS3Upload(ctx, tx, pendingID, gateTestOwner, hash, accountID, []string{"example.com/user/" + hash}))
 		require.NoError(t, tx.Commit(ctx))
 
 		assert.True(t, uploaded(hash))
@@ -354,18 +410,35 @@ func TestCompleteLeasedS3Upload(t *testing.T) {
 		insertKeyedMessage(t, database, accountID, mailboxID, 402, hash, "user", false, time.Time{})
 		insertKeyedMessage(t, database, accountID, mailboxID, 403, hash, "alias", false, time.Time{})
 		pendingID := createPendingUpload(t, database, accountID, "gate-instance", hash, 0, time.Time{}, 100)
-		_, err := database.RenewPendingUploadLease(ctx, pendingID, gateTestLease)
-		require.NoError(t, err)
+		leaseRow(t, database, pendingID, accountID, hash, gateTestOwner)
 
 		tx, err := database.GetWritePool().Begin(ctx)
 		require.NoError(t, err)
 		defer tx.Rollback(ctx)
-		require.NoError(t, database.CompleteLeasedS3Upload(ctx, tx, pendingID, hash, accountID, []string{"example.com/user/" + hash}))
+		require.NoError(t, database.CompleteLeasedS3Upload(ctx, tx, pendingID, gateTestOwner, hash, accountID, []string{"example.com/user/" + hash}))
 		require.NoError(t, tx.Commit(ctx))
 
 		lease, ok := leaseUntil(t, database, pendingID)
 		require.True(t, ok, "the row stays: example.com/alias still has to be written")
 		assert.Nil(t, lease, "and is free for the next lease right away")
+	})
+
+	t.Run("refuses an upload whose lease another upload took over", func(t *testing.T) {
+		hash := fmt.Sprintf("leased_taken_%d", suffix)
+		insertKeyedMessage(t, database, accountID, mailboxID, 404, hash, "user", false, time.Time{})
+		pendingID := createPendingUpload(t, database, accountID, "gate-instance", hash, 0, time.Time{}, 100)
+		leaseRow(t, database, pendingID, accountID, hash, gateTestOwner)
+		expireLease(t, database, pendingID) // this upload stalled past its lease
+		leaseRow(t, database, pendingID, accountID, hash, "another-owner")
+
+		tx, err := database.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		err = database.CompleteLeasedS3Upload(ctx, tx, pendingID, gateTestOwner, hash, accountID, []string{"example.com/user/" + hash})
+		require.ErrorIs(t, err, ErrUploadLeaseLost)
+		require.NoError(t, tx.Rollback(ctx))
+		assert.False(t, uploaded(hash), "the stalled upload must not finalize under the one now writing")
+		assert.Equal(t, "another-owner", leaseOwner(t, database, pendingID), "the row stays the new owner's")
 	})
 
 	t.Run("refuses once the leased row is gone, even when a new delivery re-created one", func(t *testing.T) {
@@ -379,8 +452,8 @@ func TestCompleteLeasedS3Upload(t *testing.T) {
 		tx, err := database.GetWritePool().Begin(ctx)
 		require.NoError(t, err)
 		defer tx.Rollback(ctx) // a failed require must not leave the connection held, or Close waits forever
-		err = database.CompleteLeasedS3Upload(ctx, tx, leased, hash, accountID, []string{"example.com/user/" + hash})
-		require.ErrorIs(t, err, ErrPendingUploadGone)
+		err = database.CompleteLeasedS3Upload(ctx, tx, leased, gateTestOwner, hash, accountID, []string{"example.com/user/" + hash})
+		require.ErrorIs(t, err, ErrUploadLeaseLost)
 		assert.True(t, errors.Is(err, consts.ErrDBNotFound), "an answer, not a database failure: it must not trip the write breaker")
 		require.NoError(t, tx.Rollback(ctx))
 
@@ -390,4 +463,88 @@ func TestCompleteLeasedS3Upload(t *testing.T) {
 		assert.False(t, uploaded(hash), "rows must not be marked uploaded on the strength of a lease that lapsed")
 		assert.Equal(t, 1, pendingRows(hash), "the re-created row belongs to a later upload")
 	})
+}
+
+// The reviewed hazard: two workers can hold the same pending row. A delivery queues the
+// body on node A, whose batch leases the row while the task waits for a free upload slot;
+// a second delivery of the body on node B re-arms the row for B, which leases it, passes
+// the gate and starts writing. When A's task reaches the gate, B's lease must turn it
+// away: otherwise A would finalize and drop the row B's transfer depends on, and a purge
+// could then delete the body and its rows before B's write landed, leaving it in S3 with
+// nothing pointing at it. The old object lock serialized these transfers; the lease must
+// too, with the finalize tied to its owner.
+func TestLeaseIsExclusiveAcrossReArmedDeliveries(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	database, email, accountID, mailboxID := setupCleanerTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+	hash := fmt.Sprintf("lease_rearm_%d", time.Now().UnixNano())
+	suffix := time.Now().UnixNano()
+	instanceA, instanceB := fmt.Sprintf("lease-node-a-%d", suffix), fmt.Sprintf("lease-node-b-%d", suffix)
+	ownerA, ownerB := instanceA+"/attempt", instanceB+"/attempt"
+
+	leaseTask := func(instance string) []PendingUpload {
+		t.Helper()
+		tx, err := database.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		uploads, err := database.AcquireAndLeasePendingUploads(ctx, tx, instance, 10, 0, 5)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+		return uploads
+	}
+
+	// A's batch leases the row; its task has not reached the gate yet.
+	insertDeliveredMessage(t, database, accountID, mailboxID, "INBOX", hash, instanceA, 1)
+	tasksA := leaseTask(instanceA)
+	require.Len(t, tasksA, 1)
+	pendingID := tasksA[0].ID
+
+	// The same body is delivered on B: the row is re-armed for B, which leases it and
+	// passes the gate.
+	insertDeliveredMessage(t, database, accountID, mailboxID, "INBOX", hash, instanceB, 2)
+	tasksB := leaseTask(instanceB)
+	require.Len(t, tasksB, 1)
+	require.Equal(t, pendingID, tasksB[0].ID)
+	gate, err := database.PassS3WriteGate(ctx, pendingID, accountID, hash, ownerB, gateTestLease)
+	require.NoError(t, err)
+	require.Equal(t, S3WriteOpen, gate)
+
+	// A's task finally reaches the gate while B is writing.
+	gate, err = database.PassS3WriteGate(ctx, pendingID, accountID, hash, ownerA, gateTestLease)
+	require.NoError(t, err)
+	assert.Equal(t, S3WriteBusy, gate, "a second upload of the row must not write under a live lease")
+	tx, err := database.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	err = database.CompleteLeasedS3Upload(ctx, tx, pendingID, ownerA, hash, accountID, []string{"example.com/rearm/" + hash})
+	require.ErrorIs(t, err, ErrUploadLeaseLost, "nor finalize, and drop the row, under it")
+	require.NoError(t, tx.Rollback(ctx))
+	_, pending := leaseUntil(t, database, pendingID)
+	require.True(t, pending)
+
+	// A purge while B is mid-PUT: B's leased row survives the hard delete, and the S3
+	// phase refuses the body.
+	tx, err = database.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	require.NoError(t, database.DeleteAccount(ctx, tx, email))
+	require.NoError(t, database.HardDeleteAccounts(ctx, tx, []int64{accountID}))
+	require.NoError(t, tx.Commit(ctx))
+	err = database.ExecuteWithLockedS3Orphans(ctx, []UserScopedObjectForCleanup{{AccountID: accountID, ContentHash: hash, S3Domain: "example.com", S3Localpart: "rearm"}}, -time.Hour, func(_ context.Context, orphans []UserScopedObjectForCleanup) error {
+		assert.Empty(t, orphans, "B's transfer in flight must keep the purge away from its body")
+		return nil
+	})
+	require.NoError(t, err)
+
+	// B lands and finalizes as the owner; only then is the body the purge's.
+	tx, err = database.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	require.NoError(t, database.CompleteLeasedS3Upload(ctx, tx, pendingID, ownerB, hash, accountID, []string{"example.com/rearm/" + hash}))
+	require.NoError(t, tx.Commit(ctx))
+	_, pending = leaseUntil(t, database, pendingID)
+	assert.False(t, pending, "B's finalize takes the row with it")
 }

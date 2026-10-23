@@ -143,34 +143,40 @@ func (db *Database) CompleteS3Upload(ctx context.Context, tx pgx.Tx, contentHash
 	return dropFinishedPendingUpload(ctx, tx, contentHash, accountID)
 }
 
-// ErrPendingUploadGone reports that the pending_uploads row an upload leased was deleted
-// before the upload finalized, which its lease exists to prevent: the lease ran out (the
-// uploader could not renew it), or something deleted the row regardless. It wraps
-// consts.ErrDBNotFound, so it is an answer, not a database failure.
-var ErrPendingUploadGone = fmt.Errorf("pending upload is gone: %w", consts.ErrDBNotFound)
+// ErrUploadLeaseLost reports that an upload no longer holds the lease on its pending row:
+// the row is gone, or its lease ran out (the uploader could not renew it) and another
+// upload of the body holds it now. The upload must not finalize, and must not retry: the
+// row, if it still exists, is the other upload's. It wraps consts.ErrDBNotFound, so it is
+// an answer, not a database failure.
+var ErrUploadLeaseLost = fmt.Errorf("upload lease lost: %w", consts.ErrDBNotFound)
 
 // CompleteLeasedS3Upload is CompleteS3Upload for the uploader, which writes its objects
 // without holding their lock (see PassS3WriteGate). It finalizes only if the pending row
-// the upload leased, identified by pendingID, still exists, and returns
-// ErrPendingUploadGone otherwise; the caller must then roll back, so that the rows it
-// marked are not left claiming objects nothing protected.
+// identified by pendingID is still leased to owner, and returns ErrUploadLeaseLost
+// otherwise; the caller must then roll back, so that the rows it marked are not left
+// claiming objects nothing protected.
 //
 // While the row stands, no deleter can have removed the objects since the gate: every
 // orphan re-check since then saw the row. Row ids come from a sequence and are never
 // reused, so finding the same id proves the row stood the whole time, not merely that a
-// later delivery of the same body re-created one. The row is locked after the messages
-// are marked — the order CompleteS3Upload has always taken these locks in — and held to
-// commit, so it cannot go between the check and the commit. The same statement ends the
-// upload's lease: the row is deleted below once nothing is left to write, and otherwise
-// stays, unleased, for the next lease to write what is left.
-func (db *Database) CompleteLeasedS3Upload(ctx context.Context, tx pgx.Tx, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+// later delivery of the same body re-created one; finding it still leased to owner proves
+// no other upload took it over and wrote, or is writing, under it. The row is locked after
+// the messages are marked — the order CompleteS3Upload has always taken these locks in —
+// and held to commit, so it cannot go between the check and the commit. The same
+// statement ends the lease: the row is deleted below once nothing is left to write, and
+// otherwise stays, unleased, for the next lease to write what is left.
+func (db *Database) CompleteLeasedS3Upload(ctx context.Context, tx pgx.Tx, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 	if err := markS3Uploaded(ctx, tx, contentHash, accountID, writtenKeys); err != nil {
 		return err
 	}
 	var found int
-	err := tx.QueryRow(ctx, `UPDATE pending_uploads SET lease_until = NULL WHERE id = $1 RETURNING 1`, pendingID).Scan(&found)
+	err := tx.QueryRow(ctx, `
+		UPDATE pending_uploads SET lease_until = NULL, lease_owner = NULL
+		WHERE id = $1 AND lease_owner = $2
+		RETURNING 1
+	`, pendingID, owner).Scan(&found)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrPendingUploadGone
+		return ErrUploadLeaseLost
 	}
 	if err != nil {
 		return fmt.Errorf("failed to lock pending upload %d: %w", pendingID, err)
@@ -223,14 +229,15 @@ func dropFinishedPendingUpload(ctx context.Context, tx pgx.Tx, contentHash strin
 type S3WriteGate int
 
 const (
-	// S3WriteOpen: no deleter holds the object, the leased pending row still stands, and
-	// it is now leased to this upload until the lease expires.
+	// S3WriteOpen: no deleter holds the object, the pending row still stands, and it is
+	// now leased to this upload alone until the lease expires.
 	S3WriteOpen S3WriteGate = iota
-	// S3WriteBusy: something holds the object's lock right now — the cleaner or a purge
-	// confirming the body is an orphan and deleting it, a restore, a cross-account COPY.
+	// S3WriteBusy: someone else is at the body right now — the cleaner or a purge
+	// confirming it is an orphan and deleting it, a restore, a cross-account COPY, or
+	// another upload of it that holds the row's lease. The upload is deferred.
 	S3WriteBusy
-	// S3WriteAbandoned: the leased pending row is gone (the account was deleted, or the
-	// upload reaped), so there is nothing left to upload.
+	// S3WriteAbandoned: the pending row is gone (the account was deleted, the upload
+	// reaped, or another upload finished it), so there is nothing left to upload.
 	S3WriteAbandoned
 )
 
@@ -250,61 +257,72 @@ const (
 //     leased again after retry_interval, when that delete is over;
 //   - a deleter taking the lock afterwards sees the pending row and leaves the body be.
 //
-// That holds only while the row stands, so an open gate also leases the row to the
-// upload until now + ttl (pending_uploads.lease_until), which the uploader extends while
-// the transfer runs (RenewPendingUploadLease). Nothing deletes a leased row but its own
-// upload's finalize: account deletion leaves it be (deleteAccountDependents), the reaper
-// never takes a row its live instance is still retrying (CleanupFailedUploads), and the
-// worker does not lease it a second time (AcquireAndLeasePendingUploads).
+// That holds only while the row stands, so an open gate also leases the row, to owner
+// alone, until now + ttl (pending_uploads.lease_until, lease_owner); the uploader extends
+// it while the transfer runs (RenewPendingUploadLease). Nothing deletes a row with a live
+// lease but its owner's finalize: account deletion leaves it be (deleteAccountDependents),
+// the reaper never takes a row its live instance is still retrying (CleanupFailedUploads),
+// and the worker does not lease it again (AcquireAndLeasePendingUploads).
+//
+// The lease is exclusive. Two workers can hold the same row in their queues — a delivery
+// on another node re-arms the row for that node while this one's lease of it waits for a
+// free upload slot — and whichever reaches the gate second while the first one's lease is
+// live is answered S3WriteBusy. Renewal, release and the finalize act only for the owner,
+// so the one that lost cannot finalize, and drop the row, under the one still writing.
 //
 // One autocommit statement: the transaction-scoped try-lock is released when the
 // statement's implicit transaction ends, so the gate costs one round trip and pins
 // nothing behind any pooler. It never waits.
-func (db *Database) PassS3WriteGate(ctx context.Context, pendingID, accountID int64, contentHash string, ttl time.Duration) (S3WriteGate, error) {
-	var open, leased bool
+func (db *Database) PassS3WriteGate(ctx context.Context, pendingID, accountID int64, contentHash, owner string, ttl time.Duration) (S3WriteGate, error) {
+	var open, leased, exists bool
 	err := db.GetWritePool().QueryRow(ctx, `
 		WITH gate AS MATERIALIZED (
 			SELECT pg_try_advisory_xact_lock($1) AS open
 		), lease AS (
-			UPDATE pending_uploads SET lease_until = now() + $3::interval
+			UPDATE pending_uploads SET lease_until = now() + $3::interval, lease_owner = $4
 			WHERE id = $2 AND (SELECT open FROM gate)
+			  AND (lease_until IS NULL OR lease_until < now())
 			RETURNING id
 		)
-		SELECT (SELECT open FROM gate), EXISTS (SELECT 1 FROM lease)
-	`, GetS3ObjectLockID(accountID, contentHash), pendingID, ttl).Scan(&open, &leased)
+		SELECT (SELECT open FROM gate), EXISTS (SELECT 1 FROM lease),
+		       EXISTS (SELECT 1 FROM pending_uploads WHERE id = $2)
+	`, GetS3ObjectLockID(accountID, contentHash), pendingID, ttl, owner).Scan(&open, &leased, &exists)
 	if err != nil {
 		return S3WriteBusy, fmt.Errorf("failed to pass the write gate for hash %s of account %d: %w", contentHash, accountID, err)
 	}
 	switch {
 	case !open:
 		return S3WriteBusy, nil
-	case !leased:
-		return S3WriteAbandoned, nil
+	case leased:
+		return S3WriteOpen, nil
+	case exists:
+		return S3WriteBusy, nil // another upload holds a live lease on the row
 	}
-	return S3WriteOpen, nil
+	return S3WriteAbandoned, nil
 }
 
-// RenewPendingUploadLease extends the lease of a pending row whose upload is in flight to
-// now + ttl. It reports false, with no error, when the row is gone. A lease that lapsed
-// may be renewed as long as the row stands: only account deletion takes a row for being
-// unleased, and a row it took is gone.
-func (db *Database) RenewPendingUploadLease(ctx context.Context, pendingID int64, ttl time.Duration) (bool, error) {
+// RenewPendingUploadLease extends owner's lease of a pending row to now + ttl. It reports
+// false, with no error, when the row is gone or leased to someone else. A lease that ran
+// out may be renewed as long as it is still owner's: nobody has taken the row since.
+func (db *Database) RenewPendingUploadLease(ctx context.Context, pendingID int64, owner string, ttl time.Duration) (bool, error) {
 	tag, err := db.GetWritePool().Exec(ctx, `
-		UPDATE pending_uploads SET lease_until = now() + $2::interval WHERE id = $1
-	`, pendingID, ttl)
+		UPDATE pending_uploads SET lease_until = now() + $3::interval
+		WHERE id = $1 AND lease_owner = $2
+	`, pendingID, owner, ttl)
 	if err != nil {
 		return false, fmt.Errorf("failed to renew the lease of pending upload %d: %w", pendingID, err)
 	}
 	return tag.RowsAffected() == 1, nil
 }
 
-// ReleasePendingUploadLease ends the lease of a pending row whose upload did not finish,
-// so that account deletion need not wait for the lease to run out. The row stays and is
-// leased again after retry_interval.
-func (db *Database) ReleasePendingUploadLease(ctx context.Context, pendingID int64) error {
+// ReleasePendingUploadLease ends owner's lease of a pending row whose upload did not
+// finish, so that account deletion need not wait for the lease to run out. The row stays
+// and is leased again after retry_interval. A lease that is no longer owner's is left.
+func (db *Database) ReleasePendingUploadLease(ctx context.Context, pendingID int64, owner string) error {
 	if _, err := db.GetWritePool().Exec(ctx, `
-		UPDATE pending_uploads SET lease_until = NULL WHERE id = $1
-	`, pendingID); err != nil {
+		UPDATE pending_uploads SET lease_until = NULL, lease_owner = NULL
+		WHERE id = $1 AND lease_owner = $2
+	`, pendingID, owner); err != nil {
 		return fmt.Errorf("failed to release the lease of pending upload %d: %w", pendingID, err)
 	}
 	return nil

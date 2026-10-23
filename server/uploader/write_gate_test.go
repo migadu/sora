@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -68,7 +69,7 @@ func TestProcessSingleUpload_PassesTheGateBeforeTouchingS3(t *testing.T) {
 	stageGateTestBody(t, worker)
 
 	var ev events
-	rdb.PassS3WriteGateFunc = func(ctx context.Context, pendingID, accountID int64, contentHash string, ttl time.Duration) (db.S3WriteGate, error) {
+	rdb.PassS3WriteGateFunc = func(ctx context.Context, pendingID, accountID int64, contentHash, owner string, ttl time.Duration) (db.S3WriteGate, error) {
 		assert.Equal(t, int64(77), pendingID, "the gate leases the row this upload leased")
 		assert.Equal(t, uploadLeaseTTL, ttl)
 		ev.add("gate")
@@ -78,12 +79,12 @@ func TestProcessSingleUpload_PassesTheGateBeforeTouchingS3(t *testing.T) {
 		ev.add("put")
 		return nil
 	}
-	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 		assert.Equal(t, int64(77), pendingID, "the finalize checks the row this upload leased")
 		ev.add("finalize")
 		return nil
 	}
-	rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64) error {
+	rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, owner string) error {
 		ev.add("release")
 		return nil
 	}
@@ -114,7 +115,7 @@ func TestProcessSingleUpload_GateTurnsTheUploadAway(t *testing.T) {
 				if staged {
 					path = stageGateTestBody(t, worker)
 				}
-				rdb.PassS3WriteGateFunc = func(ctx context.Context, pendingID, accountID int64, contentHash string, ttl time.Duration) (db.S3WriteGate, error) {
+				rdb.PassS3WriteGateFunc = func(ctx context.Context, pendingID, accountID int64, contentHash, owner string, ttl time.Duration) (db.S3WriteGate, error) {
 					return tc.gate, tc.err
 				}
 				var touched, counted, finalized, leased bool
@@ -130,11 +131,11 @@ func TestProcessSingleUpload_GateTurnsTheUploadAway(t *testing.T) {
 					counted = true
 					return nil
 				}
-				rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+				rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 					finalized = true
 					return nil
 				}
-				rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64) error {
+				rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, owner string) error {
 					leased = true
 					return nil
 				}
@@ -166,7 +167,7 @@ func TestProcessSingleUpload_RenewsTheLeaseUntilTheFinalize(t *testing.T) {
 
 	var renewals atomic.Int32
 	var finalizing atomic.Bool
-	rdb.RenewPendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, ttl time.Duration) (bool, error) {
+	rdb.RenewPendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, owner string, ttl time.Duration) (bool, error) {
 		assert.Equal(t, int64(77), pendingID)
 		assert.False(t, finalizing.Load(), "no renewal may run once the finalize has started")
 		renewals.Add(1)
@@ -176,7 +177,7 @@ func TestProcessSingleUpload_RenewsTheLeaseUntilTheFinalize(t *testing.T) {
 		time.Sleep(60 * time.Millisecond) // a slow transfer
 		return nil
 	}
-	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 		finalizing.Store(true)
 		time.Sleep(20 * time.Millisecond)
 		return nil
@@ -192,7 +193,7 @@ func TestProcessSingleUpload_LostLeaseStopsTheTransfer(t *testing.T) {
 	worker, rdb, s3, cache, _ := setupTestWorker(t)
 	path := stageGateTestBody(t, worker)
 
-	rdb.RenewPendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, ttl time.Duration) (bool, error) {
+	rdb.RenewPendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, owner string, ttl time.Duration) (bool, error) {
 		return false, nil // the row is gone
 	}
 	s3.PutWithRetryFunc = func(ctx context.Context, key string, reader io.Reader, size int64) error {
@@ -205,11 +206,11 @@ func TestProcessSingleUpload_LostLeaseStopsTheTransfer(t *testing.T) {
 		}
 	}
 	var finalized, released bool
-	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 		finalized = true
 		return nil
 	}
-	rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64) error {
+	rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, owner string) error {
 		released = true
 		return nil
 	}
@@ -232,7 +233,7 @@ func TestProcessSingleUpload_UnrenewableLeaseStopsTheTransfer(t *testing.T) {
 	worker, rdb, s3, _, _ := setupTestWorker(t)
 	stageGateTestBody(t, worker)
 
-	rdb.RenewPendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, ttl time.Duration) (bool, error) {
+	rdb.RenewPendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, owner string, ttl time.Duration) (bool, error) {
 		return false, errors.New("db is down")
 	}
 	s3.PutWithRetryFunc = func(ctx context.Context, key string, reader io.Reader, size int64) error {
@@ -245,7 +246,7 @@ func TestProcessSingleUpload_UnrenewableLeaseStopsTheTransfer(t *testing.T) {
 		}
 	}
 	var released atomic.Bool
-	rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64) error {
+	rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, owner string) error {
 		released.Store(true)
 		return nil
 	}
@@ -270,7 +271,7 @@ func TestProcessSingleUpload_FailedUploadReleasesItsLease(t *testing.T) {
 		}, uploadRetryLater},
 		{"finalize fails", func(w *UploadWorker, rdb *mockDB, s3 *mockS3) {
 			stageGateTestBody(t, w)
-			rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
+			rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
 				return errors.New("db is down")
 			}
 		}, uploadRetryLater},
@@ -285,7 +286,7 @@ func TestProcessSingleUpload_FailedUploadReleasesItsLease(t *testing.T) {
 			worker, rdb, s3, _, _ := setupTestWorker(t)
 			tc.setup(worker, rdb, s3)
 			var released []int64
-			rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64) error {
+			rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, owner string) error {
 				released = append(released, pendingID)
 				return nil
 			}
@@ -301,10 +302,10 @@ func TestProcessSingleUpload_FailedUploadReleasesItsLease(t *testing.T) {
 func TestProcessSingleUpload_RowGoneAtTheFinalize(t *testing.T) {
 	worker, rdb, _, cache, _ := setupTestWorker(t)
 	path := stageGateTestBody(t, worker)
-	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, contentHash string, accountID int64, writtenKeys []string) error {
-		return db.ErrPendingUploadGone
+	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
+		return db.ErrUploadLeaseLost
 	}
-	rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64) error {
+	rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, owner string) error {
 		t.Error("there is no row left to release")
 		return nil
 	}
@@ -316,4 +317,89 @@ func TestProcessSingleUpload_RowGoneAtTheFinalize(t *testing.T) {
 	assert.Equal(t, uploadSkipped, worker.processSingleUpload(context.Background(), gateTestUpload()))
 	_, err := os.Stat(path)
 	assert.NoError(t, err, "the staged body stays for the orphan sweep")
+}
+
+// The lease is exclusive to one upload attempt: the gate grants it to an owner, and the
+// renewals, the release and the finalize all name that same owner, so a second upload of
+// the same row (re-armed on another node, or a stale task here) can neither take it over
+// nor finalize under it. Each attempt is a new owner.
+func TestProcessSingleUpload_OneOwnerFromGateToFinalize(t *testing.T) {
+	shortLease(t, 5*time.Millisecond, time.Second)
+	worker, rdb, s3, _, _ := setupTestWorker(t)
+
+	var mu sync.Mutex
+	var gated []string
+	seen := map[string][]string{} // owner -> the calls that named it
+	note := func(call, owner string) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen[owner] = append(seen[owner], call)
+	}
+	rdb.PassS3WriteGateFunc = func(ctx context.Context, pendingID, accountID int64, contentHash, owner string, ttl time.Duration) (db.S3WriteGate, error) {
+		mu.Lock()
+		gated = append(gated, owner)
+		mu.Unlock()
+		note("gate", owner)
+		return db.S3WriteOpen, nil
+	}
+	rdb.RenewPendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, owner string, ttl time.Duration) (bool, error) {
+		note("renew", owner)
+		return true, nil
+	}
+	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
+		note("finalize", owner)
+		return nil
+	}
+	rdb.ReleasePendingUploadLeaseFunc = func(ctx context.Context, pendingID int64, owner string) error {
+		note("release", owner)
+		return nil
+	}
+
+	// A successful upload with a slow transfer, then a failed one.
+	stageGateTestBody(t, worker)
+	s3.PutWithRetryFunc = func(ctx context.Context, key string, reader io.Reader, size int64) error {
+		time.Sleep(30 * time.Millisecond)
+		return nil
+	}
+	require.Equal(t, uploadDone, worker.processSingleUpload(context.Background(), gateTestUpload()))
+	stageGateTestBody(t, worker)
+	s3.PutWithRetryFunc = func(ctx context.Context, key string, reader io.Reader, size int64) error {
+		return errors.New("503 SlowDown")
+	}
+	require.Equal(t, uploadRetryLater, worker.processSingleUpload(context.Background(), gateTestUpload()))
+
+	require.Len(t, gated, 2)
+	assert.NotEqual(t, gated[0], gated[1], "every attempt is a new owner")
+	for _, owner := range gated {
+		assert.True(t, strings.HasPrefix(owner, "test-instance/"), "the owner names the instance for an operator: %q", owner)
+	}
+	assert.Contains(t, seen[gated[0]], "renew")
+	assert.Equal(t, "finalize", seen[gated[0]][len(seen[gated[0]])-1], "the first attempt finalizes as the owner it was granted")
+	assert.Equal(t, []string{"gate", "release"}, seen[gated[1]], "the failed attempt releases only its own lease")
+	assert.Len(t, seen, 2, "no call names an owner the gate did not grant")
+}
+
+// An upload with nothing left to write still drops the pending row when it finalizes, so
+// it too must hold the row's lease first: otherwise it could drop the row under another
+// upload of the body still writing.
+func TestProcessSingleUpload_NothingToWriteStillTakesTheLease(t *testing.T) {
+	worker, rdb, _, _, _ := setupTestWorker(t)
+	rdb.PendingUploadKeysFunc = func(ctx context.Context, contentHash string, accountID int64) ([]string, error) {
+		return nil, nil
+	}
+	var finalized bool
+	rdb.CompleteLeasedS3UploadWithRetryFunc = func(ctx context.Context, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
+		finalized = true
+		return nil
+	}
+
+	rdb.PassS3WriteGateFunc = func(ctx context.Context, pendingID, accountID int64, contentHash, owner string, ttl time.Duration) (db.S3WriteGate, error) {
+		return db.S3WriteBusy, nil // another upload of the body holds the lease
+	}
+	assert.Equal(t, uploadSkipped, worker.processSingleUpload(context.Background(), gateTestUpload()))
+	assert.False(t, finalized, "the row is another upload's while it holds the lease")
+
+	rdb.PassS3WriteGateFunc = nil
+	assert.Equal(t, uploadDone, worker.processSingleUpload(context.Background(), gateTestUpload()))
+	assert.True(t, finalized)
 }
