@@ -3,7 +3,7 @@
 // This package wraps Go's standard library slog for high-performance
 // structured logging with support for multiple outputs:
 //   - Console (stdout/stderr)
-//   - File (with automatic rotation)
+//   - File (reopened on SIGHUP, so newsyslog or logrotate can rotate it)
 //   - Syslog (local or remote)
 //
 // # Initialization
@@ -82,6 +82,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"unicode"
 
@@ -151,6 +152,74 @@ func needsQuoting(s string) bool {
 // because tests re-Initialize or Swap it while servers from earlier tests still log.
 var globalLogger atomic.Pointer[slog.Logger]
 
+// fileOutput is the file output, when the configured output is a path; nil
+// otherwise. Atomic because Reopen runs from the signal-handling goroutine.
+var fileOutput atomic.Pointer[LogFile]
+
+// LogFile is a log output that can be reopened under the running handler.
+// newsyslog renames the file and then signals the process; writing on
+// through the old descriptor would fill the rotated file, which is then
+// compressed and lost.
+type LogFile struct {
+	mu   sync.Mutex
+	path string
+	f    *os.File
+}
+
+func openLogFile(path string) (*LogFile, error) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &LogFile{path: path, f: f}, nil
+}
+
+// Name returns the path of the log file.
+func (lf *LogFile) Name() string { return lf.path }
+
+func (lf *LogFile) Write(p []byte) (int, error) {
+	lf.mu.Lock()
+	defer lf.mu.Unlock()
+	return lf.f.Write(p)
+}
+
+// Close closes the current descriptor.
+func (lf *LogFile) Close() error {
+	lf.mu.Lock()
+	defer lf.mu.Unlock()
+	return lf.f.Close()
+}
+
+// reopen opens the path afresh and makes the current descriptor refer to the
+// new file. Every holder of that descriptor (the slog handler, os.Stdout and
+// os.Stderr as Initialize set them, a log.Logger built on them) writes to the
+// new file from here on, with nothing swapped under it. On failure the old
+// file stays, so logging never stops over a rotation gone wrong.
+func (lf *LogFile) reopen() error {
+	f, err := os.OpenFile(lf.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("reopen log file %s: %w", lf.path, err)
+	}
+	defer f.Close()
+	lf.mu.Lock()
+	defer lf.mu.Unlock()
+	if err := redirect(f, lf.f); err != nil {
+		return fmt.Errorf("reopen log file %s: %w", lf.path, err)
+	}
+	return nil
+}
+
+// Reopen closes and reopens the log file after a rotation tool such as
+// newsyslog has moved it aside; main calls it on SIGHUP. A no-op when the
+// output is not a file.
+func Reopen() error {
+	lf := fileOutput.Load()
+	if lf == nil {
+		return nil
+	}
+	return lf.reopen()
+}
+
 // syslogHandler wraps syslog.Writer to implement slog.Handler
 type syslogHandler struct {
 	writer *syslog.Writer
@@ -213,9 +282,12 @@ func (h *syslogHandler) WithGroup(name string) slog.Handler {
 	}
 }
 
-// Initialize sets up the global logger based on configuration
-func Initialize(cfg config.LoggingConfig) (*os.File, error) {
-	var logFile *os.File
+// Initialize sets up the global logger based on configuration. With a file
+// path as output it returns the file, which Reopen swaps on SIGHUP; nil
+// otherwise.
+func Initialize(cfg config.LoggingConfig) (*LogFile, error) {
+	var logFile *LogFile
+	fileOutput.Store(nil)
 
 	// Determine output
 	output := cfg.Output
@@ -288,7 +360,7 @@ func Initialize(cfg config.LoggingConfig) (*os.File, error) {
 	default:
 		// Assume it's a file path
 		var err error
-		logFile, err = os.OpenFile(output, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		logFile, err = openLogFile(output)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "WARNING: failed to open log file '%s': %v. Falling back to stderr.\n", output, err)
 			if format == "json" {
@@ -304,8 +376,9 @@ func Initialize(cfg config.LoggingConfig) (*os.File, error) {
 				handler = slog.NewTextHandler(logFile, handlerOpts)
 			}
 			// Redirect stdout and stderr to log file
-			os.Stdout = logFile
-			os.Stderr = logFile
+			os.Stdout = logFile.f
+			os.Stderr = logFile.f
+			fileOutput.Store(logFile)
 		}
 	}
 

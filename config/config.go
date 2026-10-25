@@ -1075,7 +1075,7 @@ type ServersConfig struct {
 
 // LoggingConfig holds logging configuration
 type LoggingConfig struct {
-	Output string `toml:"output"` // Log output: "stderr", "stdout", "syslog", or file path
+	Output string `toml:"output"` // Log output: "stderr", "stdout", "syslog", or file path (reopened on SIGHUP for log rotation)
 	Format string `toml:"format"` // Log format: "json" or "console"
 	Level  string `toml:"level"`  // Log level: "debug", "info", "warn", "error"
 }

@@ -1,10 +1,16 @@
 package logger
 
 import (
+	"fmt"
+	"log"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/config"
 )
 
 // TestSanitizeSyslogLine verifies CR/LF are collapsed so attacker-controlled fields
@@ -48,5 +54,67 @@ func TestFormatSyslogMessage(t *testing.T) {
 	}
 	if strings.ContainsAny(got, "\r\n") {
 		t.Errorf("formatted message contains a raw CR/LF: %q", got)
+	}
+}
+
+// After newsyslog has renamed the log file, Reopen must send later lines to a
+// fresh file at the configured path, not on into the rotated one.
+func TestReopenFollowsRotation(t *testing.T) {
+	// Initialize points the process's stdout and stderr at the log file.
+	stdout, stderr := os.Stdout, os.Stderr
+	t.Cleanup(func() { os.Stdout, os.Stderr = stdout, stderr })
+
+	path := filepath.Join(t.TempDir(), "sora.log")
+	lf, err := Initialize(config.LoggingConfig{Output: path, Format: "console", Level: "info"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { lf.Close() })
+
+	// What holds the descriptor before the rotation must follow the reopen:
+	// the error handler keeps a log.Logger on os.Stderr, the servers' debug
+	// output os.Stdout.
+	held := log.New(os.Stderr, "", 0)
+
+	Info("before rotation")
+	rotated := path + ".0"
+	if err := os.Rename(path, rotated); err != nil {
+		t.Fatal(err)
+	}
+	if err := Reopen(); err != nil {
+		t.Fatal(err)
+	}
+	Info("after reopen")
+	held.Print("held after reopen")
+	fmt.Fprintln(os.Stdout, "stdout after reopen")
+
+	current, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("no new log file after Reopen: %v", err)
+	}
+	for _, want := range []string{"after reopen", "held after reopen", "stdout after reopen"} {
+		if !strings.Contains(string(current), want) {
+			t.Fatalf("new file lacks %q: %q", want, current)
+		}
+	}
+	if strings.Contains(string(current), "before rotation") {
+		t.Fatalf("new file has %q", current)
+	}
+	old, err := os.ReadFile(rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(old), "before rotation") || strings.Contains(string(old), "after reopen") {
+		t.Fatalf("rotated file has %q", old)
+	}
+}
+
+// Reopen on a non-file output has nothing to do and must not fail.
+func TestReopenWithoutFile(t *testing.T) {
+	if _, err := Initialize(config.LoggingConfig{Output: "stderr"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Reopen(); err != nil {
+		t.Fatal(err)
 	}
 }
