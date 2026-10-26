@@ -124,6 +124,18 @@ func TestLMTP_SieveRedirect_RateLimited(t *testing.T) {
 // queue and an explicit redirect rate limit, returning its address.
 func startTestLMTPServerWithRedirect(t *testing.T, rdb *resilient.ResilientDatabase, rq *captureRelayQueue, limit int, window time.Duration) string {
 	t.Helper()
+	addr, _ := startTestLMTPServerWithOptions(t, rdb, lmtpserver.LMTPServerOptions{
+		RelayQueue:         rq,
+		RedirectRateLimit:  limit,
+		RedirectRateWindow: window,
+	})
+	return addr
+}
+
+// startTestLMTPServerWithOptions starts an LMTP server backed by rdb with opts,
+// returning its address and its uploader, whose staged files hold the stored bytes.
+func startTestLMTPServerWithOptions(t *testing.T, rdb *resilient.ResilientDatabase, opts lmtpserver.LMTPServerOptions) (string, *uploader.UploadWorker) {
+	t.Helper()
 	up, err := uploader.NewWithS3Interface(
 		t.TempDir(), 10, 2, 3, time.Second, 0, "test-instance", rdb,
 		&common.NoopUploaderS3{}, &common.NoopUploaderCache{}, make(chan error, 1),
@@ -133,11 +145,7 @@ func startTestLMTPServerWithRedirect(t *testing.T, rdb *resilient.ResilientDatab
 	}
 	addr := common.GetRandomAddress(t)
 	srv, err := lmtpserver.New(context.Background(), "test-lmtp-redirect", "localhost", addr,
-		&storage.S3Storage{}, rdb, up, lmtpserver.LMTPServerOptions{
-			RelayQueue:         rq,
-			RedirectRateLimit:  limit,
-			RedirectRateWindow: window,
-		})
+		&storage.S3Storage{}, rdb, up, opts)
 	if err != nil {
 		t.Fatalf("lmtp new: %v", err)
 	}
@@ -145,5 +153,5 @@ func startTestLMTPServerWithRedirect(t *testing.T, rdb *resilient.ResilientDatab
 	errChan := make(chan error, 1)
 	go srv.Start(errChan)
 	waitForLMTPListener(t, addr, errChan)
-	return addr
+	return addr, up
 }

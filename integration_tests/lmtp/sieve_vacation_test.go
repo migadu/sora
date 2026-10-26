@@ -5,12 +5,14 @@ package lmtp_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/resilient"
+	lmtpserver "github.com/migadu/sora/server/lmtp"
 )
 
 // TestLMTP_SieveVacation_AlongsideOtherActions is issue #113's reproduction driven
@@ -129,6 +131,99 @@ func TestLMTP_SieveVacation_AlongsideOtherActions(t *testing.T) {
 				t.Errorf("the message must be stored once in %s, found it in %v", tc.stored, got)
 			}
 		})
+	}
+}
+
+// TestLMTP_SieveDefaultFilingKeepsUserEditsAndFlags: when the user script ends in
+// the implicit keep, the default script's filing stands, and what else the user
+// script did still happens: its flags, its header edits, and its vacation, which sees
+// those edits (RFC 5293 §7). An Auto-Submitted header the user adds therefore
+// suppresses the reply. Only the reply used to be carried over to the default's
+// result, so the message was filed without the user's flags and edits, and replied to.
+func TestLMTP_SieveDefaultFilingKeepsUserEditsAndFlags(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	imapSrv, account := common.SetupIMAPServer(t)
+	defer imapSrv.Close()
+	rdb := imapSrv.ResilientDB
+	ctx := context.Background()
+
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	if err != nil {
+		t.Fatalf("account id: %v", err)
+	}
+	if _, err := rdb.GetOrCreateMailboxByNameWithRetry(ctx, accountID, "Junk"); err != nil {
+		t.Fatalf("create Junk: %v", err)
+	}
+	for _, table := range []string{"sieve_scripts", "vacation_responses"} {
+		if _, err := rdb.ExecWithRetry(ctx, "DELETE FROM "+table+" WHERE account_id = $1", accountID); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
+	}
+	script := strings.Join([]string{
+		`require ["vacation", "editheader", "imap4flags"];`,
+		`addheader "Auto-Submitted" "auto-generated";`,
+		`addheader "X-User-Edit" "kept";`,
+		`addflag "UserTag";`,
+		`vacation :days 1 "I am away until Monday.";`,
+	}, "\r\n") + "\r\n"
+	if _, err := rdb.ExecWithRetry(ctx, `
+		INSERT INTO sieve_scripts (account_id, name, script, active, created_at, updated_at)
+		VALUES ($1, $2, $3, true, NOW(), NOW())`,
+		accountID, "edits-and-away", script); err != nil {
+		t.Fatalf("insert sieve: %v", err)
+	}
+
+	rq := &captureRelayQueue{}
+	lmtpAddr, up := startTestLMTPServerWithOptions(t, rdb, lmtpserver.LMTPServerOptions{
+		RelayQueue: rq,
+		// default.sieve's extensions, and editheader and imap4flags for the user script.
+		SieveExtensions: []string{"fileinto", "envelope", "mailbox", "subaddress", "variables", "vacation", "editheader", "imap4flags"},
+	})
+
+	stamp := time.Now().UnixNano()
+	sender := fmt.Sprintf("sender-%d@example.com", stamp)
+	subject := fmt.Sprintf("cheap %d", stamp)
+	msg := strings.Join([]string{
+		"From: " + sender,
+		"To: " + account.Email,
+		"Subject: " + subject,
+		fmt.Sprintf("Message-ID: <%d@example.com>", stamp),
+		"X-Spam: Yes",
+		"",
+		"body",
+	}, "\r\n")
+	if resp := deliverLMTPRaw(t, lmtpAddr, sender, account.Email, msg); !strings.HasPrefix(resp, "250") {
+		t.Fatalf("delivery not accepted: %s", resp)
+	}
+
+	var mailbox, flags, contentHash string
+	if err := rdb.QueryRowWithRetry(ctx, `
+		SELECT mb.name, ms.custom_flags::text, m.content_hash
+		FROM messages m
+		JOIN message_state ms ON ms.message_id = m.id
+		JOIN mailboxes mb ON mb.id = m.mailbox_id
+		WHERE mb.account_id = $1 AND m.subject = $2 AND m.expunged_at IS NULL
+	`, accountID, subject).Scan(&mailbox, &flags, &contentHash); err != nil {
+		t.Fatalf("find message: %v", err)
+	}
+	if mailbox != "Junk" {
+		t.Errorf("the default script's filing must stand: stored in %s, want Junk", mailbox)
+	}
+	if !strings.Contains(strings.ToLower(flags), "usertag") {
+		t.Errorf("the user's flag was dropped: custom flags %s", flags)
+	}
+	stored, err := os.ReadFile(up.FilePath(contentHash, accountID))
+	if err != nil {
+		t.Fatalf("read stored message: %v", err)
+	}
+	if !strings.Contains(string(stored), "X-User-Edit: kept") {
+		t.Errorf("the user's header edit was dropped from the stored message")
+	}
+	for _, it := range rq.items() {
+		if it.msgType == "vacation" {
+			t.Errorf("the user's Auto-Submitted header must suppress the reply, got %+v", it)
+		}
 	}
 }
 

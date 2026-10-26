@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -692,10 +693,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				// Otherwise, the user script overrides the default
 				if userResult.Action == sieveengine.ActionKeep && result.Action != sieveengine.ActionKeep {
 					s.InfoLog("user sieve implicit keep - preserving default script action", "default_action", result.Action, "vacation", userResult.Vacation != nil)
-					// Keep the default script's action, and still send the user's vacation
-					// reply: it is no action on the message, and goes out whatever happens
-					// to it (RFC 5230 §4.7).
-					result.Vacation = userResult.Vacation
+					result = keepDefaultAction(result, userResult)
 				} else {
 					// User script has an explicit action, override the default
 					result = userResult
@@ -1012,6 +1010,34 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	recordMetrics("success")
 	return nil
+}
+
+// keepDefaultAction merges the result of a user script that ended in the implicit
+// keep into the default script's, whose action then stands: the user script only
+// left where the message goes to the default. Everything else it did still happens,
+// after the default script's work as the two ran: its flags join the default's, its
+// header edits follow the default's, and its vacation reply goes out (RFC 5230 §4.7),
+// seeing those edits as RFC 5293 §7 requires.
+func keepDefaultAction(defaultResult, userResult sieveengine.Result) sieveengine.Result {
+	merged := defaultResult
+	merged.Flags = mergeFlags(defaultResult.Flags, userResult.Flags)
+	merged.HeaderEdits = slices.Concat(defaultResult.HeaderEdits, userResult.HeaderEdits)
+	merged.Vacation = userResult.Vacation
+	return merged
+}
+
+// mergeFlags returns a's flags, then b's, without repeats. Flag names are
+// case-insensitive (RFC 5232 §3), and the first spelling seen is kept.
+func mergeFlags(a, b []string) []string {
+	merged := make([]string, 0, len(a)+len(b))
+	seen := make(map[string]bool, len(a)+len(b))
+	for _, flag := range slices.Concat(a, b) {
+		if key := strings.ToLower(flag); !seen[key] {
+			seen[key] = true
+			merged = append(merged, flag)
+		}
+	}
+	return merged
 }
 
 // logSieveAction records what the default or the user script decided.
