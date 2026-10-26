@@ -16,7 +16,7 @@ import (
 
 // VacationHandler interface defines the contract for handling vacation responses.
 type VacationHandler interface {
-	HandleVacationResponse(ctx context.Context, AccountID int64, result sieveengine.Result, fromAddr *server.Address, toAddress *server.Address, originalMessage *message.Entity) error
+	HandleVacationResponse(ctx context.Context, AccountID int64, reply sieveengine.VacationReply, fromAddr *server.Address, toAddress *server.Address, originalMessage *message.Entity) error
 }
 
 // StandardVacationHandler implements the standard vacation response handling.
@@ -127,7 +127,7 @@ func (h *StandardVacationHandler) resolveVacationFrom(ctx context.Context, accou
 }
 
 // HandleVacationResponse handles vacation auto-response.
-func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, AccountID int64, result sieveengine.Result, fromAddr *server.Address, toAddress *server.Address, originalMessage *message.Entity) error {
+func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, AccountID int64, reply sieveengine.VacationReply, fromAddr *server.Address, toAddress *server.Address, originalMessage *message.Entity) error {
 	if h.RelayHandler == nil && h.RelayQueue == nil {
 		h.log("[VACATION] external relay not configured, cannot send vacation response")
 		return nil
@@ -156,13 +156,13 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 	// Create vacation response message. A user-supplied ":from" is honored only if it
 	// is an address the account owns; otherwise fall back to the delivered-to address.
 	vacationFrom := toAddress.FullAddress()
-	if owned := h.resolveVacationFrom(ctx, AccountID, result.VacationFrom); owned != "" {
+	if owned := h.resolveVacationFrom(ctx, AccountID, reply.From); owned != "" {
 		vacationFrom = owned
 	}
 
 	vacationSubject := "Auto: Out of Office"
-	if result.VacationSubj != "" {
-		vacationSubject = result.VacationSubj
+	if reply.Subject != "" {
+		vacationSubject = reply.Subject
 	}
 
 	// Build vacation message
@@ -191,7 +191,7 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 	if err != nil {
 		return err
 	}
-	if _, err := w.Write([]byte(result.VacationMsg)); err != nil {
+	if _, err := w.Write([]byte(reply.Body)); err != nil {
 		w.Close()
 		return err
 	}
@@ -202,8 +202,8 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 	// handoff, not after — a record lost between the two would let a redelivery of
 	// this same message produce a second reply. A record that cannot be written
 	// blocks the reply rather than risking an unbounded series of them.
-	if result.RecordVacationSent != nil {
-		if err := result.RecordVacationSent(ctx); err != nil {
+	if reply.RecordSent != nil {
+		if err := reply.RecordSent(ctx); err != nil {
 			h.log("[VACATION] not sending: %v", err)
 			return err
 		}

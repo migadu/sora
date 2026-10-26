@@ -60,8 +60,8 @@ vacation :days 7 :subject "Away" "I am away";
 `
 
 // evaluateVacation runs a vacation script the way a delivery does and returns the
-// resulting sieve action.
-func evaluateVacation(t *testing.T, oracle *fakeVacationOracle, sender string) sieveengine.Result {
+// reply it asks for.
+func evaluateVacation(t *testing.T, oracle *fakeVacationOracle, sender string) sieveengine.VacationReply {
 	t.Helper()
 	executor, err := sieveengine.NewSieveExecutorWithOracleAndExtensions(vacationScript, 42, oracle, oracle, 10, time.Hour, 0, []string{"vacation"})
 	if err != nil {
@@ -76,10 +76,10 @@ func evaluateVacation(t *testing.T, oracle *fakeVacationOracle, sender string) s
 	if err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
-	if result.Action != sieveengine.ActionVacation {
-		t.Fatalf("action = %s, want %s", result.Action, sieveengine.ActionVacation)
+	if result.Vacation == nil {
+		t.Fatalf("no vacation reply (action %s)", result.Action)
 	}
-	return result
+	return *result.Vacation
 }
 
 // TestVacationSuppressionRecordedOnlyOnSend covers the RFC 5230 §4.5 per-sender period:
@@ -96,14 +96,14 @@ func TestVacationSuppressionRecordedOnlyOnSend(t *testing.T) {
 
 	t.Run("handler suppresses the reply -> window not consumed", func(t *testing.T) {
 		oracle := &fakeVacationOracle{}
-		result := evaluateVacation(t, oracle, "bob@external.com")
+		reply := evaluateVacation(t, oracle, "bob@external.com")
 
 		rq := &orderedRelayQueue{oracle: oracle}
 		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
 		// The account is not in To/Cc, so HandleVacationResponse must not reply.
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "To": "list@example.com"})
 
-		if err := h.HandleVacationResponse(context.Background(), 42, result, sender, toAddress, orig); err != nil {
+		if err := h.HandleVacationResponse(context.Background(), 42, reply, sender, toAddress, orig); err != nil {
 			t.Fatalf("HandleVacationResponse: %v", err)
 		}
 		if rq.calls != 0 {
@@ -116,12 +116,12 @@ func TestVacationSuppressionRecordedOnlyOnSend(t *testing.T) {
 
 	t.Run("relay not configured -> window not consumed", func(t *testing.T) {
 		oracle := &fakeVacationOracle{}
-		result := evaluateVacation(t, oracle, "bob@external.com")
+		reply := evaluateVacation(t, oracle, "bob@external.com")
 
 		h := &StandardVacationHandler{Hostname: "m", IsOwnedAddress: ownsJane}
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "To": owner})
 
-		if err := h.HandleVacationResponse(context.Background(), 42, result, sender, toAddress, orig); err != nil {
+		if err := h.HandleVacationResponse(context.Background(), 42, reply, sender, toAddress, orig); err != nil {
 			t.Fatalf("HandleVacationResponse: %v", err)
 		}
 		if len(oracle.recorded) != 0 {
@@ -131,13 +131,13 @@ func TestVacationSuppressionRecordedOnlyOnSend(t *testing.T) {
 
 	t.Run("reply sent -> window consumed once, before the handoff", func(t *testing.T) {
 		oracle := &fakeVacationOracle{}
-		result := evaluateVacation(t, oracle, "bob@external.com")
+		reply := evaluateVacation(t, oracle, "bob@external.com")
 
 		rq := &orderedRelayQueue{oracle: oracle}
 		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "To": owner})
 
-		if err := h.HandleVacationResponse(context.Background(), 42, result, sender, toAddress, orig); err != nil {
+		if err := h.HandleVacationResponse(context.Background(), 42, reply, sender, toAddress, orig); err != nil {
 			t.Fatalf("HandleVacationResponse: %v", err)
 		}
 		if rq.calls != 1 {
@@ -171,13 +171,13 @@ func TestVacationSuppressionRecordedOnlyOnSend(t *testing.T) {
 
 	t.Run("recording fails -> no reply is handed off", func(t *testing.T) {
 		oracle := &fakeVacationOracle{recordErr: errors.New("db down")}
-		result := evaluateVacation(t, oracle, "bob@external.com")
+		reply := evaluateVacation(t, oracle, "bob@external.com")
 
 		rq := &orderedRelayQueue{oracle: oracle}
 		h := &StandardVacationHandler{Hostname: "m", RelayQueue: rq, IsOwnedAddress: ownsJane}
 		orig := makeMessage(map[string]string{"From": "bob@external.com", "To": owner})
 
-		if err := h.HandleVacationResponse(context.Background(), 42, result, sender, toAddress, orig); err == nil {
+		if err := h.HandleVacationResponse(context.Background(), 42, reply, sender, toAddress, orig); err == nil {
 			t.Fatalf("expected an error when the suppression record cannot be written")
 		}
 		if rq.calls != 0 {

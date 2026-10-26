@@ -15,18 +15,17 @@ import (
 func TestVacationMessageConstruction(t *testing.T) {
 	tests := []struct {
 		name           string
-		vacationResult sieveengine.Result
+		vacationResult sieveengine.VacationReply
 		expectedFrom   string
 		expectedSubj   string
 		expectedBody   string
 	}{
 		{
 			name: "Basic vacation message",
-			vacationResult: sieveengine.Result{
-				Action:       sieveengine.ActionVacation,
-				VacationFrom: "user@example.com",
-				VacationSubj: "Out of Office",
-				VacationMsg:  "I'm away. Will respond when I return.",
+			vacationResult: sieveengine.VacationReply{
+				From:    "user@example.com",
+				Subject: "Out of Office",
+				Body:    "I'm away. Will respond when I return.",
 			},
 			expectedFrom: "user@example.com",
 			expectedSubj: "Out of Office",
@@ -34,11 +33,10 @@ func TestVacationMessageConstruction(t *testing.T) {
 		},
 		{
 			name: "Vacation with multiline body",
-			vacationResult: sieveengine.Result{
-				Action:       sieveengine.ActionVacation,
-				VacationFrom: "user@example.com",
-				VacationSubj: "Auto Reply",
-				VacationMsg:  "Thank you for your email.\n\nI am currently out of the office.\nI will respond when I return.",
+			vacationResult: sieveengine.VacationReply{
+				From:    "user@example.com",
+				Subject: "Auto Reply",
+				Body:    "Thank you for your email.\n\nI am currently out of the office.\nI will respond when I return.",
 			},
 			expectedFrom: "user@example.com",
 			expectedSubj: "Auto Reply",
@@ -46,11 +44,10 @@ func TestVacationMessageConstruction(t *testing.T) {
 		},
 		{
 			name: "Vacation with special characters",
-			vacationResult: sieveengine.Result{
-				Action:       sieveengine.ActionVacation,
-				VacationFrom: "user@example.com",
-				VacationSubj: "Out of Office: Réponse automatique",
-				VacationMsg:  "Bonjour,\n\nJe suis absent(e). Réponse différée.\n\nMerci!",
+			vacationResult: sieveengine.VacationReply{
+				From:    "user@example.com",
+				Subject: "Out of Office: Réponse automatique",
+				Body:    "Bonjour,\n\nJe suis absent(e). Réponse différée.\n\nMerci!",
 			},
 			expectedFrom: "user@example.com",
 			expectedSubj: "Out of Office: Réponse automatique",
@@ -63,9 +60,9 @@ func TestVacationMessageConstruction(t *testing.T) {
 			// Construct vacation message like handleVacationResponse does
 			var vacationMessage bytes.Buffer
 			var h message.Header
-			h.Set("From", tt.vacationResult.VacationFrom)
+			h.Set("From", tt.vacationResult.From)
 			h.Set("To", "sender@example.com")
-			h.Set("Subject", tt.vacationResult.VacationSubj)
+			h.Set("Subject", tt.vacationResult.Subject)
 			messageID := "<test.vacation@example.com>"
 			h.Set("Message-ID", messageID)
 			h.Set("Auto-Submitted", "auto-replied")
@@ -78,7 +75,7 @@ func TestVacationMessageConstruction(t *testing.T) {
 				t.Fatalf("Failed to create message writer: %v", err)
 			}
 
-			_, err = w.Write([]byte(tt.vacationResult.VacationMsg))
+			_, err = w.Write([]byte(tt.vacationResult.Body))
 			if err != nil {
 				w.Close()
 				t.Fatalf("Failed to write vacation message body: %v", err)

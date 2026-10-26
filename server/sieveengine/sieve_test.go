@@ -333,133 +333,83 @@ if not header :contains "precedence" ["list", "bulk", "junk"] {
 	}
 
 	// The bug was that this returned ActionDiscard
-	// Correct behavior: vacation is an implicit keep (RFC 5230)
-	if result.Action != ActionVacation {
-		t.Errorf("Expected action %s, got %s - vacation should be implicit keep, not discard", ActionVacation, result.Action)
+	// Correct behavior: vacation does not cancel the implicit keep (RFC 5230 §4.7)
+	if result.Action != ActionKeep {
+		t.Errorf("Expected action %s, got %s - vacation should be implicit keep, not discard", ActionKeep, result.Action)
 	}
 
-	if result.VacationSubj != "Out of Office" {
-		t.Errorf("Expected vacation subject 'Out of Office', got %s", result.VacationSubj)
+	if result.Vacation == nil {
+		t.Fatalf("Expected a vacation reply")
+	}
+	if result.Vacation.Subject != "Out of Office" {
+		t.Errorf("Expected vacation subject 'Out of Office', got %s", result.Vacation.Subject)
 	}
 
 	expectedMsg := "Thank you for your email. I am currently out of the office and will get back to you shortly."
-	if result.VacationMsg != expectedMsg {
-		t.Errorf("Expected vacation message %q, got %q", expectedMsg, result.VacationMsg)
+	if result.Vacation.Body != expectedMsg {
+		t.Errorf("Expected vacation message %q, got %q", expectedMsg, result.Vacation.Body)
 	}
 }
 
-func TestVacationWithExplicitKeep(t *testing.T) {
-	script := `
-require "vacation";
-vacation :days 1 :subject "Away" "I'm away";
-keep;
-`
-
-	oracle := newMockVacationOracle()
-	enabledExtensions := []string{"vacation"}
-	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, 0, enabledExtensions)
-	if err != nil {
-		t.Fatalf("Failed to create executor: %v", err)
+// TestVacationAlongsideEveryAction is issue #113: the reply used to be one more
+// Action, taken only when the script did nothing else with the message, so a message
+// it filed, redirected or discarded got none. RFC 5230 §4.7: vacation "does not affect
+// Sieve's implicit keep action", and "Implementations MUST NOT consider vacation used
+// with discard, keep, fileinto, or redirect an error."
+func TestVacationAlongsideEveryAction(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string // what the script does after the vacation
+		want    Result // only Action, Mailbox, RedirectTo and Copy are compared
+	}{
+		{name: "implicit keep", want: Result{Action: ActionKeep}},
+		{name: "keep", command: `keep;`, want: Result{Action: ActionKeep}},
+		{name: "fileinto", command: `fileinto "Archive";`, want: Result{Action: ActionFileInto, Mailbox: "Archive"}},
+		{name: "fileinto :copy", command: `fileinto :copy "Archive";`, want: Result{Action: ActionFileInto, Mailbox: "Archive", Copy: true}},
+		{name: "redirect", command: `redirect "elsewhere@example.net";`, want: Result{Action: ActionRedirect, RedirectTo: "elsewhere@example.net"}},
+		{name: "discard", command: `discard;`, want: Result{Action: ActionDiscard}},
 	}
 
-	ctx := Context{
-		EnvelopeFrom: "sender@example.com",
-		EnvelopeTo:   "recipient@example.com",
-		Header: map[string][]string{
-			"Subject": {"Test"},
-			"From":    {"sender@example.com"},
-		},
-		Message: bodyOnly("Test body"),
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			script := "require [\"vacation\", \"fileinto\", \"copy\"];\n" +
+				"vacation :days 1 :subject \"Away\" \"I'm away\";\n" + tt.command + "\n"
+			oracle := newMockVacationOracle()
+			executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, 0, []string{"vacation", "fileinto", "copy"})
+			if err != nil {
+				t.Fatalf("Failed to create executor: %v", err)
+			}
+
+			result, err := executor.Evaluate(context.Background(), Context{
+				EnvelopeFrom: "sender@example.com",
+				EnvelopeTo:   "recipient@example.com",
+				Header: map[string][]string{
+					"Subject": {"Test"},
+					"From":    {"sender@example.com"},
+				},
+				Message: bodyOnly("Test body"),
+			})
+			if err != nil {
+				t.Fatalf("Failed to evaluate script: %v", err)
+			}
+
+			if result.Action != tt.want.Action || result.Mailbox != tt.want.Mailbox ||
+				result.RedirectTo != tt.want.RedirectTo || result.Copy != tt.want.Copy {
+				t.Errorf("got action %s mailbox %q redirect %q copy %v, want %s %q %q %v",
+					result.Action, result.Mailbox, result.RedirectTo, result.Copy,
+					tt.want.Action, tt.want.Mailbox, tt.want.RedirectTo, tt.want.Copy)
+			}
+			if result.Vacation == nil {
+				t.Fatalf("the vacation reply was dropped next to %s", result.Action)
+			}
+			if result.Vacation.Subject != "Away" || result.Vacation.Body != "I'm away" {
+				t.Errorf("reply subject %q body %q, want \"Away\" \"I'm away\"", result.Vacation.Subject, result.Vacation.Body)
+			}
+			if result.Vacation.RecordSent == nil {
+				t.Errorf("expected a recorder to commit the :days window with")
+			}
+		})
 	}
-
-	result, err := executor.Evaluate(context.Background(), ctx)
-	if err != nil {
-		t.Fatalf("Failed to evaluate script: %v", err)
-	}
-
-	// Vacation should be the action
-	if result.Action != ActionVacation {
-		t.Errorf("Expected action %s, got %s", ActionVacation, result.Action)
-	}
-}
-
-func TestVacationWithDiscard(t *testing.T) {
-	// When vacation is followed by explicit discard, discard should win
-	// The vacation command preserves ImplicitKeep=true, but discard sets it to false
-	script := `
-require "vacation";
-vacation :days 1 :subject "Away" "I'm away";
-discard;
-`
-
-	oracle := newMockVacationOracle()
-	enabledExtensions := []string{"vacation"}
-	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, 0, enabledExtensions)
-	if err != nil {
-		t.Fatalf("Failed to create executor: %v", err)
-	}
-
-	ctx := Context{
-		EnvelopeFrom: "sender@example.com",
-		EnvelopeTo:   "recipient@example.com",
-		Header: map[string][]string{
-			"Subject": {"Test"},
-			"From":    {"sender@example.com"},
-		},
-		Message: bodyOnly("Test body"),
-	}
-
-	result, err := executor.Evaluate(context.Background(), ctx)
-	if err != nil {
-		t.Fatalf("Failed to evaluate script: %v", err)
-	}
-
-	// Explicit discard should override vacation's implicit keep
-	if result.Action != ActionDiscard {
-		t.Errorf("Expected action %s, got %s - explicit discard should override vacation", ActionDiscard, result.Action)
-	}
-}
-
-func TestVacationWithFileinto(t *testing.T) {
-	script := `
-require ["vacation", "fileinto"];
-vacation :days 1 :subject "Away" "I'm away";
-fileinto "Archive";
-`
-
-	oracle := newMockVacationOracle()
-	enabledExtensions := []string{"vacation", "fileinto"}
-	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, oracle, oracle, 10, time.Hour, 0, enabledExtensions)
-	if err != nil {
-		t.Fatalf("Failed to create executor: %v", err)
-	}
-
-	ctx := Context{
-		EnvelopeFrom: "sender@example.com",
-		EnvelopeTo:   "recipient@example.com",
-		Header: map[string][]string{
-			"Subject": {"Test"},
-			"From":    {"sender@example.com"},
-		},
-		Message: bodyOnly("Test body"),
-	}
-
-	result, err := executor.Evaluate(context.Background(), ctx)
-	if err != nil {
-		t.Fatalf("Failed to evaluate script: %v", err)
-	}
-
-	// Fileinto should take precedence as the primary action
-	if result.Action != ActionFileInto {
-		t.Errorf("Expected action %s, got %s", ActionFileInto, result.Action)
-	}
-
-	if result.Mailbox != "Archive" {
-		t.Errorf("Expected mailbox Archive, got %s", result.Mailbox)
-	}
-
-	// Note: In a real implementation, we might want to track that vacation
-	// was also triggered, but current implementation only returns one action
 }
 
 func TestVacationRateLimiting(t *testing.T) {
@@ -491,15 +441,15 @@ vacation :days 7 :subject "Away" "I'm away";
 		t.Fatalf("Failed to evaluate script (first): %v", err)
 	}
 
-	if result1.Action != ActionVacation {
-		t.Errorf("First evaluation: Expected action %s, got %s", ActionVacation, result1.Action)
+	if result1.Vacation == nil {
+		t.Fatalf("First evaluation: expected a vacation reply")
 	}
 
 	// The window is consumed by the delivery path once the reply is handed off.
-	if result1.RecordVacationSent == nil {
+	if result1.Vacation.RecordSent == nil {
 		t.Fatalf("First evaluation: expected a recorder for the sent reply")
 	}
-	if err := result1.RecordVacationSent(context.Background()); err != nil {
+	if err := result1.Vacation.RecordSent(context.Background()); err != nil {
 		t.Fatalf("Failed to record vacation response: %v", err)
 	}
 
@@ -515,9 +465,12 @@ vacation :days 7 :subject "Away" "I'm away";
 		t.Fatalf("Failed to evaluate script (second): %v", err)
 	}
 
-	// Should fall back to implicit keep (vacation blocked by rate limit)
+	// The implicit keep, with no reply (vacation blocked by rate limit)
 	if result2.Action != ActionKeep {
-		t.Errorf("Second evaluation: Expected action %s (vacation rate limited), got %s", ActionKeep, result2.Action)
+		t.Errorf("Second evaluation: Expected action %s, got %s", ActionKeep, result2.Action)
+	}
+	if result2.Vacation != nil {
+		t.Errorf("Second evaluation: expected no vacation reply inside the :days window")
 	}
 }
 
@@ -549,10 +502,10 @@ vacation :days 7 :subject "Away" "I'm away";
 		if err != nil {
 			t.Fatalf("Evaluation %d: failed to evaluate script: %v", i, err)
 		}
-		if result.Action != ActionVacation {
-			t.Fatalf("Evaluation %d: expected action %s, got %s", i, ActionVacation, result.Action)
+		if result.Vacation == nil {
+			t.Fatalf("Evaluation %d: expected a vacation reply", i)
 		}
-		if result.RecordVacationSent == nil {
+		if result.Vacation.RecordSent == nil {
 			t.Fatalf("Evaluation %d: expected a recorder to commit the window with", i)
 		}
 	}
@@ -578,29 +531,26 @@ if not header :contains "precedence" ["list", "bulk", "junk"] {
 	}
 
 	tests := []struct {
-		name           string
-		precedence     string
-		expectedAction Action
+		name       string
+		precedence string
+		wantReply  bool
 	}{
 		{
-			name:           "Regular email - should send vacation",
-			precedence:     "",
-			expectedAction: ActionVacation,
+			name:       "Regular email - should send vacation",
+			precedence: "",
+			wantReply:  true,
 		},
 		{
-			name:           "List email - should not send vacation",
-			precedence:     "list",
-			expectedAction: ActionKeep,
+			name:       "List email - should not send vacation",
+			precedence: "list",
 		},
 		{
-			name:           "Bulk email - should not send vacation",
-			precedence:     "bulk",
-			expectedAction: ActionKeep,
+			name:       "Bulk email - should not send vacation",
+			precedence: "bulk",
 		},
 		{
-			name:           "Junk email - should not send vacation",
-			precedence:     "junk",
-			expectedAction: ActionKeep,
+			name:       "Junk email - should not send vacation",
+			precedence: "junk",
 		},
 	}
 
@@ -626,8 +576,11 @@ if not header :contains "precedence" ["list", "bulk", "junk"] {
 				t.Fatalf("Failed to evaluate script: %v", err)
 			}
 
-			if result.Action != tt.expectedAction {
-				t.Errorf("Expected action %s, got %s", tt.expectedAction, result.Action)
+			if result.Action != ActionKeep {
+				t.Errorf("Expected action %s, got %s", ActionKeep, result.Action)
+			}
+			if got := result.Vacation != nil; got != tt.wantReply {
+				t.Errorf("vacation reply = %v, want %v", got, tt.wantReply)
 			}
 		})
 	}
@@ -645,29 +598,24 @@ if header :contains "From" "@gmail.com" {
 `
 
 	tests := []struct {
-		name           string
-		headerKey      string // "From", "from", "FROM", etc.
-		expectedAction Action
+		name      string
+		headerKey string // "From", "from", "FROM", etc.
 	}{
 		{
-			name:           "Capital From (standard)",
-			headerKey:      "From",
-			expectedAction: ActionVacation,
+			name:      "Capital From (standard)",
+			headerKey: "From",
 		},
 		{
-			name:           "Lowercase from (LMTP normalized)",
-			headerKey:      "from",
-			expectedAction: ActionVacation,
+			name:      "Lowercase from (LMTP normalized)",
+			headerKey: "from",
 		},
 		{
-			name:           "Uppercase FROM",
-			headerKey:      "FROM",
-			expectedAction: ActionVacation,
+			name:      "Uppercase FROM",
+			headerKey: "FROM",
 		},
 		{
-			name:           "Mixed case FrOm",
-			headerKey:      "FrOm",
-			expectedAction: ActionVacation,
+			name:      "Mixed case FrOm",
+			headerKey: "FrOm",
 		},
 	}
 
@@ -698,12 +646,11 @@ if header :contains "From" "@gmail.com" {
 				t.Fatalf("Failed to evaluate script: %v", err)
 			}
 
-			if result.Action != tt.expectedAction {
-				t.Errorf("Expected action %s, got %s", tt.expectedAction, result.Action)
+			if result.Vacation == nil {
+				t.Fatalf("Expected a vacation reply")
 			}
-
-			if result.Action == ActionVacation && result.VacationSubj != "Gmail blocked" {
-				t.Errorf("Expected vacation subject 'Gmail blocked', got '%s'", result.VacationSubj)
+			if result.Vacation.Subject != "Gmail blocked" {
+				t.Errorf("Expected vacation subject 'Gmail blocked', got '%s'", result.Vacation.Subject)
 			}
 		})
 	}

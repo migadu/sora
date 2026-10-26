@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -691,8 +692,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				// If user script returns implicit keep (ActionKeep), preserve the default script's action
 				// Otherwise, the user script overrides the default
 				if userResult.Action == sieveengine.ActionKeep && result.Action != sieveengine.ActionKeep {
-					s.InfoLog("user sieve implicit keep - preserving default script action", "default_action", result.Action)
-					// Keep the default script result (don't override)
+					s.InfoLog("user sieve implicit keep - preserving default script action", "default_action", result.Action, "vacation", userResult.Vacation != nil)
+					result = keepDefaultAction(result, userResult)
 				} else {
 					// User script has an explicit action, override the default
 					result = userResult
@@ -707,16 +708,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		} else {
 			s.DebugLog("no active script found, using default script result")
 		}
-	}
-
-	// A discard, which an RFC 5429 reject is delivered as, stores nothing: decide
-	// it before header edits and before the body is staged for upload, where the
-	// abandoned file would sit until the orphan sweep and count against the
-	// staging limit.
-	if result.Action == sieveengine.ActionDiscard {
-		s.InfoLog("sieve message discarded")
-		recordMetrics("success")
-		return nil
 	}
 
 	// Apply header edits if any (RFC 5293 - editheader extension)
@@ -756,6 +747,25 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				s.DebugLog("message headers updated after edits", "content_hash", contentHash)
 			}
 		}
+	}
+
+	// The vacation reply goes out whatever happens to the message (RFC 5230 §4.7),
+	// a discarded one included, and after the header edits, which it has to see
+	// (RFC 5293 §7).
+	if result.Vacation != nil {
+		if err := s.handleVacationResponse(ctx, *result.Vacation, messageContent); err != nil {
+			s.DebugLog("error handling vacation response", "error", err)
+			// Continue processing even if vacation response fails
+		}
+	}
+
+	// A discard, which an RFC 5429 reject is delivered as, stores nothing: decide
+	// it before the body is staged for upload, where the abandoned file would sit
+	// until the orphan sweep and count against the staging limit.
+	if result.Action == sieveengine.ActionDiscard {
+		s.InfoLog("sieve message discarded")
+		recordMetrics("success")
+		return nil
 	}
 
 	// Store message locally for background upload to S3
@@ -910,16 +920,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		// Or if :copy is specified
 		mailboxName = consts.MailboxInbox
 
-	case sieveengine.ActionVacation:
-		// Handle vacation response
-		err := s.handleVacationResponse(ctx, result, messageContent)
-		if err != nil {
-			s.DebugLog("error handling vacation response", "error", err)
-			// Continue processing even if vacation response fails
-		}
-		// Store the original message in INBOX
-		mailboxName = consts.MailboxInbox
-
 	default:
 		s.DebugLog("sieve keep action")
 		mailboxName = consts.MailboxInbox
@@ -1012,6 +1012,34 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	return nil
 }
 
+// keepDefaultAction merges the result of a user script that ended in the implicit
+// keep into the default script's, whose action then stands: the user script only
+// left where the message goes to the default. Everything else it did still happens,
+// after the default script's work as the two ran: its flags join the default's, its
+// header edits follow the default's, and its vacation reply goes out (RFC 5230 §4.7),
+// seeing those edits as RFC 5293 §7 requires.
+func keepDefaultAction(defaultResult, userResult sieveengine.Result) sieveengine.Result {
+	merged := defaultResult
+	merged.Flags = mergeFlags(defaultResult.Flags, userResult.Flags)
+	merged.HeaderEdits = slices.Concat(defaultResult.HeaderEdits, userResult.HeaderEdits)
+	merged.Vacation = userResult.Vacation
+	return merged
+}
+
+// mergeFlags returns a's flags, then b's, without repeats. Flag names are
+// case-insensitive (RFC 5232 §3), and the first spelling seen is kept.
+func mergeFlags(a, b []string) []string {
+	merged := make([]string, 0, len(a)+len(b))
+	seen := make(map[string]bool, len(a)+len(b))
+	for _, flag := range slices.Concat(a, b) {
+		if key := strings.ToLower(flag); !seen[key] {
+			seen[key] = true
+			merged = append(merged, flag)
+		}
+	}
+	return merged
+}
+
 // logSieveAction records what the default or the user script decided.
 func (s *LMTPSession) logSieveAction(source string, result sieveengine.Result) {
 	switch result.Action {
@@ -1026,10 +1054,11 @@ func (s *LMTPSession) logSieveAction(source string, result sieveengine.Result) {
 		} else {
 			s.InfoLog(source + " sieve discard")
 		}
-	case sieveengine.ActionVacation:
-		s.InfoLog(source + " sieve vacation response triggered")
 	case sieveengine.ActionKeep:
 		s.InfoLog(source + " sieve keep")
+	}
+	if result.Vacation != nil {
+		s.InfoLog(source + " sieve vacation response triggered")
 	}
 }
 
@@ -1139,7 +1168,7 @@ func (s *LMTPSession) notifyRelayWorker() {
 // ":from" ownership constraint, RFC 2047 subject encoding, and message construction
 // all live there. The send decision and per-sender rate-limiting are handled upstream
 // by the Sieve engine's VacationOracle.
-func (s *LMTPSession) handleVacationResponse(ctx context.Context, result sieveengine.Result, originalMessage *message.Entity) error {
+func (s *LMTPSession) handleVacationResponse(ctx context.Context, reply sieveengine.VacationReply, originalMessage *message.Entity) error {
 	handler := &delivery.StandardVacationHandler{
 		Hostname:       s.HostName,
 		RelayQueue:     s.backend.relayQueue,
@@ -1147,7 +1176,7 @@ func (s *LMTPSession) handleVacationResponse(ctx context.Context, result sieveen
 		IsOwnedAddress: s.backend.rdb.IsAddressOwnedByAccountWithRetry,
 		RelayNotify:    s.notifyRelayWorker,
 	}
-	return handler.HandleVacationResponse(ctx, s.AccountID(), result, s.sender, &s.User.Address, originalMessage)
+	return handler.HandleVacationResponse(ctx, s.AccountID(), reply, s.sender, &s.User.Address, originalMessage)
 }
 
 // saveMessageToMailbox saves a message to the specified mailbox.
