@@ -376,6 +376,9 @@ func (s *Server) setupRoutes() http.Handler {
 	// Domain-scoped account management routes
 	mux.HandleFunc("/admin/domains/", s.handleDomainOperations)
 
+	// Usage: every account's storage, page by page
+	mux.HandleFunc("/admin/usage/accounts", routeHandler("GET", s.handleAccountUsage))
+
 	// Credential management routes
 	mux.HandleFunc("/admin/credentials/", s.handleCredentialOperations)
 
@@ -821,6 +824,46 @@ func (s *Server) handleListAccountsByDomain(w http.ResponseWriter, r *http.Reque
 		"accounts": accounts,
 		"total":    len(accounts),
 	})
+}
+
+// defaultAccountsPage is the page size of /admin/usage/accounts without ?limit.
+const defaultAccountsPage = 1000
+
+// handleAccountUsage lists every account with its usage, one bounded page at a
+// time: GET /admin/usage/accounts?after={account_id}&limit={n}. next_after is
+// the after of the next page, absent on the last one.
+func (s *Server) handleAccountUsage(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var after int64
+	if v := q.Get("after"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			s.writeError(w, http.StatusBadRequest, "after must be an account id (0 or more)")
+			return
+		}
+		after = n
+	}
+	limit := defaultAccountsPage
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > db.MaxAccountsPage {
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("limit must be between 1 and %d", db.MaxAccountsPage))
+			return
+		}
+		limit = n
+	}
+
+	accounts, err := s.rdb.ListAccountsPageWithRetry(r.Context(), after, limit)
+	if err != nil {
+		logger.Warn("HTTP API: Error listing accounts page", "name", s.name, "after", after, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "Error listing accounts")
+		return
+	}
+	resp := map[string]any{"accounts": accounts}
+	if len(accounts) == limit {
+		resp["next_after"] = accounts[len(accounts)-1].AccountID
+	}
+	s.writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleAccountExists(w http.ResponseWriter, r *http.Request) {
@@ -2045,6 +2088,9 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 			},
 			"domain_management": {
 				"GET /admin/domains/{domain}/accounts (list accounts scoped to domain)",
+			},
+			"usage": {
+				"GET /admin/usage/accounts?after={account_id}&limit={n} (every account's storage, page by page)",
 			},
 			"credential_management": {
 				"GET /admin/credentials/{email}",

@@ -765,11 +765,11 @@ paths:
         - Domain Management
       summary: List accounts for a specific domain
       description: |
-        Retrieves a list of all accounts for the specified domain. This is the recommended way to list accounts
-        as it prevents performance issues with large multi-tenant deployments.
+        Retrieves a list of all accounts for the specified domain: those whose primary address is in it,
+        matched exactly and regardless of case.
 
         Note: The unrestricted `GET /accounts` endpoint has been removed to prevent accidentally listing
-        all accounts across all domains.
+        all accounts across all domains. To walk every account, use the paged `GET /usage/accounts`.
       parameters:
         - name: domain
           in: path
@@ -863,6 +863,84 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /usage/accounts:
+    get:
+      tags:
+        - Usage
+      summary: List every account with its usage, page by page
+      description: |
+        Every account with its storage, one bounded page at a time, in account id order, for usage exports
+        and reconciliation. Soft-deleted accounts are left out. Pass each response's `next_after` as the
+        next `after`; the last page has none. Each page reads only its own accounts, so it costs the same
+        wherever it starts.
+      parameters:
+        - name: after
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+          description: "List accounts whose id is above this one"
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 10000
+            default: 1000
+          description: "Accounts per page"
+      responses:
+        '200':
+          description: One page of accounts.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        account_id:
+                          type: integer
+                          format: int64
+                          example: 123
+                        primary_email:
+                          type: string
+                          format: email
+                          example: "user@example.com"
+                        credential_count:
+                          type: integer
+                          example: 2
+                        mailbox_count:
+                          type: integer
+                          example: 6
+                        message_count:
+                          type: integer
+                          format: int64
+                          example: 4211
+                        storage_used:
+                          type: integer
+                          format: int64
+                          example: 1834201991
+                          description: "Bytes of the messages in the account's mailboxes (excludes expunged messages and deleted mailboxes)"
+                        created_at:
+                          type: string
+                  next_after:
+                    type: integer
+                    format: int64
+                    example: 123
+                    description: "The after of the next page; absent on the last page"
+        '400':
+          description: after or limit out of range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /accounts:
     post:
       tags:

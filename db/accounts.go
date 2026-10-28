@@ -943,43 +943,83 @@ func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) 
 	return accounts, nil
 }
 
-// ListAccountsByDomain returns a summary of all accounts for a specific domain
+// accountUsage sums the mailboxes of account a from the mailbox_stats cache, as
+// ListAccounts does. As a LATERAL join it reads only a's own mailboxes (through
+// idx_mailboxes_account_id), so a listing costs what its accounts hold rather
+// than a pass over every mailbox.
+const accountUsage = `
+	CROSS JOIN LATERAL (
+		SELECT COUNT(mb.id) AS mailbox_count,
+			   COALESCE(SUM(ms.message_count), 0) AS message_count,
+			   COALESCE(SUM(ms.total_size), 0) AS storage_used
+		FROM mailboxes mb
+		LEFT JOIN mailbox_stats ms ON ms.mailbox_id = mb.id
+		WHERE mb.account_id = a.id AND mb.deleted_at IS NULL
+	) s`
+
+// ListAccountsByDomain returns a summary of all accounts for a specific domain:
+// those whose primary address is in it. Addresses are stored lowercased, so the
+// match on credentials.domain uses its index.
 func (db *Database) ListAccountsByDomain(ctx context.Context, domain string) ([]AccountSummary, error) {
 	query := `
-		WITH account_stats AS (
-			SELECT mb.account_id,
-				   COUNT(mb.id) as mailbox_count,
-				   -- Bulk all-accounts listing intentionally uses the mailbox_stats cache (kept accurate
-				   -- by the stats triggers + the admin recalculate-stats command) to avoid a full
-				   -- messages-table aggregate on every listing. Per-account quota lookups use live counts.
-				   COALESCE(SUM(ms.message_count), 0) as message_count,
-				   COALESCE(SUM(ms.total_size), 0) as storage_used
-			FROM mailboxes mb
-			LEFT JOIN mailbox_stats ms ON mb.id = ms.mailbox_id
-			WHERE mb.deleted_at IS NULL
-			GROUP BY mb.account_id
-		)
 		SELECT a.id,
 			   a.created_at,
-			   COALESCE(pc.address, '') AS primary_email,
+			   pc.address AS primary_email,
 			   (SELECT COUNT(*) FROM credentials WHERE account_id = a.id) AS credential_count,
-			   COALESCE(s.mailbox_count, 0),
-			   COALESCE(s.message_count, 0),
-			   COALESCE(s.storage_used, 0)
-		FROM accounts a
-		LEFT JOIN credentials pc ON a.id = pc.account_id AND pc.primary_identity = TRUE
-		LEFT JOIN account_stats s ON a.id = s.account_id
-		WHERE a.deleted_at IS NULL
-		  AND LOWER(pc.address) LIKE '%' || '@' || LOWER($1)
+			   s.mailbox_count,
+			   s.message_count,
+			   s.storage_used
+		FROM credentials pc
+		JOIN accounts a ON a.id = pc.account_id` + accountUsage + `
+		WHERE pc.primary_identity = TRUE
+		  AND pc.domain = LOWER($1)
+		  AND a.deleted_at IS NULL
 		ORDER BY a.created_at DESC`
 
 	rows, err := db.GetReadPool().Query(ctx, query, domain)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list accounts by domain: %w", err)
 	}
-	defer rows.Close()
+	return scanAccountSummaries(rows)
+}
 
-	var accounts []AccountSummary
+// MaxAccountsPage bounds a page of ListAccountsPage: walking every account is a
+// series of bounded requests, never one listing of them all.
+const MaxAccountsPage = 10000
+
+// ListAccountsPage returns up to limit accounts whose id is above afterID, in id
+// order, soft-deleted ones left out: one page of a walk over every account, for
+// usage exports and reconciliation. Each page reads only its own accounts, so it
+// costs the same wherever it starts; pass the last account_id as the next afterID.
+func (db *Database) ListAccountsPage(ctx context.Context, afterID int64, limit int) ([]AccountSummary, error) {
+	if limit < 1 || limit > MaxAccountsPage {
+		return nil, fmt.Errorf("limit must be between 1 and %d", MaxAccountsPage)
+	}
+	query := `
+		SELECT a.id,
+			   a.created_at,
+			   COALESCE(pc.address, '') AS primary_email,
+			   (SELECT COUNT(*) FROM credentials WHERE account_id = a.id) AS credential_count,
+			   s.mailbox_count,
+			   s.message_count,
+			   s.storage_used
+		FROM (SELECT id, created_at FROM accounts
+			  WHERE deleted_at IS NULL AND id > $1
+			  ORDER BY id LIMIT $2) a
+		LEFT JOIN credentials pc ON pc.account_id = a.id AND pc.primary_identity = TRUE` + accountUsage + `
+		ORDER BY a.id`
+
+	rows, err := db.GetReadPool().Query(ctx, query, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list accounts page: %w", err)
+	}
+	return scanAccountSummaries(rows)
+}
+
+// scanAccountSummaries reads the rows of an account listing.
+func scanAccountSummaries(rows pgx.Rows) ([]AccountSummary, error) {
+	defer rows.Close()
+	accounts := []AccountSummary{}
 	for rows.Next() {
 		var account AccountSummary
 		var createdAt any
@@ -992,11 +1032,9 @@ func (db *Database) ListAccountsByDomain(ctx context.Context, domain string) ([]
 		account.CreatedAt = fmt.Sprintf("%v", createdAt)
 		accounts = append(accounts, account)
 	}
-
-	if err = rows.Err(); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating accounts: %w", err)
 	}
-
 	return accounts, nil
 }
 

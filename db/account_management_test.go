@@ -448,3 +448,115 @@ func TestGetAccountDetailsStorageUsed(t *testing.T) {
 	}
 	assert.True(t, found, "created account should appear in ListAccounts")
 }
+
+// createListedAccount creates an account for email with a filled INBOX of
+// messages 512-byte messages (insertTestMessage), returning its id.
+func createListedAccount(t *testing.T, db *Database, email string, messages int) int64 {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	_, err = db.CreateAccount(ctx, tx, CreateAccountRequest{Email: email, Password: "password123", IsPrimary: true, HashType: "bcrypt"})
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit(ctx))
+	id, err := db.GetAccountIDByAddress(ctx, email)
+	require.NoError(t, err)
+
+	tx2, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx2.Rollback(ctx)
+	require.NoError(t, db.CreateMailbox(ctx, tx2, id, "INBOX", nil))
+	require.NoError(t, tx2.Commit(ctx))
+	inbox, err := db.GetMailboxByName(ctx, id, "INBOX")
+	require.NoError(t, err)
+	for i := 0; i < messages; i++ {
+		insertTestMessage(t, db, id, inbox.ID, "INBOX", fmt.Sprintf("Listed %d", i), fmt.Sprintf("<listed%d-%d@example.com>", id, i))
+	}
+	return id
+}
+
+// TestListAccountsPage walks the accounts page by page: in id order, at most
+// limit at a time, soft-deleted ones left out, each with its storage.
+func TestListAccountsPage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	db, testEmail := setupAccountManagementTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	full := createListedAccount(t, db, "full_"+testEmail, 3)
+	empty := createListedAccount(t, db, "empty_"+testEmail, 0)
+	gone := createListedAccount(t, db, "gone_"+testEmail, 1)
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	require.NoError(t, db.DeleteAccount(ctx, tx, "gone_"+testEmail))
+	require.NoError(t, tx.Commit(ctx))
+
+	// The shared test database holds other accounts, some created meanwhile by
+	// other packages: walk from just before ours until past them.
+	seen := map[int64]AccountSummary{}
+	after := full - 1
+	for after < gone {
+		page, err := db.ListAccountsPage(ctx, after, 2)
+		require.NoError(t, err)
+		require.LessOrEqual(t, len(page), 2)
+		if len(page) == 0 {
+			break
+		}
+		for _, a := range page {
+			require.Greater(t, a.AccountID, after, "pages run in id order")
+			after = a.AccountID
+			seen[a.AccountID] = a
+		}
+	}
+
+	require.Contains(t, seen, full)
+	assert.Equal(t, int64(3*512), seen[full].StorageUsed)
+	assert.Equal(t, int64(3), seen[full].MessageCount)
+	assert.Equal(t, 1, seen[full].MailboxCount)
+	assert.Equal(t, strings.ToLower("full_"+testEmail), seen[full].PrimaryEmail)
+	require.Contains(t, seen, empty)
+	assert.Equal(t, int64(0), seen[empty].StorageUsed)
+	assert.NotContains(t, seen, gone, "a soft-deleted account is not listed")
+
+	_, err = db.ListAccountsPage(ctx, 0, MaxAccountsPage+1)
+	assert.Error(t, err, "a page above MaxAccountsPage is refused")
+}
+
+// TestListAccountsByDomain lists the accounts whose primary address is in the
+// domain, matched exactly and regardless of case, with their storage.
+func TestListAccountsByDomain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	db, _ := setupAccountManagementTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	domain := fmt.Sprintf("lad%d.example", time.Now().UnixNano())
+	ann := createListedAccount(t, db, "ann@"+domain, 2)
+	bob := createListedAccount(t, db, "bob@"+domain, 0)
+	createListedAccount(t, db, "cat@sub."+domain, 1) // a subdomain is another domain
+	createListedAccount(t, db, "dan@x"+domain, 1)    // so is a longer name ending the same
+
+	accounts, err := db.ListAccountsByDomain(ctx, strings.ToUpper(domain))
+	require.NoError(t, err)
+	got := map[int64]AccountSummary{}
+	for _, a := range accounts {
+		got[a.AccountID] = a
+	}
+	require.Len(t, got, 2)
+	require.Contains(t, got, ann)
+	require.Contains(t, got, bob)
+	assert.Equal(t, int64(2*512), got[ann].StorageUsed)
+	assert.Equal(t, 1, got[ann].CredentialCount)
+	assert.Equal(t, int64(0), got[bob].StorageUsed)
+
+	none, err := db.ListAccountsByDomain(ctx, "nothing-"+domain)
+	require.NoError(t, err)
+	assert.NotNil(t, none, "an empty listing is an empty slice")
+	assert.Empty(t, none)
+}
