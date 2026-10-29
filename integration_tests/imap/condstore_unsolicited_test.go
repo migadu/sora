@@ -45,11 +45,18 @@ func TestIMAP_CondstoreUnsolicitedFlagsUpdate(t *testing.T) {
 	setupClient.Logout()
 
 	// 2. Client 1: Watched session (CONDSTORE-enabled, listens for unsolicited updates)
-	fetchChan := make(chan *imapclient.FetchMessageData, 10)
+	// The client releases an unsolicited FETCH when the callback returns, so
+	// it must be collected here, not after handing it to the test goroutine.
+	type fetchResult struct {
+		buf *imapclient.FetchMessageBuffer
+		err error
+	}
+	fetchChan := make(chan fetchResult, 10)
 	opts := &imapclient.Options{
 		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
 			Fetch: func(msg *imapclient.FetchMessageData) {
-				fetchChan <- msg
+				buf, err := msg.Collect()
+				fetchChan <- fetchResult{buf, err}
 			},
 		},
 	}
@@ -100,8 +107,8 @@ func TestIMAP_CondstoreUnsolicitedFlagsUpdate(t *testing.T) {
 
 	// 5. Verify client1 gets the update with a non-zero MODSEQ
 	select {
-	case msg := <-fetchChan:
-		buf, err := msg.Collect()
+	case res := <-fetchChan:
+		buf, err := res.buf, res.err
 		if err != nil {
 			t.Fatalf("failed to collect unsolicited fetch message data: %v", err)
 		}

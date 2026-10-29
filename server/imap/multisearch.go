@@ -90,8 +90,9 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 
 		all := imap.UIDSet{}
 		var count, min, max uint32
+		var minIdx, maxIdx int
 		first := true
-		for _, m := range messages {
+		for i, m := range messages {
 			uid := uint32(m.UID)
 			all.AddNum(imap.UID(m.UID))
 			count++
@@ -100,10 +101,10 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 				first = false
 			} else {
 				if uid < min {
-					min = uid
+					min, minIdx = uid, i
 				}
 				if uid > max {
-					max = uid
+					max, maxIdx = uid, i
 				}
 			}
 		}
@@ -119,6 +120,9 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 			if options.ReturnMax {
 				searchData.Max = max
 			}
+		}
+		if s.GetCapabilities().Has(imap.CapCondStore) {
+			searchData.ModSeq = returnedModSeq(messages, minIdx, maxIdx, options)
 		}
 
 		results = append(results, searchData)

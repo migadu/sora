@@ -265,29 +265,9 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 		}
 	}
 
-	// CONDSTORE functionality - only process if capability is enabled
-	if s.GetCapabilities().Has(imap.CapCondStore) && criteria.ModSeq != nil {
-		var highestModSeq uint64
-		for _, msg := range messages {
-			var msgModSeq int64
-			msgModSeq = msg.CreatedModSeq
-
-			if msg.UpdatedModSeq != nil && *msg.UpdatedModSeq > msgModSeq {
-				msgModSeq = *msg.UpdatedModSeq
-			}
-
-			if msg.ExpungedModSeq != nil && *msg.ExpungedModSeq > msgModSeq {
-				msgModSeq = *msg.ExpungedModSeq
-			}
-
-			if uint64(msgModSeq) > highestModSeq {
-				highestModSeq = uint64(msgModSeq)
-			}
-		}
-
-		if highestModSeq > 0 {
-			searchData.ModSeq = highestModSeq
-		}
+	if s.GetCapabilities().Has(imap.CapCondStore) {
+		// Messages are in descending UID order: the last is MIN, the first MAX.
+		searchData.ModSeq = returnedModSeq(messages, len(messages)-1, 0, options)
 	}
 
 	// Track domain and user command activity - SEARCH is expensive!

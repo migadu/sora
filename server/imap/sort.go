@@ -108,5 +108,20 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 		sortData.All = nums
 	}
 
+	if s.GetCapabilities().Has(imap.CapCondStore) {
+		// Without ESORT only All is returned, as for no options.
+		var returned *imap.SearchOptions
+		if options != nil && s.GetCapabilities().Has(imap.CapESort) {
+			returned = &imap.SearchOptions{
+				ReturnMin:   options.ReturnMin,
+				ReturnMax:   options.ReturnMax,
+				ReturnAll:   options.ReturnAll,
+				ReturnCount: options.ReturnCount,
+			}
+		}
+		// MIN and MAX are the first and last messages in sort order (RFC 5267 §3.1).
+		sortData.ModSeq = returnedModSeq(messages, 0, len(messages)-1, returned)
+	}
+
 	return sortData, nil
 }
