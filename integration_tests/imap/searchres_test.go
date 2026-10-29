@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/integration_tests/common"
@@ -203,6 +204,85 @@ func TestIMAP_SearchRes(t *testing.T) {
 		c.do("ESEARCH IN (SELECTED) RETURN (SAVE) SUBJECT no-such-subject")
 		assertUIDs(t, "UID FETCH $ after an empty ESEARCH SAVE", c.fetchDollarUIDs(), nil)
 	})
+
+	// A selected-mailbox search as SEARCH and as ESEARCH; "$" follows both alike.
+	searchCommands := []string{"UID SEARCH", "ESEARCH IN (SELECTED)"}
+
+	t.Run("SaveCountWithMinMax_SavesFullSet", func(t *testing.T) {
+		// RFC 5182 §2.4: with ALL and/or COUNT, "$" holds every match, MIN and MAX
+		// notwithstanding.
+		c := newConn(t)
+		uids := setupMailbox(t, c, "SR_SaveCountMinMax")
+		want := []imap.UID{uids[0], uids[2], uids[4]}
+		for _, cmd := range searchCommands {
+			for _, opts := range []string{"SAVE MIN COUNT", "SAVE MAX COUNT", "SAVE MIN MAX COUNT"} {
+				c.do(cmd + " RETURN (" + opts + ") SEEN")
+				assertUIDs(t, "UID FETCH $ after "+cmd+" "+opts, c.fetchDollarUIDs(), want)
+			}
+		}
+	})
+
+	t.Run("FailedSaveEmptiesDollar", func(t *testing.T) {
+		// RFC 5182 §2.1: a SAVE search that fails with NO sets "$" to the empty
+		// sequence. 21 UID keys exceed the validator's limit (NO [SERVERLIMIT]).
+		c := newConn(t)
+		uids := setupMailbox(t, c, "SR_SaveNo")
+		tooMany := strings.TrimSpace(strings.Repeat(fmt.Sprintf("UID %d ", uids[0]), 21))
+		for _, cmd := range searchCommands {
+			c.do(`UID SEARCH RETURN (SAVE) SEEN`)
+			if got := c.status(cmd + " RETURN (SAVE) " + tooMany); !strings.HasPrefix(got, "NO") {
+				t.Fatalf("%s with 21 UID keys: %s, want NO", cmd, got)
+			}
+			assertUIDs(t, "UID FETCH $ after a failed "+cmd+" SAVE", c.fetchDollarUIDs(), nil)
+		}
+	})
+
+	t.Run("RefusedSaveKeepsDollar", func(t *testing.T) {
+		// RFC 5182 §2.1: a SAVE search refused with BAD leaves "$" as it was, whether
+		// sora refuses it (an impossible size range) or go-imap does (an unknown key).
+		c := newConn(t)
+		uids := setupMailbox(t, c, "SR_SaveBad")
+		want := []imap.UID{uids[0], uids[2], uids[4]}
+		c.do(`UID SEARCH RETURN (SAVE) SEEN`)
+		for _, cmd := range searchCommands {
+			for _, criteria := range []string{"LARGER 10 SMALLER 5", "NO-SUCH-KEY"} {
+				if got := c.status(cmd + " RETURN (SAVE) " + criteria); !strings.HasPrefix(got, "BAD") {
+					t.Fatalf("%s %s: %s, want BAD", cmd, criteria, got)
+				}
+				assertUIDs(t, "UID FETCH $ after a refused "+cmd+" "+criteria, c.fetchDollarUIDs(), want)
+			}
+		}
+	})
+}
+
+// TestIMAP_SearchRes_RateLimitedSaveEmptiesDollar: a SAVE search refused with
+// NO [LIMIT] empties "$" (RFC 5182 §2.1), so a command pipelined behind it acts
+// on no message rather than on the ones an earlier search saved.
+func TestIMAP_SearchRes_RateLimitedSaveEmptiesDollar(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupIMAPServerWithOptions(t, &common.IMAPServerOpts{
+		SearchRateLimitPerMin: 1,
+		SearchRateLimitWindow: time.Hour,
+	})
+	defer server.Close()
+
+	c := dialRawIMAP(t, server.Address)
+	c.do(fmt.Sprintf("LOGIN %s %s", account.Email, account.Password))
+	old := c.appendMsg("INBOX", "Subject: old result\r\n\r\nbody\r\n")
+	wanted := c.appendMsg("INBOX", "Subject: intended result\r\n\r\nbody\r\n")
+	c.do("SELECT INBOX")
+	c.do("UID SEARCH BODY body") // spends the one search the limit allows
+
+	for _, cmd := range []string{"UID SEARCH", "ESEARCH IN (SELECTED)"} {
+		c.do(fmt.Sprintf("UID SEARCH RETURN (SAVE) UID %d", old)) // metadata only, so not charged
+		search := c.send(fmt.Sprintf("%s RETURN (SAVE) UID %d BODY body", cmd, wanted))
+		store := c.send(`UID STORE $ +FLAGS (\Flagged)`)
+		if _, tagged := c.read(search, cmd); !strings.HasPrefix(tagged, search+" NO [LIMIT]") {
+			t.Fatalf("%s: %s, want NO [LIMIT]", cmd, tagged)
+		}
+		c.collect(store, `UID STORE $`)
+		assertUIDs(t, "flagged after a rate-limited "+cmd+" SAVE", c.fetchFlaggedUIDs("1:*"), nil)
+	}
 }
 
 // --- raw IMAP helper -------------------------------------------------------
@@ -233,8 +313,8 @@ func (c *rawIMAP) nextTag() string {
 	return fmt.Sprintf("T%03d", c.n)
 }
 
-// collect reads untagged lines until the tagged completion line, asserting OK.
-func (c *rawIMAP) collect(tag, ctx string) (untagged []string, tagged string) {
+// read reads untagged lines until the tagged completion line, whatever its status.
+func (c *rawIMAP) read(tag, ctx string) (untagged []string, tagged string) {
 	c.t.Helper()
 	for {
 		line, err := c.r.ReadString('\n')
@@ -243,23 +323,44 @@ func (c *rawIMAP) collect(tag, ctx string) (untagged []string, tagged string) {
 		}
 		line = strings.TrimRight(line, "\r\n")
 		if strings.HasPrefix(line, tag+" ") {
-			if !strings.HasPrefix(line, tag+" OK") {
-				c.t.Fatalf("command %q failed: %s", ctx, line)
-			}
 			return untagged, line
 		}
 		untagged = append(untagged, line)
 	}
 }
 
-// do sends a one-line command and returns its untagged + tagged responses.
-func (c *rawIMAP) do(cmd string) (untagged []string, tagged string) {
+// collect reads untagged lines until the tagged completion line, asserting OK.
+func (c *rawIMAP) collect(tag, ctx string) (untagged []string, tagged string) {
 	c.t.Helper()
-	tag := c.nextTag()
+	untagged, tagged = c.read(tag, ctx)
+	if !strings.HasPrefix(tagged, tag+" OK") {
+		c.t.Fatalf("command %q failed: %s", ctx, tagged)
+	}
+	return untagged, tagged
+}
+
+// send writes a one-line command without waiting for its response.
+func (c *rawIMAP) send(cmd string) (tag string) {
+	c.t.Helper()
+	tag = c.nextTag()
 	if _, err := fmt.Fprintf(c.conn, "%s %s\r\n", tag, cmd); err != nil {
 		c.t.Fatalf("write %q: %v", cmd, err)
 	}
-	return c.collect(tag, cmd)
+	return tag
+}
+
+// do sends a one-line command and returns its untagged + tagged responses.
+func (c *rawIMAP) do(cmd string) (untagged []string, tagged string) {
+	c.t.Helper()
+	return c.collect(c.send(cmd), cmd)
+}
+
+// status sends a one-line command and returns its tagged status, without the tag.
+func (c *rawIMAP) status(cmd string) string {
+	c.t.Helper()
+	tag := c.send(cmd)
+	_, tagged := c.read(tag, cmd)
+	return strings.TrimPrefix(tagged, tag+" ")
 }
 
 // appendMsg appends msg using a LITERAL+ literal and returns the assigned UID.

@@ -2,6 +2,7 @@ package imap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/emersion/go-imap/v2"
@@ -10,7 +11,11 @@ import (
 	"github.com/migadu/sora/pkg/metrics"
 )
 
-func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
+func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (_ *imap.SearchData, err error) {
+	if options != nil && options.ReturnSave {
+		defer func() { s.emptySavedSearchOnNo(err) }()
+	}
+
 	// Reject pathologically complex/deep criteria before decoding or building a query.
 	// A deeply nested or very wide criteria tree would otherwise recurse unbounded and
 	// generate an unusable SQL clause (see validateSearchCriteria).
@@ -253,15 +258,15 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 }
 
 // savedSearchSet is the set a RETURN (SAVE) stores for "$", as UIDs so that it
-// survives EXPUNGE (RFC 5182 §2.4): every match with ALL or with neither MIN nor
-// MAX, otherwise only the MIN and/or MAX message, msgs[minIdx] and msgs[maxIdx].
-// COUNT never restricts it.
+// survives EXPUNGE (RFC 5182 §2.4): every match with ALL or COUNT, or with
+// neither MIN nor MAX; otherwise only the MIN and/or MAX message, msgs[minIdx]
+// and msgs[maxIdx].
 func savedSearchSet(msgs []db.SearchMessageResult, minIdx, maxIdx int, options *imap.SearchOptions) imap.UIDSet {
 	var saved imap.UIDSet
 	if len(msgs) == 0 {
 		return saved
 	}
-	if options.ReturnAll || (!options.ReturnMin && !options.ReturnMax) {
+	if options.ReturnAll || options.ReturnCount || (!options.ReturnMin && !options.ReturnMax) {
 		for _, msg := range msgs {
 			saved.AddNum(msg.UID)
 		}
@@ -274,6 +279,18 @@ func savedSearchSet(msgs []db.SearchMessageResult, minIdx, maxIdx int, options *
 		saved.AddNum(msgs[maxIdx].UID)
 	}
 	return saved
+}
+
+// emptySavedSearchOnNo empties "$" once a RETURN (SAVE) search has failed with
+// NO, which RFC 5182 §2.1 requires; one refused with BAD leaves "$" as it was.
+// go-imap answers NO to any error that is not an *imap.Error.
+func (s *IMAPSession) emptySavedSearchOnNo(err error) {
+	var imapErr *imap.Error
+	if err == nil || (errors.As(err, &imapErr) && imapErr.Type == imap.StatusResponseTypeBad) {
+		return
+	}
+	s.setSavedSearchResult(nil)
+	s.DebugLog("emptied '$' after a failed SAVE search", "error", err)
 }
 
 // decodeSearchCriteriaLocked translates sequence numbers in search criteria.

@@ -8,8 +8,8 @@ import (
 	"github.com/migadu/sora/db"
 )
 
-// RFC 5182 §2.4: SAVE stores every match with ALL or with neither MIN nor MAX,
-// otherwise only the MIN and/or MAX message; COUNT never restricts it.
+// RFC 5182 §2.4: SAVE stores every match with ALL or COUNT, or with neither MIN
+// nor MAX; otherwise only the MIN and/or MAX message.
 func TestSavedSearchSet(t *testing.T) {
 	// Search's order, newest first: MIN is the last, MAX the first.
 	msgs := []db.SearchMessageResult{{UID: 9}, {UID: 5}, {UID: 2}}
@@ -25,7 +25,9 @@ func TestSavedSearchSet(t *testing.T) {
 		{"SAVE MIN", &imap.SearchOptions{ReturnSave: true, ReturnMin: true}, []imap.UID{2}},
 		{"SAVE MAX", &imap.SearchOptions{ReturnSave: true, ReturnMax: true}, []imap.UID{9}},
 		{"SAVE MIN MAX", &imap.SearchOptions{ReturnSave: true, ReturnMin: true, ReturnMax: true}, []imap.UID{2, 9}},
-		{"SAVE MIN COUNT", &imap.SearchOptions{ReturnSave: true, ReturnMin: true, ReturnCount: true}, []imap.UID{2}},
+		{"SAVE MIN COUNT", &imap.SearchOptions{ReturnSave: true, ReturnMin: true, ReturnCount: true}, []imap.UID{2, 5, 9}},
+		{"SAVE MAX COUNT", &imap.SearchOptions{ReturnSave: true, ReturnMax: true, ReturnCount: true}, []imap.UID{2, 5, 9}},
+		{"SAVE MIN MAX COUNT", &imap.SearchOptions{ReturnSave: true, ReturnMin: true, ReturnMax: true, ReturnCount: true}, []imap.UID{2, 5, 9}},
 		{"SAVE MIN ALL", &imap.SearchOptions{ReturnSave: true, ReturnMin: true, ReturnAll: true}, []imap.UID{2, 5, 9}},
 	} {
 		got, _ := savedSearchSet(msgs, minIdx, maxIdx, tc.options).Nums()

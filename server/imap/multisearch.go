@@ -16,7 +16,11 @@ import (
 // ACL-checked set of mailboxes and UID-search each. ESEARCH always reports UIDs
 // (sequence numbers are meaningless for unselected mailboxes), and every result
 // carries its Mailbox + UIDValidity so returned UIDs are unambiguous.
-func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource, criteria *imap.SearchCriteria, options *imap.SearchOptions) ([]*imap.SearchData, error) {
+func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource, criteria *imap.SearchCriteria, options *imap.SearchOptions) (_ []*imap.SearchData, err error) {
+	if options != nil && options.ReturnSave {
+		defer func() { s.emptySavedSearchOnNo(err) }()
+	}
+
 	if ctx.Err() != nil {
 		s.DebugLog("session context is cancelled, skipping multisearch")
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed"}
