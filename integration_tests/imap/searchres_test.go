@@ -180,6 +180,29 @@ func TestIMAP_SearchRes(t *testing.T) {
 		untagged, _ := c.do("UID SEARCH $")
 		assertUIDs(t, "UID SEARCH $", parseSearchUIDs(untagged), want)
 	})
+
+	t.Run("MultiSearchSelectedSave", func(t *testing.T) {
+		// RFC 7377 §2.2: SAVE in an ESEARCH whose sole source is the selected
+		// mailbox sets "$" as SEARCH RETURN (SAVE) does. go-imap refuses SAVE with
+		// any other source.
+		c := newConn(t)
+		uids := setupMailbox(t, c, "SR_MultiSave")
+		c.do(fmt.Sprintf("UID SEARCH RETURN (SAVE) UID %d", uids[1])) // a stale "$" to replace
+
+		untagged, _ := c.do("ESEARCH IN (SELECTED) RETURN (SAVE) SEEN")
+		for _, l := range untagged {
+			if strings.HasPrefix(l, "* ESEARCH") {
+				t.Errorf("SAVE alone answered %q, want no result response (RFC 5182)", l)
+			}
+		}
+		assertUIDs(t, "UID FETCH $ after ESEARCH SAVE", c.fetchDollarUIDs(), []imap.UID{uids[0], uids[2], uids[4]})
+
+		c.do("ESEARCH IN (SELECTED) RETURN (SAVE MIN) SEEN")
+		assertUIDs(t, "UID FETCH $ after ESEARCH SAVE MIN", c.fetchDollarUIDs(), []imap.UID{uids[0]})
+
+		c.do("ESEARCH IN (SELECTED) RETURN (SAVE) SUBJECT no-such-subject")
+		assertUIDs(t, "UID FETCH $ after an empty ESEARCH SAVE", c.fetchDollarUIDs(), nil)
+	})
 }
 
 // --- raw IMAP helper -------------------------------------------------------

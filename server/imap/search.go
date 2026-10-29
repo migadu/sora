@@ -6,6 +6,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -110,48 +111,15 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 	// Whether to fill the result fields of the RETURN options below. go-imap turns a
 	// SEARCH without RETURN into RETURN (ALL) before calling the session, so from the
 	// wire this always holds; go-imap itself picks the SEARCH or ESEARCH response.
+	// It also refuses result options the session's capabilities lack (RFC 4466
+	// §2.6.1), so a client whose ESEARCH was filtered never gets this far with one.
 	isESEARCH := options != nil && (options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount || options.ReturnSave)
 
-	// ReturnAll therefore cannot tell a plain SEARCH from an extended one; only MIN,
-	// MAX, COUNT and SAVE prove the client used RETURN. A client whose ESEARCH was
-	// filtered is refused those (RFC 5530 CLIENTBUG: it used what we did not
-	// advertise). A plain SEARCH gets the SEARCH response, which go-imap writes when
-	// the session's capabilities lack ESEARCH.
-	usedReturn := options != nil && (options.ReturnMin || options.ReturnMax || options.ReturnCount || options.ReturnSave)
-	if usedReturn && !s.GetCapabilities().Has(imap.CapESearch) {
-		s.DebugLog("client using ESEARCH RETURN syntax but ESEARCH capability is filtered")
-		metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "esearch_not_advertised", "client_error").Inc()
-		return nil, &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeClientBug,
-			Text: "ESEARCH is not supported for this client",
-		}
-	}
-
 	// RFC 5182 §2.4 / RFC 9051 §6.4.4.1: SEARCH RETURN (SAVE) stores the result
-	// set referenced later by "$". The saved set is always stored as UIDs (stable
-	// across EXPUNGE). Combination rules:
-	//   - SAVE with ALL, or with neither MIN nor MAX  -> save the full match set
-	//   - SAVE with MIN and/or MAX but not ALL        -> save just MIN/MAX message(s)
-	//   - COUNT never restricts what is saved
-	// Messages are returned newest-first, so messages[0]=MAX UID, last=MIN UID.
+	// set referenced later by "$" (see savedSearchSet). Messages are returned
+	// newest-first, so messages[0]=MAX UID, last=MIN UID.
 	if options != nil && options.ReturnSave {
-		var saved imap.UIDSet
-		if len(messages) > 0 {
-			saveFull := options.ReturnAll || (!options.ReturnMin && !options.ReturnMax)
-			if saveFull {
-				for _, msg := range messages {
-					saved.AddNum(msg.UID)
-				}
-			} else {
-				if options.ReturnMin {
-					saved.AddNum(messages[len(messages)-1].UID)
-				}
-				if options.ReturnMax {
-					saved.AddNum(messages[0].UID)
-				}
-			}
-		}
+		saved := savedSearchSet(messages, len(messages)-1, 0, options)
 		s.setSavedSearchResult(saved)
 		s.DebugLog("saved SEARCH result for '$'", "count", len(saved))
 	}
@@ -282,6 +250,30 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 	}
 
 	return searchData, nil
+}
+
+// savedSearchSet is the set a RETURN (SAVE) stores for "$", as UIDs so that it
+// survives EXPUNGE (RFC 5182 §2.4): every match with ALL or with neither MIN nor
+// MAX, otherwise only the MIN and/or MAX message, msgs[minIdx] and msgs[maxIdx].
+// COUNT never restricts it.
+func savedSearchSet(msgs []db.SearchMessageResult, minIdx, maxIdx int, options *imap.SearchOptions) imap.UIDSet {
+	var saved imap.UIDSet
+	if len(msgs) == 0 {
+		return saved
+	}
+	if options.ReturnAll || (!options.ReturnMin && !options.ReturnMax) {
+		for _, msg := range msgs {
+			saved.AddNum(msg.UID)
+		}
+		return saved
+	}
+	if options.ReturnMin {
+		saved.AddNum(msgs[minIdx].UID)
+	}
+	if options.ReturnMax {
+		saved.AddNum(msgs[maxIdx].UID)
+	}
+	return saved
 }
 
 // decodeSearchCriteriaLocked translates sequence numbers in search criteria.
