@@ -214,34 +214,18 @@ func TestIMAP_CapabilityFiltering(t *testing.T) {
 		t.Fatalf("APPEND close failed: %v", err)
 	}
 
-	// Test 1: Try search - the go-imap client library automatically uses ReturnAll:true
-	// which is ESEARCH syntax, so this will fail with NO [CLIENTBUG]
-	_, err = c.Search(&imap.SearchCriteria{
-		Body: []string{"test"},
+	// With nil options the go-imap client sends a plain SEARCH (no RETURN), which a
+	// filtered client must still get answered, with the SEARCH response.
+	// TestIMAP_ESearchFiltered_PlainSearchAnswered covers the wire forms.
+	data, err := c.Search(&imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{{Key: "Subject", Value: "ESEARCH"}},
 	}, nil).Wait()
-
-	if err == nil {
-		t.Fatal("Expected error when go-imap client automatically uses ESEARCH syntax (ReturnAll:true), but got success")
+	if err != nil {
+		t.Fatalf("plain SEARCH failed after ESEARCH was filtered: %v", err)
 	}
-
-	// The go-imap library defaults to ReturnAll:true when ESEARCH was available,
-	// even when we pass nil options. This is a client library behavior.
-	var imapErr *imap.Error
-	if errors.As(err, &imapErr) && imapErr.Code == imap.ResponseCodeClientBug {
-		t.Logf("SUCCESS: Server correctly rejected ESEARCH syntax with NO [CLIENTBUG] (go-imap uses ReturnAll:true by default)")
-	} else {
-		t.Logf("Search failed with: %v (expected CLIENTBUG, but acceptable)", err)
+	if got := data.AllSeqNums(); len(got) != 1 {
+		t.Errorf("plain SEARCH after ESEARCH was filtered returned %v, want the one appended message", got)
 	}
-
-	// Note: To make SEARCH work after ESEARCH filtering, clients would need to:
-	// 1. Not cache capabilities, OR
-	// 2. Re-check capabilities before each command, OR
-	// 3. Handle the NO [CLIENTBUG] error and retry without ESEARCH syntax
-	//
-	// The go-imap client library currently doesn't do any of these, so SEARCH
-	// will fail after ESEARCH is filtered. This is correct server behavior per RFC 5530.
-
-	t.Logf("SUCCESS: Capability filtering is working correctly - server rejects ESEARCH syntax when capability is filtered")
 }
 
 func TestIMAP_CapabilityFiltering_NoClientID(t *testing.T) {
@@ -463,32 +447,19 @@ func TestIMAP_CapabilityFiltering_iOSAppleMail(t *testing.T) {
 
 	t.Logf("Successfully appended test message to INBOX")
 
-	// Test 1: Try search with nil options - the go-imap client library automatically uses ReturnAll:true
-	// which is ESEARCH syntax, so this will fail with NO [CLIENTBUG]
-	_, err = c.Search(&imap.SearchCriteria{
+	// Test 1: with nil options the go-imap client sends a plain SEARCH (no RETURN),
+	// which must still be answered once ESEARCH is filtered.
+	data, err := c.Search(&imap.SearchCriteria{
 		Header: []imap.SearchCriteriaHeaderField{
 			{Key: "Subject", Value: "Test Message"},
 		},
 	}, nil).Wait()
-	if err == nil {
-		t.Fatal("Expected error when go-imap client automatically uses ESEARCH syntax (ReturnAll:true), but got success")
+	if err != nil {
+		t.Fatalf("plain SEARCH failed after ESEARCH was filtered: %v", err)
 	}
-
-	// Verify we got the correct error with CLIENTBUG response code
-	var imapErr *imap.Error
-	if errors.As(err, &imapErr) && imapErr.Code == imap.ResponseCodeClientBug {
-		t.Logf("SUCCESS: Server correctly rejected ESEARCH syntax with NO [CLIENTBUG] (go-imap uses ReturnAll:true by default)")
-	} else {
-		t.Fatalf("Expected CLIENTBUG error, got: %v", err)
+	if got := data.AllSeqNums(); len(got) != 1 {
+		t.Errorf("plain SEARCH after ESEARCH was filtered returned %v, want the one appended message", got)
 	}
-
-	// Note: To make SEARCH work after ESEARCH filtering, clients would need to:
-	// 1. Not cache capabilities, OR
-	// 2. Re-check capabilities before each command, OR
-	// 3. Handle the NO [CLIENTBUG] error and retry without ESEARCH syntax
-	//
-	// The go-imap client library currently doesn't do any of these, so SEARCH
-	// will fail after ESEARCH is filtered. This is correct server behavior per RFC 5530.
 
 	// Test 2: SEARCH with ESEARCH options should fail or be ignored when ESEARCH is filtered
 	// Try to use ESEARCH-specific options that should be filtered out
@@ -511,7 +482,8 @@ func TestIMAP_CapabilityFiltering_iOSAppleMail(t *testing.T) {
 		t.Fatal("Expected error when using ESEARCH syntax with ESEARCH capability filtered, but got success")
 	}
 
-	// Verify we got the correct error with CLIENTBUG response code (reuse imapErr from above)
+	// Verify we got the correct error with CLIENTBUG response code
+	var imapErr *imap.Error
 	if !errors.As(err, &imapErr) {
 		t.Fatalf("Expected imap.Error, got: %v", err)
 	}
@@ -818,9 +790,10 @@ func TestIMAP_CapabilityFiltering_BeforeAfterID(t *testing.T) {
 	writer.Flush()
 	readResponse("A03")
 
-	// STEP 1: Perform ESEARCH before ID command
+	// STEP 1: Perform ESEARCH before ID command. COUNT, not ALL: a RETURN (ALL)
+	// cannot be told from a plain SEARCH, which a filtered client gets answered.
 	t.Logf("=== STEP 1: ESEARCH before ID command ===")
-	sendCommand("DI18", "UID SEARCH RETURN (ALL) UID 1:*")
+	sendCommand("DI18", "UID SEARCH RETURN (COUNT) UID 1:*")
 	beforeIDResponses := readResponse("DI18")
 
 	// Check if we got ESEARCH response (should be based on server capabilities)
@@ -843,7 +816,7 @@ func TestIMAP_CapabilityFiltering_BeforeAfterID(t *testing.T) {
 
 	// STEP 3: Perform ESEARCH after ID command - should get NO [CLIENTBUG] error
 	t.Logf("=== STEP 3: ESEARCH after ID command ===")
-	sendCommand("DI19", "UID SEARCH RETURN (ALL) UID 1:*")
+	sendCommand("DI19", "UID SEARCH RETURN (COUNT) UID 1:*")
 	afterIDResponses := readResponse("DI19")
 
 	// Check if we got NO [CLIENTBUG] response (should be filtered)
@@ -1057,24 +1030,15 @@ func TestIMAP_ESEARCHFallback_EmptyResults(t *testing.T) {
 		t.Fatalf("Failed to wait for append: %v", err)
 	}
 
-	// Try another search - will also get CLIENTBUG since go-imap uses ReturnAll:true by default
-	_, err = c.Search(&imap.SearchCriteria{
+	// Another search, plain (nil options send no RETURN): the session stays usable
+	// and a plain SEARCH is answered even though ESEARCH is filtered.
+	if _, err := c.Search(&imap.SearchCriteria{
 		Text: []string{"After Empty"},
-	}, nil).Wait()
-
-	if err == nil {
-		t.Fatal("Expected error on second search (go-imap uses ESEARCH syntax), but got success")
+	}, nil).Wait(); err != nil {
+		t.Fatalf("plain SEARCH after the refused ESEARCH failed: %v", err)
 	}
 
-	// Verify the session remains healthy - should get the same CLIENTBUG error consistently
-	if !errors.As(err, &imapErr) {
-		t.Fatalf("Expected imap.Error on second search, got: %v", err)
-	}
-	if imapErr.Code != imap.ResponseCodeClientBug {
-		t.Errorf("Expected CLIENTBUG on second search, got: %v", imapErr.Code)
-	}
-
-	t.Logf("SUCCESS: Session remains healthy after empty search - consistently returns NO [CLIENTBUG] for ESEARCH syntax")
+	t.Logf("SUCCESS: Session remains healthy after the refused ESEARCH")
 }
 
 // TestIMAP_CapabilityFiltering_MultipleJA4Patterns tests that a filter can match

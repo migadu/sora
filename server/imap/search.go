@@ -107,13 +107,18 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 	}
 	s.DebugLog("SEARCH command", "numKind", numKind, "options", optionsStr, "results", len(messages))
 
-	// Check if this is actually an ESEARCH command (has RETURN options)
-	// The library may pass an empty options struct for standard SEARCH, so we need to check if any options are actually set
+	// Whether to fill the result fields of the RETURN options below. go-imap turns a
+	// SEARCH without RETURN into RETURN (ALL) before calling the session, so from the
+	// wire this always holds; go-imap itself picks the SEARCH or ESEARCH response.
 	isESEARCH := options != nil && (options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount || options.ReturnSave)
 
-	// If client uses ESEARCH syntax but ESEARCH capability is filtered, return error
-	// RFC 5530 defines CLIENTBUG for when client violates server's advertised capabilities
-	if isESEARCH && !s.GetCapabilities().Has(imap.CapESearch) {
+	// ReturnAll therefore cannot tell a plain SEARCH from an extended one; only MIN,
+	// MAX, COUNT and SAVE prove the client used RETURN. A client whose ESEARCH was
+	// filtered is refused those (RFC 5530 CLIENTBUG: it used what we did not
+	// advertise). A plain SEARCH gets the SEARCH response, which go-imap writes when
+	// the session's capabilities lack ESEARCH.
+	usedReturn := options != nil && (options.ReturnMin || options.ReturnMax || options.ReturnCount || options.ReturnSave)
+	if usedReturn && !s.GetCapabilities().Has(imap.CapESearch) {
 		s.DebugLog("client using ESEARCH RETURN syntax but ESEARCH capability is filtered")
 		metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "esearch_not_advertised", "client_error").Inc()
 		return nil, &imap.Error{
