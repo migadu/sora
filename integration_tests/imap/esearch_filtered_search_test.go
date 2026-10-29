@@ -25,8 +25,9 @@ import (
 // session took that for the extended syntax.
 //
 // A plain SEARCH must be answered with the SEARCH response of RFC 3501, the only
-// form the session advertises. A RETURN option that a SEARCH response cannot
-// carry (MIN, MAX, COUNT) is still refused.
+// form the session advertises. A RETURN option that proves the extended syntax
+// (MIN, MAX, COUNT, SAVE) is still refused, also where the session would answer
+// without searching (an empty mailbox).
 func TestIMAP_ESearchFiltered_PlainSearchAnswered(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -61,6 +62,9 @@ func TestIMAP_ESearchFiltered_PlainSearchAnswered(t *testing.T) {
 			t.Fatalf("APPEND failed: %v", err)
 		}
 		uids = append(uids, uint32(data.UID))
+	}
+	if err := setup.Create("Empty", nil).Wait(); err != nil {
+		t.Fatalf("CREATE failed: %v", err)
 	}
 	setup.Logout()
 
@@ -114,13 +118,30 @@ func TestIMAP_ESearchFiltered_PlainSearchAnswered(t *testing.T) {
 		}
 	}
 
-	for _, cmd := range []string{
-		"SEARCH RETURN (COUNT) ALL",
-		"SEARCH RETURN (MIN MAX) ALL",
-	} {
+	refused := func(cmd string) {
+		t.Helper()
 		if resp := do(cmd); !strings.Contains(resp, " NO [CLIENTBUG]") {
 			t.Errorf("%s: want NO [CLIENTBUG], got:\n%s", cmd, resp)
 		}
+	}
+	for _, cmd := range []string{
+		"SEARCH RETURN (COUNT) ALL",
+		"SEARCH RETURN (MIN MAX) ALL",
+		"UID SEARCH RETURN (MAX) ALL",
+		"SEARCH RETURN (SAVE) ALL",
+	} {
+		refused(cmd)
+	}
+
+	// An empty mailbox answers a sequence-set search without querying; the
+	// refusal must come first.
+	if resp := do("SELECT Empty"); !strings.Contains(resp, " OK ") {
+		t.Fatalf("SELECT Empty not OK:\n%s", resp)
+	}
+	refused("SEARCH RETURN (COUNT) 1:*")
+	resp := do("SEARCH 1:*")
+	if nums, ok := searchResponseNums(resp); !ok || len(nums) > 0 {
+		t.Errorf("SEARCH 1:* in an empty mailbox: want a bare * SEARCH and OK, got:\n%s", resp)
 	}
 }
 

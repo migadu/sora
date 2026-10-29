@@ -17,6 +17,20 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 		return nil, err
 	}
 
+	// A client whose ESEARCH was filtered is refused RETURN options (RFC 5530
+	// CLIENTBUG: it used what we did not advertise), before the search is charged
+	// or run. A plain SEARCH gets the SEARCH response, which go-imap writes when
+	// the session's capabilities lack ESEARCH.
+	if usedExtendedReturn(options) && !s.GetCapabilities().Has(imap.CapESearch) {
+		s.DebugLog("client using ESEARCH RETURN syntax but ESEARCH capability is filtered")
+		metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "esearch_not_advertised", "client_error").Inc()
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeClientBug,
+			Text: "ESEARCH is not supported for this client",
+		}
+	}
+
 	// Charge a search on message content to the search rate limit, before any
 	// expensive operation; one on metadata alone is free (see search_rate_limit.go).
 	if criteriaMatchesContent(criteria) {
@@ -111,22 +125,6 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 	// SEARCH without RETURN into RETURN (ALL) before calling the session, so from the
 	// wire this always holds; go-imap itself picks the SEARCH or ESEARCH response.
 	isESEARCH := options != nil && (options.ReturnMin || options.ReturnMax || options.ReturnAll || options.ReturnCount || options.ReturnSave)
-
-	// ReturnAll therefore cannot tell a plain SEARCH from an extended one; only MIN,
-	// MAX, COUNT and SAVE prove the client used RETURN. A client whose ESEARCH was
-	// filtered is refused those (RFC 5530 CLIENTBUG: it used what we did not
-	// advertise). A plain SEARCH gets the SEARCH response, which go-imap writes when
-	// the session's capabilities lack ESEARCH.
-	usedReturn := options != nil && (options.ReturnMin || options.ReturnMax || options.ReturnCount || options.ReturnSave)
-	if usedReturn && !s.GetCapabilities().Has(imap.CapESearch) {
-		s.DebugLog("client using ESEARCH RETURN syntax but ESEARCH capability is filtered")
-		metrics.ProtocolErrors.WithLabelValues("imap", "SEARCH", "esearch_not_advertised", "client_error").Inc()
-		return nil, &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeClientBug,
-			Text: "ESEARCH is not supported for this client",
-		}
-	}
 
 	// RFC 5182 §2.4 / RFC 9051 §6.4.4.1: SEARCH RETURN (SAVE) stores the result
 	// set referenced later by "$". The saved set is always stored as UIDs (stable
@@ -302,6 +300,14 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 	}
 
 	return searchData, nil
+}
+
+// usedExtendedReturn reports whether options prove the client sent RETURN
+// (RFC 4731). go-imap turns a SEARCH without RETURN into RETURN (ALL) before
+// calling the session, so ReturnAll proves nothing and only MIN, MAX, COUNT and
+// SAVE count. An explicit RETURN (ALL) or RETURN () passes as a plain SEARCH.
+func usedExtendedReturn(options *imap.SearchOptions) bool {
+	return options != nil && (options.ReturnMin || options.ReturnMax || options.ReturnCount || options.ReturnSave)
 }
 
 // decodeSearchCriteriaLocked translates sequence numbers in search criteria.
