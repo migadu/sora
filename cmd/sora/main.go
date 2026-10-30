@@ -41,6 +41,7 @@ import (
 	"github.com/migadu/sora/server/managesieveproxy"
 	"github.com/migadu/sora/server/pop3"
 	"github.com/migadu/sora/server/pop3proxy"
+	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/relayqueue"
 	"github.com/migadu/sora/server/sieveengine"
 	"github.com/migadu/sora/server/uploader"
@@ -111,6 +112,7 @@ type serverDependencies struct {
 	authCacheInstance     *authcache.Cache                     // persistent auth cache
 	proxyServers          map[string]adminapi.ProxyServer      // proxy name -> proxy server interface (for backend health)
 	proxyServersMux       sync.Mutex                           // protects proxyServers map
+	maintenance           *proxy.Maintenance                   // backends in maintenance, honored by every proxy (nil without proxies or DB)
 	runningServers        map[string]ConfigReloader            // server name -> reloadable server
 	runningServersMux     sync.Mutex                           // protects runningServers map
 }
@@ -1161,6 +1163,9 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	errChan := make(chan error, 1)
 	allServers := deps.config.GetAllServers()
 
+	// Before any proxy server starts: each one attaches this set as it is created.
+	deps.maintenance = startBackendMaintenance(ctx, deps)
+
 	// Start HTTP-01 challenge server for Let's Encrypt if using autocert
 	if deps.tlsManager != nil {
 		handler := deps.tlsManager.HTTPHandler()
@@ -1893,6 +1898,8 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		deps.connectionTrackersMux.Unlock()
 	}
 
+	deps.attachBackendMaintenance(ctx, "IMAP-"+serverConfig.Name, server.GetConnectionManager(), server.MaintenanceTargets)
+
 	// Register proxy server for backend health monitoring via Admin API
 	deps.proxyServersMux.Lock()
 	deps.proxyServers["IMAP-"+serverConfig.Name] = server
@@ -2022,6 +2029,9 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		deps.connectionTrackersMux.Unlock()
 	}
 
+	// POP3 sessions are short and cannot add uploads: they end on their own.
+	deps.attachBackendMaintenance(ctx, "POP3-"+serverConfig.Name, server.GetConnectionManager(), nil)
+
 	// Register proxy server for backend health monitoring via Admin API
 	deps.proxyServersMux.Lock()
 	deps.proxyServers["POP3-"+serverConfig.Name] = server
@@ -2150,6 +2160,9 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		deps.connectionTrackersMux.Unlock()
 	}
 
+	// ManageSieve sessions are short and cannot add uploads: they end on their own.
+	deps.attachBackendMaintenance(ctx, "ManageSieve-"+serverConfig.Name, server.GetConnectionManager(), nil)
+
 	// Register proxy server for backend health monitoring via Admin API
 	deps.proxyServersMux.Lock()
 	deps.proxyServers["ManageSieve-"+serverConfig.Name] = server
@@ -2275,6 +2288,9 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		deps.connectionTrackers[mapKey] = tracker
 		deps.connectionTrackersMux.Unlock()
 	}
+
+	// LMTP sessions re-route at their next transaction instead (lmtpproxy RCPT handling).
+	deps.attachBackendMaintenance(ctx, "LMTP-"+serverConfig.Name, server.GetConnectionManager(), nil)
 
 	// Register proxy server for backend health monitoring via Admin API
 	deps.proxyServersMux.Lock()
@@ -2506,6 +2522,9 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		errChan <- fmt.Errorf("failed to create User API proxy server: %w", err)
 		return
 	}
+
+	// User API requests are routed one by one: nothing to drain.
+	deps.attachBackendMaintenance(ctx, "UserAPI-"+serverConfig.Name, server.GetConnectionManager(), nil)
 
 	// Register proxy server for backend health monitoring via Admin API
 	deps.proxyServersMux.Lock()

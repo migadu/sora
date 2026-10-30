@@ -363,6 +363,16 @@ func (s *Session) handleConnection() {
 				}
 			}
 
+			// A session keeps its backend across transactions (an MTA may reuse its LMTP
+			// connection), so one held to a backend that has since gone into maintenance
+			// is dropped here, at the first recipient of a transaction: the backend holds
+			// no accepted recipient yet, so nothing is poisoned, and the connect below
+			// routes afresh and re-sends MAIL FROM. Never later in a transaction.
+			if s.backendConn != nil && s.acceptedRcpts == 0 && s.server.connManager.InMaintenance(s.serverAddr) {
+				s.InfoLog("dropping backend connection: backend in maintenance", "backend", s.serverAddr)
+				s.loseBackend()
+			}
+
 			// Connect to backend if not already connected
 			if s.backendConn == nil {
 				if err := s.connectToBackend(); err != nil {

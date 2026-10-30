@@ -1306,8 +1306,8 @@ func (s *Session) connectToBackend() error {
 	s.backendConn = backendConn
 	s.backendReader = bufio.NewReader(backendConn)
 	s.backendWriter = bufio.NewWriter(backendConn)
+	s.serverAddr = actualAddr // under mu: the maintenance drain reads it from another goroutine
 	s.mu.Unlock()
-	s.serverAddr = actualAddr
 
 	// Record successful connection for future affinity if enabled
 	// Auth-only remotelookup users (IsRemoteLookupAccount=true but ServerAddress="") should get affinity

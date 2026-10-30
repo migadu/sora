@@ -1163,6 +1163,38 @@ func (a *AuthCacheConfig) GetPurgeUnused() (time.Duration, error) {
 	return helpers.ParseDuration(a.PurgeUnused)
 }
 
+// MaintenanceConfig ([backend_maintenance]) tunes how proxies honor backends an operator
+// put in maintenance (`sora-admin backends maintenance on`). Proxies read the list from
+// the database, so a proxy without one cannot honor it.
+type MaintenanceConfig struct {
+	PollInterval string  `toml:"poll_interval"` // How often proxies re-read the maintenance list (default: "5s")
+	KickRate     float64 `toml:"kick_rate"`     // IMAP sessions per second each proxy closes on a backend in maintenance (default: 10)
+}
+
+// GetPollInterval returns how often proxies re-read the maintenance list.
+func (b *MaintenanceConfig) GetPollInterval() (time.Duration, error) {
+	if b.PollInterval == "" {
+		return 5 * time.Second, nil
+	}
+	d, err := helpers.ParseDuration(b.PollInterval)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("backend_maintenance.poll_interval must be positive, got %q", b.PollInterval)
+	}
+	return d, nil
+}
+
+// GetKickRate returns how many sessions per second a proxy closes on a backend in
+// maintenance.
+func (b *MaintenanceConfig) GetKickRate() float64 {
+	if b.KickRate <= 0 {
+		return 10
+	}
+	return b.KickRate
+}
+
 // Config holds all configuration for the application.
 type Config struct {
 	Logging          LoggingConfig          `toml:"logging"`
@@ -1172,6 +1204,7 @@ type Config struct {
 	Cluster          ClusterConfig          `toml:"cluster"`
 	LocalCache       LocalCacheConfig       `toml:"local_cache"`
 	AuthCache        AuthCacheConfig        `toml:"auth_cache"` // Persistent auth cache configuration
+	Maintenance      MaintenanceConfig      `toml:"backend_maintenance"`
 	Cleanup          CleanupConfig          `toml:"cleanup"`
 	Servers          ServersConfig          `toml:"servers"`
 	Uploader         UploaderConfig         `toml:"uploader"`

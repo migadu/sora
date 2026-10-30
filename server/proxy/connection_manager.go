@@ -87,6 +87,20 @@ type ConnectionManager struct {
 	// SetRestrictRemoteLookupToPool; default false preserves dynamic routing. Written
 	// once at startup (before serving) and then read-only, so it needs no lock.
 	restrictRemoteLookupToPool bool
+
+	// maintenance is the process-wide set of backends an operator put in maintenance;
+	// routing never picks one. Nil (contains nothing) until SetMaintenance.
+	maintenance atomic.Pointer[Maintenance]
+}
+
+// SetMaintenance attaches the process-wide set of backends in maintenance.
+func (cm *ConnectionManager) SetMaintenance(m *Maintenance) {
+	cm.maintenance.Store(m)
+}
+
+// InMaintenance reports whether addr is a backend an operator put in maintenance.
+func (cm *ConnectionManager) InMaintenance(addr string) bool {
+	return cm.maintenance.Load().Contains(addr)
 }
 
 // SetRestrictRemoteLookupToPool controls whether a backend address returned by the
@@ -272,6 +286,13 @@ func (cm *ConnectionManager) GetBackendByConsistentHash(username string) string 
 			return ""
 		}
 
+		// A backend in maintenance is skipped before its health is read, so it is
+		// never dialed and its record stays clean for when it returns.
+		if cm.InMaintenance(backend) {
+			exclude[backend] = true
+			continue
+		}
+
 		// Check if this backend is healthy
 		isHealthy := cm.IsBackendHealthy(backend)
 		logger.Debug("ConnectionManager: Consistent hash health check", "username", username, "backend", backend, "healthy", isHealthy, "iteration", i)
@@ -397,6 +418,7 @@ type BackendHealthInfo struct {
 	LastSuccess        time.Time `json:"last_success,omitempty"`
 	HealthCheckEnabled bool      `json:"health_check_enabled"`
 	IsRemoteLookup     bool      `json:"is_remote_lookup"` // True if backend from remote_lookup (not in pool)
+	InMaintenance      bool      `json:"in_maintenance"`   // True if an operator put the backend in maintenance
 }
 
 // HasHealthyPoolBackends checks if at least one pool backend (from remote_addrs config) is healthy.
@@ -444,6 +466,7 @@ func (cm *ConnectionManager) GetBackendHealthStatuses() []BackendHealthInfo {
 			LastSuccess:        health.LastSuccess,
 			HealthCheckEnabled: healthCheckEnabled,
 			IsRemoteLookup:     false, // Pool backend
+			InMaintenance:      cm.InMaintenance(addr),
 		}
 
 		// If health checks are disabled, all backends are considered healthy
@@ -465,6 +488,7 @@ func (cm *ConnectionManager) GetBackendHealthStatuses() []BackendHealthInfo {
 			LastSuccess:        health.LastSuccess,
 			HealthCheckEnabled: healthCheckEnabled,
 			IsRemoteLookup:     true, // Remote lookup backend
+			InMaintenance:      cm.InMaintenance(addr),
 		}
 
 		// If health checks are disabled, all backends are considered healthy
@@ -752,9 +776,15 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 
 	// Try all servers in round-robin order
 	startIndex := cm.nextIndex.Add(1) - 1
+	inMaintenance := 0
 	for i := 0; i < len(currentRemoteAddrs); i++ {
 		idx := (startIndex + uint32(i)) % uint32(len(currentRemoteAddrs))
 		addr := currentRemoteAddrs[idx]
+
+		if cm.InMaintenance(addr) {
+			inMaintenance++
+			continue
+		}
 
 		// Skip unhealthy backends
 		if !cm.IsBackendHealthy(addr) {
@@ -780,6 +810,11 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		logger.Warn("Failed to connect to backend (round-robin)", "addr", addr, "error", err, "ctx_err", ctx.Err(), "server", cm.serverName)
 	}
 
+	if inMaintenance > 0 && inMaintenance == len(currentRemoteAddrs) {
+		// Fail closed: maintenance means no new traffic, even when nothing else is left.
+		logger.Error("Every backend in the pool is in maintenance - refusing connection", "server", cm.serverName, "backends", currentRemoteAddrs)
+		return nil, "", fmt.Errorf("all remote servers are in maintenance")
+	}
 	return nil, "", fmt.Errorf("all remote servers are unavailable")
 }
 
@@ -787,6 +822,13 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 // It returns the connection, address, and an error if it fails.
 // The 'shouldFallback' boolean indicates if the caller should attempt round-robin.
 func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (conn net.Conn, addr string, err error, shouldFallback bool) {
+	// A backend in maintenance is never dialed. DetermineRoute already routes around it;
+	// this covers a preferred address that reached here some other way.
+	if cm.InMaintenance(preferredAddr) {
+		logger.Debug("ConnectionManager: Preferred backend is in maintenance. Falling back to round-robin.", "backend", preferredAddr, "server", cm.serverName)
+		return nil, "", nil, true
+	}
+
 	// Determine if this is a remote lookup route with explicit server designation
 	// Auth-only mode (AuthOnlyMode=true) means remote API authenticated but didn't specify backend,
 	// so we should treat it like a normal DB user (allow fallback to round-robin/affinity/consistent-hash)
@@ -1516,6 +1558,18 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		}
 	}
 
+	if result.RoutingInfo != nil && result.RoutingInfo.ServerAddress != "" && params.ConnManager.InMaintenance(result.RoutingInfo.ServerAddress) {
+		// The remote-lookup-specified backend is in maintenance: route this user as in
+		// auth-only mode (affinity, consistent hash, round-robin). The routing info is
+		// copied, not edited — it may be a lookup-cache entry other sessions share, and the
+		// pin must come back when maintenance ends.
+		logger.Info("Remote lookup backend in maintenance - routing normally", "proxy", params.ProxyName, "user", params.Username, "backend", result.RoutingInfo.ServerAddress)
+		routed := *result.RoutingInfo
+		routed.ServerAddress = ""
+		routed.AuthOnlyMode = true
+		result.RoutingInfo = &routed
+	}
+
 	if result.RoutingInfo != nil && result.RoutingInfo.ServerAddress != "" {
 		// restrict_to_pool (SSRF defense): only honor the remote-lookup-specified backend
 		// if it is in the configured pool. Otherwise fall through to in-pool routing below,
@@ -1595,10 +1649,12 @@ func resolveAffinityRoute(params RouteParams, affinityMgr AffinityManager, resul
 			}
 		}
 
-		// Check if the backend is still configured in our pool.
-		// It might have been removed from the config since the affinity was cached.
-		if !params.ConnManager.HasBackend(targetAddr) {
-			logger.Info("Cluster affinity backend no longer configured - deleting affinity", "proxy", params.ProxyName, "backend", lastAddr, "user", params.Username, "protocol", foundProtocol)
+		// Check if the backend is still configured in our pool and not in maintenance.
+		// It might have been removed from the config since the affinity was cached. A
+		// backend in maintenance is treated the same: the user is routed afresh, and the
+		// new affinity keeps them there after maintenance ends (no stampede back).
+		if !params.ConnManager.HasBackend(targetAddr) || params.ConnManager.InMaintenance(targetAddr) {
+			logger.Info("Cluster affinity backend no longer configured or in maintenance - deleting affinity", "proxy", params.ProxyName, "backend", lastAddr, "user", params.Username, "protocol", foundProtocol)
 			affinityMgr.DeleteBackend(params.Username, foundProtocol)
 
 			if foundProtocol == params.Protocol {

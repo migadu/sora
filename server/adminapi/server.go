@@ -144,6 +144,7 @@ type BackendHealthInfo struct {
 	LastSuccess        time.Time `json:"last_success,omitempty"`
 	HealthCheckEnabled bool      `json:"health_check_enabled"`
 	IsRemoteLookup     bool      `json:"is_remote_lookup"` // True if backend from remote_lookup (not in pool)
+	InMaintenance      bool      `json:"in_maintenance"`   // True if this proxy honors maintenance for the backend
 }
 
 // ProxyBackendsResponse is the response structure for /admin/proxy/backends
@@ -1724,6 +1725,7 @@ func (s *Server) handleProxyBackends(w http.ResponseWriter, r *http.Request) {
 					LastSuccess:        status.LastSuccess,
 					HealthCheckEnabled: status.HealthCheckEnabled,
 					IsRemoteLookup:     status.IsRemoteLookup,
+					InMaintenance:      status.InMaintenance,
 				}
 			}
 

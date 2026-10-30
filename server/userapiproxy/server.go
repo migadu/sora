@@ -472,8 +472,9 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 		cached, found := s.lookupCache.Get(s.name, email)
 		// AllowRemoteLookupBackend re-validates the cached address against the pool when
 		// restrict_to_pool is on (defends against a stale entry surviving a pool shrink);
-		// it is a passthrough when the feature is off.
-		if found && !cached.IsNegative && s.connManager.AllowRemoteLookupBackend(cached.ServerAddress) {
+		// it is a passthrough when the feature is off. A cached backend in maintenance is
+		// skipped like a refused one; the route chosen below replaces the entry.
+		if found && !cached.IsNegative && s.connManager.AllowRemoteLookupBackend(cached.ServerAddress) && !s.connManager.InMaintenance(cached.ServerAddress) {
 			// Positive cache entry - use cached route
 			// NOTE: We do NOT refresh routing cache. Entries should expire after
 			// positive_ttl to allow periodic revalidation via remotelookup.
@@ -495,8 +496,9 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 		// AllowRemoteLookupBackend gates the affinity address too: affinity is gossip-synced
 		// and persisted, so a poisoned/out-of-pool entry from another node must not be dialed
 		// when restrict_to_pool is on. Passthrough when the feature is off. On refusal this
-		// falls through to consistent hash below.
-		if backend, found := s.affinityManager.GetBackend(email, "userapi"); found && s.connManager.AllowRemoteLookupBackend(backend) {
+		// falls through to consistent hash below, as does an affinity to a backend in
+		// maintenance (the new affinity set below keeps the user there afterwards).
+		if backend, found := s.affinityManager.GetBackend(email, "userapi"); found && s.connManager.AllowRemoteLookupBackend(backend) && !s.connManager.InMaintenance(backend) {
 			logger.Debug("User API Proxy: Using affinity backend", "name", s.name, "user", email, "backend", backend)
 			// Cache the route if lookup cache is enabled
 			if s.lookupCache != nil {
@@ -525,7 +527,7 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 		if err != nil {
 			logger.Warn("User API Proxy: RemoteLookup failed", "name", s.name, "user", email, "error", err)
 			// Fall through to consistent hash
-		} else if routingInfo != nil && routingInfo.ServerAddress != "" && s.connManager.AllowRemoteLookupBackend(routingInfo.ServerAddress) {
+		} else if routingInfo != nil && routingInfo.ServerAddress != "" && s.connManager.AllowRemoteLookupBackend(routingInfo.ServerAddress) && !s.connManager.InMaintenance(routingInfo.ServerAddress) {
 			// restrict_to_pool (SSRF defense): AllowRemoteLookupBackend logs and returns
 			// false for an out-of-pool address, so this branch is skipped and routing
 			// falls through to consistent hash below — the bad address is never dialed.
