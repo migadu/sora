@@ -258,6 +258,20 @@ func TestIMAP_SearchRes(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("RefusedLiteralInBadSaveKeepsDollar", func(t *testing.T) {
+		// SAVE from a source other than the selected mailbox is BAD (RFC 7377
+		// §2.2), and so keeps "$", even when go-imap refuses an oversized literal
+		// in it before the command is fully read.
+		c := newConn(t)
+		uids := setupMailbox(t, c, "SR_SaveLiteralBad")
+		want := []imap.UID{uids[0], uids[2], uids[4]}
+		c.do(`UID SEARCH RETURN (SAVE) SEEN`)
+		if got := c.status("ESEARCH IN (personal) RETURN (SAVE) TEXT {4097}"); !strings.HasPrefix(got, "BAD") {
+			t.Fatalf("ESEARCH IN (personal) SAVE with an oversized literal: %s, want BAD", got)
+		}
+		assertUIDs(t, "UID FETCH $ after the refused literal", c.fetchDollarUIDs(), want)
+	})
 }
 
 // TestIMAP_SearchRes_RateLimitedSaveEmptiesDollar: a SAVE search refused with
