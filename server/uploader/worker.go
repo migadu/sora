@@ -1269,7 +1269,7 @@ func (w *UploadWorker) monitorStuckUploads(ctx context.Context) error {
 			logger.Error("UploaderMonitor: Failed to get failed upload details", "error", err)
 		} else {
 			for _, upload := range failed {
-				logger.Warn("UploaderMonitor: Stuck upload", "id", upload.ID, "account_id", upload.AccountID, "hash", upload.ContentHash[:16], "attempts", upload.Attempts, "age", time.Since(upload.CreatedAt).Round(time.Minute))
+				logger.Warn("UploaderMonitor: Stuck upload", "id", upload.ID, "account_id", upload.AccountID, "hash", upload.ContentHash[:min(16, len(upload.ContentHash))], "attempts", upload.Attempts, "age", time.Since(upload.CreatedAt).Round(time.Minute))
 			}
 		}
 	}

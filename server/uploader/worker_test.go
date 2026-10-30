@@ -86,6 +86,9 @@ func (m *mockDB) ExistingPendingUploads(ctx context.Context, accountID int64, co
 }
 
 func (m *mockDB) GetFailedUploadsWithRetry(ctx context.Context, maxAttempts int, limit int) ([]db.PendingUpload, error) {
+	if m.GetFailedUploadsWithRetryFunc != nil {
+		return m.GetFailedUploadsWithRetryFunc(ctx, maxAttempts, limit)
+	}
 	return nil, nil
 }
 
