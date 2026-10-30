@@ -289,7 +289,7 @@ func (s *IMAPSession) emptySavedSearchOnNo(err error) {
 	if err == nil || (errors.As(err, &imapErr) && imapErr.Type == imap.StatusResponseTypeBad) {
 		return
 	}
-	s.setSavedSearchResult(nil)
+	s.ResetSearchRes()
 	s.DebugLog("emptied '$' after a failed SAVE search", "error", err)
 }
 

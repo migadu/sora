@@ -59,6 +59,7 @@ var (
 	_ imapserver.SessionMultiSearch    = (*meteredSession)(nil)
 	_ imapserver.SessionID             = (*meteredSession)(nil)
 	_ imapserver.SessionNotify         = (*meteredSession)(nil)
+	_ imapserver.SessionSearchRes      = (*meteredSession)(nil)
 )
 
 // newMeteredSession wraps an IMAP session for command metric collection.

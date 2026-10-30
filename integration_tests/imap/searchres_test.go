@@ -224,16 +224,21 @@ func TestIMAP_SearchRes(t *testing.T) {
 
 	t.Run("FailedSaveEmptiesDollar", func(t *testing.T) {
 		// RFC 5182 §2.1: a SAVE search that fails with NO sets "$" to the empty
-		// sequence. 21 UID keys exceed the validator's limit (NO [SERVERLIMIT]).
+		// sequence, whether sora refuses it (21 UID keys exceed the validator's
+		// limit) or go-imap does before calling sora (an unsupported charset).
 		c := newConn(t)
 		uids := setupMailbox(t, c, "SR_SaveNo")
-		tooMany := strings.TrimSpace(strings.Repeat(fmt.Sprintf("UID %d ", uids[0]), 21))
-		for _, cmd := range searchCommands {
-			c.do(`UID SEARCH RETURN (SAVE) SEEN`)
-			if got := c.status(cmd + " RETURN (SAVE) " + tooMany); !strings.HasPrefix(got, "NO") {
-				t.Fatalf("%s with 21 UID keys: %s, want NO", cmd, got)
+		for _, failing := range []struct{ criteria, want string }{
+			{strings.TrimSpace(strings.Repeat(fmt.Sprintf("UID %d ", uids[0]), 21)), "NO [SERVERLIMIT]"},
+			{fmt.Sprintf("CHARSET ISO-8859-1 UID %d", uids[1]), "NO [BADCHARSET]"},
+		} {
+			for _, cmd := range searchCommands {
+				c.do(`UID SEARCH RETURN (SAVE) SEEN`)
+				if got := c.status(cmd + " RETURN (SAVE) " + failing.criteria); !strings.HasPrefix(got, failing.want) {
+					t.Fatalf("%s RETURN (SAVE) %s: %s, want %s", cmd, failing.criteria, got, failing.want)
+				}
+				assertUIDs(t, "UID FETCH $ after "+failing.want+" to "+cmd, c.fetchDollarUIDs(), nil)
 			}
-			assertUIDs(t, "UID FETCH $ after a failed "+cmd+" SAVE", c.fetchDollarUIDs(), nil)
 		}
 	})
 

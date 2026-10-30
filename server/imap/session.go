@@ -450,6 +450,13 @@ func (s *IMAPSession) setSavedSearchResult(uids imap.UIDSet) {
 	s.mutex.Unlock()
 }
 
+// ResetSearchRes empties the saved "$" result (imapserver.SessionSearchRes).
+// go-imap calls it when it answers a SAVE search NO itself, before calling
+// Search or MultiSearch, as for an unsupported CHARSET (RFC 5182 §2.1).
+func (s *IMAPSession) ResetSearchRes() {
+	s.setSavedSearchResult(nil)
+}
+
 // savedSearchResultLocked returns a copy of the saved "$" result set.
 // The caller MUST hold s.mutex (read or write lock).
 func (s *IMAPSession) savedSearchResultLocked() imap.UIDSet {
