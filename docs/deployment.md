@@ -103,6 +103,29 @@ You will have two different `config.toml` files: one for your proxy nodes and on
 *   For improved performance, configure `[database.read]` to point to PostgreSQL read-replicas.
 
 
+## Taking a Backend Out of Service
+
+A backend cannot simply be stopped. Mail it accepted is uploaded to S3 only by that backend (the body waits in its local spool, and its `pending_uploads` rows are leased to its `[uploader] instance_id`), and once a stopped node's heartbeat is stale the cleaner eventually reaps those rows together with their messages. Removing it from `remote_addrs` needs every proxy reconfigured and restarted. Instead, put it in maintenance:
+
+```bash
+sora-admin backends maintenance on --host storage2.example.com --reason "disk swap" --wait
+```
+
+Within one `[backend_maintenance] poll_interval` (default 5s), every proxy:
+
+*   routes new logins, deliveries and User API requests to other backends, including users with affinity to the backend and users whose remote-lookup route names it (they are routed as in auth-only mode);
+*   closes IMAP sessions on the backend gradually (`kick_rate` per second per proxy, with `* BYE [UNAVAILABLE]`), since an open session can keep APPENDing;
+*   drops an LMTP session's connection to the backend at its next transaction, before any recipient is accepted.
+
+POP3 and ManageSieve sessions are short and cannot add uploads, so they are left to end. A backend in maintenance is never marked unhealthy, and if every backend of a pool is in maintenance the proxy refuses the connection rather than use one.
+
+`--wait` returns once the backend's upload backlog has stayed at zero for two minutes; `backends status` shows the same without waiting. Parked uploads (out of attempts) never drain on their own: resolve them with `sora-admin uploader resolve` on that node. Before stopping the backend, also check its relay queue (`sora-admin relay stats`, on the node) and that nothing reaches it except through proxies: maintenance is enforced by proxies, not by the backend itself.
+
+`--host` is the backend as the proxies know it, a name or an IP, without a port: one entry covers every protocol the host serves, and a name also covers the addresses it resolves to. `--instance` is the backend's uploader instance id, defaulting to the host. Proxies need database access to honor maintenance; one without it logs a warning at startup. Each proxy marks the backends it honors as `[maintenance]` in `sora-admin health status --backends`.
+
+To bring the backend back: `sora-admin backends maintenance off --host storage2.example.com`. Users moved off it keep their new backend until their affinity expires, so they do not all return at once.
+
+
 ## Connection Poolers (PgBouncer)
 
 Sora works behind PgBouncer in any pooling mode, including transaction pooling. Nothing session-scoped is relied on: statement and lock timeouts are applied with `SET LOCAL`, and every advisory lock is transaction-scoped (`pg_advisory_xact_lock`), held in a dedicated transaction that stays open exactly as long as the lock is needed.

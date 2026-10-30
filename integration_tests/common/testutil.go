@@ -1206,8 +1206,25 @@ func SetupIMAPServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 // SetupIMAPServerWithPROXYAndDatabase sets up an IMAP server with PROXY protocol using an existing database
 func SetupIMAPServerWithPROXYAndDatabase(t *testing.T, rdb *resilient.ResilientDatabase) *TestServer {
 	t.Helper()
+	return SetupIMAPServerWithPROXYAndDatabaseAt(t, rdb, GetRandomAddress(t))
+}
 
-	address := GetRandomAddress(t)
+// GetRandomIPv6LoopbackAddress returns a free "[::1]:port", or skips the test when this
+// machine has no IPv6 loopback. Tests use it for a second backend on a different HOST
+// than 127.0.0.1, which host-level features (backend maintenance) need to tell apart.
+func GetRandomIPv6LoopbackAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	defer listener.Close()
+	return listener.Addr().String()
+}
+
+// SetupIMAPServerWithPROXYAndDatabaseAt is SetupIMAPServerWithPROXYAndDatabase listening on address.
+func SetupIMAPServerWithPROXYAndDatabaseAt(t *testing.T, rdb *resilient.ResilientDatabase, address string) *TestServer {
+	t.Helper()
 
 	// Create a temporary directory for the uploader
 	tempDir, err := os.MkdirTemp("", "sora-test-upload-proxy-*")

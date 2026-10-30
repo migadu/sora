@@ -70,6 +70,16 @@ Restores soft-deleted messages for a user or the entire system. Messages are sof
 ./sora-admin -config ... restore --email user@example.com
 ```
 
+### `backends`
+
+Puts a backend in maintenance: proxies stop sending it new traffic while it finishes its own uploads, after which it is safe to stop. See [Taking a backend out of service](deployment.md#taking-a-backend-out-of-service).
+
+```bash
+./sora-admin -config ... backends maintenance on --host storage2.example.com --reason "disk swap" --wait
+./sora-admin -config ... backends status
+./sora-admin -config ... backends maintenance off --host storage2.example.com
+```
+
 ### `health-status`
 
 Checks the health of the system's components (Database, S3) and reports the status.

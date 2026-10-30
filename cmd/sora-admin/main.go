@@ -280,6 +280,8 @@ func main() {
 		handleConnectionsCommand(ctx)
 	case "affinity":
 		handleAffinityCommand(ctx)
+	case "backends":
+		handleBackendsCommand(ctx)
 	case "health":
 		handleHealthCommand(ctx)
 	case "migrate":
@@ -333,6 +335,7 @@ Commands:
   stats         System statistics and analytics
   connections   Connection management
   affinity      User-to-backend affinity management
+  backends      Backend maintenance (drain a backend before stopping it)
   health        System health status
   config        Configuration management
   migrate       Database schema migration management

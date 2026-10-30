@@ -378,6 +378,7 @@ func showBackendHealth(ctx context.Context, cfg AdminConfig) error {
 				LastSuccess        time.Time `json:"last_success,omitempty"`
 				HealthCheckEnabled bool      `json:"health_check_enabled"`
 				IsRemoteLookup     bool      `json:"is_remote_lookup"`
+				InMaintenance      bool      `json:"in_maintenance"`
 			} `json:"backends"`
 		} `json:"proxies"`
 		Timestamp time.Time `json:"timestamp"`
@@ -417,6 +418,9 @@ func showBackendHealth(ctx context.Context, cfg AdminConfig) error {
 			backendType := ""
 			if backend.IsRemoteLookup {
 				backendType = " [remote_lookup]"
+			}
+			if backend.InMaintenance {
+				backendType += " [maintenance]"
 			}
 
 			fmt.Printf("  %-25s %s%-12s\033[0m%s", backend.Address, statusColor, healthStatus, backendType)
