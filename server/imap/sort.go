@@ -82,43 +82,35 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 	// Create SortData with the results
 	sortData := &imap.SortData{}
 
-	// Handle ESORT options if provided and capability is enabled
+	// RFC 5267: only return what was requested. go-imap refuses RETURN from a
+	// session without ESORT and hands over a plain SORT as RETURN (ALL), so the
+	// options say what to return either way.
+	var returned *imap.SearchOptions
 	if options != nil {
-		if !s.GetCapabilities().Has(imap.CapESort) {
-			s.InfoLog("ESORT options ignored due to capability filtering")
-			// If ESORT is not available, return All by default
+		if options.ReturnCount {
+			sortData.Count = uint32(len(nums))
+		}
+		if options.ReturnMin && len(nums) > 0 {
+			sortData.Min = nums[0]
+		}
+		if options.ReturnMax && len(nums) > 0 {
+			sortData.Max = nums[len(nums)-1]
+		}
+		if options.ReturnAll {
 			sortData.All = nums
-		} else {
-			// RFC 5267: Only return what was requested
-			if options.ReturnCount {
-				sortData.Count = uint32(len(nums))
-			}
-			if options.ReturnMin && len(nums) > 0 {
-				sortData.Min = nums[0]
-			}
-			if options.ReturnMax && len(nums) > 0 {
-				sortData.Max = nums[len(nums)-1]
-			}
-			if options.ReturnAll {
-				sortData.All = nums
-			}
+		}
+		returned = &imap.SearchOptions{
+			ReturnMin:   options.ReturnMin,
+			ReturnMax:   options.ReturnMax,
+			ReturnAll:   options.ReturnAll,
+			ReturnCount: options.ReturnCount,
 		}
 	} else {
-		// No ESORT options, return All by default (regular SORT)
+		// No options from a direct caller: return All, as for a plain SORT.
 		sortData.All = nums
 	}
 
 	if s.GetCapabilities().Has(imap.CapCondStore) {
-		// Without ESORT only All is returned, as for no options.
-		var returned *imap.SearchOptions
-		if options != nil && s.GetCapabilities().Has(imap.CapESort) {
-			returned = &imap.SearchOptions{
-				ReturnMin:   options.ReturnMin,
-				ReturnMax:   options.ReturnMax,
-				ReturnAll:   options.ReturnAll,
-				ReturnCount: options.ReturnCount,
-			}
-		}
 		// MIN and MAX are the first and last messages in sort order (RFC 5267 §3.1).
 		sortData.ModSeq = returnedModSeq(messages, 0, len(messages)-1, returned)
 	}

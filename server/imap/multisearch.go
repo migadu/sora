@@ -16,7 +16,11 @@ import (
 // ACL-checked set of mailboxes and UID-search each. ESEARCH always reports UIDs
 // (sequence numbers are meaningless for unselected mailboxes), and every result
 // carries its Mailbox + UIDValidity so returned UIDs are unambiguous.
-func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource, criteria *imap.SearchCriteria, options *imap.SearchOptions) ([]*imap.SearchData, error) {
+func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource, criteria *imap.SearchCriteria, options *imap.SearchOptions) (_ []*imap.SearchData, err error) {
+	if options != nil && options.ReturnSave {
+		defer func() { s.emptySavedSearchOnNo(err) }()
+	}
+
 	if ctx.Err() != nil {
 		s.DebugLog("session context is cancelled, skipping multisearch")
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed"}
@@ -54,6 +58,10 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 
 	var results []*imap.SearchData
 
+	// RETURN (SAVE) sets "$" as SEARCH does. go-imap allows it only when the
+	// selected mailbox is the sole source (RFC 7377 §2.2), so at most one mailbox
+	// contributes; one with no match leaves the saved set empty.
+	var saved imap.UIDSet
 	for _, mbox := range mailboxes {
 		// RFC 4314: SEARCH requires the 'r' (read) right. GetMailboxes also lists
 		// shared mailboxes that are visible with only the 'l' (lookup) right, and
@@ -124,8 +132,16 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 		if s.GetCapabilities().Has(imap.CapCondStore) {
 			searchData.ModSeq = returnedModSeq(messages, minIdx, maxIdx, options)
 		}
+		if options != nil && options.ReturnSave {
+			saved = savedSearchSet(messages, minIdx, maxIdx, options)
+		}
 
 		results = append(results, searchData)
+	}
+
+	if options != nil && options.ReturnSave {
+		s.setSavedSearchResult(saved)
+		s.DebugLog("saved ESEARCH result for '$'", "count", len(saved))
 	}
 
 	return results, nil

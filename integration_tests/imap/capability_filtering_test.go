@@ -470,14 +470,14 @@ func TestIMAP_CapabilityFiltering_iOSAppleMail(t *testing.T) {
 		ReturnMax:   true,
 	}
 
-	// This should return NO [CLIENTBUG] error when ESEARCH is disabled per RFC 5530
+	// This should return BAD [CLIENTBUG] when ESEARCH is disabled (RFC 4466 §2.6.1)
 	_, err = c.Search(&imap.SearchCriteria{
 		Header: []imap.SearchCriteriaHeaderField{
 			{Key: "Subject", Value: "Test Message"},
 		},
 	}, searchOptions).Wait()
 
-	// The key test: ESEARCH should return NO [CLIENTBUG] when capability is filtered
+	// The key test: ESEARCH should return BAD [CLIENTBUG] when capability is filtered
 	if err == nil {
 		t.Fatal("Expected error when using ESEARCH syntax with ESEARCH capability filtered, but got success")
 	}
@@ -487,13 +487,13 @@ func TestIMAP_CapabilityFiltering_iOSAppleMail(t *testing.T) {
 	if !errors.As(err, &imapErr) {
 		t.Fatalf("Expected imap.Error, got: %v", err)
 	}
-	if imapErr.Type != imap.StatusResponseTypeNo {
-		t.Errorf("Expected NO response, got: %v", imapErr.Type)
+	if imapErr.Type != imap.StatusResponseTypeBad {
+		t.Errorf("Expected BAD response, got: %v", imapErr.Type)
 	}
 	if imapErr.Code != imap.ResponseCodeClientBug {
 		t.Errorf("Expected CLIENTBUG response code, got: %v", imapErr.Code)
 	}
-	t.Logf("SUCCESS: ESEARCH with return options correctly returned NO [CLIENTBUG] when ESEARCH is filtered")
+	t.Logf("SUCCESS: ESEARCH with return options correctly returned BAD [CLIENTBUG] when ESEARCH is filtered")
 
 	// Test 3: SORT with ESORT options should be ignored when ESORT is filtered
 	sortOptions := &imapclient.SortOptions{
@@ -603,7 +603,7 @@ func TestIMAP_CapabilityFiltering_ESEARCHFallback(t *testing.T) {
 	}
 
 	// Issue a SEARCH command with ESEARCH options. Since ESEARCH is disabled for this client,
-	// the server should return NO [CLIENTBUG] error per RFC 5530
+	// the server should return BAD [CLIENTBUG] (RFC 4466 §2.6.1)
 	cmd := c.Search(&imap.SearchCriteria{Text: []string{"fallback"}}, &imap.SearchOptions{ReturnCount: true, ReturnMin: true, ReturnMax: true})
 	_, err = cmd.Wait()
 	if err == nil {
@@ -615,17 +615,17 @@ func TestIMAP_CapabilityFiltering_ESEARCHFallback(t *testing.T) {
 	if !errors.As(err, &imapErr) {
 		t.Fatalf("Expected imap.Error, got: %v", err)
 	}
-	if imapErr.Type != imap.StatusResponseTypeNo {
-		t.Errorf("Expected NO response, got: %v", imapErr.Type)
+	if imapErr.Type != imap.StatusResponseTypeBad {
+		t.Errorf("Expected BAD response, got: %v", imapErr.Type)
 	}
 	if imapErr.Code != imap.ResponseCodeClientBug {
 		t.Errorf("Expected CLIENTBUG response code, got: %v", imapErr.Code)
 	}
-	if !strings.Contains(imapErr.Text, "ESEARCH is not supported") {
-		t.Errorf("Expected error message about ESEARCH not supported, got: %s", imapErr.Text)
+	if !strings.Contains(imapErr.Text, "require ESEARCH") {
+		t.Errorf("Expected error message about ESEARCH being required, got: %s", imapErr.Text)
 	}
 
-	t.Logf("SUCCESS: Server correctly returned NO [CLIENTBUG] for ESEARCH syntax when capability is filtered")
+	t.Logf("SUCCESS: Server correctly returned BAD [CLIENTBUG] for ESEARCH syntax when capability is filtered")
 }
 
 // TestIMAP_StandardSearch_ReturnsStandardResponse verifies that a standard SEARCH
@@ -790,10 +790,9 @@ func TestIMAP_CapabilityFiltering_BeforeAfterID(t *testing.T) {
 	writer.Flush()
 	readResponse("A03")
 
-	// STEP 1: Perform ESEARCH before ID command. COUNT, not ALL: a RETURN (ALL)
-	// cannot be told from a plain SEARCH, which a filtered client gets answered.
+	// STEP 1: Perform ESEARCH before ID command
 	t.Logf("=== STEP 1: ESEARCH before ID command ===")
-	sendCommand("DI18", "UID SEARCH RETURN (COUNT) UID 1:*")
+	sendCommand("DI18", "UID SEARCH RETURN (ALL) UID 1:*")
 	beforeIDResponses := readResponse("DI18")
 
 	// Check if we got ESEARCH response (should be based on server capabilities)
@@ -814,17 +813,17 @@ func TestIMAP_CapabilityFiltering_BeforeAfterID(t *testing.T) {
 	sendCommand("DX2", `ID ("name" "TestClientWithESEARCHDisabled" "version" "1.0")`)
 	readResponse("DX2")
 
-	// STEP 3: Perform ESEARCH after ID command - should get NO [CLIENTBUG] error
+	// STEP 3: Perform ESEARCH after ID command - should get BAD [CLIENTBUG] error
 	t.Logf("=== STEP 3: ESEARCH after ID command ===")
-	sendCommand("DI19", "UID SEARCH RETURN (COUNT) UID 1:*")
+	sendCommand("DI19", "UID SEARCH RETURN (ALL) UID 1:*")
 	afterIDResponses := readResponse("DI19")
 
-	// Check if we got NO [CLIENTBUG] response (should be filtered)
+	// Check if we got BAD [CLIENTBUG] response (should be filtered)
 	var gotClientBugAfterID bool
 	for _, resp := range afterIDResponses {
-		if strings.Contains(resp, "DI19 NO") && strings.Contains(resp, "CLIENTBUG") {
+		if strings.Contains(resp, "DI19 BAD") && strings.Contains(resp, "CLIENTBUG") {
 			gotClientBugAfterID = true
-			t.Logf("After ID: Got NO [CLIENTBUG] response: %s", resp)
+			t.Logf("After ID: Got BAD [CLIENTBUG] response: %s", resp)
 			break
 		}
 	}
@@ -837,18 +836,18 @@ func TestIMAP_CapabilityFiltering_BeforeAfterID(t *testing.T) {
 	}
 
 	if gotClientBugAfterID {
-		t.Logf("✓ After ID: Server returned NO [CLIENTBUG] (capability filtering applied)")
+		t.Logf("✓ After ID: Server returned BAD [CLIENTBUG] (capability filtering applied)")
 	} else {
-		t.Errorf("✗ After ID: Server did not properly apply capability filtering - should return NO [CLIENTBUG]")
+		t.Errorf("✗ After ID: Server did not properly apply capability filtering - should return BAD [CLIENTBUG]")
 	}
 
 	// The test should verify that:
 	// 1. Before ID: Server behavior should be based on server capabilities (ESEARCH works)
-	// 2. After ID: Server should respect capability filtering and return NO [CLIENTBUG] error
+	// 2. After ID: Server should respect capability filtering and return BAD [CLIENTBUG] error
 	if !gotClientBugAfterID {
 		t.Errorf("FAILURE: Capability filtering not working properly after ID command")
 	} else {
-		t.Logf("SUCCESS: Capability filtering working correctly - returns NO [CLIENTBUG] after ID command")
+		t.Logf("SUCCESS: Capability filtering working correctly - returns BAD [CLIENTBUG] after ID command")
 	}
 }
 
@@ -911,7 +910,7 @@ func TestIMAP_ESEARCHFallback_RepeatedSearches(t *testing.T) {
 	}
 
 	// Perform multiple searches with ESEARCH options in rapid succession
-	// Since ESEARCH is filtered, the server should return NO [CLIENTBUG] for each attempt
+	// Since ESEARCH is filtered, the server should return BAD [CLIENTBUG] for each attempt
 	// This verifies consistent error handling without infinite loop or state corruption.
 	searchOptions := &imap.SearchOptions{
 		ReturnCount: true,
@@ -934,17 +933,17 @@ func TestIMAP_ESEARCHFallback_RepeatedSearches(t *testing.T) {
 		if !errors.As(err, &imapErr) {
 			t.Fatalf("Search %d: Expected imap.Error, got: %v", i, err)
 		}
-		if imapErr.Type != imap.StatusResponseTypeNo {
-			t.Errorf("Search %d: Expected NO response, got: %v", i, imapErr.Type)
+		if imapErr.Type != imap.StatusResponseTypeBad {
+			t.Errorf("Search %d: Expected BAD response, got: %v", i, imapErr.Type)
 		}
 		if imapErr.Code != imap.ResponseCodeClientBug {
 			t.Errorf("Search %d: Expected CLIENTBUG response code, got: %v", i, imapErr.Code)
 		}
 
-		t.Logf("Search iteration %d: Correctly returned NO [CLIENTBUG]", i)
+		t.Logf("Search iteration %d: Correctly returned BAD [CLIENTBUG]", i)
 	}
 
-	t.Logf("SUCCESS: All 10 repeated searches with ESEARCH options returned NO [CLIENTBUG] consistently")
+	t.Logf("SUCCESS: All 10 repeated searches with ESEARCH options returned BAD [CLIENTBUG] consistently")
 }
 
 // TestIMAP_ESEARCHFallback_EmptyResults verifies that ESEARCH fallback
@@ -983,7 +982,7 @@ func TestIMAP_ESEARCHFallback_EmptyResults(t *testing.T) {
 		t.Fatalf("Select INBOX failed: %v", err)
 	}
 
-	// Try ESEARCH syntax - should return NO [CLIENTBUG] error
+	// Try ESEARCH syntax - should return BAD [CLIENTBUG] error
 	_, err = c.Search(&imap.SearchCriteria{
 		Text: []string{"ThisStringDoesNotExistInAnyMessage12345"},
 	}, &imap.SearchOptions{
@@ -1001,14 +1000,14 @@ func TestIMAP_ESEARCHFallback_EmptyResults(t *testing.T) {
 	if !errors.As(err, &imapErr) {
 		t.Fatalf("Expected imap.Error, got: %v", err)
 	}
-	if imapErr.Type != imap.StatusResponseTypeNo {
-		t.Errorf("Expected NO response, got: %v", imapErr.Type)
+	if imapErr.Type != imap.StatusResponseTypeBad {
+		t.Errorf("Expected BAD response, got: %v", imapErr.Type)
 	}
 	if imapErr.Code != imap.ResponseCodeClientBug {
 		t.Errorf("Expected CLIENTBUG response code, got: %v", imapErr.Code)
 	}
 
-	t.Logf("SUCCESS: ESEARCH correctly returned NO [CLIENTBUG] even for query that would return empty results")
+	t.Logf("SUCCESS: ESEARCH correctly returned BAD [CLIENTBUG] even for query that would return empty results")
 
 	// Perform another search after empty result to ensure session is still healthy
 	testMessage := fmt.Sprintf("From: test@example.com\r\n"+
