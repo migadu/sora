@@ -329,6 +329,83 @@ func TestAccountCRUD(t *testing.T) {
 	}
 }
 
+// TestAccountUsageListing walks /admin/usage/accounts page by page and checks
+// its bounds.
+func TestAccountUsageListing(t *testing.T) {
+	server := setupHTTPAPIServer(t)
+	defer server.Close()
+
+	var ids []int64
+	for i := 0; i < 3; i++ {
+		email := fmt.Sprintf("test-usage-%d-%d@example.com", time.Now().UnixNano(), i)
+		resp, body := server.makeRequest(t, "POST", "/admin/accounts", adminapi.CreateAccountRequest{Email: email, Password: "test-password-123"})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create %s: %d %s", email, resp.StatusCode, body)
+		}
+		var created struct {
+			AccountID int64 `json:"account_id"`
+		}
+		server.expectJSON(t, body, &created)
+		ids = append(ids, created.AccountID)
+	}
+
+	type page struct {
+		Accounts []struct {
+			AccountID    int64  `json:"account_id"`
+			PrimaryEmail string `json:"primary_email"`
+			StorageUsed  int64  `json:"storage_used"`
+		} `json:"accounts"`
+		NextAfter *int64 `json:"next_after"`
+	}
+	// Other tests create accounts meanwhile: walk from just before ours until
+	// past them, one account per page.
+	seen := map[int64]bool{}
+	after := ids[0] - 1
+	for after < ids[2] {
+		resp, body := server.makeRequest(t, "GET", fmt.Sprintf("/admin/usage/accounts?after=%d&limit=1", after), nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("page after %d: %d %s", after, resp.StatusCode, body)
+		}
+		var p page
+		server.expectJSON(t, body, &p)
+		if len(p.Accounts) != 1 || p.NextAfter == nil || *p.NextAfter != p.Accounts[0].AccountID {
+			t.Fatalf("page after %d: %s", after, body)
+		}
+		if p.Accounts[0].AccountID <= after {
+			t.Fatalf("page after %d went back to %d", after, p.Accounts[0].AccountID)
+		}
+		after = p.Accounts[0].AccountID
+		seen[after] = true
+	}
+	for _, id := range ids {
+		if !seen[id] {
+			t.Errorf("account %d was not listed", id)
+		}
+	}
+
+	// Past the last account: an empty page, and no next_after.
+	resp, body := server.makeRequest(t, "GET", "/admin/usage/accounts?after=9223372036854775806", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("last page: %d %s", resp.StatusCode, body)
+	}
+	var last page
+	server.expectJSON(t, body, &last)
+	if last.Accounts == nil || len(last.Accounts) != 0 || last.NextAfter != nil {
+		t.Errorf("past the end: %s", body)
+	}
+
+	for _, q := range []string{"limit=0", "limit=10001", "limit=x", "after=-1", "after=x"} {
+		resp, body := server.makeRequest(t, "GET", "/admin/usage/accounts?"+q, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: %d %s", q, resp.StatusCode, body)
+		}
+	}
+	resp, _ = server.makeRequest(t, "POST", "/admin/usage/accounts", nil)
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST: %d", resp.StatusCode)
+	}
+}
+
 func TestMultiCredentialAccount(t *testing.T) {
 	server := setupHTTPAPIServer(t)
 	defer server.Close()

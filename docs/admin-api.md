@@ -10,6 +10,7 @@ The Sora Admin API provides a RESTful HTTP interface for managing and monitoring
 - [API Endpoints](#api-endpoints)
   - [Account Management](#account-management)
   - [Credential Management](#credential-management)
+  - [Usage](#usage)
   - [Connection Management](#connection-management)
   - [Cache Management](#cache-management)
   - [Uploader Monitoring](#uploader-monitoring)
@@ -413,6 +414,50 @@ their cluster peers.
   "email": "alias@example.com",
   "message": "Credential deleted successfully"
 }
+```
+
+### Usage
+
+#### List Accounts with Their Usage
+
+**Endpoint:** `GET /admin/usage/accounts?after={account_id}&limit={n}`
+
+Every account with its storage, one page at a time, in account id order: for usage
+exports and reconciliation. Soft-deleted accounts are left out. Start with `after=0`
+(the default) and pass each response's `next_after` as the next `after`; the last page
+has no `next_after`. `limit` defaults to 1000 and is at most 10000, so a walk over all
+accounts is a series of bounded requests, never one listing of them all. Each page
+reads only its own accounts, so it costs the same wherever it starts.
+
+`storage_used` is in bytes: the messages in the account's mailboxes, as delivered,
+from the mailbox statistics the database keeps with every message change. Expunged
+messages still kept for restore, and deleted mailboxes not yet purged, are not counted.
+Pages are separate reads, so an account created during a walk may or may not appear.
+
+**Response:** `200 OK`
+```json
+{
+  "accounts": [
+    {
+      "account_id": 123,
+      "primary_email": "user@example.com",
+      "credential_count": 2,
+      "mailbox_count": 6,
+      "message_count": 4211,
+      "storage_used": 1834201991,
+      "created_at": "2024-01-15 10:30:00 +0000 UTC"
+    }
+  ],
+  "next_after": 123
+}
+```
+
+**Errors:** `400` for an `after` or `limit` out of range.
+
+**Example:**
+```bash
+curl "http://localhost:8080/admin/usage/accounts?after=0&limit=10000" \
+  -H "Authorization: Bearer your-api-key"
 ```
 
 ### Connection Management
