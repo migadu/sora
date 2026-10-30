@@ -14,9 +14,12 @@ import (
 )
 
 // setupUploadWorkerTest creates a database connection and truncates all tables
-// to ensure a clean state for tests that query global data.
+// to ensure a clean state for tests that query global data. The database is the
+// upload worker tests' own: truncating the shared test database deleted the
+// accounts and mailboxes of every test another package was running at the time,
+// and RESTART IDENTITY handed their account IDs to new accounts.
 func setupUploadWorkerTest(t *testing.T) *Database {
-	db := setupTestDatabase(t)
+	db := setupTestDatabaseWithSuffix(t, "_uploader")
 	t.Cleanup(func() {
 		db.Close()
 	})

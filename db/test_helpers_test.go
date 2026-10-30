@@ -2,12 +2,15 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/BurntSushi/toml"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/config"
 	"github.com/stretchr/testify/require"
 )
@@ -28,6 +31,14 @@ type TestConfig struct {
 
 // setupTestDatabase creates a database connection using local PostgreSQL and config-test.toml
 func setupTestDatabase(t testing.TB) *Database {
+	return setupTestDatabaseWithSuffix(t, "")
+}
+
+// setupTestDatabaseWithSuffix connects like setupTestDatabase, but to the database
+// named after the configured one plus suffix, creating it if it does not exist yet.
+// It is for tests that empty whole tables: the configured database is shared with
+// every other test package, and go test runs packages at the same time.
+func setupTestDatabaseWithSuffix(t testing.TB, suffix string) *Database {
 	ctx := context.Background()
 
 	// Find the config-test.toml file by walking up from current directory
@@ -44,6 +55,7 @@ func setupTestDatabase(t testing.TB) *Database {
 	if name := os.Getenv("SORA_TEST_DB_NAME"); name != "" {
 		cfg.Database.Write.Name = name
 	}
+	cfg.Database.Write.Name += suffix
 
 	// Create database connection using test config
 	// Convert test config to DatabaseConfig format
@@ -56,6 +68,9 @@ func setupTestDatabase(t testing.TB) *Database {
 			Name:     cfg.Database.Write.Name,
 			TLSMode:  cfg.Database.Write.TLS,
 		},
+	}
+	if suffix != "" {
+		createTestDatabaseIfMissing(t, dbConfig.Write)
 	}
 
 	database, err := NewDatabaseFromConfig(ctx, dbConfig, true)
@@ -74,6 +89,30 @@ func setupTestDatabase(t testing.TB) *Database {
 	}
 
 	return database
+}
+
+// createTestDatabaseIfMissing creates endpoint's database, connecting to the
+// postgres maintenance database on the same server with the same credentials.
+func createTestDatabaseIfMissing(t testing.TB, endpoint *config.DatabaseEndpointConfig) {
+	ctx := context.Background()
+	maintenance := *endpoint
+	maintenance.Name = "postgres"
+	admin, err := NewDatabaseFromConfig(ctx, &config.DatabaseConfig{Write: &maintenance}, false)
+	require.NoError(t, err, "Failed to connect to the postgres database to create %s", endpoint.Name)
+	defer admin.Close()
+
+	var exists bool
+	err = admin.GetWritePool().QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", endpoint.Name).Scan(&exists)
+	require.NoError(t, err)
+	if exists {
+		return
+	}
+	_, err = admin.GetWritePool().Exec(ctx, "CREATE DATABASE "+pgx.Identifier{endpoint.Name}.Sanitize())
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42P04" { // duplicate_database: another test process created it first
+		err = nil
+	}
+	require.NoError(t, err, "Failed to create test database %s", endpoint.Name)
 }
 
 // findTestConfig walks up the directory tree to find config-test.toml
