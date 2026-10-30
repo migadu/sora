@@ -540,6 +540,19 @@ cleanup_interval = "1h"            # How often to purge expired/unused entries (
 purge_unused = "168h"              # Purge entries unused for this duration (default: 7 days)
 
 
+# BACKEND MAINTENANCE
+# =============================================================================
+# How proxies honor backends put in maintenance with
+# `sora-admin backends maintenance on --host HOST`. A backend in maintenance
+# gets no new traffic from any proxy, while it keeps running to finish the
+# uploads only it can do; see docs/deployment.md. Proxies read the list from
+# the database, so a proxy without database access cannot honor it.
+
+[backend_maintenance]
+poll_interval = "5s"               # How often proxies re-read the maintenance list (default: 5s)
+kick_rate = 10                     # IMAP sessions per second each proxy closes on a backend in maintenance (default: 10)
+
+
 # LOCAL CACHE CONFIGURATION
 # =============================================================================
 # Local filesystem cache for frequently accessed message bodies, reducing
