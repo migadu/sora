@@ -72,7 +72,7 @@ Restores soft-deleted messages for a user or the entire system. Messages are sof
 
 ### `backends`
 
-Puts a backend in maintenance: proxies stop sending it new traffic while it finishes its own uploads, after which it is safe to stop. See [Taking a backend out of service](deployment.md#taking-a-backend-out-of-service).
+Puts a backend in maintenance: proxies stop sending it new traffic while it finishes its own uploads, after which it is safe to stop. `--wait` returns once the backend has nothing pending and reports no session that could add an upload. See [Taking a backend out of service](deployment.md#taking-a-backend-out-of-service).
 
 ```bash
 ./sora-admin -config ... backends maintenance on --host storage2.example.com --reason "disk swap" --wait
