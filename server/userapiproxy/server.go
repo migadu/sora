@@ -201,6 +201,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 			conn, err := (&net.Dialer{
 				Timeout:   connectTimeout,
 				KeepAlive: 30 * time.Second,
+				// Routing skips backends in maintenance; this refuses the address
+				// actually dialed, whatever name led to it.
+				Control: connManager.RefuseMaintenanceDial,
 			}).DialContext(ctx, network, addr)
 			if err != nil {
 				return nil, err
@@ -421,6 +424,14 @@ func (s *Server) setupHandler() http.Handler {
 		metrics.ConnectionsTotal.WithLabelValues("userapi_proxy", s.name, "").Inc()
 		metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, "").Inc()
 		defer metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, "").Dec()
+
+		// Fail closed until the backend maintenance list has been read: any backend
+		// might be in maintenance (proxy.Maintenance.Loaded).
+		if !s.connManager.MaintenanceLoaded() {
+			logger.Error("User API Proxy: backend maintenance list not loaded yet - refusing request", "name", s.name)
+			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+			return
+		}
 
 		// Check if this is an authentication endpoint (no JWT required)
 		isAuthEndpoint := strings.HasPrefix(r.URL.Path, "/user/auth/")

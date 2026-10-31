@@ -122,6 +122,11 @@ func TestIMAPProxyBackendMaintenance(t *testing.T) {
 		}
 		return hosts, nil
 	})
+	// cmd/sora loads the list before any proxy accepts a connection; until it is loaded
+	// the proxy dials no backend.
+	if err := poller.Refresh(ctx); err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
 
 	go func() {
 		if err := proxyServer.Start(); err != nil {

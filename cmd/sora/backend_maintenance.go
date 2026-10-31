@@ -50,7 +50,10 @@ func hasProxyServer(servers []config.ServerConfig) bool {
 
 // runBackendMaintenance loads the maintenance list once, before returning — a restarted
 // proxy must not route to a backend in maintenance while it waits for its first poll —
-// and then keeps it current every poll_interval until ctx is done.
+// and then keeps it current every poll_interval until ctx is done. If that first load
+// fails, the set stays unloaded and the proxies dial no backend until a poll succeeds:
+// any backend might be in maintenance. The database was reachable moments before (sora
+// does not start without it), so that is normally one poll.
 func runBackendMaintenance(ctx context.Context, cfg config.MaintenanceConfig, load func(context.Context) ([]string, error)) *proxy.Maintenance {
 	interval, err := cfg.GetPollInterval()
 	if err != nil {
@@ -65,7 +68,7 @@ func runBackendMaintenance(ctx context.Context, cfg config.MaintenanceConfig, lo
 	err = poller.Refresh(loadCtx)
 	cancel()
 	if err != nil {
-		logger.Error("Backend maintenance: initial load failed - proxies route to every backend until a poll succeeds", "error", err)
+		logger.Error("Backend maintenance: initial load failed - proxies refuse every backend connection until a poll succeeds", "error", err)
 	} else if hosts := m.Hosts(); len(hosts) > 0 {
 		logger.Info("Backend maintenance: honoring backends in maintenance", "hosts", hosts)
 	}

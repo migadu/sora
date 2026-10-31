@@ -85,12 +85,24 @@ func TestRunBackendMaintenance_FollowsTheListAfterStartup(t *testing.T) {
 	if m.Contains("10.0.0.5:143") {
 		t.Fatal("failed initial load produced a maintenance entry")
 	}
+	// Not knowing the list is not an empty list: the proxies dial nothing until it loads.
+	if m.Loaded() {
+		t.Fatal("loaded although the initial load failed")
+	}
+	calls := list.callCount()
+	eventually(t, func() bool { return list.callCount() >= calls+3 }, "polls retrying the initial load")
+	if m.Loaded() {
+		t.Fatal("loaded although every load failed")
+	}
 
 	list.set([]string{"10.0.0.5"}, nil)
 	eventually(t, func() bool { return m.Contains("10.0.0.5:143") }, "maintenance on to be polled")
+	if !m.Loaded() {
+		t.Fatal("not loaded after a successful poll")
+	}
 
 	list.set(nil, errors.New("database unavailable"))
-	calls := list.callCount()
+	calls = list.callCount()
 	eventually(t, func() bool { return list.callCount() >= calls+3 }, "polls during the outage")
 	if !m.Contains("10.0.0.5:143") {
 		t.Fatal("a database outage ended maintenance")

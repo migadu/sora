@@ -148,6 +148,7 @@ func setupMaintenanceLMTP(t *testing.T) *maintenanceLMTP {
 		t.Fatalf("create proxy: %v", err)
 	}
 	m := proxy.NewMaintenance()
+	m.Set(nil) // loaded, nothing in maintenance (cmd/sora loads it before the proxy starts)
 	srv.GetConnectionManager().SetMaintenance(m)
 	go srv.Start()
 	t.Cleanup(func() { srv.Stop() })

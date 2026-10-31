@@ -78,7 +78,7 @@ func TestMaintenancePoller_AddsResolvedAddressesOfHostnames(t *testing.T) {
 	p := NewMaintenancePoller(m, func(context.Context) ([]string, error) {
 		return []string{"storage1.example.com", "10.0.0.9"}, nil
 	})
-	p.lookupHost = func(_ context.Context, host string) ([]string, error) {
+	m.lookupHost = func(_ context.Context, host string) ([]string, error) {
 		if host != "storage1.example.com" {
 			t.Errorf("looked up %q; IP literals must not be resolved", host)
 		}
@@ -102,7 +102,7 @@ func TestMaintenancePoller_KeepsLastKnownStateOnFailure(t *testing.T) {
 		return []string{"storage1.example.com"}, loadErr
 	})
 	var dnsErr error
-	p.lookupHost = func(context.Context, string) ([]string, error) {
+	m.lookupHost = func(context.Context, string) ([]string, error) {
 		return []string{"10.0.0.5"}, dnsErr
 	}
 	if err := p.Refresh(context.Background()); err != nil {
@@ -222,6 +222,7 @@ func newMaintenanceTestManager(t *testing.T, backends ...string) (*ConnectionMan
 		t.Fatalf("NewConnectionManager: %v", err)
 	}
 	m := NewMaintenance()
+	m.Set(nil) // loaded, nothing in maintenance
 	cm.SetMaintenance(m)
 	return cm, m
 }
@@ -537,5 +538,220 @@ func TestMaintenanceHosts_Sorted(t *testing.T) {
 	got := m.Hosts()
 	if !sort.StringsAreSorted(got) || len(got) != 2 {
 		t.Fatalf("Hosts() = %v, want 2 sorted hosts", got)
+	}
+}
+
+// fakeResolver answers lookups from a table the test changes, and counts them.
+type fakeResolver struct {
+	mu      sync.Mutex
+	answers map[string][]string
+	lookups int
+}
+
+func (r *fakeResolver) set(name string, addrs ...string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.answers[name] = addrs
+}
+
+func (r *fakeResolver) lookup(_ context.Context, host string) ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lookups++
+	if addrs, ok := r.answers[host]; ok && addrs != nil {
+		return append([]string(nil), addrs...), nil
+	}
+	return nil, fmt.Errorf("lookup %s: no such host", host)
+}
+
+func (r *fakeResolver) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lookups
+}
+
+// A route by name matches an entry made by address: the name is in maintenance if what it
+// resolves to is. Names are resolved only while something is in maintenance, once each,
+// and re-resolved by the poller, which keeps the last answer when a lookup fails.
+func TestMaintenance_ContainsMatchesANameByItsAddresses(t *testing.T) {
+	m := NewMaintenance()
+	r := &fakeResolver{answers: map[string][]string{
+		"storage2.example.com": {"10.0.0.2"},
+		"storage3.example.com": {"10.0.0.3"},
+	}}
+	m.lookupHost = r.lookup
+
+	m.Set(nil)
+	if m.Contains("storage2.example.com:143") {
+		t.Fatal("in maintenance with nothing in maintenance")
+	}
+	if r.count() != 0 {
+		t.Fatalf("%d lookups with nothing in maintenance, want none", r.count())
+	}
+
+	m.Set([]string{"10.0.0.2", "10.0.0.3"})
+	for _, addr := range []string{"storage2.example.com:143", "STORAGE2.example.com.:993", "storage3.example.com"} {
+		if !m.Contains(addr) {
+			t.Errorf("%s resolves to an address in maintenance but is not in it", addr)
+		}
+	}
+	if m.Contains("unresolvable.example.com:143") {
+		t.Error("a name that does not resolve is in maintenance")
+	}
+	lookups := r.count()
+	m.Contains("storage2.example.com:143")
+	if r.count() != lookups {
+		t.Error("a name already resolved was looked up again")
+	}
+
+	// storage2 moves off the address in maintenance; storage3's lookup starts failing.
+	r.set("storage2.example.com", "10.0.0.20")
+	r.set("storage3.example.com")
+	p := NewMaintenancePoller(m, func(context.Context) ([]string, error) { return []string{"10.0.0.2", "10.0.0.3"}, nil })
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if m.Contains("storage2.example.com:143") {
+		t.Error("a name that moved off the address in maintenance is still in it after a poll")
+	}
+	if !m.Contains("storage3.example.com:143") {
+		t.Error("a failed re-resolution dropped the name's last known address")
+	}
+}
+
+// The review's reproduction: the pool ([::1]) in maintenance by address, and a
+// remote-lookup route naming the same host "localhost". The route is routed as auth-only,
+// nothing outside maintenance is left, and the connection is refused without a dial.
+func TestConnectWithProxy_RouteByNameOfBackendInMaintenance(t *testing.T) {
+	named, accepted := listenLocalhost(t)
+	_, port, _ := net.SplitHostPort(named)
+	if ln, err := net.Listen("tcp", "[::1]:0"); err != nil {
+		t.Skip("no IPv6 loopback")
+	} else {
+		ln.Close()
+	}
+	cm, m := newMaintenanceTestManager(t, net.JoinHostPort("::1", port))
+	m.Set([]string{"::1"})
+
+	routing := &UserRoutingInfo{IsRemoteLookupAccount: true, ServerAddress: named}
+	res, err := DetermineRoute(RouteParams{
+		Ctx: context.Background(), Username: "alice@example.com", Protocol: "imap",
+		IsRemoteLookupAccount: true, RoutingInfo: routing, ConnManager: cm, ProxyName: "test",
+	})
+	if err != nil {
+		t.Fatalf("DetermineRoute: %v", err)
+	}
+	if res.IsRemoteLookupRoute {
+		t.Fatalf("kept the remote-lookup route %q to a name of a backend in maintenance", res.PreferredAddr)
+	}
+	if conn, addr, err := cm.ConnectWithProxy(context.Background(), res.PreferredAddr, "192.0.2.1", 1234, "192.0.2.2", 143, res.RoutingInfo); err == nil {
+		conn.Close()
+		t.Fatalf("connected to %q with the whole pool in maintenance", addr)
+	}
+	// And handed the name directly, as a preferred address.
+	if conn, addr, err := cm.ConnectWithProxy(context.Background(), named, "192.0.2.1", 1234, "192.0.2.2", 143, routing); err == nil {
+		conn.Close()
+		t.Fatalf("connected to %q, a name of a backend in maintenance", addr)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := accepted.Load(); n != 0 {
+		t.Fatalf("backend in maintenance accepted %d connections", n)
+	}
+}
+
+// The dial itself refuses an address in maintenance, for a name routing could not match
+// (here its lookup fails, while the dial's own resolution succeeds): nothing connects, and
+// the refusal is no failure of the backend.
+func TestConnectWithProxy_DialRefusesAddressInMaintenance(t *testing.T) {
+	// The pool entry is the name itself, so both the preferred dial and the round-robin
+	// one are refused by the dial alone.
+	named, accepted := listenLocalhost(t)
+	cm, m := newMaintenanceTestManager(t, named)
+	m.lookupHost = (&fakeResolver{answers: map[string][]string{}}).lookup
+	m.Set([]string{"127.0.0.1", "::1"})
+	if m.Contains(named) {
+		t.Fatal("test setup: routing must not match the name")
+	}
+
+	if conn, addr, err := cm.ConnectWithProxy(context.Background(), named, "192.0.2.1", 1234, "192.0.2.2", 143, nil); err == nil {
+		conn.Close()
+		t.Fatalf("connected to %q, which resolves to an address in maintenance", addr)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := accepted.Load(); n != 0 {
+		t.Fatalf("backend in maintenance accepted %d connections", n)
+	}
+	for _, h := range cm.GetBackendHealthStatuses() {
+		if h.FailureCount != 0 || !h.IsHealthy {
+			t.Fatalf("a refused dial counted against health: %+v", h)
+		}
+	}
+}
+
+// A set that was never read is not loaded, and contains nothing: routing is not changed by
+// what is not known. Nil (maintenance not honored) counts as loaded.
+func TestMaintenance_NotLoadedUntilFirstSet(t *testing.T) {
+	m := NewMaintenance()
+	if m.Loaded() {
+		t.Fatal("loaded before the list was read")
+	}
+	if m.Contains("10.0.0.5:143") || m.Hosts() != nil {
+		t.Fatal("a set never read contains something")
+	}
+	m.Set(nil)
+	if !m.Loaded() {
+		t.Fatal("not loaded after the list was read (empty)")
+	}
+	var notHonored *Maintenance
+	if !notHonored.Loaded() {
+		t.Fatal("nil maintenance must count as loaded")
+	}
+}
+
+// Until the list is read, no backend is dialed — and routing is left alone meanwhile, so
+// an affinity is not dropped over what is not known.
+func TestConnectWithProxy_RefusesUntilMaintenanceLoaded(t *testing.T) {
+	backend, accepted := listen(t)
+	cm, err := NewConnectionManager([]string{backend}, 143, false, false, false, time.Second)
+	if err != nil {
+		t.Fatalf("NewConnectionManager: %v", err)
+	}
+	m := NewMaintenance()
+	cm.SetMaintenance(m)
+	am := &MockAffinityManager{backends: map[string]string{"alice@example.com:imap": backend}}
+	cm.SetAffinityManager(am)
+
+	res, err := DetermineRoute(RouteParams{
+		Ctx: context.Background(), Username: "alice@example.com", Protocol: "imap",
+		ConnManager: cm, EnableAffinity: true, ProxyName: "test",
+	})
+	if err != nil {
+		t.Fatalf("DetermineRoute: %v", err)
+	}
+	if res.PreferredAddr != backend || res.RoutingMethod != "affinity" {
+		t.Fatalf("route = %q by %s, want the affinity to %q", res.PreferredAddr, res.RoutingMethod, backend)
+	}
+	if conn, _, err := cm.ConnectWithProxy(context.Background(), res.PreferredAddr, "192.0.2.1", 1234, "192.0.2.2", 143, nil); !errors.Is(err, errMaintenanceNotLoaded) {
+		if conn != nil {
+			conn.Close()
+		}
+		t.Fatalf("ConnectWithProxy before the list was read: %v, want errMaintenanceNotLoaded", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := accepted.Load(); n != 0 {
+		t.Fatalf("backend accepted %d connections before the maintenance list was read", n)
+	}
+	if _, ok := am.GetBackend("alice@example.com", "imap"); !ok {
+		t.Fatal("affinity dropped while the maintenance list was not read")
+	}
+
+	m.Set(nil)
+	conn, addr, err := cm.ConnectWithProxy(context.Background(), res.PreferredAddr, "192.0.2.1", 1234, "192.0.2.2", 143, nil)
+	if err != nil {
+		t.Fatalf("ConnectWithProxy once the list was read: %v", err)
+	}
+	conn.Close()
+	if addr != backend {
+		t.Fatalf("connected to %q, want %q", addr, backend)
 	}
 }

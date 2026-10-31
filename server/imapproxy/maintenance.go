@@ -15,6 +15,9 @@ const maintenanceByeDelay = time.Second
 // for the drain that closes sessions on backends in maintenance (proxy.StartSessionDrainer).
 // IMAP is the protocol that needs it: a session can stay for hours (IDLE) and keep
 // APPENDing, which would keep adding uploads to a node that is meant to be emptying.
+//
+// The backend is the address the connection is actually connected to, not the name it
+// was routed by, so a session is found whatever name led it to a backend in maintenance.
 func (s *Server) MaintenanceTargets() []proxy.DrainTarget {
 	s.activeSessionsMu.RLock()
 	sessions := make([]*Session, 0, len(s.activeSessions))
@@ -29,6 +32,9 @@ func (s *Server) MaintenanceTargets() []proxy.DrainTarget {
 		backend := ""
 		if session.backendConn != nil {
 			backend = session.serverAddr
+			if remote := session.backendConn.RemoteAddr(); remote != nil {
+				backend = remote.String()
+			}
 		}
 		session.mu.Unlock()
 		if backend != "" {

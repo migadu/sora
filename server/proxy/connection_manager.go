@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/migadu/sora/logger"
@@ -101,6 +103,37 @@ func (cm *ConnectionManager) SetMaintenance(m *Maintenance) {
 // InMaintenance reports whether addr is a backend an operator put in maintenance.
 func (cm *ConnectionManager) InMaintenance(addr string) bool {
 	return cm.maintenance.Load().Contains(addr)
+}
+
+// MaintenanceLoaded reports whether the maintenance list has been read, or is not honored
+// at all; until it has, no backend may be dialed (see Maintenance.Loaded).
+func (cm *ConnectionManager) MaintenanceLoaded() bool {
+	return cm.maintenance.Load().Loaded()
+}
+
+var (
+	// errBackendInMaintenance is a dial refused because the address actually dialed is
+	// in maintenance. It is not a failure of the backend, and never counts against its
+	// health.
+	errBackendInMaintenance = errors.New("backend is in maintenance")
+
+	// errMaintenanceNotLoaded is a connection refused before the maintenance list was
+	// ever read.
+	errMaintenanceNotLoaded = errors.New("backend maintenance list not loaded yet")
+)
+
+// RefuseMaintenanceDial is a net.Dialer Control for dials to backends. It sees the
+// address actually dialed, after name resolution, so a backend in maintenance is never
+// connected to whatever name the route used for it, and nothing is dialed before the
+// maintenance list was read.
+func (cm *ConnectionManager) RefuseMaintenanceDial(_, address string, _ syscall.RawConn) error {
+	if !cm.MaintenanceLoaded() {
+		return errMaintenanceNotLoaded
+	}
+	if cm.InMaintenance(address) {
+		return errBackendInMaintenance
+	}
+	return nil
 }
 
 // SetRestrictRemoteLookupToPool controls whether a backend address returned by the
@@ -449,6 +482,15 @@ func (cm *ConnectionManager) HasHealthyPoolBackends() bool {
 
 // GetBackendHealthStatuses returns health information for all backends (pool + remote lookup)
 func (cm *ConnectionManager) GetBackendHealthStatuses() []BackendHealthInfo {
+	statuses := cm.backendHealthStatuses()
+	// Outside healthMu: maintenance may resolve a hostname.
+	for i := range statuses {
+		statuses[i].InMaintenance = cm.InMaintenance(statuses[i].Address)
+	}
+	return statuses
+}
+
+func (cm *ConnectionManager) backendHealthStatuses() []BackendHealthInfo {
 	cm.healthMu.RLock()
 	defer cm.healthMu.RUnlock()
 
@@ -466,7 +508,6 @@ func (cm *ConnectionManager) GetBackendHealthStatuses() []BackendHealthInfo {
 			LastSuccess:        health.LastSuccess,
 			HealthCheckEnabled: healthCheckEnabled,
 			IsRemoteLookup:     false, // Pool backend
-			InMaintenance:      cm.InMaintenance(addr),
 		}
 
 		// If health checks are disabled, all backends are considered healthy
@@ -488,7 +529,6 @@ func (cm *ConnectionManager) GetBackendHealthStatuses() []BackendHealthInfo {
 			LastSuccess:        health.LastSuccess,
 			HealthCheckEnabled: healthCheckEnabled,
 			IsRemoteLookup:     true, // Remote lookup backend
-			InMaintenance:      cm.InMaintenance(addr),
 		}
 
 		// If health checks are disabled, all backends are considered healthy
@@ -757,6 +797,12 @@ func (cm *ConnectionManager) IsRemoteStartTLS() bool {
 
 // ConnectWithProxy attempts to connect to a remote server and sends PROXY protocol header
 func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (net.Conn, string, error) {
+	if !cm.MaintenanceLoaded() {
+		// Fail closed: a backend may be in maintenance, and which is not known yet. The
+		// list is retried every poll; routing has not been touched (no affinity dropped).
+		logger.Error("Backend maintenance list not loaded yet - refusing connection", "server", cm.serverName)
+		return nil, "", errMaintenanceNotLoaded
+	}
 	cm.refreshResolvedAddrsIfStale()
 
 	if preferredAddr != "" {
@@ -796,6 +842,10 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 			// Record success in health tracking
 			cm.RecordConnectionSuccess(addr)
 			return conn, addr, nil
+		}
+		if errors.Is(err, errBackendInMaintenance) {
+			inMaintenance++ // resolved to an address in maintenance
+			continue
 		}
 
 		// Record failure in health tracking only if the caller's context is still live.
@@ -869,6 +919,11 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 
 	// Attempt to dial the preferred address.
 	conn, err = cm.dialWithProxy(ctx, preferredAddr, clientIP, clientPort, serverIP, serverPort, routingInfo)
+	if errors.Is(err, errBackendInMaintenance) {
+		// The name resolved to an address in maintenance: as above, not a failure.
+		logger.Debug("ConnectionManager: Preferred backend resolves to an address in maintenance. Falling back to round-robin.", "backend", preferredAddr, "server", cm.serverName)
+		return nil, "", nil, true
+	}
 	if err == nil {
 		// Success! Record success in health tracking
 		if isInList {
@@ -1150,6 +1205,7 @@ func resolvePoolEntriesFrom(addr string, previous []string, ips []net.IP) []stri
 func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, error) {
 	dialer := &net.Dialer{
 		Timeout: cm.connectTimeout,
+		Control: cm.RefuseMaintenanceDial,
 	}
 
 	// Resolve the address to ensure proper IPv6 formatting
@@ -1217,6 +1273,7 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// For PROXY protocol, we need to establish plain TCP connection first
 	dialer := &net.Dialer{
 		Timeout: cm.connectTimeout,
+		Control: cm.RefuseMaintenanceDial,
 	}
 
 	// Resolve the address to ensure proper IPv6 formatting

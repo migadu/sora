@@ -21,24 +21,43 @@ import (
 // on its own: it ends when the operator turns it off.
 //
 // Entries are hosts, not host:port, so one entry covers every protocol pool the host
-// serves. MaintenancePoller adds each hostname's addresses, so a pool that was resolved
-// to IPs still matches an entry made by name.
+// serves. Names and addresses match both ways: MaintenancePoller adds each hostname's
+// addresses to the set, so a pool resolved to IPs matches an entry made by name, and
+// Contains resolves a name it is asked about, so a route by name (a remote-lookup route,
+// an alias) matches an entry made by IP.
+//
+// Until the list is read once (the first Set) the set is not loaded: which backends are
+// in maintenance is unknown, Contains reports none, and the connection manager refuses
+// to dial any backend (Loaded).
 //
 // One Maintenance is shared by every proxy server of a process; a nil *Maintenance
 // contains nothing.
 type Maintenance struct {
-	hosts atomic.Pointer[map[string]struct{}]
+	hosts atomic.Pointer[map[string]struct{}] // nil until the first Set
+
+	// names caches the addresses of the hostnames Contains was asked about, refreshed by
+	// the poller while anything is in maintenance.
+	namesMu    sync.Mutex
+	names      map[string][]string
+	lookupHost func(ctx context.Context, host string) ([]string, error)
 
 	listenersMu sync.Mutex
 	listeners   []func()
 }
 
-// NewMaintenance returns an empty maintenance set.
+// NewMaintenance returns a maintenance set that is not loaded yet.
 func NewMaintenance() *Maintenance {
-	m := &Maintenance{}
-	empty := map[string]struct{}{}
-	m.hosts.Store(&empty)
-	return m
+	return &Maintenance{
+		names:      map[string][]string{},
+		lookupHost: net.DefaultResolver.LookupHost,
+	}
+}
+
+// Loaded reports whether the set has been read at least once. Until then no backend may
+// be dialed: a proxy that does not know which backends are drained must not send traffic
+// to one that is. A nil *Maintenance (maintenance not honored) counts as loaded.
+func (m *Maintenance) Loaded() bool {
+	return m == nil || m.hosts.Load() != nil
 }
 
 // Set replaces the hosts in maintenance and returns the ones that were not in it before.
@@ -52,7 +71,10 @@ func (m *Maintenance) Set(hosts []string) (entered []string) {
 			next[h] = struct{}{}
 		}
 	}
-	prev := *m.hosts.Swap(&next)
+	var prev map[string]struct{}
+	if p := m.hosts.Swap(&next); p != nil {
+		prev = *p
+	}
 	for h := range next {
 		if _, ok := prev[h]; !ok {
 			entered = append(entered, h)
@@ -72,17 +94,96 @@ func (m *Maintenance) Set(hosts []string) (entered []string) {
 	return entered
 }
 
-// Contains reports whether addr — a host or host:port — is a backend in maintenance.
+// Contains reports whether addr — a host or host:port — is a backend in maintenance. A
+// hostname is in maintenance if it is listed or any address it resolves to is. Resolving
+// costs a lookup the first time a name is asked about, and only while something is in
+// maintenance.
 func (m *Maintenance) Contains(addr string) bool {
 	if m == nil || addr == "" {
+		return false
+	}
+	set := m.hosts.Load()
+	if set == nil || len(*set) == 0 {
 		return false
 	}
 	host := addr
 	if h, _, err := net.SplitHostPort(addr); err == nil {
 		host = h
 	}
-	_, ok := (*m.hosts.Load())[normalizeMaintenanceHost(host)]
-	return ok
+	host = normalizeMaintenanceHost(host)
+	if _, ok := (*set)[host]; ok {
+		return true
+	}
+	if net.ParseIP(host) != nil {
+		return false
+	}
+	for _, ip := range m.addressesOf(host) {
+		if _, ok := (*set)[ip]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// maxMaintenanceNames bounds the name cache. Names come from the pools and from remote
+// lookup, so a few per backend; past the bound a name is resolved on every call instead.
+const maxMaintenanceNames = 4096
+
+// addressesOf returns what a hostname resolves to, normalized: from the cache, or looked
+// up and cached. A failed lookup is cached as nothing, and retried by the poller.
+func (m *Maintenance) addressesOf(name string) []string {
+	m.namesMu.Lock()
+	addrs, ok := m.names[name]
+	m.namesMu.Unlock()
+	if ok {
+		return addrs
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), maintenanceLookupTimeout)
+	addrs, _ = m.resolve(ctx, name)
+	cancel()
+
+	m.namesMu.Lock()
+	if _, ok := m.names[name]; !ok && len(m.names) < maxMaintenanceNames {
+		m.names[name] = addrs
+	}
+	m.namesMu.Unlock()
+	return addrs
+}
+
+// resolve looks name up and returns its addresses normalized.
+func (m *Maintenance) resolve(ctx context.Context, name string) ([]string, error) {
+	addrs, err := m.lookupHost(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	for i, a := range addrs {
+		addrs[i] = normalizeMaintenanceHost(a)
+	}
+	return addrs, nil
+}
+
+// refreshNames re-resolves every cached hostname, keeping the last addresses of one that
+// fails to resolve.
+func (m *Maintenance) refreshNames(ctx context.Context) {
+	m.namesMu.Lock()
+	names := make([]string, 0, len(m.names))
+	for name := range m.names {
+		names = append(names, name)
+	}
+	m.namesMu.Unlock()
+
+	for _, name := range names {
+		lookupCtx, cancel := context.WithTimeout(ctx, maintenanceLookupTimeout)
+		addrs, err := m.resolve(lookupCtx, name)
+		cancel()
+		if err != nil || len(addrs) == 0 {
+			continue
+		}
+		m.namesMu.Lock()
+		m.names[name] = addrs
+		m.namesMu.Unlock()
+	}
 }
 
 // Hosts returns the hosts in maintenance, sorted.
@@ -90,8 +191,12 @@ func (m *Maintenance) Hosts() []string {
 	if m == nil {
 		return nil
 	}
-	hosts := make([]string, 0, len(*m.hosts.Load()))
-	for h := range *m.hosts.Load() {
+	set := m.hosts.Load()
+	if set == nil {
+		return nil
+	}
+	hosts := make([]string, 0, len(*set))
+	for h := range *set {
 		hosts = append(hosts, h)
 	}
 	slices.Sort(hosts)
@@ -124,9 +229,8 @@ func normalizeMaintenanceHost(host string) string {
 // MaintenancePoller keeps a Maintenance in step with the operator's list (the
 // backend_maintenance table).
 type MaintenancePoller struct {
-	m          *Maintenance
-	load       func(ctx context.Context) ([]string, error)
-	lookupHost func(ctx context.Context, host string) ([]string, error)
+	m    *Maintenance
+	load func(ctx context.Context) ([]string, error)
 
 	// resolved is each hostname's last successful resolution, kept through DNS failures.
 	resolved map[string][]string
@@ -136,10 +240,9 @@ type MaintenancePoller struct {
 // NewMaintenancePoller returns a poller that installs the hosts load returns into m.
 func NewMaintenancePoller(m *Maintenance, load func(ctx context.Context) ([]string, error)) *MaintenancePoller {
 	return &MaintenancePoller{
-		m:          m,
-		load:       load,
-		lookupHost: net.DefaultResolver.LookupHost,
-		resolved:   map[string][]string{},
+		m:        m,
+		load:     load,
+		resolved: map[string][]string{},
 	}
 }
 
@@ -147,13 +250,18 @@ func NewMaintenancePoller(m *Maintenance, load func(ctx context.Context) ([]stri
 const maintenanceLookupTimeout = 2 * time.Second
 
 // Refresh loads the list once and installs it, together with the addresses each hostname
-// resolves to. A load failure leaves the set as it was: maintenance must never end because
-// the database was briefly unreachable, or a drained backend would silently return to
-// rotation. A hostname that fails to resolve keeps the addresses it last resolved to.
+// resolves to. A load failure leaves the set as it was (not loaded, if it never was):
+// maintenance must never end because the database was briefly unreachable, or a drained
+// backend would silently return to rotation. A hostname that fails to resolve keeps the
+// addresses it last resolved to. While anything is in maintenance, the hostnames routes
+// were checked by are re-resolved too, before the new list is installed.
 func (p *MaintenancePoller) Refresh(ctx context.Context) error {
 	hosts, err := p.load(ctx)
 	if err != nil {
 		return err
+	}
+	if len(hosts) > 0 {
+		p.m.refreshNames(ctx)
 	}
 
 	all := make([]string, 0, len(hosts))
@@ -168,7 +276,7 @@ func (p *MaintenancePoller) Refresh(ctx context.Context) error {
 			continue
 		}
 		lookupCtx, cancel := context.WithTimeout(ctx, maintenanceLookupTimeout)
-		addrs, err := p.lookupHost(lookupCtx, h)
+		addrs, err := p.m.resolve(lookupCtx, h)
 		cancel()
 		if err != nil || len(addrs) == 0 {
 			addrs = p.resolved[h]
@@ -203,7 +311,7 @@ func (p *MaintenancePoller) Run(ctx context.Context, interval time.Duration) {
 		cancel()
 		if err != nil {
 			if !p.failing && ctx.Err() == nil {
-				logger.Warn("Backend maintenance: cannot load the maintenance list - keeping the current one", "in_maintenance", p.m.Hosts(), "error", err)
+				logger.Warn("Backend maintenance: cannot load the maintenance list - keeping the current one", "in_maintenance", p.m.Hosts(), "loaded", p.m.Loaded(), "error", err)
 			}
 			p.failing = true
 			continue
