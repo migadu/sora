@@ -1165,6 +1165,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 
 	// Before any proxy server starts: each one attaches this set as it is created.
 	deps.maintenance = startBackendMaintenance(ctx, deps)
+	startSessionsReport(ctx, deps)
 
 	// Start HTTP-01 challenge server for Let's Encrypt if using autocert
 	if deps.tlsManager != nil {

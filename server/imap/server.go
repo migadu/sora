@@ -257,6 +257,7 @@ type IMAPServer struct {
 	// Connection counters
 	totalConnections         atomic.Int64
 	authenticatedConnections atomic.Int64
+	authentications          atomic.Int64 // successful logins since start; never decreases
 
 	// Connection tracking
 	connTracker *serverPkg.ConnectionTracker
@@ -1245,6 +1246,14 @@ func (s *IMAPServer) GetTotalConnections() int64 {
 // GetAuthenticatedConnections returns the current authenticated connection count
 func (s *IMAPServer) GetAuthenticatedConnections() int64 {
 	return s.authenticatedConnections.Load()
+}
+
+// UploadSessions reports the sessions that can stage uploads (an authenticated session can
+// APPEND, COPY and MOVE): how many are open, and how many have logged in since the server
+// started. The node reports them so that a backend in maintenance is only called safe to
+// stop once none is left (sora-admin backends ... --wait).
+func (s *IMAPServer) UploadSessions() (open, started int64) {
+	return s.authenticatedConnections.Load(), s.authentications.Load()
 }
 
 // warmupStateFile is the filename for persisting warmup timestamps across restarts.

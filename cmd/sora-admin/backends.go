@@ -18,14 +18,18 @@ import (
 	"github.com/migadu/sora/server/proxy"
 )
 
-// drainQuietPeriod is how long a backend's upload backlog must stay at zero before it is
-// reported safe to stop. A single zero proves little: an IMAP session the proxies have not
-// closed yet can still APPEND, and the drain closes sessions gradually. A variable so tests
-// can shorten it.
+// drainQuietPeriod is how long a backend must stay quiet before it is reported safe to
+// stop: nothing pending, and by its own report no session that can add an upload open and
+// none started. The period is measured between the node's reports (the database clock),
+// so it is time the node itself saw. Variables so tests can shorten them.
 var drainQuietPeriod = 2 * time.Minute
 
-// drainPollInterval is how often --wait re-reads the backlog.
+// drainPollInterval is how often --wait re-reads the backend's state.
 var drainPollInterval = 10 * time.Second
+
+// sessionsReportMaxAge is how old a node's sessions report may be and still be relied
+// on: a few missed reports. An older one comes from a node that stopped reporting.
+var sessionsReportMaxAge = 6 * db.SessionsReportInterval
 
 // errNotInMaintenance reports a --host that is not in maintenance.
 var errNotInMaintenance = errors.New("not in maintenance")
@@ -102,6 +106,16 @@ func maintenanceOn(ctx context.Context, rdb *resilient.ResilientDatabase, host, 
 		defaulted = true
 	}
 
+	// The instance id is what tells, later, whether the backend is safe to stop. One no
+	// node ever used has nothing pending and no sessions, and would read as drained.
+	state, err := rdb.GetInstanceDrainStateWithRetry(masterContext(ctx), instance, globalConfig.Uploader.MaxAttempts)
+	if err != nil {
+		return fmt.Errorf("check uploader instance %s: %w", instance, err)
+	}
+	if !state.Known {
+		return unknownInstanceError(ctx, rdb, instance, defaulted)
+	}
+
 	row, err := rdb.SetBackendMaintenanceWithRetry(ctx, db.BackendMaintenance{
 		Host:       host,
 		InstanceID: instance,
@@ -116,8 +130,11 @@ func maintenanceOn(ctx context.Context, rdb *resilient.ResilientDatabase, host, 
 	fmt.Printf("Proxies stop routing new traffic to it within one poll ([backend_maintenance] poll_interval,\n")
 	fmt.Printf("default 5s) and close its IMAP sessions gradually. The backend itself must keep running.\n")
 	if defaulted {
-		fmt.Printf("\nNo --instance given: its uploads are tracked under instance id %q (the host).\n", instance)
-		fmt.Printf("If the backend's uploader runs under another id, rerun with --instance.\n")
+		fmt.Printf("\nNo --instance given: its uploads and sessions are tracked under instance id %q (the host).\n", instance)
+	}
+	if state.Sessions == nil {
+		fmt.Printf("\nInstance %s does not report its sessions (a build that predates the report): --wait\n", instance)
+		fmt.Printf("cannot confirm it is safe to stop until it runs one that does.\n")
 	}
 
 	rows, err := rdb.ListBackendMaintenanceWithRetry(masterContext(ctx))
@@ -134,7 +151,25 @@ func maintenanceOn(ctx context.Context, rdb *resilient.ResilientDatabase, host, 
 		return nil
 	}
 	fmt.Println()
-	return waitUntilSafeToStop(ctx, rdb, row.Host, row.InstanceID)
+	return waitUntilSafeToStop(ctx, rdb, row.Host)
+}
+
+// unknownInstanceError refuses an instance id nothing was ever recorded under, naming the
+// ones an operator can choose from.
+func unknownInstanceError(ctx context.Context, rdb *resilient.ResilientDatabase, instance string, defaulted bool) error {
+	msg := fmt.Sprintf("no uploader instance %q has ever reported (no heartbeat, sessions report or pending upload)", instance)
+	if defaulted {
+		msg += "; --instance defaults to --host, and the backend's uploader runs under another id"
+	}
+	msg += ": pass the backend's [uploader] instance_id (default: its hostname) with --instance"
+	if known, err := rdb.ListUploaderInstancesWithRetry(masterContext(ctx), time.Now().Add(-24*time.Hour)); err == nil && len(known) > 0 {
+		ids := make([]string, len(known))
+		for i, k := range known {
+			ids[i] = k.InstanceID
+		}
+		msg += ". Instances seen in the last 24h: " + strings.Join(ids, ", ")
+	}
+	return errors.New(msg)
 }
 
 func maintenanceOff(ctx context.Context, rdb *resilient.ResilientDatabase, host string) error {
@@ -178,7 +213,7 @@ func handleBackendsStatus(ctx context.Context) {
 	defer rdb.Close()
 
 	if *wait {
-		if err := waitUntilSafeToStop(ctx, rdb, only, ""); err != nil {
+		if err := waitUntilSafeToStop(ctx, rdb, only); err != nil {
 			logger.Fatalf("%v", err)
 		}
 		return
@@ -204,9 +239,9 @@ func showBackendsStatus(ctx context.Context, rdb *resilient.ResilientDatabase, o
 			continue
 		}
 		shown++
-		backlog, err := rdb.GetInstanceUploadBacklogWithRetry(ctx, r.InstanceID, globalConfig.Uploader.MaxAttempts)
+		state, err := rdb.GetInstanceDrainStateWithRetry(ctx, r.InstanceID, globalConfig.Uploader.MaxAttempts)
 		if err != nil {
-			return fmt.Errorf("upload backlog of %s: %w", r.InstanceID, err)
+			return fmt.Errorf("drain state of %s: %w", r.InstanceID, err)
 		}
 
 		fmt.Printf("%s\n", r.Host)
@@ -218,7 +253,7 @@ func showBackendsStatus(ctx context.Context, rdb *resilient.ResilientDatabase, o
 			fmt.Printf("  Reason:               %s\n", r.Reason)
 		}
 		fmt.Printf("  Uploader instance:    %s\n", r.InstanceID)
-		printBacklog(backlog)
+		printDrainState(state)
 		fmt.Println()
 	}
 
@@ -229,32 +264,51 @@ func showBackendsStatus(ctx context.Context, rdb *resilient.ResilientDatabase, o
 		fmt.Printf("No backends in maintenance.\n")
 		return nil
 	}
-	fmt.Printf("Safe to stop needs the backlog at zero for %s: use --host <host> --wait.\n", drainQuietPeriod)
-	fmt.Printf("Also check the node's own relay queue (sora-admin relay stats, on that node), and that\n")
-	fmt.Printf("nothing reaches it except through proxies (direct LMTP, its own Admin API).\n")
+	fmt.Printf("Safe to stop needs, for %s, nothing pending and no session that can add an upload\n", drainQuietPeriod)
+	fmt.Printf("open or started, by the node's own report: use --host <host> --wait.\n")
+	fmt.Printf("Also check the node's own relay queue (sora-admin relay stats, on that node).\n")
 	fmt.Printf("Each proxy marks the backends it honors as [maintenance] in: sora-admin health status --backends\n")
 	return nil
 }
 
-func printBacklog(b db.InstanceUploadBacklog) {
-	fmt.Printf("  Pending uploads:      %d", b.Pending)
-	if b.Oldest != nil {
-		fmt.Printf(" (oldest %s ago)", formatDuration(time.Since(*b.Oldest)))
+func printDrainState(s db.InstanceDrainState) {
+	if !s.Known {
+		fmt.Printf("  UNKNOWN INSTANCE:     no uploader ever reported under this id, so nothing below means\n")
+		fmt.Printf("                        anything. Correct it: backends maintenance on --host <host> --instance <id>\n")
+	}
+	fmt.Printf("  Pending uploads:      %d", s.Pending)
+	if s.Oldest != nil {
+		fmt.Printf(" (oldest %s ago)", formatDuration(time.Since(*s.Oldest)))
 	}
 	fmt.Println()
-	if b.Parked > 0 {
-		fmt.Printf("  Parked uploads:       %d — out of attempts; they will not drain on their own.\n", b.Parked)
+	if s.Parked > 0 {
+		fmt.Printf("  Parked uploads:       %d — out of attempts; they will not drain on their own.\n", s.Parked)
 		fmt.Printf("                        Run 'sora-admin uploader resolve' on that node before stopping it.\n")
+	}
+	switch {
+	case s.Sessions == nil:
+		fmt.Printf("  Upload sessions:      not reported (the node runs a build that does not report them)\n")
+	default:
+		fmt.Printf("  Upload sessions:      %d open, %d started since %s (reported %s ago)\n",
+			s.Sessions.Open, s.Sessions.Started, s.Sessions.Since.Format(time.RFC3339), formatDuration(s.ReportAge))
+		if s.ReportAge > sessionsReportMaxAge {
+			fmt.Printf("                        The node stopped reporting: is it running?\n")
+		}
 	}
 }
 
-// waitUntilSafeToStop blocks until the backend's upload backlog has stayed at zero for
-// drainQuietPeriod. It reads from the primary (a replica lagging behind could report zero
-// while rows exist) and gives up if maintenance is turned off meanwhile.
-func waitUntilSafeToStop(ctx context.Context, rdb *resilient.ResilientDatabase, host, instance string) error {
+// waitUntilSafeToStop blocks until the backend has been quiet for drainQuietPeriod: no
+// upload pending and, by the node's own report, no session that can add one open and none
+// started. Each poll re-reads the maintenance row, so a corrected instance id is followed
+// (from scratch), and the wait gives up if maintenance is turned off. It reads from the
+// primary: a replica lagging behind could report zero while rows exist.
+func waitUntilSafeToStop(ctx context.Context, rdb *resilient.ResilientDatabase, host string) error {
 	ctx = masterContext(ctx)
-	var zeroSince time.Time
-	warnedParked := false
+	var (
+		instance     string
+		quiet        *quietMark // the report that began the current quiet period
+		warnedParked bool
+	)
 
 	for {
 		row, found, err := findMaintenance(ctx, rdb, host)
@@ -264,40 +318,49 @@ func waitUntilSafeToStop(ctx context.Context, rdb *resilient.ResilientDatabase, 
 		if !found {
 			return fmt.Errorf("backend %s is not in maintenance (any more): nothing to wait for", host)
 		}
-		if instance == "" {
+		now := time.Now().Format(time.TimeOnly)
+		if row.InstanceID != instance {
+			if instance != "" {
+				fmt.Printf("%s  instance changed from %s to %s — starting over\n", now, instance, row.InstanceID)
+			}
 			instance = row.InstanceID
+			quiet = nil
 		}
 
-		backlog, err := rdb.GetInstanceUploadBacklogWithRetry(ctx, instance, globalConfig.Uploader.MaxAttempts)
+		state, err := rdb.GetInstanceDrainStateWithRetry(ctx, instance, globalConfig.Uploader.MaxAttempts)
 		if err != nil {
-			return fmt.Errorf("upload backlog of %s: %w", instance, err)
+			return fmt.Errorf("drain state of %s: %w", instance, err)
 		}
 
-		now := time.Now()
-		switch {
-		case backlog.Pending > 0:
-			if !zeroSince.IsZero() {
-				fmt.Printf("%s  uploads pending again — restarting the %s quiet period\n", now.Format(time.TimeOnly), drainQuietPeriod)
+		if busy := notQuiet(state); busy != "" {
+			if quiet != nil {
+				fmt.Printf("%s  %s: no longer quiet — restarting the %s quiet period\n", now, instance, drainQuietPeriod)
 			}
-			zeroSince = time.Time{}
-			fmt.Printf("%s  %s: %d uploads pending", now.Format(time.TimeOnly), instance, backlog.Pending)
-			if backlog.Parked > 0 {
-				fmt.Printf(" (%d parked)", backlog.Parked)
-			}
-			fmt.Println()
-			if backlog.Parked > 0 && !warnedParked {
+			quiet = nil
+			fmt.Printf("%s  %s: %s\n", now, instance, busy)
+			if state.Parked > 0 && !warnedParked {
 				fmt.Printf("          Parked uploads are out of attempts and will not drain on their own:\n")
 				fmt.Printf("          run 'sora-admin uploader resolve' on that node.\n")
 				warnedParked = true
 			}
-		case zeroSince.IsZero():
-			zeroSince = now
-			fmt.Printf("%s  %s: no uploads pending — confirming for %s\n", now.Format(time.TimeOnly), instance, drainQuietPeriod)
-		case now.Sub(zeroSince) >= drainQuietPeriod:
-			fmt.Printf("%s  %s: no uploads pending for %s.\n\n", now.Format(time.TimeOnly), instance, drainQuietPeriod)
-			fmt.Printf("Backend %s is safe to stop as far as uploads go. Before stopping it, check its relay\n", host)
-			fmt.Printf("queue on the node (sora-admin relay stats) and that nothing reaches it except through proxies.\n")
-			return nil
+		} else {
+			mark := quietMark{since: state.Sessions.Since, started: state.Sessions.Started, at: state.ReportedAt}
+			switch {
+			case quiet == nil:
+				quiet = &mark
+				fmt.Printf("%s  %s: nothing pending, no upload sessions — confirming for %s\n", now, instance, drainQuietPeriod)
+			case !mark.since.Equal(quiet.since):
+				quiet = &mark
+				fmt.Printf("%s  %s: the node restarted — restarting the %s quiet period\n", now, instance, drainQuietPeriod)
+			case mark.started != quiet.started:
+				fmt.Printf("%s  %s: %d upload sessions came and went — restarting the %s quiet period\n", now, instance, mark.started-quiet.started, drainQuietPeriod)
+				quiet = &mark
+			case mark.at.Sub(quiet.at) >= drainQuietPeriod:
+				fmt.Printf("%s  %s: quiet for %s: nothing pending, no upload session open or started.\n\n", now, instance, drainQuietPeriod)
+				fmt.Printf("Backend %s is safe to stop as far as uploads go. Before stopping it, check its relay\n", host)
+				fmt.Printf("queue on the node (sora-admin relay stats).\n")
+				return nil
+			}
 		}
 
 		select {
@@ -306,6 +369,40 @@ func waitUntilSafeToStop(ctx context.Context, rdb *resilient.ResilientDatabase, 
 		case <-time.After(drainPollInterval):
 		}
 	}
+}
+
+// quietMark is the sessions report a quiet period is measured from.
+type quietMark struct {
+	since   time.Time // the reporting process's start: a restart begins a new count
+	started int64     // sessions started by then
+	at      time.Time // when the node wrote the report (database clock)
+}
+
+// notQuiet says what keeps an instance from being quiet, or "" when it is: nothing
+// pending, and a current report of no open upload session. Without a usable report the
+// sessions are unknown, which is never quiet.
+func notQuiet(s db.InstanceDrainState) string {
+	var busy []string
+	if !s.Known {
+		busy = append(busy, "unknown instance: no uploader ever reported under this id. Correct it with: backends maintenance on --host <host> --instance <id>")
+	}
+	if s.Pending > 0 {
+		pending := fmt.Sprintf("%d uploads pending", s.Pending)
+		if s.Parked > 0 {
+			pending += fmt.Sprintf(" (%d parked)", s.Parked)
+		}
+		busy = append(busy, pending)
+	}
+	switch {
+	case !s.Known:
+	case s.Sessions == nil:
+		busy = append(busy, "the node does not report its sessions (a build that predates the report): cannot confirm")
+	case s.ReportAge > sessionsReportMaxAge:
+		busy = append(busy, fmt.Sprintf("no sessions report for %s: is the node running?", formatDuration(s.ReportAge)))
+	case s.Sessions.Open > 0:
+		busy = append(busy, fmt.Sprintf("%d upload sessions open", s.Sessions.Open))
+	}
+	return strings.Join(busy, "; ")
 }
 
 func findMaintenance(ctx context.Context, rdb *resilient.ResilientDatabase, host string) (db.BackendMaintenance, bool, error) {
@@ -372,10 +469,14 @@ Usage:
 Options:
   --host string       Backend host as the proxies know it: a name or an IP, without a
                       port. A name also covers the addresses it resolves to.
-  --instance string   The backend's uploader instance id ([uploader] instance_id or its
-                      default), whose upload backlog must drain. Default: the host.
+  --instance string   The backend's uploader instance id ([uploader] instance_id, default
+                      its hostname): its uploads must drain, and the node reports its
+                      sessions under it. Default: the host. An id no node ever reported
+                      under is refused.
   --reason string     Note shown by status.
-  --wait              Block until the backlog has stayed at zero for %s.
+  --wait              Block until the backend has been quiet for %s: nothing pending, and
+                      by the node's own report no session that can add an upload (IMAP
+                      logged in, LMTP, Admin API delivery) open or started.
 
 Proxies need database access to honor maintenance; they re-read the list every
 [backend_maintenance] poll_interval (default 5s).

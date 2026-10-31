@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/netutil"
@@ -76,6 +77,17 @@ type Server struct {
 	redirectRateWindow time.Duration                        // Window for redirect limit
 	maxRedirectHops    int                                  // Max redirect hops per message (mail-loop backstop)
 	sieveExtensions    []string                             // [sieve] enabled_extensions, shared with the LMTP path
+
+	// Mail deliveries in flight and since start, reported as this server's upload sessions.
+	deliveriesOpen    atomic.Int64
+	deliveriesStarted atomic.Int64
+}
+
+// UploadSessions reports the mail deliveries (/admin/mail/deliver), which stage uploads:
+// how many are in flight, and how many have started since the server did. See
+// imap.IMAPServer.UploadSessions.
+func (s *Server) UploadSessions() (open, started int64) {
+	return s.deliveriesOpen.Load(), s.deliveriesStarted.Load()
 }
 
 // ServerOptions holds configuration options for the HTTP API server

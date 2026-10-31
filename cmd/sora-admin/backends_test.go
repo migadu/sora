@@ -1,6 +1,12 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/migadu/sora/db"
+)
 
 func TestNormalizeBackendHost(t *testing.T) {
 	cases := []struct {
@@ -27,6 +33,36 @@ func TestNormalizeBackendHost(t *testing.T) {
 		}
 		if got != c.want {
 			t.Errorf("normalizeBackendHost(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// notQuiet says what stands between a backend and being safe to stop; only a known
+// instance with nothing pending and a current report of no open session is quiet.
+func TestNotQuiet(t *testing.T) {
+	report := func(open int64, age time.Duration) db.InstanceDrainState {
+		return db.InstanceDrainState{Known: true, Sessions: &db.InstanceSessions{Open: open}, ReportAge: age}
+	}
+	pending := report(0, time.Second)
+	pending.Pending, pending.Parked = 3, 1
+	unreported := db.InstanceDrainState{Known: true}
+
+	cases := []struct {
+		name  string
+		state db.InstanceDrainState
+		want  string // a fragment of the reason; "" for quiet
+	}{
+		{"quiet", report(0, time.Second), ""},
+		{"unknown instance", db.InstanceDrainState{}, "unknown instance"},
+		{"pending", pending, "3 uploads pending (1 parked)"},
+		{"sessions open", report(4, time.Second), "4 upload sessions open"},
+		{"no report", unreported, "does not report its sessions"},
+		{"stale report", report(0, sessionsReportMaxAge+time.Second), "no sessions report for"},
+	}
+	for _, c := range cases {
+		got := notQuiet(c.state)
+		if c.want == "" && got != "" || c.want != "" && !strings.Contains(got, c.want) {
+			t.Errorf("%s: notQuiet = %q, want %q", c.name, got, c.want)
 		}
 	}
 }

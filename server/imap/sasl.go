@@ -153,6 +153,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					}
 
 					s.server.authenticatedConnections.Add(1)
+					s.server.authentications.Add(1)
 					duration := time.Since(authStart)
 
 					// Log authentication with alias detection
@@ -302,6 +303,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					}
 
 					s.server.authenticatedConnections.Add(1)
+					s.server.authentications.Add(1)
 					duration := time.Since(authStart)
 
 					// Log authentication with alias detection

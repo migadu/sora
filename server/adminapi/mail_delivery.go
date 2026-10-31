@@ -66,6 +66,10 @@ const defaultMaxMessageSize = 50 * 1024 * 1024 // 50 MB
 
 // handleDeliverMail handles HTTP mail delivery (mimics LMTP flow exactly)
 func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
+	s.deliveriesStarted.Add(1)
+	s.deliveriesOpen.Add(1)
+	defer s.deliveriesOpen.Add(-1)
+
 	ctx := r.Context()
 
 	// Bound the request body to the configured max_message_size (same limit LMTP uses),

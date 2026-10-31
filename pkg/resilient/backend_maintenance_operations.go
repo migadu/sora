@@ -61,15 +61,49 @@ func (rd *ResilientDatabase) ListBackendMaintenanceWithRetry(ctx context.Context
 	return hosts, nil
 }
 
-// GetInstanceUploadBacklogWithRetry reports an instance's pending and parked uploads
-// (see db.GetInstanceUploadBacklog).
-func (rd *ResilientDatabase) GetInstanceUploadBacklogWithRetry(ctx context.Context, instanceID string, maxAttempts int) (db.InstanceUploadBacklog, error) {
+// GetInstanceDrainStateWithRetry reads an instance's pending uploads and latest sessions
+// report (see db.GetInstanceDrainState).
+func (rd *ResilientDatabase) GetInstanceDrainStateWithRetry(ctx context.Context, instanceID string, maxAttempts int) (db.InstanceDrainState, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetInstanceUploadBacklog(ctx, instanceID, maxAttempts)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetInstanceDrainState(ctx, instanceID, maxAttempts)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
-		return db.InstanceUploadBacklog{}, err
+		return db.InstanceDrainState{}, err
 	}
-	return result.(db.InstanceUploadBacklog), nil
+	return result.(db.InstanceDrainState), nil
+}
+
+// ListUploaderInstancesWithRetry returns the instance ids seen since the given time (see
+// db.ListUploaderInstances).
+func (rd *ResilientDatabase) ListUploaderInstancesWithRetry(ctx context.Context, since time.Time) ([]db.UploaderInstance, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).ListUploaderInstances(ctx, since)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	instances, _ := result.([]db.UploaderInstance)
+	return instances, nil
+}
+
+// sessionsReportRetryConfig is a single attempt: the node reports every few seconds, so
+// the next report is the retry.
+var sessionsReportRetryConfig = retry.BackoffConfig{
+	InitialInterval: time.Second,
+	MaxInterval:     time.Second,
+	Multiplier:      1,
+	MaxRetries:      0,
+	OperationName:   "db_instance_sessions_report",
+}
+
+// ReportInstanceSessionsWithRetry stores a node's sessions report (see
+// db.ReportInstanceSessions). One attempt only.
+func (rd *ResilientDatabase) ReportInstanceSessionsWithRetry(ctx context.Context, s db.InstanceSessions) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).ReportInstanceSessions(ctx, tx, s)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, sessionsReportRetryConfig, timeoutWrite, op)
+	return err
 }

@@ -166,6 +166,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 			}
 
 			s.server.authenticatedConnections.Add(1)
+			s.server.authentications.Add(1)
 			duration := time.Since(authStart)
 
 			// Log authentication with alias detection
@@ -278,6 +279,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 	}
 
 	s.server.authenticatedConnections.Add(1)
+	s.server.authentications.Add(1)
 	duration := time.Since(authStart)
 
 	// Log authentication with alias detection

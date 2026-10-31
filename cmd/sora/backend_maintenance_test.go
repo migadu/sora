@@ -4,12 +4,18 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server/adminapi"
+	"github.com/migadu/sora/server/imap"
+	"github.com/migadu/sora/server/lmtp"
 	"github.com/migadu/sora/server/proxy"
+	"github.com/migadu/sora/server/uploader"
 )
 
 // scriptedList is a maintenance list whose answer the test changes between polls.
@@ -162,4 +168,106 @@ func TestAttachBackendMaintenance(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the session drain was not started for the proxy")
 	}
+}
+
+// The servers whose sessions stage uploads report them.
+var (
+	_ uploadSessionSource = (*imap.IMAPServer)(nil)
+	_ uploadSessionSource = (*lmtp.LMTPServerBackend)(nil)
+	_ uploadSessionSource = (*adminapi.Server)(nil)
+)
+
+type fakeServer struct{}
+
+func (fakeServer) ReloadConfig(config.ServerConfig) error { return nil }
+
+type fakeUploadServer struct {
+	fakeServer
+	open, started int64
+}
+
+func (f fakeUploadServer) UploadSessions() (int64, int64) { return f.open, f.started }
+
+// The node's upload sessions are those of every server that has them; a proxy server has
+// none.
+func TestUploadSessionsSumsTheServersThatHaveThem(t *testing.T) {
+	deps := &serverDependencies{}
+	deps.registerServer("imap", fakeUploadServer{open: 2, started: 10})
+	deps.registerServer("lmtp", fakeUploadServer{open: 1, started: 4})
+	deps.registerServer("imap-proxy", fakeServer{})
+
+	open, started := deps.uploadSessions()
+	if open != 3 || started != 14 {
+		t.Fatalf("upload sessions = %d open, %d started; want 3 open, 14 started", open, started)
+	}
+}
+
+// The node reports at once, then every interval: under its instance id, with the current
+// counts, and with one Since for the life of the process (sora-admin tells a restart by
+// it). A failed report does not stop the next, and the reports end with ctx.
+func TestRunSessionsReport(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var open, started atomic.Int64
+	var mu sync.Mutex
+	var reports []db.InstanceSessions
+	const failing = 2
+	failures := failing
+	report := func(_ context.Context, s db.InstanceSessions) error {
+		mu.Lock()
+		defer mu.Unlock()
+		reports = append(reports, s)
+		if failures > 0 {
+			failures--
+			return errors.New("database unavailable")
+		}
+		return nil
+	}
+	reported := func() []db.InstanceSessions {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]db.InstanceSessions(nil), reports...)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runSessionsReport(ctx, "node-1", 10*time.Millisecond, func() (int64, int64) { return open.Load(), started.Load() }, report)
+	}()
+
+	eventually(t, func() bool { return len(reported()) >= 1 }, "the first report")
+	if first := reported()[0]; first.Open != 0 || first.Started != 0 {
+		t.Fatalf("first report = %+v, want nothing open or started", first)
+	}
+	open.Store(3)
+	started.Store(5)
+	eventually(t, func() bool {
+		r := reported()
+		return len(r) > failing+1 && r[len(r)-1].Open == 3 && r[len(r)-1].Started == 5
+	}, "a report of the new counts after the failed ones")
+
+	for _, r := range reported() {
+		if r.InstanceID != "node-1" || !r.Since.Equal(reported()[0].Since) || r.Since.IsZero() {
+			t.Fatalf("report %+v: want instance node-1 and one Since throughout", r)
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("still reporting after ctx was cancelled")
+	}
+}
+
+// Only a node with an uploader stages uploads, and the report needs a database: either
+// missing, nothing reports. The database stand-in is unconnected and panics if touched.
+func TestStartSessionsReport_OnlyWithUploaderAndDatabase(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startSessionsReport(ctx, &serverDependencies{resilientDB: &resilient.ResilientDatabase{}, instanceID: "proxy-1"})
+	startSessionsReport(ctx, &serverDependencies{uploadWorker: &uploader.UploadWorker{}, instanceID: "backend-1"})
+	time.Sleep(50 * time.Millisecond) // a report that should not have started would have panicked by now
 }

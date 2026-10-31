@@ -227,7 +227,7 @@ func insertPendingUpload(t *testing.T, db *Database, accountID int64, instanceID
 // The backlog is one instance's: every pending upload it owns counts, parked ones
 // included (still mail only that node holds), and parked are those at or past
 // maxAttempts. Another instance's uploads are not its backlog.
-func TestInstanceUploadBacklog_CountsPendingAndParkedOfOneInstance(t *testing.T) {
+func TestInstanceDrainState_CountsPendingAndParkedOfOneInstance(t *testing.T) {
 	if testing.Short() {
 		t.Skip("database test")
 	}
@@ -251,29 +251,151 @@ func TestInstanceUploadBacklog_CountsPendingAndParkedOfOneInstance(t *testing.T)
 	insertPendingUpload(t, db, accountID, other, fmt.Sprintf("bl_other_1_%d", ts), 0, now.Add(-48*time.Hour))
 	insertPendingUpload(t, db, accountID, other, fmt.Sprintf("bl_other_2_%d", ts), maxAttempts, now.Add(-48*time.Hour))
 
-	backlog, err := db.GetInstanceUploadBacklog(ctx, draining, maxAttempts)
+	state, err := db.GetInstanceDrainState(ctx, draining, maxAttempts)
 	require.NoError(t, err)
-	require.Equal(t, int64(4), backlog.Pending, "every upload the instance owns, parked included")
-	require.Equal(t, int64(2), backlog.Parked, "attempts at or past maxAttempts")
-	require.NotNil(t, backlog.Oldest)
-	require.True(t, backlog.Oldest.Equal(oldest), "oldest of this instance only: got %v, want %v", *backlog.Oldest, oldest)
+	require.Equal(t, int64(4), state.Pending, "every upload the instance owns, parked included")
+	require.Equal(t, int64(2), state.Parked, "attempts at or past maxAttempts")
+	require.NotNil(t, state.Oldest)
+	require.True(t, state.Oldest.Equal(oldest), "oldest of this instance only: got %v, want %v", *state.Oldest, oldest)
+	require.True(t, state.Known, "an id with pending uploads is one a node used")
+	require.Nil(t, state.Sessions, "never reported")
 
-	otherBacklog, err := db.GetInstanceUploadBacklog(ctx, other, maxAttempts)
+	otherState, err := db.GetInstanceDrainState(ctx, other, maxAttempts)
 	require.NoError(t, err)
-	require.Equal(t, int64(2), otherBacklog.Pending)
-	require.Equal(t, int64(1), otherBacklog.Parked)
+	require.Equal(t, int64(2), otherState.Pending)
+	require.Equal(t, int64(1), otherState.Parked)
 }
 
-func TestInstanceUploadBacklog_EmptyWhenNothingPending(t *testing.T) {
+// forgetInstance removes what a test recorded under an instance id.
+func forgetInstance(t *testing.T, db *Database, instanceID string) {
+	t.Helper()
+	t.Cleanup(func() {
+		for _, stmt := range []string{
+			`DELETE FROM instance_heartbeats WHERE instance_id = $1`,
+			`DELETE FROM instance_sessions WHERE instance_id = $1`,
+		} {
+			if _, err := db.GetWritePool().Exec(context.Background(), stmt, instanceID); err != nil {
+				t.Errorf("cleanup of instance %s: %s: %v", instanceID, stmt, err)
+			}
+		}
+	})
+}
+
+// An id nothing was ever recorded under has nothing pending, and that must read as
+// unknown, not as drained: it is what a typo or a host's IP in place of its instance id
+// looks like.
+func TestInstanceDrainState_UnknownInstance(t *testing.T) {
 	if testing.Short() {
 		t.Skip("database test")
 	}
 	db := setupTestDatabase(t)
 	t.Cleanup(db.Close)
 
-	backlog, err := db.GetInstanceUploadBacklog(context.Background(), fmt.Sprintf("backlog-idle-%d", time.Now().UnixNano()), 5)
+	state, err := db.GetInstanceDrainState(context.Background(), fmt.Sprintf("backlog-idle-%d", time.Now().UnixNano()), 5)
 	require.NoError(t, err)
-	require.Equal(t, int64(0), backlog.Pending)
-	require.Equal(t, int64(0), backlog.Parked)
-	require.Nil(t, backlog.Oldest)
+	require.Equal(t, int64(0), state.Pending)
+	require.Equal(t, int64(0), state.Parked)
+	require.Nil(t, state.Oldest)
+	require.False(t, state.Known)
+	require.Nil(t, state.Sessions)
+}
+
+// A heartbeat alone makes an id known (its uploader runs), without a sessions report: a
+// node on a build that does not report.
+func TestInstanceDrainState_KnownByHeartbeatWithoutReport(t *testing.T) {
+	if testing.Short() {
+		t.Skip("database test")
+	}
+	db := setupTestDatabase(t)
+	t.Cleanup(db.Close)
+	ctx := context.Background()
+
+	instance := fmt.Sprintf("heartbeat-only-%d", time.Now().UnixNano())
+	forgetInstance(t, db, instance)
+	inTx(t, db, func(tx pgx.Tx) {
+		require.NoError(t, db.RecordInstanceHeartbeat(ctx, tx, instance))
+	})
+
+	state, err := db.GetInstanceDrainState(ctx, instance, 5)
+	require.NoError(t, err)
+	require.True(t, state.Known)
+	require.Nil(t, state.Sessions)
+}
+
+// The latest report replaces the previous one, every field of it, and its age is read
+// against the database clock that stamped it.
+func TestInstanceDrainState_ReadsLatestSessionsReport(t *testing.T) {
+	if testing.Short() {
+		t.Skip("database test")
+	}
+	db := setupTestDatabase(t)
+	t.Cleanup(db.Close)
+	ctx := context.Background()
+
+	instance := fmt.Sprintf("reporting-%d", time.Now().UnixNano())
+	forgetInstance(t, db, instance)
+	since := time.Now().Add(-time.Hour).Truncate(time.Microsecond)
+	report := func(s InstanceSessions) {
+		inTx(t, db, func(tx pgx.Tx) {
+			require.NoError(t, db.ReportInstanceSessions(ctx, tx, s))
+		})
+	}
+
+	report(InstanceSessions{InstanceID: instance, Open: 7, Started: 40, Since: since})
+	first, err := db.GetInstanceDrainState(ctx, instance, 5)
+	require.NoError(t, err)
+	require.True(t, first.Known, "a sessions report makes the id known")
+	require.NotNil(t, first.Sessions)
+	require.Equal(t, InstanceSessions{InstanceID: instance, Open: 7, Started: 40, Since: first.Sessions.Since}, *first.Sessions)
+	require.True(t, first.Sessions.Since.Equal(since))
+	require.GreaterOrEqual(t, first.ReportAge, time.Duration(0))
+	require.Less(t, first.ReportAge, time.Minute)
+
+	restarted := since.Add(30 * time.Minute)
+	report(InstanceSessions{InstanceID: instance, Open: 0, Started: 2, Since: restarted})
+	second, err := db.GetInstanceDrainState(ctx, instance, 5)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), second.Sessions.Open)
+	require.Equal(t, int64(2), second.Sessions.Started)
+	require.True(t, second.Sessions.Since.Equal(restarted))
+	require.False(t, second.ReportedAt.Before(first.ReportedAt))
+
+	inTx(t, db, func(tx pgx.Tx) {
+		require.Error(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{Open: 1}), "a report needs an instance id")
+	})
+}
+
+// The ids to choose from are those that beat or reported recently, from either table, and
+// not those silent since before the cutoff.
+func TestListUploaderInstances(t *testing.T) {
+	if testing.Short() {
+		t.Skip("database test")
+	}
+	db := setupTestDatabase(t)
+	t.Cleanup(db.Close)
+	ctx := context.Background()
+
+	ts := time.Now().UnixNano()
+	beating := fmt.Sprintf("list-beating-%d", ts)
+	reporting := fmt.Sprintf("list-reporting-%d", ts)
+	silent := fmt.Sprintf("list-silent-%d", ts)
+	for _, id := range []string{beating, reporting, silent} {
+		forgetInstance(t, db, id)
+	}
+	inTx(t, db, func(tx pgx.Tx) {
+		require.NoError(t, db.RecordInstanceHeartbeat(ctx, tx, beating))
+		require.NoError(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{InstanceID: reporting, Since: time.Now()}))
+	})
+	_, err := db.GetWritePool().Exec(ctx, `INSERT INTO instance_heartbeats (instance_id, last_seen) VALUES ($1, now() - interval '2 days')`, silent)
+	require.NoError(t, err)
+
+	instances, err := db.ListUploaderInstances(ctx, time.Now().Add(-time.Hour))
+	require.NoError(t, err)
+	seen := map[string]bool{}
+	for _, i := range instances {
+		seen[i.InstanceID] = true
+	}
+	require.True(t, seen[beating], "heartbeat")
+	require.True(t, seen[reporting], "sessions report")
+	require.False(t, seen[silent], "silent since before the cutoff")
 }
