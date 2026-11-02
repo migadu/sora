@@ -79,7 +79,8 @@ func runBackendMaintenance(ctx context.Context, cfg config.MaintenanceConfig, lo
 
 // attachBackendMaintenance makes a proxy server honor backend maintenance. sessions, when
 // non-nil, lists the server's sessions for the drain that closes those on a backend in
-// maintenance; proxies whose sessions cannot add uploads, or end quickly, pass nil.
+// maintenance; proxies whose sessions end on their own pass nil (the backend's own report
+// keeps --wait waiting for them).
 func (deps *serverDependencies) attachBackendMaintenance(ctx context.Context, proxyName string, cm *proxy.ConnectionManager, sessions func() []proxy.DrainTarget) {
 	if deps.maintenance == nil || cm == nil {
 		return
@@ -90,30 +91,31 @@ func (deps *serverDependencies) attachBackendMaintenance(ctx context.Context, pr
 	}
 }
 
-// uploadSessionSource is a server whose sessions can stage uploads: IMAP (authenticated
-// sessions), LMTP and the Admin API's mail delivery.
-type uploadSessionSource interface {
-	UploadSessions() (open, started int64)
+// drainSessionSource is a server whose sessions the node must let finish before it stops:
+// IMAP and POP3 sessions that logged in, LMTP sessions and the Admin API's mail deliveries.
+// They can stage uploads, or (POP3) apply their deletions only at QUIT.
+type drainSessionSource interface {
+	DrainSessions() (open, started int64)
 }
 
-// startSessionsReport makes this node report its upload sessions under its uploader
-// instance id, so that `sora-admin backends ... --wait` calls it safe to stop only once
-// none is left: an empty upload queue proves nothing while an IMAP session that can still
-// APPEND is open. Only a node with an uploader stages uploads, so only such a node reports.
+// startSessionsReport makes this node report those sessions under its uploader instance
+// id, so that `sora-admin backends ... --wait` calls it safe to stop only once none is
+// left: an empty upload queue proves nothing while an IMAP session that can still APPEND is
+// open. Only a node with an uploader is a backend, so only such a node reports.
 func startSessionsReport(ctx context.Context, deps *serverDependencies) {
 	if deps.uploadWorker == nil || deps.resilientDB == nil {
 		return
 	}
-	go runSessionsReport(ctx, deps.instanceID, db.SessionsReportInterval, deps.uploadSessions, deps.resilientDB.ReportInstanceSessionsWithRetry)
+	go runSessionsReport(ctx, deps.instanceID, db.SessionsReportInterval, deps.drainSessions, deps.resilientDB.ReportInstanceSessionsWithRetry)
 }
 
-// uploadSessions sums the upload sessions of every server running in this process.
-func (deps *serverDependencies) uploadSessions() (open, started int64) {
+// drainSessions sums the drain sessions of every server running in this process.
+func (deps *serverDependencies) drainSessions() (open, started int64) {
 	deps.runningServersMux.Lock()
 	defer deps.runningServersMux.Unlock()
 	for _, s := range deps.runningServers {
-		if source, ok := s.(uploadSessionSource); ok {
-			o, st := source.UploadSessions()
+		if source, ok := s.(drainSessionSource); ok {
+			o, st := source.DrainSessions()
 			open += o
 			started += st
 		}
@@ -136,10 +138,10 @@ func runSessionsReport(ctx context.Context, instanceID string, interval time.Dur
 		cancel()
 		switch {
 		case err != nil && ctx.Err() == nil && !failing:
-			logger.Warn("Cannot report upload sessions - backend maintenance cannot confirm this node is safe to stop until it can", "instance_id", instanceID, "error", err)
+			logger.Warn("Cannot report sessions - backend maintenance cannot confirm this node is safe to stop until it can", "instance_id", instanceID, "error", err)
 			failing = true
 		case err == nil && failing:
-			logger.Info("Reporting upload sessions again", "instance_id", instanceID)
+			logger.Info("Reporting sessions again", "instance_id", instanceID)
 			failing = false
 		}
 

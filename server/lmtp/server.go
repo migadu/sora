@@ -625,10 +625,10 @@ func (b *LMTPServerBackend) GetActiveConnections() int64 {
 	return b.activeConnections.Load()
 }
 
-// UploadSessions reports the sessions that can deliver, and so stage uploads (go-smtp
+// DrainSessions reports the sessions that can deliver, and so stage uploads (go-smtp
 // starts one at LHLO): how many are open, and how many have started since the server did.
-// See imap.IMAPServer.UploadSessions.
-func (b *LMTPServerBackend) UploadSessions() (open, started int64) {
+// See imap.IMAPServer.DrainSessions.
+func (b *LMTPServerBackend) DrainSessions() (open, started int64) {
 	return b.activeConnections.Load(), b.totalConnections.Load()
 }
 

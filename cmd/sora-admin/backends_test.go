@@ -55,7 +55,7 @@ func TestNotQuiet(t *testing.T) {
 		{"quiet", report(0, time.Second), ""},
 		{"unknown instance", db.InstanceDrainState{}, "unknown instance"},
 		{"pending", pending, "3 uploads pending (1 parked)"},
-		{"sessions open", report(4, time.Second), "4 upload sessions open"},
+		{"sessions open", report(4, time.Second), "4 sessions open"},
 		{"no report", unreported, "does not report its sessions"},
 		{"stale report", report(0, sessionsReportMaxAge+time.Second), "no sessions report for"},
 	}

@@ -99,9 +99,9 @@ func (db *Database) ListBackendMaintenance(ctx context.Context) ([]BackendMainte
 // SessionsReportInterval is how often a node rewrites its instance_sessions row.
 const SessionsReportInterval = 10 * time.Second
 
-// InstanceSessions is what a node reports about its sessions that can still add uploads:
-// IMAP sessions that have authenticated, LMTP connections, Admin API deliveries in flight.
-// Started counts every such session since Since, so one that came and went between two
+// InstanceSessions is what a node reports about the sessions it must let finish before it
+// stops, because they can add uploads or lose work: IMAP and POP3 sessions that have
+// authenticated, LMTP sessions, Admin API deliveries in flight. Started counts every such session since Since, so one that came and went between two
 // reports still shows; a process that restarts reports a new Since and counts from zero.
 type InstanceSessions struct {
 	InstanceID string

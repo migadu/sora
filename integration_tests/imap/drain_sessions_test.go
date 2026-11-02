@@ -11,8 +11,8 @@ import (
 	soraimap "github.com/migadu/sora/server/imap"
 )
 
-// eventuallyUploadSessions waits until a server reports want (open, started).
-func eventuallyUploadSessions(t *testing.T, sessions func() (int64, int64), wantOpen, wantStarted int64, when string) {
+// eventuallyDrainSessions waits until a server reports want (open, started).
+func eventuallyDrainSessions(t *testing.T, sessions func() (int64, int64), wantOpen, wantStarted int64, when string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -21,16 +21,16 @@ func eventuallyUploadSessions(t *testing.T, sessions func() (int64, int64), want
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s: upload sessions = %d open, %d started; want %d open, %d started", when, open, started, wantOpen, wantStarted)
+			t.Fatalf("%s: drain sessions = %d open, %d started; want %d open, %d started", when, open, started, wantOpen, wantStarted)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// The node reports IMAP sessions that have logged in as upload sessions (an authenticated
+// The node reports IMAP sessions that have logged in as drain sessions (an authenticated
 // session can APPEND), which backend maintenance waits on: a connection counts once it
 // logs in, and stops counting as open when it ends. Started never goes back.
-func TestIMAP_UploadSessionsCountLoggedInSessions(t *testing.T) {
+func TestIMAP_DrainSessionsCountLoggedInSessions(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	server, account := common.SetupIMAPServer(t)
@@ -48,15 +48,15 @@ func TestIMAP_UploadSessionsCountLoggedInSessions(t *testing.T) {
 	if err := c.WaitGreeting(); err != nil {
 		t.Fatalf("greeting: %v", err)
 	}
-	eventuallyUploadSessions(t, s.UploadSessions, 0, 0, "connected, not logged in")
+	eventuallyDrainSessions(t, s.DrainSessions, 0, 0, "connected, not logged in")
 
 	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
 		t.Fatalf("login: %v", err)
 	}
-	eventuallyUploadSessions(t, s.UploadSessions, 1, 1, "logged in")
+	eventuallyDrainSessions(t, s.DrainSessions, 1, 1, "logged in")
 
 	if err := c.Logout().Wait(); err != nil {
 		t.Fatalf("logout: %v", err)
 	}
-	eventuallyUploadSessions(t, s.UploadSessions, 0, 1, "after logout")
+	eventuallyDrainSessions(t, s.DrainSessions, 0, 1, "after logout")
 }

@@ -2035,7 +2035,8 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		deps.connectionTrackersMux.Unlock()
 	}
 
-	// POP3 sessions are short and cannot add uploads: they end on their own.
+	// POP3 sessions are not closed for maintenance: one closed before its QUIT loses its
+	// deletions. They end on their own, and the backend's report keeps --wait waiting.
 	deps.attachBackendMaintenance(ctx, "POP3-"+serverConfig.Name, server.GetConnectionManager(), nil)
 
 	// Register proxy server for backend health monitoring via Admin API
@@ -2166,7 +2167,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		deps.connectionTrackersMux.Unlock()
 	}
 
-	// ManageSieve sessions are short and cannot add uploads: they end on their own.
+	// ManageSieve sessions are short and lose nothing when cut: they end on their own.
 	deps.attachBackendMaintenance(ctx, "ManageSieve-"+serverConfig.Name, server.GetConnectionManager(), nil)
 
 	// Register proxy server for backend health monitoring via Admin API

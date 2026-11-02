@@ -14,6 +14,7 @@ import (
 	"github.com/migadu/sora/server/adminapi"
 	"github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/lmtp"
+	"github.com/migadu/sora/server/pop3"
 	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
 )
@@ -182,11 +183,12 @@ func TestAttachBackendMaintenance(t *testing.T) {
 	}
 }
 
-// The servers whose sessions stage uploads report them.
+// The servers whose sessions the node must let finish report them.
 var (
-	_ uploadSessionSource = (*imap.IMAPServer)(nil)
-	_ uploadSessionSource = (*lmtp.LMTPServerBackend)(nil)
-	_ uploadSessionSource = (*adminapi.Server)(nil)
+	_ drainSessionSource = (*imap.IMAPServer)(nil)
+	_ drainSessionSource = (*lmtp.LMTPServerBackend)(nil)
+	_ drainSessionSource = (*adminapi.Server)(nil)
+	_ drainSessionSource = (*pop3.POP3Server)(nil)
 )
 
 type fakeServer struct{}
@@ -198,19 +200,19 @@ type fakeUploadServer struct {
 	open, started int64
 }
 
-func (f fakeUploadServer) UploadSessions() (int64, int64) { return f.open, f.started }
+func (f fakeUploadServer) DrainSessions() (int64, int64) { return f.open, f.started }
 
-// The node's upload sessions are those of every server that has them; a proxy server has
+// The node's drain sessions are those of every server that has them; a proxy server has
 // none.
-func TestUploadSessionsSumsTheServersThatHaveThem(t *testing.T) {
+func TestDrainSessionsSumsTheServersThatHaveThem(t *testing.T) {
 	deps := &serverDependencies{}
 	deps.registerServer("imap", fakeUploadServer{open: 2, started: 10})
 	deps.registerServer("lmtp", fakeUploadServer{open: 1, started: 4})
 	deps.registerServer("imap-proxy", fakeServer{})
 
-	open, started := deps.uploadSessions()
+	open, started := deps.drainSessions()
 	if open != 3 || started != 14 {
-		t.Fatalf("upload sessions = %d open, %d started; want 3 open, 14 started", open, started)
+		t.Fatalf("drain sessions = %d open, %d started; want 3 open, 14 started", open, started)
 	}
 }
 

@@ -1,6 +1,7 @@
--- What each node reports about its own sessions that can still add uploads: IMAP sessions
--- that have authenticated (APPEND, COPY and MOVE stage uploads), LMTP sessions and Admin
--- API deliveries in flight. Keyed by the uploader instance id, the owner of every upload
+-- What each node reports about its own sessions that must finish before it stops: IMAP
+-- sessions that have authenticated (APPEND, COPY and MOVE stage uploads), LMTP sessions and
+-- Admin API deliveries in flight, and POP3 sessions that have authenticated (a POP3 session
+-- applies its deletions at QUIT). Keyed by the uploader instance id, the owner of every upload
 -- such a session stages (see instance_heartbeats).
 --
 -- `sora-admin backends ... --wait` reads it to decide when a backend in maintenance is

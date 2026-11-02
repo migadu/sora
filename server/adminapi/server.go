@@ -78,15 +78,15 @@ type Server struct {
 	maxRedirectHops    int                                  // Max redirect hops per message (mail-loop backstop)
 	sieveExtensions    []string                             // [sieve] enabled_extensions, shared with the LMTP path
 
-	// Mail deliveries in flight and since start, reported as this server's upload sessions.
+	// Mail deliveries in flight and since start, reported as this server's drain sessions.
 	deliveriesOpen    atomic.Int64
 	deliveriesStarted atomic.Int64
 }
 
-// UploadSessions reports the mail deliveries (/admin/mail/deliver), which stage uploads:
+// DrainSessions reports the mail deliveries (/admin/mail/deliver), which stage uploads:
 // how many are in flight, and how many have started since the server did. See
-// imap.IMAPServer.UploadSessions.
-func (s *Server) UploadSessions() (open, started int64) {
+// imap.IMAPServer.DrainSessions.
+func (s *Server) DrainSessions() (open, started int64) {
 	return s.deliveriesOpen.Load(), s.deliveriesStarted.Load()
 }
 

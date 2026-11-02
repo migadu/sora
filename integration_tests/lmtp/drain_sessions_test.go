@@ -10,10 +10,10 @@ import (
 	"github.com/migadu/sora/server/lmtp"
 )
 
-// Every LMTP session can deliver, so the node reports each as an upload session (backend
+// Every LMTP session can deliver, so the node reports each as a drain session (backend
 // maintenance waits on them), from LHLO (where go-smtp starts the session) to close.
 // Started never goes back.
-func TestLMTP_UploadSessionsCountConnections(t *testing.T) {
+func TestLMTP_DrainSessionsCountConnections(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	server, _ := common.SetupLMTPServer(t)
@@ -27,12 +27,12 @@ func TestLMTP_UploadSessionsCountConnections(t *testing.T) {
 		t.Helper()
 		deadline := time.Now().Add(5 * time.Second)
 		for {
-			open, started := backend.UploadSessions()
+			open, started := backend.DrainSessions()
 			if open == wantOpen && started == wantStarted {
 				return
 			}
 			if time.Now().After(deadline) {
-				t.Fatalf("%s: upload sessions = %d open, %d started; want %d open, %d started", when, open, started, wantOpen, wantStarted)
+				t.Fatalf("%s: drain sessions = %d open, %d started; want %d open, %d started", when, open, started, wantOpen, wantStarted)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}

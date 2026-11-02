@@ -61,6 +61,7 @@ type POP3Server struct {
 	// Connection counters
 	totalConnections         atomic.Int64
 	authenticatedConnections atomic.Int64
+	authentications          atomic.Int64 // successful logins since start; never decreases
 
 	// Connection limiting
 	limiter *serverPkg.ConnectionLimiter
@@ -796,6 +797,14 @@ func (s *POP3Server) GetTotalConnections() int64 {
 // GetAuthenticatedConnections returns the current authenticated connection count
 func (s *POP3Server) GetAuthenticatedConnections() int64 {
 	return s.authenticatedConnections.Load()
+}
+
+// DrainSessions reports the sessions the node must let finish before it stops: a
+// logged-in session applies its deletions at QUIT, so stopping under it loses them (and
+// the client downloads those messages again). How many are open, and how many have logged
+// in since the server started. See imap.IMAPServer.DrainSessions.
+func (s *POP3Server) DrainSessions() (open, started int64) {
+	return s.authenticatedConnections.Load(), s.authentications.Load()
 }
 
 // monitorActiveSessions periodically logs active session count for monitoring

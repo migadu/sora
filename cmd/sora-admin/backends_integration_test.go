@@ -61,7 +61,7 @@ func forgetInstance(t *testing.T, rdb *resilient.ResilientDatabase, instanceID s
 	})
 }
 
-// fakeNode stands in for a backend reporting its upload sessions (cmd/sora's
+// fakeNode stands in for a backend reporting its sessions (cmd/sora's
 // runSessionsReport): it reports once before returning, then every 20ms until silenced or
 // the test ends.
 type fakeNode struct {
@@ -108,7 +108,7 @@ func (n *fakeNode) report() {
 	}
 }
 
-// sessions sets how many upload sessions are open; each one opened also counts as started.
+// sessions sets how many sessions are open; each one opened also counts as started.
 func (n *fakeNode) sessions(open int64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
