@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -404,5 +405,18 @@ func TestGetLMTPCommandTimeoutsOverrides(t *testing.T) {
 	s.Timeouts.LMTPCommandTimeouts.Data = "not-a-duration"
 	if _, err := s.GetLMTPCommandTimeoutsOverrides(); err == nil {
 		t.Error("invalid duration: expected error, got nil")
+	}
+}
+
+// A kick_rate that is not a positive finite number (TOML allows nan and inf) gets the
+// default: a NaN or infinite rate would leave the drain unpaced.
+func TestMaintenanceConfig_KickRateNotFinite(t *testing.T) {
+	for _, rate := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), 0, -3} {
+		if got := (&MaintenanceConfig{KickRate: rate}).GetKickRate(); got != 10 {
+			t.Errorf("kick_rate %v: GetKickRate = %v, want the default 10", rate, got)
+		}
+	}
+	if got := (&MaintenanceConfig{KickRate: 2.5}).GetKickRate(); got != 2.5 {
+		t.Errorf("kick_rate 2.5: GetKickRate = %v", got)
 	}
 }

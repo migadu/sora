@@ -1445,8 +1445,8 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 	// This MUST be done before authenticating to the backend, as the ID command
 	// is only valid in the "Not Authenticated" state.
 	useIDCommand := s.server.remoteUseIDCommand
-	// Override with routing-specific setting if available
-	if s.routingInfo != nil {
+	// The remote lookup's setting applies to the backend it named (as for the dial)
+	if s.routingInfo.LookupRouted(s.serverAddr) {
 		useIDCommand = s.routingInfo.RemoteUseIDCommand
 	}
 	if useIDCommand {

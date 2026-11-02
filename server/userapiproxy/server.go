@@ -495,9 +495,11 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 			metrics.LookupCacheHitsTotal.Inc()
 			return cached.ServerAddress, nil
 		}
-		// Cache miss or negative entry - fall through to lookup
-		if found {
+		// Cache miss, negative entry, or a cached backend not usable now - fall through
+		if found && cached.IsNegative {
 			logger.Debug("User API Proxy: Cache miss (negative entry)", "name", s.name, "user", email)
+		} else if found {
+			logger.Debug("User API Proxy: Cached backend not usable (refused or in maintenance)", "name", s.name, "user", email, "backend", cached.ServerAddress)
 		}
 		metrics.LookupCacheMissesTotal.Inc()
 	}
@@ -508,7 +510,8 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 		// and persisted, so a poisoned/out-of-pool entry from another node must not be dialed
 		// when restrict_to_pool is on. Passthrough when the feature is off. On refusal this
 		// falls through to consistent hash below, as does an affinity to a backend in
-		// maintenance (the new affinity set below keeps the user there afterwards).
+		// maintenance (the new affinity set below keeps the user there afterwards, unless
+		// the remote lookup names that backend).
 		if backend, found := s.affinityManager.GetBackend(email, "userapi"); found && s.connManager.AllowRemoteLookupBackend(backend) && !s.connManager.InMaintenance(backend) {
 			logger.Debug("User API Proxy: Using affinity backend", "name", s.name, "user", email, "backend", backend)
 			// Cache the route if lookup cache is enabled
@@ -526,6 +529,7 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 	}
 
 	// 3. Use remotelookup if configured
+	pinInMaintenance := false // the lookup named a backend in maintenance: routed around it below
 	if s.routingLookup != nil {
 		// Bound the lookup: previously this used context.Background() with no
 		// timeout, so a hung remotelookup service blocked the request handler
@@ -561,6 +565,8 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 			}
 
 			return routingInfo.ServerAddress, nil
+		} else if routingInfo != nil && routingInfo.ServerAddress != "" && s.connManager.InMaintenance(routingInfo.ServerAddress) {
+			pinInMaintenance = true
 		}
 	}
 
@@ -572,8 +578,11 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 
 	logger.Debug("User API Proxy: Using consistent hash backend", "name", s.name, "user", email, "backend", backendAddr)
 
-	// Set affinity for future requests
-	if s.affinityManager != nil {
+	// Set affinity for future requests. Not for a detour around a remote-lookup route in
+	// maintenance: affinity outranks the remote lookup here, so it would keep the user off
+	// the backend the lookup names after maintenance ends. The cache entry below holds the
+	// detour for its TTL instead.
+	if s.affinityManager != nil && !pinInMaintenance {
 		s.affinityManager.SetBackend(email, backendAddr, "userapi")
 	}
 

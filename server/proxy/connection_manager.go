@@ -454,29 +454,26 @@ type BackendHealthInfo struct {
 	InMaintenance      bool      `json:"in_maintenance"`   // True if an operator put the backend in maintenance
 }
 
-// HasHealthyPoolBackends checks if at least one pool backend (from remote_addrs config) is healthy.
-// This is used to determine if the proxy can route messages to backends.
-// Returns true if health checks are disabled (assume healthy) or if any backend is healthy.
+// HasHealthyPoolBackends checks if at least one pool backend (from remote_addrs config) is
+// available: healthy (or due to auto-recover, or health checks are disabled) and not in
+// maintenance. This is used to determine if the proxy can route messages to backends.
 func (cm *ConnectionManager) HasHealthyPoolBackends() bool {
-	// If health checks are disabled, all backends are healthy
-	if !cm.enableBackendHealthCheck {
-		return true
-	}
-
 	cm.healthMu.RLock()
-	defer cm.healthMu.RUnlock()
-
-	// Check if any pool backend is healthy
-	for _, health := range cm.backendHealth {
-		if health.IsHealthy {
-			return true
+	healthy := make([]string, 0, len(cm.backendHealth))
+	for addr, health := range cm.backendHealth {
+		// Healthy, or due for auto-recovery (1 minute since last failure)
+		if !cm.enableBackendHealthCheck || health.IsHealthy || time.Since(health.LastFailure) > backendRecoveryInterval {
+			healthy = append(healthy, addr)
 		}
-		// Also check auto-recovery (1 minute since last failure)
-		if time.Since(health.LastFailure) > backendRecoveryInterval {
+	}
+	cm.healthMu.RUnlock()
+
+	// Outside healthMu: maintenance may resolve a hostname.
+	for _, addr := range healthy {
+		if !cm.InMaintenance(addr) {
 			return true
 		}
 	}
-
 	return false
 }
 
@@ -1302,7 +1299,7 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 
 	// If routingInfo is provided and this connection is for that specific server,
 	// override the TLS settings with the ones from the remotelookup config.
-	if routingInfo != nil && routingInfo.ServerAddress == addr {
+	if routingInfo.LookupRouted(addr) {
 		useProxyProtocol = routingInfo.RemoteUseProxyProtocol
 		remoteTLS = routingInfo.RemoteTLS
 		remoteTLSUseStartTLS = routingInfo.RemoteTLSUseStartTLS

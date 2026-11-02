@@ -21,11 +21,12 @@ import (
 )
 
 // countingBackend is a minimal LMTP backend that accepts every recipient and message and
-// counts both.
+// counts both, and the XCLIENT commands it receives.
 type countingBackend struct {
 	addr       string
 	rcpts      atomic.Int32 // recipients accepted
 	deliveries atomic.Int32 // messages received in full (end-of-data seen)
+	xclients   atomic.Int32 // XCLIENT commands received
 }
 
 func startCountingBackend(t *testing.T, l net.Listener, name string) *countingBackend {
@@ -79,6 +80,9 @@ func (b *countingBackend) serve(c net.Conn, name string) {
 				fmt.Fprint(c, "250 2.0.0 Ok\r\n")
 			}
 			accepted = 0
+		case strings.HasPrefix(upper, "XCLIENT"):
+			b.xclients.Add(1)
+			fmt.Fprint(c, "250 Ok\r\n")
 		case strings.HasPrefix(upper, "NOOP"):
 			fmt.Fprint(c, "250 Ok\r\n")
 		case strings.HasPrefix(upper, "QUIT"):
@@ -92,7 +96,8 @@ func (b *countingBackend) serve(c net.Conn, name string) {
 
 // maintenanceLMTP is an LMTP proxy over two backends on different hosts (maintenance is
 // per host): backend1 on 127.0.0.1, backend2 on ::1. Remote lookup pins every recipient to
-// backend1, so a recipient reaches backend2 only by being routed around maintenance.
+// backend1, so a recipient reaches backend2 only by being routed around maintenance. The
+// lookup's backend settings send XCLIENT (remote_use_xclient), the pool's do not.
 type maintenanceLMTP struct {
 	m                  *proxy.Maintenance
 	backend1, backend2 *countingBackend
@@ -138,9 +143,10 @@ func setupMaintenanceLMTP(t *testing.T) *maintenanceLMTP {
 		RemotePort:     24,
 		TrustedProxies: []string{"127.0.0.0/8", "::1/128"},
 		RemoteLookup: &config.RemoteLookupConfig{
-			Enabled: true,
-			URL:     fmt.Sprintf("http://%s/lookup?q=$email", lookupListener.Addr()),
-			Timeout: "5s",
+			Enabled:          true,
+			URL:              fmt.Sprintf("http://%s/lookup?q=$email", lookupListener.Addr()),
+			Timeout:          "5s",
+			RemoteUseXCLIENT: true,
 		},
 		AuthIdleTimeout: 5 * time.Second,
 	})
@@ -261,4 +267,27 @@ func TestLMTPProxyBackendMaintenanceOnAndOffFreshConnections(t *testing.T) {
 	e.expect(t, "MAIL FROM:<sender@example.com>", "250")
 	e.expect(t, "RCPT TO:<user1@example.com>", "250")
 	e.recipients(t, 1, 1, "after maintenance")
+}
+
+// The remote lookup's backend settings are for the backend it named. A recipient routed
+// around maintenance reaches a pool backend, and the session there follows the pool's
+// settings, as its dial does: here, no XCLIENT.
+func TestLMTPProxyBackendMaintenanceReroutedRecipientGetsPoolSettings(t *testing.T) {
+	e := setupMaintenanceLMTP(t)
+
+	e.expect(t, "MAIL FROM:<sender@example.com>", "250")
+	e.expect(t, "RCPT TO:<user1@example.com>", "250")
+	e.recipients(t, 1, 0, "before maintenance")
+	if got := e.backend1.xclients.Load(); got != 1 {
+		t.Fatalf("lookup-routed backend got %d XCLIENT, want 1 (the lookup's remote_use_xclient)", got)
+	}
+
+	e.m.Set([]string{"127.0.0.1"})
+	e.reconnect(t)
+	e.expect(t, "MAIL FROM:<sender@example.com>", "250")
+	e.expect(t, "RCPT TO:<user1@example.com>", "250")
+	e.recipients(t, 1, 1, "in maintenance")
+	if got := e.backend2.xclients.Load(); got != 0 {
+		t.Fatalf("pool backend got %d XCLIENT, want none (the pool does not use XCLIENT)", got)
+	}
 }

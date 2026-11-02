@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"math"
 	"net"
 	"slices"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 // Maintenance is the set of backend hosts an operator has put in maintenance
@@ -258,6 +260,7 @@ const maintenanceLookupTimeout = 2 * time.Second
 func (p *MaintenancePoller) Refresh(ctx context.Context) error {
 	hosts, err := p.load(ctx)
 	if err != nil {
+		metrics.BackendMaintenancePollFailures.Inc()
 		return err
 	}
 	if len(hosts) > 0 {
@@ -287,6 +290,7 @@ func (p *MaintenancePoller) Refresh(ctx context.Context) error {
 	}
 	p.resolved = resolved
 
+	metrics.BackendMaintenanceHosts.Set(float64(len(hosts)))
 	if entered := p.m.Set(all); len(entered) > 0 {
 		logger.Info("Backend maintenance: hosts entered maintenance", "entered", entered, "in_maintenance", hosts)
 	}
@@ -335,7 +339,7 @@ type DrainTarget struct {
 // re-checks maintenance first, so turning it off stops a drain in progress. Runs until ctx
 // is done.
 func StartSessionDrainer(ctx context.Context, m *Maintenance, rate float64, sessions func() []DrainTarget, proxyName string) {
-	if rate <= 0 {
+	if !(rate > 0) || math.IsInf(rate, 0) {
 		rate = DefaultMaintenanceKickRate
 	}
 	interval := time.Duration(float64(time.Second) / rate)
@@ -372,6 +376,7 @@ func StartSessionDrainer(ctx context.Context, m *Maintenance, rate float64, sess
 				}
 				t.Close()
 				closed++
+				metrics.BackendMaintenanceSessionsClosed.WithLabelValues(proxyName).Inc()
 			}
 			if closed > 0 {
 				logger.Info("Backend maintenance: closed sessions on backends in maintenance", "proxy", proxyName, "closed", closed, "in_maintenance", m.Hosts())

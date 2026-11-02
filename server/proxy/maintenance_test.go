@@ -10,6 +10,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestMaintenance_ContainsMatchesHostOfAnyPort(t *testing.T) {
@@ -753,5 +756,100 @@ func TestConnectWithProxy_RefusesUntilMaintenanceLoaded(t *testing.T) {
 	conn.Close()
 	if addr != backend {
 		t.Fatalf("connected to %q, want %q", addr, backend)
+	}
+}
+
+// "Is any backend available" (the LMTP proxy's guard against bouncing a recipient it
+// cannot verify) does not count a backend in maintenance, with or without health checks:
+// with every backend drained it answers no, and the recipient gets a tempfail, not a 550.
+func TestHasHealthyPoolBackends_BackendsInMaintenanceDoNotCount(t *testing.T) {
+	for _, healthChecks := range []bool{true, false} {
+		cm, err := NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(
+			[]string{"10.0.0.5:24", "10.0.0.6:24"}, 24, false, false, false, false, time.Second, nil, "test", !healthChecks)
+		if err != nil {
+			t.Fatalf("NewConnectionManager: %v", err)
+		}
+		m := NewMaintenance()
+		cm.SetMaintenance(m)
+		m.Set([]string{"10.0.0.5"})
+		if !cm.HasHealthyPoolBackends() {
+			t.Fatalf("health checks %v: one backend still serves, but none counted", healthChecks)
+		}
+		m.Set([]string{"10.0.0.5", "10.0.0.6"})
+		if cm.HasHealthyPoolBackends() {
+			t.Fatalf("health checks %v: every backend in maintenance, yet one counted as available", healthChecks)
+		}
+	}
+}
+
+// A proxy's view of maintenance is visible in its metrics: how many hosts it honors, how
+// often it failed to read the list (a proxy that never loaded it dials no backend), and
+// how many sessions it closed on backends in maintenance.
+func TestMaintenanceMetrics(t *testing.T) {
+	m := NewMaintenance()
+	var failing atomic.Bool
+	failing.Store(true)
+	p := NewMaintenancePoller(m, func(context.Context) ([]string, error) {
+		if failing.Load() {
+			return nil, errors.New("database unavailable")
+		}
+		return []string{"10.0.0.5", "10.0.0.6"}, nil
+	})
+
+	failures := testutil.ToFloat64(metrics.BackendMaintenancePollFailures)
+	if err := p.Refresh(context.Background()); err == nil {
+		t.Fatal("test setup: Refresh succeeded")
+	}
+	if got := testutil.ToFloat64(metrics.BackendMaintenancePollFailures); got != failures+1 {
+		t.Fatalf("poll failures = %v after a failed read, want %v", got, failures+1)
+	}
+
+	failing.Store(false)
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got := testutil.ToFloat64(metrics.BackendMaintenanceHosts); got != 2 {
+		t.Fatalf("hosts in maintenance = %v, want 2", got)
+	}
+
+	closed := testutil.ToFloat64(metrics.BackendMaintenanceSessionsClosed.WithLabelValues("metrics-test"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var closes atomic.Int32
+	StartSessionDrainer(ctx, m, 100, func() []DrainTarget {
+		if closes.Load() > 0 {
+			return nil
+		}
+		return []DrainTarget{{Backend: "10.0.0.5:143", Close: func() { closes.Add(1) }}}
+	}, "metrics-test")
+	m.Set(m.Hosts())
+	deadline := time.Now().Add(5 * time.Second)
+	for testutil.ToFloat64(metrics.BackendMaintenanceSessionsClosed.WithLabelValues("metrics-test")) != closed+1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("sessions closed = %v, want %v", testutil.ToFloat64(metrics.BackendMaintenanceSessionsClosed.WithLabelValues("metrics-test")), closed+1)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// The remote lookup's backend settings are for the backend it named, and only that one.
+func TestUserRoutingInfo_LookupRouted(t *testing.T) {
+	pinned := &UserRoutingInfo{ServerAddress: "10.0.0.5:24", IsRemoteLookupAccount: true}
+	authOnly := &UserRoutingInfo{IsRemoteLookupAccount: true, AuthOnlyMode: true}
+	var none *UserRoutingInfo
+	for _, c := range []struct {
+		r    *UserRoutingInfo
+		addr string
+		want bool
+	}{
+		{pinned, "10.0.0.5:24", true},
+		{pinned, "10.0.0.6:24", false}, // routed elsewhere (maintenance, failover)
+		{authOnly, "10.0.0.5:24", false},
+		{authOnly, "", false},
+		{none, "10.0.0.5:24", false},
+	} {
+		if got := c.r.LookupRouted(c.addr); got != c.want {
+			t.Errorf("%+v.LookupRouted(%q) = %v, want %v", c.r, c.addr, got, c.want)
+		}
 	}
 }

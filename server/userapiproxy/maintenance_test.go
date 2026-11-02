@@ -85,11 +85,9 @@ func TestGetBackendForUser_RemoteLookupRouteToMaintenanceBackend(t *testing.T) {
 	}
 }
 
-// An affinity to a backend in maintenance is not used; the user's affinity moves to the
-// backend chosen instead and stays there after maintenance ends.
-func TestGetBackendForUser_AffinityToMaintenanceBackend(t *testing.T) {
-	s, m := newMaintenanceTestServer(t)
-
+// withAffinity gives s a real affinity manager (on a loopback gossip node).
+func withAffinity(t *testing.T, s *Server) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -107,6 +105,13 @@ func TestGetBackendForUser_AffinityToMaintenanceBackend(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = clusterMgr.Shutdown() })
 	s.affinityManager = server.NewAffinityManager(clusterMgr, true, time.Hour, time.Hour)
+}
+
+// An affinity to a backend in maintenance is not used; the user's affinity moves to the
+// backend chosen instead and stays there after maintenance ends.
+func TestGetBackendForUser_AffinityToMaintenanceBackend(t *testing.T) {
+	s, m := newMaintenanceTestServer(t)
+	withAffinity(t, s)
 	s.affinityManager.SetBackend("user@example.com", drainedBackend, "userapi")
 
 	m.Set([]string{"10.0.0.5"})
@@ -212,4 +217,29 @@ func TestUserAPIProxy_TransportRefusesAddressInMaintenance(t *testing.T) {
 		t.Fatalf("dial after maintenance: %v", err)
 	}
 	conn.Close()
+}
+
+// With the lookup cache and affinity both on, as in production: a remote-lookup pin given
+// up for maintenance comes back once it ends (here once the cached detour expires), as it
+// does on the other proxies, where the remote lookup outranks affinity. The detour must
+// not become the user's affinity, which the User API proxy consults before remote lookup.
+func TestGetBackendForUser_RemoteLookupPinReturnsWithCacheAndAffinity(t *testing.T) {
+	s, m := newMaintenanceTestServer(t)
+	withAffinity(t, s)
+	s.lookupCache = lookupcache.New(5*time.Minute, time.Minute, 100, time.Hour, 0)
+	t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
+	s.routingLookup = &fakeRoutingLookup{backend: drainedBackend}
+
+	if got := backendFor(t, s); got != drainedBackend {
+		t.Fatalf("before maintenance: %q, want the remote-lookup route %q", got, drainedBackend)
+	}
+	m.Set([]string{"10.0.0.5"})
+	if got := backendFor(t, s); got != otherBackend {
+		t.Fatalf("in maintenance: %q, want %q", got, otherBackend)
+	}
+	m.Set(nil)
+	s.lookupCache.InvalidateUser(s.name, "user@example.com") // the cached detour expires
+	if got := backendFor(t, s); got != drainedBackend {
+		t.Fatalf("after maintenance: %q, want the remote-lookup route %q back", got, drainedBackend)
+	}
 }

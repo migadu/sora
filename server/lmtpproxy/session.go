@@ -1164,8 +1164,8 @@ func (s *Session) connectToBackend() error {
 	shouldUseStartTLS := false
 	var tlsConfig *tls.Config
 
-	if s.routingInfo != nil && s.routingInfo.RemoteTLSUseStartTLS {
-		// RemoteLookup routing specified StartTLS
+	if s.routingInfo.LookupRouted(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
+		// RemoteLookup routing specified StartTLS (for the backend it named, as for the dial)
 		shouldUseStartTLS = true
 		tlsConfig = &tls.Config{
 			InsecureSkipVerify: !s.routingInfo.RemoteTLSVerify,
@@ -1268,8 +1268,8 @@ func (s *Session) connectToBackend() error {
 
 	// Send forwarding parameters via XCLIENT if enabled
 	useXCLIENT := s.server.remoteUseXCLIENT
-	// Override with routing-specific setting if available
-	if s.routingInfo != nil {
+	// The remote lookup's setting applies to the backend it named (as for the dial)
+	if s.routingInfo.LookupRouted(s.serverAddr) {
 		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
 	}
 	// The proxy's role is to forward the original client's information if enabled.

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"reflect"
@@ -1187,9 +1188,10 @@ func (b *MaintenanceConfig) GetPollInterval() (time.Duration, error) {
 }
 
 // GetKickRate returns how many sessions per second a proxy closes on a backend in
-// maintenance.
+// maintenance. Anything but a positive finite number (TOML allows nan and inf) gets the
+// default: those would leave the drain unpaced.
 func (b *MaintenanceConfig) GetKickRate() float64 {
-	if b.KickRate <= 0 {
+	if !(b.KickRate > 0) || math.IsInf(b.KickRate, 0) {
 		return 10
 	}
 	return b.KickRate

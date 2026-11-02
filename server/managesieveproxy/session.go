@@ -850,8 +850,8 @@ func (s *Session) connectToBackendAndAuth() error {
 	shouldUseStartTLS := false
 	var tlsConfig *tls.Config
 
-	if s.routingInfo != nil && s.routingInfo.RemoteTLSUseStartTLS {
-		// RemoteLookup routing specified StartTLS
+	if s.routingInfo.LookupRouted(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
+		// RemoteLookup routing specified StartTLS (for the backend it named, as for the dial)
 		shouldUseStartTLS = true
 		tlsConfig = &tls.Config{
 			InsecureSkipVerify: !s.routingInfo.RemoteTLSVerify,

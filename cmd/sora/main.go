@@ -414,6 +414,11 @@ func handleConfigReload(configPath string, currentCfg *config.Config, errorHandl
 		logger.Info("Config reload: [sieve] changed but requires restart to take effect",
 			"current", currentCfg.Sieve, "new", newCfg.Sieve)
 	}
+	// [backend_maintenance] tunes the poller and the drains, which start with the proxies.
+	if newCfg.Maintenance != currentCfg.Maintenance {
+		logger.Info("Config reload: [backend_maintenance] changed but requires restart to take effect",
+			"current", currentCfg.Maintenance, "new", newCfg.Maintenance)
+	}
 
 	// 5. Reload metadata limits
 	if newCfg.Metadata != currentCfg.Metadata {

@@ -621,3 +621,28 @@ var (
 		[]string{"server_name", "state"},
 	)
 )
+
+// Backend maintenance metrics (proxies honoring `sora-admin backends maintenance`)
+var (
+	BackendMaintenanceHosts = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_backend_maintenance_hosts",
+			Help: "Backend hosts in maintenance, as this proxy last read the list",
+		},
+	)
+
+	BackendMaintenancePollFailures = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_backend_maintenance_poll_failures_total",
+			Help: "Failed reads of the backend maintenance list; until a first read succeeds the proxy dials no backend",
+		},
+	)
+
+	BackendMaintenanceSessionsClosed = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_backend_maintenance_sessions_closed_total",
+			Help: "Sessions a proxy closed because their backend is in maintenance",
+		},
+		[]string{"proxy"},
+	)
+)
