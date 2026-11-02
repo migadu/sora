@@ -49,6 +49,14 @@ type Session struct {
 	startTime             time.Time
 	releaseConn           func() // Connection limiter cleanup function
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
+
+	// writeMu orders the writes to clientConn once the session proxies: the backend-to-client
+	// copy, and a BYE the proxy adds (sendBye), which must land between two responses. It
+	// guards resp, byePending and byeSent. Taken before mu, never while holding it.
+	writeMu    sync.Mutex
+	resp       responseBoundary // where the backend's response stream stands
+	byePending string           // a BYE to write as soon as the stream is between responses
+	byeSent    bool             // a BYE was written: nothing from the backend follows it
 	submittedUsername     string // Username exactly as submitted by the client (lookup-cache key)
 	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
 }
@@ -1850,7 +1858,7 @@ func (s *Session) copyBufferedReaderToConn(dst net.Conn, src *bufio.Reader) (int
 				nextDeadline = now.Add(time.Second)
 			}
 
-			nw, ew := dst.Write(buf[0:nr])
+			nw, ew := s.forwardToClient(dst, buf[0:nr])
 			if nw > 0 {
 				totalBytes += int64(nw)
 			}
