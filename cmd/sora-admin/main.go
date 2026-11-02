@@ -124,6 +124,12 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	cfg.S3 = fullCfg.S3
 	cfg.LocalCache = fullCfg.LocalCache
 	cfg.Uploader = fullCfg.Uploader
+	// fullCfg starts empty, not from config.NewDefaultConfig, so an unset max_attempts reads
+	// 0, and every pending upload would count as out of attempts (parked): `uploader
+	// resolve` would treat live uploads as written off. Use the server's default.
+	if cfg.Uploader.MaxAttempts <= 0 {
+		cfg.Uploader.MaxAttempts = config.NewDefaultConfig().Uploader.MaxAttempts
+	}
 	cfg.Cleanup = fullCfg.Cleanup
 	cfg.SharedMailboxes = fullCfg.SharedMailboxes
 	cfg.TLS = fullCfg.TLS
