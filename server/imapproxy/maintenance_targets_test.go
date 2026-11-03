@@ -23,7 +23,7 @@ func TestMaintenanceTargets_ReportTheConnectedAddress(t *testing.T) {
 	defer backendConn.Close()
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
 
-	session := &Session{backendConn: backendConn, serverAddr: net.JoinHostPort("localhost", port)}
+	session := &Session{backendConn: backendConn, serverAddr: net.JoinHostPort("localhost", port), proxying: true}
 	s := &Server{activeSessions: map[*Session]struct{}{session: {}}}
 
 	targets := s.MaintenanceTargets()

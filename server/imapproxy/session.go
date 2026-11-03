@@ -49,16 +49,18 @@ type Session struct {
 	startTime             time.Time
 	releaseConn           func() // Connection limiter cleanup function
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
+	closingForMaintenance bool   // Closed for backend maintenance: the copy closes clientConn once the backend has closed
+	proxying              bool   // In proxy mode: the login reply has gone out (guarded by mu)
 
 	// writeMu orders the writes to clientConn once the session proxies: the backend-to-client
 	// copy, and a BYE the proxy adds (sendBye), which must land between two responses. It
 	// guards resp, byePending and byeSent. Taken before mu, never while holding it.
-	writeMu    sync.Mutex
-	resp       responseBoundary // where the backend's response stream stands
-	byePending string           // a BYE to write as soon as the stream is between responses
-	byeSent    bool             // a BYE was written: nothing from the backend follows it
-	submittedUsername     string // Username exactly as submitted by the client (lookup-cache key)
-	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
+	writeMu           sync.Mutex
+	resp              responseBoundary // where the backend's response stream stands
+	byePending        string           // a BYE to write as soon as the stream is between responses
+	byeSent           bool             // a BYE was written: nothing from the backend follows it
+	submittedUsername string           // Username exactly as submitted by the client (lookup-cache key)
+	connRejected      bool             // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
 }
 
 // newSession creates a new IMAP proxy session.
@@ -1590,6 +1592,9 @@ func (s *Session) startProxy() {
 		s.ErrorLog("Backend connection not established")
 		return
 	}
+	s.mu.Lock()
+	s.proxying = true // from here on a BYE cannot overtake the login reply
+	s.mu.Unlock()
 
 	var wg sync.WaitGroup
 	s.DebugLog("Created waitgroup")
@@ -1653,7 +1658,7 @@ func (s *Session) startProxy() {
 		// needs clientConn to remain open so it can write the BYE message first.
 		defer func() {
 			s.mu.Lock()
-			if !s.gracefulShutdown {
+			if !s.gracefulShutdown || s.closingForMaintenance {
 				s.clientConn.Close()
 			}
 			s.mu.Unlock()

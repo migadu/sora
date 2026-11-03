@@ -8,9 +8,10 @@ import (
 	"github.com/migadu/sora/server/proxy"
 )
 
-// maintenanceByeDelay is how long a session closed for backend maintenance stays open
-// after its BYE, so the client reads it before the connection goes (as on shutdown).
-const maintenanceByeDelay = time.Second
+// maintenanceCloseGrace bounds how long a session closed for backend maintenance may take
+// to end. It normally ends sooner, as soon as the backend has answered the commands it
+// already had and closed. A variable so tests can shorten it.
+var maintenanceCloseGrace = 30 * time.Second
 
 // byeMaintenance is the BYE of a session closed for backend maintenance.
 const byeMaintenance = "* BYE [UNAVAILABLE] Server in maintenance, please reconnect\r\n"
@@ -34,7 +35,8 @@ func (s *Server) MaintenanceTargets() []proxy.DrainTarget {
 	for _, session := range sessions {
 		session.mu.Lock()
 		backend := ""
-		if session.backendConn != nil && !session.gracefulShutdown { // not already closing
+		// Proxying (past its login reply, which a BYE must not overtake) and not already closing.
+		if session.proxying && session.backendConn != nil && !session.gracefulShutdown {
 			backend = session.serverAddr
 			if remote := session.backendConn.RemoteAddr(); remote != nil {
 				backend = remote.String()
@@ -48,24 +50,41 @@ func (s *Server) MaintenanceTargets() []proxy.DrainTarget {
 	return targets
 }
 
-// closeForMaintenance ends a session whose backend went into maintenance: BYE
-// [UNAVAILABLE] so the client reconnects at once (and is routed elsewhere), then both
-// connections close — sendGracefulShutdownBye's sequence, for one session. A session that
-// is already closing is left alone, so it is never closed (or sent a BYE) twice.
+// closeForMaintenance ends a session whose backend went into maintenance, so the client
+// reconnects (and is routed elsewhere) without losing the outcome of anything it sent:
+//
+//   - the backend's write side is shut, so no command the client sends from now on reaches
+//     it, while the commands it already has run to completion;
+//   - BYE [UNAVAILABLE] goes to the client between two responses (sendBye), and the
+//     backend's replies keep flowing after it: a client that saw no tagged OK for an APPEND
+//     it sent would send it again after reconnecting, and the mail would be there twice;
+//   - the backend, at the end of its input, answers what it had and closes, and the
+//     session ends with it (the copy closes the client), or after maintenanceCloseGrace.
+//
+// A session that is already closing is left alone, so it is never closed (or sent a BYE)
+// twice.
 func (s *Session) closeForMaintenance() {
 	s.mu.Lock()
 	if s.gracefulShutdown {
 		s.mu.Unlock()
 		return
 	}
-	// The copy goroutine must not close clientConn before the BYE is written.
+	// The copy goroutine must not close clientConn before the BYE is written; once the
+	// backend has closed, it does (closingForMaintenance).
 	s.gracefulShutdown = true
+	s.closingForMaintenance = true
+	backendConn := s.backendConn
 	s.mu.Unlock()
 	s.InfoLog("closing session: backend in maintenance", "backend", s.serverAddrLocked())
 
+	if closeWriter, ok := backendConn.(interface{ CloseWrite() error }); ok {
+		if err := closeWriter.CloseWrite(); err != nil {
+			s.DebugLog("Failed to half-close backend connection", "error", err)
+		}
+	}
 	// Not inline: sendBye waits for a write the copy has under way, and the drain must not.
 	go s.sendBye(byeMaintenance)
-	time.AfterFunc(maintenanceByeDelay, func() {
+	time.AfterFunc(maintenanceCloseGrace, func() {
 		s.mu.Lock()
 		clientConn, backendConn := s.clientConn, s.backendConn
 		s.mu.Unlock()
@@ -88,9 +107,10 @@ func (s *Session) serverAddrLocked() string {
 
 // sendBye has bye written to the client between two responses: at once if the backend's
 // stream stands between responses, else as soon as the response under way ends (the copy
-// writes it there). After the BYE nothing from the backend is forwarded. If the response
-// does not end before the session closes, no BYE is written at all: the client, cut off
-// inside a response, discards it, where a BYE could have been read as part of it.
+// writes it there). Responses after it are still forwarded, as tagged replies follow the
+// BYE of a LOGOUT. If the response under way does not end before the session closes, no BYE
+// is written at all: the client, cut off inside a response, discards it, where a BYE could
+// have been read as part of it.
 func (s *Session) sendBye(bye string) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -116,14 +136,10 @@ func (s *Session) sendBye(bye string) {
 
 // forwardToClient writes a chunk of the backend's response stream to the client, keeping
 // track of where the stream stands. With a BYE pending it writes up to the end of the
-// response under way, then the BYE, and drops the rest; after a BYE it drops everything.
-// Dropped bytes count as written: the session is closing.
+// response under way, then the BYE, then the rest.
 func (s *Session) forwardToClient(dst net.Conn, p []byte) (int, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.byeSent {
-		return len(p), nil
-	}
 	if s.byePending == "" {
 		s.resp.consume(p, false)
 		return dst.Write(p)
@@ -135,7 +151,11 @@ func (s *Session) forwardToClient(dst net.Conn, p []byte) (int, error) {
 	if nw, err := dst.Write(p[:n]); err != nil {
 		return nw, err
 	}
-	_, err := io.WriteString(dst, s.byePending)
+	if _, err := io.WriteString(dst, s.byePending); err != nil {
+		return n, err
+	}
 	s.byePending, s.byeSent = "", true
-	return len(p), err
+	s.resp.consume(p[n:], false)
+	nw, err := dst.Write(p[n:])
+	return n + nw, err
 }
