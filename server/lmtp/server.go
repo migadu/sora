@@ -146,6 +146,10 @@ type LMTPServerBackend struct {
 	totalConnections  atomic.Int64
 	activeConnections atomic.Int64
 
+	// Transactions (MAIL to the end of DATA or RSET) under way, and begun since start.
+	transactionsOpen    atomic.Int64
+	transactionsStarted atomic.Int64
+
 	// Connection limiting
 	limiter *server.ConnectionLimiter
 
@@ -625,11 +629,13 @@ func (b *LMTPServerBackend) GetActiveConnections() int64 {
 	return b.activeConnections.Load()
 }
 
-// DrainSessions reports the sessions that can deliver, and so stage uploads (go-smtp
-// starts one at LHLO): how many are open, and how many have started since the server did.
-// See imap.IMAPServer.DrainSessions.
+// DrainSessions reports the transactions, the only part of an LMTP session that stages
+// uploads: how many are under way, and how many have begun since the server started. Not
+// connections: one that only greeted (a monitoring probe) or sits idle between
+// transactions (an MTA's connection cache) holds nothing up. See
+// imap.IMAPServer.DrainSessions.
 func (b *LMTPServerBackend) DrainSessions() (open, started int64) {
-	return b.activeConnections.Load(), b.totalConnections.Load()
+	return b.transactionsOpen.Load(), b.transactionsStarted.Load()
 }
 
 // GetAuthenticatedConnections returns the current authenticated connection count

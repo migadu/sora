@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -58,6 +59,7 @@ func (s *LMTPSession) sendToExternalRelay(from string, to string, message []byte
 // LMTPSession represents a single LMTP session.
 type LMTPSession struct {
 	server.Session
+	inTransaction atomic.Bool // between a successful MAIL and the end of the transaction (counted for DrainSessions)
 	backend       *LMTPServerBackend
 	sender        *server.Address
 	recipientAddr *server.Address // Original recipient address (may include +detail)
@@ -179,9 +181,27 @@ func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOpti
 
 	s.sender = &fromAddress
 	s.smtputf8 = (opts != nil && opts.UTF8) || !server.IsASCII(from)
+	s.beginTransaction()
 
 	recordMetrics("success")
 	return nil
+}
+
+// beginTransaction counts a transaction under way for DrainSessions: LMTP stages uploads
+// only inside one, from MAIL to the end of DATA (go-smtp then resets the session), RSET,
+// or the connection's end.
+func (s *LMTPSession) beginTransaction() {
+	if s.inTransaction.CompareAndSwap(false, true) {
+		s.backend.transactionsOpen.Add(1)
+		s.backend.transactionsStarted.Add(1)
+	}
+}
+
+// endTransaction ends the transaction under way, if any.
+func (s *LMTPSession) endTransaction() {
+	if s.inTransaction.CompareAndSwap(true, false) {
+		s.backend.transactionsOpen.Add(-1)
+	}
 }
 
 func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
@@ -1063,6 +1083,7 @@ func (s *LMTPSession) logSieveAction(source string, result sieveengine.Result) {
 }
 
 func (s *LMTPSession) Reset() {
+	s.endTransaction()
 	start := time.Now()
 	recordMetrics := func(status string) {
 		metrics.CommandsTotal.WithLabelValues("lmtp", "RSET", status).Inc()
@@ -1088,6 +1109,7 @@ func (s *LMTPSession) Reset() {
 }
 
 func (s *LMTPSession) Logout() error {
+	s.endTransaction()
 	// Check if this is a normal QUIT command or an abrupt connection close
 	if s.conn != nil && s.conn.Conn() != nil {
 		s.DebugLog("session logout requested")

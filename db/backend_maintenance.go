@@ -101,8 +101,9 @@ const SessionsReportInterval = 10 * time.Second
 
 // InstanceSessions is what a node reports about the sessions it must let finish before it
 // stops, because they can add uploads or lose work: IMAP and POP3 sessions that have
-// authenticated, LMTP sessions, Admin API deliveries in flight. Started counts every such session since Since, so one that came and went between two
-// reports still shows; a process that restarts reports a new Since and counts from zero.
+// authenticated, LMTP transactions, Admin API deliveries in flight. Started counts every
+// such session since Since, so one that came and went between two reports still shows; a
+// process that restarts reports a new Since and counts from zero.
 type InstanceSessions struct {
 	InstanceID string
 	Open       int64

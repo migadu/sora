@@ -1,5 +1,5 @@
 -- What each node reports about its own sessions that must finish before it stops: IMAP
--- sessions that have authenticated (APPEND, COPY and MOVE stage uploads), LMTP sessions and
+-- sessions that have authenticated (APPEND, COPY and MOVE stage uploads), LMTP transactions and
 -- Admin API deliveries in flight, and POP3 sessions that have authenticated (a POP3 session
 -- applies its deletions at QUIT). Keyed by the uploader instance id, the owner of every upload
 -- such a session stages (see instance_heartbeats).
