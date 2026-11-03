@@ -136,6 +136,9 @@ func maintenanceOn(ctx context.Context, rdb *resilient.ResilientDatabase, host, 
 		fmt.Printf("\nInstance %s does not report its sessions (a build that predates the report): --wait\n", instance)
 		fmt.Printf("cannot confirm it is safe to stop until it runs one that does.\n")
 	}
+	if w := staleReportWarning(state); w != "" {
+		fmt.Printf("\n%s\n", w)
+	}
 
 	rows, err := rdb.ListBackendMaintenanceWithRetry(masterContext(ctx))
 	if err == nil {
@@ -152,6 +155,16 @@ func maintenanceOn(ctx context.Context, rdb *resilient.ResilientDatabase, host, 
 	}
 	fmt.Println()
 	return waitUntilSafeToStop(ctx, rdb, row.Host)
+}
+
+// staleReportWarning says when an instance's latest sessions report is old: the id is
+// known (a node once ran under it) but no node runs under it now, or that node is down.
+func staleReportWarning(s db.InstanceDrainState) string {
+	if s.Sessions == nil || s.ReportAge <= sessionsReportMaxAge {
+		return ""
+	}
+	return fmt.Sprintf("WARNING: instance %s last reported %s ago: no node runs under this id now, or it is down.\n"+
+		"If the backend runs under another id, correct it with --instance.", s.Sessions.InstanceID, formatDuration(s.ReportAge))
 }
 
 // unknownInstanceError refuses an instance id nothing was ever recorded under, naming the

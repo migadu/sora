@@ -399,3 +399,52 @@ func TestListUploaderInstances(t *testing.T) {
 	require.True(t, seen[reporting], "sessions report")
 	require.False(t, seen[silent], "silent since before the cutoff")
 }
+
+// The cleaner retires the sessions reports of instances long silent, as it does their
+// heartbeats, so a retired instance id does not stay "known" for ever. Not while uploads
+// are pending under it, nor while a backend in maintenance names it.
+func TestCleanupFailedUploads_RetiresStaleSessionsReports(t *testing.T) {
+	if testing.Short() {
+		t.Skip("database test")
+	}
+	db := setupTestDatabase(t)
+	t.Cleanup(db.Close)
+	ctx := context.Background()
+
+	ts := time.Now().UnixNano()
+	stale := fmt.Sprintf("sessions-stale-%d", ts)
+	pending := fmt.Sprintf("sessions-pending-%d", ts)
+	maintained := fmt.Sprintf("sessions-maintained-%d", ts)
+	fresh := fmt.Sprintf("sessions-fresh-%d", ts)
+	for _, id := range []string{stale, pending, maintained, fresh} {
+		forgetInstance(t, db, id)
+	}
+	pool := db.GetWritePool()
+	for _, id := range []string{stale, pending, maintained} {
+		_, err := pool.Exec(ctx, `INSERT INTO instance_sessions (instance_id, open_sessions, started_sessions, counting_since, reported_at)
+			VALUES ($1, 0, 0, now() - interval '3 days', now() - interval '2 days')`, id)
+		require.NoError(t, err)
+	}
+	inTx(t, db, func(tx pgx.Tx) {
+		require.NoError(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{InstanceID: fresh, Since: time.Now()}))
+	})
+	accountID := backlogAccount(t, db)
+	insertPendingUpload(t, db, accountID, pending, fmt.Sprintf("sessions_pending_%d", ts), 0, time.Now())
+	host := fmt.Sprintf("sessions-host-%d.example.com", ts)
+	setMaintenance(t, db, BackendMaintenance{Host: host, InstanceID: maintained})
+
+	inTx(t, db, func(tx pgx.Tx) {
+		_, err := db.CleanupFailedUploads(ctx, tx, 24*time.Hour, 5, time.Hour)
+		require.NoError(t, err)
+	})
+
+	reported := func(id string) bool {
+		var n int
+		require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM instance_sessions WHERE instance_id = $1`, id).Scan(&n))
+		return n > 0
+	}
+	require.False(t, reported(stale), "a long-silent instance's report is retired")
+	require.True(t, reported(pending), "kept while uploads are pending under it")
+	require.True(t, reported(maintained), "kept while a backend in maintenance names it")
+	require.True(t, reported(fresh), "a current report is kept")
+}

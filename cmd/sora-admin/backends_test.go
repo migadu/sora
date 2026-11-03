@@ -66,3 +66,18 @@ func TestNotQuiet(t *testing.T) {
 		}
 	}
 }
+
+// `maintenance on` says when the instance it was given has stopped reporting: an id a
+// retired node left behind is known, but nothing it reports is current.
+func TestStaleReportWarning(t *testing.T) {
+	if w := staleReportWarning(db.InstanceDrainState{Known: true, Sessions: &db.InstanceSessions{}, ReportAge: time.Second}); w != "" {
+		t.Errorf("current report: warning %q", w)
+	}
+	if w := staleReportWarning(db.InstanceDrainState{Known: true}); w != "" {
+		t.Errorf("no report at all (warned about separately): warning %q", w)
+	}
+	w := staleReportWarning(db.InstanceDrainState{Known: true, Sessions: &db.InstanceSessions{InstanceID: "storage2"}, ReportAge: 90 * 24 * time.Hour})
+	if !strings.Contains(w, "storage2") || !strings.Contains(w, "--instance") {
+		t.Errorf("stale report: warning %q, want it to name the instance and --instance", w)
+	}
+}
