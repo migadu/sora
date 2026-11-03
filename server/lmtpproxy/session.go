@@ -368,7 +368,7 @@ func (s *Session) handleConnection() {
 			// is dropped here, at the first recipient of a transaction: the backend holds
 			// no accepted recipient yet, so nothing is poisoned, and the connect below
 			// routes afresh and re-sends MAIL FROM. Never later in a transaction.
-			if s.backendConn != nil && s.acceptedRcpts == 0 && s.server.connManager.InMaintenance(s.serverAddr) {
+			if s.backendConn != nil && s.acceptedRcpts == 0 && s.backendInMaintenance() {
 				s.InfoLog("dropping backend connection: backend in maintenance", "backend", s.serverAddr)
 				s.loseBackend()
 			}
@@ -1858,4 +1858,15 @@ func (s *Session) relayMessageData() bool {
 		}
 	}
 	return true
+}
+
+// backendInMaintenance reports whether the backend the session holds is in maintenance, by
+// the name it was routed by or by the address it is connected to: a name that does not
+// resolve for the check still leaves the address.
+func (s *Session) backendInMaintenance() bool {
+	if s.server.connManager.InMaintenance(s.serverAddr) {
+		return true
+	}
+	remote := s.backendConn.RemoteAddr()
+	return remote != nil && s.server.connManager.InMaintenance(remote.String())
 }
