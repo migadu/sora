@@ -243,3 +243,58 @@ func TestGetBackendForUser_RemoteLookupPinReturnsWithCacheAndAffinity(t *testing
 		t.Fatalf("after maintenance: %q, want the remote-lookup route %q back", got, drainedBackend)
 	}
 }
+
+// A keep-alive connection the proxy opened to a backend before it entered maintenance
+// would be reused without a dial, past the dial's maintenance check: idle connections
+// are closed when the maintenance list changes.
+func TestUserAPIProxy_ClosesIdleBackendConnectionsWhenMaintenanceChanges(t *testing.T) {
+	var closed atomic.Int32
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	backend.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			closed.Add(1)
+		}
+	}
+	backend.Start()
+	t.Cleanup(backend.Close)
+	addr := strings.TrimPrefix(backend.URL, "http://")
+	s, m := newHTTPTestProxy(t, addr)
+	m.Set(nil)
+
+	rec := httptest.NewRecorder()
+	s.setupHandler().ServeHTTP(rec, httptest.NewRequest("POST", "/user/auth/login", strings.NewReader("{}")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login: status %d", rec.Code)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if closed.Load() != 0 {
+		t.Fatal("test setup: the keep-alive connection closed on its own")
+	}
+
+	m.Set([]string{"127.0.0.1"})
+	deadline := time.Now().Add(5 * time.Second)
+	for closed.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("idle keep-alive connection to the backend still open after it entered maintenance")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Cached routes expire after the configured positive TTL, as the lookup cache does for
+// every other proxy: a detour around a backend in maintenance lasts that long, not a fixed
+// five minutes.
+func TestGetBackendForUser_CachedRoutesUseThePositiveTTL(t *testing.T) {
+	s, _ := newMaintenanceTestServer(t)
+	s.lookupCache = lookupcache.New(30*time.Second, time.Minute, 100, time.Hour, 0)
+	t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
+
+	backendFor(t, s)
+	entry, ok := s.lookupCache.Get(s.name, "user@example.com")
+	if !ok {
+		t.Fatal("route not cached")
+	}
+	if left := time.Until(entry.ExpiresAt); left > 31*time.Second {
+		t.Fatalf("cached route expires in %v, want the configured 30s", left)
+	}
+}

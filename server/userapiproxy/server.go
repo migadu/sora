@@ -235,6 +235,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	// A kept-alive connection is reused without a dial, so past the dial's maintenance check:
+	// drop the idle ones whenever the maintenance list changes.
+	connManager.OnMaintenanceChange(transport.CloseIdleConnections)
 
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *server.ProxyProtocolReader
@@ -519,8 +522,7 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 				entry := &lookupcache.CacheEntry{
 					AccountID:     accountID,
 					ServerAddress: backend,
-					CreatedAt:     time.Now(),
-					ExpiresAt:     time.Now().Add(5 * time.Minute), // Use positive TTL from cache
+					// ExpiresAt left zero: Set applies the configured positive TTL
 				}
 				s.lookupCache.Set(s.name, email, entry)
 			}
@@ -558,8 +560,7 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 				entry := &lookupcache.CacheEntry{
 					AccountID:     accountID,
 					ServerAddress: routingInfo.ServerAddress,
-					CreatedAt:     time.Now(),
-					ExpiresAt:     time.Now().Add(5 * time.Minute), // Use positive TTL from cache
+					// ExpiresAt left zero: Set applies the configured positive TTL
 				}
 				s.lookupCache.Set(s.name, email, entry)
 			}
@@ -591,8 +592,7 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 		entry := &lookupcache.CacheEntry{
 			AccountID:     accountID,
 			ServerAddress: backendAddr,
-			CreatedAt:     time.Now(),
-			ExpiresAt:     time.Now().Add(5 * time.Minute), // Use positive TTL from cache
+			// ExpiresAt left zero: Set applies the configured positive TTL
 		}
 		s.lookupCache.Set(s.name, email, entry)
 	}

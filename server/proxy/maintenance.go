@@ -43,8 +43,9 @@ type Maintenance struct {
 	names      map[string][]string
 	lookupHost func(ctx context.Context, host string) ([]string, error)
 
-	listenersMu sync.Mutex
-	listeners   []func()
+	listenersMu     sync.Mutex
+	listeners       []func() // after every Set that leaves the set non-empty (OnUpdate)
+	changeListeners []func() // after every Set that changes the set (OnChange)
 }
 
 // NewMaintenance returns a maintenance set that is not loaded yet.
@@ -53,6 +54,15 @@ func NewMaintenance() *Maintenance {
 		names:      map[string][]string{},
 		lookupHost: net.DefaultResolver.LookupHost,
 	}
+}
+
+// Empty reports whether nothing is in maintenance (or the set was never read).
+func (m *Maintenance) Empty() bool {
+	if m == nil {
+		return true
+	}
+	set := m.hosts.Load()
+	return set == nil || len(*set) == 0
 }
 
 // Loaded reports whether the set has been read at least once. Until then no backend may
@@ -83,12 +93,24 @@ func (m *Maintenance) Set(hosts []string) (entered []string) {
 		}
 	}
 	slices.Sort(entered)
+	changed := len(entered) > 0 || len(prev) > len(next)-len(entered)
 
 	if len(next) == 0 {
-		return entered
+		// Nothing in maintenance: forget the names asked about, so the cache cannot grow
+		// across maintenance windows and the next one resolves afresh.
+		m.namesMu.Lock()
+		clear(m.names)
+		m.namesMu.Unlock()
 	}
+
 	m.listenersMu.Lock()
-	listeners := slices.Clone(m.listeners)
+	var listeners []func()
+	if len(next) > 0 {
+		listeners = slices.Clone(m.listeners)
+	}
+	if changed {
+		listeners = append(listeners, m.changeListeners...)
+	}
 	m.listenersMu.Unlock()
 	for _, fn := range listeners {
 		fn()
@@ -211,6 +233,15 @@ func (m *Maintenance) OnUpdate(fn func()) {
 	m.listenersMu.Lock()
 	defer m.listenersMu.Unlock()
 	m.listeners = append(m.listeners, fn)
+}
+
+// OnChange registers fn to run after every Set that changes which hosts are in
+// maintenance (one entering or leaving it). fn must not block: it runs on the poller's
+// goroutine.
+func (m *Maintenance) OnChange(fn func()) {
+	m.listenersMu.Lock()
+	defer m.listenersMu.Unlock()
+	m.changeListeners = append(m.changeListeners, fn)
 }
 
 // NormalizeMaintenanceHost is the form a host is stored and matched in: lower case, no
@@ -336,9 +367,14 @@ type DrainTarget struct {
 // StartSessionDrainer closes, at most rate per second, the sessions whose backend is in
 // maintenance, so their clients reconnect and are routed elsewhere. Pacing spreads the
 // reconnects over the remaining backends instead of landing them all at once. Each close
-// re-checks maintenance first, so turning it off stops a drain in progress. Runs until ctx
-// is done.
-func StartSessionDrainer(ctx context.Context, m *Maintenance, rate float64, sessions func() []DrainTarget, proxyName string) {
+// re-checks maintenance first, so turning it off stops a drain in progress. inMaintenance
+// decides whether a session's backend is in maintenance: the proxy server's
+// ConnectionManager.InMaintenance, which also knows the names its pool was resolved from
+// (nil means m.Contains). Runs until ctx is done.
+func StartSessionDrainer(ctx context.Context, m *Maintenance, rate float64, sessions func() []DrainTarget, inMaintenance func(addr string) bool, proxyName string) {
+	if inMaintenance == nil {
+		inMaintenance = m.Contains
+	}
 	if !(rate > 0) || math.IsInf(rate, 0) {
 		rate = DefaultMaintenanceKickRate
 	}
@@ -361,7 +397,7 @@ func StartSessionDrainer(ctx context.Context, m *Maintenance, rate float64, sess
 			}
 			closed := 0
 			for _, t := range sessions() {
-				if !m.Contains(t.Backend) {
+				if !inMaintenance(t.Backend) {
 					continue
 				}
 				if closed > 0 {
@@ -370,7 +406,7 @@ func StartSessionDrainer(ctx context.Context, m *Maintenance, rate float64, sess
 						return
 					case <-time.After(interval):
 					}
-					if !m.Contains(t.Backend) {
+					if !inMaintenance(t.Backend) {
 						continue
 					}
 				}

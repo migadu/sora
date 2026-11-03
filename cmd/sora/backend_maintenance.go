@@ -87,12 +87,12 @@ func (deps *serverDependencies) attachBackendMaintenance(ctx context.Context, pr
 	}
 	cm.SetMaintenance(deps.maintenance)
 	if sessions != nil {
-		proxy.StartSessionDrainer(ctx, deps.maintenance, deps.config.Maintenance.GetKickRate(), sessions, proxyName)
+		proxy.StartSessionDrainer(ctx, deps.maintenance, deps.config.Maintenance.GetKickRate(), sessions, cm.InMaintenance, proxyName)
 	}
 }
 
 // drainSessionSource is a server whose sessions the node must let finish before it stops:
-// IMAP and POP3 sessions that logged in, LMTP sessions and the Admin API's mail deliveries.
+// IMAP and POP3 sessions that logged in, LMTP transactions and the Admin API's mail deliveries.
 // They can stage uploads, or (POP3) apply their deletions only at QUIT.
 type drainSessionSource interface {
 	DrainSessions() (open, started int64)

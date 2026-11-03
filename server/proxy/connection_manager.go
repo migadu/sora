@@ -93,16 +93,64 @@ type ConnectionManager struct {
 	// maintenance is the process-wide set of backends an operator put in maintenance;
 	// routing never picks one. Nil (contains nothing) until SetMaintenance.
 	maintenance atomic.Pointer[Maintenance]
+
+	// onMaintenanceChange runs whenever the maintenance set changes (OnMaintenanceChange).
+	// Written at startup, before SetMaintenance, then read-only.
+	onMaintenanceChange []func()
 }
 
 // SetMaintenance attaches the process-wide set of backends in maintenance.
 func (cm *ConnectionManager) SetMaintenance(m *Maintenance) {
+	if m != nil {
+		for _, fn := range cm.onMaintenanceChange {
+			m.OnChange(fn)
+		}
+	}
 	cm.maintenance.Store(m)
 }
 
-// InMaintenance reports whether addr is a backend an operator put in maintenance.
+// OnMaintenanceChange registers fn to run whenever the set of backends in maintenance
+// changes, once one is attached. Call it before SetMaintenance; fn must not block.
+func (cm *ConnectionManager) OnMaintenanceChange(fn func()) {
+	cm.onMaintenanceChange = append(cm.onMaintenanceChange, fn)
+}
+
+// InMaintenance reports whether addr is a backend an operator put in maintenance. A pool
+// entry is also in maintenance when the configured name it was resolved from is: a
+// maintenance entry made by name matches the pool's addresses even if its own resolution
+// failed, since the pool already knows what the name resolved to.
 func (cm *ConnectionManager) InMaintenance(addr string) bool {
-	return cm.maintenance.Load().Contains(addr)
+	m := cm.maintenance.Load()
+	if m.Contains(addr) {
+		return true
+	}
+	if m.Empty() {
+		return false
+	}
+	for _, name := range cm.configuredNamesOf(addr) {
+		if m.Contains(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// configuredNamesOf returns the configured pool addresses (remote_addrs) whose resolution
+// produced addr.
+func (cm *ConnectionManager) configuredNamesOf(addr string) []string {
+	target := normalizeHostPort(addr, 0)
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+	var names []string
+	for configured, entries := range cm.resolvedHosts {
+		for _, entry := range entries {
+			if normalizeHostPort(entry, 0) == target && configured != entry {
+				names = append(names, configured)
+				break
+			}
+		}
+	}
+	return names
 }
 
 // MaintenanceLoaded reports whether the maintenance list has been read, or is not honored

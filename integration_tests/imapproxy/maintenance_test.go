@@ -110,7 +110,7 @@ func TestIMAPProxyBackendMaintenance(t *testing.T) {
 	// Wire maintenance as cmd/sora does: one set, the poller reading the database, the drain.
 	m := proxy.NewMaintenance()
 	proxyServer.GetConnectionManager().SetMaintenance(m)
-	proxy.StartSessionDrainer(ctx, m, 50, proxyServer.MaintenanceTargets, "test")
+	proxy.StartSessionDrainer(ctx, m, 50, proxyServer.MaintenanceTargets, proxyServer.GetConnectionManager().InMaintenance, "test")
 	poller := proxy.NewMaintenancePoller(m, func(ctx context.Context) ([]string, error) {
 		rows, err := rdb.ListBackendMaintenanceWithRetry(ctx)
 		if err != nil {

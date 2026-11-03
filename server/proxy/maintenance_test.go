@@ -157,7 +157,7 @@ func TestSessionDrainer_ClosesOnlySessionsOnMaintenanceBackends(t *testing.T) {
 	}
 
 	m := NewMaintenance()
-	StartSessionDrainer(ctx, m, 1000, targets, "test")
+	StartSessionDrainer(ctx, m, 1000, targets, nil, "test")
 	m.Set([]string{"10.0.0.5"})
 
 	waitFor(t, func() bool { return sessions[0].closed.Load() > 0 && sessions[2].closed.Load() > 0 })
@@ -186,7 +186,7 @@ func TestSessionDrainer_PacesClosesAndStopsWhenMaintenanceEnds(t *testing.T) {
 	}
 
 	m := NewMaintenance()
-	StartSessionDrainer(ctx, m, 20, targets, "test") // one close per 50ms
+	StartSessionDrainer(ctx, m, 20, targets, nil, "test") // one close per 50ms
 	m.Set([]string{"10.0.0.5"})
 
 	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(closedAt) >= 3 })
@@ -821,7 +821,7 @@ func TestMaintenanceMetrics(t *testing.T) {
 			return nil
 		}
 		return []DrainTarget{{Backend: "10.0.0.5:143", Close: func() { closes.Add(1) }}}
-	}, "metrics-test")
+	}, nil, "metrics-test")
 	m.Set(m.Hosts())
 	deadline := time.Now().Add(5 * time.Second)
 	for testutil.ToFloat64(metrics.BackendMaintenanceSessionsClosed.WithLabelValues("metrics-test")) != closed+1 {
@@ -851,5 +851,88 @@ func TestUserRoutingInfo_LookupRouted(t *testing.T) {
 		if got := c.r.LookupRouted(c.addr); got != c.want {
 			t.Errorf("%+v.LookupRouted(%q) = %v, want %v", c.r, c.addr, got, c.want)
 		}
+	}
+}
+
+// Names asked about during one maintenance window are forgotten once nothing is in
+// maintenance, so the cache cannot grow across windows, and the next window resolves
+// afresh.
+func TestMaintenance_ForgetsNamesWhenEmpty(t *testing.T) {
+	m := NewMaintenance()
+	m.lookupHost = (&fakeResolver{answers: map[string][]string{"storage2.example.com": {"10.0.0.2"}}}).lookup
+	m.Set([]string{"10.0.0.9"})
+	m.Contains("storage2.example.com:143")
+	m.Set(nil)
+	m.namesMu.Lock()
+	defer m.namesMu.Unlock()
+	if len(m.names) != 0 {
+		t.Fatalf("names kept after maintenance ended: %v", m.names)
+	}
+}
+
+// A backend in maintenance by NAME whose first resolution (by the poller) fails is still
+// matched: the pool knows the name it resolved each of its entries from. Otherwise the
+// maintenance set would hold only the name, the pool only addresses, and the backend would
+// be routed to and dialed.
+func TestConnectWithProxy_NameInMaintenanceThatDoesNotResolveYet(t *testing.T) {
+	named, accepted := listenLocalhost(t) // "localhost:<port>", resolved by the pool to an IP
+	cm, m := newMaintenanceTestManager(t, named)
+	if err := cm.ResolveAddresses(); err != nil {
+		t.Fatalf("ResolveAddresses: %v", err)
+	}
+	m.lookupHost = (&fakeResolver{answers: map[string][]string{}}).lookup // maintenance DNS fails
+	p := NewMaintenancePoller(m, func(context.Context) ([]string, error) { return []string{"localhost"}, nil })
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	if conn, addr, err := cm.ConnectWithProxy(context.Background(), "", "192.0.2.1", 1234, "192.0.2.2", 143, nil); err == nil {
+		conn.Close()
+		t.Fatalf("connected to %q, resolved by the pool from a name in maintenance", addr)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := accepted.Load(); n != 0 {
+		t.Fatalf("backend in maintenance accepted %d connections", n)
+	}
+	for _, h := range cm.GetBackendHealthStatuses() {
+		if !h.InMaintenance {
+			t.Fatalf("pool entry %s not reported in maintenance", h.Address)
+		}
+	}
+}
+
+// Change listeners run when the set of hosts changes, not on every poll.
+func TestMaintenance_OnChangeRunsWhenTheSetChanges(t *testing.T) {
+	m := NewMaintenance()
+	var changes atomic.Int32
+	m.OnChange(func() { changes.Add(1) })
+	m.Set(nil)
+	m.Set([]string{"10.0.0.5"})
+	m.Set([]string{"10.0.0.5"})
+	m.Set([]string{"10.0.0.5", "10.0.0.6"})
+	m.Set(nil)
+	m.Set(nil)
+	if got := changes.Load(); got != 3 {
+		t.Fatalf("change listeners ran %d times, want 3 (on, add, off)", got)
+	}
+}
+
+// The drain asks the check it is given (the proxy server's InMaintenance, which knows the
+// names its pool was resolved from), not only the maintenance list.
+func TestSessionDrainer_UsesTheGivenMaintenanceCheck(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := NewMaintenance()
+	var closes atomic.Int32
+	StartSessionDrainer(ctx, m, 100, func() []DrainTarget {
+		return []DrainTarget{{Backend: "10.0.0.7:143", Close: func() { closes.Add(1) }}}
+	}, func(addr string) bool { return addr == "10.0.0.7:143" }, "check-test")
+	m.Set([]string{"storage7.example.com"}) // a name the list could not resolve
+	deadline := time.Now().Add(5 * time.Second)
+	for closes.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("session on a backend the given check reports in maintenance was not closed")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
