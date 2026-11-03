@@ -49,7 +49,7 @@ type Session struct {
 	startTime             time.Time
 	releaseConn           func() // Connection limiter cleanup function
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
-	closingForMaintenance bool   // Closed for backend maintenance: the copy closes clientConn once the backend has closed
+	closingForMaintenance bool   // Closed for backend maintenance: the session ends with endForMaintenance once the backend has closed
 	proxying              bool   // In proxy mode: the login reply has gone out (guarded by mu)
 
 	// writeMu orders the writes to clientConn once the session proxies: the backend-to-client
@@ -58,7 +58,7 @@ type Session struct {
 	writeMu           sync.Mutex
 	resp              responseBoundary // where the backend's response stream stands
 	byePending        string           // a BYE to write as soon as the stream is between responses
-	byeSent           bool             // a BYE was written: nothing from the backend follows it
+	byeSent           bool             // a BYE was written: none is written again
 	submittedUsername string           // Username exactly as submitted by the client (lookup-cache key)
 	connRejected      bool             // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
 }
@@ -1641,6 +1641,9 @@ func (s *Session) startProxy() {
 		if err != nil && !isClosingError(err) {
 			s.DebugLog("error copying from client to backend", "error", err)
 		}
+		if s.isClosingForMaintenance() {
+			s.drainClientInput()
+		}
 	}()
 
 	// Backend to client
@@ -1655,13 +1658,18 @@ func (s *Session) startProxy() {
 		// racing with the client-to-backend goroutine's CloseWrite (which would cause "broken pipe"
 		// on the storage backend). The full backendConn.Close() happens after both goroutines exit.
 		// UNLESS a graceful shutdown is in progress, in which case sendGracefulShutdownBye
-		// needs clientConn to remain open so it can write the BYE message first.
+		// needs clientConn to remain open so it can write the BYE message first, or the
+		// session was closed for maintenance, which endForMaintenance ends.
 		defer func() {
 			s.mu.Lock()
-			if !s.gracefulShutdown || s.closingForMaintenance {
+			maintenance := s.closingForMaintenance
+			if !s.gracefulShutdown {
 				s.clientConn.Close()
 			}
 			s.mu.Unlock()
+			if maintenance {
+				s.endForMaintenance()
+			}
 		}()
 		var bytesOut int64
 		var err error

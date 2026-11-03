@@ -16,8 +16,8 @@ import (
 const maintenanceBye = "* BYE [UNAVAILABLE] Server in maintenance, please reconnect\r\n"
 
 // proxiedSession is a session in proxy mode, running the proxy's own copy loop
-// (startProxy). The test plays the backend (over TCP, so a half-close shows) and reads
-// everything the client receives.
+// (startProxy) and then closing as handleConnection does. The test plays the backend and
+// the client, both over TCP, so a half-close and a reset show.
 type proxiedSession struct {
 	s       *Session
 	backend net.Conn // the backend's end
@@ -25,27 +25,35 @@ type proxiedSession struct {
 
 	mu          sync.Mutex
 	received    bytes.Buffer // what the client got
+	clientErr   error        // how the client's connection ended (io.EOF: closed, not reset)
 	fromClient  bytes.Buffer // what the backend got
 	clientEnded chan struct{}
 	backendEOF  atomic.Bool // the backend read EOF: nothing more will reach it
 }
 
-func newProxiedSession(t *testing.T) *proxiedSession {
+// tcpPair returns the two ends of a loopback TCP connection.
+func tcpPair(t *testing.T) (net.Conn, net.Conn) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	backendProxy, err := net.Dial("tcp", ln.Addr().String())
+	defer ln.Close()
+	dialed, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	backendEnd, err := ln.Accept()
+	accepted, err := ln.Accept()
 	if err != nil {
 		t.Fatalf("accept: %v", err)
 	}
-	ln.Close()
-	clientProxy, clientEnd := net.Pipe()
+	return dialed, accepted
+}
+
+func newProxiedSession(t *testing.T) *proxiedSession {
+	t.Helper()
+	backendProxy, backendEnd := tcpPair(t)
+	clientProxy, clientEnd := tcpPair(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
@@ -58,7 +66,7 @@ func newProxiedSession(t *testing.T) *proxiedSession {
 	srv.activeSessions[s] = struct{}{}
 	p := &proxiedSession{s: s, backend: backendEnd, client: clientEnd, clientEnded: make(chan struct{})}
 
-	go s.startProxy()
+	go func() { s.startProxy(); s.close() }()
 	go func() {
 		defer close(p.clientEnded)
 		buf := make([]byte, 4096)
@@ -66,6 +74,9 @@ func newProxiedSession(t *testing.T) *proxiedSession {
 			n, err := clientEnd.Read(buf)
 			p.mu.Lock()
 			p.received.Write(buf[:n])
+			if err != nil {
+				p.clientErr = err
+			}
 			p.mu.Unlock()
 			if err != nil {
 				return
@@ -143,12 +154,20 @@ func (p *proxiedSession) untilClosed(t *testing.T, within time.Duration) string 
 	return p.text()
 }
 
-// withCloseGrace sets how long a session closed for maintenance may take to end.
+// endedBy returns how the client's connection ended, once it has.
+func (p *proxiedSession) endedBy() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.clientErr
+}
+
+// withCloseGrace sets how long a session closed for maintenance may take to end, and keeps
+// its linger after the backend has closed short.
 func withCloseGrace(t *testing.T, d time.Duration) {
 	t.Helper()
-	saved := maintenanceCloseGrace
-	maintenanceCloseGrace = d
-	t.Cleanup(func() { maintenanceCloseGrace = saved })
+	savedGrace, savedLinger := maintenanceCloseGrace, maintenanceLinger
+	maintenanceCloseGrace, maintenanceLinger = d, 200*time.Millisecond
+	t.Cleanup(func() { maintenanceCloseGrace, maintenanceLinger = savedGrace, savedLinger })
 }
 
 // A BYE never lands inside a response: with a literal under way it waits for the end of
@@ -208,6 +227,102 @@ func TestMaintenanceBye_InFlightCommandStillGetsItsReply(t *testing.T) {
 	}
 	if strings.Contains(p.backendGot(), "a6 NOOP") {
 		t.Fatalf("a command sent after the BYE reached the backend: %q", p.backendGot())
+	}
+}
+
+// The backend can close at once (idle, or in IDLE, it answers the end of its input by
+// closing) before the BYE has been written: the BYE still goes out before the client's
+// connection closes, however late sendBye runs. Holding writeMu, past the linger, stands
+// for sendBye not having run yet.
+func TestMaintenanceBye_EvenWhenTheBackendClosesFirst(t *testing.T) {
+	withCloseGrace(t, 5*time.Second)
+	p := newProxiedSession(t)
+	p.send(t, "+ idling\r\n")
+
+	p.s.writeMu.Lock()
+	p.s.closeForMaintenance()
+	waitFor(t, p.backendEOF.Load, "the backend to see the end of client input")
+	p.backend.Close()
+	time.Sleep(2 * maintenanceLinger)
+	p.s.writeMu.Unlock()
+
+	if got := p.untilClosed(t, 2*time.Second); got != "+ idling\r\n"+maintenanceBye {
+		t.Fatalf("client received %q, want the BYE before the close", got)
+	}
+}
+
+// What a client pipelined after the BYE is read before the session closes, so the close is
+// a FIN and not a reset: closing a TCP connection with input unread resets it, and a reset
+// can discard replies the client has not read yet, such as the tagged OK of an APPEND it
+// would then send again. The pipelined APPEND is larger than a single read of the proxy.
+func TestMaintenanceClose_NotAResetOverPipelinedInput(t *testing.T) {
+	withCloseGrace(t, 10*time.Second)
+	p := newProxiedSession(t)
+	p.command(t, "a5 APPEND INBOX {3+}\r\nabc\r\n")
+
+	p.s.closeForMaintenance()
+	waitFor(t, func() bool { return strings.HasSuffix(p.text(), maintenanceBye) }, "the BYE")
+	waitFor(t, p.backendEOF.Load, "the backend to see the end of client input")
+	go func() {
+		literal := strings.Repeat("x", 256<<10)
+		_, _ = io.WriteString(p.client, "a6 APPEND INBOX {262144+}\r\n"+literal+"\r\n")
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	if _, err := io.WriteString(p.backend, "a5 OK [APPENDUID 1 7] APPEND completed\r\n"); err != nil {
+		t.Fatalf("backend write: %v", err)
+	}
+	p.backend.Close()
+	got := p.untilClosed(t, 2*time.Second)
+	if err := p.endedBy(); err != io.EOF {
+		t.Fatalf("client connection ended with %v, want it closed (EOF), not reset", err)
+	}
+	if got != maintenanceBye+"a5 OK [APPENDUID 1 7] APPEND completed\r\n" {
+		t.Fatalf("client received %q, want the BYE and then the APPEND's tagged reply", got)
+	}
+	if strings.Contains(p.backendGot(), "a6 APPEND") {
+		t.Fatalf("a command sent after the BYE reached the backend: %q", p.backendGot())
+	}
+}
+
+// A command the client sends just after the backend has closed (it has not read the BYE
+// yet) is read too: a connection already closed would answer it with a reset. The
+// connection stays open for maintenanceLinger, for the client to close it.
+func TestMaintenanceClose_LingersAfterTheBackendCloses(t *testing.T) {
+	withCloseGrace(t, 10*time.Second)
+	p := newProxiedSession(t)
+	p.send(t, "+ idling\r\n")
+
+	p.s.closeForMaintenance()
+	waitFor(t, func() bool { return strings.HasSuffix(p.text(), maintenanceBye) }, "the BYE")
+	p.backend.Close()
+	time.Sleep(50 * time.Millisecond) // the session has seen the backend's close
+	if _, err := io.WriteString(p.client, "DONE\r\n"); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond) // a reset, if any, is back
+	if _, err := io.WriteString(p.client, "a7 LOGOUT\r\n"); err != nil {
+		t.Fatalf("the proxy reset the connection over a command sent after the backend closed: %v", err)
+	}
+	if got := p.untilClosed(t, 2*time.Second); got != "+ idling\r\n"+maintenanceBye {
+		t.Fatalf("client received %q", got)
+	}
+}
+
+// A client that closes its end after the BYE ends the session then, without waiting out
+// the linger.
+func TestMaintenanceClose_EndsWhenTheClientCloses(t *testing.T) {
+	withCloseGrace(t, 10*time.Second)
+	maintenanceLinger = 10 * time.Second
+	p := newProxiedSession(t)
+	p.send(t, "+ idling\r\n")
+
+	p.s.closeForMaintenance()
+	waitFor(t, func() bool { return strings.HasSuffix(p.text(), maintenanceBye) }, "the BYE")
+	p.backend.Close()
+	_ = p.client.(*net.TCPConn).CloseWrite()
+	if got := p.untilClosed(t, 2*time.Second); got != "+ idling\r\n"+maintenanceBye {
+		t.Fatalf("client received %q", got)
 	}
 }
 

@@ -13,6 +13,11 @@ import (
 // already had and closed. A variable so tests can shorten it.
 var maintenanceCloseGrace = 30 * time.Second
 
+// maintenanceLinger bounds how long a session closed for maintenance goes on reading the
+// client's input once the backend has closed, for the client to close its end first. A
+// variable so tests can shorten it.
+var maintenanceLinger = 2 * time.Second
+
 // byeMaintenance is the BYE of a session closed for backend maintenance.
 const byeMaintenance = "* BYE [UNAVAILABLE] Server in maintenance, please reconnect\r\n"
 
@@ -59,7 +64,7 @@ func (s *Server) MaintenanceTargets() []proxy.DrainTarget {
 //     backend's replies keep flowing after it: a client that saw no tagged OK for an APPEND
 //     it sent would send it again after reconnecting, and the mail would be there twice;
 //   - the backend, at the end of its input, answers what it had and closes, and the
-//     session ends with it (the copy closes the client), or after maintenanceCloseGrace.
+//     session ends with it (endForMaintenance), or after maintenanceCloseGrace.
 //
 // A session that is already closing is left alone, so it is never closed (or sent a BYE)
 // twice.
@@ -69,8 +74,8 @@ func (s *Session) closeForMaintenance() {
 		s.mu.Unlock()
 		return
 	}
-	// The copy goroutine must not close clientConn before the BYE is written; once the
-	// backend has closed, it does (closingForMaintenance).
+	// The copies no longer close clientConn (gracefulShutdown): the session ends with
+	// endForMaintenance once the backend has closed (closingForMaintenance).
 	s.gracefulShutdown = true
 	s.closingForMaintenance = true
 	backendConn := s.backendConn
@@ -95,6 +100,36 @@ func (s *Session) closeForMaintenance() {
 			clientConn.Close()
 		}
 	})
+}
+
+// endForMaintenance ends a session closed for maintenance, once its backend has closed.
+// The BYE goes out first if it has not yet: the backend can close before sendBye ran.
+// The client then has maintenanceLinger to close its end, and what it sends meanwhile is
+// read and dropped (drainClientInput), so that the proxy does not close the connection
+// with input unread: that close is a reset, and a reset can discard what the client has
+// not read yet, such as the tagged OK of an APPEND it would then send again.
+func (s *Session) endForMaintenance() {
+	s.sendBye(byeMaintenance)
+	s.mu.Lock()
+	conn := s.clientConn
+	s.mu.Unlock()
+	if conn != nil {
+		_ = conn.SetReadDeadline(time.Now().Add(maintenanceLinger))
+	}
+}
+
+// drainClientInput reads and drops what the client sends once its session is closed for
+// maintenance and its commands no longer reach the backend, until the client closes its
+// end or endForMaintenance's deadline passes.
+func (s *Session) drainClientInput() {
+	_, _ = io.Copy(io.Discard, s.clientConn)
+}
+
+// isClosingForMaintenance reports whether closeForMaintenance has run.
+func (s *Session) isClosingForMaintenance() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closingForMaintenance
 }
 
 // serverAddrLocked reads the session's backend address under its mutex, for callers on a
