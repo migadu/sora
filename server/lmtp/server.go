@@ -146,9 +146,10 @@ type LMTPServerBackend struct {
 	totalConnections  atomic.Int64
 	activeConnections atomic.Int64
 
-	// Transactions (MAIL to the end of DATA or RSET) under way, and begun since start.
-	transactionsOpen    atomic.Int64
-	transactionsStarted atomic.Int64
+	// Transactions (MAIL to the end of DATA or RSET) under way, admitted by the maintenance
+	// gate, which refuses new ones while this backend is in maintenance.
+	transactionsOpen atomic.Int64
+	maintenanceGate  *server.MaintenanceGate
 
 	// Connection limiting
 	limiter *server.ConnectionLimiter
@@ -181,7 +182,10 @@ type RelayWorkerNotifier interface {
 type LMTPServerOptions struct {
 	// InstanceID is the upload-lease key. Empty falls back to the hostname argument,
 	// which is what every caller used before the two identities were separated.
-	InstanceID                  string
+	InstanceID string
+	// MaintenanceGate admits transactions, and refuses them while this backend is in
+	// maintenance. nil admits every transaction.
+	MaintenanceGate             *server.MaintenanceGate
 	RelayQueue                  delivery.RelayQueue // Global relay queue for Sieve redirect/vacation
 	RelayWorker                 RelayWorkerNotifier // Optional: notifies worker for immediate processing
 	Debug                       bool
@@ -243,6 +247,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		appCtx:             appCtx,
 		hostname:           hostname,
 		instanceID:         instanceIDOrHostname(options.InstanceID, hostname),
+		maintenanceGate:    options.MaintenanceGate,
 		rdb:                rdb,
 		s3:                 s3,
 		uploader:           uploadWorker,
@@ -630,12 +635,11 @@ func (b *LMTPServerBackend) GetActiveConnections() int64 {
 }
 
 // DrainSessions reports the transactions, the only part of an LMTP session that stages
-// uploads: how many are under way, and how many have begun since the server started. Not
-// connections: one that only greeted (a monitoring probe) or sits idle between
-// transactions (an MTA's connection cache) holds nothing up. See
-// imap.IMAPServer.DrainSessions.
-func (b *LMTPServerBackend) DrainSessions() (open, started int64) {
-	return b.transactionsOpen.Load(), b.transactionsStarted.Load()
+// uploads: how many are under way. Not connections: one that only greeted (a monitoring
+// probe) or sits idle between transactions (an MTA's connection cache) holds nothing up.
+// See imap.IMAPServer.DrainSessions.
+func (b *LMTPServerBackend) DrainSessions() int64 {
+	return b.transactionsOpen.Load()
 }
 
 // GetAuthenticatedConnections returns the current authenticated connection count

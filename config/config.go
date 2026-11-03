@@ -1165,11 +1165,13 @@ func (a *AuthCacheConfig) GetPurgeUnused() (time.Duration, error) {
 }
 
 // MaintenanceConfig ([backend_maintenance]) tunes how proxies honor backends an operator
-// put in maintenance (`sora-admin backends maintenance on`). Proxies read the list from
-// the database, so a proxy without one cannot honor it.
+// put in maintenance (`sora-admin backends maintenance on`), and when such a backend starts
+// refusing new sessions itself. Both read the list from the database, so a node without
+// one cannot honor it.
 type MaintenanceConfig struct {
 	PollInterval string  `toml:"poll_interval"` // How often proxies re-read the maintenance list (default: "5s")
 	KickRate     float64 `toml:"kick_rate"`     // IMAP sessions per second each proxy closes on a backend in maintenance (default: 10)
+	RefuseAfter  string  `toml:"refuse_after"`  // How long a backend in maintenance still accepts new sessions, so the proxies stop routing to it first (default: "30s")
 }
 
 // GetPollInterval returns how often proxies re-read the maintenance list.
@@ -1183,6 +1185,23 @@ func (b *MaintenanceConfig) GetPollInterval() (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("backend_maintenance.poll_interval must be positive, got %q", b.PollInterval)
+	}
+	return d, nil
+}
+
+// GetRefuseAfter returns how long a backend in maintenance keeps accepting new sessions
+// before it refuses them: long enough for every proxy to have re-read the list and stopped
+// routing to it, so that only traffic bypassing them is refused. 0 refuses at once.
+func (b *MaintenanceConfig) GetRefuseAfter() (time.Duration, error) {
+	if b.RefuseAfter == "" {
+		return 30 * time.Second, nil
+	}
+	d, err := helpers.ParseDuration(b.RefuseAfter)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("backend_maintenance.refuse_after must not be negative, got %q", b.RefuseAfter)
 	}
 	return d, nil
 }

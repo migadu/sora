@@ -113,6 +113,7 @@ type serverDependencies struct {
 	proxyServers          map[string]adminapi.ProxyServer      // proxy name -> proxy server interface (for backend health)
 	proxyServersMux       sync.Mutex                           // protects proxyServers map
 	maintenance           *proxy.Maintenance                   // backends in maintenance, honored by every proxy (nil without proxies or DB)
+	maintenanceGate       *server.MaintenanceGate              // refuses new sessions while this backend is in maintenance (nil on a node that does not report its sessions)
 	runningServers        map[string]ConfigReloader            // server name -> reloadable server
 	runningServersMux     sync.Mutex                           // protects runningServers map
 }
@@ -1168,7 +1169,8 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	errChan := make(chan error, 1)
 	allServers := deps.config.GetAllServers()
 
-	// Before any proxy server starts: each one attaches this set as it is created.
+	// Before any server starts: each proxy server attaches this set as it is created, and
+	// the backend servers admit their sessions through deps.maintenanceGate.
 	deps.maintenance = startBackendMaintenance(ctx, deps)
 	startSessionsReport(ctx, deps)
 
@@ -1390,6 +1392,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	s, err := imap.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance,
 		imap.IMAPServerOptions{
 			InstanceID:                   deps.instanceID,
+			MaintenanceGate:              deps.maintenanceGate,
 			Debug:                        serverConfig.Debug,
 			TLS:                          serverConfig.TLS,
 			TLSCertFile:                  serverConfig.TLSCertFile,
@@ -1501,6 +1504,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 
 	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
 		InstanceID:              deps.instanceID,
+		MaintenanceGate:         deps.maintenanceGate,
 		RelayQueue:              deps.relayQueue,  // Global relay queue
 		RelayWorker:             deps.relayWorker, // Global relay worker for immediate processing
 		TLSVerify:               serverConfig.TLSVerify,
@@ -1590,6 +1594,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 	}
 
 	s, err := pop3.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance, pop3.POP3ServerOptions{
+		MaintenanceGate:           deps.maintenanceGate,
 		Debug:                     serverConfig.Debug,
 		TLS:                       serverConfig.TLS,
 		TLSCertFile:               serverConfig.TLSCertFile,
@@ -2390,6 +2395,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		TLSVerify:          serverConfig.TLSVerify,
 		Hostname:           deps.hostname,
 		InstanceID:         deps.instanceID,
+		MaintenanceGate:    deps.maintenanceGate,
 		FTSRetention:       deps.ftsRetention,
 		AffinityManager:    deps.affinityManager,
 		ValidBackends:      validBackends,

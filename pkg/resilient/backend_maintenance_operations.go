@@ -107,3 +107,18 @@ func (rd *ResilientDatabase) ReportInstanceSessionsWithRetry(ctx context.Context
 	_, err := rd.executeWriteInTxWithRetry(ctx, sessionsReportRetryConfig, timeoutWrite, op)
 	return err
 }
+
+// GetMaintenanceRefusalWithRetry returns when the maintenance began that instanceID's node
+// refuses new sessions for (see db.GetMaintenanceRefusal). One attempt only: the node looks
+// again at its next report.
+func (rd *ResilientDatabase) GetMaintenanceRefusalWithRetry(ctx context.Context, instanceID string, refuseAfter time.Duration) (*time.Time, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetMaintenanceRefusal(ctx, instanceID, refuseAfter)
+	}
+	result, err := rd.executeReadWithRetry(ctx, sessionsReportRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	since, _ := result.(*time.Time)
+	return since, nil
+}

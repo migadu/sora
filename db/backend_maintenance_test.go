@@ -334,35 +334,114 @@ func TestInstanceDrainState_ReadsLatestSessionsReport(t *testing.T) {
 
 	instance := fmt.Sprintf("reporting-%d", time.Now().UnixNano())
 	forgetInstance(t, db, instance)
-	since := time.Now().Add(-time.Hour).Truncate(time.Microsecond)
 	report := func(s InstanceSessions) {
 		inTx(t, db, func(tx pgx.Tx) {
 			require.NoError(t, db.ReportInstanceSessions(ctx, tx, s))
 		})
 	}
 
-	report(InstanceSessions{InstanceID: instance, Open: 7, Started: 40, Since: since})
+	report(InstanceSessions{InstanceID: instance, Open: 7})
 	first, err := db.GetInstanceDrainState(ctx, instance, 5)
 	require.NoError(t, err)
 	require.True(t, first.Known, "a sessions report makes the id known")
 	require.NotNil(t, first.Sessions)
-	require.Equal(t, InstanceSessions{InstanceID: instance, Open: 7, Started: 40, Since: first.Sessions.Since}, *first.Sessions)
-	require.True(t, first.Sessions.Since.Equal(since))
+	require.Equal(t, InstanceSessions{InstanceID: instance, Open: 7}, *first.Sessions)
+	require.False(t, first.Refusing, "a node that accepts new sessions is not refusing")
 	require.GreaterOrEqual(t, first.ReportAge, time.Duration(0))
 	require.Less(t, first.ReportAge, time.Minute)
 
-	restarted := since.Add(30 * time.Minute)
-	report(InstanceSessions{InstanceID: instance, Open: 0, Started: 2, Since: restarted})
+	report(InstanceSessions{InstanceID: instance, Open: 0})
 	second, err := db.GetInstanceDrainState(ctx, instance, 5)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), second.Sessions.Open)
-	require.Equal(t, int64(2), second.Sessions.Started)
-	require.True(t, second.Sessions.Since.Equal(restarted))
 	require.False(t, second.ReportedAt.Before(first.ReportedAt))
 
 	inTx(t, db, func(tx pgx.Tx) {
 		require.Error(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{Open: 1}), "a report needs an instance id")
 	})
+}
+
+// A node refusing new sessions names the maintenance it refuses for (its start), and that
+// counts only while that maintenance is still on. A report made for an earlier one (the
+// node restarted since, or has not looked since maintenance was turned off and on again)
+// says nothing about the sessions started after it.
+func TestInstanceDrainState_RefusingOnlyForAMaintenanceStillOn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("database test")
+	}
+	db := setupTestDatabase(t)
+	t.Cleanup(db.Close)
+	ctx := context.Background()
+
+	instance := fmt.Sprintf("refusing-%d", time.Now().UnixNano())
+	forgetInstance(t, db, instance)
+	host := maintenanceHost(t, "refusing")
+	report := func(refusingSince *time.Time) InstanceDrainState {
+		t.Helper()
+		inTx(t, db, func(tx pgx.Tx) {
+			require.NoError(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{InstanceID: instance, RefusingSince: refusingSince}))
+		})
+		state, err := db.GetInstanceDrainState(ctx, instance, 5)
+		require.NoError(t, err)
+		return state
+	}
+
+	first := setMaintenance(t, db, BackendMaintenance{Host: host, InstanceID: instance})
+	state := report(&first.CreatedAt)
+	require.True(t, state.Refusing, "refusing for the maintenance that is on")
+	require.True(t, state.Sessions.RefusingSince.Equal(first.CreatedAt))
+
+	inTx(t, db, func(tx pgx.Tx) {
+		_, err := db.ClearBackendMaintenance(ctx, tx, host)
+		require.NoError(t, err)
+	})
+	again := setMaintenance(t, db, BackendMaintenance{Host: host, InstanceID: instance})
+	require.True(t, again.CreatedAt.After(first.CreatedAt))
+	state, err := db.GetInstanceDrainState(ctx, instance, 5)
+	require.NoError(t, err)
+	require.False(t, state.Refusing, "a report refusing for an earlier maintenance")
+
+	require.True(t, report(&again.CreatedAt).Refusing, "refusing for the current one")
+	require.False(t, report(nil).Refusing, "accepting again")
+}
+
+// What a node refuses new sessions for: the oldest maintenance of its own instance (one
+// node can be in maintenance under several of its names) that has lasted refuseAfter.
+func TestGetMaintenanceRefusal(t *testing.T) {
+	if testing.Short() {
+		t.Skip("database test")
+	}
+	db := setupTestDatabase(t)
+	t.Cleanup(db.Close)
+	ctx := context.Background()
+
+	ts := time.Now().UnixNano()
+	instance := fmt.Sprintf("refusal-%d", ts)
+	other := fmt.Sprintf("refusal-other-%d", ts)
+	refusal := func(after time.Duration) *time.Time {
+		t.Helper()
+		since, err := db.GetMaintenanceRefusal(ctx, instance, after)
+		require.NoError(t, err)
+		return since
+	}
+
+	require.Nil(t, refusal(0), "not in maintenance")
+	setMaintenance(t, db, BackendMaintenance{Host: maintenanceHost(t, "refusal-other"), InstanceID: other})
+	require.Nil(t, refusal(0), "another instance's maintenance")
+
+	byName := setMaintenance(t, db, BackendMaintenance{Host: maintenanceHost(t, "refusal-name"), InstanceID: instance})
+	require.Nil(t, refusal(time.Hour), "maintenance that has not lasted refuseAfter yet")
+	since := refusal(0)
+	require.NotNil(t, since)
+	require.True(t, since.Equal(byName.CreatedAt))
+
+	byIP := setMaintenance(t, db, BackendMaintenance{Host: maintenanceHost(t, "refusal-ip"), InstanceID: instance})
+	require.True(t, refusal(0).Equal(byName.CreatedAt), "the oldest of the node's maintenances")
+
+	var backdated time.Time
+	require.NoError(t, db.GetWritePool().QueryRow(ctx,
+		`UPDATE backend_maintenance SET created_at = now() - interval '1 hour' WHERE host = $1 RETURNING created_at`, byIP.Host).Scan(&backdated))
+	require.True(t, refusal(30*time.Minute).Equal(backdated), "only the one that has lasted refuseAfter")
 }
 
 // The ids to choose from are those that beat or reported recently, from either table, and
@@ -384,7 +463,7 @@ func TestListUploaderInstances(t *testing.T) {
 	}
 	inTx(t, db, func(tx pgx.Tx) {
 		require.NoError(t, db.RecordInstanceHeartbeat(ctx, tx, beating))
-		require.NoError(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{InstanceID: reporting, Since: time.Now()}))
+		require.NoError(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{InstanceID: reporting}))
 	})
 	_, err := db.GetWritePool().Exec(ctx, `INSERT INTO instance_heartbeats (instance_id, last_seen) VALUES ($1, now() - interval '2 days')`, silent)
 	require.NoError(t, err)
@@ -421,12 +500,12 @@ func TestCleanupFailedUploads_RetiresStaleSessionsReports(t *testing.T) {
 	}
 	pool := db.GetWritePool()
 	for _, id := range []string{stale, pending, maintained} {
-		_, err := pool.Exec(ctx, `INSERT INTO instance_sessions (instance_id, open_sessions, started_sessions, counting_since, reported_at)
-			VALUES ($1, 0, 0, now() - interval '3 days', now() - interval '2 days')`, id)
+		_, err := pool.Exec(ctx, `INSERT INTO instance_sessions (instance_id, open_sessions, reported_at)
+			VALUES ($1, 0, now() - interval '2 days')`, id)
 		require.NoError(t, err)
 	}
 	inTx(t, db, func(tx pgx.Tx) {
-		require.NoError(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{InstanceID: fresh, Since: time.Now()}))
+		require.NoError(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{InstanceID: fresh}))
 	})
 	accountID := backlogAccount(t, db)
 	insertPendingUpload(t, db, accountID, pending, fmt.Sprintf("sessions_pending_%d", ts), 0, time.Now())

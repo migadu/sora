@@ -179,9 +179,17 @@ func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOpti
 	}
 	defer release()
 
+	if !s.beginTransaction() {
+		s.InfoLog("transaction refused: this backend is in maintenance", "from", from)
+		recordMetrics("failure")
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 3, 2}, // RFC 3463: system not accepting network messages
+			Message:      "Server in maintenance, try again later",
+		}
+	}
 	s.sender = &fromAddress
 	s.smtputf8 = (opts != nil && opts.UTF8) || !server.IsASCII(from)
-	s.beginTransaction()
 
 	recordMetrics("success")
 	return nil
@@ -189,12 +197,17 @@ func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOpti
 
 // beginTransaction counts a transaction under way for DrainSessions: LMTP stages uploads
 // only inside one, from MAIL to the end of DATA (go-smtp then resets the session), RSET,
-// or the connection's end.
-func (s *LMTPSession) beginTransaction() {
-	if s.inTransaction.CompareAndSwap(false, true) {
-		s.backend.transactionsOpen.Add(1)
-		s.backend.transactionsStarted.Add(1)
+// or the connection's end. It reports false, counting nothing, when the maintenance gate
+// refuses a new transaction.
+func (s *LMTPSession) beginTransaction() bool {
+	if !s.inTransaction.CompareAndSwap(false, true) {
+		return true // already under way (a repeated MAIL)
 	}
+	if !s.backend.maintenanceGate.Admit(&s.backend.transactionsOpen, "lmtp") {
+		s.inTransaction.Store(false)
+		return false
+	}
+	return true
 }
 
 // endTransaction ends the transaction under way, if any.

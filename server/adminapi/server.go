@@ -78,16 +78,16 @@ type Server struct {
 	maxRedirectHops    int                                  // Max redirect hops per message (mail-loop backstop)
 	sieveExtensions    []string                             // [sieve] enabled_extensions, shared with the LMTP path
 
-	// Mail deliveries in flight and since start, reported as this server's drain sessions.
-	deliveriesOpen    atomic.Int64
-	deliveriesStarted atomic.Int64
+	// Mail deliveries in flight, reported as this server's drain sessions, admitted by the
+	// maintenance gate, which refuses new ones while this backend is in maintenance.
+	deliveriesOpen  atomic.Int64
+	maintenanceGate *server.MaintenanceGate
 }
 
 // DrainSessions reports the mail deliveries (/admin/mail/deliver), which stage uploads:
-// how many are in flight, and how many have started since the server did. See
-// imap.IMAPServer.DrainSessions.
-func (s *Server) DrainSessions() (open, started int64) {
-	return s.deliveriesOpen.Load(), s.deliveriesStarted.Load()
+// how many are in flight. See imap.IMAPServer.DrainSessions.
+func (s *Server) DrainSessions() int64 {
+	return s.deliveriesOpen.Load()
 }
 
 // ServerOptions holds configuration options for the HTTP API server
@@ -110,6 +110,7 @@ type ServerOptions struct {
 	TLSVerify          bool
 	Hostname           string
 	InstanceID         string
+	MaintenanceGate    *server.MaintenanceGate // admits mail deliveries; refuses them while this backend is in maintenance (nil admits all)
 	FTSRetention       time.Duration
 	AffinityManager    AffinityManager
 	ValidBackends      map[string][]string                  // Map of protocol -> valid backend addresses
@@ -235,6 +236,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		tlsVerify:          options.TLSVerify,
 		hostname:           options.Hostname,
 		instanceID:         options.InstanceID,
+		maintenanceGate:    options.MaintenanceGate,
 		ftsRetention:       options.FTSRetention,
 		affinityManager:    options.AffinityManager,
 		validBackends:      options.ValidBackends,

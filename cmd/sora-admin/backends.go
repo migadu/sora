@@ -18,24 +18,20 @@ import (
 	"github.com/migadu/sora/server/proxy"
 )
 
-// drainQuietPeriod is how long a backend must stay quiet before it is reported safe to
-// stop: nothing pending, and by its own report no client session (one that could add an
-// upload or lose work) open and none started. The period is measured between the node's reports (the database clock),
-// so it is time the node itself saw. Variables so tests can shorten them.
-var drainQuietPeriod = 2 * time.Minute
-
-// drainPollInterval is how often --wait re-reads the backend's state.
+// drainPollInterval is how often --wait re-reads the backend's state. A variable, as is
+// sessionsReportMaxAge, so tests can shorten it.
 var drainPollInterval = 10 * time.Second
 
 // sessionsReportMaxAge is how old a node's sessions report may be and still be relied
 // on: a few missed reports. An older one comes from a node that stopped reporting.
 var sessionsReportMaxAge = 6 * db.SessionsReportInterval
 
-// directIngressNote is the prerequisite --wait cannot check for itself.
-const directIngressNote = "Maintenance is enforced by the proxies: it does not turn away traffic that reaches the\n" +
-	"backend directly (LMTP not through a proxy, its own Admin API) or through a proxy on an older\n" +
-	"build. Stop those first: the backend's session report is a sample, and cannot rule out a\n" +
-	"session that starts just before --wait returns."
+// refusalNote is what the backend itself does in maintenance, for traffic the proxies do
+// not hold back.
+const refusalNote = "Once it has been in maintenance for its [backend_maintenance] refuse_after (default 30s),\n" +
+	"the backend also refuses new sessions itself (IMAP and POP3 logins, LMTP transactions, Admin\n" +
+	"API deliveries) with a temporary failure, however they reach it: LMTP sent to it directly,\n" +
+	"its own Admin API, a proxy on an older build."
 
 // errNotInMaintenance reports a --host that is not in maintenance.
 var errNotInMaintenance = errors.New("not in maintenance")
@@ -135,7 +131,8 @@ func maintenanceOn(ctx context.Context, rdb *resilient.ResilientDatabase, host, 
 	fmt.Printf("Backend %s is in maintenance (since %s).\n", row.Host, row.CreatedAt.Format(time.RFC3339))
 	fmt.Printf("Proxies stop routing new traffic to it within one poll ([backend_maintenance] poll_interval,\n")
 	fmt.Printf("default 5s) and close its IMAP sessions gradually. The backend itself must keep running.\n")
-	fmt.Printf("\n%s\n", directIngressNote)
+	fmt.Printf("\n%s\n", refusalNote)
+	fmt.Printf("The node refusing them is the one reporting as instance %q: make sure that is this backend.\n", instance)
 	if defaulted {
 		fmt.Printf("\nNo --instance given: its uploads and sessions are tracked under instance id %q (the host).\n", instance)
 	}
@@ -284,10 +281,9 @@ func showBackendsStatus(ctx context.Context, rdb *resilient.ResilientDatabase, o
 		fmt.Printf("No backends in maintenance.\n")
 		return nil
 	}
-	fmt.Printf("Safe to stop needs, for %s, nothing pending and no client session open or started,\n", drainQuietPeriod)
-	fmt.Printf("by the node's own report: use --host <host> --wait.\n")
+	fmt.Printf("Safe to stop needs nothing pending and, by the node's own report, no client session open\n")
+	fmt.Printf("and new ones refused: use --host <host> --wait.\n")
 	fmt.Printf("Also check the node's own relay queue (sora-admin relay stats, on that node).\n")
-	fmt.Printf("%s\n", directIngressNote)
 	fmt.Printf("Each proxy reports the hosts it honors in sora_backend_maintenance_hosts, and marks its\n")
 	fmt.Printf("pool backends [maintenance] in: sora-admin health status --backends\n")
 	return nil
@@ -311,23 +307,31 @@ func printDrainState(s db.InstanceDrainState) {
 	case s.Sessions == nil:
 		fmt.Printf("  Client sessions:      not reported (the node runs a build that does not report them)\n")
 	default:
-		fmt.Printf("  Client sessions:      %d open, %d started since %s (reported %s ago)\n",
-			s.Sessions.Open, s.Sessions.Started, s.Sessions.Since.Format(time.RFC3339), formatDuration(s.ReportAge))
+		fmt.Printf("  Client sessions:      %d open (reported %s ago)\n", s.Sessions.Open, formatDuration(s.ReportAge))
 		if s.ReportAge > sessionsReportMaxAge {
 			fmt.Printf("                        The node stopped reporting: is it running?\n")
+		}
+		switch {
+		case s.Refusing:
+			fmt.Printf("  New sessions:         refused (maintenance since %s)\n", s.Sessions.RefusingSince.Format(time.RFC3339))
+		case s.Sessions.RefusingSince != nil:
+			fmt.Printf("  New sessions:         refused for an earlier maintenance; the node has not looked again yet\n")
+		default:
+			fmt.Printf("  New sessions:         still accepted (refused once in maintenance for the node's refuse_after, default 30s)\n")
 		}
 	}
 }
 
-// waitUntilSafeToStop blocks until the backend has been quiet for drainQuietPeriod: no
-// upload pending and, by the node's own report, no client session open and none started. Each poll re-reads the maintenance row, so a corrected instance id is followed
-// (from scratch), and the wait gives up if maintenance is turned off. It reads from the
-// primary: a replica lagging behind could report zero while rows exist.
+// waitUntilSafeToStop blocks until the backend is safe to stop: no upload pending and, by
+// the node's own report, no client session open while it refuses new ones for the
+// maintenance that is on. The node refuses before it counts, so from then on nothing can
+// start (see server.MaintenanceGate). Each poll re-reads the maintenance row, so a
+// corrected instance id is followed, and the wait gives up if maintenance is turned off.
+// It reads from the primary: a replica lagging behind could report zero while rows exist.
 func waitUntilSafeToStop(ctx context.Context, rdb *resilient.ResilientDatabase, host string) error {
 	ctx = masterContext(ctx)
 	var (
 		instance     string
-		quiet        *quietMark // the report that began the current quiet period
 		warnedParked bool
 	)
 
@@ -342,10 +346,9 @@ func waitUntilSafeToStop(ctx context.Context, rdb *resilient.ResilientDatabase, 
 		now := time.Now().Format(time.TimeOnly)
 		if row.InstanceID != instance {
 			if instance != "" {
-				fmt.Printf("%s  instance changed from %s to %s — starting over\n", now, instance, row.InstanceID)
+				fmt.Printf("%s  instance changed from %s to %s\n", now, instance, row.InstanceID)
 			}
 			instance = row.InstanceID
-			quiet = nil
 		}
 
 		state, err := rdb.GetInstanceDrainStateWithRetry(ctx, instance, globalConfig.Uploader.MaxAttempts)
@@ -353,36 +356,18 @@ func waitUntilSafeToStop(ctx context.Context, rdb *resilient.ResilientDatabase, 
 			return fmt.Errorf("drain state of %s: %w", instance, err)
 		}
 
-		if busy := notQuiet(state); busy != "" {
-			if quiet != nil {
-				fmt.Printf("%s  %s: no longer quiet — restarting the %s quiet period\n", now, instance, drainQuietPeriod)
-			}
-			quiet = nil
-			fmt.Printf("%s  %s: %s\n", now, instance, busy)
-			if state.Parked > 0 && !warnedParked {
-				fmt.Printf("          Parked uploads are out of attempts and will not drain on their own:\n")
-				fmt.Printf("          run 'sora-admin uploader resolve' on that node.\n")
-				warnedParked = true
-			}
-		} else {
-			mark := quietMark{since: state.Sessions.Since, started: state.Sessions.Started, at: state.ReportedAt}
-			switch {
-			case quiet == nil:
-				quiet = &mark
-				fmt.Printf("%s  %s: nothing pending, no client sessions — confirming for %s\n", now, instance, drainQuietPeriod)
-			case !mark.since.Equal(quiet.since):
-				quiet = &mark
-				fmt.Printf("%s  %s: the node restarted — restarting the %s quiet period\n", now, instance, drainQuietPeriod)
-			case mark.started != quiet.started:
-				fmt.Printf("%s  %s: %d client sessions came and went — restarting the %s quiet period\n", now, instance, mark.started-quiet.started, drainQuietPeriod)
-				quiet = &mark
-			case mark.at.Sub(quiet.at) >= drainQuietPeriod:
-				fmt.Printf("%s  %s: quiet for %s: nothing pending, no client session open or started.\n\n", now, instance, drainQuietPeriod)
-				fmt.Printf("Backend %s is safe to stop as far as uploads go, provided nothing reaches it except\n", host)
-				fmt.Printf("through proxies honoring maintenance. Before stopping it, check its relay queue on the\n")
-				fmt.Printf("node (sora-admin relay stats).\n")
-				return nil
-			}
+		busy := notSafe(state)
+		if busy == "" {
+			fmt.Printf("%s  %s: nothing pending, no client session open, new sessions refused.\n\n", now, instance)
+			fmt.Printf("Backend %s is safe to stop as far as uploads go. Before stopping it, check its relay\n", host)
+			fmt.Printf("queue on the node (sora-admin relay stats).\n")
+			return nil
+		}
+		fmt.Printf("%s  %s: %s\n", now, instance, busy)
+		if state.Parked > 0 && !warnedParked {
+			fmt.Printf("          Parked uploads are out of attempts and will not drain on their own:\n")
+			fmt.Printf("          run 'sora-admin uploader resolve' on that node.\n")
+			warnedParked = true
 		}
 
 		select {
@@ -393,17 +378,11 @@ func waitUntilSafeToStop(ctx context.Context, rdb *resilient.ResilientDatabase, 
 	}
 }
 
-// quietMark is the sessions report a quiet period is measured from.
-type quietMark struct {
-	since   time.Time // the reporting process's start: a restart begins a new count
-	started int64     // sessions started by then
-	at      time.Time // when the node wrote the report (database clock)
-}
-
-// notQuiet says what keeps an instance from being quiet, or "" when it is: nothing
-// pending, and a current report of no open client session. Without a usable report the
-// sessions are unknown, which is never quiet.
-func notQuiet(s db.InstanceDrainState) string {
+// notSafe says what keeps an instance from being safe to stop, or "" when nothing does:
+// nothing pending, and a current report of no open client session from a node refusing
+// new ones for a maintenance still on. Without a usable report the sessions are unknown,
+// which is never safe.
+func notSafe(s db.InstanceDrainState) string {
 	var busy []string
 	if !s.Known {
 		busy = append(busy, "unknown instance: no uploader ever reported under this id. Correct it with: backends maintenance on --host <host> --instance <id>")
@@ -421,8 +400,17 @@ func notQuiet(s db.InstanceDrainState) string {
 		busy = append(busy, "the node does not report its sessions (a build that predates the report): cannot confirm")
 	case s.ReportAge > sessionsReportMaxAge:
 		busy = append(busy, fmt.Sprintf("no sessions report for %s: is the node running?", formatDuration(s.ReportAge)))
-	case s.Sessions.Open > 0:
-		busy = append(busy, fmt.Sprintf("%d sessions open", s.Sessions.Open))
+	default:
+		if s.Sessions.Open > 0 {
+			busy = append(busy, fmt.Sprintf("%d sessions open", s.Sessions.Open))
+		}
+		switch {
+		case s.Refusing:
+		case s.Sessions.RefusingSince != nil:
+			busy = append(busy, "the node refuses new sessions for an earlier maintenance and has not looked again yet")
+		default:
+			busy = append(busy, "the node is not refusing new sessions yet (it does once in maintenance for its refuse_after, default 30s)")
+		}
 	}
 	return strings.Join(busy, "; ")
 }
@@ -475,13 +463,13 @@ func operatorName() string {
 }
 
 func printBackendsUsage() {
-	fmt.Printf(`Backend maintenance
+	fmt.Print(`Backend maintenance
 
 A backend in maintenance gets no new traffic from any proxy: new logins and deliveries go
 to other backends, users with affinity to it are re-routed, remote-lookup routes to it
-fall back to normal routing, and proxies close its IMAP sessions gradually. The backend
-keeps running, so it finishes the uploads only it can do (its spool is node-local), and
-is then safe to stop.
+fall back to normal routing, and proxies close its IMAP sessions gradually; after a
+grace period it refuses new sessions itself. The backend keeps running, so it finishes
+the uploads only it can do (its spool is node-local), and is then safe to stop.
 
 Usage:
   sora-admin backends maintenance on  --host HOST [--instance ID] [--reason TEXT] [--wait]
@@ -496,18 +484,18 @@ Options:
                       sessions under it. Default: the host. An id no node ever reported
                       under is refused.
   --reason string     Note shown by status.
-  --wait              Block until the backend has been quiet for %s: nothing pending, and
-                      by the node's own report no client session (IMAP or POP3 logged in,
-                      LMTP transaction, Admin API delivery) open or started.
+  --wait              Block until the backend is safe to stop: nothing pending, and by
+                      the node's own report no client session (IMAP or POP3 logged in,
+                      LMTP transaction, Admin API delivery) open while it refuses new ones.
 
 Proxies need database access to honor maintenance; they re-read the list every
-[backend_maintenance] poll_interval (default 5s). Maintenance is enforced by the proxies
-only: stop traffic that reaches the backend directly (LMTP not through a proxy, its own
-Admin API) before relying on --wait.
+[backend_maintenance] poll_interval (default 5s). The backend refuses new sessions
+itself once it has been in maintenance for its [backend_maintenance] refuse_after
+(default 30s), however they reach it.
 
 Examples:
   sora-admin backends maintenance on --host storage2.example.com --reason "disk swap" --wait
   sora-admin backends status
   sora-admin backends maintenance off --host storage2.example.com
-`, drainQuietPeriod)
+`)
 }

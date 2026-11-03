@@ -257,7 +257,7 @@ type IMAPServer struct {
 	// Connection counters
 	totalConnections         atomic.Int64
 	authenticatedConnections atomic.Int64
-	authentications          atomic.Int64 // successful logins since start; never decreases
+	maintenanceGate          *server.MaintenanceGate // admits logins; refuses them while this backend is in maintenance
 
 	// Connection tracking
 	connTracker *serverPkg.ConnectionTracker
@@ -331,7 +331,10 @@ type IMAPServer struct {
 
 type IMAPServerOptions struct {
 	// InstanceID is the upload-lease key. Empty falls back to the hostname argument.
-	InstanceID                  string
+	InstanceID string
+	// MaintenanceGate admits logins, and refuses them while this backend is in maintenance.
+	// nil admits every login.
+	MaintenanceGate             *server.MaintenanceGate
 	Debug                       bool
 	TLS                         bool
 	TLSCertFile                 string
@@ -547,6 +550,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	s := &IMAPServer{
 		hostname:                     hostname,
 		instanceID:                   imapInstanceIDOrHostname(options.InstanceID, hostname),
+		maintenanceGate:              options.MaintenanceGate,
 		name:                         name,
 		appCtx:                       appCtx,
 		addr:                         imapAddr,
@@ -1249,11 +1253,12 @@ func (s *IMAPServer) GetAuthenticatedConnections() int64 {
 }
 
 // DrainSessions reports the sessions the node must let finish before it stops, because they
-// can stage uploads (an authenticated session can APPEND, COPY and MOVE): how many are
-// open, and how many have logged in since the server started. The node reports them so that a backend in maintenance is only called safe to
-// stop once none is left (sora-admin backends ... --wait).
-func (s *IMAPServer) DrainSessions() (open, started int64) {
-	return s.authenticatedConnections.Load(), s.authentications.Load()
+// can stage uploads (an authenticated session can APPEND, COPY and MOVE): how many are open.
+// The node reports them so that a backend in maintenance is only called safe to stop once
+// none is left (sora-admin backends ... --wait); logins go through the maintenance gate,
+// so none can start after that.
+func (s *IMAPServer) DrainSessions() int64 {
+	return s.authenticatedConnections.Load()
 }
 
 // warmupStateFile is the filename for persisting warmup timestamps across restarts.

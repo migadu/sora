@@ -24,6 +24,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/pkg/spamtraining"
+	soraserver "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/lmtp"
 	"github.com/migadu/sora/server/managesieve"
@@ -146,6 +147,10 @@ type TestServer struct {
 	ResilientDB  *resilient.ResilientDatabase
 	uploadWorker *uploader.UploadWorker // exposed for WaitForUploads
 	UploadPath   string                 // local staging dir; set by setups that need to manipulate staged files
+
+	// MaintenanceGate is the gate the server admits sessions through, for setups that give
+	// it one: SetRefusing(true) makes it refuse new sessions as a backend in maintenance.
+	MaintenanceGate *soraserver.MaintenanceGate
 }
 
 // UploadMaxAttempts is the attempts value at which this server's upload worker parks a
@@ -425,6 +430,7 @@ func setupIMAPServerWith(t *testing.T, rdb *resilient.ResilientDatabase, hostnam
 		},
 	}
 
+	gate := soraserver.NewMaintenanceGate(false)
 	server, err := imap.New(
 		context.Background(),
 		"test",
@@ -435,8 +441,9 @@ func setupIMAPServerWith(t *testing.T, rdb *resilient.ResilientDatabase, hostnam
 		uploadWorker,
 		nil, // cache.Cache
 		imap.IMAPServerOptions{
-			InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
-			Config:       testConfig,
+			InsecureAuth:    true, // Allow PLAIN auth (no TLS in tests)
+			Config:          testConfig,
+			MaintenanceGate: gate,
 		},
 	)
 	if err != nil {
@@ -469,12 +476,13 @@ func setupIMAPServerWith(t *testing.T, rdb *resilient.ResilientDatabase, hostnam
 	}
 
 	return &TestServer{
-		Address:      address,
-		Server:       server,
-		cleanup:      cleanup,
-		ResilientDB:  rdb,
-		uploadWorker: uploadWorker,
-		UploadPath:   tempDir,
+		Address:         address,
+		Server:          server,
+		cleanup:         cleanup,
+		ResilientDB:     rdb,
+		uploadWorker:    uploadWorker,
+		UploadPath:      tempDir,
+		MaintenanceGate: gate,
 	}
 }
 
@@ -942,6 +950,9 @@ func SetupLMTPServerWithIdleTimeout(t *testing.T, idleTimeout time.Duration) (*T
 
 func setupLMTPServerWithOptions(t *testing.T, options lmtp.LMTPServerOptions) (*TestServer, TestAccount) {
 	t.Helper()
+	if options.MaintenanceGate == nil {
+		options.MaintenanceGate = soraserver.NewMaintenanceGate(false)
+	}
 
 	rdb := SetupTestDatabase(t)
 	account := CreateTestAccount(t, rdb)
@@ -1016,11 +1027,12 @@ func setupLMTPServerWithOptions(t *testing.T, options lmtp.LMTPServerOptions) (*
 	}
 
 	return &TestServer{
-		Address:      address,
-		Server:       server,
-		cleanup:      cleanup,
-		ResilientDB:  rdb,
-		uploadWorker: uploadWorker,
+		Address:         address,
+		Server:          server,
+		cleanup:         cleanup,
+		ResilientDB:     rdb,
+		uploadWorker:    uploadWorker,
+		MaintenanceGate: options.MaintenanceGate,
 	}, account
 }
 
@@ -1030,6 +1042,7 @@ func SetupPOP3Server(t *testing.T) (*TestServer, TestAccount) {
 	rdb := SetupTestDatabase(t)
 	account := CreateTestAccount(t, rdb)
 	address := GetRandomAddress(t)
+	gate := soraserver.NewMaintenanceGate(false)
 
 	server, err := pop3.New(
 		context.Background(),
@@ -1040,7 +1053,7 @@ func SetupPOP3Server(t *testing.T) (*TestServer, TestAccount) {
 		rdb,
 		nil, // uploader.UploadWorker
 		nil, // cache.Cache
-		pop3.POP3ServerOptions{InsecureAuth: true},
+		pop3.POP3ServerOptions{InsecureAuth: true, MaintenanceGate: gate},
 	)
 	if err != nil {
 		t.Fatalf("Failed to create POP3 server: %v", err)
@@ -1067,10 +1080,11 @@ func SetupPOP3Server(t *testing.T) (*TestServer, TestAccount) {
 	}
 
 	return &TestServer{
-		Address:     address,
-		Server:      server,
-		cleanup:     cleanup,
-		ResilientDB: rdb,
+		Address:         address,
+		Server:          server,
+		cleanup:         cleanup,
+		ResilientDB:     rdb,
+		MaintenanceGate: gate,
 	}, account
 }
 
@@ -1352,6 +1366,7 @@ func SetupIMAPServerWithMaster(t *testing.T) (*TestServer, TestAccount) {
 	masterUsername := "proxyuser"
 	masterPassword := "proxypass"
 
+	gate := soraserver.NewMaintenanceGate(false)
 	server, err := imap.New(
 		context.Background(),
 		"test",
@@ -1367,6 +1382,7 @@ func SetupIMAPServerWithMaster(t *testing.T) (*TestServer, TestAccount) {
 			TrustedNetworks:    []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
 			MasterSASLUsername: []byte(masterUsername),             // Master username for proxy authentication
 			MasterSASLPassword: []byte(masterPassword),             // Master password for proxy authentication
+			MaintenanceGate:    gate,
 		},
 	)
 	if err != nil {
@@ -1398,10 +1414,11 @@ func SetupIMAPServerWithMaster(t *testing.T) (*TestServer, TestAccount) {
 	}
 
 	return &TestServer{
-		Address:     address,
-		Server:      server,
-		cleanup:     cleanup,
-		ResilientDB: rdb,
+		Address:         address,
+		Server:          server,
+		cleanup:         cleanup,
+		ResilientDB:     rdb,
+		MaintenanceGate: gate,
 	}, account
 }
 

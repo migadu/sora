@@ -420,3 +420,19 @@ func TestMaintenanceConfig_KickRateNotFinite(t *testing.T) {
 		t.Errorf("kick_rate 2.5: GetKickRate = %v", got)
 	}
 }
+
+// refuse_after defaults to 30s (several proxy polls at the default 5s), takes 0 (refuse at
+// once), and refuses a negative or unparsable value.
+func TestMaintenanceConfig_RefuseAfter(t *testing.T) {
+	for in, want := range map[string]time.Duration{"": 30 * time.Second, "0s": 0, "2m": 2 * time.Minute} {
+		got, err := (&MaintenanceConfig{RefuseAfter: in}).GetRefuseAfter()
+		if err != nil || got != want {
+			t.Errorf("refuse_after %q: %v, %v; want %v", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"-5s", "soon"} {
+		if _, err := (&MaintenanceConfig{RefuseAfter: in}).GetRefuseAfter(); err == nil {
+			t.Errorf("refuse_after %q: no error", in)
+		}
+	}
+}

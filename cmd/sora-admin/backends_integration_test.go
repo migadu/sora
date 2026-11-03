@@ -36,13 +36,13 @@ func backendsTestHost(t *testing.T, rdb *resilient.ResilientDatabase) string {
 	return host
 }
 
-// shortDrainTimings makes --wait require 300ms of quiet, polling every 20ms, and count a
-// sessions report older than 200ms as stale (fakeNode reports every 20ms).
+// shortDrainTimings makes --wait poll every 20ms and count a sessions report older than
+// 200ms as stale (fakeNode reports every 20ms).
 func shortDrainTimings(t *testing.T) {
 	t.Helper()
-	quiet, poll, maxAge := drainQuietPeriod, drainPollInterval, sessionsReportMaxAge
-	drainQuietPeriod, drainPollInterval, sessionsReportMaxAge = 300*time.Millisecond, 20*time.Millisecond, 200*time.Millisecond
-	t.Cleanup(func() { drainQuietPeriod, drainPollInterval, sessionsReportMaxAge = quiet, poll, maxAge })
+	poll, maxAge := drainPollInterval, sessionsReportMaxAge
+	drainPollInterval, sessionsReportMaxAge = 20*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { drainPollInterval, sessionsReportMaxAge = poll, maxAge })
 }
 
 // forgetInstance removes, when the test ends, what was recorded under an instance id.
@@ -61,18 +61,18 @@ func forgetInstance(t *testing.T, rdb *resilient.ResilientDatabase, instanceID s
 	})
 }
 
-// fakeNode stands in for a backend reporting its sessions (cmd/sora's
-// runSessionsReport): it reports once before returning, then every 20ms until silenced or
-// the test ends.
+// fakeNode stands in for a backend reporting its sessions (cmd/sora's sessionsReporter):
+// it reports once before returning, then every 20ms until silenced or the test ends. Like
+// the real node it looks up its own maintenance before each report and, once in it,
+// reports refusing new sessions for it (refuse_after 0), unless told it still accepts them.
 type fakeNode struct {
 	t        *testing.T
 	rdb      *resilient.ResilientDatabase
 	instance string
 
-	mu      sync.Mutex
-	open    int64
-	started int64
-	since   time.Time
+	mu        sync.Mutex
+	open      int64
+	accepting bool // refuse_after has not passed yet
 
 	silenced chan struct{}
 	done     chan struct{}
@@ -82,7 +82,7 @@ type fakeNode struct {
 func startFakeNode(t *testing.T, rdb *resilient.ResilientDatabase, instance string) *fakeNode {
 	t.Helper()
 	forgetInstance(t, rdb, instance)
-	n := &fakeNode{t: t, rdb: rdb, instance: instance, since: time.Now(), silenced: make(chan struct{}), done: make(chan struct{})}
+	n := &fakeNode{t: t, rdb: rdb, instance: instance, silenced: make(chan struct{}), done: make(chan struct{})}
 	n.report()
 	go func() {
 		defer close(n.done)
@@ -101,35 +101,35 @@ func startFakeNode(t *testing.T, rdb *resilient.ResilientDatabase, instance stri
 
 func (n *fakeNode) report() {
 	n.mu.Lock()
-	s := db.InstanceSessions{InstanceID: n.instance, Open: n.open, Started: n.started, Since: n.since}
+	s := db.InstanceSessions{InstanceID: n.instance, Open: n.open}
+	accepting := n.accepting
 	n.mu.Unlock()
+	if !accepting {
+		since, err := n.rdb.GetMaintenanceRefusalWithRetry(context.Background(), n.instance, 0)
+		if err != nil {
+			n.t.Errorf("maintenance of %s: %v", n.instance, err)
+			return
+		}
+		s.RefusingSince = since
+	}
 	if err := n.rdb.ReportInstanceSessionsWithRetry(context.Background(), s); err != nil {
 		n.t.Errorf("report sessions of %s: %v", n.instance, err)
 	}
 }
 
-// sessions sets how many sessions are open; each one opened also counts as started.
+// sessions sets how many sessions are open.
 func (n *fakeNode) sessions(open int64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if open > n.open {
-		n.started += open - n.open
-	}
 	n.open = open
 }
 
-// sessionCameAndWent counts a session that started and ended between two reports.
-func (n *fakeNode) sessionCameAndWent() {
+// accept makes the node accept new sessions in maintenance (true), as it does until
+// refuse_after has passed, or refuse them (false).
+func (n *fakeNode) accept(accepting bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.started++
-}
-
-// restart is the node's process restarting: a new count from zero.
-func (n *fakeNode) restart() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.since, n.started = time.Now(), n.open
+	n.accepting = accepting
 }
 
 // silence stops the reports, as from a node that stopped.
@@ -295,33 +295,42 @@ func TestBackendsMaintenanceOn_RefusesUnknownInstance(t *testing.T) {
 	}
 }
 
-// --wait reports safe to stop only after the backend has been quiet for the quiet period,
-// and starts over when an upload appears inside it.
-func TestWaitUntilSafeToStop_NeedsASustainedZero(t *testing.T) {
+// --wait reports safe to stop once nothing is pending, and not before.
+func TestWaitUntilSafeToStop_WaitsForPendingUploads(t *testing.T) {
 	rdb := backendsTestDB(t)
 	shortDrainTimings(t)
 	host := backendsTestHost(t, rdb)
 	startFakeNode(t, rdb, host)
 	inMaintenance(t, rdb, host, "")
 
-	removeFirst := pendingUpload(t, rdb, host, 0)
+	removeUpload := pendingUpload(t, rdb, host, 0)
 	done := waitAsync(t, rdb, host)
-	stillWaiting(t, done, 150*time.Millisecond, "with an upload pending")
+	stillWaiting(t, done, 300*time.Millisecond, "with an upload pending")
 
-	removeFirst()
-	time.Sleep(150 * time.Millisecond) // inside the quiet period
-	removeSecond := pendingUpload(t, rdb, host, 0)
-	stillWaiting(t, done, drainQuietPeriod+100*time.Millisecond, "although an upload appeared inside the quiet period")
+	removeUpload()
+	safeWithin(t, done, 5*time.Second)
+}
 
-	removeSecond()
-	if waited := safeWithin(t, done, 5*time.Second); waited < drainQuietPeriod {
-		t.Fatalf("safe to stop after %v of quiet, want at least %v", waited, drainQuietPeriod)
-	}
+// Until the node refuses new sessions, none open proves nothing: the next one could start
+// right after the report. --wait waits for the node to refuse them.
+func TestWaitUntilSafeToStop_WaitsUntilTheNodeRefusesNewSessions(t *testing.T) {
+	rdb := backendsTestDB(t)
+	shortDrainTimings(t)
+	host := backendsTestHost(t, rdb)
+	node := startFakeNode(t, rdb, host)
+	node.accept(true)
+	inMaintenance(t, rdb, host, "")
+
+	done := waitAsync(t, rdb, host)
+	stillWaiting(t, done, 300*time.Millisecond, "while the node still accepts new sessions")
+
+	node.accept(false)
+	safeWithin(t, done, 5*time.Second)
 }
 
 // An empty queue is not enough while the node still has sessions that can add uploads
 // (the proxies close IMAP sessions gradually, and one still open can APPEND): --wait
-// waits for the node to report none, then for the quiet period.
+// waits for the node to report none.
 func TestWaitUntilSafeToStop_WaitsForOpenSessions(t *testing.T) {
 	rdb := backendsTestDB(t)
 	shortDrainTimings(t)
@@ -331,60 +340,41 @@ func TestWaitUntilSafeToStop_WaitsForOpenSessions(t *testing.T) {
 	inMaintenance(t, rdb, host, "")
 
 	done := waitAsync(t, rdb, host)
-	stillWaiting(t, done, 3*drainQuietPeriod, "with sessions open and nothing pending")
+	stillWaiting(t, done, 300*time.Millisecond, "with sessions open and nothing pending")
 
 	node.sessions(1)
-	stillWaiting(t, done, 3*drainQuietPeriod, "with one session open")
+	stillWaiting(t, done, 300*time.Millisecond, "with one session open")
 
 	node.sessions(0)
-	if waited := safeWithin(t, done, 5*time.Second); waited < drainQuietPeriod {
-		t.Fatalf("safe to stop %v after the last session ended, want at least %v", waited, drainQuietPeriod)
-	}
-}
-
-// A session that started and ended between two reports leaves no open count, only a
-// higher started count: it restarts the quiet period.
-func TestWaitUntilSafeToStop_SessionsThatCameAndWentRestartIt(t *testing.T) {
-	rdb := backendsTestDB(t)
-	shortDrainTimings(t)
-	host := backendsTestHost(t, rdb)
-	node := startFakeNode(t, rdb, host)
-	inMaintenance(t, rdb, host, "")
-	done := waitAsync(t, rdb, host)
-
-	var last time.Time
-	deadline := time.Now().Add(3 * drainQuietPeriod)
-	for time.Now().Before(deadline) {
-		node.sessionCameAndWent()
-		last = time.Now()
-		stillWaiting(t, done, drainQuietPeriod/3, "while sessions kept coming")
-	}
 	safeWithin(t, done, 5*time.Second)
-	if since := time.Since(last); since < drainQuietPeriod {
-		t.Fatalf("safe to stop %v after the last session, want at least %v", since, drainQuietPeriod)
-	}
 }
 
-// A restart of the node restarts the quiet period, even when its new count happens to
-// match the old one: what the node saw before it restarted says nothing about after.
-func TestWaitUntilSafeToStop_NodeRestartRestartsIt(t *testing.T) {
+// A node's report of refusing new sessions holds only for the maintenance it refused for.
+// Maintenance turned off and on again while the node restarts: its last report (refusing,
+// none open) is still current, but the new process accepted sessions until it looked.
+func TestWaitUntilSafeToStop_NotOnARefusalForAnEarlierMaintenance(t *testing.T) {
 	rdb := backendsTestDB(t)
 	shortDrainTimings(t)
+	sessionsReportMaxAge = time.Minute // the old process's last report stays current
+	ctx := context.Background()
 	host := backendsTestHost(t, rdb)
 	node := startFakeNode(t, rdb, host)
 	inMaintenance(t, rdb, host, "")
-	done := waitAsync(t, rdb, host)
+	time.Sleep(60 * time.Millisecond) // a report refusing for this maintenance
+	node.silence()
 
-	time.Sleep(drainQuietPeriod / 2)
-	node.restart() // nothing started before or after: the count stays 0
-	restarted := time.Now()
-	waited := safeWithin(t, done, 5*time.Second)
-	if since := time.Since(restarted); since < drainQuietPeriod {
-		t.Fatalf("safe to stop %v after the node restarted (%v into the wait), want at least %v", since, waited, drainQuietPeriod)
+	if err := maintenanceOff(ctx, rdb, host); err != nil {
+		t.Fatalf("off: %v", err)
 	}
+	inMaintenance(t, rdb, host, "")
+	done := waitAsync(t, rdb, host)
+	stillWaiting(t, done, 300*time.Millisecond, "on a report refusing for the earlier maintenance")
+
+	startFakeNode(t, rdb, host) // the new process reports, refusing for the current one
+	safeWithin(t, done, 5*time.Second)
 }
 
-// Without a current report the sessions are unknown, which never counts as quiet: neither a
+// Without a current report the sessions are unknown, which is never safe: neither a
 // node that does not report (an older build: heartbeat only) nor one that stopped reporting.
 func TestWaitUntilSafeToStop_NeverWithoutACurrentReport(t *testing.T) {
 	rdb := backendsTestDB(t)
@@ -398,7 +388,7 @@ func TestWaitUntilSafeToStop_NeverWithoutACurrentReport(t *testing.T) {
 			t.Fatalf("heartbeat: %v", err)
 		}
 		inMaintenance(t, rdb, host, "")
-		stillWaiting(t, waitAsync(t, rdb, host), 3*drainQuietPeriod, "for a node that does not report its sessions")
+		stillWaiting(t, waitAsync(t, rdb, host), 300*time.Millisecond, "for a node that does not report its sessions")
 	})
 
 	t.Run("stopped reporting", func(t *testing.T) {
@@ -406,27 +396,27 @@ func TestWaitUntilSafeToStop_NeverWithoutACurrentReport(t *testing.T) {
 		node := startFakeNode(t, rdb, host)
 		inMaintenance(t, rdb, host, "")
 		node.silence()
-		stillWaiting(t, waitAsync(t, rdb, host), 3*drainQuietPeriod, "on a report that stopped advancing")
+		stillWaiting(t, waitAsync(t, rdb, host), 300*time.Millisecond, "on a report that stopped advancing")
 	})
 }
 
-// Correcting the instance id while a wait runs: the wait follows the corrected one, from
-// scratch, instead of finishing on the old (empty) one.
+// Correcting the instance id while a wait runs: the wait follows the corrected one instead
+// of staying on the old one.
 func TestWaitUntilSafeToStop_FollowsInstanceCorrection(t *testing.T) {
 	rdb := backendsTestDB(t)
 	shortDrainTimings(t)
-	drainQuietPeriod = time.Second // room to correct the id while the wait is on the old one
 	host := backendsTestHost(t, rdb)
-	startFakeNode(t, rdb, host) // reports, but is not where the uploads are
+	wrong := startFakeNode(t, rdb, host) // reports, but is not the node in maintenance
+	wrong.sessions(1)
 	real := fmt.Sprintf("node-real-%d", time.Now().UnixNano())
 	startFakeNode(t, rdb, real)
 	inMaintenance(t, rdb, host, "")
 	done := waitAsync(t, rdb, host)
+	stillWaiting(t, done, 100*time.Millisecond, "on the wrong instance with a session open")
 
-	time.Sleep(drainQuietPeriod / 3)
 	removePending := pendingUpload(t, rdb, real, 0)
 	inMaintenance(t, rdb, host, real)
-	stillWaiting(t, done, 3*drainQuietPeriod, "on the old instance after the correction")
+	stillWaiting(t, done, 300*time.Millisecond, "on the corrected instance with an upload pending")
 
 	removePending()
 	safeWithin(t, done, 5*time.Second)
@@ -442,7 +432,7 @@ func TestWaitUntilSafeToStop_ParkedUploadsKeepItWaiting(t *testing.T) {
 	inMaintenance(t, rdb, host, "")
 	pendingUpload(t, rdb, host, globalConfig.Uploader.MaxAttempts)
 
-	stillWaiting(t, waitAsync(t, rdb, host), 3*drainQuietPeriod, "with a parked upload")
+	stillWaiting(t, waitAsync(t, rdb, host), 300*time.Millisecond, "with a parked upload")
 }
 
 // Turning maintenance off ends a --wait: there is nothing to wait for any more.

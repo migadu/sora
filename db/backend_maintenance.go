@@ -6,8 +6,9 @@ package db
 // An operator marks a host with `sora-admin backends maintenance on`; proxies poll
 // ListBackendMaintenance and stop routing new sessions to it. The host keeps running
 // until its node-local pending uploads are finished (a pending_upload is leased only by
-// the instance that wrote it) and nothing on it can add another: the node reports those
-// sessions itself (ReportInstanceSessions), and GetInstanceDrainState reads both.
+// the instance that wrote it) and nothing on it can add another: the node itself refuses
+// new sessions while in maintenance (GetMaintenanceRefusal) and reports those still open
+// (ReportInstanceSessions), and GetInstanceDrainState reads both.
 
 import (
 	"context"
@@ -101,14 +102,16 @@ const SessionsReportInterval = 10 * time.Second
 
 // InstanceSessions is what a node reports about the sessions it must let finish before it
 // stops, because they can add uploads or lose work: IMAP and POP3 sessions that have
-// authenticated, LMTP transactions, Admin API deliveries in flight. Started counts every
-// such session since Since, so one that came and went between two reports still shows; a
-// process that restarts reports a new Since and counts from zero.
+// authenticated, LMTP transactions, Admin API deliveries in flight.
+//
+// RefusingSince is set while the node refuses new such sessions because it is in
+// maintenance: the CreatedAt of the maintenance it refuses for (GetMaintenanceRefusal). The
+// node refuses before it counts, so a report of refusing and none open stays true for as
+// long as that maintenance lasts.
 type InstanceSessions struct {
-	InstanceID string
-	Open       int64
-	Started    int64
-	Since      time.Time
+	InstanceID    string
+	Open          int64
+	RefusingSince *time.Time
 }
 
 // ReportInstanceSessions stores s as its instance's latest report, stamped with the
@@ -118,18 +121,38 @@ func (db *Database) ReportInstanceSessions(ctx context.Context, tx pgx.Tx, s Ins
 		return fmt.Errorf("a sessions report needs an instance id")
 	}
 	_, err := tx.Exec(ctx, `
-		INSERT INTO instance_sessions (instance_id, open_sessions, started_sessions, counting_since, reported_at)
-		VALUES ($1, $2, $3, $4, now())
+		INSERT INTO instance_sessions (instance_id, open_sessions, refusing_since, reported_at)
+		VALUES ($1, $2, $3, now())
 		ON CONFLICT (instance_id) DO UPDATE
 		SET open_sessions = EXCLUDED.open_sessions,
-		    started_sessions = EXCLUDED.started_sessions,
-		    counting_since = EXCLUDED.counting_since,
+		    refusing_since = EXCLUDED.refusing_since,
 		    reported_at = now()
-	`, s.InstanceID, s.Open, s.Started, s.Since)
+	`, s.InstanceID, s.Open, s.RefusingSince)
 	if err != nil {
 		return fmt.Errorf("failed to report sessions of instance %s: %w", s.InstanceID, err)
 	}
 	return nil
+}
+
+// GetMaintenanceRefusal returns when the maintenance began that the node behind instanceID
+// refuses new sessions for: the oldest of the instance's maintenance rows (one node can be
+// in maintenance under several of its names) that has lasted refuseAfter, by the database
+// clock. nil when there is none.
+//
+// It reads the pool the context selects. A lagging replica only delays when the node
+// starts or stops refusing, and its report names the row it saw, which --wait checks
+// against the primary.
+func (db *Database) GetMaintenanceRefusal(ctx context.Context, instanceID string, refuseAfter time.Duration) (*time.Time, error) {
+	var since *time.Time
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT min(created_at)
+		FROM backend_maintenance
+		WHERE instance_id = $1 AND created_at <= now() - $2::interval
+	`, instanceID, refuseAfter).Scan(&since)
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up maintenance of instance %s: %w", instanceID, err)
+	}
+	return since, nil
 }
 
 // InstanceDrainState is what decides whether the node behind an uploader instance may be
@@ -154,6 +177,12 @@ type InstanceDrainState struct {
 	Sessions   *InstanceSessions
 	ReportedAt time.Time
 	ReportAge  time.Duration
+
+	// Refusing reports whether that report refuses new sessions for a maintenance of this
+	// instance that is still on. A report refusing for an earlier one (maintenance turned
+	// off and on again since, perhaps while the node restarted) does not count: the node
+	// may have let sessions in between.
+	Refusing bool
 }
 
 // GetInstanceDrainState reads instanceID's pending uploads (those with at least
@@ -163,21 +192,22 @@ type InstanceDrainState struct {
 // It reads the pool the context selects. A lagging replica can miss an upload queued
 // just now, so a caller deciding that a host is safe to stop pins the primary
 // (consts.UseMasterDBKey). The (instance_id, created_at) index serves the backlog and its
-// minimum; the rest are primary-key lookups.
+// minimum; the rest are primary-key lookups and a scan of the few maintenance rows.
 func (db *Database) GetInstanceDrainState(ctx context.Context, instanceID string, maxAttempts int) (InstanceDrainState, error) {
 	var (
 		state      InstanceDrainState
 		heartbeat  bool
 		open       *int64
-		started    *int64
-		since      *time.Time
 		reportedAt *time.Time
 		dbNow      time.Time
+		refusing   *time.Time
 	)
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT b.pending, b.parked, b.oldest,
 		       EXISTS (SELECT 1 FROM instance_heartbeats WHERE instance_id = $1),
-		       s.open_sessions, s.started_sessions, s.counting_since, s.reported_at,
+		       s.open_sessions, s.refusing_since, s.reported_at,
+		       EXISTS (SELECT 1 FROM backend_maintenance bm
+		               WHERE bm.instance_id = $1 AND bm.created_at = s.refusing_since),
 		       now()
 		FROM (
 			SELECT count(*) AS pending,
@@ -188,13 +218,13 @@ func (db *Database) GetInstanceDrainState(ctx context.Context, instanceID string
 		) b
 		LEFT JOIN instance_sessions s ON s.instance_id = $1
 	`, instanceID, maxAttempts).Scan(&state.Pending, &state.Parked, &state.Oldest,
-		&heartbeat, &open, &started, &since, &reportedAt, &dbNow)
+		&heartbeat, &open, &refusing, &reportedAt, &state.Refusing, &dbNow)
 	if err != nil {
 		return InstanceDrainState{}, fmt.Errorf("failed to get drain state of instance %s: %w", instanceID, err)
 	}
 
 	if reportedAt != nil {
-		state.Sessions = &InstanceSessions{InstanceID: instanceID, Open: *open, Started: *started, Since: *since}
+		state.Sessions = &InstanceSessions{InstanceID: instanceID, Open: *open, RefusingSince: refusing}
 		state.ReportedAt = *reportedAt
 		state.ReportAge = dbNow.Sub(*reportedAt)
 	}

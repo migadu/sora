@@ -9,20 +9,20 @@
 -- APPEND is open, and only the node itself sees every such session, including those that
 -- did not come through a proxy.
 --
---   open_sessions     open when the row was written.
---   started_sessions  started since counting_since: a counter, so a session that started
---                     and ended between two reports still shows.
---   counting_since    when the reporting process started counting; a restart begins a new
---                     count.
---   reported_at       written every few seconds by the node (database clock). A row that
---                     stopped advancing comes from a node that stopped reporting, and an
---                     instance with no row at all runs a build that does not report.
+--   open_sessions   open when the row was written.
+--   refusing_since  set while the node refuses new such sessions because it is in
+--                   maintenance: the created_at of the backend_maintenance row it refuses
+--                   for. The node starts refusing before it counts, so refusing with none
+--                   open means none can open later, as long as that maintenance lasts; a
+--                   row naming an earlier maintenance proves nothing about the current one.
+--   reported_at     written every few seconds by the node (database clock). A row that
+--                   stopped advancing comes from a node that stopped reporting, and an
+--                   instance with no row at all runs a build that does not report.
 --
 -- One row per instance, rewritten in place.
 CREATE TABLE IF NOT EXISTS instance_sessions (
-    instance_id      TEXT PRIMARY KEY,
-    open_sessions    BIGINT NOT NULL,
-    started_sessions BIGINT NOT NULL,
-    counting_since   TIMESTAMPTZ NOT NULL,
-    reported_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    instance_id    TEXT PRIMARY KEY,
+    open_sessions  BIGINT NOT NULL,
+    refusing_since TIMESTAMPTZ,
+    reported_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );

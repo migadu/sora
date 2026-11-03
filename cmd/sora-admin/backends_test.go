@@ -37,32 +37,36 @@ func TestNormalizeBackendHost(t *testing.T) {
 	}
 }
 
-// notQuiet says what stands between a backend and being safe to stop; only a known
-// instance with nothing pending and a current report of no open session is quiet.
-func TestNotQuiet(t *testing.T) {
+// notSafe says what stands between a backend and being safe to stop; only a known instance
+// with nothing pending and a current report of no open session, from a node that refuses
+// new ones for a maintenance still on, is safe.
+func TestNotSafe(t *testing.T) {
 	report := func(open int64, age time.Duration) db.InstanceDrainState {
-		return db.InstanceDrainState{Known: true, Sessions: &db.InstanceSessions{Open: open}, ReportAge: age}
+		return db.InstanceDrainState{Known: true, Sessions: &db.InstanceSessions{Open: open}, ReportAge: age, Refusing: true}
 	}
 	pending := report(0, time.Second)
 	pending.Pending, pending.Parked = 3, 1
+	accepting := report(0, time.Second)
+	accepting.Refusing = false
 	unreported := db.InstanceDrainState{Known: true}
 
 	cases := []struct {
 		name  string
 		state db.InstanceDrainState
-		want  string // a fragment of the reason; "" for quiet
+		want  string // a fragment of the reason; "" for safe
 	}{
-		{"quiet", report(0, time.Second), ""},
+		{"safe", report(0, time.Second), ""},
 		{"unknown instance", db.InstanceDrainState{}, "unknown instance"},
 		{"pending", pending, "3 uploads pending (1 parked)"},
 		{"sessions open", report(4, time.Second), "4 sessions open"},
+		{"still accepting new sessions", accepting, "not refusing new sessions yet"},
 		{"no report", unreported, "does not report its sessions"},
 		{"stale report", report(0, sessionsReportMaxAge+time.Second), "no sessions report for"},
 	}
 	for _, c := range cases {
-		got := notQuiet(c.state)
+		got := notSafe(c.state)
 		if c.want == "" && got != "" || c.want != "" && !strings.Contains(got, c.want) {
-			t.Errorf("%s: notQuiet = %q, want %q", c.name, got, c.want)
+			t.Errorf("%s: notSafe = %q, want %q", c.name, got, c.want)
 		}
 	}
 }

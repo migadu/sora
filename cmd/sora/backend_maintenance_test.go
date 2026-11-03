@@ -4,19 +4,21 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/adminapi"
 	"github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/lmtp"
 	"github.com/migadu/sora/server/pop3"
 	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/uploader"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // scriptedList is a maintenance list whose answer the test changes between polls.
@@ -197,75 +199,185 @@ func (fakeServer) ReloadConfig(config.ServerConfig) error { return nil }
 
 type fakeUploadServer struct {
 	fakeServer
-	open, started int64
+	open int64
 }
 
-func (f fakeUploadServer) DrainSessions() (int64, int64) { return f.open, f.started }
+func (f fakeUploadServer) DrainSessions() int64 { return f.open }
 
 // The node's drain sessions are those of every server that has them; a proxy server has
 // none.
 func TestDrainSessionsSumsTheServersThatHaveThem(t *testing.T) {
 	deps := &serverDependencies{}
-	deps.registerServer("imap", fakeUploadServer{open: 2, started: 10})
-	deps.registerServer("lmtp", fakeUploadServer{open: 1, started: 4})
+	deps.registerServer("imap", fakeUploadServer{open: 2})
+	deps.registerServer("lmtp", fakeUploadServer{open: 1})
 	deps.registerServer("imap-proxy", fakeServer{})
 
-	open, started := deps.drainSessions()
-	if open != 3 || started != 14 {
-		t.Fatalf("drain sessions = %d open, %d started; want 3 open, 14 started", open, started)
+	if open := deps.drainSessions(); open != 3 {
+		t.Fatalf("drain sessions = %d open, want 3", open)
 	}
 }
 
-// The node reports at once, then every interval: under its instance id, with the current
-// counts, and with one Since for the life of the process (sora-admin tells a restart by
-// it). A failed report does not stop the next, and the reports end with ctx.
-func TestRunSessionsReport(t *testing.T) {
+// fakeReporting is what a sessionsReporter talks to: the node's maintenance as the
+// database answers it, its session count, and the reports it writes.
+type fakeReporting struct {
+	mu         sync.Mutex
+	since      *time.Time // the maintenance the node is in, past refuse_after
+	refusalErr error
+	reportErr  error
+	open       int64
+	reports    []db.InstanceSessions
+
+	gate            *server.MaintenanceGate
+	countedRefusing []bool // whether the gate refused at each count
+}
+
+// reporter returns the node's reporter (newSessionsReporter) talking to f.
+func (f *fakeReporting) reporter() *sessionsReporter {
+	r := newSessionsReporter("node-1", func(context.Context) (*time.Time, error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.since, f.refusalErr
+	}, func() int64 {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.countedRefusing = append(f.countedRefusing, f.gate.Refusing())
+		return f.open
+	}, func(_ context.Context, s db.InstanceSessions) error {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.reports = append(f.reports, s)
+		return f.reportErr
+	})
+	f.gate = r.gate
+	return r
+}
+
+func (f *fakeReporting) set(fn func(f *fakeReporting)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn(f)
+}
+
+func (f *fakeReporting) last(t *testing.T) db.InstanceSessions {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.reports) == 0 {
+		t.Fatal("no report written")
+	}
+	return f.reports[len(f.reports)-1]
+}
+
+// A node refuses new sessions until it knows it is not in maintenance: a process that
+// starts while its node is in maintenance must not let a session in before its first look
+// (an earlier process's report of none open would still read as current). The first look
+// lets them in.
+func TestSessionsReporter_RefusesUntilItKnows(t *testing.T) {
+	f := &fakeReporting{refusalErr: errors.New("database unavailable")}
+	r := f.reporter()
+	gate := r.gate
+	if !gate.Refusing() {
+		t.Fatal("a new reporter's gate admits sessions before any look")
+	}
+
+	r.tick(context.Background(), time.Second)
+	if !gate.Refusing() {
+		t.Fatal("accepting sessions before the node could look up its maintenance")
+	}
+	if got := f.last(t); got.RefusingSince != nil {
+		t.Fatalf("report %+v claims a maintenance the node could not look up", got)
+	}
+
+	f.set(func(f *fakeReporting) { f.refusalErr = nil })
+	r.tick(context.Background(), time.Second)
+	if gate.Refusing() {
+		t.Fatal("still refusing sessions once the node knows it is not in maintenance")
+	}
+}
+
+// The node refuses BEFORE it counts, and reports the maintenance it refuses for with that
+// count: a report of refusing and none open then holds for every later moment.
+func TestSessionsReporter_RefusesBeforeItCounts(t *testing.T) {
+	began := time.Now().Add(-time.Minute).Truncate(time.Microsecond)
+	f := &fakeReporting{open: 2}
+	r := f.reporter()
+	gate := r.gate
+	r.tick(context.Background(), time.Second)
+	if gate.Refusing() {
+		t.Fatal("refusing sessions out of maintenance")
+	}
+
+	f.set(func(f *fakeReporting) { f.since = &began })
+	r.tick(context.Background(), time.Second)
+	if !gate.Refusing() {
+		t.Fatal("not refusing sessions in maintenance")
+	}
+	if len(f.countedRefusing) != 2 || !f.countedRefusing[1] {
+		t.Fatalf("counted with the gate refusing = %v, want the gate set before the count", f.countedRefusing)
+	}
+	got := f.last(t)
+	if got.InstanceID != "node-1" || got.Open != 2 || got.RefusingSince == nil || !got.RefusingSince.Equal(began) {
+		t.Fatalf("report = %+v, want node-1, 2 open, refusing since %v", got, began)
+	}
+	if v := testutil.ToFloat64(metrics.BackendMaintenanceRefusing); v != 1 {
+		t.Fatalf("refusing gauge = %v, want 1", v)
+	}
+
+	f.set(func(f *fakeReporting) { f.since = nil })
+	r.tick(context.Background(), time.Second)
+	if gate.Refusing() || f.last(t).RefusingSince != nil {
+		t.Fatalf("after maintenance ended: refusing=%v, report %+v; want accepting", gate.Refusing(), f.last(t))
+	}
+	if v := testutil.ToFloat64(metrics.BackendMaintenanceRefusing); v != 0 {
+		t.Fatalf("refusing gauge = %v, want 0", v)
+	}
+}
+
+// A lookup that fails keeps what the node knew: the gate as it was, and the report naming
+// the same maintenance (the gate has refused for it throughout).
+func TestSessionsReporter_FailedLookupKeepsTheLastState(t *testing.T) {
+	began := time.Now().Add(-time.Minute).Truncate(time.Microsecond)
+	f := &fakeReporting{since: &began}
+	r := f.reporter()
+	gate := r.gate
+	r.tick(context.Background(), time.Second)
+
+	f.set(func(f *fakeReporting) { f.since, f.refusalErr = nil, errors.New("database unavailable") })
+	r.tick(context.Background(), time.Second)
+	if !gate.Refusing() {
+		t.Fatal("a failed lookup let sessions in")
+	}
+	if got := f.last(t); got.RefusingSince == nil || !got.RefusingSince.Equal(began) {
+		t.Fatalf("report after a failed lookup = %+v, want still refusing since %v", got, began)
+	}
+}
+
+// The node reports at once, then every interval. A failed report does not stop the next,
+// and the reports end with ctx.
+func TestSessionsReporter_Run(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var open, started atomic.Int64
-	var mu sync.Mutex
-	var reports []db.InstanceSessions
-	const failing = 2
-	failures := failing
-	report := func(_ context.Context, s db.InstanceSessions) error {
-		mu.Lock()
-		defer mu.Unlock()
-		reports = append(reports, s)
-		if failures > 0 {
-			failures--
-			return errors.New("database unavailable")
-		}
-		return nil
-	}
+	f := &fakeReporting{reportErr: errors.New("database unavailable")}
+	r := f.reporter()
 	reported := func() []db.InstanceSessions {
-		mu.Lock()
-		defer mu.Unlock()
-		return append([]db.InstanceSessions(nil), reports...)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return append([]db.InstanceSessions(nil), f.reports...)
 	}
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runSessionsReport(ctx, "node-1", 10*time.Millisecond, func() (int64, int64) { return open.Load(), started.Load() }, report)
+		r.run(ctx, 10*time.Millisecond)
 	}()
 
-	eventually(t, func() bool { return len(reported()) >= 1 }, "the first report")
-	if first := reported()[0]; first.Open != 0 || first.Started != 0 {
-		t.Fatalf("first report = %+v, want nothing open or started", first)
-	}
-	open.Store(3)
-	started.Store(5)
+	eventually(t, func() bool { return len(reported()) >= 2 }, "reports after a failed one")
+	f.set(func(f *fakeReporting) { f.reportErr, f.open = nil, 3 })
 	eventually(t, func() bool {
 		r := reported()
-		return len(r) > failing+1 && r[len(r)-1].Open == 3 && r[len(r)-1].Started == 5
-	}, "a report of the new counts after the failed ones")
-
-	for _, r := range reported() {
-		if r.InstanceID != "node-1" || !r.Since.Equal(reported()[0].Since) || r.Since.IsZero() {
-			t.Fatalf("report %+v: want instance node-1 and one Since throughout", r)
-		}
-	}
+		return r[len(r)-1].Open == 3
+	}, "a report of the new count")
 
 	cancel()
 	select {
@@ -281,7 +393,14 @@ func TestStartSessionsReport_OnlyWithUploaderAndDatabase(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	startSessionsReport(ctx, &serverDependencies{resilientDB: &resilient.ResilientDatabase{}, instanceID: "proxy-1"})
-	startSessionsReport(ctx, &serverDependencies{uploadWorker: &uploader.UploadWorker{}, instanceID: "backend-1"})
+	for _, deps := range []*serverDependencies{
+		{resilientDB: &resilient.ResilientDatabase{}, instanceID: "proxy-1"},
+		{uploadWorker: &uploader.UploadWorker{}, instanceID: "backend-1"},
+	} {
+		startSessionsReport(ctx, deps)
+		if deps.maintenanceGate != nil {
+			t.Fatalf("%s: a node that does not report its sessions got a maintenance gate", deps.instanceID)
+		}
+	}
 	time.Sleep(50 * time.Millisecond) // a report that should not have started would have panicked by now
 }
