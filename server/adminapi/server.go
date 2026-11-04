@@ -284,22 +284,26 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 		errChan <- fmt.Errorf("failed to create HTTP API server: %w", err)
 		return nil
 	}
+	server.Serve(ctx, errChan)
+	return server
+}
 
+// Serve starts the server in the background; a failure to serve is sent to errChan.
+func (s *Server) Serve(ctx context.Context, errChan chan error) {
 	protocol := "HTTP"
-	if options.TLS {
+	if s.tls {
 		protocol = "HTTPS"
 	}
-	serverName := options.Name
+	serverName := s.name
 	if serverName == "" {
 		serverName = "default"
 	}
-	logger.Info("HTTP API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
+	logger.Info("HTTP API: Starting server", "name", serverName, "protocol", protocol, "addr", s.addr)
 	go func() {
-		if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
+		if err := s.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
 			errChan <- fmt.Errorf("HTTP API server failed: %w", err)
 		}
 	}()
-	return server
 }
 
 // start initializes and starts the HTTP server

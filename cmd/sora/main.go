@@ -2333,10 +2333,15 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 
 	options := buildAdminAPIServerOptions(deps, serverConfig)
 
-	srv := adminapi.Start(ctx, deps.resilientDB, options, errChan)
-	if srv != nil {
-		deps.registerServer(serverConfig.Name, srv)
+	srv, err := adminapi.New(deps.resilientDB, options)
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create HTTP API server: %w", err)
+		return
 	}
+	// Registered before it serves, as the other servers are: its deliveries count in the
+	// node's sessions report (drainSessions) from the first.
+	deps.registerServer(serverConfig.Name, srv)
+	srv.Serve(ctx, errChan)
 }
 
 // buildAdminAPIServerOptions maps the running config onto the Admin API server options.
