@@ -269,7 +269,10 @@ type MaintenancePoller struct {
 
 	// resolved is each hostname's last successful resolution, kept through DNS failures.
 	resolved map[string][]string
-	failing  bool
+	// unresolved holds the hostnames whose last resolution failed, so each failure is
+	// logged once, not at every poll.
+	unresolved map[string]bool
+	failing    bool
 }
 
 // NewMaintenancePoller returns a poller that installs the hosts load returns into m
@@ -309,6 +312,7 @@ func (p *MaintenancePoller) Refresh(ctx context.Context) error {
 	hosts := make([]string, 0, len(rows))
 	all := make([]string, 0, len(rows))
 	resolved := make(map[string][]string, len(rows))
+	unresolved := make(map[string]bool)
 	for _, r := range rows {
 		h := normalizeMaintenanceHost(r.Host)
 		if h == "" {
@@ -325,12 +329,18 @@ func (p *MaintenancePoller) Refresh(ctx context.Context) error {
 		cancel()
 		if err != nil || len(addrs) == 0 {
 			addrs = p.resolved[h]
-			logger.Warn("Backend maintenance: hostname did not resolve - keeping last known addresses", "host", h, "addresses", addrs, "node_addresses", r.Addresses, "error", err)
+			unresolved[h] = true
+			if !p.unresolved[h] {
+				logger.Warn("Backend maintenance: hostname did not resolve - keeping last known addresses", "host", h, "addresses", addrs, "node_addresses", r.Addresses, "error", err)
+			}
+		} else if p.unresolved[h] {
+			logger.Info("Backend maintenance: hostname resolves again", "host", h, "addresses", addrs)
 		}
 		resolved[h] = addrs
 		all = append(all, addrs...)
 	}
 	p.resolved = resolved
+	p.unresolved = unresolved
 
 	metrics.BackendMaintenanceHosts.Set(float64(len(hosts)))
 	if entered := p.m.Set(all); len(entered) > 0 {

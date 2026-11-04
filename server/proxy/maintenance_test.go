@@ -1,11 +1,14 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1020,5 +1023,77 @@ func TestConnectWithProxy_BackendInMaintenanceByTheAddressItsNodeReports(t *test
 	time.Sleep(50 * time.Millisecond)
 	if n := drainedAccepts.Load(); n != 0 {
 		t.Fatalf("backend in maintenance accepted %d connections", n)
+	}
+}
+
+// syncBuffer serialises writes from the slog handler, so the capture is safe under -race.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// captureLogs redirects the default slog logger (which logger.Get() falls back to when
+// the process never called logger.Initialize) for the duration of the test.
+func captureLogs(t *testing.T) *syncBuffer {
+	t.Helper()
+	buf := &syncBuffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return buf
+}
+
+// A hostname in maintenance that does not resolve here is warned about once, not at every
+// poll: with its node's addresses matching it, that is a setup the poller serves, and it
+// polls every few seconds. Resolving again is logged once, and failing after that warns
+// again.
+func TestMaintenancePoller_WarnsOnceWhileAHostnameDoesNotResolve(t *testing.T) {
+	logs := captureLogs(t)
+	m := NewMaintenance()
+	r := &fakeResolver{answers: map[string][]string{}}
+	m.lookupHost = r.lookup
+	p := NewMaintenancePoller(m, func(context.Context) ([]db.BackendMaintenance, error) {
+		return []db.BackendMaintenance{{Host: "storage1.example.com", InstanceID: "storage1", Addresses: []string{"10.0.0.1"}}}, nil
+	})
+	refresh := func(times int) {
+		t.Helper()
+		for range times {
+			if err := p.Refresh(context.Background()); err != nil {
+				t.Fatalf("Refresh: %v", err)
+			}
+		}
+	}
+	logged := func(msg string) int { return strings.Count(logs.String(), msg) }
+
+	refresh(3)
+	if got := logged("hostname did not resolve"); got != 1 {
+		t.Fatalf("warned %d times over three polls, want once", got)
+	}
+	if !m.Contains("10.0.0.1:143") {
+		t.Fatal("the node's address is not in maintenance")
+	}
+
+	r.set("storage1.example.com", "10.0.0.1")
+	refresh(2)
+	if got := logged("hostname resolves again"); got != 1 {
+		t.Fatalf("logged resolving again %d times over two polls, want once", got)
+	}
+
+	r.set("storage1.example.com")
+	refresh(2)
+	if got := logged("hostname did not resolve"); got != 2 {
+		t.Fatalf("warned %d times in all, want twice (once per failure)", got)
 	}
 }
