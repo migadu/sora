@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -78,8 +79,8 @@ func TestMaintenance_ListenersRunOnEveryNonEmptySet(t *testing.T) {
 
 func TestMaintenancePoller_AddsResolvedAddressesOfHostnames(t *testing.T) {
 	m := NewMaintenance()
-	p := NewMaintenancePoller(m, func(context.Context) ([]string, error) {
-		return []string{"storage1.example.com", "10.0.0.9"}, nil
+	p := NewMaintenancePoller(m, func(context.Context) ([]db.BackendMaintenance, error) {
+		return maintenanceList("storage1.example.com", "10.0.0.9"), nil
 	})
 	m.lookupHost = func(_ context.Context, host string) ([]string, error) {
 		if host != "storage1.example.com" {
@@ -101,8 +102,8 @@ func TestMaintenancePoller_AddsResolvedAddressesOfHostnames(t *testing.T) {
 func TestMaintenancePoller_KeepsLastKnownStateOnFailure(t *testing.T) {
 	m := NewMaintenance()
 	var loadErr error
-	p := NewMaintenancePoller(m, func(context.Context) ([]string, error) {
-		return []string{"storage1.example.com"}, loadErr
+	p := NewMaintenancePoller(m, func(context.Context) ([]db.BackendMaintenance, error) {
+		return maintenanceList("storage1.example.com"), loadErr
 	})
 	var dnsErr error
 	m.lookupHost = func(context.Context, string) ([]string, error) {
@@ -430,7 +431,7 @@ func TestMaintenancePoller_RunFollowsTheList(t *testing.T) {
 	hosts, loadErr := []string{"10.0.0.5"}, error(nil)
 	noDeadline := false
 	m := NewMaintenance()
-	p := NewMaintenancePoller(m, func(ctx context.Context) ([]string, error) {
+	p := NewMaintenancePoller(m, func(ctx context.Context) ([]db.BackendMaintenance, error) {
 		if _, ok := ctx.Deadline(); !ok {
 			mu.Lock()
 			noDeadline = true
@@ -438,7 +439,7 @@ func TestMaintenancePoller_RunFollowsTheList(t *testing.T) {
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		return hosts, loadErr
+		return maintenanceList(hosts...), loadErr
 	})
 	go p.Run(ctx, 10*time.Millisecond)
 
@@ -610,7 +611,9 @@ func TestMaintenance_ContainsMatchesANameByItsAddresses(t *testing.T) {
 	// storage2 moves off the address in maintenance; storage3's lookup starts failing.
 	r.set("storage2.example.com", "10.0.0.20")
 	r.set("storage3.example.com")
-	p := NewMaintenancePoller(m, func(context.Context) ([]string, error) { return []string{"10.0.0.2", "10.0.0.3"}, nil })
+	p := NewMaintenancePoller(m, func(context.Context) ([]db.BackendMaintenance, error) {
+		return maintenanceList("10.0.0.2", "10.0.0.3"), nil
+	})
 	if err := p.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
@@ -789,11 +792,11 @@ func TestMaintenanceMetrics(t *testing.T) {
 	m := NewMaintenance()
 	var failing atomic.Bool
 	failing.Store(true)
-	p := NewMaintenancePoller(m, func(context.Context) ([]string, error) {
+	p := NewMaintenancePoller(m, func(context.Context) ([]db.BackendMaintenance, error) {
 		if failing.Load() {
 			return nil, errors.New("database unavailable")
 		}
-		return []string{"10.0.0.5", "10.0.0.6"}, nil
+		return maintenanceList("10.0.0.5", "10.0.0.6"), nil
 	})
 
 	failures := testutil.ToFloat64(metrics.BackendMaintenancePollFailures)
@@ -881,7 +884,7 @@ func TestConnectWithProxy_NameInMaintenanceThatDoesNotResolveYet(t *testing.T) {
 		t.Fatalf("ResolveAddresses: %v", err)
 	}
 	m.lookupHost = (&fakeResolver{answers: map[string][]string{}}).lookup // maintenance DNS fails
-	p := NewMaintenancePoller(m, func(context.Context) ([]string, error) { return []string{"localhost"}, nil })
+	p := NewMaintenancePoller(m, func(context.Context) ([]db.BackendMaintenance, error) { return maintenanceList("localhost"), nil })
 	if err := p.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
@@ -934,5 +937,88 @@ func TestSessionDrainer_UsesTheGivenMaintenanceCheck(t *testing.T) {
 			t.Fatal("session on a backend the given check reports in maintenance was not closed")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// maintenanceList is the maintenance list of these hosts, whose nodes report no addresses.
+func maintenanceList(hosts ...string) []db.BackendMaintenance {
+	rows := make([]db.BackendMaintenance, len(hosts))
+	for i, h := range hosts {
+		rows[i] = db.BackendMaintenance{Host: h, InstanceID: h}
+	}
+	return rows
+}
+
+// A host is also matched by the addresses its node reports for itself, so the name it is
+// in maintenance by need not lead to the address the proxies route to: a name that does
+// not resolve here, or a public name of a backend the pools list by its private address.
+// The addresses are the node's, not hosts of their own: they do not count as hosts.
+func TestMaintenancePoller_MatchesTheAddressesTheNodeReports(t *testing.T) {
+	m := NewMaintenance()
+	r := &fakeResolver{answers: map[string][]string{}}
+	r.set("storage2.example.com", "203.0.113.2")
+	m.lookupHost = r.lookup
+	p := NewMaintenancePoller(m, func(context.Context) ([]db.BackendMaintenance, error) {
+		return []db.BackendMaintenance{
+			{Host: "storage1.example.com", InstanceID: "storage1", Addresses: []string{"10.0.0.1", "2001:DB8::1"}},
+			{Host: "storage2.example.com", InstanceID: "storage2", Addresses: []string{"10.0.0.2"}},
+		}, nil
+	})
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	for _, addr := range []string{"10.0.0.1:143", "[2001:db8::1]:143", "storage1.example.com:143", "10.0.0.2:143", "203.0.113.2:143"} {
+		if !m.Contains(addr) {
+			t.Errorf("Contains(%q) = false", addr)
+		}
+	}
+	if m.Contains("10.0.0.3:143") {
+		t.Error("an address no node in maintenance reports is in maintenance")
+	}
+	if got := testutil.ToFloat64(metrics.BackendMaintenanceHosts); got != 2 {
+		t.Fatalf("hosts in maintenance = %v, want 2", got)
+	}
+}
+
+// The gap a name alone left, end to end: the pool lists the drained backend by its
+// address, the name it is in maintenance by does not resolve here, and its node reports
+// that address. Every route goes to the other backend, and the drained one is never dialed.
+func TestConnectWithProxy_BackendInMaintenanceByTheAddressItsNodeReports(t *testing.T) {
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Skip("no IPv6 loopback")
+	}
+	drainedAccepts := &atomic.Int32{}
+	acceptOn(t, ln, drainedAccepts)
+	drained := ln.Addr().String()
+	live, _ := listen(t)
+
+	cm, m := newMaintenanceTestManager(t, drained, live)
+	m.lookupHost = (&fakeResolver{answers: map[string][]string{}}).lookup
+	p := NewMaintenancePoller(m, func(context.Context) ([]db.BackendMaintenance, error) {
+		return []db.BackendMaintenance{{Host: "storage1.example.com", InstanceID: "storage1", Addresses: []string{"::1"}}}, nil
+	})
+	if err := p.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	for i := 0; i < 6; i++ {
+		preferred := ""
+		if i%2 == 0 {
+			preferred = drained
+		}
+		conn, addr, err := cm.ConnectWithProxy(context.Background(), preferred, "192.0.2.1", 1234, "192.0.2.2", 143, nil)
+		if err != nil {
+			t.Fatalf("ConnectWithProxy: %v", err)
+		}
+		conn.Close()
+		if addr != live {
+			t.Fatalf("connected to %q, want %q", addr, live)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := drainedAccepts.Load(); n != 0 {
+		t.Fatalf("backend in maintenance accepted %d connections", n)
 	}
 }

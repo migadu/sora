@@ -111,17 +111,7 @@ func TestIMAPProxyBackendMaintenance(t *testing.T) {
 	m := proxy.NewMaintenance()
 	proxyServer.GetConnectionManager().SetMaintenance(m)
 	proxy.StartSessionDrainer(ctx, m, 50, proxyServer.MaintenanceTargets, proxyServer.GetConnectionManager().InMaintenance, "test")
-	poller := proxy.NewMaintenancePoller(m, func(ctx context.Context) ([]string, error) {
-		rows, err := rdb.ListBackendMaintenanceWithRetry(ctx)
-		if err != nil {
-			return nil, err
-		}
-		hosts := make([]string, len(rows))
-		for i, r := range rows {
-			hosts[i] = r.Host
-		}
-		return hosts, nil
-	})
+	poller := proxy.NewMaintenancePoller(m, rdb.ListBackendMaintenanceWithRetry)
 	// cmd/sora loads the list before any proxy accepts a connection; until it is loaded
 	// the proxy dials no backend.
 	if err := poller.Refresh(ctx); err != nil {

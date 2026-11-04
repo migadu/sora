@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -26,7 +27,8 @@ import (
 // serves. Names and addresses match both ways: MaintenancePoller adds each hostname's
 // addresses to the set, so a pool resolved to IPs matches an entry made by name, and
 // Contains resolves a name it is asked about, so a route by name (a remote-lookup route,
-// an alias) matches an entry made by IP.
+// an alias) matches an entry made by IP. The poller also adds the addresses each host's
+// node reports for itself, which match it whatever its name resolves to here.
 //
 // Until the list is read once (the first Set) the set is not loaded: which backends are
 // in maintenance is unknown, Contains reports none, and the connection manager refuses
@@ -263,15 +265,16 @@ func normalizeMaintenanceHost(host string) string {
 // backend_maintenance table).
 type MaintenancePoller struct {
 	m    *Maintenance
-	load func(ctx context.Context) ([]string, error)
+	load func(ctx context.Context) ([]db.BackendMaintenance, error)
 
 	// resolved is each hostname's last successful resolution, kept through DNS failures.
 	resolved map[string][]string
 	failing  bool
 }
 
-// NewMaintenancePoller returns a poller that installs the hosts load returns into m.
-func NewMaintenancePoller(m *Maintenance, load func(ctx context.Context) ([]string, error)) *MaintenancePoller {
+// NewMaintenancePoller returns a poller that installs the hosts load returns into m
+// (db.ListBackendMaintenance).
+func NewMaintenancePoller(m *Maintenance, load func(ctx context.Context) ([]db.BackendMaintenance, error)) *MaintenancePoller {
 	return &MaintenancePoller{
 		m:        m,
 		load:     load,
@@ -283,29 +286,37 @@ func NewMaintenancePoller(m *Maintenance, load func(ctx context.Context) ([]stri
 const maintenanceLookupTimeout = 2 * time.Second
 
 // Refresh loads the list once and installs it, together with the addresses each hostname
-// resolves to. A load failure leaves the set as it was (not loaded, if it never was):
-// maintenance must never end because the database was briefly unreachable, or a drained
-// backend would silently return to rotation. A hostname that fails to resolve keeps the
-// addresses it last resolved to. While anything is in maintenance, the hostnames routes
-// were checked by are re-resolved too, before the new list is installed.
+// resolves to and those its node reports for itself. A load failure leaves the set as it
+// was (not loaded, if it never was): maintenance must never end because the database was
+// briefly unreachable, or a drained backend would silently return to rotation. A hostname
+// that fails to resolve keeps the addresses it last resolved to. While anything is in
+// maintenance, the hostnames routes were checked by are re-resolved too, before the new
+// list is installed.
+//
+// The node's addresses are what match a host whose name leads nowhere the proxies route
+// to: a name that does not resolve here, or resolves to another of the node's addresses
+// (a public one, where the pools list private ones).
 func (p *MaintenancePoller) Refresh(ctx context.Context) error {
-	hosts, err := p.load(ctx)
+	rows, err := p.load(ctx)
 	if err != nil {
 		metrics.BackendMaintenancePollFailures.Inc()
 		return err
 	}
-	if len(hosts) > 0 {
+	if len(rows) > 0 {
 		p.m.refreshNames(ctx)
 	}
 
-	all := make([]string, 0, len(hosts))
-	resolved := make(map[string][]string, len(hosts))
-	for _, h := range hosts {
-		h = normalizeMaintenanceHost(h)
+	hosts := make([]string, 0, len(rows))
+	all := make([]string, 0, len(rows))
+	resolved := make(map[string][]string, len(rows))
+	for _, r := range rows {
+		h := normalizeMaintenanceHost(r.Host)
 		if h == "" {
 			continue
 		}
+		hosts = append(hosts, h)
 		all = append(all, h)
+		all = append(all, r.Addresses...)
 		if net.ParseIP(h) != nil {
 			continue
 		}
@@ -314,7 +325,7 @@ func (p *MaintenancePoller) Refresh(ctx context.Context) error {
 		cancel()
 		if err != nil || len(addrs) == 0 {
 			addrs = p.resolved[h]
-			logger.Warn("Backend maintenance: hostname did not resolve - keeping last known addresses", "host", h, "addresses", addrs, "error", err)
+			logger.Warn("Backend maintenance: hostname did not resolve - keeping last known addresses", "host", h, "addresses", addrs, "node_addresses", r.Addresses, "error", err)
 		}
 		resolved[h] = addrs
 		all = append(all, addrs...)

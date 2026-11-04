@@ -340,20 +340,21 @@ func TestInstanceDrainState_ReadsLatestSessionsReport(t *testing.T) {
 		})
 	}
 
-	report(InstanceSessions{InstanceID: instance, Open: 7})
+	report(InstanceSessions{InstanceID: instance, Open: 7, Addresses: []string{"10.0.0.7", "2001:db8::7"}})
 	first, err := db.GetInstanceDrainState(ctx, instance, 5)
 	require.NoError(t, err)
 	require.True(t, first.Known, "a sessions report makes the id known")
 	require.NotNil(t, first.Sessions)
-	require.Equal(t, InstanceSessions{InstanceID: instance, Open: 7}, *first.Sessions)
+	require.Equal(t, InstanceSessions{InstanceID: instance, Open: 7, Addresses: []string{"10.0.0.7", "2001:db8::7"}}, *first.Sessions)
 	require.False(t, first.Refusing, "a node that accepts new sessions is not refusing")
 	require.GreaterOrEqual(t, first.ReportAge, time.Duration(0))
 	require.Less(t, first.ReportAge, time.Minute)
 
-	report(InstanceSessions{InstanceID: instance, Open: 0})
+	report(InstanceSessions{InstanceID: instance, Open: 0, Addresses: []string{"10.0.0.8"}})
 	second, err := db.GetInstanceDrainState(ctx, instance, 5)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), second.Sessions.Open)
+	require.Equal(t, []string{"10.0.0.8"}, second.Sessions.Addresses)
 	require.False(t, second.ReportedAt.Before(first.ReportedAt))
 
 	inTx(t, db, func(tx pgx.Tx) {
@@ -526,4 +527,63 @@ func TestCleanupFailedUploads_RetiresStaleSessionsReports(t *testing.T) {
 	require.True(t, reported(pending), "kept while uploads are pending under it")
 	require.True(t, reported(maintained), "kept while a backend in maintenance names it")
 	require.True(t, reported(fresh), "a current report is kept")
+}
+
+// The list carries the addresses each host's node reports for itself (its instance's
+// sessions report), so that proxies match the host by them too: every host of that
+// instance gets them, and a host whose instance never reported gets none.
+func TestBackendMaintenance_ListsTheAddressesItsNodeReports(t *testing.T) {
+	if testing.Short() {
+		t.Skip("database test")
+	}
+	db := setupTestDatabase(t)
+	t.Cleanup(db.Close)
+	ctx := context.Background()
+
+	reporting := fmt.Sprintf("addresses-%d", time.Now().UnixNano())
+	silent := reporting + "-silent"
+	forgetInstance(t, db, reporting)
+	byName := maintenanceHost(t, "byname")
+	byAddress := "192.0.2.31"
+	unreported := maintenanceHost(t, "unreported")
+	setMaintenance(t, db, BackendMaintenance{Host: byName, InstanceID: reporting})
+	setMaintenance(t, db, BackendMaintenance{Host: byAddress, InstanceID: reporting})
+	setMaintenance(t, db, BackendMaintenance{Host: unreported, InstanceID: silent})
+	inTx(t, db, func(tx pgx.Tx) {
+		require.NoError(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{InstanceID: reporting, Addresses: []string{"192.0.2.31", "2001:db8::31"}}))
+	})
+
+	for _, host := range []string{byName, byAddress} {
+		m, ok := listedMaintenance(t, db, host)
+		require.True(t, ok, "%s not listed", host)
+		require.Equal(t, []string{"192.0.2.31", "2001:db8::31"}, m.Addresses, "addresses listed with %s", host)
+	}
+	m, ok := listedMaintenance(t, db, unreported)
+	require.True(t, ok)
+	require.Empty(t, m.Addresses, "a host whose node never reported has no addresses")
+
+	// An address another node reports too (a container bridge every Docker host has) names
+	// neither, and is left out, but only while that node is still reporting: a silent one
+	// (an instance id the node no longer runs under, until the cleaner retires it) does not
+	// take its addresses away from the node that has them now.
+	sharing := reporting + "-sharing"
+	gone := reporting + "-gone"
+	forgetInstance(t, db, sharing)
+	forgetInstance(t, db, gone)
+	inTx(t, db, func(tx pgx.Tx) {
+		require.NoError(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{InstanceID: reporting, Addresses: []string{"192.0.2.31", "198.51.100.31", "2001:db8::31"}}))
+		require.NoError(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{InstanceID: sharing, Addresses: []string{"198.51.100.31"}}))
+		require.NoError(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{InstanceID: gone, Addresses: []string{"192.0.2.31", "2001:db8::31"}}))
+	})
+	_, err := db.GetWritePool().Exec(ctx, `UPDATE instance_sessions SET reported_at = now() - $2::interval WHERE instance_id = $1`, gone, SessionsReportMaxAge+time.Second)
+	require.NoError(t, err)
+	m, _ = listedMaintenance(t, db, byName)
+	require.Equal(t, []string{"192.0.2.31", "2001:db8::31"}, m.Addresses, "a shared address is left out, one only a silent node shares is not")
+
+	// The report is stored as it is: one naming no address replaces them too.
+	inTx(t, db, func(tx pgx.Tx) {
+		require.NoError(t, db.ReportInstanceSessions(ctx, tx, InstanceSessions{InstanceID: reporting}))
+	})
+	m, _ = listedMaintenance(t, db, byName)
+	require.Empty(t, m.Addresses)
 }

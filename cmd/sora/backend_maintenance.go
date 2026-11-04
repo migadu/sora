@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"net"
+	"slices"
 	"time"
 
 	"github.com/migadu/sora/config"
@@ -27,17 +29,7 @@ func startBackendMaintenance(ctx context.Context, deps *serverDependencies) *pro
 		logger.Warn("Backend maintenance is not honored on this node: proxies read the maintenance list from the database, and none is configured")
 		return nil
 	}
-	return runBackendMaintenance(ctx, deps.config.Maintenance, func(ctx context.Context) ([]string, error) {
-		rows, err := deps.resilientDB.ListBackendMaintenanceWithRetry(ctx)
-		if err != nil {
-			return nil, err
-		}
-		hosts := make([]string, len(rows))
-		for i, r := range rows {
-			hosts[i] = r.Host
-		}
-		return hosts, nil
-	})
+	return runBackendMaintenance(ctx, deps.config.Maintenance, deps.resilientDB.ListBackendMaintenanceWithRetry)
 }
 
 func hasProxyServer(servers []config.ServerConfig) bool {
@@ -56,7 +48,7 @@ func hasProxyServer(servers []config.ServerConfig) bool {
 // fails, the set stays unloaded and the proxies dial no backend until a poll succeeds:
 // any backend might be in maintenance. The database was reachable moments before (sora
 // does not start without it), so that is normally one poll.
-func runBackendMaintenance(ctx context.Context, cfg config.MaintenanceConfig, load func(context.Context) ([]string, error)) *proxy.Maintenance {
+func runBackendMaintenance(ctx context.Context, cfg config.MaintenanceConfig, load func(context.Context) ([]db.BackendMaintenance, error)) *proxy.Maintenance {
 	interval, err := cfg.GetPollInterval()
 	if err != nil {
 		logger.Warn("Invalid [backend_maintenance] poll_interval - using 5s", "error", err)
@@ -149,17 +141,24 @@ func (deps *serverDependencies) drainSessions() int64 {
 // server.MaintenanceGate). A process starts out refusing, since a session it let in before
 // its first look would not be in the report of the process before it, which may still read
 // as current. A failed look keeps what the node last knew, gate and report alike.
+//
+// Each report also carries the node's own addresses, read afresh every time (one can move
+// to another node), for proxies to match it by while it is in maintenance: the name it is
+// in maintenance by need not resolve, where they run, to the address they route to it by.
 type sessionsReporter struct {
 	instanceID string
 	gate       *server.MaintenanceGate
 	refusal    func(context.Context) (*time.Time, error) // the maintenance to refuse for, nil for none
 	count      func() int64
 	report     func(context.Context, db.InstanceSessions) error
+	addresses  func() ([]string, error) // the node's own addresses (nodeAddresses)
 
-	refusingSince *time.Time // the maintenance the gate refuses for, as last looked up
-	known         bool       // a look has succeeded
-	lookupFailing bool
-	reportFailing bool
+	refusingSince    *time.Time // the maintenance the gate refuses for, as last looked up
+	known            bool       // a look has succeeded
+	addrs            []string   // the node's addresses, as last read
+	lookupFailing    bool
+	reportFailing    bool
+	addressesFailing bool
 }
 
 // newSessionsReporter returns a reporter whose gate refuses new sessions until its first
@@ -171,6 +170,7 @@ func newSessionsReporter(instanceID string, refusal func(context.Context) (*time
 		refusal:    refusal,
 		count:      count,
 		report:     report,
+		addresses:  nodeAddresses,
 	}
 }
 
@@ -214,9 +214,11 @@ func (r *sessionsReporter) tick(ctx context.Context, timeout time.Duration) {
 		metrics.BackendMaintenanceRefusing.Set(0)
 	}
 
+	r.readAddresses()
+
 	open := r.count()
 	reportCtx, cancel := context.WithTimeout(ctx, timeout)
-	err = r.report(reportCtx, db.InstanceSessions{InstanceID: r.instanceID, Open: open, RefusingSince: r.refusingSince})
+	err = r.report(reportCtx, db.InstanceSessions{InstanceID: r.instanceID, Open: open, RefusingSince: r.refusingSince, Addresses: r.addrs})
 	cancel()
 	switch {
 	case err != nil && ctx.Err() == nil && !r.reportFailing:
@@ -225,6 +227,24 @@ func (r *sessionsReporter) tick(ctx context.Context, timeout time.Duration) {
 	case err == nil && r.reportFailing:
 		logger.Info("Reporting sessions again", "instance_id", r.instanceID)
 		r.reportFailing = false
+	}
+}
+
+// readAddresses reads the node's addresses for the report. Interfaces that cannot be read
+// keep the addresses last read: reporting none would let proxies route to the node by an
+// address they then no longer match.
+func (r *sessionsReporter) readAddresses() {
+	addrs, err := r.addresses()
+	switch {
+	case err != nil && !r.addressesFailing:
+		logger.Warn("Cannot read this node's addresses - reporting those last read", "instance_id", r.instanceID, "addresses", r.addrs, "error", err)
+		r.addressesFailing = true
+	case err == nil:
+		if r.addressesFailing {
+			logger.Info("Reading this node's addresses again", "instance_id", r.instanceID)
+		}
+		r.addressesFailing = false
+		r.addrs = addrs
 	}
 }
 
@@ -240,4 +260,36 @@ func (r *sessionsReporter) setRefusing(refusing bool) {
 	case r.known:
 		logger.Info("Backend maintenance: this node is out of maintenance - accepting new sessions", "instance_id", r.instanceID)
 	}
+}
+
+// nodeAddresses returns the addresses proxies elsewhere can reach this node by, read from
+// its interfaces.
+func nodeAddresses() ([]string, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	return reachableAddresses(addrs), nil
+}
+
+// reachableAddresses returns, sorted and each once, the addresses in addrs that a proxy on
+// another node could reach this one by: not loopback, link-local, multicast or unspecified
+// addresses, which every node has alike.
+func reachableAddresses(addrs []net.Addr) []string {
+	var reachable []string
+	for _, a := range addrs {
+		var ip net.IP
+		switch a := a.(type) {
+		case *net.IPNet:
+			ip = a.IP
+		case *net.IPAddr:
+			ip = a.IP
+		}
+		if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+			continue
+		}
+		reachable = append(reachable, ip.String())
+	}
+	slices.Sort(reachable)
+	return slices.Compact(reachable)
 }

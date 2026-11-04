@@ -23,8 +23,8 @@ import (
 var drainPollInterval = 10 * time.Second
 
 // sessionsReportMaxAge is how old a node's sessions report may be and still be relied
-// on: a few missed reports. An older one comes from a node that stopped reporting.
-var sessionsReportMaxAge = 6 * db.SessionsReportInterval
+// on (db.SessionsReportMaxAge).
+var sessionsReportMaxAge = db.SessionsReportMaxAge
 
 // refusalNote is what the backend itself does in maintenance, for traffic the proxies do
 // not hold back.
@@ -149,6 +149,9 @@ func maintenanceOn(ctx context.Context, rdb *resilient.ResilientDatabase, host, 
 		hosts := make([]string, len(rows))
 		for i, r := range rows {
 			hosts[i] = r.Host
+			if r.Host == row.Host {
+				fmt.Printf("\n%s\n", addressesNote(r.Host, r.Addresses))
+			}
 		}
 		fmt.Printf("\nAll backends in maintenance: %s\n", strings.Join(hosts, ", "))
 	}
@@ -159,6 +162,16 @@ func maintenanceOn(ctx context.Context, rdb *resilient.ResilientDatabase, host, 
 	}
 	fmt.Println()
 	return waitUntilSafeToStop(ctx, rdb, row.Host)
+}
+
+// addressesNote says what proxies match a host in maintenance by: the host, and the
+// addresses its node reports for itself (as listed: those no other node has).
+func addressesNote(host string, addresses []string) string {
+	if len(addresses) == 0 {
+		return fmt.Sprintf("Its node reports no address of its own: proxies match it by %q alone (and what that\n"+
+			"resolves to where they run).", host)
+	}
+	return fmt.Sprintf("Proxies match it by %q and by the addresses its node reports: %s.", host, strings.Join(addresses, ", "))
 }
 
 // staleReportWarning says when an instance's latest sessions report is old: the id is
@@ -270,6 +283,11 @@ func showBackendsStatus(ctx context.Context, rdb *resilient.ResilientDatabase, o
 			fmt.Printf("  Reason:               %s\n", r.Reason)
 		}
 		fmt.Printf("  Uploader instance:    %s\n", r.InstanceID)
+		if len(r.Addresses) > 0 {
+			fmt.Printf("  Node addresses:       %s (proxies match the host by these too)\n", strings.Join(r.Addresses, ", "))
+		} else {
+			fmt.Printf("  Node addresses:       none of its own reported: proxies match it by the host alone\n")
+		}
 		printDrainState(state)
 		fmt.Println()
 	}
@@ -478,7 +496,9 @@ Usage:
 
 Options:
   --host string       Backend host as the proxies know it: a name or an IP, without a
-                      port. A name also covers the addresses it resolves to.
+                      port. A name also covers the addresses it resolves to, and the
+                      addresses its node (--instance) reports for itself are matched
+                      too.
   --instance string   The backend's uploader instance id ([uploader] instance_id, default
                       its hostname): its uploads must drain, and the node reports its
                       sessions under it. Default: the host. An id no node ever reported

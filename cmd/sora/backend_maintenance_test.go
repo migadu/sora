@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -35,11 +37,15 @@ func (s *scriptedList) set(hosts []string, err error) {
 	s.hosts, s.err = hosts, err
 }
 
-func (s *scriptedList) load(context.Context) ([]string, error) {
+func (s *scriptedList) load(context.Context) ([]db.BackendMaintenance, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
-	return s.hosts, s.err
+	rows := make([]db.BackendMaintenance, len(s.hosts))
+	for i, h := range s.hosts {
+		rows[i] = db.BackendMaintenance{Host: h, InstanceID: h}
+	}
+	return rows, s.err
 }
 
 func (s *scriptedList) callCount() int {
@@ -349,6 +355,68 @@ func TestSessionsReporter_FailedLookupKeepsTheLastState(t *testing.T) {
 	}
 	if got := f.last(t); got.RefusingSince == nil || !got.RefusingSince.Equal(began) {
 		t.Fatalf("report after a failed lookup = %+v, want still refusing since %v", got, began)
+	}
+}
+
+// The node reports its own addresses, those of its interfaces by default, read afresh for
+// every report: proxies match it by them while it is in maintenance, and an address can
+// move to another node. Interfaces that cannot be read keep the addresses last read.
+func TestSessionsReporter_ReportsTheNodesAddresses(t *testing.T) {
+	f := &fakeReporting{}
+	r := f.reporter()
+	r.tick(context.Background(), time.Second)
+	want, err := nodeAddresses()
+	if err != nil {
+		t.Fatalf("nodeAddresses: %v", err)
+	}
+	if got := f.last(t).Addresses; !slices.Equal(got, want) {
+		t.Fatalf("reported addresses %v, want the interfaces' %v", got, want)
+	}
+
+	addrs, addrsErr := []string{"10.0.0.13", "2001:db8::13"}, error(nil)
+	r.addresses = func() ([]string, error) {
+		if addrsErr != nil {
+			return nil, addrsErr
+		}
+		return addrs, nil
+	}
+	r.tick(context.Background(), time.Second)
+	if got := f.last(t).Addresses; !slices.Equal(got, addrs) {
+		t.Fatalf("reported addresses %v, want %v", got, addrs)
+	}
+	addrs = []string{"10.0.0.14"}
+	r.tick(context.Background(), time.Second)
+	if got := f.last(t).Addresses; !slices.Equal(got, addrs) {
+		t.Fatalf("reported addresses %v after they changed, want %v", got, addrs)
+	}
+
+	addrsErr = errors.New("netlink: too many open files")
+	for i := 0; i < 2; i++ { // failing, and still failing
+		r.tick(context.Background(), time.Second)
+		if got := f.last(t).Addresses; !slices.Equal(got, addrs) {
+			t.Fatalf("reported addresses %v when the interfaces could not be read, want the last read %v", got, addrs)
+		}
+	}
+}
+
+// What proxies elsewhere can reach a node by: not its loopback, link-local, multicast or
+// unspecified addresses, which every node has alike. Each once, sorted.
+func TestReachableAddresses(t *testing.T) {
+	cidr := func(s string) net.Addr {
+		ip, n, err := net.ParseCIDR(s)
+		if err != nil {
+			t.Fatalf("ParseCIDR(%q): %v", s, err)
+		}
+		n.IP = ip
+		return n
+	}
+	got := reachableAddresses([]net.Addr{
+		cidr("127.0.0.1/8"), cidr("::1/128"), cidr("fe80::1/64"), cidr("169.254.10.1/16"),
+		cidr("2001:db8::13/64"), cidr("10.0.0.13/24"), &net.IPAddr{IP: net.ParseIP("192.0.2.13")},
+		cidr("10.0.0.13/24"), cidr("0.0.0.0/0"), &net.IPAddr{IP: net.ParseIP("ff02::1")},
+	})
+	if want := []string{"10.0.0.13", "192.0.2.13", "2001:db8::13"}; !slices.Equal(got, want) {
+		t.Fatalf("reachableAddresses = %v, want %v", got, want)
 	}
 }
 

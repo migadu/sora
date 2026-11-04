@@ -15,6 +15,10 @@
 --                   for. The node starts refusing before it counts, so refusing with none
 --                   open means none can open later, as long as that maintenance lasts; a
 --                   row naming an earlier maintenance proves nothing about the current one.
+--   addresses       the node's own addresses (those of its interfaces, less loopback and
+--                   link-local): proxies match a host in maintenance by them as well as by
+--                   its name, which need not resolve, where they run, to the address they
+--                   route to it by. One that another node reports too is not matched.
 --   reported_at     written every few seconds by the node (database clock). A row that
 --                   stopped advancing comes from a node that stopped reporting, and an
 --                   instance with no row at all runs a build that does not report.
@@ -24,5 +28,6 @@ CREATE TABLE IF NOT EXISTS instance_sessions (
     instance_id    TEXT PRIMARY KEY,
     open_sessions  BIGINT NOT NULL,
     refusing_since TIMESTAMPTZ,
+    addresses      TEXT[] NOT NULL DEFAULT '{}',
     reported_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
