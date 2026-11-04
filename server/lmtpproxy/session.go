@@ -255,6 +255,15 @@ func (s *Session) handleConnection() {
 			s.sender = sender
 			s.mailFromReceived = true
 			s.smtputf8 = hasSMTPUTF8Param(args) || !server.IsASCII(sender)
+			// A held backend that has gone into maintenance is dropped before it is asked
+			// (past refuse_after it refuses every MAIL, and the MTA keeping this connection
+			// would get that for every message): the transaction has no recipient yet, and
+			// the first RCPT routes afresh. The RCPT check below covers maintenance that
+			// begins between the two.
+			if s.backendConn != nil && s.backendInMaintenance() {
+				s.InfoLog("dropping backend connection: backend in maintenance", "backend", s.serverAddr)
+				s.loseBackend()
+			}
 			// A connected backend must learn the new sender too (RFC 5321 §4.1.1.2: MAIL
 			// after a completed or reset transaction), or it would deliver with the
 			// previous transaction's Return-Path. Its answer is the answer; a backend
@@ -290,6 +299,13 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			s.DebugLog("Extracted recipient address", "to", to)
+			// No MAIL in effect (none yet, RSET, or one the backend refused while a
+			// pipelining MTA sent on): a bad sequence, answered here, as a backend asked
+			// would answer 5xx, which reads as a routing inconsistency below.
+			if !s.mailFromReceived {
+				s.sendResponse("503 5.5.1 Error: need MAIL command")
+				continue
+			}
 			if !server.IsASCII(to) {
 				s.smtputf8 = true
 			}

@@ -21,12 +21,14 @@ import (
 )
 
 // countingBackend is a minimal LMTP backend that accepts every recipient and message and
-// counts both, and the XCLIENT commands it receives.
+// counts both, and the XCLIENT commands it receives. With refuseMail set it refuses every
+// MAIL as a backend in maintenance does once past refuse_after.
 type countingBackend struct {
 	addr       string
 	rcpts      atomic.Int32 // recipients accepted
 	deliveries atomic.Int32 // messages received in full (end-of-data seen)
 	xclients   atomic.Int32 // XCLIENT commands received
+	refuseMail atomic.Bool
 }
 
 func startCountingBackend(t *testing.T, l net.Listener, name string) *countingBackend {
@@ -57,6 +59,9 @@ func (b *countingBackend) serve(c net.Conn, name string) {
 		switch upper := strings.ToUpper(strings.TrimSpace(line)); {
 		case strings.HasPrefix(upper, "LHLO"):
 			fmt.Fprintf(c, "250-%s\r\n250-PIPELINING\r\n250 8BITMIME\r\n", name)
+		case strings.HasPrefix(upper, "MAIL FROM") && b.refuseMail.Load():
+			accepted = 0
+			fmt.Fprint(c, "451 4.3.2 Server in maintenance, try again later\r\n")
 		case strings.HasPrefix(upper, "MAIL FROM"), strings.HasPrefix(upper, "RSET"):
 			accepted = 0
 			fmt.Fprint(c, "250 Ok\r\n")
@@ -220,6 +225,48 @@ func TestLMTPProxyBackendMaintenanceReroutesPinnedSession(t *testing.T) {
 	e.expect(t, "MAIL FROM:<sender@example.com>", "250")
 	e.expect(t, "RCPT TO:<user1@example.com>", "250")
 	e.recipients(t, 1, 1, "in maintenance")
+}
+
+// The session holds backend1 past its refuse_after, when it refuses every MAIL: the next
+// transaction must not ask it, or an MTA that keeps its connection gets 451 for every
+// message until it reconnects. The MAIL is accepted and the recipient reaches backend2.
+func TestLMTPProxyBackendMaintenanceHeldBackendThatRefusesMail(t *testing.T) {
+	e := setupMaintenanceLMTP(t)
+
+	e.expect(t, "MAIL FROM:<sender@example.com>", "250")
+	e.expect(t, "RCPT TO:<user1@example.com>", "250")
+	e.expect(t, "RSET", "250")
+	e.recipients(t, 1, 0, "before maintenance")
+
+	e.m.Set([]string{"127.0.0.1"})
+	e.backend1.refuseMail.Store(true)
+
+	e.expect(t, "MAIL FROM:<sender@example.com>", "250")
+	e.expect(t, "RCPT TO:<user1@example.com>", "250")
+	e.recipients(t, 1, 1, "in maintenance")
+}
+
+// RCPT without a MAIL in effect is a bad sequence (RFC 5321 §3.3: 503), answered here: a
+// backend asked for it answers 5xx too, which the proxy would take for a routing
+// inconsistency (451 and a dropped lookup cache entry). It happens where a pipelining MTA
+// sends its RCPTs after a MAIL the held backend refused.
+func TestLMTPProxyRecipientWithoutMailIsABadSequence(t *testing.T) {
+	e := setupMaintenanceLMTP(t)
+
+	e.expect(t, "RCPT TO:<user1@example.com>", "503 5.5.1")
+	e.recipients(t, 0, 0, "RCPT before any MAIL")
+
+	e.expect(t, "MAIL FROM:<sender@example.com>", "250")
+	e.expect(t, "RCPT TO:<user1@example.com>", "250")
+	e.expect(t, "RSET", "250")
+	e.expect(t, "RCPT TO:<user1@example.com>", "503 5.5.1")
+	e.recipients(t, 1, 0, "RCPT after RSET")
+
+	// backend1 refuses MAIL without the proxy knowing why (no maintenance here)
+	e.backend1.refuseMail.Store(true)
+	e.expect(t, "MAIL FROM:<sender@example.com>", "451")
+	e.expect(t, "RCPT TO:<user1@example.com>", "503 5.5.1")
+	e.recipients(t, 1, 0, "RCPT after a refused MAIL")
 }
 
 // Maintenance starting mid-transaction must not move it: backend1 already accepted a
