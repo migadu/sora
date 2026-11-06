@@ -66,6 +66,15 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// RFC 9979 §3.2, as for IMAP STORE (server/imap/flag_color.go): clearing
+	// \Flagged also clears the flag color keywords, so no stale color is left for
+	// the next time the message is flagged.
+	if helpers.HasFlag(helpers.StringsToFlags(req.RemoveFlags), imap.FlagFlagged) {
+		for _, k := range helpers.FlagColorKeywords {
+			req.RemoveFlags = append(req.RemoveFlags, string(k))
+		}
+	}
+
 	// Update message flags
 	err = s.rdb.UpdateMessageFlagsWithRetry(ctx, accountID, messageID, req.AddFlags, req.RemoveFlags)
 	if err != nil {
