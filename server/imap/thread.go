@@ -39,6 +39,11 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 		}
 	}
 
+	criteria, err := s.withSessionRecent(criteria, s.selectedMailbox.ID)
+	if err != nil {
+		return nil, err
+	}
+
 	includeSubject := algorithm == imap.ThreadReferences || algorithm == imap.ThreadOrderedSubject
 	// The FTS scope is the mailbox OWNER, which for a shared mailbox is not the session
 	// account: messages.account_id always carries the owner (server/imap/copy.go passes

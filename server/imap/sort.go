@@ -58,6 +58,11 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 		return nil, s.internalError("no session tracker available for sort")
 	}
 
+	searchCriteria, err := s.withSessionRecent(searchCriteria, selectedMailboxID)
+	if err != nil {
+		return nil, err
+	}
+
 	// Check for context cancellation before database query
 	if ctx.Err() != nil {
 		return nil, s.internalError("request aborted")

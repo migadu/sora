@@ -54,6 +54,7 @@ type IMAPSession struct {
 
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
+	recentAboveUID        imap.UID    // Messages above this UID are \Recent in this session (RFC 3501 §2.3.2); set by SELECT
 	useMasterDB           atomic.Bool // Pin session to master DB after a write to ensure consistency
 	selectedReadOnly      atomic.Bool // True when the selected mailbox was opened with EXAMINE (RFC 3501 §6.3.2)
 

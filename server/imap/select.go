@@ -119,6 +119,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 
 	// Now perform all database operations outside the lock
 	var numRecent uint32
+	var recentAbove imap.UID // numRecent counts the messages above this UID
 
 	if isReselectOfPrevious {
 		s.DebugLog("mailbox reselected", "mailbox", mboxName)
@@ -130,6 +131,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 			numRecent = uint32(currentSummary.NumMessages) // Fallback
 		} else {
 			numRecent = count
+			recentAbove = uidToCompareAgainst
 		}
 	} else {
 		// Different mailbox or first select in this session.
@@ -149,6 +151,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 				numRecent = uint32(currentSummary.NumMessages)
 			} else {
 				numRecent = count
+				recentAbove = lastSeenUID
 			}
 		} else {
 			// No previous read-write SELECT on any session for this mailbox (since
@@ -174,6 +177,9 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		s.DebugLog("request aborted during mailbox selection, aborting state update", "mailbox", mboxName)
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
 	}
+
+	// SEARCH RECENT, NEW and OLD answer from this (see recent.go).
+	s.recentAboveUID = recentAbove
 
 	// Update session state for the *next* Unselect/Select cycle
 	s.lastSelectedMailboxID = mailbox.ID

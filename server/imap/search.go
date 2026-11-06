@@ -72,6 +72,9 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 
 	// Now decode search criteria using decodeSearchCriteriaLocked helper that we'll create
 	criteria = s.decodeSearchCriteria(criteria)
+	if criteria, err = s.withSessionRecent(criteria, selectedMailboxID); err != nil {
+		return nil, err
+	}
 
 	if currentNumMessages == 0 && len(criteria.SeqNum) > 0 {
 		s.DebugLog("skipping SEARCH because mailbox is empty")

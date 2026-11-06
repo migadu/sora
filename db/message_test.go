@@ -58,7 +58,8 @@ func TestFlagToBitwise(t *testing.T) {
 		{"flagged flag", imap.FlagFlagged, FlagFlagged},
 		{"deleted flag", imap.FlagDeleted, FlagDeleted},
 		{"draft flag", imap.FlagDraft, FlagDraft},
-		{"recent flag", imap.Flag("\\Recent"), FlagRecent},
+		{"recent is a session flag with no bit", imap.Flag("\\Recent"), 0},
+		{"unknown flag-extension", imap.Flag("\\Unknown"), 0},
 		{"custom flag", imap.Flag("CustomFlag"), 0},
 		{"empty flag", imap.Flag(""), 0},
 		{"case insensitive", imap.Flag("\\SEEN"), FlagSeen},
@@ -90,9 +91,9 @@ func TestFlagsToBitwise(t *testing.T) {
 			expected: FlagSeen | FlagAnswered,
 		},
 		{
-			name:     "all standard flags",
+			name:     "all standard flags, \\Recent ignored",
 			flags:    []imap.Flag{imap.FlagSeen, imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted, imap.FlagDraft, imap.Flag("\\Recent")},
-			expected: FlagSeen | FlagAnswered | FlagFlagged | FlagDeleted | FlagDraft | FlagRecent,
+			expected: FlagSeen | FlagAnswered | FlagFlagged | FlagDeleted | FlagDraft,
 		},
 		{
 			name:     "with custom flags",
