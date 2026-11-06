@@ -1262,6 +1262,13 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 
 	size := int64(len(fullMessageBytes))
 
+	// RFC 9979 §4: the server sets $hasattachment or $hasnoattachment on delivery.
+	var classifiedBS imap.BodyStructure
+	if bodyStructure != nil {
+		classifiedBS = *bodyStructure
+	}
+	flags = db.WithAttachmentKeyword(flags, classifiedBS, true)
+
 	// No need to query - it's already cached in the session
 	_, messageUID, err := s.backend.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
@@ -1282,7 +1289,7 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 			References:    references,
 			BodyStructure: bodyStructure,
 			Recipients:    recipients,
-			Flags:         flags, // Flags set by the Sieve script (imap4flags); empty -> unread
+			Flags:         flags, // Sieve-set flags (imap4flags) plus the attachment keyword; no \Seen -> unread
 			FTSRetention:  s.backend.ftsRetention,
 		},
 		db.PendingUpload{
