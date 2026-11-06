@@ -704,6 +704,12 @@ components:
             type: string
         has_attachments:
           type: boolean
+          description: |
+            Whether the message has attachments, from the RFC 9979 keywords Sora sets
+            on delivery and on APPEND: `true` for `$hasattachment`, `false` for
+            `$hasnoattachment`. Omitted when the message carries neither, which is
+            mail stored before Sora set them, or mail it could not inspect (such as
+            encrypted mail).
 
     Message:
       type: object
@@ -775,6 +781,11 @@ components:
                 type: integer
               part_number:
                 type: string
+        has_attachments:
+          type: boolean
+          description: |
+            Whether the message has attachments, from its RFC 9979 keywords; omitted
+            when it carries neither. See MessageListItem.has_attachments.
 
     Filter:
       type: object

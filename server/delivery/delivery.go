@@ -210,6 +210,11 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(messageBytes))
 	bodyStructure := &bodyStructureVal
 
+	// RFC 9979 §4: the server sets $hasattachment or $hasnoattachment on
+	// delivery. Decided from the parsed structure, not the fallback below: one
+	// that fails validation decides nothing (see helpers.AttachmentKeyword).
+	deliveryFlags := db.WithAttachmentKeyword(sieveFlags, bodyStructureVal, true)
+
 	// Validate body structure to prevent panics during FETCH BODYSTRUCTURE
 	if err := helpers.ValidateBodyStructure(bodyStructure); err != nil {
 		// Log the validation error but create a safe fallback body structure
@@ -305,7 +310,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			References:           references,
 			BodyStructure:        bodyStructure,
 			Recipients:           recipients,
-			Flags:                sieveFlags, // Flags set by the Sieve script (imap4flags); empty -> unread
+			Flags:                deliveryFlags, // Sieve-set flags (imap4flags) plus the attachment keyword; no \Seen -> unread
 			FTSRetention:         d.FTSRetention,
 			PreservedUID:         recipient.PreservedUID,
 			PreservedUIDValidity: recipient.PreservedUIDVal,
@@ -546,7 +551,7 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 			References:    references,
 			BodyStructure: bodyStructure,
 			Recipients:    recipients,
-			Flags:         flags,
+			Flags:         db.WithAttachmentKeyword(flags, bodyStructureVal, true), // as in DeliverMessage
 			FTSRetention:  d.FTSRetention,
 		},
 		db.PendingUpload{

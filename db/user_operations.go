@@ -40,6 +40,12 @@ type DBMessage struct {
 	AccountID    int64     `json:"-"` // owner of the row (the pending-upload key, with ContentHash)
 	Uploaded     bool      `json:"-"` // body is in S3 under S3Domain/S3Localpart/ContentHash
 	S3Localpart  string    `json:"-"`
+
+	// HasAttachments mirrors the RFC 9979 §4 keywords: true for $hasattachment,
+	// false for $hasnoattachment, nil (omitted) for mail stored before Sora set
+	// them. RFC 9979 asks JMAP's hasAttachment to "reflect the same information
+	// as this keyword"; this API follows the same rule.
+	HasAttachments *bool `json:"has_attachments,omitempty"`
 }
 
 // RecipientInfo represents email recipient information
@@ -232,6 +238,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 
 		// Convert bitwise flags to string array
 		msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
+		msg.HasAttachments = hasAttachmentsFromKeywords(msg.CustomFlags)
 		messages = append(messages, msg)
 	}
 
@@ -331,6 +338,7 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		}
 
 		msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
+		msg.HasAttachments = hasAttachmentsFromKeywords(msg.CustomFlags)
 		messages = append(messages, msg)
 	}
 
@@ -508,6 +516,7 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 	}
 
 	msg.Flags = bitwiseFlagsToStrings(flagsBitmask)
+	msg.HasAttachments = hasAttachmentsFromKeywords(msg.CustomFlags)
 	return msg, nil
 }
 
