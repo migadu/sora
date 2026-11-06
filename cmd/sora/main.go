@@ -41,6 +41,7 @@ import (
 	"github.com/migadu/sora/server/managesieveproxy"
 	"github.com/migadu/sora/server/pop3"
 	"github.com/migadu/sora/server/pop3proxy"
+	"github.com/migadu/sora/server/proxy"
 	"github.com/migadu/sora/server/relayqueue"
 	"github.com/migadu/sora/server/sieveengine"
 	"github.com/migadu/sora/server/uploader"
@@ -111,6 +112,8 @@ type serverDependencies struct {
 	authCacheInstance     *authcache.Cache                     // persistent auth cache
 	proxyServers          map[string]adminapi.ProxyServer      // proxy name -> proxy server interface (for backend health)
 	proxyServersMux       sync.Mutex                           // protects proxyServers map
+	maintenance           *proxy.Maintenance                   // backends in maintenance, honored by every proxy (nil without proxies or DB)
+	maintenanceGate       *server.MaintenanceGate              // refuses new sessions while this backend is in maintenance (nil on a node that does not report its sessions)
 	runningServers        map[string]ConfigReloader            // server name -> reloadable server
 	runningServersMux     sync.Mutex                           // protects runningServers map
 }
@@ -411,6 +414,11 @@ func handleConfigReload(configPath string, currentCfg *config.Config, errorHandl
 	if !reflect.DeepEqual(newCfg.Sieve, currentCfg.Sieve) {
 		logger.Info("Config reload: [sieve] changed but requires restart to take effect",
 			"current", currentCfg.Sieve, "new", newCfg.Sieve)
+	}
+	// [backend_maintenance] tunes the poller and the drains, which start with the proxies.
+	if newCfg.Maintenance != currentCfg.Maintenance {
+		logger.Info("Config reload: [backend_maintenance] changed but requires restart to take effect",
+			"current", currentCfg.Maintenance, "new", newCfg.Maintenance)
 	}
 
 	// 5. Reload metadata limits
@@ -1161,6 +1169,11 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	errChan := make(chan error, 1)
 	allServers := deps.config.GetAllServers()
 
+	// Before any server starts: each proxy server attaches this set as it is created, and
+	// the backend servers admit their sessions through deps.maintenanceGate.
+	deps.maintenance = startBackendMaintenance(ctx, deps)
+	startSessionsReport(ctx, deps)
+
 	// Start HTTP-01 challenge server for Let's Encrypt if using autocert
 	if deps.tlsManager != nil {
 		handler := deps.tlsManager.HTTPHandler()
@@ -1379,6 +1392,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	s, err := imap.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance,
 		imap.IMAPServerOptions{
 			InstanceID:                   deps.instanceID,
+			MaintenanceGate:              deps.maintenanceGate,
 			Debug:                        serverConfig.Debug,
 			TLS:                          serverConfig.TLS,
 			TLSCertFile:                  serverConfig.TLSCertFile,
@@ -1490,6 +1504,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 
 	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
 		InstanceID:              deps.instanceID,
+		MaintenanceGate:         deps.maintenanceGate,
 		RelayQueue:              deps.relayQueue,  // Global relay queue
 		RelayWorker:             deps.relayWorker, // Global relay worker for immediate processing
 		TLSVerify:               serverConfig.TLSVerify,
@@ -1579,6 +1594,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 	}
 
 	s, err := pop3.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance, pop3.POP3ServerOptions{
+		MaintenanceGate:           deps.maintenanceGate,
 		Debug:                     serverConfig.Debug,
 		TLS:                       serverConfig.TLS,
 		TLSCertFile:               serverConfig.TLSCertFile,
@@ -1893,6 +1909,8 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		deps.connectionTrackersMux.Unlock()
 	}
 
+	deps.attachBackendMaintenance(ctx, "IMAP-"+serverConfig.Name, server.GetConnectionManager(), server.MaintenanceTargets)
+
 	// Register proxy server for backend health monitoring via Admin API
 	deps.proxyServersMux.Lock()
 	deps.proxyServers["IMAP-"+serverConfig.Name] = server
@@ -2022,6 +2040,10 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		deps.connectionTrackersMux.Unlock()
 	}
 
+	// POP3 sessions are not closed for maintenance: one closed before its QUIT loses its
+	// deletions. They end on their own, and the backend's report keeps --wait waiting.
+	deps.attachBackendMaintenance(ctx, "POP3-"+serverConfig.Name, server.GetConnectionManager(), nil)
+
 	// Register proxy server for backend health monitoring via Admin API
 	deps.proxyServersMux.Lock()
 	deps.proxyServers["POP3-"+serverConfig.Name] = server
@@ -2150,6 +2172,9 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		deps.connectionTrackersMux.Unlock()
 	}
 
+	// ManageSieve sessions are short and lose nothing when cut: they end on their own.
+	deps.attachBackendMaintenance(ctx, "ManageSieve-"+serverConfig.Name, server.GetConnectionManager(), nil)
+
 	// Register proxy server for backend health monitoring via Admin API
 	deps.proxyServersMux.Lock()
 	deps.proxyServers["ManageSieve-"+serverConfig.Name] = server
@@ -2276,6 +2301,9 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		deps.connectionTrackersMux.Unlock()
 	}
 
+	// LMTP sessions re-route at their next transaction instead (lmtpproxy RCPT handling).
+	deps.attachBackendMaintenance(ctx, "LMTP-"+serverConfig.Name, server.GetConnectionManager(), nil)
+
 	// Register proxy server for backend health monitoring via Admin API
 	deps.proxyServersMux.Lock()
 	deps.proxyServers["LMTP-"+serverConfig.Name] = server
@@ -2305,10 +2333,15 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 
 	options := buildAdminAPIServerOptions(deps, serverConfig)
 
-	srv := adminapi.Start(ctx, deps.resilientDB, options, errChan)
-	if srv != nil {
-		deps.registerServer(serverConfig.Name, srv)
+	srv, err := adminapi.New(deps.resilientDB, options)
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create HTTP API server: %w", err)
+		return
 	}
+	// Registered before it serves, as the other servers are: its deliveries count in the
+	// node's sessions report (drainSessions) from the first.
+	deps.registerServer(serverConfig.Name, srv)
+	srv.Serve(ctx, errChan)
 }
 
 // buildAdminAPIServerOptions maps the running config onto the Admin API server options.
@@ -2367,6 +2400,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		TLSVerify:          serverConfig.TLSVerify,
 		Hostname:           deps.hostname,
 		InstanceID:         deps.instanceID,
+		MaintenanceGate:    deps.maintenanceGate,
 		FTSRetention:       deps.ftsRetention,
 		AffinityManager:    deps.affinityManager,
 		ValidBackends:      validBackends,
@@ -2506,6 +2540,9 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		errChan <- fmt.Errorf("failed to create User API proxy server: %w", err)
 		return
 	}
+
+	// User API requests are routed one by one: nothing to drain.
+	deps.attachBackendMaintenance(ctx, "UserAPI-"+serverConfig.Name, server.GetConnectionManager(), nil)
 
 	// Register proxy server for backend health monitoring via Admin API
 	deps.proxyServersMux.Lock()

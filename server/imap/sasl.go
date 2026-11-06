@@ -152,7 +152,9 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
 					}
 
-					s.server.authenticatedConnections.Add(1)
+					if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "imap") {
+						return s.refusedInMaintenance()
+					}
 					duration := time.Since(authStart)
 
 					// Log authentication with alias detection
@@ -301,7 +303,9 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
 					}
 
-					s.server.authenticatedConnections.Add(1)
+					if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "imap") {
+						return s.refusedInMaintenance()
+					}
 					duration := time.Since(authStart)
 
 					// Log authentication with alias detection

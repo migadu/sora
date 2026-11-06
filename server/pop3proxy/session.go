@@ -743,8 +743,8 @@ func (s *POP3ProxySession) connectToBackend() error {
 	// Send XCLIENT command to backend with forwarding parameters if enabled.
 	// This MUST be done before authenticating.
 	useXCLIENT := s.server.remoteUseXCLIENT
-	// Override with routing-specific setting if available
-	if s.routingInfo != nil {
+	// The remote lookup's setting applies to the backend it named (as for the dial)
+	if s.routingInfo.LookupRouted(s.serverAddr) {
 		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
 	}
 	if useXCLIENT {
@@ -763,7 +763,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	// non-sora backends (Dovecot): the session simply stays in ASCII mode,
 	// exactly as it did pre-migration.
 	mirrorUTF8 := s.server.remoteUseUTF8
-	if s.routingInfo != nil {
+	if s.routingInfo.LookupRouted(s.serverAddr) {
 		mirrorUTF8 = s.routingInfo.RemoteUseUTF8
 	}
 	if s.utf8Requested && mirrorUTF8 {

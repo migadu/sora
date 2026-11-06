@@ -66,6 +66,14 @@ const defaultMaxMessageSize = 50 * 1024 * 1024 // 50 MB
 
 // handleDeliverMail handles HTTP mail delivery (mimics LMTP flow exactly)
 func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
+	if !s.maintenanceGate.Admit(&s.deliveriesOpen, "http_delivery") {
+		logger.Info("Mail delivery refused: this backend is in maintenance", "remote", r.RemoteAddr)
+		w.Header().Set("Retry-After", "60")
+		s.writeError(w, http.StatusServiceUnavailable, "Server in maintenance, try again later")
+		return
+	}
+	defer s.deliveriesOpen.Add(-1)
+
 	ctx := r.Context()
 
 	// Bound the request body to the configured max_message_size (same limit LMTP uses),

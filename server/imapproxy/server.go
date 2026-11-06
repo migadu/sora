@@ -782,14 +782,12 @@ func (s *Server) sendGracefulShutdownBye() {
 	}
 
 	// Step 2: Write BYE directly to clientConn (bypassing bufio.Writer to avoid
-	// stale buffer state from the authentication phase). Go's net.Conn.Write
-	// serialization ensures this won't interleave with any remaining writes.
+	// stale buffer state from the authentication phase), between two of the backend's
+	// responses: a BYE written between two chunks of the copy could land inside a
+	// literal (see sendBye). Each waits for a write the copy has under way, so they run
+	// side by side, within the second before the connections close.
 	for _, session := range activeSessions {
-		session.mu.Lock()
-		if session.clientConn != nil {
-			_, _ = fmt.Fprint(session.clientConn, "* BYE Server shutting down, please reconnect\r\n")
-		}
-		session.mu.Unlock()
+		go session.sendBye("* BYE Server shutting down, please reconnect\r\n")
 	}
 
 	// Step 3: Give clients a moment to process the BYE before closing.

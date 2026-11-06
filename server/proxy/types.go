@@ -75,6 +75,15 @@ type UserRoutingInfo struct {
 	ProxySessionID         string   // Proxy session ID for end-to-end tracing
 }
 
+// LookupRouted reports whether addr is the backend the remote lookup named, the only one
+// its backend settings (the Remote* fields) are for. A user the proxy routes itself — in
+// auth-only mode, from the database, or around a remote-lookup route in maintenance —
+// reaches a pool backend, which gets the proxy server's own settings. The dial
+// (dialWithProxy) and the session after it follow this one rule.
+func (r *UserRoutingInfo) LookupRouted(addr string) bool {
+	return r != nil && r.ServerAddress != "" && r.ServerAddress == addr
+}
+
 // normalizeHostPort normalizes a host:port address, adding a default port if missing
 func normalizeHostPort(addr string, defaultPort int) string {
 	if addr == "" {

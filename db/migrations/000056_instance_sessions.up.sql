@@ -1,0 +1,33 @@
+-- What each node reports about its own sessions that must finish before it stops: IMAP
+-- sessions that have authenticated (APPEND, COPY and MOVE stage uploads), LMTP transactions and
+-- Admin API deliveries in flight, and POP3 sessions that have authenticated (a POP3 session
+-- applies its deletions at QUIT). Keyed by the uploader instance id, the owner of every upload
+-- such a session stages (see instance_heartbeats).
+--
+-- `sora-admin backends ... --wait` reads it to decide when a backend in maintenance is
+-- safe to stop. An empty upload queue alone proves nothing while a session that can still
+-- APPEND is open, and only the node itself sees every such session, including those that
+-- did not come through a proxy.
+--
+--   open_sessions   open when the row was written.
+--   refusing_since  set while the node refuses new such sessions because it is in
+--                   maintenance: the created_at of the backend_maintenance row it refuses
+--                   for. The node starts refusing before it counts, so refusing with none
+--                   open means none can open later, as long as that maintenance lasts; a
+--                   row naming an earlier maintenance proves nothing about the current one.
+--   addresses       the node's own addresses (those of its interfaces, less loopback and
+--                   link-local): proxies match a host in maintenance by them as well as by
+--                   its name, which need not resolve, where they run, to the address they
+--                   route to it by. One that another node reports too is not matched.
+--   reported_at     written every few seconds by the node (database clock). A row that
+--                   stopped advancing comes from a node that stopped reporting, and an
+--                   instance with no row at all runs a build that does not report.
+--
+-- One row per instance, rewritten in place.
+CREATE TABLE IF NOT EXISTS instance_sessions (
+    instance_id    TEXT PRIMARY KEY,
+    open_sessions  BIGINT NOT NULL,
+    refusing_since TIMESTAMPTZ,
+    addresses      TEXT[] NOT NULL DEFAULT '{}',
+    reported_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
