@@ -818,12 +818,15 @@ func bitwiseFlagsToStrings(flags any) []string {
 	if bitwiseFlags&FlagDraft != 0 {
 		result = append(result, "\\Draft")
 	}
-	if bitwiseFlags&FlagRecent != 0 {
-		result = append(result, "\\Recent")
-	}
+	// The FlagRecent bit is skipped for the reason BitwiseToFlags gives: \Recent
+	// is a session flag, and a set bit is stale data from before IMAP stopped
+	// writing it.
 	return result
 }
 
+// stringFlagToBitwise maps a system flag the User API may set or clear to its
+// bit. \Recent maps to nothing, so this path can never write the FlagRecent bit
+// (RFC 3501 §2.3.2: no client can change \Recent).
 func stringFlagToBitwise(flag string) int {
 	switch strings.ToLower(flag) {
 	case "\\seen":
@@ -836,8 +839,6 @@ func stringFlagToBitwise(flag string) int {
 		return FlagDeleted
 	case "\\draft":
 		return FlagDraft
-	case "\\recent":
-		return FlagRecent
 	default:
 		return 0
 	}
