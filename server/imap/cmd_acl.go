@@ -2,6 +2,7 @@ package imap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -364,7 +365,10 @@ func (s *IMAPSession) SetACL(ctx context.Context, mailbox string, identifier ima
 	// If final rights are empty, this is a DELETEACL operation
 	if finalRights == "" {
 		err = s.server.rdb.RevokeMailboxAccessByIdentifierWithRetry(writeCtx, mbox.ID, identifierStr)
-		if err != nil {
+		// RFC 4314 §3.2: DELETEACL "removes any <identifier,rights> pair" for the
+		// identifier. With none (never granted, or a retried or concurrent revoke)
+		// the ACL is already what the client asked for.
+		if err != nil && !errors.Is(err, consts.ErrDBNotFound) {
 			return s.internalError("failed to revoke access: %v", err)
 		}
 		s.DebugLog("revoked all rights", "identifier", identifierStr, "mailbox", mailbox)
@@ -375,6 +379,22 @@ func (s *IMAPSession) SetACL(ctx context.Context, mailbox string, identifier ima
 	// Grant access with final rights using identifier
 	err = s.server.rdb.GrantMailboxAccessByIdentifierWithRetry(writeCtx, AccountID, identifierStr, mailbox, finalRights)
 	if err != nil {
+		// RFC 5530 CANNOT: these grants can never succeed, which the client must be
+		// able to tell from a server fault.
+		if errors.Is(err, db.ErrMailboxNotShared) {
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeCannot,
+				Text: "Only mailboxes in the shared namespace can be shared",
+			}
+		}
+		if errors.Is(err, db.ErrCrossDomainGrant) {
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeCannot,
+				Text: "Mailboxes can only be shared with users in the same domain",
+			}
+		}
 		return s.internalError("failed to grant access: %v", err)
 	}
 

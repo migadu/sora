@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -46,6 +47,15 @@ const (
 	// RFC 4314: "anyone" refers to the universal identity (all authenticted users)
 	// We scope this to same-domain for security
 	AnyoneIdentifier = "anyone"
+)
+
+// Refusals from GrantMailboxAccessByIdentifier: grants that can never succeed, as
+// opposed to a failure to carry one out, so callers can tell the client which.
+var (
+	// ErrMailboxNotShared: only mailboxes in the shared namespace carry grants.
+	ErrMailboxNotShared = errors.New("mailbox is not shared")
+	// ErrCrossDomainGrant: a shared mailbox is shared only within its owner's domain.
+	ErrCrossDomainGrant = errors.New("cannot grant access to user from different domain")
 )
 
 // unionRights returns the set union of two ACL rights strings, preserving the
@@ -109,7 +119,7 @@ func (db *Database) GrantMailboxAccessByIdentifier(ctx context.Context, ownerAcc
 	}
 
 	if !isShared {
-		return fmt.Errorf("mailbox is not shared")
+		return ErrMailboxNotShared
 	}
 
 	if ownerDomain == nil || *ownerDomain == "" {
@@ -154,7 +164,7 @@ func (db *Database) GrantMailboxAccessByIdentifier(ctx context.Context, ownerAcc
 
 	// Enforce same-domain restriction
 	if *ownerDomain != granteeDomain {
-		return fmt.Errorf("cannot grant access to user from different domain (owner: %s, grantee: %s)", *ownerDomain, granteeDomain)
+		return fmt.Errorf("%w (owner: %s, grantee: %s)", ErrCrossDomainGrant, *ownerDomain, granteeDomain)
 	}
 
 	// Insert or update ACL
