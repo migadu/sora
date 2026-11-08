@@ -88,7 +88,12 @@ func (s *Session) closeForMaintenance() {
 	// and can wait for a stalled peer or for an existing Write's TLS mutex. The
 	// drain's pacing loop must not wait for any one session to finish that work.
 	time.AfterFunc(maintenanceCloseGrace, func() {
-		closeMaintenanceTransport(clientConn)
+		// Nothing half-closes the client side, so its tls.Close cannot wait on a
+		// CloseWrite holding the TLS writer: a plain Close is already bounded and
+		// still sends close_notify. The backend is the one that may be stuck.
+		if clientConn != nil {
+			_ = clientConn.Close()
+		}
 		closeMaintenanceTransport(backendConn)
 	})
 	go func() {
@@ -126,6 +131,10 @@ func closeMaintenanceTransport(conn net.Conn) {
 			return
 		}
 		unwrapped = true
+		if transport == nil {
+			_ = conn.Close()
+			return
+		}
 	}
 }
 
