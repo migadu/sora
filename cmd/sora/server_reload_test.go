@@ -1,6 +1,10 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -82,5 +86,92 @@ func TestServerReloadSaysNothingWhenEverythingChangedWasApplied(t *testing.T) {
 
 	if out := logs.String(); strings.Contains(out, "require restart") {
 		t.Errorf("a reload that changed only applied settings reported a restart:\n%s", out)
+	}
+}
+
+// Every setting in the table is one RestartRequiredChanges can name (a table name such
+// as "timeouts" would match nothing and so silence nothing), under a real server type.
+func TestReloadableServerSettingsAreRealKeys(t *testing.T) {
+	keys := config.ServerConfigKeys()
+	for typ, settings := range reloadableServerSettings {
+		probe := config.ServerConfig{Type: typ, Name: typ, Addr: ":1"}
+		if err := probe.Validate(); err != nil {
+			t.Errorf("%q is not a server type: %v", typ, err)
+		}
+		for _, setting := range settings {
+			if !slices.Contains(keys, setting) {
+				t.Errorf("%s: %q is not a setting of [[server]]", typ, setting)
+			}
+		}
+	}
+}
+
+// reloadConfigSources is where each type's ReloadConfig lives. These are the types
+// main.go registers for reload: every type but metrics, which has no ReloadConfig.
+var reloadConfigSources = map[string]string{
+	"imap":              "server/imap/server.go",
+	"pop3":              "server/pop3/server.go",
+	"managesieve":       "server/managesieve/server.go",
+	"lmtp":              "server/lmtp/server.go",
+	"imap_proxy":        "server/imapproxy/server.go",
+	"pop3_proxy":        "server/pop3proxy/server.go",
+	"managesieve_proxy": "server/managesieveproxy/server.go",
+	"lmtp_proxy":        "server/lmtpproxy/server.go",
+	"http_admin_api":    "server/adminapi/server.go",
+	"http_user_api":     "server/userapi/server.go",
+	"user_api_proxy":    "server/userapiproxy/server.go",
+}
+
+// reloadedSettingKeys maps the names a ReloadConfig appends to "reloaded" to their TOML
+// keys where the two differ: the timeouts and limits live in tables.
+var reloadedSettingKeys = map[string]string{
+	"command_timeout":          "timeouts.command_timeout",
+	"absolute_session_timeout": "timeouts.absolute_session_timeout",
+	"min_bytes_per_minute":     "timeouts.min_bytes_per_minute",
+	"session_memory_limit":     "limits.session_memory_limit",
+	"max_auth_errors":          "limits.max_auth_errors",
+}
+
+// Each list in reloadableServerSettings must be exactly what its ReloadConfig applies,
+// read off the names it appends to "reloaded" (each a string literal). A setting
+// applied but not listed would be reported as needing a restart it does not need; one
+// listed but no longer applied would go unreported. Every type that registers for
+// reload has an entry, since a type without one has every change reported.
+func TestReloadableServerSettingsMatchEachReloadConfig(t *testing.T) {
+	appended := regexp.MustCompile(`reloaded = append\(reloaded, "([a-z_]+)"\)`)
+	for typ, path := range reloadConfigSources {
+		src, err := os.ReadFile(filepath.Join("..", "..", path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var applies []string
+		for _, m := range appended.FindAllStringSubmatch(string(src), -1) {
+			key := m[1]
+			if tableKey, ok := reloadedSettingKeys[key]; ok {
+				key = tableKey
+			}
+			applies = append(applies, key)
+		}
+		if len(applies) == 0 {
+			t.Errorf("%s: no `reloaded = append(reloaded, \"...\")` found; has ReloadConfig changed shape?", path)
+			continue
+		}
+		slices.Sort(applies)
+		applies = slices.Compact(applies)
+
+		listed, ok := reloadableServerSettings[typ]
+		if !ok {
+			t.Errorf("no reloadable settings for %q, which registers for reload", typ)
+			continue
+		}
+		listed = slices.Sorted(slices.Values(listed))
+		if !slices.Equal(listed, applies) {
+			t.Errorf("%s: the table lists %v, ReloadConfig in %s applies %v", typ, listed, path, applies)
+		}
+	}
+	for typ := range reloadableServerSettings {
+		if _, ok := reloadConfigSources[typ]; !ok {
+			t.Errorf("%q is in the table but has no ReloadConfig source listed here", typ)
+		}
 	}
 }
