@@ -174,6 +174,8 @@ type SoraConn struct {
 	idleTimeout         time.Duration // Maximum idle time (e.g., 5 minutes)
 	absoluteTimeout     time.Duration // Maximum session duration (e.g., 30 minutes)
 	minBytesPerMinute   int64         // Minimum throughput (0 = disabled)
+	throughputWindow    time.Duration // Slowloris measurement window (see checkTimeouts)
+	throughputGrace     time.Duration // Session age before a window counts against the connection
 	lastActivity        time.Time
 	sessionStart        time.Time
 	lastThroughputCheck time.Time
@@ -223,6 +225,14 @@ type SoraConnConfig struct {
 	// ignored): for a caller whose protocol library owns that limit.
 	NoAbsoluteTimeout bool
 
+	// ThroughputWindow is the window the slowloris check samples a connection's
+	// throughput over, and ThroughputGrace the session age before a window counts
+	// against it (see checkTimeouts); 0 = one minute and two minutes. Production
+	// leaves both at their defaults; a test shortens them so a multi-minute
+	// measurement history runs in under a second.
+	ThroughputWindow time.Duration
+	ThroughputGrace  time.Duration
+
 	// OnTimeout is called before closing connection due to timeout.
 	// The reason will be one of: "idle", "slow_throughput", or "session_max".
 	// The handler should send a protocol-specific goodbye message and return quickly.
@@ -246,6 +256,12 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 	if config.Protocol == "" {
 		config.Protocol = "unknown"
 	}
+	if config.ThroughputWindow <= 0 {
+		config.ThroughputWindow = time.Minute
+	}
+	if config.ThroughputGrace <= 0 {
+		config.ThroughputGrace = 2 * time.Minute
+	}
 
 	sc := &SoraConn{
 		Conn:                conn,
@@ -253,6 +269,8 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 		idleTimeout:         config.IdleTimeout,
 		absoluteTimeout:     config.AbsoluteTimeout,
 		minBytesPerMinute:   config.MinBytesPerMinute,
+		throughputWindow:    config.ThroughputWindow,
+		throughputGrace:     config.ThroughputGrace,
 		lastActivity:        now,
 		sessionStart:        now,
 		lastThroughputCheck: now,
@@ -323,13 +341,13 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 	//   - no bytes either way: left to the idle timeout, count unchanged.
 	// Two consecutive stalled windows disconnect.
 	// Skipped while suspended (IMAP IDLE), where client silence is expected.
-	if c.minBytesPerMinute > 0 && throughputDuration >= time.Minute {
+	if c.minBytesPerMinute > 0 && throughputDuration >= c.throughputWindow {
 		if suspended {
 			// Throughput checking is suspended - skip check
 			return
 		}
 
-		if sessionDuration >= 2*time.Minute {
+		if sessionDuration >= c.throughputGrace {
 			bytesPerMinute := int64(float64(bytesRead+bytesWritten) / throughputDuration.Minutes())
 
 			c.mu.Lock()
