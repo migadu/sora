@@ -187,6 +187,7 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 
 	if reply.IsMime {
 		if err := writeVacationMIME(&vacationMessage, msgHeader, reply.Body); err != nil {
+			h.log("[VACATION] not sending: %v", err)
 			return err
 		}
 	} else {

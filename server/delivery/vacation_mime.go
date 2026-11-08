@@ -23,7 +23,7 @@ func writeVacationMIME(w io.Writer, header message.Header, reason string) error 
 	// charsets, transfer encodings and multipart boundaries need no conversion.
 	err = entity.Walk(func(path []int, part *message.Entity, parseErr error) error {
 		if len(path) > 64 {
-			return fmt.Errorf("vacation MIME nesting exceeds 64 parts")
+			return fmt.Errorf("vacation MIME nesting deeper than 64 levels")
 		}
 		if parseErr != nil && !message.IsUnknownCharset(parseErr) {
 			return parseErr
@@ -61,9 +61,11 @@ func writeVacationMIME(w io.Writer, header message.Header, reason string) error 
 		if !strings.HasPrefix(strings.ToLower(name), "content-") {
 			continue
 		}
+		// Copied values go on the wire as-is: only printable ASCII and HT, so a
+		// control byte or 8-bit octet cannot ride along in a header the reply sends.
 		for _, b := range []byte(value) {
-			if b >= 128 {
-				return fmt.Errorf("invalid non-ASCII vacation MIME header %s", name)
+			if (b < 0x20 && b != '\t') || b >= 0x7f {
+				return fmt.Errorf("invalid byte in vacation MIME header %s", name)
 			}
 		}
 		header.Add(name, value)

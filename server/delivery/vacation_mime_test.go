@@ -106,6 +106,8 @@ func TestVacationMIMEMalformedDoesNotSendOrConsumePeriod(t *testing.T) {
 		"Content-Type: multipart/mixed\r\n\r\nbody",
 		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nbody",
 		"Content-Type: text/plain\r\nContent-Type: text/html\r\n\r\nbody",
+		"Content-Type: text/plain\r\nContent-Description: a\x00b\r\n\r\nbody",
+		"Content-Type: text/plain\r\nContent-Description: caf\xc3\xa9\r\n\r\nbody",
 	} {
 		t.Run(reason, func(t *testing.T) {
 			q := &captureRelayQueue{}
