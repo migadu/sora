@@ -19,7 +19,6 @@ import (
 	"github.com/emersion/go-message/mail"
 
 	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-smtp"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -842,8 +841,13 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	}
 
 	// Classify and extract the final stored MIME once, after editheader, and
-	// reuse both results for every fileinto :copy destination.
-	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(fullMessageBytes))
+	// reuse both results for every fileinto :copy destination. The structure
+	// gets the same validation and fallback as APPEND's and the Admin API's:
+	// a stored structure that does not serialize panics the FETCH write path.
+	bodyStructureVal, bsErr := helpers.SafeBodyStructure(fullMessageBytes)
+	if bsErr != nil {
+		s.WarnLog("storing a fallback body structure", "error", bsErr)
+	}
 	bodyStructure := &bodyStructureVal
 	sieveFlags = db.WithAttachmentKeyword(sieveFlags, fullMessageBytes, true)
 
