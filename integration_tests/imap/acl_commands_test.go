@@ -752,7 +752,14 @@ func TestACL_ListRightsIndividualGroups(t *testing.T) {
 		t.Fatalf("Owner login failed: %v", err)
 	}
 
-	data, err := c1.ListRights("INBOX", imap.RightsIdentifier(email2)).Wait()
+	// Rights can only be granted on a shared mailbox; on INBOX LISTRIGHTS offers none.
+	sharedMailbox := fmt.Sprintf("Shared/TestLRGroups-%d", common.GetTimestamp())
+	if err := c1.Create(sharedMailbox, nil).Wait(); err != nil {
+		t.Fatalf("Failed to create shared mailbox: %v", err)
+	}
+	defer func() { c1.Delete(sharedMailbox).Wait() }()
+
+	data, err := c1.ListRights(sharedMailbox, imap.RightsIdentifier(email2)).Wait()
 	if err != nil {
 		t.Fatalf("LISTRIGHTS failed: %v", err)
 	}

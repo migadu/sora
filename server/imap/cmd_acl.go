@@ -480,8 +480,9 @@ func (s *IMAPSession) ListRights(ctx context.Context, mailbox string, identifier
 	// Verify the identifier. Special identifiers ("anyone") are valid without a
 	// backing account; any other identifier must resolve to an existing account.
 	identifierEmail := string(identifier)
+	isOwner := false
 	if !db.IsSpecialIdentifier(identifierEmail) {
-		_, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(readCtx, identifierEmail)
+		identifierAccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(readCtx, identifierEmail)
 		if err != nil {
 			if err == consts.ErrUserNotFound {
 				return nil, &imap.Error{
@@ -492,17 +493,29 @@ func (s *IMAPSession) ListRights(ctx context.Context, mailbox string, identifier
 			}
 			return nil, s.internalError("failed to get account ID for '%s': %v", identifierEmail, err)
 		}
+		isOwner = identifierAccountID == mbox.AccountID
 	}
 
-	// RFC 4314 §3.7: rights listed in the same string are "tied" — the server must
-	// grant them all or none. Sora grants every right independently, so each right
-	// is returned as its own single-character group rather than one bundled string
-	// (which would falsely advertise all 11 rights as an all-or-none unit). No
-	// rights are always-granted, so RequiredRights is empty. The go-imap wire layer
-	// adds the obsolete virtual c/d rights as their own groups.
-	optionalRights := make([]imap.RightSet, 0, len(db.AllACLRights))
-	for _, r := range db.AllACLRights {
-		optionalRights = append(optionalRights, imap.RightSet{imap.Right(r)})
+	// RFC 4314 §2: LISTRIGHTS tells a client what may be granted, and an
+	// implementation MAY force rights to always or never be granted to an identifier.
+	// The go-imap wire layer adds the obsolete virtual c/d rights as needed.
+	requiredRights := imap.RightSet{}
+	var optionalRights []imap.RightSet
+	switch {
+	case isOwner:
+		// The owner always holds every right (has_mailbox_right), whatever the ACL says.
+		requiredRights = stringToRightSet(db.AllACLRights)
+	case !mbox.IsShared:
+		// Only shared mailboxes carry grants; SETACL here answers NO [CANNOT].
+	default:
+		// RFC 4314 §3.7: rights listed in the same string are "tied" — the server
+		// must grant them all or none. Sora grants every right independently, so each
+		// right is returned as its own single-character group rather than one bundled
+		// string (which would falsely advertise all 11 rights as an all-or-none unit).
+		optionalRights = make([]imap.RightSet, 0, len(db.AllACLRights))
+		for _, r := range db.AllACLRights {
+			optionalRights = append(optionalRights, imap.RightSet{imap.Right(r)})
+		}
 	}
 
 	s.DebugLog("returning available rights", "identifier", identifierEmail, "mailbox", mailbox)
@@ -510,7 +523,7 @@ func (s *IMAPSession) ListRights(ctx context.Context, mailbox string, identifier
 	return &imap.ListRightsData{
 		Mailbox:        mailbox,
 		Identifier:     identifier,
-		RequiredRights: imap.RightSet{},
+		RequiredRights: requiredRights,
 		OptionalRights: optionalRights,
 	}, nil
 }

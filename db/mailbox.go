@@ -24,6 +24,7 @@ type DBMailbox struct {
 	UIDValidity uint32
 	Subscribed  bool
 	HasChildren bool
+	IsShared    bool   // In the shared namespace; only shared mailboxes carry ACL grants
 	Path        string // Hex-encoded path of ancestor IDs
 	SpecialUse  string // RFC 6154 special-use attribute (e.g. "\Sent"); empty if none
 	CreatedAt   time.Time
@@ -61,7 +62,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 	query := `
 		WITH accessible_mailboxes AS (
 			-- 1. All mailboxes owned by user (including shared mailboxes they created)
-			SELECT id, name, uid_validity, path, subscribed, special_use, created_at, updated_at, account_id
+			SELECT id, name, uid_validity, path, subscribed, special_use, created_at, updated_at, account_id, is_shared
 			FROM mailboxes
 			WHERE account_id = $1
 			  AND deleted_at IS NULL
@@ -69,7 +70,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			UNION
 
 			-- 2. Shared mailboxes where user has direct ACL access (must have at least 'l' lookup right)
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id, m.is_shared
 			FROM mailboxes m
 			INNER JOIN mailbox_acls acl ON m.id = acl.mailbox_id
 			WHERE m.is_shared = TRUE
@@ -80,7 +81,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			UNION
 
 			-- 3. Shared mailboxes with "anyone" access (same domain, must have 'l' right)
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id, m.is_shared
 			FROM mailboxes m
 			INNER JOIN mailbox_acls anyone_acl ON m.id = anyone_acl.mailbox_id
 			WHERE m.is_shared = TRUE
@@ -99,6 +100,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			-- match at-most-one, so no rows are duplicated.
 			(subs.mailbox_name IS NOT NULL) AS subscribed,
 			COALESCE(m.special_use, '') AS special_use, m.created_at, m.updated_at, m.account_id,
+			COALESCE(m.is_shared, FALSE) AS is_shared,
 			-- has_children: does a direct child exist? The child's direct-parent path is
 			-- its path minus the final 16-char ancestor segment, matched by equality so the
 			-- expression index idx_mailboxes_account_parent_path (migration 000038) applies.
@@ -132,7 +134,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 		var mailbox DBMailbox
 		var uidValidityInt64 int64
 
-		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID, &mailbox.HasChildren); err != nil {
+		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID, &mailbox.IsShared, &mailbox.HasChildren); err != nil {
 			return nil, err
 		}
 
@@ -170,11 +172,11 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, AccountID i
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT id, name, uid_validity, path,
 			EXISTS(SELECT 1 FROM subscriptions s WHERE s.account_id = $2 AND LOWER(s.mailbox_name) = LOWER(mailboxes.name)) AS subscribed,
-			COALESCE(special_use, ''), created_at, updated_at, account_id
+			COALESCE(special_use, ''), created_at, updated_at, account_id, COALESCE(is_shared, FALSE)
 		FROM mailboxes
 		WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
 	`, mailboxID, AccountID).Scan(
-		&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID,
+		&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID, &mailbox.IsShared,
 	)
 
 	if err != nil {
@@ -237,9 +239,9 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT id, name, uid_validity, path,
 			EXISTS(SELECT 1 FROM subscriptions s WHERE s.account_id = $1 AND LOWER(s.mailbox_name) = LOWER(sub.name)) AS subscribed,
-			COALESCE(special_use, ''), created_at, updated_at, account_id FROM (
+			COALESCE(special_use, ''), created_at, updated_at, account_id, COALESCE(is_shared, FALSE) FROM (
 			-- 1) Owned by user
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id, m.is_shared
 			FROM mailboxes m
 			WHERE m.account_id = $1 AND LOWER(m.name) = LOWER($2)
 			  AND m.deleted_at IS NULL
@@ -247,7 +249,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			UNION ALL
 
 			-- 2) Specifically shared to this user explicitly via ACL
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id, m.is_shared
 			FROM mailbox_acls acl
 			JOIN mailboxes m ON m.id = acl.mailbox_id
 			WHERE acl.account_id = $1
@@ -260,7 +262,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			UNION ALL
 
 			-- 3) Publicly shared within the same domain ('anyone' ACL)
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id, m.is_shared
 			FROM mailbox_acls anyone_acl
 			JOIN mailboxes m ON m.id = anyone_acl.mailbox_id
 			WHERE anyone_acl.identifier = 'anyone'
@@ -272,7 +274,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 			  AND m.deleted_at IS NULL
 		) sub
 		LIMIT 1
-	`, AccountID, name, ownerDomain).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
+	`, AccountID, name, ownerDomain).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID, &mailbox.IsShared)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
