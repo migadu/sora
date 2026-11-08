@@ -16,9 +16,8 @@ func TestValidateToken(t *testing.T) {
 	secret := "test-secret-key"
 
 	// Create a test server
-	server := &Server{
-		jwtSecret: secret,
-	}
+	server := &Server{}
+	server.settings.Store(&reloadableSettings{jwtSecret: secret})
 
 	tests := []struct {
 		name      string
@@ -129,9 +128,8 @@ func TestValidateToken(t *testing.T) {
 func TestExtractAndValidateToken(t *testing.T) {
 	secret := "test-secret-key"
 
-	server := &Server{
-		jwtSecret: secret,
-	}
+	server := &Server{}
+	server.settings.Store(&reloadableSettings{jwtSecret: secret})
 
 	// Create a valid token
 	validToken := func() string {
@@ -310,8 +308,8 @@ func TestNewServerValidation(t *testing.T) {
 				return
 			}
 
-			if server.jwtSecret != tt.opts.JWTSecret {
-				t.Errorf("Expected JWT secret %s, got %s", tt.opts.JWTSecret, server.jwtSecret)
+			if got := server.settings.Load().jwtSecret; got != tt.opts.JWTSecret {
+				t.Errorf("Expected JWT secret %s, got %s", tt.opts.JWTSecret, got)
 			}
 		})
 	}

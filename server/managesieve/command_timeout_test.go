@@ -111,7 +111,6 @@ func TestCommandContextAbortsCommand(t *testing.T) {
 		authenticated: true,
 		ctx:           context.Background(),
 		server: &ManageSieveServer{
-			maxScriptSize:       1024,
 			supportedExtensions: []string{"fileinto"},
 			commandTimeouts:     defaultCommandTimeouts(),
 		},

@@ -35,10 +35,9 @@ func TestRateLimitedLoginDisconnects(t *testing.T) {
 			FailureCount: 99,
 			BlockedUntil: time.Now().Add(time.Minute),
 		}},
-		insecureAuth:    true,
-		maxAuthErrors:   3,
-		authIdleTimeout: 5 * time.Second,
+		insecureAuth: true,
 	}
+	srv.settings.Store(&reloadableSettings{maxAuthErrors: 3, authIdleTimeout: 5 * time.Second})
 
 	client, remote := net.Pipe()
 	defer remote.Close()

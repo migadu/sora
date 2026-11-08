@@ -27,6 +27,7 @@ import (
 // Session represents an IMAP proxy session.
 type Session struct {
 	server                *Server
+	settings              *reloadableSettings // the server's settings when the session started (see reloadableSettings)
 	clientConn            net.Conn
 	backendConn           net.Conn // Reassigned on backend connect/error; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
 	backendReader         *bufio.Reader
@@ -79,6 +80,7 @@ func newSession(s *Server, conn net.Conn) *Session {
 
 	return &Session{
 		server:       s,
+		settings:     s.loadSettings(),
 		clientConn:   conn,
 		clientReader: bufio.NewReader(conn),
 		clientWriter: bufio.NewWriter(conn),
@@ -115,9 +117,9 @@ func (s *Session) handleConnection() {
 	}()
 
 	// Enforce absolute session timeout to prevent hung sessions from leaking
-	if s.server.absoluteSessionTimeout > 0 {
-		timeout := time.AfterFunc(s.server.absoluteSessionTimeout, func() {
-			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.server.absoluteSessionTimeout)
+	if s.settings.absoluteSessionTimeout > 0 {
+		timeout := time.AfterFunc(s.settings.absoluteSessionTimeout, func() {
+			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.settings.absoluteSessionTimeout)
 			s.cancel() // Force cancel context to unblock any stuck I/O
 		})
 		defer timeout.Stop()
@@ -145,8 +147,8 @@ func (s *Session) handleConnection() {
 	for !authenticated {
 		// Set a read deadline for the client command to prevent idle connections
 		// from sitting in the authentication phase forever.
-		if s.server.authIdleTimeout > 0 {
-			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.server.authIdleTimeout)); err != nil {
+		if s.settings.authIdleTimeout > 0 {
+			if err := s.clientConn.SetReadDeadline(time.Now().Add(s.settings.authIdleTimeout)); err != nil {
 				s.ErrorLog("Failed to set read deadline", "error", err)
 				return
 			}
@@ -556,7 +558,7 @@ func (s *Session) handleConnection() {
 
 	// Clear the read deadline once authenticated, as the connection will now be
 	// in proxy mode where idle is handled by the backend (e.g., IDLE command).
-	if s.server.authIdleTimeout > 0 {
+	if s.settings.authIdleTimeout > 0 {
 		if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 			s.WarnLog("failed to clear read deadline", "error", err)
 		}
@@ -612,7 +614,7 @@ func (s *Session) drainLiterals(args []string) error {
 func (s *Session) handleAuthError(response string) bool {
 	s.errorCount++
 	s.sendResponse(response)
-	if s.errorCount >= s.server.maxAuthErrors {
+	if s.errorCount >= s.settings.maxAuthErrors {
 		s.WarnLog("too many authentication errors, dropping connection")
 		// Send a final BYE message before closing.
 		s.sendResponse("* BYE Too many invalid commands")
@@ -680,7 +682,7 @@ func (s *Session) getLogger() *server.ProxySessionLogger {
 		Username:   s.username,
 		AccountID:  s.accountID,
 		SessionID:  s.sessionID,
-		Debug:      s.server.debug,
+		Debug:      s.server.loadSettings().debug,
 	}
 }
 
@@ -1370,7 +1372,8 @@ func (s *Session) connectToBackend() error {
 func (s *Session) authenticateToBackend() (string, error) {
 	// Authenticate to the backend using master credentials in a single step.
 	// SASL PLAIN format: [authz-id]\0authn-id\0password
-	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, string(s.server.masterSASLUsername), string(s.server.masterSASLPassword))
+	settings := s.server.loadSettings() // one copy of the credentials, however a reload replaces them meanwhile
+	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, string(settings.masterSASLUsername), string(settings.masterSASLPassword))
 	encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
 	// Set a deadline for the authentication process

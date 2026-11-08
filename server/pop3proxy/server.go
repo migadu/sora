@@ -30,31 +30,50 @@ import (
 	"github.com/migadu/go-pop3/pop3server"
 )
 
-type POP3ProxyServer struct {
-	name                   string // Server name for logging
-	addr                   string
-	hostname               string
-	rdb                    *resilient.ResilientDatabase
-	appCtx                 context.Context
-	cancel                 context.CancelFunc
-	tlsConfig              *tls.Config
-	masterUsername         string
-	masterPassword         string
-	masterSASLUsername     string
-	masterSASLPassword     string
-	connManager            *proxy.ConnectionManager
-	connTracker            *server.ConnectionTracker
-	wg                     sync.WaitGroup
-	enableAffinity         bool
-	authLimiter            server.AuthLimiter
-	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
-	remotelookupConfig     *config.RemoteLookupConfig
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after: a session takes the one its
+// protocol server was built with and keeps it, so it never mixes the values of two
+// reloads. Debug logging and the master SASL credentials are read afresh, per log
+// line and per backend login.
+type reloadableSettings struct {
+	maxAuthErrors          int // Maximum authentication errors before disconnection
 	authIdleTimeout        time.Duration
 	commandTimeout         time.Duration // Idle timeout
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput
-	remoteUseXCLIENT       bool          // Whether backend supports XCLIENT command for forwarding
-	remoteUseUTF8          bool          // Whether pool backends support POP3 UTF8; gates CAPA advertisement and the pre-auth UTF8 mirror
+	masterSASLUsername     string
+	masterSASLPassword     string
+	debug                  bool
+}
+
+// loadSettings returns the current settings. A server built without New (as tests
+// do) has none stored and reads as zero, as its fields did.
+func (s *POP3ProxyServer) loadSettings() *reloadableSettings {
+	if settings := s.settings.Load(); settings != nil {
+		return settings
+	}
+	return &reloadableSettings{}
+}
+
+type POP3ProxyServer struct {
+	name               string // Server name for logging
+	addr               string
+	hostname           string
+	rdb                *resilient.ResilientDatabase
+	appCtx             context.Context
+	cancel             context.CancelFunc
+	tlsConfig          *tls.Config
+	masterUsername     string
+	masterPassword     string
+	connManager        *proxy.ConnectionManager
+	connTracker        *server.ConnectionTracker
+	wg                 sync.WaitGroup
+	enableAffinity     bool
+	authLimiter        server.AuthLimiter
+	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
+	remotelookupConfig *config.RemoteLookupConfig
+	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
+	remoteUseUTF8      bool // Whether pool backends support POP3 UTF8; gates CAPA advertisement and the pre-auth UTF8 mirror
 
 	// Connection limiting
 	limiter *server.ConnectionLimiter
@@ -70,11 +89,10 @@ type POP3ProxyServer struct {
 	insecureAuth bool
 
 	// Debug logging
-	debug       bool
 	debugWriter io.Writer
 
-	// Authentication limits
-	maxAuthErrors int // Maximum authentication errors before disconnection
+	// The settings ReloadConfig replaces; see reloadableSettings.
+	settings atomic.Pointer[reloadableSettings]
 
 	// Active session tracking for graceful shutdown
 	activeSessionsMu sync.RWMutex
@@ -388,30 +406,32 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		cancel:                     serverCancel,
 		masterUsername:             options.MasterUsername,
 		masterPassword:             options.MasterPassword,
-		masterSASLUsername:         options.MasterSASLUsername,
-		masterSASLPassword:         options.MasterSASLPassword,
 		connManager:                connManager,
 		enableAffinity:             options.EnableAffinity,
 		authLimiter:                authLimiter,
 		trustedProxies:             options.TrustedProxies,
 		remotelookupConfig:         options.RemoteLookup,
-		authIdleTimeout:            options.AuthIdleTimeout,
-		commandTimeout:             options.CommandTimeout,
-		absoluteSessionTimeout:     options.AbsoluteSessionTimeout,
-		minBytesPerMinute:          options.MinBytesPerMinute,
 		remoteUseXCLIENT:           options.RemoteUseXCLIENT,
 		remoteUseUTF8:              options.RemoteUseUTF8,
 		limiter:                    limiter,
 		lookupCache:                lookupCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		listenBacklog:              listenBacklog,
-		maxAuthErrors:              options.MaxAuthErrors,
 		insecureAuth:               options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
-		debug:                      options.Debug,
 		debugWriter:                debugWriter,
 		activeSessions:             make(map[*POP3ProxySession]struct{}),
 		proxyReader:                proxyReader,
 	}
+	srv.settings.Store(&reloadableSettings{
+		maxAuthErrors:          options.MaxAuthErrors,
+		authIdleTimeout:        options.AuthIdleTimeout,
+		commandTimeout:         options.CommandTimeout,
+		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
+		minBytesPerMinute:      options.MinBytesPerMinute,
+		masterSASLUsername:     options.MasterSASLUsername,
+		masterSASLPassword:     options.MasterSASLPassword,
+		debug:                  options.Debug,
+	})
 
 	// Setup TLS: Three scenarios
 	// 1. Per-server TLS: cert files provided
@@ -457,12 +477,14 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 // SIGHUP-reloaded settings apply to new connections (existing connections keep
 // the snapshot they were accepted with).
 func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
+	settings := s.loadSettings()
+
 	// Build capabilities
 	var caps []pop3.Capability
 	caps = append(caps, pop3.Capability{Name: "AUTH-RESP-CODE"})
 	caps = append(caps, pop3.Capability{Name: "IMPLEMENTATION", Params: []string{"Sora-POP3-Proxy"}})
 
-	maxErrors := s.maxAuthErrors
+	maxErrors := settings.maxAuthErrors
 	if maxErrors <= 0 {
 		maxErrors = 10
 	}
@@ -485,10 +507,10 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 
 	opts := pop3server.Options{
 		TLSConfig:              s.tlsConfig,
-		IdleTimeout:            s.commandTimeout,
-		AuthIdleTimeout:        s.authIdleTimeout,
-		AbsoluteSessionTimeout: s.absoluteSessionTimeout,
-		CommandTimeout:         s.commandTimeout,
+		IdleTimeout:            settings.commandTimeout,
+		AuthIdleTimeout:        settings.authIdleTimeout,
+		AbsoluteSessionTimeout: settings.absoluteSessionTimeout,
+		CommandTimeout:         settings.commandTimeout,
 		InsecureAuth:           s.insecureAuth,
 		MaxLineLength:          1024,
 		MaxErrors:              maxErrors,
@@ -543,6 +565,7 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 
 			session := &POP3ProxySession{
 				server:      s,
+				settings:    settings,
 				clientConn:  netConn,
 				ctx:         sessionCtx,
 				cancel:      sessionCancel,
@@ -568,18 +591,19 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 	return pop3server.New(opts)
 }
 
-func (s *POP3ProxyServer) Start() error {
-	var listener net.Listener
-
-	// Configure SoraConn with timeout protection
-	connConfig := server.SoraConnConfig{
+// connConfig is the SoraConn configuration for a connection accepted now. The
+// listener asks for it at every accept, so the timeouts a reload changes reach the
+// connections accepted after it, as they reach the protocol server rebuilt for them.
+func (s *POP3ProxyServer) connConfig() server.SoraConnConfig {
+	settings := s.loadSettings()
+	return server.SoraConnConfig{
 		Protocol:             "pop3_proxy",
 		ServerName:           s.name,
 		Hostname:             s.hostname,
-		IdleTimeout:          s.commandTimeout,
-		AbsoluteTimeout:      s.absoluteSessionTimeout,
-		MinBytesPerMinute:    s.minBytesPerMinute,
-		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0,
+		IdleTimeout:          settings.commandTimeout,
+		AbsoluteTimeout:      settings.absoluteSessionTimeout,
+		MinBytesPerMinute:    settings.minBytesPerMinute,
+		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Send POP3 error response before closing
 			// RFC 1939 doesn't define specific timeout response codes, but [IN-USE] is commonly used
@@ -597,6 +621,10 @@ func (s *POP3ProxyServer) Start() error {
 			_, _ = fmt.Fprint(conn, message)
 		},
 	}
+}
+
+func (s *POP3ProxyServer) Start() error {
+	var listener net.Listener
 
 	// Create base TCP listener with custom backlog
 	tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -617,10 +645,10 @@ func (s *POP3ProxyServer) Start() error {
 
 	if s.tlsConfig != nil {
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
-		listener = server.NewSoraTLSListener(base, s.tlsConfig, connConfig)
+		listener = server.NewSoraTLSListenerFunc(base, s.tlsConfig, s.connConfig)
 	} else {
 		// Use SoraListener for non-TLS with timeout protection
-		listener = server.NewSoraListener(base, connConfig)
+		listener = server.NewSoraListenerFunc(base, s.connConfig)
 	}
 	defer listener.Close()
 
@@ -870,48 +898,50 @@ func (s *POP3ProxyServer) monitorActiveSessions() {
 // Called on SIGHUP. Only affects new connections; existing sessions keep old settings.
 func (s *POP3ProxyServer) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	next := *s.loadSettings()
 
 	// Update max auth errors
-	if newVal := cfg.GetMaxAuthErrors(); newVal != s.maxAuthErrors {
-		s.maxAuthErrors = newVal
+	if newVal := cfg.GetMaxAuthErrors(); newVal != next.maxAuthErrors {
+		next.maxAuthErrors = newVal
 		reloaded = append(reloaded, "max_auth_errors")
 	}
 
 	// Update timeouts (affect new connections only)
-	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != s.authIdleTimeout {
-		s.authIdleTimeout = timeout
+	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != next.authIdleTimeout {
+		next.authIdleTimeout = timeout
 		reloaded = append(reloaded, "auth_idle_timeout")
 	}
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != s.commandTimeout {
-		s.commandTimeout = timeout
+	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != s.absoluteSessionTimeout {
-		s.absoluteSessionTimeout = timeout
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
-	if bpm := cfg.GetMinBytesPerMinute(); bpm != s.minBytesPerMinute {
-		s.minBytesPerMinute = bpm
+	if bpm := cfg.GetMinBytesPerMinute(); bpm != next.minBytesPerMinute {
+		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
 
 	// Update master credentials
-	if cfg.MasterSASLUsername != s.masterSASLUsername {
-		s.masterSASLUsername = cfg.MasterSASLUsername
+	if cfg.MasterSASLUsername != next.masterSASLUsername {
+		next.masterSASLUsername = cfg.MasterSASLUsername
 		reloaded = append(reloaded, "master_sasl_username")
 	}
-	if cfg.MasterSASLPassword != s.masterSASLPassword {
-		s.masterSASLPassword = cfg.MasterSASLPassword
+	if cfg.MasterSASLPassword != next.masterSASLPassword {
+		next.masterSASLPassword = cfg.MasterSASLPassword
 		reloaded = append(reloaded, "master_sasl_password")
 	}
 
 	// Update debug flag
-	if cfg.Debug != s.debug {
-		s.debug = cfg.Debug
+	if cfg.Debug != next.debug {
+		next.debug = cfg.Debug
 		reloaded = append(reloaded, "debug")
 	}
 
 	if len(reloaded) > 0 {
+		s.settings.Store(&next)
 		// Rebuild the protocol server so new connections pick up the reloaded
 		// settings; existing connections keep the snapshot they started with.
 		s.pop3libServer.Store(s.buildLibServer())

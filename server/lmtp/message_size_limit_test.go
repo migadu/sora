@@ -59,9 +59,8 @@ func TestMessageSizeLimit_EnforcedCorrectly(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create a backend with the specified max message size
-			backend := &LMTPServerBackend{
-				maxMessageSize: tt.maxMessageSize,
-			}
+			backend := &LMTPServerBackend{}
+			backend.settings.Store(&reloadableSettings{maxMessageSize: tt.maxMessageSize})
 
 			// Create a mock LMTPSession
 			session := &LMTPSession{
@@ -74,7 +73,7 @@ func TestMessageSizeLimit_EnforcedCorrectly(t *testing.T) {
 
 			// Simulate the size limit check logic from Data() method
 			// Apply fallback if limit is 0 (matches production code)
-			limitToUse := session.backend.maxMessageSize
+			limitToUse := session.backend.settings.Load().maxMessageSize
 			if limitToUse <= 0 {
 				limitToUse = 50 * 1024 * 1024 // 50MB fallback
 			}
@@ -190,9 +189,8 @@ func TestMessageSizeLimit_LimitReaderBehavior(t *testing.T) {
 
 // TestMessageSizeLimit_ZeroUsesFallback tests that 0 triggers 50MB fallback limit
 func TestMessageSizeLimit_ZeroUsesFallback(t *testing.T) {
-	backend := &LMTPServerBackend{
-		maxMessageSize: 0, // 0 means use 50MB fallback
-	}
+	backend := &LMTPServerBackend{}
+	backend.settings.Store(&reloadableSettings{maxMessageSize: 0}) // 0 means use 50MB fallback
 
 	session := &LMTPSession{
 		backend: backend,
@@ -204,7 +202,7 @@ func TestMessageSizeLimit_ZeroUsesFallback(t *testing.T) {
 	reader := strings.NewReader(smallMessage)
 
 	// Simulate the check - should apply 50MB fallback when maxMessageSize is 0
-	limitToUse := session.backend.maxMessageSize
+	limitToUse := session.backend.settings.Load().maxMessageSize
 	if limitToUse <= 0 {
 		limitToUse = 50 * 1024 * 1024 // 50MB fallback
 	}
@@ -241,9 +239,9 @@ func TestMessageSizeLimit_DefaultValue(t *testing.T) {
 
 	expectedDefault := int64(50 * 1024 * 1024) // 50MB
 
-	backend := &LMTPServerBackend{
-		maxMessageSize: expectedDefault,
-	}
+	backend := &LMTPServerBackend{}
+	backend.settings.Store(&reloadableSettings{maxMessageSize: expectedDefault})
+	maxMessageSize := backend.settings.Load().maxMessageSize
 
 	// Verify the default allows messages up to 50MB
 	allowedSize := 50*1024*1024 - 1 // Just under 50MB
@@ -251,7 +249,7 @@ func TestMessageSizeLimit_DefaultValue(t *testing.T) {
 	reader := strings.NewReader(largeMessage)
 
 	var buf bytes.Buffer
-	limitedReader := io.LimitReader(reader, backend.maxMessageSize+1)
+	limitedReader := io.LimitReader(reader, maxMessageSize+1)
 
 	_, err := io.Copy(&buf, limitedReader)
 	if err != nil {
@@ -260,7 +258,7 @@ func TestMessageSizeLimit_DefaultValue(t *testing.T) {
 
 	// Should not exceed limit
 	var sizeError error
-	if backend.maxMessageSize > 0 && int64(buf.Len()) > backend.maxMessageSize {
+	if maxMessageSize > 0 && int64(buf.Len()) > maxMessageSize {
 		sizeError = &struct{ error }{error: io.EOF}
 	}
 
@@ -274,7 +272,7 @@ func TestMessageSizeLimit_DefaultValue(t *testing.T) {
 	reader2 := strings.NewReader(tooLargeMessage)
 
 	var buf2 bytes.Buffer
-	limitedReader2 := io.LimitReader(reader2, backend.maxMessageSize+1)
+	limitedReader2 := io.LimitReader(reader2, maxMessageSize+1)
 
 	_, err = io.Copy(&buf2, limitedReader2)
 	if err != nil {
@@ -283,7 +281,7 @@ func TestMessageSizeLimit_DefaultValue(t *testing.T) {
 
 	// Should exceed limit
 	var sizeError2 error
-	if backend.maxMessageSize > 0 && int64(buf2.Len()) > backend.maxMessageSize {
+	if maxMessageSize > 0 && int64(buf2.Len()) > maxMessageSize {
 		sizeError2 = &struct{ error }{error: io.EOF}
 	}
 

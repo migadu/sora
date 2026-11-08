@@ -313,7 +313,7 @@ func (s *Server) generateToken(email string, accountID int64, authEpoch int64) (
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString([]byte(s.jwtSecret))
+	tokenString, err := token.SignedString([]byte(s.settings.Load().jwtSecret))
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("failed to sign token: %w", err)
 	}
@@ -338,7 +338,7 @@ func (s *Server) validateToken(tokenString string) (*JWTClaims, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
-		return []byte(s.jwtSecret), nil
+		return []byte(s.settings.Load().jwtSecret), nil
 	}, opts...)
 
 	if err != nil {

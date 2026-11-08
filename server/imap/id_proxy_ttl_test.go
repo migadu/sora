@@ -52,6 +52,7 @@ func newTTLTestServer(t *testing.T, name string) (*IMAPServer, string, *syncLogB
 		activeConns: make(map[*imapserver.Conn]struct{}),
 		limiter:     serverPkg.NewConnectionLimiterWithTrustedNets("IMAP", 0, 0, []string{"127.0.0.0/8"}),
 	}
+	srv.settings.Store(&reloadableSettings{})
 	var golog syncLogBuffer
 	is := imapserver.New(&imapserver.Options{
 		NewSession:   srv.newSession,

@@ -285,6 +285,7 @@ func InitializeGlobalTimeoutScheduler(shardCount int) error {
 
 // Package-level helpers used by other files
 func registerConn(c *SoraConn) {
+	c.checked.Store(true)
 	globalScheduler.Register(c)
 }
 
