@@ -763,6 +763,8 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 		outcome := "unknown_pool"
 		if errors.Is(err, proxy.ErrNoDefaultPool) {
 			outcome = "no_default"
+		} else if errors.Is(err, proxy.ErrAmbiguousBackendPool) {
+			outcome = "ambiguous_pool"
 		}
 		metrics.ProxyPoolRoute.WithLabelValues("userapi", proxy.PoolRouteLabel(poolName, err), outcome).Inc()
 		logger.Error("User API Proxy: No backend pool for route - refusing to route elsewhere", "name", s.name, "user", email, "pool", poolName, "error", err)

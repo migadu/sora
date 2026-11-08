@@ -405,3 +405,42 @@ func TestUserAPIProxy_HostnamePoolBackendIsVerifiedByItsName(t *testing.T) {
 		t.Fatalf("hostname pool backend with a certificate for its name: status %d, want the backend's 418", code)
 	}
 }
+
+func TestUserAPIProxy_DNSCollisionNeverReachesAnotherPoolsBackend(t *testing.T) {
+	var hits atomic.Int32
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	b.Listener.Close()
+	b.Listener = ln
+	b.StartTLS()
+	t.Cleanup(b.Close)
+	caFile, otherCA := filepath.Join(t.TempDir(), "a.pem"), filepath.Join(t.TempDir(), "b.pem")
+	for file, cert := range map[string][]byte{caFile: b.Certificate().Raw, otherCA: selfSignedCert(t).Certificate[0]} {
+		if err := os.WriteFile(file, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	port := fmt.Sprint(ln.Addr().(*net.TCPAddr).Port)
+	for _, verify := range []bool{true, false} {
+		pools := []proxy.PoolSpec{
+			{Name: "a", Default: true, Backends: []string{net.JoinHostPort("127.0.0.1", port), net.JoinHostPort("::1", port)},
+				Settings: proxy.BackendSettings{TLS: true, TLSVerify: true, TLSCAFile: caFile}},
+			{Name: "b", Backends: []string{net.JoinHostPort("localhost", port)},
+				Settings: proxy.BackendSettings{TLS: true, TLSVerify: verify, TLSCAFile: otherCA}},
+		}
+		for _, lookup := range []*scriptedLookup{poolAnswer("b"), {info: &proxy.UserRoutingInfo{ServerAddress: net.JoinHostPort("localhost", port)}, result: proxy.AuthSuccess}} {
+			if code := login(newPoolsHTTPProxy(t, ServerOptions{Pools: pools}, lookup), `{"email":"user@example.com"}`); code != http.StatusServiceUnavailable {
+				t.Fatalf("ambiguous pool, verify=%v: status %d, want 503", verify, code)
+			}
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("ambiguous pools reached backend %d times", hits.Load())
+	}
+}

@@ -61,6 +61,10 @@ var (
 	// ErrRouteLookupFailed is returned when, with named pools, the routing lookup itself
 	// fails: there is no pool to route into, and the default pool is not a safe guess.
 	ErrRouteLookupFailed = errors.New("routing lookup failed")
+
+	// ErrAmbiguousBackendPool means DNS made independently configured pools share
+	// a destination. Neither its owner nor its TLS trust settings can be guessed.
+	ErrAmbiguousBackendPool = errors.New("backend belongs to multiple resolved pools")
 )
 
 // BackendSettings is the backend-leg configuration of one pool: how the proxy talks to a
@@ -125,6 +129,9 @@ func PoolRouteLabel(name string, err error) string {
 }
 
 func poolRouteOutcome(err error) string {
+	if errors.Is(err, ErrAmbiguousBackendPool) {
+		return "ambiguous_pool"
+	}
 	if errors.Is(err, ErrNoDefaultPool) {
 		return "no_default"
 	}

@@ -1429,6 +1429,9 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # too); a [[server]] remote_tls_ca_file covers only backends in no pool. A backend
 # configured by hostname is verified by that name, although it is dialed at an address
 # the name resolved to; a certificate issued for the address is accepted as well.
+# If DNS makes two pools share a host:port, both pools are refused until their
+# destinations are distinct again. This is checked on every DNS refresh, including
+# lookup pins, and cannot be bypassed by disabling certificate verification.
 #
 # ROLLOUT: deploy the [[pool]] config on every proxy BEFORE the lookup API starts
 # answering with "pool". A proxy still on remote_addrs ignores the field (with a
@@ -1466,7 +1469,7 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 #
 # The Admin API's /admin/proxy/backends lists each backend under its pool, and
 # sora_proxy_pool_route_total{protocol,pool,result} counts routes per pool
-# (result = routed | unknown_pool | no_default).
+# (result = routed | unknown_pool | no_default | ambiguous_pool).
 
 
 # IMAP PROXY EXAMPLE

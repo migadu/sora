@@ -136,6 +136,11 @@ type ConnectionManager struct {
 	// resolvedHosts is, per configured address, the pool entries its last successful
 	// resolution produced, so a failed re-resolution can keep them. Guarded by healthMu.
 	resolvedHosts map[string][]string
+	// DNS may alias distinct configured names into the same host:port. Affected
+	// named pools and all their addresses are refused until the overlap clears.
+	// Both maps are rebuilt with resolvedHosts under healthMu.
+	poolErrors    map[string]error
+	backendErrors map[string]error
 
 	// resolvedAt is when the pool was last resolved (UnixNano, 0 = never), and resolving
 	// is held for the duration of a re-resolution so that concurrent logins cost one DNS
@@ -246,6 +251,9 @@ var (
 // connected to whatever name the route used for it, and nothing is dialed before the
 // maintenance list was read.
 func (cm *ConnectionManager) RefuseMaintenanceDial(_, address string, _ syscall.RawConn) error {
+	if err := cm.backendPoolError(address); err != nil {
+		return err
+	}
 	if !cm.MaintenanceLoaded() {
 		return errMaintenanceNotLoaded
 	}
@@ -272,6 +280,10 @@ func (cm *ConnectionManager) SetRestrictRemoteLookupToPool(v bool) {
 // refusal is logged here so every call site (DetermineRoute and the User API proxy, which
 // does not use DetermineRoute) reports it consistently.
 func (cm *ConnectionManager) AllowRemoteLookupBackend(addr string) bool {
+	if err := cm.backendPoolError(addr); err != nil {
+		logger.Error("refusing ambiguous backend pool", "server", cm.serverName, "backend", addr, "error", err)
+		return false
+	}
 	if !cm.restrictRemoteLookupToPool {
 		return true
 	}
@@ -472,13 +484,25 @@ func (cm *ConnectionManager) poolByName(name string) (*backendPool, error) {
 		if cm.defaultPool == nil {
 			return nil, ErrNoDefaultPool
 		}
-		return cm.defaultPool, nil
+		name = cm.defaultPool.name
 	}
 	p, ok := cm.poolsByName[name]
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownPool, name)
 	}
+	cm.healthMu.RLock()
+	err := cm.poolErrors[name]
+	cm.healthMu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
 	return p, nil
+}
+
+func (cm *ConnectionManager) backendPoolError(addr string) error {
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+	return cm.backendErrors[normalizeHostPort(addr, cm.remotePort)]
 }
 
 // poolForRoute is poolByName for the pool a route's info names.
@@ -508,6 +532,9 @@ func (cm *ConnectionManager) PoolOfBackend(addr string) string {
 	target := normalizeHostPort(addr, cm.remotePort)
 	cm.healthMu.RLock()
 	defer cm.healthMu.RUnlock()
+	if cm.backendErrors[target] != nil {
+		return ""
+	}
 	for _, p := range cm.pools {
 		for _, a := range p.configured {
 			if normalizeHostPort(a, cm.remotePort) == target {
@@ -1131,6 +1158,13 @@ func loadCAFile(path string) (*x509.CertPool, error) {
 //     so a backend whose certificate names only its address keeps working as before.
 func (cm *ConnectionManager) BackendClientTLS(verify bool, addr string) *tls.Config {
 	cfg := cm.backendTLSConfig(verify)
+	if err := cm.backendPoolError(addr); err != nil {
+		// Also guard STARTTLS and callers that already hold a TCP connection.
+		// Disabling certificate verification must not disable pool isolation.
+		cfg.InsecureSkipVerify = true
+		cfg.VerifyConnection = func(tls.ConnectionState) error { return err }
+		return cfg
+	}
 	if name := cm.PoolOfBackend(addr); name != "" {
 		cfg.RootCAs = cm.poolsByName[name].rootCAs
 	}
@@ -1239,6 +1273,9 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 	cm.refreshResolvedAddrsIfStale()
 
 	if preferredAddr != "" {
+		if err := cm.backendPoolError(preferredAddr); err != nil {
+			return nil, "", err
+		}
 		conn, addr, err, fallback := cm.tryPreferredAddress(ctx, preferredAddr, clientIP, clientPort, serverIP, serverPort, routingInfo)
 		if !fallback {
 			// If no fallback is needed, we either succeeded or had a hard failure.
@@ -1294,6 +1331,9 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		if errors.Is(err, errBackendInMaintenance) {
 			inMaintenance++ // resolved to an address in maintenance
 			continue
+		}
+		if errors.Is(err, ErrAmbiguousBackendPool) {
+			return nil, "", err
 		}
 
 		// Record failure in health tracking only if the caller's context is still live.
@@ -1367,6 +1407,9 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 
 	// Attempt to dial the preferred address.
 	conn, err = cm.dialWithProxy(ctx, preferredAddr, clientIP, clientPort, serverIP, serverPort, routingInfo)
+	if errors.Is(err, ErrAmbiguousBackendPool) {
+		return nil, "", err, false
+	}
 	if errors.Is(err, errBackendInMaintenance) {
 		// The name resolved to an address in maintenance: as above, not a failure.
 		logger.Debug("ConnectionManager: Preferred backend resolves to an address in maintenance. Falling back to round-robin.", "backend", preferredAddr, "server", cm.serverName)
@@ -1419,7 +1462,15 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 func (cm *ConnectionManager) ResolveAddresses() error {
 	logger.Info("ConnectionManager: Starting address resolution", "server", cm.serverName, "configured_backends", len(cm.configuredAddrs))
 	cm.resolveAddresses()
-	return nil
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+	var errs []error
+	for _, p := range cm.pools {
+		if err := cm.poolErrors[p.name]; err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // DefaultResolveRefreshInterval is how long a resolved pool is used before the next
@@ -1510,14 +1561,12 @@ func (cm *ConnectionManager) installResolvedAddrs(resolvedAddrs []string, resolv
 	defer cm.resolvedAt.Store(time.Now().UnixNano())
 
 	cm.resolvedHosts = resolvedHosts
+	cm.installPoolsLocked(resolvedHosts)
 
 	if slices.Equal(cm.remoteAddrs, resolvedAddrs) {
 		logger.Debug("ConnectionManager: Address resolution unchanged", "server", cm.serverName, "backends", len(resolvedAddrs))
-		// The union is unchanged, but an address can still have moved from one pool's
-		// name to another's: rebuild the pools (health carries over by address).
-		for _, p := range cm.pools {
-			p.install(resolvedHosts)
-		}
+		// Membership and ownership checks were rebuilt even though the union stayed
+		// unchanged: addresses can have moved between pools, or begun to overlap.
 		return
 	}
 
@@ -1537,12 +1586,40 @@ func (cm *ConnectionManager) installResolvedAddrs(resolvedAddrs []string, resolv
 
 	cm.remoteAddrs = resolvedAddrs
 	cm.backendHealth = newBackendHealth
+}
 
-	// Rebuild every pool's member list and hash ring from the resolution. This is
-	// critical: a ring left with the old hostnames while backendHealth holds IP
-	// addresses would make IsBackendHealthy() fail for every member.
+// installPoolsLocked publishes membership and its ownership checks together. Retaining
+// both colliding pools as usable would let PoolOfBackend pick the first pool's CA and
+// configuredHostnamesOf accept the other pool's names. Refuse the affected pools,
+// including their configured aliases and cached pins; unrelated pools remain available.
+func (cm *ConnectionManager) installPoolsLocked(resolvedHosts map[string][]string) {
+	cm.poolErrors = make(map[string]error)
+	cm.backendErrors = make(map[string]error)
+	owners := make(map[string]string)
 	for _, p := range cm.pools {
 		p.install(resolvedHosts)
+		if !p.named {
+			continue
+		}
+		for _, addr := range p.resolved {
+			if owner, exists := owners[addr]; exists && owner != p.name {
+				err := fmt.Errorf("%w: %s is in %q and %q", ErrAmbiguousBackendPool, addr, owner, p.name)
+				cm.poolErrors[owner], cm.poolErrors[p.name] = err, err
+				logger.Error("ConnectionManager: refusing overlapping backend pools", "server", cm.serverName, "error", err)
+			} else {
+				owners[addr] = p.name
+			}
+		}
+	}
+	for _, p := range cm.pools {
+		if err := cm.poolErrors[p.name]; err != nil {
+			for _, addr := range p.configured {
+				cm.backendErrors[addr] = err
+			}
+			for _, addr := range p.resolved {
+				cm.backendErrors[addr] = err
+			}
+		}
 	}
 }
 
