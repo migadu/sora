@@ -107,6 +107,16 @@ func (h *throughputHarness) closed() bool {
 	return h.conn.closed
 }
 
+// Timeout notification and transport closure run outside the scheduler. Wait for
+// the observable closure before asserting a timeout's final state.
+func (h *throughputHarness) waitClosed() bool {
+	deadline := time.Now().Add(time.Second)
+	for !h.closed() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	return h.closed()
+}
+
 func (h *throughputHarness) timeoutReasons() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -144,7 +154,7 @@ func TestSoraConnThroughput_TrickledPartialCommandIsDisconnected(t *testing.T) {
 	}
 	h.clientSends([]byte("2 NO"))
 	h.tick()
-	if !h.closed() {
+	if !h.waitClosed() {
 		t.Fatal("two consecutive stalled windows must disconnect")
 	}
 	if got := h.timeoutReasons(); len(got) != 1 || got[0] != "slow_throughput" {
@@ -168,7 +178,7 @@ func TestSoraConnThroughput_ResponseResetsStallCount(t *testing.T) {
 	}
 	h.clientSends([]byte("3"))
 	h.tick()
-	if !h.closed() {
+	if !h.waitClosed() {
 		t.Fatal("two consecutive stalled windows after the reset must disconnect")
 	}
 }
@@ -196,7 +206,7 @@ func TestSoraConnThroughput_SilentWindowDoesNotResetStallCount(t *testing.T) {
 	h.tick() // silent
 	h.clientSends([]byte("2"))
 	h.tick()
-	if !h.closed() {
+	if !h.waitClosed() {
 		t.Fatal("stall, silence, stall must disconnect: no command ever completed")
 	}
 }
