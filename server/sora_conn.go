@@ -208,11 +208,15 @@ type SoraConnConfig struct {
 	ServerName           string        // Server name for metrics
 	Hostname             string        // Hostname for metrics
 	IdleTimeout          time.Duration // 0 = no idle timeout
-	AbsoluteTimeout      time.Duration // 0 = no absolute timeout
+	AbsoluteTimeout      time.Duration // 0 = the 30m default, unless NoAbsoluteTimeout
 	MinBytesPerMinute    int64         // 0 = no throughput checking
 	InitialJA4           string        // Pre-captured JA4 fingerprint
 	InitialProxyInfo     *ProxyProtocolInfo
 	EnableTimeoutChecker bool // If false, caller must handle timeouts
+
+	// NoAbsoluteTimeout has the checker enforce no session limit (AbsoluteTimeout is
+	// ignored): for a caller whose protocol library owns that limit.
+	NoAbsoluteTimeout bool
 
 	// OnTimeout is called before closing connection due to timeout.
 	// The reason will be one of: "idle", "slow_throughput", or "session_max".
@@ -227,7 +231,9 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 	now := time.Now()
 
 	// Apply defaults (MinBytesPerMinute default is protocol-specific, set by caller)
-	if config.AbsoluteTimeout == 0 {
+	if config.NoAbsoluteTimeout {
+		config.AbsoluteTimeout = 0
+	} else if config.AbsoluteTimeout == 0 {
 		config.AbsoluteTimeout = 30 * time.Minute // Default: 30 minutes
 	}
 	if config.Protocol == "" {

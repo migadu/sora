@@ -155,7 +155,7 @@ type ManageSieveServerOptions struct {
 	AuthIdleTimeout             time.Duration             // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	CommandTimeout              time.Duration             // Maximum idle time before disconnection
 	CommandTimeoutOverrides     map[string]time.Duration  // Per-command hard execution timeouts (overrides defaults)
-	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = use default 30m)
+	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = no limit; go-managesieve enforces it)
 	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
 	Config                      *config.Config            // Full config for shared settings like connection tracking timeouts
 }
@@ -561,6 +561,7 @@ func (s *ManageSieveServer) connConfig() serverPkg.SoraConnConfig {
 		Hostname:             s.hostname,
 		MinBytesPerMinute:    settings.minBytesPerMinute,
 		EnableTimeoutChecker: settings.minBytesPerMinute > 0,
+		NoAbsoluteTimeout:    true, // the library enforces absolute_session_timeout
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Best-effort BYE before closing (RFC 5804 Section 1.3); TRYLATER
 			// indicates a temporary condition.
