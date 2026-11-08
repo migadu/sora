@@ -21,6 +21,16 @@
 //   - Affinity method (consistent hash or round robin)
 //   - User identity for session persistence
 //
+// # Named Pools
+//
+// A manager built with NewConnectionManagerWithPools routes by named backend pools
+// ([[pool]] blocks): the remote-lookup answer names a pool, and affinity, consistent
+// hashing and round-robin are all confined to that pool's members. A flat remote_addrs
+// list is one unnamed default pool, so both kinds of manager take the same routing
+// path. A route that names a pool the manager lacks, or names none where no pool is
+// the default, is an error (ErrUnknownPool, ErrNoDefaultPool) the proxy turns into a
+// temporary failure; it is never spilled into another pool's backends.
+//
 // # Affinity Methods
 //
 // Consistent Hashing:

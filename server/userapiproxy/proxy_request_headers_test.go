@@ -51,7 +51,7 @@ func TestProxyRequestForwardsOriginalHost(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 
-	s.proxyRequest(w, r, backendAddr)
+	s.proxyRequest(w, r, backendRoute{addr: backendAddr})
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("backend not reached: status %d, body %q", w.Code, w.Body.String())

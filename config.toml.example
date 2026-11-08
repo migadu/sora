@@ -1394,6 +1394,66 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # timeouts.managesieve_command_timeouts.havespace    = "10s"  # HAVESPACE (default: 10s)
 
 
+# NAMED BACKEND POOLS
+# =============================================================================
+# Group backend hosts into named pools, declared ONCE per node and shared by every
+# proxy server below. The remote_lookup API then names a pool instead of a host:
+#   {"address": "user@example.com", "password_hash": "...", "pool": "sora1"}
+# and the proxy picks a member with the same affinity -> consistent-hash -> round-robin
+# logic it applies to remote_addrs, confined to that pool. A one-member pool behaves
+# like an explicit "server". An answer with "server" keeps its meaning (a hard pin;
+# "pool" is then ignored), so the API can switch users over one by one.
+#
+# With pools, a proxy server MUST NOT list remote_addrs. Each pool repeats the full set
+# of backend-leg settings for its hosts; nothing is inherited from the [[server]] that
+# dials them. A backend without a port gets the dialing proxy's remote_port, so one
+# block serves the IMAP, POP3, ManageSieve, LMTP and User API proxies alike (give a
+# backend its own port only when the pool is used by a single protocol).
+#
+# There is no default pool unless one block says default = true: that is where an
+# auth-only answer (no "server", no "pool") and a user found through lookup_local_users
+# are routed. Without a default such an answer is refused with a temporary failure
+# (IMAP NO [UNAVAILABLE], POP3 -ERR [SYS/TEMP], ManageSieve NO, LMTP 451) and logged,
+# never sent to another pool. The same happens for a pool name this proxy lacks.
+#
+# ROLLOUT: deploy the [[pool]] config on every proxy BEFORE the lookup API starts
+# answering with "pool". A proxy still on remote_addrs ignores the field (with a
+# warning) and routes the user into remote_addrs. Keep default = true on the old pool
+# until the API names a pool for every user, then drop it.
+#
+# [[pool]]
+# name = "sora0"
+# backends = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"]
+# default = true                        # transitional: where answers without a pool go
+# remote_use_proxy_protocol = true
+# remote_use_id_command = true          # IMAP: forward the client IP via ID
+# remote_use_xclient = true             # POP3/LMTP: forward the client IP via XCLIENT
+# remote_use_utf8 = true                # POP3: sora backends only
+# remote_tls = false
+# remote_tls_use_starttls = false       # LMTP/ManageSieve only
+# remote_tls_verify = true
+#
+# [[pool]]
+# name = "sora1"
+# backends = ["10.0.1.1", "10.0.1.2"]
+# remote_use_proxy_protocol = true
+# remote_use_id_command = true
+# remote_use_xclient = true
+# remote_use_utf8 = true
+#
+# [[pool]]
+# name = "dovecot1"
+# backends = ["10.0.2.1"]
+# remote_use_proxy_protocol = true
+# remote_use_id_command = true
+# remote_use_xclient = true
+# remote_use_utf8 = false               # Dovecot rejects the POP3 UTF8 command
+#
+# The Admin API's /admin/proxy/backends lists each backend under its pool, and
+# sora_proxy_pool_route_total{protocol,pool,result} counts routes per pool
+# (result = routed | unknown_pool | no_default).
+
+
 # IMAP PROXY EXAMPLE
 # =============================================================================
 # Proxy IMAP connections across multiple backend servers with load balancing

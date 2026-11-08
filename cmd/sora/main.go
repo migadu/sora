@@ -483,6 +483,13 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		}
 	}
 
+	// Named backend pools are validated as a whole: the checks cross the [[pool]] blocks
+	// and the proxy servers that route into them.
+	if err := cfg.ValidatePools(); err != nil {
+		errorHandler.ValidationError("[[pool]]", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
 	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
 	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
 	if missing := cfg.ProxyProtocolListenersMissingTrust(); len(missing) > 0 {
@@ -1841,6 +1848,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		Name:                     serverConfig.Name,
 		Addr:                     serverConfig.Addr,
 		RemoteAddrs:              serverConfig.RemoteAddrs,
+		Pools:                    proxy.PoolSpecsFromConfig(deps.config.Pools),
 		RemotePort:               remotePort,
 		MasterUsername:           serverConfig.MasterUsername,
 		MasterPassword:           serverConfig.MasterPassword,
@@ -1975,6 +1983,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	server, err := pop3proxy.New(ctx, deps.hostname, serverConfig.Addr, deps.resilientDB, pop3proxy.POP3ProxyServerOptions{
 		Name:                     serverConfig.Name,
 		RemoteAddrs:              serverConfig.RemoteAddrs,
+		Pools:                    proxy.PoolSpecsFromConfig(deps.config.Pools),
 		RemotePort:               remotePort,
 		MasterUsername:           serverConfig.MasterUsername,
 		MasterPassword:           serverConfig.MasterPassword,
@@ -2107,6 +2116,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		Name:                     serverConfig.Name,
 		Addr:                     serverConfig.Addr,
 		RemoteAddrs:              serverConfig.RemoteAddrs,
+		Pools:                    proxy.PoolSpecsFromConfig(deps.config.Pools),
 		RemotePort:               remotePort,
 		InsecureAuth:             serverConfig.InsecureAuth || !serverConfig.TLS, // Ignored when TLS not configured
 		MasterUsername:           serverConfig.MasterUsername,
@@ -2246,6 +2256,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		Name:                     serverConfig.Name,
 		Addr:                     serverConfig.Addr,
 		RemoteAddrs:              serverConfig.RemoteAddrs,
+		Pools:                    proxy.PoolSpecsFromConfig(deps.config.Pools),
 		RemotePort:               remotePort,
 		TLS:                      serverConfig.TLS,
 		TLSUseStartTLS:           serverConfig.TLSUseStartTLS,
@@ -2358,11 +2369,26 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		"managesieve_proxy": "managesieve",
 	}
 	for _, srv := range deps.config.DynamicServers {
-		if !srv.IsEnabled() || len(srv.RemoteAddrs) == 0 {
+		if !srv.IsEnabled() {
 			continue
 		}
-		if protocol, ok := proxyProtocolByType[srv.Type]; ok {
-			validBackends[protocol] = append(validBackends[protocol], srv.RemoteAddrs...)
+		protocol, ok := proxyProtocolByType[srv.Type]
+		if !ok {
+			continue
+		}
+		validBackends[protocol] = append(validBackends[protocol], srv.RemoteAddrs...)
+		// Named pools: every member of every pool, with this proxy's port, as the
+		// connection manager keys them.
+		if deps.config.HasPools() {
+			port, err := srv.GetRemotePort()
+			if err != nil {
+				port = 0
+			}
+			for _, pool := range deps.config.Pools {
+				for _, backend := range pool.Backends {
+					validBackends[protocol] = append(validBackends[protocol], proxy.NormalizeBackendAddr(backend, port))
+				}
+			}
 		}
 	}
 
@@ -2513,6 +2539,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		Name:                     serverConfig.Name,
 		Addr:                     serverConfig.Addr,
 		RemoteAddrs:              serverConfig.RemoteAddrs,
+		Pools:                    proxy.PoolSpecsFromConfig(deps.config.Pools),
 		RemotePort:               remotePort,
 		JWTSecret:                serverConfig.JWTSecret,
 		TLS:                      serverConfig.TLS,

@@ -146,7 +146,8 @@ type POP3ProxyServerOptions struct {
 	TLSVerify                bool
 	TLSConfig                *tls.Config // Global TLS config from TLS manager (optional)
 	RemoteAddrs              []string
-	RemotePort               int // Default port for backends if not in address
+	Pools                    []proxy.PoolSpec // Named backend pools ([[pool]] blocks); when set, RemoteAddrs is unused and each pool brings its own backend-leg settings
+	RemotePort               int              // Default port for backends if not in address
 	RemoteTLS                bool
 	RemoteTLSVerify          bool
 	RemoteTLSCAFile          string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
@@ -227,18 +228,16 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	}
 
 	// Create connection manager with routing
-	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(
-		options.RemoteAddrs,
-		options.RemotePort,
-		options.RemoteTLS,
-		false,
-		options.RemoteTLSVerify,
-		options.RemoteUseProxyProtocol,
-		connectTimeout,
-		routingLookup,
-		options.Name,
-		!options.EnableBackendHealthCheck,
-	)
+	connManager, err := proxy.NewConnectionManagerFromOptions(proxy.ManagerOptions{
+		Pools:              options.Pools,
+		RemoteAddrs:        options.RemoteAddrs,
+		RemotePort:         options.RemotePort,
+		Settings:           proxy.BackendSettings{TLS: options.RemoteTLS, TLSVerify: options.RemoteTLSVerify, UseProxyProtocol: options.RemoteUseProxyProtocol},
+		ConnectTimeout:     connectTimeout,
+		RoutingLookup:      routingLookup,
+		ServerName:         options.Name,
+		DisableHealthCheck: !options.EnableBackendHealthCheck,
+	})
 	if err != nil {
 		if routingLookup != nil {
 			routingLookup.Close()

@@ -1241,6 +1241,10 @@ type Config struct {
 
 	// Dynamic server instances (top-level array)
 	DynamicServers []ServerConfig `toml:"server"`
+
+	// Pools are the named backend groups ([[pool]] blocks) every proxy server on this node
+	// routes into; see PoolConfig. Empty = each proxy uses its own remote_addrs.
+	Pools []PoolConfig `toml:"pool"`
 }
 
 // GetBcryptCost returns the configured bcrypt cost for password hashing, clamped to

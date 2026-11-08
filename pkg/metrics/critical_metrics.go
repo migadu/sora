@@ -245,6 +245,14 @@ var (
 		[]string{"protocol", "method"}, // e.g., protocol="imap", method="remotelookup"
 	)
 
+	ProxyPoolRoute = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_proxy_pool_route_total",
+			Help: "Routing decisions by named backend pool: routed into the pool, the named pool is unknown to this proxy, or no pool was named and none is the default.",
+		},
+		[]string{"protocol", "pool", "result"}, // result: routed/unknown_pool/no_default
+	)
+
 	RemoteLookupResult = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "sora_remote_lookup_result_total",

@@ -14,12 +14,12 @@ func TestConnectionManager_ConsistentHashInitialization(t *testing.T) {
 		t.Fatalf("Failed to create connection manager: %v", err)
 	}
 
-	if cm.consistentHash == nil {
+	if cm.defaultPool.ring == nil {
 		t.Fatal("Consistent hash should be initialized")
 	}
 
-	if cm.consistentHash.Size() != len(backends) {
-		t.Errorf("Expected %d backends in ring, got %d", len(backends), cm.consistentHash.Size())
+	if cm.defaultPool.ring.Size() != len(backends) {
+		t.Errorf("Expected %d backends in ring, got %d", len(backends), cm.defaultPool.ring.Size())
 	}
 }
 

@@ -6,7 +6,9 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 )
 
@@ -45,7 +47,92 @@ var (
 	// ErrRemoteLookupInvalidResponse represents an invalid 2xx response (malformed JSON, missing required fields)
 	// This is a server bug - should fail hard, no fallback
 	ErrRemoteLookupInvalidResponse = errors.New("remotelookup invalid response")
+
+	// ErrUnknownPool is returned when a route names a pool this proxy does not have:
+	// a lookup answer for a pool the proxy's config lacks (rollout skew, a typo in
+	// the API). The connection fails; it is never spilled into another pool.
+	ErrUnknownPool = errors.New("backend pool is not configured on this proxy")
+
+	// ErrNoDefaultPool is returned when a route carries no pool name and the proxy has no
+	// pool marked default: an auth-only lookup answer, or a locally found user, on a proxy
+	// whose lookup API is expected to name a pool for everyone.
+	ErrNoDefaultPool = errors.New("route names no pool and no pool is marked default")
 )
+
+// BackendSettings is the backend-leg configuration of one pool: how the proxy talks to a
+// member once it has picked one. A named pool carries its own (config.PoolConfig); the
+// unnamed pool a flat remote_addrs list becomes uses the proxy server's.
+type BackendSettings struct {
+	TLS              bool
+	TLSUseStartTLS   bool // LMTP/ManageSieve only
+	TLSVerify        bool
+	UseProxyProtocol bool
+	UseIDCommand     bool // IMAP only
+	UseXCLIENT       bool // POP3/LMTP only
+	UseUTF8          bool // POP3 only
+}
+
+// PoolSpec is one named backend pool as a proxy server hands it to the connection
+// manager. Backends may omit the port; the manager completes them with the proxy's
+// remote_port, so one spec serves proxies of every protocol.
+type PoolSpec struct {
+	Name     string
+	Backends []string
+	Default  bool
+	Settings BackendSettings
+}
+
+// NormalizeBackendAddr canonicalizes a backend address and completes a missing port with
+// defaultPort, the way the connection manager keys its pool members.
+func NormalizeBackendAddr(addr string, defaultPort int) string {
+	return normalizeHostPort(addr, defaultPort)
+}
+
+// ManagerOptions is what a proxy server hands over to build its connection manager: the
+// named pools when the config declares [[pool]] blocks, else the flat remote_addrs list
+// with the server's own backend-leg settings.
+type ManagerOptions struct {
+	Pools              []PoolSpec
+	RemoteAddrs        []string
+	RemotePort         int
+	Settings           BackendSettings // flat-list settings; unused with Pools
+	ConnectTimeout     time.Duration
+	RoutingLookup      UserRoutingLookup
+	ServerName         string
+	DisableHealthCheck bool
+}
+
+// NewConnectionManagerFromOptions builds a pool-routing manager when Pools is set and a
+// flat-list one otherwise.
+func NewConnectionManagerFromOptions(o ManagerOptions) (*ConnectionManager, error) {
+	if len(o.Pools) > 0 {
+		return NewConnectionManagerWithPools(o.Pools, o.RemotePort, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+	}
+	return NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(o.RemoteAddrs, o.RemotePort, o.Settings.TLS, o.Settings.TLSUseStartTLS, o.Settings.TLSVerify, o.Settings.UseProxyProtocol, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+}
+
+// PoolSpecsFromConfig converts the [[pool]] blocks of a config file into pool specs.
+func PoolSpecsFromConfig(pools []config.PoolConfig) []PoolSpec {
+	specs := make([]PoolSpec, 0, len(pools))
+	for i := range pools {
+		p := &pools[i]
+		specs = append(specs, PoolSpec{
+			Name:     p.Name,
+			Backends: append([]string(nil), p.Backends...),
+			Default:  p.Default,
+			Settings: BackendSettings{
+				TLS:              p.RemoteTLS,
+				TLSUseStartTLS:   p.RemoteTLSUseStartTLS,
+				TLSVerify:        p.GetRemoteTLSVerify(),
+				UseProxyProtocol: p.RemoteUseProxyProtocol,
+				UseIDCommand:     p.RemoteUseIDCommand,
+				UseXCLIENT:       p.RemoteUseXCLIENT,
+				UseUTF8:          p.RemoteUseUTF8,
+			},
+		})
+	}
+	return specs
+}
 
 // UserRoutingLookup interface for routing lookups
 // NOTE: No caching - remotelookup is just a data source, caching happens at higher level
@@ -58,7 +145,8 @@ type UserRoutingLookup interface {
 
 // UserRoutingInfo contains backend routing information for a user
 type UserRoutingInfo struct {
-	ServerAddress          string   // Backend server to connect to (empty in auth-only mode)
+	ServerAddress          string   // Backend server to connect to (empty in auth-only mode or when routed by pool)
+	PoolName               string   // Named pool to pick a backend from (set by the lookup answer, or by routing once resolved)
 	AccountID              int64    // Account ID for tracking/metrics
 	IsRemoteLookupAccount  bool     // Whether this came from remotelookup
 	AuthOnlyMode           bool     // Remote API authenticated but didn't specify backend (use local selection)
@@ -82,6 +170,23 @@ type UserRoutingInfo struct {
 // (dialWithProxy) and the session after it follow this one rule.
 func (r *UserRoutingInfo) LookupRouted(addr string) bool {
 	return r != nil && r.ServerAddress != "" && r.ServerAddress == addr
+}
+
+// UsesRouteSettings reports whether the Remote* fields are the backend-leg settings for
+// addr: either the remote lookup named addr itself (LookupRouted), or routing confined the
+// user to a named pool and stamped that pool's settings, which then hold for whichever
+// member was picked. A user routed into the flat remote_addrs list, or around a lookup
+// route in maintenance into no named pool, gets the proxy server's own settings. The dial
+// (dialWithProxy) and the session after it follow this one rule.
+func (r *UserRoutingInfo) UsesRouteSettings(addr string) bool {
+	return r.LookupRouted(addr) || r.PoolRouted()
+}
+
+// PoolRouted reports whether routing confined this user to a named pool, whose settings
+// (stamped on the Remote* fields) are then the whole backend-leg configuration: nothing
+// falls back to the proxy server's own remote_* settings.
+func (r *UserRoutingInfo) PoolRouted() bool {
+	return r != nil && r.ServerAddress == "" && r.PoolName != ""
 }
 
 // normalizeHostPort normalizes a host:port address, adding a default port if missing

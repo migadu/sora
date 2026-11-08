@@ -203,6 +203,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					s.routingInfo = &proxy.UserRoutingInfo{
 						AccountID:              cached.AccountID,
 						ServerAddress:          cached.ServerAddress,
+						PoolName:               cached.PoolName,
 						RemoteTLS:              cached.RemoteTLS,
 						RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
 						RemoteTLSVerify:        cached.RemoteTLSVerify,
@@ -415,6 +416,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 						PasswordDigest:         lookupcache.NewPasswordDigest(password),
 						ActualEmail:            resolvedEmail, // Store resolved email for cache hits
 						ServerAddress:          routingInfo.ServerAddress,
+						PoolName:               routingInfo.PoolName,
 						RemoteTLS:              routingInfo.RemoteTLS,
 						RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
 						RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
@@ -650,7 +652,10 @@ func (s *POP3ProxySession) connectToBackend() error {
 		ProxyName:             "POP3 Proxy",
 	})
 	if err != nil {
-		s.WarnLog("Error determining route", "error", err)
+		// No pool to route into (a pool this proxy lacks, or none named and none default):
+		// fail the connection rather than let the fallback dial another pool's backend.
+		s.invalidateLookupCache("no backend pool for route")
+		return fmt.Errorf("%w: failed to determine route: %w", server.ErrBackendConnectionFailed, err)
 	}
 
 	// Update session routing info if it was fetched by DetermineRoute
@@ -743,8 +748,8 @@ func (s *POP3ProxySession) connectToBackend() error {
 	// Send XCLIENT command to backend with forwarding parameters if enabled.
 	// This MUST be done before authenticating.
 	useXCLIENT := s.server.remoteUseXCLIENT
-	// The remote lookup's setting applies to the backend it named (as for the dial)
-	if s.routingInfo.LookupRouted(s.serverAddr) {
+	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
+	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
 		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
 	}
 	if useXCLIENT {
@@ -763,7 +768,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	// non-sora backends (Dovecot): the session simply stays in ASCII mode,
 	// exactly as it did pre-migration.
 	mirrorUTF8 := s.server.remoteUseUTF8
-	if s.routingInfo.LookupRouted(s.serverAddr) {
+	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
 		mirrorUTF8 = s.routingInfo.RemoteUseUTF8
 	}
 	if s.utf8Requested && mirrorUTF8 {

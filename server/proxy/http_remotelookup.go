@@ -67,7 +67,8 @@ type HTTPRemoteLookupClient struct {
 type HTTPRemoteLookupResponse struct {
 	Address      string `json:"address"`       // Email address for the user (required - used to derive account_id)
 	PasswordHash string `json:"password_hash"` // Password hash to verify against (required)
-	Server       string `json:"server"`        // Backend server IP/hostname:port (optional - if empty, uses auth-only mode)
+	Server       string `json:"server"`        // Backend server IP/hostname:port (optional; a hard pin when set)
+	Pool         string `json:"pool"`          // Named backend pool to pick from (optional; read only when Server is empty)
 	AccountID    int64  // Derived from Address, not part of JSON response
 	AuthOnlyMode bool   // Internal flag: true when Server is empty (auth-only, local backend selection)
 }
@@ -379,10 +380,21 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 			return nil, fmt.Errorf("%w: password_hash is empty in response", ErrRemoteLookupInvalidResponse)
 		}
 
-		// If server is null/empty, this is auth-only mode (remotelookup handles authentication,
-		// Sora handles backend selection via affinity/consistent-hash/round-robin)
-		// We mark this with a special flag in the response so it can be processed differently
-		if strings.TrimSpace(lookupResp.Server) == "" {
+		// Where to route. An explicit server wins and keeps its meaning (a hard pin); a
+		// pool name is read only when there is no server, so proxies and answers that
+		// predate pools keep working unchanged. Neither = auth-only: remotelookup handled
+		// authentication, the proxy picks a backend from its default pool.
+		lookupResp.Server = strings.TrimSpace(lookupResp.Server)
+		lookupResp.Pool = strings.TrimSpace(lookupResp.Pool)
+		switch {
+		case lookupResp.Server != "":
+			if lookupResp.Pool != "" {
+				logger.Debug("remotelookup: Response names both server and pool - using server", "user", lookupEmail, "server", lookupResp.Server, "pool", lookupResp.Pool)
+				lookupResp.Pool = ""
+			}
+		case lookupResp.Pool != "":
+			logger.Debug("remotelookup: Response names a pool - member picked locally", "user", lookupEmail, "pool", lookupResp.Pool)
+		default:
 			logger.Debug("remotelookup: Server is null/empty - auth-only mode (local backend selection)", "user", lookupEmail)
 			lookupResp.AuthOnlyMode = true
 		}
@@ -470,6 +482,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 
 	info := &UserRoutingInfo{
 		ServerAddress:          normalizedServer,
+		PoolName:               lookupResp.Pool,
 		AccountID:              lookupResp.AccountID,
 		IsRemoteLookupAccount:  true,
 		AuthOnlyMode:           lookupResp.AuthOnlyMode,
@@ -488,7 +501,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	if routeOnly {
 		source = "api-route-only"
 	}
-	logger.Debug("remotelookup: SUCCESS", "user", authEmail, "source", source, "hash_prefix", hashPrefix, "auth_only_mode", lookupResp.AuthOnlyMode, "server", normalizedServer)
+	logger.Debug("remotelookup: SUCCESS", "user", authEmail, "source", source, "hash_prefix", hashPrefix, "auth_only_mode", lookupResp.AuthOnlyMode, "server", normalizedServer, "pool", lookupResp.Pool)
 
 	return info, AuthSuccess, nil
 }

@@ -144,7 +144,8 @@ type ServerOptions struct {
 	Name                     string // Server name for logging
 	Addr                     string
 	RemoteAddrs              []string
-	RemotePort               int // Default port for backends if not in address
+	Pools                    []proxy.PoolSpec // Named backend pools ([[pool]] blocks); when set, RemoteAddrs is unused and each pool brings its own backend-leg settings
+	RemotePort               int              // Default port for backends if not in address
 	MasterUsername           string
 	MasterPassword           string
 	MasterSASLUsername       string
@@ -208,9 +209,9 @@ type ServerOptions struct {
 func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname string, opts ServerOptions) (*Server, error) {
 	ctx, cancel := context.WithCancel(appCtx)
 
-	if len(opts.RemoteAddrs) == 0 {
+	if len(opts.RemoteAddrs) == 0 && len(opts.Pools) == 0 {
 		cancel()
-		return nil, fmt.Errorf("no remote addresses configured")
+		return nil, fmt.Errorf("no remote addresses or backend pools configured")
 	}
 
 	// Set default timeout if not specified
@@ -244,7 +245,16 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Create connection manager with routing
-	connManager, err := proxy.NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(opts.RemoteAddrs, opts.RemotePort, opts.RemoteTLS, false, opts.RemoteTLSVerify, opts.RemoteUseProxyProtocol, connectTimeout, routingLookup, opts.Name, !opts.EnableBackendHealthCheck)
+	connManager, err := proxy.NewConnectionManagerFromOptions(proxy.ManagerOptions{
+		Pools:              opts.Pools,
+		RemoteAddrs:        opts.RemoteAddrs,
+		RemotePort:         opts.RemotePort,
+		Settings:           proxy.BackendSettings{TLS: opts.RemoteTLS, TLSVerify: opts.RemoteTLSVerify, UseProxyProtocol: opts.RemoteUseProxyProtocol},
+		ConnectTimeout:     connectTimeout,
+		RoutingLookup:      routingLookup,
+		ServerName:         opts.Name,
+		DisableHealthCheck: !opts.EnableBackendHealthCheck,
+	})
 	if err != nil {
 		if routingLookup != nil {
 			routingLookup.Close()

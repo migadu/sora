@@ -421,20 +421,29 @@ func (s *Session) handleConnection() {
 					ProxyName:             "LMTP Proxy",
 				})
 
-				if err == nil {
-					targetAddr := routeResult.PreferredAddr
-					// If a specific backend is required (targetAddr not empty) and it differs from
-					// the currently connected backend, we must reject this recipient.
-					// The client should retry this recipient in a separate transaction.
-					if targetAddr != "" && targetAddr != s.serverAddr {
-						s.InfoLog("rejecting recipient - routing mismatch (requires different backend)",
-							"to", s.to,
-							"current_backend", s.serverAddr,
-							"target_backend", targetAddr,
-							"method", routeResult.RoutingMethod)
-						s.sendResponse("451 4.3.0 Recipient requires different backend server, start new transaction")
-						continue
-					}
+				if err != nil {
+					// No pool for this recipient: it cannot share the held backend, whatever
+					// pool that backend is in.
+					s.InfoLog("rejecting recipient - no backend pool for route", "to", s.to, "error", err)
+					s.sendResponse("451 4.3.0 No backend pool for recipient, start new transaction")
+					continue
+				}
+				targetAddr := routeResult.PreferredAddr
+				// If a specific backend is required (targetAddr not empty) and it differs from
+				// the currently connected backend, we must reject this recipient.
+				// The client should retry this recipient in a separate transaction.
+				// Without a specific backend (every member of the pool unhealthy), the held
+				// backend still has to be a member of the recipient's pool.
+				if (targetAddr != "" && targetAddr != s.serverAddr) ||
+					(targetAddr == "" && routeResult.Pool != "" && !s.server.connManager.PoolHasBackend(routeResult.Pool, s.serverAddr)) {
+					s.InfoLog("rejecting recipient - routing mismatch (requires different backend)",
+						"to", s.to,
+						"current_backend", s.serverAddr,
+						"target_backend", targetAddr,
+						"pool", routeResult.Pool,
+						"method", routeResult.RoutingMethod)
+					s.sendResponse("451 4.3.0 Recipient requires different backend server, start new transaction")
+					continue
 				}
 			}
 
@@ -798,6 +807,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			s.routingInfo = &proxy.UserRoutingInfo{
 				AccountID:              cached.AccountID,
 				ServerAddress:          cached.ServerAddress,
+				PoolName:               cached.PoolName,
 				IsRemoteLookupAccount:  cached.FromRemoteLookup, // CRITICAL: Prevents fallback to other backends
 				RemoteTLS:              cached.RemoteTLS,
 				RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
@@ -888,6 +898,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				AccountID:              routingInfo.AccountID,
 				ActualEmail:            resolvedEmail, // Store resolved email for cache hits
 				ServerAddress:          routingInfo.ServerAddress,
+				PoolName:               routingInfo.PoolName,
 				RemoteTLS:              routingInfo.RemoteTLS,
 				RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
 				RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
@@ -1051,7 +1062,9 @@ func (s *Session) connectToBackend() error {
 		ProxyName:             "LMTP Proxy",
 	})
 	if err != nil {
-		s.DebugLog("Error determining route", "error", err)
+		// No pool to route into (a pool this proxy lacks, or none named and none default):
+		// fail the connection rather than let the fallback dial another pool's backend.
+		return fmt.Errorf("failed to determine route: %w", err)
 	}
 
 	// Update session routing info if it was fetched by DetermineRoute
@@ -1180,16 +1193,14 @@ func (s *Session) connectToBackend() error {
 	shouldUseStartTLS := false
 	var tlsConfig *tls.Config
 
-	if s.routingInfo.LookupRouted(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
-		// RemoteLookup routing specified StartTLS (for the backend it named, as for the dial)
+	if s.routingInfo.UsesRouteSettings(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
+		// The route specified StartTLS (for the backend the lookup named or its pool picked, as for the dial)
 		shouldUseStartTLS = true
-		tlsConfig = &tls.Config{
-			InsecureSkipVerify: !s.routingInfo.RemoteTLSVerify,
-			Renegotiation:      tls.RenegotiateNever,
-		}
+		tlsConfig = s.server.connManager.BackendTLSConfig(s.routingInfo.RemoteTLSVerify)
 		s.DebugLog("Using remotelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
-	} else if s.server.connManager.IsRemoteStartTLS() {
-		// Global proxy config specified StartTLS
+	} else if !s.routingInfo.PoolRouted() && s.server.connManager.IsRemoteStartTLS() {
+		// Global proxy config specified StartTLS. A pool's own settings are authoritative:
+		// a pool without remote_tls_use_starttls never inherits the server's.
 		shouldUseStartTLS = true
 		tlsConfig = s.server.connManager.GetTLSConfig()
 		s.DebugLog("Using global StartTLS settings")
@@ -1284,8 +1295,8 @@ func (s *Session) connectToBackend() error {
 
 	// Send forwarding parameters via XCLIENT if enabled
 	useXCLIENT := s.server.remoteUseXCLIENT
-	// The remote lookup's setting applies to the backend it named (as for the dial)
-	if s.routingInfo.LookupRouted(s.serverAddr) {
+	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
+	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
 		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
 	}
 	// The proxy's role is to forward the original client's information if enabled.

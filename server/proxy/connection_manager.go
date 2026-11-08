@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
 
@@ -35,6 +36,68 @@ type BackendHealth struct {
 	IsHealthy        bool      // Current health status
 }
 
+// backendPool is one group of backends the manager can route into, with its own hash
+// ring and round-robin cursor. Health is not kept here: it is per address in the
+// manager's union, so a backend keeps its failure history however it was reached.
+type backendPool struct {
+	name      string
+	named     bool // false for the unnamed pool a flat remote_addrs list becomes
+	isDefault bool
+	settings  BackendSettings
+	// configured is the normalized host:port list from config. resolved and ring are
+	// what the last DNS resolution made of it: rebuilt by install under cm.healthMu and
+	// read under it.
+	configured []string
+	resolved   []string
+	ring       *ConsistentHash
+	// nextIndex is the round-robin cursor for this pool.
+	nextIndex atomic.Uint32
+}
+
+// install rebuilds the pool's members and hash ring from a resolution result (nil = the
+// configured addresses themselves, before the first resolution).
+func (p *backendPool) install(resolvedHosts map[string][]string) {
+	resolved := make([]string, 0, len(p.configured))
+	seen := make(map[string]bool, len(p.configured))
+	for _, addr := range p.configured {
+		entries := resolvedHosts[addr]
+		if len(entries) == 0 {
+			entries = []string{addr}
+		}
+		for _, entry := range entries {
+			if seen[entry] {
+				continue
+			}
+			seen[entry] = true
+			resolved = append(resolved, entry)
+		}
+	}
+	ring := NewConsistentHash(150) // 150 virtual nodes per backend
+	for _, addr := range resolved {
+		ring.AddBackend(addr)
+	}
+	p.resolved = resolved
+	p.ring = ring
+}
+
+// stamp writes the pool's name and backend-leg settings onto a route's info, so the dial
+// (dialWithProxy) and the session (ID/XCLIENT/UTF8 forwarding, STARTTLS) read one
+// consistent set. Only a named pool stamps: the unnamed pool of a flat list leaves the
+// proxy server's own settings in force, as before pools existed.
+func (p *backendPool) stamp(info *UserRoutingInfo) {
+	if !p.named {
+		return
+	}
+	info.PoolName = p.name
+	info.RemoteTLS = p.settings.TLS
+	info.RemoteTLSUseStartTLS = p.settings.TLSUseStartTLS
+	info.RemoteTLSVerify = p.settings.TLSVerify
+	info.RemoteUseProxyProtocol = p.settings.UseProxyProtocol
+	info.RemoteUseIDCommand = p.settings.UseIDCommand
+	info.RemoteUseXCLIENT = p.settings.UseXCLIENT
+	info.RemoteUseUTF8 = p.settings.UseUTF8
+}
+
 // ConnectionManager manages connections to multiple remote servers with round-robin and failover
 type ConnectionManager struct {
 	serverName  string // Server name for logging
@@ -51,11 +114,14 @@ type ConnectionManager struct {
 	remoteUseProxyProtocol bool
 	connectTimeout         time.Duration
 
-	// Round-robin index (fallback when consistent hash not used)
-	nextIndex atomic.Uint32
-
-	// Consistent hashing for deterministic backend selection
-	consistentHash *ConsistentHash
+	// pools are the backend groups this manager routes into, each with its own hash ring
+	// and round-robin cursor. A manager built from a flat remote_addrs list has exactly
+	// one, unnamed, default pool, so every routing decision is pool-scoped whichever way
+	// it was built. The slice, the index and defaultPool are fixed at construction; a
+	// pool's resolved members and ring are rebuilt under healthMu.
+	pools       []*backendPool
+	poolsByName map[string]*backendPool
+	defaultPool *backendPool // nil when named pools are configured without a default
 
 	// Backend health tracking
 	healthMu                 sync.RWMutex
@@ -239,55 +305,223 @@ func NewConnectionManagerWithRoutingAndStartTLS(remoteAddrs []string, remotePort
 	return NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(remoteAddrs, remotePort, remoteTLS, remoteTLSUseStartTLS, remoteTLSVerify, remoteUseProxyProtocol, connectTimeout, routingLookup, serverName, false)
 }
 
-// NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck creates a new connection manager with all options including health check control
+// NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck creates a new connection manager with all options including health check control.
+// The flat remoteAddrs list becomes one unnamed pool that is also the default, which routes
+// auth-only lookup answers and locally found users exactly as before pools existed.
 func NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(remoteAddrs []string, remotePort int, remoteTLS bool, remoteTLSUseStartTLS bool, remoteTLSVerify bool, remoteUseProxyProtocol bool, connectTimeout time.Duration, routingLookup UserRoutingLookup, serverName string, disableHealthCheck bool) (*ConnectionManager, error) {
 	if len(remoteAddrs) == 0 {
 		return nil, fmt.Errorf("no remote addresses provided")
 	}
-
-	// Normalize remote addresses to include default port if missing
-	normalizedAddrs := make([]string, len(remoteAddrs))
-	for i, addr := range remoteAddrs {
-		normalizedAddrs[i] = normalizeHostPort(addr, remotePort)
+	settings := BackendSettings{
+		TLS:              remoteTLS,
+		TLSUseStartTLS:   remoteTLSUseStartTLS,
+		TLSVerify:        remoteTLSVerify,
+		UseProxyProtocol: remoteUseProxyProtocol,
 	}
+	return newConnectionManager([]PoolSpec{{Backends: remoteAddrs, Default: true, Settings: settings}}, false, remotePort, connectTimeout, routingLookup, serverName, disableHealthCheck)
+}
 
-	backendHealth := make(map[string]*BackendHealth)
-
-	// Initially mark all servers as healthy
-	for _, addr := range normalizedAddrs {
-		backendHealth[addr] = &BackendHealth{
-			IsHealthy:   true,
-			LastSuccess: time.Now(),
-		}
+// NewConnectionManagerWithPools creates a connection manager that routes by named pools
+// ([[pool]] blocks). Each pool carries its own backend-leg settings and the manager's own
+// remote_* settings stay unset, so a dial always uses the settings of the route it serves.
+// A backend without a port gets remotePort.
+func NewConnectionManagerWithPools(pools []PoolSpec, remotePort int, connectTimeout time.Duration, routingLookup UserRoutingLookup, serverName string, disableHealthCheck bool) (*ConnectionManager, error) {
+	if len(pools) == 0 {
+		return nil, fmt.Errorf("no backend pools provided")
 	}
+	return newConnectionManager(pools, true, remotePort, connectTimeout, routingLookup, serverName, disableHealthCheck)
+}
 
-	// Initialize consistent hash ring with all backends
-	consistentHash := NewConsistentHash(150) // 150 virtual nodes per backend
-	for _, addr := range normalizedAddrs {
-		consistentHash.AddBackend(addr)
-	}
-
+func newConnectionManager(specs []PoolSpec, named bool, remotePort int, connectTimeout time.Duration, routingLookup UserRoutingLookup, serverName string, disableHealthCheck bool) (*ConnectionManager, error) {
 	cm := &ConnectionManager{
 		serverName:               serverName,
-		remoteAddrs:              normalizedAddrs,
-		configuredAddrs:          normalizedAddrs,
 		remotePort:               remotePort,
-		remoteTLS:                remoteTLS,
-		remoteTLSUseStartTLS:     remoteTLSUseStartTLS,
-		remoteTLSVerify:          remoteTLSVerify,
-		remoteUseProxyProtocol:   remoteUseProxyProtocol,
 		connectTimeout:           connectTimeout,
-		consistentHash:           consistentHash,
-		backendHealth:            backendHealth,
+		poolsByName:              make(map[string]*backendPool, len(specs)),
+		backendHealth:            make(map[string]*BackendHealth),
 		remoteLookupHealth:       make(map[string]*BackendHealth), // Dynamic remote lookup backends
 		routingLookup:            routingLookup,
 		enableBackendHealthCheck: !disableHealthCheck,
 		resolveRefresh:           DefaultResolveRefreshInterval,
 	}
+	if !named {
+		// The unnamed pool's settings are the manager's own: they also serve the
+		// protocol-layer STARTTLS fallback and the TLS config accessors.
+		cm.remoteTLS = specs[0].Settings.TLS
+		cm.remoteTLSUseStartTLS = specs[0].Settings.TLSUseStartTLS
+		cm.remoteTLSVerify = specs[0].Settings.TLSVerify
+		cm.remoteUseProxyProtocol = specs[0].Settings.UseProxyProtocol
+	}
 
-	logger.Debug("Connection manager: Initialized consistent hash ring", "prefix", cm.logPrefix(), "backends", len(normalizedAddrs))
+	owner := make(map[string]string) // normalized address -> pool name
+	for _, spec := range specs {
+		if named && spec.Name == "" {
+			return nil, fmt.Errorf("backend pool without a name")
+		}
+		if _, dup := cm.poolsByName[spec.Name]; dup {
+			return nil, fmt.Errorf("backend pool %q declared twice", spec.Name)
+		}
+		if len(spec.Backends) == 0 {
+			return nil, fmt.Errorf("backend pool %q has no backends", spec.Name)
+		}
+		p := &backendPool{name: spec.Name, named: named, isDefault: spec.Default, settings: spec.Settings}
+		for _, addr := range spec.Backends {
+			// Normalize remote addresses to include default port if missing
+			normalized := normalizeHostPort(addr, remotePort)
+			if other, taken := owner[normalized]; taken {
+				if other == spec.Name {
+					continue // listed twice in the same pool
+				}
+				return nil, fmt.Errorf("backend %s is in pool %q and in pool %q", normalized, other, spec.Name)
+			}
+			owner[normalized] = spec.Name
+			p.configured = append(p.configured, normalized)
+			cm.configuredAddrs = append(cm.configuredAddrs, normalized)
+			// Initially mark all servers as healthy
+			cm.backendHealth[normalized] = &BackendHealth{
+				IsHealthy:   true,
+				LastSuccess: time.Now(),
+			}
+		}
+		// Until the first resolution the configured addresses are the members.
+		p.install(nil)
+		if spec.Default {
+			if cm.defaultPool != nil {
+				return nil, fmt.Errorf("backend pools %q and %q are both default", cm.defaultPool.name, spec.Name)
+			}
+			cm.defaultPool = p
+		}
+		cm.pools = append(cm.pools, p)
+		cm.poolsByName[spec.Name] = p
+	}
+	cm.remoteAddrs = slices.Clone(cm.configuredAddrs)
+
+	logger.Debug("Connection manager: Initialized backend pools", "prefix", cm.logPrefix(), "pools", len(cm.pools), "named", named, "backends", len(cm.configuredAddrs))
 
 	return cm, nil
+}
+
+// HasNamedPools reports whether this manager routes by named pools ([[pool]] blocks)
+// rather than one flat remote_addrs list.
+func (cm *ConnectionManager) HasNamedPools() bool {
+	return len(cm.pools) > 0 && cm.pools[0].named
+}
+
+// PoolNames lists the named pools in configuration order (empty for a flat list).
+func (cm *ConnectionManager) PoolNames() []string {
+	if !cm.HasNamedPools() {
+		return nil
+	}
+	names := make([]string, 0, len(cm.pools))
+	for _, p := range cm.pools {
+		names = append(names, p.name)
+	}
+	return names
+}
+
+// PoolInfo describes the pool a route is confined to.
+type PoolInfo struct {
+	Name     string
+	Named    bool // false for the unnamed pool of a flat remote_addrs list
+	Default  bool
+	Settings BackendSettings
+}
+
+// ResolvePool reports the pool a route naming name ("" = the default pool) is confined to,
+// or the error DetermineRoute would return for it: ErrUnknownPool, or ErrNoDefaultPool when
+// nothing is named and no pool is the default. A flat-list manager always answers with its
+// one pool.
+func (cm *ConnectionManager) ResolvePool(name string) (PoolInfo, error) {
+	p, err := cm.poolByName(name)
+	if err != nil {
+		return PoolInfo{}, err
+	}
+	return PoolInfo{Name: p.name, Named: p.named, Default: p.isDefault, Settings: p.settings}, nil
+}
+
+// PoolHasBackend reports whether backend is a current member of the pool a route naming
+// name is confined to; false for an unknown pool.
+func (cm *ConnectionManager) PoolHasBackend(name, backend string) bool {
+	p, err := cm.poolByName(name)
+	if err != nil {
+		return false
+	}
+	return cm.poolHasBackend(p, backend)
+}
+
+// poolByName returns the pool a route naming name is confined to. A flat-list manager has
+// one pool and every route lands in it; a named-pool manager refuses an unknown name, and
+// an empty name when no pool is the default.
+func (cm *ConnectionManager) poolByName(name string) (*backendPool, error) {
+	if !cm.HasNamedPools() {
+		return cm.defaultPool, nil
+	}
+	if name == "" {
+		if cm.defaultPool == nil {
+			return nil, ErrNoDefaultPool
+		}
+		return cm.defaultPool, nil
+	}
+	p, ok := cm.poolsByName[name]
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownPool, name)
+	}
+	return p, nil
+}
+
+// poolForRoute is poolByName for the pool a route's info names.
+func (cm *ConnectionManager) poolForRoute(info *UserRoutingInfo) (*backendPool, error) {
+	name := ""
+	if info != nil {
+		name = info.PoolName
+	}
+	return cm.poolByName(name)
+}
+
+func (cm *ConnectionManager) poolHasBackend(p *backendPool, backend string) bool {
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+	return slices.Contains(p.resolved, backend)
+}
+
+// PoolOfBackend names the named pool addr is a member of, as configured or as resolved;
+// "" when it is in none, or this manager routes a flat remote_addrs list. It is how a user
+// pinned to a backend in maintenance is routed among that backend's own siblings: a lookup
+// pin carries no pool, and the pool the pinned host belongs to is the only one its account
+// is known to live in.
+func (cm *ConnectionManager) PoolOfBackend(addr string) string {
+	if !cm.HasNamedPools() || addr == "" {
+		return ""
+	}
+	target := normalizeHostPort(addr, cm.remotePort)
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+	for _, p := range cm.pools {
+		for _, a := range p.configured {
+			if normalizeHostPort(a, cm.remotePort) == target {
+				return p.name
+			}
+		}
+		for _, a := range p.resolved {
+			if normalizeHostPort(a, cm.remotePort) == target {
+				return p.name
+			}
+		}
+	}
+	return ""
+}
+
+// poolBackendByHost is FindPoolBackendByHost confined to one pool.
+func (cm *ConnectionManager) poolBackendByHost(p *backendPool, host string) (string, bool) {
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+	for _, addr := range p.resolved {
+		h, _, err := net.SplitHostPort(addr)
+		if err == nil && h == host {
+			return addr, true
+		}
+	}
+	return "", false
 }
 
 // logPrefix returns a consistent log prefix for this connection manager
@@ -339,16 +573,32 @@ func (cm *ConnectionManager) HasBackend(backend string) bool {
 }
 
 // GetBackendByConsistentHash returns a backend for a username using consistent hashing
-// Automatically excludes unhealthy backends and tries the next one in the ring
-// Returns empty string if all backends are unhealthy
+// over the default pool (the whole list of a flat-list manager). Automatically excludes
+// unhealthy backends and tries the next one in the ring. Returns empty string if all
+// backends are unhealthy, or if no pool is the default.
 func (cm *ConnectionManager) GetBackendByConsistentHash(username string) string {
+	return cm.GetBackendByConsistentHashInPool("", username)
+}
+
+// GetBackendByConsistentHashInPool is GetBackendByConsistentHash confined to the pool a
+// route naming pool ("" = default) is confined to; "" when that pool is unknown.
+func (cm *ConnectionManager) GetBackendByConsistentHashInPool(pool, username string) string {
+	p, err := cm.poolByName(pool)
+	if err != nil {
+		logger.Debug("ConnectionManager: Consistent hash has no pool", "username", username, "pool", pool, "error", err)
+		return ""
+	}
+	return cm.hashInPool(p, username)
+}
+
+func (cm *ConnectionManager) hashInPool(p *backendPool, username string) string {
 	cm.refreshResolvedAddrsIfStale()
 
 	// Snapshot the ring and the pool size: a re-resolution replaces both, and the
 	// health checks below take the write lock, so this cannot hold the read lock.
 	cm.healthMu.RLock()
-	ring := cm.consistentHash
-	poolSize := len(cm.remoteAddrs)
+	ring := p.ring
+	poolSize := len(p.resolved)
 	cm.healthMu.RUnlock()
 
 	if ring == nil {
@@ -387,10 +637,12 @@ func (cm *ConnectionManager) GetBackendByConsistentHash(username string) string 
 	}
 
 	// All backends unhealthy - log diagnostics
-	logger.Warn("ConnectionManager: All consistent hash backends unhealthy", "username", username, "pool_size", poolSize)
+	logger.Warn("ConnectionManager: All consistent hash backends unhealthy", "username", username, "pool", p.name, "pool_size", poolSize)
 	cm.healthMu.RLock()
-	for addr, health := range cm.backendHealth {
-		logger.Debug("ConnectionManager: Backend health status", "backend", addr, "healthy", health.IsHealthy, "consecutive_fails", health.ConsecutiveFails, "last_failure", health.LastFailure)
+	for _, addr := range p.resolved {
+		if health, ok := cm.backendHealth[addr]; ok {
+			logger.Debug("ConnectionManager: Backend health status", "backend", addr, "healthy", health.IsHealthy, "consecutive_fails", health.ConsecutiveFails, "last_failure", health.LastFailure)
+		}
 	}
 	cm.healthMu.RUnlock()
 
@@ -492,6 +744,7 @@ func (cm *ConnectionManager) IsRemoteLookupBackendHealthy(backend string) bool {
 // BackendHealthInfo represents the health status of a single backend for external reporting
 type BackendHealthInfo struct {
 	Address            string    `json:"address"`
+	Pool               string    `json:"pool,omitempty"` // Named pool the backend belongs to ("" for a flat remote_addrs list)
 	IsHealthy          bool      `json:"is_healthy"`
 	FailureCount       int       `json:"failure_count"`
 	ConsecutiveFails   int       `json:"consecutive_fails"`
@@ -542,10 +795,10 @@ func (cm *ConnectionManager) backendHealthStatuses() []BackendHealthInfo {
 	healthCheckEnabled := cm.enableBackendHealthCheck
 	statuses := make([]BackendHealthInfo, 0, len(cm.backendHealth)+len(cm.remoteLookupHealth))
 
-	// Add pool backends (from remote_addrs config)
-	for addr, health := range cm.backendHealth {
+	report := func(addr, pool string, health *BackendHealth) {
 		info := BackendHealthInfo{
 			Address:            addr,
+			Pool:               pool,
 			IsHealthy:          health.IsHealthy,
 			FailureCount:       health.FailureCount,
 			ConsecutiveFails:   health.ConsecutiveFails,
@@ -561,6 +814,25 @@ func (cm *ConnectionManager) backendHealthStatuses() []BackendHealthInfo {
 		}
 
 		statuses = append(statuses, info)
+	}
+
+	// Pool backends, each under the pool it belongs to
+	seen := make(map[string]bool, len(cm.backendHealth))
+	for _, p := range cm.pools {
+		for _, addr := range p.resolved {
+			seen[addr] = true
+			health, ok := cm.backendHealth[addr]
+			if !ok {
+				health = &BackendHealth{IsHealthy: true}
+			}
+			report(addr, p.name, health)
+		}
+	}
+	// A health entry no pool lists any more (a member a re-resolution dropped)
+	for addr, health := range cm.backendHealth {
+		if !seen[addr] {
+			report(addr, "", health)
+		}
 	}
 
 	// Add remote lookup backends (dynamic, not in pool)
@@ -826,6 +1098,14 @@ func (cm *ConnectionManager) backendTLSConfig(verify bool) *tls.Config {
 	}
 }
 
+// BackendTLSConfig returns the client TLS config for a STARTTLS upgrade of the
+// proxy->backend leg negotiated at the protocol layer, with the same hardening and custom
+// roots the implicit-TLS dial uses. verify is per route: a lookup answer or a pool may
+// override remote_tls_verify.
+func (cm *ConnectionManager) BackendTLSConfig(verify bool) *tls.Config {
+	return cm.backendTLSConfig(verify)
+}
+
 // GetTLSConfig returns the TLS configuration for remote connections
 // Used for StartTLS negotiation at the protocol layer
 func (cm *ConnectionManager) GetTLSConfig() *tls.Config {
@@ -860,13 +1140,19 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		// The error from tryPreferredAddress is logged but not returned to the client yet.
 	}
 
-	// Capture the current list of addresses under lock to avoid data race with ResolveAddresses
+	// Round-robin stays inside the route's pool: a user whose pool has no backend left is
+	// refused, never handed to another pool's backend. The member list is snapshotted
+	// under the lock because a re-resolution replaces it.
+	pool, err := cm.poolForRoute(routingInfo)
+	if err != nil {
+		return nil, "", err
+	}
 	cm.healthMu.RLock()
-	currentRemoteAddrs := cm.remoteAddrs
+	currentRemoteAddrs := pool.resolved
 	cm.healthMu.RUnlock()
 
 	// Try all servers in round-robin order
-	startIndex := cm.nextIndex.Add(1) - 1
+	startIndex := pool.nextIndex.Add(1) - 1
 	inMaintenance := 0
 	for i := 0; i < len(currentRemoteAddrs); i++ {
 		idx := (startIndex + uint32(i)) % uint32(len(currentRemoteAddrs))
@@ -1130,15 +1416,11 @@ func (cm *ConnectionManager) installResolvedAddrs(resolvedAddrs []string, resolv
 	cm.remoteAddrs = resolvedAddrs
 	cm.backendHealth = newBackendHealth
 
-	// Rebuild consistent hash ring with resolved addresses
-	// This is critical: if we don't update the ring, it will contain old hostnames
-	// while backendHealth contains IP addresses, causing IsBackendHealthy() to fail
-	if cm.consistentHash != nil {
-		ring := NewConsistentHash(150)
-		for _, addr := range resolvedAddrs {
-			ring.AddBackend(addr)
-		}
-		cm.consistentHash = ring
+	// Rebuild every pool's member list and hash ring from the resolution. This is
+	// critical: a ring left with the old hostnames while backendHealth holds IP
+	// addresses would make IsBackendHealthy() fail for every member.
+	for _, p := range cm.pools {
+		p.install(resolvedHosts)
 	}
 }
 
@@ -1345,9 +1627,10 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	remoteTLSUseStartTLS := cm.remoteTLSUseStartTLS
 	remoteTLSVerify := cm.remoteTLSVerify
 
-	// If routingInfo is provided and this connection is for that specific server,
-	// override the TLS settings with the ones from the remotelookup config.
-	if routingInfo.LookupRouted(addr) {
+	// A route carries its own backend-leg settings for the backend the remote lookup named,
+	// and for every member of the named pool routing confined it to (which stamped that
+	// pool's settings on it). Otherwise the proxy server's own settings apply.
+	if routingInfo.UsesRouteSettings(addr) {
 		useProxyProtocol = routingInfo.RemoteUseProxyProtocol
 		remoteTLS = routingInfo.RemoteTLS
 		remoteTLSUseStartTLS = routingInfo.RemoteTLSUseStartTLS
@@ -1636,24 +1919,32 @@ type RouteResult struct {
 	PreferredAddr       string
 	RoutingMethod       string
 	IsRemoteLookupRoute bool
+	Pool                string           // Named pool the route is confined to ("" for a flat list or an explicit server)
 	RoutingInfo         *UserRoutingInfo // Can be updated by the lookup
 }
 
 // DetermineRoute centralizes the logic for choosing a backend server.
-// The precedence is: RemoteLookup > Affinity > Consistent Hash > Round-robin.
+// The precedence is: RemoteLookup server > Affinity > Consistent Hash > Round-robin.
+//
+// Everything below the explicit-server step is confined to ONE pool: the one the lookup
+// answer named, or the default pool when it named none. A route that names a pool this
+// proxy lacks, or names none where no pool is the default, is returned as an error that
+// the caller MUST turn into a connection failure: the user is never spilled into another
+// pool's backends, where the account does not exist.
 func DetermineRoute(params RouteParams) (RouteResult, error) {
 	result := RouteResult{
 		RoutingMethod: "consistent_hash", // Default: consistent hashing
 		RoutingInfo:   params.RoutingInfo,
 	}
+	cm := params.ConnManager
 
 	// 1. Try routing lookup first, only if not already available from auth
-	if result.RoutingInfo == nil && params.ConnManager.HasRouting() {
+	if result.RoutingInfo == nil && cm.HasRouting() {
 		// Use remotelookup timeout for routing lookup (accounts for dial + TLS + HTTP)
-		lookupTimeout := params.ConnManager.GetRemoteLookupTimeout()
+		lookupTimeout := cm.GetRemoteLookupTimeout()
 		routingCtx, routingCancel := context.WithTimeout(params.Ctx, lookupTimeout)
 		var lookupErr error
-		result.RoutingInfo, lookupErr = params.ConnManager.LookupUserRoute(routingCtx, params.Username)
+		result.RoutingInfo, lookupErr = cm.LookupUserRoute(routingCtx, params.Username)
 		routingCancel()
 		if lookupErr != nil {
 			logger.Debug("Routing lookup failed, falling back to affinity", "proxy", params.ProxyName, "user", params.Username, "error", lookupErr)
@@ -1666,9 +1957,12 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		// copied, not edited — it may be a lookup-cache entry other sessions share, and the
 		// pin must come back when maintenance ends.
 		logger.Info("Remote lookup backend in maintenance - routing normally", "proxy", params.ProxyName, "user", params.Username, "backend", result.RoutingInfo.ServerAddress)
+		// With named pools the user stays among the pinned backend's own siblings: the pool
+		// it is a member of, or (in none) the default pool, or a refusal from routePool.
 		routed := *result.RoutingInfo
 		routed.ServerAddress = ""
 		routed.AuthOnlyMode = true
+		routed.PoolName = cm.PoolOfBackend(result.RoutingInfo.ServerAddress)
 		result.RoutingInfo = &routed
 	}
 
@@ -1677,55 +1971,99 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		// if it is in the configured pool. Otherwise fall through to in-pool routing below,
 		// so the proxy never dials an attacker-chosen host. AllowRemoteLookupBackend logs
 		// the refusal and is a no-op (always true) when the feature is disabled.
-		if params.ConnManager.AllowRemoteLookupBackend(result.RoutingInfo.ServerAddress) {
+		if cm.AllowRemoteLookupBackend(result.RoutingInfo.ServerAddress) {
 			// Use server address from routing info (remotelookup specified backend)
 			result.PreferredAddr = result.RoutingInfo.ServerAddress
 			logger.Debug("Using routing lookup", "proxy", params.ProxyName, "user", params.Username, "server", result.PreferredAddr)
 			result.RoutingMethod = "remotelookup"
 			result.IsRemoteLookupRoute = true
-		} else {
-			// Blocked out-of-pool address (logged in AllowRemoteLookupBackend): drop it so
-			// the affinity and consistent-hash steps below still run and the user is routed
-			// to a valid in-pool backend instead of being stranded on a single rejected route.
-			result.RoutingInfo.ServerAddress = ""
+			return result, nil
 		}
+		// Blocked out-of-pool address (logged in AllowRemoteLookupBackend): drop it so
+		// the affinity and consistent-hash steps below still run and the user is routed
+		// to a valid in-pool backend instead of being stranded on a single rejected route.
+		result.RoutingInfo.ServerAddress = ""
 	}
 
-	// 2. If no routing info from remotelookup, try cluster-wide affinity
+	// 2. The pool the rest of the decision is confined to.
+	pool, err := cm.routePool(params, &result)
+	if err != nil {
+		return result, err
+	}
+
+	// 3. Cluster-wide affinity, honored only inside the pool.
 	// Note: For auth-only remotelookup (IsRemoteLookupAccount=true but ServerAddress=""),
 	// we still use affinity/consistent-hash (remotelookup only handled auth, not routing)
-	if result.PreferredAddr == "" && params.EnableAffinity {
-		// Only skip affinity if remotelookup explicitly provided a backend server
-		// Auth-only mode: has routing info but no server address - should use affinity
-		skipAffinity := params.IsRemoteLookupAccount && result.RoutingInfo != nil && result.RoutingInfo.ServerAddress != ""
-		if !skipAffinity {
-			affinityMgr := params.ConnManager.GetAffinityManager()
-			if affinityMgr != nil && params.Protocol != "" {
-				result.PreferredAddr, result.RoutingMethod = resolveAffinityRoute(params, affinityMgr, &result)
-			}
+	if params.EnableAffinity {
+		affinityMgr := cm.GetAffinityManager()
+		if affinityMgr != nil && params.Protocol != "" {
+			result.PreferredAddr, result.RoutingMethod = resolveAffinityRoute(params, pool, affinityMgr)
 		}
 	}
 
-	// 3. If no affinity, try consistent hashing (deterministic, no race condition)
+	// 4. If no affinity, try consistent hashing (deterministic, no race condition)
 	if result.PreferredAddr == "" && params.Username != "" {
-		if backend := params.ConnManager.GetBackendByConsistentHash(params.Username); backend != "" {
+		if backend := cm.hashInPool(pool, params.Username); backend != "" {
 			result.PreferredAddr = backend
 			result.RoutingMethod = "consistent_hash"
-			logger.Info("Using consistent hash", "proxy", params.ProxyName, "user", params.Username, "backend", result.PreferredAddr)
+			logger.Info("Using consistent hash", "proxy", params.ProxyName, "user", params.Username, "pool", pool.name, "backend", result.PreferredAddr)
 		} else {
 			// All backends unhealthy in consistent hash, fall back to round-robin
 			result.RoutingMethod = "roundrobin"
-			logger.Info("All consistent hash backends unhealthy - falling back to round-robin", "proxy", params.ProxyName, "user", params.Username)
+			logger.Info("All consistent hash backends unhealthy - falling back to round-robin", "proxy", params.ProxyName, "user", params.Username, "pool", pool.name)
 		}
 	}
 
 	return result, nil
 }
 
-// resolveAffinityRoute attempts to find a healthy backend via affinity, including cross-protocol.
+// routePool resolves the pool a route is confined to and stamps a named pool's name and
+// settings on the routing info, so the dial and the session use that pool's backend-leg
+// configuration. A flat-list manager ignores a pool name in the answer with a warning:
+// that is what a proxy without pools did before pools existed, and it lets binaries and
+// configs roll out independently.
+func (cm *ConnectionManager) routePool(params RouteParams, result *RouteResult) (*backendPool, error) {
+	info := result.RoutingInfo
+	if !cm.HasNamedPools() {
+		if info != nil && info.PoolName != "" {
+			logger.Warn("Lookup answer names a pool but this proxy has no [[pool]] blocks - using remote_addrs", "proxy", params.ProxyName, "user", params.Username, "pool", info.PoolName)
+			info.PoolName = ""
+		}
+		return cm.defaultPool, nil
+	}
+
+	name := ""
+	if info != nil {
+		name = info.PoolName
+	}
+	pool, err := cm.poolByName(name)
+	if err != nil {
+		outcome := "unknown_pool"
+		if errors.Is(err, ErrNoDefaultPool) {
+			outcome = "no_default"
+		}
+		metrics.ProxyPoolRoute.WithLabelValues(params.Protocol, name, outcome).Inc()
+		logger.Error("No backend pool for route - refusing to route elsewhere", "proxy", params.ProxyName, "user", params.Username, "pool", name, "error", err)
+		return nil, err
+	}
+	if info == nil {
+		info = &UserRoutingInfo{}
+		result.RoutingInfo = info
+	}
+	pool.stamp(info)
+	result.Pool = pool.name
+	metrics.ProxyPoolRoute.WithLabelValues(params.Protocol, pool.name, "routed").Inc()
+	return pool, nil
+}
+
+// resolveAffinityRoute attempts to find a healthy backend via affinity, including cross-protocol,
+// inside the given pool. An affinity that points outside the pool is deleted and the user is
+// routed afresh: that is how a user moved between pools by the lookup API lands in the new one.
 // If same-protocol affinity is stale (unhealthy), it deletes it and retries once to check
 // cross-protocol affinities from other protocols that may have already failed over.
-func resolveAffinityRoute(params RouteParams, affinityMgr AffinityManager, result *RouteResult) (preferredAddr, routingMethod string) {
+func resolveAffinityRoute(params RouteParams, pool *backendPool, affinityMgr AffinityManager) (preferredAddr, routingMethod string) {
+	cm := params.ConnManager
+
 	// Try affinity lookup (may retry once after deleting stale same-protocol affinity)
 	for attempt := 0; attempt < 2; attempt++ {
 		lastAddr, foundProtocol, found := affinityMgr.GetBackendAcrossProtocols(params.Username, params.Protocol)
@@ -1739,28 +2077,29 @@ func resolveAffinityRoute(params RouteParams, affinityMgr AffinityManager, resul
 		if foundProtocol != params.Protocol {
 			host, _, err := net.SplitHostPort(lastAddr)
 			if err == nil {
-				if localAddr, ok := params.ConnManager.FindPoolBackendByHost(host); ok {
+				if localAddr, ok := cm.poolBackendByHost(pool, host); ok {
 					targetAddr = localAddr
 				} else {
-					// Backend host not in our pool — skip this affinity entry
+					// Backend host not in the user's pool — skip this affinity entry
 					logger.Debug("Cross-protocol affinity host not in pool, skipping",
-						"proxy", params.ProxyName, "user", params.Username,
+						"proxy", params.ProxyName, "user", params.Username, "pool", pool.name,
 						"affinity_addr", lastAddr, "from_protocol", foundProtocol)
 					return "", ""
 				}
 			}
 		}
 
-		// Check if the backend is still configured in our pool and not in maintenance.
-		// It might have been removed from the config since the affinity was cached. A
-		// backend in maintenance is treated the same: the user is routed afresh, and the
-		// new affinity keeps them there after maintenance ends (no stampede back).
-		if !params.ConnManager.HasBackend(targetAddr) || params.ConnManager.InMaintenance(targetAddr) {
-			logger.Info("Cluster affinity backend no longer configured or in maintenance - deleting affinity", "proxy", params.ProxyName, "backend", lastAddr, "user", params.Username, "protocol", foundProtocol)
+		// Check if the backend is still a member of the user's pool and not in maintenance.
+		// It might have been removed from the config since the affinity was cached, or the
+		// lookup may have moved the user to another pool. A backend in maintenance is
+		// treated the same: the user is routed afresh, and the new affinity keeps them there
+		// after maintenance ends (no stampede back).
+		if !cm.poolHasBackend(pool, targetAddr) || cm.InMaintenance(targetAddr) {
+			logger.Info("Cluster affinity backend not in the user's pool or in maintenance - deleting affinity", "proxy", params.ProxyName, "backend", lastAddr, "pool", pool.name, "user", params.Username, "protocol", foundProtocol)
 			affinityMgr.DeleteBackend(params.Username, foundProtocol)
 
 			if foundProtocol == params.Protocol {
-				logger.Debug("Retrying affinity lookup after deleting unconfigured same-protocol affinity",
+				logger.Debug("Retrying affinity lookup after deleting out-of-pool same-protocol affinity",
 					"proxy", params.ProxyName, "user", params.Username, "protocol", params.Protocol)
 				continue
 			}
@@ -1768,7 +2107,7 @@ func resolveAffinityRoute(params RouteParams, affinityMgr AffinityManager, resul
 		}
 
 		// Check if resolved backend is healthy (without auto-recovery for sticky failover)
-		if params.ConnManager.IsBackendHealthyForAffinity(targetAddr) {
+		if cm.IsBackendHealthyForAffinity(targetAddr) {
 			if foundProtocol == params.Protocol {
 				logger.Info("Using cluster affinity", "proxy", params.ProxyName, "user", params.Username, "backend", targetAddr)
 				return targetAddr, "affinity"
@@ -1811,13 +2150,18 @@ func UpdateAffinityAfterConnection(params RouteParams, connectedBackend string, 
 		return
 	}
 
-	affinityMgr := params.ConnManager.GetAffinityManager()
+	cm := params.ConnManager
+	affinityMgr := cm.GetAffinityManager()
 	if affinityMgr == nil || params.Protocol == "" {
 		return
 	}
 
-	// Get the consistent hash placement for this user
-	consistentHashBackend := params.ConnManager.GetBackendByConsistentHash(params.Username)
+	// Get the consistent hash placement for this user, inside the pool it was routed in
+	pool, err := cm.poolForRoute(params.RoutingInfo)
+	if err != nil {
+		return
+	}
+	consistentHashBackend := cm.hashInPool(pool, params.Username)
 
 	// Check current affinity
 	currentBackend, hasAffinity := affinityMgr.GetBackend(params.Username, params.Protocol)

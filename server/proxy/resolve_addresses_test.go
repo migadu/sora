@@ -173,7 +173,7 @@ func TestResolveAddressesPicksUpAChangedBackendAddress(t *testing.T) {
 	if got := cm.remoteAddrs; len(got) != 1 || got[0] != "10.0.0.2:143" {
 		t.Errorf("pool after the backend's address changed = %v, want [10.0.0.2:143]", got)
 	}
-	if got := cm.consistentHash.GetBackend("user@example.com"); got != "10.0.0.2:143" {
+	if got := cm.defaultPool.ring.GetBackend("user@example.com"); got != "10.0.0.2:143" {
 		t.Errorf("consistent hash still routes to %q, want 10.0.0.2:143", got)
 	}
 	if !cm.IsBackendHealthy("10.0.0.2:143") {
@@ -314,7 +314,7 @@ func TestResolveAddressesGivesADualStackBackendOnePoolEntry(t *testing.T) {
 	if got := len(cm.backendHealth); got != 1 {
 		t.Errorf("one dual-stack backend has %d health entries, want 1", got)
 	}
-	if got := cm.consistentHash.Size(); got != 1 {
+	if got := cm.defaultPool.ring.Size(); got != 1 {
 		t.Errorf("one dual-stack backend takes %d places in the hash ring, want 1", got)
 	}
 
