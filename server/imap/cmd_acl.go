@@ -376,8 +376,9 @@ func (s *IMAPSession) SetACL(ctx context.Context, mailbox string, identifier ima
 		return nil
 	}
 
-	// Grant access with final rights using identifier
-	err = s.server.rdb.GrantMailboxAccessByIdentifierWithRetry(writeCtx, AccountID, identifierStr, mailbox, finalRights)
+	// Grant on the mailbox's owner, not the session's account: a user holding 'a'
+	// on someone else's shared mailbox administers that mailbox (RFC 4314 §2.1).
+	err = s.server.rdb.GrantMailboxAccessByIdentifierWithRetry(writeCtx, mbox.AccountID, identifierStr, mbox.Name, finalRights)
 	if err != nil {
 		// RFC 5530 CANNOT: these grants can never succeed, which the client must be
 		// able to tell from a server fault.
