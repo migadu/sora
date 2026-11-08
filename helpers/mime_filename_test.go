@@ -12,6 +12,7 @@ func TestAttachmentKeyword_FilenameParameters(t *testing.T) {
 		{"quoted escape", `inline; filename="report\"; final.pdf"`, attachmentFound},
 		{"parameter text inside another value", `inline; description="notes; filename*=iso-8859-1''%E4.pdf"`, attachmentNone},
 		{"invalid quoted disposition", `"inline; filename=report.pdf`, attachmentUnknown},
+		{"invalid disposition token sequence", `x-custom garbage`, attachmentUnknown},
 		{"malformed legacy with valid extended", `inline; filename=quarterly report.pdf; filename*=UTF-8''quarterly%20report.pdf`, attachmentFound},
 		{"valid legacy with malformed extended", `inline; filename="quarterly report.pdf"; filename*=UTF-8''quarterly report.pdf`, attachmentFound},
 		{"invalid extended before valid legacy", `inline; filename*=UTF-8''bad%ZZ; filename="report.pdf"`, attachmentFound},

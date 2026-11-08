@@ -44,3 +44,22 @@ func TestAttachmentKeyword_RFCDigestDefaultScope(t *testing.T) {
 		})
 	}
 }
+
+func TestAttachmentKeyword_AmbiguousMIMEHeaders(t *testing.T) {
+	for _, raw := range []string{
+		"Content-Type: text/plain\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Disposition: attachment\r\n\r\nPDF\r\n--b--\r\n",
+		"Content-Type: application/pdf\r\nContent-Disposition: inline\r\nContent-Disposition: attachment\r\n\r\nPDF",
+	} {
+		keyword, known := AttachmentKeyword([]byte(raw))
+		if known {
+			t.Fatalf("ambiguous MIME headers yielded %q; want unknown", keyword)
+		}
+	}
+	// Conflicting disposition fields do not make a unique MIME boundary
+	// ambiguous, so a real child attachment still settles the positive result.
+	raw := "Content-Type: multipart/mixed; boundary=b\r\nContent-Disposition: inline\r\nContent-Disposition: x-custom\r\n\r\n" +
+		"--b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment\r\n\r\nPDF\r\n--b--\r\n"
+	if keyword, known := AttachmentKeyword([]byte(raw)); !known || keyword != KeywordHasAttachment {
+		t.Fatalf("definite child attachment yielded %q, %v", keyword, known)
+	}
+}

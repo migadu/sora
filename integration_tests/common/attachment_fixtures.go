@@ -9,6 +9,9 @@ import "strings"
 func AttachmentKeywordRegressionCases() []struct{ Name, MIME, Keyword string } {
 	msg := func(lines ...string) string { return strings.Join(lines, "\r\n") + "\r\n" }
 	return []struct{ Name, MIME, Keyword string }{
+		{"duplicate content types stay unknown", msg("Content-Type: text/plain", "Content-Type: multipart/mixed; boundary=b", "",
+			"--b", "Content-Disposition: attachment", "", "PDF", "--b--"), ""},
+		{"duplicate dispositions stay unknown", msg("Content-Type: application/pdf", "Content-Disposition: inline", "Content-Disposition: attachment", "", "PDF"), ""},
 		{"related boundary survives unquoted type", msg(`Content-Type: multipart/related; boundary="b"; type=text/html`, "",
 			"--b", "Content-Type: text/html", "", "<p>body</p>",
 			"--b", "Content-Type: application/pdf", "Content-Disposition: attachment", "", "PDF", "--b--"), "$hasattachment"},

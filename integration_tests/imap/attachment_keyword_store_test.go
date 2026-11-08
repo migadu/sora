@@ -88,9 +88,15 @@ func TestIMAP_AttachmentKeywordOtherFlagWriters(t *testing.T) {
 	require.NoError(t, err)
 	mailbox, err := b.ResilientDB.GetMailboxByNameWithRetry(ctx, accountID, "INBOX")
 	require.NoError(t, err)
-	for _, operation := range []string{"single add", "single set", "user api add", "user api conflicting pair"} {
+	for _, operation := range []string{"single add", "single set", "user api add", "user api conflicting pair", "user api switch at keyword cap"} {
 		t.Run(operation, func(t *testing.T) {
-			uid := appendRaw(t, c, "INBOX", "Subject: "+operation+"\r\n\r\nbody", []imap.Flag{imap.FlagSeen, "Work", "$hasnoattachment"})
+			initial := []imap.Flag{imap.FlagSeen, "Work", "$hasnoattachment"}
+			if operation == "user api switch at keyword cap" {
+				for i := 0; i < db.MaxCustomKeywordsPerMessage-2; i++ {
+					initial = append(initial, imap.Flag(fmt.Sprintf("kw%d", i)))
+				}
+			}
+			uid := appendRaw(t, c, "INBOX", "Subject: "+operation+"\r\n\r\nbody", initial)
 			want := "$hasattachment"
 			switch operation {
 			case "single add":
@@ -109,7 +115,11 @@ func TestIMAP_AttachmentKeywordOtherFlagWriters(t *testing.T) {
 				err = b.ResilientDB.UpdateMessageFlagsWithRetry(ctx, accountID, id, add, nil)
 			}
 			require.NoError(t, err)
-			assertAttachmentStoreFlags(t, fetchFlags(t, c, uid), want)
+			got := fetchFlags(t, c, uid)
+			assertAttachmentStoreFlags(t, got, want)
+			if operation == "user api switch at keyword cap" {
+				require.Equal(t, db.MaxCustomKeywordsPerMessage, db.DistinctKeywordCount(got))
+			}
 		})
 	}
 }
@@ -128,33 +138,52 @@ func TestIMAP_AttachmentKeywordConcurrentStore(t *testing.T) {
 		return c
 	}
 	c1, c2 := dial(), dial()
-	for i := 0; i < 12; i++ {
-		uid := appendRaw(t, c1, "INBOX", fmt.Sprintf("Subject: concurrent-%d\r\n\r\nbody", i), []imap.Flag{imap.FlagSeen, "Work"})
-		start := make(chan struct{})
-		errors := make(chan error, 2)
-		var wg sync.WaitGroup
-		for _, update := range []struct {
-			c       *imapclient.Client
-			keyword imap.Flag
-			work    imap.Flag
-		}{{c1, "$HASATTACHMENT", "First"}, {c2, "$hasnoattachment", "Second"}} {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				<-start
-				_, err := update.c.Store(imap.UIDSetNum(uid), &imap.StoreFlags{Op: imap.StoreFlagsAdd, Flags: []imap.Flag{update.keyword, update.work}}, nil).Collect()
-				errors <- err
-			}()
-		}
-		close(start)
-		wg.Wait()
-		require.NoError(t, <-errors)
-		require.NoError(t, <-errors)
-		flags := fetchFlags(t, c1, uid)
-		has, _ := countFold(flags, "$hasattachment")
-		hasNo, _ := countFold(flags, "$hasnoattachment")
-		require.Equal(t, 1, has+hasNo, "flags = %v", flags)
-		require.Contains(t, flags, imap.Flag("First"))
-		require.Contains(t, flags, imap.Flag("Second"))
+	ctx := context.Background()
+	accountID, err := b.ResilientDB.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+	mailbox, err := b.ResilientDB.GetMailboxByNameWithRetry(ctx, accountID, "INBOX")
+	require.NoError(t, err)
+	for _, writer := range []string{"store", "single DB add", "user API"} {
+		t.Run(writer, func(t *testing.T) {
+			for i := 0; i < 12; i++ {
+				uid := appendRaw(t, c1, "INBOX", fmt.Sprintf("Subject: concurrent-%s-%d\r\n\r\nbody", writer, i), []imap.Flag{imap.FlagSeen, "Work"})
+				var id int64
+				require.NoError(t, b.ResilientDB.QueryRowWithRetry(ctx, "SELECT id FROM messages WHERE mailbox_id = $1 AND uid = $2", mailbox.ID, uid).Scan(&id))
+				start := make(chan struct{})
+				errors := make(chan error, 2)
+				var wg sync.WaitGroup
+				for _, update := range []func() error{
+					func() error {
+						_, err := c1.Store(imap.UIDSetNum(uid), &imap.StoreFlags{Op: imap.StoreFlagsAdd, Flags: []imap.Flag{"$HASATTACHMENT", "First"}}, nil).Collect()
+						return err
+					},
+					func() error {
+						switch writer {
+						case "single DB add":
+							_, _, err := b.ResilientDB.AddMessageFlagsWithRetry(ctx, uid, mailbox.ID, []imap.Flag{"$hasnoattachment", "Second"})
+							return err
+						case "user API":
+							return b.ResilientDB.UpdateMessageFlagsWithRetry(ctx, accountID, id, []string{"$hasnoattachment", "Second"}, nil)
+						default:
+							_, err := c2.Store(imap.UIDSetNum(uid), &imap.StoreFlags{Op: imap.StoreFlagsAdd, Flags: []imap.Flag{"$hasnoattachment", "Second"}}, nil).Collect()
+							return err
+						}
+					},
+				} {
+					wg.Add(1)
+					go func() { defer wg.Done(); <-start; errors <- update() }()
+				}
+				close(start)
+				wg.Wait()
+				require.NoError(t, <-errors)
+				require.NoError(t, <-errors)
+				flags := fetchFlags(t, c1, uid)
+				has, _ := countFold(flags, "$hasattachment")
+				hasNo, _ := countFold(flags, "$hasnoattachment")
+				require.Equal(t, 1, has+hasNo, "flags = %v", flags)
+				require.Contains(t, flags, imap.Flag("First"))
+				require.Contains(t, flags, imap.Flag("Second"))
+			}
+		})
 	}
 }
