@@ -27,6 +27,9 @@ const (
 //     outside multipart/related. That counts Apple Mail's inline-disposition
 //     attachments and older mailers' name-only ones, but not the images an HTML
 //     body embeds by Content-ID, or
+//   - is a leaf outside multipart/related with no Content-Disposition whose type
+//     is not text/plain, text/html, image, audio or video (RFC 8621 §4.1.4's
+//     body types; RFC 9979 §4.1 ties the keyword to JMAP's hasAttachment), or
 //   - is a message/rfc822 or message/global part (a forwarded message).
 //
 // Signature parts (S/MIME and OpenPGP) are never attachments, though mailers

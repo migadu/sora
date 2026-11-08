@@ -61,7 +61,9 @@ func attachmentInMessage(data []byte) attachmentResult {
 			if !contentType.complete {
 				unknown = true
 			}
-			if primary, subtype, ok := strings.Cut(mediaType, "/"); !ok || primary == "" || subtype == "" {
+			primary, subtype, validType := strings.Cut(mediaType, "/")
+			validType = validType && primary != "" && subtype != ""
+			if !validType {
 				unknown = true
 			}
 			disposition := mimeHeaderValue{complete: true}
@@ -90,6 +92,17 @@ func attachmentInMessage(data []byte) attachmentResult {
 						unknown = true
 					}
 				}
+				// RFC 8621 §4.1.4 counts every leaf that is not text/plain,
+				// text/html, image, audio or video as an attachment, and RFC
+				// 9979 §4.1 ties this keyword to JMAP's hasAttachment. With no
+				// Content-Disposition at all the type alone decides, so a bare
+				// application/pdf is an attachment. A disposition was judged
+				// above: attachment returned, inline is exempt (RFC 8621's
+				// hasAttachment), and an unparsable one stays undecided.
+				if validType && !header.Has("Content-Disposition") &&
+					!strings.HasPrefix(mediaType, "multipart/") && !inlineMediaType(mediaType) {
+					return attachmentFound
+				}
 			}
 			if strings.HasPrefix(mediaType, "multipart/") {
 				if len(parents) >= maxAttachmentMultipartDepth {
@@ -101,7 +114,9 @@ func attachmentInMessage(data []byte) attachmentResult {
 					mr := textproto.NewMultipartReader(body, boundary)
 					part, err := mr.NextPart()
 					if err == nil {
-						inRelated = inRelated || mediaType == "multipart/related"
+						// RFC 2387 relates the direct children only, and RFC
+						// 8621 §4.1.4 scopes its related rule the same way.
+						inRelated = mediaType == "multipart/related"
 						// RFC 2046 §5.1.5 changes only direct digest children's
 						// default; an explicitly typed nested multipart resets it.
 						defaultType = "text/plain"
@@ -144,4 +159,13 @@ func attachmentInMessage(data []byte) attachmentResult {
 			break
 		}
 	}
+}
+
+// inlineMediaType reports the body types RFC 8621 §4.1.4 renders inline. Any
+// other leaf type is an attachment unless its disposition says otherwise.
+func inlineMediaType(mediaType string) bool {
+	return mediaType == "text/plain" || mediaType == "text/html" ||
+		strings.HasPrefix(mediaType, "image/") ||
+		strings.HasPrefix(mediaType, "audio/") ||
+		strings.HasPrefix(mediaType, "video/")
 }

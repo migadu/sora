@@ -13,7 +13,7 @@ func TestAttachmentKeyword_MIMEStructure(t *testing.T) {
 		valid bool
 	}{
 		{"plain", "Subject: plain\r\n\r\nbody", true},
-		{"opaque body", "Content-Type: application/octet-stream\r\n\r\n\x00\xff", true},
+		{"opaque body", "Content-Type: text/plain\r\n\r\n\x00\xff", true},
 		{"multipart", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nbody\r\n--b--\r\n", true},
 		{"closing boundary without newline", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nbody\r\n--b--", true},
 		{"bad header", "not a header\r\n\r\nbody", false},
