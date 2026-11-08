@@ -30,9 +30,9 @@ func (o *dbVacationOracle) IsVacationResponseAllowed(ctx context.Context, Accoun
 	return !hasRecent, nil // Allowed if no recent response found
 }
 
-// RecordVacationResponseSent records that a vacation response has been sent.
-func (o *dbVacationOracle) RecordVacationResponseSent(ctx context.Context, AccountID int64, originalSender string, responseIdentity string) error {
-	return o.rdb.RecordVacationResponseWithRetry(ctx, AccountID, originalSender, responseIdentity)
+// ClaimVacationResponse makes the definitive suppression decision at handoff.
+func (o *dbVacationOracle) ClaimVacationResponse(ctx context.Context, AccountID int64, originalSender, responseIdentity string, duration time.Duration) (bool, error) {
+	return o.rdb.ClaimVacationResponseWithRetry(ctx, AccountID, originalSender, responseIdentity, duration)
 }
 
 // CountRedirectsSince returns the number of redirects performed by the given account within the specified duration window.

@@ -144,12 +144,11 @@ type VacationReply struct {
 	Body    string // the reason
 	IsMime  bool
 
-	// RecordSent commits the :days window for this sender. It is nil without a
-	// VacationOracle, and the delivery path must call it immediately before handing
-	// the reply to the relay: the mandatory §4.5 suppression checks run there and may
-	// still decide not to reply, while recording after the handoff would let a
-	// redelivery of the same message produce a second reply.
-	RecordSent func(ctx context.Context) error
+	// ClaimResponse atomically consumes the :days window for this sender and
+	// response identity. It is nil without a VacationOracle. Delivery calls it
+	// after suppression/MIME checks, immediately before relay handoff; false means
+	// another delivery already consumed the window and this reply must be skipped.
+	ClaimResponse func(ctx context.Context) (bool, error)
 }
 
 type Context struct {
@@ -175,9 +174,9 @@ type VacationOracle interface {
 	// to the given originalSender for the specified user and response identity,
 	// considering the duration since the last response.
 	IsVacationResponseAllowed(ctx context.Context, AccountID int64, originalSender string, responseIdentity string, duration time.Duration) (bool, error)
-	// RecordVacationResponseSent records that a vacation response has been sent
-	// to the originalSender for the specified user and response identity.
-	RecordVacationResponseSent(ctx context.Context, AccountID int64, originalSender string, responseIdentity string) error
+	// ClaimVacationResponse atomically checks and consumes the suppression period.
+	// Unlike the evaluation-time check, this handoff-time decision is definitive.
+	ClaimVacationResponse(ctx context.Context, AccountID int64, originalSender, responseIdentity string, duration time.Duration) (bool, error)
 }
 
 // RedirectOracle defines the methods SievePolicy needs to interact with
@@ -400,11 +399,11 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 			break
 		}
 		result.Vacation = &VacationReply{
-			From:       vacation.From,
-			Subject:    vacation.Subject,
-			Body:       vacation.Body,
-			IsMime:     vacation.IsMime,
-			RecordSent: execPolicy.vacationRecorder(sender, vacation.ResponseIdentity),
+			From:          vacation.From,
+			Subject:       vacation.Subject,
+			Body:          vacation.Body,
+			IsMime:        vacation.IsMime,
+			ClaimResponse: execPolicy.vacationClaimer(sender, vacation.ResponseIdentity, duration),
 		}
 		break
 	}
@@ -526,21 +525,22 @@ func (p *SievePolicy) VacationResponseAllowed(ctx context.Context, d *interp.Run
 	return true, nil
 }
 
-// vacationRecorder returns the deferred commit of the persistent :days window for
+// vacationClaimer returns the deferred claim of the persistent :days window for
 // `originalSender`, or nil when there is no oracle (the in-memory fallback tracking
 // lives and dies with a single evaluation). The returned function takes its own
 // context: it runs on the delivery path, after this evaluation's budget has expired.
-func (p *SievePolicy) vacationRecorder(originalSender, responseIdentity string) func(context.Context) error {
+func (p *SievePolicy) vacationClaimer(originalSender, responseIdentity string, duration time.Duration) func(context.Context) (bool, error) {
 	oracle := p.vacationOracle
 	if oracle == nil {
 		return nil
 	}
 	accountID := p.AccountID
-	return func(ctx context.Context) error {
-		if err := oracle.RecordVacationResponseSent(ctx, accountID, originalSender, responseIdentity); err != nil {
-			return fmt.Errorf("failed to record vacation response sent via oracle: %w", err)
+	return func(ctx context.Context) (bool, error) {
+		claimed, err := oracle.ClaimVacationResponse(ctx, accountID, originalSender, responseIdentity, duration)
+		if err != nil {
+			return false, fmt.Errorf("failed to claim vacation response via oracle: %w", err)
 		}
-		return nil
+		return claimed, nil
 	}
 }
 
