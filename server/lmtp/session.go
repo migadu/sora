@@ -19,7 +19,6 @@ import (
 	"github.com/emersion/go-message/mail"
 
 	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-smtp"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -565,8 +564,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// address (s.User.Address, set in Rcpt) — the same value the Admin API path uses — so
 	// loop detection is consistent across aliases and ingress paths, and within-account
 	// content dedup (per-account S3 keys) is preserved. Re-parse so downstream header/
-	// metadata extraction sees the stamped header (the prepended header does not change MIME
-	// body structure, so the buf.Bytes()-based body structure below stays correct).
+	// metadata extraction sees the stamped header. MIME structure is extracted
+	// from the final bytes after Sieve's header edits below.
 	if s.User != nil {
 		deliveredTo := s.User.Address.BaseAddress()
 		if helpers.IsRedirectLoop(helpers.HeaderGetter(messageContent.Header.Map()), deliveredTo) {
@@ -634,8 +633,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		s.DebugLog("message sent date", "sent_date", sentDate)
 	}
 
-	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(buf.Bytes()))
-	bodyStructure := &bodyStructureVal
 	var plaintextBody *string
 	plaintextBodyResult, extractErr := helpers.ExtractPlaintextBody(messageContent)
 	if extractErr != nil {
@@ -902,6 +899,17 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			"flags", strings.Join(rejected, ","),
 			"reason", "not a valid IMAP flag-keyword (RFC 9051 §9: ASCII atom, no specials)")
 	}
+
+	// Classify and extract the final stored MIME once, after editheader, and
+	// reuse both results for every fileinto :copy destination. The structure
+	// gets the same validation and fallback as APPEND's and the Admin API's:
+	// a stored structure that does not serialize panics the FETCH write path.
+	bodyStructureVal, bsErr := helpers.SafeBodyStructure(fullMessageBytes)
+	if bsErr != nil {
+		s.WarnLog("storing a fallback body structure", "error", bsErr)
+	}
+	bodyStructure := &bodyStructureVal
+	sieveFlags = db.WithAttachmentKeyword(sieveFlags, fullMessageBytes, true)
 
 	switch result.Action {
 	case sieveengine.ActionFileInto:
@@ -1362,7 +1370,7 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 			References:    references,
 			BodyStructure: bodyStructure,
 			Recipients:    recipients,
-			Flags:         flags, // Flags set by the Sieve script (imap4flags); empty -> unread
+			Flags:         flags, // Sieve-set flags (imap4flags) plus the attachment keyword; no \Seen -> unread
 			FTSRetention:  s.backend.ftsRetention,
 		},
 		db.PendingUpload{

@@ -387,6 +387,14 @@ List messages in a mailbox with pagination.
 }
 ```
 
+`has_attachments` comes from the RFC 9979 keywords Sora sets when it stores a message
+(on delivery and on IMAP APPEND): `true` for `$hasattachment`, `false` for
+`$hasnoattachment`. It is omitted when the message carries neither, which is mail
+stored before Sora set them, or mail Sora could not inspect, such as encrypted mail.
+A part counts as an attachment when it has `Content-Disposition: attachment`, has a
+filename outside `multipart/related` (so images an HTML body embeds do not count), or
+is a forwarded message. Signature parts (`smime.p7s`, `signature.asc`) never count.
+
 **Example:**
 ```bash
 # First page (messages 1-50)
@@ -509,6 +517,10 @@ curl http://localhost:8081/user/messages/12345/raw \
 **Endpoint:** `PATCH /user/messages/{id}`
 
 Add or remove flags from a message.
+
+Additions are applied before removals. A keyword listed in both arrays is
+removed, regardless of case. Only additions that survive removals can replace
+the opposite attachment keyword.
 
 **Request Body:**
 ```json
