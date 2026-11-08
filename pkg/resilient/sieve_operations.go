@@ -218,9 +218,9 @@ func (rd *ResilientDatabase) RenameScriptWithRetry(ctx context.Context, AccountI
 // Vacation response methods
 
 // HasRecentVacationResponseWithRetry checks if a vacation response was sent recently with retry logic
-func (rd *ResilientDatabase) HasRecentVacationResponseWithRetry(ctx context.Context, AccountID int64, recipient string, duration time.Duration) (bool, error) {
+func (rd *ResilientDatabase) HasRecentVacationResponseWithRetry(ctx context.Context, AccountID int64, recipient, responseIdentity string, duration time.Duration) (bool, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).HasRecentVacationResponse(ctx, AccountID, recipient, duration)
+		return rd.getOperationalDatabaseForOperation(ctx, false).HasRecentVacationResponse(ctx, AccountID, recipient, responseIdentity, duration)
 	}
 
 	result, err := rd.executeReadWithRetry(ctx, sieveReadRetryConfig, timeoutRead, op)
@@ -232,9 +232,9 @@ func (rd *ResilientDatabase) HasRecentVacationResponseWithRetry(ctx context.Cont
 }
 
 // RecordVacationResponseWithRetry records that a vacation response was sent with retry logic
-func (rd *ResilientDatabase) RecordVacationResponseWithRetry(ctx context.Context, AccountID int64, recipient string) error {
+func (rd *ResilientDatabase) RecordVacationResponseWithRetry(ctx context.Context, AccountID int64, recipient, responseIdentity string) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RecordVacationResponse(ctx, tx, AccountID, recipient)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RecordVacationResponse(ctx, tx, AccountID, recipient, responseIdentity)
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)

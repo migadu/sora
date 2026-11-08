@@ -9,26 +9,27 @@ import (
 
 // VacationResponse represents a record of a vacation auto-response sent to a sender
 type VacationResponse struct {
-	ID            int64
-	AccountID     int64
-	SenderAddress string
-	ResponseDate  time.Time
-	CreatedAt     time.Time
+	ID               int64
+	AccountID        int64
+	SenderAddress    string
+	ResponseIdentity string
+	ResponseDate     time.Time
+	CreatedAt        time.Time
 }
 
 // RecordVacationResponse records that a vacation response was sent to a specific sender
-func (db *Database) RecordVacationResponse(ctx context.Context, tx pgx.Tx, AccountID int64, senderAddress string) error {
+func (db *Database) RecordVacationResponse(ctx context.Context, tx pgx.Tx, AccountID int64, senderAddress, responseIdentity string) error {
 	now := time.Now()
 	_, err := tx.Exec(ctx, `
-		INSERT INTO vacation_responses (account_id, sender_address, response_date, created_at)
-		VALUES ($1, $2, $3, $4)
-	`, AccountID, senderAddress, now, now)
+		INSERT INTO vacation_responses (account_id, sender_address, response_identity, response_date, created_at)
+		VALUES ($1, $2, $3, $4, $4)
+	`, AccountID, senderAddress, responseIdentity, now)
 
 	return err
 }
 
 // HasRecentVacationResponse checks if a vacation response was sent to this sender within the specified duration
-func (db *Database) HasRecentVacationResponse(ctx context.Context, AccountID int64, senderAddress string, duration time.Duration) (bool, error) {
+func (db *Database) HasRecentVacationResponse(ctx context.Context, AccountID int64, senderAddress, responseIdentity string, duration time.Duration) (bool, error) {
 	cutoffTime := time.Now().Add(-duration)
 
 	var exists bool
@@ -37,9 +38,10 @@ func (db *Database) HasRecentVacationResponse(ctx context.Context, AccountID int
 			SELECT 1 FROM vacation_responses 
 			WHERE account_id = $1 
 			AND sender_address = $2 
-			AND response_date > $3
+			AND response_identity = $3
+			AND response_date > $4
 		)
-	`, AccountID, senderAddress, cutoffTime).Scan(&exists)
+	`, AccountID, senderAddress, responseIdentity, cutoffTime).Scan(&exists)
 
 	return exists, err
 }
