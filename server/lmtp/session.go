@@ -1089,12 +1089,15 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 // left where the message goes to the default. Everything else it did still happens,
 // after the default script's work as the two ran: its flags join the default's, its
 // header edits follow the default's, and its vacation reply goes out (RFC 5230 §4.7),
-// seeing those edits as RFC 5293 §7 requires.
+// seeing those edits as RFC 5293 §7 requires. A user reply takes precedence;
+// otherwise the default script's independent vacation reply still stands.
 func keepDefaultAction(defaultResult, userResult sieveengine.Result) sieveengine.Result {
 	merged := defaultResult
 	merged.Flags = mergeFlags(defaultResult.Flags, userResult.Flags)
 	merged.HeaderEdits = slices.Concat(defaultResult.HeaderEdits, userResult.HeaderEdits)
-	merged.Vacation = userResult.Vacation
+	if userResult.Vacation != nil {
+		merged.Vacation = userResult.Vacation
+	}
 	return merged
 }
 

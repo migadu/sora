@@ -281,10 +281,13 @@ func (m *mockVacationOracle) IsVacationResponseAllowed(ctx context.Context, acco
 	return time.Since(lastSent) >= duration, nil
 }
 
-func (m *mockVacationOracle) RecordVacationResponseSent(ctx context.Context, accountID int64, originalSender string, handle string) error {
+func (m *mockVacationOracle) ClaimVacationResponse(ctx context.Context, accountID int64, originalSender, handle string, duration time.Duration) (bool, error) {
 	key := m.makeKey(accountID, originalSender, handle)
+	if last, ok := m.responses[key]; ok && time.Since(last) < duration {
+		return false, nil
+	}
 	m.responses[key] = time.Now()
-	return nil
+	return true, nil
 }
 
 func (m *mockVacationOracle) CountRedirectsSince(ctx context.Context, accountID int64, window time.Duration) (int, error) {
@@ -405,7 +408,7 @@ func TestVacationAlongsideEveryAction(t *testing.T) {
 			if result.Vacation.Subject != "Away" || result.Vacation.Body != "I'm away" {
 				t.Errorf("reply subject %q body %q, want \"Away\" \"I'm away\"", result.Vacation.Subject, result.Vacation.Body)
 			}
-			if result.Vacation.RecordSent == nil {
+			if result.Vacation.ClaimResponse == nil {
 				t.Errorf("expected a recorder to commit the :days window with")
 			}
 		})
@@ -446,11 +449,11 @@ vacation :days 7 :subject "Away" "I'm away";
 	}
 
 	// The window is consumed by the delivery path once the reply is handed off.
-	if result1.Vacation.RecordSent == nil {
+	if result1.Vacation.ClaimResponse == nil {
 		t.Fatalf("First evaluation: expected a recorder for the sent reply")
 	}
-	if err := result1.Vacation.RecordSent(context.Background()); err != nil {
-		t.Fatalf("Failed to record vacation response: %v", err)
+	if claimed, err := result1.Vacation.ClaimResponse(context.Background()); err != nil || !claimed {
+		t.Fatalf("Failed to claim vacation response: claimed=%v error=%v", claimed, err)
 	}
 
 	// Second evaluation immediately after - should NOT trigger vacation (rate limited)
@@ -505,7 +508,7 @@ vacation :days 7 :subject "Away" "I'm away";
 		if result.Vacation == nil {
 			t.Fatalf("Evaluation %d: expected a vacation reply", i)
 		}
-		if result.Vacation.RecordSent == nil {
+		if result.Vacation.ClaimResponse == nil {
 			t.Fatalf("Evaluation %d: expected a recorder to commit the window with", i)
 		}
 	}

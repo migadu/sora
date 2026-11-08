@@ -46,18 +46,18 @@ type VacationOracle struct {
 	RDB *resilient.ResilientDatabase
 }
 
-// IsVacationResponseAllowed checks if a vacation response is allowed for the given original sender and handle.
-func (o *VacationOracle) IsVacationResponseAllowed(ctx context.Context, AccountID int64, originalSender string, handle string, duration time.Duration) (bool, error) {
-	hasRecent, err := o.RDB.HasRecentVacationResponseWithRetry(ctx, AccountID, originalSender, duration)
+// IsVacationResponseAllowed checks if a vacation response is allowed for the given original sender and response identity.
+func (o *VacationOracle) IsVacationResponseAllowed(ctx context.Context, AccountID int64, originalSender string, responseIdentity string, duration time.Duration) (bool, error) {
+	hasRecent, err := o.RDB.HasRecentVacationResponseWithRetry(ctx, AccountID, originalSender, responseIdentity, duration)
 	if err != nil {
 		return false, fmt.Errorf("checking db for recent vacation response: %w", err)
 	}
 	return !hasRecent, nil
 }
 
-// RecordVacationResponseSent records that a vacation response has been sent.
-func (o *VacationOracle) RecordVacationResponseSent(ctx context.Context, AccountID int64, originalSender string, handle string) error {
-	return o.RDB.RecordVacationResponseWithRetry(ctx, AccountID, originalSender)
+// ClaimVacationResponse makes the definitive suppression decision at handoff.
+func (o *VacationOracle) ClaimVacationResponse(ctx context.Context, AccountID int64, originalSender, responseIdentity string, duration time.Duration) (bool, error) {
+	return o.RDB.ClaimVacationResponseWithRetry(ctx, AccountID, originalSender, responseIdentity, duration)
 }
 
 // CountRedirectsSince returns the number of redirects performed by the given account within the specified duration window.
