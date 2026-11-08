@@ -1,0 +1,147 @@
+package server
+
+import (
+	"crypto/tls"
+	"fmt"
+	"net"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type timeoutNoticeCloseObservedConn struct {
+	net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *timeoutNoticeCloseObservedConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func TestSoraConnTimeoutTLSCloseIsBounded(t *testing.T) {
+	cert, err := tls.LoadX509KeyPair("../testdata/sora.crt", "../testdata/sora.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, peer := net.Pipe()
+	defer transport.Close()
+	defer peer.Close()
+	observed := &timeoutNoticeCloseObservedConn{Conn: transport, closed: make(chan struct{})}
+	serverTLS := tls.Server(observed, &tls.Config{Certificates: []tls.Certificate{cert}})
+	clientTLS := tls.Client(peer, &tls.Config{InsecureSkipVerify: true})
+	clientHandshake := make(chan error, 1)
+	go func() { clientHandshake <- clientTLS.Handshake() }()
+	if err := serverTLS.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-clientHandshake; err != nil {
+		t.Fatal(err)
+	}
+	// The callback returns immediately, but TLS Close itself sends close_notify
+	// and can block for five seconds when the peer stops reading after handshake.
+	sc := NewSoraConn(serverTLS, SoraConnConfig{AbsoluteTimeout: time.Millisecond})
+	checked := make(chan struct{})
+	go func() { sc.checkTimeouts(time.Now().Add(time.Second)); close(checked) }()
+	select {
+	case <-observed.closed:
+	case <-time.After(time.Second):
+		t.Error("timeout did not close the underlying TLS transport within one second")
+	}
+	peer.Close()
+	<-checked
+}
+
+// A protocol writer can replace a connection's write deadline while a timeout
+// notice is being sent. Simulate a transport whose deadline cannot bound the
+// callback, to check that hard closure still releases its write and goroutine.
+type timeoutNoticeNoDeadlineConn struct{ net.Conn }
+
+func (c timeoutNoticeNoDeadlineConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestSoraConnTimeoutNoticeCannotHoldConnectionOpen(t *testing.T) {
+	for _, reason := range []string{"idle", "session_max", "slow_throughput"} {
+		t.Run(reason, func(t *testing.T) {
+			transport, peer := net.Pipe()
+			defer peer.Close()
+			defer transport.Close()
+			finished := make(chan struct{})
+			sc := NewSoraConn(timeoutNoticeNoDeadlineConn{transport}, SoraConnConfig{
+				NoAbsoluteTimeout: true,
+				OnTimeout: func(conn net.Conn, got string) {
+					defer close(finished)
+					if got != reason {
+						t.Errorf("timeout reason = %q, want %q", got, reason)
+					}
+					fmt.Fprint(conn, "goodbye\r\n")
+				},
+			})
+			now := time.Now()
+			switch reason {
+			case "idle":
+				sc.idleTimeout = time.Second
+				sc.lastActivity = now.Add(-time.Minute)
+			case "session_max":
+				sc.absoluteTimeout = time.Second
+				sc.sessionStart = now.Add(-time.Minute)
+			case "slow_throughput":
+				sc.minBytesPerMinute = 512
+				sc.sessionStart = now.Add(-5 * time.Minute)
+				sc.lastThroughputCheck = now.Add(-time.Minute)
+				sc.bytesRead = 1
+				sc.consecutiveStalledWindows = 1
+			}
+			checked := make(chan struct{})
+			go func() { sc.checkTimeouts(now); close(checked) }()
+			select {
+			case <-checked:
+			case <-time.After(time.Second):
+				t.Error("timeout check blocked on the protocol notice")
+			}
+			select {
+			case <-finished:
+			case <-time.After(time.Second):
+				t.Error("stalled notice was not released by closing the transport")
+			}
+			// Cleanup also waits for the check and callback on the unfixed code.
+			peer.Close()
+			<-checked
+			<-finished
+		})
+	}
+}
+
+func TestSoraConnTimeoutNoticeRunsOnce(t *testing.T) {
+	transport, peer := net.Pipe()
+	defer transport.Close()
+	entered := make(chan struct{})
+	var first sync.Once
+	var calls atomic.Int32
+	sc := NewSoraConn(transport, SoraConnConfig{
+		AbsoluteTimeout: time.Millisecond,
+		OnTimeout: func(conn net.Conn, _ string) {
+			calls.Add(1)
+			first.Do(func() { close(entered) })
+			fmt.Fprint(conn, "goodbye\r\n")
+		},
+	})
+	now := time.Now().Add(time.Second)
+	var checks sync.WaitGroup
+	check := func() { defer checks.Done(); sc.checkTimeouts(now) }
+	checks.Add(1)
+	go check()
+	<-entered
+	for range 20 {
+		checks.Add(1)
+		go check()
+	}
+	// Leave the first notice blocked while subsequent checks run.
+	time.Sleep(30 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Errorf("timeout notice invoked %d times for one connection, want 1", got)
+	}
+	peer.Close()
+	checks.Wait()
+}
