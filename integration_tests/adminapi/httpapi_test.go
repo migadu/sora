@@ -2345,6 +2345,88 @@ func TestACLManagementStatusCodes(t *testing.T) {
 	}
 }
 
+// TestACLManagementOneEntryPerAccount: an address names its account whatever its
+// case, so a grant is stored under the account's primary address and a revoke under
+// any spelling removes it. Revoking used to match the stored text exactly and answer
+// 200 while the user kept access. Also: rights are stored canonically (so a repeated
+// right is not a 500 from the column width), the owner can't be given rights it
+// always holds, and a deleted account can't be granted anything.
+func TestACLManagementOneEntryPerAccount(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server := setupHTTPAPIServer(t)
+	defer server.Close()
+
+	owner := common.CreateTestAccount(t, server.rdb)
+	member := common.CreateTestAccount(t, server.rdb)
+	gone := common.CreateTestAccount(t, server.rdb)
+
+	ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/"},
+	})
+	ownerID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
+	if err != nil {
+		t.Fatalf("Failed to resolve owner: %v", err)
+	}
+	shared := fmt.Sprintf("Shared/OneEntry-%d", time.Now().UnixNano())
+	if err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, shared, nil); err != nil {
+		t.Fatalf("Failed to create mailbox: %v", err)
+	}
+	if err := server.rdb.DeleteAccountWithRetry(ctx, gone.Email); err != nil {
+		t.Fatalf("Failed to delete account: %v", err)
+	}
+
+	const grantPath, revokePath = "/admin/mailboxes/acl/grant", "/admin/mailboxes/acl/revoke"
+	post := func(path string, body map[string]any, want int) {
+		t.Helper()
+		resp, respBody := server.makeRequest(t, "POST", path, body)
+		if resp.StatusCode != want {
+			t.Fatalf("POST %s %v: got %d %s, want %d", path, body, resp.StatusCode, strings.TrimSpace(string(respBody)), want)
+		}
+	}
+	// memberEntries returns the listed entries naming the member, in any case.
+	memberEntries := func() map[string]string {
+		t.Helper()
+		resp, body := server.makeRequest(t, "GET", "/admin/mailboxes/acl?"+url.Values{"owner": {owner.Email}, "mailbox": {shared}}.Encode(), nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("list: got %d %s", resp.StatusCode, body)
+		}
+		var list struct {
+			ACLs []struct{ Identifier, Rights string } `json:"acls"`
+		}
+		server.expectJSON(t, body, &list)
+		found := map[string]string{}
+		for _, e := range list.ACLs {
+			if strings.EqualFold(e.Identifier, member.Email) {
+				found[e.Identifier] = e.Rights
+			}
+		}
+		return found
+	}
+	grant := func(identifier, rights string) map[string]any {
+		return map[string]any{"owner": owner.Email, "mailbox": shared, "identifier": identifier, "rights": rights}
+	}
+
+	post(grantPath, grant(strings.ToUpper(member.Email), strings.Repeat("l", 21)+"r"), http.StatusOK)
+	if got := memberEntries(); len(got) != 1 || got[member.Email] != "lr" {
+		t.Fatalf("after granting <MEMBER> %q: entries %v, want {%s: lr}", strings.Repeat("l", 21)+"r", got, member.Email)
+	}
+	post(revokePath, map[string]any{"owner": owner.Email, "mailbox": shared, "identifier": strings.ToUpper(member.Email)}, http.StatusOK)
+	if got := memberEntries(); len(got) != 0 {
+		t.Fatalf("after revoking <MEMBER>: entries %v, want none", got)
+	}
+
+	post(grantPath, grant(gone.Email, "lr"), http.StatusNotFound)
+	post(grantPath, grant(owner.Email, "lr"), http.StatusBadRequest)
+	for _, path := range []string{grantPath, revokePath} {
+		post(path, map[string]any{"owner": "  ", "mailbox": shared, "identifier": member.Email, "rights": "lr"}, http.StatusBadRequest)
+	}
+	resp, body := server.makeRequest(t, "GET", "/admin/mailboxes/acl?"+url.Values{"owner": {"  "}, "mailbox": {shared}}.Encode(), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("list with a blank owner: got %d %s, want 400", resp.StatusCode, body)
+	}
+}
+
 // Mock AffinityManager for testing
 type mockAffinityManager struct {
 	mu       sync.RWMutex

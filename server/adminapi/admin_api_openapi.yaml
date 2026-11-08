@@ -2361,7 +2361,9 @@ paths:
         Use "anyone" as the identifier to grant access to all users in the same domain.
 
         Only mailboxes in the shared namespace (e.g. "Shared/") carry grants, and only
-        to users in the owner's domain; any other grant is refused with 400.
+        to users in the owner's domain other than the owner, who always holds every
+        right; any other grant is refused with 400. A user may be named by any of
+        their addresses in any case; the entry is stored under their primary address.
       security:
         - ApiKeyAuth: []
       requestBody:
@@ -2412,13 +2414,13 @@ paths:
                     type: string
                     example: "lrs"
         '400':
-          description: Bad request - invalid parameters or rights, a mailbox outside the shared namespace, or a user in another domain
+          description: Bad request - invalid parameters or rights, a mailbox outside the shared namespace, a user in another domain, or the owner
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '404':
-          description: Owner, mailbox or user not found
+          description: Owner, mailbox or user not found, or the user's account is deleted
           content:
             application/json:
               schema:
@@ -2443,7 +2445,9 @@ paths:
       summary: Revoke ACL rights from a user on a mailbox
       description: |
         Revoke all ACL (Access Control List) rights from a specific user or identifier on a mailbox.
-        Revoking from an identifier that holds no entry succeeds and changes nothing.
+        The identifier names its account whatever its case or which of the account's
+        addresses is given. Revoking from an identifier that holds no entry succeeds
+        and changes nothing.
       security:
         - ApiKeyAuth: []
       requestBody:

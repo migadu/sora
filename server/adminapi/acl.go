@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -40,7 +41,8 @@ func aclErrorStatus(err error) int {
 	switch {
 	case errors.Is(err, consts.ErrUserNotFound), errors.Is(err, consts.ErrMailboxNotFound):
 		return http.StatusNotFound
-	case errors.Is(err, db.ErrInvalidACLRight), errors.Is(err, db.ErrMailboxNotShared), errors.Is(err, db.ErrCrossDomainGrant):
+	case errors.Is(err, db.ErrInvalidACLRight), errors.Is(err, db.ErrMailboxNotShared),
+		errors.Is(err, db.ErrCrossDomainGrant), errors.Is(err, db.ErrOwnerACL):
 		return http.StatusBadRequest
 	}
 	return http.StatusInternalServerError
@@ -55,7 +57,7 @@ func (s *Server) handleACLGrant(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate required fields
-	if req.Owner == "" {
+	if strings.TrimSpace(req.Owner) == "" {
 		http.Error(w, `{"error": "owner is required"}`, http.StatusBadRequest)
 		return
 	}
@@ -107,7 +109,7 @@ func (s *Server) handleACLRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate required fields
-	if req.Owner == "" {
+	if strings.TrimSpace(req.Owner) == "" {
 		http.Error(w, `{"error": "owner is required"}`, http.StatusBadRequest)
 		return
 	}
@@ -124,8 +126,8 @@ func (s *Server) handleACLRevoke(w http.ResponseWriter, r *http.Request) {
 	aclSvc := aclservice.New(s.rdb)
 
 	// Revoke ACL
-	// Revoking an entry that is not there leaves the ACL as asked, as IMAP DELETEACL
-	// does (RFC 4314 §3.2), so it succeeds.
+	// Revoking what is not there leaves the ACL as asked (RFC 4314 §3.2), so it
+	// succeeds, whether or not the identifier names an account.
 	if err := aclSvc.Revoke(r.Context(), req.Owner, req.Mailbox, req.Identifier); err != nil && !errors.Is(err, consts.ErrDBNotFound) {
 		if status := aclErrorStatus(err); status != http.StatusInternalServerError {
 			s.writeError(w, status, err.Error())
@@ -154,7 +156,7 @@ func (s *Server) handleACLList(w http.ResponseWriter, r *http.Request) {
 	mailbox := r.URL.Query().Get("mailbox")
 
 	// Validate required parameters
-	if owner == "" {
+	if strings.TrimSpace(owner) == "" {
 		http.Error(w, `{"error": "owner parameter is required"}`, http.StatusBadRequest)
 		return
 	}

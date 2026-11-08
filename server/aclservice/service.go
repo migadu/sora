@@ -68,7 +68,7 @@ func (s *Service) Revoke(ctx context.Context, owner, mailboxName, identifier str
 	// if the current user has ACL access, so we need to verify ownership
 	mailbox, err := s.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, mailboxName)
 	if err != nil {
-		return fmt.Errorf("mailbox not found: %w", err)
+		return fmt.Errorf("mailbox %q: %w", mailboxName, err)
 	}
 
 	// Verify that the mailbox is actually owned by the specified owner
@@ -103,7 +103,7 @@ func (s *Service) List(ctx context.Context, owner, mailboxName string) ([]ACLEnt
 	// if the current user has ACL access, so we need to verify ownership
 	mailbox, err := s.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, mailboxName)
 	if err != nil {
-		return nil, fmt.Errorf("mailbox not found: %w", err)
+		return nil, fmt.Errorf("mailbox %q: %w", mailboxName, err)
 	}
 
 	// Verify that the mailbox is actually owned by the specified owner
