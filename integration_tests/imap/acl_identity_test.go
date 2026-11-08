@@ -518,14 +518,26 @@ func TestACL_OwnerAliasAbroadRevealsNothing(t *testing.T) {
 	require.NoError(t, co.SetACL(shared, imap.RightsIdentifier(admin), imap.RightModificationReplace, imap.RightSet("lra")).Wait())
 	ca := dialAndLogin(t, server.Address, admin, adminPassword)
 
-	answer := func(id string) string {
+	answers := func(id string) []string {
 		t.Helper()
-		data, err := ca.ListRights(shared, imap.RightsIdentifier(id)).Wait()
+		ri := imap.RightsIdentifier(id)
+		data, err := ca.ListRights(shared, ri).Wait()
 		require.NoError(t, err, "LISTRIGHTS %s", id)
-		return fmt.Sprintf("listrights=%q/%q setacl=%v", data.RequiredRights, rightGroups(data),
-			ca.SetACL(shared, imap.RightsIdentifier(id), imap.RightModificationReplace, imap.RightSet("l")).Wait())
+		got := []string{fmt.Sprintf("LISTRIGHTS %q/%q", data.RequiredRights, rightGroups(data))}
+		for _, op := range []struct {
+			mod    imap.RightModification
+			rights string
+		}{{imap.RightModificationRemove, "a"}, {imap.RightModificationRemove, "x"}, {imap.RightModificationReplace, "l"}, {imap.RightModificationAdd, "l"}} {
+			err := ca.SetACL(shared, ri, op.mod, imap.RightSet(op.rights)).Wait()
+			got = append(got, fmt.Sprintf("SETACL %c%s: %v", op.mod, op.rights, err))
+		}
+		got = append(got, fmt.Sprintf("DELETEACL: %v", ca.DeleteACL(shared, ri).Wait()))
+		for i := range got {
+			got[i] = strings.ReplaceAll(got[i], id, "X")
+		}
+		return got
 	}
-	require.Equal(t, strings.ReplaceAll(answer(ghost), ghost, "X"), strings.ReplaceAll(answer(ownerAbroad), ownerAbroad, "X"))
+	require.Equal(t, answers(ghost), answers(ownerAbroad))
 }
 
 // TestACL_NoOwnerDomainStillRevokes: a shared mailbox without an owner domain (legacy
@@ -550,6 +562,14 @@ func TestACL_NoOwnerDomainStillRevokes(t *testing.T) {
 	data, err := co.ListRights(shared, imap.RightsIdentifier(owner.Email)).Wait()
 	require.NoError(t, err)
 	require.True(t, hasAllRights(data.RequiredRights, imap.RightSet(db.AllACLRights)))
+	// Without an owner domain no grant would take effect ("anyone" applies only
+	// within it), so nothing is offered and nothing is granted.
+	for _, id := range []imap.RightsIdentifier{imap.RightsIdentifier(member), "anyone"} {
+		data, err := co.ListRights(shared, id).Wait()
+		require.NoError(t, err, "LISTRIGHTS %s", id)
+		require.Empty(t, data.RequiredRights.String()+rightGroups(data), "LISTRIGHTS %s", id)
+		require.Error(t, co.SetACL(shared, id, imap.RightModificationAdd, imap.RightSet("w")).Wait(), "SETACL %s +w", id)
+	}
 	require.NoError(t, co.SetACL(shared, imap.RightsIdentifier(member), imap.RightModificationRemove, imap.RightSet("r")).Wait())
 	require.NoError(t, co.DeleteACL(shared, imap.RightsIdentifier(member)).Wait())
 	cm := dialAndLogin(t, server.Address, member, memberPassword)
@@ -610,4 +630,88 @@ func TestACL_GrantHoldsTheACLLock(t *testing.T) {
 	acl, err := co.GetACL(shared).Wait()
 	require.NoError(t, err)
 	require.Empty(t, entriesFor(acl, admin), "the revoke ran after the grant, so it must have removed the administrator")
+}
+
+// TestACL_GrantOverStaleLabelsLands: when an address moves to a new account, the old
+// account's entry is relabelled so the new account can have one under that address.
+// That must work even when the old account already has a row under its new primary
+// address (two moves, or a duplicate from before one row per account).
+func TestACL_GrantOverStaleLabelsLands(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	ctx := context.Background()
+
+	server, owner := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	moved, password := createSecondUser(t, server, "example.com", "stale")
+	renamed := fmt.Sprintf("renamed-stale-%d@example.com", common.GetTimestamp())
+	co := dialAndLogin(t, server.Address, owner.Email, owner.Password)
+	shared := fmt.Sprintf("Shared/Stale-%d", common.GetTimestamp())
+	require.NoError(t, co.Create(shared, nil).Wait())
+	defer func() { co.Delete(shared).Wait() }()
+	require.NoError(t, co.SetACL(shared, imap.RightsIdentifier(moved), imap.RightModificationReplace, imap.RightSet("lr")).Wait())
+
+	movedID := mustAccountID(t, server, moved)
+	require.NoError(t, server.ResilientDB.AddCredentialWithRetry(ctx, db.AddCredentialRequest{
+		AccountID: movedID, NewEmail: renamed, NewPassword: password, NewHashType: "bcrypt", IsPrimary: true,
+	}))
+	mbox, err := server.ResilientDB.GetMailboxByNameWithRetry(ctx, mustAccountID(t, server, owner.Email), shared)
+	require.NoError(t, err)
+	_, err = server.ResilientDB.GetDatabase().GetWritePool().Exec(ctx,
+		`INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights) VALUES ($1, $2, $3, 'l')`, mbox.ID, movedID, renamed)
+	require.NoError(t, err)
+	require.NoError(t, server.ResilientDB.DeleteCredentialWithRetry(ctx, moved))
+	createAccount(t, server, moved)
+
+	require.NoError(t, co.SetACL(shared, imap.RightsIdentifier(moved), imap.RightModificationReplace, imap.RightSet("l")).Wait())
+	acl, err := co.GetACL(shared).Wait()
+	require.NoError(t, err)
+	require.Equal(t, map[imap.RightsIdentifier]string{imap.RightsIdentifier(renamed): "lr", imap.RightsIdentifier(moved): "l"},
+		entriesFor(acl, renamed, moved))
+}
+
+// TestACL_RevokedAdminCannotFinishRevoke: like a grant, a delegated administrator's
+// revoke of someone else is checked again under the ACL lock. Otherwise an
+// administrator revoked just before (or, with a lagging replica, well before) could
+// still take others' access away after losing the right to.
+func TestACL_RevokedAdminCannotFinishRevoke(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	ctx := context.Background()
+
+	server, owner := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	admin, adminPassword := createSecondUser(t, server, "example.com", "revokingadmin")
+	member, _ := createSecondUser(t, server, "example.com", "revokedmember")
+	co := dialAndLogin(t, server.Address, owner.Email, owner.Password)
+	shared := fmt.Sprintf("Shared/RevokingAdmin-%d", common.GetTimestamp())
+	require.NoError(t, co.Create(shared, nil).Wait())
+	defer func() { co.Delete(shared).Wait() }()
+	require.NoError(t, co.SetACL(shared, imap.RightsIdentifier(admin), imap.RightModificationReplace, imap.RightSet("lra")).Wait())
+	require.NoError(t, co.SetACL(shared, imap.RightsIdentifier(member), imap.RightModificationReplace, imap.RightSet("lr")).Wait())
+
+	mbox, err := server.ResilientDB.GetMailboxByNameWithRetry(ctx, mustAccountID(t, server, owner.Email), shared)
+	require.NoError(t, err)
+	gate := &aclPermissionGate{mailboxID: mbox.ID, accountID: mustAccountID(t, server, admin), reached: make(chan struct{}), release: make(chan struct{})}
+	ca := dialAndLogin(t, startACLPermissionGateServer(t, server.ResilientDB, gate), admin, adminPassword)
+	defer gate.resume()
+
+	result := make(chan error, 1)
+	go func() { result <- ca.DeleteACL(shared, imap.RightsIdentifier(member)).Wait() }()
+	select {
+	case <-gate.reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("DELETEACL never reached the permission check")
+	}
+	require.NoError(t, co.DeleteACL(shared, imap.RightsIdentifier(admin)).Wait())
+	gate.resume()
+	select {
+	case err := <-result:
+		requireResponseCode(t, err, imap.ResponseCodeNoPerm, "the revoked administrator's DELETEACL")
+	case <-time.After(5 * time.Second):
+		t.Fatal("DELETEACL did not finish after releasing the permission check")
+	}
+	acl, err := co.GetACL(shared).Wait()
+	require.NoError(t, err)
+	require.Equal(t, "lr", acl.Rights[imap.RightsIdentifier(member)].String())
 }

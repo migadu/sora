@@ -178,11 +178,13 @@ func outsideOwnerDomain(mb aclMailbox, identifier string) bool {
 // The domain is compared before the address is looked up, so the answer never tells
 // whether an address exists outside the owner's domain.
 func resolveGrantee(ctx context.Context, q aclQuerier, mb aclMailbox, identifier string) (accountID *int64, canonical string, err error) {
-	if identifier == AnyoneIdentifier {
-		return nil, AnyoneIdentifier, nil
-	}
+	// has_mailbox_right applies "anyone" only within the owner domain, so without one
+	// no grant would take effect.
 	if mb.ownerDomain == "" {
 		return nil, "", fmt.Errorf("shared mailbox has no owner domain")
+	}
+	if identifier == AnyoneIdentifier {
+		return nil, AnyoneIdentifier, nil
 	}
 	at := strings.LastIndexByte(identifier, '@')
 	if at < 0 {
@@ -301,10 +303,11 @@ func deleteACLRows(ctx context.Context, tx pgx.Tx, ids []int64) error {
 // addresses outside that domain.
 //
 // grantorAccountID is the account the caller authorised to administer the mailbox,
-// or 0 for a trusted caller (the Admin API, sora-admin). A grant re-checks its 'a'
-// right under the ACL lock, so an administrator revoked meanwhile is refused with
-// consts.ErrNotPermitted rather than granting after the revoke. Taking rights away
-// needs no re-check: its result is one a serial order of the two commands gives.
+// or 0 for a trusted caller (the Admin API, sora-admin). Its 'a' right is checked
+// again under the ACL lock, so an administrator revoked meanwhile, or before the
+// command on a lagging replica, is refused with consts.ErrNotPermitted. Taking rights
+// from their own entry is exempt, so an administrator can drop their own 'a' and a
+// retry of that does not fail.
 func (db *Database) SetMailboxACL(ctx context.Context, mailboxID, grantorAccountID int64, identifier string, mod ACLModification, rights string) error {
 	if err := ValidateACLRights(rights); err != nil {
 		return err
@@ -333,18 +336,34 @@ func (db *Database) SetMailboxACL(ctx context.Context, mailboxID, grantorAccount
 	default:
 		final = canonicalRights(rights)
 	}
-	isOwner := target.accountID != nil && *target.accountID == mb.ownerAccountID
+	// An address outside the owner's domain is answered as any such address: never
+	// as the owner, and only "-" and DELETEACL act on an entry it names, so no answer
+	// tells whether it is one of the owner's or names an entry at all.
+	outside := outsideOwnerDomain(mb, identifier)
+	isOwner := !outside && target.accountID != nil && *target.accountID == mb.ownerAccountID
+	reduction := len(target.ids) > 0 && !isOwner && intersectRights(final, target.rights) == final &&
+		(mod == ACLRemove || !outside)
+	ownEntry := target.accountID != nil && *target.accountID == grantorAccountID
+	if grantorAccountID != 0 && grantorAccountID != mb.ownerAccountID && !(ownEntry && (final == "" || reduction)) {
+		var allowed bool
+		if err := tx.QueryRow(ctx, "SELECT has_mailbox_right($1, $2, 'a')", mailboxID, grantorAccountID).Scan(&allowed); err != nil {
+			return fmt.Errorf("failed to check admin permission: %w", err)
+		}
+		if !allowed {
+			return fmt.Errorf("%w: no admin right on mailbox %d", consts.ErrNotPermitted, mailboxID)
+		}
+	}
 
 	switch {
 	case final == "":
 		err = deleteACLRows(ctx, tx, target.ids)
-	case len(target.ids) > 0 && !isOwner && intersectRights(final, target.rights) == final:
+	case reduction:
 		// Only taking rights away: one row keeps what is left.
 		if err = deleteACLRows(ctx, tx, target.ids[1:]); err == nil {
 			_, err = tx.Exec(ctx, `UPDATE mailbox_acls SET rights = $2, updated_at = now() WHERE id = $1`, target.ids[0], final)
 		}
 	default:
-		err = db.grantInTx(ctx, tx, mb, mailboxID, grantorAccountID, identifier, target, final)
+		err = grantInTx(ctx, tx, mb, mailboxID, identifier, target, final)
 	}
 	if err != nil {
 		return err
@@ -356,16 +375,7 @@ func (db *Database) SetMailboxACL(ctx context.Context, mailboxID, grantorAccount
 }
 
 // grantInTx stores final as identifier's rights on mailboxID, replacing target's rows.
-func (db *Database) grantInTx(ctx context.Context, tx pgx.Tx, mb aclMailbox, mailboxID, grantorAccountID int64, identifier string, target aclTarget, final string) error {
-	if grantorAccountID != 0 && grantorAccountID != mb.ownerAccountID {
-		var allowed bool
-		if err := tx.QueryRow(ctx, "SELECT has_mailbox_right($1, $2, 'a')", mailboxID, grantorAccountID).Scan(&allowed); err != nil {
-			return fmt.Errorf("failed to check admin permission: %w", err)
-		}
-		if !allowed {
-			return fmt.Errorf("%w: no admin right on mailbox %d", consts.ErrNotPermitted, mailboxID)
-		}
-	}
+func grantInTx(ctx context.Context, tx pgx.Tx, mb aclMailbox, mailboxID int64, identifier string, target aclTarget, final string) error {
 	if !mb.isShared {
 		return ErrMailboxNotShared
 	}
@@ -378,14 +388,17 @@ func (db *Database) grantInTx(ctx context.Context, tx pgx.Tx, mb aclMailbox, mai
 		return err
 	}
 	// A row can still be labelled with an address its account has since lost, one
-	// that now names this grantee. Relabel it with its own account's primary address
-	// rather than let this grant take it over.
+	// that now names this grantee. Relabel it rather than let this grant take it
+	// over: with its account's primary address, or, if a row of that account already
+	// has that label, one made unique by the row's id. GetMailboxACLs shows rows
+	// under the primary address, so the label is never seen.
 	if _, err := tx.Exec(ctx, `
-		UPDATE mailbox_acls a SET identifier = p.address, updated_at = now()
+		UPDATE mailbox_acls a SET updated_at = now(), identifier = CASE
+			WHEN EXISTS (SELECT 1 FROM mailbox_acls b WHERE b.mailbox_id = $1 AND b.identifier = p.address)
+			THEN a.identifier || '#' || a.id ELSE p.address END
 		FROM credentials p
 		WHERE a.mailbox_id = $1 AND a.identifier = $2 AND a.account_id IS DISTINCT FROM $3
 		  AND p.account_id = a.account_id AND p.primary_identity = TRUE
-		  AND NOT EXISTS (SELECT 1 FROM mailbox_acls b WHERE b.mailbox_id = $1 AND b.identifier = p.address)
 	`, mailboxID, canonical, accountID); err != nil {
 		return fmt.Errorf("failed to relabel ACL entry: %w", err)
 	}
@@ -474,7 +487,7 @@ func (db *Database) MailboxACLGrantability(ctx context.Context, mailboxID int64,
 		return ACLGrantNone, err
 	}
 	if identifier == AnyoneIdentifier {
-		if mb.isShared {
+		if mb.isShared && mb.ownerDomain != "" {
 			return ACLGrantAny, nil
 		}
 		return ACLGrantNone, nil
@@ -491,7 +504,7 @@ func (db *Database) MailboxACLGrantability(ctx context.Context, mailboxID int64,
 	if isOwner {
 		return ACLGrantOwner, nil
 	}
-	if !mb.isShared {
+	if !mb.isShared || mb.ownerDomain == "" {
 		return ACLGrantNone, nil
 	}
 	switch _, _, err := resolveGrantee(ctx, pool, mb, identifier); {
