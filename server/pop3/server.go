@@ -154,7 +154,7 @@ type POP3ServerOptions struct {
 	AuthIdleTimeout             time.Duration             // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	CommandTimeout              time.Duration             // Maximum idle time before disconnection
 	CommandTimeoutOverrides     map[string]time.Duration  // Per-command hard execution timeouts (overrides defaults)
-	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = use default 30m)
+	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = no limit; go-pop3 enforces it)
 	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
 	InsecureAuth                bool                      // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
 	Config                      *config.Config            // Full config for shared settings like connection tracking timeouts
@@ -599,6 +599,7 @@ func (s *POP3Server) connConfig() serverPkg.SoraConnConfig {
 		Hostname:             s.hostname,
 		MinBytesPerMinute:    settings.minBytesPerMinute,
 		EnableTimeoutChecker: settings.minBytesPerMinute > 0,
+		NoAbsoluteTimeout:    true, // the library enforces absolute_session_timeout
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Best-effort notice before closing; RFC 1939 doesn't define
 			// timeout response codes, but [IN-USE] is commonly used.
