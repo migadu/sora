@@ -18,8 +18,6 @@ import (
 // TestSearchConstants tests the search-related constants
 func TestSearchConstants(t *testing.T) {
 	assert.Equal(t, 100000, MaxSearchResults)
-	assert.Equal(t, 500, MaxComplexSortResults)
-	assert.Less(t, MaxComplexSortResults, MaxSearchResults, "Complex sort limit should be less than search limit")
 }
 
 // TestSeqNumSearchQueryPathSelection verifies the query-path selection after the
@@ -1211,11 +1209,8 @@ func TestSearchPerformanceBasic(t *testing.T) {
 	// Validate search constants are reasonable
 	t.Run("SearchConstants", func(t *testing.T) {
 		assert.Equal(t, 100000, MaxSearchResults, "MaxSearchResults should be 100000")
-		assert.Equal(t, 500, MaxComplexSortResults, "MaxComplexSortResults should be 500")
-		assert.Less(t, MaxComplexSortResults, MaxSearchResults, "Complex sort limit should be less than regular search limit")
 
-		t.Logf("Search limits: MaxSearchResults=%d, MaxComplexSortResults=%d",
-			MaxSearchResults, MaxComplexSortResults)
+		t.Logf("Search limits: MaxSearchResults=%d", MaxSearchResults)
 	})
 
 	t.Logf("Successfully tested basic search performance with accountID: %d, mailboxID: %d", accountID, mailboxID)

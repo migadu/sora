@@ -23,10 +23,6 @@ const (
 	// IMAP FETCH is NOT limited by this - it uses GetMessagesByNumSet() which has no limit
 	// SEARCH ALL is also exempted from this limit to avoid breaking clients like imapsync
 	MaxSearchResults = 100000
-
-	// MaxComplexSortResults limits expensive sorting operations (JSONB sorts, etc.)
-	// Lower limit due to per-row JSONB processing overhead
-	MaxComplexSortResults = 500
 )
 
 // ErrSearchTooManyResults means a complete SEARCH/SORT result exceeds the
@@ -967,11 +963,11 @@ const ftsScopedJoin = `LEFT JOIN messages_fts_v2 mc ON mc.content_hash = m.conte
 // paramPrefix is the named-argument prefix used across the search query builders.
 const paramPrefix = "p"
 
-// resolveResultLimit selects the row cap for a search query. It must be called
-// AFTER any seqnum→UID rewrite so that isComplexQuery reflects the final query
-// shape: a search that was only "complex" because of sequence-number criteria is
-// downgraded to a simple query and therefore earns the higher simple-query limit.
-func resolveResultLimit(explicitLimit int, isSearchAll, isComplexQuery bool, orderByClause string) int {
+// resolveResultLimit selects the row cap for a search query: a caller's explicit
+// page, no cap for ALL, and MaxSearchResults otherwise. Every sort key orders by
+// an indexed column now (the JSONB subselects that once earned DISPLAYFROM and
+// DISPLAYTO a 500-row cap are gone), so the query shape does not change the cap.
+func resolveResultLimit(explicitLimit int, isSearchAll bool) int {
 	if explicitLimit > 0 {
 		// Caller specified an explicit limit - use it
 		return explicitLimit
@@ -982,15 +978,7 @@ func resolveResultLimit(explicitLimit int, isSearchAll, isComplexQuery bool, ord
 		// even 1 million messages would only be ~4MB of UIDs.
 		return 0 // No limit for SEARCH ALL
 	}
-	if isComplexQuery {
-		// Complex queries (CTE, JSONB sorting) get lower limits due to processing overhead
-		lower := strings.ToLower(orderByClause)
-		if strings.Contains(lower, "coalesce(") || strings.Contains(lower, "jsonb_array_elements") {
-			return MaxComplexSortResults // 500 for expensive JSONB sorting
-		}
-		return MaxSearchResults // 100k for other complex queries (FTS, sequence)
-	}
-	return MaxSearchResults // 100k for simple queries - reasonable for IMAP clients
+	return MaxSearchResults
 }
 
 // mapSeqNumCriteriaToUID rewrites every sequence-set search key in c, nested ones
@@ -1178,9 +1166,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID, acc
 		}
 	}
 
-	// Determine the result limit from the final query complexity (after any
-	// seqnum→UID rewrite above may have downgraded a complex query to simple).
-	resultLimit = resolveResultLimit(limit, isSearchAll, isComplexQuery, orderByClause)
+	resultLimit = resolveResultLimit(limit, isSearchAll)
 
 	// Use optimized query path when possible
 	if !isComplexQuery {
@@ -1498,9 +1484,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 		}
 	}
 
-	// Determine the result limit from the final query complexity (after any
-	// seqnum→UID rewrite above may have downgraded a complex query to simple).
-	resultLimit = resolveResultLimit(limit, isSearchAll, isComplexQuery, orderByClause)
+	resultLimit = resolveResultLimit(limit, isSearchAll)
 	// Read one extra row to distinguish a complete result at the cap from an
 	// overflow. Caller-requested pages keep their exact limit; ALL is exempt.
 	defaultLimit := 0

@@ -23,32 +23,9 @@ func TestIMAP_SearchOverflowIsLimit(t *testing.T) {
 	defer srv.Close()
 	c := dialRawIMAP(t, srv.Address)
 	c.do(fmt.Sprintf("LOGIN %s %s", account.Email, account.Password))
-	c.do("CREATE Overflow")
-	c.appendMsg("Overflow", "From: sender@example.com\r\nSubject: match\r\n\r\nbody\r\n")
 	ctx := context.Background()
 	database := srv.ResilientDB.GetDatabase()
-	var mailboxID, accountID int64
-	require.NoError(t, database.GetWritePool().QueryRow(ctx, `
-		SELECT m.id, m.account_id FROM mailboxes m JOIN credentials c ON c.account_id = m.account_id
-		WHERE m.name = 'Overflow' AND c.address = $1`, account.Email).Scan(&mailboxID, &accountID))
-	_, err := database.GetWritePool().Exec(ctx, `
-		INSERT INTO messages
-		(account_id, mailbox_id, mailbox_path, uid, message_id, in_reply_to, content_hash, s3_domain, s3_localpart,
-		 internal_date, size, subject, sent_date, body_structure, recipients_json, created_modseq,
-		 subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
-		SELECT m.account_id, m.mailbox_id, m.mailbox_path, n, '<overflow-'||n||'@example.com>', '',
-		 m.content_hash, m.s3_domain, m.s3_localpart, m.internal_date, m.size, m.subject, m.sent_date,
-		 m.body_structure, m.recipients_json, nextval('messages_modseq'), m.subject_sort, m.from_name_sort,
-		 m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
-		FROM messages m CROSS JOIN generate_series(2, $2::integer) n
-		WHERE m.mailbox_id = $1 AND m.uid = 1`, mailboxID, db.MaxSearchResults+1)
-	require.NoError(t, err)
-	_, err = database.GetWritePool().Exec(ctx, "UPDATE mailboxes SET highest_uid = $2 WHERE id = $1", mailboxID, db.MaxSearchResults+1)
-	require.NoError(t, err)
-	// Direct bulk seeding must publish realistic planner statistics as well as
-	// mailbox state; this test is about completeness, not a stale-statistics plan.
-	_, err = database.GetWritePool().Exec(ctx, "ANALYZE messages")
-	require.NoError(t, err)
+	mailboxID, accountID := seedMatchingMessages(t, c, database, account.Email, "Overflow", db.MaxSearchResults+1)
 	c.do("SELECT Overflow")
 
 	// ALL remains exempt, and an exact-cap filtered search is complete.
@@ -88,4 +65,70 @@ func TestIMAP_SearchOverflowIsLimit(t *testing.T) {
 	page, err := database.SearchMessagesWithCriteria(ctx, mailboxID, accountID, &imap.SearchCriteria{}, 2, db.MaxSearchResults+1)
 	require.NoError(t, err, "an explicit caller limit is a page, not a complete search")
 	require.Len(t, page, 2)
+}
+
+// DISPLAYFROM and DISPLAYTO sorts once carried a 500-row cap for the JSONB
+// subselects they ordered by. Those are indexed columns now, and the cap is
+// gone: a body-scope search sorted by display name with more than 500 matches
+// is complete and succeeds, instead of being refused as an overflow.
+func TestIMAP_SortByDisplayNameIsNotCappedAt500(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	srv, account := common.SetupIMAPServer(t)
+	defer srv.Close()
+	c := dialRawIMAP(t, srv.Address)
+	c.do(fmt.Sprintf("LOGIN %s %s", account.Email, account.Password))
+	const matches = 501
+	seedMatchingMessages(t, c, srv.ResilientDB.GetDatabase(), account.Email, "Display", matches)
+	c.do("SELECT Display")
+
+	untagged, tagged := c.do("UID SORT (DISPLAYFROM) UTF-8 TEXT match")
+	require.Contains(t, tagged, " OK ", "a %d-match display sort is complete, not an overflow", matches)
+	var sorted []string
+	for _, line := range untagged {
+		if strings.HasPrefix(line, "* SORT ") {
+			sorted = append(sorted, strings.Fields(line)[2:]...)
+		}
+	}
+	require.Len(t, sorted, matches)
+
+	untagged, tagged = c.do("UID SORT RETURN (COUNT) (DISPLAYTO) UTF-8 OR SUBJECT match TEXT match")
+	require.Contains(t, tagged, " OK ")
+	require.Contains(t, strings.Join(untagged, " "), fmt.Sprintf("COUNT %d", matches))
+}
+
+// seedMatchingMessages creates mailbox name holding n messages that match
+// SUBJECT "match" and FROM sender@example.com: one real APPEND, cloned in SQL.
+// The rows are deleted when the test ends, so a shared test database does not
+// grow by n messages per run.
+func seedMatchingMessages(t *testing.T, c *rawIMAP, database *db.Database, email, name string, n int) (mailboxID, accountID int64) {
+	t.Helper()
+	ctx := context.Background()
+	c.do("CREATE " + name)
+	c.appendMsg(name, "From: sender@example.com\r\nSubject: match\r\n\r\nbody\r\n")
+	require.NoError(t, database.GetWritePool().QueryRow(ctx, `
+		SELECT m.id, m.account_id FROM mailboxes m JOIN credentials c ON c.account_id = m.account_id
+		WHERE m.name = $2 AND c.address = $1`, email, name).Scan(&mailboxID, &accountID))
+	t.Cleanup(func() {
+		_, err := database.GetWritePool().Exec(context.Background(), "DELETE FROM messages WHERE mailbox_id = $1", mailboxID)
+		require.NoError(t, err)
+	})
+	_, err := database.GetWritePool().Exec(ctx, `
+		INSERT INTO messages
+		(account_id, mailbox_id, mailbox_path, uid, message_id, in_reply_to, content_hash, s3_domain, s3_localpart,
+		 internal_date, size, subject, sent_date, body_structure, recipients_json, created_modseq,
+		 subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
+		SELECT m.account_id, m.mailbox_id, m.mailbox_path, s, '<seed-'||s||'@example.com>', '',
+		 m.content_hash, m.s3_domain, m.s3_localpart, m.internal_date, m.size, m.subject, m.sent_date,
+		 m.body_structure, m.recipients_json, nextval('messages_modseq'), m.subject_sort, m.from_name_sort,
+		 m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort
+		FROM messages m CROSS JOIN generate_series(2, $2::integer) s
+		WHERE m.mailbox_id = $1 AND m.uid = 1`, mailboxID, n)
+	require.NoError(t, err)
+	_, err = database.GetWritePool().Exec(ctx, "UPDATE mailboxes SET highest_uid = $2 WHERE id = $1", mailboxID, n)
+	require.NoError(t, err)
+	// Direct bulk seeding must publish realistic planner statistics as well as
+	// mailbox state; these tests are about completeness, not a stale-statistics plan.
+	_, err = database.GetWritePool().Exec(ctx, "ANALYZE messages")
+	require.NoError(t, err)
+	return mailboxID, accountID
 }
