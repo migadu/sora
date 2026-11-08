@@ -171,12 +171,18 @@ func (s *IMAPSession) GetACL(ctx context.Context, mailbox string) (*imap.GetACLD
 	}
 
 	// Convert ACL entries to IMAP format
-	// Use the identifier field directly (email or "anyone")
+	// Use the identifier field directly (email or "anyone"). The owner holds every
+	// right whatever a stored row says (has_mailbox_right), so it is listed that way.
 	aclList := make([]imap.ACLEntry, 0, len(aclEntries)+1)
+	ownerListed := false
 	for _, entry := range aclEntries {
+		rights := entry.Rights
+		if entry.AccountID != nil && *entry.AccountID == mbox.AccountID {
+			rights, ownerListed = db.AllACLRights, true
+		}
 		aclList = append(aclList, imap.ACLEntry{
 			Identifier: imap.RightsIdentifier(entry.Identifier),
-			Rights:     stringToRightSet(entry.Rights),
+			Rights:     stringToRightSet(rights),
 		})
 	}
 
@@ -186,20 +192,12 @@ func (s *IMAPSession) GetACL(ctx context.Context, mailbox string) (*imap.GetACLD
 	// GETACL never returns an empty ACL that omits the owner. If the owner address
 	// cannot be resolved (rare data-integrity case), omit the synthesized entry
 	// rather than failing the whole command.
-	if ownerEmail, ownerErr := s.server.rdb.GetPrimaryEmailForAccountWithRetry(readCtx, mbox.AccountID); ownerErr != nil {
-		s.WarnLog("could not resolve mailbox owner for GETACL owner entry", "mailbox", mailbox, "error", ownerErr)
-	} else {
-		ownerIdentifier := ownerEmail.FullAddress()
-		ownerListed := false
-		for _, entry := range aclList {
-			if strings.EqualFold(string(entry.Identifier), ownerIdentifier) {
-				ownerListed = true
-				break
-			}
-		}
-		if !ownerListed {
+	if !ownerListed {
+		if ownerEmail, ownerErr := s.server.rdb.GetPrimaryEmailForAccountWithRetry(readCtx, mbox.AccountID); ownerErr != nil {
+			s.WarnLog("could not resolve mailbox owner for GETACL owner entry", "mailbox", mailbox, "error", ownerErr)
+		} else {
 			aclList = append(aclList, imap.ACLEntry{
-				Identifier: imap.RightsIdentifier(ownerIdentifier),
+				Identifier: imap.RightsIdentifier(ownerEmail.FullAddress()),
 				Rights:     stringToRightSet(db.AllACLRights),
 			})
 		}
@@ -295,65 +293,15 @@ func (s *IMAPSession) SetACL(ctx context.Context, mailbox string, identifier ima
 		}
 	}
 
-	// Get identifier string (email address or "anyone")
 	identifierStr := string(identifier)
-
-	// Validate identifier - must be email or "anyone"
-	if !db.IsSpecialIdentifier(identifierStr) {
-		// Validate it's a valid email by checking if user exists
-		_, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(writeCtx, identifierStr)
-		if err != nil {
-			if err == consts.ErrUserNotFound {
-				return &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeNonExistent,
-					Text: fmt.Sprintf("user '%s' does not exist", identifierStr),
-				}
-			}
-			return s.internalError("failed to validate identifier '%s': %v", identifierStr, err)
-		}
-	}
-
-	// Convert RightSet to string
-	newRightsStr := rightSetToString(rights)
-
-	// Handle modification type
-	var finalRights string
+	var mod db.ACLModification
 	switch modification {
 	case imap.RightModificationReplace:
-		// Replace all rights
-		finalRights = newRightsStr
-
+		mod = db.ACLReplace
 	case imap.RightModificationAdd:
-		// Add rights to existing (need to get existing ACL by identifier)
-		existingRights := ""
-		acls, err := s.server.rdb.GetMailboxACLsWithRetry(writeCtx, mbox.ID)
-		if err != nil {
-			return s.internalError("failed to get existing ACLs: %v", err)
-		}
-		for _, acl := range acls {
-			if acl.Identifier == identifierStr {
-				existingRights = acl.Rights
-				break
-			}
-		}
-		finalRights = mergeRights(existingRights, newRightsStr)
-
+		mod = db.ACLAdd
 	case imap.RightModificationRemove:
-		// Remove rights from existing
-		existingRights := ""
-		acls, err := s.server.rdb.GetMailboxACLsWithRetry(writeCtx, mbox.ID)
-		if err != nil {
-			return s.internalError("failed to get existing ACLs: %v", err)
-		}
-		for _, acl := range acls {
-			if acl.Identifier == identifierStr {
-				existingRights = acl.Rights
-				break
-			}
-		}
-		finalRights = removeRights(existingRights, newRightsStr)
-
+		mod = db.ACLRemove
 	default:
 		return &imap.Error{
 			Type: imap.StatusResponseTypeBad,
@@ -362,53 +310,42 @@ func (s *IMAPSession) SetACL(ctx context.Context, mailbox string, identifier ima
 		}
 	}
 
-	// If final rights are empty, this is a DELETEACL operation
-	if finalRights == "" {
-		err = s.server.rdb.RevokeMailboxAccessByIdentifierWithRetry(writeCtx, mbox.ID, identifierStr)
-		// RFC 4314 §3.2: DELETEACL "removes any <identifier,rights> pair" for the
-		// identifier. With none (never granted, or a retried or concurrent revoke)
-		// the ACL is already what the client asked for.
-		if err != nil && !errors.Is(err, consts.ErrDBNotFound) {
-			return s.internalError("failed to revoke access: %v", err)
-		}
-		s.DebugLog("revoked all rights", "identifier", identifierStr, "mailbox", mailbox)
-		s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
-		return nil
-	}
-
-	// Use the ID whose 'a' right we checked. A concurrent rename can put a
-	// different mailbox at this name, on which the caller has no permission.
-	err = s.server.rdb.GrantMailboxAccessByIDWithRetry(writeCtx, mbox.ID, identifierStr, finalRights)
+	// By the ID whose 'a' right was checked: a concurrent rename can put a different
+	// mailbox at this name, on which the caller has no permission. The database
+	// resolves the identifier (any spelling or alias of an account names its one
+	// entry) and checks 'a' again under the ACL lock.
+	err = s.server.rdb.SetMailboxACLWithRetry(writeCtx, mbox.ID, AccountID, identifierStr, mod, rightSetToString(rights))
 	if err != nil {
-		if errors.Is(err, consts.ErrMailboxNotFound) {
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeNonExistent,
-				Text: fmt.Sprintf("mailbox '%s' no longer exists", mailbox),
-			}
-		}
-		// RFC 5530 CANNOT: these grants can never succeed, which the client must be
-		// able to tell from a server fault.
-		if errors.Is(err, db.ErrMailboxNotShared) {
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeCannot,
-				Text: "Only mailboxes in the shared namespace can be shared",
-			}
-		}
-		if errors.Is(err, db.ErrCrossDomainGrant) {
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeCannot,
-				Text: "Mailboxes can only be shared with users in the same domain",
-			}
-		}
-		return s.internalError("failed to grant access: %v", err)
+		return s.setACLError(mailbox, identifierStr, err)
 	}
 
-	s.DebugLog("granted rights", "rights", finalRights, "identifier", identifierStr, "mailbox", mailbox)
+	s.DebugLog("ACL changed", "identifier", identifierStr, "modification", modification, "rights", rights, "mailbox", mailbox)
 	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
 	return nil
+}
+
+// setACLError turns a refused ACL change into the response the client can act on.
+func (s *IMAPSession) setACLError(mailbox, identifier string, err error) error {
+	no := func(code imap.ResponseCode, text string) error {
+		return &imap.Error{Type: imap.StatusResponseTypeNo, Code: code, Text: text}
+	}
+	switch {
+	case errors.Is(err, consts.ErrMailboxNotFound):
+		return no(imap.ResponseCodeNonExistent, fmt.Sprintf("mailbox '%s' no longer exists", mailbox))
+	case errors.Is(err, consts.ErrUserNotFound):
+		return no(imap.ResponseCodeNonExistent, fmt.Sprintf("user '%s' does not exist", identifier))
+	case errors.Is(err, consts.ErrNotPermitted):
+		return no(imap.ResponseCodeNoPerm, "You do not have permission to modify ACL for this mailbox")
+	// RFC 5530 CANNOT: these changes can never succeed, which the client must be
+	// able to tell from a server fault.
+	case errors.Is(err, db.ErrMailboxNotShared):
+		return no(imap.ResponseCodeCannot, "Only mailboxes in the shared namespace can be shared")
+	case errors.Is(err, db.ErrCrossDomainGrant):
+		return no(imap.ResponseCodeCannot, "Mailboxes can only be shared with users in the same domain")
+	case errors.Is(err, db.ErrOwnerACL):
+		return no(imap.ResponseCodeCannot, "The mailbox owner always holds every right")
+	}
+	return s.internalError("failed to change ACL: %v", err)
 }
 
 // DeleteACL removes the access control list entry for an identifier.
@@ -484,23 +421,19 @@ func (s *IMAPSession) ListRights(ctx context.Context, mailbox string, identifier
 		}
 	}
 
-	// Verify the identifier. Special identifiers ("anyone") are valid without a
-	// backing account; any other identifier must resolve to an existing account.
+	// The database decides by the same checks SETACL makes, so LISTRIGHTS offers
+	// exactly what SETACL grants and reveals no more about which addresses exist.
 	identifierEmail := string(identifier)
-	isOwner := false
-	if !db.IsSpecialIdentifier(identifierEmail) {
-		identifierAccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(readCtx, identifierEmail)
-		if err != nil {
-			if err == consts.ErrUserNotFound {
-				return nil, &imap.Error{
-					Type: imap.StatusResponseTypeNo,
-					Code: imap.ResponseCodeNonExistent,
-					Text: fmt.Sprintf("user '%s' does not exist", identifierEmail),
-				}
+	grantability, err := s.server.rdb.MailboxACLGrantabilityWithRetry(readCtx, mbox.ID, identifierEmail)
+	if err != nil {
+		if errors.Is(err, consts.ErrUserNotFound) {
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeNonExistent,
+				Text: fmt.Sprintf("user '%s' does not exist", identifierEmail),
 			}
-			return nil, s.internalError("failed to get account ID for '%s': %v", identifierEmail, err)
 		}
-		isOwner = identifierAccountID == mbox.AccountID
+		return nil, s.internalError("failed to list rights for '%s': %v", identifierEmail, err)
 	}
 
 	// RFC 4314 §2: LISTRIGHTS tells a client what may be granted, and an
@@ -508,13 +441,11 @@ func (s *IMAPSession) ListRights(ctx context.Context, mailbox string, identifier
 	// The go-imap wire layer adds the obsolete virtual c/d rights as needed.
 	requiredRights := imap.RightSet{}
 	var optionalRights []imap.RightSet
-	switch {
-	case isOwner:
+	switch grantability {
+	case db.ACLGrantOwner:
 		// The owner always holds every right (has_mailbox_right), whatever the ACL says.
 		requiredRights = stringToRightSet(db.AllACLRights)
-	case !mbox.IsShared:
-		// Only shared mailboxes carry grants; SETACL here answers NO [CANNOT].
-	default:
+	case db.ACLGrantAny:
 		// RFC 4314 §3.7: rights listed in the same string are "tied" — the server
 		// must grant them all or none. Sora grants every right independently, so each
 		// right is returned as its own single-character group rather than one bundled
@@ -557,27 +488,4 @@ func rightSetToString(rights imap.RightSet) string {
 		}
 	}
 	return result.String()
-}
-
-// mergeRights adds newRights to existingRights
-func mergeRights(existingRights, newRights string) string {
-	rightSet := stringToRightSet(existingRights)
-	for _, r := range newRights {
-		if !strings.ContainsRune(string(rightSet), r) {
-			rightSet = append(rightSet, imap.Right(r))
-		}
-	}
-	return rightSetToString(rightSet)
-}
-
-// removeRights removes removeRights from existingRights
-func removeRights(existingRights, removeRights string) string {
-	rightSet := stringToRightSet(existingRights)
-	newRightSet := make(imap.RightSet, 0, len(rightSet))
-	for _, r := range rightSet {
-		if !strings.ContainsRune(removeRights, rune(r)) {
-			newRightSet = append(newRightSet, r)
-		}
-	}
-	return rightSetToString(newRightSet)
 }

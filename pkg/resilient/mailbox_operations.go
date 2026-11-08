@@ -584,10 +584,10 @@ func (rd *ResilientDatabase) GrantMailboxAccessByIdentifierWithRetry(ctx context
 	})
 }
 
-// GrantMailboxAccessByIDWithRetry preserves the authorized mailbox ID across retries.
-func (rd *ResilientDatabase) GrantMailboxAccessByIDWithRetry(ctx context.Context, mailboxID int64, identifier, rights string) error {
+// SetMailboxACLWithRetry preserves the authorized mailbox ID across retries.
+func (rd *ResilientDatabase) SetMailboxACLWithRetry(ctx context.Context, mailboxID, grantorAccountID int64, identifier string, mod db.ACLModification, rights string) error {
 	return rd.grantMailboxAccessWithRetry(ctx, func(writeCtx context.Context) error {
-		return rd.getOperationalDatabaseForOperation(writeCtx, true).GrantMailboxAccessByID(writeCtx, mailboxID, identifier, rights)
+		return rd.getOperationalDatabaseForOperation(writeCtx, true).SetMailboxACL(writeCtx, mailboxID, grantorAccountID, identifier, mod, rights)
 	})
 }
 
@@ -626,6 +626,17 @@ func (rd *ResilientDatabase) RevokeMailboxAccessByIdentifierWithRetry(ctx contex
 		return nil
 	}, config)
 	return err
+}
+
+func (rd *ResilientDatabase) MailboxACLGrantabilityWithRetry(ctx context.Context, mailboxID int64, identifier string) (db.ACLGrantability, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).MailboxACLGrantability(ctx, mailboxID, identifier)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return db.ACLGrantNone, err
+	}
+	return result.(db.ACLGrantability), nil
 }
 
 func (rd *ResilientDatabase) GetMailboxACLsWithRetry(ctx context.Context, mailboxID int64) ([]db.ACLEntry, error) {

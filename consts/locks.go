@@ -16,3 +16,7 @@ const SoraMigrationLeaderLockID = SoraAdvisoryLockID + 1
 // SoraFTSOrphanSweepLockClassID is the class ID used for transaction-scoped advisory locks
 // coordinating FTS delivery staging (shared) and orphan sweep deletion (exclusive).
 const SoraFTSOrphanSweepLockClassID = int32(0x46545332) // "FTS2" in hex = 1179997490
+
+// SoraMailboxACLLockClassID is the class ID of the transaction-scoped advisory lock,
+// keyed by hashint8(mailbox_id), that serialises every ACL write on a mailbox.
+const SoraMailboxACLLockClassID = int32(0x41434C31) // "ACL1" in hex = 1094929457
