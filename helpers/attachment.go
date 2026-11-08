@@ -17,7 +17,8 @@ const (
 // and the walk cannot mistake the extractor's synthetic children for real ones.
 //
 // A part is an attachment when it:
-//   - has Content-Disposition: attachment, or
+//   - has Content-Disposition: attachment or an unrecognized disposition type
+//     (RFC 2183 §2.8), or
 //   - has a filename (Content-Disposition filename, else Content-Type name),
 //     outside multipart/related. That counts Apple Mail's inline-disposition
 //     attachments and older mailers' name-only ones, but not the images an HTML

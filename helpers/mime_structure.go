@@ -6,7 +6,6 @@ import (
 	"io"
 	"strings"
 
-	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/textproto"
 )
 
@@ -23,15 +22,25 @@ func attachmentInMessage(data []byte) attachmentResult {
 	}
 	var body io.Reader = reader
 	type parent struct {
-		reader    *textproto.MultipartReader
-		inRelated bool
+		reader      *textproto.MultipartReader
+		inRelated   bool
+		defaultType string
 	}
 	var parents []parent
 	inRelated, unknown := false, false
+	defaultType := "text/plain"
 	for {
-		mimeHeader := message.Header{Header: header}
-		mediaType, params, err := mimeHeader.ContentType()
-		opaque := false
+		ambiguousType := len(header.Values("Content-Type")) > 1
+		ambiguousDisposition := len(header.Values("Content-Disposition")) > 1
+		if ambiguousType || ambiguousDisposition {
+			unknown = true
+		}
+		contentType := mimeHeaderValue{value: defaultType, complete: true}
+		if header.Has("Content-Type") {
+			contentType = parseMIMEHeader(header.Get("Content-Type"), true)
+		}
+		mediaType := contentType.value
+		opaque := ambiguousType
 		switch mediaType {
 		case "application/pkcs7-signature", "application/x-pkcs7-signature", "application/pgp-signature":
 			// Signature filenames never make the signature an attachment.
@@ -39,31 +48,37 @@ func attachmentInMessage(data []byte) attachmentResult {
 		case "multipart/encrypted", "application/pkcs7-mime", "application/x-pkcs7-mime":
 			unknown, opaque = true, true
 		case "message/rfc822", "message/global":
-			return attachmentFound
+			if !ambiguousType {
+				return attachmentFound
+			}
 		}
 		if !opaque {
-			if err != nil {
+			if !contentType.complete {
 				unknown = true
 			}
 			if primary, subtype, ok := strings.Cut(mediaType, "/"); !ok || primary == "" || subtype == "" {
 				unknown = true
 			}
-			if mimeHeader.Get("Content-Disposition") != "" {
-				disposition, _, err := mimeHeader.ContentDisposition()
-				// go-message preserves the disposition type when only its
-				// parameters are malformed (e.g. an unquoted filename).
-				if strings.EqualFold(disposition, "attachment") {
+			disposition := mimeHeaderValue{complete: true}
+			if header.Has("Content-Disposition") && !ambiguousDisposition {
+				disposition = parseMIMEHeader(header.Get("Content-Disposition"), false)
+				// RFC 2183 §2.8 gives unknown disposition types attachment
+				// semantics. Only inline suppresses that positive evidence.
+				if disposition.value != "" && disposition.value != "inline" {
 					return attachmentFound
 				}
-				if err != nil {
+				if !disposition.complete {
 					unknown = true
 				}
 			}
 			if !inRelated {
-				for _, field := range []struct{ header, param string }{
-					{"Content-Disposition", "filename"}, {"Content-Type", "name"},
+				for _, field := range []struct {
+					header mimeHeaderValue
+					param  string
+				}{
+					{disposition, "filename"}, {contentType, "name"},
 				} {
-					switch mimeFilename(mimeHeader.Get(field.header), field.param) {
+					switch mimeFilename(field.header, field.param) {
 					case attachmentFound:
 						return attachmentFound
 					case attachmentUnknown:
@@ -72,12 +87,18 @@ func attachmentInMessage(data []byte) attachmentResult {
 				}
 			}
 			if strings.HasPrefix(mediaType, "multipart/") {
-				if params["boundary"] != "" {
-					mr := textproto.NewMultipartReader(body, params["boundary"])
+				if boundary, ok := contentType.boundary(); ok {
+					mr := textproto.NewMultipartReader(body, boundary)
 					part, err := mr.NextPart()
 					if err == nil {
 						inRelated = inRelated || mediaType == "multipart/related"
-						parents = append(parents, parent{mr, inRelated})
+						// RFC 2046 §5.1.5 changes only direct digest children's
+						// default; an explicitly typed nested multipart resets it.
+						defaultType = "text/plain"
+						if mediaType == "multipart/digest" {
+							defaultType = "message/rfc822"
+						}
+						parents = append(parents, parent{mr, inRelated, defaultType})
 						header, body = part.Header, part
 						continue
 					}
@@ -108,6 +129,7 @@ func attachmentInMessage(data []byte) attachmentResult {
 				continue
 			}
 			inRelated = p.inRelated
+			defaultType = p.defaultType
 			header, body = part.Header, part
 			break
 		}

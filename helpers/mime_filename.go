@@ -1,104 +1,108 @@
 package helpers
 
 import (
-	stdmime "mime"
 	"net/url"
 	"strconv"
 	"strings"
 )
 
-// mimeFilename checks for a nonempty filename without decoding its charset.
-// mime.ParseMediaType silently drops RFC 2231 values in charsets other than
-// UTF-8/ASCII. Parse each value under a neutral attribute instead, retaining
-// encoded bytes and continuations. Their existence, not display text, matters.
-func mimeFilename(header, name string) attachmentResult {
-	prefix, remaining, hasParams := strings.Cut(header, ";")
-	if !hasParams {
-		return attachmentNone
+type mimeParameter struct {
+	value   string
+	present bool
+	valid   bool
+}
+
+// parameterForms resolves independent legacy, extended, and continued forms.
+// RFC 2231 values need byte unescaping, not charset decoding, for attachment
+// detection. A bad alternative cannot erase a valid nonempty filename.
+func (h mimeHeaderValue) parameterForms(name string) (plain, extended, continued mimeParameter) {
+	plain.value, plain.present = h.params[name]
+	plain.present = plain.present || h.invalid[name]
+	plain.valid = !h.invalid[name]
+	extended.value, extended.present = h.params[name+"*"]
+	extended.present = extended.present || h.invalid[name+"*"]
+	extended.valid = !h.invalid[name+"*"]
+	if extended.present && extended.valid {
+		extended.value, extended.valid = mimeParameterBytes(extended.value, true)
 	}
-	// A quote in an invalid type/disposition must not turn text inside it
-	// into an apparent filename parameter.
-	if _, _, err := stdmime.ParseMediaType(prefix); err != nil {
-		return attachmentUnknown
+
+	keys := make(map[string]bool)
+	for key := range h.params {
+		if strings.HasPrefix(key, name+"*") && key != name+"*" {
+			keys[key] = true
+		}
 	}
-	params := make(map[string]string)
-	for remaining != "" {
-		var segment string
-		segment, remaining = nextMIMEParameter(remaining)
-		key, value, ok := strings.Cut(segment, "=")
-		key = strings.ToLower(strings.TrimSpace(key))
-		if !ok || (key != name && !strings.HasPrefix(key, name+"*")) {
-			continue
+	for key := range h.invalid {
+		if strings.HasPrefix(key, name+"*") && key != name+"*" {
+			keys[key] = true
 		}
-		_, parsed, err := stdmime.ParseMediaType("x; value=" + strings.TrimSpace(value))
-		if err != nil {
-			return attachmentUnknown
-		}
-		if previous, exists := params[key]; exists && previous != parsed["value"] {
-			return attachmentUnknown
-		}
-		params[key] = parsed["value"]
 	}
-	if params[name] != "" {
-		return attachmentFound
-	}
-	delete(params, name)
-	if value, exists := params[name+"*"]; exists {
-		decoded, ok := mimeParameterBytes(value, true)
-		if !ok {
-			return attachmentUnknown
-		}
-		if decoded != "" {
-			return attachmentFound
-		}
-		delete(params, name+"*")
-	}
-	// RFC 2231 continuations start at zero, have no gaps, and may arrive in
-	// any order. Bound the loop by the number of parameters, not an index
-	// supplied by the message.
-	found, consumed := false, 0
-	for i := 0; i < len(params); i++ {
+	continued.present, continued.valid = len(keys) > 0, true
+	var joined strings.Builder
+	// Bound the loop by the number of attributes, never a supplied index.
+	for i := 0; i < len(keys); i++ {
 		key := name + "*" + strconv.Itoa(i)
-		plain, hasPlain := params[key]
-		encoded, hasEncoded := params[key+"*"]
-		if hasPlain == hasEncoded {
-			return attachmentUnknown
+		value, hasPlain := h.params[key]
+		encoded, hasEncoded := h.params[key+"*"]
+		if hasPlain == hasEncoded || h.invalid[key] || h.invalid[key+"*"] {
+			continued.valid = false
+			break
 		}
 		if hasEncoded {
 			var ok bool
-			plain, ok = mimeParameterBytes(encoded, i == 0)
+			value, ok = mimeParameterBytes(encoded, i == 0)
 			if !ok {
-				return attachmentUnknown
+				continued.valid = false
+				break
 			}
 		}
-		found = found || plain != ""
-		consumed++
+		joined.WriteString(value)
 	}
-	if consumed > 0 && found {
-		return attachmentFound
+	continued.value = joined.String()
+	return plain, extended, continued
+}
+
+func mimeFilename(h mimeHeaderValue, name string) attachmentResult {
+	plain, extended, continued := h.parameterForms(name)
+	unknown := false
+	for _, form := range []mimeParameter{plain, extended, continued} {
+		if form.present && form.valid && form.value != "" {
+			return attachmentFound
+		}
+		unknown = unknown || (form.present && !form.valid)
+	}
+	if unknown {
+		return attachmentUnknown
 	}
 	return attachmentNone
 }
 
-// nextMIMEParameter only finds an unquoted semicolon. The standard MIME parser
-// handles the actual token/quoted-string syntax and escapes of each value.
-func nextMIMEParameter(s string) (string, string) {
-	quoted := false
-	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case '\\':
-			if quoted {
-				i++
-			}
-		case '"':
-			quoted = !quoted
-		case ';':
-			if !quoted {
-				return s[:i], s[i+1:]
-			}
+// boundary follows the extended > continued > legacy preference of the MIME
+// parser. An invalid selected form must not guess a different delimiter.
+func (h mimeHeaderValue) boundary() (string, bool) {
+	plain, extended, continued := h.parameterForms("boundary")
+	for _, form := range []mimeParameter{extended, continued, plain} {
+		if form.present {
+			return form.value, form.valid && validMIMEBoundary(form.value)
 		}
 	}
-	return s, ""
+	return "", false
+}
+
+func validMIMEBoundary(value string) bool {
+	// RFC 2046 §5.1.1 bchars: spaces are permitted except at the end.
+	if len(value) == 0 || len(value) > 70 || value[len(value)-1] == ' ' {
+		return false
+	}
+	for _, c := range []byte(value) {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		if !strings.ContainsRune("'()+_,-./:=? ", rune(c)) {
+			return false
+		}
+	}
+	return true
 }
 
 func mimeParameterBytes(value string, first bool) (string, bool) {
