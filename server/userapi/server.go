@@ -107,16 +107,25 @@ const minJWTSecretLength = 32
 // Seven days is generous for an access token while keeping that window finite.
 const maxTokenDuration = 7 * 24 * time.Hour
 
+// checkJWTSecret refuses a JWT secret the server must not sign with, at start-up and
+// on a config reload alike.
+func checkJWTSecret(secret string) error {
+	if secret == "" {
+		return fmt.Errorf("JWT secret is required for Mail API server")
+	}
+	if len(secret) < minJWTSecretLength {
+		return fmt.Errorf("JWT secret must be at least %d bytes for HS256 (RFC 7518 §3.2); got %d", minJWTSecretLength, len(secret))
+	}
+	if secret == "your-secret-jwt-signing-key-here" {
+		return fmt.Errorf("JWT secret is the placeholder value from config.toml.example — set a real, random jwt_secret")
+	}
+	return nil
+}
+
 // New creates a new HTTP Mail API server
 func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, error) {
-	if options.JWTSecret == "" {
-		return nil, fmt.Errorf("JWT secret is required for Mail API server")
-	}
-	if len(options.JWTSecret) < minJWTSecretLength {
-		return nil, fmt.Errorf("JWT secret must be at least %d bytes for HS256 (RFC 7518 §3.2); got %d", minJWTSecretLength, len(options.JWTSecret))
-	}
-	if options.JWTSecret == "your-secret-jwt-signing-key-here" {
-		return nil, fmt.Errorf("JWT secret is the placeholder value from config.toml.example — set a real, random jwt_secret")
+	if err := checkJWTSecret(options.JWTSecret); err != nil {
+		return nil, err
 	}
 
 	if options.TokenDuration == 0 {
@@ -237,8 +246,21 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 // ReloadConfig updates runtime-configurable settings from new config.
 func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	var refused error
 	next := *s.settings.Load()
 
+	if cfg.JWTSecret != "" && cfg.JWTSecret != next.jwtSecret {
+		// Tokens signed with the previous secret stop validating, as on the User API
+		// proxy, which reloads it too.
+		if err := checkJWTSecret(cfg.JWTSecret); err != nil {
+			// The rest still reloads. The error has the caller log a failed reload, so an
+			// operator rotating a leaked secret learns that the old one is still live.
+			refused = fmt.Errorf("jwt_secret refused, the previous one stays in use: %w", err)
+		} else {
+			next.jwtSecret = cfg.JWTSecret
+			reloaded = append(reloaded, "jwt_secret")
+		}
+	}
 	if len(cfg.AllowedOrigins) > 0 {
 		next.allowedOrigins = slices.Clone(cfg.AllowedOrigins)
 		reloaded = append(reloaded, "allowed_origins")
@@ -252,7 +274,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 		s.settings.Store(&next)
 		logger.Info("User API config reloaded", "name", s.name, "updated", reloaded)
 	}
-	return nil
+	return refused
 }
 
 func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options ServerOptions, errChan chan error) *Server {

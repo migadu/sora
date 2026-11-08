@@ -185,17 +185,26 @@ type ProxyBackendInfo struct {
 // key is a real brute-force risk; reject it at startup rather than run with it.
 const minAPIKeyLength = 16
 
+// checkAPIKey refuses an API key the server must not run with, at start-up and on
+// a config reload alike.
+func checkAPIKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("API key is required for HTTP API server")
+	}
+	if len(key) < minAPIKeyLength {
+		return fmt.Errorf("API key must be at least %d characters (got %d) — use a long, random value", minAPIKeyLength, len(key))
+	}
+	switch key {
+	case "your-api-key-here", "your-secret-api-key-here":
+		return fmt.Errorf("API key is the placeholder value from config.toml.example — set a real, random api_key")
+	}
+	return nil
+}
+
 // New creates a new HTTP API server
 func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, error) {
-	if options.APIKey == "" {
-		return nil, fmt.Errorf("API key is required for HTTP API server")
-	}
-	if len(options.APIKey) < minAPIKeyLength {
-		return nil, fmt.Errorf("API key must be at least %d characters (got %d) — use a long, random value", minAPIKeyLength, len(options.APIKey))
-	}
-	switch options.APIKey {
-	case "your-api-key-here", "your-secret-api-key-here":
-		return nil, fmt.Errorf("API key is the placeholder value from config.toml.example — set a real, random api_key")
+	if err := checkAPIKey(options.APIKey); err != nil {
+		return nil, err
 	}
 
 	// Validate TLS configuration
@@ -272,11 +281,18 @@ func (s *Server) SetAuthCache(ac AuthCacheStats) {
 // ReloadConfig updates runtime-configurable settings from new config.
 func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	var refused error
 	next := *s.settings.Load()
 
 	if cfg.APIKey != "" && cfg.APIKey != next.apiKey {
-		next.apiKey = cfg.APIKey
-		reloaded = append(reloaded, "api_key")
+		if err := checkAPIKey(cfg.APIKey); err != nil {
+			// The rest still reloads. The error has the caller log a failed reload, so an
+			// operator rotating a leaked key learns that the old one is still live.
+			refused = fmt.Errorf("api_key refused, the previous one stays in use: %w", err)
+		} else {
+			next.apiKey = cfg.APIKey
+			reloaded = append(reloaded, "api_key")
+		}
 	}
 	if len(cfg.AllowedHosts) > 0 {
 		next.allowedHosts = slices.Clone(cfg.AllowedHosts)
@@ -287,7 +303,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 		s.settings.Store(&next)
 		logger.Info("Admin API config reloaded", "name", s.name, "updated", reloaded)
 	}
-	return nil
+	return refused
 }
 
 func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options ServerOptions, errChan chan error) *Server {

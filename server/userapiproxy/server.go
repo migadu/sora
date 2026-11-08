@@ -115,6 +115,21 @@ type ServerOptions struct {
 	RemoteUseProxyProtocol bool   // Use PROXY protocol for backend connections
 }
 
+// checkJWTSecret refuses a JWT secret the proxy must not validate with, at start-up and
+// on a config reload alike.
+func checkJWTSecret(secret string) error {
+	if secret == "" {
+		return fmt.Errorf("JWT secret is required for User API proxy")
+	}
+	if len(secret) < 32 {
+		return fmt.Errorf("JWT secret must be at least 32 bytes for HS256 (RFC 7518 §3.2); got %d", len(secret))
+	}
+	if secret == "your-secret-jwt-signing-key-here" {
+		return fmt.Errorf("JWT secret is the placeholder value from config.toml.example — set a real, random jwt_secret")
+	}
+	return nil
+}
+
 // New creates a new User API proxy server
 func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOptions) (*Server, error) {
 	ctx, cancel := context.WithCancel(appCtx)
@@ -124,17 +139,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		return nil, fmt.Errorf("no remote addresses configured")
 	}
 
-	if opts.JWTSecret == "" {
+	if err := checkJWTSecret(opts.JWTSecret); err != nil {
 		cancel()
-		return nil, fmt.Errorf("JWT secret is required for User API proxy")
-	}
-	if len(opts.JWTSecret) < 32 {
-		cancel()
-		return nil, fmt.Errorf("JWT secret must be at least 32 bytes for HS256 (RFC 7518 §3.2); got %d", len(opts.JWTSecret))
-	}
-	if opts.JWTSecret == "your-secret-jwt-signing-key-here" {
-		cancel()
-		return nil, fmt.Errorf("JWT secret is the placeholder value from config.toml.example — set a real, random jwt_secret")
+		return nil, err
 	}
 
 	// Set default timeout if not specified
@@ -767,18 +774,25 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 // ReloadConfig updates runtime-configurable settings from new config.
 func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	var refused error
 	next := *s.settings.Load()
 
 	if cfg.JWTSecret != "" && cfg.JWTSecret != next.jwtSecret {
-		next.jwtSecret = cfg.JWTSecret
-		reloaded = append(reloaded, "jwt_secret")
+		if err := checkJWTSecret(cfg.JWTSecret); err != nil {
+			// The rest still reloads. The error has the caller log a failed reload, so an
+			// operator rotating a leaked secret learns that the old one is still live.
+			refused = fmt.Errorf("jwt_secret refused, the previous one stays in use: %w", err)
+		} else {
+			next.jwtSecret = cfg.JWTSecret
+			reloaded = append(reloaded, "jwt_secret")
+		}
 	}
 
 	if len(reloaded) > 0 {
 		s.settings.Store(&next)
 		logger.Info("User API proxy config reloaded", "name", s.name, "updated", reloaded)
 	}
-	return nil
+	return refused
 }
 
 func (s *Server) Stop() error {
