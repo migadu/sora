@@ -752,7 +752,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				var keptDefault bool
 				result, keptDefault = mergeSieveResults(result, userResult)
 				if keptDefault {
-					s.InfoLog("user sieve implicit keep - preserving default script action", "default_action", result.Action, "vacation", userResult.Vacation != nil)
+					s.InfoLog("user sieve keep - merging with default script result", "default_action", result.Action, "vacation", result.Vacation != nil)
 				} else {
 					s.logSieveAction("user", result)
 				}
@@ -1080,25 +1080,27 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 }
 
 // mergeSieveResults decides what the default script and the user script together
-// ask of delivery. A user script that ended in the implicit keep leaves where the
-// message goes to the default script, and the two results are merged by
-// keepDefaultAction; it reports keptDefault then. When both scripts kept, or the
-// user script took an explicit fileinto, redirect or discard, the user result
-// stands alone.
+// ask of delivery. A user script that kept, implicitly or explicitly, leaves where
+// the message goes to the default script, whatever it decided, and the two results
+// are merged by keepDefaultAction; it reports keptDefault then. A user script that
+// took an explicit fileinto, redirect or discard took the message over, and its
+// result stands alone: the default script's flags, header edits and reply are all
+// replaced, the reply with them, since the user script overruled that run entirely.
 func mergeSieveResults(defaultResult, userResult sieveengine.Result) (merged sieveengine.Result, keptDefault bool) {
-	if userResult.Action == sieveengine.ActionKeep && defaultResult.Action != sieveengine.ActionKeep {
+	if userResult.Action == sieveengine.ActionKeep {
 		return keepDefaultAction(defaultResult, userResult), true
 	}
 	return userResult, false
 }
 
-// keepDefaultAction merges the result of a user script that ended in the implicit
-// keep into the default script's, whose action then stands: the user script only
-// left where the message goes to the default. Everything else it did still happens,
-// after the default script's work as the two ran: its flags join the default's, its
-// header edits follow the default's, and its vacation reply goes out (RFC 5230 §4.7),
-// seeing those edits as RFC 5293 §7 requires. A user reply takes precedence;
-// otherwise the default script's independent vacation reply still stands.
+// keepDefaultAction merges the result of a user script that ended in a keep into
+// the default script's, whose action then stands, be it a filing or a keep of its
+// own: the user script only left where the message goes to the default. Everything
+// else it did still happens, after the default script's work as the two ran: its
+// flags join the default's, its header edits follow the default's, and its vacation
+// reply goes out (RFC 5230 §4.7), seeing those edits as RFC 5293 §7 requires. A user
+// reply takes precedence; otherwise the default script's independent vacation reply
+// still stands.
 func keepDefaultAction(defaultResult, userResult sieveengine.Result) sieveengine.Result {
 	merged := defaultResult
 	merged.Flags = mergeFlags(defaultResult.Flags, userResult.Flags)
