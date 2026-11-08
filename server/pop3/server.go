@@ -494,6 +494,12 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 				c.SetTLS(true)
 			}
 
+			// go-pop3 upgrades the stream on STLS by layering its TLS connection
+			// ABOVE netConn, so the throughput-timeout notice must be written to
+			// the library's current connection, not to netConn's transport, or
+			// it lands in plaintext under the TLS records (#163).
+			serverPkg.SetTimeoutNoticeConn(netConn, c.NetConn)
+
 			// Count the connection only once it is past every rejection point,
 			// so the decrements in the session close path always balance.
 			s.totalConnections.Add(1)
@@ -601,8 +607,10 @@ func (s *POP3Server) connConfig() serverPkg.SoraConnConfig {
 		EnableTimeoutChecker: settings.minBytesPerMinute > 0,
 		NoAbsoluteTimeout:    true, // the library enforces absolute_session_timeout
 		OnTimeout: func(conn net.Conn, reason string) {
-			// Best-effort notice before closing; RFC 1939 doesn't define
-			// timeout response codes, but [IN-USE] is commonly used.
+			// Best-effort notice before closing, on the connection the library
+			// is using (the TLS one after STLS; see NewSession); RFC 1939
+			// doesn't define timeout response codes, but [IN-USE] is commonly
+			// used.
 			message := "-ERR [IN-USE] Connection timeout, please reconnect\r\n"
 			if reason == "slow_throughput" {
 				message = "-ERR [IN-USE] Connection too slow, please reconnect\r\n"
