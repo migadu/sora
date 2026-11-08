@@ -9,6 +9,11 @@ import (
 	"github.com/emersion/go-message/textproto"
 )
 
+// Each multipart reader wraps its parent, so an unbounded reader chain makes
+// even an iterative traversal quadratic. Bound the chain independently of the
+// message size; classification is optional metadata and can remain unknown.
+const maxAttachmentMultipartDepth = 128
+
 // attachmentInMessage uses raw part readers: classification needs no body
 // decoding. An explicit stack avoids recursion for deeply nested multiparts.
 func attachmentInMessage(data []byte) attachmentResult {
@@ -87,6 +92,11 @@ func attachmentInMessage(data []byte) attachmentResult {
 				}
 			}
 			if strings.HasPrefix(mediaType, "multipart/") {
+				if len(parents) >= maxAttachmentMultipartDepth {
+					// Do not drain this subtree to find outer siblings: doing
+					// so would still incur the nested-reader amplification.
+					return attachmentUnknown
+				}
 				if boundary, ok := contentType.boundary(); ok {
 					mr := textproto.NewMultipartReader(body, boundary)
 					part, err := mr.NextPart()

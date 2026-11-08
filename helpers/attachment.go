@@ -16,6 +16,9 @@ const (
 // Raw headers retain the RFC 2231 charset and continuation information needed
 // to interpret filenames, and synthetic BODYSTRUCTURE children cannot establish
 // attachment absence.
+// Classification stops with unknown status before opening a 129th active
+// multipart reader. Attachment evidence found before that cutoff still settles
+// a positive result.
 //
 // A part is an attachment when it:
 //   - has Content-Disposition: attachment or an unrecognized disposition type
