@@ -12,11 +12,12 @@ type mimeHeaderValue struct {
 	complete bool
 }
 
-// parseMIMEHeader follows the RFC 2045 token/quoted-string grammar. Content-Type
-// also permits RFC 822 comments between tokens; Content-Disposition does not.
+// parseMIMEHeader follows the MIME token/quoted-string grammar, including RFC
+// 822 comments between tokens in both type and disposition fields (RFC 2183 §2
+// and RFC 2045 verified erratum 2586).
 func parseMIMEHeader(raw string, contentType bool) mimeHeaderValue {
 	v := mimeHeaderValue{params: make(map[string]string), invalid: make(map[string]bool), complete: true}
-	s := mimeHeaderScanner{rest: raw, comments: contentType}
+	s := mimeHeaderScanner{rest: raw}
 	if !s.skipCFWS() {
 		v.complete = false
 		return v
@@ -50,6 +51,11 @@ func parseMIMEHeader(raw string, contentType bool) mimeHeaderValue {
 		}
 		if !s.take(';') || !s.skipCFWS() {
 			break
+		}
+		// Match mime.ParseMediaType's tolerance of a dangling separator.
+		// It supplies no parameter and cannot conceal another MIME part.
+		if s.rest == "" {
+			return v
 		}
 		key := strings.ToLower(s.token())
 		if key == "" || !s.skipCFWS() || !s.take('=') || !s.skipCFWS() {
@@ -86,8 +92,7 @@ func (v *mimeHeaderValue) invalidate(key string) {
 }
 
 type mimeHeaderScanner struct {
-	rest     string
-	comments bool
+	rest string
 }
 
 func (s *mimeHeaderScanner) take(c byte) bool {
@@ -118,9 +123,6 @@ func (s *mimeHeaderScanner) skipCFWS() bool {
 		case ' ', '\t', '\r', '\n':
 			s.rest = s.rest[1:]
 		case '(':
-			if !s.comments {
-				return true
-			}
 			depth := 1
 			s.rest = s.rest[1:]
 			for depth > 0 {
@@ -190,7 +192,7 @@ func (s *mimeHeaderScanner) recoverParameter() bool {
 		case '"':
 			return false
 		case '(':
-			if !s.comments || !s.skipCFWS() {
+			if !s.skipCFWS() {
 				return false
 			}
 		default:

@@ -622,7 +622,19 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 	// RFC 9979 §4: one explicitly added attachment keyword replaces its
 	// opposite; an explicitly conflicting pair clears both. Apply this before
 	// the cap check so replacing a keyword does not consume another slot.
-	normalizedCustom := NormalizeAttachmentKeywordUpdate(helpers.StringsToFlags(customFlags), helpers.StringsToFlags(addFlags))
+	// Removals run after additions, so cancelled additions must not replace a
+	// surviving opposite keyword. Keep validating the original addFlags above.
+	removed := make(map[string]struct{}, len(removeFlags))
+	for _, flag := range removeFlags {
+		removed[foldKeyword(flag)] = struct{}{}
+	}
+	effectiveAdded := make([]imap.Flag, 0, len(addFlags))
+	for _, flag := range addFlags {
+		if _, cancelled := removed[foldKeyword(flag)]; !cancelled {
+			effectiveAdded = append(effectiveAdded, imap.Flag(flag))
+		}
+	}
+	normalizedCustom := NormalizeAttachmentKeywordUpdate(helpers.StringsToFlags(customFlags), effectiveAdded)
 	customFlags = make([]string, len(normalizedCustom))
 	for i, flag := range normalizedCustom {
 		customFlags[i] = string(flag)

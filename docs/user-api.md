@@ -518,6 +518,10 @@ curl http://localhost:8081/user/messages/12345/raw \
 
 Add or remove flags from a message.
 
+Additions are applied before removals. A keyword listed in both arrays is
+removed, regardless of case. Only additions that survive removals can replace
+the opposite attachment keyword.
+
 **Request Body:**
 ```json
 {
