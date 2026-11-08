@@ -208,7 +208,8 @@ func isQuerySuccessful(err error) bool {
 		return true
 	}
 	// Business logic errors that should NOT trip the circuit breaker.
-	if errors.Is(err, consts.ErrUserNotFound) ||
+	if errors.Is(err, db.ErrSearchTooManyResults) ||
+		errors.Is(err, consts.ErrUserNotFound) ||
 		errors.Is(err, consts.ErrMailboxNotFound) ||
 		errors.Is(err, consts.ErrMailboxHasChildren) ||
 		errors.Is(err, consts.ErrMessageNotAvailable) ||

@@ -562,27 +562,6 @@ func TestSearchPerformance(t *testing.T) {
 				t.Logf("✓ Search returned %d results (under limit of %d)", len(messages), MaxSearchResults)
 			}
 		})
-
-		t.Run("ComplexSortLimit", func(t *testing.T) {
-			// Test complex sort limits with JSONB operations
-			criteria := &imap.SearchCriteria{
-				Header: []imap.SearchCriteriaHeaderField{
-					{Key: "from", Value: "sender1@example.com"},
-				},
-			}
-			sortCriteria := []imap.SortCriterion{{Key: imap.SortKeyFrom, Reverse: false}}
-
-			messages, err := pts.db.GetMessagesSorted(ctx, pts.mailboxID, pts.accountID, criteria, sortCriteria, 0, 0)
-			assert.NoError(t, err)
-
-			if len(messages) >= MaxComplexSortResults {
-				assert.LessOrEqual(t, len(messages), MaxComplexSortResults,
-					"Complex sort should respect MaxComplexSortResults limit")
-				t.Logf("✓ Complex sort correctly limited to ≤%d results", MaxComplexSortResults)
-			} else {
-				t.Logf("✓ Complex sort returned %d results (under limit)", len(messages))
-			}
-		})
 	})
 
 	t.Run("MemoryUsageValidation", func(t *testing.T) {
@@ -631,7 +610,6 @@ func TestSearchPerformance(t *testing.T) {
 		t.Logf("=== PERFORMANCE TEST SUMMARY ===")
 		t.Logf("Total test messages: %d", totalMessages)
 		t.Logf("MaxSearchResults limit: %d", MaxSearchResults)
-		t.Logf("MaxComplexSortResults limit: %d", MaxComplexSortResults)
 		t.Logf("Test configuration: %+v", pts.config)
 
 		if testing.Short() {

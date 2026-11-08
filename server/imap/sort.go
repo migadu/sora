@@ -2,9 +2,11 @@ package imap
 
 import (
 	"context"
+	"errors"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/db"
 )
 
 // Sort implements the SORT extension (RFC 5256), SORT=DISPLAY extension (RFC 5957),
@@ -64,6 +66,9 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 	// Pass both search criteria and sort criteria to the database layer
 	// SORT only returns UIDs, so we can use a high limit (0 = use default MaxSearchResults)
 	messages, err := s.server.rdb.SearchMessagesSortedWithRetry(ctx, selectedMailboxID, selectedMailboxOwnerID, searchCriteria, sortCriteria, 0, mailboxMessageCount)
+	if errors.Is(err, db.ErrSearchTooManyResults) {
+		return nil, searchResultLimitError()
+	}
 	if err != nil {
 		return nil, s.internalError("failed to sort messages: %v", err)
 	}

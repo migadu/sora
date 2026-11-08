@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -22,11 +23,11 @@ const (
 	// IMAP FETCH is NOT limited by this - it uses GetMessagesByNumSet() which has no limit
 	// SEARCH ALL is also exempted from this limit to avoid breaking clients like imapsync
 	MaxSearchResults = 100000
-
-	// MaxComplexSortResults limits expensive sorting operations (JSONB sorts, etc.)
-	// Lower limit due to per-row JSONB processing overhead
-	MaxComplexSortResults = 500
 )
+
+// ErrSearchTooManyResults means a complete SEARCH/SORT result exceeds the
+// default safety cap. Explicit caller limits are pages and do not return it.
+var ErrSearchTooManyResults = errors.New("search matches too many messages")
 
 // buildSearchCriteria builds the SQL WHERE clause for the search criteria
 func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPrefix string, paramCounter *int) (string, pgx.NamedArgs, error) {
@@ -962,11 +963,11 @@ const ftsScopedJoin = `LEFT JOIN messages_fts_v2 mc ON mc.content_hash = m.conte
 // paramPrefix is the named-argument prefix used across the search query builders.
 const paramPrefix = "p"
 
-// resolveResultLimit selects the row cap for a search query. It must be called
-// AFTER any seqnum→UID rewrite so that isComplexQuery reflects the final query
-// shape: a search that was only "complex" because of sequence-number criteria is
-// downgraded to a simple query and therefore earns the higher simple-query limit.
-func resolveResultLimit(explicitLimit int, isSearchAll, isComplexQuery bool, orderByClause string) int {
+// resolveResultLimit selects the row cap for a search query: a caller's explicit
+// page, no cap for ALL, and MaxSearchResults otherwise. Every sort key orders by
+// an indexed column now (the JSONB subselects that once earned DISPLAYFROM and
+// DISPLAYTO a 500-row cap are gone), so the query shape does not change the cap.
+func resolveResultLimit(explicitLimit int, isSearchAll bool) int {
 	if explicitLimit > 0 {
 		// Caller specified an explicit limit - use it
 		return explicitLimit
@@ -977,15 +978,7 @@ func resolveResultLimit(explicitLimit int, isSearchAll, isComplexQuery bool, ord
 		// even 1 million messages would only be ~4MB of UIDs.
 		return 0 // No limit for SEARCH ALL
 	}
-	if isComplexQuery {
-		// Complex queries (CTE, JSONB sorting) get lower limits due to processing overhead
-		lower := strings.ToLower(orderByClause)
-		if strings.Contains(lower, "coalesce(") || strings.Contains(lower, "jsonb_array_elements") {
-			return MaxComplexSortResults // 500 for expensive JSONB sorting
-		}
-		return MaxSearchResults // 100k for other complex queries (FTS, sequence)
-	}
-	return MaxSearchResults // 100k for simple queries - reasonable for IMAP clients
+	return MaxSearchResults
 }
 
 // mapSeqNumCriteriaToUID rewrites every sequence-set search key in c, nested ones
@@ -1173,9 +1166,7 @@ func (db *Database) getMessagesQueryExecutor(ctx context.Context, mailboxID, acc
 		}
 	}
 
-	// Determine the result limit from the final query complexity (after any
-	// seqnum→UID rewrite above may have downgraded a complex query to simple).
-	resultLimit = resolveResultLimit(limit, isSearchAll, isComplexQuery, orderByClause)
+	resultLimit = resolveResultLimit(limit, isSearchAll)
 
 	// Use optimized query path when possible
 	if !isComplexQuery {
@@ -1493,9 +1484,14 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 		}
 	}
 
-	// Determine the result limit from the final query complexity (after any
-	// seqnum→UID rewrite above may have downgraded a complex query to simple).
-	resultLimit = resolveResultLimit(limit, isSearchAll, isComplexQuery, orderByClause)
+	resultLimit = resolveResultLimit(limit, isSearchAll)
+	// Read one extra row to distinguish a complete result at the cap from an
+	// overflow. Caller-requested pages keep their exact limit; ALL is exempt.
+	defaultLimit := 0
+	if limit <= 0 && resultLimit > 0 {
+		defaultLimit = resultLimit
+		resultLimit++
+	}
 
 	// Use optimized query path when possible
 	if !isComplexQuery {
@@ -1695,17 +1691,15 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 		logger.Warn("Database: slow message scan detected", "scan_duration", scanDuration, "row_count", len(messages), "mailbox_id", mailboxID, "query_type", metricsLabel, "query", finalQueryString, "args", whereArgs)
 	}
 
+	if defaultLimit > 0 && len(messages) > defaultLimit {
+		return nil, fmt.Errorf("%w (maximum %d)", ErrSearchTooManyResults, defaultLimit)
+	}
+
 	// Dynamic sequence hydration (O(1) mapped iteration rather than PostgreSQL quadratic windowing)
 	if len(messages) > 0 {
 		if err := db.HydrateSearchMessageSequences(ctx, mailboxID, messages); err != nil {
 			return nil, fmt.Errorf("failed to hydrate sequences dynamically: %w", err)
 		}
-	}
-
-	// Log warning if we hit the default result limit (may indicate client needs to refine search)
-	// Don't warn if caller explicitly requested this limit (limit > 0) or if it's SEARCH ALL (resultLimit == 0)
-	if limit == 0 && resultLimit > 0 && len(messages) >= resultLimit {
-		logger.Warn("Database: search query hit result limit", "limit", resultLimit, "mailbox_id", mailboxID, "complex", isComplexQuery, "message", "Client may need to use more specific search criteria")
 	}
 
 	return messages, nil

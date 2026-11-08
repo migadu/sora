@@ -85,6 +85,9 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 	// The configured search_timeout is now automatically applied by the resilient DB layer.
 	// SEARCH only returns UIDs, so we can use a high limit (0 = use default MaxSearchResults)
 	messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(ctx, selectedMailboxID, selectedMailboxOwnerID, criteria, 0, int(currentNumMessages))
+	if errors.Is(err, db.ErrSearchTooManyResults) {
+		return nil, searchResultLimitError()
+	}
 	if err != nil {
 		// The resilient layer already logs retry attempts. We just log the final error.
 		s.DebugLog("[SEARCH] final error after retries", "error", err)
@@ -345,4 +348,13 @@ func (s *IMAPSession) decodeSearchCriteria(criteria *imap.SearchCriteria) *imap.
 	defer release()
 
 	return s.decodeSearchCriteriaLocked(criteria)
+}
+
+// A safety cap is a protocol refusal, never a partial successful result.
+func searchResultLimitError() *imap.Error {
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeLimit,
+		Text: "Search matches too many messages, narrow the search",
+	}
 }
