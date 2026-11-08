@@ -49,6 +49,9 @@ type Server struct {
 	addr                       string
 	connManager                *proxy.ConnectionManager
 	remoteUseProxyProtocol     bool // the server's own PROXY-header setting; a named pool's setting overrides it per route
+	remoteTLS                  bool // the server's own backend TLS setting; a named pool's setting overrides it per route
+	remoteTLSVerify            bool // the server's own backend certificate check; likewise
+	lookupLocalUsers           bool // a user the remote lookup does not know is routed into the default pool
 	rdb                        *resilient.ResilientDatabase
 	routingLookup              proxy.UserRoutingLookup  // RemoteLookup client for user routing (optional)
 	affinityManager            *server.AffinityManager  // Affinity manager for sticky routing (optional)
@@ -73,8 +76,11 @@ type Server struct {
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
 
-	// Shared HTTP transport (prevents connection pool leaks)
-	transport *http.Transport
+	// Shared HTTP transport (prevents connection pool leaks), verifying backend certificates
+	// as the server's remote_tls_verify says. transports holds one per verify setting, so a
+	// named pool's own remote_tls_verify is honored per route (proxyRequest).
+	transport  *http.Transport
+	transports map[bool]*http.Transport
 
 	// PROXY protocol support for incoming connections
 	proxyReader *server.ProxyProtocolReader
@@ -207,59 +213,69 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		}
 	}
 
-	// Create shared HTTP transport (reused for all proxied requests to prevent connection pool leaks)
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: !opts.RemoteTLSVerify,
-			Renegotiation:      tls.RenegotiateNever,
-		},
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := (&net.Dialer{
-				Timeout:   connectTimeout,
-				KeepAlive: 30 * time.Second,
-				// Routing skips backends in maintenance; this refuses the address
-				// actually dialed, whatever name led to it.
-				Control: connManager.RefuseMaintenanceDial,
-			}).DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			// The route decides whether this backend gets a PROXY header: a named pool's
-			// own setting, else the server's. proxyRequest puts it on the context.
-			useProxyProtocol := opts.RemoteUseProxyProtocol
-			if v, ok := ctx.Value(proxyProtocolKey).(bool); ok {
-				useProxyProtocol = v
-			}
-			if useProxyProtocol {
-				// Retrieve client IP and port from context
-				if cIP, ok := ctx.Value(clientIPKey).(string); ok {
-					if cPort, ok := ctx.Value(clientPortKey).(int); ok {
-						// Retrieve local IP/port from conn to use as server IP/port in PROXY header
-						var serverIP string = "127.0.0.1"
-						var serverPort int = 0
-						if localAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
-							serverIP = localAddr.IP.String()
-							serverPort = localAddr.Port
-						}
-						// Write PROXY v2 header
-						if err := server.WriteProxyV2Header(conn, cIP, cPort, serverIP, serverPort, "tcp"); err != nil {
-							conn.Close()
-							return nil, fmt.Errorf("failed to write PROXY v2 header: %w", err)
-						}
+	// Shared HTTP transports (reused for all proxied requests to prevent connection pool
+	// leaks): one that verifies backend certificates and one that does not, so a route can
+	// use its own pool's remote_tls_verify. A backend host is in one pool only, so the
+	// connections each keeps alive are never shared between two settings for one host.
+	dialBackend := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := (&net.Dialer{
+			Timeout:   connectTimeout,
+			KeepAlive: 30 * time.Second,
+			// Routing skips backends in maintenance; this refuses the address
+			// actually dialed, whatever name led to it.
+			Control: connManager.RefuseMaintenanceDial,
+		}).DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		// The route decides whether this backend gets a PROXY header: a named pool's
+		// own setting, else the server's. proxyRequest puts it on the context.
+		useProxyProtocol := opts.RemoteUseProxyProtocol
+		if v, ok := ctx.Value(proxyProtocolKey).(bool); ok {
+			useProxyProtocol = v
+		}
+		if useProxyProtocol {
+			// Retrieve client IP and port from context
+			if cIP, ok := ctx.Value(clientIPKey).(string); ok {
+				if cPort, ok := ctx.Value(clientPortKey).(int); ok {
+					// Retrieve local IP/port from conn to use as server IP/port in PROXY header
+					var serverIP string = "127.0.0.1"
+					var serverPort int = 0
+					if localAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
+						serverIP = localAddr.IP.String()
+						serverPort = localAddr.Port
+					}
+					// Write PROXY v2 header
+					if err := server.WriteProxyV2Header(conn, cIP, cPort, serverIP, serverPort, "tcp"); err != nil {
+						conn.Close()
+						return nil, fmt.Errorf("failed to write PROXY v2 header: %w", err)
 					}
 				}
 			}
-			return conn, nil
-		},
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		}
+		return conn, nil
 	}
-	// A kept-alive connection is reused without a dial, so past the dial's maintenance check:
-	// drop the idle ones whenever the maintenance list changes.
-	connManager.OnMaintenanceChange(transport.CloseIdleConnections)
+	newTransport := func(verify bool) *http.Transport {
+		return &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: !verify,
+				Renegotiation:      tls.RenegotiateNever,
+			},
+			DialContext:           dialBackend,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+	transports := map[bool]*http.Transport{true: newTransport(true), false: newTransport(false)}
+	transport := transports[opts.RemoteTLSVerify]
+	for _, t := range transports {
+		// A kept-alive connection is reused without a dial, so past the dial's maintenance
+		// check: drop the idle ones whenever the maintenance list changes.
+		connManager.OnMaintenanceChange(t.CloseIdleConnections)
+	}
 
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *server.ProxyProtocolReader
@@ -329,6 +345,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		addr:                       opts.Addr,
 		connManager:                connManager,
 		remoteUseProxyProtocol:     opts.RemoteUseProxyProtocol,
+		remoteTLS:                  opts.RemoteTLS,
+		remoteTLSVerify:            opts.RemoteTLSVerify,
+		lookupLocalUsers:           opts.RemoteLookup != nil && opts.RemoteLookup.ShouldLookupLocalUsers(),
 		rdb:                        rdb,
 		routingLookup:              routingLookup,
 		affinityManager:            opts.AffinityManager,
@@ -343,6 +362,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		trustedProxies:             opts.TrustedProxies,
 		limiter:                    limiter,
 		transport:                  transport,
+		transports:                 transports,
 		proxyReader:                proxyReader,
 		ctx:                        ctx,
 		cancel:                     cancel,
@@ -518,29 +538,25 @@ func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, error) {
 		return backendRoute{}, err
 	}
 	if email != "" {
-		return s.getBackendForUser(r.Context(), email, 0)
+		return s.routeUser(r.Context(), email, 0, true)
 	}
-	addr := s.connManager.GetBackendByConsistentHash(r.URL.Path)
+	// Names nobody: the backend answers the malformed request itself, wherever it lands.
+	pool, err := s.connManager.ResolvePool("")
+	if err != nil {
+		return backendRoute{}, err
+	}
+	addr := s.connManager.GetBackendByConsistentHashInPool(pool.Name, r.URL.Path)
 	if addr == "" {
 		return backendRoute{}, fmt.Errorf("no backend available")
 	}
-	useTLS, useProxyProtocol := s.defaultRouteSettings()
-	return backendRoute{addr: addr, tls: useTLS, proxyProtocol: useProxyProtocol}, nil
-}
-
-// defaultRouteSettings is how the backend leg of a route into the default pool is spoken:
-// the pool's own settings for a named pool, else the server's.
-func (s *Server) defaultRouteSettings() (useTLS, useProxyProtocol bool) {
-	if pool, err := s.connManager.ResolvePool(""); err == nil && pool.Named {
-		return pool.Settings.TLS, pool.Settings.UseProxyProtocol
-	}
-	return s.connManager.IsRemoteTLS(), s.remoteUseProxyProtocol
+	return s.poolRoute(addr, pool), nil
 }
 
 // peekAuthEmail reads the user an auth request is for without consuming the request: the
 // email of a login body, or the subject of the (valid) token a refresh body carries. The
-// body is put back for the backend. "" when the body names nobody the proxy can route
-// by; the backend then answers the malformed request itself.
+// body is put back for the backend, and read as the backend reads it (the first JSON value)
+// so the two cannot disagree on whose request it is. "" when the body names nobody the
+// proxy can route by; the backend then answers the malformed request itself.
 func (s *Server) peekAuthEmail(r *http.Request) (string, error) {
 	if r.Body == nil || r.Body == http.NoBody {
 		return "", nil
@@ -559,7 +575,7 @@ func (s *Server) peekAuthEmail(r *http.Request) (string, error) {
 		Email string `json:"email"`
 		Token string `json:"token"`
 	}
-	if json.Unmarshal(body, &req) != nil {
+	if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
 		return "", nil
 	}
 	switch r.URL.Path {
@@ -573,61 +589,101 @@ func (s *Server) peekAuthEmail(r *http.Request) (string, error) {
 	return "", nil
 }
 
-// backendRoute is where a request goes and whether the backend leg speaks TLS: with
-// named pools that is the route's pool's setting, otherwise the proxy server's own.
+// backendRoute is where a request goes and how its backend leg is spoken: with named
+// pools a pool route uses that pool's settings; every other route (a lookup pin, a flat
+// remote_addrs list) uses the proxy server's own, as before pools.
 type backendRoute struct {
 	addr          string
 	tls           bool
+	tlsVerify     bool
 	proxyProtocol bool
 }
 
-// getBackendForUser determines the backend for a user: the pool the lookup answered with
-// (cached for positive_ttl), then affinity inside that pool, then consistent hash inside
-// it. An explicit server in the lookup answer is a hard pin, as on every other proxy; an
-// affinity entry outside the user's pool is dropped, which is how a user the lookup moved
-// to another pool lands there.
+// poolRoute is a route to addr, a member of pool.
+func (s *Server) poolRoute(addr string, pool proxy.PoolInfo) backendRoute {
+	if !pool.Named {
+		return s.serverRoute(addr)
+	}
+	return backendRoute{addr: addr, tls: pool.Settings.TLS, tlsVerify: pool.Settings.TLSVerify, proxyProtocol: pool.Settings.UseProxyProtocol}
+}
+
+// serverRoute is a route to addr with the proxy server's own backend-leg settings.
+func (s *Server) serverRoute(addr string) backendRoute {
+	return backendRoute{addr: addr, tls: s.remoteTLS, tlsVerify: s.remoteTLSVerify, proxyProtocol: s.remoteUseProxyProtocol}
+}
+
+// transportFor is the shared transport that checks backend certificates as verify says.
+func (s *Server) transportFor(verify bool) http.RoundTripper {
+	if t, ok := s.transports[verify]; ok {
+		return t
+	}
+	return s.transport
+}
+
+// getBackendForUser determines the backend for a request carrying the user's token.
+// ctx should be the request context so a hung remotelookup cannot outlive the request;
+// it is additionally bounded by the remotelookup timeout.
+func (s *Server) getBackendForUser(ctx context.Context, email string, accountID int64) (backendRoute, error) {
+	return s.routeUser(ctx, email, accountID, false)
+}
+
+// routeUser determines the backend for a user: the pool the lookup answered with (cached
+// for positive_ttl), then affinity inside that pool, then consistent hash inside it. An
+// explicit server in the lookup answer is a hard pin, as on every other proxy; an affinity
+// entry outside the user's pool is dropped, which is how a user the lookup moved to another
+// pool lands there.
+//
+// With named pools, routing never guesses: a lookup that fails, or answers nothing usable,
+// is refused rather than routed into the default pool, because the backends trust the
+// token's account ID and a backend of another pool holds another tenant's account under
+// it. A user the lookup does not know goes to the default pool only with
+// lookup_local_users, as on every other proxy.
 //
 // A backend in maintenance is never picked. A pin to one routes the user among that
 // backend's own siblings (the pool it is a member of, or the default pool) without
 // setting affinity, so the pin takes the user back when maintenance ends; an affinity to
 // one is dropped and the user routed afresh, so the new affinity keeps them there after it.
 //
-// ctx should be the request context so a hung remotelookup cannot outlive the request;
-// it is additionally bounded by the remotelookup timeout below.
-func (s *Server) getBackendForUser(ctx context.Context, email string, accountID int64) (backendRoute, error) {
+// forAuth is set for a login or refresh, which carries no token yet: anyone can name any
+// user in one, so it reads affinity but never writes it (no gossip per made-up user).
+func (s *Server) routeUser(ctx context.Context, email string, accountID int64, forAuth bool) (backendRoute, error) {
+	named := s.connManager.HasNamedPools()
 	poolName := ""
 	havePool := false
+	notFound := false         // the lookup does not know this user
 	pinInMaintenance := false // the lookup pins a backend in maintenance: routed among its siblings below
 
-	// 1. Lookup cache: an explicit server, or the pool the lookup named.
+	// 1. Lookup cache: an explicit server, the pool the lookup named, or "not found".
 	if s.lookupCache != nil {
 		cached, found := s.lookupCache.Get(s.name, email)
-		if found && !cached.IsNegative {
-			switch {
-			case cached.ServerAddress == "":
-				logger.Debug("User API Proxy: Using cached pool", "name", s.name, "user", email, "pool", cached.PoolName, "age", time.Since(cached.CreatedAt))
-				poolName, havePool = cached.PoolName, true
-			case !s.connManager.AllowRemoteLookupBackend(cached.ServerAddress):
-				// restrict_to_pool re-validates the cached address against the pool (a stale
-				// entry surviving a pool shrink); a passthrough when the feature is off.
-				// Refused: ask the lookup again below.
-			case s.connManager.InMaintenance(cached.ServerAddress):
-				logger.Debug("User API Proxy: Cached backend in maintenance - routing among its siblings", "name", s.name, "user", email, "backend", cached.ServerAddress)
-				poolName, havePool, pinInMaintenance = s.connManager.PoolOfBackend(cached.ServerAddress), true, true
-			default:
-				// NOTE: We do NOT refresh routing cache. Entries should expire after
-				// positive_ttl to allow periodic revalidation via remotelookup, so that when
-				// a domain moves backends, active users eventually pick up the new backend.
-				logger.Debug("User API Proxy: Using cached route", "name", s.name, "user", email, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
-				metrics.LookupCacheHitsTotal.Inc()
-				return backendRoute{addr: cached.ServerAddress, tls: cached.RemoteTLS, proxyProtocol: s.remoteUseProxyProtocol}, nil
-			}
+		switch {
+		case !found:
+		case cached.IsNegative:
+			logger.Debug("User API Proxy: Cached: not known to the remote lookup", "name", s.name, "user", email)
+			notFound, havePool = true, true
+		case cached.ServerAddress == "":
+			logger.Debug("User API Proxy: Using cached pool", "name", s.name, "user", email, "pool", cached.PoolName, "age", time.Since(cached.CreatedAt))
+			poolName, havePool = cached.PoolName, true
+		case !s.connManager.AllowRemoteLookupBackend(cached.ServerAddress):
+			// restrict_to_pool re-validates the cached address against the pool (a stale
+			// entry surviving a pool shrink); a passthrough when the feature is off.
+			// Refused: ask the lookup again below.
+		case s.connManager.InMaintenance(cached.ServerAddress):
+			logger.Debug("User API Proxy: Cached backend in maintenance - routing among its siblings", "name", s.name, "user", email, "backend", cached.ServerAddress)
+			poolName, havePool, pinInMaintenance = s.connManager.PoolOfBackend(cached.ServerAddress), true, true
+		default:
+			// NOTE: We do NOT refresh routing cache. Entries should expire after
+			// positive_ttl to allow periodic revalidation via remotelookup, so that when
+			// a domain moves backends, active users eventually pick up the new backend.
+			logger.Debug("User API Proxy: Using cached route", "name", s.name, "user", email, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
+			metrics.LookupCacheHitsTotal.Inc()
+			return s.serverRoute(cached.ServerAddress), nil
 		}
 		if havePool {
 			metrics.LookupCacheHitsTotal.Inc()
 		} else {
 			if found {
-				logger.Debug("User API Proxy: Cache miss (negative or refused entry)", "name", s.name, "user", email)
+				logger.Debug("User API Proxy: Cache miss (refused entry)", "name", s.name, "user", email)
 			}
 			metrics.LookupCacheMissesTotal.Inc()
 		}
@@ -640,15 +696,22 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 		lookupCtx, lookupCancel := context.WithTimeout(ctx, s.connManager.GetRemoteLookupTimeout())
 		defer lookupCancel()
 
-		routingInfo, _, err := s.routingLookup.LookupUserRouteWithOptions(lookupCtx, email, "", true)
+		routingInfo, result, err := s.routingLookup.LookupUserRouteWithOptions(lookupCtx, email, "", true)
 		switch {
 		case err != nil:
 			logger.Warn("User API Proxy: RemoteLookup failed", "name", s.name, "user", email, "error", err)
-			// Fall through to the default pool, if there is one; nothing is cached.
+			if named {
+				return backendRoute{}, fmt.Errorf("%w: %w", proxy.ErrRouteLookupFailed, err)
+			}
+			// A flat list is one pool: route into it, as before pools; nothing is cached.
+		case routingInfo == nil && result == proxy.AuthUserNotFound:
+			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, IsNegative: true})
+			notFound = true
 		case routingInfo == nil:
-			// User not found: the default pool, if there is one (lookup_local_users).
-			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID})
-			havePool = true
+			logger.Warn("User API Proxy: RemoteLookup gave no route", "name", s.name, "user", email, "result", result)
+			if named {
+				return backendRoute{}, fmt.Errorf("%w: no route in the answer", proxy.ErrRouteLookupFailed)
+			}
 		case routingInfo.ServerAddress != "":
 			// restrict_to_pool (SSRF defense): AllowRemoteLookupBackend logs and returns
 			// false for an out-of-pool address, which then falls through to in-pool routing
@@ -658,21 +721,24 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 			}
 			// The answer is cached as given, in maintenance or not: routing decides each
 			// time, so the pin returns the user to its backend once maintenance ends.
-			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, ServerAddress: routingInfo.ServerAddress, RemoteTLS: routingInfo.RemoteTLS})
+			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, ServerAddress: routingInfo.ServerAddress})
 			if s.connManager.InMaintenance(routingInfo.ServerAddress) {
 				logger.Info("User API Proxy: Remote lookup backend in maintenance - routing among its siblings", "name", s.name, "user", email, "backend", routingInfo.ServerAddress)
 				poolName, havePool, pinInMaintenance = s.connManager.PoolOfBackend(routingInfo.ServerAddress), true, true
 				break
 			}
 			logger.Debug("User API Proxy: Using remotelookup backend", "name", s.name, "user", email, "backend", routingInfo.ServerAddress)
-			if s.affinityManager != nil {
+			if s.affinityManager != nil && !forAuth {
 				s.affinityManager.SetBackend(email, routingInfo.ServerAddress, "userapi")
 			}
-			return backendRoute{addr: routingInfo.ServerAddress, tls: routingInfo.RemoteTLS, proxyProtocol: s.remoteUseProxyProtocol}, nil
+			return s.serverRoute(routingInfo.ServerAddress), nil
 		default:
 			poolName, havePool = routingInfo.PoolName, true
 			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, PoolName: routingInfo.PoolName})
 		}
+	}
+	if notFound && named && !s.lookupLocalUsers {
+		return backendRoute{}, fmt.Errorf("user is not known to the remote lookup, and lookup_local_users is off")
 	}
 
 	// 3. Inside the pool: affinity, then consistent hash.
@@ -682,14 +748,12 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 		if errors.Is(err, proxy.ErrNoDefaultPool) {
 			outcome = "no_default"
 		}
-		metrics.ProxyPoolRoute.WithLabelValues("userapi", poolName, outcome).Inc()
+		metrics.ProxyPoolRoute.WithLabelValues("userapi", proxy.PoolRouteLabel(poolName, err), outcome).Inc()
 		logger.Error("User API Proxy: No backend pool for route - refusing to route elsewhere", "name", s.name, "user", email, "pool", poolName, "error", err)
 		return backendRoute{}, err
 	}
-	useTLS, useProxyProtocol := s.connManager.IsRemoteTLS(), s.remoteUseProxyProtocol
 	if pool.Named {
 		metrics.ProxyPoolRoute.WithLabelValues("userapi", pool.Name, "routed").Inc()
-		useTLS, useProxyProtocol = pool.Settings.TLS, pool.Settings.UseProxyProtocol
 	}
 
 	if s.affinityManager != nil {
@@ -700,10 +764,12 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 			// never to a backend in maintenance.
 			if s.connManager.PoolHasBackend(pool.Name, backend) && s.connManager.AllowRemoteLookupBackend(backend) && !s.connManager.InMaintenance(backend) {
 				logger.Debug("User API Proxy: Using affinity backend", "name", s.name, "user", email, "backend", backend, "pool", pool.Name)
-				return backendRoute{addr: backend, tls: useTLS, proxyProtocol: useProxyProtocol}, nil
+				return s.poolRoute(backend, pool), nil
 			}
-			logger.Info("User API Proxy: Affinity backend not in the user's pool or in maintenance - deleting affinity", "name", s.name, "user", email, "backend", backend, "pool", pool.Name)
-			s.affinityManager.DeleteBackend(email, "userapi")
+			if !forAuth {
+				logger.Info("User API Proxy: Affinity backend not in the user's pool or in maintenance - deleting affinity", "name", s.name, "user", email, "backend", backend, "pool", pool.Name)
+				s.affinityManager.DeleteBackend(email, "userapi")
+			}
 		}
 	}
 
@@ -715,19 +781,20 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 
 	// Set affinity for future requests. Not for a detour around a remote-lookup pin in
 	// maintenance: the pin, not affinity, is what routes that user once maintenance ends.
-	if s.affinityManager != nil && !pinInMaintenance {
+	// Not for a login either: it is not yet anyone's request (see forAuth).
+	if s.affinityManager != nil && !pinInMaintenance && !forAuth {
 		s.affinityManager.SetBackend(email, backendAddr, "userapi")
 	}
-	return backendRoute{addr: backendAddr, tls: useTLS, proxyProtocol: useProxyProtocol}, nil
+	return s.poolRoute(backendAddr, pool), nil
 }
 
-// cacheRoute remembers a lookup answer for the configured positive TTL, if the lookup
-// cache is enabled.
+// cacheRoute remembers a lookup answer for the configured positive TTL (negative TTL for
+// a user the lookup does not know), if the lookup cache is enabled.
 func (s *Server) cacheRoute(email string, entry *lookupcache.CacheEntry) {
 	if s.lookupCache == nil {
 		return
 	}
-	// ExpiresAt left zero: Set applies the configured positive TTL
+	// ExpiresAt left zero: Set applies the configured TTL
 	s.lookupCache.Set(s.name, email, entry)
 }
 
@@ -748,7 +815,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 
 	// Create reverse proxy with shared transport (prevents connection pool leaks)
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Transport = s.transport
+	proxy.Transport = s.transportFor(route.tlsVerify)
 
 	// Modify request. Capture the original Host BEFORE overwriting r.Host:
 	// the Host of an incoming request lives in r.Host, not in r.Header

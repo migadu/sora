@@ -57,6 +57,10 @@ var (
 	// pool marked default: an auth-only lookup answer, or a locally found user, on a proxy
 	// whose lookup API is expected to name a pool for everyone.
 	ErrNoDefaultPool = errors.New("route names no pool and no pool is marked default")
+
+	// ErrRouteLookupFailed is returned when, with named pools, the routing lookup itself
+	// fails: there is no pool to route into, and the default pool is not a safe guess.
+	ErrRouteLookupFailed = errors.New("routing lookup failed")
 )
 
 // BackendSettings is the backend-leg configuration of one pool: how the proxy talks to a
@@ -100,13 +104,45 @@ type ManagerOptions struct {
 	RoutingLookup      UserRoutingLookup
 	ServerName         string
 	DisableHealthCheck bool
+	// ImplicitTLSOnly is set by proxies that cannot STARTTLS to a backend (IMAP, POP3): a
+	// pool's remote_tls_use_starttls is then ignored and remote_tls means implicit TLS, as
+	// those proxies already do with their own flat settings.
+	ImplicitTLSOnly bool
+}
+
+// PoolRouteLabel is the pool label of sora_proxy_pool_route_total for a route naming name
+// that ended in err: a pool name the lookup API made up is not configured anywhere, so it
+// is counted under "unknown" instead of one series per name.
+func PoolRouteLabel(name string, err error) string {
+	if errors.Is(err, ErrUnknownPool) {
+		return "unknown"
+	}
+	return name
+}
+
+func poolRouteOutcome(err error) string {
+	if errors.Is(err, ErrNoDefaultPool) {
+		return "no_default"
+	}
+	return "unknown_pool"
 }
 
 // NewConnectionManagerFromOptions builds a pool-routing manager when Pools is set and a
 // flat-list one otherwise.
 func NewConnectionManagerFromOptions(o ManagerOptions) (*ConnectionManager, error) {
 	if len(o.Pools) > 0 {
-		return NewConnectionManagerWithPools(o.Pools, o.RemotePort, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+		pools := o.Pools
+		if o.ImplicitTLSOnly {
+			// remote_tls_use_starttls is for the protocols that can upgrade a backend
+			// connection (LMTP, ManageSieve). For the others remote_tls means TLS from the
+			// first byte; dialed with the flag, their backend leg would stay plaintext.
+			pools = make([]PoolSpec, len(o.Pools))
+			for i, p := range o.Pools {
+				p.Settings.TLSUseStartTLS = false
+				pools[i] = p
+			}
+		}
+		return NewConnectionManagerWithPools(pools, o.RemotePort, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
 	}
 	return NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(o.RemoteAddrs, o.RemotePort, o.Settings.TLS, o.Settings.TLSUseStartTLS, o.Settings.TLSVerify, o.Settings.UseProxyProtocol, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
 }

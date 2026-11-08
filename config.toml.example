@@ -1408,13 +1408,21 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # of backend-leg settings for its hosts; nothing is inherited from the [[server]] that
 # dials them. A backend without a port gets the dialing proxy's remote_port, so one
 # block serves the IMAP, POP3, ManageSieve, LMTP and User API proxies alike (give a
-# backend its own port only when the pool is used by a single protocol).
+# backend its own port only when the pool is used by a single protocol). A proxy
+# whose pools have such backends must set remote_port; sora refuses to start otherwise.
 #
 # There is no default pool unless one block says default = true: that is where an
 # auth-only answer (no "server", no "pool") and a user found through lookup_local_users
 # are routed. Without a default such an answer is refused with a temporary failure
 # (IMAP NO [UNAVAILABLE], POP3 -ERR [SYS/TEMP], ManageSieve NO, LMTP 451) and logged,
-# never sent to another pool. The same happens for a pool name this proxy lacks.
+# never sent to another pool. The same happens for a pool name this proxy lacks, and
+# for a lookup that fails or answers nothing usable: with pools, no answer is never a
+# guess at the default pool.
+#
+# A backend in maintenance (see BACKEND MAINTENANCE) is skipped inside its pool. A user
+# the API pins with "server" to a backend in maintenance is routed among the other
+# members of that backend's pool (or, in no pool, the default pool), and refused when
+# none is left; the pin takes the user back when maintenance ends.
 #
 # ROLLOUT: deploy the [[pool]] config on every proxy BEFORE the lookup API starts
 # answering with "pool". A proxy still on remote_addrs ignores the field (with a
@@ -1430,7 +1438,7 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # remote_use_xclient = true             # POP3/LMTP: forward the client IP via XCLIENT
 # remote_use_utf8 = true                # POP3: sora backends only
 # remote_tls = false
-# remote_tls_use_starttls = false       # LMTP/ManageSieve only
+# remote_tls_use_starttls = false       # LMTP/ManageSieve; IMAP/POP3/User API always use implicit TLS when remote_tls = true
 # remote_tls_verify = true
 #
 # [[pool]]

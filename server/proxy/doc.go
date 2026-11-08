@@ -29,7 +29,9 @@
 // list is one unnamed default pool, so both kinds of manager take the same routing
 // path. A route that names a pool the manager lacks, or names none where no pool is
 // the default, is an error (ErrUnknownPool, ErrNoDefaultPool) the proxy turns into a
-// temporary failure; it is never spilled into another pool's backends.
+// temporary failure; it is never spilled into another pool's backends. A lookup pin to
+// a backend in maintenance is routed among that backend's own pool (PoolOfBackend), or
+// the default pool when it is in none.
 //
 // # Affinity Methods
 //

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -27,7 +28,7 @@ type PoolConfig struct {
 	Default bool `toml:"default"`
 
 	RemoteTLS              bool  `toml:"remote_tls"`
-	RemoteTLSUseStartTLS   bool  `toml:"remote_tls_use_starttls"` // LMTP/ManageSieve only
+	RemoteTLSUseStartTLS   bool  `toml:"remote_tls_use_starttls"` // LMTP/ManageSieve; IMAP/POP3/User API use implicit TLS
 	RemoteTLSVerify        *bool `toml:"remote_tls_verify"`       // default true
 	RemoteUseProxyProtocol bool  `toml:"remote_use_proxy_protocol"`
 	RemoteUseIDCommand     bool  `toml:"remote_use_id_command"` // IMAP only
@@ -57,18 +58,27 @@ func (c *Config) DefaultPool() *PoolConfig {
 
 // ValidatePools checks the [[pool]] blocks and how the proxy servers relate to them:
 //   - every pool has a name without whitespace, unique among pools, and at least one backend;
-//   - a backend host belongs to exactly one pool (health and affinity are per address);
+//   - a backend belongs to exactly one pool and appears once, whatever letter case or IP
+//     spelling it is written with. A backend without a port stands for its host on every
+//     proxy's remote_port, so it clashes with any other entry for that host; entries with
+//     explicit, different ports may share a host (one pool per protocol on one machine);
+//   - remote_tls_use_starttls only comes with remote_tls;
 //   - at most one pool is the default;
 //   - a proxy server lists remote_addrs OR the file declares pools, never both;
-//   - a proxy that falls back to local users (lookup_local_users) has a default pool to
-//     route them into, since such a user comes with no pool name.
+//   - a proxy server has a remote_port when a pool backend is written without a port;
+//   - a proxy that routes users without a pool name has a default pool to route them
+//     into: one that falls back to local users (lookup_local_users), and one without a
+//     remote lookup at all, whose every user comes with no pool name.
 func (c *Config) ValidatePools() error {
 	if !c.HasPools() {
 		return nil
 	}
 
 	names := make(map[string]bool, len(c.Pools))
-	hosts := make(map[string]string)
+	bareHosts := make(map[string]string)   // host -> pool, for backends written without a port
+	portedHosts := make(map[string]string) // host -> first pool listing it with a port
+	ported := make(map[string]string)      // host:port -> pool
+	var portless []string                  // backends written without a port: each proxy's remote_port completes them
 	defaults := 0
 	for i := range c.Pools {
 		p := &c.Pools[i]
@@ -86,14 +96,36 @@ func (c *Config) ValidatePools() error {
 			return fmt.Errorf("[[pool]] %q: backends is required (at least one host)", p.Name)
 		}
 		for _, b := range p.Backends {
-			key := poolBackendKey(b)
-			if key == "" {
+			host, port := poolBackendHost(b)
+			if host == "" {
 				return fmt.Errorf("[[pool]] %q: empty backend address", p.Name)
 			}
-			if other, dup := hosts[key]; dup {
+			other, clash := bareHosts[host]
+			if !clash {
+				if port == "" {
+					other, clash = portedHosts[host]
+				} else {
+					other, clash = ported[net.JoinHostPort(host, port)]
+				}
+			}
+			if clash {
+				if other == p.Name {
+					return fmt.Errorf("[[pool]] %q: backend %q is listed more than once", p.Name, b)
+				}
 				return fmt.Errorf("[[pool]] %q: backend %q already belongs to pool %q", p.Name, b, other)
 			}
-			hosts[key] = p.Name
+			if port == "" {
+				bareHosts[host] = p.Name
+				portless = append(portless, b)
+			} else {
+				ported[net.JoinHostPort(host, port)] = p.Name
+				if _, seen := portedHosts[host]; !seen {
+					portedHosts[host] = p.Name
+				}
+			}
+		}
+		if p.RemoteTLSUseStartTLS && !p.RemoteTLS {
+			return fmt.Errorf("[[pool]] %q: remote_tls_use_starttls = true needs remote_tls = true", p.Name)
 		}
 		if p.Default {
 			defaults++
@@ -110,22 +142,41 @@ func (c *Config) ValidatePools() error {
 		if len(s.RemoteAddrs) > 0 {
 			return fmt.Errorf("server %q: remote_addrs cannot be combined with [[pool]] blocks; list its backends in a pool instead", s.Name)
 		}
-		if s.RemoteLookup != nil && s.RemoteLookup.ShouldLookupLocalUsers() && defaults == 0 {
-			return fmt.Errorf("server %q: lookup_local_users = true needs a pool with default = true to route local users into", s.Name)
+		if len(portless) > 0 {
+			if port, err := s.GetRemotePort(); err == nil && port == 0 {
+				return fmt.Errorf("server %q: remote_port is required, since pool backend %q has no port", s.Name, portless[0])
+			}
+		}
+		if defaults == 0 {
+			if s.RemoteLookup == nil || !s.RemoteLookup.Enabled {
+				return fmt.Errorf("server %q: without remote_lookup every user comes with no pool name, which needs a pool with default = true", s.Name)
+			}
+			if s.RemoteLookup.ShouldLookupLocalUsers() {
+				return fmt.Errorf("server %q: lookup_local_users = true needs a pool with default = true to route local users into", s.Name)
+			}
 		}
 	}
 	return nil
 }
 
-// poolBackendKey identifies a backend for the one-pool-per-host check: lowercase, and
-// host:port when a port is given (a bare IPv6 literal is one host, not host:port).
-func poolBackendKey(addr string) string {
+// poolBackendHost splits a pool backend address for the one-pool-per-backend check: the
+// host lowercase, an IP in canonical form, without brackets; and the port, "" when none
+// was given. A bare IPv6 literal is one host, not host:port.
+func poolBackendHost(addr string) (host, port string) {
 	addr = strings.ToLower(strings.TrimSpace(addr))
 	if addr == "" {
-		return ""
+		return "", ""
 	}
-	if host, port, err := net.SplitHostPort(addr); err == nil {
-		return net.JoinHostPort(host, port)
+	host = addr
+	if h, p, err := net.SplitHostPort(addr); err == nil {
+		host, port = h, p
+		if n, err := strconv.Atoi(p); err == nil {
+			port = strconv.Itoa(n) // "0143" is port 143
+		}
 	}
-	return addr
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+	return host, port
 }

@@ -94,6 +94,16 @@ remote_addrs = ["backend1:143"]
 	}
 }
 
+// twoPoolsNoDefault is two pools, neither of them the default.
+const twoPoolsNoDefault = `
+[[pool]]
+name = "sora0"
+backends = ["10.0.0.1"]
+[[pool]]
+name = "sora1"
+backends = ["10.0.1.1"]
+`
+
 func TestPoolsConfig_Validation(t *testing.T) {
 	cases := []struct {
 		name string
@@ -199,6 +209,7 @@ backends = ["10.0.0.1"]
 type = "imap_proxy"
 name = "imap-proxy"
 addr = ":1143"
+remote_port = 143
 [server.remote_lookup]
 enabled = true
 url = "https://lookup.example.com/?email=$email"
@@ -213,6 +224,7 @@ lookup_local_users = true
 type = "imap_proxy"
 name = "imap-proxy"
 addr = ":1143"
+remote_port = 143
 [server.remote_lookup]
 enabled = true
 url = "https://lookup.example.com/?email=$email"
@@ -222,20 +234,152 @@ lookup_local_users = true
 		},
 		{
 			name: "no default pool and no local users is fine",
-			toml: `
-[[pool]]
-name = "sora0"
-backends = ["10.0.0.1"]
-[[pool]]
-name = "sora1"
-backends = ["10.0.1.1"]
-
+			toml: twoPoolsNoDefault + `
 [[server]]
 type = "lmtp_proxy"
 name = "lmtp-proxy"
 addr = ":24"
+remote_port = 24
+[server.remote_lookup]
+enabled = true
+url = "https://lookup.example.com/?email=$email"
 `,
 			want: "",
+		},
+		{
+			// Without a remote lookup no user ever comes with a pool name: every login
+			// would be refused.
+			name: "no default pool and no remote lookup",
+			toml: twoPoolsNoDefault + `
+[[server]]
+type = "lmtp_proxy"
+name = "lmtp-proxy"
+addr = ":24"
+remote_port = 24
+`,
+			want: "without remote_lookup every user comes with no pool name",
+		},
+		{
+			name: "disabled remote lookup counts as none",
+			toml: twoPoolsNoDefault + `
+[[server]]
+type = "imap_proxy"
+name = "imap-proxy"
+addr = ":1143"
+remote_port = 143
+[server.remote_lookup]
+enabled = false
+url = "https://lookup.example.com/?email=$email"
+`,
+			want: "without remote_lookup every user comes with no pool name",
+		},
+		{
+			// A bare host would be dialed without a port: every connection fails.
+			name: "port-less backend and no remote_port",
+			toml: poolsBase + `
+[[server]]
+type = "pop3_proxy"
+name = "pop3-proxy"
+addr = ":1110"
+`,
+			want: `server "pop3-proxy": remote_port is required`,
+		},
+		{
+			name: "every backend has a port, no remote_port needed",
+			toml: `
+[[pool]]
+name = "sora0"
+backends = ["10.0.0.1:143", "[2001:db8::1]:143"]
+default = true
+
+[[server]]
+type = "imap_proxy"
+name = "imap-proxy"
+addr = ":1143"
+`,
+			want: "",
+		},
+		{
+			name: "same host in two pools, once with a port",
+			toml: `
+[[pool]]
+name = "a"
+backends = ["b1"]
+[[pool]]
+name = "b"
+backends = ["B1:143"]
+`,
+			want: `already belongs to pool "a"`,
+		},
+		{
+			// One pool per protocol on one machine: explicit, different ports.
+			name: "same host in two pools on different explicit ports",
+			toml: `
+[[pool]]
+name = "a"
+backends = ["b1:143"]
+default = true
+[[pool]]
+name = "b"
+backends = ["b1:110"]
+`,
+			want: "",
+		},
+		{
+			name: "same host and port in two pools",
+			toml: `
+[[pool]]
+name = "a"
+backends = ["10.0.0.1:143"]
+[[pool]]
+name = "b"
+backends = ["10.0.0.1:0143"]
+`,
+			want: `already belongs to pool "a"`,
+		},
+		{
+			// A port-less backend is that host on every proxy's remote_port.
+			name: "port-less backend clashes with the same host on any port",
+			toml: `
+[[pool]]
+name = "a"
+backends = ["b1:110"]
+[[pool]]
+name = "b"
+backends = ["b1"]
+`,
+			want: `already belongs to pool "a"`,
+		},
+		{
+			name: "same IPv6 host in two spellings",
+			toml: `
+[[pool]]
+name = "a"
+backends = ["[2001:db8:0::1]:143"]
+[[pool]]
+name = "b"
+backends = ["2001:db8::1"]
+`,
+			want: `already belongs to pool "a"`,
+		},
+		{
+			name: "host listed twice in one pool",
+			toml: `
+[[pool]]
+name = "a"
+backends = ["10.0.0.1:143", "10.0.0.1"]
+`,
+			want: "listed more than once",
+		},
+		{
+			name: "STARTTLS without TLS",
+			toml: `
+[[pool]]
+name = "a"
+backends = ["10.0.0.1"]
+remote_tls_use_starttls = true
+`,
+			want: "remote_tls_use_starttls = true needs remote_tls = true",
 		},
 	}
 	for _, tc := range cases {

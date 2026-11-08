@@ -758,10 +758,27 @@ type BackendHealthInfo struct {
 // HasHealthyPoolBackends checks if at least one pool backend (from remote_addrs config) is
 // available: healthy (or due to auto-recover, or health checks are disabled) and not in
 // maintenance. This is used to determine if the proxy can route messages to backends.
+//
+// With named pools only the default pool counts: the LMTP proxy asks before bouncing a
+// recipient its own database does not know, and only a local user, who lives in the
+// default pool, could be known to those backends instead. Without a default pool there is
+// no such backend, and the answer is false (a temporary failure, never a bounce).
 func (cm *ConnectionManager) HasHealthyPoolBackends() bool {
 	cm.healthMu.RLock()
+	var members map[string]bool // nil = every backend counts
+	if cm.HasNamedPools() {
+		members = map[string]bool{}
+		if cm.defaultPool != nil {
+			for _, addr := range cm.defaultPool.resolved {
+				members[addr] = true
+			}
+		}
+	}
 	healthy := make([]string, 0, len(cm.backendHealth))
 	for addr, health := range cm.backendHealth {
+		if members != nil && !members[addr] {
+			continue
+		}
 		// Healthy, or due for auto-recovery (1 minute since last failure)
 		if !cm.enableBackendHealthCheck || health.IsHealthy || time.Since(health.LastFailure) > backendRecoveryInterval {
 			healthy = append(healthy, addr)
@@ -1138,6 +1155,15 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		}
 		// If fallback is true, the connection failed but we should proceed to round-robin.
 		// The error from tryPreferredAddress is logged but not returned to the client yet.
+		if cm.HasNamedPools() && routingInfo != nil && routingInfo.ServerAddress != "" && routingInfo.ServerAddress == preferredAddr {
+			// A lookup pin whose backend cannot be dialed has no pool to fall back into:
+			// the pin names none, and the default pool need not hold the account (the
+			// session would close a backend other than the pin anyway). DetermineRoute
+			// already routes a pin in maintenance among its siblings; this is the race
+			// where it entered maintenance after that, or a pin seen as a plain preference.
+			logger.Warn("ConnectionManager: Pinned backend unavailable - not falling back into a pool", "backend", preferredAddr, "server", cm.serverName)
+			return nil, "", fmt.Errorf("remote-lookup backend %s is unavailable", preferredAddr)
+		}
 	}
 
 	// Round-robin stays inside the route's pool: a user whose pool has no backend left is
@@ -1396,6 +1422,11 @@ func (cm *ConnectionManager) installResolvedAddrs(resolvedAddrs []string, resolv
 
 	if slices.Equal(cm.remoteAddrs, resolvedAddrs) {
 		logger.Debug("ConnectionManager: Address resolution unchanged", "server", cm.serverName, "backends", len(resolvedAddrs))
+		// The union is unchanged, but an address can still have moved from one pool's
+		// name to another's: rebuild the pools (health carries over by address).
+		for _, p := range cm.pools {
+			p.install(resolvedHosts)
+		}
 		return
 	}
 
@@ -1946,6 +1977,12 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		var lookupErr error
 		result.RoutingInfo, lookupErr = cm.LookupUserRoute(routingCtx, params.Username)
 		routingCancel()
+		if lookupErr != nil && cm.HasNamedPools() {
+			// No answer is no pool: routing on would put the user in the default pool,
+			// where the account need not live, and drop their affinity in the real one.
+			logger.Warn("Routing lookup failed - refusing to route without a pool", "proxy", params.ProxyName, "user", params.Username, "error", lookupErr)
+			return result, fmt.Errorf("%w: %w", ErrRouteLookupFailed, lookupErr)
+		}
 		if lookupErr != nil {
 			logger.Debug("Routing lookup failed, falling back to affinity", "proxy", params.ProxyName, "user", params.Username, "error", lookupErr)
 		}
@@ -2038,11 +2075,7 @@ func (cm *ConnectionManager) routePool(params RouteParams, result *RouteResult) 
 	}
 	pool, err := cm.poolByName(name)
 	if err != nil {
-		outcome := "unknown_pool"
-		if errors.Is(err, ErrNoDefaultPool) {
-			outcome = "no_default"
-		}
-		metrics.ProxyPoolRoute.WithLabelValues(params.Protocol, name, outcome).Inc()
+		metrics.ProxyPoolRoute.WithLabelValues(params.Protocol, PoolRouteLabel(name, err), poolRouteOutcome(err)).Inc()
 		logger.Error("No backend pool for route - refusing to route elsewhere", "proxy", params.ProxyName, "user", params.Username, "pool", name, "error", err)
 		return nil, err
 	}

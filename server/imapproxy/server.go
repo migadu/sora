@@ -254,6 +254,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		RoutingLookup:      routingLookup,
 		ServerName:         opts.Name,
 		DisableHealthCheck: !opts.EnableBackendHealthCheck,
+		ImplicitTLSOnly:    true, // no backend STARTTLS in IMAP: remote_tls is implicit TLS
 	})
 	if err != nil {
 		if routingLookup != nil {

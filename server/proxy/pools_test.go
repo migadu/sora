@@ -418,7 +418,9 @@ func TestPools_ResolutionRebuildsEachPool(t *testing.T) {
 	}
 }
 
-func TestPools_UpdateAffinityUsesPoolHash(t *testing.T) {
+// After a connection the user's affinity records the backend reached; a route whose pool
+// is gone records nothing.
+func TestPools_UpdateAffinityRecordsTheBackendReached(t *testing.T) {
 	cm := newPoolsCM(t, testPoolSpecs())
 	aff := &poolAffinityStub{}
 	cm.SetAffinityManager(aff)
