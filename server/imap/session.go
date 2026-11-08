@@ -32,6 +32,7 @@ type IMAPSession struct {
 	mutexHelper *server.MutexTimeoutHelper
 	releaseConn func() // Function to release connection from limiter
 	startTime   time.Time
+	closed      bool // Close has run; guarded by mutex
 
 	inboxWarmupDone atomic.Bool // Ensures warmup runs only once
 	selectedMailbox *db.DBMailbox
@@ -351,6 +352,12 @@ func (s *IMAPSession) Close() error {
 	// to protect modifications to IMAPSession fields and embedded Session fields.
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
+	// A second call must not count the session out again.
+	if s.closed {
+		return nil
+	}
+	s.closed = true
 
 	// Untrack connection from active connections
 	if s.conn != nil {
