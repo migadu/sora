@@ -219,8 +219,9 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 		    updated_modseq = nextval('messages_modseq')
 		WHERE message_id = ANY($4)
 		  AND ( (flags & $1) != $1 OR NOT (custom_flags @> to_jsonb($2::text[]))
-		        OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(custom_flags) AS old_keyword
-		                   WHERE lower(old_keyword) = ANY($5::text[])) )
+		        OR (cardinality($5::text[]) > 0 AND EXISTS (
+		              SELECT 1 FROM jsonb_array_elements_text(custom_flags) AS old_keyword
+		              WHERE lower(old_keyword) = ANY($5::text[]))) )
 		RETURNING message_id, updated_modseq
 	`, bitwiseSystemFlagsToAdd, customKeywordsToAdd, time.Now(), messageIDs, attachmentRemovals)
 	if err != nil {
