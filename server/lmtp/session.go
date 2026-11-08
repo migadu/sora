@@ -749,16 +749,11 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			} else {
 				metrics.SieveExecutions.WithLabelValues("lmtp", "success").Inc()
 
-				// Merge user script result with default script result
-				// If user script returns implicit keep (ActionKeep), preserve the default script's action
-				// Otherwise, the user script overrides the default
-				if userResult.Action == sieveengine.ActionKeep && result.Action != sieveengine.ActionKeep {
+				var keptDefault bool
+				result, keptDefault = mergeSieveResults(result, userResult)
+				if keptDefault {
 					s.InfoLog("user sieve implicit keep - preserving default script action", "default_action", result.Action, "vacation", userResult.Vacation != nil)
-					result = keepDefaultAction(result, userResult)
 				} else {
-					// User script has an explicit action, override the default
-					result = userResult
-
 					s.logSieveAction("user", result)
 				}
 			}
@@ -1082,6 +1077,19 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	recordMetrics("success")
 	return nil
+}
+
+// mergeSieveResults decides what the default script and the user script together
+// ask of delivery. A user script that ended in the implicit keep leaves where the
+// message goes to the default script, and the two results are merged by
+// keepDefaultAction; it reports keptDefault then. When both scripts kept, or the
+// user script took an explicit fileinto, redirect or discard, the user result
+// stands alone.
+func mergeSieveResults(defaultResult, userResult sieveengine.Result) (merged sieveengine.Result, keptDefault bool) {
+	if userResult.Action == sieveengine.ActionKeep && defaultResult.Action != sieveengine.ActionKeep {
+		return keepDefaultAction(defaultResult, userResult), true
+	}
+	return userResult, false
 }
 
 // keepDefaultAction merges the result of a user script that ended in the implicit
