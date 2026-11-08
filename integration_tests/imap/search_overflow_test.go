@@ -11,12 +11,15 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
 
 // A default database row cap must never turn an incomplete search into OK.
 // Exercise the real cap and wire handlers: exactly the cap succeeds, one more
 // match is refused, and an explicit caller limit still means a bounded page.
+// Every refusal is counted in sora_imap_search_refused_total{reason="result_cap"},
+// since it is otherwise invisible to the operator.
 func TestIMAP_SearchOverflowIsLimit(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	srv, account := common.SetupIMAPServer(t)
@@ -42,11 +45,13 @@ func TestIMAP_SearchOverflowIsLimit(t *testing.T) {
 		"ESEARCH IN (SELECTED) RETURN (COUNT MIN MAX) SUBJECT match",
 	} {
 		t.Run(command, func(t *testing.T) {
+			before := searchRefusedCount(t, "result_cap")
 			untagged, tagged := c.read(c.send(command), command)
 			require.Contains(t, tagged, " NO [LIMIT] ", "must refuse overflow rather than acknowledge partial results")
 			for _, line := range untagged {
 				require.False(t, strings.HasPrefix(line, "* SEARCH") || strings.HasPrefix(line, "* SORT") || strings.HasPrefix(line, "* ESEARCH"), "partial result leaked: %s", line)
 			}
+			require.Equal(t, before+1, searchRefusedCount(t, "result_cap"), `sora_imap_search_refused_total{reason="result_cap"} must count the refusal`)
 		})
 	}
 
@@ -57,7 +62,9 @@ func TestIMAP_SearchOverflowIsLimit(t *testing.T) {
 		t.Run(command, func(t *testing.T) {
 			c.do("UID SEARCH RETURN (SAVE) UID 1")
 			require.Len(t, c.fetchDollarUIDs(), 1)
+			before := searchRefusedCount(t, "result_cap")
 			require.Contains(t, c.status(command), "NO [LIMIT] ")
+			require.Equal(t, before+1, searchRefusedCount(t, "result_cap"), `sora_imap_search_refused_total{reason="result_cap"} must count the refusal`)
 			require.Empty(t, c.fetchDollarUIDs(), "failed SAVE must empty the old saved result")
 		})
 	}
@@ -94,6 +101,26 @@ func TestIMAP_SortByDisplayNameIsNotCappedAt500(t *testing.T) {
 	untagged, tagged = c.do("UID SORT RETURN (COUNT) (DISPLAYTO) UTF-8 OR SUBJECT match TEXT match")
 	require.Contains(t, tagged, " OK ")
 	require.Contains(t, strings.Join(untagged, " "), fmt.Sprintf("COUNT %d", matches))
+}
+
+// searchRefusedCount reads sora_imap_search_refused_total{reason} from the default
+// registry, which the in-process server shares with the test. It finds the metric
+// by name, so that a build without the metric reads 0 rather than failing to compile.
+func searchRefusedCount(t *testing.T, reason string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() != "sora_imap_search_refused_total" {
+			continue
+		}
+		for _, m := range family.GetMetric() {
+			if labelValue(m, "reason") == reason {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
 }
 
 // seedMatchingMessages creates mailbox name holding n messages that match
