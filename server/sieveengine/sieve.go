@@ -137,7 +137,7 @@ type Result struct {
 }
 
 // VacationReply is an RFC 5230 auto-reply a script decided to send, its :days window
-// for this sender already checked.
+// for this sender and response identity already checked.
 type VacationReply struct {
 	From    string // the :from address; delivery uses it only if the account owns it
 	Subject string
@@ -172,12 +172,12 @@ type Context struct {
 // persistent storage for vacation response tracking.
 type VacationOracle interface {
 	// IsVacationResponseAllowed checks if a vacation response is allowed to be sent
-	// to the given originalSender for the specified user and handle,
+	// to the given originalSender for the specified user and response identity,
 	// considering the duration since the last response.
-	IsVacationResponseAllowed(ctx context.Context, AccountID int64, originalSender string, handle string, duration time.Duration) (bool, error)
+	IsVacationResponseAllowed(ctx context.Context, AccountID int64, originalSender string, responseIdentity string, duration time.Duration) (bool, error)
 	// RecordVacationResponseSent records that a vacation response has been sent
-	// to the originalSender for the specified user and handle.
-	RecordVacationResponseSent(ctx context.Context, AccountID int64, originalSender string, handle string) error
+	// to the originalSender for the specified user and response identity.
+	RecordVacationResponseSent(ctx context.Context, AccountID int64, originalSender string, responseIdentity string) error
 }
 
 // RedirectOracle defines the methods SievePolicy needs to interact with
@@ -394,7 +394,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 	// already refused a vacation next to reject.
 	for sender, vacation := range data.VacationResponses {
 		duration := time.Duration(vacation.Days) * 24 * time.Hour
-		allowed, err := execPolicy.VacationResponseAllowed(timeoutCtx, data, sender, vacation.Handle, duration)
+		allowed, err := execPolicy.VacationResponseAllowed(timeoutCtx, data, sender, vacation.ResponseIdentity, duration)
 		if err != nil || !allowed {
 			// An oracle error must not fail the delivery; it costs this one reply.
 			break
@@ -404,7 +404,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 			Subject:    vacation.Subject,
 			Body:       vacation.Body,
 			IsMime:     vacation.IsMime,
-			RecordSent: execPolicy.vacationRecorder(sender, vacation.Handle),
+			RecordSent: execPolicy.vacationRecorder(sender, vacation.ResponseIdentity),
 		}
 		break
 	}
@@ -487,18 +487,18 @@ func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData
 
 // VacationResponseAllowed is called by the Sieve interpreter.
 // `recipient` is the address of the original sender of the message being processed.
-// `handle` can be used to distinguish between multiple vacation actions in a script.
+// `responseIdentity` identifies the unexpanded vacation arguments or explicit handle.
 // `duration` is the :days parameter from the vacation command.
 func (p *SievePolicy) VacationResponseAllowed(ctx context.Context, d *interp.RuntimeData,
-	originalSender, handle string, duration time.Duration) (bool, error) {
+	originalSender, responseIdentity string, duration time.Duration) (bool, error) {
 
 	// Key for in-memory tracking (per script execution, per handle)
 	// This is for Sieve's :handle specific cooldown within the same script evaluation.
-	inMemoryKey := originalSender + ":" + handle
+	inMemoryKey := originalSender + ":" + responseIdentity
 
 	if p.vacationOracle != nil {
 		// Use the oracle for the persistent check (this is the main :days check)
-		allowed, err := p.vacationOracle.IsVacationResponseAllowed(ctx, p.AccountID, originalSender, handle, duration)
+		allowed, err := p.vacationOracle.IsVacationResponseAllowed(ctx, p.AccountID, originalSender, responseIdentity, duration)
 		if err != nil {
 			return false, fmt.Errorf("checking persistent vacation allowance via oracle: %w", err)
 		}
@@ -530,14 +530,14 @@ func (p *SievePolicy) VacationResponseAllowed(ctx context.Context, d *interp.Run
 // `originalSender`, or nil when there is no oracle (the in-memory fallback tracking
 // lives and dies with a single evaluation). The returned function takes its own
 // context: it runs on the delivery path, after this evaluation's budget has expired.
-func (p *SievePolicy) vacationRecorder(originalSender, handle string) func(context.Context) error {
+func (p *SievePolicy) vacationRecorder(originalSender, responseIdentity string) func(context.Context) error {
 	oracle := p.vacationOracle
 	if oracle == nil {
 		return nil
 	}
 	accountID := p.AccountID
 	return func(ctx context.Context) error {
-		if err := oracle.RecordVacationResponseSent(ctx, accountID, originalSender, handle); err != nil {
+		if err := oracle.RecordVacationResponseSent(ctx, accountID, originalSender, responseIdentity); err != nil {
 			return fmt.Errorf("failed to record vacation response sent via oracle: %w", err)
 		}
 		return nil
