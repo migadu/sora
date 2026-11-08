@@ -2,13 +2,23 @@
 
 package common
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // AttachmentKeywordRegressionCases is shared by the real APPEND, LMTP, and
 // delivery tests so each ingestion path exercises the same malformed MIME.
 func AttachmentKeywordRegressionCases() []struct{ Name, MIME, Keyword string } {
 	msg := func(lines ...string) string { return strings.Join(lines, "\r\n") + "\r\n" }
 	return []struct{ Name, MIME, Keyword string }{
+		{"over nested plain remains unknown", NestedAttachmentMIME(256, false), ""},
+		{"over nested hidden attachment remains unknown", NestedAttachmentMIME(256, true), ""},
+		{"shallow nested plain", NestedAttachmentMIME(4, false), "$hasnoattachment"},
+		{"shallow nested attachment", NestedAttachmentMIME(4, true), "$hasattachment"},
+		{"attachment before over nested sibling", msg("Content-Type: multipart/mixed; boundary=known-outer", "",
+			"--known-outer", "Content-Type: application/pdf", "Content-Disposition: attachment", "", "PDF",
+			"--known-outer", NestedAttachmentMIME(256, false), "--known-outer--"), "$hasattachment"},
 		{"UTF16BE boundary decodes to b", msg("Content-Type: multipart/mixed; boundary*=utf-16be''%00%62", "",
 			"--b", "Content-Type: application/pdf", "Content-Disposition: attachment", "", "PDF", "--b--"), "$hasattachment"},
 		{"UTF16LE boundary decodes to b", msg("Content-Type: multipart/mixed; boundary*=utf-16le''%62%00", "",
@@ -103,4 +113,23 @@ func AttachmentKeywordRegressionCases() []struct{ Name, MIME, Keyword string } {
 		{"truncated plain multipart stays unknown", msg("Content-Type: multipart/mixed; boundary=b", "",
 			"--b", "Content-Type: text/plain", "", "body"), ""},
 	}
+}
+
+// NestedAttachmentMIME builds valid MIME with unique fixed-width boundaries.
+// Comments exercise the raw classifier independently of the BODYSTRUCTURE
+// extractor's permissive fallback for MIME syntax it does not understand.
+func NestedAttachmentMIME(depth int, attached bool) string {
+	var raw strings.Builder
+	for i := 0; i < depth; i++ {
+		fmt.Fprintf(&raw, "Content-Type: multipart/mixed (nested); boundary=nest%04d\r\n\r\n--nest%04d\r\n", i, i)
+	}
+	if attached {
+		raw.WriteString("Content-Type: application/pdf\r\nContent-Disposition: attachment\r\n\r\nPDF")
+	} else {
+		raw.WriteString("Content-Type: text/plain\r\n\r\nbody")
+	}
+	for i := depth - 1; i >= 0; i-- {
+		fmt.Fprintf(&raw, "\r\n--nest%04d--\r\n", i)
+	}
+	return raw.String()
 }
