@@ -1994,12 +1994,15 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		// copied, not edited — it may be a lookup-cache entry other sessions share, and the
 		// pin must come back when maintenance ends.
 		logger.Info("Remote lookup backend in maintenance - routing normally", "proxy", params.ProxyName, "user", params.Username, "backend", result.RoutingInfo.ServerAddress)
-		// With named pools the user stays among the pinned backend's own siblings: the pool
-		// it is a member of, or (in none) the default pool, or a refusal from routePool.
+		// With named pools the user stays among the pinned backend's own siblings.
+		// An unowned pin has no safe detour, even when a default pool is configured.
 		routed := *result.RoutingInfo
 		routed.ServerAddress = ""
 		routed.AuthOnlyMode = true
 		routed.PoolName = cm.PoolOfBackend(result.RoutingInfo.ServerAddress)
+		if cm.HasNamedPools() && routed.PoolName == "" {
+			return result, fmt.Errorf("%w: pinned backend in maintenance has no pool", ErrRouteLookupFailed)
+		}
 		result.RoutingInfo = &routed
 	}
 
@@ -2019,6 +2022,9 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		// Blocked out-of-pool address (logged in AllowRemoteLookupBackend): drop it so
 		// the affinity and consistent-hash steps below still run and the user is routed
 		// to a valid in-pool backend instead of being stranded on a single rejected route.
+		if cm.HasNamedPools() {
+			return result, fmt.Errorf("%w: pinned backend is outside the configured pools", ErrRouteLookupFailed)
+		}
 		result.RoutingInfo.ServerAddress = ""
 	}
 

@@ -169,9 +169,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		remotelookupClient, err := proxy.InitializeRemoteLookup("userapi", opts.RemoteLookup)
 		if err != nil {
 			logger.Warn("User API Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
-			if !opts.RemoteLookup.ShouldLookupLocalUsers() {
+			if len(opts.Pools) > 0 || !opts.RemoteLookup.ShouldLookupLocalUsers() {
 				cancel()
-				return nil, fmt.Errorf("remotelookup initialization failed and local lookup disabled: %w", err)
+				return nil, fmt.Errorf("remotelookup initialization failed: %w", err)
 			}
 			logger.Info("User API Proxy: Continuing with consistent hash fallback", "name", opts.Name)
 		} else {
@@ -588,17 +588,24 @@ func (s *Server) peekAuthEmail(r *http.Request) (string, error) {
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 
-	var req struct {
-		Email string `json:"email"`
-		Token string `json:"token"`
-	}
-	if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
-		return "", nil
-	}
 	switch r.URL.Path {
 	case "/user/auth/login":
+		// Decode only fields the login endpoint uses. A refresh-only field must
+		// stay unknown here, just as it is to the backend's login decoder.
+		var req struct {
+			Email string `json:"email"`
+		}
+		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
+			return "", nil
+		}
 		return strings.TrimSpace(req.Email), nil
 	case "/user/auth/refresh":
+		var req struct {
+			Token string `json:"token"`
+		}
+		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
+			return "", nil
+		}
 		if claims, err := s.validateToken(req.Token); err == nil {
 			return claims.Email, nil
 		}
@@ -653,11 +660,11 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 // With named pools, routing never guesses: a lookup that fails, or answers nothing usable,
 // is refused rather than routed into the default pool, because the backends trust the
 // token's account ID and a backend of another pool holds another tenant's account under
-// it. A user the lookup does not know goes to the default pool only with
-// lookup_local_users, as on every other proxy.
+// it. With lookup_local_users, a JWT request the lookup does not know also has to
+// identify an active local account before it can enter the default pool.
 //
 // A backend in maintenance is never picked. A pin to one routes the user among that
-// backend's own siblings (the pool it is a member of, or the default pool) without
+// backend's own siblings (refused if its named pool cannot be identified) without
 // setting affinity, so the pin takes the user back when maintenance ends; an affinity to
 // one is dropped and the user routed afresh, so the new affinity keeps them there after it.
 //
@@ -682,12 +689,18 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			logger.Debug("User API Proxy: Using cached pool", "name", s.name, "user", email, "pool", cached.PoolName, "age", time.Since(cached.CreatedAt))
 			poolName, havePool = cached.PoolName, true
 		case !s.connManager.AllowRemoteLookupBackend(cached.ServerAddress):
+			if named {
+				return backendRoute{}, fmt.Errorf("%w: cached pin is outside the configured pools", proxy.ErrRouteLookupFailed)
+			}
 			// restrict_to_pool re-validates the cached address against the pool (a stale
 			// entry surviving a pool shrink); a passthrough when the feature is off.
 			// Refused: ask the lookup again below.
 		case s.connManager.InMaintenance(cached.ServerAddress):
 			logger.Debug("User API Proxy: Cached backend in maintenance - routing among its siblings", "name", s.name, "user", email, "backend", cached.ServerAddress)
 			poolName, havePool, pinInMaintenance = s.connManager.PoolOfBackend(cached.ServerAddress), true, true
+			if named && poolName == "" {
+				return backendRoute{}, fmt.Errorf("%w: cached pin in maintenance has no pool", proxy.ErrRouteLookupFailed)
+			}
 		default:
 			// NOTE: We do NOT refresh routing cache. Entries should expire after
 			// positive_ttl to allow periodic revalidation via remotelookup, so that when
@@ -734,6 +747,9 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			// false for an out-of-pool address, which then falls through to in-pool routing
 			// below — the bad address is never dialed.
 			if !s.connManager.AllowRemoteLookupBackend(routingInfo.ServerAddress) {
+				if named {
+					return backendRoute{}, fmt.Errorf("%w: pin is outside the configured pools", proxy.ErrRouteLookupFailed)
+				}
 				break
 			}
 			// The answer is cached as given, in maintenance or not: routing decides each
@@ -742,6 +758,9 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			if s.connManager.InMaintenance(routingInfo.ServerAddress) {
 				logger.Info("User API Proxy: Remote lookup backend in maintenance - routing among its siblings", "name", s.name, "user", email, "backend", routingInfo.ServerAddress)
 				poolName, havePool, pinInMaintenance = s.connManager.PoolOfBackend(routingInfo.ServerAddress), true, true
+				if named && poolName == "" {
+					return backendRoute{}, fmt.Errorf("%w: pin in maintenance has no pool", proxy.ErrRouteLookupFailed)
+				}
 				break
 			}
 			logger.Debug("User API Proxy: Using remotelookup backend", "name", s.name, "user", email, "backend", routingInfo.ServerAddress)
@@ -754,8 +773,26 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, PoolName: routingInfo.PoolName})
 		}
 	}
-	if notFound && named && !s.lookupLocalUsers {
-		return backendRoute{}, fmt.Errorf("user is not known to the remote lookup, and lookup_local_users is off")
+	if notFound && named {
+		if !s.lookupLocalUsers {
+			return backendRoute{}, fmt.Errorf("user is not known to the remote lookup, and lookup_local_users is off")
+		}
+		// A valid JWT from another pool may carry the ID of an unrelated local
+		// account. A lookup miss is not evidence that its owner is a local user.
+		// Logins are authenticated by the backend; refreshes revalidate the email
+		// there. Ordinary JWT requests need this check on every fallback, including
+		// negative-cache hits; the routing cache cannot establish local ownership.
+		if !forAuth {
+			if s.rdb == nil {
+				return backendRoute{}, fmt.Errorf("cannot verify local token ownership without a local database")
+			}
+			localCtx, cancel := context.WithTimeout(ctx, s.rdb.GetQueryTimeout())
+			defer cancel()
+			localID, err := s.rdb.GetActiveAccountIDByAddressWithRetry(localCtx, email)
+			if err != nil || accountID <= 0 || localID != accountID {
+				return backendRoute{}, fmt.Errorf("token does not identify an active local account")
+			}
+		}
 	}
 
 	// 3. Inside the pool: affinity, then consistent hash.

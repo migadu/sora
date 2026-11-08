@@ -108,7 +108,7 @@ func TestRouteUser_UnknownUserNeedsLookupLocalUsers(t *testing.T) {
 	s.lookupCache = lookupcache.New(5*time.Minute, time.Minute, 100, time.Hour, 0)
 	t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
 	for i := 0; i < 3; i++ {
-		got, err := s.getBackendForUser(context.Background(), "local@example.com", 42)
+		got, err := s.routeUser(context.Background(), "local@example.com", 0, true)
 		if err != nil || got.addr != "10.0.0.1:8081" {
 			t.Fatalf("with lookup_local_users: %q, %v; want the default pool's 10.0.0.1:8081", got.addr, err)
 		}

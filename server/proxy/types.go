@@ -230,6 +230,14 @@ func normalizeHostPort(addr string, defaultPort int) string {
 	if addr == "" {
 		return ""
 	}
+	// A complete IPv6 literal has no port, even when its last group is decimal.
+	// Trying the unbracketed host:port heuristic first silently changes the host.
+	if net.ParseIP(addr) != nil {
+		if defaultPort > 0 {
+			return net.JoinHostPort(addr, strconv.Itoa(defaultPort))
+		}
+		return addr
+	}
 
 	// net.SplitHostPort is the robust way to do this, as it correctly
 	// handles IPv6 addresses like "[::1]:143".
