@@ -127,6 +127,24 @@ func TestAttachmentKeyword(t *testing.T) {
 			"UEsDBA==",
 			"--b--",
 		), has},
+		{"attached multipart document", mime(
+			`Content-Type: multipart/mixed; boundary="outer"`,
+			"",
+			"--outer", "Content-Type: text/plain", "", "See attached web page.",
+			"--outer", `Content-Type: multipart/related; boundary="page"`,
+			`Content-Disposition: attachment; filename="page.mhtml"`, "",
+			"--page", "Content-Type: text/html", "", "<p>Attached page</p>",
+			"--page--", "--outer--",
+		), has},
+		{"multipart document with a name only", mime(
+			`Content-Type: multipart/mixed; boundary="b"; name="document.mime"`, "",
+			"--b", "Content-Type: text/plain", "", "document body", "--b--",
+		), has},
+		{"named multipart resource inside related stays inline", mime(
+			`Content-Type: multipart/related; boundary="outer"`, "",
+			"--outer", `Content-Type: multipart/alternative; boundary="b"; name="body.mime"`, "",
+			"--b", "Content-Type: text/plain", "", "body", "--b--", "--outer--",
+		), none},
 		{"forwarded message", mime(
 			`Content-Type: multipart/mixed; boundary="b"`,
 			"",

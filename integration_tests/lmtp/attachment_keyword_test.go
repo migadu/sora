@@ -140,11 +140,28 @@ func TestLMTP_AttachmentKeyword(t *testing.T) {
 		"JVBERi0=",
 		"--b--",
 	)
+	deliver("multipart-attached",
+		`Content-Type: multipart/related; boundary="b"`,
+		`Content-Disposition: attachment; filename="page.mhtml"`, "",
+		"--b", "Content-Type: text/html", "", "<p>Attached page</p>", "--b--",
+	)
+	deliver("malformed",
+		`Content-Type: multipart/mixed; boundary="declared"`, "",
+		"--actual", "Content-Type: text/plain", "", "body", "--actual--",
+	)
 
 	if kw := keywordsOf("plain"); !slices.Contains(kw, "$hasnoattachment") || slices.Contains(kw, "$hasattachment") {
 		t.Errorf("plain message keywords = %v, want $hasnoattachment in place of the script's $hasattachment", kw)
 	}
 	if kw := keywordsOf("attached"); !slices.Contains(kw, "$hasattachment") || slices.Contains(kw, "$hasnoattachment") {
 		t.Errorf("message with a PDF keywords = %v, want $hasattachment", kw)
+	}
+	if kw := keywordsOf("multipart-attached"); !slices.Contains(kw, "$hasattachment") || slices.Contains(kw, "$hasnoattachment") {
+		t.Errorf("attached multipart keywords = %v, want $hasattachment", kw)
+	}
+	// An undecidable structure must not replace the script's explicit keyword
+	// with a server-generated assertion that no attachments exist.
+	if kw := keywordsOf("malformed"); !slices.Contains(kw, "$hasattachment") || slices.Contains(kw, "$hasnoattachment") {
+		t.Errorf("malformed MIME keywords = %v, want the script's keyword left alone", kw)
 	}
 }
