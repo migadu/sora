@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -256,9 +257,9 @@ func main() {
 		defer deps.relayWorker.Stop()
 	}
 
-	// SIGHUP handler for config reload - set up AFTER deps is created so we can
-	// update deps.config directly. Servers that hold Config *config.Config pointers
-	// (IMAP, POP3, ManageSieve) will see changes through the shared pointer.
+	// SIGHUP handler for config reload - set up AFTER deps is created so the running
+	// servers are registered. Global settings are only reported (handleConfigReload
+	// leaves deps.config as it is); each server reloads its own.
 	reloadChan := make(chan os.Signal, 1)
 	signal.Notify(reloadChan, syscall.SIGHUP)
 	go func() {
@@ -272,7 +273,7 @@ func main() {
 				continue
 			}
 
-			// Update shared config settings (propagates via Config pointer)
+			// Report the global settings that need a restart
 			handleConfigReload(*configPath, &deps.config, errorHandler)
 
 			// Dispatch per-server reload to running servers
@@ -367,8 +368,11 @@ func cleanupDatabaseDefaults(cfg *config.Config) {
 	}
 }
 
-// handleConfigReload re-reads config and applies safe-to-reload settings.
-// Settings that require restart (listen addresses, database, S3, cluster) are NOT reloaded.
+// handleConfigReload reports the global settings a reload changed but cannot apply.
+// Their consumers took them at start-up, or (for [shared_mailboxes]) read the
+// process-wide config with no lock, so the running config is left as it is and a
+// change takes effect on restart. Per-server settings are reloaded by each server's
+// ReloadConfig, which the SIGHUP handler calls after this.
 func handleConfigReload(configPath string, currentCfg *config.Config, errorHandler *errors.ErrorHandler) {
 	newCfg := config.NewDefaultConfig()
 
@@ -378,36 +382,27 @@ func handleConfigReload(configPath string, currentCfg *config.Config, errorHandl
 		return
 	}
 
-	// Track what was reloaded
-	var reloaded []string
-
-	// 1. Logging level changes require restart (logger doesn't support runtime level change)
+	// Logging level changes require restart (logger doesn't support runtime level change)
 	if newCfg.Logging.Level != currentCfg.Logging.Level {
 		logger.Info("Config reload: logging.level changed but requires restart to take effect",
 			"current", currentCfg.Logging.Level, "new", newCfg.Logging.Level)
 	}
 
-	// 2. Reload cleanup settings
-	if newCfg.Cleanup.GracePeriod != currentCfg.Cleanup.GracePeriod {
-		reloaded = append(reloaded, fmt.Sprintf("cleanup.grace_period: %s → %s", currentCfg.Cleanup.GracePeriod, newCfg.Cleanup.GracePeriod))
-		currentCfg.Cleanup.GracePeriod = newCfg.Cleanup.GracePeriod
-	}
-	if newCfg.Cleanup.WakeInterval != currentCfg.Cleanup.WakeInterval {
-		reloaded = append(reloaded, fmt.Sprintf("cleanup.wake_interval: %s → %s", currentCfg.Cleanup.WakeInterval, newCfg.Cleanup.WakeInterval))
-		currentCfg.Cleanup.WakeInterval = newCfg.Cleanup.WakeInterval
-	}
-	if newCfg.Cleanup.MaxAgeRestriction != currentCfg.Cleanup.MaxAgeRestriction {
-		reloaded = append(reloaded, fmt.Sprintf("cleanup.max_age_restriction: %s → %s", currentCfg.Cleanup.MaxAgeRestriction, newCfg.Cleanup.MaxAgeRestriction))
-		currentCfg.Cleanup.MaxAgeRestriction = newCfg.Cleanup.MaxAgeRestriction
+	// The cleaner is configured once, at start-up.
+	if newCfg.Cleanup != currentCfg.Cleanup {
+		logger.Info("Config reload: [cleanup] changed but requires restart to take effect",
+			"current", currentCfg.Cleanup, "new", newCfg.Cleanup)
 	}
 
-	// 3. Reload shared mailbox settings
+	// IMAP sessions read [shared_mailboxes] from the process-wide config with no lock,
+	// so a reload must not write it (and a session that has seen the shared namespace
+	// would lose it midway).
 	if newCfg.SharedMailboxes != currentCfg.SharedMailboxes {
-		reloaded = append(reloaded, "shared_mailboxes")
-		currentCfg.SharedMailboxes = newCfg.SharedMailboxes
+		logger.Info("Config reload: [shared_mailboxes] changed but requires restart to take effect",
+			"current", currentCfg.SharedMailboxes, "new", newCfg.SharedMailboxes)
 	}
 
-	// 4. The [sieve] section is read once at startup by every consumer (LMTP, the
+	// The [sieve] section is read once at startup by every consumer (LMTP, the
 	// Admin and User APIs, ManageSieve; max_execution_time at process start), so a
 	// change takes effect on restart. It used to be reported as reloaded, and
 	// whenever the list was non-empty, not only when it changed.
@@ -421,30 +416,18 @@ func handleConfigReload(configPath string, currentCfg *config.Config, errorHandl
 			"current", currentCfg.Maintenance, "new", newCfg.Maintenance)
 	}
 
-	// 5. Reload metadata limits
+	// IMAP takes the [metadata] limits at start-up.
 	if newCfg.Metadata != currentCfg.Metadata {
-		reloaded = append(reloaded, "metadata")
-		currentCfg.Metadata = newCfg.Metadata
+		logger.Info("Config reload: [metadata] changed but requires restart to take effect",
+			"current", currentCfg.Metadata, "new", newCfg.Metadata)
 	}
 
-	// 6. Reload trusted_networks (propagates to servers via Config pointer)
-	if len(newCfg.Servers.TrustedNetworks) > 0 {
-		currentCfg.Servers.TrustedNetworks = newCfg.Servers.TrustedNetworks
-		reloaded = append(reloaded, "servers.trusted_networks")
+	// Every server and proxy takes trusted_networks at start-up: until a restart, the
+	// networks they started with stay trusted and added ones are not.
+	if !slices.Equal(newCfg.Servers.TrustedNetworks, currentCfg.Servers.TrustedNetworks) {
+		logger.Warn("Config reload: servers.trusted_networks changed but requires restart to take effect; the networks the servers started with stay trusted until then",
+			"current", currentCfg.Servers.TrustedNetworks, "new", newCfg.Servers.TrustedNetworks)
 	}
-
-	if len(reloaded) == 0 {
-		logger.Info("Config reload: no runtime changes detected")
-	} else {
-		for _, item := range reloaded {
-			logger.Info("Config reloaded", "setting", item)
-		}
-		logger.Info("Config reload complete", "changes", len(reloaded))
-	}
-
-	// Dispatch per-server config reload to running servers
-	// Note: handleConfigReload receives *config.Config (not deps), so we need
-	// a reference to deps. This is passed via closure in the SIGHUP handler.
 }
 
 // loadAndValidateConfig loads configuration from file and validates all server configurations
