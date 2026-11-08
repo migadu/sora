@@ -136,7 +136,10 @@ func (s *IMAPSession) processForwardingParameters(forwardingFields map[string]st
 	// Decrement TTL to prevent loops. This is for proxy-chaining.
 	if !forwardingParams.DecrementTTL() {
 		s.DebugLog("proxy TTL expired, dropping connection to prevent loop")
-		s.Close() // Close the connection to prevent loops
+		// ID cannot answer with an error, so the socket is closed, as a kick does:
+		// the response write fails, the connection ends, and go-imap closes the
+		// session.
+		s.conn.NetConn().Close()
 		return
 	}
 

@@ -19,11 +19,11 @@ import (
 	"github.com/emersion/go-message/mail"
 
 	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-smtp"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
@@ -250,12 +250,6 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 
 	s.DebugLog("processing rcpt to command", "to", to)
 
-	// Process XRCPTFORWARD parameters if present
-	// This supports Dovecot-style per-recipient parameter forwarding
-	if opts != nil {
-		s.ParseRCPTForward(opts)
-	}
-
 	toAddress, err := server.NewAddress(to)
 	if err != nil {
 		s.WarnLog("invalid to address", "error", err)
@@ -385,6 +379,14 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 		}
 	}
 	defer release()
+
+	// Process XRCPTFORWARD parameters if present, for the accepted recipient. This supports
+	// Dovecot-style per-recipient parameter forwarding. It may set the proxy address, which
+	// Logout reads under this lock.
+	if opts != nil {
+		s.ParseRCPTForward(opts)
+	}
+
 	s.User = server.NewUser(primaryAddr, AccountID) // Always use primary address
 	if !server.IsASCII(to) {
 		s.smtputf8 = true
@@ -566,8 +568,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// address (s.User.Address, set in Rcpt) — the same value the Admin API path uses — so
 	// loop detection is consistent across aliases and ingress paths, and within-account
 	// content dedup (per-account S3 keys) is preserved. Re-parse so downstream header/
-	// metadata extraction sees the stamped header (the prepended header does not change MIME
-	// body structure, so the buf.Bytes()-based body structure below stays correct).
+	// metadata extraction sees the stamped header. MIME structure is extracted
+	// from the final bytes after Sieve's header edits below.
 	if s.User != nil {
 		deliveredTo := s.User.Address.BaseAddress()
 		if helpers.IsRedirectLoop(helpers.HeaderGetter(messageContent.Header.Map()), deliveredTo) {
@@ -635,8 +637,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		s.DebugLog("message sent date", "sent_date", sentDate)
 	}
 
-	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(buf.Bytes()))
-	bodyStructure := &bodyStructureVal
 	var plaintextBody *string
 	plaintextBodyResult, extractErr := helpers.ExtractPlaintextBody(messageContent)
 	if extractErr != nil {
@@ -904,6 +904,17 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			"reason", "not a valid IMAP flag-keyword (RFC 9051 §9: ASCII atom, no specials)")
 	}
 
+	// Classify and extract the final stored MIME once, after editheader, and
+	// reuse both results for every fileinto :copy destination. The structure
+	// gets the same validation and fallback as APPEND's and the Admin API's:
+	// a stored structure that does not serialize panics the FETCH write path.
+	bodyStructureVal, bsErr := helpers.SafeBodyStructure(fullMessageBytes)
+	if bsErr != nil {
+		s.WarnLog("storing a fallback body structure", "error", bsErr)
+	}
+	bodyStructure := &bodyStructureVal
+	sieveFlags = db.WithAttachmentKeyword(sieveFlags, fullMessageBytes, true)
+
 	switch result.Action {
 	case sieveengine.ActionFileInto:
 		mailboxName = result.Mailbox
@@ -1151,21 +1162,26 @@ func (s *LMTPSession) Reset() {
 
 func (s *LMTPSession) Logout() error {
 	s.endSession()
-	// Check if this is a normal QUIT command or an abrupt connection close
-	if s.conn != nil && s.conn.Conn() != nil {
-		s.DebugLog("session logout requested")
+	// go-smtp also logs a session out from Server.Close, on the closing goroutine, while this
+	// connection's goroutine may be inside a command writing the user, the trace id or the
+	// remote address. Those are written under the session lock and read here only with it.
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
+	debugLog, infoLog := s.DebugLog, s.InfoLog
+	if acquired {
+		defer release()
 	} else {
-		s.DebugLog("client dropped connection")
+		// Continue with logout even if we can't get the lock. The command holding it may still
+		// be writing (go-smtp cancels the session context at Server.Close, and a cancelled
+		// session does not wait for the lock), so log only what was fixed at session creation.
+		debugLog, infoLog = s.fixedFieldsLog(logger.Debug), s.fixedFieldsLog(logger.Info)
+		s.fixedFieldsLog(logger.Warn)("failed to acquire write lock", "command", "LOGOUT")
 	}
 
-	// Acquire write lock for logout operations
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-	if !acquired {
-		s.WarnLog("failed to acquire write lock", "command", "LOGOUT")
-		// Continue with logout even if we can't get the lock
+	// Check if this is a normal QUIT command or an abrupt connection close
+	if s.conn != nil && s.conn.Conn() != nil {
+		debugLog("session logout requested")
 	} else {
-		defer release()
-		// Clean up any session state if needed
+		debugLog("client dropped connection")
 	}
 
 	// Release connection from limiter
@@ -1186,12 +1202,25 @@ func (s *LMTPSession) Logout() error {
 		s.cancel()
 	}
 
-	s.InfoLog("session logout completed", "active_count", activeCount)
+	infoLog("session logout completed", "active_count", activeCount)
 
 	return &smtp.SMTPError{
 		Code:         221,
 		EnhancedCode: smtp.EnhancedCode{2, 0, 0},
 		Message:      "Closing transmission channel",
+	}
+}
+
+// fixedFieldsLog logs through logFn with the session's fields that never change after
+// NewSession, for Logout when it does not hold the session lock. The remote address is not one
+// of them: XCLIENT and XRCPTFORWARD rewrite it.
+func (s *LMTPSession) fixedFieldsLog(logFn func(msg string, keysAndValues ...any)) func(msg string, keysAndValues ...any) {
+	protocol := s.Protocol
+	if s.ServerName != "" {
+		protocol += "-" + s.ServerName
+	}
+	return func(msg string, keysAndValues ...any) {
+		logFn(msg, append([]any{"protocol", protocol, "session", s.Id}, keysAndValues...)...)
 	}
 }
 
@@ -1345,7 +1374,7 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 			References:    references,
 			BodyStructure: bodyStructure,
 			Recipients:    recipients,
-			Flags:         flags, // Flags set by the Sieve script (imap4flags); empty -> unread
+			Flags:         flags, // Sieve-set flags (imap4flags) plus the attachment keyword; no \Seen -> unread
 			FTSRetention:  s.backend.ftsRetention,
 		},
 		db.PendingUpload{

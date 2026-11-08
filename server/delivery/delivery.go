@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/jackc/pgx/v5"
@@ -206,25 +205,14 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// Calculate content hash
 	contentHash := helpers.HashContent(messageBytes)
 
-	// Extract body structure
-	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(messageBytes))
-	bodyStructure := &bodyStructureVal
-
-	// Validate body structure to prevent panics during FETCH BODYSTRUCTURE
-	if err := helpers.ValidateBodyStructure(bodyStructure); err != nil {
-		// Log the validation error but create a safe fallback body structure
-		d.Logger.Log("Invalid body structure detected, using fallback: %v", err)
-		// Create a minimal valid body structure
-		fallback := &imap.BodyStructureSinglePart{
-			Type:     "text",
-			Subtype:  "plain",
-			Size:     uint32(len(messageBytes)),
-			Extended: &imap.BodyStructureSinglePartExt{}, // Always populate Extended to match imapserver.ExtractBodyStructure behavior
-			Text:     &imap.BodyStructureText{},          // body-fld-lines is mandatory for a text part
-		}
-		var fallbackBS imap.BodyStructure = fallback
-		bodyStructure = &fallbackBS
+	// The stored BODYSTRUCTURE and the attachment classification both describe
+	// the final bytes, but classification never uses an extractor fallback.
+	bodyStructureVal, bsErr := helpers.SafeBodyStructure(messageBytes)
+	if bsErr != nil {
+		d.Logger.Log("Invalid body structure detected, using fallback: %v", bsErr)
 	}
+	bodyStructure := &bodyStructureVal
+	deliveryFlags := db.WithAttachmentKeyword(sieveFlags, messageBytes, true)
 
 	// Extract recipients
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
@@ -265,7 +253,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// pending_uploads row can never name a file that is not staged yet - the uploader
 	// treats a missing local file as permanently lost content.
 	if copyMailbox != "" {
-		err := d.SaveMessageToMailbox(d.Ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, sieveFlags)
+		err := d.SaveMessageToMailbox(d.Ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, deliveryFlags, contentHash, bodyStructure)
 		// A duplicate copy is an accepted delivery, as it is in LMTP: the copy is
 		// already in the mailbox, so a resubmission must not fail the delivery.
 		if err != nil && !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -305,7 +293,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			References:           references,
 			BodyStructure:        bodyStructure,
 			Recipients:           recipients,
-			Flags:                sieveFlags, // Flags set by the Sieve script (imap4flags); empty -> unread
+			Flags:                deliveryFlags, // Sieve-set flags (imap4flags) plus the attachment keyword; no \Seen -> unread
 			FTSRetention:         d.FTSRetention,
 			PreservedUID:         recipient.PreservedUID,
 			PreservedUIDValidity: recipient.PreservedUIDVal,
@@ -499,11 +487,12 @@ func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient Reci
 	return mailbox, destAccountID, destS3Domain, destS3Localpart, nil
 }
 
-// SaveMessageToMailbox saves a message to a specific mailbox (helper for Sieve :copy).
-// flags carries any keywords/flags set by the Sieve script (imap4flags, RFC 5232).
-func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient RecipientInfo, mailboxName string, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string, flags []imap.Flag) error {
-	contentHash := helpers.HashContent(messageBytes)
-
+// SaveMessageToMailbox stores one copy of a message in the named mailbox of the
+// recipient, or of the owner of a shared mailbox the recipient may post to. The
+// caller computes contentHash and bodyStructure once (helpers.SafeBodyStructure)
+// and passes the final flags, Sieve-set ones plus the attachment keyword, so a
+// fileinto :copy stores the same metadata in both mailboxes.
+func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient RecipientInfo, mailboxName string, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string, flags []imap.Flag, contentHash string, bodyStructure *imap.BodyStructure) error {
 	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash)
 	if err != nil {
 		return err
@@ -521,8 +510,6 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 		sentDate = time.Now()
 	}
 
-	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(messageBytes))
-	bodyStructure := &bodyStructureVal
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
 
 	size := int64(len(messageBytes))

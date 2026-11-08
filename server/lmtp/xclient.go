@@ -20,6 +20,15 @@ func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) err
 		return fmt.Errorf("XCLIENT denied")
 	}
 
+	// go-smtp logs this session out next, and Server.Close may do so on another goroutine
+	// while the hook runs: rewrite the remote address under the lock that Logout reads it with.
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
+	if !acquired {
+		s.WarnLog("failed to acquire write lock", "command", "XCLIENT")
+		return fmt.Errorf("XCLIENT temporarily unavailable")
+	}
+	defer release()
+
 	s.applyXCLIENTAttrs(attrs)
 
 	s.DebugLog("processed xclient attributes", "client_ip", s.ForwardingParams.OriginatingIP, "client_port", s.ForwardingParams.OriginatingPort, "protocol", s.ForwardingParams.Protocol, "helo", s.ForwardingParams.HELO, "login", s.ForwardingParams.Login)
