@@ -26,6 +26,10 @@ var copyBufPool = sync.Pool{
 	},
 }
 
+// Timeout notices are best effort. A peer that does not read must not hold a
+// scheduler shard, its connection, or the notice goroutine open indefinitely.
+const timeoutNoticeGrace = 100 * time.Millisecond
+
 // GetAddrString safely extracts address string without triggering reverse DNS lookup.
 // This should be used instead of addr.String() to avoid slow reverse DNS lookups.
 func GetAddrString(addr net.Addr) string {
@@ -158,7 +162,8 @@ type SoraConn struct {
 	// serially — the same accept-path stall class as the 2026-07-05 incident.
 	probeTLSOnFirstRead atomic.Bool
 
-	checked atomic.Bool // registered with the timeout checker (see CheckedTimeouts)
+	checked   atomic.Bool // registered with the timeout checker (see CheckedTimeouts)
+	timingOut atomic.Bool // one owner for timeout notification and teardown
 
 	// Server context for metrics
 	protocol   string
@@ -221,6 +226,8 @@ type SoraConnConfig struct {
 	// OnTimeout is called before closing connection due to timeout.
 	// The reason will be one of: "idle", "slow_throughput", or "session_max".
 	// The handler should send a protocol-specific goodbye message and return quickly.
+	// It runs outside the scheduler, with a bounded write deadline and transport
+	// closure to unblock pending I/O. It must not wait on anything other than conn I/O.
 	// If nil, the connection will be closed without sending any message.
 	// The conn parameter is the underlying net.Conn for writing goodbye messages.
 	OnTimeout func(conn net.Conn, reason string)
@@ -281,7 +288,7 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 	closed := c.closed
 	c.closeMutex.Unlock()
 
-	if closed {
+	if closed || c.timingOut.Load() {
 		return
 	}
 
@@ -297,16 +304,7 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 
 	// Check absolute session timeout (highest priority)
 	if c.absoluteTimeout > 0 && sessionDuration >= c.absoluteTimeout {
-		remoteAddr := c.remoteAddr
-		logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "session_max", "duration", sessionDuration.Round(time.Second), "max", c.absoluteTimeout)
-		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, c.serverName, c.hostname, "session_max").Inc()
-
-		// Call timeout handler before closing (if provided)
-		if c.onTimeout != nil {
-			c.onTimeout(c.Conn, "session_max")
-		}
-
-		c.Close()
+		c.closeForTimeout(username, "session_max", "duration", sessionDuration.Round(time.Second), "max", c.absoluteTimeout)
 		return
 	}
 
@@ -345,16 +343,7 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 			c.mu.Unlock()
 
 			if stalled >= 2 {
-				remoteAddr := c.remoteAddr
-				logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "slow_throughput", "bytes_read", bytesRead, "bytes_written", bytesWritten, "bytes_per_min", bytesPerMinute, "required", c.minBytesPerMinute, "stalled_windows", stalled)
-				metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, c.serverName, c.hostname, "slow_throughput").Inc()
-
-				// Call timeout handler before closing (if provided)
-				if c.onTimeout != nil {
-					c.onTimeout(c.Conn, "slow_throughput")
-				}
-
-				c.Close()
+				c.closeForTimeout(username, "slow_throughput", "bytes_read", bytesRead, "bytes_written", bytesWritten, "bytes_per_min", bytesPerMinute, "required", c.minBytesPerMinute, "stalled_windows", stalled)
 				return
 			}
 		}
@@ -364,17 +353,52 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 
 	// Check idle timeout
 	if c.idleTimeout > 0 && idleTime >= c.idleTimeout {
-		remoteAddr := c.remoteAddr
-		logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "idle", "idle_time", idleTime.Round(time.Second), "max_idle", c.idleTimeout)
-		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, c.serverName, c.hostname, "idle").Inc()
+		c.closeForTimeout(username, "idle", "idle_time", idleTime.Round(time.Second), "max_idle", c.idleTimeout)
+	}
+}
 
-		// Call timeout handler before closing (if provided)
-		if c.onTimeout != nil {
-			c.onTimeout(c.Conn, "idle")
-		}
-
-		c.Close()
+// closeForTimeout claims the timeout once before handing off any socket work.
+// A blocked peer must never prevent the shard from checking another connection.
+func (c *SoraConn) closeForTimeout(username, reason string, details ...any) {
+	if !c.timingOut.CompareAndSwap(false, true) {
 		return
+	}
+	attrs := []any{"proto", c.protocol, "remote", c.remoteAddr, "user", username, "reason", reason}
+	logger.Info("Connection closed - timeout", append(attrs, details...)...)
+	metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, c.serverName, c.hostname, reason).Inc()
+
+	go func() {
+		// Unregister here too: Stop may hold the scheduler mutex while waiting
+		// for the shard to exit, so the shard must not perform this operation.
+		unregisterConn(c)
+		transport := c.Conn
+		// A concurrent protocol writer can replace the deadline, and TLS Close
+		// can wait while sending close_notify. Close the underlying transport
+		// at the same bound so neither can strand this goroutine.
+		timer := time.AfterFunc(timeoutNoticeGrace, func() { closeTimeoutTransport(transport) })
+		defer timer.Stop()
+		defer c.Close()
+		if c.onTimeout != nil {
+			if err := transport.SetWriteDeadline(time.Now().Add(timeoutNoticeGrace)); err == nil {
+				c.onTimeout(transport, reason)
+			}
+		}
+	}()
+}
+
+// closeTimeoutTransport bypasses TLS close_notify and wrapper cleanup, which
+// c.Close performs afterwards. Closing the innermost socket unblocks its I/O.
+func closeTimeoutTransport(conn net.Conn) {
+	for {
+		switch c := conn.(type) {
+		case interface{ Unwrap() net.Conn }:
+			conn = c.Unwrap()
+		case *tls.Conn:
+			conn = c.NetConn()
+		default:
+			conn.Close()
+			return
+		}
 	}
 }
 
