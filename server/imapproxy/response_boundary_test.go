@@ -24,6 +24,26 @@ func TestResponseBoundary(t *testing.T) {
 		{"non-synchronizing form", "* 1 FETCH (BODY[] {3+}\r\nabc)\r\n", true},
 		{"empty literal", "* 1 FETCH (BODY[] {0}\r\n)\r\n", true},
 		{"brace that is no literal", "* OK [ALERT] {not a literal}\r\n", true},
+		{"tagged status ending in braces", "a1 NO [NONEXISTENT] mailbox does not exist: missing{64}\r\n", true},
+		{"long tagged status", "long-client-command-tag OK completed {8}\r\n", true},
+		{"untagged OK text", "* OK [ALERT] notice {8}\r\n", true},
+		{"untagged NO text", "* NO failed {8}\r\n", true},
+		{"untagged BAD text", "* BAD failed {8}\r\n", true},
+		{"untagged BYE text", "* BYE closing {8}\r\n", true},
+		{"untagged PREAUTH text", "* PREAUTH ready {8}\r\n", true},
+		{"case-insensitive status", "* oK notice {8}\r\n", true},
+		{"literal in a status code", "a1 NO [BADCHARSET ({5}\r\n", false},
+		{"status code continues after its literal", "a1 NO [BADCHARSET ({5}\r\nUTF-8", false},
+		{"text after a status-code literal", "* NO [BADCHARSET ({5}\r\nUTF-8)] failed {64}\r\n", true},
+		{"quoted bracket in a status code", "a1 NO [BADCHARSET (\"odd]name\" {5}\r\nUTF-8)] failed {64}\r\n", true},
+		{"escaped quote in a status code", "a1 NO [BADCHARSET (\"odd\\\"]name\" {5}\r\nUTF-8)] failed {64}\r\n", true},
+		{"bracket inside a status-code literal", "a1 NO [BADCHARSET ({5}\r\n]UTF-)] failed {64}\r\n", true},
+		{"spaces begin ordinary status text", "a1 NO  [notice {8}\r\n", true},
+		{"continuation ending in braces", "+ Ready {8}\r\n", true},
+		{"continuation with a response code", "+ [ALERT] Ready {8}\r\n", true},
+		{"data type shares a status prefix", "* OKAY {5}\r\n", false},
+		{"list mailbox literal", "* LIST () \"/\" {5}\r\nINBOX\r\n", true},
+		{"literal continuation is not a new response", "* X {2}\r\nab {3}\r\ncde\r\n", true},
 		{"continuation request", "+ Ready\r\n", true},
 	}
 	for _, c := range cases {
@@ -47,5 +67,20 @@ func TestResponseBoundary_StopsAtTheFirstBoundary(t *testing.T) {
 	n := b.consume(chunk, true)
 	if string(chunk[:n]) != "cd)\r\n" || !b.atBoundary() {
 		t.Fatalf("stopped after %q (atBoundary %v), want after %q", chunk[:n], b.atBoundary(), "cd)\r\n")
+	}
+}
+
+func TestResponseBoundary_StopsAfterStatusText(t *testing.T) {
+	for _, status := range []string{
+		"a1 NO [NONEXISTENT] mailbox does not exist: missing{64}\r\n",
+		"* NO [BADCHARSET ({5}\r\nUTF-8)] failed {64}\r\n",
+		"+ Ready {64}\r\n",
+	} {
+		var b responseBoundary
+		chunk := status + "* 1 FETCH (BODY[] {4}\r\nab"
+		n := b.consume([]byte(chunk), true)
+		if n != len(status) || !b.atBoundary() {
+			t.Errorf("stopped after %q (atBoundary %v), want after %q", chunk[:n], b.atBoundary(), status)
+		}
 	}
 }

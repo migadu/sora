@@ -191,6 +191,36 @@ func TestMaintenanceBye_WaitsForTheEndOfTheResponse(t *testing.T) {
 	}
 }
 
+// GETMETADATA of a missing mailbox named "missing{64}" returns ordinary NO text
+// ending in braces. It must not make the proxy skip the next FETCH's literal
+// announcement and insert its BYE into the message body at the body's CRLF.
+func TestMaintenanceBye_StatusTextCannotSplitAFetchLiteral(t *testing.T) {
+	withCloseGrace(t, 5*time.Second)
+	p := newProxiedSession(t)
+	status := "a1 NO [NONEXISTENT] mailbox does not exist: missing{64}\r\n"
+	p.send(t, status)
+
+	header := "* 1 FETCH (BODY[] {100}\r\n"
+	first := strings.Repeat("x", 60)
+	last := "\r\n" + strings.Repeat("y", 38)
+	p.send(t, header+first)
+	p.s.closeForMaintenance()
+	waitFor(t, func() bool {
+		p.s.writeMu.Lock()
+		defer p.s.writeMu.Unlock()
+		return p.s.byePending != ""
+	}, "the BYE to wait for the FETCH response")
+	if _, err := io.WriteString(p.backend, last+")\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	p.backend.Close()
+	got := p.untilClosed(t, 2*time.Second)
+	want := status + header + first + last + ")\r\n" + maintenanceBye
+	if got != want {
+		t.Fatalf("BYE corrupted a FETCH literal after status text:\ngot  %q\nwant %q", got, want)
+	}
+}
+
 // Between responses (an IDLE session, say) the BYE goes out at once.
 func TestMaintenanceBye_AtOnceBetweenResponses(t *testing.T) {
 	withCloseGrace(t, 5*time.Second)
