@@ -255,6 +255,15 @@ func (s *Session) handleConnection() {
 			s.sender = sender
 			s.mailFromReceived = true
 			s.smtputf8 = hasSMTPUTF8Param(args) || !server.IsASCII(sender)
+			// A held backend that has gone into maintenance is dropped before it is asked
+			// (past refuse_after it refuses every MAIL, and the MTA keeping this connection
+			// would get that for every message): the transaction has no recipient yet, and
+			// the first RCPT routes afresh. The RCPT check below covers maintenance that
+			// begins between the two.
+			if s.backendConn != nil && s.backendInMaintenance() {
+				s.InfoLog("dropping backend connection: backend in maintenance", "backend", s.serverAddr)
+				s.loseBackend()
+			}
 			// A connected backend must learn the new sender too (RFC 5321 §4.1.1.2: MAIL
 			// after a completed or reset transaction), or it would deliver with the
 			// previous transaction's Return-Path. Its answer is the answer; a backend
@@ -290,6 +299,13 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			s.DebugLog("Extracted recipient address", "to", to)
+			// No MAIL in effect (none yet, RSET, or one the backend refused while a
+			// pipelining MTA sent on): a bad sequence, answered here, as a backend asked
+			// would answer 5xx, which reads as a routing inconsistency below.
+			if !s.mailFromReceived {
+				s.sendResponse("503 5.5.1 Error: need MAIL command")
+				continue
+			}
 			if !server.IsASCII(to) {
 				s.smtputf8 = true
 			}
@@ -361,6 +377,16 @@ func (s *Session) handleConnection() {
 				if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 					s.DebugLog("Failed to clear read deadline", "error", err)
 				}
+			}
+
+			// A session keeps its backend across transactions (an MTA may reuse its LMTP
+			// connection), so one held to a backend that has since gone into maintenance
+			// is dropped here, at the first recipient of a transaction: the backend holds
+			// no accepted recipient yet, so nothing is poisoned, and the connect below
+			// routes afresh and re-sends MAIL FROM. Never later in a transaction.
+			if s.backendConn != nil && s.acceptedRcpts == 0 && s.backendInMaintenance() {
+				s.InfoLog("dropping backend connection: backend in maintenance", "backend", s.serverAddr)
+				s.loseBackend()
 			}
 
 			// Connect to backend if not already connected
@@ -1154,8 +1180,8 @@ func (s *Session) connectToBackend() error {
 	shouldUseStartTLS := false
 	var tlsConfig *tls.Config
 
-	if s.routingInfo != nil && s.routingInfo.RemoteTLSUseStartTLS {
-		// RemoteLookup routing specified StartTLS
+	if s.routingInfo.LookupRouted(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
+		// RemoteLookup routing specified StartTLS (for the backend it named, as for the dial)
 		shouldUseStartTLS = true
 		tlsConfig = &tls.Config{
 			InsecureSkipVerify: !s.routingInfo.RemoteTLSVerify,
@@ -1258,8 +1284,8 @@ func (s *Session) connectToBackend() error {
 
 	// Send forwarding parameters via XCLIENT if enabled
 	useXCLIENT := s.server.remoteUseXCLIENT
-	// Override with routing-specific setting if available
-	if s.routingInfo != nil {
+	// The remote lookup's setting applies to the backend it named (as for the dial)
+	if s.routingInfo.LookupRouted(s.serverAddr) {
 		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
 	}
 	// The proxy's role is to forward the original client's information if enabled.
@@ -1848,4 +1874,15 @@ func (s *Session) relayMessageData() bool {
 		}
 	}
 	return true
+}
+
+// backendInMaintenance reports whether the backend the session holds is in maintenance, by
+// the name it was routed by or by the address it is connected to: a name that does not
+// resolve for the check still leaves the address.
+func (s *Session) backendInMaintenance() bool {
+	if s.server.connManager.InMaintenance(s.serverAddr) {
+		return true
+	}
+	remote := s.backendConn.RemoteAddr()
+	return remote != nil && s.server.connManager.InMaintenance(remote.String())
 }

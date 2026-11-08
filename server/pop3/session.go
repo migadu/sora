@@ -96,6 +96,7 @@ var (
 	errTempUnavailable = &pop3server.Error{Code: "SYS/TEMP", Message: "Service temporarily unavailable, please try again later"}
 	errBodyRetryLater  = &pop3server.Error{Code: "SYS/TEMP", Message: "Message temporarily unavailable, please try again later"}
 	errServerBusy      = &pop3server.Error{Code: "SYS/TEMP", Message: "Server busy, please try again"}
+	errInMaintenance   = &pop3server.Error{Code: "SYS/TEMP", Message: "Server in maintenance, please try again later"}
 	errMailboxTooBig   = &pop3server.Error{Code: "SYS/TEMP", Message: "Mailbox too large to open in this session"}
 	errBodyTooBig      = &pop3server.Error{Code: "SYS/TEMP", Message: "Message too large to retrieve in this session"}
 )
@@ -480,6 +481,13 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		return 0, errTempUnavailable
 	}
 
+	// Counted (and let in) before the session takes the user: a login the maintenance gate
+	// refuses leaves the session as it was, not logged in.
+	if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "pop3") {
+		s.InfoLog("login refused: this backend is in maintenance", "address", userAddress.BaseAddress())
+		return 0, errInMaintenance
+	}
+
 	// Setup session state
 	s.mutex.Lock()
 	s.inboxMailboxID = inboxMailboxID.ID
@@ -487,8 +495,6 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	s.deleted = make(map[int]bool)
 	s.useMasterDB.Store(true)
 	s.mutex.Unlock()
-
-	s.server.authenticatedConnections.Add(1)
 
 	if masterAuthUsed {
 		s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", time.Since(start).Seconds()))

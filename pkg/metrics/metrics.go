@@ -621,3 +621,44 @@ var (
 		[]string{"server_name", "state"},
 	)
 )
+
+// Backend maintenance metrics (proxies honoring `sora-admin backends maintenance`, and
+// backends refusing new sessions while in it)
+var (
+	BackendMaintenanceHosts = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_backend_maintenance_hosts",
+			Help: "Backend hosts in maintenance, as this proxy last read the list",
+		},
+	)
+
+	BackendMaintenancePollFailures = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_backend_maintenance_poll_failures_total",
+			Help: "Failed reads of the backend maintenance list; until a first read succeeds the proxy dials no backend",
+		},
+	)
+
+	BackendMaintenanceSessionsClosed = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_backend_maintenance_sessions_closed_total",
+			Help: "Sessions a proxy closed because their backend is in maintenance",
+		},
+		[]string{"proxy"},
+	)
+
+	BackendMaintenanceRefusing = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sora_backend_maintenance_refusing",
+			Help: "1 while this backend refuses new sessions because it is in maintenance (or does not know yet whether it is), else 0",
+		},
+	)
+
+	BackendMaintenanceSessionsRefused = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_backend_maintenance_sessions_refused_total",
+			Help: "New sessions (logins, LMTP transactions, Admin API deliveries) this backend refused because it is in maintenance",
+		},
+		[]string{"protocol"},
+	)
+)

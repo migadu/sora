@@ -571,6 +571,9 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 	//    only while they own no pending upload at all: as long as one exists, that row
 	//    is the evidence that permits reaping it. CTEs see the pre-statement snapshot,
 	//    so rows deleted above still count here and are retired a cycle later.
+	// 4. The `deleted_sessions` CTE retires the sessions reports (instance_sessions) of
+	//    instances silent as long, on the same terms, and not while a backend in
+	//    maintenance names the instance: otherwise a retired id would stay "known" for ever.
 	// The final SELECT returns the count of messages that were deleted.
 	//
 	// GREATEST ignores NULLs in PostgreSQL, so it yields the most recent evidence that
@@ -600,6 +603,12 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 			DELETE FROM instance_heartbeats ih
 			WHERE ih.last_seen < now() - $3::interval
 			  AND NOT EXISTS (SELECT 1 FROM pending_uploads pu WHERE pu.instance_id = ih.instance_id)
+		),
+		deleted_sessions AS (
+			DELETE FROM instance_sessions s
+			WHERE s.reported_at < now() - $3::interval
+			  AND NOT EXISTS (SELECT 1 FROM pending_uploads pu WHERE pu.instance_id = s.instance_id)
+			  AND NOT EXISTS (SELECT 1 FROM backend_maintenance bm WHERE bm.instance_id = s.instance_id)
 		)
 		SELECT count(*) FROM deleted_messages
 	`

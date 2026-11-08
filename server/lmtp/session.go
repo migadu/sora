@@ -58,6 +58,9 @@ func (s *LMTPSession) sendToExternalRelay(from string, to string, message []byte
 // LMTPSession represents a single LMTP session.
 type LMTPSession struct {
 	server.Session
+	txMu          sync.Mutex // guards inTransaction and loggedOut: go-smtp may run Logout while MAIL is handled
+	inTransaction bool       // between a successful MAIL and the end of the transaction (counted for DrainSessions)
+	loggedOut     bool       // no transaction begins any more
 	backend       *LMTPServerBackend
 	sender        *server.Address
 	recipientAddr *server.Address // Original recipient address (may include +detail)
@@ -177,11 +180,65 @@ func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOpti
 	}
 	defer release()
 
+	if !s.beginTransaction() {
+		s.InfoLog("transaction refused: this backend is in maintenance", "from", from)
+		recordMetrics("failure")
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 3, 2}, // RFC 3463: system not accepting network messages
+			Message:      "Server in maintenance, try again later",
+		}
+	}
 	s.sender = &fromAddress
 	s.smtputf8 = (opts != nil && opts.UTF8) || !server.IsASCII(from)
 
 	recordMetrics("success")
 	return nil
+}
+
+// beginTransaction counts a transaction under way for DrainSessions: LMTP stages uploads
+// only inside one, from MAIL to the end of DATA (go-smtp then resets the session), RSET,
+// or the connection's end. It reports false, counting nothing, when the maintenance gate
+// refuses a new transaction.
+//
+// A MAIL handled after Logout counts nothing (go-smtp logs a session out from Server.Close
+// while its commands may still run): no end would ever take that count back.
+func (s *LMTPSession) beginTransaction() bool {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+	if s.inTransaction || s.loggedOut {
+		return true // already under way (a repeated MAIL), or the connection is ending
+	}
+	if beforeAdmit != nil {
+		beforeAdmit()
+	}
+	if !s.backend.maintenanceGate.Admit(&s.backend.transactionsOpen, "lmtp") {
+		return false
+	}
+	s.inTransaction = true
+	return true
+}
+
+// beforeAdmit, set only by tests, runs in beginTransaction just before the gate admits the
+// transaction: where the connection's end must not slip in.
+var beforeAdmit func()
+
+// endTransaction ends the transaction under way, if any.
+func (s *LMTPSession) endTransaction() {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+	if s.inTransaction {
+		s.inTransaction = false
+		s.backend.transactionsOpen.Add(-1)
+	}
+}
+
+// endSession ends the transaction under way and lets none begin: the connection's end.
+func (s *LMTPSession) endSession() {
+	s.txMu.Lock()
+	s.loggedOut = true
+	s.txMu.Unlock()
+	s.endTransaction()
 }
 
 func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
@@ -1063,6 +1120,7 @@ func (s *LMTPSession) logSieveAction(source string, result sieveengine.Result) {
 }
 
 func (s *LMTPSession) Reset() {
+	s.endTransaction()
 	start := time.Now()
 	recordMetrics := func(status string) {
 		metrics.CommandsTotal.WithLabelValues("lmtp", "RSET", status).Inc()
@@ -1088,6 +1146,7 @@ func (s *LMTPSession) Reset() {
 }
 
 func (s *LMTPSession) Logout() error {
+	s.endSession()
 	// Check if this is a normal QUIT command or an abrupt connection close
 	if s.conn != nil && s.conn.Conn() != nil {
 		s.DebugLog("session logout requested")

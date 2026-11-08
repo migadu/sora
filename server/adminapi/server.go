@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/netutil"
@@ -76,6 +77,17 @@ type Server struct {
 	redirectRateWindow time.Duration                        // Window for redirect limit
 	maxRedirectHops    int                                  // Max redirect hops per message (mail-loop backstop)
 	sieveExtensions    []string                             // [sieve] enabled_extensions, shared with the LMTP path
+
+	// Mail deliveries in flight, reported as this server's drain sessions, admitted by the
+	// maintenance gate, which refuses new ones while this backend is in maintenance.
+	deliveriesOpen  atomic.Int64
+	maintenanceGate *server.MaintenanceGate
+}
+
+// DrainSessions reports the mail deliveries (/admin/mail/deliver), which stage uploads:
+// how many are in flight. See imap.IMAPServer.DrainSessions.
+func (s *Server) DrainSessions() int64 {
+	return s.deliveriesOpen.Load()
 }
 
 // ServerOptions holds configuration options for the HTTP API server
@@ -98,6 +110,7 @@ type ServerOptions struct {
 	TLSVerify          bool
 	Hostname           string
 	InstanceID         string
+	MaintenanceGate    *server.MaintenanceGate // admits mail deliveries; refuses them while this backend is in maintenance (nil admits all)
 	FTSRetention       time.Duration
 	AffinityManager    AffinityManager
 	ValidBackends      map[string][]string                  // Map of protocol -> valid backend addresses
@@ -144,6 +157,7 @@ type BackendHealthInfo struct {
 	LastSuccess        time.Time `json:"last_success,omitempty"`
 	HealthCheckEnabled bool      `json:"health_check_enabled"`
 	IsRemoteLookup     bool      `json:"is_remote_lookup"` // True if backend from remote_lookup (not in pool)
+	InMaintenance      bool      `json:"in_maintenance"`   // True if this proxy honors maintenance for the backend
 }
 
 // ProxyBackendsResponse is the response structure for /admin/proxy/backends
@@ -222,6 +236,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		tlsVerify:          options.TLSVerify,
 		hostname:           options.Hostname,
 		instanceID:         options.InstanceID,
+		maintenanceGate:    options.MaintenanceGate,
 		ftsRetention:       options.FTSRetention,
 		affinityManager:    options.AffinityManager,
 		validBackends:      options.ValidBackends,
@@ -269,22 +284,26 @@ func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options Server
 		errChan <- fmt.Errorf("failed to create HTTP API server: %w", err)
 		return nil
 	}
+	server.Serve(ctx, errChan)
+	return server
+}
 
+// Serve starts the server in the background; a failure to serve is sent to errChan.
+func (s *Server) Serve(ctx context.Context, errChan chan error) {
 	protocol := "HTTP"
-	if options.TLS {
+	if s.tls {
 		protocol = "HTTPS"
 	}
-	serverName := options.Name
+	serverName := s.name
 	if serverName == "" {
 		serverName = "default"
 	}
-	logger.Info("HTTP API: Starting server", "name", serverName, "protocol", protocol, "addr", options.Addr)
+	logger.Info("HTTP API: Starting server", "name", serverName, "protocol", protocol, "addr", s.addr)
 	go func() {
-		if err := server.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
+		if err := s.start(ctx); err != nil && err != http.ErrServerClosed && ctx.Err() == nil {
 			errChan <- fmt.Errorf("HTTP API server failed: %w", err)
 		}
 	}()
-	return server
 }
 
 // start initializes and starts the HTTP server
@@ -1724,6 +1743,7 @@ func (s *Server) handleProxyBackends(w http.ResponseWriter, r *http.Request) {
 					LastSuccess:        status.LastSuccess,
 					HealthCheckEnabled: status.HealthCheckEnabled,
 					IsRemoteLookup:     status.IsRemoteLookup,
+					InMaintenance:      status.InMaintenance,
 				}
 			}
 

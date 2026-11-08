@@ -24,6 +24,18 @@ func authFailedError() *imap.Error {
 	}
 }
 
+// refusedInMaintenance answers a login the maintenance gate refused, after the credentials
+// checked out: a temporary failure, so the client (or the proxy, which answers its own
+// client the same way) tries again, by when the proxies route it to another backend.
+func (s *IMAPSession) refusedInMaintenance() *imap.Error {
+	s.InfoLog("login refused: this backend is in maintenance")
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeUnavailable,
+		Text: "Server in maintenance, please try again later",
+	}
+}
+
 // Login handles the IMAP LOGIN command. It always applies the authentication
 // gate (progressive delay + rate-limit check) before authenticating.
 func (s *IMAPSession) Login(ctx context.Context, address, password string) error {
@@ -165,7 +177,9 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 				return s.internalError("failed to get primary email: %v", err)
 			}
 
-			s.server.authenticatedConnections.Add(1)
+			if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "imap") {
+				return s.refusedInMaintenance()
+			}
 			duration := time.Since(authStart)
 
 			// Log authentication with alias detection
@@ -277,7 +291,9 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		return s.internalError("failed to get primary email: %v", err)
 	}
 
-	s.server.authenticatedConnections.Add(1)
+	if !s.server.maintenanceGate.Admit(&s.server.authenticatedConnections, "imap") {
+		return s.refusedInMaintenance()
+	}
 	duration := time.Since(authStart)
 
 	// Log authentication with alias detection

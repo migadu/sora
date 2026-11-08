@@ -61,6 +61,7 @@ type POP3Server struct {
 	// Connection counters
 	totalConnections         atomic.Int64
 	authenticatedConnections atomic.Int64
+	maintenanceGate          *serverPkg.MaintenanceGate // admits logins; refuses them while this backend is in maintenance
 
 	// Connection limiting
 	limiter *serverPkg.ConnectionLimiter
@@ -117,7 +118,10 @@ type POP3ServerOptions struct {
 	// (nil in all production paths); used by tests to observe what the auth paths
 	// record, which is otherwise unobservable from the wire because blocked and
 	// failed replies are deliberately byte-identical.
-	AuthLimiterOverride         serverPkg.AuthLimiter
+	AuthLimiterOverride serverPkg.AuthLimiter
+	// MaintenanceGate admits logins, and refuses them while this backend is in maintenance.
+	// nil admits every login.
+	MaintenanceGate             *serverPkg.MaintenanceGate
 	Debug                       bool
 	TLS                         bool
 	TLSCertFile                 string
@@ -276,6 +280,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	}
 
 	server := &POP3Server{
+		maintenanceGate:        options.MaintenanceGate,
 		hostname:               hostname,
 		name:                   name,
 		addr:                   popAddr,
@@ -795,6 +800,14 @@ func (s *POP3Server) GetTotalConnections() int64 {
 
 // GetAuthenticatedConnections returns the current authenticated connection count
 func (s *POP3Server) GetAuthenticatedConnections() int64 {
+	return s.authenticatedConnections.Load()
+}
+
+// DrainSessions reports the sessions the node must let finish before it stops: a
+// logged-in session applies its deletions at QUIT, so stopping under it loses them (and
+// the client downloads those messages again). How many are open; logins go through the
+// maintenance gate. See imap.IMAPServer.DrainSessions.
+func (s *POP3Server) DrainSessions() int64 {
 	return s.authenticatedConnections.Load()
 }
 

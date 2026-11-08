@@ -15,6 +15,7 @@ import (
 	"github.com/emersion/go-sasl"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
+	soraserver "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
@@ -74,6 +75,7 @@ func setupIMAPServerWithMasterAuth(t *testing.T) (*common.TestServer, common.Tes
 		},
 	}
 
+	gate := soraserver.NewMaintenanceGate(false)
 	server, err := imap.New(
 		context.Background(),
 		"test",
@@ -90,6 +92,7 @@ func setupIMAPServerWithMasterAuth(t *testing.T) (*common.TestServer, common.Tes
 			MasterPassword:     []byte(masterPassword),
 			MasterSASLUsername: []byte(masterSASLUsername),
 			MasterSASLPassword: []byte(masterSASLPassword),
+			MaintenanceGate:    gate,
 		},
 	)
 	if err != nil {
@@ -121,9 +124,10 @@ func setupIMAPServerWithMasterAuth(t *testing.T) (*common.TestServer, common.Tes
 	// Note: TestServer.cleanup is a private field, but we can still create the struct
 	// and the Close() method will call it
 	ts := &common.TestServer{
-		Address:     address,
-		Server:      server,
-		ResilientDB: rdb,
+		Address:         address,
+		Server:          server,
+		ResilientDB:     rdb,
+		MaintenanceGate: gate,
 	}
 	// Use reflection or call server.Close() manually when ts.Close() is called
 	// For now, register cleanup with t.Cleanup()
