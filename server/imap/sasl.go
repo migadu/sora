@@ -33,6 +33,10 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			// Get the underlying net.Conn for proxy-aware rate limiting
 			netConn := s.conn.NetConn()
 
+			// One copy of the master SASL settings for the whole login, however a
+			// config reload replaces them meanwhile.
+			settings := s.server.settings.Load()
+
 			// Create proxy info from session data
 			var proxyInfo *server.ProxyProtocolInfo
 			if s.ProxyIP != "" {
@@ -226,16 +230,16 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			// authorization identity IS the impersonation target. A submission without
 			// one cannot be a master login, so it is not answered from here at all —
 			// see the no-authorization-identity note below.
-			if identity != "" && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 {
+			if identity != "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 {
 				// Check if the provided authentication identity and password match the server's master SASL credentials
-				if checkMasterCredential(username, s.server.masterSASLUsername) &&
-					checkMasterCredential(password, s.server.masterSASLPassword) {
+				if checkMasterCredential(username, settings.masterSASLUsername) &&
+					checkMasterCredential(password, settings.masterSASLPassword) {
 
 					// Network gate: master SASL is a tenant-wide impersonation capability,
 					// so it may optionally be restricted to the proxy hosts. Anchored to the
 					// real socket peer (NetConn().RemoteAddr()), which cannot be forged via
 					// PROXY/XCLIENT/ID forwarding (those only rewrite s.RemoteIP/s.ProxyIP).
-					if !s.server.masterSASLGate.Allowed(netConn.RemoteAddr()) {
+					if !settings.masterSASLGate.Allowed(netConn.RemoteAddr()) {
 						s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
 						metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 						// Recorded and answered exactly like a wrong master password.
@@ -357,7 +361,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					}
 
 					return nil
-				} else if checkMasterCredential(username, s.server.masterSASLUsername) && identity != username {
+				} else if checkMasterCredential(username, settings.masterSASLUsername) && identity != username {
 					// The authentication identity IS the master SASL username, a
 					// DIFFERENT user was named as the impersonation target, but the
 					// password is wrong. This must
@@ -400,9 +404,9 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			// also lets an account whose address happens to be the master SASL
 			// username log in with its own password. Logged for the operator
 			// debugging a proxy that forgot to send the target user.
-			if identity == "" && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 &&
-				checkMasterCredential(username, s.server.masterSASLUsername) &&
-				checkMasterCredential(password, s.server.masterSASLPassword) {
+			if identity == "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
+				checkMasterCredential(username, settings.masterSASLUsername) &&
+				checkMasterCredential(password, settings.masterSASLPassword) {
 				s.WarnLog("master SASL password presented without an authorization identity; not a master login, falling through to regular authentication", "peer", server.GetAddrString(netConn.RemoteAddr()))
 			}
 

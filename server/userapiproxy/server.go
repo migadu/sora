@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -38,6 +39,12 @@ type JWTClaims struct {
 	jwt.RegisteredClaims
 }
 
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after; a request loads it once.
+type reloadableSettings struct {
+	jwtSecret string // JWT secret for token validation
+}
+
 // Server represents a User API proxy server
 type Server struct {
 	name                       string
@@ -48,7 +55,6 @@ type Server struct {
 	affinityManager            *server.AffinityManager  // Affinity manager for sticky routing (optional)
 	lookupCache                *lookupcache.LookupCache // Route lookup cache (optional)
 	positiveRevalidationWindow time.Duration            // Revalidation window for cached routes
-	jwtSecret                  string                   // JWT secret for token validation
 	tls                        bool
 	tlsCertFile                string
 	tlsKeyFile                 string
@@ -72,6 +78,9 @@ type Server struct {
 
 	// PROXY protocol support for incoming connections
 	proxyReader *server.ProxyProtocolReader
+
+	// The settings ReloadConfig replaces; see reloadableSettings.
+	settings atomic.Pointer[reloadableSettings]
 }
 
 // ServerOptions holds configuration options for the User API proxy server
@@ -302,7 +311,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
-	return &Server{
+	s := &Server{
 		name:                       opts.Name,
 		addr:                       opts.Addr,
 		connManager:                connManager,
@@ -311,7 +320,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		affinityManager:            opts.AffinityManager,
 		lookupCache:                lookupCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
-		jwtSecret:                  opts.JWTSecret,
 		tls:                        opts.TLS,
 		tlsCertFile:                opts.TLSCertFile,
 		tlsKeyFile:                 opts.TLSKeyFile,
@@ -324,7 +332,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		ctx:                        ctx,
 		cancel:                     cancel,
 		connReleases:               make(map[net.Conn]func()),
-	}, nil
+	}
+	s.settings.Store(&reloadableSettings{jwtSecret: opts.JWTSecret})
+	return s, nil
 }
 
 // Start starts the User API proxy server
@@ -665,7 +675,7 @@ func (s *Server) validateToken(tokenString string) (*JWTClaims, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
-		return []byte(s.jwtSecret), nil
+		return []byte(s.settings.Load().jwtSecret), nil
 	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 
 	if err != nil {
@@ -757,13 +767,15 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 // ReloadConfig updates runtime-configurable settings from new config.
 func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	next := *s.settings.Load()
 
-	if cfg.JWTSecret != "" && cfg.JWTSecret != s.jwtSecret {
-		s.jwtSecret = cfg.JWTSecret
+	if cfg.JWTSecret != "" && cfg.JWTSecret != next.jwtSecret {
+		next.jwtSecret = cfg.JWTSecret
 		reloaded = append(reloaded, "jwt_secret")
 	}
 
 	if len(reloaded) > 0 {
+		s.settings.Store(&next)
 		logger.Info("User API proxy config reloaded", "name", s.name, "updated", reloaded)
 	}
 	return nil

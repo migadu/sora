@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/migadu/sora/cluster"
@@ -22,38 +23,57 @@ import (
 	"github.com/migadu/sora/server/proxy"
 )
 
-// Server represents an IMAP proxy server.
-type Server struct {
-	listener               net.Listener
-	listenerMu             sync.RWMutex
-	rdb                    *resilient.ResilientDatabase
-	name                   string // Server name for logging
-	addr                   string
-	hostname               string
-	connManager            *proxy.ConnectionManager
-	connTracker            *server.ConnectionTracker
-	masterUsername         []byte
-	masterPassword         []byte
-	masterSASLUsername     []byte
-	masterSASLPassword     []byte
-	tls                    bool
-	tlsCertFile            string
-	tlsKeyFile             string
-	tlsVerify              bool
-	tlsConfig              *tls.Config // Global TLS config from TLS manager (optional)
-	enableAffinity         bool
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after: a session takes the one current
+// when it starts and keeps it, so it never mixes the values of two reloads. Debug
+// logging and the master SASL credentials are read afresh, per log line and per
+// backend login.
+type reloadableSettings struct {
+	maxAuthErrors          int           // Maximum authentication errors before disconnection
 	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only)
 	commandTimeout         time.Duration // Idle timeout
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput
-	wg                     sync.WaitGroup
-	ctx                    context.Context
-	cancel                 context.CancelFunc
-	authLimiter            server.AuthLimiter
-	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
-	remotelookupConfig     *config.RemoteLookupConfig
-	remoteUseIDCommand     bool                        // Whether backend supports IMAP ID command for forwarding
-	proxyReader            *server.ProxyProtocolReader // PROXY protocol reader for incoming connections
+	masterSASLUsername     []byte
+	masterSASLPassword     []byte
+	debug                  bool
+}
+
+// loadSettings returns the current settings. A Server built without New (as tests
+// do) has none stored and reads as zero, as its fields did.
+func (s *Server) loadSettings() *reloadableSettings {
+	if settings := s.settings.Load(); settings != nil {
+		return settings
+	}
+	return &reloadableSettings{}
+}
+
+// Server represents an IMAP proxy server.
+type Server struct {
+	listener           net.Listener
+	listenerMu         sync.RWMutex
+	rdb                *resilient.ResilientDatabase
+	name               string // Server name for logging
+	addr               string
+	hostname           string
+	connManager        *proxy.ConnectionManager
+	connTracker        *server.ConnectionTracker
+	masterUsername     []byte
+	masterPassword     []byte
+	tls                bool
+	tlsCertFile        string
+	tlsKeyFile         string
+	tlsVerify          bool
+	tlsConfig          *tls.Config // Global TLS config from TLS manager (optional)
+	enableAffinity     bool
+	wg                 sync.WaitGroup
+	ctx                context.Context
+	cancel             context.CancelFunc
+	authLimiter        server.AuthLimiter
+	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
+	remotelookupConfig *config.RemoteLookupConfig
+	remoteUseIDCommand bool                        // Whether backend supports IMAP ID command for forwarding
+	proxyReader        *server.ProxyProtocolReader // PROXY protocol reader for incoming connections
 
 	// Authentication cache
 	lookupCache                *lookupcache.LookupCache
@@ -80,11 +100,10 @@ type Server struct {
 	idSupportURL string
 
 	// Debug logging
-	debug       bool
 	debugWriter io.Writer
 
-	// Authentication limits
-	maxAuthErrors int // Maximum authentication errors before disconnection
+	// The settings ReloadConfig replaces; see reloadableSettings.
+	settings atomic.Pointer[reloadableSettings]
 
 	// Active session tracking for graceful shutdown
 	activeSessionsMu sync.RWMutex
@@ -371,7 +390,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		logger.Info("IMAP Proxy: Lookup cache disabled", "name", opts.Name)
 	}
 
-	return &Server{
+	s := &Server{
 		rdb:                        rdb,
 		name:                       opts.Name,
 		addr:                       opts.Addr,
@@ -379,18 +398,12 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		connManager:                connManager,
 		masterUsername:             []byte(opts.MasterUsername),
 		masterPassword:             []byte(opts.MasterPassword),
-		masterSASLUsername:         []byte(opts.MasterSASLUsername),
-		masterSASLPassword:         []byte(opts.MasterSASLPassword),
 		tls:                        opts.TLS,
 		tlsCertFile:                opts.TLSCertFile,
 		tlsKeyFile:                 opts.TLSKeyFile,
 		tlsVerify:                  opts.TLSVerify,
 		tlsConfig:                  opts.TLSConfig,
 		enableAffinity:             opts.EnableAffinity,
-		authIdleTimeout:            opts.AuthIdleTimeout,
-		commandTimeout:             opts.CommandTimeout,
-		absoluteSessionTimeout:     opts.AbsoluteSessionTimeout,
-		minBytesPerMinute:          opts.MinBytesPerMinute,
 		ctx:                        ctx,
 		cancel:                     cancel,
 		authLimiter:                authLimiter,
@@ -408,11 +421,51 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		idVersion:                  opts.IDVersion,
 		idVendor:                   opts.IDVendor,
 		idSupportURL:               opts.IDSupportURL,
-		debug:                      opts.Debug,
 		debugWriter:                debugWriter,
-		maxAuthErrors:              opts.MaxAuthErrors,
 		activeSessions:             make(map[*Session]struct{}),
-	}, nil
+	}
+	s.settings.Store(&reloadableSettings{
+		maxAuthErrors:          opts.MaxAuthErrors,
+		authIdleTimeout:        opts.AuthIdleTimeout,
+		commandTimeout:         opts.CommandTimeout,
+		absoluteSessionTimeout: opts.AbsoluteSessionTimeout,
+		minBytesPerMinute:      opts.MinBytesPerMinute,
+		masterSASLUsername:     []byte(opts.MasterSASLUsername),
+		masterSASLPassword:     []byte(opts.MasterSASLPassword),
+		debug:                  opts.Debug,
+	})
+	return s, nil
+}
+
+// connConfig is the SoraConn configuration for a connection accepted now. The
+// listener asks for it at every accept, so the timeouts a reload changes reach the
+// connections accepted after it.
+func (s *Server) connConfig() server.SoraConnConfig {
+	settings := s.loadSettings()
+	return server.SoraConnConfig{
+		Protocol:             "imap_proxy",
+		ServerName:           s.name,
+		Hostname:             s.hostname,
+		IdleTimeout:          settings.commandTimeout,
+		AbsoluteTimeout:      settings.absoluteSessionTimeout,
+		MinBytesPerMinute:    settings.minBytesPerMinute,
+		EnableTimeoutChecker: true,
+		OnTimeout: func(conn net.Conn, reason string) {
+			// Send BYE to client before closing
+			var message string
+			switch reason {
+			case "idle":
+				message = "* BYE Idle timeout, please reconnect\r\n"
+			case "slow_throughput":
+				message = "* BYE Connection too slow, please reconnect\r\n"
+			case "session_max":
+				message = "* BYE Maximum session duration exceeded, please reconnect\r\n"
+			default:
+				message = "* BYE Connection timeout, please reconnect\r\n"
+			}
+			_, _ = fmt.Fprint(conn, message)
+		},
+	}
 }
 
 // Start starts the IMAP proxy server.
@@ -454,31 +507,7 @@ func (s *Server) Start() error {
 		}
 		logger.Debug("IMAP Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
 		// Wrap with SoraTLSListener for TLS + JA4 capture + timeout protection
-		connConfig := server.SoraConnConfig{
-			Protocol:             "imap_proxy",
-			ServerName:           s.name,
-			Hostname:             s.hostname,
-			IdleTimeout:          s.commandTimeout,
-			AbsoluteTimeout:      s.absoluteSessionTimeout,
-			MinBytesPerMinute:    s.minBytesPerMinute,
-			EnableTimeoutChecker: true,
-			OnTimeout: func(conn net.Conn, reason string) {
-				// Send BYE to client before closing
-				var message string
-				switch reason {
-				case "idle":
-					message = "* BYE Idle timeout, please reconnect\r\n"
-				case "slow_throughput":
-					message = "* BYE Connection too slow, please reconnect\r\n"
-				case "session_max":
-					message = "* BYE Maximum session duration exceeded, please reconnect\r\n"
-				default:
-					message = "* BYE Connection timeout, please reconnect\r\n"
-				}
-				_, _ = fmt.Fprint(conn, message)
-			},
-		}
-		s.listener = server.NewSoraTLSListener(s.wrapProxyProtocol(tcpListener), tlsConfig, connConfig)
+		s.listener = server.NewSoraTLSListenerFunc(s.wrapProxyProtocol(tcpListener), tlsConfig, s.connConfig)
 		s.listenerMu.Unlock()
 	} else if s.tls && s.tlsConfig != nil {
 		// Scenario 2: Global TLS manager
@@ -491,31 +520,7 @@ func (s *Server) Start() error {
 		}
 		logger.Debug("IMAP Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
 		// Wrap with SoraTLSListener for TLS + JA4 capture + timeout protection
-		connConfig := server.SoraConnConfig{
-			Protocol:             "imap_proxy",
-			ServerName:           s.name,
-			Hostname:             s.hostname,
-			IdleTimeout:          s.commandTimeout,
-			AbsoluteTimeout:      s.absoluteSessionTimeout,
-			MinBytesPerMinute:    s.minBytesPerMinute,
-			EnableTimeoutChecker: true,
-			OnTimeout: func(conn net.Conn, reason string) {
-				// Send BYE to client before closing
-				var message string
-				switch reason {
-				case "idle":
-					message = "* BYE Idle timeout, please reconnect\r\n"
-				case "slow_throughput":
-					message = "* BYE Connection too slow, please reconnect\r\n"
-				case "session_max":
-					message = "* BYE Maximum session duration exceeded, please reconnect\r\n"
-				default:
-					message = "* BYE Connection timeout, please reconnect\r\n"
-				}
-				_, _ = fmt.Fprint(conn, message)
-			},
-		}
-		s.listener = server.NewSoraTLSListener(s.wrapProxyProtocol(tcpListener), s.tlsConfig, connConfig)
+		s.listener = server.NewSoraTLSListenerFunc(s.wrapProxyProtocol(tcpListener), s.tlsConfig, s.connConfig)
 		s.listenerMu.Unlock()
 	} else if s.tls {
 		// TLS enabled but no cert files and no global TLS config provided
@@ -532,31 +537,7 @@ func (s *Server) Start() error {
 		}
 		logger.Debug("IMAP Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
 		// Wrap with SoraListener for timeout protection (no TLS/JA4)
-		connConfig := server.SoraConnConfig{
-			Protocol:             "imap_proxy",
-			ServerName:           s.name,
-			Hostname:             s.hostname,
-			IdleTimeout:          s.commandTimeout,
-			AbsoluteTimeout:      s.absoluteSessionTimeout,
-			MinBytesPerMinute:    s.minBytesPerMinute,
-			EnableTimeoutChecker: true,
-			OnTimeout: func(conn net.Conn, reason string) {
-				// Send BYE to client before closing
-				var message string
-				switch reason {
-				case "idle":
-					message = "* BYE Idle timeout, please reconnect\r\n"
-				case "slow_throughput":
-					message = "* BYE Connection too slow, please reconnect\r\n"
-				case "session_max":
-					message = "* BYE Maximum session duration exceeded, please reconnect\r\n"
-				default:
-					message = "* BYE Connection timeout, please reconnect\r\n"
-				}
-				_, _ = fmt.Fprint(conn, message)
-			},
-		}
-		s.listener = server.NewSoraListener(s.wrapProxyProtocol(tcpListener), connConfig)
+		s.listener = server.NewSoraListenerFunc(s.wrapProxyProtocol(tcpListener), s.connConfig)
 		s.listenerMu.Unlock()
 	}
 
@@ -848,41 +829,43 @@ func (s *Server) monitorActiveSessions() {
 // Called on SIGHUP. Only affects new connections; existing sessions keep old settings.
 func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	next := *s.loadSettings()
 
-	if newVal := cfg.GetMaxAuthErrors(); newVal != s.maxAuthErrors {
-		s.maxAuthErrors = newVal
+	if newVal := cfg.GetMaxAuthErrors(); newVal != next.maxAuthErrors {
+		next.maxAuthErrors = newVal
 		reloaded = append(reloaded, "max_auth_errors")
 	}
-	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != s.authIdleTimeout {
-		s.authIdleTimeout = timeout
+	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != next.authIdleTimeout {
+		next.authIdleTimeout = timeout
 		reloaded = append(reloaded, "auth_idle_timeout")
 	}
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != s.commandTimeout {
-		s.commandTimeout = timeout
+	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != s.absoluteSessionTimeout {
-		s.absoluteSessionTimeout = timeout
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
-	if bpm := cfg.GetMinBytesPerMinute(); bpm != s.minBytesPerMinute {
-		s.minBytesPerMinute = bpm
+	if bpm := cfg.GetMinBytesPerMinute(); bpm != next.minBytesPerMinute {
+		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if cfg.MasterSASLUsername != string(s.masterSASLUsername) {
-		s.masterSASLUsername = []byte(cfg.MasterSASLUsername)
+	if cfg.MasterSASLUsername != string(next.masterSASLUsername) {
+		next.masterSASLUsername = []byte(cfg.MasterSASLUsername)
 		reloaded = append(reloaded, "master_sasl_username")
 	}
-	if cfg.MasterSASLPassword != string(s.masterSASLPassword) {
-		s.masterSASLPassword = []byte(cfg.MasterSASLPassword)
+	if cfg.MasterSASLPassword != string(next.masterSASLPassword) {
+		next.masterSASLPassword = []byte(cfg.MasterSASLPassword)
 		reloaded = append(reloaded, "master_sasl_password")
 	}
-	if cfg.Debug != s.debug {
-		s.debug = cfg.Debug
+	if cfg.Debug != next.debug {
+		next.debug = cfg.Debug
 		reloaded = append(reloaded, "debug")
 	}
 
 	if len(reloaded) > 0 {
+		s.settings.Store(&next)
 		logger.Info("IMAP proxy config reloaded", "name", s.name, "updated", reloaded)
 	}
 	return nil

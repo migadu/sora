@@ -33,6 +33,8 @@ type IMAPSession struct {
 	releaseConn func() // Function to release connection from limiter
 	startTime   time.Time
 
+	checkedIdleTimeout time.Duration // the idle timeout this connection's checker enforces (the IDLE keepalive beats it)
+
 	inboxWarmupDone atomic.Bool // Ensures warmup runs only once
 	selectedMailbox *db.DBMailbox
 	mailboxTracker  *imapserver.MailboxTracker

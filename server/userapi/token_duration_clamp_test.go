@@ -43,7 +43,8 @@ func TestNew_ClampsTokenDuration(t *testing.T) {
 // TestGenerateToken_EmbedsAuthEpoch verifies the issued token carries the password
 // epoch claim that the refresh-gate compares against.
 func TestGenerateToken_EmbedsAuthEpoch(t *testing.T) {
-	s := &Server{jwtSecret: strings.Repeat("k", minJWTSecretLength), tokenIssuer: "sora-test", tokenDuration: time.Hour}
+	s := &Server{tokenIssuer: "sora-test", tokenDuration: time.Hour}
+	s.settings.Store(&reloadableSettings{jwtSecret: strings.Repeat("k", minJWTSecretLength)})
 
 	const epoch int64 = 1_700_000_000
 	tok, _, err := s.generateToken("user@example.com", 7, epoch)

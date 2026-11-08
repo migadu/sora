@@ -31,6 +31,7 @@ import (
 // bytes bidirectionally.
 type Session struct {
 	server                *Server
+	settings              *reloadableSettings     // the settings its protocol server was built with (see reloadableSettings)
 	msConn                *managesieveserver.Conn // library connection (Hijack seam)
 	clientConn            net.Conn
 	backendConn           net.Conn      // Reassigned on backend connect/STARTTLS; writes must hold mu (sendGracefulShutdownBye reads it from the Stop goroutine)
@@ -153,7 +154,7 @@ func (s *Session) AuthenticatePlain(_ context.Context, _, username, password str
 		"duration", fmt.Sprintf("%.3fs", backendDuration.Seconds()))
 
 	// Clear the read deadline before the relay phase, which sets its own.
-	if s.server.authIdleTimeout > 0 {
+	if s.settings.authIdleTimeout > 0 {
 		if err := clientConn.SetReadDeadline(time.Time{}); err != nil {
 			s.DebugLog("failed to clear read deadline", "error", err)
 		}
@@ -200,7 +201,7 @@ func (s *Session) getLogger() *server.ProxySessionLogger {
 		Username:   s.username,
 		AccountID:  s.accountID,
 		SessionID:  s.sessionID,
-		Debug:      s.server.debug,
+		Debug:      s.server.loadSettings().debug,
 	}
 }
 
@@ -942,7 +943,8 @@ func (s *Session) authenticateToBackend() error {
 	s.backendReader = backendReader
 
 	// Send AUTHENTICATE PLAIN command with impersonation
-	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, string(s.server.masterSASLUsername), string(s.server.masterSASLPassword))
+	settings := s.server.loadSettings() // one copy of the credentials, however a reload replaces them meanwhile
+	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, string(settings.masterSASLUsername), string(settings.masterSASLPassword))
 	encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
 	// Do NOT log `encoded` or the master SASL username: `encoded` base64-decodes

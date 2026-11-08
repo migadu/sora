@@ -457,10 +457,14 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	var buf bytes.Buffer
 
+	// One copy of the reloadable settings for the whole delivery, however a config
+	// reload replaces them meanwhile.
+	settings := s.backend.settings.Load()
+
 	// Enforce message size limit BEFORE reading into memory to prevent DoS
 	// Default: 50MB (configurable). Without limit, malicious senders could
 	// deliver 50+ MB messages × concurrent connections causing memory exhaustion.
-	limitToUse := s.backend.maxMessageSize
+	limitToUse := settings.maxMessageSize
 	if limitToUse <= 0 {
 		limitToUse = DefaultMaxMessageSize // 50MB fallback
 	}
@@ -692,7 +696,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Use the pre-parsed default executor from the backend
 	if s.backend.defaultSieveExecutor != nil {
 		// SIEVE debugging information
-		if s.backend.debug {
+		if settings.debug {
 			s.DebugLog("sieve message headers for evaluation")
 			for key, values := range sieveCtx.Header {
 				for _, value := range values {

@@ -25,38 +25,57 @@ import (
 	"github.com/migadu/sora/server/sieveengine"
 )
 
-// Server represents a ManageSieve proxy server.
-type Server struct {
-	listener               net.Listener
-	listenerMu             sync.RWMutex
-	rdb                    *resilient.ResilientDatabase
-	name                   string // Server name for logging
-	addr                   string
-	hostname               string
-	insecureAuth           bool
-	masterUsername         []byte
-	masterPassword         []byte
-	masterSASLUsername     []byte
-	masterSASLPassword     []byte
-	tls                    bool
-	tlsUseStartTLS         bool
-	tlsCertFile            string
-	tlsKeyFile             string
-	tlsVerify              bool
-	tlsConfig              *tls.Config // Global TLS config from TLS manager or per-server config
-	connManager            *proxy.ConnectionManager
-	connTracker            *server.ConnectionTracker
-	wg                     sync.WaitGroup
-	ctx                    context.Context
-	cancel                 context.CancelFunc
-	enableAffinity         bool
-	authLimiter            server.AuthLimiter
-	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
-	remotelookupConfig     *config.RemoteLookupConfig
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after: a session takes the one its
+// protocol server was built with and keeps it, so it never mixes the values of two
+// reloads. Debug logging and the master SASL credentials are read afresh, per log
+// line and per backend login.
+type reloadableSettings struct {
+	maxAuthErrors          int // Maximum authentication errors before disconnection
 	authIdleTimeout        time.Duration
 	commandTimeout         time.Duration // Idle timeout
 	absoluteSessionTimeout time.Duration // Maximum total session duration
 	minBytesPerMinute      int64         // Minimum throughput
+	masterSASLUsername     []byte
+	masterSASLPassword     []byte
+	debug                  bool
+}
+
+// loadSettings returns the current settings. A Server built without New (as tests
+// do) has none stored and reads as zero, as its fields did.
+func (s *Server) loadSettings() *reloadableSettings {
+	if settings := s.settings.Load(); settings != nil {
+		return settings
+	}
+	return &reloadableSettings{}
+}
+
+// Server represents a ManageSieve proxy server.
+type Server struct {
+	listener           net.Listener
+	listenerMu         sync.RWMutex
+	rdb                *resilient.ResilientDatabase
+	name               string // Server name for logging
+	addr               string
+	hostname           string
+	insecureAuth       bool
+	masterUsername     []byte
+	masterPassword     []byte
+	tls                bool
+	tlsUseStartTLS     bool
+	tlsCertFile        string
+	tlsKeyFile         string
+	tlsVerify          bool
+	tlsConfig          *tls.Config // Global TLS config from TLS manager or per-server config
+	connManager        *proxy.ConnectionManager
+	connTracker        *server.ConnectionTracker
+	wg                 sync.WaitGroup
+	ctx                context.Context
+	cancel             context.CancelFunc
+	enableAffinity     bool
+	authLimiter        server.AuthLimiter
+	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
+	remotelookupConfig *config.RemoteLookupConfig
 
 	// Connection limiting
 	limiter *server.ConnectionLimiter
@@ -68,14 +87,11 @@ type Server struct {
 	// Listen backlog
 	listenBacklog int
 
-	// Debug logging
-	debug bool
-
 	// SIEVE extensions (additional to builtin)
 	supportedExtensions []string
 
-	// Authentication limits
-	maxAuthErrors int // Maximum authentication errors before disconnection
+	// The settings ReloadConfig replaces; see reloadableSettings.
+	settings atomic.Pointer[reloadableSettings]
 
 	// Active session tracking for graceful shutdown
 	activeSessionsMu sync.RWMutex
@@ -318,8 +334,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		insecureAuth:               opts.InsecureAuth || !opts.TLS, // Auto-enable when TLS not configured
 		masterUsername:             []byte(opts.MasterUsername),
 		masterPassword:             []byte(opts.MasterPassword),
-		masterSASLUsername:         []byte(opts.MasterSASLUsername),
-		masterSASLPassword:         []byte(opts.MasterSASLPassword),
 		tls:                        opts.TLS,
 		tlsUseStartTLS:             opts.TLSUseStartTLS,
 		tlsCertFile:                opts.TLSCertFile,
@@ -332,20 +346,24 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		authLimiter:                authLimiter,
 		trustedProxies:             opts.TrustedProxies,
 		remotelookupConfig:         opts.RemoteLookup,
-		authIdleTimeout:            opts.AuthIdleTimeout,
-		commandTimeout:             opts.CommandTimeout,
-		absoluteSessionTimeout:     opts.AbsoluteSessionTimeout,
-		minBytesPerMinute:          opts.MinBytesPerMinute,
 		limiter:                    limiter,
 		lookupCache:                lookupCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		listenBacklog:              listenBacklog,
-		maxAuthErrors:              opts.MaxAuthErrors,
-		debug:                      opts.Debug,
 		supportedExtensions:        opts.SupportedExtensions,
 		activeSessions:             make(map[*Session]struct{}),
 		proxyReader:                proxyReader,
 	}
+	s.settings.Store(&reloadableSettings{
+		maxAuthErrors:          opts.MaxAuthErrors,
+		authIdleTimeout:        opts.AuthIdleTimeout,
+		commandTimeout:         opts.CommandTimeout,
+		absoluteSessionTimeout: opts.AbsoluteSessionTimeout,
+		minBytesPerMinute:      opts.MinBytesPerMinute,
+		masterSASLUsername:     []byte(opts.MasterSASLUsername),
+		masterSASLPassword:     []byte(opts.MasterSASLPassword),
+		debug:                  opts.Debug,
+	})
 
 	// Setup TLS config: Support both implicit TLS and STARTTLS
 	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
@@ -390,7 +408,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 // current runtime settings. It is called at startup and again from
 // ReloadConfig so SIGHUP-reloaded settings apply to new connections.
 func (s *Server) buildLibServer() *managesieveserver.Server {
-	maxErrors := s.maxAuthErrors
+	settings := s.loadSettings()
+
+	maxErrors := settings.maxAuthErrors
 	if maxErrors <= 0 {
 		maxErrors = 10
 	}
@@ -410,9 +430,9 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 		GreetingStartTLSHint:   false, // pre-migration parity: the proxy greeting carried no (STARTTLS) hint
 		SieveExtensions:        managesieve.GetSieveCapabilities(s.supportedExtensions),
 		MaxLineLength:          8192,
-		IdleTimeout:            s.commandTimeout,
-		AuthIdleTimeout:        s.authIdleTimeout,
-		AbsoluteSessionTimeout: s.absoluteSessionTimeout,
+		IdleTimeout:            settings.commandTimeout,
+		AuthIdleTimeout:        settings.authIdleTimeout,
+		AbsoluteSessionTimeout: settings.absoluteSessionTimeout,
 		InsecureAuth:           s.insecureAuth,
 		MaxErrors:              maxErrors,
 		// Pre-migration parity: failed logins never counted toward the auth
@@ -468,6 +488,7 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 
 			session := &Session{
 				server:      s,
+				settings:    settings,
 				msConn:      c,
 				clientConn:  netConn,
 				clientAddr:  clientAddr,
@@ -490,17 +511,19 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 	return managesieveserver.New(opts)
 }
 
-// Start starts the ManageSieve proxy server.
-func (s *Server) Start() error {
-	// Configure SoraConn with timeout protection
-	connConfig := server.SoraConnConfig{
+// connConfig is the SoraConn configuration for a connection accepted now. The
+// listener asks for it at every accept, so the timeouts a reload changes reach the
+// connections accepted after it, as they reach the protocol server rebuilt for them.
+func (s *Server) connConfig() server.SoraConnConfig {
+	settings := s.loadSettings()
+	return server.SoraConnConfig{
 		Protocol:             "managesieve_proxy",
 		ServerName:           s.name,
 		Hostname:             s.hostname,
-		IdleTimeout:          s.commandTimeout,
-		AbsoluteTimeout:      s.absoluteSessionTimeout,
-		MinBytesPerMinute:    s.minBytesPerMinute,
-		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0,
+		IdleTimeout:          settings.commandTimeout,
+		AbsoluteTimeout:      settings.absoluteSessionTimeout,
+		MinBytesPerMinute:    settings.minBytesPerMinute,
+		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Send BYE with TRYLATER before closing (RFC 5804)
 			var message string
@@ -517,6 +540,10 @@ func (s *Server) Start() error {
 			_, _ = fmt.Fprint(conn, message)
 		},
 	}
+}
+
+// Start starts the ManageSieve proxy server.
+func (s *Server) Start() error {
 
 	// Four TLS scenarios:
 	// 1. Per-server TLS with cert files (implicit TLS): Use static certificate with TLS listener
@@ -535,7 +562,7 @@ func (s *Server) Start() error {
 		}
 		logger.Debug("ManageSieve Proxy: Using listen backlog with per-server TLS (implicit)", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraTLSListener for implicit TLS with JA4 capture and timeout protection
-		s.listener = server.NewSoraTLSListener(s.wrapProxyProtocol(tcpListener), s.tlsConfig, connConfig)
+		s.listener = server.NewSoraTLSListenerFunc(s.wrapProxyProtocol(tcpListener), s.tlsConfig, s.connConfig)
 		s.listenerMu.Unlock()
 	} else if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
 		// Scenario 2: Global TLS manager (implicit TLS)
@@ -548,7 +575,7 @@ func (s *Server) Start() error {
 		}
 		logger.Debug("ManageSieve Proxy: Using listen backlog with global TLS manager (implicit)", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraTLSListener with global TLS config for implicit TLS
-		s.listener = server.NewSoraTLSListener(s.wrapProxyProtocol(tcpListener), s.tlsConfig, connConfig)
+		s.listener = server.NewSoraTLSListenerFunc(s.wrapProxyProtocol(tcpListener), s.tlsConfig, s.connConfig)
 		s.listenerMu.Unlock()
 	} else if s.tls && s.tlsUseStartTLS {
 		// Scenario 3: STARTTLS mode - plain listener, TLS upgrade happens in session
@@ -561,7 +588,7 @@ func (s *Server) Start() error {
 		}
 		logger.Debug("ManageSieve Proxy: Using listen backlog with STARTTLS mode", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use plain SoraListener - TLS upgrade handled in session after STARTTLS command
-		s.listener = server.NewSoraListener(s.wrapProxyProtocol(tcpListener), connConfig)
+		s.listener = server.NewSoraListenerFunc(s.wrapProxyProtocol(tcpListener), s.connConfig)
 		s.listenerMu.Unlock()
 	} else if s.tls {
 		// TLS enabled but no cert files and no global TLS config provided
@@ -578,7 +605,7 @@ func (s *Server) Start() error {
 		}
 		logger.Debug("ManageSieve Proxy: Using listen backlog (no TLS)", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraListener for non-TLS with timeout protection
-		s.listener = server.NewSoraListener(s.wrapProxyProtocol(tcpListener), connConfig)
+		s.listener = server.NewSoraListenerFunc(s.wrapProxyProtocol(tcpListener), s.connConfig)
 		s.listenerMu.Unlock()
 	}
 
@@ -820,41 +847,43 @@ func (s *Server) monitorActiveSessions() {
 // Called on SIGHUP. Only affects new connections; existing sessions keep old settings.
 func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	next := *s.loadSettings()
 
-	if newVal := cfg.GetMaxAuthErrors(); newVal != s.maxAuthErrors {
-		s.maxAuthErrors = newVal
+	if newVal := cfg.GetMaxAuthErrors(); newVal != next.maxAuthErrors {
+		next.maxAuthErrors = newVal
 		reloaded = append(reloaded, "max_auth_errors")
 	}
-	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != s.authIdleTimeout {
-		s.authIdleTimeout = timeout
+	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != next.authIdleTimeout {
+		next.authIdleTimeout = timeout
 		reloaded = append(reloaded, "auth_idle_timeout")
 	}
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != s.commandTimeout {
-		s.commandTimeout = timeout
+	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != s.absoluteSessionTimeout {
-		s.absoluteSessionTimeout = timeout
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
-	if bpm := cfg.GetMinBytesPerMinute(); bpm != s.minBytesPerMinute {
-		s.minBytesPerMinute = bpm
+	if bpm := cfg.GetMinBytesPerMinute(); bpm != next.minBytesPerMinute {
+		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if cfg.MasterSASLUsername != string(s.masterSASLUsername) {
-		s.masterSASLUsername = []byte(cfg.MasterSASLUsername)
+	if cfg.MasterSASLUsername != string(next.masterSASLUsername) {
+		next.masterSASLUsername = []byte(cfg.MasterSASLUsername)
 		reloaded = append(reloaded, "master_sasl_username")
 	}
-	if cfg.MasterSASLPassword != string(s.masterSASLPassword) {
-		s.masterSASLPassword = []byte(cfg.MasterSASLPassword)
+	if cfg.MasterSASLPassword != string(next.masterSASLPassword) {
+		next.masterSASLPassword = []byte(cfg.MasterSASLPassword)
 		reloaded = append(reloaded, "master_sasl_password")
 	}
-	if cfg.Debug != s.debug {
-		s.debug = cfg.Debug
+	if cfg.Debug != next.debug {
+		next.debug = cfg.Debug
 		reloaded = append(reloaded, "debug")
 	}
 
 	if len(reloaded) > 0 {
+		s.settings.Store(&next)
 		// Rebuild the library server so new connections pick up the reloaded
 		// settings; existing connections keep their snapshot.
 		s.msLibServer.Store(s.buildLibServer())

@@ -14,7 +14,8 @@ func TestCORSMiddleware(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	t.Run("wildcard emits * without credentials", func(t *testing.T) {
-		s := &Server{allowedOrigins: []string{"*"}}
+		s := &Server{}
+		s.settings.Store(&reloadableSettings{allowedOrigins: []string{"*"}})
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/user/mailboxes", nil)
 		req.Header.Set("Origin", "https://evil.example")
@@ -28,7 +29,8 @@ func TestCORSMiddleware(t *testing.T) {
 	})
 
 	t.Run("specific origin reflects with credentials", func(t *testing.T) {
-		s := &Server{allowedOrigins: []string{"https://app.example.com"}}
+		s := &Server{}
+		s.settings.Store(&reloadableSettings{allowedOrigins: []string{"https://app.example.com"}})
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/user/mailboxes", nil)
 		req.Header.Set("Origin", "https://app.example.com")
@@ -42,7 +44,8 @@ func TestCORSMiddleware(t *testing.T) {
 	})
 
 	t.Run("disallowed origin gets no CORS headers", func(t *testing.T) {
-		s := &Server{allowedOrigins: []string{"https://app.example.com"}}
+		s := &Server{}
+		s.settings.Store(&reloadableSettings{allowedOrigins: []string{"https://app.example.com"}})
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/user/mailboxes", nil)
 		req.Header.Set("Origin", "https://evil.example")
