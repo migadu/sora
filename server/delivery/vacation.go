@@ -176,8 +176,6 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 	msgHeader.Set("Auto-Submitted", "auto-replied")
 	msgHeader.Set("X-Auto-Response-Suppress", "All")
 	msgHeader.Set("Date", time.Now().Format(time.RFC1123Z))
-	// Single-part text/plain (not multipart) — the appropriate shape for an auto-reply.
-	msgHeader.Set("Content-Type", "text/plain; charset=utf-8")
 
 	originalHeader := mail.Header{Header: originalMessage.Header}
 	if originalMessageID, _ := originalHeader.MessageID(); originalMessageID != "" {
@@ -187,15 +185,25 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 		msgHeader.Set("References", "<"+originalMessageID+">")
 	}
 
-	w, err := message.CreateWriter(&vacationMessage, msgHeader)
-	if err != nil {
-		return err
+	if reply.IsMime {
+		if err := writeVacationMIME(&vacationMessage, msgHeader, reply.Body); err != nil {
+			h.log("[VACATION] not sending: %v", err)
+			return err
+		}
+	} else {
+		msgHeader.Set("Content-Type", "text/plain; charset=utf-8")
+		w, err := message.CreateWriter(&vacationMessage, msgHeader)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write([]byte(reply.Body)); err != nil {
+			w.Close()
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
 	}
-	if _, err := w.Write([]byte(reply.Body)); err != nil {
-		w.Close()
-		return err
-	}
-	w.Close()
 
 	// Atomically consume the RFC 5230 :days window now, after suppression checks
 	// and message construction but before relay handoff. Multiple evaluations can
