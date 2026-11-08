@@ -1,7 +1,9 @@
 package helpers
 
 import (
+	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"mime/quotedprintable"
@@ -9,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/k3a/html2text"
@@ -169,4 +172,49 @@ func ValidateBodyStructure(bs *imap.BodyStructure) error {
 	}
 
 	return nil
+}
+
+// ExtractBodyStructure is imapserver.ExtractBodyStructure, indirected so tests
+// can exercise SafeBodyStructure's recovery path.
+var ExtractBodyStructure = imapserver.ExtractBodyStructure
+
+// SafeBodyStructure returns the BODYSTRUCTURE to store for a raw message. Every
+// ingestion path (LMTP, APPEND, Admin API delivery) stores one and FETCH later
+// serializes it, and a nil or malformed structure panics the FETCH write path,
+// so the result is never nil: a panic in the extractor, a nil result or a
+// structure that fails ValidateBodyStructure (such as a multipart with no
+// children) is replaced by a text/plain fallback. The error says why the
+// fallback was used, for the caller to log with its own logger.
+func SafeBodyStructure(data []byte) (result imap.BodyStructure, err error) {
+	// Named results: a bare recover() leaves an unnamed result at its zero
+	// value, the nil this function exists to avoid.
+	defer func() {
+		if r := recover(); r != nil {
+			result, err = fallbackBodyStructure(len(data)), fmt.Errorf("body structure extraction panicked: %v", r)
+		}
+	}()
+	bs := ExtractBodyStructure(bytes.NewReader(data))
+	if bs == nil {
+		return fallbackBodyStructure(len(data)), errors.New("body structure extraction returned no structure")
+	}
+	if err := ValidateBodyStructure(&bs); err != nil {
+		return fallbackBodyStructure(len(data)), err
+	}
+	return bs, nil
+}
+
+// fallbackBodyStructure stands in for a message whose real structure could not
+// be produced. Extended is always populated to match imapserver.ExtractBodyStructure,
+// and Text because body-fld-lines is mandatory for a text part (RFC 9051
+// body-type-text): without it FETCH emits a structure clients reject outright,
+// failing the whole response.
+func fallbackBodyStructure(size int) imap.BodyStructure {
+	return &imap.BodyStructureSinglePart{
+		Type:     "text",
+		Subtype:  "plain",
+		Params:   map[string]string{"charset": "utf-8"},
+		Size:     uint32(size),
+		Extended: &imap.BodyStructureSinglePartExt{},
+		Text:     &imap.BodyStructureText{},
+	}
 }

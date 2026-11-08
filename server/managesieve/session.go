@@ -183,6 +183,10 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		}
 	}
 
+	// One copy of the master SASL settings for the whole login, however a config
+	// reload replaces them meanwhile.
+	settings := s.server.settings.Load()
+
 	// 2. Check for Master SASL Authentication (traditional)
 	// Entered on the authentication identity alone (constant-time comparison, to
 	// avoid a timing side-channel on the tenant-wide credential). The password is
@@ -204,9 +208,9 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	// records its own failure under the same key, so a master-password guess dressed up as
 	// a self-login is still metered. A CORRECT master password keeps entering the block
 	// whatever the target, which is what the proxy flow relies on.
-	if !impersonating && authzID != "" && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 &&
-		checkMasterCredential(authnID, s.server.masterSASLUsername) &&
-		(checkMasterCredential(password, s.server.masterSASLPassword) || authzID != authnID) {
+	if !impersonating && authzID != "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
+		checkMasterCredential(authnID, settings.masterSASLUsername) &&
+		(checkMasterCredential(password, settings.masterSASLPassword) || authzID != authnID) {
 		netConn := s.conn
 		proxyInfo := s.proxyInfo()
 		// The master SASL username is not an address, so it keeps a stable
@@ -231,7 +235,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			}
 		}
 
-		if !checkMasterCredential(password, s.server.masterSASLPassword) {
+		if !checkMasterCredential(password, settings.masterSASLPassword) {
 			s.WarnLog("master SASL authentication failed (invalid password)", "peer", server.GetAddrString(s.conn.RemoteAddr()))
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
@@ -244,7 +248,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// Network gate: master SASL is a tenant-wide impersonation
 		// capability. Anchored to the real socket peer (cannot be forged
 		// via PROXY/XCLIENT forwarding).
-		if !s.server.masterSASLGate.Allowed(s.conn.RemoteAddr()) {
+		if !settings.masterSASLGate.Allowed(s.conn.RemoteAddr()) {
 			s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(s.conn.RemoteAddr()))
 			// Recorded exactly like a wrong master password: reachable ONLY with the
 			// correct one, so an uncharged failure diverges at the block threshold and
@@ -295,9 +299,9 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	// accounting, whatever the password — which also lets an account whose address
 	// happens to be the master SASL username log in with its own password. Logged
 	// for the operator debugging a proxy that forgot to send the target user.
-	if !impersonating && authzID == "" && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 &&
-		checkMasterCredential(authnID, s.server.masterSASLUsername) &&
-		checkMasterCredential(password, s.server.masterSASLPassword) {
+	if !impersonating && authzID == "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
+		checkMasterCredential(authnID, settings.masterSASLUsername) &&
+		checkMasterCredential(password, settings.masterSASLPassword) {
 		s.WarnLog("master SASL password presented without an authorization identity; not a master login, falling through to regular authentication", "peer", server.GetAddrString(s.conn.RemoteAddr()))
 	}
 

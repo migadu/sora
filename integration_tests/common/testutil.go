@@ -938,17 +938,19 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 
 func SetupLMTPServer(t *testing.T) (*TestServer, TestAccount) {
 	t.Helper()
-	return setupLMTPServerWithOptions(t, lmtp.LMTPServerOptions{})
+	return SetupLMTPServerWithOptions(t, lmtp.LMTPServerOptions{})
 }
 
 // SetupLMTPServerWithIdleTimeout sets up an LMTP server with a short idle
 // timeout (go-smtp ReadTimeout) for timeout behavior tests.
 func SetupLMTPServerWithIdleTimeout(t *testing.T, idleTimeout time.Duration) (*TestServer, TestAccount) {
 	t.Helper()
-	return setupLMTPServerWithOptions(t, lmtp.LMTPServerOptions{IdleTimeout: idleTimeout})
+	return SetupLMTPServerWithOptions(t, lmtp.LMTPServerOptions{IdleTimeout: idleTimeout})
 }
 
-func setupLMTPServerWithOptions(t *testing.T, options lmtp.LMTPServerOptions) (*TestServer, TestAccount) {
+// SetupLMTPServerWithOptions sets up an LMTP server with the protocol features
+// a test needs enabled.
+func SetupLMTPServerWithOptions(t *testing.T, options lmtp.LMTPServerOptions) (*TestServer, TestAccount) {
 	t.Helper()
 	if options.MaintenanceGate == nil {
 		options.MaintenanceGate = soraserver.NewMaintenanceGate(false)

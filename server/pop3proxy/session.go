@@ -47,10 +47,11 @@ var (
 
 type POP3ProxySession struct {
 	server                *POP3ProxyServer
-	clientConn            net.Conn      // Reassigned on hijack; writes must hold mutex (sendGracefulShutdownMessage reads it from the Stop goroutine)
-	backendConn           net.Conn      // Assigned in connectToBackend; writes must hold mutex (same reason)
-	backendReader         *bufio.Reader // Buffered reader from authentication phase
-	clientReader          *bufio.Reader // Buffered reader from the pre-auth phase; reused by the relay so a command pipelined with PASS/AUTH is not dropped
+	settings              *reloadableSettings // the settings its protocol server was built with (see reloadableSettings)
+	clientConn            net.Conn            // Reassigned on hijack; writes must hold mutex (sendGracefulShutdownMessage reads it from the Stop goroutine)
+	backendConn           net.Conn            // Assigned in connectToBackend; writes must hold mutex (same reason)
+	backendReader         *bufio.Reader       // Buffered reader from authentication phase
+	clientReader          *bufio.Reader       // Buffered reader from the pre-auth phase; reused by the relay so a command pipelined with PASS/AUTH is not dropped
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	RemoteIP              string
@@ -85,7 +86,7 @@ func (s *POP3ProxySession) getLogger() *server.ProxySessionLogger {
 		Username:   s.username,
 		AccountID:  s.accountID,
 		SessionID:  s.sessionID,
-		Debug:      s.server.debug,
+		Debug:      s.server.loadSettings().debug,
 	}
 }
 
@@ -803,7 +804,8 @@ func (s *POP3ProxySession) connectToBackend() error {
 		s.backendConn.Close()
 		return fmt.Errorf("%w: failed to set auth deadline: %w", server.ErrBackendAuthFailed, err)
 	}
-	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, s.server.masterSASLUsername, s.server.masterSASLPassword)
+	settings := s.server.loadSettings() // one copy of the credentials, however a reload replaces them meanwhile
+	authString := fmt.Sprintf("%s\x00%s\x00%s", s.username, settings.masterSASLUsername, settings.masterSASLPassword)
 	encoded := base64.StdEncoding.EncodeToString([]byte(authString))
 
 	if _, err := backendWriter.WriteString(fmt.Sprintf("AUTH PLAIN %s\r\n", encoded)); err != nil {
@@ -1120,10 +1122,16 @@ func (s *POP3ProxySession) filteredCopyClientToBackend() {
 		// default) right here rather than silently losing idle protection.
 		// RFC 1939 recommends an autologout timer of at least 10 minutes,
 		// which that short pre-auth timeout would violate.
-		checkerOwnsIdle := s.server.commandTimeout > 0
-		readDeadline := s.server.authIdleTimeout
+		// The checker's idle timeout is the one its listener gave this connection
+		// when it accepted it, whatever a reload has changed since.
+		checkedIdle := s.settings.commandTimeout
+		if checked, ok := server.ConnCheckedTimeouts(s.clientConn); ok {
+			checkedIdle = checked.Idle
+		}
+		checkerOwnsIdle := checkedIdle > 0
+		readDeadline := s.settings.authIdleTimeout
 		if checkerOwnsIdle {
-			readDeadline = max(2*s.server.commandTimeout, 30*time.Minute)
+			readDeadline = max(2*checkedIdle, 30*time.Minute)
 		}
 		if readDeadline > 0 {
 			if err := s.clientConn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
@@ -1369,7 +1377,7 @@ func (s *POP3ProxySession) doLogin(ctx context.Context, username, password strin
 		"duration", fmt.Sprintf("%.3fs", time.Since(authStart).Seconds()))
 
 	// Clear the read deadline before moving to the proxying phase, which sets its own.
-	if s.server.authIdleTimeout > 0 {
+	if s.settings.authIdleTimeout > 0 {
 		if err := s.clientConn.SetReadDeadline(time.Time{}); err != nil {
 			s.WarnLog("Failed to clear read deadline", "error", err)
 		}

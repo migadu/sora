@@ -158,6 +158,8 @@ type SoraConn struct {
 	// serially — the same accept-path stall class as the 2026-07-05 incident.
 	probeTLSOnFirstRead atomic.Bool
 
+	checked atomic.Bool // registered with the timeout checker (see CheckedTimeouts)
+
 	// Server context for metrics
 	protocol   string
 	serverName string
@@ -206,11 +208,15 @@ type SoraConnConfig struct {
 	ServerName           string        // Server name for metrics
 	Hostname             string        // Hostname for metrics
 	IdleTimeout          time.Duration // 0 = no idle timeout
-	AbsoluteTimeout      time.Duration // 0 = no absolute timeout
+	AbsoluteTimeout      time.Duration // 0 = the 30m default, unless NoAbsoluteTimeout
 	MinBytesPerMinute    int64         // 0 = no throughput checking
 	InitialJA4           string        // Pre-captured JA4 fingerprint
 	InitialProxyInfo     *ProxyProtocolInfo
 	EnableTimeoutChecker bool // If false, caller must handle timeouts
+
+	// NoAbsoluteTimeout has the checker enforce no session limit (AbsoluteTimeout is
+	// ignored): for a caller whose protocol library owns that limit.
+	NoAbsoluteTimeout bool
 
 	// OnTimeout is called before closing connection due to timeout.
 	// The reason will be one of: "idle", "slow_throughput", or "session_max".
@@ -225,7 +231,9 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 	now := time.Now()
 
 	// Apply defaults (MinBytesPerMinute default is protocol-specific, set by caller)
-	if config.AbsoluteTimeout == 0 {
+	if config.NoAbsoluteTimeout {
+		config.AbsoluteTimeout = 0
+	} else if config.AbsoluteTimeout == 0 {
 		config.AbsoluteTimeout = 30 * time.Minute // Default: 30 minutes
 	}
 	if config.Protocol == "" {
@@ -522,6 +530,44 @@ func (c *SoraConn) Unwrap() net.Conn {
 	return c.Conn
 }
 
+// CheckedTimeouts are the limits the timeout checker enforces on a connection; a zero
+// value is a limit it does not enforce.
+type CheckedTimeouts struct {
+	Idle              time.Duration
+	Absolute          time.Duration
+	MinBytesPerMinute int64
+}
+
+// CheckedTimeouts returns the limits the timeout checker enforces on this connection,
+// as its listener configured it when it accepted the connection: none while it is not
+// checked (the checker is off for it, or its TLS handshake has not completed).
+func (c *SoraConn) CheckedTimeouts() CheckedTimeouts {
+	if !c.checked.Load() {
+		return CheckedTimeouts{}
+	}
+	return CheckedTimeouts{Idle: c.idleTimeout, Absolute: c.absoluteTimeout, MinBytesPerMinute: c.minBytesPerMinute}
+}
+
+// ConnCheckedTimeouts returns the CheckedTimeouts of the SoraConn that conn is or wraps,
+// walking the Unwrap chain (and a *tls.Conn on top of it, after STARTTLS). ok is false
+// when there is no SoraConn under conn.
+func ConnCheckedTimeouts(conn net.Conn) (timeouts CheckedTimeouts, ok bool) {
+	for conn != nil {
+		if sc, isSora := conn.(interface{ CheckedTimeouts() CheckedTimeouts }); isSora {
+			return sc.CheckedTimeouts(), true
+		}
+		switch c := conn.(type) {
+		case interface{ Unwrap() net.Conn }:
+			conn = c.Unwrap()
+		case *tls.Conn:
+			conn = c.NetConn()
+		default:
+			return CheckedTimeouts{}, false
+		}
+	}
+	return CheckedTimeouts{}, false
+}
+
 // ConnIsTLS reports whether conn is, or wraps, a *tls.Conn.
 //
 // Sora's listeners hand protocol handlers a connection wrapped in several
@@ -601,11 +647,18 @@ func (c *SoraConn) probeTLSSignature() error {
 // SoraListener wraps a net.Listener to create SoraConn instances
 type SoraListener struct {
 	net.Listener
-	config SoraConnConfig
+	config func() SoraConnConfig
 }
 
 // NewSoraListener creates a listener that wraps accepted connections with SoraConn
 func NewSoraListener(listener net.Listener, config SoraConnConfig) *SoraListener {
+	return NewSoraListenerFunc(listener, func() SoraConnConfig { return config })
+}
+
+// NewSoraListenerFunc is NewSoraListener with the configuration asked for at every
+// accepted connection, so the timeouts a config reload changes reach the connections
+// accepted after it. Connections already accepted keep theirs.
+func NewSoraListenerFunc(listener net.Listener, config func() SoraConnConfig) *SoraListener {
 	return &SoraListener{
 		Listener: listener,
 		config:   config,
@@ -620,7 +673,7 @@ func (l *SoraListener) Accept() (net.Conn, error) {
 			return nil, err
 		}
 
-		soraConn := NewSoraConn(conn, l.config)
+		soraConn := NewSoraConn(conn, l.config())
 
 		// Arm TLS-on-plaintext-port detection for the connection's FIRST
 		// Read (see probeTLSSignature) — never probe here in the accept
@@ -641,11 +694,17 @@ func (l *SoraListener) Accept() (net.Conn, error) {
 type SoraTLSListener struct {
 	net.Listener
 	tlsConfig  *tls.Config
-	connConfig SoraConnConfig
+	connConfig func() SoraConnConfig
 }
 
 // NewSoraTLSListener creates a TLS listener that captures JA4 and returns SoraConn
 func NewSoraTLSListener(tcpListener net.Listener, tlsConfig *tls.Config, connConfig SoraConnConfig) *SoraTLSListener {
+	return NewSoraTLSListenerFunc(tcpListener, tlsConfig, func() SoraConnConfig { return connConfig })
+}
+
+// NewSoraTLSListenerFunc is NewSoraTLSListener with the connection configuration asked
+// for at every accepted connection (see NewSoraListenerFunc).
+func NewSoraTLSListenerFunc(tcpListener net.Listener, tlsConfig *tls.Config, connConfig func() SoraConnConfig) *SoraTLSListener {
 	return &SoraTLSListener{
 		Listener:   tcpListener,
 		tlsConfig:  tlsConfig,
@@ -663,7 +722,7 @@ func (l *SoraTLSListener) Accept() (net.Conn, error) {
 	}
 
 	// Return SoraTLSConn that will perform handshake when PerformHandshake() is called
-	return NewSoraTLSConn(tcpConn, l.tlsConfig, l.connConfig), nil
+	return NewSoraTLSConn(tcpConn, l.tlsConfig, l.connConfig()), nil
 }
 
 // SoraTLSConn wraps a TCP connection and performs TLS handshake + JA4 capture on demand.

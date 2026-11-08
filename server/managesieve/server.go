@@ -49,6 +49,19 @@ func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []stri
 
 const DefaultMaxScriptSize = 16 * 1024 // 16 KB
 
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after: a session or a login loads it
+// once and uses that copy throughout, so it never mixes the values of two reloads.
+type reloadableSettings struct {
+	maxScriptSize          int64
+	commandTimeout         time.Duration
+	absoluteSessionTimeout time.Duration // Maximum total session duration
+	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
+	masterSASLUsername     []byte
+	masterSASLPassword     []byte
+	masterSASLGate         *serverPkg.MasterSASLNetworkGate
+}
+
 type ManageSieveServer struct {
 	addr                string
 	name                string
@@ -59,13 +72,9 @@ type ManageSieveServer struct {
 	tlsConfig           *tls.Config
 	useStartTLS         bool
 	insecureAuth        bool
-	maxScriptSize       int64
 	supportedExtensions []string // List of supported Sieve extensions
 	masterUsername      []byte
 	masterPassword      []byte
-	masterSASLUsername  []byte
-	masterSASLPassword  []byte
-	masterSASLGate      *serverPkg.MasterSASLNetworkGate
 
 	// Connection counters
 	totalConnections         atomic.Int64
@@ -87,11 +96,11 @@ type ManageSieveServer struct {
 	lookupCache *lookupcache.LookupCache
 
 	// Command timeout and throughput enforcement
-	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
-	commandTimeout         time.Duration
-	commandTimeouts        *CommandTimeouts // Per-command hard execution timeouts (nil = use defaults)
-	absoluteSessionTimeout time.Duration    // Maximum total session duration
-	minBytesPerMinute      int64            // Minimum throughput to prevent slowloris (0 = disabled)
+	authIdleTimeout time.Duration    // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	commandTimeouts *CommandTimeouts // Per-command hard execution timeouts (nil = use defaults)
+
+	// The settings ReloadConfig replaces; see reloadableSettings.
+	settings atomic.Pointer[reloadableSettings]
 
 	// Connection tracking
 	connTracker *serverPkg.ConnectionTracker
@@ -146,7 +155,7 @@ type ManageSieveServerOptions struct {
 	AuthIdleTimeout             time.Duration             // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	CommandTimeout              time.Duration             // Maximum idle time before disconnection
 	CommandTimeoutOverrides     map[string]time.Duration  // Per-command hard execution timeouts (overrides defaults)
-	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = use default 30m)
+	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = no limit; go-managesieve enforces it)
 	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
 	Config                      *config.Config            // Full config for shared settings like connection tracking timeouts
 }
@@ -270,31 +279,33 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	}
 
 	serverInstance := &ManageSieveServer{
-		hostname:               hostname,
-		name:                   name,
-		addr:                   addr,
-		rdb:                    rdb,
-		appCtx:                 serverCtx,
-		cancel:                 serverCancel,
-		useStartTLS:            options.TLSUseStartTLS,
-		insecureAuth:           options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
+		hostname:            hostname,
+		name:                name,
+		addr:                addr,
+		rdb:                 rdb,
+		appCtx:              serverCtx,
+		cancel:              serverCancel,
+		useStartTLS:         options.TLSUseStartTLS,
+		insecureAuth:        options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
+		supportedExtensions: options.SupportedExtensions,
+		masterUsername:      []byte(options.MasterUsername),
+		masterPassword:      []byte(options.MasterPassword),
+		proxyReader:         proxyReader,
+		authLimiter:         authLimiter,
+		lookupCache:         lookupCache,
+		authIdleTimeout:     options.AuthIdleTimeout,
+		commandTimeouts:     defaultCommandTimeouts(),
+		activeSessions:      make(map[*ManageSieveSession]struct{}),
+	}
+	serverInstance.settings.Store(&reloadableSettings{
 		maxScriptSize:          maxScriptSize,
-		supportedExtensions:    options.SupportedExtensions,
-		masterUsername:         []byte(options.MasterUsername),
-		masterPassword:         []byte(options.MasterPassword),
+		commandTimeout:         options.CommandTimeout,
+		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
+		minBytesPerMinute:      options.MinBytesPerMinute,
 		masterSASLUsername:     []byte(options.MasterSASLUsername),
 		masterSASLPassword:     []byte(options.MasterSASLPassword),
 		masterSASLGate:         masterSASLGate,
-		proxyReader:            proxyReader,
-		authLimiter:            authLimiter,
-		lookupCache:            lookupCache,
-		authIdleTimeout:        options.AuthIdleTimeout,
-		commandTimeout:         options.CommandTimeout,
-		commandTimeouts:        defaultCommandTimeouts(),
-		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
-		minBytesPerMinute:      options.MinBytesPerMinute,
-		activeSessions:         make(map[*ManageSieveSession]struct{}),
-	}
+	})
 
 	// Apply operator overrides for per-command execution timeouts
 	if len(options.CommandTimeoutOverrides) > 0 {
@@ -363,10 +374,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	// Start connection limiter cleanup
 	serverInstance.limiter.StartCleanup(serverCtx)
 
-	// Initialize command timeout metrics
-	if serverInstance.commandTimeout > 0 {
-		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("managesieve").Set(serverInstance.commandTimeout.Seconds())
-	}
+	reportCommandTimeout(options.CommandTimeout)
 
 	// Initialize local connection tracking (no gossip, just local tracking)
 	// This enables per-user connection limits and kick functionality on backend servers
@@ -412,6 +420,8 @@ var knownCommands = map[string]bool{
 // current runtime settings. It is called at startup and again from
 // ReloadConfig so SIGHUP-reloaded settings apply to new connections.
 func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
+	settings := s.settings.Load()
+
 	// STARTTLS upgrades are the library's job only on plaintext listeners;
 	// implicit-TLS listeners keep TLS outside the library (SoraTLSListener +
 	// deferred handshake), and passing a TLSConfig there would wrongly
@@ -427,11 +437,11 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 		Greeting:               `"Sora" ManageSieve server ready.`,
 		GreetingStartTLSHint:   true,
 		SieveExtensions:        msieve.GetSieveCapabilities(s.supportedExtensions),
-		MaxScriptSize:          s.maxScriptSize,
+		MaxScriptSize:          settings.maxScriptSize,
 		MaxLineLength:          ManageSieveMaxLineLength,
-		IdleTimeout:            s.commandTimeout,
+		IdleTimeout:            settings.commandTimeout,
 		AuthIdleTimeout:        s.authIdleTimeout,
-		AbsoluteSessionTimeout: s.absoluteSessionTimeout,
+		AbsoluteSessionTimeout: settings.absoluteSessionTimeout,
 		InsecureAuth:           s.insecureAuth,
 		MaxErrors:              10,
 		// The library owns the idle and absolute-session timers (the SoraConn
@@ -527,24 +537,31 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 	return managesieveserver.New(opts)
 }
 
-func (s *ManageSieveServer) Start(errChan chan error) {
-	var listener net.Listener
+// reportCommandTimeout publishes command_timeout's metric, at start-up and whenever a
+// reload changes it.
+func reportCommandTimeout(timeout time.Duration) {
+	metrics.CommandTimeoutThresholdSeconds.WithLabelValues("managesieve").Set(timeout.Seconds())
+}
 
-	// Configure SoraConn with timeout protection
-	// Configure SoraConn with timeout protection. The idle and absolute-
-	// session timers are owned by the go-managesieve library: it clears the
-	// deadline during command execution, distinguishes the two cases in its
-	// BYE notice, and reports disconnects through the OnTimeout hook wired in
-	// the library options above. Arming the checker here with the same knobs
-	// raced the library and could send the client a duplicate BYE, so only
-	// the throughput check — which the library does not provide — stays at
-	// this layer.
-	connConfig := serverPkg.SoraConnConfig{
+// connConfig is the SoraConn configuration for a connection accepted now. The
+// listener asks for it at every accept, so a reloaded min_bytes_per_minute reaches
+// the connections accepted after it.
+//
+// The idle and absolute-session timers are owned by the go-managesieve library: it
+// clears the deadline during command execution, distinguishes the two cases in its
+// BYE notice, and reports disconnects through the OnTimeout hook wired in the
+// library options above. Arming the checker here with the same knobs raced the
+// library and could send the client a duplicate BYE, so only the throughput check —
+// which the library does not provide — stays at this layer.
+func (s *ManageSieveServer) connConfig() serverPkg.SoraConnConfig {
+	settings := s.settings.Load()
+	return serverPkg.SoraConnConfig{
 		Protocol:             "managesieve",
 		ServerName:           s.name,
 		Hostname:             s.hostname,
-		MinBytesPerMinute:    s.minBytesPerMinute,
-		EnableTimeoutChecker: s.minBytesPerMinute > 0,
+		MinBytesPerMinute:    settings.minBytesPerMinute,
+		EnableTimeoutChecker: settings.minBytesPerMinute > 0,
+		NoAbsoluteTimeout:    true, // the library enforces absolute_session_timeout
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Best-effort BYE before closing (RFC 5804 Section 1.3); TRYLATER
 			// indicates a temporary condition.
@@ -555,6 +572,12 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 			_, _ = fmt.Fprint(conn, message)
 		},
 	}
+}
+
+func (s *ManageSieveServer) Start(errChan chan error) {
+	var listener net.Listener
+
+	connConfig := s.connConfig()
 
 	// Create TCP listener with custom backlog
 	tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -577,17 +600,19 @@ func (s *ManageSieveServer) Start(errChan chan error) {
 	isImplicitTLS := s.tlsConfig != nil && !s.useStartTLS
 	// Only use a TLS listener if we're not using StartTLS and TLS is enabled
 	if isImplicitTLS {
-		listener = serverPkg.NewSoraTLSListener(base, s.tlsConfig, connConfig)
+		listener = serverPkg.NewSoraTLSListenerFunc(base, s.tlsConfig, s.connConfig)
 		if connConfig.EnableTimeoutChecker {
+			settings := s.settings.Load()
 			logger.Info("ManageSieve server listening with TLS", "name", s.name, "addr", s.addr, "idle_timeout",
-				s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
+				settings.commandTimeout, "session_max", settings.absoluteSessionTimeout, "min_throughput", connConfig.MinBytesPerMinute)
 		} else {
 			logger.Info("ManageSieve server listening with TLS", "name", s.name, "addr", s.addr)
 		}
 	} else {
-		listener = serverPkg.NewSoraListener(base, connConfig)
+		listener = serverPkg.NewSoraListenerFunc(base, s.connConfig)
 		if connConfig.EnableTimeoutChecker {
-			logger.Info("ManageSieve server listening", "name", s.name, "addr", s.addr, "tls", false, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
+			settings := s.settings.Load()
+			logger.Info("ManageSieve server listening", "name", s.name, "addr", s.addr, "tls", false, "idle_timeout", settings.commandTimeout, "session_max", settings.absoluteSessionTimeout, "min_throughput", connConfig.MinBytesPerMinute)
 		} else {
 			logger.Info("ManageSieve server listening", "name", s.name, "addr", s.addr, "tls", false)
 		}
@@ -803,39 +828,42 @@ func (s *ManageSieveServer) GetLimiter() *serverPkg.ConnectionLimiter {
 // ReloadConfig updates runtime-configurable settings from new config.
 func (s *ManageSieveServer) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	next := *s.settings.Load()
 
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != s.commandTimeout {
-		s.commandTimeout = timeout
+	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
+		reportCommandTimeout(timeout)
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != s.absoluteSessionTimeout {
-		s.absoluteSessionTimeout = timeout
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
-	if bpm := cfg.GetMinBytesPerMinute(); bpm != s.minBytesPerMinute {
-		s.minBytesPerMinute = bpm
+	if bpm := cfg.GetMinBytesPerMinute(); bpm != next.minBytesPerMinute {
+		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if maxSize := cfg.GetMaxScriptSizeWithDefault(); maxSize != s.maxScriptSize {
-		s.maxScriptSize = maxSize
+	if maxSize := cfg.GetMaxScriptSizeWithDefault(); maxSize != next.maxScriptSize {
+		next.maxScriptSize = maxSize
 		reloaded = append(reloaded, "max_script_size")
 	}
-	if cfg.MasterSASLUsername != string(s.masterSASLUsername) {
-		s.masterSASLUsername = []byte(cfg.MasterSASLUsername)
+	if cfg.MasterSASLUsername != string(next.masterSASLUsername) {
+		next.masterSASLUsername = []byte(cfg.MasterSASLUsername)
 		reloaded = append(reloaded, "master_sasl_username")
 	}
-	if cfg.MasterSASLPassword != string(s.masterSASLPassword) {
-		s.masterSASLPassword = []byte(cfg.MasterSASLPassword)
+	if cfg.MasterSASLPassword != string(next.masterSASLPassword) {
+		next.masterSASLPassword = []byte(cfg.MasterSASLPassword)
 		reloaded = append(reloaded, "master_sasl_password")
 	}
 	if gate, err := serverPkg.NewMasterSASLNetworkGate(cfg.MasterSASLAllowedNetworks); err != nil {
 		logger.Warn("ManageSieve config reload: invalid master_sasl_allowed_networks, keeping previous gate", "name", s.name, "error", err)
-	} else if !s.masterSASLGate.Equal(gate) {
-		s.masterSASLGate = gate
+	} else if !next.masterSASLGate.Equal(gate) {
+		next.masterSASLGate = gate
 		reloaded = append(reloaded, "master_sasl_allowed_networks")
 	}
 
 	if len(reloaded) > 0 {
+		s.settings.Store(&next)
 		// Rebuild the library server so new connections pick up the reloaded
 		// settings; existing connections keep their snapshot.
 		s.msLibServer.Store(s.buildLibServer())

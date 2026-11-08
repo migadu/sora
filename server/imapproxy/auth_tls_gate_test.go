@@ -19,17 +19,16 @@ func TestAuthenticateRequiresTLS(t *testing.T) {
 	defer cancel()
 
 	srv := &Server{
-		name:            "test",
-		hostname:        "test-host",
-		ctx:             ctx,
-		cancel:          cancel,
-		activeSessions:  make(map[*Session]struct{}),
-		connManager:     newTestConnManager(t, "127.0.0.1:1"),
-		authLimiter:     &fakeAuthLimiter{},
-		insecureAuth:    false, // cleartext auth NOT permitted
-		maxAuthErrors:   3,
-		authIdleTimeout: 5 * time.Second,
+		name:           "test",
+		hostname:       "test-host",
+		ctx:            ctx,
+		cancel:         cancel,
+		activeSessions: make(map[*Session]struct{}),
+		connManager:    newTestConnManager(t, "127.0.0.1:1"),
+		authLimiter:    &fakeAuthLimiter{},
+		insecureAuth:   false, // cleartext auth NOT permitted
 	}
+	srv.settings.Store(&reloadableSettings{maxAuthErrors: 3, authIdleTimeout: 5 * time.Second})
 
 	client, remote := net.Pipe()
 	defer remote.Close()

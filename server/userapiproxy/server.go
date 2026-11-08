@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -43,6 +44,12 @@ type JWTClaims struct {
 	jwt.RegisteredClaims
 }
 
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after; a request loads it once.
+type reloadableSettings struct {
+	jwtSecret string // JWT secret for token validation
+}
+
 // Server represents a User API proxy server
 type Server struct {
 	name                       string
@@ -57,7 +64,6 @@ type Server struct {
 	affinityManager            *server.AffinityManager  // Affinity manager for sticky routing (optional)
 	lookupCache                *lookupcache.LookupCache // Route lookup cache (optional)
 	positiveRevalidationWindow time.Duration            // Revalidation window for cached routes
-	jwtSecret                  string                   // JWT secret for token validation
 	tls                        bool
 	tlsCertFile                string
 	tlsKeyFile                 string
@@ -84,6 +90,9 @@ type Server struct {
 
 	// PROXY protocol support for incoming connections
 	proxyReader *server.ProxyProtocolReader
+
+	// The settings ReloadConfig replaces; see reloadableSettings.
+	settings atomic.Pointer[reloadableSettings]
 }
 
 // ServerOptions holds configuration options for the User API proxy server
@@ -119,6 +128,21 @@ type ServerOptions struct {
 	RemoteUseProxyProtocol bool   // Use PROXY protocol for backend connections
 }
 
+// checkJWTSecret refuses a JWT secret the proxy must not validate with, at start-up and
+// on a config reload alike.
+func checkJWTSecret(secret string) error {
+	if secret == "" {
+		return fmt.Errorf("JWT secret is required for User API proxy")
+	}
+	if len(secret) < 32 {
+		return fmt.Errorf("JWT secret must be at least 32 bytes for HS256 (RFC 7518 §3.2); got %d", len(secret))
+	}
+	if secret == "your-secret-jwt-signing-key-here" {
+		return fmt.Errorf("JWT secret is the placeholder value from config.toml.example — set a real, random jwt_secret")
+	}
+	return nil
+}
+
 // New creates a new User API proxy server
 func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOptions) (*Server, error) {
 	ctx, cancel := context.WithCancel(appCtx)
@@ -128,17 +152,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		return nil, fmt.Errorf("no remote addresses or backend pools configured")
 	}
 
-	if opts.JWTSecret == "" {
+	if err := checkJWTSecret(opts.JWTSecret); err != nil {
 		cancel()
-		return nil, fmt.Errorf("JWT secret is required for User API proxy")
-	}
-	if len(opts.JWTSecret) < 32 {
-		cancel()
-		return nil, fmt.Errorf("JWT secret must be at least 32 bytes for HS256 (RFC 7518 §3.2); got %d", len(opts.JWTSecret))
-	}
-	if opts.JWTSecret == "your-secret-jwt-signing-key-here" {
-		cancel()
-		return nil, fmt.Errorf("JWT secret is the placeholder value from config.toml.example — set a real, random jwt_secret")
+		return nil, err
 	}
 
 	// Set default timeout if not specified
@@ -340,7 +356,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
-	return &Server{
+	s := &Server{
 		name:                       opts.Name,
 		addr:                       opts.Addr,
 		connManager:                connManager,
@@ -353,7 +369,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		affinityManager:            opts.AffinityManager,
 		lookupCache:                lookupCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
-		jwtSecret:                  opts.JWTSecret,
 		tls:                        opts.TLS,
 		tlsCertFile:                opts.TLSCertFile,
 		tlsKeyFile:                 opts.TLSKeyFile,
@@ -367,7 +382,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		ctx:                        ctx,
 		cancel:                     cancel,
 		connReleases:               make(map[net.Conn]func()),
-	}, nil
+	}
+	s.settings.Store(&reloadableSettings{jwtSecret: opts.JWTSecret})
+	return s, nil
 }
 
 // Start starts the User API proxy server
@@ -864,7 +881,7 @@ func (s *Server) validateToken(tokenString string) (*JWTClaims, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
-		return []byte(s.jwtSecret), nil
+		return []byte(s.settings.Load().jwtSecret), nil
 	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 
 	if err != nil {
@@ -956,16 +973,25 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 // ReloadConfig updates runtime-configurable settings from new config.
 func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	var refused error
+	next := *s.settings.Load()
 
-	if cfg.JWTSecret != "" && cfg.JWTSecret != s.jwtSecret {
-		s.jwtSecret = cfg.JWTSecret
-		reloaded = append(reloaded, "jwt_secret")
+	if cfg.JWTSecret != "" && cfg.JWTSecret != next.jwtSecret {
+		if err := checkJWTSecret(cfg.JWTSecret); err != nil {
+			// The rest still reloads. The error has the caller log a failed reload, so an
+			// operator rotating a leaked secret learns that the old one is still live.
+			refused = fmt.Errorf("jwt_secret refused, the previous one stays in use: %w", err)
+		} else {
+			next.jwtSecret = cfg.JWTSecret
+			reloaded = append(reloaded, "jwt_secret")
+		}
 	}
 
 	if len(reloaded) > 0 {
+		s.settings.Store(&next)
 		logger.Info("User API proxy config reloaded", "name", s.name, "updated", reloaded)
 	}
-	return nil
+	return refused
 }
 
 func (s *Server) Stop() error {

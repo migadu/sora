@@ -319,6 +319,7 @@ func (db *Database) SetMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 		return nil, 0, err
 	}
 
+	newFlags = NormalizeAttachmentKeywordUpdate(newFlags, newFlags)
 	systemFlagsToSet, customKeywordsToSet := SplitFlags(newFlags)
 	bitwiseSystemFlags := FlagsToBitwise(systemFlagsToSet)
 	// Fold keywords onto the case already used in this mailbox (RFC 9051 §2.3.2).
@@ -361,6 +362,8 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 		return nil, 0, err
 	}
 
+	attachmentRemovals := attachmentKeywordRemovals(newFlags)
+	newFlags = NormalizeAttachmentKeywordUpdate(newFlags, newFlags)
 	systemFlagsToAdd, customKeywordsToAdd := SplitFlags(newFlags)
 	// Fold keywords onto the case already used in this mailbox (RFC 9051 §2.3.2)
 	// so adding a different-case variant of an existing keyword is a no-op merge
@@ -369,7 +372,7 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 	if err != nil {
 		return nil, 0, err
 	}
-	hasCustom := len(customKeywordsToAdd) > 0
+	hasCustom := len(customKeywordsToAdd) > 0 || len(attachmentRemovals) > 0
 	var finalModSeq int64
 	var hasUpdate bool
 
@@ -417,10 +420,11 @@ func (db *Database) AddMessageFlags(ctx context.Context, tx pgx.Tx, messageUID i
 					UNION ALL
 					SELECT unnest($2::text[]) AS flag_element
 				) AS combined_flags
+				WHERE NOT (lower(flag_element) = ANY($4::text[]))
 			), flags_changed_at = $3, updated_modseq = nextval('messages_modseq')
 			WHERE message_id = $1
 			RETURNING updated_modseq
-		`, messageID, customKeywordsToAdd, time.Now()).Scan(&finalModSeq)
+		`, messageID, customKeywordsToAdd, time.Now(), attachmentRemovals).Scan(&finalModSeq)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, 0, fmt.Errorf("message UID %d in mailbox %d not found (may be expunged or moved)", messageUID, mailboxID)

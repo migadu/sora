@@ -83,9 +83,8 @@ func TestGetClientIP(t *testing.T) {
 }
 
 func TestAuthMiddleware(t *testing.T) {
-	server := &Server{
-		apiKey: "test-api-key-12345",
-	}
+	server := &Server{}
+	server.settings.Store(&reloadableSettings{apiKey: "test-api-key-12345"})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -224,9 +223,8 @@ func TestAllowedHostsMiddleware(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server := &Server{
-				allowedHosts: tt.allowedHosts,
-			}
+			server := &Server{}
+			server.settings.Store(&reloadableSettings{allowedHosts: tt.allowedHosts})
 
 			req := httptest.NewRequest("GET", "/test", nil)
 			req.RemoteAddr = tt.clientIP + ":12345"
@@ -450,9 +448,7 @@ func TestCreateAccountRequestValidation(t *testing.T) {
 			req.Header.Set("Authorization", "Bearer test-api-key")
 
 			// Create a server with minimal setup just for validation testing
-			server := &Server{
-				apiKey: "test-api-key",
-			}
+			server := &Server{}
 
 			rr := httptest.NewRecorder()
 			server.handleCreateAccount(rr, req)
@@ -517,9 +513,7 @@ func TestUpdateAccountRequestValidation(t *testing.T) {
 			req.Header.Set("Authorization", "Bearer test-api-key")
 
 			// Create a server with minimal setup just for validation testing
-			server := &Server{
-				apiKey: "test-api-key",
-			}
+			server := &Server{}
 
 			rr := httptest.NewRecorder()
 			server.handleUpdateAccount(rr, req)
@@ -595,9 +589,7 @@ func TestAddCredentialRequestValidation(t *testing.T) {
 			req.Header.Set("Authorization", "Bearer test-api-key")
 
 			// Create a server with minimal setup just for validation testing
-			server := &Server{
-				apiKey: "test-api-key",
-			}
+			server := &Server{}
 
 			rr := httptest.NewRecorder()
 			server.handleAddCredential(rr, req)
@@ -730,9 +722,7 @@ func TestACLGrantRequestValidation(t *testing.T) {
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Authorization", "Bearer test-api-key")
 
-			server := &Server{
-				apiKey: "test-api-key",
-			}
+			server := &Server{}
 
 			rr := httptest.NewRecorder()
 			server.handleACLGrant(rr, req)
@@ -838,9 +828,7 @@ func TestACLRevokeRequestValidation(t *testing.T) {
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Authorization", "Bearer test-api-key")
 
-			server := &Server{
-				apiKey: "test-api-key",
-			}
+			server := &Server{}
 
 			rr := httptest.NewRecorder()
 			server.handleACLRevoke(rr, req)
@@ -909,9 +897,7 @@ func TestACLListRequestValidation(t *testing.T) {
 			req := httptest.NewRequest("GET", url, nil)
 			req.Header.Set("Authorization", "Bearer test-api-key")
 
-			server := &Server{
-				apiKey: "test-api-key",
-			}
+			server := &Server{}
 
 			rr := httptest.NewRecorder()
 			server.handleACLList(rr, req)

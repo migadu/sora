@@ -129,7 +129,9 @@ func TestDelivery_SaveMessageToMailbox_OwnerAttributionEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 
 	// File into the owner's shared mailbox via the B2-fixed delivery path.
-	require.NoError(t, dctx.SaveMessageToMailbox(ctx, recipient, shared, msgBytes, entity, plaintext, nil))
+	bodyStructure, err := helpers.SafeBodyStructure(msgBytes)
+	require.NoError(t, err)
+	require.NoError(t, dctx.SaveMessageToMailbox(ctx, recipient, shared, msgBytes, entity, plaintext, nil, contentHash, &bodyStructure))
 	// SaveMessageToMailbox stages + inserts + queues the owner pending_upload; the
 	// caller (DeliverMessage) is what flushes the upload, so emulate that here.
 	up.NotifyUploadQueued()

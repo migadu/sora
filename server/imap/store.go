@@ -110,6 +110,12 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	// flags the user lacks rights for; a naive replace would also clear UNLISTED flags.
 	// The apply step below preserves the current value of each non-modifiable flag.
 
+	// RFC 9979 §3.2: unflagging also clears the flag color keywords (see
+	// flag_color.go).
+	if sanitizedStoreFlags.Op == imap.StoreFlagsDel {
+		sanitizedStoreFlags.Flags = withColorsOnUnflag(sanitizedStoreFlags.Flags)
+	}
+
 	// Perform database operations outside of lock
 	messages, err := s.server.rdb.GetMessagesByNumSetWithRetry(ctx, selectedMailboxID, decodedNumSet)
 	if err != nil {
@@ -202,8 +208,9 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			for _, cf := range msg.CustomFlags {
 				cur = append(cur, imap.Flag(cf))
 			}
-			resulting = replaceTargetFlags(cur, sanitizedStoreFlags.Flags, storeRights)
+			resulting = storeReplaceTarget(cur, sanitizedStoreFlags.Flags, storeRights)
 		}
+		resulting = db.NormalizeAttachmentKeywordUpdate(resulting, sanitizedStoreFlags.Flags)
 		if db.DistinctKeywordCount(resulting) > db.MaxCustomKeywordsPerMessage {
 			return keywordLimitExceededError()
 		}
@@ -233,7 +240,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			groupUIDs := make(map[string][]imap.UID)
 			groupFlags := make(map[string][]imap.Flag)
 			for _, uid := range validUIDs {
-				target := replaceTargetFlags(currentByUID[uid], sanitizedStoreFlags.Flags, storeRights)
+				target := storeReplaceTarget(currentByUID[uid], sanitizedStoreFlags.Flags, storeRights)
 				key := flagSetKey(target)
 				groupUIDs[key] = append(groupUIDs[key], uid)
 				groupFlags[key] = target

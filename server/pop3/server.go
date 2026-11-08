@@ -41,22 +41,33 @@ func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []stri
 	return trustedNetworks
 }
 
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after: a session or a login loads it
+// once and uses that copy throughout, so it never mixes the values of two reloads.
+type reloadableSettings struct {
+	sessionMemoryLimit     int64
+	commandTimeout         time.Duration // Idle timeout (defaulted to Pop3DefaultIdleTimeout when unset)
+	libCommandTimeout      time.Duration // Per-command execution timeout passed to the library (raw config value, 0 = disabled)
+	absoluteSessionTimeout time.Duration // Maximum total session duration
+	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
+	masterSASLUsername     []byte
+	masterSASLPassword     []byte
+	masterSASLGate         *serverPkg.MasterSASLNetworkGate
+}
+
 type POP3Server struct {
-	addr               string
-	name               string
-	hostname           string
-	rdb                *resilient.ResilientDatabase
-	s3                 *resilient.ResilientS3Storage
-	appCtx             context.Context
-	cancel             context.CancelFunc
-	uploader           *uploader.UploadWorker
-	cache              *cache.Cache
-	tlsConfig          *tls.Config
-	masterUsername     []byte
-	masterPassword     []byte
-	masterSASLUsername []byte
-	masterSASLPassword []byte
-	masterSASLGate     *serverPkg.MasterSASLNetworkGate
+	addr           string
+	name           string
+	hostname       string
+	rdb            *resilient.ResilientDatabase
+	s3             *resilient.ResilientS3Storage
+	appCtx         context.Context
+	cancel         context.CancelFunc
+	uploader       *uploader.UploadWorker
+	cache          *cache.Cache
+	tlsConfig      *tls.Config
+	masterUsername []byte
+	masterPassword []byte
 
 	// Connection counters
 	totalConnections         atomic.Int64
@@ -84,17 +95,13 @@ type POP3Server struct {
 	// Auth security
 	insecureAuth bool // Allow PLAIN auth over non-TLS connections
 
-	// Memory limiting
-	sessionMemoryLimit int64
-
 	// Command timeout and throughput enforcement
-	authIdleTimeout        time.Duration    // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
-	commandTimeout         time.Duration    // Idle timeout (defaulted to Pop3DefaultIdleTimeout when unset)
-	libCommandTimeout      time.Duration    // Per-command execution timeout passed to the library (raw config value, 0 = disabled)
-	commandTimeouts        *CommandTimeouts // Per-command hard execution timeouts (nil = use defaults)
-	absoluteSessionTimeout time.Duration    // Maximum total session duration
-	minBytesPerMinute      int64            // Minimum throughput to prevent slowloris (0 = disabled)
-	maxMessageAge          time.Duration    // Ephemeral-storage retention (cleanup max_age_restriction); 0 = keep forever. Drives the CAPA EXPIRE value.
+	authIdleTimeout time.Duration    // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	commandTimeouts *CommandTimeouts // Per-command hard execution timeouts (nil = use defaults)
+	maxMessageAge   time.Duration    // Ephemeral-storage retention (cleanup max_age_restriction); 0 = keep forever. Drives the CAPA EXPIRE value.
+
+	// The settings ReloadConfig replaces; see reloadableSettings.
+	settings atomic.Pointer[reloadableSettings]
 
 	// Connection tracking
 	connTracker *serverPkg.ConnectionTracker
@@ -147,7 +154,7 @@ type POP3ServerOptions struct {
 	AuthIdleTimeout             time.Duration             // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	CommandTimeout              time.Duration             // Maximum idle time before disconnection
 	CommandTimeoutOverrides     map[string]time.Duration  // Per-command hard execution timeouts (overrides defaults)
-	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = use default 30m)
+	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = no limit; go-pop3 enforces it)
 	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
 	InsecureAuth                bool                      // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
 	Config                      *config.Config            // Full config for shared settings like connection tracking timeouts
@@ -280,36 +287,38 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	}
 
 	server := &POP3Server{
-		maintenanceGate:        options.MaintenanceGate,
-		hostname:               hostname,
-		name:                   name,
-		addr:                   popAddr,
-		rdb:                    rdb,
-		s3:                     resilientS3,
-		appCtx:                 serverCtx,
-		cancel:                 serverCancel,
-		uploader:               uploadWorker,
-		cache:                  cache,
-		masterUsername:         []byte(options.MasterUsername),
-		masterPassword:         []byte(options.MasterPassword),
+		maintenanceGate: options.MaintenanceGate,
+		hostname:        hostname,
+		name:            name,
+		addr:            popAddr,
+		rdb:             rdb,
+		s3:              resilientS3,
+		appCtx:          serverCtx,
+		cancel:          serverCancel,
+		uploader:        uploadWorker,
+		cache:           cache,
+		masterUsername:  []byte(options.MasterUsername),
+		masterPassword:  []byte(options.MasterPassword),
+		proxyReader:     proxyReader,
+		authLimiter:     authLimiter,
+		lookupCache:     lookupCache,
+		trustedNetworks: options.TrustedNetworks,
+		authIdleTimeout: options.AuthIdleTimeout,
+		commandTimeouts: defaultCommandTimeouts(),
+		insecureAuth:    insecureAuth, // Auto-enabled when TLS not configured (warned above)
+		maxMessageAge:   maxMessageAge,
+		activeSessions:  make(map[*POP3Session]struct{}),
+	}
+	server.settings.Store(&reloadableSettings{
+		sessionMemoryLimit:     options.SessionMemoryLimit,
+		commandTimeout:         commandTimeout,
+		libCommandTimeout:      options.CommandTimeout,
+		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
+		minBytesPerMinute:      options.MinBytesPerMinute,
 		masterSASLUsername:     []byte(options.MasterSASLUsername),
 		masterSASLPassword:     []byte(options.MasterSASLPassword),
 		masterSASLGate:         masterSASLGate,
-		proxyReader:            proxyReader,
-		authLimiter:            authLimiter,
-		lookupCache:            lookupCache,
-		trustedNetworks:        options.TrustedNetworks,
-		sessionMemoryLimit:     options.SessionMemoryLimit,
-		authIdleTimeout:        options.AuthIdleTimeout,
-		commandTimeout:         commandTimeout,
-		libCommandTimeout:      options.CommandTimeout,
-		commandTimeouts:        defaultCommandTimeouts(),
-		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
-		insecureAuth:           insecureAuth, // Auto-enabled when TLS not configured (warned above)
-		minBytesPerMinute:      options.MinBytesPerMinute,
-		maxMessageAge:          maxMessageAge,
-		activeSessions:         make(map[*POP3Session]struct{}),
-	}
+	})
 
 	// Apply operator overrides for per-command execution timeouts
 	if len(options.CommandTimeoutOverrides) > 0 {
@@ -370,10 +379,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 	// Start connection limiter cleanup
 	server.limiter.StartCleanup(serverCtx)
 
-	// Initialize command timeout metrics
-	if server.commandTimeout > 0 {
-		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("pop3").Set(server.commandTimeout.Seconds())
-	}
+	reportCommandTimeout(commandTimeout)
 
 	// Initialize local connection tracking (no gossip, just local tracking)
 	// This enables per-user connection limits and kick functionality on backend servers
@@ -418,8 +424,10 @@ var knownCommands = map[string]bool{
 // buildLibServer constructs the go-pop3 protocol server from the current
 // runtime settings. It is called at startup and again from ReloadConfig so
 // SIGHUP-reloaded timeouts apply to new connections (existing connections keep
-// the snapshot they were accepted with).
+// the snapshot they were accepted with, sessions included).
 func (s *POP3Server) buildLibServer() *pop3server.Server {
+	settings := s.settings.Load()
+
 	// Build custom capabilities based on config. Ephemeral-storage retention
 	// drives the CAPA EXPIRE value (RFC 2449 §5.1).
 	var caps []pop3.Capability
@@ -433,10 +441,10 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 
 	opts := pop3server.Options{
 		TLSConfig:              s.tlsConfig,
-		IdleTimeout:            s.commandTimeout,
+		IdleTimeout:            settings.commandTimeout,
 		AuthIdleTimeout:        s.authIdleTimeout,
-		AbsoluteSessionTimeout: s.absoluteSessionTimeout,
-		CommandTimeout:         s.libCommandTimeout,
+		AbsoluteSessionTimeout: settings.absoluteSessionTimeout,
+		CommandTimeout:         settings.libCommandTimeout,
 		// The library owns the idle and absolute-session timers (the SoraConn
 		// checker must not duplicate them — see the SoraConnConfig in Start),
 		// so timeout disconnects are counted from its hook.
@@ -493,7 +501,7 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 			metrics.ConnectionsCurrent.WithLabelValues("pop3", s.name, s.hostname).Inc()
 
 			sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
-			memTracker := serverPkg.NewSessionMemoryTracker(s.sessionMemoryLimit)
+			memTracker := serverPkg.NewSessionMemoryTracker(settings.sessionMemoryLimit)
 
 			session := &POP3Session{
 				server:      s,
@@ -566,23 +574,32 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 	return pop3server.New(opts)
 }
 
-func (s *POP3Server) Start(errChan chan error) {
-	var listener net.Listener
+// reportCommandTimeout publishes command_timeout's metric (the idle timeout it sets), at
+// start-up and whenever a reload changes it.
+func reportCommandTimeout(timeout time.Duration) {
+	metrics.CommandTimeoutThresholdSeconds.WithLabelValues("pop3").Set(timeout.Seconds())
+}
 
-	// Configure SoraConn with timeout protection. The idle and absolute-
-	// session timers are owned by the go-pop3 library: it clears the read
-	// deadline during command execution (so a streamed RETR is never on the
-	// idle clock), distinguishes the two cases in its notice, and reports
-	// disconnects through the OnTimeout hook wired in buildLibServer. Arming
-	// the checker here with the same knobs raced the library and could send
-	// the client a duplicate "-ERR" notice, so only the throughput check —
-	// which the library does not provide — stays at this layer.
-	connConfig := serverPkg.SoraConnConfig{
+// connConfig is the SoraConn configuration for a connection accepted now. The
+// listener asks for it at every accept, so a reloaded min_bytes_per_minute reaches
+// the connections accepted after it.
+//
+// The idle and absolute-session timers are owned by the go-pop3 library: it
+// clears the read deadline during command execution (so a streamed RETR is
+// never on the idle clock), distinguishes the two cases in its notice, and
+// reports disconnects through the OnTimeout hook wired in buildLibServer.
+// Arming the checker here with the same knobs raced the library and could send
+// the client a duplicate "-ERR" notice, so only the throughput check — which
+// the library does not provide — stays at this layer.
+func (s *POP3Server) connConfig() serverPkg.SoraConnConfig {
+	settings := s.settings.Load()
+	return serverPkg.SoraConnConfig{
 		Protocol:             "pop3",
 		ServerName:           s.name,
 		Hostname:             s.hostname,
-		MinBytesPerMinute:    s.minBytesPerMinute,
-		EnableTimeoutChecker: s.minBytesPerMinute > 0,
+		MinBytesPerMinute:    settings.minBytesPerMinute,
+		EnableTimeoutChecker: settings.minBytesPerMinute > 0,
+		NoAbsoluteTimeout:    true, // the library enforces absolute_session_timeout
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Best-effort notice before closing; RFC 1939 doesn't define
 			// timeout response codes, but [IN-USE] is commonly used.
@@ -593,6 +610,12 @@ func (s *POP3Server) Start(errChan chan error) {
 			_, _ = fmt.Fprint(conn, message)
 		},
 	}
+}
+
+func (s *POP3Server) Start(errChan chan error) {
+	var listener net.Listener
+
+	connConfig := s.connConfig()
 
 	// Create base TCP listener with custom backlog
 	tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -614,17 +637,19 @@ func (s *POP3Server) Start(errChan chan error) {
 
 	if s.tlsConfig != nil {
 		// Use SoraTLSListener for TLS with timeout protection
-		listener = serverPkg.NewSoraTLSListener(base, s.tlsConfig, connConfig)
+		listener = serverPkg.NewSoraTLSListenerFunc(base, s.tlsConfig, s.connConfig)
 		if connConfig.EnableTimeoutChecker {
-			logger.Info("POP3 server listening with TLS", "name", s.name, "addr", s.addr, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
+			settings := s.settings.Load()
+			logger.Info("POP3 server listening with TLS", "name", s.name, "addr", s.addr, "idle_timeout", settings.commandTimeout, "session_max", settings.absoluteSessionTimeout, "min_throughput", connConfig.MinBytesPerMinute)
 		} else {
 			logger.Info("POP3 server listening with TLS", "name", s.name, "addr", s.addr)
 		}
 	} else {
 		// Use SoraListener for non-TLS with timeout protection
-		listener = serverPkg.NewSoraListener(base, connConfig)
+		listener = serverPkg.NewSoraListenerFunc(base, s.connConfig)
 		if connConfig.EnableTimeoutChecker {
-			logger.Info("POP3 server listening", "name", s.name, "addr", s.addr, "tls", false, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
+			settings := s.settings.Load()
+			logger.Info("POP3 server listening", "name", s.name, "addr", s.addr, "tls", false, "idle_timeout", settings.commandTimeout, "session_max", settings.absoluteSessionTimeout, "min_throughput", connConfig.MinBytesPerMinute)
 		} else {
 			logger.Info("POP3 server listening", "name", s.name, "addr", s.addr, "tls", false)
 		}
@@ -847,46 +872,49 @@ func (s *POP3Server) GetLimiter() *serverPkg.ConnectionLimiter {
 // Called on SIGHUP. Only affects new connections; existing sessions keep old settings.
 func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	next := *s.settings.Load()
 
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != s.libCommandTimeout {
+	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.libCommandTimeout {
 		// Mirror construction: the raw value feeds the per-command execution
 		// timeout (0 = disabled) while the idle timeout keeps the RFC 1939 §3
 		// 10-minute floor.
-		s.libCommandTimeout = timeout
+		next.libCommandTimeout = timeout
 		if timeout == 0 {
 			timeout = Pop3DefaultIdleTimeout
 		}
-		s.commandTimeout = timeout
+		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
+		reportCommandTimeout(timeout)
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != s.absoluteSessionTimeout {
-		s.absoluteSessionTimeout = timeout
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
-	if bpm := cfg.GetMinBytesPerMinute(); bpm != s.minBytesPerMinute {
-		s.minBytesPerMinute = bpm
+	if bpm := cfg.GetMinBytesPerMinute(); bpm != next.minBytesPerMinute {
+		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if limit, err := cfg.GetSessionMemoryLimit(); err == nil && limit != s.sessionMemoryLimit {
-		s.sessionMemoryLimit = limit
+	if limit, err := cfg.GetSessionMemoryLimit(); err == nil && limit != next.sessionMemoryLimit {
+		next.sessionMemoryLimit = limit
 		reloaded = append(reloaded, "session_memory_limit")
 	}
-	if cfg.MasterSASLUsername != string(s.masterSASLUsername) {
-		s.masterSASLUsername = []byte(cfg.MasterSASLUsername)
+	if cfg.MasterSASLUsername != string(next.masterSASLUsername) {
+		next.masterSASLUsername = []byte(cfg.MasterSASLUsername)
 		reloaded = append(reloaded, "master_sasl_username")
 	}
-	if cfg.MasterSASLPassword != string(s.masterSASLPassword) {
-		s.masterSASLPassword = []byte(cfg.MasterSASLPassword)
+	if cfg.MasterSASLPassword != string(next.masterSASLPassword) {
+		next.masterSASLPassword = []byte(cfg.MasterSASLPassword)
 		reloaded = append(reloaded, "master_sasl_password")
 	}
 	if gate, err := serverPkg.NewMasterSASLNetworkGate(cfg.MasterSASLAllowedNetworks); err != nil {
 		logger.Warn("POP3 config reload: invalid master_sasl_allowed_networks, keeping previous gate", "name", s.name, "error", err)
-	} else if !s.masterSASLGate.Equal(gate) {
-		s.masterSASLGate = gate
+	} else if !next.masterSASLGate.Equal(gate) {
+		next.masterSASLGate = gate
 		reloaded = append(reloaded, "master_sasl_allowed_networks")
 	}
 
 	if len(reloaded) > 0 {
+		s.settings.Store(&next)
 		// Rebuild the protocol server so new connections pick up the reloaded
 		// settings; existing connections keep the snapshot they started with.
 		s.pop3libServer.Store(s.buildLibServer())

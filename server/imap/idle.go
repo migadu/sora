@@ -60,9 +60,10 @@ func (s *IMAPSession) Idle(ctx context.Context, w *imapserver.UpdateWriter, done
 
 	// Keepalive cadence must beat the idle checker: with a command_timeout
 	// shorter than the 2m default (tests use seconds), send at half the knob
-	// so the activity clock is always refreshed in time.
+	// so the activity clock is always refreshed in time. The knob is this
+	// connection's checker's: a reload changes it for new connections only.
 	keepalive := idleKeepaliveInterval
-	if ct := s.server.commandTimeout; ct > 0 && ct/2 < keepalive {
+	if ct := s.checkedIdleTimeout; ct > 0 && ct/2 < keepalive {
 		keepalive = ct / 2
 	}
 
