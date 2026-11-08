@@ -19,17 +19,6 @@ type VacationResponse struct {
 	CreatedAt        time.Time
 }
 
-// RecordVacationResponse records that a vacation response was sent to a specific sender
-func (db *Database) RecordVacationResponse(ctx context.Context, tx pgx.Tx, AccountID int64, senderAddress, responseIdentity string) error {
-	now := time.Now()
-	_, err := tx.Exec(ctx, `
-		INSERT INTO vacation_responses (account_id, sender_address, response_identity, response_date, created_at)
-		VALUES ($1, $2, $3, $4, $4)
-	`, AccountID, senderAddress, responseIdentity, now)
-
-	return err
-}
-
 // ClaimVacationResponse atomically consumes a response's suppression period. It
 // must run in a fresh write transaction, committed before a winning reply is sent.
 // A losing caller writes no history. Evaluation-time allowance checks are only
