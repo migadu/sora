@@ -249,18 +249,23 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 	return messages, nil
 }
 
-// SearchMessagesInMailbox performs full-text search
-func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64, mailboxPath string, query string) ([]*DBMessage, error) {
+// UserAPISearchLimit caps the messages a User API search returns. The query reads one
+// row past it so the caller can tell a result clipped at the cap from a complete one.
+const UserAPISearchLimit = 100
+
+// SearchMessagesInMailbox performs full-text search. It returns at most
+// UserAPISearchLimit messages, newest first, and whether more matches were left out.
+func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64, mailboxPath string, query string) ([]*DBMessage, bool, error) {
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// Require the 'r' (read) right for shared mailboxes; 'l' (lookup) alone must not
 	// expose message contents. Treat a denial as not-found to avoid leaking existence.
 	if ok, err := db.canReadMailbox(ctx, mailbox, accountID); err != nil {
-		return nil, err
+		return nil, false, err
 	} else if !ok {
-		return nil, consts.ErrMailboxNotFound
+		return nil, false, consts.ErrMailboxNotFound
 	}
 
 	searchQuery := `
@@ -290,13 +295,13 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			OR (mf.text_body_tsv IS NOT NULL AND mf.text_body_tsv @@ plainto_tsquery('simple', $3))
 		)
 		ORDER BY m.internal_date DESC
-		LIMIT 100
+		LIMIT $5
 	`
 
 	searchQuery = strings.Replace(searchQuery, "__HEADER_COND__", headerSubstringCond("m.", "$2"), 1)
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, searchQuery, mailbox.ID, strings.ToLower(query), query, mailbox.AccountID)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, searchQuery, mailbox.ID, strings.ToLower(query), query, mailbox.AccountID, UserAPISearchLimit+1)
 	if err != nil {
-		return nil, fmt.Errorf("failed to search messages: %w", err)
+		return nil, false, fmt.Errorf("failed to search messages: %w", err)
 	}
 	defer rows.Close()
 
@@ -314,7 +319,7 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			&msg.S3Domain, &msg.S3Localpart, &msg.MailboxPath,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan message: %w", err)
+			return nil, false, fmt.Errorf("failed to scan message: %w", err)
 		}
 
 		// Parse custom flags
@@ -342,7 +347,15 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		messages = append(messages, msg)
 	}
 
-	return messages, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	// The extra row only says that the cap was hit; it is never returned.
+	truncated := len(messages) > UserAPISearchLimit
+	if truncated {
+		messages = messages[:UserAPISearchLimit]
+	}
+	return messages, truncated, nil
 }
 
 // MessageS3Info represents minimal message info needed for S3 verification
