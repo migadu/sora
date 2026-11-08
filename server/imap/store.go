@@ -204,6 +204,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			}
 			resulting = replaceTargetFlags(cur, sanitizedStoreFlags.Flags, storeRights)
 		}
+		resulting = db.NormalizeAttachmentKeywordUpdate(resulting, sanitizedStoreFlags.Flags)
 		if db.DistinctKeywordCount(resulting) > db.MaxCustomKeywordsPerMessage {
 			return keywordLimitExceededError()
 		}

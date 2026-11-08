@@ -528,16 +528,14 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 	}
 	defer tx.Rollback(context.Background())
 
-	// Get current flags
-	var currentFlags int
-	var currentCustomFlags []byte
+	// Resolve the mailbox before locking it. Read flags only after that lock,
+	// so a concurrent STORE cannot make this update overwrite a stale snapshot.
 	var mailboxID int64
 	err = tx.QueryRow(ctx, `
-		SELECT ms.flags, ms.custom_flags, m.mailbox_id
+		SELECT m.mailbox_id
 		FROM messages m
-		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
-	`, messageID, accountID).Scan(&currentFlags, &currentCustomFlags, &mailboxID)
+	`, messageID, accountID).Scan(&mailboxID)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -552,6 +550,21 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 	// drifts unseen_count negative — the same bug the IMAP paths already guard against.
 	if err = lockMailboxStats(ctx, tx, mailboxID); err != nil {
 		return err
+	}
+
+	var currentFlags int
+	var currentCustomFlags []byte
+	err = tx.QueryRow(ctx, `
+		SELECT ms.flags, ms.custom_flags
+		FROM messages m
+		JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL
+	`, messageID, accountID).Scan(&currentFlags, &currentCustomFlags)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return consts.ErrDBNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get current flags: %w", err)
 	}
 
 	var customFlags []string
@@ -604,6 +617,15 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 			canon = c
 		}
 		customFlags = removeString(customFlags, canon)
+	}
+
+	// RFC 9979 §4: one explicitly added attachment keyword replaces its
+	// opposite; an explicitly conflicting pair clears both. Apply this before
+	// the cap check so replacing a keyword does not consume another slot.
+	normalizedCustom := NormalizeAttachmentKeywordUpdate(helpers.StringsToFlags(customFlags), helpers.StringsToFlags(addFlags))
+	customFlags = make([]string, len(normalizedCustom))
+	for i, flag := range normalizedCustom {
+		customFlags[i] = string(flag)
 	}
 
 	// Reject rather than silently drop if the result would exceed what a single
