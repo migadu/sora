@@ -344,14 +344,10 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	// Extract config from context if available
 	isShared := false
 	var ownerDomain *string
-	sharedPrefix := "Shared/" // Default prefix
 
 	// Try to get config from context
-	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.Enabled {
-		sharedPrefix = cfg.SharedMailboxes.NamespacePrefix
-		// Check if name starts with prefix, or is the prefix itself (without trailing slash)
-		prefixWithoutSlash := strings.TrimSuffix(sharedPrefix, "/")
-		if strings.HasPrefix(name, sharedPrefix) || name == prefixWithoutSlash {
+	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil {
+		if cfg.SharedMailboxes.InNamespace(name) {
 			isShared = true
 
 			// Extract domain from user's primary credential
@@ -1094,6 +1090,14 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			return consts.ErrMailboxNotFound
 		}
 		return fmt.Errorf("failed to fetch mailbox for rename: %w", err)
+	}
+
+	// Whether a mailbox is shared (is_shared, owner_domain, its ACL) is settled when
+	// it is created in or outside the shared namespace; a rename to the other side
+	// would leave that describing the old name, so it is refused (issue #160).
+	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.Enabled &&
+		cfg.SharedMailboxes.InNamespace(newName) != isShared {
+		return consts.ErrMailboxSharedBoundary
 	}
 
 	// If it's a shared mailbox, check ACL permissions

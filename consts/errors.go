@@ -8,6 +8,7 @@ var (
 	ErrMailboxInvalidName     = errors.New("invalid mailbox name")
 	ErrMailboxAlreadyExists   = errors.New("mailbox already exists")
 	ErrMailboxSpecialUseInUse = errors.New("special-use attribute already assigned")
+	ErrMailboxSharedBoundary  = errors.New("mailbox cannot be moved into or out of the shared namespace")
 	ErrUserNotFound           = errors.New("user not found")
 	ErrAccountAlreadyExists   = errors.New("account already exists")
 	ErrInternalError          = errors.New("internal error")

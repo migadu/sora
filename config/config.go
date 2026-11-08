@@ -1100,6 +1100,15 @@ type SharedMailboxesConfig struct {
 	AllowAnyoneIdentifier bool   `toml:"allow_anyone_identifier"` // Enable RFC 4314 "anyone" identifier for domain-wide sharing
 }
 
+// InNamespace reports whether a mailbox of this name is created as a shared mailbox:
+// the feature is enabled and the name is under the namespace prefix, or is its root.
+func (c SharedMailboxesConfig) InNamespace(name string) bool {
+	if !c.Enabled {
+		return false
+	}
+	return strings.HasPrefix(name, c.NamespacePrefix) || name == strings.TrimSuffix(c.NamespacePrefix, "/")
+}
+
 // AdminCLIConfig holds configuration for sora-admin CLI tool
 type AdminCLIConfig struct {
 	Addr               string `toml:"addr"`                 // HTTP Admin API endpoint address
