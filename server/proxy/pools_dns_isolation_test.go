@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/migadu/sora/config"
@@ -71,6 +72,51 @@ func TestPools_DNSCollisionRefusesRoutingAndTLS(t *testing.T) {
 	}
 }
 
+func TestPools_DNSCollisionTLSUsesOneResolutionSnapshot(t *testing.T) {
+	a, b := newTestCA(t), newTestCA(t)
+	cm := newPoolsCM(t, []PoolSpec{
+		{Name: "a", Backends: []string{"a.example:143"}, Settings: BackendSettings{TLS: true, TLSVerify: true, TLSCAFile: a.file}},
+		{Name: "b", Backends: []string{"b.example:143"}, Settings: BackendSettings{TLS: true, TLSVerify: true, TLSCAFile: b.file}},
+	})
+	cm.SetRemoteTLSRootCAs(mustPool(t, a.file))
+	const first, target = "127.0.0.1:143", "127.0.0.2:143"
+	install := func(overlap bool) {
+		addr := first
+		if overlap {
+			addr = target
+		}
+		cm.installResolvedAddrs([]string{addr, target}, map[string][]string{"a.example:143": {addr}, "b.example:143": {target}})
+	}
+	install(false)
+	cert := a.leaf(t, []string{"a.example"}, nil)
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	bad := make(chan struct{}, 4)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				cfg := cm.BackendClientTLS(true, target)
+				if cfg.VerifyConnection(tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}) == nil {
+					bad <- struct{}{}
+					return
+				}
+			}
+		}()
+	}
+	for i := 0; i < 1000; i++ {
+		install(i%2 == 0)
+	}
+	wg.Wait()
+	if len(bad) != 0 {
+		t.Fatal("TLS mixed DNS snapshots and trusted another pool's CA")
+	}
+}
+
 // Cover re-resolution, including unchanged union, unrelated pools, a cached route,
 // and recovery. None of the ownership checks may depend on a changed union or on
 // the first startup DNS answer being the only answer the process will ever see.
@@ -130,5 +176,18 @@ func TestPools_DNSCollisionRefreshAndRecovery(t *testing.T) {
 	}
 	if err := cm.RefuseMaintenanceDial("tcp", stale.PreferredAddr, nil); err != nil {
 		t.Fatalf("resolved ownership left a stale dial refusal: %v", err)
+	}
+}
+
+func TestPools_DNSCollisionCanonicalizesDestinationPorts(t *testing.T) {
+	startFakeDNS(t, "pool-b.test.", net.ParseIP("127.0.0.1"))
+	for _, port := range []string{"00143", "imap"} {
+		cm := newPoolsCM(t, []PoolSpec{
+			{Name: "a", Backends: []string{"127.0.0.1:143"}},
+			{Name: "b", Backends: []string{"pool-b.test:" + port}},
+		})
+		if err := cm.ResolveAddresses(); !errors.Is(err, ErrAmbiguousBackendPool) {
+			t.Fatalf("port %s hid a DNS collision: %v", port, err)
+		}
 	}
 }

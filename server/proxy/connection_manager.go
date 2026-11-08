@@ -214,9 +214,13 @@ func (cm *ConnectionManager) InMaintenance(addr string) bool {
 // configuredNamesOf returns the configured pool addresses (remote_addrs) whose resolution
 // produced addr.
 func (cm *ConnectionManager) configuredNamesOf(addr string) []string {
-	target := normalizeHostPort(addr, 0)
 	cm.healthMu.RLock()
 	defer cm.healthMu.RUnlock()
+	return cm.configuredNamesOfLocked(addr)
+}
+
+func (cm *ConnectionManager) configuredNamesOfLocked(addr string) []string {
+	target := normalizeHostPort(addr, 0)
 	var names []string
 	for configured, entries := range cm.resolvedHosts {
 		for _, entry := range entries {
@@ -526,12 +530,16 @@ func (cm *ConnectionManager) poolHasBackend(p *backendPool, backend string) bool
 // pin carries no pool, and the pool the pinned host belongs to is the only one its account
 // is known to live in.
 func (cm *ConnectionManager) PoolOfBackend(addr string) string {
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+	return cm.poolOfBackendLocked(addr)
+}
+
+func (cm *ConnectionManager) poolOfBackendLocked(addr string) string {
 	if !cm.HasNamedPools() || addr == "" {
 		return ""
 	}
 	target := normalizeHostPort(addr, cm.remotePort)
-	cm.healthMu.RLock()
-	defer cm.healthMu.RUnlock()
 	if cm.backendErrors[target] != nil {
 		return ""
 	}
@@ -1158,21 +1166,26 @@ func loadCAFile(path string) (*x509.CertPool, error) {
 //     so a backend whose certificate names only its address keeps working as before.
 func (cm *ConnectionManager) BackendClientTLS(verify bool, addr string) *tls.Config {
 	cfg := cm.backendTLSConfig(verify)
-	if err := cm.backendPoolError(addr); err != nil {
+	// The conflict check, CA and names must belong to the same DNS snapshot. A
+	// refresh between separate reads could otherwise turn a pool member into an
+	// apparently unowned pin that inherits the server's roots and another pool's name.
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+	if err := cm.backendErrors[normalizeHostPort(addr, cm.remotePort)]; err != nil {
 		// Also guard STARTTLS and callers that already hold a TCP connection.
 		// Disabling certificate verification must not disable pool isolation.
 		cfg.InsecureSkipVerify = true
 		cfg.VerifyConnection = func(tls.ConnectionState) error { return err }
 		return cfg
 	}
-	if name := cm.PoolOfBackend(addr); name != "" {
+	if name := cm.poolOfBackendLocked(addr); name != "" {
 		cfg.RootCAs = cm.poolsByName[name].rootCAs
 	}
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
 	}
-	names := append(cm.configuredHostnamesOf(addr), host)
+	names := append(cm.configuredHostnamesOfLocked(addr), host)
 	cfg.ServerName = names[0]
 	if verify {
 		// Go's own check accepts only ServerName; this one is that check (chain to the
@@ -1183,11 +1196,11 @@ func (cm *ConnectionManager) BackendClientTLS(verify bool, addr string) *tls.Con
 	return cfg
 }
 
-// configuredHostnamesOf returns the hostnames (not IP literals) of the configured backend
-// entries whose resolution produced addr.
-func (cm *ConnectionManager) configuredHostnamesOf(addr string) []string {
+// configuredHostnamesOfLocked returns the hostnames (not IP literals) whose resolution
+// produced addr. The caller holds healthMu so roots and names use one DNS snapshot.
+func (cm *ConnectionManager) configuredHostnamesOfLocked(addr string) []string {
 	var hosts []string
-	for _, configured := range cm.configuredNamesOf(addr) {
+	for _, configured := range cm.configuredNamesOfLocked(addr) {
 		h, _, err := net.SplitHostPort(configured)
 		if err != nil {
 			h = configured

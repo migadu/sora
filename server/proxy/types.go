@@ -260,6 +260,11 @@ func normalizeHostPort(addr string, defaultPort int) string {
 		if ip := net.ParseIP(host); ip != nil {
 			host = ip.String()
 		}
+		// DNS ownership is keyed by the destination actually dialed. Numeric
+		// spellings such as 0143 and service names such as imap mean the same port.
+		if n, err := net.LookupPort("tcp", port); err == nil {
+			port = strconv.Itoa(n)
+		}
 		return net.JoinHostPort(host, port)
 	}
 
