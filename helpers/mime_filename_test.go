@@ -19,7 +19,7 @@ func TestAttachmentKeyword_FilenameParameters(t *testing.T) {
 		{"invalid extended after valid continuation", `inline; filename*0="report"; filename*1=".pdf"; filename*=UTF-8''bad%ZZ`, attachmentFound},
 		{"latin1", `inline; filename*=iso-8859-1''%E4.pdf`, attachmentFound},
 		{"windows", `inline; filename*=windows-1252''%80.pdf`, attachmentFound},
-		{"japanese", `inline; filename*=iso-2022-jp'ja'%1B%24Breport.pdf`, attachmentFound},
+		{"japanese", `inline; filename*=iso-2022-jp'ja'%1B%24B%24%22%1B%28B.pdf`, attachmentFound},
 		{"unspecified charset", `inline; filename*=''report.pdf`, attachmentFound},
 		{"encoded empty", `inline; filename*=iso-8859-1''`, attachmentNone},
 		{"plain empty", `inline; filename=""`, attachmentNone},
