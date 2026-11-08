@@ -261,7 +261,9 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 			reloaded = append(reloaded, "jwt_secret")
 		}
 	}
-	if len(cfg.AllowedOrigins) > 0 {
+	// Reload receives the complete config: an empty or removed list revokes
+	// every previously allowed origin, just as it does at startup.
+	if !slices.Equal(cfg.AllowedOrigins, next.allowedOrigins) {
 		next.allowedOrigins = slices.Clone(cfg.AllowedOrigins)
 		reloaded = append(reloaded, "allowed_origins")
 	}
