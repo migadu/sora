@@ -1,6 +1,7 @@
 package imapproxy
 
 import (
+	"crypto/tls"
 	"io"
 	"net"
 	"time"
@@ -79,27 +80,62 @@ func (s *Session) closeForMaintenance() {
 	s.gracefulShutdown = true
 	s.closingForMaintenance = true
 	backendConn := s.backendConn
+	clientConn := s.clientConn
 	s.mu.Unlock()
 	s.InfoLog("closing session: backend in maintenance", "backend", s.serverAddrLocked())
 
-	if closeWriter, ok := backendConn.(interface{ CloseWrite() error }); ok {
-		if err := closeWriter.CloseWrite(); err != nil {
-			s.DebugLog("Failed to half-close backend connection", "error", err)
+	// Arm the bound before any network operation. TLS CloseWrite sends an alert
+	// and can wait for a stalled peer or for an existing Write's TLS mutex. The
+	// drain's pacing loop must not wait for any one session to finish that work.
+	time.AfterFunc(maintenanceCloseGrace, func() {
+		// Nothing half-closes the client side, so its tls.Close cannot wait on a
+		// CloseWrite holding the TLS writer: a plain Close is already bounded and
+		// still sends close_notify. The backend is the one that may be stuck.
+		if clientConn != nil {
+			_ = clientConn.Close()
+		}
+		closeMaintenanceTransport(backendConn)
+	})
+	go func() {
+		if closeWriter, ok := backendConn.(interface{ CloseWrite() error }); ok {
+			if err := closeWriter.CloseWrite(); err != nil {
+				s.DebugLog("Failed to half-close backend connection", "error", err)
+			}
+		}
+		// The BYE follows the half-close, so commands sent after it cannot reach
+		// the backend. Already accepted commands still get their responses.
+		s.sendBye(byeMaintenance)
+	}()
+}
+
+// closeMaintenanceTransport forces the socket closed at the end of the grace
+// period, then lets outer wrappers release their bookkeeping. tls.Conn.Close
+// alone can wait for the very close_notify write this deadline must interrupt.
+func closeMaintenanceTransport(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	transport := conn
+	unwrapped := false
+	for {
+		switch c := transport.(type) {
+		case *tls.Conn:
+			transport = c.NetConn()
+		case interface{ Unwrap() net.Conn }:
+			transport = c.Unwrap()
+		default:
+			_ = transport.Close()
+			if unwrapped {
+				_ = conn.Close()
+			}
+			return
+		}
+		unwrapped = true
+		if transport == nil {
+			_ = conn.Close()
+			return
 		}
 	}
-	// Not inline: sendBye waits for a write the copy has under way, and the drain must not.
-	go s.sendBye(byeMaintenance)
-	time.AfterFunc(maintenanceCloseGrace, func() {
-		s.mu.Lock()
-		clientConn, backendConn := s.clientConn, s.backendConn
-		s.mu.Unlock()
-		if backendConn != nil {
-			backendConn.Close()
-		}
-		if clientConn != nil {
-			clientConn.Close()
-		}
-	})
 }
 
 // endForMaintenance ends a session closed for maintenance, once its backend has closed.
