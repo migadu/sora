@@ -109,14 +109,17 @@ func TestVacationMIMEMalformedDoesNotSendOrConsumePeriod(t *testing.T) {
 	} {
 		t.Run(reason, func(t *testing.T) {
 			q := &captureRelayQueue{}
-			recorded := false
+			oracle := &fakeVacationOracle{}
+			reply := evaluateVacation(t, oracle, "sender@example.net")
+			reply.IsMime = true
+			reply.Body = reason
 			h := &StandardVacationHandler{Hostname: "m", RelayQueue: q}
-			err := h.HandleVacationResponse(context.Background(), 1, sieveengine.VacationReply{IsMime: true, Body: reason, RecordSent: func(context.Context) error { recorded = true; return nil }}, vacAddr(t, "sender@example.net"), vacAddr(t, "owner@example.com"), makeMessage(nil))
+			err := h.HandleVacationResponse(context.Background(), 42, reply, vacAddr(t, "sender@example.net"), vacAddr(t, "owner@example.com"), makeMessage(nil))
 			if err == nil {
 				t.Error("malformed MIME accepted")
 			}
-			if len(q.calls) != 0 || recorded {
-				t.Errorf("malformed MIME consumed period or was sent: queued=%d recorded=%v", len(q.calls), recorded)
+			if len(q.calls) != 0 || len(oracle.recorded) != 0 {
+				t.Errorf("malformed MIME consumed period or was sent: queued=%d recorded=%d", len(q.calls), len(oracle.recorded))
 			}
 		})
 	}
