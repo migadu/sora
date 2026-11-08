@@ -505,8 +505,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// address (s.User.Address, set in Rcpt) — the same value the Admin API path uses — so
 	// loop detection is consistent across aliases and ingress paths, and within-account
 	// content dedup (per-account S3 keys) is preserved. Re-parse so downstream header/
-	// metadata extraction sees the stamped header (the prepended header does not change MIME
-	// body structure, so the buf.Bytes()-based body structure below stays correct).
+	// metadata extraction sees the stamped header. MIME structure is extracted
+	// from the final bytes after Sieve's header edits below.
 	if s.User != nil {
 		deliveredTo := s.User.Address.BaseAddress()
 		if helpers.IsRedirectLoop(helpers.HeaderGetter(messageContent.Header.Map()), deliveredTo) {
@@ -574,8 +574,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		s.DebugLog("message sent date", "sent_date", sentDate)
 	}
 
-	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(buf.Bytes()))
-	bodyStructure := &bodyStructureVal
 	var plaintextBody *string
 	plaintextBodyResult, extractErr := helpers.ExtractPlaintextBody(messageContent)
 	if extractErr != nil {
@@ -842,6 +840,12 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			"flags", strings.Join(rejected, ","),
 			"reason", "not a valid IMAP flag-keyword (RFC 9051 §9: ASCII atom, no specials)")
 	}
+
+	// Classify and extract the final stored MIME once, after editheader, and
+	// reuse both results for every fileinto :copy destination.
+	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(fullMessageBytes))
+	bodyStructure := &bodyStructureVal
+	sieveFlags = db.WithAttachmentKeyword(sieveFlags, fullMessageBytes, true)
 
 	switch result.Action {
 	case sieveengine.ActionFileInto:
@@ -1261,13 +1265,6 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 	}
 
 	size := int64(len(fullMessageBytes))
-
-	// RFC 9979 §4: the server sets $hasattachment or $hasnoattachment on delivery.
-	var classifiedBS imap.BodyStructure
-	if bodyStructure != nil && helpers.ValidateMIMEStructure(fullMessageBytes) == nil {
-		classifiedBS = *bodyStructure
-	}
-	flags = db.WithAttachmentKeyword(flags, classifiedBS, true)
 
 	// No need to query - it's already cached in the session
 	_, messageUID, err := s.backend.rdb.InsertMessageWithRetry(ctx,

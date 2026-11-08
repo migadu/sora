@@ -44,27 +44,27 @@ var extractBodyStructure = imapserver.ExtractBodyStructure
 // extractBodyStructureSafe wraps imapserver.ExtractBodyStructure with panic recovery and validation.
 // Returns a default body structure if extraction fails or structure is invalid (e.g., multipart with no children).
 // The result is never nil: callers store it and later serialize it, and a nil
-// body structure panics the FETCH write path. parsed is false after any MIME
-// parse failure, including a synthetic fallback inside the underlying extractor.
-func extractBodyStructureSafe(data []byte) (result imap.BodyStructure, parsed bool) {
+// body structure panics the FETCH write path. Attachment classification uses
+// the raw message separately, so a synthetic fallback cannot assert absence.
+func extractBodyStructureSafe(data []byte) (result imap.BodyStructure) {
 	// Named results: a bare recover() leaves an unnamed result at its zero value,
 	// so a panic here would have returned the nil this function exists to avoid.
 	defer func() {
 		if r := recover(); r != nil {
-			result, parsed = fallbackBodyStructure(), false
+			result = fallbackBodyStructure()
 		}
 	}()
 
 	bs := extractBodyStructure(bytes.NewReader(data))
 	if bs == nil {
 		// Corrupted message.
-		return fallbackBodyStructure(), false
+		return fallbackBodyStructure()
 	}
 	if err := helpers.ValidateBodyStructure(&bs); err != nil {
 		// Invalid structure (e.g., multipart with no children), use default
-		return fallbackBodyStructure(), false
+		return fallbackBodyStructure()
 	}
-	return bs, helpers.ValidateMIMEStructure(data) == nil
+	return bs
 }
 
 // errAppendLiteralTooLarge marks an APPEND refused because the literal does not fit the
@@ -300,7 +300,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	}
 
 	// Extract body structure with panic recovery for malformed messages
-	bodyStructure, bodyStructureParsed := extractBodyStructureSafe(fullMessageBytes)
+	bodyStructure := extractBodyStructureSafe(fullMessageBytes)
 
 	// Store message locally for background upload to S3
 	// Check if file already exists to prevent race condition:
@@ -414,12 +414,9 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	// RFC 9979 §4: fill in $hasattachment or $hasnoattachment when the client set
 	// neither, as Sent and Drafts copies arrive this way. It is server-set, so no
 	// flag right is needed, and it comes after the [LIMIT] check above, so it can
-	// never be what fails an APPEND. A fallback structure decides nothing.
-	var classifiedBS imap.BodyStructure
-	if bodyStructureParsed {
-		classifiedBS = bodyStructure
-	}
-	appendFlags = db.WithAttachmentKeyword(appendFlags, classifiedBS, false)
+	// never be what fails an APPEND. The raw MIME walk distinguishes a known
+	// attachment from an undecidable or synthetic BODYSTRUCTURE.
+	appendFlags = db.WithAttachmentKeyword(appendFlags, fullMessageBytes, false)
 
 	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{

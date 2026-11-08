@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestValidateMIMEStructure(t *testing.T) {
+func TestAttachmentKeyword_MIMEStructure(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		data  string
@@ -28,14 +28,14 @@ func TestValidateMIMEStructure(t *testing.T) {
 		{"malformed second part after plaintext", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nplain\r\n--b\r\nContent-Type: multipart/mixed; boundary=inner\r\n\r\nmissing inner boundary\r\n--b--\r\n", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := ValidateMIMEStructure([]byte(tc.data)); (err == nil) != tc.valid {
-				t.Fatalf("ValidateMIMEStructure = %v, valid=%v", err, tc.valid)
+			if kw, known := AttachmentKeyword([]byte(tc.data)); known != tc.valid || (known && kw != KeywordHasNoAttachment) {
+				t.Fatalf("AttachmentKeyword = %q, %v; want known-no-attachments=%v", kw, known, tc.valid)
 			}
 		})
 	}
 }
 
-func TestValidateMIMEStructure_NestedParts(t *testing.T) {
+func TestAttachmentKeyword_MIMEStructure_NestedParts(t *testing.T) {
 	var data strings.Builder
 	for i := 0; i < 100; i++ {
 		fmt.Fprintf(&data, "Content-Type: multipart/mixed; boundary=b%d\r\n\r\n--b%d\r\n", i, i)
@@ -44,7 +44,7 @@ func TestValidateMIMEStructure_NestedParts(t *testing.T) {
 	for i := 99; i >= 0; i-- {
 		fmt.Fprintf(&data, "\r\n--b%d--\r\n", i)
 	}
-	if err := ValidateMIMEStructure([]byte(data.String())); err != nil {
-		t.Fatal(err)
+	if kw, known := AttachmentKeyword([]byte(data.String())); !known || kw != KeywordHasNoAttachment {
+		t.Fatalf("AttachmentKeyword = %q, %v; want no attachments", kw, known)
 	}
 }

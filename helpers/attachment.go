@@ -1,23 +1,20 @@
 package helpers
 
-import (
-	"strings"
-
-	"github.com/emersion/go-imap/v2"
-)
+import "github.com/emersion/go-imap/v2"
 
 // The RFC 9979 §4 attachment keywords. They are mutually exclusive, and the
 // server sets one during delivery; $hasnoattachment records that the message
-// was checked and has none, so a message with neither was never checked.
+// was checked and has none. Neither keyword means the status is unknown.
 const (
 	KeywordHasAttachment   imap.Flag = "$hasattachment"
 	KeywordHasNoAttachment imap.Flag = "$hasnoattachment"
 )
 
-// AttachmentKeyword returns the RFC 9979 §4 keyword for a message with body
-// structure bs, or false when the structure cannot tell: it is missing or
-// malformed, or the content is encrypted (multipart/encrypted, S/MIME
-// application/pkcs7-mime), so the server never sees the parts inside.
+// AttachmentKeyword returns the RFC 9979 §4 keyword for the raw message, or
+// false when its attachment status is unknown. A found attachment settles the
+// answer even next to an unreadable part; absence requires a complete MIME walk.
+// Unlike BODYSTRUCTURE, the raw headers retain RFC 2231 filenames in any charset
+// and the walk cannot mistake the extractor's synthetic children for real ones.
 //
 // A part is an attachment when it:
 //   - has Content-Disposition: attachment, or
@@ -29,11 +26,8 @@ const (
 //
 // Signature parts (S/MIME and OpenPGP) are never attachments, though mailers
 // often give them a disposition and a filename such as smime.p7s.
-func AttachmentKeyword(bs imap.BodyStructure) (imap.Flag, bool) {
-	if bs == nil || ValidateBodyStructure(&bs) != nil {
-		return "", false
-	}
-	switch hasAttachment(bs, false) {
+func AttachmentKeyword(data []byte) (imap.Flag, bool) {
+	switch attachmentInMessage(data) {
 	case attachmentFound:
 		return KeywordHasAttachment, true
 	case attachmentNone:
@@ -50,53 +44,3 @@ const (
 	attachmentUnknown
 	attachmentFound
 )
-
-func hasAttachment(bs imap.BodyStructure, inRelated bool) attachmentResult {
-	switch part := bs.(type) {
-	case *imap.BodyStructureMultiPart:
-		subtype := strings.ToLower(part.Subtype)
-		if subtype == "encrypted" {
-			return attachmentUnknown
-		}
-		// A disposition on a multipart applies to the whole entity (RFC 2183
-		// §2.9), for example an attached HTML document with related images.
-		if d := part.Disposition(); d != nil {
-			if strings.EqualFold(d.Value, "attachment") || (!inRelated && d.Params["filename"] != "") {
-				return attachmentFound
-			}
-		}
-		if !inRelated && part.Extended != nil && part.Extended.Params["name"] != "" {
-			return attachmentFound
-		}
-		inRelated = inRelated || subtype == "related"
-		result := attachmentNone
-		for _, child := range part.Children {
-			switch hasAttachment(child, inRelated) {
-			case attachmentFound:
-				// A found attachment settles it, even next to an unreadable part.
-				return attachmentFound
-			case attachmentUnknown:
-				result = attachmentUnknown
-			}
-		}
-		return result
-	case *imap.BodyStructureSinglePart:
-		switch part.MediaType() {
-		case "application/pkcs7-signature", "application/x-pkcs7-signature", "application/pgp-signature":
-			return attachmentNone
-		case "application/pkcs7-mime", "application/x-pkcs7-mime":
-			return attachmentUnknown
-		case "message/rfc822", "message/global":
-			return attachmentFound
-		}
-		if d := part.Disposition(); d != nil && strings.EqualFold(d.Value, "attachment") {
-			return attachmentFound
-		}
-		if !inRelated && part.Filename() != "" {
-			return attachmentFound
-		}
-		return attachmentNone
-	default:
-		return attachmentUnknown
-	}
-}

@@ -1,12 +1,10 @@
 package helpers
 
 import (
-	"bytes"
 	"strings"
 	"testing"
 
 	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
 )
 
 // mime joins header and body lines with CRLF.
@@ -218,8 +216,7 @@ func TestAttachmentKeyword(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			bs := imapserver.ExtractBodyStructure(bytes.NewReader([]byte(tt.msg)))
-			got, ok := AttachmentKeyword(bs)
+			got, ok := AttachmentKeyword([]byte(tt.msg))
 			if tt.want == skip {
 				if ok {
 					t.Errorf("AttachmentKeyword = %q, want undecided", got)
@@ -237,9 +234,8 @@ func TestAttachmentKeyword_Undecidable(t *testing.T) {
 	if kw, ok := AttachmentKeyword(nil); ok {
 		t.Errorf("AttachmentKeyword(nil) = %q, want undecided", kw)
 	}
-	// A multipart with no children fails ValidateBodyStructure: it says nothing
-	// about the message.
-	if kw, ok := AttachmentKeyword(&imap.BodyStructureMultiPart{Subtype: "mixed"}); ok {
+	// A multipart with no readable children says nothing about attachments.
+	if kw, ok := AttachmentKeyword([]byte("Content-Type: multipart/mixed; boundary=b\r\n\r\n--b--\r\n")); ok {
 		t.Errorf("AttachmentKeyword(empty multipart) = %q, want undecided", kw)
 	}
 }

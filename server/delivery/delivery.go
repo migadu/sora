@@ -206,34 +206,10 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// Calculate content hash
 	contentHash := helpers.HashContent(messageBytes)
 
-	// Extract body structure
-	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(messageBytes))
-	bodyStructure := &bodyStructureVal
-
-	// RFC 9979 §4: the server sets $hasattachment or $hasnoattachment on
-	// delivery. The extractor can return a synthetic or partial tree after a
-	// MIME error, so validate the raw structure before deciding anything.
-	classifiedBS := bodyStructureVal
-	if helpers.ValidateMIMEStructure(messageBytes) != nil {
-		classifiedBS = nil
-	}
-	deliveryFlags := db.WithAttachmentKeyword(sieveFlags, classifiedBS, true)
-
-	// Validate body structure to prevent panics during FETCH BODYSTRUCTURE
-	if err := helpers.ValidateBodyStructure(bodyStructure); err != nil {
-		// Log the validation error but create a safe fallback body structure
-		d.Logger.Log("Invalid body structure detected, using fallback: %v", err)
-		// Create a minimal valid body structure
-		fallback := &imap.BodyStructureSinglePart{
-			Type:     "text",
-			Subtype:  "plain",
-			Size:     uint32(len(messageBytes)),
-			Extended: &imap.BodyStructureSinglePartExt{}, // Always populate Extended to match imapserver.ExtractBodyStructure behavior
-			Text:     &imap.BodyStructureText{},          // body-fld-lines is mandatory for a text part
-		}
-		var fallbackBS imap.BodyStructure = fallback
-		bodyStructure = &fallbackBS
-	}
+	// The stored BODYSTRUCTURE and the attachment classification both describe
+	// the final bytes, but classification never uses an extractor fallback.
+	bodyStructure := d.extractBodyStructure(messageBytes)
+	deliveryFlags := db.WithAttachmentKeyword(sieveFlags, messageBytes, true)
 
 	// Extract recipients
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
@@ -274,7 +250,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// pending_uploads row can never name a file that is not staged yet - the uploader
 	// treats a missing local file as permanently lost content.
 	if copyMailbox != "" {
-		err := d.SaveMessageToMailbox(d.Ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, sieveFlags)
+		err := d.saveMessageToMailbox(d.Ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, deliveryFlags, contentHash, bodyStructure)
 		// A duplicate copy is an accepted delivery, as it is in LMTP: the copy is
 		// already in the mailbox, so a resubmission must not fail the delivery.
 		if err != nil && !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -512,7 +488,29 @@ func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient Reci
 // flags carries any keywords/flags set by the Sieve script (imap4flags, RFC 5232).
 func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient RecipientInfo, mailboxName string, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string, flags []imap.Flag) error {
 	contentHash := helpers.HashContent(messageBytes)
+	bodyStructure := d.extractBodyStructure(messageBytes)
+	flags = db.WithAttachmentKeyword(flags, messageBytes, true)
+	return d.saveMessageToMailbox(ctx, recipient, mailboxName, messageBytes, messageEntity, plaintextBody, flags, contentHash, bodyStructure)
+}
 
+// extractBodyStructure applies the same serialization fallback to direct saves
+// and DeliverMessage. A fileinto :copy reuses this already validated structure.
+func (d *DeliveryContext) extractBodyStructure(messageBytes []byte) *imap.BodyStructure {
+	bs := imapserver.ExtractBodyStructure(bytes.NewReader(messageBytes))
+	if err := helpers.ValidateBodyStructure(&bs); err != nil {
+		d.Logger.Log("Invalid body structure detected, using fallback: %v", err)
+		bs = &imap.BodyStructureSinglePart{
+			Type:     "text",
+			Subtype:  "plain",
+			Size:     uint32(len(messageBytes)),
+			Extended: &imap.BodyStructureSinglePartExt{},
+			Text:     &imap.BodyStructureText{},
+		}
+	}
+	return &bs
+}
+
+func (d *DeliveryContext) saveMessageToMailbox(ctx context.Context, recipient RecipientInfo, mailboxName string, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string, flags []imap.Flag, contentHash string, bodyStructure *imap.BodyStructure) error {
 	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash)
 	if err != nil {
 		return err
@@ -530,12 +528,6 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 		sentDate = time.Now()
 	}
 
-	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(messageBytes))
-	bodyStructure := &bodyStructureVal
-	classifiedBS := bodyStructureVal
-	if helpers.ValidateMIMEStructure(messageBytes) != nil {
-		classifiedBS = nil
-	}
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
 
 	size := int64(len(messageBytes))
@@ -559,7 +551,7 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 			References:    references,
 			BodyStructure: bodyStructure,
 			Recipients:    recipients,
-			Flags:         db.WithAttachmentKeyword(flags, classifiedBS, true), // as in DeliverMessage
+			Flags:         flags,
 			FTSRetention:  d.FTSRetention,
 		},
 		db.PendingUpload{

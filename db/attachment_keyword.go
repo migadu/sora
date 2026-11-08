@@ -8,11 +8,11 @@ import (
 	"github.com/migadu/sora/helpers"
 )
 
-// WithAttachmentKeyword returns the flags to store for a new message with body
-// structure bs, with the RFC 9979 §4 attachment keyword set by the server
+// WithAttachmentKeyword returns the flags to store for the raw message data,
+// with the RFC 9979 §4 attachment keyword set by the server
 // (see helpers.AttachmentKeyword).
 //
-// On delivery (override), the server's answer replaces any attachment keyword
+// On delivery (override), a known server result replaces any attachment keyword
 // a Sieve script set: RFC 9979 §4 has the server set it "during message
 // delivery". On APPEND (!override) the client's own keyword is kept, and the
 // server only fills in one when the client set neither, or both, which §4
@@ -21,10 +21,10 @@ import (
 // The keyword is only added while the message has room under
 // MaxCustomKeywordsPerMessage, so it never pushes out a keyword the client or
 // script set, and never turns an APPEND into a [LIMIT] refusal.
-func WithAttachmentKeyword(flags []imap.Flag, bs imap.BodyStructure, override bool) []imap.Flag {
+func WithAttachmentKeyword(flags []imap.Flag, data []byte, override bool) []imap.Flag {
 	has := slices.ContainsFunc(flags, isHasAttachmentKeyword)
 	hasNo := slices.ContainsFunc(flags, isHasNoAttachmentKeyword)
-	keyword, known := helpers.AttachmentKeyword(bs)
+	keyword, known := helpers.AttachmentKeyword(data)
 
 	if known && (override || has == hasNo) {
 		flags = slices.DeleteFunc(slices.Clone(flags), isAttachmentKeyword)

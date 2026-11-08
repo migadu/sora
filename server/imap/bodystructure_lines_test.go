@@ -60,7 +60,7 @@ func TestExtractBodyStructureSafeLineCount(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			bs, _ := extractBodyStructureSafe([]byte(tc.data))
+			bs := extractBodyStructureSafe([]byte(tc.data))
 			if bs == nil {
 				t.Fatal("extractBodyStructureSafe() = nil")
 			}
@@ -80,7 +80,7 @@ func TestExtractBodyStructureSafePanic(t *testing.T) {
 	}
 	defer func() { extractBodyStructure = orig }()
 
-	bs, _ := extractBodyStructureSafe([]byte("whatever"))
+	bs := extractBodyStructureSafe([]byte("whatever"))
 	if bs == nil {
 		t.Fatal("extractBodyStructureSafe() = nil, want the fallback structure")
 	}
@@ -93,7 +93,7 @@ func TestExtractBodyStructureSafeNil(t *testing.T) {
 	extractBodyStructure = func(io.Reader) imap.BodyStructure { return nil }
 	defer func() { extractBodyStructure = orig }()
 
-	bs, _ := extractBodyStructureSafe([]byte("whatever"))
+	bs := extractBodyStructureSafe([]byte("whatever"))
 	if bs == nil {
 		t.Fatal("extractBodyStructureSafe() = nil, want the fallback structure")
 	}

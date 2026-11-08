@@ -10,25 +10,14 @@ import (
 )
 
 func TestWithAttachmentKeyword(t *testing.T) {
-	withPDF := &imap.BodyStructureMultiPart{
-		Subtype: "mixed",
-		Children: []imap.BodyStructure{
-			&imap.BodyStructureSinglePart{Type: "text", Subtype: "plain"},
-			&imap.BodyStructureSinglePart{
-				Type: "application", Subtype: "pdf",
-				Extended: &imap.BodyStructureSinglePartExt{
-					Disposition: &imap.BodyStructureDisposition{Value: "attachment"},
-				},
-			},
-		},
-	}
-	plain := &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain"}
+	withPDF := []byte("Content-Type: application/pdf\r\nContent-Disposition: attachment\r\n\r\nPDF")
+	plain := []byte("Content-Type: text/plain\r\n\r\nbody")
 	has, hasNo := helpers.KeywordHasAttachment, helpers.KeywordHasNoAttachment
 
 	tests := []struct {
 		name     string
 		flags    []imap.Flag
-		bs       imap.BodyStructure
+		data     []byte
 		override bool
 		want     []imap.Flag
 	}{
@@ -42,7 +31,7 @@ func TestWithAttachmentKeyword(t *testing.T) {
 	}
 	for _, tt := range tests {
 		in := slices.Clone(tt.flags)
-		got := WithAttachmentKeyword(tt.flags, tt.bs, tt.override)
+		got := WithAttachmentKeyword(tt.flags, tt.data, tt.override)
 		if !slices.Equal(got, tt.want) {
 			t.Errorf("%s: got %v, want %v", tt.name, got, tt.want)
 		}
@@ -53,7 +42,7 @@ func TestWithAttachmentKeyword(t *testing.T) {
 }
 
 func TestWithAttachmentKeyword_KeywordCap(t *testing.T) {
-	plain := &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain"}
+	plain := []byte("Content-Type: text/plain\r\n\r\nbody")
 	full := make([]imap.Flag, 0, MaxCustomKeywordsPerMessage)
 	for i := 0; i < MaxCustomKeywordsPerMessage; i++ {
 		full = append(full, imap.Flag(fmt.Sprintf("kw%d", i)))
