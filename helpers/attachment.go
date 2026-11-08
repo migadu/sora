@@ -19,7 +19,7 @@ const (
 // malformed, or the content is encrypted (multipart/encrypted, S/MIME
 // application/pkcs7-mime), so the server never sees the parts inside.
 //
-// A part is an attachment when it is a leaf part that:
+// A part is an attachment when it:
 //   - has Content-Disposition: attachment, or
 //   - has a filename (Content-Disposition filename, else Content-Type name),
 //     outside multipart/related. That counts Apple Mail's inline-disposition
@@ -57,6 +57,16 @@ func hasAttachment(bs imap.BodyStructure, inRelated bool) attachmentResult {
 		subtype := strings.ToLower(part.Subtype)
 		if subtype == "encrypted" {
 			return attachmentUnknown
+		}
+		// A disposition on a multipart applies to the whole entity (RFC 2183
+		// §2.9), for example an attached HTML document with related images.
+		if d := part.Disposition(); d != nil {
+			if strings.EqualFold(d.Value, "attachment") || (!inRelated && d.Params["filename"] != "") {
+				return attachmentFound
+			}
+		}
+		if !inRelated && part.Extended != nil && part.Extended.Params["name"] != "" {
+			return attachmentFound
 		}
 		inRelated = inRelated || subtype == "related"
 		result := attachmentNone

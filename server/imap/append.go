@@ -44,8 +44,8 @@ var extractBodyStructure = imapserver.ExtractBodyStructure
 // extractBodyStructureSafe wraps imapserver.ExtractBodyStructure with panic recovery and validation.
 // Returns a default body structure if extraction fails or structure is invalid (e.g., multipart with no children).
 // The result is never nil: callers store it and later serialize it, and a nil
-// body structure panics the FETCH write path. parsed is false when the result
-// is that default, which says nothing about the message.
+// body structure panics the FETCH write path. parsed is false after any MIME
+// parse failure, including a synthetic fallback inside the underlying extractor.
 func extractBodyStructureSafe(data []byte) (result imap.BodyStructure, parsed bool) {
 	// Named results: a bare recover() leaves an unnamed result at its zero value,
 	// so a panic here would have returned the nil this function exists to avoid.
@@ -64,7 +64,7 @@ func extractBodyStructureSafe(data []byte) (result imap.BodyStructure, parsed bo
 		// Invalid structure (e.g., multipart with no children), use default
 		return fallbackBodyStructure(), false
 	}
-	return bs, true
+	return bs, helpers.ValidateMIMEStructure(data) == nil
 }
 
 // errAppendLiteralTooLarge marks an APPEND refused because the literal does not fit the

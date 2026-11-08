@@ -1264,7 +1264,7 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailboxName stri
 
 	// RFC 9979 §4: the server sets $hasattachment or $hasnoattachment on delivery.
 	var classifiedBS imap.BodyStructure
-	if bodyStructure != nil {
+	if bodyStructure != nil && helpers.ValidateMIMEStructure(fullMessageBytes) == nil {
 		classifiedBS = *bodyStructure
 	}
 	flags = db.WithAttachmentKeyword(flags, classifiedBS, true)

@@ -211,9 +211,13 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	bodyStructure := &bodyStructureVal
 
 	// RFC 9979 §4: the server sets $hasattachment or $hasnoattachment on
-	// delivery. Decided from the parsed structure, not the fallback below: one
-	// that fails validation decides nothing (see helpers.AttachmentKeyword).
-	deliveryFlags := db.WithAttachmentKeyword(sieveFlags, bodyStructureVal, true)
+	// delivery. The extractor can return a synthetic or partial tree after a
+	// MIME error, so validate the raw structure before deciding anything.
+	classifiedBS := bodyStructureVal
+	if helpers.ValidateMIMEStructure(messageBytes) != nil {
+		classifiedBS = nil
+	}
+	deliveryFlags := db.WithAttachmentKeyword(sieveFlags, classifiedBS, true)
 
 	// Validate body structure to prevent panics during FETCH BODYSTRUCTURE
 	if err := helpers.ValidateBodyStructure(bodyStructure); err != nil {
@@ -528,6 +532,10 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 
 	bodyStructureVal := imapserver.ExtractBodyStructure(bytes.NewReader(messageBytes))
 	bodyStructure := &bodyStructureVal
+	classifiedBS := bodyStructureVal
+	if helpers.ValidateMIMEStructure(messageBytes) != nil {
+		classifiedBS = nil
+	}
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
 
 	size := int64(len(messageBytes))
@@ -551,7 +559,7 @@ func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient Re
 			References:    references,
 			BodyStructure: bodyStructure,
 			Recipients:    recipients,
-			Flags:         db.WithAttachmentKeyword(flags, bodyStructureVal, true), // as in DeliverMessage
+			Flags:         db.WithAttachmentKeyword(flags, classifiedBS, true), // as in DeliverMessage
 			FTSRetention:  d.FTSRetention,
 		},
 		db.PendingUpload{
