@@ -44,6 +44,7 @@ type CacheEntry struct {
 	RemoteUseProxyProtocol bool
 	RemoteUseIDCommand     bool
 	RemoteUseXCLIENT       bool
+	RemoteUseUTF8          bool // POP3: mirror a client's pre-auth UTF8 to the backend
 
 	// Metadata
 	Result           AuthResult

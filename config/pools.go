@@ -34,6 +34,9 @@ type PoolConfig struct {
 	RemoteUseIDCommand     bool  `toml:"remote_use_id_command"` // IMAP only
 	RemoteUseXCLIENT       bool  `toml:"remote_use_xclient"`    // POP3/LMTP only
 	RemoteUseUTF8          bool  `toml:"remote_use_utf8"`       // POP3 only; sora backends only
+	// RemoteTLSCAFile is a PEM file of CA certificates this pool's backends are verified
+	// against (private-CA or self-signed backends), on every proxy; empty = system roots.
+	RemoteTLSCAFile string `toml:"remote_tls_ca_file"`
 }
 
 // GetRemoteTLSVerify returns whether backend certificates are verified (default true).
@@ -126,6 +129,9 @@ func (c *Config) ValidatePools() error {
 		}
 		if p.RemoteTLSUseStartTLS && !p.RemoteTLS {
 			return fmt.Errorf("[[pool]] %q: remote_tls_use_starttls = true needs remote_tls = true", p.Name)
+		}
+		if p.RemoteTLSCAFile != "" && !p.RemoteTLS {
+			return fmt.Errorf("[[pool]] %q: remote_tls_ca_file needs remote_tls = true", p.Name)
 		}
 		if p.Default {
 			defaults++

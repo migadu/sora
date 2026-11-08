@@ -2,9 +2,21 @@ package userapiproxy
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
+	"fmt"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -283,5 +295,113 @@ func TestUserAPIProxy_LoginRoutedByTheUserTheBackendSees(t *testing.T) {
 	login(handler, `{"email":"user@example.com","password":"x"} trailing`)
 	if asked := lookup.asked(); len(asked) != 1 || asked[0] != "user@example.com" {
 		t.Fatalf("lookup asked for %v, want the login's user", asked)
+	}
+}
+
+// A pool's remote_tls_ca_file verifies its backends on the User API proxy too: a
+// private-CA backend is reachable with verification on, and only in the pool that trusts
+// its CA.
+func TestUserAPIProxy_PoolCAFileVerifiesItsBackend(t *testing.T) {
+	b := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	t.Cleanup(b.Close)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: b.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	addr := strings.TrimPrefix(b.URL, "https://")
+	// Every httptest TLS server shares one built-in certificate: the stranger gets its own.
+	other := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	other.TLS = &tls.Config{Certificates: []tls.Certificate{selfSignedCert(t)}}
+	other.StartTLS()
+	t.Cleanup(other.Close)
+
+	pools := []proxy.PoolSpec{
+		{Name: "private", Backends: []string{addr}, Settings: proxy.BackendSettings{TLS: true, TLSVerify: true, TLSCAFile: caFile}},
+		// Same CA file, but a backend with another certificate: not trusted.
+		{Name: "stranger", Backends: []string{strings.TrimPrefix(other.URL, "https://")}, Settings: proxy.BackendSettings{TLS: true, TLSVerify: true, TLSCAFile: caFile}},
+	}
+	if code := login(newPoolsHTTPProxy(t, ServerOptions{Pools: pools}, poolAnswer("private")), `{"email":"user@example.com"}`); code != http.StatusTeapot {
+		t.Fatalf("pool trusting its backend's CA: status %d, want the backend's 418", code)
+	}
+	if code := login(newPoolsHTTPProxy(t, ServerOptions{Pools: pools}, poolAnswer("stranger")), `{"email":"user@example.com"}`); code != http.StatusBadGateway {
+		t.Fatalf("pool whose CA did not sign its backend: status %d, want 502", code)
+	}
+}
+
+// selfSignedCert is a fresh certificate for 127.0.0.1 that no CA file in these tests holds.
+func selfSignedCert(t *testing.T) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: "stranger"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+// A pool backend configured by hostname is verified by that name on the User API proxy
+// too, although the proxy dials the address it resolved to: a certificate issued only for
+// the name is accepted, with the pool's CA file.
+func TestUserAPIProxy_HostnamePoolBackendIsVerifiedByItsName(t *testing.T) {
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test CA"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCert, _ := x509.ParseCertificate(caDER)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	leafKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leafTmpl := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "backend"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		DNSNames: []string{"localhost"}, KeyUsage: x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", ":0") // every local address: "localhost" may resolve to either family
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	b.Listener.Close()
+	b.Listener = ln
+	b.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{leafDER}, PrivateKey: leafKey}}}
+	b.StartTLS()
+	t.Cleanup(b.Close)
+	backend := net.JoinHostPort("localhost", fmt.Sprint(ln.Addr().(*net.TCPAddr).Port))
+
+	pools := []proxy.PoolSpec{{Name: "named", Backends: []string{backend}, Default: true,
+		Settings: proxy.BackendSettings{TLS: true, TLSVerify: true, TLSCAFile: caFile}}}
+	if code := login(newPoolsHTTPProxy(t, ServerOptions{Pools: pools}, poolAnswer("named")), `{"email":"user@example.com"}`); code != http.StatusTeapot {
+		t.Fatalf("hostname pool backend with a certificate for its name: status %d, want the backend's 418", code)
 	}
 }

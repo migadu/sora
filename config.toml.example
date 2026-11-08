@@ -1424,6 +1424,12 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # members of that backend's pool (or, in no pool, the default pool), and refused when
 # none is left; the pin takes the user back when maintenance ends.
 #
+# TLS to a pool member is verified against that pool's remote_tls_ca_file (system roots
+# without one), on every proxy and however routing reached it (a lookup pin to a member
+# too); a [[server]] remote_tls_ca_file covers only backends in no pool. A backend
+# configured by hostname is verified by that name, although it is dialed at an address
+# the name resolved to; a certificate issued for the address is accepted as well.
+#
 # ROLLOUT: deploy the [[pool]] config on every proxy BEFORE the lookup API starts
 # answering with "pool". A proxy still on remote_addrs ignores the field (with a
 # warning) and routes the user into remote_addrs. Keep default = true on the old pool
@@ -1440,6 +1446,7 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # remote_tls = false
 # remote_tls_use_starttls = false       # LMTP/ManageSieve; IMAP/POP3/User API always use implicit TLS when remote_tls = true
 # remote_tls_verify = true
+# remote_tls_ca_file = "/etc/sora/sora0-ca.pem"  # private-CA / self-signed backends; default: system roots
 #
 # [[pool]]
 # name = "sora1"
@@ -1933,7 +1940,7 @@ tls_verify = true
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
 remote_tls_verify = true              # Verify backend server TLS certificates
-# remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots. POP3 proxy only for now.
+# remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots. POP3 proxy only, and only for backends in no [[pool]] (a pool member uses its pool's remote_tls_ca_file).
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
 remote_use_utf8 = false               # Advertise UTF8/LANG (RFC 6856) in the proxy's pre-auth CAPA and mirror

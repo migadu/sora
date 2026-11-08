@@ -804,17 +804,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 			s.accountID = cached.AccountID
 			s.isRemoteLookupAccount = cached.FromRemoteLookup
-			s.routingInfo = &proxy.UserRoutingInfo{
-				AccountID:              cached.AccountID,
-				ServerAddress:          cached.ServerAddress,
-				PoolName:               cached.PoolName,
-				IsRemoteLookupAccount:  cached.FromRemoteLookup, // CRITICAL: Prevents fallback to other backends
-				RemoteTLS:              cached.RemoteTLS,
-				RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
-				RemoteTLSVerify:        cached.RemoteTLSVerify,
-				RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
-				RemoteUseXCLIENT:       cached.RemoteUseXCLIENT,
-			}
+			// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
+			// its enforcement and every backend-leg setting the lookup answer carried.
+			s.routingInfo = proxy.RouteFromCache(cached)
 
 			if cached.ActualEmail != "" {
 				s.username = cached.ActualEmail
@@ -894,19 +886,12 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			// Cache positive result (routing info found)
 			// Cache key is originalAddress (BaseAddress of submitted recipient)
 			// Store ActualEmail if remotelookup resolved to a different address
-			s.server.lookupCache.Set(s.server.name, originalAddress, &lookupcache.CacheEntry{
-				AccountID:              routingInfo.AccountID,
-				ActualEmail:            resolvedEmail, // Store resolved email for cache hits
-				ServerAddress:          routingInfo.ServerAddress,
-				PoolName:               routingInfo.PoolName,
-				RemoteTLS:              routingInfo.RemoteTLS,
-				RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
-				RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
-				RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
-				RemoteUseXCLIENT:       routingInfo.RemoteUseXCLIENT,
-				Result:                 lookupcache.AuthSuccess,
-				FromRemoteLookup:       true,
-			})
+			entry := &lookupcache.CacheEntry{
+				ActualEmail: resolvedEmail, // Store resolved email for cache hits
+				Result:      lookupcache.AuthSuccess,
+			}
+			proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
+			s.server.lookupCache.Set(s.server.name, originalAddress, entry)
 
 			// Single consolidated log for lookup success
 			duration := time.Since(lookupStart)
@@ -1196,25 +1181,14 @@ func (s *Session) connectToBackend() error {
 	if s.routingInfo.UsesRouteSettings(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
 		// The route specified StartTLS (for the backend the lookup named or its pool picked, as for the dial)
 		shouldUseStartTLS = true
-		tlsConfig = s.server.connManager.BackendTLSConfig(s.routingInfo.RemoteTLSVerify)
+		tlsConfig = s.server.connManager.BackendClientTLS(s.routingInfo.RemoteTLSVerify, actualAddr)
 		s.DebugLog("Using remotelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
 	} else if !s.routingInfo.PoolRouted() && s.server.connManager.IsRemoteStartTLS() {
 		// Global proxy config specified StartTLS. A pool's own settings are authoritative:
 		// a pool without remote_tls_use_starttls never inherits the server's.
 		shouldUseStartTLS = true
-		tlsConfig = s.server.connManager.GetTLSConfig()
+		tlsConfig = s.server.connManager.GetTLSConfig(actualAddr)
 		s.DebugLog("Using global StartTLS settings")
-	}
-
-	// Set ServerName so tls.Client verifies the backend certificate hostname. Without it,
-	// DNSName is empty and Go verifies only the chain (not the host), so remote_tls_verify=true
-	// would still let any CA-valid cert MITM the proxy->backend leg. Derive it from the address
-	// we actually connected to (the configured backend hostname; both tls.Config values here are
-	// per-connection, safe to mutate).
-	if tlsConfig != nil && tlsConfig.ServerName == "" {
-		if host, _, splitErr := net.SplitHostPort(actualAddr); splitErr == nil && host != "" {
-			tlsConfig.ServerName = host
-		}
 	}
 
 	if shouldUseStartTLS && tlsConfig != nil {

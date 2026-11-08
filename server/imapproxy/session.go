@@ -806,17 +806,10 @@ func (s *Session) authenticateUser(username, password string) error {
 
 				s.accountID = cached.AccountID
 				s.isRemoteLookupAccount = cached.FromRemoteLookup
-				s.routingInfo = &proxy.UserRoutingInfo{
-					AccountID:              cached.AccountID,
-					ServerAddress:          cached.ServerAddress,
-					PoolName:               cached.PoolName,
-					RemoteTLS:              cached.RemoteTLS,
-					RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
-					RemoteTLSVerify:        cached.RemoteTLSVerify,
-					RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
-					RemoteUseIDCommand:     cached.RemoteUseIDCommand,
-					ClientConn:             s.clientConn, // Always set current client connection for JA4
-				}
+				// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
+				// its enforcement and every backend-leg setting the lookup answer carried.
+				s.routingInfo = proxy.RouteFromCache(cached)
+				s.routingInfo.ClientConn = s.clientConn // Always set current client connection for JA4
 				// If cache has ActualEmail (e.g., "user@example.com" for "user@TOKEN"), use it
 				// Otherwise fall back to submitted username
 				if cached.ActualEmail != "" {
@@ -1026,21 +1019,14 @@ func (s *Session) authenticateUser(username, password string) error {
 				// CRITICAL: Cache key is submitted username (e.g., "user@TOKEN")
 				// BUT store ActualEmail so cache hits can use the resolved address
 				// This allows token-based auth to work correctly on cache hits
-				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-					AccountID:              routingInfo.AccountID,
-					PasswordDigest:         lookupcache.NewPasswordDigest(password),
-					ActualEmail:            resolvedEmail, // Store resolved email for cache hits
-					ServerAddress:          routingInfo.ServerAddress,
-					PoolName:               routingInfo.PoolName,
-					RemoteTLS:              routingInfo.RemoteTLS,
-					RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
-					RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
-					RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
-					RemoteUseIDCommand:     routingInfo.RemoteUseIDCommand,
-					Result:                 lookupcache.AuthSuccess,
-					FromRemoteLookup:       true,
-					IsNegative:             false,
-				})
+				entry := &lookupcache.CacheEntry{
+					PasswordDigest: lookupcache.NewPasswordDigest(password),
+					ActualEmail:    resolvedEmail, // Store resolved email for cache hits
+					Result:         lookupcache.AuthSuccess,
+					IsNegative:     false,
+				}
+				proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
+				s.server.lookupCache.Set(s.server.name, username, entry)
 
 				// Single consolidated log for authentication success
 				method := "remotelookup"

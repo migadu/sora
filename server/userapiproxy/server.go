@@ -78,7 +78,8 @@ type Server struct {
 
 	// Shared HTTP transport (prevents connection pool leaks), verifying backend certificates
 	// as the server's remote_tls_verify says. transports holds one per verify setting, so a
-	// named pool's own remote_tls_verify is honored per route (proxyRequest).
+	// route's own remote_tls_verify is honored (proxyRequest); the roots and name follow the
+	// backend dialed (proxy.BackendClientTLS).
 	transport  *http.Transport
 	transports map[bool]*http.Transport
 
@@ -255,13 +256,27 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		}
 		return conn, nil
 	}
+	// The TLS leg is set up here rather than by the transport, with the connection
+	// manager's config for the address dialed (proxy.BackendClientTLS): a pool member is
+	// verified against its pool's CA file, and by the name it was configured with although
+	// the transport dials the address that name resolved to.
 	newTransport := func(verify bool) *http.Transport {
 		return &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: !verify,
-				Renegotiation:      tls.RenegotiateNever,
+			DialContext: dialBackend,
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := dialBackend(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				tlsConn := tls.Client(conn, connManager.BackendClientTLS(verify, addr))
+				handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
+					conn.Close()
+					return nil, err
+				}
+				return tlsConn, nil
 			},
-			DialContext:           dialBackend,
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   10,
 			IdleConnTimeout:       90 * time.Second,
@@ -612,9 +627,10 @@ func (s *Server) serverRoute(addr string) backendRoute {
 	return backendRoute{addr: addr, tls: s.remoteTLS, tlsVerify: s.remoteTLSVerify, proxyProtocol: s.remoteUseProxyProtocol}
 }
 
-// transportFor is the shared transport that checks backend certificates as verify says.
-func (s *Server) transportFor(verify bool) http.RoundTripper {
-	if t, ok := s.transports[verify]; ok {
+// transportFor is the shared transport that checks a route's backend certificate as the
+// route's remote_tls_verify says (roots and name follow the backend dialed).
+func (s *Server) transportFor(route backendRoute) http.RoundTripper {
+	if t, ok := s.transports[route.tlsVerify]; ok {
 		return t
 	}
 	return s.transport
@@ -815,7 +831,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 
 	// Create reverse proxy with shared transport (prevents connection pool leaks)
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Transport = s.transportFor(route.tlsVerify)
+	proxy.Transport = s.transportFor(route)
 
 	// Modify request. Capture the original Host BEFORE overwriting r.Host:
 	// the Host of an incoming request lives in r.Host, not in r.Header

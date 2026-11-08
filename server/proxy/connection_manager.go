@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -44,6 +46,9 @@ type backendPool struct {
 	named     bool // false for the unnamed pool a flat remote_addrs list becomes
 	isDefault bool
 	settings  BackendSettings
+	// rootCAs verifies the pool's backends (its TLSCAFile); nil = the system roots. Never
+	// the proxy server's own remote_tls_ca_file: a pool inherits nothing.
+	rootCAs *x509.CertPool
 	// configured is the normalized host:port list from config. resolved and ring are
 	// what the last DNS resolution made of it: rebuilt by install under cm.healthMu and
 	// read under it.
@@ -365,6 +370,13 @@ func newConnectionManager(specs []PoolSpec, named bool, remotePort int, connectT
 			return nil, fmt.Errorf("backend pool %q has no backends", spec.Name)
 		}
 		p := &backendPool{name: spec.Name, named: named, isDefault: spec.Default, settings: spec.Settings}
+		if spec.Settings.TLSCAFile != "" {
+			roots, err := loadCAFile(spec.Settings.TLSCAFile)
+			if err != nil {
+				return nil, fmt.Errorf("backend pool %q: remote_tls_ca_file: %w", spec.Name, err)
+			}
+			p.rootCAs = roots
+		}
 		for _, addr := range spec.Backends {
 			// Normalize remote addresses to include default port if missing
 			normalized := normalizeHostPort(addr, remotePort)
@@ -1092,6 +1104,92 @@ func (cm *ConnectionManager) SetRemoteTLSRootCAs(pool *x509.CertPool) {
 	cm.remoteTLSRootCAs = pool
 }
 
+// loadCAFile reads a PEM file of CA certificates; an unreadable file, or one without a
+// usable certificate, is an error (never a silent fallback to the system roots).
+func loadCAFile(path string) (*x509.CertPool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("%s contains no usable certificates", path)
+	}
+	return roots, nil
+}
+
+// BackendClientTLS is the client TLS config for a connection to the backend at addr, the
+// address actually dialed, on the implicit-TLS dial and for a STARTTLS upgrade alike:
+//   - the hardening of backendTLSConfig, verifying certificates when verify is set;
+//   - the roots: a member of a named pool is verified against its pool's remote_tls_ca_file
+//     (the system roots without one): a certificate belongs to the host, however routing
+//     reached it. Any other backend uses the server's remote_tls_ca_file (POP3) or the
+//     system roots;
+//   - the name: a pool or remote_addrs entry configured by hostname is dialed at an address
+//     the name resolved to, but the certificate is issued for the name. ServerName (SNI) is
+//     that name, and a certificate valid for the name or for the address dialed is accepted,
+//     so a backend whose certificate names only its address keeps working as before.
+func (cm *ConnectionManager) BackendClientTLS(verify bool, addr string) *tls.Config {
+	cfg := cm.backendTLSConfig(verify)
+	if name := cm.PoolOfBackend(addr); name != "" {
+		cfg.RootCAs = cm.poolsByName[name].rootCAs
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	names := append(cm.configuredHostnamesOf(addr), host)
+	cfg.ServerName = names[0]
+	if verify {
+		// Go's own check accepts only ServerName; this one is that check (chain to the
+		// roots, then the leaf's name) with any of names.
+		cfg.InsecureSkipVerify = true
+		cfg.VerifyConnection = verifyBackendCertificate(cfg.RootCAs, names)
+	}
+	return cfg
+}
+
+// configuredHostnamesOf returns the hostnames (not IP literals) of the configured backend
+// entries whose resolution produced addr.
+func (cm *ConnectionManager) configuredHostnamesOf(addr string) []string {
+	var hosts []string
+	for _, configured := range cm.configuredNamesOf(addr) {
+		h, _, err := net.SplitHostPort(configured)
+		if err != nil {
+			h = configured
+		}
+		if h != "" && net.ParseIP(strings.Trim(h, "[]")) == nil {
+			hosts = append(hosts, h)
+		}
+	}
+	return hosts
+}
+
+// verifyBackendCertificate verifies a backend's certificate chain against roots (nil = the
+// system roots) and accepts it if it is valid for any of names.
+func verifyBackendCertificate(roots *x509.CertPool, names []string) func(tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return errors.New("backend presented no certificate")
+		}
+		opts := x509.VerifyOptions{Roots: roots, Intermediates: x509.NewCertPool()}
+		for _, c := range cs.PeerCertificates[1:] {
+			opts.Intermediates.AddCert(c)
+		}
+		leaf := cs.PeerCertificates[0]
+		if _, err := leaf.Verify(opts); err != nil {
+			return err
+		}
+		var err error
+		for _, name := range names {
+			if err = leaf.VerifyHostname(name); err == nil {
+				return nil
+			}
+		}
+		return err
+	}
+}
+
 // backendTLSConfig builds the client TLS config for the proxy->backend leg.
 // Shared by the implicit-TLS dial paths and the STARTTLS upgrade path so the
 // hardening choices (no client certs, no renegotiation, TLS 1.2 floor, custom
@@ -1115,21 +1213,14 @@ func (cm *ConnectionManager) backendTLSConfig(verify bool) *tls.Config {
 	}
 }
 
-// BackendTLSConfig returns the client TLS config for a STARTTLS upgrade of the
-// proxy->backend leg negotiated at the protocol layer, with the same hardening and custom
-// roots the implicit-TLS dial uses. verify is per route: a lookup answer or a pool may
-// override remote_tls_verify.
-func (cm *ConnectionManager) BackendTLSConfig(verify bool) *tls.Config {
-	return cm.backendTLSConfig(verify)
-}
-
 // GetTLSConfig returns the TLS configuration for remote connections
 // Used for StartTLS negotiation at the protocol layer
-func (cm *ConnectionManager) GetTLSConfig() *tls.Config {
+// addr is the backend address actually connected to (see BackendClientTLS).
+func (cm *ConnectionManager) GetTLSConfig(addr string) *tls.Config {
 	if !cm.remoteTLS {
 		return nil
 	}
-	return cm.backendTLSConfig(cm.remoteTLSVerify)
+	return cm.BackendClientTLS(cm.remoteTLSVerify, addr)
 }
 
 // IsRemoteStartTLS returns whether remote connections should use StartTLS
@@ -1579,14 +1670,9 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 	// Only use implicit TLS if remoteTLS is enabled AND StartTLS is not being used
 	// When StartTLS is enabled, the protocol layer will handle the TLS upgrade
 	if cm.remoteTLS && !cm.remoteTLSUseStartTLS {
-		tlsConfig := cm.backendTLSConfig(cm.remoteTLSVerify)
-		// tls.Dial would infer ServerName from the dial target, but we dial the DNS-resolved
-		// IP (resolvedAddr), which would verify the cert against the IP rather than the
-		// configured backend hostname. Pin ServerName to the configured host so verification
-		// matches the cert's DNS SAN, consistent with the STARTTLS / proxy-protocol paths.
-		if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil && host != "" {
-			tlsConfig.ServerName = host
-		}
+		// Verified by the backend's configured name (or its address), not by the formatted
+		// dial target alone; see BackendClientTLS.
+		tlsConfig := cm.BackendClientTLS(cm.remoteTLSVerify, addr)
 		conn, err = tls.DialWithDialer(dialer, "tcp", resolvedAddr, tlsConfig)
 	} else {
 		// Plain connection (either no TLS, or TLS will be negotiated via StartTLS)
@@ -1709,15 +1795,10 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// Now establish TLS if required (only for implicit TLS, not StartTLS)
 	// When StartTLS is enabled, the protocol layer will handle TLS upgrade
 	if remoteTLS && !remoteTLSUseStartTLS {
-		tlsConfig := cm.backendTLSConfig(remoteTLSVerify)
-		// Verify the backend certificate against its configured hostname. tls.Client (unlike
-		// tls.Dial) does NOT infer ServerName, so without this it stays empty and Go verifies
-		// only the chain, not the host — remote_tls_verify=true would still let any CA-valid
-		// cert MITM the proxy->backend leg. Use `addr` (the configured backend address), not the
-		// DNS-resolved IP, so it matches the backend certificate's DNS SAN.
-		if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil && host != "" {
-			tlsConfig.ServerName = host
-		}
+		// The backend's name and roots come from addr: tls.Client (unlike tls.Dial) does not
+		// infer ServerName, and an empty one would verify only the chain, letting any CA-valid
+		// cert MITM the proxy->backend leg (BackendClientTLS always sets it).
+		tlsConfig := cm.BackendClientTLS(remoteTLSVerify, addr)
 		logger.Debug("Starting TLS handshake", "addr", addr, "InsecureSkipVerify", !remoteTLSVerify, "server_name", tlsConfig.ServerName)
 		tlsConn := tls.Client(conn, tlsConfig)
 
@@ -2089,11 +2170,45 @@ func (cm *ConnectionManager) routePool(params RouteParams, result *RouteResult) 
 	return pool, nil
 }
 
+// crossProtocolLister is implemented by the cluster affinity manager: every live affinity of
+// a user's other protocols, in the order GetBackendAcrossProtocols consults them.
+type crossProtocolLister interface {
+	CrossProtocolBackends(username, protocol string) (backends, protocols []string)
+}
+
+// crossProtocolInPool picks, among the user's affinities of other protocols, the first whose
+// host is a member of pool, resolved to this proxy's address for it. first is the one
+// GetBackendAcrossProtocols returned; the others are only known through crossProtocolLister.
+// An entry outside the pool is passed over, not deleted: it is that protocol's to correct when
+// it routes the user, and what looks outside the pool here may be the same host as another
+// node resolved it (the other address family), whose deletion would be cluster-wide.
+func crossProtocolInPool(params RouteParams, pool *backendPool, affinityMgr AffinityManager, firstAddr, firstProtocol string) (affAddr, protocol, target string, ok bool) {
+	backends, protocols := []string{firstAddr}, []string{firstProtocol}
+	if l, isLister := affinityMgr.(crossProtocolLister); isLister {
+		backends, protocols = l.CrossProtocolBackends(params.Username, params.Protocol)
+	}
+	for i, addr := range backends {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return addr, protocols[i], addr, true // checked against the pool by the caller
+		}
+		if local, found := params.ConnManager.poolBackendByHost(pool, host); found {
+			return addr, protocols[i], local, true
+		}
+		logger.Debug("Cross-protocol affinity host not in pool, passing over it",
+			"proxy", params.ProxyName, "user", params.Username, "pool", pool.name,
+			"affinity_addr", addr, "from_protocol", protocols[i])
+	}
+	return "", "", "", false
+}
+
 // resolveAffinityRoute attempts to find a healthy backend via affinity, including cross-protocol,
-// inside the given pool. An affinity that points outside the pool is deleted and the user is
+// inside the given pool. A same-protocol affinity outside the pool is deleted and the user is
 // routed afresh: that is how a user moved between pools by the lookup API lands in the new one.
-// If same-protocol affinity is stale (unhealthy), it deletes it and retries once to check
-// cross-protocol affinities from other protocols that may have already failed over.
+// A cross-protocol one outside the pool is passed over for the next (crossProtocolInPool), so a
+// stale entry of one protocol cannot mask the user's good entry of another. If same-protocol
+// affinity is stale (unhealthy), it deletes it and retries once to check cross-protocol
+// affinities from other protocols that may have already failed over.
 func resolveAffinityRoute(params RouteParams, pool *backendPool, affinityMgr AffinityManager) (preferredAddr, routingMethod string) {
 	cm := params.ConnManager
 
@@ -2106,19 +2221,13 @@ func resolveAffinityRoute(params RouteParams, pool *backendPool, affinityMgr Aff
 
 		targetAddr := lastAddr
 
-		// Cross-protocol: resolve hostname to this proxy's pool address
+		// Cross-protocol: the first of the user's other protocols' affinities inside the
+		// pool, resolved to this proxy's address for that host
 		if foundProtocol != params.Protocol {
-			host, _, err := net.SplitHostPort(lastAddr)
-			if err == nil {
-				if localAddr, ok := cm.poolBackendByHost(pool, host); ok {
-					targetAddr = localAddr
-				} else {
-					// Backend host not in the user's pool — skip this affinity entry
-					logger.Debug("Cross-protocol affinity host not in pool, skipping",
-						"proxy", params.ProxyName, "user", params.Username, "pool", pool.name,
-						"affinity_addr", lastAddr, "from_protocol", foundProtocol)
-					return "", ""
-				}
+			var ok bool
+			lastAddr, foundProtocol, targetAddr, ok = crossProtocolInPool(params, pool, affinityMgr, lastAddr, foundProtocol)
+			if !ok {
+				return "", ""
 			}
 		}
 

@@ -74,6 +74,10 @@ type BackendSettings struct {
 	UseIDCommand     bool // IMAP only
 	UseXCLIENT       bool // POP3/LMTP only
 	UseUTF8          bool // POP3 only
+	// TLSCAFile is a PEM file of CA certificates the pool's backends are verified against
+	// (private-CA or self-signed backends); "" = the system roots. Loaded once, when the
+	// manager is built.
+	TLSCAFile string
 }
 
 // PoolSpec is one named backend pool as a proxy server hands it to the connection
@@ -164,6 +168,7 @@ func PoolSpecsFromConfig(pools []config.PoolConfig) []PoolSpec {
 				UseIDCommand:     p.RemoteUseIDCommand,
 				UseXCLIENT:       p.RemoteUseXCLIENT,
 				UseUTF8:          p.RemoteUseUTF8,
+				TLSCAFile:        p.RemoteTLSCAFile,
 			},
 		})
 	}

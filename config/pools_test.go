@@ -401,3 +401,48 @@ remote_tls_use_starttls = true
 		})
 	}
 }
+
+// A pool's backends can be verified against a CA of its own (private-CA or self-signed
+// backends), declared in the pool block like every other backend-leg setting. It only means
+// something with remote_tls.
+func TestPoolsConfig_CAFile(t *testing.T) {
+	cfg, err := loadPoolsConfig(t, `
+[[pool]]
+name = "private"
+backends = ["10.0.0.1"]
+default = true
+remote_tls = true
+remote_tls_ca_file = "/etc/sora/private-ca.pem"
+
+[[pool]]
+name = "public"
+backends = ["10.0.1.1"]
+remote_tls = true
+`)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := cfg.Pools[0].RemoteTLSCAFile; got != "/etc/sora/private-ca.pem" {
+		t.Errorf("private pool CA file = %q", got)
+	}
+	if got := cfg.Pools[1].RemoteTLSCAFile; got != "" {
+		t.Errorf("public pool CA file = %q, want none", got)
+	}
+	if err := cfg.ValidatePools(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	cfg, err = loadPoolsConfig(t, `
+[[pool]]
+name = "plain"
+backends = ["10.0.0.1"]
+default = true
+remote_tls_ca_file = "/etc/sora/private-ca.pem"
+`)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if err := cfg.ValidatePools(); err == nil || !strings.Contains(err.Error(), "remote_tls_ca_file needs remote_tls = true") {
+		t.Fatalf("CA file without TLS: err = %v", err)
+	}
+}

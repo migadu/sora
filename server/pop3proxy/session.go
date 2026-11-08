@@ -200,15 +200,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 					s.accountID = cached.AccountID
 					s.isRemoteLookupAccount = cached.FromRemoteLookup
-					s.routingInfo = &proxy.UserRoutingInfo{
-						AccountID:              cached.AccountID,
-						ServerAddress:          cached.ServerAddress,
-						PoolName:               cached.PoolName,
-						RemoteTLS:              cached.RemoteTLS,
-						RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
-						RemoteTLSVerify:        cached.RemoteTLSVerify,
-						RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
-					}
+					// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
+					// its enforcement and every backend-leg setting the lookup answer carried.
+					s.routingInfo = proxy.RouteFromCache(cached)
 					if cached.ActualEmail != "" {
 						s.username = cached.ActualEmail
 					} else {
@@ -411,20 +405,14 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				// BUT store ActualEmail so cache hits can use the resolved address
 				// Always digest the password, even for master auth, to prevent cache bypass
 				if s.server.lookupCache != nil {
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-						AccountID:              routingInfo.AccountID,
-						PasswordDigest:         lookupcache.NewPasswordDigest(password),
-						ActualEmail:            resolvedEmail, // Store resolved email for cache hits
-						ServerAddress:          routingInfo.ServerAddress,
-						PoolName:               routingInfo.PoolName,
-						RemoteTLS:              routingInfo.RemoteTLS,
-						RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
-						RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
-						RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
-						Result:                 lookupcache.AuthSuccess,
-						FromRemoteLookup:       true,
-						IsNegative:             false,
-					})
+					entry := &lookupcache.CacheEntry{
+						PasswordDigest: lookupcache.NewPasswordDigest(password),
+						ActualEmail:    resolvedEmail, // Store resolved email for cache hits
+						Result:         lookupcache.AuthSuccess,
+						IsNegative:     false,
+					}
+					proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
+					s.server.lookupCache.Set(s.server.name, username, entry)
 				}
 
 				s.authenticated = true

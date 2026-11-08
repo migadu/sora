@@ -277,6 +277,29 @@ func (am *AffinityManager) GetBackendAcrossProtocols(username, protocol string) 
 	return "", "", false
 }
 
+// CrossProtocolBackends lists the user's live affinities for protocols other than
+// protocol, in the order GetBackendAcrossProtocols consults them (backends[i] was set by
+// protocols[i]). A proxy uses it to pass over an entry it cannot use (one outside the
+// user's backend pool) to the next, instead of stopping at the first.
+func (am *AffinityManager) CrossProtocolBackends(username, protocol string) (backends, protocols []string) {
+	if am == nil || !am.enabled {
+		return nil, nil
+	}
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	now := time.Now()
+	for _, proto := range []string{"imap", "pop3", "lmtp", "managesieve"} {
+		if proto == protocol {
+			continue
+		}
+		if info, exists := am.affinityMap[fmt.Sprintf("%s:%s", username, proto)]; exists && now.Before(info.ExpiresAt) {
+			backends = append(backends, info.Backend)
+			protocols = append(protocols, proto)
+		}
+	}
+	return backends, protocols
+}
+
 // SetBackend assigns a user to a backend and broadcasts to cluster
 func (am *AffinityManager) SetBackend(username, backend, protocol string) {
 	if am == nil || !am.enabled {
