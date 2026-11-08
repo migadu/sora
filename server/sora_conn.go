@@ -389,16 +389,8 @@ func (c *SoraConn) closeForTimeout(username, reason string, details ...any) {
 // closeTimeoutTransport bypasses TLS close_notify and wrapper cleanup, which
 // c.Close performs afterwards. Closing the innermost socket unblocks its I/O.
 func closeTimeoutTransport(conn net.Conn) {
-	for {
-		switch c := conn.(type) {
-		case interface{ Unwrap() net.Conn }:
-			conn = c.Unwrap()
-		case *tls.Conn:
-			conn = c.NetConn()
-		default:
-			conn.Close()
-			return
-		}
+	if raw := RawConn(conn); raw != nil {
+		raw.Close()
 	}
 }
 
