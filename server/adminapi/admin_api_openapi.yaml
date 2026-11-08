@@ -2359,6 +2359,12 @@ paths:
         - `a` (admin) - Administer ACL
 
         Use "anyone" as the identifier to grant access to all users in the same domain.
+
+        Only mailboxes in the shared namespace (e.g. "Shared/") carry grants, and only
+        to users in the owner's domain other than the owner, who always holds every
+        right; any other grant is refused with 400. A user may be named by any of
+        their addresses in the owner's domain, in any case; the entry is stored, and
+        listed, under their primary address.
       security:
         - ApiKeyAuth: []
       requestBody:
@@ -2409,7 +2415,13 @@ paths:
                     type: string
                     example: "lrs"
         '400':
-          description: Bad request - invalid parameters
+          description: Bad request - invalid parameters or rights, a mailbox outside the shared namespace, a user in another domain, or the owner
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Owner, mailbox or user not found, or the user's account is deleted
           content:
             application/json:
               schema:
@@ -2434,6 +2446,9 @@ paths:
       summary: Revoke ACL rights from a user on a mailbox
       description: |
         Revoke all ACL (Access Control List) rights from a specific user or identifier on a mailbox.
+        The identifier names its account whatever its case or which of the account's
+        addresses is given (the address shown by the list works). Revoking from an
+        identifier that holds no entry succeeds and changes nothing.
       security:
         - ApiKeyAuth: []
       requestBody:
@@ -2484,6 +2499,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '404':
+          description: Owner not found, or the owner has no such mailbox
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '401':
           description: Unauthorized - invalid or missing API key
           content:
@@ -2504,7 +2525,8 @@ paths:
       summary: List all ACL entries for a mailbox
       description: |
         Retrieve all ACL (Access Control List) entries for a specific mailbox.
-        Returns a list of identifiers (email addresses or "anyone") and their associated rights.
+        Returns a list of identifiers (email addresses or "anyone") and their associated rights:
+        one entry per account, under its current primary address, and the owner with every right.
       security:
         - ApiKeyAuth: []
       parameters:
@@ -2551,6 +2573,12 @@ paths:
                     acls: []
         '400':
           description: Bad request - missing or invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Owner not found, or the owner has no such mailbox
           content:
             application/json:
               schema:
