@@ -65,12 +65,12 @@ func TestAttachmentKeyword_RFCBoundaryParameters(t *testing.T) {
 		{"valid extended takes precedence", `boundary=legacy; boundary*=us-ascii''b`, "b", "$hasattachment"},
 		{"conflicting selected extended boundary", `boundary=b; boundary*=us-ascii''a; boundary*=us-ascii''b`, "b", ""},
 		{"boundary length limit", `boundary="` + strings.Repeat("b", 70) + `"`, strings.Repeat("b", 70), "$hasattachment"},
-		{"boundary too long", `boundary="` + strings.Repeat("b", 71) + `"`, strings.Repeat("b", 71), ""},
+		{"boundary over 70 octets is used verbatim", `boundary="` + strings.Repeat("b", 71) + `"`, strings.Repeat("b", 71), "$hasattachment"},
 		{"leading space is permitted", `boundary=" b"`, " b", "$hasattachment"},
 		{"interior space is permitted", `boundary="b b"`, "b b", "$hasattachment"},
 		{"boundary punctuation is permitted", `boundary="b'()+_,-./:=?b"`, "b'()+_,-./:=?b", "$hasattachment"},
-		{"trailing space is invalid", `boundary="b "`, "b ", ""},
-		{"tab is invalid", "boundary=\"b\tb\"", "b\tb", ""},
+		{"trailing space is used verbatim", `boundary="b "`, "b ", "$hasattachment"},
+		{"tab is used verbatim", "boundary=\"b\tb\"", "b\tb", "$hasattachment"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			raw := "Content-Type: multipart/mixed; " + tc.params + "\r\n\r\n--" + tc.boundary +

@@ -94,31 +94,18 @@ func mimeFilename(h mimeHeaderValue, name string) attachmentResult {
 }
 
 // boundary follows the extended > continued > legacy preference of the MIME
-// parser. An invalid selected form must not guess a different delimiter.
+// parser. An invalid selected form must not guess a different delimiter. The
+// value is otherwise used verbatim, as the BODYSTRUCTURE extractor and mail
+// clients use it: enforcing RFC 2046 §5.1.1's bchars and 70-octet limits here
+// would only withhold the keyword from mail that everything else parses.
 func (h mimeHeaderValue) boundary() (string, bool) {
 	plain, extended, continued := h.parameterForms("boundary")
 	for _, form := range []mimeParameter{extended, continued, plain} {
 		if form.present {
-			return form.value, form.valid && validMIMEBoundary(form.value)
+			return form.value, form.valid && form.value != ""
 		}
 	}
 	return "", false
-}
-
-func validMIMEBoundary(value string) bool {
-	// RFC 2046 §5.1.1 bchars: spaces are permitted except at the end.
-	if len(value) == 0 || len(value) > 70 || value[len(value)-1] == ' ' {
-		return false
-	}
-	for _, c := range []byte(value) {
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
-			continue
-		}
-		if !strings.ContainsRune("'()+_,-./:=? ", rune(c)) {
-			return false
-		}
-	}
-	return true
 }
 
 func mimeParameterBytes(value string, first bool) (decoded, charset string, valid bool) {
