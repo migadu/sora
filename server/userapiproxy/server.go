@@ -550,12 +550,12 @@ var errAuthBodyTooLarge = errors.New("auth request body too large")
 
 // routeAuthRequest picks the backend for an unauthenticated auth request.
 func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, error) {
-	email, err := s.peekAuthEmail(r)
+	email, tokenAccountID, err := s.peekAuthIdentity(r)
 	if err != nil {
 		return backendRoute{}, err
 	}
 	if email != "" {
-		return s.routeUser(r.Context(), email, 0, true)
+		return s.routeUser(r.Context(), email, tokenAccountID, true)
 	}
 	// Names nobody: the backend answers the malformed request itself, wherever it lands.
 	pool, err := s.connManager.ResolvePool("")
@@ -569,22 +569,23 @@ func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, error) {
 	return s.poolRoute(addr, pool), nil
 }
 
-// peekAuthEmail reads the user an auth request is for without consuming the request: the
+// peekAuthIdentity reads the user an auth request is for without consuming the request: the
 // email of a login body, or the subject of the (valid) token a refresh body carries. The
 // body is put back for the backend, and read as the backend reads it (the first JSON value)
 // so the two cannot disagree on whose request it is. "" when the body names nobody the
 // proxy can route by; the backend then answers the malformed request itself.
-func (s *Server) peekAuthEmail(r *http.Request) (string, error) {
+// A refresh also carries its token's account ID, for local-fallback ownership checks.
+func (s *Server) peekAuthIdentity(r *http.Request) (string, int64, error) {
 	if r.Body == nil || r.Body == http.NoBody {
-		return "", nil
+		return "", 0, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxAuthBodyBytes+1))
 	r.Body.Close()
 	if err != nil {
-		return "", fmt.Errorf("reading auth request body: %w", err)
+		return "", 0, fmt.Errorf("reading auth request body: %w", err)
 	}
 	if len(body) > maxAuthBodyBytes {
-		return "", errAuthBodyTooLarge
+		return "", 0, errAuthBodyTooLarge
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 
@@ -596,21 +597,24 @@ func (s *Server) peekAuthEmail(r *http.Request) (string, error) {
 			Email string `json:"email"`
 		}
 		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
-			return "", nil
+			return "", 0, nil
 		}
-		return strings.TrimSpace(req.Email), nil
+		return strings.TrimSpace(req.Email), 0, nil
 	case "/user/auth/refresh":
 		var req struct {
 			Token string `json:"token"`
 		}
 		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
-			return "", nil
+			return "", 0, nil
 		}
 		if claims, err := s.validateToken(req.Token); err == nil {
-			return claims.Email, nil
+			if claims.AccountID <= 0 {
+				return "", 0, fmt.Errorf("refresh token has no valid account ID")
+			}
+			return claims.Email, claims.AccountID, nil
 		}
 	}
-	return "", nil
+	return "", 0, nil
 }
 
 // backendRoute is where a request goes and how its backend leg is spoken: with named
@@ -779,10 +783,10 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 		}
 		// A valid JWT from another pool may carry the ID of an unrelated local
 		// account. A lookup miss is not evidence that its owner is a local user.
-		// Logins are authenticated by the backend; refreshes revalidate the email
-		// there. Ordinary JWT requests need this check on every fallback, including
+		// Logins are authenticated by the backend. Requests carrying a token,
+		// including refreshes, need this check on every fallback, including
 		// negative-cache hits; the routing cache cannot establish local ownership.
-		if !forAuth {
+		if !forAuth || accountID != 0 {
 			if s.rdb == nil {
 				return backendRoute{}, fmt.Errorf("cannot verify local token ownership without a local database")
 			}

@@ -1421,8 +1421,8 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 #
 # A backend in maintenance (see BACKEND MAINTENANCE) is skipped inside its pool. A user
 # the API pins with "server" to a backend in maintenance is routed among the other
-# members of that backend's pool (or, in no pool, the default pool), and refused when
-# none is left; the pin takes the user back when maintenance ends.
+# members of that backend's pool, and refused when its pool is unknown or none is
+# left; the pin takes the user back when maintenance ends.
 #
 # ROLLOUT: deploy the [[pool]] config on every proxy BEFORE the lookup API starts
 # answering with "pool". A proxy still on remote_addrs ignores the field (with a

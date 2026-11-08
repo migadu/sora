@@ -37,6 +37,7 @@ func TestPools_RemoteTokenMustNotReadLocalAccount(t *testing.T) {
 	// Represents a still-valid token issued in another database/pool whose local
 	// account ID happens to equal the victim's ID. All pools share the signing key.
 	claims := userapi.JWTClaims{Email: "removed@remote-pool.example", AccountID: accountID,
+		AuthEpoch:        time.Now().Unix(),
 		RegisteredClaims: jwt.RegisteredClaims{Issuer: "test-issuer", Subject: "removed@remote-pool.example", ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour))}}
 	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(testJWTSecret))
 	if err != nil {
@@ -71,9 +72,16 @@ func TestPools_RemoteTokenMustNotReadLocalAccount(t *testing.T) {
 			p.GetConnectionManager().SetMaintenance(m)
 			go p.Start()
 			time.Sleep(100 * time.Millisecond)
-			request := func(token string) (int, string) {
+			request := func(token string, refresh bool) (int, string) {
 				t.Helper()
-				req, _ := http.NewRequest("GET", "http://"+addr+"/user/mailboxes", nil)
+				method, path := "GET", "/user/mailboxes"
+				var bodyReader io.Reader
+				if refresh {
+					method, path = "POST", "/user/auth/refresh"
+					bodyReader = strings.NewReader(fmt.Sprintf(`{"token":%q,"email":123}`, token))
+				}
+				req, _ := http.NewRequest(method, "http://"+addr+path, bodyReader)
+				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("Authorization", "Bearer "+token)
 				resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
 				if err != nil {
@@ -94,7 +102,7 @@ func TestPools_RemoteTokenMustNotReadLocalAccount(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					status, body := request(localToken)
+					status, body := request(localToken, false)
 					want := http.StatusOK
 					if id != accountID {
 						want = http.StatusServiceUnavailable
@@ -102,13 +110,20 @@ func TestPools_RemoteTokenMustNotReadLocalAccount(t *testing.T) {
 					if status != want || (status == http.StatusOK && !strings.Contains(body, marker)) {
 						t.Fatalf("local fallback ID %d: status=%d, want %d", id, status, want)
 					}
+					before := backend.count.Load()
+					status, _ = request(localToken, true)
+					if status != want || (id != accountID && backend.count.Load() != before) {
+						t.Fatalf("local refresh ID %d: status=%d, want %d, backend hits=%d", id, status, want, backend.count.Load()-before)
+					}
 				}
 			}
 			for i := 0; i < 2; i++ {
-				before := backend.count.Load()
-				status, body := request(token)
-				if status != http.StatusServiceUnavailable || strings.Contains(body, marker) || backend.count.Load() != before {
-					t.Fatalf("request %d: remote token reached local account: status=%d, backend hits=%d", i, status, backend.count.Load()-before)
+				for _, refresh := range []bool{false, true} {
+					before := backend.count.Load()
+					status, body := request(token, refresh)
+					if status != http.StatusServiceUnavailable || strings.Contains(body, marker) || backend.count.Load() != before {
+						t.Fatalf("request %d: remote token reached local account: status=%d, backend hits=%d", i, status, backend.count.Load()-before)
+					}
 				}
 			}
 		})

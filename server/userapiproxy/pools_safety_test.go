@@ -58,7 +58,7 @@ func TestPools_RemovedRemoteUserMustNotBecomeLocal(t *testing.T) {
 
 func TestPools_AuthUsesEndpointJSONSchema(t *testing.T) {
 	const email, secret = "user@pool-b.example", "test-secret-key-at-least-32-bytes!!"
-	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, JWTClaims{Email: email,
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, JWTClaims{Email: email, AccountID: 42,
 		RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour))}}).SignedString([]byte(secret))
 	if err != nil {
 		t.Fatal(err)
