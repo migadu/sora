@@ -9,6 +9,14 @@ import "strings"
 func AttachmentKeywordRegressionCases() []struct{ Name, MIME, Keyword string } {
 	msg := func(lines ...string) string { return strings.Join(lines, "\r\n") + "\r\n" }
 	return []struct{ Name, MIME, Keyword string }{
+		{"trailing charset semicolon", msg(`Content-Type: text/plain; charset="utf-8";`, "", "body"), "$hasnoattachment"},
+		{"trailing inline semicolon", msg("Content-Type: text/plain", "Content-Disposition: inline;", "", "body"), "$hasnoattachment"},
+		{"trailing multipart semicolon", msg("Content-Type: multipart/mixed; boundary=b;", "",
+			"--b", "Content-Type: text/plain", "", "body", "--b--"), "$hasnoattachment"},
+		{"commented attachment disposition", msg("Content-Type: application/pdf", `Content-Disposition: attachment (PDF); filename="report.pdf"`, "", "PDF"), "$hasattachment"},
+		{"comment before inline filename", msg("Content-Type: application/pdf", `Content-Disposition: inline; size=123 (bytes); filename="report.pdf"`, "", "PDF"), "$hasattachment"},
+		{"comment after inline filename", msg("Content-Type: application/pdf", `Content-Disposition: inline; filename="report.pdf" (PDF)`, "", "PDF"), "$hasattachment"},
+		{"disposition comment cannot supply filename", msg("Content-Type: text/plain", `Content-Disposition: inline; size=123 (notes; filename=report.pdf; bytes)`, "", "body"), "$hasnoattachment"},
 		{"duplicate content types stay unknown", msg("Content-Type: text/plain", "Content-Type: multipart/mixed; boundary=b", "",
 			"--b", "Content-Disposition: attachment", "", "PDF", "--b--"), ""},
 		{"duplicate dispositions stay unknown", msg("Content-Type: application/pdf", "Content-Disposition: inline", "Content-Disposition: attachment", "", "PDF"), ""},
