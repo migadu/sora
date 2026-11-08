@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -27,6 +28,10 @@ const (
 	// Lower limit due to per-row JSONB processing overhead
 	MaxComplexSortResults = 500
 )
+
+// ErrSearchTooManyResults means a complete SEARCH/SORT result exceeds the
+// default safety cap. Explicit caller limits are pages and do not return it.
+var ErrSearchTooManyResults = errors.New("search matches too many messages")
 
 // buildSearchCriteria builds the SQL WHERE clause for the search criteria
 func (db *Database) buildSearchCriteria(criteria *imap.SearchCriteria, paramPrefix string, paramCounter *int) (string, pgx.NamedArgs, error) {
@@ -1496,6 +1501,13 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 	// Determine the result limit from the final query complexity (after any
 	// seqnum→UID rewrite above may have downgraded a complex query to simple).
 	resultLimit = resolveResultLimit(limit, isSearchAll, isComplexQuery, orderByClause)
+	// Read one extra row to distinguish a complete result at the cap from an
+	// overflow. Caller-requested pages keep their exact limit; ALL is exempt.
+	defaultLimit := 0
+	if limit <= 0 && resultLimit > 0 {
+		defaultLimit = resultLimit
+		resultLimit++
+	}
 
 	// Use optimized query path when possible
 	if !isComplexQuery {
@@ -1695,17 +1707,15 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 		logger.Warn("Database: slow message scan detected", "scan_duration", scanDuration, "row_count", len(messages), "mailbox_id", mailboxID, "query_type", metricsLabel, "query", finalQueryString, "args", whereArgs)
 	}
 
+	if defaultLimit > 0 && len(messages) > defaultLimit {
+		return nil, fmt.Errorf("%w (maximum %d)", ErrSearchTooManyResults, defaultLimit)
+	}
+
 	// Dynamic sequence hydration (O(1) mapped iteration rather than PostgreSQL quadratic windowing)
 	if len(messages) > 0 {
 		if err := db.HydrateSearchMessageSequences(ctx, mailboxID, messages); err != nil {
 			return nil, fmt.Errorf("failed to hydrate sequences dynamically: %w", err)
 		}
-	}
-
-	// Log warning if we hit the default result limit (may indicate client needs to refine search)
-	// Don't warn if caller explicitly requested this limit (limit > 0) or if it's SEARCH ALL (resultLimit == 0)
-	if limit == 0 && resultLimit > 0 && len(messages) >= resultLimit {
-		logger.Warn("Database: search query hit result limit", "limit", resultLimit, "mailbox_id", mailboxID, "complex", isComplexQuery, "message", "Client may need to use more specific search criteria")
 	}
 
 	return messages, nil

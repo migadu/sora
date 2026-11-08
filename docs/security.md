@@ -79,10 +79,10 @@ Sora includes built-in protections against resource exhaustion attacks:
 ### Search Result Limits
 
 To prevent memory exhaustion from large search operations:
-- **MaxSearchResults**: Limited to 1,000 messages per search (down from 5,000)
+- **MaxSearchResults**: Limited to 100,000 matching messages for filtered searches
 - **MaxComplexSortResults**: Limited to 500 messages for expensive JSONB-based sorts
 
-These limits are enforced at the database layer and cannot be bypassed by clients. For mailboxes with more messages, clients should use more specific search criteria or implement pagination.
+IMAP SEARCH, SORT and ESEARCH refuse a result above the default cap with `NO [LIMIT]`, rather than returning a partial set as success. Exactly the cap is allowed. `ALL` searches remain exempt for full mailbox synchronization. Clients can narrow the criteria when a filtered search exceeds the cap. Database callers that explicitly request a bounded page keep that page size.
 
 ### Search Rate Limiting
 
