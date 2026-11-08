@@ -723,3 +723,33 @@ func TestConnIsTLS(t *testing.T) {
 		})
 	}
 }
+
+// NoAbsoluteTimeout leaves the session limit to the caller's protocol library: the
+// checker still checks throughput but enforces no session limit, not even the 30m
+// default an AbsoluteTimeout of 0 otherwise gets (#138).
+func TestSoraConn_NoAbsoluteTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  SoraConnConfig
+		want time.Duration
+	}{
+		{"default", SoraConnConfig{MinBytesPerMinute: 512, EnableTimeoutChecker: true}, 30 * time.Minute},
+		{"explicit", SoraConnConfig{AbsoluteTimeout: time.Hour, MinBytesPerMinute: 512, EnableTimeoutChecker: true}, time.Hour},
+		{"none", SoraConnConfig{MinBytesPerMinute: 512, EnableTimeoutChecker: true, NoAbsoluteTimeout: true}, 0},
+		{"none wins", SoraConnConfig{AbsoluteTimeout: time.Hour, MinBytesPerMinute: 512, EnableTimeoutChecker: true, NoAbsoluteTimeout: true}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, srv := net.Pipe()
+			defer client.Close()
+			sc := NewSoraConn(srv, tc.cfg)
+			defer sc.Close()
+			checked := sc.CheckedTimeouts()
+			if checked.MinBytesPerMinute != 512 {
+				t.Fatalf("not checked for throughput: %+v", checked)
+			}
+			if checked.Absolute != tc.want {
+				t.Errorf("session limit %v, want %v", checked.Absolute, tc.want)
+			}
+		})
+	}
+}

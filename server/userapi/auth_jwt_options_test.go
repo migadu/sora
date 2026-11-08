@@ -13,7 +13,8 @@ import (
 // the issuer is enforced.
 func TestValidateToken_ParserOptions(t *testing.T) {
 	secret := strings.Repeat("k", 32)
-	s := &Server{jwtSecret: secret, tokenIssuer: "sora-test", tokenDuration: time.Hour}
+	s := &Server{tokenIssuer: "sora-test", tokenDuration: time.Hour}
+	s.settings.Store(&reloadableSettings{jwtSecret: secret})
 
 	sign := func(method jwt.SigningMethod, key any, claims JWTClaims) string {
 		t.Helper()

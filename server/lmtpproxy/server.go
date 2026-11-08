@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/migadu/sora/logger"
@@ -21,32 +22,49 @@ import (
 	"github.com/migadu/sora/server/proxy"
 )
 
-// Server represents an LMTP proxy server.
-type Server struct {
-	listener               net.Listener
-	listenerMu             sync.RWMutex
-	rdb                    *resilient.ResilientDatabase
-	name                   string // Server name for logging
-	addr                   string
-	hostname               string
-	connManager            *proxy.ConnectionManager
-	connTracker            *server.ConnectionTracker
-	tls                    bool
-	tlsUseStartTLS         bool
-	tlsCertFile            string
-	tlsKeyFile             string
-	tlsVerify              bool
-	tlsConfig              *tls.Config // Global TLS config from TLS manager or per-server config
-	enableAffinity         bool
-	wg                     sync.WaitGroup
-	ctx                    context.Context
-	cancel                 context.CancelFunc
-	trustedProxies         []string // CIDR blocks for trusted proxies that can forward parameters
-	remotelookupConfig     *config.RemoteLookupConfig
-	remoteUseXCLIENT       bool          // Whether backend supports XCLIENT command for forwarding
-	authIdleTimeout        time.Duration // Idle timeout between commands
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after: a session takes the one current
+// when it starts and keeps it, so it never mixes the values of two reloads. Debug
+// logging is read afresh, per log line.
+type reloadableSettings struct {
 	absoluteSessionTimeout time.Duration // Maximum total session duration (prevents hung sessions)
 	maxMessageSize         int64
+	debug                  bool
+}
+
+// loadSettings returns the current settings. A Server built without New (as tests
+// do) has none stored and reads as zero, as its fields did.
+func (s *Server) loadSettings() *reloadableSettings {
+	if settings := s.settings.Load(); settings != nil {
+		return settings
+	}
+	return &reloadableSettings{}
+}
+
+// Server represents an LMTP proxy server.
+type Server struct {
+	listener           net.Listener
+	listenerMu         sync.RWMutex
+	rdb                *resilient.ResilientDatabase
+	name               string // Server name for logging
+	addr               string
+	hostname           string
+	connManager        *proxy.ConnectionManager
+	connTracker        *server.ConnectionTracker
+	tls                bool
+	tlsUseStartTLS     bool
+	tlsCertFile        string
+	tlsKeyFile         string
+	tlsVerify          bool
+	tlsConfig          *tls.Config // Global TLS config from TLS manager or per-server config
+	enableAffinity     bool
+	wg                 sync.WaitGroup
+	ctx                context.Context
+	cancel             context.CancelFunc
+	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
+	remotelookupConfig *config.RemoteLookupConfig
+	remoteUseXCLIENT   bool          // Whether backend supports XCLIENT command for forwarding
+	authIdleTimeout    time.Duration // Idle timeout between commands
 
 	// Trusted networks for connection filtering
 	trustedNetworks []*net.IPNet
@@ -61,8 +79,10 @@ type Server struct {
 	listenBacklog int
 
 	// Debug logging
-	debug       bool
 	debugWriter io.Writer
+
+	// The settings ReloadConfig replaces; see reloadableSettings.
+	settings atomic.Pointer[reloadableSettings]
 
 	// Active session tracking for graceful shutdown
 	activeSessionsMu sync.RWMutex
@@ -285,34 +305,36 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	s := &Server{
-		rdb:                    rdb,
-		name:                   opts.Name,
-		addr:                   opts.Addr,
-		hostname:               hostname,
-		connManager:            connManager,
-		tls:                    opts.TLS,
-		tlsUseStartTLS:         opts.TLSUseStartTLS,
-		tlsCertFile:            opts.TLSCertFile,
-		tlsKeyFile:             opts.TLSKeyFile,
-		tlsVerify:              opts.TLSVerify,
-		enableAffinity:         opts.EnableAffinity,
-		ctx:                    ctx,
-		cancel:                 cancel,
-		trustedProxies:         opts.TrustedProxies,
-		remotelookupConfig:     opts.RemoteLookup,
-		remoteUseXCLIENT:       opts.RemoteUseXCLIENT,
-		authIdleTimeout:        opts.AuthIdleTimeout,
+		rdb:                rdb,
+		name:               opts.Name,
+		addr:               opts.Addr,
+		hostname:           hostname,
+		connManager:        connManager,
+		tls:                opts.TLS,
+		tlsUseStartTLS:     opts.TLSUseStartTLS,
+		tlsCertFile:        opts.TLSCertFile,
+		tlsKeyFile:         opts.TLSKeyFile,
+		tlsVerify:          opts.TLSVerify,
+		enableAffinity:     opts.EnableAffinity,
+		ctx:                ctx,
+		cancel:             cancel,
+		trustedProxies:     opts.TrustedProxies,
+		remotelookupConfig: opts.RemoteLookup,
+		remoteUseXCLIENT:   opts.RemoteUseXCLIENT,
+		authIdleTimeout:    opts.AuthIdleTimeout,
+		trustedNetworks:    trustedNets,
+		limiter:            limiter,
+		lookupCache:        lookupCache,
+		listenBacklog:      listenBacklog,
+		debugWriter:        debugWriter,
+		activeSessions:     make(map[*Session]struct{}),
+		proxyReader:        proxyReader,
+	}
+	s.settings.Store(&reloadableSettings{
 		absoluteSessionTimeout: opts.AbsoluteSessionTimeout,
 		maxMessageSize:         opts.MaxMessageSize,
-		trustedNetworks:        trustedNets,
-		limiter:                limiter,
-		lookupCache:            lookupCache,
-		listenBacklog:          listenBacklog,
 		debug:                  opts.Debug,
-		debugWriter:            debugWriter,
-		activeSessions:         make(map[*Session]struct{}),
-		proxyReader:            proxyReader,
-	}
+	})
 
 	// Setup TLS config: Support both implicit TLS and STARTTLS
 	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
@@ -653,21 +675,23 @@ func (s *Server) sendGracefulShutdownMessage() {
 // Called on SIGHUP. Only affects new connections; existing sessions keep old settings.
 func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	next := *s.loadSettings()
 
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != s.absoluteSessionTimeout {
-		s.absoluteSessionTimeout = timeout
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
-	if maxSize := cfg.GetMaxMessageSizeWithDefault(); maxSize != s.maxMessageSize {
-		s.maxMessageSize = maxSize
+	if maxSize := cfg.GetMaxMessageSizeWithDefault(); maxSize != next.maxMessageSize {
+		next.maxMessageSize = maxSize
 		reloaded = append(reloaded, "max_message_size")
 	}
-	if cfg.Debug != s.debug {
-		s.debug = cfg.Debug
+	if cfg.Debug != next.debug {
+		next.debug = cfg.Debug
 		reloaded = append(reloaded, "debug")
 	}
 
 	if len(reloaded) > 0 {
+		s.settings.Store(&next)
 		logger.Info("LMTP proxy config reloaded", "name", s.name, "updated", reloaded)
 	}
 	return nil

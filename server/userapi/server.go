@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/netutil"
@@ -25,16 +27,23 @@ import (
 	"github.com/migadu/sora/storage"
 )
 
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after: a request loads it once and
+// uses that copy throughout, so it never mixes the values of two reloads.
+type reloadableSettings struct {
+	jwtSecret      string
+	allowedOrigins []string
+	allowedHosts   []string
+}
+
 // Server represents the HTTP Mail API server for user operations
 type Server struct {
 	name                       string
 	addr                       string
-	jwtSecret                  string
+	settings                   atomic.Pointer[reloadableSettings] // the settings ReloadConfig replaces
 	tokenDuration              time.Duration
 	tokenIssuer                string
 	maxConnections             int // Max concurrent connections; 0 -> unlimited
-	allowedOrigins             []string
-	allowedHosts               []string
 	rdb                        *resilient.ResilientDatabase
 	storage                    *storage.S3Storage
 	rs3                        *resilient.ResilientS3Storage // storage behind retries + breaker; nil when storage is
@@ -98,16 +107,25 @@ const minJWTSecretLength = 32
 // Seven days is generous for an access token while keeping that window finite.
 const maxTokenDuration = 7 * 24 * time.Hour
 
+// checkJWTSecret refuses a JWT secret the server must not sign with, at start-up and
+// on a config reload alike.
+func checkJWTSecret(secret string) error {
+	if secret == "" {
+		return fmt.Errorf("JWT secret is required for Mail API server")
+	}
+	if len(secret) < minJWTSecretLength {
+		return fmt.Errorf("JWT secret must be at least %d bytes for HS256 (RFC 7518 §3.2); got %d", minJWTSecretLength, len(secret))
+	}
+	if secret == "your-secret-jwt-signing-key-here" {
+		return fmt.Errorf("JWT secret is the placeholder value from config.toml.example — set a real, random jwt_secret")
+	}
+	return nil
+}
+
 // New creates a new HTTP Mail API server
 func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, error) {
-	if options.JWTSecret == "" {
-		return nil, fmt.Errorf("JWT secret is required for Mail API server")
-	}
-	if len(options.JWTSecret) < minJWTSecretLength {
-		return nil, fmt.Errorf("JWT secret must be at least %d bytes for HS256 (RFC 7518 §3.2); got %d", minJWTSecretLength, len(options.JWTSecret))
-	}
-	if options.JWTSecret == "your-secret-jwt-signing-key-here" {
-		return nil, fmt.Errorf("JWT secret is the placeholder value from config.toml.example — set a real, random jwt_secret")
+	if err := checkJWTSecret(options.JWTSecret); err != nil {
+		return nil, err
 	}
 
 	if options.TokenDuration == 0 {
@@ -197,12 +215,9 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		name:                       options.Name,
 		addr:                       options.Addr,
 		sieveExtensions:            sieveengine.EffectiveExtensions(options.SieveExtensions),
-		jwtSecret:                  options.JWTSecret,
 		maxConnections:             options.MaxConnections,
 		tokenDuration:              options.TokenDuration,
 		tokenIssuer:                options.TokenIssuer,
-		allowedOrigins:             options.AllowedOrigins,
-		allowedHosts:               options.AllowedHosts,
 		rdb:                        rdb,
 		storage:                    options.Storage,
 		rs3:                        newResilientStorage(options.Storage),
@@ -218,6 +233,11 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		tlsVerify:                  options.TLSVerify,
 		proxyReader:                proxyReader,
 	}
+	s.settings.Store(&reloadableSettings{
+		jwtSecret:      options.JWTSecret,
+		allowedOrigins: options.AllowedOrigins,
+		allowedHosts:   options.AllowedHosts,
+	})
 
 	return s, nil
 }
@@ -226,20 +246,35 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 // ReloadConfig updates runtime-configurable settings from new config.
 func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	var refused error
+	next := *s.settings.Load()
 
+	if cfg.JWTSecret != "" && cfg.JWTSecret != next.jwtSecret {
+		// Tokens signed with the previous secret stop validating, as on the User API
+		// proxy, which reloads it too.
+		if err := checkJWTSecret(cfg.JWTSecret); err != nil {
+			// The rest still reloads. The error has the caller log a failed reload, so an
+			// operator rotating a leaked secret learns that the old one is still live.
+			refused = fmt.Errorf("jwt_secret refused, the previous one stays in use: %w", err)
+		} else {
+			next.jwtSecret = cfg.JWTSecret
+			reloaded = append(reloaded, "jwt_secret")
+		}
+	}
 	if len(cfg.AllowedOrigins) > 0 {
-		s.allowedOrigins = cfg.AllowedOrigins
+		next.allowedOrigins = slices.Clone(cfg.AllowedOrigins)
 		reloaded = append(reloaded, "allowed_origins")
 	}
 	if len(cfg.AllowedHosts) > 0 {
-		s.allowedHosts = cfg.AllowedHosts
+		next.allowedHosts = slices.Clone(cfg.AllowedHosts)
 		reloaded = append(reloaded, "allowed_hosts")
 	}
 
 	if len(reloaded) > 0 {
+		s.settings.Store(&next)
 		logger.Info("User API config reloaded", "name", s.name, "updated", reloaded)
 	}
-	return nil
+	return refused
 }
 
 func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options ServerOptions, errChan chan error) *Server {
@@ -513,10 +548,11 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 		origin := r.Header.Get("Origin")
 
 		// Check if origin is allowed
-		if origin != "" && len(s.allowedOrigins) > 0 {
+		allowedOrigins := s.settings.Load().allowedOrigins
+		if origin != "" && len(allowedOrigins) > 0 {
 			allowed := false
 			wildcard := false
-			for _, allowedOrigin := range s.allowedOrigins {
+			for _, allowedOrigin := range allowedOrigins {
 				if allowedOrigin == "*" {
 					allowed = true
 					wildcard = true
@@ -557,14 +593,15 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) allowedHostsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(s.allowedHosts) == 0 {
+		allowedHosts := s.settings.Load().allowedHosts
+		if len(allowedHosts) == 0 {
 			// No restrictions, allow all hosts
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		clientIP := getClientIP(r)
-		if !isIPAllowed(clientIP, s.allowedHosts) {
+		if !isIPAllowed(clientIP, allowedHosts) {
 			s.writeError(w, http.StatusForbidden, "Host not allowed")
 			return
 		}

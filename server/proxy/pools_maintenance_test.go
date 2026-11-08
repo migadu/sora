@@ -58,13 +58,13 @@ func TestPools_LookupPinInMaintenanceStaysInItsPool(t *testing.T) {
 }
 
 // A pin to a backend in maintenance that belongs to no pool has no siblings: it goes to
-// the default pool when there is one, and is refused when there is none.
+// no safe detour, even when there is a default pool.
 func TestPools_LookupPinInMaintenanceOutsideEveryPool(t *testing.T) {
 	cm := newPoolsCM(t, testPoolSpecs())
 	maintenanceOn(t, cm, "10.9.9.9")
 	res, err := routeUser(cm, "user@example.com", &UserRoutingInfo{ServerAddress: "10.9.9.9:143", IsRemoteLookupAccount: true})
-	if err != nil || res.Pool != "sora0" {
-		t.Fatalf("with a default pool: pool %q, err %v; want sora0", res.Pool, err)
+	if !errors.Is(err, ErrRouteLookupFailed) || res.PreferredAddr != "" {
+		t.Fatalf("with a default pool: route %+v, err %v; want refusal", res, err)
 	}
 
 	specs := testPoolSpecs()
@@ -72,8 +72,8 @@ func TestPools_LookupPinInMaintenanceOutsideEveryPool(t *testing.T) {
 	cm = newPoolsCM(t, specs)
 	maintenanceOn(t, cm, "10.9.9.9")
 	_, err = routeUser(cm, "user@example.com", &UserRoutingInfo{ServerAddress: "10.9.9.9:143", IsRemoteLookupAccount: true})
-	if !errors.Is(err, ErrNoDefaultPool) {
-		t.Fatalf("without a default pool: err %v, want ErrNoDefaultPool", err)
+	if !errors.Is(err, ErrRouteLookupFailed) {
+		t.Fatalf("without a default pool: err %v, want ErrRouteLookupFailed", err)
 	}
 }
 

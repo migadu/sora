@@ -108,6 +108,7 @@ func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 		return nil, err
 	}
 
+	newFlags = NormalizeAttachmentKeywordUpdate(newFlags, newFlags)
 	systemFlagsToSet, customKeywordsToSet := SplitFlags(newFlags)
 	bitwiseSystemFlags := FlagsToBitwise(systemFlagsToSet)
 	// Fold keywords onto the case already used in this mailbox (RFC 9051 §2.3.2).
@@ -188,6 +189,8 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 		return nil, err
 	}
 
+	attachmentRemovals := attachmentKeywordRemovals(newFlags)
+	newFlags = NormalizeAttachmentKeywordUpdate(newFlags, newFlags)
 	systemFlagsToAdd, customKeywordsToAdd := SplitFlags(newFlags)
 	// Fold keywords onto the case already used in this mailbox (RFC 9051 §2.3.2)
 	// so adding a different-case variant of an existing keyword is a no-op merge.
@@ -210,13 +213,17 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 					UNION ALL
 					SELECT unnest($2::text[]) AS flag_element
 				) AS combined_flags
+				WHERE NOT (lower(flag_element) = ANY($5::text[]))
 			),
 		    flags_changed_at = $3,
 		    updated_modseq = nextval('messages_modseq')
 		WHERE message_id = ANY($4)
-		  AND ( (flags & $1) != $1 OR NOT (custom_flags @> to_jsonb($2::text[])) )
+		  AND ( (flags & $1) != $1 OR NOT (custom_flags @> to_jsonb($2::text[]))
+		        OR (cardinality($5::text[]) > 0 AND EXISTS (
+		              SELECT 1 FROM jsonb_array_elements_text(custom_flags) AS old_keyword
+		              WHERE lower(old_keyword) = ANY($5::text[]))) )
 		RETURNING message_id, updated_modseq
-	`, bitwiseSystemFlagsToAdd, customKeywordsToAdd, time.Now(), messageIDs)
+	`, bitwiseSystemFlagsToAdd, customKeywordsToAdd, time.Now(), messageIDs, attachmentRemovals)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute batch add message flags in mailbox %d: %w", mailboxID, err)
 	}

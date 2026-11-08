@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -42,12 +43,19 @@ func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []stri
 	return trustedNetworks
 }
 
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after: a request loads it once and
+// uses that copy throughout, so it never mixes the values of two reloads.
+type reloadableSettings struct {
+	apiKey       string
+	allowedHosts []string
+}
+
 // Server represents the HTTP API server
 type Server struct {
 	name           string
 	addr           string
-	apiKey         string
-	allowedHosts   []string
+	settings       atomic.Pointer[reloadableSettings] // the settings ReloadConfig replaces
 	rdb            *resilient.ResilientDatabase
 	cache          *cache.Cache
 	uploader       *uploader.UploadWorker
@@ -178,17 +186,26 @@ type ProxyBackendInfo struct {
 // key is a real brute-force risk; reject it at startup rather than run with it.
 const minAPIKeyLength = 16
 
+// checkAPIKey refuses an API key the server must not run with, at start-up and on
+// a config reload alike.
+func checkAPIKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("API key is required for HTTP API server")
+	}
+	if len(key) < minAPIKeyLength {
+		return fmt.Errorf("API key must be at least %d characters (got %d) — use a long, random value", minAPIKeyLength, len(key))
+	}
+	switch key {
+	case "your-api-key-here", "your-secret-api-key-here":
+		return fmt.Errorf("API key is the placeholder value from config.toml.example — set a real, random api_key")
+	}
+	return nil
+}
+
 // New creates a new HTTP API server
 func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, error) {
-	if options.APIKey == "" {
-		return nil, fmt.Errorf("API key is required for HTTP API server")
-	}
-	if len(options.APIKey) < minAPIKeyLength {
-		return nil, fmt.Errorf("API key must be at least %d characters (got %d) — use a long, random value", minAPIKeyLength, len(options.APIKey))
-	}
-	switch options.APIKey {
-	case "your-api-key-here", "your-secret-api-key-here":
-		return nil, fmt.Errorf("API key is the placeholder value from config.toml.example — set a real, random api_key")
+	if err := checkAPIKey(options.APIKey); err != nil {
+		return nil, err
 	}
 
 	// Validate TLS configuration
@@ -220,8 +237,6 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 	s := &Server{
 		name:               options.Name,
 		addr:               options.Addr,
-		apiKey:             options.APIKey,
-		allowedHosts:       options.AllowedHosts,
 		rdb:                rdb,
 		cache:              options.Cache,
 		uploader:           options.Uploader,
@@ -250,6 +265,10 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		maxRedirectHops:    options.MaxRedirectHops,
 		sieveExtensions:    sieveengine.EffectiveExtensions(options.SieveExtensions),
 	}
+	s.settings.Store(&reloadableSettings{
+		apiKey:       options.APIKey,
+		allowedHosts: options.AllowedHosts,
+	})
 
 	return s, nil
 }
@@ -263,20 +282,29 @@ func (s *Server) SetAuthCache(ac AuthCacheStats) {
 // ReloadConfig updates runtime-configurable settings from new config.
 func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	var refused error
+	next := *s.settings.Load()
 
-	if cfg.APIKey != "" && cfg.APIKey != s.apiKey {
-		s.apiKey = cfg.APIKey
-		reloaded = append(reloaded, "api_key")
+	if cfg.APIKey != "" && cfg.APIKey != next.apiKey {
+		if err := checkAPIKey(cfg.APIKey); err != nil {
+			// The rest still reloads. The error has the caller log a failed reload, so an
+			// operator rotating a leaked key learns that the old one is still live.
+			refused = fmt.Errorf("api_key refused, the previous one stays in use: %w", err)
+		} else {
+			next.apiKey = cfg.APIKey
+			reloaded = append(reloaded, "api_key")
+		}
 	}
 	if len(cfg.AllowedHosts) > 0 {
-		s.allowedHosts = cfg.AllowedHosts
+		next.allowedHosts = slices.Clone(cfg.AllowedHosts)
 		reloaded = append(reloaded, "allowed_hosts")
 	}
 
 	if len(reloaded) > 0 {
+		s.settings.Store(&next)
 		logger.Info("Admin API config reloaded", "name", s.name, "updated", reloaded)
 	}
-	return nil
+	return refused
 }
 
 func Start(ctx context.Context, rdb *resilient.ResilientDatabase, options ServerOptions, errChan chan error) *Server {
@@ -588,7 +616,8 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) allowedHostsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(s.allowedHosts) == 0 {
+		allowedHosts := s.settings.Load().allowedHosts
+		if len(allowedHosts) == 0 {
 			// No restrictions, allow all hosts
 			next.ServeHTTP(w, r)
 			return
@@ -598,7 +627,7 @@ func (s *Server) allowedHostsMiddleware(next http.Handler) http.Handler {
 
 		// Single shared check: allowedHosts entries may be CIDRs or bare IPs (incl. IPv6,
 		// matched by value rather than string form). See helpers.IPInNetworks.
-		allowed := helpers.IPInNetworks(net.ParseIP(clientIP), s.allowedHosts)
+		allowed := helpers.IPInNetworks(net.ParseIP(clientIP), allowedHosts)
 
 		if !allowed {
 			s.writeError(w, http.StatusForbidden, "Host not allowed")
@@ -623,7 +652,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(s.apiKey)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(s.settings.Load().apiKey)) != 1 {
 			s.writeError(w, http.StatusForbidden, "Invalid API key")
 			return
 		}

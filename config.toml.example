@@ -1421,8 +1421,8 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 #
 # A backend in maintenance (see BACKEND MAINTENANCE) is skipped inside its pool. A user
 # the API pins with "server" to a backend in maintenance is routed among the other
-# members of that backend's pool (or, in no pool, the default pool), and refused when
-# none is left; the pin takes the user back when maintenance ends.
+# members of that backend's pool, and refused when its pool is unknown or none is
+# left; the pin takes the user back when maintenance ends.
 #
 # TLS to a pool member is verified against that pool's remote_tls_ca_file (system roots
 # without one), on every proxy and however routing reached it (a lookup pin to a member
@@ -1437,6 +1437,11 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # answering with "pool". A proxy still on remote_addrs ignores the field (with a
 # warning) and routes the user into remote_addrs. Keep default = true on the old pool
 # until the API names a pool for every user, then drop it.
+# With named pools, an unusable server pin without a known owning pool is refused.
+# User API lookup_local_users fallback for JWT requests also requires a local database
+# whose active credential matches both the token's email and account ID.
+# Write an IPv6 backend with an explicit port as "[2001:db8::10:20]:143";
+# a bare "2001:db8::10:20" is one IP and receives the proxy's remote_port.
 #
 # [[pool]]
 # name = "sora0"

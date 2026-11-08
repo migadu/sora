@@ -132,9 +132,8 @@ func TestAllowedHostsMiddleware(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server := &Server{
-				allowedHosts: tt.allowedHosts,
-			}
+			server := &Server{}
+			server.settings.Store(&reloadableSettings{allowedHosts: tt.allowedHosts})
 
 			req := httptest.NewRequest("GET", "/test", nil)
 			req.RemoteAddr = tt.clientIP + ":12345"

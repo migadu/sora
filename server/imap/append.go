@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message/mail"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -21,50 +20,6 @@ import (
 
 	_ "github.com/emersion/go-message/charset"
 )
-
-// fallbackBodyStructure is the body structure served for a message whose real
-// one could not be produced. Extended is always populated to match
-// imapserver.ExtractBodyStructure behavior, and Text because body-fld-lines is
-// mandatory for a text part -- omitting it makes FETCH emit a body structure
-// that clients reject outright, failing the whole response.
-func fallbackBodyStructure() imap.BodyStructure {
-	return &imap.BodyStructureSinglePart{
-		Type:     "text",
-		Subtype:  "plain",
-		Params:   map[string]string{"charset": "utf-8"},
-		Extended: &imap.BodyStructureSinglePartExt{},
-		Text:     &imap.BodyStructureText{},
-	}
-}
-
-// extractBodyStructure is imapserver.ExtractBodyStructure, indirected so that
-// tests can exercise the panic path below.
-var extractBodyStructure = imapserver.ExtractBodyStructure
-
-// extractBodyStructureSafe wraps imapserver.ExtractBodyStructure with panic recovery and validation.
-// Returns a default body structure if extraction fails or structure is invalid (e.g., multipart with no children).
-// The result is never nil: callers store it and later serialize it, and a nil
-// body structure panics the FETCH write path.
-func extractBodyStructureSafe(data []byte) (result imap.BodyStructure) {
-	// Named result: a bare recover() leaves an unnamed result at its zero value,
-	// so a panic here would have returned the nil this function exists to avoid.
-	defer func() {
-		if r := recover(); r != nil {
-			result = fallbackBodyStructure()
-		}
-	}()
-
-	bs := extractBodyStructure(bytes.NewReader(data))
-	if bs == nil {
-		// Corrupted message.
-		return fallbackBodyStructure()
-	}
-	if err := helpers.ValidateBodyStructure(&bs); err != nil {
-		// Invalid structure (e.g., multipart with no children), use default
-		return fallbackBodyStructure()
-	}
-	return bs
-}
 
 // errAppendLiteralTooLarge marks an APPEND refused because the literal does not fit the
 // session memory budget. Distinct from a network read failure: the literal is never read.
@@ -299,7 +254,12 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	}
 
 	// Extract body structure with panic recovery for malformed messages
-	bodyStructure := extractBodyStructureSafe(fullMessageBytes)
+	// Attachment classification reads the raw message separately, so a
+	// synthetic fallback structure cannot assert absence.
+	bodyStructure, bsErr := helpers.SafeBodyStructure(fullMessageBytes)
+	if bsErr != nil {
+		s.WarnLog("storing a fallback body structure", "error", bsErr)
+	}
 
 	// Store message locally for background upload to S3
 	// Check if file already exists to prevent race condition:
@@ -409,6 +369,13 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		recordMetrics(ierr)
 		return nil, ierr
 	}
+
+	// RFC 9979 §4: fill in $hasattachment or $hasnoattachment when the client set
+	// neither, as Sent and Drafts copies arrive this way. It is server-set, so no
+	// flag right is needed, and it comes after the [LIMIT] check above, so it can
+	// never be what fails an APPEND. The raw MIME walk distinguishes a known
+	// attachment from an undecidable or synthetic BODYSTRUCTURE.
+	appendFlags = db.WithAttachmentKeyword(appendFlags, fullMessageBytes, false)
 
 	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{

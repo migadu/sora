@@ -273,6 +273,10 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	var accountID int64
 	var userAddress *server.Address
 
+	// One copy of the master SASL settings for the whole login, however a config
+	// reload replaces them meanwhile.
+	settings := s.server.settings.Load()
+
 	// Master SASL password authentication. Checked on the RAW username before any
 	// address parsing: the master SASL username (e.g. "proxyuser") is not
 	// necessarily an email address; only the impersonation target must parse.
@@ -289,10 +293,10 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	// which records its own failure under the same authKey, so a master-password guess
 	// dressed up as a self-login is still metered. A CORRECT master password keeps entering
 	// the block whatever the target, which is what the proxy flow relies on.
-	if identity != "" && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 &&
-		checkMasterCredential(username, s.server.masterSASLUsername) &&
-		(checkMasterCredential(password, s.server.masterSASLPassword) || identity != username) {
-		if !checkMasterCredential(password, s.server.masterSASLPassword) {
+	if identity != "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
+		checkMasterCredential(username, settings.masterSASLUsername) &&
+		(checkMasterCredential(password, settings.masterSASLPassword) || identity != username) {
+		if !checkMasterCredential(password, settings.masterSASLPassword) {
 			// The submitted username IS the master SASL username, an impersonation
 			// was requested, but the password is wrong. This must be recorded as an
 			// authentication failure and must not fall through to regular
@@ -310,7 +314,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 			// confirm the master SASL username to an attacker.
 			return 0, errAuthFailed
 		}
-		if !s.server.masterSASLGate.Allowed(netConn.RemoteAddr()) {
+		if !settings.masterSASLGate.Allowed(netConn.RemoteAddr()) {
 			s.WarnLog("master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
 			// Recorded exactly like a wrong master password: this site is reachable ONLY
 			// with the correct one, so a failure the credential is not charged for
@@ -353,9 +357,9 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		masterAuthUsed = true
 		// The session belongs to the impersonated account, not the master credential.
 		userAddress = &targetAddr
-	} else if identity == "" && len(s.server.masterSASLUsername) > 0 && len(s.server.masterSASLPassword) > 0 &&
-		checkMasterCredential(username, s.server.masterSASLUsername) &&
-		checkMasterCredential(password, s.server.masterSASLPassword) {
+	} else if identity == "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
+		checkMasterCredential(username, settings.masterSASLUsername) &&
+		checkMasterCredential(password, settings.masterSASLPassword) {
 		// Master SASL credentials submitted WITHOUT an authorization identity.
 		// There is nothing to impersonate, so this is not a master login and must
 		// not be answered differently from any other login by that username: the
@@ -389,7 +393,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		// Master username authentication: user@domain.com@MASTER_USERNAME
 		if len(s.server.masterUsername) > 0 && userAddress.HasSuffix() && checkMasterCredential(userAddress.Suffix(), s.server.masterUsername) {
 			if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-				if !s.server.masterSASLGate.Allowed(netConn.RemoteAddr()) {
+				if !settings.masterSASLGate.Allowed(netConn.RemoteAddr()) {
 					s.WarnLog("master username credentials valid but source not in master_sasl_allowed_networks; rejecting", "peer", server.GetAddrString(netConn.RemoteAddr()))
 					if s.server.authLimiter != nil {
 						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)

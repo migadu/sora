@@ -221,6 +221,19 @@ func (mw *maskingWriter) Write(p []byte) (n int, err error) {
 	return originalLen, nil
 }
 
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after: a session or a login loads it
+// once and uses that copy throughout, so it never mixes the values of two reloads.
+type reloadableSettings struct {
+	commandTimeout         time.Duration
+	absoluteSessionTimeout time.Duration // Maximum total session duration
+	minBytesPerMinute      int64         // Minimum throughput to prevent slowloris (0 = disabled)
+	sessionMemoryLimit     int64
+	masterSASLUsername     []byte
+	masterSASLPassword     []byte
+	masterSASLGate         *serverPkg.MasterSASLNetworkGate
+}
+
 type IMAPServer struct {
 	addr     string
 	name     string
@@ -228,25 +241,22 @@ type IMAPServer struct {
 	hostname string
 	// instanceID keys the upload lease (pending_uploads.instance_id). Distinct from
 	// hostname, which is the SMTP-visible name; see config.NodeIdentity.
-	instanceID         string
-	s3                 *resilient.ResilientS3Storage
-	server             *imapserver.Server
-	uploader           *uploader.UploadWorker
-	cache              *cache.Cache
-	lookupCache        *lookupcache.LookupCache // Authentication cache (wraps database authentication calls)
-	appCtx             context.Context
-	caps               imap.CapSet
-	tlsConfig          *tls.Config
-	masterUsername     []byte
-	masterPassword     []byte
-	masterSASLUsername []byte
-	masterSASLPassword []byte
-	masterSASLGate     *serverPkg.MasterSASLNetworkGate
-	appendLimit        int64
-	ftsRetention       time.Duration
-	version            string
-	config             *config.Config       // Full config reference for shared mailboxes
-	spamTraining       *spamtraining.Client // Spam filter training client (optional)
+	instanceID     string
+	s3             *resilient.ResilientS3Storage
+	server         *imapserver.Server
+	uploader       *uploader.UploadWorker
+	cache          *cache.Cache
+	lookupCache    *lookupcache.LookupCache // Authentication cache (wraps database authentication calls)
+	appCtx         context.Context
+	caps           imap.CapSet
+	tlsConfig      *tls.Config
+	masterUsername []byte
+	masterPassword []byte
+	appendLimit    int64
+	ftsRetention   time.Duration
+	version        string
+	config         *config.Config       // Full config reference for shared mailboxes
+	spamTraining   *spamtraining.Client // Spam filter training client (optional)
 
 	// Metadata limits (RFC 5464)
 	metadataMaxEntrySize         int
@@ -273,9 +283,6 @@ type IMAPServer struct {
 
 	// Search rate limiting
 	searchRateLimiter *serverPkg.SearchRateLimiter
-
-	// Session memory limit
-	sessionMemoryLimit int64
 
 	// Node-wide total of body-section bytes retained by sessions for <offset.size>
 	// chunk fetches (see body_section_cache.go).
@@ -317,11 +324,11 @@ type IMAPServer struct {
 	idSupportURL string
 
 	// Command timeout and throughput enforcement
-	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
-	commandTimeout         time.Duration
-	commandTimeouts        *CommandTimeouts // Per-command hard execution timeouts (nil = use defaults)
-	absoluteSessionTimeout time.Duration    // Maximum total session duration
-	minBytesPerMinute      int64            // Minimum throughput to prevent slowloris (0 = disabled)
+	authIdleTimeout time.Duration    // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
+	commandTimeouts *CommandTimeouts // Per-command hard execution timeouts (nil = use defaults)
+
+	// The settings ReloadConfig replaces; see reloadableSettings.
+	settings atomic.Pointer[reloadableSettings]
 
 	// Active connection tracking for graceful shutdown
 	activeConnsMutex sync.RWMutex
@@ -570,7 +577,6 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		metadataMaxTotalSize:         options.MetadataMaxTotalSize,
 		authLimiter:                  authLimiter,
 		searchRateLimiter:            searchRateLimiter,
-		sessionMemoryLimit:           options.SessionMemoryLimit,
 		proxyReader:                  proxyReader,
 		enableWarmup:                 options.EnableWarmup,
 		warmupMessageCount:           options.WarmupMessageCount,
@@ -612,18 +618,21 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			imap.Cap("THREAD=ORDEREDSUBJECT"): struct{}{},
 			imap.Cap("MULTISEARCH"):           struct{}{},
 		},
-		masterUsername:         options.MasterUsername,
-		masterPassword:         options.MasterPassword,
+		masterUsername:  options.MasterUsername,
+		masterPassword:  options.MasterPassword,
+		authIdleTimeout: options.AuthIdleTimeout,
+		commandTimeouts: defaultCommandTimeouts(),
+		activeConns:     make(map[*imapserver.Conn]struct{}),
+	}
+	s.settings.Store(&reloadableSettings{
+		commandTimeout:         options.CommandTimeout,
+		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
+		minBytesPerMinute:      options.MinBytesPerMinute,
+		sessionMemoryLimit:     options.SessionMemoryLimit,
 		masterSASLUsername:     options.MasterSASLUsername,
 		masterSASLPassword:     options.MasterSASLPassword,
 		masterSASLGate:         masterSASLGate,
-		authIdleTimeout:        options.AuthIdleTimeout,
-		commandTimeout:         options.CommandTimeout,
-		commandTimeouts:        defaultCommandTimeouts(),
-		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
-		minBytesPerMinute:      options.MinBytesPerMinute,
-		activeConns:            make(map[*imapserver.Conn]struct{}),
-	}
+	})
 
 	// Apply operator-configured per-command timeout overrides on top of defaults.
 	if len(options.CommandTimeoutOverrides) > 0 {
@@ -800,18 +809,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// Start active connections monitoring
 	go s.monitorActiveConnections()
 
-	// Initialize command timeout metrics
-	if s.commandTimeout > 0 {
-		metrics.CommandTimeoutThresholdSeconds.WithLabelValues("imap").Set(s.commandTimeout.Seconds())
-	}
-
-	// go-imap arms its own hardcoded 35-minute read deadline on authenticated
-	// connections (RFC 3501 §5.4 autologout floor + margin) and closes
-	// silently — no BYE, no timeout metric — when it expires. A knob at or
-	// above that value is therefore silently capped by the library.
-	if s.commandTimeout >= 35*time.Minute {
-		logger.Warn("IMAP: command_timeout is at or above the protocol library's 35m read deadline; idle sessions will be closed silently at 35m instead", "name", s.name, "command_timeout", s.commandTimeout)
-	}
+	s.reportCommandTimeout(options.CommandTimeout)
 
 	// Initialize local connection tracking (no gossip, just local tracking)
 	// This enables per-user connection limits and kick functionality on backend servers
@@ -884,7 +882,16 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	s.totalConnections.Add(1)
 
 	// Initialize memory tracker with configured limit
-	memTracker := serverPkg.NewSessionMemoryTracker(s.sessionMemoryLimit)
+	settings := s.settings.Load()
+	memTracker := serverPkg.NewSessionMemoryTracker(settings.sessionMemoryLimit)
+
+	// The IDLE keepalive must beat this connection's idle checker, which took
+	// command_timeout when the connection was accepted: a reload since (during the
+	// TLS handshake above, say) does not change it.
+	checkedIdleTimeout := settings.commandTimeout
+	if checked, ok := serverPkg.ConnCheckedTimeouts(conn.NetConn()); ok {
+		checkedIdleTimeout = checked.Idle
+	}
 
 	session := &IMAPSession{
 		server:     s,
@@ -893,6 +900,8 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		cancel:     sessionCancel,
 		startTime:  time.Now(),
 		memTracker: memTracker,
+
+		checkedIdleTimeout: checkedIdleTimeout,
 	}
 
 	// Extract underlying net.Conn for setting timeouts and proxy protocol handling
@@ -1026,19 +1035,33 @@ func (s *IMAPServer) untrackConnection(conn *imapserver.Conn) {
 	delete(s.activeConns, conn)
 }
 
-func (s *IMAPServer) Serve(imapAddr string) error {
-	var listener net.Listener
-	var err error
+// reportCommandTimeout publishes command_timeout's metric and warns about a value the
+// protocol library caps, at start-up and whenever a reload changes it.
+func (s *IMAPServer) reportCommandTimeout(timeout time.Duration) {
+	metrics.CommandTimeoutThresholdSeconds.WithLabelValues("imap").Set(timeout.Seconds())
 
-	// Configure SoraConn
-	connConfig := serverPkg.SoraConnConfig{
+	// go-imap arms its own hardcoded 35-minute read deadline on authenticated
+	// connections (RFC 3501 §5.4 autologout floor + margin) and closes
+	// silently — no BYE, no timeout metric — when it expires. A knob at or
+	// above that value is therefore silently capped by the library.
+	if timeout >= 35*time.Minute {
+		logger.Warn("IMAP: command_timeout is at or above the protocol library's 35m read deadline; idle sessions will be closed silently at 35m instead", "name", s.name, "command_timeout", timeout)
+	}
+}
+
+// connConfig is the SoraConn configuration for a connection accepted now. The
+// listener asks for it at every accept, so the timeouts a reload changes reach the
+// connections accepted after it.
+func (s *IMAPServer) connConfig() serverPkg.SoraConnConfig {
+	settings := s.settings.Load()
+	return serverPkg.SoraConnConfig{
 		Protocol:             "imap",
 		ServerName:           s.name,
 		Hostname:             s.hostname,
-		IdleTimeout:          s.commandTimeout,
-		AbsoluteTimeout:      s.absoluteSessionTimeout,
-		MinBytesPerMinute:    s.minBytesPerMinute,
-		EnableTimeoutChecker: s.commandTimeout > 0 || s.absoluteSessionTimeout > 0 || s.minBytesPerMinute > 0,
+		IdleTimeout:          settings.commandTimeout,
+		AbsoluteTimeout:      settings.absoluteSessionTimeout,
+		MinBytesPerMinute:    settings.minBytesPerMinute,
+		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0 || settings.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Send BYE message before closing due to timeout (RFC 3501 Section 7.1.5)
 			// Using [UNAVAILABLE] response code helps clients recognize this as a normal
@@ -1059,6 +1082,13 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 			_, _ = fmt.Fprint(conn, message)
 		},
 	}
+}
+
+func (s *IMAPServer) Serve(imapAddr string) error {
+	var listener net.Listener
+	var err error
+
+	connConfig := s.connConfig()
 
 	// Create base TCP listener with custom backlog
 	tcpListener, err := serverPkg.ListenWithBacklog(context.Background(), "tcp", imapAddr, s.listenBacklog)
@@ -1078,17 +1108,17 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 
 	if s.tlsConfig != nil {
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
-		listener = serverPkg.NewSoraTLSListener(base, s.tlsConfig, connConfig)
+		listener = serverPkg.NewSoraTLSListenerFunc(base, s.tlsConfig, s.connConfig)
 		if connConfig.EnableTimeoutChecker {
-			logger.Info("IMAP server listening with TLS", "name", s.name, "addr", imapAddr, "ja4", true, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
+			logger.Info("IMAP server listening with TLS", "name", s.name, "addr", imapAddr, "ja4", true, "idle_timeout", connConfig.IdleTimeout, "session_max", connConfig.AbsoluteTimeout, "min_throughput", connConfig.MinBytesPerMinute)
 		} else {
 			logger.Info("IMAP server listening with TLS", "name", s.name, "addr", imapAddr, "ja4", true)
 		}
 	} else {
 		// Use SoraListener for non-TLS with timeout protection
-		listener = serverPkg.NewSoraListener(base, connConfig)
+		listener = serverPkg.NewSoraListenerFunc(base, s.connConfig)
 		if connConfig.EnableTimeoutChecker {
-			logger.Info("IMAP server listening", "name", s.name, "addr", imapAddr, "tls", false, "idle_timeout", s.commandTimeout, "session_max", s.absoluteSessionTimeout, "min_throughput", s.minBytesPerMinute)
+			logger.Info("IMAP server listening", "name", s.name, "addr", imapAddr, "tls", false, "idle_timeout", connConfig.IdleTimeout, "session_max", connConfig.AbsoluteTimeout, "min_throughput", connConfig.MinBytesPerMinute)
 		} else {
 			logger.Info("IMAP server listening", "name", s.name, "addr", imapAddr, "tls", false)
 		}
@@ -1749,39 +1779,44 @@ func (s *IMAPServer) GetLimiter() *serverPkg.ConnectionLimiter {
 // Called on SIGHUP. Only affects new connections; existing sessions keep old settings.
 func (s *IMAPServer) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	next := *s.settings.Load()
 
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != s.commandTimeout {
-		s.commandTimeout = timeout
+	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
+		s.reportCommandTimeout(timeout)
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != s.absoluteSessionTimeout {
-		s.absoluteSessionTimeout = timeout
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
-	if bpm := cfg.GetMinBytesPerMinute(); bpm != s.minBytesPerMinute {
-		s.minBytesPerMinute = bpm
+	if bpm := cfg.GetMinBytesPerMinute(); bpm != next.minBytesPerMinute {
+		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if limit, err := cfg.GetSessionMemoryLimit(); err == nil && limit != s.sessionMemoryLimit {
-		s.sessionMemoryLimit = limit
+	if limit, err := cfg.GetSessionMemoryLimit(); err == nil && limit != next.sessionMemoryLimit {
+		next.sessionMemoryLimit = limit
 		reloaded = append(reloaded, "session_memory_limit")
 	}
-	if cfg.MasterSASLUsername != string(s.masterSASLUsername) {
-		s.masterSASLUsername = []byte(cfg.MasterSASLUsername)
+	if cfg.MasterSASLUsername != string(next.masterSASLUsername) {
+		next.masterSASLUsername = []byte(cfg.MasterSASLUsername)
 		reloaded = append(reloaded, "master_sasl_username")
 	}
-	if cfg.MasterSASLPassword != string(s.masterSASLPassword) {
-		s.masterSASLPassword = []byte(cfg.MasterSASLPassword)
+	if cfg.MasterSASLPassword != string(next.masterSASLPassword) {
+		next.masterSASLPassword = []byte(cfg.MasterSASLPassword)
 		reloaded = append(reloaded, "master_sasl_password")
 	}
 	if gate, err := serverPkg.NewMasterSASLNetworkGate(cfg.MasterSASLAllowedNetworks); err != nil {
 		logger.Warn("IMAP config reload: invalid master_sasl_allowed_networks, keeping previous gate", "name", s.name, "error", err)
-	} else if !s.masterSASLGate.Equal(gate) {
-		s.masterSASLGate = gate
+	} else if !next.masterSASLGate.Equal(gate) {
+		next.masterSASLGate = gate
 		reloaded = append(reloaded, "master_sasl_allowed_networks")
 	}
 
 	if len(reloaded) > 0 {
+		// Sessions and logins started from now on see the new settings; the
+		// timeouts reach the connections accepted from now on (connConfig).
+		s.settings.Store(&next)
 		logger.Info("IMAP config reloaded", "name", s.name, "updated", reloaded)
 	}
 	return nil

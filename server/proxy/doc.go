@@ -31,7 +31,8 @@
 // the default, is an error (ErrUnknownPool, ErrNoDefaultPool) the proxy turns into a
 // temporary failure; it is never spilled into another pool's backends. A lookup pin to
 // a backend in maintenance is routed among that backend's own pool (PoolOfBackend), or
-// the default pool when it is in none.
+// refused when it is in none. A rejected lookup pin likewise never guesses a named
+// default pool.
 //
 // # Affinity Methods
 //

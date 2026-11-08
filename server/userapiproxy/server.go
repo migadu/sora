@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -43,6 +44,12 @@ type JWTClaims struct {
 	jwt.RegisteredClaims
 }
 
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after; a request loads it once.
+type reloadableSettings struct {
+	jwtSecret string // JWT secret for token validation
+}
+
 // Server represents a User API proxy server
 type Server struct {
 	name                       string
@@ -57,7 +64,6 @@ type Server struct {
 	affinityManager            *server.AffinityManager  // Affinity manager for sticky routing (optional)
 	lookupCache                *lookupcache.LookupCache // Route lookup cache (optional)
 	positiveRevalidationWindow time.Duration            // Revalidation window for cached routes
-	jwtSecret                  string                   // JWT secret for token validation
 	tls                        bool
 	tlsCertFile                string
 	tlsKeyFile                 string
@@ -85,6 +91,9 @@ type Server struct {
 
 	// PROXY protocol support for incoming connections
 	proxyReader *server.ProxyProtocolReader
+
+	// The settings ReloadConfig replaces; see reloadableSettings.
+	settings atomic.Pointer[reloadableSettings]
 }
 
 // ServerOptions holds configuration options for the User API proxy server
@@ -120,6 +129,21 @@ type ServerOptions struct {
 	RemoteUseProxyProtocol bool   // Use PROXY protocol for backend connections
 }
 
+// checkJWTSecret refuses a JWT secret the proxy must not validate with, at start-up and
+// on a config reload alike.
+func checkJWTSecret(secret string) error {
+	if secret == "" {
+		return fmt.Errorf("JWT secret is required for User API proxy")
+	}
+	if len(secret) < 32 {
+		return fmt.Errorf("JWT secret must be at least 32 bytes for HS256 (RFC 7518 §3.2); got %d", len(secret))
+	}
+	if secret == "your-secret-jwt-signing-key-here" {
+		return fmt.Errorf("JWT secret is the placeholder value from config.toml.example — set a real, random jwt_secret")
+	}
+	return nil
+}
+
 // New creates a new User API proxy server
 func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOptions) (*Server, error) {
 	ctx, cancel := context.WithCancel(appCtx)
@@ -129,17 +153,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		return nil, fmt.Errorf("no remote addresses or backend pools configured")
 	}
 
-	if opts.JWTSecret == "" {
+	if err := checkJWTSecret(opts.JWTSecret); err != nil {
 		cancel()
-		return nil, fmt.Errorf("JWT secret is required for User API proxy")
-	}
-	if len(opts.JWTSecret) < 32 {
-		cancel()
-		return nil, fmt.Errorf("JWT secret must be at least 32 bytes for HS256 (RFC 7518 §3.2); got %d", len(opts.JWTSecret))
-	}
-	if opts.JWTSecret == "your-secret-jwt-signing-key-here" {
-		cancel()
-		return nil, fmt.Errorf("JWT secret is the placeholder value from config.toml.example — set a real, random jwt_secret")
+		return nil, err
 	}
 
 	// Set default timeout if not specified
@@ -154,9 +170,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		remotelookupClient, err := proxy.InitializeRemoteLookup("userapi", opts.RemoteLookup)
 		if err != nil {
 			logger.Warn("User API Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
-			if !opts.RemoteLookup.ShouldLookupLocalUsers() {
+			if len(opts.Pools) > 0 || !opts.RemoteLookup.ShouldLookupLocalUsers() {
 				cancel()
-				return nil, fmt.Errorf("remotelookup initialization failed and local lookup disabled: %w", err)
+				return nil, fmt.Errorf("remotelookup initialization failed: %w", err)
 			}
 			logger.Info("User API Proxy: Continuing with consistent hash fallback", "name", opts.Name)
 		} else {
@@ -355,7 +371,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
-	return &Server{
+	s := &Server{
 		name:                       opts.Name,
 		addr:                       opts.Addr,
 		connManager:                connManager,
@@ -368,7 +384,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		affinityManager:            opts.AffinityManager,
 		lookupCache:                lookupCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
-		jwtSecret:                  opts.JWTSecret,
 		tls:                        opts.TLS,
 		tlsCertFile:                opts.TLSCertFile,
 		tlsKeyFile:                 opts.TLSKeyFile,
@@ -382,7 +397,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		ctx:                        ctx,
 		cancel:                     cancel,
 		connReleases:               make(map[net.Conn]func()),
-	}, nil
+	}
+	s.settings.Store(&reloadableSettings{jwtSecret: opts.JWTSecret})
+	return s, nil
 }
 
 // Start starts the User API proxy server
@@ -548,12 +565,12 @@ var errAuthBodyTooLarge = errors.New("auth request body too large")
 
 // routeAuthRequest picks the backend for an unauthenticated auth request.
 func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, error) {
-	email, err := s.peekAuthEmail(r)
+	email, tokenAccountID, err := s.peekAuthIdentity(r)
 	if err != nil {
 		return backendRoute{}, err
 	}
 	if email != "" {
-		return s.routeUser(r.Context(), email, 0, true)
+		return s.routeUser(r.Context(), email, tokenAccountID, true)
 	}
 	// Names nobody: the backend answers the malformed request itself, wherever it lands.
 	pool, err := s.connManager.ResolvePool("")
@@ -567,41 +584,52 @@ func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, error) {
 	return s.poolRoute(addr, pool), nil
 }
 
-// peekAuthEmail reads the user an auth request is for without consuming the request: the
+// peekAuthIdentity reads the user an auth request is for without consuming the request: the
 // email of a login body, or the subject of the (valid) token a refresh body carries. The
 // body is put back for the backend, and read as the backend reads it (the first JSON value)
 // so the two cannot disagree on whose request it is. "" when the body names nobody the
 // proxy can route by; the backend then answers the malformed request itself.
-func (s *Server) peekAuthEmail(r *http.Request) (string, error) {
+// A refresh also carries its token's account ID, for local-fallback ownership checks.
+func (s *Server) peekAuthIdentity(r *http.Request) (string, int64, error) {
 	if r.Body == nil || r.Body == http.NoBody {
-		return "", nil
+		return "", 0, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxAuthBodyBytes+1))
 	r.Body.Close()
 	if err != nil {
-		return "", fmt.Errorf("reading auth request body: %w", err)
+		return "", 0, fmt.Errorf("reading auth request body: %w", err)
 	}
 	if len(body) > maxAuthBodyBytes {
-		return "", errAuthBodyTooLarge
+		return "", 0, errAuthBodyTooLarge
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 
-	var req struct {
-		Email string `json:"email"`
-		Token string `json:"token"`
-	}
-	if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
-		return "", nil
-	}
 	switch r.URL.Path {
 	case "/user/auth/login":
-		return strings.TrimSpace(req.Email), nil
+		// Decode only fields the login endpoint uses. A refresh-only field must
+		// stay unknown here, just as it is to the backend's login decoder.
+		var req struct {
+			Email string `json:"email"`
+		}
+		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
+			return "", 0, nil
+		}
+		return strings.TrimSpace(req.Email), 0, nil
 	case "/user/auth/refresh":
+		var req struct {
+			Token string `json:"token"`
+		}
+		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
+			return "", 0, nil
+		}
 		if claims, err := s.validateToken(req.Token); err == nil {
-			return claims.Email, nil
+			if claims.AccountID <= 0 {
+				return "", 0, fmt.Errorf("refresh token has no valid account ID")
+			}
+			return claims.Email, claims.AccountID, nil
 		}
 	}
-	return "", nil
+	return "", 0, nil
 }
 
 // backendRoute is where a request goes and how its backend leg is spoken: with named
@@ -652,11 +680,11 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 // With named pools, routing never guesses: a lookup that fails, or answers nothing usable,
 // is refused rather than routed into the default pool, because the backends trust the
 // token's account ID and a backend of another pool holds another tenant's account under
-// it. A user the lookup does not know goes to the default pool only with
-// lookup_local_users, as on every other proxy.
+// it. With lookup_local_users, a JWT request the lookup does not know also has to
+// identify an active local account before it can enter the default pool.
 //
 // A backend in maintenance is never picked. A pin to one routes the user among that
-// backend's own siblings (the pool it is a member of, or the default pool) without
+// backend's own siblings (refused if its named pool cannot be identified) without
 // setting affinity, so the pin takes the user back when maintenance ends; an affinity to
 // one is dropped and the user routed afresh, so the new affinity keeps them there after it.
 //
@@ -681,12 +709,18 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			logger.Debug("User API Proxy: Using cached pool", "name", s.name, "user", email, "pool", cached.PoolName, "age", time.Since(cached.CreatedAt))
 			poolName, havePool = cached.PoolName, true
 		case !s.connManager.AllowRemoteLookupBackend(cached.ServerAddress):
+			if named {
+				return backendRoute{}, fmt.Errorf("%w: cached pin is outside the configured pools", proxy.ErrRouteLookupFailed)
+			}
 			// restrict_to_pool re-validates the cached address against the pool (a stale
 			// entry surviving a pool shrink); a passthrough when the feature is off.
 			// Refused: ask the lookup again below.
 		case s.connManager.InMaintenance(cached.ServerAddress):
 			logger.Debug("User API Proxy: Cached backend in maintenance - routing among its siblings", "name", s.name, "user", email, "backend", cached.ServerAddress)
 			poolName, havePool, pinInMaintenance = s.connManager.PoolOfBackend(cached.ServerAddress), true, true
+			if named && poolName == "" {
+				return backendRoute{}, fmt.Errorf("%w: cached pin in maintenance has no pool", proxy.ErrRouteLookupFailed)
+			}
 		default:
 			// NOTE: We do NOT refresh routing cache. Entries should expire after
 			// positive_ttl to allow periodic revalidation via remotelookup, so that when
@@ -733,6 +767,9 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			// false for an out-of-pool address, which then falls through to in-pool routing
 			// below — the bad address is never dialed.
 			if !s.connManager.AllowRemoteLookupBackend(routingInfo.ServerAddress) {
+				if named {
+					return backendRoute{}, fmt.Errorf("%w: pin is outside the configured pools", proxy.ErrRouteLookupFailed)
+				}
 				break
 			}
 			// The answer is cached as given, in maintenance or not: routing decides each
@@ -741,6 +778,9 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			if s.connManager.InMaintenance(routingInfo.ServerAddress) {
 				logger.Info("User API Proxy: Remote lookup backend in maintenance - routing among its siblings", "name", s.name, "user", email, "backend", routingInfo.ServerAddress)
 				poolName, havePool, pinInMaintenance = s.connManager.PoolOfBackend(routingInfo.ServerAddress), true, true
+				if named && poolName == "" {
+					return backendRoute{}, fmt.Errorf("%w: pin in maintenance has no pool", proxy.ErrRouteLookupFailed)
+				}
 				break
 			}
 			logger.Debug("User API Proxy: Using remotelookup backend", "name", s.name, "user", email, "backend", routingInfo.ServerAddress)
@@ -753,8 +793,26 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, PoolName: routingInfo.PoolName})
 		}
 	}
-	if notFound && named && !s.lookupLocalUsers {
-		return backendRoute{}, fmt.Errorf("user is not known to the remote lookup, and lookup_local_users is off")
+	if notFound && named {
+		if !s.lookupLocalUsers {
+			return backendRoute{}, fmt.Errorf("user is not known to the remote lookup, and lookup_local_users is off")
+		}
+		// A valid JWT from another pool may carry the ID of an unrelated local
+		// account. A lookup miss is not evidence that its owner is a local user.
+		// Logins are authenticated by the backend. Requests carrying a token,
+		// including refreshes, need this check on every fallback, including
+		// negative-cache hits; the routing cache cannot establish local ownership.
+		if !forAuth || accountID != 0 {
+			if s.rdb == nil {
+				return backendRoute{}, fmt.Errorf("cannot verify local token ownership without a local database")
+			}
+			localCtx, cancel := context.WithTimeout(ctx, s.rdb.GetQueryTimeout())
+			defer cancel()
+			localID, err := s.rdb.GetActiveAccountIDByAddressWithRetry(localCtx, email)
+			if err != nil || accountID <= 0 || localID != accountID {
+				return backendRoute{}, fmt.Errorf("token does not identify an active local account")
+			}
+		}
 	}
 
 	// 3. Inside the pool: affinity, then consistent hash.
@@ -882,7 +940,7 @@ func (s *Server) validateToken(tokenString string) (*JWTClaims, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
-		return []byte(s.jwtSecret), nil
+		return []byte(s.settings.Load().jwtSecret), nil
 	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 
 	if err != nil {
@@ -974,16 +1032,25 @@ func (s *Server) GetConnectionManager() *proxy.ConnectionManager {
 // ReloadConfig updates runtime-configurable settings from new config.
 func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	var refused error
+	next := *s.settings.Load()
 
-	if cfg.JWTSecret != "" && cfg.JWTSecret != s.jwtSecret {
-		s.jwtSecret = cfg.JWTSecret
-		reloaded = append(reloaded, "jwt_secret")
+	if cfg.JWTSecret != "" && cfg.JWTSecret != next.jwtSecret {
+		if err := checkJWTSecret(cfg.JWTSecret); err != nil {
+			// The rest still reloads. The error has the caller log a failed reload, so an
+			// operator rotating a leaked secret learns that the old one is still live.
+			refused = fmt.Errorf("jwt_secret refused, the previous one stays in use: %w", err)
+		} else {
+			next.jwtSecret = cfg.JWTSecret
+			reloaded = append(reloaded, "jwt_secret")
+		}
 	}
 
 	if len(reloaded) > 0 {
+		s.settings.Store(&next)
 		logger.Info("User API proxy config reloaded", "name", s.name, "updated", reloaded)
 	}
-	return nil
+	return refused
 }
 
 func (s *Server) Stop() error {

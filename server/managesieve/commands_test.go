@@ -26,7 +26,6 @@ func TestCheckScript(t *testing.T) {
 		authenticated: true,
 		ctx:           context.Background(),
 		server: &ManageSieveServer{
-			maxScriptSize:       1024,
 			supportedExtensions: []string{"fileinto"},
 		},
 	}
@@ -71,7 +70,6 @@ func TestCheckScriptAcceptsRejectByDefault(t *testing.T) {
 		authenticated: true,
 		ctx:           context.Background(),
 		server: &ManageSieveServer{
-			maxScriptSize:       1024,
 			supportedExtensions: DefaultEnabledExtensions,
 		},
 	}
@@ -100,9 +98,7 @@ func TestHaveSpaceAdvisoryWithoutDB(t *testing.T) {
 		},
 		authenticated: true,
 		ctx:           context.Background(),
-		server: &ManageSieveServer{
-			maxScriptSize: 1024,
-		},
+		server:        &ManageSieveServer{},
 	}
 
 	if err := session.HaveSpace(context.Background(), "myscript", 512); err != nil {

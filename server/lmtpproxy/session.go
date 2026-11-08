@@ -23,8 +23,9 @@ import (
 // Session represents an LMTP proxy session.
 type Session struct {
 	server                *Server
-	clientConn            net.Conn // Reassigned on STARTTLS; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
-	backendConn           net.Conn // Reassigned on backend connect/STARTTLS/error; writes must hold mu (same reason)
+	settings              *reloadableSettings // the server's settings when the session started (see reloadableSettings)
+	clientConn            net.Conn            // Reassigned on STARTTLS; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
+	backendConn           net.Conn            // Reassigned on backend connect/STARTTLS/error; writes must hold mu (same reason)
 	backendReader         *bufio.Reader
 	backendWriter         *bufio.Writer
 	clientReader          *bufio.Reader
@@ -88,6 +89,7 @@ func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *
 
 	return &Session{
 		server:               s,
+		settings:             s.loadSettings(),
 		clientConn:           conn,
 		clientReader:         bufio.NewReader(conn),
 		clientWriter:         bufio.NewWriter(conn),
@@ -131,16 +133,16 @@ func (s *Session) handleConnection() {
 	}()
 
 	// Enforce absolute session timeout to prevent hung sessions from leaking
-	if s.server.absoluteSessionTimeout > 0 {
-		timeout := time.AfterFunc(s.server.absoluteSessionTimeout, func() {
-			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.server.absoluteSessionTimeout)
+	if s.settings.absoluteSessionTimeout > 0 {
+		timeout := time.AfterFunc(s.settings.absoluteSessionTimeout, func() {
+			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.settings.absoluteSessionTimeout)
 			s.cancel() // Force cancel context to unblock any stuck I/O
 		})
 		defer timeout.Stop()
 	}
 
 	// Log connection at INFO level
-	s.InfoLog("connected", "absolute_timeout", s.server.absoluteSessionTimeout, "auth_idle_timeout", s.server.authIdleTimeout)
+	s.InfoLog("connected", "absolute_timeout", s.settings.absoluteSessionTimeout, "auth_idle_timeout", s.server.authIdleTimeout)
 
 	// Register this session for graceful shutdown tracking
 	s.server.registerSession(s)
@@ -231,8 +233,8 @@ func (s *Session) handleConnection() {
 				}
 
 				s.sendResponse("250-PIPELINING")
-				if s.server.maxMessageSize > 0 {
-					s.sendResponse(fmt.Sprintf("250-SIZE %d", s.server.maxMessageSize))
+				if s.settings.maxMessageSize > 0 {
+					s.sendResponse(fmt.Sprintf("250-SIZE %d", s.settings.maxMessageSize))
 				}
 				s.sendResponse("250-ENHANCEDSTATUSCODES")
 				s.sendResponse("250-8BITMIME")
@@ -618,7 +620,7 @@ func (s *Session) getLogger() *server.ProxySessionLogger {
 		Username:   s.username,
 		AccountID:  s.accountID,
 		SessionID:  s.sessionID,
-		Debug:      s.server.debug,
+		Debug:      s.server.loadSettings().debug,
 	}
 }
 

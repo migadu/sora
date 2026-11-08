@@ -116,24 +116,33 @@ func (c *connectionLimitingConn) Close() error {
 	return c.Conn.Close()
 }
 
+// reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
+// publishes a new one whole and none is changed after: a delivery loads it once and
+// uses that copy throughout, so it never mixes the values of two reloads.
+type reloadableSettings struct {
+	maxMessageSize int64 // Maximum size for incoming messages
+	debug          bool
+}
+
 type LMTPServerBackend struct {
 	addr     string
 	name     string
 	hostname string
 	// instanceID keys the upload lease (pending_uploads.instance_id). Distinct from
 	// hostname, which is published in the Received header this server stamps.
-	instanceID     string
-	rdb            *resilient.ResilientDatabase
-	s3             *storage.S3Storage
-	uploader       *uploader.UploadWorker
-	server         *smtp.Server
-	appCtx         context.Context
-	tlsConfig      *tls.Config
-	debug          bool
-	ftsRetention   time.Duration
-	maxMessageSize int64               // Maximum size for incoming messages
-	relayQueue     delivery.RelayQueue // Disk-based queue for relay retry
-	relayWorker    RelayWorkerNotifier // Optional: notifies worker for immediate processing
+	instanceID   string
+	rdb          *resilient.ResilientDatabase
+	s3           *storage.S3Storage
+	uploader     *uploader.UploadWorker
+	server       *smtp.Server
+	appCtx       context.Context
+	tlsConfig    *tls.Config
+	ftsRetention time.Duration
+	relayQueue   delivery.RelayQueue // Disk-based queue for relay retry
+	relayWorker  RelayWorkerNotifier // Optional: notifies worker for immediate processing
+
+	// The settings ReloadConfig replaces; see reloadableSettings.
+	settings atomic.Pointer[reloadableSettings]
 
 	redirectRateLimit  int
 	redirectRateWindow time.Duration
@@ -251,9 +260,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		rdb:                rdb,
 		s3:                 s3,
 		uploader:           uploadWorker,
-		debug:              options.Debug,
 		ftsRetention:       options.FTSRetention,
-		maxMessageSize:     options.MaxMessageSize,
 		proxyReader:        proxyReader,
 		relayQueue:         options.RelayQueue,
 		relayWorker:        options.RelayWorker,
@@ -262,6 +269,10 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		maxRedirectHops:    options.MaxRedirectHops,
 		commandTimeouts:    defaultCommandTimeouts(),
 	}
+	backend.settings.Store(&reloadableSettings{
+		maxMessageSize: options.MaxMessageSize,
+		debug:          options.Debug,
+	})
 
 	// Apply operator overrides for per-command execution timeouts
 	if len(options.CommandTimeoutOverrides) > 0 {
@@ -601,17 +612,19 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 // Called on SIGHUP. Only affects new deliveries; in-flight messages keep old settings.
 func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
+	next := *b.settings.Load()
 
-	if maxSize := cfg.GetMaxMessageSizeWithDefault(); maxSize != b.maxMessageSize {
-		b.maxMessageSize = maxSize
+	if maxSize := cfg.GetMaxMessageSizeWithDefault(); maxSize != next.maxMessageSize {
+		next.maxMessageSize = maxSize
 		reloaded = append(reloaded, "max_message_size")
 	}
-	if cfg.Debug != b.debug {
-		b.debug = cfg.Debug
+	if cfg.Debug != next.debug {
+		next.debug = cfg.Debug
 		reloaded = append(reloaded, "debug")
 	}
 
 	if len(reloaded) > 0 {
+		b.settings.Store(&next)
 		logger.Info("LMTP config reloaded", "name", b.name, "updated", reloaded)
 	}
 	return nil

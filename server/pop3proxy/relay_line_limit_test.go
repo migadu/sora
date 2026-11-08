@@ -24,13 +24,13 @@ func TestRelayLineTooLong(t *testing.T) {
 	defer backendB.Close()
 
 	srv := &POP3ProxyServer{
-		name:           "test",
-		hostname:       "test-host",
-		commandTimeout: 5 * time.Second,
+		name:     "test",
+		hostname: "test-host",
 	}
 
 	sess := &POP3ProxySession{
 		server:       srv,
+		settings:     &reloadableSettings{commandTimeout: 5 * time.Second},
 		clientConn:   clientA,
 		clientReader: bufio.NewReader(clientA),
 		backendConn:  backendA,
