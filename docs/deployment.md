@@ -18,6 +18,16 @@ Sora uses a schema for its PostgreSQL database. Before running the server for th
 ./sora-admin -config /path/to/config.toml migrate up
 ```
 
+### Vacation suppression during rolling upgrades
+
+Vacation replies claim their per-account, sender, and response-identity period on
+the primary database immediately before relay handoff. Concurrent deliveries on
+upgraded nodes share that claim, so only one queues a reply. Upgrade every node
+that handles LMTP or Admin API delivery before relying on this guarantee: older
+nodes do not participate in the claim and can still send a duplicate during a
+mixed-version rollout. A failed or uncertain claim skips the reply; it does not
+prevent delivery of the incoming message.
+
 ## Scenario 1: Single-Node Deployment
 
 This is the simplest way to run Sora, with all components on a single instance. It's suitable for smaller-scale deployments or for testing.

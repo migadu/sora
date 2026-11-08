@@ -241,6 +241,20 @@ func (rd *ResilientDatabase) RecordVacationResponseWithRetry(ctx context.Context
 	return err
 }
 
+// ClaimVacationResponseWithRetry atomically consumes the sender/response period
+// on the write pool. A failed COMMIT is not retried by the shared transaction
+// wrapper: an ambiguous claim must fail closed rather than authorize a reply.
+func (rd *ResilientDatabase) ClaimVacationResponseWithRetry(ctx context.Context, accountID int64, sender, responseIdentity string, duration time.Duration) (bool, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).ClaimVacationResponse(ctx, tx, accountID, sender, responseIdentity, duration)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
 // Redirect rate limit methods
 
 // CountRedirectsSinceWithRetry returns the number of redirects performed by the given account within the specified duration window with retry logic

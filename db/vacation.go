@@ -2,9 +2,11 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 )
 
 // VacationResponse represents a record of a vacation auto-response sent to a sender
@@ -26,6 +28,47 @@ func (db *Database) RecordVacationResponse(ctx context.Context, tx pgx.Tx, Accou
 	`, AccountID, senderAddress, responseIdentity, now)
 
 	return err
+}
+
+// ClaimVacationResponse atomically consumes a response's suppression period. It
+// must run in a fresh write transaction, committed before a winning reply is sent.
+// A losing caller writes no history. Evaluation-time allowance checks are only
+// an optimization: other deliveries may have passed them before this claim.
+func (db *Database) ClaimVacationResponse(ctx context.Context, tx pgx.Tx, accountID int64, senderAddress, responseIdentity string, duration time.Duration) (bool, error) {
+	// Each statement after waiting for the lock must see the preceding winner's
+	// commit, even if the connection's default isolation is REPEATABLE READ.
+	// Call this before any snapshot-taking statement in the transaction.
+	if _, err := tx.Exec(ctx, `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`); err != nil {
+		return false, fmt.Errorf("set vacation claim isolation: %w", err)
+	}
+	// Length prefixes make the tuple unambiguous. Hash collisions only serialize
+	// unrelated claims; the full tuple below always decides suppression.
+	key := fmt.Sprintf("%d:%d:%s%d:%s", accountID, len(senderAddress), senderAddress, len(responseIdentity), responseIdentity)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext($2))`, consts.SoraVacationClaimLockClassID, key); err != nil {
+		return false, fmt.Errorf("lock vacation response claim: %w", err)
+	}
+	// Keep this separate from the lock statement: a statement snapshot taken
+	// before waiting for its lock would miss a winner that committed during it.
+	var recent bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM vacation_responses
+			WHERE account_id = $1 AND sender_address = $2 AND response_identity = $3
+			  AND response_date > clock_timestamp() - $4::interval
+		)
+	`, accountID, senderAddress, responseIdentity, duration).Scan(&recent); err != nil {
+		return false, fmt.Errorf("check vacation response claim: %w", err)
+	}
+	if recent {
+		return false, nil
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO vacation_responses (account_id, sender_address, response_identity, response_date, created_at)
+		VALUES ($1, $2, $3, clock_timestamp(), clock_timestamp())
+	`, accountID, senderAddress, responseIdentity); err != nil {
+		return false, fmt.Errorf("record vacation response claim: %w", err)
+	}
+	return true, nil
 }
 
 // HasRecentVacationResponse checks if a vacation response was sent to this sender within the specified duration

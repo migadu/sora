@@ -16,3 +16,7 @@ const SoraMigrationLeaderLockID = SoraAdvisoryLockID + 1
 // SoraFTSOrphanSweepLockClassID is the class ID used for transaction-scoped advisory locks
 // coordinating FTS delivery staging (shared) and orphan sweep deletion (exclusive).
 const SoraFTSOrphanSweepLockClassID = int32(0x46545332) // "FTS2" in hex = 1179997490
+
+// SoraVacationClaimLockClassID separates per-response claims from other users of
+// PostgreSQL's two-integer advisory lock namespace.
+const SoraVacationClaimLockClassID = int32(0x56414341) // "VACA"
