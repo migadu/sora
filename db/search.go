@@ -1356,7 +1356,7 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 	scanDuration := time.Since(scanStart)
 	if err != nil {
 		logger.Error("Database: failed scanning messages", "err", err, "scan_duration", scanDuration, "query_duration", time.Since(start), "mailbox_id", mailboxID, "query", finalQueryString, "args", whereArgs)
-		return nil, fmt.Errorf("getMessagesQueryExecutor: failed to scan messages: %w", err)
+		return nil, fmt.Errorf("getSearchMessagesQueryExecutor: failed to scan messages: %w", err)
 	}
 	if scanDuration > 5*time.Second {
 		logger.Warn("Database: slow message scan detected", "scan_duration", scanDuration, "row_count", len(messages), "mailbox_id", mailboxID, "query_type", metricsLabel, "query", finalQueryString, "args", whereArgs)
