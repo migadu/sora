@@ -58,6 +58,10 @@ var (
 	ErrCrossDomainGrant = errors.New("cannot grant access to user from different domain")
 )
 
+// ErrInvalidACLRight is returned by ValidateACLRights for a character that is not
+// one of AllACLRights.
+var ErrInvalidACLRight = errors.New("invalid ACL right")
+
 // unionRights returns the set union of two ACL rights strings, preserving the
 // order of first appearance and removing duplicates.
 func unionRights(a, b string) string {
@@ -76,7 +80,7 @@ func unionRights(a, b string) string {
 func ValidateACLRights(rights string) error {
 	for _, r := range rights {
 		if !strings.ContainsRune(AllACLRights, r) {
-			return fmt.Errorf("invalid ACL right: %c", r)
+			return fmt.Errorf("%w: %c", ErrInvalidACLRight, r)
 		}
 	}
 	return nil
@@ -113,7 +117,7 @@ func (db *Database) GrantMailboxAccessByIdentifier(ctx context.Context, ownerAcc
 	`, ownerAccountID, mailboxName).Scan(&mailboxID, &isShared, &ownerDomain)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return fmt.Errorf("mailbox not found: %w", err)
+			return fmt.Errorf("%w: %s", consts.ErrMailboxNotFound, mailboxName)
 		}
 		return fmt.Errorf("failed to get mailbox: %w", err)
 	}

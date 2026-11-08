@@ -2,8 +2,11 @@ package adminapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
+	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/server/aclservice"
 )
@@ -28,6 +31,19 @@ type ACLListResponse struct {
 	Mailbox string                `json:"mailbox"` // Mailbox name
 	Owner   string                `json:"owner"`   // Owner email
 	ACLs    []aclservice.ACLEntry `json:"acls"`    // List of ACL entries
+}
+
+// aclErrorStatus maps an aclservice error to its HTTP status: a refused grant, or an
+// owner, mailbox or user that does not resolve, is the caller's to fix (4xx), and
+// anything else is a server fault (500).
+func aclErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, consts.ErrUserNotFound), errors.Is(err, consts.ErrMailboxNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, db.ErrInvalidACLRight), errors.Is(err, db.ErrMailboxNotShared), errors.Is(err, db.ErrCrossDomainGrant):
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
 }
 
 // handleACLGrant handles POST /admin/mailboxes/acl/grant
@@ -61,6 +77,10 @@ func (s *Server) handleACLGrant(w http.ResponseWriter, r *http.Request) {
 
 	// Grant ACL
 	if err := aclSvc.Grant(r.Context(), req.Owner, req.Mailbox, req.Identifier, req.Rights); err != nil {
+		if status := aclErrorStatus(err); status != http.StatusInternalServerError {
+			s.writeError(w, status, err.Error())
+			return
+		}
 		logger.Debug("Admin API: ACL grant failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to grant ACL")
 		return
@@ -104,7 +124,13 @@ func (s *Server) handleACLRevoke(w http.ResponseWriter, r *http.Request) {
 	aclSvc := aclservice.New(s.rdb)
 
 	// Revoke ACL
-	if err := aclSvc.Revoke(r.Context(), req.Owner, req.Mailbox, req.Identifier); err != nil {
+	// Revoking an entry that is not there leaves the ACL as asked, as IMAP DELETEACL
+	// does (RFC 4314 §3.2), so it succeeds.
+	if err := aclSvc.Revoke(r.Context(), req.Owner, req.Mailbox, req.Identifier); err != nil && !errors.Is(err, consts.ErrDBNotFound) {
+		if status := aclErrorStatus(err); status != http.StatusInternalServerError {
+			s.writeError(w, status, err.Error())
+			return
+		}
 		logger.Debug("Admin API: ACL revoke failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to revoke ACL")
 		return
@@ -143,6 +169,10 @@ func (s *Server) handleACLList(w http.ResponseWriter, r *http.Request) {
 	// List ACLs
 	acls, err := aclSvc.List(r.Context(), owner, mailbox)
 	if err != nil {
+		if status := aclErrorStatus(err); status != http.StatusInternalServerError {
+			s.writeError(w, status, err.Error())
+			return
+		}
 		logger.Debug("Admin API: ACL list failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Failed to list ACLs")
 		return
