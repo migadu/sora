@@ -201,6 +201,9 @@ type SoraConn struct {
 
 	// Timeout callback
 	onTimeout func(conn net.Conn, reason string) // Called before closing due to timeout
+	// noticeConn returns the connection the timeout notice is written to in place
+	// of the transport (see SetTimeoutNoticeConn); nil writes to the transport.
+	noticeConn func() net.Conn
 
 	// Lifecycle management
 	closed     bool
@@ -239,7 +242,8 @@ type SoraConnConfig struct {
 	// It runs outside the scheduler, with a bounded write deadline and transport
 	// closure to unblock pending I/O. It must not wait on anything other than conn I/O.
 	// If nil, the connection will be closed without sending any message.
-	// The conn parameter is the underlying net.Conn for writing goodbye messages.
+	// The conn parameter is the connection to write the goodbye message to: the
+	// underlying transport, or the connection registered with SetTimeoutNoticeConn.
 	OnTimeout func(conn net.Conn, reason string)
 }
 
@@ -390,6 +394,19 @@ func (c *SoraConn) closeForTimeout(username, reason string, details ...any) {
 		// for the shard to exit, so the shard must not perform this operation.
 		unregisterConn(c)
 		transport := c.Conn
+		// The notice goes to the connection the protocol is using now: the
+		// transport, unless a library layered its own connection above this
+		// one (STARTTLS) and registered it with SetTimeoutNoticeConn. Both
+		// reach the socket through transport, whose deadline bounds the write.
+		notice := transport
+		c.mu.RLock()
+		current := c.noticeConn
+		c.mu.RUnlock()
+		if current != nil {
+			if nc := current(); nc != nil {
+				notice = nc
+			}
+		}
 		// A concurrent protocol writer can replace the deadline, and TLS Close
 		// can wait while sending close_notify. Close the underlying transport
 		// at the same bound so neither can strand this goroutine.
@@ -398,10 +415,41 @@ func (c *SoraConn) closeForTimeout(username, reason string, details ...any) {
 		defer c.Close()
 		if c.onTimeout != nil {
 			if err := transport.SetWriteDeadline(time.Now().Add(timeoutNoticeGrace)); err == nil {
-				c.onTimeout(transport, reason)
+				c.onTimeout(notice, reason)
 			}
 		}
 	}()
+}
+
+// setTimeoutNoticeConn registers the provider of the connection a timeout
+// notice is written to; see SetTimeoutNoticeConn.
+func (c *SoraConn) setTimeoutNoticeConn(current func() net.Conn) {
+	c.mu.Lock()
+	c.noticeConn = current
+	c.mu.Unlock()
+}
+
+// SetTimeoutNoticeConn has the SoraConn that conn is or wraps write its timeout
+// notice to the connection current returns when the timeout fires, in place of
+// its transport. A protocol library that upgrades the stream with STARTTLS
+// layers its TLS connection ABOVE the SoraConn, so a notice written to the
+// transport lands in plaintext under the TLS records and the client sees a TLS
+// error in place of it (#163). Pass the library's accessor for its current
+// connection: the SoraConn itself until an upgrade, the TLS connection after
+// it. It returns false when there is no SoraConn under conn.
+func SetTimeoutNoticeConn(conn net.Conn, current func() net.Conn) bool {
+	for conn != nil {
+		if sc, ok := conn.(interface{ setTimeoutNoticeConn(func() net.Conn) }); ok {
+			sc.setTimeoutNoticeConn(current)
+			return true
+		}
+		w, ok := conn.(interface{ Unwrap() net.Conn })
+		if !ok {
+			return false
+		}
+		conn = w.Unwrap()
+	}
+	return false
 }
 
 // closeTimeoutTransport bypasses TLS close_notify and wrapper cleanup, which
