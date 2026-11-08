@@ -94,7 +94,26 @@ func IsSpecialIdentifier(identifier string) bool {
 // GrantMailboxAccessByIdentifier grants access to a mailbox using an identifier (email or "anyone")
 // Enforces same-domain restriction for security
 func (db *Database) GrantMailboxAccessByIdentifier(ctx context.Context, ownerAccountID int64, identifier string, mailboxName string, rights string) error {
-	// Validate rights string
+	if err := ValidateACLRights(rights); err != nil {
+		return err
+	}
+	var mailboxID int64
+	err := db.GetWritePool().QueryRow(ctx, `
+		SELECT id FROM mailboxes
+		WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
+	`, ownerAccountID, mailboxName).Scan(&mailboxID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: %s", consts.ErrMailboxNotFound, mailboxName)
+		}
+		return fmt.Errorf("failed to get mailbox: %w", err)
+	}
+	return db.GrantMailboxAccessByID(ctx, mailboxID, identifier, rights)
+}
+
+// GrantMailboxAccessByID grants rights on the exact mailbox the caller authorized.
+// Resolving its name again could target a different mailbox after a concurrent rename.
+func (db *Database) GrantMailboxAccessByID(ctx context.Context, mailboxID int64, identifier, rights string) error {
 	if err := ValidateACLRights(rights); err != nil {
 		return err
 	}
@@ -107,17 +126,17 @@ func (db *Database) GrantMailboxAccessByIdentifier(ctx context.Context, ownerAcc
 	defer tx.Rollback(context.Background())
 
 	// Get mailbox details within the transaction
-	var mailboxID int64
 	var isShared bool
 	var ownerDomain *string
 	err = tx.QueryRow(ctx, `
-		SELECT id, COALESCE(is_shared, FALSE), owner_domain
+		SELECT COALESCE(is_shared, FALSE), owner_domain
 		FROM mailboxes
-		WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
-	`, ownerAccountID, mailboxName).Scan(&mailboxID, &isShared, &ownerDomain)
+		WHERE id = $1 AND deleted_at IS NULL
+		FOR SHARE
+	`, mailboxID).Scan(&isShared, &ownerDomain)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return fmt.Errorf("%w: %s", consts.ErrMailboxNotFound, mailboxName)
+			return fmt.Errorf("%w: %d", consts.ErrMailboxNotFound, mailboxID)
 		}
 		return fmt.Errorf("failed to get mailbox: %w", err)
 	}

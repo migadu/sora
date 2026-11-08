@@ -376,10 +376,17 @@ func (s *IMAPSession) SetACL(ctx context.Context, mailbox string, identifier ima
 		return nil
 	}
 
-	// Grant on the mailbox's owner, not the session's account: a user holding 'a'
-	// on someone else's shared mailbox administers that mailbox (RFC 4314 §2.1).
-	err = s.server.rdb.GrantMailboxAccessByIdentifierWithRetry(writeCtx, mbox.AccountID, identifierStr, mbox.Name, finalRights)
+	// Use the ID whose 'a' right we checked. A concurrent rename can put a
+	// different mailbox at this name, on which the caller has no permission.
+	err = s.server.rdb.GrantMailboxAccessByIDWithRetry(writeCtx, mbox.ID, identifierStr, finalRights)
 	if err != nil {
+		if errors.Is(err, consts.ErrMailboxNotFound) {
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeNonExistent,
+				Text: fmt.Sprintf("mailbox '%s' no longer exists", mailbox),
+			}
+		}
 		// RFC 5530 CANNOT: these grants can never succeed, which the client must be
 		// able to tell from a server fault.
 		if errors.Is(err, db.ErrMailboxNotShared) {
