@@ -491,8 +491,8 @@ func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData
 func (p *SievePolicy) VacationResponseAllowed(ctx context.Context, d *interp.RuntimeData,
 	originalSender, responseIdentity string, duration time.Duration) (bool, error) {
 
-	// Key for in-memory tracking (per script execution, per handle)
-	// This is for Sieve's :handle specific cooldown within the same script evaluation.
+	// Key for in-memory tracking (per script execution, per response identity)
+	// This is the cooldown per response identity within the same script evaluation.
 	inMemoryKey := originalSender + ":" + responseIdentity
 
 	if p.vacationOracle != nil {
@@ -511,12 +511,12 @@ func (p *SievePolicy) VacationResponseAllowed(ctx context.Context, d *interp.Run
 		}
 		lastSent, exists := p.vacationResponses[inMemoryKey]
 		if exists && time.Since(lastSent) < duration {
-			return false, nil // Deny based on in-script, per-handle cooldown for this session
+			return false, nil // Deny based on in-script, per-identity cooldown for this session
 		}
 	}
 
 	// If allowed (either by oracle or by lack of recent in-memory for no-oracle case),
-	// update the in-memory map for this specific script execution session and handle.
+	// update the in-memory map for this specific script execution session and response identity.
 	if p.vacationResponses == nil {
 		p.vacationResponses = make(map[string]time.Time)
 	}
