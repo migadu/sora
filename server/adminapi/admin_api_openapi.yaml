@@ -2363,7 +2363,8 @@ paths:
         Only mailboxes in the shared namespace (e.g. "Shared/") carry grants, and only
         to users in the owner's domain other than the owner, who always holds every
         right; any other grant is refused with 400. A user may be named by any of
-        their addresses in any case; the entry is stored under their primary address.
+        their addresses in the owner's domain, in any case; the entry is stored, and
+        listed, under their primary address.
       security:
         - ApiKeyAuth: []
       requestBody:
@@ -2446,8 +2447,8 @@ paths:
       description: |
         Revoke all ACL (Access Control List) rights from a specific user or identifier on a mailbox.
         The identifier names its account whatever its case or which of the account's
-        addresses is given. Revoking from an identifier that holds no entry succeeds
-        and changes nothing.
+        addresses is given (the address shown by the list works). Revoking from an
+        identifier that holds no entry succeeds and changes nothing.
       security:
         - ApiKeyAuth: []
       requestBody:
@@ -2524,7 +2525,8 @@ paths:
       summary: List all ACL entries for a mailbox
       description: |
         Retrieve all ACL (Access Control List) entries for a specific mailbox.
-        Returns a list of identifiers (email addresses or "anyone") and their associated rights.
+        Returns a list of identifiers (email addresses or "anyone") and their associated rights:
+        one entry per account, under its current primary address, and the owner with every right.
       security:
         - ApiKeyAuth: []
       parameters:

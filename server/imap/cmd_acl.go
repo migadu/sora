@@ -171,18 +171,17 @@ func (s *IMAPSession) GetACL(ctx context.Context, mailbox string) (*imap.GetACLD
 	}
 
 	// Convert ACL entries to IMAP format
-	// Use the identifier field directly (email or "anyone"). The owner holds every
-	// right whatever a stored row says (has_mailbox_right), so it is listed that way.
+	// GetMailboxACLs lists each grantee under its current primary address, and the
+	// owner with every right, which it holds whatever a stored row says.
 	aclList := make([]imap.ACLEntry, 0, len(aclEntries)+1)
 	ownerListed := false
 	for _, entry := range aclEntries {
-		rights := entry.Rights
 		if entry.AccountID != nil && *entry.AccountID == mbox.AccountID {
-			rights, ownerListed = db.AllACLRights, true
+			ownerListed = true
 		}
 		aclList = append(aclList, imap.ACLEntry{
 			Identifier: imap.RightsIdentifier(entry.Identifier),
-			Rights:     stringToRightSet(rights),
+			Rights:     stringToRightSet(entry.Rights),
 		})
 	}
 
@@ -426,6 +425,13 @@ func (s *IMAPSession) ListRights(ctx context.Context, mailbox string, identifier
 	identifierEmail := string(identifier)
 	grantability, err := s.server.rdb.MailboxACLGrantabilityWithRetry(readCtx, mbox.ID, identifierEmail)
 	if err != nil {
+		if errors.Is(err, consts.ErrMailboxNotFound) {
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeNonExistent,
+				Text: fmt.Sprintf("mailbox '%s' no longer exists", mailbox),
+			}
+		}
 		if errors.Is(err, consts.ErrUserNotFound) {
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,

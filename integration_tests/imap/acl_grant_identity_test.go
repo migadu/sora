@@ -34,11 +34,17 @@ type aclPermissionGate struct {
 	reached, release     chan struct{}
 	paused               atomic.Bool
 	resumeOnce           sync.Once
+	// inTransaction pauses at the 'a' re-check inside the ACL write transaction,
+	// with the ACL lock held, instead of at SETACL's own check before it.
+	inTransaction bool
 }
 
 func (g *aclPermissionGate) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
-	if strings.Contains(data.SQL, "SELECT has_mailbox_right(") && len(data.Args) == 3 &&
-		data.Args[0] == g.mailboxID && data.Args[1] == g.accountID && data.Args[2] == "a" {
+	if !strings.Contains(data.SQL, "SELECT has_mailbox_right(") || len(data.Args) < 2 ||
+		data.Args[0] != g.mailboxID || data.Args[1] != g.accountID {
+		return ctx
+	}
+	if g.inTransaction && len(data.Args) == 2 || !g.inTransaction && len(data.Args) == 3 && data.Args[2] == "a" {
 		return context.WithValue(ctx, aclPermissionGateKey{}, true)
 	}
 	return ctx

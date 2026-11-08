@@ -123,7 +123,7 @@ type aclQuerier interface {
 type aclMailbox struct {
 	ownerAccountID int64
 	isShared       bool
-	ownerDomain    string
+	ownerDomain    string // empty if unknown; only a grant needs it
 }
 
 func getACLMailbox(ctx context.Context, q aclQuerier, mailboxID int64, lock string) (aclMailbox, error) {
@@ -138,9 +138,6 @@ func getACLMailbox(ctx context.Context, q aclQuerier, mailboxID int64, lock stri
 	}
 	if err != nil {
 		return mb, fmt.Errorf("failed to get mailbox: %w", err)
-	}
-	if mb.isShared && mb.ownerDomain == "" {
-		return mb, fmt.Errorf("shared mailbox %d has no owner domain", mailboxID)
 	}
 	return mb, nil
 }
@@ -167,6 +164,14 @@ func (db *Database) beginACLWrite(ctx context.Context, mailboxID int64) (pgx.Tx,
 	return tx, mb, nil
 }
 
+// outsideOwnerDomain reports whether an address is outside a shared mailbox's owner
+// domain. It is decided from the text alone, before any lookup, so a refusal on
+// these grounds never tells whether the address exists.
+func outsideOwnerDomain(mb aclMailbox, identifier string) bool {
+	at := strings.LastIndexByte(identifier, '@')
+	return mb.isShared && mb.ownerDomain != "" && at >= 0 && !strings.EqualFold(identifier[at+1:], mb.ownerDomain)
+}
+
 // resolveGrantee returns who identifier names as a grantee on a shared mailbox:
 // "anyone", or an active account in the owner's domain, stored under its primary
 // address (RFC 4314 §3.4 lets "multiple forms of an identifier" name one account).
@@ -176,11 +181,14 @@ func resolveGrantee(ctx context.Context, q aclQuerier, mb aclMailbox, identifier
 	if identifier == AnyoneIdentifier {
 		return nil, AnyoneIdentifier, nil
 	}
+	if mb.ownerDomain == "" {
+		return nil, "", fmt.Errorf("shared mailbox has no owner domain")
+	}
 	at := strings.LastIndexByte(identifier, '@')
 	if at < 0 {
 		return nil, "", fmt.Errorf("%w: user %s not found", consts.ErrUserNotFound, identifier)
 	}
-	if !strings.EqualFold(identifier[at+1:], mb.ownerDomain) {
+	if outsideOwnerDomain(mb, identifier) {
 		return nil, "", fmt.Errorf("%w (owner: %s, grantee: %s)", ErrCrossDomainGrant, mb.ownerDomain, identifier[at+1:])
 	}
 	var id int64
@@ -207,38 +215,68 @@ func resolveGrantee(ctx context.Context, q aclQuerier, mb aclMailbox, identifier
 	return &id, primary, nil
 }
 
-// aclRowsFor returns the ACL rows on mailboxID that identifier names and the union
-// of their rights: every row of the account the identifier is an address of (in any
-// case, an alias, a deleted account too), or, when it is no account's address, rows
-// stored under that text, such as one written before its address changed.
-func aclRowsFor(ctx context.Context, tx pgx.Tx, mailboxID int64, identifier string) ([]int64, string, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT id, rights FROM mailbox_acls
-		WHERE mailbox_id = $1 AND (
-			account_id = (SELECT account_id FROM credentials WHERE LOWER(address) = LOWER($2))
-			OR (LOWER(identifier) = LOWER($2)
-				AND NOT EXISTS (SELECT 1 FROM credentials WHERE LOWER(address) = LOWER($2)))
-		)
-	`, mailboxID, identifier)
+// aclTarget is the entry an identifier names on a mailbox.
+type aclTarget struct {
+	ids       []int64 // its rows; more than one only in data from before one row per account
+	rights    string  // the rights every one of those rows grants
+	accountID *int64  // the account the identifier is an address of, if any
+}
+
+// aclTargetFor finds the entry identifier names on mailboxID: "anyone" (exactly), or
+// every row of the account the identifier is an address of (in any case, an alias, a
+// deleted account too), or, when it is no account's address, rows stored under that
+// text. Duplicate rows of one account, left from before one row per account, are
+// enforced by whichever has_mailbox_right reads first, so a change starts from the
+// rights all of them grant: it can then never add a right the owner did not ask for.
+func aclTargetFor(ctx context.Context, tx pgx.Tx, mailboxID int64, identifier string) (aclTarget, error) {
+	var target aclTarget
+	query, args := `SELECT id, rights FROM mailbox_acls WHERE mailbox_id = $1 AND identifier = 'anyone'`, []any{mailboxID}
+	if identifier != AnyoneIdentifier {
+		var id int64
+		err := tx.QueryRow(ctx, `SELECT account_id FROM credentials WHERE LOWER(address) = LOWER($1)`, identifier).Scan(&id)
+		switch {
+		case err == nil:
+			target.accountID = &id
+			query, args = `SELECT id, rights FROM mailbox_acls WHERE mailbox_id = $1 AND account_id = $2`, append(args, id)
+		case errors.Is(err, pgx.ErrNoRows):
+			query = `SELECT id, rights FROM mailbox_acls WHERE mailbox_id = $1 AND LOWER(identifier) = LOWER($2) AND identifier <> 'anyone'`
+			args = append(args, identifier)
+		default:
+			return target, fmt.Errorf("failed to resolve identifier: %w", err)
+		}
+	}
+	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to read ACL entries: %w", err)
+		return target, fmt.Errorf("failed to read ACL entries: %w", err)
 	}
 	defer rows.Close()
-	var ids []int64
-	var rights string
 	for rows.Next() {
 		var id int64
 		var r string
 		if err := rows.Scan(&id, &r); err != nil {
-			return nil, "", fmt.Errorf("failed to scan ACL entry: %w", err)
+			return target, fmt.Errorf("failed to scan ACL entry: %w", err)
 		}
-		ids = append(ids, id)
-		rights += r
+		if len(target.ids) == 0 {
+			target.rights = canonicalRights(r)
+		} else {
+			target.rights = intersectRights(target.rights, r)
+		}
+		target.ids = append(target.ids, id)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, "", fmt.Errorf("failed to read ACL entries: %w", err)
+		return target, fmt.Errorf("failed to read ACL entries: %w", err)
 	}
-	return ids, canonicalRights(rights), nil
+	return target, nil
+}
+
+// intersectRights returns the rights of a that b also holds.
+func intersectRights(a, b string) string {
+	return strings.Map(func(r rune) rune {
+		if strings.ContainsRune(b, r) {
+			return r
+		}
+		return -1
+	}, a)
 }
 
 func deleteACLRows(ctx context.Context, tx pgx.Tx, ids []int64) error {
@@ -254,14 +292,19 @@ func deleteACLRows(ctx context.Context, tx pgx.Tx, ids []int64) error {
 // SetMailboxACL applies one SETACL to mailboxID: rights replace, are added to, or are
 // removed from those identifier holds, and DELETEACL is a replace with no rights.
 // The identifier's entry is the account's whatever spelling or alias names it.
-// Removing rights that are not there leaves the ACL as asked and succeeds (RFC 4314
-// §3.2); only a change that would leave rights can be refused, and on a mailbox
-// outside the shared namespace it is, before any address is looked up.
+//
+// Taking rights away always succeeds, also from a grantee that could no longer be
+// granted them (deleted, moved to another domain), and removing what is not there
+// leaves the ACL as asked (RFC 4314 §3.2). Only a change that gives rights is checked
+// as a grant: the mailbox must be shared and the grantee an active account in the
+// owner's domain other than the owner, checked in an order that reveals nothing about
+// addresses outside that domain.
 //
 // grantorAccountID is the account the caller authorised to administer the mailbox,
-// or 0 for a trusted caller (the Admin API, sora-admin). Its 'a' right is checked
-// again under the ACL lock, so an administrator revoked meanwhile is refused with
-// consts.ErrNotPermitted rather than granting after the revoke.
+// or 0 for a trusted caller (the Admin API, sora-admin). A grant re-checks its 'a'
+// right under the ACL lock, so an administrator revoked meanwhile is refused with
+// consts.ErrNotPermitted rather than granting after the revoke. Taking rights away
+// needs no re-check: its result is one a serial order of the two commands gives.
 func (db *Database) SetMailboxACL(ctx context.Context, mailboxID, grantorAccountID int64, identifier string, mod ACLModification, rights string) error {
 	if err := ValidateACLRights(rights); err != nil {
 		return err
@@ -272,6 +315,48 @@ func (db *Database) SetMailboxACL(ctx context.Context, mailboxID, grantorAccount
 	}
 	defer tx.Rollback(context.Background())
 
+	target, err := aclTargetFor(ctx, tx, mailboxID, identifier)
+	if err != nil {
+		return err
+	}
+	var final string
+	switch mod {
+	case ACLAdd:
+		final = canonicalRights(target.rights + rights)
+	case ACLRemove:
+		final = strings.Map(func(r rune) rune {
+			if strings.ContainsRune(rights, r) {
+				return -1
+			}
+			return r
+		}, target.rights)
+	default:
+		final = canonicalRights(rights)
+	}
+	isOwner := target.accountID != nil && *target.accountID == mb.ownerAccountID
+
+	switch {
+	case final == "":
+		err = deleteACLRows(ctx, tx, target.ids)
+	case len(target.ids) > 0 && !isOwner && intersectRights(final, target.rights) == final:
+		// Only taking rights away: one row keeps what is left.
+		if err = deleteACLRows(ctx, tx, target.ids[1:]); err == nil {
+			_, err = tx.Exec(ctx, `UPDATE mailbox_acls SET rights = $2, updated_at = now() WHERE id = $1`, target.ids[0], final)
+		}
+	default:
+		err = db.grantInTx(ctx, tx, mb, mailboxID, grantorAccountID, identifier, target, final)
+	}
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	return nil
+}
+
+// grantInTx stores final as identifier's rights on mailboxID, replacing target's rows.
+func (db *Database) grantInTx(ctx context.Context, tx pgx.Tx, mb aclMailbox, mailboxID, grantorAccountID int64, identifier string, target aclTarget, final string) error {
 	if grantorAccountID != 0 && grantorAccountID != mb.ownerAccountID {
 		var allowed bool
 		if err := tx.QueryRow(ctx, "SELECT has_mailbox_right($1, $2, 'a')", mailboxID, grantorAccountID).Scan(&allowed); err != nil {
@@ -281,52 +366,42 @@ func (db *Database) SetMailboxACL(ctx context.Context, mailboxID, grantorAccount
 			return fmt.Errorf("%w: no admin right on mailbox %d", consts.ErrNotPermitted, mailboxID)
 		}
 	}
-
-	ids, existing, err := aclRowsFor(ctx, tx, mailboxID, identifier)
+	if !mb.isShared {
+		return ErrMailboxNotShared
+	}
+	accountID, canonical, err := resolveGrantee(ctx, tx, mb, identifier)
 	if err != nil {
 		return err
 	}
-	var final string
-	switch mod {
-	case ACLAdd:
-		final = canonicalRights(existing + rights)
-	case ACLRemove:
-		final = strings.Map(func(r rune) rune {
-			if strings.ContainsRune(rights, r) {
-				return -1
-			}
-			return r
-		}, existing)
-	default:
-		final = canonicalRights(rights)
-	}
-
-	if final != "" {
-		if !mb.isShared {
-			return ErrMailboxNotShared
-		}
-		accountID, canonical, err := resolveGrantee(ctx, tx, mb, identifier)
-		if err != nil {
-			return err
-		}
-		// One row per account: earlier rows under other spellings go.
-		if err := deleteACLRows(ctx, tx, ids); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, now(), now())
-			ON CONFLICT (mailbox_id, identifier)
-			DO UPDATE SET account_id = EXCLUDED.account_id, rights = EXCLUDED.rights, updated_at = now()
-		`, mailboxID, accountID, canonical, final); err != nil {
-			return fmt.Errorf("failed to grant access: %w", err)
-		}
-	} else if err := deleteACLRows(ctx, tx, ids); err != nil {
+	// One row per account: rows under other spellings go.
+	if err := deleteACLRows(ctx, tx, target.ids); err != nil {
 		return err
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+	// A row can still be labelled with an address its account has since lost, one
+	// that now names this grantee. Relabel it with its own account's primary address
+	// rather than let this grant take it over.
+	if _, err := tx.Exec(ctx, `
+		UPDATE mailbox_acls a SET identifier = p.address, updated_at = now()
+		FROM credentials p
+		WHERE a.mailbox_id = $1 AND a.identifier = $2 AND a.account_id IS DISTINCT FROM $3
+		  AND p.account_id = a.account_id AND p.primary_identity = TRUE
+		  AND NOT EXISTS (SELECT 1 FROM mailbox_acls b WHERE b.mailbox_id = $1 AND b.identifier = p.address)
+	`, mailboxID, canonical, accountID); err != nil {
+		return fmt.Errorf("failed to relabel ACL entry: %w", err)
+	}
+	var stored int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, now(), now())
+		ON CONFLICT (mailbox_id, identifier) DO UPDATE SET rights = EXCLUDED.rights, updated_at = now()
+		WHERE mailbox_acls.account_id IS NOT DISTINCT FROM EXCLUDED.account_id
+		RETURNING id
+	`, mailboxID, accountID, canonical, final).Scan(&stored)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("ACL entry %q on mailbox %d belongs to another account", canonical, mailboxID)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to grant access: %w", err)
 	}
 	return nil
 }
@@ -363,14 +438,14 @@ func (db *Database) RevokeMailboxAccessByIdentifier(ctx context.Context, mailbox
 		return err
 	}
 	defer tx.Rollback(context.Background())
-	ids, _, err := aclRowsFor(ctx, tx, mailboxID, identifier)
+	target, err := aclTargetFor(ctx, tx, mailboxID, identifier)
 	if err != nil {
 		return err
 	}
-	if len(ids) == 0 {
+	if len(target.ids) == 0 {
 		return fmt.Errorf("%w: ACL entry not found for identifier %s", consts.ErrDBNotFound, identifier)
 	}
-	if err := deleteACLRows(ctx, tx, ids); err != nil {
+	if err := deleteACLRows(ctx, tx, target.ids); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -398,6 +473,15 @@ func (db *Database) MailboxACLGrantability(ctx context.Context, mailboxID int64,
 	if err != nil {
 		return ACLGrantNone, err
 	}
+	if identifier == AnyoneIdentifier {
+		if mb.isShared {
+			return ACLGrantAny, nil
+		}
+		return ACLGrantNone, nil
+	}
+	if outsideOwnerDomain(mb, identifier) {
+		return ACLGrantNone, nil
+	}
 	var isOwner bool
 	if err := pool.QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM credentials WHERE account_id = $1 AND LOWER(address) = LOWER($2))
@@ -422,14 +506,21 @@ func (db *Database) MailboxACLGrantability(ctx context.Context, mailboxID int64,
 	}
 }
 
-// GetMailboxACLs retrieves all ACL entries for a mailbox
+// GetMailboxACLs retrieves all ACL entries for a mailbox, one per grantee: each
+// account's rows under the account's current primary address, which is what a
+// revoke under that address acts on, with every right any of them grants, and the
+// mailbox owner with every right, which it holds whatever a stored row says.
 func (db *Database) GetMailboxACLs(ctx context.Context, mailboxID int64) ([]ACLEntry, error) {
 	rows, err := db.GetReadPool().Query(ctx, `
-		SELECT mailbox_id, account_id, identifier, rights, created_at, updated_at
-		FROM mailbox_acls
-		WHERE mailbox_id = $1
-		ORDER BY identifier
-	`, mailboxID)
+		SELECT a.mailbox_id, a.account_id, COALESCE(p.address, a.identifier),
+			CASE WHEN a.account_id = m.account_id THEN $2 ELSE a.rights END,
+			a.created_at, a.updated_at
+		FROM mailbox_acls a
+		JOIN mailboxes m ON m.id = a.mailbox_id
+		LEFT JOIN credentials p ON p.account_id = a.account_id AND p.primary_identity = TRUE
+		WHERE a.mailbox_id = $1
+		ORDER BY 3, a.id
+	`, mailboxID, AllACLRights)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query ACLs: %w", err)
 	}
@@ -441,6 +532,15 @@ func (db *Database) GetMailboxACLs(ctx context.Context, mailboxID int64) ([]ACLE
 		if err := rows.Scan(&entry.MailboxID, &entry.AccountID, &entry.Identifier, &entry.Rights, &entry.CreatedAt, &entry.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("failed to scan ACL entry: %w", err)
 		}
+		if n := len(entries); n > 0 && entries[n-1].Identifier == entry.Identifier {
+			prev := &entries[n-1]
+			prev.Rights = canonicalRights(prev.Rights + entry.Rights)
+			if entry.UpdatedAt.After(prev.UpdatedAt) {
+				prev.UpdatedAt = entry.UpdatedAt
+			}
+			continue
+		}
+		entry.Rights = canonicalRights(entry.Rights)
 		entries = append(entries, entry)
 	}
 
