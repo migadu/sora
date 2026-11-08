@@ -13,8 +13,9 @@ const (
 // AttachmentKeyword returns the RFC 9979 §4 keyword for the raw message, or
 // false when its attachment status is unknown. A found attachment settles the
 // answer even next to an unreadable part; absence requires a complete MIME walk.
-// Unlike BODYSTRUCTURE, the raw headers retain RFC 2231 filenames in any charset
-// and the walk cannot mistake the extractor's synthetic children for real ones.
+// Raw headers retain the RFC 2231 charset and continuation information needed
+// to interpret filenames, and synthetic BODYSTRUCTURE children cannot establish
+// attachment absence.
 //
 // A part is an attachment when it:
 //   - has Content-Disposition: attachment or an unrecognized disposition type
