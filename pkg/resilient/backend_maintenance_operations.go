@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/retry"
 )
@@ -109,13 +110,15 @@ func (rd *ResilientDatabase) ReportInstanceSessionsWithRetry(ctx context.Context
 }
 
 // GetMaintenanceRefusalWithRetry returns when the maintenance began that instanceID's node
-// refuses new sessions for (see db.GetMaintenanceRefusal). One attempt only: the node looks
-// again at its next report.
+// refuses new sessions for (see db.GetMaintenanceRefusal). Always read the primary: a
+// lagging replica must not reopen the gate while the primary still holds a report of
+// refusing with no sessions open. One attempt only: the node looks again at its next report.
 func (rd *ResilientDatabase) GetMaintenanceRefusalWithRetry(ctx context.Context, instanceID string, refuseAfter time.Duration) (*time.Time, error) {
+	masterCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetMaintenanceRefusal(ctx, instanceID, refuseAfter)
+		return rd.getOperationalDatabaseForOperation(ctx, true).GetMaintenanceRefusal(ctx, instanceID, refuseAfter)
 	}
-	result, err := rd.executeReadWithRetry(ctx, sessionsReportRetryConfig, timeoutRead, op)
+	result, err := rd.executeReadWithRetry(masterCtx, sessionsReportRetryConfig, timeoutRead, op)
 	if err != nil {
 		return nil, err
 	}

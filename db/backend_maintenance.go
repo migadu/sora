@@ -166,9 +166,9 @@ func (db *Database) ReportInstanceSessions(ctx context.Context, tx pgx.Tx, s Ins
 // in maintenance under several of its names) that has lasted refuseAfter, by the database
 // clock. nil when there is none.
 //
-// It reads the pool the context selects. A lagging replica only delays when the node
-// starts or stops refusing, and its report names the row it saw, which --wait checks
-// against the primary.
+// It reads the pool the context selects. Callers controlling the admission gate must pin
+// the primary (consts.UseMasterDBKey): a lagging replica can otherwise reopen the gate
+// while the primary still holds a report of refusing with no sessions open.
 func (db *Database) GetMaintenanceRefusal(ctx context.Context, instanceID string, refuseAfter time.Duration) (*time.Time, error) {
 	var since *time.Time
 	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
