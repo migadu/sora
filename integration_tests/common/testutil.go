@@ -933,6 +933,12 @@ func SetupLMTPServer(t *testing.T) (*TestServer, TestAccount) {
 	return setupLMTPServerWithOptions(t, lmtp.LMTPServerOptions{})
 }
 
+// SetupLMTPServerWithOptions enables protocol features needed by a test.
+func SetupLMTPServerWithOptions(t *testing.T, options lmtp.LMTPServerOptions) (*TestServer, TestAccount) {
+	t.Helper()
+	return setupLMTPServerWithOptions(t, options)
+}
+
 // SetupLMTPServerWithIdleTimeout sets up an LMTP server with a short idle
 // timeout (go-smtp ReadTimeout) for timeout behavior tests.
 func SetupLMTPServerWithIdleTimeout(t *testing.T, idleTimeout time.Duration) (*TestServer, TestAccount) {

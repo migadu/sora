@@ -9,6 +9,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/stretchr/testify/require"
 )
 
 // A malformed multipart still has to be accepted and fetched, but the body
@@ -47,5 +48,28 @@ func TestIMAP_AppendMalformedMimeLeavesAttachmentUnknown(t *testing.T) {
 		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
 	}).Collect(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestIMAP_AppendAttachmentKeywordMimeEvidence(t *testing.T) {
+	b, account := common.SetupIMAPServer(t)
+	defer b.Close()
+	c, err := imapclient.DialInsecure(b.Address, nil)
+	require.NoError(t, err)
+	defer c.Close()
+	require.NoError(t, c.Login(account.Email, account.Password).Wait())
+	_, err = c.Select("INBOX", nil).Wait()
+	require.NoError(t, err)
+	for _, tc := range common.AttachmentKeywordRegressionCases() {
+		t.Run(tc.Name, func(t *testing.T) {
+			uid := appendRaw(t, c, "INBOX", "Subject: "+tc.Name+"\r\n"+tc.MIME, nil)
+			flags := fetchFlags(t, c, uid)
+			if tc.Keyword == "" {
+				require.NotContains(t, flags, imap.Flag("$hasattachment"))
+				require.NotContains(t, flags, imap.Flag("$hasnoattachment"))
+			} else {
+				require.Contains(t, flags, imap.Flag(tc.Keyword))
+			}
+		})
 	}
 }

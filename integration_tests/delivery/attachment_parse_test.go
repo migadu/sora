@@ -29,23 +29,11 @@ func TestDelivery_AttachmentKeywordMultipartAndMalformed(t *testing.T) {
 	require.NoError(t, err)
 	recipient := delivery.RecipientInfo{AccountID: accountID, Address: &addr, ToAddress: &addr}
 
-	for _, tc := range []struct {
-		name, mime, keyword string
-	}{
-		{"attached document", strings.Join([]string{
-			`Content-Type: multipart/related; boundary="b"`,
-			`Content-Disposition: attachment; filename="page.mhtml"`, "",
-			"--b", "Content-Type: text/html", "", "<p>Attached page</p>", "--b--", "",
-		}, "\r\n"), "$hasattachment"},
-		{"malformed", strings.Join([]string{
-			`Content-Type: multipart/mixed; boundary="declared"`, "",
-			"--actual", "Content-Type: text/plain", "", "body", "--actual--", "",
-		}, "\r\n"), ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			marker := fmt.Sprintf("attachment-parse-%s-%d", strings.ReplaceAll(tc.name, " ", "-"), common.GetTimestamp())
+	for _, tc := range common.AttachmentKeywordRegressionCases() {
+		t.Run(tc.Name, func(t *testing.T) {
+			marker := fmt.Sprintf("attachment-parse-%s-%d", strings.ReplaceAll(tc.Name, " ", "-"), common.GetTimestamp())
 			message := []byte("From: sender@example.com\r\nTo: " + account.Email +
-				"\r\nSubject: " + marker + "\r\nMessage-ID: <" + marker + "@example.com>\r\n" + tc.mime)
+				"\r\nSubject: " + marker + "\r\nMessage-ID: <" + marker + "@example.com>\r\n" + tc.MIME)
 			result, err := dctx.DeliverMessage(recipient, message)
 			require.NoError(t, err)
 			require.True(t, result.Success)
@@ -60,12 +48,14 @@ func TestDelivery_AttachmentKeywordMultipartAndMalformed(t *testing.T) {
 				require.NoError(t, err)
 				var keywords []string
 				require.NoError(t, json.Unmarshal(raw, &keywords))
-				if tc.keyword == "" {
+				if tc.Keyword == "" {
 					require.NotContains(t, keywords, "$hasattachment", mailbox)
 					require.NotContains(t, keywords, "$hasnoattachment", mailbox)
 				} else {
-					require.True(t, slices.Contains(keywords, tc.keyword), "%s keywords: %v", mailbox, keywords)
-					require.NotContains(t, keywords, "$hasnoattachment", mailbox)
+					require.True(t, slices.Contains(keywords, tc.Keyword), "%s keywords: %v", mailbox, keywords)
+					if tc.Keyword == "$hasattachment" {
+						require.NotContains(t, keywords, "$hasnoattachment", mailbox)
+					}
 				}
 			}
 		})
