@@ -277,35 +277,7 @@ func main() {
 			handleConfigReload(*configPath, &deps.config, errorHandler)
 
 			// Dispatch per-server reload to running servers
-			deps.runningServersMux.Lock()
-			serverCount := len(deps.runningServers)
-			deps.runningServersMux.Unlock()
-
-			if serverCount > 0 {
-				newServers := newCfg.GetAllServers()
-				serversByName := make(map[string]config.ServerConfig, len(newServers))
-				for _, s := range newServers {
-					serversByName[s.Name] = s
-				}
-
-				deps.runningServersMux.Lock()
-				for name, srv := range deps.runningServers {
-					if newServerCfg, ok := serversByName[name]; ok {
-						// Re-validate before applying: keeps the fail-closed startup guards
-						// (e.g. master_username with an empty master_password) effective on
-						// SIGHUP reload. Invalid new config is skipped; the server keeps
-						// running on its previous, already-validated config.
-						if err := newServerCfg.Validate(); err != nil {
-							logger.Error("Skipping reload: invalid new server config", "server", name, "error", err)
-							continue
-						}
-						if err := srv.ReloadConfig(newServerCfg); err != nil {
-							logger.Error("Failed to reload server config", "server", name, "error", err)
-						}
-					}
-				}
-				deps.runningServersMux.Unlock()
-			}
+			deps.reloadServers(&newCfg)
 		}
 	}()
 
