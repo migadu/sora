@@ -616,9 +616,16 @@ Full-text search messages in a mailbox.
     }
   ],
   "total": 1,
+  "truncated": false,
+  "limit": 100,
   "query": "meeting"
 }
 ```
+
+**Response fields:**
+- `total` - Number of messages in this response
+- `limit` - Most messages a search returns (100), newest first
+- `truncated` - `true` when more messages matched than were returned. The result is the newest `limit` matches; narrow the query (a rarer word, a sender, a subject filter) to reach the rest. A result is never clipped silently: when `truncated` is `false`, `messages` holds every match.
 
 **Examples:**
 ```bash

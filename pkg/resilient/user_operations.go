@@ -81,19 +81,29 @@ func (rdb *ResilientDatabase) GetMessagesForMailboxWithRetry(ctx context.Context
 	return result.([]*db.DBMessage), nil
 }
 
-// SearchMessagesInMailboxWithRetry performs full-text search with retry logic
-func (rdb *ResilientDatabase) SearchMessagesInMailboxWithRetry(ctx context.Context, accountID int64, mailboxPath string, query string) ([]*db.DBMessage, error) {
+// SearchMessagesInMailboxWithRetry performs full-text search with retry logic. The
+// bool reports a result clipped at db.UserAPISearchLimit.
+func (rdb *ResilientDatabase) SearchMessagesInMailboxWithRetry(ctx context.Context, accountID int64, mailboxPath string, query string) ([]*db.DBMessage, bool, error) {
+	type searchResult struct {
+		messages  []*db.DBMessage
+		truncated bool
+	}
 	config := readRetryConfig
 
 	op := func(ctx context.Context) (any, error) {
-		return rdb.getOperationalDatabaseForOperation(ctx, false).SearchMessagesInMailbox(ctx, accountID, mailboxPath, query)
+		messages, truncated, err := rdb.getOperationalDatabaseForOperation(ctx, false).SearchMessagesInMailbox(ctx, accountID, mailboxPath, query)
+		if err != nil {
+			return nil, err
+		}
+		return searchResult{messages: messages, truncated: truncated}, nil
 	}
 
 	result, err := rdb.executeReadWithRetry(ctx, config, timeoutSearch, op)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return result.([]*db.DBMessage), nil
+	res := result.(searchResult)
+	return res.messages, res.truncated, nil
 }
 
 // GetMessageByIDWithRetry retrieves a single message with retry logic
