@@ -101,6 +101,11 @@ func validateVacationMIME(header message.Header, body io.Reader, defaultType str
 	if err != nil {
 		return err
 	}
+	// RFC 2046 §§5.2.2–5.2.3 allow only 7bit for partial and external-body
+	// containers, regardless of whether a more permissive transport is available.
+	if (mediaType == "message/partial" || mediaType == "message/external-body") && encoding != "" && encoding != "7bit" {
+		return fmt.Errorf("invalid %s transfer encoding %q", mediaType, encoding)
+	}
 	// Identity encodings constrain the complete source body, including nested
 	// MIME headers, child bodies and multipart preambles/epilogues (§§2.7–2.8).
 	if encoding == "" || encoding == "7bit" || encoding == "8bit" {
