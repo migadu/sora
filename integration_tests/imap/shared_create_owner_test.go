@@ -52,7 +52,7 @@ func TestSharedMailboxes_DelegatedCreateUsesHierarchyOwner(t *testing.T) {
 				require.Contains(t, inherited, "r", "new shared mailbox must inherit delegated read right")
 			}
 			// The immediate parent's k right suffices even if its shared root is hidden.
-			require.NoError(t, c.SetACL("Shared/Team", imap.RightsIdentifier(member), imap.RightModificationReplace, "").Wait())
+			require.NoError(t, c.SetACL("Shared/Team", imap.RightsIdentifier(member), imap.RightModificationReplace, imap.RightSet("")).Wait())
 			require.NoError(t, m.Create("Shared/Team/Child/Grandchild", nil).Wait())
 			// A user lacking k must be refused before creating any missing parent.
 			require.NoError(t, c.SetACL("Shared/Team", imap.RightsIdentifier(member), imap.RightModificationReplace, imap.RightSet("lr")).Wait())
