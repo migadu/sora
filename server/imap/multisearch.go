@@ -55,7 +55,12 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 		return nil, err
 	}
 
-	criteria = s.decodeSearchCriteria(criteria)
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
+	if !acquired {
+		return nil, s.internalError("failed to acquire lock for multisearch")
+	}
+	criteria = s.decodeSearchCriteriaWithSeqNumsLocked(criteria, false)
+	release()
 
 	var results []*imap.SearchData
 

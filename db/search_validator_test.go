@@ -82,10 +82,9 @@ func TestValidateSequenceRanges(t *testing.T) {
 			errorField:  "SeqNum",
 		},
 		{
-			name:        "invalid sequence range - zero start",
+			name:        "valid sequence range - star start",
 			seqNum:      []imap.SeqSet{{imap.SeqRange{Start: 0, Stop: 10}}},
-			expectError: true,
-			errorField:  "SeqNum",
+			expectError: false,
 		},
 		{
 			name:        "invalid UID range - start > stop",

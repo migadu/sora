@@ -38,6 +38,7 @@ var ErrThreadTooManyMessages = errors.New("THREAD search matches too many messag
 // ROW_NUMBER() over the whole mailbox; otherwise Seq is 0. maxMessages bounds the
 // rows retained in memory; nonpositive values use the default cap.
 func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, includeSubject, withSeqNums bool, maxMessages int) ([]ThreadMessageResult, error) {
+	criteria = cloneSearchCriteria(criteria)
 	if maxMessages <= 0 {
 		maxMessages = config.DefaultThreadMaxMessages
 	}

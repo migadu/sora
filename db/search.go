@@ -1019,16 +1019,32 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 		}
 		uidBySeq[uint32(seq)] = imap.UID(uid)
 	}
-	return uidBySeq, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if slices.Contains(seqNums, 0) {
+		// Zero represents '*', whose UID is the target mailbox's last live UID.
+		// Resolve it by index rather than ranking the whole mailbox.
+		var uid imap.UID
+		err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+			SELECT uid FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL
+			ORDER BY uid DESC LIMIT 1`, mailboxID).Scan(&uid)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("failed to resolve last message UID: %w", err)
+		}
+		if err == nil {
+			uidBySeq[0] = uid
+		}
+	}
+	return uidBySeq, nil
 }
 
-// appendSeqSetNums appends the sequence numbers set names as range ends; "*" is not one.
+// appendSeqSetNums includes zero as a marker for a target-mailbox '*' lookup.
 func appendSeqSetNums(seqNums []int64, set imap.SeqSet) []int64 {
 	for _, r := range set {
 		for _, n := range []uint32{r.Start, r.Stop} {
-			if n != 0 {
-				seqNums = append(seqNums, int64(n))
-			}
+			seqNums = append(seqNums, int64(n))
 		}
 	}
 	return seqNums
@@ -1042,6 +1058,11 @@ func seqSetToUIDSet(set imap.SeqSet, uidBySeq map[uint32]imap.UID) imap.UIDSet {
 	for _, seqRange := range set {
 		startUID, ok := uidBySeq[seqRange.Start]
 		if !ok {
+			if seqRange.Stop == 0 {
+				if lastUID, exists := uidBySeq[0]; exists {
+					uidSet = append(uidSet, imap.UIDRange{Start: lastUID, Stop: lastUID})
+				}
+			}
 			continue // Out of bounds or invalid
 		}
 		uidRange := imap.UIDRange{Start: startUID} // Stop 0 is "*"
@@ -1098,6 +1119,7 @@ func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID)
 }
 
 func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, orderByClause string, limit, mailboxMessageCount int) ([]SearchMessageResult, error) {
+	criteria = cloneSearchCriteria(criteria)
 	if err := db.canonicalizeSearchCriteriaKeywords(ctx, nil, mailboxID, criteria); err != nil {
 		return nil, err
 	}
@@ -1374,6 +1396,36 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 	}
 
 	return messages, nil
+}
+
+// cloneSearchCriteria isolates mailbox-specific keyword and sequence rewrites
+// from the caller, which may reuse the same criteria for other mailboxes or retries.
+func cloneSearchCriteria(c *imap.SearchCriteria) *imap.SearchCriteria {
+	if c == nil {
+		return nil
+	}
+	out := *c
+	out.SeqNum = slices.Clone(c.SeqNum)
+	for i := range out.SeqNum {
+		out.SeqNum[i] = slices.Clone(c.SeqNum[i])
+	}
+	out.UID = slices.Clone(c.UID)
+	for i := range out.UID {
+		out.UID[i] = slices.Clone(c.UID[i])
+	}
+	out.Flag = slices.Clone(c.Flag)
+	out.NotFlag = slices.Clone(c.NotFlag)
+	out.Not = slices.Clone(c.Not)
+	for i := range out.Not {
+		out.Not[i] = *cloneSearchCriteria(&c.Not[i])
+	}
+	out.Or = slices.Clone(c.Or)
+	for i := range out.Or {
+		for j := range out.Or[i] {
+			out.Or[i][j] = *cloneSearchCriteria(&c.Or[i][j])
+		}
+	}
+	return &out
 }
 
 // SearchMessagesWithCriteria retrieves only lightweight message metadata needed for IMAP SEARCH requests.
