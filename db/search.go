@@ -992,7 +992,8 @@ func (db *Database) mapSeqNumCriteriaToUID(ctx context.Context, mailboxID int64,
 }
 
 // uidsBySeqNum returns the UID at each of the given sequence numbers. A sequence number
-// past the last message is missing from the result.
+// past the last message is missing from the result. Key zero always contains the
+// last live UID, for wildcard resolution and clipping out-of-bounds range ends.
 func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums []int64) (map[uint32]imap.UID, error) {
 	query := `
 		SELECT ranked.seqnum, ranked.uid
@@ -1005,17 +1006,15 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 		) ranked
 		WHERE ranked.seqnum = ANY($3)
 	`
-	if slices.Contains(seqNums, 0) {
-		// Both endpoints must use one MVCC snapshot: an append/expunge between
-		// a ranked read and a separate last-UID read can create a range that
-		// names the wrong messages in every possible mailbox state.
-		query += ` UNION ALL
-			SELECT 0 AS seqnum, last.uid FROM (
-				SELECT uid FROM messages
-				WHERE mailbox_id = $1 AND expunged_at IS NULL
-				ORDER BY uid DESC LIMIT 1
-			) last`
-	}
+	// Both endpoints must use one MVCC snapshot: an append/expunge between
+	// a ranked read and a separate last-UID read can create a range that
+	// names the wrong messages in every possible mailbox state.
+	query += ` UNION ALL
+		SELECT 0 AS seqnum, last.uid FROM (
+			SELECT uid FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			ORDER BY uid DESC LIMIT 1
+		) last`
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, slices.Max(seqNums), seqNums)
 	if err != nil {
 		return nil, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
@@ -1046,7 +1045,7 @@ func appendSeqSetNums(seqNums []int64, set imap.SeqSet) []int64 {
 
 // seqSetToUIDSet maps set to the UID set it names according to uidBySeq (see
 // uidsBySeqNum): a range starting past the last message is dropped, one ending past it
-// runs to the last message ("*"), and the ends of a range may come in either order.
+// runs to the snapshot's last message, and range ends may come in either order.
 func seqSetToUIDSet(set imap.SeqSet, uidBySeq map[uint32]imap.UID) imap.UIDSet {
 	var uidSet imap.UIDSet
 	for _, seqRange := range set {
@@ -1063,6 +1062,11 @@ func seqSetToUIDSet(set imap.SeqSet, uidBySeq map[uint32]imap.UID) imap.UIDSet {
 		if stopUID, ok := uidBySeq[seqRange.Stop]; ok {
 			uidRange.Start = min(startUID, stopUID)
 			uidRange.Stop = max(startUID, stopUID)
+		} else if lastUID, ok := uidBySeq[0]; ok {
+			// A fixed endpoint beyond the mailbox ends at the snapshot's tail,
+			// not an open UID range that could admit later arrivals past it.
+			uidRange.Start = min(startUID, lastUID)
+			uidRange.Stop = max(startUID, lastUID)
 		}
 		uidSet = append(uidSet, uidRange)
 	}

@@ -64,7 +64,7 @@ func TestMapSeqNumCriteriaToUID(t *testing.T) {
 		{
 			name:     "a range ending past the last message runs to it",
 			criteria: imap.SearchCriteria{SeqNum: []imap.SeqSet{seqs([2]uint32{7, 50})}},
-			want:     imap.SearchCriteria{UID: []imap.UIDSet{uids([2]imap.UID{9, 0})}},
+			want:     imap.SearchCriteria{UID: []imap.UIDSet{uids([2]imap.UID{9, 10})}},
 		},
 		{
 			name:     "a range starting past the last message is dropped",
