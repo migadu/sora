@@ -241,27 +241,11 @@ func (s *IMAPSession) writeRenameOldName(w *imapserver.RenameWriter, oldName, ne
 // Shared by the INBOX-rename and regular-rename destination-parent resolution so
 // both link a hierarchical target under its parent rather than storing a flat name.
 func (s *IMAPSession) resolveOrCreateParentPath(ctx context.Context, newParentPath string, ownerAccountID int64) (*int64, error) {
-	newParentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, newParentPath)
-	if err == consts.ErrMailboxNotFound {
-		s.DebugLog("new parent mailbox does not exist, auto-creating", "parent", newParentPath)
-		createErr := s.server.rdb.CreateMailboxWithRetry(ctx, ownerAccountID, newParentPath, nil)
-		if createErr != nil {
-			// Handle race condition: another session may have created the parent concurrently.
-			if errors.Is(createErr, consts.ErrDBUniqueViolation) {
-				s.DebugLog("parent mailbox already exists (concurrent create)", "parent", newParentPath)
-			} else {
-				return nil, s.internalError("failed to auto-create new parent mailbox '%s': %v", newParentPath, createErr)
-			}
-		}
-		// Fetch the newly created parent to get its ID.
-		newParentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, newParentPath)
-		if err != nil {
-			return nil, s.internalError("failed to fetch auto-created new parent mailbox '%s': %v", newParentPath, err)
-		}
-	} else if err != nil {
-		return nil, s.internalError("failed to fetch new parent mailbox '%s': %v", newParentPath, err)
+	parentID, err := s.server.rdb.ResolveOrCreateMailboxPathWithRetry(ctx, ownerAccountID, newParentPath)
+	if err != nil {
+		return nil, s.internalError("failed to resolve new parent hierarchy %q: %v", newParentPath, err)
 	}
-	return &newParentMailbox.ID, nil
+	return parentID, nil
 }
 
 // checkCreateRightForHierarchy verifies the acting user holds the "k" (create)

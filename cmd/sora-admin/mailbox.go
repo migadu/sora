@@ -404,11 +404,21 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Rename mailbox - newParentID is handled internally by RenameMailbox. With the
-	// shared mailbox config in the context it refuses a move across the shared
-	// namespace boundary, as IMAP RENAME does.
+	// Validate before creating parents, so a refused rename leaves no hierarchy.
+	if helpers.MailboxNameHasTraversal(*newName) || globalConfig.SharedMailboxes.InNamespace(*oldName) != globalConfig.SharedMailboxes.InNamespace(*newName) {
+		fmt.Println("Failed to rename mailbox: invalid destination or shared namespace boundary")
+		os.Exit(1)
+	}
 	renameCtx := context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: globalConfig.SharedMailboxes})
-	err = rdb.RenameMailboxWithRetry(renameCtx, mbox.ID, accountID, *newName, nil)
+	var parentID *int64
+	if index := strings.LastIndex(*newName, string(consts.MailboxDelimiter)); index >= 0 {
+		parentID, err = rdb.ResolveOrCreateMailboxPathWithRetry(renameCtx, mbox.AccountID, (*newName)[:index])
+		if err != nil {
+			fmt.Printf("Failed to resolve destination parent: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	err = rdb.RenameMailboxWithRetry(renameCtx, mbox.ID, mbox.AccountID, *newName, parentID)
 	if err != nil {
 		fmt.Printf("Failed to rename mailbox: %v\n", err)
 		os.Exit(1)
