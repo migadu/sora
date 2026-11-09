@@ -43,6 +43,10 @@ func TestIMAP_MultiSearch_SequenceSetsPerMailbox(t *testing.T) {
 		}{
 			{"1", map[string]string{"SeqA": "2", "SeqB": "1"}},
 			{"*", map[string]string{"SeqA": "3", "SeqB": "1"}},
+			{"UID *", map[string]string{"SeqA": "3", "SeqB": "1"}},
+			{"UID 99:*", map[string]string{"SeqA": "3", "SeqB": "1"}},
+			{"NOT UID *", map[string]string{"SeqA": "2"}},
+			{"OR UID * 1", map[string]string{"SeqA": "2:3", "SeqB": "1"}},
 			{"*:1", map[string]string{"SeqA": "2:3", "SeqB": "1"}},
 			{"99:*", map[string]string{"SeqA": "3", "SeqB": "1"}},
 			{"NOT 1", map[string]string{"SeqA": "3"}},
