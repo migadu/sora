@@ -78,6 +78,30 @@ type SMTPRelayHandler struct {
 	CircuitBreaker *circuitbreaker.CircuitBreaker // Circuit breaker for resilience
 }
 
+// smtpUTF8Required includes top-level headers in the SMTPUTF8 decision (RFC 6531
+// §3.4). For example, a vacation reply can have ASCII envelope addresses but a
+// non-ASCII script owner in X-Redirected-By. An 8-bit body alone does not require
+// SMTPUTF8, so stop at the header/body separator.
+func smtpUTF8Required(from, to string, messageBytes []byte) bool {
+	if !server.IsASCII(from) || !server.IsASCII(to) {
+		return true
+	}
+	for len(messageBytes) > 0 {
+		line, rest, found := bytes.Cut(messageBytes, []byte{'\n'})
+		if len(line) == 0 || (len(line) == 1 && line[0] == '\r') {
+			return false
+		}
+		if !server.IsASCII(string(line)) {
+			return true
+		}
+		if !found {
+			break
+		}
+		messageBytes = rest
+	}
+	return false
+}
+
 // GetCircuitBreaker returns the circuit breaker for health monitoring
 func (r *SMTPRelayHandler) GetCircuitBreaker() *circuitbreaker.CircuitBreaker {
 	return r.CircuitBreaker
@@ -176,9 +200,9 @@ func (r *SMTPRelayHandler) sendToSMTPRelay(from string, to string, messageBytes 
 		}
 	}
 
-	// RFC 6531 §3.2: a non-ASCII envelope needs the SMTPUTF8 parameter. go-smtp adds it
-	// when the relay advertised the extension and refuses to send the transaction otherwise.
-	mailOpts := &smtp.MailOptions{UTF8: !server.IsASCII(from) || !server.IsASCII(to)}
+	// RFC 6531 §3.4: non-ASCII envelopes or headers need SMTPUTF8. go-smtp
+	// adds it when advertised and refuses the transaction otherwise.
+	mailOpts := &smtp.MailOptions{UTF8: smtpUTF8Required(from, to, messageBytes)}
 	if relayErr = c.Mail(from, mailOpts); relayErr != nil {
 		// Classify SMTP error (5xx = permanent, 4xx = temporary)
 		return &RelayError{Err: relayErr, Permanent: IsPermanentError(relayErr)}
