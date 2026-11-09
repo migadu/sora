@@ -994,7 +994,7 @@ func (db *Database) mapSeqNumCriteriaToUID(ctx context.Context, mailboxID int64,
 // uidsBySeqNum returns the UID at each of the given sequence numbers. A sequence number
 // past the last message is missing from the result.
 func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums []int64) (map[uint32]imap.UID, error) {
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+	query := `
 		SELECT ranked.seqnum, ranked.uid
 		FROM (
 			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
@@ -1004,7 +1004,19 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 			LIMIT $2
 		) ranked
 		WHERE ranked.seqnum = ANY($3)
-	`, mailboxID, slices.Max(seqNums), seqNums)
+	`
+	if slices.Contains(seqNums, 0) {
+		// Both endpoints must use one MVCC snapshot: an append/expunge between
+		// a ranked read and a separate last-UID read can create a range that
+		// names the wrong messages in every possible mailbox state.
+		query += ` UNION ALL
+			SELECT 0 AS seqnum, last.uid FROM (
+				SELECT uid FROM messages
+				WHERE mailbox_id = $1 AND expunged_at IS NULL
+				ORDER BY uid DESC LIMIT 1
+			) last`
+	}
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, slices.Max(seqNums), seqNums)
 	if err != nil {
 		return nil, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
 	}
@@ -1019,25 +1031,7 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 		}
 		uidBySeq[uint32(seq)] = imap.UID(uid)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	rows.Close()
-	if slices.Contains(seqNums, 0) {
-		// Zero represents '*', whose UID is the target mailbox's last live UID.
-		// Resolve it by index rather than ranking the whole mailbox.
-		var uid imap.UID
-		err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-			SELECT uid FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL
-			ORDER BY uid DESC LIMIT 1`, mailboxID).Scan(&uid)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("failed to resolve last message UID: %w", err)
-		}
-		if err == nil {
-			uidBySeq[0] = uid
-		}
-	}
-	return uidBySeq, nil
+	return uidBySeq, rows.Err()
 }
 
 // appendSeqSetNums includes zero as a marker for a target-mailbox '*' lookup.
