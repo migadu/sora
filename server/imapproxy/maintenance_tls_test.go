@@ -121,3 +121,52 @@ func TestMaintenanceTLS_GraceBoundsStalledHalfClose(t *testing.T) {
 		t.Fatalf("client still open past the maintenance grace while TLS CloseWrite is blocked: %v", err)
 	}
 }
+
+// The grace callback must reach the backend even while a client TLS Write holds
+// TLS's output mutex. Closing the raw client transport releases that writer.
+func TestMaintenanceTLS_StalledClientWriteDoesNotDelayBackendClose(t *testing.T) {
+	withCloseGrace(t, 100*time.Millisecond)
+	client, writing := stalledMaintenanceTLSBackend(t)
+	backend, peer := net.Pipe()
+	t.Cleanup(func() { backend.Close(); peer.Close() })
+	session := &Session{server: &Server{}, clientConn: client, backendConn: backend}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := session.forwardToClient(client, []byte("* 1 EXISTS\r\n"))
+		writeDone <- err
+	}()
+	select {
+	case <-writing:
+	case <-time.After(time.Second):
+		t.Fatal("client TLS write never reached the unread transport")
+	}
+	session.closeForMaintenance()
+	peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("backend was not closed at maintenance grace with client TLS Write blocked: %v", err)
+	}
+	select {
+	case err := <-writeDone:
+		if err == nil {
+			t.Fatal("stalled client write completed without a transport error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client TLS write still blocked after maintenance grace")
+	}
+}
+
+// An idle TLS client that stopped reading can block Close in close_notify even
+// without a concurrent Write. That must not delay closing the backend socket.
+func TestMaintenanceTLS_UnreadClientCloseNotifyDoesNotDelayBackendClose(t *testing.T) {
+	withCloseGrace(t, 100*time.Millisecond)
+	client, _ := stalledMaintenanceTLSBackend(t)
+	backend, peer := net.Pipe()
+	t.Cleanup(func() { backend.Close(); peer.Close() })
+	// Model a session whose BYE was delivered before the client stopped reading.
+	session := &Session{server: &Server{}, clientConn: client, backendConn: backend, byeSent: true}
+	session.closeForMaintenance()
+	peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("backend was not closed at maintenance grace with unread TLS client: %v", err)
+	}
+}
