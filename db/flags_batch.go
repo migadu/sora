@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -125,6 +128,17 @@ func (db *Database) getAllFlagsForMessages(ctx context.Context, tx pgx.Tx, messa
 }
 
 func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag, unchangedSince ...uint64) ([]BatchFlagUpdateResult, error) {
+	return db.setMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, newFlags, nil, unchangedSince...)
+}
+
+// SetMessageFlagsBatchWithRights applies the requested replacement only to flags
+// the user may modify (RFC 4314 §4). Protected flags come from the current row in
+// the locked UPDATE, never from the IMAP command's earlier read snapshot.
+func (db *Database) SetMessageFlagsBatchWithRights(ctx context.Context, tx pgx.Tx, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag, rights string, unchangedSince ...uint64) ([]BatchFlagUpdateResult, error) {
+	return db.setMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, newFlags, &rights, unchangedSince...)
+}
+
+func (db *Database) setMessageFlagsBatch(ctx context.Context, tx pgx.Tx, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag, rights *string, unchangedSince ...uint64) ([]BatchFlagUpdateResult, error) {
 	start := time.Now()
 	defer func() {
 		metrics.DBQueryDuration.WithLabelValues("flags_set_batch", "write").Observe(time.Since(start).Seconds())
@@ -146,9 +160,29 @@ func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 		return failed, err
 	}
 
+	preserveSystem := 0
+	preserveCustom := false
+	if rights != nil {
+		if !strings.ContainsRune(*rights, 's') {
+			preserveSystem |= FlagSeen
+		}
+		if !strings.ContainsRune(*rights, 't') {
+			preserveSystem |= FlagDeleted
+		}
+		if !strings.ContainsRune(*rights, 'w') {
+			preserveSystem |= ^(FlagSeen | FlagDeleted)
+			preserveCustom = true
+		} else if !helpers.HasFlag(newFlags, imap.FlagFlagged) {
+			// Match STORE's unflagging policy without touching protected colors.
+			newFlags = slices.DeleteFunc(slices.Clone(newFlags), helpers.IsFlagColorKeyword)
+		}
+	}
 	newFlags = NormalizeAttachmentKeywordUpdate(newFlags, newFlags)
+	if rights != nil && !preserveCustom && DistinctKeywordCount(newFlags) > MaxCustomKeywordsPerMessage {
+		return nil, consts.ErrTooManyKeywords
+	}
 	systemFlagsToSet, customKeywordsToSet := SplitFlags(newFlags)
-	bitwiseSystemFlags := FlagsToBitwise(systemFlagsToSet)
+	bitwiseSystemFlags := FlagsToBitwise(systemFlagsToSet) &^ preserveSystem
 	// Fold keywords onto the case already used in this mailbox (RFC 9051 §2.3.2).
 	customKeywordsToSet, err = db.canonicalizeKeywords(ctx, tx, mailboxID, customKeywordsToSet)
 	if err != nil {
@@ -164,11 +198,14 @@ func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 
 	rows, err := tx.Query(ctx, `
 		UPDATE message_state
-		SET flags = $1, custom_flags = $2::jsonb, flags_changed_at = $3, updated_modseq = nextval('messages_modseq')
+		SET flags = $1 | (flags & $5),
+		    custom_flags = CASE WHEN $6 THEN custom_flags ELSE $2::jsonb END,
+		    flags_changed_at = $3, updated_modseq = nextval('messages_modseq')
 		WHERE message_id = ANY($4)
-		  AND (flags != $1 OR custom_flags != $2::jsonb)
+		  AND (flags != ($1 | (flags & $5))
+		       OR custom_flags != CASE WHEN $6 THEN custom_flags ELSE $2::jsonb END)
 		RETURNING message_id, updated_modseq
-	`, bitwiseSystemFlags, customKeywordsJSON, time.Now(), messageIDs)
+	`, bitwiseSystemFlags, customKeywordsJSON, time.Now(), messageIDs, preserveSystem, preserveCustom)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute batch set message flags in mailbox %d: %w", mailboxID, err)
 	}

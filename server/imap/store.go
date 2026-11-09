@@ -2,6 +2,7 @@ package imap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/emersion/go-imap/v2"
@@ -236,37 +237,15 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			batchResults, err = s.server.rdb.RemoveMessageFlagsBatchWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags, unchangedSince...)
 		case imap.StoreFlagsSet:
 			// RFC 4314 §4: a replace must not modify flags the user lacks rights for.
-			// Per message, compute the target = requested values for modifiable flags
-			// + preserved current values for the rest, then SET each distinct target
-			// as one batch. For the owner (full rights) every message's target equals
-			// the requested set, collapsing to a single batch (no behaviour change).
-			currentByUID := make(map[imap.UID][]imap.Flag, len(messages))
-			for _, msg := range messages {
-				cur := db.BitwiseToFlags(msg.BitwiseFlags)
-				for _, cf := range msg.CustomFlags {
-					cur = append(cur, imap.Flag(cf))
-				}
-				currentByUID[msg.UID] = cur
-			}
-			groupUIDs := make(map[string][]imap.UID)
-			groupFlags := make(map[string][]imap.Flag)
-			for _, uid := range validUIDs {
-				target := storeReplaceTarget(currentByUID[uid], sanitizedStoreFlags.Flags, storeRights)
-				key := flagSetKey(target)
-				groupUIDs[key] = append(groupUIDs[key], uid)
-				groupFlags[key] = target
-			}
-			for key, uids := range groupUIDs {
-				var res []db.BatchFlagUpdateResult
-				res, err = s.server.rdb.SetMessageFlagsBatchWithRetry(ctx, uids, selectedMailboxID, groupFlags[key], unchangedSince...)
-				if err != nil {
-					break
-				}
-				batchResults = append(batchResults, res...)
-			}
+			// Merge protected values from current rows inside the write transaction,
+			// rather than overwriting concurrent changes with this read snapshot.
+			batchResults, err = s.server.rdb.SetMessageFlagsBatchWithRightsWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags, storeRights, unchangedSince...)
 		}
 
 		if err != nil {
+			if errors.Is(err, consts.ErrTooManyKeywords) {
+				return keywordLimitExceededError()
+			}
 			return s.internalError("failed to update flags for batch: %v", err)
 		}
 

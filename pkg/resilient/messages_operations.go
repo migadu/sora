@@ -116,6 +116,17 @@ func (rd *ResilientDatabase) SetMessageFlagsBatchWithRetry(ctx context.Context, 
 	return result.([]db.BatchFlagUpdateResult), nil
 }
 
+func (rd *ResilientDatabase) SetMessageFlagsBatchWithRightsWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag, rights string, unchangedSince ...uint64) ([]db.BatchFlagUpdateResult, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).SetMessageFlagsBatchWithRights(ctx, tx, messageUIDs, mailboxID, newFlags, rights, unchangedSince...)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]db.BatchFlagUpdateResult), nil
+}
+
 func (rd *ResilientDatabase) GetMessageBodyStructureWithRetry(ctx context.Context, uid imap.UID, mailboxID int64) (*imap.BodyStructure, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetMessageBodyStructure(ctx, uid, mailboxID)
