@@ -81,7 +81,7 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 		// selects the default (per-message probe) query shape.
 		messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(ctx, mbox.ID, mbox.AccountID, criteria, 0, 0)
 		if errors.Is(err, db.ErrSearchTooManyResults) {
-			return nil, searchResultLimitError()
+			return nil, s.searchResultLimitError("MULTISEARCH", "mailbox", mbox.Name)
 		}
 		if err != nil {
 			s.DebugLog("[MULTISEARCH] final error after retries", "mailbox", mbox.Name, "error", err)
