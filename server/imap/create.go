@@ -71,7 +71,7 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 	// Users should create "Shared/Something", not just "Shared"
 	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
 		sharedPrefix := strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, "/")
-		if name == sharedPrefix {
+		if strings.EqualFold(name, sharedPrefix) {
 			s.DebugLog("cannot create shared namespace root explicitly", "name", name)
 			return &imap.Error{
 				Type: imap.StatusResponseTypeNo,
@@ -288,12 +288,15 @@ func (s *IMAPSession) sharedCreateRefusal(ctx context.Context, accountID int64, 
 	if !shared.Enabled || shared.AllowUserCreate {
 		return nil
 	}
-	if !strings.HasPrefix(name, shared.NamespacePrefix) && name != strings.TrimSuffix(shared.NamespacePrefix, "/") {
+	if !shared.InNamespace(name) {
 		return nil
 	}
-	if rest := strings.TrimPrefix(name, shared.NamespacePrefix); rest != name {
+	// Lookup uses LOWER(name), so the spelling of either the configured prefix
+	// or the client's name must not change whether an existing root is reused.
+	foldedName, foldedPrefix := strings.ToLower(name), strings.ToLower(shared.NamespacePrefix)
+	if rest := strings.TrimPrefix(foldedName, foldedPrefix); rest != foldedName {
 		top := shared.NamespacePrefix + strings.SplitN(rest, string(consts.MailboxDelimiter), 2)[0]
-		if top != name {
+		if !strings.EqualFold(top, name) {
 			if _, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, accountID, top); err == nil {
 				return nil
 			} else if err != consts.ErrMailboxNotFound {
