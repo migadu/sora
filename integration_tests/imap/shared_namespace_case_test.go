@@ -10,6 +10,7 @@ import (
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/stretchr/testify/require"
 )
@@ -35,6 +36,12 @@ func TestSharedNamespaceCasePreservesPolicyAndClassification(t *testing.T) {
 				err = c.Create(name, nil).Wait()
 				if !allow {
 					requireResponseCode(t, err, imap.ResponseCodeNoPerm, "case-insensitive shared policy")
+					adminCfg := &config.Config{SharedMailboxes: config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: prefix, AllowUserCreate: true, DefaultRights: "lrswipkxtea"}}
+					adminCtx := context.WithValue(context.Background(), consts.ConfigContextKey, adminCfg)
+					ownerID, err := server.ResilientDB.GetAccountIDByEmailWithRetry(adminCtx, owner.Email)
+					require.NoError(t, err)
+					require.NoError(t, server.ResilientDB.CreateMailboxForUserWithRetry(adminCtx, ownerID, prefix+"Existing"))
+					require.NoError(t, c.Create(strings.ToLower(prefix)+"existing/Child", nil).Wait(), "case variants may extend an existing shared root")
 					return
 				}
 				require.NoError(t, err)

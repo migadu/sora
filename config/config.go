@@ -1107,7 +1107,10 @@ func (c SharedMailboxesConfig) InNamespace(name string) bool {
 	if !c.Enabled {
 		return false
 	}
-	return strings.HasPrefix(name, c.NamespacePrefix) || name == strings.TrimSuffix(c.NamespacePrefix, "/")
+	// Sora resolves every mailbox name case-insensitively. Classification must
+	// use that same rule, or a case variant can bypass shared namespace policy.
+	name, prefix := strings.ToLower(name), strings.ToLower(c.NamespacePrefix)
+	return strings.HasPrefix(name, prefix) || name == strings.TrimSuffix(prefix, "/")
 }
 
 // AdminCLIConfig holds configuration for sora-admin CLI tool
