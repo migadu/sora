@@ -59,3 +59,25 @@ func TestIMAP_ReadOnlySharedOpensPreserveRecent(t *testing.T) {
 		})
 	}
 }
+
+func TestIMAP_ExamineOtherMailboxDoesNotReviveConsumedRecent(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, owner := common.SetupIMAPServer(t)
+	defer server.Close()
+	first, r1 := esearchDialLogin(t, server, owner.Email, owner.Password)
+	defer first.Close()
+	esearchAppend(t, first, r1, "a1", "INBOX", "old")
+	esearchCmdOK(t, first, r1, "a2", "SELECT INBOX")
+	esearchCreate(t, first, r1, "a3", "Other")
+	esearchCmdOK(t, first, r1, "a4", "EXAMINE Other")
+	// INBOX is now closed in the first session. A new read-write session is
+	// the first to select it after this delivery and consumes the new Recent.
+	second, r2 := esearchDialLogin(t, server, owner.Email, owner.Password)
+	defer second.Close()
+	esearchAppend(t, second, r2, "b1", "INBOX", "new")
+	lines := esearchCmdOK(t, second, r2, "b2", "SELECT INBOX")
+	require.Contains(t, lines, "* 1 RECENT")
+	lines = esearchCmdOK(t, first, r1, "a5", "EXAMINE INBOX")
+	require.Contains(t, lines, "* 0 RECENT", "an old session baseline cannot revive Recent consumed while INBOX was closed")
+	require.Empty(t, responseNums(esearchCmdOK(t, first, r1, "a6", "UID SEARCH RECENT"), "* SEARCH"))
+}
