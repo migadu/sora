@@ -2025,7 +2025,10 @@ Date: %s
 func TestACLManagement(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	server := setupHTTPAPIServer(t)
+	// This positive-path fixture includes a grant to anyone. Enable that policy
+	// explicitly rather than relying on shared-mailbox policy being disabled.
+	shared := config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: true}
+	server := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.SharedMailboxes = shared })
 	defer server.Close()
 
 	// Create test accounts
@@ -2038,10 +2041,7 @@ func TestACLManagement(t *testing.T) {
 
 	// Add config to context to enable shared mailbox detection
 	cfg := &config.Config{
-		SharedMailboxes: config.SharedMailboxesConfig{
-			Enabled:         true,
-			NamespacePrefix: "Shared/",
-		},
+		SharedMailboxes: shared,
 	}
 	ctx = context.WithValue(ctx, consts.ConfigContextKey, cfg)
 
