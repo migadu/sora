@@ -283,6 +283,7 @@ type IMAPServer struct {
 
 	// Search rate limiting
 	searchRateLimiter *serverPkg.SearchRateLimiter
+	threadMaxMessages int // Startup-only, per-server cap on messages threaded in memory.
 
 	// Node-wide total of body-section bytes retained by sessions for <offset.size>
 	// chunk fetches (see body_section_cache.go).
@@ -371,6 +372,7 @@ type IMAPServerOptions struct {
 	SearchRateLimitPerMin int                       // Search rate limit (searches per minute, 0=disabled)
 	SearchRateLimitWindow time.Duration             // Search rate limit time window
 	SearchRateLimitBurst  int                       // Searches allowed back to back (0=SearchRateLimitPerMin)
+	ThreadMaxMessages     int                       // THREAD result cap (<=0 uses 50,000)
 	SessionMemoryLimit    int64                     // Per-session memory limit in bytes (0=unlimited)
 	// Cache warmup configuration
 	EnableWarmup       bool
@@ -467,6 +469,10 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 	// Initialize search rate limiter
 	searchRateLimiter := serverPkg.NewSearchRateLimiter("IMAP", options.SearchRateLimitPerMin, options.SearchRateLimitWindow, options.SearchRateLimitBurst)
+	threadMaxMessages := options.ThreadMaxMessages
+	if threadMaxMessages <= 0 {
+		threadMaxMessages = config.DefaultThreadMaxMessages
+	}
 
 	// Initialize authentication cache from config
 	// Default to enabled if not explicitly configured
@@ -577,6 +583,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		metadataMaxTotalSize:         options.MetadataMaxTotalSize,
 		authLimiter:                  authLimiter,
 		searchRateLimiter:            searchRateLimiter,
+		threadMaxMessages:            threadMaxMessages,
 		proxyReader:                  proxyReader,
 		enableWarmup:                 options.EnableWarmup,
 		warmupMessageCount:           options.WarmupMessageCount,

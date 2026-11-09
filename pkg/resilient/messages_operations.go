@@ -215,9 +215,9 @@ func (rd *ResilientDatabase) SearchMessagesWithCriteriaWithRetry(ctx context.Con
 	return result.([]db.SearchMessageResult), nil
 }
 
-func (rd *ResilientDatabase) GetMessagesForThreadingWithRetry(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, includeSubject, withSeqNums bool) ([]db.ThreadMessageResult, error) {
+func (rd *ResilientDatabase) GetMessagesForThreadingWithRetry(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, includeSubject, withSeqNums bool, maxMessages int) ([]db.ThreadMessageResult, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetMessagesForThreading(ctx, mailboxID, accountID, criteria, includeSubject, withSeqNums)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetMessagesForThreading(ctx, mailboxID, accountID, criteria, includeSubject, withSeqNums, maxMessages)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op, db.ErrThreadTooManyMessages)
 	if err != nil {

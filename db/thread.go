@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -24,25 +26,21 @@ type ThreadMessageResult struct {
 	Seq          uint32
 }
 
-// ThreadMaxMessages is the most messages one THREAD command threads. A search
-// matching more is refused with ErrThreadTooManyMessages rather than threaded in
-// part: a client such as Roundcube shows the THREAD result as the message list, so
-// a partial result would present the rest of the folder as gone.
-//
-// Threading is in memory and cheap (about 18 ms and 27 MB for 50,000 messages);
-// the cap bounds the rows one command pulls from the database. It is a variable
-// only so tests can lower it.
-var ThreadMaxMessages = 50000
-
 // ErrThreadTooManyMessages is returned when a THREAD search matches more than
-// ThreadMaxMessages messages.
+// the configured message cap. The entire search is refused: a client such as
+// Roundcube shows the THREAD result as the message list, so a partial result
+// would present the rest of the folder as gone.
 var ErrThreadTooManyMessages = errors.New("THREAD search matches too many messages")
 
 // GetMessagesForThreading returns the threading metadata of the messages in a
 // mailbox that match criteria, in UID order. withSeqNums fills in each message's
 // sequence number, which only THREAD (not UID THREAD) needs and which costs a
-// ROW_NUMBER() over the whole mailbox; otherwise Seq is 0.
-func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, includeSubject, withSeqNums bool) ([]ThreadMessageResult, error) {
+// ROW_NUMBER() over the whole mailbox; otherwise Seq is 0. maxMessages bounds the
+// rows retained in memory; nonpositive values use the default cap.
+func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, includeSubject, withSeqNums bool, maxMessages int) ([]ThreadMessageResult, error) {
+	if maxMessages <= 0 {
+		maxMessages = config.DefaultThreadMaxMessages
+	}
 	// Fold custom keywords in the criteria onto the mailbox's canonical case so
 	// THREAD ... KEYWORD <name> matches case-insensitively (RFC 9051 §2.3.2),
 	// mirroring the SEARCH executors.
@@ -86,6 +84,10 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 	}
 
 	// One row past the cap tells a search that is too large from one that is not.
+	rowLimit := maxMessages
+	if rowLimit < math.MaxInt {
+		rowLimit++
+	}
 	finalQueryString := fmt.Sprintf(`
 		%s
 		SELECT m.uid, m.message_id, m.in_reply_to, m."references", %s, m.sent_date, m.internal_date, %s
@@ -98,7 +100,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 		  AND %s
 		ORDER BY m.uid
 		LIMIT %d
-	`, seqCTE, subjectSelect, seqSelect, ftsJoin, seqJoin, whereClause, ThreadMaxMessages+1)
+	`, seqCTE, subjectSelect, seqSelect, ftsJoin, seqJoin, whereClause, rowLimit)
 
 	start := time.Now()
 	rows, err := db.ReadPool.Query(ctx, finalQueryString, whereArgs)
@@ -141,7 +143,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 		}
 
 		messages = append(messages, msg)
-		if len(messages) > ThreadMaxMessages {
+		if len(messages) > maxMessages {
 			metrics.DBQueriesTotal.WithLabelValues("search_thread", "too_many", "read").Inc()
 			return nil, ErrThreadTooManyMessages
 		}

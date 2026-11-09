@@ -1131,6 +1131,12 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 limits.search_rate_limit_per_min = 60    # Searches per window per user (default: 60, set to 0 to disable).
 limits.search_rate_limit_window = "1m"   # Time window for search rate limiting (default: "1m").
 # limits.search_rate_limit_burst = 60    # Searches allowed back to back (default: search_rate_limit_per_min).
+# Maximum matching messages per THREAD or UID THREAD command (IMAP backend only).
+# Applies to all algorithms and criteria, including ALL. At the cap the complete result is
+# returned; above it the command fails with NO [LIMIT], never a partial message list.
+# Raising this cap increases memory and CPU use. Omitted, zero or negative values use 50000;
+# there is no unlimited setting. Changes require restarting this server.
+limits.thread_max_messages = 50000
 limits.redirect_rate_limit = 100         # Maximum SIEVE redirects per user (default: 100, set to 0 to disable).
 limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h").
 limits.max_redirect_hops = 2             # Max times one message may be redirected before suppression — mail-loop
