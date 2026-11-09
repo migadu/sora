@@ -405,7 +405,7 @@ Examples:
 	}
 
 	// Validate before creating parents, so a refused rename leaves no hierarchy.
-	if helpers.MailboxNameHasTraversal(*newName) || globalConfig.SharedMailboxes.InNamespace(*oldName) != globalConfig.SharedMailboxes.InNamespace(*newName) {
+	if helpers.MailboxNameHasTraversal(*newName) || globalConfig.SharedMailboxes.InNamespace(mbox.Name) != globalConfig.SharedMailboxes.InNamespace(*newName) {
 		fmt.Println("Failed to rename mailbox: invalid destination or shared namespace boundary")
 		os.Exit(1)
 	}
