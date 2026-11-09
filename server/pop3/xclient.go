@@ -27,6 +27,9 @@ func (s *POP3Session) handleXCLIENT(args string) (bool, string) {
 	}
 
 	// Validate parameters
+	if forwardingParams.ProxyTTL <= 0 {
+		return false, xclientTTLExpired
+	}
 	if err := forwardingParams.ValidateForwarding(); err != nil {
 		s.DebugLog("invalid xclient parameters", "error", err)
 		return false, "Invalid forwarding parameters"
