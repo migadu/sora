@@ -271,9 +271,7 @@ func (v *SearchCriteriaValidator) validateUIDSets(uidSets []imap.UIDSet, fieldNa
 				return fmt.Errorf("%s[%d][%d]: start (%d) must be <= stop (%d)",
 					fieldName, i, j, r.Start, r.Stop)
 			}
-			if r.Start == 0 {
-				return fmt.Errorf("%s[%d][%d]: UIDs must be >= 1", fieldName, i, j)
-			}
+			// go-imap represents UID '*' as zero, just as for sequence sets.
 		}
 	}
 	return nil

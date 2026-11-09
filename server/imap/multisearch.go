@@ -38,6 +38,9 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 		return nil, err
 	}
 
+	if s.useMasterDB.Load() {
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
 	accountID := s.IMAPUser.AccountID()
 
 	// Fetch all mailboxes visible to the account (owned + shared). Each mailbox's

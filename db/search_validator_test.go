@@ -93,9 +93,9 @@ func TestValidateSequenceRanges(t *testing.T) {
 			errorField:  "UID",
 		},
 		{
-			name:        "invalid UID range - zero start",
+			name:        "UID wildcard start",
 			uid:         []imap.UIDSet{{imap.UIDRange{Start: 0, Stop: 100}}},
-			expectError: true,
+			expectError: false,
 			errorField:  "UID",
 		},
 	}

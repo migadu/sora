@@ -1075,14 +1075,47 @@ func seqSetToUIDSet(set imap.SeqSet, uidBySeq map[uint32]imap.UID) imap.UIDSet {
 	return uidSet
 }
 
+func criteriaContainsUIDWildcard(c *imap.SearchCriteria) bool {
+	if c == nil {
+		return false
+	}
+	for _, set := range c.UID {
+		for _, r := range set {
+			if r.Start == 0 || r.Stop == 0 {
+				return true
+			}
+		}
+	}
+	for i := range c.Not {
+		if criteriaContainsUIDWildcard(&c.Not[i]) {
+			return true
+		}
+	}
+	for i := range c.Or {
+		for j := range c.Or[i] {
+			if criteriaContainsUIDWildcard(&c.Or[i][j]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // collectSeqNums appends every sequence number c's sequence sets name as a range end,
-// nested criteria included; "*" is not one.
+// nested criteria included; zero also requests the target mailbox's last UID.
 func collectSeqNums(c *imap.SearchCriteria, seqNums *[]int64) {
 	if c == nil {
 		return
 	}
 	for _, seqSet := range c.SeqNum {
 		*seqNums = appendSeqSetNums(*seqNums, seqSet)
+	}
+	for _, uidSet := range c.UID {
+		for _, r := range uidSet {
+			if r.Start == 0 || r.Stop == 0 {
+				*seqNums = append(*seqNums, 0) // resolve UID '*' in this mailbox too
+			}
+		}
 	}
 	for i := range c.Not {
 		collectSeqNums(&c.Not[i], seqNums)
@@ -1100,6 +1133,29 @@ func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID)
 	if c == nil {
 		return
 	}
+	// UID '*' denotes the last live UID, not MaxUint32. Resolve it before
+	// appending sequence rewrites, whose UID 0 sentinel deliberately matches none.
+	for i, set := range c.UID {
+		var resolved imap.UIDSet
+		for _, r := range set {
+			if r.Start == 0 || r.Stop == 0 {
+				last, exists := uidBySeq[0]
+				if !exists {
+					continue // an empty mailbox has no wildcard endpoint
+				}
+				if r.Start == 0 {
+					r.Start = last
+				}
+				if r.Stop == 0 {
+					r.Stop = last
+				}
+				r.Start, r.Stop = min(r.Start, r.Stop), max(r.Start, r.Stop)
+			}
+			resolved = append(resolved, r)
+		}
+		c.UID[i] = resolved
+	}
+
 	for _, seqSet := range c.SeqNum {
 		if mappedUIDSet := seqSetToUIDSet(seqSet, uidBySeq); len(mappedUIDSet) > 0 {
 			c.UID = append(c.UID, mappedUIDSet)
@@ -1120,6 +1176,11 @@ func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID)
 
 func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, orderByClause string, limit, mailboxMessageCount int) ([]SearchMessageResult, error) {
 	criteria = cloneSearchCriteria(criteria)
+	if criteriaContainsUIDWildcard(criteria) {
+		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, criteria); err != nil {
+			return nil, err
+		}
+	}
 	if err := db.canonicalizeSearchCriteriaKeywords(ctx, nil, mailboxID, criteria); err != nil {
 		return nil, err
 	}
