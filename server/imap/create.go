@@ -34,6 +34,11 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 	}
 	AccountID := s.AccountID()
 	release()
+	// Keep parent lookups and ACL checks on the writer after this session's
+	// earlier CREATE/SETACL, just as MYRIGHTS and GETACL do.
+	if s.useMasterDB.Load() {
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
 
 	// Reject path-traversal segments ("." / "..") up front with a clean client
 	// error. These names would let the maildir exporter escape its target
