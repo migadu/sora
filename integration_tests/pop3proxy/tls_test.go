@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"strings"
@@ -469,4 +470,184 @@ func TestPOP3ProxyImplicitTLSWithProxyProtocol(t *testing.T) {
 
 	t.Run("header in separate segment", func(t *testing.T) { run(t, false) })
 	t.Run("header coalesced with ClientHello", func(t *testing.T) { run(t, true) })
+}
+
+// startSTARTTLSProxy starts a POP3 proxy with a tls_use_starttls listener in
+// front of a plaintext backend that accepts the proxy's master SASL login;
+// configure adjusts the proxy's options before it is created.
+func startSTARTTLSProxy(t *testing.T, configure ...func(*pop3proxy.POP3ProxyServerOptions)) (proxy *pop3proxy.POP3ProxyServer, proxyAddr string, account common.TestAccount, certPool *x509.CertPool) {
+	t.Helper()
+	backend, account := common.SetupPOP3ServerWithMaster(t)
+	t.Cleanup(backend.Close)
+
+	proxyAddr = common.GetRandomAddress(t)
+	certFile, keyFile, certPool := common.GenerateTestTLSCert(t, nil, nil)
+	opts := pop3proxy.POP3ProxyServerOptions{
+		Name:               "test-proxy-starttls",
+		RemoteAddrs:        []string{backend.Address},
+		MasterSASLUsername: "proxyuser",
+		MasterSASLPassword: "proxypass",
+		TLS:                true,
+		TLSCertFile:        certFile,
+		TLSKeyFile:         keyFile,
+		TLSUseStartTLS:     true,
+		InsecureAuth:       false,
+		ConnectTimeout:     10 * time.Second,
+	}
+	for _, c := range configure {
+		c(&opts)
+	}
+	proxy, err := pop3proxy.New(context.Background(), "localhost", proxyAddr, backend.ResilientDB, opts)
+	if err != nil {
+		t.Fatalf("Failed to create POP3 proxy with STARTTLS: %v", err)
+	}
+	go func() { proxy.Start() }()
+	time.Sleep(200 * time.Millisecond)
+	return proxy, proxyAddr, account, certPool
+}
+
+// readCAPA sends CAPA and returns the capability lines, one per line.
+func readCAPA(t *testing.T, w net.Conn, reader *bufio.Reader) string {
+	t.Helper()
+	fmt.Fprintf(w, "CAPA\r\n")
+	if resp, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("CAPA failed: %q, %v", resp, err)
+	}
+	var caps []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Failed reading CAPA list: %v", err)
+		}
+		if line = strings.TrimSpace(line); line == "." {
+			return strings.Join(caps, "\n")
+		}
+		caps = append(caps, line)
+	}
+}
+
+// dialSTLS connects to a STARTTLS listener in plaintext, checks that STLS is
+// offered and login is not, and upgrades with full certificate verification.
+func dialSTLS(t *testing.T, addr string, certPool *x509.CertPool) (*tls.Conn, *bufio.Reader) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	reader := bufio.NewReader(conn)
+
+	if greeting, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(greeting, "+OK") {
+		t.Fatalf("plaintext greeting: %q, %v", greeting, err)
+	}
+	caps := readCAPA(t, conn, reader)
+	if !strings.Contains(caps, "STLS") {
+		t.Errorf("plaintext CAPA must advertise STLS, got:\n%s", caps)
+	}
+	if strings.Contains(caps, "USER") || strings.Contains(caps, "SASL") {
+		t.Errorf("plaintext CAPA must not advertise USER or SASL with insecure_auth off, got:\n%s", caps)
+	}
+
+	fmt.Fprintf(conn, "STLS\r\n")
+	if resp, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("STLS failed: %q, %v", resp, err)
+	}
+	tlsConn := tls.Client(conn, &tls.Config{RootCAs: certPool, ServerName: "127.0.0.1"})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("TLS handshake after STLS failed: %v", err)
+	}
+	return tlsConn, bufio.NewReader(tlsConn)
+}
+
+// TestPOP3ProxySTARTTLS covers a tls_use_starttls proxy listener end to end
+// (RFC 2595): login is withheld until STLS, and after the upgrade the client
+// logs in through the proxy and the relayed session runs over TLS.
+func TestPOP3ProxySTARTTLS(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	proxy, proxyAddr, account, certPool := startSTARTTLSProxy(t)
+	defer proxy.Stop()
+
+	conn, reader := dialSTLS(t, proxyAddr, certPool)
+	caps := readCAPA(t, conn, reader)
+	if !strings.Contains(caps, "USER") || !strings.Contains(caps, "SASL") {
+		t.Errorf("CAPA after STLS must advertise USER and SASL, got:\n%s", caps)
+	}
+	if strings.Contains(caps, "STLS") {
+		t.Errorf("CAPA after STLS must not advertise STLS, got:\n%s", caps)
+	}
+
+	fmt.Fprintf(conn, "USER %s\r\n", account.Email)
+	if resp, _ := reader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("USER after STLS failed: %q", resp)
+	}
+	fmt.Fprintf(conn, "PASS %s\r\n", account.Password)
+	if resp, _ := reader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("PASS after STLS failed: %q", resp)
+	}
+	// Relayed by the proxy after hijacking the library's TLS connection.
+	fmt.Fprintf(conn, "STAT\r\n")
+	if resp, _ := reader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("STAT through the proxy after STLS failed: %q", resp)
+	}
+	fmt.Fprintf(conn, "QUIT\r\n")
+	if resp, _ := reader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("QUIT through the proxy after STLS failed: %q", resp)
+	}
+}
+
+// Before login the proxy's shutdown broadcast writes from the goroutine that
+// stops it. After STLS the client reads through the library's TLS connection,
+// which sits above the session's SoraConn, so a notice written to the SoraConn
+// arrives as plaintext inside the TLS stream and the client sees a TLS error.
+func TestPOP3ProxyShutdownNoticeAfterSTLSIsReadableThroughTLS(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	proxy, proxyAddr, _, certPool := startSTARTTLSProxy(t)
+
+	conn, reader := dialSTLS(t, proxyAddr, certPool)
+	// A command through TLS: the library has read from its TLS connection, so
+	// the SoraConn has recorded it as the connection the session is using.
+	readCAPA(t, conn, reader)
+
+	go proxy.Stop()
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading the shutdown notice through TLS: %v", err)
+	}
+	if want := "-ERR Server shutting down, please reconnect\r\n"; line != want {
+		t.Fatalf("shutdown notice through TLS = %q, want %q", line, want)
+	}
+}
+
+// After login the proxy's SoraConn timeout checker owns the idle timeout, and
+// its notice is written from the checker's goroutine. After STLS the client
+// reads through the TLS connection the proxy hijacked from the library, which
+// sits above the SoraConn, so the notice must be written there (#163).
+func TestPOP3ProxyIdleNoticeAfterSTLSIsReadableThroughTLS(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	idleTimeout := 2 * time.Second
+	proxy, proxyAddr, account, certPool := startSTARTTLSProxy(t, func(o *pop3proxy.POP3ProxyServerOptions) {
+		o.CommandTimeout = idleTimeout
+		o.AuthIdleTimeout = 30 * time.Second
+	})
+	defer proxy.Stop()
+
+	conn, reader := dialSTLS(t, proxyAddr, certPool)
+	fmt.Fprintf(conn, "USER %s\r\n", account.Email)
+	if resp, _ := reader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("USER after STLS failed: %q", resp)
+	}
+	fmt.Fprintf(conn, "PASS %s\r\n", account.Password)
+	if resp, _ := reader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("PASS after STLS failed: %q", resp)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(idleTimeout + 5*time.Second))
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading the idle notice through TLS: %v", err)
+	}
+	if want := "-ERR [IN-USE] Idle timeout, please reconnect\r\n"; line != want {
+		t.Fatalf("idle notice through TLS = %q, want %q", line, want)
+	}
 }

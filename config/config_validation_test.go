@@ -217,22 +217,40 @@ func TestWarnUnusedConfigOptions_MultipleIssues(t *testing.T) {
 }
 
 func TestWarnUnusedStartTLS(t *testing.T) {
+	supported := map[string]bool{"lmtp": true, "managesieve": true, "pop3": true, "lmtp_proxy": true, "managesieve_proxy": true, "pop3_proxy": true}
 	for _, serverType := range []string{"imap", "pop3", "imap_proxy", "pop3_proxy", "metrics", "http_admin_api", "http_user_api", "lmtp", "managesieve", "lmtp_proxy", "managesieve_proxy"} {
+		t.Run(serverType, func(t *testing.T) {
+			cfg := ServerConfig{Type: serverType, Name: "listener", TLS: supported[serverType], TLSUseStartTLS: true}
+			var warnings []string
+			cfg.WarnUnusedConfigOptions(func(format string, args ...any) {
+				warnings = append(warnings, fmt.Sprintf(format, args...))
+			})
+			if supported[serverType] {
+				if len(warnings) != 0 {
+					t.Fatalf("supported STARTTLS listener warned: %v", warnings)
+				}
+				return
+			}
+			if len(warnings) != 1 || !strings.Contains(warnings[0], "'tls_use_starttls'") || !strings.Contains(warnings[0], "LMTP, ManageSieve and POP3 servers and proxies") {
+				t.Fatalf("expected accurate unsupported STARTTLS warning, got %v", warnings)
+			}
+		})
+	}
+}
+
+// tls_use_starttls without tls is dropped by every server that supports it, so the
+// listener comes up plaintext with no STARTTLS; that must be said at startup, not
+// only in a debug log.
+func TestWarnStartTLSWithoutTLS(t *testing.T) {
+	for _, serverType := range []string{"lmtp", "managesieve", "pop3", "lmtp_proxy", "managesieve_proxy", "pop3_proxy"} {
 		t.Run(serverType, func(t *testing.T) {
 			cfg := ServerConfig{Type: serverType, Name: "listener", TLSUseStartTLS: true}
 			var warnings []string
 			cfg.WarnUnusedConfigOptions(func(format string, args ...any) {
 				warnings = append(warnings, fmt.Sprintf(format, args...))
 			})
-			supported := serverType == "lmtp" || serverType == "managesieve" || serverType == "lmtp_proxy" || serverType == "managesieve_proxy"
-			if supported {
-				if len(warnings) != 0 {
-					t.Fatalf("supported STARTTLS listener warned: %v", warnings)
-				}
-				return
-			}
-			if len(warnings) != 1 || !strings.Contains(warnings[0], "'tls_use_starttls'") || !strings.Contains(warnings[0], "LMTP and ManageSieve servers and proxies") {
-				t.Fatalf("expected accurate unsupported STARTTLS warning, got %v", warnings)
+			if len(warnings) != 1 || !strings.Contains(warnings[0], "without 'tls = true'") {
+				t.Fatalf("expected a warning that tls_use_starttls needs tls, got %v", warnings)
 			}
 		})
 	}

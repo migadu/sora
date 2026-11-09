@@ -20,12 +20,10 @@ import (
 
 // startSTLSThroughputServer serves POP3 with STLS available and the slowloris
 // check armed to fire in well under a second: the plaintext SoraListener in
-// front, the library upgrading the stream on STLS behind it, which is how a
-// ManageSieve tls_use_starttls listener is wired. Sora's POP3 server has no
-// STARTTLS listener mode of its own (a configured certificate makes its
-// listener implicit-TLS, where the TLS layer sits below the SoraConn and the
-// notice cannot land under it), so the test assembles the two halves from the
-// server's own connConfig and buildLibServer.
+// front, the library upgrading the stream on STLS behind it, which is how Start
+// wires a tls_use_starttls listener. The test assembles the two halves from the
+// server's own connConfig and buildLibServer because Start offers no way to
+// shorten the throughput window.
 func startSTLSThroughputServer(t *testing.T) string {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
