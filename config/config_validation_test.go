@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -212,5 +213,27 @@ func TestWarnUnusedConfigOptions_MultipleIssues(t *testing.T) {
 	// (MaxScriptSize doesn't trigger a warning for IMAP as we didn't add that check)
 	if warningCount < 2 {
 		t.Errorf("Expected at least 2 warnings for multiple invalid options, got %d", warningCount)
+	}
+}
+
+func TestWarnUnusedStartTLS(t *testing.T) {
+	for _, serverType := range []string{"imap", "pop3", "imap_proxy", "pop3_proxy", "metrics", "http_admin_api", "http_user_api", "lmtp", "managesieve", "lmtp_proxy", "managesieve_proxy"} {
+		t.Run(serverType, func(t *testing.T) {
+			cfg := ServerConfig{Type: serverType, Name: "listener", TLSUseStartTLS: true}
+			var warnings []string
+			cfg.WarnUnusedConfigOptions(func(format string, args ...any) {
+				warnings = append(warnings, fmt.Sprintf(format, args...))
+			})
+			supported := serverType == "lmtp" || serverType == "managesieve" || serverType == "lmtp_proxy" || serverType == "managesieve_proxy"
+			if supported {
+				if len(warnings) != 0 {
+					t.Fatalf("supported STARTTLS listener warned: %v", warnings)
+				}
+				return
+			}
+			if len(warnings) != 1 || !strings.Contains(warnings[0], "'tls_use_starttls'") || !strings.Contains(warnings[0], "LMTP and ManageSieve servers and proxies") {
+				t.Fatalf("expected accurate unsupported STARTTLS warning, got %v", warnings)
+			}
+		})
 	}
 }
