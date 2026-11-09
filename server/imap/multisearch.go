@@ -3,7 +3,6 @@ package imap
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 
 	"github.com/emersion/go-imap/v2"
@@ -53,7 +52,7 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 	}
 
 	// Resolve the source scopes to a concrete, ordered, de-duplicated mailbox set.
-	mailboxes, err := s.resolveSearchSource(source, allMailboxes)
+	mailboxes, err := s.resolveSearchSource(ctx, source, allMailboxes)
 	if err != nil {
 		return nil, err
 	}
@@ -165,12 +164,22 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 
 // resolveSearchSource turns an ESEARCH source spec into an ordered, de-duplicated
 // list of mailboxes to search, drawn from the account's visible mailboxes. Scope
-// verbs (selected/inboxes/personal/subscribed/subtree/subtree-one) silently
-// resolve to whatever exists; an explicitly named mailbox that does not exist
-// yields NO [NONEXISTENT] (RFC 7377 §2.1). ACL filtering happens later, per result.
-func (s *IMAPSession) resolveSearchSource(source *imap.SearchSource, allMailboxes []*db.DBMailbox) ([]*db.DBMailbox, error) {
+// verbs (selected/inboxes/personal/subscribed/subtree/subtree-one) require lookup
+// visibility. Explicit names additionally allow read-only ACL visibility (r without
+// l); inaccessible names are ignored (RFC 7377 §2.2). Read checks follow per result.
+func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.SearchSource, allMailboxes []*db.DBMailbox) ([]*db.DBMailbox, error) {
 	accountID := s.IMAPUser.AccountID()
 	delim := string(consts.MailboxDelimiter)
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
+	if !acquired {
+		return nil, s.internalError("failed to snapshot selected ESEARCH source")
+	}
+	var selected *db.DBMailbox
+	if s.selectedMailbox != nil {
+		copy := *s.selectedMailbox
+		selected = &copy
+	}
+	release()
 
 	byLower := make(map[string]*db.DBMailbox, len(allMailboxes))
 	for _, m := range allMailboxes {
@@ -190,11 +199,11 @@ func (s *IMAPSession) resolveSearchSource(source *imap.SearchSource, allMailboxe
 		out = append(out, m)
 	}
 
-	if source.Selected && s.selectedMailbox != nil {
-		if m, ok := byLower[strings.ToLower(s.selectedMailbox.Name)]; ok {
+	if source.Selected && selected != nil {
+		if m, ok := byLower[strings.ToLower(selected.Name)]; ok {
 			add(m)
 		} else {
-			add(s.selectedMailbox)
+			add(selected)
 		}
 	}
 	if source.Inboxes {
@@ -244,12 +253,13 @@ func (s *IMAPSession) resolveSearchSource(source *imap.SearchSource, allMailboxe
 	for _, name := range source.Mailboxes {
 		m, ok := byLower[strings.ToLower(name)]
 		if !ok {
-			// RFC 7377: "If a specified mailbox doesn't exist, the server SHOULD
-			// return a NO response." (Applies only to explicitly named mailboxes.)
-			return nil, &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeNonExistent,
-				Text: fmt.Sprintf("Mailbox does not exist: %s", name),
+			var err error
+			m, err = s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, accountID, name, db.ACLRightRead)
+			if errors.Is(err, consts.ErrMailboxNotFound) {
+				continue
+			}
+			if err != nil {
+				return nil, s.internalError("failed to resolve explicit search mailbox: %v", err)
 			}
 		}
 		add(m)
