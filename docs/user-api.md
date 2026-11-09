@@ -377,7 +377,7 @@ List messages in a mailbox with pagination.
       "to": "user@example.com",
       "date": "2024-01-20T10:30:00Z",
       "size": 4096,
-      "flags": ["Seen"],
+      "flags": ["\\Seen"],
       "has_attachments": false
     }
   ],
@@ -436,7 +436,7 @@ Get full message details in JSON format.
   "cc": [],
   "date": "2024-01-20T10:30:00Z",
   "size": 4096,
-  "flags": ["Seen"],
+  "flags": ["\\Seen"],
   "headers": {
     "message-id": ["<abc123@example.com>"],
     "x-mailer": ["Sora Mail"]
@@ -525,22 +525,37 @@ the opposite attachment keyword.
 **Request Body:**
 ```json
 {
-  "add_flags": ["Seen", "Flagged"],
-  "remove_flags": ["Draft"]
+  "add_flags": ["\\Seen", "\\Flagged"],
+  "remove_flags": ["\\Draft"]
 }
 ```
 
-**Standard IMAP Flags:**
-- `Seen` - Message has been read
-- `Answered` - Message has been replied to
-- `Flagged` - Message is flagged/starred
-- `Deleted` - Message is marked for deletion
-- `Draft` - Message is a draft
+Flags are spelled as in IMAP. In JSON the backslash is escaped, so `"\\Seen"` is the
+flag `\Seen`.
 
-**Response:** `200 OK`
+**System Flags** (with the backslash, in any case):
+- `\Seen` - Message has been read
+- `\Answered` - Message has been replied to
+- `\Flagged` - Message is flagged/starred
+- `\Deleted` - Message is marked for deletion
+- `\Draft` - Message is a draft
+
+`\Recent` cannot be set or cleared: no client can change it (RFC 3501 §2.3.2).
+
+**Keywords:** anything without a backslash is an IMAP keyword, such as `$Forwarded`
+or `Work`. It must be a valid IMAP atom: ASCII, with no spaces or `( ) { % * " \ ]`.
+A system flag name without its backslash (`"Seen"`) is rejected with `400` instead
+of being added as a keyword.
+
+**Response:** `200 OK`, with the updated message
 ```json
 {
-  "message": "Flags updated successfully"
+  "message": "Message flags updated successfully",
+  "data": {
+    "id": 12345,
+    "flags": ["\\Seen", "\\Flagged"],
+    "custom_flags": ["Work"]
+  }
 }
 ```
 
@@ -551,7 +566,7 @@ curl -X PATCH http://localhost:8081/user/messages/12345 \
   -H "Authorization: Bearer your-jwt-token" \
   -H "Content-Type: application/json" \
   -d '{
-    "add_flags": ["Seen", "Flagged"]
+    "add_flags": ["\\Seen", "\\Flagged"]
   }'
 
 # Remove draft flag
@@ -559,7 +574,7 @@ curl -X PATCH http://localhost:8081/user/messages/12345 \
   -H "Authorization: Bearer your-jwt-token" \
   -H "Content-Type: application/json" \
   -d '{
-    "remove_flags": ["Draft"]
+    "remove_flags": ["\\Draft"]
   }'
 ```
 
@@ -611,7 +626,7 @@ Full-text search messages in a mailbox.
       "to": "user@example.com",
       "date": "2024-01-20T10:30:00Z",
       "size": 4096,
-      "flags": ["Seen"],
+      "flags": ["\\Seen"],
       "has_attachments": false
     }
   ],
@@ -982,7 +997,7 @@ await fetch(`http://localhost:8081/user/messages/${messages[0].id}`, {
     'Authorization': `Bearer ${token}`,
     'Content-Type': 'application/json'
   },
-  body: JSON.stringify({ add_flags: ['Seen'] })
+  body: JSON.stringify({ add_flags: ['\\Seen'] })
 });
 ```
 
@@ -1246,14 +1261,14 @@ const mailboxes = await client.request('/mailboxes');
 3. **Optimistic updates**
    ```javascript
    // Update UI immediately
-   message.flags.push('Seen');
+   message.flags.push('\\Seen');
    updateUI(message);
 
    // Sync with server
-   await api.updateFlags(message.id, { add_flags: ['Seen'] })
+   await api.updateFlags(message.id, { add_flags: ['\\Seen'] })
      .catch(error => {
        // Revert on failure
-       message.flags = message.flags.filter(f => f !== 'Seen');
+       message.flags = message.flags.filter(f => f !== '\\Seen');
        updateUI(message);
      });
    ```

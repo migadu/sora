@@ -376,15 +376,13 @@ paths:
                 add_flags:
                   type: array
                   items:
-                    type: string
-                    enum: [Seen, Answered, Flagged, Deleted, Draft]
-                  example: ["Seen", "Flagged"]
+                    $ref: '#/components/schemas/SettableFlag'
+                  example: ['\Seen', '\Flagged']
                 remove_flags:
                   type: array
                   items:
-                    type: string
-                    enum: [Seen, Answered, Flagged, Deleted, Draft]
-                  example: ["Draft"]
+                    $ref: '#/components/schemas/SettableFlag'
+                  example: ['\Draft']
       responses:
         '200':
           description: Flags updated successfully
@@ -678,6 +676,34 @@ components:
           type: integer
           format: int64
 
+    SettableFlag:
+      type: string
+      description: |
+        A system flag, written with its backslash as in IMAP: `\Seen`, `\Answered`,
+        `\Flagged`, `\Deleted` or `\Draft`, in any case. `\Recent` cannot be set or
+        cleared. Anything without a backslash is an IMAP keyword such as `$Forwarded`
+        or `Work`, and must be a valid IMAP atom (RFC 9051 §9). A system flag name
+        without its backslash (`Seen`) is rejected with 400 rather than taken as a
+        keyword.
+      example: '\Seen'
+
+    SystemFlags:
+      type: array
+      description: System flags set on the message, with their backslash.
+      items:
+        type: string
+        enum: ['\Seen', '\Answered', '\Flagged', '\Deleted', '\Draft']
+      example: ['\Seen']
+
+    CustomFlags:
+      type: array
+      description: |
+        IMAP keywords set on the message, without a backslash. Omitted when there
+        are none.
+      items:
+        type: string
+      example: ['$Forwarded', 'Work']
+
     MessageListItem:
       type: object
       properties:
@@ -701,9 +727,9 @@ components:
         size:
           type: integer
         flags:
-          type: array
-          items:
-            type: string
+          $ref: '#/components/schemas/SystemFlags'
+        custom_flags:
+          $ref: '#/components/schemas/CustomFlags'
         has_attachments:
           type: boolean
           description: |
@@ -757,9 +783,9 @@ components:
         size:
           type: integer
         flags:
-          type: array
-          items:
-            type: string
+          $ref: '#/components/schemas/SystemFlags'
+        custom_flags:
+          $ref: '#/components/schemas/CustomFlags'
         headers:
           type: object
           additionalProperties:
