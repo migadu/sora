@@ -22,6 +22,12 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	AccountID := s.AccountID()
 	release()
 
+	// As in CREATE: a parent this RENAME creates inside the shared namespace must be a
+	// shared mailbox, which CreateMailbox decides from the config in the context.
+	if s.server.config != nil {
+		ctx = context.WithValue(ctx, consts.ConfigContextKey, s.server.config)
+	}
+
 	if strings.EqualFold(existingName, newName) {
 		s.DebugLog("new mailbox name is the same as current one (case-insensitive)", "mailbox", existingName)
 		return &imap.Error{
@@ -41,6 +47,14 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 			Code: imap.ResponseCodeCannot,
 			Text: "Invalid mailbox name",
 		}
+	}
+
+	// Whether a mailbox is shared is settled when it is created in or outside the
+	// shared namespace, so a RENAME never crosses it (issue #160). Checked before any
+	// parent of the new name is created; db.RenameMailbox checks the stored flag too.
+	if s.server.config != nil && s.server.config.SharedMailboxes.InNamespace(existingName) != s.server.config.SharedMailboxes.InNamespace(newName) {
+		s.DebugLog("rejecting rename across the shared namespace boundary", "old_name", existingName, "new_name", newName)
+		return sharedBoundaryError()
 	}
 
 	// Middle phase: Database operations outside lock
@@ -189,6 +203,9 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	// Rename using the mailbox owner's AccountID
 	err = s.server.rdb.RenameMailboxWithRetry(ctx, oldMailbox.ID, ownerAccountID, newName, newParentMailboxID)
 	if err != nil {
+		if errors.Is(err, consts.ErrMailboxSharedBoundary) {
+			return sharedBoundaryError()
+		}
 		return s.internalError("failed to rename mailbox '%s' to '%s': %v", existingName, newName, err)
 	}
 
@@ -285,4 +302,14 @@ func (s *IMAPSession) checkCreateRightForHierarchy(ctx context.Context, newParen
 		return nil
 	}
 	return nil
+}
+
+// sharedBoundaryError is the refusal of a RENAME into or out of the shared namespace:
+// RFC 5530 CANNOT, an operation that can never succeed.
+func sharedBoundaryError() *imap.Error {
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeCannot,
+		Text: "Mailboxes cannot be moved into or out of the shared namespace",
+	}
 }

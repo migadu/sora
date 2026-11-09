@@ -105,13 +105,19 @@ const (
 	FlagFlagged              // 4: 000100
 	FlagDeleted              // 8: 001000
 	FlagDraft                // 16: 010000
-	FlagRecent               // 32: 100000
+	FlagRecent               // 32: 100000, no longer written (see FlagToBitwise)
 )
 
 func ContainsFlag(flags int, flag int) bool {
 	return flags&flag != 0
 }
 
+// FlagToBitwise returns the stored bit for a system flag, or 0 for a flag that
+// has none: a keyword, an unknown flag-extension, or \Recent. RFC 3501 §2.3.2
+// makes \Recent a session flag that "can not be altered by the client", so it
+// is neither stored nor searched as a bit; the IMAP session works it out from
+// UIDs (see server/imap/recent.go). Rows stored before may still carry
+// FlagRecent; IMAP never reads it.
 func FlagToBitwise(flag imap.Flag) int {
 	switch strings.ToLower(string(flag)) {
 	case "\\seen":
@@ -124,8 +130,6 @@ func FlagToBitwise(flag imap.Flag) int {
 		return FlagDeleted
 	case "\\draft":
 		return FlagDraft
-	case "\\recent":
-		return FlagRecent
 	}
 
 	return 0

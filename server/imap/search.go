@@ -67,11 +67,15 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 	// session account here would make every shared-mailbox body search return nothing.
 	selectedMailboxID = s.selectedMailbox.ID
 	selectedMailboxOwnerID := s.selectedMailbox.AccountID
+	selectedMailboxName := s.selectedMailbox.Name
 	currentNumMessages = s.currentNumMessages.Load()
 	release() // Release read lock
 
 	// Now decode search criteria using decodeSearchCriteriaLocked helper that we'll create
 	criteria = s.decodeSearchCriteria(criteria)
+	if criteria, err = s.withSessionRecent(criteria, selectedMailboxID); err != nil {
+		return nil, err
+	}
 
 	if currentNumMessages == 0 && len(criteria.SeqNum) > 0 {
 		s.DebugLog("skipping SEARCH because mailbox is empty")
@@ -86,7 +90,7 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 	// SEARCH only returns UIDs, so we can use a high limit (0 = use default MaxSearchResults)
 	messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(ctx, selectedMailboxID, selectedMailboxOwnerID, criteria, 0, int(currentNumMessages))
 	if errors.Is(err, db.ErrSearchTooManyResults) {
-		return nil, searchResultLimitError()
+		return nil, s.searchResultLimitError("SEARCH", "mailbox", selectedMailboxName, "mailbox_messages", currentNumMessages)
 	}
 	if err != nil {
 		// The resilient layer already logs retry attempts. We just log the final error.
@@ -350,8 +354,15 @@ func (s *IMAPSession) decodeSearchCriteria(criteria *imap.SearchCriteria) *imap.
 	return s.decodeSearchCriteriaLocked(criteria)
 }
 
-// A safety cap is a protocol refusal, never a partial successful result.
-func searchResultLimitError() *imap.Error {
+// searchResultLimitError answers a command that matched more than db.MaxSearchResults
+// messages: a safety cap is a protocol refusal, never a partial successful result.
+// Each refusal is counted and logged with the command, the mailbox and what the
+// caller knows of its size, since nothing else shows how often, or in which
+// mailboxes, clients run into the cap; deciding whether the cap or the ALL
+// exemption needs changing takes both.
+func (s *IMAPSession) searchResultLimitError(command string, keysAndValues ...any) *imap.Error {
+	metrics.IMAPSearchRefused.WithLabelValues("result_cap").Inc()
+	s.InfoLog("search refused at the result cap", append([]any{"command", command, "cap", db.MaxSearchResults}, keysAndValues...)...)
 	return &imap.Error{
 		Type: imap.StatusResponseTypeNo,
 		Code: imap.ResponseCodeLimit,

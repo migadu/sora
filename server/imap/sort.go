@@ -49,6 +49,7 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 	// session account here would make every shared-mailbox body search return nothing.
 	selectedMailboxID := s.selectedMailbox.ID
 	selectedMailboxOwnerID := s.selectedMailbox.AccountID
+	selectedMailboxName := s.selectedMailbox.Name
 	// Mailbox size selects the search query shape (see db.ftsCTEThreshold). Only the order
 	// of magnitude matters, so the session's cached count is good enough.
 	mailboxMessageCount := int(s.currentNumMessages.Load())
@@ -56,6 +57,11 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 
 	if sessionTrackerSnapshot == nil {
 		return nil, s.internalError("no session tracker available for sort")
+	}
+
+	searchCriteria, err := s.withSessionRecent(searchCriteria, selectedMailboxID)
+	if err != nil {
+		return nil, err
 	}
 
 	// Check for context cancellation before database query
@@ -67,7 +73,7 @@ func (s *IMAPSession) Sort(ctx context.Context, numKind imapserver.NumKind, sort
 	// SORT only returns UIDs, so we can use a high limit (0 = use default MaxSearchResults)
 	messages, err := s.server.rdb.SearchMessagesSortedWithRetry(ctx, selectedMailboxID, selectedMailboxOwnerID, searchCriteria, sortCriteria, 0, mailboxMessageCount)
 	if errors.Is(err, db.ErrSearchTooManyResults) {
-		return nil, searchResultLimitError()
+		return nil, s.searchResultLimitError("SORT", "mailbox", selectedMailboxName, "mailbox_messages", mailboxMessageCount)
 	}
 	if err != nil {
 		return nil, s.internalError("failed to sort messages: %v", err)

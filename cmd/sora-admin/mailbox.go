@@ -409,8 +409,11 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Rename mailbox - newParentID is handled internally by RenameMailbox
-	err = rdb.RenameMailboxWithRetry(ctx, mbox.ID, accountID, *newName, nil)
+	// Rename mailbox - newParentID is handled internally by RenameMailbox. With the
+	// shared mailbox config in the context it refuses a move across the shared
+	// namespace boundary, as IMAP RENAME does.
+	renameCtx := context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: globalConfig.SharedMailboxes})
+	err = rdb.RenameMailboxWithRetry(renameCtx, mbox.ID, accountID, *newName, nil)
 	if err != nil {
 		fmt.Printf("Failed to rename mailbox: %v\n", err)
 		os.Exit(1)

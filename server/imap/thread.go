@@ -39,20 +39,25 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 		}
 	}
 
+	criteria, err := s.withSessionRecent(criteria, s.selectedMailbox.ID)
+	if err != nil {
+		return nil, err
+	}
+
 	includeSubject := algorithm == imap.ThreadReferences || algorithm == imap.ThreadOrderedSubject
 	// The FTS scope is the mailbox OWNER, which for a shared mailbox is not the session
 	// account: messages.account_id always carries the owner (server/imap/copy.go passes
 	// destMailbox.AccountID, LMTP and delivery resolve the owner likewise). Passing the
 	// session account here would make every shared-mailbox body search return nothing.
 	withSeqNums := numKind == imapserver.NumKindSeq
-	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, s.selectedMailbox.ID, s.selectedMailbox.AccountID, criteria, includeSubject, withSeqNums)
+	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, s.selectedMailbox.ID, s.selectedMailbox.AccountID, criteria, includeSubject, withSeqNums, s.server.threadMaxMessages)
 	if errors.Is(err, db.ErrThreadTooManyMessages) {
 		// RFC 5530 section 3, LIMIT: "The operation ran up against an
 		// implementation limit of some kind".
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeLimit,
-			Text: fmt.Sprintf("THREAD matches more than %d messages, narrow the search", db.ThreadMaxMessages),
+			Text: fmt.Sprintf("THREAD matches more than %d messages, narrow the search", s.server.threadMaxMessages),
 		}
 	}
 	if err != nil {

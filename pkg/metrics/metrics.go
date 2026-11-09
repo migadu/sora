@@ -362,6 +362,17 @@ var (
 		},
 	)
 
+	IMAPSearchRefused = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_imap_search_refused_total",
+			Help: "Total IMAP SEARCH, SORT, THREAD and ESEARCH commands refused with NO [LIMIT], by reason",
+		},
+		// result_cap: more than db.MaxSearchResults matches; rate_limit: the account's
+		// search rate limit, which sora_protocol_errors_total{error_type="rate_limited"}
+		// counts as well.
+		[]string{"reason"},
+	)
+
 	// ManageSieve-specific
 	ManageSieveScriptsUploaded = promauto.NewCounter(
 		prometheus.CounterOpts{

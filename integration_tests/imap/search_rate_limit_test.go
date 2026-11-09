@@ -76,12 +76,18 @@ func TestIMAP_SearchRateLimit_ChargesByCost(t *testing.T) {
 		"UID SORT (DATE) UTF-8 2",
 		"ESEARCH IN (personal) RETURN (ALL) UNSEEN",
 	}
+	before := searchRefusedCount(t, "rate_limit")
 	for i, cmd := range refused {
 		rtag := fmt.Sprintf("r%d", i)
 		_, tagged := esearchExec(t, conn, r, rtag, cmd)
 		if !strings.HasPrefix(tagged, rtag+" NO [LIMIT] ") || !strings.Contains(tagged, "please wait") {
 			t.Errorf("%s with the budget spent: got %q, want NO [LIMIT] with a time to wait", cmd, tagged)
 		}
+	}
+	// A refusal by the rate limiter is a search refused too, and is counted next to
+	// the result cap's so that one metric answers how often NO [LIMIT] is sent and why.
+	if got, want := searchRefusedCount(t, "rate_limit"), before+float64(len(refused)); got != want {
+		t.Errorf(`sora_imap_search_refused_total{reason="rate_limit"} after %d refusals: got %.0f, want %.0f`, len(refused), got, want)
 	}
 
 	runFree("after")

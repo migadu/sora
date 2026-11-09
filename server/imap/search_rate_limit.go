@@ -5,6 +5,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 // The search rate limit (server.SearchRateLimiter) is for the searches that are
@@ -99,8 +100,11 @@ func (s *IMAPSession) chargeSearch(ctx context.Context) error {
 	if s.IMAPUser == nil {
 		return nil
 	}
-	// The limiter logs with suppression and counts the refusal in its metrics.
+	// The limiter logs with suppression and counts the refusal in its own metric. It
+	// is counted here too, next to the result cap's refusals, so that one metric says
+	// how often NO [LIMIT] is sent and why.
 	if err := s.server.searchRateLimiter.CanSearch(ctx, s.IMAPUser.AccountID()); err != nil {
+		metrics.IMAPSearchRefused.WithLabelValues("rate_limit").Inc()
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeLimit,

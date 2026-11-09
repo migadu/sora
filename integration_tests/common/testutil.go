@@ -199,7 +199,8 @@ type IMAPServerOpts struct {
 	SearchRateLimitBurst          int
 	// SharedMailboxes replaces the default shared mailbox settings (enabled, users
 	// may create shared mailboxes and grant "anyone").
-	SharedMailboxes *config.SharedMailboxesConfig
+	SharedMailboxes   *config.SharedMailboxesConfig
+	ThreadMaxMessages int
 }
 
 func (ts *TestServer) Close() {
@@ -904,6 +905,7 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 			SearchRateLimitPerMin: opts.SearchRateLimitPerMin,
 			SearchRateLimitWindow: opts.SearchRateLimitWindow,
 			SearchRateLimitBurst:  opts.SearchRateLimitBurst,
+			ThreadMaxMessages:     opts.ThreadMaxMessages,
 		},
 	)
 	if err != nil {

@@ -21,7 +21,7 @@ require (
 	github.com/k3a/html2text v1.4.0
 	github.com/migadu/go-managesieve v0.1.3
 	github.com/migadu/go-pop3 v0.1.4
-	github.com/migadu/go-sieve v1.4.4-0.20261108221321-a4779685c8bc
+	github.com/migadu/go-sieve v1.4.4
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2
 	github.com/stretchr/testify v1.11.1
@@ -90,4 +90,4 @@ require (
 	rsc.io/binaryregexp v0.2.0 // indirect
 )
 
-replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20261030090407-161f7836ef0e
+replace github.com/emersion/go-imap/v2 => github.com/migadu/go-imap/v2 v2.0.0-20261108235340-0877c58286fa

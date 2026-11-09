@@ -297,7 +297,9 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 			reloaded = append(reloaded, "api_key")
 		}
 	}
-	if len(cfg.AllowedHosts) > 0 {
+	// Reload receives the complete config, so an empty or removed list means what
+	// it does at startup: every host is allowed.
+	if !slices.Equal(cfg.AllowedHosts, next.allowedHosts) {
 		next.allowedHosts = slices.Clone(cfg.AllowedHosts)
 		reloaded = append(reloaded, "allowed_hosts")
 	}

@@ -559,7 +559,6 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,
-			Flags:         []imap.Flag{imap.Flag("\\Recent")}, // Mark as recent
 			InternalDate:  sentDate,
 			Size:          obj.Size,
 			Subject:       subject,

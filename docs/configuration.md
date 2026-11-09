@@ -102,6 +102,20 @@ Each protocol (IMAP, LMTP, POP3, ManageSieve) has its own configuration table.
 *   `auth_rate_limit`: Contains settings to enable and configure brute-force authentication protection.
 *   `proxy_protocol`: Contains settings to enable PROXY protocol, which is essential for seeing real client IPs when Sora is behind a load balancer. **Only enable this if you are behind a trusted proxy.**
 
+#### THREAD Message Limit
+
+For each IMAP backend server, `limits.thread_max_messages` sets the maximum number of matching messages one `THREAD` or `UID THREAD` command can process (default: `50000`). It applies to every threading algorithm and search criterion, including `ALL`. A search matching exactly the limit returns its complete result; a search matching more returns `NO [LIMIT]` without a partial thread result. Narrowing the search can bring it within the cap.
+
+```toml
+[[server]]
+type = "imap"
+name = "imap"
+addr = ":143"
+limits.thread_max_messages = 50000
+```
+
+Omitted, zero and negative values use the default; there is no unlimited setting. Each server has its own cap, and changing it requires a restart. Higher caps increase memory and CPU use because threading loads metadata and constructs threads in memory. This setting does not change `SEARCH` or `SORT` limits or search rate limiting.
+
 #### Command Timeout and DoS Protection
 
 All protocol servers support multi-layered timeout protection to defend against various denial-of-service attacks:

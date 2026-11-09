@@ -79,9 +79,13 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 		// mbox.AccountID, never the session accountID above: for a shared mailbox the FTS
 		// rows belong to the owner. No message count is available per mailbox here, so 0
 		// selects the default (per-message probe) query shape.
-		messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(ctx, mbox.ID, mbox.AccountID, criteria, 0, 0)
+		mboxCriteria, err := s.withSessionRecent(criteria, mbox.ID)
+		if err != nil {
+			return nil, err
+		}
+		messages, err := s.server.rdb.SearchMessagesWithCriteriaWithRetry(ctx, mbox.ID, mbox.AccountID, mboxCriteria, 0, 0)
 		if errors.Is(err, db.ErrSearchTooManyResults) {
-			return nil, searchResultLimitError()
+			return nil, s.searchResultLimitError("MULTISEARCH", "mailbox", mbox.Name)
 		}
 		if err != nil {
 			s.DebugLog("[MULTISEARCH] final error after retries", "mailbox", mbox.Name, "error", err)

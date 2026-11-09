@@ -81,7 +81,7 @@ Sora includes built-in protections against resource exhaustion attacks:
 To prevent memory exhaustion from large search operations:
 - **MaxSearchResults**: Limited to 100,000 matching messages for filtered searches
 
-IMAP SEARCH, SORT and ESEARCH refuse a result above the default cap with `NO [LIMIT]`, rather than returning a partial set as success. Exactly the cap is allowed. `ALL` searches remain exempt for full mailbox synchronization. Clients can narrow the criteria when a filtered search exceeds the cap. Database callers that explicitly request a bounded page keep that page size.
+IMAP SEARCH, SORT and ESEARCH refuse a result above the default cap with `NO [LIMIT]`, rather than returning a partial set as success. Exactly the cap is allowed. `ALL` searches remain exempt for full mailbox synchronization. Clients can narrow the criteria when a filtered search exceeds the cap. Database callers that explicitly request a bounded page keep that page size. Each refusal is counted in `sora_imap_search_refused_total{reason="result_cap"}` and logged at INFO with the command, the mailbox and its message count, so that how often, and where, clients hit the cap is visible.
 
 ### Search Rate Limiting
 
@@ -101,7 +101,7 @@ The limit charges the searches that are expensive, not every command that is a s
 The rate limiter:
 - Tracks searches per user (not per IP), across all of the user's connections
 - Uses a token bucket: it holds `search_rate_limit_burst` searches and refills continuously at `search_rate_limit_per_min` per `search_rate_limit_window`. With the default burst it allows every sequence the earlier sliding window allowed, at the same sustained rate, and a burst followed by idle time is no longer refused for a whole window
-- Refuses with `NO [LIMIT]` (RFC 5530), saying how long to wait, so that clients can tell throttling from failure
+- Refuses with `NO [LIMIT]` (RFC 5530), saying how long to wait, so that clients can tell throttling from failure; each refusal is counted in `sora_imap_search_refused_total{reason="rate_limit"}`, next to the result cap's, as well as in `sora_protocol_errors_total{error_type="rate_limited"}`
 - Automatically cleans up inactive user tracking
 - Is on by default at 60 searches per minute (set `search_rate_limit_per_min = 0` to disable it)
 

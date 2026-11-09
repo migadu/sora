@@ -859,6 +859,7 @@ type ServerLimitsConfig struct {
 	SearchRateLimitPerMin *int   `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled, default: 60)
 	SearchRateLimitWindow string `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
 	SearchRateLimitBurst  *int   `toml:"search_rate_limit_burst,omitempty"`   // Searches allowed back to back (default: search_rate_limit_per_min)
+	ThreadMaxMessages     int    `toml:"thread_max_messages,omitempty"`       // Maximum matches per THREAD command (IMAP backend only, <=0 uses default: 50000)
 	RedirectRateLimit     *int   `toml:"redirect_rate_limit,omitempty"`       // Redirect rate limit (per account across the window, 0=unlimited, default: 100)
 	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (default: 1h)
 	MaxRedirectHops       *int   `toml:"max_redirect_hops,omitempty"`         // Max times one message may be redirected before suppression (mail-loop backstop, 0=unlimited, default: 2)
@@ -1098,6 +1099,15 @@ type SharedMailboxesConfig struct {
 	AllowUserCreate       bool   `toml:"allow_user_create"`       // Allow regular users to create shared mailboxes
 	DefaultRights         string `toml:"default_rights"`          // Default ACL rights for shared mailbox creators
 	AllowAnyoneIdentifier bool   `toml:"allow_anyone_identifier"` // Enable RFC 4314 "anyone" identifier for domain-wide sharing
+}
+
+// InNamespace reports whether a mailbox of this name is created as a shared mailbox:
+// the feature is enabled and the name is under the namespace prefix, or is its root.
+func (c SharedMailboxesConfig) InNamespace(name string) bool {
+	if !c.Enabled {
+		return false
+	}
+	return strings.HasPrefix(name, c.NamespacePrefix) || name == strings.TrimSuffix(c.NamespacePrefix, "/")
 }
 
 // AdminCLIConfig holds configuration for sora-admin CLI tool
@@ -1677,6 +1687,19 @@ func (s *ServerConfig) GetSearchRateLimitBurst() int {
 		return *s.Limits.SearchRateLimitBurst
 	}
 	return s.GetSearchRateLimitPerMin()
+}
+
+// DefaultThreadMaxMessages bounds the metadata fetched and threaded in memory
+// by one IMAP THREAD command.
+const DefaultThreadMaxMessages = 50000
+
+// GetThreadMaxMessages returns the maximum number of matches one THREAD command
+// may process. Unset, zero and negative values retain the bounded default.
+func (s *ServerConfig) GetThreadMaxMessages() int {
+	if s.Limits != nil && s.Limits.ThreadMaxMessages > 0 {
+		return s.Limits.ThreadMaxMessages
+	}
+	return DefaultThreadMaxMessages
 }
 
 // GetMinBytesPerMinute returns minimum bytes per minute

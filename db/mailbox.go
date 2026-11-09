@@ -202,6 +202,54 @@ func (db *Database) GetMailbox(ctx context.Context, mailboxID int64, AccountID i
 }
 
 // GetMailboxByName fetches the mailbox for a specific user by name
+// mailboxByNameSQL selects a mailbox's columns from the candidate rows in %s, sub.
+// Use LOWER() on both sides to ensure consistent case-insensitive comparison
+// regardless of database locale (C/POSIX locales don't lowercase non-ASCII in LOWER())
+const mailboxByNameSQL = `
+	SELECT id, name, uid_validity, path,
+		EXISTS(SELECT 1 FROM subscriptions s WHERE s.account_id = $1 AND LOWER(s.mailbox_name) = LOWER(sub.name)) AS subscribed,
+		COALESCE(special_use, ''), created_at, updated_at, account_id FROM (%s
+	) sub`
+
+// mailboxByNameOwnedSQL finds the user's own mailbox; names are unique per owner.
+var mailboxByNameOwnedSQL = fmt.Sprintf(mailboxByNameSQL, `
+		SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
+		FROM mailboxes m
+		WHERE m.account_id = $1 AND LOWER(m.name) = LOWER($2)
+		  AND m.deleted_at IS NULL`)
+
+// mailboxByNameSharedSQL finds a mailbox of another owner shared with the user. Of
+// several, one granted to the user directly comes before one granted to "anyone" in
+// their domain, and the oldest before newer ones: a stable choice, not whichever row
+// the plan happens to produce first.
+var mailboxByNameSharedSQL = fmt.Sprintf(mailboxByNameSQL, `
+		-- Specifically shared to this user explicitly via ACL
+		SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id, 1 AS priority
+		FROM mailbox_acls acl
+		JOIN mailboxes m ON m.id = acl.mailbox_id
+		WHERE acl.account_id = $1
+		  AND position('l' IN acl.rights) > 0
+		  AND LOWER(m.name) = LOWER($2)
+		  AND m.account_id != $1
+		  AND COALESCE(m.is_shared, FALSE) = TRUE
+		  AND m.deleted_at IS NULL
+
+		UNION ALL
+
+		-- Publicly shared within the same domain ('anyone' ACL)
+		SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id, 2 AS priority
+		FROM mailbox_acls anyone_acl
+		JOIN mailboxes m ON m.id = anyone_acl.mailbox_id
+		WHERE anyone_acl.identifier = 'anyone'
+		  AND position('l' IN anyone_acl.rights) > 0
+		  AND LOWER(m.name) = LOWER($2)
+		  AND m.account_id != $1
+		  AND COALESCE(m.is_shared, FALSE) = TRUE
+		  AND m.owner_domain = $3
+		  AND m.deleted_at IS NULL`) + `
+	ORDER BY sub.priority, sub.id
+	LIMIT 1`
+
 func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name string) (*DBMailbox, error) {
 	start := time.Now()
 	var err error
@@ -221,58 +269,25 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	var mailbox DBMailbox
 	var uidValidityInt64 int64
 	var accountID int64
-
-	ownerDomain, fetchErr := db.GetAccountDomain(ctx, AccountID)
-	if fetchErr != nil {
-		// Log the error but don't fail immediately, wait for the actual query execution
-		if !errors.Is(fetchErr, pgx.ErrNoRows) {
-			logger.Error("Database: failed to get account domain for GetMailboxByName", "err", fetchErr)
-		}
-		ownerDomain = "" // fallback
+	scan := func(row pgx.Row) error {
+		return row.Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
 	}
 
-	// Optimized query using denormalized domain column
-	// Use LOWER() on both sides to ensure consistent case-insensitive comparison
-	// regardless of database locale (C/POSIX locales don't lowercase non-ASCII in LOWER())
-	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT id, name, uid_validity, path,
-			EXISTS(SELECT 1 FROM subscriptions s WHERE s.account_id = $1 AND LOWER(s.mailbox_name) = LOWER(sub.name)) AS subscribed,
-			COALESCE(special_use, ''), created_at, updated_at, account_id FROM (
-			-- 1) Owned by user
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
-			FROM mailboxes m
-			WHERE m.account_id = $1 AND LOWER(m.name) = LOWER($2)
-			  AND m.deleted_at IS NULL
-
-			UNION ALL
-
-			-- 2) Specifically shared to this user explicitly via ACL
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
-			FROM mailbox_acls acl
-			JOIN mailboxes m ON m.id = acl.mailbox_id
-			WHERE acl.account_id = $1
-			  AND position('l' IN acl.rights) > 0
-			  AND LOWER(m.name) = LOWER($2)
-			  AND m.account_id != $1
-			  AND COALESCE(m.is_shared, FALSE) = TRUE
-			  AND m.deleted_at IS NULL
-
-			UNION ALL
-
-			-- 3) Publicly shared within the same domain ('anyone' ACL)
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
-			FROM mailbox_acls anyone_acl
-			JOIN mailboxes m ON m.id = anyone_acl.mailbox_id
-			WHERE anyone_acl.identifier = 'anyone'
-			  AND position('l' IN anyone_acl.rights) > 0
-			  AND LOWER(m.name) = LOWER($2)
-			  AND m.account_id != $1
-			  AND COALESCE(m.is_shared, FALSE) = TRUE
-			  AND m.owner_domain = $3
-			  AND m.deleted_at IS NULL
-		) sub
-		LIMIT 1
-	`, AccountID, name, ownerDomain).Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &accountID)
+	// Names are unique per owner, so a user can see several mailboxes of one name:
+	// their own and others' shared with them (issue #161). Their own comes first, and
+	// is looked up on its own, so the common case never evaluates the shared lookups.
+	err = scan(db.GetReadPoolWithContext(ctx).QueryRow(ctx, mailboxByNameOwnedSQL, AccountID, name))
+	if errors.Is(err, pgx.ErrNoRows) {
+		ownerDomain, fetchErr := db.GetAccountDomain(ctx, AccountID)
+		if fetchErr != nil {
+			// Log the error but don't fail immediately, wait for the actual query execution
+			if !errors.Is(fetchErr, pgx.ErrNoRows) {
+				logger.Error("Database: failed to get account domain for GetMailboxByName", "err", fetchErr)
+			}
+			ownerDomain = "" // fallback
+		}
+		err = scan(db.GetReadPoolWithContext(ctx).QueryRow(ctx, mailboxByNameSharedSQL, AccountID, name, ownerDomain))
+	}
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -344,14 +359,10 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	// Extract config from context if available
 	isShared := false
 	var ownerDomain *string
-	sharedPrefix := "Shared/" // Default prefix
 
 	// Try to get config from context
-	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.Enabled {
-		sharedPrefix = cfg.SharedMailboxes.NamespacePrefix
-		// Check if name starts with prefix, or is the prefix itself (without trailing slash)
-		prefixWithoutSlash := strings.TrimSuffix(sharedPrefix, "/")
-		if strings.HasPrefix(name, sharedPrefix) || name == prefixWithoutSlash {
+	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil {
+		if cfg.SharedMailboxes.InNamespace(name) {
 			isShared = true
 
 			// Extract domain from user's primary credential
@@ -1094,6 +1105,14 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			return consts.ErrMailboxNotFound
 		}
 		return fmt.Errorf("failed to fetch mailbox for rename: %w", err)
+	}
+
+	// Whether a mailbox is shared (is_shared, owner_domain, its ACL) is settled when
+	// it is created in or outside the shared namespace; a rename to the other side
+	// would leave that describing the old name, so it is refused (issue #160).
+	if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.Enabled &&
+		cfg.SharedMailboxes.InNamespace(newName) != isShared {
+		return consts.ErrMailboxSharedBoundary
 	}
 
 	// If it's a shared mailbox, check ACL permissions
