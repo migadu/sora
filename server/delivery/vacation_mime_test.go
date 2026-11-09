@@ -153,9 +153,9 @@ func TestVacationMIMEUnknownCharsetPreservesEncoding(t *testing.T) {
 			leaf := "Content-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: " + tc.encoding + "\r\n\r\n" + tc.body + "\r\n"
 			for _, reason := range []string{
 				leaf,
-				"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n" + leaf + "--b--\r\n",
-				"Content-Type: message/rfc822\r\n\r\nSubject: Away\r\n" + leaf,
-				"Content-Type: multipart/digest; boundary=d\r\n\r\n--d\r\n\r\nSubject: Away\r\n" + leaf + "--d--\r\n",
+				"Content-Type: multipart/mixed; boundary=b\r\nContent-Transfer-Encoding: binary\r\n\r\n--b\r\n" + leaf + "--b--\r\n",
+				"Content-Type: message/rfc822\r\nContent-Transfer-Encoding: binary\r\n\r\nSubject: Away\r\n" + leaf,
+				"Content-Type: multipart/digest; boundary=d\r\nContent-Transfer-Encoding: binary\r\n\r\n--d\r\nContent-Transfer-Encoding: binary\r\n\r\nSubject: Away\r\n" + leaf + "--d--\r\n",
 			} {
 				var wire bytes.Buffer
 				if err := writeVacationMIME(&wire, message.Header{}, reason); err != nil {
@@ -183,7 +183,7 @@ func TestVacationMIMEHeaderSizeBound(t *testing.T) {
 		}
 	}
 	var wire bytes.Buffer
-	if err := writeVacationMIME(&wire, message.Header{}, "Content-Type: application/octet-stream\r\n\r\n"+large); err != nil {
+	if err := writeVacationMIME(&wire, message.Header{}, "Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: binary\r\n\r\n"+large); err != nil {
 		t.Fatalf("body incorrectly limited with headers: %v", err)
 	}
 }

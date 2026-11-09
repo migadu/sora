@@ -101,6 +101,11 @@ func validateVacationMIME(header message.Header, body io.Reader, defaultType str
 	if err != nil {
 		return err
 	}
+	// Identity encodings constrain the complete source body, including nested
+	// MIME headers, child bodies and multipart preambles/epilogues (§§2.7–2.8).
+	if encoding == "" || encoding == "7bit" || encoding == "8bit" {
+		body = newVacationMIMELineReader(body, 998, encoding != "8bit")
+	}
 	if mediaType == "message/rfc822" {
 		// RFC 2046 §5.2.1: message/rfc822 containers cannot use an encoding
 		// other than 7bit, 8bit or binary. Validate their embedded MIME too.
@@ -117,8 +122,8 @@ func validateVacationMIME(header message.Header, body io.Reader, defaultType str
 		return validateVacationMIME(message.Header{Header: embedded}, embeddedBody, "text/plain", depth+1)
 	}
 	if strings.HasPrefix(mediaType, "multipart/") {
-		if params["boundary"] == "" {
-			return fmt.Errorf("multipart entity has no boundary")
+		if !validVacationMIMEBoundary(params["boundary"]) {
+			return fmt.Errorf("invalid multipart boundary")
 		}
 		// RFC 2045 §6.4 forbids encoded multipart containers.
 		if encoding == "quoted-printable" || encoding == "base64" {
@@ -146,17 +151,87 @@ func validateVacationMIME(header message.Header, body io.Reader, defaultType str
 		if count == 0 {
 			return fmt.Errorf("multipart entity has no body parts")
 		}
-		return nil
+		// NextPart stops at the final boundary. Drain the remaining source so
+		// its identity transfer encoding also constrains the epilogue.
+		_, err = io.Copy(io.Discard, body)
+		return err
 	}
 	// Charsets do not affect transfer-encoding validity and need no conversion.
 	if encoding == "quoted-printable" {
 		return validateVacationQuotedPrintable(body)
 	}
 	if encoding == "base64" {
-		body = base64.NewDecoder(base64.StdEncoding, body)
+		// Decoder tolerance for line endings must not permit us to generate
+		// bare CR/LF or lines longer than RFC 2045 §6.8's 76 characters.
+		body = base64.NewDecoder(base64.StdEncoding, newVacationMIMELineReader(body, 76, true))
 	}
 	_, err = io.Copy(io.Discard, body)
 	return err
+}
+
+// RFC 2046 §5.1.1: 1–70 bchars, with no space at the end.
+func validVacationMIMEBoundary(boundary string) bool {
+	if len(boundary) == 0 || len(boundary) > 70 || boundary[len(boundary)-1] == ' ' {
+		return false
+	}
+	for _, b := range []byte(boundary) {
+		if b >= '0' && b <= '9' || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || strings.ContainsRune("'()+_,-./:=? ", rune(b)) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// Validate one bounded wire line before exposing any of its original bytes.
+// Unlike Scanner, this retains line endings exactly and never buffers a body.
+type vacationMIMELineReader struct {
+	reader   *bufio.Reader
+	maxLine  int
+	sevenBit bool
+	pending  []byte
+	err      error
+}
+
+func newVacationMIMELineReader(body io.Reader, maxLine int, sevenBit bool) *vacationMIMELineReader {
+	return &vacationMIMELineReader{reader: bufio.NewReaderSize(body, maxLine+3), maxLine: maxLine, sevenBit: sevenBit}
+}
+
+func (r *vacationMIMELineReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if len(r.pending) == 0 {
+		if r.err != nil {
+			return 0, r.err
+		}
+		line, err := r.reader.ReadSlice('\n')
+		if err != nil && err != io.EOF {
+			return 0, err
+		}
+		content := line
+		if len(content) > 0 && content[len(content)-1] == '\n' {
+			if len(content) < 2 || content[len(content)-2] != '\r' {
+				return 0, fmt.Errorf("bare LF in MIME transfer encoding")
+			}
+			content = content[:len(content)-2]
+		}
+		if len(content) > r.maxLine {
+			return 0, fmt.Errorf("MIME transfer line exceeds %d characters", r.maxLine)
+		}
+		for _, b := range content {
+			if b == 0 || b == '\r' || b == '\n' || r.sevenBit && b >= 128 {
+				return 0, fmt.Errorf("invalid byte in MIME transfer encoding")
+			}
+		}
+		r.pending, r.err = line, err
+	}
+	n := copy(p, r.pending)
+	r.pending = r.pending[n:]
+	if len(r.pending) == 0 {
+		return n, r.err
+	}
+	return n, nil
 }
 
 // RFC 2045 §6.7 permits only upper-case hex escapes, soft line breaks,
