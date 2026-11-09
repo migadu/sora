@@ -3,6 +3,7 @@
 package imap_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/BurntSushi/toml"
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/config"
@@ -146,13 +148,25 @@ func TestSoraAdminMailboxCreateMakesSharedMailbox(t *testing.T) {
 
 	base, err := os.ReadFile(common.GetTestConfigPath(t))
 	require.NoError(t, err)
+	// The server fixture honors SORA_TEST_DB_NAME; the subprocess must use that
+	// same database rather than the repository config's default test database.
+	var settings map[string]any
+	_, err = toml.Decode(string(base), &settings)
+	require.NoError(t, err)
+	if name := os.Getenv("SORA_TEST_DB_NAME"); name != "" {
+		for _, key := range []string{"write", "read"} {
+			if endpoint, ok := settings["database"].(map[string]any)[key].(map[string]any); ok {
+				endpoint["name"] = name
+			}
+		}
+	}
+	settings["shared_mailboxes"] = map[string]any{
+		"enabled": true, "namespace_prefix": "Shared/", "allow_user_create": false,
+	}
+	var encoded bytes.Buffer
+	require.NoError(t, toml.NewEncoder(&encoded).Encode(settings))
 	configPath := filepath.Join(t.TempDir(), "sora-admin.toml")
-	require.NoError(t, os.WriteFile(configPath, append(base, []byte(`
-[shared_mailboxes]
-enabled = true
-namespace_prefix = "Shared/"
-allow_user_create = false
-`)...), 0o600))
+	require.NoError(t, os.WriteFile(configPath, encoded.Bytes(), 0o600))
 
 	name := fmt.Sprintf("Shared/AdminMade-%d", common.GetTimestamp())
 	out, err := exec.Command(common.GetSoraAdminBinary(t), "--config", configPath,
