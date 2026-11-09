@@ -1987,6 +1987,14 @@ func (s *ServerConfig) Validate() error {
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
+	if s.TLSUseStartTLS {
+		switch s.Type {
+		case "lmtp", "managesieve", "lmtp_proxy", "managesieve_proxy":
+		default:
+			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to LMTP and ManageSieve servers and proxies", s.Name, s.Type)
+		}
+	}
+
 	// Check proxy-only options on non-proxy servers
 	if !strings.HasSuffix(s.Type, "_proxy") {
 		if len(s.RemoteAddrs) > 0 {
@@ -2095,9 +2103,6 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.AppendLimit != "" {
 			logger("WARNING: Server %s (type: %s) has 'append_limit' configured, but this only applies to IMAP servers", s.Name, s.Type)
-		}
-		if s.TLSUseStartTLS {
-			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to protocol servers (IMAP, POP3, LMTP, ManageSieve)", s.Name, s.Type)
 		}
 		if s.Type == "metrics" && s.TLS {
 			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)
