@@ -103,7 +103,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 	`, seqCTE, subjectSelect, seqSelect, ftsJoin, seqJoin, whereClause, rowLimit)
 
 	start := time.Now()
-	rows, err := db.ReadPool.Query(ctx, finalQueryString, whereArgs)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, finalQueryString, whereArgs)
 
 	metrics.DBQueryDuration.WithLabelValues("search_thread", "read").Observe(time.Since(start).Seconds())
 	if err != nil {
