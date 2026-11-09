@@ -6,6 +6,8 @@ import (
 	"github.com/migadu/sora/server"
 )
 
+const xclientTTLExpired = "Proxy TTL expired"
+
 // handleXCLIENT handles the POP3 XCLIENT command for Dovecot-style parameter
 // forwarding. This is a custom extension that follows Dovecot's XCLIENT
 // specification. It returns whether the parameters were accepted together with
@@ -33,7 +35,7 @@ func (s *POP3Session) handleXCLIENT(args string) (bool, string) {
 	// Check TTL to prevent loops
 	if !forwardingParams.DecrementTTL() {
 		s.DebugLog("xclient ttl expired, possible forwarding loop")
-		return false, "Proxy TTL expired"
+		return false, xclientTTLExpired
 	}
 
 	// Store forwarding parameters in session
