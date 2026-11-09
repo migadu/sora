@@ -108,6 +108,15 @@ func TestVacationMIMEMalformedDoesNotSendOrConsumePeriod(t *testing.T) {
 		"Content-Type: text/plain\r\nContent-Type: text/html\r\n\r\nbody",
 		"Content-Type: text/plain\r\nContent-Description: a\x00b\r\n\r\nbody",
 		"Content-Type: text/plain\r\nContent-Description: caf\xc3\xa9\r\n\r\nbody",
+		"Content-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: bogus-cte\r\n\r\nbody",
+		"Content-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: base64\r\n\r\n!notbase64!",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\nContent-Transfer-Encoding: base64\r\n\r\n--b\r\n\r\nbody\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: multipart/mixed; boundary=c\r\n\r\n--c--\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: bogus-cte\r\n\r\nbody\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: base64\r\n\r\n!notbase64!\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Description: a\x00b\r\n\r\nbody\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nX-Description: caf\xc3\xa9\r\n\r\nbody\r\n--b--\r\n",
 	} {
 		t.Run(reason, func(t *testing.T) {
 			q := &captureRelayQueue{}
@@ -122,6 +131,34 @@ func TestVacationMIMEMalformedDoesNotSendOrConsumePeriod(t *testing.T) {
 			}
 			if len(q.calls) != 0 || len(oracle.recorded) != 0 {
 				t.Errorf("malformed MIME consumed period or was sent: queued=%d recorded=%d", len(q.calls), len(oracle.recorded))
+			}
+		})
+	}
+}
+
+func TestVacationMIMEUnknownCharsetPreservesEncoding(t *testing.T) {
+	for _, tc := range []struct{ encoding, body string }{
+		{"7bit", "Away"},
+		{"8bit", "Caf\xe9"},
+		{"binary", "Caf\xe9"},
+		{"BASE64", "Q2Fm6Q=="},
+		{"quoted-printable", "Caf=E9"},
+	} {
+		t.Run(tc.encoding, func(t *testing.T) {
+			leaf := "Content-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: " + tc.encoding + "\r\n\r\n" + tc.body + "\r\n"
+			for _, reason := range []string{
+				leaf,
+				"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n" + leaf + "--b--\r\n",
+			} {
+				var wire bytes.Buffer
+				if err := writeVacationMIME(&wire, message.Header{}, reason); err != nil {
+					t.Fatal(err)
+				}
+				gotBody := strings.SplitN(wire.String(), "\r\n\r\n", 2)[1]
+				wantBody := strings.SplitN(reason, "\r\n\r\n", 2)[1]
+				if gotBody != wantBody || !strings.Contains(wire.String(), "Content-Transfer-Encoding: "+tc.encoding+"\r\n") {
+					t.Fatalf("encoded entity changed: %q", wire.String())
+				}
 			}
 		})
 	}
