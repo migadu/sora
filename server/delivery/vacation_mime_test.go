@@ -185,6 +185,26 @@ func TestVacationMIMEHeaderSizeBound(t *testing.T) {
 	}
 }
 
+func TestVacationMIMEHeaderComments(t *testing.T) {
+	for _, reason := range []string{
+		"Content-Type: text/plain (text); charset=(local) x-unknown\r\nContent-Transfer-Encoding: (wire) base64 (encoded)\r\n\r\nQXdheQ==",
+		"Content-Type: (outer (inner)) text (type) / (subtype) plain; charset=\"x-(unknown)\"\r\nContent-Transfer-Encoding: quoted-printable (a\\)b)\r\n\r\nAway=3D",
+		"Content-Type: multipart/mixed (mixed); boundary=\"a(b)\"\r\n\r\n--a(b)\r\nContent-Type: text/plain (text)\r\nContent-Transfer-Encoding: base64 (body)\r\n\r\nQXdheQ==\r\n--a(b)--\r\n",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			var wire bytes.Buffer
+			if err := writeVacationMIME(&wire, message.Header{}, reason); err != nil {
+				t.Fatalf("valid MIME comments rejected: %v", err)
+			}
+			got := strings.SplitN(wire.String(), "\r\n\r\n", 2)[1]
+			want := strings.SplitN(reason, "\r\n\r\n", 2)[1]
+			if got != want {
+				t.Fatalf("encoded body changed: got %q want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestVacationMIMERejectsInvalidEncodedContent(t *testing.T) {
 	for _, body := range []string{"bad=ZZ", "bad=", "bad=A", "bad= \r\n", "bad=af", "bad\x00", "bad\xe9", "bad \r\n", strings.Repeat("x", 77)} {
 		for _, charset := range []string{"utf-8", "x-unknown"} {
