@@ -160,7 +160,7 @@ func TestIMAP_StoreSilentMixedModifiedAndNoop(t *testing.T) {
 	defer server.Close()
 	c := dialRawIMAP(t, server.Address)
 	c.do(fmt.Sprintf("LOGIN %s %s", owner.Email, owner.Password))
-	for range 2 {
+	for range 3 {
 		c.appendMsg("INBOX", "Subject: mixed\r\n\r\nbody\r\n")
 	}
 	c.do("SELECT INBOX (CONDSTORE)")
@@ -174,19 +174,24 @@ func TestIMAP_StoreSilentMixedModifiedAndNoop(t *testing.T) {
 	require.NoError(t, server.ResilientDB.QueryRowWithRetry(ctx, `SELECT max(greatest(m.created_modseq,coalesce(ms.updated_modseq,0))) FROM messages m JOIN message_state ms ON ms.message_id=m.id AND ms.mailbox_id=m.mailbox_id WHERE m.mailbox_id=$1`, mailbox.ID).Scan(&cutoff))
 	c.do(`UID STORE 1 +FLAGS (\Answered)`)
 	c.do("SELECT INBOX (CONDSTORE)")
-	for _, requested := range []string{`\Seen`, `\Flagged`} {
-		lines, tagged := c.do(fmt.Sprintf(`UID STORE 1:2 (UNCHANGEDSINCE %d) +FLAGS.SILENT (%s)`, cutoff, requested))
-		require.Contains(t, tagged, "MODIFIED 1")
-		var success []string
+	// UID 1 fails, UID 2 is a successful no-op, and UID 3 changes.
+	lines, tagged := c.do(fmt.Sprintf(`UID STORE 1:3 (UNCHANGEDSINCE %d) +FLAGS.SILENT (\Seen)`, cutoff))
+	require.Contains(t, tagged, "MODIFIED 1")
+	for _, uid := range []int{1, 2, 3} {
+		var responses []string
 		for _, line := range lines {
-			if strings.Contains(line, " FETCH ") && strings.Contains(line, "UID 2") {
-				success = append(success, line)
+			if strings.Contains(line, " FETCH ") && strings.Contains(line, fmt.Sprintf("UID %d", uid)) {
+				responses = append(responses, line)
 			}
 		}
-		require.Len(t, success, 1, "%q", lines)
-		require.Contains(t, success[0], "MODSEQ (")
-		if requested == `\Seen` {
-			require.NotContains(t, success[0], "FLAGS (")
+		if uid == 1 {
+			require.Empty(t, responses, "failed row must not reappear via no-op fallback")
+			continue
+		}
+		require.Len(t, responses, 1, "UID %d: %q", uid, lines)
+		require.Contains(t, responses[0], "MODSEQ (")
+		if uid == 2 {
+			require.NotContains(t, responses[0], "FLAGS (")
 		}
 	}
 }
