@@ -2,6 +2,7 @@ package lmtp
 
 import (
 	"context"
+	"reflect"
 	"slices"
 	"testing"
 
@@ -117,5 +118,165 @@ func TestKeepDefaultActionKeepsTheUserScriptsWork(t *testing.T) {
 	}
 	if len(defaultResult.HeaderEdits) != 1 || len(defaultResult.Flags) != 2 {
 		t.Errorf("the default script's result was modified: %+v", defaultResult)
+	}
+}
+
+// evaluateSieve runs one script through the real executor, as the LMTP delivery
+// path does, and returns its result. editheader is enabled on top of the default
+// extensions, as deployments that use addheader in a script configure it.
+func evaluateSieve(t *testing.T, script string) sieveengine.Result {
+	t.Helper()
+	compiled, err := sieveengine.CompileScript(`require ["vacation", "fileinto", "imap4flags", "editheader"]; `+script, append(sieveengine.EffectiveExtensions(nil), "editheader"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := compiled.NewExecutor(1, nil, nil, 0, 0, 0).Evaluate(context.Background(), sieveengine.Context{
+		EnvelopeFrom: "sender@example.com",
+		EnvelopeTo:   "recipient@example.com",
+		Header: map[string][]string{
+			"From": {"sender@example.com"}, "To": {"recipient@example.com"},
+			"Subject": {"A message"},
+		},
+		Message: []byte("From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: A message\r\n\r\nHello.\r\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+// The default script's work on a message it keeps: a reply, a flag and a header
+// edit, none of which the embedded default.sieve produces today.
+const defaultKeepWork = ` addflag "defaulttag"; addheader "X-Default" "default"; vacation :subject "System away" "System auto-reply";`
+
+// A user script that keeps, implicitly or explicitly, leaves where the message goes
+// to the default script. When the default script also kept, its reply, flags and
+// header edits must survive the merge exactly as they do when it filed the message
+// elsewhere: the user script only confirmed the filing, it did not undo the rest.
+func TestMergeSieveResultsKeepingUserScriptKeepsTheDefaultScriptsWork(t *testing.T) {
+	for _, def := range []struct{ name, script string }{
+		{"default implicit keep", defaultKeepWork},
+		{"default explicit keep", `keep;` + defaultKeepWork},
+	} {
+		for _, user := range []struct {
+			name, script  string
+			flags         []string
+			ownReply      bool
+			ownHeaderEdit bool
+		}{
+			{"empty", ``, nil, false, false},
+			{"if false", `if false { }`, nil, false, false},
+			{"explicit keep", `keep;`, nil, false, false},
+			{"keep with own work", `addflag "usertag"; addheader "X-User" "user"; keep;`, []string{"usertag"}, false, true},
+			{"user vacation", `vacation :subject "User away" "User auto-reply";`, nil, true, false},
+		} {
+			t.Run(def.name+"/"+user.name, func(t *testing.T) {
+				defaultResult := evaluateSieve(t, def.script)
+				userResult := evaluateSieve(t, user.script)
+				if defaultResult.Action != sieveengine.ActionKeep || defaultResult.Vacation == nil || len(defaultResult.Flags) != 1 || len(defaultResult.HeaderEdits) != 1 {
+					t.Fatalf("default script did not keep with a reply, a flag and a header edit: %+v", defaultResult)
+				}
+				if userResult.Action != sieveengine.ActionKeep || (userResult.Vacation != nil) != user.ownReply {
+					t.Fatalf("user script did not produce the expected keep: %+v", userResult)
+				}
+
+				merged, keptDefault := mergeSieveResults(defaultResult, userResult)
+
+				if !keptDefault {
+					t.Errorf("keptDefault = false, want the user's keep to leave the default script's result standing")
+				}
+				if merged.Action != sieveengine.ActionKeep {
+					t.Errorf("action = %s, want keep", merged.Action)
+				}
+				wantReply := defaultResult.Vacation
+				if user.ownReply {
+					wantReply = userResult.Vacation
+				}
+				if merged.Vacation != wantReply {
+					t.Errorf("vacation = %+v, want %+v", merged.Vacation, wantReply)
+				}
+				if want := append([]string{"defaulttag"}, user.flags...); !slices.Equal(merged.Flags, want) {
+					t.Errorf("flags = %v, want %v", merged.Flags, want)
+				}
+				if want := slices.Concat(defaultResult.HeaderEdits, userResult.HeaderEdits); !slices.Equal(merged.HeaderEdits, want) {
+					t.Errorf("header edits = %v, want the default's, then the user's: %v", merged.HeaderEdits, want)
+				}
+			})
+		}
+	}
+}
+
+// A user script that files, redirects or discards the message decides alone: the
+// default script's filing, flags, header edits and reply are all replaced, its
+// reply included, since the user script took the message over entirely.
+func TestMergeSieveResultsUserActionOverridesDefault(t *testing.T) {
+	for _, user := range []struct {
+		name, script string
+		want         sieveengine.Action
+	}{
+		{"fileinto", `fileinto "Archive";`, sieveengine.ActionFileInto},
+		{"redirect", `redirect "other@example.net";`, sieveengine.ActionRedirect},
+		{"discard", `discard;`, sieveengine.ActionDiscard},
+	} {
+		t.Run(user.name, func(t *testing.T) {
+			defaultResult := evaluateSieve(t, defaultKeepWork)
+			userResult := evaluateSieve(t, user.script+` addflag "usertag"; addheader "X-User" "user";`)
+			if userResult.Action != user.want {
+				t.Fatalf("user script did not produce %s: %+v", user.want, userResult)
+			}
+
+			merged, keptDefault := mergeSieveResults(defaultResult, userResult)
+
+			if keptDefault {
+				t.Errorf("keptDefault = true, want the user's explicit action to stand alone")
+			}
+			if !reflect.DeepEqual(merged, userResult) {
+				t.Errorf("merged = %+v, want the user result unchanged: %+v", merged, userResult)
+			}
+			if merged.Vacation != nil {
+				t.Errorf("the default script's reply survived a user %s", user.want)
+			}
+		})
+	}
+}
+
+// The case #152 settled, through the same seam: the default script filed the
+// message and the user script kept, so the default's filing stands with both
+// scripts' work merged, and a user reply takes precedence over the default's.
+func TestMergeSieveResultsUserKeepPreservesDefaultAction(t *testing.T) {
+	for _, user := range []struct {
+		name, script string
+		ownReply     bool
+	}{
+		{"implicit keep", `addflag "usertag";`, false},
+		{"explicit keep", `addflag "usertag"; keep;`, false},
+		{"user vacation", `addflag "usertag"; vacation :subject "User away" "User auto-reply";`, true},
+	} {
+		t.Run(user.name, func(t *testing.T) {
+			defaultResult := evaluateSieve(t, `fileinto "Junk";`+defaultKeepWork)
+			userResult := evaluateSieve(t, user.script+` addheader "X-User" "user";`)
+
+			merged, keptDefault := mergeSieveResults(defaultResult, userResult)
+
+			if !keptDefault {
+				t.Errorf("keptDefault = false, want the default's filing to stand")
+			}
+			if merged.Action != sieveengine.ActionFileInto || merged.Mailbox != "Junk" {
+				t.Errorf("action %s mailbox %q, want the default's fileinto Junk", merged.Action, merged.Mailbox)
+			}
+			wantReply := defaultResult.Vacation
+			if user.ownReply {
+				wantReply = userResult.Vacation
+			}
+			if merged.Vacation != wantReply {
+				t.Errorf("vacation = %+v, want %+v", merged.Vacation, wantReply)
+			}
+			if want := []string{"defaulttag", "usertag"}; !slices.Equal(merged.Flags, want) {
+				t.Errorf("flags = %v, want %v", merged.Flags, want)
+			}
+			if want := slices.Concat(defaultResult.HeaderEdits, userResult.HeaderEdits); !slices.Equal(merged.HeaderEdits, want) {
+				t.Errorf("header edits = %v, want the default's, then the user's: %v", merged.HeaderEdits, want)
+			}
+		})
 	}
 }
