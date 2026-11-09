@@ -12,6 +12,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -50,6 +51,10 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 	mailboxMessageCount := s.currentNumMessages.Load()
 	criteria = s.decodeSearchCriteriaLocked(criteria)
 	release()
+
+	if s.useMasterDB.Load() {
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
 
 	criteria, err := s.withSessionRecent(criteria, selectedMailboxID)
 	if err != nil {
