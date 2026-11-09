@@ -34,6 +34,15 @@ func (g *wildcardSnapshotAppend) TraceQueryEnd(ctx context.Context, _ *pgx.Conn,
 }
 
 func TestSearchWildcardUsesOneMailboxSnapshot(t *testing.T) {
+	testSearchRangeSnapshot(t, imap.SeqRange{Start: 99, Stop: 0}, imap.UIDSetNum(98))
+}
+
+func TestSearchBoundedRangeUsesOneMailboxSnapshot(t *testing.T) {
+	testSearchRangeSnapshot(t, imap.SeqRange{Start: 1, Stop: 99}, imap.UIDSet{{Start: 1, Stop: 98}})
+}
+
+func testSearchRangeSnapshot(t *testing.T, target imap.SeqRange, want imap.UIDSet) {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("requires PostgreSQL")
 	}
@@ -44,9 +53,9 @@ func TestSearchWildcardUsesOneMailboxSnapshot(t *testing.T) {
 	mailboxID := seedDenseMailbox(t, database, accountID, "WildcardSnapshot", 98)
 	appended := false
 	gate := &wildcardSnapshotAppend{appendMessages: func() {
-		// Commit after the ranked endpoint query has read 98 messages, before a
-		// separate last-UID query could run. 99:* initially means UID 98; after
-		// this append it means UIDs 99:100. UID 100 alone is never a valid answer.
+		// Commit after the mapping query reads 98 messages, before a separate
+		// tail read or final search could run. Both '*' and out-of-bounds fixed
+		// endpoints must stay clipped to the mapping snapshot's last UID.
 		tx, err := database.WritePool.Begin(ctx)
 		require.NoError(t, err)
 		defer tx.Rollback(ctx)
@@ -62,8 +71,8 @@ func TestSearchWildcardUsesOneMailboxSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	defer pool.Close()
 	reader := &Database{ReadPool: pool, WritePool: database.WritePool}
-	criteria := &imap.SearchCriteria{SeqNum: []imap.SeqSet{{{Start: 99, Stop: 0}}}}
+	criteria := &imap.SearchCriteria{SeqNum: []imap.SeqSet{{target}}}
 	require.NoError(t, reader.mapSeqNumCriteriaToUID(ctx, mailboxID, criteria))
 	require.True(t, appended, "the race control must have committed both messages")
-	require.Equal(t, []imap.UIDSet{imap.UIDSetNum(98)}, criteria.UID, "range endpoints must share the same read snapshot")
+	require.Equal(t, []imap.UIDSet{want}, criteria.UID, "range endpoints must share the same read snapshot")
 }
