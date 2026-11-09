@@ -22,7 +22,7 @@ func TestMailboxViewsChooseNameLookupWinner(t *testing.T) {
 	database := setupTestDatabase(t)
 	defer database.Close()
 	ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{
-		SharedMailboxes: config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/"},
+		SharedMailboxes: config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: true},
 	})
 	domain := fmt.Sprintf("nameviews-%d.example.com", time.Now().UnixNano())
 	account := func(local, domain string) (int64, string) {
