@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"strings"
 
 	"github.com/emersion/go-message"
@@ -78,20 +79,27 @@ func validateVacationMIME(header message.Header, body io.Reader, defaultType str
 			}
 		}
 	}
-	// An unknown charset can hide go-message's unknown-encoding error, so
-	// validate the transfer encoding independently before accepting that error.
-	encoding := strings.ToLower(header.Get("Content-Transfer-Encoding"))
+	encoding, err := vacationMIMETokens(header.Get("Content-Transfer-Encoding"))
+	if err != nil {
+		return err
+	}
+	encoding = strings.ToLower(encoding)
 	switch encoding {
 	case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
 	default:
 		return fmt.Errorf("unsupported transfer encoding %q", encoding)
 	}
-	mediaType, params, err := header.ContentType()
+	contentType := header.Get("Content-Type")
+	if !header.Has("Content-Type") {
+		contentType = defaultType
+	}
+	contentType, err = vacationMIMETokens(contentType)
 	if err != nil {
 		return err
 	}
-	if !header.Has("Content-Type") {
-		mediaType = defaultType
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return err
 	}
 	if mediaType == "message/rfc822" {
 		// RFC 2046 §5.2.1: message/rfc822 containers cannot use an encoding
@@ -193,4 +201,68 @@ func validateVacationQuotedPrintable(body io.Reader) error {
 
 func isVacationHex(b byte) bool {
 	return b >= '0' && b <= '9' || b >= 'A' && b <= 'F'
+}
+
+// RFC 2045 §2 permits RFC 822 comments between MIME header tokens. Remove
+// comments and folding whitespace for parsing, retaining quoted strings and
+// separation between adjacent tokens. The original headers are still emitted.
+func vacationMIMETokens(value string) (string, error) {
+	var out strings.Builder
+	word := false
+	for i := 0; i < len(value); {
+		switch value[i] {
+		case ' ', '\t':
+			i++
+		case '(':
+			depth := 1
+			i++
+			for i < len(value) && depth > 0 {
+				switch value[i] {
+				case '\\':
+					i++ // A quoted-pair cannot open or close a comment.
+				case '(':
+					depth++
+				case ')':
+					depth--
+				}
+				i++
+			}
+			if depth != 0 {
+				return "", fmt.Errorf("unterminated MIME header comment")
+			}
+		case '/', ';', '=':
+			out.WriteByte(value[i])
+			i++
+			word = false
+		default:
+			start := i
+			if value[i] == '"' {
+				i++
+				closed := false
+				for i < len(value) {
+					b := value[i]
+					i++
+					if b == '\\' && i < len(value) {
+						i++
+					} else if b == '"' {
+						closed = true
+						break
+					}
+				}
+				if !closed {
+					return "", fmt.Errorf("unterminated MIME header quoted string")
+				}
+			} else {
+				for i < len(value) && !strings.ContainsRune(" \t(/;=\"", rune(value[i])) {
+					i++
+				}
+			}
+			if word {
+				out.WriteByte(' ')
+			}
+			out.WriteString(value[start:i])
+			word = true
+		}
+	}
+	return out.String(), nil
 }
