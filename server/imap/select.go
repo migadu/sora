@@ -126,6 +126,12 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 
 	if isReselectOfPrevious {
 		s.DebugLog("mailbox reselected", "mailbox", mboxName)
+		// A read-only open did not advance our last read-write baseline. Another
+		// session may since have consumed newer Recent while this mailbox was
+		// closed here, so an older local baseline must not revive those messages.
+		if lastSeenUID, ok := s.server.mailboxRecentUIDs.Load(mailbox.ID); ok {
+			uidToCompareAgainst = max(uidToCompareAgainst, lastSeenUID)
+		}
 		// This mailbox was the one most recently selected (and then unselected by the imapserver library).
 		// Count messages with UID > uidToCompareAgainst. Use the potentially master-pinned context.
 		count, dbErr := s.server.rdb.CountMessagesGreaterThanUIDWithRetry(readCtx, mailbox.ID, uidToCompareAgainst)
