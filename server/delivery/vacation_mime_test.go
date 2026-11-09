@@ -163,3 +163,51 @@ func TestVacationMIMEUnknownCharsetPreservesEncoding(t *testing.T) {
 		})
 	}
 }
+
+func TestVacationMIMERejectsInvalidEncodedContent(t *testing.T) {
+	for _, body := range []string{"bad=ZZ", "bad=", "bad=A", "bad= \r\n", "bad=af", "bad\x00", "bad\xe9", "bad \r\n", strings.Repeat("x", 77)} {
+		for _, charset := range []string{"utf-8", "x-unknown"} {
+			leaf := "Content-Type: text/plain; charset=" + charset + "\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n" + body
+			for _, reason := range []string{leaf, "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n" + leaf + "\r\n--b--\r\n"} {
+				t.Run(reason, func(t *testing.T) {
+					var wire bytes.Buffer
+					if err := writeVacationMIME(&wire, message.Header{}, reason); err == nil {
+						t.Fatal("malformed quoted-printable accepted")
+					}
+					if wire.Len() != 0 {
+						t.Fatal("malformed content was partially written")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestVacationMIMEEncapsulatedMessageValidation(t *testing.T) {
+	for _, body := range []string{
+		"Subject: Away\r\nContent-Transfer-Encoding: base64\r\n\r\n!notbase64!",
+		"Subject: Away\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nbad=ZZ",
+		"Subject: caf\xc3\xa9\r\n\r\nAway",
+		"Subject: Away\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b--\r\n",
+		"Content-Type: text/plain\r\n\r\nNo identifying message header",
+	} {
+		for _, reason := range []string{
+			"Content-Type: message/rfc822\r\n\r\n" + body,
+			"Content-Type: multipart/digest; boundary=d\r\n\r\n--d\r\n\r\n" + body + "\r\n--d--\r\n",
+		} {
+			t.Run(reason, func(t *testing.T) {
+				var wire bytes.Buffer
+				if err := writeVacationMIME(&wire, message.Header{}, reason); err == nil {
+					t.Fatal("invalid encapsulated MIME message accepted")
+				}
+			})
+		}
+	}
+	for _, encoding := range []string{"base64", "quoted-printable"} {
+		reason := "Content-Type: message/rfc822\r\nContent-Transfer-Encoding: " + encoding + "\r\n\r\nU3ViamVjdDogQXdheQ0KDQpBd2F5"
+		var wire bytes.Buffer
+		if err := writeVacationMIME(&wire, message.Header{}, reason); err == nil {
+			t.Errorf("message/rfc822 accepted forbidden %s encoding", encoding)
+		}
+	}
+}
