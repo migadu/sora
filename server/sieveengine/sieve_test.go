@@ -263,7 +263,7 @@ fileinto "Spam";
 
 // mockVacationOracle is a test implementation of VacationOracle
 type mockVacationOracle struct {
-	responses map[string]time.Time // key: "accountID:originalSender:handle"
+	responses map[string]time.Time // key: "accountID:originalSender:responseIdentity"
 }
 
 func newMockVacationOracle() *mockVacationOracle {
@@ -272,8 +272,8 @@ func newMockVacationOracle() *mockVacationOracle {
 	}
 }
 
-func (m *mockVacationOracle) IsVacationResponseAllowed(ctx context.Context, accountID int64, originalSender string, handle string, duration time.Duration) (bool, error) {
-	key := m.makeKey(accountID, originalSender, handle)
+func (m *mockVacationOracle) IsVacationResponseAllowed(ctx context.Context, accountID int64, originalSender string, responseIdentity string, duration time.Duration) (bool, error) {
+	key := m.makeKey(accountID, originalSender, responseIdentity)
 	lastSent, exists := m.responses[key]
 	if !exists {
 		return true, nil
@@ -281,8 +281,8 @@ func (m *mockVacationOracle) IsVacationResponseAllowed(ctx context.Context, acco
 	return time.Since(lastSent) >= duration, nil
 }
 
-func (m *mockVacationOracle) ClaimVacationResponse(ctx context.Context, accountID int64, originalSender, handle string, duration time.Duration) (bool, error) {
-	key := m.makeKey(accountID, originalSender, handle)
+func (m *mockVacationOracle) ClaimVacationResponse(ctx context.Context, accountID int64, originalSender, responseIdentity string, duration time.Duration) (bool, error) {
+	key := m.makeKey(accountID, originalSender, responseIdentity)
 	if last, ok := m.responses[key]; ok && time.Since(last) < duration {
 		return false, nil
 	}
@@ -298,8 +298,8 @@ func (m *mockVacationOracle) RecordRedirect(ctx context.Context, accountID int64
 	return nil
 }
 
-func (m *mockVacationOracle) makeKey(accountID int64, originalSender string, handle string) string {
-	return string(rune(accountID)) + ":" + originalSender + ":" + handle
+func (m *mockVacationOracle) makeKey(accountID int64, originalSender string, responseIdentity string) string {
+	return string(rune(accountID)) + ":" + originalSender + ":" + responseIdentity
 }
 
 func TestVacationIsImplicitKeep(t *testing.T) {
