@@ -298,11 +298,14 @@ func validateSpecialUse(attrs []imap.MailboxAttr) (string, *imap.Error) {
 }
 
 // sharedCreateRefusal refuses a user creating a mailbox called name, by CREATE or as
-// a parent or destination RENAME creates, when it would be a new top-level shared
-// mailbox and [shared_mailboxes] allow_user_create is false (the default).
-// Administrators create those (sora-admin mailbox create). Inside an existing one
-// (prefix plus its first segment), the ACL's 'k' right decides, as anywhere else.
-// accountID is the account whose view resolves that top-level mailbox.
+// a parent RENAME creates, when it would be a new top-level shared mailbox and
+// [shared_mailboxes] allow_user_create is false (the default). Administrators create
+// those (sora-admin mailbox create). Inside an existing shared mailbox the ACL's 'k'
+// right decides, as anywhere else. A personal mailbox found under a parent's name
+// does not count: the User API and Sieve fileinto :create make personal mailboxes
+// under the prefix, and personal ones in any case variant of it ("shared/Team")
+// predate case-insensitive namespace matching. accountID is the account whose view
+// resolves the parents.
 func (s *IMAPSession) sharedCreateRefusal(ctx context.Context, accountID int64, name string) error {
 	if s.server.config == nil {
 		return nil
@@ -314,8 +317,9 @@ func (s *IMAPSession) sharedCreateRefusal(ctx context.Context, accountID int64, 
 	if !shared.InNamespace(name) {
 		return nil
 	}
-	// An existing parent inside the namespace proves this extends an existing
-	// shared root. k alone can authorize CREATE even when l hides that root.
+	// An existing shared parent inside the namespace proves this extends an
+	// existing shared root. k alone can authorize CREATE even when l hides that
+	// root. A personal mailbox under a parent's name proves nothing: look further.
 	for parent := name; ; {
 		separator := strings.LastIndex(parent, string(consts.MailboxDelimiter))
 		if separator < 0 {
@@ -325,9 +329,14 @@ func (s *IMAPSession) sharedCreateRefusal(ctx context.Context, accountID int64, 
 		if strings.EqualFold(parent, strings.TrimSuffix(shared.NamespacePrefix, "/")) || !shared.InNamespace(parent) {
 			break
 		}
-		if _, err := s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, accountID, parent, db.ACLRightCreate); err == nil {
-			return nil
-		} else if !errors.Is(err, consts.ErrMailboxNotFound) {
+		mbox, err := s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, accountID, parent, db.ACLRightCreate)
+		if err == nil {
+			var isShared bool
+			if isShared, err = s.server.rdb.IsMailboxSharedWithRetry(ctx, mbox.ID); err == nil && isShared {
+				return nil
+			}
+		}
+		if err != nil && !errors.Is(err, consts.ErrMailboxNotFound) {
 			return s.internalError("failed to look up shared mailbox '%s': %v", parent, err)
 		}
 	}

@@ -121,9 +121,6 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		}
 
 		// 1. Create the destination mailbox, linked to its parent.
-		if refusal := s.sharedCreateRefusal(ctx, AccountID, newName); refusal != nil {
-			return refusal
-		}
 		err = s.server.rdb.CreateMailboxWithRetry(ctx, AccountID, newName, destParentID)
 		if err != nil {
 			return s.internalError("failed to create destination mailbox '%s': %v", newName, err)

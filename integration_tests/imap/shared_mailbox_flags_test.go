@@ -96,6 +96,59 @@ func TestSharedMailboxes_AllowUserCreate(t *testing.T) {
 	defer func() { c.Delete(renamed + "/Child").Wait() }()
 }
 
+// TestSharedMailboxes_AllowUserCreate_PersonalNamesake: with allow_user_create false a
+// user may create mailboxes inside an existing shared mailbox, and those are shared.
+// The existing one must therefore BE shared, not merely be found under the shared
+// name. The User API and Sieve fileinto :create make personal mailboxes there
+// (without the shared settings), and a personal "shared/Team" from before namespace
+// matching ignored case answers to "Shared/Team". Either let the user create, and
+// then grant, shared mailboxes of their own.
+func TestSharedMailboxes_AllowUserCreate_PersonalNamesake(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, owner := common.SetupIMAPServerWithOptions(t, sharedMailboxSettings(false, true))
+	defer server.Close()
+
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	require.NoError(t, err)
+	defer c.Logout()
+	require.NoError(t, c.Login(owner.Email, owner.Password).Wait())
+
+	ts := common.GetTimestamp()
+	ownerID, err := server.ResilientDB.GetActiveAccountIDByAddressWithRetry(context.Background(), owner.Email)
+	require.NoError(t, err)
+	// Personal mailboxes under the shared name, as the User API creates them.
+	lowercase := fmt.Sprintf("shared/Team-%d", ts)
+	planted := fmt.Sprintf("Shared/Planted-%d", ts)
+	for _, name := range []string{lowercase, planted} {
+		require.NoError(t, server.ResilientDB.CreateMailboxForUserWithRetry(context.Background(), ownerID, name))
+	}
+	adminCfg := &config.Config{SharedMailboxes: config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/", AllowUserCreate: true}}
+	byAdmin := fmt.Sprintf("Shared/ByAdmin-%d", ts)
+	require.NoError(t, server.ResilientDB.CreateMailboxForUserWithRetry(
+		context.WithValue(context.Background(), consts.ConfigContextKey, adminCfg), ownerID, byAdmin))
+	defer func() {
+		for _, name := range []string{byAdmin, planted, lowercase} {
+			c.Delete(name).Wait()
+		}
+	}()
+
+	inLowercase := fmt.Sprintf("Shared/Team-%d/Child", ts)
+	inPlanted := planted + "/Child"
+	for _, name := range []string{inLowercase, inPlanted} {
+		requireResponseCode(t, c.Create(name, nil).Wait(), imap.ResponseCodeNoPerm, "CREATE "+name)
+	}
+	// RENAME of the administrator's shared mailbox would create its new parent.
+	newParent := fmt.Sprintf("Shared/Team-%d/New", ts)
+	requireResponseCode(t, c.Rename(byAdmin, newParent+"/ByAdmin", nil).Wait(), imap.ResponseCodeNoPerm, "RENAME into "+newParent)
+
+	names := mailboxNames(t, c)
+	for _, name := range []string{inLowercase, inPlanted, newParent} {
+		require.NotContains(t, names, name, "a refused CREATE or RENAME left it behind")
+	}
+	require.Contains(t, names, byAdmin)
+}
+
 // TestSharedMailboxes_AllowAnyoneIdentifier covers the other half of issue #159:
 // allow_anyone_identifier defaults to false, yet SETACL could grant "anyone". With it
 // false, nothing can be granted to "anyone" (SETACL answers NO [CANNOT], LISTRIGHTS
