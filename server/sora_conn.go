@@ -470,6 +470,38 @@ func SetTimeoutNoticeConn(conn net.Conn, current func() net.Conn) bool {
 	return false
 }
 
+// recordedNoticeConn returns the connection recordNoticeConn last recorded, nil
+// when none is registered.
+func (c *SoraConn) recordedNoticeConn() net.Conn {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.noticeConn
+}
+
+// NoticeConn returns the connection a notice written from outside the protocol
+// goroutine (a shutdown broadcast) must go to: the connection the SoraConn under
+// conn last recorded from its SetTimeoutNoticeConn provider, which after a
+// STARTTLS upgrade is the TLS connection above it; conn itself when there is no
+// SoraConn or nothing is registered. Writing to conn after an upgrade lands the
+// notice in plaintext under the TLS records, as #163 did for timeout notices.
+// It reads only the record, never the provider, so any goroutine may call it.
+func NoticeConn(conn net.Conn) net.Conn {
+	for c := conn; c != nil; {
+		if sc, ok := c.(interface{ recordedNoticeConn() net.Conn }); ok {
+			if notice := sc.recordedNoticeConn(); notice != nil {
+				return notice
+			}
+			return conn
+		}
+		w, ok := c.(interface{ Unwrap() net.Conn })
+		if !ok {
+			return conn
+		}
+		c = w.Unwrap()
+	}
+	return conn
+}
+
 // closeTimeoutTransport bypasses TLS close_notify and wrapper cleanup, which
 // c.Close performs afterwards. Closing the innermost socket unblocks its I/O.
 func closeTimeoutTransport(conn net.Conn) {
