@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"mime"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-message"
@@ -127,6 +128,24 @@ func (h *StandardVacationHandler) resolveVacationFrom(ctx context.Context, accou
 	return addr.FullAddress()
 }
 
+// replyReferences returns the msg-ids of a reply's References field per RFC 5322
+// §3.6.4: the parent's References (if any), or its In-Reply-To when that holds a
+// single msg-id and there is no References, followed by the parent's Message-ID (if
+// any). Only the ids that parse are carried over, so a malformed tail in the parent
+// cannot put a malformed id on the wire; the header writer folds a long list.
+func replyReferences(parent mail.Header) []string {
+	refs, _ := parent.MsgIDList("References")
+	if len(refs) == 0 {
+		if inReplyTo, _ := parent.MsgIDList("In-Reply-To"); len(inReplyTo) == 1 {
+			refs = inReplyTo
+		}
+	}
+	if id, _ := parent.MessageID(); id != "" {
+		refs = append(refs, id)
+	}
+	return refs
+}
+
 // HandleVacationResponse handles vacation auto-response.
 func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, AccountID int64, reply sieveengine.VacationReply, fromAddr *server.Address, toAddress *server.Address, originalMessage *message.Entity) error {
 	if h.RelayHandler == nil && h.RelayQueue == nil {
@@ -175,15 +194,20 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 	msgHeader.Set("Subject", mime.QEncoding.Encode("utf-8", vacationSubject))
 	msgHeader.Set("Message-ID", fmt.Sprintf("<%d.vacation@%s>", time.Now().UnixNano(), h.Hostname))
 	msgHeader.Set("Auto-Submitted", "auto-replied")
+	// RFC 3834 §3.1.8: discourage pre-RFC 3834 responders from answering the reply;
+	// "bulk" is what Pigeonhole sends on every vacation reply.
+	msgHeader.Set("Precedence", "bulk")
 	msgHeader.Set("X-Auto-Response-Suppress", "All")
 	msgHeader.Set("Date", time.Now().Format(time.RFC1123Z))
 
+	// MessageID() and MsgIDList() return bare ids; In-Reply-To/References msg-ids
+	// require angle brackets (RFC 5322 §3.6.4) for clients to thread the reply.
 	originalHeader := mail.Header{Header: originalMessage.Header}
 	if originalMessageID, _ := originalHeader.MessageID(); originalMessageID != "" {
-		// MessageID() returns the bare id; In-Reply-To/References msg-ids require angle
-		// brackets (RFC 5322 §3.6.4) for clients to thread the reply to the original.
 		msgHeader.Set("In-Reply-To", "<"+originalMessageID+">")
-		msgHeader.Set("References", "<"+originalMessageID+">")
+	}
+	if refs := replyReferences(originalHeader); len(refs) > 0 {
+		msgHeader.Set("References", "<"+strings.Join(refs, "> <")+">")
 	}
 
 	if reply.IsMime {
