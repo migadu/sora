@@ -11,7 +11,7 @@ import (
 )
 
 func TestXCLIENTExpiredTTLClosesConnection(t *testing.T) {
-	for _, ttl := range []int{1, 2} {
+	for _, ttl := range []int{-1, 0, 1, 2} {
 		t.Run(fmt.Sprint(ttl), func(t *testing.T) {
 			s, addr := newReloadTestServer(t, POP3ServerOptions{TrustedNetworks: []string{"127.0.0.0/8"}, CommandTimeout: time.Minute})
 			startListenerTestServer(t, s, addr)
@@ -30,7 +30,7 @@ func TestXCLIENTExpiredTTLClosesConnection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if ttl == 1 {
+			if ttl <= 1 {
 				if line != "-ERR Proxy TTL expired\r\n" {
 					t.Fatalf("expired TTL response = %q", line)
 				}
