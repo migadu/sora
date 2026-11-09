@@ -92,6 +92,10 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 		}
 	}
 
+	if refusal := s.sharedCreateRefusal(ctx, AccountID, name); refusal != nil {
+		return refusal
+	}
+
 	// Split the mailbox name by the delimiter to check if it's nested
 	parts := strings.Split(name, string(consts.MailboxDelimiter))
 	var parentMailboxID *int64
@@ -267,5 +271,40 @@ func validateSpecialUse(attrs []imap.MailboxAttr) (string, *imap.Error) {
 			Code: imap.ResponseCode("USEATTR"),
 			Text: "Unsupported special-use attribute",
 		}
+	}
+}
+
+// sharedCreateRefusal refuses a user creating a mailbox called name, by CREATE or as
+// a parent or destination RENAME creates, when it would be a new top-level shared
+// mailbox and [shared_mailboxes] allow_user_create is false (the default).
+// Administrators create those (sora-admin mailbox create). Inside an existing one
+// (prefix plus its first segment), the ACL's 'k' right decides, as anywhere else.
+// accountID is the account whose view resolves that top-level mailbox.
+func (s *IMAPSession) sharedCreateRefusal(ctx context.Context, accountID int64, name string) error {
+	if s.server.config == nil {
+		return nil
+	}
+	shared := s.server.config.SharedMailboxes
+	if !shared.Enabled || shared.AllowUserCreate {
+		return nil
+	}
+	if !strings.HasPrefix(name, shared.NamespacePrefix) && name != strings.TrimSuffix(shared.NamespacePrefix, "/") {
+		return nil
+	}
+	if rest := strings.TrimPrefix(name, shared.NamespacePrefix); rest != name {
+		top := shared.NamespacePrefix + strings.SplitN(rest, string(consts.MailboxDelimiter), 2)[0]
+		if top != name {
+			if _, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, accountID, top); err == nil {
+				return nil
+			} else if err != consts.ErrMailboxNotFound {
+				return s.internalError("failed to look up shared mailbox '%s': %v", top, err)
+			}
+		}
+	}
+	s.DebugLog("refusing to create a shared mailbox: allow_user_create is off", "mailbox", name)
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeNoPerm,
+		Text: "Only administrators can create shared mailboxes",
 	}
 }

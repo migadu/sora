@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
@@ -99,8 +101,13 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Create mailbox
-	err = rdb.CreateMailboxForUserWithRetry(ctx, accountID, *mailbox)
+	// Create mailbox. With the shared mailbox config in the context, a name in the
+	// shared namespace becomes a shared mailbox, as it does from IMAP CREATE; an
+	// administrator may create one whatever allow_user_create says.
+	sharedMailboxes := globalConfig.SharedMailboxes
+	sharedMailboxes.AllowUserCreate = true
+	createCtx := context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: sharedMailboxes})
+	err = rdb.CreateMailboxForUserWithRetry(createCtx, accountID, *mailbox)
 	if err != nil {
 		fmt.Printf("Failed to create mailbox: %v\n", err)
 		os.Exit(1)

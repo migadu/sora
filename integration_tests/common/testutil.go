@@ -197,6 +197,9 @@ type IMAPServerOpts struct {
 	SearchRateLimitPerMin         int
 	SearchRateLimitWindow         time.Duration
 	SearchRateLimitBurst          int
+	// SharedMailboxes replaces the default shared mailbox settings (enabled, users
+	// may create shared mailboxes and grant "anyone").
+	SharedMailboxes *config.SharedMailboxesConfig
 }
 
 func (ts *TestServer) Close() {
@@ -845,6 +848,9 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 			DefaultRights:         "lrswipkxtea",
 			AllowAnyoneIdentifier: true,
 		},
+	}
+	if opts != nil && opts.SharedMailboxes != nil {
+		testConfig.SharedMailboxes = *opts.SharedMailboxes
 	}
 
 	// Configure spam training if enabled

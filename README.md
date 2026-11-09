@@ -214,7 +214,8 @@ region = "us-east-1"
 [shared_mailboxes]
 enabled = true
 namespace_prefix = "Shared/"
-allow_user_create = true          # Allow users to create shared mailboxes
+allow_user_create = true          # Allow users to create shared mailboxes (default: false, admin-only)
+allow_anyone_identifier = true    # Allow sharing with "anyone" in the domain (default: false)
 default_rights = "lrswipkxtea"    # Full rights for creators
 ```
 

@@ -107,6 +107,9 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		}
 
 		// 1. Create the destination mailbox, linked to its parent.
+		if refusal := s.sharedCreateRefusal(ctx, AccountID, newName); refusal != nil {
+			return refusal
+		}
 		err = s.server.rdb.CreateMailboxWithRetry(ctx, AccountID, newName, destParentID)
 		if err != nil {
 			return s.internalError("failed to create destination mailbox '%s': %v", newName, err)
@@ -226,6 +229,9 @@ func (s *IMAPSession) writeRenameOldName(w *imapserver.RenameWriter, oldName, ne
 func (s *IMAPSession) resolveOrCreateParentPath(ctx context.Context, newParentPath string, ownerAccountID int64) (*int64, error) {
 	newParentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, newParentPath)
 	if err == consts.ErrMailboxNotFound {
+		if refusal := s.sharedCreateRefusal(ctx, ownerAccountID, newParentPath); refusal != nil {
+			return nil, refusal
+		}
 		s.DebugLog("new parent mailbox does not exist, auto-creating", "parent", newParentPath)
 		createErr := s.server.rdb.CreateMailboxWithRetry(ctx, ownerAccountID, newParentPath, nil)
 		if createErr != nil {

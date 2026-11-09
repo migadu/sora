@@ -281,8 +281,19 @@ Enables RFC 4314 shared mailboxes with Access Control Lists (ACL).
 enabled = true
 namespace_prefix = "Shared/"      # Prefix for shared mailboxes
 allow_user_create = true          # Allow users to create shared mailboxes
+allow_anyone_identifier = true    # Allow granting rights to "anyone" in the domain
 default_rights = "lrswipkxtea"    # Full rights for creators
 ```
+
+Both `allow_*` settings default to `false`:
+
+- `allow_user_create = false` refuses IMAP CREATE (and a RENAME that would create a
+  mailbox) in the shared namespace with `NO [NOPERM]`. Administrators create shared
+  mailboxes with `sora-admin mailbox create --mailbox "Shared/Team"`; users with the
+  `k` right can still create children under one.
+- `allow_anyone_identifier = false` refuses granting rights to `anyone` (IMAP SETACL
+  answers `NO [CANNOT]`, the Admin API 400, LISTRIGHTS offers nothing). Grants made
+  earlier keep applying until revoked; revoking and reducing them still works.
 
 **ACL Rights:**
 - `l` - lookup: Mailbox visible in LIST/LSUB
