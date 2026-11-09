@@ -1067,6 +1067,7 @@ func (s *IMAPServer) connConfig() serverPkg.SoraConnConfig {
 		Hostname:             s.hostname,
 		IdleTimeout:          settings.commandTimeout,
 		AbsoluteTimeout:      settings.absoluteSessionTimeout,
+		NoAbsoluteTimeout:    settings.absoluteSessionTimeout <= 0,
 		MinBytesPerMinute:    settings.minBytesPerMinute,
 		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0 || settings.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {

@@ -118,7 +118,8 @@ func (c *connectionLimitingConn) Close() error {
 
 // reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
 // publishes a new one whole and none is changed after: a delivery loads it once and
-// uses that copy throughout, so it never mixes the values of two reloads.
+// uses that copy throughout, so it never mixes the values of two reloads. Debug
+// is included in the snapshot but fixed at startup, like the protocol writer.
 type reloadableSettings struct {
 	maxMessageSize int64 // Maximum size for incoming messages
 	debug          bool
@@ -618,10 +619,7 @@ func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 		next.maxMessageSize = maxSize
 		reloaded = append(reloaded, "max_message_size")
 	}
-	if cfg.Debug != next.debug {
-		next.debug = cfg.Debug
-		reloaded = append(reloaded, "debug")
-	}
+	// Debug configures the protocol writer at startup and requires a restart.
 
 	if len(reloaded) > 0 {
 		b.settings.Store(&next)
