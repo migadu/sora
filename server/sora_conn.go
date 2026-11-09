@@ -201,9 +201,12 @@ type SoraConn struct {
 
 	// Timeout callback
 	onTimeout func(conn net.Conn, reason string) // Called before closing due to timeout
-	// noticeConn returns the connection the timeout notice is written to in place
-	// of the transport (see SetTimeoutNoticeConn); nil writes to the transport.
-	noticeConn func() net.Conn
+	// currentConn reports the connection the protocol is using (see
+	// SetTimeoutNoticeConn). It is called only on the goroutine that reads, which
+	// records its answer in noticeConn, under mu, for the timeout goroutine; nil
+	// noticeConn writes the notice to the transport.
+	currentConn func() net.Conn
+	noticeConn  net.Conn
 
 	// Lifecycle management
 	closed     bool
@@ -394,19 +397,16 @@ func (c *SoraConn) closeForTimeout(username, reason string, details ...any) {
 		// for the shard to exit, so the shard must not perform this operation.
 		unregisterConn(c)
 		transport := c.Conn
-		// The notice goes to the connection the protocol is using now: the
+		// The notice goes to the connection the protocol is using: the
 		// transport, unless a library layered its own connection above this
 		// one (STARTTLS) and registered it with SetTimeoutNoticeConn. Both
 		// reach the socket through transport, whose deadline bounds the write.
 		notice := transport
 		c.mu.RLock()
-		current := c.noticeConn
-		c.mu.RUnlock()
-		if current != nil {
-			if nc := current(); nc != nil {
-				notice = nc
-			}
+		if c.noticeConn != nil {
+			notice = c.noticeConn
 		}
+		c.mu.RUnlock()
 		// A concurrent protocol writer can replace the deadline, and TLS Close
 		// can wait while sending close_notify. Close the underlying transport
 		// at the same bound so neither can strand this goroutine.
@@ -424,19 +424,37 @@ func (c *SoraConn) closeForTimeout(username, reason string, details ...any) {
 // setTimeoutNoticeConn registers the provider of the connection a timeout
 // notice is written to; see SetTimeoutNoticeConn.
 func (c *SoraConn) setTimeoutNoticeConn(current func() net.Conn) {
+	c.currentConn = current
+	c.recordNoticeConn()
+}
+
+// recordNoticeConn asks the registered provider for the connection the
+// protocol is using and records it for closeForTimeout. Only the goroutine
+// that reads may call it: a library swaps in its STARTTLS connection on that
+// goroutine, with nothing the timeout goroutine could synchronise with.
+func (c *SoraConn) recordNoticeConn() {
+	if c.currentConn == nil {
+		return
+	}
+	current := c.currentConn()
 	c.mu.Lock()
 	c.noticeConn = current
 	c.mu.Unlock()
 }
 
 // SetTimeoutNoticeConn has the SoraConn that conn is or wraps write its timeout
-// notice to the connection current returns when the timeout fires, in place of
-// its transport. A protocol library that upgrades the stream with STARTTLS
-// layers its TLS connection ABOVE the SoraConn, so a notice written to the
-// transport lands in plaintext under the TLS records and the client sees a TLS
-// error in place of it (#163). Pass the library's accessor for its current
-// connection: the SoraConn itself until an upgrade, the TLS connection after
-// it. It returns false when there is no SoraConn under conn.
+// notice to the connection current returns, in place of its transport. A
+// protocol library that upgrades the stream with STARTTLS layers its TLS
+// connection ABOVE the SoraConn, so a notice written to the transport lands in
+// plaintext under the TLS records and the client sees a TLS error in place of
+// it (#163). Pass the library's accessor for its current connection: the
+// SoraConn itself until an upgrade, the TLS connection after it.
+//
+// Call it on the goroutine that reads conn (a library's NewSession). current is
+// called only there, at registration and as each Read starts, never by the
+// timeout goroutine, so it may read the library's state without
+// synchronisation; the read that follows an upgrade picks up the new
+// connection. It returns false when there is no SoraConn under conn.
 func SetTimeoutNoticeConn(conn net.Conn, current func() net.Conn) bool {
 	for conn != nil {
 		if sc, ok := conn.(interface{ setTimeoutNoticeConn(func() net.Conn) }); ok {
@@ -482,6 +500,8 @@ func (c *SoraConn) openNextThroughputWindow(now time.Time, seenRead, seenWritten
 func (c *SoraConn) Read(b []byte) (int, error) {
 	var n int
 	var err error
+
+	c.recordNoticeConn()
 
 	// First protocol-issued read on a direct plaintext connection: check for
 	// a TLS ClientHello before handing bytes to the protocol parser.
