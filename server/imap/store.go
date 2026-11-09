@@ -83,6 +83,14 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		Flags:  sanitizedFlags,
 	}
 
+	if s.useMasterDB.Load() {
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
+	var unchangedSince []uint64
+	if s.GetCapabilities().Has(imap.CapCondStore) && options != nil && options.UnchangedSinceSet {
+		unchangedSince = []uint64{options.UnchangedSince}
+	}
+
 	// RFC 4314 §4: STORE requires 's' to modify \Seen, 't' for \Deleted, and 'w'
 	// for all other flags. Fetch the user's rights once (owner fast-path).
 	storeRights, err := s.userRightsForMailbox(ctx, selectedMailboxID, selectedMailboxOwnerID)
@@ -138,10 +146,11 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	}
 
 	type storeResponseMessage struct {
-		seq    uint32
-		uid    imap.UID
-		flags  []imap.Flag
-		modSeq int64
+		seq       uint32
+		uid       imap.UID
+		flags     []imap.Flag
+		modSeq    int64
+		unchanged bool
 	}
 	var responseMessages []storeResponseMessage
 
@@ -222,9 +231,9 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		var batchResults []db.BatchFlagUpdateResult
 		switch sanitizedStoreFlags.Op {
 		case imap.StoreFlagsAdd:
-			batchResults, err = s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
+			batchResults, err = s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags, unchangedSince...)
 		case imap.StoreFlagsDel:
-			batchResults, err = s.server.rdb.RemoveMessageFlagsBatchWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
+			batchResults, err = s.server.rdb.RemoveMessageFlagsBatchWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags, unchangedSince...)
 		case imap.StoreFlagsSet:
 			// RFC 4314 §4: a replace must not modify flags the user lacks rights for.
 			// Per message, compute the target = requested values for modifiable flags
@@ -249,7 +258,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			}
 			for key, uids := range groupUIDs {
 				var res []db.BatchFlagUpdateResult
-				res, err = s.server.rdb.SetMessageFlagsBatchWithRetry(ctx, uids, selectedMailboxID, groupFlags[key])
+				res, err = s.server.rdb.SetMessageFlagsBatchWithRetry(ctx, uids, selectedMailboxID, groupFlags[key], unchangedSince...)
 				if err != nil {
 					break
 				}
@@ -262,6 +271,11 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 
 		for _, res := range batchResults {
+			if res.PreconditionFailed {
+				failedUIDs.AddNum(res.UID)
+				failedSeqs.AddNum(seqMap[res.UID])
+				continue
+			}
 			responseMessages = append(responseMessages, storeResponseMessage{
 				seq:    seqMap[res.UID],
 				uid:    res.UID,
@@ -281,7 +295,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		// left the stored state unchanged. Batch updates omit such no-op rows.
 		// Read them from the master so a concurrent writer's flags are current;
 		// only validUIDs are eligible, preserving UNCHANGEDSINCE failures.
-		if !sanitizedStoreFlags.Silent && len(batchResults) < len(validUIDs) {
+		if (!sanitizedStoreFlags.Silent || s.condStoreEnabled()) && len(batchResults) < len(validUIDs) {
 			changed := make(map[imap.UID]bool, len(batchResults))
 			for _, res := range batchResults {
 				changed[res.UID] = true
@@ -306,7 +320,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 				if msg.UpdatedModSeq != nil {
 					modSeq = max(modSeq, *msg.UpdatedModSeq)
 				}
-				responseMessages = append(responseMessages, storeResponseMessage{seq: seqMap[msg.UID], uid: msg.UID, flags: flags, modSeq: modSeq})
+				responseMessages = append(responseMessages, storeResponseMessage{seq: seqMap[msg.UID], uid: msg.UID, flags: flags, modSeq: modSeq, unchanged: true})
 			}
 		}
 	}
@@ -323,10 +337,15 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		s.DebugLog("CONDSTORE: returning MODIFIED for failed UIDs", "uids", failedUIDs.String())
 
 		// Still send FETCH responses for successfully modified messages (before the OK).
-		if !sanitizedStoreFlags.Silent {
+		if !sanitizedStoreFlags.Silent || s.condStoreEnabled() {
 			for _, modified := range responseMessages {
+				if sanitizedStoreFlags.Silent && !modified.unchanged {
+					continue
+				}
 				m := w.CreateMessage(modified.seq)
-				m.WriteFlags(modified.flags)
+				if !sanitizedStoreFlags.Silent {
+					m.WriteFlags(modified.flags)
+				}
 				m.WriteUID(modified.uid)
 				if s.condStoreEnabled() {
 					m.WriteModSeq(uint64(modified.modSeq))
@@ -364,12 +383,19 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	}
 	release()
 
-	if !sanitizedStoreFlags.Silent {
+	if !sanitizedStoreFlags.Silent || s.condStoreEnabled() {
 		for _, modified := range responseMessages {
+			// Changed rows are notified by the normal command-boundary Poll.
+			// No-op rows need an explicit MODSEQ response because Poll has no delta.
+			if sanitizedStoreFlags.Silent && !modified.unchanged {
+				continue
+			}
 			// Use database sequence number directly (no encoding needed)
 			m := w.CreateMessage(modified.seq)
 
-			m.WriteFlags(modified.flags)
+			if !sanitizedStoreFlags.Silent {
+				m.WriteFlags(modified.flags)
+			}
 			m.WriteUID(modified.uid)
 			// RFC 7162 §3.2: include MODSEQ in the STORE-triggered FETCH reply only
 			// when the client is CONDSTORE-aware (issued an enabling command) and the

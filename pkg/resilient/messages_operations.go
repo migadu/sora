@@ -80,9 +80,9 @@ func (rd *ResilientDatabase) SetMessageFlagsWithRetry(ctx context.Context, messa
 
 // --- Fetch Wrappers ---
 
-func (rd *ResilientDatabase) AddMessageFlagsBatchWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag) ([]db.BatchFlagUpdateResult, error) {
+func (rd *ResilientDatabase) AddMessageFlagsBatchWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag, unchangedSince ...uint64) ([]db.BatchFlagUpdateResult, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).AddMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, newFlags)
+		return rd.getOperationalDatabaseForOperation(ctx, true).AddMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, newFlags, unchangedSince...)
 	}
 
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
@@ -92,9 +92,9 @@ func (rd *ResilientDatabase) AddMessageFlagsBatchWithRetry(ctx context.Context, 
 	return result.([]db.BatchFlagUpdateResult), nil
 }
 
-func (rd *ResilientDatabase) RemoveMessageFlagsBatchWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, flagsToRemove []imap.Flag) ([]db.BatchFlagUpdateResult, error) {
+func (rd *ResilientDatabase) RemoveMessageFlagsBatchWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, flagsToRemove []imap.Flag, unchangedSince ...uint64) ([]db.BatchFlagUpdateResult, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).RemoveMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, flagsToRemove)
+		return rd.getOperationalDatabaseForOperation(ctx, true).RemoveMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, flagsToRemove, unchangedSince...)
 	}
 
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
@@ -104,9 +104,9 @@ func (rd *ResilientDatabase) RemoveMessageFlagsBatchWithRetry(ctx context.Contex
 	return result.([]db.BatchFlagUpdateResult), nil
 }
 
-func (rd *ResilientDatabase) SetMessageFlagsBatchWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag) ([]db.BatchFlagUpdateResult, error) {
+func (rd *ResilientDatabase) SetMessageFlagsBatchWithRetry(ctx context.Context, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag, unchangedSince ...uint64) ([]db.BatchFlagUpdateResult, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).SetMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, newFlags)
+		return rd.getOperationalDatabaseForOperation(ctx, true).SetMessageFlagsBatch(ctx, tx, messageUIDs, mailboxID, newFlags, unchangedSince...)
 	}
 
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)

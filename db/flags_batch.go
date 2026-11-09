@@ -14,9 +14,43 @@ import (
 )
 
 type BatchFlagUpdateResult struct {
-	UID    imap.UID
-	Flags  []imap.Flag
-	ModSeq int64
+	UID                imap.UID
+	Flags              []imap.Flag
+	ModSeq             int64
+	PreconditionFailed bool // current mod-sequence exceeded the optional UNCHANGEDSINCE bound
+}
+
+// filterConditionalFlagIDs runs after lockMailboxStats in the write transaction.
+// Checking the server's earlier read snapshot is insufficient: another STORE may
+// have committed between that read and this lock (RFC 7162 §3.1.3.1).
+func filterConditionalFlagIDs(ctx context.Context, tx pgx.Tx, ids []int64, idToUID map[int64]imap.UID, unchangedSince []uint64) ([]int64, []BatchFlagUpdateResult, error) {
+	if len(unchangedSince) == 0 || len(ids) == 0 {
+		return ids, nil, nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT m.id, GREATEST(m.created_modseq, COALESCE(ms.updated_modseq, 0))
+		FROM messages m
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+		WHERE m.id = ANY($1) AND m.expunged_at IS NULL
+	`, ids)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var allowed []int64
+	var failed []BatchFlagUpdateResult
+	for rows.Next() {
+		var id, modSeq int64
+		if err := rows.Scan(&id, &modSeq); err != nil {
+			return nil, nil, err
+		}
+		if uint64(modSeq) > unchangedSince[0] {
+			failed = append(failed, BatchFlagUpdateResult{UID: idToUID[id], ModSeq: modSeq, PreconditionFailed: true})
+		} else {
+			allowed = append(allowed, id)
+		}
+	}
+	return allowed, failed, rows.Err()
 }
 
 func (db *Database) resolveMessageIDsBatch(ctx context.Context, tx pgx.Tx, mailboxID int64, messageUIDs []imap.UID) (map[int64]imap.UID, []int64, error) {
@@ -90,7 +124,7 @@ func (db *Database) getAllFlagsForMessages(ctx context.Context, tx pgx.Tx, messa
 	return results, rows.Err()
 }
 
-func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag) ([]BatchFlagUpdateResult, error) {
+func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag, unchangedSince ...uint64) ([]BatchFlagUpdateResult, error) {
 	start := time.Now()
 	defer func() {
 		metrics.DBQueryDuration.WithLabelValues("flags_set_batch", "write").Observe(time.Since(start).Seconds())
@@ -106,6 +140,10 @@ func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 	idToUID, messageIDs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
 	if err != nil || len(messageIDs) == 0 {
 		return nil, err
+	}
+	messageIDs, failed, err := filterConditionalFlagIDs(ctx, tx, messageIDs, idToUID, unchangedSince)
+	if err != nil || len(messageIDs) == 0 {
+		return failed, err
 	}
 
 	newFlags = NormalizeAttachmentKeywordUpdate(newFlags, newFlags)
@@ -149,7 +187,7 @@ func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 	}
 
 	if len(updatedModSeqs) == 0 {
-		return []BatchFlagUpdateResult{}, nil
+		return failed, nil
 	}
 
 	currentFlagsMap, err := db.getAllFlagsForMessages(ctx, tx, messageIDs)
@@ -157,7 +195,7 @@ func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 		return nil, err
 	}
 
-	var results []BatchFlagUpdateResult
+	results := failed
 	for _, id := range messageIDs {
 		if modSeq, ok := updatedModSeqs[id]; ok {
 			results = append(results, BatchFlagUpdateResult{
@@ -171,7 +209,7 @@ func (db *Database) SetMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 	return results, nil
 }
 
-func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag) ([]BatchFlagUpdateResult, error) {
+func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, messageUIDs []imap.UID, mailboxID int64, newFlags []imap.Flag, unchangedSince ...uint64) ([]BatchFlagUpdateResult, error) {
 	start := time.Now()
 	defer func() {
 		metrics.DBQueryDuration.WithLabelValues("flags_add_batch", "write").Observe(time.Since(start).Seconds())
@@ -187,6 +225,10 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 	idToUID, messageIDs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
 	if err != nil || len(messageIDs) == 0 {
 		return nil, err
+	}
+	messageIDs, failed, err := filterConditionalFlagIDs(ctx, tx, messageIDs, idToUID, unchangedSince)
+	if err != nil || len(messageIDs) == 0 {
+		return failed, err
 	}
 
 	attachmentRemovals := attachmentKeywordRemovals(newFlags)
@@ -242,7 +284,7 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 	}
 
 	if len(updatedModSeqs) == 0 {
-		return []BatchFlagUpdateResult{}, nil
+		return failed, nil
 	}
 
 	currentFlagsMap, err := db.getAllFlagsForMessages(ctx, tx, messageIDs)
@@ -250,7 +292,7 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 		return nil, err
 	}
 
-	var results []BatchFlagUpdateResult
+	results := failed
 	for _, id := range messageIDs {
 		if modSeq, ok := updatedModSeqs[id]; ok {
 			results = append(results, BatchFlagUpdateResult{
@@ -264,7 +306,7 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 	return results, nil
 }
 
-func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, messageUIDs []imap.UID, mailboxID int64, flagsToRemove []imap.Flag) ([]BatchFlagUpdateResult, error) {
+func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, messageUIDs []imap.UID, mailboxID int64, flagsToRemove []imap.Flag, unchangedSince ...uint64) ([]BatchFlagUpdateResult, error) {
 	start := time.Now()
 	defer func() {
 		metrics.DBQueryDuration.WithLabelValues("flags_del_batch", "write").Observe(time.Since(start).Seconds())
@@ -280,6 +322,10 @@ func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, mess
 	idToUID, messageIDs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
 	if err != nil || len(messageIDs) == 0 {
 		return nil, err
+	}
+	messageIDs, failed, err := filterConditionalFlagIDs(ctx, tx, messageIDs, idToUID, unchangedSince)
+	if err != nil || len(messageIDs) == 0 {
+		return failed, err
 	}
 
 	systemFlagsToRemove, customKeywordsToRemove := SplitFlags(flagsToRemove)
@@ -323,7 +369,7 @@ func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, mess
 	}
 
 	if len(updatedModSeqs) == 0 {
-		return []BatchFlagUpdateResult{}, nil
+		return failed, nil
 	}
 
 	currentFlagsMap, err := db.getAllFlagsForMessages(ctx, tx, messageIDs)
@@ -331,7 +377,7 @@ func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, mess
 		return nil, err
 	}
 
-	var results []BatchFlagUpdateResult
+	results := failed
 	for _, id := range messageIDs {
 		if modSeq, ok := updatedModSeqs[id]; ok {
 			results = append(results, BatchFlagUpdateResult{

@@ -153,3 +153,40 @@ func TestIMAP_StoreSilentReturnsModSeq(t *testing.T) {
 		require.NotContains(t, fetches[0], "FLAGS (")
 	}
 }
+
+func TestIMAP_StoreSilentMixedModifiedAndNoop(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, owner := common.SetupIMAPServer(t)
+	defer server.Close()
+	c := dialRawIMAP(t, server.Address)
+	c.do(fmt.Sprintf("LOGIN %s %s", owner.Email, owner.Password))
+	for range 2 {
+		c.appendMsg("INBOX", "Subject: mixed\r\n\r\nbody\r\n")
+	}
+	c.do("SELECT INBOX (CONDSTORE)")
+	c.do(`UID STORE 1:2 FLAGS (\Seen)`)
+	ctx := context.Background()
+	ownerID, err := server.ResilientDB.GetAccountIDByEmailWithRetry(ctx, owner.Email)
+	require.NoError(t, err)
+	mailbox, err := server.ResilientDB.GetMailboxByNameWithRetry(ctx, ownerID, "INBOX")
+	require.NoError(t, err)
+	var cutoff uint64
+	require.NoError(t, server.ResilientDB.QueryRowWithRetry(ctx, `SELECT max(greatest(m.created_modseq,coalesce(ms.updated_modseq,0))) FROM messages m JOIN message_state ms ON ms.message_id=m.id AND ms.mailbox_id=m.mailbox_id WHERE m.mailbox_id=$1`, mailbox.ID).Scan(&cutoff))
+	c.do(`UID STORE 1 +FLAGS (\Answered)`)
+	c.do("SELECT INBOX (CONDSTORE)")
+	for _, requested := range []string{`\Seen`, `\Flagged`} {
+		lines, tagged := c.do(fmt.Sprintf(`UID STORE 1:2 (UNCHANGEDSINCE %d) +FLAGS.SILENT (%s)`, cutoff, requested))
+		require.Contains(t, tagged, "MODIFIED 1")
+		var success []string
+		for _, line := range lines {
+			if strings.Contains(line, " FETCH ") && strings.Contains(line, "UID 2") {
+				success = append(success, line)
+			}
+		}
+		require.Len(t, success, 1, "%q", lines)
+		require.Contains(t, success[0], "MODSEQ (")
+		if requested == `\Seen` {
+			require.NotContains(t, success[0], "FLAGS (")
+		}
+	}
+}
