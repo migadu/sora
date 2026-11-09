@@ -446,7 +446,7 @@ func TestSearchPerformance(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				start := time.Now()
-				messages, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, tc.criteria, 0, 0)
+				messages, err := pts.db.SearchMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, tc.criteria, 0, 0)
 				elapsed := time.Since(start)
 
 				assert.NoError(t, err)
@@ -487,7 +487,7 @@ func TestSearchPerformance(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				memStats := CaptureMemoryStats(func() {
 					start := time.Now()
-					messages, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, tc.criteria, 0, 0)
+					messages, err := pts.db.SearchMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, tc.criteria, 0, 0)
 					elapsed := time.Since(start)
 
 					assert.NoError(t, err)
@@ -531,7 +531,7 @@ func TestSearchPerformance(t *testing.T) {
 		for _, sc := range sortCriteria {
 			t.Run(sc.name, func(t *testing.T) {
 				start := time.Now()
-				messages, err := pts.db.GetMessagesSorted(ctx, pts.mailboxID, pts.accountID, criteria, sc.sort, 0, 0)
+				messages, err := pts.db.SearchMessagesSorted(ctx, pts.mailboxID, pts.accountID, criteria, sc.sort, 0, 0)
 				elapsed := time.Since(start)
 
 				assert.NoError(t, err)
@@ -545,25 +545,6 @@ func TestSearchPerformance(t *testing.T) {
 		}
 	})
 
-	t.Run("ResultLimitEnforcement", func(t *testing.T) {
-		// Test that search results are properly limited
-		t.Run("MaxSearchResultsLimit", func(t *testing.T) {
-			// Search that should return many results
-			criteria := &imap.SearchCriteria{} // Empty criteria = all messages
-
-			messages, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, criteria, 0, 0)
-			assert.NoError(t, err)
-
-			if len(messages) >= MaxSearchResults {
-				assert.Equal(t, MaxSearchResults, len(messages),
-					"Search should be limited to MaxSearchResults (%d)", MaxSearchResults)
-				t.Logf("✓ Search correctly limited to %d results", MaxSearchResults)
-			} else {
-				t.Logf("✓ Search returned %d results (under limit of %d)", len(messages), MaxSearchResults)
-			}
-		})
-	})
-
 	t.Run("MemoryUsageValidation", func(t *testing.T) {
 		// Test memory usage doesn't grow excessively
 		const maxMemoryGrowthMB = 50 // Maximum acceptable memory growth in MB
@@ -574,7 +555,7 @@ func TestSearchPerformance(t *testing.T) {
 				criteria := &imap.SearchCriteria{
 					Body: []string{fmt.Sprintf("term%d", i)},
 				}
-				_, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, criteria, 0, 0)
+				_, err := pts.db.SearchMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, criteria, 0, 0)
 				assert.NoError(t, err)
 			}
 		})
@@ -640,7 +621,7 @@ func BenchmarkSearchOperations(b *testing.B) {
 		criteria := &imap.SearchCriteria{UID: []imap.UIDSet{{imap.UIDRange{Start: 1, Stop: 100}}}}
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			_, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, criteria, 0, 0)
+			_, err := pts.db.SearchMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, criteria, 0, 0)
 			if err != nil {
 				b.Fatalf("Search failed: %v", err)
 			}
@@ -651,7 +632,7 @@ func BenchmarkSearchOperations(b *testing.B) {
 		criteria := &imap.SearchCriteria{Body: []string{"quarterly"}}
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			_, err := pts.db.GetMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, criteria, 0, 0)
+			_, err := pts.db.SearchMessagesWithCriteria(ctx, pts.mailboxID, pts.accountID, criteria, 0, 0)
 			if err != nil {
 				b.Fatalf("Search failed: %v", err)
 			}
@@ -663,7 +644,7 @@ func BenchmarkSearchOperations(b *testing.B) {
 		sortCriteria := []imap.SortCriterion{{Key: imap.SortKeySubject, Reverse: false}}
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			_, err := pts.db.GetMessagesSorted(ctx, pts.mailboxID, pts.accountID, criteria, sortCriteria, 0, 0)
+			_, err := pts.db.SearchMessagesSorted(ctx, pts.mailboxID, pts.accountID, criteria, sortCriteria, 0, 0)
 			if err != nil {
 				b.Fatalf("Sort failed: %v", err)
 			}

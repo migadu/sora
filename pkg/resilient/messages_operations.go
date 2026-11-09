@@ -127,20 +127,6 @@ func (rd *ResilientDatabase) GetMessageBodyStructureWithRetry(ctx context.Contex
 	return result.(*imap.BodyStructure), nil
 }
 
-func (rd *ResilientDatabase) GetMessagesSorted(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit, mailboxMessageCount int) ([]db.Message, error) {
-	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetMessagesSorted(ctx, mailboxID, accountID, criteria, sortCriteria, limit, mailboxMessageCount)
-	}
-	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return []db.Message{}, nil
-	}
-	return result.([]db.Message), nil
-}
-
 func (rd *ResilientDatabase) SearchMessagesSortedWithRetry(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, sortCriteria []imap.SortCriterion, limit, mailboxMessageCount int) ([]db.SearchMessageResult, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).SearchMessagesSorted(ctx, mailboxID, accountID, criteria, sortCriteria, limit, mailboxMessageCount)
@@ -213,20 +199,6 @@ func (rd *ResilientDatabase) ListMessagesForPOP3WithRetry(ctx context.Context, m
 		return []db.POP3Message{}, nil
 	}
 	return result.([]db.POP3Message), nil
-}
-
-func (rd *ResilientDatabase) GetMessagesWithCriteriaWithRetry(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, limit, mailboxMessageCount int) ([]db.Message, error) {
-	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, limit, mailboxMessageCount)
-	}
-	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		return []db.Message{}, nil
-	}
-	return result.([]db.Message), nil
 }
 
 func (rd *ResilientDatabase) SearchMessagesWithCriteriaWithRetry(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, limit, mailboxMessageCount int) ([]db.SearchMessageResult, error) {
