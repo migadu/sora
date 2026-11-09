@@ -197,6 +197,7 @@ type IMAPServerOpts struct {
 	SearchRateLimitPerMin         int
 	SearchRateLimitWindow         time.Duration
 	SearchRateLimitBurst          int
+	ThreadMaxMessages             int
 }
 
 func (ts *TestServer) Close() {
@@ -898,6 +899,7 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 			SearchRateLimitPerMin: opts.SearchRateLimitPerMin,
 			SearchRateLimitWindow: opts.SearchRateLimitWindow,
 			SearchRateLimitBurst:  opts.SearchRateLimitBurst,
+			ThreadMaxMessages:     opts.ThreadMaxMessages,
 		},
 	)
 	if err != nil {

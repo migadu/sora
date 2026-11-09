@@ -208,7 +208,7 @@ func TestUIDThreadByUIDSetReadsOnlyThoseMessages(t *testing.T) {
 	traced := &Database{WritePool: database.GetWritePool(), ReadPool: pool}
 
 	criteria := &imap.SearchCriteria{UID: []imap.UIDSet{{imap.UIDRange{Start: messages - named + 1, Stop: messages}}}}
-	found, err := traced.GetMessagesForThreading(ctx, mailboxID, accountID, criteria, true, false)
+	found, err := traced.GetMessagesForThreading(ctx, mailboxID, accountID, criteria, true, false, 0)
 	require.NoError(t, err)
 	require.Len(t, found, named)
 

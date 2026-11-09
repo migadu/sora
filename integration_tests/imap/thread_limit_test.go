@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
-	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 )
 
@@ -45,9 +45,9 @@ func roots(threads []imap.ThreadData) []uint32 {
 	return out
 }
 
-func dialSelected(t *testing.T) (*imapclient.Client, func()) {
+func dialSelected(t *testing.T, opts *common.IMAPServerOpts) (*imapclient.Client, func()) {
 	t.Helper()
-	server, account := common.SetupIMAPServer(t)
+	server, account := common.SetupIMAPServerWithOptions(t, opts)
 	c, err := imapclient.DialInsecure(server.Address, nil)
 	if err != nil {
 		server.Close()
@@ -68,7 +68,7 @@ func dialSelected(t *testing.T) (*imapclient.Client, func()) {
 func TestIMAP_Thread_SequenceNumbers(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	c, done := dialSelected(t)
+	c, done := dialSelected(t, nil)
 	defer done()
 
 	appendStandalone(t, c, 4)
@@ -82,9 +82,11 @@ func TestIMAP_Thread_SequenceNumbers(t *testing.T) {
 	thread := func(uid bool, criteria *imap.SearchCriteria) []uint32 {
 		t.Helper()
 		opts := &imapclient.ThreadOptions{Algorithm: imap.ThreadRefs, SearchCriteria: criteria}
-		cmd := c.Thread(opts)
+		var cmd *imapclient.ThreadCommand
 		if uid {
 			cmd = c.UIDThread(opts)
+		} else {
+			cmd = c.Thread(opts)
 		}
 		res, err := cmd.Wait()
 		if err != nil {
@@ -113,36 +115,80 @@ func TestIMAP_Thread_SequenceNumbers(t *testing.T) {
 }
 
 // TestIMAP_Thread_TooManyMessages checks that a THREAD matching more messages
-// than db.ThreadMaxMessages is refused with NO [LIMIT] (RFC 5530 section 3)
+// than the configured cap is refused with NO [LIMIT] (RFC 5530 section 3)
 // instead of threading only some of them: a client showing the result as its
 // message list would otherwise present the rest as gone.
 func TestIMAP_Thread_TooManyMessages(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	saved := db.ThreadMaxMessages
-	db.ThreadMaxMessages = 3
-	t.Cleanup(func() { db.ThreadMaxMessages = saved })
-
-	c, done := dialSelected(t)
+	c, done := dialSelected(t, &common.IMAPServerOpts{ThreadMaxMessages: 3})
 	defer done()
 
 	appendStandalone(t, c, 4)
 
-	_, err := c.UIDThread(&imapclient.ThreadOptions{Algorithm: imap.ThreadRefs, SearchCriteria: &imap.SearchCriteria{}}).Wait()
-	var imapErr *imap.Error
-	if !errors.As(err, &imapErr) || imapErr.Type != imap.StatusResponseTypeNo || imapErr.Code != imap.ResponseCodeLimit {
-		t.Fatalf("UID THREAD over the limit = %v, want NO [LIMIT]", err)
+	check := func(t *testing.T, client *imapclient.Client, uid bool, algorithm imap.ThreadAlgorithm, criteria *imap.SearchCriteria, want []uint32) {
+		t.Helper()
+		opts := &imapclient.ThreadOptions{Algorithm: algorithm, SearchCriteria: criteria}
+		var cmd *imapclient.ThreadCommand
+		if uid {
+			cmd = client.UIDThread(opts)
+		} else {
+			cmd = client.Thread(opts)
+		}
+		res, err := cmd.Wait()
+		if want == nil {
+			var imapErr *imap.Error
+			if !errors.As(err, &imapErr) || imapErr.Type != imap.StatusResponseTypeNo || imapErr.Code != imap.ResponseCodeLimit {
+				t.Fatalf("THREAD over the limit = %v, want NO [LIMIT]", err)
+			}
+			if !strings.Contains(imapErr.Text, "more than 3 messages") {
+				t.Errorf("limit response = %q, want configured cap 3", imapErr.Text)
+			}
+			if len(res) != 0 {
+				t.Errorf("refused THREAD returned partial results: %v", res)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("THREAD within the limit failed: %v", err)
+		}
+		if got := roots(res); !reflect.DeepEqual(got, want) {
+			t.Errorf("THREAD = %v, want %v", got, want)
+		}
 	}
 
-	// A search narrowed to the limit is threaded in full.
-	res, err := c.UIDThread(&imapclient.ThreadOptions{
-		Algorithm:      imap.ThreadRefs,
-		SearchCriteria: &imap.SearchCriteria{UID: []imap.UIDSet{{imap.UIDRange{Start: 2, Stop: 4}}}},
-	}).Wait()
-	if err != nil {
-		t.Fatalf("UID THREAD at the limit failed: %v", err)
+	for _, uid := range []bool{false, true} {
+		for _, algorithm := range []imap.ThreadAlgorithm{imap.ThreadReferences, imap.ThreadRefs, imap.ThreadOrderedSubject} {
+			for _, tc := range []struct {
+				name       string
+				start, end imap.UID
+				want       []uint32
+			}{
+				{name: "ALL over"},
+				{name: "below", start: 2, end: 3, want: []uint32{2, 3}},
+				{name: "at", start: 2, end: 4, want: []uint32{2, 3, 4}},
+				{name: "over", start: 1, end: 4},
+			} {
+				t.Run(fmt.Sprintf("uid=%v/%s/%s", uid, algorithm, tc.name), func(t *testing.T) {
+					criteria := &imap.SearchCriteria{}
+					if tc.start != 0 {
+						criteria.UID = []imap.UIDSet{{imap.UIDRange{Start: tc.start, Stop: tc.end}}}
+					}
+					check(t, c, uid, algorithm, criteria, tc.want)
+				})
+			}
+		}
 	}
-	if got, want := roots(res), []uint32{2, 3, 4}; !reflect.DeepEqual(got, want) {
-		t.Errorf("UID THREAD UID 2:4 = %v, want %v", got, want)
+
+	// Raising the cap on another listener admits its full mailbox without
+	// changing the first listener's limit.
+	higher, closeHigher := dialSelected(t, &common.IMAPServerOpts{ThreadMaxMessages: 4})
+	defer closeHigher()
+	appendStandalone(t, higher, 4)
+	for _, uid := range []bool{false, true} {
+		for _, algorithm := range []imap.ThreadAlgorithm{imap.ThreadReferences, imap.ThreadRefs, imap.ThreadOrderedSubject} {
+			check(t, higher, uid, algorithm, &imap.SearchCriteria{}, []uint32{1, 2, 3, 4})
+			check(t, c, uid, algorithm, &imap.SearchCriteria{}, nil)
+		}
 	}
 }
