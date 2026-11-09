@@ -6,6 +6,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 )
@@ -136,12 +137,13 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 	}
 
-	var modifiedMessages []struct {
+	type storeResponseMessage struct {
 		seq    uint32
 		uid    imap.UID
 		flags  []imap.Flag
 		modSeq int64
 	}
+	var responseMessages []storeResponseMessage
 
 	// Check if the context is still valid before proceeding with flag updates
 	if ctx.Err() != nil {
@@ -260,12 +262,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 
 		for _, res := range batchResults {
-			modifiedMessages = append(modifiedMessages, struct {
-				seq    uint32
-				uid    imap.UID
-				flags  []imap.Flag
-				modSeq int64
-			}{
+			responseMessages = append(responseMessages, storeResponseMessage{
 				seq:    seqMap[res.UID],
 				uid:    res.UID,
 				flags:  res.Flags,
@@ -278,6 +275,40 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		// so a subsequent FETCH or SEARCH in this session reads the new flags from
 		// the master rather than a lagging read replica.
 		s.useMasterDB.Store(true)
+
+		// RFC 9051 §6.4.6: non-silent STORE returns the resulting flags as a
+		// FETCH, including when normalization rejected a requested keyword but
+		// left the stored state unchanged. Batch updates omit such no-op rows.
+		// Read them from the master so a concurrent writer's flags are current;
+		// only validUIDs are eligible, preserving UNCHANGEDSINCE failures.
+		if !sanitizedStoreFlags.Silent && len(batchResults) < len(validUIDs) {
+			changed := make(map[imap.UID]bool, len(batchResults))
+			for _, res := range batchResults {
+				changed[res.UID] = true
+			}
+			var unchanged imap.UIDSet
+			for _, uid := range validUIDs {
+				if !changed[uid] {
+					unchanged.AddNum(uid)
+				}
+			}
+			readCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
+			current, err := s.server.rdb.GetMessagesByNumSetWithRetry(readCtx, selectedMailboxID, unchanged)
+			if err != nil {
+				return s.internalError("failed to read unchanged STORE flags: %v", err)
+			}
+			for _, msg := range current {
+				flags := db.BitwiseToFlags(msg.BitwiseFlags)
+				for _, flag := range msg.CustomFlags {
+					flags = append(flags, imap.Flag(flag))
+				}
+				modSeq := msg.CreatedModSeq
+				if msg.UpdatedModSeq != nil {
+					modSeq = max(modSeq, *msg.UpdatedModSeq)
+				}
+				responseMessages = append(responseMessages, storeResponseMessage{seq: seqMap[msg.UID], uid: msg.UID, flags: flags, modSeq: modSeq})
+			}
+		}
 	}
 
 	// RFC 7162 §3.1.3: report messages that failed the UNCHANGEDSINCE precondition
@@ -293,7 +324,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 
 		// Still send FETCH responses for successfully modified messages (before the OK).
 		if !sanitizedStoreFlags.Silent {
-			for _, modified := range modifiedMessages {
+			for _, modified := range responseMessages {
 				m := w.CreateMessage(modified.seq)
 				m.WriteFlags(modified.flags)
 				m.WriteUID(modified.uid)
@@ -334,7 +365,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	release()
 
 	if !sanitizedStoreFlags.Silent {
-		for _, modified := range modifiedMessages {
+		for _, modified := range responseMessages {
 			// Use database sequence number directly (no encoding needed)
 			m := w.CreateMessage(modified.seq)
 
