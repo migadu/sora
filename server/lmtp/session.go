@@ -693,8 +693,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	}
 
 	// Always run the default script first as a "before script"
-	// Use the pre-parsed default executor from the backend
-	if s.backend.defaultSieveExecutor != nil {
+	// Share the compiled script, but bind its policy to this delivery's account.
+	if s.backend.defaultSieveScript != nil {
 		// SIEVE debugging information
 		if settings.debug {
 			s.DebugLog("sieve message headers for evaluation")
@@ -705,7 +705,15 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			}
 		}
 
-		defaultResult, defaultEvalErr := s.backend.defaultSieveExecutor.Evaluate(ctx, sieveCtx)
+		defaultSieveExecutor := s.backend.defaultSieveScript.NewExecutor(
+			s.AccountID(),
+			sieveVacOracle,
+			sieveVacOracle,
+			s.backend.redirectRateLimit,
+			s.backend.redirectRateWindow,
+			s.backend.maxRedirectHops,
+		)
+		defaultResult, defaultEvalErr := defaultSieveExecutor.Evaluate(ctx, sieveCtx)
 		if defaultEvalErr != nil {
 			metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
 			s.WarnLog("default sieve script evaluation error", "error", defaultEvalErr)
@@ -719,7 +727,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			s.logSieveAction("default", result)
 		}
 	} else {
-		s.DebugLog("no default sieve executor available")
+		s.DebugLog("no default sieve script available")
 		result = sieveengine.Result{Action: sieveengine.ActionKeep}
 	}
 
