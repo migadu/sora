@@ -1,11 +1,11 @@
 package imapproxy
 
 import (
-	"crypto/tls"
 	"io"
 	"net"
 	"time"
 
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -112,29 +112,13 @@ func (s *Session) closeForMaintenance() {
 // period, then lets outer wrappers release their bookkeeping. tls.Conn.Close
 // alone can wait for the very close_notify write this deadline must interrupt.
 func closeMaintenanceTransport(conn net.Conn) {
-	if conn == nil {
+	raw := server.RawConn(conn)
+	if raw == nil {
 		return
 	}
-	transport := conn
-	unwrapped := false
-	for {
-		switch c := transport.(type) {
-		case *tls.Conn:
-			transport = c.NetConn()
-		case interface{ Unwrap() net.Conn }:
-			transport = c.Unwrap()
-		default:
-			_ = transport.Close()
-			if unwrapped {
-				_ = conn.Close()
-			}
-			return
-		}
-		unwrapped = true
-		if transport == nil {
-			_ = conn.Close()
-			return
-		}
+	_ = raw.Close()
+	if raw != conn {
+		_ = conn.Close()
 	}
 }
 
