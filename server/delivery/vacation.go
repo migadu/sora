@@ -10,6 +10,7 @@ import (
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
 )
@@ -222,11 +223,15 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 		}
 	}
 
-	// Send via external relay or queue
+	// Send via external relay or queue. A failure from here on is lost for the rest
+	// of the :days window, and the session trace (h.log) is debug-level on both LMTP
+	// and the Admin API, so it is also reported at Warn where an operator sees it.
 	if h.RelayQueue != nil {
 		// Queue for background delivery with retry
 		if err := h.RelayQueue.Enqueue(vacationFrom, fromAddr.FullAddress(), "vacation", vacationMessage.Bytes()); err != nil {
 			h.log("[VACATION] Failed to enqueue vacation response: %v", err)
+			logger.Warn("Sieve vacation reply could not be queued; the response period is consumed",
+				"account_id", AccountID, "sender", fromAddr.FullAddress(), "error", err)
 			return err
 		}
 		if h.RelayNotify != nil {
@@ -234,7 +239,13 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 		}
 		return nil
 	} else if h.RelayHandler != nil {
-		return h.RelayHandler.SendToExternalRelay(vacationFrom, fromAddr.FullAddress(), vacationMessage.Bytes())
+		if err := h.RelayHandler.SendToExternalRelay(vacationFrom, fromAddr.FullAddress(), vacationMessage.Bytes()); err != nil {
+			h.log("[VACATION] Failed to relay vacation response: %v", err)
+			logger.Warn("Sieve vacation reply could not be relayed; the response period is consumed",
+				"account_id", AccountID, "sender", fromAddr.FullAddress(), "error", err)
+			return err
+		}
+		return nil
 	}
 
 	return nil
