@@ -89,6 +89,9 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		return nil, s.internalError("failed to get user rights for mailbox '%s': %v", mboxName, err)
 	}
 
+	// EXAMINE and ACL-forced read-only SELECT must use the same state rules.
+	isReadOnly := (options != nil && options.ReadOnly) || !strings.ContainsAny(userRights, "iestw")
+
 	currentSummary, err := s.server.rdb.GetMailboxSummaryWithRetry(readCtx, mailbox.ID)
 	if err != nil {
 		return nil, s.internalError("failed to get current summary for selected mailbox '%s': %v", mboxName, err)
@@ -181,22 +184,19 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 	// SEARCH RECENT, NEW and OLD answer from this (see recent.go).
 	s.recentAboveUID = recentAbove
 
-	// Update session state for the *next* Unselect/Select cycle
-	s.lastSelectedMailboxID = mailbox.ID
-	if currentSummary.UIDNext > 0 {
-		// UIDNext is the *next* UID to be assigned. So the current highest is UIDNext - 1.
-		s.lastHighestUID = imap.UID(currentSummary.UIDNext - 1)
-	} else {
-		// This case implies the mailbox is empty or UIDs start at 1 and UIDNext is 1.
-		s.lastHighestUID = 0
-	}
-
-	// Update the server-wide recent-UID tracker for this mailbox.
-	// Only update on read-write SELECT — EXAMINE (read-only) must not clear \Recent
-	// for subsequent sessions (RFC 3501 §6.3.2).
-	isReadOnly := options != nil && options.ReadOnly
-	if !isReadOnly && s.lastHighestUID > 0 {
-		s.server.mailboxRecentUIDs.Store(mailbox.ID, s.lastHighestUID)
+	// Only a read-write selection advances the session and server baselines.
+	// EXAMINE must preserve Recent for both later opens in this session and other
+	// sessions (RFC 3501 §6.3.2); the same applies to ACL read-only SELECT.
+	if !isReadOnly {
+		s.lastSelectedMailboxID = mailbox.ID
+		if currentSummary.UIDNext > 0 {
+			s.lastHighestUID = imap.UID(currentSummary.UIDNext - 1)
+		} else {
+			s.lastHighestUID = 0
+		}
+		if s.lastHighestUID > 0 {
+			s.server.mailboxRecentUIDs.Store(mailbox.ID, s.lastHighestUID)
+		}
 	}
 
 	s.currentNumMessages.Store(uint32(currentSummary.NumMessages))
@@ -240,7 +240,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		// RFC 4314 §5.2: SELECT is READ-ONLY when the user holds none of the rights
 		// that permit modifying the mailbox — insert ('i'), expunge ('e'), or the
 		// shared-flag rights (Sora shares all flags: 's','t','w').
-		ReadOnly:          !strings.ContainsAny(userRights, "iestw"),
+		ReadOnly:          isReadOnly,
 		NumMessages:       s.currentNumMessages.Load(),
 		UIDNext:           imap.UID(currentSummary.UIDNext),
 		UIDValidity:       s.selectedMailbox.UIDValidity,
