@@ -404,7 +404,7 @@ type IMAPServerOptions struct {
 	AuthIdleTimeout         time.Duration            // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	CommandTimeout          time.Duration            // Maximum idle time before disconnection
 	CommandTimeoutOverrides map[string]time.Duration // Per-command hard execution timeouts (overrides defaults)
-	AbsoluteSessionTimeout  time.Duration            // Maximum total session duration (0 = use default 30m)
+	AbsoluteSessionTimeout  time.Duration            // Maximum total session duration (0 = no absolute limit)
 	MinBytesPerMinute       int64                    // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
 	// Auth security
 	InsecureAuth bool // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
