@@ -176,8 +176,8 @@ type LMTPServerBackend struct {
 
 	// Sieve extensions enabled for user scripts, and the default script (parsed once at
 	// startup). User scripts are compiled through sieveengine.SharedScriptCache().
-	sieveExtensions      []string
-	defaultSieveExecutor sieveengine.Executor
+	sieveExtensions    []string
+	defaultSieveScript *sieveengine.CompiledScript
 
 	// PROXY protocol support
 	proxyReader *server.ProxyProtocolReader
@@ -305,11 +305,11 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	backend.sieveExtensions = sieveengine.EffectiveExtensions(options.SieveExtensions)
 
 	// Parse and cache the default Sieve script at startup
-	defaultExecutor, err := sieveengine.NewSieveExecutorWithExtensions(defaultSieveScript, backend.sieveExtensions)
+	compiledDefault, err := sieveengine.CompileScript(defaultSieveScript, backend.sieveExtensions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse default Sieve script: %w", err)
 	}
-	backend.defaultSieveExecutor = defaultExecutor
+	backend.defaultSieveScript = compiledDefault
 	logger.Debug("default sieve script parsed and cached", "name", backend.name)
 
 	// Set up TLS config: Support both file-based certificates and global TLS manager
