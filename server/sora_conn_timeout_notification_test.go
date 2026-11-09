@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -144,4 +145,69 @@ func TestSoraConnTimeoutNoticeRunsOnce(t *testing.T) {
 	}
 	peer.Close()
 	checks.Wait()
+}
+
+// noticeRecordingConn stands for the TLS connection a protocol library layers
+// above a SoraConn on STARTTLS: what is written to it reaches the SoraConn.
+type noticeRecordingConn struct {
+	net.Conn
+	mu    sync.Mutex
+	wrote []byte
+}
+
+func (c *noticeRecordingConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	c.wrote = append(c.wrote, b...)
+	c.mu.Unlock()
+	return c.Conn.Write(b)
+}
+
+// A protocol library swaps in its STARTTLS connection on the goroutine that
+// reads, without synchronisation (go-pop3 and go-managesieve assign a plain
+// field), so the provider registered with SetTimeoutNoticeConn may only be
+// called on that goroutine. Calling it from the timeout goroutine raced with
+// the swap; run with -race. The notice still goes to the swapped-in connection.
+func TestSoraConnTimeoutNoticeConnIsAskedForOnTheReadingGoroutine(t *testing.T) {
+	transport, peer := net.Pipe()
+	defer peer.Close()
+	notified := make(chan struct{})
+	sc := NewSoraConn(transport, SoraConnConfig{
+		IdleTimeout:       time.Minute,
+		NoAbsoluteTimeout: true,
+		OnTimeout: func(conn net.Conn, _ string) {
+			defer close(notified)
+			fmt.Fprint(conn, "goodbye\r\n")
+		},
+	})
+	upgraded := &noticeRecordingConn{Conn: sc}
+	var libraryConn net.Conn = sc
+	SetTimeoutNoticeConn(sc, func() net.Conn { return libraryConn })
+
+	// The library: read STLS, swap in the TLS connection, read on through it.
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		buf := make([]byte, 16)
+		if _, err := sc.Read(buf); err != nil {
+			return
+		}
+		libraryConn = upgraded
+		sc.Read(buf) // until the timeout closes the connection
+	}()
+	if _, err := peer.Write([]byte("STLS\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	// Nothing synchronises with the library after its swap, as with a client
+	// that goes quiet after STARTTLS; give it time to start reading again.
+	time.Sleep(50 * time.Millisecond)
+	go io.Copy(io.Discard, peer)
+	sc.checkTimeouts(time.Now().Add(time.Hour))
+	<-notified
+	<-served
+
+	upgraded.mu.Lock()
+	defer upgraded.mu.Unlock()
+	if got := string(upgraded.wrote); got != "goodbye\r\n" {
+		t.Errorf("notice written to the swapped-in connection = %q, want %q", got, "goodbye\r\n")
+	}
 }
