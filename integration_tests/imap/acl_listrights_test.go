@@ -73,16 +73,16 @@ func TestACL_ListRightsMatchesWhatCanBeGranted(t *testing.T) {
 		}
 	}
 
-	// The owner always holds every right, so all are required and none can be
-	// granted or taken away. go-imap may still add the virtual c/d (RFC 4314
-	// §2.1.1), but no standard right may be offered as optional.
+	// The owner always holds every right, so all are required and nothing is
+	// optional: not even the virtual c/d (RFC 4314 §2.1.1), which go-imap now puts
+	// with the required rights when all their members are required (go-imap #112).
 	for _, mailbox := range []string{"INBOX", personal, shared} {
 		data := listRights(mailbox, imap.RightsIdentifier(owner.Email))
-		if !hasAllRights(data.RequiredRights, imap.RightSet(db.AllACLRights)) {
-			t.Errorf("LISTRIGHTS %s <owner>: required %q, want all of %q", mailbox, data.RequiredRights, db.AllACLRights)
+		if !hasAllRights(data.RequiredRights, imap.RightSet(db.AllACLRights+"cd")) {
+			t.Errorf("LISTRIGHTS %s <owner>: required %q, want all of %q", mailbox, data.RequiredRights, db.AllACLRights+"cd")
 		}
-		if opt := optional(data); strings.ContainsAny(opt, db.AllACLRights) {
-			t.Errorf("LISTRIGHTS %s <owner>: optional %q offers a right the owner always holds", mailbox, opt)
+		if opt := optional(data); opt != "" {
+			t.Errorf("LISTRIGHTS %s <owner>: optional %q, want none: the owner always holds every right", mailbox, opt)
 		}
 	}
 
