@@ -48,6 +48,8 @@ func TestSharedNamespaceCasePreservesPolicyAndClassification(t *testing.T) {
 				var shared bool
 				require.NoError(t, server.ResilientDB.QueryRowWithRetry(context.Background(), `SELECT is_shared FROM mailboxes m JOIN credentials c ON c.account_id=m.account_id AND c.primary_identity WHERE LOWER(m.name)=LOWER($1) AND c.address=$2 AND m.deleted_at IS NULL`, name, owner.Email).Scan(&shared))
 				require.True(t, shared, "case variant must not create an unshareable personal mailbox")
+				_, err = c.Select(strings.ToLower(strings.TrimSuffix(prefix, "/")), nil).Wait()
+				requireResponseCode(t, err, imap.ResponseCodeCannot, "case variant namespace root stays non-selectable")
 				require.NoError(t, c.Rename(name, prefix+"Renamed", nil).Wait(), "case variant source stays in the same shared namespace")
 			})
 		}
