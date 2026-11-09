@@ -82,7 +82,7 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 	}
 
 	// Check if mailbox already exists
-	_, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, name)
+	_, err := s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, AccountID, name, db.ACLRightCreate)
 	if err == nil {
 		s.DebugLog("mailbox already exists", "mailbox", name)
 		return &imap.Error{
@@ -99,6 +99,29 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 	// Split the mailbox name by the delimiter to check if it's nested
 	parts := strings.Split(name, string(consts.MailboxDelimiter))
 	var parentMailboxID *int64
+	ownerAccountID := AccountID
+	// Resolve the nearest existing ancestor before creating anything. Shared
+	// children belong to that hierarchy's owner, while permission is checked
+	// against the acting account. RFC 4314 §4 requires k, independently of l.
+	for i := len(parts) - 1; i >= 1; i-- {
+		ancestorName := strings.Join(parts[:i], string(consts.MailboxDelimiter))
+		ancestor, lookupErr := s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, AccountID, ancestorName, db.ACLRightCreate)
+		if errors.Is(lookupErr, consts.ErrMailboxNotFound) {
+			continue
+		}
+		if lookupErr != nil {
+			return s.internalError("failed to resolve create ancestor: %v", lookupErr)
+		}
+		allowed, checkErr := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, ancestor.ID, AccountID, db.ACLRightCreate)
+		if checkErr != nil {
+			return s.internalError("failed to check create permission: %v", checkErr)
+		}
+		if !allowed {
+			return &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNoPerm, Text: "You do not have permission to create child mailboxes under this parent"}
+		}
+		ownerAccountID = ancestor.AccountID
+		break
+	}
 
 	// For nested mailboxes, we need to find the immediate parent
 	if len(parts) > 1 {
@@ -119,7 +142,7 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 				var parentMailbox *db.DBMailbox
 
 				// Check if parent mailbox exists. If not, create it.
-				parentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, parentPathWithoutDelim)
+				parentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, parentPathWithoutDelim)
 				if err == consts.ErrMailboxNotFound {
 					// If parent doesn't exist and we have a grandparent, check 'k' right on grandparent
 					if currentParentID != nil {
@@ -138,7 +161,7 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 					}
 
 					s.DebugLog("auto-creating parent mailbox", "mailbox", parentPathWithoutDelim)
-					err = s.server.rdb.CreateMailboxWithRetry(ctx, AccountID, parentPathWithoutDelim, currentParentID)
+					err = s.server.rdb.CreateMailboxWithRetry(ctx, ownerAccountID, parentPathWithoutDelim, currentParentID)
 					if err != nil {
 						// Handle race condition: another session may have created the same parent
 						// mailbox concurrently. If so, just fetch the existing one.
@@ -149,7 +172,7 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 						}
 					}
 
-					parentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, parentPathWithoutDelim)
+					parentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, parentPathWithoutDelim)
 					if err != nil {
 						return s.internalError("failed to fetch auto-created parent mailbox '%s': %v", parentPathWithoutDelim, err)
 					}
@@ -186,7 +209,7 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 	// up front if it is already in use, so we don't create the mailbox first. (The
 	// partial unique index is the race-proof backstop, handled after creation.)
 	if specialUse != "" {
-		inUse, uErr := s.server.rdb.HasMailboxWithSpecialUseWithRetry(ctx, AccountID, specialUse)
+		inUse, uErr := s.server.rdb.HasMailboxWithSpecialUseWithRetry(ctx, ownerAccountID, specialUse)
 		if uErr != nil {
 			return s.internalError("failed to check special-use uniqueness: %v", uErr)
 		}
@@ -205,7 +228,7 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 	// without its attribute (RFC 6154), and LIST never observes a transient
 	// attribute-less state. Auto-created parents above do not inherit it.
 	if specialUse != "" {
-		err = s.server.rdb.CreateMailboxWithSpecialUseWithRetry(ctx, AccountID, name, parentMailboxID, specialUse)
+		err = s.server.rdb.CreateMailboxWithSpecialUseWithRetry(ctx, ownerAccountID, name, parentMailboxID, specialUse)
 		if err != nil {
 			if errors.Is(err, consts.ErrMailboxSpecialUseInUse) {
 				// Lost the race with the pre-check: another mailbox claimed the
@@ -230,7 +253,7 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 		return nil
 	}
 
-	err = s.server.rdb.CreateMailboxWithRetry(ctx, AccountID, name, parentMailboxID)
+	err = s.server.rdb.CreateMailboxWithRetry(ctx, ownerAccountID, name, parentMailboxID)
 	if err != nil {
 		// Handle race condition: another session may have created the same mailbox
 		// between our existence check and the actual INSERT.
@@ -291,17 +314,21 @@ func (s *IMAPSession) sharedCreateRefusal(ctx context.Context, accountID int64, 
 	if !shared.InNamespace(name) {
 		return nil
 	}
-	// Lookup uses LOWER(name), so the spelling of either the configured prefix
-	// or the client's name must not change whether an existing root is reused.
-	foldedName, foldedPrefix := strings.ToLower(name), strings.ToLower(shared.NamespacePrefix)
-	if rest := strings.TrimPrefix(foldedName, foldedPrefix); rest != foldedName {
-		top := shared.NamespacePrefix + strings.SplitN(rest, string(consts.MailboxDelimiter), 2)[0]
-		if !strings.EqualFold(top, name) {
-			if _, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, accountID, top); err == nil {
-				return nil
-			} else if err != consts.ErrMailboxNotFound {
-				return s.internalError("failed to look up shared mailbox '%s': %v", top, err)
-			}
+	// An existing parent inside the namespace proves this extends an existing
+	// shared root. k alone can authorize CREATE even when l hides that root.
+	for parent := name; ; {
+		separator := strings.LastIndex(parent, string(consts.MailboxDelimiter))
+		if separator < 0 {
+			break
+		}
+		parent = parent[:separator]
+		if strings.EqualFold(parent, strings.TrimSuffix(shared.NamespacePrefix, "/")) || !shared.InNamespace(parent) {
+			break
+		}
+		if _, err := s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, accountID, parent, db.ACLRightCreate); err == nil {
+			return nil
+		} else if !errors.Is(err, consts.ErrMailboxNotFound) {
+			return s.internalError("failed to look up shared mailbox '%s': %v", parent, err)
 		}
 	}
 	s.DebugLog("refusing to create a shared mailbox: allow_user_create is off", "mailbox", name)
