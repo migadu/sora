@@ -498,7 +498,16 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 			// ABOVE netConn, so the throughput-timeout notice must be written to
 			// the library's current connection, not to netConn's transport, or
 			// it lands in plaintext under the TLS records (#163).
-			serverPkg.SetTimeoutNoticeConn(netConn, c.NetConn)
+			if s.tlsConfig != nil && !c.IsTLS() {
+				serverPkg.SetTimeoutNoticeConn(netConn, func() net.Conn {
+					// NetConn is still plaintext during the library's TLS handshake.
+					// Only the reading goroutine asks; an unsafe notice is omitted.
+					if !c.IsTLS() {
+						return nil
+					}
+					return c.NetConn()
+				})
+			}
 
 			// Count the connection only once it is past every rejection point,
 			// so the decrements in the session close path always balance.
