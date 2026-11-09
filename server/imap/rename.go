@@ -121,6 +121,9 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		}
 
 		// 1. Create the destination mailbox, linked to its parent.
+		if refusal := s.sharedCreateRefusal(ctx, AccountID, newName); refusal != nil {
+			return refusal
+		}
 		err = s.server.rdb.CreateMailboxWithRetry(ctx, AccountID, newName, destParentID)
 		if err != nil {
 			return s.internalError("failed to create destination mailbox '%s': %v", newName, err)
@@ -241,6 +244,19 @@ func (s *IMAPSession) writeRenameOldName(w *imapserver.RenameWriter, oldName, ne
 // Shared by the INBOX-rename and regular-rename destination-parent resolution so
 // both link a hierarchical target under its parent rather than storing a flat name.
 func (s *IMAPSession) resolveOrCreateParentPath(ctx context.Context, newParentPath string, ownerAccountID int64) (*int64, error) {
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, newParentPath)
+	if err == nil {
+		return &mailbox.ID, nil
+	}
+	if !errors.Is(err, consts.ErrMailboxNotFound) {
+		return nil, s.internalError("failed to fetch new parent mailbox %q: %v", newParentPath, err)
+	}
+	// Policy applies only when creating a missing parent. Reusing an existing
+	// shared mailbox is still allowed when user-created shared roots are disabled.
+	if refusal := s.sharedCreateRefusal(ctx, ownerAccountID, newParentPath); refusal != nil {
+		return nil, refusal
+	}
 	parentID, err := s.server.rdb.ResolveOrCreateMailboxPathWithRetry(ctx, ownerAccountID, newParentPath)
 	if err != nil {
 		return nil, s.internalError("failed to resolve new parent hierarchy %q: %v", newParentPath, err)

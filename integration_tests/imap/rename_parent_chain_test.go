@@ -3,10 +3,13 @@
 package imap_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/stretchr/testify/require"
 )
@@ -15,13 +18,21 @@ import (
 // superior names. Every newly created shared parent must inherit Sora's ACLs.
 func TestRename_AutoCreatedParentsInheritAndCascade(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
-	server, owner := common.SetupIMAPServer(t)
+	server, owner := common.SetupIMAPServerWithOptions(t, sharedMailboxSettings(false, true))
 	defer server.Close()
 	member, password := createSecondUser(t, server, "example.com", "parentchain")
 	c, err := imapclient.DialInsecure(server.Address, nil)
 	require.NoError(t, err)
 	defer c.Logout()
 	require.NoError(t, c.Login(owner.Email, owner.Password).Wait())
+	// An administrator creates the root; delegates may extend its hierarchy with
+	// the k right even while creating new shared roots is disabled (#159).
+	adminCtx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/", AllowUserCreate: true},
+	})
+	ownerID, err := server.ResilientDB.GetAccountIDByEmailWithRetry(adminCtx, owner.Email)
+	require.NoError(t, err)
+	require.NoError(t, server.ResilientDB.CreateMailboxForUserWithRetry(adminCtx, ownerID, "Shared/Team"))
 	require.NoError(t, c.Create("Shared/Team/Leaf", nil).Wait())
 	for _, name := range []string{"Shared/Team", "Shared/Team/Leaf"} {
 		require.NoError(t, c.SetACL(name, imap.RightsIdentifier(member), imap.RightModificationReplace, imap.RightSet("lrswipkxtea")).Wait())
