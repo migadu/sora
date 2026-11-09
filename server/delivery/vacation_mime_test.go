@@ -143,12 +143,16 @@ func TestVacationMIMEUnknownCharsetPreservesEncoding(t *testing.T) {
 		{"binary", "Caf\xe9"},
 		{"BASE64", "Q2Fm6Q=="},
 		{"quoted-printable", "Caf=E9"},
+		{"quoted-printable", "abc \t=\r\ndef=00=FF=3D"},
+		{"quoted-printable", strings.Repeat("x", 75) + "=\r\ny"},
 	} {
 		t.Run(tc.encoding, func(t *testing.T) {
 			leaf := "Content-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: " + tc.encoding + "\r\n\r\n" + tc.body + "\r\n"
 			for _, reason := range []string{
 				leaf,
 				"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n" + leaf + "--b--\r\n",
+				"Content-Type: message/rfc822\r\n\r\nSubject: Away\r\n" + leaf,
+				"Content-Type: multipart/digest; boundary=d\r\n\r\n--d\r\n\r\nSubject: Away\r\n" + leaf + "--d--\r\n",
 			} {
 				var wire bytes.Buffer
 				if err := writeVacationMIME(&wire, message.Header{}, reason); err != nil {
@@ -161,6 +165,23 @@ func TestVacationMIMEUnknownCharsetPreservesEncoding(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestVacationMIMEHeaderSizeBound(t *testing.T) {
+	large := strings.Repeat("x", 1<<20)
+	for _, reason := range []string{
+		"X-Large: " + large + "\r\n\r\nAway",
+		"Content-Type: message/rfc822\r\n\r\nSubject: " + large + "\r\n\r\nAway",
+	} {
+		var wire bytes.Buffer
+		if err := writeVacationMIME(&wire, message.Header{}, reason); err == nil {
+			t.Fatal("oversized MIME header accepted")
+		}
+	}
+	var wire bytes.Buffer
+	if err := writeVacationMIME(&wire, message.Header{}, "Content-Type: application/octet-stream\r\n\r\n"+large); err != nil {
+		t.Fatalf("body incorrectly limited with headers: %v", err)
 	}
 }
 

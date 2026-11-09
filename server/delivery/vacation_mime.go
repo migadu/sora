@@ -2,8 +2,10 @@ package delivery
 
 import (
 	"bufio"
+	"encoding/base64"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 
 	"github.com/emersion/go-message"
@@ -14,21 +16,19 @@ import (
 // headers. Transport headers always come from the generated reply, so :mime
 // cannot replace From, To, Subject, Message-ID or auto-response protections.
 func writeVacationMIME(w io.Writer, header message.Header, reason string) error {
-	entity, err := message.Read(strings.NewReader(reason))
-	if err != nil && !message.IsUnknownCharset(err) {
-		return fmt.Errorf("invalid vacation MIME entity: %w", err)
-	}
-	// Validate decoded content before consuming the suppression window or handing
-	// the reply to the relay. The original encoded octets are copied below: MIME
-	// charsets, transfer encodings and multipart boundaries need no conversion.
-	if err := validateVacationMIME(entity, 0); err != nil {
-		return fmt.Errorf("invalid vacation MIME entity: %w", err)
-	}
-
-	reader := bufio.NewReader(strings.NewReader(reason))
-	mimeHeader, err := textproto.ReadHeader(reader)
+	mimeHeader, body, err := readVacationMIMEHeader(strings.NewReader(reason))
 	if err != nil {
 		return fmt.Errorf("invalid vacation MIME header: %w", err)
+	}
+	// Validate the encoded source, not go-message's lenient decoders: those
+	// repair malformed received mail, but we must not generate invalid MIME.
+	if err := validateVacationMIME(message.Header{Header: mimeHeader}, body, "text/plain", 0); err != nil {
+		return fmt.Errorf("invalid vacation MIME entity: %w", err)
+	}
+	// Re-read after validation to preserve the original encoded body verbatim.
+	_, reader, err := readVacationMIMEHeader(strings.NewReader(reason))
+	if err != nil {
+		return err
 	}
 	fields := mimeHeader.Fields()
 	for fields.Next() {
@@ -46,18 +46,31 @@ func writeVacationMIME(w io.Writer, header message.Header, reason string) error 
 	return err
 }
 
-func validateVacationMIME(part *message.Entity, depth int) error {
+// Keep the same 1 MiB header bound as message.Read, including embedded messages.
+func readVacationMIMEHeader(r io.Reader) (textproto.Header, io.Reader, error) {
+	const limit = 1 << 20
+	limited := &io.LimitedReader{R: r, N: limit + 1}
+	reader := bufio.NewReader(limited)
+	header, err := textproto.ReadHeader(reader)
+	if limit+1-limited.N-int64(reader.Buffered()) > limit {
+		return header, nil, textproto.ErrHeaderTooBig
+	}
+	limited.N = math.MaxInt64
+	return header, reader, err
+}
+
+func validateVacationMIME(header message.Header, body io.Reader, defaultType string, depth int) error {
 	if depth > 64 {
 		return fmt.Errorf("vacation MIME nesting deeper than 64 levels")
 	}
 	for _, name := range []string{"Content-Type", "Content-Transfer-Encoding", "MIME-Version"} {
-		if len(part.Header.Values(name)) > 1 {
+		if len(header.Values(name)) > 1 {
 			return fmt.Errorf("duplicate %s", name)
 		}
 	}
 	// Child headers are copied verbatim as part of the encoded multipart body.
 	// RFC 2046 §5.1.1 requires ASCII even for headers of 8bit/binary body parts.
-	fields := part.Header.Fields()
+	fields := header.Fields()
 	for fields.Next() {
 		for _, b := range []byte(fields.Value()) {
 			if (b < 0x20 && b != '\t') || b >= 0x7f {
@@ -67,15 +80,33 @@ func validateVacationMIME(part *message.Entity, depth int) error {
 	}
 	// An unknown charset can hide go-message's unknown-encoding error, so
 	// validate the transfer encoding independently before accepting that error.
-	encoding := strings.ToLower(part.Header.Get("Content-Transfer-Encoding"))
+	encoding := strings.ToLower(header.Get("Content-Transfer-Encoding"))
 	switch encoding {
 	case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
 	default:
 		return fmt.Errorf("unsupported transfer encoding %q", encoding)
 	}
-	mediaType, params, err := part.Header.ContentType()
+	mediaType, params, err := header.ContentType()
 	if err != nil {
 		return err
+	}
+	if !header.Has("Content-Type") {
+		mediaType = defaultType
+	}
+	if mediaType == "message/rfc822" {
+		// RFC 2046 §5.2.1: message/rfc822 containers cannot use an encoding
+		// other than 7bit, 8bit or binary. Validate their embedded MIME too.
+		if encoding == "quoted-printable" || encoding == "base64" {
+			return fmt.Errorf("invalid message/rfc822 transfer encoding %q", encoding)
+		}
+		embedded, embeddedBody, err := readVacationMIMEHeader(body)
+		if err != nil {
+			return err
+		}
+		if !embedded.Has("From") && !embedded.Has("Subject") && !embedded.Has("Date") {
+			return fmt.Errorf("message/rfc822 has no From, Subject or Date header")
+		}
+		return validateVacationMIME(message.Header{Header: embedded}, embeddedBody, "text/plain", depth+1)
 	}
 	if strings.HasPrefix(mediaType, "multipart/") {
 		if params["boundary"] == "" {
@@ -85,17 +116,21 @@ func validateVacationMIME(part *message.Entity, depth int) error {
 		if encoding == "quoted-printable" || encoding == "base64" {
 			return fmt.Errorf("invalid multipart transfer encoding %q", encoding)
 		}
-		reader := part.MultipartReader()
+		reader := textproto.NewMultipartReader(body, params["boundary"])
+		childDefault := "text/plain"
+		if mediaType == "multipart/digest" {
+			childDefault = "message/rfc822" // RFC 2046 §5.1.5
+		}
 		count := 0
 		for {
 			child, err := reader.NextPart()
 			if err == io.EOF {
 				break
 			}
-			if err != nil && !message.IsUnknownCharset(err) {
+			if err != nil {
 				return err
 			}
-			if err := validateVacationMIME(child, depth+1); err != nil {
+			if err := validateVacationMIME(message.Header{Header: child.Header}, child, childDefault, depth+1); err != nil {
 				return err
 			}
 			count++
@@ -105,8 +140,57 @@ func validateVacationMIME(part *message.Entity, depth int) error {
 		}
 		return nil
 	}
-	// Even when the charset is unknown, Body still contains the transfer
-	// decoder; consume it to catch malformed base64 or quoted-printable.
-	_, err = io.Copy(io.Discard, part.Body)
+	// Charsets do not affect transfer-encoding validity and need no conversion.
+	if encoding == "quoted-printable" {
+		return validateVacationQuotedPrintable(body)
+	}
+	if encoding == "base64" {
+		body = base64.NewDecoder(base64.StdEncoding, body)
+	}
+	_, err = io.Copy(io.Discard, body)
 	return err
+}
+
+// RFC 2045 §6.7 permits only upper-case hex escapes, soft line breaks,
+// printable ASCII and non-trailing space/tab, with at most 76 bytes per line.
+func validateVacationQuotedPrintable(body io.Reader) error {
+	reader := bufio.NewReader(body)
+	for {
+		line, err := reader.ReadSlice('\n')
+		if err != nil && err != io.EOF {
+			return err
+		}
+		terminated := len(line) >= 2 && line[len(line)-2] == '\r' && line[len(line)-1] == '\n'
+		if terminated {
+			line = line[:len(line)-2]
+		}
+		if len(line) > 76 {
+			return fmt.Errorf("quoted-printable line exceeds 76 characters")
+		}
+		for i := 0; i < len(line); i++ {
+			b := line[i]
+			if b == '=' {
+				if i == len(line)-1 && terminated {
+					break // Soft line break.
+				}
+				if i+2 >= len(line) || !isVacationHex(line[i+1]) || !isVacationHex(line[i+2]) {
+					return fmt.Errorf("invalid quoted-printable escape")
+				}
+				i += 2
+			} else if b == ' ' || b == '\t' {
+				if i == len(line)-1 {
+					return fmt.Errorf("trailing quoted-printable whitespace")
+				}
+			} else if b < 33 || b > 126 {
+				return fmt.Errorf("invalid quoted-printable byte")
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+	}
+}
+
+func isVacationHex(b byte) bool {
+	return b >= '0' && b <= '9' || b >= 'A' && b <= 'F'
 }
