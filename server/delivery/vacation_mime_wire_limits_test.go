@@ -2,12 +2,45 @@ package delivery
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/emersion/go-message"
 )
+
+// RFC 2046 §§5.2.2–5.2.3 restrict these containers to 7bit even when their
+// individual body octets would also fit an 8bit or binary transport.
+func TestVacationMIMESevenBitMessageSubtypes(t *testing.T) {
+	for _, tc := range []struct{ contentType, body string }{
+		{`message/partial; id="away"; number=1; total=1`, "Subject: Away\r\n\r\nAway"},
+		{`message/external-body; access-type=local-file; name="away.txt"`, "Content-ID: <away@example.com>\r\n\r\n"},
+	} {
+		for _, encoding := range []string{"", "7bit", "8bit", "binary", "base64", "quoted-printable"} {
+			t.Run(tc.contentType+"/"+encoding, func(t *testing.T) {
+				reason := "Content-Type: " + tc.contentType + "\r\n"
+				if encoding != "" {
+					reason += "Content-Transfer-Encoding: " + encoding + "\r\n"
+				}
+				body := tc.body
+				if encoding == "base64" {
+					body = base64.StdEncoding.EncodeToString([]byte(body))
+				}
+				reason += "\r\n" + body
+				var wire bytes.Buffer
+				err := writeVacationMIME(&wire, message.Header{}, reason)
+				if encoding == "" || encoding == "7bit" {
+					if err != nil {
+						t.Fatalf("valid 7bit entity rejected: %v", err)
+					}
+				} else if err == nil || wire.Len() != 0 {
+					t.Fatalf("forbidden transfer encoding accepted: err=%v output=%q", err, wire.String())
+				}
+			})
+		}
+	}
+}
 
 func TestVacationMIMETransferWireLimits(t *testing.T) {
 	for _, tc := range []struct {
