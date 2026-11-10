@@ -65,6 +65,8 @@ var (
 	// ErrAmbiguousBackendPool means DNS made independently configured pools share
 	// a destination. Neither its owner nor its TLS trust settings can be guessed.
 	ErrAmbiguousBackendPool = errors.New("backend belongs to multiple resolved pools")
+	// ErrBackendOutsidePool refuses a socket whose destination no longer belongs to its route.
+	ErrBackendOutsidePool = errors.New("backend is outside the routed pool")
 )
 
 // BackendSettings is the backend-leg configuration of one pool: how the proxy talks to a
@@ -178,22 +180,23 @@ type UserRoutingLookup interface {
 
 // UserRoutingInfo contains backend routing information for a user
 type UserRoutingInfo struct {
-	ServerAddress          string   // Backend server to connect to (empty in auth-only mode or when routed by pool)
-	PoolName               string   // Named pool to pick a backend from (set by the lookup answer, or by routing once resolved)
-	AccountID              int64    // Account ID for tracking/metrics
-	IsRemoteLookupAccount  bool     // Whether this came from remotelookup
-	AuthOnlyMode           bool     // Remote API authenticated but didn't specify backend (use local selection)
-	ActualEmail            string   // Actual email address for backend impersonation
-	FromCache              bool     // Whether this result came from remotelookup cache
-	RemoteTLS              bool     // Use TLS for backend connection
-	RemoteTLSUseStartTLS   bool     // Use STARTTLS after the greeting instead of implicit TLS
-	RemoteTLSVerify        bool     // Verify backend TLS certificate
-	RemoteUseProxyProtocol bool     // Use PROXY protocol for backend connection
-	RemoteUseIDCommand     bool     // Use IMAP ID command (IMAP only)
-	RemoteUseXCLIENT       bool     // Use XCLIENT command (POP3/LMTP)
-	RemoteUseUTF8          bool     // Backend supports POP3 UTF8 (RFC 6856); mirror a client's pre-auth UTF8 to it (POP3 only)
-	ClientConn             net.Conn // Client connection (for extracting JA4 fingerprint)
-	ProxySessionID         string   // Proxy session ID for end-to-end tracing
+	backendRoute           *BackendRoute // per-request explicit-pin ownership; never persisted in the lookup cache
+	ServerAddress          string        // Backend server to connect to (empty in auth-only mode or when routed by pool)
+	PoolName               string        // Named pool to pick a backend from (set by the lookup answer, or by routing once resolved)
+	AccountID              int64         // Account ID for tracking/metrics
+	IsRemoteLookupAccount  bool          // Whether this came from remotelookup
+	AuthOnlyMode           bool          // Remote API authenticated but didn't specify backend (use local selection)
+	ActualEmail            string        // Actual email address for backend impersonation
+	FromCache              bool          // Whether this result came from remotelookup cache
+	RemoteTLS              bool          // Use TLS for backend connection
+	RemoteTLSUseStartTLS   bool          // Use STARTTLS after the greeting instead of implicit TLS
+	RemoteTLSVerify        bool          // Verify backend TLS certificate
+	RemoteUseProxyProtocol bool          // Use PROXY protocol for backend connection
+	RemoteUseIDCommand     bool          // Use IMAP ID command (IMAP only)
+	RemoteUseXCLIENT       bool          // Use XCLIENT command (POP3/LMTP)
+	RemoteUseUTF8          bool          // Backend supports POP3 UTF8 (RFC 6856); mirror a client's pre-auth UTF8 to it (POP3 only)
+	ClientConn             net.Conn      // Client connection (for extracting JA4 fingerprint)
+	ProxySessionID         string        // Proxy session ID for end-to-end tracing
 }
 
 // LookupRouted reports whether addr is the backend the remote lookup named, the only one
