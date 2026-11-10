@@ -633,10 +633,11 @@ func (s *Server) sendGracefulShutdownMessage() {
 		session.mu.Unlock()
 	}
 
-	// Step 2: Write 421 shutdown message directly to clientConn.
+	// Step 2: Write 421 shutdown message directly to clientConn: the TLS
+	// connection after STARTTLS, and nothing while STARTTLS is negotiating.
 	for _, session := range activeSessions {
 		session.mu.Lock()
-		if session.clientConn != nil {
+		if session.clientConn != nil && !session.startTLSInProgress {
 			_, _ = fmt.Fprint(session.clientConn, "421 4.3.2 Service shutting down, please try again later\r\n")
 		}
 		session.mu.Unlock()
