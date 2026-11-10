@@ -100,6 +100,7 @@ func TestUserAPITLSReuseStaysWithPoolAfterDNSOwnershipChange(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			phase := poolTransferDNS(t)
 			var hits atomic.Int32
+			addresses := make(chan string, 8)
 			entered, release := make(chan struct{}), make(chan struct{})
 			defer func() {
 				select {
@@ -109,6 +110,7 @@ func TestUserAPITLSReuseStaysWithPoolAfterDNSOwnershipChange(t *testing.T) {
 				}
 			}()
 			backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				addresses <- r.RemoteAddr
 				if hits.Add(1) == 1 && inFlight {
 					close(entered)
 					<-release
@@ -156,6 +158,13 @@ func TestUserAPITLSReuseStaysWithPoolAfterDNSOwnershipChange(t *testing.T) {
 				if code := <-firstDone; code != http.StatusTeapot {
 					t.Fatalf("warm A connection: %d", code)
 				}
+				firstAddr := <-addresses
+				if code := login(handler, `{"email":"a@example.com"}`); code != http.StatusTeapot {
+					t.Fatalf("reuse within A: %d", code)
+				}
+				if reused := <-addresses; reused != firstAddr {
+					t.Fatalf("same-pool requests stopped reusing TCP: %s != %s", reused, firstAddr)
+				}
 			}
 			phase.Store(true)
 			if err := s.connManager.ResolveAddresses(); err != nil {
@@ -184,8 +193,12 @@ func TestUserAPITLSReuseStaysWithPoolAfterDNSOwnershipChange(t *testing.T) {
 			if code := login(handler, `{"email":"b@example.com"}`); code != http.StatusBadGateway {
 				t.Fatalf("B reused an A TLS connection: status=%d backend_requests=%d", code, hits.Load())
 			}
-			if got := hits.Load(); got != 1 {
-				t.Fatalf("requests reaching A=%d want 1", got)
+			want := int32(2)
+			if inFlight {
+				want = 1
+			}
+			if got := hits.Load(); got != want {
+				t.Fatalf("requests reaching A=%d want %d", got, want)
 			}
 		})
 	}
