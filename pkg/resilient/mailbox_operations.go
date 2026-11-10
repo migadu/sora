@@ -3,6 +3,8 @@ package resilient
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
@@ -23,6 +25,31 @@ func (rd *ResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, Acco
 		return nil, err
 	}
 	return result.(*db.DBMailbox), nil
+}
+
+// ResolveOrCreateMailboxPathWithRetry resolves every level of a mailbox path,
+// creating missing ancestors in order so paths and inherited ACLs stay linked.
+// The caller is responsible for authorizing creation before invoking this helper.
+func (rd *ResilientDatabase) ResolveOrCreateMailboxPathWithRetry(ctx context.Context, accountID int64, name string) (*int64, error) {
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	parts := strings.Split(name, string(consts.MailboxDelimiter))
+	var parentID *int64
+	for i := 1; i <= len(parts); i++ {
+		path := strings.Join(parts[:i], string(consts.MailboxDelimiter))
+		mailbox, err := rd.GetMailboxByNameWithRetry(ctx, accountID, path)
+		if errors.Is(err, consts.ErrMailboxNotFound) {
+			if err := rd.CreateMailboxWithRetry(ctx, accountID, path, parentID); err != nil && !errors.Is(err, consts.ErrDBUniqueViolation) {
+				return nil, fmt.Errorf("create parent mailbox %q: %w", path, err)
+			}
+			// Re-fetch after a successful or concurrent creation, using the writer.
+			mailbox, err = rd.GetMailboxByNameWithRetry(ctx, accountID, path)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("resolve parent mailbox %q: %w", path, err)
+		}
+		parentID = &mailbox.ID
+	}
+	return parentID, nil
 }
 
 // HasLiveDescendantsWithRetry reports whether any live mailbox sits below the given path.
