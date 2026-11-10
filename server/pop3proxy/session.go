@@ -733,7 +733,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	// remote_tls_use_starttls: the connection manager dialed plaintext, and the upgrade
 	// must come before anything else is sent (XCLIENT carries the client's address, AUTH
 	// the master credential).
-	if tlsConfig := s.server.connManager.BackendStartTLSConfig(s.routingInfo, s.serverAddr); tlsConfig != nil {
+	if tlsConfig := s.server.connManager.BackendStartTLSConfig(s.routingInfo, s.serverAddr, s.backendConn); tlsConfig != nil {
 		if backendReader, err = s.startTLSWithBackend(backendReader, tlsConfig, greetingTimeout); err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: STLS with backend: %w", server.ErrBackendConnectionFailed, err)

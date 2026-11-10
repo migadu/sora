@@ -849,13 +849,13 @@ func (s *Session) connectToBackendAndAuth() error {
 	if s.routingInfo.UsesRouteSettings(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
 		// The route specified StartTLS (for the backend the lookup named or its pool picked, as for the dial)
 		shouldUseStartTLS = true
-		tlsConfig = s.server.connManager.BackendClientTLS(s.routingInfo.RemoteTLSVerify, actualAddr)
+		tlsConfig = s.server.connManager.BackendClientTLSForConn(s.routingInfo.RemoteTLSVerify, actualAddr, s.backendConn)
 		s.DebugLog("Using remotelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
 	} else if !s.routingInfo.PoolRouted() && s.server.connManager.IsRemoteStartTLS() {
 		// Global proxy config specified StartTLS. A pool's own settings are authoritative:
 		// a pool without remote_tls_use_starttls never inherits the server's.
 		shouldUseStartTLS = true
-		tlsConfig = s.server.connManager.GetTLSConfig(actualAddr)
+		tlsConfig = s.server.connManager.GetTLSConfigForConn(actualAddr, s.backendConn)
 		s.DebugLog("Using global StartTLS settings")
 	}
 

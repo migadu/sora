@@ -1166,35 +1166,11 @@ func loadCAFile(path string) (*x509.CertPool, error) {
 //     that name, and a certificate valid for the name or for the address dialed is accepted,
 //     so a backend whose certificate names only its address keeps working as before.
 func (cm *ConnectionManager) BackendClientTLS(verify bool, addr string) *tls.Config {
-	cfg := cm.backendTLSConfig(verify)
-	// The conflict check, CA and names must belong to the same DNS snapshot. A
-	// refresh between separate reads could otherwise turn a pool member into an
-	// apparently unowned pin that inherits the server's roots and another pool's name.
-	cm.healthMu.RLock()
-	defer cm.healthMu.RUnlock()
-	if err := cm.backendErrors[normalizeHostPort(addr, cm.remotePort)]; err != nil {
-		// Also guard STARTTLS and callers that already hold a TCP connection.
-		// Disabling certificate verification must not disable pool isolation.
-		cfg.InsecureSkipVerify = true
-		cfg.VerifyConnection = func(tls.ConnectionState) error { return err }
-		return cfg
-	}
-	if name := cm.poolOfBackendLocked(addr); name != "" {
-		cfg.RootCAs = cm.poolsByName[name].rootCAs
-	}
-	host, _, err := net.SplitHostPort(addr)
+	route, err := cm.BindBackendRoute("", addr)
 	if err != nil {
-		host = addr
+		return cm.refusedBackendTLS(err)
 	}
-	names := append(cm.configuredHostnamesOfLocked(addr), host)
-	cfg.ServerName = names[0]
-	if verify {
-		// Go's own check accepts only ServerName; this one is that check (chain to the
-		// roots, then the leaf's name) with any of names.
-		cfg.InsecureSkipVerify = true
-		cfg.VerifyConnection = verifyBackendCertificate(cfg.RootCAs, names)
-	}
-	return cfg
+	return route.TLSConfig(verify)
 }
 
 // configuredHostnamesOfLocked returns the hostnames (not IP literals) whose resolution
@@ -1292,12 +1268,19 @@ func (cm *ConnectionManager) backendTLSSettings(routingInfo *UserRoutingInfo, ad
 // greeting: nil when that connection needs none (implicit TLS, which the dial did, or a
 // plaintext leg). ConnectWithProxy dials plaintext whenever it returns a config, so a
 // proxy that skips the upgrade then runs the leg in plaintext.
-func (cm *ConnectionManager) BackendStartTLSConfig(routingInfo *UserRoutingInfo, addr string) *tls.Config {
+func (cm *ConnectionManager) BackendStartTLSConfig(routingInfo *UserRoutingInfo, addr string, connected ...net.Conn) *tls.Config {
 	remoteTLS, useStartTLS, verify := cm.backendTLSSettings(routingInfo, addr)
 	if !remoteTLS || !useStartTLS {
 		return nil
 	}
-	return cm.BackendClientTLS(verify, addr)
+	if len(connected) > 0 && connected[0] != nil {
+		return cm.BackendClientTLSForConn(verify, addr, connected[0])
+	}
+	route, err := cm.bindForDial(routingInfo, addr)
+	if err != nil {
+		return cm.refusedBackendTLS(err)
+	}
+	return route.TLSConfig(verify)
 }
 
 // ConnectWithProxy attempts to connect to a remote server and sends PROXY protocol header
@@ -1916,20 +1899,7 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// Now establish TLS if required (only for implicit TLS, not StartTLS)
 	// When StartTLS is enabled, the protocol layer will handle TLS upgrade
 	if remoteTLS && !remoteTLSUseStartTLS {
-		// The backend's name and roots come from addr: tls.Client (unlike tls.Dial) does not
-		// infer ServerName, and an empty one would verify only the chain, letting any CA-valid
-		// cert MITM the proxy->backend leg (BackendClientTLS always sets it).
-		tlsConfig := cm.BackendClientTLS(remoteTLSVerify, addr)
-		verifyConnection := tlsConfig.VerifyConnection
-		tlsConfig.VerifyConnection = func(cs tls.ConnectionState) error {
-			if err := route.ValidateDestination(conn.RemoteAddr().String()); err != nil {
-				return err
-			}
-			if verifyConnection != nil {
-				return verifyConnection(cs)
-			}
-			return nil
-		}
+		tlsConfig := route.TLSConfig(remoteTLSVerify, conn)
 		logger.Debug("Starting TLS handshake", "addr", addr, "InsecureSkipVerify", !remoteTLSVerify, "server_name", tlsConfig.ServerName)
 		tlsConn := tls.Client(conn, tlsConfig)
 

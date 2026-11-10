@@ -1354,7 +1354,7 @@ func (s *Session) connectToBackend() error {
 	// remote_tls_use_starttls: the connection manager dialed plaintext, and the upgrade
 	// must come before anything else is sent (ID forwarding carries the client's address,
 	// AUTHENTICATE the master credential).
-	if tlsConfig := s.server.connManager.BackendStartTLSConfig(s.routingInfo, actualAddr); tlsConfig != nil {
+	if tlsConfig := s.server.connManager.BackendStartTLSConfig(s.routingInfo, actualAddr, s.backendConn); tlsConfig != nil {
 		if err := s.startTLSWithBackend(tlsConfig, readTimeout); err != nil {
 			s.backendConn.Close()
 			s.ErrorLog("STARTTLS with backend failed", "backend", s.serverAddr, "error", err)
