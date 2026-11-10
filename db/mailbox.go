@@ -609,6 +609,19 @@ func (db *Database) HasLiveDescendants(ctx context.Context, accountID int64, pat
 	return hasLiveDescendants(ctx, db.GetReadPoolWithContext(ctx), accountID, path)
 }
 
+// IsMailboxShared reports whether a live mailbox is a shared one (is_shared), as
+// settled when it was created; a name under the shared prefix does not make it one.
+func (db *Database) IsMailboxShared(ctx context.Context, mailboxID int64) (bool, error) {
+	var shared bool
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx,
+		`SELECT COALESCE(is_shared, FALSE) FROM mailboxes WHERE id = $1 AND deleted_at IS NULL`,
+		mailboxID).Scan(&shared)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, consts.ErrMailboxNotFound
+	}
+	return shared, err
+}
+
 // PurgeMailboxStep performs ONE bounded step of the hard delete of a mailbox, and reports
 // whether the mailbox is now gone.
 //

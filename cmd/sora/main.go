@@ -2360,6 +2360,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		RedirectRateWindow: redirectRateWindow,
 		MaxRedirectHops:    serverConfig.GetMaxRedirectHops(),
 		SieveExtensions:    deps.config.Sieve.EnabledExtensions,
+		SharedMailboxes:    deps.config.SharedMailboxes,
 	}
 }
 

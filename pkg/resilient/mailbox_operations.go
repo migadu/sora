@@ -37,6 +37,18 @@ func (rd *ResilientDatabase) HasLiveDescendantsWithRetry(ctx context.Context, ac
 	return result.(bool), nil
 }
 
+// IsMailboxSharedWithRetry reports whether a live mailbox is a shared one.
+func (rd *ResilientDatabase) IsMailboxSharedWithRetry(ctx context.Context, mailboxID int64) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).IsMailboxShared(ctx, mailboxID)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
 func (rd *ResilientDatabase) InsertMessageWithRetry(ctx context.Context, options *db.InsertMessageOptions, upload db.PendingUpload) (messageID int64, uid int64, err error) {
 	// Lock the mailbox at the Go level to prevent connection pool starvation during mass concurrent inserts.
 	unlock := rd.getOperationalDatabaseForOperation(ctx, true).LockMailbox(options.MailboxID)

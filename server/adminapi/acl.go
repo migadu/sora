@@ -1,11 +1,13 @@
 package adminapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
@@ -42,10 +44,16 @@ func aclErrorStatus(err error) int {
 	case errors.Is(err, consts.ErrUserNotFound), errors.Is(err, consts.ErrMailboxNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, db.ErrInvalidACLRight), errors.Is(err, db.ErrMailboxNotShared),
-		errors.Is(err, db.ErrCrossDomainGrant), errors.Is(err, db.ErrOwnerACL):
+		errors.Is(err, db.ErrCrossDomainGrant), errors.Is(err, db.ErrOwnerACL), errors.Is(err, db.ErrAnyoneDisabled):
 		return http.StatusBadRequest
 	}
 	return http.StatusInternalServerError
+}
+
+// aclContext carries the shared mailbox config to the ACL service, which decides
+// with it whether "anyone" may be granted rights.
+func (s *Server) aclContext(r *http.Request) context.Context {
+	return context.WithValue(r.Context(), consts.ConfigContextKey, &config.Config{SharedMailboxes: s.sharedMailboxes})
 }
 
 // handleACLGrant handles POST /admin/mailboxes/acl/grant
@@ -78,7 +86,7 @@ func (s *Server) handleACLGrant(w http.ResponseWriter, r *http.Request) {
 	aclSvc := aclservice.New(s.rdb)
 
 	// Grant ACL
-	if err := aclSvc.Grant(r.Context(), req.Owner, req.Mailbox, req.Identifier, req.Rights); err != nil {
+	if err := aclSvc.Grant(s.aclContext(r), req.Owner, req.Mailbox, req.Identifier, req.Rights); err != nil {
 		if status := aclErrorStatus(err); status != http.StatusInternalServerError {
 			s.writeError(w, status, err.Error())
 			return

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 )
 
@@ -59,7 +60,17 @@ var (
 	// ErrOwnerACL: the owner holds every right whatever the ACL says
 	// (has_mailbox_right), so the owner's rights cannot be changed.
 	ErrOwnerACL = errors.New("the mailbox owner always holds every right")
+	// ErrAnyoneDisabled: [shared_mailboxes] allow_anyone_identifier is false.
+	ErrAnyoneDisabled = errors.New(`granting rights to "anyone" is disabled`)
 )
+
+// anyoneAllowed reports whether rights may be granted to "anyone": not when the
+// shared mailbox config in ctx has allow_anyone_identifier off (its default). A
+// caller without that config in ctx, a direct database caller, is not restricted.
+func anyoneAllowed(ctx context.Context) bool {
+	cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config)
+	return !ok || cfg == nil || !cfg.SharedMailboxes.Enabled || cfg.SharedMailboxes.AllowAnyoneIdentifier
+}
 
 // ErrInvalidACLRight is returned by ValidateACLRights for a character that is not
 // one of AllACLRights.
@@ -184,6 +195,9 @@ func resolveGrantee(ctx context.Context, q aclQuerier, mb aclMailbox, identifier
 		return nil, "", fmt.Errorf("shared mailbox has no owner domain")
 	}
 	if identifier == AnyoneIdentifier {
+		if !anyoneAllowed(ctx) {
+			return nil, "", ErrAnyoneDisabled
+		}
 		return nil, AnyoneIdentifier, nil
 	}
 	at := strings.LastIndexByte(identifier, '@')
@@ -487,7 +501,7 @@ func (db *Database) MailboxACLGrantability(ctx context.Context, mailboxID int64,
 		return ACLGrantNone, err
 	}
 	if identifier == AnyoneIdentifier {
-		if mb.isShared && mb.ownerDomain != "" {
+		if mb.isShared && mb.ownerDomain != "" && anyoneAllowed(ctx) {
 			return ACLGrantAny, nil
 		}
 		return ACLGrantNone, nil

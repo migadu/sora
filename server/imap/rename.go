@@ -248,6 +248,9 @@ func (s *IMAPSession) writeRenameOldName(w *imapserver.RenameWriter, oldName, ne
 func (s *IMAPSession) resolveOrCreateParentPath(ctx context.Context, newParentPath string, ownerAccountID int64) (*int64, error) {
 	newParentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, newParentPath)
 	if err == consts.ErrMailboxNotFound {
+		if refusal := s.sharedCreateRefusal(ctx, ownerAccountID, newParentPath); refusal != nil {
+			return nil, refusal
+		}
 		s.DebugLog("new parent mailbox does not exist, auto-creating", "parent", newParentPath)
 		createErr := s.server.rdb.CreateMailboxWithRetry(ctx, ownerAccountID, newParentPath, nil)
 		if createErr != nil {
