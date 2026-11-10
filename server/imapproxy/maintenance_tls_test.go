@@ -129,7 +129,7 @@ func TestMaintenanceTLS_StalledClientWriteDoesNotDelayBackendClose(t *testing.T)
 	client, writing := stalledMaintenanceTLSBackend(t)
 	backend, peer := net.Pipe()
 	t.Cleanup(func() { backend.Close(); peer.Close() })
-	session := &Session{server: &Server{}, clientConn: client, backendConn: backend}
+	session := &Session{server: &Server{}, clientConn: client, listenerConn: client, backendConn: backend}
 	writeDone := make(chan error, 1)
 	go func() {
 		_, err := session.forwardToClient(client, []byte("* 1 EXISTS\r\n"))
@@ -163,7 +163,7 @@ func TestMaintenanceTLS_UnreadClientCloseNotifyDoesNotDelayBackendClose(t *testi
 	backend, peer := net.Pipe()
 	t.Cleanup(func() { backend.Close(); peer.Close() })
 	// Model a session whose BYE was delivered before the client stopped reading.
-	session := &Session{server: &Server{}, clientConn: client, backendConn: backend, byeSent: true}
+	session := &Session{server: &Server{}, clientConn: client, listenerConn: client, backendConn: backend, byeSent: true}
 	session.closeForMaintenance()
 	peer.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
