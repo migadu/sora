@@ -4,17 +4,13 @@ package managesieveproxy_test
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
-	"log"
 	"net"
-	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -22,51 +18,6 @@ import (
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/managesieveproxy"
 )
-
-// logCapture redirects the standard log output, which the logger package
-// writes to, into a buffer guarded by a mutex: server goroutines keep logging
-// while the test reads it.
-type logCapture struct {
-	mu     sync.Mutex
-	buffer bytes.Buffer
-}
-
-func newLogCapture(t *testing.T) *logCapture {
-	lc := &logCapture{}
-	log.SetOutput(lc)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
-	return lc
-}
-
-func (lc *logCapture) Write(p []byte) (int, error) {
-	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	return lc.buffer.Write(p)
-}
-
-// waitForLine returns the first captured line containing every one of parts,
-// waiting up to ten seconds.
-func (lc *logCapture) waitForLine(t *testing.T, parts ...string) string {
-	t.Helper()
-	for deadline := time.Now().Add(10 * time.Second); ; {
-		lc.mu.Lock()
-		logs := lc.buffer.String()
-		lc.mu.Unlock()
-		for _, line := range strings.Split(logs, "\n") {
-			found := true
-			for _, p := range parts {
-				found = found && strings.Contains(line, p)
-			}
-			if found {
-				return line
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no log line contains %q", parts)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
 
 // startSTARTTLSSieveProxy starts a backend with master SASL and, in front of
 // it, a ManageSieve proxy with a generated certificate and tls_use_starttls
@@ -195,7 +146,7 @@ func TestManageSieveProxyIdleNoticeAfterSTARTTLSIsReadableThroughTLS(t *testing.
 // closes.
 func TestManageSieveProxyLogsJA4AndUserAfterSTARTTLS(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
-	logs := newLogCapture(t)
+	logs := common.CaptureLogs(t)
 	_, addr, account, certPool := startSTARTTLSSieveProxy(t, func(o *managesieveproxy.ServerOptions) {
 		o.CommandTimeout = 2 * time.Second
 	})
@@ -207,10 +158,10 @@ func TestManageSieveProxyLogsJA4AndUserAfterSTARTTLS(t *testing.T) {
 	}
 
 	// Logged after the hijack, once the client has its OK.
-	if line := logs.waitForLine(t, "proto=managesieve_proxy", "authentication complete"); !strings.Contains(line, "ja4=t13") {
+	if line := logs.WaitForLine(t, "proto=managesieve_proxy", "authentication complete"); !strings.Contains(line, "ja4=t13") {
 		t.Errorf("the post-login log line names no JA4 after STARTTLS: %s", line)
 	}
-	if line := logs.waitForLine(t, "proto=managesieve_proxy", "Connection closed - timeout"); !strings.Contains(line, "user="+account.Email) {
+	if line := logs.WaitForLine(t, "proto=managesieve_proxy", "Connection closed - timeout"); !strings.Contains(line, "user="+account.Email) {
 		t.Errorf("the timeout log line does not name the user after STARTTLS: %s", line)
 	}
 }

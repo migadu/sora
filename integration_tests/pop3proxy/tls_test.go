@@ -652,38 +652,13 @@ func TestPOP3ProxyIdleNoticeAfterSTLSIsReadableThroughTLS(t *testing.T) {
 	}
 }
 
-// waitForLogLine returns the first captured line containing every one of
-// parts, waiting up to five seconds: a session logs after it has replied.
-func waitForLogLine(t *testing.T, lc *LogCapture, parts ...string) string {
-	t.Helper()
-	for deadline := time.Now().Add(5 * time.Second); ; {
-		lc.mu.Lock()
-		logs := lc.buffer.String()
-		lc.mu.Unlock()
-		for _, line := range strings.Split(logs, "\n") {
-			found := true
-			for _, p := range parts {
-				found = found && strings.Contains(line, p)
-			}
-			if found {
-				return line
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no log line contains %q", parts)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
 // After STLS the relay runs on the TLS connection the proxy hijacked from the
 // library, which carries no JA4. The session's log lines must still name the
 // client's JA4: it is recorded during the STLS handshake on the listener's
 // SoraConn, which the session logs through.
 func TestPOP3ProxyLogsJA4AfterSTLS(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
-	logCapture := NewLogCapture()
-	defer logCapture.Stop()
+	logs := common.CaptureLogs(t)
 	proxy, proxyAddr, account, certPool := startSTARTTLSProxy(t)
 	defer proxy.Stop()
 
@@ -698,7 +673,7 @@ func TestPOP3ProxyLogsJA4AfterSTLS(t *testing.T) {
 	}
 
 	// Logged after the hijack, once the client has its +OK.
-	line := waitForLogLine(t, logCapture, "proto=pop3_proxy", "authentication complete")
+	line := logs.WaitForLine(t, "proto=pop3_proxy", "authentication complete")
 	if !strings.Contains(line, "ja4=t13") {
 		t.Fatalf("the post-login log line names no JA4 after STLS: %s", line)
 	}
