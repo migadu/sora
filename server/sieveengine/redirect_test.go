@@ -179,3 +179,67 @@ func TestRedirectRateLimit(t *testing.T) {
 		}
 	})
 }
+
+// evalRedirectScript evaluates script for account 1 against ro with the given limit.
+func evalRedirectScript(t *testing.T, script string, ro RedirectOracle, limit int) (Result, error) {
+	t.Helper()
+	exts := []string{"fileinto", "copy"}
+	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, newMockVacationOracle(), ro, limit, time.Hour, 0, exts)
+	if err != nil {
+		t.Fatalf("failed to create executor: %v", err)
+	}
+	return executor.Evaluate(context.Background(), cleanRedirectCtx())
+}
+
+// The rate limit is charged for the redirects delivery is asked to make (#230),
+// not for every redirect command the script happened to run.
+func TestRedirectRateLimitChargesWhatIsRelayed(t *testing.T) {
+	t.Run("redirect cancelled by fileinto is not charged", func(t *testing.T) {
+		ro := &configurableRedirectOracle{}
+		res, err := evalRedirectScript(t, `require "fileinto"; fileinto "Archive"; redirect "forward@example.com";`, ro, 100)
+		if err != nil {
+			t.Fatalf("evaluate: %v", err)
+		}
+		// fileinto still takes the message over and the redirect is not relayed.
+		if res.Action != ActionFileInto {
+			t.Fatalf("expected fileinto, got %s", res.Action)
+		}
+		if ro.recordedN != 0 {
+			t.Errorf("no redirect is relayed, but %d were charged", ro.recordedN)
+		}
+	})
+
+	t.Run("the same address twice is charged once", func(t *testing.T) {
+		ro := &configurableRedirectOracle{}
+		res, err := evalRedirectScript(t, `redirect "forward@example.com"; redirect "forward@example.com";`, ro, 100)
+		if err != nil {
+			t.Fatalf("evaluate: %v", err)
+		}
+		if res.Action != ActionRedirect {
+			t.Fatalf("expected redirect, got %s", res.Action)
+		}
+		if ro.recordedN != 1 {
+			t.Errorf("one address is relayed, but %d redirects were charged", ro.recordedN)
+		}
+	})
+
+	t.Run("a script that fails is not charged", func(t *testing.T) {
+		ro := &configurableRedirectOracle{}
+		// go-sieve allows five redirects and fails the script on the sixth; the
+		// message is then kept and nothing is relayed.
+		var script string
+		for i := range 6 {
+			script += fmt.Sprintf("redirect \"forward%d@example.com\";\n", i)
+		}
+		res, err := evalRedirectScript(t, script, ro, 100)
+		if err == nil {
+			t.Fatalf("expected the script to fail on too many redirects, got %+v", res)
+		}
+		if res.Action != ActionKeep {
+			t.Fatalf("expected keep after a failed script, got %s", res.Action)
+		}
+		if ro.recordedN != 0 {
+			t.Errorf("nothing is relayed, but %d redirects were charged", ro.recordedN)
+		}
+	})
+}
