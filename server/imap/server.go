@@ -349,7 +349,7 @@ type IMAPServerOptions struct {
 	TLSCertFile                 string
 	TLSKeyFile                  string
 	TLSVerify                   bool
-	TLSUseStartTLS              bool // Plaintext listener offering STARTTLS (RFC 9051 §6.2.1) instead of implicit TLS; requires TLS
+	TLSUseStartTLS              bool        // Plaintext listener offering STARTTLS (RFC 9051 §6.2.1) instead of implicit TLS; requires TLS
 	TLSConfig                   *tls.Config // Global TLS config from TLS manager (optional)
 	MasterUsername              []byte
 	MasterPassword              []byte
@@ -763,8 +763,14 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// commands (notably MYRIGHTS) are functional on a user's own mailboxes
 	// regardless of whether shared mailboxes are configured.
 
-	// Setup TLS if TLS is enabled and certificate and key files are provided
-	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
+	// Setup TLS: the global [tls] manager's config when there is one, the
+	// per-server certificate files otherwise.
+	if options.TLS && options.TLSConfig != nil {
+		if options.TLSCertFile != "" || options.TLSKeyFile != "" {
+			logger.Warn("IMAP: tls_cert_file/tls_key_file ignored - global [tls] is enabled", "name", name)
+		}
+		s.tlsConfig = options.TLSConfig
+	} else if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		logger.Debug("IMAP: Loading TLS certificate", "name", name, "cert", options.TLSCertFile, "key", options.TLSKeyFile)
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
@@ -792,6 +798,9 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
 			logger.Debug("IMAP: WARNING - Client TLS certificate verification not enforced", "name", name)
 		}
+	} else if options.TLS {
+		// Without a certificate the listener would be plaintext on the port meant for TLS.
+		return nil, fmt.Errorf("TLS enabled for IMAP [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
 	}
 
 	var debugWriter io.Writer

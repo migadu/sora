@@ -135,7 +135,7 @@ type POP3ServerOptions struct {
 	TLSCertFile                 string
 	TLSKeyFile                  string
 	TLSVerify                   bool
-	TLSUseStartTLS              bool // Plaintext listener offering STLS (RFC 2595) instead of implicit TLS; requires TLS
+	TLSUseStartTLS              bool        // Plaintext listener offering STLS (RFC 2595) instead of implicit TLS; requires TLS
 	TLSConfig                   *tls.Config // Global TLS config from TLS manager (optional)
 	MasterUsername              string
 	MasterPassword              string
@@ -354,8 +354,14 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		server.listenBacklog = 1024 // Default backlog
 	}
 
-	// Setup TLS if TLS is enabled and certificate and key files are provided
-	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
+	// Setup TLS: the global [tls] manager's config when there is one, the
+	// per-server certificate files otherwise.
+	if options.TLS && options.TLSConfig != nil {
+		if options.TLSCertFile != "" || options.TLSKeyFile != "" {
+			logger.Warn("POP3: tls_cert_file/tls_key_file ignored - global [tls] is enabled", "name", name)
+		}
+		server.tlsConfig = options.TLSConfig
+	} else if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
 			serverCancel()
@@ -378,6 +384,10 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
 			logger.Debug("POP3: WARNING - TLS certificate verification not enforced", "name", name)
 		}
+	} else if options.TLS {
+		// Without a certificate the listener would be plaintext on the port meant for TLS.
+		serverCancel()
+		return nil, fmt.Errorf("TLS enabled for POP3 [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
 	}
 
 	// Start connection limiter cleanup

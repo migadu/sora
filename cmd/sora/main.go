@@ -1344,6 +1344,14 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 		commandTimeoutOverrides = nil
 	}
 
+	// Get global TLS config if available and wrap with server-specific default domain
+	var tlsConfig *tls.Config
+	if deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+		// Wrap with server-specific default domain if specified
+		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
+	}
+
 	s, err := imap.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance,
 		imap.IMAPServerOptions{
 			InstanceID:                   deps.instanceID,
@@ -1354,6 +1362,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			TLSKeyFile:                   serverConfig.TLSKeyFile,
 			TLSVerify:                    serverConfig.TLSVerify,
 			TLSUseStartTLS:               serverConfig.TLSUseStartTLS,
+			TLSConfig:                    tlsConfig,
 			MasterUsername:               []byte(serverConfig.MasterUsername),
 			MasterPassword:               []byte(serverConfig.MasterPassword),
 			MasterSASLUsername:           []byte(serverConfig.MasterSASLUsername),
@@ -1550,6 +1559,14 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
+	// Get global TLS config if available and wrap with server-specific default domain
+	var tlsConfig *tls.Config
+	if deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+		// Wrap with server-specific default domain if specified
+		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
+	}
+
 	s, err := pop3.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance, pop3.POP3ServerOptions{
 		MaintenanceGate:           deps.maintenanceGate,
 		Debug:                     serverConfig.Debug,
@@ -1558,6 +1575,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		TLSKeyFile:                serverConfig.TLSKeyFile,
 		TLSVerify:                 serverConfig.TLSVerify,
 		TLSUseStartTLS:            serverConfig.TLSUseStartTLS,
+		TLSConfig:                 tlsConfig,
 		MasterUsername:            serverConfig.MasterUsername,
 		MasterPassword:            serverConfig.MasterPassword,
 		MasterSASLUsername:        serverConfig.MasterSASLUsername,
