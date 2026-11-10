@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
@@ -71,7 +72,6 @@ func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, cr
 	currentNumMessages = s.currentNumMessages.Load()
 	release() // Release read lock
 
-	// Now decode search criteria using decodeSearchCriteriaLocked helper that we'll create
 	criteria = s.decodeSearchCriteria(criteria)
 	if criteria, err = s.withSessionRecent(criteria, selectedMailboxID); err != nil {
 		return nil, err
@@ -300,50 +300,44 @@ func (s *IMAPSession) emptySavedSearchOnNo(err error) {
 	s.DebugLog("emptied '$' after a failed SAVE search", "error", err)
 }
 
-// decodeSearchCriteriaLocked translates sequence numbers in search criteria.
+// decodeSearchCriteriaLocked resolves the "$" markers in search criteria to this
+// session's saved search result. Sequence sets are left as the client sent them:
+// the database maps them to UIDs in one snapshot of the mailbox, and needs "*"
+// still unresolved to answer a range such as 99:* that starts past the last message.
 // IMPORTANT: The caller MUST hold s.mutex (either read or write lock) when calling this method.
 func (s *IMAPSession) decodeSearchCriteriaLocked(criteria *imap.SearchCriteria) *imap.SearchCriteria {
-	return s.decodeSearchCriteriaWithSeqNumsLocked(criteria, true)
+	return searchResAsUIDs(criteria, s.savedSearchResultLocked())
 }
 
-// Multimailbox searches resolve '*' in each target mailbox, while still
-// resolving SEARCHRES against the selected session's saved UID set.
-func (s *IMAPSession) decodeSearchCriteriaWithSeqNumsLocked(criteria *imap.SearchCriteria, decodeSeqNums bool) *imap.SearchCriteria {
+// searchResAsUIDs returns a copy of criteria with every "$" marker (RFC 5182),
+// nested ones included, replaced by the UID set saved.
+func searchResAsUIDs(criteria *imap.SearchCriteria, saved imap.UIDSet) *imap.SearchCriteria {
 	decoded := *criteria // make a shallow copy
 
-	if decodeSeqNums {
-		decoded.SeqNum = make([]imap.SeqSet, len(criteria.SeqNum))
-		for i, seqSet := range criteria.SeqNum {
-			decoded.SeqNum[i] = s.decodeNumSetLocked(seqSet).(imap.SeqSet)
-		}
-	}
-
-	// UID sets don't need sequence-number decoding, but a "$" marker in the UID
-	// criteria must be resolved to this session's saved search result (RFC 5182).
 	decoded.UID = make([]imap.UIDSet, len(criteria.UID))
 	for i, uidSet := range criteria.UID {
 		if imap.IsSearchRes(uidSet) {
-			decoded.UID[i] = s.savedSearchResultLocked()
+			decoded.UID[i] = slices.Clone(saved)
 		} else {
 			decoded.UID[i] = uidSet
 		}
 	}
 
 	decoded.Not = make([]imap.SearchCriteria, len(criteria.Not))
-	for i, not := range criteria.Not {
-		decoded.Not[i] = *s.decodeSearchCriteriaWithSeqNumsLocked(&not, decodeSeqNums)
+	for i := range criteria.Not {
+		decoded.Not[i] = *searchResAsUIDs(&criteria.Not[i], saved)
 	}
 	decoded.Or = make([][2]imap.SearchCriteria, len(criteria.Or))
 	for i := range criteria.Or {
 		for j := range criteria.Or[i] {
-			decoded.Or[i][j] = *s.decodeSearchCriteriaWithSeqNumsLocked(&criteria.Or[i][j], decodeSeqNums)
+			decoded.Or[i][j] = *searchResAsUIDs(&criteria.Or[i][j], saved)
 		}
 	}
 
 	return &decoded
 }
 
-// decodeSearchCriteria safely acquires the read mutex and translates sequence numbers in search criteria.
+// decodeSearchCriteria safely acquires the read mutex and resolves "$" in search criteria.
 func (s *IMAPSession) decodeSearchCriteria(criteria *imap.SearchCriteria) *imap.SearchCriteria {
 	if s.ctx.Err() != nil {
 		s.DebugLog("session context is cancelled, skipping decodeSearchCriteria")
