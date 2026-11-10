@@ -1985,6 +1985,21 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		if s.RemoteUseProxyProtocol {
 			logger("WARNING: Server %s (type: %s) has 'remote_use_proxy_protocol' configured, but this only applies to proxy servers", s.Name, s.Type)
 		}
+	} else if s.Type == "user_api_proxy" {
+		if s.RemoteTLSUseStartTLS {
+			logger("WARNING: Server %s (type: %s) has 'remote_tls_use_starttls' configured, but the User API proxy speaks HTTP to its backends: 'remote_tls' alone selects HTTPS, there is no STARTTLS", s.Name, s.Type)
+		}
+		if s.RemoteLookup != nil && s.RemoteLookup.RemoteTLSUseStartTLS {
+			logger("WARNING: Server %s (type: %s) has 'remote_lookup.remote_tls_use_starttls' configured, but the User API proxy speaks HTTP to its backends: 'remote_lookup.remote_tls' alone selects HTTPS, there is no STARTTLS", s.Name, s.Type)
+		}
+	} else {
+		// STARTTLS is a way of doing remote_tls: without it the backend leg is plaintext.
+		if s.RemoteTLSUseStartTLS && !s.RemoteTLS {
+			logger("WARNING: Server %s (type: %s) has 'remote_tls_use_starttls' configured without 'remote_tls', so it is ignored and backend connections are plaintext; set 'remote_tls = true' to use STARTTLS", s.Name, s.Type)
+		}
+		if s.RemoteLookup != nil && s.RemoteLookup.RemoteTLSUseStartTLS && !s.RemoteLookup.RemoteTLS {
+			logger("WARNING: Server %s (type: %s) has 'remote_lookup.remote_tls_use_starttls' configured without 'remote_lookup.remote_tls', so it is ignored and connections to lookup-routed backends are plaintext; set 'remote_lookup.remote_tls = true' to use STARTTLS", s.Name, s.Type)
+		}
 	}
 
 	switch s.Type {

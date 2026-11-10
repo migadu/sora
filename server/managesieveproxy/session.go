@@ -841,25 +841,10 @@ func (s *Session) connectToBackendAndAuth() error {
 		}
 	}
 
-	// Check if we need to negotiate StartTLS with the backend
-	// This happens when remotelookup (or global config) specifies remote_tls_use_starttls
-	shouldUseStartTLS := false
-	var tlsConfig *tls.Config
-
-	if s.routingInfo.UsesRouteSettings(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
-		// The route specified StartTLS (for the backend the lookup named or its pool picked, as for the dial)
-		shouldUseStartTLS = true
-		tlsConfig = s.server.connManager.BackendClientTLS(s.routingInfo.RemoteTLSVerify, actualAddr)
-		s.DebugLog("Using remotelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
-	} else if !s.routingInfo.PoolRouted() && s.server.connManager.IsRemoteStartTLS() {
-		// Global proxy config specified StartTLS. A pool's own settings are authoritative:
-		// a pool without remote_tls_use_starttls never inherits the server's.
-		shouldUseStartTLS = true
-		tlsConfig = s.server.connManager.GetTLSConfig(actualAddr)
-		s.DebugLog("Using global StartTLS settings")
-	}
-
-	if shouldUseStartTLS && tlsConfig != nil {
+	// remote_tls_use_starttls: the connection manager dialed plaintext and left the upgrade
+	// to us. Whether this connection needs it is asked of the settings the dial used
+	// (the route's or the proxy's own), so the two cannot disagree.
+	if tlsConfig := s.server.connManager.BackendStartTLSConfig(s.routingInfo, actualAddr); tlsConfig != nil {
 		s.DebugLog("Negotiating StartTLS with backend", "backend", actualAddr, "insecure_skip_verify", tlsConfig.InsecureSkipVerify)
 
 		// Send STARTTLS command
@@ -880,6 +865,14 @@ func (s *Session) connectToBackendAndAuth() error {
 		if !strings.HasPrefix(strings.TrimSpace(response), "OK") {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: backend STARTTLS failed: %s", server.ErrBackendConnectionFailed, strings.TrimSpace(response))
+		}
+
+		// Bytes already buffered came in plaintext after the OK, where anyone on the path
+		// could have put them. The reader replaced below would drop them; a stream that
+		// broke the protocol there fails the connection instead (cf. CVE-2011-0411).
+		if backendReader.Buffered() > 0 {
+			s.backendConn.Close()
+			return fmt.Errorf("%w: backend sent data after its STARTTLS response", server.ErrBackendConnectionFailed)
 		}
 
 		// Upgrade connection to TLS
@@ -913,16 +906,20 @@ func (s *Session) connectToBackendAndAuth() error {
 		}
 	}
 
-	// Now authenticate to backend
+	// Now authenticate to backend, reading on from the reader that read the capabilities:
+	// what it buffered behind them would be lost with a new one.
+	s.backendReader = backendReader
 	return s.authenticateToBackend()
 }
 
-// authenticateToBackend authenticates to the backend using master credentials.
+// authenticateToBackend authenticates to the backend using master credentials. It reads
+// from s.backendReader, which the proxy phase goes on using so no buffered data is lost.
 func (s *Session) authenticateToBackend() error {
 	backendWriter := bufio.NewWriter(s.backendConn)
-	backendReader := bufio.NewReader(s.backendConn)
-	// Store backendReader for use in proxy phase to avoid losing buffered data
-	s.backendReader = backendReader
+	if s.backendReader == nil {
+		s.backendReader = bufio.NewReader(s.backendConn)
+	}
+	backendReader := s.backendReader
 
 	// Send AUTHENTICATE PLAIN command with impersonation
 	settings := s.server.loadSettings() // one copy of the credentials, however a reload replaces them meanwhile
