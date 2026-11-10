@@ -1,6 +1,7 @@
 package helpers
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -61,6 +62,50 @@ func TestPrependHeaderLine(t *testing.T) {
 	inj := string(PrependHeaderLine([]byte("body"), "X-Sora-Loop", "1\r\nInjected: evil"))
 	if strings.Contains(inj, "\nInjected:") {
 		t.Errorf("CRLF not stripped from header value (header injected): %q", inj)
+	}
+}
+
+func TestSetHeaderLine(t *testing.T) {
+	const name = "X-Redirected-By"
+	const replacement = "X-Redirected-By: alice@a.ch\r\n"
+	for _, newline := range []string{"\r\n", "\n"} {
+		t.Run(fmt.Sprintf("newline=%q", newline), func(t *testing.T) {
+			// The old values may be duplicated, mixed-case, and folded. Leave
+			// unrelated folded headers, signatures, and body bytes exactly intact.
+			retained := strings.Join([]string{
+				"Received: from mx.example.com", "\tby mail.example.com; now",
+				"DKIM-Signature: v=1; b=abc", " def==", "Subject: hello", "",
+				"X-Redirected-By: body content", "\tmore body", "body\x00\xff",
+			}, newline)
+			original := strings.Join([]string{
+				"x-redirected-by: attacker@example.com", " folded old value",
+				"Received: from mx.example.com", "\tby mail.example.com; now",
+				"X-Redirected-By: old@example.com", "\tanother old value",
+				"X-Redirected-By \t: older@example.com", " folded whitespace-name value",
+				"DKIM-Signature: v=1; b=abc", " def==", "Subject: hello", "",
+				"X-Redirected-By: body content", "\tmore body", "body\x00\xff",
+			}, newline)
+			input := []byte(original)
+			got := SetHeaderLine(input, name, "alice@a.ch")
+			if string(got) != replacement+retained {
+				t.Errorf("SetHeaderLine changed unrelated bytes:\ngot  %q\nwant %q", got, replacement+retained)
+			}
+			if string(input) != original {
+				t.Fatal("SetHeaderLine mutated the input")
+			}
+		})
+	}
+
+	for _, msg := range []string{"", "\r\nbody", "Subject: hello\r\n\r\nbody", "Subject: unterminated"} {
+		if got := string(SetHeaderLine([]byte(msg), name, "alice@a.ch")); got != replacement+msg {
+			t.Errorf("SetHeaderLine(%q) = %q, want %q", msg, got, replacement+msg)
+		}
+	}
+	if got := string(SetHeaderLine([]byte("x-redirected-by: old@example.com"), name, "alice@a.ch")); got != replacement {
+		t.Errorf("unterminated old header retained: %q", got)
+	}
+	if got := string(SetHeaderLine([]byte("X-Redirected-By: old\r\n\r\nbody"), "X-Redirected-\r\nBy", "alice@a.ch\r\nInjected: evil")); got != "X-Redirected-By: alice@a.chInjected: evil\r\n\r\nbody" {
+		t.Errorf("header injection not sanitized or existing field retained: %q", got)
 	}
 }
 

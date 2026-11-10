@@ -102,12 +102,24 @@ func TestVacationMIMEMalformedDoesNotSendOrConsumePeriod(t *testing.T) {
 		"not a MIME header\r\n\r\nbody",
 		"Content-Type: text/plain; charset=\"broken\r\n\r\nbody",
 		"Content-Type: text/plain\r\nContent-Transfer-Encoding: unknown\r\n\r\nbody",
+		"Content-Type: text/plain (unterminated\r\n\r\nbody",
+		"Content-Type: text/plain\r\nContent-Transfer-Encoding: base(comment)64\r\n\r\nQXdheQ==",
+		"Content-Type: text/plain\r\nContent-Transfer-Encoding: base64 (unterminated\r\n\r\nQXdheQ==",
 		"Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n!notbase64!",
 		"Content-Type: multipart/mixed\r\n\r\nbody",
 		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nbody",
 		"Content-Type: text/plain\r\nContent-Type: text/html\r\n\r\nbody",
 		"Content-Type: text/plain\r\nContent-Description: a\x00b\r\n\r\nbody",
 		"Content-Type: text/plain\r\nContent-Description: caf\xc3\xa9\r\n\r\nbody",
+		"Content-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: bogus-cte\r\n\r\nbody",
+		"Content-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: base64\r\n\r\n!notbase64!",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\nContent-Transfer-Encoding: base64\r\n\r\n--b\r\n\r\nbody\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: multipart/mixed; boundary=c\r\n\r\n--c--\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: bogus-cte\r\n\r\nbody\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: base64\r\n\r\n!notbase64!\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Description: a\x00b\r\n\r\nbody\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nX-Description: caf\xc3\xa9\r\n\r\nbody\r\n--b--\r\n",
 	} {
 		t.Run(reason, func(t *testing.T) {
 			q := &captureRelayQueue{}
@@ -124,5 +136,122 @@ func TestVacationMIMEMalformedDoesNotSendOrConsumePeriod(t *testing.T) {
 				t.Errorf("malformed MIME consumed period or was sent: queued=%d recorded=%d", len(q.calls), len(oracle.recorded))
 			}
 		})
+	}
+}
+
+func TestVacationMIMEUnknownCharsetPreservesEncoding(t *testing.T) {
+	for _, tc := range []struct{ encoding, body string }{
+		{"7bit", "Away"},
+		{"8bit", "Caf\xe9"},
+		{"binary", "Caf\xe9"},
+		{"BASE64", "Q2Fm6Q=="},
+		{"quoted-printable", "Caf=E9"},
+		{"quoted-printable", "abc \t=\r\ndef=00=FF=3D"},
+		{"quoted-printable", strings.Repeat("x", 75) + "=\r\ny"},
+	} {
+		t.Run(tc.encoding, func(t *testing.T) {
+			leaf := "Content-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: " + tc.encoding + "\r\n\r\n" + tc.body + "\r\n"
+			for _, reason := range []string{
+				leaf,
+				"Content-Type: multipart/mixed; boundary=b\r\nContent-Transfer-Encoding: binary\r\n\r\n--b\r\n" + leaf + "--b--\r\n",
+				"Content-Type: message/rfc822\r\nContent-Transfer-Encoding: binary\r\n\r\nSubject: Away\r\n" + leaf,
+				"Content-Type: multipart/digest; boundary=d\r\nContent-Transfer-Encoding: binary\r\n\r\n--d\r\nContent-Transfer-Encoding: binary\r\n\r\nSubject: Away\r\n" + leaf + "--d--\r\n",
+			} {
+				var wire bytes.Buffer
+				if err := writeVacationMIME(&wire, message.Header{}, reason); err != nil {
+					t.Fatal(err)
+				}
+				gotBody := strings.SplitN(wire.String(), "\r\n\r\n", 2)[1]
+				wantBody := strings.SplitN(reason, "\r\n\r\n", 2)[1]
+				if gotBody != wantBody || !strings.Contains(wire.String(), "Content-Transfer-Encoding: "+tc.encoding+"\r\n") {
+					t.Fatalf("encoded entity changed: %q", wire.String())
+				}
+			}
+		})
+	}
+}
+
+func TestVacationMIMEHeaderSizeBound(t *testing.T) {
+	large := strings.Repeat("x", 1<<20)
+	for _, reason := range []string{
+		"X-Large: " + large + "\r\n\r\nAway",
+		"Content-Type: message/rfc822\r\n\r\nSubject: " + large + "\r\n\r\nAway",
+	} {
+		var wire bytes.Buffer
+		if err := writeVacationMIME(&wire, message.Header{}, reason); err == nil {
+			t.Fatal("oversized MIME header accepted")
+		}
+	}
+	var wire bytes.Buffer
+	if err := writeVacationMIME(&wire, message.Header{}, "Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: binary\r\n\r\n"+large); err != nil {
+		t.Fatalf("body incorrectly limited with headers: %v", err)
+	}
+}
+
+func TestVacationMIMEHeaderComments(t *testing.T) {
+	for _, reason := range []string{
+		"Content-Type: text/plain (text); charset=(local) x-unknown\r\nContent-Transfer-Encoding: (wire) base64 (encoded)\r\n\r\nQXdheQ==",
+		"Content-Type: (outer (inner)) text (type) / (subtype) plain; charset=\"x-(unknown)\"\r\nContent-Transfer-Encoding: quoted-printable (a\\)b)\r\n\r\nAway=3D",
+		"Content-Type: multipart/mixed (mixed); boundary=\"a(b)\"\r\n\r\n--a(b)\r\nContent-Type: text/plain (text)\r\nContent-Transfer-Encoding: base64 (body)\r\n\r\nQXdheQ==\r\n--a(b)--\r\n",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			var wire bytes.Buffer
+			if err := writeVacationMIME(&wire, message.Header{}, reason); err != nil {
+				t.Fatalf("valid MIME comments rejected: %v", err)
+			}
+			got := strings.SplitN(wire.String(), "\r\n\r\n", 2)[1]
+			want := strings.SplitN(reason, "\r\n\r\n", 2)[1]
+			if got != want {
+				t.Fatalf("encoded body changed: got %q want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestVacationMIMERejectsInvalidEncodedContent(t *testing.T) {
+	for _, body := range []string{"bad=ZZ", "bad=", "bad=A", "bad= \r\n", "bad=af", "bad\x00", "bad\xe9", "bad \r\n", strings.Repeat("x", 77)} {
+		for _, charset := range []string{"utf-8", "x-unknown"} {
+			leaf := "Content-Type: text/plain; charset=" + charset + "\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n" + body
+			for _, reason := range []string{leaf, "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n" + leaf + "\r\n--b--\r\n"} {
+				t.Run(reason, func(t *testing.T) {
+					var wire bytes.Buffer
+					if err := writeVacationMIME(&wire, message.Header{}, reason); err == nil {
+						t.Fatal("malformed quoted-printable accepted")
+					}
+					if wire.Len() != 0 {
+						t.Fatal("malformed content was partially written")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestVacationMIMEEncapsulatedMessageValidation(t *testing.T) {
+	for _, body := range []string{
+		"Subject: Away\r\nContent-Transfer-Encoding: base64\r\n\r\n!notbase64!",
+		"Subject: Away\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nbad=ZZ",
+		"Subject: caf\xc3\xa9\r\n\r\nAway",
+		"Subject: Away\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b--\r\n",
+		"Content-Type: text/plain\r\n\r\nNo identifying message header",
+	} {
+		for _, reason := range []string{
+			"Content-Type: message/rfc822\r\n\r\n" + body,
+			"Content-Type: multipart/digest; boundary=d\r\n\r\n--d\r\n\r\n" + body + "\r\n--d--\r\n",
+		} {
+			t.Run(reason, func(t *testing.T) {
+				var wire bytes.Buffer
+				if err := writeVacationMIME(&wire, message.Header{}, reason); err == nil {
+					t.Fatal("invalid encapsulated MIME message accepted")
+				}
+			})
+		}
+	}
+	for _, encoding := range []string{"base64", "quoted-printable"} {
+		reason := "Content-Type: message/rfc822\r\nContent-Transfer-Encoding: " + encoding + "\r\n\r\nU3ViamVjdDogQXdheQ0KDQpBd2F5"
+		var wire bytes.Buffer
+		if err := writeVacationMIME(&wire, message.Header{}, reason); err == nil {
+			t.Errorf("message/rfc822 accepted forbidden %s encoding", encoding)
+		}
 	}
 }

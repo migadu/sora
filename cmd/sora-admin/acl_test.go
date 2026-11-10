@@ -156,8 +156,9 @@ func testACLGrantAnyone(t *testing.T, rdb *resilient.ResilientDatabase, ownerEma
 	// Create config context for shared mailbox detection
 	cfg := &config.Config{
 		SharedMailboxes: config.SharedMailboxesConfig{
-			Enabled:         true,
-			NamespacePrefix: "Shared/",
+			Enabled:               true,
+			NamespacePrefix:       "Shared/",
+			AllowAnyoneIdentifier: true, // this grants to "anyone"
 		},
 	}
 	ctx := context.WithValue(context.Background(), consts.ConfigContextKey, cfg)

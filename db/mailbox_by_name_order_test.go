@@ -25,7 +25,9 @@ func TestGetMailboxByName_SameNamedMailboxesAreChosenInOrder(t *testing.T) {
 	defer db.Close()
 
 	ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{
-		SharedMailboxes: config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/"},
+		SharedMailboxes: config.SharedMailboxesConfig{
+			Enabled: true, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: true, // this test compares direct and anyone grants
+		},
 	})
 	ts := time.Now().UnixNano()
 	domain := fmt.Sprintf("order-%d.example.com", ts)

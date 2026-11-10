@@ -406,7 +406,7 @@ type IMAPServerOptions struct {
 	AuthIdleTimeout         time.Duration            // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	CommandTimeout          time.Duration            // Maximum idle time before disconnection
 	CommandTimeoutOverrides map[string]time.Duration // Per-command hard execution timeouts (overrides defaults)
-	AbsoluteSessionTimeout  time.Duration            // Maximum total session duration (0 = use default 30m)
+	AbsoluteSessionTimeout  time.Duration            // Maximum total session duration (0 = no absolute limit)
 	MinBytesPerMinute       int64                    // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
 	// Auth security
 	InsecureAuth bool // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
@@ -929,7 +929,16 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	// ABOVE netConn, so the timeout BYE must be written to the library's
 	// current connection, not to netConn's transport, or it lands in plaintext
 	// under the TLS records (#163).
-	serverPkg.SetTimeoutNoticeConn(netConn, conn.NetConn)
+	serverPkg.SetTimeoutNoticeConn(netConn, func() net.Conn {
+		current := conn.NetConn()
+		// The timeout goroutine can retain this snapshot while STARTTLS is
+		// acknowledged. Never give it the plaintext writer of an upgradeable
+		// listener; TLS is published before go-imap starts its handshake.
+		if s.useStartTLS && !serverPkg.ConnIsTLS(current) {
+			return nil
+		}
+		return current
+	})
 
 	// Set auth idle timeout if configured (applies during pre-auth phase only)
 	if s.authIdleTimeout > 0 {
@@ -1084,6 +1093,7 @@ func (s *IMAPServer) connConfig() serverPkg.SoraConnConfig {
 		Hostname:             s.hostname,
 		IdleTimeout:          settings.commandTimeout,
 		AbsoluteTimeout:      settings.absoluteSessionTimeout,
+		NoAbsoluteTimeout:    settings.absoluteSessionTimeout <= 0,
 		MinBytesPerMinute:    settings.minBytesPerMinute,
 		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0 || settings.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {

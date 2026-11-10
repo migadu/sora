@@ -358,7 +358,8 @@ ACL entries are restricted to the same domain:
 [shared_mailboxes]
 enabled = true
 namespace_prefix = "Shared/"
-allow_user_create = true          # Or false for admin-only
+allow_user_create = true          # Or false (the default) for admin-only
+allow_anyone_identifier = false   # The default: no grants to "anyone"
 default_rights = "lrswipkxtea"    # Full rights for creators
 ```
 
