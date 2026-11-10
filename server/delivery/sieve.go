@@ -224,31 +224,32 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 			// Attribute this redirect to the script owner, replacing any earlier or
 			// sender-supplied attribution. Aliases still use the account's primary address.
 			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, recipient.Address.FullAddress())
-			// Try immediate delivery first if queue is not configured
-			if s.RelayQueue == nil && s.RelayHandler != nil {
-				err := s.RelayHandler.SendToExternalRelay(recipient.FromAddress.FullAddress(), result.RedirectTo, relayBytes)
-				if err == nil && !result.Copy {
-					// Successfully redirected without copy
-					outcome.MailboxName = ""
-					outcome.Discarded = true
-					return outcome, nil
+			from := recipient.FromAddress.FullAddress()
+			relayed := s.RelayQueue != nil || s.RelayHandler != nil
+			for _, redirectTo := range result.RedirectTo {
+				// Try immediate delivery first if queue is not configured
+				if s.RelayQueue == nil && s.RelayHandler != nil {
+					if err := s.RelayHandler.SendToExternalRelay(from, redirectTo, relayBytes); err != nil {
+						relayed = false
+					}
+				} else if s.RelayQueue != nil {
+					// Queue for background delivery with retry
+					if err := s.RelayQueue.Enqueue(from, redirectTo, "redirect", relayBytes); err != nil {
+						// Failed to enqueue: keep the message in INBOX rather than fail the
+						// delivery, but say so where an operator will see it — the user's
+						// redirect silently did not happen.
+						s.DeliveryCtx.Logger.Log("Failed to enqueue redirect message: %v", err)
+						logger.Warn("Sieve redirect could not be queued; message kept in INBOX instead",
+							"account_id", recipient.AccountID, "redirect_to", redirectTo, "error", err)
+						relayed = false
+					}
 				}
-			} else if s.RelayQueue != nil {
-				// Queue for background delivery with retry
-				err := s.RelayQueue.Enqueue(recipient.FromAddress.FullAddress(), result.RedirectTo, "redirect", relayBytes)
-				if err != nil {
-					// Failed to enqueue: keep the message in INBOX rather than fail the
-					// delivery, but say so where an operator will see it — the user's
-					// redirect silently did not happen.
-					s.DeliveryCtx.Logger.Log("Failed to enqueue redirect message: %v", err)
-					logger.Warn("Sieve redirect could not be queued; message kept in INBOX instead",
-						"account_id", recipient.AccountID, "redirect_to", result.RedirectTo, "error", err)
-				} else if !result.Copy {
-					// Successfully queued for redirect without copy
-					outcome.MailboxName = ""
-					outcome.Discarded = true
-					return outcome, nil
-				}
+			}
+			if relayed && !result.Copy {
+				// Every address relayed or queued, and no copy was asked for
+				outcome.MailboxName = ""
+				outcome.Discarded = true
+				return outcome, nil
 			}
 		}
 		// Fallback or copy: deliver to INBOX

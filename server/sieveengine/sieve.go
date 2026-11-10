@@ -114,7 +114,7 @@ type HeaderEdit struct {
 type Result struct {
 	Action        Action
 	Mailbox       string            // used for fileinto
-	RedirectTo    string            // used for redirect
+	RedirectTo    []string          // used for redirect: every address to relay to, without repeats
 	Flags         []string          // flags to add to the message
 	Copy          bool              // RFC3894 - :copy modifier for redirect and fileinto
 	CreateMailbox bool              // RFC5490 - :create modifier (mailbox extension)
@@ -367,10 +367,18 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 			}
 		}
 	} else if len(data.RedirectAddr) > 0 {
-		// Handle redirect action
-		// Use the first redirect address (we could support multiple redirects in the future)
+		// Handle redirect action. A script may redirect to several addresses
+		// (RFC 5228 §2.10.4); one named twice gets a single copy (§2.10.3).
 		result.Action = ActionRedirect
-		result.RedirectTo = data.RedirectAddr[0]
+		for _, addr := range data.RedirectAddr {
+			if !slices.Contains(result.RedirectTo, addr) {
+				result.RedirectTo = append(result.RedirectTo, addr)
+			}
+		}
+		// Charge the rate limit here, for the addresses delivery will relay to,
+		// and not as each redirect command runs: a redirect that fileinto took
+		// over or that a later script error undid is never sent.
+		execPolicy.recordRedirects(timeoutCtx, len(result.RedirectTo))
 
 		// Check if ImplicitKeep is true (means :copy was used) OR if Keep is true (explicit keep action)
 		// With normal redirect (no :copy), ImplicitKeep would be false, but an explicit keep
@@ -444,6 +452,11 @@ type SievePolicy struct {
 	redirectRateLimit  int
 	redirectRateWindow time.Duration
 	maxRedirectHops    int // mail-loop backstop; 0 = unlimited
+
+	// redirectsAllowed holds the distinct addresses this evaluation has let a
+	// redirect through to. They count against the rate limit as they
+	// accumulate, though nothing is recorded until the evaluation ends.
+	redirectsAllowed []string
 }
 
 func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData, addr string) (bool, error) {
@@ -470,6 +483,11 @@ func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData
 		return false, nil
 	}
 
+	// A repeated address is relayed once, so it is already accounted for.
+	if slices.Contains(p.redirectsAllowed, addr) {
+		return true, nil
+	}
+
 	// (1) Per-account rate limit.
 	if p.redirectOracle != nil && p.redirectRateLimit > 0 {
 		n, err := p.redirectOracle.CountRedirectsSince(ctx, p.AccountID, p.redirectRateWindow)
@@ -477,14 +495,24 @@ func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData
 			// fail-closed-to-keep
 			return false, nil
 		}
-		if n >= p.redirectRateLimit {
+		if n+len(p.redirectsAllowed) >= p.redirectRateLimit {
 			return false, nil
 		}
+	}
+	p.redirectsAllowed = append(p.redirectsAllowed, addr)
+	return true, nil
+}
+
+// recordRedirects charges n relayed redirects against the account's rate limit.
+func (p *SievePolicy) recordRedirects(ctx context.Context, n int) {
+	if p.redirectOracle == nil || p.redirectRateLimit <= 0 {
+		return
+	}
+	for range n {
 		if err := p.redirectOracle.RecordRedirect(ctx, p.AccountID); err != nil {
 			// Best effort, log error implicitly or explicitly if a logger becomes available in context
 		}
 	}
-	return true, nil
 }
 
 // VacationResponseAllowed is called by the Sieve interpreter.
