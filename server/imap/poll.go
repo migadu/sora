@@ -343,6 +343,16 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 			}
 		}
 		s.currentNumMessages.Store(poll.NumMessages)
+
+		// RFC 3501 §2.3.2: a read-write session that is notified of a message is
+		// the one that sees it as \Recent; later opens must not. Advance the same
+		// baselines a read-write SELECT sets, so that EXAMINE/SELECT after this
+		// point (here or in another session) does not count these messages again.
+		// recentAboveUID is left alone: they stay \Recent in this session.
+		if !s.selectedReadOnly.Load() && s.lastSelectedMailboxID == mailboxID && poll.HighestUID > 0 {
+			s.lastHighestUID = max(s.lastHighestUID, poll.HighestUID)
+			s.server.mailboxRecentUIDs.Store(mailboxID, poll.HighestUID)
+		}
 	}
 
 	// Process message flag updates

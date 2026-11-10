@@ -26,14 +26,17 @@ func TestIMAP_RecentIsSessionState(t *testing.T) {
 	defer server.Close()
 
 	// Session A: UIDs 1 and 2, then a read-write SELECT that makes them old for
-	// later sessions. A then asks for \Recent on UID 1, appends UID 3 with it
-	// and UID 4 without, and fills another mailbox with UIDs 1-3 carrying it.
+	// later sessions. A then asks for \Recent on UID 1, closes INBOX, appends
+	// UID 3 with it and UID 4 without, and fills another mailbox with UIDs 1-3 carrying it.
 	connA, rA := esearchDialLogin(t, server, account.Email, account.Password)
 	defer connA.Close()
 	esearchAppend(t, connA, rA, "a1", "INBOX", "one")
 	esearchAppend(t, connA, rA, "a2", "INBOX", "two")
 	esearchCmdOK(t, connA, rA, "a3", "SELECT INBOX")
 	esearchCmdOK(t, connA, rA, "a4", `UID STORE 1 +FLAGS (\Recent)`)
+	// A closes INBOX: a read-write session that has it selected would be notified
+	// of the appends below and consume their \Recent before B selects.
+	esearchCmdOK(t, connA, rA, "a4c", "CLOSE")
 	recentAppend(t, connA, rA, "a5", "INBOX", "three")
 	esearchAppend(t, connA, rA, "a6", "INBOX", "four")
 	esearchCreate(t, connA, rA, "a7", "Other")

@@ -26,6 +26,7 @@ type MailboxPoll struct {
 	Updates     []MessageUpdate
 	NumMessages uint32
 	ModSeq      uint64
+	HighestUID  imap.UID // mailboxes.highest_uid, read before NumMessages was counted
 }
 
 // pollMailboxStateQuery is the single statement a poll that finds nothing changed
@@ -80,6 +81,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			Updates:     []MessageUpdate{},
 			NumMessages: uint32(messageCount),
 			ModSeq:      currentModSeq,
+			HighestUID:  imap.UID(uidNext),
 		}, nil
 	}
 
@@ -166,6 +168,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		Updates:     []MessageUpdate{},
 		NumMessages: uint32(messageCount),
 		ModSeq:      currentModSeq,
+		HighestUID:  imap.UID(uidNext),
 	}
 
 	if len(rawUpdates) == 0 {
