@@ -528,7 +528,9 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	// real client and populates ForwardingParams (HELO/LOGIN/PROTO) on the session that
 	// actually delivers, so the Received: trace and logs name the client, not the proxy.
 	if xd := c.XCLIENTData(); len(xd) > 0 {
-		s.applyXCLIENTAttrs(xd)
+		// Attributes the XCLIENT hook refused stay recorded on the Conn; they are
+		// refused here as well and leave this session with the peer's own address.
+		_ = s.applyXCLIENTAttrs(xd)
 	}
 
 	s.Id = idgen.New()

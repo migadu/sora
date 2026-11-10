@@ -93,3 +93,21 @@ func TestParseXCLIENT_MalformedTTLIsAnError(t *testing.T) {
 		})
 	}
 }
+
+// ParseIMAPID reports a malformed x-proxy-ttl too, and leaves ProxyTTL at 0 when the ID
+// carries none: IMAP has no default hop budget.
+func TestParseIMAPID_MalformedTTLIsAnError(t *testing.T) {
+	for _, ttl := range []string{"invalid", "", "5x"} {
+		if params, err := ParseIMAPID(map[string]string{"x-originating-ip": "192.0.2.1", "x-proxy-ttl": ttl}); err == nil {
+			t.Errorf("no error for x-proxy-ttl %q; parsed %+v", ttl, params)
+		}
+	}
+	params, err := ParseIMAPID(map[string]string{"x-originating-ip": "192.0.2.1", "x-proxy-ttl": "-1"})
+	if err != nil || params.ProxyTTL != -1 {
+		t.Errorf("x-proxy-ttl -1: params = %+v, err = %v", params, err)
+	}
+	params, err = ParseIMAPID(map[string]string{"x-originating-ip": "192.0.2.1"})
+	if err != nil || params.ProxyTTL != 0 {
+		t.Errorf("no x-proxy-ttl: params = %+v, err = %v", params, err)
+	}
+}

@@ -29,7 +29,10 @@ func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) err
 	}
 	defer release()
 
-	s.applyXCLIENTAttrs(attrs)
+	if err := s.applyXCLIENTAttrs(attrs); err != nil {
+		s.InfoLog("invalid xclient attributes", "error", err)
+		return &smtp.SMTPError{Code: 501, EnhancedCode: smtp.EnhancedCode{5, 5, 4}, Message: "Invalid XCLIENT attributes"}
+	}
 
 	s.DebugLog("processed xclient attributes", "client_ip", s.ForwardingParams.OriginatingIP, "client_port", s.ForwardingParams.OriginatingPort, "protocol", s.ForwardingParams.Protocol, "helo", s.ForwardingParams.HELO, "login", s.ForwardingParams.Login)
 
@@ -46,7 +49,19 @@ func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) err
 // persists on the Conn across the reset, and only ever records from trusted proxies — onto the
 // fresh session that actually handles MAIL/RCPT/DATA. Without that second call the forwarded
 // client identity would be lost and the trace would name the proxy instead of the real client.
-func (s *LMTPSession) applyXCLIENTAttrs(attrs map[string]string) {
+//
+// A TTL that is not a number makes the whole attribute set invalid: nothing is applied and
+// an error is returned, so the forwarded identity is never taken with a fresh hop budget.
+func (s *LMTPSession) applyXCLIENTAttrs(attrs map[string]string) error {
+	for name, value := range attrs {
+		if strings.ToUpper(name) != "TTL" {
+			continue
+		}
+		if _, err := strconv.Atoi(value); err != nil {
+			return fmt.Errorf("invalid proxy TTL: %q", value)
+		}
+	}
+
 	// Initialize forwarding parameters if not already present
 	if s.ForwardingParams == nil {
 		s.ForwardingParams = &server.ForwardingParams{
@@ -97,6 +112,7 @@ func (s *LMTPSession) applyXCLIENTAttrs(attrs map[string]string) {
 			s.ForwardingParams.Variables["xclient-"+strings.ToLower(name)] = value
 		}
 	}
+	return nil
 }
 
 // isFromTrustedProxy reports whether the peer may override the real client IP via
