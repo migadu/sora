@@ -509,7 +509,7 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 	}
 
 	opts := pop3server.Options{
-		TLSConfig:              s.tlsConfig,
+		TLSConfig:              server.StartTLSConfig(s.tlsConfig, "pop3_proxy"), // records JA4 on STLS, as SoraTLSConn does for implicit TLS
 		IdleTimeout:            settings.commandTimeout,
 		AuthIdleTimeout:        settings.authIdleTimeout,
 		AbsoluteSessionTimeout: settings.absoluteSessionTimeout,
@@ -580,16 +580,17 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 			sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
 			session := &POP3ProxySession{
-				server:      s,
-				settings:    settings,
-				clientConn:  netConn,
-				ctx:         sessionCtx,
-				cancel:      sessionCancel,
-				releaseConn: releaseConn,
-				proxyInfo:   proxyInfo,
-				sessionID:   idgen.New(),
-				pop3Conn:    c,
-				startTime:   time.Now(),
+				server:       s,
+				settings:     settings,
+				clientConn:   netConn,
+				listenerConn: netConn,
+				ctx:          sessionCtx,
+				cancel:       sessionCancel,
+				releaseConn:  releaseConn,
+				proxyInfo:    proxyInfo,
+				sessionID:    idgen.New(),
+				pop3Conn:     c,
+				startTime:    time.Now(),
 			}
 
 			if proxyInfo != nil && proxyInfo.SrcIP != "" {

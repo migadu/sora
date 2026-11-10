@@ -1054,8 +1054,11 @@ func captureJA4(protocol string, hello *tls.ClientHelloInfo, record func(string)
 // plaintext connection with on STARTTLS. Its handshake records the client's JA4
 // fingerprint on the SoraConn under the upgraded connection, as SoraTLSConn's
 // does for implicit TLS, so client filters keyed on JA4 apply to STARTTLS
-// sessions too.
+// sessions too. It is nil when config is.
 func StartTLSConfig(config *tls.Config, protocol string) *tls.Config {
+	if config == nil {
+		return nil
+	}
 	cfg := config.Clone()
 	original := cfg.GetConfigForClient
 	cfg.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {

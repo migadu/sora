@@ -131,7 +131,7 @@ func TestReloadConfig_DuringBackendLogin(t *testing.T) {
 	clientEnd, peer := net.Pipe() // only logged from
 	defer clientEnd.Close()
 	defer peer.Close()
-	s := &Session{server: srv, clientConn: clientEnd, backendConn: proxyEnd, username: "user@example.com", ctx: context.Background()}
+	s := &Session{server: srv, clientConn: clientEnd, listenerConn: clientEnd, backendConn: proxyEnd, username: "user@example.com", ctx: context.Background()}
 
 	reloadWhile(t, srv.ReloadConfig, reloadRaceConfigs, func() {
 		for i := 0; i < 50; i++ {
