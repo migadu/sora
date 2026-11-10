@@ -203,10 +203,11 @@ type SoraConn struct {
 	onTimeout func(conn net.Conn, reason string) // Called before closing due to timeout
 	// currentConn reports the connection the protocol is using (see
 	// SetTimeoutNoticeConn). It is called only on the goroutine that reads, which
-	// records its answer in noticeConn, under mu, for the timeout goroutine; nil
-	// noticeConn writes the notice to the transport.
-	currentConn func() net.Conn
-	noticeConn  net.Conn
+	// records its answer in noticeConn, under mu, for the timeout goroutine.
+	// A registered provider returning nil suppresses the best-effort notice.
+	currentConn          func() net.Conn
+	noticeConn           net.Conn
+	noticeConnRegistered bool
 
 	// Lifecycle management
 	closed     bool
@@ -403,7 +404,7 @@ func (c *SoraConn) closeForTimeout(username, reason string, details ...any) {
 		// reach the socket through transport, whose deadline bounds the write.
 		notice := transport
 		c.mu.RLock()
-		if c.noticeConn != nil {
+		if c.noticeConnRegistered {
 			notice = c.noticeConn
 		}
 		c.mu.RUnlock()
@@ -413,7 +414,7 @@ func (c *SoraConn) closeForTimeout(username, reason string, details ...any) {
 		timer := time.AfterFunc(timeoutNoticeGrace, func() { closeTimeoutTransport(transport) })
 		defer timer.Stop()
 		defer c.Close()
-		if c.onTimeout != nil {
+		if c.onTimeout != nil && notice != nil {
 			if err := transport.SetWriteDeadline(time.Now().Add(timeoutNoticeGrace)); err == nil {
 				c.onTimeout(notice, reason)
 			}
@@ -424,6 +425,9 @@ func (c *SoraConn) closeForTimeout(username, reason string, details ...any) {
 // setTimeoutNoticeConn registers the provider of the connection a timeout
 // notice is written to; see SetTimeoutNoticeConn.
 func (c *SoraConn) setTimeoutNoticeConn(current func() net.Conn) {
+	c.mu.Lock()
+	c.noticeConnRegistered = true
+	c.mu.Unlock()
 	c.currentConn = current
 	c.recordNoticeConn()
 }
@@ -448,7 +452,10 @@ func (c *SoraConn) recordNoticeConn() {
 // connection ABOVE the SoraConn, so a notice written to the transport lands in
 // plaintext under the TLS records and the client sees a TLS error in place of
 // it (#163). Pass the library's accessor for its current connection: the
-// SoraConn itself until an upgrade, the TLS connection after it.
+// TLS connection after a completed upgrade, and nil while STARTTLS may be
+// starting or its handshake is incomplete. Nil suppresses the notice while
+// retaining the hard close: the library may already be handshaking through a
+// TLS connection that its accessor does not publish until the handshake ends.
 //
 // Call it on the goroutine that reads conn (a library's NewSession). current is
 // called only there, at registration and as each Read starts, never by the
@@ -470,25 +477,21 @@ func SetTimeoutNoticeConn(conn net.Conn, current func() net.Conn) bool {
 	return false
 }
 
-// recordedNoticeConn returns the connection recordNoticeConn last recorded, nil
-// when none is registered.
-func (c *SoraConn) recordedNoticeConn() net.Conn {
+// recordedNoticeConn returns the recorded notice connection and whether a
+// provider was registered. A registered nil connection suppresses unsafe notices.
+func (c *SoraConn) recordedNoticeConn() (net.Conn, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.noticeConn
+	return c.noticeConn, c.noticeConnRegistered
 }
 
-// NoticeConn returns the connection a notice written from outside the protocol
-// goroutine (a shutdown broadcast) must go to: the connection the SoraConn under
-// conn last recorded from its SetTimeoutNoticeConn provider, which after a
-// STARTTLS upgrade is the TLS connection above it; conn itself when there is no
-// SoraConn or nothing is registered. Writing to conn after an upgrade lands the
-// notice in plaintext under the TLS records, as #163 did for timeout notices.
-// It reads only the record, never the provider, so any goroutine may call it.
+// NoticeConn returns the safe connection for an asynchronous shutdown notice.
+// It returns nil while a registered STARTTLS provider cannot expose a safe
+// writer; callers must omit the notice in that case and retain normal closure.
 func NoticeConn(conn net.Conn) net.Conn {
 	for c := conn; c != nil; {
-		if sc, ok := c.(interface{ recordedNoticeConn() net.Conn }); ok {
-			if notice := sc.recordedNoticeConn(); notice != nil {
+		if sc, ok := c.(interface{ recordedNoticeConn() (net.Conn, bool) }); ok {
+			if notice, registered := sc.recordedNoticeConn(); registered {
 				return notice
 			}
 			return conn
