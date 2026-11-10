@@ -420,7 +420,7 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 	// deferred handshake).
 	var startTLSConfig *tls.Config
 	if s.tls && s.tlsUseStartTLS {
-		startTLSConfig = s.tlsConfig
+		startTLSConfig = server.StartTLSConfig(s.tlsConfig, "managesieve_proxy") // records JA4, as SoraTLSConn does for implicit TLS
 	}
 
 	opts := managesieveserver.Options{
@@ -472,6 +472,13 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 				c.SetTLS(true)
 			}
 
+			// go-managesieve upgrades the stream on STARTTLS by layering its
+			// TLS connection ABOVE netConn, so the timeout notice must be
+			// written to the library's current connection, or it lands in
+			// plaintext under the TLS records (#163). Hijack hands the relay
+			// that same connection.
+			server.SetTimeoutNoticeConn(netConn, c.NetConn)
+
 			// Count the connection only once it is past every rejection
 			// point, so the decrements in the session close path always
 			// balance.
@@ -487,16 +494,17 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 			}
 
 			session := &Session{
-				server:      s,
-				settings:    settings,
-				msConn:      c,
-				clientConn:  netConn,
-				clientAddr:  clientAddr,
-				ctx:         sessionCtx,
-				cancel:      sessionCancel,
-				startTime:   time.Now(),
-				releaseConn: releaseConn,
-				proxyInfo:   proxyInfo,
+				server:       s,
+				settings:     settings,
+				msConn:       c,
+				clientConn:   netConn,
+				listenerConn: netConn,
+				clientAddr:   clientAddr,
+				ctx:          sessionCtx,
+				cancel:       sessionCancel,
+				startTime:    time.Now(),
+				releaseConn:  releaseConn,
+				proxyInfo:    proxyInfo,
 				// Generate the session id once, up front, so every log line
 				// carries it.
 				sessionID: idgen.New(),
@@ -782,11 +790,13 @@ func (s *Server) sendGracefulShutdownBye() {
 		session.mu.Unlock()
 	}
 
-	// Step 2: Write BYE directly to clientConn (RFC 5804 TRYLATER).
+	// Step 2: Write BYE directly to clientConn (RFC 5804 TRYLATER). Before the
+	// hijack clientConn is the SoraConn, below the library's TLS connection
+	// after STARTTLS: NoticeConn returns the connection the session is using.
 	for _, session := range activeSessions {
 		session.mu.Lock()
 		if session.clientConn != nil {
-			_, _ = fmt.Fprint(session.clientConn, "BYE (TRYLATER) \"Server shutting down, please reconnect\"\r\n")
+			_, _ = fmt.Fprint(server.NoticeConn(session.clientConn), "BYE (TRYLATER) \"Server shutting down, please reconnect\"\r\n")
 		}
 		session.mu.Unlock()
 	}

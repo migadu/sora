@@ -428,7 +428,7 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 	// advertise STARTTLS.
 	var startTLSConfig *tls.Config
 	if s.useStartTLS {
-		startTLSConfig = s.tlsConfig
+		startTLSConfig = serverPkg.StartTLSConfig(s.tlsConfig, "managesieve") // records JA4, as SoraTLSConn does for implicit TLS
 	}
 
 	opts := managesieveserver.Options{

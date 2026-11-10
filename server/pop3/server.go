@@ -443,7 +443,7 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 	caps = append(caps, pop3.Capability{Name: "IMPLEMENTATION", Params: []string{"Sora-POP3-Server"}})
 
 	opts := pop3server.Options{
-		TLSConfig:              s.tlsConfig,
+		TLSConfig:              serverPkg.StartTLSConfig(s.tlsConfig, "pop3"), // records JA4 on STLS, as SoraTLSConn does for implicit TLS
 		IdleTimeout:            settings.commandTimeout,
 		AuthIdleTimeout:        s.authIdleTimeout,
 		AbsoluteSessionTimeout: settings.absoluteSessionTimeout,
