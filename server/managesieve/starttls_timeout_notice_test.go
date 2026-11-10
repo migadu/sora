@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -146,5 +148,33 @@ func TestSlowThroughputNoticeAfterStartTLSIsReadableThroughTLS(t *testing.T) {
 	}
 	if _, err := tlsReader.ReadString('\n'); err == nil {
 		t.Fatal("connection stayed open after the timeout notice")
+	}
+}
+
+func TestSlowThroughputDuringStartTLSHandshakeDoesNotWritePlaintext(t *testing.T) {
+	addr := startStartTLSThroughputServer(t)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(8 * time.Second))
+	r := bufio.NewReader(conn)
+	readUntilOK(t, r, "greeting")
+	fmt.Fprint(conn, "STARTTLS\r\n")
+	if line, err := r.ReadString('\n'); err != nil || !strings.HasPrefix(line, "OK") {
+		t.Fatalf("STARTTLS = %q, %v", line, err)
+	}
+	if _, err := conn.Write([]byte{0x16, 0x03, 0x03, 0x10, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	defer trickle(conn)()
+	got, err := io.ReadAll(r)
+	if len(got) != 0 {
+		t.Fatalf("plaintext during TLS handshake: %q", got)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatalf("handshake timeout did not close connection: %v", err)
 	}
 }

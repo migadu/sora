@@ -563,7 +563,14 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 			// ABOVE netConn, so the timeout notice must be written to the
 			// library's current connection, or it lands in plaintext under the
 			// TLS records (#163). Hijack hands the relay that same connection.
-			server.SetTimeoutNoticeConn(netConn, c.NetConn)
+			if s.tlsConfig != nil && !c.IsTLS() {
+				server.SetTimeoutNoticeConn(netConn, func() net.Conn {
+					if !c.IsTLS() {
+						return nil
+					}
+					return c.NetConn()
+				})
+			}
 
 			// Count the connection only once it is past every rejection point,
 			// so the decrements in the session close path always balance.
@@ -848,10 +855,10 @@ func (s *POP3ProxyServer) sendGracefulShutdownMessage() {
 	// Step 2: Write shutdown message directly to clientConn.
 	for _, session := range activeSessions {
 		session.mutex.Lock()
-		if session.clientConn != nil {
+		if noticeConn := server.NoticeConn(session.clientConn); noticeConn != nil {
 			// Before hijack, after STLS, the client reads through the library's
 			// TLS connection, which sits above clientConn.
-			_, _ = fmt.Fprint(server.NoticeConn(session.clientConn), "-ERR Server shutting down, please reconnect\r\n")
+			_, _ = fmt.Fprint(noticeConn, "-ERR Server shutting down, please reconnect\r\n")
 		}
 		session.mutex.Unlock()
 	}
