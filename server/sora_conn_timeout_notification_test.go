@@ -259,3 +259,16 @@ func TestNoticeConnFollowsTheRecordedConnection(t *testing.T) {
 		}
 	}
 }
+
+func TestNoticeConnSuppressesUnsafeRegisteredWriter(t *testing.T) {
+	transport, peer := net.Pipe()
+	defer peer.Close()
+	sc := NewSoraConn(transport, SoraConnConfig{NoAbsoluteTimeout: true})
+	defer sc.Close()
+	SetTimeoutNoticeConn(sc, func() net.Conn { return nil })
+	for _, conn := range []net.Conn{sc, unwrapConn{sc}} {
+		if got := NoticeConn(conn); got != nil {
+			t.Fatalf("unsafe registered writer returned %T", got)
+		}
+	}
+}
