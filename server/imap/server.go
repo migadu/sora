@@ -929,7 +929,16 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	// ABOVE netConn, so the timeout BYE must be written to the library's
 	// current connection, not to netConn's transport, or it lands in plaintext
 	// under the TLS records (#163).
-	serverPkg.SetTimeoutNoticeConn(netConn, conn.NetConn)
+	serverPkg.SetTimeoutNoticeConn(netConn, func() net.Conn {
+		current := conn.NetConn()
+		// The timeout goroutine can retain this snapshot while STARTTLS is
+		// acknowledged. Never give it the plaintext writer of an upgradeable
+		// listener; TLS is published before go-imap starts its handshake.
+		if s.useStartTLS && !serverPkg.ConnIsTLS(current) {
+			return nil
+		}
+		return current
+	})
 
 	// Set auth idle timeout if configured (applies during pre-auth phase only)
 	if s.authIdleTimeout > 0 {
