@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"crypto/tls"
+	"fmt"
+	"net"
 	"testing"
 	"time"
 )
@@ -149,7 +151,10 @@ func TestConnectionManagerGetTLSConfig(t *testing.T) {
 				t.Fatalf("Failed to create connection manager: %v", err)
 			}
 
-			tlsConfig := cm.GetTLSConfig("backend.example:24")
+			ca := newTestCA(t)
+			port := tlsBackendOnEveryAddress(t, ca.leaf(t, nil, loopbackIPs))
+			addr := fmt.Sprintf("127.0.0.1:%d", port)
+			tlsConfig := cm.GetTLSConfig(addr)
 
 			if tt.wantNil {
 				if tlsConfig != nil {
@@ -162,8 +167,18 @@ func TestConnectionManagerGetTLSConfig(t *testing.T) {
 				t.Fatalf("Expected TLS config, got nil")
 			}
 
-			if verifiesCertificates(tlsConfig) == tt.wantSkipVerify {
-				t.Errorf("Expected certificate verification skipped=%v, got verifies=%v", tt.wantSkipVerify, verifiesCertificates(tlsConfig))
+			// A VerifyConnection callback may enforce pool ownership without
+			// checking certificates. Test the actual TLS policy with an untrusted
+			// certificate instead of inferring it from the callback's presence.
+			conn, handshakeErr := tls.DialWithDialer(&net.Dialer{Timeout: time.Second}, "tcp", addr, tlsConfig)
+			if conn != nil {
+				conn.Close()
+			}
+			if tt.wantSkipVerify && handshakeErr != nil {
+				t.Fatalf("verification disabled: %v", handshakeErr)
+			}
+			if !tt.wantSkipVerify && handshakeErr == nil {
+				t.Fatal("verification enabled accepted an untrusted certificate")
 			}
 
 			// Verify no client certificates are set
