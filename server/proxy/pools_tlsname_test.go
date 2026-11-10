@@ -79,14 +79,18 @@ func (ca *testCA) leaf(t *testing.T, dnsNames []string, ips []net.IP) tls.Certif
 
 // tlsBackendOnEveryAddress serves TLS with cert on a port open on every local address, so a
 // name like "localhost" reaches it whichever address family it resolves to.
-func tlsBackendOnEveryAddress(t *testing.T, cert tls.Certificate) int {
+func tlsBackendOnEveryAddress(t *testing.T, cert tls.Certificate, hooks ...func(*tls.ClientHelloInfo) (*tls.Config, error)) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
-	tl := tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}})
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+	if len(hooks) > 0 {
+		cfg.GetConfigForClient = hooks[0]
+	}
+	tl := tls.NewListener(ln, cfg)
 	go func() {
 		for {
 			c, err := tl.Accept()
