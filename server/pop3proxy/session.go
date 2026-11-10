@@ -725,7 +725,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 		return fmt.Errorf("%w: failed to clear greeting read deadline: %w", server.ErrBackendConnectionFailed, err)
 	}
 
-	if !strings.HasPrefix(greeting, "+OK") {
+	if !isPositiveResponse(greeting) {
 		s.backendConn.Close()
 		return fmt.Errorf("%w: unexpected backend greeting: %s", server.ErrBackendConnectionFailed, greeting)
 	}
@@ -846,6 +846,16 @@ func (s *POP3ProxySession) connectToBackend() error {
 	return nil
 }
 
+// isPositiveResponse reports whether a backend response line carries the +OK status
+// indicator: ASCII case-insensitive (RFC 1939 section 3) and complete, so that a prefix
+// such as +OKAY is not an OK status.
+func isPositiveResponse(line string) bool {
+	if len(line) < 3 || !strings.EqualFold(line[:3], "+OK") {
+		return false
+	}
+	return len(line) == 3 || line[3] == ' ' || line[3] == '\r' || line[3] == '\n'
+}
+
 // startTLSWithBackend upgrades the backend connection with STLS (RFC 2595), within
 // timeout, republishes it under the mutex and returns the reader for the TLS connection.
 func (s *POP3ProxySession) startTLSWithBackend(reader *bufio.Reader, tlsConfig *tls.Config, timeout time.Duration) (*bufio.Reader, error) {
@@ -859,7 +869,7 @@ func (s *POP3ProxySession) startTLSWithBackend(reader *bufio.Reader, tlsConfig *
 	if err != nil {
 		return nil, fmt.Errorf("reading the STLS response: %w", err)
 	}
-	if !strings.HasPrefix(resp, "+OK") {
+	if !isPositiveResponse(resp) {
 		return nil, fmt.Errorf("backend refused STLS: %s", strings.TrimSpace(resp))
 	}
 	// Bytes already buffered came in plaintext after the +OK, where anyone on the path

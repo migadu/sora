@@ -1175,25 +1175,10 @@ func (s *Session) connectToBackend() error {
 		}
 	}
 
-	// Check if we need to negotiate StartTLS with the backend
-	// This happens when remotelookup (or global config) specifies remote_tls_use_starttls
-	shouldUseStartTLS := false
-	var tlsConfig *tls.Config
-
-	if s.routingInfo.UsesRouteSettings(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
-		// The route specified StartTLS (for the backend the lookup named or its pool picked, as for the dial)
-		shouldUseStartTLS = true
-		tlsConfig = s.server.connManager.BackendClientTLSForConn(s.routingInfo.RemoteTLSVerify, actualAddr, s.backendConn)
-		s.DebugLog("Using remotelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
-	} else if !s.routingInfo.PoolRouted() && s.server.connManager.IsRemoteStartTLS() {
-		// Global proxy config specified StartTLS. A pool's own settings are authoritative:
-		// a pool without remote_tls_use_starttls never inherits the server's.
-		shouldUseStartTLS = true
-		tlsConfig = s.server.connManager.GetTLSConfigForConn(actualAddr, s.backendConn)
-		s.DebugLog("Using global StartTLS settings")
-	}
-
-	if shouldUseStartTLS && tlsConfig != nil {
+	// remote_tls_use_starttls: the connection manager dialed plaintext and left the upgrade
+	// to us. Whether this connection needs it is asked of the settings the dial used
+	// (the route's or the proxy's own), so the two cannot disagree.
+	if tlsConfig := s.server.connManager.BackendStartTLSConfig(s.routingInfo, actualAddr, s.backendConn); tlsConfig != nil {
 		s.DebugLog("Negotiating StartTLS with backend", "backend", actualAddr, "insecure_skip_verify", tlsConfig.InsecureSkipVerify)
 
 		// Send STARTTLS command
@@ -1216,12 +1201,31 @@ func (s *Session) connectToBackend() error {
 			return fmt.Errorf("backend STARTTLS failed: %s", strings.TrimSpace(response))
 		}
 
-		// Upgrade connection to TLS
+		// Bytes already buffered came in plaintext after the 220, where anyone on the path
+		// could have put them. The reader replaced below would drop them; a stream that
+		// broke the protocol there fails the connection instead (cf. CVE-2011-0411).
+		if s.backendReader.Buffered() > 0 {
+			s.backendConn.Close()
+			return errors.New("backend sent data after its STARTTLS response")
+		}
+
+		// Upgrade connection to TLS. readBackendLine cleared its deadline, so the
+		// handshake gets its own: a backend that never answers must not hold the session.
+		if timeout := s.server.connManager.GetConnectTimeout(); timeout > 0 {
+			if err := s.backendConn.SetDeadline(time.Now().Add(timeout)); err != nil {
+				s.backendConn.Close()
+				return fmt.Errorf("failed to set the STARTTLS handshake deadline: %w", err)
+			}
+		}
 		tlsConn := tls.Client(s.backendConn, tlsConfig)
 		err = tlsConn.Handshake()
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("TLS handshake with backend failed: %w", err)
+		}
+		if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+			s.backendConn.Close()
+			return fmt.Errorf("failed to clear the STARTTLS handshake deadline: %w", err)
 		}
 
 		s.DebugLog("StartTLS negotiation successful with backend", "backend", actualAddr)
