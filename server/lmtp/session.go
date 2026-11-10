@@ -975,14 +975,18 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			// User.Address is the script owner's primary address, even for aliases.
 			// Replace earlier or sender-supplied attribution on the outgoing copy only.
 			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
-			err := s.sendToExternalRelay(s.sender.FullAddress(), result.RedirectTo, relayBytes)
-			if err != nil {
-				s.DebugLog("error enqueuing redirected message, falling back to inbox", "error", err)
-				// Continue processing even if queue fails, store in INBOX as fallback
-			} else {
-				s.DebugLog("successfully queued message for relay delivery", "redirect_to", result.RedirectTo)
-
-				// If :copy is not specified and relay succeeded, we don't store the message locally
+			relayed := true
+			for _, redirectTo := range result.RedirectTo {
+				if err := s.sendToExternalRelay(s.sender.FullAddress(), redirectTo, relayBytes); err != nil {
+					s.DebugLog("error enqueuing redirected message, falling back to inbox", "redirect_to", redirectTo, "error", err)
+					// Continue processing even if queue fails, store in INBOX as fallback
+					relayed = false
+					continue
+				}
+				s.DebugLog("successfully queued message for relay delivery", "redirect_to", redirectTo)
+			}
+			if relayed {
+				// If :copy is not specified and every relay succeeded, we don't store the message locally
 				if !result.Copy {
 					s.DebugLog("redirect without :copy - skipping local delivery")
 					recordMetrics("success")

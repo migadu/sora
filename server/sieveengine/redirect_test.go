@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 )
@@ -242,4 +243,95 @@ func TestRedirectRateLimitChargesWhatIsRelayed(t *testing.T) {
 			t.Errorf("nothing is relayed, but %d redirects were charged", ro.recordedN)
 		}
 	})
+}
+
+// countingRedirectOracle counts like the database does: every recorded redirect
+// shows up in the next count.
+type countingRedirectOracle struct{ recorded int }
+
+func (o *countingRedirectOracle) CountRedirectsSince(ctx context.Context, accountID int64, window time.Duration) (int, error) {
+	return o.recorded, nil
+}
+
+func (o *countingRedirectOracle) RecordRedirect(ctx context.Context, accountID int64) error {
+	o.recorded++
+	return nil
+}
+
+// A script may redirect to several addresses (RFC 5228 §2.10.4); the result
+// carries each one once, in script order (#230).
+func TestMultipleRedirects(t *testing.T) {
+	tests := []struct {
+		name         string
+		script       string
+		limit        int
+		want         []string
+		wantCopy     bool
+		wantRecorded int
+	}{
+		{
+			name:         "every address is carried",
+			script:       `redirect "one@example.com"; redirect "two@example.org"; redirect "three@example.net";`,
+			limit:        100,
+			want:         []string{"one@example.com", "two@example.org", "three@example.net"},
+			wantRecorded: 3,
+		},
+		{
+			name:         "copy keeps the message too",
+			script:       `require "copy"; redirect :copy "one@example.com"; redirect :copy "two@example.org";`,
+			limit:        100,
+			want:         []string{"one@example.com", "two@example.org"},
+			wantCopy:     true,
+			wantRecorded: 2,
+		},
+		{
+			name:         "one redirect without copy cancels the keep",
+			script:       `require "copy"; redirect :copy "one@example.com"; redirect "two@example.org";`,
+			limit:        100,
+			want:         []string{"one@example.com", "two@example.org"},
+			wantRecorded: 2,
+		},
+		{
+			name:         "a repeated address is carried once",
+			script:       `redirect "one@example.com"; redirect "two@example.org"; redirect "one@example.com";`,
+			limit:        100,
+			want:         []string{"one@example.com", "two@example.org"},
+			wantRecorded: 2,
+		},
+		{
+			name:         "a malformed address does not stop the others",
+			script:       `redirect "not-an-address"; redirect "two@example.org";`,
+			limit:        100,
+			want:         []string{"two@example.org"},
+			wantRecorded: 1,
+		},
+		{
+			name:         "the rate limit cuts off within one message",
+			script:       `redirect "one@example.com"; redirect "two@example.org"; redirect "three@example.net";`,
+			limit:        2,
+			want:         []string{"one@example.com", "two@example.org"},
+			wantRecorded: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ro := &countingRedirectOracle{}
+			res, err := evalRedirectScript(t, tt.script, ro, tt.limit)
+			if err != nil {
+				t.Fatalf("evaluate: %v", err)
+			}
+			if res.Action != ActionRedirect {
+				t.Fatalf("expected redirect, got %s", res.Action)
+			}
+			if !slices.Equal(res.RedirectTo, tt.want) {
+				t.Errorf("RedirectTo = %v, want %v", res.RedirectTo, tt.want)
+			}
+			if res.Copy != tt.wantCopy {
+				t.Errorf("Copy = %v, want %v", res.Copy, tt.wantCopy)
+			}
+			if ro.recorded != tt.wantRecorded {
+				t.Errorf("charged %d redirects, want %d", ro.recorded, tt.wantRecorded)
+			}
+		})
+	}
 }

@@ -67,7 +67,7 @@ func TestKeepDefaultActionPreservesDefaultVacation(t *testing.T) {
 				if merged.Vacation != wantReply {
 					t.Errorf("vacation = %+v, want %+v", merged.Vacation, wantReply)
 				}
-				if merged.Action != defaultResult.Action || merged.Mailbox != defaultResult.Mailbox || merged.RedirectTo != defaultResult.RedirectTo {
+				if merged.Action != defaultResult.Action || merged.Mailbox != defaultResult.Mailbox || !slices.Equal(merged.RedirectTo, defaultResult.RedirectTo) {
 					t.Errorf("user keep changed the default action: %+v", merged)
 				}
 				if want := []string{"defaulttag", "usertag"}; !slices.Equal(merged.Flags, want) {
