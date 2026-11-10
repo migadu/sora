@@ -3,10 +3,7 @@
 package pop3proxy_test
 
 import (
-	"bufio"
 	"context"
-	"fmt"
-	"net"
 	"strings"
 	"testing"
 	"time"
@@ -18,12 +15,13 @@ import (
 	"github.com/migadu/sora/storage"
 )
 
-// TestPOP3ProxyPoolTLSIsImplicitTLS: one [[pool]] block serves every protocol, so a pool
-// that sets remote_tls_use_starttls for LMTP and ManageSieve also sets it for POP3. POP3
-// cannot STARTTLS to a backend: for it remote_tls still means TLS from the first byte. A
-// TLS-only backend proves it, since a plaintext leg would wait forever for a greeting the
-// backend only sends inside TLS (and would carry the master credentials in the clear).
-func TestPOP3ProxyPoolTLSIsImplicitTLS(t *testing.T) {
+// TestPOP3ProxyPoolTLSModes: one [[pool]] block serves every protocol, and the POP3 proxy
+// honours its remote_tls_use_starttls like LMTP and ManageSieve. Against a backend that
+// only speaks implicit TLS, a pool with remote_tls logs in over TLS from the first byte,
+// and one that adds remote_tls_use_starttls dials plaintext for its STLS, never gets the
+// greeting the backend only sends inside TLS, and refuses the login as a temporary
+// failure: it never falls back to sending the master credentials in the clear.
+func TestPOP3ProxyPoolTLSModes(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	rdb := common.SetupTestDatabase(t)
@@ -46,43 +44,38 @@ func TestPOP3ProxyPoolTLSIsImplicitTLS(t *testing.T) {
 	defer backend.Close()
 	time.Sleep(200 * time.Millisecond)
 
-	proxyAddr := common.GetRandomAddress(t)
-	p, err := pop3proxy.New(context.Background(), "localhost", proxyAddr, rdb, pop3proxy.POP3ProxyServerOptions{
-		Name: "test-proxy-pool-tls",
-		Pools: []proxy.PoolSpec{{Name: "tls", Backends: []string{backendAddr}, Default: true,
-			Settings: proxy.BackendSettings{TLS: true, TLSUseStartTLS: true, TLSVerify: false}}},
-		MasterSASLUsername: "proxyuser",
-		MasterSASLPassword: "proxypass",
-		InsecureAuth:       true,
-		ConnectTimeout:     3 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("pop3proxy.New: %v", err)
-	}
-	go func() { p.Start() }()
-	defer p.Stop()
-	time.Sleep(200 * time.Millisecond)
+	for _, c := range []struct {
+		name     string
+		settings proxy.BackendSettings
+		wantOK   bool
+	}{
+		{"remote_tls", proxy.BackendSettings{TLS: true}, true},
+		{"remote_tls_use_starttls", proxy.BackendSettings{TLS: true, TLSUseStartTLS: true}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			proxyAddr := common.GetRandomAddress(t)
+			p, err := pop3proxy.New(context.Background(), "localhost", proxyAddr, rdb, pop3proxy.POP3ProxyServerOptions{
+				Name:               "test-proxy-pool-tls",
+				Pools:              []proxy.PoolSpec{{Name: "tls", Backends: []string{backendAddr}, Default: true, Settings: c.settings}},
+				MasterSASLUsername: "proxyuser",
+				MasterSASLPassword: "proxypass",
+				InsecureAuth:       true,
+				ConnectTimeout:     3 * time.Second,
+			})
+			if err != nil {
+				t.Fatalf("pop3proxy.New: %v", err)
+			}
+			go func() { p.Start() }()
+			defer p.Stop()
+			time.Sleep(200 * time.Millisecond)
 
-	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
-	if err != nil {
-		t.Fatalf("dial proxy: %v", err)
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(20 * time.Second))
-	reader := bufio.NewReader(conn)
-	if resp, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(resp, "+OK") {
-		t.Fatalf("greeting: %q, %v", resp, err)
-	}
-	fmt.Fprintf(conn, "USER %s\r\n", account.Email)
-	if resp, _ := reader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
-		t.Fatalf("USER: %q", resp)
-	}
-	fmt.Fprintf(conn, "PASS %s\r\n", account.Password)
-	if resp, _ := reader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
-		t.Fatalf("PASS through the pool's TLS backend leg: %q (a plaintext leg never gets the backend's greeting)", resp)
-	}
-	fmt.Fprintf(conn, "STAT\r\n")
-	if resp, _ := reader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
-		t.Fatalf("STAT: %q", resp)
+			resp := pop3Login(t, proxyAddr, account)
+			if c.wantOK && !strings.HasPrefix(resp, "+OK") {
+				t.Fatalf("PASS through the pool's implicit-TLS backend leg: %q", resp)
+			}
+			if !c.wantOK && !strings.HasPrefix(resp, "-ERR [SYS/TEMP]") {
+				t.Fatalf("PASS through a STLS pool whose backend only speaks implicit TLS = %q, want a temporary failure", resp)
+			}
+		})
 	}
 }

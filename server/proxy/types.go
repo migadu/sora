@@ -72,7 +72,7 @@ var (
 // unnamed pool a flat remote_addrs list becomes uses the proxy server's.
 type BackendSettings struct {
 	TLS              bool
-	TLSUseStartTLS   bool // LMTP/ManageSieve only
+	TLSUseStartTLS   bool // Dial plaintext; the proxy upgrades with its protocol's STARTTLS (BackendStartTLSConfig)
 	TLSVerify        bool
 	UseProxyProtocol bool
 	UseIDCommand     bool // IMAP only
@@ -112,10 +112,6 @@ type ManagerOptions struct {
 	RoutingLookup      UserRoutingLookup
 	ServerName         string
 	DisableHealthCheck bool
-	// ImplicitTLSOnly is set by proxies that cannot STARTTLS to a backend (IMAP, POP3): a
-	// pool's remote_tls_use_starttls is then ignored and remote_tls means implicit TLS, as
-	// those proxies already do with their own flat settings.
-	ImplicitTLSOnly bool
 }
 
 // PoolRouteLabel is the pool label of sora_proxy_pool_route_total for a route naming name
@@ -142,18 +138,7 @@ func poolRouteOutcome(err error) string {
 // flat-list one otherwise.
 func NewConnectionManagerFromOptions(o ManagerOptions) (*ConnectionManager, error) {
 	if len(o.Pools) > 0 {
-		pools := o.Pools
-		if o.ImplicitTLSOnly {
-			// remote_tls_use_starttls is for the protocols that can upgrade a backend
-			// connection (LMTP, ManageSieve). For the others remote_tls means TLS from the
-			// first byte; dialed with the flag, their backend leg would stay plaintext.
-			pools = make([]PoolSpec, len(o.Pools))
-			for i, p := range o.Pools {
-				p.Settings.TLSUseStartTLS = false
-				pools[i] = p
-			}
-		}
-		return NewConnectionManagerWithPools(pools, o.RemotePort, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+		return NewConnectionManagerWithPools(o.Pools, o.RemotePort, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
 	}
 	return NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(o.RemoteAddrs, o.RemotePort, o.Settings.TLS, o.Settings.TLSUseStartTLS, o.Settings.TLSVerify, o.Settings.UseProxyProtocol, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
 }
@@ -201,7 +186,7 @@ type UserRoutingInfo struct {
 	ActualEmail            string   // Actual email address for backend impersonation
 	FromCache              bool     // Whether this result came from remotelookup cache
 	RemoteTLS              bool     // Use TLS for backend connection
-	RemoteTLSUseStartTLS   bool     // Use STARTTLS (LMTP/ManageSieve only)
+	RemoteTLSUseStartTLS   bool     // Use STARTTLS after the greeting instead of implicit TLS
 	RemoteTLSVerify        bool     // Verify backend TLS certificate
 	RemoteUseProxyProtocol bool     // Use PROXY protocol for backend connection
 	RemoteUseIDCommand     bool     // Use IMAP ID command (IMAP only)
