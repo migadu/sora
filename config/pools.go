@@ -135,7 +135,9 @@ func (c *Config) ValidatePools() error {
 		}
 	}
 
-	for _, s := range c.DynamicServers {
+	// Match the startup path: inactive stanzas are retained in the file, but
+	// do not constrain the backend pools used by the servers that will run.
+	for _, s := range c.GetAllServers() {
 		if !strings.HasSuffix(s.Type, "_proxy") {
 			continue
 		}
