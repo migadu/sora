@@ -616,7 +616,9 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 			canon = flag
 			canonical[foldKeyword(flag)] = flag
 		}
-		if !contains(customFlags, canon) {
+		// Compare against the message's own keywords case-insensitively: the
+		// mailbox registry (custom_flags_cache) may not list them.
+		if !slices.ContainsFunc(customFlags, func(cf string) bool { return foldKeyword(cf) == foldKeyword(canon) }) {
 			customFlags = append(customFlags, canon)
 		}
 	}
@@ -626,11 +628,7 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 			newFlags &^= stringFlagToBitwise(flag)
 			continue
 		}
-		canon := flag
-		if c, ok := canonical[foldKeyword(flag)]; ok {
-			canon = c
-		}
-		customFlags = removeString(customFlags, canon)
+		customFlags = slices.DeleteFunc(customFlags, func(cf string) bool { return foldKeyword(cf) == foldKeyword(flag) })
 	}
 
 	// RFC 9979 §4: one explicitly added attachment keyword replaces its
@@ -862,23 +860,4 @@ func stringFlagToBitwise(flag string) int {
 	default:
 		return 0
 	}
-}
-
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
-}
-
-func removeString(slice []string, item string) []string {
-	var result []string
-	for _, s := range slice {
-		if s != item {
-			result = append(result, s)
-		}
-	}
-	return result
 }
