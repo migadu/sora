@@ -1109,7 +1109,10 @@ func (c SharedMailboxesConfig) InNamespace(name string) bool {
 	if !c.Enabled {
 		return false
 	}
-	return strings.HasPrefix(name, c.NamespacePrefix) || name == strings.TrimSuffix(c.NamespacePrefix, "/")
+	// Sora resolves every mailbox name case-insensitively. Classification must
+	// use that same rule, or a case variant can bypass shared namespace policy.
+	name, prefix := strings.ToLower(name), strings.ToLower(c.NamespacePrefix)
+	return strings.HasPrefix(name, prefix) || name == strings.TrimSuffix(prefix, "/")
 }
 
 // AdminCLIConfig holds configuration for sora-admin CLI tool
@@ -1511,12 +1514,16 @@ func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
 	}
 }
 
-// GetAbsoluteSessionTimeout parses the absolute session timeout duration (default: 24 hours for all protocols)
+// GetAbsoluteSessionTimeout parses the absolute session timeout duration.
+// Delivery proxy connections default to 5 minutes; other protocols use 24 hours.
 func (s *ServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
 	if s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != "" {
 		return helpers.ParseDuration(s.Timeouts.AbsoluteSessionTimeout)
 	}
-	return 24 * time.Hour, nil // Default: 24 hours for all protocols
+	if s.Type == "lmtp_proxy" {
+		return 5 * time.Minute, nil
+	}
+	return 24 * time.Hour, nil
 }
 
 // GetCommandTimeoutsOverrides returns a map of command name to timeout duration

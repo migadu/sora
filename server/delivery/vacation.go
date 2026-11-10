@@ -198,6 +198,8 @@ func (h *StandardVacationHandler) HandleVacationResponse(ctx context.Context, Ac
 	// "bulk" is what Pigeonhole sends on every vacation reply.
 	msgHeader.Set("Precedence", "bulk")
 	msgHeader.Set("X-Auto-Response-Suppress", "All")
+	// Attribute the script to its owning account even when :from selects an alias.
+	msgHeader.Set(helpers.RedirectedByHeader, toAddress.FullAddress())
 	msgHeader.Set("Date", time.Now().Format(time.RFC1123Z))
 
 	// MessageID() and MsgIDList() return bare ids; In-Reply-To/References msg-ids

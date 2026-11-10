@@ -3,11 +3,15 @@
 package imap
 
 import (
+	"bytes"
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	imapClient "github.com/emersion/go-imap/v2/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/stretchr/testify/assert"
@@ -62,6 +66,23 @@ func TestSharedMailboxE2E(t *testing.T) {
 	// Test 2: Grant ACL via sora-admin command
 	soraAdminBin := common.GetSoraAdminBinary(t)
 	configPath := common.GetTestConfigPath(t)
+	// The real CLI must use the same isolated database as the server fixture.
+	if databaseName := os.Getenv("SORA_TEST_DB_NAME"); databaseName != "" {
+		base, err := os.ReadFile(configPath)
+		require.NoError(t, err)
+		var settings map[string]any
+		_, err = toml.Decode(string(base), &settings)
+		require.NoError(t, err)
+		for _, key := range []string{"write", "read"} {
+			if endpoint, ok := settings["database"].(map[string]any)[key].(map[string]any); ok {
+				endpoint["name"] = databaseName
+			}
+		}
+		var encoded bytes.Buffer
+		require.NoError(t, toml.NewEncoder(&encoded).Encode(settings))
+		configPath = filepath.Join(t.TempDir(), "sora-admin.toml")
+		require.NoError(t, os.WriteFile(configPath, encoded.Bytes(), 0o600))
+	}
 
 	t.Run("GrantACLViaSoraAdmin", func(t *testing.T) {
 		// Run sora-admin acl grant command

@@ -570,6 +570,9 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 				c.OK(msg)
 			} else {
 				c.Err(msg)
+				// A forwarding loop is terminal: a proxy must not continue to
+				// authenticate on a connection whose hop budget is exhausted.
+				return true, msg == xclientTTLExpired
 			}
 			return true, false
 		},
