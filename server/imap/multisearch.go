@@ -61,7 +61,12 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 	if !acquired {
 		return nil, s.internalError("failed to acquire lock for multisearch")
 	}
-	criteria = s.decodeSearchCriteriaWithSeqNumsLocked(criteria, false)
+	// "$" holds UIDs of the selected mailbox, so it names no message in any other.
+	var selectedMailboxID int64
+	if s.selectedMailbox != nil {
+		selectedMailboxID = s.selectedMailbox.ID
+	}
+	savedSearchUIDs := s.savedSearchResultLocked()
 	release()
 
 	var results []*imap.SearchData
@@ -86,7 +91,11 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 		// mbox.AccountID, never the session accountID above: for a shared mailbox the FTS
 		// rows belong to the owner. No message count is available per mailbox here, so 0
 		// selects the default (per-message probe) query shape.
-		mboxCriteria, err := s.withSessionRecent(criteria, mbox.ID)
+		mboxSaved := imap.UIDSet{}
+		if mbox.ID == selectedMailboxID {
+			mboxSaved = savedSearchUIDs
+		}
+		mboxCriteria, err := s.withSessionRecent(searchResAsUIDs(criteria, mboxSaved), mbox.ID)
 		if err != nil {
 			return nil, err
 		}
