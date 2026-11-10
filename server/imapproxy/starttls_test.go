@@ -185,3 +185,21 @@ func TestSTARTTLSOmitsPlaintextTimeoutDuringHandshake(t *testing.T) {
 		t.Fatalf("timeout did not close connection: %v", err)
 	}
 }
+
+// A notice that already took a snapshot of the plaintext writer owns writeMu.
+// STARTTLS must wait for it to finish before sending its success response.
+func TestSTARTTLSWaitsForPriorNoticeBeforeAcknowledgingUpgrade(t *testing.T) {
+	sess, conn, r, _ := startSTARTTLSSession(t)
+	sess.writeMu.Lock()
+	io.WriteString(conn, "s STARTTLS\r\n")
+	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	line, err := r.ReadString('\n')
+	sess.writeMu.Unlock()
+	if len(line) != 0 || err == nil {
+		t.Fatalf("acknowledged upgrade while a plaintext notice could still write: %q, %v", line, err)
+	}
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	if line := readLine(t, r); line != "s OK Begin TLS negotiation now" {
+		t.Fatal(line)
+	}
+}
