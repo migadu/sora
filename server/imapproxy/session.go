@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -1350,12 +1351,78 @@ func (s *Session) connectToBackend() error {
 		return fmt.Errorf("unexpected backend greeting: %s", strings.TrimRight(greeting, "\r\n"))
 	}
 
+	// remote_tls_use_starttls: the connection manager dialed plaintext, and the upgrade
+	// must come before anything else is sent (ID forwarding carries the client's address,
+	// AUTHENTICATE the master credential).
+	if tlsConfig := s.server.connManager.BackendStartTLSConfig(s.routingInfo, actualAddr); tlsConfig != nil {
+		if err := s.startTLSWithBackend(tlsConfig, readTimeout); err != nil {
+			s.backendConn.Close()
+			s.ErrorLog("STARTTLS with backend failed", "backend", s.serverAddr, "error", err)
+			return fmt.Errorf("STARTTLS with backend: %w", err)
+		}
+	}
+
 	// Clear the read deadline after successful greeting
 	if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
 		s.WarnLog("failed to clear read deadline", "error", err)
 	}
 
 	return nil
+}
+
+// startTLSWithBackend upgrades the backend connection with STARTTLS (RFC 9051 §6.2.1),
+// within timeout, and republishes the connection, its reader and writer under mu.
+func (s *Session) startTLSWithBackend(tlsConfig *tls.Config, timeout time.Duration) error {
+	if err := s.backendConn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("setting the STARTTLS deadline: %w", err)
+	}
+	tag := fmt.Sprintf("s%d", rand.Intn(10000))
+	s.mu.Lock()
+	_, err := s.backendWriter.WriteString(tag + " STARTTLS\r\n")
+	if err == nil {
+		err = s.backendWriter.Flush()
+	}
+	s.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("sending STARTTLS: %w", err)
+	}
+	for i := 0; i < 32; i++ {
+		line, err := server.ReadBoundedLine(s.backendReader, 8192)
+		if err != nil {
+			return fmt.Errorf("reading the STARTTLS response: %w", err)
+		}
+		if strings.HasPrefix(line, "* ") {
+			continue // untagged response before the tagged reply
+		}
+		responseTag, rest, hasTag := strings.Cut(line, " ")
+		status, _, hasText := strings.Cut(rest, " ")
+		// Tags are exact; protocol status atoms are ASCII case-insensitive
+		// (RFC 9051 section 9). A prefix such as OKAY is not an OK status.
+		if !hasTag || responseTag != tag || !hasText || len(status) != 2 || !strings.EqualFold(status, "OK") {
+			return fmt.Errorf("backend refused STARTTLS: %s", strings.TrimSpace(line))
+		}
+		// Bytes already buffered came in plaintext after the OK, where anyone on the path
+		// could have put them. The reader replaced below would drop them; a stream that
+		// broke the protocol there fails the connection instead (cf. CVE-2011-0411).
+		if s.backendReader.Buffered() > 0 {
+			return errors.New("backend sent data after its STARTTLS response")
+		}
+		tlsConn := tls.Client(s.backendConn, tlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			return fmt.Errorf("TLS handshake: %w", err)
+		}
+		if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+			return fmt.Errorf("clearing the STARTTLS deadline: %w", err)
+		}
+		s.mu.Lock()
+		s.backendConn = tlsConn
+		s.backendReader = bufio.NewReader(tlsConn)
+		s.backendWriter = bufio.NewWriter(tlsConn)
+		s.mu.Unlock()
+		s.DebugLog("backend connection upgraded with STARTTLS", "backend", s.serverAddr)
+		return nil
+	}
+	return errors.New("no tagged STARTTLS response from backend")
 }
 
 // authenticateToBackend authenticates to the backend using master credentials.

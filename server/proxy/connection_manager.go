@@ -1275,6 +1275,30 @@ func (cm *ConnectionManager) IsRemoteStartTLS() bool {
 	return cm.remoteTLS && cm.remoteTLSUseStartTLS
 }
 
+// backendTLSSettings are the remote_tls, remote_tls_use_starttls and remote_tls_verify a
+// connection to addr uses: the route's for the backend the lookup named or a member of the
+// pool routing confined it to, else the manager's own. ConnectWithProxy dials by them and
+// BackendStartTLSConfig asks them again, so the two cannot disagree.
+func (cm *ConnectionManager) backendTLSSettings(routingInfo *UserRoutingInfo, addr string) (remoteTLS, useStartTLS, verify bool) {
+	if routingInfo.UsesRouteSettings(addr) {
+		return routingInfo.RemoteTLS, routingInfo.RemoteTLSUseStartTLS, routingInfo.RemoteTLSVerify
+	}
+	return cm.remoteTLS, cm.remoteTLSUseStartTLS, cm.remoteTLSVerify
+}
+
+// BackendStartTLSConfig returns the config the protocol layer upgrades a connection
+// ConnectWithProxy returned for addr with, by its protocol's STARTTLS, right after the
+// greeting: nil when that connection needs none (implicit TLS, which the dial did, or a
+// plaintext leg). ConnectWithProxy dials plaintext whenever it returns a config, so a
+// proxy that skips the upgrade then runs the leg in plaintext.
+func (cm *ConnectionManager) BackendStartTLSConfig(routingInfo *UserRoutingInfo, addr string) *tls.Config {
+	remoteTLS, useStartTLS, verify := cm.backendTLSSettings(routingInfo, addr)
+	if !remoteTLS || !useStartTLS {
+		return nil
+	}
+	return cm.BackendClientTLS(verify, addr)
+}
+
 // ConnectWithProxy attempts to connect to a remote server and sends PROXY protocol header
 func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (net.Conn, string, error) {
 	if !cm.MaintenanceLoaded() {
@@ -1830,18 +1854,13 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// Determine effective settings for this connection.
 	// Default to the connection manager's global settings.
 	useProxyProtocol := cm.remoteUseProxyProtocol
-	remoteTLS := cm.remoteTLS
-	remoteTLSUseStartTLS := cm.remoteTLSUseStartTLS
-	remoteTLSVerify := cm.remoteTLSVerify
+	remoteTLS, remoteTLSUseStartTLS, remoteTLSVerify := cm.backendTLSSettings(routingInfo, addr)
 
 	// A route carries its own backend-leg settings for the backend the remote lookup named,
 	// and for every member of the named pool routing confined it to (which stamped that
 	// pool's settings on it). Otherwise the proxy server's own settings apply.
 	if routingInfo.UsesRouteSettings(addr) {
 		useProxyProtocol = routingInfo.RemoteUseProxyProtocol
-		remoteTLS = routingInfo.RemoteTLS
-		remoteTLSUseStartTLS = routingInfo.RemoteTLSUseStartTLS
-		remoteTLSVerify = routingInfo.RemoteTLSVerify
 		logger.Debug("Using remotelookup settings", "addr", addr, "remoteTLS", remoteTLS, "remoteTLSUseStartTLS", remoteTLSUseStartTLS, "remoteTLSVerify", remoteTLSVerify, "useProxyProtocol", useProxyProtocol)
 	} else {
 		logger.Debug("Using global settings", "addr", addr, "remoteTLS", remoteTLS, "remoteTLSUseStartTLS", remoteTLSUseStartTLS, "remoteTLSVerify", remoteTLSVerify, "useProxyProtocol", useProxyProtocol)

@@ -16,12 +16,13 @@ import (
 	"github.com/migadu/sora/storage"
 )
 
-// TestIMAPProxyPoolTLSIsImplicitTLS: one [[pool]] block serves every protocol, so a pool
-// that sets remote_tls_use_starttls for LMTP and ManageSieve also sets it for IMAP. IMAP
-// cannot STARTTLS to a backend: for it remote_tls still means TLS from the first byte. A
-// TLS-only backend proves it, since a plaintext leg would wait forever for a greeting the
-// backend only sends inside TLS (and would carry the master credentials in the clear).
-func TestIMAPProxyPoolTLSIsImplicitTLS(t *testing.T) {
+// TestIMAPProxyPoolTLSModes: one [[pool]] block serves every protocol, and the IMAP proxy
+// honours its remote_tls_use_starttls like LMTP and ManageSieve. Against a backend that
+// only speaks implicit TLS, a pool with remote_tls logs in over TLS from the first byte,
+// and one that adds remote_tls_use_starttls dials plaintext for its STARTTLS, never gets
+// the greeting the backend only sends inside TLS, and refuses the login as a temporary
+// failure: it never falls back to sending the master credentials in the clear.
+func TestIMAPProxyPoolTLSModes(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	rdb := common.SetupTestDatabase(t)
 	user := common.CreateTestAccountWithEmail(t, rdb, fmt.Sprintf("pool-tls-%d@example.com", time.Now().UnixNano()), "pw")
@@ -53,10 +54,20 @@ func TestIMAPProxyPoolTLSIsImplicitTLS(t *testing.T) {
 
 	lookup, lookupURL := newPoolLookup(t)
 	lookup.set(user.Email, answer(t, user, "tls"))
-	proxyAddr := setupIMAPProxy(t, rdb, []proxy.PoolSpec{{Name: "tls", Backends: []string{backendAddr},
-		Settings: proxy.BackendSettings{TLS: true, TLSUseStartTLS: true, TLSVerify: false}}}, lookupURL, nil)
 
-	if err := imapLogin(t, proxyAddr, user); err != nil {
-		t.Fatalf("login through the pool's TLS backend leg: %v (a plaintext leg never gets the backend's greeting)", err)
-	}
+	t.Run("remote_tls", func(t *testing.T) {
+		proxyAddr := setupIMAPProxy(t, rdb, []proxy.PoolSpec{{Name: "tls", Backends: []string{backendAddr},
+			Settings: proxy.BackendSettings{TLS: true, TLSVerify: false}}}, lookupURL, nil)
+		if err := imapLogin(t, proxyAddr, user); err != nil {
+			t.Fatalf("login through the pool's implicit-TLS backend leg: %v", err)
+		}
+	})
+	t.Run("remote_tls_use_starttls", func(t *testing.T) {
+		proxyAddr := setupIMAPProxy(t, rdb, []proxy.PoolSpec{{Name: "tls", Backends: []string{backendAddr},
+			Settings: proxy.BackendSettings{TLS: true, TLSUseStartTLS: true, TLSVerify: false}}}, lookupURL, nil)
+		err := imapLogin(t, proxyAddr, user)
+		if err == nil || !strings.Contains(err.Error(), "UNAVAILABLE") {
+			t.Fatalf("login through a STARTTLS pool whose backend only speaks implicit TLS = %v, want a temporary failure", err)
+		}
+	})
 }

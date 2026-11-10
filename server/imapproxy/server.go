@@ -175,6 +175,7 @@ type ServerOptions struct {
 	TLSVerify                bool
 	TLSConfig                *tls.Config // Global TLS config from TLS manager (optional)
 	RemoteTLS                bool
+	RemoteTLSUseStartTLS     bool // Dial the backend in plaintext and upgrade with STARTTLS after its greeting (requires RemoteTLS)
 	RemoteTLSVerify          bool
 	RemoteUseProxyProtocol   bool
 	ConnectTimeout           time.Duration
@@ -268,12 +269,11 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		Pools:              opts.Pools,
 		RemoteAddrs:        opts.RemoteAddrs,
 		RemotePort:         opts.RemotePort,
-		Settings:           proxy.BackendSettings{TLS: opts.RemoteTLS, TLSVerify: opts.RemoteTLSVerify, UseProxyProtocol: opts.RemoteUseProxyProtocol},
+		Settings:           proxy.BackendSettings{TLS: opts.RemoteTLS, TLSUseStartTLS: opts.RemoteTLSUseStartTLS, TLSVerify: opts.RemoteTLSVerify, UseProxyProtocol: opts.RemoteUseProxyProtocol},
 		ConnectTimeout:     connectTimeout,
 		RoutingLookup:      routingLookup,
 		ServerName:         opts.Name,
 		DisableHealthCheck: !opts.EnableBackendHealthCheck,
-		ImplicitTLSOnly:    true, // no backend STARTTLS in IMAP: remote_tls is implicit TLS
 	})
 	if err != nil {
 		if routingLookup != nil {

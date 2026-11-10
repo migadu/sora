@@ -167,6 +167,7 @@ type POP3ProxyServerOptions struct {
 	Pools                    []proxy.PoolSpec // Named backend pools ([[pool]] blocks); when set, RemoteAddrs is unused and each pool brings its own backend-leg settings
 	RemotePort               int              // Default port for backends if not in address
 	RemoteTLS                bool
+	RemoteTLSUseStartTLS     bool // Dial the backend in plaintext and upgrade with STLS after its greeting (requires RemoteTLS)
 	RemoteTLSVerify          bool
 	RemoteTLSCAFile          string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
 	RemoteUseProxyProtocol   bool
@@ -250,12 +251,11 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		Pools:              options.Pools,
 		RemoteAddrs:        options.RemoteAddrs,
 		RemotePort:         options.RemotePort,
-		Settings:           proxy.BackendSettings{TLS: options.RemoteTLS, TLSVerify: options.RemoteTLSVerify, UseProxyProtocol: options.RemoteUseProxyProtocol},
+		Settings:           proxy.BackendSettings{TLS: options.RemoteTLS, TLSUseStartTLS: options.RemoteTLSUseStartTLS, TLSVerify: options.RemoteTLSVerify, UseProxyProtocol: options.RemoteUseProxyProtocol},
 		ConnectTimeout:     connectTimeout,
 		RoutingLookup:      routingLookup,
 		ServerName:         options.Name,
 		DisableHealthCheck: !options.EnableBackendHealthCheck,
-		ImplicitTLSOnly:    true, // no backend STARTTLS in POP3: remote_tls is implicit TLS
 	})
 	if err != nil {
 		if routingLookup != nil {
