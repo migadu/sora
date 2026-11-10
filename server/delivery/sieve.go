@@ -221,6 +221,9 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		if recipient.FromAddress != nil {
 			// Stamp the outgoing copy with an incremented hop count (loop backstop).
 			relayBytes := helpers.PrependHeaderLine(outcome.MessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(helpers.RedirectHopCount(helpers.HeaderGetter(outcome.MessageEntity.Header.Map()))+1))
+			// Attribute this redirect to the script owner, replacing any earlier or
+			// sender-supplied attribution. Aliases still use the account's primary address.
+			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, recipient.Address.FullAddress())
 			// Try immediate delivery first if queue is not configured
 			if s.RelayQueue == nil && s.RelayHandler != nil {
 				err := s.RelayHandler.SendToExternalRelay(recipient.FromAddress.FullAddress(), result.RedirectTo, relayBytes)
