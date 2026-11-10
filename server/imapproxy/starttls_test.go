@@ -18,6 +18,11 @@ import (
 // listener's is, and returns the client end with the greeting read.
 func startSTARTTLSSession(t *testing.T) (*Session, net.Conn, *bufio.Reader, string) {
 	t.Helper()
+	return startSTARTTLSSessionWithConfig(t, server.SoraConnConfig{Protocol: "imap_proxy"})
+}
+
+func startSTARTTLSSessionWithConfig(t *testing.T, connConfig server.SoraConnConfig) (*Session, net.Conn, *bufio.Reader, string) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	cert, err := tls.LoadX509KeyPair("../../testdata/sora.crt", "../../testdata/sora.key")
@@ -38,7 +43,7 @@ func startSTARTTLSSession(t *testing.T) (*Session, net.Conn, *bufio.Reader, stri
 	srv.settings.Store(&reloadableSettings{maxAuthErrors: 5, authIdleTimeout: 5 * time.Second})
 
 	serverEnd, client := net.Pipe()
-	sess := newSession(srv, server.NewSoraConn(serverEnd, server.SoraConnConfig{Protocol: "imap_proxy"}))
+	sess := newSession(srv, server.NewSoraConn(serverEnd, connConfig))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -146,5 +151,37 @@ func TestSTARTTLSRecordsJA4OnTheListenerConn(t *testing.T) {
 	ja4, _ := sess.listenerConn.(interface{ GetJA4Fingerprint() (string, error) }).GetJA4Fingerprint()
 	if !strings.HasPrefix(ja4, "t13") {
 		t.Errorf("JA4 on the listener's SoraConn = %q, want a TLS 1.3 fingerprint", ja4)
+	}
+}
+
+func TestSTARTTLSOmitsPlaintextShutdownDuringHandshake(t *testing.T) {
+	sess, conn, r, _ := startSTARTTLSSession(t)
+	io.WriteString(conn, "s STARTTLS\r\n")
+	if line := readLine(t, r); line != "s OK Begin TLS negotiation now" {
+		t.Fatal(line)
+	}
+	go sess.sendBye("* BYE Server shutting down, please reconnect\r\n")
+	conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	line, _ := r.ReadString('\n')
+	if len(line) != 0 {
+		t.Fatalf("plaintext after positive STARTTLS response: %q", line)
+	}
+}
+
+func TestSTARTTLSOmitsPlaintextTimeoutDuringHandshake(t *testing.T) {
+	_, conn, r, _ := startSTARTTLSSessionWithConfig(t, server.SoraConnConfig{
+		Protocol: "imap_proxy", IdleTimeout: 100 * time.Millisecond, EnableTimeoutChecker: true,
+		OnTimeout: func(c net.Conn, _ string) { io.WriteString(c, "* BYE Idle timeout\r\n") },
+	})
+	io.WriteString(conn, "s STARTTLS\r\n")
+	if line := readLine(t, r); line != "s OK Begin TLS negotiation now" {
+		t.Fatal(line)
+	}
+	got, err := io.ReadAll(r)
+	if len(got) != 0 {
+		t.Fatalf("plaintext after positive STARTTLS response: %q", got)
+	}
+	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatalf("timeout did not close connection: %v", err)
 	}
 }

@@ -178,8 +178,9 @@ func (s *Session) sendBye(bye string) {
 	}
 	s.mu.Lock()
 	conn := s.clientConn
+	upgrading := s.startTLSInProgress
 	s.mu.Unlock()
-	if conn == nil {
+	if conn == nil || upgrading {
 		return
 	}
 	// Bounded: a client that stopped reading must not hold this goroutine. The session

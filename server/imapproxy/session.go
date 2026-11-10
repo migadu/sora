@@ -29,6 +29,7 @@ import (
 type Session struct {
 	server                *Server
 	settings              *reloadableSettings // the server's settings when the session started (see reloadableSettings)
+	startTLSInProgress    bool                // Protected by mu; asynchronous notices are omitted during negotiation
 	clientConn            net.Conn            // The client transport: listenerConn, or the TLS conn above it after STARTTLS (reassigned under mu)
 	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4, username and timeouts
 	backendConn           net.Conn            // Reassigned on backend connect/error; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
@@ -700,6 +701,12 @@ func (s *Session) handleStartTLS(tag string, args []string) bool {
 	if s.clientReader.Buffered() > 0 {
 		return !s.handleAuthError(fmt.Sprintf("%s BAD STARTTLS must be the last command sent before TLS negotiation", tag))
 	}
+	// Stop asynchronous plaintext notices before acknowledging the upgrade.
+	// The TLS connection is not published until HandshakeContext succeeds.
+	s.mu.Lock()
+	s.startTLSInProgress = true
+	s.mu.Unlock()
+	server.SetTimeoutNoticeConn(s.listenerConn, func() net.Conn { return nil })
 	if err := s.sendResponse(fmt.Sprintf("%s OK Begin TLS negotiation now", tag)); err != nil {
 		return false
 	}
@@ -721,6 +728,7 @@ func (s *Session) handleStartTLS(tag string, args []string) bool {
 	// from other goroutines.
 	s.mu.Lock()
 	s.clientConn = tlsConn
+	s.startTLSInProgress = false
 	s.clientReader = bufio.NewReader(tlsConn)
 	s.clientWriter = bufio.NewWriter(tlsConn)
 	s.mu.Unlock()
