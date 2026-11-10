@@ -11,6 +11,8 @@ import (
 )
 
 func (s *IMAPSession) Delete(ctx context.Context, mboxName string) error {
+	ctx = s.pinnedContext(ctx)
+
 	// First phase: Read-only validation with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {

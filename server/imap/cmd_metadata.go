@@ -14,6 +14,8 @@ import (
 // GetMetadata implements the GETMETADATA command (RFC 5464).
 // If mailbox is empty string "", retrieves server metadata.
 func (s *IMAPSession) GetMetadata(ctx context.Context, mailbox string, entries []string, options *imap.GetMetadataOptions) (*imap.GetMetadataData, error) {
+	ctx = s.pinnedContext(ctx)
+
 	s.DebugLog("GETMETADATA command", "mailbox", mailbox, "entries", entries)
 
 	// RFC 5464 does not support wildcard mailbox names in GETMETADATA
@@ -99,6 +101,8 @@ func (s *IMAPSession) GetMetadata(ctx context.Context, mailbox string, entries [
 // If mailbox is empty string "", sets server metadata.
 // To remove an entry, set its value to nil.
 func (s *IMAPSession) SetMetadata(ctx context.Context, mailbox string, entries map[string]*[]byte) error {
+	ctx = s.pinnedContext(ctx)
+
 	// Canonicalise (case-fold) entry names first so the case-insensitivity rule
 	// (RFC 5464 §3.1) is honoured for storage AND for the /private-vs-/shared
 	// scope classification below — otherwise a /SHARED/... spelling would be

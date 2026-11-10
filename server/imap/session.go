@@ -203,6 +203,16 @@ func (s *IMAPSession) applyCapabilityFilters() {
 	}
 }
 
+// pinnedContext returns ctx marked to read from the master DB when the session is
+// pinned to it (a write earlier in the session), so the command reads its own
+// session's writes rather than a lagging read replica.
+func (s *IMAPSession) pinnedContext(ctx context.Context) context.Context {
+	if s.useMasterDB.Load() {
+		return context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
+	return ctx
+}
+
 func (s *IMAPSession) internalError(format string, a ...any) *imap.Error {
 	// Format the error message once
 	errorText := fmt.Sprintf(format, a...)

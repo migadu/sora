@@ -10,6 +10,8 @@ import (
 )
 
 func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet imap.NumSet, dest string) error {
+	ctx = s.pinnedContext(ctx)
+
 	// First, safely read necessary session state
 	var selectedMailboxID int64
 	var decodedNumSet imap.NumSet

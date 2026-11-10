@@ -9,6 +9,8 @@ import (
 )
 
 func (s *IMAPSession) Expunge(ctx context.Context, w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) error {
+	ctx = s.pinnedContext(ctx)
+
 	// First phase: Read session state with simple read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {

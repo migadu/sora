@@ -14,6 +14,8 @@ import (
 )
 
 func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName string) (*imap.CopyData, error) {
+	ctx = s.pinnedContext(ctx)
+
 	// First phase: Read session state with read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {

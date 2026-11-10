@@ -12,7 +12,7 @@ import (
 func (d *Database) CountMessagesGreaterThanUID(ctx context.Context, mailboxID int64, minUID imap.UID) (uint32, error) {
 	var count uint32
 	query := `SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND uid > $2 AND expunged_at IS NULL`
-	err := d.GetReadPool().QueryRow(ctx, query, mailboxID, minUID).Scan(&count)
+	err := d.GetReadPoolWithContext(ctx).QueryRow(ctx, query, mailboxID, minUID).Scan(&count)
 	if err != nil {
 		// The pgx driver's default logger will log the error.
 		return 0, fmt.Errorf("CountMessagesGreaterThanUID: failed for mailbox %d, minUID %d: %w", mailboxID, minUID, err)
