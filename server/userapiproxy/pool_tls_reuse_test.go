@@ -138,12 +138,7 @@ func TestUserAPITLSReuseStaysWithPoolAfterDNSOwnershipChange(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() {
-				s.cancel()
-				for _, tr := range s.transports {
-					tr.CloseIdleConnections()
-				}
-			})
+			t.Cleanup(func() { _ = s.Stop() })
 			s.routingLookup = &poolTransferLookup{}
 			handler := s.setupHandler()
 			firstDone := make(chan int, 1)

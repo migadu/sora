@@ -35,6 +35,7 @@ const (
 	clientIPKey      contextKey = "client-ip"
 	clientPortKey    contextKey = "client-port"
 	proxyProtocolKey contextKey = "proxy-protocol" // bool: whether this request's backend gets a PROXY header
+	backendRouteKey  contextKey = "backend-route"
 )
 
 // JWTClaims represents the JWT token claims (must match userapi.JWTClaims)
@@ -82,12 +83,15 @@ type Server struct {
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
 
-	// Shared HTTP transport (prevents connection pool leaks), verifying backend certificates
-	// as the server's remote_tls_verify says. transports holds one per verify setting, so a
-	// route's own remote_tls_verify is honored (proxyRequest); the roots and name follow the
-	// backend dialed (proxy.BackendClientTLS).
-	transport  *http.Transport
-	transports map[bool]*http.Transport
+	// Base transports retain the server's dial policy. Proxied requests use a
+	// bounded cache partitioned by pool, verification policy and DNS snapshot;
+	// no reused connection can silently acquire another pool's trust identity.
+	transport         *http.Transport
+	transports        map[bool]*http.Transport
+	newTransport      func(bool) *http.Transport
+	transportMu       sync.Mutex
+	poolTransports    map[backendTransportKey]*http.Transport
+	transportSnapshot uint64
 
 	// PROXY protocol support for incoming connections
 	proxyReader *server.ProxyProtocolReader
@@ -230,18 +234,20 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		}
 	}
 
-	// Shared HTTP transports (reused for all proxied requests to prevent connection pool
-	// leaks): one that verifies backend certificates and one that does not, so a route can
-	// use its own pool's remote_tls_verify. A backend host is in one pool only, so the
-	// connections each keeps alive are never shared between two settings for one host.
+	// Dial callbacks use each request's immutable route binding. Connection reuse
+	// is separately partitioned by pool and DNS snapshot in transportFor.
 	dialBackend := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		conn, err := (&net.Dialer{
+		dial := (&net.Dialer{
 			Timeout:   connectTimeout,
 			KeepAlive: 30 * time.Second,
 			// Routing skips backends in maintenance; this refuses the address
 			// actually dialed, whatever name led to it.
 			Control: connManager.RefuseMaintenanceDial,
-		}).DialContext(ctx, network, addr)
+		}).DialContext
+		if route, ok := ctx.Value(backendRouteKey).(*proxy.BackendRoute); ok {
+			dial = route.DialContext
+		}
+		conn, err := dial(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
@@ -284,7 +290,11 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 				if err != nil {
 					return nil, err
 				}
-				tlsConn := tls.Client(conn, connManager.BackendClientTLS(verify, addr))
+				cfg := connManager.BackendClientTLSForConn(verify, addr, conn)
+				if route, ok := ctx.Value(backendRouteKey).(*proxy.BackendRoute); ok {
+					cfg = route.TLSConfig(verify, conn)
+				}
+				tlsConn := tls.Client(conn, cfg)
 				handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 				defer cancel()
 				if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
@@ -302,11 +312,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	}
 	transports := map[bool]*http.Transport{true: newTransport(true), false: newTransport(false)}
 	transport := transports[opts.RemoteTLSVerify]
-	for _, t := range transports {
-		// A kept-alive connection is reused without a dial, so past the dial's maintenance
-		// check: drop the idle ones whenever the maintenance list changes.
-		connManager.OnMaintenanceChange(t.CloseIdleConnections)
-	}
 
 	// Initialize PROXY protocol reader if enabled
 	var proxyReader *server.ProxyProtocolReader
@@ -393,11 +398,14 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		limiter:                    limiter,
 		transport:                  transport,
 		transports:                 transports,
+		newTransport:               newTransport,
+		poolTransports:             make(map[backendTransportKey]*http.Transport),
 		proxyReader:                proxyReader,
 		ctx:                        ctx,
 		cancel:                     cancel,
 		connReleases:               make(map[net.Conn]func()),
 	}
+	connManager.OnMaintenanceChange(s.closeBackendIdleConnections)
 	s.settings.Store(&reloadableSettings{jwtSecret: opts.JWTSecret})
 	return s, nil
 }
@@ -637,6 +645,7 @@ func (s *Server) peekAuthIdentity(r *http.Request) (string, int64, error) {
 // remote_addrs list) uses the proxy server's own, as before pools.
 type backendRoute struct {
 	addr          string
+	pool          string
 	tls           bool
 	tlsVerify     bool
 	proxyProtocol bool
@@ -647,17 +656,21 @@ func (s *Server) poolRoute(addr string, pool proxy.PoolInfo) backendRoute {
 	if !pool.Named {
 		return s.serverRoute(addr)
 	}
-	return backendRoute{addr: addr, tls: pool.Settings.TLS, tlsVerify: pool.Settings.TLSVerify, proxyProtocol: pool.Settings.UseProxyProtocol}
+	return backendRoute{addr: addr, pool: pool.Name, tls: pool.Settings.TLS, tlsVerify: pool.Settings.TLSVerify, proxyProtocol: pool.Settings.UseProxyProtocol}
 }
 
 // serverRoute is a route to addr with the proxy server's own backend-leg settings.
 func (s *Server) serverRoute(addr string) backendRoute {
-	return backendRoute{addr: addr, tls: s.remoteTLS, tlsVerify: s.remoteTLSVerify, proxyProtocol: s.remoteUseProxyProtocol}
+	pool := ""
+	if s.connManager != nil {
+		pool = s.connManager.PoolOfBackend(addr)
+	}
+	return backendRoute{addr: addr, pool: pool, tls: s.remoteTLS, tlsVerify: s.remoteTLSVerify, proxyProtocol: s.remoteUseProxyProtocol}
 }
 
 // transportFor is the shared transport that checks a route's backend certificate as the
 // route's remote_tls_verify says (roots and name follow the backend dialed).
-func (s *Server) transportFor(route backendRoute) http.RoundTripper {
+func (s *Server) legacyTransportFor(route backendRoute) http.RoundTripper {
 	if t, ok := s.transports[route.tlsVerify]; ok {
 		return t
 	}
@@ -876,6 +889,16 @@ func (s *Server) cacheRoute(email string, entry *lookupcache.CacheEntry) {
 
 // proxyRequest proxies the request to the backend
 func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route backendRoute) {
+	binding, err := s.connManager.BindBackendRoute(route.pool, route.addr)
+	if err != nil {
+		http.Error(w, "Backend route unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	transport, err := s.transportFor(route, binding)
+	if err != nil {
+		http.Error(w, "Backend route unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	// Create reverse proxy to backend
 	scheme := "http"
 	if route.tls {
@@ -891,7 +914,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 
 	// Create reverse proxy with shared transport (prevents connection pool leaks)
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Transport = s.transportFor(route)
+	proxy.Transport = transport
 
 	// Modify request. Capture the original Host BEFORE overwriting r.Host:
 	// the Host of an incoming request lives in r.Host, not in r.Header
@@ -913,6 +936,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 
 	// Inject client IP and port into context for transport.DialContext to pick up
 	ctx := r.Context()
+	ctx = context.WithValue(ctx, backendRouteKey, binding)
 	host, portStr, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil {
 		if port, err := strconv.Atoi(portStr); err == nil {
@@ -1057,6 +1081,7 @@ func (s *Server) Stop() error {
 	logger.Info("User API Proxy: Stopping", "name", s.name)
 
 	s.cancel()
+	s.closeBackendIdleConnections()
 
 	// HTTP server shutdown is handled by the graceful shutdown goroutine
 	// Wait for it to complete
