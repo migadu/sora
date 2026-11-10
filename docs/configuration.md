@@ -121,7 +121,7 @@ Omitted, zero and negative values use the default; there is no unlimited setting
 All protocol servers support multi-layered timeout protection to defend against various denial-of-service attacks:
 
 *   `command_timeout`: Maximum idle time before closing an inactive connection (default: `"30m"` for IMAP, the RFC 3501 §5.4 autologout floor; `"10m"` for POP3 per RFC 1939 §3; `"3m"` for ManageSieve). This protects against clients that connect but never send commands. For IMAP keep it under `"35m"`, the protocol library's own read deadline.
-*   `absolute_session_timeout`: Maximum total session duration regardless of activity (default: `"30m"`). This ensures connections don't stay open indefinitely.
+*   `absolute_session_timeout`: Maximum total session duration regardless of activity (default: `"24h"`). Set `"0"` to disable this limit.
 *   `min_bytes_per_minute`: Slowloris guard (default: `0`, disabled; `512` recommended). A session is closed after two consecutive one-minute windows in which the client sent fewer bytes than this **and no command completed** (the server produced no output). It starts two minutes after the handshake. A client that completes a small command every few seconds (a NOOP poll) is never affected however little it transfers, and a silent session is governed by `command_timeout` instead. IMAP IDLE suspends the check.
 
 Example:
@@ -150,8 +150,12 @@ Sora can also act as a proxy to load balance connections to other Sora backend s
 Proxy servers also support the same multi-layered timeout protection as direct protocol servers:
 
 *   `command_timeout`: Maximum idle time before closing an inactive connection (same per-protocol defaults as the backends: `"30m"` for IMAP, `"10m"` for POP3, `"3m"` for ManageSieve).
-*   `absolute_session_timeout`: Maximum total session duration (default: `"30m"`).
+*   `absolute_session_timeout`: Maximum total session duration (default: `"24h"`, or `"5m"` for `lmtp_proxy`). Set `"0"` to disable this limit. Defaults are the same at startup and after SIGHUP.
 *   `min_bytes_per_minute`: Slowloris guard, same semantics as for backends (default: `0`, disabled).
+
+Timeout settings reloaded by SIGHUP apply to new connections. Changing `debug` on
+`lmtp`, `lmtp_proxy`, or `imap_proxy` requires a restart because their protocol
+writers are configured at startup; SIGHUP reports that requirement.
 
 **Important:** When configuring timeout values for proxies, ensure the proxy's `command_timeout` is **longer** than any backend timeout values (including `proxy_protocol_timeout` if PROXY protocol is enabled on backends). This prevents the proxy from timing out while waiting for backend responses.
 
