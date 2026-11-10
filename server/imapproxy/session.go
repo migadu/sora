@@ -1394,7 +1394,11 @@ func (s *Session) startTLSWithBackend(tlsConfig *tls.Config, timeout time.Durati
 		if strings.HasPrefix(line, "* ") {
 			continue // untagged response before the tagged reply
 		}
-		if !strings.HasPrefix(line, tag+" OK") {
+		responseTag, rest, hasTag := strings.Cut(line, " ")
+		status, _, hasText := strings.Cut(rest, " ")
+		// Tags are exact; protocol status atoms are ASCII case-insensitive
+		// (RFC 9051 section 9). A prefix such as OKAY is not an OK status.
+		if !hasTag || responseTag != tag || !hasText || len(status) != 2 || !strings.EqualFold(status, "OK") {
 			return fmt.Errorf("backend refused STARTTLS: %s", strings.TrimSpace(line))
 		}
 		// Bytes already buffered came in plaintext after the OK, where anyone on the path
