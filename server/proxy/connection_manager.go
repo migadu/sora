@@ -130,7 +130,8 @@ type ConnectionManager struct {
 	enableBackendHealthCheck bool                      // If true, backend health checks are enabled (default: true)
 	// resolvedHosts is, per configured address, the pool entries its last successful
 	// resolution produced, so a failed re-resolution can keep them. Guarded by healthMu.
-	resolvedHosts map[string][]string
+	resolvedHosts        map[string][]string
+	resolutionGeneration uint64 // guarded by healthMu; identifies a published DNS snapshot
 
 	// resolvedAt is when the pool was last resolved (UnixNano, 0 = never), and resolving
 	// is held for the duration of a re-resolution so that concurrent logins cost one DNS
@@ -1200,6 +1201,9 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 			cm.RecordConnectionSuccess(addr)
 			return conn, addr, nil
 		}
+		if errors.Is(err, ErrBackendOutsidePool) {
+			continue
+		}
 		if errors.Is(err, errBackendInMaintenance) {
 			inMaintenance++ // resolved to an address in maintenance
 			continue
@@ -1276,6 +1280,9 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 
 	// Attempt to dial the preferred address.
 	conn, err = cm.dialWithProxy(ctx, preferredAddr, clientIP, clientPort, serverIP, serverPort, routingInfo)
+	if errors.Is(err, ErrBackendOutsidePool) {
+		return nil, "", err, true
+	}
 	if errors.Is(err, errBackendInMaintenance) {
 		// The name resolved to an address in maintenance: as above, not a failure.
 		logger.Debug("ConnectionManager: Preferred backend resolves to an address in maintenance. Falling back to round-robin.", "backend", preferredAddr, "server", cm.serverName)
@@ -1419,6 +1426,7 @@ func (cm *ConnectionManager) installResolvedAddrs(resolvedAddrs []string, resolv
 	defer cm.resolvedAt.Store(time.Now().UnixNano())
 
 	cm.resolvedHosts = resolvedHosts
+	cm.resolutionGeneration++
 
 	if slices.Equal(cm.remoteAddrs, resolvedAddrs) {
 		logger.Debug("ConnectionManager: Address resolution unchanged", "server", cm.serverName, "backends", len(resolvedAddrs))
@@ -1628,10 +1636,14 @@ func (cm *ConnectionManager) resolveAddress(addr string) string {
 }
 
 func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP string, clientPort int, serverIP string, serverPort int, routingInfo *UserRoutingInfo) (net.Conn, error) {
+	route, err := cm.bindForDial(routingInfo, addr)
+	if err != nil {
+		return nil, err
+	}
 	// For PROXY protocol, we need to establish plain TCP connection first
 	dialer := &net.Dialer{
 		Timeout: cm.connectTimeout,
-		Control: cm.RefuseMaintenanceDial,
+		Control: route.Control,
 	}
 
 	// Resolve the address to ensure proper IPv6 formatting
@@ -1710,6 +1722,9 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// When StartTLS is enabled, the protocol layer will handle TLS upgrade
 	if remoteTLS && !remoteTLSUseStartTLS {
 		tlsConfig := cm.backendTLSConfig(remoteTLSVerify)
+		tlsConfig.VerifyConnection = func(tls.ConnectionState) error {
+			return route.ValidateDestination(conn.RemoteAddr().String())
+		}
 		// Verify the backend certificate against its configured hostname. tls.Client (unlike
 		// tls.Dial) does NOT infer ServerName, so without this it stays empty and Go verifies
 		// only the chain, not the host — remote_tls_verify=true would still let any CA-valid
@@ -1744,6 +1759,9 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 		return tlsConn, nil
 	}
 
+	if remoteTLS && remoteTLSUseStartTLS {
+		return &backendRouteConn{Conn: conn, route: route}, nil
+	}
 	return conn, nil
 }
 
@@ -2017,6 +2035,13 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 			logger.Debug("Using routing lookup", "proxy", params.ProxyName, "user", params.Username, "server", result.PreferredAddr)
 			result.RoutingMethod = "remotelookup"
 			result.IsRemoteLookupRoute = true
+			binding, err := cm.BindBackendRoute("", result.PreferredAddr)
+			if err != nil {
+				return result, err
+			}
+			boundInfo := *result.RoutingInfo
+			boundInfo.backendRoute = binding
+			result.RoutingInfo = &boundInfo
 			return result, nil
 		}
 		// Blocked out-of-pool address (logged in AllowRemoteLookupBackend): drop it so
