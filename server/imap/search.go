@@ -13,6 +13,8 @@ import (
 )
 
 func (s *IMAPSession) Search(ctx context.Context, numKind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (_ *imap.SearchData, err error) {
+	ctx = s.pinnedContext(ctx)
+
 	if options != nil && options.ReturnSave {
 		defer func() { s.emptySavedSearchOnNo(err) }()
 	}

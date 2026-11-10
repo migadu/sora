@@ -21,7 +21,7 @@ type SieveScript struct {
 }
 
 func (db *Database) GetUserScripts(ctx context.Context, AccountID int64) ([]*SieveScript, error) {
-	rows, err := db.GetReadPool().Query(ctx, "SELECT id, account_id, name, script, active, updated_at FROM sieve_scripts WHERE account_id = $1", AccountID)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, "SELECT id, account_id, name, script, active, updated_at FROM sieve_scripts WHERE account_id = $1", AccountID)
 	if err != nil {
 		return nil, err
 	}
@@ -41,7 +41,7 @@ func (db *Database) GetUserScripts(ctx context.Context, AccountID int64) ([]*Sie
 
 func (db *Database) GetScript(ctx context.Context, scriptID, AccountID int64) (*SieveScript, error) {
 	var script SieveScript
-	err := db.GetReadPool().QueryRow(ctx, "SELECT id, account_id, name, script, active, updated_at FROM sieve_scripts WHERE id = $1 AND account_id = $2",
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, "SELECT id, account_id, name, script, active, updated_at FROM sieve_scripts WHERE id = $1 AND account_id = $2",
 		scriptID, AccountID).Scan(&script.ID, &script.AccountID, &script.Name, &script.Script, &script.Active, &script.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -52,7 +52,7 @@ func (db *Database) GetScript(ctx context.Context, scriptID, AccountID int64) (*
 
 func (db *Database) GetActiveScript(ctx context.Context, AccountID int64) (*SieveScript, error) {
 	var script SieveScript
-	err := db.GetReadPool().QueryRow(ctx, "SELECT id, account_id, name, script, active, updated_at FROM sieve_scripts WHERE account_id = $1 AND active = true", AccountID).Scan(&script.ID, &script.AccountID, &script.Name, &script.Script, &script.Active, &script.UpdatedAt)
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, "SELECT id, account_id, name, script, active, updated_at FROM sieve_scripts WHERE account_id = $1 AND active = true", AccountID).Scan(&script.ID, &script.AccountID, &script.Name, &script.Script, &script.Active, &script.UpdatedAt)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, consts.ErrDBNotFound
@@ -65,7 +65,7 @@ func (db *Database) GetActiveScript(ctx context.Context, AccountID int64) (*Siev
 
 func (db *Database) GetScriptByName(ctx context.Context, name string, AccountID int64) (*SieveScript, error) {
 	var script SieveScript
-	err := db.GetReadPool().QueryRow(ctx, "SELECT id, name, script, active, updated_at FROM sieve_scripts WHERE name = $1 AND account_id = $2", name, AccountID).Scan(&script.ID, &script.Name, &script.Script, &script.Active, &script.UpdatedAt)
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, "SELECT id, name, script, active, updated_at FROM sieve_scripts WHERE name = $1 AND account_id = $2", name, AccountID).Scan(&script.ID, &script.Name, &script.Script, &script.Active, &script.UpdatedAt)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, consts.ErrDBNotFound
