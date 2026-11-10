@@ -1013,6 +1013,7 @@ master_sasl_allowed_networks = []   # e.g. ["10.0.0.0/24", "192.168.1.10"]
 # 2. Use per-server certificates (only if global [tls] enabled=false)
 #    Set tls=true AND provide tls_cert_file/tls_key_file below
 tls = false                               # Enable TLS for IMAP (IMAPS). Typically on port 993.
+tls_use_starttls = false                  # With tls = true: plaintext port offering STARTTLS (usually :143) instead of implicit TLS (:993).
 # tls_cert_file = "/path/to/your/imap.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
 # tls_key_file = "/path/to/your/imap.key"   # [OPTIONAL] Only needed if global [tls] is disabled
 tls_verify = false                        # Verify client certificates (mutual TLS). Usually false.
@@ -1047,8 +1048,9 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 #
 # disabled_caps = ["ESEARCH", "CONDSTORE", "IDLE"]  # Example: disable these capabilities globally
 #
-# NOTE: Do not disable core capabilities like IMAP4rev1, STARTTLS, or AUTH=PLAIN
-# as this will break basic IMAP functionality.
+# NOTE: Do not disable IMAP4rev1, as this will break basic IMAP functionality.
+# STARTTLS, LOGINDISABLED and AUTH=PLAIN follow tls, tls_use_starttls and
+# insecure_auth; disabled_caps does not change them.
 
 # --- ADDITIONAL CAPABILITY TOKENS ---
 # Advertise extra, non-standard capability tokens to ALL clients, verbatim. These

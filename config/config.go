@@ -980,7 +980,7 @@ type ServerConfig struct {
 	// legacy behavior; relies solely on network isolation + secret secrecy).
 	MasterSASLAllowedNetworks []string `toml:"master_sasl_allowed_networks,omitempty"`
 
-	// STARTTLS on the listening port (requires tls = true): LMTP, ManageSieve, POP3 and their proxies
+	// STARTTLS on the listening port (requires tls = true): IMAP, LMTP, ManageSieve, POP3 and the LMTP, ManageSieve and POP3 proxies
 	TLSUseStartTLS bool `toml:"tls_use_starttls,omitempty"`
 
 	// LMTP specific
@@ -1998,14 +1998,14 @@ func (s *ServerConfig) Validate() error {
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
 	if s.TLSUseStartTLS {
 		switch s.Type {
-		case "lmtp", "managesieve", "pop3", "lmtp_proxy", "managesieve_proxy", "pop3_proxy":
+		case "imap", "lmtp", "managesieve", "pop3", "lmtp_proxy", "managesieve_proxy", "pop3_proxy":
 			// The servers drop tls_use_starttls without tls (there is no certificate
 			// to upgrade with), so the listener comes up plaintext with no STARTTLS.
 			if !s.TLS {
 				logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured without 'tls = true'; it is ignored and the listener is plaintext with no STARTTLS", s.Name, s.Type)
 			}
 		default:
-			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to LMTP, ManageSieve and POP3 servers and proxies", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to IMAP, LMTP, ManageSieve and POP3 servers and to the LMTP, ManageSieve and POP3 proxies", s.Name, s.Type)
 		}
 	}
 

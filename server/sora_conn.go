@@ -979,19 +979,7 @@ func (c *SoraTLSConn) PerformHandshake() error {
 	originalGetConfig := tlsConfig.GetConfigForClient
 
 	tlsConfig.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-		// Capture JA4 fingerprint with panic recovery
-		// The ja4plus library can panic on malformed ClientHello messages
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					logger.Warn("JA4 fingerprinting panic recovered (likely malformed ClientHello)", "proto", c.connConfig.Protocol, "error", r)
-					// Set empty fingerprint on panic
-					c.SetJA4Fingerprint("")
-				}
-			}()
-			ja4 := ja4plus.JA4(hello)
-			c.SetJA4Fingerprint(ja4)
-		}()
+		captureJA4(c.connConfig.Protocol, hello, c.SetJA4Fingerprint)
 
 		// Call original callback if it exists
 		if originalGetConfig != nil {
@@ -1048,6 +1036,48 @@ func (c *SoraTLSConn) PerformHandshake() error {
 	}
 
 	return nil
+}
+
+// captureJA4 hands hello's JA4 fingerprint to record, or "" when the ja4plus
+// library panics, as it can on a malformed ClientHello.
+func captureJA4(protocol string, hello *tls.ClientHelloInfo, record func(string)) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Warn("JA4 fingerprinting panic recovered (likely malformed ClientHello)", "proto", protocol, "error", r)
+			record("")
+		}
+	}()
+	record(ja4plus.JA4(hello))
+}
+
+// StartTLSConfig returns a copy of config for a protocol library to upgrade a
+// plaintext connection with on STARTTLS. Its handshake records the client's JA4
+// fingerprint on the SoraConn under the upgraded connection, as SoraTLSConn's
+// does for implicit TLS, so client filters keyed on JA4 apply to STARTTLS
+// sessions too.
+func StartTLSConfig(config *tls.Config, protocol string) *tls.Config {
+	cfg := config.Clone()
+	original := cfg.GetConfigForClient
+	cfg.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		// hello.Conn is the connection the library handed tls.Server: the
+		// plaintext one, which is or wraps the SoraConn.
+		for conn := hello.Conn; conn != nil; {
+			if sc, ok := conn.(interface{ SetJA4Fingerprint(string) }); ok {
+				captureJA4(protocol, hello, sc.SetJA4Fingerprint)
+				break
+			}
+			w, ok := conn.(interface{ Unwrap() net.Conn })
+			if !ok {
+				break
+			}
+			conn = w.Unwrap()
+		}
+		if original != nil {
+			return original(hello)
+		}
+		return nil, nil
+	}
+	return cfg
 }
 
 // detectAndRejectPlainText checks if the connection is attempting to use plain-text on a TLS port.
