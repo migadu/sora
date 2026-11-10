@@ -25,9 +25,9 @@ import (
 
 // reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
 // publishes a new one whole and none is changed after: a session takes the one current
-// when it starts and keeps it, so it never mixes the values of two reloads. Debug
-// logging and the master SASL credentials are read afresh, per log line and per
-// backend login.
+// when it starts and keeps it, so it never mixes the values of two reloads. The
+// master SASL credentials are read afresh per backend login. Debug is included
+// in the snapshot but fixed at startup, like the protocol writer.
 type reloadableSettings struct {
 	maxAuthErrors          int           // Maximum authentication errors before disconnection
 	authIdleTimeout        time.Duration // Idle timeout during authentication phase (pre-auth only)
@@ -448,6 +448,7 @@ func (s *Server) connConfig() server.SoraConnConfig {
 		Hostname:             s.hostname,
 		IdleTimeout:          settings.commandTimeout,
 		AbsoluteTimeout:      settings.absoluteSessionTimeout,
+		NoAbsoluteTimeout:    settings.absoluteSessionTimeout <= 0,
 		MinBytesPerMinute:    settings.minBytesPerMinute,
 		EnableTimeoutChecker: true,
 		OnTimeout: func(conn net.Conn, reason string) {
@@ -859,10 +860,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 		next.masterSASLPassword = []byte(cfg.MasterSASLPassword)
 		reloaded = append(reloaded, "master_sasl_password")
 	}
-	if cfg.Debug != next.debug {
-		next.debug = cfg.Debug
-		reloaded = append(reloaded, "debug")
-	}
+	// Debug configures the protocol writer at startup and requires a restart.
 
 	if len(reloaded) > 0 {
 		s.settings.Store(&next)

@@ -776,6 +776,9 @@ vacation :days 7 :subject "Out of Office"
 "I am currently out of office and will respond when I return.";
 ```
 
+Vacation suppression periods are clamped to 1–365 days. Omitting `:days` uses
+7 days (RFC 5230 §4.1).
+
 **Organize by Sender:**
 ```sieve
 require ["fileinto"];

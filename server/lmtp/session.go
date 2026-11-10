@@ -972,6 +972,9 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			// Stamp the outgoing copy with an incremented hop count (loop backstop).
 			hops := helpers.RedirectHopCount(helpers.HeaderGetter(messageContent.Header.Map()))
 			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(hops+1))
+			// User.Address is the script owner's primary address, even for aliases.
+			// Replace earlier or sender-supplied attribution on the outgoing copy only.
+			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
 			err := s.sendToExternalRelay(s.sender.FullAddress(), result.RedirectTo, relayBytes)
 			if err != nil {
 				s.DebugLog("error enqueuing redirected message, falling back to inbox", "error", err)
