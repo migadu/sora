@@ -41,3 +41,11 @@ func TestStartTLSConfigRecordsJA4OnTheSoraConn(t *testing.T) {
 		t.Fatalf("JA4 recorded on the SoraConn = %q, want a TLS 1.3 fingerprint", ja4)
 	}
 }
+
+// A listener without TLS hands its library no config, and StartTLSConfig must
+// keep it that way rather than offer STARTTLS with an empty one.
+func TestStartTLSConfigOfNilIsNil(t *testing.T) {
+	if cfg := StartTLSConfig(nil, "test"); cfg != nil {
+		t.Fatalf("StartTLSConfig(nil) = %v, want nil", cfg)
+	}
+}

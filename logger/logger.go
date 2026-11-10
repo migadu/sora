@@ -82,6 +82,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode"
 
 	"github.com/migadu/sora/config"
@@ -146,10 +147,9 @@ func needsQuoting(s string) bool {
 	return false
 }
 
-var (
-	// Global logger instance
-	globalLogger *slog.Logger
-)
+// globalLogger is the logger every package-level function logs through. It is atomic
+// because tests re-Initialize or Swap it while servers from earlier tests still log.
+var globalLogger atomic.Pointer[slog.Logger]
 
 // syslogHandler wraps syslog.Writer to implement slog.Handler
 type syslogHandler struct {
@@ -310,8 +310,9 @@ func Initialize(cfg config.LoggingConfig) (*os.File, error) {
 	}
 
 	// Create and set global logger
-	globalLogger = slog.New(handler)
-	slog.SetDefault(globalLogger)
+	l := slog.New(handler)
+	globalLogger.Store(l)
+	slog.SetDefault(l)
 
 	return logFile, nil
 }
@@ -334,10 +335,17 @@ func parseLogLevel(level string) slog.Level {
 
 // Get returns the global logger instance
 func Get() *slog.Logger {
-	if globalLogger == nil {
-		return slog.Default()
+	if l := globalLogger.Load(); l != nil {
+		return l
 	}
-	return globalLogger
+	return slog.Default()
+}
+
+// Swap makes l the global logger and returns the previous one (nil before Initialize),
+// to hand back to Swap. It is for tests that read what a server logs: they cannot rely on
+// where an earlier test's Initialize sent the output.
+func Swap(l *slog.Logger) *slog.Logger {
+	return globalLogger.Swap(l)
 }
 
 // Info logs an info message with optional key-value pairs

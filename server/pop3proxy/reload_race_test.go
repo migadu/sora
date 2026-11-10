@@ -128,7 +128,7 @@ func TestReloadConfig_DuringBackendLogin(t *testing.T) {
 	defer peer.Close()
 	reloadWhile(t, srv.ReloadConfig, reloadRaceConfigs, func() {
 		for i := 0; i < 20; i++ {
-			s := &POP3ProxySession{server: srv, clientConn: client, ctx: context.Background(), username: "user@example.com"}
+			s := &POP3ProxySession{server: srv, clientConn: client, listenerConn: client, ctx: context.Background(), username: "user@example.com"}
 			if err := s.connectToBackend(); err != nil {
 				t.Fatalf("connectToBackend: %v", err)
 			}
