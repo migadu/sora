@@ -211,3 +211,64 @@ func TestSoraConnTimeoutNoticeConnIsAskedForOnTheReadingGoroutine(t *testing.T) 
 		t.Errorf("notice written to the swapped-in connection = %q, want %q", got, "goodbye\r\n")
 	}
 }
+
+// A shutdown broadcast writes from another goroutine, so NoticeConn must hand it
+// the connection the library is using without calling the provider: the record
+// the reading goroutine made. Before any record, and with no SoraConn at all, it
+// is the connection it was given. Run with -race.
+func TestNoticeConnFollowsTheRecordedConnection(t *testing.T) {
+	transport, peer := net.Pipe()
+	defer peer.Close()
+	sc := NewSoraConn(transport, SoraConnConfig{NoAbsoluteTimeout: true})
+	defer sc.Close()
+
+	if got := NoticeConn(sc); got != sc {
+		t.Fatalf("NoticeConn with nothing registered = %T, want the SoraConn itself", got)
+	}
+	plain, other := net.Pipe()
+	defer plain.Close()
+	defer other.Close()
+	if got := NoticeConn(plain); got != plain {
+		t.Fatalf("NoticeConn without a SoraConn = %T, want the connection given", got)
+	}
+
+	upgraded := &noticeRecordingConn{Conn: sc}
+	var libraryConn net.Conn = sc
+	SetTimeoutNoticeConn(sc, func() net.Conn { return libraryConn })
+
+	// The library: read STLS, swap in the TLS connection, read on through it.
+	read := make(chan struct{})
+	go func() {
+		buf := make([]byte, 16)
+		if _, err := sc.Read(buf); err != nil {
+			return
+		}
+		libraryConn = upgraded
+		read <- struct{}{}
+		sc.Read(buf)
+		read <- struct{}{}
+	}()
+	peer.Write([]byte("STLS\r\n"))
+	<-read
+	peer.Write([]byte("CAPA\r\n"))
+	<-read
+
+	for name, conn := range map[string]net.Conn{"SoraConn": sc, "wrapper": unwrapConn{sc}} {
+		if got := NoticeConn(conn); got != upgraded {
+			t.Errorf("NoticeConn(%s) after the upgrade = %T, want the swapped-in connection", name, got)
+		}
+	}
+}
+
+func TestNoticeConnSuppressesUnsafeRegisteredWriter(t *testing.T) {
+	transport, peer := net.Pipe()
+	defer peer.Close()
+	sc := NewSoraConn(transport, SoraConnConfig{NoAbsoluteTimeout: true})
+	defer sc.Close()
+	SetTimeoutNoticeConn(sc, func() net.Conn { return nil })
+	for _, conn := range []net.Conn{sc, unwrapConn{sc}} {
+		if got := NoticeConn(conn); got != nil {
+			t.Fatalf("unsafe registered writer returned %T", got)
+		}
+	}
+}

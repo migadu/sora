@@ -228,3 +228,121 @@ func TestPOP3ImplicitTLSWithProxyProtocol(t *testing.T) {
 	t.Run("header in separate segment", func(t *testing.T) { run(t, false) })
 	t.Run("header coalesced with ClientHello", func(t *testing.T) { run(t, true) })
 }
+
+// readCAPA sends CAPA and returns the capability lines, one per line.
+func readCAPA(t *testing.T, w net.Conn, reader *bufio.Reader) string {
+	t.Helper()
+	fmt.Fprintf(w, "CAPA\r\n")
+	if resp, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("CAPA failed: %q, %v", resp, err)
+	}
+	var caps []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("Failed reading CAPA list: %v", err)
+		}
+		if line = strings.TrimSpace(line); line == "." {
+			return strings.Join(caps, "\n")
+		}
+		caps = append(caps, line)
+	}
+}
+
+// TestPOP3STARTTLS covers a tls_use_starttls listener end to end (RFC 2595):
+// the greeting is plaintext, login is withheld until STLS when insecure_auth
+// is off, and after the upgrade the client logs in and reads its maildrop
+// through TLS.
+func TestPOP3STARTTLS(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	rdb := common.SetupTestDatabase(t)
+	account := common.CreateTestAccount(t, rdb)
+	addr := common.GetRandomAddress(t)
+	certFile, keyFile, certPool := common.GenerateTestTLSCert(t, nil, nil)
+
+	server, err := pop3.New(
+		context.Background(),
+		"test-starttls",
+		"localhost",
+		addr,
+		&storage.S3Storage{},
+		rdb,
+		nil, // uploader.UploadWorker
+		nil, // cache.Cache
+		pop3.POP3ServerOptions{
+			TLS:            true,
+			TLSCertFile:    certFile,
+			TLSKeyFile:     keyFile,
+			TLSUseStartTLS: true,
+			InsecureAuth:   false,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Failed to create POP3 server with STARTTLS: %v", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() { server.Start(errChan) }()
+	defer server.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	reader := bufio.NewReader(conn)
+
+	if greeting, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(greeting, "+OK") {
+		t.Fatalf("plaintext greeting: %q, %v", greeting, err)
+	}
+	caps := readCAPA(t, conn, reader)
+	if !strings.Contains(caps, "STLS") {
+		t.Errorf("plaintext CAPA must advertise STLS, got:\n%s", caps)
+	}
+	if strings.Contains(caps, "USER") || strings.Contains(caps, "SASL") {
+		t.Errorf("plaintext CAPA must not advertise USER or SASL with insecure_auth off, got:\n%s", caps)
+	}
+	fmt.Fprintf(conn, "USER %s\r\n", account.Email)
+	if resp, _ := reader.ReadString('\n'); !strings.HasPrefix(resp, "-ERR") {
+		t.Fatalf("USER before STLS must be refused, got %q", resp)
+	}
+
+	fmt.Fprintf(conn, "STLS\r\n")
+	if resp, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("STLS failed: %q, %v", resp, err)
+	}
+	// Full verification: the ephemeral cert covers 127.0.0.1.
+	tlsConn := tls.Client(conn, &tls.Config{RootCAs: certPool, ServerName: "127.0.0.1"})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("TLS handshake after STLS failed: %v", err)
+	}
+	tlsReader := bufio.NewReader(tlsConn)
+
+	caps = readCAPA(t, tlsConn, tlsReader)
+	if !strings.Contains(caps, "USER") || !strings.Contains(caps, "SASL") {
+		t.Errorf("CAPA after STLS must advertise USER and SASL, got:\n%s", caps)
+	}
+	if strings.Contains(caps, "STLS") {
+		t.Errorf("CAPA after STLS must not advertise STLS, got:\n%s", caps)
+	}
+
+	fmt.Fprintf(tlsConn, "USER %s\r\n", account.Email)
+	if resp, _ := tlsReader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("USER after STLS failed: %q", resp)
+	}
+	fmt.Fprintf(tlsConn, "PASS %s\r\n", account.Password)
+	if resp, _ := tlsReader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("PASS after STLS failed: %q", resp)
+	}
+	fmt.Fprintf(tlsConn, "STAT\r\n")
+	if resp, _ := tlsReader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("STAT after STLS failed: %q", resp)
+	}
+	fmt.Fprintf(tlsConn, "QUIT\r\n")
+	if resp, _ := tlsReader.ReadString('\n'); !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("QUIT after STLS failed: %q", resp)
+	}
+}

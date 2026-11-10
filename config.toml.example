@@ -1324,6 +1324,7 @@ max_connections_per_ip = 5
 master_sasl_username = ""
 master_sasl_password = ""
 tls = false
+tls_use_starttls = false      # With tls = true: plaintext port offering STLS (RFC 2595, usually :110) instead of implicit TLS (:995).
 # tls_cert_file = "/path/to/your/pop3.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
 # tls_key_file = "/path/to/your/pop3.key"   # [OPTIONAL] Only needed if global [tls] is disabled
 tls_verify = false
@@ -1872,6 +1873,7 @@ master_sasl_password = "proxypass"
 
 # --- PROXY TLS CONFIGURATION ---
 tls = false
+tls_use_starttls = false              # With tls = true: plaintext port offering STLS (RFC 2595) instead of implicit TLS
 tls_cert_file = ""
 tls_key_file = ""
 tls_verify = true

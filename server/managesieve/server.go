@@ -779,8 +779,10 @@ func (s *ManageSieveServer) sendGracefulShutdownMessage() {
 	// Send shutdown message to all active connections
 	// ManageSieve uses BYE response for clean disconnection
 	for _, session := range activeSessions {
-		if session.conn != nil {
-			writer := bufio.NewWriter(session.conn)
+		if noticeConn := serverPkg.NoticeConn(session.conn); noticeConn != nil {
+			// After STARTTLS the client reads through the library's TLS
+			// connection, which sits above session.conn.
+			writer := bufio.NewWriter(noticeConn)
 			// Send BYE with TRYLATER response code (RFC 5804 Section 1.3)
 			writer.WriteString("BYE (TRYLATER) \"Server shutting down, please reconnect\"\r\n")
 			writer.Flush()

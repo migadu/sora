@@ -477,6 +477,34 @@ func SetTimeoutNoticeConn(conn net.Conn, current func() net.Conn) bool {
 	return false
 }
 
+// recordedNoticeConn returns the recorded notice connection and whether a
+// provider was registered. A registered nil connection suppresses unsafe notices.
+func (c *SoraConn) recordedNoticeConn() (net.Conn, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.noticeConn, c.noticeConnRegistered
+}
+
+// NoticeConn returns the safe connection for an asynchronous shutdown notice.
+// It returns nil while a registered STARTTLS provider cannot expose a safe
+// writer; callers must omit the notice in that case and retain normal closure.
+func NoticeConn(conn net.Conn) net.Conn {
+	for c := conn; c != nil; {
+		if sc, ok := c.(interface{ recordedNoticeConn() (net.Conn, bool) }); ok {
+			if notice, registered := sc.recordedNoticeConn(); registered {
+				return notice
+			}
+			return conn
+		}
+		w, ok := c.(interface{ Unwrap() net.Conn })
+		if !ok {
+			return conn
+		}
+		c = w.Unwrap()
+	}
+	return conn
+}
+
 // closeTimeoutTransport bypasses TLS close_notify and wrapper cleanup, which
 // c.Close performs afterwards. Closing the innermost socket unblocks its I/O.
 func closeTimeoutTransport(conn net.Conn) {
