@@ -306,7 +306,8 @@ default_rights = "lrswipkxtea"    # Full rights for creators
 Both `allow_*` settings default to `false`:
 
 - `allow_user_create = false` refuses IMAP CREATE (and a RENAME that would create a
-  mailbox) in the shared namespace with `NO [NOPERM]`. Administrators create shared
+  mailbox, or move one out of a shared mailbox to the top level) in the shared
+  namespace with `NO [NOPERM]`. Administrators create shared
   mailboxes with `sora-admin mailbox create --mailbox "Shared/Team"`; users with the
   `k` right can still create children under one.
 - `allow_anyone_identifier = false` refuses granting rights to `anyone` (IMAP SETACL

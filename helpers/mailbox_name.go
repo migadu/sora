@@ -44,3 +44,9 @@ func MailboxNameHasTraversal(name string) bool {
 	}
 	return false
 }
+
+// MailboxNameIsBelow reports whether name is a descendant of ancestor in the
+// mailbox hierarchy. Mailbox names are case-insensitive.
+func MailboxNameIsBelow(name, ancestor string) bool {
+	return strings.HasPrefix(strings.ToLower(name), strings.ToLower(ancestor)+"/")
+}
