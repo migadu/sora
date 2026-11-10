@@ -161,7 +161,7 @@ func TestIMAP_RecentFlag_CopyDoesNotStoreRecent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("COPY to Sent failed: %v", err)
 	}
-	destUID := copyData.DestUIDs[0].Start
+	destUID := copyData.UIDMapping[0].Dest.Start
 	t.Logf("COPY succeeded, dest UID %d in Sent", destUID)
 
 	// Select Sent and fetch the copied message's flags via UID.

@@ -4,6 +4,7 @@ package imap_test
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -83,38 +84,25 @@ func TestMOVE_COPYUID_Ordering(t *testing.T) {
 		t.Fatal("MOVE returned no COPYUID data")
 	}
 
-	t.Logf("COPYUID: source=%v dest=%v", moveData.SourceUIDs, moveData.DestUIDs)
+	t.Logf("COPYUID: %v", moveData.UIDMapping)
 
-	sourceUIDSet, ok := moveData.SourceUIDs.(imap.UIDSet)
-	if !ok {
-		t.Fatalf("SourceUIDs is not a UIDSet: %T", moveData.SourceUIDs)
-	}
-	destUIDSet, ok := moveData.DestUIDs.(imap.UIDSet)
-	if !ok {
-		t.Fatalf("DestUIDs is not a UIDSet: %T", moveData.DestUIDs)
-	}
-	sourceUIDs := uidSetToSlice(sourceUIDSet)
-	destUIDs := uidSetToSlice(destUIDSet)
-
-	if len(sourceUIDs) != 3 || len(destUIDs) != 3 {
-		t.Fatalf("Expected 3 UIDs each, got source=%d dest=%d", len(sourceUIDs), len(destUIDs))
+	if err := moveData.UIDMapping.Validate(); err != nil {
+		t.Fatalf("COPYUID mapping is invalid: %v", err)
 	}
 
-	// Verify source UIDs are sorted
-	for i := 1; i < len(sourceUIDs); i++ {
-		if sourceUIDs[i] <= sourceUIDs[i-1] {
-			t.Errorf("Source UIDs not sorted: %v", sourceUIDs)
-		}
+	// Source UID -> destination UID, as the server paired them.
+	destBySource := make(map[imap.UID]imap.UID)
+	var sourceUIDs []imap.UID
+	for sourceUID, destUID := range moveData.UIDMapping.All() {
+		destBySource[sourceUID] = destUID
+		sourceUIDs = append(sourceUIDs, sourceUID)
 	}
 
-	// Verify dest UIDs are sorted
-	for i := 1; i < len(destUIDs); i++ {
-		if destUIDs[i] <= destUIDs[i-1] {
-			t.Errorf("Dest UIDs not sorted: %v", destUIDs)
-		}
+	if want := []imap.UID{1, 3, 5}; !slices.Equal(sourceUIDs, want) {
+		t.Fatalf("Expected source UIDs %v in that order, got %v", want, sourceUIDs)
 	}
 
-	// Verify pairing: fetch from Archive and check subjects match source order
+	// Verify pairing: each destination UID must hold the message its source UID named
 	if _, err := c.Select("Archive", nil).Wait(); err != nil {
 		t.Fatalf("Failed to select Archive: %v", err)
 	}
@@ -129,13 +117,19 @@ func TestMOVE_COPYUID_Ordering(t *testing.T) {
 		t.Fatalf("Expected 3 messages in Archive, got %d", len(msgs))
 	}
 
-	// Messages should be "Message 1", "Message 3", "Message 5" in UID order
-	expectedSubjects := []string{"Message 1", "Message 3", "Message 5"}
+	subjectByUID := make(map[imap.UID]string)
 	for i, msg := range msgs {
 		t.Logf("Archive[%d]: UID=%d Subject=%q", i, msg.UID, msg.Envelope.Subject)
-		if msg.Envelope.Subject != expectedSubjects[i] {
-			t.Errorf("Message %d: expected Subject=%q, got %q (COPYUID pairing may be wrong)",
-				i, expectedSubjects[i], msg.Envelope.Subject)
+		subjectByUID[msg.UID] = msg.Envelope.Subject
+	}
+
+	// The INBOX was empty, so "Message N" was appended as UID N.
+	for _, sourceUID := range sourceUIDs {
+		destUID := destBySource[sourceUID]
+		want := fmt.Sprintf("Message %d", sourceUID)
+		if got := subjectByUID[destUID]; got != want {
+			t.Errorf("COPYUID pairs source UID %d with dest UID %d, which holds %q, want %q",
+				sourceUID, destUID, got, want)
 		}
 	}
 
@@ -232,15 +226,4 @@ func TestDELETE_SelectedMailbox(t *testing.T) {
 			t.Logf("FETCH after DELETE returned error: %v (expected — mailbox gone)", fetchErr)
 		}
 	}
-}
-
-// uidSetToSlice converts a UIDSet to a flat slice of UIDs
-func uidSetToSlice(set imap.UIDSet) []imap.UID {
-	var uids []imap.UID
-	for _, r := range set {
-		for uid := r.Start; uid <= r.Stop; uid++ {
-			uids = append(uids, uid)
-		}
-	}
-	return uids
 }

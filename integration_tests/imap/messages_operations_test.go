@@ -165,7 +165,7 @@ func TestIMAP_ComprehensiveCopyMove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("COPY by sequence number failed: %v", err)
 	}
-	t.Logf("COPY successful - Source UID: %d, Dest UID: %d", copyData.SourceUIDs[0], copyData.DestUIDs[0])
+	t.Logf("COPY successful - Source UID: %d, Dest UID: %d", copyData.UIDMapping[0].Source.Start, copyData.UIDMapping[0].Dest.Start)
 
 	// Verify message was copied
 	selectData, err := c.Select(testMailbox, nil).Wait()
@@ -231,7 +231,7 @@ func TestIMAP_ComprehensiveCopyMove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("COPY second message failed: %v", err)
 	}
-	t.Logf("COPY second message successful - Source UID: %d, Dest UID: %d", copyData.SourceUIDs[0], copyData.DestUIDs[0])
+	t.Logf("COPY second message successful - Source UID: %d, Dest UID: %d", copyData.UIDMapping[0].Source.Start, copyData.UIDMapping[0].Dest.Start)
 
 	// Verify destination now has 2 messages
 	selectData, err = c.Select(testMailbox, nil).Wait()
