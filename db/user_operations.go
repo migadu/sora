@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"time"
 
@@ -648,6 +649,12 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		}
 	}
 	normalizedCustom := NormalizeAttachmentKeywordUpdate(helpers.StringsToFlags(customFlags), effectiveAdded)
+	// Apply the User API's color policy to the final state, after additions and
+	// removals: color keywords are meaningful only with \Flagged (RFC 9979
+	// §§3.1–3.2). This also handles adding a color while removing \Flagged.
+	if newFlags&FlagFlagged == 0 {
+		normalizedCustom = slices.DeleteFunc(normalizedCustom, helpers.IsFlagColorKeyword)
+	}
 	customFlags = make([]string, len(normalizedCustom))
 	for i, flag := range normalizedCustom {
 		customFlags[i] = string(flag)

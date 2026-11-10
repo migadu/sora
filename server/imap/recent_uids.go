@@ -50,7 +50,10 @@ func (t *recentUIDTracker) Store(mailboxID int64, uid imap.UID) {
 	}
 
 	if el, ok := t.items[mailboxID]; ok {
-		el.Value.(*recentUIDEntry).uid = uid
+		// SELECTs may finish out of order or observe replicas at different lag.
+		// Once consumed, a UID must not become Recent again for later opens.
+		entry := el.Value.(*recentUIDEntry)
+		entry.uid = max(entry.uid, uid)
 		t.order.MoveToFront(el)
 		return
 	}

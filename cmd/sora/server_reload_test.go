@@ -175,3 +175,19 @@ func TestReloadableServerSettingsMatchEachReloadConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestServerReloadReportsDebugRequiresRestart(t *testing.T) {
+	for _, typ := range []string{"lmtp", "lmtp_proxy", "imap_proxy"} {
+		t.Run(typ, func(t *testing.T) {
+			logs := captureReloadLogs(t)
+			started := config.ServerConfig{Type: typ, Name: typ, Addr: ":1234"}
+			deps, _ := runningDeps(t, started)
+			next := started
+			next.Debug = true
+			deps.reloadServers(reloadedConfig(next))
+			if !hasLineWith(logs.String(), "server="+typ, "require restart", "debug") {
+				t.Errorf("missing debug restart notice: %s", logs.String())
+			}
+		})
+	}
+}

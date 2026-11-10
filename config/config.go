@@ -980,8 +980,10 @@ type ServerConfig struct {
 	// legacy behavior; relies solely on network isolation + secret secrecy).
 	MasterSASLAllowedNetworks []string `toml:"master_sasl_allowed_networks,omitempty"`
 
+	// STARTTLS on the listening port (requires tls = true): LMTP, ManageSieve, POP3 and their proxies
+	TLSUseStartTLS bool `toml:"tls_use_starttls,omitempty"`
+
 	// LMTP specific
-	TLSUseStartTLS bool   `toml:"tls_use_starttls,omitempty"`
 	MaxMessageSize string `toml:"max_message_size,omitempty"` // Maximum size for incoming LMTP messages
 
 	// Auth security
@@ -1107,7 +1109,10 @@ func (c SharedMailboxesConfig) InNamespace(name string) bool {
 	if !c.Enabled {
 		return false
 	}
-	return strings.HasPrefix(name, c.NamespacePrefix) || name == strings.TrimSuffix(c.NamespacePrefix, "/")
+	// Sora resolves every mailbox name case-insensitively. Classification must
+	// use that same rule, or a case variant can bypass shared namespace policy.
+	name, prefix := strings.ToLower(name), strings.ToLower(c.NamespacePrefix)
+	return strings.HasPrefix(name, prefix) || name == strings.TrimSuffix(prefix, "/")
 }
 
 // AdminCLIConfig holds configuration for sora-admin CLI tool
@@ -1509,12 +1514,16 @@ func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
 	}
 }
 
-// GetAbsoluteSessionTimeout parses the absolute session timeout duration (default: 24 hours for all protocols)
+// GetAbsoluteSessionTimeout parses the absolute session timeout duration.
+// Delivery proxy connections default to 5 minutes; other protocols use 24 hours.
 func (s *ServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
 	if s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != "" {
 		return helpers.ParseDuration(s.Timeouts.AbsoluteSessionTimeout)
 	}
-	return 24 * time.Hour, nil // Default: 24 hours for all protocols
+	if s.Type == "lmtp_proxy" {
+		return 5 * time.Minute, nil
+	}
+	return 24 * time.Hour, nil
 }
 
 // GetCommandTimeoutsOverrides returns a map of command name to timeout duration
@@ -1987,6 +1996,19 @@ func (s *ServerConfig) Validate() error {
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
+	if s.TLSUseStartTLS {
+		switch s.Type {
+		case "lmtp", "managesieve", "pop3", "lmtp_proxy", "managesieve_proxy", "pop3_proxy":
+			// The servers drop tls_use_starttls without tls (there is no certificate
+			// to upgrade with), so the listener comes up plaintext with no STARTTLS.
+			if !s.TLS {
+				logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured without 'tls = true'; it is ignored and the listener is plaintext with no STARTTLS", s.Name, s.Type)
+			}
+		default:
+			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to LMTP, ManageSieve and POP3 servers and proxies", s.Name, s.Type)
+		}
+	}
+
 	// Check proxy-only options on non-proxy servers
 	if !strings.HasSuffix(s.Type, "_proxy") {
 		if len(s.RemoteAddrs) > 0 {
@@ -2095,9 +2117,6 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.AppendLimit != "" {
 			logger("WARNING: Server %s (type: %s) has 'append_limit' configured, but this only applies to IMAP servers", s.Name, s.Type)
-		}
-		if s.TLSUseStartTLS {
-			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to protocol servers (IMAP, POP3, LMTP, ManageSieve)", s.Name, s.Type)
 		}
 		if s.Type == "metrics" && s.TLS {
 			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)

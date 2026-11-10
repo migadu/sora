@@ -259,10 +259,14 @@ func (s *IMAPSession) SetACL(ctx context.Context, mailbox string, identifier ima
 	AccountID := s.AccountID()
 	release()
 
-	// Create context for database operations
+	// Create context for database operations, with the config that decides whether
+	// "anyone" may be granted rights ([shared_mailboxes] allow_anyone_identifier)
 	writeCtx := ctx
 	if s.useMasterDB.Load() {
 		writeCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
+	if s.server.config != nil {
+		writeCtx = context.WithValue(writeCtx, consts.ConfigContextKey, s.server.config)
 	}
 
 	// Get mailbox
@@ -343,6 +347,8 @@ func (s *IMAPSession) setACLError(mailbox, identifier string, err error) error {
 		return no(imap.ResponseCodeCannot, "Mailboxes can only be shared with users in the same domain")
 	case errors.Is(err, db.ErrOwnerACL):
 		return no(imap.ResponseCodeCannot, "The mailbox owner always holds every right")
+	case errors.Is(err, db.ErrAnyoneDisabled):
+		return no(imap.ResponseCodeCannot, `Sharing with "anyone" is disabled on this server`)
 	}
 	return s.internalError("failed to change ACL: %v", err)
 }
@@ -387,10 +393,14 @@ func (s *IMAPSession) ListRights(ctx context.Context, mailbox string, identifier
 	AccountID := s.AccountID()
 	release()
 
-	// Create context for database operations
+	// Create context for database operations, with the config that decides whether
+	// "anyone" may be granted rights ([shared_mailboxes] allow_anyone_identifier)
 	readCtx := ctx
 	if s.useMasterDB.Load() {
 		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
+	if s.server.config != nil {
+		readCtx = context.WithValue(readCtx, consts.ConfigContextKey, s.server.config)
 	}
 
 	// Get mailbox

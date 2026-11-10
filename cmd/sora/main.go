@@ -1556,6 +1556,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		TLSCertFile:               serverConfig.TLSCertFile,
 		TLSKeyFile:                serverConfig.TLSKeyFile,
 		TLSVerify:                 serverConfig.TLSVerify,
+		TLSUseStartTLS:            serverConfig.TLSUseStartTLS,
 		MasterUsername:            serverConfig.MasterUsername,
 		MasterPassword:            serverConfig.MasterPassword,
 		MasterSASLUsername:        serverConfig.MasterSASLUsername,
@@ -1940,6 +1941,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		TLSCertFile:              serverConfig.TLSCertFile,
 		TLSKeyFile:               serverConfig.TLSKeyFile,
 		TLSVerify:                serverConfig.TLSVerify,
+		TLSUseStartTLS:           serverConfig.TLSUseStartTLS,
 		TLSConfig:                tlsConfig,
 		RemoteTLS:                serverConfig.RemoteTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
@@ -2176,13 +2178,6 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		logger.Info("LMTP proxy: Invalid absolute session timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
 		absoluteSessionTimeout = 5 * time.Minute
 	}
-	// Override default 24h with 5m for LMTP since connections should be short-lived
-	// LMTP is a delivery protocol - messages should be delivered in seconds/minutes, not hours
-	// Check if timeout is the default 24h value (either Timeouts is nil or AbsoluteSessionTimeout is empty)
-	if absoluteSessionTimeout == 24*time.Hour && (serverConfig.Timeouts == nil || serverConfig.Timeouts.AbsoluteSessionTimeout == "") {
-		logger.Info("LMTP proxy: Using LMTP-specific default (5 minutes) instead of generic default (24 hours)", "name", serverConfig.Name)
-		absoluteSessionTimeout = 5 * time.Minute
-	}
 
 	remotePort, err := serverConfig.GetRemotePort()
 	if err != nil {
@@ -2367,6 +2362,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		RedirectRateWindow: redirectRateWindow,
 		MaxRedirectHops:    serverConfig.GetMaxRedirectHops(),
 		SieveExtensions:    deps.config.Sieve.EnabledExtensions,
+		SharedMailboxes:    deps.config.SharedMailboxes,
 	}
 }
 

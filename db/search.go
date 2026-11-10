@@ -992,9 +992,10 @@ func (db *Database) mapSeqNumCriteriaToUID(ctx context.Context, mailboxID int64,
 }
 
 // uidsBySeqNum returns the UID at each of the given sequence numbers. A sequence number
-// past the last message is missing from the result.
+// past the last message is missing from the result. Key zero always contains the
+// last live UID, for wildcard resolution and clipping out-of-bounds range ends.
 func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums []int64) (map[uint32]imap.UID, error) {
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+	query := `
 		SELECT ranked.seqnum, ranked.uid
 		FROM (
 			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
@@ -1004,7 +1005,17 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 			LIMIT $2
 		) ranked
 		WHERE ranked.seqnum = ANY($3)
-	`, mailboxID, slices.Max(seqNums), seqNums)
+	`
+	// Both endpoints must use one MVCC snapshot: an append/expunge between
+	// a ranked read and a separate last-UID read can create a range that
+	// names the wrong messages in every possible mailbox state.
+	query += ` UNION ALL
+		SELECT 0 AS seqnum, last.uid FROM (
+			SELECT uid FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			ORDER BY uid DESC LIMIT 1
+		) last`
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, slices.Max(seqNums), seqNums)
 	if err != nil {
 		return nil, fmt.Errorf("failed to map sequence numbers to UIDs: %w", err)
 	}
@@ -1022,13 +1033,11 @@ func (db *Database) uidsBySeqNum(ctx context.Context, mailboxID int64, seqNums [
 	return uidBySeq, rows.Err()
 }
 
-// appendSeqSetNums appends the sequence numbers set names as range ends; "*" is not one.
+// appendSeqSetNums includes zero as a marker for a target-mailbox '*' lookup.
 func appendSeqSetNums(seqNums []int64, set imap.SeqSet) []int64 {
 	for _, r := range set {
 		for _, n := range []uint32{r.Start, r.Stop} {
-			if n != 0 {
-				seqNums = append(seqNums, int64(n))
-			}
+			seqNums = append(seqNums, int64(n))
 		}
 	}
 	return seqNums
@@ -1036,32 +1045,75 @@ func appendSeqSetNums(seqNums []int64, set imap.SeqSet) []int64 {
 
 // seqSetToUIDSet maps set to the UID set it names according to uidBySeq (see
 // uidsBySeqNum): a range starting past the last message is dropped, one ending past it
-// runs to the last message ("*"), and the ends of a range may come in either order.
+// runs to the snapshot's last message, and range ends may come in either order.
 func seqSetToUIDSet(set imap.SeqSet, uidBySeq map[uint32]imap.UID) imap.UIDSet {
 	var uidSet imap.UIDSet
 	for _, seqRange := range set {
 		startUID, ok := uidBySeq[seqRange.Start]
 		if !ok {
+			if seqRange.Stop == 0 {
+				if lastUID, exists := uidBySeq[0]; exists {
+					uidSet = append(uidSet, imap.UIDRange{Start: lastUID, Stop: lastUID})
+				}
+			}
 			continue // Out of bounds or invalid
 		}
 		uidRange := imap.UIDRange{Start: startUID} // Stop 0 is "*"
 		if stopUID, ok := uidBySeq[seqRange.Stop]; ok {
 			uidRange.Start = min(startUID, stopUID)
 			uidRange.Stop = max(startUID, stopUID)
+		} else if lastUID, ok := uidBySeq[0]; ok {
+			// A fixed endpoint beyond the mailbox ends at the snapshot's tail,
+			// not an open UID range that could admit later arrivals past it.
+			uidRange.Start = min(startUID, lastUID)
+			uidRange.Stop = max(startUID, lastUID)
 		}
 		uidSet = append(uidSet, uidRange)
 	}
 	return uidSet
 }
 
+func criteriaContainsUIDWildcard(c *imap.SearchCriteria) bool {
+	if c == nil {
+		return false
+	}
+	for _, set := range c.UID {
+		for _, r := range set {
+			if r.Start == 0 || r.Stop == 0 {
+				return true
+			}
+		}
+	}
+	for i := range c.Not {
+		if criteriaContainsUIDWildcard(&c.Not[i]) {
+			return true
+		}
+	}
+	for i := range c.Or {
+		for j := range c.Or[i] {
+			if criteriaContainsUIDWildcard(&c.Or[i][j]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // collectSeqNums appends every sequence number c's sequence sets name as a range end,
-// nested criteria included; "*" is not one.
+// nested criteria included; zero also requests the target mailbox's last UID.
 func collectSeqNums(c *imap.SearchCriteria, seqNums *[]int64) {
 	if c == nil {
 		return
 	}
 	for _, seqSet := range c.SeqNum {
 		*seqNums = appendSeqSetNums(*seqNums, seqSet)
+	}
+	for _, uidSet := range c.UID {
+		for _, r := range uidSet {
+			if r.Start == 0 || r.Stop == 0 {
+				*seqNums = append(*seqNums, 0) // resolve UID '*' in this mailbox too
+			}
+		}
 	}
 	for i := range c.Not {
 		collectSeqNums(&c.Not[i], seqNums)
@@ -1079,6 +1131,29 @@ func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID)
 	if c == nil {
 		return
 	}
+	// UID '*' denotes the last live UID, not MaxUint32. Resolve it before
+	// appending sequence rewrites, whose UID 0 sentinel deliberately matches none.
+	for i, set := range c.UID {
+		var resolved imap.UIDSet
+		for _, r := range set {
+			if r.Start == 0 || r.Stop == 0 {
+				last, exists := uidBySeq[0]
+				if !exists {
+					continue // an empty mailbox has no wildcard endpoint
+				}
+				if r.Start == 0 {
+					r.Start = last
+				}
+				if r.Stop == 0 {
+					r.Stop = last
+				}
+				r.Start, r.Stop = min(r.Start, r.Stop), max(r.Start, r.Stop)
+			}
+			resolved = append(resolved, r)
+		}
+		c.UID[i] = resolved
+	}
+
 	for _, seqSet := range c.SeqNum {
 		if mappedUIDSet := seqSetToUIDSet(seqSet, uidBySeq); len(mappedUIDSet) > 0 {
 			c.UID = append(c.UID, mappedUIDSet)
@@ -1098,6 +1173,12 @@ func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID)
 }
 
 func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxID, accountID int64, criteria *imap.SearchCriteria, orderByClause string, limit, mailboxMessageCount int) ([]SearchMessageResult, error) {
+	criteria = cloneSearchCriteria(criteria)
+	if criteriaContainsUIDWildcard(criteria) {
+		if err := db.mapSeqNumCriteriaToUID(ctx, mailboxID, criteria); err != nil {
+			return nil, err
+		}
+	}
 	if err := db.canonicalizeSearchCriteriaKeywords(ctx, nil, mailboxID, criteria); err != nil {
 		return nil, err
 	}
@@ -1374,6 +1455,36 @@ func (db *Database) getSearchMessagesQueryExecutor(ctx context.Context, mailboxI
 	}
 
 	return messages, nil
+}
+
+// cloneSearchCriteria isolates mailbox-specific keyword and sequence rewrites
+// from the caller, which may reuse the same criteria for other mailboxes or retries.
+func cloneSearchCriteria(c *imap.SearchCriteria) *imap.SearchCriteria {
+	if c == nil {
+		return nil
+	}
+	out := *c
+	out.SeqNum = slices.Clone(c.SeqNum)
+	for i := range out.SeqNum {
+		out.SeqNum[i] = slices.Clone(c.SeqNum[i])
+	}
+	out.UID = slices.Clone(c.UID)
+	for i := range out.UID {
+		out.UID[i] = slices.Clone(c.UID[i])
+	}
+	out.Flag = slices.Clone(c.Flag)
+	out.NotFlag = slices.Clone(c.NotFlag)
+	out.Not = slices.Clone(c.Not)
+	for i := range out.Not {
+		out.Not[i] = *cloneSearchCriteria(&c.Not[i])
+	}
+	out.Or = slices.Clone(c.Or)
+	for i := range out.Or {
+		for j := range out.Or[i] {
+			out.Or[i][j] = *cloneSearchCriteria(&c.Or[i][j])
+		}
+	}
+	return &out
 }
 
 // SearchMessagesWithCriteria retrieves only lightweight message metadata needed for IMAP SEARCH requests.

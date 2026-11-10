@@ -12,7 +12,9 @@ import (
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/pkg/metrics"
 )
 
 var _ imapserver.SessionThread = (*IMAPSession)(nil)
@@ -32,14 +34,29 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 		}
 	}
 
+	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
+	if !acquired {
+		return nil, s.internalError("failed to acquire lock for thread")
+	}
 	if s.selectedMailbox == nil {
+		release()
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: "No mailbox selected",
 		}
 	}
+	selectedMailboxID := s.selectedMailbox.ID
+	selectedMailboxOwnerID := s.selectedMailbox.AccountID
+	selectedMailboxName := s.selectedMailbox.Name
+	mailboxMessageCount := s.currentNumMessages.Load()
+	criteria = s.decodeSearchCriteriaLocked(criteria)
+	release()
 
-	criteria, err := s.withSessionRecent(criteria, s.selectedMailbox.ID)
+	if s.useMasterDB.Load() {
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
+
+	criteria, err := s.withSessionRecent(criteria, selectedMailboxID)
 	if err != nil {
 		return nil, err
 	}
@@ -50,10 +67,12 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 	// destMailbox.AccountID, LMTP and delivery resolve the owner likewise). Passing the
 	// session account here would make every shared-mailbox body search return nothing.
 	withSeqNums := numKind == imapserver.NumKindSeq
-	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, s.selectedMailbox.ID, s.selectedMailbox.AccountID, criteria, includeSubject, withSeqNums, s.server.threadMaxMessages)
+	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, selectedMailboxID, selectedMailboxOwnerID, criteria, includeSubject, withSeqNums, s.server.threadMaxMessages)
 	if errors.Is(err, db.ErrThreadTooManyMessages) {
 		// RFC 5530 section 3, LIMIT: "The operation ran up against an
 		// implementation limit of some kind".
+		metrics.IMAPSearchRefused.WithLabelValues("result_cap").Inc()
+		s.InfoLog("search refused at the result cap", "command", "THREAD", "cap", s.server.threadMaxMessages, "mailbox", selectedMailboxName, "mailbox_messages", mailboxMessageCount)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeLimit,

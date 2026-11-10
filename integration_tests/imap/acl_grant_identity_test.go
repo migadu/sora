@@ -91,7 +91,7 @@ func startACLPermissionGateServer(t *testing.T, source *resilient.ResilientDatab
 		&storage.S3Storage{}, rdb, nil, nil, serverimap.IMAPServerOptions{
 			InsecureAuth: true,
 			Config: &config.Config{SharedMailboxes: config.SharedMailboxesConfig{
-				Enabled: true, NamespacePrefix: "Shared/", AllowUserCreate: true,
+				Enabled: true, NamespacePrefix: "Shared/", AllowUserCreate: true, AllowAnyoneIdentifier: true,
 			}},
 		})
 	require.NoError(t, err)

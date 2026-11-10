@@ -1,6 +1,7 @@
 package helpers
 
 import (
+	"bytes"
 	"strconv"
 	"strings"
 )
@@ -16,6 +17,10 @@ const (
 	// a backstop for loops that Delivered-To misses (chains that never repeat a local
 	// recipient, or forwarders that strip Delivered-To).
 	RedirectLoopHeader = "X-Sora-Loop"
+
+	// RedirectedByHeader identifies the primary address of the account whose
+	// Sieve script generated the outgoing message. Incoming copies are replaced.
+	RedirectedByHeader = "X-Redirected-By"
 
 	// DefaultMaxRedirectHops is the default cap on how many times one message may be
 	// redirected by Sora before further redirects are suppressed (mail-loop backstop).
@@ -87,6 +92,38 @@ func PrependHeaderLine(msg []byte, name, value string) []byte {
 	out = append(out, line...)
 	out = append(out, msg...)
 	return out
+}
+
+// SetHeaderLine removes every existing field named name, including its folded
+// continuation lines, and prepends a single replacement. All other bytes are
+// preserved, including the header/body separator and the body. Like
+// PrependHeaderLine, it strips CR/LF from name and value to prevent injection.
+func SetHeaderLine(msg []byte, name, value string) []byte {
+	name = stripCRLF(name)
+	remaining := make([]byte, 0, len(msg))
+	drop := false
+	for offset := 0; offset < len(msg); {
+		end := len(msg)
+		if n := bytes.IndexByte(msg[offset:], '\n'); n >= 0 {
+			end = offset + n + 1
+		}
+		line := bytes.TrimSuffix(msg[offset:end], []byte{'\n'})
+		line = bytes.TrimSuffix(line, []byte{'\r'})
+		if len(line) == 0 {
+			remaining = append(remaining, msg[offset:]...)
+			break
+		}
+		if line[0] != ' ' && line[0] != '\t' {
+			colon := bytes.IndexByte(line, ':')
+			// Match the message parser's tolerance for whitespace before the colon.
+			drop = colon >= 0 && strings.EqualFold(string(bytes.TrimRight(line[:colon], " \t")), name)
+		}
+		if !drop {
+			remaining = append(remaining, msg[offset:end]...)
+		}
+		offset = end
+	}
+	return PrependHeaderLine(remaining, name, value)
 }
 
 // stripCRLF removes CR and LF so a value cannot inject extra header lines.

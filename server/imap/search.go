@@ -303,11 +303,19 @@ func (s *IMAPSession) emptySavedSearchOnNo(err error) {
 // decodeSearchCriteriaLocked translates sequence numbers in search criteria.
 // IMPORTANT: The caller MUST hold s.mutex (either read or write lock) when calling this method.
 func (s *IMAPSession) decodeSearchCriteriaLocked(criteria *imap.SearchCriteria) *imap.SearchCriteria {
+	return s.decodeSearchCriteriaWithSeqNumsLocked(criteria, true)
+}
+
+// Multimailbox searches resolve '*' in each target mailbox, while still
+// resolving SEARCHRES against the selected session's saved UID set.
+func (s *IMAPSession) decodeSearchCriteriaWithSeqNumsLocked(criteria *imap.SearchCriteria, decodeSeqNums bool) *imap.SearchCriteria {
 	decoded := *criteria // make a shallow copy
 
-	decoded.SeqNum = make([]imap.SeqSet, len(criteria.SeqNum))
-	for i, seqSet := range criteria.SeqNum {
-		decoded.SeqNum[i] = s.decodeNumSetLocked(seqSet).(imap.SeqSet)
+	if decodeSeqNums {
+		decoded.SeqNum = make([]imap.SeqSet, len(criteria.SeqNum))
+		for i, seqSet := range criteria.SeqNum {
+			decoded.SeqNum[i] = s.decodeNumSetLocked(seqSet).(imap.SeqSet)
+		}
 	}
 
 	// UID sets don't need sequence-number decoding, but a "$" marker in the UID
@@ -323,12 +331,12 @@ func (s *IMAPSession) decodeSearchCriteriaLocked(criteria *imap.SearchCriteria) 
 
 	decoded.Not = make([]imap.SearchCriteria, len(criteria.Not))
 	for i, not := range criteria.Not {
-		decoded.Not[i] = *s.decodeSearchCriteriaLocked(&not)
+		decoded.Not[i] = *s.decodeSearchCriteriaWithSeqNumsLocked(&not, decodeSeqNums)
 	}
 	decoded.Or = make([][2]imap.SearchCriteria, len(criteria.Or))
 	for i := range criteria.Or {
 		for j := range criteria.Or[i] {
-			decoded.Or[i][j] = *s.decodeSearchCriteriaLocked(&criteria.Or[i][j])
+			decoded.Or[i][j] = *s.decodeSearchCriteriaWithSeqNumsLocked(&criteria.Or[i][j], decodeSeqNums)
 		}
 	}
 

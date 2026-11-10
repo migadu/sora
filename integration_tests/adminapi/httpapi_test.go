@@ -43,7 +43,7 @@ func (h *HTTPAPITestServer) Close() {
 }
 
 // setupHTTPAPIServer creates a test HTTP API server
-func setupHTTPAPIServer(t *testing.T) *HTTPAPITestServer {
+func setupHTTPAPIServer(t *testing.T, configure ...func(*adminapi.ServerOptions)) *HTTPAPITestServer {
 	t.Helper()
 
 	// Set up database
@@ -67,6 +67,9 @@ func setupHTTPAPIServer(t *testing.T) *HTTPAPITestServer {
 		AllowedHosts: []string{}, // Allow all for testing
 		Cache:        testCache,
 		TLS:          false,
+	}
+	for _, c := range configure {
+		c(&options)
 	}
 
 	// Create server
@@ -2022,7 +2025,10 @@ Date: %s
 func TestACLManagement(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	server := setupHTTPAPIServer(t)
+	// This positive-path fixture includes a grant to anyone. Enable that policy
+	// explicitly rather than relying on shared-mailbox policy being disabled.
+	shared := config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: true}
+	server := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.SharedMailboxes = shared })
 	defer server.Close()
 
 	// Create test accounts
@@ -2035,10 +2041,7 @@ func TestACLManagement(t *testing.T) {
 
 	// Add config to context to enable shared mailbox detection
 	cfg := &config.Config{
-		SharedMailboxes: config.SharedMailboxesConfig{
-			Enabled:         true,
-			NamespacePrefix: "Shared/",
-		},
+		SharedMailboxes: shared,
 	}
 	ctx = context.WithValue(ctx, consts.ConfigContextKey, cfg)
 
@@ -2424,6 +2427,45 @@ func TestACLManagementOneEntryPerAccount(t *testing.T) {
 	resp, body := server.makeRequest(t, "GET", "/admin/mailboxes/acl?"+url.Values{"owner": {"  "}, "mailbox": {shared}}.Encode(), nil)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("list with a blank owner: got %d %s, want 400", resp.StatusCode, body)
+	}
+}
+
+// TestACLGrantAnyoneFollowsAllowAnyoneIdentifier covers the Admin API half of issue
+// #159: with [shared_mailboxes] allow_anyone_identifier false (its default), granting
+// to "anyone" is refused (400), as it is over IMAP; a user can still be granted.
+func TestACLGrantAnyoneFollowsAllowAnyoneIdentifier(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	for _, allowed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("allow_anyone_identifier=%t", allowed), func(t *testing.T) {
+			shared := config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: allowed}
+			server := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.SharedMailboxes = shared })
+			defer server.Close()
+
+			owner := common.CreateTestAccount(t, server.rdb)
+			member := common.CreateTestAccount(t, server.rdb)
+			ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{SharedMailboxes: shared})
+			ownerID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
+			if err != nil {
+				t.Fatalf("Failed to resolve owner: %v", err)
+			}
+			mailbox := fmt.Sprintf("Shared/Anyone-%d", time.Now().UnixNano())
+			if err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, mailbox, nil); err != nil {
+				t.Fatalf("Failed to create mailbox: %v", err)
+			}
+
+			want := http.StatusBadRequest
+			if allowed {
+				want = http.StatusOK
+			}
+			for identifier, status := range map[string]int{"anyone": want, member.Email: http.StatusOK} {
+				resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant",
+					map[string]any{"owner": owner.Email, "mailbox": mailbox, "identifier": identifier, "rights": "lr"})
+				if resp.StatusCode != status {
+					t.Errorf("grant to %s: got %d %s, want %d", identifier, resp.StatusCode, strings.TrimSpace(string(body)), status)
+				}
+			}
+		})
 	}
 }
 
