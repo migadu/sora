@@ -95,3 +95,39 @@ func TestXClient_AdmissionVsForwardingDecoupling(t *testing.T) {
 		t.Errorf("peer %s must NOT be trusted to override the client IP under empty config", peer)
 	}
 }
+
+// A TTL that is not a number is an invalid XCLIENT attribute: the command is refused and
+// none of it applied, rather than the forwarded identity taken with a fresh hop budget.
+func TestXCLIENT_MalformedTTLIsRejected(t *testing.T) {
+	for _, ttl := range []string{"invalid", "", "5x"} {
+		t.Run("TTL="+ttl, func(t *testing.T) {
+			s := newLogoutTestSession(t)
+			s.conn = loopbackConn(t)
+			s.backend.xclientTrustedNets = mustParseNets(t, []string{"127.0.0.0/8"})
+
+			err := s.XCLIENT(nil, map[string]string{"ADDR": "203.0.113.7", "TTL": ttl})
+			if err == nil {
+				t.Errorf("XCLIENT with TTL=%q was accepted", ttl)
+			}
+			if s.RemoteIP != "127.0.0.1" || s.ProxyIP != "" || s.ForwardingParams != nil {
+				t.Errorf("refused XCLIENT was applied: remote %q, proxy %q, params %+v", s.RemoteIP, s.ProxyIP, s.ForwardingParams)
+			}
+		})
+	}
+
+	// Without a TTL, or with a numeric one, the forwarded identity is applied as before.
+	for _, attrs := range []map[string]string{
+		{"ADDR": "203.0.113.7"},
+		{"ADDR": "203.0.113.7", "TTL": "5"},
+	} {
+		s := newLogoutTestSession(t)
+		s.conn = loopbackConn(t)
+		s.backend.xclientTrustedNets = mustParseNets(t, []string{"127.0.0.0/8"})
+		if err := s.XCLIENT(nil, attrs); err != nil {
+			t.Fatalf("XCLIENT %v: %v", attrs, err)
+		}
+		if s.RemoteIP != "203.0.113.7" {
+			t.Errorf("XCLIENT %v: remote = %q, want the forwarded address", attrs, s.RemoteIP)
+		}
+	}
+}
