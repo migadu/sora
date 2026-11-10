@@ -250,6 +250,7 @@ type IMAPServer struct {
 	appCtx         context.Context
 	caps           imap.CapSet
 	tlsConfig      *tls.Config
+	useStartTLS    bool // tlsConfig upgrades a plaintext listener on STARTTLS instead of wrapping it
 	masterUsername []byte
 	masterPassword []byte
 	appendLimit    int64
@@ -348,6 +349,7 @@ type IMAPServerOptions struct {
 	TLSCertFile                 string
 	TLSKeyFile                  string
 	TLSVerify                   bool
+	TLSUseStartTLS              bool // Plaintext listener offering STARTTLS (RFC 9051 §6.2.1) instead of implicit TLS; requires TLS
 	MasterUsername              []byte
 	MasterPassword              []byte
 	MasterSASLUsername          []byte
@@ -564,6 +566,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		hostname:                     hostname,
 		instanceID:                   imapInstanceIDOrHostname(options.InstanceID, hostname),
 		maintenanceGate:              options.MaintenanceGate,
+		useStartTLS:                  options.TLS && options.TLSUseStartTLS, // config warns when tls_use_starttls lacks tls
 		name:                         name,
 		appCtx:                       appCtx,
 		addr:                         imapAddr,
@@ -796,6 +799,14 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		debugWriter = &maskingWriter{w: os.Stdout}
 	}
 
+	// go-imap offers STARTTLS whenever it has a TLS config and the connection
+	// is not a *tls.Conn, which an implicit-TLS connection under Sora's
+	// wrappers never is: hand it the config only for a STARTTLS listener.
+	var startTLSConfig *tls.Config
+	if s.tlsConfig != nil && s.useStartTLS {
+		startTLSConfig = serverPkg.StartTLSConfig(s.tlsConfig, "imap")
+	}
+
 	s.server = imapserver.New(&imapserver.Options{
 		NewSession:   s.newSession,
 		Logger:       log.Default(),
@@ -807,7 +818,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		IsTLS:       serverPkg.ConnIsTLS,
 		DebugWriter: debugWriter,
 		Caps:        s.caps,
-		TLSConfig:   nil,
+		TLSConfig:   startTLSConfig,
 	})
 
 	// Start connection limiter cleanup
@@ -913,6 +924,12 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	// Extract underlying net.Conn for setting timeouts and proxy protocol handling
 	netConn := conn.NetConn()
+
+	// go-imap upgrades the stream on STARTTLS by layering its TLS connection
+	// ABOVE netConn, so the timeout BYE must be written to the library's
+	// current connection, not to netConn's transport, or it lands in plaintext
+	// under the TLS records (#163).
+	serverPkg.SetTimeoutNoticeConn(netConn, conn.NetConn)
 
 	// Set auth idle timeout if configured (applies during pre-auth phase only)
 	if s.authIdleTimeout > 0 {
@@ -1113,7 +1130,7 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 	// bytes (broken PROXY+TLS combo).
 	base := serverPkg.WrapProxyProtocol(tcpListener, s.proxyReader, "IMAP")
 
-	if s.tlsConfig != nil {
+	if s.tlsConfig != nil && !s.useStartTLS {
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
 		listener = serverPkg.NewSoraTLSListenerFunc(base, s.tlsConfig, s.connConfig)
 		if connConfig.EnableTimeoutChecker {
@@ -1124,10 +1141,11 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 	} else {
 		// Use SoraListener for non-TLS with timeout protection
 		listener = serverPkg.NewSoraListenerFunc(base, s.connConfig)
+		starttls := s.tlsConfig != nil
 		if connConfig.EnableTimeoutChecker {
-			logger.Info("IMAP server listening", "name", s.name, "addr", imapAddr, "tls", false, "idle_timeout", connConfig.IdleTimeout, "session_max", connConfig.AbsoluteTimeout, "min_throughput", connConfig.MinBytesPerMinute)
+			logger.Info("IMAP server listening", "name", s.name, "addr", imapAddr, "tls", false, "starttls", starttls, "idle_timeout", connConfig.IdleTimeout, "session_max", connConfig.AbsoluteTimeout, "min_throughput", connConfig.MinBytesPerMinute)
 		} else {
-			logger.Info("IMAP server listening", "name", s.name, "addr", imapAddr, "tls", false)
+			logger.Info("IMAP server listening", "name", s.name, "addr", imapAddr, "tls", false, "starttls", starttls)
 		}
 	}
 	defer listener.Close()

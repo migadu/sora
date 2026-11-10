@@ -1353,6 +1353,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			TLSCertFile:                  serverConfig.TLSCertFile,
 			TLSKeyFile:                   serverConfig.TLSKeyFile,
 			TLSVerify:                    serverConfig.TLSVerify,
+			TLSUseStartTLS:               serverConfig.TLSUseStartTLS,
 			MasterUsername:               []byte(serverConfig.MasterUsername),
 			MasterPassword:               []byte(serverConfig.MasterPassword),
 			MasterSASLUsername:           []byte(serverConfig.MasterSASLUsername),
