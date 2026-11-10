@@ -127,3 +127,30 @@ func TestShutdownNoticeAfterSTLSIsReadableThroughTLS(t *testing.T) {
 		t.Fatalf("shutdown notice through TLS = %q, want %q", line, want)
 	}
 }
+
+// A shutdown while STLS is negotiating must not insert a plaintext -ERR into
+// the TLS handshake. The library exposes its plaintext NetConn until completion.
+func TestShutdownDuringSTLSHandshakeOmitsPlaintextNotice(t *testing.T) {
+	s, addr := startSTARTTLSTestServer(t)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	r := bufio.NewReader(conn)
+	if _, err := r.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprint(conn, "STLS\r\n")
+	if line, err := r.ReadString('\n'); err != nil || !strings.HasPrefix(line, "+OK") {
+		t.Fatalf("STLS = %q, %v", line, err)
+	}
+	// The positive response has been sent, so all subsequent bytes must be TLS.
+	go s.sendGracefulShutdownMessage()
+	conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	got := make([]byte, 128)
+	if n, _ := r.Read(got); n != 0 {
+		t.Fatalf("plaintext during STLS handshake: %q", got[:n])
+	}
+}
