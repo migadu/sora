@@ -203,11 +203,21 @@ type SoraConn struct {
 	onTimeout func(conn net.Conn, reason string) // Called before closing due to timeout
 	// currentConn reports the connection the protocol is using (see
 	// SetTimeoutNoticeConn). It is called only on the goroutine that reads, which
-	// records its answer in noticeConn, under mu, for the timeout goroutine.
-	// A registered provider returning nil suppresses the best-effort notice.
-	currentConn          func() net.Conn
-	noticeConn           net.Conn
-	noticeConnRegistered bool
+	// records its answer in noticeConn, under mu, for the timeout goroutine:
+	// the connection a library layered above this one, nil while there is none.
+	// noticeTLS, under mu too, is whether that connection's handshake is done.
+	currentConn func() net.Conn
+	noticeConn  net.Conn
+	noticeTLS   handshakeCheck
+	// startTLS is where a STARTTLS upgrade of a connection with a provider
+	// stands, under mu; startTLSScan finds the command in what the reading
+	// goroutine reads. See noticeTarget.
+	startTLS     startTLSPhase
+	startTLSScan startTLSScanner
+	// noticeMu is held while an asynchronous notice is chosen a writer and
+	// written, so that the read of a STARTTLS command can wait for a plaintext
+	// notice to finish before the library gets to acknowledge the command.
+	noticeMu sync.Mutex
 
 	// Lifecycle management
 	closed     bool
@@ -398,111 +408,317 @@ func (c *SoraConn) closeForTimeout(username, reason string, details ...any) {
 		// for the shard to exit, so the shard must not perform this operation.
 		unregisterConn(c)
 		transport := c.Conn
-		// The notice goes to the connection the protocol is using: the
-		// transport, unless a library layered its own connection above this
-		// one (STARTTLS) and registered it with SetTimeoutNoticeConn. Both
-		// reach the socket through transport, whose deadline bounds the write.
-		notice := transport
-		c.mu.RLock()
-		if c.noticeConnRegistered {
-			notice = c.noticeConn
-		}
-		c.mu.RUnlock()
 		// A concurrent protocol writer can replace the deadline, and TLS Close
 		// can wait while sending close_notify. Close the underlying transport
 		// at the same bound so neither can strand this goroutine.
 		timer := time.AfterFunc(timeoutNoticeGrace, func() { closeTimeoutTransport(transport) })
 		defer timer.Stop()
 		defer c.Close()
-		if c.onTimeout != nil && notice != nil {
+		if c.onTimeout == nil {
+			return
+		}
+		// The notice goes to the connection the protocol is using: the
+		// transport, unless a library layered its own connection above this
+		// one (STARTTLS) and registered it with SetTimeoutNoticeConn. Both
+		// reach the socket through transport, whose deadline bounds the write.
+		c.writeNotice(transport, func(notice net.Conn) {
 			if err := transport.SetWriteDeadline(time.Now().Add(timeoutNoticeGrace)); err == nil {
 				c.onTimeout(notice, reason)
 			}
-		}
+		})
 	}()
 }
 
-// setTimeoutNoticeConn registers the provider of the connection a timeout
-// notice is written to; see SetTimeoutNoticeConn.
-func (c *SoraConn) setTimeoutNoticeConn(current func() net.Conn) {
+// startTLSPhase is where the STARTTLS upgrade of a connection stands, as far
+// as the bytes its client sends show it.
+type startTLSPhase int
+
+const (
+	// startTLSNone: the session is plaintext, and a plaintext notice is safe.
+	startTLSNone startTLSPhase = iota
+	// startTLSRequested: the last thing read was a STARTTLS command. The
+	// library may acknowledge it at any moment, and the client then expects TLS.
+	startTLSRequested
+	// startTLSHandshaking: the client has started the TLS handshake.
+	startTLSHandshaking
+)
+
+// startTLSVerbs are the commands that start the upgrade: POP3's (RFC 2595) and
+// that of IMAP, ManageSieve and LMTP.
+var startTLSVerbs = [...]string{"STLS", "STARTTLS"}
+
+// startTLSScanner finds a STARTTLS command in the plaintext a client sends. The
+// verb is the first word of a line, or the second behind an IMAP tag.
+type startTLSScanner struct {
+	words   int                      // words completed on the current line
+	length  int                      // bytes of the word being read, 0 between words
+	matches [len(startTLSVerbs)]bool // the word so far is the start of that verb
+	found   bool                     // a word of the current line was a verb
+}
+
+// scan consumes data and reports whether it ends with a complete STARTTLS
+// command line. A command with anything behind it was pipelined, which the
+// library refuses.
+func (s *startTLSScanner) scan(data []byte) bool {
+	ended := false
+	for _, b := range data {
+		ended = false
+		switch b {
+		case '\n':
+			s.endWord()
+			ended = s.found
+			*s = startTLSScanner{}
+		case ' ', '\t', '\r':
+			s.endWord()
+		default:
+			if s.words >= 2 {
+				continue
+			}
+			for i, verb := range startTLSVerbs {
+				s.matches[i] = (s.length == 0 || s.matches[i]) && s.length < len(verb) && verb[s.length] == b&^0x20
+			}
+			s.length++
+		}
+	}
+	return ended
+}
+
+func (s *startTLSScanner) endWord() {
+	if s.length == 0 {
+		return
+	}
+	for i, verb := range startTLSVerbs {
+		if s.matches[i] && s.length == len(verb) {
+			s.found = true
+		}
+	}
+	s.words++
+	s.length = 0
+}
+
+// trackStartTLS follows a possible STARTTLS upgrade through data, which the
+// reading goroutine has just read in plaintext. A library offers no hook
+// between reading the command and acknowledging it, so the command itself is
+// the last moment at which a plaintext notice can be ruled out.
+func (c *SoraConn) trackStartTLS(data []byte) {
+	c.mu.RLock()
+	phase := c.startTLS
+	c.mu.RUnlock()
+	if phase == startTLSHandshaking {
+		return
+	}
+	next := startTLSNone
+	if phase == startTLSRequested && data[0] == 0x16 {
+		// A TLS handshake record, where a refused STARTTLS would be followed
+		// by the next command: the upgrade is under way.
+		next = startTLSHandshaking
+	} else if c.startTLSScan.scan(data) {
+		next = startTLSRequested
+	}
+	if next == phase {
+		return
+	}
 	c.mu.Lock()
-	c.noticeConnRegistered = true
+	if c.startTLS != startTLSHandshaking {
+		c.startTLS = next
+	}
 	c.mu.Unlock()
-	c.currentConn = current
-	c.recordNoticeConn()
+	if next != startTLSNone {
+		// A notice that chose the plaintext writer before the change is being
+		// written under noticeMu: let it finish before the library sees the
+		// command.
+		c.noticeMu.Lock()
+		c.noticeMu.Unlock()
+	}
+}
+
+// markStartTLSHandshake records that a TLS handshake above this connection has
+// begun (StartTLSConfig calls it with the ClientHello), whether or not the
+// STARTTLS command was recognised in the stream.
+func (c *SoraConn) markStartTLSHandshake() {
+	c.mu.Lock()
+	c.startTLS = startTLSHandshaking
+	c.mu.Unlock()
+}
+
+// noticeTarget returns the connection an asynchronous notice may be written to
+// right now, plain being the plaintext one, and nil when there is none: from
+// the STARTTLS command until the library's TLS connection has completed its
+// handshake the client reads neither plaintext nor, yet, TLS.
+func (c *SoraConn) noticeTarget(plain net.Conn) net.Conn {
+	c.mu.RLock()
+	upgraded, phase := c.noticeConn, c.startTLS
+	handshaken := c.noticeTLS.ready
+	c.mu.RUnlock()
+	if upgraded != nil {
+		// A library may publish its *tls.Conn before the handshake has run
+		// (go-imap does); a Write would then run, or wait for, the server
+		// handshake on this goroutine.
+		if _, isTLS := upgraded.(*tls.Conn); isTLS && !handshaken {
+			return nil
+		}
+		return upgraded
+	}
+	if phase != startTLSNone {
+		return nil
+	}
+	return plain
+}
+
+// writeNotice calls write with the connection an asynchronous notice may be
+// written to, and returns false without calling it when there is none.
+func (c *SoraConn) writeNotice(plain net.Conn, write func(net.Conn)) bool {
+	c.noticeMu.Lock()
+	defer c.noticeMu.Unlock()
+	target := c.noticeTarget(plain)
+	if target == nil {
+		return false
+	}
+	write(target)
+	return true
+}
+
+// notices returns the SoraConn itself; a type embedding one promotes it, which
+// is how soraConnUnder finds the SoraConn of a wrapper.
+func (c *SoraConn) notices() *SoraConn { return c }
+
+// soraConnUnder returns the SoraConn that conn is or wraps, or nil.
+func soraConnUnder(conn net.Conn) *SoraConn {
+	for conn != nil {
+		if sc, ok := conn.(interface{ notices() *SoraConn }); ok {
+			return sc.notices()
+		}
+		w, ok := conn.(interface{ Unwrap() net.Conn })
+		if !ok {
+			return nil
+		}
+		conn = w.Unwrap()
+	}
+	return nil
 }
 
 // recordNoticeConn asks the registered provider for the connection the
-// protocol is using and records it for closeForTimeout. Only the goroutine
+// protocol is using and records it for the notice writers. Only the goroutine
 // that reads may call it: a library swaps in its STARTTLS connection on that
-// goroutine, with nothing the timeout goroutine could synchronise with.
-func (c *SoraConn) recordNoticeConn() {
-	if c.currentConn == nil {
-		return
-	}
-	current := c.currentConn()
-	c.mu.Lock()
-	c.noticeConn = current
-	c.mu.Unlock()
+// goroutine, with nothing the timeout goroutine could synchronise with. It
+// reports whether the session may still upgrade: there is a provider, and it
+// has no upgraded connection yet.
+func (c *SoraConn) recordNoticeConn() bool {
+	return c.recordNoticeConnDuring(false)
 }
 
-// SetTimeoutNoticeConn has the SoraConn that conn is or wraps write its timeout
-// notice to the connection current returns, in place of its transport. A
-// protocol library that upgrades the stream with STARTTLS layers its TLS
-// connection ABOVE the SoraConn, so a notice written to the transport lands in
+// recordNoticeConnDuring is recordNoticeConn; reading says the caller is Read.
+//
+// A *tls.Conn is a writer for notices only once its handshake is complete,
+// which ConnectionState tells, but not without waiting for a handshake in
+// progress, and it is the handshake that issues the Read in which go-imap's
+// connection is first seen: the question is then asked on a goroutine of its
+// own, which gets its answer when the handshake ends. Elsewhere the reading
+// goroutine is not inside a handshake and asks directly.
+func (c *SoraConn) recordNoticeConnDuring(reading bool) bool {
+	if c.currentConn == nil {
+		return false
+	}
+	current := c.currentConn()
+	tlsConn, _ := current.(*tls.Conn)
+	c.mu.Lock()
+	c.noticeConn = current
+	if c.noticeTLS.conn != tlsConn {
+		c.noticeTLS = handshakeCheck{conn: tlsConn}
+	}
+	check := tlsConn != nil && !c.noticeTLS.ready && !c.noticeTLS.checking
+	if check {
+		c.noticeTLS.checking = true
+	}
+	c.mu.Unlock()
+	if check {
+		ask := func() {
+			ready := tlsConn.ConnectionState().HandshakeComplete
+			c.mu.Lock()
+			if c.noticeTLS.conn == tlsConn {
+				c.noticeTLS.ready, c.noticeTLS.checking = ready, false
+			}
+			c.mu.Unlock()
+		}
+		if reading {
+			go ask()
+		} else {
+			ask()
+		}
+	}
+	return current == nil
+}
+
+// handshakeCheck is what is known of the handshake of the *tls.Conn a provider
+// reported.
+type handshakeCheck struct {
+	conn     *tls.Conn
+	ready    bool // the handshake is complete
+	checking bool // a goroutine is waiting to learn whether it is
+}
+
+// SetTimeoutNoticeConn tells the SoraConn that conn is or wraps where the
+// protocol library's own connection is, for a listener whose library upgrades
+// the stream with STARTTLS. The library layers its TLS connection ABOVE the
+// SoraConn, so a notice written to the transport after the upgrade lands in
 // plaintext under the TLS records and the client sees a TLS error in place of
-// it (#163). Pass the library's accessor for its current connection: the
-// TLS connection after a completed upgrade, and nil while STARTTLS may be
-// starting or its handshake is incomplete. Nil suppresses the notice while
-// retaining the hard close: the library may already be handshaking through a
-// TLS connection that its accessor does not publish until the handshake ends.
+// it (#163). current is the library's accessor for that connection: the TLS
+// connection once there is one, nil before. While it returns nil the SoraConn
+// follows the client's side of the stream itself: a notice goes to the
+// transport in plaintext until the client sends STARTTLS, and nowhere from
+// then until the TLS connection is there with its handshake complete (the hard
+// close stays). A STARTTLS the library refuses shows in the plaintext command
+// that follows it.
 //
 // Call it on the goroutine that reads conn (a library's NewSession). current is
 // called only there, at registration and as each Read starts, never by the
 // timeout goroutine, so it may read the library's state without
 // synchronisation; the read that follows an upgrade picks up the new
-// connection. It returns false when there is no SoraConn under conn.
+// connection, and RefreshTimeoutNoticeConn does where none follows. It returns
+// false when there is no SoraConn under conn.
 func SetTimeoutNoticeConn(conn net.Conn, current func() net.Conn) bool {
-	for conn != nil {
-		if sc, ok := conn.(interface{ setTimeoutNoticeConn(func() net.Conn) }); ok {
-			sc.setTimeoutNoticeConn(current)
-			return true
-		}
-		w, ok := conn.(interface{ Unwrap() net.Conn })
-		if !ok {
-			return false
-		}
-		conn = w.Unwrap()
+	sc := soraConnUnder(conn)
+	if sc == nil {
+		return false
 	}
-	return false
+	sc.currentConn = current
+	sc.recordNoticeConn()
+	return true
 }
 
-// recordedNoticeConn returns the recorded notice connection and whether a
-// provider was registered. A registered nil connection suppresses unsafe notices.
-func (c *SoraConn) recordedNoticeConn() (net.Conn, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.noticeConn, c.noticeConnRegistered
+// RefreshTimeoutNoticeConn asks the provider registered with
+// SetTimeoutNoticeConn again. A TLS 1.3 client may send its first command with
+// the end of its handshake; the library then runs that command without a read
+// of the SoraConn in between, which is where the provider is otherwise asked.
+// Call it on the goroutine that reads conn, from a command that can take long.
+func RefreshTimeoutNoticeConn(conn net.Conn) {
+	if sc := soraConnUnder(conn); sc != nil {
+		sc.recordNoticeConn()
+	}
 }
 
-// NoticeConn returns the safe connection for an asynchronous shutdown notice.
-// It returns nil while a registered STARTTLS provider cannot expose a safe
-// writer; callers must omit the notice in that case and retain normal closure.
+// NoticeConn returns the connection an asynchronous notice to the session on
+// conn may be written to: conn itself, or the TLS connection a library layered
+// above its SoraConn on STARTTLS. It returns nil while that upgrade is being
+// negotiated; callers must omit the notice in that case and retain normal
+// closure. WriteNotice also keeps the upgrade from starting under the notice.
 func NoticeConn(conn net.Conn) net.Conn {
-	for c := conn; c != nil; {
-		if sc, ok := c.(interface{ recordedNoticeConn() (net.Conn, bool) }); ok {
-			if notice, registered := sc.recordedNoticeConn(); registered {
-				return notice
-			}
-			return conn
-		}
-		w, ok := c.(interface{ Unwrap() net.Conn })
-		if !ok {
-			return conn
-		}
-		c = w.Unwrap()
+	if sc := soraConnUnder(conn); sc != nil {
+		return sc.noticeTarget(conn)
 	}
 	return conn
+}
+
+// WriteNotice calls write with the connection NoticeConn returns for conn, and
+// returns false without calling it when there is none. A STARTTLS command that
+// arrives meanwhile is not handed to the library until write has returned, so
+// the notice cannot follow the acknowledgement of the upgrade in plaintext.
+func WriteNotice(conn net.Conn, write func(net.Conn)) bool {
+	if sc := soraConnUnder(conn); sc != nil {
+		return sc.writeNotice(conn, write)
+	}
+	write(conn)
+	return true
 }
 
 // closeTimeoutTransport bypasses TLS close_notify and wrapper cleanup, which
@@ -536,7 +752,7 @@ func (c *SoraConn) Read(b []byte) (int, error) {
 	var n int
 	var err error
 
-	c.recordNoticeConn()
+	upgradeable := c.recordNoticeConnDuring(true)
 
 	// First protocol-issued read on a direct plaintext connection: check for
 	// a TLS ClientHello before handing bytes to the protocol parser.
@@ -558,6 +774,9 @@ func (c *SoraConn) Read(b []byte) (int, error) {
 		c.lastActivity = time.Now()
 		c.bytesRead += int64(n)
 		c.mu.Unlock()
+		if upgradeable {
+			c.trackStartTLS(b[:n])
+		}
 	}
 
 	return n, err
@@ -1067,6 +1286,9 @@ func StartTLSConfig(config *tls.Config, protocol string) *tls.Config {
 		for conn := hello.Conn; conn != nil; {
 			if sc, ok := conn.(interface{ SetJA4Fingerprint(string) }); ok {
 				captureJA4(protocol, hello, sc.SetJA4Fingerprint)
+				if sc := soraConnUnder(conn); sc != nil {
+					sc.markStartTLSHandshake()
+				}
 				break
 			}
 			w, ok := conn.(interface{ Unwrap() net.Conn })

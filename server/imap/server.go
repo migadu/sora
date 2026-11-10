@@ -931,9 +931,9 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	// under the TLS records (#163).
 	serverPkg.SetTimeoutNoticeConn(netConn, func() net.Conn {
 		current := conn.NetConn()
-		// The timeout goroutine can retain this snapshot while STARTTLS is
-		// acknowledged. Never give it the plaintext writer of an upgradeable
-		// listener; TLS is published before go-imap starts its handshake.
+		// No TLS connection yet: the SoraConn tells a plaintext session from
+		// an upgrade in progress. go-imap publishes its TLS connection before
+		// the handshake has run, which the SoraConn waits out as well.
 		if s.useStartTLS && !serverPkg.ConnIsTLS(current) {
 			return nil
 		}

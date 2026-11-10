@@ -478,9 +478,9 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 			// plaintext under the TLS records (#163). Hijack hands the relay
 			// that same connection.
 			server.SetTimeoutNoticeConn(netConn, func() net.Conn {
-				// The library publishes its TLS connection only after the
-				// handshake succeeds. On a STARTTLS listener, even its
-				// currently plaintext stream may already be negotiating TLS.
+				// The library publishes its TLS connection once the handshake
+				// is done. Until then the SoraConn tells a plaintext session
+				// from an upgrade in progress. Only the reading goroutine asks.
 				if startTLSConfig != nil && !c.IsTLS() {
 					return nil
 				}
@@ -804,9 +804,9 @@ func (s *Server) sendGracefulShutdownBye() {
 	// after STARTTLS: NoticeConn returns the connection the session is using.
 	for _, session := range activeSessions {
 		session.mu.Lock()
-		if conn := server.NoticeConn(session.clientConn); conn != nil {
+		server.WriteNotice(session.clientConn, func(conn net.Conn) {
 			_, _ = fmt.Fprint(conn, "BYE (TRYLATER) \"Server shutting down, please reconnect\"\r\n")
-		}
+		})
 		session.mu.Unlock()
 	}
 

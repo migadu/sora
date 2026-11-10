@@ -136,3 +136,129 @@ func TestNoticeConnOmitsUnhandshakedTLSConn(t *testing.T) {
 		}
 	}
 }
+
+// The same through a real handshake that the library starts lazily, from its
+// first read of the published connection, as go-imap does: no writer, and no
+// waiting for one, while the handshake is in flight; the TLS connection once
+// it is done, without a further read.
+func TestNoticeConnFollowsLazyTLSHandshake(t *testing.T) {
+	cert, err := tls.LoadX509KeyPair("../testdata/sora.crt", "../testdata/sora.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, peer, upgraded := newUpgradeableConn(t, SoraConnConfig{})
+	libraryReads(t, sc, peer, "a STARTTLS\r\n")
+	tlsConn := tls.Server(sc, StartTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}}, "test"))
+	*upgraded = tlsConn
+	served := make(chan error, 1)
+	go func() {
+		_, err := tlsConn.Read(make([]byte, 16)) // handshakes first
+		served <- err
+	}()
+
+	// The handshake is waiting for the ClientHello inside sc.Read.
+	time.Sleep(50 * time.Millisecond)
+	answered := make(chan net.Conn, 1)
+	go func() { answered <- NoticeConn(sc) }()
+	select {
+	case got := <-answered:
+		if got != nil {
+			t.Fatalf("NoticeConn during the handshake = %T, want none", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("NoticeConn waited for the handshake in flight")
+	}
+
+	client := tls.Client(peer, &tls.Config{InsecureSkipVerify: true})
+	peer.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := client.Handshake(); err != nil {
+		t.Fatalf("client handshake: %v", err)
+	}
+	if _, err := client.Write([]byte("a NOOP\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-served; err != nil {
+		t.Fatalf("server read: %v", err)
+	}
+	for deadline := time.Now().Add(2 * time.Second); NoticeConn(sc) != net.Conn(tlsConn); {
+		if time.Now().After(deadline) {
+			t.Fatalf("NoticeConn after the handshake = %T, want the TLS connection", NoticeConn(sc))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A handshake through StartTLSConfig leaves no plaintext writer even when the
+// STARTTLS command that led to it was not recognised in the stream.
+func TestStartTLSConfigHandshakeSuppressesPlaintextNotice(t *testing.T) {
+	cert, err := tls.LoadX509KeyPair("../testdata/sora.crt", "../testdata/sora.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, peer, _ := newUpgradeableConn(t, SoraConnConfig{})
+	tlsConn := tls.Server(unwrapConn{sc}, StartTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}}, "test"))
+	clientErr := make(chan error, 1)
+	go func() { clientErr <- tls.Client(peer, &tls.Config{InsecureSkipVerify: true}).Handshake() }()
+	tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("server handshake: %v", err)
+	}
+	if err := <-clientErr; err != nil {
+		t.Fatalf("client handshake: %v", err)
+	}
+	if got := NoticeConn(sc); got != nil {
+		t.Fatalf("NoticeConn after an unannounced handshake = %T, want none", got)
+	}
+}
+
+// A TLS 1.3 client's first command can arrive with the end of its handshake:
+// the library publishes its TLS connection and runs the command with no read
+// in between. RefreshTimeoutNoticeConn is how the command picks it up.
+func TestRefreshTimeoutNoticeConnPicksUpTheUpgradeWithoutARead(t *testing.T) {
+	sc, peer, upgraded := newUpgradeableConn(t, SoraConnConfig{})
+	libraryReads(t, sc, peer, "STLS\r\n", "\x16\x03\x01\x02\x00")
+	tlsConn := &noticeRecordingConn{Conn: sc}
+	*upgraded = tlsConn
+	if got := NoticeConn(sc); got != nil {
+		t.Fatalf("NoticeConn before the refresh = %T, want none", got)
+	}
+	RefreshTimeoutNoticeConn(unwrapConn{sc})
+	if got := NoticeConn(sc); got != tlsConn {
+		t.Fatalf("NoticeConn after the refresh = %T, want the library's connection", got)
+	}
+}
+
+// A notice being written in plaintext must be on the wire before the library
+// can acknowledge a STARTTLS command, or it would follow the acknowledgement
+// into what the client reads as TLS.
+func TestWriteNoticeHoldsBackTheStartTLSCommand(t *testing.T) {
+	sc, peer, _ := newUpgradeableConn(t, SoraConnConfig{})
+	writing, finish := make(chan struct{}), make(chan struct{})
+	written := make(chan bool, 1)
+	go func() {
+		written <- WriteNotice(sc, func(net.Conn) {
+			close(writing)
+			<-finish
+		})
+	}()
+	<-writing
+
+	read := make(chan struct{})
+	go func() {
+		defer close(read)
+		libraryReads(t, sc, peer, "STLS\r\n")
+	}()
+	select {
+	case <-read:
+		t.Fatal("the library got the STARTTLS command while a plaintext notice was being written")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(finish)
+	<-read
+	if !<-written {
+		t.Fatal("WriteNotice reported no writer for a plaintext session")
+	}
+	if WriteNotice(sc, func(net.Conn) { t.Error("notice written after the STARTTLS command") }) {
+		t.Fatal("WriteNotice reported a writer after the STARTTLS command")
+	}
+}

@@ -67,6 +67,8 @@ var (
 // connection or server goes away mid-command.
 func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, authnID, password string) error {
 	start := time.Now()
+	// A login can arrive with the end of a STARTTLS handshake, with no read since.
+	server.RefreshTimeoutNoticeConn(s.conn)
 	success := false
 	defer func() {
 		if !success {
@@ -392,6 +394,8 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 // re-authentication gates. ctx is the library's per-command context.
 func (s *ManageSieveSession) Login(ctx context.Context, username, password string) error {
 	start := time.Now()
+	// A login can arrive with the end of a STARTTLS handshake, with no read since.
+	server.RefreshTimeoutNoticeConn(s.conn)
 
 	address, err := server.NewAddress(username)
 	if err != nil {

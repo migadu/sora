@@ -565,6 +565,9 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 			// TLS records (#163). Hijack hands the relay that same connection.
 			if s.tlsConfig != nil && !c.IsTLS() {
 				server.SetTimeoutNoticeConn(netConn, func() net.Conn {
+					// The library publishes its TLS connection once the handshake
+					// is done. Until then the SoraConn tells a plaintext session
+					// from an upgrade in progress. Only the reading goroutine asks.
 					if !c.IsTLS() {
 						return nil
 					}
@@ -857,11 +860,12 @@ func (s *POP3ProxyServer) sendGracefulShutdownMessage() {
 	// Step 2: Write shutdown message directly to clientConn.
 	for _, session := range activeSessions {
 		session.mutex.Lock()
-		if noticeConn := server.NoticeConn(session.clientConn); noticeConn != nil {
-			// Before hijack, after STLS, the client reads through the library's
-			// TLS connection, which sits above clientConn.
+		// Before hijack, after STLS, the client reads through the library's
+		// TLS connection, which sits above clientConn; while STLS is
+		// negotiating there is nothing to write to.
+		server.WriteNotice(session.clientConn, func(noticeConn net.Conn) {
 			_, _ = fmt.Fprint(noticeConn, "-ERR Server shutting down, please reconnect\r\n")
-		}
+		})
 		session.mutex.Unlock()
 	}
 

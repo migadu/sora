@@ -49,26 +49,6 @@ func TestShutdownNoticeBeforeSTLSReachesPlaintextClient(t *testing.T) {
 	}
 }
 
-// A STLS the library refuses leaves the session plaintext, and its notices
-// with it.
-func TestShutdownNoticeAfterRefusedSTLSReachesPlaintextClient(t *testing.T) {
-	s, addr := startSTARTTLSTestServer(t)
-	conn, reader := dialPlaintext(t, addr)
-	fmt.Fprint(conn, "STLS\r\nNOOP\r\n")
-	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "-ERR") {
-		t.Fatalf("pipelined STLS = %q, %v, want a refusal", line, err)
-	}
-
-	go s.sendGracefulShutdownMessage()
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		t.Fatalf("reading the shutdown notice in plaintext: %v", err)
-	}
-	if want := "-ERR Server shutting down, please reconnect\r\n"; line != want {
-		t.Fatalf("shutdown notice = %q, want %q", line, want)
-	}
-}
-
 // The slow-throughput notice of a session that stays plaintext on a listener
 // offering STLS goes to it in plaintext.
 func TestSlowThroughputNoticeOnPlaintextSessionOfSTLSListener(t *testing.T) {

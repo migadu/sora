@@ -1314,6 +1314,8 @@ func (s *POP3ProxySession) Login(ctx context.Context, username, password string)
 
 func (s *POP3ProxySession) doLogin(ctx context.Context, username, password string) error {
 	authStart := time.Now()
+	// A login can arrive with the end of a STLS handshake, with no read since.
+	server.RefreshTimeoutNoticeConn(s.listenerConn)
 	s.username = username
 	if err := s.authenticate(username, password); err != nil {
 		var rateLimitErr *server.RateLimitError

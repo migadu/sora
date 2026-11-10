@@ -216,6 +216,9 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		password = server.UnquoteString(password)
 	}
 
+	// A login can arrive with the end of a STLS handshake, with no read since.
+	server.RefreshTimeoutNoticeConn(s.conn)
+
 	// Apply progressive authentication delay BEFORE any other checks
 	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 	delayType := "POP3-PASS"

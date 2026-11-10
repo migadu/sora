@@ -81,9 +81,10 @@ func newSession(s *Server, conn net.Conn) *Session {
 	// Determine real client address (from PROXY header or direct connection)
 	clientAddr := server.GetRealClientIP(conn, proxyInfo)
 
-	// A STARTTLS-capable plaintext session has no asynchronous notice writer
+	// A STARTTLS-capable session has no TLS connection for a timeout notice
 	// until the upgrade completes. Register before any client command can be
-	// read, so the timeout goroutine cannot retain an old plaintext snapshot.
+	// read, so the SoraConn sees the STARTTLS command and stops its plaintext
+	// notices from there until handleStartTLS registers the TLS connection.
 	if s.startTLSConfig != nil && !server.ConnIsTLS(conn) {
 		server.SetTimeoutNoticeConn(conn, func() net.Conn { return nil })
 	}
@@ -708,7 +709,8 @@ func (s *Session) handleStartTLS(tag string, args []string) bool {
 	if s.clientReader.Buffered() > 0 {
 		return !s.handleAuthError(fmt.Sprintf("%s BAD STARTTLS must be the last command sent before TLS negotiation", tag))
 	}
-	// Stop asynchronous plaintext notices before acknowledging the upgrade.
+	// Stop asynchronous plaintext notices before acknowledging the upgrade
+	// (the SoraConn's own stopped when it read the command).
 	// The TLS connection is not published until HandshakeContext succeeds.
 	// sendBye holds writeMu while using its snapshot of clientConn. Wait for
 	// any earlier plaintext notice before acknowledging STARTTLS, then make
