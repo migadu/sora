@@ -13,6 +13,7 @@ import (
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/resilient"
+	serverPkg "github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/uploader"
 	"github.com/migadu/sora/storage"
 )
@@ -161,4 +162,28 @@ func TestShutdownByeAfterSTARTTLSIsReadableThroughTLS(t *testing.T) {
 	if want := "* BYE Server shutting down, please reconnect\r\n"; line != want {
 		t.Fatalf("shutdown BYE through TLS = %q, want %q", line, want)
 	}
+}
+
+func TestSTARTTLSHasNoPlaintextTimeoutNoticeWriter(t *testing.T) {
+	srv, addr := startSTARTTLSTestServer(t, time.Minute)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(time.Second))
+	if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	srv.activeConnsMutex.RLock()
+	defer srv.activeConnsMutex.RUnlock()
+	for c := range srv.activeConns {
+		if c.NetConn().RemoteAddr().String() == conn.LocalAddr().String() {
+			if got := serverPkg.NoticeConn(c.NetConn()); got != nil {
+				t.Fatalf("plaintext STARTTLS notice writer = %T; timeout can retain it across upgrade", got)
+			}
+			return
+		}
+	}
+	t.Fatal("accepted connection was not registered")
 }
