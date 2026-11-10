@@ -65,6 +65,8 @@ type Server struct {
 	tlsKeyFile         string
 	tlsVerify          bool
 	tlsConfig          *tls.Config // Global TLS config from TLS manager (optional)
+	useStartTLS        bool        // The listener is plaintext and sessions upgrade it on STARTTLS
+	startTLSConfig     *tls.Config // What sessions upgrade with on STARTTLS (set by Start); nil when STARTTLS is not offered
 	enableAffinity     bool
 	wg                 sync.WaitGroup
 	ctx                context.Context
@@ -172,6 +174,7 @@ type ServerOptions struct {
 	TLSCertFile              string
 	TLSKeyFile               string
 	TLSVerify                bool
+	TLSUseStartTLS           bool        // Plaintext listener offering STARTTLS (RFC 9051 §6.2.1) instead of implicit TLS; requires TLS
 	TLSConfig                *tls.Config // Global TLS config from TLS manager (optional)
 	RemoteTLS                bool
 	RemoteTLSVerify          bool
@@ -403,6 +406,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		tlsKeyFile:                 opts.TLSKeyFile,
 		tlsVerify:                  opts.TLSVerify,
 		tlsConfig:                  opts.TLSConfig,
+		useStartTLS:                opts.TLS && opts.TLSUseStartTLS, // config warns when tls_use_starttls lacks tls
 		enableAffinity:             opts.EnableAffinity,
 		ctx:                        ctx,
 		cancel:                     cancel,
@@ -475,6 +479,7 @@ func (s *Server) Start() error {
 	// 1. Per-server TLS: cert files provided
 	// 2. Global TLS: tls=true, no cert files, global TLS config provided
 	// 3. No TLS: tls=false
+	var tlsConfig *tls.Config
 	if s.tls && s.tlsCertFile != "" && s.tlsKeyFile != "" {
 		// Scenario 1: Per-server TLS with explicit cert files
 		cert, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
@@ -488,7 +493,7 @@ func (s *Server) Start() error {
 			clientAuth = tls.RequireAndVerifyClientCert
 		}
 
-		tlsConfig := &tls.Config{
+		tlsConfig = &tls.Config{
 			Certificates:             []tls.Certificate{cert},
 			MinVersion:               tls.VersionTLS12,
 			ClientAuth:               clientAuth,
@@ -497,49 +502,35 @@ func (s *Server) Start() error {
 			NextProtos:               []string{"imap"},
 			Renegotiation:            tls.RenegotiateNever,
 		}
-
-		s.listenerMu.Lock()
-		// Create base TCP listener with custom backlog
-		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-		if err != nil {
-			s.listenerMu.Unlock()
-			return fmt.Errorf("failed to start TCP listener: %w", err)
-		}
-		logger.Debug("IMAP Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
-		// Wrap with SoraTLSListener for TLS + JA4 capture + timeout protection
-		s.listener = server.NewSoraTLSListenerFunc(s.wrapProxyProtocol(tcpListener), tlsConfig, s.connConfig)
-		s.listenerMu.Unlock()
 	} else if s.tls && s.tlsConfig != nil {
 		// Scenario 2: Global TLS manager
-		s.listenerMu.Lock()
-		// Create base TCP listener with custom backlog
-		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-		if err != nil {
-			s.listenerMu.Unlock()
-			return fmt.Errorf("failed to start TCP listener: %w", err)
-		}
-		logger.Debug("IMAP Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
-		// Wrap with SoraTLSListener for TLS + JA4 capture + timeout protection
-		s.listener = server.NewSoraTLSListenerFunc(s.wrapProxyProtocol(tcpListener), s.tlsConfig, s.connConfig)
-		s.listenerMu.Unlock()
+		tlsConfig = s.tlsConfig
 	} else if s.tls {
 		// TLS enabled but no cert files and no global TLS config provided
 		s.cancel()
 		return fmt.Errorf("TLS enabled for IMAP proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", s.name)
-	} else {
-		// Scenario 3: No TLS
-		s.listenerMu.Lock()
-		// Create base TCP listener with custom backlog
-		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-		if err != nil {
-			s.listenerMu.Unlock()
-			return fmt.Errorf("failed to start listener: %w", err)
-		}
-		logger.Debug("IMAP Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
-		// Wrap with SoraListener for timeout protection (no TLS/JA4)
-		s.listener = server.NewSoraListenerFunc(s.wrapProxyProtocol(tcpListener), s.connConfig)
-		s.listenerMu.Unlock()
 	}
+
+	s.listenerMu.Lock()
+	// Create base TCP listener with custom backlog
+	tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
+	if err != nil {
+		s.listenerMu.Unlock()
+		return fmt.Errorf("failed to start TCP listener: %w", err)
+	}
+	logger.Debug("IMAP Proxy: Using listen backlog", "proxy", s.name, "backlog", s.listenBacklog)
+	if tlsConfig != nil && !s.useStartTLS {
+		// Wrap with SoraTLSListener for TLS + JA4 capture + timeout protection
+		s.listener = server.NewSoraTLSListenerFunc(s.wrapProxyProtocol(tcpListener), tlsConfig, s.connConfig)
+	} else {
+		// Wrap with SoraListener for timeout protection; with STARTTLS the
+		// session upgrades the connection itself, recording JA4 as it does.
+		s.listener = server.NewSoraListenerFunc(s.wrapProxyProtocol(tcpListener), s.connConfig)
+		if tlsConfig != nil {
+			s.startTLSConfig = server.StartTLSConfig(tlsConfig, "imap_proxy")
+		}
+	}
+	s.listenerMu.Unlock()
 
 	// Start connection limiter cleanup if enabled
 	if s.limiter != nil {

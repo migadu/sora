@@ -73,7 +73,7 @@ func maintenanceTLSSession(t *testing.T, backend net.Conn) (*Session, net.Conn) 
 	t.Helper()
 	clientProxy, clientPeer := net.Pipe()
 	t.Cleanup(func() { clientProxy.Close(); clientPeer.Close() })
-	return &Session{server: &Server{}, backendConn: backend, clientConn: clientProxy}, clientPeer
+	return &Session{server: &Server{}, backendConn: backend, clientConn: clientProxy, listenerConn: clientProxy}, clientPeer
 }
 
 func TestMaintenanceTLS_StalledHalfCloseDoesNotBlockOtherSessions(t *testing.T) {

@@ -60,7 +60,7 @@ func newProxiedSession(t *testing.T) *proxiedSession {
 	srv := &Server{name: "test-imap-proxy", ctx: ctx, activeSessions: map[*Session]struct{}{}}
 	s := &Session{
 		server: srv, ctx: ctx,
-		clientConn: clientProxy, clientReader: bufio.NewReader(clientProxy),
+		clientConn: clientProxy, listenerConn: clientProxy, clientReader: bufio.NewReader(clientProxy),
 		backendConn: backendProxy, backendReader: bufio.NewReader(backendProxy),
 	}
 	srv.activeSessions[s] = struct{}{}

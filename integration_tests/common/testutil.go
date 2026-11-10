@@ -1130,6 +1130,13 @@ func SkipIfDatabaseUnavailable(t *testing.T) {
 // SetupIMAPServerWithPROXY sets up an IMAP server with PROXY protocol support for proxy testing
 func SetupIMAPServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 	t.Helper()
+	return SetupIMAPServerWithPROXYOptions(t, nil)
+}
+
+// SetupIMAPServerWithPROXYOptions is SetupIMAPServerWithPROXY with configure
+// applied to the server options before the server is created.
+func SetupIMAPServerWithPROXYOptions(t *testing.T, configure func(*imap.IMAPServerOptions)) (*TestServer, TestAccount) {
+	t.Helper()
 
 	rdb := SetupTestDatabase(t)
 	account := CreateTestAccount(t, rdb)
@@ -1167,6 +1174,17 @@ func SetupIMAPServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 	masterUsername := "proxyuser"
 	masterPassword := "proxypass"
 
+	opts := imap.IMAPServerOptions{
+		InsecureAuth:         true,                               // Allow PLAIN auth (no TLS in tests)
+		ProxyProtocol:        true,                               // Enable PROXY protocol support
+		ProxyProtocolTimeout: "5s",                               // Timeout for PROXY headers
+		TrustedNetworks:      []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
+		MasterSASLUsername:   []byte(masterUsername),             // Master username for proxy authentication
+		MasterSASLPassword:   []byte(masterPassword),             // Master password for proxy authentication
+	}
+	if configure != nil {
+		configure(&opts)
+	}
 	server, err := imap.New(
 		context.Background(),
 		"test",
@@ -1176,14 +1194,7 @@ func SetupIMAPServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 		rdb,
 		uploadWorker, // properly initialized UploadWorker
 		nil,          // cache.Cache
-		imap.IMAPServerOptions{
-			InsecureAuth:         true,                               // Allow PLAIN auth (no TLS in tests)
-			ProxyProtocol:        true,                               // Enable PROXY protocol support
-			ProxyProtocolTimeout: "5s",                               // Timeout for PROXY headers
-			TrustedNetworks:      []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
-			MasterSASLUsername:   []byte(masterUsername),             // Master username for proxy authentication
-			MasterSASLPassword:   []byte(masterPassword),             // Master password for proxy authentication
-		},
+		opts,
 	)
 	if err != nil {
 		t.Fatalf("Failed to create IMAP server with PROXY support: %v", err)

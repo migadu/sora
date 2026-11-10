@@ -1421,6 +1421,7 @@ master_sasl_password = "proxypass"
 
 # --- PROXY TLS CONFIGURATION ---
 tls = false
+tls_use_starttls = false              # With tls = true: plaintext port offering STARTTLS (usually :143) instead of implicit TLS (:993)
 tls_cert_file = ""
 tls_key_file = ""
 tls_verify = true

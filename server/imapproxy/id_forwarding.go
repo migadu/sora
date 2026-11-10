@@ -31,7 +31,7 @@ func (s *Session) sendForwardingParametersToBackend() error {
 
 	// Forward JA4 TLS fingerprint if available
 	// The fingerprint is crucial for capability filtering on the backend
-	if ja4Conn, ok := s.clientConn.(interface{ GetJA4Fingerprint() (string, error) }); ok {
+	if ja4Conn, ok := s.listenerConn.(interface{ GetJA4Fingerprint() (string, error) }); ok {
 		fingerprint, err := ja4Conn.GetJA4Fingerprint()
 		if err == nil && fingerprint != "" {
 			forwardingParams.Variables["ja4-fingerprint"] = fingerprint
