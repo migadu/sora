@@ -350,6 +350,7 @@ type IMAPServerOptions struct {
 	TLSKeyFile                  string
 	TLSVerify                   bool
 	TLSUseStartTLS              bool // Plaintext listener offering STARTTLS (RFC 9051 §6.2.1) instead of implicit TLS; requires TLS
+	TLSConfig                   *tls.Config // Global TLS config from TLS manager (optional)
 	MasterUsername              []byte
 	MasterPassword              []byte
 	MasterSASLUsername          []byte

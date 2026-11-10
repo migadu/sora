@@ -136,6 +136,7 @@ type POP3ServerOptions struct {
 	TLSKeyFile                  string
 	TLSVerify                   bool
 	TLSUseStartTLS              bool // Plaintext listener offering STLS (RFC 2595) instead of implicit TLS; requires TLS
+	TLSConfig                   *tls.Config // Global TLS config from TLS manager (optional)
 	MasterUsername              string
 	MasterPassword              string
 	MasterSASLUsername          string
