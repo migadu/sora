@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/go-imap/imapserver"
 )
 
 // TestMonitorActiveConnections_LogsCount verifies monitoring logs active connections

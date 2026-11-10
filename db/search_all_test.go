@@ -3,7 +3,7 @@ package db
 import (
 	"testing"
 
-	imap "github.com/emersion/go-imap/v2"
+	imap "github.com/migadu/go-imap"
 )
 
 func TestIsCriteriaSearchAll(t *testing.T) {

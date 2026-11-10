@@ -1,6 +1,6 @@
 package helpers
 
-import "github.com/emersion/go-imap/v2"
+import "github.com/migadu/go-imap"
 
 // The RFC 9979 §4 attachment keywords. They are mutually exclusive, and the
 // server sets one during delivery; $hasnoattachment records that the message

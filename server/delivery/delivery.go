@@ -11,10 +11,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"

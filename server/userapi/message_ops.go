@@ -10,7 +10,7 @@ import (
 
 	"github.com/migadu/sora/logger"
 
-	imap "github.com/emersion/go-imap/v2"
+	imap "github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"

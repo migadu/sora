@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	imap "github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapclient"
+	imap "github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
 )
 

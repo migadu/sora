@@ -4,7 +4,7 @@ import (
 	"maps"
 	"slices"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 )
 
 // copyUIDMapping turns a source UID → destination UID map into the COPYUID mapping

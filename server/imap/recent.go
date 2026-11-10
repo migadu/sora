@@ -5,7 +5,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 )
 
 // RFC 3501 §2.3.2: \Recent is a session flag, so Sora does not store it (see

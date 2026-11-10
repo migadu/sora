@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 )
 
 // TestBuildSearchCriteria_TextSearch verifies that TEXT searches correctly query
