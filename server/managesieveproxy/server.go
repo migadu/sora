@@ -477,7 +477,15 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 			// written to the library's current connection, or it lands in
 			// plaintext under the TLS records (#163). Hijack hands the relay
 			// that same connection.
-			server.SetTimeoutNoticeConn(netConn, c.NetConn)
+			server.SetTimeoutNoticeConn(netConn, func() net.Conn {
+				// The library publishes its TLS connection only after the
+				// handshake succeeds. On a STARTTLS listener, even its
+				// currently plaintext stream may already be negotiating TLS.
+				if startTLSConfig != nil && !c.IsTLS() {
+					return nil
+				}
+				return c.NetConn()
+			})
 
 			// Count the connection only once it is past every rejection
 			// point, so the decrements in the session close path always
@@ -796,8 +804,8 @@ func (s *Server) sendGracefulShutdownBye() {
 	// after STARTTLS: NoticeConn returns the connection the session is using.
 	for _, session := range activeSessions {
 		session.mu.Lock()
-		if session.clientConn != nil {
-			_, _ = fmt.Fprint(server.NoticeConn(session.clientConn), "BYE (TRYLATER) \"Server shutting down, please reconnect\"\r\n")
+		if conn := server.NoticeConn(session.clientConn); conn != nil {
+			_, _ = fmt.Fprint(conn, "BYE (TRYLATER) \"Server shutting down, please reconnect\"\r\n")
 		}
 		session.mu.Unlock()
 	}
