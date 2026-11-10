@@ -482,6 +482,22 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 				c.SetTLS(true)
 			}
 
+			// go-managesieve upgrades the stream on STARTTLS by layering its
+			// TLS connection ABOVE netConn, so the throughput-timeout notice
+			// must be written to the library's current connection, not to
+			// netConn's transport, or it lands in plaintext under the TLS
+			// records (#163).
+			if startTLSConfig != nil && !c.IsTLS() {
+				serverPkg.SetTimeoutNoticeConn(netConn, func() net.Conn {
+					// NetConn is still plaintext during the library's TLS handshake.
+					// Only the reading goroutine asks; an unsafe notice is omitted.
+					if !c.IsTLS() {
+						return nil
+					}
+					return c.NetConn()
+				})
+			}
+
 			// Count the connection only once it is past every rejection
 			// point, so the decrements in the session close path always
 			// balance.
@@ -563,8 +579,9 @@ func (s *ManageSieveServer) connConfig() serverPkg.SoraConnConfig {
 		EnableTimeoutChecker: settings.minBytesPerMinute > 0,
 		NoAbsoluteTimeout:    true, // the library enforces absolute_session_timeout
 		OnTimeout: func(conn net.Conn, reason string) {
-			// Best-effort BYE before closing (RFC 5804 Section 1.3); TRYLATER
-			// indicates a temporary condition.
+			// Best-effort BYE before closing, on the connection the library is
+			// using (the TLS one after STARTTLS; see NewSession). RFC 5804
+			// Section 1.3; TRYLATER indicates a temporary condition.
 			message := "BYE (TRYLATER) \"Connection timeout, please reconnect\"\r\n"
 			if reason == "slow_throughput" {
 				message = "BYE (TRYLATER) \"Connection too slow, please reconnect\"\r\n"
