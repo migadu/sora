@@ -386,15 +386,16 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 
 	// Determine the parent path if parentID is provided
 	var parentPath string
+	var parentIsShared bool
 	if parentID != nil {
 		// Fetch the parent mailbox to get its path. FOR KEY SHARE holds the parent in
 		// place until this child is committed: it conflicts with SoftDeleteMailbox's FOR
 		// UPDATE (so the parent's delete sees this child, or this create sees the parent
 		// gone), but not with the highest_uid UPDATE every delivery into the parent takes.
 		err := tx.QueryRow(ctx, `
-			SELECT path FROM mailboxes WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
+			SELECT path, COALESCE(is_shared, FALSE) FROM mailboxes WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
 			FOR KEY SHARE
-		`, *parentID, AccountID).Scan(&parentPath)
+		`, *parentID, AccountID).Scan(&parentPath, &parentIsShared)
 
 		if err != nil {
 			if err == pgx.ErrNoRows {
@@ -456,8 +457,10 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	// If shared mailbox, grant creator full rights (or configured default rights)
 	// Also inherit ACLs from parent mailbox if one exists (RFC 4314)
 	if isShared {
-		// If there's a parent mailbox, inherit its ACLs
-		if parentID != nil {
+		// If there's a shared parent mailbox, inherit its ACLs. A parent that is not
+		// shared has none to give: a level above a namespace prefix of several levels,
+		// or a personal mailbox under the namespace's name.
+		if parentID != nil && parentIsShared {
 			// Copy all ACL entries from parent to child
 			_, err = tx.Exec(ctx, `
 				INSERT INTO mailbox_acls (mailbox_id, account_id, identifier, rights, created_at, updated_at)
@@ -470,7 +473,7 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 			}
 			logger.Info("Database: created shared mailbox with inherited ACLs from parent", "name", name, "mailbox_id", mailboxID, "parent_id", *parentID)
 		} else {
-			// No parent, grant creator full rights (or configured default rights)
+			// No shared parent, grant creator full rights (or configured default rights)
 			defaultRights := "lrswipkxtea" // Full rights by default
 			if cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config); ok && cfg != nil && cfg.SharedMailboxes.DefaultRights != "" {
 				defaultRights = cfg.SharedMailboxes.DefaultRights
@@ -620,6 +623,20 @@ func (db *Database) IsMailboxShared(ctx context.Context, mailboxID int64) (bool,
 		return false, consts.ErrMailboxNotFound
 	}
 	return shared, err
+}
+
+// GetOwnedMailboxIDByName returns the ID of the account's own live mailbox of that
+// name. Unlike GetMailboxByName it never answers with another owner's shared
+// mailbox, which cannot be the parent of a mailbox of this account.
+func (db *Database) GetOwnedMailboxIDByName(ctx context.Context, accountID int64, name string) (int64, error) {
+	var id int64
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx,
+		`SELECT id FROM mailboxes WHERE account_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL`,
+		accountID, name).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, consts.ErrMailboxNotFound
+	}
+	return id, err
 }
 
 // PurgeMailboxStep performs ONE bounded step of the hard delete of a mailbox, and reports

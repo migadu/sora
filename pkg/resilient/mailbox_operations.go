@@ -30,26 +30,39 @@ func (rd *ResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, Acco
 // ResolveOrCreateMailboxPathWithRetry resolves every level of a mailbox path,
 // creating missing ancestors in order so paths and inherited ACLs stay linked.
 // The caller is responsible for authorizing creation before invoking this helper.
+// Every level is the account's own: another owner's shared mailbox of the same name
+// cannot be the parent of a mailbox of this account.
 func (rd *ResilientDatabase) ResolveOrCreateMailboxPathWithRetry(ctx context.Context, accountID int64, name string) (*int64, error) {
 	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	parts := strings.Split(name, string(consts.MailboxDelimiter))
 	var parentID *int64
 	for i := 1; i <= len(parts); i++ {
 		path := strings.Join(parts[:i], string(consts.MailboxDelimiter))
-		mailbox, err := rd.GetMailboxByNameWithRetry(ctx, accountID, path)
+		id, err := rd.getOwnedMailboxIDByNameWithRetry(ctx, accountID, path)
 		if errors.Is(err, consts.ErrMailboxNotFound) {
 			if err := rd.CreateMailboxWithRetry(ctx, accountID, path, parentID); err != nil && !errors.Is(err, consts.ErrDBUniqueViolation) {
 				return nil, fmt.Errorf("create parent mailbox %q: %w", path, err)
 			}
 			// Re-fetch after a successful or concurrent creation, using the writer.
-			mailbox, err = rd.GetMailboxByNameWithRetry(ctx, accountID, path)
+			id, err = rd.getOwnedMailboxIDByNameWithRetry(ctx, accountID, path)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("resolve parent mailbox %q: %w", path, err)
 		}
-		parentID = &mailbox.ID
+		parentID = &id
 	}
 	return parentID, nil
+}
+
+func (rd *ResilientDatabase) getOwnedMailboxIDByNameWithRetry(ctx context.Context, accountID int64, name string) (int64, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetOwnedMailboxIDByName(ctx, accountID, name)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
 }
 
 // HasLiveDescendantsWithRetry reports whether any live mailbox sits below the given path.

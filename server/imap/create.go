@@ -108,9 +108,19 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 	// Resolve the nearest existing ancestor before creating anything. Shared
 	// children belong to that hierarchy's owner, while permission is checked
 	// against the acting account. RFC 4314 §4 requires k, independently of l.
+	// A shared mailbox's hierarchy is that of its nearest shared ancestor, as in
+	// sharedCreateRefusal: a personal mailbox of the user's under an ancestor's
+	// name does not make the new shared mailbox the user's own.
+	inSharedNamespace := s.server.config != nil && s.server.config.SharedMailboxes.InNamespace(name)
 	for i := len(parts) - 1; i >= 1; i-- {
 		ancestorName := strings.Join(parts[:i], string(consts.MailboxDelimiter))
 		ancestor, lookupErr := s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, AccountID, ancestorName, db.ACLRightCreate)
+		if lookupErr == nil && inSharedNamespace {
+			var isShared bool
+			if isShared, lookupErr = s.server.rdb.IsMailboxSharedWithRetry(ctx, ancestor.ID); lookupErr == nil && !isShared {
+				continue
+			}
+		}
 		if errors.Is(lookupErr, consts.ErrMailboxNotFound) {
 			continue
 		}
@@ -312,15 +322,34 @@ func validateSpecialUse(attrs []imap.MailboxAttr) (string, *imap.Error) {
 // predate case-insensitive namespace matching. accountID is the account whose view
 // resolves the parents.
 func (s *IMAPSession) sharedCreateRefusal(ctx context.Context, accountID int64, name string) error {
-	if s.server.config == nil {
+	refused, err := s.isRefusedSharedRoot(ctx, accountID, name)
+	if err != nil {
+		return err
+	}
+	if !refused {
 		return nil
+	}
+	s.DebugLog("refusing to create a shared mailbox: allow_user_create is off", "mailbox", name)
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeNoPerm,
+		Text: "Only administrators can create shared mailboxes",
+	}
+}
+
+// isRefusedSharedRoot reports whether name is one sharedCreateRefusal refuses: in the
+// shared namespace with no existing shared mailbox above it, while users may not
+// create top-level shared mailboxes.
+func (s *IMAPSession) isRefusedSharedRoot(ctx context.Context, accountID int64, name string) (bool, error) {
+	if s.server.config == nil {
+		return false, nil
 	}
 	shared := s.server.config.SharedMailboxes
 	if !shared.Enabled || shared.AllowUserCreate {
-		return nil
+		return false, nil
 	}
 	if !shared.InNamespace(name) {
-		return nil
+		return false, nil
 	}
 	// An existing shared parent inside the namespace proves this extends an
 	// existing shared root. k alone can authorize CREATE even when l hides that
@@ -338,17 +367,12 @@ func (s *IMAPSession) sharedCreateRefusal(ctx context.Context, accountID int64, 
 		if err == nil {
 			var isShared bool
 			if isShared, err = s.server.rdb.IsMailboxSharedWithRetry(ctx, mbox.ID); err == nil && isShared {
-				return nil
+				return false, nil
 			}
 		}
 		if err != nil && !errors.Is(err, consts.ErrMailboxNotFound) {
-			return s.internalError("failed to look up shared mailbox '%s': %v", parent, err)
+			return false, s.internalError("failed to look up shared mailbox '%s': %v", parent, err)
 		}
 	}
-	s.DebugLog("refusing to create a shared mailbox: allow_user_create is off", "mailbox", name)
-	return &imap.Error{
-		Type: imap.StatusResponseTypeNo,
-		Code: imap.ResponseCodeNoPerm,
-		Text: "Only administrators can create shared mailboxes",
-	}
+	return true, nil
 }

@@ -409,9 +409,21 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Validate before creating parents, so a refused rename leaves no hierarchy.
-	if helpers.MailboxNameHasTraversal(*newName) || globalConfig.SharedMailboxes.InNamespace(mbox.Name) != globalConfig.SharedMailboxes.InNamespace(*newName) {
+	// Validate before creating parents, so a refused rename leaves no hierarchy. The
+	// namespace boundary is checked against the stored flag, as db.RenameMailbox does:
+	// a personal mailbox under the shared prefix may only be renamed out of it.
+	isShared, err := rdb.IsMailboxSharedWithRetry(ctx, mbox.ID)
+	if err != nil {
+		fmt.Printf("Failed to check whether mailbox '%s' is shared: %v\n", *oldName, err)
+		os.Exit(1)
+	}
+	if helpers.MailboxNameHasTraversal(*newName) ||
+		(globalConfig.SharedMailboxes.Enabled && globalConfig.SharedMailboxes.InNamespace(*newName) != isShared) {
 		fmt.Println("Failed to rename mailbox: invalid destination or shared namespace boundary")
+		os.Exit(1)
+	}
+	if helpers.MailboxNameIsBelow(*newName, mbox.Name) {
+		fmt.Println("Failed to rename mailbox: a mailbox cannot be renamed to a name below itself")
 		os.Exit(1)
 	}
 	renameCtx := context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: globalConfig.SharedMailboxes})
