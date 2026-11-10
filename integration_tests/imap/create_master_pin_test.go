@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/migadu/go-imap/imapclient"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/stretchr/testify/require"

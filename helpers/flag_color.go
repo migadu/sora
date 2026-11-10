@@ -3,7 +3,7 @@ package helpers
 import (
 	"strings"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 )
 
 // FlagColorKeywords are the RFC 9979 §3.1 keywords whose bit pattern gives a

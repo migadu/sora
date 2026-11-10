@@ -5,7 +5,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/pkg/metrics"
 	serverPkg "github.com/migadu/sora/server"
 )

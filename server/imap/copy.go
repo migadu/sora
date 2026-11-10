@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -250,18 +250,9 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 		}
 	}
 
-	// The uidMap contains the mapping of original UIDs to new UIDs.
-	// We need to construct the UID sets for the response.
-	var sourceUIDSet, destUIDSet imap.UIDSet
-	for oldUID, newUID := range uidMap {
-		sourceUIDSet.AddNum(oldUID)
-		destUIDSet.AddNum(newUID)
-	}
-
 	copyData := &imap.CopyData{
 		UIDValidity: destMailbox.UIDValidity,
-		SourceUIDs:  sourceUIDSet,
-		DestUIDs:    destUIDSet,
+		UIDMapping:  copyUIDMapping(uidMap),
 	}
 
 	s.DebugLog("messages copied", "from", selectedMailboxName, "to", mboxName)

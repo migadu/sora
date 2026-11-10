@@ -5,8 +5,8 @@ package imap_test
 import (
 	"testing"
 
-	imap "github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapclient"
+	imap "github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
 )
 
@@ -161,7 +161,7 @@ func TestIMAP_RecentFlag_CopyDoesNotStoreRecent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("COPY to Sent failed: %v", err)
 	}
-	destUID := copyData.DestUIDs[0].Start
+	destUID := copyData.UIDMapping[0].Dest.Start
 	t.Logf("COPY succeeded, dest UID %d in Sent", destUID)
 
 	// Select Sent and fetch the copied message's flags via UID.

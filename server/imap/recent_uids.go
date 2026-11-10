@@ -4,7 +4,7 @@ import (
 	"container/list"
 	"sync"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 )
 
 // maxRecentUIDMailboxes bounds how many mailboxes a node keeps \Recent bookkeeping for.

@@ -4,7 +4,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 )
 
 // assertTextPartsHaveLineCount walks a body structure and fails if any text part

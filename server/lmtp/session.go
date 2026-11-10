@@ -18,8 +18,8 @@ import (
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 
-	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-smtp"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"

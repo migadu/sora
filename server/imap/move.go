@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/helpers"
 )
 
@@ -168,19 +168,10 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		s.triggerSpamTraining(ctx, destMailbox.ID, s.selectedMailbox.Name, dest, messageUIDMap)
 	}
 
-	var mappedSourceUIDs []imap.UID
-	var mappedDestUIDs []imap.UID
-
-	for originalUID, newUID := range messageUIDMap {
-		mappedSourceUIDs = append(mappedSourceUIDs, imap.UID(originalUID))
-		mappedDestUIDs = append(mappedDestUIDs, imap.UID(newUID))
-	}
-
-	if len(mappedSourceUIDs) > 0 && len(mappedDestUIDs) > 0 {
+	if len(messageUIDMap) > 0 {
 		copyData := &imap.CopyData{
-			UIDValidity: destMailbox.UIDValidity,             // UIDVALIDITY of the destination mailbox
-			SourceUIDs:  imap.UIDSetNum(mappedSourceUIDs...), // Original UIDs (source mailbox)
-			DestUIDs:    imap.UIDSetNum(mappedDestUIDs...),   // New UIDs in the destination mailbox
+			UIDValidity: destMailbox.UIDValidity, // UIDVALIDITY of the destination mailbox
+			UIDMapping:  copyUIDMapping(messageUIDMap),
 		}
 
 		if err := w.WriteCopyData(copyData); err != nil {

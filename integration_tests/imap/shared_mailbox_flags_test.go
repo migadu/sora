@@ -12,8 +12,8 @@ import (
 	"testing"
 
 	"github.com/BurntSushi/toml"
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapclient"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/integration_tests/common"

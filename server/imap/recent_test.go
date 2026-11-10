@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 )
 
 // TestRecentAsUIDs: go-imap passes SEARCH RECENT as Flag \Recent, OLD as

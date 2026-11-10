@@ -3,7 +3,7 @@ package imap
 import (
 	"testing"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 )
 
 // deepNotCriteria builds `depth` levels of nested NOT iteratively (no recursion in the

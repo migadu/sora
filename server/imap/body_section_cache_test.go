@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 )
 
 // TestRetainBodySection_Bounds pins the bounds on what a session may keep between

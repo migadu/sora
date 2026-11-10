@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-message"
+	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/assert"
 )
 

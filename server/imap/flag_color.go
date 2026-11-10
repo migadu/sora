@@ -3,7 +3,7 @@ package imap
 import (
 	"slices"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/helpers"
 )
 

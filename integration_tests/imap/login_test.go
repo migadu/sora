@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/migadu/go-imap/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
 )
 
