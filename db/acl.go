@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 )
 
@@ -59,7 +60,17 @@ var (
 	// ErrOwnerACL: the owner holds every right whatever the ACL says
 	// (has_mailbox_right), so the owner's rights cannot be changed.
 	ErrOwnerACL = errors.New("the mailbox owner always holds every right")
+	// ErrAnyoneDisabled: [shared_mailboxes] allow_anyone_identifier is false.
+	ErrAnyoneDisabled = errors.New(`granting rights to "anyone" is disabled`)
 )
+
+// anyoneAllowed reports whether rights may be granted to "anyone": not when the
+// shared mailbox config in ctx has allow_anyone_identifier off (its default). A
+// caller without that config in ctx, a direct database caller, is not restricted.
+func anyoneAllowed(ctx context.Context) bool {
+	cfg, ok := ctx.Value(consts.ConfigContextKey).(*config.Config)
+	return !ok || cfg == nil || !cfg.SharedMailboxes.Enabled || cfg.SharedMailboxes.AllowAnyoneIdentifier
+}
 
 // ErrInvalidACLRight is returned by ValidateACLRights for a character that is not
 // one of AllACLRights.
@@ -184,6 +195,9 @@ func resolveGrantee(ctx context.Context, q aclQuerier, mb aclMailbox, identifier
 		return nil, "", fmt.Errorf("shared mailbox has no owner domain")
 	}
 	if identifier == AnyoneIdentifier {
+		if !anyoneAllowed(ctx) {
+			return nil, "", ErrAnyoneDisabled
+		}
 		return nil, AnyoneIdentifier, nil
 	}
 	at := strings.LastIndexByte(identifier, '@')
@@ -487,7 +501,7 @@ func (db *Database) MailboxACLGrantability(ctx context.Context, mailboxID int64,
 		return ACLGrantNone, err
 	}
 	if identifier == AnyoneIdentifier {
-		if mb.isShared && mb.ownerDomain != "" {
+		if mb.isShared && mb.ownerDomain != "" && anyoneAllowed(ctx) {
 			return ACLGrantAny, nil
 		}
 		return ACLGrantNone, nil
@@ -524,7 +538,7 @@ func (db *Database) MailboxACLGrantability(ctx context.Context, mailboxID int64,
 // revoke under that address acts on, with every right any of them grants, and the
 // mailbox owner with every right, which it holds whatever a stored row says.
 func (db *Database) GetMailboxACLs(ctx context.Context, mailboxID int64) ([]ACLEntry, error) {
-	rows, err := db.GetReadPool().Query(ctx, `
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
 		SELECT a.mailbox_id, a.account_id, COALESCE(p.address, a.identifier),
 			CASE WHEN a.account_id = m.account_id THEN $2 ELSE a.rights END,
 			a.created_at, a.updated_at
@@ -568,7 +582,7 @@ func (db *Database) GetMailboxACLs(ctx context.Context, mailboxID int64) ([]ACLE
 // Uses the PostgreSQL function for efficient permission checking
 func (db *Database) CheckMailboxPermission(ctx context.Context, mailboxID, accountID int64, right ACLRight) (bool, error) {
 	var hasRight bool
-	err := db.GetReadPool().QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT has_mailbox_right($1, $2, $3)
 	`, mailboxID, accountID, string(right)).Scan(&hasRight)
 	if err != nil {
@@ -584,7 +598,7 @@ func (db *Database) CheckMailboxPermission(ctx context.Context, mailboxID, accou
 // CheckMailboxPermission calls. When source and destination are the same mailbox the
 // caller passes equal ids; the function still returns all three booleans correctly.
 func (db *Database) CheckMoveRights(ctx context.Context, srcMailboxID, destMailboxID, accountID int64) (canInsertDest, canDeleteSrc, canExpungeSrc bool, err error) {
-	err = db.GetReadPool().QueryRow(ctx, `
+	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT
 			has_mailbox_right($1, $3, 'i'),
 			has_mailbox_right($2, $3, 't'),
@@ -616,7 +630,7 @@ func (db *Database) GetUserMailboxRights(ctx context.Context, mailboxID, account
 	// First check if user owns the mailbox (owner always has full access)
 	var isOwner bool
 	var ownerDomain *string
-	err := db.GetReadPool().QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT (account_id = $1), owner_domain
 		FROM mailboxes
 		WHERE id = $2 AND deleted_at IS NULL
@@ -638,7 +652,7 @@ func (db *Database) GetUserMailboxRights(ctx context.Context, mailboxID, account
 	// entry contains it; MYRIGHTS must report the same set the server enforces.
 	// (RFC 4314 §2 leaves the combination of matching identifiers implementation-defined.)
 	var userRights string
-	err = db.GetReadPool().QueryRow(ctx, `
+	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT rights
 		FROM mailbox_acls
 		WHERE mailbox_id = $1 AND account_id = $2
@@ -651,7 +665,7 @@ func (db *Database) GetUserMailboxRights(ctx context.Context, mailboxID, account
 	var anyoneRights string
 	if ownerDomain != nil {
 		var userDomain string
-		derr := db.GetReadPool().QueryRow(ctx, `
+		derr := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 			SELECT SPLIT_PART(address, '@', 2)
 			FROM credentials
 			WHERE account_id = $1 AND primary_identity = TRUE
@@ -660,7 +674,7 @@ func (db *Database) GetUserMailboxRights(ctx context.Context, mailboxID, account
 			return "", fmt.Errorf("failed to get user domain: %w", derr)
 		}
 		if derr == nil && userDomain == *ownerDomain {
-			aerr := db.GetReadPool().QueryRow(ctx, `
+			aerr := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 				SELECT rights
 				FROM mailbox_acls
 				WHERE mailbox_id = $1 AND identifier = $2

@@ -619,8 +619,9 @@ func (s *POP3ProxyServer) connConfig() server.SoraConnConfig {
 		Hostname:             s.hostname,
 		IdleTimeout:          settings.commandTimeout,
 		AbsoluteTimeout:      settings.absoluteSessionTimeout,
+		NoAbsoluteTimeout:    settings.absoluteSessionTimeout <= 0,
 		MinBytesPerMinute:    settings.minBytesPerMinute,
-		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0,
+		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0 || settings.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Send POP3 error response before closing
 			// RFC 1939 doesn't define specific timeout response codes, but [IN-USE] is commonly used

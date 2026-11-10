@@ -26,11 +26,11 @@ var reloadableServerSettings = map[string][]string{
 		"max_script_size",
 		"master_sasl_username", "master_sasl_password", "master_sasl_allowed_networks",
 	},
-	"lmtp": {"max_message_size", "debug"},
+	"lmtp": {"max_message_size"},
 	"imap_proxy": {
 		"limits.max_auth_errors", "auth_idle_timeout",
 		"timeouts.command_timeout", "timeouts.absolute_session_timeout", "timeouts.min_bytes_per_minute",
-		"master_sasl_username", "master_sasl_password", "debug",
+		"master_sasl_username", "master_sasl_password",
 	},
 	"pop3_proxy": {
 		"limits.max_auth_errors", "auth_idle_timeout",
@@ -42,7 +42,7 @@ var reloadableServerSettings = map[string][]string{
 		"timeouts.command_timeout", "timeouts.absolute_session_timeout", "timeouts.min_bytes_per_minute",
 		"master_sasl_username", "master_sasl_password", "debug",
 	},
-	"lmtp_proxy":     {"timeouts.absolute_session_timeout", "max_message_size", "debug"},
+	"lmtp_proxy":     {"timeouts.absolute_session_timeout", "max_message_size"},
 	"http_admin_api": {"api_key", "allowed_hosts"},
 	"http_user_api":  {"jwt_secret", "allowed_origins", "allowed_hosts"},
 	"user_api_proxy": {"jwt_secret"},
