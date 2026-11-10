@@ -217,7 +217,7 @@ func TestWarnUnusedConfigOptions_MultipleIssues(t *testing.T) {
 }
 
 func TestWarnUnusedStartTLS(t *testing.T) {
-	supported := map[string]bool{"imap": true, "lmtp": true, "managesieve": true, "pop3": true, "lmtp_proxy": true, "managesieve_proxy": true, "pop3_proxy": true}
+	supported := map[string]bool{"imap": true, "lmtp": true, "managesieve": true, "pop3": true, "imap_proxy": true, "lmtp_proxy": true, "managesieve_proxy": true, "pop3_proxy": true}
 	for _, serverType := range []string{"imap", "pop3", "imap_proxy", "pop3_proxy", "metrics", "http_admin_api", "http_user_api", "lmtp", "managesieve", "lmtp_proxy", "managesieve_proxy"} {
 		t.Run(serverType, func(t *testing.T) {
 			cfg := ServerConfig{Type: serverType, Name: "listener", TLS: supported[serverType], TLSUseStartTLS: true}
@@ -231,7 +231,7 @@ func TestWarnUnusedStartTLS(t *testing.T) {
 				}
 				return
 			}
-			if len(warnings) != 1 || !strings.Contains(warnings[0], "'tls_use_starttls'") || !strings.Contains(warnings[0], "IMAP, LMTP, ManageSieve and POP3 servers and to the LMTP, ManageSieve and POP3 proxies") {
+			if len(warnings) != 1 || !strings.Contains(warnings[0], "'tls_use_starttls'") || !strings.Contains(warnings[0], "IMAP, LMTP, ManageSieve and POP3 servers and proxies") {
 				t.Fatalf("expected accurate unsupported STARTTLS warning, got %v", warnings)
 			}
 		})
@@ -242,7 +242,7 @@ func TestWarnUnusedStartTLS(t *testing.T) {
 // listener comes up plaintext with no STARTTLS; that must be said at startup, not
 // only in a debug log.
 func TestWarnStartTLSWithoutTLS(t *testing.T) {
-	for _, serverType := range []string{"imap", "lmtp", "managesieve", "pop3", "lmtp_proxy", "managesieve_proxy", "pop3_proxy"} {
+	for _, serverType := range []string{"imap", "lmtp", "managesieve", "pop3", "imap_proxy", "lmtp_proxy", "managesieve_proxy", "pop3_proxy"} {
 		t.Run(serverType, func(t *testing.T) {
 			cfg := ServerConfig{Type: serverType, Name: "listener", TLSUseStartTLS: true}
 			var warnings []string

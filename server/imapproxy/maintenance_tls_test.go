@@ -73,7 +73,7 @@ func maintenanceTLSSession(t *testing.T, backend net.Conn) (*Session, net.Conn) 
 	t.Helper()
 	clientProxy, clientPeer := net.Pipe()
 	t.Cleanup(func() { clientProxy.Close(); clientPeer.Close() })
-	return &Session{server: &Server{}, backendConn: backend, clientConn: clientProxy}, clientPeer
+	return &Session{server: &Server{}, backendConn: backend, clientConn: clientProxy, listenerConn: clientProxy}, clientPeer
 }
 
 func TestMaintenanceTLS_StalledHalfCloseDoesNotBlockOtherSessions(t *testing.T) {
@@ -129,7 +129,7 @@ func TestMaintenanceTLS_StalledClientWriteDoesNotDelayBackendClose(t *testing.T)
 	client, writing := stalledMaintenanceTLSBackend(t)
 	backend, peer := net.Pipe()
 	t.Cleanup(func() { backend.Close(); peer.Close() })
-	session := &Session{server: &Server{}, clientConn: client, backendConn: backend}
+	session := &Session{server: &Server{}, clientConn: client, listenerConn: client, backendConn: backend}
 	writeDone := make(chan error, 1)
 	go func() {
 		_, err := session.forwardToClient(client, []byte("* 1 EXISTS\r\n"))
@@ -163,7 +163,7 @@ func TestMaintenanceTLS_UnreadClientCloseNotifyDoesNotDelayBackendClose(t *testi
 	backend, peer := net.Pipe()
 	t.Cleanup(func() { backend.Close(); peer.Close() })
 	// Model a session whose BYE was delivered before the client stopped reading.
-	session := &Session{server: &Server{}, clientConn: client, backendConn: backend, byeSent: true}
+	session := &Session{server: &Server{}, clientConn: client, listenerConn: client, backendConn: backend, byeSent: true}
 	session.closeForMaintenance()
 	peer.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := peer.Read(make([]byte, 1)); err != io.EOF {

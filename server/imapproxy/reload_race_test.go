@@ -122,6 +122,7 @@ func TestReloadConfig_DuringBackendLogin(t *testing.T) {
 	s := &Session{
 		server:        srv,
 		clientConn:    clientEnd,
+		listenerConn:  clientEnd,
 		backendConn:   proxyEnd,
 		backendReader: bufio.NewReader(proxyEnd),
 		backendWriter: bufio.NewWriter(proxyEnd),

@@ -24,6 +24,7 @@ func TestDrainClientReaderToBackend(t *testing.T) {
 	sess := &Session{
 		server:       &Server{name: "test"},
 		clientConn:   clientA,
+		listenerConn: clientA,
 		clientReader: bufio.NewReader(clientA),
 		backendConn:  backendA,
 	}
