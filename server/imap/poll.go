@@ -3,6 +3,7 @@ package imap
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
@@ -36,6 +37,13 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	mailboxID := s.selectedMailbox.ID
 	highestModSeqToPollFrom := s.currentHighestModSeq.Load()
 	release()
+
+	// Hold off while a STORE .SILENT of this session is between its write and
+	// its own MODSEQ responses (the NOTIFY pump polls concurrently), so the
+	// delta read below either precedes that write or finds it in ownStoreEcho.
+	s.ownStoreMu.Lock()
+	unlockOwnStore := sync.OnceFunc(s.ownStoreMu.Unlock)
+	defer unlockOwnStore()
 
 	// Create a context that signals to use the master DB if the session is pinned.
 	readCtx := ctx
@@ -351,6 +359,11 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 			continue
 		}
 
+		// Already answered by this session's own STORE .SILENT, without FLAGS.
+		if modSeq, ok := s.ownStoreEcho[update.UID]; ok && modSeq == update.EffectiveModSeq && s.ownStoreEchoMailboxID == mailboxID {
+			continue
+		}
+
 		allFlags := db.BitwiseToFlags(update.BitwiseFlags)
 		if allFlags == nil {
 			allFlags = []imap.Flag{}
@@ -367,10 +380,22 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		s.mailboxTracker.QueueMessageFlags(update.SeqNum, update.UID, allFlags, update.EffectiveModSeq, nil)
 	}
 
+	// The session has now seen every change up to its cursor.
+	if s.ownStoreEchoMailboxID != mailboxID {
+		s.ownStoreEcho = nil
+	}
+	cursor := s.currentHighestModSeq.Load()
+	for uid, modSeq := range s.ownStoreEcho {
+		if modSeq <= cursor {
+			delete(s.ownStoreEcho, uid)
+		}
+	}
+
 	// Store sessionTracker reference before releasing lock to avoid race condition
 	sessionTracker := s.sessionTracker
 
 	release() // Release lock before writing to the network
+	unlockOwnStore()
 
 	// Check if sessionTracker is still valid after releasing lock
 	if sessionTracker == nil {

@@ -282,6 +282,34 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 	}
 	bitwiseSystemFlagsToAdd := FlagsToBitwise(systemFlagsToAdd)
 
+	// Re-check the keyword cap under the mailbox lock: the caller's check ran on
+	// an earlier snapshot, and a concurrent writer may have filled a message since.
+	// The count mirrors the custom_flags expression of the UPDATE below.
+	if len(customKeywordsToAdd) > 0 {
+		var overLimit bool
+		err = tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM message_state
+				WHERE message_id = ANY($1)
+				  AND (
+					SELECT count(DISTINCT flag_element)
+					FROM (
+						SELECT jsonb_array_elements_text(message_state.custom_flags) AS flag_element
+						UNION ALL
+						SELECT unnest($2::text[]) AS flag_element
+					) AS combined_flags
+					WHERE NOT (lower(flag_element) = ANY($3::text[]))
+				  ) > $4
+			)
+		`, messageIDs, customKeywordsToAdd, attachmentRemovals, MaxCustomKeywordsPerMessage).Scan(&overLimit)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check keyword limit in mailbox %d: %w", mailboxID, err)
+		}
+		if overLimit {
+			return nil, consts.ErrTooManyKeywords
+		}
+	}
+
 	rows, err := tx.Query(ctx, `
 		UPDATE message_state
 		SET flags = flags | $1,

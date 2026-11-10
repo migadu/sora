@@ -58,6 +58,17 @@ type IMAPSession struct {
 	useMasterDB           atomic.Bool // Pin session to master DB after a write to ensure consistency
 	selectedReadOnly      atomic.Bool // True when the selected mailbox was opened with EXAMINE (RFC 3501 §6.3.2)
 
+	// A CONDSTORE STORE .SILENT answers its changed rows itself with
+	// FETCH (UID MODSEQ) (RFC 7162 §3.1.3). ownStoreMu serializes that STORE
+	// with Poll so Poll can tell those changes from foreign ones; it is taken
+	// before s.mutex, never while holding it. ownStoreEcho maps each UID so
+	// reported to its mod-sequence, in mailbox ownStoreEchoMailboxID; Poll
+	// skips exactly those updates instead of echoing them with FLAGS. Both
+	// fields are guarded by ownStoreMu.
+	ownStoreMu            sync.Mutex
+	ownStoreEcho          map[imap.UID]uint64
+	ownStoreEchoMailboxID int64
+
 	// savedSearchUIDs holds the SEARCH RETURN (SAVE) result set referenced by
 	// "$" (RFC 5182 / RFC 9051 §6.4.4.1). It is per-session, scoped to the
 	// currently selected mailbox, stored as UIDs (stable across EXPUNGE), and

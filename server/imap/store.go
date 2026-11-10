@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
@@ -115,10 +116,20 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 		sanitizedFlags = permitted
 		sanitizedStoreFlags.Flags = permitted
+	} else if !strings.ContainsAny(storeRights, "stw") {
+		// A replace addresses every flag, listed or not, so it fails only when the
+		// user can modify no flag at all.
+		s.DebugLog("user lacks permission to modify any flag")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "You do not have permission to modify the specified flags",
+		}
 	}
-	// Note: STORE FLAGS (replace) does not reject here. RFC 4314 §4 forbids modifying
-	// flags the user lacks rights for; a naive replace would also clear UNLISTED flags.
-	// The apply step below preserves the current value of each non-modifiable flag.
+	// Note: STORE FLAGS (replace) does not reject a user holding only some of the
+	// flag rights. RFC 4314 §4 forbids modifying flags the user lacks rights for; a
+	// naive replace would also clear UNLISTED flags. The apply step below preserves
+	// the current value of each non-modifiable flag.
 
 	// RFC 9979 §3.2: unflagging also clears the flag color keywords (see
 	// flag_color.go).
@@ -154,6 +165,49 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		unchanged bool
 	}
 	var responseMessages []storeResponseMessage
+
+	// RFC 7162 §3.1.3: a CONDSTORE-aware client gets FETCH (MODSEQ) for every
+	// message a .SILENT STORE updated. That is command response data, so STORE
+	// writes it itself rather than leaving it to the command-boundary Poll, which
+	// would add FLAGS, is skipped under NOTIFY, and stops at a pending expunge.
+	// Poll is held off until those rows are recorded in ownStoreEcho.
+	silentModSeq := sanitizedStoreFlags.Silent && s.condStoreEnabled()
+	if silentModSeq {
+		s.ownStoreMu.Lock()
+		defer s.ownStoreMu.Unlock()
+	}
+	writeResponses := func() {
+		if sanitizedStoreFlags.Silent && !silentModSeq {
+			return
+		}
+		for _, modified := range responseMessages {
+			// Use database sequence number directly (no encoding needed)
+			m := w.CreateMessage(modified.seq)
+
+			if !sanitizedStoreFlags.Silent {
+				m.WriteFlags(modified.flags)
+			}
+			m.WriteUID(modified.uid)
+			// RFC 7162 §3.2: include MODSEQ in the STORE-triggered FETCH reply only
+			// when the client is CONDSTORE-aware (issued an enabling command) and the
+			// session still advertises CONDSTORE.
+			if s.condStoreEnabled() {
+				m.WriteModSeq(uint64(modified.modSeq))
+			}
+
+			if err := m.Close(); err != nil {
+				s.DebugLog("failed to close fetch response", "uid", modified.uid, "error", err)
+				continue
+			}
+			if silentModSeq && !modified.unchanged {
+				if s.ownStoreEcho == nil || s.ownStoreEchoMailboxID != selectedMailboxID {
+					s.ownStoreEcho = make(map[imap.UID]uint64)
+					s.ownStoreEchoMailboxID = selectedMailboxID
+				}
+				s.ownStoreEcho[modified.uid] = uint64(modified.modSeq)
+			}
+		}
+	}
 
 	// Check if the context is still valid before proceeding with flag updates
 	if ctx.Err() != nil {
@@ -274,7 +328,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		// left the stored state unchanged. Batch updates omit such no-op rows.
 		// Read them from the master so a concurrent writer's flags are current;
 		// only validUIDs are eligible, preserving UNCHANGEDSINCE failures.
-		if (!sanitizedStoreFlags.Silent || s.condStoreEnabled()) && len(batchResults) < len(validUIDs) {
+		if (!sanitizedStoreFlags.Silent || silentModSeq) && len(batchResults) < len(validUIDs) {
 			changed := make(map[imap.UID]bool, len(batchResults))
 			for _, res := range batchResults {
 				changed[res.UID] = true
@@ -316,24 +370,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		s.DebugLog("CONDSTORE: returning MODIFIED for failed UIDs", "uids", failedUIDs.String())
 
 		// Still send FETCH responses for successfully modified messages (before the OK).
-		if !sanitizedStoreFlags.Silent || s.condStoreEnabled() {
-			for _, modified := range responseMessages {
-				if sanitizedStoreFlags.Silent && !modified.unchanged {
-					continue
-				}
-				m := w.CreateMessage(modified.seq)
-				if !sanitizedStoreFlags.Silent {
-					m.WriteFlags(modified.flags)
-				}
-				m.WriteUID(modified.uid)
-				if s.condStoreEnabled() {
-					m.WriteModSeq(uint64(modified.modSeq))
-				}
-				if err := m.Close(); err != nil {
-					s.DebugLog("failed to close fetch response", "uid", modified.uid, "error", err)
-				}
-			}
-		}
+		writeResponses()
 
 		// RFC 7162 §3.1.3: the MODIFIED set uses the command's number space —
 		// sequence numbers for a sequence-number STORE, UIDs for a UID STORE.
@@ -362,32 +399,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	}
 	release()
 
-	if !sanitizedStoreFlags.Silent || s.condStoreEnabled() {
-		for _, modified := range responseMessages {
-			// Changed rows are notified by the normal command-boundary Poll.
-			// No-op rows need an explicit MODSEQ response because Poll has no delta.
-			if sanitizedStoreFlags.Silent && !modified.unchanged {
-				continue
-			}
-			// Use database sequence number directly (no encoding needed)
-			m := w.CreateMessage(modified.seq)
-
-			if !sanitizedStoreFlags.Silent {
-				m.WriteFlags(modified.flags)
-			}
-			m.WriteUID(modified.uid)
-			// RFC 7162 §3.2: include MODSEQ in the STORE-triggered FETCH reply only
-			// when the client is CONDSTORE-aware (issued an enabling command) and the
-			// session still advertises CONDSTORE.
-			if s.condStoreEnabled() {
-				m.WriteModSeq(uint64(modified.modSeq))
-			}
-
-			if err := m.Close(); err != nil {
-				s.DebugLog("failed to close fetch response", "uid", modified.uid, "error", err)
-			}
-		}
-	}
+	writeResponses()
 
 	return nil
 }
