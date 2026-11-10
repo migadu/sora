@@ -21,6 +21,11 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	}
 	AccountID := s.AccountID()
 	release()
+	// The source, destination hierarchy and ACLs may have been created or
+	// changed by an earlier command in this same session.
+	if s.useMasterDB.Load() {
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
 
 	// As in CREATE: a parent this RENAME creates inside the shared namespace must be a
 	// shared mailbox, which CreateMailbox decides from the config in the context.
