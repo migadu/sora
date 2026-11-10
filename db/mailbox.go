@@ -61,15 +61,15 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 	query := `
 		WITH accessible_mailboxes AS (
 			-- 1. All mailboxes owned by user (including shared mailboxes they created)
-			SELECT id, name, uid_validity, path, subscribed, special_use, created_at, updated_at, account_id
+			SELECT id, name, uid_validity, path, subscribed, special_use, created_at, updated_at, account_id, 0 AS priority
 			FROM mailboxes
 			WHERE account_id = $1
 			  AND deleted_at IS NULL
 
-			UNION
+			UNION ALL
 
 			-- 2. Shared mailboxes where user has direct ACL access (must have at least 'l' lookup right)
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id, 1 AS priority
 			FROM mailboxes m
 			INNER JOIN mailbox_acls acl ON m.id = acl.mailbox_id
 			WHERE m.is_shared = TRUE
@@ -77,10 +77,10 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			  AND position('l' IN acl.rights) > 0
 			  AND m.deleted_at IS NULL
 
-			UNION
+			UNION ALL
 
 			-- 3. Shared mailboxes with "anyone" access (same domain, must have 'l' right)
-			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id
+			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id, 2 AS priority
 			FROM mailboxes m
 			INNER JOIN mailbox_acls anyone_acl ON m.id = anyone_acl.mailbox_id
 			WHERE m.is_shared = TRUE
@@ -88,6 +88,11 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			  AND anyone_acl.identifier = 'anyone'
 			  AND position('l' IN anyone_acl.rights) > 0
 			  AND m.deleted_at IS NULL
+		), visible_mailboxes AS (
+			-- Match GetMailboxByName: owned, direct ACL, domain anyone, then ID.
+			SELECT DISTINCT ON (LOWER(name)) *
+			FROM accessible_mailboxes
+			ORDER BY LOWER(name), priority, id
 		)
 		SELECT
 			m.id, m.name, m.uid_validity, m.path,
@@ -107,7 +112,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			-- index and seq-scanned the account's mailboxes once per row -- O(N^2), which
 			-- exceeded the read query_timeout for accounts with tens of thousands of mailboxes.
 			EXISTS(SELECT 1 FROM mailboxes child WHERE child.account_id = m.account_id AND LEFT(child.path, LENGTH(child.path) - 16) = m.path AND child.deleted_at IS NULL) AS has_children
-		FROM accessible_mailboxes m
+		FROM visible_mailboxes m
 		LEFT JOIN subscriptions subs ON subs.account_id = $1 AND LOWER(subs.mailbox_name) = LOWER(m.name)
 		WHERE 1=1
 	`

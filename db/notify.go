@@ -38,26 +38,31 @@ func (db *Database) GetMailboxNotifySnapshot(ctx context.Context, accountID int6
 
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
 		WITH accessible_mailboxes AS (
-			SELECT id, name, uid_validity, account_id
+			SELECT id, name, uid_validity, account_id, 0 AS priority
 			FROM mailboxes
 			WHERE account_id = $1 AND deleted_at IS NULL
-			UNION
-			SELECT m.id, m.name, m.uid_validity, m.account_id
+			UNION ALL
+			SELECT m.id, m.name, m.uid_validity, m.account_id, 1 AS priority
 			FROM mailboxes m
 			INNER JOIN mailbox_acls acl ON m.id = acl.mailbox_id
 			WHERE m.is_shared = TRUE AND acl.account_id = $1
 			  AND position('l' IN acl.rights) > 0 AND m.deleted_at IS NULL
-			UNION
-			SELECT m.id, m.name, m.uid_validity, m.account_id
+			UNION ALL
+			SELECT m.id, m.name, m.uid_validity, m.account_id, 2 AS priority
 			FROM mailboxes m
 			INNER JOIN mailbox_acls anyone_acl ON m.id = anyone_acl.mailbox_id
 			WHERE m.is_shared = TRUE AND m.owner_domain = $2
 			  AND anyone_acl.identifier = 'anyone'
 			  AND position('l' IN anyone_acl.rights) > 0 AND m.deleted_at IS NULL
+		), visible_mailboxes AS (
+			-- Match the addressable name winner in GetMailboxByName/GetMailboxes.
+			SELECT DISTINCT ON (LOWER(name)) *
+			FROM accessible_mailboxes
+			ORDER BY LOWER(name), priority, id
 		)
 		SELECT m.id, m.name, m.uid_validity, m.account_id,
 		       (subs.mailbox_name IS NOT NULL) AS subscribed
-		FROM accessible_mailboxes m
+		FROM visible_mailboxes m
 		LEFT JOIN subscriptions subs ON subs.account_id = $1 AND LOWER(subs.mailbox_name) = LOWER(m.name)
 	`, accountID, ownerDomain)
 	if err != nil {
