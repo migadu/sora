@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -20,10 +22,12 @@ import (
 
 // startSTLSThroughputServer serves POP3 with STLS available and the slowloris
 // check armed to fire in well under a second: the plaintext SoraListener in
-// front, the library upgrading the stream on STLS behind it, which is how Start
-// wires a tls_use_starttls listener. The test assembles the two halves from the
-// server's own connConfig and buildLibServer because Start offers no way to
-// shorten the throughput window.
+// front, the library upgrading the stream on STLS behind it, which is how a
+// ManageSieve tls_use_starttls listener is wired. Sora's POP3 server has no
+// STARTTLS listener mode of its own (a configured certificate makes its
+// listener implicit-TLS, where the TLS layer sits below the SoraConn and the
+// notice cannot land under it), so the test assembles the two halves from the
+// server's own connConfig and buildLibServer.
 func startSTLSThroughputServer(t *testing.T) string {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -135,5 +139,37 @@ func TestSlowThroughputNoticeAfterSTLSIsReadableThroughTLS(t *testing.T) {
 	}
 	if _, err := tlsReader.ReadString('\n'); err == nil {
 		t.Fatal("connection stayed open after the timeout notice")
+	}
+}
+
+func TestSlowThroughputDuringSTLSHandshakeDoesNotWritePlaintext(t *testing.T) {
+	addr := startSTLSThroughputServer(t)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(8 * time.Second))
+	r := bufio.NewReader(conn)
+	if _, err := r.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprint(conn, "STLS\r\n")
+	if line, err := r.ReadString('\n'); err != nil || !strings.HasPrefix(line, "+OK") {
+		t.Fatalf("STLS = %q, %v", line, err)
+	}
+	// Begin a large TLS handshake record, then stall before its ClientHello
+	// is complete. The library still reports its old plaintext NetConn here.
+	if _, err := conn.Write([]byte{0x16, 0x03, 0x03, 0x10, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	defer trickle(conn)()
+	got, err := io.ReadAll(r)
+	if len(got) != 0 {
+		t.Fatalf("plaintext during TLS handshake: %q", got)
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatalf("handshake timeout did not close connection: %v", err)
 	}
 }
