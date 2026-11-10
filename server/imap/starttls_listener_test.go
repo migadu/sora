@@ -164,26 +164,89 @@ func TestShutdownByeAfterSTARTTLSIsReadableThroughTLS(t *testing.T) {
 	}
 }
 
-func TestSTARTTLSHasNoPlaintextTimeoutNoticeWriter(t *testing.T) {
+// listenerConnOf returns the server's connection to the client at local, as
+// the listener handed it to go-imap.
+func listenerConnOf(t *testing.T, srv *IMAPServer, local net.Addr) net.Conn {
+	t.Helper()
+	srv.activeConnsMutex.RLock()
+	defer srv.activeConnsMutex.RUnlock()
+	for c := range srv.activeConns {
+		if c.NetConn().RemoteAddr().String() == local.String() {
+			return c.NetConn()
+		}
+	}
+	t.Fatal("accepted connection was not registered")
+	return nil
+}
+
+// The writer of an asynchronous notice follows the session: the plaintext
+// connection until the client sends STARTTLS, none from then until the TLS
+// handshake has completed, the TLS connection afterwards. go-imap publishes its
+// *tls.Conn before the handshake runs, so being a *tls.Conn is not enough
+// (#236).
+func TestSTARTTLSNoticeWriterFollowsTheUpgrade(t *testing.T) {
 	srv, addr := startSTARTTLSTestServer(t, time.Minute)
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(time.Second))
-	if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadString('\n'); err != nil {
 		t.Fatal(err)
 	}
-	srv.activeConnsMutex.RLock()
-	defer srv.activeConnsMutex.RUnlock()
-	for c := range srv.activeConns {
-		if c.NetConn().RemoteAddr().String() == conn.LocalAddr().String() {
-			if got := serverPkg.NoticeConn(c.NetConn()); got != nil {
-				t.Fatalf("plaintext STARTTLS notice writer = %T; timeout can retain it across upgrade", got)
-			}
-			return
-		}
+	capabilities(t, conn, reader, "a")
+	plain := listenerConnOf(t, srv, conn.LocalAddr())
+	if got := serverPkg.NoticeConn(plain); got != plain {
+		t.Fatalf("notice writer of a plaintext session = %T, want its plaintext connection", got)
 	}
-	t.Fatal("accepted connection was not registered")
+
+	fmt.Fprint(conn, "c STARTTLS\r\n")
+	if line := readTagged(t, reader, "c "); !strings.HasPrefix(line, "c OK") {
+		t.Fatalf("STARTTLS = %q", line)
+	}
+	// go-imap is now waiting for the ClientHello inside its TLS connection.
+	time.Sleep(100 * time.Millisecond)
+	if got := serverPkg.NoticeConn(plain); got != nil {
+		t.Fatalf("notice writer before the TLS handshake = %T, want none", got)
+	}
+
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("TLS handshake after STARTTLS: %v", err)
+	}
+	capabilities(t, tlsConn, bufio.NewReader(tlsConn), "d")
+	if _, ok := serverPkg.NoticeConn(plain).(*tls.Conn); !ok {
+		t.Fatalf("notice writer after the TLS handshake = %T, want the TLS connection", serverPkg.NoticeConn(plain))
+	}
+}
+
+// A client that has not sent STARTTLS reads in plaintext: the idle BYE must
+// reach it. It used to be withheld from every session of a STARTTLS listener
+// that was not yet TLS (#236).
+func TestIdleTimeoutNoticeBeforeSTARTTLSReachesPlaintextClient(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for the idle timeout")
+	}
+	_, addr := startSTARTTLSTestServer(t, 2*time.Second)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	capabilities(t, conn, reader, "a")
+
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading the idle notice in plaintext: %v", err)
+	}
+	if want := "* BYE [UNAVAILABLE] Idle timeout, please reconnect\r\n"; line != want {
+		t.Fatalf("idle notice = %q, want %q", line, want)
+	}
 }

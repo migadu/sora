@@ -260,12 +260,18 @@ func TestNoticeConnFollowsTheRecordedConnection(t *testing.T) {
 	}
 }
 
+// A provider that reports no upgraded connection leaves no safe writer once
+// the client has sent STARTTLS: the library may have acknowledged it.
 func TestNoticeConnSuppressesUnsafeRegisteredWriter(t *testing.T) {
 	transport, peer := net.Pipe()
 	defer peer.Close()
 	sc := NewSoraConn(transport, SoraConnConfig{NoAbsoluteTimeout: true})
 	defer sc.Close()
 	SetTimeoutNoticeConn(sc, func() net.Conn { return nil })
+	go peer.Write([]byte("STARTTLS\r\n"))
+	if _, err := io.ReadFull(sc, make([]byte, 10)); err != nil {
+		t.Fatal(err)
+	}
 	for _, conn := range []net.Conn{sc, unwrapConn{sc}} {
 		if got := NoticeConn(conn); got != nil {
 			t.Fatalf("unsafe registered writer returned %T", got)
