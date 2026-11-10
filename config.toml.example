@@ -756,6 +756,15 @@ max_total_size = 1048576       # Maximum total metadata size per account (1MB). 
 # Enable shared mailboxes for collaboration between users on the same domain.
 # Uses IMAP namespace extension (RFC 2342) for proper client support.
 # Implements Access Control Lists (RFC 4314) for fine-grained permissions.
+#
+# Before enabling on a server with existing users: the prefix is matched
+# case-insensitively, so folders users already made under it ("Shared",
+# "shared/Old", ...) fall inside the namespace without being shared. The root
+# folder can no longer be selected, and none of them can be renamed out of it.
+# Find them first (for the default prefix):
+#   SELECT count(*), count(DISTINCT account_id) FROM mailboxes
+#    WHERE deleted_at IS NULL AND NOT COALESCE(is_shared, FALSE)
+#      AND (LOWER(name) = 'shared' OR LOWER(name) LIKE 'shared/%');
 
 [shared_mailboxes]
 enabled = false                  # Enable shared mailbox functionality (default: false)
