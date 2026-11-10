@@ -69,9 +69,10 @@ func TestConnectToBackendNoGreetingTimesOut(t *testing.T) {
 	defer clientB.Close()
 
 	sess := &POP3ProxySession{
-		server:     srv,
-		clientConn: clientA,
-		ctx:        context.Background(),
+		server:       srv,
+		clientConn:   clientA,
+		listenerConn: clientA,
+		ctx:          context.Background(),
 	}
 
 	start := time.Now()
@@ -113,9 +114,10 @@ func TestConnectToBackendDialRefusedIsBackendError(t *testing.T) {
 	defer clientB.Close()
 
 	sess := &POP3ProxySession{
-		server:     srv,
-		clientConn: clientA,
-		ctx:        context.Background(),
+		server:       srv,
+		clientConn:   clientA,
+		listenerConn: clientA,
+		ctx:          context.Background(),
 	}
 
 	err = sess.connectToBackend()

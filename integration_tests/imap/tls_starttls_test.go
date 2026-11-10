@@ -3,8 +3,10 @@
 package imap_test
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"os"
@@ -14,6 +16,7 @@ import (
 
 	imap "github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapclient"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
 	imapserver "github.com/migadu/sora/server/imap"
 	"github.com/migadu/sora/server/uploader"
@@ -21,7 +24,7 @@ import (
 )
 
 // setupIMAPServerWithTLS creates an IMAP server with TLS configuration for testing
-func setupIMAPServerWithTLS(t *testing.T, tlsEnabled bool, certFile, keyFile string) (*common.TestServer, common.TestAccount) {
+func setupIMAPServerWithTLS(t *testing.T, tlsEnabled bool, certFile, keyFile string, configure ...func(*imapserver.IMAPServerOptions)) (*common.TestServer, common.TestAccount) {
 	t.Helper()
 
 	rdb := common.SetupTestDatabase(t)
@@ -57,6 +60,16 @@ func setupIMAPServerWithTLS(t *testing.T, tlsEnabled bool, certFile, keyFile str
 	}
 
 	// Create IMAP server with TLS configuration
+	opts := imapserver.IMAPServerOptions{
+		InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
+		TLS:          tlsEnabled,
+		TLSCertFile:  certFile,
+		TLSKeyFile:   keyFile,
+		TLSVerify:    false, // Don't require client certificates for testing
+	}
+	for _, c := range configure {
+		c(&opts)
+	}
 	server, err := imapserver.New(
 		context.Background(),
 		"test",
@@ -66,13 +79,7 @@ func setupIMAPServerWithTLS(t *testing.T, tlsEnabled bool, certFile, keyFile str
 		rdb,
 		uploadWorker,
 		nil, // cache.Cache
-		imapserver.IMAPServerOptions{
-			InsecureAuth: true, // Allow PLAIN auth (no TLS in tests)
-			TLS:          tlsEnabled,
-			TLSCertFile:  certFile,
-			TLSKeyFile:   keyFile,
-			TLSVerify:    false, // Don't require client certificates for testing
-		},
+		opts,
 	)
 	if err != nil {
 		t.Fatalf("Failed to create IMAP server: %v", err)
@@ -395,4 +402,116 @@ func TestIMAP_TLS_ArchitectureValidation(t *testing.T) {
 	t.Logf("✓ TLS architecture works: tlsConfig set → tls.Listen → encrypted connections → authentication allowed")
 	t.Logf("✓ No complex TLS detection needed - architecture guarantees encryption")
 	t.Logf("✓ Cipher suite: %s", tls.CipherSuiteName(tlsState.CipherSuite))
+}
+
+// readResponse reads lines until the response for the given tag arrives and
+// returns all of them, untagged ones included.
+func readResponse(t *testing.T, reader *bufio.Reader, tag string) string {
+	t.Helper()
+	var lines []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading response for %s: %v", tag, err)
+		}
+		lines = append(lines, strings.TrimSpace(line))
+		if strings.HasPrefix(line, tag+" ") {
+			return strings.Join(lines, "\n")
+		}
+	}
+}
+
+// setupIMAPServerWithSTARTTLS creates an IMAP server with a generated
+// certificate and tls_use_starttls, insecure_auth off as it is by default with
+// tls = true, and returns the pool that verifies its certificate.
+func setupIMAPServerWithSTARTTLS(t *testing.T, configure ...func(*imapserver.IMAPServerOptions)) (*common.TestServer, common.TestAccount, *x509.CertPool) {
+	t.Helper()
+	certFile, keyFile, certPool := common.GenerateTestTLSCert(t, nil, nil)
+	configure = append([]func(*imapserver.IMAPServerOptions){func(o *imapserver.IMAPServerOptions) {
+		o.InsecureAuth = false
+		o.TLSUseStartTLS = true
+	}}, configure...)
+	server, account := setupIMAPServerWithTLS(t, true, certFile, keyFile, configure...)
+	return server, account, certPool
+}
+
+// tls_use_starttls on an imap server: a plaintext listener that offers STARTTLS
+// and LOGINDISABLED, refuses LOGIN until the upgrade, and after it serves a
+// verified TLS session like the implicit-TLS listener does.
+func TestIMAPSTARTTLS(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account, certPool := setupIMAPServerWithSTARTTLS(t)
+
+	conn, err := net.DialTimeout("tcp", server.Address, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	reader := bufio.NewReader(conn)
+	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "* OK") {
+		t.Fatalf("plaintext greeting = %q, %v", line, err)
+	}
+	fmt.Fprint(conn, "a CAPABILITY\r\n")
+	caps := readResponse(t, reader, "a")
+	if !strings.Contains(caps, " STARTTLS") || !strings.Contains(caps, " LOGINDISABLED") || strings.Contains(caps, "AUTH=") {
+		t.Errorf("plaintext CAPABILITY must offer STARTTLS and LOGINDISABLED and no AUTH=, got:\n%s", caps)
+	}
+	fmt.Fprintf(conn, "b LOGIN %s %s\r\n", account.Email, account.Password)
+	if resp := readResponse(t, reader, "b"); !strings.Contains(resp, "b NO [PRIVACYREQUIRED]") {
+		t.Errorf("LOGIN before STARTTLS must be refused with PRIVACYREQUIRED, got:\n%s", resp)
+	}
+	conn.Close()
+
+	c, err := imapclient.DialStartTLS(server.Address, &imapclient.Options{TLSConfig: &tls.Config{RootCAs: certPool}})
+	if err != nil {
+		t.Fatalf("DialStartTLS (certificate verified): %v", err)
+	}
+	defer c.Close()
+	caps2, err := c.Capability().Wait()
+	if err != nil {
+		t.Fatalf("CAPABILITY after STARTTLS: %v", err)
+	}
+	if caps2.Has(imap.CapStartTLS) || caps2.Has(imap.CapLoginDisabled) || !caps2.Has(imap.Cap("AUTH=PLAIN")) {
+		t.Errorf("CAPABILITY after STARTTLS must offer AUTH=PLAIN and neither STARTTLS nor LOGINDISABLED, got %v", caps2)
+	}
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("LOGIN after STARTTLS: %v", err)
+	}
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatalf("SELECT INBOX after STARTTLS: %v", err)
+	}
+	if err := c.Logout().Wait(); err != nil {
+		t.Fatalf("LOGOUT: %v", err)
+	}
+}
+
+// A JA4 client filter must apply to a session that upgraded with STARTTLS: the
+// fingerprint comes from go-imap's handshake, not from an implicit-TLS
+// listener's.
+func TestIMAPSTARTTLSAppliesJA4CapabilityFilters(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account, certPool := setupIMAPServerWithSTARTTLS(t, func(o *imapserver.IMAPServerOptions) {
+		o.CapabilityFilters = []config.ClientCapabilityFilter{{
+			JA4Fingerprints: []string{"^t13"}, // any TLS 1.3 client, as Go's is
+			DisableCaps:     []string{"IDLE"},
+			Reason:          "test",
+		}}
+	})
+
+	c, err := imapclient.DialStartTLS(server.Address, &imapclient.Options{TLSConfig: &tls.Config{RootCAs: certPool}})
+	if err != nil {
+		t.Fatalf("DialStartTLS: %v", err)
+	}
+	defer c.Close()
+	if err := c.Login(account.Email, account.Password).Wait(); err != nil {
+		t.Fatalf("LOGIN after STARTTLS: %v", err)
+	}
+	caps, err := c.Capability().Wait()
+	if err != nil {
+		t.Fatalf("CAPABILITY: %v", err)
+	}
+	if caps.Has(imap.CapIdle) {
+		t.Fatalf("the JA4 filter disabling IDLE did not apply after STARTTLS: %v", caps)
+	}
 }

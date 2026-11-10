@@ -34,13 +34,14 @@ func TestStartProxy_NoGoroutineLeaks(t *testing.T) {
 
 	// Create session
 	session := &Session{
-		server:      server,
-		clientConn:  clientConn,
-		backendConn: backendConn,
-		ctx:         ctx,
-		cancel:      cancel,
-		username:    "test@example.com",
-		startTime:   time.Now(),
+		server:       server,
+		clientConn:   clientConn,
+		listenerConn: clientConn,
+		backendConn:  backendConn,
+		ctx:          ctx,
+		cancel:       cancel,
+		username:     "test@example.com",
+		startTime:    time.Now(),
 	}
 
 	// Run startProxy in a goroutine
@@ -144,13 +145,14 @@ func TestStartProxy_CopyGoroutinesUnblockOnContextCancel(t *testing.T) {
 	}
 
 	session := &Session{
-		server:      server,
-		clientConn:  clientConn,
-		backendConn: backendConn,
-		ctx:         ctx,
-		cancel:      cancel,
-		username:    "test@example.com",
-		startTime:   time.Now(),
+		server:       server,
+		clientConn:   clientConn,
+		listenerConn: clientConn,
+		backendConn:  backendConn,
+		ctx:          ctx,
+		cancel:       cancel,
+		username:     "test@example.com",
+		startTime:    time.Now(),
 	}
 
 	// Start proxy
@@ -190,13 +192,14 @@ func TestStartProxy_ActivityUpdaterExits(t *testing.T) {
 	}
 
 	session := &Session{
-		server:      server,
-		clientConn:  clientConn,
-		backendConn: backendConn,
-		ctx:         ctx,
-		cancel:      cancel,
-		username:    "test@example.com",
-		startTime:   time.Now(),
+		server:       server,
+		clientConn:   clientConn,
+		listenerConn: clientConn,
+		backendConn:  backendConn,
+		ctx:          ctx,
+		cancel:       cancel,
+		username:     "test@example.com",
+		startTime:    time.Now(),
 	}
 
 	// Track goroutine count before starting proxy
@@ -262,13 +265,14 @@ func TestStartProxy_ConcurrentShutdown(t *testing.T) {
 			}
 
 			session := &Session{
-				server:      server,
-				clientConn:  clientConn,
-				backendConn: backendConn,
-				ctx:         ctx,
-				cancel:      cancel,
-				username:    "test@example.com",
-				startTime:   time.Now(),
+				server:       server,
+				clientConn:   clientConn,
+				listenerConn: clientConn,
+				backendConn:  backendConn,
+				ctx:          ctx,
+				cancel:       cancel,
+				username:     "test@example.com",
+				startTime:    time.Now(),
 			}
 
 			// Start proxy
@@ -332,13 +336,14 @@ func TestStartProxy_ReadBlockedDuringShutdown(t *testing.T) {
 	}
 
 	session := &Session{
-		server:      server,
-		clientConn:  clientConn,
-		backendConn: backendConn,
-		ctx:         ctx,
-		cancel:      cancel,
-		username:    "test@example.com",
-		startTime:   time.Now(),
+		server:       server,
+		clientConn:   clientConn,
+		listenerConn: clientConn,
+		backendConn:  backendConn,
+		ctx:          ctx,
+		cancel:       cancel,
+		username:     "test@example.com",
+		startTime:    time.Now(),
 	}
 
 	// Start proxy - goroutines will block on Read since no data is being sent

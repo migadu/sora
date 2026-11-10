@@ -16,7 +16,7 @@ Always use TLS to encrypt communications between clients, proxies, and servers.
     ```
     It is highly recommended that `tls_cert_file` contains the full certificate chain.
 
-*   **STARTTLS**: LMTP, ManageSieve and POP3 (servers and proxies) can serve a plaintext port that upgrades with STARTTLS (STLS for POP3) instead of implicit TLS: set `tls = true` and `tls_use_starttls = true`. Unless `insecure_auth = true`, login is offered only after the upgrade.
+*   **STARTTLS**: IMAP, LMTP, ManageSieve and POP3 servers and proxies can serve a plaintext port that upgrades with STARTTLS (STLS for POP3) instead of implicit TLS: set `tls = true` and `tls_use_starttls = true`. Unless `insecure_auth = true`, login is offered only after the upgrade (IMAP advertises `LOGINDISABLED` until then). JA4 client filters apply to STARTTLS sessions from the upgrade on.
 
 *   **Client Certificates**: Sora can be configured to verify client certificates for mutual TLS (`tls_verify = true`), but this is typically disabled (`false`) for general-purpose mail servers.
 

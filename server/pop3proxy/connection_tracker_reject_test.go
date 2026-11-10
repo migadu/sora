@@ -41,6 +41,7 @@ func TestPOP3CloseSkipsUnregisterWhenRejected(t *testing.T) {
 	sess := &POP3ProxySession{
 		server:       srv,
 		clientConn:   clientA,
+		listenerConn: clientA,
 		ctx:          ctx,
 		accountID:    42,
 		RemoteIP:     clientAddr,

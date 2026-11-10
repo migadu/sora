@@ -651,3 +651,30 @@ func TestPOP3ProxyIdleNoticeAfterSTLSIsReadableThroughTLS(t *testing.T) {
 		t.Fatalf("idle notice through TLS = %q, want %q", line, want)
 	}
 }
+
+// After STLS the relay runs on the TLS connection the proxy hijacked from the
+// library, which carries no JA4. The session's log lines must still name the
+// client's JA4: it is recorded during the STLS handshake on the listener's
+// SoraConn, which the session logs through.
+func TestPOP3ProxyLogsJA4AfterSTLS(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	logs := common.CaptureLogs(t)
+	proxy, proxyAddr, account, certPool := startSTARTTLSProxy(t)
+	defer proxy.Stop()
+
+	conn, reader := dialSTLS(t, proxyAddr, certPool)
+	fmt.Fprintf(conn, "USER %s\r\n", account.Email)
+	if resp, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("USER after STLS: %q, %v", resp, err)
+	}
+	fmt.Fprintf(conn, "PASS %s\r\n", account.Password)
+	if resp, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(resp, "+OK") {
+		t.Fatalf("PASS after STLS: %q, %v", resp, err)
+	}
+
+	// Logged after the hijack, once the client has its +OK.
+	line := logs.WaitForLine(t, "proto=pop3_proxy", "authentication complete")
+	if !strings.Contains(line, "ja4=t13") {
+		t.Fatalf("the post-login log line names no JA4 after STLS: %s", line)
+	}
+}
