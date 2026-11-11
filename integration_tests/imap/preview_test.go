@@ -136,3 +136,39 @@ func TestIMAP_FetchPreviewDisabled(t *testing.T) {
 	}
 	c.ok("NOOP")
 }
+
+// TestIMAP_FetchPreviewFromS3 covers bodies that are only in object storage: the
+// test server uploads synchronously and keeps no local copy. PREVIEW (LAZY) must
+// not download them; PREVIEW without LAZY does, within the account's budget.
+func TestIMAP_FetchPreviewFromS3(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account, fake := common.SetupIMAPServerWithRealS3Options(t, func(o *imap.IMAPServerOptions) {
+		o.Preview = imap.PreviewOptions{Enabled: true, S3PerMin: 1, S3Burst: 1}
+	})
+	defer server.Close()
+	c := dialPreview(t, server.Address, account)
+	c.appendMessage("From: alice@example.com\nTo: bob@example.com\nSubject: one\n\nThe body in storage.\n")
+	c.appendMessage("From: alice@example.com\nTo: bob@example.com\nSubject: two\n\nPast the budget.\n")
+	server.WaitForUploads(t)
+	if n := fake.ObjectCount(); n < 2 {
+		t.Fatalf("%d objects in S3, want both bodies uploaded", n)
+	}
+
+	if untagged := c.ok("FETCH 1:* (UID PREVIEW (LAZY))"); strings.Count(untagged, "PREVIEW NIL") != 2 {
+		t.Fatalf("FETCH 1:* (UID PREVIEW (LAZY)) = %q, want NIL for both: their bodies are not on this node", untagged)
+	}
+
+	// One download fits the account's budget: the first message gets its text and
+	// the second an empty preview, which is all RFC 8970 allows without LAZY.
+	untagged := c.ok("FETCH 1:* (UID PREVIEW)")
+	lines := strings.Split(untagged, "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], `PREVIEW "The body in storage."`) || !strings.Contains(lines[1], `PREVIEW ""`) {
+		t.Fatalf("FETCH 1:* (UID PREVIEW) = %q, want the first text and an empty second", untagged)
+	}
+
+	// The downloaded preview is remembered, so LAZY now has it to hand.
+	if untagged := c.ok("FETCH 1 (PREVIEW (LAZY))"); !strings.Contains(untagged, `PREVIEW "The body in storage."`) {
+		t.Errorf("FETCH 1 (PREVIEW (LAZY)) after the download = %q, want the text", untagged)
+	}
+}
