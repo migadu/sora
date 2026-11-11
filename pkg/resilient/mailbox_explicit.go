@@ -20,3 +20,16 @@ func (rd *ResilientDatabase) GetMailboxByNameForRightWithRetry(ctx context.Conte
 	}
 	return result.(*db.DBMailbox), nil
 }
+
+// GetSharedMailboxByNameForRightWithRetry is GetMailboxByNameForRightWithRetry among
+// shared mailboxes only: a personal mailbox of the account's does not answer.
+func (rd *ResilientDatabase) GetSharedMailboxByNameForRightWithRetry(ctx context.Context, accountID int64, name string, right db.ACLRight) (*db.DBMailbox, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetSharedMailboxByNameForRight(ctx, accountID, name, right)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	if err != nil {
+		return nil, err
+	}
+	return result.(*db.DBMailbox), nil
+}

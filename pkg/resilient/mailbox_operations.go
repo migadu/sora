@@ -38,13 +38,13 @@ func (rd *ResilientDatabase) ResolveOrCreateMailboxPathWithRetry(ctx context.Con
 	var parentID *int64
 	for i := 1; i <= len(parts); i++ {
 		path := strings.Join(parts[:i], string(consts.MailboxDelimiter))
-		id, err := rd.getOwnedMailboxIDByNameWithRetry(ctx, accountID, path)
+		id, err := rd.GetOwnedMailboxIDByNameWithRetry(ctx, accountID, path)
 		if errors.Is(err, consts.ErrMailboxNotFound) {
 			if err := rd.CreateMailboxWithRetry(ctx, accountID, path, parentID); err != nil && !errors.Is(err, consts.ErrDBUniqueViolation) {
 				return nil, fmt.Errorf("create parent mailbox %q: %w", path, err)
 			}
 			// Re-fetch after a successful or concurrent creation, using the writer.
-			id, err = rd.getOwnedMailboxIDByNameWithRetry(ctx, accountID, path)
+			id, err = rd.GetOwnedMailboxIDByNameWithRetry(ctx, accountID, path)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("resolve parent mailbox %q: %w", path, err)
@@ -54,7 +54,9 @@ func (rd *ResilientDatabase) ResolveOrCreateMailboxPathWithRetry(ctx context.Con
 	return parentID, nil
 }
 
-func (rd *ResilientDatabase) getOwnedMailboxIDByNameWithRetry(ctx context.Context, accountID int64, name string) (int64, error) {
+// GetOwnedMailboxIDByNameWithRetry returns the ID of the account's own mailbox of
+// that name, never another owner's shared mailbox.
+func (rd *ResilientDatabase) GetOwnedMailboxIDByNameWithRetry(ctx context.Context, accountID int64, name string) (int64, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetOwnedMailboxIDByName(ctx, accountID, name)
 	}
