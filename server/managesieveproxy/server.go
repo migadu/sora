@@ -425,6 +425,8 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 
 	opts := managesieveserver.Options{
 		TLSConfig:              startTLSConfig,
+		OnStartTLS:             server.BeginStartTLS,
+		OnTLSHandshakeComplete: server.CompleteStartTLS,
 		Implementation:         "Sora ManageSieve Proxy",
 		Greeting:               `"ManageSieve proxy ready"`,
 		GreetingStartTLSHint:   false, // pre-migration parity: the proxy greeting carried no (STARTTLS) hint
@@ -471,21 +473,6 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 			} else if didTLS {
 				c.SetTLS(true)
 			}
-
-			// go-managesieve upgrades the stream on STARTTLS by layering its
-			// TLS connection ABOVE netConn, so the timeout notice must be
-			// written to the library's current connection, or it lands in
-			// plaintext under the TLS records (#163). Hijack hands the relay
-			// that same connection.
-			server.SetTimeoutNoticeConn(netConn, func() net.Conn {
-				// The library publishes its TLS connection once the handshake
-				// is done. Until then the SoraConn tells a plaintext session
-				// from an upgrade in progress. Only the reading goroutine asks.
-				if startTLSConfig != nil && !c.IsTLS() {
-					return nil
-				}
-				return c.NetConn()
-			})
 
 			// Count the connection only once it is past every rejection
 			// point, so the decrements in the session close path always

@@ -510,6 +510,8 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 
 	opts := pop3server.Options{
 		TLSConfig:              server.StartTLSConfig(s.tlsConfig, "pop3_proxy"), // records JA4 on STLS, as SoraTLSConn does for implicit TLS
+		OnStartTLS:             server.BeginStartTLS,
+		OnTLSHandshakeComplete: server.CompleteStartTLS,
 		IdleTimeout:            settings.commandTimeout,
 		AuthIdleTimeout:        settings.authIdleTimeout,
 		AbsoluteSessionTimeout: settings.absoluteSessionTimeout,
@@ -557,22 +559,6 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 				return nil, fmt.Errorf("%w: TLS handshake: %w", pop3server.ErrSilentReject, err)
 			} else if didTLS {
 				c.SetTLS(true)
-			}
-
-			// go-pop3 upgrades the stream on STLS by layering its TLS connection
-			// ABOVE netConn, so the timeout notice must be written to the
-			// library's current connection, or it lands in plaintext under the
-			// TLS records (#163). Hijack hands the relay that same connection.
-			if s.tlsConfig != nil && !c.IsTLS() {
-				server.SetTimeoutNoticeConn(netConn, func() net.Conn {
-					// The library publishes its TLS connection once the handshake
-					// is done. Until then the SoraConn tells a plaintext session
-					// from an upgrade in progress. Only the reading goroutine asks.
-					if !c.IsTLS() {
-						return nil
-					}
-					return c.NetConn()
-				})
 			}
 
 			// Count the connection only once it is past every rejection point,

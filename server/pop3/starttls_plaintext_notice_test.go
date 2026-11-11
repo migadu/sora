@@ -181,3 +181,45 @@ func TestShutdownNoticeAfterCoalescedSTLSHandshakeIsReadableThroughTLS(t *testin
 		t.Fatalf("shutdown notice through TLS = %q, want %q", line, want)
 	}
 }
+
+// Notice suppression follows the library's accepted transition, including
+// whitespace its parser accepts, rather than a second command parser.
+func TestShutdownNoticeDuringSTLSWithAcceptedWhitespaceIsSuppressed(t *testing.T) {
+	for _, command := range []string{"STLS\v\r\n", "\vSTLS\r\n", "STLS\u00a0\r\n"} {
+		t.Run(fmt.Sprintf("%q", command), func(t *testing.T) {
+			s, addr := startSTARTTLSTestServer(t)
+			conn, reader := dialPlaintext(t, addr)
+			fmt.Fprint(conn, command)
+			if line, err := reader.ReadString('\n'); err != nil || line != "+OK Begin TLS negotiation\r\n" {
+				t.Fatalf("STLS reply = %q, %v", line, err)
+			}
+			go s.sendGracefulShutdownMessage()
+			conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			if line, _ := reader.ReadString('\n'); len(line) != 0 {
+				t.Fatalf("plaintext after STLS acknowledgement = %q", line)
+			}
+		})
+	}
+}
+
+// A command argument that looks like a TLS verb is ordinary protocol data.
+func TestShutdownNoticeAfterUserNamedSTLSRemainsPlaintext(t *testing.T) {
+	s, addr := newReloadTestServer(t, POP3ServerOptions{
+		TLS:            true,
+		TLSCertFile:    "../../testdata/sora.crt",
+		TLSKeyFile:     "../../testdata/sora.key",
+		TLSUseStartTLS: true,
+		InsecureAuth:   true,
+		CommandTimeout: time.Minute,
+	})
+	startListenerTestServer(t, s, addr)
+	conn, reader := dialPlaintext(t, addr)
+	fmt.Fprint(conn, "USER STLS\r\n")
+	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "+OK") {
+		t.Fatalf("USER reply = %q, %v", line, err)
+	}
+	go s.sendGracefulShutdownMessage()
+	if line, err := reader.ReadString('\n'); err != nil || line != "-ERR Server shutting down, please reconnect\r\n" {
+		t.Fatalf("plaintext shutdown notice = %q, %v", line, err)
+	}
+}

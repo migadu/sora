@@ -78,8 +78,6 @@ func (s *Session) Close() error {
 // re-authenticates with master SASL credentials.
 func (s *Session) AuthenticatePlain(_ context.Context, _, username, password string) error {
 	authStart := time.Now()
-	// A login can arrive with the end of a STARTTLS handshake, with no read since.
-	server.RefreshTimeoutNoticeConn(s.listenerConn)
 	if err := s.authenticateUser(username, password, authStart); err != nil {
 		s.DebugLog("authentication failed", "error", err)
 		// Rate limiter blocked the attempt: reply with the same line as a bad

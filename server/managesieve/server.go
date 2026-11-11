@@ -433,6 +433,8 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 
 	opts := managesieveserver.Options{
 		TLSConfig:              startTLSConfig,
+		OnStartTLS:             serverPkg.BeginStartTLS,
+		OnTLSHandshakeComplete: serverPkg.CompleteStartTLS,
 		Implementation:         "ManageSieve",
 		Greeting:               `"Sora" ManageSieve server ready.`,
 		GreetingStartTLSHint:   true,
@@ -480,23 +482,6 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 				return nil, fmt.Errorf("%w: TLS handshake: %w", managesieveserver.ErrSilentReject, err)
 			} else if didTLS {
 				c.SetTLS(true)
-			}
-
-			// go-managesieve upgrades the stream on STARTTLS by layering its
-			// TLS connection ABOVE netConn, so the throughput-timeout notice
-			// must be written to the library's current connection, not to
-			// netConn's transport, or it lands in plaintext under the TLS
-			// records (#163).
-			if startTLSConfig != nil && !c.IsTLS() {
-				serverPkg.SetTimeoutNoticeConn(netConn, func() net.Conn {
-					// The library publishes its TLS connection once the handshake
-					// is done. Until then the SoraConn tells a plaintext session
-					// from an upgrade in progress. Only the reading goroutine asks.
-					if !c.IsTLS() {
-						return nil
-					}
-					return c.NetConn()
-				})
 			}
 
 			// Count the connection only once it is past every rejection
