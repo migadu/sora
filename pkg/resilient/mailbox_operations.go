@@ -152,51 +152,42 @@ func (rd *ResilientDatabase) InsertMessagesBatchWithRetry(ctx context.Context, o
 }
 
 func (rd *ResilientDatabase) GetMessagesByNumSetWithRetry(ctx context.Context, mailboxID int64, numSet imap.NumSet, includeBodyStructure ...bool) ([]db.Message, error) {
-	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetMessagesByNumSet(ctx, mailboxID, numSet, includeBodyStructure...)
-	}
-	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
+	var allMessages []db.Message
+	err := rd.StreamMessagesByNumSetWithRetry(ctx, mailboxID, numSet, func(chunk []db.Message) error {
+		allMessages = append(allMessages, chunk...)
+		return nil
+	}, includeBodyStructure...)
 	if err != nil {
 		return nil, err
 	}
-	if result == nil {
+	if allMessages == nil {
 		return []db.Message{}, nil
 	}
-	return result.([]db.Message), nil
+	return allMessages, nil
 }
 
+// StreamMessagesByNumSetWithRetry streams messages in chunks, bounding and retrying
+// each database read step (sequence-set resolution and per-chunk query + sequence
+// hydration) independently. The consumer callback runs outside executeReadWithRetry
+// and queryBreaker so slow S3 body downloads or client writes cannot exhaust a
+// subsequent chunk's DB timeout, replay already-delivered chunks on retry, or trip
+// the database circuit breaker on consumer errors.
 func (rd *ResilientDatabase) StreamMessagesByNumSetWithRetry(ctx context.Context, mailboxID int64, numSet imap.NumSet, cb db.MessageStreamCallback, includeBodyStructure ...bool) error {
-	return rd.streamMessagesWithRetry(ctx, cb, func(ctx context.Context, cb db.MessageStreamCallback) error {
-		return rd.getOperationalDatabaseForOperation(ctx, false).StreamMessagesByNumSet(ctx, mailboxID, numSet, cb, includeBodyStructure...)
+	runStep := func(ctx context.Context, step func(context.Context, *db.Database) error) error {
+		return rd.runMessageStreamStep(ctx, readRetryConfig, func(stepCtx context.Context) error {
+			return step(stepCtx, rd.getOperationalDatabaseForOperation(stepCtx, false))
+		})
+	}
+	return db.StreamMessagesByNumSetWithRunner(ctx, runStep, mailboxID, numSet, cb, includeBodyStructure...)
+}
+
+func (rd *ResilientDatabase) runMessageStreamStep(ctx context.Context, retryCfg retry.BackoffConfig, step func(context.Context) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_, err := rd.executeReadWithRetry(ctx, retryCfg, timeoutSearch, func(stepCtx context.Context) (any, error) {
+		return nil, step(stepCtx)
 	})
-}
-
-// messageStreamCallbackError distinguishes consumer failures from database
-// failures while the stream passes through retry and circuit-breaker handling.
-type messageStreamCallbackError struct {
-	cause error
-}
-
-func (e *messageStreamCallbackError) Error() string { return e.cause.Error() }
-func (e *messageStreamCallbackError) Unwrap() error { return e.cause }
-
-func (rd *ResilientDatabase) streamMessagesWithRetry(ctx context.Context, cb db.MessageStreamCallback, stream func(context.Context, db.MessageStreamCallback) error) error {
-	consumer := func(messages []db.Message) error {
-		if err := cb(messages); err != nil {
-			return &messageStreamCallbackError{cause: err}
-		}
-		return nil
-	}
-	op := func(ctx context.Context) (any, error) {
-		return nil, stream(ctx, consumer)
-	}
-	_, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutSearch, op)
-	// The marker is internal to resilience accounting. Preserve the callback's
-	// original error for its caller, including identity and wrapped causes.
-	var callbackErr *messageStreamCallbackError
-	if errors.As(err, &callbackErr) {
-		return callbackErr.cause
-	}
 	return err
 }
 

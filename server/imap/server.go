@@ -705,15 +705,8 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// S3 download per message. Like every capability it can still be removed
 	// per client (client_filters) or below (disabled_caps).
 	if options.Preview.Enabled {
-		s.preview = newPreviewState(options.Preview)
 		s.caps[imap.CapPreview] = struct{}{}
 	}
-	previewReady := false
-	defer func() {
-		if !previewReady {
-			s.preview.close()
-		}
-	}()
 
 	// Remove globally disabled capabilities from the server
 	if len(options.DisabledCaps) > 0 {
@@ -727,6 +720,18 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			}
 		}
 	}
+
+	// Allocate PREVIEW memoization and S3 rate-limiter goroutines only if PREVIEW
+	// remains enabled after applying disabled_caps.
+	if s.caps.Has(imap.CapPreview) {
+		s.preview = newPreviewState(options.Preview)
+	}
+	previewReady := false
+	defer func() {
+		if !previewReady {
+			s.preview.close()
+		}
+	}()
 
 	// Extra, non-standard capability tokens advertised verbatim to all clients.
 	// These bypass the go-imap known-capability allowlist (via SessionAdditionalCaps)

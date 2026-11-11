@@ -135,7 +135,7 @@ func (s *IMAPSession) writePreview(ctx context.Context, w previewWriter, msg *db
 func (s *IMAPSession) findPreview(ctx context.Context, msg *db.Message, lazy bool, run *previewRun, bodyData *[]byte, bodyDataFetched *bool) (text string, available bool, source string) {
 	p := s.server.preview
 	if p == nil {
-		return "", false, "unavailable" // a server not built by New
+		return "", false, "unavailable" // PREVIEW disabled or server not built by New
 	}
 
 	// Reuse generated text even when this FETCH also loaded the body. Repeated

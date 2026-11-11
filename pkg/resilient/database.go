@@ -199,12 +199,6 @@ func isQuerySuccessful(err error) bool {
 	if err == nil {
 		return true
 	}
-	// A streaming consumer can fail after the database successfully supplies a
-	// chunk, for example because the IMAP client disconnected during FETCH.
-	var callbackErr *messageStreamCallbackError
-	if errors.As(err, &callbackErr) {
-		return true
-	}
 	// An *imap.Error returned through a streaming callback (e.g. a FETCH whose body is
 	// temporarily unavailable from S3) is an IMAP protocol/application outcome, not a
 	// database system failure — the underlying query already succeeded. Don't let it trip
@@ -489,12 +483,6 @@ func (rd *ResilientDatabase) GetWriteTimeout() time.Duration {
 // It uses type assertions and error codes for robust checking.
 func (rd *ResilientDatabase) isRetryableError(err error) bool {
 	if err == nil {
-		return false
-	}
-	// Replaying the database stream would also replay consumer side effects.
-	// Its failure is final even if the cause resembles a retryable DB error.
-	var callbackErr *messageStreamCallbackError
-	if errors.As(err, &callbackErr) {
 		return false
 	}
 
@@ -854,7 +842,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 
 			logger.Info("Creating write pool", "component", "RESILIENT-FAILOVER", "host", host, "index", i, "total", len(config.Write.Hosts))
 
-			pool, err := createDatabasePool(ctx, host, config.Write, config.GetDebug(), "write", runMigrations && isFirstPool)
+			pool, err := createDatabasePool(ctx, host, config, config.Write, "write", runMigrations && isFirstPool)
 			if err != nil {
 				logger.Error("Failed to create write pool for host", "component", "RESILIENT-FAILOVER", "host", host, "error", err)
 				continue
@@ -892,7 +880,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 		for _, host := range config.Read.Hosts {
 			go func(h string) {
 				// Never run migrations for read pools.
-				pool, err := createDatabasePool(ctx, h, config.Read, config.GetDebug(), "read", false)
+				pool, err := createDatabasePool(ctx, h, config, config.Read, "read", false)
 				resultChan <- poolResult{host: h, pool: pool, err: err}
 			}(host)
 		}
@@ -961,24 +949,20 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 }
 
 // createDatabasePool creates a single database connection pool
-func createDatabasePool(ctx context.Context, host string, endpointConfig *config.DatabaseEndpointConfig, logQueries bool, poolType string, runMigrations bool) (*db.Database, error) {
-	// Create a temporary config for this single host
+func createDatabasePool(ctx context.Context, host string, dbConfig *config.DatabaseConfig, endpointConfig *config.DatabaseEndpointConfig, poolType string, runMigrations bool) (*db.Database, error) {
+	// Shallow-copy the endpoint config so overriding Hosts for this single pool
+	// preserves every pool setting (including MinIdleConnections, QueryTimeout, etc.)
+	// without mutating the caller's config.
+	singleHostEndpoint := *endpointConfig
+	singleHostEndpoint.Hosts = []string{host}
+
 	// Note: We use Write endpoint config even for read pools because db.NewDatabaseFromConfig
 	// expects Write to be populated. The actual pool type is tracked by the poolType parameter.
 	tempConfig := &config.DatabaseConfig{
-		Debug: logQueries,
-		Write: &config.DatabaseEndpointConfig{
-			Hosts:           []string{host},
-			Port:            endpointConfig.Port,
-			User:            endpointConfig.User,
-			Password:        endpointConfig.Password,
-			Name:            endpointConfig.Name,
-			TLSMode:         endpointConfig.TLSMode,
-			MaxConnections:  endpointConfig.MaxConnections,
-			MinConnections:  endpointConfig.MinConnections,
-			MaxConnLifetime: endpointConfig.MaxConnLifetime,
-			MaxConnIdleTime: endpointConfig.MaxConnIdleTime,
-		},
+		Debug:            dbConfig.GetDebug(),
+		MigrationTimeout: dbConfig.MigrationTimeout,
+		FetchChunkSize:   dbConfig.FetchChunkSize,
+		Write:            &singleHostEndpoint,
 		PoolTypeOverride: poolType, // Pass the actual pool type for logging
 	}
 
@@ -1319,7 +1303,7 @@ func (rd *ResilientDatabase) attemptReconnectFailedReplicas(ctx context.Context)
 		// Attempt reconnection
 		logger.Info("Attempting to reconnect to read replica", "component", "RESILIENT-FAILOVER", "host", replica.host, "attempt", attemptCount+1)
 
-		pool, err := createDatabasePool(ctx, replica.host, replica.endpointConfig, rd.config.GetDebug(), "read", false)
+		pool, err := createDatabasePool(ctx, replica.host, rd.config, replica.endpointConfig, "read", false)
 
 		replica.mu.Lock()
 		replica.lastAttempt = time.Now()

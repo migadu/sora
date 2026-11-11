@@ -11,17 +11,23 @@ import (
 )
 
 func TestPreviewServerLifecycle(t *testing.T) {
-	for _, enabled := range []bool{false, true} {
-		name := "disabled"
-		if enabled {
-			name = "enabled"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		enabled      bool
+		disabledCaps []string
+		wantActive   bool
+	}{
+		{name: "disabled", enabled: false, wantActive: false},
+		{name: "enabled", enabled: true, wantActive: true},
+		{name: "disabled_via_disabled_caps", enabled: true, disabledCaps: []string{"PREVIEW"}, wantActive: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
 			s, err := New(ctx, t.Name(), "localhost", "127.0.0.1:0", &storage.S3Storage{}, &resilient.ResilientDatabase{}, nil, nil, IMAPServerOptions{
-				LookupCache: &config.LookupCacheConfig{Enabled: false},
-				Preview:     PreviewOptions{Enabled: enabled, S3PerMin: 300, S3Burst: 200, S3NodePerMin: 3000},
+				LookupCache:  &config.LookupCacheConfig{Enabled: false},
+				DisabledCaps: tc.disabledCaps,
+				Preview:      PreviewOptions{Enabled: tc.enabled, S3PerMin: 300, S3Burst: 200, S3NodePerMin: 3000},
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -36,12 +42,12 @@ func TestPreviewServerLifecycle(t *testing.T) {
 					p.nodeLimit.Stop()
 				})
 			}
-			if got := s.caps.Has(goimap.CapPreview); got != enabled {
-				t.Errorf("PREVIEW advertised = %v, want %v", got, enabled)
+			if got := s.caps.Has(goimap.CapPreview); got != tc.wantActive {
+				t.Errorf("PREVIEW advertised = %v, want %v", got, tc.wantActive)
 			}
-			if !enabled {
+			if !tc.wantActive {
 				if p != nil {
-					t.Error("disabled PREVIEW initialized cache and limiter state")
+					t.Error("inactive PREVIEW initialized cache and limiter state")
 				}
 				return
 			}
