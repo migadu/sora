@@ -6,8 +6,14 @@ package imap
 // write and must be treated as a miss, never served: S3 is the authority. A row with
 // no recorded size only rules out an empty file.
 func bodySizeMatches(data []byte, size int) bool {
+	return bodyLenMatches(int64(len(data)), size)
+}
+
+// bodyLenMatches is bodySizeMatches for a local copy known only by its length, such
+// as a file that is about to be streamed.
+func bodyLenMatches(n int64, size int) bool {
 	if size <= 0 {
-		return len(data) > 0
+		return n > 0
 	}
-	return len(data) == size
+	return n == int64(size)
 }

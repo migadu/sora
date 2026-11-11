@@ -865,6 +865,10 @@ type ServerLimitsConfig struct {
 	MaxRedirectHops       *int   `toml:"max_redirect_hops,omitempty"`         // Max times one message may be redirected before suppression (mail-loop backstop, 0=unlimited, default: 2)
 	SessionMemoryLimit    string `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
 	MaxAuthErrors         int    `toml:"max_auth_errors,omitempty"`           // Maximum authentication errors before disconnection (default: 2)
+	PreviewS3PerMin       *int   `toml:"preview_s3_per_min,omitempty"`        // S3 downloads per account per minute to answer FETCH PREVIEW without LAZY (IMAP backend only, 0=unlimited, default: 300)
+	PreviewS3Burst        *int   `toml:"preview_s3_burst,omitempty"`          // Of those, how many may run back to back (default: 200)
+	PreviewS3NodePerMin   *int   `toml:"preview_s3_node_per_min,omitempty"`   // The same downloads for the whole server per minute (0=unlimited, default: 3000)
+	PreviewS3MaxSize      string `toml:"preview_s3_max_size,omitempty"`       // Largest message downloaded for a preview (default: [local_cache] max_object_size)
 }
 
 // ServerTimeoutsConfig holds timeout settings for a server
@@ -1052,6 +1056,7 @@ type ServerConfig struct {
 	ClientFilters  []ClientCapabilityFilter `toml:"client_filters,omitempty"`
 	DisabledCaps   []string                 `toml:"disabled_caps,omitempty"`   // Globally disabled capabilities (IMAP specific)
 	AdditionalCaps []string                 `toml:"additional_caps,omitempty"` // Extra capability tokens advertised verbatim, e.g. "X-ICEWARP-SERVER" (IMAP specific)
+	EnablePreview  bool                     `toml:"enable_preview,omitempty"`  // Advertise FETCH PREVIEW, RFC 8970 (IMAP backend only, default: false; limits in [limits] preview_s3_*)
 	IDName         string                   `toml:"id_name,omitempty"`         // IMAP ID command 'name' field (IMAP specific)
 	IDVersion      string                   `toml:"id_version,omitempty"`      // IMAP ID command 'version' field (IMAP specific)
 	IDVendor       string                   `toml:"id_vendor,omitempty"`       // IMAP ID command 'vendor' field (IMAP specific)
@@ -1700,6 +1705,41 @@ func (s *ServerConfig) GetSearchRateLimitBurst() int {
 		return *s.Limits.SearchRateLimitBurst
 	}
 	return s.GetSearchRateLimitPerMin()
+}
+
+// GetPreviewS3PerMin returns how many bodies one account may have downloaded
+// from S3 per minute to answer FETCH PREVIEW without LAZY (0 or less: no limit).
+func (s *ServerConfig) GetPreviewS3PerMin() int {
+	if s.Limits != nil && s.Limits.PreviewS3PerMin != nil {
+		return *s.Limits.PreviewS3PerMin
+	}
+	return 300
+}
+
+// GetPreviewS3Burst returns how many of those downloads may run back to back.
+func (s *ServerConfig) GetPreviewS3Burst() int {
+	if s.Limits != nil && s.Limits.PreviewS3Burst != nil && *s.Limits.PreviewS3Burst > 0 {
+		return *s.Limits.PreviewS3Burst
+	}
+	return 200
+}
+
+// GetPreviewS3NodePerMin returns how many bodies the whole server may download
+// from S3 per minute for previews (0 or less: no limit).
+func (s *ServerConfig) GetPreviewS3NodePerMin() int {
+	if s.Limits != nil && s.Limits.PreviewS3NodePerMin != nil {
+		return *s.Limits.PreviewS3NodePerMin
+	}
+	return 3000
+}
+
+// GetPreviewS3MaxSize returns the largest message downloaded for a preview, or
+// defaultSize (the body cache's max_object_size) when unset.
+func (s *ServerConfig) GetPreviewS3MaxSize(defaultSize int64) (int64, error) {
+	if s.Limits != nil && s.Limits.PreviewS3MaxSize != "" {
+		return helpers.ParseSize(s.Limits.PreviewS3MaxSize)
+	}
+	return defaultSize, nil
 }
 
 // DefaultThreadMaxMessages bounds the metadata fetched and threaded in memory

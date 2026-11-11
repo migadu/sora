@@ -34,6 +34,9 @@ type SearchRateLimiter struct {
 	cleanupInterval time.Duration
 	stopCleanup     chan struct{}
 	protocol        string
+	// command labels refusals in the protocol error metric; empty leaves them
+	// to the caller to count.
+	command string
 }
 
 // searchBucket is one account's token bucket, kept as the time at which it will
@@ -49,6 +52,13 @@ type searchBucket struct {
 // per window, of which up to burst may run back to back (burst <= 0 means
 // perWindow). It returns nil, which allows every search, when perWindow <= 0.
 func NewSearchRateLimiter(protocol string, perWindow int, window time.Duration, burst int) *SearchRateLimiter {
+	return NewCommandRateLimiter(protocol, "SEARCH", perWindow, window, burst)
+}
+
+// NewCommandRateLimiter is NewSearchRateLimiter for another expensive
+// operation: refusals are counted in the protocol error metric under command,
+// or not at all when command is empty.
+func NewCommandRateLimiter(protocol, command string, perWindow int, window time.Duration, burst int) *SearchRateLimiter {
 	if perWindow <= 0 {
 		return nil // Disabled
 	}
@@ -71,12 +81,13 @@ func NewSearchRateLimiter(protocol string, perWindow int, window time.Duration, 
 		cleanupInterval: 5 * time.Minute,
 		stopCleanup:     make(chan struct{}),
 		protocol:        protocol,
+		command:         command,
 	}
 
 	// Start cleanup goroutine
 	go limiter.cleanupRoutine()
 
-	logger.Debug("Search rate limiter: Initialized", "protocol", protocol, "max", perWindow, "window", window, "burst", burst)
+	logger.Debug("Search rate limiter: Initialized", "protocol", protocol, "command", command, "max", perWindow, "window", window, "burst", burst)
 
 	return limiter
 }
@@ -111,7 +122,9 @@ func (s *SearchRateLimiter) CanSearch(ctx context.Context, accountID int64) erro
 	}
 
 	// Record rate limit event
-	metrics.ProtocolErrors.WithLabelValues(s.protocol, "SEARCH", "rate_limited", "client_error").Inc()
+	if s.command != "" {
+		metrics.ProtocolErrors.WithLabelValues(s.protocol, s.command, "rate_limited", "client_error").Inc()
+	}
 
 	// Log suppression: only log once per minute per user to prevent spam
 	// iOS Mail and other aggressive clients may retry dozens of times per second
@@ -122,6 +135,7 @@ func (s *SearchRateLimiter) CanSearch(ctx context.Context, accountID int64) erro
 		if bucket.suppressCount > 0 {
 			logger.Debug("Search rate limiter: Rate limit exceeded",
 				"protocol", s.protocol,
+				"command", s.command,
 				"account", accountID,
 				"burst", s.burst,
 				"window", s.window,
@@ -130,6 +144,7 @@ func (s *SearchRateLimiter) CanSearch(ctx context.Context, accountID int64) erro
 		} else {
 			logger.Debug("Search rate limiter: Rate limit exceeded",
 				"protocol", s.protocol,
+				"command", s.command,
 				"account", accountID,
 				"burst", s.burst,
 				"window", s.window,

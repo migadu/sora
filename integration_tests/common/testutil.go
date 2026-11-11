@@ -201,6 +201,7 @@ type IMAPServerOpts struct {
 	// may create shared mailboxes and grant "anyone").
 	SharedMailboxes   *config.SharedMailboxesConfig
 	ThreadMaxMessages int
+	Preview           imap.PreviewOptions
 }
 
 func (ts *TestServer) Close() {
@@ -906,6 +907,7 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 			SearchRateLimitWindow: opts.SearchRateLimitWindow,
 			SearchRateLimitBurst:  opts.SearchRateLimitBurst,
 			ThreadMaxMessages:     opts.ThreadMaxMessages,
+			Preview:               opts.Preview,
 		},
 	)
 	if err != nil {

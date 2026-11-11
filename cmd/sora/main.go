@@ -1323,6 +1323,21 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 		sessionMemoryLimit = 100 * 1024 * 1024
 	}
 
+	// A body larger than the cache's max_object_size is never cached, so by
+	// default it is not downloaded for a preview either.
+	previewS3MaxSize, err := serverConfig.GetPreviewS3MaxSize(deps.config.LocalCache.GetMaxObjectSizeWithDefault())
+	if err != nil {
+		logger.Info("IMAP: Invalid preview_s3_max_size - using the cache's max_object_size", "name", serverConfig.Name, "error", err)
+		previewS3MaxSize = deps.config.LocalCache.GetMaxObjectSizeWithDefault()
+	}
+	previewOptions := imap.PreviewOptions{
+		Enabled:      serverConfig.EnablePreview,
+		S3PerMin:     serverConfig.GetPreviewS3PerMin(),
+		S3Burst:      serverConfig.GetPreviewS3Burst(),
+		S3NodePerMin: serverConfig.GetPreviewS3NodePerMin(),
+		S3MaxSize:    previewS3MaxSize,
+	}
+
 	// Parse auth idle timeout
 	authIdleTimeout, err := serverConfig.GetAuthIdleTimeout()
 	if err != nil {
@@ -1389,6 +1404,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			SearchRateLimitWindow:        searchRateLimitWindow,
 			SearchRateLimitBurst:         serverConfig.GetSearchRateLimitBurst(),
 			ThreadMaxMessages:            serverConfig.GetThreadMaxMessages(),
+			Preview:                      previewOptions,
 			SessionMemoryLimit:           sessionMemoryLimit,
 			AuthIdleTimeout:              authIdleTimeout,
 			CommandTimeout:               commandTimeout,

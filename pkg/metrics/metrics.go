@@ -373,6 +373,19 @@ var (
 		[]string{"reason"},
 	)
 
+	IMAPPreviewTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_imap_preview_total",
+			Help: "Total FETCH PREVIEW items answered, by where the preview came from",
+		},
+		// loaded: a body the FETCH had already loaded; memo: the in-memory preview
+		// cache; local: the body cache or staging file; storage: an S3 download;
+		// nil: not readily available, answered NIL to PREVIEW (LAZY). Answered ""
+		// without a download: unavailable (body not on this node and not uploaded,
+		// or an earlier load failed), too_large, limited (a budget), error (S3).
+		[]string{"source"},
+	)
+
 	// ManageSieve-specific
 	ManageSieveScriptsUploaded = promauto.NewCounter(
 		prometheus.CounterOpts{

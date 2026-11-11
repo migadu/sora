@@ -271,6 +271,18 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	var totalBytesFetched int64
 	var writeErr error
 
+	var preview *previewRun
+	if options.Preview != nil {
+		preview = newPreviewRun()
+		defer func() {
+			// RFC 8970 §8: log who makes the server generate previews. Only
+			// downloads are worth a line; the session log carries the user.
+			if preview.downloads > 0 {
+				s.InfoLog("FETCH PREVIEW downloaded message bodies", "count", preview.downloads)
+			}
+		}()
+	}
+
 	cb := func(messages []db.Message) error {
 		// CONDSTORE functionality - only process if capability is enabled
 		if s.GetCapabilities().Has(imap.CapCondStore) && options.ChangedSince > 0 {
@@ -349,7 +361,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			if s.IMAPUser != nil {
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
-			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID); err != nil {
+			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, preview); err != nil {
 				writeErr = err
 				return err
 			}
@@ -377,7 +389,8 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 }
 
 // writeMessageFetchData handles writing all FETCH data items for a single message.
-func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64) error {
+// preview is the command's PREVIEW state, nil unless PREVIEW was requested.
+func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, preview *previewRun) error {
 	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
 
 	// ARCHITECTURE DECISION: Use database sequence numbers directly, not sessionTracker.EncodeSeqNum().
@@ -503,6 +516,12 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 				s.DebugLog("BINARY section size requests ignored due to capability filtering")
 			}
 		}
+	}
+
+	// The parser accepted PREVIEW only if the session advertises it, so the
+	// request alone gates it here.
+	if options.Preview != nil && preview != nil {
+		s.writePreview(ctx, m, msg, options.Preview.Lazy, preview, &bodyData, &bodyDataFetched)
 	}
 
 	if s.GetCapabilities().Has(imap.CapCondStore) && options.ModSeq {
