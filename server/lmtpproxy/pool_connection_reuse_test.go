@@ -91,8 +91,11 @@ type lmtpPoolCommand struct {
 // just because DNS transfers its numeric destination. Between transactions a fresh
 // connection is allowed; during a transaction accepted recipients must be preserved.
 func TestLMTPHeldConnectionKeepsPoolIdentityAcrossDNSTransfer(t *testing.T) {
-	for _, pin := range []bool{false, true} {
+	for _, pin := range []string{"pool", "numeric", "hostname"} {
 		for _, inTransaction := range []bool{false, true} {
+			if pin == "hostname" && !inTransaction {
+				continue
+			}
 			t.Run(fmt.Sprintf("pin=%v/in_transaction=%v", pin, inTransaction), func(t *testing.T) {
 				phase := lmtpPoolTransferDNS(t)
 				ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -135,8 +138,12 @@ func TestLMTPHeldConnectionKeepsPoolIdentityAcrossDNSTransfer(t *testing.T) {
 						pool = "b"
 					}
 					answer := map[string]any{"address": email, "pool": pool}
-					if pin {
-						answer["server"] = net.JoinHostPort("127.0.0.1", port)
+					if pin != "pool" {
+						host := "127.0.0.1"
+						if pin == "hostname" {
+							host = "a.transfer.test"
+						}
+						answer["server"] = net.JoinHostPort(host, port)
 						delete(answer, "pool")
 					}
 					json.NewEncoder(w).Encode(answer)
@@ -200,6 +207,10 @@ func TestLMTPHeldConnectionKeepsPoolIdentityAcrossDNSTransfer(t *testing.T) {
 				require("MAIL FROM:<sender@example.com>", "250")
 				require("RCPT TO:<a@example.com>", "250")
 				first := <-commands
+				// Even a published but unchanged DNS generation should retain this socket.
+				if err := srv.connManager.ResolveAddresses(); err != nil {
+					t.Fatal(err)
+				}
 				// A same-pool recipient is a positive control: retain the existing socket.
 				require("RCPT TO:<a2@example.com>", "250")
 				if second := <-commands; second.connection != first.connection {
