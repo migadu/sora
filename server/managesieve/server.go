@@ -428,11 +428,13 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 	// advertise STARTTLS.
 	var startTLSConfig *tls.Config
 	if s.useStartTLS {
-		startTLSConfig = s.tlsConfig
+		startTLSConfig = serverPkg.StartTLSConfig(s.tlsConfig, "managesieve") // records JA4, as SoraTLSConn does for implicit TLS
 	}
 
 	opts := managesieveserver.Options{
 		TLSConfig:              startTLSConfig,
+		OnStartTLS:             serverPkg.BeginStartTLS,
+		OnTLSHandshakeComplete: serverPkg.CompleteStartTLS,
 		Implementation:         "ManageSieve",
 		Greeting:               `"Sora" ManageSieve server ready.`,
 		GreetingStartTLSHint:   true,
@@ -563,8 +565,9 @@ func (s *ManageSieveServer) connConfig() serverPkg.SoraConnConfig {
 		EnableTimeoutChecker: settings.minBytesPerMinute > 0,
 		NoAbsoluteTimeout:    true, // the library enforces absolute_session_timeout
 		OnTimeout: func(conn net.Conn, reason string) {
-			// Best-effort BYE before closing (RFC 5804 Section 1.3); TRYLATER
-			// indicates a temporary condition.
+			// Best-effort BYE before closing, on the connection the library is
+			// using (the TLS one after STARTTLS; see NewSession). RFC 5804
+			// Section 1.3; TRYLATER indicates a temporary condition.
 			message := "BYE (TRYLATER) \"Connection timeout, please reconnect\"\r\n"
 			if reason == "slow_throughput" {
 				message = "BYE (TRYLATER) \"Connection too slow, please reconnect\"\r\n"
@@ -762,12 +765,15 @@ func (s *ManageSieveServer) sendGracefulShutdownMessage() {
 	// Send shutdown message to all active connections
 	// ManageSieve uses BYE response for clean disconnection
 	for _, session := range activeSessions {
-		if session.conn != nil {
-			writer := bufio.NewWriter(session.conn)
+		// After STARTTLS the client reads through the library's TLS
+		// connection, which sits above session.conn; while STARTTLS is
+		// negotiating there is nothing to write to.
+		serverPkg.WriteNotice(session.conn, func(noticeConn net.Conn) {
+			writer := bufio.NewWriter(noticeConn)
 			// Send BYE with TRYLATER response code (RFC 5804 Section 1.3)
 			writer.WriteString("BYE (TRYLATER) \"Server shutting down, please reconnect\"\r\n")
 			writer.Flush()
-		}
+		})
 	}
 
 	// Give clients a brief moment (1 second) to receive the message

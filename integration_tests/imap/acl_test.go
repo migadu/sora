@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapclient"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 )
@@ -392,9 +392,12 @@ func TestACL_DELETEACL(t *testing.T) {
 //
 // Example:
 //
-//	C: A001 LISTRIGHTS INBOX user@example.com
-//	S: * LISTRIGHTS INBOX user@example.com "" lrswipkxtea
+//	C: A001 LISTRIGHTS Shared/Sales user@example.com
+//	S: * LISTRIGHTS Shared/Sales user@example.com "" l r s w i p k x t e a c d
 //	S: A001 OK LISTRIGHTS completed
+//
+// Only shared mailboxes carry grants, so on INBOX nothing is offered (see
+// TestACL_ListRightsMatchesWhatCanBeGranted).
 func TestACL_LISTRIGHTS(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -427,8 +430,13 @@ func TestACL_LISTRIGHTS(t *testing.T) {
 		t.Fatalf("User1 login failed: %v", err)
 	}
 
-	// Test LISTRIGHTS on INBOX
-	listRightsCmd := c1.ListRights("INBOX", imap.RightsIdentifier(email2))
+	sharedMailbox := fmt.Sprintf("Shared/TestLISTRIGHTS-%d", common.GetTimestamp())
+	if err := c1.Create(sharedMailbox, nil).Wait(); err != nil {
+		t.Fatalf("Failed to create shared mailbox: %v", err)
+	}
+	defer func() { c1.Delete(sharedMailbox).Wait() }()
+
+	listRightsCmd := c1.ListRights(sharedMailbox, imap.RightsIdentifier(email2))
 	listRightsData, err := listRightsCmd.Wait()
 	if err != nil {
 		t.Fatalf("LISTRIGHTS command failed: %v", err)

@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/storage"
@@ -99,8 +101,13 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Create mailbox
-	err = rdb.CreateMailboxForUserWithRetry(ctx, accountID, *mailbox)
+	// Create mailbox. With the shared mailbox config in the context, a name in the
+	// shared namespace becomes a shared mailbox, as it does from IMAP CREATE; an
+	// administrator may create one whatever allow_user_create says.
+	sharedMailboxes := globalConfig.SharedMailboxes
+	sharedMailboxes.AllowUserCreate = true
+	createCtx := context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: sharedMailboxes})
+	err = rdb.CreateMailboxForUserWithRetry(createCtx, accountID, *mailbox)
 	if err != nil {
 		fmt.Printf("Failed to create mailbox: %v\n", err)
 		os.Exit(1)
@@ -402,8 +409,33 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Rename mailbox - newParentID is handled internally by RenameMailbox
-	err = rdb.RenameMailboxWithRetry(ctx, mbox.ID, accountID, *newName, nil)
+	// Validate before creating parents, so a refused rename leaves no hierarchy. The
+	// namespace boundary is checked against the stored flag, as db.RenameMailbox does:
+	// a personal mailbox under the shared prefix may only be renamed out of it.
+	isShared, err := rdb.IsMailboxSharedWithRetry(ctx, mbox.ID)
+	if err != nil {
+		fmt.Printf("Failed to check whether mailbox '%s' is shared: %v\n", *oldName, err)
+		os.Exit(1)
+	}
+	if helpers.MailboxNameHasTraversal(*newName) ||
+		(globalConfig.SharedMailboxes.Enabled && globalConfig.SharedMailboxes.InNamespace(*newName) != isShared) {
+		fmt.Println("Failed to rename mailbox: invalid destination or shared namespace boundary")
+		os.Exit(1)
+	}
+	if helpers.MailboxNameIsBelow(*newName, mbox.Name) {
+		fmt.Println("Failed to rename mailbox: a mailbox cannot be renamed to a name below itself")
+		os.Exit(1)
+	}
+	renameCtx := context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: globalConfig.SharedMailboxes})
+	var parentID *int64
+	if index := strings.LastIndex(*newName, string(consts.MailboxDelimiter)); index >= 0 {
+		parentID, err = rdb.ResolveOrCreateMailboxPathWithRetry(renameCtx, mbox.AccountID, (*newName)[:index])
+		if err != nil {
+			fmt.Printf("Failed to resolve destination parent: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	err = rdb.RenameMailboxWithRetry(renameCtx, mbox.ID, mbox.AccountID, *newName, parentID)
 	if err != nil {
 		fmt.Printf("Failed to rename mailbox: %v\n", err)
 		os.Exit(1)

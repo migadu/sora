@@ -50,6 +50,7 @@ type POP3ProxySession struct {
 	server                *POP3ProxyServer
 	settings              *reloadableSettings // the settings its protocol server was built with (see reloadableSettings)
 	clientConn            net.Conn            // Reassigned on hijack; writes must hold mutex (sendGracefulShutdownMessage reads it from the Stop goroutine)
+	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4, which the hijacked TLS conn does not after STLS
 	backendConn           net.Conn            // Assigned in connectToBackend; writes must hold mutex (same reason)
 	backendReader         *bufio.Reader       // Buffered reader from authentication phase
 	clientReader          *bufio.Reader       // Buffered reader from the pre-auth phase; reused by the relay so a command pipelined with PASS/AUTH is not dropped
@@ -83,7 +84,7 @@ func (s *POP3ProxySession) getLogger() *server.ProxySessionLogger {
 	return &server.ProxySessionLogger{
 		Protocol:   "pop3_proxy",
 		ServerName: s.server.name,
-		ClientConn: s.clientConn,
+		ClientConn: s.listenerConn,
 		Username:   s.username,
 		AccountID:  s.accountID,
 		SessionID:  s.sessionID,

@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapserver"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/migadu/sora/pkg/metrics"
@@ -73,6 +73,12 @@ func newTTLTestServer(t *testing.T, name string) (*IMAPServer, string, *syncLogB
 // everything the server sent after it, up to the connection closing (or 3s).
 func sendExpiredTTL(t *testing.T, addr string) string {
 	t.Helper()
+	return sendLoopingTTL(t, addr, "1")
+}
+
+// sendLoopingTTL is sendExpiredTTL for any x-proxy-ttl value that must end the connection.
+func sendLoopingTTL(t *testing.T, addr, ttl string) string {
+	t.Helper()
 	c, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +89,7 @@ func sendExpiredTTL(t *testing.T, addr string) string {
 	if _, err := r.ReadString('\n'); err != nil {
 		t.Fatalf("greeting: %v", err)
 	}
-	c.Write([]byte(`a ID ("name" "proxy" "x-proxy-ttl" "1" "x-originating-ip" "198.51.100.7")` + "\r\n"))
+	c.Write([]byte(`a ID ("name" "proxy" "x-proxy-ttl" "` + ttl + `" "x-originating-ip" "198.51.100.7")` + "\r\n"))
 	// A client that ignores the refusal and carries on.
 	c.Write([]byte("b NOOP\r\n"))
 	// EOF or a reset both mean the server closed it; only the deadline means it did not.
@@ -183,4 +189,76 @@ func TestIMAPSessionCloseIsIdempotent(t *testing.T) {
 	}
 	srv.sessionsWg.Done() // the other session ends
 	<-done
+}
+
+// A TTL that arrives already spent is the same loop as one this hop spends: the
+// connection is dropped rather than answered and left open.
+func TestIDNonPositiveProxyTTLDropsConnection(t *testing.T) {
+	for _, ttl := range []string{"0", "-1"} {
+		t.Run(ttl, func(t *testing.T) {
+			srv, addr, _ := newTTLTestServer(t, "ttl-nonpositive-"+ttl)
+
+			rest := sendLoopingTTL(t, addr, ttl)
+			if strings.Contains(rest, "a OK") || strings.Contains(rest, "b OK") {
+				t.Errorf("connection served commands after x-proxy-ttl %s:\n%s", ttl, rest)
+			}
+			waitFor(t, "the session to close", func() bool { return srv.totalConnections.Load() <= 0 })
+		})
+	}
+}
+
+// sendIDAndLogout sends an ID with the given forwarding fields, then LOGOUT, and returns
+// everything the server answered.
+func sendIDAndLogout(t *testing.T, addr, fields string) string {
+	t.Helper()
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r := bufio.NewReader(c)
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := r.ReadString('\n'); err != nil {
+		t.Fatalf("greeting: %v", err)
+	}
+	c.Write([]byte(`a ID ("name" "proxy" ` + fields + `)` + "\r\n"))
+	c.Write([]byte("b LOGOUT\r\n"))
+	rest, err := io.ReadAll(r)
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("no LOGOUT within 3s; server sent:\n%s", rest)
+	}
+	return string(rest)
+}
+
+// A TTL that is not a number is an invalid forwarding parameter, not a loop: the ID is
+// answered and the connection kept, but none of the forwarded identity is applied. A
+// valid TTL is applied and echoed with one hop spent; an ID that carries no TTL at all
+// is not forwarding and is left alone.
+func TestIDMalformedProxyTTLIgnoresForwarding(t *testing.T) {
+	const origin = `"x-originating-ip" "198.51.100.7"`
+	for _, tc := range []struct {
+		name, fields string
+		applied      bool
+	}{
+		{"non-numeric", `"x-proxy-ttl" "abc" ` + origin, false},
+		{"empty", `"x-proxy-ttl" "" ` + origin, false},
+		{"trailing garbage", `"x-proxy-ttl" "5x" ` + origin, false},
+		{"absent", origin, false},
+		{"valid", `"x-proxy-ttl" "5" ` + origin, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, addr, _ := newTTLTestServer(t, "ttl-malformed")
+
+			rest := sendIDAndLogout(t, addr, tc.fields)
+			if !strings.Contains(rest, "a OK") || !strings.Contains(rest, "b OK") {
+				t.Fatalf("ID and LOGOUT were not both answered:\n%s", rest)
+			}
+			if got := strings.Contains(rest, "198.51.100.7"); got != tc.applied {
+				t.Errorf("forwarded identity applied = %v, want %v:\n%s", got, tc.applied, rest)
+			}
+			if tc.applied && !strings.Contains(rest, `"x-proxy-ttl" "4"`) {
+				t.Errorf("valid TTL 5 was not echoed as 4:\n%s", rest)
+			}
+		})
+	}
 }

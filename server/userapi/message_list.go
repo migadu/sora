@@ -130,7 +130,7 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Perform search
-	messages, err := s.rdb.SearchMessagesInMailboxWithRetry(ctx, accountID, mailboxName, searchQuery)
+	messages, truncated, err := s.rdb.SearchMessagesInMailboxWithRetry(ctx, accountID, mailboxName, searchQuery)
 	if err != nil {
 		if errors.Is(err, consts.ErrMailboxNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
@@ -141,10 +141,14 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// total stays the number of messages in this response. truncated says the cap left
+	// matches out, so a clipped result is never presented as complete (#166).
 	response := map[string]any{
-		"messages": messages,
-		"total":    len(messages),
-		"query":    searchQuery,
+		"messages":  messages,
+		"total":     len(messages),
+		"truncated": truncated,
+		"limit":     db.UserAPISearchLimit,
+		"query":     searchQuery,
 	}
 
 	s.writeJSON(w, http.StatusOK, response)

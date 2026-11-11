@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -73,7 +73,7 @@ func TestMessagesWithoutFTSRowStayVisible(t *testing.T) {
 	}
 
 	t.Run("THREAD ALL returns messages with no FTS row", func(t *testing.T) {
-		msgs, err := db.GetMessagesForThreading(ctx, mailboxID, accountID, &imap.SearchCriteria{}, true, true)
+		msgs, err := db.GetMessagesForThreading(ctx, mailboxID, accountID, &imap.SearchCriteria{}, true, true, 0)
 		require.NoError(t, err)
 		found := map[imap.UID]bool{}
 		for _, m := range msgs {
@@ -87,7 +87,7 @@ func TestMessagesWithoutFTSRowStayVisible(t *testing.T) {
 		// A BODY key brings the FTS table into the THREAD query. NOT BODY of a term no
 		// message contains is true of every message, the one without an FTS row included.
 		msgs, err := db.GetMessagesForThreading(ctx, mailboxID, accountID,
-			&imap.SearchCriteria{Not: []imap.SearchCriteria{{Body: []string{"zzqxnomatch"}}}}, true, false)
+			&imap.SearchCriteria{Not: []imap.SearchCriteria{{Body: []string{"zzqxnomatch"}}}}, true, false, 0)
 		require.NoError(t, err)
 		found := map[imap.UID]bool{}
 		for _, m := range msgs {

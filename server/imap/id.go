@@ -4,7 +4,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 
 	"github.com/migadu/sora/server"
 )
@@ -125,7 +125,18 @@ func (s *IMAPSession) extractForwardingFields(rawFields map[string]string) map[s
 // processForwardingParameters extracts and validates forwarding parameters from filtered fields
 func (s *IMAPSession) processForwardingParameters(forwardingFields map[string]string) {
 	// Parse forwarding parameters from the filtered forwarding fields
-	forwardingParams := server.ParseIMAPID(forwardingFields)
+	forwardingParams, err := server.ParseIMAPID(forwardingFields)
+	if err != nil {
+		s.DebugLog("invalid forwarding parameters", "error", err)
+		return
+	}
+
+	// A TTL that arrives already spent is a loop, like one this hop spends below.
+	// An ID without x-proxy-ttl is not a forwarding hop and is only ignored.
+	if _, hasTTL := forwardingFields["x-proxy-ttl"]; hasTTL && forwardingParams.ProxyTTL <= 0 {
+		s.dropForwardingLoop()
+		return
+	}
 
 	// Validate parameters
 	if err := forwardingParams.ValidateForwarding(); err != nil {
@@ -135,11 +146,7 @@ func (s *IMAPSession) processForwardingParameters(forwardingFields map[string]st
 
 	// Decrement TTL to prevent loops. This is for proxy-chaining.
 	if !forwardingParams.DecrementTTL() {
-		s.DebugLog("proxy TTL expired, dropping connection to prevent loop")
-		// ID cannot answer with an error, so the socket is closed, as a kick does:
-		// the response write fails, the connection ends, and go-imap closes the
-		// session.
-		s.conn.NetConn().Close()
+		s.dropForwardingLoop()
 		return
 	}
 
@@ -180,6 +187,14 @@ func (s *IMAPSession) processForwardingParameters(forwardingFields map[string]st
 	}
 
 	s.DebugLog("processed forwarding parameters", "client_ip", forwardingParams.OriginatingIP, "client_port", forwardingParams.OriginatingPort, "proxy_ip", s.ProxyIP, "session_id", forwardingParams.SessionID, "ttl", forwardingParams.ProxyTTL, "ja4", s.ja4Fingerprint)
+}
+
+// dropForwardingLoop ends a connection whose proxy TTL has run out. ID cannot answer
+// with an error, so the socket is closed, as a kick does: the response write fails, the
+// connection ends, and go-imap closes the session.
+func (s *IMAPSession) dropForwardingLoop() {
+	s.DebugLog("proxy TTL expired, dropping connection to prevent loop")
+	s.conn.NetConn().Close()
 }
 
 // addForwardingToIMAPID adds forwarding parameters to IMAP ID response

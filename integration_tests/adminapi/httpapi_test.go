@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -42,7 +43,7 @@ func (h *HTTPAPITestServer) Close() {
 }
 
 // setupHTTPAPIServer creates a test HTTP API server
-func setupHTTPAPIServer(t *testing.T) *HTTPAPITestServer {
+func setupHTTPAPIServer(t *testing.T, configure ...func(*adminapi.ServerOptions)) *HTTPAPITestServer {
 	t.Helper()
 
 	// Set up database
@@ -66,6 +67,9 @@ func setupHTTPAPIServer(t *testing.T) *HTTPAPITestServer {
 		AllowedHosts: []string{}, // Allow all for testing
 		Cache:        testCache,
 		TLS:          false,
+	}
+	for _, c := range configure {
+		c(&options)
 	}
 
 	// Create server
@@ -2021,7 +2025,10 @@ Date: %s
 func TestACLManagement(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	server := setupHTTPAPIServer(t)
+	// This positive-path fixture includes a grant to anyone. Enable that policy
+	// explicitly rather than relying on shared-mailbox policy being disabled.
+	shared := config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: true}
+	server := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.SharedMailboxes = shared })
 	defer server.Close()
 
 	// Create test accounts
@@ -2034,10 +2041,7 @@ func TestACLManagement(t *testing.T) {
 
 	// Add config to context to enable shared mailbox detection
 	cfg := &config.Config{
-		SharedMailboxes: config.SharedMailboxesConfig{
-			Enabled:         true,
-			NamespacePrefix: "Shared/",
-		},
+		SharedMailboxes: shared,
 	}
 	ctx = context.WithValue(ctx, consts.ConfigContextKey, cfg)
 
@@ -2196,8 +2200,8 @@ func TestACLManagement(t *testing.T) {
 		}
 
 		resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant", grantReq)
-		if resp.StatusCode == http.StatusOK {
-			t.Fatalf("Expected error for invalid rights, got status 200 - %s", string(body))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected status 400 for invalid rights, got %d - %s", resp.StatusCode, string(body))
 		}
 
 		var errResp map[string]any
@@ -2260,12 +2264,209 @@ func TestACLManagement(t *testing.T) {
 
 		resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/revoke", revokeReq)
 		// This should succeed (idempotent) even if the user doesn't have access
-		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusInternalServerError {
-			t.Fatalf("Expected status 200 or 500, got %d - %s", resp.StatusCode, string(body))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200, got %d - %s", resp.StatusCode, string(body))
 		}
 
 		t.Log("Revoke operation completed (idempotent behavior)")
 	})
+}
+
+// TestACLManagementStatusCodes: a request the server refuses, or one naming something
+// that does not exist, is the caller's to fix and must not answer 500, which reads as
+// a server fault. Revoking an entry that is not there leaves the ACL as asked (as
+// IMAP DELETEACL does) and succeeds.
+func TestACLManagementStatusCodes(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server := setupHTTPAPIServer(t)
+	defer server.Close()
+
+	owner := common.CreateTestAccount(t, server.rdb)
+	member := common.CreateTestAccount(t, server.rdb)
+	foreign := common.CreateTestAccountWithEmail(t, server.rdb,
+		fmt.Sprintf("foreign-%d@other.example.com", time.Now().UnixNano()), "password")
+
+	ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/"},
+	})
+	ownerID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
+	if err != nil {
+		t.Fatalf("Failed to resolve owner: %v", err)
+	}
+	shared := fmt.Sprintf("Shared/Status-%d", time.Now().UnixNano())
+	personal := fmt.Sprintf("Projects-%d", time.Now().UnixNano())
+	for _, name := range []string{shared, personal} {
+		if err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, name, nil); err != nil {
+			t.Fatalf("Failed to create mailbox %s: %v", name, err)
+		}
+	}
+	// The member can see the shared mailbox, so naming the member as its owner is
+	// refused for not owning it rather than for not finding it.
+	if err := server.rdb.GrantMailboxAccessByIdentifierWithRetry(ctx, ownerID, member.Email, shared, "l"); err != nil {
+		t.Fatalf("Failed to grant member lookup: %v", err)
+	}
+
+	grant := func(owner, mailbox, identifier, rights string) map[string]any {
+		return map[string]any{"owner": owner, "mailbox": mailbox, "identifier": identifier, "rights": rights}
+	}
+	revoke := func(owner, mailbox, identifier string) map[string]any {
+		return map[string]any{"owner": owner, "mailbox": mailbox, "identifier": identifier}
+	}
+	list := func(owner, mailbox string) string {
+		return "/admin/mailboxes/acl?" + url.Values{"owner": {owner}, "mailbox": {mailbox}}.Encode()
+	}
+	const grantPath, revokePath = "/admin/mailboxes/acl/grant", "/admin/mailboxes/acl/revoke"
+	missing := fmt.Sprintf("missing-%d@example.com", time.Now().UnixNano())
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   any
+		want   int
+	}{
+		{"grant on a personal mailbox", "POST", grantPath, grant(owner.Email, personal, member.Email, "lr"), http.StatusBadRequest},
+		{"grant to another domain", "POST", grantPath, grant(owner.Email, shared, foreign.Email, "lr"), http.StatusBadRequest},
+		{"grant unknown rights", "POST", grantPath, grant(owner.Email, shared, member.Email, "lrZ"), http.StatusBadRequest},
+		{"grant for an unknown owner", "POST", grantPath, grant(missing, shared, member.Email, "lr"), http.StatusNotFound},
+		{"grant on an unknown mailbox", "POST", grantPath, grant(owner.Email, "Shared/NoSuchMailbox", member.Email, "lr"), http.StatusNotFound},
+		{"grant to an unknown user", "POST", grantPath, grant(owner.Email, shared, missing, "lr"), http.StatusNotFound},
+		{"revoke an entry that is not there", "POST", revokePath, revoke(owner.Email, shared, "anyone"), http.StatusOK},
+		{"revoke for an unknown owner", "POST", revokePath, revoke(missing, shared, member.Email), http.StatusNotFound},
+		{"revoke on an unknown mailbox", "POST", revokePath, revoke(owner.Email, "Shared/NoSuchMailbox", member.Email), http.StatusNotFound},
+		{"revoke on another owner's mailbox", "POST", revokePath, revoke(member.Email, shared, owner.Email), http.StatusNotFound},
+		{"list for an unknown owner", "GET", list(missing, shared), nil, http.StatusNotFound},
+		{"list an unknown mailbox", "GET", list(owner.Email, "Shared/NoSuchMailbox"), nil, http.StatusNotFound},
+		{"list another owner's mailbox", "GET", list(member.Email, shared), nil, http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		resp, body := server.makeRequest(t, tc.method, tc.path, tc.body)
+		if resp.StatusCode != tc.want {
+			t.Errorf("%s: got %d %s, want %d", tc.name, resp.StatusCode, strings.TrimSpace(string(body)), tc.want)
+		}
+	}
+}
+
+// TestACLManagementOneEntryPerAccount: an address names its account whatever its
+// case, so a grant is stored under the account's primary address and a revoke under
+// any spelling removes it. Revoking used to match the stored text exactly and answer
+// 200 while the user kept access. Also: rights are stored canonically (so a repeated
+// right is not a 500 from the column width), the owner can't be given rights it
+// always holds, and a deleted account can't be granted anything.
+func TestACLManagementOneEntryPerAccount(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server := setupHTTPAPIServer(t)
+	defer server.Close()
+
+	owner := common.CreateTestAccount(t, server.rdb)
+	member := common.CreateTestAccount(t, server.rdb)
+	gone := common.CreateTestAccount(t, server.rdb)
+
+	ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{
+		SharedMailboxes: config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/"},
+	})
+	ownerID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
+	if err != nil {
+		t.Fatalf("Failed to resolve owner: %v", err)
+	}
+	shared := fmt.Sprintf("Shared/OneEntry-%d", time.Now().UnixNano())
+	if err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, shared, nil); err != nil {
+		t.Fatalf("Failed to create mailbox: %v", err)
+	}
+	if err := server.rdb.DeleteAccountWithRetry(ctx, gone.Email); err != nil {
+		t.Fatalf("Failed to delete account: %v", err)
+	}
+
+	const grantPath, revokePath = "/admin/mailboxes/acl/grant", "/admin/mailboxes/acl/revoke"
+	post := func(path string, body map[string]any, want int) {
+		t.Helper()
+		resp, respBody := server.makeRequest(t, "POST", path, body)
+		if resp.StatusCode != want {
+			t.Fatalf("POST %s %v: got %d %s, want %d", path, body, resp.StatusCode, strings.TrimSpace(string(respBody)), want)
+		}
+	}
+	// memberEntries returns the listed entries naming the member, in any case.
+	memberEntries := func() map[string]string {
+		t.Helper()
+		resp, body := server.makeRequest(t, "GET", "/admin/mailboxes/acl?"+url.Values{"owner": {owner.Email}, "mailbox": {shared}}.Encode(), nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("list: got %d %s", resp.StatusCode, body)
+		}
+		var list struct {
+			ACLs []struct{ Identifier, Rights string } `json:"acls"`
+		}
+		server.expectJSON(t, body, &list)
+		found := map[string]string{}
+		for _, e := range list.ACLs {
+			if strings.EqualFold(e.Identifier, member.Email) {
+				found[e.Identifier] = e.Rights
+			}
+		}
+		return found
+	}
+	grant := func(identifier, rights string) map[string]any {
+		return map[string]any{"owner": owner.Email, "mailbox": shared, "identifier": identifier, "rights": rights}
+	}
+
+	post(grantPath, grant(strings.ToUpper(member.Email), strings.Repeat("l", 21)+"r"), http.StatusOK)
+	if got := memberEntries(); len(got) != 1 || got[member.Email] != "lr" {
+		t.Fatalf("after granting <MEMBER> %q: entries %v, want {%s: lr}", strings.Repeat("l", 21)+"r", got, member.Email)
+	}
+	post(revokePath, map[string]any{"owner": owner.Email, "mailbox": shared, "identifier": strings.ToUpper(member.Email)}, http.StatusOK)
+	if got := memberEntries(); len(got) != 0 {
+		t.Fatalf("after revoking <MEMBER>: entries %v, want none", got)
+	}
+
+	post(grantPath, grant(gone.Email, "lr"), http.StatusNotFound)
+	post(grantPath, grant(owner.Email, "lr"), http.StatusBadRequest)
+	for _, path := range []string{grantPath, revokePath} {
+		post(path, map[string]any{"owner": "  ", "mailbox": shared, "identifier": member.Email, "rights": "lr"}, http.StatusBadRequest)
+	}
+	resp, body := server.makeRequest(t, "GET", "/admin/mailboxes/acl?"+url.Values{"owner": {"  "}, "mailbox": {shared}}.Encode(), nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("list with a blank owner: got %d %s, want 400", resp.StatusCode, body)
+	}
+}
+
+// TestACLGrantAnyoneFollowsAllowAnyoneIdentifier covers the Admin API half of issue
+// #159: with [shared_mailboxes] allow_anyone_identifier false (its default), granting
+// to "anyone" is refused (400), as it is over IMAP; a user can still be granted.
+func TestACLGrantAnyoneFollowsAllowAnyoneIdentifier(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	for _, allowed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("allow_anyone_identifier=%t", allowed), func(t *testing.T) {
+			shared := config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/", AllowAnyoneIdentifier: allowed}
+			server := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.SharedMailboxes = shared })
+			defer server.Close()
+
+			owner := common.CreateTestAccount(t, server.rdb)
+			member := common.CreateTestAccount(t, server.rdb)
+			ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{SharedMailboxes: shared})
+			ownerID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)
+			if err != nil {
+				t.Fatalf("Failed to resolve owner: %v", err)
+			}
+			mailbox := fmt.Sprintf("Shared/Anyone-%d", time.Now().UnixNano())
+			if err := server.rdb.CreateMailboxWithRetry(ctx, ownerID, mailbox, nil); err != nil {
+				t.Fatalf("Failed to create mailbox: %v", err)
+			}
+
+			want := http.StatusBadRequest
+			if allowed {
+				want = http.StatusOK
+			}
+			for identifier, status := range map[string]int{"anyone": want, member.Email: http.StatusOK} {
+				resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/grant",
+					map[string]any{"owner": owner.Email, "mailbox": mailbox, "identifier": identifier, "rights": "lr"})
+				if resp.StatusCode != status {
+					t.Errorf("grant to %s: got %d %s, want %d", identifier, resp.StatusCode, strings.TrimSpace(string(body)), status)
+				}
+			}
+		})
+	}
 }
 
 // Mock AffinityManager for testing

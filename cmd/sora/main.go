@@ -277,35 +277,7 @@ func main() {
 			handleConfigReload(*configPath, &deps.config, errorHandler)
 
 			// Dispatch per-server reload to running servers
-			deps.runningServersMux.Lock()
-			serverCount := len(deps.runningServers)
-			deps.runningServersMux.Unlock()
-
-			if serverCount > 0 {
-				newServers := newCfg.GetAllServers()
-				serversByName := make(map[string]config.ServerConfig, len(newServers))
-				for _, s := range newServers {
-					serversByName[s.Name] = s
-				}
-
-				deps.runningServersMux.Lock()
-				for name, srv := range deps.runningServers {
-					if newServerCfg, ok := serversByName[name]; ok {
-						// Re-validate before applying: keeps the fail-closed startup guards
-						// (e.g. master_username with an empty master_password) effective on
-						// SIGHUP reload. Invalid new config is skipped; the server keeps
-						// running on its previous, already-validated config.
-						if err := newServerCfg.Validate(); err != nil {
-							logger.Error("Skipping reload: invalid new server config", "server", name, "error", err)
-							continue
-						}
-						if err := srv.ReloadConfig(newServerCfg); err != nil {
-							logger.Error("Failed to reload server config", "server", name, "error", err)
-						}
-					}
-				}
-				deps.runningServersMux.Unlock()
-			}
+			deps.reloadServers(&newCfg)
 		}
 	}()
 
@@ -1379,6 +1351,14 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 		commandTimeoutOverrides = nil
 	}
 
+	// Get global TLS config if available and wrap with server-specific default domain
+	var tlsConfig *tls.Config
+	if deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+		// Wrap with server-specific default domain if specified
+		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
+	}
+
 	s, err := imap.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance,
 		imap.IMAPServerOptions{
 			InstanceID:                   deps.instanceID,
@@ -1388,6 +1368,8 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			TLSCertFile:                  serverConfig.TLSCertFile,
 			TLSKeyFile:                   serverConfig.TLSKeyFile,
 			TLSVerify:                    serverConfig.TLSVerify,
+			TLSUseStartTLS:               serverConfig.TLSUseStartTLS,
+			TLSConfig:                    tlsConfig,
 			MasterUsername:               []byte(serverConfig.MasterUsername),
 			MasterPassword:               []byte(serverConfig.MasterPassword),
 			MasterSASLUsername:           []byte(serverConfig.MasterSASLUsername),
@@ -1406,6 +1388,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			SearchRateLimitPerMin:        serverConfig.GetSearchRateLimitPerMin(),
 			SearchRateLimitWindow:        searchRateLimitWindow,
 			SearchRateLimitBurst:         serverConfig.GetSearchRateLimitBurst(),
+			ThreadMaxMessages:            serverConfig.GetThreadMaxMessages(),
 			SessionMemoryLimit:           sessionMemoryLimit,
 			AuthIdleTimeout:              authIdleTimeout,
 			CommandTimeout:               commandTimeout,
@@ -1583,6 +1566,14 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		absoluteSessionTimeout = 30 * time.Minute
 	}
 
+	// Get global TLS config if available and wrap with server-specific default domain
+	var tlsConfig *tls.Config
+	if deps.tlsManager != nil {
+		tlsConfig = deps.tlsManager.GetTLSConfig()
+		// Wrap with server-specific default domain if specified
+		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
+	}
+
 	s, err := pop3.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, deps.cacheInstance, pop3.POP3ServerOptions{
 		MaintenanceGate:           deps.maintenanceGate,
 		Debug:                     serverConfig.Debug,
@@ -1590,6 +1581,8 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		TLSCertFile:               serverConfig.TLSCertFile,
 		TLSKeyFile:                serverConfig.TLSKeyFile,
 		TLSVerify:                 serverConfig.TLSVerify,
+		TLSUseStartTLS:            serverConfig.TLSUseStartTLS,
+		TLSConfig:                 tlsConfig,
 		MasterUsername:            serverConfig.MasterUsername,
 		MasterPassword:            serverConfig.MasterPassword,
 		MasterSASLUsername:        serverConfig.MasterSASLUsername,
@@ -1841,6 +1834,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		TLSCertFile:              serverConfig.TLSCertFile,
 		TLSKeyFile:               serverConfig.TLSKeyFile,
 		TLSVerify:                serverConfig.TLSVerify,
+		TLSUseStartTLS:           serverConfig.TLSUseStartTLS,
 		TLSConfig:                tlsConfig,
 		RemoteTLS:                serverConfig.RemoteTLS,
 		RemoteTLSUseStartTLS:     serverConfig.RemoteTLSUseStartTLS,
@@ -1977,6 +1971,7 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		TLSCertFile:              serverConfig.TLSCertFile,
 		TLSKeyFile:               serverConfig.TLSKeyFile,
 		TLSVerify:                serverConfig.TLSVerify,
+		TLSUseStartTLS:           serverConfig.TLSUseStartTLS,
 		TLSConfig:                tlsConfig,
 		RemoteTLS:                serverConfig.RemoteTLS,
 		RemoteTLSUseStartTLS:     serverConfig.RemoteTLSUseStartTLS,
@@ -2215,13 +2210,6 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		logger.Info("LMTP proxy: Invalid absolute session timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
 		absoluteSessionTimeout = 5 * time.Minute
 	}
-	// Override default 24h with 5m for LMTP since connections should be short-lived
-	// LMTP is a delivery protocol - messages should be delivered in seconds/minutes, not hours
-	// Check if timeout is the default 24h value (either Timeouts is nil or AbsoluteSessionTimeout is empty)
-	if absoluteSessionTimeout == 24*time.Hour && (serverConfig.Timeouts == nil || serverConfig.Timeouts.AbsoluteSessionTimeout == "") {
-		logger.Info("LMTP proxy: Using LMTP-specific default (5 minutes) instead of generic default (24 hours)", "name", serverConfig.Name)
-		absoluteSessionTimeout = 5 * time.Minute
-	}
 
 	remotePort, err := serverConfig.GetRemotePort()
 	if err != nil {
@@ -2422,6 +2410,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		RedirectRateWindow: redirectRateWindow,
 		MaxRedirectHops:    serverConfig.GetMaxRedirectHops(),
 		SieveExtensions:    deps.config.Sieve.EnabledExtensions,
+		SharedMailboxes:    deps.config.SharedMailboxes,
 	}
 }
 

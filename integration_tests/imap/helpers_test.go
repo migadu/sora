@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	imap "github.com/emersion/go-imap/v2"
+	imap "github.com/migadu/go-imap"
 )
 
 // LogCapture helps capture log output for verification. It guards the buffer

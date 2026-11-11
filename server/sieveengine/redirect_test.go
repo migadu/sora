@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 )
@@ -178,4 +179,159 @@ func TestRedirectRateLimit(t *testing.T) {
 			t.Errorf("a failed rate-limit check must not record, got %d records", ro.recordedN)
 		}
 	})
+}
+
+// evalRedirectScript evaluates script for account 1 against ro with the given limit.
+func evalRedirectScript(t *testing.T, script string, ro RedirectOracle, limit int) (Result, error) {
+	t.Helper()
+	exts := []string{"fileinto", "copy"}
+	executor, err := NewSieveExecutorWithOracleAndExtensions(script, 1, newMockVacationOracle(), ro, limit, time.Hour, 0, exts)
+	if err != nil {
+		t.Fatalf("failed to create executor: %v", err)
+	}
+	return executor.Evaluate(context.Background(), cleanRedirectCtx())
+}
+
+// The rate limit is charged for the redirects delivery is asked to make (#230),
+// not for every redirect command the script happened to run.
+func TestRedirectRateLimitChargesWhatIsRelayed(t *testing.T) {
+	t.Run("redirect cancelled by fileinto is not charged", func(t *testing.T) {
+		ro := &configurableRedirectOracle{}
+		res, err := evalRedirectScript(t, `require "fileinto"; fileinto "Archive"; redirect "forward@example.com";`, ro, 100)
+		if err != nil {
+			t.Fatalf("evaluate: %v", err)
+		}
+		// fileinto still takes the message over and the redirect is not relayed.
+		if res.Action != ActionFileInto {
+			t.Fatalf("expected fileinto, got %s", res.Action)
+		}
+		if ro.recordedN != 0 {
+			t.Errorf("no redirect is relayed, but %d were charged", ro.recordedN)
+		}
+	})
+
+	t.Run("the same address twice is charged once", func(t *testing.T) {
+		ro := &configurableRedirectOracle{}
+		res, err := evalRedirectScript(t, `redirect "forward@example.com"; redirect "forward@example.com";`, ro, 100)
+		if err != nil {
+			t.Fatalf("evaluate: %v", err)
+		}
+		if res.Action != ActionRedirect {
+			t.Fatalf("expected redirect, got %s", res.Action)
+		}
+		if ro.recordedN != 1 {
+			t.Errorf("one address is relayed, but %d redirects were charged", ro.recordedN)
+		}
+	})
+
+	t.Run("a script that fails is not charged", func(t *testing.T) {
+		ro := &configurableRedirectOracle{}
+		// go-sieve allows five redirects and fails the script on the sixth; the
+		// message is then kept and nothing is relayed.
+		var script string
+		for i := range 6 {
+			script += fmt.Sprintf("redirect \"forward%d@example.com\";\n", i)
+		}
+		res, err := evalRedirectScript(t, script, ro, 100)
+		if err == nil {
+			t.Fatalf("expected the script to fail on too many redirects, got %+v", res)
+		}
+		if res.Action != ActionKeep {
+			t.Fatalf("expected keep after a failed script, got %s", res.Action)
+		}
+		if ro.recordedN != 0 {
+			t.Errorf("nothing is relayed, but %d redirects were charged", ro.recordedN)
+		}
+	})
+}
+
+// countingRedirectOracle counts like the database does: every recorded redirect
+// shows up in the next count.
+type countingRedirectOracle struct{ recorded int }
+
+func (o *countingRedirectOracle) CountRedirectsSince(ctx context.Context, accountID int64, window time.Duration) (int, error) {
+	return o.recorded, nil
+}
+
+func (o *countingRedirectOracle) RecordRedirect(ctx context.Context, accountID int64) error {
+	o.recorded++
+	return nil
+}
+
+// A script may redirect to several addresses (RFC 5228 §2.10.4); the result
+// carries each one once, in script order (#230).
+func TestMultipleRedirects(t *testing.T) {
+	tests := []struct {
+		name         string
+		script       string
+		limit        int
+		want         []string
+		wantCopy     bool
+		wantRecorded int
+	}{
+		{
+			name:         "every address is carried",
+			script:       `redirect "one@example.com"; redirect "two@example.org"; redirect "three@example.net";`,
+			limit:        100,
+			want:         []string{"one@example.com", "two@example.org", "three@example.net"},
+			wantRecorded: 3,
+		},
+		{
+			name:         "copy keeps the message too",
+			script:       `require "copy"; redirect :copy "one@example.com"; redirect :copy "two@example.org";`,
+			limit:        100,
+			want:         []string{"one@example.com", "two@example.org"},
+			wantCopy:     true,
+			wantRecorded: 2,
+		},
+		{
+			name:         "one redirect without copy cancels the keep",
+			script:       `require "copy"; redirect :copy "one@example.com"; redirect "two@example.org";`,
+			limit:        100,
+			want:         []string{"one@example.com", "two@example.org"},
+			wantRecorded: 2,
+		},
+		{
+			name:         "a repeated address is carried once",
+			script:       `redirect "one@example.com"; redirect "two@example.org"; redirect "one@example.com";`,
+			limit:        100,
+			want:         []string{"one@example.com", "two@example.org"},
+			wantRecorded: 2,
+		},
+		{
+			name:         "a malformed address does not stop the others",
+			script:       `redirect "not-an-address"; redirect "two@example.org";`,
+			limit:        100,
+			want:         []string{"two@example.org"},
+			wantRecorded: 1,
+		},
+		{
+			name:         "the rate limit cuts off within one message",
+			script:       `redirect "one@example.com"; redirect "two@example.org"; redirect "three@example.net";`,
+			limit:        2,
+			want:         []string{"one@example.com", "two@example.org"},
+			wantRecorded: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ro := &countingRedirectOracle{}
+			res, err := evalRedirectScript(t, tt.script, ro, tt.limit)
+			if err != nil {
+				t.Fatalf("evaluate: %v", err)
+			}
+			if res.Action != ActionRedirect {
+				t.Fatalf("expected redirect, got %s", res.Action)
+			}
+			if !slices.Equal(res.RedirectTo, tt.want) {
+				t.Errorf("RedirectTo = %v, want %v", res.RedirectTo, tt.want)
+			}
+			if res.Copy != tt.wantCopy {
+				t.Errorf("Copy = %v, want %v", res.Copy, tt.wantCopy)
+			}
+			if ro.recorded != tt.wantRecorded {
+				t.Errorf("charged %d redirects, want %d", ro.recorded, tt.wantRecorded)
+			}
+		})
+	}
 }

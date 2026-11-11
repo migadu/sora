@@ -16,7 +16,7 @@ Always use TLS to encrypt communications between clients, proxies, and servers.
     ```
     It is highly recommended that `tls_cert_file` contains the full certificate chain.
 
-*   **STARTTLS**: For protocols that support opportunistic encryption (LMTP, ManageSieve), you can enable `tls_use_starttls = true`.
+*   **STARTTLS**: IMAP, LMTP, ManageSieve and POP3 servers and proxies can serve a plaintext port that upgrades with STARTTLS (STLS for POP3) instead of implicit TLS: set `tls = true` and `tls_use_starttls = true`. Unless `insecure_auth = true`, login is offered only after the upgrade (IMAP advertises `LOGINDISABLED` until then). JA4 client filters apply to STARTTLS sessions from the upgrade on.
 
 *   **Client Certificates**: Sora can be configured to verify client certificates for mutual TLS (`tls_verify = true`), but this is typically disabled (`false`) for general-purpose mail servers.
 
@@ -79,10 +79,9 @@ Sora includes built-in protections against resource exhaustion attacks:
 ### Search Result Limits
 
 To prevent memory exhaustion from large search operations:
-- **MaxSearchResults**: Limited to 1,000 messages per search (down from 5,000)
-- **MaxComplexSortResults**: Limited to 500 messages for expensive JSONB-based sorts
+- **MaxSearchResults**: Limited to 100,000 matching messages for filtered searches
 
-These limits are enforced at the database layer and cannot be bypassed by clients. For mailboxes with more messages, clients should use more specific search criteria or implement pagination.
+IMAP SEARCH, SORT and ESEARCH refuse a result above the default cap with `NO [LIMIT]`, rather than returning a partial set as success. Exactly the cap is allowed. `ALL` searches remain exempt for full mailbox synchronization. Clients can narrow the criteria when a filtered search exceeds the cap. Database callers that explicitly request a bounded page keep that page size. Each refusal is counted in `sora_imap_search_refused_total{reason="result_cap"}` and logged at INFO with the command, the mailbox and its message count, so that how often, and where, clients hit the cap is visible.
 
 ### Search Rate Limiting
 
@@ -102,7 +101,7 @@ The limit charges the searches that are expensive, not every command that is a s
 The rate limiter:
 - Tracks searches per user (not per IP), across all of the user's connections
 - Uses a token bucket: it holds `search_rate_limit_burst` searches and refills continuously at `search_rate_limit_per_min` per `search_rate_limit_window`. With the default burst it allows every sequence the earlier sliding window allowed, at the same sustained rate, and a burst followed by idle time is no longer refused for a whole window
-- Refuses with `NO [LIMIT]` (RFC 5530), saying how long to wait, so that clients can tell throttling from failure
+- Refuses with `NO [LIMIT]` (RFC 5530), saying how long to wait, so that clients can tell throttling from failure; each refusal is counted in `sora_imap_search_refused_total{reason="rate_limit"}`, next to the result cap's, as well as in `sora_protocol_errors_total{error_type="rate_limited"}`
 - Automatically cleans up inactive user tracking
 - Is on by default at 60 searches per minute (set `search_rate_limit_per_min = 0` to disable it)
 
@@ -359,7 +358,8 @@ ACL entries are restricted to the same domain:
 [shared_mailboxes]
 enabled = true
 namespace_prefix = "Shared/"
-allow_user_create = true          # Or false for admin-only
+allow_user_create = true          # Or false (the default) for admin-only
+allow_anyone_identifier = false   # The default: no grants to "anyone"
 default_rights = "lrswipkxtea"    # Full rights for creators
 ```
 

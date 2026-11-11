@@ -3,8 +3,20 @@ package imap
 import (
 	"testing"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 )
+
+func TestRecentUIDs_ConsumedBaselineNeverRewinds(t *testing.T) {
+	var tracker recentUIDTracker
+	tracker.Store(1, 99)
+	// Concurrent SELECTs can finish out of order, or one can read a lagging
+	// replica. Neither may revive Recent consumed by a newer selection.
+	tracker.Store(1, 42)
+	uid, ok := tracker.Load(1)
+	if !ok || uid != 99 {
+		t.Fatalf("consumed baseline = %v, %v; want 99, true", uid, ok)
+	}
+}
 
 // TestRecentUIDs_Bounded covers RECENT-1: the server-wide \Recent bookkeeping is keyed
 // by mailbox ID and nothing ever removes an entry, so on a multi-tenant node it grows

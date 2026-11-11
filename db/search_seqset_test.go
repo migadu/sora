@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/require"
 )
 
@@ -59,12 +59,12 @@ func TestMapSeqNumCriteriaToUID(t *testing.T) {
 		{
 			name:     "single numbers and a star",
 			criteria: imap.SearchCriteria{SeqNum: []imap.SeqSet{seqs([2]uint32{8, 8}, [2]uint32{1, 1}, [2]uint32{6, 0})}},
-			want:     imap.SearchCriteria{UID: []imap.UIDSet{uids([2]imap.UID{10, 10}, [2]imap.UID{1, 1}, [2]imap.UID{8, 0})}},
+			want:     imap.SearchCriteria{UID: []imap.UIDSet{uids([2]imap.UID{10, 10}, [2]imap.UID{1, 1}, [2]imap.UID{8, 10})}},
 		},
 		{
 			name:     "a range ending past the last message runs to it",
 			criteria: imap.SearchCriteria{SeqNum: []imap.SeqSet{seqs([2]uint32{7, 50})}},
-			want:     imap.SearchCriteria{UID: []imap.UIDSet{uids([2]imap.UID{9, 0})}},
+			want:     imap.SearchCriteria{UID: []imap.UIDSet{uids([2]imap.UID{9, 10})}},
 		},
 		{
 			name:     "a range starting past the last message is dropped",
@@ -208,7 +208,7 @@ func TestUIDThreadByUIDSetReadsOnlyThoseMessages(t *testing.T) {
 	traced := &Database{WritePool: database.GetWritePool(), ReadPool: pool}
 
 	criteria := &imap.SearchCriteria{UID: []imap.UIDSet{{imap.UIDRange{Start: messages - named + 1, Stop: messages}}}}
-	found, err := traced.GetMessagesForThreading(ctx, mailboxID, accountID, criteria, true, false)
+	found, err := traced.GetMessagesForThreading(ctx, mailboxID, accountID, criteria, true, false, 0)
 	require.NoError(t, err)
 	require.Len(t, found, named)
 

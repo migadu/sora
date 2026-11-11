@@ -5,6 +5,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
 )
 
@@ -79,27 +80,44 @@ func (s *Session) closeForMaintenance() {
 	s.gracefulShutdown = true
 	s.closingForMaintenance = true
 	backendConn := s.backendConn
+	clientConn := s.clientConn
 	s.mu.Unlock()
 	s.InfoLog("closing session: backend in maintenance", "backend", s.serverAddrLocked())
 
-	if closeWriter, ok := backendConn.(interface{ CloseWrite() error }); ok {
-		if err := closeWriter.CloseWrite(); err != nil {
-			s.DebugLog("Failed to half-close backend connection", "error", err)
-		}
-	}
-	// Not inline: sendBye waits for a write the copy has under way, and the drain must not.
-	go s.sendBye(byeMaintenance)
+	// Arm the bound before any network operation. TLS CloseWrite sends an alert
+	// and can wait for a stalled peer or for an existing Write's TLS mutex. The
+	// drain's pacing loop must not wait for any one session to finish that work.
 	time.AfterFunc(maintenanceCloseGrace, func() {
-		s.mu.Lock()
-		clientConn, backendConn := s.clientConn, s.backendConn
-		s.mu.Unlock()
-		if backendConn != nil {
-			backendConn.Close()
-		}
-		if clientConn != nil {
-			clientConn.Close()
-		}
+		// Close the client socket before its TLS wrapper: even an idle TLS
+		// Close can spend five seconds writing close_notify to an unread peer.
+		// Neither side may hold up teardown of the other after the grace.
+		closeMaintenanceTransport(clientConn)
+		closeMaintenanceTransport(backendConn)
 	})
+	go func() {
+		if closeWriter, ok := backendConn.(interface{ CloseWrite() error }); ok {
+			if err := closeWriter.CloseWrite(); err != nil {
+				s.DebugLog("Failed to half-close backend connection", "error", err)
+			}
+		}
+		// The BYE follows the half-close, so commands sent after it cannot reach
+		// the backend. Already accepted commands still get their responses.
+		s.sendBye(byeMaintenance)
+	}()
+}
+
+// closeMaintenanceTransport forces the socket closed at the end of the grace
+// period, then lets outer wrappers release their bookkeeping. tls.Conn.Close
+// alone can wait for the very close_notify write this deadline must interrupt.
+func closeMaintenanceTransport(conn net.Conn) {
+	raw := server.RawConn(conn)
+	if raw == nil {
+		return
+	}
+	_ = raw.Close()
+	if raw != conn {
+		_ = conn.Close()
+	}
 }
 
 // endForMaintenance ends a session closed for maintenance, once its backend has closed.
@@ -158,8 +176,9 @@ func (s *Session) sendBye(bye string) {
 	}
 	s.mu.Lock()
 	conn := s.clientConn
+	upgrading := s.startTLSInProgress
 	s.mu.Unlock()
-	if conn == nil {
+	if conn == nil || upgrading {
 		return
 	}
 	// Bounded: a client that stopped reading must not hold this goroutine. The session

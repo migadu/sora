@@ -33,10 +33,11 @@ type Session struct {
 	server                *Server
 	settings              *reloadableSettings     // the settings its protocol server was built with (see reloadableSettings)
 	msConn                *managesieveserver.Conn // library connection (Hijack seam)
-	clientConn            net.Conn
-	backendConn           net.Conn      // Reassigned on backend connect/STARTTLS; writes must hold mu (sendGracefulShutdownBye reads it from the Stop goroutine)
-	backendReader         *bufio.Reader // Buffered reader from authentication phase
-	clientReader          *bufio.Reader // Hijacked reader holding any pipelined client bytes
+	clientConn            net.Conn                // Reassigned on hijack (the TLS conn after STARTTLS); writes must hold mu
+	listenerConn          net.Conn                // The accepted connection, never reassigned: its SoraConn carries the JA4, username and timeouts
+	backendConn           net.Conn                // Reassigned on backend connect/STARTTLS; writes must hold mu (sendGracefulShutdownBye reads it from the Stop goroutine)
+	backendReader         *bufio.Reader           // Buffered reader from authentication phase
+	clientReader          *bufio.Reader           // Hijacked reader holding any pipelined client bytes
 	username              string
 	accountID             int64
 	isRemoteLookupAccount bool
@@ -136,7 +137,7 @@ func (s *Session) AuthenticatePlain(_ context.Context, _, username, password str
 	s.clientReader = clientReader
 
 	// Set username on client connection for timeout logging
-	if soraConn, ok := clientConn.(interface{ SetUsername(string) }); ok {
+	if soraConn, ok := s.listenerConn.(interface{ SetUsername(string) }); ok {
 		soraConn.SetUsername(s.username)
 	}
 
@@ -197,7 +198,7 @@ func (s *Session) getLogger() *server.ProxySessionLogger {
 	return &server.ProxySessionLogger{
 		Protocol:   "managesieve_proxy",
 		ServerName: s.server.name,
-		ClientConn: s.clientConn,
+		ClientConn: s.listenerConn,
 		Username:   s.username,
 		AccountID:  s.accountID,
 		SessionID:  s.sessionID,

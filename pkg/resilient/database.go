@@ -92,10 +92,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -208,7 +208,8 @@ func isQuerySuccessful(err error) bool {
 		return true
 	}
 	// Business logic errors that should NOT trip the circuit breaker.
-	if errors.Is(err, consts.ErrUserNotFound) ||
+	if errors.Is(err, db.ErrSearchTooManyResults) ||
+		errors.Is(err, consts.ErrUserNotFound) ||
 		errors.Is(err, consts.ErrMailboxNotFound) ||
 		errors.Is(err, consts.ErrMailboxHasChildren) ||
 		errors.Is(err, consts.ErrMessageNotAvailable) ||

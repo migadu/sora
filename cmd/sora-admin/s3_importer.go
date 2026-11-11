@@ -18,9 +18,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message/mail"
+	"github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
@@ -559,7 +559,6 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 			MailboxName:   mailbox.Name,
 			ContentHash:   contentHash,
 			MessageID:     messageID,
-			Flags:         []imap.Flag{imap.Flag("\\Recent")}, // Mark as recent
 			InternalDate:  sentDate,
 			Size:          obj.Size,
 			Subject:       subject,

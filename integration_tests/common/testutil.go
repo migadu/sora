@@ -197,6 +197,10 @@ type IMAPServerOpts struct {
 	SearchRateLimitPerMin         int
 	SearchRateLimitWindow         time.Duration
 	SearchRateLimitBurst          int
+	// SharedMailboxes replaces the default shared mailbox settings (enabled, users
+	// may create shared mailboxes and grant "anyone").
+	SharedMailboxes   *config.SharedMailboxesConfig
+	ThreadMaxMessages int
 }
 
 func (ts *TestServer) Close() {
@@ -846,6 +850,9 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 			AllowAnyoneIdentifier: true,
 		},
 	}
+	if opts != nil && opts.SharedMailboxes != nil {
+		testConfig.SharedMailboxes = *opts.SharedMailboxes
+	}
 
 	// Configure spam training if enabled
 	var spamTrainingClient *spamtraining.Client
@@ -898,6 +905,7 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 			SearchRateLimitPerMin: opts.SearchRateLimitPerMin,
 			SearchRateLimitWindow: opts.SearchRateLimitWindow,
 			SearchRateLimitBurst:  opts.SearchRateLimitBurst,
+			ThreadMaxMessages:     opts.ThreadMaxMessages,
 		},
 	)
 	if err != nil {
@@ -1128,6 +1136,13 @@ func SkipIfDatabaseUnavailable(t *testing.T) {
 // SetupIMAPServerWithPROXY sets up an IMAP server with PROXY protocol support for proxy testing
 func SetupIMAPServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 	t.Helper()
+	return SetupIMAPServerWithPROXYOptions(t, nil)
+}
+
+// SetupIMAPServerWithPROXYOptions is SetupIMAPServerWithPROXY with configure
+// applied to the server options before the server is created.
+func SetupIMAPServerWithPROXYOptions(t *testing.T, configure func(*imap.IMAPServerOptions)) (*TestServer, TestAccount) {
+	t.Helper()
 
 	rdb := SetupTestDatabase(t)
 	account := CreateTestAccount(t, rdb)
@@ -1165,6 +1180,17 @@ func SetupIMAPServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 	masterUsername := "proxyuser"
 	masterPassword := "proxypass"
 
+	opts := imap.IMAPServerOptions{
+		InsecureAuth:         true,                               // Allow PLAIN auth (no TLS in tests)
+		ProxyProtocol:        true,                               // Enable PROXY protocol support
+		ProxyProtocolTimeout: "5s",                               // Timeout for PROXY headers
+		TrustedNetworks:      []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
+		MasterSASLUsername:   []byte(masterUsername),             // Master username for proxy authentication
+		MasterSASLPassword:   []byte(masterPassword),             // Master password for proxy authentication
+	}
+	if configure != nil {
+		configure(&opts)
+	}
 	server, err := imap.New(
 		context.Background(),
 		"test",
@@ -1174,14 +1200,7 @@ func SetupIMAPServerWithPROXY(t *testing.T) (*TestServer, TestAccount) {
 		rdb,
 		uploadWorker, // properly initialized UploadWorker
 		nil,          // cache.Cache
-		imap.IMAPServerOptions{
-			InsecureAuth:         true,                               // Allow PLAIN auth (no TLS in tests)
-			ProxyProtocol:        true,                               // Enable PROXY protocol support
-			ProxyProtocolTimeout: "5s",                               // Timeout for PROXY headers
-			TrustedNetworks:      []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
-			MasterSASLUsername:   []byte(masterUsername),             // Master username for proxy authentication
-			MasterSASLPassword:   []byte(masterPassword),             // Master password for proxy authentication
-		},
+		opts,
 	)
 	if err != nil {
 		t.Fatalf("Failed to create IMAP server with PROXY support: %v", err)

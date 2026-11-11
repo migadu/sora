@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/migadu/sora/logger"
 
-	imap "github.com/emersion/go-imap/v2"
+	imap "github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -55,13 +56,13 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 	// Validate flag names
 	for _, flag := range req.AddFlags {
 		if !isValidFlag(flag) {
-			s.writeError(w, http.StatusBadRequest, "Invalid flag: "+flag)
+			s.writeError(w, http.StatusBadRequest, invalidFlagMessage(flag))
 			return
 		}
 	}
 	for _, flag := range req.RemoveFlags {
 		if !isValidFlag(flag) {
-			s.writeError(w, http.StatusBadRequest, "Invalid flag: "+flag)
+			s.writeError(w, http.StatusBadRequest, invalidFlagMessage(flag))
 			return
 		}
 	}
@@ -153,25 +154,47 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 
 // isValidFlag checks if a flag name is valid.
 //
-// System flags are restricted to the set this API lets a client set. Keywords
-// must be valid IMAP flag-keywords (RFC 9051 §9): the API is a write path into
-// the same mailbox an IMAP client reads, so a keyword that cannot be encoded as
-// an atom -- non-ASCII, but equally a space or a "]" or "%" -- would wedge
-// SELECT of that mailbox for every IMAP client. Defer to the shared check rather
-// than keeping a second, looser copy of the rule here.
+// System flags are restricted to the set this API lets a client set (see
+// isSettableSystemFlag). Keywords must be valid IMAP flag-keywords (RFC 9051 §9):
+// the API is a write path into the same mailbox an IMAP client reads, so a
+// keyword that cannot be encoded as an atom -- non-ASCII, but equally a space or
+// a "]" or "%" -- would wedge SELECT of that mailbox for every IMAP client. Defer
+// to the shared check rather than keeping a second, looser copy of the rule here.
+//
+// A keyword spelled like a system flag without its backslash ("Seen") is refused
+// too. It is a client that meant \Seen: taken as a keyword it would add a "Seen"
+// keyword and leave the message unread, and the client would never find "Seen"
+// in the "\Seen" this API returns.
 func isValidFlag(flag string) bool {
 	// System flags start with backslash
-	if len(flag) > 0 && flag[0] == '\\' {
-		validSystemFlags := map[string]bool{
-			"\\Seen":     true,
-			"\\Answered": true,
-			"\\Flagged":  true,
-			"\\Deleted":  true,
-			"\\Draft":    true,
-			"\\Recent":   true,
-		}
-		return validSystemFlags[flag]
+	if strings.HasPrefix(flag, "\\") {
+		return isSettableSystemFlag(flag)
+	}
+	if isSettableSystemFlag("\\" + flag) {
+		return false
 	}
 
 	return helpers.IsValidFlagName(imap.Flag(flag))
+}
+
+// isSettableSystemFlag reports whether flag is a system flag this API lets a
+// client set, in any case: IMAP flag names are case-insensitive (RFC 9051 §9),
+// and db.UpdateMessageFlags folds them. \Recent is not one: it "can not be used
+// as an argument in a STORE or APPEND command" (RFC 3501 §2.3.2), and IMAP no
+// longer stores it (see db.FlagToBitwise).
+func isSettableSystemFlag(flag string) bool {
+	switch strings.ToLower(flag) {
+	case "\\seen", "\\answered", "\\flagged", "\\deleted", "\\draft":
+		return true
+	}
+	return false
+}
+
+// invalidFlagMessage is the 400 text for a flag isValidFlag refused. A system
+// flag name given without its backslash gets a pointer to the right spelling.
+func invalidFlagMessage(flag string) string {
+	if isSettableSystemFlag("\\" + flag) {
+		return fmt.Sprintf("Invalid flag: %s (system flags take a backslash: \\%s)", flag, flag)
+	}
+	return "Invalid flag: " + flag
 }

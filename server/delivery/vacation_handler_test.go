@@ -8,6 +8,7 @@ import (
 
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
 )
@@ -106,6 +107,48 @@ func TestHandleVacationResponse(t *testing.T) {
 		decoded := mail.Header{Header: ent.Header}
 		if subj, _ := decoded.Subject(); subj != "Réponse: Out of Office" {
 			t.Errorf("decoded Subject = %q, want %q", subj, "Réponse: Out of Office")
+		}
+	})
+
+	t.Run("script owner header uses primary address with an owned :from alias", func(t *testing.T) {
+		const alias = "away@example.com"
+		rq := &captureRelayQueue{}
+		h := &StandardVacationHandler{
+			Hostname:   "mail.example.com",
+			RelayQueue: rq,
+			IsOwnedAddress: func(_ context.Context, _ int64, addr string) (bool, error) {
+				return addr == owner || addr == alias, nil
+			},
+		}
+		orig := makeMessage(map[string]string{
+			"From":                     "bob@external.com",
+			"To":                       owner,
+			helpers.RedirectedByHeader: "spoofed@example.net",
+		})
+		reply := sieveengine.VacationReply{From: alias, Body: "I am away."}
+		if err := h.HandleVacationResponse(context.Background(), 1, reply, sender, toAddress, orig); err != nil {
+			t.Fatalf("HandleVacationResponse: %v", err)
+		}
+		if len(rq.calls) != 1 {
+			t.Fatalf("expected 1 enqueue, got %d", len(rq.calls))
+		}
+		call := rq.calls[0]
+		ent, err := message.Read(bytes.NewReader(call.body))
+		if err != nil {
+			t.Fatalf("parse message: %v", err)
+		}
+		if call.from != alias || ent.Header.Get("From") != alias {
+			t.Errorf("owned :from alias not used: envelope = %q, From = %q", call.from, ent.Header.Get("From"))
+		}
+		if got := ent.Header.Get(helpers.RedirectedByHeader); got != owner {
+			t.Errorf("%s = %q, want script owner %q", helpers.RedirectedByHeader, got, owner)
+		}
+		count := 0
+		for fields := ent.Header.FieldsByKey(helpers.RedirectedByHeader); fields.Next(); {
+			count++
+		}
+		if count != 1 {
+			t.Errorf("expected exactly one %s header, got %d", helpers.RedirectedByHeader, count)
 		}
 	})
 

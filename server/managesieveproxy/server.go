@@ -430,11 +430,13 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 	// deferred handshake).
 	var startTLSConfig *tls.Config
 	if s.tls && s.tlsUseStartTLS {
-		startTLSConfig = s.tlsConfig
+		startTLSConfig = server.StartTLSConfig(s.tlsConfig, "managesieve_proxy") // records JA4, as SoraTLSConn does for implicit TLS
 	}
 
 	opts := managesieveserver.Options{
 		TLSConfig:              startTLSConfig,
+		OnStartTLS:             server.BeginStartTLS,
+		OnTLSHandshakeComplete: server.CompleteStartTLS,
 		Implementation:         "Sora ManageSieve Proxy",
 		Greeting:               `"ManageSieve proxy ready"`,
 		GreetingStartTLSHint:   false, // pre-migration parity: the proxy greeting carried no (STARTTLS) hint
@@ -497,16 +499,17 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 			}
 
 			session := &Session{
-				server:      s,
-				settings:    settings,
-				msConn:      c,
-				clientConn:  netConn,
-				clientAddr:  clientAddr,
-				ctx:         sessionCtx,
-				cancel:      sessionCancel,
-				startTime:   time.Now(),
-				releaseConn: releaseConn,
-				proxyInfo:   proxyInfo,
+				server:       s,
+				settings:     settings,
+				msConn:       c,
+				clientConn:   netConn,
+				listenerConn: netConn,
+				clientAddr:   clientAddr,
+				ctx:          sessionCtx,
+				cancel:       sessionCancel,
+				startTime:    time.Now(),
+				releaseConn:  releaseConn,
+				proxyInfo:    proxyInfo,
 				// Generate the session id once, up front, so every log line
 				// carries it.
 				sessionID: idgen.New(),
@@ -532,8 +535,9 @@ func (s *Server) connConfig() server.SoraConnConfig {
 		Hostname:             s.hostname,
 		IdleTimeout:          settings.commandTimeout,
 		AbsoluteTimeout:      settings.absoluteSessionTimeout,
+		NoAbsoluteTimeout:    settings.absoluteSessionTimeout <= 0,
 		MinBytesPerMinute:    settings.minBytesPerMinute,
-		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0,
+		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0 || settings.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Send BYE with TRYLATER before closing (RFC 5804)
 			var message string
@@ -792,12 +796,14 @@ func (s *Server) sendGracefulShutdownBye() {
 		session.mu.Unlock()
 	}
 
-	// Step 2: Write BYE directly to clientConn (RFC 5804 TRYLATER).
+	// Step 2: Write BYE directly to clientConn (RFC 5804 TRYLATER). Before the
+	// hijack clientConn is the SoraConn, below the library's TLS connection
+	// after STARTTLS: NoticeConn returns the connection the session is using.
 	for _, session := range activeSessions {
 		session.mu.Lock()
-		if session.clientConn != nil {
-			_, _ = fmt.Fprint(session.clientConn, "BYE (TRYLATER) \"Server shutting down, please reconnect\"\r\n")
-		}
+		server.WriteNotice(session.clientConn, func(conn net.Conn) {
+			_, _ = fmt.Fprint(conn, "BYE (TRYLATER) \"Server shutting down, please reconnect\"\r\n")
+		})
 		session.mu.Unlock()
 	}
 

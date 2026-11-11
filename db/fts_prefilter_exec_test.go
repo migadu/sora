@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,8 +17,8 @@ import (
 // The large-mailbox prefilter (WITH fts_hits AS MATERIALIZED ...) is only selected when the
 // caller reports a mailbox at or above ftsCTEThreshold. No integration caller does, so
 // without this test the SQL that path emits is never executed against PostgreSQL at all --
-// the unit tests only inspect the generated string. This runs every executor through it,
-// with and without a SORT, and checks both the results and that the path was really taken.
+// the unit tests only inspect the generated string. This runs the executor through it, with
+// and without a SORT, and checks both the results and that the path was really taken.
 func TestFTSPrefilterPathExecutes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -89,17 +89,9 @@ func TestFTSPrefilterPathExecutes(t *testing.T) {
 		assert.Equal(t, imap.UID(9401), res[0].UID, "SORT (SUBJECT): 'first' before 'third'")
 	})
 
-	t.Run("full executor", func(t *testing.T) {
+	t.Run("lightweight executor sorted by size", func(t *testing.T) {
 		before := pathCount()
-		res, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, body, 0, ftsCTEThreshold)
-		require.NoError(t, err)
-		require.Equal(t, before+1, pathCount())
-		assert.Len(t, res, 2)
-	})
-
-	t.Run("full executor sorted by size", func(t *testing.T) {
-		before := pathCount()
-		res, err := db.GetMessagesSorted(ctx, mailboxID, accountID, body, bySize, 0, ftsCTEThreshold)
+		res, err := db.SearchMessagesSorted(ctx, mailboxID, accountID, body, bySize, 0, ftsCTEThreshold)
 		require.NoError(t, err)
 		require.Equal(t, before+1, pathCount())
 		assert.Len(t, res, 2)
@@ -113,13 +105,6 @@ func TestFTSPrefilterPathExecutes(t *testing.T) {
 		require.Equal(t, before+1, pathCount())
 		require.Len(t, res, 1)
 		assert.Equal(t, imap.UID(9403), res[0].UID)
-	})
-
-	t.Run("CONTROL: full executor on the existing probe path with the same fixture", func(t *testing.T) {
-		// Separates a prefilter defect from a fixture artefact: the probe path selects the
-		// same columns from the same CTE shape, so it must behave identically.
-		_, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, body, 0, 0)
-		require.NoError(t, err)
 	})
 
 	t.Run("below the threshold the probe path is used", func(t *testing.T) {
@@ -246,25 +231,17 @@ func TestFTSPrefilterMatchesProbeForEveryShape(t *testing.T) {
 			t.Run(shape.name+"/"+size.name, func(t *testing.T) {
 				before := pathCount()
 
-				light, err := db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, shape.criteria(), 0, size.count)
+				res, err := db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, shape.criteria(), 0, size.count)
 				require.NoError(t, err)
 				var got []imap.UID
-				for _, m := range light {
+				for _, m := range res {
 					got = append(got, m.UID)
 				}
-				assert.Equal(t, shape.want, sorted(got), "lightweight executor")
-
-				full, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, shape.criteria(), 0, size.count)
-				require.NoError(t, err)
-				got = got[:0]
-				for _, m := range full {
-					got = append(got, m.UID)
-				}
-				assert.Equal(t, shape.want, sorted(got), "full executor")
+				assert.Equal(t, shape.want, sorted(got))
 
 				taken := pathCount() - before
 				if size.prefilter {
-					assert.Equal(t, 2.0, taken, "at the threshold both executors must take the match-set form")
+					assert.Equal(t, 1.0, taken, "at the threshold the match-set form must be taken")
 				} else {
 					assert.Equal(t, 0.0, taken, "below the threshold the per-message probe must be kept")
 				}

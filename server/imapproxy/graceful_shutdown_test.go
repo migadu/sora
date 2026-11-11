@@ -84,6 +84,7 @@ func TestSendGracefulShutdownBye_ByeWrittenBeforeClose(t *testing.T) {
 	session := &Session{
 		server:        srv,
 		clientConn:    clientProxy,
+		listenerConn:  clientProxy,
 		backendConn:   backendProxy,
 		backendReader: bufio.NewReader(backendProxy),
 		clientWriter:  bufio.NewWriter(clientProxy),
@@ -190,6 +191,7 @@ func TestSendGracefulShutdownBye_CleanByeDuringActiveTransfer(t *testing.T) {
 	session := &Session{
 		server:        srv,
 		clientConn:    clientProxy,
+		listenerConn:  clientProxy,
 		backendConn:   backendProxy,
 		backendReader: bufio.NewReader(backendProxy),
 		clientWriter:  bufio.NewWriter(clientProxy),
@@ -312,6 +314,7 @@ func TestSendGracefulShutdownBye_IdleSession(t *testing.T) {
 	session := &Session{
 		server:        srv,
 		clientConn:    clientProxy,
+		listenerConn:  clientProxy,
 		backendConn:   backendProxy,
 		backendReader: bufio.NewReader(backendProxy),
 		clientWriter:  bufio.NewWriter(clientProxy),

@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -548,7 +548,7 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUI
 func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxID int64) ([]string, error) {
 	// Try the cached version first (maintained by trigger in migration 009)
 	var cachedFlagsJSON []byte
-	err := db.GetReadPool().QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT custom_flags_cache FROM mailbox_stats WHERE mailbox_id = $1
 	`, mailboxID).Scan(&cachedFlagsJSON)
 
@@ -588,7 +588,7 @@ func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxI
 		  AND m.expunged_at IS NULL
 		  AND flag !~ '^\\';
 	`
-	rows, err := db.GetReadPool().Query(ctx, query, mailboxID)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query unique custom flags for mailbox %d: %w", mailboxID, err)
 	}
