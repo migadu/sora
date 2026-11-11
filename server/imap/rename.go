@@ -9,6 +9,7 @@ import (
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 )
 
@@ -135,6 +136,9 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		newParts := strings.Split(newName, string(consts.MailboxDelimiter))
 		if len(newParts) > 1 {
 			newParentPath := strings.Join(newParts[:len(newParts)-1], string(consts.MailboxDelimiter))
+			if refusal := s.foreignParentRefusal(ctx, newParentPath, AccountID, AccountID); refusal != nil {
+				return refusal
+			}
 			if permErr := s.checkCreateRightForHierarchy(ctx, newParentPath, AccountID, AccountID); permErr != nil {
 				return permErr
 			}
@@ -198,28 +202,40 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	// Use the owner's AccountID for shared mailbox support
 	ownerAccountID := oldMailbox.AccountID
 
+	var newParentPath string
+	newParts := strings.Split(newName, string(consts.MailboxDelimiter))
+	if len(newParts) > 1 {
+		newParentPath = strings.Join(newParts[:len(newParts)-1], string(consts.MailboxDelimiter))
+
+		// A mailbox stays with its owner, so it cannot move into another owner's
+		// shared mailbox, whatever rights anyone holds there. That can never succeed
+		// and is refused first: neither allow_user_create nor the "k" right, checked
+		// below, has a say in it.
+		if refusal := s.foreignParentRefusal(ctx, newParentPath, ownerAccountID, AccountID); refusal != nil {
+			return refusal
+		}
+	}
+
 	// With allow_user_create off, RENAME must not make a top-level shared mailbox
 	// out of one inside an existing shared mailbox: that is creating one. Renaming
-	// what already is a top-level shared mailbox adds none.
-	newRoot, rootErr := s.isRefusedSharedRoot(ctx, ownerAccountID, newName)
+	// what already is a top-level shared mailbox adds none. Only the owner's own
+	// shared mailboxes count as existing ones: the mailbox cannot be in another's.
+	newRoot, rootErr := s.isRefusedSharedRoot(ctx, ownerAccountID, newName, true)
 	if rootErr != nil {
 		return rootErr
 	}
 	if newRoot {
-		oldRoot, rootErr := s.isRefusedSharedRoot(ctx, ownerAccountID, existingName)
+		oldRoot, rootErr := s.isRefusedSharedRoot(ctx, ownerAccountID, existingName, true)
 		if rootErr != nil {
 			return rootErr
 		}
 		if !oldRoot {
-			return s.sharedCreateRefusal(ctx, ownerAccountID, newName)
+			return s.sharedCreateRefusal(ctx, ownerAccountID, newName, true)
 		}
 	}
 
 	var newParentMailboxID *int64
-	newParts := strings.Split(newName, string(consts.MailboxDelimiter))
-	if len(newParts) > 1 {
-		newParentPath := strings.Join(newParts[:len(newParts)-1], string(consts.MailboxDelimiter))
-
+	if newParentPath != "" {
 		// RFC 4314 §4: moving a mailbox to a DIFFERENT parent requires the "k"
 		// (create) right on the new parent — or, when the new parent must be
 		// auto-created, on the nearest existing ancestor that CREATE would extend.
@@ -283,37 +299,20 @@ func (s *IMAPSession) writeRenameOldName(w *imapserver.RenameWriter, oldName, ne
 // it if it does not exist (a common IMAP-client expectation, matching CREATE).
 // Shared by the INBOX-rename and regular-rename destination-parent resolution so
 // both link a hierarchical target under its parent rather than storing a flat name.
+// Every level is the owner's own; foreignParentRefusal has ruled out the path
+// leading into another owner's shared mailbox.
 func (s *IMAPSession) resolveOrCreateParentPath(ctx context.Context, newParentPath string, ownerAccountID int64) (*int64, error) {
 	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-	// The nearest existing level of the path, as the owner sees it, may be another
-	// owner's shared mailbox. A mailbox stays with its owner, so it cannot move
-	// there; nor is a namesake hierarchy of the owner's created in front of it.
-	parts := strings.Split(newParentPath, string(consts.MailboxDelimiter))
-	for i := len(parts); i >= 1; i-- {
-		path := strings.Join(parts[:i], string(consts.MailboxDelimiter))
-		mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, path)
-		if errors.Is(err, consts.ErrMailboxNotFound) {
-			continue
-		}
-		if err != nil {
-			return nil, s.internalError("failed to fetch new parent mailbox %q: %v", path, err)
-		}
-		if mailbox.AccountID != ownerAccountID {
-			s.DebugLog("rejecting rename into another owner's shared mailbox", "parent", path)
-			return nil, &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeCannot,
-				Text: "Mailboxes cannot be moved into another owner's shared mailbox",
-			}
-		}
-		if i == len(parts) {
-			return &mailbox.ID, nil
-		}
-		break
+	id, err := s.server.rdb.GetOwnedMailboxIDByNameWithRetry(ctx, ownerAccountID, newParentPath)
+	if err == nil {
+		return &id, nil
+	}
+	if !errors.Is(err, consts.ErrMailboxNotFound) {
+		return nil, s.internalError("failed to fetch new parent mailbox %q: %v", newParentPath, err)
 	}
 	// Policy applies only when creating a missing parent. Reusing an existing
 	// shared mailbox is still allowed when user-created shared roots are disabled.
-	if refusal := s.sharedCreateRefusal(ctx, ownerAccountID, newParentPath); refusal != nil {
+	if refusal := s.sharedCreateRefusal(ctx, ownerAccountID, newParentPath, true); refusal != nil {
 		return nil, refusal
 	}
 	parentID, err := s.server.rdb.ResolveOrCreateMailboxPathWithRetry(ctx, ownerAccountID, newParentPath)
@@ -321,6 +320,49 @@ func (s *IMAPSession) resolveOrCreateParentPath(ctx context.Context, newParentPa
 		return nil, s.internalError("failed to resolve new parent hierarchy %q: %v", newParentPath, err)
 	}
 	return parentID, nil
+}
+
+// foreignParentRefusal refuses a RENAME whose new parent path leads into another
+// owner's shared mailbox. A mailbox stays with its owner, so it cannot move there;
+// nor is a namesake hierarchy of the owner's created in front of it. The nearest
+// existing level of the path decides: the owner's own mailbox, or a shared mailbox
+// of someone else's that the owner or the acting user (accountID) can act in. Either
+// of them may hold only the "k" right there, without the "l" a lookup by name needs,
+// and the acting user may see one the owner cannot, their own included.
+func (s *IMAPSession) foreignParentRefusal(ctx context.Context, newParentPath string, ownerAccountID, accountID int64) error {
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	viewers := []int64{ownerAccountID}
+	if accountID != ownerAccountID {
+		viewers = append(viewers, accountID)
+	}
+	parts := strings.Split(newParentPath, string(consts.MailboxDelimiter))
+	for i := len(parts); i >= 1; i-- {
+		path := strings.Join(parts[:i], string(consts.MailboxDelimiter))
+		_, err := s.server.rdb.GetOwnedMailboxIDByNameWithRetry(ctx, ownerAccountID, path)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, consts.ErrMailboxNotFound) {
+			return s.internalError("failed to fetch new parent mailbox %q: %v", path, err)
+		}
+		// The owner has no mailbox of this name, so a shared one is another owner's.
+		for _, viewer := range viewers {
+			_, err := s.server.rdb.GetSharedMailboxByNameForRightWithRetry(ctx, viewer, path, db.ACLRightCreate)
+			if errors.Is(err, consts.ErrMailboxNotFound) {
+				continue
+			}
+			if err != nil {
+				return s.internalError("failed to look up shared mailbox %q: %v", path, err)
+			}
+			s.DebugLog("rejecting rename into another owner's shared mailbox", "parent", path)
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeCannot,
+				Text: "Mailboxes cannot be moved into another owner's shared mailbox",
+			}
+		}
+	}
+	return nil
 }
 
 // checkCreateRightForHierarchy verifies the acting user holds the "k" (create)
