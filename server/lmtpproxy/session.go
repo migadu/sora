@@ -881,17 +881,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 			s.accountID = cached.AccountID
 			s.isRemoteLookupAccount = cached.FromRemoteLookup
-			s.routingInfo = &proxy.UserRoutingInfo{
-				AccountID:              cached.AccountID,
-				ServerAddress:          cached.ServerAddress,
-				PoolName:               cached.PoolName,
-				IsRemoteLookupAccount:  cached.FromRemoteLookup, // CRITICAL: Prevents fallback to other backends
-				RemoteTLS:              cached.RemoteTLS,
-				RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
-				RemoteTLSVerify:        cached.RemoteTLSVerify,
-				RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
-				RemoteUseXCLIENT:       cached.RemoteUseXCLIENT,
-			}
+			// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
+			// its enforcement and every backend-leg setting the lookup answer carried.
+			s.routingInfo = proxy.RouteFromCache(cached)
 
 			if cached.ActualEmail != "" {
 				s.username = cached.ActualEmail
@@ -971,19 +963,12 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			// Cache positive result (routing info found)
 			// Cache key is originalAddress (BaseAddress of submitted recipient)
 			// Store ActualEmail if remotelookup resolved to a different address
-			s.server.lookupCache.Set(s.server.name, originalAddress, &lookupcache.CacheEntry{
-				AccountID:              routingInfo.AccountID,
-				ActualEmail:            resolvedEmail, // Store resolved email for cache hits
-				ServerAddress:          routingInfo.ServerAddress,
-				PoolName:               routingInfo.PoolName,
-				RemoteTLS:              routingInfo.RemoteTLS,
-				RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
-				RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
-				RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
-				RemoteUseXCLIENT:       routingInfo.RemoteUseXCLIENT,
-				Result:                 lookupcache.AuthSuccess,
-				FromRemoteLookup:       true,
-			})
+			entry := &lookupcache.CacheEntry{
+				ActualEmail: resolvedEmail, // Store resolved email for cache hits
+				Result:      lookupcache.AuthSuccess,
+			}
+			proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
+			s.server.lookupCache.Set(s.server.name, originalAddress, entry)
 
 			// Single consolidated log for lookup success
 			duration := time.Since(lookupStart)
@@ -1287,36 +1272,10 @@ func (s *Session) connectToBackend() error {
 		}
 	}
 
-	// Check if we need to negotiate StartTLS with the backend
-	// This happens when remotelookup (or global config) specifies remote_tls_use_starttls
-	shouldUseStartTLS := false
-	var tlsConfig *tls.Config
-
-	if s.routingInfo.UsesRouteSettings(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
-		// The route specified StartTLS (for the backend the lookup named or its pool picked, as for the dial)
-		shouldUseStartTLS = true
-		tlsConfig = s.server.connManager.BackendTLSConfig(s.routingInfo.RemoteTLSVerify)
-		s.DebugLog("Using remotelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
-	} else if !s.routingInfo.PoolRouted() && s.server.connManager.IsRemoteStartTLS() {
-		// Global proxy config specified StartTLS. A pool's own settings are authoritative:
-		// a pool without remote_tls_use_starttls never inherits the server's.
-		shouldUseStartTLS = true
-		tlsConfig = s.server.connManager.GetTLSConfig()
-		s.DebugLog("Using global StartTLS settings")
-	}
-
-	// Set ServerName so tls.Client verifies the backend certificate hostname. Without it,
-	// DNSName is empty and Go verifies only the chain (not the host), so remote_tls_verify=true
-	// would still let any CA-valid cert MITM the proxy->backend leg. Derive it from the address
-	// we actually connected to (the configured backend hostname; both tls.Config values here are
-	// per-connection, safe to mutate).
-	if tlsConfig != nil && tlsConfig.ServerName == "" {
-		if host, _, splitErr := net.SplitHostPort(actualAddr); splitErr == nil && host != "" {
-			tlsConfig.ServerName = host
-		}
-	}
-
-	if shouldUseStartTLS && tlsConfig != nil {
+	// remote_tls_use_starttls: the connection manager dialed plaintext and left the upgrade
+	// to us. Whether this connection needs it is asked of the settings the dial used
+	// (the route's or the proxy's own), so the two cannot disagree.
+	if tlsConfig := s.server.connManager.BackendStartTLSConfig(s.routingInfo, actualAddr, s.backendConn); tlsConfig != nil {
 		s.DebugLog("Negotiating StartTLS with backend", "backend", actualAddr, "insecure_skip_verify", tlsConfig.InsecureSkipVerify)
 
 		// Send STARTTLS command
@@ -1339,12 +1298,31 @@ func (s *Session) connectToBackend() error {
 			return fmt.Errorf("backend STARTTLS failed: %s", strings.TrimSpace(response))
 		}
 
-		// Upgrade connection to TLS
+		// Bytes already buffered came in plaintext after the 220, where anyone on the path
+		// could have put them. The reader replaced below would drop them; a stream that
+		// broke the protocol there fails the connection instead (cf. CVE-2011-0411).
+		if s.backendReader.Buffered() > 0 {
+			s.backendConn.Close()
+			return errors.New("backend sent data after its STARTTLS response")
+		}
+
+		// Upgrade connection to TLS. readBackendLine cleared its deadline, so the
+		// handshake gets its own: a backend that never answers must not hold the session.
+		if timeout := s.server.connManager.GetConnectTimeout(); timeout > 0 {
+			if err := s.backendConn.SetDeadline(time.Now().Add(timeout)); err != nil {
+				s.backendConn.Close()
+				return fmt.Errorf("failed to set the STARTTLS handshake deadline: %w", err)
+			}
+		}
 		tlsConn := tls.Client(s.backendConn, tlsConfig)
 		err = tlsConn.Handshake()
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("TLS handshake with backend failed: %w", err)
+		}
+		if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+			s.backendConn.Close()
+			return fmt.Errorf("failed to clear the STARTTLS handshake deadline: %w", err)
 		}
 
 		s.DebugLog("StartTLS negotiation successful with backend", "backend", actualAddr)

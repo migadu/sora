@@ -35,51 +35,79 @@ func (f *failingLookup) LookupUserRouteWithClientIP(ctx context.Context, email, 
 }
 func (f *failingLookup) Close() error { return nil }
 
-// A pool with remote_tls and remote_tls_use_starttls (what LMTP and ManageSieve need)
-// gives IMAP and POP3, which cannot STARTTLS to a backend, an implicit-TLS backend leg,
-// never a plaintext one. The same pool keeps the STARTTLS meaning for the protocols that
-// upgrade the connection themselves.
-func TestPools_ImplicitTLSOnlyProtocolsNeverDialPlaintext(t *testing.T) {
+// Every proxy protocol upgrades a STARTTLS backend leg itself, so a connection is either
+// dialed with TLS or handed a config to upgrade with, never neither: that would be a
+// plaintext leg where remote_tls asked for TLS. One pool's settings serve every protocol.
+func TestBackendLegIsTLSOrUpgradedNeverPlaintext(t *testing.T) {
 	backend := httptest.NewUnstartedServer(http.NotFoundHandler())
 	backend.StartTLS()
 	t.Cleanup(backend.Close)
 	addr := backend.Listener.Addr().String()
 
-	specs := []PoolSpec{{Name: "tls", Backends: []string{addr}, Default: true,
-		Settings: BackendSettings{TLS: true, TLSUseStartTLS: true, TLSVerify: false}}}
-
 	for _, c := range []struct {
-		name         string
-		implicitOnly bool
-		wantTLS      bool
+		name        string
+		settings    BackendSettings
+		wantTLSDial bool
+		wantUpgrade bool
 	}{
-		{"IMAP/POP3 proxy (implicit TLS only)", true, true},
-		{"LMTP/ManageSieve proxy (STARTTLS after connect)", false, false},
+		{"implicit TLS", BackendSettings{TLS: true}, true, false},
+		{"STARTTLS", BackendSettings{TLS: true, TLSUseStartTLS: true}, false, true},
+		{"plaintext", BackendSettings{}, false, false},
+		{"STARTTLS without remote_tls", BackendSettings{TLSUseStartTLS: true}, false, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			cm, err := NewConnectionManagerFromOptions(ManagerOptions{
-				Pools: specs, RemotePort: 143, ConnectTimeout: 2 * time.Second,
-				ServerName: "tls-test", DisableHealthCheck: true, ImplicitTLSOnly: c.implicitOnly,
+			check := func(t *testing.T, cm *ConnectionManager, info *UserRoutingInfo) {
+				t.Helper()
+				res, err := routeFor(t, cm, info, nil)
+				if err != nil {
+					t.Fatalf("DetermineRoute: %v", err)
+				}
+				conn, actual, err := cm.ConnectWithProxy(context.Background(), res.PreferredAddr, "", 0, "", 0, res.RoutingInfo)
+				if err != nil {
+					t.Fatalf("ConnectWithProxy: %v", err)
+				}
+				defer conn.Close()
+				if _, isTLS := conn.(*tls.Conn); isTLS != c.wantTLSDial {
+					t.Errorf("dialed with TLS = %v, want %v", isTLS, c.wantTLSDial)
+				}
+				if upgrade := cm.BackendStartTLSConfig(res.RoutingInfo, actual) != nil; upgrade != c.wantUpgrade {
+					t.Errorf("BackendStartTLSConfig returned a config = %v, want %v", upgrade, c.wantUpgrade)
+				}
+			}
+			t.Run("pool", func(t *testing.T) {
+				cm, err := NewConnectionManagerFromOptions(ManagerOptions{
+					Pools:      []PoolSpec{{Name: "p", Backends: []string{addr}, Default: true, Settings: c.settings}},
+					RemotePort: 143, ConnectTimeout: 2 * time.Second, ServerName: "tls-test", DisableHealthCheck: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				check(t, cm, &UserRoutingInfo{PoolName: "p"})
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			res, err := routeFor(t, cm, &UserRoutingInfo{PoolName: "tls"}, nil)
-			if err != nil {
-				t.Fatalf("DetermineRoute: %v", err)
-			}
-			conn, _, err := cm.ConnectWithProxy(context.Background(), res.PreferredAddr, "", 0, "", 0, res.RoutingInfo)
-			if err != nil {
-				t.Fatalf("ConnectWithProxy: %v", err)
-			}
-			defer conn.Close()
-			tlsConn, isTLS := conn.(*tls.Conn)
-			if isTLS != c.wantTLS {
-				t.Fatalf("backend leg is TLS = %v, want %v", isTLS, c.wantTLS)
-			}
-			if isTLS && !tlsConn.ConnectionState().HandshakeComplete {
-				t.Fatal("TLS handshake with the backend did not complete")
-			}
+			t.Run("server settings", func(t *testing.T) {
+				cm, err := NewConnectionManagerFromOptions(ManagerOptions{
+					RemoteAddrs: []string{addr}, Settings: c.settings,
+					RemotePort: 143, ConnectTimeout: 2 * time.Second, ServerName: "tls-test", DisableHealthCheck: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				check(t, cm, nil)
+			})
+			t.Run("lookup route", func(t *testing.T) {
+				// The server's own settings say plaintext: the route's must decide both.
+				cm, err := NewConnectionManagerFromOptions(ManagerOptions{
+					RemoteAddrs: []string{addr},
+					RemotePort:  143, ConnectTimeout: 2 * time.Second, ServerName: "tls-test", DisableHealthCheck: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				check(t, cm, &UserRoutingInfo{
+					ServerAddress: addr, IsRemoteLookupAccount: true,
+					RemoteTLS: c.settings.TLS, RemoteTLSUseStartTLS: c.settings.TLSUseStartTLS,
+				})
+			})
 		})
 	}
 }

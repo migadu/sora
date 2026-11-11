@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -44,6 +46,9 @@ type backendPool struct {
 	named     bool // false for the unnamed pool a flat remote_addrs list becomes
 	isDefault bool
 	settings  BackendSettings
+	// rootCAs verifies the pool's backends (its TLSCAFile); nil = the system roots. Never
+	// the proxy server's own remote_tls_ca_file: a pool inherits nothing.
+	rootCAs *x509.CertPool
 	// configured is the normalized host:port list from config. resolved and ring are
 	// what the last DNS resolution made of it: rebuilt by install under cm.healthMu and
 	// read under it.
@@ -131,7 +136,12 @@ type ConnectionManager struct {
 	// resolvedHosts is, per configured address, the pool entries its last successful
 	// resolution produced, so a failed re-resolution can keep them. Guarded by healthMu.
 	resolvedHosts        map[string][]string
-	resolutionGeneration uint64 // guarded by healthMu; identifies a published DNS snapshot
+	resolutionGeneration uint64 // guarded by healthMu
+	// DNS may alias distinct configured names into the same host:port. Affected
+	// named pools and all their addresses are refused until the overlap clears.
+	// Both maps are rebuilt with resolvedHosts under healthMu.
+	poolErrors    map[string]error
+	backendErrors map[string]error
 
 	// resolvedAt is when the pool was last resolved (UnixNano, 0 = never), and resolving
 	// is held for the duration of a re-resolution so that concurrent logins cost one DNS
@@ -205,9 +215,13 @@ func (cm *ConnectionManager) InMaintenance(addr string) bool {
 // configuredNamesOf returns the configured pool addresses (remote_addrs) whose resolution
 // produced addr.
 func (cm *ConnectionManager) configuredNamesOf(addr string) []string {
-	target := normalizeHostPort(addr, 0)
 	cm.healthMu.RLock()
 	defer cm.healthMu.RUnlock()
+	return cm.configuredNamesOfLocked(addr)
+}
+
+func (cm *ConnectionManager) configuredNamesOfLocked(addr string) []string {
+	target := normalizeHostPort(addr, 0)
 	var names []string
 	for configured, entries := range cm.resolvedHosts {
 		for _, entry := range entries {
@@ -242,6 +256,9 @@ var (
 // connected to whatever name the route used for it, and nothing is dialed before the
 // maintenance list was read.
 func (cm *ConnectionManager) RefuseMaintenanceDial(_, address string, _ syscall.RawConn) error {
+	if err := cm.backendPoolError(address); err != nil {
+		return err
+	}
 	if !cm.MaintenanceLoaded() {
 		return errMaintenanceNotLoaded
 	}
@@ -268,6 +285,10 @@ func (cm *ConnectionManager) SetRestrictRemoteLookupToPool(v bool) {
 // refusal is logged here so every call site (DetermineRoute and the User API proxy, which
 // does not use DetermineRoute) reports it consistently.
 func (cm *ConnectionManager) AllowRemoteLookupBackend(addr string) bool {
+	if err := cm.backendPoolError(addr); err != nil {
+		logger.Error("refusing ambiguous backend pool", "server", cm.serverName, "backend", addr, "error", err)
+		return false
+	}
 	if !cm.restrictRemoteLookupToPool {
 		return true
 	}
@@ -366,6 +387,13 @@ func newConnectionManager(specs []PoolSpec, named bool, remotePort int, connectT
 			return nil, fmt.Errorf("backend pool %q has no backends", spec.Name)
 		}
 		p := &backendPool{name: spec.Name, named: named, isDefault: spec.Default, settings: spec.Settings}
+		if spec.Settings.TLSCAFile != "" {
+			roots, err := loadCAFile(spec.Settings.TLSCAFile)
+			if err != nil {
+				return nil, fmt.Errorf("backend pool %q: remote_tls_ca_file: %w", spec.Name, err)
+			}
+			p.rootCAs = roots
+		}
 		for _, addr := range spec.Backends {
 			// Normalize remote addresses to include default port if missing
 			normalized := normalizeHostPort(addr, remotePort)
@@ -461,13 +489,25 @@ func (cm *ConnectionManager) poolByName(name string) (*backendPool, error) {
 		if cm.defaultPool == nil {
 			return nil, ErrNoDefaultPool
 		}
-		return cm.defaultPool, nil
+		name = cm.defaultPool.name
 	}
 	p, ok := cm.poolsByName[name]
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownPool, name)
 	}
+	cm.healthMu.RLock()
+	err := cm.poolErrors[name]
+	cm.healthMu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
 	return p, nil
+}
+
+func (cm *ConnectionManager) backendPoolError(addr string) error {
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+	return cm.backendErrors[normalizeHostPort(addr, cm.remotePort)]
 }
 
 // poolForRoute is poolByName for the pool a route's info names.
@@ -491,12 +531,19 @@ func (cm *ConnectionManager) poolHasBackend(p *backendPool, backend string) bool
 // pin carries no pool, and the pool the pinned host belongs to is the only one its account
 // is known to live in.
 func (cm *ConnectionManager) PoolOfBackend(addr string) string {
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+	return cm.poolOfBackendLocked(addr)
+}
+
+func (cm *ConnectionManager) poolOfBackendLocked(addr string) string {
 	if !cm.HasNamedPools() || addr == "" {
 		return ""
 	}
 	target := normalizeHostPort(addr, cm.remotePort)
-	cm.healthMu.RLock()
-	defer cm.healthMu.RUnlock()
+	if cm.backendErrors[target] != nil {
+		return ""
+	}
 	for _, p := range cm.pools {
 		for _, a := range p.configured {
 			if normalizeHostPort(a, cm.remotePort) == target {
@@ -1093,6 +1140,80 @@ func (cm *ConnectionManager) SetRemoteTLSRootCAs(pool *x509.CertPool) {
 	cm.remoteTLSRootCAs = pool
 }
 
+// loadCAFile reads a PEM file of CA certificates; an unreadable file, or one without a
+// usable certificate, is an error (never a silent fallback to the system roots).
+func loadCAFile(path string) (*x509.CertPool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("%s contains no usable certificates", path)
+	}
+	return roots, nil
+}
+
+// BackendClientTLS is the client TLS config for a connection to the backend at addr, the
+// address actually dialed, on the implicit-TLS dial and for a STARTTLS upgrade alike:
+//   - the hardening of backendTLSConfig, verifying certificates when verify is set;
+//   - the roots: a member of a named pool is verified against its pool's remote_tls_ca_file
+//     (the system roots without one): a certificate belongs to the host, however routing
+//     reached it. Any other backend uses the server's remote_tls_ca_file (POP3) or the
+//     system roots;
+//   - the name: a pool or remote_addrs entry configured by hostname is dialed at an address
+//     the name resolved to, but the certificate is issued for the name. ServerName (SNI) is
+//     that name, and a certificate valid for the name or for the address dialed is accepted,
+//     so a backend whose certificate names only its address keeps working as before.
+func (cm *ConnectionManager) BackendClientTLS(verify bool, addr string) *tls.Config {
+	route, err := cm.BindBackendRoute("", addr)
+	if err != nil {
+		return cm.refusedBackendTLS(err)
+	}
+	return route.TLSConfig(verify)
+}
+
+// configuredHostnamesOfLocked returns the hostnames (not IP literals) whose resolution
+// produced addr. The caller holds healthMu so roots and names use one DNS snapshot.
+func (cm *ConnectionManager) configuredHostnamesOfLocked(addr string) []string {
+	var hosts []string
+	for _, configured := range cm.configuredNamesOfLocked(addr) {
+		h, _, err := net.SplitHostPort(configured)
+		if err != nil {
+			h = configured
+		}
+		if h != "" && net.ParseIP(strings.Trim(h, "[]")) == nil {
+			hosts = append(hosts, h)
+		}
+	}
+	return hosts
+}
+
+// verifyBackendCertificate verifies a backend's certificate chain against roots (nil = the
+// system roots) and accepts it if it is valid for any of names.
+func verifyBackendCertificate(roots *x509.CertPool, names []string) func(tls.ConnectionState) error {
+	return func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return errors.New("backend presented no certificate")
+		}
+		opts := x509.VerifyOptions{Roots: roots, Intermediates: x509.NewCertPool()}
+		for _, c := range cs.PeerCertificates[1:] {
+			opts.Intermediates.AddCert(c)
+		}
+		leaf := cs.PeerCertificates[0]
+		if _, err := leaf.Verify(opts); err != nil {
+			return err
+		}
+		var err error
+		for _, name := range names {
+			if err = leaf.VerifyHostname(name); err == nil {
+				return nil
+			}
+		}
+		return err
+	}
+}
+
 // backendTLSConfig builds the client TLS config for the proxy->backend leg.
 // Shared by the implicit-TLS dial paths and the STARTTLS upgrade path so the
 // hardening choices (no client certs, no renegotiation, TLS 1.2 floor, custom
@@ -1116,26 +1237,50 @@ func (cm *ConnectionManager) backendTLSConfig(verify bool) *tls.Config {
 	}
 }
 
-// BackendTLSConfig returns the client TLS config for a STARTTLS upgrade of the
-// proxy->backend leg negotiated at the protocol layer, with the same hardening and custom
-// roots the implicit-TLS dial uses. verify is per route: a lookup answer or a pool may
-// override remote_tls_verify.
-func (cm *ConnectionManager) BackendTLSConfig(verify bool) *tls.Config {
-	return cm.backendTLSConfig(verify)
-}
-
 // GetTLSConfig returns the TLS configuration for remote connections
 // Used for StartTLS negotiation at the protocol layer
-func (cm *ConnectionManager) GetTLSConfig() *tls.Config {
+// addr is the backend address actually connected to (see BackendClientTLS).
+func (cm *ConnectionManager) GetTLSConfig(addr string) *tls.Config {
 	if !cm.remoteTLS {
 		return nil
 	}
-	return cm.backendTLSConfig(cm.remoteTLSVerify)
+	return cm.BackendClientTLS(cm.remoteTLSVerify, addr)
 }
 
 // IsRemoteStartTLS returns whether remote connections should use StartTLS
 func (cm *ConnectionManager) IsRemoteStartTLS() bool {
 	return cm.remoteTLS && cm.remoteTLSUseStartTLS
+}
+
+// backendTLSSettings are the remote_tls, remote_tls_use_starttls and remote_tls_verify a
+// connection to addr uses: the route's for the backend the lookup named or a member of the
+// pool routing confined it to, else the manager's own. ConnectWithProxy dials by them and
+// BackendStartTLSConfig asks them again, so the two cannot disagree.
+func (cm *ConnectionManager) backendTLSSettings(routingInfo *UserRoutingInfo, addr string) (remoteTLS, useStartTLS, verify bool) {
+	if routingInfo.UsesRouteSettings(addr) {
+		return routingInfo.RemoteTLS, routingInfo.RemoteTLSUseStartTLS, routingInfo.RemoteTLSVerify
+	}
+	return cm.remoteTLS, cm.remoteTLSUseStartTLS, cm.remoteTLSVerify
+}
+
+// BackendStartTLSConfig returns the config the protocol layer upgrades a connection
+// ConnectWithProxy returned for addr with, by its protocol's STARTTLS, right after the
+// greeting: nil when that connection needs none (implicit TLS, which the dial did, or a
+// plaintext leg). ConnectWithProxy dials plaintext whenever it returns a config, so a
+// proxy that skips the upgrade then runs the leg in plaintext.
+func (cm *ConnectionManager) BackendStartTLSConfig(routingInfo *UserRoutingInfo, addr string, connected ...net.Conn) *tls.Config {
+	remoteTLS, useStartTLS, verify := cm.backendTLSSettings(routingInfo, addr)
+	if !remoteTLS || !useStartTLS {
+		return nil
+	}
+	if len(connected) > 0 && connected[0] != nil {
+		return cm.BackendClientTLSForConn(verify, addr, connected[0])
+	}
+	route, err := cm.bindForDial(routingInfo, addr)
+	if err != nil {
+		return cm.refusedBackendTLS(err)
+	}
+	return route.TLSConfig(verify)
 }
 
 // ConnectWithProxy attempts to connect to a remote server and sends PROXY protocol header
@@ -1149,6 +1294,9 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 	cm.refreshResolvedAddrsIfStale()
 
 	if preferredAddr != "" {
+		if err := cm.backendPoolError(preferredAddr); err != nil {
+			return nil, "", err
+		}
 		conn, addr, err, fallback := cm.tryPreferredAddress(ctx, preferredAddr, clientIP, clientPort, serverIP, serverPort, routingInfo)
 		if !fallback {
 			// If no fallback is needed, we either succeeded or had a hard failure.
@@ -1207,6 +1355,9 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		if errors.Is(err, errBackendInMaintenance) {
 			inMaintenance++ // resolved to an address in maintenance
 			continue
+		}
+		if errors.Is(err, ErrAmbiguousBackendPool) {
+			return nil, "", err
 		}
 
 		// Record failure in health tracking only if the caller's context is still live.
@@ -1280,6 +1431,9 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 
 	// Attempt to dial the preferred address.
 	conn, err = cm.dialWithProxy(ctx, preferredAddr, clientIP, clientPort, serverIP, serverPort, routingInfo)
+	if errors.Is(err, ErrAmbiguousBackendPool) {
+		return nil, "", err, false
+	}
 	if errors.Is(err, ErrBackendOutsidePool) {
 		return nil, "", err, true
 	}
@@ -1335,7 +1489,15 @@ func (cm *ConnectionManager) tryPreferredAddress(ctx context.Context, preferredA
 func (cm *ConnectionManager) ResolveAddresses() error {
 	logger.Info("ConnectionManager: Starting address resolution", "server", cm.serverName, "configured_backends", len(cm.configuredAddrs))
 	cm.resolveAddresses()
-	return nil
+	cm.healthMu.RLock()
+	defer cm.healthMu.RUnlock()
+	var errs []error
+	for _, p := range cm.pools {
+		if err := cm.poolErrors[p.name]; err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // DefaultResolveRefreshInterval is how long a resolved pool is used before the next
@@ -1426,15 +1588,13 @@ func (cm *ConnectionManager) installResolvedAddrs(resolvedAddrs []string, resolv
 	defer cm.resolvedAt.Store(time.Now().UnixNano())
 
 	cm.resolvedHosts = resolvedHosts
+	cm.installPoolsLocked(resolvedHosts)
 	cm.resolutionGeneration++
 
 	if slices.Equal(cm.remoteAddrs, resolvedAddrs) {
 		logger.Debug("ConnectionManager: Address resolution unchanged", "server", cm.serverName, "backends", len(resolvedAddrs))
-		// The union is unchanged, but an address can still have moved from one pool's
-		// name to another's: rebuild the pools (health carries over by address).
-		for _, p := range cm.pools {
-			p.install(resolvedHosts)
-		}
+		// Membership and ownership checks were rebuilt even though the union stayed
+		// unchanged: addresses can have moved between pools, or begun to overlap.
 		return
 	}
 
@@ -1454,12 +1614,40 @@ func (cm *ConnectionManager) installResolvedAddrs(resolvedAddrs []string, resolv
 
 	cm.remoteAddrs = resolvedAddrs
 	cm.backendHealth = newBackendHealth
+}
 
-	// Rebuild every pool's member list and hash ring from the resolution. This is
-	// critical: a ring left with the old hostnames while backendHealth holds IP
-	// addresses would make IsBackendHealthy() fail for every member.
+// installPoolsLocked publishes membership and its ownership checks together. Retaining
+// both colliding pools as usable would let PoolOfBackend pick the first pool's CA and
+// configuredHostnamesOf accept the other pool's names. Refuse the affected pools,
+// including their configured aliases and cached pins; unrelated pools remain available.
+func (cm *ConnectionManager) installPoolsLocked(resolvedHosts map[string][]string) {
+	cm.poolErrors = make(map[string]error)
+	cm.backendErrors = make(map[string]error)
+	owners := make(map[string]string)
 	for _, p := range cm.pools {
 		p.install(resolvedHosts)
+		if !p.named {
+			continue
+		}
+		for _, addr := range p.resolved {
+			if owner, exists := owners[addr]; exists && owner != p.name {
+				err := fmt.Errorf("%w: %s is in %q and %q", ErrAmbiguousBackendPool, addr, owner, p.name)
+				cm.poolErrors[owner], cm.poolErrors[p.name] = err, err
+				logger.Error("ConnectionManager: refusing overlapping backend pools", "server", cm.serverName, "error", err)
+			} else {
+				owners[addr] = p.name
+			}
+		}
+	}
+	for _, p := range cm.pools {
+		if err := cm.poolErrors[p.name]; err != nil {
+			for _, addr := range p.configured {
+				cm.backendErrors[addr] = err
+			}
+			for _, addr := range p.resolved {
+				cm.backendErrors[addr] = err
+			}
+		}
 	}
 }
 
@@ -1587,14 +1775,9 @@ func (cm *ConnectionManager) dial(ctx context.Context, addr string) (net.Conn, e
 	// Only use implicit TLS if remoteTLS is enabled AND StartTLS is not being used
 	// When StartTLS is enabled, the protocol layer will handle the TLS upgrade
 	if cm.remoteTLS && !cm.remoteTLSUseStartTLS {
-		tlsConfig := cm.backendTLSConfig(cm.remoteTLSVerify)
-		// tls.Dial would infer ServerName from the dial target, but we dial the DNS-resolved
-		// IP (resolvedAddr), which would verify the cert against the IP rather than the
-		// configured backend hostname. Pin ServerName to the configured host so verification
-		// matches the cert's DNS SAN, consistent with the STARTTLS / proxy-protocol paths.
-		if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil && host != "" {
-			tlsConfig.ServerName = host
-		}
+		// Verified by the backend's configured name (or its address), not by the formatted
+		// dial target alone; see BackendClientTLS.
+		tlsConfig := cm.BackendClientTLS(cm.remoteTLSVerify, addr)
 		conn, err = tls.DialWithDialer(dialer, "tcp", resolvedAddr, tlsConfig)
 	} else {
 		// Plain connection (either no TLS, or TLS will be negotiated via StartTLS)
@@ -1666,18 +1849,13 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// Determine effective settings for this connection.
 	// Default to the connection manager's global settings.
 	useProxyProtocol := cm.remoteUseProxyProtocol
-	remoteTLS := cm.remoteTLS
-	remoteTLSUseStartTLS := cm.remoteTLSUseStartTLS
-	remoteTLSVerify := cm.remoteTLSVerify
+	remoteTLS, remoteTLSUseStartTLS, remoteTLSVerify := cm.backendTLSSettings(routingInfo, addr)
 
 	// A route carries its own backend-leg settings for the backend the remote lookup named,
 	// and for every member of the named pool routing confined it to (which stamped that
 	// pool's settings on it). Otherwise the proxy server's own settings apply.
 	if routingInfo.UsesRouteSettings(addr) {
 		useProxyProtocol = routingInfo.RemoteUseProxyProtocol
-		remoteTLS = routingInfo.RemoteTLS
-		remoteTLSUseStartTLS = routingInfo.RemoteTLSUseStartTLS
-		remoteTLSVerify = routingInfo.RemoteTLSVerify
 		logger.Debug("Using remotelookup settings", "addr", addr, "remoteTLS", remoteTLS, "remoteTLSUseStartTLS", remoteTLSUseStartTLS, "remoteTLSVerify", remoteTLSVerify, "useProxyProtocol", useProxyProtocol)
 	} else {
 		logger.Debug("Using global settings", "addr", addr, "remoteTLS", remoteTLS, "remoteTLSUseStartTLS", remoteTLSUseStartTLS, "remoteTLSVerify", remoteTLSVerify, "useProxyProtocol", useProxyProtocol)
@@ -1721,18 +1899,7 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 	// Now establish TLS if required (only for implicit TLS, not StartTLS)
 	// When StartTLS is enabled, the protocol layer will handle TLS upgrade
 	if remoteTLS && !remoteTLSUseStartTLS {
-		tlsConfig := cm.backendTLSConfig(remoteTLSVerify)
-		tlsConfig.VerifyConnection = func(tls.ConnectionState) error {
-			return route.ValidateDestination(conn.RemoteAddr().String())
-		}
-		// Verify the backend certificate against its configured hostname. tls.Client (unlike
-		// tls.Dial) does NOT infer ServerName, so without this it stays empty and Go verifies
-		// only the chain, not the host — remote_tls_verify=true would still let any CA-valid
-		// cert MITM the proxy->backend leg. Use `addr` (the configured backend address), not the
-		// DNS-resolved IP, so it matches the backend certificate's DNS SAN.
-		if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil && host != "" {
-			tlsConfig.ServerName = host
-		}
+		tlsConfig := route.TLSConfig(remoteTLSVerify, conn)
 		logger.Debug("Starting TLS handshake", "addr", addr, "InsecureSkipVerify", !remoteTLSVerify, "server_name", tlsConfig.ServerName)
 		tlsConn := tls.Client(conn, tlsConfig)
 
@@ -2120,11 +2287,45 @@ func (cm *ConnectionManager) routePool(params RouteParams, result *RouteResult) 
 	return pool, nil
 }
 
+// crossProtocolLister is implemented by the cluster affinity manager: every live affinity of
+// a user's other protocols, in the order GetBackendAcrossProtocols consults them.
+type crossProtocolLister interface {
+	CrossProtocolBackends(username, protocol string) (backends, protocols []string)
+}
+
+// crossProtocolInPool picks, among the user's affinities of other protocols, the first whose
+// host is a member of pool, resolved to this proxy's address for it. first is the one
+// GetBackendAcrossProtocols returned; the others are only known through crossProtocolLister.
+// An entry outside the pool is passed over, not deleted: it is that protocol's to correct when
+// it routes the user, and what looks outside the pool here may be the same host as another
+// node resolved it (the other address family), whose deletion would be cluster-wide.
+func crossProtocolInPool(params RouteParams, pool *backendPool, affinityMgr AffinityManager, firstAddr, firstProtocol string) (affAddr, protocol, target string, ok bool) {
+	backends, protocols := []string{firstAddr}, []string{firstProtocol}
+	if l, isLister := affinityMgr.(crossProtocolLister); isLister {
+		backends, protocols = l.CrossProtocolBackends(params.Username, params.Protocol)
+	}
+	for i, addr := range backends {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return addr, protocols[i], addr, true // checked against the pool by the caller
+		}
+		if local, found := params.ConnManager.poolBackendByHost(pool, host); found {
+			return addr, protocols[i], local, true
+		}
+		logger.Debug("Cross-protocol affinity host not in pool, passing over it",
+			"proxy", params.ProxyName, "user", params.Username, "pool", pool.name,
+			"affinity_addr", addr, "from_protocol", protocols[i])
+	}
+	return "", "", "", false
+}
+
 // resolveAffinityRoute attempts to find a healthy backend via affinity, including cross-protocol,
-// inside the given pool. An affinity that points outside the pool is deleted and the user is
+// inside the given pool. A same-protocol affinity outside the pool is deleted and the user is
 // routed afresh: that is how a user moved between pools by the lookup API lands in the new one.
-// If same-protocol affinity is stale (unhealthy), it deletes it and retries once to check
-// cross-protocol affinities from other protocols that may have already failed over.
+// A cross-protocol one outside the pool is passed over for the next (crossProtocolInPool), so a
+// stale entry of one protocol cannot mask the user's good entry of another. If same-protocol
+// affinity is stale (unhealthy), it deletes it and retries once to check cross-protocol
+// affinities from other protocols that may have already failed over.
 func resolveAffinityRoute(params RouteParams, pool *backendPool, affinityMgr AffinityManager) (preferredAddr, routingMethod string) {
 	cm := params.ConnManager
 
@@ -2137,19 +2338,13 @@ func resolveAffinityRoute(params RouteParams, pool *backendPool, affinityMgr Aff
 
 		targetAddr := lastAddr
 
-		// Cross-protocol: resolve hostname to this proxy's pool address
+		// Cross-protocol: the first of the user's other protocols' affinities inside the
+		// pool, resolved to this proxy's address for that host
 		if foundProtocol != params.Protocol {
-			host, _, err := net.SplitHostPort(lastAddr)
-			if err == nil {
-				if localAddr, ok := cm.poolBackendByHost(pool, host); ok {
-					targetAddr = localAddr
-				} else {
-					// Backend host not in the user's pool — skip this affinity entry
-					logger.Debug("Cross-protocol affinity host not in pool, skipping",
-						"proxy", params.ProxyName, "user", params.Username, "pool", pool.name,
-						"affinity_addr", lastAddr, "from_protocol", foundProtocol)
-					return "", ""
-				}
+			var ok bool
+			lastAddr, foundProtocol, targetAddr, ok = crossProtocolInPool(params, pool, affinityMgr, lastAddr, foundProtocol)
+			if !ok {
+				return "", ""
 			}
 		}
 

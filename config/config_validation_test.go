@@ -216,6 +216,72 @@ func TestWarnUnusedConfigOptions_MultipleIssues(t *testing.T) {
 	}
 }
 
+// remote_tls_use_starttls only does anything together with remote_tls: without it the
+// backend leg is dialed plaintext and never upgraded. The User API proxy speaks HTTPS to
+// its backends and has no STARTTLS at all.
+func TestWarnUnusedConfigOptions_RemoteStartTLS(t *testing.T) {
+	tests := []struct {
+		name         string
+		serverConfig ServerConfig
+		wantWarning  string // substring of the one expected warning; "" for none
+	}{
+		{
+			name:         "proxy with remote_tls_use_starttls but no remote_tls",
+			serverConfig: ServerConfig{Type: "lmtp_proxy", Name: "lmtp-proxy-test", RemoteTLSUseStartTLS: true},
+			wantWarning:  "'remote_tls_use_starttls' configured without 'remote_tls'",
+		},
+		{
+			name:         "proxy with remote_tls and remote_tls_use_starttls",
+			serverConfig: ServerConfig{Type: "imap_proxy", Name: "imap-proxy-test", RemoteTLS: true, RemoteTLSUseStartTLS: true},
+		},
+		{
+			name: "remote_lookup with remote_tls_use_starttls but no remote_tls",
+			serverConfig: ServerConfig{Type: "managesieve_proxy", Name: "sieve-proxy-test", RemoteTLS: true, RemoteTLSUseStartTLS: true,
+				RemoteLookup: &RemoteLookupConfig{RemoteTLSUseStartTLS: true}},
+			wantWarning: "'remote_lookup.remote_tls_use_starttls' configured without 'remote_lookup.remote_tls'",
+		},
+		{
+			name: "remote_lookup with remote_tls and remote_tls_use_starttls",
+			serverConfig: ServerConfig{Type: "pop3_proxy", Name: "pop3-proxy-test",
+				RemoteLookup: &RemoteLookupConfig{RemoteTLS: true, RemoteTLSUseStartTLS: true}},
+		},
+		{
+			name:         "user_api_proxy with remote_tls_use_starttls",
+			serverConfig: ServerConfig{Type: "user_api_proxy", Name: "user-api-proxy-test", RemoteTLS: true, RemoteTLSUseStartTLS: true},
+			wantWarning:  "'remote_tls_use_starttls' configured, but the User API proxy",
+		},
+		{
+			name:         "user_api_proxy with remote_tls_use_starttls but no remote_tls",
+			serverConfig: ServerConfig{Type: "user_api_proxy", Name: "user-api-proxy-test", RemoteTLSUseStartTLS: true},
+			wantWarning:  "'remote_tls_use_starttls' configured, but the User API proxy",
+		},
+		{
+			name: "user_api_proxy with remote_lookup remote_tls_use_starttls",
+			serverConfig: ServerConfig{Type: "user_api_proxy", Name: "user-api-proxy-test", RemoteTLS: true,
+				RemoteLookup: &RemoteLookupConfig{RemoteTLS: true, RemoteTLSUseStartTLS: true}},
+			wantWarning: "'remote_lookup.remote_tls_use_starttls' configured, but the User API proxy",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var warnings []string
+			tt.serverConfig.WarnUnusedConfigOptions(func(format string, args ...any) {
+				warnings = append(warnings, fmt.Sprintf(format, args...))
+			})
+			if tt.wantWarning == "" {
+				if len(warnings) > 0 {
+					t.Errorf("Expected no warnings, but got: %v", warnings)
+				}
+				return
+			}
+			if len(warnings) != 1 || !strings.Contains(warnings[0], tt.wantWarning) || !strings.Contains(warnings[0], tt.serverConfig.Name) {
+				t.Errorf("Expected one warning containing %q for %s, got: %v", tt.wantWarning, tt.serverConfig.Name, warnings)
+			}
+		})
+	}
+}
+
 func TestWarnUnusedStartTLS(t *testing.T) {
 	supported := map[string]bool{"imap": true, "lmtp": true, "managesieve": true, "pop3": true, "imap_proxy": true, "lmtp_proxy": true, "managesieve_proxy": true, "pop3_proxy": true}
 	for _, serverType := range []string{"imap", "pop3", "imap_proxy", "pop3_proxy", "metrics", "http_admin_api", "http_user_api", "lmtp", "managesieve", "lmtp_proxy", "managesieve_proxy"} {

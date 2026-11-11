@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -202,15 +203,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 
 					s.accountID = cached.AccountID
 					s.isRemoteLookupAccount = cached.FromRemoteLookup
-					s.routingInfo = &proxy.UserRoutingInfo{
-						AccountID:              cached.AccountID,
-						ServerAddress:          cached.ServerAddress,
-						PoolName:               cached.PoolName,
-						RemoteTLS:              cached.RemoteTLS,
-						RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
-						RemoteTLSVerify:        cached.RemoteTLSVerify,
-						RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
-					}
+					// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
+					// its enforcement and every backend-leg setting the lookup answer carried.
+					s.routingInfo = proxy.RouteFromCache(cached)
 					if cached.ActualEmail != "" {
 						s.username = cached.ActualEmail
 					} else {
@@ -413,20 +408,14 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				// BUT store ActualEmail so cache hits can use the resolved address
 				// Always digest the password, even for master auth, to prevent cache bypass
 				if s.server.lookupCache != nil {
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-						AccountID:              routingInfo.AccountID,
-						PasswordDigest:         lookupcache.NewPasswordDigest(password),
-						ActualEmail:            resolvedEmail, // Store resolved email for cache hits
-						ServerAddress:          routingInfo.ServerAddress,
-						PoolName:               routingInfo.PoolName,
-						RemoteTLS:              routingInfo.RemoteTLS,
-						RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
-						RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
-						RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
-						Result:                 lookupcache.AuthSuccess,
-						FromRemoteLookup:       true,
-						IsNegative:             false,
-					})
+					entry := &lookupcache.CacheEntry{
+						PasswordDigest: lookupcache.NewPasswordDigest(password),
+						ActualEmail:    resolvedEmail, // Store resolved email for cache hits
+						Result:         lookupcache.AuthSuccess,
+						IsNegative:     false,
+					}
+					proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
+					s.server.lookupCache.Set(s.server.name, username, entry)
 				}
 
 				s.authenticated = true
@@ -737,9 +726,19 @@ func (s *POP3ProxySession) connectToBackend() error {
 		return fmt.Errorf("%w: failed to clear greeting read deadline: %w", server.ErrBackendConnectionFailed, err)
 	}
 
-	if !strings.HasPrefix(greeting, "+OK") {
+	if !isPositiveResponse(greeting) {
 		s.backendConn.Close()
 		return fmt.Errorf("%w: unexpected backend greeting: %s", server.ErrBackendConnectionFailed, greeting)
+	}
+
+	// remote_tls_use_starttls: the connection manager dialed plaintext, and the upgrade
+	// must come before anything else is sent (XCLIENT carries the client's address, AUTH
+	// the master credential).
+	if tlsConfig := s.server.connManager.BackendStartTLSConfig(s.routingInfo, s.serverAddr, s.backendConn); tlsConfig != nil {
+		if backendReader, err = s.startTLSWithBackend(backendReader, tlsConfig, greetingTimeout); err != nil {
+			s.backendConn.Close()
+			return fmt.Errorf("%w: STLS with backend: %w", server.ErrBackendConnectionFailed, err)
+		}
 	}
 
 	// Store backendReader for use in proxy phase to avoid losing buffered data
@@ -846,6 +845,52 @@ func (s *POP3ProxySession) connectToBackend() error {
 	s.DebugLog("Authenticated to backend")
 
 	return nil
+}
+
+// isPositiveResponse reports whether a backend response line carries the +OK status
+// indicator: ASCII case-insensitive (RFC 1939 section 3) and complete, so that a prefix
+// such as +OKAY is not an OK status.
+func isPositiveResponse(line string) bool {
+	if len(line) < 3 || !strings.EqualFold(line[:3], "+OK") {
+		return false
+	}
+	return len(line) == 3 || line[3] == ' ' || line[3] == '\r' || line[3] == '\n'
+}
+
+// startTLSWithBackend upgrades the backend connection with STLS (RFC 2595), within
+// timeout, republishes it under the mutex and returns the reader for the TLS connection.
+func (s *POP3ProxySession) startTLSWithBackend(reader *bufio.Reader, tlsConfig *tls.Config, timeout time.Duration) (*bufio.Reader, error) {
+	if err := s.backendConn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, fmt.Errorf("setting the STLS deadline: %w", err)
+	}
+	if _, err := io.WriteString(s.backendConn, "STLS\r\n"); err != nil {
+		return nil, fmt.Errorf("sending STLS: %w", err)
+	}
+	resp, err := server.ReadBoundedLine(reader, 1024)
+	if err != nil {
+		return nil, fmt.Errorf("reading the STLS response: %w", err)
+	}
+	if !isPositiveResponse(resp) {
+		return nil, fmt.Errorf("backend refused STLS: %s", strings.TrimSpace(resp))
+	}
+	// Bytes already buffered came in plaintext after the +OK, where anyone on the path
+	// could have put them. The reader returned below would drop them; a stream that
+	// broke the protocol there fails the connection instead (cf. CVE-2011-0411).
+	if reader.Buffered() > 0 {
+		return nil, errors.New("backend sent data after its STLS response")
+	}
+	tlsConn := tls.Client(s.backendConn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, fmt.Errorf("TLS handshake: %w", err)
+	}
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("clearing the STLS deadline: %w", err)
+	}
+	s.mutex.Lock()
+	s.backendConn = tlsConn
+	s.mutex.Unlock()
+	s.DebugLog("backend connection upgraded with STLS", "backend", s.serverAddr)
+	return bufio.NewReader(tlsConn), nil
 }
 
 // invalidateLookupCache removes this session's lookup-cache entry so the next

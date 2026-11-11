@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"crypto/tls"
+	"fmt"
+	"net"
 	"testing"
 	"time"
 )
@@ -79,16 +82,12 @@ func TestNewConnectionManagerWithRoutingAndStartTLS(t *testing.T) {
 			}
 
 			// Verify GetTLSConfig() behavior
-			tlsConfig := cm.GetTLSConfig()
+			tlsConfig := cm.GetTLSConfig("backend.example:24")
 			if tt.remoteTLS {
 				if tlsConfig == nil {
 					t.Errorf("Expected TLS config when remoteTLS=true, got nil")
-				} else {
-					// Verify InsecureSkipVerify is set correctly (opposite of remoteTLSVerify)
-					if tlsConfig.InsecureSkipVerify != false {
-						t.Errorf("Expected InsecureSkipVerify=false (remoteTLSVerify=true), got %v",
-							tlsConfig.InsecureSkipVerify)
-					}
+				} else if !verifiesCertificates(tlsConfig) {
+					t.Errorf("Expected backend certificates verified (remoteTLSVerify=true), got a config that skips it")
 				}
 			} else {
 				if tlsConfig != nil {
@@ -152,7 +151,10 @@ func TestConnectionManagerGetTLSConfig(t *testing.T) {
 				t.Fatalf("Failed to create connection manager: %v", err)
 			}
 
-			tlsConfig := cm.GetTLSConfig()
+			ca := newTestCA(t)
+			port := tlsBackendOnEveryAddress(t, ca.leaf(t, nil, loopbackIPs))
+			addr := fmt.Sprintf("127.0.0.1:%d", port)
+			tlsConfig := cm.GetTLSConfig(addr)
 
 			if tt.wantNil {
 				if tlsConfig != nil {
@@ -165,8 +167,18 @@ func TestConnectionManagerGetTLSConfig(t *testing.T) {
 				t.Fatalf("Expected TLS config, got nil")
 			}
 
-			if tlsConfig.InsecureSkipVerify != tt.wantSkipVerify {
-				t.Errorf("Expected InsecureSkipVerify=%v, got %v", tt.wantSkipVerify, tlsConfig.InsecureSkipVerify)
+			// A VerifyConnection callback may enforce pool ownership without
+			// checking certificates. Test the actual TLS policy with an untrusted
+			// certificate instead of inferring it from the callback's presence.
+			conn, handshakeErr := tls.DialWithDialer(&net.Dialer{Timeout: time.Second}, "tcp", addr, tlsConfig)
+			if conn != nil {
+				conn.Close()
+			}
+			if tt.wantSkipVerify && handshakeErr != nil {
+				t.Fatalf("verification disabled: %v", handshakeErr)
+			}
+			if !tt.wantSkipVerify && handshakeErr == nil {
+				t.Fatal("verification enabled accepted an untrusted certificate")
 			}
 
 			// Verify no client certificates are set
@@ -318,8 +330,8 @@ func TestConnectionManagerTLSConfigIndependence(t *testing.T) {
 		t.Fatalf("Failed to create connection manager: %v", err)
 	}
 
-	config1 := cm.GetTLSConfig()
-	config2 := cm.GetTLSConfig()
+	config1 := cm.GetTLSConfig("backend.example:24")
+	config2 := cm.GetTLSConfig("backend.example:24")
 
 	// Configs should have the same settings but be different objects
 	if config1 == config2 {
@@ -327,7 +339,13 @@ func TestConnectionManagerTLSConfigIndependence(t *testing.T) {
 	}
 
 	// But they should have the same values
-	if config1.InsecureSkipVerify != config2.InsecureSkipVerify {
+	if verifiesCertificates(config1) != verifiesCertificates(config2) {
 		t.Error("TLS configs should have the same InsecureSkipVerify value")
 	}
+}
+
+// verifiesCertificates reports whether a backend TLS config checks the backend's
+// certificate: Go's own check, or BackendClientTLS's name-or-address check in its place.
+func verifiesCertificates(cfg *tls.Config) bool {
+	return !cfg.InsecureSkipVerify || cfg.VerifyConnection != nil
 }

@@ -332,16 +332,9 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					// reaches DetermineRoute without routing info has the lookup run again,
 					// which would both defeat the cache and follow an answer that changed
 					// before the entry expired. IMAP, POP3 and LMTP do the same.
-					s.routingInfo = &proxy.UserRoutingInfo{
-						AccountID:              cached.AccountID,
-						ServerAddress:          cached.ServerAddress,
-						PoolName:               cached.PoolName,
-						RemoteTLS:              cached.RemoteTLS,
-						RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
-						RemoteTLSVerify:        cached.RemoteTLSVerify,
-						RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
-						IsRemoteLookupAccount:  cached.FromRemoteLookup,
-					}
+					// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
+					// its enforcement and every backend-leg setting the lookup answer carried.
+					s.routingInfo = proxy.RouteFromCache(cached)
 
 					// Track successful authentication using resolved email
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
@@ -523,20 +516,14 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				// BUT store ActualEmail so cache hits can use the resolved address
 				// Always digest the password, even for master auth, to prevent cache bypass
 				if s.server.lookupCache != nil {
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-						AccountID:              routingInfo.AccountID,
-						PasswordDigest:         lookupcache.NewPasswordDigest(password),
-						ActualEmail:            resolvedEmail, // Store resolved email for cache hits
-						ServerAddress:          routingInfo.ServerAddress,
-						PoolName:               routingInfo.PoolName,
-						RemoteTLS:              routingInfo.RemoteTLS,
-						RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
-						RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
-						RemoteUseProxyProtocol: routingInfo.RemoteUseProxyProtocol,
-						Result:                 lookupcache.AuthSuccess,
-						FromRemoteLookup:       true,
-						IsNegative:             false,
-					})
+					entry := &lookupcache.CacheEntry{
+						PasswordDigest: lookupcache.NewPasswordDigest(password),
+						ActualEmail:    resolvedEmail, // Store resolved email for cache hits
+						Result:         lookupcache.AuthSuccess,
+						IsNegative:     false,
+					}
+					proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
+					s.server.lookupCache.Set(s.server.name, username, entry)
 				}
 
 				// Use resolvedEmail for rate limiting (not submitted username with token)
@@ -855,36 +842,10 @@ func (s *Session) connectToBackendAndAuth() error {
 		}
 	}
 
-	// Check if we need to negotiate StartTLS with the backend
-	// This happens when remotelookup (or global config) specifies remote_tls_use_starttls
-	shouldUseStartTLS := false
-	var tlsConfig *tls.Config
-
-	if s.routingInfo.UsesRouteSettings(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
-		// The route specified StartTLS (for the backend the lookup named or its pool picked, as for the dial)
-		shouldUseStartTLS = true
-		tlsConfig = s.server.connManager.BackendTLSConfig(s.routingInfo.RemoteTLSVerify)
-		s.DebugLog("Using remotelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
-	} else if !s.routingInfo.PoolRouted() && s.server.connManager.IsRemoteStartTLS() {
-		// Global proxy config specified StartTLS. A pool's own settings are authoritative:
-		// a pool without remote_tls_use_starttls never inherits the server's.
-		shouldUseStartTLS = true
-		tlsConfig = s.server.connManager.GetTLSConfig()
-		s.DebugLog("Using global StartTLS settings")
-	}
-
-	// Set ServerName so tls.Client verifies the backend certificate hostname. Without
-	// it, DNSName is empty and Go verifies only the chain (not the host), so
-	// remote_tls_verify=true would still let any CA-valid cert MITM the proxy->backend
-	// leg. Derive it from the address we actually connected to (preserves the configured
-	// backend hostname; both tls.Config values here are per-connection, safe to mutate).
-	if tlsConfig != nil && tlsConfig.ServerName == "" {
-		if host, _, splitErr := net.SplitHostPort(actualAddr); splitErr == nil && host != "" {
-			tlsConfig.ServerName = host
-		}
-	}
-
-	if shouldUseStartTLS && tlsConfig != nil {
+	// remote_tls_use_starttls: the connection manager dialed plaintext and left the upgrade
+	// to us. Whether this connection needs it is asked of the settings the dial used
+	// (the route's or the proxy's own), so the two cannot disagree.
+	if tlsConfig := s.server.connManager.BackendStartTLSConfig(s.routingInfo, actualAddr, s.backendConn); tlsConfig != nil {
 		s.DebugLog("Negotiating StartTLS with backend", "backend", actualAddr, "insecure_skip_verify", tlsConfig.InsecureSkipVerify)
 
 		// Send STARTTLS command
@@ -905,6 +866,14 @@ func (s *Session) connectToBackendAndAuth() error {
 		if !strings.HasPrefix(strings.TrimSpace(response), "OK") {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: backend STARTTLS failed: %s", server.ErrBackendConnectionFailed, strings.TrimSpace(response))
+		}
+
+		// Bytes already buffered came in plaintext after the OK, where anyone on the path
+		// could have put them. The reader replaced below would drop them; a stream that
+		// broke the protocol there fails the connection instead (cf. CVE-2011-0411).
+		if backendReader.Buffered() > 0 {
+			s.backendConn.Close()
+			return fmt.Errorf("%w: backend sent data after its STARTTLS response", server.ErrBackendConnectionFailed)
 		}
 
 		// Upgrade connection to TLS
@@ -938,16 +907,20 @@ func (s *Session) connectToBackendAndAuth() error {
 		}
 	}
 
-	// Now authenticate to backend
+	// Now authenticate to backend, reading on from the reader that read the capabilities:
+	// what it buffered behind them would be lost with a new one.
+	s.backendReader = backendReader
 	return s.authenticateToBackend()
 }
 
-// authenticateToBackend authenticates to the backend using master credentials.
+// authenticateToBackend authenticates to the backend using master credentials. It reads
+// from s.backendReader, which the proxy phase goes on using so no buffered data is lost.
 func (s *Session) authenticateToBackend() error {
 	backendWriter := bufio.NewWriter(s.backendConn)
-	backendReader := bufio.NewReader(s.backendConn)
-	// Store backendReader for use in proxy phase to avoid losing buffered data
-	s.backendReader = backendReader
+	if s.backendReader == nil {
+		s.backendReader = bufio.NewReader(s.backendConn)
+	}
+	backendReader := s.backendReader
 
 	// Send AUTHENTICATE PLAIN command with impersonation
 	settings := s.server.loadSettings() // one copy of the credentials, however a reload replaces them meanwhile

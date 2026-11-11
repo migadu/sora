@@ -62,6 +62,9 @@ var (
 	// fails: there is no pool to route into, and the default pool is not a safe guess.
 	ErrRouteLookupFailed = errors.New("routing lookup failed")
 
+	// ErrAmbiguousBackendPool means DNS made independently configured pools share
+	// a destination. Neither its owner nor its TLS trust settings can be guessed.
+	ErrAmbiguousBackendPool = errors.New("backend belongs to multiple resolved pools")
 	// ErrBackendOutsidePool refuses a socket whose destination no longer belongs to its route.
 	ErrBackendOutsidePool = errors.New("backend is outside the routed pool")
 )
@@ -71,12 +74,16 @@ var (
 // unnamed pool a flat remote_addrs list becomes uses the proxy server's.
 type BackendSettings struct {
 	TLS              bool
-	TLSUseStartTLS   bool // LMTP/ManageSieve only
+	TLSUseStartTLS   bool // Dial plaintext; the proxy upgrades with its protocol's STARTTLS (BackendStartTLSConfig)
 	TLSVerify        bool
 	UseProxyProtocol bool
 	UseIDCommand     bool // IMAP only
 	UseXCLIENT       bool // POP3/LMTP only
 	UseUTF8          bool // POP3 only
+	// TLSCAFile is a PEM file of CA certificates the pool's backends are verified against
+	// (private-CA or self-signed backends); "" = the system roots. Loaded once, when the
+	// manager is built.
+	TLSCAFile string
 }
 
 // PoolSpec is one named backend pool as a proxy server hands it to the connection
@@ -107,10 +114,6 @@ type ManagerOptions struct {
 	RoutingLookup      UserRoutingLookup
 	ServerName         string
 	DisableHealthCheck bool
-	// ImplicitTLSOnly is set by proxies that cannot STARTTLS to a backend (IMAP, POP3): a
-	// pool's remote_tls_use_starttls is then ignored and remote_tls means implicit TLS, as
-	// those proxies already do with their own flat settings.
-	ImplicitTLSOnly bool
 }
 
 // PoolRouteLabel is the pool label of sora_proxy_pool_route_total for a route naming name
@@ -124,6 +127,9 @@ func PoolRouteLabel(name string, err error) string {
 }
 
 func poolRouteOutcome(err error) string {
+	if errors.Is(err, ErrAmbiguousBackendPool) {
+		return "ambiguous_pool"
+	}
 	if errors.Is(err, ErrNoDefaultPool) {
 		return "no_default"
 	}
@@ -134,18 +140,7 @@ func poolRouteOutcome(err error) string {
 // flat-list one otherwise.
 func NewConnectionManagerFromOptions(o ManagerOptions) (*ConnectionManager, error) {
 	if len(o.Pools) > 0 {
-		pools := o.Pools
-		if o.ImplicitTLSOnly {
-			// remote_tls_use_starttls is for the protocols that can upgrade a backend
-			// connection (LMTP, ManageSieve). For the others remote_tls means TLS from the
-			// first byte; dialed with the flag, their backend leg would stay plaintext.
-			pools = make([]PoolSpec, len(o.Pools))
-			for i, p := range o.Pools {
-				p.Settings.TLSUseStartTLS = false
-				pools[i] = p
-			}
-		}
-		return NewConnectionManagerWithPools(pools, o.RemotePort, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
+		return NewConnectionManagerWithPools(o.Pools, o.RemotePort, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
 	}
 	return NewConnectionManagerWithRoutingAndStartTLSAndHealthCheck(o.RemoteAddrs, o.RemotePort, o.Settings.TLS, o.Settings.TLSUseStartTLS, o.Settings.TLSVerify, o.Settings.UseProxyProtocol, o.ConnectTimeout, o.RoutingLookup, o.ServerName, o.DisableHealthCheck)
 }
@@ -167,6 +162,7 @@ func PoolSpecsFromConfig(pools []config.PoolConfig) []PoolSpec {
 				UseIDCommand:     p.RemoteUseIDCommand,
 				UseXCLIENT:       p.RemoteUseXCLIENT,
 				UseUTF8:          p.RemoteUseUTF8,
+				TLSCAFile:        p.RemoteTLSCAFile,
 			},
 		})
 	}
@@ -193,7 +189,7 @@ type UserRoutingInfo struct {
 	ActualEmail            string        // Actual email address for backend impersonation
 	FromCache              bool          // Whether this result came from remotelookup cache
 	RemoteTLS              bool          // Use TLS for backend connection
-	RemoteTLSUseStartTLS   bool          // Use STARTTLS (LMTP/ManageSieve only)
+	RemoteTLSUseStartTLS   bool          // Use STARTTLS after the greeting instead of implicit TLS
 	RemoteTLSVerify        bool          // Verify backend TLS certificate
 	RemoteUseProxyProtocol bool          // Use PROXY protocol for backend connection
 	RemoteUseIDCommand     bool          // Use IMAP ID command (IMAP only)
@@ -251,6 +247,11 @@ func normalizeHostPort(addr string, defaultPort int) string {
 		// IPv6 zero-compression) so different spellings of the same address compare equal.
 		if ip := net.ParseIP(host); ip != nil {
 			host = ip.String()
+		}
+		// DNS ownership is keyed by the destination actually dialed. Numeric
+		// spellings such as 0143 and service names such as imap mean the same port.
+		if n, err := net.LookupPort("tcp", port); err == nil {
+			port = strconv.Itoa(n)
 		}
 		return net.JoinHostPort(host, port)
 	}
