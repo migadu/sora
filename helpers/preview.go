@@ -1,13 +1,13 @@
 package helpers
 
 import (
-	"bufio"
 	"io"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/emersion/go-message"
+	_ "github.com/emersion/go-message/charset"
 )
 
 // PreviewMaxChars is the length of a generated preview, in characters. RFC 8970
@@ -29,6 +29,9 @@ const (
 	// Each MIME nesting level adds parser buffers and wraps the parent's reader.
 	// Skip deeper subtrees while still looking for a shallower inline sibling.
 	previewMaxMIMEDepth = 32
+	// Empty parts cost parser objects and buffers even when they contain no
+	// bytes of text. Bound the total visited entities, including containers.
+	previewMaxMIMEParts = 128
 )
 
 // MessagePreview returns a short plain-text preview of a raw RFC 5322 message
@@ -51,47 +54,59 @@ func MessagePreview(r io.Reader) (preview string) {
 		}
 	}()
 
-	entity, err := message.Read(bufio.NewReader(io.LimitReader(r, previewMaxInput)))
-	if err != nil && !message.IsUnknownCharset(err) {
+	entity, err := readPreviewEntity(r)
+	if err != nil && !message.IsUnknownCharset(err) && !message.IsUnknownEncoding(err) {
 		return ""
 	}
 	// Inspect each entity before descending: mail.Reader flattens multiparts
 	// and loses an attachment container's disposition on its inline leaves.
-	var readers []message.MultipartReader
+	type multipartFrame struct {
+		reader    message.MultipartReader
+		mediaType string
+	}
+	var readers []multipartFrame
 	defer func() {
 		for i := len(readers) - 1; i >= 0; i-- {
-			readers[i].Close()
+			readers[i].reader.Close()
 		}
 	}()
 
 	html, haveHTML := "", false
 	part := entity
-	for {
+	partErr := err
+	for partsRead := 0; partsRead < previewMaxMIMEParts; {
+		parentMediaType := ""
 		if part == nil {
 			if len(readers) == 0 {
 				break
 			}
-			mr := readers[len(readers)-1]
-			part, err = mr.NextPart()
-			if err == io.EOF {
-				mr.Close()
+			frame := readers[len(readers)-1]
+			part, partErr = frame.reader.NextPart()
+			if partErr == io.EOF || (partErr != nil && !message.IsUnknownCharset(partErr) && !message.IsUnknownEncoding(partErr)) {
+				// A broken nested multipart cannot yield more parts, but its
+				// parent can still advance past it to a valid sibling.
+				frame.reader.Close()
 				readers = readers[:len(readers)-1]
 				part = nil
 				continue
 			}
-			if err != nil && !message.IsUnknownCharset(err) {
-				break // malformed part: retain any HTML already collected
-			}
+			parentMediaType = frame.mediaType
 		}
 		current := part
 		part = nil
+		partsRead++
 		disposition, _, _ := current.Header.ContentDisposition()
-		if disposition == "attachment" {
+		// RFC 2183 §2.8 assigns attachment semantics to unknown dispositions.
+		// Fail closed on malformed values too, while retaining a usable inline
+		// type when only its parameters were malformed.
+		if current.Header.Get("Content-Disposition") != "" && !strings.EqualFold(disposition, "inline") {
 			continue
 		}
-		mediaType, _, err := current.Header.ContentType()
-		if err != nil {
-			continue
+		// go-message returns a usable type alongside malformed-parameter errors.
+		mediaType, _, _ := current.Header.ContentType()
+		if parentMediaType == "multipart/digest" && current.Header.Get("Content-Type") == "" {
+			// RFC 2046 §5.1.5 changes the default for direct digest children.
+			mediaType = "message/rfc822"
 		}
 		if mediaType == "multipart/encrypted" {
 			continue
@@ -99,12 +114,20 @@ func MessagePreview(r io.Reader) (preview string) {
 		if strings.HasPrefix(mediaType, "multipart/") {
 			if len(readers) < previewMaxMIMEDepth {
 				if mr := current.MultipartReader(); mr != nil {
-					readers = append(readers, mr)
+					readers = append(readers, multipartFrame{reader: mr, mediaType: mediaType})
 				}
 			}
 			// NextPart discards a skipped subtree as raw bytes, so it neither
 			// allocates descendant parsers nor visits attachment contents.
 			continue
+		}
+		// Check leaf coding independently of the parser warning: an unknown
+		// charset can overwrite its earlier unknown-encoding error. Multipart
+		// transfer codings remain ignored, matching go-message's MIME quirk.
+		switch strings.ToLower(current.Header.Get("Content-Transfer-Encoding")) {
+		case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
+		default:
+			continue // undecoded bytes must never be shown as text
 		}
 		switch mediaType {
 		case "text/plain":
@@ -124,7 +147,11 @@ func MessagePreview(r io.Reader) (preview string) {
 		}
 	}
 	if haveHTML {
-		return previewFromText(previewHTMLText(html))
+		text := previewHTMLText(html)
+		if isPGPMessage(text) {
+			return ""
+		}
+		return previewFromText(text)
 	}
 	return ""
 }

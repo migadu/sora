@@ -866,9 +866,9 @@ type ServerLimitsConfig struct {
 	SessionMemoryLimit    string `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
 	MaxAuthErrors         int    `toml:"max_auth_errors,omitempty"`           // Maximum authentication errors before disconnection (default: 2)
 	PreviewS3PerMin       *int   `toml:"preview_s3_per_min,omitempty"`        // S3 downloads per account per minute to answer FETCH PREVIEW without LAZY (IMAP backend only, 0=unlimited, default: 300)
-	PreviewS3Burst        *int   `toml:"preview_s3_burst,omitempty"`          // Of those, how many may run back to back (default: 200)
+	PreviewS3Burst        *int   `toml:"preview_s3_burst,omitempty"`          // Of those, how many may run back to back (default: min(200, positive per-minute limit))
 	PreviewS3NodePerMin   *int   `toml:"preview_s3_node_per_min,omitempty"`   // The same downloads for the whole server per minute (0=unlimited, default: 3000)
-	PreviewS3MaxSize      string `toml:"preview_s3_max_size,omitempty"`       // Largest message downloaded for a preview (default: [local_cache] max_object_size)
+	PreviewS3MaxSize      string `toml:"preview_s3_max_size,omitempty"`       // Largest message downloaded for a preview (unset or 0: [local_cache] max_object_size)
 }
 
 // ServerTimeoutsConfig holds timeout settings for a server
@@ -1717,9 +1717,13 @@ func (s *ServerConfig) GetPreviewS3PerMin() int {
 }
 
 // GetPreviewS3Burst returns how many of those downloads may run back to back.
+// Unless explicitly configured, it is at most one minute's positive budget.
 func (s *ServerConfig) GetPreviewS3Burst() int {
 	if s.Limits != nil && s.Limits.PreviewS3Burst != nil && *s.Limits.PreviewS3Burst > 0 {
 		return *s.Limits.PreviewS3Burst
+	}
+	if perMin := s.GetPreviewS3PerMin(); perMin > 0 && perMin < 200 {
+		return perMin
 	}
 	return 200
 }
@@ -1734,10 +1738,16 @@ func (s *ServerConfig) GetPreviewS3NodePerMin() int {
 }
 
 // GetPreviewS3MaxSize returns the largest message downloaded for a preview, or
-// defaultSize (the body cache's max_object_size) when unset.
+// defaultSize (the body cache's max_object_size) when unset or zero.
 func (s *ServerConfig) GetPreviewS3MaxSize(defaultSize int64) (int64, error) {
 	if s.Limits != nil && s.Limits.PreviewS3MaxSize != "" {
-		return helpers.ParseSize(s.Limits.PreviewS3MaxSize)
+		maxSize, err := helpers.ParseSize(s.Limits.PreviewS3MaxSize)
+		if err != nil {
+			return 0, err
+		}
+		if maxSize > 0 {
+			return maxSize, nil
+		}
 	}
 	return defaultSize, nil
 }

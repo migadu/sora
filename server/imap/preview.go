@@ -5,6 +5,7 @@ import (
 	"container/list"
 	"context"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,8 +66,8 @@ const (
 	// generates from local files; past it the answer is NIL, which LAZY allows.
 	previewLazyLocalMax = 200
 	// previewMemReserve is charged to the session memory budget while a preview
-	// is parsed from a local file: the header block (at most 1 MiB in
-	// go-message) plus the parts read.
+	// is parsed from a local file: bounded headers, MIME parser buffers, and the
+	// selected text or HTML part (see helpers/preview_input.go).
 	previewMemReserve = 2 << 20
 	// previewMemoBytes bounds the in-memory preview cache.
 	previewMemoBytes = 16 << 20
@@ -80,6 +81,7 @@ type previewState struct {
 	accountLimit *serverPkg.SearchRateLimiter
 	nodeLimit    *serverPkg.SearchRateLimiter
 	s3MaxSize    int64
+	closeOnce    sync.Once
 }
 
 func newPreviewState(options PreviewOptions) *previewState {
@@ -92,6 +94,15 @@ func newPreviewState(options PreviewOptions) *previewState {
 		accountLimit: serverPkg.NewCommandRateLimiter("IMAP", "", options.S3PerMin, time.Minute, options.S3Burst),
 		nodeLimit:    serverPkg.NewCommandRateLimiter("IMAP", "", options.S3NodePerMin, time.Minute, 0),
 		s3MaxSize:    maxSize,
+	}
+}
+
+func (p *previewState) close() {
+	if p != nil {
+		p.closeOnce.Do(func() {
+			p.accountLimit.Stop()
+			p.nodeLimit.Stop()
+		})
 	}
 }
 
@@ -144,12 +155,18 @@ func (s *IMAPSession) findPreview(ctx context.Context, msg *db.Message, lazy boo
 	}
 
 	if !lazy || run.lazyLocalLeft > 0 {
-		if text, ok := s.localPreview(msg); ok {
+		text, state := s.localPreview(msg)
+		switch state {
+		case previewLocalFound:
 			if lazy {
 				run.lazyLocalLeft--
 			}
 			p.memo.put(msg.ContentHash, text)
 			return text, true, "local"
+		case previewLocalLimited:
+			// The body is already here. A memory refusal must not turn a
+			// cheap local preview into a redundant S3 download.
+			return "", !lazy, "limited"
 		}
 	}
 	if lazy {
@@ -159,20 +176,28 @@ func (s *IMAPSession) findPreview(ctx context.Context, msg *db.Message, lazy boo
 	return s.storagePreview(ctx, msg, run, bodyData, bodyDataFetched)
 }
 
+type previewLocalState uint8
+
+const (
+	previewLocalMiss previewLocalState = iota
+	previewLocalFound
+	previewLocalLimited
+)
+
 // localPreview generates a preview from a copy of the body on this node, if
 // there is a whole one.
-func (s *IMAPSession) localPreview(msg *db.Message) (string, bool) {
+func (s *IMAPSession) localPreview(msg *db.Message) (string, previewLocalState) {
 	if s.server.cache != nil {
-		if text, ok := s.previewFromFile(s.server.cache.GetPathForContentHash(msg.ContentHash), msg.Size); ok {
-			return text, true
+		if text, state := s.previewFromFile(s.server.cache.GetPathForContentHash(msg.ContentHash), msg.Size); state != previewLocalMiss {
+			return text, state
 		}
 	}
 	if s.server.uploader != nil {
-		if text, ok := s.previewFromFile(s.server.uploader.FilePath(msg.ContentHash, msg.AccountID), msg.Size); ok {
-			return text, true
+		if text, state := s.previewFromFile(s.server.uploader.FilePath(msg.ContentHash, msg.AccountID), msg.Size); state != previewLocalMiss {
+			return text, state
 		}
 	}
-	return "", false
+	return "", previewLocalMiss
 }
 
 // previewFromFile parses a preview from a local copy of a body. The file is
@@ -180,23 +205,26 @@ func (s *IMAPSession) localPreview(msg *db.Message) (string, bool) {
 // as a cache hit or miss nor refreshes the entry; a file whose size disagrees
 // with the message is a leftover of an interrupted write and is ignored, as
 // loadMessageBody ignores it.
-func (s *IMAPSession) previewFromFile(path string, size int) (string, bool) {
+func (s *IMAPSession) previewFromFile(path string, size int) (string, previewLocalState) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", false
+		return "", previewLocalMiss
 	}
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil || !fi.Mode().IsRegular() || !bodyLenMatches(fi.Size(), size) {
-		return "", false
+		return "", previewLocalMiss
+	}
+	if !s.memoryAvailable(previewMemReserve) {
+		return "", previewLocalLimited
 	}
 	if s.memTracker != nil {
 		if err := s.memTracker.Allocate(previewMemReserve); err != nil {
-			return "", false
+			return "", previewLocalLimited
 		}
 		defer s.memTracker.Free(previewMemReserve)
 	}
-	return helpers.MessagePreview(f), true
+	return helpers.MessagePreview(f), previewLocalFound
 }
 
 // storagePreview downloads the body from S3 to answer PREVIEW without LAZY.
@@ -207,13 +235,18 @@ func (s *IMAPSession) storagePreview(ctx context.Context, msg *db.Message, run *
 		// download, and waiting for the upload is not worth a FETCH's time.
 		return "", true, "unavailable"
 	}
+	if msg.Size <= 0 {
+		// The normal loader accepts legacy rows without a recorded size, but
+		// a preview must know the read fits its download and memory budgets.
+		return "", true, "unavailable"
+	}
 	if int64(msg.Size) > p.s3MaxSize {
 		return "", true, "too_large"
 	}
-	if p.accountLimit.CanSearch(ctx, s.AccountID()) != nil || p.nodeLimit.CanSearch(ctx, previewNodeKey) != nil {
+	if !s.memoryAvailable(int64(msg.Size)) {
 		return "", true, "limited"
 	}
-	if msg.Size > 0 && !s.memoryAvailable(int64(msg.Size)) {
+	if p.accountLimit.CanSearch(ctx, s.AccountID()) != nil || p.nodeLimit.CanSearch(ctx, previewNodeKey) != nil {
 		return "", true, "limited"
 	}
 
@@ -283,11 +316,13 @@ func (m *previewMemo) put(hash, text string) {
 	if el, ok := m.entries[hash]; ok {
 		e := el.Value.(*previewMemoEntry)
 		m.bytes += len(text) - len(e.text)
-		e.text = text
+		e.text = strings.Clone(text)
 		m.order.MoveToFront(el)
 	} else {
-		e := &previewMemoEntry{hash: hash, text: text}
-		m.entries[hash] = m.order.PushFront(e)
+		// Both strings may be slices of larger buffers. Own exactly the bytes
+		// charged below, including the map key, rather than retain a body.
+		e := &previewMemoEntry{hash: strings.Clone(hash), text: strings.Clone(text)}
+		m.entries[e.hash] = m.order.PushFront(e)
 		m.bytes += e.size()
 	}
 	for m.bytes > m.maxBytes && m.order.Len() > 0 {

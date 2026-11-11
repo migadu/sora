@@ -284,6 +284,10 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	}
 
 	cb := func(messages []db.Message) error {
+		if err := ctx.Err(); err != nil {
+			writeErr = err
+			return err
+		}
 		// CONDSTORE functionality - only process if capability is enabled
 		if s.GetCapabilities().Has(imap.CapCondStore) && options.ChangedSince > 0 {
 			s.DebugLog("CONDSTORE FETCH with CHANGEDSINCE", "changed_since", options.ChangedSince)
@@ -356,6 +360,10 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 
 		for _, msg := range messages {
+			if err := ctx.Err(); err != nil {
+				writeErr = err
+				return err
+			}
 			totalBytesFetched += int64(msg.Size)
 			metrics.MessageThroughput.WithLabelValues("imap", "fetched", "success").Inc()
 			if s.IMAPUser != nil {
@@ -390,7 +398,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 
 // writeMessageFetchData handles writing all FETCH data items for a single message.
 // preview is the command's PREVIEW state, nil unless PREVIEW was requested.
-func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, preview *previewRun) error {
+func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, preview *previewRun) (retErr error) {
 	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
 
 	// ARCHITECTURE DECISION: Use database sequence numbers directly, not sessionTracker.EncodeSeqNum().
@@ -429,10 +437,15 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		// This indicates an issue with the imapserver library or FetchWriter.
 		return fmt.Errorf("imapserver: FetchWriter.CreateMessage returned nil for seq %d (UID %d)", seqNum, msg.UID)
 	}
-	// Ensure m.Close() is called for this message, even if errors occur mid-processing.
+	// Metadata and PREVIEW may remain buffered until Close. Propagate a failed
+	// flush so the caller stops streaming bodies into a disconnected client.
+	// An earlier handler error still takes precedence over the close error.
 	defer func() {
 		if closeErr := m.Close(); closeErr != nil {
 			s.DebugLog("error closing FetchResponseWriter", "uid", msg.UID, "seq", seqNum, "error", closeErr)
+			if retErr == nil {
+				retErr = closeErr
+			}
 		}
 	}()
 

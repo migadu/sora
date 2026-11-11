@@ -704,10 +704,16 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// PREVIEW is opt-in: answering it for mail that is not on this node costs an
 	// S3 download per message. Like every capability it can still be removed
 	// per client (client_filters) or below (disabled_caps).
-	s.preview = newPreviewState(options.Preview)
 	if options.Preview.Enabled {
+		s.preview = newPreviewState(options.Preview)
 		s.caps[imap.CapPreview] = struct{}{}
 	}
+	previewReady := false
+	defer func() {
+		if !previewReady {
+			s.preview.close()
+		}
+	}()
 
 	// Remove globally disabled capabilities from the server
 	if len(options.DisabledCaps) > 0 {
@@ -888,6 +894,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		s.startWarmupWorkers()
 	}
 
+	previewReady = true
 	return s, nil
 }
 
@@ -1203,6 +1210,8 @@ func (s *IMAPServer) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 }
 
 func (s *IMAPServer) Close() {
+	s.preview.close()
+
 	// Unregister rate limiter from global registry
 	serverPkg.UnregisterRateLimiter("imap", s.name)
 

@@ -61,6 +61,107 @@ func TestPreviewHTMLTextBounds(t *testing.T) {
 	})
 }
 
+func TestMessagePreviewHTMLPreformatted(t *testing.T) {
+	for _, tc := range []struct {
+		name, html, want string
+	}{
+		{
+			name: "bottom-posted reply after a long quote",
+			html: "<pre>&gt; Earlier proposal: " + strings.Repeat("Please read the old proposal carefully. ", 10) +
+				"\n\nNew reply: Reject the old proposal; use the revised budget instead.</pre>",
+			want: "New reply: Reject the old proposal; use the revised budget instead.",
+		},
+		{
+			name: "quote and reply across inline markup",
+			html: "<pre>&gt; Quoted <b>old mail</b>\n\nNew <i>reply</i> here.</pre>",
+			want: "New reply here.",
+		},
+		{
+			name: "signature delimiter",
+			html: "<pre>Actual message.\n\n-- \nAlice\nPrivate signature</pre>",
+			want: "Actual message.",
+		},
+		{
+			name: "signature across token boundaries",
+			html: "<pre>Actual message.<span>\r\n</span>-- <b>\r\n</b>Alice</pre>",
+			want: "Actual message.",
+		},
+		{
+			name: "CRLF normalization",
+			html: "<PRE>&gt; Earlier proposal\r\n\r\nApproved budget.</PRE>",
+			want: "Approved budget.",
+		},
+		{
+			name: "encoded CRLF",
+			html: "<pre>&gt; Earlier proposal&#13;&#10;New reply.</pre>",
+			want: "New reply.",
+		},
+		{
+			name: "preformatted blockquote does not swallow following reply",
+			html: "<blockquote><pre>Earlier proposal\nOlder detail</pre></blockquote><pre>New reply.</pre>",
+			want: "New reply.",
+		},
+		{
+			name: "hidden text inside preformatted content",
+			html: "<pre>&gt; Earlier proposal\n<script>Not message text</script>New reply.</pre>",
+			want: "New reply.",
+		},
+		{
+			name: "ordinary HTML whitespace remains collapsed",
+			html: "<p>&gt; Earlier\nproposal</p><p>New\nreply.</p>",
+			want: "New reply.",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := "Content-Type: text/html; charset=utf-8\r\n\r\n" + tc.html
+			if got := MessagePreview(strings.NewReader(msg)); got != tc.want {
+				t.Errorf("MessagePreview() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPreviewHTMLImplicitHeadEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name, html, want string
+	}{
+		{"paragraph", `<head><meta charset=utf-8><p>Hello</p>`, "Hello"},
+		{"plain text", `<head><title>Subject</title>Hello`, "Hello"},
+		{"table", `<head><style>p{}</style><table><tr><td>Hello</td></tr></table>`, "Hello"},
+		{"head template remains hidden", `<head><template><p>Hidden template text</p></template><p>Hello</p>`, "Hello"},
+		{"head script remains hidden", `<head><script>"<p>Hidden script text</p>"</script><p>Hello</p>`, "Hello"},
+		{"nested non-void self-closing template", `<template><template/>Inner</template><p>Still hidden</p></template><p>Hello</p>`, "Hello"},
+		{"unclosed outer template remains hidden", `<template><template/>Inner</template><p>Still hidden</p>`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := previewFromText(previewHTMLText(tc.html)); got != tc.want {
+				t.Errorf("HTML preview = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMessagePreviewHTMLUTF8Cutoff(t *testing.T) {
+	for _, char := range []string{"é", "€", "🙂"} {
+		for retained := 1; retained <= len(char); retained++ {
+			t.Run(fmt.Sprintf("%U/%d_bytes", []rune(char)[0], retained), func(t *testing.T) {
+				const beforePadding = "<head><style>"
+				const afterPadding = "</style></head><body>Hello "
+				padding := previewMaxHTML - retained - len(beforePadding) - len(afterPadding)
+				html := beforePadding + strings.Repeat(" ", padding) + afterPadding + char + "</body>"
+				msg := "Content-Type: text/html; charset=utf-8\r\n\r\n" + html
+				want := "Hello"
+				if retained == len(char) {
+					want += " " + char
+				}
+				if got := MessagePreview(strings.NewReader(msg)); got != want {
+					t.Errorf("MessagePreview() = %q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
 // The old converter repeatedly rescanned a growing tag for every '>' in this
 // message, spending tens of seconds on 256 KiB. Run the full MIME path in a
 // subprocess so a regression cannot occupy the test process indefinitely. The

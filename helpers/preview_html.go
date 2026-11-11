@@ -1,6 +1,7 @@
 package helpers
 
 import (
+	"bytes"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -12,8 +13,18 @@ import (
 // consumes each token once, including malformed markup, and both its input and
 // the resulting text are bounded independently of the message's size.
 func previewHTMLText(source string) string {
-	if len(source) > previewMaxHTML {
+	if len(source) >= previewMaxHTML {
 		source = source[:previewMaxHTML]
+		// MessagePreview may already have cut the part at this byte limit.
+		// Drop a final incomplete rune instead of manufacturing replacement
+		// characters for bytes that belong to the unread part of the message.
+		start := len(source) - 1
+		for start > 0 && len(source)-start < utf8.UTFMax && !utf8.RuneStart(source[start]) {
+			start--
+		}
+		if !utf8.FullRuneInString(source[start:]) {
+			source = source[:start]
+		}
 	}
 	z := html.NewTokenizer(strings.NewReader(source))
 	// SetMaxBuf rejects a token when its size reaches the limit. Allow the
@@ -22,7 +33,8 @@ func previewHTMLText(source string) string {
 
 	var out previewHTMLWriter
 	var hidden string
-	hiddenDepth, quoteDepth := 0, 0
+	hiddenDepth, quoteDepth, preDepth := 0, 0, 0
+	inHead := false
 	for !out.full {
 		token := z.Next()
 		switch token {
@@ -30,39 +42,75 @@ func previewHTMLText(source string) string {
 			return string(out.text)
 		case html.TextToken:
 			if hidden == "" {
-				out.writeText(z.Text(), quoteDepth > 0)
+				text := z.Text()
+				if inHead {
+					if len(bytes.Trim(text, " \t\r\n\f")) == 0 {
+						continue
+					}
+					inHead = false // non-whitespace text implicitly starts the body
+				}
+				out.writeText(text, quoteDepth > 0, preDepth > 0)
 			}
 		case html.StartTagToken, html.SelfClosingTagToken, html.EndTagToken:
 			name, _ := z.TagName()
 			tag := string(name)
 			closing := token == html.EndTagToken
 			if hidden != "" {
-				// A missing </head> must not hide the document's body.
-				if hidden == "head" && tag == "body" && !closing {
-					hidden, hiddenDepth = "", 0
-				} else {
-					if tag == hidden {
-						if closing {
-							hiddenDepth--
-						} else {
-							hiddenDepth++
-						}
-						if hiddenDepth == 0 {
-							hidden = ""
-							out.space()
-						}
+				if tag == hidden {
+					if closing {
+						hiddenDepth--
+					} else {
+						hiddenDepth++
 					}
-					continue
+					if hiddenDepth == 0 {
+						hidden = ""
+						out.space()
+					}
+				}
+				continue
+			}
+			if tag == "head" {
+				inHead = !closing
+				continue
+			}
+			if inHead {
+				if closing {
+					if tag != "body" && tag != "html" && tag != "br" {
+						continue
+					}
+					inHead = false
+				} else if !previewHTMLHeadTag(tag) {
+					// A body element implicitly closes head, even when both
+					// </head> and <body> are omitted. Hidden head children are
+					// tracked separately so their markup cannot start the body.
+					inHead = false
 				}
 			}
 			if !closing {
 				switch tag {
-				case "head", "script", "style", "title", "template":
+				case "script", "style", "title", "template":
 					out.space()
 					// These are non-void HTML elements: a trailing slash on
 					// their start tag does not make their content visible.
 					hidden, hiddenDepth = tag, 1
 					continue
+				case "noscript", "noframes":
+					if inHead {
+						hidden, hiddenDepth = tag, 1
+						continue
+					}
+				}
+			}
+			if inHead {
+				continue
+			}
+			if tag == "pre" {
+				if closing {
+					if preDepth > 0 {
+						preDepth--
+					}
+				} else {
+					preDepth++
 				}
 			}
 			if tag == "blockquote" {
@@ -80,6 +128,14 @@ func previewHTMLText(source string) string {
 		}
 	}
 	return string(out.text)
+}
+
+func previewHTMLHeadTag(tag string) bool {
+	switch tag {
+	case "html", "base", "basefont", "bgsound", "link", "meta", "title", "noscript", "noframes", "script", "style", "template":
+		return true
+	}
+	return false
 }
 
 func previewHTMLBlockTag(tag string) bool {
@@ -121,10 +177,16 @@ func (w *previewHTMLWriter) lineBreak() {
 	}
 }
 
-func (w *previewHTMLWriter) writeText(text []byte, quoted bool) {
+func (w *previewHTMLWriter) writeText(text []byte, quoted, preformatted bool) {
 	for len(text) > 0 && !w.full {
 		r, size := utf8.DecodeRune(text)
 		text = text[size:]
+		if preformatted && (r == '\r' || r == '\n') {
+			// Keep line boundaries until previewFromText has removed quoted
+			// lines and signatures. HTML entities may decode to CR as well as LF.
+			w.lineBreak()
+			continue
+		}
 		if unicode.IsSpace(r) {
 			w.space()
 			continue

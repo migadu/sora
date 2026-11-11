@@ -35,6 +35,23 @@ type FakeS3 struct {
 	hangGets    bool                // when set, GET holds the connection open until the client gives up
 	failDeletes bool                // when set, every delete is refused with AccessDenied
 	onDelete    func(keys []string) // called before a delete is applied, outside the lock
+	onGet       func(key string)    // called before a GET responds, outside the lock
+	getCount    int
+}
+
+// OnGet registers fn to run before each GET response, outside the object lock.
+// Tests may use it to coordinate a body fetch with a disconnect. nil clears it.
+func (f *FakeS3) OnGet(fn func(key string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onGet = fn
+}
+
+// GetCount returns the number of GET requests received, including failed GETs.
+func (f *FakeS3) GetCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getCount
 }
 
 // HangGets makes every GET block until the requesting client disconnects, simulating a
@@ -146,7 +163,12 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		data, ok := f.objects[key]
 		hang := f.hangGets
+		hook := f.onGet
+		f.getCount++
 		f.mu.Unlock()
+		if hook != nil {
+			hook(key)
+		}
 		if hang {
 			<-r.Context().Done()
 			return

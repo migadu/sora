@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/db"
@@ -43,7 +44,7 @@ func newPreviewTestSession(t *testing.T, options PreviewOptions) *IMAPSession {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &IMAPSession{
+	s := &IMAPSession{
 		server: &IMAPServer{
 			cache:   c,
 			s3:      resilient.NewResilientS3Storage(&storage.S3Storage{}),
@@ -52,6 +53,8 @@ func newPreviewTestSession(t *testing.T, options PreviewOptions) *IMAPSession {
 		IMAPUser:   NewIMAPUser(addr, 7),
 		memTracker: serverPkg.NewSessionMemoryTracker(64 << 20),
 	}
+	t.Cleanup(s.server.preview.close)
+	return s
 }
 
 func previewTestMessage(uploaded bool) *db.Message {
@@ -260,22 +263,22 @@ func TestPreviewFromFileReleasesItsReservation(t *testing.T) {
 	if err := os.WriteFile(path, []byte(previewTestBody), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if text, ok := s.previewFromFile(path, len(previewTestBody)); !ok || text != "Lunch at noon?" {
-		t.Errorf("previewFromFile() = %q, %v", text, ok)
+	if text, state := s.previewFromFile(path, len(previewTestBody)); state != previewLocalFound || text != "Lunch at noon?" {
+		t.Errorf("previewFromFile() = %q, %v", text, state)
 	}
 	if n := s.memTracker.Current(); n != 0 {
 		t.Errorf("session memory still charged %d bytes", n)
 	}
-	if _, ok := s.previewFromFile(path, len(previewTestBody)+1); ok {
+	if _, state := s.previewFromFile(path, len(previewTestBody)+1); state != previewLocalMiss {
 		t.Errorf("a file of the wrong size was used")
 	}
-	if _, ok := s.previewFromFile(filepath.Dir(path), 0); ok {
+	if _, state := s.previewFromFile(filepath.Dir(path), 0); state != previewLocalMiss {
 		t.Errorf("a directory was used")
 	}
 
 	tight := newPreviewTestSession(t, PreviewOptions{Enabled: true})
 	tight.memTracker = serverPkg.NewSessionMemoryTracker(previewMemReserve - 1)
-	if _, ok := tight.previewFromFile(path, len(previewTestBody)); ok {
+	if _, state := tight.previewFromFile(path, len(previewTestBody)); state != previewLocalLimited {
 		t.Errorf("a preview was parsed beyond the session memory budget")
 	}
 }
@@ -301,5 +304,126 @@ func TestPreviewMemoIsBoundedByBytes(t *testing.T) {
 	}
 	if m.bytes > m.maxBytes {
 		t.Errorf("memo holds %d bytes, over its %d", m.bytes, m.maxBytes)
+	}
+}
+
+func TestPreviewMemoOwnsStoredStrings(t *testing.T) {
+	for _, update := range []bool{false, true} {
+		name := "insert"
+		if update {
+			name = "update"
+		}
+		t.Run(name, func(t *testing.T) {
+			m := previewMemo{maxBytes: previewMemoBytes}
+			if update {
+				m.put(strings.Repeat("a", 64), "Old preview")
+			}
+			// Short strings can be slices of much larger message buffers. The
+			// memo must not retain those buffers while charging just len(text).
+			textSource := strings.Repeat(" ", 64<<10) + "Hello"
+			text := textSource[len(textSource)-5:]
+			hashSource := strings.Repeat(" ", 64<<10) + strings.Repeat("a", 64)
+			hash := hashSource[len(hashSource)-64:]
+			m.put(hash, text)
+
+			got, ok := m.get(hash)
+			if !ok || got != "Hello" {
+				t.Fatalf("memo = %q, %v, want Hello", got, ok)
+			}
+			// Comparing data pointers deterministically detects retained backing
+			// storage without relying on process-wide GC or heap measurements.
+			if unsafe.StringData(got) == unsafe.StringData(text) {
+				t.Error("memo preview retains the caller's large backing buffer")
+			}
+			e := m.entries[hash].Value.(*previewMemoEntry)
+			if unsafe.StringData(e.hash) == unsafe.StringData(hash) {
+				t.Error("memo hash retains the caller's large backing buffer")
+			}
+			for key := range m.entries {
+				if unsafe.StringData(key) == unsafe.StringData(hash) {
+					t.Error("memo map key retains the caller's large backing buffer")
+				}
+			}
+			if want := len(hash) + len(text) + previewMemoOverhead; m.bytes != want {
+				t.Errorf("accounted %d bytes, want %d", m.bytes, want)
+			}
+		})
+	}
+}
+
+func TestPreviewMemoryRefusalPreservesDownloadBudgets(t *testing.T) {
+	s := newPreviewTestSession(t, PreviewOptions{Enabled: true, S3PerMin: 1, S3Burst: 1, S3NodePerMin: 1})
+	msg := previewTestMessage(true)
+	s.memTracker = serverPkg.NewSessionMemoryTracker(int64(msg.Size))
+	if err := s.memTracker.Allocate(int64(msg.Size)); err != nil {
+		t.Fatal(err)
+	}
+	run := newPreviewRun()
+	if got, source := s.previewOnce(msg, false, run); got != (recordedPreview{"", true}) || source != "limited" || run.downloads != 0 {
+		t.Fatalf("memory refusal = %+v from %q after %d downloads", got, source, run.downloads)
+	}
+	s.memTracker.Free(int64(msg.Size))
+	// The stub fails actual GETs. Reaching that failure proves neither budget
+	// was spent by the earlier refusal that downloaded nothing.
+	if _, source := s.previewOnce(msg, false, run); source != "error" || run.downloads != 1 {
+		t.Fatalf("after memory release got %q with %d downloads, want an allowed GET", source, run.downloads)
+	}
+}
+
+func TestPreviewLocalMemoryReclaimsRetainedSection(t *testing.T) {
+	s := newPreviewTestSession(t, PreviewOptions{Enabled: true})
+	msg := previewTestMessage(true)
+	putCacheFile(t, s, msg.ContentHash, previewTestBody)
+	s.memTracker = serverPkg.NewSessionMemoryTracker(previewMemReserve)
+	section := []byte(strings.Repeat("x", 1024))
+	if err := s.memTracker.Allocate(int64(len(section))); err != nil {
+		t.Fatal(err)
+	}
+	if !s.retainBodySection("older section", section) {
+		t.Fatal("could not retain section")
+	}
+	t.Cleanup(s.releaseBodySectionCache)
+	if got, source := s.previewOnce(msg, true, newPreviewRun()); got != (recordedPreview{"Lunch at noon?", true}) || source != "local" {
+		t.Fatalf("got %+v from %q, want local preview after evicting retained section", got, source)
+	}
+	if s.cachedBodySection("older section") != nil || s.server.bodySectionCacheBytes.Load() != 0 || s.memTracker.Current() != 0 {
+		t.Fatal("retained body section or preview memory charge survived")
+	}
+}
+
+func TestPreviewLocalMemoryRefusalDoesNotDownload(t *testing.T) {
+	for _, lazy := range []bool{false, true} {
+		t.Run(map[bool]string{false: "without LAZY", true: "LAZY"}[lazy], func(t *testing.T) {
+			s := newPreviewTestSession(t, PreviewOptions{Enabled: true, S3PerMin: 1, S3Burst: 1, S3NodePerMin: 1})
+			msg := previewTestMessage(true)
+			putCacheFile(t, s, msg.ContentHash, previewTestBody)
+			s.memTracker = serverPkg.NewSessionMemoryTracker(previewMemReserve - 1)
+			run := newPreviewRun()
+			if got, source := s.previewOnce(msg, lazy, run); got != (recordedPreview{"", !lazy}) || source != "limited" || run.downloads != 0 {
+				t.Fatalf("got %+v from %q after %d downloads, want local memory refusal", got, source, run.downloads)
+			}
+			if _, ok := s.server.preview.memo.get(msg.ContentHash); ok {
+				t.Fatal("memory refusal was remembered as an empty preview")
+			}
+			if err := os.Remove(s.server.cache.GetPathForContentHash(msg.ContentHash)); err != nil {
+				t.Fatal(err)
+			}
+			s.memTracker = serverPkg.NewSessionMemoryTracker(64 << 20)
+			if _, source := s.previewOnce(msg, false, run); source != "error" || run.downloads != 1 {
+				t.Fatalf("local refusal spent download budgets: got %q after %d downloads", source, run.downloads)
+			}
+		})
+	}
+}
+
+func TestPreviewUnknownSizeIsNotDownloaded(t *testing.T) {
+	for _, size := range []int{0, -1} {
+		s := newPreviewTestSession(t, PreviewOptions{Enabled: true})
+		msg := previewTestMessage(true)
+		msg.Size = size
+		run := newPreviewRun()
+		if got, source := s.previewOnce(msg, false, run); got != (recordedPreview{"", true}) || source != "unavailable" || run.downloads != 0 {
+			t.Errorf("size %d: got %+v from %q after %d downloads, want no unbounded GET", size, got, source, run.downloads)
+		}
 	}
 }

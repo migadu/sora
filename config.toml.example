@@ -1087,6 +1087,9 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 #     or the upload staging spool) and is NIL otherwise, so it never reads from S3.
 #   - PREVIEW without LAZY downloads the body from S3 when it is not on this node,
 #     within the limits.preview_s3_* budgets below; past them the preview is empty.
+# Bodies still uploading on another node can also yield an empty non-LAZY preview.
+# Use LAZY for initial listings and NOTIFY MessageNew when unavailable previews should be retried.
+# Preview text is approximate and may change for the same message.
 # Off by default because once advertised every client may use it. Backend only, and the
 # proxy relays the backend's post-login CAPABILITY. Changes require a restart.
 # enable_preview = true
@@ -1162,9 +1165,9 @@ limits.search_rate_limit_window = "1m"   # Time window for search rate limiting 
 limits.thread_max_messages = 50000
 # S3 downloads made to answer FETCH PREVIEW without LAZY (only with enable_preview).
 # limits.preview_s3_per_min = 300        # Per account per minute (default: 300, 0 = unlimited).
-# limits.preview_s3_burst = 200          # Of those, back to back (default: 200).
+# limits.preview_s3_burst = 200          # Back to back (default: min(200, positive preview_s3_per_min)).
 # limits.preview_s3_node_per_min = 3000  # For the whole server per minute (default: 3000, 0 = unlimited).
-# limits.preview_s3_max_size = "5mb"     # Largest message downloaded (default: [local_cache] max_object_size).
+# limits.preview_s3_max_size = "5mb"     # Largest message downloaded (unset or 0: [local_cache] max_object_size).
 limits.redirect_rate_limit = 100         # Maximum SIEVE redirects per user (default: 100, set to 0 to disable).
 limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h").
 limits.max_redirect_hops = 2             # Max times one message may be redirected before suppression — mail-loop

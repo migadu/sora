@@ -5,8 +5,6 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
-
-	_ "github.com/emersion/go-message/charset"
 )
 
 func previewMessage(header, body string) string {
