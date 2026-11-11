@@ -271,7 +271,23 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 	var totalBytesFetched int64
 	var writeErr error
 
+	var preview *previewRun
+	if options.Preview != nil {
+		preview = newPreviewRun()
+		defer func() {
+			// RFC 8970 §8: log who makes the server generate previews. Only
+			// downloads are worth a line; the session log carries the user.
+			if preview.downloads > 0 {
+				s.InfoLog("FETCH PREVIEW downloaded message bodies", "count", preview.downloads)
+			}
+		}()
+	}
+
 	cb := func(messages []db.Message) error {
+		if err := ctx.Err(); err != nil {
+			writeErr = err
+			return err
+		}
 		// CONDSTORE functionality - only process if capability is enabled
 		if s.GetCapabilities().Has(imap.CapCondStore) && options.ChangedSince > 0 {
 			s.DebugLog("CONDSTORE FETCH with CHANGEDSINCE", "changed_since", options.ChangedSince)
@@ -344,12 +360,16 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 
 		for _, msg := range messages {
+			if err := ctx.Err(); err != nil {
+				writeErr = err
+				return err
+			}
 			totalBytesFetched += int64(msg.Size)
 			metrics.MessageThroughput.WithLabelValues("imap", "fetched", "success").Inc()
 			if s.IMAPUser != nil {
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
-			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID); err != nil {
+			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, preview); err != nil {
 				writeErr = err
 				return err
 			}
@@ -377,7 +397,8 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 }
 
 // writeMessageFetchData handles writing all FETCH data items for a single message.
-func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64) error {
+// preview is the command's PREVIEW state, nil unless PREVIEW was requested.
+func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, preview *previewRun) (retErr error) {
 	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
 
 	// ARCHITECTURE DECISION: Use database sequence numbers directly, not sessionTracker.EncodeSeqNum().
@@ -416,10 +437,15 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		// This indicates an issue with the imapserver library or FetchWriter.
 		return fmt.Errorf("imapserver: FetchWriter.CreateMessage returned nil for seq %d (UID %d)", seqNum, msg.UID)
 	}
-	// Ensure m.Close() is called for this message, even if errors occur mid-processing.
+	// Metadata and PREVIEW may remain buffered until Close. Propagate a failed
+	// flush so the caller stops streaming bodies into a disconnected client.
+	// An earlier handler error still takes precedence over the close error.
 	defer func() {
 		if closeErr := m.Close(); closeErr != nil {
 			s.DebugLog("error closing FetchResponseWriter", "uid", msg.UID, "seq", seqNum, "error", closeErr)
+			if retErr == nil {
+				retErr = closeErr
+			}
 		}
 	}()
 
@@ -503,6 +529,12 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 				s.DebugLog("BINARY section size requests ignored due to capability filtering")
 			}
 		}
+	}
+
+	// The parser accepted PREVIEW only if the session advertises it, so the
+	// request alone gates it here.
+	if options.Preview != nil && preview != nil {
+		s.writePreview(ctx, m, msg, options.Preview.Lazy, preview, &bodyData, &bodyDataFetched)
 	}
 
 	if s.GetCapabilities().Has(imap.CapCondStore) && options.ModSeq {

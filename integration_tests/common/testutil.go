@@ -201,6 +201,7 @@ type IMAPServerOpts struct {
 	// may create shared mailboxes and grant "anyone").
 	SharedMailboxes   *config.SharedMailboxesConfig
 	ThreadMaxMessages int
+	Preview           imap.PreviewOptions
 }
 
 func (ts *TestServer) Close() {
@@ -498,6 +499,13 @@ func setupIMAPServerWith(t *testing.T, rdb *resilient.ResilientDatabase, hostnam
 // to exercise the genuine S3 round-trip. Shared mailboxes are enabled.
 func SetupIMAPServerWithRealS3(t *testing.T) (*TestServer, TestAccount, *FakeS3) {
 	t.Helper()
+	return SetupIMAPServerWithRealS3Options(t, nil)
+}
+
+// SetupIMAPServerWithRealS3Options is SetupIMAPServerWithRealS3 with the server's
+// options passed through configure first, unless it is nil.
+func SetupIMAPServerWithRealS3Options(t *testing.T, configure func(*imap.IMAPServerOptions)) (*TestServer, TestAccount, *FakeS3) {
+	t.Helper()
 
 	rdb := SetupTestDatabase(t)
 	account := CreateTestAccount(t, rdb)
@@ -546,6 +554,13 @@ func SetupIMAPServerWithRealS3(t *testing.T) (*TestServer, TestAccount, *FakeS3)
 		},
 	}
 
+	options := imap.IMAPServerOptions{
+		InsecureAuth: true,
+		Config:       testConfig,
+	}
+	if configure != nil {
+		configure(&options)
+	}
 	server, err := imap.New(
 		context.Background(),
 		"test",
@@ -555,10 +570,7 @@ func SetupIMAPServerWithRealS3(t *testing.T) (*TestServer, TestAccount, *FakeS3)
 		rdb,
 		uploadWorker,
 		nil, // cache.Cache
-		imap.IMAPServerOptions{
-			InsecureAuth: true,
-			Config:       testConfig,
-		},
+		options,
 	)
 	if err != nil {
 		t.Fatalf("Failed to create IMAP server: %v", err)
@@ -906,6 +918,7 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 			SearchRateLimitWindow: opts.SearchRateLimitWindow,
 			SearchRateLimitBurst:  opts.SearchRateLimitBurst,
 			ThreadMaxMessages:     opts.ThreadMaxMessages,
+			Preview:               opts.Preview,
 		},
 	)
 	if err != nil {

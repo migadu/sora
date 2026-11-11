@@ -286,6 +286,9 @@ type IMAPServer struct {
 	searchRateLimiter *serverPkg.SearchRateLimiter
 	threadMaxMessages int // Startup-only, per-server cap on messages threaded in memory.
 
+	// FETCH PREVIEW: preview cache and download budgets (see preview.go).
+	preview *previewState
+
 	// Node-wide total of body-section bytes retained by sessions for <offset.size>
 	// chunk fetches (see body_section_cache.go).
 	bodySectionCacheBytes atomic.Int64
@@ -376,6 +379,7 @@ type IMAPServerOptions struct {
 	SearchRateLimitWindow time.Duration             // Search rate limit time window
 	SearchRateLimitBurst  int                       // Searches allowed back to back (0=SearchRateLimitPerMin)
 	ThreadMaxMessages     int                       // THREAD result cap (<=0 uses 50,000)
+	Preview               PreviewOptions            // FETCH PREVIEW (RFC 8970), off unless Enabled
 	SessionMemoryLimit    int64                     // Per-session memory limit in bytes (0=unlimited)
 	// Cache warmup configuration
 	EnableWarmup       bool
@@ -697,6 +701,20 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// Store the valid filters
 	s.capFilters = validFilters
 
+	// PREVIEW is opt-in: answering it for mail that is not on this node costs an
+	// S3 download per message. Like every capability it can still be removed
+	// per client (client_filters) or below (disabled_caps).
+	if options.Preview.Enabled {
+		s.preview = newPreviewState(options.Preview)
+		s.caps[imap.CapPreview] = struct{}{}
+	}
+	previewReady := false
+	defer func() {
+		if !previewReady {
+			s.preview.close()
+		}
+	}()
+
 	// Remove globally disabled capabilities from the server
 	if len(options.DisabledCaps) > 0 {
 		for _, capStr := range options.DisabledCaps {
@@ -876,6 +894,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		s.startWarmupWorkers()
 	}
 
+	previewReady = true
 	return s, nil
 }
 
@@ -1191,6 +1210,8 @@ func (s *IMAPServer) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 }
 
 func (s *IMAPServer) Close() {
+	s.preview.close()
+
 	// Unregister rate limiter from global registry
 	serverPkg.UnregisterRateLimiter("imap", s.name)
 
