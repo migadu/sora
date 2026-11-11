@@ -28,6 +28,7 @@ type Session struct {
 	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4 and username, which the TLS conn above it after STARTTLS does not
 	startTLSInProgress    bool                // Between the 220 to STARTTLS and the end of its handshake, under mu: the client reads neither plaintext nor, yet, TLS
 	backendConn           net.Conn            // Reassigned on backend connect/STARTTLS/error; writes must hold mu (same reason)
+	backendRoute          *proxy.BackendRoute // Authorization of the held socket; survives per-recipient routing and transaction resets
 	backendReader         *bufio.Reader
 	backendWriter         *bufio.Writer
 	clientReader          *bufio.Reader
@@ -384,6 +385,21 @@ func (s *Session) handleConnection() {
 				}
 			}
 
+			// A numeric destination may have changed pools while this socket stayed
+			// open. Keep its original authorization across MAIL/RSET and validate the
+			// actual peer before forwarding another recipient. Losing a socket that
+			// already accepted recipients poisons the whole transaction.
+			if s.backendConn != nil && s.backendRoute != nil {
+				if err := s.backendRoute.ValidatePoolDestination(s.backendConn.RemoteAddr().String()); err != nil {
+					s.InfoLog("dropping backend connection: route authorization changed", "backend", s.serverAddr, "error", err)
+					s.loseBackend()
+					if s.txPoisoned {
+						s.sendResponse("451 4.4.2 Backend route changed, please retry the transaction")
+						continue
+					}
+				}
+			}
+
 			// A session keeps its backend across transactions (an MTA may reuse its LMTP
 			// connection), so one held to a backend that has since gone into maintenance
 			// is dropped here, at the first recipient of a transaction: the backend holds
@@ -434,6 +450,29 @@ func (s *Session) handleConnection() {
 					continue
 				}
 				targetAddr := routeResult.PreferredAddr
+				// DetermineRoute can refresh DNS. Recheck the held socket after that
+				// refresh too, then compare immutable pool identities rather than
+				// accepting equal numeric addresses as proof of compatibility.
+				recipientPool := routeResult.Pool
+				if targetAddr != "" {
+					binding, err := s.server.connManager.BindRoutedBackend(routeResult.RoutingInfo, targetAddr)
+					if err != nil {
+						s.sendResponse("451 4.3.0 Backend route unavailable, please retry")
+						continue
+					}
+					recipientPool = binding.PoolName()
+				}
+				if s.backendRoute != nil {
+					if err := s.backendRoute.ValidatePoolDestination(s.backendConn.RemoteAddr().String()); err != nil {
+						s.loseBackend()
+						s.sendResponse("451 4.4.2 Backend route changed, please retry the transaction")
+						continue
+					}
+					if s.backendRoute.PoolName() != recipientPool {
+						s.sendResponse("451 4.3.0 Recipient requires different backend pool, start new transaction")
+						continue
+					}
+				}
 				// If a specific backend is required (targetAddr not empty) and it differs from
 				// the currently connected backend, we must reject this recipient.
 				// The client should retry this recipient in a separate transaction.
@@ -1107,6 +1146,13 @@ func (s *Session) connectToBackend() error {
 
 	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
+	var backendRoute *proxy.BackendRoute
+	if preferredAddr != "" {
+		backendRoute, err = s.server.connManager.BindRoutedBackend(s.routingInfo, preferredAddr)
+		if err != nil {
+			return fmt.Errorf("failed to bind backend route: %w", err)
+		}
+	}
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		s.ctx,
 		preferredAddr,
@@ -1127,10 +1173,25 @@ func (s *Session) connectToBackend() error {
 		return fmt.Errorf("remotelookup route to %s failed, and fallback is disabled for remotelookup routes", preferredAddr)
 	}
 
+	// With no preferred destination, round-robin selected the actual member.
+	// The route still carries its expected pool, so a post-dial ownership change
+	// fails closed instead of reclassifying this socket into another pool.
+	if backendRoute == nil {
+		backendRoute, err = s.server.connManager.BindRoutedBackend(s.routingInfo, actualAddr)
+	}
+	if err == nil {
+		err = backendRoute.ValidateDestination(backendConn.RemoteAddr().String())
+	}
+	if err != nil {
+		backendConn.Close()
+		return fmt.Errorf("backend route changed while connecting: %w", err)
+	}
+
 	// Track backend connection success
 	metrics.ProxyBackendConnections.WithLabelValues("lmtp", "success").Inc()
 	s.mu.Lock()
 	s.backendConn = backendConn
+	s.backendRoute = backendRoute
 	s.backendReader = bufio.NewReader(backendConn)
 	s.backendWriter = bufio.NewWriter(backendConn)
 	s.mu.Unlock()
@@ -1711,6 +1772,7 @@ func (s *Session) loseBackend() {
 		s.backendConn.Close()
 		s.backendConn = nil
 	}
+	s.backendRoute = nil
 	s.mu.Unlock()
 	if s.acceptedRcpts > 0 {
 		s.txPoisoned = true

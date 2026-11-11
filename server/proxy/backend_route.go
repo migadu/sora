@@ -125,6 +125,14 @@ func (r *BackendRoute) ValidateDestination(address string) error {
 	if cm.InMaintenance(address) {
 		return errBackendInMaintenance
 	}
+	return r.ValidatePoolDestination(address)
+}
+
+// ValidatePoolDestination rechecks only DNS ownership and pool collisions. A held
+// transaction may finish on a backend entering maintenance, but must never reuse
+// its connection after the destination changes pools.
+func (r *BackendRoute) ValidatePoolDestination(address string) error {
+	cm := r.manager
 	target := normalizeHostPort(address, cm.remotePort)
 	cm.healthMu.RLock()
 	defer cm.healthMu.RUnlock()
@@ -199,6 +207,13 @@ func (cm *ConnectionManager) GetTLSConfigForConn(addr string, conn net.Conn) *tl
 func (r *BackendRoute) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: r.manager.connectTimeout, Control: r.Control}
 	return dialer.DialContext(ctx, network, address)
+}
+
+// BindRoutedBackend captures the same authorization a routed dial will use. Callers
+// retaining a connection across requests must retain this binding as well: routing
+// info can be replaced by the next request and DNS can change a destination's owner.
+func (cm *ConnectionManager) BindRoutedBackend(info *UserRoutingInfo, addr string) (*BackendRoute, error) {
+	return cm.bindForDial(info, addr)
 }
 
 func (cm *ConnectionManager) bindForDial(info *UserRoutingInfo, addr string) (*BackendRoute, error) {
