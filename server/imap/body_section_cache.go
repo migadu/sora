@@ -3,7 +3,7 @@ package imap
 import (
 	"fmt"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 )
 
 // A session retains the last body section it fully extracted so that a client pulling

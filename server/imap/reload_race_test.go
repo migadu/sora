@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/metrics"

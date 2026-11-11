@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
 )
@@ -67,12 +68,12 @@ func (s *Service) Revoke(ctx context.Context, owner, mailboxName, identifier str
 	// if the current user has ACL access, so we need to verify ownership
 	mailbox, err := s.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, mailboxName)
 	if err != nil {
-		return fmt.Errorf("mailbox not found: %w", err)
+		return fmt.Errorf("mailbox %q: %w", mailboxName, err)
 	}
 
 	// Verify that the mailbox is actually owned by the specified owner
 	if mailbox.AccountID != ownerAccountID {
-		return fmt.Errorf("mailbox '%s' is not owned by %s", mailboxName, owner)
+		return fmt.Errorf("%w: '%s' is not owned by %s", consts.ErrMailboxNotFound, mailboxName, owner)
 	}
 
 	// Revoke access using identifier
@@ -102,12 +103,12 @@ func (s *Service) List(ctx context.Context, owner, mailboxName string) ([]ACLEnt
 	// if the current user has ACL access, so we need to verify ownership
 	mailbox, err := s.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, mailboxName)
 	if err != nil {
-		return nil, fmt.Errorf("mailbox not found: %w", err)
+		return nil, fmt.Errorf("mailbox %q: %w", mailboxName, err)
 	}
 
 	// Verify that the mailbox is actually owned by the specified owner
 	if mailbox.AccountID != ownerAccountID {
-		return nil, fmt.Errorf("mailbox '%s' is not owned by %s", mailboxName, owner)
+		return nil, fmt.Errorf("%w: '%s' is not owned by %s", consts.ErrMailboxNotFound, mailboxName, owner)
 	}
 
 	// Get ACLs from database

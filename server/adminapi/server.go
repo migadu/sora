@@ -85,6 +85,7 @@ type Server struct {
 	redirectRateWindow time.Duration                        // Window for redirect limit
 	maxRedirectHops    int                                  // Max redirect hops per message (mail-loop backstop)
 	sieveExtensions    []string                             // [sieve] enabled_extensions, shared with the LMTP path
+	sharedMailboxes    config.SharedMailboxesConfig         // [shared_mailboxes], which ACL grants honour
 
 	// Mail deliveries in flight, reported as this server's drain sessions, admitted by the
 	// maintenance gate, which refuses new ones while this backend is in maintenance.
@@ -128,7 +129,8 @@ type ServerOptions struct {
 	RedirectRateLimit  int
 	RedirectRateWindow time.Duration
 	MaxRedirectHops    int
-	SieveExtensions    []string // [sieve] enabled_extensions (empty = default set)
+	SieveExtensions    []string                     // [sieve] enabled_extensions (empty = default set)
+	SharedMailboxes    config.SharedMailboxesConfig // [shared_mailboxes]; allow_anyone_identifier gates ACL grants to "anyone"
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol               bool     // Enable PROXY protocol support for incoming connections
@@ -264,6 +266,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		redirectRateWindow: options.RedirectRateWindow,
 		maxRedirectHops:    options.MaxRedirectHops,
 		sieveExtensions:    sieveengine.EffectiveExtensions(options.SieveExtensions),
+		sharedMailboxes:    options.SharedMailboxes,
 	}
 	s.settings.Store(&reloadableSettings{
 		apiKey:       options.APIKey,
@@ -295,7 +298,9 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 			reloaded = append(reloaded, "api_key")
 		}
 	}
-	if len(cfg.AllowedHosts) > 0 {
+	// Reload receives the complete config, so an empty or removed list means what
+	// it does at startup: every host is allowed.
+	if !slices.Equal(cfg.AllowedHosts, next.allowedHosts) {
 		next.allowedHosts = slices.Clone(cfg.AllowedHosts)
 		reloaded = append(reloaded, "allowed_hosts")
 	}

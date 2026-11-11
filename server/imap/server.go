@@ -20,8 +20,8 @@ import (
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/server"
 
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
@@ -250,6 +250,7 @@ type IMAPServer struct {
 	appCtx         context.Context
 	caps           imap.CapSet
 	tlsConfig      *tls.Config
+	useStartTLS    bool // tlsConfig upgrades a plaintext listener on STARTTLS instead of wrapping it
 	masterUsername []byte
 	masterPassword []byte
 	appendLimit    int64
@@ -283,6 +284,7 @@ type IMAPServer struct {
 
 	// Search rate limiting
 	searchRateLimiter *serverPkg.SearchRateLimiter
+	threadMaxMessages int // Startup-only, per-server cap on messages threaded in memory.
 
 	// Node-wide total of body-section bytes retained by sessions for <offset.size>
 	// chunk fetches (see body_section_cache.go).
@@ -347,6 +349,8 @@ type IMAPServerOptions struct {
 	TLSCertFile                 string
 	TLSKeyFile                  string
 	TLSVerify                   bool
+	TLSUseStartTLS              bool        // Plaintext listener offering STARTTLS (RFC 9051 §6.2.1) instead of implicit TLS; requires TLS
+	TLSConfig                   *tls.Config // Global TLS config from TLS manager (optional)
 	MasterUsername              []byte
 	MasterPassword              []byte
 	MasterSASLUsername          []byte
@@ -371,6 +375,7 @@ type IMAPServerOptions struct {
 	SearchRateLimitPerMin int                       // Search rate limit (searches per minute, 0=disabled)
 	SearchRateLimitWindow time.Duration             // Search rate limit time window
 	SearchRateLimitBurst  int                       // Searches allowed back to back (0=SearchRateLimitPerMin)
+	ThreadMaxMessages     int                       // THREAD result cap (<=0 uses 50,000)
 	SessionMemoryLimit    int64                     // Per-session memory limit in bytes (0=unlimited)
 	// Cache warmup configuration
 	EnableWarmup       bool
@@ -402,7 +407,7 @@ type IMAPServerOptions struct {
 	AuthIdleTimeout         time.Duration            // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
 	CommandTimeout          time.Duration            // Maximum idle time before disconnection
 	CommandTimeoutOverrides map[string]time.Duration // Per-command hard execution timeouts (overrides defaults)
-	AbsoluteSessionTimeout  time.Duration            // Maximum total session duration (0 = use default 30m)
+	AbsoluteSessionTimeout  time.Duration            // Maximum total session duration (0 = no absolute limit)
 	MinBytesPerMinute       int64                    // Minimum throughput to prevent slowloris (0 = use default 512 bytes/min)
 	// Auth security
 	InsecureAuth bool // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
@@ -467,6 +472,10 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 	// Initialize search rate limiter
 	searchRateLimiter := serverPkg.NewSearchRateLimiter("IMAP", options.SearchRateLimitPerMin, options.SearchRateLimitWindow, options.SearchRateLimitBurst)
+	threadMaxMessages := options.ThreadMaxMessages
+	if threadMaxMessages <= 0 {
+		threadMaxMessages = config.DefaultThreadMaxMessages
+	}
 
 	// Initialize authentication cache from config
 	// Default to enabled if not explicitly configured
@@ -558,6 +567,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		hostname:                     hostname,
 		instanceID:                   imapInstanceIDOrHostname(options.InstanceID, hostname),
 		maintenanceGate:              options.MaintenanceGate,
+		useStartTLS:                  options.TLS && options.TLSUseStartTLS, // config warns when tls_use_starttls lacks tls
 		name:                         name,
 		appCtx:                       appCtx,
 		addr:                         imapAddr,
@@ -577,6 +587,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		metadataMaxTotalSize:         options.MetadataMaxTotalSize,
 		authLimiter:                  authLimiter,
 		searchRateLimiter:            searchRateLimiter,
+		threadMaxMessages:            threadMaxMessages,
 		proxyReader:                  proxyReader,
 		enableWarmup:                 options.EnableWarmup,
 		warmupMessageCount:           options.WarmupMessageCount,
@@ -752,8 +763,14 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// commands (notably MYRIGHTS) are functional on a user's own mailboxes
 	// regardless of whether shared mailboxes are configured.
 
-	// Setup TLS if TLS is enabled and certificate and key files are provided
-	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
+	// Setup TLS: the global [tls] manager's config when there is one, the
+	// per-server certificate files otherwise.
+	if options.TLS && options.TLSConfig != nil {
+		if options.TLSCertFile != "" || options.TLSKeyFile != "" {
+			logger.Warn("IMAP: tls_cert_file/tls_key_file ignored - global [tls] is enabled", "name", name)
+		}
+		s.tlsConfig = options.TLSConfig
+	} else if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		logger.Debug("IMAP: Loading TLS certificate", "name", name, "cert", options.TLSCertFile, "key", options.TLSKeyFile)
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
@@ -781,12 +798,23 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
 			logger.Debug("IMAP: WARNING - Client TLS certificate verification not enforced", "name", name)
 		}
+	} else if options.TLS {
+		// Without a certificate the listener would be plaintext on the port meant for TLS.
+		return nil, fmt.Errorf("TLS enabled for IMAP [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
 	}
 
 	var debugWriter io.Writer
 	if options.Debug {
 		// Wrap os.Stdout with our masking writer to redact passwords from debug logs
 		debugWriter = &maskingWriter{w: os.Stdout}
+	}
+
+	// go-imap offers STARTTLS whenever it has a TLS config and the connection
+	// is not a *tls.Conn, which an implicit-TLS connection under Sora's
+	// wrappers never is: hand it the config only for a STARTTLS listener.
+	var startTLSConfig *tls.Config
+	if s.tlsConfig != nil && s.useStartTLS {
+		startTLSConfig = serverPkg.StartTLSConfig(s.tlsConfig, "imap")
 	}
 
 	s.server = imapserver.New(&imapserver.Options{
@@ -797,10 +825,12 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		// SoraTLSConn -> *tls.Conn) to detect implicit TLS. Without it, go-imap's
 		// default `conn.(*tls.Conn)` assertion fails on our wrapped connections
 		// and rejects auth when insecure_auth=false even over a secure channel.
-		IsTLS:       serverPkg.ConnIsTLS,
-		DebugWriter: debugWriter,
-		Caps:        s.caps,
-		TLSConfig:   nil,
+		IsTLS:                  serverPkg.ConnIsTLS,
+		DebugWriter:            debugWriter,
+		Caps:                   s.caps,
+		TLSConfig:              startTLSConfig,
+		OnStartTLS:             serverPkg.BeginStartTLS,
+		OnTLSHandshakeComplete: serverPkg.CompleteStartTLS,
 	})
 
 	// Start connection limiter cleanup
@@ -1060,6 +1090,7 @@ func (s *IMAPServer) connConfig() serverPkg.SoraConnConfig {
 		Hostname:             s.hostname,
 		IdleTimeout:          settings.commandTimeout,
 		AbsoluteTimeout:      settings.absoluteSessionTimeout,
+		NoAbsoluteTimeout:    settings.absoluteSessionTimeout <= 0,
 		MinBytesPerMinute:    settings.minBytesPerMinute,
 		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0 || settings.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
@@ -1106,7 +1137,7 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 	// bytes (broken PROXY+TLS combo).
 	base := serverPkg.WrapProxyProtocol(tcpListener, s.proxyReader, "IMAP")
 
-	if s.tlsConfig != nil {
+	if s.tlsConfig != nil && !s.useStartTLS {
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
 		listener = serverPkg.NewSoraTLSListenerFunc(base, s.tlsConfig, s.connConfig)
 		if connConfig.EnableTimeoutChecker {
@@ -1117,10 +1148,11 @@ func (s *IMAPServer) Serve(imapAddr string) error {
 	} else {
 		// Use SoraListener for non-TLS with timeout protection
 		listener = serverPkg.NewSoraListenerFunc(base, s.connConfig)
+		starttls := s.tlsConfig != nil
 		if connConfig.EnableTimeoutChecker {
-			logger.Info("IMAP server listening", "name", s.name, "addr", imapAddr, "tls", false, "idle_timeout", connConfig.IdleTimeout, "session_max", connConfig.AbsoluteTimeout, "min_throughput", connConfig.MinBytesPerMinute)
+			logger.Info("IMAP server listening", "name", s.name, "addr", imapAddr, "tls", false, "starttls", starttls, "idle_timeout", connConfig.IdleTimeout, "session_max", connConfig.AbsoluteTimeout, "min_throughput", connConfig.MinBytesPerMinute)
 		} else {
-			logger.Info("IMAP server listening", "name", s.name, "addr", imapAddr, "tls", false)
+			logger.Info("IMAP server listening", "name", s.name, "addr", imapAddr, "tls", false, "starttls", starttls)
 		}
 	}
 	defer listener.Close()

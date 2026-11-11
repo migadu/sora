@@ -27,12 +27,17 @@ func (o *fakeVacationOracle) IsVacationResponseAllowed(_ context.Context, _ int6
 	return true, nil
 }
 
-func (o *fakeVacationOracle) RecordVacationResponseSent(_ context.Context, _ int64, originalSender string, _ string) error {
+func (o *fakeVacationOracle) ClaimVacationResponse(_ context.Context, _ int64, originalSender, _ string, _ time.Duration) (bool, error) {
 	if o.recordErr != nil {
-		return o.recordErr
+		return false, o.recordErr
+	}
+	for _, sender := range o.recorded {
+		if sender == originalSender {
+			return false, nil
+		}
 	}
 	o.recorded = append(o.recorded, originalSender)
-	return nil
+	return true, nil
 }
 
 func (o *fakeVacationOracle) CountRedirectsSince(_ context.Context, _ int64, _ time.Duration) (int, error) {

@@ -114,7 +114,7 @@ type HeaderEdit struct {
 type Result struct {
 	Action        Action
 	Mailbox       string            // used for fileinto
-	RedirectTo    string            // used for redirect
+	RedirectTo    []string          // used for redirect: every address to relay to, without repeats
 	Flags         []string          // flags to add to the message
 	Copy          bool              // RFC3894 - :copy modifier for redirect and fileinto
 	CreateMailbox bool              // RFC5490 - :create modifier (mailbox extension)
@@ -137,19 +137,18 @@ type Result struct {
 }
 
 // VacationReply is an RFC 5230 auto-reply a script decided to send, its :days window
-// for this sender already checked.
+// for this sender and response identity already checked.
 type VacationReply struct {
 	From    string // the :from address; delivery uses it only if the account owns it
 	Subject string
 	Body    string // the reason
 	IsMime  bool
 
-	// RecordSent commits the :days window for this sender. It is nil without a
-	// VacationOracle, and the delivery path must call it immediately before handing
-	// the reply to the relay: the mandatory §4.5 suppression checks run there and may
-	// still decide not to reply, while recording after the handoff would let a
-	// redelivery of the same message produce a second reply.
-	RecordSent func(ctx context.Context) error
+	// ClaimResponse atomically consumes the :days window for this sender and
+	// response identity. It is nil without a VacationOracle. Delivery calls it
+	// after suppression/MIME checks, immediately before relay handoff; false means
+	// another delivery already consumed the window and this reply must be skipped.
+	ClaimResponse func(ctx context.Context) (bool, error)
 }
 
 type Context struct {
@@ -172,12 +171,12 @@ type Context struct {
 // persistent storage for vacation response tracking.
 type VacationOracle interface {
 	// IsVacationResponseAllowed checks if a vacation response is allowed to be sent
-	// to the given originalSender for the specified user and handle,
+	// to the given originalSender for the specified user and response identity,
 	// considering the duration since the last response.
-	IsVacationResponseAllowed(ctx context.Context, AccountID int64, originalSender string, handle string, duration time.Duration) (bool, error)
-	// RecordVacationResponseSent records that a vacation response has been sent
-	// to the originalSender for the specified user and handle.
-	RecordVacationResponseSent(ctx context.Context, AccountID int64, originalSender string, handle string) error
+	IsVacationResponseAllowed(ctx context.Context, AccountID int64, originalSender string, responseIdentity string, duration time.Duration) (bool, error)
+	// ClaimVacationResponse atomically checks and consumes the suppression period.
+	// Unlike the evaluation-time check, this handoff-time decision is definitive.
+	ClaimVacationResponse(ctx context.Context, AccountID int64, originalSender, responseIdentity string, duration time.Duration) (bool, error)
 }
 
 // RedirectOracle defines the methods SievePolicy needs to interact with
@@ -368,10 +367,18 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 			}
 		}
 	} else if len(data.RedirectAddr) > 0 {
-		// Handle redirect action
-		// Use the first redirect address (we could support multiple redirects in the future)
+		// Handle redirect action. A script may redirect to several addresses
+		// (RFC 5228 §2.10.4); one named twice gets a single copy (§2.10.3).
 		result.Action = ActionRedirect
-		result.RedirectTo = data.RedirectAddr[0]
+		for _, addr := range data.RedirectAddr {
+			if !slices.Contains(result.RedirectTo, addr) {
+				result.RedirectTo = append(result.RedirectTo, addr)
+			}
+		}
+		// Charge the rate limit here, for the addresses delivery will relay to,
+		// and not as each redirect command runs: a redirect that fileinto took
+		// over or that a later script error undid is never sent.
+		execPolicy.recordRedirects(timeoutCtx, len(result.RedirectTo))
 
 		// Check if ImplicitKeep is true (means :copy was used) OR if Keep is true (explicit keep action)
 		// With normal redirect (no :copy), ImplicitKeep would be false, but an explicit keep
@@ -393,18 +400,21 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 	// VacationResponses by the envelope sender, so there is at most one, and it has
 	// already refused a vacation next to reject.
 	for sender, vacation := range data.VacationResponses {
-		duration := time.Duration(vacation.Days) * 24 * time.Hour
-		allowed, err := execPolicy.VacationResponseAllowed(timeoutCtx, data, sender, vacation.Handle, duration)
+		// RFC 5230 §4.1: clamp to the site's supported range before converting
+		// to time.Duration, which would overflow for large Sieve numbers.
+		days := max(1, min(vacation.Days, 365))
+		duration := time.Duration(days) * 24 * time.Hour
+		allowed, err := execPolicy.VacationResponseAllowed(timeoutCtx, data, sender, vacation.ResponseIdentity, duration)
 		if err != nil || !allowed {
 			// An oracle error must not fail the delivery; it costs this one reply.
 			break
 		}
 		result.Vacation = &VacationReply{
-			From:       vacation.From,
-			Subject:    vacation.Subject,
-			Body:       vacation.Body,
-			IsMime:     vacation.IsMime,
-			RecordSent: execPolicy.vacationRecorder(sender, vacation.Handle),
+			From:          vacation.From,
+			Subject:       vacation.Subject,
+			Body:          vacation.Body,
+			IsMime:        vacation.IsMime,
+			ClaimResponse: execPolicy.vacationClaimer(sender, vacation.ResponseIdentity, duration),
 		}
 		break
 	}
@@ -442,6 +452,11 @@ type SievePolicy struct {
 	redirectRateLimit  int
 	redirectRateWindow time.Duration
 	maxRedirectHops    int // mail-loop backstop; 0 = unlimited
+
+	// redirectsAllowed holds the distinct addresses this evaluation has let a
+	// redirect through to. They count against the rate limit as they
+	// accumulate, though nothing is recorded until the evaluation ends.
+	redirectsAllowed []string
 }
 
 func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData, addr string) (bool, error) {
@@ -468,6 +483,11 @@ func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData
 		return false, nil
 	}
 
+	// A repeated address is relayed once, so it is already accounted for.
+	if slices.Contains(p.redirectsAllowed, addr) {
+		return true, nil
+	}
+
 	// (1) Per-account rate limit.
 	if p.redirectOracle != nil && p.redirectRateLimit > 0 {
 		n, err := p.redirectOracle.CountRedirectsSince(ctx, p.AccountID, p.redirectRateWindow)
@@ -475,30 +495,40 @@ func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData
 			// fail-closed-to-keep
 			return false, nil
 		}
-		if n >= p.redirectRateLimit {
+		if n+len(p.redirectsAllowed) >= p.redirectRateLimit {
 			return false, nil
 		}
+	}
+	p.redirectsAllowed = append(p.redirectsAllowed, addr)
+	return true, nil
+}
+
+// recordRedirects charges n relayed redirects against the account's rate limit.
+func (p *SievePolicy) recordRedirects(ctx context.Context, n int) {
+	if p.redirectOracle == nil || p.redirectRateLimit <= 0 {
+		return
+	}
+	for range n {
 		if err := p.redirectOracle.RecordRedirect(ctx, p.AccountID); err != nil {
 			// Best effort, log error implicitly or explicitly if a logger becomes available in context
 		}
 	}
-	return true, nil
 }
 
 // VacationResponseAllowed is called by the Sieve interpreter.
 // `recipient` is the address of the original sender of the message being processed.
-// `handle` can be used to distinguish between multiple vacation actions in a script.
+// `responseIdentity` identifies the unexpanded vacation arguments or explicit handle.
 // `duration` is the :days parameter from the vacation command.
 func (p *SievePolicy) VacationResponseAllowed(ctx context.Context, d *interp.RuntimeData,
-	originalSender, handle string, duration time.Duration) (bool, error) {
+	originalSender, responseIdentity string, duration time.Duration) (bool, error) {
 
-	// Key for in-memory tracking (per script execution, per handle)
-	// This is for Sieve's :handle specific cooldown within the same script evaluation.
-	inMemoryKey := originalSender + ":" + handle
+	// Key for in-memory tracking (per script execution, per response identity)
+	// This is the cooldown per response identity within the same script evaluation.
+	inMemoryKey := originalSender + ":" + responseIdentity
 
 	if p.vacationOracle != nil {
 		// Use the oracle for the persistent check (this is the main :days check)
-		allowed, err := p.vacationOracle.IsVacationResponseAllowed(ctx, p.AccountID, originalSender, handle, duration)
+		allowed, err := p.vacationOracle.IsVacationResponseAllowed(ctx, p.AccountID, originalSender, responseIdentity, duration)
 		if err != nil {
 			return false, fmt.Errorf("checking persistent vacation allowance via oracle: %w", err)
 		}
@@ -512,12 +542,12 @@ func (p *SievePolicy) VacationResponseAllowed(ctx context.Context, d *interp.Run
 		}
 		lastSent, exists := p.vacationResponses[inMemoryKey]
 		if exists && time.Since(lastSent) < duration {
-			return false, nil // Deny based on in-script, per-handle cooldown for this session
+			return false, nil // Deny based on in-script, per-identity cooldown for this session
 		}
 	}
 
 	// If allowed (either by oracle or by lack of recent in-memory for no-oracle case),
-	// update the in-memory map for this specific script execution session and handle.
+	// update the in-memory map for this specific script execution session and response identity.
 	if p.vacationResponses == nil {
 		p.vacationResponses = make(map[string]time.Time)
 	}
@@ -526,21 +556,22 @@ func (p *SievePolicy) VacationResponseAllowed(ctx context.Context, d *interp.Run
 	return true, nil
 }
 
-// vacationRecorder returns the deferred commit of the persistent :days window for
+// vacationClaimer returns the deferred claim of the persistent :days window for
 // `originalSender`, or nil when there is no oracle (the in-memory fallback tracking
 // lives and dies with a single evaluation). The returned function takes its own
 // context: it runs on the delivery path, after this evaluation's budget has expired.
-func (p *SievePolicy) vacationRecorder(originalSender, handle string) func(context.Context) error {
+func (p *SievePolicy) vacationClaimer(originalSender, responseIdentity string, duration time.Duration) func(context.Context) (bool, error) {
 	oracle := p.vacationOracle
 	if oracle == nil {
 		return nil
 	}
 	accountID := p.AccountID
-	return func(ctx context.Context) error {
-		if err := oracle.RecordVacationResponseSent(ctx, accountID, originalSender, handle); err != nil {
-			return fmt.Errorf("failed to record vacation response sent via oracle: %w", err)
+	return func(ctx context.Context) (bool, error) {
+		claimed, err := oracle.ClaimVacationResponse(ctx, accountID, originalSender, responseIdentity, duration)
+		if err != nil {
+			return false, fmt.Errorf("failed to claim vacation response via oracle: %w", err)
 		}
-		return nil
+		return claimed, nil
 	}
 }
 

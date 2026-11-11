@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	imap "github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
+	imap "github.com/migadu/go-imap"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/server/pop3"

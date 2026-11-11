@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"testing"
 
-	imap "github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	imap "github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 )
 
 // TestDatabaseBreakerIsSuccessful pins down which errors the database circuit breakers
@@ -41,6 +42,8 @@ func TestDatabaseBreakerIsSuccessful(t *testing.T) {
 		{"ErrMailboxNotFound", consts.ErrMailboxNotFound, true, true},
 		{"pgx.ErrNoRows", pgx.ErrNoRows, true, true},
 		{"pgx.ErrNoRows wrapped", fmt.Errorf("lookup: %w", pgx.ErrNoRows), true, true},
+		{"search result limit", db.ErrSearchTooManyResults, true, false},
+		{"wrapped search result limit", fmt.Errorf("search: %w", db.ErrSearchTooManyResults), true, false},
 
 		// Differences between the two predicates.
 		{"ErrDBUniqueViolation", consts.ErrDBUniqueViolation, false, true},

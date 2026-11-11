@@ -261,11 +261,13 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 			reloaded = append(reloaded, "jwt_secret")
 		}
 	}
-	if len(cfg.AllowedOrigins) > 0 {
+	// Reload receives the complete config, so an empty or removed list means what
+	// it does at startup: no origin is authorized, and every host is allowed.
+	if !slices.Equal(cfg.AllowedOrigins, next.allowedOrigins) {
 		next.allowedOrigins = slices.Clone(cfg.AllowedOrigins)
 		reloaded = append(reloaded, "allowed_origins")
 	}
-	if len(cfg.AllowedHosts) > 0 {
+	if !slices.Equal(cfg.AllowedHosts, next.allowedHosts) {
 		next.allowedHosts = slices.Clone(cfg.AllowedHosts)
 		reloaded = append(reloaded, "allowed_hosts")
 	}

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-sasl"
+	"github.com/migadu/go-imap/imapclient"
 	"github.com/migadu/sora/integration_tests/common"
 	serverPkg "github.com/migadu/sora/server"
 	serverImap "github.com/migadu/sora/server/imap"

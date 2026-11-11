@@ -25,6 +25,8 @@ type Session struct {
 	server                *Server
 	settings              *reloadableSettings // the server's settings when the session started (see reloadableSettings)
 	clientConn            net.Conn            // Reassigned on STARTTLS; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
+	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4 and username, which the TLS conn above it after STARTTLS does not
+	startTLSInProgress    bool                // Between the 220 to STARTTLS and the end of its handshake, under mu: the client reads neither plaintext nor, yet, TLS
 	backendConn           net.Conn            // Reassigned on backend connect/STARTTLS/error; writes must hold mu (same reason)
 	backendReader         *bufio.Reader
 	backendWriter         *bufio.Writer
@@ -91,6 +93,7 @@ func newSession(s *Server, conn net.Conn, proxyInfo *server.ProxyProtocolInfo) *
 		server:               s,
 		settings:             s.loadSettings(),
 		clientConn:           conn,
+		listenerConn:         conn,
 		clientReader:         bufio.NewReader(conn),
 		clientWriter:         bufio.NewWriter(conn),
 		clientAddr:           clientAddr, // Use real client IP from PROXY protocol or connection
@@ -505,10 +508,13 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// Send OK response
-			if err := s.sendResponse("220 2.0.0 Ready to start TLS"); err != nil {
-				s.DebugLog("Failed to send STARTTLS response", "error", err)
-				return
+			// Bytes the client sent after STARTTLS were sent in plaintext, where
+			// anyone on the path could have added them; the upgraded session must
+			// never read them as commands (CVE-2011-0411). They stay plaintext
+			// commands instead.
+			if s.clientReader.Buffered() > 0 {
+				s.sendResponse("503 5.5.1 STARTTLS must be the last command sent before TLS negotiation")
+				continue
 			}
 
 			// Load TLS config: Use global TLS manager config if available, otherwise load from files
@@ -521,7 +527,8 @@ func (s *Session) handleConnection() {
 				cert, err := tls.LoadX509KeyPair(s.server.tlsCertFile, s.server.tlsKeyFile)
 				if err != nil {
 					s.DebugLog("Failed to load TLS certificate", "error", err)
-					return
+					s.sendResponse("454 4.3.0 TLS not available due to configuration error")
+					continue
 				}
 
 				tlsConfig = &tls.Config{
@@ -539,9 +546,24 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// Upgrade connection to TLS
-			tlsConn := tls.Server(s.clientConn, tlsConfig)
-			if err := tlsConn.Handshake(); err != nil {
+			// The shutdown notice writes clientConn under mu from another
+			// goroutine: stop it before the reply that makes the client expect
+			// TLS, so no plaintext 421 can follow that reply.
+			s.mu.Lock()
+			s.startTLSInProgress = true
+			s.mu.Unlock()
+			if err := s.sendResponse("220 2.0.0 Ready to start TLS"); err != nil {
+				s.DebugLog("Failed to send STARTTLS response", "error", err)
+				return
+			}
+
+			// Upgrade connection to TLS. The handshake records the JA4 on the
+			// listener's SoraConn, as an implicit-TLS listener's does.
+			tlsConn := tls.Server(s.clientConn, server.StartTLSConfig(tlsConfig, "lmtp_proxy"))
+			handshakeCtx, cancelHandshake := context.WithTimeout(s.ctx, startTLSHandshakeTimeout)
+			err := tlsConn.HandshakeContext(handshakeCtx)
+			cancelHandshake()
+			if err != nil {
 				s.DebugLog("TLS handshake failed", "error", err)
 				return
 			}
@@ -549,6 +571,7 @@ func (s *Session) handleConnection() {
 			// Update session with TLS connection
 			s.mu.Lock()
 			s.clientConn = tlsConn
+			s.startTLSInProgress = false
 			s.clientReader = bufio.NewReader(tlsConn)
 			s.clientWriter = bufio.NewWriter(tlsConn)
 			s.mu.Unlock()
@@ -611,12 +634,25 @@ func (s *Session) Log(format string, args ...any) {
 	}
 }
 
+// startTLSHandshakeTimeout bounds the handshake after STARTTLS, as SoraTLSConn
+// bounds an implicit-TLS one.
+const startTLSHandshakeTimeout = 10 * time.Second
+
+// acceptedConn returns the connection the listener accepted. A Session built
+// without newSession (as tests do) has only its clientConn.
+func (s *Session) acceptedConn() net.Conn {
+	if s.listenerConn != nil {
+		return s.listenerConn
+	}
+	return s.clientConn
+}
+
 // getLogger returns a ProxySessionLogger for this session
 func (s *Session) getLogger() *server.ProxySessionLogger {
 	return &server.ProxySessionLogger{
 		Protocol:   "lmtp_proxy",
 		ServerName: s.server.name,
-		ClientConn: s.clientConn,
+		ClientConn: s.acceptedConn(),
 		Username:   s.username,
 		AccountID:  s.accountID,
 		SessionID:  s.sessionID,
@@ -775,7 +811,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	s.originalAddress = originalAddress // Store in session for cache invalidation later
 
 	// Set username on client connection for timeout logging
-	if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
+	if soraConn, ok := s.acceptedConn().(interface{ SetUsername(string) }); ok {
 		soraConn.SetUsername(s.username)
 	}
 

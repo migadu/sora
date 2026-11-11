@@ -5,7 +5,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )

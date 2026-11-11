@@ -3,9 +3,11 @@ package resilient
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 
-	"github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/retry"
@@ -25,12 +27,62 @@ func (rd *ResilientDatabase) GetMailboxByNameWithRetry(ctx context.Context, Acco
 	return result.(*db.DBMailbox), nil
 }
 
+// ResolveOrCreateMailboxPathWithRetry resolves every level of a mailbox path,
+// creating missing ancestors in order so paths and inherited ACLs stay linked.
+// The caller is responsible for authorizing creation before invoking this helper.
+// Every level is the account's own: another owner's shared mailbox of the same name
+// cannot be the parent of a mailbox of this account.
+func (rd *ResilientDatabase) ResolveOrCreateMailboxPathWithRetry(ctx context.Context, accountID int64, name string) (*int64, error) {
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	parts := strings.Split(name, string(consts.MailboxDelimiter))
+	var parentID *int64
+	for i := 1; i <= len(parts); i++ {
+		path := strings.Join(parts[:i], string(consts.MailboxDelimiter))
+		id, err := rd.getOwnedMailboxIDByNameWithRetry(ctx, accountID, path)
+		if errors.Is(err, consts.ErrMailboxNotFound) {
+			if err := rd.CreateMailboxWithRetry(ctx, accountID, path, parentID); err != nil && !errors.Is(err, consts.ErrDBUniqueViolation) {
+				return nil, fmt.Errorf("create parent mailbox %q: %w", path, err)
+			}
+			// Re-fetch after a successful or concurrent creation, using the writer.
+			id, err = rd.getOwnedMailboxIDByNameWithRetry(ctx, accountID, path)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("resolve parent mailbox %q: %w", path, err)
+		}
+		parentID = &id
+	}
+	return parentID, nil
+}
+
+func (rd *ResilientDatabase) getOwnedMailboxIDByNameWithRetry(ctx context.Context, accountID int64, name string) (int64, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetOwnedMailboxIDByName(ctx, accountID, name)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
+}
+
 // HasLiveDescendantsWithRetry reports whether any live mailbox sits below the given path.
 func (rd *ResilientDatabase) HasLiveDescendantsWithRetry(ctx context.Context, accountID int64, path string) (bool, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).HasLiveDescendants(ctx, accountID, path)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
+// IsMailboxSharedWithRetry reports whether a live mailbox is a shared one.
+func (rd *ResilientDatabase) IsMailboxSharedWithRetry(ctx context.Context, mailboxID int64) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).IsMailboxShared(ctx, mailboxID)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
 	if err != nil {
 		return false, err
 	}
@@ -579,14 +631,26 @@ func (rd *ResilientDatabase) GetUniqueCustomFlagsForMailboxWithRetry(ctx context
 // --- ACL (Access Control List) Wrappers ---
 
 func (rd *ResilientDatabase) GrantMailboxAccessByIdentifierWithRetry(ctx context.Context, ownerAccountID int64, identifier string, mailboxName string, rights string) error {
-	// GrantMailboxAccessByIdentifier already begins its own transaction, so we can't use executeWriteInTxWithRetry
-	// Instead, call it directly with retry logic
+	return rd.grantMailboxAccessWithRetry(ctx, func(writeCtx context.Context) error {
+		return rd.getOperationalDatabaseForOperation(writeCtx, true).GrantMailboxAccessByIdentifier(writeCtx, ownerAccountID, identifier, mailboxName, rights)
+	})
+}
+
+// SetMailboxACLWithRetry preserves the authorized mailbox ID across retries.
+func (rd *ResilientDatabase) SetMailboxACLWithRetry(ctx context.Context, mailboxID, grantorAccountID int64, identifier string, mod db.ACLModification, rights string) error {
+	return rd.grantMailboxAccessWithRetry(ctx, func(writeCtx context.Context) error {
+		return rd.getOperationalDatabaseForOperation(writeCtx, true).SetMailboxACL(writeCtx, mailboxID, grantorAccountID, identifier, mod, rights)
+	})
+}
+
+func (rd *ResilientDatabase) grantMailboxAccessWithRetry(ctx context.Context, grant func(context.Context) error) error {
+	// The grant begins its own transaction, so don't use executeWriteInTxWithRetry.
 	config := writeRetryConfig
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
 		defer cancel()
 
-		opErr := rd.getOperationalDatabaseForOperation(ctx, true).GrantMailboxAccessByIdentifier(writeCtx, ownerAccountID, identifier, mailboxName, rights)
+		opErr := grant(writeCtx)
 		if opErr != nil {
 			if !rd.isRetryableError(opErr) {
 				return retry.Stop(opErr)
@@ -614,6 +678,17 @@ func (rd *ResilientDatabase) RevokeMailboxAccessByIdentifierWithRetry(ctx contex
 		return nil
 	}, config)
 	return err
+}
+
+func (rd *ResilientDatabase) MailboxACLGrantabilityWithRetry(ctx context.Context, mailboxID int64, identifier string) (db.ACLGrantability, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).MailboxACLGrantability(ctx, mailboxID, identifier)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return db.ACLGrantNone, err
+	}
+	return result.(db.ACLGrantability), nil
 }
 
 func (rd *ResilientDatabase) GetMailboxACLsWithRetry(ctx context.Context, mailboxID int64) ([]db.ACLEntry, error) {

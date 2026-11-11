@@ -2,6 +2,8 @@ package sieveengine
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -86,7 +88,7 @@ stop;
 				t.Errorf("Expected Copy=%v, got %v", tt.expectedCopy, result.Copy)
 			}
 
-			if result.RedirectTo != tt.expectedRedirect {
+			if strings.Join(result.RedirectTo, ",") != tt.expectedRedirect {
 				t.Errorf("Expected RedirectTo=%s, got %s", tt.expectedRedirect, result.RedirectTo)
 			}
 		})
@@ -129,7 +131,7 @@ redirect "another@email.com";
 		t.Errorf("Expected Copy=false (no explicit keep), got true")
 	}
 
-	if result.RedirectTo != "another@email.com" {
+	if !slices.Equal(result.RedirectTo, []string{"another@email.com"}) {
 		t.Errorf("Expected RedirectTo=another@email.com, got %s", result.RedirectTo)
 	}
 }
@@ -171,7 +173,7 @@ redirect :copy "another@email.com";
 		t.Errorf("Expected Copy=true (with :copy modifier), got false")
 	}
 
-	if result.RedirectTo != "another@email.com" {
+	if !slices.Equal(result.RedirectTo, []string{"another@email.com"}) {
 		t.Errorf("Expected RedirectTo=another@email.com, got %s", result.RedirectTo)
 	}
 }
@@ -263,7 +265,7 @@ fileinto "Spam";
 
 // mockVacationOracle is a test implementation of VacationOracle
 type mockVacationOracle struct {
-	responses map[string]time.Time // key: "accountID:originalSender:handle"
+	responses map[string]time.Time // key: "accountID:originalSender:responseIdentity"
 }
 
 func newMockVacationOracle() *mockVacationOracle {
@@ -272,8 +274,8 @@ func newMockVacationOracle() *mockVacationOracle {
 	}
 }
 
-func (m *mockVacationOracle) IsVacationResponseAllowed(ctx context.Context, accountID int64, originalSender string, handle string, duration time.Duration) (bool, error) {
-	key := m.makeKey(accountID, originalSender, handle)
+func (m *mockVacationOracle) IsVacationResponseAllowed(ctx context.Context, accountID int64, originalSender string, responseIdentity string, duration time.Duration) (bool, error) {
+	key := m.makeKey(accountID, originalSender, responseIdentity)
 	lastSent, exists := m.responses[key]
 	if !exists {
 		return true, nil
@@ -281,10 +283,13 @@ func (m *mockVacationOracle) IsVacationResponseAllowed(ctx context.Context, acco
 	return time.Since(lastSent) >= duration, nil
 }
 
-func (m *mockVacationOracle) RecordVacationResponseSent(ctx context.Context, accountID int64, originalSender string, handle string) error {
-	key := m.makeKey(accountID, originalSender, handle)
+func (m *mockVacationOracle) ClaimVacationResponse(ctx context.Context, accountID int64, originalSender, responseIdentity string, duration time.Duration) (bool, error) {
+	key := m.makeKey(accountID, originalSender, responseIdentity)
+	if last, ok := m.responses[key]; ok && time.Since(last) < duration {
+		return false, nil
+	}
 	m.responses[key] = time.Now()
-	return nil
+	return true, nil
 }
 
 func (m *mockVacationOracle) CountRedirectsSince(ctx context.Context, accountID int64, window time.Duration) (int, error) {
@@ -295,8 +300,8 @@ func (m *mockVacationOracle) RecordRedirect(ctx context.Context, accountID int64
 	return nil
 }
 
-func (m *mockVacationOracle) makeKey(accountID int64, originalSender string, handle string) string {
-	return string(rune(accountID)) + ":" + originalSender + ":" + handle
+func (m *mockVacationOracle) makeKey(accountID int64, originalSender string, responseIdentity string) string {
+	return string(rune(accountID)) + ":" + originalSender + ":" + responseIdentity
 }
 
 func TestVacationIsImplicitKeep(t *testing.T) {
@@ -366,7 +371,7 @@ func TestVacationAlongsideEveryAction(t *testing.T) {
 		{name: "keep", command: `keep;`, want: Result{Action: ActionKeep}},
 		{name: "fileinto", command: `fileinto "Archive";`, want: Result{Action: ActionFileInto, Mailbox: "Archive"}},
 		{name: "fileinto :copy", command: `fileinto :copy "Archive";`, want: Result{Action: ActionFileInto, Mailbox: "Archive", Copy: true}},
-		{name: "redirect", command: `redirect "elsewhere@example.net";`, want: Result{Action: ActionRedirect, RedirectTo: "elsewhere@example.net"}},
+		{name: "redirect", command: `redirect "elsewhere@example.net";`, want: Result{Action: ActionRedirect, RedirectTo: []string{"elsewhere@example.net"}}},
 		{name: "discard", command: `discard;`, want: Result{Action: ActionDiscard}},
 	}
 
@@ -394,7 +399,7 @@ func TestVacationAlongsideEveryAction(t *testing.T) {
 			}
 
 			if result.Action != tt.want.Action || result.Mailbox != tt.want.Mailbox ||
-				result.RedirectTo != tt.want.RedirectTo || result.Copy != tt.want.Copy {
+				!slices.Equal(result.RedirectTo, tt.want.RedirectTo) || result.Copy != tt.want.Copy {
 				t.Errorf("got action %s mailbox %q redirect %q copy %v, want %s %q %q %v",
 					result.Action, result.Mailbox, result.RedirectTo, result.Copy,
 					tt.want.Action, tt.want.Mailbox, tt.want.RedirectTo, tt.want.Copy)
@@ -405,7 +410,7 @@ func TestVacationAlongsideEveryAction(t *testing.T) {
 			if result.Vacation.Subject != "Away" || result.Vacation.Body != "I'm away" {
 				t.Errorf("reply subject %q body %q, want \"Away\" \"I'm away\"", result.Vacation.Subject, result.Vacation.Body)
 			}
-			if result.Vacation.RecordSent == nil {
+			if result.Vacation.ClaimResponse == nil {
 				t.Errorf("expected a recorder to commit the :days window with")
 			}
 		})
@@ -446,11 +451,11 @@ vacation :days 7 :subject "Away" "I'm away";
 	}
 
 	// The window is consumed by the delivery path once the reply is handed off.
-	if result1.Vacation.RecordSent == nil {
+	if result1.Vacation.ClaimResponse == nil {
 		t.Fatalf("First evaluation: expected a recorder for the sent reply")
 	}
-	if err := result1.Vacation.RecordSent(context.Background()); err != nil {
-		t.Fatalf("Failed to record vacation response: %v", err)
+	if claimed, err := result1.Vacation.ClaimResponse(context.Background()); err != nil || !claimed {
+		t.Fatalf("Failed to claim vacation response: claimed=%v error=%v", claimed, err)
 	}
 
 	// Second evaluation immediately after - should NOT trigger vacation (rate limited)
@@ -505,7 +510,7 @@ vacation :days 7 :subject "Away" "I'm away";
 		if result.Vacation == nil {
 			t.Fatalf("Evaluation %d: expected a vacation reply", i)
 		}
-		if result.Vacation.RecordSent == nil {
+		if result.Vacation.ClaimResponse == nil {
 			t.Fatalf("Evaluation %d: expected a recorder to commit the window with", i)
 		}
 	}

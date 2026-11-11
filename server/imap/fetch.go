@@ -9,8 +9,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -127,6 +127,8 @@ func safeExtractBinarySectionSize(bodyData []byte, section *imap.FetchItemBinary
 }
 
 func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
+	ctx = s.pinnedContext(ctx)
+
 	// FETCH is not wrapped by meteredSession (it self-instruments below), so the
 	// per-command cap is applied here. It is zero by default — see CommandTimeouts.Fetch.
 	ctx, cancelCommandTimeout := applyCommandTimeout(ctx, "FETCH", s.server.commandTimeouts)

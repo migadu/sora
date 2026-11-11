@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -14,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/lookupcache"
@@ -28,8 +29,10 @@ import (
 type Session struct {
 	server                *Server
 	settings              *reloadableSettings // the server's settings when the session started (see reloadableSettings)
-	clientConn            net.Conn
-	backendConn           net.Conn // Reassigned on backend connect/error; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
+	startTLSInProgress    bool                // Protected by mu; asynchronous notices are omitted during negotiation
+	clientConn            net.Conn            // The client transport: listenerConn, or the TLS conn above it after STARTTLS (reassigned under mu)
+	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4, username and timeouts
+	backendConn           net.Conn            // Reassigned on backend connect/error; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
 	backendReader         *bufio.Reader
 	backendWriter         *bufio.Writer
 	clientReader          *bufio.Reader
@@ -82,6 +85,7 @@ func newSession(s *Server, conn net.Conn) *Session {
 		server:       s,
 		settings:     s.loadSettings(),
 		clientConn:   conn,
+		listenerConn: conn,
 		clientReader: bufio.NewReader(conn),
 		clientWriter: bufio.NewWriter(conn),
 		clientAddr:   clientAddr,
@@ -384,7 +388,7 @@ func (s *Session) handleConnection() {
 			}
 
 			// Set username on client connection for timeout logging
-			if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
+			if soraConn, ok := s.listenerConn.(interface{ SetUsername(string) }); ok {
 				soraConn.SetUsername(s.username)
 			}
 
@@ -493,7 +497,7 @@ func (s *Session) handleConnection() {
 			}
 
 			// Set username on client connection for timeout logging
-			if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
+			if soraConn, ok := s.listenerConn.(interface{ SetUsername(string) }); ok {
 				soraConn.SetUsername(s.username)
 			}
 
@@ -508,8 +512,13 @@ func (s *Session) handleConnection() {
 			s.sendResponse(fmt.Sprintf("%s OK LOGOUT completed", tag))
 			return
 
+		case "STARTTLS":
+			if !s.handleStartTLS(tag, args) {
+				return
+			}
+
 		case "CAPABILITY":
-			s.sendResponse("* CAPABILITY " + PreAuthCapabilities + s.server.additionalCapsSuffix)
+			s.sendResponse("* CAPABILITY " + s.preAuthCapabilities() + s.server.additionalCapsSuffix)
 			s.sendResponse(fmt.Sprintf("%s OK CAPABILITY completed", tag))
 
 		case "ID":
@@ -646,14 +655,95 @@ func (s *Session) handleAuthError(response string) bool {
 //
 // Post-auth the session is a raw relay and the backend's real capabilities
 // take over. TestIMAPProxyGreetingCapabilities pins this list.
+//
+// It is the list over TLS (or with insecure_auth). Before a STARTTLS upgrade
+// the session advertises preAuthCapabilities' variant instead.
 const PreAuthCapabilities = "IMAP4rev2 IMAP4rev1 SASL-IR LITERAL- AUTH=PLAIN"
+
+// preAuthCapabilities is the list the session advertises now: PreAuthCapabilities,
+// or, while a STARTTLS listener's connection is still plaintext, the same list
+// with STARTTLS, and with LOGINDISABLED in place of AUTH=PLAIN unless
+// insecure_auth (RFC 9051 §6.2.3), since LOGIN and AUTHENTICATE are refused
+// until the upgrade.
+func (s *Session) preAuthCapabilities() string {
+	if !s.canStartTLS() {
+		return PreAuthCapabilities
+	}
+	if s.server.insecureAuth {
+		return "IMAP4rev2 IMAP4rev1 SASL-IR LITERAL- STARTTLS AUTH=PLAIN"
+	}
+	return "IMAP4rev2 IMAP4rev1 SASL-IR LITERAL- STARTTLS LOGINDISABLED"
+}
+
+// canStartTLS reports whether STARTTLS is on offer: the listener is a STARTTLS
+// one and this connection has not upgraded yet. Session goroutine only.
+func (s *Session) canStartTLS() bool {
+	return s.server.startTLSConfig != nil && !server.ConnIsTLS(s.clientConn)
+}
+
+// startTLSHandshakeTimeout bounds the handshake after STARTTLS, as SoraTLSConn
+// bounds an implicit-TLS one.
+const startTLSHandshakeTimeout = 10 * time.Second
+
+// handleStartTLS runs the STARTTLS command (RFC 9051 §6.2.1). It returns false
+// when the session must end: the error budget is spent, or the handshake failed
+// after the client was told to begin it.
+func (s *Session) handleStartTLS(tag string, args []string) bool {
+	if !s.canStartTLS() {
+		return !s.handleAuthError(fmt.Sprintf("%s BAD STARTTLS not available", tag))
+	}
+	if len(args) > 0 {
+		return !s.handleAuthError(fmt.Sprintf("%s BAD STARTTLS takes no arguments", tag))
+	}
+	// Bytes the client sent after STARTTLS were sent in plaintext, where anyone
+	// on the path could have added them; the upgraded session must never read
+	// them as commands (CVE-2011-0411). They stay plaintext commands instead.
+	if s.clientReader.Buffered() > 0 {
+		return !s.handleAuthError(fmt.Sprintf("%s BAD STARTTLS must be the last command sent before TLS negotiation", tag))
+	}
+	// Stop asynchronous plaintext notices before acknowledging the upgrade.
+	// The TLS connection is not published until HandshakeContext succeeds.
+	// sendBye holds writeMu while using its snapshot of clientConn. Wait for
+	// any earlier plaintext notice before acknowledging STARTTLS, then make
+	// later notices see the transition flag under the same lock order.
+	server.BeginStartTLS(s.listenerConn)
+	s.writeMu.Lock()
+	s.mu.Lock()
+	s.startTLSInProgress = true
+	s.mu.Unlock()
+	err := s.sendResponse(fmt.Sprintf("%s OK Begin TLS negotiation now", tag))
+	s.writeMu.Unlock()
+	if err != nil {
+		return false
+	}
+
+	plain := s.clientConn
+	tlsConn := tls.Server(plain, s.server.startTLSConfig)
+	ctx, cancel := context.WithTimeout(s.ctx, startTLSHandshakeTimeout)
+	defer cancel()
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		s.WarnLog("TLS handshake after STARTTLS failed", "error", err)
+		return false
+	}
+
+	server.CompleteStartTLS(plain, tlsConn)
+	// The shutdown and maintenance BYE and close() read clientConn under mu
+	// from other goroutines.
+	s.mu.Lock()
+	s.clientConn = tlsConn
+	s.startTLSInProgress = false
+	s.clientReader = bufio.NewReader(tlsConn)
+	s.clientWriter = bufio.NewWriter(tlsConn)
+	s.mu.Unlock()
+	return true
+}
 
 // sendGreeting sends the IMAP greeting.
 func (s *Session) sendGreeting() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	greeting := "* OK [CAPABILITY " + PreAuthCapabilities + s.server.additionalCapsSuffix + "] Proxy Ready\r\n"
+	greeting := "* OK [CAPABILITY " + s.preAuthCapabilities() + s.server.additionalCapsSuffix + "] Proxy Ready\r\n"
 	_, err := s.clientWriter.WriteString(greeting)
 	if err != nil {
 		return err
@@ -678,7 +768,7 @@ func (s *Session) getLogger() *server.ProxySessionLogger {
 	return &server.ProxySessionLogger{
 		Protocol:   "imap_proxy",
 		ServerName: s.server.name,
-		ClientConn: s.clientConn,
+		ClientConn: s.listenerConn,
 		Username:   s.username,
 		AccountID:  s.accountID,
 		SessionID:  s.sessionID,
@@ -817,7 +907,7 @@ func (s *Session) authenticateUser(username, password string) error {
 					RemoteTLSVerify:        cached.RemoteTLSVerify,
 					RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
 					RemoteUseIDCommand:     cached.RemoteUseIDCommand,
-					ClientConn:             s.clientConn, // Always set current client connection for JA4
+					ClientConn:             s.listenerConn, // Always set current client connection for JA4
 				}
 				// If cache has ActualEmail (e.g., "user@example.com" for "user@TOKEN"), use it
 				// Otherwise fall back to submitted username
@@ -838,7 +928,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				}
 
 				// Set username on client connection for timeout logging
-				if soraConn, ok := s.clientConn.(interface{ SetUsername(string) }); ok {
+				if soraConn, ok := s.listenerConn.(interface{ SetUsername(string) }); ok {
 					soraConn.SetUsername(s.username)
 				}
 
@@ -1278,12 +1368,12 @@ func (s *Session) connectToBackend() error {
 		// Create minimal routing info with client connection for JA4 extraction
 		// Copy server's settings to avoid overriding them with zero values later
 		s.routingInfo = &proxy.UserRoutingInfo{
-			ClientConn:         s.clientConn,
+			ClientConn:         s.listenerConn,
 			RemoteUseIDCommand: s.server.remoteUseIDCommand,
 			ProxySessionID:     s.sessionID, // Include session ID for end-to-end tracing
 		}
 	} else {
-		s.routingInfo.ClientConn = s.clientConn
+		s.routingInfo.ClientConn = s.listenerConn
 		s.routingInfo.ProxySessionID = s.sessionID
 	}
 

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -82,10 +82,9 @@ func TestValidateSequenceRanges(t *testing.T) {
 			errorField:  "SeqNum",
 		},
 		{
-			name:        "invalid sequence range - zero start",
+			name:        "valid sequence range - star start",
 			seqNum:      []imap.SeqSet{{imap.SeqRange{Start: 0, Stop: 10}}},
-			expectError: true,
-			errorField:  "SeqNum",
+			expectError: false,
 		},
 		{
 			name:        "invalid UID range - start > stop",
@@ -94,9 +93,9 @@ func TestValidateSequenceRanges(t *testing.T) {
 			errorField:  "UID",
 		},
 		{
-			name:        "invalid UID range - zero start",
+			name:        "UID wildcard start",
 			uid:         []imap.UIDSet{{imap.UIDRange{Start: 0, Stop: 100}}},
-			expectError: true,
+			expectError: false,
 			errorField:  "UID",
 		},
 	}

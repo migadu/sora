@@ -183,8 +183,19 @@ func (fp *ForwardingParams) encodeForwardVariables() string {
 	return base64.StdEncoding.EncodeToString([]byte(tabSeparated))
 }
 
+// parseProxyTTL parses a forwarded hop count. A value that is not a number is an error
+// rather than "no TTL": treating it as absent would hand a looping proxy a fresh hop
+// budget on every pass.
+func parseProxyTTL(value string) (int, error) {
+	ttl, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid proxy TTL: %q", value)
+	}
+	return ttl, nil
+}
+
 // ParseIMAPID parses forwarding parameters from IMAP ID command
-func ParseIMAPID(idData map[string]string) *ForwardingParams {
+func ParseIMAPID(idData map[string]string) (*ForwardingParams, error) {
 	params := &ForwardingParams{
 		Variables: make(map[string]string),
 	}
@@ -208,9 +219,11 @@ func ParseIMAPID(idData map[string]string) *ForwardingParams {
 		case "x-session-ext-id":
 			params.SessionExtID = value
 		case "x-proxy-ttl":
-			if ttl, err := strconv.Atoi(value); err == nil {
-				params.ProxyTTL = ttl
+			ttl, err := parseProxyTTL(value)
+			if err != nil {
+				return nil, err
 			}
+			params.ProxyTTL = ttl
 		default:
 			// Handle x-forward- prefixed variables
 			if strings.HasPrefix(key, "x-forward-") {
@@ -220,7 +233,7 @@ func ParseIMAPID(idData map[string]string) *ForwardingParams {
 		}
 	}
 
-	return params
+	return params, nil
 }
 
 // ParsePOP3XCLIENT parses forwarding parameters from POP3 XCLIENT command
@@ -249,9 +262,11 @@ func ParsePOP3XCLIENT(xclientLine string) (*ForwardingParams, error) {
 		case "SESSION":
 			params.SessionID = value
 		case "TTL":
-			if ttl, err := strconv.Atoi(value); err == nil {
-				params.ProxyTTL = ttl
+			ttl, err := parseProxyTTL(value)
+			if err != nil {
+				return nil, err
 			}
+			params.ProxyTTL = ttl
 		case "FORWARD":
 			// Decode Base64 and parse tab-separated variables
 			if decoded, err := base64.StdEncoding.DecodeString(value); err == nil {
@@ -308,9 +323,11 @@ func ParseLMTPXCLIENT(xclientLine string) (*ForwardingParams, error) {
 				params.OriginatingPort = port
 			}
 		case "TTL":
-			if ttl, err := strconv.Atoi(value); err == nil {
-				params.ProxyTTL = ttl
+			ttl, err := parseProxyTTL(value)
+			if err != nil {
+				return nil, err
 			}
+			params.ProxyTTL = ttl
 		case "HELO":
 			params.HELO = value
 		case "LOGIN":

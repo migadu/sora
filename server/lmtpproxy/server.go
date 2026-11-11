@@ -25,7 +25,7 @@ import (
 // reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
 // publishes a new one whole and none is changed after: a session takes the one current
 // when it starts and keeps it, so it never mixes the values of two reloads. Debug
-// logging is read afresh, per log line.
+// is included in the snapshot but fixed at startup, like the protocol writer.
 type reloadableSettings struct {
 	absoluteSessionTimeout time.Duration // Maximum total session duration (prevents hung sessions)
 	maxMessageSize         int64
@@ -643,10 +643,11 @@ func (s *Server) sendGracefulShutdownMessage() {
 		session.mu.Unlock()
 	}
 
-	// Step 2: Write 421 shutdown message directly to clientConn.
+	// Step 2: Write 421 shutdown message directly to clientConn: the TLS
+	// connection after STARTTLS, and nothing while STARTTLS is negotiating.
 	for _, session := range activeSessions {
 		session.mu.Lock()
-		if session.clientConn != nil {
+		if session.clientConn != nil && !session.startTLSInProgress {
 			_, _ = fmt.Fprint(session.clientConn, "421 4.3.2 Service shutting down, please try again later\r\n")
 		}
 		session.mu.Unlock()
@@ -685,10 +686,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 		next.maxMessageSize = maxSize
 		reloaded = append(reloaded, "max_message_size")
 	}
-	if cfg.Debug != next.debug {
-		next.debug = cfg.Debug
-		reloaded = append(reloaded, "debug")
-	}
+	// Debug configures the protocol writer at startup and requires a restart.
 
 	if len(reloaded) > 0 {
 		s.settings.Store(&next)

@@ -66,6 +66,7 @@ type POP3Server struct {
 	uploader       *uploader.UploadWorker
 	cache          *cache.Cache
 	tlsConfig      *tls.Config
+	useStartTLS    bool // tlsConfig upgrades a plaintext listener on STLS instead of wrapping it
 	masterUsername []byte
 	masterPassword []byte
 
@@ -134,6 +135,8 @@ type POP3ServerOptions struct {
 	TLSCertFile                 string
 	TLSKeyFile                  string
 	TLSVerify                   bool
+	TLSUseStartTLS              bool        // Plaintext listener offering STLS (RFC 2595) instead of implicit TLS; requires TLS
+	TLSConfig                   *tls.Config // Global TLS config from TLS manager (optional)
 	MasterUsername              string
 	MasterPassword              string
 	MasterSASLUsername          string
@@ -297,6 +300,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		cancel:          serverCancel,
 		uploader:        uploadWorker,
 		cache:           cache,
+		useStartTLS:     options.TLS && options.TLSUseStartTLS, // config warns when tls_use_starttls lacks tls
 		masterUsername:  []byte(options.MasterUsername),
 		masterPassword:  []byte(options.MasterPassword),
 		proxyReader:     proxyReader,
@@ -350,8 +354,14 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		server.listenBacklog = 1024 // Default backlog
 	}
 
-	// Setup TLS if TLS is enabled and certificate and key files are provided
-	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
+	// Setup TLS: the global [tls] manager's config when there is one, the
+	// per-server certificate files otherwise.
+	if options.TLS && options.TLSConfig != nil {
+		if options.TLSCertFile != "" || options.TLSKeyFile != "" {
+			logger.Warn("POP3: tls_cert_file/tls_key_file ignored - global [tls] is enabled", "name", name)
+		}
+		server.tlsConfig = options.TLSConfig
+	} else if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
 		if err != nil {
 			serverCancel()
@@ -374,6 +384,10 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
 			logger.Debug("POP3: WARNING - TLS certificate verification not enforced", "name", name)
 		}
+	} else if options.TLS {
+		// Without a certificate the listener would be plaintext on the port meant for TLS.
+		serverCancel()
+		return nil, fmt.Errorf("TLS enabled for POP3 [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
 	}
 
 	// Start connection limiter cleanup
@@ -440,7 +454,9 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 	caps = append(caps, pop3.Capability{Name: "IMPLEMENTATION", Params: []string{"Sora-POP3-Server"}})
 
 	opts := pop3server.Options{
-		TLSConfig:              s.tlsConfig,
+		TLSConfig:              serverPkg.StartTLSConfig(s.tlsConfig, "pop3"), // records JA4 on STLS, as SoraTLSConn does for implicit TLS
+		OnStartTLS:             serverPkg.BeginStartTLS,
+		OnTLSHandshakeComplete: serverPkg.CompleteStartTLS,
 		IdleTimeout:            settings.commandTimeout,
 		AuthIdleTimeout:        s.authIdleTimeout,
 		AbsoluteSessionTimeout: settings.absoluteSessionTimeout,
@@ -552,6 +568,9 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 				c.OK(msg)
 			} else {
 				c.Err(msg)
+				// A forwarding loop is terminal: a proxy must not continue to
+				// authenticate on a connection whose hop budget is exhausted.
+				return true, msg == xclientTTLExpired
 			}
 			return true, false
 		},
@@ -601,8 +620,10 @@ func (s *POP3Server) connConfig() serverPkg.SoraConnConfig {
 		EnableTimeoutChecker: settings.minBytesPerMinute > 0,
 		NoAbsoluteTimeout:    true, // the library enforces absolute_session_timeout
 		OnTimeout: func(conn net.Conn, reason string) {
-			// Best-effort notice before closing; RFC 1939 doesn't define
-			// timeout response codes, but [IN-USE] is commonly used.
+			// Best-effort notice before closing, on the connection the library
+			// is using (the TLS one after STLS; see NewSession); RFC 1939
+			// doesn't define timeout response codes, but [IN-USE] is commonly
+			// used.
 			message := "-ERR [IN-USE] Connection timeout, please reconnect\r\n"
 			if reason == "slow_throughput" {
 				message = "-ERR [IN-USE] Connection too slow, please reconnect\r\n"
@@ -635,7 +656,10 @@ func (s *POP3Server) Start(errChan chan error) {
 	// bytes (broken PROXY+TLS combo).
 	base := serverPkg.WrapProxyProtocol(tcpListener, s.proxyReader, "POP3")
 
-	if s.tlsConfig != nil {
+	// In STARTTLS mode the listener stays plaintext and the library upgrades
+	// the stream on STLS (it advertises STLS whenever it has a TLSConfig and
+	// the connection is not yet TLS).
+	if s.tlsConfig != nil && !s.useStartTLS {
 		// Use SoraTLSListener for TLS with timeout protection
 		listener = serverPkg.NewSoraTLSListenerFunc(base, s.tlsConfig, s.connConfig)
 		if connConfig.EnableTimeoutChecker {
@@ -647,11 +671,12 @@ func (s *POP3Server) Start(errChan chan error) {
 	} else {
 		// Use SoraListener for non-TLS with timeout protection
 		listener = serverPkg.NewSoraListenerFunc(base, s.connConfig)
+		starttls := s.tlsConfig != nil
 		if connConfig.EnableTimeoutChecker {
 			settings := s.settings.Load()
-			logger.Info("POP3 server listening", "name", s.name, "addr", s.addr, "tls", false, "idle_timeout", settings.commandTimeout, "session_max", settings.absoluteSessionTimeout, "min_throughput", connConfig.MinBytesPerMinute)
+			logger.Info("POP3 server listening", "name", s.name, "addr", s.addr, "tls", false, "starttls", starttls, "idle_timeout", settings.commandTimeout, "session_max", settings.absoluteSessionTimeout, "min_throughput", connConfig.MinBytesPerMinute)
 		} else {
-			logger.Info("POP3 server listening", "name", s.name, "addr", s.addr, "tls", false)
+			logger.Info("POP3 server listening", "name", s.name, "addr", s.addr, "tls", false, "starttls", starttls)
 		}
 	}
 	defer listener.Close()
@@ -796,13 +821,16 @@ func (s *POP3Server) sendGracefulShutdownMessage() {
 
 	// Send shutdown message to all active connections
 	for _, session := range activeSessions {
-		if session.conn != nil {
-			writer := bufio.NewWriter(session.conn)
+		// After STLS the client reads through the library's TLS connection,
+		// which sits above session.conn; while STLS is negotiating there is
+		// nothing to write to.
+		serverPkg.WriteNotice(session.conn, func(noticeConn net.Conn) {
+			writer := bufio.NewWriter(noticeConn)
 			// POP3 doesn't have a specific "server shutting down" response code
 			// But we can send a polite message before disconnection
 			writer.WriteString("-ERR Server shutting down, please reconnect\r\n")
 			writer.Flush()
-		}
+		})
 	}
 
 	// Give clients a brief moment (1 second) to receive the message

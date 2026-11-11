@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/migadu/go-imap/imapclient"
 	imapserver "github.com/migadu/sora/server/imap"
 	lmtpserver "github.com/migadu/sora/server/lmtp"
 	"github.com/migadu/sora/server/uploader"

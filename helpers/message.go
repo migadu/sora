@@ -10,11 +10,11 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/k3a/html2text"
+	"github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapserver"
 	"lukechampine.com/blake3"
 )
 

@@ -2,10 +2,13 @@ package imap
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapserver"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 )
@@ -82,6 +85,14 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		Flags:  sanitizedFlags,
 	}
 
+	if s.useMasterDB.Load() {
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
+	var unchangedSince []uint64
+	if s.GetCapabilities().Has(imap.CapCondStore) && options != nil && options.UnchangedSinceSet {
+		unchangedSince = []uint64{options.UnchangedSince}
+	}
+
 	// RFC 4314 §4: STORE requires 's' to modify \Seen, 't' for \Deleted, and 'w'
 	// for all other flags. Fetch the user's rights once (owner fast-path).
 	storeRights, err := s.userRightsForMailbox(ctx, selectedMailboxID, selectedMailboxOwnerID)
@@ -105,10 +116,20 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 		sanitizedFlags = permitted
 		sanitizedStoreFlags.Flags = permitted
+	} else if !strings.ContainsAny(storeRights, "stw") {
+		// A replace addresses every flag, listed or not, so it fails only when the
+		// user can modify no flag at all.
+		s.DebugLog("user lacks permission to modify any flag")
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "You do not have permission to modify the specified flags",
+		}
 	}
-	// Note: STORE FLAGS (replace) does not reject here. RFC 4314 §4 forbids modifying
-	// flags the user lacks rights for; a naive replace would also clear UNLISTED flags.
-	// The apply step below preserves the current value of each non-modifiable flag.
+	// Note: STORE FLAGS (replace) does not reject a user holding only some of the
+	// flag rights. RFC 4314 §4 forbids modifying flags the user lacks rights for; a
+	// naive replace would also clear UNLISTED flags. The apply step below preserves
+	// the current value of each non-modifiable flag.
 
 	// RFC 9979 §3.2: unflagging also clears the flag color keywords (see
 	// flag_color.go).
@@ -136,11 +157,56 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 	}
 
-	var modifiedMessages []struct {
-		seq    uint32
-		uid    imap.UID
-		flags  []imap.Flag
-		modSeq int64
+	type storeResponseMessage struct {
+		seq       uint32
+		uid       imap.UID
+		flags     []imap.Flag
+		modSeq    int64
+		unchanged bool
+	}
+	var responseMessages []storeResponseMessage
+
+	// RFC 7162 §3.1.3: a CONDSTORE-aware client gets FETCH (MODSEQ) for every
+	// message a .SILENT STORE updated. That is command response data, so STORE
+	// writes it itself rather than leaving it to the command-boundary Poll, which
+	// would add FLAGS, is skipped under NOTIFY, and stops at a pending expunge.
+	// Poll is held off until those rows are recorded in ownStoreEcho.
+	silentModSeq := sanitizedStoreFlags.Silent && s.condStoreEnabled()
+	if silentModSeq {
+		s.ownStoreMu.Lock()
+		defer s.ownStoreMu.Unlock()
+	}
+	writeResponses := func() {
+		if sanitizedStoreFlags.Silent && !silentModSeq {
+			return
+		}
+		for _, modified := range responseMessages {
+			// Use database sequence number directly (no encoding needed)
+			m := w.CreateMessage(modified.seq)
+
+			if !sanitizedStoreFlags.Silent {
+				m.WriteFlags(modified.flags)
+			}
+			m.WriteUID(modified.uid)
+			// RFC 7162 §3.2: include MODSEQ in the STORE-triggered FETCH reply only
+			// when the client is CONDSTORE-aware (issued an enabling command) and the
+			// session still advertises CONDSTORE.
+			if s.condStoreEnabled() {
+				m.WriteModSeq(uint64(modified.modSeq))
+			}
+
+			if err := m.Close(); err != nil {
+				s.DebugLog("failed to close fetch response", "uid", modified.uid, "error", err)
+				continue
+			}
+			if silentModSeq && !modified.unchanged {
+				if s.ownStoreEcho == nil || s.ownStoreEchoMailboxID != selectedMailboxID {
+					s.ownStoreEcho = make(map[imap.UID]uint64)
+					s.ownStoreEchoMailboxID = selectedMailboxID
+				}
+				s.ownStoreEcho[modified.uid] = uint64(modified.modSeq)
+			}
+		}
 	}
 
 	// Check if the context is still valid before proceeding with flag updates
@@ -220,52 +286,30 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		var batchResults []db.BatchFlagUpdateResult
 		switch sanitizedStoreFlags.Op {
 		case imap.StoreFlagsAdd:
-			batchResults, err = s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
+			batchResults, err = s.server.rdb.AddMessageFlagsBatchWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags, unchangedSince...)
 		case imap.StoreFlagsDel:
-			batchResults, err = s.server.rdb.RemoveMessageFlagsBatchWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags)
+			batchResults, err = s.server.rdb.RemoveMessageFlagsBatchWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags, unchangedSince...)
 		case imap.StoreFlagsSet:
 			// RFC 4314 §4: a replace must not modify flags the user lacks rights for.
-			// Per message, compute the target = requested values for modifiable flags
-			// + preserved current values for the rest, then SET each distinct target
-			// as one batch. For the owner (full rights) every message's target equals
-			// the requested set, collapsing to a single batch (no behaviour change).
-			currentByUID := make(map[imap.UID][]imap.Flag, len(messages))
-			for _, msg := range messages {
-				cur := db.BitwiseToFlags(msg.BitwiseFlags)
-				for _, cf := range msg.CustomFlags {
-					cur = append(cur, imap.Flag(cf))
-				}
-				currentByUID[msg.UID] = cur
-			}
-			groupUIDs := make(map[string][]imap.UID)
-			groupFlags := make(map[string][]imap.Flag)
-			for _, uid := range validUIDs {
-				target := storeReplaceTarget(currentByUID[uid], sanitizedStoreFlags.Flags, storeRights)
-				key := flagSetKey(target)
-				groupUIDs[key] = append(groupUIDs[key], uid)
-				groupFlags[key] = target
-			}
-			for key, uids := range groupUIDs {
-				var res []db.BatchFlagUpdateResult
-				res, err = s.server.rdb.SetMessageFlagsBatchWithRetry(ctx, uids, selectedMailboxID, groupFlags[key])
-				if err != nil {
-					break
-				}
-				batchResults = append(batchResults, res...)
-			}
+			// Merge protected values from current rows inside the write transaction,
+			// rather than overwriting concurrent changes with this read snapshot.
+			batchResults, err = s.server.rdb.SetMessageFlagsBatchWithRightsWithRetry(ctx, validUIDs, selectedMailboxID, sanitizedStoreFlags.Flags, storeRights, unchangedSince...)
 		}
 
 		if err != nil {
+			if errors.Is(err, consts.ErrTooManyKeywords) {
+				return keywordLimitExceededError()
+			}
 			return s.internalError("failed to update flags for batch: %v", err)
 		}
 
 		for _, res := range batchResults {
-			modifiedMessages = append(modifiedMessages, struct {
-				seq    uint32
-				uid    imap.UID
-				flags  []imap.Flag
-				modSeq int64
-			}{
+			if res.PreconditionFailed {
+				failedUIDs.AddNum(res.UID)
+				failedSeqs.AddNum(seqMap[res.UID])
+				continue
+			}
+			responseMessages = append(responseMessages, storeResponseMessage{
 				seq:    seqMap[res.UID],
 				uid:    res.UID,
 				flags:  res.Flags,
@@ -278,6 +322,40 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		// so a subsequent FETCH or SEARCH in this session reads the new flags from
 		// the master rather than a lagging read replica.
 		s.useMasterDB.Store(true)
+
+		// RFC 9051 §6.4.6: non-silent STORE returns the resulting flags as a
+		// FETCH, including when normalization rejected a requested keyword but
+		// left the stored state unchanged. Batch updates omit such no-op rows.
+		// Read them from the master so a concurrent writer's flags are current;
+		// only validUIDs are eligible, preserving UNCHANGEDSINCE failures.
+		if (!sanitizedStoreFlags.Silent || silentModSeq) && len(batchResults) < len(validUIDs) {
+			changed := make(map[imap.UID]bool, len(batchResults))
+			for _, res := range batchResults {
+				changed[res.UID] = true
+			}
+			var unchanged imap.UIDSet
+			for _, uid := range validUIDs {
+				if !changed[uid] {
+					unchanged.AddNum(uid)
+				}
+			}
+			readCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
+			current, err := s.server.rdb.GetMessagesByNumSetWithRetry(readCtx, selectedMailboxID, unchanged)
+			if err != nil {
+				return s.internalError("failed to read unchanged STORE flags: %v", err)
+			}
+			for _, msg := range current {
+				flags := db.BitwiseToFlags(msg.BitwiseFlags)
+				for _, flag := range msg.CustomFlags {
+					flags = append(flags, imap.Flag(flag))
+				}
+				modSeq := msg.CreatedModSeq
+				if msg.UpdatedModSeq != nil {
+					modSeq = max(modSeq, *msg.UpdatedModSeq)
+				}
+				responseMessages = append(responseMessages, storeResponseMessage{seq: seqMap[msg.UID], uid: msg.UID, flags: flags, modSeq: modSeq, unchanged: true})
+			}
+		}
 	}
 
 	// RFC 7162 §3.1.3: report messages that failed the UNCHANGEDSINCE precondition
@@ -292,19 +370,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		s.DebugLog("CONDSTORE: returning MODIFIED for failed UIDs", "uids", failedUIDs.String())
 
 		// Still send FETCH responses for successfully modified messages (before the OK).
-		if !sanitizedStoreFlags.Silent {
-			for _, modified := range modifiedMessages {
-				m := w.CreateMessage(modified.seq)
-				m.WriteFlags(modified.flags)
-				m.WriteUID(modified.uid)
-				if s.condStoreEnabled() {
-					m.WriteModSeq(uint64(modified.modSeq))
-				}
-				if err := m.Close(); err != nil {
-					s.DebugLog("failed to close fetch response", "uid", modified.uid, "error", err)
-				}
-			}
-		}
+		writeResponses()
 
 		// RFC 7162 §3.1.3: the MODIFIED set uses the command's number space —
 		// sequence numbers for a sequence-number STORE, UIDs for a UID STORE.
@@ -333,25 +399,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	}
 	release()
 
-	if !sanitizedStoreFlags.Silent {
-		for _, modified := range modifiedMessages {
-			// Use database sequence number directly (no encoding needed)
-			m := w.CreateMessage(modified.seq)
-
-			m.WriteFlags(modified.flags)
-			m.WriteUID(modified.uid)
-			// RFC 7162 §3.2: include MODSEQ in the STORE-triggered FETCH reply only
-			// when the client is CONDSTORE-aware (issued an enabling command) and the
-			// session still advertises CONDSTORE.
-			if s.condStoreEnabled() {
-				m.WriteModSeq(uint64(modified.modSeq))
-			}
-
-			if err := m.Close(); err != nil {
-				s.DebugLog("failed to close fetch response", "uid", modified.uid, "error", err)
-			}
-		}
-	}
+	writeResponses()
 
 	return nil
 }

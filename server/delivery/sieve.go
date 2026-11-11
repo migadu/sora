@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-message"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
@@ -46,18 +46,18 @@ type VacationOracle struct {
 	RDB *resilient.ResilientDatabase
 }
 
-// IsVacationResponseAllowed checks if a vacation response is allowed for the given original sender and handle.
-func (o *VacationOracle) IsVacationResponseAllowed(ctx context.Context, AccountID int64, originalSender string, handle string, duration time.Duration) (bool, error) {
-	hasRecent, err := o.RDB.HasRecentVacationResponseWithRetry(ctx, AccountID, originalSender, duration)
+// IsVacationResponseAllowed checks if a vacation response is allowed for the given original sender and response identity.
+func (o *VacationOracle) IsVacationResponseAllowed(ctx context.Context, AccountID int64, originalSender string, responseIdentity string, duration time.Duration) (bool, error) {
+	hasRecent, err := o.RDB.HasRecentVacationResponseWithRetry(ctx, AccountID, originalSender, responseIdentity, duration)
 	if err != nil {
 		return false, fmt.Errorf("checking db for recent vacation response: %w", err)
 	}
 	return !hasRecent, nil
 }
 
-// RecordVacationResponseSent records that a vacation response has been sent.
-func (o *VacationOracle) RecordVacationResponseSent(ctx context.Context, AccountID int64, originalSender string, handle string) error {
-	return o.RDB.RecordVacationResponseWithRetry(ctx, AccountID, originalSender)
+// ClaimVacationResponse makes the definitive suppression decision at handoff.
+func (o *VacationOracle) ClaimVacationResponse(ctx context.Context, AccountID int64, originalSender, responseIdentity string, duration time.Duration) (bool, error) {
+	return o.RDB.ClaimVacationResponseWithRetry(ctx, AccountID, originalSender, responseIdentity, duration)
 }
 
 // CountRedirectsSince returns the number of redirects performed by the given account within the specified duration window.
@@ -221,31 +221,35 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		if recipient.FromAddress != nil {
 			// Stamp the outgoing copy with an incremented hop count (loop backstop).
 			relayBytes := helpers.PrependHeaderLine(outcome.MessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(helpers.RedirectHopCount(helpers.HeaderGetter(outcome.MessageEntity.Header.Map()))+1))
-			// Try immediate delivery first if queue is not configured
-			if s.RelayQueue == nil && s.RelayHandler != nil {
-				err := s.RelayHandler.SendToExternalRelay(recipient.FromAddress.FullAddress(), result.RedirectTo, relayBytes)
-				if err == nil && !result.Copy {
-					// Successfully redirected without copy
-					outcome.MailboxName = ""
-					outcome.Discarded = true
-					return outcome, nil
+			// Attribute this redirect to the script owner, replacing any earlier or
+			// sender-supplied attribution. Aliases still use the account's primary address.
+			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, recipient.Address.FullAddress())
+			from := recipient.FromAddress.FullAddress()
+			relayed := s.RelayQueue != nil || s.RelayHandler != nil
+			for _, redirectTo := range result.RedirectTo {
+				// Try immediate delivery first if queue is not configured
+				if s.RelayQueue == nil && s.RelayHandler != nil {
+					if err := s.RelayHandler.SendToExternalRelay(from, redirectTo, relayBytes); err != nil {
+						relayed = false
+					}
+				} else if s.RelayQueue != nil {
+					// Queue for background delivery with retry
+					if err := s.RelayQueue.Enqueue(from, redirectTo, "redirect", relayBytes); err != nil {
+						// Failed to enqueue: keep the message in INBOX rather than fail the
+						// delivery, but say so where an operator will see it — the user's
+						// redirect silently did not happen.
+						s.DeliveryCtx.Logger.Log("Failed to enqueue redirect message: %v", err)
+						logger.Warn("Sieve redirect could not be queued; message kept in INBOX instead",
+							"account_id", recipient.AccountID, "redirect_to", redirectTo, "error", err)
+						relayed = false
+					}
 				}
-			} else if s.RelayQueue != nil {
-				// Queue for background delivery with retry
-				err := s.RelayQueue.Enqueue(recipient.FromAddress.FullAddress(), result.RedirectTo, "redirect", relayBytes)
-				if err != nil {
-					// Failed to enqueue: keep the message in INBOX rather than fail the
-					// delivery, but say so where an operator will see it — the user's
-					// redirect silently did not happen.
-					s.DeliveryCtx.Logger.Log("Failed to enqueue redirect message: %v", err)
-					logger.Warn("Sieve redirect could not be queued; message kept in INBOX instead",
-						"account_id", recipient.AccountID, "redirect_to", result.RedirectTo, "error", err)
-				} else if !result.Copy {
-					// Successfully queued for redirect without copy
-					outcome.MailboxName = ""
-					outcome.Discarded = true
-					return outcome, nil
-				}
+			}
+			if relayed && !result.Copy {
+				// Every address relayed or queued, and no copy was asked for
+				outcome.MailboxName = ""
+				outcome.Discarded = true
+				return outcome, nil
 			}
 		}
 		// Fallback or copy: deliver to INBOX

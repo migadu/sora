@@ -756,11 +756,21 @@ max_total_size = 1048576       # Maximum total metadata size per account (1MB). 
 # Enable shared mailboxes for collaboration between users on the same domain.
 # Uses IMAP namespace extension (RFC 2342) for proper client support.
 # Implements Access Control Lists (RFC 4314) for fine-grained permissions.
+#
+# Before enabling on a server with existing users: the prefix is matched
+# case-insensitively, so folders users already made under it ("Shared",
+# "shared/Old", ...) fall inside the namespace without being shared. The root
+# folder can no longer be selected, and none of them can be renamed out of it.
+# Find them first (for the default prefix):
+#   SELECT count(*), count(DISTINCT account_id) FROM mailboxes
+#    WHERE deleted_at IS NULL AND NOT COALESCE(is_shared, FALSE)
+#      AND (LOWER(name) = 'shared' OR LOWER(name) LIKE 'shared/%');
 
 [shared_mailboxes]
 enabled = false                  # Enable shared mailbox functionality (default: false)
 namespace_prefix = "Shared/"     # IMAP namespace prefix for shared mailboxes (e.g., "Shared/" or "#shared/")
-allow_user_create = false        # Allow regular users to create shared mailboxes (false = admin-only)
+allow_user_create = false        # Allow users to create shared mailboxes over IMAP (false = admin-only: sora-admin mailbox create)
+allow_anyone_identifier = false  # Allow granting rights to "anyone" (every user in the owner's domain); existing grants stay until revoked
 default_rights = "lrswipkxtea"   # Default ACL rights for shared mailbox creators (full rights by default)
                                 # Rights: l=lookup, r=read, s=seen, w=write, i=insert, p=post, k=create, x=delete, t=delete-msg, e=expunge, a=admin
 
@@ -1003,6 +1013,7 @@ master_sasl_allowed_networks = []   # e.g. ["10.0.0.0/24", "192.168.1.10"]
 # 2. Use per-server certificates (only if global [tls] enabled=false)
 #    Set tls=true AND provide tls_cert_file/tls_key_file below
 tls = false                               # Enable TLS for IMAP (IMAPS). Typically on port 993.
+tls_use_starttls = false                  # With tls = true: plaintext port offering STARTTLS (usually :143) instead of implicit TLS (:993).
 # tls_cert_file = "/path/to/your/imap.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
 # tls_key_file = "/path/to/your/imap.key"   # [OPTIONAL] Only needed if global [tls] is disabled
 tls_verify = false                        # Verify client certificates (mutual TLS). Usually false.
@@ -1037,8 +1048,9 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 #
 # disabled_caps = ["ESEARCH", "CONDSTORE", "IDLE"]  # Example: disable these capabilities globally
 #
-# NOTE: Do not disable core capabilities like IMAP4rev1, STARTTLS, or AUTH=PLAIN
-# as this will break basic IMAP functionality.
+# NOTE: Do not disable IMAP4rev1, as this will break basic IMAP functionality.
+# STARTTLS, LOGINDISABLED and AUTH=PLAIN follow tls, tls_use_starttls and
+# insecure_auth; disabled_caps does not change them.
 
 # --- ADDITIONAL CAPABILITY TOKENS ---
 # Advertise extra, non-standard capability tokens to ALL clients, verbatim. These
@@ -1131,6 +1143,12 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 limits.search_rate_limit_per_min = 60    # Searches per window per user (default: 60, set to 0 to disable).
 limits.search_rate_limit_window = "1m"   # Time window for search rate limiting (default: "1m").
 # limits.search_rate_limit_burst = 60    # Searches allowed back to back (default: search_rate_limit_per_min).
+# Maximum matching messages per THREAD or UID THREAD command (IMAP backend only).
+# Applies to all algorithms and criteria, including ALL. At the cap the complete result is
+# returned; above it the command fails with NO [LIMIT], never a partial message list.
+# Raising this cap increases memory and CPU use. Omitted, zero or negative values use 50000;
+# there is no unlimited setting. Changes require restarting this server.
+limits.thread_max_messages = 50000
 limits.redirect_rate_limit = 100         # Maximum SIEVE redirects per user (default: 100, set to 0 to disable).
 limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h").
 limits.max_redirect_hops = 2             # Max times one message may be redirected before suppression — mail-loop
@@ -1308,6 +1326,7 @@ max_connections_per_ip = 5
 master_sasl_username = ""
 master_sasl_password = ""
 tls = false
+tls_use_starttls = false      # With tls = true: plaintext port offering STLS (RFC 2595, usually :110) instead of implicit TLS (:995).
 # tls_cert_file = "/path/to/your/pop3.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
 # tls_key_file = "/path/to/your/pop3.key"   # [OPTIONAL] Only needed if global [tls] is disabled
 tls_verify = false
@@ -1485,6 +1504,7 @@ master_sasl_password = "proxypass"
 
 # --- PROXY TLS CONFIGURATION ---
 tls = false
+tls_use_starttls = false              # With tls = true: plaintext port offering STARTTLS (usually :143) instead of implicit TLS (:993)
 tls_cert_file = ""
 tls_key_file = ""
 tls_verify = true
@@ -1929,6 +1949,7 @@ master_sasl_password = "proxypass"
 
 # --- PROXY TLS CONFIGURATION ---
 tls = false
+tls_use_starttls = false              # With tls = true: plaintext port offering STLS (RFC 2595) instead of implicit TLS
 tls_cert_file = ""
 tls_key_file = ""
 tls_verify = true

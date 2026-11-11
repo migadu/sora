@@ -3,9 +3,10 @@ package imap
 import (
 	"context"
 	"errors"
+	"sync"
 
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -36,6 +37,13 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 	mailboxID := s.selectedMailbox.ID
 	highestModSeqToPollFrom := s.currentHighestModSeq.Load()
 	release()
+
+	// Hold off while a STORE .SILENT of this session is between its write and
+	// its own MODSEQ responses (the NOTIFY pump polls concurrently), so the
+	// delta read below either precedes that write or finds it in ownStoreEcho.
+	s.ownStoreMu.Lock()
+	unlockOwnStore := sync.OnceFunc(s.ownStoreMu.Unlock)
+	defer unlockOwnStore()
 
 	// Create a context that signals to use the master DB if the session is pinned.
 	readCtx := ctx
@@ -343,11 +351,26 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 			}
 		}
 		s.currentNumMessages.Store(poll.NumMessages)
+
+		// RFC 3501 §2.3.2: a read-write session that is notified of a message is
+		// the one that sees it as \Recent; later opens must not. Advance the same
+		// baselines a read-write SELECT sets, so that EXAMINE/SELECT after this
+		// point (here or in another session) does not count these messages again.
+		// recentAboveUID is left alone: they stay \Recent in this session.
+		if !s.selectedReadOnly.Load() && s.lastSelectedMailboxID == mailboxID && poll.HighestUID > 0 {
+			s.lastHighestUID = max(s.lastHighestUID, poll.HighestUID)
+			s.server.mailboxRecentUIDs.Store(mailboxID, poll.HighestUID)
+		}
 	}
 
 	// Process message flag updates
 	for _, update := range poll.Updates {
 		if update.IsExpunge {
+			continue
+		}
+
+		// Already answered by this session's own STORE .SILENT, without FLAGS.
+		if modSeq, ok := s.ownStoreEcho[update.UID]; ok && modSeq == update.EffectiveModSeq && s.ownStoreEchoMailboxID == mailboxID {
 			continue
 		}
 
@@ -367,10 +390,22 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		s.mailboxTracker.QueueMessageFlags(update.SeqNum, update.UID, allFlags, update.EffectiveModSeq, nil)
 	}
 
+	// The session has now seen every change up to its cursor.
+	if s.ownStoreEchoMailboxID != mailboxID {
+		s.ownStoreEcho = nil
+	}
+	cursor := s.currentHighestModSeq.Load()
+	for uid, modSeq := range s.ownStoreEcho {
+		if modSeq <= cursor {
+			delete(s.ownStoreEcho, uid)
+		}
+	}
+
 	// Store sessionTracker reference before releasing lock to avoid race condition
 	sessionTracker := s.sessionTracker
 
 	release() // Release lock before writing to the network
+	unlockOwnStore()
 
 	// Check if sessionTracker is still valid after releasing lock
 	if sessionTracker == nil {

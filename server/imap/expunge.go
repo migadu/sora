@@ -3,12 +3,14 @@ package imap
 import (
 	"context"
 
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
 func (s *IMAPSession) Expunge(ctx context.Context, w *imapserver.ExpungeWriter, uidSet *imap.UIDSet) error {
+	ctx = s.pinnedContext(ctx)
+
 	// First phase: Read session state with simple read lock
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {

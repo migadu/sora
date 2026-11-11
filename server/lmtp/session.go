@@ -18,8 +18,8 @@ import (
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 
-	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-smtp"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -693,8 +693,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	}
 
 	// Always run the default script first as a "before script"
-	// Use the pre-parsed default executor from the backend
-	if s.backend.defaultSieveExecutor != nil {
+	// Share the compiled script, but bind its policy to this delivery's account.
+	if s.backend.defaultSieveScript != nil {
 		// SIEVE debugging information
 		if settings.debug {
 			s.DebugLog("sieve message headers for evaluation")
@@ -705,7 +705,15 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			}
 		}
 
-		defaultResult, defaultEvalErr := s.backend.defaultSieveExecutor.Evaluate(ctx, sieveCtx)
+		defaultSieveExecutor := s.backend.defaultSieveScript.NewExecutor(
+			s.AccountID(),
+			sieveVacOracle,
+			sieveVacOracle,
+			s.backend.redirectRateLimit,
+			s.backend.redirectRateWindow,
+			s.backend.maxRedirectHops,
+		)
+		defaultResult, defaultEvalErr := defaultSieveExecutor.Evaluate(ctx, sieveCtx)
 		if defaultEvalErr != nil {
 			metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
 			s.WarnLog("default sieve script evaluation error", "error", defaultEvalErr)
@@ -719,7 +727,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			s.logSieveAction("default", result)
 		}
 	} else {
-		s.DebugLog("no default sieve executor available")
+		s.DebugLog("no default sieve script available")
 		result = sieveengine.Result{Action: sieveengine.ActionKeep}
 	}
 
@@ -749,16 +757,11 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			} else {
 				metrics.SieveExecutions.WithLabelValues("lmtp", "success").Inc()
 
-				// Merge user script result with default script result
-				// If user script returns implicit keep (ActionKeep), preserve the default script's action
-				// Otherwise, the user script overrides the default
-				if userResult.Action == sieveengine.ActionKeep && result.Action != sieveengine.ActionKeep {
-					s.InfoLog("user sieve implicit keep - preserving default script action", "default_action", result.Action, "vacation", userResult.Vacation != nil)
-					result = keepDefaultAction(result, userResult)
+				var keptDefault bool
+				result, keptDefault = mergeSieveResults(result, userResult)
+				if keptDefault {
+					s.InfoLog("user sieve keep - merging with default script result", "default_action", result.Action, "vacation", result.Vacation != nil)
 				} else {
-					// User script has an explicit action, override the default
-					result = userResult
-
 					s.logSieveAction("user", result)
 				}
 			}
@@ -969,14 +972,21 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			// Stamp the outgoing copy with an incremented hop count (loop backstop).
 			hops := helpers.RedirectHopCount(helpers.HeaderGetter(messageContent.Header.Map()))
 			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(hops+1))
-			err := s.sendToExternalRelay(s.sender.FullAddress(), result.RedirectTo, relayBytes)
-			if err != nil {
-				s.DebugLog("error enqueuing redirected message, falling back to inbox", "error", err)
-				// Continue processing even if queue fails, store in INBOX as fallback
-			} else {
-				s.DebugLog("successfully queued message for relay delivery", "redirect_to", result.RedirectTo)
-
-				// If :copy is not specified and relay succeeded, we don't store the message locally
+			// User.Address is the script owner's primary address, even for aliases.
+			// Replace earlier or sender-supplied attribution on the outgoing copy only.
+			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
+			relayed := true
+			for _, redirectTo := range result.RedirectTo {
+				if err := s.sendToExternalRelay(s.sender.FullAddress(), redirectTo, relayBytes); err != nil {
+					s.DebugLog("error enqueuing redirected message, falling back to inbox", "redirect_to", redirectTo, "error", err)
+					// Continue processing even if queue fails, store in INBOX as fallback
+					relayed = false
+					continue
+				}
+				s.DebugLog("successfully queued message for relay delivery", "redirect_to", redirectTo)
+			}
+			if relayed {
+				// If :copy is not specified and every relay succeeded, we don't store the message locally
 				if !result.Copy {
 					s.DebugLog("redirect without :copy - skipping local delivery")
 					recordMetrics("success")
@@ -1084,17 +1094,35 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	return nil
 }
 
-// keepDefaultAction merges the result of a user script that ended in the implicit
-// keep into the default script's, whose action then stands: the user script only
-// left where the message goes to the default. Everything else it did still happens,
-// after the default script's work as the two ran: its flags join the default's, its
-// header edits follow the default's, and its vacation reply goes out (RFC 5230 §4.7),
-// seeing those edits as RFC 5293 §7 requires.
+// mergeSieveResults decides what the default script and the user script together
+// ask of delivery. A user script that kept, implicitly or explicitly, leaves where
+// the message goes to the default script, whatever it decided, and the two results
+// are merged by keepDefaultAction; it reports keptDefault then. A user script that
+// took an explicit fileinto, redirect or discard took the message over, and its
+// result stands alone: the default script's flags, header edits and reply are all
+// replaced, the reply with them, since the user script overruled that run entirely.
+func mergeSieveResults(defaultResult, userResult sieveengine.Result) (merged sieveengine.Result, keptDefault bool) {
+	if userResult.Action == sieveengine.ActionKeep {
+		return keepDefaultAction(defaultResult, userResult), true
+	}
+	return userResult, false
+}
+
+// keepDefaultAction merges the result of a user script that ended in a keep into
+// the default script's, whose action then stands, be it a filing or a keep of its
+// own: the user script only left where the message goes to the default. Everything
+// else it did still happens, after the default script's work as the two ran: its
+// flags join the default's, its header edits follow the default's, and its vacation
+// reply goes out (RFC 5230 §4.7), seeing those edits as RFC 5293 §7 requires. A user
+// reply takes precedence; otherwise the default script's independent vacation reply
+// still stands.
 func keepDefaultAction(defaultResult, userResult sieveengine.Result) sieveengine.Result {
 	merged := defaultResult
 	merged.Flags = mergeFlags(defaultResult.Flags, userResult.Flags)
 	merged.HeaderEdits = slices.Concat(defaultResult.HeaderEdits, userResult.HeaderEdits)
-	merged.Vacation = userResult.Vacation
+	if userResult.Vacation != nil {
+		merged.Vacation = userResult.Vacation
+	}
 	return merged
 }
 

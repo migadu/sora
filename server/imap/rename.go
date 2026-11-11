@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/migadu/go-imap"
+	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 )
@@ -21,6 +21,17 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	}
 	AccountID := s.AccountID()
 	release()
+	// The source, destination hierarchy and ACLs may have been created or
+	// changed by an earlier command in this same session.
+	if s.useMasterDB.Load() {
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
+
+	// As in CREATE: a parent this RENAME creates inside the shared namespace must be a
+	// shared mailbox, which CreateMailbox decides from the config in the context.
+	if s.server.config != nil {
+		ctx = context.WithValue(ctx, consts.ConfigContextKey, s.server.config)
+	}
 
 	if strings.EqualFold(existingName, newName) {
 		s.DebugLog("new mailbox name is the same as current one (case-insensitive)", "mailbox", existingName)
@@ -55,6 +66,34 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 			}
 		}
 		return s.internalError("failed to fetch mailbox '%s': %v", existingName, err)
+	}
+
+	// Whether a mailbox is shared is settled when it is created in or outside the
+	// shared namespace, so a RENAME never crosses it (issue #160). Checked before any
+	// parent of the new name is created, and against the stored flag as
+	// db.RenameMailbox does: a personal mailbox can sit under the shared prefix, and
+	// may only be renamed out of it.
+	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
+		isShared, sharedErr := s.server.rdb.IsMailboxSharedWithRetry(ctx, oldMailbox.ID)
+		if sharedErr != nil {
+			return s.internalError("failed to check whether mailbox '%s' is shared: %v", existingName, sharedErr)
+		}
+		if s.server.config.SharedMailboxes.InNamespace(newName) != isShared {
+			s.DebugLog("rejecting rename across the shared namespace boundary", "old_name", existingName, "new_name", newName)
+			return sharedBoundaryError()
+		}
+	}
+
+	// A mailbox cannot become its own descendant. Refused before the missing levels
+	// of the new name are created, which would be below this mailbox. (RENAME INBOX
+	// moves messages into a new mailbox instead, which may be below INBOX.)
+	if !strings.EqualFold(existingName, consts.MailboxInbox) && helpers.MailboxNameIsBelow(newName, existingName) {
+		s.DebugLog("rejecting rename of a mailbox below itself", "old_name", existingName, "new_name", newName)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeCannot,
+			Text: "A mailbox cannot be renamed to a name below itself",
+		}
 	}
 
 	// Check ACL permissions - requires 'x' (delete) right on the mailbox being renamed
@@ -158,6 +197,24 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	// Determine the new parent mailbox ID
 	// Use the owner's AccountID for shared mailbox support
 	ownerAccountID := oldMailbox.AccountID
+
+	// With allow_user_create off, RENAME must not make a top-level shared mailbox
+	// out of one inside an existing shared mailbox: that is creating one. Renaming
+	// what already is a top-level shared mailbox adds none.
+	newRoot, rootErr := s.isRefusedSharedRoot(ctx, ownerAccountID, newName)
+	if rootErr != nil {
+		return rootErr
+	}
+	if newRoot {
+		oldRoot, rootErr := s.isRefusedSharedRoot(ctx, ownerAccountID, existingName)
+		if rootErr != nil {
+			return rootErr
+		}
+		if !oldRoot {
+			return s.sharedCreateRefusal(ctx, ownerAccountID, newName)
+		}
+	}
+
 	var newParentMailboxID *int64
 	newParts := strings.Split(newName, string(consts.MailboxDelimiter))
 	if len(newParts) > 1 {
@@ -186,6 +243,9 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	// Rename using the mailbox owner's AccountID
 	err = s.server.rdb.RenameMailboxWithRetry(ctx, oldMailbox.ID, ownerAccountID, newName, newParentMailboxID)
 	if err != nil {
+		if errors.Is(err, consts.ErrMailboxSharedBoundary) {
+			return sharedBoundaryError()
+		}
 		return s.internalError("failed to rename mailbox '%s' to '%s': %v", existingName, newName, err)
 	}
 
@@ -224,27 +284,43 @@ func (s *IMAPSession) writeRenameOldName(w *imapserver.RenameWriter, oldName, ne
 // Shared by the INBOX-rename and regular-rename destination-parent resolution so
 // both link a hierarchical target under its parent rather than storing a flat name.
 func (s *IMAPSession) resolveOrCreateParentPath(ctx context.Context, newParentPath string, ownerAccountID int64) (*int64, error) {
-	newParentMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, newParentPath)
-	if err == consts.ErrMailboxNotFound {
-		s.DebugLog("new parent mailbox does not exist, auto-creating", "parent", newParentPath)
-		createErr := s.server.rdb.CreateMailboxWithRetry(ctx, ownerAccountID, newParentPath, nil)
-		if createErr != nil {
-			// Handle race condition: another session may have created the parent concurrently.
-			if errors.Is(createErr, consts.ErrDBUniqueViolation) {
-				s.DebugLog("parent mailbox already exists (concurrent create)", "parent", newParentPath)
-			} else {
-				return nil, s.internalError("failed to auto-create new parent mailbox '%s': %v", newParentPath, createErr)
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	// The nearest existing level of the path, as the owner sees it, may be another
+	// owner's shared mailbox. A mailbox stays with its owner, so it cannot move
+	// there; nor is a namesake hierarchy of the owner's created in front of it.
+	parts := strings.Split(newParentPath, string(consts.MailboxDelimiter))
+	for i := len(parts); i >= 1; i-- {
+		path := strings.Join(parts[:i], string(consts.MailboxDelimiter))
+		mailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, path)
+		if errors.Is(err, consts.ErrMailboxNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, s.internalError("failed to fetch new parent mailbox %q: %v", path, err)
+		}
+		if mailbox.AccountID != ownerAccountID {
+			s.DebugLog("rejecting rename into another owner's shared mailbox", "parent", path)
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeCannot,
+				Text: "Mailboxes cannot be moved into another owner's shared mailbox",
 			}
 		}
-		// Fetch the newly created parent to get its ID.
-		newParentMailbox, err = s.server.rdb.GetMailboxByNameWithRetry(ctx, ownerAccountID, newParentPath)
-		if err != nil {
-			return nil, s.internalError("failed to fetch auto-created new parent mailbox '%s': %v", newParentPath, err)
+		if i == len(parts) {
+			return &mailbox.ID, nil
 		}
-	} else if err != nil {
-		return nil, s.internalError("failed to fetch new parent mailbox '%s': %v", newParentPath, err)
+		break
 	}
-	return &newParentMailbox.ID, nil
+	// Policy applies only when creating a missing parent. Reusing an existing
+	// shared mailbox is still allowed when user-created shared roots are disabled.
+	if refusal := s.sharedCreateRefusal(ctx, ownerAccountID, newParentPath); refusal != nil {
+		return nil, refusal
+	}
+	parentID, err := s.server.rdb.ResolveOrCreateMailboxPathWithRetry(ctx, ownerAccountID, newParentPath)
+	if err != nil {
+		return nil, s.internalError("failed to resolve new parent hierarchy %q: %v", newParentPath, err)
+	}
+	return parentID, nil
 }
 
 // checkCreateRightForHierarchy verifies the acting user holds the "k" (create)
@@ -279,4 +355,14 @@ func (s *IMAPSession) checkCreateRightForHierarchy(ctx context.Context, newParen
 		return nil
 	}
 	return nil
+}
+
+// sharedBoundaryError is the refusal of a RENAME into or out of the shared namespace:
+// RFC 5530 CANNOT, an operation that can never succeed.
+func sharedBoundaryError() *imap.Error {
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeCannot,
+		Text: "Mailboxes cannot be moved into or out of the shared namespace",
+	}
 }

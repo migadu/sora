@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -83,7 +83,7 @@ func TestLegacySharedMailboxMessagesStaySearchable(t *testing.T) {
 	}
 
 	t.Run("THREAD ALL", func(t *testing.T) {
-		msgs, err := db.GetMessagesForThreading(ctx, mailboxID, ownerID, &imap.SearchCriteria{}, true, true)
+		msgs, err := db.GetMessagesForThreading(ctx, mailboxID, ownerID, &imap.SearchCriteria{}, true, true, 0)
 		require.NoError(t, err)
 		found := map[imap.UID]bool{}
 		for _, m := range msgs {

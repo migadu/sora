@@ -63,6 +63,7 @@ type POP3ProxyServer struct {
 	appCtx             context.Context
 	cancel             context.CancelFunc
 	tlsConfig          *tls.Config
+	useStartTLS        bool // tlsConfig upgrades a plaintext listener on STLS instead of wrapping it
 	masterUsername     string
 	masterPassword     string
 	connManager        *proxy.ConnectionManager
@@ -162,6 +163,7 @@ type POP3ProxyServerOptions struct {
 	TLSCertFile              string
 	TLSKeyFile               string
 	TLSVerify                bool
+	TLSUseStartTLS           bool        // Plaintext listener offering STLS (RFC 2595) instead of implicit TLS; requires TLS
 	TLSConfig                *tls.Config // Global TLS config from TLS manager (optional)
 	RemoteAddrs              []string
 	Pools                    []proxy.PoolSpec // Named backend pools ([[pool]] blocks); when set, RemoteAddrs is unused and each pool brings its own backend-leg settings
@@ -404,6 +406,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		rdb:                        rdb,
 		appCtx:                     serverCtx,
 		cancel:                     serverCancel,
+		useStartTLS:                options.TLS && options.TLSUseStartTLS, // config warns when tls_use_starttls lacks tls
 		masterUsername:             options.MasterUsername,
 		masterPassword:             options.MasterPassword,
 		connManager:                connManager,
@@ -506,7 +509,9 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 	}
 
 	opts := pop3server.Options{
-		TLSConfig:              s.tlsConfig,
+		TLSConfig:              server.StartTLSConfig(s.tlsConfig, "pop3_proxy"), // records JA4 on STLS, as SoraTLSConn does for implicit TLS
+		OnStartTLS:             server.BeginStartTLS,
+		OnTLSHandshakeComplete: server.CompleteStartTLS,
 		IdleTimeout:            settings.commandTimeout,
 		AuthIdleTimeout:        settings.authIdleTimeout,
 		AbsoluteSessionTimeout: settings.absoluteSessionTimeout,
@@ -564,16 +569,17 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 			sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
 			session := &POP3ProxySession{
-				server:      s,
-				settings:    settings,
-				clientConn:  netConn,
-				ctx:         sessionCtx,
-				cancel:      sessionCancel,
-				releaseConn: releaseConn,
-				proxyInfo:   proxyInfo,
-				sessionID:   idgen.New(),
-				pop3Conn:    c,
-				startTime:   time.Now(),
+				server:       s,
+				settings:     settings,
+				clientConn:   netConn,
+				listenerConn: netConn,
+				ctx:          sessionCtx,
+				cancel:       sessionCancel,
+				releaseConn:  releaseConn,
+				proxyInfo:    proxyInfo,
+				sessionID:    idgen.New(),
+				pop3Conn:     c,
+				startTime:    time.Now(),
 			}
 
 			if proxyInfo != nil && proxyInfo.SrcIP != "" {
@@ -602,8 +608,9 @@ func (s *POP3ProxyServer) connConfig() server.SoraConnConfig {
 		Hostname:             s.hostname,
 		IdleTimeout:          settings.commandTimeout,
 		AbsoluteTimeout:      settings.absoluteSessionTimeout,
+		NoAbsoluteTimeout:    settings.absoluteSessionTimeout <= 0,
 		MinBytesPerMinute:    settings.minBytesPerMinute,
-		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0,
+		EnableTimeoutChecker: settings.commandTimeout > 0 || settings.absoluteSessionTimeout > 0 || settings.minBytesPerMinute > 0,
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Send POP3 error response before closing
 			// RFC 1939 doesn't define specific timeout response codes, but [IN-USE] is commonly used
@@ -643,7 +650,10 @@ func (s *POP3ProxyServer) Start() error {
 	// bytes (broken PROXY+TLS combo).
 	base := server.WrapProxyProtocol(tcpListener, s.proxyReader, "POP3-PROXY")
 
-	if s.tlsConfig != nil {
+	// In STARTTLS mode the listener stays plaintext and the library upgrades
+	// the stream on STLS (it advertises STLS whenever it has a TLSConfig and
+	// the connection is not yet TLS).
+	if s.tlsConfig != nil && !s.useStartTLS {
 		// Use SoraTLSListener for TLS with JA4 capture and timeout protection
 		listener = server.NewSoraTLSListenerFunc(base, s.tlsConfig, s.connConfig)
 	} else {
@@ -836,9 +846,12 @@ func (s *POP3ProxyServer) sendGracefulShutdownMessage() {
 	// Step 2: Write shutdown message directly to clientConn.
 	for _, session := range activeSessions {
 		session.mutex.Lock()
-		if session.clientConn != nil {
-			_, _ = fmt.Fprint(session.clientConn, "-ERR Server shutting down, please reconnect\r\n")
-		}
+		// Before hijack, after STLS, the client reads through the library's
+		// TLS connection, which sits above clientConn; while STLS is
+		// negotiating there is nothing to write to.
+		server.WriteNotice(session.clientConn, func(noticeConn net.Conn) {
+			_, _ = fmt.Fprint(noticeConn, "-ERR Server shutting down, please reconnect\r\n")
+		})
 		session.mutex.Unlock()
 	}
 

@@ -57,3 +57,57 @@ type mockAddrConn struct {
 }
 
 func (c *mockAddrConn) RemoteAddr() net.Addr { return c.remote }
+
+// A TTL that is not a number is a malformed forwarding parameter. It must be reported,
+// not skipped: skipping it leaves the default hop budget in place, so a looping proxy
+// that garbles its TTL would start every hop with a fresh one.
+func TestParseXCLIENT_MalformedTTLIsAnError(t *testing.T) {
+	parsers := map[string]func(string) (*ForwardingParams, error){
+		"POP3": ParsePOP3XCLIENT,
+		"LMTP": ParseLMTPXCLIENT,
+	}
+	for proto, parse := range parsers {
+		for _, ttl := range []string{"invalid", "", "5x", "1.5", "0x10"} {
+			t.Run(proto+"/TTL="+ttl, func(t *testing.T) {
+				params, err := parse("ADDR=192.0.2.1 PORT=12345 TTL=" + ttl)
+				if err == nil {
+					t.Fatalf("no error for TTL=%q; parsed ProxyTTL = %d", ttl, params.ProxyTTL)
+				}
+			})
+		}
+		t.Run(proto+"/valid", func(t *testing.T) {
+			params, err := parse("ADDR=192.0.2.1 TTL=3")
+			if err != nil || params.ProxyTTL != 3 {
+				t.Fatalf("TTL=3: ProxyTTL = %v, err = %v", params, err)
+			}
+			params, err = parse("ADDR=192.0.2.1 TTL=0")
+			if err != nil || params.ProxyTTL != 0 {
+				t.Fatalf("TTL=0: ProxyTTL = %v, err = %v", params, err)
+			}
+		})
+		t.Run(proto+"/absent", func(t *testing.T) {
+			params, err := parse("ADDR=192.0.2.1")
+			if err != nil || params.ProxyTTL != 10 {
+				t.Fatalf("no TTL: ProxyTTL = %v, err = %v; want the default 10", params, err)
+			}
+		})
+	}
+}
+
+// ParseIMAPID reports a malformed x-proxy-ttl too, and leaves ProxyTTL at 0 when the ID
+// carries none: IMAP has no default hop budget.
+func TestParseIMAPID_MalformedTTLIsAnError(t *testing.T) {
+	for _, ttl := range []string{"invalid", "", "5x"} {
+		if params, err := ParseIMAPID(map[string]string{"x-originating-ip": "192.0.2.1", "x-proxy-ttl": ttl}); err == nil {
+			t.Errorf("no error for x-proxy-ttl %q; parsed %+v", ttl, params)
+		}
+	}
+	params, err := ParseIMAPID(map[string]string{"x-originating-ip": "192.0.2.1", "x-proxy-ttl": "-1"})
+	if err != nil || params.ProxyTTL != -1 {
+		t.Errorf("x-proxy-ttl -1: params = %+v, err = %v", params, err)
+	}
+	params, err = ParseIMAPID(map[string]string{"x-originating-ip": "192.0.2.1"})
+	if err != nil || params.ProxyTTL != 0 {
+		t.Errorf("no x-proxy-ttl: params = %+v, err = %v", params, err)
+	}
+}

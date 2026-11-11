@@ -724,7 +724,7 @@ func TestMessageFlags(t *testing.T) {
 
 	t.Run("UpdateFlags_AddFlags", func(t *testing.T) {
 		updateReq := map[string]any{
-			"add_flags": []string{"Seen", "Flagged"},
+			"add_flags": []string{"\\Seen", "\\Flagged"},
 		}
 		resp := tc.makeRequest(t, "PATCH", "/user/messages/1", updateReq)
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
@@ -734,7 +734,7 @@ func TestMessageFlags(t *testing.T) {
 
 	t.Run("UpdateFlags_RemoveFlags", func(t *testing.T) {
 		updateReq := map[string]any{
-			"remove_flags": []string{"Draft"},
+			"remove_flags": []string{"\\Draft"},
 		}
 		resp := tc.makeRequest(t, "PATCH", "/user/messages/1", updateReq)
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
@@ -744,8 +744,8 @@ func TestMessageFlags(t *testing.T) {
 
 	t.Run("UpdateFlags_BothAddAndRemove", func(t *testing.T) {
 		updateReq := map[string]any{
-			"add_flags":    []string{"Seen"},
-			"remove_flags": []string{"Draft"},
+			"add_flags":    []string{"\\Seen"},
+			"remove_flags": []string{"\\Draft"},
 		}
 		resp := tc.makeRequest(t, "PATCH", "/user/messages/1", updateReq)
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {

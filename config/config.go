@@ -859,6 +859,7 @@ type ServerLimitsConfig struct {
 	SearchRateLimitPerMin *int   `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled, default: 60)
 	SearchRateLimitWindow string `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
 	SearchRateLimitBurst  *int   `toml:"search_rate_limit_burst,omitempty"`   // Searches allowed back to back (default: search_rate_limit_per_min)
+	ThreadMaxMessages     int    `toml:"thread_max_messages,omitempty"`       // Maximum matches per THREAD command (IMAP backend only, <=0 uses default: 50000)
 	RedirectRateLimit     *int   `toml:"redirect_rate_limit,omitempty"`       // Redirect rate limit (per account across the window, 0=unlimited, default: 100)
 	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (default: 1h)
 	MaxRedirectHops       *int   `toml:"max_redirect_hops,omitempty"`         // Max times one message may be redirected before suppression (mail-loop backstop, 0=unlimited, default: 2)
@@ -979,8 +980,10 @@ type ServerConfig struct {
 	// legacy behavior; relies solely on network isolation + secret secrecy).
 	MasterSASLAllowedNetworks []string `toml:"master_sasl_allowed_networks,omitempty"`
 
+	// STARTTLS on the listening port (requires tls = true): IMAP, LMTP, ManageSieve, POP3 and their proxies
+	TLSUseStartTLS bool `toml:"tls_use_starttls,omitempty"`
+
 	// LMTP specific
-	TLSUseStartTLS bool   `toml:"tls_use_starttls,omitempty"`
 	MaxMessageSize string `toml:"max_message_size,omitempty"` // Maximum size for incoming LMTP messages
 
 	// Auth security
@@ -1098,6 +1101,18 @@ type SharedMailboxesConfig struct {
 	AllowUserCreate       bool   `toml:"allow_user_create"`       // Allow regular users to create shared mailboxes
 	DefaultRights         string `toml:"default_rights"`          // Default ACL rights for shared mailbox creators
 	AllowAnyoneIdentifier bool   `toml:"allow_anyone_identifier"` // Enable RFC 4314 "anyone" identifier for domain-wide sharing
+}
+
+// InNamespace reports whether a mailbox of this name is created as a shared mailbox:
+// the feature is enabled and the name is under the namespace prefix, or is its root.
+func (c SharedMailboxesConfig) InNamespace(name string) bool {
+	if !c.Enabled {
+		return false
+	}
+	// Sora resolves every mailbox name case-insensitively. Classification must
+	// use that same rule, or a case variant can bypass shared namespace policy.
+	name, prefix := strings.ToLower(name), strings.ToLower(c.NamespacePrefix)
+	return strings.HasPrefix(name, prefix) || name == strings.TrimSuffix(prefix, "/")
 }
 
 // AdminCLIConfig holds configuration for sora-admin CLI tool
@@ -1503,12 +1518,16 @@ func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
 	}
 }
 
-// GetAbsoluteSessionTimeout parses the absolute session timeout duration (default: 24 hours for all protocols)
+// GetAbsoluteSessionTimeout parses the absolute session timeout duration.
+// Delivery proxy connections default to 5 minutes; other protocols use 24 hours.
 func (s *ServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
 	if s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != "" {
 		return helpers.ParseDuration(s.Timeouts.AbsoluteSessionTimeout)
 	}
-	return 24 * time.Hour, nil // Default: 24 hours for all protocols
+	if s.Type == "lmtp_proxy" {
+		return 5 * time.Minute, nil
+	}
+	return 24 * time.Hour, nil
 }
 
 // GetCommandTimeoutsOverrides returns a map of command name to timeout duration
@@ -1681,6 +1700,19 @@ func (s *ServerConfig) GetSearchRateLimitBurst() int {
 		return *s.Limits.SearchRateLimitBurst
 	}
 	return s.GetSearchRateLimitPerMin()
+}
+
+// DefaultThreadMaxMessages bounds the metadata fetched and threaded in memory
+// by one IMAP THREAD command.
+const DefaultThreadMaxMessages = 50000
+
+// GetThreadMaxMessages returns the maximum number of matches one THREAD command
+// may process. Unset, zero and negative values retain the bounded default.
+func (s *ServerConfig) GetThreadMaxMessages() int {
+	if s.Limits != nil && s.Limits.ThreadMaxMessages > 0 {
+		return s.Limits.ThreadMaxMessages
+	}
+	return DefaultThreadMaxMessages
 }
 
 // GetMinBytesPerMinute returns minimum bytes per minute
@@ -1968,6 +2000,19 @@ func (s *ServerConfig) Validate() error {
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
+	if s.TLSUseStartTLS {
+		switch s.Type {
+		case "imap", "lmtp", "managesieve", "pop3", "imap_proxy", "lmtp_proxy", "managesieve_proxy", "pop3_proxy":
+			// The servers drop tls_use_starttls without tls (there is no certificate
+			// to upgrade with), so the listener comes up plaintext with no STARTTLS.
+			if !s.TLS {
+				logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured without 'tls = true'; it is ignored and the listener is plaintext with no STARTTLS", s.Name, s.Type)
+			}
+		default:
+			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to IMAP, LMTP, ManageSieve and POP3 servers and proxies", s.Name, s.Type)
+		}
+	}
+
 	// Check proxy-only options on non-proxy servers
 	if !strings.HasSuffix(s.Type, "_proxy") {
 		if len(s.RemoteAddrs) > 0 {
@@ -2076,9 +2121,6 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.AppendLimit != "" {
 			logger("WARNING: Server %s (type: %s) has 'append_limit' configured, but this only applies to IMAP servers", s.Name, s.Type)
-		}
-		if s.TLSUseStartTLS {
-			logger("WARNING: Server %s (type: %s) has 'tls_use_starttls' configured, but this only applies to protocol servers (IMAP, POP3, LMTP, ManageSieve)", s.Name, s.Type)
 		}
 		if s.Type == "metrics" && s.TLS {
 			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)

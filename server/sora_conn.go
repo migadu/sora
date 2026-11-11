@@ -26,6 +26,10 @@ var copyBufPool = sync.Pool{
 	},
 }
 
+// Timeout notices are best effort. A peer that does not read must not hold a
+// scheduler shard, its connection, or the notice goroutine open indefinitely.
+const timeoutNoticeGrace = 100 * time.Millisecond
+
 // GetAddrString safely extracts address string without triggering reverse DNS lookup.
 // This should be used instead of addr.String() to avoid slow reverse DNS lookups.
 func GetAddrString(addr net.Addr) string {
@@ -158,7 +162,8 @@ type SoraConn struct {
 	// serially — the same accept-path stall class as the 2026-07-05 incident.
 	probeTLSOnFirstRead atomic.Bool
 
-	checked atomic.Bool // registered with the timeout checker (see CheckedTimeouts)
+	checked   atomic.Bool // registered with the timeout checker (see CheckedTimeouts)
+	timingOut atomic.Bool // one owner for timeout notification and teardown
 
 	// Server context for metrics
 	protocol   string
@@ -169,6 +174,8 @@ type SoraConn struct {
 	idleTimeout         time.Duration // Maximum idle time (e.g., 5 minutes)
 	absoluteTimeout     time.Duration // Maximum session duration (e.g., 30 minutes)
 	minBytesPerMinute   int64         // Minimum throughput (0 = disabled)
+	throughputWindow    time.Duration // Slowloris measurement window (see checkTimeouts)
+	throughputGrace     time.Duration // Session age before a window counts against the connection
 	lastActivity        time.Time
 	sessionStart        time.Time
 	lastThroughputCheck time.Time
@@ -194,6 +201,14 @@ type SoraConn struct {
 
 	// Timeout callback
 	onTimeout func(conn net.Conn, reason string) // Called before closing due to timeout
+	// STARTTLS hooks record the accepted upgrade before its acknowledgement,
+	// then publish the TLS connection only after its handshake succeeds.
+	// These fields are protected by mu.
+	noticeConn         net.Conn
+	startTLSInProgress bool
+	// noticeMu serializes a notice with BeginStartTLS, so an earlier plaintext
+	// notice finishes before the protocol acknowledges the upgrade.
+	noticeMu sync.Mutex
 
 	// Lifecycle management
 	closed     bool
@@ -218,11 +233,22 @@ type SoraConnConfig struct {
 	// ignored): for a caller whose protocol library owns that limit.
 	NoAbsoluteTimeout bool
 
+	// ThroughputWindow is the window the slowloris check samples a connection's
+	// throughput over, and ThroughputGrace the session age before a window counts
+	// against it (see checkTimeouts); 0 = one minute and two minutes. Production
+	// leaves both at their defaults; a test shortens them so a multi-minute
+	// measurement history runs in under a second.
+	ThroughputWindow time.Duration
+	ThroughputGrace  time.Duration
+
 	// OnTimeout is called before closing connection due to timeout.
 	// The reason will be one of: "idle", "slow_throughput", or "session_max".
 	// The handler should send a protocol-specific goodbye message and return quickly.
+	// It runs outside the scheduler, with a bounded write deadline and transport
+	// closure to unblock pending I/O. It must not wait on anything other than conn I/O.
 	// If nil, the connection will be closed without sending any message.
-	// The conn parameter is the underlying net.Conn for writing goodbye messages.
+	// The conn parameter is the connection to write the goodbye message to: the
+	// underlying transport, or the connection published by CompleteStartTLS.
 	OnTimeout func(conn net.Conn, reason string)
 }
 
@@ -239,6 +265,12 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 	if config.Protocol == "" {
 		config.Protocol = "unknown"
 	}
+	if config.ThroughputWindow <= 0 {
+		config.ThroughputWindow = time.Minute
+	}
+	if config.ThroughputGrace <= 0 {
+		config.ThroughputGrace = 2 * time.Minute
+	}
 
 	sc := &SoraConn{
 		Conn:                conn,
@@ -246,6 +278,8 @@ func NewSoraConn(conn net.Conn, config SoraConnConfig) *SoraConn {
 		idleTimeout:         config.IdleTimeout,
 		absoluteTimeout:     config.AbsoluteTimeout,
 		minBytesPerMinute:   config.MinBytesPerMinute,
+		throughputWindow:    config.ThroughputWindow,
+		throughputGrace:     config.ThroughputGrace,
 		lastActivity:        now,
 		sessionStart:        now,
 		lastThroughputCheck: now,
@@ -281,7 +315,7 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 	closed := c.closed
 	c.closeMutex.Unlock()
 
-	if closed {
+	if closed || c.timingOut.Load() {
 		return
 	}
 
@@ -297,16 +331,7 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 
 	// Check absolute session timeout (highest priority)
 	if c.absoluteTimeout > 0 && sessionDuration >= c.absoluteTimeout {
-		remoteAddr := c.remoteAddr
-		logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "session_max", "duration", sessionDuration.Round(time.Second), "max", c.absoluteTimeout)
-		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, c.serverName, c.hostname, "session_max").Inc()
-
-		// Call timeout handler before closing (if provided)
-		if c.onTimeout != nil {
-			c.onTimeout(c.Conn, "session_max")
-		}
-
-		c.Close()
+		c.closeForTimeout(username, "session_max", "duration", sessionDuration.Round(time.Second), "max", c.absoluteTimeout)
 		return
 	}
 
@@ -325,13 +350,13 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 	//   - no bytes either way: left to the idle timeout, count unchanged.
 	// Two consecutive stalled windows disconnect.
 	// Skipped while suspended (IMAP IDLE), where client silence is expected.
-	if c.minBytesPerMinute > 0 && throughputDuration >= time.Minute {
+	if c.minBytesPerMinute > 0 && throughputDuration >= c.throughputWindow {
 		if suspended {
 			// Throughput checking is suspended - skip check
 			return
 		}
 
-		if sessionDuration >= 2*time.Minute {
+		if sessionDuration >= c.throughputGrace {
 			bytesPerMinute := int64(float64(bytesRead+bytesWritten) / throughputDuration.Minutes())
 
 			c.mu.Lock()
@@ -345,16 +370,7 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 			c.mu.Unlock()
 
 			if stalled >= 2 {
-				remoteAddr := c.remoteAddr
-				logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "slow_throughput", "bytes_read", bytesRead, "bytes_written", bytesWritten, "bytes_per_min", bytesPerMinute, "required", c.minBytesPerMinute, "stalled_windows", stalled)
-				metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, c.serverName, c.hostname, "slow_throughput").Inc()
-
-				// Call timeout handler before closing (if provided)
-				if c.onTimeout != nil {
-					c.onTimeout(c.Conn, "slow_throughput")
-				}
-
-				c.Close()
+				c.closeForTimeout(username, "slow_throughput", "bytes_read", bytesRead, "bytes_written", bytesWritten, "bytes_per_min", bytesPerMinute, "required", c.minBytesPerMinute, "stalled_windows", stalled)
 				return
 			}
 		}
@@ -364,17 +380,144 @@ func (c *SoraConn) checkTimeouts(now time.Time) {
 
 	// Check idle timeout
 	if c.idleTimeout > 0 && idleTime >= c.idleTimeout {
-		remoteAddr := c.remoteAddr
-		logger.Info("Connection closed - timeout", "proto", c.protocol, "remote", remoteAddr, "user", username, "reason", "idle", "idle_time", idleTime.Round(time.Second), "max_idle", c.idleTimeout)
-		metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, c.serverName, c.hostname, "idle").Inc()
+		c.closeForTimeout(username, "idle", "idle_time", idleTime.Round(time.Second), "max_idle", c.idleTimeout)
+	}
+}
 
-		// Call timeout handler before closing (if provided)
-		if c.onTimeout != nil {
-			c.onTimeout(c.Conn, "idle")
-		}
-
-		c.Close()
+// closeForTimeout claims the timeout once before handing off any socket work.
+// A blocked peer must never prevent the shard from checking another connection.
+func (c *SoraConn) closeForTimeout(username, reason string, details ...any) {
+	if !c.timingOut.CompareAndSwap(false, true) {
 		return
+	}
+	attrs := []any{"proto", c.protocol, "remote", c.remoteAddr, "user", username, "reason", reason}
+	logger.Info("Connection closed - timeout", append(attrs, details...)...)
+	metrics.ConnectionTimeoutsTotal.WithLabelValues(c.protocol, c.serverName, c.hostname, reason).Inc()
+
+	go func() {
+		// Unregister here too: Stop may hold the scheduler mutex while waiting
+		// for the shard to exit, so the shard must not perform this operation.
+		unregisterConn(c)
+		transport := c.Conn
+		// A concurrent protocol writer can replace the deadline, and TLS Close
+		// can wait while sending close_notify. Close the underlying transport
+		// at the same bound so neither can strand this goroutine.
+		timer := time.AfterFunc(timeoutNoticeGrace, func() { closeTimeoutTransport(transport) })
+		defer timer.Stop()
+		defer c.Close()
+		if c.onTimeout == nil {
+			return
+		}
+		// The notice goes to the connection the protocol is using: the
+		// transport, unless a library layered its own connection above this
+		// one (STARTTLS) and published it through CompleteStartTLS. Both
+		// reach the socket through transport, whose deadline bounds the write.
+		c.writeNotice(transport, func(notice net.Conn) {
+			if err := transport.SetWriteDeadline(time.Now().Add(timeoutNoticeGrace)); err == nil {
+				c.onTimeout(notice, reason)
+			}
+		})
+	}()
+}
+
+// BeginStartTLS is called by the protocol after accepting STARTTLS and before
+// writing its positive reply. It waits for any earlier notice to finish, then
+// suppresses notices until CompleteStartTLS publishes the secured connection.
+// A failed upgrade stays suppressed until the protocol closes the connection.
+func BeginStartTLS(conn net.Conn) {
+	if c := soraConnUnder(conn); c != nil {
+		c.noticeMu.Lock()
+		defer c.noticeMu.Unlock()
+		c.mu.Lock()
+		c.startTLSInProgress = true
+		c.mu.Unlock()
+	}
+}
+
+// CompleteStartTLS publishes the successfully handshaken connection before the
+// protocol dispatches any post-TLS commands. No library state is read by the
+// notice goroutine, and no subsequent socket read is needed to learn the upgrade.
+func CompleteStartTLS(plain net.Conn, secure *tls.Conn) {
+	if c := soraConnUnder(plain); c != nil {
+		c.mu.Lock()
+		c.noticeConn = secure
+		c.startTLSInProgress = false
+		c.mu.Unlock()
+	}
+}
+
+// noticeTarget returns the safe writer: the completed TLS connection, nil
+// during an accepted upgrade, or the original connection while still plaintext.
+func (c *SoraConn) noticeTarget(plain net.Conn) net.Conn {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.startTLSInProgress {
+		return nil
+	}
+	if c.noticeConn != nil {
+		return c.noticeConn
+	}
+	return plain
+}
+
+func (c *SoraConn) writeNotice(plain net.Conn, write func(net.Conn)) bool {
+	c.noticeMu.Lock()
+	defer c.noticeMu.Unlock()
+	target := c.noticeTarget(plain)
+	if target == nil {
+		return false
+	}
+	write(target)
+	return true
+}
+
+// notices returns the SoraConn itself; a type embedding one promotes it, which
+// is how soraConnUnder finds the SoraConn of a wrapper.
+func (c *SoraConn) notices() *SoraConn { return c }
+
+// soraConnUnder returns the SoraConn that conn is or wraps, or nil.
+func soraConnUnder(conn net.Conn) *SoraConn {
+	for conn != nil {
+		if sc, ok := conn.(interface{ notices() *SoraConn }); ok {
+			return sc.notices()
+		}
+		w, ok := conn.(interface{ Unwrap() net.Conn })
+		if !ok {
+			return nil
+		}
+		conn = w.Unwrap()
+	}
+	return nil
+}
+
+// NoticeConn returns the connection an asynchronous notice to the session on
+// conn may be written to: conn itself, or the TLS connection a library layered
+// above its SoraConn on STARTTLS. It returns nil while that upgrade is being
+// negotiated; callers must omit the notice in that case and retain normal
+// closure. WriteNotice also keeps the upgrade from starting under the notice.
+func NoticeConn(conn net.Conn) net.Conn {
+	if sc := soraConnUnder(conn); sc != nil {
+		return sc.noticeTarget(conn)
+	}
+	return conn
+}
+
+// WriteNotice calls write with the safe connection, returning false if an
+// upgrade is negotiating. BeginStartTLS waits for write to return before the
+// positive reply, so a plaintext notice cannot follow that acknowledgement.
+func WriteNotice(conn net.Conn, write func(net.Conn)) bool {
+	if sc := soraConnUnder(conn); sc != nil {
+		return sc.writeNotice(conn, write)
+	}
+	write(conn)
+	return true
+}
+
+// closeTimeoutTransport bypasses TLS close_notify and wrapper cleanup, which
+// c.Close performs afterwards. Closing the innermost socket unblocks its I/O.
+func closeTimeoutTransport(conn net.Conn) {
+	if raw := RawConn(conn); raw != nil {
+		raw.Close()
 	}
 }
 
@@ -842,19 +985,7 @@ func (c *SoraTLSConn) PerformHandshake() error {
 	originalGetConfig := tlsConfig.GetConfigForClient
 
 	tlsConfig.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-		// Capture JA4 fingerprint with panic recovery
-		// The ja4plus library can panic on malformed ClientHello messages
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					logger.Warn("JA4 fingerprinting panic recovered (likely malformed ClientHello)", "proto", c.connConfig.Protocol, "error", r)
-					// Set empty fingerprint on panic
-					c.SetJA4Fingerprint("")
-				}
-			}()
-			ja4 := ja4plus.JA4(hello)
-			c.SetJA4Fingerprint(ja4)
-		}()
+		captureJA4(c.connConfig.Protocol, hello, c.SetJA4Fingerprint)
 
 		// Call original callback if it exists
 		if originalGetConfig != nil {
@@ -911,6 +1042,51 @@ func (c *SoraTLSConn) PerformHandshake() error {
 	}
 
 	return nil
+}
+
+// captureJA4 hands hello's JA4 fingerprint to record, or "" when the ja4plus
+// library panics, as it can on a malformed ClientHello.
+func captureJA4(protocol string, hello *tls.ClientHelloInfo, record func(string)) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Warn("JA4 fingerprinting panic recovered (likely malformed ClientHello)", "proto", protocol, "error", r)
+			record("")
+		}
+	}()
+	record(ja4plus.JA4(hello))
+}
+
+// StartTLSConfig returns a copy of config for a protocol library to upgrade a
+// plaintext connection with on STARTTLS. Its handshake records the client's JA4
+// fingerprint on the SoraConn under the upgraded connection, as SoraTLSConn's
+// does for implicit TLS, so client filters keyed on JA4 apply to STARTTLS
+// sessions too. It is nil when config is.
+func StartTLSConfig(config *tls.Config, protocol string) *tls.Config {
+	if config == nil {
+		return nil
+	}
+	cfg := config.Clone()
+	original := cfg.GetConfigForClient
+	cfg.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		// hello.Conn is the connection the library handed tls.Server: the
+		// plaintext one, which is or wraps the SoraConn.
+		for conn := hello.Conn; conn != nil; {
+			if sc, ok := conn.(interface{ SetJA4Fingerprint(string) }); ok {
+				captureJA4(protocol, hello, sc.SetJA4Fingerprint)
+				break
+			}
+			w, ok := conn.(interface{ Unwrap() net.Conn })
+			if !ok {
+				break
+			}
+			conn = w.Unwrap()
+		}
+		if original != nil {
+			return original(hello)
+		}
+		return nil, nil
+	}
+	return cfg
 }
 
 // detectAndRejectPlainText checks if the connection is attempting to use plain-text on a TLS port.

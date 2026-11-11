@@ -6,11 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"time"
 
-	imap "github.com/emersion/go-imap/v2"
 	"github.com/jackc/pgx/v5"
+	imap "github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 )
@@ -249,18 +250,23 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 	return messages, nil
 }
 
-// SearchMessagesInMailbox performs full-text search
-func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64, mailboxPath string, query string) ([]*DBMessage, error) {
+// UserAPISearchLimit caps the messages a User API search returns. The query reads one
+// row past it so the caller can tell a result clipped at the cap from a complete one.
+const UserAPISearchLimit = 100
+
+// SearchMessagesInMailbox performs full-text search. It returns at most
+// UserAPISearchLimit messages, newest first, and whether more matches were left out.
+func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64, mailboxPath string, query string) ([]*DBMessage, bool, error) {
 	mailbox, err := db.GetMailboxByName(ctx, accountID, mailboxPath)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// Require the 'r' (read) right for shared mailboxes; 'l' (lookup) alone must not
 	// expose message contents. Treat a denial as not-found to avoid leaking existence.
 	if ok, err := db.canReadMailbox(ctx, mailbox, accountID); err != nil {
-		return nil, err
+		return nil, false, err
 	} else if !ok {
-		return nil, consts.ErrMailboxNotFound
+		return nil, false, consts.ErrMailboxNotFound
 	}
 
 	searchQuery := `
@@ -290,13 +296,13 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			OR (mf.text_body_tsv IS NOT NULL AND mf.text_body_tsv @@ plainto_tsquery('simple', $3))
 		)
 		ORDER BY m.internal_date DESC
-		LIMIT 100
+		LIMIT $5
 	`
 
 	searchQuery = strings.Replace(searchQuery, "__HEADER_COND__", headerSubstringCond("m.", "$2"), 1)
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, searchQuery, mailbox.ID, strings.ToLower(query), query, mailbox.AccountID)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, searchQuery, mailbox.ID, strings.ToLower(query), query, mailbox.AccountID, UserAPISearchLimit+1)
 	if err != nil {
-		return nil, fmt.Errorf("failed to search messages: %w", err)
+		return nil, false, fmt.Errorf("failed to search messages: %w", err)
 	}
 	defer rows.Close()
 
@@ -314,7 +320,7 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 			&msg.S3Domain, &msg.S3Localpart, &msg.MailboxPath,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan message: %w", err)
+			return nil, false, fmt.Errorf("failed to scan message: %w", err)
 		}
 
 		// Parse custom flags
@@ -342,7 +348,15 @@ func (db *Database) SearchMessagesInMailbox(ctx context.Context, accountID int64
 		messages = append(messages, msg)
 	}
 
-	return messages, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	// The extra row only says that the cap was hit; it is never returned.
+	truncated := len(messages) > UserAPISearchLimit
+	if truncated {
+		messages = messages[:UserAPISearchLimit]
+	}
+	return messages, truncated, nil
 }
 
 // MessageS3Info represents minimal message info needed for S3 verification
@@ -602,7 +616,9 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 			canon = flag
 			canonical[foldKeyword(flag)] = flag
 		}
-		if !contains(customFlags, canon) {
+		// Compare against the message's own keywords case-insensitively: the
+		// mailbox registry (custom_flags_cache) may not list them.
+		if !slices.ContainsFunc(customFlags, func(cf string) bool { return foldKeyword(cf) == foldKeyword(canon) }) {
 			customFlags = append(customFlags, canon)
 		}
 	}
@@ -612,11 +628,7 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 			newFlags &^= stringFlagToBitwise(flag)
 			continue
 		}
-		canon := flag
-		if c, ok := canonical[foldKeyword(flag)]; ok {
-			canon = c
-		}
-		customFlags = removeString(customFlags, canon)
+		customFlags = slices.DeleteFunc(customFlags, func(cf string) bool { return foldKeyword(cf) == foldKeyword(flag) })
 	}
 
 	// RFC 9979 §4: one explicitly added attachment keyword replaces its
@@ -635,6 +647,12 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		}
 	}
 	normalizedCustom := NormalizeAttachmentKeywordUpdate(helpers.StringsToFlags(customFlags), effectiveAdded)
+	// Apply the User API's color policy to the final state, after additions and
+	// removals: color keywords are meaningful only with \Flagged (RFC 9979
+	// §§3.1–3.2). This also handles adding a color while removing \Flagged.
+	if newFlags&FlagFlagged == 0 {
+		normalizedCustom = slices.DeleteFunc(normalizedCustom, helpers.IsFlagColorKeyword)
+	}
 	customFlags = make([]string, len(normalizedCustom))
 	for i, flag := range normalizedCustom {
 		customFlags[i] = string(flag)
@@ -818,12 +836,15 @@ func bitwiseFlagsToStrings(flags any) []string {
 	if bitwiseFlags&FlagDraft != 0 {
 		result = append(result, "\\Draft")
 	}
-	if bitwiseFlags&FlagRecent != 0 {
-		result = append(result, "\\Recent")
-	}
+	// The FlagRecent bit is skipped for the reason BitwiseToFlags gives: \Recent
+	// is a session flag, and a set bit is stale data from before IMAP stopped
+	// writing it.
 	return result
 }
 
+// stringFlagToBitwise maps a system flag the User API may set or clear to its
+// bit. \Recent maps to nothing, so this path can never write the FlagRecent bit
+// (RFC 3501 §2.3.2: no client can change \Recent).
 func stringFlagToBitwise(flag string) int {
 	switch strings.ToLower(flag) {
 	case "\\seen":
@@ -836,28 +857,7 @@ func stringFlagToBitwise(flag string) int {
 		return FlagDeleted
 	case "\\draft":
 		return FlagDraft
-	case "\\recent":
-		return FlagRecent
 	default:
 		return 0
 	}
-}
-
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
-}
-
-func removeString(slice []string, item string) []string {
-	var result []string
-	for _, s := range slice {
-		if s != item {
-			result = append(result, s)
-		}
-	}
-	return result
 }

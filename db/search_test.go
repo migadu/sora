@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
+	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -18,12 +18,10 @@ import (
 // TestSearchConstants tests the search-related constants
 func TestSearchConstants(t *testing.T) {
 	assert.Equal(t, 100000, MaxSearchResults)
-	assert.Equal(t, 500, MaxComplexSortResults)
-	assert.Less(t, MaxComplexSortResults, MaxSearchResults, "Complex sort limit should be less than search limit")
 }
 
 // TestSeqNumSearchQueryPathSelection verifies the query-path selection after the
-// seqnum→UID rewrite in getMessagesQueryExecutor:
+// seqnum→UID rewrite in getSearchMessagesQueryExecutor:
 //
 //   - A pure sequence-number search (SEARCH <seqset>) is rewritten from sequence
 //     numbers to UID ranges and then served by the optimized "simple" path —
@@ -58,7 +56,7 @@ func TestSeqNumSearchQueryPathSelection(t *testing.T) {
 		criteria := &imap.SearchCriteria{
 			SeqNum: []imap.SeqSet{{imap.SeqRange{Start: 1, Stop: 5}}},
 		}
-		messages, err := suite.db.GetMessagesWithCriteria(ctx, suite.mailboxID, suite.accountID, criteria, 0, 0)
+		messages, err := suite.db.SearchMessagesWithCriteria(ctx, suite.mailboxID, suite.accountID, criteria, 0, 0)
 		require.NoError(t, err)
 		require.NotEmpty(t, messages, "sequence search 1:5 should return messages")
 
@@ -82,7 +80,7 @@ func TestSeqNumSearchQueryPathSelection(t *testing.T) {
 			SeqNum: []imap.SeqSet{{imap.SeqRange{Start: 1, Stop: 5}}},
 			Body:   []string{"report"},
 		}
-		_, err := suite.db.GetMessagesWithCriteria(ctx, suite.mailboxID, suite.accountID, criteria, 0, 0)
+		_, err := suite.db.SearchMessagesWithCriteria(ctx, suite.mailboxID, suite.accountID, criteria, 0, 0)
 		require.NoError(t, err)
 
 		assert.Equal(t, 0.0, pathCount("search_messages_simple")-simpleBefore,
@@ -387,23 +385,15 @@ func TestTextUnionSearchResults(t *testing.T) {
 			}
 
 			before := pathCount(shape.label)
-			light, err := db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria(), 0, shape.mailboxCount)
+			res, err := db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria(), 0, shape.mailboxCount)
 			require.NoError(t, err)
 			var uids []imap.UID
-			for _, r := range light {
+			for _, r := range res {
 				uids = append(uids, r.UID)
 			}
 			check(t, uids)
 
-			full, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria(), 0, shape.mailboxCount)
-			require.NoError(t, err)
-			uids = uids[:0]
-			for _, m := range full {
-				uids = append(uids, m.UID)
-			}
-			check(t, uids)
-
-			assert.Equal(t, 2.0, pathCount(shape.label)-before,
+			assert.Equal(t, 1.0, pathCount(shape.label)-before,
 				"TEXT search should execute via %s", shape.label)
 		})
 	}
@@ -825,8 +815,8 @@ func TestNeedsComplexQuery(t *testing.T) {
 	}
 }
 
-// TestGetMessagesWithCriteria tests message search functionality
-func TestGetMessagesWithCriteria(t *testing.T) {
+// TestSearchMessagesWithCriteria tests message search functionality
+func TestSearchMessagesWithCriteria(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
 	}
@@ -838,7 +828,7 @@ func TestGetMessagesWithCriteria(t *testing.T) {
 
 	// Test 1: Search empty mailbox (should return empty results)
 	criteria := &imap.SearchCriteria{}
-	messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err := db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages)
 
@@ -848,7 +838,7 @@ func TestGetMessagesWithCriteria(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		UID: []imap.UIDSet{uidSet},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err = db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox, so no results
 
@@ -858,7 +848,7 @@ func TestGetMessagesWithCriteria(t *testing.T) {
 		Since:  now.Add(-7 * 24 * time.Hour),
 		Before: now,
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err = db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox, so no results
 
@@ -867,21 +857,21 @@ func TestGetMessagesWithCriteria(t *testing.T) {
 		Flag:    []imap.Flag{imap.FlagSeen},
 		NotFlag: []imap.Flag{imap.FlagDeleted},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err = db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox, so no results
 
 	// Test 5: Search with invalid mailbox ID
 	criteria = &imap.SearchCriteria{}
-	messages, err = db.GetMessagesWithCriteria(ctx, 99999, accountID, criteria, 0, 0)
+	messages, err = db.SearchMessagesWithCriteria(ctx, 99999, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Invalid mailbox returns empty
 
-	t.Logf("Successfully tested GetMessagesWithCriteria with accountID: %d, mailboxID: %d", accountID, mailboxID)
+	t.Logf("Successfully tested SearchMessagesWithCriteria with accountID: %d, mailboxID: %d", accountID, mailboxID)
 }
 
-// TestGetMessagesSorted tests sorted message retrieval
-func TestGetMessagesSorted(t *testing.T) {
+// TestSearchMessagesSorted tests sorted message retrieval
+func TestSearchMessagesSorted(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
 	}
@@ -896,7 +886,7 @@ func TestGetMessagesSorted(t *testing.T) {
 	sortCriteria := []imap.SortCriterion{
 		{Key: imap.SortKeyArrival, Reverse: false},
 	}
-	messages, err := db.GetMessagesSorted(ctx, mailboxID, accountID, criteria, sortCriteria, 0, 0)
+	messages, err := db.SearchMessagesSorted(ctx, mailboxID, accountID, criteria, sortCriteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages)
 
@@ -904,7 +894,7 @@ func TestGetMessagesSorted(t *testing.T) {
 	sortCriteria = []imap.SortCriterion{
 		{Key: imap.SortKeyArrival, Reverse: true},
 	}
-	messages, err = db.GetMessagesSorted(ctx, mailboxID, accountID, criteria, sortCriteria, 0, 0)
+	messages, err = db.SearchMessagesSorted(ctx, mailboxID, accountID, criteria, sortCriteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -912,7 +902,7 @@ func TestGetMessagesSorted(t *testing.T) {
 	sortCriteria = []imap.SortCriterion{
 		{Key: imap.SortKeySubject, Reverse: false},
 	}
-	messages, err = db.GetMessagesSorted(ctx, mailboxID, accountID, criteria, sortCriteria, 0, 0)
+	messages, err = db.SearchMessagesSorted(ctx, mailboxID, accountID, criteria, sortCriteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -920,7 +910,7 @@ func TestGetMessagesSorted(t *testing.T) {
 	sortCriteria = []imap.SortCriterion{
 		{Key: imap.SortKeySize, Reverse: false},
 	}
-	messages, err = db.GetMessagesSorted(ctx, mailboxID, accountID, criteria, sortCriteria, 0, 0)
+	messages, err = db.SearchMessagesSorted(ctx, mailboxID, accountID, criteria, sortCriteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -930,11 +920,11 @@ func TestGetMessagesSorted(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		UID: []imap.UIDSet{uidSet},
 	}
-	messages, err = db.GetMessagesSorted(ctx, 99999, accountID, criteria, sortCriteria, 0, 0)
+	messages, err = db.SearchMessagesSorted(ctx, 99999, accountID, criteria, sortCriteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Invalid mailbox
 
-	t.Logf("Successfully tested GetMessagesSorted with accountID: %d, mailboxID: %d", accountID, mailboxID)
+	t.Logf("Successfully tested SearchMessagesSorted with accountID: %d, mailboxID: %d", accountID, mailboxID)
 }
 
 // TestSortedSearchWithComplexCriteria is a regression test for an ambiguous
@@ -988,17 +978,11 @@ func TestSortedSearchWithComplexCriteria(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// SearchMessagesSorted is the lightweight path that produced the
-			// original "column reference sent_date is ambiguous" error.
+			// SearchMessagesSorted produced the original "column reference
+			// sent_date is ambiguous" error.
 			searchResults, err := db.SearchMessagesSorted(ctx, mailboxID, accountID, tc.criteria, tc.sort, 0, 0)
 			assert.NoError(t, err, "SearchMessagesSorted must not error on complex criteria + sort")
 			assert.Empty(t, searchResults)
-
-			// GetMessagesSorted is the heavyweight path; it has the same join
-			// structure and was vulnerable to the same ambiguity.
-			messages, err := db.GetMessagesSorted(ctx, mailboxID, accountID, tc.criteria, tc.sort, 0, 0)
-			assert.NoError(t, err, "GetMessagesSorted must not error on complex criteria + sort")
-			assert.Empty(t, messages)
 		})
 	}
 }
@@ -1018,7 +1002,7 @@ func TestFullTextSearch(t *testing.T) {
 	criteria := &imap.SearchCriteria{
 		Body: []string{"important"},
 	}
-	messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err := db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -1026,7 +1010,7 @@ func TestFullTextSearch(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		Body: []string{"meeting agenda"},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err = db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -1034,7 +1018,7 @@ func TestFullTextSearch(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		Text: []string{"conference call"},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err = db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	// TEXT search matches against text_body_tsv and dedicated header columns (subject, from/to/cc sort fields)
 	t.Logf("TEXT search for 'conference call' returned %d results", len(messages))
@@ -1043,7 +1027,7 @@ func TestFullTextSearch(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		Body: []string{"user@example.com"},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err = db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -1053,7 +1037,7 @@ func TestFullTextSearch(t *testing.T) {
 			{Key: "Subject", Value: "test"},
 		},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err = db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty mailbox
 
@@ -1188,7 +1172,7 @@ func TestSearchPerformanceBasic(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				start := time.Now()
-				messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, tc.criteria, 0, 0)
+				messages, err := db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, tc.criteria, 0, 0)
 				elapsed := time.Since(start)
 
 				assert.NoError(t, err)
@@ -1211,11 +1195,8 @@ func TestSearchPerformanceBasic(t *testing.T) {
 	// Validate search constants are reasonable
 	t.Run("SearchConstants", func(t *testing.T) {
 		assert.Equal(t, 100000, MaxSearchResults, "MaxSearchResults should be 100000")
-		assert.Equal(t, 500, MaxComplexSortResults, "MaxComplexSortResults should be 500")
-		assert.Less(t, MaxComplexSortResults, MaxSearchResults, "Complex sort limit should be less than regular search limit")
 
-		t.Logf("Search limits: MaxSearchResults=%d, MaxComplexSortResults=%d",
-			MaxSearchResults, MaxComplexSortResults)
+		t.Logf("Search limits: MaxSearchResults=%d", MaxSearchResults)
 	})
 
 	t.Logf("Successfully tested basic search performance with accountID: %d, mailboxID: %d", accountID, mailboxID)
@@ -1237,7 +1218,7 @@ func TestSearchEdgeCases(t *testing.T) {
 	criteria := &imap.SearchCriteria{
 		Body: []string{""},
 	}
-	messages, err := db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err := db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Empty search term in empty mailbox
 
@@ -1245,7 +1226,7 @@ func TestSearchEdgeCases(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		Body: []string{"   "},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err = db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Whitespace search
 
@@ -1253,7 +1234,7 @@ func TestSearchEdgeCases(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		Body: []string{"测试"},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err = db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Unicode search
 
@@ -1261,7 +1242,7 @@ func TestSearchEdgeCases(t *testing.T) {
 	criteria = &imap.SearchCriteria{
 		Body: []string{"user@example.com [urgent]"},
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err = db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Special characters
 
@@ -1276,7 +1257,7 @@ func TestSearchEdgeCases(t *testing.T) {
 		Since:   time.Now().Add(-30 * 24 * time.Hour),
 		Before:  time.Now(),
 	}
-	messages, err = db.GetMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
+	messages, err = db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, criteria, 0, 0)
 	assert.NoError(t, err)
 	assert.Empty(t, messages) // Complex criteria on empty mailbox
 

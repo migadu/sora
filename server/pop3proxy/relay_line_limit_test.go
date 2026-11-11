@@ -32,6 +32,7 @@ func TestRelayLineTooLong(t *testing.T) {
 		server:       srv,
 		settings:     &reloadableSettings{commandTimeout: 5 * time.Second},
 		clientConn:   clientA,
+		listenerConn: clientA,
 		clientReader: bufio.NewReader(clientA),
 		backendConn:  backendA,
 		ctx:          context.Background(),
