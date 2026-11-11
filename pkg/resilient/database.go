@@ -199,6 +199,12 @@ func isQuerySuccessful(err error) bool {
 	if err == nil {
 		return true
 	}
+	// A streaming consumer can fail after the database successfully supplies a
+	// chunk, for example because the IMAP client disconnected during FETCH.
+	var callbackErr *messageStreamCallbackError
+	if errors.As(err, &callbackErr) {
+		return true
+	}
 	// An *imap.Error returned through a streaming callback (e.g. a FETCH whose body is
 	// temporarily unavailable from S3) is an IMAP protocol/application outcome, not a
 	// database system failure — the underlying query already succeeded. Don't let it trip
@@ -483,6 +489,12 @@ func (rd *ResilientDatabase) GetWriteTimeout() time.Duration {
 // It uses type assertions and error codes for robust checking.
 func (rd *ResilientDatabase) isRetryableError(err error) bool {
 	if err == nil {
+		return false
+	}
+	// Replaying the database stream would also replay consumer side effects.
+	// Its failure is final even if the cause resembles a retryable DB error.
+	var callbackErr *messageStreamCallbackError
+	if errors.As(err, &callbackErr) {
 		return false
 	}
 

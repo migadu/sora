@@ -60,3 +60,30 @@ func TestIMAP_FetchPreviewMIMEHardening(t *testing.T) {
 		})
 	}
 }
+
+func TestIMAP_FetchPreviewRelatedRoot(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupIMAPServerWithOptions(t, &common.IMAPServerOpts{
+		Preview: imap.PreviewOptions{Enabled: true},
+	})
+	defer server.Close()
+	c := dialPreview(t, server.Address, account)
+	if err := c.conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	c.appendMessage("From: sender@example.com\nSubject: Meeting update\nMIME-Version: 1.0\n" +
+		"Content-Type: multipart/related; type=\"text/html\"; boundary=b; start=\"<root@example.com>\"\n\n" +
+		"--b\nContent-Type: text/html\nContent-ID: <archive@example.com>\n\n" +
+		"<p>Archived message: The meeting is confirmed.</p>\n" +
+		"--b\nContent-Type: text/html\nContent-ID: <root@example.com>\n\n" +
+		"<p>The meeting is cancelled.</p><a href=\"cid:archive@example.com\">Previous message</a>\n" +
+		"--b--\n")
+
+	for _, item := range []string{"PREVIEW (LAZY)", "PREVIEW"} {
+		command := fmt.Sprintf("FETCH 1 (%s)", item)
+		got := c.ok(command)
+		if !strings.Contains(got, `PREVIEW "The meeting is cancelled. Previous message"`) || strings.Contains(got, "confirmed") {
+			t.Errorf("%s = %q, want the related root without the archived resource", command, got)
+		}
+	}
+}

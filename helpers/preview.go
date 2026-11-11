@@ -37,6 +37,7 @@ const (
 // MessagePreview returns a short plain-text preview of a raw RFC 5322 message
 // for FETCH PREVIEW (RFC 8970): the start of its first inline text/plain part
 // that has any text, else of its first text/html part converted to text.
+// Only the root subtree of a multipart/related container contributes text.
 // Attachments are never used. Quoted lines and the signature are left out,
 // whitespace is collapsed, and the text is cut at a word boundary to
 // PreviewMaxChars characters.
@@ -61,8 +62,11 @@ func MessagePreview(r io.Reader) (preview string) {
 	// Inspect each entity before descending: mail.Reader flattens multiparts
 	// and loses an attachment container's disposition on its inline leaves.
 	type multipartFrame struct {
-		reader    message.MultipartReader
-		mediaType string
+		reader          message.MultipartReader
+		mediaType       string
+		relatedStart    string
+		hasRelatedStart bool
+		relatedRootSeen bool
 	}
 	var readers []multipartFrame
 	defer func() {
@@ -75,36 +79,48 @@ func MessagePreview(r io.Reader) (preview string) {
 	part := entity
 	partErr := err
 	for partsRead := 0; partsRead < previewMaxMIMEParts; {
-		parentMediaType := ""
+		var parent *multipartFrame
 		if part == nil {
 			if len(readers) == 0 {
 				break
 			}
-			frame := readers[len(readers)-1]
-			part, partErr = frame.reader.NextPart()
+			parent = &readers[len(readers)-1]
+			part, partErr = parent.reader.NextPart()
 			if partErr == io.EOF || (partErr != nil && !message.IsUnknownCharset(partErr) && !message.IsUnknownEncoding(partErr)) {
 				// A broken nested multipart cannot yield more parts, but its
 				// parent can still advance past it to a valid sibling.
-				frame.reader.Close()
+				parent.reader.Close()
 				readers = readers[:len(readers)-1]
 				part = nil
 				continue
 			}
-			parentMediaType = frame.mediaType
 		}
 		current := part
 		part = nil
 		partsRead++
+		relatedRoot := parent != nil && parent.mediaType == "multipart/related"
+		if relatedRoot {
+			// RFC 2387 §3.2 selects the root by Content-ID when start is
+			// present, otherwise by the first child. Other children are
+			// resources, not alternative message bodies, even if textual.
+			if parent.relatedRootSeen || (parent.hasRelatedStart &&
+				(parent.relatedStart == "" || strings.TrimSpace(current.Header.Get("Content-ID")) != parent.relatedStart)) {
+				continue
+			}
+			parent.relatedRootSeen = true
+		}
 		disposition, _, _ := current.Header.ContentDisposition()
 		// RFC 2183 §2.8 assigns attachment semantics to unknown dispositions.
 		// Fail closed on malformed values too, while retaining a usable inline
 		// type when only its parameters were malformed.
-		if current.Header.Get("Content-Disposition") != "" && !strings.EqualFold(disposition, "inline") {
+		// Related processing takes precedence over its direct children's
+		// disposition (RFC 2387 §4). Attachment ancestors remain excluded.
+		if !relatedRoot && current.Header.Get("Content-Disposition") != "" && !strings.EqualFold(disposition, "inline") {
 			continue
 		}
 		// go-message returns a usable type alongside malformed-parameter errors.
-		mediaType, _, _ := current.Header.ContentType()
-		if parentMediaType == "multipart/digest" && current.Header.Get("Content-Type") == "" {
+		mediaType, params, _ := current.Header.ContentType()
+		if parent != nil && parent.mediaType == "multipart/digest" && current.Header.Get("Content-Type") == "" {
 			// RFC 2046 §5.1.5 changes the default for direct digest children.
 			mediaType = "message/rfc822"
 		}
@@ -114,7 +130,11 @@ func MessagePreview(r io.Reader) (preview string) {
 		if strings.HasPrefix(mediaType, "multipart/") {
 			if len(readers) < previewMaxMIMEDepth {
 				if mr := current.MultipartReader(); mr != nil {
-					readers = append(readers, multipartFrame{reader: mr, mediaType: mediaType})
+					start, hasStart := params["start"]
+					readers = append(readers, multipartFrame{
+						reader: mr, mediaType: mediaType,
+						relatedStart: strings.TrimSpace(start), hasRelatedStart: hasStart,
+					})
 				}
 			}
 			// NextPart discards a skipped subtree as raw bytes, so it neither
