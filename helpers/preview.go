@@ -8,8 +8,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/emersion/go-message"
-	"github.com/emersion/go-message/mail"
-	"github.com/k3a/html2text"
 )
 
 // PreviewMaxChars is the length of a generated preview, in characters. RFC 8970
@@ -28,6 +26,9 @@ const (
 	// because newsletters carry tens of kilobytes of <head> and <style> before
 	// the first word of text.
 	previewMaxHTML = 256 << 10
+	// Each MIME nesting level adds parser buffers and wraps the parent's reader.
+	// Skip deeper subtrees while still looking for a shallower inline sibling.
+	previewMaxMIMEDepth = 32
 )
 
 // MessagePreview returns a short plain-text preview of a raw RFC 5322 message
@@ -54,26 +55,60 @@ func MessagePreview(r io.Reader) (preview string) {
 	if err != nil && !message.IsUnknownCharset(err) {
 		return ""
 	}
-	mr := mail.NewReader(entity)
-	defer mr.Close()
+	// Inspect each entity before descending: mail.Reader flattens multiparts
+	// and loses an attachment container's disposition on its inline leaves.
+	var readers []message.MultipartReader
+	defer func() {
+		for i := len(readers) - 1; i >= 0; i-- {
+			readers[i].Close()
+		}
+	}()
 
 	html, haveHTML := "", false
+	part := entity
 	for {
-		part, err := mr.NextPart()
-		if err != nil {
-			break // io.EOF, or a malformed part: nothing further is readable
+		if part == nil {
+			if len(readers) == 0 {
+				break
+			}
+			mr := readers[len(readers)-1]
+			part, err = mr.NextPart()
+			if err == io.EOF {
+				mr.Close()
+				readers = readers[:len(readers)-1]
+				part = nil
+				continue
+			}
+			if err != nil && !message.IsUnknownCharset(err) {
+				break // malformed part: retain any HTML already collected
+			}
 		}
-		header, ok := part.Header.(*mail.InlineHeader)
-		if !ok {
+		current := part
+		part = nil
+		disposition, _, _ := current.Header.ContentDisposition()
+		if disposition == "attachment" {
 			continue
 		}
-		mediaType, _, err := header.ContentType()
+		mediaType, _, err := current.Header.ContentType()
 		if err != nil {
+			continue
+		}
+		if mediaType == "multipart/encrypted" {
+			continue
+		}
+		if strings.HasPrefix(mediaType, "multipart/") {
+			if len(readers) < previewMaxMIMEDepth {
+				if mr := current.MultipartReader(); mr != nil {
+					readers = append(readers, mr)
+				}
+			}
+			// NextPart discards a skipped subtree as raw bytes, so it neither
+			// allocates descendant parsers nor visits attachment contents.
 			continue
 		}
 		switch mediaType {
 		case "text/plain":
-			b, _ := io.ReadAll(io.LimitReader(part.Body, previewMaxText))
+			b, _ := io.ReadAll(io.LimitReader(current.Body, previewMaxText))
 			text := string(b)
 			if isPGPMessage(text) {
 				return ""
@@ -83,13 +118,13 @@ func MessagePreview(r io.Reader) (preview string) {
 			}
 		case "text/html":
 			if !haveHTML {
-				b, _ := io.ReadAll(io.LimitReader(part.Body, previewMaxHTML))
+				b, _ := io.ReadAll(io.LimitReader(current.Body, previewMaxHTML))
 				html, haveHTML = string(b), true
 			}
 		}
 	}
 	if haveHTML {
-		return previewFromText(html2text.HTML2Text(stripBase64DataURIs(html)))
+		return previewFromText(previewHTMLText(html))
 	}
 	return ""
 }

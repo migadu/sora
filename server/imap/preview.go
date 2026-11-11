@@ -22,8 +22,8 @@ import (
 // by content hash. What that costs depends on where the body is, so the sources
 // are tried cheapest first:
 //
-//  1. a body this FETCH already loaded for a BODY[] or BINARY[] item;
-//  2. the in-memory preview cache;
+//  1. the in-memory preview cache;
+//  2. a body this FETCH already loaded for a BODY[] or BINARY[] item;
 //  3. a local copy of the body: the body cache or the upload staging file,
 //     checked against the stored size, read through a bounded parser;
 //  4. for PREVIEW (LAZY), nothing more: the answer is NIL, which the client
@@ -127,6 +127,12 @@ func (s *IMAPSession) findPreview(ctx context.Context, msg *db.Message, lazy boo
 		return "", false, "unavailable" // a server not built by New
 	}
 
+	// Reuse generated text even when this FETCH also loaded the body. Repeated
+	// BODY.PEEK[] + PREVIEW requests must not repeat MIME and HTML parsing.
+	if text, ok := p.memo.get(msg.ContentHash); ok {
+		return text, true, "memo"
+	}
+
 	if *bodyDataFetched {
 		if *bodyData == nil {
 			// Loading the body already failed for this message; don't try again.
@@ -135,10 +141,6 @@ func (s *IMAPSession) findPreview(ctx context.Context, msg *db.Message, lazy boo
 		text = helpers.MessagePreview(bytes.NewReader(*bodyData))
 		p.memo.put(msg.ContentHash, text)
 		return text, true, "loaded"
-	}
-
-	if text, ok := p.memo.get(msg.ContentHash); ok {
-		return text, true, "memo"
 	}
 
 	if !lazy || run.lazyLocalLeft > 0 {

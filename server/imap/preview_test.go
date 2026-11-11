@@ -224,6 +224,36 @@ func TestWritePreviewCountsAndWrites(t *testing.T) {
 	}
 }
 
+func TestPreviewMemoReusedWithLoadedBody(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body []byte
+		text string
+	}{
+		{name: "loaded body", body: []byte(previewTestBody), text: "Remembered preview"},
+		{name: "loaded body with empty preview", body: []byte(previewTestBody)},
+		{name: "failed body load", text: "Remembered preview"},
+		{name: "failed body load with empty preview"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newPreviewTestSession(t, PreviewOptions{Enabled: true})
+			msg := previewTestMessage(true)
+			s.server.preview.memo.put(msg.ContentHash, tc.text)
+			body, fetched := tc.body, true
+			run := newPreviewRun()
+			// BODY.PEEK[] and PREVIEW share the loaded body. A remembered
+			// preview must avoid parsing it again, even when loading it failed.
+			text, available, source := s.findPreview(context.Background(), msg, false, run, &body, &fetched)
+			if text != tc.text || !available || source != "memo" {
+				t.Errorf("got %q %v from %q, want %q from memo", text, available, source, tc.text)
+			}
+			if run.downloads != 0 || run.lazyLocalLeft != previewLazyLocalMax {
+				t.Errorf("memo consumed generation resources: %+v", run)
+			}
+		})
+	}
+}
+
 func TestPreviewFromFileReleasesItsReservation(t *testing.T) {
 	s := newPreviewTestSession(t, PreviewOptions{Enabled: true})
 	path := filepath.Join(t.TempDir(), "body")
