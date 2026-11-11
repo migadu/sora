@@ -25,10 +25,10 @@ func TestNormalizeHostPort(t *testing.T) {
 			want:        "[2001:db8::1]:143",
 		},
 		{
-			name:        "Malformed IPv6 with port, no brackets",
+			name:        "Valid IPv6 ending in decimal digits",
 			addr:        "2001:db8::1:143",
 			defaultPort: 993,
-			want:        "[2001:db8::1]:143",
+			want:        "[2001:db8::1:143]:993",
 		},
 		{
 			name:        "Full IPv6 without port",
@@ -55,10 +55,10 @@ func TestNormalizeHostPort(t *testing.T) {
 			want:        "[::1]:143",
 		},
 		{
-			name:        "Malformed IPv6 loopback with port, no brackets",
+			name:        "Valid IPv6 with loopback prefix and decimal suffix",
 			addr:        "::1:143",
 			defaultPort: 993,
-			want:        "[::1]:143",
+			want:        "[::1:143]:993",
 		},
 
 		// IPv4 Test Cases

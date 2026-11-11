@@ -54,8 +54,8 @@ func TestGetBackendForUserBoundsRemoteLookup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getBackendForUser failed: %v", err)
 	}
-	if got != backendAddr {
-		t.Fatalf("getBackendForUser returned %q, want %q", got, backendAddr)
+	if got.addr != backendAddr {
+		t.Fatalf("getBackendForUser returned %q, want %q", got.addr, backendAddr)
 	}
 	if !fake.sawDeadline {
 		t.Fatal("remotelookup context had no deadline (a hung lookup service would block the request handler)")

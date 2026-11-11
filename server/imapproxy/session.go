@@ -901,6 +901,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				s.routingInfo = &proxy.UserRoutingInfo{
 					AccountID:              cached.AccountID,
 					ServerAddress:          cached.ServerAddress,
+					PoolName:               cached.PoolName,
 					RemoteTLS:              cached.RemoteTLS,
 					RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
 					RemoteTLSVerify:        cached.RemoteTLSVerify,
@@ -1122,6 +1123,7 @@ func (s *Session) authenticateUser(username, password string) error {
 					PasswordDigest:         lookupcache.NewPasswordDigest(password),
 					ActualEmail:            resolvedEmail, // Store resolved email for cache hits
 					ServerAddress:          routingInfo.ServerAddress,
+					PoolName:               routingInfo.PoolName,
 					RemoteTLS:              routingInfo.RemoteTLS,
 					RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
 					RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
@@ -1339,7 +1341,9 @@ func (s *Session) connectToBackend() error {
 		ProxyName:             "IMAP Proxy",
 	})
 	if err != nil {
-		s.WarnLog("error determining route", "error", err)
+		// No pool to route into (a pool this proxy lacks, or none named and none default):
+		// fail the connection rather than let the fallback dial another pool's backend.
+		return fmt.Errorf("failed to determine route: %w", err)
 	}
 
 	// Update session routing info if it was fetched by DetermineRoute
@@ -1540,8 +1544,8 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 	// This MUST be done before authenticating to the backend, as the ID command
 	// is only valid in the "Not Authenticated" state.
 	useIDCommand := s.server.remoteUseIDCommand
-	// The remote lookup's setting applies to the backend it named (as for the dial)
-	if s.routingInfo.LookupRouted(s.serverAddr) {
+	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
+	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
 		useIDCommand = s.routingInfo.RemoteUseIDCommand
 	}
 	if useIDCommand {

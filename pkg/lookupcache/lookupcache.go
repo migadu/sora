@@ -37,6 +37,7 @@ type CacheEntry struct {
 
 	// Routing data (for proxy)
 	ServerAddress          string
+	PoolName               string // Named backend pool the lookup answered with (empty = default pool)
 	RemoteTLS              bool
 	RemoteTLSUseStartTLS   bool
 	RemoteTLSVerify        bool

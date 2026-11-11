@@ -43,13 +43,15 @@ func backendFor(t *testing.T, s *Server) string {
 	if err != nil {
 		t.Fatalf("getBackendForUser: %v", err)
 	}
-	return got
+	return got.addr
 }
 
-// A cached route to a backend in maintenance is not used, and the route chosen instead
-// replaces the cache entry.
+// A cached route to a backend in maintenance is not used while maintenance lasts, and the
+// cached pin takes the user back once it ends, without asking the lookup again: the cache
+// holds the lookup's answer, and routing decides around maintenance on every request.
 func TestGetBackendForUser_CachedRouteToMaintenanceBackend(t *testing.T) {
 	s, m := newMaintenanceTestServer(t)
+	withAffinity(t, s)
 	s.lookupCache = lookupcache.New(5*time.Minute, time.Minute, 100, time.Hour, 0)
 	t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
 	s.lookupCache.Set(s.name, "user@example.com", &lookupcache.CacheEntry{
@@ -64,8 +66,13 @@ func TestGetBackendForUser_CachedRouteToMaintenanceBackend(t *testing.T) {
 	if got := backendFor(t, s); got != otherBackend {
 		t.Fatalf("in maintenance: %q, want %q", got, otherBackend)
 	}
-	if cached, ok := s.lookupCache.Get(s.name, "user@example.com"); !ok || cached.ServerAddress != otherBackend {
-		t.Fatalf("cache entry not replaced by the new route: %+v", cached)
+	if backend, ok := s.affinityManager.GetBackend("user@example.com", "userapi"); ok && backend == otherBackend {
+		t.Fatalf("the detour around the cached pin became the user's affinity (%q)", backend)
+	}
+
+	m.Set(nil)
+	if got := backendFor(t, s); got != drainedBackend {
+		t.Fatalf("after maintenance: %q, want the cached pin %q back", got, drainedBackend)
 	}
 }
 
@@ -281,13 +288,14 @@ func TestUserAPIProxy_ClosesIdleBackendConnectionsWhenMaintenanceChanges(t *test
 	}
 }
 
-// Cached routes expire after the configured positive TTL, as the lookup cache does for
-// every other proxy: a detour around a backend in maintenance lasts that long, not a fixed
-// five minutes.
+// Cached lookup answers expire after the configured positive TTL, as the lookup cache does
+// for every other proxy: a cached pin, and the detour around it while its backend is in
+// maintenance, last that long, not a fixed five minutes.
 func TestGetBackendForUser_CachedRoutesUseThePositiveTTL(t *testing.T) {
 	s, _ := newMaintenanceTestServer(t)
 	s.lookupCache = lookupcache.New(30*time.Second, time.Minute, 100, time.Hour, 0)
 	t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
+	s.routingLookup = &fakeRoutingLookup{backend: drainedBackend}
 
 	backendFor(t, s)
 	entry, ok := s.lookupCache.Get(s.name, "user@example.com")

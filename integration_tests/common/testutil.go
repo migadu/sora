@@ -1241,7 +1241,7 @@ func SetupIMAPServerWithPROXYOptions(t *testing.T, configure func(*imap.IMAPServ
 // SetupIMAPServerWithPROXYAndDatabase sets up an IMAP server with PROXY protocol using an existing database
 func SetupIMAPServerWithPROXYAndDatabase(t *testing.T, rdb *resilient.ResilientDatabase) *TestServer {
 	t.Helper()
-	return SetupIMAPServerWithPROXYAndDatabaseAt(t, rdb, GetRandomAddress(t))
+	return SetupIMAPServerWithPROXYAt(t, rdb, GetRandomAddress(t), nil)
 }
 
 // GetRandomIPv6LoopbackAddress returns a free "[::1]:port", or skips the test when this
@@ -1259,6 +1259,15 @@ func GetRandomIPv6LoopbackAddress(t *testing.T) string {
 
 // SetupIMAPServerWithPROXYAndDatabaseAt is SetupIMAPServerWithPROXYAndDatabase listening on address.
 func SetupIMAPServerWithPROXYAndDatabaseAt(t *testing.T, rdb *resilient.ResilientDatabase, address string) *TestServer {
+	t.Helper()
+	return SetupIMAPServerWithPROXYAt(t, rdb, address, nil)
+}
+
+// SetupIMAPServerWithPROXYAt is SetupIMAPServerWithPROXYAndDatabase on a fixed address, with
+// extra capability tokens the backend advertises (to the client, through a proxy, after
+// login). The fixed address lets a test stop a backend and bring it back on the same
+// host:port; the capability tag lets a client tell which backend served it.
+func SetupIMAPServerWithPROXYAt(t *testing.T, rdb *resilient.ResilientDatabase, address string, additionalCaps []string) *TestServer {
 	t.Helper()
 
 	// Create a temporary directory for the uploader
@@ -1309,6 +1318,7 @@ func SetupIMAPServerWithPROXYAndDatabaseAt(t *testing.T, rdb *resilient.Resilien
 			TrustedNetworks:      []string{"127.0.0.0/8", "::1/128"}, // Trust localhost connections
 			MasterSASLUsername:   []byte(masterUsername),             // Master username for proxy authentication
 			MasterSASLPassword:   []byte(masterPassword),             // Master password for proxy authentication
+			AdditionalCaps:       additionalCaps,
 		},
 	)
 	if err != nil {

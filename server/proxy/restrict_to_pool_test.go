@@ -27,7 +27,7 @@ func TestAllowRemoteLookupBackend(t *testing.T) {
 		{"backend1.internal:143", true},  // configured hostname (pre-resolution)
 		{"10.0.0.5:143", true},           // resolved IP (post-resolution)
 		{"[2001:db8::1]:143", true},      // IPv6 canonical form
-		{"2001:db8::1:143", true},        // IPv6 non-bracketed form normalizes to the same
+		{"2001:db8::1:143", false},       // A different, portless IPv6 literal
 		{"169.254.169.254:80", false},    // classic SSRF target, not in pool
 		{"10.0.0.5:144", false},          // right host, wrong port
 		{"backend2.internal:143", false}, // unknown host

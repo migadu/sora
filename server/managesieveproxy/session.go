@@ -327,16 +327,20 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 						s.username = username // Fallback
 					}
 
-					if cached.ServerAddress != "" {
-						s.routingInfo = &proxy.UserRoutingInfo{
-							AccountID:              cached.AccountID,
-							ServerAddress:          cached.ServerAddress,
-							RemoteTLS:              cached.RemoteTLS,
-							RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
-							RemoteTLSVerify:        cached.RemoteTLSVerify,
-							RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
-							IsRemoteLookupAccount:  cached.FromRemoteLookup,
-						}
+					// Rebuild the routing info from the entry whether it carries an explicit
+					// server, a pool name, or neither (a locally found user): a session that
+					// reaches DetermineRoute without routing info has the lookup run again,
+					// which would both defeat the cache and follow an answer that changed
+					// before the entry expired. IMAP, POP3 and LMTP do the same.
+					s.routingInfo = &proxy.UserRoutingInfo{
+						AccountID:              cached.AccountID,
+						ServerAddress:          cached.ServerAddress,
+						PoolName:               cached.PoolName,
+						RemoteTLS:              cached.RemoteTLS,
+						RemoteTLSUseStartTLS:   cached.RemoteTLSUseStartTLS,
+						RemoteTLSVerify:        cached.RemoteTLSVerify,
+						RemoteUseProxyProtocol: cached.RemoteUseProxyProtocol,
+						IsRemoteLookupAccount:  cached.FromRemoteLookup,
 					}
 
 					// Track successful authentication using resolved email
@@ -524,6 +528,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 						PasswordDigest:         lookupcache.NewPasswordDigest(password),
 						ActualEmail:            resolvedEmail, // Store resolved email for cache hits
 						ServerAddress:          routingInfo.ServerAddress,
+						PoolName:               routingInfo.PoolName,
 						RemoteTLS:              routingInfo.RemoteTLS,
 						RemoteTLSUseStartTLS:   routingInfo.RemoteTLSUseStartTLS,
 						RemoteTLSVerify:        routingInfo.RemoteTLSVerify,
@@ -757,7 +762,10 @@ func (s *Session) connectToBackendAndAuth() error {
 		ProxyName:             "ManageSieve Proxy",
 	})
 	if err != nil {
-		s.DebugLog("Error determining route", "error", err)
+		// No pool to route into (a pool this proxy lacks, or none named and none default):
+		// fail the connection rather than let the fallback dial another pool's backend.
+		s.invalidateLookupCache("no backend pool for route")
+		return fmt.Errorf("%w: failed to determine route: %w", server.ErrBackendConnectionFailed, err)
 	}
 
 	// Update session routing info if it was fetched by DetermineRoute
@@ -852,16 +860,14 @@ func (s *Session) connectToBackendAndAuth() error {
 	shouldUseStartTLS := false
 	var tlsConfig *tls.Config
 
-	if s.routingInfo.LookupRouted(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
-		// RemoteLookup routing specified StartTLS (for the backend it named, as for the dial)
+	if s.routingInfo.UsesRouteSettings(s.serverAddr) && s.routingInfo.RemoteTLSUseStartTLS {
+		// The route specified StartTLS (for the backend the lookup named or its pool picked, as for the dial)
 		shouldUseStartTLS = true
-		tlsConfig = &tls.Config{
-			InsecureSkipVerify: !s.routingInfo.RemoteTLSVerify,
-			Renegotiation:      tls.RenegotiateNever,
-		}
+		tlsConfig = s.server.connManager.BackendTLSConfig(s.routingInfo.RemoteTLSVerify)
 		s.DebugLog("Using remotelookup StartTLS settings", "remote_tls_verify", s.routingInfo.RemoteTLSVerify)
-	} else if s.server.connManager.IsRemoteStartTLS() {
-		// Global proxy config specified StartTLS
+	} else if !s.routingInfo.PoolRouted() && s.server.connManager.IsRemoteStartTLS() {
+		// Global proxy config specified StartTLS. A pool's own settings are authoritative:
+		// a pool without remote_tls_use_starttls never inherits the server's.
 		shouldUseStartTLS = true
 		tlsConfig = s.server.connManager.GetTLSConfig()
 		s.DebugLog("Using global StartTLS settings")

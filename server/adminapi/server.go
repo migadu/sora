@@ -160,6 +160,7 @@ type AuthCacheStats interface {
 // BackendHealthInfo represents backend health status (mirrors proxy.BackendHealthInfo)
 type BackendHealthInfo struct {
 	Address            string    `json:"address"`
+	Pool               string    `json:"pool,omitempty"` // Named pool the backend belongs to ("" for a flat remote_addrs list)
 	IsHealthy          bool      `json:"is_healthy"`
 	FailureCount       int       `json:"failure_count"`
 	ConsecutiveFails   int       `json:"consecutive_fails"`
@@ -1770,6 +1771,7 @@ func (s *Server) handleProxyBackends(w http.ResponseWriter, r *http.Request) {
 			for i, status := range backendStatuses {
 				backends[i] = BackendHealthInfo{
 					Address:            status.Address,
+					Pool:               status.Pool,
 					IsHealthy:          status.IsHealthy,
 					FailureCount:       status.FailureCount,
 					ConsecutiveFails:   status.ConsecutiveFails,
