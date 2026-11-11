@@ -878,7 +878,7 @@ func TestRemoteLookupBackendContextCancellationDoesNotMarkUnhealthy(t *testing.T
 	defer cancel()
 
 	// Wait for context to expire
-	time.Sleep(5 * time.Millisecond)
+	<-ctx.Done()
 
 	// Try to connect with expired context
 	_, _, err, _ = cm.tryPreferredAddress(ctx, remoteLookupBackend, "", 0, "", 0, routingInfo)
