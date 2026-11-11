@@ -18,9 +18,9 @@ require (
 	github.com/hashicorp/memberlist v0.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/k3a/html2text v1.4.0
-	github.com/migadu/go-imap v1.0.0
-	github.com/migadu/go-managesieve v0.1.3
-	github.com/migadu/go-pop3 v0.1.4
+	github.com/migadu/go-imap v1.0.1-0.20261111064229-000e018fab7c
+	github.com/migadu/go-managesieve v0.1.4-0.20261111064008-c40a1d686eed
+	github.com/migadu/go-pop3 v0.1.5-0.20261111064228-de4f7d66d394
 	github.com/migadu/go-sieve v1.4.4
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2

@@ -81,13 +81,6 @@ func newSession(s *Server, conn net.Conn) *Session {
 	// Determine real client address (from PROXY header or direct connection)
 	clientAddr := server.GetRealClientIP(conn, proxyInfo)
 
-	// A STARTTLS-capable plaintext session has no asynchronous notice writer
-	// until the upgrade completes. Register before any client command can be
-	// read, so the timeout goroutine cannot retain an old plaintext snapshot.
-	if s.startTLSConfig != nil && !server.ConnIsTLS(conn) {
-		server.SetTimeoutNoticeConn(conn, func() net.Conn { return nil })
-	}
-
 	return &Session{
 		server:       s,
 		settings:     s.loadSettings(),
@@ -713,6 +706,7 @@ func (s *Session) handleStartTLS(tag string, args []string) bool {
 	// sendBye holds writeMu while using its snapshot of clientConn. Wait for
 	// any earlier plaintext notice before acknowledging STARTTLS, then make
 	// later notices see the transition flag under the same lock order.
+	server.BeginStartTLS(s.listenerConn)
 	s.writeMu.Lock()
 	s.mu.Lock()
 	s.startTLSInProgress = true
@@ -732,10 +726,7 @@ func (s *Session) handleStartTLS(tag string, args []string) bool {
 		return false
 	}
 
-	// Timeout notices go to the TLS connection from now on, or they land in
-	// plaintext under its records (#163). Registered from this goroutine, the
-	// one that reads the connection.
-	server.SetTimeoutNoticeConn(plain, func() net.Conn { return tlsConn })
+	server.CompleteStartTLS(plain, tlsConn)
 	// The shutdown and maintenance BYE and close() read clientConn under mu
 	// from other goroutines.
 	s.mu.Lock()

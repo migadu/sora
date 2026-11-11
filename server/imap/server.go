@@ -825,10 +825,12 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		// SoraTLSConn -> *tls.Conn) to detect implicit TLS. Without it, go-imap's
 		// default `conn.(*tls.Conn)` assertion fails on our wrapped connections
 		// and rejects auth when insecure_auth=false even over a secure channel.
-		IsTLS:       serverPkg.ConnIsTLS,
-		DebugWriter: debugWriter,
-		Caps:        s.caps,
-		TLSConfig:   startTLSConfig,
+		IsTLS:                  serverPkg.ConnIsTLS,
+		DebugWriter:            debugWriter,
+		Caps:                   s.caps,
+		TLSConfig:              startTLSConfig,
+		OnStartTLS:             serverPkg.BeginStartTLS,
+		OnTLSHandshakeComplete: serverPkg.CompleteStartTLS,
 	})
 
 	// Start connection limiter cleanup
@@ -934,21 +936,6 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 
 	// Extract underlying net.Conn for setting timeouts and proxy protocol handling
 	netConn := conn.NetConn()
-
-	// go-imap upgrades the stream on STARTTLS by layering its TLS connection
-	// ABOVE netConn, so the timeout BYE must be written to the library's
-	// current connection, not to netConn's transport, or it lands in plaintext
-	// under the TLS records (#163).
-	serverPkg.SetTimeoutNoticeConn(netConn, func() net.Conn {
-		current := conn.NetConn()
-		// The timeout goroutine can retain this snapshot while STARTTLS is
-		// acknowledged. Never give it the plaintext writer of an upgradeable
-		// listener; TLS is published before go-imap starts its handshake.
-		if s.useStartTLS && !serverPkg.ConnIsTLS(current) {
-			return nil
-		}
-		return current
-	})
 
 	// Set auth idle timeout if configured (applies during pre-auth phase only)
 	if s.authIdleTimeout > 0 {

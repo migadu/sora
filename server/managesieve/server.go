@@ -433,6 +433,8 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 
 	opts := managesieveserver.Options{
 		TLSConfig:              startTLSConfig,
+		OnStartTLS:             serverPkg.BeginStartTLS,
+		OnTLSHandshakeComplete: serverPkg.CompleteStartTLS,
 		Implementation:         "ManageSieve",
 		Greeting:               `"Sora" ManageSieve server ready.`,
 		GreetingStartTLSHint:   true,
@@ -480,22 +482,6 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 				return nil, fmt.Errorf("%w: TLS handshake: %w", managesieveserver.ErrSilentReject, err)
 			} else if didTLS {
 				c.SetTLS(true)
-			}
-
-			// go-managesieve upgrades the stream on STARTTLS by layering its
-			// TLS connection ABOVE netConn, so the throughput-timeout notice
-			// must be written to the library's current connection, not to
-			// netConn's transport, or it lands in plaintext under the TLS
-			// records (#163).
-			if startTLSConfig != nil && !c.IsTLS() {
-				serverPkg.SetTimeoutNoticeConn(netConn, func() net.Conn {
-					// NetConn is still plaintext during the library's TLS handshake.
-					// Only the reading goroutine asks; an unsafe notice is omitted.
-					if !c.IsTLS() {
-						return nil
-					}
-					return c.NetConn()
-				})
 			}
 
 			// Count the connection only once it is past every rejection
@@ -779,14 +765,15 @@ func (s *ManageSieveServer) sendGracefulShutdownMessage() {
 	// Send shutdown message to all active connections
 	// ManageSieve uses BYE response for clean disconnection
 	for _, session := range activeSessions {
-		if noticeConn := serverPkg.NoticeConn(session.conn); noticeConn != nil {
-			// After STARTTLS the client reads through the library's TLS
-			// connection, which sits above session.conn.
+		// After STARTTLS the client reads through the library's TLS
+		// connection, which sits above session.conn; while STARTTLS is
+		// negotiating there is nothing to write to.
+		serverPkg.WriteNotice(session.conn, func(noticeConn net.Conn) {
 			writer := bufio.NewWriter(noticeConn)
 			// Send BYE with TRYLATER response code (RFC 5804 Section 1.3)
 			writer.WriteString("BYE (TRYLATER) \"Server shutting down, please reconnect\"\r\n")
 			writer.Flush()
-		}
+		})
 	}
 
 	// Give clients a brief moment (1 second) to receive the message

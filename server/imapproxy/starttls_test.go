@@ -186,6 +186,23 @@ func TestSTARTTLSOmitsPlaintextTimeoutDuringHandshake(t *testing.T) {
 	}
 }
 
+// A client that has not sent STARTTLS reads in plaintext: the timeout notice
+// must reach it. It used to be withheld from every session of a STARTTLS
+// listener that was not yet TLS, upgrade in progress or not (#236).
+func TestSTARTTLSListenerSendsPlaintextTimeoutNoticeBeforeUpgrade(t *testing.T) {
+	_, conn, r, _ := startSTARTTLSSessionWithConfig(t, server.SoraConnConfig{
+		Protocol: "imap_proxy", IdleTimeout: 300 * time.Millisecond, EnableTimeoutChecker: true,
+		OnTimeout: func(c net.Conn, _ string) { io.WriteString(c, "* BYE Idle timeout\r\n") },
+	})
+	io.WriteString(conn, "a NOOP\r\n")
+	if line := readLine(t, r); line != "a OK NOOP completed" {
+		t.Fatalf("NOOP = %q", line)
+	}
+	if line := readLine(t, r); line != "* BYE Idle timeout" {
+		t.Fatalf("timeout notice = %q", line)
+	}
+}
+
 // A notice that already took a snapshot of the plaintext writer owns writeMu.
 // STARTTLS must wait for it to finish before sending its success response.
 func TestSTARTTLSWaitsForPriorNoticeBeforeAcknowledgingUpgrade(t *testing.T) {
