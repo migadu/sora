@@ -167,8 +167,8 @@ github.com/mattn/go-isatty v0.0.24/go.mod h1:nMCL3Zebbrt45jsMDgnfIwz6ydEQApk5oEI
 github.com/matttproud/golang_protobuf_extensions v1.0.1/go.mod h1:D8He9yQNgCq6Z5Ld7szi9bcBfOoFv/3dc6xSMkL2PC0=
 github.com/miekg/dns v1.1.72 h1:vhmr+TF2A3tuoGNkLDFK9zi36F2LS+hKTRW0Uf8kbzI=
 github.com/miekg/dns v1.1.72/go.mod h1:+EuEPhdHOsfk6Wk5TT2CzssZdqkmFhf8r+aVyDEToIs=
-github.com/migadu/go-imap v1.2.0 h1:DEYlwvPdKKJ3KfYohjQTTz8vAs56rTq8FK+fmv2IyJo=
-github.com/migadu/go-imap v1.2.0/go.mod h1:fvRvl7ajggZYKHgHokVT0O5uQsAj7ZVAhK6PoQYgga0=
+github.com/migadu/go-imap v1.2.2 h1:tsiK3Lx2LKCoWvQERNtOk1OepPtJzFZiYjnlT0PiAoo=
+github.com/migadu/go-imap v1.2.2/go.mod h1:fvRvl7ajggZYKHgHokVT0O5uQsAj7ZVAhK6PoQYgga0=
 github.com/migadu/go-managesieve v0.1.4-0.20261111064008-c40a1d686eed h1:/4Otj5PB5MAZW+g6neHCffnyA6E+AR1JmgYNO5XxH6Y=
 github.com/migadu/go-managesieve v0.1.4-0.20261111064008-c40a1d686eed/go.mod h1:E38XgVuCDYRSNz/9ku4Sc7CvVDmJ8FLqGc1udcxP9SE=
 github.com/migadu/go-message v0.0.0-20260705121217-8814c0e56d68 h1:roaycu/LcVmWGO8i9nN0HTnW81NXHgfy45gR2+G6yxs=
