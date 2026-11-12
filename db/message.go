@@ -236,8 +236,6 @@ func streamMessagesByUIDSet(ctx context.Context, run MessageStreamDBRunner, mail
 }
 
 func streamMessagesWhereChunked(ctx context.Context, run MessageStreamDBRunner, metricType string, mailboxID int64, whereClause string, args []any, cb MessageStreamCallback, includeBodyStructure bool) error {
-	metrics.MessageFetchChunked.WithLabelValues(metricType).Inc()
-
 	bsColInner := ""
 	if includeBodyStructure {
 		bsColInner = "m.body_structure, "
@@ -257,7 +255,51 @@ func streamMessagesWhereChunked(ctx context.Context, run MessageStreamDBRunner, 
 		ORDER BY m.uid ASC
 		LIMIT $%d`, bsColInner, whereClause, len(args)+1, len(args)+2)
 
-	var lastUID int64
+	return StreamMessageChunksWithRunner(ctx, run, metricType, func(stepCtx context.Context, db *Database, afterUID imap.UID, afterSeq uint32) ([]Message, int, error) {
+		chunkSize := db.effectiveFetchChunkSize()
+		argsWithLimit := make([]any, 0, len(args)+2)
+		argsWithLimit = append(argsWithLimit, args...)
+		argsWithLimit = append(argsWithLimit, int64(afterUID), chunkSize)
+
+		rows, err := db.GetReadPoolWithContext(stepCtx).Query(stepCtx, query, argsWithLimit...)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to query messages chunk after uid %d: %w", afterUID, err)
+		}
+
+		messages, err := scanMessages(rows, includeBodyStructure)
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(messages) == 0 {
+			return nil, chunkSize, nil
+		}
+
+		if err := stepCtx.Err(); err != nil {
+			return nil, 0, fmt.Errorf("chunked fetch cancelled: %w", err)
+		}
+
+		// The previous chunk's last message anchors this one: every UID here is above it.
+		if err := db.hydrateChunkSequences(stepCtx, mailboxID, messages, uint32(afterUID), afterSeq); err != nil {
+			return nil, 0, err
+		}
+		return messages, chunkSize, nil
+	}, cb)
+}
+
+// MessageChunkFetcher reads the next chunk of a message stream: the messages whose
+// UIDs follow afterUID, in ascending UID order and with Seq populated (afterSeq is the
+// sequence number of the message at afterUID; both are zero for the first chunk). It
+// also returns the row limit it applied, so a short chunk can end the stream. It runs
+// inside a MessageStreamDBRunner step and may run again if that step is retried.
+type MessageChunkFetcher func(stepCtx context.Context, db *Database, afterUID imap.UID, afterSeq uint32) (messages []Message, limit int, err error)
+
+// StreamMessageChunksWithRunner drives a chunked message stream: every fetch runs as
+// its own step of run, and cb receives each chunk outside that step. The cursor only
+// advances once a step has succeeded, so a retried step never replays a delivered chunk.
+func StreamMessageChunksWithRunner(ctx context.Context, run MessageStreamDBRunner, metricType string, fetch MessageChunkFetcher, cb MessageStreamCallback) error {
+	metrics.MessageFetchChunked.WithLabelValues(metricType).Inc()
+
+	var lastUID imap.UID
 	var lastSeq uint32
 	chunkCount := 0
 
@@ -276,49 +318,23 @@ func streamMessagesWhereChunked(ctx context.Context, run MessageStreamDBRunner, 
 		}
 
 		var messages []Message
-		var chunkSize int
-		// The previous chunk's last message anchors this one: every UID here is above it.
-		anchorUID, anchorSeq := uint32(lastUID), lastSeq
-
+		var limit int
 		if err := run(ctx, func(stepCtx context.Context, db *Database) error {
-			chunkSize = db.effectiveFetchChunkSize()
-			argsWithLimit := make([]any, 0, len(args)+2)
-			argsWithLimit = append(argsWithLimit, args...)
-			argsWithLimit = append(argsWithLimit, lastUID, chunkSize)
-
-			rows, err := db.GetReadPoolWithContext(stepCtx).Query(stepCtx, query, argsWithLimit...)
-			if err != nil {
-				return fmt.Errorf("failed to query messages chunk after uid %d: %w", lastUID, err)
-			}
-
-			scanned, err := scanMessages(rows, includeBodyStructure)
+			fetched, fetchLimit, err := fetch(stepCtx, db, lastUID, lastSeq)
 			if err != nil {
 				return err
 			}
-			if len(scanned) == 0 {
-				messages = nil
-				return nil
-			}
-
-			if err := stepCtx.Err(); err != nil {
-				return fmt.Errorf("chunked fetch cancelled: %w", err)
-			}
-
-			if err := db.hydrateChunkSequences(stepCtx, mailboxID, scanned, anchorUID, anchorSeq); err != nil {
-				return err
-			}
-
-			messages = scanned
+			messages, limit = fetched, fetchLimit
 			return nil
 		}); err != nil {
 			return err
 		}
 
 		if len(messages) == 0 {
-			break
+			return nil
 		}
 
-		lastUID = int64(messages[len(messages)-1].UID)
+		lastUID = messages[len(messages)-1].UID
 		lastSeq = messages[len(messages)-1].Seq
 		chunkCount++
 
@@ -326,12 +342,10 @@ func streamMessagesWhereChunked(ctx context.Context, run MessageStreamDBRunner, 
 			return err
 		}
 
-		if len(messages) < chunkSize {
-			break
+		if len(messages) < limit {
+			return nil
 		}
 	}
-
-	return nil
 }
 
 // uidSetCondition returns the condition on m.uid that selects uidSet's messages, as one
@@ -357,7 +371,6 @@ func streamMessagesBySeqSet(ctx context.Context, run MessageStreamDBRunner, mail
 		return nil
 	}
 	if len(seqSet) == 1 && seqSet[0].Start == 1 && (seqSet[0].Stop == 0) {
-		log.Printf("Database: SeqSet includes all messages (1:*) for mailbox %d", mailboxID)
 		logger.Debug("Database: Streaming SeqSet 1:* fetch", "mailbox_id", mailboxID)
 		return streamAllActiveMessagesRawChunked(ctx, run, mailboxID, cb, includeBodyStructure)
 	}
@@ -397,8 +410,6 @@ func streamMessagesBySeqSet(ctx context.Context, run MessageStreamDBRunner, mail
 }
 
 func streamAllActiveMessagesRawChunked(ctx context.Context, run MessageStreamDBRunner, mailboxID int64, cb MessageStreamCallback, includeBodyStructure bool) error {
-	metrics.MessageFetchChunked.WithLabelValues("all_messages").Inc()
-
 	bsCol := ""
 	if includeBodyStructure {
 		bsCol = "m.body_structure, "
@@ -417,68 +428,25 @@ func streamAllActiveMessagesRawChunked(ctx context.Context, run MessageStreamDBR
 		LIMIT $3
 	`, bsCol)
 
-	var lastUID int64
-	var nextSeqNum uint32 = 1
-	chunkCount := 0
-
-	defer func() {
-		if chunkCount > 0 {
-			metrics.MessageFetchChunks.WithLabelValues("all_messages").Observe(float64(chunkCount))
-		}
-	}()
-
-	for {
-		if err := ctx.Err(); err != nil {
-			if chunkCount > 0 {
-				return fmt.Errorf("chunked fetch cancelled: %w", err)
-			}
-			return err
+	return StreamMessageChunksWithRunner(ctx, run, "all_messages", func(stepCtx context.Context, db *Database, afterUID imap.UID, afterSeq uint32) ([]Message, int, error) {
+		chunkSize := db.effectiveFetchChunkSize()
+		rows, err := db.GetReadPoolWithContext(stepCtx).Query(stepCtx, query, mailboxID, int64(afterUID), chunkSize)
+		if err != nil {
+			return nil, 0, fmt.Errorf("fetchAllActiveMessagesRaw: failed to query chunk after uid %d: %w", afterUID, err)
 		}
 
-		var messages []Message
-		var chunkSize int
-
-		if err := run(ctx, func(stepCtx context.Context, db *Database) error {
-			chunkSize = db.effectiveFetchChunkSize()
-			rows, err := db.GetReadPoolWithContext(stepCtx).Query(stepCtx, query, mailboxID, lastUID, chunkSize)
-			if err != nil {
-				return fmt.Errorf("fetchAllActiveMessagesRaw: failed to query chunk after uid %d: %w", lastUID, err)
-			}
-
-			scanned, err := scanMessages(rows, includeBodyStructure)
-			if err != nil {
-				return err
-			}
-			messages = scanned
-			return nil
-		}); err != nil {
-			return err
+		messages, err := scanMessages(rows, includeBodyStructure)
+		if err != nil {
+			return nil, 0, err
 		}
 
-		if len(messages) == 0 {
-			break
-		}
-
-		lastUID = int64(messages[len(messages)-1].UID)
-		chunkCount++
-
-		// Because we comprehensively requested all active messages sequentially from UID 0
-		// tracking their absolute sequential order natively skips any need for DB re-queries!
+		// Every active message is read in UID order from the start, so sequence
+		// numbers simply continue from the previous chunk without a DB query.
 		for i := range messages {
-			messages[i].Seq = nextSeqNum
-			nextSeqNum++
+			messages[i].Seq = afterSeq + uint32(i) + 1
 		}
-
-		if err := cb(messages); err != nil {
-			return err
-		}
-
-		if len(messages) < chunkSize {
-			break
-		}
-	}
-
-	return nil
+		return messages, chunkSize, nil
+	}, cb)
 }
 
 func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {

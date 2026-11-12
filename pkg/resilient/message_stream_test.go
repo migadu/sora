@@ -39,9 +39,11 @@ var fastTestRetryConfig = retry.BackoffConfig{
 	OperationName:   "test_stream_step",
 }
 
-// runChunkedTestStream mirrors db.StreamMessagesByNumSetWithRunner's control flow
-// against rd.runMessageStreamStep so unit tests can exercise timeout, retry, and
-// circuit-breaker boundaries without a live PostgreSQL instance.
+// runChunkedTestStream drives the production chunk loop
+// (db.StreamMessageChunksWithRunner) through rd.runMessageStreamStep, with fetchChunk
+// standing in for the SQL, so unit tests exercise the real timeout, retry, and
+// circuit-breaker boundaries without a live PostgreSQL instance. chunkIdx counts the
+// chunks delivered so far, so a retried step sees the same index again.
 func runChunkedTestStream(
 	ctx context.Context,
 	rd *ResilientDatabase,
@@ -49,31 +51,21 @@ func runChunkedTestStream(
 	fetchChunk func(stepCtx context.Context, chunkIdx int) ([]db.Message, error),
 	cb db.MessageStreamCallback,
 ) error {
-	for chunkIdx := 0; ; chunkIdx++ {
-		if err := ctx.Err(); err != nil {
-			if chunkIdx > 0 {
-				return fmt.Errorf("chunked fetch cancelled: %w", err)
-			}
-			return err
-		}
-		var chunk []db.Message
-		if err := rd.runMessageStreamStep(ctx, retryCfg, func(stepCtx context.Context) error {
-			msgs, err := fetchChunk(stepCtx, chunkIdx)
-			if err != nil {
-				return err
-			}
-			chunk = msgs
-			return nil
-		}); err != nil {
-			return err
-		}
-		if len(chunk) == 0 {
-			return nil
-		}
-		if err := cb(chunk); err != nil {
-			return err
-		}
+	chunkIdx := 0
+	run := func(ctx context.Context, step func(context.Context, *db.Database) error) error {
+		return rd.runMessageStreamStep(ctx, retryCfg, func(stepCtx context.Context) error {
+			return step(stepCtx, nil) // fetchChunk never touches the database
+		})
 	}
+	fetch := func(stepCtx context.Context, _ *db.Database, _ imap.UID, _ uint32) ([]db.Message, int, error) {
+		msgs, err := fetchChunk(stepCtx, chunkIdx)
+		// A full chunk (limit == len) keeps the stream going until an empty one.
+		return msgs, len(msgs), err
+	}
+	return db.StreamMessageChunksWithRunner(ctx, run, "test", fetch, func(chunk []db.Message) error {
+		chunkIdx++
+		return cb(chunk)
+	})
 }
 
 func TestMessageStreamCallbackErrorsDoNotTripDatabaseBreaker(t *testing.T) {
