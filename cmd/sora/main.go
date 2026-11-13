@@ -2405,6 +2405,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		Name:               serverConfig.Name,
 		Addr:               serverConfig.Addr,
 		APIKey:             serverConfig.APIKey,
+		ReadOnlyAPIKey:     serverConfig.ReadOnlyAPIKey,
 		AllowedHosts:       serverConfig.AllowedHosts,
 		Cache:              deps.cacheInstance,
 		Uploader:           deps.uploadWorker,

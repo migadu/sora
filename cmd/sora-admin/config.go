@@ -251,6 +251,9 @@ Examples:
 			if sc.APIKey != "" {
 				sc.APIKey = "***MASKED***"
 			}
+			if sc.ReadOnlyAPIKey != "" {
+				sc.ReadOnlyAPIKey = "***MASKED***"
+			}
 			if sc.JWTSecret != "" {
 				sc.JWTSecret = "***MASKED***"
 			}

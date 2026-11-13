@@ -2178,6 +2178,7 @@ type = "http_admin_api"
 name = "admin-api"
 addr = ":8080"
 api_key = "your-secret-api-key-here"  # REQUIRED for API access.
+# read_only_api_key = ""      # [OPTIONAL] Second key that may only make GET requests (monitoring, dashboards). Must differ from api_key.
 allowed_hosts = []            # Empty = all hosts (not recommended for production).
 tls = false
 tls_cert_file = ""            # Static cert file (or use Let's Encrypt autocert from [tls] section)

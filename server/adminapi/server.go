@@ -47,8 +47,9 @@ func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []stri
 // publishes a new one whole and none is changed after: a request loads it once and
 // uses that copy throughout, so it never mixes the values of two reloads.
 type reloadableSettings struct {
-	apiKey       string
-	allowedHosts []string
+	apiKey         string
+	readOnlyAPIKey string // optional second key, accepted for GET requests only
+	allowedHosts   []string
 }
 
 // Server represents the HTTP API server
@@ -104,6 +105,7 @@ type ServerOptions struct {
 	Name               string
 	Addr               string
 	APIKey             string
+	ReadOnlyAPIKey     string // optional; grants only GET requests
 	AllowedHosts       []string
 	Cache              *cache.Cache
 	Uploader           *uploader.UploadWorker
@@ -204,9 +206,28 @@ func checkAPIKey(key string) error {
 	return nil
 }
 
+// checkReadOnlyAPIKey refuses a read-only API key the server must not run with. It is
+// optional, so empty is fine; otherwise it is held to the same strength rules as
+// api_key and must differ from it, or every read-only client would hold full access.
+func checkReadOnlyAPIKey(key, apiKey string) error {
+	if key == "" {
+		return nil
+	}
+	if err := checkAPIKey(key); err != nil {
+		return fmt.Errorf("read-only %w", err)
+	}
+	if key == apiKey {
+		return fmt.Errorf("read-only API key must differ from the API key")
+	}
+	return nil
+}
+
 // New creates a new HTTP API server
 func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, error) {
 	if err := checkAPIKey(options.APIKey); err != nil {
+		return nil, err
+	}
+	if err := checkReadOnlyAPIKey(options.ReadOnlyAPIKey, options.APIKey); err != nil {
 		return nil, err
 	}
 
@@ -269,8 +290,9 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		sharedMailboxes:    options.SharedMailboxes,
 	}
 	s.settings.Store(&reloadableSettings{
-		apiKey:       options.APIKey,
-		allowedHosts: options.AllowedHosts,
+		apiKey:         options.APIKey,
+		readOnlyAPIKey: options.ReadOnlyAPIKey,
+		allowedHosts:   options.AllowedHosts,
 	})
 
 	return s, nil
@@ -287,15 +309,33 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	var refused error
 	next := *s.settings.Load()
+	previousAPIKey := next.apiKey
 
 	if cfg.APIKey != "" && cfg.APIKey != next.apiKey {
-		if err := checkAPIKey(cfg.APIKey); err != nil {
+		if cfg.APIKey == next.readOnlyAPIKey {
+			// Read-only clients already hold this value; taking it as api_key would
+			// hand them full access.
+			refused = fmt.Errorf("api_key refused, the previous one stays in use: it equals the current read_only_api_key")
+		} else if err := checkAPIKey(cfg.APIKey); err != nil {
 			// The rest still reloads. The error has the caller log a failed reload, so an
 			// operator rotating a leaked key learns that the old one is still live.
 			refused = fmt.Errorf("api_key refused, the previous one stays in use: %w", err)
 		} else {
 			next.apiKey = cfg.APIKey
 			reloaded = append(reloaded, "api_key")
+		}
+	}
+	// read_only_api_key is optional, so unlike api_key an empty value is applied: it
+	// revokes the read-only key.
+	if cfg.ReadOnlyAPIKey != next.readOnlyAPIKey {
+		if err := checkReadOnlyAPIKey(cfg.ReadOnlyAPIKey, next.apiKey); err != nil {
+			refused = errors.Join(refused, fmt.Errorf("read_only_api_key refused, the previous one stays in use: %w", err))
+		} else if cfg.ReadOnlyAPIKey != "" && cfg.ReadOnlyAPIKey == previousAPIKey {
+			// The api_key being rotated out may be a leaked one; it must not live on as a read key.
+			refused = errors.Join(refused, fmt.Errorf("read_only_api_key refused, the previous one stays in use: it equals the api_key this reload replaces"))
+		} else {
+			next.readOnlyAPIKey = cfg.ReadOnlyAPIKey
+			reloaded = append(reloaded, "read_only_api_key")
 		}
 	}
 	// Reload receives the complete config, so an empty or removed list means what
@@ -657,8 +697,20 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(s.settings.Load().apiKey)) != 1 {
+		settings := s.settings.Load()
+		token := []byte(parts[1])
+		if subtle.ConstantTimeCompare(token, []byte(settings.apiKey)) == 1 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if settings.readOnlyAPIKey == "" || subtle.ConstantTimeCompare(token, []byte(settings.readOnlyAPIKey)) != 1 {
 			s.writeError(w, http.StatusForbidden, "Invalid API key")
+			return
+		}
+		// The read-only key: every GET route only reads, and every write is a
+		// POST, PUT or DELETE.
+		if r.Method != http.MethodGet {
+			s.writeError(w, http.StatusForbidden, "API key is read-only")
 			return
 		}
 

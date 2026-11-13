@@ -43,7 +43,7 @@ var reloadableServerSettings = map[string][]string{
 		"master_sasl_username", "master_sasl_password", "debug",
 	},
 	"lmtp_proxy":     {"timeouts.absolute_session_timeout", "max_message_size"},
-	"http_admin_api": {"api_key", "allowed_hosts"},
+	"http_admin_api": {"api_key", "read_only_api_key", "allowed_hosts"},
 	"http_user_api":  {"jwt_secret", "allowed_origins", "allowed_hosts"},
 	"user_api_proxy": {"jwt_secret"},
 }

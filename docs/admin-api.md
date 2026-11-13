@@ -59,6 +59,19 @@ tls = false
 - Rotate keys periodically
 - Use TLS in production
 
+### Read-Only API Key
+
+A second, optional key can be configured for clients that only need to read (monitoring, dashboards, reporting):
+
+```toml
+[[server]]
+type = "http_admin_api"
+api_key = "replace-with-a-long-random-full-access-key"
+read_only_api_key = "replace-with-a-long-random-read-only-key"  # Optional; same rules (16+ chars), must differ from api_key
+```
+
+The read-only key is accepted only for `GET` requests. Any other method (`POST`, `PUT`, `DELETE`, …) made with it is rejected with `403 {"error": "API key is read-only"}`. Like `api_key`, it is reloaded on SIGHUP; removing it from the config revokes it. As a guard against copy-paste mistakes, a reload is refused when it sets `api_key` to the read-only key currently in use, or `read_only_api_key` to the `api_key` it replaces. This only compares against the keys live at that moment: when retiring a key, give it a fresh value rather than reusing one from the other slot.
+
 ### Making Authenticated Requests
 
 Include the API key in the `Authorization` header:
