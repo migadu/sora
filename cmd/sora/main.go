@@ -167,12 +167,12 @@ func main() {
 	// Initialize logging with zap logger
 	logFile, err := logger.Initialize(cfg.Logging)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "SORA: Warning initializing logger: %v\n", err)
+		fmt.Fprintf(logger.Stderr(), "SORA: Warning initializing logger: %v\n", err)
 	}
 	if logFile != nil {
-		defer func(f *os.File) {
+		defer func(f *logger.LogFile) {
 			logger.Sync() // Flush any buffered log entries
-			fmt.Fprintf(os.Stderr, "SORA: Closing log file %s\n", f.Name())
+			fmt.Fprintf(logger.Stderr(), "SORA: Closing log file %s\n", f.Name())
 			if err := f.Close(); err != nil {
 				fmt.Fprintf(os.Stderr, "SORA: Error closing log file %s: %v\n", f.Name(), err)
 			}
@@ -264,6 +264,11 @@ func main() {
 	signal.Notify(reloadChan, syscall.SIGHUP)
 	go func() {
 		for range reloadChan {
+			// newsyslog sends SIGHUP after rotating the log file: reopen it first,
+			// so the reload below is logged into the new file.
+			if err := logger.Reopen(); err != nil {
+				logger.Error("SIGHUP: log file not reopened", "error", err)
+			}
 			logger.Info("SIGHUP received - reloading configuration", "config", *configPath)
 
 			// Re-read the full config for per-server dispatch

@@ -3,7 +3,7 @@
 // This package wraps Go's standard library slog for high-performance
 // structured logging with support for multiple outputs:
 //   - Console (stdout/stderr)
-//   - File (with automatic rotation)
+//   - File (reopened on SIGHUP, so newsyslog or logrotate can rotate it)
 //   - Syslog (local or remote)
 //
 // # Initialization
@@ -76,12 +76,14 @@ package logger
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"log/syslog"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"unicode"
 
@@ -151,6 +153,107 @@ func needsQuoting(s string) bool {
 // because tests re-Initialize or Swap it while servers from earlier tests still log.
 var globalLogger atomic.Pointer[slog.Logger]
 
+// fileOutput is the file output, when the configured output is a path; nil
+// otherwise. Retained output writers load it on every write, including writers
+// created before Initialize.
+var fileOutput atomic.Pointer[LogFile]
+
+// Stdout returns a writer for unstructured output such as protocol debug logs.
+// It follows the configured log file across rotations, or writes to os.Stdout
+// when file logging is not configured. The writer may be kept across Initialize.
+func Stdout() io.Writer { return streamWriter{} }
+
+// Stderr is like Stdout, but falls back to os.Stderr. It can be used by error
+// handlers created before logging is initialized.
+func Stderr() io.Writer { return streamWriter{stderr: true} }
+
+type streamWriter struct{ stderr bool }
+
+func (w streamWriter) Write(p []byte) (int, error) {
+	if lf := fileOutput.Load(); lf != nil {
+		return lf.Write(p)
+	}
+	if w.stderr {
+		return os.Stderr.Write(p)
+	}
+	return os.Stdout.Write(p)
+}
+
+// LogFile is a log output that can be reopened under the running handler.
+// newsyslog renames the file and then signals the process; writing on
+// through the old descriptor would fill the rotated file, which is then
+// compressed and lost.
+type LogFile struct {
+	mu   sync.Mutex
+	path string
+	f    *os.File
+}
+
+func openLogFile(path string) (*LogFile, error) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &LogFile{path: path, f: f}, nil
+}
+
+// Name returns the path of the log file.
+func (lf *LogFile) Name() string { return lf.path }
+
+func (lf *LogFile) Write(p []byte) (int, error) {
+	lf.mu.Lock()
+	defer lf.mu.Unlock()
+	if lf.f == nil {
+		return 0, os.ErrClosed
+	}
+	return lf.f.Write(p)
+}
+
+// Close closes the current descriptor.
+func (lf *LogFile) Close() error {
+	lf.mu.Lock()
+	defer lf.mu.Unlock()
+	if lf.f == nil {
+		return os.ErrClosed
+	}
+	err := lf.f.Close()
+	lf.f = nil
+	fileOutput.CompareAndSwap(lf, nil)
+	return err
+}
+
+// reopen swaps the underlying file while holding the same lock as every writer.
+// Saved Stdout and Stderr writers go through this handle too, so rotation never
+// closes a descriptor beneath an in-flight write. If opening fails, the old
+// file remains usable.
+func (lf *LogFile) reopen() error {
+	lf.mu.Lock()
+	defer lf.mu.Unlock()
+	if lf.f == nil {
+		return fmt.Errorf("reopen log file %s: %w", lf.path, os.ErrClosed)
+	}
+	f, err := os.OpenFile(lf.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("reopen log file %s: %w", lf.path, err)
+	}
+	old := lf.f
+	lf.f = f
+	if err := old.Close(); err != nil {
+		return fmt.Errorf("close rotated log file %s: %w", lf.path, err)
+	}
+	return nil
+}
+
+// Reopen reopens the log file after a rotation tool such as newsyslog has moved
+// it aside; main calls it on SIGHUP. A no-op when the output is not a file.
+func Reopen() error {
+	lf := fileOutput.Load()
+	if lf == nil {
+		return nil
+	}
+	return lf.reopen()
+}
+
 // syslogHandler wraps syslog.Writer to implement slog.Handler
 type syslogHandler struct {
 	writer *syslog.Writer
@@ -213,9 +316,12 @@ func (h *syslogHandler) WithGroup(name string) slog.Handler {
 	}
 }
 
-// Initialize sets up the global logger based on configuration
-func Initialize(cfg config.LoggingConfig) (*os.File, error) {
-	var logFile *os.File
+// Initialize sets up the global logger based on configuration. With a file
+// path as output it returns the file, which Reopen swaps on SIGHUP; nil
+// otherwise.
+func Initialize(cfg config.LoggingConfig) (*LogFile, error) {
+	var logFile *LogFile
+	fileOutput.Store(nil)
 
 	// Determine output
 	output := cfg.Output
@@ -288,7 +394,7 @@ func Initialize(cfg config.LoggingConfig) (*os.File, error) {
 	default:
 		// Assume it's a file path
 		var err error
-		logFile, err = os.OpenFile(output, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		logFile, err = openLogFile(output)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "WARNING: failed to open log file '%s': %v. Falling back to stderr.\n", output, err)
 			if format == "json" {
@@ -303,9 +409,7 @@ func Initialize(cfg config.LoggingConfig) (*os.File, error) {
 			} else {
 				handler = slog.NewTextHandler(logFile, handlerOpts)
 			}
-			// Redirect stdout and stderr to log file
-			os.Stdout = logFile
-			os.Stderr = logFile
+			fileOutput.Store(logFile)
 		}
 	}
 

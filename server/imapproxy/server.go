@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -340,7 +339,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Setup debug writer with password masking if debug is enabled
 	var debugWriter io.Writer
 	if opts.Debug {
-		debugWriter = &maskingWriter{w: os.Stdout}
+		debugWriter = &maskingWriter{w: logger.Stdout()}
 	}
 
 	// Set listen backlog with reasonable default

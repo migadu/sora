@@ -38,7 +38,7 @@ type ErrorHandler struct {
 func NewErrorHandler() *ErrorHandler {
 	return &ErrorHandler{
 		exitChannel: make(chan int, 1),
-		logger:      log.New(os.Stderr, "[ERROR] ", log.LstdFlags),
+		logger:      log.New(logger.Stderr(), "[ERROR] ", log.LstdFlags),
 	}
 }
 

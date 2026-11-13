@@ -324,7 +324,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Setup debug writer with password masking if debug is enabled
 	var debugWriter io.Writer
 	if options.Debug {
-		debugWriter = &maskingWriter{w: os.Stdout}
+		debugWriter = &maskingWriter{w: logger.Stdout()}
 	}
 
 	// Set listen backlog with reasonable default

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -235,7 +234,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Setup debug writer if debug is enabled
 	var debugWriter io.Writer
 	if opts.Debug {
-		debugWriter = os.Stdout
+		debugWriter = logger.Stdout()
 	}
 
 	// Set listen backlog with reasonable default

@@ -828,8 +828,8 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 	var debugWriter io.Writer
 	if options.Debug {
-		// Wrap os.Stdout with our masking writer to redact passwords from debug logs
-		debugWriter = &maskingWriter{w: os.Stdout}
+		// Mask passwords before writing to the rotating log output.
+		debugWriter = &maskingWriter{w: logger.Stdout()}
 	}
 
 	// go-imap offers STARTTLS whenever it has a TLS config and the connection
