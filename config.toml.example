@@ -9,23 +9,27 @@
 # - Copy this file to config.toml and modify the values for your deployment
 # - All sections and options are documented with their default values
 # - Duration values accept Go duration format: "1h", "30m", "5s", "100ms"
-# - Size values accept common suffixes: "1gb", "100mb", "5kb"
+# - Size values accept common suffixes: "1gb", "100mb", "5kb" (the "b" must be lowercase: "25MB" is rejected)
 #
 # CONFIG VALIDATION:
 # - Unknown keys will log warnings but are ignored (helps detect typos)
 # - Duplicate keys will log warnings and use first occurrence
 # - Syntax errors (e.g., "f" instead of "false") will fail with helpful hints
-# - Run './sora --config config.toml' to validate your configuration
+# - Run 'sora-admin --config config.toml config validate' to check the file without starting
+#   the server ('sora --config config.toml' starts it). It checks syntax and each [[server]]
+#   block, but not [[pool]] blocks, the trusted_networks rule for proxy_protocol, or whether
+#   the database and S3 are reachable; the server checks those at startup.
 
 # GLOBAL: bcrypt cost factor for password hashing (clamped to 10..14, default 12).
 # Higher is stronger but slower per login; raising it transparently rehashes existing
-# lower-cost hashes on the user's next successful login.
+# lower-cost hashes on the user's next successful login. sora-admin does not read it:
+# passwords it sets are always hashed with cost 12.
 bcrypt_cost = 12
 
 # ADMIN CLI CONFIGURATION (for sora-admin tool)
 # =============================================================================
 # Configuration for the sora-admin CLI tool to connect to the HTTP Admin API server.
-# Required for commands like 'sora-admin stats auth', 'stats connection', 'connections list', 'connections kick', etc.
+# Required for commands like 'sora-admin stats blocked', 'stats connection', 'connections list', 'connections kick', etc.
 
 [admin_cli]
 addr = "http://localhost:8080"              # HTTP Admin API endpoint address (use https:// if TLS is enabled)
@@ -34,8 +38,8 @@ insecure_skip_verify = true                 # Skip TLS cert verification. Defaul
 
 # Maximum message size for maildir import operations
 # Messages larger than this will be skipped during import
-# Default: 50mb (larger than IMAP append_limit since imports are batch operations)
-# This setting is independent of IMAP server configuration
+# Default when unset: the append_limit of the first IMAP [[server]] in this file (25mb if
+# that block sets none); 50mb only when no IMAP server is configured.
 import_message_limit = "50mb"
 
 
@@ -52,11 +56,12 @@ level = "info"            # Log level: "debug", "info", "warn", "error"
 # DATABASE CONFIGURATION
 # =============================================================================
 # PostgreSQL database connection settings with read/write split support.
-# Sora requires PostgreSQL with the pg_trgm extension for full-text search.
+# Sora requires PostgreSQL with the pg_trgm and btree_gin extensions (the migrations create them).
 
 [database]
 debug = false                   # Enable SQL query logging. Useful for debugging, but impacts performance.
-query_timeout = "30s"           # Default timeout for all database queries (e.g., "30s", "1m").
+query_timeout = "30s"           # Timeout for read queries (default: 30s). The read endpoint's own query_timeout
+                                # ([database.read], or [database.write] without one; default 30s) takes precedence.
 search_timeout = "1m"           # Specific timeout for complex search queries (e.g., "60s", "2m").
 write_timeout = "15s"           # Timeout for write operations (INSERT, UPDATE, DELETE).
 lock_timeout = "10s"            # Max time a write statement waits for a row lock before failing with 55P03. Applied
@@ -69,14 +74,18 @@ lock_timeout = "10s"            # Max time a write statement waits for a row loc
                                 # overhead, set this to "0" and apply the bound globally on the database role instead:
                                 #   ALTER ROLE sora SET lock_timeout = '10s';
                                 # Sora keeps no session state on its connections: timeouts are SET LOCAL and every
-                                # advisory lock is transaction-scoped, so any PgBouncer pool_mode works. Locks that
+                                # advisory lock Sora takes is transaction-scoped, so PgBouncer works in session or
+                                # transaction mode (not statement mode). In transaction mode PgBouncer must track
+                                # prepared statements (1.21 or later, max_prepared_statements > 0), and migrations
+                                # take a session-level lock, so apply them over a direct connection to PostgreSQL
+                                # (for example 'sora-admin migrate up' with a config that points there). Locks that
                                 # span an S3 round trip (uploader, cleaner, cross-account IMAP COPY) hold their
                                 # transaction open for its duration and keep it alive at least every minute, so
                                 # idle_in_transaction_session_timeout must be well above that. See [uploader]
                                 # concurrency for sizing a pooler's pool.
-migration_timeout = "2m"      # Timeout for auto-migrations at startup. When multiple instances start simultaneously,
-                                # one will run migrations while others wait. If timeout is reached, the instance will
-                                # verify migrations are complete before continuing. Default: "2m" (2 minutes).
+migration_timeout = "2m"      # Migrations run at startup. When several instances start together, one applies them
+                                # (with no time limit) and the others wait, polling for up to 3x this value; a waiting
+                                # instance that runs out of time fails to start. Default: "2m".
 
 # WRITE DATABASE CONFIGURATION
 # =============================================================================
@@ -85,7 +94,7 @@ migration_timeout = "2m"      # Timeout for auto-migrations at startup. When mul
 [database.write]
 hosts = ["localhost"]         # Database server hosts. Can be ["host:port"] or multiple for failover.
 port = 5432                   # Database port. Alternative to including it in hosts.
-user = "postgres"             # Database username for authentication.
+user = "sora"                 # Database username. Not "postgres" here: hosts ["localhost"] + user "postgres" + name "sora_mail_db" is read as "no database configured" and dropped at startup.
 password = ""                 # Database user password. Leave empty for no password.
 name = "sora_mail_db"         # Database name to connect to.
 tls = false                   # Enable TLS/SSL for database connection. Recommended for remote connections.
@@ -103,13 +112,13 @@ query_timeout = "30s"           # Per-endpoint timeout for individual database q
 # READ DATABASE CONFIGURATION
 # =============================================================================
 # Read replica database endpoint(s) for SELECT operations. Can specify multiple
-# hosts for load balancing across read replicas. If not configured, read
-# operations will use the write database connection pool.
+# hosts for load balancing across read replicas. If not configured, reads use a
+# second pool opened against the write hosts, with the [database.write] pool settings.
 
 [database.read]
 hosts = ["localhost"]         # Database server hosts for read operations. Can specify multiple for load balancing.
 port = 5432                   # Database port for read operations.
-user = "postgres"             # Database username for read operations.
+user = "sora"                 # Database username for read operations (same rule as [database.write] user).
 password = ""                 # Database user password for read operations.
 name = "sora_mail_db"         # Database name for read operations (typically same as write).
 tls = false                   # Enable TLS/SSL for read database connections.
@@ -156,24 +165,24 @@ encryption_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd
 # - Centralized certificate management for ALL servers
 # - Supports Let's Encrypt automatic certificates with auto-renewal
 # - Supports file-based certificates
-# - When enabled, ALL servers with tls=true will use certificates from here
-# - Servers do NOT need tls_cert_file/tls_key_file when global TLS is enabled
+# - Servers with tls=true and no tls_cert_file/tls_key_file use certificates from here
 #
 # OPTION B: Per-Server TLS (in each [[server]] section)
 # - Individual certificate files per server (tls_cert_file, tls_key_file)
 # - More flexible but requires manual certificate management
 # - Use this if you need different certificates per protocol/server
-# - Global TLS manager must be DISABLED (enabled = false) to use per-server TLS
 #
-# IMPORTANT: You cannot mix both approaches!
-# - If [tls] enabled = true → all servers use global TLS, ignore per-server tls_cert_file/tls_key_file
-# - If [tls] enabled = false → each server needs its own tls_cert_file/tls_key_file
+# WHEN A SERVER HAS BOTH (global [tls] enabled AND its own tls_cert_file/tls_key_file):
+# - imap, pop3, http_user_api: the global certificate is used, the files are ignored
+# - lmtp, managesieve, all proxies (imap_proxy, pop3_proxy, managesieve_proxy, lmtp_proxy,
+#   user_api_proxy): the server's own files are used
+# - http_admin_api: the global certificate for clients that send SNI, the file otherwise
 #
 # RECOMMENDATION: Use global TLS with Let's Encrypt for automatic certificate management
 
 [tls]
 enabled = false                                 # Enable global TLS management (default: false)
-provider = "file"                               # TLS provider: "file" or "letsencrypt" (default: "file")
+provider = "file"                               # TLS provider: "file" or "letsencrypt". No default: required when enabled = true.
 
 # --- OPTION 1: FILE-BASED CERTIFICATES (provider = "file") ---
 # Use this for static certificates (purchased SSL, self-signed, or existing certs)
@@ -210,7 +219,8 @@ default_domain = ""                             # OPTIONAL: Default domain to us
                                                 # Use this to handle legacy clients that don't support SNI.
 storage_provider = "s3"                         # Certificate storage backend (currently only "s3" is supported)
 
-# OPTIONAL: Customize certificate renewal window (default: 30 days before expiry)
+# OPTIONAL: Customize certificate renewal window (default: the lesser of 30 days and 1/3 of the
+# certificate's lifetime; values above 30 days are treated as 30 days)
 # renew_before = "720h"                         # Renew certificates 720 hours (30 days) before expiration (format: "Xh", "Xd" not supported, use hours)
 
 # OPTIONAL: Certificate synchronization from S3 (enabled by default)
@@ -272,7 +282,7 @@ debug = false                                   # Enable detailed S3 request/res
 #
 # [tls.letsencrypt.s3]
 # bucket = "sora-tls-certificates"
-# region = "us-east-1"
+# # There is no region key: requests are signed for us-east-1, so on AWS the bucket must be there.
 #
 # [[server]]
 # type = "imap"
@@ -284,11 +294,12 @@ debug = false                                   # Enable detailed S3 request/res
 
 # --- OPTION 3: PER-SERVER TLS (Alternative to Global TLS) ---
 # Use this if you need different certificates for different protocols/servers
-# IMPORTANT: Global [tls] must be DISABLED (enabled = false) to use this approach
+# IMPORTANT: imap, pop3 and http_user_api ignore their own files while global [tls] is
+# enabled (see "WHEN A SERVER HAS BOTH" above), so disable it for them.
 #
 # EXAMPLE USAGE (Per-server TLS with different certificates):
 # [tls]
-# enabled = false               # MUST be false for per-server TLS
+# enabled = false               # Needed for imap/pop3 to use their own files
 #
 # [[server]]
 # type = "imap"
@@ -314,12 +325,14 @@ debug = false                                   # Enable detailed S3 request/res
 # 3. Ensure port 80 is open:
 #    Sora will automatically start an HTTP-01 challenge server on port 80
 # 4. Set provider = "letsencrypt" and enabled = true
-# 5. Start Sora - certificates will be issued on first HTTPS request
+# 5. Start Sora - a certificate is issued on the first TLS connection for each name
 #
 # FEATURES:
 # - Automatic certificate issuance (30-60 seconds on first request)
-# - Automatic renewal (certificates renewed 30 days before expiration by default, configurable via renew_before)
-# - Hot reload (new certificates automatically loaded on next TLS handshake - no restart needed)
+# - Automatic renewal (by default the lesser of 30 days and 1/3 of the lifetime before expiry, configurable
+#   via renew_before). A node renews only names it has served since it started; in a cluster the other
+#   nodes pick up the leader's renewal when their own renewal timer next fires (retried every 30-60 minutes).
+# - No restart needed: a renewed certificate is used from the next TLS handshake
 # - Multi-instance support (multiple Sora instances share certificates via S3)
 # - Split-brain safe issuance: only one node in the cluster runs an ACME order for a given
 #   domain, fenced on a database lock rather than on gossip leadership. Leader election has
@@ -327,7 +340,7 @@ debug = false                                   # Enable detailed S3 request/res
 #   would order the same certificate, race for the HTTP-01 challenge, and the node that is
 #   not answering port 80 would fail validation against the 5-per-hostname-per-hour limit.
 #   Nodes with no database configured (proxy-only) fall back to leadership alone.
-# - Zero-downtime renewal (renewals happen in background during TLS handshakes)
+# - Zero-downtime renewal (renewals run on a background timer; the old certificate is served meanwhile)
 # - Server-side encryption (certificates encrypted at rest with AES256; configurable, see s3 section below)
 # - File fallback (local filesystem cache when S3 is unavailable - automatic recovery)
 # - Cost: ~$0.001/month for S3 storage
@@ -335,7 +348,8 @@ debug = false                                   # Enable detailed S3 request/res
 # LIMITATIONS:
 # - Let's Encrypt rate limits: 50 certificates per domain per week
 # - Requires port 80 for HTTP-01 challenges (cannot be changed)
-# - Only supports HTTP-01 challenge (no DNS-01 for wildcard certificates yet)
+# - No DNS-01 challenge, so no wildcard certificates. The ACME library tries TLS-ALPN-01 (answered on
+#   port 443 by a listener using the global certificate) first, then HTTP-01 on port 80.
 
 
 # CLUSTER CONFIGURATION
@@ -343,9 +357,13 @@ debug = false                                   # Enable detailed S3 request/res
 # Distributed coordination using gossip protocol (HashiCorp memberlist)
 # for leader election and cluster membership management.
 #
-# USE CASE: When running multiple Sora instances with Let's Encrypt TLS,
-# cluster mode ensures only ONE node requests certificates from Let's Encrypt
-# at a time, preventing rate limit issues and duplicate certificate requests.
+# USE CASES:
+# - Let's Encrypt with several instances: only ONE node requests certificates
+#   at a time, preventing rate limit issues and duplicate certificate requests.
+# - IMAP, POP3 and ManageSieve proxies: per-user connection counts
+#   (max_connections_per_user) and kicks across all proxy nodes.
+# - Proxies: user-to-backend affinity shared across nodes (see [cluster.affinity]).
+# Authentication rate limits are NOT shared: each node counts failures on its own.
 #
 # ARCHITECTURE:
 # - Uses gossip protocol for peer discovery and failure detection
@@ -372,11 +390,10 @@ enabled = false                                 # Enable cluster mode (default: 
 # INVALID (WILL FAIL):
 #   addr = "0.0.0.0:7946"             # Cannot use 0.0.0.0 - other nodes cannot reach you
 #   addr = "localhost:7946"           # Cannot use localhost - hostname resolution issues
-#   addr = "[::]:7946"                # Cannot use :: - IPv6 any address not reachable
+#   addr = "[::]:7946"                # IPv6 addresses are not supported (also "[::1]:7946" and any other)
 #
 # TESTING ONLY (works but not for production):
 #   addr = "127.0.0.1:7946"           # Loopback - works for single-machine testing only
-#   addr = "[::1]:7946"               # IPv6 loopback - works for single-machine testing only
 #
 # WHY THIS MATTERS:
 # The gossip protocol needs to advertise a real IP address to other nodes. When you bind to
@@ -395,33 +412,29 @@ addr = "10.10.10.40:7946"                       # Gossip bind address - MUST be 
 # If addr="10.10.10.40", this port will be appended to create "10.10.10.40:7946".
 port = 7946                                     # Gossip port (default: 7946)
 
-node_id = ""                                    # Unique node ID (default: hostname). Also this node's instance ID,
-                                                # applied even when cluster mode is disabled.
+node_id = ""                                    # Unique node ID (default: hostname). Names this node in the cluster
+                                                # (membership, leader election, gossip).
+                                                # It is NOT the upload lease identity: that is [uploader] instance_id
+                                                # (default: hostname), see the WARNING there.
                                                 # INTERNAL ONLY — never appears on the wire. The SMTP-visible name (the
                                                 # "by" host of Received:, the Message-ID domain of vacation replies, and
                                                 # the protocol greetings) comes from the machine's hostname and is NOT
                                                 # affected by node_id. Give the host an FQDN; setting node_id to one
                                                 # does not help. A non-FQDN mail hostname is warned about at startup.
-                                                # WARNING: the instance ID is the lease key for pending_uploads — a queued
-                                                # message body lives on the local disk of the node that accepted it, so only
-                                                # that instance can upload it. Renaming a node abandons its queued rows: no
-                                                # instance claims them and the cleaner deletes them once they pass
-                                                # uploader.cleanup_grace_period. Before changing this, stop delivery to the
-                                                # node and wait until it owns no pending_uploads rows.
 peers = []                                      # Initial seed nodes for cluster discovery (e.g., ["node-1.example.com:7946", "node-2.example.com:7946"])
-                                                # IMPORTANT: Do NOT include this node's own node_id in the peers list!
-                                                # Only list OTHER nodes in the cluster. Self-references will be filtered out
-                                                # automatically and a warning will be logged.
+                                                # IMPORTANT: list only OTHER nodes, never this node's own address.
+                                                # Only an entry equal to this node's node_id is filtered out (with a
+                                                # warning); this node's own addr is not recognised as itself.
 secret_key = ""                                 # Cluster encryption key: base64-encoded 32-byte key.
                                                 # REQUIRED whenever cluster mode is enabled — the server refuses to
-                                                # start without it (gossip carries auth/rate-limit/kick state that an
-                                                # unencrypted channel would let any reachable host forge).
+                                                # start without it (gossip carries connection counts, kicks and
+                                                # affinity that an unencrypted channel would let any reachable host forge).
                                                 # Generate with: openssl rand -base64 32
 
 # --- GOSSIP EVENT QUEUE SETTINGS ---
-# Configure the maximum size of the event queue for gossip broadcasts. Each protocol
-# (IMAP, POP3, ManageSieve, LMTP) maintains its own queue of connection events to be
-# gossiped to other cluster nodes. When the queue fills up, oldest events are dropped.
+# Configure the maximum size of the event queue for gossip broadcasts. Each IMAP, POP3
+# and ManageSieve proxy server keeps its own queue of connection events to be gossiped
+# to other cluster nodes (the LMTP proxy does not gossip connection events).
 #
 # RECOMMENDED SIZING:
 # - Default (50,000): Suitable for most deployments with <2000 users per proxy
@@ -429,32 +442,34 @@ secret_key = ""                                 # Cluster encryption key: base64
 # - Low-traffic (10,000): For small deployments with <500 users
 #
 # MEMORY IMPACT:
-# - ~200 bytes per event × 50,000 × 4 protocols = ~40 MB per proxy server
+# - ~200 bytes per event × 50,000 × 3 protocols = ~30 MB per proxy node
 # - Safe to increase significantly on modern hardware
 #
 # QUEUE OVERFLOW BEHAVIOR:
-# - When full, drops oldest 10% of events and logs a warning
-# - Periodic state snapshots (every 60s) recover from any lost events
+# - When full, memberlist drops the events already sent most often, and a warning is logged
+# - Every 30 seconds each node exchanges its full connection state with one other member,
+#   which repairs lost events
 # - Temporary inconsistency acceptable; eventual consistency guaranteed
 #
 max_event_queue_size = 50000                    # Max events per protocol queue (default: 50000)
 
 # --- CLUSTER-WIDE AUTH RATE LIMITING ---
-# Synchronize authentication rate limiting across cluster nodes via gossip protocol.
-# When enabled, failed authentication attempts on one node immediately block the IP
-# on all other nodes, providing cluster-wide brute-force protection.
-[cluster.rate_limit_sync]
-enabled = true                                  # Enable cluster-wide rate limiting (default: true if cluster enabled)
-sync_blocks = true                              # Synchronize IP blocks across nodes (default: true)
-sync_failure_counts = true                      # Synchronize progressive delay failure counts (default: true)
+# Not implemented: these keys are accepted but have no effect. Authentication rate
+# limits (auth_rate_limit) are counted on each node separately.
+# [cluster.rate_limit_sync]
+# enabled = true
+# sync_blocks = true
+# sync_failure_counts = true
 
 # --- CLUSTER-WIDE SERVER AFFINITY ---
 # Synchronize user-to-backend affinity (sticky sessions) across cluster nodes via gossip.
-# When enabled, users are consistently routed to the same backend server across all proxy nodes
-# for better cache locality and connection reuse. Affinity automatically updates when backends fail.
-# NOTE: Affinity is ONLY for non-remote_lookup users. RemoteLookup routes are always authoritative.
+# The affinity store exists whenever [cluster] enabled = true; a proxy uses it when its
+# own enable_affinity = true. Users are then routed to the same backend across all proxy
+# nodes for better cache locality. Affinity automatically updates when backends fail.
+# NOTE: affinity is skipped only for users the remote_lookup pins to a "server"; auth-only
+# and "pool" answers use it.
 [cluster.affinity]
-enabled = false                                 # Enable cluster-wide server affinity (default: false)
+# enabled = false                               # Not read: affinity is on whenever [cluster] is enabled
 ttl = "24h"                                     # How long affinity persists (default: "24h")
 cleanup_interval = "1h"                         # How often to clean up expired affinities (default: "1h")
 # cache_path = "/sora/affinity_cache.db"        # SQLite path for persistent affinity (survives restarts)
@@ -510,7 +525,7 @@ cleanup_interval = "1h"                         # How often to clean up expired 
 #
 # SECURITY:
 # - ALWAYS use secret_key in production for encrypted gossip communication
-# - Use firewall rules to restrict bind_port access to cluster nodes only
+# - Use firewall rules to restrict gossip port access to cluster nodes only
 # - Rotate secret_key periodically (requires cluster restart)
 #
 # MONITORING:
@@ -530,12 +545,14 @@ cleanup_interval = "1h"                         # How often to clean up expired 
 # When enabled, successful authentications are cached. On the next login the
 # password is verified locally against the cached hash. If the password has
 # changed, the stale entry is invalidated and the request falls through to
-# the database transparently.
+# the database transparently. A password change or account removal is not pushed
+# to the cache, though: until max_age passes, the OLD password still logs in
+# through a proxy that has it cached.
 
 [auth_cache]
 enabled = true                     # Enable persistent auth cache (default: false)
-path = "/sora/auth_cache.db"       # SQLite database path. Fast storage (SSD) recommended.
-max_age = "24"                     # Max age for cached entries before re-fetching (default: 1 day)
+path = "/sora/auth_cache.db"       # SQLite database path (default: /tmp/sora/auth_cache.db). Fast storage (SSD) recommended.
+max_age = "24h"                    # Max age for cached entries before re-fetching (default: 24h)
 cleanup_interval = "1h"            # How often to purge expired/unused entries (default: 1 hour)
 purge_unused = "168h"              # Purge entries unused for this duration (default: 7 days)
 
@@ -545,7 +562,7 @@ purge_unused = "168h"              # Purge entries unused for this duration (def
 # How proxies honor backends put in maintenance with
 # `sora-admin backends maintenance on --host HOST`. A backend in maintenance
 # gets no new traffic from any proxy, while it keeps running to finish the
-# uploads only it can do; see docs/deployment.md. After refuse_after it also
+# uploads only it can do; see docs/PROXY.md, "Backend maintenance mode". After refuse_after it also
 # refuses new sessions itself (logins, LMTP transactions, Admin API
 # deliveries), whichever way they reach it. Both read the list from the
 # database, so a node without database access cannot honor it.
@@ -562,7 +579,7 @@ refuse_after = "30s"               # How long a backend in maintenance still acc
 # S3 API calls and improving performance for recently accessed messages.
 
 [local_cache]
-path = "/sora/cache"      # Filesystem path for cache storage. Must be writable. Fast storage (SSD) recommended.
+path = "/sora/cache"      # Filesystem path for cache storage (default: /tmp/sora/cache). Must be writable. Fast storage (SSD) recommended.
 capacity = "1gb"              # Maximum total cache size (e.g., "100mb", "1gb"). LRU eviction when exceeded.
 max_object_size = "5mb"       # Maximum size for individual cached objects. Prevents large messages from dominating cache.
 metrics_interval = "5m"       # How often cache hit/miss ratios are stored in the database.
@@ -577,7 +594,7 @@ warmup_message_count = 50     # Number of recent messages to preload per mailbox
 warmup_mailboxes = ["INBOX"]  # Mailboxes to warm up. Most clients check INBOX first. e.g., ["INBOX", "Sent"].
 warmup_async = true           # true: warmup happens in background (fast login). false: blocks login.
 warmup_timeout = "5m"         # Maximum time allowed for a cache warmup operation.
-warmup_interval = "24h"       # Minimum time between warmups for the same user. Prevents warmup on every connection.
+warmup_interval = "24h"       # Minimum time between warmups for the same user. Currently not applied: the interval is always 24h.
 
 
 # S3 UPLOADER CONFIGURATION
@@ -586,7 +603,8 @@ warmup_interval = "24h"       # Minimum time between warmups for the same user. 
 # to S3 storage after messages are initially stored locally.
 
 [uploader]
-path = "/sora/uploads"    # Filesystem path for staging uploads (temporary storage before S3).
+path = "/sora/uploads"    # Filesystem path for staging uploads (default: /tmp/sora/uploads). A staged body is the
+                          # only copy until it is uploaded, so use storage that survives a reboot.
 # instance_id = ""            # Upload lease identity written to pending_uploads.instance_id and
                               # instance_heartbeats.instance_id. Default: this host's hostname —
                               # the same value earlier releases stamped, so upgrades are
@@ -597,12 +615,13 @@ path = "/sora/uploads"    # Filesystem path for staging uploads (temporary stora
                               # change. WARNING: changing the resolved value strands queued
                               # uploads — stop delivery and drain pending_uploads for the old id
                               # before restarting under a new one.
-batch_size = 20               # Number of messages batched together per upload operation.
-concurrency = 10              # Number of concurrent upload workers. An upload holds no database connection
+batch_size = 20               # Pending uploads leased per database query (default: 10). Each body is still
+                              # uploaded on its own.
+concurrency = 10              # Number of concurrent upload workers (default: 20). An upload holds no database connection
                               # across its S3 transfer (it passes a one-statement lock gate before writing),
                               # so this is bounded by what S3 accepts, not by the pooler's pool. See
-                              # docs/deployment.md, "Connection Poolers".
-max_attempts = 5              # Attempts after which an upload is parked ("failed", needs sora-admin uploader resolve).
+                              # docs/DATABASE.md, "PgBouncer and other connection poolers".
+max_attempts = 5              # Attempts after which an upload is parked ("failed", needs sora-admin uploader resolve; default: 20).
                               # Only evidence about the content counts: an empty or size-mismatched staging file,
                               # or a file missing while S3 reports the object absent. Provider errors (any HTTP
                               # status, including 4xx) and database errors never count — the body is intact on
@@ -611,7 +630,8 @@ retry_interval = "30s"        # Delay before a failed upload is leased again. Wh
                               # (provider or database outage) the worker backs off exponentially from this value,
                               # doubling per failed cycle up to 10 minutes, and resumes on the first success.
 cleanup_grace_period = "1h"   # Minimum age of a local upload file before cleanup considers it.
-max_staging_size = "100gb"    # Maximum size of the global upload staging queue (e.g. "100gb"). If set and exceeded, new appends are rejected.
+max_staging_size = "100gb"    # Limit on this node's own not-yet-uploaded bytes (default: no limit). Over it, IMAP APPEND,
+                              # LMTP deliveries (452 4.3.1) and Admin API deliveries are refused.
 
 # CLEANUP PROCESS CONFIGURATION
 # =============================================================================
@@ -657,9 +677,9 @@ type = "smtp"                                      # Relay type: "smtp" or "http
 
 # SMTP Relay Configuration (when type="smtp")
 smtp_host = "smtp.example.com:587"                # SMTP relay host and port
-smtp_tls = true                                   # Use TLS (recommended: true)
-smtp_tls_verify = true                            # Verify TLS certificates (recommended: true)
-smtp_use_starttls = true                          # Use STARTTLS (port 587) instead of direct TLS (port 465)
+smtp_tls = true                                   # Use TLS (default: false, which sends to the relay in plaintext)
+smtp_tls_verify = true                            # Verify the relay's certificate (default: false, which accepts any certificate)
+smtp_use_starttls = true                          # With smtp_tls = true: STARTTLS (port 587) instead of direct TLS (port 465)
 # smtp_helo_host = "mail.example.com"            # Hostname sent in EHLO/HELO (default: system hostname). Set to your FQDN for deliverability.
 # smtp_tls_cert_file = "/path/to/client.crt"     # Client certificate for mTLS (optional)
 # smtp_tls_key_file = "/path/to/client.key"      # Client key for mTLS (optional)
@@ -668,11 +688,10 @@ smtp_use_starttls = true                          # Use STARTTLS (port 587) inst
 # http_url = "https://api.example.com/v1/mail/deliver"  # HTTP API endpoint
 # auth_token = "your-bearer-token"                      # Bearer token for Authorization header
 
-# Common relay providers:
-#   Gmail: smtp.gmail.com:587 (requires app-specific password)
-#   SendGrid: smtp.sendgrid.net:587 (API key as password)
-#   Mailgun: smtp.mailgun.org:587 (API credentials)
-#   Amazon SES: email-smtp.us-east-1.amazonaws.com:587 (SMTP credentials)
+# The SMTP relay client does not authenticate (no SMTP AUTH, no username or password).
+# Use a relay that accepts this host by its IP address, or by a client certificate
+# (smtp_tls_cert_file / smtp_tls_key_file). Providers that require a username and
+# password cannot be used directly.
 
 # RELAY QUEUE CONFIGURATION
 # =============================================================================
@@ -716,7 +735,7 @@ retry_backoff = ["1m", "5m", "15m", "1h", "6h", "24h"]           # Backoff durat
                                                                   # With these 6 values and 10 max_attempts:
                                                                   # Attempts 1-6 use the configured backoff values
                                                                   # Attempts 7-10 all use 24h (last value is repeated)
-                                                                  # Total retry time: ~1m+5m+15m+1h+6h+24h+24h+24h+24h ≈ 99 hours (4 days)
+                                                                  # Total retry time: 1m+5m+15m+1h+6h+24h+24h+24h+24h = 103h21m (about 4.3 days)
 
 # Circuit Breaker Configuration
 circuit_breaker_threshold = 5                                     # Consecutive failures before opening circuit (default: 5)
@@ -730,7 +749,7 @@ circuit_breaker_max_requests = 3                                  # Max requests
 failed_retention = "168h"                                         # How long to retain failed messages before deletion (default: 168h = 7 days)
                                                                   # Messages older than this are automatically deleted
                                                                   # Accepted formats: "24h", "7d", "168h"
-                                                                  # Special value: "0" = disable cleanup (keep failed messages forever)
+                                                                  # "0" means the default (168h); failed messages cannot be kept forever
 cleanup_interval = "1h"                                           # How often to run cleanup of old failed messages (default: 1h)
                                                                   # More frequent cleanup = less disk space used
                                                                   # Less frequent cleanup = lower I/O overhead
@@ -746,8 +765,8 @@ cleanup_interval = "1h"                                           # How often to
 
 [metadata]
 max_entry_size = 65536         # Maximum size per metadata entry (64KB). Prevents huge single values.
-max_entries_per_mailbox = 1000 # Maximum number of metadata entries per mailbox (mailbox-level).
-max_entries_per_server = 1000  # Maximum number of account-level metadata entries (server-level).
+max_entries_per_mailbox = 1000 # Maximum number of metadata entries per mailbox (mailbox-level; default: 100).
+max_entries_per_server = 1000  # Maximum number of account-level metadata entries (server-level; default: 50).
 max_total_size = 1048576       # Maximum total metadata size per account (1MB). Overall quota protection.
 
 
@@ -760,7 +779,8 @@ max_total_size = 1048576       # Maximum total metadata size per account (1MB). 
 # Before enabling on a server with existing users: the prefix is matched
 # case-insensitively, so folders users already made under it ("Shared",
 # "shared/Old", ...) fall inside the namespace without being shared. The root
-# folder can no longer be selected, and none of them can be renamed out of it.
+# folder can no longer be selected, and each of them can be renamed only to a
+# name outside the namespace.
 # Find them first (for the default prefix):
 #   SELECT count(*), count(DISTINCT account_id) FROM mailboxes
 #    WHERE deleted_at IS NULL AND NOT COALESCE(is_shared, FALSE)
@@ -771,7 +791,10 @@ enabled = false                  # Enable shared mailbox functionality (default:
 namespace_prefix = "Shared/"     # IMAP namespace prefix for shared mailboxes (e.g., "Shared/" or "#shared/")
 allow_user_create = false        # Allow users to create shared mailboxes over IMAP (false = admin-only: sora-admin mailbox create)
 allow_anyone_identifier = false  # Allow granting rights to "anyone" (every user in the owner's domain); existing grants stay until revoked
-default_rights = "lrswipkxtea"   # Default ACL rights for shared mailbox creators (full rights by default)
+default_rights = "lrswipkxtea"   # Rights written to the creator's ACL entry on a new shared mailbox without a shared
+                                # parent (a child copies its parent's entries instead). Default: all.
+                                # The creator owns the mailbox and always has every right, so this does not
+                                # limit the creator; it only changes what GETACL lists for them.
                                 # Rights: l=lookup, r=read, s=seen, w=write, i=insert, p=post, k=create, x=delete, t=delete-msg, e=expunge, a=admin
 
 # =============================================================================
@@ -806,7 +829,7 @@ enabled_extensions = []
 
 # IMPORTANT NOTES:
 # - Shared mailboxes are restricted to users within the same domain for security
-# - Creators automatically receive the default_rights on mailboxes they create
+# - Creators own the shared mailboxes they create and have every right on them
 # - Additional users must be granted access via IMAP ACL commands or admin API
 # - The NAMESPACE command will advertise the shared namespace when enabled
 
@@ -849,22 +872,9 @@ enabled = false
 # Maximum time to wait for the training endpoint to respond
 # timeout = "10s"
 
-# Maximum message size to submit (default: "10mb")
-# Messages larger than this are skipped (not submitted for training)
-# Attachments are already stripped, so this applies to the text content size
-# max_message_size = "10mb"
-
-# Maximum attachment size threshold (default: "0")
-# If set to "0" (default): Always strip attachments and submit for training
-# If set to a size: Skip training if total attachments exceed this size
-# This is a pre-filter - attachments are always stripped before submission
-# max_attachment_size = "0"
-
-# Async mode (default: true)
-# When true, training submissions happen in background (non-blocking)
-# When false, MOVE command waits for training submission to complete
-# RECOMMENDED: Keep true to avoid slowing down IMAP operations
-# async = true
+# max_message_size, max_attachment_size and async are accepted but not read: there is
+# no size limit, attachments are always stripped before submission, and submission
+# always runs in the background without delaying the IMAP command.
 
 # Circuit breaker configuration for training endpoint
 # Protects against cascading failures if the training endpoint becomes unavailable
@@ -887,7 +897,6 @@ enabled = false
 # endpoint = "https://rspamd.example.com/learnspam"
 # auth_token = "secret-token-123"
 # timeout = "15s"
-# async = true
 #
 # [spam_training.circuit_breaker]
 # threshold = 10
@@ -932,8 +941,10 @@ shard_count = 0  # Default: 0 (runtime.NumCPU())
 # any neighbor spoof client IPs and bypass rate limiting (startup logs a warning if you do).
 #
 # - proxy_protocol listeners REQUIRE a non-empty list here (the server refuses to start otherwise).
-# - LMTP delivery admission is independent of this and still accepts RFC1918 by default,
-#   so leaving this empty does NOT break mail delivery.
+# - LMTP backend delivery admission is independent of this and still accepts RFC1918 by
+#   default, so leaving this empty does not break delivery straight to an lmtp server.
+# - An lmtp_proxy accepts connections ONLY from hosts in this list: with it empty, the
+#   proxy refuses every delivery.
 #
 # trusted_networks = ["10.20.0.5/32", "10.20.0.6/32"]   # e.g. only your two proxy hosts
 trusted_networks = []
@@ -946,7 +957,7 @@ trusted_networks = []
 # defined as a [[server]] section with a unique name and configuration.
 #
 # Server Types:
-# - imap: IMAP4rev1 server for email access
+# - imap: IMAP4rev1 and IMAP4rev2 server for email access
 # - lmtp: Local Mail Transfer Protocol for mail delivery
 # - pop3: POP3 server for email download
 # - managesieve: ManageSieve server for SIEVE script management
@@ -964,7 +975,7 @@ trusted_networks = []
 # IMAP SERVER EXAMPLE
 # =============================================================================
 # Internet Message Access Protocol - primary protocol for email access
-# Supports IMAP4rev1 with IDLE extension for real-time notifications.
+# Supports IMAP4rev1 and IMAP4rev2, with the IDLE extension for real-time notifications.
 
 [[server]]
 type = "imap"
@@ -975,14 +986,16 @@ debug = false                 # Enable debug logging for this IMAP server
 # --- CONNECTION LIMITING AND MEMORY MANAGEMENT ---
 max_connections = 1000              # Maximum concurrent IMAP connections to this server instance.
 max_connections_per_ip = 200        # Max connections per IP. High enough for corporate gateways (~40 users), catches DoS. Set to 0 if behind load balancer.
-max_connections_per_user = 15       # Max authenticated connections per user across all IPs. 0 = unlimited. (Requires connection tracking)
+max_connections_per_user = 15       # Max authenticated connections per user across all IPs, counted on this server block
+                                    # only (not across nodes or other blocks). 0 = unlimited. Enforced by IMAP; POP3 and
+                                    # ManageSieve backends only log when a per-user limit is exceeded.
 max_connections_per_user_per_ip = 5 # Max connections per user from same IP. KEY PROTECTION against buggy clients & brute force. 0 = unlimited.
 listen_backlog = 4096               # TCP listen backlog size (0 = default 1024). Prevents connection delays under high load.
                               # FreeBSD/Linux default is often too small (~128-512). Recommended: 4096-8192 for high-load servers.
                               # Small backlog causes SYN queue to fill, leading to ~60s connection delays.
 
 # --- IMAP-SPECIFIC CONFIGURATION ---
-append_limit = "25mb"         # Maximum message size for IMAP APPEND. Empty = no limit.
+append_limit = "25mb"         # Maximum message size for IMAP APPEND (default: 25mb; empty or "0" also means 25mb, there is no unlimited setting).
 
 # --- MASTER USER AUTHENTICATION ---
 master_username = ""          # Master username for administrative IMAP access (e.g., for proxies).
@@ -1016,7 +1029,7 @@ tls = false                               # Enable TLS for IMAP (IMAPS). Typical
 tls_use_starttls = false                  # With tls = true: plaintext port offering STARTTLS (usually :143) instead of implicit TLS (:993).
 # tls_cert_file = "/path/to/your/imap.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
 # tls_key_file = "/path/to/your/imap.key"   # [OPTIONAL] Only needed if global [tls] is disabled
-tls_verify = false                        # Verify client certificates (mutual TLS). Usually false.
+# tls_verify = false                      # No effect on backend servers (imap, pop3, lmtp, managesieve): they never request client certificates.
 # tls_default_domain = "imap.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
                                           # Useful when different protocols should have different default certificates
                                           # (e.g., imap.example.com for IMAP, pop3.example.com for POP3).
@@ -1026,10 +1039,8 @@ tls_verify = false                        # Verify client certificates (mutual T
 # Enable if this server is behind a load balancer or reverse proxy
 proxy_protocol = false            # Enable PROXY protocol support (HAProxy, nginx, etc.)
 proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
-# proxy_protocol_trusted_proxies = []  # CIDR blocks allowed to send PROXY headers (defaults to trusted_networks if empty)
-                                  # Use this to specify which IPs can send PROXY protocol headers
-                                  # If not set, falls back to [servers] trusted_networks setting
-                                  # Example: ["10.0.0.0/8", "192.168.1.0/24"]
+                                  # PROXY headers are accepted only from hosts in [servers] trusted_networks;
+                                  # with proxy_protocol = true and that list empty, the server refuses to start.
 
 # --- GLOBAL CAPABILITY CONFIGURATION ---
 # Disable specific IMAP capabilities for ALL clients connecting to this server.
@@ -1043,11 +1054,14 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # - CONDSTORE: Conditional STORE (RFC 7162)
 # - IDLE: Push notifications (RFC 2177)
 # - MOVE: Efficient message moving (RFC 6851)
-# - COMPRESS: DEFLATE compression (RFC 4978)
 # - SORT/ESORT: Server-side sorting
 #
 # disabled_caps = ["ESEARCH", "CONDSTORE", "IDLE"]  # Example: disable these capabilities globally
 #
+# NOTE: IMAP4rev2 includes IDLE, ESEARCH, MOVE, UIDPLUS, NAMESPACE, SEARCHRES, ENABLE, UNSELECT,
+# LIST-EXTENDED, LIST-STATUS, STATUS=SIZE, CHILDREN, SASL-IR and LITERAL-. While IMAP4rev2 is
+# advertised these stay advertised and usable even when listed here; add "IMAP4rev2" to the
+# list to remove them. The same applies to disable_caps in client_filters below.
 # NOTE: Do not disable IMAP4rev1, as this will break basic IMAP functionality.
 # STARTTLS, LOGINDISABLED and AUTH=PLAIN follow tls, tls_use_starttls and
 # insecure_auth; disabled_caps does not change them.
@@ -1174,9 +1188,11 @@ limits.max_redirect_hops = 2             # Max times one message may be redirect
                                          # backstop, counted via the X-Sora-Loop header (default: 2; 1 = allow a
                                          # single redirect then stop; 0 = unlimited). Delivered-To loop detection
                                          # still applies regardless of this value.
-limits.max_auth_errors = 2               # Maximum authentication errors before disconnection (default: 2).
+limits.max_auth_errors = 2               # Protocol errors before login after which the connection is closed (default: 2).
                                          # Applies to proxy servers only (imap_proxy, pop3_proxy, managesieve_proxy).
-                                         # Protects against malformed commands and protocol abuse during authentication.
+                                         # Counts protocol errors before authentication (malformed commands, a login
+                                         # refused for lack of TLS); wrong passwords do NOT count (auth_rate_limit
+                                         # handles those).
                                          # Recommended: 2-5 for most deployments.
                                          # Note: Backend servers use protocol libraries with built-in validation.
 
@@ -1247,7 +1263,8 @@ auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expire
 # Memory safety limits (prevents unbounded growth during burst attacks)
 # These limits protect against memory exhaustion when under sustained attack. When a map exceeds
 # its size limit, the oldest entries (by FirstFailure time) are evicted using LRU policy.
-# Set to 0 to disable size-based limits (time-based cleanup only).
+# There is no unlimited setting: with auth_rate_limit.enabled = true, 0 (like any omitted key
+# in this block) means the default.
 #
 # RECOMMENDED VALUES:
 # - Default (100k/50k/50k): Suitable for most deployments, ~40MB per protocol max
@@ -1259,15 +1276,16 @@ auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expire
 # - IP entries: ~150 bytes each × max_ip_entries
 # - Username entries: ~150 bytes each × max_username_entries
 #
-auth_rate_limit.max_ip_username_entries = 100000  # Max IP+username tracking entries (0 = unlimited, default: 100000)
-auth_rate_limit.max_ip_entries = 50000            # Max IP failure tracking entries (0 = unlimited, default: 50000)
-auth_rate_limit.max_username_entries = 50000      # Max username tracking entries (0 = unlimited, default: 50000)
+auth_rate_limit.max_ip_username_entries = 100000  # Max IP+username tracking entries (default: 100000)
+auth_rate_limit.max_ip_entries = 50000            # Max IP failure tracking entries (default: 50000)
+auth_rate_limit.max_username_entries = 50000      # Max username tracking entries (default: 50000)
 
 # --- LOOKUP CACHE ---
 # Cache authentication results to reduce database queries and improve performance.
-# ENABLED BY DEFAULT with sensible settings. Only configure to override defaults or disable.
+# ENABLED BY DEFAULT when this table is absent. If you add the table, set enabled = true:
+# a [server.lookup_cache] table without it turns the cache OFF.
 # [server.lookup_cache]
-# enabled = true                          # Enable authentication and routing lookup caching for this server (default: true)
+# enabled = true                          # Enable authentication and routing lookup caching for this server (false when the table is present without it)
 # positive_ttl = "5m"                     # How long to cache successful authentications (default: 5m)
 #                                         # Longer TTL = better performance, but password changes take time to propagate
 # negative_ttl = "1m"                     # How long to cache failed auth attempts (default: 1m)
@@ -1275,9 +1293,10 @@ auth_rate_limit.max_username_entries = 50000      # Max username tracking entrie
 #                                         # Note: Brute force protection itself is handled by protocol-level rate limiting
 # max_size = 50000                        # Maximum cached entries (default: 10000, LRU eviction)
 # cleanup_interval = "5m"                 # How often to remove expired entries (default: 5m)
-# positive_revalidation_window = "30s"    # Revalidation window for successful auth with different password (default: 30s)
-#                                         # Protects against unauthorized access when password changes
-#                                         # If a different password is tried within this window on a cached success, authentication is rejected
+# positive_revalidation_window = "30s"    # Backends only: a cached success older than this is checked against the database
+#                                         # again, even with the same password (default: 30s)
+#                                         # A different password is never answered from the cache: it is always checked
+#                                         # against the database (or remote_lookup), never rejected by the cache
 
 
 # LMTP SERVER EXAMPLE
@@ -1303,20 +1322,19 @@ name = "main-lmtp"
 addr = ":24"
 debug = true                  # Enable debug logging for LMTP server
 max_connections = 500
-max_connections_per_ip = 5
+# max_connections_per_ip = 5  # No effect on LMTP: there is no per-IP limit.
 tls = false
 tls_use_starttls = false      # Use STARTTLS for opportunistic encryption.
-# tls_cert_file = "/path/to/your/lmtp.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
-# tls_key_file = "/path/to/your/lmtp.key"   # [OPTIONAL] Only needed if global [tls] is disabled
-tls_verify = false
+# tls_cert_file = "/path/to/your/lmtp.crt"  # [OPTIONAL] When set, used instead of the global [tls] certificate
+# tls_key_file = "/path/to/your/lmtp.key"   # [OPTIONAL] When set, used instead of the global [tls] certificate
+# tls_verify = false                        # No effect here (see the IMAP example above).
 # tls_default_domain = "lmtp.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 proxy_protocol = false        # Enable PROXY protocol support for LMTP
 proxy_protocol_timeout = "5s"
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- MESSAGE SIZE LIMITING ---
 # Maximum size for incoming LMTP messages to prevent memory exhaustion attacks
-max_message_size = "50mb"     # Maximum message size (default: 50MB, 0 = unlimited)
+max_message_size = "50mb"     # Maximum message size (default: 50MB; "0" also means 50MB, there is no unlimited setting)
 
 # --- PER-COMMAND EXECUTION TIMEOUTS (optional) ---
 # Hard caps on server-side work, mirroring imap_command_timeouts. On expiry
@@ -1348,11 +1366,10 @@ tls = false
 tls_use_starttls = false      # With tls = true: plaintext port offering STLS (RFC 2595, usually :110) instead of implicit TLS (:995).
 # tls_cert_file = "/path/to/your/pop3.crt"  # [OPTIONAL] Only needed if global [tls] is disabled
 # tls_key_file = "/path/to/your/pop3.key"   # [OPTIONAL] Only needed if global [tls] is disabled
-tls_verify = false
+# tls_verify = false                        # No effect here (see the IMAP example above).
 # tls_default_domain = "pop3.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 proxy_protocol = false        # Enable PROXY protocol support for POP3
 proxy_protocol_timeout = "5s"
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
@@ -1370,7 +1387,7 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # command exceeding its cap gets an -ERR and its in-flight work is cancelled,
 # instead of wedging the session. RETR/TOP cover only loading the body — the
 # already-loaded message streams to the client off the clock. Defaults are
-# safety nets; "0" disables a specific cap. USER/PASS/APOP/AUTH are not
+# safety nets; "0" disables a specific cap. USER/PASS/AUTH are not
 # covered (they are paced by auth_rate_limit delays).
 # timeouts.pop3_command_timeouts.stat = "10s"  # STAT (default: 10s)
 # timeouts.pop3_command_timeouts.list = "10s"  # LIST (default: 10s)
@@ -1400,12 +1417,11 @@ master_sasl_password = ""
 tls = false
 tls_use_starttls = false
 # tls_default_domain = "managesieve.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
-tls_cert_file = "/path/to/your/managesieve.crt"
+tls_cert_file = "/path/to/your/managesieve.crt"   # When set, used instead of the global [tls] certificate
 tls_key_file = "/path/to/your/managesieve.key"
-tls_verify = true
+# tls_verify = false                              # No effect here (see the IMAP example above).
 proxy_protocol = false        # Enable PROXY protocol support for ManageSieve
 proxy_protocol_timeout = "5s"
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
@@ -1536,13 +1552,14 @@ tls = false
 tls_use_starttls = false              # With tls = true: plaintext port offering STARTTLS (usually :143) instead of implicit TLS (:993)
 tls_cert_file = ""
 tls_key_file = ""
-tls_verify = true
+tls_verify = false                    # true (with tls_cert_file) demands a client certificate from every client; mail clients send none
 # tls_default_domain = "imap.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 
 # --- BACKEND TLS CONFIGURATION ---
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
-remote_tls_verify = true              # Verify backend server TLS certificates
+remote_tls_verify = true              # Verify backend server TLS certificates (default on a [[server]]: false;
+                                      # in [[pool]] and [server.remote_lookup]: true)
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_id_command = false         # Send IMAP ID command to backends
 remote_health_checks = true           # Enable backend health tracking (default: true)
@@ -1556,41 +1573,17 @@ remote_dns_refresh = "5m"             # How often to re-resolve the hostnames in
                                       # keeps its last known addresses.
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
-# Enable PROXY protocol v2 support for incoming connections from HAProxy, nginx, or other load balancers.
-# This preserves the real client IP when a load balancer is placed in front of the Sora proxy.
+# Currently not applied on the mail proxies (imap_proxy, pop3_proxy, managesieve_proxy,
+# lmtp_proxy): proxy_protocol is accepted, but the listener never reads a PROXY header,
+# so a load balancer in front of a Sora proxy hides the client IP from it and from the
+# backends. Setting it to true still makes startup require [servers] trusted_networks.
 #
-# FLOW WITH HAPROXY:
-#   Client (203.0.113.42) → HAProxy → Sora Proxy (reads PROXY header) → Backend (sees 203.0.113.42)
-#
-# Without this setting:
-#   Client (203.0.113.42) → HAProxy (10.0.0.5) → Sora Proxy → Backend (sees 10.0.0.5) ❌
-#
-# With proxy_protocol enabled:
-#   Client (203.0.113.42) → HAProxy → Sora Proxy → Backend (sees 203.0.113.42) ✅
-#
-# REQUIREMENTS:
-# - HAProxy/nginx must send PROXY protocol v2 headers (send-proxy-v2 in HAProxy)
-# - Connections must originate from trusted_networks (security requirement)
-# - Both proxy_protocol (incoming) and remote_use_proxy_protocol (outgoing) should be enabled
-#
-# HAPROXY CONFIGURATION EXAMPLE:
-#   backend sora_proxy
-#       mode tcp
-#       server proxy1 10.0.0.10:1143 send-proxy-v2
-#
-# SECURITY:
-# - PROXY headers are ONLY accepted from IPs in trusted_networks
-# - When enabled, PROXY protocol is REQUIRED (not optional)
-# - Invalid PROXY headers immediately terminate the connection
-# - 5-second timeout prevents DoS attacks
-#
-# NOTE: This is different from remote_use_proxy_protocol:
+# NOTE: This is different from remote_use_proxy_protocol (above), which works:
 # - proxy_protocol = INCOMING connections (from HAProxy → Sora Proxy)
 # - remote_use_proxy_protocol = OUTGOING connections (from Sora Proxy → Backend)
 #
-proxy_protocol = false                # Enable PROXY protocol support for incoming connections (HAProxy, nginx, etc.)
-proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol headers
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
+# proxy_protocol = false              # No effect on this server type (see above)
+# proxy_protocol_timeout = "5s"       # No effect on this server type (see above)
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
@@ -1598,7 +1591,7 @@ auth_idle_timeout = "2m"        # Idle timeout between commands during authentic
                               # Resets after each command received. If client is silent for 2 minutes, disconnected.
                               # Cleared after successful authentication.
                               # Note: absolute_session_timeout (below) separately limits total session duration.
-enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
+enable_affinity = true        # Enable user-to-backend affinity (default: false; needs [cluster] enabled)
 
 # --- IMAP ID COMMAND CUSTOMIZATION ---
 # Override the fields returned by the IMAP ID command (RFC 2971) in proxy mode.
@@ -1609,8 +1602,6 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 # id_support_url = "https://dovecot.org"
 
 # --- TIMEOUT CONFIGURATION ---
-# IMPORTANT: IMAP proxy cannot detect IDLE commands (RFC 2177), so command_timeout should be disabled (0).
-#
 # IMAP proxy has THREE timeout mechanisms:
 # 1. auth_idle_timeout (above): Idle timeout during pre-auth phase only
 #    - Resets after each command received
@@ -1618,18 +1609,16 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 #    - Cleared after successful authentication
 #
 # 2. command_timeout (below): Idle timeout that applies during entire connection
-#    - MUST be disabled (0) for IMAP proxy because:
-#      - IDLE commands can legitimately last 29+ minutes (RFC 2177)
-#      - Proxy is protocol-agnostic and cannot detect IDLE
-#      - Backend IMAP server handles IDLE correctly with its own timeouts
-#    - Pre-auth protection is already provided by session_timeout above
+#    - Default when unset: 30m (POP3 proxy 10m, ManageSieve proxy 3m; the LMTP proxy does not read it)
+#    - Traffic in either direction resets it; a Sora backend in IDLE sends a
+#      keepalive every 2 minutes, so IDLE sessions are not cut. "0" disables it.
 #
 # 3. absolute_session_timeout (below): Maximum total session duration
 #    - Enforced throughout entire connection (pre-auth AND post-auth)
 #    - Prevents indefinitely long sessions
-#    - 30 minutes from connection to disconnection, regardless of activity
+#    - Default: 24h from connection to disconnection, regardless of activity
 #
-timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disable (REQUIRED for IMAP proxy, default: 0).
+timeouts.command_timeout = "0"              # Idle timeout. "0" disables it (default when unset: 30m).
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration from connect to disconnect (default: 24h).
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
@@ -1639,7 +1628,7 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # The remote_lookup service is called via HTTP GET with email interpolation.
 # The URL can contain $email placeholder which is replaced with the URL-encoded email address.
 #
-# Example URLs:
+# Example URLs (http:// is accepted only for localhost/loopback; any other host needs https://):
 #   "http://localhost:8080/lookup?email=$email" → GET /lookup?email=user@domain.com
 #   "http://localhost:8080/user/$email/info"    → GET /user/user@domain.com/info
 #
@@ -1648,26 +1637,28 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # REQUIRED FIELDS:
 # - address: Email address for backend impersonation (string)
 # - password_hash: Password hash to verify authentication (string)
+#
+# OPTIONAL FIELDS:
 # - server: Backend server address - can be IP/hostname:port OR just IP/hostname (string)
 #   * If port is included: "192.168.1.10:143" or "backend.example.com:993"
 #   * If port is omitted: "192.168.1.10" or "backend.example.com"
-#     → Port from remote_port config will be appended (default: 143)
-# - account_id: Account ID for tracking/metrics (integer, must be > 0)
+#     → remote_port from [server.remote_lookup] is appended (default: 143, whatever the protocol)
+#   * Omitted, null or "": auth-only mode (see below)
+# - pool: a named [[pool]] to pick a backend from (read only when server is empty)
+# An "account_id" field is not read: Sora derives an ID from the address.
 #
 # Example JSON Response (with port):
 # {
 #   "address": "user@domain.com",
 #   "password_hash": "$2a$12$abcdef...",
-#   "server": "backend1.example.com:143",
-#   "account_id": 12345
+#   "server": "backend1.example.com:143"
 # }
 #
 # Example JSON Response (without port - uses remote_port):
 # {
 #   "address": "user@domain.com",
 #   "password_hash": "$2a$12$abcdef...",
-#   "server": "192.168.1.10",
-#   "account_id": 12345
+#   "server": "192.168.1.10"
 # }
 #
 # BEHAVIOR:
@@ -1676,9 +1667,10 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # - Password formats: bcrypt ($2a$...), SSHA512 ({SSHA512}...), SHA512 ({SHA512}...), BLF-CRYPT ($2b$...)
 # - If HTTP endpoint returns 404/3xx → respects lookup_local_users setting (user partitioning)
 # - If HTTP endpoint returns 401/403 → authentication rejected (no fallback)
-# - If HTTP endpoint returns other 4xx/5xx → service unavailable, ALWAYS reject (no fallback)
+# - If HTTP endpoint returns any other 4xx → authentication rejected (no fallback)
+# - If HTTP endpoint returns 5xx → service unavailable, ALWAYS reject (no fallback)
 # - If HTTP endpoint returns 200 with data but auth fails → connection REJECTED (no fallback)
-# - Server addresses normalized: missing ports use remote_port default (e.g., 143 for IMAP)
+# - Server addresses normalized: missing ports get [server.remote_lookup] remote_port (default 143 for every protocol)
 # - Timeout for HTTP requests is configurable (default: 5s)
 #
 # ALIAS RESOLUTION:
@@ -1700,8 +1692,7 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # {
 #   "address": "user@domain.com",
 #   "password_hash": "$2a$12$abcdef...",
-#   "server": null,           # or "" or omit entirely
-#   "account_id": 12345
+#   "server": null            # or "" or omit entirely
 # }
 #
 # BACKEND SELECTION IN AUTH-ONLY MODE:
@@ -1723,11 +1714,10 @@ url = "http://localhost:8080/lookup?email=$email"  # HTTP endpoint URL with $ema
                                             #   "http://localhost:8080/lookup?email=$email" → query parameter
                                             #   "http://localhost:8080/user/$email/lookup" → path parameter
                                             #   "http://localhost:8080/api/v1/auth?user=$email&format=json" → custom format
-timeout = "10s"                             # HTTP response timeout (default: 10s)
-                                            # NOTE: The actual context timeout is automatically calculated as:
-                                            #   dial_timeout + tls_handshake_timeout + timeout + 10% buffer
-                                            # With defaults (10s + 10s + 10s + 10%) = ~33 seconds for first request
-                                            # Subsequent requests reuse connections and complete within this timeout
+timeout = "10s"                             # Limit for the whole lookup request (default: 5s)
+                                            # NOTE: it covers connecting, the TLS handshake and the response together,
+                                            # also on a new connection; dial_timeout and tls_handshake_timeout below
+                                            # cannot extend it
 # auth_token = "your-secret-token"          # Bearer token for HTTP authentication (optional)
                                             # If set, sends "Authorization: Bearer <token>" header with requests
                                             # Use this to secure your remote_lookup endpoint
@@ -1779,7 +1769,7 @@ lookup_local_users = true             # Check local DB when remote returns 404/3
                                       #
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
-remote_tls_verify = true              # Verify backend TLS certificates
+remote_tls_verify = true              # Verify backend TLS certificates (default here: true)
 # remote_port = 143                   # Default port to append if server address doesn't include port (default: 143)
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
 remote_use_id_command = false         # Send IMAP ID command to backends (IMAP only)
@@ -1840,20 +1830,19 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # --- HTTP TRANSPORT CONFIGURATION ---
   # Connection pooling and timeout settings for the HTTP client used to query the remote_lookup endpoint.
   # Proper connection pooling enables parallel authentication requests while reusing connections.
-  # Separate timeouts for different connection phases prevent premature timeouts during initial setup.
+  # Every lookup, including its dial and TLS handshake, must finish within [server.remote_lookup] timeout.
   #
   # TRANSPORT BEHAVIOR:
   # - Multiple concurrent authentication requests reuse pooled HTTP connections
   # - Idle connections are kept alive to avoid TCP handshake overhead
   # - Unlimited concurrent connections per host (max_conns_per_host=0) for high throughput
-  # - First connection: dial + TLS handshake + HTTP request (can take 60s+ on slow networks)
-  # - Subsequent requests: Reuse existing connection, only HTTP timeout applies (typically <10s)
+  # - First connection: dial + TLS handshake + HTTP request, all within timeout
+  # - Subsequent requests: Reuse existing connection, skipping dial and TLS handshake
   #
   # PERFORMANCE IMPACT:
   # - Higher max_idle_conns = more connections kept alive = faster subsequent requests
   # - max_conns_per_host=0 (unlimited) = no bottleneck for concurrent auth requests
   # - Longer idle_conn_timeout = fewer reconnects = better performance under load
-  # - Separate dial/TLS timeouts prevent timeouts during initial connection establishment
   #
   # CONNECTION REUSE VERIFICATION:
   # Testing shows connection reuse provides 16x performance improvement:
@@ -1864,7 +1853,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # - 100 concurrent user logins → reuses up to 100 idle connections from pool
   # - Low traffic → connections automatically closed after idle_conn_timeout
   # - High traffic → connections stay warm and reused immediately
-  # - Slow network → generous dial/TLS timeouts prevent spurious failures
+  # - Slow network → raise [server.remote_lookup] timeout
   #
   # [server.remote_lookup.transport]
   # max_idle_conns = 100            # Maximum idle connections across all hosts (default: 100)
@@ -1882,17 +1871,14 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   #
   # --- TIMEOUT SETTINGS FOR DIFFERENT CONNECTION PHASES ---
   # These settings control timeouts for different phases of HTTP connection establishment.
-  # They allow generous time for initial connection while keeping response timeouts tight.
+  # Each is also bounded by [server.remote_lookup] timeout (see OVERALL LIMIT below).
   #
   # dial_timeout = "10s"            # TCP connection + DNS resolution timeout (default: "10s")
                                     # Time to establish TCP connection and resolve DNS
-                                    # Typical: DNS 100-500ms, TCP 10-100ms. Default allows 100x margin.
-                                    # Increase to 20-30s for very high-latency or unreliable networks
+                                    # Typical: DNS 100-500ms, TCP 10-100ms.
   # tls_handshake_timeout = "10s"   # TLS handshake timeout (default: "10s")
                                     # TLS handshakes typically take 50-500ms
-                                    # Default allows 20-50x margin for slow servers and high latency
                                     # This is ONLY for initial connection; reused connections skip this
-                                    # Increase to 20-30s if experiencing timeout errors on slow networks
   # keep_alive = "30s"              # TCP keep-alive interval for idle connections (default: "30s")
                                     # Interval for TCP keep-alive probes on idle connections
                                     # Helps detect broken connections and prevent NAT/firewall timeouts
@@ -1902,25 +1888,11 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
                                     # This is just a protocol-level acknowledgment, should be short
                                     # Rarely needs adjustment
   #
-  # AUTOMATIC CONTEXT TIMEOUT CALCULATION:
-  # The context timeout for authentication is automatically calculated as:
-  #   context_timeout = (dial_timeout + tls_handshake_timeout + timeout) * 1.10
-  #
-  # With default values:
-  #   context_timeout = (10s + 10s + 10s) * 1.10 = 33s
-  #
-  # This ensures:
-  # - First request to new host: Has full 33s for dial + TLS + HTTP
-  # - Subsequent requests (connection reused): Complete within HTTP timeout (~10s)
-  # - Context never cancels before HTTP client timeouts complete
-  # - No manual tuning required - automatically adapts to your timeout settings
-  #
-  # If you increase dial_timeout or tls_handshake_timeout, the context timeout
-  # automatically increases proportionally. You never need to worry about the
-  # context canceling requests prematurely.
-  #
-  # Example: For very slow networks, set dial_timeout="20s" and tls_handshake_timeout="20s"
-  # → context_timeout automatically becomes (20s + 20s + 10s) * 1.10 = 55s
+  # OVERALL LIMIT:
+  # The [server.remote_lookup] timeout (default 5s) caps each lookup request as a whole,
+  # including dial and TLS handshake on a new connection. dial_timeout and
+  # tls_handshake_timeout only matter when they are shorter than that; raising them
+  # does not give a lookup more time. For slow networks, raise timeout itself.
 
 # --- MASTER TOKEN / ALIAS RESOLUTION ---
 # The HTTP endpoint can implement master token authentication or alias resolution.
@@ -1933,8 +1905,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
 #   {
 #     "address": "user@domain.com",
 #     "password_hash": "<hash of MASTERTOKEN>",
-#     "server": "backend1:143",
-#     "account_id": 123
+#     "server": "backend1:143"
 #   }
 # - Proxy verifies "anything" against the returned hash
 # - Proxy connects to backend as "user@domain.com" (from "address" field)
@@ -1946,16 +1917,13 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
 #   {
 #     "address": "realuser@domain.com",
 #     "password_hash": "<hash of userpass>",
-#     "server": "backend1:143",
-#     "account_id": 456
+#     "server": "backend1:143"
 #   }
 # - Proxy verifies "userpass" against the returned hash
 # - Proxy connects to backend as "realuser@domain.com" (from "address" field)
 #
 # The "address" field in the HTTP response determines which user the proxy authenticates as on the backend.
 # All logic for token splitting, validation, alias resolution, etc. is handled by your HTTP endpoint.
-#
-# See test_remote_lookup_server.go for a working example implementation.
 
 
 # POP3 PROXY EXAMPLE
@@ -1979,13 +1947,13 @@ tls = false
 tls_use_starttls = false              # With tls = true: plaintext port offering STLS (RFC 2595) instead of implicit TLS
 tls_cert_file = ""
 tls_key_file = ""
-tls_verify = true
+tls_verify = false                    # true (with tls_cert_file) demands a client certificate from every client
 # tls_default_domain = "pop3.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 
 # --- BACKEND TLS CONFIGURATION ---
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
-remote_tls_verify = true              # Verify backend server TLS certificates
+remote_tls_verify = true              # Verify backend server TLS certificates (default on a [[server]]: false)
 # remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots. POP3 proxy only, and only for backends in no [[pool]] (a pool member uses its pool's remote_tls_ca_file).
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
@@ -2001,20 +1969,19 @@ remote_dns_refresh = "5m"             # Backend hostname re-resolution interval;
                                       # addresses resolved at startup. See the IMAP proxy example above.
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
-# Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
-proxy_protocol = false                # Enable PROXY protocol support for incoming connections
-proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol headers
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
+# Currently not applied on this server type; see the IMAP proxy example above.
+# proxy_protocol = false              # No effect on this server type
+# proxy_protocol_timeout = "5s"       # No effect on this server type
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
 auth_idle_timeout = "2m"        # Idle timeout between commands during authentication phase (pre-auth only).
                               # Resets after each command received. Cleared after successful authentication.
                               # Note: absolute_session_timeout (below) separately limits total session duration.
-enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
+enable_affinity = true        # Enable user-to-backend affinity (default: false; needs [cluster] enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+timeouts.command_timeout = "0"              # Maximum idle time; "0" disables it (default when unset: see IMAP proxy above)
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24h)
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
@@ -2044,33 +2011,32 @@ tls = false
 tls_use_starttls = false              # Use STARTTLS on listening port (client connections)
 tls_cert_file = ""
 tls_key_file = ""
-tls_verify = true
+tls_verify = false                    # true (with tls_cert_file) demands a client certificate from every client
 # tls_default_domain = "managesieve.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 
 # --- BACKEND TLS CONFIGURATION ---
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
-remote_tls_verify = true              # Verify backend server TLS certificates
+remote_tls_verify = true              # Verify backend server TLS certificates (default on a [[server]]: false)
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_health_checks = true           # Enable backend health tracking (default: true)
 remote_dns_refresh = "5m"             # Backend hostname re-resolution interval; "0" pins the pool to the
                                       # addresses resolved at startup. See the IMAP proxy example above.
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
-# Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
-proxy_protocol = false                # Enable PROXY protocol support for incoming connections
-proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol headers
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
+# Currently not applied on this server type; see the IMAP proxy example above.
+# proxy_protocol = false              # No effect on this server type
+# proxy_protocol_timeout = "5s"       # No effect on this server type
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
 auth_idle_timeout = "2m"        # Idle timeout between commands during authentication phase (pre-auth only).
                               # Resets after each command received. Cleared after successful authentication.
                               # Note: absolute_session_timeout (below) separately limits total session duration.
-enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
+enable_affinity = true        # Enable user-to-backend affinity (default: false; needs [cluster] enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+timeouts.command_timeout = "0"              # Maximum idle time; "0" disables it (default when unset: see IMAP proxy above)
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24h)
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
@@ -2084,6 +2050,8 @@ debug = false                         # Enable debug logging (logs backend greet
 # LMTP PROXY EXAMPLE
 # =============================================================================
 # Proxy LMTP connections across multiple backend servers for load balancing
+# Accepts connections ONLY from hosts in [servers] trusted_networks: with that list
+# empty, every delivery is refused.
 
 [[server]]
 type = "lmtp_proxy"
@@ -2091,7 +2059,7 @@ name = "lmtp-proxy-1"
 addr = ":124"                 # Proxy listen address. Must be different from backend LMTP port.
 remote_addrs = ["backend1.example.com:24", "backend2.example.com:24"]
 max_connections = 1000
-max_connections_per_ip = 0            # Typically no per-IP limits for LMTP (trusted sources)
+# max_connections_per_ip = 0          # No effect on lmtp_proxy: there is no per-IP limit
 # Note: max_connections_per_user not applicable for LMTP (no user authentication)
 #       LMTP uses local-only connection tracking (no gossip) for monitoring visibility.
 #       Connection limits are automatically disabled for LMTP to prevent delivery rejection.
@@ -2101,13 +2069,13 @@ tls = false
 tls_use_starttls = false              # Use STARTTLS on listening port (client connections)
 tls_cert_file = ""
 tls_key_file = ""
-tls_verify = true
+tls_verify = false                    # true (with tls_cert_file) demands a client certificate from every client
 # tls_default_domain = "lmtp.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 
 # --- BACKEND TLS CONFIGURATION ---
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
-remote_tls_verify = true              # Verify backend server TLS certificates
+remote_tls_verify = true              # Verify backend server TLS certificates (default on a [[server]]: false)
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
 remote_health_checks = true           # Enable backend health tracking (default: true)
@@ -2115,25 +2083,24 @@ remote_dns_refresh = "5m"             # Backend hostname re-resolution interval;
                                       # addresses resolved at startup. See the IMAP proxy example above.
 
 # --- PROXY PROTOCOL INCOMING (FROM HAPROXY/NGINX) ---
-# Enable PROXY protocol v2 for incoming connections. See IMAP proxy example above for full documentation.
-proxy_protocol = false                # Enable PROXY protocol support for incoming connections
-proxy_protocol_timeout = "5s"         # Timeout for reading PROXY protocol headers
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
+# Currently not applied on this server type; see the IMAP proxy example above.
+# proxy_protocol = false              # No effect on this server type
+# proxy_protocol_timeout = "5s"       # No effect on this server type
 
 # --- PROXY BEHAVIOR CONFIGURATION ---
 connect_timeout = "30s"
-auth_idle_timeout = "2m"        # Idle timeout between commands during authentication phase (pre-auth only).
-                              # Resets after each command received. Cleared after successful authentication.
+auth_idle_timeout = "2m"        # On lmtp_proxy: idle timeout for reads from the client, between commands
+                              # and during DATA (there is no authentication phase).
                               # Note: absolute_session_timeout (below) separately limits total session duration.
 max_message_size = "50mb"
-enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
+enable_affinity = true        # Enable user-to-backend affinity (default: false; needs [cluster] enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+# timeouts.command_timeout = "0"            # No effect on lmtp_proxy (auth_idle_timeout above bounds idle reads)
 timeouts.absolute_session_timeout = "5m"    # Maximum total session duration (default: 5m for LMTP)
                                             # LMTP is a delivery protocol - connections should complete in seconds/minutes
                                             # 5 minutes is generous for large messages while detecting hung backends quickly
-timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
+# timeouts.min_bytes_per_minute = 0         # No effect on lmtp_proxy
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)
@@ -2147,7 +2114,7 @@ debug = false                         # Enable debug logging (logs backend greet
 type = "metrics"
 name = "prometheus-metrics"
 addr = ":9090"
-path = "/metrics"             # HTTP endpoint path for metrics.
+path = "/metrics"             # HTTP endpoint path for metrics. Required: there is no default.
 
 # --- ACCESS CONTROL ---
 # The metrics endpoint has NO access control unless configured here, and it exposes
@@ -2161,6 +2128,9 @@ api_key = ""                  # Require "Authorization: Bearer <key>" on each sc
                               # NOTE: metrics are always served over plain HTTP (tls is ignored here),
                               # so terminate TLS in front if the token crosses an untrusted network.
 
+# The keys below are used as written: an omitted key is false or 0. So without them domain
+# metrics are off, enable_user_metrics without max_tracked_users tracks no user, and
+# hash_usernames is false (user labels then carry plain addresses).
 enable_domain_metrics = true
 enable_user_metrics = false  # CAUTION: high cardinality, for small deployments only.
 user_metrics_threshold = 1000
@@ -2185,9 +2155,10 @@ tls_cert_file = ""            # Static cert file (or use Let's Encrypt autocert 
 tls_key_file = ""             # Static key file (or use Let's Encrypt autocert from [tls] section)
 tls_default_domain = ""       # [OPTIONAL] Default domain for SNI-less connections (uses global default_domain if not set)
 tls_verify = false
-proxy_protocol = false        # Enable PROXY protocol support for HTTP API
-proxy_protocol_timeout = "5s"
-# proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
+# The Admin API does not support PROXY protocol: proxy_protocol is accepted but not read
+# (setting it to true still makes startup require [servers] trusted_networks).
+# proxy_protocol = false
+# proxy_protocol_timeout = "5s"
 
 # NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint
 # NOTE: When tls=true and tls_cert_file/tls_key_file are empty, uses Let's Encrypt autocert from [tls] section
@@ -2204,9 +2175,10 @@ type = "http_user_api"
 name = "user-api"
 addr = ":8081"
 jwt_secret = "your-secret-jwt-signing-key-here"  # REQUIRED: Secret key for signing JWT tokens. KEEP SECRET!
-token_duration = "24h"        # JWT token validity duration (e.g., "24h", "7d", "12h").
+token_duration = "24h"        # JWT token validity duration in Go syntax (e.g., "24h", "168h", "12h"). Days ("7d")
+                              # are not accepted: such a value is logged and replaced by the default, 24h.
                               # Tokens are validated statelessly and cannot be revoked before they expire,
-                              # so this is clamped to a maximum of 7d (168h); larger values are reduced with
+                              # so this is clamped to a maximum of 168h (7 days); larger values are reduced with
                               # a startup warning. A password change or account deletion stops token *renewal*
                               # at /user/auth/refresh, so a leaked token survives at most one token_duration.
 token_issuer = "sora-mail-api" # JWT issuer field (optional, for token validation).
@@ -2236,19 +2208,25 @@ tls_verify = false
 #remote_port = 8081                  # Default backend port if not specified in remote_addrs
 #jwt_secret = "your-secret-jwt-signing-key-here"  # REQUIRED: Same JWT secret as backend servers
 #max_connections = 10000             # Maximum total concurrent connections (0 = unlimited)
-#max_connections_per_ip = 100        # Maximum connections per client IP (0 = unlimited)
-#connect_timeout = "10s"             # Timeout for establishing backend connections
-#enable_affinity = true              # Enable user-to-backend affinity (sticky routing via consistent hashing)
+#max_connections_per_ip = 100        # Maximum connections per client IP on this node (0 = unlimited)
+#connect_timeout = "10s"             # Timeout for establishing backend connections (default: 30s)
+# enable_affinity has no effect here: this proxy uses cluster affinity whenever [cluster] is enabled
 #tls = false                         # Enable TLS on frontend proxy listener
 #tls_cert_file = ""
 #tls_key_file = ""
 #tls_verify = false
 #tls_default_domain = "api.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this proxy.
 #remote_tls = false                  # Use HTTPS for backend connections
-#remote_tls_verify = true            # Verify backend TLS certificates
+#remote_tls_verify = true            # Verify backend TLS certificates (default: false)
+#remote_use_proxy_protocol = false   # Send a PROXY header to backends, carrying the client IP
 
-# IMPORTANT: Backend User API servers should configure allowed_hosts to trust this proxy
-# Backend configuration example:
+# IMPORTANT: Backends see this proxy as the client. They do not read the X-Forwarded-For
+# header the proxy adds; only a PROXY header carries the client IP to them.
+# - Without remote_use_proxy_protocol: list the proxy hosts in the backend's allowed_hosts.
+# - With remote_use_proxy_protocol = true: set proxy_protocol = true on the backend and list
+#   the proxies in [servers] trusted_networks. The backend then checks allowed_hosts (and
+#   rate limits) against the client IP, so allowed_hosts must admit the clients.
+# Backend configuration example (without PROXY):
 # [[server]]
 # type = "http_user_api"
-# allowed_hosts = ["10.0.0.0/8"]  # Trust requests from proxy network
+# allowed_hosts = ["192.0.2.10", "192.0.2.11"]  # The user_api_proxy hosts

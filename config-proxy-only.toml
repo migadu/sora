@@ -1,7 +1,7 @@
 # Proxy-only configuration (no database required)
 
 [logging]
-format = "text"
+format = "console"
 level = "info"
 
 # Database section can be omitted or left with dummy values
@@ -17,9 +17,13 @@ type = "imap_proxy"
 name = "imap-proxy"
 addr = ":1143"
 remote_addrs = ["backend1.example.com:143"]
+# The proxy logs in to the backend as the user with these master SASL credentials;
+# they must match master_sasl_username/master_sasl_password on the backends.
+master_sasl_username = "proxyuser"
+master_sasl_password = "proxypass"
 
 [server.remote_lookup]
 enabled = true
-url = "http://auth-api.example.com/lookup?email=$email"
+url = "https://auth-api.example.com/lookup?email=$email"  # https:// is required for any host but localhost/loopback
 lookup_local_users = false  # Critical: must be false to skip database
 timeout = "5s"
