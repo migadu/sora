@@ -76,6 +76,7 @@ package logger
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"log/syslog"
 	"os"
@@ -153,8 +154,30 @@ func needsQuoting(s string) bool {
 var globalLogger atomic.Pointer[slog.Logger]
 
 // fileOutput is the file output, when the configured output is a path; nil
-// otherwise. Atomic because Reopen runs from the signal-handling goroutine.
+// otherwise. Retained output writers load it on every write, including writers
+// created before Initialize.
 var fileOutput atomic.Pointer[LogFile]
+
+// Stdout returns a writer for unstructured output such as protocol debug logs.
+// It follows the configured log file across rotations, or writes to os.Stdout
+// when file logging is not configured. The writer may be kept across Initialize.
+func Stdout() io.Writer { return streamWriter{} }
+
+// Stderr is like Stdout, but falls back to os.Stderr. It can be used by error
+// handlers created before logging is initialized.
+func Stderr() io.Writer { return streamWriter{stderr: true} }
+
+type streamWriter struct{ stderr bool }
+
+func (w streamWriter) Write(p []byte) (int, error) {
+	if lf := fileOutput.Load(); lf != nil {
+		return lf.Write(p)
+	}
+	if w.stderr {
+		return os.Stderr.Write(p)
+	}
+	return os.Stdout.Write(p)
+}
 
 // LogFile is a log output that can be reopened under the running handler.
 // newsyslog renames the file and then signals the process; writing on
@@ -180,6 +203,9 @@ func (lf *LogFile) Name() string { return lf.path }
 func (lf *LogFile) Write(p []byte) (int, error) {
 	lf.mu.Lock()
 	defer lf.mu.Unlock()
+	if lf.f == nil {
+		return 0, os.ErrClosed
+	}
 	return lf.f.Write(p)
 }
 
@@ -187,31 +213,39 @@ func (lf *LogFile) Write(p []byte) (int, error) {
 func (lf *LogFile) Close() error {
 	lf.mu.Lock()
 	defer lf.mu.Unlock()
-	return lf.f.Close()
+	if lf.f == nil {
+		return os.ErrClosed
+	}
+	err := lf.f.Close()
+	lf.f = nil
+	fileOutput.CompareAndSwap(lf, nil)
+	return err
 }
 
-// reopen opens the path afresh and makes the current descriptor refer to the
-// new file. Every holder of that descriptor (the slog handler, os.Stdout and
-// os.Stderr as Initialize set them, a log.Logger built on them) writes to the
-// new file from here on, with nothing swapped under it. On failure the old
-// file stays, so logging never stops over a rotation gone wrong.
+// reopen swaps the underlying file while holding the same lock as every writer.
+// Saved Stdout and Stderr writers go through this handle too, so rotation never
+// closes a descriptor beneath an in-flight write. If opening fails, the old
+// file remains usable.
 func (lf *LogFile) reopen() error {
+	lf.mu.Lock()
+	defer lf.mu.Unlock()
+	if lf.f == nil {
+		return fmt.Errorf("reopen log file %s: %w", lf.path, os.ErrClosed)
+	}
 	f, err := os.OpenFile(lf.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("reopen log file %s: %w", lf.path, err)
 	}
-	defer f.Close()
-	lf.mu.Lock()
-	defer lf.mu.Unlock()
-	if err := redirect(f, lf.f); err != nil {
-		return fmt.Errorf("reopen log file %s: %w", lf.path, err)
+	old := lf.f
+	lf.f = f
+	if err := old.Close(); err != nil {
+		return fmt.Errorf("close rotated log file %s: %w", lf.path, err)
 	}
 	return nil
 }
 
-// Reopen closes and reopens the log file after a rotation tool such as
-// newsyslog has moved it aside; main calls it on SIGHUP. A no-op when the
-// output is not a file.
+// Reopen reopens the log file after a rotation tool such as newsyslog has moved
+// it aside; main calls it on SIGHUP. A no-op when the output is not a file.
 func Reopen() error {
 	lf := fileOutput.Load()
 	if lf == nil {
@@ -375,9 +409,6 @@ func Initialize(cfg config.LoggingConfig) (*LogFile, error) {
 			} else {
 				handler = slog.NewTextHandler(logFile, handlerOpts)
 			}
-			// Redirect stdout and stderr to log file
-			os.Stdout = logFile.f
-			os.Stderr = logFile.f
 			fileOutput.Store(logFile)
 		}
 	}

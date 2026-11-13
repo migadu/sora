@@ -5,8 +5,8 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log"
 	"net"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -346,6 +346,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	}
 
 	s := smtp.NewServer(backend)
+	s.ErrorLog = log.New(logger.Stderr(), "smtp/server ", log.LstdFlags)
 	s.Addr = addr
 	s.Domain = hostname
 	// Seed every connection's context (smtp.Conn.Context) from the application
@@ -439,7 +440,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 
 	var debugWriter io.Writer
 	if options.Debug {
-		debugWriter = os.Stdout
+		debugWriter = logger.Stdout()
 		s.Debug = debugWriter
 	}
 

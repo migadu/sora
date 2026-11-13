@@ -51,6 +51,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/migadu/sora/logger"
 )
 
 type State int
@@ -363,7 +365,7 @@ func DefaultSettings(name string) Settings {
 			return counts.Requests >= 3 && failureRatio >= 0.6
 		},
 		OnStateChange: func(name string, from State, to State) {
-			fmt.Printf("CircuitBreaker '%s' changed from %s to %s\n", name, from, to)
+			fmt.Fprintf(logger.Stdout(), "CircuitBreaker '%s' changed from %s to %s\n", name, from, to)
 		},
 		IsSuccessful: func(err error) bool {
 			return err == nil

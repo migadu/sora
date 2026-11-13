@@ -167,12 +167,12 @@ func main() {
 	// Initialize logging with zap logger
 	logFile, err := logger.Initialize(cfg.Logging)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "SORA: Warning initializing logger: %v\n", err)
+		fmt.Fprintf(logger.Stderr(), "SORA: Warning initializing logger: %v\n", err)
 	}
 	if logFile != nil {
 		defer func(f *logger.LogFile) {
 			logger.Sync() // Flush any buffered log entries
-			fmt.Fprintf(os.Stderr, "SORA: Closing log file %s\n", f.Name())
+			fmt.Fprintf(logger.Stderr(), "SORA: Closing log file %s\n", f.Name())
 			if err := f.Close(); err != nil {
 				fmt.Fprintf(os.Stderr, "SORA: Error closing log file %s: %v\n", f.Name(), err)
 			}
