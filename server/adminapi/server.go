@@ -309,31 +309,40 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	var refused error
 	next := *s.settings.Load()
-	previousAPIKey := next.apiKey
+	nextAPIKey := cfg.APIKey
+	if nextAPIKey == "" {
+		nextAPIKey = next.apiKey
+	}
 
-	if cfg.APIKey != "" && cfg.APIKey != next.apiKey {
-		if cfg.APIKey == next.readOnlyAPIKey {
+	// Validate both keys before changing either. A refused reload must preserve
+	// the live keys used by the guards, even when the same config is retried.
+	if nextAPIKey != next.apiKey {
+		if nextAPIKey == next.readOnlyAPIKey {
 			// Read-only clients already hold this value; taking it as api_key would
 			// hand them full access.
-			refused = fmt.Errorf("api_key refused, the previous one stays in use: it equals the current read_only_api_key")
-		} else if err := checkAPIKey(cfg.APIKey); err != nil {
-			// The rest still reloads. The error has the caller log a failed reload, so an
-			// operator rotating a leaked key learns that the old one is still live.
-			refused = fmt.Errorf("api_key refused, the previous one stays in use: %w", err)
-		} else {
-			next.apiKey = cfg.APIKey
-			reloaded = append(reloaded, "api_key")
+			refused = fmt.Errorf("api_key refused, both previous API keys stay in use: it equals the current read_only_api_key")
+		} else if err := checkAPIKey(nextAPIKey); err != nil {
+			// The error has the caller log a failed reload, so an operator rotating
+			// a leaked key learns that the old one is still live.
+			refused = fmt.Errorf("api_key refused, both previous API keys stay in use: %w", err)
 		}
 	}
 	// read_only_api_key is optional, so unlike api_key an empty value is applied: it
 	// revokes the read-only key.
 	if cfg.ReadOnlyAPIKey != next.readOnlyAPIKey {
-		if err := checkReadOnlyAPIKey(cfg.ReadOnlyAPIKey, next.apiKey); err != nil {
-			refused = errors.Join(refused, fmt.Errorf("read_only_api_key refused, the previous one stays in use: %w", err))
-		} else if cfg.ReadOnlyAPIKey != "" && cfg.ReadOnlyAPIKey == previousAPIKey {
+		if err := checkReadOnlyAPIKey(cfg.ReadOnlyAPIKey, nextAPIKey); err != nil {
+			refused = errors.Join(refused, fmt.Errorf("read_only_api_key refused, both previous API keys stay in use: %w", err))
+		} else if cfg.ReadOnlyAPIKey != "" && cfg.ReadOnlyAPIKey == next.apiKey {
 			// The api_key being rotated out may be a leaked one; it must not live on as a read key.
-			refused = errors.Join(refused, fmt.Errorf("read_only_api_key refused, the previous one stays in use: it equals the api_key this reload replaces"))
-		} else {
+			refused = errors.Join(refused, fmt.Errorf("read_only_api_key refused, both previous API keys stay in use: it equals the api_key this reload replaces"))
+		}
+	}
+	if refused == nil {
+		if nextAPIKey != next.apiKey {
+			next.apiKey = nextAPIKey
+			reloaded = append(reloaded, "api_key")
+		}
+		if cfg.ReadOnlyAPIKey != next.readOnlyAPIKey {
 			next.readOnlyAPIKey = cfg.ReadOnlyAPIKey
 			reloaded = append(reloaded, "read_only_api_key")
 		}

@@ -119,36 +119,99 @@ func TestReloadConfig_ReadOnlyAPIKey(t *testing.T) {
 	if got := authStatus(s, http.MethodGet, roKey2); got != http.StatusForbidden {
 		t.Errorf("revoked read_only_api_key: status %d, want 403", got)
 	}
+}
 
-	// Rotating api_key onto the value read-only clients hold is refused, whether or
-	// not read_only_api_key changes in the same reload: it would grant them full access.
-	for _, nextRO := range []string{roKey, roKey2, ""} {
-		if err := s.ReloadConfig(config.ServerConfig{Name: "ro", APIKey: rwKey, ReadOnlyAPIKey: roKey}); err != nil {
-			t.Fatal(err)
-		}
-		err := s.ReloadConfig(config.ServerConfig{Name: "ro", APIKey: roKey, ReadOnlyAPIKey: nextRO})
-		if err == nil || !strings.Contains(err.Error(), "api_key refused") {
-			t.Errorf("api_key rotated onto read_only_api_key (next read-only %q): error %v, want api_key refused", nextRO, err)
-		}
-		if got := authStatus(s, http.MethodPost, roKey); got != http.StatusForbidden {
-			t.Errorf("former read-only key (next read-only %q): POST status %d, want 403", nextRO, got)
-		}
-		if got := authStatus(s, http.MethodPost, rwKey); got != http.StatusOK {
-			t.Errorf("previous api_key (next read-only %q): POST status %d, want 200", nextRO, got)
-		}
+// Every SIGHUP retries the complete config, including one a previous reload
+// refused. A refusal must leave both keys in place so retries cannot bypass it.
+func TestReloadConfig_RepeatedSIGHUPRejectsAPIKeyReuse(t *testing.T) {
+	const nextRW = "full-access-api-key-dddddddddddddddd"
+	cases := []struct {
+		name, apiKey, readOnlyAPIKey, wantErr string
+	}{
+		{"read-only unchanged", roKey, roKey, "api_key refused"},
+		{"read-only replaced", roKey, roKey2, "api_key refused"},
+		{"read-only revoked", roKey, "", "api_key refused"},
+		{"full-access moved to read-only", nextRW, rwKey, "read_only_api_key refused"},
 	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, err := New(&resilient.ResilientDatabase{}, ServerOptions{
+				Name: "ro", APIKey: rwKey, ReadOnlyAPIKey: roKey,
+				AllowedHosts: []string{"192.0.2.0/24"},
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			cfg := config.ServerConfig{
+				Name: "ro", APIKey: c.apiKey, ReadOnlyAPIKey: c.readOnlyAPIKey,
+				AllowedHosts: []string{"198.51.100.0/24"},
+			}
+			for attempt := 1; attempt <= 3; attempt++ {
+				if err := s.ReloadConfig(cfg); err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Errorf("reload %d: error %v, want %q", attempt, err, c.wantErr)
+				}
+				for _, check := range []struct {
+					method, key string
+					want        int
+				}{
+					{http.MethodGet, rwKey, http.StatusOK},
+					{http.MethodPost, rwKey, http.StatusOK},
+					{http.MethodGet, roKey, http.StatusOK},
+					{http.MethodPost, roKey, http.StatusForbidden},
+					{http.MethodGet, nextRW, http.StatusForbidden},
+					{http.MethodPost, nextRW, http.StatusForbidden},
+					{http.MethodGet, roKey2, http.StatusForbidden},
+				} {
+					if got := authStatus(s, check.method, check.key); got != check.want {
+						t.Errorf("reload %d: %s with %q: status %d, want %d", attempt, check.method, check.key, got, check.want)
+					}
+				}
+				// Unrelated host restrictions still reload when credentials are refused.
+				h := s.allowedHostsMiddleware(okHandler)
+				if got := hostStatus(h, "198.51.100.5:1234"); got != http.StatusOK {
+					t.Errorf("reload %d: new allowed host status %d, want 200", attempt, got)
+				}
+				if got := hostStatus(h, "192.0.2.5:1234"); got != http.StatusForbidden {
+					t.Errorf("reload %d: old allowed host status %d, want 403", attempt, got)
+				}
+			}
+		})
+	}
+}
 
-	// Rotating api_key while moving the old one into the read-only slot keeps the
-	// rotated-out (possibly leaked) key from living on as a read key.
-	const rwKey2 = "full-access-api-key-dddddddddddddddd"
-	err = s.ReloadConfig(config.ServerConfig{Name: "ro", APIKey: rwKey2, ReadOnlyAPIKey: rwKey})
-	if err == nil || !strings.Contains(err.Error(), "read_only_api_key refused") {
-		t.Errorf("old api_key moved to read_only_api_key: error %v, want read_only_api_key refused", err)
+func TestReloadConfig_RotatesAPIKeysTogether(t *testing.T) {
+	const nextRW = "full-access-api-key-dddddddddddddddd"
+	s, err := New(&resilient.ResilientDatabase{}, ServerOptions{Name: "ro", APIKey: rwKey, ReadOnlyAPIKey: roKey})
+	if err != nil {
+		t.Fatalf("New: %v", err)
 	}
-	if got := authStatus(s, http.MethodGet, rwKey); got != http.StatusForbidden {
-		t.Errorf("rotated-out api_key: GET status %d, want 403", got)
+	cfg := config.ServerConfig{Name: "ro", APIKey: nextRW, ReadOnlyAPIKey: roKey2}
+	if err := s.ReloadConfig(cfg); err != nil {
+		t.Fatal(err)
 	}
-	if got := authStatus(s, http.MethodPost, rwKey2); got != http.StatusOK {
-		t.Errorf("new api_key: POST status %d, want 200", got)
+	for _, check := range []struct {
+		method, key string
+		want        int
+	}{
+		{http.MethodGet, rwKey, http.StatusForbidden},
+		{http.MethodGet, roKey, http.StatusForbidden},
+		{http.MethodGet, nextRW, http.StatusOK},
+		{http.MethodPost, nextRW, http.StatusOK},
+		{http.MethodGet, roKey2, http.StatusOK},
+		{http.MethodPost, roKey2, http.StatusForbidden},
+	} {
+		if got := authStatus(s, check.method, check.key); got != check.want {
+			t.Errorf("%s with %q: status %d, want %d", check.method, check.key, got, check.want)
+		}
+	}
+	cfg.ReadOnlyAPIKey = ""
+	if err := s.ReloadConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := authStatus(s, http.MethodGet, roKey2); got != http.StatusForbidden {
+		t.Errorf("revoked read-only key: status %d, want 403", got)
+	}
+	if got := authStatus(s, http.MethodPost, nextRW); got != http.StatusOK {
+		t.Errorf("full-access key after revocation: status %d, want 200", got)
 	}
 }
