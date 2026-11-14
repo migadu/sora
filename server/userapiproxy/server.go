@@ -974,8 +974,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 	// Get real client IP (from PROXY protocol or RemoteAddr)
 	realClientIP := s.getRealClientIP(r)
 
-	// Forward real client IP to backend in X-Forwarded-For and X-Real-IP headers
-	// Backend should trust these headers from trusted proxy networks
+	// Forward real client IP to backend in X-Forwarded-For and X-Real-IP headers.
+	// The sora User API backend does not read them: it learns the client address
+	// only from the PROXY protocol header (remote_use_proxy_protocol).
 	r.Header.Set("X-Real-IP", realClientIP)
 	r.Header.Set("X-Forwarded-For", realClientIP)
 

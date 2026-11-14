@@ -276,7 +276,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		}
 	}
 
-	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
+	// Ensure the default mailboxes (INBOX/Sent/Drafts/Archive/Junk/Trash, consts.DefaultMailboxes) exist
 	err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, AccountID)
 	if err != nil {
 		return s.internalError("failed to create default mailboxes: %v", err)

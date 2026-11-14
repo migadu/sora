@@ -145,7 +145,7 @@ type ServerOptions struct {
 	MaxConnections      int      // Maximum total connections per instance (0 = unlimited, local only)
 	MaxConnectionsPerIP int      // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
 	TrustedNetworks     []string // CIDR blocks for trusted networks that bypass per-IP limits
-	ListenBacklog       int      // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+	ListenBacklog       int      // TCP listen backlog size (0 = 1024; recommended: 4096-8192)
 
 	// Auth cache configuration
 	LookupCache *config.LookupCacheConfig

@@ -15,8 +15,8 @@
 //   - Script storage: per-account scripts in PostgreSQL via the resilient
 //     database layer, with master-DB session pinning after writes.
 //   - SIEVE validation: scripts are validated with github.com/migadu/go-sieve
-//     against the configured supported_extensions on PUTSCRIPT, CHECKSCRIPT,
-//     and SETACTIVE.
+//     against the [sieve] enabled_extensions on PUTSCRIPT, CHECKSCRIPT, and
+//     SETACTIVE.
 //   - Quotas: max_script_size (enforced by the library, including
 //     reject-before-read of oversized literals) and the per-account
 //     script-count limit.

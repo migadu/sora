@@ -122,7 +122,7 @@ type ServerOptions struct {
 
 	// Connection limiting (total connections only, no per-IP for LMTP)
 	MaxConnections int // Maximum total connections (0 = unlimited)
-	ListenBacklog  int // TCP listen backlog size (0 = system default; recommended: 4096-8192)
+	ListenBacklog  int // TCP listen backlog size (0 = 1024; recommended: 4096-8192)
 
 	// Routing cache configuration (for user lookups)
 	LookupCache *config.LookupCacheConfig

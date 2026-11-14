@@ -1350,8 +1350,9 @@ func (w *UploadWorker) addStagingSize(delta int64) {
 	}
 }
 
-// IsStagingLimitExceeded checks if the total staging size across the system
-// plus the provided additional size exceeds the configured max staging size.
+// IsStagingLimitExceeded checks if this instance's own staging backlog plus the
+// provided additional size exceeds the configured max staging size. Other nodes'
+// backlogs are not counted (see monitorStuckUploads).
 func (w *UploadWorker) IsStagingLimitExceeded(additionalSize int64) bool {
 	if w.maxStagingSize <= 0 {
 		return false // No limit configured
