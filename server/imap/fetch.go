@@ -310,8 +310,9 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			writeErr = err
 			return err
 		}
-		// CONDSTORE functionality - only process if capability is enabled
-		if s.GetCapabilities().Has(imap.CapCondStore) && options.ChangedSince > 0 {
+		// The parser accepted CHANGEDSINCE only if the session offers
+		// CONDSTORE, so the request alone gates it here.
+		if options.ChangedSince > 0 {
 			s.DebugLog("CONDSTORE FETCH with CHANGEDSINCE", "changed_since", options.ChangedSince)
 			var filteredMessages []db.Message
 
@@ -553,7 +554,11 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		s.writePreview(ctx, m, msg, options.Preview.Lazy, preview, &bodyData, &bodyDataFetched)
 	}
 
-	if s.GetCapabilities().Has(imap.CapCondStore) && options.ModSeq {
+	// Likewise MODSEQ, and CHANGEDSINCE, which implies it: the parser accepted
+	// them only if the session offers CONDSTORE. A NOTIFY watch set before a
+	// client filter withdrew CONDSTORE still asks for MODSEQ, and WriteModSeq
+	// leaves it out then.
+	if options.ModSeq {
 		var highestModSeq int64
 		highestModSeq = msg.CreatedModSeq
 

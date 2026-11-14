@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
@@ -100,5 +101,55 @@ func TestIMAP_DisabledCondStoreFetchItems(t *testing.T) {
 			}
 			c.do("NOOP")
 		})
+	}
+}
+
+// TestIMAP_ClientFilterAfterNotifyLeavesOutModSeq: a NOTIFY watch whose
+// MessageNew fetch-atts name MODSEQ, set while the session offered CONDSTORE,
+// keeps asking for it after an ID-matched client filter withdraws CONDSTORE.
+// Fetch writes MODSEQ whenever it is asked for, since the parser refuses it
+// without CONDSTORE, and relies on the writer to leave it out here: MODSEQ is
+// CONDSTORE's data item (RFC 7162 §3.1.4.2), and a session whose CAPABILITY
+// lacks CONDSTORE does not offer the extension (RFC 7162 §3.1.1). The new
+// message's FETCH still carries its UID, so it is never empty (RFC 9051 §9
+// msg-att).
+func TestIMAP_ClientFilterAfterNotifyLeavesOutModSeq(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account, _ := common.SetupIMAPServerWithRealS3Options(t, func(o *imapserver.IMAPServerOptions) {
+		o.CapabilityFilters = []config.ClientCapabilityFilter{{ClientName: "^buggy$", DisableCaps: []string{"CONDSTORE"}}}
+	})
+	t.Cleanup(server.Close)
+	login := fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password)
+
+	watcher := dialRawIMAP(t, server.Address)
+	watcher.do(login)
+	watcher.do("SELECT INBOX")
+	watcher.do("NOTIFY SET (SELECTED (MessageNew (UID MODSEQ) MessageExpunge))")
+	watcher.do(`ID ("name" "buggy")`)
+	capLines, _ := watcher.do("CAPABILITY")
+	if caps := strings.Fields(strings.Join(capLines, " ")); slices.Contains(caps, "CONDSTORE") {
+		t.Fatalf("CAPABILITY after ID: want no CONDSTORE, got:\n%s", strings.Join(capLines, "\n"))
+	}
+
+	other := dialRawIMAP(t, server.Address)
+	other.do(login)
+	other.appendMsg("INBOX", "From: a@example.com\r\nTo: b@example.com\r\nSubject: condstore\r\n\r\nhello\r\n")
+
+	if err := watcher.conn.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	var fetch string
+	for fetch == "" {
+		line, err := watcher.r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("waiting for the MessageNew FETCH: %v", err)
+		}
+		if strings.Contains(line, " FETCH ") {
+			fetch = strings.TrimRight(line, "\r\n")
+		}
+	}
+	if !strings.Contains(fetch, "UID ") || strings.Contains(fetch, "MODSEQ") {
+		t.Errorf("MessageNew FETCH: want UID and no MODSEQ, got: %s", fetch)
 	}
 }
