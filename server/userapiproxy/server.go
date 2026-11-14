@@ -284,14 +284,27 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		}
 		return conn, nil
 	}
+	// Each connection's outcome, once it is usable or has failed (after the TLS handshake
+	// if there is one), is recorded against the backend the request was routed to:
+	// routing passes over a backend that failed three connections in a row, as on the
+	// other proxies, instead of sending its users there for a 502 while it is down.
+	recordDial := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+		return func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dial(ctx, network, addr)
+			if route, ok := ctx.Value(backendRouteKey).(*proxy.BackendRoute); ok {
+				route.RecordDialOutcome(ctx, err)
+			}
+			return conn, err
+		}
+	}
 	// The TLS leg is set up here rather than by the transport, with the connection
 	// manager's config for the address dialed (proxy.BackendClientTLS): a pool member is
 	// verified against its pool's CA file, and by the name it was configured with although
 	// the transport dials the address that name resolved to.
 	newTransport := func(verify bool) *http.Transport {
 		return &http.Transport{
-			DialContext: dialBackend,
-			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			DialContext: recordDial(dialBackend),
+			DialTLSContext: recordDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
 				conn, err := dialBackend(ctx, network, addr)
 				if err != nil {
 					return nil, err
@@ -308,7 +321,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 					return nil, err
 				}
 				return tlsConn, nil
-			},
+			}),
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   10,
 			IdleConnTimeout:       90 * time.Second,
@@ -572,8 +585,9 @@ func isCORSPreflight(r *http.Request) bool {
 // any handler, so it reaches no account. Unlike a request that names a user it is
 // therefore not confined to one pool: it goes to the default pool (the one pool of a flat
 // remote_addrs list), and failing that (no default pool, or no backend of it available)
-// to the first pool in configuration order with a backend available. Which pool answers
-// decides whose allowed_origins applies, so every pool's backends should share them.
+// to the first pool in configuration order with a backend available (neither in
+// maintenance nor marked unhealthy). Which pool answers decides whose allowed_origins
+// applies, so every pool's backends should share them.
 func (s *Server) routePreflight(r *http.Request) (backendRoute, error) {
 	tried := ""
 	if pool, err := s.connManager.ResolvePool(""); err == nil {
@@ -732,6 +746,9 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 // backend's own siblings (refused if its named pool cannot be identified) without
 // setting affinity, so the pin takes the user back when maintenance ends; an affinity to
 // one is dropped and the user routed afresh, so the new affinity keeps them there after it.
+// A backend marked unhealthy (three failed connections in a row) is passed over the same
+// way by affinity and consistent hash, but not by a pin: the lookup's answer is
+// definitive, as on the other proxies.
 //
 // forAuth is set for a login or refresh, which carries no token yet: anyone can name any
 // user in one, so it reads affinity but never writes it (no gossip per made-up user).
@@ -882,14 +899,17 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 		if backend, found := s.affinityManager.GetBackend(email, "userapi"); found {
 			// Affinity is gossip-synced and persisted: honor it only inside the user's pool
 			// (a user the lookup moved to another pool must not follow a stale entry), only
-			// when restrict_to_pool allows it (a poisoned entry from another node), and
-			// never to a backend in maintenance.
-			if s.connManager.PoolHasBackend(pool.Name, backend) && s.connManager.AllowRemoteLookupBackend(backend) && !s.connManager.InMaintenance(backend) {
+			// when restrict_to_pool allows it (a poisoned entry from another node), never
+			// to a backend in maintenance, and never to one marked unhealthy. Health is read
+			// without auto-recovery, as the other proxies' affinity does: a user who failed
+			// over stays on the new backend when the old one comes back.
+			if s.connManager.PoolHasBackend(pool.Name, backend) && s.connManager.AllowRemoteLookupBackend(backend) &&
+				!s.connManager.InMaintenance(backend) && s.connManager.IsBackendHealthyForAffinity(backend) {
 				logger.Debug("User API Proxy: Using affinity backend", "name", s.name, "user", email, "backend", backend, "pool", pool.Name)
 				return s.poolRoute(backend, pool), nil
 			}
 			if !forAuth {
-				logger.Info("User API Proxy: Affinity backend not in the user's pool or in maintenance - deleting affinity", "name", s.name, "user", email, "backend", backend, "pool", pool.Name)
+				logger.Info("User API Proxy: Affinity backend not in the user's pool, in maintenance or unhealthy - deleting affinity", "name", s.name, "user", email, "backend", backend, "pool", pool.Name)
 				s.affinityManager.DeleteBackend(email, "userapi")
 			}
 		}
