@@ -1386,7 +1386,7 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Extract protocol from tracker key
-			// Key format: "PROTOCOL-hostname-servername" or "PROTOCOL-servername"
+			// Key format: "PROTOCOL-node-servername" (proxies) or "PROTOCOL-servername"
 			// Display: Just "PROTOCOL" for simplicity
 			protocol := extractProtocolFromKey(trackerKey)
 
@@ -1454,7 +1454,7 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		// Find all trackers that match the protocol prefix
 		normalizedProtocol := strings.ToUpper(req.Protocol)
 		for trackerKey, tracker := range s.connectionTrackers {
-			// Extract protocol from tracker key (format: "PROTOCOL-hostname-servername")
+			// Extract protocol from tracker key (format: "PROTOCOL-node-servername")
 			trackerProtocol := extractProtocolFromKey(trackerKey)
 			if strings.ToUpper(trackerProtocol) == normalizedProtocol {
 				trackersToKick = append(trackersToKick, struct {

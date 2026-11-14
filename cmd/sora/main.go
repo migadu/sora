@@ -1279,12 +1279,25 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	return errChan
 }
 
+// proxyTrackerInstanceID names a proxy listener's connection tracker to its peers.
+// A tracker discards every event and snapshot that carries its own ID as coming
+// from itself, so in cluster mode the ID must differ between nodes. The OS
+// hostname does not: containers and cloned VMs commonly share one. cluster.node_id
+// does, because memberlist admits only one member per name. Outside cluster mode
+// the ID never leaves the node and the hostname is kept.
+func proxyTrackerInstanceID(clusterMgr *cluster.Manager, hostname, serverName string) string {
+	if clusterMgr != nil {
+		return clusterMgr.GetNodeID() + "-" + serverName
+	}
+	return hostname + "-" + serverName
+}
+
 // startConnectionTrackerForProxy initializes and starts a connection tracker for a proxy server (with gossip).
 // Returns both the tracker and the map key to use for registration.
 func startConnectionTrackerForProxy(protocol string, serverName string, hostname string, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, clusterMgr *cluster.Manager, clusterCfg *config.ClusterConfig, srv interface {
 	SetConnectionTracker(*server.ConnectionTracker)
 }) (*server.ConnectionTracker, string) {
-	instanceID := fmt.Sprintf("%s-%s", hostname, serverName)
+	instanceID := proxyTrackerInstanceID(clusterMgr, hostname, serverName)
 
 	// LMTP proxy connections are short-lived (often seconds) and typically originate from
 	// trusted internal infrastructure.
@@ -1330,7 +1343,7 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 		srv.SetConnectionTracker(tracker)
 	}
 
-	// Return tracker and the map key (protocol-instanceID for uniqueness across cluster)
+	// Return tracker and the map key (protocol-instanceID)
 	mapKey := protocol + "-" + instanceID
 	return tracker, mapKey
 }
