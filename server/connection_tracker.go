@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
-	"strings"
+	"net"
 	"sync"
 	"time"
 
@@ -422,10 +422,11 @@ func (ct *ConnectionTracker) unregisterLocked(accountID int64, protocol, clientA
 }
 
 // clientIPOf strips the port from a "host:port" client address. An address
-// without a port is already an IP.
+// without a port is already an IP, IPv6 included: cutting "2001:db8::1" at
+// its last colon would give every address in 2001:db8::/112 one key.
 func clientIPOf(clientAddr string) string {
-	if idx := strings.LastIndexByte(clientAddr, ':'); idx >= 0 {
-		return clientAddr[:idx]
+	if host, _, err := net.SplitHostPort(clientAddr); err == nil {
+		return host
 	}
 	return clientAddr
 }

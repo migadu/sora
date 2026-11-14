@@ -135,6 +135,25 @@ func (deps *serverDependencies) registerServer(name string, server ConfigReloade
 	deps.runningServers[name] = server
 }
 
+// relayQueueOption is the relay queue as the servers' delivery.RelayQueue option: a nil
+// interface on a node without [relay]. Assigning the nil *relayqueue.DiskQueue directly
+// would store a nil pointer in a non-nil interface, so every "relay not configured" check
+// (RelayQueue == nil) would take the configured branch and call Enqueue on the nil queue.
+func (deps *serverDependencies) relayQueueOption() delivery.RelayQueue {
+	if deps.relayQueue == nil {
+		return nil
+	}
+	return deps.relayQueue
+}
+
+// relayWorkerOption is relayQueueOption for the worker LMTP wakes after an enqueue.
+func (deps *serverDependencies) relayWorkerOption() lmtp.RelayWorkerNotifier {
+	if deps.relayWorker == nil {
+		return nil
+	}
+	return deps.relayWorker
+}
+
 func main() {
 	errorHandler := errors.NewErrorHandler()
 	cfg := config.NewDefaultConfig()
@@ -560,6 +579,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	// Determine if any mail storage services are enabled
 	allServers := cfg.GetAllServers()
 	storageServicesNeeded := false
+	userAPIServed := false
 	databaseNeeded := false
 
 	// Check if database is actually configured
@@ -582,6 +602,9 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		// Admin API and User API need database for account management
 		if server.Type == "http_admin_api" || server.Type == "http_user_api" {
 			databaseNeeded = true
+		}
+		if server.Type == "http_user_api" {
+			userAPIServed = true
 		}
 	}
 
@@ -607,11 +630,24 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		proxyServers:       make(map[string]adminapi.ProxyServer),
 	}
 
+	// The User API serves message bodies (/user/messages/{id}/body and /raw) from S3, so
+	// it needs the [s3] connection on a node without mail services too. It reads through
+	// to S3 without the cache and workers those start below. Without any [s3] settings it
+	// serves everything but bodies.
+	s3Needed := storageServicesNeeded
+	if userAPIServed && !storageServicesNeeded {
+		if cfg.S3.Endpoint == "" && cfg.S3.Bucket == "" && cfg.S3.AccessKey == "" && cfg.S3.SecretKey == "" {
+			logger.Warn("User API: no [s3] configured on this node; message bodies (/user/messages/{id}/body and /raw) cannot be served")
+		} else {
+			s3Needed = true
+		}
+	}
+
 	// Initialize S3 storage if needed
-	if storageServicesNeeded {
+	if s3Needed {
 		// Ensure required S3 arguments are provided only if needed
 		if cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
-			errorHandler.ValidationError("S3 credentials", fmt.Errorf("missing required S3 credentials for mail services (IMAP, LMTP, POP3)"))
+			errorHandler.ValidationError("S3 credentials", fmt.Errorf("missing required S3 credentials for mail services (IMAP, LMTP, POP3) or the User API"))
 			os.Exit(errorHandler.WaitForExit())
 		}
 
@@ -1213,14 +1249,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 		case "managesieve":
 			go startDynamicManageSieveServer(ctx, deps, server, errChan)
 		case "metrics":
-			// Configure metrics collection settings
-			metrics.Configure(
-				server.EnableUserMetrics,
-				server.EnableDomainMetrics,
-				server.UserMetricsThreshold,
-				server.MaxTrackedUsers,
-				server.HashUsernames,
-			)
+			configureMetrics(server)
 			go startDynamicMetricsServer(ctx, deps, server, errChan)
 		case "imap_proxy":
 			go startDynamicIMAPProxyServer(ctx, deps, server, errChan)
@@ -1472,6 +1501,30 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 	deps.serverManager.Add()
 	defer deps.serverManager.Done()
 
+	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, buildLMTPServerOptions(deps, serverConfig))
+
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create LMTP server: %w", err)
+		return
+	}
+
+	go func() {
+		<-ctx.Done()
+		logger.Info("Shutting down LMTP server", "name", serverConfig.Name)
+		if err := lmtpServer.Close(); err != nil {
+			logger.Info("Error closing LMTP server", "error", err)
+		}
+	}()
+
+	deps.registerServer(serverConfig.Name, lmtpServer)
+
+	lmtpServer.Start(errChan)
+}
+
+// buildLMTPServerOptions maps the running config onto the LMTP server options, split out
+// of the start path (as buildAdminAPIServerOptions is) so the config -> options threading
+// is exercised on its own.
+func buildLMTPServerOptions(deps *serverDependencies, serverConfig config.ServerConfig) lmtp.LMTPServerOptions {
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
 	maxMessageSize := serverConfig.GetMaxMessageSizeWithDefault()
@@ -1496,11 +1549,11 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		lmtpCommandTimeoutOverrides = nil
 	}
 
-	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
+	return lmtp.LMTPServerOptions{
 		InstanceID:              deps.instanceID,
 		MaintenanceGate:         deps.maintenanceGate,
-		RelayQueue:              deps.relayQueue,  // Global relay queue
-		RelayWorker:             deps.relayWorker, // Global relay worker for immediate processing
+		RelayQueue:              deps.relayQueueOption(),  // Global relay queue; nil without [relay]
+		RelayWorker:             deps.relayWorkerOption(), // Global relay worker for immediate processing
 		TLSVerify:               serverConfig.TLSVerify,
 		TLS:                     serverConfig.TLS,
 		TLSCertFile:             serverConfig.TLSCertFile,
@@ -1522,24 +1575,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		RedirectRateWindow:      redirectRateWindow,
 		MaxRedirectHops:         serverConfig.GetMaxRedirectHops(),
 		CommandTimeoutOverrides: lmtpCommandTimeoutOverrides,
-	})
-
-	if err != nil {
-		errChan <- fmt.Errorf("failed to create LMTP server: %w", err)
-		return
 	}
-
-	go func() {
-		<-ctx.Done()
-		logger.Info("Shutting down LMTP server", "name", serverConfig.Name)
-		if err := lmtpServer.Close(); err != nil {
-			logger.Info("Error closing LMTP server", "error", err)
-		}
-	}()
-
-	deps.registerServer(serverConfig.Name, lmtpServer)
-
-	lmtpServer.Start(errChan)
 }
 
 func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
@@ -1766,12 +1802,24 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	s.Start(errChan)
 }
 
+// configureMetrics applies a metrics block's collection settings. A tuning key the
+// block leaves out keeps the default a node without a metrics block has.
+func configureMetrics(server config.ServerConfig) {
+	metrics.Configure(
+		server.EnableUserMetrics,
+		server.GetEnableDomainMetrics(),
+		server.GetUserMetricsThreshold(),
+		server.GetMaxTrackedUsers(),
+		server.GetHashUsernames(),
+	)
+}
+
 func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
 	deps.serverManager.Add()
 	defer deps.serverManager.Done()
 
 	mux := http.NewServeMux()
-	mux.Handle(serverConfig.Path, metricsAccessGuard(serverConfig.AllowedHosts, serverConfig.APIKey, promhttp.Handler()))
+	mux.Handle(serverConfig.MetricsPath(), metricsAccessGuard(serverConfig.AllowedHosts, serverConfig.APIKey, promhttp.Handler()))
 
 	server := &http.Server{
 		Addr:    serverConfig.Addr,
@@ -2337,6 +2385,9 @@ func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencie
 	}
 
 	options := buildAdminAPIServerOptions(deps, serverConfig)
+	if options.Uploader == nil {
+		logger.Warn("HTTP Admin API: no upload worker on this node (no imap, pop3 or lmtp server), POST /admin/mail/deliver will answer 503", "name", serverConfig.Name)
+	}
 
 	srv, err := adminapi.New(deps.resilientDB, options)
 	if err != nil {
@@ -2401,7 +2452,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		redirectRateWindow = time.Hour
 	}
 
-	return adminapi.ServerOptions{
+	options := adminapi.ServerOptions{
 		Name:               serverConfig.Name,
 		Addr:               serverConfig.Addr,
 		APIKey:             serverConfig.APIKey,
@@ -2411,7 +2462,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		Uploader:           deps.uploadWorker,
 		Storage:            deps.storage,
 		PurgeWorker:        deps.purgeWorker,
-		RelayQueue:         deps.relayQueue, // Global relay queue
+		RelayQueue:         deps.relayQueueOption(), // Global relay queue; nil without [relay]
 		MaxMessageSize:     serverConfig.GetMaxMessageSizeWithDefault(),
 		MaxConnections:     serverConfig.MaxConnections,
 		TLS:                serverConfig.TLS,
@@ -2423,17 +2474,25 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		InstanceID:         deps.instanceID,
 		MaintenanceGate:    deps.maintenanceGate,
 		FTSRetention:       deps.ftsRetention,
-		AffinityManager:    deps.affinityManager,
 		ValidBackends:      validBackends,
 		ConnectionTrackers: deps.connectionTrackers,
 		ProxyServers:       deps.proxyServers,
-		AuthCache:          deps.authCacheInstance,
 		RedirectRateLimit:  serverConfig.GetRedirectRateLimit(),
 		RedirectRateWindow: redirectRateWindow,
 		MaxRedirectHops:    serverConfig.GetMaxRedirectHops(),
 		SieveExtensions:    deps.config.Sieve.EnabledExtensions,
 		SharedMailboxes:    deps.config.SharedMailboxes,
 	}
+	// Set only when the feature is on: a nil pointer stored in an interface field is a
+	// non-nil interface, and the handlers tell "not enabled on this node" by comparing
+	// the interface with nil.
+	if deps.affinityManager != nil {
+		options.AffinityManager = deps.affinityManager
+	}
+	if deps.authCacheInstance != nil {
+		options.AuthCache = deps.authCacheInstance
+	}
+	return options
 }
 
 func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
@@ -2481,7 +2540,8 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		AllowedHosts:                serverConfig.AllowedHosts,
 		Storage:                     deps.storage,
 		Cache:                       deps.cacheInstance,
-		Uploader:                    deps.uploadWorker, // spool reads + pending-upload state for bodies not yet in S3
+		Uploader:                    deps.uploadWorker,                // spool reads + pending-upload state for bodies not yet in S3
+		UploadMaxAttempts:           deps.config.Uploader.MaxAttempts, // pending-upload state on a node without an uploader
 		AuthRateLimit:               authRateLimit,
 		LookupCache:                 serverConfig.LookupCache,
 		TLS:                         serverConfig.TLS,

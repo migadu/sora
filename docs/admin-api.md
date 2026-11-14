@@ -935,6 +935,7 @@ curl -X POST http://localhost:8080/admin/mail/deliver \
 **Notes:**
 - Messages must be valid RFC822 format
 - Sieve filters are applied to delivered messages
+- `503 Service Unavailable` with `Retry-After` means retry later or on another node: the backend is in maintenance, the node has no upload worker (it runs no `imap`, `pop3` or `lmtp` server), or the single recipient failed for a server-side reason (`"transient": true`)
 - Large messages (up to server limits) are supported
 - Supports MIME multipart messages
 
