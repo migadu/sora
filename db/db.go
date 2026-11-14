@@ -638,6 +638,10 @@ func (db *Database) checkHostHealth(ctx context.Context, fm *FailoverManager, ho
 	fm.MarkHostHealthy(host.Host)
 }
 
+// ErrMigrationFailed wraps a NewDatabaseFromConfig error that came from running the
+// schema migrations, after the pools had connected.
+var ErrMigrationFailed = errors.New("database migration failed")
+
 // NewDatabaseFromConfig creates a new database connection with read/write split configuration
 func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig, runMigrations bool) (*Database, error) {
 	if dbConfig.Write == nil {
@@ -700,7 +704,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 		}
 		if err := db.migrate(ctx, migrationTimeout); err != nil {
 			db.Close()
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", ErrMigrationFailed, err)
 		}
 	}
 

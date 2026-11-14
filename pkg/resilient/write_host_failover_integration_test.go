@@ -176,10 +176,10 @@ func TestReconnect_WriteHostDownAtStartupIsAddedLater(t *testing.T) {
 	}
 
 	proxy.up.Store(true)
-	for _, f := range manager.failedReplicas {
+	for _, f := range manager.failedHosts {
 		f.lastAttempt = time.Now().Add(-time.Hour) // skip the reconnect backoff
 	}
-	rd.attemptReconnectFailedReplicas(context.Background())
+	rd.attemptReconnectFailedHosts(context.Background())
 
 	if !hasPoolFor(manager.writePools, proxy.addr) {
 		t.Fatalf("write host %s is reachable again but was never added (write pools: %d)", proxy.addr, len(manager.writePools))
