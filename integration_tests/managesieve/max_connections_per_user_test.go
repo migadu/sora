@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // max_connections_per_user was counted but not enforced on the ManageSieve
@@ -22,10 +24,21 @@ func TestManageSieve_MaxConnectionsPerUserRefusesLogin(t *testing.T) {
 	first.login(account)
 
 	// A second login is refused with a temporary error (RFC 5804 TRYLATER) and
-	// leaves its session not logged in and not counted.
+	// leaves its session not logged in and not counted. Its credentials were
+	// right, so it counts as a successful login attempt, as on the IMAP
+	// backend, and not also as a failed one.
+	success := metrics.AuthenticationAttempts.WithLabelValues("managesieve", "test", "localhost", "success")
+	failure := metrics.AuthenticationAttempts.WithLabelValues("managesieve", "test", "localhost", "failure")
+	successBefore, failureBefore := testutil.ToFloat64(success), testutil.ToFloat64(failure)
 	over := dialProxiedManageSieve(t, addr, ip)
 	if resp := over.tryLogin(account); !strings.HasPrefix(resp, "NO (TRYLATER)") {
 		t.Fatalf("login over max_connections_per_user = %q, want NO (TRYLATER)", resp)
+	}
+	if d := testutil.ToFloat64(success) - successBefore; d != 1 {
+		t.Errorf(`refused login: sora_authentication_attempts_total{result="success"} grew by %v, want 1`, d)
+	}
+	if d := testutil.ToFloat64(failure) - failureBefore; d != 0 {
+		t.Errorf(`refused login: sora_authentication_attempts_total{result="failure"} grew by %v, want 0`, d)
 	}
 	if resp := over.do("LISTSCRIPTS"); !strings.HasPrefix(resp, "NO") {
 		t.Fatalf("LISTSCRIPTS after the refused login = %q, want NO", resp)
