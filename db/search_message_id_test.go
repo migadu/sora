@@ -142,10 +142,10 @@ func TestMessageIDSearchPlan(t *testing.T) {
 	})
 }
 
-// TestMessageIDSearchSQL pins the two shapes of a HEADER Message-ID criterion. A whole ID in
-// angle brackets can only be a substring of the one-ID field if it is that ID, so it is an
-// equality on LOWER(message_id), which idx_messages_message_id serves. Every other term,
-// including one without the brackets, is a substring of the field rebuilt with its brackets.
+// TestMessageIDSearchSQL pins the two shapes of a HEADER Message-ID criterion. Ordinary
+// whole-ID terms retain the indexed equality lookup on LOWER(message_id). Other terms
+// search the normalized ID rebuilt with brackets. Raw-header and domain-literal edge
+// cases remain outside that optimization's semantics; see #529.
 func TestMessageIDSearchSQL(t *testing.T) {
 	var db *Database // the builder never dereferences its receiver
 	const field = `CASE WHEN left(m.message_id, 1) <> '<' THEN '<' || LOWER(m.message_id) || '>' END`

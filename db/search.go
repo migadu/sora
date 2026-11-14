@@ -239,10 +239,11 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			args[param] = lowerValue
 			conditions = append(conditions, substringCond(fmt.Sprintf("LOWER(%ssubject)", datePrefix), "@"+param))
 		case "message-id":
-			// The term is a substring of the field (RFC 9051 §6.4.4), but clients
-			// usually send one whole ID to find one message. That case is the
-			// equality idx_messages_message_id serves; anything else is matched
-			// against the mailbox's rows (message_id is not in the covering index).
+			// Match substrings of the normalized Message-ID. Raw field text and
+			// exact header presence are not retained in message_id (see #529).
+			// Preserve the indexed equality lookup for ordinary whole-ID terms;
+			// other terms read this mailbox's rows, since the covering header
+			// index does not contain message_id.
 			param := nextParam()
 			if id, ok := wholeMessageIDTerm(lowerValue); ok {
 				args[param] = id
@@ -250,7 +251,7 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 				break
 			}
 			args[param] = lowerValue
-			// A message without the header yields NULL; turn it into FALSE before NOT/OR.
+			// Synthetic IDs yield NULL; turn it into FALSE before NOT/OR.
 			conditions = append(conditions, "COALESCE("+substringCond(messageIDFieldExpr(datePrefix+"message_id"), "@"+param)+", FALSE)")
 		case "in-reply-to", "references":
 			// Both headers hold message IDs, which threading clients search with
@@ -670,22 +671,22 @@ func msgIDListExpr(column string) string {
 	return fmt.Sprintf(`'<' || replace(LOWER(NULLIF(%s, '')), ' ', '> <') || '>'`, column)
 }
 
-// messageIDFieldExpr rebuilds the Message-ID header field ("<id>", lowercased) from the
-// message_id column, which stores the msg-id without its angle brackets (go-message's
-// Header.MessageID). A message whose header was absent or unparseable is stored with a
-// synthetic ID that keeps its brackets (InsertMessage, syntheticMessageID): it has no
-// header field to match, so the expression is NULL for it, and an empty term then tests
-// for the header's presence (RFC 9051 §6.4.4). A real msg-id never starts with '<'.
+// messageIDFieldExpr brackets the normalized ID stored by go-message's Header.MessageID.
+// The current ingress parser cannot return an ID beginning with '<'; synthetic IDs
+// retain their brackets (InsertMessage, syntheticMessageID) and yield NULL here.
+// This represents parseable IDs, not raw header presence: CFWS is discarded, and absent,
+// empty or unparseable fields all become synthetic IDs. Those remaining RFC 9051 §6.4.4
+// search limitations are tracked in #529.
 func messageIDFieldExpr(column string) string {
 	return fmt.Sprintf(`CASE WHEN left(%[1]s, 1) <> '<' THEN '<' || LOWER(%[1]s) || '>' END`, column)
 }
 
 // wholeMessageIDTerm reports whether the lowercased term is one whole msg-id in angle
-// brackets, and returns the ID inside them. Such a term is a substring of the field "<id>"
-// only when it is the field: the brackets of a msg-id appear nowhere else in it, except
-// inside a domain literal ("<a@[...]>", RFC 5322 §3.6.4), which is why a term containing
-// '[' or ']' is not taken as whole. The one field it would miss is one whose domain
-// literal itself contains the bracketed term.
+// brackets, and returns the ID inside them. This preserves the existing indexed lookup
+// for ordinary whole-ID terms. A term containing brackets inside a domain literal
+// ("<a@[...]>", RFC 5322 §3.6.4) uses substring matching instead. A bracketed term inside
+// another ID's domain literal still misses on the equality path, as it did before this
+// change; #529 tracks that remaining limitation.
 func wholeMessageIDTerm(term string) (string, bool) {
 	if len(term) < 3 || term[0] != '<' || term[len(term)-1] != '>' {
 		return "", false
