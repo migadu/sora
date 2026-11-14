@@ -398,7 +398,7 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 			crl.limiter.evictOldestIP()
 		}
 		info = &IPFailureInfo{FirstFailure: event.FirstFailure}
-		crl.limiter.ipFailureCounts[event.IP] = info
+		crl.limiter.addIPCounter(event.IP, info)
 	}
 
 	info.FailureCount = max(info.FailureCount, event.FailureCount)
@@ -411,6 +411,7 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 	}
 	if !event.FirstFailure.IsZero() && event.FirstFailure.Before(info.FirstFailure) {
 		info.FirstFailure = event.FirstFailure
+		crl.limiter.ipQueue.fix(info) // a parked counter is ordered by its block instead
 	}
 	if event.Timestamp.After(info.LastFailure) {
 		info.LastFailure = event.Timestamp
@@ -444,7 +445,7 @@ func (crl *ClusterRateLimiter) handleUsernameFailure(event RateLimitEvent) {
 			crl.limiter.evictOldestUsername()
 		}
 		info = &UsernameFailureInfo{FirstFailure: event.Timestamp}
-		crl.limiter.usernameFailureCounts[event.Username] = info
+		crl.limiter.addUsernameCounter(event.Username, info)
 	}
 
 	// Increment failure count (each node broadcasts its local failure).
@@ -487,7 +488,7 @@ func (crl *ClusterRateLimiter) handleUsernameSuccess(event RateLimitEvent) {
 		return
 	}
 
-	delete(crl.limiter.usernameFailureCounts, event.Username)
+	crl.limiter.dropUsernameCounter(event.Username)
 
 	logger.Debug("CLUSTER-LIMITER: Cleared username failures from cluster", "protocol", crl.limiter.protocol,
 		"username", event.Username, "from_node", event.NodeID)

@@ -214,14 +214,15 @@ func TestProxyProtocolConnectionLimitsRealClientIP(t *testing.T) {
 		return
 	}
 
-	// Try to read from third connection - should fail or get connection closed
+	// Read from the third connection: the refusal is answered with a BYE greeting, so
+	// the PROXY peer can tell it from a dead backend (#703)
 	conn3.SetReadDeadline(time.Now().Add(1 * time.Second))
 	n, err = conn3.Read(buffer)
-	if err == nil && n > 0 {
-		t.Fatalf("third connection from the same real client IP was accepted (%s), want max_connections_per_ip = 2 to refuse it", strings.TrimSpace(string(buffer[:n])))
+	if err != nil || !strings.HasPrefix(string(buffer[:n]), "* BYE ") {
+		t.Fatalf("third connection from the same real client IP: %q, %v; want max_connections_per_ip = 2 to refuse it with a BYE greeting", string(buffer[:n]), err)
 	}
 
-	t.Logf("Third connection from same real client IP properly rejected: %v", err)
+	t.Logf("Third connection from same real client IP properly refused: %s", strings.TrimSpace(string(buffer[:n])))
 }
 
 func TestProxyProtocolConnectionLimitsDifferentClientIPs(t *testing.T) {

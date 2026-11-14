@@ -104,6 +104,12 @@ func (l *connectionLimitingListener) Accept() (net.Conn, error) {
 		releaseConn, limitErr := l.limiter.AcceptWithRealIP(conn.RemoteAddr(), realClientIP)
 		if limitErr != nil {
 			logger.Debug("IMAP: Connection rejected", "name", l.name, "error", limitErr)
+			if serverPkg.IsProxiedClientRefusal(limitErr, proxyInfo) {
+				// Answered, not dropped: newSession completes the TLS handshake and
+				// greets with BYE, so the proxy fails this client's login and not
+				// the backend. The connection holds no limiter slot.
+				return &connectionLimitingConn{Conn: conn, proxyInfo: proxyInfo, refusal: limitErr}, nil
+			}
 			conn.Close()
 			continue // Try to accept the next connection
 		}
@@ -145,6 +151,7 @@ type connectionLimitingConn struct {
 	net.Conn
 	releaseFunc func()
 	proxyInfo   *serverPkg.ProxyProtocolInfo
+	refusal     error // non-nil: the limiter refused the client, and newSession answers it
 	closeMu     sync.Mutex
 	closed      bool
 }
@@ -907,7 +914,16 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 		}
 	}
 
-	// Connection limits are handled at the listener level
+	// Connection limits are handled at the listener level, which passes on a refused
+	// client a PROXY peer named so that the refusal is answered here, after the TLS
+	// handshake.
+	if lc, ok := conn.NetConn().(*connectionLimitingConn); ok && lc.refusal != nil {
+		return nil, nil, &imap.Error{
+			Type: imap.StatusResponseTypeBye,
+			Code: imap.ResponseCodeLimit,
+			Text: "Too many connections",
+		}
+	}
 	sessionCtx, sessionCancel := context.WithCancel(s.appCtx)
 
 	// Prometheus metrics - connection established
