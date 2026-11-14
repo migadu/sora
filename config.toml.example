@@ -1908,8 +1908,9 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # 5. If tests fail → circuit re-opens and waits another timeout period
   #
   # IMPORTANT: These count as failures: network errors, timeouts, 5xx, 408, 429, a 2xx other than
-  # 200, and a 200 that is not JSON with address and password_hash. 404, 3xx, 401, 403 and the
-  # other 4xx do NOT count, nor does a 200 whose password_hash sora cannot verify.
+  # 200, and a 200 with invalid JSON or no address. Authentication lookups also require password_hash;
+  # route-only lookups do not. 404, 3xx, 401, 403 and the other 4xx do NOT count, nor does a 200
+  # whose password_hash sora cannot verify.
   #
   # PRODUCTION RECOMMENDATIONS:
   # - timeout: 60s-300s (longer allows more time for service recovery)
