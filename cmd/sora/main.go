@@ -1579,6 +1579,7 @@ func buildLMTPServerOptions(deps *serverDependencies, serverConfig config.Server
 		RedirectRateLimit:       serverConfig.GetRedirectRateLimit(),
 		RedirectRateWindow:      redirectRateWindow,
 		MaxRedirectHops:         serverConfig.GetMaxRedirectHops(),
+		SharedMailboxes:         deps.config.SharedMailboxes,
 		CommandTimeoutOverrides: lmtpCommandTimeoutOverrides,
 	}
 }
