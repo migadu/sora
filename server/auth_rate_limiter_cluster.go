@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cluster"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/server/idgen"
 )
@@ -41,10 +42,13 @@ type RateLimitEvent struct {
 	Timestamp time.Time          `json:"timestamp"`
 	NodeID    string             `json:"node_id"`
 
+	// Protocol is the protocol of the limiter that produced the event; only
+	// limiters of the same protocol apply it.
+	Protocol string `json:"protocol,omitempty"`
+
 	// For BLOCK_IP events
 	BlockedUntil time.Time `json:"blocked_until,omitempty"`
 	FailureCount int       `json:"failure_count,omitempty"`
-	Protocol     string    `json:"protocol,omitempty"`
 	FirstFailure time.Time `json:"first_failure,omitempty"`
 
 	// For FAILURE_COUNT events (progressive delays)
@@ -59,8 +63,14 @@ type ClusterRateLimiter struct {
 	limiter        *AuthRateLimiter
 	clusterManager *cluster.Manager
 
-	// Outgoing gossip
-	queue *gossipQueue
+	// Outgoing gossip. IP blocks and unblocks have a tier of their own that is
+	// drained first: every failed login queues a username failure and, past
+	// the delay threshold, a failure count, and within a transmit tier
+	// memberlist hands out the largest message first, so during an attack -
+	// when a block matters most - username failures for long addresses would
+	// otherwise hold the block off the wire until it went stale.
+	blocks *gossipQueue
+	queue  *gossipQueue
 
 	// Duplicate suppression for received events
 	dedup gossipDedup
@@ -88,6 +98,7 @@ func NewClusterRateLimiter(limiter *AuthRateLimiter, clusterMgr *cluster.Manager
 		clusterManager:    clusterMgr,
 		syncBlocks:        syncBlocks,
 		syncFailureCounts: syncFailureCounts,
+		blocks:            newGossipQueue("rate-limit-blocks:"+limiter.protocol, clusterMgr, maxRateLimitEventQueueSize),
 		queue:             newGossipQueue("rate-limit:"+limiter.protocol, clusterMgr, maxRateLimitEventQueueSize),
 	}
 
@@ -110,8 +121,20 @@ func NewClusterRateLimiter(limiter *AuthRateLimiter, clusterMgr *cluster.Manager
 	return crl
 }
 
+// JoinCluster makes the limiter share its IP blocks, progressive-delay failure
+// counts and username failures with the limiters of the same protocol on the
+// other cluster nodes, as [cluster.rate_limit_sync] configures. It does nothing
+// on a disabled (nil) limiter, without a cluster manager, or with sync disabled.
+// Call it before the limiter records its first attempt.
+func (a *AuthRateLimiter) JoinCluster(clusterMgr *cluster.Manager, sync config.ClusterRateLimitSyncConfig) {
+	if a == nil || clusterMgr == nil || !sync.Enabled {
+		return
+	}
+	a.SetClusterLimiter(NewClusterRateLimiter(a, clusterMgr, sync.SyncBlocks, sync.SyncFailureCounts))
+}
+
 // BroadcastBlockIP broadcasts an IP block event to the cluster
-func (crl *ClusterRateLimiter) BroadcastBlockIP(ip string, blockedUntil time.Time, failureCount int, protocol string, firstFailure time.Time) {
+func (crl *ClusterRateLimiter) BroadcastBlockIP(ip string, blockedUntil time.Time, failureCount int, firstFailure time.Time) {
 	if !crl.syncBlocks {
 		return
 	}
@@ -123,7 +146,6 @@ func (crl *ClusterRateLimiter) BroadcastBlockIP(ip string, blockedUntil time.Tim
 		NodeID:       crl.clusterManager.GetNodeID(),
 		BlockedUntil: blockedUntil,
 		FailureCount: failureCount,
-		Protocol:     protocol,
 		FirstFailure: firstFailure,
 	}
 
@@ -196,6 +218,7 @@ func (crl *ClusterRateLimiter) queueEvent(event RateLimitEvent) {
 	if event.EventID == "" {
 		event.EventID = idgen.New()
 	}
+	event.Protocol = crl.limiter.protocol
 
 	encoded, err := encodeRateLimitEvent(event)
 	if err != nil {
@@ -203,14 +226,21 @@ func (crl *ClusterRateLimiter) queueEvent(event RateLimitEvent) {
 		return
 	}
 
-	crl.queue.enqueue(encoded)
+	switch event.Type {
+	case RateLimitEventBlockIP, RateLimitEventUnblockIP:
+		crl.blocks.enqueue(encoded)
+	default:
+		crl.queue.enqueue(encoded)
+	}
 }
 
 // GetBroadcasts returns events to broadcast (called by cluster manager).
 // memberlist calls this once per gossip target, so an event stays queued until
-// it has been transmitted often enough to have reached the cluster.
+// it has been transmitted often enough to have reached the cluster. Blocks go
+// first, within half of the datagram so a burst of them cannot stall the
+// failure counts behind it.
 func (crl *ClusterRateLimiter) GetBroadcasts(overhead, limit int) [][]byte {
-	return crl.queue.GetBroadcasts(overhead, limit)
+	return drainTiers(nil, crl.blocks, crl.queue, overhead, limit)
 }
 
 // HandleClusterEvent processes a rate limit event from another node
@@ -223,6 +253,14 @@ func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
 
 	// Skip events from this node (we already applied them locally)
 	if event.NodeID == crl.clusterManager.GetNodeID() {
+		return
+	}
+
+	// Every limiter on this node receives every rate-limit event of the cluster.
+	// The limiters of one node are independent of each other - an IMAP failure
+	// does not count against POP3 - so a peer's event belongs only to the limiter
+	// of the protocol that produced it.
+	if event.Protocol != crl.limiter.protocol {
 		return
 	}
 
@@ -326,7 +364,13 @@ func (crl *ClusterRateLimiter) handleUnblockIP(event RateLimitEvent) {
 	logger.Debug("Cluster limiter: Applied cluster unblock", "protocol", crl.limiter.protocol, "ip", event.IP, "from_node", event.NodeID)
 }
 
-// handleFailureCount updates progressive delay tracking from another node
+// handleFailureCount merges progressive delay tracking from another node.
+//
+// Both nodes count failures of the same address, so a peer's count says the
+// address failed at least that often: it raises this node's count and never
+// lowers it. Taking the newest count instead let a peer that had seen fewer
+// failures reset the count of a node close to blocking the address, so an
+// attack spread over two nodes could stay under max_attempts_per_ip on both.
 func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 	if !crl.syncFailureCounts {
 		return
@@ -335,21 +379,31 @@ func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
 	crl.limiter.ipMu.Lock()
 	defer crl.limiter.ipMu.Unlock()
 
-	// Check if we already have more recent failure info for this IP
-	existing, exists := crl.limiter.ipFailureCounts[event.IP]
-	if exists && existing.LastFailure.After(event.Timestamp) {
-		return
+	info, exists := crl.limiter.ipFailureCounts[event.IP]
+	if !exists {
+		// The cap bounds the map however its entries arrive, as in
+		// updateFailureTracking: every node would otherwise hold the union of
+		// the whole cluster's attack traffic for the length of the window.
+		if maxIPs := crl.limiter.config.MaxIPEntries; maxIPs > 0 && len(crl.limiter.ipFailureCounts) >= maxIPs {
+			crl.limiter.evictOldestIP()
+		}
+		info = &IPFailureInfo{FirstFailure: event.FirstFailure}
+		crl.limiter.ipFailureCounts[event.IP] = info
 	}
 
-	// Update failure count
-	crl.limiter.ipFailureCounts[event.IP] = &IPFailureInfo{
-		FailureCount: event.FailureCount,
-		FirstFailure: event.FirstFailure,
-		LastFailure:  event.Timestamp,
-		LastDelay:    event.LastDelay,
+	info.FailureCount = max(info.FailureCount, event.FailureCount)
+	if event.LastDelay > info.LastDelay {
+		info.LastDelay = event.LastDelay
+	}
+	if !event.FirstFailure.IsZero() && event.FirstFailure.Before(info.FirstFailure) {
+		info.FirstFailure = event.FirstFailure
+	}
+	if event.Timestamp.After(info.LastFailure) {
+		info.LastFailure = event.Timestamp
 	}
 
-	logger.Debug("Cluster limiter: Updated failure count", "protocol", crl.limiter.protocol, "ip", event.IP, "from_node", event.NodeID, "failures", event.FailureCount, "delay", event.LastDelay)
+	logger.Debug("Cluster limiter: Merged failure count", "protocol", crl.limiter.protocol, "ip", event.IP, "from_node", event.NodeID,
+		"peer_failures", event.FailureCount, "failures", info.FailureCount, "delay", info.LastDelay)
 }
 
 // handleUsernameFailure applies a username failure from another node
@@ -371,6 +425,10 @@ func (crl *ClusterRateLimiter) handleUsernameFailure(event RateLimitEvent) {
 
 	info, exists := crl.limiter.usernameFailureCounts[event.Username]
 	if !exists {
+		// Bounded however entries arrive, as in updateUsernameFailure.
+		if maxUsernames := crl.limiter.config.MaxUsernameEntries; maxUsernames > 0 && len(crl.limiter.usernameFailureCounts) >= maxUsernames {
+			crl.limiter.evictOldestUsername()
+		}
 		info = &UsernameFailureInfo{FirstFailure: event.Timestamp}
 		crl.limiter.usernameFailureCounts[event.Username] = info
 	}

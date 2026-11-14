@@ -27,6 +27,7 @@ func newTestClusterRateLimiter(t *testing.T) *ClusterRateLimiter {
 
 	return &ClusterRateLimiter{
 		limiter: limiter,
+		blocks:  newGossipQueue("rate-limit-blocks:test", nil, maxRateLimitEventQueueSize),
 		queue:   newGossipQueue("rate-limit:test", nil, maxRateLimitEventQueueSize),
 	}
 }
@@ -45,7 +46,7 @@ func TestClusterRateLimiter_BroadcastQueueSizeLimit(t *testing.T) {
 		})
 	}
 
-	if queued := crl.queue.numQueued(); queued != maxRateLimitEventQueueSize {
+	if queued := crl.blocks.numQueued(); queued != maxRateLimitEventQueueSize {
 		t.Fatalf("Expected queue size %d, got %d", maxRateLimitEventQueueSize, queued)
 	}
 
@@ -56,7 +57,7 @@ func TestClusterRateLimiter_BroadcastQueueSizeLimit(t *testing.T) {
 		NodeID:    "test-node",
 	})
 
-	if queued := crl.queue.numQueued(); queued > maxRateLimitEventQueueSize {
+	if queued := crl.blocks.numQueued(); queued > maxRateLimitEventQueueSize {
 		t.Errorf("Queue size %d exceeded the limit %d", queued, maxRateLimitEventQueueSize)
 	}
 }
@@ -116,7 +117,7 @@ func TestClusterRateLimiter_QueueDoesNotGrowUnbounded(t *testing.T) {
 		})
 	}
 
-	queued := crl.queue.numQueued()
+	queued := crl.blocks.numQueued()
 	if queued > maxRateLimitEventQueueSize {
 		t.Errorf("Queue size %d exceeded limit %d - unbounded growth!", queued, maxRateLimitEventQueueSize)
 	}

@@ -1124,16 +1124,10 @@ func TestErrorScenarios(t *testing.T) {
 		// Try to create same account again
 		resp2, body2 := server.makeRequest(t, "POST", "/admin/accounts", reqBody)
 
-		// The API might return 409 Conflict or 500 Internal Server Error depending on how it handles duplicates
-		if resp2.StatusCode != http.StatusConflict && resp2.StatusCode != http.StatusInternalServerError {
-			t.Errorf("Expected status %d or %d, got %d. Body: %s", http.StatusConflict, http.StatusInternalServerError, resp2.StatusCode, string(body2))
+		if resp2.StatusCode != http.StatusConflict {
+			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusConflict, resp2.StatusCode, string(body2))
 		}
-
-		// Check that it's some kind of error about the account existing or creation failing
-		bodyStr := string(body2)
-		if !strings.Contains(bodyStr, "already exists") && !strings.Contains(bodyStr, "Failed to create") && !strings.Contains(bodyStr, "unique") && !strings.Contains(bodyStr, "duplicate") {
-			t.Errorf("Expected error message about duplicate/existing account, got: %s", bodyStr)
-		}
+		server.expectError(t, body2, "already exists")
 	})
 
 	t.Run("invalid email format", func(t *testing.T) {
@@ -1144,14 +1138,10 @@ func TestErrorScenarios(t *testing.T) {
 
 		resp, body := server.makeRequest(t, "POST", "/admin/accounts", reqBody)
 
-		if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusInternalServerError {
-			t.Errorf("Expected status %d or %d, got %d. Body: %s", http.StatusBadRequest, http.StatusInternalServerError, resp.StatusCode, string(body))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("Expected status %d, got %d. Body: %s", http.StatusBadRequest, resp.StatusCode, string(body))
 		}
-
-		// Should contain some error about invalid email
-		if !strings.Contains(string(body), "error") {
-			t.Errorf("Expected error message, got: %s", string(body))
-		}
+		server.expectError(t, body, "invalid email address")
 	})
 
 	t.Run("delete non-existent account", func(t *testing.T) {

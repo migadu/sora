@@ -71,6 +71,7 @@ func TestGossipBroadcastQueues_DeliverEventToEveryTargetNodeInARound(t *testing.
 
 		crl := &ClusterRateLimiter{
 			limiter: limiter,
+			blocks:  newGossipQueue("rate-limit-blocks:test", nil, maxRateLimitEventQueueSize),
 			queue:   newGossipQueue("rate-limit:test", nil, maxRateLimitEventQueueSize),
 		}
 		crl.queueEvent(RateLimitEvent{

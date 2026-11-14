@@ -76,11 +76,11 @@ This section is for your S3-compatible object storage, where message bodies are 
 These two components work together to provide high-performance mail delivery and access.
 
 *   `[local_cache]`: Configures the local filesystem cache for message bodies.
-    *   `path`: The directory to store cached files. Use a fast disk (SSD) for best performance.
+    *   `path`: The directory to store cached files (default: `/var/cache/sora/cache`). Use a fast disk (SSD) for best performance.
     *   `capacity`: The maximum size of the cache (e.g., `"10gb"`).
     *   `enable_warmup`: If `true`, Sora will proactively fetch recent messages for a user's `INBOX` upon login, making the initial client experience much faster.
 *   `[uploader]`: Configures the background service that moves messages to S3.
-    *   `path`: A temporary staging directory where incoming messages are stored before being uploaded.
+    *   `path`: The staging directory where incoming messages are stored until they are uploaded (default: `/var/spool/sora/uploads`). A staged body is the only copy of its message, so this must be persistent storage, never `/tmp`. Releases before this one defaulted to `/tmp/sora/uploads`; sora refuses to start with the new default while that directory still holds staged bodies.
     *   `instance_id`: The upload lease identity this node writes into `pending_uploads.instance_id` and `instance_heartbeats.instance_id` (default: the host's hostname, which is what earlier releases stamped — upgrades are lease-continuous). A pending upload can only be completed by the instance that staged it, because the message body is a file on that node's local disk, so this value must be unique per sora instance and stable across restarts. It is deliberately independent of `cluster.node_id`: renaming the gossip node must not strand queued uploads. Set it explicitly when running several sora instances on one host, or to pin the identity across a planned hostname change. **Changing the resolved value strands queued uploads** — stop delivery and let `pending_uploads` drain for the old id before restarting under a new one (the cleanup worker warns about any leftover owner by name).
     *   `concurrency`: The number of parallel workers uploading to S3 (default: `20`).
     *   `batch_size`: The number of pending uploads leased per database round trip (default: `10`).

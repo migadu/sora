@@ -443,6 +443,25 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 	}, nil
 }
 
+// CanFileInto reports whether a message for accountID can be filed into the mailbox
+// named name: one of the account's own, or one shared with it with the insert right
+// (RFC 4314 'i'), resolved the way delivery resolves a fileinto target. It is the
+// Sieve mailboxexists test (RFC 5490 §3.1): the mailbox exists "and each allows the
+// user in whose context the Sieve script runs to "deliver" messages into it".
+func CanFileInto(ctx context.Context, rdb *resilient.ResilientDatabase, accountID int64, name string) (bool, error) {
+	mailbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, name)
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if mailbox.AccountID == accountID {
+		return true, nil
+	}
+	return rdb.CheckMailboxPermissionWithRetry(ctx, mailbox.ID, accountID, db.ACLRightInsert)
+}
+
 // createMissingMailbox carries out a Sieve fileinto :create (RFC 5490 §3.2): it
 // creates the recipient's mailbox named name "if needed". A mailbox the recipient
 // already has by that name, its own or one shared with it, is used as it is ("If the

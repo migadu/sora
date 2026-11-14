@@ -71,6 +71,9 @@
 //   - Open: Too many failures, reject immediately
 //   - Half-open: Testing recovery
 //
+// Only the database failing counts against them (see isDatabaseFailure): an error the
+// database answered with, such as a rejected request, is a success.
+//
 // # Transient Error Detection
 //
 // The package automatically detects and retries transient errors:
@@ -86,6 +89,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -104,7 +108,6 @@ import (
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/retry"
-	"github.com/migadu/sora/server"
 )
 
 // DatabasePool represents a single database connection pool with health tracking
@@ -198,76 +201,72 @@ func (rd *ResilientDatabase) SetAuthCache(cache authCacheInterface) {
 	rd.authCache = cache
 }
 
-// isQuerySuccessful reports whether a database query error should be treated as a
-// success by the query circuit breaker — i.e. it is an expected application/protocol
-// outcome rather than a database system failure. Extracted as a named function so the
-// classification is unit-testable.
-func isQuerySuccessful(err error) bool {
+// isDatabaseFailure reports whether err shows the database failing: unreachable or
+// dropping the connection, timing out, out of resources, shutting down, or reporting an
+// internal error. Only these count against the circuit breakers. Anything else is an
+// answer from a working database or a decision made without it — a not-found, a
+// constraint violation, a rejected request, an *imap.Error from a stream callback — and
+// counting it would let a few bad requests (say, deleting a primary credential three
+// times) open the write breaker and refuse every write on the node, deliveries
+// included. The rule goes by the kind of error rather than an allowlist of application
+// errors, so a new rejection cannot trip a breaker by being left off a list.
+func isDatabaseFailure(err error) bool {
 	if err == nil {
+		return false
+	}
+	// The breaker refusing a request: the database is considered unavailable.
+	if errors.Is(err, circuitbreaker.ErrCircuitBreakerOpen) || errors.Is(err, circuitbreaker.ErrTooManyRequests) {
 		return true
 	}
-	// An *imap.Error returned through a streaming callback (e.g. a FETCH whose body is
-	// temporarily unavailable from S3) is an IMAP protocol/application outcome, not a
-	// database system failure — the underlying query already succeeded. Don't let it trip
-	// the DB breaker, which would escalate an S3 outage into a DB-read outage.
-	var imapErr *imap.Error
-	if errors.As(err, &imapErr) {
+	// The caller giving up (client gone, shutdown) says nothing about the database.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var connectErr *pgconn.ConnectError
+	if errors.As(err, &connectErr) {
 		return true
 	}
-	// Business logic errors that should NOT trip the circuit breaker.
-	if errors.Is(err, db.ErrSearchTooManyResults) ||
-		errors.Is(err, consts.ErrUserNotFound) ||
-		errors.Is(err, consts.ErrMailboxNotFound) ||
-		errors.Is(err, consts.ErrMailboxHasChildren) ||
-		errors.Is(err, consts.ErrMessageNotAvailable) ||
-		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
-		errors.Is(err, consts.ErrAccountAlreadyExists) ||
-		errors.Is(err, consts.ErrNotPermitted) ||
-		errors.Is(err, consts.ErrDBNotFound) ||
-		errors.Is(err, consts.ErrMessageExists) ||
-		errors.Is(err, server.ErrInvalidAddress) ||
-		errors.Is(err, pgx.ErrNoRows) {
-		return true
-	}
-	return false // Actual system failure
-}
-
-// isWriteSuccessful is the write-breaker counterpart of isQuerySuccessful. In addition to
-// the query cases it tolerates unique-constraint violations and self-resolving transient
-// PostgreSQL errors (deadlock / serialization failure), which are retried.
-func isWriteSuccessful(err error) bool {
-	if err == nil {
-		return true
-	}
-	var imapErr *imap.Error
-	if errors.As(err, &imapErr) {
-		return true
-	}
-	if errors.Is(err, consts.ErrUserNotFound) ||
-		errors.Is(err, consts.ErrMailboxNotFound) ||
-		errors.Is(err, consts.ErrMailboxHasChildren) ||
-		errors.Is(err, consts.ErrMessageNotAvailable) ||
-		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
-		errors.Is(err, consts.ErrAccountAlreadyExists) ||
-		errors.Is(err, consts.ErrNotPermitted) ||
-		errors.Is(err, consts.ErrDBNotFound) ||
-		errors.Is(err, consts.ErrDBUniqueViolation) ||
-		errors.Is(err, consts.ErrMessageExists) ||
-		errors.Is(err, server.ErrInvalidAddress) ||
-		errors.Is(err, pgx.ErrNoRows) {
-		return true
-	}
-	// Transient PostgreSQL errors (deadlock, serialization failure) are retried and should
-	// not count as circuit breaker failures — they are self-resolving.
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		switch pgErr.Code {
-		case "40P01", // deadlock detected
-			"40001": // serialization failure
-			return true
-		}
+		return isDatabaseFailureSQLState(pgErr.Code)
 	}
-	return false // Actual system failure
+	// The connection broke or timed out (pgx wraps the net/io error it read).
+	var netErr net.Error
+	return errors.As(err, &netErr) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, pgconn.ErrConnClosed) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// isDatabaseFailureSQLState reports whether a PostgreSQL error code is the server failing
+// rather than refusing the statement (PostgreSQL documentation, Appendix A "PostgreSQL
+// Error Codes"). Data exceptions (22), integrity constraint violations (23), syntax or
+// access rule violations (42), transaction rollbacks such as deadlocks (40) and the rest
+// are answers to the statement.
+func isDatabaseFailureSQLState(code string) bool {
+	switch code {
+	case "25006", // read_only_sql_transaction: the write pool reached a standby after a failover
+		"55P03": // lock_not_available: lock_timeout elapsed waiting for a row lock
+		return true
+	}
+	if len(code) != 5 {
+		return false
+	}
+	switch code[:2] {
+	case "08", // Connection Exception (PgBouncer reports its own failures as 08P01)
+		"53", // Insufficient Resources: disk full, out of memory, too many connections
+		"57", // Operator Intervention: shutdown, cannot connect now, statement_timeout
+		"58", // System Error (errors external to PostgreSQL itself)
+		"XX": // Internal Error
+		return true
+	}
+	return false
+}
+
+// isBreakerSuccess is the IsSuccessful predicate of both database circuit breakers.
+func isBreakerSuccess(err error) bool {
+	return !isDatabaseFailure(err)
 }
 
 func NewResilientDatabase(ctx context.Context, config *config.DatabaseConfig, enableHealthCheck bool, runMigrations bool) (*ResilientDatabase, error) {
@@ -313,9 +312,7 @@ func NewResilientDatabaseWithOptions(ctx context.Context, config *config.Databas
 	querySettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("Database query circuit breaker state changed", "component", "RESILIENT-FAILOVER", "name", name, "from", from, "to", to)
 	}
-	// Configure IsSuccessful to treat business logic errors as successes
-	// Only system errors (connection failures, timeouts, etc.) should count as failures
-	querySettings.IsSuccessful = isQuerySuccessful
+	querySettings.IsSuccessful = isBreakerSuccess
 
 	writeSettings := circuitbreaker.DefaultSettings("database_write")
 	writeSettings.MaxRequests = 10 // Allow more test requests in half-open state for faster recovery
@@ -347,9 +344,7 @@ func NewResilientDatabaseWithOptions(ctx context.Context, config *config.Databas
 	writeSettings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Info("Database write circuit breaker state changed", "component", "RESILIENT-FAILOVER", "name", name, "from", from, "to", to)
 	}
-	// Configure IsSuccessful to treat business logic errors as successes
-	// Only system errors (connection failures, timeouts, etc.) should count as failures
-	writeSettings.IsSuccessful = isWriteSuccessful
+	writeSettings.IsSuccessful = isBreakerSuccess
 
 	// Create failover manager
 	failoverManager, err := newRuntimeFailoverManager(ctx, config, runMigrations, skipReadReplicas)
@@ -529,26 +524,13 @@ func (rd *ResilientDatabase) isRetryableError(err error) bool {
 	return false
 }
 
-// isBusinessLogicError checks if an error is a business logic error that should not
-// be logged at WARN level (e.g., user not found, already exists, etc.)
-func (rd *ResilientDatabase) isBusinessLogicError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Check against all business logic errors that are treated as success by circuit breaker
-	return errors.Is(err, consts.ErrUserNotFound) ||
-		errors.Is(err, consts.ErrMailboxNotFound) ||
-		errors.Is(err, consts.ErrMailboxHasChildren) ||
-		errors.Is(err, consts.ErrMessageNotAvailable) ||
-		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
-		errors.Is(err, consts.ErrAccountAlreadyExists) ||
-		errors.Is(err, consts.ErrNotPermitted) ||
-		errors.Is(err, consts.ErrDBNotFound) ||
-		errors.Is(err, consts.ErrDBUniqueViolation) ||
-		errors.Is(err, consts.ErrMessageExists) ||
-		errors.Is(err, server.ErrInvalidAddress) ||
-		errors.Is(err, pgx.ErrNoRows)
+// logsWriteErrorAtWarn reports whether an error from a write through the breaker is
+// logged at WARN: a retryable error (a deadlock or serialization failure, which is retried
+// and does not count against the breaker, or a connection timeout), or the database
+// failing while the breaker is not CLOSED. Anything else, such as a rejected request or a
+// not-found, is logged at DEBUG.
+func (rd *ResilientDatabase) logsWriteErrorAtWarn(err error, state circuitbreaker.State) bool {
+	return rd.isRetryableError(err) || (isDatabaseFailure(err) && state != circuitbreaker.StateClosed)
 }
 
 func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
@@ -714,9 +696,7 @@ func (rd *ResilientDatabase) BeginTxWithRetry(ctx context.Context, txOptions pgx
 			state := rd.writeBreaker.State()
 			counts := rd.writeBreaker.Counts()
 
-			// Log at WARN only for system failures or when breaker is not CLOSED
-			// Business logic errors log at DEBUG to reduce noise
-			if !rd.isBusinessLogicError(cbErr) && (rd.isRetryableError(cbErr) || state != circuitbreaker.StateClosed) {
+			if rd.logsWriteErrorAtWarn(cbErr, state) {
 				logger.Warn("Write operation failed through circuit breaker", "component", "RESILIENT-FAILOVER",
 					"error", cbErr, "breaker_state", state, "total_failures", counts.TotalFailures,
 					"total_requests", counts.Requests, "consecutive_failures", counts.ConsecutiveFailures)

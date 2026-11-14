@@ -162,9 +162,12 @@ type Result struct {
 // for this sender and response identity already checked.
 type VacationReply struct {
 	From    string // the :from address; delivery uses it only if the account owns it
-	Subject string
+	Subject string // the :subject, or "Auto: " and the original subject (RFC 5230 §5.3)
 	Body    string // the reason
 	IsMime  bool
+	// Addresses is the :addresses list: addresses of the recipient besides the
+	// account's own, for the personal message check (RFC 5230 §4.5).
+	Addresses []string
 
 	// ClaimResponse atomically consumes the :days window for this sender and
 	// response identity. It is nil without a VacationOracle. Delivery calls it
@@ -187,6 +190,11 @@ type Context struct {
 	// size test (RFC 5228 §5.9) measures the whole message, so this must not be the
 	// extracted search text. It is never empty: a delivery has at least a header.
 	Message []byte
+	// MailboxExists answers the mailbox extension's mailboxexists test (RFC 5490
+	// §3.1) for the user the script runs for: the mailbox exists and a fileinto
+	// may deliver into it. nil takes every mailbox to exist, for an evaluation that
+	// has no mailstore behind it.
+	MailboxExists func(ctx context.Context, mailbox string) (bool, error)
 }
 
 // VacationOracle defines the methods SievePolicy needs to interact with
@@ -331,6 +339,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		redirectRateWindow: e.policy.redirectRateWindow,
 		maxRedirectHops:    e.policy.maxRedirectHops,
 		vacationResponses:  make(map[string]time.Time),
+		mailboxExists:      ctx.MailboxExists,
 	}
 
 	// Limit execution time of the Sieve script to prevent CPU/resource exhaustion
@@ -427,6 +436,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 			Subject:       vacation.Subject,
 			Body:          vacation.Body,
 			IsMime:        vacation.IsMime,
+			Addresses:     vacation.Addresses,
 			ClaimResponse: execPolicy.vacationClaimer(sender, vacation.ResponseIdentity, duration),
 		}
 		break
@@ -470,6 +480,18 @@ type SievePolicy struct {
 	// redirect through to. They count against the rate limit as they
 	// accumulate, though nothing is recorded until delivery relays them.
 	redirectsAllowed []string
+
+	mailboxExists func(ctx context.Context, mailbox string) (bool, error) // Context.MailboxExists
+}
+
+// MailboxExists implements go-sieve's MailboxChecker, the mailboxexists test (RFC
+// 5490 §3.1), through Context.MailboxExists. Without a policy implementing it the
+// interpreter takes every mailbox to exist.
+func (p *SievePolicy) MailboxExists(ctx context.Context, mailbox string) (bool, error) {
+	if p.mailboxExists == nil {
+		return true, nil
+	}
+	return p.mailboxExists(ctx, mailbox)
 }
 
 func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData, addr string) (bool, error) {

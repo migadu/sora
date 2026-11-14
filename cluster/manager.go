@@ -8,7 +8,11 @@ import (
 	"encoding/base64"
 	"encoding/gob"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -267,7 +271,7 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	mlConfig.Delegate = m.delegate
 
 	// Warn if both addr contains port AND port field is set (port field will be ignored)
-	if cfg.Addr != "" && strings.Contains(cfg.Addr, ":") && cfg.Port > 0 {
+	if _, _, err := net.SplitHostPort(cfg.Addr); err == nil && cfg.Port > 0 {
 		logger.Warn("Cluster configuration: 'addr' contains port and 'port' field is also set", "addr", cfg.Addr, "port", cfg.Port)
 		logger.Warn("The port from 'addr' will be used - 'port' field will be ignored", "addr_port", bindPort, "port_field", cfg.Port)
 		logger.Warn("To avoid confusion, remove either the port from 'addr' or remove the 'port' field")
@@ -298,8 +302,8 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	logger.Info("Memberlist config", "name", mlConfig.Name, "bind_addr", mlConfig.BindAddr, "bind_port", mlConfig.BindPort, "advertise_addr", mlConfig.AdvertiseAddr, "advertise_port", mlConfig.AdvertisePort, "gossip_interval", mlConfig.GossipInterval, "gossip_nodes", mlConfig.GossipNodes)
 	logger.Info("Cluster delegate attached to memberlist config", "delegate", fmt.Sprintf("%p", mlConfig.Delegate))
 
-	// Enable more verbose memberlist logging to debug gossip
-	mlConfig.LogOutput = &memberlistLogger{prefix: "[Memberlist] "}
+	// Forward memberlist's own log lines at their level
+	mlConfig.LogOutput = &memberlistLogger{prefix: "Cluster: "}
 
 	// Set up encryption if secret key is provided
 	if cfg.SecretKey != "" {
@@ -338,39 +342,23 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	m.memberlist = ml
 	logger.Info("Memberlist created successfully", "instance", fmt.Sprintf("%p", ml))
 
-	// Filter out self-references from peers list
-	// A node should never list itself in the peers array as this causes gossip issues
-	logger.Info("Filtering peers", "node_id", nodeID, "configured_peers", cfg.Peers)
-	filteredPeers := make([]string, 0, len(cfg.Peers))
-	selfReferenceFound := false
-	for _, peer := range cfg.Peers {
-		logger.Info("Checking peer against nodeID", "peer", peer, "node_id", nodeID)
-		if peer == nodeID {
-			selfReferenceFound = true
-			logger.Warn("Cluster configuration: node_id found in peers list - ignoring self-reference", "node_id", nodeID)
-			logger.Warn("The peers list should only contain OTHER nodes in the cluster, not this node itself")
-		} else {
-			logger.Info("Peer accepted (not self)", "peer", peer)
-			filteredPeers = append(filteredPeers, peer)
-		}
+	// A peers list shared by every node names this node too. Joining ourselves is
+	// pointless, and the entry would count as a peer that is never a member.
+	self := ml.LocalNode()
+	selfAddr := net.JoinHostPort(self.Addr.String(), strconv.Itoa(int(self.Port)))
+	peers, own := m.excludeOwnAddress(cfg.Peers, self.Addr, int(self.Port), mlConfig.BindPort)
+	if len(own) > 0 {
+		logger.Warn("Cluster configuration: peers lists this node's own address - ignoring it", "addr", selfAddr, "entries", own)
 	}
-	logger.Info("Peer filtering complete", "count", len(filteredPeers), "peers", filteredPeers)
 
 	// Join cluster if peers are specified (after filtering)
-	if len(filteredPeers) > 0 {
-		logger.Info("Attempting to join cluster with peers", "peers", filteredPeers)
-		n, err := ml.Join(filteredPeers)
+	if len(peers) > 0 {
+		logger.Info("Attempting to join cluster with peers", "peers", peers)
+		n, err := ml.Join(peers)
 		if err != nil {
-			logger.Warn("Failed to join cluster peers (will retry in background)", "peers", filteredPeers, "error", err)
+			logger.Warn("Failed to join cluster peers (will retry in background)", "peers", peers, "error", err)
 		} else {
-			logger.Info("Join returned - contacted peers", "count", n, "peers", filteredPeers)
-			// Check actual member count after join
-			actualMembers := ml.NumMembers()
-			logger.Info("Cluster members after join (expected 2+)", "members", actualMembers)
-			if actualMembers < 2 {
-				logger.Warn("Join succeeded but cluster only has few members - peer may have rejected us", "members", actualMembers)
-				logger.Warn("Common causes: encryption key mismatch, network issues, or peer not running")
-			}
+			logger.Info("Join returned - contacted peers", "count", n, "members", ml.NumMembers())
 		}
 	} else {
 		logger.Warn("No peers to join - running as standalone single-node cluster")
@@ -379,54 +367,187 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	// Start leader election loop
 	go m.leaderElectionLoop()
 
-	// Start retry loop for cluster membership
-	if len(filteredPeers) > 0 {
-		go m.joinRetryLoop(filteredPeers)
+	// Keep the configured peers in the cluster for the life of the process
+	if len(peers) > 0 {
+		go m.rejoinLoop(peers, mlConfig.BindPort, rejoinInterval)
 	}
 
-	if selfReferenceFound {
-		logger.Info("Cluster manager started", "node_id", nodeID, "addr", cfg.Addr, "original_peers", cfg.Peers, "filtered_peers", filteredPeers)
-	} else {
-		logger.Info("Cluster manager started", "node_id", nodeID, "addr", cfg.Addr, "peers", filteredPeers)
-	}
+	logger.Info("Cluster manager started", "node_id", nodeID, "addr", selfAddr, "peers", peers)
 
 	return m, nil
 }
 
-// joinRetryLoop periodically retries joining the cluster if we haven't joined all peers
-func (m *Manager) joinRetryLoop(peers []string) {
-	ticker := time.NewTicker(10 * time.Second)
+// rejoinInterval is how often configured peers that are not members are joined
+// again. A variable so that tests can shorten it; New reads it once.
+var rejoinInterval = 10 * time.Second
+
+// rejoinLoop joins the configured peers that are not members, for as long as the
+// manager runs. memberlist never contacts a node again once it has marked it dead
+// or left: probes and push/pull skip it, and gossip stops once
+// GossipToTheDeadTime has passed. The two sides of a partition that outlasts
+// that, or a peer that restarted knowing nobody, would otherwise stay apart until
+// one of them restarts.
+func (m *Manager) rejoinLoop(peers []string, defaultPort int, interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	expectedMembers := len(peers) + 1 // peers + ourselves
-
+	// What the previous round reported, so that a peer that stays away is
+	// reported when it goes and when it comes back, not every interval.
+	reported := ""
+	// The addresses each peer resolved to last time: a peer that is a member
+	// there is not looked up again, so a healthy cluster makes no DNS queries.
+	resolved := make(map[string][]netip.AddrPort, len(peers))
 	for {
 		select {
 		case <-m.ctx.Done():
-			logger.Info("Cluster join retry loop stopping")
 			return
 		case <-ticker.C:
-			currentMembers := m.memberlist.NumMembers()
-			if currentMembers < expectedMembers {
-				logger.Info("Cluster: Retry join - attempting to rejoin", "current", currentMembers, "expected", expectedMembers, "peers", peers)
-				n, err := m.memberlist.Join(peers)
-				if err != nil {
-					logger.Warn("Cluster: Retry join failed", "peers", peers, "error", err)
-				} else {
-					newMembers := m.memberlist.NumMembers()
-					logger.Info("Cluster: Retry join contacted peers", "contacted", n, "members", newMembers)
-					if newMembers >= expectedMembers {
-						logger.Info("Cluster: Successfully joined all peers - stopping retry loop")
-						return
-					}
-				}
+		}
+
+		var joined, unreachable, unresolved, elsewhere []string
+		var joinErr error
+		members := m.memberAddrs()
+		isMember := func(a netip.AddrPort) bool { return members[a] }
+		for _, peer := range peers {
+			if slices.ContainsFunc(resolved[peer], isMember) {
+				continue
+			}
+			addrs := m.resolvePeer(peer, defaultPort)
+			resolved[peer] = addrs
+			if len(addrs) == 0 {
+				unresolved = append(unresolved, peer)
+				continue
+			}
+			if slices.ContainsFunc(addrs, isMember) {
+				continue
+			}
+			// Join the addresses resolved here rather than the entry: memberlist
+			// would resolve it again, and log a warning every round for a name
+			// that does not resolve.
+			if _, err := m.memberlist.Join(joinAddrs(peer, addrs)); err != nil {
+				unreachable = append(unreachable, peer)
+				joinErr = err
+				continue
+			}
+			members = m.memberAddrs()
+			if slices.ContainsFunc(addrs, isMember) {
+				joined = append(joined, peer)
 			} else {
-				// We have all expected members, stop retrying
-				logger.Debug("Cluster: Join retry - cluster complete", "current", currentMembers, "expected", expectedMembers)
-				return
+				// It answered, but no member advertises the address it was
+				// reached on, so it is joined again (a full state exchange)
+				// every round.
+				elsewhere = append(elsewhere, peer)
 			}
 		}
+
+		if len(joined) > 0 {
+			logger.Info("Cluster: Rejoined configured peers", "peers", joined, "members", m.memberlist.NumMembers())
+		}
+
+		key := ""
+		if len(unreachable)+len(unresolved)+len(elsewhere) > 0 {
+			key = fmt.Sprint(unreachable, unresolved, elsewhere)
+		}
+		if key == reported {
+			continue
+		}
+		reported = key
+		if key == "" {
+			logger.Info("Cluster: All configured peers are members")
+			continue
+		}
+		if len(unreachable)+len(unresolved) > 0 {
+			args := []any{"unreachable", unreachable, "unresolved", unresolved, "every", interval}
+			if joinErr != nil {
+				args = append(args, "error", joinErr)
+			}
+			logger.Warn("Cluster: Configured peers are not members and could not be joined - retrying", args...)
+		}
+		if len(elsewhere) > 0 {
+			logger.Warn("Cluster: Configured peers answer on an address no member advertises - list each node's cluster addr in peers; until then they are joined again", "peers", elsewhere, "every", interval)
+		}
 	}
+}
+
+// memberAddrs returns the addresses the current members (alive or suspect, this
+// node included) advertise
+func (m *Manager) memberAddrs() map[netip.AddrPort]bool {
+	members := make(map[netip.AddrPort]bool)
+	for _, n := range m.memberlist.Members() {
+		if addr, ok := netip.AddrFromSlice(n.Addr); ok {
+			members[netip.AddrPortFrom(addr.Unmap(), n.Port)] = true
+		}
+	}
+	return members
+}
+
+// joinAddrs spells the resolved addresses of a peers entry for memberlist's Join,
+// keeping the entry's "name/" prefix
+func joinAddrs(peer string, addrs []netip.AddrPort) []string {
+	name := ""
+	if i := strings.Index(peer, "/"); i >= 0 {
+		name = peer[:i+1]
+	}
+	targets := make([]string, len(addrs))
+	for i, a := range addrs {
+		targets[i] = name + a.String()
+	}
+	return targets
+}
+
+// excludeOwnAddress splits the configured peers into the ones that name other
+// nodes and the ones that name only this node. An entry that stands for this
+// node and others as well (one DNS name for the whole cluster, or localhost on a
+// dual-stack host) is how this node finds the others, so it is kept.
+func (m *Manager) excludeOwnAddress(peers []string, selfIP net.IP, selfPort, defaultPort int) (others, own []string) {
+	addr, _ := netip.AddrFromSlice(selfIP)
+	self := netip.AddrPortFrom(addr.Unmap(), uint16(selfPort))
+	notSelf := func(a netip.AddrPort) bool { return a != self }
+
+	for _, peer := range peers {
+		if addrs := m.resolvePeer(peer, defaultPort); len(addrs) > 0 && !slices.ContainsFunc(addrs, notSelf) {
+			own = append(own, peer)
+		} else {
+			others = append(others, peer)
+		}
+	}
+	return others, own
+}
+
+// resolvePeer returns the addresses a peers entry stands for, read the way
+// memberlist's Join reads it: an optional "name/" prefix, a host name or IPv4 or
+// IPv6 address, and an optional port that defaults to the gossip bind port. A
+// name that does not resolve stands for nothing.
+func (m *Manager) resolvePeer(peer string, defaultPort int) []netip.AddrPort {
+	if i := strings.Index(peer, "/"); i >= 0 {
+		peer = peer[i+1:]
+	}
+
+	host, portStr, err := net.SplitHostPort(peer)
+	if err != nil {
+		host, portStr = strings.TrimSuffix(strings.TrimPrefix(peer, "["), "]"), strconv.Itoa(defaultPort)
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return nil
+	}
+
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return []netip.AddrPort{netip.AddrPortFrom(addr.Unmap(), uint16(port))}
+	}
+
+	ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		logger.Debug("Cluster: Could not resolve peer", "peer", peer, "error", err)
+		return nil
+	}
+	resolved := make([]netip.AddrPort, len(addrs))
+	for i, a := range addrs {
+		resolved[i] = netip.AddrPortFrom(a.Unmap(), uint16(port))
+	}
+	return resolved
 }
 
 // leaderElectionLoop continuously monitors cluster membership and determines leader
@@ -945,19 +1066,38 @@ type MemberInfo struct {
 	Port uint16
 }
 
-// memberlistLogger adapts memberlist's log output to our logger
+// memberlistLogger forwards memberlist's log output at the level memberlist gave
+// each line. memberlist writes "<date> <time> [LEVEL] memberlist: <message>"
+// through a standard logger: failed probes and push/pull, packets it cannot
+// decrypt (a node with another secret_key) and nodes it marks failed all arrive
+// this way.
 type memberlistLogger struct {
 	prefix string
 }
 
+// memberlistLevels maps memberlist's level tags to the logger's functions
+var memberlistLevels = []struct {
+	tag string
+	log func(msg string, args ...any)
+}{
+	{"[ERR] ", logger.Error},
+	{"[ERROR] ", logger.Error},
+	{"[WARN] ", logger.Warn},
+	{"[INFO] ", logger.Info},
+	{"[DEBUG] ", logger.Debug},
+}
+
 func (m *memberlistLogger) Write(p []byte) (n int, err error) {
-	msg := string(p)
-	// Memberlist logs are very verbose, only log important ones
-	if bytes.Contains(p, []byte("broadcasting")) ||
-		bytes.Contains(p, []byte("GetBroadcasts")) ||
-		bytes.Contains(p, []byte("gossip")) {
-		logger.Debug("Cluster", "prefix", m.prefix, "msg", msg)
+	line := strings.TrimSpace(string(p))
+	if i := strings.IndexByte(line, '['); i >= 0 {
+		for _, level := range memberlistLevels {
+			if msg, ok := strings.CutPrefix(line[i:], level.tag); ok {
+				level.log(m.prefix + msg)
+				return len(p), nil
+			}
+		}
 	}
+	logger.Info(m.prefix + line)
 	return len(p), nil
 }
 

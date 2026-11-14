@@ -125,6 +125,7 @@ func TestUsernameSuccessTombstonesAreBounded(t *testing.T) {
 			Username:  fmt.Sprintf("user%d@example.com", i),
 			Timestamp: time.Now(),
 			NodeID:    "node-b",
+			Protocol:  "test",
 		})
 		if err != nil {
 			t.Fatalf("encode: %v", err)

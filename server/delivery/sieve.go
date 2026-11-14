@@ -165,6 +165,9 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		EnvelopeTo:   recipient.ToAddress.FullAddress(),
 		Header:       messageEntity.Header.Map(),
 		Message:      fullMessageBytes,
+		MailboxExists: func(ctx context.Context, mailbox string) (bool, error) {
+			return CanFileInto(ctx, s.DeliveryCtx.RDB, recipient.AccountID, mailbox)
+		},
 	}
 
 	// The built-in default script runs first, as on LMTP, and the user's script then
