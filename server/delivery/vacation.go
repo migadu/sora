@@ -79,12 +79,16 @@ func (h *StandardVacationHandler) recipientIsAddressed(ctx context.Context, acco
 			}
 		}
 	}
+	// The :addresses are a string comparison; try them all before any recipient
+	// costs an ownership query.
 	for _, a := range recipients {
 		for _, own := range scriptAddresses {
 			if strings.EqualFold(strings.TrimSpace(own), a.Address) {
 				return true, nil
 			}
 		}
+	}
+	for _, a := range recipients {
 		// Check the address as written and its base form (without +detail). Credentials
 		// are stored without plus-addressing detail, and a plus-addressed or aliased
 		// recipient is still a personal recipient — so jane+tag@ must not be suppressed.

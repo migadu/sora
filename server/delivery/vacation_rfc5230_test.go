@@ -164,3 +164,31 @@ func TestVacationPersonalMessageEveryFieldOccurrence(t *testing.T) {
 		t.Errorf("the owner in the second Resent-To makes the message personal: expected 1 reply, got %d", len(rq.calls))
 	}
 }
+
+// TestVacationScriptAddressesNeedNoOwnershipLookup: an :addresses match is a string
+// comparison, so it is found before any recipient costs a credentials query.
+func TestVacationScriptAddressesNeedNoOwnershipLookup(t *testing.T) {
+	lookups := 0
+	owns := func(_ context.Context, _ int64, _ string) (bool, error) {
+		lookups++
+		return false, nil
+	}
+	original := makeMessage(map[string]string{
+		"From":    "bob@example.org",
+		"To":      "a@example.org, b@example.org, c+tag@example.org",
+		"Cc":      "jane@example.net",
+		"Subject": "Hello",
+	})
+	rq := &captureRelayQueue{}
+	h := &StandardVacationHandler{Hostname: "mail.example.com", RelayQueue: rq, IsOwnedAddress: owns}
+	reply := sieveengine.VacationReply{Body: "I am away.", Addresses: []string{"jane@example.net"}}
+	if err := h.HandleVacationResponse(context.Background(), 1, reply, vacAddr(t, "bob@example.org"), vacAddr(t, "jane@example.com"), original); err != nil {
+		t.Fatalf("HandleVacationResponse: %v", err)
+	}
+	if len(rq.calls) != 1 {
+		t.Fatalf("expected 1 reply, got %d", len(rq.calls))
+	}
+	if lookups != 0 {
+		t.Errorf("ownership lookups = %d, want 0: the :addresses match needs none", lookups)
+	}
+}
