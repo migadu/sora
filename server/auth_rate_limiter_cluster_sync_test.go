@@ -128,3 +128,42 @@ func TestClusterBlockIsNotStarvedByFailureEvents(t *testing.T) {
 	}
 	t.Error("the first datagram carried username failures and left the IP block queued behind them")
 }
+
+// TestLoginWithoutFailuresSendsNoGossip: username failures are statistics only
+// and a peer holds them only for a username some node reported, so a successful
+// login with nothing to clear has nothing to tell the cluster. Broadcasting it
+// anyway cost one gossip event per login, the most frequent event a proxy sees.
+func TestLoginWithoutFailuresSendsNoGossip(t *testing.T) {
+	crl := newTestClusterRateLimiter(t)
+	crl.limiter.SetClusterLimiter(crl)
+
+	ctx := context.Background()
+	client := &StringAddr{Addr: "192.0.2.50:40000"}
+
+	crl.limiter.RecordAuthAttempt(ctx, client, "anna@example.com", true)
+	if types := queuedRateLimitEventTypes(t, crl); len(types) != 0 {
+		t.Errorf("a login with no failures to clear queued %v", types)
+	}
+
+	// Failures this node saw are cleared on the peers.
+	crl.limiter.RecordAuthAttempt(ctx, client, "bob@example.com", false)
+	queuedRateLimitEventTypes(t, crl)
+	crl.limiter.RecordAuthAttempt(ctx, client, "bob@example.com", true)
+	if types := queuedRateLimitEventTypes(t, crl); len(types) != 1 || types[0] != RateLimitEventUsernameSuccess {
+		t.Errorf("a login after a local failure queued %v, want one %s", types, RateLimitEventUsernameSuccess)
+	}
+
+	// So are failures a peer reported.
+	deliverRateLimitEvent(t, crl, RateLimitEvent{
+		Type:      RateLimitEventUsernameFailure,
+		EventID:   "peer-username-failure",
+		Username:  "carol@example.com",
+		Timestamp: time.Now().Add(-time.Second),
+		NodeID:    "node-b",
+		Protocol:  crl.limiter.protocol,
+	})
+	crl.limiter.RecordAuthAttempt(ctx, client, "carol@example.com", true)
+	if types := queuedRateLimitEventTypes(t, crl); len(types) != 1 || types[0] != RateLimitEventUsernameSuccess {
+		t.Errorf("a login after a peer's failure queued %v, want one %s", types, RateLimitEventUsernameSuccess)
+	}
+}
