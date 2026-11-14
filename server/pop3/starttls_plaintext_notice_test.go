@@ -60,7 +60,7 @@ func TestSlowThroughputNoticeOnPlaintextSessionOfSTLSListener(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the timeout notice in plaintext: %v", err)
 	}
-	if want := "-ERR [IN-USE] Connection too slow, please reconnect\r\n"; line != want {
+	if want := "-ERR Connection too slow, please reconnect\r\n"; line != want {
 		t.Fatalf("timeout notice = %q, want %q", line, want)
 	}
 }
