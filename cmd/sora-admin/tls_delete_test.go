@@ -25,15 +25,37 @@ import (
 // tlsStubS3 is a minimal path-style S3 endpoint for the tls commands: HEAD on the
 // bucket succeeds, HEAD and GET on an object answer 404 when it is absent, PUT
 // stores, DELETE removes. A non-zero deleteStatus makes every DELETE fail with it.
+//
+// A stub from newVersionedTLSStubS3 keeps versions, as a Backblaze B2 bucket always
+// does: PUT adds a version, HEAD and GET answer with the newest one and its
+// x-amz-version-id, DELETE with a versionId removes that version for good (the one
+// before it becomes the object again), and DELETE without one adds a delete marker.
 type tlsStubS3 struct {
 	mu           sync.Mutex
-	objects      map[string][]byte
+	objects      map[string][]byte           // what GET serves for each object
+	versions     map[string][]tlsStubVersion // oldest first; nil unless versioned
+	lastVersion  int
 	deleteStatus int
+}
+
+// tlsStubVersion is one version of an object in a versioned stub. A delete marker has
+// no data.
+type tlsStubVersion struct {
+	id   string
+	data []byte
 }
 
 func newTLSStubS3(t *testing.T) (*tlsStubS3, string) {
 	t.Helper()
 	s := &tlsStubS3{objects: make(map[string][]byte)}
+	srv := httptest.NewServer(s)
+	t.Cleanup(srv.Close)
+	return s, srv.URL
+}
+
+func newVersionedTLSStubS3(t *testing.T) (*tlsStubS3, string) {
+	t.Helper()
+	s := &tlsStubS3{objects: make(map[string][]byte), versions: make(map[string][]tlsStubVersion)}
 	srv := httptest.NewServer(s)
 	t.Cleanup(srv.Close)
 	return s, srv.URL
@@ -50,6 +72,7 @@ func (s *tlsStubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodHead:
 		if isBucket || found {
+			s.setVersionHeader(w, path)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -64,6 +87,7 @@ func (s *tlsStubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>`)
 			return
 		}
+		s.setVersionHeader(w, path)
 		w.Write(data)
 	case http.MethodPut:
 		body, err := io.ReadAll(r.Body)
@@ -71,7 +95,8 @@ func (s *tlsStubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		s.objects[path] = body
+		s.store(path, body)
+		s.setVersionHeader(w, path)
 		w.WriteHeader(http.StatusOK)
 	case http.MethodDelete:
 		if s.deleteStatus != 0 {
@@ -79,7 +104,7 @@ func (s *tlsStubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>InternalError</Code><Message>stub failure</Message></Error>`)
 			return
 		}
-		delete(s.objects, path)
+		s.remove(path, r.URL.Query().Get("versionId"))
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -113,7 +138,46 @@ func (s *tlsStubS3) writeList(w http.ResponseWriter, bucket string, q url.Values
 func (s *tlsStubS3) put(bucket, key string, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.objects["/"+bucket+"/"+key] = data
+	s.store("/"+bucket+"/"+key, data)
+}
+
+// store makes data the object at path: in a versioned stub, its newest version.
+func (s *tlsStubS3) store(path string, data []byte) {
+	s.objects[path] = data
+	if s.versions != nil {
+		s.lastVersion++
+		s.versions[path] = append(s.versions[path], tlsStubVersion{id: fmt.Sprintf("v%d", s.lastVersion), data: data})
+	}
+}
+
+// remove deletes the object at path. A versioned stub deletes the version versionID
+// for good, or without one adds a delete marker; either way the newest remaining
+// version, unless it is a marker, is the object afterwards.
+func (s *tlsStubS3) remove(path, versionID string) {
+	if s.versions == nil {
+		delete(s.objects, path)
+		return
+	}
+	versions := s.versions[path]
+	if versionID == "" {
+		s.lastVersion++
+		versions = append(versions, tlsStubVersion{id: fmt.Sprintf("v%d", s.lastVersion)})
+	} else {
+		versions = slices.DeleteFunc(versions, func(v tlsStubVersion) bool { return v.id == versionID })
+	}
+	s.versions[path] = versions
+	if len(versions) == 0 || versions[len(versions)-1].data == nil {
+		delete(s.objects, path)
+	} else {
+		s.objects[path] = versions[len(versions)-1].data
+	}
+}
+
+// setVersionHeader sends the version id of the object at path, in a versioned stub.
+func (s *tlsStubS3) setVersionHeader(w http.ResponseWriter, path string) {
+	if versions := s.versions[path]; len(versions) > 0 {
+		w.Header().Set("x-amz-version-id", versions[len(versions)-1].id)
+	}
 }
 
 // keys returns the stored object paths, sorted.
