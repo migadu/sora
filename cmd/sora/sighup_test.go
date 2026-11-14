@@ -125,6 +125,54 @@ func TestServersRegisteredWithoutAServerThatReloads(t *testing.T) {
 	}
 }
 
+func TestSIGHUPCanceledBeforeRegistrationDoesNotArmReload(t *testing.T) {
+	for range 100 {
+		deps := &serverDependencies{}
+		deps.expectRegistrations(nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		h := &sighupHandler{signals: make(chan os.Signal, 1)}
+		h.startWhenServersRegistered(ctx, deps, func() {})
+		time.Sleep(time.Millisecond)
+		h.mu.Lock()
+		started := h.reload != nil
+		h.mu.Unlock()
+		if started {
+			t.Fatal("armed a configuration reload after shutdown cancellation")
+		}
+	}
+}
+
+func TestSIGHUPCanceledAfterRegistrationDoesNotReload(t *testing.T) {
+	captureReloadLogs(t)
+	deps := &serverDependencies{}
+	deps.expectRegistrations(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	reloads := make(chan struct{}, 1)
+	h := &sighupHandler{signals: make(chan os.Signal, 1)}
+	h.startWhenServersRegistered(ctx, deps, func() { reloads <- struct{}{} })
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		h.mu.Lock()
+		started := h.reload != nil
+		h.mu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reload was not armed after registration")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	h.received()
+	select {
+	case <-reloads:
+		t.Fatal("a SIGHUP after shutdown reloaded stopped servers")
+	default:
+	}
+}
+
 // Without a SIGHUP during start-up, starting does not reload.
 func TestSIGHUPStartWithoutSignalDoesNotReload(t *testing.T) {
 	h := listenForSIGHUP()

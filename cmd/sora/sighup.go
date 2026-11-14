@@ -83,7 +83,17 @@ func (h *sighupHandler) startWhenServersRegistered(ctx context.Context, deps *se
 	go func() {
 		select {
 		case <-deps.serversRegistered():
-			h.start(reload)
+			// Both channels can be ready during shutdown; select does not give
+			// cancellation priority over a completed registration barrier.
+			if ctx.Err() != nil {
+				return
+			}
+			h.start(func() {
+				// A held signal may be delivered after shutdown has begun.
+				if ctx.Err() == nil {
+					reload()
+				}
+			})
 		case <-ctx.Done():
 		}
 	}()
