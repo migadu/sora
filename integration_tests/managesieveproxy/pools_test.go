@@ -170,8 +170,8 @@ func TestManageSieveProxyPools(t *testing.T) {
 			t.Errorf("%s: AUTHENTICATE succeeded; the user was routed to another pool's backend", tc.name)
 			continue
 		}
-		if !strings.HasPrefix(resp, "NO") || !strings.Contains(resp, "UNAVAILABLE") {
-			t.Errorf("%s: %q, want NO (UNAVAILABLE), a temporary failure", tc.name, resp)
+		if !strings.HasPrefix(resp, "NO") || !strings.Contains(resp, "TRYLATER") {
+			t.Errorf("%s: %q, want NO (TRYLATER), a temporary failure", tc.name, resp)
 		}
 	}
 }

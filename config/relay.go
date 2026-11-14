@@ -1,7 +1,10 @@
 package config
 
 import (
+	"net"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/migadu/sora/helpers"
@@ -14,9 +17,9 @@ type RelayConfig struct {
 
 	// SMTP relay configuration
 	SMTPHost        string `toml:"smtp_host"`          // SMTP server address (e.g., "smtp.example.com:587")
-	SMTPTLS         bool   `toml:"smtp_tls"`           // Use TLS for SMTP connection (default: true if not specified)
-	SMTPTLSVerify   bool   `toml:"smtp_tls_verify"`    // Verify TLS certificates (default: true)
-	SMTPUseStartTLS bool   `toml:"smtp_use_starttls"`  // Use STARTTLS instead of direct TLS (default: false)
+	SMTPTLS         *bool  `toml:"smtp_tls"`           // Use TLS for the SMTP connection (default: true); false relays in plaintext. Read via GetSMTPTLS.
+	SMTPTLSVerify   *bool  `toml:"smtp_tls_verify"`    // Verify the relay's certificate chain and host name (default: true). Read via GetSMTPTLSVerify.
+	SMTPUseStartTLS bool   `toml:"smtp_use_starttls"`  // Use STARTTLS instead of direct TLS (default: false); ignored when smtp_tls = false
 	SMTPTLSCertFile string `toml:"smtp_tls_cert_file"` // Client certificate for mTLS (optional)
 	SMTPTLSKeyFile  string `toml:"smtp_tls_key_file"`  // Client key for mTLS (optional)
 	SMTPHELOHost    string `toml:"smtp_helo_host"`     // Hostname to send in EHLO/HELO (default: "localhost"). Set to your FQDN for correct deliverability.
@@ -62,6 +65,58 @@ func (r *RelayConfig) IsHTTP() bool {
 // IsQueueEnabled returns true if relay is configured (queue is always enabled when relay is configured)
 func (r *RelayConfig) IsQueueEnabled() bool {
 	return r.IsConfigured()
+}
+
+// GetSMTPTLS reports whether the SMTP relay connection uses TLS (default true).
+func (r *RelayConfig) GetSMTPTLS() bool {
+	return r.SMTPTLS == nil || *r.SMTPTLS
+}
+
+// GetSMTPTLSVerify reports whether the SMTP relay's certificate is verified
+// (default true).
+func (r *RelayConfig) GetSMTPTLSVerify() bool {
+	return r.SMTPTLSVerify == nil || *r.SMTPTLSVerify
+}
+
+// TransportWarning returns a warning for startup when the relay connection to a
+// non-loopback host is plaintext (smtp_tls = false, or an http:// http_url) or does
+// not verify the relay's certificate (smtp_tls_verify = false), and "" otherwise.
+// Either exposes relayed mail (Sieve redirects, vacation replies), and for the HTTP
+// relay the auth_token, to an on-path attacker, who can read it or, without
+// verification, impersonate the relay.
+func (r *RelayConfig) TransportWarning() string {
+	switch {
+	case r.IsSMTP():
+		if isLoopbackHostPort(r.SMTPHost) {
+			return ""
+		}
+		if !r.GetSMTPTLS() {
+			return "[relay] smtp_tls = false: mail is relayed in plaintext to a non-loopback host"
+		}
+		if !r.GetSMTPTLSVerify() {
+			return "[relay] smtp_tls_verify = false: the relay's TLS certificate is not verified, so any host on the path can impersonate it"
+		}
+	case r.IsHTTP():
+		u, err := url.Parse(r.HTTPURL)
+		if err == nil && strings.EqualFold(u.Scheme, "http") && !isLoopbackHostPort(u.Host) {
+			return "[relay] http_url is http://: mail and the auth_token are relayed in plaintext to a non-loopback host"
+		}
+	}
+	return ""
+}
+
+// isLoopbackHostPort reports whether hostport ("host:port", or a bare host) names
+// localhost or a loopback IP address.
+func isLoopbackHostPort(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = strings.Trim(hostport, "[]")
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // GetSMTPHELOHost returns the hostname to send in EHLO/HELO. If smtp_helo_host
