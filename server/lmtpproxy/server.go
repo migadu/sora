@@ -54,7 +54,7 @@ type Server struct {
 	tlsUseStartTLS     bool
 	tlsConfig          *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
 	enableAffinity     bool
-	wg                 sync.WaitGroup
+	sessions           server.SessionGroup // Session goroutines, which Stop drains
 	ctx                context.Context
 	cancel             context.CancelFunc
 	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
@@ -493,10 +493,7 @@ func (s *Server) acceptConnections() error {
 		// BEFORE the deferred TLS handshake in handleConnection.
 		proxyInfo := server.GetProxyProtocolInfo(conn)
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-
+		started := s.sessions.Go(func() {
 			// Track proxy connection
 			metrics.ConnectionsTotal.WithLabelValues("lmtp_proxy", s.name, s.hostname).Inc()
 			metrics.ConnectionsCurrent.WithLabelValues("lmtp_proxy", s.name, s.hostname).Inc()
@@ -504,6 +501,9 @@ func (s *Server) acceptConnections() error {
 			session := newSession(s, conn, proxyInfo)
 			session.releaseConn = releaseConn // Set cleanup function on session
 			s.registerSession(session)
+			if s.sessions.IsDraining() {
+				server.RawConn(conn).Close()
+			}
 
 			// CRITICAL: Panic recovery MUST clean up metrics and limiter
 			defer func() {
@@ -525,7 +525,15 @@ func (s *Server) acceptConnections() error {
 			// Note: releaseConn is called in session.close(), which is deferred in handleConnection()
 			// This ensures cleanup happens when the session ends, not when the goroutine exits
 			session.handleConnection()
-		}()
+		})
+		if !started {
+			// Stop is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			if releaseConn != nil {
+				releaseConn()
+			}
+			return nil
+		}
 	}
 }
 
@@ -651,6 +659,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 }
 
 func (s *Server) Stop() error {
+	s.sessions.BeginDrain()
 	logger.Info("Stopping LMTP proxy server", "name", s.name)
 
 	// Stop connection tracker first to prevent it from trying to access closed database
@@ -671,16 +680,9 @@ func (s *Server) Stop() error {
 		listener.Close()
 	}
 
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(30 * time.Second) {
 		logger.Debug("LMTP Proxy: Server stopped gracefully", "name", s.name)
-	case <-time.After(30 * time.Second):
+	} else {
 		logger.Debug("LMTP Proxy: Server stop timeout", "name", s.name)
 	}
 
