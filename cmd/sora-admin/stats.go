@@ -341,13 +341,15 @@ func showConnectionStats(ctx context.Context, cfg AdminConfig, userEmail string,
 
 		fmt.Printf("Active Connections for User: %s\n", userEmail)
 		fmt.Printf("==========================================\n\n")
-		fmt.Printf("Total connections: %d\n\n", result.Count)
-
-		// Group by protocol
+		// Group by protocol. result.Count is the number of entries (one per tracker that
+		// knows the account), not of connections: the total is the sum of the counts.
 		protocolCounts := make(map[string]int)
+		total := 0
 		for _, conn := range result.Connections {
 			protocolCounts[conn.Protocol] += conn.TotalCount
+			total += conn.TotalCount
 		}
+		fmt.Printf("Total connections: %d\n\n", total)
 
 		fmt.Println("By Protocol:")
 		for protocol, count := range protocolCounts {

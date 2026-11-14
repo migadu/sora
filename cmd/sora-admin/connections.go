@@ -616,7 +616,9 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 	fmt.Printf("%-25s %-12s %-30s %-12s %-12s %-20s\n",
 		"----", "--------", "--------", "-----", "------", "-----------")
 
-	// Print connection details
+	// Print connection details. Each row is an account on one tracker, so the totals are
+	// the sums of its Local and Remote columns, not the number of rows.
+	totalLocal, totalRemote := 0, 0
 	for _, conn := range filteredConnections {
 		email := conn.Email
 		if email == "" {
@@ -637,6 +639,8 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 
 		// Calculate remote count (Total - Local)
 		remoteCount := conn.TotalCount - conn.LocalCount
+		totalLocal += conn.LocalCount
+		totalRemote += remoteCount
 
 		fmt.Printf("%-25s %-12s %-30s %-12d %-12d %-20s\n",
 			email,
@@ -647,7 +651,7 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 			conn.LastUpdate.Format("2006-01-02 15:04:05"))
 	}
 
-	fmt.Printf("\nTotal connections: %d\n", len(filteredConnections))
+	fmt.Printf("\nTotal connections: %d local, %d remote\n", totalLocal, totalRemote)
 	if result.Source != "" {
 		fmt.Printf("Source: %s\n", result.Source)
 	}

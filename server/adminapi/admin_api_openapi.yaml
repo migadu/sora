@@ -255,29 +255,25 @@ components:
     ConnectionStats:
       type: object
       properties:
-        TotalConnections:
+        total_connections:
           type: integer
-          format: int64
-        ConnectionsByProtocol:
+          description: "Connections on this node, every session counted; connections other nodes report through gossip are not included. A session through a proxy is counted by the proxy and again by its backend, so a cluster total sums the proxy nodes or the backend nodes, not both."
+          example: 150
+        connections_by_protocol:
           type: object
+          description: "total_connections per connection tracker, keyed <PROTOCOL>-<server name> on a backend and <PROTOCOL>-<host name>-<server name> on a proxy."
           additionalProperties:
             type: integer
-            format: int64
           example:
-            IMAP: 50
-            POP3: 10
-        ConnectionsByServer:
-          type: object
-          additionalProperties:
-            type: integer
-            format: int64
-          example:
-            "10.0.1.10:143": 30
-            "10.0.1.11:143": 30
-        Users:
-          type: array
-          items:
-            $ref: '#/components/schemas/ConnectionInfo'
+            IMAP-imap: 120
+            POP3-pop3: 20
+            ManageSieve-managesieve: 10
+        source:
+          type: string
+          example: "in-memory connection tracker"
+        note:
+          type: string
+          description: "Present, with zero counts, when this node has no connection trackers."
 
     CacheStats:
       type: object

@@ -512,22 +512,18 @@ Retrieve all active connections across all protocols.
 
 **Endpoint:** `GET /admin/connections/stats`
 
-Get aggregated statistics about active connections.
+Get the number of active connections on this node, every session counted, in total and per connection tracker. Trackers are keyed `<PROTOCOL>-<server name>` on a backend and `<PROTOCOL>-<host name>-<server name>` on a proxy. Connections other nodes report through gossip are not included. For a cluster total, sum the proxy nodes or the backend nodes, not both: a session through a proxy is counted by the proxy and again by its backend (also within one node that runs both).
 
 **Response:** `200 OK`
 ```json
 {
-  "TotalConnections": 150,
-  "ConnectionsByProtocol": {
-    "IMAP": 120,
-    "POP3": 20,
-    "ManageSieve": 10
+  "total_connections": 150,
+  "connections_by_protocol": {
+    "IMAP-imap": 120,
+    "POP3-pop3": 20,
+    "ManageSieve-managesieve": 10
   },
-  "ConnectionsByServer": {
-    "10.0.1.10:143": 80,
-    "10.0.1.11:143": 70
-  },
-  "Users": [...]
+  "source": "in-memory connection tracker"
 }
 ```
 
