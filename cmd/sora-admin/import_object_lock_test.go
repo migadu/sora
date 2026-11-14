@@ -7,12 +7,14 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/pkg/resilient"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -158,4 +160,92 @@ func TestImportS3WaitsForCleanerDeleteOfBody(t *testing.T) {
 	assert.Zero(t, uploaded, "the imported row is marked uploaded, but the cleaner's DELETE removed its body")
 	assert.Zero(t, live, "a row was imported for a body that is gone")
 	assert.Error(t, err, "the import reported success for a body that is gone")
+}
+
+// TestImportS3WorkersFitTheWritePool: an `import s3` worker holds a write-pool connection
+// for the S3 object lock of the body it imports and needs a second one for the insert it
+// runs under that lock. With as many workers as the write pool has connections, the
+// locks can take every connection, and each insert then waits for one until its write
+// timeout fails it.
+func TestImportS3WorkersFitTheWritePool(t *testing.T) {
+	f := newRekeyFixture(t)
+	cfg := adminTestDBConfig(t)
+	cfg.Write.MaxConnections = 2
+	cfg.WriteTimeout = "1s"
+	rdb, err := resilient.NewResilientDatabase(f.ctx, cfg, false, false)
+	require.NoError(t, err)
+	t.Cleanup(rdb.Close)
+
+	accountID, domain, localpart := f.account("import-s3-pool")
+	fake, s3storage := common.NewFakeS3Storage(t)
+	importer, err := NewS3Importer(rdb, s3storage, S3ImporterOptions{
+		Email:      localpart + "@" + domain,
+		Workers:    2,
+		BatchSize:  10,
+		InstanceID: "import-s3-pool-test",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { importer.Close() })
+
+	var hashes []string
+	for _, name := range []string{"first", "second"} {
+		body := f.body("import-s3-pool-" + name)
+		hash := helpers.HashContent(body)
+		key := helpers.NewS3Key(domain, localpart, hash)
+		require.NoError(t, s3storage.Put(key, bytes.NewReader(body), int64(len(body))))
+		_, err := importer.db.Exec(`INSERT INTO s3_objects (key, size, last_modified, etag, domain, local_part, content_hash)
+			VALUES (?, ?, '', '', ?, ?, ?)`, key, len(body), domain, localpart, hash)
+		require.NoError(t, err)
+		hashes = append(hashes, hash)
+	}
+	importer.totalObjects = int64(len(hashes))
+
+	// A worker reads its body under the lock: each read waits (for at most a second) for
+	// the other's, so that two workers hold their locks at once if they run at once.
+	var reads atomic.Int32
+	fake.OnGet(func(string) {
+		reads.Add(1)
+		for deadline := time.Now().Add(time.Second); reads.Load() < 2 && time.Now().Before(deadline); {
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+
+	require.NoError(t, importer.importFromS3())
+	assert.Zero(t, atomic.LoadInt64(&importer.failedMessages), "an insert waited for a connection the workers' locks held")
+	for _, hash := range hashes {
+		live, uploaded := liveRows(t, f, accountID, hash)
+		assert.Equal(t, 1, live)
+		assert.Equal(t, 1, uploaded)
+	}
+}
+
+// TestImportMaildirRefusesAWritePoolThatCannotFitOneBatch: a batch holds a write-pool
+// connection for its bodies' S3 object locks and inserts its rows on another. With a
+// single connection every batch would wait for one until its write timeout failed it, so
+// the import refuses to start.
+func TestImportMaildirRefusesAWritePoolThatCannotFitOneBatch(t *testing.T) {
+	f := newRekeyFixture(t)
+	cfg := adminTestDBConfig(t)
+	cfg.Write.MaxConnections = 1
+	cfg.WriteTimeout = "100ms"
+	rdb, err := resilient.NewResilientDatabase(f.ctx, cfg, false, false)
+	require.NoError(t, err)
+	t.Cleanup(rdb.Close)
+
+	accountID, domain, localpart := f.account("import-maildir-pool")
+	body := f.body("import-maildir-pool")
+	maildir := filepath.Join(t.TempDir(), "Maildir")
+	for _, dir := range []string{"cur", "new", "tmp"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(maildir, dir), 0o755))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(maildir, "cur", "1700000001.M1P1.host:2,S"), body, 0o644))
+	importer, err := NewImporter(f.ctx, maildir, localpart+"@"+domain, 1, rdb, f.store, ImporterOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { importer.Close() })
+
+	require.ErrorContains(t, importer.Run(), "at least 2 write-pool connections")
+	_, stored := f.stored(helpers.NewS3Key(domain, localpart, helpers.HashContent(body)))
+	assert.False(t, stored, "nothing is written before the refusal")
+	live, _ := liveRows(t, f, accountID, helpers.HashContent(body))
+	assert.Zero(t, live)
 }
