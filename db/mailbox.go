@@ -256,6 +256,13 @@ var mailboxByNameSharedSQL = fmt.Sprintf(mailboxByNameSQL, `
 	LIMIT 1`
 
 func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name string) (*DBMailbox, error) {
+	// A name PostgreSQL cannot hold (a NUL, invalid UTF-8) names no mailbox. Querying
+	// with it fails with SQLSTATE 22021, which callers took for a database failure:
+	// a Sieve fileinto to such a name, which a script can take from a header value,
+	// was answered 451 on every attempt.
+	if !helpers.MailboxNameStorable(name) {
+		return nil, consts.ErrMailboxNotFound
+	}
 	start := time.Now()
 	var err error
 	defer func() {

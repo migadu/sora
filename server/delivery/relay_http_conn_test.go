@@ -98,12 +98,39 @@ func TestHTTPRelayHandlerReusesConnections(t *testing.T) {
 // delivers [relay.queue] concurrency messages at once (default 5). The idle pool
 // must hold that many connections, or every round closes the surplus and dials it
 // again (net/http's default is 2 idle connections per host).
+//
+// The server holds each request until all workers' requests of the round have
+// arrived, so every round needs exactly one connection per worker at the same
+// time. That makes the count exact: the first round dials one connection per
+// worker and later rounds reuse them. Without the barrier, how many connections
+// the first rounds dial depends on scheduling (a request waiting for its own dial
+// can be handed another request's freed connection, and the dialed one is pooled
+// as well), and a fixed upper bound on it is flaky.
 func TestHTTPRelayHandlerReusesConnectionsConcurrently(t *testing.T) {
-	const workers, perWorker = 5, 50
+	const workers, rounds = 5, 20
 	msg := []byte("Subject: x\r\n\r\nbody")
 
+	var (
+		mu      sync.Mutex
+		arrived int
+		release = make(chan struct{})
+	)
 	srv, opened, _ := connCountingServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		ch := release
+		if arrived++; arrived == workers {
+			arrived = 0
+			close(release)
+			release = make(chan struct{})
+		}
+		mu.Unlock()
+		select {
+		case <-ch:
+		case <-time.After(10 * time.Second):
+			http.Error(w, "barrier timeout", http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = io.WriteString(w, `{"status":"queued"}`)
 	})
@@ -112,12 +139,12 @@ func TestHTTPRelayHandlerReusesConnectionsConcurrently(t *testing.T) {
 		false, false, false, "", "", "", &testLogger{}, CircuitBreakerConfig{})
 
 	var wg sync.WaitGroup
-	errs := make(chan error, workers*perWorker)
+	errs := make(chan error, workers*rounds)
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < perWorker; i++ {
+			for i := 0; i < rounds; i++ {
 				if err := h.SendToExternalRelay("a@example.com", "b@example.com", msg); err != nil {
 					errs <- err
 				}
@@ -130,12 +157,8 @@ func TestHTTPRelayHandlerReusesConnectionsConcurrently(t *testing.T) {
 		t.Fatalf("SendToExternalRelay: %v", err)
 	}
 
-	// Steady state needs one connection per worker. A request that finds no idle
-	// connection dials one, and net/http may hand it another request's freed
-	// connection first and pool the dialed one, so the warm-up can open up to
-	// twice that; after it, connections are only reused.
-	if n := opened.Load(); n > 2*workers {
-		t.Errorf("%d concurrent workers sending %d messages opened %d connections, want at most %d",
-			workers, workers*perWorker, n, 2*workers)
+	if n := opened.Load(); n != workers {
+		t.Errorf("%d concurrent workers sending %d messages opened %d connections, want %d (one per worker, reused)",
+			workers, workers*rounds, n, workers)
 	}
 }

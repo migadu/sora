@@ -150,6 +150,20 @@ func TestHTTPRemoteLookupErrorTypes(t *testing.T) {
 			description:      "200 with empty password_hash should return ErrRemoteLookupInvalidResponse",
 		},
 		{
+			name: "200_UnverifiableHashedPassword",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]any{
+					"address":       "user@example.com",
+					"password_hash": "{SHA512-CRYPT}$6$saltsaltsaltsalt$Uz0B733KLAcpeAFT5hlALRwUMzwqxSoBO9VG7Ph8v7auZDaXL8PutBQPqOVLMvwy0rORlpwlXHm83Z4uAhgLB0",
+					"server":        "backend:143",
+				})
+			},
+			expectAuthResult: AuthTemporarilyUnavailable,
+			expectErrorType:  ErrRemoteLookupInvalidResponse,
+			description:      "200 with a password_hash sora cannot verify says nothing about the password: an invalid answer, not a wrong password",
+		},
+		{
 			name: "200_MissingServerIP_AuthOnlyMode",
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")

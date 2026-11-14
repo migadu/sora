@@ -470,12 +470,20 @@ func (rd *ResilientDatabase) GetDatabase() *db.Database {
 }
 
 // PingReadPools pings, on every read host, the pool reads are served from: each
-// replica's, or the write hosts' while reads use them. The error names every host that
-// failed.
+// replica's, or the write hosts' while reads use them. A replica that has not connected
+// since startup is not in the read pools yet; it fails the check as it would had it gone
+// down later. The error names every host that failed.
 func (rd *ResilientDatabase) PingReadPools(ctx context.Context) error {
-	rd.failoverManager.mu.RLock()
-	pools := append([]*DatabasePool(nil), rd.failoverManager.readPools...)
-	rd.failoverManager.mu.RUnlock()
+	fm := rd.failoverManager
+	fm.mu.RLock()
+	pools := append([]*DatabasePool(nil), fm.readPools...)
+	var unconnected []error
+	for _, f := range fm.failedHosts {
+		if f.poolType == "read" {
+			unconnected = append(unconnected, fmt.Errorf("read replica %s: not connected since startup, reconnecting in the background", f.host))
+		}
+	}
+	fm.mu.RUnlock()
 
 	errs := make([]error, len(pools))
 	var wg sync.WaitGroup
@@ -489,7 +497,7 @@ func (rd *ResilientDatabase) PingReadPools(ctx context.Context) error {
 		}()
 	}
 	wg.Wait()
-	return errors.Join(errs...)
+	return errors.Join(append(errs, unconnected...)...)
 }
 
 // GetQueryTimeout returns the configured query timeout for read operations
@@ -1099,34 +1107,36 @@ func (rd *ResilientDatabase) GetOperationalDatabase() *db.Database {
 	return rd.getOperationalDatabaseForOperation(context.Background(), true)
 }
 
+// poolsFor returns the pools for one kind of operation and the index of the current one.
+// Caller holds fm.mu: attemptReconnectFailedHosts replaces the slices at runtime, and an
+// index is only valid for the slice it was chosen in.
+func (fm *RuntimeFailoverManager) poolsFor(isWrite bool) ([]*DatabasePool, int) {
+	if isWrite {
+		return fm.writePools, int(fm.currentWriteIdx.Load())
+	}
+	return fm.readPools, int(fm.currentReadIdx.Load())
+}
+
 // getHealthyDatabaseWithFailover attempts to get a healthy database, failing over if necessary
 func (rd *ResilientDatabase) getHealthyDatabaseWithFailover(isWrite bool) *db.Database {
-	var pools []*DatabasePool
-	var currentIdx int64
-
-	rd.failoverManager.mu.RLock()
-	if isWrite {
-		pools = rd.failoverManager.writePools
-		currentIdx = rd.failoverManager.currentWriteIdx.Load()
-	} else {
-		pools = rd.failoverManager.readPools
-		currentIdx = rd.failoverManager.currentReadIdx.Load()
-	}
-	rd.failoverManager.mu.RUnlock()
-
-	if len(pools) == 0 {
-		panic("no database pools available")
-	}
+	fm := rd.failoverManager
 
 	// --- Fast Path (Read Lock) ---
 	// Check if the current pool is healthy. This is the most common case.
-	rd.failoverManager.mu.RLock()
-	currentPool := pools[currentIdx]
-	isHealthy := currentPool.isHealthy.Load()
-	rd.failoverManager.mu.RUnlock()
+	fm.mu.RLock()
+	pools, currentIdx := fm.poolsFor(isWrite)
+	var currentPool *DatabasePool
+	if len(pools) > 0 {
+		currentPool = pools[currentIdx]
+	}
+	fm.mu.RUnlock()
 
-	if isHealthy {
-		if !isWrite && rd.failoverManager.readsOnWritePools.CompareAndSwap(true, false) {
+	if currentPool == nil {
+		panic("no database pools available")
+	}
+
+	if currentPool.isHealthy.Load() {
+		if !isWrite && fm.readsOnWritePools.Load() && fm.readsOnWritePools.CompareAndSwap(true, false) {
 			logger.Info("Read operations are back on a read replica", "component", "RESILIENT-FAILOVER", "pool", currentPool.host)
 		}
 		return currentPool.database
@@ -1134,31 +1144,27 @@ func (rd *ResilientDatabase) getHealthyDatabaseWithFailover(isWrite bool) *db.Da
 
 	// --- Slow Path (Write Lock) ---
 	// The current pool is unhealthy. Acquire a write lock to perform a failover.
-	rd.failoverManager.mu.Lock()
-	defer rd.failoverManager.mu.Unlock()
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
 
-	// Double-check: Another goroutine might have already performed the failover while we were waiting for the lock.
-	if isWrite {
-		currentIdx = rd.failoverManager.currentWriteIdx.Load()
-	} else {
-		currentIdx = rd.failoverManager.currentReadIdx.Load()
-	}
-
-	if int(currentIdx) < len(pools) && pools[currentIdx].isHealthy.Load() {
+	// Read the pools again: while we waited for the lock another goroutine may have failed
+	// over, and a reconnect may have replaced the slice the fast path read.
+	pools, currentIdx = fm.poolsFor(isWrite)
+	if pools[currentIdx].isHealthy.Load() {
 		return pools[currentIdx].database
 	}
 
 	// Iterate through all pools to find a healthy one, starting from the next one.
 	numPools := len(pools)
 	for i := 1; i <= numPools; i++ {
-		nextIdx := (int(currentIdx) + i) % numPools
+		nextIdx := (currentIdx + i) % numPools
 		if pools[nextIdx].isHealthy.Load() {
 			// Found a healthy pool, switch to it.
 			if isWrite {
-				rd.failoverManager.currentWriteIdx.Store(int64(nextIdx))
+				fm.currentWriteIdx.Store(int64(nextIdx))
 				logger.Info("Switched write operations from unhealthy pool to healthy pool", "component", "RESILIENT-FAILOVER", "from", pools[currentIdx].host, "to", pools[nextIdx].host)
 			} else {
-				rd.failoverManager.currentReadIdx.Store(int64(nextIdx))
+				fm.currentReadIdx.Store(int64(nextIdx))
 				logger.Info("Switched read operations from unhealthy pool to healthy pool", "component", "RESILIENT-FAILOVER", "from", pools[currentIdx].host, "to", pools[nextIdx].host)
 			}
 			return pools[nextIdx].database
@@ -1167,13 +1173,13 @@ func (rd *ResilientDatabase) getHealthyDatabaseWithFailover(isWrite bool) *db.Da
 
 	// No read replica is healthy: serve reads from a healthy write pool, as startup does
 	// when every replica is down, rather than from a replica known to be failing.
-	if !isWrite && rd.failoverManager.readPoolsAreDistinct() {
-		writePools := rd.failoverManager.writePools
-		writeIdx := int(rd.failoverManager.currentWriteIdx.Load())
+	if !isWrite && fm.readPoolsAreDistinct() {
+		writePools := fm.writePools
+		writeIdx := int(fm.currentWriteIdx.Load())
 		for i := 0; i < len(writePools); i++ {
 			p := writePools[(writeIdx+i)%len(writePools)]
 			if p.isHealthy.Load() {
-				if rd.failoverManager.readsOnWritePools.CompareAndSwap(false, true) {
+				if fm.readsOnWritePools.CompareAndSwap(false, true) {
 					logger.Warn("No healthy read replica, serving read operations from the write pool", "component", "RESILIENT-FAILOVER", "pool", p.host)
 				}
 				return p.database

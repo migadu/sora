@@ -54,7 +54,10 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 	// Generate password hash or use provided hash
 	var hashedPassword string
 	if req.PasswordHash != "" {
-		// Use provided hash directly
+		// Use provided hash directly, if it is one VerifyPassword can check
+		if err = ValidatePasswordHash(req.PasswordHash); err != nil {
+			return 0, fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+		}
 		hashedPassword = req.PasswordHash
 	} else {
 		// Generate hash from password
@@ -126,7 +129,10 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 	// Generate password hash or use provided hash
 	var hashedPassword string
 	if req.NewPasswordHash != "" {
-		// Use provided hash directly
+		// Use provided hash directly, if it is one VerifyPassword can check
+		if err = ValidatePasswordHash(req.NewPasswordHash); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+		}
 		hashedPassword = req.NewPasswordHash
 	} else {
 		// Generate hash from password
@@ -218,7 +224,10 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 	var hashedPassword string
 	var updatePassword bool
 	if req.PasswordHash != "" {
-		// Use provided hash directly
+		// Use provided hash directly, if it is one VerifyPassword can check
+		if err = ValidatePasswordHash(req.PasswordHash); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+		}
 		hashedPassword = req.PasswordHash
 		updatePassword = true
 	} else if req.Password != "" {
@@ -366,8 +375,9 @@ var (
 	// ErrInvalidAccountRequest wraps the errors CreateAccount, CreateAccountWithCredentials
 	// and UpdateAccount return for a request that cannot succeed as written (malformed
 	// address, no or several primaries, an address twice, unknown hash type, a password
-	// over bcrypt's 72 bytes, ...), so a caller can tell a bad request from a database
-	// failure.
+	// over bcrypt's 72 bytes, a password_hash VerifyPassword cannot check, ...), so a
+	// caller can tell a bad request from a database failure. AddCredential wraps it for
+	// a password_hash too.
 	ErrInvalidAccountRequest = errors.New("invalid account request")
 )
 
@@ -814,7 +824,9 @@ type AccountSummary struct {
 // GetAccountsByDomain returns a simplified list of the accounts whose primary address is
 // in domain, soft-deleted ones included. It is what the purge-domain command iterates
 // through, and a purge that failed leaves its account soft-deleted: leaving those out would
-// make a re-run skip exactly the accounts it has to finish.
+// make a re-run skip exactly the accounts it has to finish. The domain is matched exactly,
+// as ListAccountsByDomain matches it: never as a LIKE pattern, where % and _ would name
+// other domains in an irreversible purge.
 func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]AccountSummary, error) {
 	query := `
 		SELECT a.id,
@@ -825,7 +837,7 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 			   0 as message_count
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id AND c.primary_identity = TRUE
-		WHERE LOWER(c.address) LIKE '%' || '@' || LOWER($1)
+		WHERE c.domain = LOWER($1)
 		ORDER BY c.address
 	`
 
@@ -860,13 +872,14 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 // address is in the given domain, across active (non-deleted) accounts. Domain purge uses
 // this to find cross-domain aliases: addresses in the purged domain that hang off accounts
 // whose primary identity lives in a different domain (so the account is not itself purged).
-// Such aliases keep receiving mail for the purged domain unless explicitly removed.
+// Such aliases keep receiving mail for the purged domain unless explicitly removed. The
+// domain is matched exactly, as in GetAccountsByDomain.
 func (db *Database) GetAliasCredentialsByDomain(ctx context.Context, domain string) ([]string, error) {
 	rows, err := db.GetReadPool().Query(ctx, `
 		SELECT c.address
 		FROM credentials c
 		JOIN accounts a ON a.id = c.account_id
-		WHERE LOWER(c.address) LIKE '%' || '@' || LOWER($1)
+		WHERE c.domain = LOWER($1)
 		  AND c.primary_identity = FALSE
 		  AND a.deleted_at IS NULL
 		ORDER BY c.address
@@ -1081,6 +1094,11 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 				return 0, fmt.Errorf("credential %d: %w", i+1, err)
 			}
 		}
+		if cred.PasswordHash != "" {
+			if err := ValidatePasswordHash(cred.PasswordHash); err != nil {
+				return 0, fmt.Errorf("%w: credential %d: %w", ErrInvalidAccountRequest, i+1, err)
+			}
+		}
 	}
 
 	// Ensure exactly one primary credential
@@ -1143,7 +1161,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 		// Generate password hash or use provided hash
 		var hashedPassword string
 		if cred.PasswordHash != "" {
-			// Use provided hash directly
+			// Use provided hash directly (validated above)
 			hashedPassword = cred.PasswordHash
 		} else {
 			// Generate hash from password

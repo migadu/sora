@@ -487,19 +487,22 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 		logger.Debug("remotelookup: Using address from response", "response_email", actualEmail, "query_email", lookupEmail)
 	}
 
-	// Verify password against hash (skip if route_only mode)
-	hashPrefix := lookupResp.PasswordHash
-	if len(hashPrefix) > 30 {
-		hashPrefix = hashPrefix[:30] + "..."
-	}
-
+	// Verify password against hash (skip if route_only mode). No part of the hash is
+	// logged: a lookup service could answer a password in that field.
 	if !routeOnly {
 		// Verify password against hash returned by HTTP endpoint
 		// Note: The HTTP endpoint handles all master token logic and returns the appropriate hash
-		if !c.verifyPassword(password, lookupResp.PasswordHash) {
+		if err := db.VerifyPassword(lookupResp.PasswordHash, password); err != nil {
+			if !errors.Is(err, db.ErrInvalidCredentials) {
+				// A hash sora cannot check says nothing about the password: like a 200
+				// without one, it is a broken answer, handled as an outage. It does not
+				// count toward the circuit breaker, which has already recorded a good
+				// answer: other users' hashes may be fine.
+				return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: %w: %w", ErrRemoteLookupTransient, ErrRemoteLookupInvalidResponse, err)
+			}
 			// Don't cache auth failures - password verification failed
 			// Could be wrong password or password change in progress
-			logger.Debug("remotelookup: Password verification failed", "user", authEmail, "source", "api", "hash_prefix", hashPrefix)
+			logger.Debug("remotelookup: Password verification failed", "user", authEmail, "source", "api")
 			return nil, AuthFailed, nil
 		}
 	}
@@ -533,7 +536,7 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	if routeOnly {
 		source = "api-route-only"
 	}
-	logger.Debug("remotelookup: SUCCESS", "user", authEmail, "source", source, "hash_prefix", hashPrefix, "auth_only_mode", lookupResp.AuthOnlyMode, "server", normalizedServer, "pool", lookupResp.Pool)
+	logger.Debug("remotelookup: SUCCESS", "user", authEmail, "source", source, "auth_only_mode", lookupResp.AuthOnlyMode, "server", normalizedServer, "pool", lookupResp.Pool)
 
 	return info, AuthSuccess, nil
 }
@@ -549,12 +552,6 @@ func drainAndClose(resp *http.Response) {
 		_, _ = io.CopyN(io.Discard, resp.Body, maxDrainBytes)
 	}
 	_ = resp.Body.Close()
-}
-
-// verifyPassword verifies a password against a hash
-func (c *HTTPRemoteLookupClient) verifyPassword(password, hash string) bool {
-	err := db.VerifyPassword(hash, password)
-	return err == nil
 }
 
 // normalizeServerAddress gives a server address without a port the client's default

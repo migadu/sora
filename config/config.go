@@ -48,7 +48,7 @@ type DatabaseEndpointConfig struct {
 	Hosts              []string `toml:"hosts"`
 	Port               any      `toml:"port"` // Database port (default: "5432"), can be string or integer
 	User               string   `toml:"user"`
-	Password           string   `toml:"password"`
+	Password           string   `toml:"password" secret:"true"`
 	Name               string   `toml:"name"`
 	TLSMode            bool     `toml:"tls"`
 	MaxConnections     int      `toml:"max_connections"`      // Maximum number of connections in the pool (per host; without [database.read] a write host has a second, read pool of the same size)
@@ -169,14 +169,14 @@ func (d *DatabaseConfig) GetFetchChunkSize() int {
 type S3Config struct {
 	Endpoint      string `toml:"endpoint"`
 	DisableTLS    bool   `toml:"disable_tls"`
-	Region        string `toml:"region"`     // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
-	AccessKey     string `toml:"access_key"` // Without both keys the AWS default credential chain is used
-	SecretKey     string `toml:"secret_key"`
+	Region        string `toml:"region"`                   // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
+	AccessKey     string `toml:"access_key" secret:"true"` // Without both keys the AWS default credential chain is used
+	SecretKey     string `toml:"secret_key" secret:"true"`
 	Bucket        string `toml:"bucket"`
 	Debug         bool   `toml:"debug"`   // Enable detailed S3 request/response tracing
 	Timeout       string `toml:"timeout"` // Timeout for individual S3 operations (default: 30s)
 	Encrypt       bool   `toml:"encrypt"`
-	EncryptionKey string `toml:"encryption_key"`
+	EncryptionKey string `toml:"encryption_key" secret:"true"`
 }
 
 // GetDebug returns the debug flag
@@ -225,15 +225,15 @@ func (c *ClusterAffinityConfig) GetCleanupInterval() (time.Duration, error) {
 
 // ClusterConfig holds cluster coordination configuration using gossip protocol
 type ClusterConfig struct {
-	Enabled           bool                       `toml:"enabled"`              // Enable cluster mode
-	Addr              string                     `toml:"addr"`                 // Gossip listen address (must be specific IP:port, NOT 0.0.0.0 or localhost)
-	Port              int                        `toml:"port"`                 // Gossip port (used if not specified in addr)
-	NodeID            string                     `toml:"node_id"`              // Unique node ID (defaults to hostname)
-	Peers             []string                   `toml:"peers"`                // Initial seed nodes
-	SecretKey         string                     `toml:"secret_key"`           // Cluster encryption key (base64-encoded 32-byte key)
-	MaxEventQueueSize int                        `toml:"max_event_queue_size"` // Maximum events per protocol queue (default: 50000)
-	RateLimitSync     ClusterRateLimitSyncConfig `toml:"rate_limit_sync"`      // Auth rate limiting sync configuration
-	Affinity          ClusterAffinityConfig      `toml:"affinity"`             // Server affinity configuration
+	Enabled           bool                       `toml:"enabled"`                  // Enable cluster mode
+	Addr              string                     `toml:"addr"`                     // Gossip listen address (must be specific IP:port, NOT 0.0.0.0 or localhost)
+	Port              int                        `toml:"port"`                     // Gossip port (used if not specified in addr)
+	NodeID            string                     `toml:"node_id"`                  // Unique node ID (defaults to hostname)
+	Peers             []string                   `toml:"peers"`                    // Initial seed nodes
+	SecretKey         string                     `toml:"secret_key" secret:"true"` // Cluster encryption key (base64-encoded 32-byte key)
+	MaxEventQueueSize int                        `toml:"max_event_queue_size"`     // Maximum events per protocol queue (default: 50000)
+	RateLimitSync     ClusterRateLimitSyncConfig `toml:"rate_limit_sync"`          // Auth rate limiting sync configuration
+	Affinity          ClusterAffinityConfig      `toml:"affinity"`                 // Server affinity configuration
 }
 
 // splitClusterAddr splits addr into host and port. addr is a host or IP address,
@@ -280,13 +280,13 @@ func (c *ClusterConfig) GetMaxEventQueueSize() int {
 
 // TLSLetsEncryptS3Config holds S3-specific configuration for Let's Encrypt certificate storage
 type TLSLetsEncryptS3Config struct {
-	Bucket     string `toml:"bucket"`      // S3 bucket for certificate storage
-	Endpoint   string `toml:"endpoint"`    // S3-compatible storage endpoint (default: "s3.amazonaws.com")
-	DisableTLS bool   `toml:"disable_tls"` // Disable TLS for S3 endpoint (useful for local MinIO setups)
-	Region     string `toml:"region"`      // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
-	Debug      bool   `toml:"debug"`       // Enable detailed S3 request/response tracing
-	AccessKey  string `toml:"access_key"`  // AWS credentials (optional, uses default chain)
-	SecretKey  string `toml:"secret_key"`  // AWS credentials (optional)
+	Bucket     string `toml:"bucket"`                   // S3 bucket for certificate storage
+	Endpoint   string `toml:"endpoint"`                 // S3-compatible storage endpoint (default: "s3.amazonaws.com")
+	DisableTLS bool   `toml:"disable_tls"`              // Disable TLS for S3 endpoint (useful for local MinIO setups)
+	Region     string `toml:"region"`                   // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
+	Debug      bool   `toml:"debug"`                    // Enable detailed S3 request/response tracing
+	AccessKey  string `toml:"access_key" secret:"true"` // AWS credentials (optional, uses default chain)
+	SecretKey  string `toml:"secret_key" secret:"true"` // AWS credentials (optional)
 	// ServerSideEncryption is the encryption asked of the store on every certificate
 	// write: "AES256" for the store's own key management, "aws:kms" with a key id, or
 	// "" for no encryption header at all. Pointer so an absent key (keep the default,
@@ -835,9 +835,9 @@ func lookupCacheDurationWithDefault(server, key, value string, def time.Duration
 // RemoteLookupConfig holds configuration for HTTP-based user routing
 type RemoteLookupConfig struct {
 	Enabled   bool   `toml:"enabled"`
-	URL       string `toml:"url"`        // HTTP endpoint URL for lookups (e.g., "http://localhost:8080/lookup")
-	Timeout   string `toml:"timeout"`    // HTTP request timeout (default: "5s")
-	AuthToken string `toml:"auth_token"` // Bearer token for HTTP authentication (optional)
+	URL       string `toml:"url"`                      // HTTP endpoint URL for lookups (e.g., "http://localhost:8080/lookup")
+	Timeout   string `toml:"timeout"`                  // HTTP request timeout (default: "5s")
+	AuthToken string `toml:"auth_token" secret:"true"` // Bearer token for HTTP authentication (optional)
 
 	// Backend connection settings
 	LookupLocalUsers       bool   `toml:"lookup_local_users"`        // Check local DB when remote returns 404/3xx (for split user scenarios)
@@ -1173,9 +1173,9 @@ type ServerConfig struct {
 	// IMAP specific
 	AppendLimit        string `toml:"append_limit,omitempty"`
 	MasterUsername     string `toml:"master_username,omitempty"`
-	MasterPassword     string `toml:"master_password,omitempty"`
+	MasterPassword     string `toml:"master_password,omitempty" secret:"true"`
 	MasterSASLUsername string `toml:"master_sasl_username,omitempty"`
-	MasterSASLPassword string `toml:"master_sasl_password,omitempty"`
+	MasterSASLPassword string `toml:"master_sasl_password,omitempty" secret:"true"`
 	// MasterSASLAllowedNetworks optionally restricts which source networks may use
 	// master credentials to impersonate users on this backend: master SASL and the
 	// master-username form (user@domain@master_username) alike, on IMAP, POP3 and
@@ -1221,15 +1221,15 @@ type ServerConfig struct {
 	RemoteDNSRefresh string `toml:"remote_dns_refresh,omitempty"`
 
 	// HTTP API specific
-	APIKey         string   `toml:"api_key,omitempty"`
-	ReadOnlyAPIKey string   `toml:"read_only_api_key,omitempty"` // http_admin_api: optional second key, GET requests only
+	APIKey         string   `toml:"api_key,omitempty" secret:"true"`
+	ReadOnlyAPIKey string   `toml:"read_only_api_key,omitempty" secret:"true"` // http_admin_api: optional second key, GET requests only
 	AllowedHosts   []string `toml:"allowed_hosts,omitempty"`
 
 	// Mail HTTP API specific (stateless JWT-based authentication)
-	JWTSecret      string   `toml:"jwt_secret,omitempty"`      // Secret key for signing JWT tokens
-	TokenDuration  string   `toml:"token_duration,omitempty"`  // Token validity duration (e.g., "24h", "7d")
-	TokenIssuer    string   `toml:"token_issuer,omitempty"`    // JWT issuer field
-	AllowedOrigins []string `toml:"allowed_origins,omitempty"` // CORS allowed origins for web clients
+	JWTSecret      string   `toml:"jwt_secret,omitempty" secret:"true"` // Secret key for signing JWT tokens
+	TokenDuration  string   `toml:"token_duration,omitempty"`           // Token validity duration (e.g., "24h", "7d")
+	TokenIssuer    string   `toml:"token_issuer,omitempty"`             // JWT issuer field
+	AllowedOrigins []string `toml:"allowed_origins,omitempty"`          // CORS allowed origins for web clients
 
 	// Metrics specific
 	Path                 string `toml:"path,omitempty"`
@@ -1344,10 +1344,10 @@ func (c SharedMailboxesConfig) Validate() error {
 
 // AdminCLIConfig holds configuration for sora-admin CLI tool
 type AdminCLIConfig struct {
-	Addr               string `toml:"addr"`                 // HTTP Admin API endpoint address
-	APIKey             string `toml:"api_key"`              // API key for authentication
-	InsecureSkipVerify *bool  `toml:"insecure_skip_verify"` // Skip TLS verification (default: auto; true for loopback, false for remote)
-	ImportMessageLimit string `toml:"import_message_limit"` // Maximum message size for import operations (e.g., "50mb")
+	Addr               string `toml:"addr"`                  // HTTP Admin API endpoint address
+	APIKey             string `toml:"api_key" secret:"true"` // API key for authentication
+	InsecureSkipVerify *bool  `toml:"insecure_skip_verify"`  // Skip TLS verification (default: auto; true for loopback, false for remote)
+	ImportMessageLimit string `toml:"import_message_limit"`  // Maximum message size for import operations (e.g., "50mb")
 }
 
 // SieveConfig holds Sieve script engine configuration
