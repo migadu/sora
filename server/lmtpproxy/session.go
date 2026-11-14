@@ -1148,7 +1148,8 @@ func (s *Session) connectToBackend() error {
 	// Track which routing method was used for this connection.
 	metrics.ProxyRoutingMethod.WithLabelValues("lmtp", routeResult.RoutingMethod).Inc()
 
-	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
+	// The backend's PROXY header names the real client (the incoming PROXY header's source).
+	clientHost, clientPort := server.GetRealClientAddr(s.clientConn, s.proxyInfo)
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	var backendRoute *proxy.BackendRoute
 	if preferredAddr != "" {

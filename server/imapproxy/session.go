@@ -1361,15 +1361,8 @@ func (s *Session) connectToBackend() error {
 		s.routingInfo.ProxySessionID = s.sessionID
 	}
 
-	// Use real client IP from PROXY protocol if available
-	var clientHost string
-	var clientPort int
-	if s.proxyInfo != nil && s.proxyInfo.SrcIP != "" {
-		clientHost = s.proxyInfo.SrcIP
-		clientPort = s.proxyInfo.SrcPort
-	} else {
-		clientHost, clientPort = server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
-	}
+	// The backend's PROXY header names the real client (the incoming PROXY header's source).
+	clientHost, clientPort := server.GetRealClientAddr(s.clientConn, s.proxyInfo)
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,

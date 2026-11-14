@@ -616,6 +616,15 @@ func GetRealClientIP(conn net.Conn, proxyInfo *ProxyProtocolInfo) string {
 	}
 }
 
+// GetRealClientAddr returns the real client's IP and port: the source of the PROXY
+// header when there is one, else the connection's peer.
+func GetRealClientAddr(conn net.Conn, proxyInfo *ProxyProtocolInfo) (string, int) {
+	if proxyInfo != nil && proxyInfo.SrcIP != "" {
+		return proxyInfo.SrcIP, proxyInfo.SrcPort
+	}
+	return GetHostPortFromAddr(conn.RemoteAddr())
+}
+
 // GetConnectionIPs returns both real client IP and proxy IP (if applicable)
 func GetConnectionIPs(conn net.Conn, proxyInfo *ProxyProtocolInfo) (clientIP, proxyIP string) {
 	// Get the direct connection IP (proxy IP if proxied)

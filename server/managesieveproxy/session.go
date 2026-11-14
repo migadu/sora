@@ -772,7 +772,8 @@ func (s *Session) connectToBackendAndAuth() error {
 	connectCtx, connectCancel := context.WithTimeout(s.ctx, s.server.connManager.ConnectBudget())
 	defer connectCancel()
 
-	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
+	// The backend's PROXY header names the real client (the incoming PROXY header's source).
+	clientHost, clientPort := server.GetRealClientAddr(s.clientConn, s.proxyInfo)
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	conn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,
