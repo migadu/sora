@@ -330,6 +330,10 @@ Both `allow_*` settings default to `false`:
 - `allow_anyone_identifier = false` refuses granting rights to `anyone` (IMAP SETACL
   answers `NO [CANNOT]`, the Admin API 400, LISTRIGHTS offers nothing). Grants made
   earlier keep applying until revoked; revoking and reducing them still works.
+  It is read from the config of whoever makes the grant, whatever that config's
+  `enabled` says: the IMAP server, the Admin API's node, or the file given to
+  `sora-admin acl grant`, which needs `allow_anyone_identifier = true` under
+  `[shared_mailboxes]` to grant `anyone`.
 
 **ACL Rights:**
 - `l` - lookup: Mailbox visible in LIST/LSUB
