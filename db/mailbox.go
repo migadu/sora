@@ -842,6 +842,28 @@ func (db *Database) HasMailboxWithSpecialUse(ctx context.Context, accountID int6
 	return exists, nil
 }
 
+// GetPersonalMailboxNameBySpecialUse returns the name of the account's mailbox in
+// its personal namespace that carries the RFC 6154 special-use attribute attr, or
+// consts.ErrMailboxNotFound if there is none. A mailbox the account owns in the
+// shared namespace does not count: RFC 8579 §4 looks the attribute up "in the
+// user's personal namespace". An attribute marks at most one live mailbox of an
+// account (mailboxes_account_special_use_unique).
+func (db *Database) GetPersonalMailboxNameBySpecialUse(ctx context.Context, accountID int64, attr string) (string, error) {
+	var name string
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT name FROM mailboxes
+		WHERE account_id = $1 AND special_use = $2 AND deleted_at IS NULL
+		  AND NOT COALESCE(is_shared, FALSE)
+	`, accountID, attr).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", consts.ErrMailboxNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to look up the %s mailbox: %w", attr, err)
+	}
+	return name, nil
+}
+
 func (db *Database) CreateDefaultMailboxes(ctx context.Context, tx pgx.Tx, AccountID int64) error {
 	// OPTIMIZATION: Early exit if INBOX already exists
 	// This avoids 5 INSERT attempts on every LMTP delivery when mailboxes already exist

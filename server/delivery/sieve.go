@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -21,12 +22,55 @@ import (
 )
 
 // DefaultSieveScript is the built-in script every delivery runs before the user's
-// own: it files spam into Junk and a +detail recipient into the detail folder. Both
-// delivery paths run it and merge its result with the user script's
-// (MergeSieveResults), so one message is filed the same way whichever way it came.
+// own: it files spam into Junk (ResolveDefaultJunk) and a +detail recipient into the
+// detail folder. Both delivery paths run it and merge its result with the user
+// script's (MergeSieveResults), so one message is filed the same way whichever way
+// it came.
 //
 //go:embed default.sieve
 var DefaultSieveScript string
+
+// defaultJunkIndex returns the position in the default script's result of its spam
+// filing, the plain fileinto "Junk" of default.sieve, or -1 if it has none. The
+// script's other filing, by +detail, is a fileinto :create of a lower-case name.
+func defaultJunkIndex(result sieveengine.Result) int {
+	i := slices.Index(result.Mailboxes, consts.MailboxJunk)
+	if i < 0 || slices.Contains(result.CreateMailboxes, consts.MailboxJunk) {
+		return -1
+	}
+	return i
+}
+
+// ResolveDefaultJunk points the default script's spam filing at the account's \Junk
+// mailbox (RFC 6154 §2), the one LIST shows as the Junk folder. default.sieve files
+// spam with fileinto "Junk", but the attribute, not the name, says which mailbox
+// that is: it survives RENAME, and a plain folder may be named Junk. The filing is
+// carried out as RFC 8579 §4 has fileinto :specialuse "\\Junk" "Junk" do: it "first
+// checks whether a mailbox exists in the user's personal namespace [NAMESPACE] with
+// the specified special-use attribute assigned to it", and only without one is the
+// mailbox named Junk used. A user script's fileinto "Junk" still names a mailbox
+// (RFC 5228 §4.1), so this is applied to the default script's result only, before
+// it is merged with the user script's.
+//
+// A failed lookup fails the delivery, to be retried: RFC 8579 §4 does not let a
+// failure that is not about the special-use mailbox's existence fall back to the
+// named one, which would spread the account's spam over two folders.
+func ResolveDefaultJunk(ctx context.Context, rdb *resilient.ResilientDatabase, accountID int64, result sieveengine.Result) (sieveengine.Result, error) {
+	i := defaultJunkIndex(result)
+	if i < 0 {
+		return result, nil
+	}
+	name, err := rdb.GetPersonalMailboxNameBySpecialUseWithRetry(ctx, accountID, string(imap.MailboxAttrJunk))
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		return result, nil
+	}
+	if err != nil {
+		return result, fmt.Errorf("failed to look up the \\Junk mailbox: %w", err)
+	}
+	result.Mailboxes = slices.Clone(result.Mailboxes)
+	result.Mailboxes[i] = name
+	return result, nil
+}
 
 // SieveOutcome is the result of evaluating a recipient's Sieve script for one delivery.
 type SieveOutcome struct {
@@ -188,7 +232,11 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	// The built-in default script runs first, as on LMTP, and the user's script then
 	// takes the message over or keeps the default's filing (MergeSieveResults). A
 	// script that fails to compile or run leaves the result before it standing.
-	result := s.evaluate(ctx, recipient, sieveCtx, DefaultSieveScript, "default")
+	result, err := ResolveDefaultJunk(ctx, s.DeliveryCtx.RDB, recipient.AccountID,
+		s.evaluate(ctx, recipient, sieveCtx, DefaultSieveScript, "default"))
+	if err != nil {
+		return nil, err
+	}
 	activeScript, err := s.DeliveryCtx.RDB.GetActiveScriptWithRetry(ctx, recipient.AccountID)
 	if err != nil && err != consts.ErrDBNotFound {
 		s.DeliveryCtx.Logger.Log("Failed to get the active Sieve script, using the default script's result: %v", err)

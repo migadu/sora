@@ -138,8 +138,11 @@ if envelope :matches :detail "To" "*" {
 
 What it does:
 
-- A message with an `X-Spam` header that contains `Yes` (in any case) goes to `Junk`. Your
-  spam filter must add that header for this to work.
+- A message with an `X-Spam` header that contains `Yes` (in any case) goes to the account's Junk
+  folder: the personal mailbox with the `\Junk` special-use attribute (RFC 6154), whatever it is
+  named, so a renamed Junk folder keeps receiving spam. Only if no mailbox has `\Junk` does it go
+  to the mailbox named `Junk` (the RFC 8579 `fileinto :specialuse` rule). Your spam filter must
+  add that header for this to work.
 - A message sent to `user+tag@example.com` goes to a folder named after the detail, in lower case
   (`tag`). The folder is created if it does not exist.
 - Everything else stays in INBOX.

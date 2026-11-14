@@ -908,7 +908,8 @@ Received: from <helo> ([<client-ip>])
 `<helo>` is the `HELO` value from XCLIENT if the MTA sent one, otherwise the `LHLO` name. The
 protocol word is `UTF8LMTP` for an internationalised transaction (RFC 6531 §3.7.3).
 
-The built-in default script files messages whose `X-Spam` header contains `Yes` into `Junk`. For an
+The built-in default script files messages whose `X-Spam` header contains `Yes` into the
+account's mailbox with the `\Junk` special-use attribute, or into `Junk` if none has it. For an
 address with a detail, it files the message into a mailbox named after the detail, creating it if
 needed. Any sender can therefore create a folder in an account by writing to `user+name@`.
 
