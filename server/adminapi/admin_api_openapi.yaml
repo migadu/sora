@@ -1876,12 +1876,13 @@ paths:
         and broadcasts the kick to the cluster, where each node ends the account's sessions
         and drops its cached logins.
         The account is kicked by its database account ID and by the ID derived from each
-        of its addresses: a proxy keys a session that remote lookup authenticated by the ID
-        derived from the address the lookup answered, also when the database holds the
+        of its database addresses: a proxy keys a session that remote lookup authenticated
+        by the ID derived from the address the lookup answered, also when the database holds the
         account. An address the database does not know (a lookup service's own account) is
-        kicked by the ID derived from it. A session the lookup service answered with an
-        address the database does not hold for the account is keyed by that address's ID
-        and is not reached. When the database cannot be asked, nothing is kicked and the
+        kicked by the ID derived from it. If the lookup service answered with an address
+        the database does not hold for the account, kicking another address of the account
+        does not reach that session. Kick the lookup service's answered address explicitly
+        to reach it. When the database cannot be asked, nothing is kicked and the
         answer is 500. The response does not count sessions: they end within seconds, as
         each node applies the kick.
       requestBody:

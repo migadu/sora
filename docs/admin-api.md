@@ -540,12 +540,13 @@ logins. `user_email` is required; `protocol` (IMAP, POP3, ManageSieve or LMTP, a
 the kick to the trackers of that protocol.
 
 The account is kicked by its database account ID and by the ID derived from each of its
-addresses: a proxy keys a session that remote lookup authenticated by the ID derived from the
-address the lookup answered, also when the database holds the account. An address the database
-does not know (a lookup service's own account) is kicked by the ID derived from it. Ending the
+database addresses: a proxy keys a session that remote lookup authenticated by the ID derived
+from the address the lookup answered, also when the database holds the account. An address
+the database does not know (a lookup service's own account) is kicked by the ID derived from it. Ending the
 sessions of a deleted or purged account, and dropping cached logins after a password change or
-a removed credential, use the same IDs. A session the lookup service answered with an address
-the database does not hold for the account is keyed by that address's ID and is not reached.
+a removed credential, use the same IDs. If the lookup service answered with an address the
+database does not hold for the account, kicking another address of the account does not
+reach that session. Kick the lookup service's answered address explicitly to reach it.
 
 **Request Body:**
 ```json
