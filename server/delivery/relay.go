@@ -67,8 +67,8 @@ type RelayHandler interface {
 // SMTPRelayHandler implements SMTP relay with configurable TLS and circuit breaker.
 type SMTPRelayHandler struct {
 	SMTPHost       string
-	UseTLS         bool   // Use TLS (default: true)
-	TLSVerify      bool   // Verify TLS certificates (default: true)
+	UseTLS         bool   // Use TLS; false relays in plaintext ([relay] smtp_tls, default true)
+	TLSVerify      bool   // Verify the relay's certificate ([relay] smtp_tls_verify, default true)
 	UseStartTLS    bool   // Use STARTTLS instead of direct TLS
 	TLSCertFile    string // Client certificate for mTLS (optional)
 	TLSKeyFile     string // Client key for mTLS (optional)
@@ -320,6 +320,13 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 				MinVersion: tls.VersionTLS12,
 			},
 		},
+		// Never follow a redirect: a followed 301/302/303 turns the POST into a
+		// body-less GET whose 2xx would count as delivered, and a 307/308 replays
+		// the message and the bearer token to the Location. The 3xx reaches the
+		// status check below as a failure.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
 	resp, err := client.Do(req)
@@ -333,13 +340,16 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 	// Check response status
 	// HTTP 5xx = server error (temporary, server may recover)
 	// HTTP 4xx = client error (permanent, e.g., bad auth, invalid request)
+	// HTTP 3xx = http_url is not the final URL (temporary, the message stays queued until it is fixed)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		permanent := resp.StatusCode >= 400 && resp.StatusCode < 500 // 4xx = permanent
-		return &RelayError{
-			Err:       fmt.Errorf("HTTP relay returned error status: %d", resp.StatusCode),
-			Permanent: permanent,
+		err := fmt.Errorf("HTTP relay returned error status: %d", resp.StatusCode)
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			err = fmt.Errorf("HTTP relay returned redirect status %d to %q; redirects are not followed, so [relay] http_url must be the final URL",
+				resp.StatusCode, resp.Header.Get("Location"))
 		}
+		return &RelayError{Err: err, Permanent: permanent}
 	}
 
 	metrics.LMTPExternalRelay.WithLabelValues("success").Inc()
@@ -353,7 +363,12 @@ type CircuitBreakerConfig struct {
 	MaxRequests int           // Max requests in half-open state (default: 3)
 }
 
-// NewRelayHandlerFromConfig creates the appropriate relay handler based on configuration with circuit breaker
+// NewRelayHandlerFromConfig creates the appropriate relay handler based on configuration with circuit breaker.
+//
+// The breaker trips on consecutive failures, which a success resets, so its counts are
+// never cleared on a timer (Interval 0). With a counting window, an attempt that takes
+// longer than the window to fail (a blackholed relay's 30 s dial, a hung one's 5 min
+// command timeout) has its result dropped, and a dead relay never opens the breaker.
 func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsLabel string, useTLS, tlsVerify, useStartTLS bool, tlsCertFile, tlsKeyFile, heloHost string, logger Logger, cbConfig CircuitBreakerConfig) RelayHandler {
 	// Apply defaults if not set
 	if cbConfig.Threshold <= 0 {
@@ -372,7 +387,7 @@ func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsL
 		cb := circuitbreaker.NewCircuitBreaker(circuitbreaker.Settings{
 			Name:        "smtp_relay",
 			MaxRequests: uint32(cbConfig.MaxRequests),
-			Interval:    10 * time.Second,
+			Interval:    0, // counts cleared only by state changes; see above
 			Timeout:     cbConfig.Timeout,
 			ReadyToTrip: func(counts circuitbreaker.Counts) bool {
 				return counts.ConsecutiveFailures >= uint32(cbConfig.Threshold)
@@ -410,7 +425,7 @@ func NewRelayHandlerFromConfig(relayType, smtpHost, httpURL, httpToken, metricsL
 		cb := circuitbreaker.NewCircuitBreaker(circuitbreaker.Settings{
 			Name:        "http_relay",
 			MaxRequests: uint32(cbConfig.MaxRequests),
-			Interval:    10 * time.Second,
+			Interval:    0, // counts cleared only by state changes; see above
 			Timeout:     cbConfig.Timeout,
 			ReadyToTrip: func(counts circuitbreaker.Counts) bool {
 				return counts.ConsecutiveFailures >= uint32(cbConfig.Threshold)

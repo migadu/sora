@@ -561,7 +561,7 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 
 		// Broadcast to cluster
 		if a.clusterLimiter != nil {
-			a.clusterLimiter.BroadcastBlockIP(ip, blockedUntil, info.FailureCount, a.protocol, info.FirstFailure)
+			a.clusterLimiter.BroadcastBlockIP(ip, blockedUntil, info.FailureCount, info.FirstFailure)
 		}
 	} else if info.FailureCount >= a.config.DelayStartThreshold {
 		logger.Debug("Auth limiter: Progressive delay for IP", "protocol", a.protocol, "ip", ip, "delay", info.LastDelay, "failures", info.FailureCount)
@@ -695,13 +695,18 @@ func (a *AuthRateLimiter) clearUsernameFailure(username string) {
 	}
 
 	a.usernameMu.Lock()
+	_, tracked := a.usernameFailureCounts[username]
 	delete(a.usernameFailureCounts, username)
 	a.usernameMu.Unlock()
 
 	logger.Debug("Auth limiter: Cleared username failure tracking after successful login", "protocol", a.protocol, "username", username)
 
-	// Broadcast to cluster
-	if a.clusterLimiter != nil {
+	// Every username failure is broadcast, so a peer holds failures for this
+	// username only if one reached us too. With none here there is nothing for
+	// the cluster to clear, and an ordinary login - the most frequent event a
+	// proxy sees - costs no gossip. A failure still in flight stays counted on
+	// the peer that saw it until its window ends; the count is statistics only.
+	if tracked && a.clusterLimiter != nil {
 		a.clusterLimiter.BroadcastUsernameSuccess(username)
 	}
 }

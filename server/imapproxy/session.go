@@ -1045,15 +1045,8 @@ func (s *Session) authenticateUser(username, password string) error {
 		s.DebugLog("remotelookup authentication", "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
 
 		if err != nil {
-			// Categorize the error type to determine fallback behavior
-			if errors.Is(err, proxy.ErrRemoteLookupInvalidResponse) {
-				// Invalid response from remotelookup (malformed 2xx) - this is a server bug, fail hard
-				s.ErrorLog("remotelookup returned invalid response - server bug", "error", err)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return fmt.Errorf("remotelookup server error: invalid response")
-			}
-
+			// Categorize the error type to determine fallback behavior. A malformed
+			// answer arrives as ErrRemoteLookupTransient: a broken lookup service.
 			if errors.Is(err, proxy.ErrRemoteLookupTransient) {
 				// Check if this is due to context cancellation (server shutdown)
 				if errors.Is(err, server.ErrServerShuttingDown) {
@@ -1063,12 +1056,14 @@ func (s *Session) authenticateUser(username, password string) error {
 				}
 
 				// Transient error (network, 5xx, circuit breaker) - NEVER fallback to DB
-				// These are service availability issues, not "user not found" cases
+				// These are service availability issues, not "user not found" cases.
+				// Nothing is wrong with the client's credentials: answer a temporary
+				// failure (NO [UNAVAILABLE]) and do not charge the auth rate limiter, or
+				// clients retrying during an outage get delayed and blocked.
 				s.WarnLog("remotelookup transient error - service unavailable", "error", err)
 				metrics.RemoteLookupResult.WithLabelValues("imap", "transient_error_rejected").Inc()
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return fmt.Errorf("remotelookup service unavailable")
+				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+				return server.ErrAuthServiceUnavailable
 			} else {
 				// Unknown error type - fallthrough to main DB auth
 			}
@@ -1225,20 +1220,10 @@ func (s *Session) authenticateUser(username, password string) error {
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 
-			// Only cache definitive authentication failures, NOT transient errors
-			// Definitive failures: user not found, wrong password (from bcrypt.CompareHashAndPassword)
-			// Do NOT cache: DB connection errors, timeouts, etc (let circuit breakers handle those)
-			isDefinitiveFailure := errors.Is(err, consts.ErrUserNotFound) ||
-				strings.Contains(err.Error(), "hashedPassword is not the hash") || // bcrypt wrong password
-				strings.Contains(err.Error(), "user not found")
-
-			// Determine failure reason for logging
-			reason := "transient_error"
-			if errors.Is(err, consts.ErrUserNotFound) || strings.Contains(err.Error(), "user not found") {
-				reason = "user_not_found"
-			} else if strings.Contains(err.Error(), "hashedPassword is not the hash") {
-				reason = "invalid_password"
-			}
+			// Only cache definitive authentication failures (user not found, wrong
+			// password), NOT transient errors (DB connection errors, timeouts, etc):
+			// circuit breakers handle those.
+			reason, isDefinitiveFailure := proxy.ClassifyDBAuthFailure(err)
 
 			if isDefinitiveFailure {
 				s.DebugLog("caching definitive auth failure", "username", username)

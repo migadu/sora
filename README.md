@@ -42,7 +42,6 @@ It provides enterprise-grade email infrastructure with modern storage backends, 
 - **Health monitoring** with component status tracking (26 Prometheus metrics)
 - **Rate limiting** with cluster-wide synchronization and IP blocking
 - **Connection limits** per protocol, per IP, and per user
-- **Graceful degradation** strategies under load
 - **Background workers** with distributed task processing
 - **Relay queue** with disk persistence and exponential backoff retry
 - **JA4 TLS fingerprinting** for client detection and capability filtering
@@ -395,8 +394,9 @@ Manage multiple credentials per account:
 ./sora-admin health --config config.toml
 ./sora-admin health --config config.toml --detailed
 
-# View authentication statistics
-./sora-admin stats auth --config config.toml --window 24h
+# List addresses blocked by the authentication rate limiters
+./sora-admin stats blocked --config config.toml
+./sora-admin stats blocked --config config.toml --protocol imap_proxy
 
 # Kick connections
 ./sora-admin connections kick --config config.toml --user user@example.com

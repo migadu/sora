@@ -98,6 +98,10 @@ The default base URL depends on your configuration:
 
 All endpoints are prefixed with `/admin/`.
 
+An `{email}` in a path is one path segment: percent-encode it (`url.PathEscape`,
+`encodeURIComponent`), so a `/` in the local part goes as `%2F`. An unencoded `/` separates
+segments, and such a request answers `404`.
+
 ## API Endpoints
 
 ### Account Management
@@ -481,26 +485,24 @@ Monitor and manage active client connections to the mail server.
 
 **Endpoint:** `GET /admin/connections`
 
-Retrieve all active connections across all protocols.
+List the accounts with sessions on this node: one entry per account and connection tracker, not per session. `instance` is the tracker key (`<PROTOCOL>-<server name>` on a backend, `<PROTOCOL>-<cluster node_id>-<server name>` on a proxy, with the host name in place of the node_id outside cluster mode, where the LMTP proxy is the only proxy that tracks sessions) and `protocol` its first part. `email` is the address of the session that created the entry (the login address, or the recipient on an LMTP proxy). `local_count` is the account's sessions on this tracker; `total_count` adds the sessions other nodes report for the protocol through gossip (backends and LMTP proxies do not gossip, so there it equals `local_count`). `last_update` also moves when gossip about the account arrives, even if no count changed. Accounts this node knows only through gossip are not listed. Without connection trackers the response has no entries and a `note` instead of `source`.
 
 **Response:** `200 OK`
 ```json
 {
   "connections": [
     {
-      "ID": 1,
-      "AccountID": 123,
-      "Protocol": "IMAP",
-      "ClientAddr": "192.168.1.100:54321",
-      "ServerAddr": "10.0.1.10:143",
-      "InstanceID": "sora-instance-1",
-      "ConnectedAt": "2024-01-20T09:15:00Z",
-      "LastActivity": "2024-01-20T09:20:00Z",
-      "ShouldTerminate": false,
-      "Email": "user@example.com"
+      "protocol": "IMAP",
+      "instance": "IMAP-node1-imap-proxy",
+      "account_id": 123,
+      "email": "user@example.com",
+      "local_count": 2,
+      "total_count": 3,
+      "last_update": "2024-01-20T09:20:00Z"
     }
   ],
-  "count": 1
+  "count": 1,
+  "source": "in-memory connection tracker"
 }
 ```
 
@@ -508,22 +510,18 @@ Retrieve all active connections across all protocols.
 
 **Endpoint:** `GET /admin/connections/stats`
 
-Get aggregated statistics about active connections.
+Get the number of active connections on this node, every session counted, in total and per connection tracker. Trackers are keyed `<PROTOCOL>-<server name>` on a backend and `<PROTOCOL>-<cluster node_id>-<server name>` on a proxy (the host name in place of the node_id outside cluster mode). Connections other nodes report through gossip are not included. For a cluster total, sum the proxy nodes or the backend nodes, not both: a session through a proxy is counted by the proxy and again by its backend (also within one node that runs both).
 
 **Response:** `200 OK`
 ```json
 {
-  "TotalConnections": 150,
-  "ConnectionsByProtocol": {
-    "IMAP": 120,
-    "POP3": 20,
-    "ManageSieve": 10
+  "total_connections": 150,
+  "connections_by_protocol": {
+    "IMAP-imap": 120,
+    "POP3-pop3": 20,
+    "ManageSieve-managesieve": 10
   },
-  "ConnectionsByServer": {
-    "10.0.1.10:143": 80,
-    "10.0.1.11:143": 70
-  },
-  "Users": [...]
+  "source": "in-memory connection tracker"
 }
 ```
 
@@ -566,14 +564,24 @@ curl -X POST http://localhost:8080/admin/connections/kick \
 
 **Endpoint:** `GET /admin/connections/user/{email}`
 
-Get all active connections for a specific user.
+Get the user's entries on this node's connection trackers, matched case-insensitively against each entry's `email`: an account whose entry was created by an alias login is found only under that alias. Unlike `GET /admin/connections`, `protocol` is the whole tracker key, there is no `instance`, and a tracker that knows the account only through gossip is listed with `local_count` 0.
 
 **Response:** `200 OK`
 ```json
 {
   "email": "user@example.com",
-  "connections": [...],
-  "count": 3
+  "connections": [
+    {
+      "protocol": "IMAP-node1-imap-proxy",
+      "account_id": 123,
+      "email": "user@example.com",
+      "local_count": 2,
+      "total_count": 3,
+      "last_update": "2024-01-20T09:20:00Z"
+    }
+  ],
+  "count": 1,
+  "source": "in-memory connection tracker"
 }
 ```
 
@@ -585,18 +593,17 @@ Monitor and manage the local filesystem cache for message bodies.
 
 **Endpoint:** `GET /admin/cache/stats`
 
-Get current cache statistics including size, items, and hit/miss ratios.
+Get this node's cache statistics: size, object count, and hits/misses since the cache was opened. The keys are Go field names; `HitRatio` is from 0 to 1 and `Uptime` is in nanoseconds.
 
 **Response:** `200 OK`
 ```json
 {
-  "total_size": 524288000,
-  "items": 1523,
-  "hits": 45678,
-  "misses": 3421,
-  "hit_rate": 0.93,
-  "capacity": 1073741824,
-  "path": "/var/sora/cache"
+  "TotalSizeBytes": 524288000,
+  "ObjectCount": 1523,
+  "Hits": 45678,
+  "Misses": 3421,
+  "HitRatio": 0.93,
+  "Uptime": 86400000000000
 }
 ```
 
@@ -642,12 +649,20 @@ Clear the entire cache. Returns statistics before and after purge.
 {
   "message": "Cache purged successfully",
   "stats_before": {
-    "total_size": 524288000,
-    "items": 1523
+    "TotalSizeBytes": 524288000,
+    "ObjectCount": 1523,
+    "Hits": 45678,
+    "Misses": 3421,
+    "HitRatio": 0.93,
+    "Uptime": 86400000000000
   },
   "stats_after": {
-    "total_size": 0,
-    "items": 0
+    "TotalSizeBytes": 0,
+    "ObjectCount": 0,
+    "Hits": 45678,
+    "Misses": 3421,
+    "HitRatio": 0.93,
+    "Uptime": 86400000000000
   }
 }
 ```
@@ -664,7 +679,7 @@ Get status of the S3 upload queue.
 
 **Query Parameters:**
 - `show_failed=true` - Include list of recent failed uploads
-- `max_attempts=5` - Failure threshold
+- `max_attempts=N` - Failure threshold (default: `[uploader] max_attempts`, 20 unless configured)
 - `failed_limit=10` - Limit failed uploads returned
 
 **Response:** `200 OK`
@@ -690,7 +705,7 @@ Get status of the S3 upload queue.
 Get list of failed S3 uploads.
 
 **Query Parameters:**
-- `max_attempts=5` - Failure threshold
+- `max_attempts=N` - Failure threshold (default: `[uploader] max_attempts`, 20 unless configured)
 - `limit=50` - Maximum records to return
 
 **Response:** `200 OK`
@@ -713,33 +728,57 @@ Get list of failed S3 uploads.
 
 ### Authentication Statistics
 
-Monitor authentication attempts and track potential security issues.
+Failed logins are tracked in memory by each server's authentication rate limiter, per address, and expire on their own. The API exposes the addresses those limiters currently block. IMAP, POP3 and ManageSieve attempt counts (servers and proxies) are exported as the Prometheus counter `sora_authentication_attempts_total`; User API logins are not counted there.
 
 #### Get Authentication Statistics
 
 **Endpoint:** `GET /admin/auth/stats`
 
-Get statistics about authentication attempts.
-
-**Query Parameters:**
-- `window=24h` - Time window (e.g., "1h", "30m", "24h")
+Returns no counters: the response is the same fixed description of the tracking on every call. Use [`GET /admin/auth/blocked`](#list-blocked-addresses) for live data. Query parameters are ignored; the `window` parameter of older versions is still accepted.
 
 **Response:** `200 OK`
 ```json
 {
-  "stats": {
-    "total_attempts": 1523,
-    "successful_attempts": 1489,
-    "failed_attempts": 34,
-    "unique_ips": 245,
-    "unique_usernames": 180,
-    "unique_protocols": 3,
-    "window_duration": "24h0m0s"
+  "implementation": "in-memory",
+  "tracking_mode": "per-address rate limiting with automatic expiry",
+  "available_stats": {
+    "blocked_entries": "GET /admin/auth/blocked"
   },
-  "window": "24h",
-  "window_seconds": 86400
+  "access_methods": {
+    "blocked_list": "GET /admin/auth/blocked - list currently blocked addresses"
+  }
 }
 ```
+
+#### List Blocked Addresses
+
+**Endpoint:** `GET /admin/auth/blocked`
+
+List the IP and IP+username blocks currently held by this node's authentication rate limiters.
+
+**Query Parameters:**
+- `protocol=imap` - Only the rate limiters of this server type: `imap`, `imap_proxy`, `pop3`, `pop3_proxy`, `managesieve`, `managesieve_proxy` or `userapi`
+
+**Response:** `200 OK`
+```json
+{
+  "blocked_entries": [
+    {
+      "ip": "192.0.2.10",
+      "username": "user@example.com",
+      "blocked_until": "2026-11-14T10:45:00Z",
+      "failure_count": 5,
+      "first_failure": "2026-11-14T10:29:12Z",
+      "last_failure": "2026-11-14T10:30:00Z",
+      "protocol": "IMAP",
+      "type": "ip_username"
+    }
+  ],
+  "count": 1
+}
+```
+
+`type` is `ip_username` for a block of one username from one IP and `ip` for a block of every login from the IP; `username` is absent for an `ip` block. `protocol` is the rate limiter's label (`IMAP`, `POP3`, `ManageSieve`, `IMAP-PROXY`, `POP3-PROXY`, `SIEVE-PROXY` or `user-api`), not the server type the query parameter takes.
 
 ### Health Monitoring
 
@@ -934,6 +973,7 @@ curl -X POST http://localhost:8080/admin/mail/deliver \
 **Notes:**
 - Messages must be valid RFC822 format
 - Sieve filters are applied to delivered messages
+- `503 Service Unavailable` with `Retry-After` means retry later or on another node: the backend is in maintenance, the node has no upload worker (it runs no `imap`, `pop3` or `lmtp` server), or the single recipient failed for a server-side reason (`"transient": true`)
 - Large messages (up to server limits) are supported
 - Supports MIME multipart messages
 
@@ -1222,7 +1262,7 @@ The Admin API implements rate limiting based on authentication attempts and API 
 
 4. **Rotate API keys periodically**
 
-5. **Monitor authentication statistics** for suspicious activity
+5. **Monitor blocked addresses** ([`GET /admin/auth/blocked`](#list-blocked-addresses)) and the `sora_authentication_attempts_total` counter for suspicious activity
 
 ### Performance
 

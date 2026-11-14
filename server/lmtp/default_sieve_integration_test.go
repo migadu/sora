@@ -3,6 +3,7 @@
 package lmtp_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emersion/go-message"
 	"github.com/emersion/go-smtp"
 	"github.com/migadu/sora/integration_tests/common"
 	lmtpserver "github.com/migadu/sora/server/lmtp"
@@ -22,13 +24,17 @@ type defaultVacationQueue struct {
 }
 
 type defaultVacationItem struct {
-	from, to, kind string
+	envelopeFrom, from, to, kind string // from: the reply's From field
 }
 
-func (q *defaultVacationQueue) Enqueue(from, to, kind string, _ []byte) error {
+func (q *defaultVacationQueue) Enqueue(envelopeFrom, to, kind string, body []byte) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.items = append(q.items, defaultVacationItem{from: from, to: to, kind: kind})
+	from := ""
+	if entity, err := message.Read(bytes.NewReader(body)); err == nil {
+		from = entity.Header.Get("From")
+	}
+	q.items = append(q.items, defaultVacationItem{envelopeFrom: envelopeFrom, from: from, to: to, kind: kind})
 	return nil
 }
 
@@ -89,8 +95,8 @@ vacation :days 7 :subject "Away" "I am away.";
 			t.Fatalf("vacation handoffs = %d, want %d: %+v", len(items), len(wantFrom), items)
 		}
 		for i, from := range wantFrom {
-			if item := items[i]; item.kind != "vacation" || item.from != from || item.to != sender {
-				t.Errorf("handoff %d = %+v, want vacation from %s to %s", i, item, from, sender)
+			if item := items[i]; item.kind != "vacation" || item.envelopeFrom != "" || item.from != from || item.to != sender {
+				t.Errorf("handoff %d = %+v, want vacation <> -> %s, From %s", i, item, sender, from)
 			}
 		}
 	}
@@ -123,7 +129,7 @@ vacation :days 7 :subject "Away" "I am away.";
 	}
 	deliver(accountA.Email, 4)
 	assertReplies(accountA.Email, accountB.Email, accountA.Email)
-	assertRecords(accountAID, 2)
+	assertRecords(accountAID, 1) // the new period supersedes the expired one
 	deliver(accountB.Email, 5)
 	assertReplies(accountA.Email, accountB.Email, accountA.Email)
 	assertRecords(accountBID, 1)

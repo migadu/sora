@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/assert"
@@ -19,7 +21,7 @@ func TestMetadataSetAndGet(t *testing.T) {
 	ctx := context.Background()
 
 	// Create test account
-	accountID := createTestAccount(t, db, "test-setget@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-setget-%d@example.com", time.Now().UnixNano()), "password")
 
 	// Test server metadata (mailbox_id = nil)
 	t.Run("ServerMetadata", func(t *testing.T) {
@@ -123,7 +125,7 @@ func TestMetadataUpdate(t *testing.T) {
 
 	db := setupTestDatabase(t)
 	ctx := context.Background()
-	accountID := createTestAccount(t, db, "test-update@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-update-%d@example.com", time.Now().UnixNano()), "password")
 
 	entryName := "/private/comment"
 	initialValue := bytePtr([]byte("Initial value"))
@@ -173,7 +175,7 @@ func TestMetadataDelete(t *testing.T) {
 
 	db := setupTestDatabase(t)
 	ctx := context.Background()
-	accountID := createTestAccount(t, db, "test-delete@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-delete-%d@example.com", time.Now().UnixNano()), "password")
 
 	entryName := "/private/comment"
 	value := bytePtr([]byte("To be deleted"))
@@ -222,7 +224,7 @@ func TestMetadataDepth(t *testing.T) {
 
 	db := setupTestDatabase(t)
 	ctx := context.Background()
-	accountID := createTestAccount(t, db, "test-depth@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-depth-%d@example.com", time.Now().UnixNano()), "password")
 
 	// Set up hierarchical entries
 	entries := map[string]*[]byte{
@@ -307,7 +309,7 @@ func TestMetadataMaxSize(t *testing.T) {
 
 	db := setupTestDatabase(t)
 	ctx := context.Background()
-	accountID := createTestAccount(t, db, "test-maxsize@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-maxsize-%d@example.com", time.Now().UnixNano()), "password")
 
 	// Set entries with different sizes
 	entries := map[string]*[]byte{
@@ -362,7 +364,7 @@ func TestMetadataEmptyValue(t *testing.T) {
 
 	db := setupTestDatabase(t)
 	ctx := context.Background()
-	accountID := createTestAccount(t, db, "test-empty@example.com", "password")
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-empty-%d@example.com", time.Now().UnixNano()), "password")
 
 	// Set entry with empty byte slice
 	emptyValue := bytePtr([]byte{})

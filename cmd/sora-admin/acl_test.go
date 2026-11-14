@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -304,15 +303,9 @@ func testACLListAfterRevoke(t *testing.T, rdb *resilient.ResilientDatabase, owne
 func setupACLTestDatabase(t *testing.T) *resilient.ResilientDatabase {
 	t.Helper()
 
-	// Load test configuration - use adminConfig structure instead of full config
-	cfg := AdminConfig{}
-	if _, err := toml.DecodeFile("../../config-test.toml", &cfg); err != nil {
-		t.Fatalf("Failed to load test config: %v", err)
-	}
-
 	// Create database connection
 	ctx := context.Background()
-	rdb, err := resilient.NewResilientDatabase(ctx, &cfg.Database, false, true)
+	rdb, err := resilient.NewResilientDatabase(ctx, configTestDatabase(t), false, true)
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}

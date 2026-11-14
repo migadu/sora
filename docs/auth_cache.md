@@ -43,9 +43,9 @@ Add an `[auth_cache]` section to `config.toml`:
 [auth_cache]
 enabled = true
 path = "/var/cache/sora/auth/auth_cache.db"
-max_age = "168h"           # 7 days - entries older than this are considered stale
+max_age = "24h"            # entries older than this are considered stale
 cleanup_interval = "1h"    # Run cleanup every hour
-purge_unused = "720h"      # 30 days - entries unused for this long are removed
+purge_unused = "168h"      # 7 days - entries unused for this long are removed
 ```
 
 ### Parameters
@@ -53,10 +53,10 @@ purge_unused = "720h"      # 30 days - entries unused for this long are removed
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `false` | Enable the persistent auth cache |
-| `path` | `/tmp/sora/auth_cache.db` | Path to the SQLite database file |
-| `max_age` | `168h` (7 days) | Maximum age before an entry is considered expired |
+| `path` | `/var/cache/sora/auth_cache.db` | Path to the SQLite database file |
+| `max_age` | `24h` | Maximum age before an entry is considered expired |
 | `cleanup_interval` | `1h` | How often the cleanup loop runs to purge stale entries |
-| `purge_unused` | `720h` (30 days) | Entries unused for this duration are removed |
+| `purge_unused` | `168h` (7 days) | Entries unused for this duration are removed |
 
 The `[auth_cache]` is a **global configuration** — when enabled, it applies to all proxy servers automatically. There is no per-proxy cache configuration.
 
