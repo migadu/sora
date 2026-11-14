@@ -562,7 +562,7 @@ func proxiesWithAffinity(cfg config.Config) []string {
 	var names []string
 	for _, s := range cfg.GetAllServers() {
 		switch s.Type {
-		case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy":
+		case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy":
 			if s.EnableAffinity {
 				names = append(names, s.Name)
 			}
@@ -1180,7 +1180,6 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		} else {
 			logger.Info("Spam training client initialized",
 				"endpoint", cfg.SpamTraining.Endpoint,
-				"async", cfg.SpamTraining.Async,
 				"cb_threshold", cfg.SpamTraining.CircuitBreaker.GetThreshold())
 		}
 	}
@@ -1239,7 +1238,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 	// Start all configured servers dynamically
 	for _, server := range allServers {
 		// Warn about unused config options
-		server.WarnUnusedConfigOptions(func(format string, args ...any) { logger.Info(fmt.Sprintf(format, args...)) })
+		server.WarnUnusedConfigOptions(func(format string, args ...any) { logger.Warn(fmt.Sprintf(format, args...)) })
 
 		// Surface a dangerous misconfiguration: plaintext authentication allowed without
 		// TLS on a publicly reachable listener (clients would send credentials in the
@@ -1602,6 +1601,7 @@ func buildLMTPServerOptions(deps *serverDependencies, serverConfig config.Server
 		MaxRedirectHops:         serverConfig.GetMaxRedirectHops(),
 		SharedMailboxes:         deps.config.SharedMailboxes,
 		CommandTimeoutOverrides: lmtpCommandTimeoutOverrides,
+		IdleTimeout:             serverConfig.GetCommandTimeoutWithDefault(),
 	}
 }
 
@@ -1901,6 +1901,7 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteTLS:                serverConfig.RemoteTLS,
 		RemoteTLSUseStartTLS:     serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
+		RemoteTLSCAFile:          serverConfig.RemoteTLSCAFile,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseIDCommand:       serverConfig.RemoteUseIDCommand,
 		ProxyProtocol:            serverConfig.ProxyProtocol,
@@ -2166,6 +2167,7 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		RemoteTLS:                serverConfig.RemoteTLS,
 		RemoteTLSUseStartTLS:     serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
+		RemoteTLSCAFile:          serverConfig.RemoteTLSCAFile,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		ProxyProtocol:            serverConfig.ProxyProtocol,
 		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
@@ -2243,18 +2245,8 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	deps.serverManager.Add()
 	defer deps.serverManager.Done()
 
-	// Warn if user configured connection limits (they will be ignored for LMTP)
-	if serverConfig.MaxConnectionsPerUser > 0 {
-		logger.Warn("LMTP proxy: max_connections_per_user configured but will be ignored (LMTP uses local-only tracking with limits disabled)",
-			"name", serverConfig.Name,
-			"configured_value", serverConfig.MaxConnectionsPerUser)
-	}
-	if serverConfig.MaxConnectionsPerUserPerIP > 0 {
-		logger.Warn("LMTP proxy: max_connections_per_user_per_ip configured but will be ignored (LMTP uses local-only tracking with limits disabled)",
-			"name", serverConfig.Name,
-			"configured_value", serverConfig.MaxConnectionsPerUserPerIP)
-	}
-
+	// max_connections_per_user(_per_ip) are not applied (local-only tracking with limits
+	// disabled); WarnUnusedConfigOptions says so at startup.
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
 	if err != nil {
@@ -2294,6 +2286,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteTLS:                serverConfig.RemoteTLS,
 		RemoteTLSUseStartTLS:     serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
+		RemoteTLSCAFile:          serverConfig.RemoteTLSCAFile,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:         serverConfig.RemoteUseXCLIENT,
 		ProxyProtocol:            serverConfig.ProxyProtocol,
@@ -2582,6 +2575,12 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		tlsConfig = tlsmanager.WrapTLSConfigWithDefaultDomain(tlsConfig, serverConfig.TLSDefaultDomain)
 	}
 
+	// enable_affinity decides, as on every other proxy; nil reads and writes no affinity.
+	var userAPIProxyAffinity *server.AffinityManager
+	if serverConfig.EnableAffinity {
+		userAPIProxyAffinity = deps.affinityManager
+	}
+
 	server, err := userapiproxy.New(ctx, deps.resilientDB, userapiproxy.ServerOptions{
 		Name:                     serverConfig.Name,
 		Addr:                     serverConfig.Addr,
@@ -2596,6 +2595,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		TLSConfig:                tlsConfig,
 		RemoteTLS:                serverConfig.RemoteTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
+		RemoteTLSCAFile:          serverConfig.RemoteTLSCAFile,
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		EnableBackendHealthCheck: serverConfig.GetRemoteHealthChecks(),
@@ -2605,7 +2605,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		TrustedProxies:           deps.config.Servers.TrustedNetworks,
 		RemoteLookup:             serverConfig.RemoteLookup,
 		LookupCache:              serverConfig.LookupCache,
-		AffinityManager:          deps.affinityManager,
+		AffinityManager:          userAPIProxyAffinity,
 		ProxyProtocol:            serverConfig.ProxyProtocol,
 		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
