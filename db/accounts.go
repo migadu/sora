@@ -54,7 +54,10 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 	// Generate password hash or use provided hash
 	var hashedPassword string
 	if req.PasswordHash != "" {
-		// Use provided hash directly
+		// Use provided hash directly, if it is one VerifyPassword can check
+		if err = ValidatePasswordHash(req.PasswordHash); err != nil {
+			return 0, fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+		}
 		hashedPassword = req.PasswordHash
 	} else {
 		// Generate hash from password
@@ -126,7 +129,10 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 	// Generate password hash or use provided hash
 	var hashedPassword string
 	if req.NewPasswordHash != "" {
-		// Use provided hash directly
+		// Use provided hash directly, if it is one VerifyPassword can check
+		if err = ValidatePasswordHash(req.NewPasswordHash); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+		}
 		hashedPassword = req.NewPasswordHash
 	} else {
 		// Generate hash from password
@@ -218,7 +224,10 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 	var hashedPassword string
 	var updatePassword bool
 	if req.PasswordHash != "" {
-		// Use provided hash directly
+		// Use provided hash directly, if it is one VerifyPassword can check
+		if err = ValidatePasswordHash(req.PasswordHash); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+		}
 		hashedPassword = req.PasswordHash
 		updatePassword = true
 	} else if req.Password != "" {
@@ -366,8 +375,9 @@ var (
 	// ErrInvalidAccountRequest wraps the errors CreateAccount, CreateAccountWithCredentials
 	// and UpdateAccount return for a request that cannot succeed as written (malformed
 	// address, no or several primaries, an address twice, unknown hash type, a password
-	// over bcrypt's 72 bytes, ...), so a caller can tell a bad request from a database
-	// failure.
+	// over bcrypt's 72 bytes, a password_hash VerifyPassword cannot check, ...), so a
+	// caller can tell a bad request from a database failure. AddCredential wraps it for
+	// a password_hash too.
 	ErrInvalidAccountRequest = errors.New("invalid account request")
 )
 
@@ -1081,6 +1091,11 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 				return 0, fmt.Errorf("credential %d: %w", i+1, err)
 			}
 		}
+		if cred.PasswordHash != "" {
+			if err := ValidatePasswordHash(cred.PasswordHash); err != nil {
+				return 0, fmt.Errorf("%w: credential %d: %w", ErrInvalidAccountRequest, i+1, err)
+			}
+		}
 	}
 
 	// Ensure exactly one primary credential
@@ -1143,7 +1158,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 		// Generate password hash or use provided hash
 		var hashedPassword string
 		if cred.PasswordHash != "" {
-			// Use provided hash directly
+			// Use provided hash directly (validated above)
 			hashedPassword = cred.PasswordHash
 		} else {
 			// Generate hash from password

@@ -168,13 +168,13 @@ func TestVerifySSHA512(t *testing.T) {
 			}
 
 			// Test correct password
-			err = verifySSHA512(hash, password)
+			err = VerifyPassword(hash, password)
 			if err != nil {
 				t.Errorf("Verification failed for correct password: %v", err)
 			}
 
 			// Test wrong password
-			err = verifySSHA512(hash, "wrongPassword")
+			err = VerifyPassword(hash, "wrongPassword")
 			if err == nil {
 				t.Error("Verification should fail for incorrect password")
 			}
@@ -190,7 +190,7 @@ func TestVerifySSHA512(t *testing.T) {
 			}
 
 			// But both should verify correctly
-			err = verifySSHA512(hash2, password)
+			err = VerifyPassword(hash2, password)
 			if err != nil {
 				t.Errorf("Second hash verification failed for correct password: %v", err)
 			}
@@ -198,20 +198,20 @@ func TestVerifySSHA512(t *testing.T) {
 	}
 
 	// Test malformed SSHA512 hash
-	err := verifySSHA512("{SSHA512}invalidBase64", password)
+	err := VerifyPassword("{SSHA512}invalidBase64", password)
 	if err == nil {
 		t.Error("Verification should fail for malformed hash")
 	}
 
 	// Test with invalid format prefix
-	err = verifySSHA512("{INVALID}hash", password)
+	err = VerifyPassword("{INVALID}hash", password)
 	if err == nil {
 		t.Error("Verification should fail for invalid format prefix")
 	}
 
 	// Test with too short hash
 	shortHash := "{SSHA512}" + base64.StdEncoding.EncodeToString([]byte("tooshort"))
-	err = verifySSHA512(shortHash, password)
+	err = VerifyPassword(shortHash, password)
 	if err == nil {
 		t.Error("Verification should fail for too short hash")
 	}
@@ -249,13 +249,13 @@ func TestVerifySHA512(t *testing.T) {
 			}
 
 			// Test correct password
-			err := verifySHA512(hash, password)
+			err := VerifyPassword(hash, password)
 			if err != nil {
 				t.Errorf("Verification failed for correct password: %v", err)
 			}
 
 			// Test wrong password
-			err = verifySHA512(hash, "wrongPassword")
+			err = VerifyPassword(hash, "wrongPassword")
 			if err == nil {
 				t.Error("Verification should fail for incorrect password")
 			}
@@ -269,13 +269,13 @@ func TestVerifySHA512(t *testing.T) {
 	}
 
 	// Test malformed SHA512 hash
-	err := verifySHA512("{SHA512}invalidBase64", password)
+	err := VerifyPassword("{SHA512}invalidBase64", password)
 	if err == nil {
 		t.Error("Verification should fail for malformed hash")
 	}
 
 	// Test with invalid format prefix
-	err = verifySHA512("{INVALID}hash", password)
+	err = VerifyPassword("{INVALID}hash", password)
 	if err == nil {
 		t.Error("Verification should fail for invalid format prefix")
 	}

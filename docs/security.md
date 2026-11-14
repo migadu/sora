@@ -22,7 +22,7 @@ Always use TLS to encrypt communications between clients, proxies, and servers.
 
 ## Authentication
 
-*   **Password Schemes**: Sora supports modern and legacy password hashing schemes. The default and recommended scheme is `bcrypt`. Support for various Dovecot schemes (`SSHA512`, `SHA512-CRYPT`, etc.) is included for easier migration. This is configured in the `sora-admin` tool or via the API when creating/updating credentials, not in `config.toml`.
+*   **Password Schemes**: Sora supports modern and legacy password hashing schemes. The default and recommended scheme is `bcrypt`. For migration, pre-computed hashes in Dovecot's `{BLF-CRYPT}`, `{CRYPT}` (bcrypt only), `{SSHA512}` and `{SHA512}` schemes are verified, with the scheme name and `.b64`/`.base64`/`.hex` suffix in any case, as in Dovecot. Other schemes (`SHA512-CRYPT`, `ARGON2ID`, ...) are not: `sora-admin` and the Admin API refuse to store a hash sora cannot verify, and no part of a stored hash is logged. This is configured in the `sora-admin` tool or via the API when creating/updating credentials, not in `config.toml`.
 
 *   **Master Users**: The `master_username` and `master_password` settings in the protocol server sections allow a special user to log in as any other user. This is primarily intended for proxy-to-backend authentication and administrative access. **Protect these credentials carefully.**
 
