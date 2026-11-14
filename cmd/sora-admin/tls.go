@@ -11,11 +11,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/storage"
@@ -184,6 +189,11 @@ Options:
   --config string       Path to TOML configuration file (required)
 
 This command deletes only expired certificates from both S3 and local cache.
+A certificate a node renews while clean runs is kept: on a bucket that keeps
+versions (Backblaze B2 buckets always do) clean deletes only the versions it
+found expired, which needs the right to delete object versions. A bucket
+without versioning offers no such check, so there clean deletes by name and
+takes a renewal stored during the run with it: run it while no node renews.
 
 Examples:
   # Clean expired certificates (with confirmation)
@@ -948,7 +958,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	prefix := "autocert/"
 	objChan, errChan := s3store.ListObjects(ctx, prefix, false)
 
-	var expiredCerts []CertificateInfo
+	var expiredCerts []expiredCertificate
 	now := time.Now()
 
 	// clean fails if it could not read a certificate (it cannot tell whether that one
@@ -992,17 +1002,9 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			}
 
 			// Download and parse certificate to check expiry
-			reader, err := s3store.GetContext(ctx, obj.Key)
+			certData, version, err := readTLSObject(ctx, s3store, obj.Key)
 			if err != nil {
 				logger.Warn("Failed to download certificate", "key", obj.Key, "error", err)
-				failures = append(failures, fmt.Errorf("read S3 object %s: %w", obj.Key, err))
-				continue
-			}
-
-			certData, err := io.ReadAll(reader)
-			reader.Close()
-			if err != nil {
-				logger.Warn("Failed to read certificate", "key", obj.Key, "error", err)
 				failures = append(failures, fmt.Errorf("read S3 object %s: %w", obj.Key, err))
 				continue
 			}
@@ -1015,7 +1017,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 			// Check if expired
 			if certInfo.Expiry.Before(now) {
-				expiredCerts = append(expiredCerts, certInfo)
+				expiredCerts = append(expiredCerts, expiredCertificate{CertificateInfo: certInfo, version: version})
 			}
 
 		case err, ok := <-errChan:
@@ -1080,10 +1082,11 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		}
 	}
 
-	// Delete expired certificates
+	// Delete expired certificates. A node may have stored a renewal under the same
+	// name since they were read, so each delete is tied to what clean found expired.
 	deleted, removed := 0, 0
 	for _, cert := range expiredCerts {
-		if err := s3store.DeleteContext(ctx, cert.S3Key); err != nil {
+		if err := deleteExpiredS3Object(ctx, s3store, cert.S3Key, cert.version, now); err != nil {
 			logger.Warn("Failed to delete certificate from S3", "key", cert.S3Key, "error", err)
 			failures = append(failures, fmt.Errorf("delete S3 object %s: %w", cert.S3Key, err))
 		} else {
@@ -1094,19 +1097,144 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		if !cert.InLocalCache {
 			continue
 		}
-		if err := os.Remove(cert.LocalPath); err != nil {
-			if !os.IsNotExist(err) {
-				logger.Warn("Failed to delete certificate from local cache", "path", cert.LocalPath, "error", err)
-				failures = append(failures, fmt.Errorf("delete local file %s: %w", cert.LocalPath, err))
-			}
+		gone, err := removeExpiredLocalCopy(cert.LocalPath, now)
+		if err != nil {
+			logger.Warn("Failed to delete certificate from local cache", "path", cert.LocalPath, "error", err)
+			failures = append(failures, fmt.Errorf("delete local file %s: %w", cert.LocalPath, err))
 			continue
 		}
-		logger.Info("Deleted expired certificate from local cache", "path", cert.LocalPath)
-		removed++
+		if gone {
+			logger.Info("Deleted expired certificate from local cache", "path", cert.LocalPath)
+			removed++
+		}
 	}
 
 	fmt.Printf("\nDeleted %d expired certificate(s) from S3 and %d file(s) from the local cache\n", deleted, removed)
 	return failed()
+}
+
+// expiredCertificate is a certificate clean found expired, with the version of the S3
+// object it read it from ("" when the bucket keeps no versions).
+type expiredCertificate struct {
+	CertificateInfo
+	version string
+}
+
+// readTLSObject downloads the object at key and returns it with the version the bucket
+// served, or "" when the bucket keeps no versions. A bucket whose versioning is
+// suspended names the version "null", which every write replaces in place: that does
+// not identify what was read, so it counts as none.
+func readTLSObject(ctx context.Context, s3store *storage.S3Storage, key string) ([]byte, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, s3store.Timeout)
+	defer cancel()
+	out, err := s3store.Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s3store.BucketName),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	version := aws.ToString(out.VersionId)
+	if version == "null" {
+		version = ""
+	}
+	return data, version, nil
+}
+
+// deleteExpiredS3Object deletes the expired certificate clean read from key, given the
+// version it read. On a bucket that keeps versions it deletes that version and no
+// other, so a renewal a node stored since (a newer version) stays. Deleting a version
+// brings back the one before it, an older certificate; while that one has expired too
+// it is deleted the same way, so the name is left absent, as a plain delete leaves it,
+// or holding a valid certificate. A bucket without versions offers nothing to tie the
+// delete to what was read: there the object is deleted by name.
+func deleteExpiredS3Object(ctx context.Context, s3store *storage.S3Storage, key, version string, now time.Time) error {
+	if version == "" {
+		return s3store.DeleteContext(ctx, key)
+	}
+	for {
+		if err := deleteTLSObjectVersion(ctx, s3store, key, version); err != nil {
+			return err
+		}
+		data, next, err := readTLSObject(ctx, s3store, key)
+		var responseError *awshttp.ResponseError
+		if errors.As(err, &responseError) && responseError.HTTPStatusCode() == http.StatusNotFound {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read back after deleting version %s: %w", version, err)
+		}
+		if next == "" || next == version {
+			return fmt.Errorf("version %s is still served after it was deleted", version)
+		}
+		var info CertificateInfo
+		if err := parseCertificate(data, &info); err != nil {
+			return fmt.Errorf("parse version %s, served after deleting version %s: %w", next, version, err)
+		}
+		if !info.Expiry.Before(now) {
+			logger.Info("Kept a valid certificate stored under the name of an expired one", "key", key, "version", next, "expiry", info.Expiry)
+			return nil
+		}
+		version = next
+	}
+}
+
+// deleteTLSObjectVersion deletes one version of the object at key for good.
+func deleteTLSObjectVersion(ctx context.Context, s3store *storage.S3Storage, key, version string) error {
+	ctx, cancel := context.WithTimeout(ctx, s3store.Timeout)
+	defer cancel()
+	_, err := s3store.Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket:    aws.String(s3store.BucketName),
+		Key:       aws.String(key),
+		VersionId: aws.String(version),
+	})
+	return err
+}
+
+// removeExpiredLocalCopy removes the local cache file path if the certificate it holds
+// has expired, and reports whether it did. autocert.DirCache stores an entry by renaming
+// a new file over the old one, so a node can replace the expired file clean inspected
+// with a renewal at any moment. The file is therefore first renamed aside, which takes
+// exactly one version of it, and that version is removed only if it has expired. Any
+// other, such as a renewal stored since the inspection, is linked back under its name,
+// unless the node has meanwhile stored a still newer one there.
+func removeExpiredLocalCopy(path string, now time.Time) (bool, error) {
+	aside, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".clean-")
+	if err != nil {
+		return false, err
+	}
+	aside.Close()
+	if err := os.Rename(path, aside.Name()); err != nil {
+		os.Remove(aside.Name())
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	data, err := os.ReadFile(aside.Name())
+	var info CertificateInfo
+	if err == nil {
+		err = parseCertificate(data, &info)
+	}
+	if err == nil && info.Expiry.Before(now) {
+		return true, os.Remove(aside.Name())
+	}
+
+	if linkErr := os.Link(aside.Name(), path); linkErr != nil && !errors.Is(linkErr, fs.ErrExist) {
+		return false, fmt.Errorf("could not put back the file, which changed after clean read it; it is kept as %s: %w", aside.Name(), linkErr)
+	}
+	os.Remove(aside.Name())
+	if err != nil {
+		return false, fmt.Errorf("changed after clean read it, and cannot be parsed now: %w", err)
+	}
+	logger.Info("Kept a valid certificate stored in the local cache after clean read the expired one", "path", path, "expiry", info.Expiry)
+	return false, nil
 }
 
 func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, specificDomain string, force bool) error {

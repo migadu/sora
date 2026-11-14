@@ -529,7 +529,7 @@ Sora holds in memory:
 | `sora-admin tls list` | Lists certificates in S3, whether each is in the local directory, and with `--details` their expiry. |
 | `sora-admin tls cache` | Copies certificates from S3 into the local directory, for example on a new node. |
 | `sora-admin tls delete --domain <name>` | Deletes a name's certificates, ECDSA and RSA, from S3 and from the local directory. `--key` deletes one object from S3 by the full key that `tls list --details` shows. |
-| `sora-admin tls clean` | Deletes expired certificates. |
+| `sora-admin tls clean` | Deletes expired certificates. Keeps a renewal stored while it runs, except in a bucket without versioning (see ADMIN_CLI.md). |
 
 Flags and output are in [ADMIN_CLI.md](ADMIN_CLI.md).
 
