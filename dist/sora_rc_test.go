@@ -139,6 +139,34 @@ func TestRCScriptDetachesAndWritesPidfile(t *testing.T) {
 	}
 }
 
+// TestRCScriptOutputFileCanBeRotated: daemon(8) holds sora's stdout/stderr file (-o), which
+// is where its logs go with the default [logging] output. newsyslog(8) can rotate it only by
+// signalling daemon itself, which needs daemon's own PID in a supervisor pidfile (-P; the
+// -p pidfile holds sora's), and daemon reopens the file on SIGHUP only with -H. Without
+// both the file grows until sora is restarted.
+func TestRCScriptOutputFileCanBeRotated(t *testing.T) {
+	vars, _ := runRCScript(t, "start", "")
+	args := strings.Fields(vars["command_args"])
+	if i := slices.Index(args, vars["procname"]); i >= 0 {
+		args = args[:i] // daemon's own options
+	}
+	flag := func(f string) string {
+		if i := slices.Index(args, f); i >= 0 && i+1 < len(args) {
+			return args[i+1]
+		}
+		return ""
+	}
+	if flag("-o") == "" {
+		t.Fatalf("command_args %q: daemon writes no output file (-o)", vars["command_args"])
+	}
+	if !slices.Contains(args, "-H") {
+		t.Errorf("command_args %q: daemon does not reopen %s on SIGHUP (-H)", vars["command_args"], flag("-o"))
+	}
+	if p := flag("-P"); p == "" || p == vars["pidfile"] {
+		t.Errorf("command_args %q: daemon -P = %q, want a supervisor pidfile other than %q", vars["command_args"], p, vars["pidfile"])
+	}
+}
+
 // TestRCScriptReloadSignalsSora: rc.subr runs reload only when the script lists it in
 // extra_commands ("Note that `reload' isn't provided by default, it should be enabled via
 // $extra_commands"). Without it `service sora reload` fails with "unknown directive" and

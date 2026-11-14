@@ -7,6 +7,9 @@
 # Reload:  service sora reload  (sends SIGHUP for config reload)
 # Logs:    tail -f /var/log/sora/sora.log  ([logging] output = "/var/log/sora/sora.log";
 #          with the default output, stderr, they go to /var/log/sora/sora.out)
+# Rotate:  newsyslog.conf(5); its SIGHUP makes daemon(8) reopen sora.out, sora reopen sora.log:
+#          /var/log/sora/sora.out            600  7  *  @T00  J  /var/run/sora_daemon.pid
+#          /var/log/sora/sora.log  sora:sora 640  7  *  @T00  J  /var/run/sora.pid
 
 # PROVIDE: sora
 # REQUIRE: LOGIN networking postgresql
@@ -28,11 +31,13 @@ load_rc_config $name
 
 # sora stays in the foreground and writes no pidfile. daemon(8) detaches it, writes its
 # PID to ${pidfile} (which status, stop and reload use; procname matches it), sends its
-# output to sora.out and runs it as ${sora_user}.
+# output to sora.out and runs it as ${sora_user}. daemon's own PID goes to
+# ${supervisor_pidfile}, so newsyslog can signal it to reopen sora.out (-H).
 pidfile="/var/run/${name}.pid"
+supervisor_pidfile="/var/run/${name}_daemon.pid"
 procname="/usr/local/bin/sora"
 command="/usr/sbin/daemon"
-command_args="-f -p ${pidfile} -u ${sora_user} -o ${sora_logdir}/sora.out ${procname} --config ${sora_config}"
+command_args="-f -p ${pidfile} -P ${supervisor_pidfile} -u ${sora_user} -H -o ${sora_logdir}/sora.out ${procname} --config ${sora_config}"
 
 # SIGHUP triggers config reload. rc.subr provides reload only when extra_commands lists it.
 extra_commands="reload"
