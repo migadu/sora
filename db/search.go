@@ -239,13 +239,19 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			args[param] = lowerValue
 			conditions = append(conditions, substringCond(fmt.Sprintf("LOWER(%ssubject)", datePrefix), "@"+param))
 		case "message-id":
+			// The term is a substring of the field (RFC 9051 §6.4.4), but clients
+			// usually send one whole ID to find one message. That case is the
+			// equality idx_messages_message_id serves; anything else is matched
+			// against the mailbox's rows (message_id is not in the covering index).
 			param := nextParam()
-			// if the message ID is wrapped in <messageId>, we need to remove the brackets
-			if strings.HasPrefix(lowerValue, "<") && strings.HasSuffix(lowerValue, ">") {
-				lowerValue = lowerValue[1 : len(lowerValue)-1]
+			if id, ok := wholeMessageIDTerm(lowerValue); ok {
+				args[param] = id
+				conditions = append(conditions, fmt.Sprintf("LOWER(%smessage_id) = @%s", datePrefix, param))
+				break
 			}
 			args[param] = lowerValue
-			conditions = append(conditions, fmt.Sprintf("LOWER(%smessage_id) = @%s", datePrefix, param))
+			// A message without the header yields NULL; turn it into FALSE before NOT/OR.
+			conditions = append(conditions, "COALESCE("+substringCond(messageIDFieldExpr(datePrefix+"message_id"), "@"+param)+", FALSE)")
 		case "in-reply-to", "references":
 			// Both headers hold message IDs, which threading clients search with
 			// the angle brackets they are written with. The columns store the IDs
@@ -662,6 +668,33 @@ func substringCond(expr, placeholder string) string {
 // then tests for the header's presence, as RFC 9051 §6.4.4 describes.
 func msgIDListExpr(column string) string {
 	return fmt.Sprintf(`'<' || replace(LOWER(NULLIF(%s, '')), ' ', '> <') || '>'`, column)
+}
+
+// messageIDFieldExpr rebuilds the Message-ID header field ("<id>", lowercased) from the
+// message_id column, which stores the msg-id without its angle brackets (go-message's
+// Header.MessageID). A message whose header was absent or unparseable is stored with a
+// synthetic ID that keeps its brackets (InsertMessage, syntheticMessageID): it has no
+// header field to match, so the expression is NULL for it, and an empty term then tests
+// for the header's presence (RFC 9051 §6.4.4). A real msg-id never starts with '<'.
+func messageIDFieldExpr(column string) string {
+	return fmt.Sprintf(`CASE WHEN left(%[1]s, 1) <> '<' THEN '<' || LOWER(%[1]s) || '>' END`, column)
+}
+
+// wholeMessageIDTerm reports whether the lowercased term is one whole msg-id in angle
+// brackets, and returns the ID inside them. Such a term is a substring of the field "<id>"
+// only when it is the field: the brackets of a msg-id appear nowhere else in it, except
+// inside a domain literal ("<a@[...]>", RFC 5322 §3.6.4), which is why a term containing
+// '[' or ']' is not taken as whole. The one field it would miss is one whose domain
+// literal itself contains the bracketed term.
+func wholeMessageIDTerm(term string) (string, bool) {
+	if len(term) < 3 || term[0] != '<' || term[len(term)-1] != '>' {
+		return "", false
+	}
+	id := term[1 : len(term)-1]
+	if strings.ContainsAny(id, "<>[]") {
+		return "", false
+	}
+	return id, true
 }
 
 // headerSubstringCond is the TEXT header predicate: the bound term as a substring of any
