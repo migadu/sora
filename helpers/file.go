@@ -9,23 +9,48 @@ import (
 	"path/filepath"
 )
 
-// FileErrorCause returns the cause of a filesystem error without the file names it
-// carries: the Err of the *fs.PathError or *os.LinkError in err's chain, or err itself
-// when there is none. A reply to a client is built from the cause, since server paths
-// mean nothing to the client and name local details (spool layout, account ids, content
-// hashes); the full error belongs in the log. errors.Is still matches the cause, so
-// syscall.ENOSPC or syscall.EROFS is recognised in the result.
+// FileErrorCause displays a filesystem error's underlying cause without its file names.
+// Filesystem and ordinary wrappers beneath it are stripped from the displayed text;
+// the original error chain remains available through errors.Is/As for classification.
+// If no filesystem error is present, err is returned unchanged. Log the original error
+// to retain the spool path, account ID and content hash for diagnosis.
 func FileErrorCause(err error) error {
 	var pathErr *fs.PathError
-	if errors.As(err, &pathErr) {
-		return pathErr.Err
-	}
 	var linkErr *os.LinkError
-	if errors.As(err, &linkErr) {
-		return linkErr.Err
+	var cause error
+	switch {
+	case errors.As(err, &pathErr):
+		cause = pathErr.Err
+	case errors.As(err, &linkErr):
+		cause = linkErr.Err
+	default:
+		return err
 	}
-	return err
+	for cause != nil {
+		var next error
+		switch {
+		case errors.As(cause, &pathErr):
+			next = pathErr.Err
+		case errors.As(cause, &linkErr):
+			next = linkErr.Err
+		default:
+			next = errors.Unwrap(cause)
+		}
+		if next == nil {
+			break
+		}
+		cause = next
+	}
+	if cause == nil {
+		cause = errors.New("filesystem operation failed")
+	}
+	return fileErrorCause{display: cause, original: err}
 }
+
+type fileErrorCause struct{ display, original error }
+
+func (e fileErrorCause) Error() string { return e.display.Error() }
+func (e fileErrorCause) Unwrap() error { return e.original }
 
 // LinkOrCopyFile attempts to hardlink a file from src to dst. If linking fails
 // (e.g., cross-device link), it falls back to copying the file.

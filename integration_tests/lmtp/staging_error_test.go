@@ -27,6 +27,22 @@ func TestLMTP_StagingErrorHidesSpoolPath(t *testing.T) {
 		want     string
 	}{
 		{
+			name: "permission",
+			obstruct: func(t *testing.T, accountDir string) {
+				if os.Geteuid() == 0 {
+					t.Skip("root bypasses directory permissions")
+				}
+				if err := os.MkdirAll(accountDir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(accountDir, 0000); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(accountDir, 0755) })
+			},
+			want: "failed to check file existence: ",
+		},
+		{
 			// The existence check before staging fails (*fs.PathError from os.Stat).
 			name: "stat",
 			obstruct: func(t *testing.T, accountDir string) {
