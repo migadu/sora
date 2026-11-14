@@ -2192,6 +2192,7 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 			},
 			"credential_management": {
 				"GET /admin/credentials/{email}",
+				"DELETE /admin/credentials/{email}",
 			},
 			"message_restoration": {
 				"GET /admin/accounts/{email}/messages/deleted",
@@ -2220,9 +2221,28 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 			"auth_statistics": {
 				"GET /admin/auth/stats",
 				"GET /admin/auth/blocked",
+				"GET /admin/auth-cache/stats",
+			},
+			"proxy_monitoring": {
+				"GET /admin/proxy/backends",
 			},
 			"system_information": {
 				"GET /admin/config",
+			},
+			"mail_delivery": {
+				"POST /admin/mail/deliver",
+			},
+			"acl_management": {
+				"POST /admin/mailboxes/acl/grant",
+				"POST /admin/mailboxes/acl/revoke",
+				"GET /admin/mailboxes/acl",
+			},
+			"affinity_management": {
+				"GET /admin/affinity",
+				"POST /admin/affinity",
+				"DELETE /admin/affinity",
+				"GET /admin/affinity/list",
+				"GET /admin/affinity/stats",
 			},
 		},
 	})
