@@ -2,6 +2,7 @@ package spamtraining
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -26,12 +27,19 @@ const testMessage = "From: sender@example.org\r\nTo: user@example.com\r\nSubject
 type recordingEndpoint struct {
 	mu       sync.Mutex
 	requests []TrainingRequest
+	bodies   [][]byte // the request bodies as sent
 }
 
 func (e *recordingEndpoint) received() []TrainingRequest {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]TrainingRequest(nil), e.requests...)
+}
+
+func (e *recordingEndpoint) receivedBodies() [][]byte {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([][]byte(nil), e.bodies...)
 }
 
 func (e *recordingEndpoint) waitFor(t *testing.T, n int) []TrainingRequest {
@@ -52,12 +60,17 @@ func newTestClient(t *testing.T, cfg config.SpamTrainingConfig) (*Client, *recor
 	t.Helper()
 	e := &recordingEndpoint{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading training request: %v", err)
+		}
 		var req TrainingRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.Unmarshal(body, &req); err != nil {
 			t.Errorf("training request does not decode: %v", err)
 		}
 		e.mu.Lock()
 		e.requests = append(e.requests, req)
+		e.bodies = append(e.bodies, body)
 		e.mu.Unlock()
 	}))
 	t.Cleanup(srv.Close)
@@ -253,6 +266,101 @@ func TestWorkerSubmitsTheFetchedMessage(t *testing.T) {
 	if req.Type != TrainingTypeHam || req.User != "user@example.com" || req.SourceMailbox != "Junk" ||
 		req.DestMailbox != "INBOX" || req.Message != testMessage || req.Timestamp.IsZero() {
 		t.Errorf("unexpected submission: %+v", req)
+	}
+}
+
+// TestSubmittedMessageKeepsItsBytes: a JSON string is Unicode, and json.Marshal
+// replaces every byte that is not valid UTF-8 with U+FFFD. 8-bit text in any other
+// charset, in a body, a part kept from a multipart or a raw header value, must
+// still reach the endpoint byte for byte: in message_base64, with message as it
+// was for receivers that do not read message_base64. A UTF-8 message is exact in
+// message and its request has no message_base64.
+func TestSubmittedMessageKeepsItsBytes(t *testing.T) {
+	multipart := "Subject: x\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n" +
+		"--b\r\nContent-Type: text/plain; charset=windows-1251\r\nContent-Transfer-Encoding: 8bit\r\n\r\n" +
+		"\xcf\xf0\xe8\xe2\xe5\xf2\r\n" +
+		"--b\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAAAA\r\n" +
+		"--b--\r\n"
+	strippedMultipart, err := StripAttachments([]byte(multipart))
+	if err != nil {
+		t.Fatalf("StripAttachments: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		message string // as fetched
+		want    string // as it must reach the endpoint
+		lossy   bool   // not valid UTF-8
+	}{{
+		name:    "8-bit iso-8859-1 single part",
+		message: "Subject: test\r\nContent-Type: text/plain; charset=iso-8859-1\r\nContent-Transfer-Encoding: 8bit\r\n\r\nSch\xf6n\r\n",
+		lossy:   true,
+	}, {
+		name:    "raw 8-bit header value",
+		message: "Subject: Sch\xf6n\r\nFrom: sender@example.org\r\n\r\nbody\r\n",
+		lossy:   true,
+	}, {
+		name:    "8-bit windows-1251 part kept from a multipart",
+		message: multipart,
+		want:    string(strippedMultipart),
+		lossy:   true,
+	}, {
+		name:    "UTF-8",
+		message: "Subject: Schön\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\nSchön <&>\r\n",
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			want := tc.want
+			if want == "" {
+				want = tc.message
+			}
+			c, endpoint := newTestClient(t, config.SpamTrainingConfig{})
+			err := c.Enqueue(Job{Type: TrainingTypeSpam, User: "user@example.com",
+				Size: int64(len(tc.message)), Open: openString(tc.message)})
+			if err != nil {
+				t.Fatalf("Enqueue: %v", err)
+			}
+			if got := endpoint.waitFor(t, 1); len(got) != 1 {
+				t.Fatalf("endpoint received %d submissions, want 1", len(got))
+			}
+
+			// Decoded as a receiver outside this package would.
+			var wire struct {
+				Message       string  `json:"message"`
+				MessageBase64 *string `json:"message_base64"`
+			}
+			if err := json.Unmarshal(endpoint.receivedBodies()[0], &wire); err != nil {
+				t.Fatalf("decoding the request: %v", err)
+			}
+
+			if !tc.lossy {
+				if wire.MessageBase64 != nil {
+					t.Errorf("a UTF-8 message was also sent in message_base64")
+				}
+				if wire.Message != want {
+					t.Errorf("message = %q, want %q", wire.Message, want)
+				}
+				return
+			}
+
+			// message is what it always was: the text with each invalid byte replaced.
+			var asBefore string
+			b, _ := json.Marshal(want)
+			_ = json.Unmarshal(b, &asBefore)
+			if wire.Message != asBefore {
+				t.Errorf("message = %q, want %q (unchanged for receivers that do not read message_base64)", wire.Message, asBefore)
+			}
+			if wire.MessageBase64 == nil {
+				t.Fatalf("no message_base64: the endpoint received only %q, the message was %q", wire.Message, want)
+			}
+			got, err := base64.StdEncoding.DecodeString(*wire.MessageBase64)
+			if err != nil {
+				t.Fatalf("message_base64 is not standard base64: %v", err)
+			}
+			if string(got) != want {
+				t.Errorf("message_base64 decodes to %q, want %q", got, want)
+			}
+		})
 	}
 }
 
