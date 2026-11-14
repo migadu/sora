@@ -99,7 +99,15 @@ func MaxScriptsPerAccount() int { return maxScriptsPerAccount }
 // can map it to a permanent protocol error rather than a retryable one.
 var ErrSieveScriptLimitReached = errors.New("maximum number of sieve scripts reached")
 
+// ErrSieveScriptNotStorable is returned by CreateScript and UpdateScript when the script
+// name or content contains a NUL byte or invalid UTF-8, which PostgreSQL text columns
+// reject with SQLSTATE 22021.
+var ErrSieveScriptNotStorable = errors.New("sieve script contains NUL or invalid UTF-8")
+
 func (db *Database) CreateScript(ctx context.Context, tx pgx.Tx, AccountID int64, name, script string) (*SieveScript, error) {
+	if !helpers.TextStorable(name) || !helpers.TextStorable(script) {
+		return nil, ErrSieveScriptNotStorable
+	}
 	var count int
 	if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM sieve_scripts WHERE account_id = $1", AccountID).Scan(&count); err != nil {
 		return nil, err
@@ -121,6 +129,9 @@ func (db *Database) CreateScript(ctx context.Context, tx pgx.Tx, AccountID int64
 }
 
 func (db *Database) UpdateScript(ctx context.Context, tx pgx.Tx, scriptID, AccountID int64, name, script string) (*SieveScript, error) {
+	if !helpers.TextStorable(name) || !helpers.TextStorable(script) {
+		return nil, ErrSieveScriptNotStorable
+	}
 	var s SieveScript
 	err := tx.QueryRow(ctx, `
 		UPDATE sieve_scripts SET name = $1, script = $2, updated_at = now() 
