@@ -18,7 +18,7 @@ import (
 //   - Refresh() should NOT be called for routing cache
 func TestPositiveTTLShouldExpireWithoutRefresh(t *testing.T) {
 	positiveTTL := 2 * time.Second
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		positiveTTL,   // positive_ttl
 		1*time.Minute, // negative_ttl
 		10000,
@@ -75,7 +75,7 @@ func TestPositiveTTLShouldExpireWithoutRefresh(t *testing.T) {
 //   - Negative entries should NEVER be refreshed (always expire after negative_ttl)
 func TestNegativeTTLShouldExpire(t *testing.T) {
 	negativeTTL := 2 * time.Second
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		5*time.Minute, // positive_ttl
 		negativeTTL,   // negative_ttl
 		10000,
@@ -129,7 +129,7 @@ func TestNegativeTTLShouldExpire(t *testing.T) {
 //   - This forces next request to do fresh remotelookup
 //   - Applies to both auth cache and routing cache
 func TestBackendAuthFailureShouldInvalidateCache(t *testing.T) {
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		5*time.Minute, // positive_ttl
 		1*time.Minute, // negative_ttl
 		10000,
@@ -209,7 +209,7 @@ func TestBackendAuthFailureShouldInvalidateCache(t *testing.T) {
 // cache.Refresh() calls prevented cache expiration for active users.
 func TestCacheExpiresForActiveUsers(t *testing.T) {
 	positiveTTL := 2 * time.Second
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		positiveTTL,   // positive_ttl
 		1*time.Minute, // negative_ttl
 		10000,
@@ -264,7 +264,7 @@ func TestPositiveTTLVsNegativeTTLBehavior(t *testing.T) {
 	positiveTTL := 5 * time.Minute
 	negativeTTL := 1 * time.Minute
 
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		positiveTTL,
 		negativeTTL,
 		10000,

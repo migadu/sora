@@ -30,7 +30,7 @@ func TestRoutingCacheExpiration(t *testing.T) {
 	// Create a lookup cache with SHORT TTL for testing (2 seconds)
 	// In production, this is typically 5 minutes
 	shortTTL := 2 * time.Second
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		shortTTL,       // positiveTTL (successful lookups)
 		1*time.Minute,  // negativeTTL (failures)
 		10000,          // maxSize
@@ -152,7 +152,7 @@ func TestRoutingCacheExpiration(t *testing.T) {
 
 // TestRoutingCacheNoExpirationWithinTTL verifies cache behavior within TTL window
 func TestRoutingCacheNoExpirationWithinTTL(t *testing.T) {
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		5*time.Minute,  // positiveTTL - production default
 		1*time.Minute,  // negativeTTL
 		10000,          // maxSize
@@ -203,7 +203,7 @@ func TestRoutingCacheNoExpirationWithinTTL(t *testing.T) {
 
 // TestManualCacheInvalidationWorkaround tests manual cache invalidation as workaround
 func TestManualCacheInvalidationWorkaround(t *testing.T) {
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		5*time.Minute,  // positiveTTL
 		1*time.Minute,  // negativeTTL
 		10000,          // maxSize
@@ -270,7 +270,7 @@ func TestManualCacheInvalidationWorkaround(t *testing.T) {
 func TestCacheExpirationWithActiveUser(t *testing.T) {
 	// Use SHORT TTL for testing (2 seconds)
 	shortTTL := 2 * time.Second
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		shortTTL,       // positiveTTL
 		1*time.Minute,  // negativeTTL
 		10000,          // maxSize

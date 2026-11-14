@@ -9,7 +9,7 @@ import (
 
 func newEvictionTestCache(t testing.TB, maxSize int) *LookupCache {
 	t.Helper()
-	cache := New(5*time.Minute, time.Minute, maxSize, time.Hour, 30*time.Second)
+	cache := New("imap", t.Name(), 5*time.Minute, time.Minute, maxSize, time.Hour, 30*time.Second)
 	t.Cleanup(func() { _ = cache.Stop(context.Background()) })
 	return cache
 }

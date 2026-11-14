@@ -15,7 +15,7 @@ import (
 // uses the same key derivation as Get/Set (InvalidateUser). Companion to the
 // IMAP/POP3/ManageSieve proxy invalidation tests.
 func TestLMTPInvalidateLookupCacheUsesSubmittedAddress(t *testing.T) {
-	cache := lookupcache.New(5*time.Minute, time.Minute, 100, time.Minute, 0)
+	cache := lookupcache.New("test", "test", 5*time.Minute, time.Minute, 100, time.Minute, 0)
 	defer func() {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
 		defer stopCancel()

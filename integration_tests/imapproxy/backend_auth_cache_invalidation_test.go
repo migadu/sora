@@ -19,7 +19,7 @@ import (
 // - Cache MUST be invalidated immediately
 // - Next request does fresh remotelookup → gets backend B
 func TestBackendAuthFailureInvalidatesCache(t *testing.T) {
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		5*time.Minute, // positiveTTL
 		1*time.Minute, // negativeTTL
 		10000,
@@ -100,7 +100,7 @@ func TestBackendAuthFailureInvalidatesCache(t *testing.T) {
 
 // TestBackendAuthFailureScenarios tests different backend auth failure scenarios
 func TestBackendAuthFailureScenarios(t *testing.T) {
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		5*time.Minute,
 		1*time.Minute,
 		10000,
@@ -183,7 +183,7 @@ func TestBackendAuthFailureScenarios(t *testing.T) {
 // TestCacheInvalidationDoesNotAffectOtherUsers verifies that invalidating
 // one user's cache doesn't affect other users
 func TestCacheInvalidationDoesNotAffectOtherUsers(t *testing.T) {
-	cache := lookupcache.New(
+	cache := lookupcache.New("test", "test",
 		5*time.Minute,
 		1*time.Minute,
 		10000,

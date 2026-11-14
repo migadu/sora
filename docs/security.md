@@ -213,10 +213,12 @@ min_bytes_per_minute = 512
 All timeout events are logged with detailed information and exported as Prometheus metrics:
 
 ```
-command_timeouts_total{protocol="imap", reason="idle"}
-command_timeouts_total{protocol="imap", reason="session_max"}
-command_timeouts_total{protocol="imap", reason="slow_throughput"}
+sora_connection_timeouts_total{protocol="imap", reason="idle"}
+sora_connection_timeouts_total{protocol="imap", reason="session_max"}
+sora_connection_timeouts_total{protocol="imap", reason="slow_throughput"}
 ```
+
+The series also carry the `server_name` and `hostname` labels.
 
 Monitor these metrics to:
 - Detect potential attack patterns (sudden spikes in timeouts)
