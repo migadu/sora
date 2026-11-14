@@ -112,20 +112,31 @@ func (rd *ResilientDatabase) GetCredentialEpochWithRetry(ctx context.Context, ad
 //
 // This eliminates the "thundering herd" problem on proxy restart where thousands
 // of clients reconnect simultaneously.
+//
+// TIMING: every failed login costs exactly one password verification, whether
+// the address is unknown, the password is wrong, or the account's hash was
+// cached, so response time does not reveal which addresses have an account
+// (security-audit M14; the backends equalise the same way).
 func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address, password string) (accountID int64, err error) {
+	// The cached hash Step 1 already verified the password against, and the result.
+	var mismatchedHash string
+	var mismatchErr error
+
 	// --- Step 1: Try persistent auth cache (if enabled) ---
 	// The cache is ONLY populated from successful DB lookups, never from remote lookups.
 	if rd.authCache != nil {
 		cachedAccountID, cachedHash, cacheErr := rd.authCache.Get(ctx, address)
 		if cacheErr == nil {
 			// Cache hit — verify password locally using the cached hash
-			if verifyErr := db.VerifyPassword(cachedHash, password); verifyErr == nil {
+			verifyErr := db.VerifyPassword(cachedHash, password)
+			if verifyErr == nil {
 				// Password matches cached hash — no database round-trip needed
 				return cachedAccountID, nil
 			}
 			// Password mismatch — the password may have changed since caching.
 			// Invalidate the stale entry and fall through to the authoritative DB.
 			rd.authCache.Invalidate(ctx, address)
+			mismatchedHash, mismatchErr = cachedHash, verifyErr
 		}
 		// Cache miss or cache error — proceed to PostgreSQL
 	}
@@ -155,6 +166,11 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 
 	result, err := rd.executeReadWithRetry(ctx, config, timeoutAuth, op, consts.ErrUserNotFound)
 	if err != nil {
+		// No account: spend the verification a wrong password spends, unless Step 1
+		// already did (an account deleted since it was cached).
+		if errors.Is(err, consts.ErrUserNotFound) && mismatchErr == nil {
+			db.DummyVerifyPassword(password)
+		}
 		// NOTE: No logging here - let the calling server log with proper context
 		return 0, err // Return error from fetching credentials
 	}
@@ -164,6 +180,12 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 	hashedPassword := cred.Hash
 
 	// --- Step 3: Verify password ---
+	// Step 1 already compared the password with this very hash, and the comparison
+	// is deterministic: a second one would make a wrong password cost twice as much
+	// for a cached account as for any other address.
+	if mismatchErr != nil && hashedPassword == mismatchedHash {
+		return 0, mismatchErr
+	}
 	if err := db.VerifyPassword(hashedPassword, password); err != nil {
 		// NOTE: No logging here - let the calling server log with proper context
 		// (protocol, server name, cached status, etc)
