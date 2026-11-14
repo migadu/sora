@@ -235,7 +235,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 
 		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("pop3", name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("POP3: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
@@ -476,7 +476,7 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 			session.Id = idgen.New()
 			session.HostName = s.hostname
 			session.Stats = s
-			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "POP3", session.InfoLog)
+			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "pop3", session.InfoLog)
 
 			session.InfoLog("connected")
 			s.addSession(session)

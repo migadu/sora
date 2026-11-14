@@ -43,6 +43,20 @@ func ParseTrustedNetworks(cidrs []string) ([]*net.IPNet, error) {
 	return networks, nil
 }
 
+// InvalidNetworkEntries returns the entries of networks that are neither an IP address nor
+// a CIDR: the entries IPInNetworks skips. A host name is one of them, as names are never
+// resolved. Callers holding an allow-list report these when they install it, since such an
+// entry matches no client while the list as a whole still restricts access.
+func InvalidNetworkEntries(networks []string) []string {
+	var invalid []string
+	for _, entry := range networks {
+		if _, err := ParseTrustedNetworks([]string{entry}); err != nil {
+			invalid = append(invalid, entry)
+		}
+	}
+	return invalid
+}
+
 // IPInNetworks reports whether ip falls within any entry of networks. Entries may be CIDRs
 // ("10.0.0.0/8") OR bare IPs ("10.0.0.1", treated as /32 or /128). This is the single
 // check-time counterpart to ParseTrustedNetworks (the construction-time parser): both accept

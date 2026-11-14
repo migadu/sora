@@ -241,7 +241,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("managesieve", name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("ManageSieve: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
@@ -454,7 +454,7 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 			logFunc := func(format string, args ...any) {
 				session.InfoLog(format, args...)
 			}
-			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "MANAGESIEVE", logFunc)
+			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "managesieve", logFunc)
 
 			// Log connection with session context (protocol, remote, session id)
 			session.DebugLog("new connection")
@@ -796,7 +796,11 @@ func (s *ManageSieveServer) ReloadConfig(cfg config.ServerConfig) error {
 		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if maxSize := cfg.GetMaxScriptSizeWithDefault(); maxSize != next.maxScriptSize {
+	// A value that does not parse keeps the running limit (start-up, which has none,
+	// uses the default).
+	if maxSize, err := cfg.GetMaxScriptSize(); err != nil {
+		logger.Warn("ManageSieve config reload: invalid max_script_size, keeping the running value", "name", s.name, "error", err, "running", next.maxScriptSize)
+	} else if maxSize != next.maxScriptSize {
 		next.maxScriptSize = maxSize
 		reloaded = append(reloaded, "max_script_size")
 	}

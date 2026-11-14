@@ -51,15 +51,18 @@ var (
 	_ managesieveserver.SessionLogin = (*ManageSieveSession)(nil)
 )
 
-// Shared wire responses. Uncoded *Error messages are emitted verbatim after
-// "NO ", so these preserve sora's historical response bytes exactly.
+// Shared wire responses. go-managesieve emits an uncoded *Error message verbatim
+// after "NO ", so it is pre-quoted: RFC 5804 section 4 allows only a string
+// (quoted or literal) as the text of a NO response. A coded message is quoted by
+// the library.
 var (
-	errAuthFailed    = &managesieveserver.Error{Message: "Authentication failed"}
-	errTryLater      = &managesieveserver.Error{Code: "TRYLATER", Message: "Service temporarily unavailable"}
-	errNonExistent   = &managesieveserver.Error{Code: "NONEXISTENT", Message: "Script does not exist"}
-	errServerBusy    = &managesieveserver.Error{Message: "Server busy, try again later"}
-	errSessionClosed = &managesieveserver.Error{Message: "Session closed", Close: true}
-	errDelayQueueFul = &managesieveserver.Error{Message: "Too many concurrent authentication attempts. Please try again later."}
+	errAuthFailed      = &managesieveserver.Error{Message: msieve.Quote("Authentication failed")}
+	errAuthFailedClose = &managesieveserver.Error{Message: msieve.Quote("Authentication failed"), Close: true}
+	errTryLater        = &managesieveserver.Error{Code: "TRYLATER", Message: "Service temporarily unavailable"}
+	errNonExistent     = &managesieveserver.Error{Code: "NONEXISTENT", Message: "Script does not exist"}
+	errServerBusy      = &managesieveserver.Error{Message: msieve.Quote("Server busy, try again later")}
+	errSessionClosed   = &managesieveserver.Error{Message: msieve.Quote("Session closed"), Close: true}
+	errDelayQueueFul   = &managesieveserver.Error{Message: msieve.Quote("Too many concurrent authentication attempts. Please try again later.")}
 )
 
 // authUnavailable reports whether a failed Authenticate says nothing about the
@@ -123,7 +126,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 				return errDelayQueueFul
 			}
 			// Context cancelled or other error - close connection
-			return &managesieveserver.Error{Message: "Authentication failed", Close: true}
+			return errAuthFailedClose
 		}
 		if s.server.authLimiter != nil {
 			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, authKey); err != nil {
@@ -242,7 +245,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 				return errDelayQueueFul
 			}
 			// Context cancelled or other error - close connection
-			return &managesieveserver.Error{Message: "Authentication failed", Close: true}
+			return errAuthFailedClose
 		}
 		if s.server.authLimiter != nil {
 			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, authKey); err != nil {
@@ -317,7 +320,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// For regular ManageSieve, we don't support proxy authentication
 		if authzID != "" && authzID != authnID {
 			s.DebugLog("proxy authentication requires master credentials", "authz_id", authzID, "authn_id", authnID)
-			return &managesieveserver.Error{Message: "Proxy authentication requires master_sasl_username and master_sasl_password to be configured"}
+			return &managesieveserver.Error{Message: msieve.Quote("Proxy authentication requires master_sasl_username and master_sasl_password to be configured")}
 		}
 
 		netConn := s.conn
@@ -342,7 +345,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 				return errDelayQueueFul
 			}
 			// Context cancelled or other error - close connection
-			return &managesieveserver.Error{Message: "Authentication failed", Close: true}
+			return errAuthFailedClose
 		}
 
 		// Check authentication rate limiting after delay
@@ -365,7 +368,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
-			return &managesieveserver.Error{Message: "Invalid username format"}
+			return &managesieveserver.Error{Message: msieve.Quote("Invalid username format")}
 		}
 
 		s.DebugLog("authentication attempt", "address", address.FullAddress())
@@ -408,7 +411,7 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 	address, err := server.NewAddress(username)
 	if err != nil {
 		s.DebugLog("invalid address", "error", err)
-		return &managesieveserver.Error{Message: "Invalid address"}
+		return &managesieveserver.Error{Message: msieve.Quote("Invalid address")}
 	}
 
 	netConn := s.conn
@@ -432,7 +435,7 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 			return errDelayQueueFul
 		}
 		// Context cancelled or other error - close connection
-		return &managesieveserver.Error{Message: "Authentication failed", Close: true}
+		return errAuthFailedClose
 	}
 
 	// Check authentication rate limiting after delay

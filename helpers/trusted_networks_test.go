@@ -2,6 +2,7 @@ package helpers
 
 import (
 	"net"
+	"slices"
 	"testing"
 )
 
@@ -211,5 +212,21 @@ func TestIPInNetworks(t *testing.T) {
 	// A nil IP is never trusted (e.g. unparseable client address).
 	if IPInNetworks(nil, []string{"0.0.0.0/0"}) {
 		t.Error("nil IP must never match, even against 0.0.0.0/0")
+	}
+}
+
+// InvalidNetworkEntries reports exactly the entries IPInNetworks skips: anything that is
+// not an IP address or CIDR, host names included (they are never resolved).
+func TestInvalidNetworkEntries(t *testing.T) {
+	entries := []string{
+		"10.0.1.0/24", "192.0.2.7", "2001:db8::/32", "2001:db8::1",
+		"admin.example.com", "localhost", "", " 192.0.2.8", "10.0.0.0/33", "fe80::1%eth0",
+	}
+	want := []string{"admin.example.com", "localhost", "", " 192.0.2.8", "10.0.0.0/33", "fe80::1%eth0"}
+	if got := InvalidNetworkEntries(entries); !slices.Equal(got, want) {
+		t.Errorf("InvalidNetworkEntries(%q) = %q, want %q", entries, got, want)
+	}
+	if got := InvalidNetworkEntries([]string{"10.0.0.0/8", "::1"}); len(got) != 0 {
+		t.Errorf("valid list reported invalid entries %q", got)
 	}
 }

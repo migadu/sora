@@ -113,3 +113,50 @@ func TestExecuteS3OperationRecordsTerminalError(t *testing.T) {
 	assert.Equal(t, float64(0),
 		testutil.ToFloat64(metrics.S3OperationsTotal.WithLabelValues("GET", "success")))
 }
+
+// TestExecuteS3OperationCountsRetries: sora_s3_operations_total counts a retried
+// operation once by design, so sora_storage_retries_total is where the attempts that
+// failed and were tried again show up. Every attempt after the first is one retry; an
+// operation that succeeds at once, or fails with an error that is not retried, has none.
+func TestExecuteS3OperationCountsRetries(t *testing.T) {
+	config := retry.BackoffConfig{
+		InitialInterval: time.Millisecond,
+		MaxInterval:     5 * time.Millisecond,
+		Multiplier:      2.0,
+		Jitter:          false,
+		MaxRetries:      5,
+		OperationName:   "s3_retry_count_test",
+	}
+
+	cases := []struct {
+		name        string
+		failures    int   // attempts that fail before one succeeds
+		failWith    error // the failure
+		wantRetries float64
+	}{
+		{"succeeds at once", 0, nil, 0},
+		{"two transient failures", 2, awsResponseError(http.StatusInternalServerError, "transient"), 2},
+		{"not retryable", 1, awsResponseError(http.StatusForbidden, "denied"), 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics.StorageRetries.Reset()
+			rs := NewResilientS3Storage(&storage.S3Storage{})
+
+			attempts := 0
+			op := func() (any, error) {
+				attempts++
+				if attempts <= tc.failures {
+					return nil, tc.failWith
+				}
+				return "ok", nil
+			}
+			_, _ = rs.executeS3OperationWithRetry(
+				context.Background(), rs.getBreaker, config, rs.isRetryableGetError, op, "key", "GET")
+
+			assert.Equal(t, tc.wantRetries,
+				testutil.ToFloat64(metrics.StorageRetries.WithLabelValues("GET")),
+				"sora_storage_retries_total{operation=\"GET\"} after %d attempts", attempts)
+		})
+	}
+}
