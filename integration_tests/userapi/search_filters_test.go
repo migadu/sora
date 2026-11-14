@@ -111,3 +111,28 @@ func TestUserAPI_SearchAppliesFilters(t *testing.T) {
 		})
 	}
 }
+
+// TestUserAPI_SearchRejectsMalformedFilters: from and subject are bound as PostgreSQL
+// text, which refuses a NUL and bytes that are not UTF-8 (SQLSTATE 22021). Such a filter
+// is the client's malformed input, so it is a 400 and never reaches the database; it
+// once answered 500 for a NUL, and searched for U+FFFD for invalid UTF-8.
+func TestUserAPI_SearchRejectsMalformedFilters(t *testing.T) {
+	h := newBodyStateHarness(t)
+	for _, tt := range []struct {
+		query string
+		want  int
+	}{
+		{"q=x&from=%00", http.StatusBadRequest},
+		{"q=x&from=boss%00@example.com", http.StatusBadRequest},
+		{"q=x&from=%FF", http.StatusBadRequest},
+		{"q=x&subject=%00", http.StatusBadRequest},
+		{"q=x&subject=%FF", http.StatusBadRequest},
+		{"q=x&subject=%C3%A9t%C3%A9&from=J%C3%BCrgen", http.StatusOK},
+	} {
+		resp := h.tc.makeRequest(t, "GET", "/user/mailboxes/INBOX/search?"+tt.query, nil)
+		resp.Body.Close()
+		if resp.StatusCode != tt.want {
+			t.Errorf("search %s: status %d, want %d", tt.query, resp.StatusCode, tt.want)
+		}
+	}
+}

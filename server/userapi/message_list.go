@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/migadu/sora/logger"
 
@@ -105,6 +107,13 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, response)
 }
 
+// validSearchText reports whether s can be bound as a PostgreSQL text parameter, which
+// refuses a NUL and bytes that are not UTF-8 (SQLSTATE 22021). A value that cannot is
+// the client's malformed input: it gets a 400 instead of reaching the database.
+func validSearchText(s string) bool {
+	return strings.IndexByte(s, 0) < 0 && utf8.ValidString(s)
+}
+
 // handleSearchMessages searches messages in a mailbox
 func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -135,6 +144,10 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 		From:       query.Get("from"),
 		Subject:    query.Get("subject"),
 		UnseenOnly: query.Get("unseen") == "true",
+	}
+	if !validSearchText(filter.From) || !validSearchText(filter.Subject) {
+		s.writeError(w, http.StatusBadRequest, "Search filters 'from' and 'subject' must be UTF-8 text without NUL")
+		return
 	}
 
 	// Perform search
