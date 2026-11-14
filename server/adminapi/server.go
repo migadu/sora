@@ -1329,7 +1329,9 @@ func (s *Server) trackedAccountID(ctx context.Context, address string) int64 {
 
 // endAccountSessions closes the account's sessions on this node's servers and,
 // through the trackers that gossip, on their cluster peers. A kick also drops the
-// account's cached logins.
+// account's cached logins. This is what makes it immediate: every node with database
+// access also does both within seconds of the change, from credential_changes (see
+// credchanges.Watcher), whichever node or tool made it.
 func (s *Server) endAccountSessions(accountID int64, address string) {
 	if accountID == 0 {
 		return
@@ -1346,7 +1348,8 @@ func (s *Server) endAccountSessions(accountID int64, address string) {
 
 // forgetAccountLogins drops the account's cached logins on this node's servers
 // and, through the trackers that gossip, on their cluster peers, so that its next
-// login is checked against the database. Its sessions are left alone.
+// login is checked against the database. Its sessions are left alone. As with
+// endAccountSessions, every node also does this within seconds from credential_changes.
 func (s *Server) forgetAccountLogins(accountID int64, address string) {
 	if accountID == 0 {
 		return

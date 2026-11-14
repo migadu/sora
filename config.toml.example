@@ -557,7 +557,7 @@ cleanup_interval = "1h"                         # How often to clean up expired 
 [auth_cache]
 enabled = true                     # Enable persistent auth cache (default: false)
 path = "/var/cache/sora/auth_cache.db" # SQLite database path (default: "/var/cache/sora/auth_cache.db"). Fast storage (SSD) recommended.
-max_age = "24h"                    # Max age for cached entries before re-fetching (default: 24h)
+max_age = "24h"                    # Max age for cached entries before re-fetching (default: 24h; at most 168h, how long credential changes are kept)
 cleanup_interval = "1h"            # How often to purge expired/unused entries (default: 1 hour)
 purge_unused = "168h"              # Purge entries unused for this duration (default: 7 days)
 

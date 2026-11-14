@@ -285,14 +285,31 @@ func (c *LookupCache) InvalidateUser(serverName, username string) {
 // no account and are left alone: they never let anyone in.
 // Safe to call on a nil receiver (no-op when the cache is disabled).
 func (c *LookupCache) InvalidateAccount(accountID int64) {
-	if c == nil || accountID == 0 {
+	c.InvalidateAccounts([]int64{accountID})
+}
+
+// InvalidateAccounts is InvalidateAccount for several accounts, in one pass over the
+// cache: the credential-change poll hands over every account changed in its window at
+// once. Safe to call on a nil receiver (no-op when the cache is disabled).
+func (c *LookupCache) InvalidateAccounts(accountIDs []int64) {
+	if c == nil || len(accountIDs) == 0 {
 		return
 	}
+	drop := make(map[int64]struct{}, len(accountIDs))
+	for _, id := range accountIDs {
+		if id != 0 {
+			drop[id] = struct{}{}
+		}
+	}
+	if len(drop) == 0 {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	for key, entry := range c.entries {
-		if !entry.IsNegative && entry.AccountID == accountID {
+		if _, ok := drop[entry.AccountID]; ok && !entry.IsNegative {
 			delete(c.entries, key)
 		}
 	}

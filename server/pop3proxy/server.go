@@ -734,6 +734,12 @@ func (s *POP3ProxyServer) SetConnectionTracker(tracker *server.ConnectionTracker
 	}
 }
 
+// GetLookupCache returns the server's cache of logins (nil when disabled), so that a
+// changed account's cached logins can be dropped (see credchanges.Watcher).
+func (s *POP3ProxyServer) GetLookupCache() *lookupcache.LookupCache {
+	return s.lookupCache
+}
+
 // GetConnectionTracker returns the connection tracker for the server.
 func (s *POP3ProxyServer) GetConnectionTracker() *server.ConnectionTracker {
 	return s.connTracker

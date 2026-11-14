@@ -19,7 +19,6 @@ import (
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/helpers"
-	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
@@ -38,29 +37,27 @@ type reloadableSettings struct {
 
 // Server represents the HTTP Mail API server for user operations
 type Server struct {
-	name                       string
-	addr                       string
-	settings                   atomic.Pointer[reloadableSettings] // the settings ReloadConfig replaces
-	tokenDuration              time.Duration
-	tokenIssuer                string
-	maxConnections             int // Max concurrent connections; 0 -> unlimited
-	rdb                        *resilient.ResilientDatabase
-	storage                    *storage.S3Storage
-	rs3                        *resilient.ResilientS3Storage // storage behind retries + breaker; nil when storage is
-	uploader                   *uploader.UploadWorker
-	uploadMaxAttempts          int // [uploader] max_attempts for a node without uploader; see ServerOptions
-	cache                      *cache.Cache
-	authCache                  *lookupcache.LookupCache
-	positiveRevalidationWindow time.Duration
-	authLimiter                *server.AuthRateLimiter
-	server                     *http.Server
-	tls                        bool
-	tlsConfig                  *tls.Config // TLS config from manager (takes precedence) or nil
-	tlsCertFile                string
-	tlsKeyFile                 string
-	tlsVerify                  bool
-	proxyReader                *server.ProxyProtocolReader
-	sieveExtensions            []string
+	name              string
+	addr              string
+	settings          atomic.Pointer[reloadableSettings] // the settings ReloadConfig replaces
+	tokenDuration     time.Duration
+	tokenIssuer       string
+	maxConnections    int // Max concurrent connections; 0 -> unlimited
+	rdb               *resilient.ResilientDatabase
+	storage           *storage.S3Storage
+	rs3               *resilient.ResilientS3Storage // storage behind retries + breaker; nil when storage is
+	uploader          *uploader.UploadWorker
+	uploadMaxAttempts int // [uploader] max_attempts for a node without uploader; see ServerOptions
+	cache             *cache.Cache
+	authLimiter       *server.AuthRateLimiter
+	server            *http.Server
+	tls               bool
+	tlsConfig         *tls.Config // TLS config from manager (takes precedence) or nil
+	tlsCertFile       string
+	tlsKeyFile        string
+	tlsVerify         bool
+	proxyReader       *server.ProxyProtocolReader
+	sieveExtensions   []string
 }
 
 // ServerOptions holds configuration options for the HTTP Mail API server
@@ -85,7 +82,7 @@ type ServerOptions struct {
 	// upload as on its way.
 	UploadMaxAttempts           int
 	AuthRateLimit               server.AuthRateLimiterConfig
-	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
+	LookupCache                 *config.LookupCacheConfig // Ignored: logins are not cached (see handleLogin); a configured one is warned about
 	TLS                         bool
 	TLSConfig                   *tls.Config // TLS config from manager (takes precedence over cert files)
 	TLSCertFile                 string
@@ -161,41 +158,10 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 	authLimiter := server.NewAuthRateLimiter("user-api", options.Name, "", options.AuthRateLimit)
 	server.RegisterRateLimiter("userapi", options.Name, authLimiter)
 
-	// Initialize authentication cache if configured
-	var authCache *lookupcache.LookupCache
-	var positiveRevalidationWindow time.Duration
+	// Logins are not cached: one read gives the hash to check and the epoch the token
+	// needs, and a cached login would outlive a password change made since.
 	if options.LookupCache != nil && options.LookupCache.Enabled {
-		// Parse TTL and other config values
-		lookupCacheConfig := options.LookupCache
-
-		positiveTTL, err := time.ParseDuration(lookupCacheConfig.PositiveTTL)
-		if err != nil || lookupCacheConfig.PositiveTTL == "" {
-			logger.Info("User API: Using default positive TTL (5m)", "name", options.Name)
-			positiveTTL = 5 * time.Minute
-		}
-
-		negativeTTL, err := time.ParseDuration(lookupCacheConfig.NegativeTTL)
-		if err != nil || lookupCacheConfig.NegativeTTL == "" {
-			logger.Info("User API: Using default negative TTL (1m)", "name", options.Name)
-			negativeTTL = 1 * time.Minute
-		}
-
-		cleanupInterval, err := time.ParseDuration(lookupCacheConfig.CleanupInterval)
-		if err != nil || lookupCacheConfig.CleanupInterval == "" {
-			logger.Info("User API: Using default cleanup interval (5m)", "name", options.Name)
-			cleanupInterval = 5 * time.Minute
-		}
-
-		maxSize := lookupCacheConfig.GetMaxSize()
-
-		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
-		if err != nil {
-			logger.Info("User API: Invalid positive revalidation window in auth cache config, using default (30s)", "name", options.Name, "error", err)
-			positiveRevalidationWindow = 30 * time.Second
-		}
-
-		authCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
-		logger.Info("User API: Lookup cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
+		logger.Warn("User API: lookup_cache is ignored - every login reads its credential once, which the token needs anyway", "name", options.Name)
 	}
 
 	// Initialize PROXY protocol reader if enabled
@@ -215,27 +181,25 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 	}
 
 	s := &Server{
-		name:                       options.Name,
-		addr:                       options.Addr,
-		sieveExtensions:            sieveengine.EffectiveExtensions(options.SieveExtensions),
-		maxConnections:             options.MaxConnections,
-		tokenDuration:              options.TokenDuration,
-		tokenIssuer:                options.TokenIssuer,
-		rdb:                        rdb,
-		storage:                    options.Storage,
-		rs3:                        newResilientStorage(options.Storage),
-		cache:                      options.Cache,
-		uploader:                   options.Uploader,
-		uploadMaxAttempts:          options.UploadMaxAttempts,
-		authCache:                  authCache,
-		positiveRevalidationWindow: positiveRevalidationWindow,
-		authLimiter:                authLimiter,
-		tls:                        options.TLS,
-		tlsConfig:                  options.TLSConfig,
-		tlsCertFile:                options.TLSCertFile,
-		tlsKeyFile:                 options.TLSKeyFile,
-		tlsVerify:                  options.TLSVerify,
-		proxyReader:                proxyReader,
+		name:              options.Name,
+		addr:              options.Addr,
+		sieveExtensions:   sieveengine.EffectiveExtensions(options.SieveExtensions),
+		maxConnections:    options.MaxConnections,
+		tokenDuration:     options.TokenDuration,
+		tokenIssuer:       options.TokenIssuer,
+		rdb:               rdb,
+		storage:           options.Storage,
+		rs3:               newResilientStorage(options.Storage),
+		cache:             options.Cache,
+		uploader:          options.Uploader,
+		uploadMaxAttempts: options.UploadMaxAttempts,
+		authLimiter:       authLimiter,
+		tls:               options.TLS,
+		tlsConfig:         options.TLSConfig,
+		tlsCertFile:       options.TLSCertFile,
+		tlsKeyFile:        options.TLSKeyFile,
+		tlsVerify:         options.TLSVerify,
+		proxyReader:       proxyReader,
 	}
 	s.settings.Store(&reloadableSettings{
 		jwtSecret:      options.JWTSecret,

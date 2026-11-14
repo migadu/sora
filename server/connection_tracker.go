@@ -110,8 +110,11 @@ type ConnectionTracker struct {
 	kickSessions   map[int64][]chan struct{} // accountID -> channels to notify
 	kickSessionsMu sync.RWMutex
 
-	// Cache invalidation (optional): the lookup cache of the server this tracker serves
+	// Cache invalidation (optional): the lookup cache of the server this tracker serves,
+	// and the node's persistent auth cache, which a proxy falls back on when the lookup
+	// cache misses
 	lookupCache LookupCacheInvalidator // Interface for invalidating auth/routing cache on kick or forgotten logins
+	authCache   AuthCacheInvalidator
 
 	// Configuration
 	maxConnectionsPerUser      int  // Cluster-wide limit per user (0 = unlimited)
@@ -158,6 +161,17 @@ type LookupCacheInvalidator interface {
 	// (no session here), or when the address a backend cached is another alias.
 	InvalidateAccount(accountID int64)
 }
+
+// AuthCacheInvalidator drops an account from the node's persistent auth cache
+// (authcache.Cache), which the proxies answer a login from when their lookup cache
+// misses.
+type AuthCacheInvalidator interface {
+	InvalidateAccount(ctx context.Context, accountID int64) error
+}
+
+// authCacheInvalidateTimeout bounds dropping an account from the persistent auth cache,
+// which can run on the gossip receive path.
+const authCacheInvalidateTimeout = 2 * time.Second
 
 // NewConnectionTracker creates a new connection tracker.
 // If clusterMgr is provided, uses gossip protocol for cluster-wide tracking (for proxies).
@@ -226,6 +240,13 @@ func NewConnectionTracker(name, serverName, hostname string, instanceID string, 
 // This should be called after creating the tracker to enable cache invalidation.
 func (ct *ConnectionTracker) SetLookupCache(cache LookupCacheInvalidator) {
 	ct.lookupCache = cache
+}
+
+// SetAuthCache sets the node's persistent auth cache, so that a kick or forgotten logins
+// drop the account from it as well: otherwise the next login misses the lookup cache and
+// is answered from the auth cache, with the old password.
+func (ct *ConnectionTracker) SetAuthCache(cache AuthCacheInvalidator) {
+	ct.authCache = cache
 }
 
 // trackerType returns the name of the tracker for logging purposes.
@@ -655,8 +676,17 @@ func (ct *ConnectionTracker) broadcastAccountEvent(eventType ConnectionEventType
 
 // forgetLogins drops the cached routing and auth entries that let the account
 // sign in: the one for the address given (a proxy keys it by the username the
-// client submitted) and every other one the account has.
+// client submitted) and every other one the account has. The persistent auth cache
+// goes first: a login between the two would otherwise miss the lookup cache, be
+// answered from the auth cache and fill the lookup cache again.
 func (ct *ConnectionTracker) forgetLogins(accountID int64, username string) {
+	if ct.authCache != nil && accountID != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), authCacheInvalidateTimeout)
+		if err := ct.authCache.InvalidateAccount(ctx, accountID); err != nil {
+			logger.Warn("Connection tracker: Failed to drop account from auth cache", "name", ct.name, "account_id", accountID, "error", err)
+		}
+		cancel()
+	}
 	if ct.lookupCache == nil {
 		return
 	}
@@ -674,7 +704,27 @@ func (ct *ConnectionTracker) forgetLogins(accountID int64, username string) {
 // from the kick it issued and from a peer's copy of the same event.
 func (ct *ConnectionTracker) applyKick(accountID int64, username string) int {
 	ct.forgetLogins(accountID, username)
+	return ct.closeSessions(accountID)
+}
 
+// EndLocalSessions closes this node's sessions of an account and reports how many there
+// were. It tells no peer and drops no cached login: it is for the credential-change poll
+// (credchanges.Watcher), which every node runs for itself and which drops every cache of
+// the node on its own. Safe on a nil tracker (a server without one has nothing to close).
+func (ct *ConnectionTracker) EndLocalSessions(accountID int64) int {
+	if ct == nil {
+		return 0
+	}
+	n := ct.closeSessions(accountID)
+	if n > 0 {
+		logger.Info("Connection tracker: Ended sessions of an account taken out of service", "tracker", ct.trackerType(), "name", ct.name,
+			"count", n, "account_id", accountID)
+	}
+	return n
+}
+
+// closeSessions closes the kick channel of every session this node holds for the account.
+func (ct *ConnectionTracker) closeSessions(accountID int64) int {
 	ct.kickSessionsMu.Lock()
 	defer ct.kickSessionsMu.Unlock()
 

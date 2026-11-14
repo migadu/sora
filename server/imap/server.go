@@ -1910,7 +1910,8 @@ func (s *IMAPServer) ReloadConfig(cfg config.ServerConfig) error {
 	return nil
 }
 
-// GetLookupCache returns the lookup cache for testing purposes
+// GetLookupCache returns the server's cache of logins (nil when disabled), so that a
+// changed account's cached logins can be dropped (see credchanges.Watcher).
 func (s *IMAPServer) GetLookupCache() *lookupcache.LookupCache {
 	return s.lookupCache
 }

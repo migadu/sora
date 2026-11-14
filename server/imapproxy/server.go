@@ -645,6 +645,12 @@ func (s *Server) SetConnectionTracker(tracker *server.ConnectionTracker) {
 	}
 }
 
+// GetLookupCache returns the server's cache of logins (nil when disabled), so that a
+// changed account's cached logins can be dropped (see credchanges.Watcher).
+func (s *Server) GetLookupCache() *lookupcache.LookupCache {
+	return s.lookupCache
+}
+
 // GetConnectionTracker returns the connection tracker for testing
 func (s *Server) GetConnectionTracker() *server.ConnectionTracker {
 	return s.connTracker

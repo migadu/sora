@@ -103,14 +103,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var accountID int64
-	var hashedPassword string
-	var err error
-
-	// Check authentication rate limiting before the auth cache: a blocked address or
-	// IP+username pair is refused whether or not the answer is cached (the cache only
-	// saves the database work), and a cached success must not be recorded for an
-	// attempt the limiter would have refused.
+	// Check authentication rate limiting
 	if s.authLimiter != nil {
 		if err := s.authLimiter.CanAttemptAuth(ctx, remoteAddr, authKey); err != nil {
 			// Return the SAME response as a bad-credential failure (401 "Invalid credentials")
@@ -127,43 +120,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Check cache (if enabled)
-	if s.authCache != nil {
-		cachedAccountID, found, cacheErr := s.authCache.Authenticate(req.Email, req.Password)
-		if cacheErr != nil {
-			// Cached failure (same wrong password)
-			logger.Debug("User API: Cache hit - authentication failed", "name", s.name, "email", req.Email)
-			if s.authLimiter != nil {
-				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
-			}
-			s.writeError(w, http.StatusUnauthorized, "Invalid credentials")
-			return
-		}
-		if found {
-			// Cache hit - successful authentication
-			logger.Debug("User API: Cache hit - using cached auth", "name", s.name, "email", req.Email, "account_id", cachedAccountID)
-			accountID = cachedAccountID
-			if s.authLimiter != nil {
-				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, true)
-			}
-			// Skip database lookup - use cached account ID
-			goto generateToken
-		}
-		// Cache miss or revalidation needed - fall through to full auth
-		logger.Debug("User API: Cache miss - performing full authentication", "name", s.name, "email", req.Email)
-	}
-
-	// Authenticate user (full database lookup)
-	accountID, hashedPassword, err = s.rdb.GetCredentialForAuthWithRetry(ctx, req.Email)
+	// One read gives the hash to check and the password epoch to bind the token to (so a
+	// later password change or account deletion invalidates it at refresh time). Read
+	// together, the epoch is that of the hash checked. There is no login cache: the token
+	// needs this read anyway, and a cached login would outlive a password change, a
+	// removed credential or a deleted account that this read sees at once.
+	accountID, hashedPassword, epoch, err := s.rdb.GetCredentialForTokenWithRetry(ctx, req.Email)
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			// Equalize response timing with the wrong-password path (which runs bcrypt) so
 			// response time can't reveal whether the account exists. (security-audit M14)
 			db.DummyVerifyPassword(req.Password)
-			// Cache negative result if cache enabled (result=1 for user not found)
-			if s.authCache != nil {
-				s.authCache.SetFailure(req.Email, 1)
-			}
 			// Record failed attempt
 			if s.authLimiter != nil {
 				s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
@@ -179,10 +146,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, req.Password); err != nil {
-		// Cache negative result if cache enabled (result=2 for invalid password)
-		if s.authCache != nil {
-			s.authCache.SetFailure(req.Email, 2)
-		}
 		// Record failed attempt
 		if s.authLimiter != nil {
 			s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, false)
@@ -191,26 +154,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cache positive result if cache enabled
-	if s.authCache != nil {
-		s.authCache.SetSuccess(req.Email, accountID, hashedPassword, req.Password)
-	}
-
 	// Record successful attempt
 	if s.authLimiter != nil {
 		s.authLimiter.RecordAuthAttempt(ctx, remoteAddr, authKey, true)
-	}
-
-generateToken:
-
-	// Bind the token to the current password epoch so a later password change or
-	// account deletion invalidates it at refresh time (the cache fast-path above
-	// can skip the DB, so fetch it here for both paths).
-	_, epoch, err := s.rdb.GetCredentialEpochWithRetry(ctx, req.Email)
-	if err != nil {
-		logger.Warn("HTTP Mail API: Error fetching credential epoch", "name", s.name, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "Token generation failed")
-		return
 	}
 
 	// Generate JWT token

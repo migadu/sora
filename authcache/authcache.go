@@ -19,14 +19,17 @@
 // # Cache Invalidation
 //
 //   - Entries expire after a configurable max age (default: 7 days)
-//   - Password changes invalidate the entry on next failed verification
+//   - A password change, a removed credential or a deleted account drops the account's
+//     entries on every node within seconds (credchanges.Watcher reads credential_changes),
+//     and at once through cluster gossip where the change came from the Admin API
+//   - A login with another password than the cached one drops the entry and asks the database
 //   - Unused entries are purged after a configurable period (default: 30 days)
-//   - Account-wide invalidation is supported for account deletion
 package authcache
 
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -246,6 +249,11 @@ func (c *Cache) Get(ctx context.Context, address string) (accountID int64, hashe
 	return accountID, hashedPassword, nil
 }
 
+// MaxAge returns how old an entry may be and still be used.
+func (c *Cache) MaxAge() time.Duration {
+	return c.maxAge
+}
+
 // Put stores credentials in the cache, replacing any existing entry for the address.
 func (c *Cache) Put(ctx context.Context, address string, accountID int64, hashedPassword string) error {
 	address = strings.ToLower(strings.TrimSpace(address))
@@ -305,6 +313,30 @@ func (c *Cache) InvalidateAccount(ctx context.Context, accountID int64) error {
 	count, _ := result.RowsAffected()
 	if count > 0 {
 		logger.Info("AuthCache: Invalidated account cache", "account_id", accountID, "entries_removed", count)
+	}
+	return nil
+}
+
+// InvalidateAccounts removes every entry of the given accounts, in one statement: the
+// credential-change poll hands over all the accounts changed in its window at once.
+func (c *Cache) InvalidateAccounts(ctx context.Context, accountIDs []int64) error {
+	if len(accountIDs) == 0 {
+		return nil
+	}
+	ids, err := json.Marshal(accountIDs)
+	if err != nil {
+		return fmt.Errorf("failed to encode account ids: %w", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	result, err := c.db.ExecContext(ctx, `DELETE FROM auth_cache WHERE account_id IN (SELECT value FROM json_each(?))`, string(ids))
+	if err != nil {
+		return fmt.Errorf("failed to invalidate accounts in cache: %w", err)
+	}
+	if count, _ := result.RowsAffected(); count > 0 {
+		logger.Info("AuthCache: Invalidated changed accounts", "accounts", len(accountIDs), "entries_removed", count)
 	}
 	return nil
 }

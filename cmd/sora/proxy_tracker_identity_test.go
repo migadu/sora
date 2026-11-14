@@ -169,12 +169,12 @@ func startProxyTrackersSharingAHostname(t *testing.T, maxPerUser int) (trackerA,
 	}
 
 	clusterCfg := &config.ClusterConfig{}
-	trackerA, _ = startConnectionTrackerForProxy("IMAP", serverName, hostname, maxPerUser, 0, nodeA, clusterCfg, &trackerSink{})
+	trackerA, _ = startConnectionTrackerForProxy("IMAP", serverName, hostname, maxPerUser, 0, nodeA, clusterCfg, nil, &trackerSink{})
 	if trackerA == nil {
 		t.Fatal("no tracker on node A")
 	}
 	t.Cleanup(trackerA.Stop)
-	trackerB, _ = startConnectionTrackerForProxy("IMAP", serverName, hostname, maxPerUser, 0, nodeB, clusterCfg, &trackerSink{})
+	trackerB, _ = startConnectionTrackerForProxy("IMAP", serverName, hostname, maxPerUser, 0, nodeB, clusterCfg, nil, &trackerSink{})
 	if trackerB == nil {
 		t.Fatal("no tracker on node B")
 	}
