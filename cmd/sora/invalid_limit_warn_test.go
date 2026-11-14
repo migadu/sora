@@ -42,6 +42,14 @@ func TestInvalidServerLimitsFallbackLogsAtWarn(t *testing.T) {
 			},
 		},
 		{
+			// A zero or negative window parses, but the rate limiter replaces it
+			// with the same 1 minute default.
+			serverType: "imap",
+			limits:     config.ServerLimitsConfig{SearchRateLimitWindow: "-1m"},
+			build:      startBackendUntilListening(startDynamicIMAPServer),
+			want:       [][2]string{{"limits.search_rate_limit_window", "-1m"}},
+		},
+		{
 			serverType: "pop3",
 			limits:     config.ServerLimitsConfig{SessionMemoryLimit: "100 megabytes"},
 			build:      startBackendUntilListening(startDynamicPOP3Server),
