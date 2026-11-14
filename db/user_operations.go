@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"slices"
 	"strings"
 	"time"
@@ -229,7 +228,7 @@ func (db *Database) GetMessagesForMailbox(ctx context.Context, accountID int64, 
 		// Parse custom flags
 		if len(customFlagsJSON) > 0 {
 			if err := json.Unmarshal(customFlagsJSON, &msg.CustomFlags); err != nil {
-				log.Printf("Database: failed to unmarshal custom flags: %v", err)
+				logger.Error("Database: failed to unmarshal custom_flags", "message_id", msg.ID, "err", err)
 				msg.CustomFlags = []string{}
 			}
 		}

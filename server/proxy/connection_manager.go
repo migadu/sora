@@ -1903,8 +1903,7 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 		err = tlsConn.Handshake()
 		if err != nil {
 			conn.Close()
-			logger.Debug("ConnectionManager: TLS handshake failed", "addr", addr, "error", err)
-			logger.Debug("ConnectionManager: TLS handshake was using InsecureSkipVerify=%t, no client certificates", !remoteTLSVerify)
+			logger.Debug("ConnectionManager: TLS handshake failed", "addr", addr, "error", err, "verify", remoteTLSVerify)
 			return nil, fmt.Errorf("TLS handshake failed: %w", err)
 		}
 

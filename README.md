@@ -455,8 +455,8 @@ Sora provides a comprehensive REST API for administration and monitoring:
 export API_KEY="your-api-key"
 export BASE_URL="http://localhost:8080/admin"
 
-# List accounts
-curl -H "Authorization: Bearer $API_KEY" $BASE_URL/accounts
+# List a domain's accounts
+curl -H "Authorization: Bearer $API_KEY" $BASE_URL/domains/example.com/accounts
 
 # Create account
 curl -X POST -H "Authorization: Bearer $API_KEY" \
@@ -473,7 +473,7 @@ curl -H "Authorization: Bearer $API_KEY" $BASE_URL/connections/stats
 # Kick user connections
 curl -X POST -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com"}' \
+  -d '{"user_email":"user@example.com"}' \
   $BASE_URL/connections/kick
 
 # Get cache metrics

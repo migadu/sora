@@ -8,7 +8,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
 )
@@ -43,4 +45,18 @@ func StoreUnverifiableHash(t *testing.T, rdb *resilient.ResilientDatabase, addre
 			t.Fatalf("restore the stored hash of %s: %v", address, err)
 		}
 	}
+}
+
+// LookupCacheRevalidationWindow is the positive_revalidation_window of
+// RevalidatingLookupCache.
+const LookupCacheRevalidationWindow = 10 * time.Millisecond
+
+// RevalidatingLookupCache is the default proxy lookup cache with a
+// positive_revalidation_window of LookupCacheRevalidationWindow: once that has passed,
+// a password other than the one a cached login used is checked against the database
+// instead of being refused from the cache.
+func RevalidatingLookupCache() *config.LookupCacheConfig {
+	c := config.DefaultLookupCacheConfig()
+	c.PositiveRevalidationWindow = LookupCacheRevalidationWindow.String()
+	return &c
 }
