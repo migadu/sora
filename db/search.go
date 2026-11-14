@@ -340,6 +340,47 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	return finalCondition, args, nil
 }
 
+// SORT and THREAD collate strings with i;unicode-casemap (RFC 5256 §7, RFC 5957 §7): each
+// string is prepared by titlecasing every code point and then fully decomposing it
+// ("effectively Normalization Form KD"), and the prepared strings are compared as i;octet
+// (RFC 5051 §2). The string keys are therefore sorted on a prepared expression under
+// octetCollation, never under the database's default collation, which may ignore
+// punctuation or rank "É" next to "E". The expressions only read the stored columns, so
+// the WHERE side and its indexes are unchanged; SORT already sorts a mailbox's rows in
+// memory.
+
+// octetCollation compares UTF-8 strings octet by octet, which is code point order.
+const octetCollation = ` COLLATE "C"`
+
+// subjectCasemapKey is the i;unicode-casemap form of a subject_sort column. That column
+// holds the base subject uppercased by strings.ToUpper (helpers.NormalizeSubjectForSort),
+// and the titlecase of an uppercase letter is the letter itself except for the four
+// digraphs DŽ, LJ, NJ and DZ, which the translate maps to their titlecase forms (RFC 5051's
+// own example: U+01C4 becomes U+0044 U+007A U+030C). The only letters the stored key
+// cannot reproduce are the Georgian Mkhedruli ones: they are their own titlecase, but
+// strings.ToUpper stored them as Mtavruli. THREAD reads the same expression, so SORT
+// (SUBJECT) and THREAD agree on which subjects are equal.
+func subjectCasemapKey(col string) string {
+	return fmt.Sprintf("normalize(translate(%s, '%s', '%s'), NFKD)", col, upperDigraphs, titleDigraphs)
+}
+
+// The code points strings.ToUpper can return whose titlecase is another code point, and
+// that titlecase, in the same order.
+const (
+	upperDigraphs = "\u01C4\u01C7\u01CA\u01F1" // DŽ LJ NJ DZ
+	titleDigraphs = "\u01C5\u01C8\u01CB\u01F2" // Dž Lj Nj Dz
+)
+
+// addressCasemapKey is the i;unicode-casemap form of an expression over the lowercased
+// name and address columns (sortColumnsFor). PostgreSQL has no per-code-point titlecase, so
+// upper() stands in for it: the two differ on a few code points only, such as the
+// digraphs above, and ICU's upper() turns "ß" into "SS". The decomposition runs first, so
+// a letter that has one is uppercased through its base letter, which even an ASCII-only
+// upper() (a database with LC_CTYPE C) gets right.
+func addressCasemapKey(expr string) string {
+	return fmt.Sprintf("upper(normalize(%s, NFKD))", expr)
+}
+
 // buildSortOrderClause builds an SQL ORDER BY clause from IMAP sort criteria
 func (db *Database) buildSortOrderClause(sortCriteria []imap.SortCriterion) string {
 	return db.buildSortOrderClauseWithPrefix(sortCriteria, "m")
@@ -376,30 +417,29 @@ func (db *Database) buildSortOrderClauseWithPrefix(sortCriteria []imap.SortCrite
 		case imap.SortKeyDate:
 			orderField = fmt.Sprintf("%ssent_date", colPrefix)
 		case imap.SortKeySubject:
-			// Use the pre-normalized sort column for performance.
-			orderField = fmt.Sprintf("%ssubject_sort", colPrefix)
+			orderField = subjectCasemapKey(colPrefix+"subject_sort") + octetCollation
 		case imap.SortKeySize:
 			orderField = fmt.Sprintf("%ssize", colPrefix)
 		case imap.SortKeyDisplayFrom:
 			// DISPLAYFROM: the display name, or the address when the name is empty (RFC 5957
 			// §3). sortColumnsFor stores a missing name as '', not NULL, hence the NULLIF;
 			// the COALESCE also covers a NULL name.
-			orderField = fmt.Sprintf("COALESCE(NULLIF(%sfrom_name_sort, ''), %sfrom_email_sort)", colPrefix, colPrefix)
+			orderField = addressCasemapKey(fmt.Sprintf("COALESCE(NULLIF(%sfrom_name_sort, ''), %sfrom_email_sort)", colPrefix, colPrefix)) + octetCollation
 		case imap.SortKeyFrom:
 			// FROM: sort by addr-mailbox (the local part) per RFC 5256 §3, not the
 			// full local@domain address. The stored column keeps the full email
 			// (DISPLAYFROM needs it); take the local part at sort time.
-			orderField = fmt.Sprintf("split_part(%sfrom_email_sort, '@', 1)", colPrefix)
+			orderField = addressCasemapKey(fmt.Sprintf("split_part(%sfrom_email_sort, '@', 1)", colPrefix)) + octetCollation
 		case imap.SortKeyDisplayTo:
 			// DISPLAYTO: as DISPLAYFROM. to_name_sort is also NULL on rows written before
 			// migration 000006.
-			orderField = fmt.Sprintf("COALESCE(NULLIF(%sto_name_sort, ''), %sto_email_sort)", colPrefix, colPrefix)
+			orderField = addressCasemapKey(fmt.Sprintf("COALESCE(NULLIF(%sto_name_sort, ''), %sto_email_sort)", colPrefix, colPrefix)) + octetCollation
 		case imap.SortKeyTo:
 			// TO: sort by addr-mailbox (local part) per RFC 5256 §3.
-			orderField = fmt.Sprintf("split_part(%sto_email_sort, '@', 1)", colPrefix)
+			orderField = addressCasemapKey(fmt.Sprintf("split_part(%sto_email_sort, '@', 1)", colPrefix)) + octetCollation
 		case imap.SortKeyCc:
 			// CC: sort by addr-mailbox (local part) per RFC 5256 §3.
-			orderField = fmt.Sprintf("split_part(%scc_email_sort, '@', 1)", colPrefix)
+			orderField = addressCasemapKey(fmt.Sprintf("split_part(%scc_email_sort, '@', 1)", colPrefix)) + octetCollation
 		default:
 			// If the sort key is not supported, default to uid
 			orderField = fmt.Sprintf("%suid", colPrefix)

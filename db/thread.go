@@ -20,7 +20,7 @@ type ThreadMessageResult struct {
 	MessageID    string
 	InReplyTo    string
 	References   string
-	SubjectSort  string
+	SubjectSort  string // base subject in i;unicode-casemap form (subjectCasemapKey): compare with == and <
 	SentDate     time.Time
 	InternalDate time.Time // arrival; THREAD=REFS orders threads by it
 	Seq          uint32
@@ -64,7 +64,7 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 
 	subjectSelect := `'' AS subject_sort`
 	if includeSubject {
-		subjectSelect = `m.subject_sort`
+		subjectSelect = subjectCasemapKey("m.subject_sort") + " AS subject_sort"
 	}
 
 	// The FTS table is joined only for a BODY or TEXT key: one probe per message
