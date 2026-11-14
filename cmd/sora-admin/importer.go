@@ -146,6 +146,9 @@ type Importer struct {
 
 	failedPathsMutex sync.Mutex
 	failedPaths      []failedImport
+	// scanRefused is published after scan workers finish. Keep refused cache
+	// rows (including their legacy hash/upload history), but omit them this run.
+	scanRefused map[maildirFileKey]struct{}
 
 	// sieveOutcome is what became of --sieve-path, for the summary.
 	sieveOutcome string
@@ -828,6 +831,9 @@ func (i *Importer) performDryRun() error {
 			logger.Info("Failed to scan row", "error", err)
 			continue
 		}
+		if _, refused := i.scanRefused[maildirFileKey{filename, mailbox}]; refused {
+			continue
+		}
 
 		totalToScan++
 
@@ -1277,6 +1283,11 @@ type fileToProcess struct {
 	mailboxName string
 }
 
+type maildirFileKey struct {
+	filename string
+	mailbox  string
+}
+
 // scanMaildir scans the maildir path and populates the SQLite database.
 func (i *Importer) scanMaildir() error {
 	// Ensure path is clean and safe
@@ -1315,17 +1326,18 @@ func (i *Importer) scanMaildir() error {
 	// This channel will be used by the producer (filepath.Walk) to send files to consumers (workers).
 	filesToProcess := make(chan fileToProcess, i.jobs*10) // Buffered channel
 
-	// refuse reports a file the import does not take, and drops the row an earlier run
-	// cached for it (the key the INSERT OR IGNORE below keeps it by): the import phase
-	// imports every cached row, so it would otherwise import what this scan refuses.
+	var refusedMu sync.Mutex
+	refusedFiles := make(map[maildirFileKey]struct{})
+	// Refusals apply only to this run. Deleting a prior cache row would also lose
+	// a successful legacy import's SHA-256 identity and duplicate it under BLAKE3
+	// if a later run raises the limit again.
 	refuse := func(file fileToProcess, err error) {
 		logger.Warn("Invalid message", "path", file.path, "error", err)
 		i.recordFailedPath(file.path, fmt.Sprintf("invalid message: %v", err))
 		atomic.AddInt64(&i.failedMessages, 1)
-		if _, derr := i.sqliteDB.Exec("DELETE FROM messages WHERE filename = ? AND mailbox = ?",
-			file.filename, file.mailboxName); derr != nil {
-			logger.Warn("Failed to drop the cached row of a refused message", "path", file.path, "error", derr)
-		}
+		refusedMu.Lock()
+		refusedFiles[maildirFileKey{file.filename, file.mailboxName}] = struct{}{}
+		refusedMu.Unlock()
 	}
 
 	// Start worker goroutines
@@ -1469,6 +1481,7 @@ func (i *Importer) scanMaildir() error {
 
 	// Wait for all workers to finish processing.
 	wg.Wait()
+	i.scanRefused = refusedFiles
 
 	return walkErr
 }
@@ -2632,6 +2645,9 @@ func (i *Importer) importMessages() error {
 		if err := rows.Scan(&msg.path, &msg.filename, &msg.hash,
 			&msg.size, &msg.mailbox, &msg.imported); err != nil {
 			logger.Info("Failed to scan row", "error", err)
+			continue
+		}
+		if _, refused := i.scanRefused[maildirFileKey{msg.filename, msg.mailbox}]; refused {
 			continue
 		}
 

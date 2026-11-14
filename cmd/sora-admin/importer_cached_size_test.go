@@ -127,3 +127,50 @@ func TestImportRefusesAFileGrownAboveTheLimitSinceTheScan(t *testing.T) {
 		assert.Contains(t, reasons[0], "message too large")
 	}
 }
+
+// The upload must validate the current decoded bytes, rather than a stale cache
+// size or a compressed file's on-disk size. A paths file leaves the cached row
+// outside this run's scan, so only the upload's check can decide it.
+func TestImportChecksCurrentBytesForUnscannedCachedFile(t *testing.T) {
+	const limit = 4 << 10
+	const steady = "1700000001.M1P1.host:2,S"
+	const changed = "1700000002.M2P1.host:2,S"
+	big := cachedSizeMessage("Changed", 2*limit)
+	for _, tc := range []struct {
+		name     string
+		content  []byte
+		wantFail bool
+	}{
+		{"stale larger cached size now fits", cachedSizeMessage("Changed", 100), false},
+		{"exact decoded limit", append(cachedSizeMessage("Changed", 100), make([]byte, limit-len(cachedSizeMessage("Changed", 100)))...), false},
+		{"compressed bytes fit but decoded message does not", mustGzip(big), true},
+		{"file is now empty", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			maildirPath := newMaildirWith(t, map[string][]byte{
+				steady:  cachedSizeMessage("Steady", 100),
+				changed: big,
+			})
+			earlier := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), ImporterOptions{MaxMessageSize: 4 * limit})
+			require.NoError(t, earlier.scanMaildir())
+			require.NoError(t, earlier.Close())
+			changedPath := filepath.Join(maildirPath, "cur", changed)
+			require.NoError(t, os.WriteFile(changedPath, tc.content, 0644))
+			pathsFile := filepath.Join(t.TempDir(), "paths")
+			require.NoError(t, os.WriteFile(pathsFile, []byte("cur/"+steady+"\n"), 0644))
+			importer := newTestModeImporter(t, maildirPath, newMockResilientDatabase(),
+				ImporterOptions{MaxMessageSize: limit, PathsFile: pathsFile})
+			err := importer.Run()
+			if tc.wantFail {
+				require.Error(t, err)
+				assert.Equal(t, int64(1), importer.importedMessages)
+				assert.Equal(t, int64(1), importer.failedMessages)
+				assert.Len(t, failureReasons(importer, changedPath), 1)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, int64(2), importer.importedMessages)
+				assert.Zero(t, importer.failedMessages)
+			}
+		})
+	}
+}
