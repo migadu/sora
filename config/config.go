@@ -2742,6 +2742,35 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 	return err
 }
 
+// LoadServerConfig loads the file at configPath into cfg as the server runs with it. cfg
+// starts from NewDefaultConfig, so a setting the file leaves out takes the server's
+// default, not the zero value. sora-admin loads its file with it too: it works on the
+// same spool, cache and database, and an unset [uploader] path read as "" made `uploader
+// resolve` look for staged bodies in its working directory.
+//
+// A [database.write] or [database.read] endpoint the file does not define is unset, so a
+// node without one (a proxy) runs without that database. NewDefaultConfig seeds both only
+// so that a table in the file takes the defaults for the keys it leaves out. Whether a
+// table is in the file is read from the TOML metadata, never from its values: a table
+// that names localhost, postgres and sora_mail_db is a database the node must use.
+//
+// A file that does not exist leaves cfg at those defaults, without database endpoints,
+// and returns the error from os.ReadFile.
+func LoadServerConfig(configPath string, cfg *Config) error {
+	*cfg = NewDefaultConfig()
+	md, err := LoadConfigFromFileWithMetadata(configPath, cfg)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if !md.IsDefined("database", "write") {
+		cfg.Database.Write = nil
+	}
+	if !md.IsDefined("database", "read") {
+		cfg.Database.Read = nil
+	}
+	return err
+}
+
 // LoadConfigFromFileWithMetadata is LoadConfigFromFile that also returns the file's TOML
 // metadata. cfg is usually seeded by NewDefaultConfig, so after the load a value equal to
 // its default may be the default or may be set by the file; MetaData.IsDefined tells them

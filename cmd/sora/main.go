@@ -17,7 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/affinitycache"
 	"github.com/migadu/sora/authcache"
 	"github.com/migadu/sora/cache"
@@ -356,21 +355,6 @@ func main() {
 	}
 }
 
-// dropUndefinedDatabaseEndpoints unsets the [database.write] and [database.read]
-// endpoints the config file does not define, so a node without them (a proxy) runs
-// without a database. NewDefaultConfig seeds both endpoints only so that a table in the
-// file takes the defaults for the keys it leaves out. Whether a table is in the file is
-// read from the TOML metadata, never from its values: a table that names localhost,
-// postgres and sora_mail_db is a database the node must use.
-func dropUndefinedDatabaseEndpoints(cfg *config.Config, md toml.MetaData) {
-	if !md.IsDefined("database", "write") {
-		cfg.Database.Write = nil
-	}
-	if !md.IsDefined("database", "read") {
-		cfg.Database.Read = nil
-	}
-}
-
 // handleConfigReload reports the global settings a reload changed but cannot apply.
 // Their consumers took them at start-up, or (for [shared_mailboxes]) read the
 // process-wide config with no lock, so the running config is left as it is and a
@@ -440,7 +424,7 @@ func handleConfigReload(configPath string, currentCfg *config.Config, errorHandl
 // loadAndValidateConfig loads configuration from file and validates all server configurations
 func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *errors.ErrorHandler) {
 	// Load configuration from TOML file
-	md, err := config.LoadConfigFromFileWithMetadata(configPath, cfg)
+	err := config.LoadServerConfig(configPath, cfg)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// If default config doesn't exist, that's okay - use defaults
@@ -458,7 +442,6 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	} else {
 		logger.Info("Loaded configuration", "path", configPath)
 	}
-	dropUndefinedDatabaseEndpoints(cfg, md)
 	if invalid := sieveengine.InvalidExtensions(cfg.Sieve.EnabledExtensions); len(invalid) > 0 {
 		logger.Warn("[sieve] enabled_extensions names extensions the engine does not support; they are ignored, and the default set is used if none remain",
 			"invalid", invalid, "effective", sieveengine.EffectiveExtensions(cfg.Sieve.EnabledExtensions))

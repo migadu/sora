@@ -5,8 +5,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"time"
@@ -109,6 +111,9 @@ Actions taken per upload:
                                on this host retries it on its next tick.
   [SKIP]   owned by other host → nothing: that host's spool may still hold the body. Run resolve there.
   [SKIP]   file size differs   → nothing: inspect manually.
+  [SKIP]   spool unreadable    → nothing: [uploader] path is not a directory on this host, or the body's
+                               file cannot be stat'ed, so its absence is not proven. Check the path and
+                               run resolve as the server's user.
   [DELETE] MISSING everywhere  → DeleteFailedUpload: removes undeliverable message rows and pending record.
                                Content is in neither S3 nor this host's spool; the message is lost.
 
@@ -188,6 +193,10 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 	// upload whose body is still in the spool (a provider fault, not lost content —
 	// see uploader.processSingleUpload) must be re-armed, never deleted with its message.
 	localInstance := cfg.InstanceID()
+	// A spool directory that does not exist here proves nothing about the bodies: the
+	// uploader creates it at start, so it is not where this host stages them.
+	spoolInfo, err := os.Stat(cfg.Uploader.Path)
+	spoolHere := err == nil && spoolInfo.IsDir()
 
 	var resolved, rearmed, deleted, skipped int
 
@@ -234,7 +243,10 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 			}
 		}
 
-		staged := stagedBodyState(uploader.StagingFilePath(cfg.Uploader.Path, upload.ContentHash, upload.AccountID), upload.Size)
+		staged := stagedUnknown
+		if spoolHere {
+			staged = stagedBodyState(uploader.StagingFilePath(cfg.Uploader.Path, upload.ContentHash, upload.AccountID), upload.Size)
+		}
 		switch decideResolve(len(missing) == 0, upload.InstanceID == localInstance, staged) {
 		case resolveRepair:
 			// Every key this upload still had to write has its object, or nothing was
@@ -269,6 +281,10 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 		case resolveSkipSizeMismatch:
 			fmt.Printf("  [SKIP]   id=%-10d account=%-8d hash=%.16s... staged file size differs from the row (%d bytes expected) — inspect manually\n",
 				upload.ID, upload.AccountID, upload.ContentHash, upload.Size)
+			skipped++
+		case resolveSkipUnknown:
+			fmt.Printf("  [SKIP]   id=%-10d account=%-8d hash=%.16s... cannot read the spool %q on this host — check [uploader] path and run as the server's user\n",
+				upload.ID, upload.AccountID, upload.ContentHash, cfg.Uploader.Path)
 			skipped++
 		case resolveDelete:
 			// Content is in neither S3 nor this host's spool - the message is lost. Clean up.
@@ -455,6 +471,7 @@ const (
 	resolveRearm                                  // body intact in this host's spool: let the uploader retry
 	resolveSkipRemote                             // owned by another host whose spool cannot be seen from here
 	resolveSkipSizeMismatch                       // a file is here but disagrees with the row: a human decides
+	resolveSkipUnknown                            // this host's spool cannot be read: absence is not proven
 	resolveDelete                                 // in neither S3 nor this host's spool: the content is lost
 )
 
@@ -465,12 +482,21 @@ const (
 	stagedAbsent       stagedBody = iota
 	stagedIntact                  // present with exactly the row's size
 	stagedSizeMismatch            // present with a different size
+	stagedUnknown                 // the spool cannot be read here
 )
 
-// stagedBodyState inspects the spool file for an upload.
+// stagedBodyState inspects the spool file for an upload. Only a file that does not exist
+// is absent: any other error (a permission denied to a user other than the server's) is
+// no proof that the body is gone.
 func stagedBodyState(path string, expectedSize int64) stagedBody {
 	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
+	if errors.Is(err, fs.ErrNotExist) {
+		return stagedAbsent
+	}
+	if err != nil {
+		return stagedUnknown
+	}
+	if info.IsDir() {
 		return stagedAbsent
 	}
 	if info.Size() != expectedSize {
@@ -495,7 +521,9 @@ func decideResolve(inS3 bool, ownedHere bool, staged stagedBody) resolveOutcome 
 		return resolveRearm
 	case stagedSizeMismatch:
 		return resolveSkipSizeMismatch
-	default:
+	case stagedAbsent:
 		return resolveDelete
+	default:
+		return resolveSkipUnknown
 	}
 }
