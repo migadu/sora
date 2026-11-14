@@ -212,7 +212,7 @@ func (s *Server) handleSubscribeMailbox(w http.ResponseWriter, r *http.Request) 
 
 	// Subscribe to mailbox
 	if err := s.rdb.SubscribeToMailboxWithRetry(ctx, accountID, name); err != nil {
-		if errors.Is(err, consts.ErrDBNotFound) {
+		if errors.Is(err, consts.ErrMailboxNotFound) || errors.Is(err, consts.ErrDBNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
@@ -248,7 +248,7 @@ func (s *Server) handleUnsubscribeMailbox(w http.ResponseWriter, r *http.Request
 
 	// Unsubscribe from mailbox
 	if err := s.rdb.UnsubscribeFromMailboxWithRetry(ctx, accountID, name); err != nil {
-		if errors.Is(err, consts.ErrDBNotFound) {
+		if errors.Is(err, consts.ErrMailboxNotFound) || errors.Is(err, consts.ErrDBNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
