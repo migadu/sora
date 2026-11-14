@@ -383,8 +383,9 @@ func (db *Database) IsAnyAddressOwnedByAccount(ctx context.Context, accountID in
 }
 
 var (
-	ErrCannotDeletePrimaryCredential = errors.New("cannot delete the primary credential. Use update-account to make another credential primary first")
-	ErrCannotDeleteLastCredential    = errors.New("cannot delete the last credential for an account. Use delete-account to remove the entire account")
+	// The Admin API returns these to its clients as well, so they name no sora-admin command.
+	ErrCannotDeletePrimaryCredential = errors.New("cannot delete the primary credential: make another credential of the account primary first")
+	ErrCannotDeleteLastCredential    = errors.New("cannot delete the last credential of an account: delete the account instead")
 	// ErrCrossDomainPrimaryChange is returned when an operation would switch an account's
 	// primary identity to a different domain while the account already has messages. Message
 	// storage keys (s3_domain) are captured per-message from the then-current primary, so such

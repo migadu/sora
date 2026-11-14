@@ -854,7 +854,11 @@ func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *s.settings.Load()
 
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.libCommandTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("POP3 config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.libCommandTimeout)
+	} else if timeout != next.libCommandTimeout {
 		// Mirror construction: the raw value feeds the per-command execution
 		// timeout (0 = disabled) while the idle timeout keeps the RFC 1939 §3
 		// 10-minute floor.
@@ -866,7 +870,9 @@ func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 		reloaded = append(reloaded, "command_timeout")
 		reportCommandTimeout(timeout)
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("POP3 config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
@@ -874,7 +880,9 @@ func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if limit, err := cfg.GetSessionMemoryLimit(); err == nil && limit != next.sessionMemoryLimit {
+	if limit, err := cfg.GetSessionMemoryLimit(); err != nil {
+		logger.Warn("POP3 config reload: invalid session_memory_limit, keeping the running value", "name", s.name, "error", err, "running", next.sessionMemoryLimit)
+	} else if limit != next.sessionMemoryLimit {
 		next.sessionMemoryLimit = limit
 		reloaded = append(reloaded, "session_memory_limit")
 	}
