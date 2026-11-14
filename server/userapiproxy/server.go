@@ -438,7 +438,7 @@ func (s *Server) Start() error {
 		Addr:         s.addr,
 		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: writeTimeout,
 		IdleTimeout:  120 * time.Second,
 		ConnState:    s.connStateHandler,
 	}
@@ -671,6 +671,10 @@ func (s *Server) routeNameless(r *http.Request) (backendRoute, error) {
 	}
 	return backendRoute{}, fmt.Errorf("no backend available for a request naming no user")
 }
+
+// writeTimeout is the proxy's http.Server WriteTimeout: no answer later than this after a
+// request was read reaches its client.
+const writeTimeout = 30 * time.Second
 
 // maxAuthBodyBytes bounds how much of an auth request body the proxy reads to find the
 // user it is for; a login or refresh body is a few hundred bytes.
@@ -1178,6 +1182,17 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 		}
 	}
 	ctx = context.WithValue(ctx, proxyProtocolKey, route.proxyProtocol)
+	if login != nil {
+		// The backend's answer is counted whether or not the client waits for it, as the
+		// proxy's own refusal of a login is (routeAuthRequest): cancelled with the client,
+		// a login that left before the backend answered went uncounted, and the rate limit
+		// alone showed which addresses the lookup knows. Bounded by writeTimeout, past
+		// which no answer reaches a client. (Without a deadline the context could never
+		// be done, and ReverseProxy would cancel it on the client's close itself.)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
+		defer cancel()
+	}
 	r = r.WithContext(ctx)
 
 	// Keep Authorization header for backend JWT validation

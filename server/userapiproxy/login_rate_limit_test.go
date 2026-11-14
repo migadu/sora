@@ -51,6 +51,13 @@ func (knownAddressLookup) Close() error { return nil }
 // refused by the proxy itself.
 func rateLimitedProxy(t *testing.T, limit config.AuthRateLimiterConfig) (handler http.Handler, hits *atomic.Int32) {
 	t.Helper()
+	return rateLimitedProxyWith(t, limit, nil)
+}
+
+// rateLimitedProxyWith is rateLimitedProxy whose backend calls verify, if not nil, before
+// it answers a login: the time the backend takes to verify the password.
+func rateLimitedProxyWith(t *testing.T, limit config.AuthRateLimiterConfig, verify func()) (handler http.Handler, hits *atomic.Int32) {
+	t.Helper()
 	origCost := db.BcryptCost
 	db.BcryptCost = bcrypt.MinCost
 	t.Cleanup(func() { db.BcryptCost = origCost })
@@ -60,6 +67,9 @@ func rateLimitedProxy(t *testing.T, limit config.AuthRateLimiterConfig) (handler
 		hits.Add(1)
 		var req struct{ Email, Password string }
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		if verify != nil {
+			verify()
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if req.Password == rateLimitRightPassword {
 			_, _ = w.Write([]byte(`{"token":"t","expires_at":0,"email":"` + req.Email + `","account_id":42}`))
@@ -256,4 +266,37 @@ func TestUserAPIProxy_LoginRateLimitCountsTheBackendsVerdict(t *testing.T) {
 	checkFailed(t, sendLogin(t, h, hits, "192.0.2.1", rateLimitKnown, "wrong-password"), true, "failure 1 after the success")
 	checkFailed(t, sendLogin(t, h, hits, "192.0.2.1", rateLimitKnown, "wrong-password"), true, "failure 2 after the success")
 	checkBlocked(t, sendLogin(t, h, hits, "192.0.2.1", rateLimitKnown, "wrong-password"), "after two failures")
+}
+
+// A login a backend answers is counted whether or not its client waits for the answer,
+// as the proxy's own refusals are, which it counts however soon the client leaves. A
+// client that left while the backend verified the password went uncounted, so it could
+// tell from the rate limit alone which addresses the lookup knows: max_attempts_per_ip_username
+// abandoned logins blocked an address the lookup does not know, never one it knows.
+func TestUserAPIProxy_LoginRateLimitCountsALoginItsClientLeft(t *testing.T) {
+	limit := rateLimit()
+	limit.MaxAttemptsPerIPUsername = 2
+	verifying, answer := make(chan struct{}, 1), make(chan struct{})
+	h, hits := rateLimitedProxyWith(t, limit, func() {
+		verifying <- struct{}{}
+		<-answer
+	})
+
+	for i := 1; i <= limit.MaxAttemptsPerIPUsername; i++ {
+		ctx, leave := context.WithCancel(context.Background())
+		r := httptest.NewRequestWithContext(ctx, http.MethodPost, "/user/auth/login", strings.NewReader(`{"email":"`+rateLimitKnown+`","password":"wrong-password"}`))
+		r.RemoteAddr = "192.0.2.1:40000"
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			h.ServeHTTP(httptest.NewRecorder(), r)
+		}()
+		<-verifying
+		leave()                           // the client goes away while the backend verifies the password
+		time.Sleep(50 * time.Millisecond) // time for the proxy to see it gone
+		answer <- struct{}{}              // the backend's 401
+		<-done
+	}
+	close(answer)
+	checkBlocked(t, sendLogin(t, h, hits, "192.0.2.1", rateLimitKnown, "wrong-password"), "after logins whose client left before the backend answered")
 }
