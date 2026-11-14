@@ -446,6 +446,47 @@ func TestIPUsernameFullBlockTableReusesOutOfOrderBlock(t *testing.T) {
 	}
 }
 
+// A failure while blocked renews the block: in a full block table it is no longer the
+// first block to end, and a block that has ended since makes room ahead of it.
+func TestIPUsernameFullBlockTableReusesSlotPastRenewedBlock(t *testing.T) {
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIPUsername: 1,
+		IPUsernameBlockDuration:  time.Minute,
+		IPUsernameWindowDuration: time.Hour,
+		CleanupInterval:          time.Hour,
+		MaxIPUsernameEntries:     2,
+	})
+	defer limiter.Stop()
+	t0 := time.Now()
+	fail := func(ip string, at time.Duration) {
+		limiter.updateIPUsernameFailure(ip, "user@example.com", t0.Add(at))
+	}
+	blockedUntil := func(ip string) (time.Duration, bool) {
+		limiter.ipUsernameMu.RLock()
+		defer limiter.ipUsernameMu.RUnlock()
+		blocked, ok := limiter.blockedIPUsernames[ip+"|user@example.com"]
+		if !ok {
+			return 0, false
+		}
+		return blocked.BlockedUntil.Sub(t0), true
+	}
+
+	fail("198.51.100.1", 0)              // blocked until t0+60s
+	fail("198.51.100.2", 10*time.Second) // blocked until t0+70s: the table is full
+	fail("198.51.100.1", 50*time.Second) // renewed until t0+110s
+	fail("198.51.100.3", 75*time.Second) // .2's block has ended: .3 takes its slot
+	if _, ok := blockedUntil("198.51.100.3"); !ok {
+		t.Error("a block that had ended kept its slot in a full table while an earlier block was renewed")
+	}
+	if end, ok := blockedUntil("198.51.100.1"); !ok || end != 110*time.Second {
+		t.Errorf("renewed block: blocked = %v, ends %v after t0, want until t0+110s", ok, end)
+	}
+	if _, ok := blockedUntil("198.51.100.2"); ok {
+		t.Error("the block that had ended is still stored")
+	}
+}
+
 // CanAttemptAuth removes a block that has ended after trading its read lock for the
 // write lock. A failure that blocks the address (or pair) anew in between must survive
 // that removal. The window is short, so the race is retried many times.
