@@ -98,9 +98,12 @@ func (db *Database) GetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 			args = append(args, name)
 			argIdx++
 
-			// Immediate children (one level deeper, separated by /)
-			conditions = append(conditions, fmt.Sprintf("entry_name LIKE $%d AND entry_name NOT LIKE $%d", argIdx, argIdx+1))
-			args = append(args, name+"/%", name+"/%/%")
+			// Immediate children (one level deeper, separated by /). The name
+			// is escaped: "_" and "\" are valid in entry names (RFC 5464
+			// §3.2) and must match literally, not as LIKE metacharacters.
+			prefix := escapeLike(name + "/")
+			conditions = append(conditions, fmt.Sprintf(`entry_name LIKE $%d ESCAPE '\' AND entry_name NOT LIKE $%d ESCAPE '\'`, argIdx, argIdx+1))
+			args = append(args, prefix+"%", prefix+"%/%")
 			argIdx += 2
 		}
 
@@ -120,9 +123,9 @@ func (db *Database) GetMetadata(ctx context.Context, tx pgx.Tx, accountID int64,
 		args = []any{accountID, mailboxID}
 
 		for _, name := range entryNames {
-			// Exact match or any descendant
-			conditions = append(conditions, fmt.Sprintf("(entry_name = $%d OR entry_name LIKE $%d)", argIdx, argIdx+1))
-			args = append(args, name, name+"/%")
+			// Exact match or any descendant, the name escaped as for DEPTH 1
+			conditions = append(conditions, fmt.Sprintf(`(entry_name = $%d OR entry_name LIKE $%d ESCAPE '\')`, argIdx, argIdx+1))
+			args = append(args, name, escapeLike(name+"/")+"%")
 			argIdx += 2
 		}
 
