@@ -442,6 +442,13 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 // mailbox already exists, this argument is ignored"). None is created in the shared
 // namespace, where a personal namesake would shadow a shared mailbox in later
 // lookups; the message then falls back to INBOX, as for any missing target.
+//
+// A name the mailstore refuses is no delivery failure either: "Failure to create the
+// specified mailbox is considered to be an error" (RFC 5490 §3.2), and on an error
+// implementations "do an implicit keep" (RFC 5228 §2.10.6), so the message goes to
+// INBOX. The name never becomes valid; failing the delivery would only have it
+// retried until it bounces, and through the default script's +detail filing any
+// sender can choose the name.
 func (d *DeliveryContext) createMissingMailbox(ctx context.Context, recipient RecipientInfo, name string) error {
 	_, err := d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, name)
 	if !errors.Is(err, consts.ErrMailboxNotFound) {
@@ -452,6 +459,10 @@ func (d *DeliveryContext) createMissingMailbox(ctx context.Context, recipient Re
 		return nil
 	}
 	_, err = d.RDB.GetOrCreateMailboxByNameWithRetry(ctx, recipient.AccountID, name)
+	if errors.Is(err, consts.ErrMailboxInvalidName) {
+		d.Logger.Log("Sieve fileinto :create of an invalid mailbox name %q, keeping the message: %v", name, err)
+		return nil
+	}
 	return err
 }
 

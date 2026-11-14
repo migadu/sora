@@ -50,6 +50,16 @@ func TestAdminAPI_DeliverMail_RunsDefaultSieveAndCreate(t *testing.T) {
 			script: []string{`require ["fileinto", "mailbox"];`, `fileinto :create "Receipts/2026";`},
 			want:   "Receipts/2026",
 		},
+		// A name the mailstore refuses can never be created: RFC 5490 §3.2 makes
+		// that an error, and RFC 5228 §2.10.6 an implicit keep, not a delivery
+		// failure the caller would retry forever. Through the default script any
+		// sender can pick such a name with the +detail.
+		{
+			name:   "user fileinto :create of an invalid name keeps",
+			script: []string{`require ["fileinto", "mailbox"];`, `fileinto :create "Bad/./Name";`},
+			want:   "INBOX",
+		},
+		{name: "default fileinto :create of an invalid detail keeps", detail: "a/./b", want: "INBOX"},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -109,8 +119,8 @@ func TestAdminAPI_DeliverMail_RunsDefaultSieveAndCreate(t *testing.T) {
 
 // TestAdminAPI_DeliverMail_SieveCreateNotInSharedNamespace: fileinto :create of a
 // missing name in the [shared_mailboxes] namespace keeps the message in INBOX and
-// makes no personal mailbox there, as on LMTP; such a namesake would shadow a
-// shared mailbox of that name in every later lookup by this user.
+// makes no personal mailbox there (the LMTP side is #323); such a namesake would
+// shadow a shared mailbox of that name in every later lookup by this user.
 func TestAdminAPI_DeliverMail_SieveCreateNotInSharedNamespace(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
