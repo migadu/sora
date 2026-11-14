@@ -215,8 +215,9 @@ func (r *BackendRoute) DialContext(ctx context.Context, network, address string)
 // for a caller that dials through its own transport instead of ConnectWithProxy (the
 // User API proxy). It counts what ConnectWithProxy counts: a backend outside the pools
 // has no health entry; a dial the proxy refused itself (maintenance, pool ownership) says
-// nothing about the backend; and a failure counts only while the caller's context is
-// live, as a dial its caller abandoned cannot be told from one the backend timed out.
+// nothing about the backend; and a failure counts only while the supplied dial context
+// is live. HTTP transports can keep a dial alive after the request that started it is
+// canceled so its connection can be reused; its independent backend outcome still counts.
 func (r *BackendRoute) RecordDialOutcome(ctx context.Context, err error) {
 	cm := r.manager
 	if !cm.HasBackend(r.addr) {
