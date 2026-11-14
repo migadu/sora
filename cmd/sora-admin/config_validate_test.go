@@ -113,6 +113,7 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 	const imapBackend = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
 	const imapProxy = "\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\n"
 	const proxyProtocolImap = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\nproxy_protocol = true\n"
+	const remoteLookup = "remote_addrs = [\"192.0.2.10:143\"]\n\n[server.remote_lookup]\nenabled = true\n"
 	tests := []struct {
 		name    string
 		content string
@@ -132,6 +133,27 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			content: "[[pool]]\nname = \"sora1\"\nbackends = [\"192.0.2.10:143\"]\ndefault = true\n\n" +
 				"[[pool]]\nname = \"sora1\"\nbackends = [\"192.0.2.11:143\"]\n" + imapProxy,
 			wantErr: []string{`[[pool]] "sora1": declared more than once`},
+		},
+		{
+			// The proxies refused these [server.remote_lookup] settings only when they
+			// were built (#853).
+			name:    "remote_lookup with $email in the URL host",
+			content: imapProxy + remoteLookup + "url = \"https://$email.lookup.example.com/lookup\"\n",
+			wantErr: []string{`$email is allowed only in the path and query, not in the host "$email.lookup.example.com"`},
+		},
+		{
+			name:    "remote_lookup plaintext to a remote host",
+			content: imapProxy + remoteLookup + "url = \"http://lookup.example.com/lookup?email=$email\"\n",
+			wantErr: []string{"remote_lookup.url must use https:// for non-loopback hosts"},
+		},
+		{
+			name:    "remote_lookup timeout without a unit",
+			content: imapProxy + remoteLookup + "url = \"https://lookup.example.com/lookup?email=$email\"\ntimeout = \"5\"\n",
+			wantErr: []string{"invalid remote_lookup.timeout"},
+		},
+		{
+			name:    "remote_lookup the proxies start with",
+			content: imapProxy + remoteLookup + "url = \"https://lookup.example.com/lookup?email=$email\"\ntimeout = \"5s\"\n",
 		},
 		{
 			name:    "uploader concurrency 0 on a mail backend",
