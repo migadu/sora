@@ -522,7 +522,7 @@ func (s *Server) setupHandler() http.Handler {
 		// Check if this is an authentication endpoint (no JWT required)
 		isAuthEndpoint := strings.HasPrefix(r.URL.Path, "/user/auth/")
 
-		if !isAuthEndpoint {
+		if !isAuthEndpoint && !isCORSPreflight(r) {
 			// Validate JWT token and extract claims for non-auth endpoints
 			claims, err := s.extractAndValidateToken(r)
 			if err != nil {
@@ -544,11 +544,12 @@ func (s *Server) setupHandler() http.Handler {
 			return
 		}
 
-		// Auth endpoints carry no JWT. A login names its user in the body and a refresh
-		// carries the user's token, so both are routed like any other request for that
-		// user: the account lives on a backend of the user's pool. A request that names
-		// nobody goes to the default pool by path hash, as before pools; without a default
-		// pool it is refused. The backend handles rate limiting.
+		// Auth endpoints and CORS preflights carry no JWT. A login names its user in the
+		// body and a refresh carries the user's token, so both are routed like any other
+		// request for that user: the account lives on a backend of the user's pool. A
+		// request that names nobody, such as a preflight, goes to the default pool by path
+		// hash, as before pools; without a default pool it is refused. The backend handles
+		// rate limiting, and answers a preflight with its CORS policy (allowed_origins).
 		route, err := s.routeAuthRequest(r)
 		if err != nil {
 			if errors.Is(err, errAuthBodyTooLarge) {
@@ -563,6 +564,15 @@ func (s *Server) setupHandler() http.Handler {
 		// Proxy unauthenticated request
 		s.proxyRequest(w, r, route)
 	})
+}
+
+// isCORSPreflight reports whether r is a CORS-preflight request: an OPTIONS request with
+// Access-Control-Request-Method (Fetch Standard, "HTTP requests"). A browser sends one
+// before a cross-origin call that carries Authorization and never puts credentials on it,
+// so it cannot be held to the JWT check; the backend answers it without touching any
+// account, as it does when it is reached directly.
+func isCORSPreflight(r *http.Request) bool {
+	return r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
 }
 
 // maxAuthBodyBytes bounds how much of an auth request body the proxy reads to find the
