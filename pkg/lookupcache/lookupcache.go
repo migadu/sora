@@ -10,6 +10,7 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -75,13 +76,17 @@ type LookupCache struct {
 	// Metrics
 	hits   uint64
 	misses uint64
+	// This cache's series of the per-cache gauges.
+	entriesGauge prometheus.Gauge
+	hitRateGauge prometheus.Gauge
 
 	// Cleanup counter for periodic memory reporting
 	cleanupCounter uint64
 }
 
-// New creates a new authentication cache instance
-func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval time.Duration, positiveRevalidationWindow time.Duration) *LookupCache {
+// New creates a new authentication cache instance for the server named serverName
+// of type protocol ("imap", "imap_proxy", "userapi", ...), which label its gauges.
+func New(protocol, serverName string, positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval time.Duration, positiveRevalidationWindow time.Duration) *LookupCache {
 	if maxSize <= 0 {
 		maxSize = 10000
 	}
@@ -101,6 +106,8 @@ func New(positiveTTL, negativeTTL time.Duration, maxSize int, cleanupInterval ti
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		stopCleanup:                make(chan struct{}),
 		cleanupStopped:             make(chan struct{}),
+		entriesGauge:               metrics.LookupCacheEntriesTotal.WithLabelValues(protocol, serverName),
+		hitRateGauge:               metrics.LookupCacheHitRate.WithLabelValues(protocol, serverName),
 	}
 
 	// Start background cleanup goroutine
@@ -220,7 +227,7 @@ func (c *LookupCache) SetSuccess(address string, accountID int64, hashedPassword
 		ExpiresAt:      now.Add(c.positiveTTL),
 	}
 
-	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+	c.entriesGauge.Set(float64(len(c.entries)))
 }
 
 // SetFailure caches a failed authentication result (user not found or invalid password)
@@ -252,7 +259,7 @@ func (c *LookupCache) SetFailure(address string, result int) {
 		IsNegative: true,
 	}
 
-	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+	c.entriesGauge.Set(float64(len(c.entries)))
 }
 
 // Invalidate removes a specific entry from the cache (e.g., after password change).
@@ -265,7 +272,7 @@ func (c *LookupCache) Invalidate(address string) {
 	defer c.mu.Unlock()
 
 	delete(c.entries, address)
-	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+	c.entriesGauge.Set(float64(len(c.entries)))
 }
 
 // InvalidateUser removes the entry for a serverName/username pair, using the
@@ -296,7 +303,7 @@ func (c *LookupCache) InvalidateAccount(accountID int64) {
 			delete(c.entries, key)
 		}
 	}
-	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+	c.entriesGauge.Set(float64(len(c.entries)))
 }
 
 // evictOldest removes the oldest entry from the cache
@@ -357,7 +364,7 @@ func (c *LookupCache) cleanup() {
 
 	if removed > 0 {
 		logger.Info("LookupCache: Cleanup removed expired entries", "removed", removed, "remaining", len(c.entries))
-		metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+		c.entriesGauge.Set(float64(len(c.entries)))
 	}
 
 	// Update hit rate metric
@@ -408,7 +415,7 @@ func (c *LookupCache) updateHitRateMetric() {
 	total := hits + misses
 	if total > 0 {
 		hitRate := float64(hits) / float64(total) * 100
-		metrics.LookupCacheHitRate.Set(hitRate)
+		c.hitRateGauge.Set(hitRate)
 	}
 }
 
@@ -533,7 +540,7 @@ func (c *LookupCache) Set(serverName, username string, entry *CacheEntry) {
 	}
 
 	c.entries[key] = entry
-	metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+	c.entriesGauge.Set(float64(len(c.entries)))
 }
 
 // Refresh extends the TTL of an existing cache entry
@@ -625,7 +632,7 @@ func (c *LookupCache) GetOrFetch(serverName, username string, fetchFn func() (*C
 
 		// Store in cache
 		c.entries[key] = fetchedEntry
-		metrics.LookupCacheEntriesTotal.Set(float64(len(c.entries)))
+		c.entriesGauge.Set(float64(len(c.entries)))
 
 		return fetchedEntry, nil
 	})

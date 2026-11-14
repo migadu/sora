@@ -52,7 +52,7 @@ func backendFor(t *testing.T, s *Server) string {
 func TestGetBackendForUser_CachedRouteToMaintenanceBackend(t *testing.T) {
 	s, m := newMaintenanceTestServer(t)
 	withAffinity(t, s)
-	s.lookupCache = lookupcache.New(5*time.Minute, time.Minute, 100, time.Hour, 0)
+	s.lookupCache = lookupcache.New("test", "test", 5*time.Minute, time.Minute, 100, time.Hour, 0)
 	t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
 	s.lookupCache.Set(s.name, "user@example.com", &lookupcache.CacheEntry{
 		AccountID: 42, ServerAddress: drainedBackend, CreatedAt: time.Now(), ExpiresAt: time.Now().Add(5 * time.Minute),
@@ -233,7 +233,7 @@ func TestUserAPIProxy_TransportRefusesAddressInMaintenance(t *testing.T) {
 func TestGetBackendForUser_RemoteLookupPinReturnsWithCacheAndAffinity(t *testing.T) {
 	s, m := newMaintenanceTestServer(t)
 	withAffinity(t, s)
-	s.lookupCache = lookupcache.New(5*time.Minute, time.Minute, 100, time.Hour, 0)
+	s.lookupCache = lookupcache.New("test", "test", 5*time.Minute, time.Minute, 100, time.Hour, 0)
 	t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
 	s.routingLookup = &fakeRoutingLookup{backend: drainedBackend}
 
@@ -293,7 +293,7 @@ func TestUserAPIProxy_ClosesIdleBackendConnectionsWhenMaintenanceChanges(t *test
 // maintenance, last that long, not a fixed five minutes.
 func TestGetBackendForUser_CachedRoutesUseThePositiveTTL(t *testing.T) {
 	s, _ := newMaintenanceTestServer(t)
-	s.lookupCache = lookupcache.New(30*time.Second, time.Minute, 100, time.Hour, 0)
+	s.lookupCache = lookupcache.New("test", "test", 30*time.Second, time.Minute, 100, time.Hour, 0)
 	t.Cleanup(func() { _ = s.lookupCache.Stop(context.Background()) })
 	s.routingLookup = &fakeRoutingLookup{backend: drainedBackend}
 

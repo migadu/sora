@@ -10,7 +10,7 @@ import (
 
 func newMSTestLookupCache(t *testing.T) *lookupcache.LookupCache {
 	t.Helper()
-	c := lookupcache.New(5*time.Minute, 1*time.Minute, 100, 5*time.Minute, 30*time.Second)
+	c := lookupcache.New("test", "test", 5*time.Minute, 1*time.Minute, 100, 5*time.Minute, 30*time.Second)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

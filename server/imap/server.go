@@ -510,7 +510,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	}
 
 	// Initialize search rate limiter
-	searchRateLimiter := serverPkg.NewSearchRateLimiter("IMAP", options.SearchRateLimitPerMin, options.SearchRateLimitWindow, options.SearchRateLimitBurst)
+	searchRateLimiter := serverPkg.NewSearchRateLimiter("imap", options.SearchRateLimitPerMin, options.SearchRateLimitWindow, options.SearchRateLimitBurst)
 	threadMaxMessages := options.ThreadMaxMessages
 	if threadMaxMessages <= 0 {
 		threadMaxMessages = config.DefaultThreadMaxMessages
@@ -539,7 +539,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 
 		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("imap", name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("IMAP: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
@@ -1026,7 +1026,7 @@ func (s *IMAPServer) newSession(conn *imapserver.Conn) (imapserver.Session, *ima
 	session.Id = idgen.New()
 	session.HostName = s.hostname
 	session.Stats = s
-	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "IMAP", session.InfoLog)
+	session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "imap", session.InfoLog)
 
 	greeting := &imapserver.GreetingData{
 		PreAuth: false,
