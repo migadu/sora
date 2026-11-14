@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
@@ -31,8 +32,14 @@ const (
 type TrainingRequest struct {
 	// Type of training: "spam" or "ham"
 	Type TrainingType `json:"type"`
-	// Message content (without attachments)
+	// Message content (without attachments). A JSON string holds Unicode text
+	// only, so a message that is not valid UTF-8 arrives here with each invalid
+	// byte replaced by U+FFFD and is also sent as MessageBase64.
 	Message string `json:"message"`
+	// MessageBase64 is the message byte for byte, base64 on the wire (RFC 4648
+	// section 4). submitHTTP sets it when Message is not valid UTF-8, the one
+	// case Message cannot carry exactly; it is absent otherwise.
+	MessageBase64 []byte `json:"message_base64,omitempty"`
 	// Email address of the user performing the training
 	User string `json:"user"`
 	// Source mailbox name
@@ -70,6 +77,9 @@ var (
 
 // jobTimeout bounds one job: fetching the body and submitting it.
 const jobTimeout = 60 * time.Second
+
+// maxResponseBodyBytes bounds how much of the training endpoint's answer is read.
+const maxResponseBodyBytes = 1 << 10
 
 // Client handles spam training submissions to remote endpoint. A fixed pool of
 // workers serves a bounded queue, so however many messages are moved, at most one
@@ -290,6 +300,17 @@ func (c *Client) SubmitTraining(ctx context.Context, req *TrainingRequest) error
 
 // submitHTTP performs the actual HTTP request to the training endpoint
 func (c *Client) submitHTTP(ctx context.Context, req *TrainingRequest) error {
+	// json.Marshal replaces every byte of a string that is not valid UTF-8 with
+	// U+FFFD, which destroys 8-bit text in any other charset: a body, a part kept
+	// from a multipart, a raw header value. Such a message also goes byte for
+	// byte in message_base64; message stays as it was for receivers that do not
+	// read message_base64.
+	if !utf8.ValidString(req.Message) {
+		withBytes := *req
+		withBytes.MessageBase64 = []byte(req.Message)
+		req = &withBytes
+	}
+
 	// Marshal request to JSON
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -315,8 +336,10 @@ func (c *Client) submitHTTP(ctx context.Context, req *TrainingRequest) error {
 	}
 	defer resp.Body.Close()
 
-	// Read response body for error details
-	body, _ := io.ReadAll(resp.Body)
+	// Only a refusal's body is used, quoted in the error. Read at most
+	// maxResponseBodyBytes: a short body is read to its end, so the transport keeps
+	// the connection, and a longer one is cut off and its connection closed.
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 
 	// Check response status
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {

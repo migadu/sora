@@ -126,9 +126,9 @@ Omitted, zero and negative values use the default; there is no unlimited setting
 
 #### Command Timeout and DoS Protection
 
-All protocol servers support multi-layered timeout protection to defend against various denial-of-service attacks:
+All protocol servers support multi-layered timeout protection to defend against various denial-of-service attacks. The LMTP server applies `command_timeout` only; it warns at startup about the other two.
 
-*   `command_timeout`: Maximum idle time before closing an inactive connection (default: `"30m"` for IMAP, the RFC 3501 §5.4 autologout floor; `"10m"` for POP3 per RFC 1939 §3; `"3m"` for ManageSieve). This protects against clients that connect but never send commands. For IMAP keep it under `"35m"`, the protocol library's own read deadline.
+*   `command_timeout`: Maximum idle time before closing an inactive connection (default: `"30m"` for IMAP, the RFC 3501 §5.4 autologout floor; `"10m"` for POP3 per RFC 1939 §3; `"3m"` for ManageSieve; `"5m"` for LMTP per RFC 5321 §4.5.3.2.7, where `"0"` also means the default). This protects against clients that connect but never send commands. For IMAP keep it under `"35m"`, the protocol library's own read deadline. On LMTP it also bounds receiving a message: the read deadline set for the DATA command is not extended while the data arrives, so a message that takes longer than `command_timeout` is refused with `421` and the MTA retries it.
 *   `absolute_session_timeout`: Maximum total session duration regardless of activity (default: `"24h"`). Set `"0"` to disable this limit.
 *   `min_bytes_per_minute`: Slowloris guard (default: `0`, disabled; `512` recommended). A session is closed after two consecutive one-minute windows in which the client sent fewer bytes than this **and no command completed** (the server produced no output). It starts two minutes after the handshake. A client that completes a small command every few seconds (a NOOP poll) is never affected however little it transfers, and a silent session is governed by `command_timeout` instead. IMAP IDLE suspends the check.
 
@@ -156,7 +156,7 @@ Sora can also act as a proxy to load balance connections to other Sora backend s
 
 #### Proxy Timeout Protection
 
-Proxy servers also support the same multi-layered timeout protection as direct protocol servers:
+Proxy servers also support the same multi-layered timeout protection as direct protocol servers, except the LMTP proxy, which applies `absolute_session_timeout` and `auth_idle_timeout` and warns at startup about the other two:
 
 *   `command_timeout`: Maximum idle time before closing an inactive connection (same per-protocol defaults as the backends: `"30m"` for IMAP, `"10m"` for POP3, `"3m"` for ManageSieve).
 *   `absolute_session_timeout`: Maximum total session duration (default: `"24h"`, or `"5m"` for `lmtp_proxy`). Set `"0"` to disable this limit. Defaults are the same at startup and after SIGHUP.
