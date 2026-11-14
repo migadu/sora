@@ -12,6 +12,7 @@ import (
 
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/migadu/sora/pkg/metrics"
+	"github.com/migadu/sora/server/lmtp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -191,5 +192,36 @@ func TestDataStallClosesConnection(t *testing.T) {
 	after := testutil.ToFloat64(metrics.ConnectionTimeoutsTotal.WithLabelValues("lmtp", "test", "localhost", "idle"))
 	if after-before != 1 {
 		t.Errorf("Expected the idle timeout metric to increase by 1, got %+.0f", after-before)
+	}
+}
+
+// TestDataTimeoutBoundsTransfer verifies that DataTimeout bounds the whole
+// DATA transfer, so a sender that trickles a message in cannot hold the
+// connection however regularly it sends.
+func TestDataTimeoutBoundsTransfer(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupLMTPServerWithOptions(t, lmtp.LMTPServerOptions{
+		IdleTimeout: time.Minute,
+		DataTimeout: time.Second,
+	})
+	defer server.Close()
+
+	client := startDataTransfer(t, server, account)
+	go trickleBody(client, 50, 100*time.Millisecond) // 5s, a line every 100ms
+
+	start := time.Now()
+	resp, err := client.ReadResponse()
+	if err != nil {
+		t.Fatalf("Failed to read the DATA reply: %v", err)
+	}
+	if !strings.HasPrefix(resp, "421 4.4.2") {
+		t.Fatalf("Expected 421 4.4.2 once DataTimeout passed, got: %s", resp)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("The transfer ran %v with a DataTimeout of 1s", elapsed)
+	}
+	if extra, err := client.ReadResponse(); err == nil {
+		t.Fatalf("Expected the connection closed after DataTimeout, read %q", extra)
 	}
 }
