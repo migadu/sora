@@ -1209,6 +1209,7 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # --- AUTHENTICATION RATE LIMITING ---
 # Two-tier blocking system protects shared IPs while catching distributed attacks
 # Use dotted notation for nested config within [[server]] array element
+# A key left out or set to 0 takes its default; a negative value stops startup.
 auth_rate_limit.enabled = false                   # Enable authentication rate limiting.
 
 # TIER 1: Fast IP+username blocking (protects shared IPs like corporate gateways)
@@ -1248,7 +1249,7 @@ auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expire
 # Memory safety limits (prevents unbounded growth during burst attacks)
 # These limits protect against memory exhaustion when under sustained attack. When a map exceeds
 # its size limit, the oldest entries (by FirstFailure time) are evicted using LRU policy.
-# Set to 0 to disable size-based limits (time-based cleanup only).
+# There is no unlimited setting: 0, like any key left out, takes the default.
 #
 # RECOMMENDED VALUES:
 # - Default (100k/50k/50k): Suitable for most deployments, ~40MB per protocol max
@@ -1260,9 +1261,9 @@ auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expire
 # - IP entries: ~150 bytes each × max_ip_entries
 # - Username entries: ~150 bytes each × max_username_entries
 #
-auth_rate_limit.max_ip_username_entries = 100000  # Max IP+username tracking entries (0 = unlimited, default: 100000)
-auth_rate_limit.max_ip_entries = 50000            # Max IP failure tracking entries (0 = unlimited, default: 50000)
-auth_rate_limit.max_username_entries = 50000      # Max username tracking entries (0 = unlimited, default: 50000)
+auth_rate_limit.max_ip_username_entries = 100000  # Max IP+username tracking entries (default: 100000)
+auth_rate_limit.max_ip_entries = 50000            # Max IP failure tracking entries (default: 50000)
+auth_rate_limit.max_username_entries = 50000      # Max username tracking entries (default: 50000)
 
 # --- LOOKUP CACHE ---
 # Cache authentication results to reduce database queries and improve performance.

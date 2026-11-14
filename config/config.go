@@ -529,9 +529,9 @@ type AuthRateLimiterConfig struct {
 	DelayMultiplier     float64       `toml:"delay_multiplier"`      // Delay increase factor
 
 	// Memory safety limits (prevents unbounded growth during burst attacks)
-	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username tracking entries (0 = unlimited, default: 100000)
-	MaxIPEntries         int `toml:"max_ip_entries"`          // Maximum IP failure tracking entries (0 = unlimited, default: 50000)
-	MaxUsernameEntries   int `toml:"max_username_entries"`    // Maximum username tracking entries (0 = unlimited, default: 50000)
+	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username tracking entries (default: 100000)
+	MaxIPEntries         int `toml:"max_ip_entries"`          // Maximum IP failure tracking entries (default: 50000)
+	MaxUsernameEntries   int `toml:"max_username_entries"`    // Maximum username tracking entries (default: 50000)
 
 	// Networks exempt from IP-based blocking (Tier 1 IP+username and Tier 2 IP-only).
 	// Username statistics are still tracked even for exempt IPs.
@@ -546,6 +546,38 @@ type AuthRateLimiterConfig struct {
 	//   - exempt_networks = []           → exempt nobody (every IP is rate-limited)
 	//   - exempt_networks = ["a", "b"]   → exempt only these CIDRs
 	ExemptNetworks []string `toml:"exempt_networks,omitempty"`
+}
+
+// Validate rejects negative counts, durations and multipliers, and a NaN or infinite
+// multiplier. Zero means "use the default" (see applyAuthRateLimitDefaults); a negative
+// value has no meaning, and the limiter does not read it consistently
+// (max_attempts_per_ip = -1 blocked an address at its first failure on one path and
+// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check;
+// the limiter converts the multiplied delay to a time.Duration before capping it at
+// max_delay, and that conversion is platform-dependent for them (on amd64 +Inf becomes
+// a negative delay, which switches progressive delays off).
+func (c *AuthRateLimiterConfig) Validate() error {
+	v := reflect.ValueOf(c).Elem()
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Field(i)
+		problem := ""
+		switch {
+		case f.CanInt(): // int counts and time.Duration
+			if f.Int() < 0 {
+				problem = "must not be negative"
+			}
+		case f.CanFloat():
+			if x := f.Float(); math.IsNaN(x) || math.IsInf(x, 0) {
+				problem = "must be a finite number"
+			} else if x < 0 {
+				problem = "must not be negative"
+			}
+		}
+		if problem != "" {
+			return fmt.Errorf("auth_rate_limit.%s %s, got %v", tomlKey(v.Type().Field(i)), problem, f.Interface())
+		}
+	}
+	return nil
 }
 
 // DefaultAuthRateLimiterConfig returns sensible defaults for authentication rate limiting
@@ -2127,6 +2159,12 @@ func (s *ServerConfig) Validate() error {
 	}
 	if s.MasterSASLUsername != "" && s.MasterSASLPassword == "" {
 		return fmt.Errorf("server %q: master_sasl_username is set but master_sasl_password is empty; refusing to start (an empty password would allow impersonation of any account)", s.Name)
+	}
+
+	if s.AuthRateLimit != nil {
+		if err := s.AuthRateLimit.Validate(); err != nil {
+			return fmt.Errorf("server %q: %w", s.Name, err)
+		}
 	}
 
 	if s.Type == "metrics" {
