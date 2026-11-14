@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -330,7 +331,7 @@ func TestProcessBatch_DBInsertFailure(t *testing.T) {
 		}
 
 		// 5. Create a batch with one message
-		msgHash := HashContent(msgContent)
+		msgHash := helpers.HashContent(msgContent)
 		batch := []msgInfo{
 			{
 				path:     msgPath,
