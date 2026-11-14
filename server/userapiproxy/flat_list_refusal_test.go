@@ -144,6 +144,15 @@ func TestUserAPIProxy_FlatListRefusesWhatTheLookupRefuses(t *testing.T) {
 					}
 				}
 			}
+			// Only a 404/3xx is cached: the second request for that user is answered from
+			// the negative cache entry, the others ask the lookup again.
+			wantAsked := 2
+			if c.lookup.result == proxy.AuthUserNotFound {
+				wantAsked = 1
+			}
+			if asked := len(c.lookup.asked()); asked != wantAsked {
+				t.Errorf("the lookup was asked %d times for the two requests, want %d", asked, wantAsked)
+			}
 		})
 	}
 }
