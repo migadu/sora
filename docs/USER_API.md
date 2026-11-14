@@ -780,9 +780,13 @@ remote_use_proxy_protocol = true
 1. **Login and refresh** (`/user/auth/*`) carry no token. The proxy reads the body (at most
    64 KiB, else `413 Request body too large`) to find the user: the `email` of a login, or the
    user named in the (valid) token of a refresh. It routes by that user and passes the body on
-   unchanged. A body that names nobody goes to a backend of the default pool (or of
-   `remote_addrs`), which answers the malformed request. The backend checks the password; the
-   proxy does not.
+   unchanged. A malformed body or a login without a usable email and password goes to
+   the default pool, or the first pool in configuration order with an available backend,
+   which answers it without looking up an account. A refused refresh token gets `401`
+   from the proxy. Normally the backend checks the password. With named pools, a login
+   the lookup refuses (`401`/`403`) or does not know (`404`/`3xx`, with
+   `lookup_local_users` off) instead gets `401 {"error":"Invalid credentials"}` after
+   one dummy password verification, and reaches no backend.
 2. **Every other request** must carry a valid token, except a CORS preflight (12.3). The proxy
    checks the signature with its own `jwt_secret` and the expiry (not the issuer; the backend
    checks that), and routes by the token's `email`. A missing or bad token gets
@@ -822,16 +826,23 @@ connection. With named pools, the pool's own `remote_use_proxy_protocol` decides
 
 ### 12.3 Errors from the proxy itself
 
-These come from the proxy, as plain text, before any backend is involved:
+These come from the proxy as `application/json`, before any backend is involved.
+Each body is `{"error":"message"}` with the message below. Set the proxy's
+`allowed_origins` to the same list as its backends so browsers can read these errors.
 
 | Status | Body | When |
 |---|---|---|
-| 401 | `Unauthorized` | Missing, malformed, expired or wrongly signed token. |
+| 401 | `Authorization header required`, `Invalid authorization header format`, `Invalid or expired token` | Missing, malformed, expired or wrongly signed bearer token. |
+| 401 | `Invalid or expired token` | A refused refresh token, including one without usable account identity. |
+| 401 | `Invalid credentials` | A named-pool login the remote lookup refuses or does not know, as described in 12.1. |
 | 413 | `Request body too large` | A login or refresh body over 64 KiB. |
 | 503 | `Service unavailable` | No route for the user, or the backend maintenance list has not been read yet after start-up. |
 | 503 | `Backend route unavailable` | The chosen backend could not be bound to a connection. |
+| 502 | `Bad gateway` | The backend request failed. |
+| 500 | `Internal server error` | The backend request could not be constructed. |
 
-Errors in JSON come from the backend and are passed through unchanged.
+Backend responses are passed through unchanged. Protected bearer-token errors carry a
+`WWW-Authenticate: Bearer` challenge; public JSON login and refresh errors do not.
 
 A CORS preflight (`OPTIONS`) needs no token, on any path. It is answered with the backend's
 CORS headers, as when the backend is reached directly, so browser clients on another origin can
