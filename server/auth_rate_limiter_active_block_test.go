@@ -199,3 +199,37 @@ func TestIPSizeLimitAllBlockedKeepsBlocks(t *testing.T) {
 		t.Error("the oldest counter was not the one evicted")
 	}
 }
+
+func TestFullAuthTablesStillAccumulateFailures(t *testing.T) {
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIP:         2,
+		MaxAttemptsPerIPUsername: 2,
+		IPBlockDuration:          time.Hour,
+		IPUsernameBlockDuration:  time.Hour,
+		IPWindowDuration:         time.Hour,
+		CleanupInterval:          time.Hour,
+		MaxIPEntries:             1,
+		MaxIPUsernameEntries:     1,
+		MaxUsernameEntries:       1,
+	})
+	defer limiter.Stop()
+	ctx := context.Background()
+	addr := &StringAddr{Addr: "198.51.100.1"}
+	const username = "user@example.com"
+	for range 2 {
+		limiter.RecordAuthAttempt(ctx, addr, username, false)
+	}
+	limiter.ipMu.RLock()
+	ipFailures := limiter.ipFailureCounts[addr.Addr].FailureCount
+	limiter.ipMu.RUnlock()
+	limiter.ipUsernameMu.RLock()
+	pairFailures := limiter.blockedIPUsernames[addr.Addr+"|"+username].FailureCount
+	limiter.ipUsernameMu.RUnlock()
+	if ipFailures != 2 || pairFailures != 2 || limiter.getUsernameFailureCount(username) != 2 {
+		t.Errorf("updating a full table reset existing counters: IP=%d pair=%d username=%d, want 2 each", ipFailures, pairFailures, limiter.getUsernameFailureCount(username))
+	}
+	if err := limiter.CanAttemptAuth(ctx, addr, username); err == nil {
+		t.Error("repeated failures at table capacity never reached the block threshold")
+	}
+}

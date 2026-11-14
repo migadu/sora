@@ -519,7 +519,7 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 	defer a.ipMu.Unlock()
 
 	// Enforce size limit with LRU eviction (if configured)
-	if a.config.MaxIPEntries > 0 && len(a.ipFailureCounts) >= a.config.MaxIPEntries {
+	if _, exists := a.ipFailureCounts[ip]; !exists && a.config.MaxIPEntries > 0 && len(a.ipFailureCounts) >= a.config.MaxIPEntries {
 		a.evictOldestIP()
 	}
 
@@ -600,7 +600,7 @@ func (a *AuthRateLimiter) updateIPUsernameFailure(ip, username string, failureTi
 	defer a.ipUsernameMu.Unlock()
 
 	// Enforce size limit with LRU eviction (if configured)
-	if a.config.MaxIPUsernameEntries > 0 && len(a.blockedIPUsernames) >= a.config.MaxIPUsernameEntries {
+	if _, exists := a.blockedIPUsernames[ipUsernameKey]; !exists && a.config.MaxIPUsernameEntries > 0 && len(a.blockedIPUsernames) >= a.config.MaxIPUsernameEntries {
 		a.evictOldestIPUsername()
 	}
 
@@ -681,7 +681,7 @@ func (a *AuthRateLimiter) updateUsernameFailure(username string, failureTime tim
 	defer a.usernameMu.Unlock()
 
 	// Enforce size limit with LRU eviction (if configured)
-	if a.config.MaxUsernameEntries > 0 && len(a.usernameFailureCounts) >= a.config.MaxUsernameEntries {
+	if _, exists := a.usernameFailureCounts[username]; !exists && a.config.MaxUsernameEntries > 0 && len(a.usernameFailureCounts) >= a.config.MaxUsernameEntries {
 		a.evictOldestUsername()
 	}
 
