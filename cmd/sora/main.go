@@ -274,7 +274,7 @@ func main() {
 		defer logger.Sync() // Still sync even without a log file
 	}
 
-	logger.Info("Logging configuration", "format", cfg.Logging.Format, "level", cfg.Logging.Level)
+	logger.Info("Logging configuration", "format", cfg.Logging.Format, "log_level", cfg.Logging.Level)
 
 	// Initialize global timeout scheduler with configured shard count
 	shardCount := cfg.TimeoutScheduler.ShardCount
