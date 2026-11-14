@@ -233,3 +233,25 @@ func TestAdminAPI_Kick_DatabaseFailureIsAnError(t *testing.T) {
 		t.Error("a kick that answered an error ended a session")
 	}
 }
+
+// A kick that cannot be issued is refused before the database is asked, so a database
+// outage does not turn it into a 500: a blank user_email is 400 (it was taken for an
+// address, failed the lookup and kicked the ID derived from "" with 200), a protocol
+// no tracker serves 404, and a node without trackers 503.
+func TestAdminAPI_Kick_RefusalsDoNotAskTheDatabase(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb, outage := common.SetupTestDatabaseWithOutage(t)
+	t.Cleanup(outage.End)
+	s := setupRemoteLookupProxyStack(t, rdb)
+	noTrackers := startAdminAPI(t, rdb, map[string]*serverPkg.ConnectionTracker{})
+	t.Cleanup(noTrackers.Close)
+
+	outage.Begin()
+	s.kick(t, "   ", http.StatusBadRequest)
+	s.request(t, "POST", "/admin/connections/kick",
+		map[string]string{"user_email": "anna@example.com", "protocol": "POP3"}, http.StatusNotFound)
+	if resp, body := noTrackers.makeRequest(t, "POST", "/admin/connections/kick",
+		map[string]string{"user_email": "anna@example.com"}); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("POST /admin/connections/kick on a node without trackers: %d %s", resp.StatusCode, body)
+	}
+}
