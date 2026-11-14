@@ -153,10 +153,10 @@ func (rd *ResilientDatabase) SearchMessagesSortedWithRetry(ctx context.Context, 
 	return result.([]db.SearchMessageResult), nil
 }
 
-// destObjectKeepalive is the longest a move transaction sits without a statement while
+// destObjectKeepalive is the longest a COPY/MOVE transaction sits without a statement while
 // it makes its destination objects exist in S3. The server kills a session idle in a
 // transaction for idle_in_transaction_session_timeout, and the S3 round trips of a large
-// move can outlast that. A variable so tests can shorten it.
+// operation can outlast that. A variable so tests can shorten it.
 var destObjectKeepalive = 30 * time.Second
 
 // MoveMessagesWithRetry moves ids from srcMailboxID into destMailboxID, owned by
@@ -233,7 +233,7 @@ func (rd *ResilientDatabase) ensureDestObjects(ctx context.Context, tx pgx.Tx, h
 					if ctx.Err() != nil {
 						done <- nil
 					} else {
-						done <- fmt.Errorf("failed to keep the move transaction alive: %w", err)
+						done <- fmt.Errorf("failed to keep the destination object transaction alive: %w", err)
 					}
 					return
 				}
@@ -254,7 +254,7 @@ func (rd *ResilientDatabase) ensureDestObjects(ctx context.Context, tx pgx.Tx, h
 	return nil
 }
 
-// DestObjectError is a failure to make a cross-account move's destination object exist
+// DestObjectError is a failure to make a cross-account COPY/MOVE destination object exist
 // in S3. It has no Unwrap on purpose: an S3 timeout, a refused connection or an open S3
 // circuit breaker must not pass for a database failure with the write circuit breaker
 // or the retry. The caller classifies Err itself.

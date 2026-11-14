@@ -124,8 +124,14 @@ func truncateHash(hash string) string {
 // point at a key nothing wrote. A renamed source fails the copy with ErrCopySourceChanged
 // before anything commits. The check is made by the INSERT, the statement that copies the
 // rows' hashes; once inserted, a copy keeps its hash whatever happens to the source.
-func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string) (map[imap.UID]imap.UID, []int64, error) {
+// destObjects names the destination bodies made to exist in S3 while tx holds their
+// shared object locks. Only those re-keyed rows are uploaded; all other re-keyed rows
+// are staged for upload, even if their source's upload finished in the meantime.
+func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string) (map[imap.UID]imap.UID, []int64, error) {
 	messageUIDMap := make(map[imap.UID]imap.UID)
+	if destObjects == nil {
+		destObjects = []string{} // = ANY(NULL) would be NULL, not false.
+	}
 	if srcMailboxID == destMailboxID {
 		return nil, nil, fmt.Errorf("source and destination mailboxes cannot be the same")
 	}
@@ -204,7 +210,9 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	insRows, err := tx.Query(ctx, `
 		WITH src_data AS (
 			SELECT
-				m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
+				m.content_hash,
+				CASE WHEN m.account_id = $6 THEN m.uploaded ELSE m.content_hash = ANY($10::text[]) END AS uploaded,
+				m.message_id, m.in_reply_to,
 				m.subject, m.sent_date, m.internal_date, m.size,
 				m.body_structure, m.recipients_json,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
@@ -255,7 +263,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 			RETURNING message_id
 		)
 		SELECT id FROM inserted ORDER BY uid
-	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, expectedHashes)
+	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, expectedHashes, destObjects)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to batch copy messages: %w", err)
 	}

@@ -74,7 +74,7 @@ func TestCrossAccountMessageOwnership(t *testing.T) {
 	uids := []imap.UID{imap.UID(srcUID)}
 
 	// Copy from A to B using resilient operations
-	uidMap, _, err := rdb.CopyMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, domainB, localB, "test-instance", map[imap.UID]string{imap.UID(srcUID): contentHash})
+	uidMap, _, err := rdb.CopyMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, domainB, localB, "test-instance", map[imap.UID]string{imap.UID(srcUID): contentHash}, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, uidMap, 1)
 
@@ -174,14 +174,14 @@ func TestCopyMessagesRefusesSourceRenamedSinceCaller(t *testing.T) {
 	renamed := map[imap.UID]string{uids[0]: hashes[uids[0]], uids[1]: "0761" + hashes[uids[1]][4:]}
 	missing := map[imap.UID]string{uids[0]: hashes[uids[0]]}
 	for name, sourceHashes := range map[string]map[imap.UID]string{"renamed": renamed, "missing": missing} {
-		_, _, err := rdb.CopyMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, "example.net", "user_b", "test-instance", sourceHashes)
+		_, _, err := rdb.CopyMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, "example.net", "user_b", "test-instance", sourceHashes, nil, nil)
 		require.ErrorIs(t, err, db.ErrCopySourceChanged, name)
 		rows, highest := destState()
 		assert.Zero(t, rows, "%s: a refused copy wrote rows", name)
 		assert.Equal(t, highestBefore, highest, "%s: a refused copy allocated UIDs", name)
 	}
 
-	uidMap, _, err := rdb.CopyMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, "example.net", "user_b", "test-instance", hashes)
+	uidMap, _, err := rdb.CopyMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, "example.net", "user_b", "test-instance", hashes, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, uidMap, 2)
 	for _, uid := range uids {

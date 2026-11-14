@@ -103,28 +103,14 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 		destS3Localpart = localpart
 	}
 
-	// ensureDestObject makes the body readable under the destination owner's S3 path.
-	// It runs under GetS3ObjectLockID(destination account, hash), the lock the cleaner
-	// holds while it re-checks that nothing references an object and deletes it: without
-	// it, an object whose only rows for this account are expunged can be deleted between
-	// the existence check and the copy, and the new message row would point at nothing
-	// (the 404 NoSuchKey hazard the APPEND dedup and IsContentHashUploaded describe).
-	ensureDestObject := func(contentHash, sourceKey, destKey string) error {
-		return s.server.rdb.ExecuteWithS3ObjectLock(ctx, contentHash, destMailbox.AccountID, func(ctx context.Context) error {
-			exists, err := s.server.s3.ExistsWithRetry(ctx, destKey)
-			if err != nil {
-				s.WarnLog("failed to check if S3 object exists at destination", "destKey", destKey, "error", err)
-			}
-			if exists {
-				return nil
-			}
-			return s.server.s3.CopyWithRetry(ctx, sourceKey, destKey)
-		})
+	// COPY's transaction holds the destination object locks before checking S3 and
+	// until its rows commit, as MOVE does. A body staged locally is re-staged instead.
+	type crossAccountObject struct {
+		sourceKey, destKey string
+		sourcePending      bool
 	}
-
-	type crossAccountObject struct{ contentHash, sourceKey, destKey string }
-	var crossAccountObjects []crossAccountObject
-	seenHashes := make(map[string]bool)
+	destObjects := make(map[string]crossAccountObject)
+	var destHashes []string
 	// The hash each cross-account body is made available for below. CopyMessages copies a
 	// source only if it still has it, since a rekey can rename it before the INSERT.
 	sourceHashes := make(map[imap.UID]string)
@@ -155,25 +141,36 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 			}
 		}
 		// Body is in S3 under the source's path; copy it to the owner's path.
-		if seenHashes[msg.ContentHash] {
+		if _, seen := destObjects[msg.ContentHash]; seen {
 			continue
 		}
-		seenHashes[msg.ContentHash] = true
-		obj := crossAccountObject{
-			contentHash: msg.ContentHash,
-			sourceKey:   helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash),
-			destKey:     helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash),
+		destObjects[msg.ContentHash] = crossAccountObject{
+			sourceKey:     helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash),
+			destKey:       helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash),
+			sourcePending: !msg.IsUploaded,
 		}
-		if err := ensureDestObject(obj.contentHash, obj.sourceKey, obj.destKey); err != nil {
-			return nil, s.crossAccountObjectError(!msg.IsUploaded, err)
+		destHashes = append(destHashes, msg.ContentHash)
+	}
+
+	ensureDestObject := func(ctx context.Context, contentHash string) error {
+		obj := destObjects[contentHash]
+		exists, err := s.server.s3.ExistsWithRetry(ctx, obj.destKey)
+		if err != nil {
+			s.WarnLog("failed to check if S3 object exists at destination", "destKey", obj.destKey, "error", err)
 		}
-		crossAccountObjects = append(crossAccountObjects, obj)
+		if exists {
+			return nil
+		}
+		return s.server.s3.CopyWithRetry(ctx, obj.sourceKey, obj.destKey)
 	}
 
 	// Perform the batch copy operation
-	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname, sourceHashes)
+	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname, sourceHashes, destHashes, ensureDestObject)
 	if err != nil {
+		var destErr *resilient.DestObjectError
 		switch {
+		case errors.As(err, &destErr):
+			return nil, s.crossAccountObjectError(destObjects[destErr.ContentHash].sourcePending, destErr.Err)
 		case errors.Is(err, resilient.ErrCommitOutcomeUnknown):
 			// The COMMIT's acknowledgement was lost: the copy may or may not have applied.
 			// Answering OK here on a copy that rolled back is the dangerous outcome — a
@@ -221,17 +218,6 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 			}
 		default:
 			return nil, s.internalError("failed to copy messages: %v", err)
-		}
-	}
-
-	// The lock above is released before the rows exist, so a cleaner that was already
-	// waiting on it could still have found the object unreferenced and deleted it. Re-run
-	// the check now that the copied rows are committed: from here on they keep the
-	// object out of every orphan check, so this pass either finds it intact or restores
-	// it for good.
-	for _, obj := range crossAccountObjects {
-		if err := ensureDestObject(obj.contentHash, obj.sourceKey, obj.destKey); err != nil {
-			s.ErrorLog("failed to re-validate copied S3 object after copy", "destKey", obj.destKey, "error", err)
 		}
 	}
 
