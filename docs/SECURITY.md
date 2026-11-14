@@ -483,7 +483,8 @@ allowed_hosts and/or api_key`. The metrics themselves are in [METRICS.md](METRIC
 
 - **Admin API** (`http_admin_api`): every request needs `Authorization: Bearer <api_key>`, and
   `allowed_hosts` can restrict the client addresses. Sora refuses to start without an `api_key`, with
-  one shorter than 16 characters, or with the placeholder from `config.toml.example`. The Admin API
+  one shorter than 16 characters, or with the placeholder from `config.toml.example`. An optional
+  `read_only_api_key` allows `GET` requests only; give it to monitoring tools. The Admin API
   can create and delete accounts, deliver mail and end sessions: keep it on a private address. See
   [ADMIN_API.md](ADMIN_API.md).
 - **User API** (`http_user_api`): users sign in with their password and receive a JWT signed with

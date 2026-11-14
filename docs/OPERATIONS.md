@@ -264,7 +264,7 @@ already open keep the settings they started with.
 | `pop3_proxy` | the same as `imap_proxy`, plus `debug` |
 | `managesieve_proxy` | the same as `imap_proxy`, plus `debug` |
 | `lmtp_proxy` | `timeouts.absolute_session_timeout`, `max_message_size` |
-| `http_admin_api` | `api_key`, `allowed_hosts` |
+| `http_admin_api` | `api_key`, `read_only_api_key`, `allowed_hosts` |
 | `http_user_api` | `jwt_secret`, `allowed_origins`, `allowed_hosts` |
 | `user_api_proxy` | `jwt_secret` |
 | `metrics` | nothing; changes are not reported either |

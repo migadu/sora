@@ -309,7 +309,7 @@ Only the settings in this table reload:
 | `imap_proxy` | `limits.max_auth_errors`, `auth_idle_timeout`, `timeouts.command_timeout`, `timeouts.absolute_session_timeout`, `timeouts.min_bytes_per_minute`, `master_sasl_username`, `master_sasl_password` |
 | `pop3_proxy`, `managesieve_proxy` | the `imap_proxy` list, plus `debug` |
 | `lmtp_proxy` | `timeouts.absolute_session_timeout`, `max_message_size` |
-| `http_admin_api` | `api_key`, `allowed_hosts` |
+| `http_admin_api` | `api_key`, `read_only_api_key`, `allowed_hosts` |
 | `http_user_api` | `jwt_secret`, `allowed_origins`, `allowed_hosts` |
 | `user_api_proxy` | `jwt_secret` |
 | `metrics` | nothing |
@@ -976,6 +976,7 @@ See [ADMIN_API.md](ADMIN_API.md) and [USER_API.md](USER_API.md).
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
 | `api_key` | string | none | `http_admin_api`, `metrics` | Bearer token. Required for `http_admin_api` (without it the server is skipped). Optional for `metrics`. |
+| `read_only_api_key` | string | none | `http_admin_api` | Optional second key, accepted for `GET` requests only. Same rules as `api_key`; must differ from it. See [ADMIN_API.md](ADMIN_API.md#3-authentication-and-access-control). |
 | `allowed_hosts` | list of strings | empty (any host) | `http_admin_api`, `http_user_api`, `metrics` | IPs or CIDR blocks allowed to connect. |
 | `jwt_secret` | string | none | `http_user_api`, `user_api_proxy` | Key that signs and checks JWTs. Without it the server is skipped. |
 | `token_duration` | duration | `"24h"` | `http_user_api` | Token lifetime. Must not be negative. |

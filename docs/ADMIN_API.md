@@ -72,6 +72,7 @@ allowed_hosts = ["127.0.0.1", "10.0.0.0/24"]
 | `name` | required | Names the server in logs. |
 | `addr` | required | Listen address, for example `":8080"` or `"127.0.0.1:8080"`. |
 | `api_key` | none | The bearer token every request must carry. When it is empty the server is skipped and Sora logs `HTTP Admin API server enabled but no API key configured - skipping`. When it is shorter than 16 characters, or is one of the placeholders from `config.toml.example` (`your-api-key-here`, `your-secret-api-key-here`), Sora refuses to start. |
+| `read_only_api_key` | none | An optional second key for clients that only read, such as monitoring and dashboards. It is accepted for `GET` requests only. It follows the same length and placeholder rules as `api_key` and must differ from it, or Sora refuses to start. See [section 3](#3-authentication-and-access-control). |
 | `allowed_hosts` | `[]` (everyone) | Client addresses allowed to connect: IP addresses and CIDR blocks. Entries that are neither, such as host names, never match. |
 | `max_connections` | `0` (no limit) | Most concurrent TCP connections. |
 | `max_message_size` | `"50mb"` | Largest request body `POST /admin/mail/deliver` accepts. |
@@ -92,10 +93,14 @@ The HTTP server's own limits are fixed: 10 seconds to read the request headers, 
 read the whole request and 5 minutes to write the response, 120 seconds for an idle
 keep-alive connection, and 5 seconds to finish open requests at shutdown.
 
-**Reload.** On SIGHUP Sora re-reads `api_key` and `allowed_hosts` and applies them to new
-requests. An empty `api_key` in the reloaded file keeps the old key. A key that fails the
-length or placeholder check is refused, the old key stays in use, and the reload is logged as
-failed. An empty or removed `allowed_hosts` opens the API to every address, as it does at
+**Reload.** On SIGHUP Sora re-reads `api_key`, `read_only_api_key` and `allowed_hosts` and
+applies them to new requests. An empty `api_key` in the reloaded file keeps the old key. An
+empty or removed `read_only_api_key` revokes the read-only key. A key that fails the length or
+placeholder check is refused, and so is a reload that sets `api_key` to the read-only key in use,
+or `read_only_api_key` to the `api_key` it replaces. The two keys change together: when either is
+refused, both previous keys stay in use and the reload is logged as failed; `allowed_hosts` still
+reloads. When you retire a key, give the slot a fresh value instead of moving a key from the other
+slot. An empty or removed `allowed_hosts` opens the API to every address, as it does at
 start-up. Every other key needs a restart. See [OPERATIONS.md](OPERATIONS.md) for reloads in
 general.
 
@@ -132,6 +137,11 @@ The word `Bearer` may be in any case. The key is compared in constant time.
 | No `Authorization` header | 401 | `{"error":"Authorization header required"}` |
 | Header is not `Bearer <key>` | 401 | `{"error":"Authorization header must be 'Bearer <token>'"}` |
 | Wrong key | 403 | `{"error":"Invalid API key"}` |
+| `read_only_api_key` with a method other than `GET` | 403 | `{"error":"API key is read-only"}` |
+
+`api_key` grants every endpoint. `read_only_api_key`, when set, grants every `GET` endpoint and
+nothing else: every endpoint that changes something uses `POST`, `PUT` or `DELETE`. Give the
+read-only key to monitoring and reporting tools, and keep `api_key` for administration.
 
 Both checks run before the path is looked at, so an unknown path also answers 401 or 403
 until the request is authenticated.
