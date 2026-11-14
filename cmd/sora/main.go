@@ -244,6 +244,13 @@ func main() {
 		os.Exit(0)
 	}
 
+	// Logging is configured by the file loadAndValidateConfig reads. What is logged until
+	// logger.Initialize, the warnings about that file among it, is held and then written
+	// where [logging] says, at its level.
+	logger.Hold()
+	logger.Info("---------------------")
+	logger.Info("SORA application starting", "version", version, "commit", commit, "built", date)
+
 	// Load and validate configuration
 	loadAndValidateConfig(*configPath, &cfg, errorHandler)
 
@@ -254,7 +261,7 @@ func main() {
 	// soft-wait cap). Clamped to a sane range inside the setter.
 	sieveengine.SetScriptExecutionTimeout(cfg.Sieve.GetMaxExecutionTime())
 
-	// Initialize logging with zap logger
+	// Initialize logging, which writes out what was held since logger.Hold
 	logFile, err := logger.Initialize(cfg.Logging)
 	if err != nil {
 		fmt.Fprintf(logger.Stderr(), "SORA: Warning initializing logger: %v\n", err)
@@ -271,8 +278,6 @@ func main() {
 		defer logger.Sync() // Still sync even without a log file
 	}
 
-	logger.Info("---------------------")
-	logger.Info("SORA application starting", "version", version, "commit", commit, "built", date)
 	logger.Info("Logging configuration", "format", cfg.Logging.Format, "level", cfg.Logging.Level)
 
 	// Initialize global timeout scheduler with configured shard count
@@ -2660,6 +2665,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		Pools:                    proxy.PoolSpecsFromConfig(deps.config.Pools),
 		RemotePort:               remotePort,
 		JWTSecret:                serverConfig.JWTSecret,
+		AllowedOrigins:           serverConfig.AllowedOrigins,
 		TLS:                      serverConfig.TLS,
 		TLSCertFile:              serverConfig.TLSCertFile,
 		TLSKeyFile:               serverConfig.TLSKeyFile,

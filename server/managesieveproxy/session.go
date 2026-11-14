@@ -355,7 +355,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					// This ensures that when a domain moves backends or password changes,
 					// active users eventually pick up the changes.
 					s.DebugLog("cache hit - positive entry with matching password", "username", username, "age", time.Since(cached.CreatedAt))
-					metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit_positive").Inc()
+					metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit").Inc()
 
 					// Populate session with cached routing info
 					s.accountID = cached.AccountID
@@ -398,12 +398,12 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					// Different password on positive cache - revalidate if old enough
 					if cached.IsOld(s.server.positiveRevalidationWindow) {
 						s.DebugLog("cache hit - positive entry with different password (old enough to revalidate)", "username", username, "age", time.Since(cached.CreatedAt))
-						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit_positive_revalidate").Inc()
+						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "revalidate_positive_different_pw").Inc()
 						// Fall through to full authentication
 					} else {
 						// Different password but too fresh
 						s.DebugLog("cache hit - positive entry with different password (too fresh)", "username", username, "age", time.Since(cached.CreatedAt))
-						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit_positive_fresh").Inc()
+						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit_positive_wrong_pw").Inc()
 						// Cost what a failed login for an unknown address costs, or the instant
 						// answer shows that this address has an account. (#346)
 						db.DummyVerifyPassword(password)
