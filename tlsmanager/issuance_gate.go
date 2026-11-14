@@ -52,7 +52,7 @@ func (g *issuanceGate) Get(ctx context.Context, name string) ([]byte, error) {
 	if !isCertificate {
 		return nil, err
 	}
-	if refusal := g.manager.refuseIssuance(domain); refusal != nil {
+	if refusal := g.manager.refuseKeyIssuance(domain, name); refusal != nil {
 		return nil, refusal
 	}
 
@@ -63,9 +63,9 @@ func (g *issuanceGate) Get(ctx context.Context, name string) ([]byte, error) {
 func (g *issuanceGate) Put(ctx context.Context, name string, data []byte) error {
 	err := g.underlying.Put(ctx, name, data)
 	// The order is finished either way - a failed Put does not mean it is still running -
-	// so the cluster-wide claim is given back regardless.
+	// so give back this variant's share of the cluster-wide claim regardless.
 	if domain, isCertificate := certificateDomain(name); isCertificate {
-		g.manager.releaseIssuance(domain)
+		g.manager.releaseKeyIssuance(domain, name)
 	}
 	return err
 }
@@ -101,6 +101,18 @@ func (m *Manager) mayIssue() bool {
 // refuseIssuance reports why this node must not order a certificate for domain now, or
 // nil if it may.
 func (m *Manager) refuseIssuance(domain string) error {
+	return m.refuseIssuanceWith(domain, "", false)
+}
+
+func (m *Manager) refuseKeyIssuance(domain, cacheKey string) error {
+	return m.refuseIssuanceWith(domain, cacheKey, false)
+}
+
+func (m *Manager) refuseOrderIssuance(domain string) error {
+	return m.refuseIssuanceWith(domain, "", true)
+}
+
+func (m *Manager) refuseIssuanceWith(domain, cacheKey string, isNewOrder bool) error {
 	if !m.mayIssue() {
 		leader := m.clusterManager.GetLeaderID()
 		// Debug because a waiting handshake arrives here on every poll; the wait itself
@@ -117,7 +129,7 @@ func (m *Manager) refuseIssuance(domain string) error {
 	// Last: leadership above says this node SHOULD issue, the fence says whether it MAY.
 	// Under a partition the check above passes on both sides, because each side elected
 	// its own leader; only one of them can hold the claim.
-	return m.holdIssuance(domain)
+	return m.holdIssuanceWith(domain, cacheKey, isNewOrder)
 }
 
 // awaitIssuedCertificate waits, bounded, for a certificate ordered by the cluster leader
@@ -180,12 +192,23 @@ func (f *issuanceFence) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	var claimed []string
 	for _, domain := range domains {
-		if refusal := f.manager.refuseIssuance(domain); refusal != nil {
+		if refusal := f.manager.refuseOrderIssuance(domain); refusal != nil {
+			for _, d := range claimed {
+				f.manager.dropFailedOrderRef(d)
+			}
 			return nil, refusal
 		}
+		claimed = append(claimed, domain)
 	}
-	return f.base.RoundTrip(req)
+	resp, err := f.base.RoundTrip(req)
+	if err != nil || (resp != nil && resp.StatusCode >= 400) {
+		for _, d := range claimed {
+			f.manager.dropFailedOrderRef(d)
+		}
+	}
+	return resp, err
 }
 
 // orderedDomains returns the DNS identifiers that a newOrder request asks a certificate
