@@ -35,6 +35,25 @@ func TestCacheIsTheConfiguredFile(t *testing.T) {
 		}
 		assertCacheIsFile(t, root, "a?b", filepath.Join("a?b", "auth_cache.db"))
 	})
+
+	// The OS resolves a ".." that follows a symlink from the symlink's target, both for
+	// the 0600 file openAndValidate creates and for SQLite; the cache must not be the
+	// file a lexically cleaned path names instead.
+	t.Run("symlink then ..", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root, "dir", "sub"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		linkDir := t.TempDir()
+		if err := os.Symlink(filepath.Join(root, "dir", "sub"), filepath.Join(linkDir, "link")); err != nil {
+			t.Fatal(err)
+		}
+		// Not filepath.Join, which would clean the ".." away.
+		assertCacheIsFile(t, root, "dir", filepath.Join(linkDir, "link")+"/../auth_cache.db")
+		if names := dirNames(t, linkDir); !reflect.DeepEqual(names, []string{"link"}) {
+			t.Errorf("files next to the symlink: %q", names)
+		}
+	})
 }
 
 // assertCacheIsFile opens the cache at dbPath, which is <root>/<dir>/auth_cache.db, and

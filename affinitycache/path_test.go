@@ -33,6 +33,25 @@ func TestStoreIsTheConfiguredFile(t *testing.T) {
 		}
 		assertStoreIsFile(t, root, "a?b", filepath.Join("a?b", "affinity.db"))
 	})
+
+	// The OS resolves a ".." that follows a symlink from the symlink's target, both for
+	// the 0600 file openAndValidate creates and for SQLite; the store must not be the
+	// file a lexically cleaned path names instead.
+	t.Run("symlink then ..", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root, "dir", "sub"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		linkDir := t.TempDir()
+		if err := os.Symlink(filepath.Join(root, "dir", "sub"), filepath.Join(linkDir, "link")); err != nil {
+			t.Fatal(err)
+		}
+		// Not filepath.Join, which would clean the ".." away.
+		assertStoreIsFile(t, root, "dir", filepath.Join(linkDir, "link")+"/../affinity.db")
+		if names := dirNames(t, linkDir); !reflect.DeepEqual(names, []string{"link"}) {
+			t.Errorf("files next to the symlink: %q", names)
+		}
+	})
 }
 
 // assertStoreIsFile opens the store at dbPath, which is <root>/<dir>/affinity.db, and
