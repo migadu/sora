@@ -232,3 +232,32 @@ func TestCleanupTempLeftoverDoesNotSubtractUnstagedBytes(t *testing.T) {
 	require.True(t, w.IsStagingLimitExceeded(bodySize),
 		"max_staging_size guard must still account for the live staged body after .tmp cleanup")
 }
+
+// An orphan lookup can outlive the file it scanned: a new delivery stages the
+// same body while the query is in flight, before committing its pending row.
+func TestCleanupOrphanedFilesKeepsFreshReplacement(t *testing.T) {
+	const accountID = int64(955)
+	hash := fmt.Sprintf("%064x", 955)
+	body := []byte("new delivery of the same content\r\n")
+	rdb := &mockDB{}
+	w := &UploadWorker{rdb: rdb, path: t.TempDir()}
+	path, err := w.StoreLocally(hash, accountID, body)
+	require.NoError(t, err)
+	old := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(*path, old, old))
+
+	restaged := false
+	rdb.ExistingPendingUploadsFunc = func(ctx context.Context, gotAccount int64, hashes []string) (map[string]struct{}, error) {
+		require.Equal(t, accountID, gotAccount)
+		require.Equal(t, []string{hash}, hashes)
+		_, err := w.StoreLocally(hash, accountID, body)
+		restaged = true
+		return map[string]struct{}{}, err // snapshot predates the new pending row
+	}
+	require.NoError(t, w.cleanupOrphanedFiles(context.Background()))
+	require.True(t, restaged)
+	got, err := os.ReadFile(*path)
+	require.NoError(t, err, "cleanup must not delete the new delivery's fresh replacement")
+	require.Equal(t, body, got)
+	require.Equal(t, int64(len(body)), atomic.LoadInt64(&w.currentStagingSize))
+}

@@ -1490,7 +1490,18 @@ func (w *UploadWorker) cleanupOrphanedFiles(ctx context.Context) error {
 				}
 				pathMu := w.stagingPathLock(file.path)
 				pathMu.Lock()
-				size := fileSize(file.path)
+				// A delivery may have replaced this old candidate while the lookup
+				// was in flight, before its new pending row committed. Recheck the
+				// grace period under the same lock as staging and removal.
+				info, statErr := os.Stat(file.path)
+				if statErr != nil || info.ModTime().After(cutoffTime) {
+					pathMu.Unlock()
+					if statErr != nil && !os.IsNotExist(statErr) {
+						logger.Warn("UploaderCleanup: Failed to stat orphan candidate", "path", file.path, "error", statErr)
+					}
+					continue
+				}
+				size := info.Size()
 				removeErr := os.Remove(file.path)
 				if removeErr == nil {
 					w.addStagingSize(-size)
