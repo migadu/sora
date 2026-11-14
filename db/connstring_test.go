@@ -76,3 +76,35 @@ func TestNewDatabaseFromConfig_HostEntryPort(t *testing.T) {
 		})
 	}
 }
+
+// EndpointURL resolves host entries the way the server always has (a port in the entry
+// wins, then the endpoint's port, then 5432) and brackets IPv6 literals.
+func TestEndpointURL_HostPort(t *testing.T) {
+	for _, tc := range []struct {
+		host string
+		port any
+		want string
+	}{
+		{"db.example.com", nil, "db.example.com:5432"},
+		{"db.example.com", int64(5433), "db.example.com:5433"},
+		{"db.example.com", "5433", "db.example.com:5433"},
+		{"db.example.com", 5433, "db.example.com:5433"},
+		{"db.example.com:6432", int64(5433), "db.example.com:6432"},
+		{"2001:db8::1", nil, "[2001:db8::1]:5432"},
+		{"[2001:db8::1]", int64(5433), "[2001:db8::1]:5433"},
+		{"[2001:db8::1]:6432", nil, "[2001:db8::1]:6432"},
+	} {
+		u, err := db.EndpointURL(&config.DatabaseEndpointConfig{Port: tc.port, Name: "sora_mail_db"}, tc.host)
+		if err != nil {
+			t.Fatalf("host %q port %v: %v", tc.host, tc.port, err)
+		}
+		if u.Host != tc.want {
+			t.Errorf("host %q port %v: got %q, want %q", tc.host, tc.port, u.Host, tc.want)
+		}
+	}
+	for _, port := range []any{"x", int64(0), int64(70000), 1.5} {
+		if _, err := db.EndpointURL(&config.DatabaseEndpointConfig{Port: port}, "db.example.com"); err == nil {
+			t.Errorf("port %v: expected an error", port)
+		}
+	}
+}
