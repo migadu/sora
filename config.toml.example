@@ -1452,7 +1452,7 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # There is no default pool unless one block says default = true: that is where an
 # auth-only answer (no "server", no "pool") and a user found through lookup_local_users
 # are routed. Without a default such an answer is refused with a temporary failure
-# (IMAP NO [UNAVAILABLE], POP3 -ERR [SYS/TEMP], ManageSieve NO, LMTP 451) and logged,
+# (IMAP NO [UNAVAILABLE], POP3 -ERR [SYS/TEMP], ManageSieve NO (TRYLATER), LMTP 451) and logged,
 # never sent to another pool. The same happens for a pool name this proxy lacks, and
 # for a lookup that fails or answers nothing usable: with pools, no answer is never a
 # guess at the default pool.
