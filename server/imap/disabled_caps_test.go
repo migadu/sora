@@ -317,3 +317,22 @@ func TestDisabledCaps_KeepsCommandsOutsideDisabledCapability(t *testing.T) {
 		}
 	}
 }
+
+// LIST RETURN (METADATA) is the LIST-METADATA return option (RFC 9590 §1), and
+// RFC 5258 §3 says "a client MUST NOT send an option for which the server has
+// not advertised support. A server MUST respond to options it does not
+// recognize with a BAD response." go-imap parses the option and lets it through
+// whenever LIST-EXTENDED is offered, so a session that does not offer
+// LIST-METADATA must refuse it itself (#889).
+func TestList_RefusesReturnMetadataWithoutListMetadata(t *testing.T) {
+	srv := newDisabledCapsTestServer(t, IMAPServerOptions{})
+	s := newDisabledCapsTestSession(srv)
+	caps := srv.caps.Copy()
+	delete(caps, imap.CapListMetadata)
+	s.sessionCaps.Store(caps)
+
+	err := callHandler(func() error {
+		return s.List(context.Background(), nil, "", []string{"*"}, &imap.ListOptions{ReturnMetadata: []string{"/private/comment"}})
+	})
+	assertRefusedAsBad(t, "without LIST-METADATA", "LIST RETURN (METADATA)", err)
+}
