@@ -371,8 +371,13 @@ func (crl *ClusterRateLimiter) handleUnblockIP(event RateLimitEvent) {
 // lowers it. Taking the newest count instead let a peer that had seen fewer
 // failures reset the count of a node close to blocking the address, so an
 // attack spread over two nodes could stay under max_attempts_per_ip on both.
+//
+// An address this node exempts from rate limiting is not tracked, as the local
+// path never tracks it: peers of one protocol may exempt other networks (a
+// rolling change of exempt_networks, or two [[server]] entries of the same
+// protocol), and their delay must not apply here.
 func (crl *ClusterRateLimiter) handleFailureCount(event RateLimitEvent) {
-	if !crl.syncFailureCounts {
+	if !crl.syncFailureCounts || crl.limiter.isRateLimitExempt(event.IP) {
 		return
 	}
 
