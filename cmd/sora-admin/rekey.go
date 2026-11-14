@@ -358,8 +358,8 @@ func (r *rekeyRun) deleteOldObjects(ctx context.Context, wait bool) {
 }
 
 // deleteOldObject deletes old if nothing references it, holding its S3 object lock across
-// the check and the delete as the cleaner does, so a restore or cross-account COPY that
-// claims the body in between is either seen or waits.
+// the check and the delete as the cleaner does, so a restore or cross-account COPY or MOVE
+// that claims the body in between is either seen or waits.
 func (r *rekeyRun) deleteOldObject(ctx context.Context, old db.ContentObject) {
 	var referenced bool
 	err := r.rdb.ExecuteWithS3ObjectLock(ctx, old.ContentHash, r.accountID, func(ctx context.Context) error {

@@ -243,8 +243,8 @@ const (
 	// now leased to this upload alone until the lease expires.
 	S3WriteOpen S3WriteGate = iota
 	// S3WriteBusy: someone else is at the body right now — the cleaner or a purge
-	// confirming it is an orphan and deleting it, a restore, a cross-account COPY, or
-	// another upload of it that holds the row's lease. The upload is deferred.
+	// confirming it is an orphan and deleting it, a restore, a cross-account COPY or
+	// MOVE, or another upload of it that holds the row's lease. The upload is deferred.
 	S3WriteBusy
 	// S3WriteAbandoned: the pending row is gone (the account was deleted, the upload
 	// reaped, or another upload finished it), so there is nothing left to upload.
