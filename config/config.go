@@ -70,7 +70,9 @@ type DatabaseConfig struct {
 	PoolTypeOverride string                  `toml:"-"`                 // Internal: Override pool type in logs (not in config file)
 	// Internal (not in config file): with Read unset, serve reads from the write pool
 	// instead of opening a dedicated read pool to the same host. The resilient layer sets
-	// it for every host that does not serve both reads and writes.
+	// it for read replicas, and for write hosts when [database.read] is configured: those
+	// serve reads only while no replica is healthy, or in sora-admin, which skips the
+	// replicas, and then the reads share the one pool with the writes.
 	ReadsShareWritePool bool `toml:"-"`
 }
 
