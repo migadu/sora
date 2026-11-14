@@ -274,7 +274,7 @@ already open keep the settings they started with.
 | `lmtp_proxy` | `timeouts.absolute_session_timeout`, `max_message_size` |
 | `http_admin_api` | `api_key`, `read_only_api_key`, `allowed_hosts` |
 | `http_user_api` | `jwt_secret`, `allowed_origins`, `allowed_hosts` |
-| `user_api_proxy` | `jwt_secret` |
+| `user_api_proxy` | `jwt_secret`, `allowed_origins` |
 | `metrics` | nothing; changes are not reported either |
 
 The list lives in `reloadableServerSettings` in

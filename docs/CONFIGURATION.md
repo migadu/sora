@@ -315,7 +315,7 @@ Only the settings in this table reload:
 | `lmtp_proxy` | `timeouts.absolute_session_timeout`, `max_message_size` |
 | `http_admin_api` | `api_key`, `read_only_api_key`, `allowed_hosts` |
 | `http_user_api` | `jwt_secret`, `allowed_origins`, `allowed_hosts` |
-| `user_api_proxy` | `jwt_secret` |
+| `user_api_proxy` | `jwt_secret`, `allowed_origins` |
 | `metrics` | nothing |
 
 A server that applied a change logs it, for example `IMAP config reloaded` with the list of updated
@@ -769,7 +769,7 @@ See [SECURITY.md](SECURITY.md).
 | `max_connections_per_ip` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `user_api_proxy` | Concurrent connections from one IP. Hosts in `trusted_networks` are not limited. |
 | `max_connections_per_user` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Logged-in sessions of one user. Enforced on this server by `imap`, `pop3` and `managesieve`. Enforced across the cluster for proxies, which track connections only with `[cluster] enabled = true`; without it a proxy ignores the key, with a startup warning. Ignored by `lmtp_proxy` with a warning. |
 | `max_connections_per_user_per_ip` | integer | `0` (no limit) | as `max_connections_per_user` | Logged-in sessions of one user from one IP. |
-| `listen_backlog` | integer | `1024` | backends, line proxies | TCP listen backlog. `0` means 1024. |
+| `listen_backlog` | integer | `1024` | backends, line proxies | TCP listen backlog. `0` means 1024. The HTTP servers listen with the kernel's default backlog; on them the key is ignored, with a startup warning. |
 
 ### 9.5 Limits (`[server.limits]`)
 

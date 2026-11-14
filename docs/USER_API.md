@@ -856,6 +856,7 @@ call the API through the proxy.
 |---|---|---|
 | `type`, `name`, `addr` | required | `user_api_proxy`, a name, the listen address. |
 | `jwt_secret` | none | Must equal the backends' `jwt_secret`. Empty: the proxy is skipped with `User API proxy server enabled but no JWT secret configured - skipping`. Under 32 bytes or the placeholder: Sora refuses to start. Reloaded on SIGHUP, with the same rules as on the backend. |
+| `allowed_origins` | `[]` | CORS origins of the errors the proxy answers itself (12.3); set it to the backends' list. Reloaded on SIGHUP. |
 | `remote_addrs` | none | Backend `host:port` list. Either this or `[[pool]]` blocks are required. |
 | `remote_port` | none | Port for backends listed without one. |
 | `remote_tls` | `false` | Speak HTTPS to the backends. |
@@ -875,7 +876,8 @@ call the API through the proxy.
 | `[server.remote_lookup]` | off | Route lookups; see [PROXY.md](PROXY.md). |
 | `[server.lookup_cache]` | off | Caches lookup answers; same keys and defaults as in section 2. |
 
-`allowed_hosts`, `token_duration` and `token_issuer` have no effect on this proxy. Affinity is
+`allowed_hosts`, `token_duration` and `token_issuer` have no effect on this proxy; set in its block,
+each is reported with a startup warning. Affinity is
 used when the block sets `enable_affinity = true` and the cluster runs its affinity store
 (`[cluster.affinity] enabled = true`). The proxy's HTTP
 limits are fixed: 30 seconds to read a request and 30 seconds to write a response, 120 seconds
