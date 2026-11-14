@@ -12,9 +12,8 @@ import (
 const configValidateHelperEnv = "SORA_ADMIN_CONFIG_VALIDATE_HELPER_PATH"
 
 // TestConfigValidateCommandHelper is not a test: it is `sora-admin config validate`,
-// run by TestConfigValidateRejectsUnsupportedRelayType and
-// TestConfigValidateRejectsIncompleteServerBlock in a process of its own because the
-// command exits.
+// run by the TestConfigValidate* tests in a process of its own because the command
+// exits.
 func TestConfigValidateCommandHelper(t *testing.T) {
 	path := os.Getenv(configValidateHelperEnv)
 	if path == "" {
@@ -25,7 +24,8 @@ func TestConfigValidateCommandHelper(t *testing.T) {
 }
 
 // TestConfigValidateRejectsUnsupportedRelayType: `sora-admin config validate` fails a
-// [relay] type the server refuses to start with (#277).
+// [relay] type the server refuses to start with (#277), and a relay type without a
+// usable smtp_host or http_url (#532).
 func TestConfigValidateRejectsUnsupportedRelayType(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -34,6 +34,9 @@ func TestConfigValidateRejectsUnsupportedRelayType(t *testing.T) {
 	}{
 		{name: "smtp", relay: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n", wantErr: ""},
 		{name: "upper-case SMTP", relay: "[relay]\ntype = \"SMTP\"\nsmtp_host = \"smtp.example.com:587\"\n", wantErr: `unsupported [relay] type "SMTP"`},
+		{name: "smtp without smtp_host", relay: "[relay]\ntype = \"smtp\"\n", wantErr: `[relay] type "smtp" requires smtp_host as host:port`},
+		{name: "smtp_host without port", relay: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com\"\n", wantErr: `[relay] smtp_host "smtp.example.com" must be host:port`},
+		{name: "http without http_url", relay: "[relay]\ntype = \"http\"\n", wantErr: `[relay] type "http" requires http_url`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -97,6 +100,97 @@ func TestConfigValidateRejectsIncompleteServerBlock(t *testing.T) {
 			}
 			if !strings.Contains(string(out), tt.wantErr) {
 				t.Errorf("config validate failed, but the output does not say %q:\n%s", tt.wantErr, out)
+			}
+		})
+	}
+}
+
+// TestConfigValidateRefusesWhatStartupRefuses covers the shared startup checks
+// added for #516. The CLI printed "[OK] Configuration is valid!" for checks it did not run: [[pool]] blocks,
+// PROXY protocol without trusted_networks, [uploader] and [shared_mailboxes], and it
+// only warned about a file without servers. A file with several problems reports each.
+func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
+	const imapBackend = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
+	const imapProxy = "\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\n"
+	const proxyProtocolImap = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\nproxy_protocol = true\n"
+	tests := []struct {
+		name    string
+		content string
+		wantErr []string // substrings of the failure, none for a valid file
+	}{
+		{
+			name:    "PROXY protocol without trusted_networks",
+			content: "[servers]\ntrusted_networks = []\n" + proxyProtocolImap,
+			wantErr: []string{"proxy_protocol is enabled on server(s) imap but [servers] trusted_networks is empty"},
+		},
+		{
+			name:    "PROXY protocol with trusted_networks",
+			content: "[servers]\ntrusted_networks = [\"192.0.2.10\"]\n" + proxyProtocolImap,
+		},
+		{
+			name: "pool declared twice",
+			content: "[[pool]]\nname = \"sora1\"\nbackends = [\"192.0.2.10:143\"]\ndefault = true\n\n" +
+				"[[pool]]\nname = \"sora1\"\nbackends = [\"192.0.2.11:143\"]\n" + imapProxy,
+			wantErr: []string{`[[pool]] "sora1": declared more than once`},
+		},
+		{
+			name:    "uploader concurrency 0 on a mail backend",
+			content: "[uploader]\nconcurrency = 0\n" + imapBackend,
+			wantErr: []string{"[uploader] concurrency must be positive, got 0"},
+		},
+		{
+			// A node without a mail backend runs no upload worker; the server starts it.
+			name:    "uploader concurrency 0 on a proxy",
+			content: "[uploader]\nconcurrency = 0\n" + imapProxy + "remote_addrs = [\"192.0.2.10:143\"]\n",
+		},
+		{
+			name:    "cleanup fts_retention negative on a mail backend",
+			content: "[cleanup]\nfts_retention = \"-24h\"\n" + imapBackend,
+			wantErr: []string{"fts_retention must not be negative"},
+		},
+		{
+			name:    "shared namespace_prefix without delimiter",
+			content: "[shared_mailboxes]\nenabled = true\nnamespace_prefix = \"Shared\"\n" + imapBackend,
+			wantErr: []string{`namespace_prefix "Shared"`},
+		},
+		{
+			name:    "no servers",
+			content: "[logging]\nlevel = \"info\"\n",
+			wantErr: []string{"no servers configured"},
+		},
+		{
+			name: "every problem reported",
+			content: "[servers]\ntrusted_networks = []\n\n[uploader]\nconcurrency = 0\n\n" +
+				"[relay]\ntype = \"SMTP\"\nsmtp_host = \"smtp.example.com:587\"\n" + proxyProtocolImap,
+			wantErr: []string{
+				"proxy_protocol is enabled on server(s) imap",
+				"[uploader] concurrency must be positive, got 0",
+				`unsupported [relay] type "SMTP"`,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tt.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(os.Args[0], "-test.run=^TestConfigValidateCommandHelper$")
+			cmd.Env = append(os.Environ(), configValidateHelperEnv+"="+path)
+			out, err := cmd.CombinedOutput()
+			if len(tt.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("config validate failed a file the server starts with: %v\n%s", err, out)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("config validate passed the file; want it failed with %q:\n%s", tt.wantErr, out)
+			}
+			for _, want := range tt.wantErr {
+				if !strings.Contains(string(out), want) {
+					t.Errorf("config validate failed, but the output does not say %q:\n%s", want, out)
+				}
 			}
 		})
 	}

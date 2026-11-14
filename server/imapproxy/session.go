@@ -65,7 +65,7 @@ type Session struct {
 	byePending        string           // a BYE to write as soon as the stream is between responses
 	byeSent           bool             // a BYE was written: none is written again
 	submittedUsername string           // Username exactly as submitted by the client (lookup-cache key)
-	connRejected      bool             // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
+	connRegistered    bool             // connTracker.RegisterConnection accepted this session: close() unregisters only then
 }
 
 // newSession creates a new IMAP proxy session.
@@ -1662,9 +1662,6 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 	// the backend server does the same and replies NO [LIMIT].
 	if err := s.registerConnection(); err != nil {
 		s.InfoLog("connection rejected by connection tracker", "error", err)
-		// Mark as rejected so close() does not decrement a slot this session
-		// never held (which would erode the limit for the account).
-		s.connRejected = true
 		s.sendResponse(fmt.Sprintf("%s NO [LIMIT] Too many connections", clientTag))
 		s.sendResponse("* BYE Too many connections")
 		s.mu.Lock()
@@ -1914,9 +1911,13 @@ func (s *Session) close() {
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
 	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
-	// Skip unregister when registration was rejected; otherwise we would
-	// decrement a slot this session never held (limit erosion for the account).
-	if s.server.connTracker != nil && !s.connRejected {
+	// Only a session the tracker registered unregisters. The account ID is set
+	// as soon as the client's credentials are accepted, before the backend leg
+	// and the registration: a session whose backend leg failed, or whose
+	// registration was refused, holds no slot, and unregistering it would free
+	// the slot of another session of the account from the same IP.
+	if s.server.connTracker != nil && s.connRegistered {
+		s.connRegistered = false // the slot is released once, however often close() runs
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -1932,7 +1933,7 @@ func (s *Session) close() {
 			s.DebugLog("Successfully unregistered connection")
 		}
 	} else {
-		s.DebugLog("Skipping unregister - no connTracker")
+		s.DebugLog("Skipping unregister - not registered with connTracker")
 	}
 
 	if s.clientConn != nil {
@@ -1957,7 +1958,10 @@ func (s *Session) registerConnection() error {
 
 	// Use cached client address (real IP) to match UnregisterConnection in close()
 	if s.server.connTracker != nil {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "IMAP", s.clientAddr)
+		if err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "IMAP", s.clientAddr); err != nil {
+			return err
+		}
+		s.connRegistered = true
 	}
 	return nil
 }
