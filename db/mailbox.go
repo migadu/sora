@@ -548,7 +548,7 @@ func (db *Database) SoftDeleteMailbox(ctx context.Context, tx pgx.Tx, mailboxID 
 			return fmt.Errorf("failed to check delete permission: %w", err)
 		}
 		if !hasDeleteRight {
-			return fmt.Errorf("permission denied: user does not have delete right on shared mailbox")
+			return fmt.Errorf("%w: no delete right on shared mailbox %d", consts.ErrNotPermitted, mailboxID)
 		}
 	}
 
