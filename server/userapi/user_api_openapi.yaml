@@ -271,7 +271,7 @@ paths:
                   messages:
                     type: array
                     items:
-                      $ref: '#/components/schemas/MessageListItem'
+                      $ref: '#/components/schemas/Message'
                   total:
                     type: integer
                   offset:
@@ -326,9 +326,22 @@ paths:
                   messages:
                     type: array
                     items:
-                      $ref: '#/components/schemas/MessageListItem'
+                      $ref: '#/components/schemas/Message'
                   total:
                     type: integer
+                    description: Number of messages in this response.
+                  truncated:
+                    type: boolean
+                    description: |
+                      `true` when more messages matched than were returned. The response
+                      holds the newest `limit` matches.
+                  limit:
+                    type: integer
+                    description: Most messages a search returns.
+                    example: 100
+                  query:
+                    type: string
+                    description: The `q` parameter.
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -339,7 +352,9 @@ paths:
       tags:
         - Messages
       summary: Get message details
-      description: Retrieve full message details in JSON format
+      description: |
+        Retrieve a message's metadata in JSON. The body is not included: use
+        /messages/{id}/body or /messages/{id}/raw.
       operationId: getMessage
       security:
         - bearerAuth: []
@@ -388,7 +403,23 @@ paths:
                   example: ['\Draft']
       responses:
         '200':
-          description: Flags updated successfully
+          description: |
+            Flags updated. `data` is the message as GET /messages/{id} returns it. If
+            the message cannot be read back after the update, `data` is left out and
+            `id` is sent instead.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Message flags updated successfully
+                  data:
+                    $ref: '#/components/schemas/Message'
+                  id:
+                    type: integer
+                    format: int64
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -488,10 +519,13 @@ paths:
               schema:
                 type: object
                 properties:
-                  filters:
+                  scripts:
                     type: array
                     items:
                       $ref: '#/components/schemas/Filter'
+                  count:
+                    type: integer
+                    description: Number of scripts in the list.
         '401':
           $ref: '#/components/responses/Unauthorized'
 
@@ -533,27 +567,22 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required:
-                - content
-              properties:
-                content:
-                  type: string
-                  description: Sieve script content
-                  example: |
-                    require ["fileinto"];
-                    if header :contains "Subject" "[SPAM]" {
-                      fileinto "Junk";
-                    }
+              $ref: '#/components/schemas/FilterRequest'
       responses:
         '200':
-          description: Filter updated successfully
-        '201':
-          description: Filter created successfully
+          description: The stored script, whether it was created or replaced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Filter'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: A new script would exceed the limit of 100 scripts per account
+        '413':
+          description: The script is larger than `max_script_size`
 
     delete:
       tags:
@@ -724,32 +753,101 @@ components:
         type: string
       example: ['$Forwarded', 'Work']
 
-    MessageListItem:
+    Message:
       type: object
+      description: |
+        A message as the message list, the search and GET /messages/{id} return it.
+        Addresses are bare email addresses from the message's headers, without display
+        names. The body is not included: GET /messages/{id}/body and
+        /messages/{id}/raw return it.
       properties:
         id:
           type: integer
           format: int64
+          description: The message's ID in the /messages/{id} endpoints.
+          example: 12345
         uid:
           type: integer
           format: int64
-        mailbox:
+          description: The message's IMAP UID in its mailbox.
+          example: 142
+        mailbox_id:
+          type: integer
+          format: int64
+          description: ID of the mailbox holding the message.
+          example: 7
+        mailbox_path:
           type: string
+          description: Full name of the mailbox holding the message.
+          example: INBOX
         subject:
           type: string
+          example: Meeting Tomorrow
         from:
           type: string
+          description: The first address of the From header; empty when there is none.
+          example: boss@example.com
         to:
-          type: string
+          type: array
+          description: The addresses of the To header.
+          items:
+            type: string
+          example: ['user@example.com']
+        cc:
+          type: array
+          description: The addresses of the Cc header. Omitted when there are none.
+          items:
+            type: string
+          example: ['team@example.com']
+        bcc:
+          type: array
+          description: |
+            The addresses of the Bcc header, which normally only a message the user
+            sent still carries. Omitted when there are none.
+          items:
+            type: string
         date:
           type: string
           format: date-time
+          description: The Date header; the internal date when the message has none.
+          example: '2024-01-20T10:30:00Z'
+        internal_date:
+          type: string
+          format: date-time
+          description: |
+            When the message was delivered or appended (IMAP INTERNALDATE). The
+            message list and the search are sorted by it, newest first.
+          example: '2024-01-20T10:30:05Z'
         size:
           type: integer
+          description: Size of the raw message in octets.
+          example: 4096
         flags:
           $ref: '#/components/schemas/SystemFlags'
         custom_flags:
           $ref: '#/components/schemas/CustomFlags'
+        message_id:
+          type: string
+          description: |
+            The Message-ID header, without angle brackets. A message delivered without
+            one has an ID Sora generated, in angle brackets.
+          example: abc123@example.com
+        in_reply_to:
+          type: string
+          description: |
+            The message IDs of the In-Reply-To header, without angle brackets and
+            separated by spaces. Omitted when there are none.
+        references:
+          type: string
+          description: |
+            The message IDs of the References header, without angle brackets and
+            separated by spaces. Only GET /messages/{id} and the PATCH response send
+            it; message list and search entries never do. Omitted when there are none.
+        content_hash:
+          type: string
+          description: |
+            BLAKE3 hash of the raw message, hex-encoded. Messages with the same content
+            have the same hash.
         has_attachments:
           type: boolean
           description: |
@@ -759,99 +857,48 @@ components:
             mail stored before Sora set them, or mail it could not inspect (such as
             encrypted mail).
 
-    Message:
-      type: object
-      properties:
-        id:
-          type: integer
-          format: int64
-        uid:
-          type: integer
-          format: int64
-        mailbox:
-          type: string
-        subject:
-          type: string
-        from:
-          type: object
-          properties:
-            name:
-              type: string
-            email:
-              type: string
-        to:
-          type: array
-          items:
-            type: object
-            properties:
-              name:
-                type: string
-              email:
-                type: string
-        cc:
-          type: array
-          items:
-            type: object
-            properties:
-              name:
-                type: string
-              email:
-                type: string
-        date:
-          type: string
-          format: date-time
-        size:
-          type: integer
-        flags:
-          $ref: '#/components/schemas/SystemFlags'
-        custom_flags:
-          $ref: '#/components/schemas/CustomFlags'
-        headers:
-          type: object
-          additionalProperties:
-            type: array
-            items:
-              type: string
-        body_text:
-          type: string
-        body_html:
-          type: string
-        attachments:
-          type: array
-          items:
-            type: object
-            properties:
-              filename:
-                type: string
-              content_type:
-                type: string
-              size:
-                type: integer
-              part_number:
-                type: string
-        has_attachments:
-          type: boolean
-          description: |
-            Whether the message has attachments, from its RFC 9979 keywords; omitted
-            when it carries neither. See MessageListItem.has_attachments.
-
     Filter:
       type: object
+      description: |
+        A Sieve script. GET /filters/{name} and PUT /filters/{name} send all four
+        fields; the list (GET /filters) leaves out `script`.
       properties:
         name:
           type: string
-        content:
+          example: spam-filter
+        script:
           type: string
+          description: The script's source. Not sent in the list.
+          example: |
+            require ["fileinto"];
+            if header :contains "Subject" "[SPAM]" {
+              fileinto "Junk";
+            }
         active:
           type: boolean
-        size:
-          type: integer
-        created_at:
-          type: string
-          format: date-time
+          description: Whether delivery runs this script. At most one script is active.
         updated_at:
           type: string
           format: date-time
+          description: When the script was last stored.
+          example: '2024-01-15T10:00:00Z'
+
+    FilterRequest:
+      type: object
+      required:
+        - script
+      properties:
+        script:
+          type: string
+          description: |
+            The Sieve script's source, at most `max_script_size` bytes. It must compile
+            against the extensions GET /filters/capabilities reports, or the request is
+            refused with 400 and nothing is stored.
+          example: |
+            require ["fileinto"];
+            if header :contains "Subject" "[SPAM]" {
+              fileinto "Junk";
+            }
 
   responses:
     BadRequest:

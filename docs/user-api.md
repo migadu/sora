@@ -385,21 +385,55 @@ List messages in a mailbox with pagination.
     {
       "id": 12345,
       "uid": 142,
-      "mailbox": "INBOX",
+      "mailbox_id": 7,
+      "mailbox_path": "INBOX",
       "subject": "Meeting Tomorrow",
       "from": "boss@example.com",
-      "to": "user@example.com",
+      "to": ["user@example.com"],
+      "cc": ["team@example.com"],
       "date": "2024-01-20T10:30:00Z",
+      "internal_date": "2024-01-20T10:30:05Z",
       "size": 4096,
       "flags": ["\\Seen"],
+      "custom_flags": ["$hasnoattachment"],
+      "message_id": "abc123@example.com",
+      "content_hash": "9c1185a5c5e9fc54612808977ee8f548b2258d31a3d2a1c46c87a1d7b1f8a2c4",
       "has_attachments": false
     }
   ],
   "total": 142,
-  "offset": 0,
-  "limit": 50
+  "limit": 50,
+  "offset": 0
 }
 ```
+
+**Message fields** (the same in the message list, the search and
+`GET /user/messages/{id}`):
+- `id` - The message's ID in the `/user/messages/{id}` endpoints
+- `uid` - The message's IMAP UID in its mailbox
+- `mailbox_id`, `mailbox_path` - ID and full name of the mailbox holding the message
+- `subject` - The Subject header
+- `from` - The first address of the From header; empty when there is none
+- `to`, `cc`, `bcc` - The addresses of the To, Cc and Bcc headers. `cc` and `bcc` are
+  omitted when there are none; normally only a message the user sent still has a Bcc
+  header
+- `date` - The Date header; the internal date when the message has none
+- `internal_date` - When the message was delivered or appended (IMAP INTERNALDATE).
+  Messages are listed newest first by it
+- `size` - Size of the raw message in octets
+- `flags` - System flags, with their backslash
+- `custom_flags` - IMAP keywords; omitted when there are none
+- `message_id` - The Message-ID header, without angle brackets. A message delivered
+  without one has an ID Sora generated, in angle brackets
+- `in_reply_to` - The message IDs of the In-Reply-To header, without angle brackets and
+  separated by spaces; omitted when there are none
+- `references` - The message IDs of the References header, in the same form. Only
+  `GET /user/messages/{id}` and the `PATCH` response send it
+- `content_hash` - BLAKE3 hash of the raw message, hex-encoded
+- `has_attachments` - See below
+
+Addresses are bare email addresses, without display names. No message headers or body
+are included: `GET /user/messages/{id}/raw` returns the message as stored.
 
 `has_attachments` comes from the RFC 9979 keywords Sora sets when it stores a message
 (on delivery and on IMAP APPEND): `true` for `$hasattachment`, `false` for
@@ -428,36 +462,30 @@ curl "http://localhost:8081/user/mailboxes/INBOX/messages?unseen=true" \
 
 **Endpoint:** `GET /user/messages/{id}`
 
-Get full message details in JSON format.
+Get a message's metadata in JSON: the [message fields](#list-messages) of a list
+entry, plus `references`. The body is not included: `GET /user/messages/{id}/body`
+and `GET /user/messages/{id}/raw` return it.
 
 **Response:** `200 OK`
 ```json
 {
-  "id": 12345,
-  "uid": 142,
-  "mailbox": "INBOX",
-  "subject": "Meeting Tomorrow",
-  "from": {
-    "name": "John Boss",
-    "email": "boss@example.com"
-  },
-  "to": [
-    {
-      "name": "You",
-      "email": "user@example.com"
-    }
-  ],
-  "cc": [],
-  "date": "2024-01-20T10:30:00Z",
-  "size": 4096,
+  "id": 12346,
+  "uid": 143,
+  "mailbox_id": 7,
+  "mailbox_path": "INBOX",
+  "subject": "Re: Meeting Tomorrow",
+  "from": "boss@example.com",
+  "to": ["user@example.com"],
+  "date": "2024-01-20T11:00:00Z",
+  "internal_date": "2024-01-20T11:00:02Z",
+  "size": 5120,
   "flags": ["\\Seen"],
-  "headers": {
-    "message-id": ["<abc123@example.com>"],
-    "x-mailer": ["Sora Mail"]
-  },
-  "body_text": "Let's meet tomorrow at 2pm.",
-  "body_html": "<p>Let's meet tomorrow at 2pm.</p>",
-  "attachments": []
+  "custom_flags": ["$hasnoattachment"],
+  "message_id": "def456@example.com",
+  "in_reply_to": "abc123@example.com",
+  "references": "abc123@example.com",
+  "content_hash": "4be0a7d1c5e9fc54612808977ee8f548b2258d31a3d2a1c46c87a1d7b1f8a2c4",
+  "has_attachments": false
 }
 ```
 
@@ -561,7 +589,9 @@ or `Work`. It must be a valid IMAP atom: ASCII, with no spaces or `( ) { % * " \
 A system flag name without its backslash (`"Seen"`) is rejected with `400` instead
 of being added as a keyword.
 
-**Response:** `200 OK`, with the updated message
+**Response:** `200 OK`, with the updated message in `data`: every field
+`GET /user/messages/{id}` returns (the example shows only some). If the message cannot
+be read back after the update, `data` is left out and `id` is sent instead.
 ```json
 {
   "message": "Message flags updated successfully",
@@ -642,13 +672,19 @@ Full-text search messages in a mailbox.
     {
       "id": 12345,
       "uid": 142,
-      "mailbox": "INBOX",
+      "mailbox_id": 7,
+      "mailbox_path": "INBOX",
       "subject": "Meeting Tomorrow",
       "from": "boss@example.com",
-      "to": "user@example.com",
+      "to": ["user@example.com"],
+      "cc": ["team@example.com"],
       "date": "2024-01-20T10:30:00Z",
+      "internal_date": "2024-01-20T10:30:05Z",
       "size": 4096,
       "flags": ["\\Seen"],
+      "custom_flags": ["$hasnoattachment"],
+      "message_id": "abc123@example.com",
+      "content_hash": "9c1185a5c5e9fc54612808977ee8f548b2258d31a3d2a1c46c87a1d7b1f8a2c4",
       "has_attachments": false
     }
   ],
@@ -660,6 +696,8 @@ Full-text search messages in a mailbox.
 ```
 
 **Response fields:**
+- `messages` - The matches, newest first, each with the [message fields](#list-messages)
+  of a list entry
 - `total` - Number of messages in this response
 - `limit` - Most messages a search returns (100), newest first
 - `truncated` - `true` when more messages matched than were returned. The result is the newest `limit` matches; narrow the query (a rarer word, a sender, a subject filter) to reach the rest. A result is never clipped silently: when `truncated` is `false`, `messages` holds every match.
@@ -702,18 +740,20 @@ List all Sieve filter scripts.
 **Response:** `200 OK`
 ```json
 {
-  "filters": [
+  "scripts": [
     {
       "name": "spam-filter",
-      "content": "require [\"fileinto\"];\nif header :contains \"Subject\" \"[SPAM]\" {\n  fileinto \"Junk\";\n}",
       "active": true,
-      "size": 94,
-      "created_at": "2024-01-15T10:00:00Z",
       "updated_at": "2024-01-15T10:00:00Z"
     }
-  ]
+  ],
+  "count": 1
 }
 ```
+
+The list leaves out the scripts themselves; `GET /user/filters/{name}` returns one.
+`active` marks the script delivery runs; at most one is active. `updated_at` is when
+the script was last stored.
 
 **Example:**
 ```bash
@@ -731,10 +771,8 @@ Get a specific Sieve filter script.
 ```json
 {
   "name": "spam-filter",
-  "content": "require [\"fileinto\"];\nif header :contains \"Subject\" \"[SPAM]\" {\n  fileinto \"Junk\";\n}",
+  "script": "require [\"fileinto\"];\nif header :contains \"Subject\" \"[SPAM]\" {\n  fileinto \"Junk\";\n}",
   "active": true,
-  "size": 94,
-  "created_at": "2024-01-15T10:00:00Z",
   "updated_at": "2024-01-15T10:00:00Z"
 }
 ```
@@ -754,14 +792,21 @@ Create a new filter or update an existing one.
 **Request Body:**
 ```json
 {
-  "content": "require [\"fileinto\"];\nif header :contains \"Subject\" \"[SPAM]\" {\n  fileinto \"Junk\";\n}"
+  "script": "require [\"fileinto\"];\nif header :contains \"Subject\" \"[SPAM]\" {\n  fileinto \"Junk\";\n}"
 }
 ```
 
-**Response:** `200 OK` (updated) or `201 Created` (new)
+`script` is the script's source, at most `max_script_size` (65536) bytes.
+
+**Response:** `200 OK`, whether the script was created or replaced, with the stored
+script as `GET /user/filters/{name}` returns it. A new script is inactive until it is
+activated; replacing a script keeps its active state.
 ```json
 {
-  "message": "Filter created successfully"
+  "name": "spam-filter",
+  "script": "require [\"fileinto\"];\nif header :contains \"Subject\" \"[SPAM]\" {\n  fileinto \"Junk\";\n}",
+  "active": false,
+  "updated_at": "2024-01-15T10:00:00Z"
 }
 ```
 
@@ -780,7 +825,7 @@ curl -X PUT http://localhost:8081/user/filters/spam-filter \
   -H "Authorization: Bearer your-jwt-token" \
   -H "Content-Type: application/json" \
   -d '{
-    "content": "require [\"fileinto\"];\nif header :contains \"Subject\" \"[SPAM]\" {\n  fileinto \"Junk\";\n}"
+    "script": "require [\"fileinto\"];\nif header :contains \"Subject\" \"[SPAM]\" {\n  fileinto \"Junk\";\n}"
   }'
 ```
 
@@ -832,7 +877,8 @@ Delete a Sieve filter script.
 **Response:** `200 OK`
 ```json
 {
-  "message": "Filter deleted successfully"
+  "message": "Script deleted successfully",
+  "name": "old-filter"
 }
 ```
 
@@ -851,7 +897,9 @@ Set a filter script as the active script. Only one script can be active at a tim
 **Response:** `200 OK`
 ```json
 {
-  "message": "Filter activated successfully"
+  "message": "Script activated successfully",
+  "name": "spam-filter",
+  "active": true
 }
 ```
 
@@ -1093,7 +1141,7 @@ curl -X PUT "$BASE_URL/filters/spam-filter" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "content": "require [\"fileinto\"];\nif header :contains \"Subject\" \"[SPAM]\" {\n  fileinto \"Junk\";\n}"
+    "script": "require [\"fileinto\"];\nif header :contains \"Subject\" \"[SPAM]\" {\n  fileinto \"Junk\";\n}"
   }'
 
 # Activate the filter
