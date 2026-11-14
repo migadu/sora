@@ -2310,6 +2310,9 @@ func (s *ServerConfig) IsEnabled() bool {
 	return s.Type != "" && s.Name != "" && s.Addr != ""
 }
 
+// ServerTypes are the [[server]] types the configuration accepts.
+var ServerTypes = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api", "user_api_proxy"}
+
 // ValidateServerConfig validates a server configuration
 func (s *ServerConfig) Validate() error {
 	if s.Type == "" {
@@ -2322,16 +2325,15 @@ func (s *ServerConfig) Validate() error {
 		return fmt.Errorf("server address is required")
 	}
 
-	validTypes := []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api", "user_api_proxy"}
 	isValidType := false
-	for _, validType := range validTypes {
+	for _, validType := range ServerTypes {
 		if s.Type == validType {
 			isValidType = true
 			break
 		}
 	}
 	if !isValidType {
-		return fmt.Errorf("invalid server type '%s', must be one of: %s", s.Type, strings.Join(validTypes, ", "))
+		return fmt.Errorf("invalid server type '%s', must be one of: %s", s.Type, strings.Join(ServerTypes, ", "))
 	}
 
 	// Master credentials: a configured master username with an EMPTY master
@@ -2532,6 +2534,9 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		if s.Type == "metrics" && s.TLS {
 			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)
 		}
+		if s.Type == "metrics" && s.ProxyProtocol {
+			logger("WARNING: Server %s (type: metrics) has 'proxy_protocol' configured, but the metrics endpoint does not read PROXY protocol headers; it is ignored, and 'allowed_hosts' matches the connecting host", s.Name)
+		}
 	}
 }
 
@@ -2559,7 +2564,9 @@ func (c *Config) ProxyProtocolListenersMissingTrust() []string {
 	}
 	var names []string
 	for _, s := range c.GetAllServers() {
-		if s.ProxyProtocol {
+		// The metrics endpoint does not read PROXY headers (its proxy_protocol is warned
+		// about and ignored), so no peer can spoof a client IP through it.
+		if s.ProxyProtocol && s.Type != "metrics" {
 			names = append(names, s.Name)
 		}
 	}
