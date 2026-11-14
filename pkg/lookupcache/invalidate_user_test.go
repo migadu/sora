@@ -120,3 +120,37 @@ func TestInvalidateAccount(t *testing.T) {
 	var disabled *LookupCache
 	disabled.InvalidateAccount(42) // must not panic
 }
+
+// TestInvalidateAccounts drops the logins of several accounts in one pass over the cache:
+// the credential-change poll hands over every account changed in its window at once, and
+// one InvalidateAccount per account would scan the whole cache once per account.
+func TestInvalidateAccounts(t *testing.T) {
+	c := New(5*time.Minute, 1*time.Minute, 100, 5*time.Minute, 30*time.Second)
+	defer func() {
+		ctx, cancel := invalidateTestContext()
+		defer cancel()
+		_ = c.Stop(ctx)
+	}()
+
+	c.SetSuccess("user@example.com", 42, "hash", "secret")
+	c.Set("proxy-1", "alias@example.com", &CacheEntry{AccountID: 43, Result: AuthSuccess})
+	c.SetSuccess("other@example.com", 7, "hash", "secret")
+	c.SetFailure("nobody@example.com", int(AuthUserNotFound))
+
+	c.InvalidateAccounts([]int64{42, 43, 1000})
+
+	for _, key := range []string{"user@example.com", "proxy-1:alias@example.com"} {
+		if _, found := c.Get("", key); found {
+			t.Errorf("entry %q for an invalidated account is still cached", key)
+		}
+	}
+	for _, key := range []string{"other@example.com", "nobody@example.com"} {
+		if _, found := c.Get("", key); !found {
+			t.Errorf("entry %q for another account was removed", key)
+		}
+	}
+
+	c.InvalidateAccounts(nil) // nothing to do
+	var disabled *LookupCache
+	disabled.InvalidateAccounts([]int64{42}) // must not panic
+}
