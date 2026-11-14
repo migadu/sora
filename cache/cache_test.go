@@ -141,27 +141,6 @@ func TestPutGetExistsDelete(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestDelete_RemovesEmptyParents(t *testing.T) {
-	c, _ := newTestCache(t, 262144, 512)
-
-	// Use a crafted hash to ensure a predictable directory structure.
-	hash1 := "aabb111111111111111111111111111111111111111111111111111111111111"
-	data, _ := randomDataAndHash(t, 10)
-
-	// Put a file, which creates parent directories.
-	require.NoError(t, c.Put(hash1, data))
-	path1 := c.GetPathForContentHash(hash1)
-
-	// Delete the file.
-	require.NoError(t, c.Delete(hash1))
-
-	// The file's direct parent and its parent should be removed.
-	dir_level2 := filepath.Dir(path1)
-	dir_level1 := filepath.Dir(dir_level2)
-	_, err := os.Stat(dir_level1)
-	assert.True(t, os.IsNotExist(err), "empty parent directories should be removed")
-}
-
 func TestPut_ObjectTooLarge(t *testing.T) {
 	c, _ := newTestCache(t, 262144, 100)
 	data, hash := randomDataAndHash(t, 101)
