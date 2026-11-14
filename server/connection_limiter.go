@@ -371,14 +371,27 @@ func (cl *ConnectionLimiter) GetStats() ConnectionStats {
 
 	// Get per-IP counts from cluster tracker if available, otherwise from local map
 	if cl.ipTracker != nil {
-		// Cluster mode: get cluster-wide IP counts from tracker
-		cl.ipTracker.mu.RLock()
-		for ip, info := range cl.ipTracker.connections {
-			if info.TotalCount > 0 {
-				stats.IPConnections[ip] = int64(info.TotalCount)
+		// Snapshot the same counts admission checks, including sibling-only IPs.
+		// Keep the tracker -> node lock order used by TryIncrementIP/GetIPCount.
+		tracker := cl.ipTracker
+		tracker.mu.RLock()
+		if tracker.node != nil {
+			tracker.node.mu.Lock()
+		}
+		for ip := range tracker.connections {
+			if count := tracker.countLocked(ip); count > 0 {
+				stats.IPConnections[ip] = int64(count)
 			}
 		}
-		cl.ipTracker.mu.RUnlock()
+		if tracker.node != nil {
+			for ip := range tracker.node.counts {
+				if count := tracker.countLocked(ip); count > 0 {
+					stats.IPConnections[ip] = int64(count)
+				}
+			}
+			tracker.node.mu.Unlock()
+		}
+		tracker.mu.RUnlock()
 	} else {
 		// Local mode: get local IP counts from map
 		cl.perIPConnections.Range(func(key, value interface{}) bool {

@@ -23,6 +23,40 @@ func newNodeLimiter(t *testing.T, node *cluster.Manager, protocol, instanceID st
 	return cl
 }
 
+func TestConnectionLimiterStatsIncludeSiblingIPCounts(t *testing.T) {
+	node := newSingleNodeCluster(t, "stats-node")
+	a := newNodeLimiter(t, node, "IMAP-PROXY", "stats-a", 3)
+	b := newNodeLimiter(t, node, "IMAP-PROXY", "stats-b", 3)
+	const ip = "192.0.2.1"
+	release, err := a.AcceptWithRealIP(&net.TCPAddr{IP: net.ParseIP(ip)}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	check := func(want int64) {
+		t.Helper()
+		for _, cl := range []*ConnectionLimiter{a, b} {
+			if got := cl.GetStats().IPConnections[ip]; got != want {
+				t.Errorf("%s stats per-IP count=%d, want%d (admission count=%d)",
+					cl.instanceID, got, want, cl.ipTracker.GetIPCount(ip))
+			}
+		}
+	}
+	check(1) // b has no local/remote entry yet, but its sibling already holds a slot.
+	for _, cl := range []*ConnectionLimiter{a, b} {
+		deliverIncrement(t, cl.ipTracker, "remote", "IMAP-PROXY", ip, time.Now())
+	}
+	check(2) // A remote count is reported once alongside the node's local count.
+	a.ipTracker.Stop()
+	check(2) // Stopping broadcasts must not release a connection that is still live.
+	release()
+	release() // A duplicate close must not subtract the remote connection.
+	check(1)
+	if a.GetStats().TotalConnections != 0 || b.GetStats().TotalConnections != 0 {
+		t.Fatal("listener-local totals retained a released connection")
+	}
+}
+
 // TestConnectionLimitersOfAProtocolOnOneNodeCountEachOther covers two proxy
 // listeners of one protocol on one node (an IMAP proxy on 143 and one on 993).
 // Each has its own per-IP tracker, and memberlist delivers neither gossip nor
