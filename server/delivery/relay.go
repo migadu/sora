@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-smtp"
@@ -266,6 +268,51 @@ type HTTPRelayHandler struct {
 	MetricsLabel   string
 	Logger         Logger
 	CircuitBreaker *circuitbreaker.CircuitBreaker // Circuit breaker for resilience
+
+	clientOnce sync.Once
+	client     *http.Client // shared by every send; see httpClient
+}
+
+const (
+	// httpRelayMaxIdleConnsPerHost bounds the idle connections kept to the relay.
+	// It is above any sensible [relay.queue] concurrency (default 5), so the
+	// worker's concurrent deliveries keep their connections instead of closing
+	// and redialing all but net/http's default of 2. The pool only holds
+	// connections those deliveries opened, and httpRelayIdleConnTimeout closes them.
+	httpRelayMaxIdleConnsPerHost = 32
+	httpRelayIdleConnTimeout     = 90 * time.Second
+	// httpRelayMaxDrain is how much of a response body is read so its connection
+	// can be reused; a longer body costs the connection, not the send.
+	httpRelayMaxDrain = 64 << 10
+)
+
+// httpClient returns the handler's client, built on first use, so every message
+// reuses the same transport and its kept-alive connections. A client per message
+// never reused a connection, and left each connection that answered with an empty
+// body idle in a transport nothing referenced, without an idle timeout (#461).
+func (r *HTTPRelayHandler) httpClient() *http.Client {
+	r.clientOnce.Do(func() {
+		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		r.client = &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				DialContext:         dialer.DialContext,
+				TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+				TLSHandshakeTimeout: 10 * time.Second,
+				MaxIdleConns:        httpRelayMaxIdleConnsPerHost,
+				MaxIdleConnsPerHost: httpRelayMaxIdleConnsPerHost,
+				IdleConnTimeout:     httpRelayIdleConnTimeout,
+			},
+			// Never follow a redirect: a followed 301/302/303 turns the POST into a
+			// body-less GET whose 2xx would count as delivered, and a 307/308 replays
+			// the message and the bearer token to the Location. The 3xx reaches the
+			// status check in sendToHTTPRelay as a failure.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+	})
+	return r.client
 }
 
 // GetCircuitBreaker returns the circuit breaker for health monitoring
@@ -333,30 +380,18 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 		req.Header.Set("Authorization", "Bearer "+r.AuthToken)
 	}
 
-	// Send request with timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
-			},
-		},
-		// Never follow a redirect: a followed 301/302/303 turns the POST into a
-		// body-less GET whose 2xx would count as delivered, and a 307/308 replays
-		// the message and the bearer token to the Location. The 3xx reaches the
-		// status check below as a failure.
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
-	resp, err := client.Do(req)
+	resp, err := r.httpClient().Do(req)
 	if err != nil {
 		metrics.LMTPExternalRelay.WithLabelValues("failure").Inc()
 		// Network/connection errors are temporary
 		return &RelayError{Err: fmt.Errorf("failed to send HTTP relay request: %w", err), Permanent: false}
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Read the body to EOF so the transport keeps the connection for the
+		// next message; closing it unread closes the connection.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, httpRelayMaxDrain))
+		resp.Body.Close()
+	}()
 
 	// Check response status
 	// HTTP 5xx = server error (temporary, server may recover)
