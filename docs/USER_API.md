@@ -145,8 +145,8 @@ Response `200`:
 | 400 | `Email and password are required` | A field is missing or empty. |
 | 401 | `Invalid credentials` | Unknown address, deleted account, wrong password, or the client is blocked by the rate limiter. The four look the same on purpose. |
 | 429 | `Too many concurrent authentication attempts. Please try again later.` | Too many logins are waiting out a progressive delay at once. |
-| 503 | `Service unavailable` | The request was cancelled while it waited out a delay. |
-| 500 | `Authentication failed` / `Token generation failed` | Database or signing error. |
+| 503 | `Service unavailable` | Database error, a stored password hash that cannot be verified, or the request was cancelled while it waited out a delay. Not counted as a failed login. |
+| 500 | `Token generation failed` | Signing error. |
 
 With `[server.auth_rate_limit] enabled = true`, failed logins are counted per client address
 and per address-and-user, and a blocked client gets the same `401` as a wrong password.
@@ -261,7 +261,7 @@ with these plain-text exceptions from Go's HTTP library:
 | 201 | Mailbox created. |
 | 400 | Bad request: bad JSON, a missing or invalid field or parameter, a script that does not compile. |
 | 401 | No, bad or expired token; failed login. |
-| 403 | Client address not in `allowed_hosts`; or deleting `INBOX`. |
+| 403 | Client address not in `allowed_hosts`; deleting `INBOX`; or changing flags or deleting a message in a shared mailbox without the right. |
 | 404 | Mailbox, message or script not found. |
 | 409 | Mailbox already exists, or has child mailboxes. |
 | 410 | The message body is gone for good. |
@@ -514,6 +514,7 @@ change, the answer is `{"message": "Message flags updated successfully", "id": 9
 | Status | Body `error` |
 |---|---|
 | 400 | `Invalid message ID`, `Invalid request body`, `At least one of add_flags or remove_flags must be specified`, `Invalid flag: ...` |
+| 403 | `Not permitted to change these flags in this mailbox`: a shared mailbox where the account may change none of the flags asked for. Flags it may not change are otherwise left alone. |
 | 404 | `Message not found` |
 | 422 | `Too many keywords on a message (maximum 50)` |
 | 500 | `Failed to update message flags` |
@@ -528,7 +529,8 @@ Adds the `\Deleted` flag. That is all: the message stays in the mailbox until an
 expunges it. The User API has no expunge.
 
 Response `200 {"message":"Message marked as deleted successfully","id":98321}`.
-`400 Invalid message ID`, `404 Message not found`, `500 Failed to delete message`.
+`400 Invalid message ID`, `403 Not permitted to delete messages in this mailbox` (a shared
+mailbox without the `t` right), `404 Message not found`, `500 Failed to delete message`.
 
 ---
 
