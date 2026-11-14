@@ -864,8 +864,8 @@ See [AUTHENTICATION.md](AUTHENTICATION.md).
 
 ### 9.9 Authentication rate limit (`[server.auth_rate_limit]`)
 
-Applies to `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` and
-`http_user_api`. When `enabled = true`, every key you leave
+Applies to `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`,
+`http_user_api` and `user_api_proxy`. When `enabled = true`, every key you leave
 out, or set to 0, gets the default below. See [AUTHENTICATION.md](AUTHENTICATION.md).
 
 | Key | Type | Default |
