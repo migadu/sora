@@ -83,9 +83,9 @@ func TestCopyMoveCarryEveryMessageColumn(t *testing.T) {
 	defer tx.Rollback(ctx)
 	copied, _, err := db.CopyMessages(ctx, tx, &[]imap.UID{copySrcUID}, inboxID, archiveID, accountID, "example.com", "copymovecols", "test", nil, nil)
 	require.NoError(t, err)
-	moved, err := db.MoveMessages(ctx, tx, &[]imap.UID{moveSrcUID}, inboxID, archiveID, accountID, "example.com", "copymovecols", "test", nil)
+	moved, err := db.MoveMessages(ctx, tx, &[]imap.UID{moveSrcUID}, inboxID, archiveID, accountID, "example.com", "copymovecols", "test", nil, nil)
 	require.NoError(t, err)
-	sameMoved, err := db.MoveMessages(ctx, tx, &[]imap.UID{sameSrcUID}, inboxID, inboxID, accountID, "example.com", "copymovecols", "test", nil)
+	sameMoved, err := db.MoveMessages(ctx, tx, &[]imap.UID{sameSrcUID}, inboxID, inboxID, accountID, "example.com", "copymovecols", "test", nil, nil)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(ctx))
 
