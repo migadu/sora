@@ -2451,8 +2451,9 @@ func LoadConfigFromFile(configPath string, cfg *Config) error {
 
 // LoadConfigFromFileWithMetadata is LoadConfigFromFile that also returns the file's TOML
 // metadata. cfg is usually seeded by NewDefaultConfig, so after the load a value equal to
-// its default may be the default or may be set by the file; MetaData.IsDefined tells them
-// apart.
+// its default may be the default or may be set by the file; the metadata keys tell them
+// apart. The keys keep the file's spelling while the decoder matches them to fields
+// case-insensitively, so compare them with strings.EqualFold, not MetaData.IsDefined.
 func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaData, error) {
 	// Read the file content first
 	content, err := os.ReadFile(configPath)

@@ -344,12 +344,25 @@ func main() {
 // read from the TOML metadata, never from its values: a table that names localhost,
 // postgres and sora_mail_db is a database the node must use.
 func dropUndefinedDatabaseEndpoints(cfg *config.Config, md toml.MetaData) {
-	if !md.IsDefined("database", "write") {
+	if !definesDatabaseEndpoint(md, "write") {
 		cfg.Database.Write = nil
 	}
-	if !md.IsDefined("database", "read") {
+	if !definesDatabaseEndpoint(md, "read") {
 		cfg.Database.Read = nil
 	}
+}
+
+// definesDatabaseEndpoint reports whether the file has a database.<endpoint> key, in any
+// TOML form. Keys are compared case-insensitively, as toml.Decode matches them to struct
+// fields: [Database.Write] fills cfg.Database.Write with no unknown-key warning, so it
+// is defined too. MetaData.IsDefined compares exactly and would drop it.
+func definesDatabaseEndpoint(md toml.MetaData, endpoint string) bool {
+	for _, key := range md.Keys() {
+		if len(key) >= 2 && strings.EqualFold(key[0], "database") && strings.EqualFold(key[1], endpoint) {
+			return true
+		}
+	}
+	return false
 }
 
 // handleConfigReload reports the global settings a reload changed but cannot apply.
