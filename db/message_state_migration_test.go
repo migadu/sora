@@ -176,13 +176,15 @@ func TestMessageStateMigrationKeepsFlags(t *testing.T) {
 			SELECT id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq
 			FROM messages WHERE id = $1`, s.unseenID)
 		require.NoError(t, err)
+		// xmax as well as xmin: ON CONFLICT DO UPDATE locks every conflicting row even
+		// when its WHERE leaves the row alone, a WAL record per row of the table.
 		var before, after string
 		require.NoError(t, database.GetWritePool().QueryRow(ctx,
-			`SELECT xmin::text FROM message_state WHERE message_id = $1`, s.unseenID).Scan(&before))
+			`SELECT xmin::text || '/' || xmax::text FROM message_state WHERE message_id = $1`, s.unseenID).Scan(&before))
 		require.NoError(t, m.Migrate(22))
 		require.NoError(t, database.GetWritePool().QueryRow(ctx,
-			`SELECT xmin::text FROM message_state WHERE message_id = $1`, s.unseenID).Scan(&after))
-		assert.Equal(t, before, after, "an identical pre-copied row should not be rewritten")
+			`SELECT xmin::text || '/' || xmax::text FROM message_state WHERE message_id = $1`, s.unseenID).Scan(&after))
+		assert.Equal(t, before, after, "an identical pre-copied row should be neither rewritten nor locked")
 		database.Close()
 		upgrade(t, m)
 		assertKept(t, s)
