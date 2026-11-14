@@ -142,16 +142,24 @@ with status 1. It does not leave the other listeners running.
 
 ### Messages that stop startup
 
-Errors from steps 2 to 9 are written by Sora's error handler, in this form:
+Errors from steps 2 to 9 are written by Sora's error handler. Before step 6 the `[logging]` output
+is not open yet, so they go to standard error, in this form:
 
 ```
 [ERROR] 2026/01/15 10:00:00 ERROR: invalid configuration - <what>: <why>
 [ERROR] 2026/01/15 10:00:00 FATAL: operation '<what>' failed: <why>
 ```
 
-Before step 6 they go to standard error. From step 6 on they go to the `[logging]` output. With
-`output` set to a file, a node that fails to start under systemd may therefore show nothing in the
-journal: look in the log file.
+From step 6 on they are ERROR records of the `[logging]` output, in its format, like every other
+error Sora logs. With the console format:
+
+```
+time=2026-01-15T10:00:00.000+01:00 level=ERROR msg="Invalid configuration" field=<what> error=<why>
+time=2026-01-15T10:00:00.000+01:00 level=ERROR msg="Fatal error" operation=<what> error=<why>
+```
+
+With `output` set to a file or to `syslog`, a node that fails to start under systemd may therefore
+show nothing on standard error: look in the log file or in syslog.
 
 | Message contains | Cause | Fix |
 |---|---|---|
@@ -165,11 +173,11 @@ journal: look in the log file.
 | `duplicate server name` / `duplicate server address` | Two blocks share a `name` or `addr`. | Make them unique. |
 | `database is required for configured servers but not configured` | No `[database.write]` section (step 4). | Configure `[database.write]`. |
 | `missing required S3 credentials` / `S3 endpoint not specified` | A backend without `[s3]` settings. | Set `[s3]`. |
-| `Failed to initialize resilient database` | No write host reachable, or migrations failed. The line before it says why. | See [Database migrations](#10-database-migrations) and [DATABASE.md](DATABASE.md). |
-| `FATAL: operation 'initialize cache' failed` | `[local_cache] path` cannot be created. | Fix the path or its permissions. |
-| `FATAL: operation 'create upload worker' failed` | `[uploader] path` cannot be created. | Fix the path or its permissions. |
-| `FATAL: operation 'initialize TLS manager' failed` | Certificate files unreadable, or a Let's Encrypt setting is missing. | See [TLS.md](TLS.md). |
-| `FATAL: operation 'server operation' failed` | A listener could not start or failed later, for example `address already in use`. | Free the port, or check privileges for ports below 1024. |
+| `Fatal error` with operation `initialize resilient database` | No write host reachable, or migrations failed. The line before it says why. | See [Database migrations](#10-database-migrations) and [DATABASE.md](DATABASE.md). |
+| `Fatal error` with operation `initialize cache` | `[local_cache] path` cannot be created. | Fix the path or its permissions. |
+| `Fatal error` with operation `create upload worker` | `[uploader] path` cannot be created. | Fix the path or its permissions. |
+| `Fatal error` with operation `initialize TLS manager` | Certificate files unreadable, or a Let's Encrypt setting is missing. | See [TLS.md](TLS.md). |
+| `Fatal error` with operation `server operation` | A listener could not start or failed later, for example `address already in use`. | Free the port, or check privileges for ports below 1024. |
 
 ### Warnings worth reading at startup
 
@@ -457,9 +465,9 @@ A few things are always written to the process's standard error, whatever `outpu
 Under systemd these are in the journal even when Sora logs to a file. Check both when Sora does not
 start.
 
-Errors after logging is set up, and protocol traces from `debug = true` on a `[[server]]`, go to the
-log file when `output` is a file path, and to standard error or standard output otherwise. They are
-plain text, not `slog` lines.
+Protocol traces from `debug = true` on a `[[server]]` go to the log file when `output` is a file
+path, and to standard output otherwise. They are plain text, not `slog` lines. Errors that stop Sora
+after logging is set up go through `[logging]`, like every other error.
 
 ### Rotating the log file
 
