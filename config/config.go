@@ -2046,7 +2046,22 @@ func (s *ServerConfig) Validate() error {
 		return fmt.Errorf("server %q: master_sasl_username is set but master_sasl_password is empty; refusing to start (an empty password would allow impersonation of any account)", s.Name)
 	}
 
+	if s.Type == "metrics" && s.Path != "" && !strings.HasPrefix(s.Path, "/") {
+		return fmt.Errorf("server %q: metrics path %q must begin with '/'", s.Name, s.Path)
+	}
+
 	return nil
+}
+
+// MetricsPath returns the HTTP path the metrics handler is served on. An unset
+// path defaults to "/metrics": net/http.ServeMux panics on an empty pattern,
+// and the panic would run in the metrics goroutine, taking the whole process
+// down with it.
+func (s *ServerConfig) MetricsPath() string {
+	if s.Path == "" {
+		return "/metrics"
+	}
+	return s.Path
 }
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type

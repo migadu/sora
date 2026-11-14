@@ -1771,7 +1771,7 @@ func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, se
 	defer deps.serverManager.Done()
 
 	mux := http.NewServeMux()
-	mux.Handle(serverConfig.Path, metricsAccessGuard(serverConfig.AllowedHosts, serverConfig.APIKey, promhttp.Handler()))
+	mux.Handle(serverConfig.MetricsPath(), metricsAccessGuard(serverConfig.AllowedHosts, serverConfig.APIKey, promhttp.Handler()))
 
 	server := &http.Server{
 		Addr:    serverConfig.Addr,
