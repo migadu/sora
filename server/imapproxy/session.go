@@ -1008,6 +1008,9 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Otherwise: treat as token, send full username (including @SUFFIX) to remotelookup
 	var usernameForRemoteLookup string
 	var masterAuthValidated bool
+	// The master username form with a wrong master password: refused whatever the
+	// credential check below says, even for the account's own password (#801).
+	var wrongMasterPassword bool
 
 	// Parse username (handles both regular addresses and addresses with @SUFFIX)
 	parsedAddr, parseErr := server.NewAddress(username)
@@ -1018,15 +1021,22 @@ func (s *Session) authenticateUser(username, password string) error {
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
 			// Suffix matches master username - validate master password locally
 			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
-				// Wrong master password - fail immediately
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return consts.ErrAuthenticationFailed
+				// Wrong master password. Refused like a wrong password under any other
+				// suffix, and only after the same work: the regular credential path below
+				// (lookup, password verification, lookup-cache entry). An
+				// immediate refusal is answered one verification sooner, which confirms
+				// a guessed master username (#801).
+				s.DebugLog("wrong master password, refusing after the regular credential check", "username", username)
+				// A refused master guess must query the same submitted name as
+				// another suffix. The service may route or refuse tokens differently.
+				usernameForRemoteLookup = username
+				wrongMasterPassword = true
+			} else {
+				// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
+				s.DebugLog("master username authentication successful, using base address for routing", "base_address", parsedAddr.BaseAddress())
+				usernameForRemoteLookup = parsedAddr.BaseAddress()
+				masterAuthValidated = true
 			}
-			// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
-			s.DebugLog("master username authentication successful, using base address for routing", "base_address", parsedAddr.BaseAddress())
-			usernameForRemoteLookup = parsedAddr.BaseAddress()
-			masterAuthValidated = true
 		} else {
 			// Suffix doesn't match master username - treat as token
 			// Send FULL username (including @TOKEN) to remotelookup for validation
@@ -1058,6 +1068,10 @@ func (s *Session) authenticateUser(username, password string) error {
 			}
 		}
 		s.DebugLog("remotelookup authentication", "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
+		if err == nil && authResult == proxy.AuthSuccess && wrongMasterPassword {
+			// The account's own password, not the master password: refused as a wrong one.
+			authResult = proxy.AuthFailed
+		}
 
 		if err != nil {
 			// Check if this is due to context cancellation (server shutdown)
@@ -1240,6 +1254,10 @@ func (s *Session) authenticateUser(username, password string) error {
 		s.DebugLog("authenticating user via main database")
 		// Use base address (without +detail) for authentication
 		accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
+		if err == nil && wrongMasterPassword {
+			// The account's own password, not the master password: refused as a wrong one.
+			err = db.ErrInvalidCredentials
+		}
 		if err != nil {
 			// Check if error is due to session context cancellation (server shutdown)
 			// Note: Must check s.ctx.Err(), not just the query error, because the query context

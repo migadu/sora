@@ -315,7 +315,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		checkMasterCredential(password, settings.masterSASLPassword) &&
 		(!selfLogin || s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master SASL self-login")) {
 		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master SASL") {
-			return 0, s.refuseMasterSASLImpersonation(ctx, username, password, netConn, proxyInfo, authKey)
+			return 0, s.refuseLikeWrongPassword(ctx, username, password, netConn, proxyInfo, authKey)
 		}
 		s.DebugLog("master sasl password authentication successful", "base_address", identity)
 
@@ -326,7 +326,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 			// Never recorded under the target's key: that charges an account for
 			// merely having been named. The real reason stays in the log.
 			s.WarnLog("impersonation target rejected (address not in the correct format)", "target_user", identity, "error", err)
-			return 0, s.refuseMasterSASLImpersonation(ctx, username, password, netConn, proxyInfo, authKey)
+			return 0, s.refuseLikeWrongPassword(ctx, username, password, netConn, proxyInfo, authKey)
 		}
 
 		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, targetAddr.BaseAddress())
@@ -349,7 +349,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 			s.WarnLog("impersonation target rejected (account not found)", "target_user", targetAddr.BaseAddress(), "error", err)
 			if !selfLogin {
 				// Same reply, accounting, and password-verification work as a bad credential (#846).
-				return 0, s.refuseMasterSASLImpersonation(ctx, username, password, netConn, proxyInfo, authKey)
+				return 0, s.refuseLikeWrongPassword(ctx, username, password, netConn, proxyInfo, authKey)
 			}
 			// A self-login: answered by regular authentication below (see above).
 		} else {
@@ -452,15 +452,14 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 				masterAuthUsed = true
 				userAddress = &targetAddr
 			} else {
-				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
-				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-				}
 				// Answer exactly like any other bad credential (errAuthFailed): the
 				// distinct reply was reachable with only the master USERNAME and confirmed
-				// it to an attacker. Reason kept for the operator at WARN.
+				// it to an attacker. At the same cost too: any other suffix is answered
+				// after the regular check of the base address, so a refusal without it
+				// confirms the master username by its response time (#801). Reason kept
+				// for the operator at WARN.
 				s.WarnLog("master username authentication failed (invalid master password)")
-				return 0, errAuthFailed
+				return 0, s.refuseLikeWrongPassword(ctx, username, password, netConn, proxyInfo, authKey)
 			}
 		}
 	}
@@ -562,14 +561,17 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	return accountID, nil
 }
 
-// refuseMasterSASLImpersonation answers a refused non-self master SASL login
-// with the same password-verification work, lookup-cache update, rate-limit
-// accounting, and error reply that a wrong password receives via regular
-// authentication (#846), without exposing proxy-auth errors if username
-// happens to name an account whose own password equals master_sasl_password.
-func (s *POP3Session) refuseMasterSASLImpersonation(ctx context.Context, username, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) error {
-	if authnAddr, err := server.NewAddress(username); err == nil &&
-		!(len(s.server.masterUsername) > 0 && authnAddr.HasSuffix() && checkMasterCredential(authnAddr.Suffix(), s.server.masterUsername)) {
+// refuseLikeWrongPassword refuses a login that must not succeed with what regular
+// authentication gives username with a wrong password: the credential check of its
+// base address (password verification and lookup-cache update), whose verdict is
+// discarded, then the same rate-limit accounting and reply. A refusal that skipped the
+// check would be answered one verification sooner and confirm what made it one. Used
+// for a refused master SASL impersonation (#846), which must not answer with the
+// proxy-auth error when username names an account whose own password is the master
+// SASL password, and for a wrong password in the master username form (#801), which
+// must not log in even when it is the account's own password.
+func (s *POP3Session) refuseLikeWrongPassword(ctx context.Context, username, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) error {
+	if authnAddr, err := server.NewAddress(username); err == nil {
 		if _, authErr := s.server.Authenticate(ctx, authnAddr.BaseAddress(), password); authErr != nil {
 			if errors.Is(authErr, context.Canceled) || errors.Is(authErr, context.DeadlineExceeded) {
 				s.InfoLog("authentication cancelled due to server shutdown")
