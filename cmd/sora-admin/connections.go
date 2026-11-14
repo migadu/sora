@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -463,6 +464,17 @@ Use 'sora-admin affinity <subcommand> --help' for detailed help.
 `)
 }
 
+// trackerInstance returns what follows the protocol in the key the Admin API
+// reports a tracker under: "<node_id>-<listener>" for a proxy, the listener
+// name for a backend. Node IDs and listener names both contain dashes
+// ("node-1", "imap-proxy"), so the key is cut after the protocol only.
+func trackerInstance(key string) string {
+	if _, instance, ok := strings.Cut(key, "-"); ok {
+		return instance
+	}
+	return key
+}
+
 func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, protocol, instanceID string) error {
 	// Create HTTP API client
 	client, err := createHTTPAPIClient(cfg)
@@ -471,15 +483,16 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 	}
 
 	// Build URL based on whether user email is specified
-	var url string
+	var endpoint string
 	if userEmail != "" {
-		url = fmt.Sprintf("%s/admin/connections/user/%s", cfg.HTTPAPIAddr, userEmail)
+		// One path segment: a "/" in the local part goes as %2F (RFC 3986 §2.2).
+		endpoint = fmt.Sprintf("%s/admin/connections/user/%s", cfg.HTTPAPIAddr, url.PathEscape(userEmail))
 	} else {
-		url = fmt.Sprintf("%s/admin/connections", cfg.HTTPAPIAddr)
+		endpoint = fmt.Sprintf("%s/admin/connections", cfg.HTTPAPIAddr)
 	}
 
 	// Create request
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -615,15 +628,7 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 			email = email[:21] + "..."
 		}
 
-		// Extract just the server name from instance
-		// Instance format: "PROTOCOL-hostname-servername"
-		// We want just: "servername"
-		instance := conn.Instance
-		parts := strings.Split(instance, "-")
-		if len(parts) >= 3 {
-			// Join everything after "PROTOCOL-hostname"
-			instance = strings.Join(parts[2:], "-")
-		}
+		instance := trackerInstance(conn.Instance)
 
 		// Truncate if still too long
 		if len(instance) > 29 {
