@@ -1613,3 +1613,16 @@ func syntheticMessageID(contentHash, mailboxName string) string {
 	}
 	return fmt.Sprintf("<%s@%s.synthetic.invalid>", contentHash, mailboxName)
 }
+
+// headerMessageID is the Message-ID header a stored message_id stands for, or "" when
+// the message had no usable one. The ingress parser (mail.Header.MessageID) returns a
+// msg-id without its angle brackets, and its id-left cannot begin with '<'; only the
+// synthetic IDs stored for duplicate detection (InsertMessage, syntheticMessageID) keep
+// theirs. Every reader that reports message_id as the message's header goes through
+// this; messageIDFieldExpr is the same rule in SQL.
+func headerMessageID(stored string) string {
+	if strings.HasPrefix(stored, "<") {
+		return ""
+	}
+	return stored
+}
