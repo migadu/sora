@@ -1057,7 +1057,7 @@ type ServerLimitsConfig struct {
 	SearchRateLimitBurst  *int   `toml:"search_rate_limit_burst,omitempty"`   // Searches allowed back to back (default: search_rate_limit_per_min)
 	ThreadMaxMessages     int    `toml:"thread_max_messages,omitempty"`       // Maximum matches per THREAD command (IMAP backend only, <=0 uses default: 50000)
 	RedirectRateLimit     *int   `toml:"redirect_rate_limit,omitempty"`       // Redirect rate limit (per account across the window, 0=unlimited, default: 100)
-	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (default: 1h)
+	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (must be positive, default: 1h)
 	MaxRedirectHops       *int   `toml:"max_redirect_hops,omitempty"`         // Max times one message may be redirected before suppression (mail-loop backstop, 0=unlimited, default: 2)
 	SessionMemoryLimit    string `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
 	MaxAuthErrors         int    `toml:"max_auth_errors,omitempty"`           // Maximum authentication errors before disconnection (default: 2)
@@ -2465,6 +2465,16 @@ func (s *ServerConfig) Validate() error {
 	if s.AuthRateLimit != nil {
 		if err := s.AuthRateLimit.Validate(); err != nil {
 			return fmt.Errorf("server %q: %w", s.Name, err)
+		}
+	}
+
+	// The Sieve redirect rate limit (LMTP and Admin API delivery) counts the redirects
+	// newer than now - redirect_rate_window. A zero or negative window counts none, so
+	// every redirect would be allowed; redirect_rate_limit = 0 is how the limit is
+	// switched off. An unparsable window falls back to the 1h default at startup.
+	if (s.Type == "lmtp" || s.Type == "http_admin_api") && s.Limits != nil && s.Limits.RedirectRateWindow != "" {
+		if window, err := helpers.ParseDuration(s.Limits.RedirectRateWindow); err == nil && window <= 0 {
+			return fmt.Errorf("server %q: limits.redirect_rate_window must be positive, got %q (set limits.redirect_rate_limit = 0 to disable the limit)", s.Name, s.Limits.RedirectRateWindow)
 		}
 	}
 
