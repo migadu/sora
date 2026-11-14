@@ -503,6 +503,26 @@ components:
               type: integer
               example: 3
 
+    AccountCredential:
+      type: object
+      description: >-
+        One credential in GET /accounts/{email}/credentials. The keys are Go field names,
+        and the timestamps are Go's default time format in the server's time zone, not RFC 3339.
+      properties:
+        Address:
+          type: string
+          format: email
+          example: "user@example.com"
+        PrimaryIdentity:
+          type: boolean
+          example: true
+        CreatedAt:
+          type: string
+          example: "2026-11-14 10:31:58.184087 +0000 UTC"
+        UpdatedAt:
+          type: string
+          example: "2026-11-14 10:31:58.184087 +0000 UTC"
+
     DeletedMessage:
       type: object
       description: >-
@@ -784,7 +804,11 @@ components:
           format: date-time
         protocol:
           type: string
-          example: "imap"
+          description: >-
+            Label of the rate limiter that holds the block: IMAP, POP3, ManageSieve, IMAP-PROXY,
+            POP3-PROXY, SIEVE-PROXY or user-api. These are not the server types the protocol
+            query parameter takes.
+          example: "IMAP"
         type:
           type: string
           enum: [ip_username, ip]
@@ -1543,6 +1567,51 @@ paths:
                 $ref: '#/components/schemas/Error'
 
   /accounts/{email}/credentials:
+    get:
+      tags:
+        - Account Management
+      summary: List an account's credentials
+      description: Lists every credential (address) of the account the address in the path belongs to, the primary one first.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          description: "Any address (primary or alias) of the account."
+          schema:
+            type: string
+            format: email
+      responses:
+        '200':
+          description: The account's credentials.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:
+                    type: string
+                    format: email
+                    description: "The address from the path."
+                    example: "user@example.com"
+                  credentials:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AccountCredential'
+                  count:
+                    type: integer
+                    example: 2
+        '404':
+          description: Account not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
     post:
       tags:
         - Account Management
