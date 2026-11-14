@@ -1472,7 +1472,7 @@ func (s *Session) connectToBackend() error {
 	// Only an untagged OK greeting is usable: BYE means the backend refuses
 	// service, and PREAUTH would be an already-authenticated connection that
 	// cannot go through our AUTHENTICATE impersonation flow.
-	if !strings.HasPrefix(greeting, "* OK") {
+	if tag, ok := statusOK(greeting); tag != "*" || !ok {
 		s.backendConn.Close()
 		s.ErrorLog("Unexpected backend greeting", "backend", s.serverAddr, "greeting", strings.TrimRight(greeting, "\r\n"))
 		return fmt.Errorf("unexpected backend greeting: %s", strings.TrimRight(greeting, "\r\n"))
@@ -1552,6 +1552,19 @@ func (s *Session) startTLSWithBackend(tlsConfig *tls.Config, timeout time.Durati
 	return errors.New("no tagged STARTTLS response from backend")
 }
 
+// statusOK returns the tag of a backend response line ("*" when it is untagged) and
+// whether its status is OK. RFC 9051 section 9: the status is a whole atom (greeting =
+// "*" SP (resp-cond-auth / resp-cond-bye) CRLF, response-tagged = tag SP resp-cond-state
+// CRLF, resp-cond-state = ("OK" / "NO" / "BAD") SP resp-text), and "Implementations MUST
+// accept these strings in a case-insensitive fashion". The atom ends at SP or the line
+// end, so OKAY, or OK run into its text, is not OK. The length check keeps the folding
+// ASCII: a multi-byte rune that folds to K (the Kelvin sign) cannot fit.
+func statusOK(line string) (tag string, ok bool) {
+	tag, rest, _ := strings.Cut(strings.TrimRight(line, "\r\n"), " ")
+	status, _, _ := strings.Cut(rest, " ")
+	return tag, len(status) == 2 && strings.EqualFold(status, "OK")
+}
+
 // authenticateToBackend authenticates to the backend using master credentials.
 func (s *Session) authenticateToBackend() (string, error) {
 	// Authenticate to the backend using master credentials in a single step.
@@ -1607,7 +1620,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 		s.WarnLog("failed to clear auth deadline", "error", err)
 	}
 
-	if !strings.HasPrefix(strings.TrimSpace(response), tag+" OK") {
+	if responseTag, ok := statusOK(response); responseTag != tag || !ok {
 		return "", fmt.Errorf("%w: %s", server.ErrBackendAuthFailed, strings.TrimSpace(response))
 	}
 
