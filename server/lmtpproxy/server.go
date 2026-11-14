@@ -167,7 +167,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize remotelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
 	if opts.RemoteLookup.Enabled {
-		remotelookupClient, err := proxy.InitializeRemoteLookup("lmtp", opts.RemoteLookup)
+		remotelookupClient, err := proxy.InitializeRemoteLookup("lmtp", opts.RemoteLookup, opts.RemotePort)
 		if err != nil {
 			logger.Debug("LMTP Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
 			if !opts.RemoteLookup.ShouldLookupLocalUsers() {
@@ -291,10 +291,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			logger.Info("LMTP Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize <= 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// LMTP proxy doesn't do password validation, so positive revalidation window is not needed (use 0)
 		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, 0)

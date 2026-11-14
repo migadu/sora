@@ -156,7 +156,8 @@ type ServerOptions struct {
 	MaxAuthErrors int // Maximum authentication errors before disconnection (0 = use default)
 
 	// Cluster support
-	ClusterManager *cluster.Manager // Optional: enables cluster-wide per-IP limiting
+	ClusterManager       *cluster.Manager                  // Optional: shares per-IP connection counts and auth rate limits with the cluster
+	ClusterRateLimitSync config.ClusterRateLimitSyncConfig // [cluster.rate_limit_sync]; read only with ClusterManager
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
@@ -197,7 +198,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	// Initialize remotelookup client if configured
-	routingLookup, err := proxy.InitializeRemoteLookup("managesieve", opts.RemoteLookup)
+	routingLookup, err := proxy.InitializeRemoteLookup("managesieve", opts.RemoteLookup, opts.RemotePort)
 	if err != nil {
 		logger.Debug("ManageSieve Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
 		if opts.RemoteLookup != nil && !opts.RemoteLookup.ShouldLookupLocalUsers() {
@@ -250,6 +251,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("SIEVE-PROXY", opts.Name, hostname, opts.AuthRateLimit, opts.TrustedProxies)
 	server.RegisterRateLimiter("managesieve_proxy", opts.Name, authLimiter)
+	authLimiter.JoinCluster(opts.ClusterManager, opts.ClusterRateLimitSync)
 
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter
@@ -318,10 +320,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			logger.Info("ManageSieve Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize <= 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// Parse positive revalidation window from config (used for password change detection)
 		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()

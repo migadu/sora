@@ -533,21 +533,24 @@ var (
 		[]string{"protocol", "server_name", "hostname"},
 	)
 
-	// Auth delay queue metrics (per-IP semaphore tracking)
+	// Auth delay queue metrics. Labelled by the call site only: a client-address
+	// label would add series for every address ever delayed and never drop them.
+	// Per-address detail is in the logs and, for addresses that end up blocked, in
+	// GET /admin/auth/blocked.
 	AuthDelayQueueDepth = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "sora_auth_delay_queue_depth",
-			Help: "Current number of connections waiting in auth delay queue per IP",
+			Help: "Current number of connections waiting in an auth delay",
 		},
-		[]string{"protocol", "ip"},
+		[]string{"protocol"},
 	)
 
 	AuthDelayRejections = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "sora_auth_delay_rejections_total",
-			Help: "Total number of connections rejected due to full delay queue per IP",
+			Help: "Total number of connections rejected because their IP's auth delay queue was full",
 		},
-		[]string{"protocol", "ip"},
+		[]string{"protocol"},
 	)
 
 	AuthDelayCompleted = promauto.NewCounterVec(
@@ -555,7 +558,7 @@ var (
 			Name: "sora_auth_delay_completed_total",
 			Help: "Total number of auth delays completed successfully",
 		},
-		[]string{"protocol", "ip"},
+		[]string{"protocol"},
 	)
 
 	AuthDelayCancelled = promauto.NewCounterVec(
@@ -563,7 +566,7 @@ var (
 			Name: "sora_auth_delay_cancelled_total",
 			Help: "Total number of auth delays cancelled (connection closed, shutdown, etc.)",
 		},
-		[]string{"protocol", "ip"},
+		[]string{"protocol"},
 	)
 
 	// Connection tracker memory usage (proxy mode)
@@ -684,5 +687,16 @@ var (
 			Help: "New sessions (logins, LMTP transactions, Admin API deliveries) this backend refused because it is in maintenance",
 		},
 		[]string{"protocol"},
+	)
+)
+
+// Spam training metrics
+var (
+	SpamTrainingMessagesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_spam_training_messages_total",
+			Help: "Messages moved to or from Junk, by spam training outcome (submitted, failed, too_large, dropped)",
+		},
+		[]string{"result"},
 	)
 )

@@ -77,9 +77,8 @@ func (hi *HealthIntegration) registerStandardChecks() {
 			Interval: 30 * time.Second,
 			Timeout:  10 * time.Second,
 			Critical: false,
-			Check: func(ctx context.Context) error {
-				return hi.database.GetDatabase().ReadPool.Ping(ctx)
-			},
+			// What reads are served from: the replicas, or the write hosts without them.
+			Check: hi.database.PingReadPools,
 		}
 		hi.monitor.RegisterCheck(dbReadCheck)
 	}
@@ -212,14 +211,11 @@ func (hi *HealthIntegration) RegisterRemoteLookupCheck(remotelookupClient Remote
 	}
 	hi.monitor.RegisterCheck(remotelookupCheck)
 
-	// If the client has a circuit breaker, register it too
+	// If the client has a circuit breaker, register it too, as
+	// circuit_breaker_<checkName> (RegisterCircuitBreakerCheck adds the prefix)
 	if clientWithBreaker, ok := remotelookupClient.(RemoteLookupWithCircuitBreaker); ok {
 		if breaker := clientWithBreaker.GetCircuitBreaker(); breaker != nil {
-			cbName := "remotelookup_http_circuit_breaker"
-			if serverName != "" {
-				cbName = fmt.Sprintf("remotelookup_http_circuit_breaker_%s", serverName)
-			}
-			hi.RegisterCircuitBreakerCheck(cbName, breaker)
+			hi.RegisterCircuitBreakerCheck(checkName, breaker)
 		}
 	}
 }

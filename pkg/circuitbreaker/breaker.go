@@ -82,8 +82,11 @@ var (
 )
 
 type Settings struct {
-	Name          string
-	MaxRequests   uint32
+	Name        string
+	MaxRequests uint32
+	// Interval is how often the counts are cleared while closed (0: only on state
+	// changes). A request that outlives it is counted, with its result, in the window
+	// it completes in.
 	Interval      time.Duration
 	Timeout       time.Duration
 	ReadyToTrip   func(counts Counts) bool
@@ -134,7 +137,8 @@ type CircuitBreaker struct {
 
 	mutex      sync.Mutex
 	state      State
-	generation uint64
+	generation uint64 // advances on every state change
+	window     uint64 // advances whenever the counts are cleared
 	counts     Counts
 	expiry     time.Time
 }
@@ -204,7 +208,7 @@ func (cb *CircuitBreaker) Counts() Counts {
 }
 
 func (cb *CircuitBreaker) Execute(req func() (any, error)) (any, error) {
-	generation, err := cb.beforeRequest()
+	generation, window, err := cb.beforeRequest()
 	if err != nil {
 		return nil, err
 	}
@@ -212,13 +216,13 @@ func (cb *CircuitBreaker) Execute(req func() (any, error)) (any, error) {
 	defer func() {
 		e := recover()
 		if e != nil {
-			cb.afterRequest(generation, false)
+			cb.afterRequest(generation, window, false)
 			panic(e)
 		}
 	}()
 
 	result, err := req()
-	cb.afterRequest(generation, cb.isSuccessful(err))
+	cb.afterRequest(generation, window, cb.isSuccessful(err))
 	return result, err
 }
 
@@ -232,7 +236,9 @@ func (cb *CircuitBreaker) ExecuteWithFallback(req func() (any, error), fallback 
 	return result, err
 }
 
-func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
+// beforeRequest admits a request and returns the generation and counting window it
+// starts in.
+func (cb *CircuitBreaker) beforeRequest() (uint64, uint64, error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
@@ -240,23 +246,32 @@ func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
 	state, generation := cb.currentState(now)
 
 	if state == StateOpen {
-		return generation, ErrCircuitBreakerOpen
+		return generation, cb.window, ErrCircuitBreakerOpen
 	} else if state == StateHalfOpen && cb.counts.Requests >= cb.maxRequests {
-		return generation, ErrTooManyRequests
+		return generation, cb.window, ErrTooManyRequests
 	}
 
 	cb.counts.onRequest()
-	return generation, nil
+	return generation, cb.window, nil
 }
 
-func (cb *CircuitBreaker) afterRequest(before uint64, success bool) {
+func (cb *CircuitBreaker) afterRequest(beforeGeneration, beforeWindow uint64, success bool) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
 	now := time.Now()
 	state, generation := cb.currentState(now)
-	if generation != before {
+	if generation != beforeGeneration {
+		// The breaker changed state while the request ran: the result describes the
+		// service as it was before that change.
 		return
+	}
+	if cb.window != beforeWindow {
+		// Only the closed-state counting window rolled over, clearing the request from
+		// the counts. Count it again with its result, in the current window: an
+		// operation slower than the interval (a timeout against a hung service) must
+		// count, or such failures could never open the breaker.
+		cb.counts.onRequest()
 	}
 
 	if success {
@@ -296,7 +311,7 @@ func (cb *CircuitBreaker) currentState(now time.Time) (State, uint64) {
 	switch cb.state {
 	case StateClosed:
 		if !cb.expiry.IsZero() && cb.expiry.Before(now) {
-			cb.toNewGeneration(now)
+			cb.toNewWindow(now)
 		}
 	case StateOpen:
 		if cb.expiry.Before(now) {
@@ -323,6 +338,13 @@ func (cb *CircuitBreaker) setState(state State, now time.Time) {
 
 func (cb *CircuitBreaker) toNewGeneration(now time.Time) {
 	cb.generation++
+	cb.toNewWindow(now)
+}
+
+// toNewWindow clears the counts and sets when the current state expires: while closed,
+// that is when the counts are cleared again.
+func (cb *CircuitBreaker) toNewWindow(now time.Time) {
+	cb.window++
 	cb.counts.clear()
 
 	var zero time.Time

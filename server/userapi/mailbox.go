@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/migadu/sora/logger"
@@ -158,8 +157,7 @@ func (s *Server) handleDeleteMailbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract mailbox name from path: /user/mailboxes/{name}
-	name := extractPathParam(r.URL.Path, "/user/mailboxes/", "")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/mailboxes/", "")
 	if err != nil || name == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 		return
@@ -203,8 +201,7 @@ func (s *Server) handleSubscribeMailbox(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Extract mailbox name from path: /user/mailboxes/{name}/subscribe
-	name := extractPathParam(r.URL.Path, "/user/mailboxes/", "/subscribe")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/mailboxes/", "/subscribe")
 	if err != nil || name == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 		return
@@ -212,7 +209,7 @@ func (s *Server) handleSubscribeMailbox(w http.ResponseWriter, r *http.Request) 
 
 	// Subscribe to mailbox
 	if err := s.rdb.SubscribeToMailboxWithRetry(ctx, accountID, name); err != nil {
-		if errors.Is(err, consts.ErrDBNotFound) {
+		if errors.Is(err, consts.ErrMailboxNotFound) || errors.Is(err, consts.ErrDBNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
@@ -239,8 +236,7 @@ func (s *Server) handleUnsubscribeMailbox(w http.ResponseWriter, r *http.Request
 	}
 
 	// Extract mailbox name from path: /user/mailboxes/{name}/unsubscribe
-	name := extractPathParam(r.URL.Path, "/user/mailboxes/", "/unsubscribe")
-	name, err = url.QueryUnescape(name)
+	name, err := pathName(r, "/user/mailboxes/", "/unsubscribe")
 	if err != nil || name == "" {
 		s.writeError(w, http.StatusBadRequest, "Invalid mailbox name")
 		return
@@ -248,7 +244,7 @@ func (s *Server) handleUnsubscribeMailbox(w http.ResponseWriter, r *http.Request
 
 	// Unsubscribe from mailbox
 	if err := s.rdb.UnsubscribeFromMailboxWithRetry(ctx, accountID, name); err != nil {
-		if errors.Is(err, consts.ErrDBNotFound) {
+		if errors.Is(err, consts.ErrMailboxNotFound) || errors.Is(err, consts.ErrDBNotFound) {
 			s.writeError(w, http.StatusNotFound, "Mailbox not found")
 			return
 		}
