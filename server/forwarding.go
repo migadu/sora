@@ -420,3 +420,22 @@ func IsTrustedForwardingWithProxy(conn net.Conn, proxyIP string, trustedProxies 
 	// Fall back to checking the direct connection's remote address (no PROXY protocol)
 	return IsTrustedForwarding(conn, trustedProxies)
 }
+
+// ForwardingSourceIP returns the address that must be trusted before a forwarding command
+// on conn (an IMAP ID with x-originating-ip, a POP3 or LMTP XCLIENT) may replace the client
+// address: the source of the connection's PROXY header when it has one, else the socket
+// peer. It is nil, which no network contains, when there is no connection or its address
+// cannot be parsed.
+//
+// The PROXY header's sender is trusted to say who the client is, not to vouch for the bytes
+// after the header: a layer-4 load balancer (HAProxy, nginx stream) relays the client's own
+// commands, so judging the sender would let every client behind it choose the address the
+// auth rate limiter and the per-IP connection limits count. A proxy behind the load balancer
+// is the header's source and stays trusted. Dovecot's login processes do the same: they test
+// login_trusted_networks against the address the haproxy header gave.
+func ForwardingSourceIP(conn net.Conn) net.IP {
+	if conn == nil {
+		return nil
+	}
+	return net.ParseIP(GetRealClientIP(conn, GetProxyProtocolInfo(conn)))
+}
