@@ -288,6 +288,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	// if there is one), is recorded against the backend the request was routed to:
 	// routing passes over a backend that failed three connections in a row, as on the
 	// other proxies, instead of sending its users there for a 502 while it is down.
+	// http.Transport dials with a context detached from the request's cancellation: a
+	// dial outlives a client that went away, and counts when it fails on its own; only a
+	// dial CloseIdleConnections cancels once no request waits for it goes uncounted.
 	recordDial := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
 		return func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := dial(ctx, network, addr)
