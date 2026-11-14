@@ -130,10 +130,17 @@ func (s *Server) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The documented filters, each ANDed with q. unseen is parsed as in the list endpoint.
+	filter := db.UserAPISearchFilter{
+		From:       query.Get("from"),
+		Subject:    query.Get("subject"),
+		UnseenOnly: query.Get("unseen") == "true",
+	}
+
 	// Perform search
-	messages, truncated, err := s.rdb.SearchMessagesInMailboxWithRetry(ctx, accountID, mailboxName, searchQuery)
+	messages, truncated, err := s.rdb.SearchMessagesInMailboxWithRetry(ctx, accountID, mailboxName, searchQuery, filter)
 	if errors.Is(err, consts.ErrMailboxNotFound) {
-		messages, truncated, err = s.rdb.SearchMessagesInMailboxWithRetry(readFromWriter(ctx), accountID, mailboxName, searchQuery)
+		messages, truncated, err = s.rdb.SearchMessagesInMailboxWithRetry(readFromWriter(ctx), accountID, mailboxName, searchQuery, filter)
 	}
 	if err != nil {
 		if errors.Is(err, consts.ErrMailboxNotFound) {

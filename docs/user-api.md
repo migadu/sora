@@ -661,11 +661,14 @@ In a mailbox shared with you this needs the `t` right (`403 Forbidden` without i
 
 Full-text search messages in a mailbox.
 
-**Query Parameters (all optional):**
+**Query Parameters:**
 - `q=search terms` - Search query (required)
-- `from=email@example.com` - Filter by sender
-- `subject=keyword` - Filter by subject
+- `from=email@example.com` - Only messages whose sender's address or name contains this text
+- `subject=keyword` - Only messages whose subject contains this text
 - `unseen=true` - Only unseen messages
+
+The filters are optional, case-insensitive and literal (no wildcards); each one that is
+given narrows the result for `q`.
 
 **Response:** `200 OK`
 ```json
