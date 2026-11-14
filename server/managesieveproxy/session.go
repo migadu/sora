@@ -462,15 +462,8 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		}
 
 		if err != nil {
-			// Categorize the error type to determine fallback behavior
-			if errors.Is(err, proxy.ErrRemoteLookupInvalidResponse) {
-				// Invalid response from remotelookup (malformed 2xx) - this is a server bug, fail hard
-				s.WarnLog("remotelookup invalid response - server bug", "error", err)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return fmt.Errorf("remotelookup server error: invalid response")
-			}
-
+			// Categorize the error type to determine fallback behavior. A malformed
+			// answer arrives as ErrRemoteLookupTransient: a broken lookup service.
 			if errors.Is(err, proxy.ErrRemoteLookupTransient) {
 				// Check if this is due to context cancellation (server shutdown)
 				if errors.Is(err, server.ErrServerShuttingDown) {

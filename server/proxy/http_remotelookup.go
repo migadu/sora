@@ -336,19 +336,25 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 			return map[string]any{"result": AuthFailed}, nil
 		}
 
-		// Other 4xx errors are client errors - don't trigger circuit breaker
-		// These indicate wrong request format, invalid parameters, etc. (not service failures)
-		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			logger.Warn("remotelookup: Client error - bad request", "status", resp.StatusCode, "user", lookupEmail)
-			// Return success to circuit breaker but indicate auth failed
-			// This prevents 4xx from triggering circuit breaker (they're not service failures)
-			return map[string]any{"result": AuthFailed}, nil
-		}
-
-		// 5xx errors are server failures - these SHOULD trigger circuit breaker
-		if resp.StatusCode >= 500 {
+		// 5xx errors are server failures - these SHOULD trigger circuit breaker. 408 and 429
+		// describe the service the same way: 408 (RFC 9110 section 15.5.9) "the server did
+		// not receive a complete request message within the time that it was prepared to
+		// wait", 429 (RFC 6585 section 4) "the user has sent too many requests in a given
+		// amount of time", the user being this proxy. The open breaker is the backing off
+		// a 429 asks for.
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests {
 			logger.Warn("remotelookup: Server error - service unavailable", "status", resp.StatusCode, "user", lookupEmail)
 			return nil, fmt.Errorf("%w: server error %d", ErrRemoteLookupTransient, resp.StatusCode)
+		}
+
+		// Any other 4xx refuses this request (wrong URL or parameters, an answer the service
+		// keeps for some addresses) and, unlike 401/403, says nothing about the password:
+		// the service is unavailable for this login, a temporary failure. Not a breaker
+		// failure though: the service is up, and answers that may depend on the address
+		// looked up must not let one client open the breaker for every user.
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			logger.Warn("remotelookup: Client error - service unavailable", "status", resp.StatusCode, "user", lookupEmail)
+			return map[string]any{"result": AuthTemporarilyUnavailable, "status": resp.StatusCode}, nil
 		}
 
 		// Non-200 2xx responses - treat as transient
@@ -427,10 +433,15 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 		}
 		// Check if this is a transient error or invalid response
 		if errors.Is(err, ErrRemoteLookupTransient) {
-			// Transient errors (network, timeout, 5xx) - temporarily unavailable
+			// Transient errors (network, timeout, 5xx, 408, 429) - temporarily unavailable
 			return nil, AuthTemporarilyUnavailable, err
 		}
-		// Invalid response errors (malformed 2xx) - authentication failed
+		if errors.Is(err, ErrRemoteLookupInvalidResponse) {
+			// A malformed 200 (not JSON - a maintenance page from a reverse proxy - or
+			// required fields missing) is a broken lookup service, like an outage: it says
+			// nothing about the password. Accounts are refused with 401/403.
+			return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: %w", ErrRemoteLookupTransient, err)
+		}
 		return nil, AuthFailed, err
 	}
 
@@ -446,6 +457,10 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 				// Don't cache auth failures - these could be typos or password changes
 				// Better to always check remotelookup for security
 				return nil, AuthFailed, nil
+			}
+			if authResult == AuthTemporarilyUnavailable {
+				// A 4xx other than 401/403/404 (see above). The proxies branch on the error.
+				return nil, AuthTemporarilyUnavailable, fmt.Errorf("%w: client error %v", ErrRemoteLookupTransient, resultMap["status"])
 			}
 		}
 	}

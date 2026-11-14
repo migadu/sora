@@ -1679,8 +1679,10 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # - Circuit breaker protects against service failures (60% failure rate triggers open state)
 # - Password formats: bcrypt ($2a$...), SSHA512 ({SSHA512}...), SHA512 ({SHA512}...), BLF-CRYPT ($2b$...)
 # - If HTTP endpoint returns 404/3xx → respects lookup_local_users setting (user partitioning)
-# - If HTTP endpoint returns 401/403 → authentication rejected (no fallback)
-# - If HTTP endpoint returns other 4xx/5xx → service unavailable, ALWAYS reject (no fallback)
+# - If HTTP endpoint returns 401/403 → authentication rejected (no fallback); the way to refuse an account
+# - If HTTP endpoint returns other 4xx/5xx, or a 200 that is not JSON with address and password_hash
+#   → service unavailable (no verdict on the password), ALWAYS reject (no fallback); 5xx, 408, 429
+#   and malformed 200s also count toward the circuit breaker
 # - If HTTP endpoint returns 200 with data but auth fails → connection REJECTED (no fallback)
 # - Server addresses normalized: a missing port is filled in as described for "server" above
 # - Timeout for HTTP requests is configurable (default: 5s)
