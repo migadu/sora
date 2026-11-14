@@ -2862,7 +2862,7 @@ var serverLimitKeys = []struct {
 	{"preview_s3_max_size", func(l *ServerLimitsConfig) bool { return l.PreviewS3MaxSize != "" }, []string{"imap"}},
 	// The session memory tracker.
 	{"session_memory_limit", func(l *ServerLimitsConfig) bool { return l.SessionMemoryLimit != "" }, []string{"imap", "pop3"}},
-	// The login proxies' cap on errors (bad commands, refused logins) before authentication.
+	// The login proxies' cap on protocol errors before authentication (wrong passwords do not count).
 	{"max_auth_errors", func(l *ServerLimitsConfig) bool { return l.MaxAuthErrors != 0 }, []string{"imap_proxy", "pop3_proxy", "managesieve_proxy"}},
 	// Sieve on delivery: LMTP and the Admin API's /admin/mail/deliver.
 	{"redirect_rate_limit", func(l *ServerLimitsConfig) bool { return l.RedirectRateLimit != nil }, []string{"lmtp", "http_admin_api"}},

@@ -1758,9 +1758,10 @@ timeouts.absolute_session_timeout = "24h"   # Maximum total session duration fro
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
 # --- AUTHENTICATION ERROR LIMIT ---
-limits.max_auth_errors = 2                  # Number of errors before authentication (bad commands, refused logins) at which
-                                            # the proxy disconnects (default: 2). Protects against malformed commands and
-                                            # protocol abuse during authentication. Recommended: 2-5 for most deployments.
+limits.max_auth_errors = 2                  # Number of protocol errors before authentication (unknown or malformed commands,
+                                            # logins refused without TLS) at which the proxy disconnects (default: 2).
+                                            # Wrong passwords do not count: auth_rate_limit handles those.
+                                            # Protects against protocol abuse during authentication. Recommended: 2-5.
                                             # Only the imap_proxy, pop3_proxy and managesieve_proxy servers apply it.
 
 # --- HTTP-BASED USER ROUTING (REMOTE_LOOKUP) ---
@@ -2170,7 +2171,7 @@ timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (de
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
 # --- AUTHENTICATION ERROR LIMIT ---
-limits.max_auth_errors = 2                  # Disconnect at this many errors before authentication (default: 2). See the IMAP proxy example above.
+limits.max_auth_errors = 2                  # Disconnect at this many protocol errors before authentication (default: 2). See the IMAP proxy example above.
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)
@@ -2230,7 +2231,7 @@ timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (de
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
 # --- AUTHENTICATION ERROR LIMIT ---
-limits.max_auth_errors = 2                  # Disconnect at this many errors before authentication (default: 2). See the IMAP proxy example above.
+limits.max_auth_errors = 2                  # Disconnect at this many protocol errors before authentication (default: 2). See the IMAP proxy example above.
 
 # NOTE: SIEVE extensions are configured globally in the [sieve] section.
 # The proxy should match capabilities from backend servers.
