@@ -14,7 +14,18 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
-func newACMENewOrderRequest(t *testing.T, domain string) *http.Request {
+// exchange is the context autocert runs one ACME exchange under - its cache read, its
+// newOrder requests and its Put - with the deadline autocert gives it: five minutes
+// for a handshake, ten for a renewal.
+func exchange(t *testing.T, timeout time.Duration) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+// newACMENewOrderRequest is a newOrder for domain sent by the exchange ctx belongs to.
+func newACMENewOrderRequest(t *testing.T, ctx context.Context, domain string) *http.Request {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{
 		"identifiers": []map[string]string{{"type": "dns", "value": domain}},
@@ -28,7 +39,7 @@ func newACMENewOrderRequest(t *testing.T, domain string) *http.Request {
 	if err != nil {
 		t.Fatalf("marshal jws: %v", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, "https://acme.example/order", bytes.NewReader(jws))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://acme.example/order", bytes.NewReader(jws))
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
@@ -43,7 +54,7 @@ func (f orderRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error)
 
 func TestCacheMissOrderRetryReleasesClaimAfterPut(t *testing.T) {
 	const domain = "retry.example.com"
-	ctx := context.Background()
+	ctx := exchange(t, 5*time.Minute)
 	fence := newFakeFence()
 	nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
 	gate := newIssuanceGate(emptyCache{}, nodeA)
@@ -57,13 +68,13 @@ func TestCacheMissOrderRetryReleasesClaimAfterPut(t *testing.T) {
 			}
 			return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 		})}
-		resp, _ := rt.RoundTrip(newACMENewOrderRequest(t, domain))
+		resp, _ := rt.RoundTrip(newACMENewOrderRequest(t, ctx, domain))
 		if resp != nil {
 			resp.Body.Close()
 		}
 	}
 	rt := &issuanceFence{manager: nodeA, base: okRoundTripper{}}
-	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, ctx, domain)); err != nil {
 		t.Fatalf("retry newOrder: %v", err)
 	}
 	if err := gate.Put(ctx, domain, []byte("cert")); err != nil {
@@ -76,25 +87,25 @@ func TestCacheMissOrderRetryReleasesClaimAfterPut(t *testing.T) {
 
 func TestFailedRenewalDoesNotLeaveCacheMissOrderReference(t *testing.T) {
 	const domain = "mixed.example.com"
-	ctx := context.Background()
+	handshake, renewal := exchange(t, 5*time.Minute), exchange(t, 10*time.Minute)
 	fence := newFakeFence()
 	nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
 	gate := newIssuanceGate(emptyCache{}, nodeA)
-	if _, err := gate.Get(ctx, domain); !errors.Is(err, autocert.ErrCacheMiss) {
+	if _, err := gate.Get(handshake, domain); !errors.Is(err, autocert.ErrCacheMiss) {
 		t.Fatalf("Get: %v", err)
 	}
 	// The newOrder payload identifies the domain, not RSA/ECDSA. A sibling RSA
 	// renewal can arrive before this ECDSA cache miss's order, and fail later.
-	failedRenewal, err := nodeA.refuseOrderIssuance(ctx, domain)
+	failedRenewal, err := nodeA.refuseOrderIssuance(renewal, domain)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rt := &issuanceFence{manager: nodeA, base: okRoundTripper{}}
-	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, handshake, domain)); err != nil {
 		t.Fatal(err)
 	}
 	nodeA.dropFailedOrderRef(failedRenewal)
-	if err := gate.Put(ctx, domain, []byte("ecdsa-cert")); err != nil {
+	if err := gate.Put(handshake, domain, []byte("ecdsa-cert")); err != nil {
 		t.Fatal(err)
 	}
 	if err := nodeB.refuseIssuance(domain); err != nil {
@@ -107,7 +118,7 @@ func TestLateNewOrderFailureDoesNotDropNewClaimReference(t *testing.T) {
 	ctx := context.Background()
 	fence := newFakeFence()
 	nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
-	oldRef, err := nodeA.refuseOrderIssuance(ctx, domain)
+	oldRef, err := nodeA.refuseOrderIssuance(exchange(t, 10*time.Minute), domain)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,20 +130,21 @@ func TestLateNewOrderFailureDoesNotDropNewClaimReference(t *testing.T) {
 	nodeA.claimMu.Unlock()
 	old.release(ctx)
 	rt := &issuanceFence{manager: nodeA, base: okRoundTripper{}}
-	for range 2 {
-		if _, err := rt.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+	ecdsa, rsa := exchange(t, 10*time.Minute), exchange(t, 10*time.Minute)
+	for _, renewal := range []context.Context{ecdsa, rsa} {
+		if _, err := rt.RoundTrip(newACMENewOrderRequest(t, renewal, domain)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	nodeA.dropFailedOrderRef(oldRef)
 	gate := newIssuanceGate(emptyCache{}, nodeA)
-	if err := gate.Put(ctx, domain, []byte("ecdsa")); err != nil {
+	if err := gate.Put(ecdsa, domain, []byte("ecdsa")); err != nil {
 		t.Fatal(err)
 	}
 	if err := nodeB.refuseIssuance(domain); !errors.Is(err, errIssuanceDeferred) {
 		t.Fatalf("late failure released new sibling's claim: %v", err)
 	}
-	if err := gate.Put(ctx, domain+"+rsa", []byte("rsa")); err != nil {
+	if err := gate.Put(rsa, domain+"+rsa", []byte("rsa")); err != nil {
 		t.Fatal(err)
 	}
 	if err := nodeB.refuseIssuance(domain); err != nil {
@@ -154,7 +166,7 @@ func (okRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 func TestConcurrentCacheMissVariantsKeepClaimUntilLastPut(t *testing.T) {
 	const domain = "mail.example.com"
 	const rsaKey = domain + "+rsa"
-	ctx := context.Background()
+	ecdsa, rsa := exchange(t, 5*time.Minute), exchange(t, 5*time.Minute)
 
 	fence := newFakeFence()
 	nodeA := splitBrainNode(fence)
@@ -163,10 +175,10 @@ func TestConcurrentCacheMissVariantsKeepClaimUntilLastPut(t *testing.T) {
 	rtA := &issuanceFence{manager: nodeA, base: okRoundTripper{}}
 
 	// Both ECDSA and RSA handshakes miss the cache on nodeA.
-	if _, err := gateA.Get(ctx, domain); !errors.Is(err, autocert.ErrCacheMiss) {
+	if _, err := gateA.Get(ecdsa, domain); !errors.Is(err, autocert.ErrCacheMiss) {
 		t.Fatalf("ECDSA Get = %v, want ErrCacheMiss", err)
 	}
-	if _, err := gateA.Get(ctx, rsaKey); !errors.Is(err, autocert.ErrCacheMiss) {
+	if _, err := gateA.Get(rsa, rsaKey); !errors.Is(err, autocert.ErrCacheMiss) {
 		t.Fatalf("RSA Get = %v, want ErrCacheMiss", err)
 	}
 	if got := fence.grantCount(); got != 1 {
@@ -174,10 +186,10 @@ func TestConcurrentCacheMissVariantsKeepClaimUntilLastPut(t *testing.T) {
 	}
 
 	// ECDSA sends newOrder and stores its certificate before RSA sends newOrder.
-	if _, err := rtA.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+	if _, err := rtA.RoundTrip(newACMENewOrderRequest(t, ecdsa, domain)); err != nil {
 		t.Fatalf("ECDSA newOrder: %v", err)
 	}
-	if err := gateA.Put(ctx, domain, []byte("ecdsa-cert")); err != nil {
+	if err := gateA.Put(ecdsa, domain, []byte("ecdsa-cert")); err != nil {
 		t.Fatalf("ECDSA Put: %v", err)
 	}
 
@@ -186,12 +198,12 @@ func TestConcurrentCacheMissVariantsKeepClaimUntilLastPut(t *testing.T) {
 	if err := nodeB.refuseIssuance(domain); !errors.Is(err, errIssuanceDeferred) {
 		t.Fatalf("nodeB was allowed to claim %s while nodeA's RSA order is still in flight: %v", domain, err)
 	}
-	if _, err := rtA.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+	if _, err := rtA.RoundTrip(newACMENewOrderRequest(t, rsa, domain)); err != nil {
 		t.Fatalf("nodeA's own in-flight RSA newOrder was refused after ECDSA Put: %v", err)
 	}
 
 	// Once RSA stores its certificate as well, the claim must be released.
-	if err := gateA.Put(ctx, rsaKey, []byte("rsa-cert")); err != nil {
+	if err := gateA.Put(rsa, rsaKey, []byte("rsa-cert")); err != nil {
 		t.Fatalf("RSA Put: %v", err)
 	}
 	if err := nodeB.refuseIssuance(domain); err != nil {
@@ -207,7 +219,7 @@ func TestConcurrentCacheMissVariantsKeepClaimUntilLastPut(t *testing.T) {
 func TestConcurrentRenewalVariantsKeepClaimUntilLastPut(t *testing.T) {
 	const domain = "mail.example.com"
 	const rsaKey = domain + "+rsa"
-	ctx := context.Background()
+	ecdsa, rsa := exchange(t, 10*time.Minute), exchange(t, 10*time.Minute)
 
 	fence := newFakeFence()
 	nodeA := splitBrainNode(fence)
@@ -216,10 +228,10 @@ func TestConcurrentRenewalVariantsKeepClaimUntilLastPut(t *testing.T) {
 	rtA := &issuanceFence{manager: nodeA, base: okRoundTripper{}}
 
 	// Both ECDSA and RSA renewal goroutines post newOrder on nodeA.
-	if _, err := rtA.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+	if _, err := rtA.RoundTrip(newACMENewOrderRequest(t, ecdsa, domain)); err != nil {
 		t.Fatalf("ECDSA renewal newOrder: %v", err)
 	}
-	if _, err := rtA.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+	if _, err := rtA.RoundTrip(newACMENewOrderRequest(t, rsa, domain)); err != nil {
 		t.Fatalf("RSA renewal newOrder: %v", err)
 	}
 	if got := fence.grantCount(); got != 1 {
@@ -227,7 +239,7 @@ func TestConcurrentRenewalVariantsKeepClaimUntilLastPut(t *testing.T) {
 	}
 
 	// ECDSA renewal finishes first.
-	if err := gateA.Put(ctx, domain, []byte("ecdsa-renewed")); err != nil {
+	if err := gateA.Put(ecdsa, domain, []byte("ecdsa-renewed")); err != nil {
 		t.Fatalf("ECDSA renewal Put: %v", err)
 	}
 	if err := nodeB.refuseIssuance(domain); !errors.Is(err, errIssuanceDeferred) {
@@ -235,7 +247,7 @@ func TestConcurrentRenewalVariantsKeepClaimUntilLastPut(t *testing.T) {
 	}
 
 	// RSA renewal finishes second; now the claim is released.
-	if err := gateA.Put(ctx, rsaKey, []byte("rsa-renewed")); err != nil {
+	if err := gateA.Put(rsa, rsaKey, []byte("rsa-renewed")); err != nil {
 		t.Fatalf("RSA renewal Put: %v", err)
 	}
 	if err := nodeB.refuseIssuance(domain); err != nil {
@@ -274,7 +286,11 @@ func TestStaleVariantPutKeepsNewerClaim(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			const domain = "mail.example.com"
 			const rsaKey = domain + "+rsa"
-			ctx := context.Background()
+			rsa := exchange(t, 10*time.Minute)
+			if tc.cacheMiss {
+				rsa = exchange(t, 5*time.Minute)
+			}
+			ecdsa := exchange(t, 10*time.Minute)
 			fence := newFakeFence()
 			nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
 			gate := newIssuanceGate(emptyCache{}, nodeA)
@@ -285,11 +301,11 @@ func TestStaleVariantPutKeepsNewerClaim(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.cacheMiss {
-				if _, err := gate.Get(ctx, rsaKey); !errors.Is(err, autocert.ErrCacheMiss) {
+				if _, err := gate.Get(rsa, rsaKey); !errors.Is(err, autocert.ErrCacheMiss) {
 					t.Fatalf("RSA Get = %v, want ErrCacheMiss", err)
 				}
 			}
-			if _, err := rt.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+			if _, err := rt.RoundTrip(newACMENewOrderRequest(t, rsa, domain)); err != nil {
 				t.Fatalf("RSA newOrder: %v", err)
 			}
 
@@ -297,21 +313,21 @@ func TestStaleVariantPutKeepsNewerClaim(t *testing.T) {
 
 			// The ECDSA renewal reads a cached certificate, so no cache miss holds the
 			// fresh claim it takes: only its order does.
-			if _, err := rt.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+			if _, err := rt.RoundTrip(newACMENewOrderRequest(t, ecdsa, domain)); err != nil {
 				t.Fatalf("ECDSA newOrder: %v", err)
 			}
 			if got := fence.grantCount(); got != 2 {
 				t.Fatalf("fence grants = %d, want 2: the ECDSA order must take a fresh claim", got)
 			}
 
-			if err := gate.Put(ctx, rsaKey, []byte("rsa-cert")); err != nil {
+			if err := gate.Put(rsa, rsaKey, []byte("rsa-cert")); err != nil {
 				t.Fatal(err)
 			}
 			if err := nodeB.refuseIssuance(domain); !errors.Is(err, errIssuanceDeferred) {
 				t.Fatalf("the RSA order from the lapsed claim gave away the claim the ECDSA order still runs under: nodeB = %v", err)
 			}
 
-			if err := gate.Put(ctx, domain, []byte("ecdsa-cert")); err != nil {
+			if err := gate.Put(ecdsa, domain, []byte("ecdsa-cert")); err != nil {
 				t.Fatal(err)
 			}
 			if err := nodeB.refuseIssuance(domain); err != nil {
@@ -325,7 +341,7 @@ func TestStaleVariantPutKeepsNewerClaim(t *testing.T) {
 // Put must not give away the claim the sibling variant took once the fence was back.
 func TestUnfencedVariantPutKeepsLaterClaim(t *testing.T) {
 	const domain = "mail.example.com"
-	ctx := context.Background()
+	rsa, ecdsa := exchange(t, 10*time.Minute), exchange(t, 10*time.Minute)
 	fence := newFakeFence()
 	nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
 	gate := newIssuanceGate(emptyCache{}, nodeA)
@@ -334,27 +350,27 @@ func TestUnfencedVariantPutKeepsLaterClaim(t *testing.T) {
 	fence.mu.Lock()
 	fence.err = errors.New("database unreachable")
 	fence.mu.Unlock()
-	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, rsa, domain)); err != nil {
 		t.Fatalf("RSA newOrder with the fence unreachable: %v", err)
 	}
 	fence.mu.Lock()
 	fence.err = nil
 	fence.mu.Unlock()
-	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, ecdsa, domain)); err != nil {
 		t.Fatalf("ECDSA newOrder: %v", err)
 	}
 	if got := fence.grantCount(); got != 1 {
 		t.Fatalf("fence grants = %d, want 1", got)
 	}
 
-	if err := gate.Put(ctx, domain+"+rsa", []byte("rsa-cert")); err != nil {
+	if err := gate.Put(rsa, domain+"+rsa", []byte("rsa-cert")); err != nil {
 		t.Fatal(err)
 	}
 	if err := nodeB.refuseIssuance(domain); !errors.Is(err, errIssuanceDeferred) {
 		t.Fatalf("the unfenced RSA order gave away the claim the ECDSA order still runs under: nodeB = %v", err)
 	}
 
-	if err := gate.Put(ctx, domain, []byte("ecdsa-cert")); err != nil {
+	if err := gate.Put(ecdsa, domain, []byte("ecdsa-cert")); err != nil {
 		t.Fatal(err)
 	}
 	if err := nodeB.refuseIssuance(domain); err != nil {
@@ -368,7 +384,6 @@ func TestUnfencedVariantPutKeepsLaterClaim(t *testing.T) {
 // nothing has failed.
 func TestFinishedExchangeDoesNotHoldLaterClaim(t *testing.T) {
 	const domain = "mail.example.com"
-	ctx := context.Background()
 	fence := newFakeFence()
 	nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
 	gate := newIssuanceGate(emptyCache{}, nodeA)
@@ -376,24 +391,112 @@ func TestFinishedExchangeDoesNotHoldLaterClaim(t *testing.T) {
 
 	// A handshake's miss is ordered and the order accepted, then the exchange fails, so
 	// no Put follows.
-	ended, cancel := context.WithDeadline(ctx, time.Now().Add(-time.Hour))
+	ended, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
 	defer cancel()
 	if _, err := gate.Get(ended, domain+"+rsa"); !errors.Is(err, autocert.ErrCacheMiss) {
 		t.Fatalf("failed exchange's Get = %v, want ErrCacheMiss", err)
 	}
-	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, domain).WithContext(ended)); err != nil {
+	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, ended, domain)); err != nil {
 		t.Fatalf("failed exchange's newOrder: %v", err)
 	}
 
 	lapseClaim(t, nodeA, domain)
 
-	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, domain)); err != nil {
+	next := exchange(t, 10*time.Minute)
+	if _, err := rt.RoundTrip(newACMENewOrderRequest(t, next, domain)); err != nil {
 		t.Fatalf("next newOrder: %v", err)
 	}
-	if err := gate.Put(ctx, domain, []byte("cert")); err != nil {
+	if err := gate.Put(next, domain, []byte("cert")); err != nil {
 		t.Fatal(err)
 	}
 	if err := nodeB.refuseIssuance(domain); err != nil {
 		t.Fatalf("an exchange that ended an hour ago kept the later claim held: %v", err)
+	}
+}
+
+// autocert's GetCertificate stores the certificate for every handshake that missed the
+// cache, also for one that only waited for another handshake's order: createCert hands
+// the waiter the certificate, and GetCertificate then calls cachePut for it (x/crypto
+// v0.55.0 acme/autocert). The owner releases the waiter before it stores the
+// certificate itself, so the waiter's Put can come first. That Put completes no order,
+// and must not stand in for the sibling variant's renewal, which is still ordering.
+func TestWaitingHandshakePutKeepsSiblingOrderClaim(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		waiterFirst bool
+	}{
+		{name: "waiter stores first", waiterFirst: true},
+		{name: "owner stores first"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const domain = "mail.example.com"
+			fence := newFakeFence()
+			nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
+			gate := newIssuanceGate(emptyCache{}, nodeA)
+			rt := &issuanceFence{manager: nodeA, base: okRoundTripper{}}
+
+			// The RSA certificate is still cached, so its renewal misses nothing: only
+			// its order holds the claim.
+			rsaRenewal := exchange(t, 10*time.Minute)
+			if _, err := rt.RoundTrip(newACMENewOrderRequest(t, rsaRenewal, domain)); err != nil {
+				t.Fatalf("RSA renewal newOrder: %v", err)
+			}
+
+			// Two handshakes miss the ECDSA certificate; the owner orders it, the waiter
+			// waits for that order.
+			owner, waiter := exchange(t, 5*time.Minute), exchange(t, 5*time.Minute)
+			for _, handshake := range []context.Context{owner, waiter} {
+				if _, err := gate.Get(handshake, domain); !errors.Is(err, autocert.ErrCacheMiss) {
+					t.Fatalf("ECDSA Get = %v, want ErrCacheMiss", err)
+				}
+			}
+			if _, err := rt.RoundTrip(newACMENewOrderRequest(t, owner, domain)); err != nil {
+				t.Fatalf("ECDSA newOrder: %v", err)
+			}
+
+			puts := []context.Context{owner, waiter}
+			if tc.waiterFirst {
+				puts = []context.Context{waiter, owner}
+			}
+			for _, handshake := range puts {
+				if err := gate.Put(handshake, domain, []byte("ecdsa-cert")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := nodeB.refuseIssuance(domain); !errors.Is(err, errIssuanceDeferred) {
+				t.Fatalf("the ECDSA handshakes gave away the claim the RSA renewal still runs under: nodeB = %v", err)
+			}
+
+			if err := gate.Put(rsaRenewal, domain+"+rsa", []byte("rsa-cert")); err != nil {
+				t.Fatal(err)
+			}
+			if err := nodeB.refuseIssuance(domain); err != nil {
+				t.Fatalf("claim was not released after every order stored its certificate: %v", err)
+			}
+		})
+	}
+}
+
+// autocert tries one challenge type per order and starts a new order for the next type
+// when one fails (verifyRFC), so one exchange can send several accepted newOrders. Its
+// Put ends the exchange, and with it every one of them.
+func TestPutCompletesEveryOrderOfItsExchange(t *testing.T) {
+	const domain = "mail.example.com"
+	fence := newFakeFence()
+	nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
+	gate := newIssuanceGate(emptyCache{}, nodeA)
+	rt := &issuanceFence{manager: nodeA, base: okRoundTripper{}}
+
+	renewal := exchange(t, 10*time.Minute)
+	for _, challenge := range []string{"tls-alpn-01", "http-01"} {
+		if _, err := rt.RoundTrip(newACMENewOrderRequest(t, renewal, domain)); err != nil {
+			t.Fatalf("newOrder for %s: %v", challenge, err)
+		}
+	}
+	if err := gate.Put(renewal, domain, []byte("cert")); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodeB.refuseIssuance(domain); err != nil {
+		t.Fatalf("the exchange stored its certificate but its first order still holds the claim: %v", err)
 	}
 }
