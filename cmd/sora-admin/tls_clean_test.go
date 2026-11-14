@@ -10,8 +10,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -189,5 +191,61 @@ func TestTLSCleanFailsWhenLocalDeleteFails(t *testing.T) {
 
 	if err := cleanTLSCertificates(context.Background(), cfg, cacheDir, false, true); err == nil {
 		t.Fatal("cleanTLSCertificates succeeded although the expired local copies could not be removed")
+	}
+}
+
+// TestTLSCleanStaysInTheCacheDir: the local file clean removes is named by an autocert
+// cache name, never by whatever name an expired certificate in the bucket carries. A
+// certificate for "../victim" stored under that name's key must not make clean remove
+// a file next to the cache directory (#937).
+func TestTLSCleanStaysInTheCacheDir(t *testing.T) {
+	stub, endpoint := newTLSStubS3(t)
+	cfg := tlsTestConfig(endpoint)
+	parent := t.TempDir()
+	cacheDir := filepath.Join(parent, "certs")
+	if err := os.Mkdir(cacheDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(parent, "victim")
+	if err := os.WriteFile(victim, []byte("not a certificate"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stub.put("certs", tlsmanager.S3ObjectKey("../victim"), autocertEntry(t, "../victim", false, time.Now().Add(-24*time.Hour)))
+
+	if err := cleanTLSCertificates(context.Background(), cfg, cacheDir, false, true); err != nil {
+		t.Fatalf("cleanTLSCertificates: %v", err)
+	}
+
+	if got := stub.keys(); len(got) != 0 {
+		t.Errorf("S3 objects after clean = %v, want none", got)
+	}
+	if _, err := os.Stat(victim); err != nil {
+		t.Errorf("file outside the cache directory: %v", err)
+	}
+}
+
+// TestTLSCleanFailsWhenACertificateCannotBeRead: clean cannot tell whether a certificate
+// it failed to download has expired, so it must not report success; the certificates it
+// did read are still cleaned.
+func TestTLSCleanFailsWhenACertificateCannotBeRead(t *testing.T) {
+	stub := &tlsStubS3{objects: make(map[string][]byte)}
+	unreadable := "/certs/" + tlsmanager.S3ObjectKey("mail.example.com")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == unreadable {
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>stub failure</Message></Error>`)
+			return
+		}
+		stub.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	cfg := tlsTestConfig(srv.URL)
+	putExpiredEntries(t, cfg, t.TempDir(), "mail.example.com")
+
+	if err := cleanTLSCertificates(context.Background(), cfg, t.TempDir(), false, true); err == nil {
+		t.Fatal("cleanTLSCertificates succeeded although it could not read a certificate")
+	}
+	if got, want := stub.keys(), []string{unreadable}; !slices.Equal(got, want) {
+		t.Errorf("S3 objects after clean = %v, want only the unreadable %v", got, want)
 	}
 }
