@@ -552,17 +552,32 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 		// Check if origin is allowed
 		allowedOrigins := s.settings.Load().allowedOrigins
 		if len(allowedOrigins) > 0 {
-			wildcard := slices.Contains(allowedOrigins, "*")
+			// The first matching entry decides: "*" answers with a literal "*",
+			// a listed origin is reflected with credentials.
+			allowed := false
+			wildcard := false
+			for _, allowedOrigin := range allowedOrigins {
+				if allowedOrigin == "*" {
+					allowed = true
+					wildcard = true
+					break
+				}
+				if origin != "" && allowedOrigin == origin {
+					allowed = true
+					break
+				}
+			}
 			// Fetch Standard, "CORS protocol and HTTP caches": a "*" is sent on
 			// every response, CORS request or not, and needs no Vary; an answer
 			// that depends on the request's Origin needs Vary: Origin on every
 			// response, including the ones that do not reflect it, or a cache can
-			// answer one origin with a response stored for another.
-			if !wildcard {
+			// answer one origin with a response stored for another. The answer is
+			// the same "*" for everyone only when "*" is the first entry.
+			if allowedOrigins[0] != "*" {
 				w.Header().Add("Vary", "Origin")
 			}
 
-			if wildcard || (origin != "" && slices.Contains(allowedOrigins, origin)) {
+			if allowed {
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 				w.Header().Set("Access-Control-Max-Age", "3600")

@@ -117,6 +117,38 @@ func TestCORSMiddlewareVaryOrigin(t *testing.T) {
 		}
 	})
 
+	// The first matching entry decides, as before Vary was added: an origin listed
+	// before "*" keeps its credentialed answer, and since the answer then depends on
+	// the Origin every response says Vary: Origin. A "*" listed first answers every
+	// request with the static "*".
+	for _, tc := range []struct {
+		name            string
+		origins         []string
+		origin          string
+		wantAllowOrigin string
+		wantCredentials string
+		wantVary        bool
+	}{
+		{"origin before * is reflected", []string{"https://app.example.com", "*"}, "https://app.example.com", "https://app.example.com", "true", true},
+		{"origin before *, other origin", []string{"https://app.example.com", "*"}, "https://other.example", "*", "", true},
+		{"origin before *, no origin", []string{"https://app.example.com", "*"}, "", "*", "", true},
+		{"* first wins", []string{"*", "https://app.example.com"}, "https://app.example.com", "*", "", false},
+		{"* first, no origin", []string{"*", "https://app.example.com"}, "", "*", "", false},
+	} {
+		t.Run("mixed/"+tc.name, func(t *testing.T) {
+			rec := serve(tc.origins, http.MethodGet, tc.origin)
+			if got := rec.Header().Get("Access-Control-Allow-Origin"); got != tc.wantAllowOrigin {
+				t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, tc.wantAllowOrigin)
+			}
+			if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != tc.wantCredentials {
+				t.Errorf("Access-Control-Allow-Credentials = %q, want %q", got, tc.wantCredentials)
+			}
+			if got := hasVaryOrigin(rec.Header()); got != tc.wantVary {
+				t.Errorf("Vary = %q, want Vary: Origin %v", rec.Header().Values("Vary"), tc.wantVary)
+			}
+		})
+	}
+
 	t.Run("no allowed origins", func(t *testing.T) {
 		rec := serve(nil, http.MethodGet, "https://app.example.com")
 		if hasVaryOrigin(rec.Header()) {
