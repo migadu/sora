@@ -10,12 +10,16 @@
 -- This copies them into messages_fts_v2, one row per (body, mailbox owner) as 000050 does,
 -- for every body some message holds, together with any text an older binary stored in
 -- message_contents after 23 ran (text without a vector), which the FTS worker then tokenises.
--- A row that already exists is left as it is. It needs messages_fts_v2: on a database between
--- 23 and 49, migrate first.
+-- A nonempty legacy vector also repairs a destination with neither text nor a nonempty
+-- vector: COPY/restaging can leave a placeholder, and the worker can mark it with an empty
+-- vector after its only sibling source is purged. Existing queued text, nonempty vectors
+-- and destination timestamps are preserved. Legacy text alone never resets an empty/poison
+-- vector; inspect those unresolved pairs separately rather than repeatedly retrying text
+-- PostgreSQL may not be able to tokenize. It needs messages_fts_v2: between 23 and 49, migrate first.
 --
 -- WHO NEEDS IT. A database that ran 23 before #791, unless the vectors were copied out of
 -- band at the time. This counts, in a sample of message_contents, the bodies that a message's
--- mailbox owner has no messages_fts_v2 row for. A nonzero result confirms missing rows;
+-- mailbox owner has no usable messages_fts_v2 row for. A nonzero result confirms unresolved pairs;
 -- zero in a sample is not proof that every row has been recovered. Include queued text as
 -- well as vectors. For an exhaustive check, remove LIMIT 10000. With
 -- fts_retention set, rows older than it are missing from messages_fts_v2 on purpose, so add
@@ -26,7 +30,12 @@
 --                 WHERE m.content_hash = mc.content_hash
 --                   AND NOT EXISTS (SELECT 1 FROM messages_fts_v2 v
 --                                   WHERE v.content_hash = m.content_hash
---                                     AND v.account_id = COALESCE(mb.account_id, m.account_id)));
+--                                     AND v.account_id = COALESCE(mb.account_id, m.account_id)
+--                                     AND (v.text_body IS NOT NULL OR length(v.text_body_tsv) > 0)));
+-- This deliberately flags empty vectors as well as textless/vectorless placeholders.
+-- An empty vector can be valid (no searchable lexemes) or poison; verify such pairs against
+-- the legacy source/body before cleanup. Queued destination text is preserved and must be
+-- processed successfully by the FTS worker before the final exhaustive check and DROP.
 --
 -- HOW TO RUN, on a running system:
 --   psql -h <primary> -d <db> -f scripts/fts_recover_message_contents.sql   -- defines the functions
@@ -52,7 +61,9 @@
 -- message_contents be dropped to free its space. Do not drop it during a rolling upgrade.
 
 -- One batch: the next p_batch bodies after p_after that have a vector or text. Returns the rows
--- added, the bodies read and the last of them, where the next batch starts.
+-- restored (inserted or repaired), the bodies read and the last of them, where the next batch starts.
+-- The historical output column name "inserted" is retained so reloading this script can
+-- CREATE OR REPLACE an already defined function; its count includes repaired rows too.
 --
 -- The cursor is a single comparison, not "p_after IS NULL OR content_hash > p_after": in a
 -- generic plan the OR cannot be an index condition, and every batch would rescan the table from
@@ -67,7 +78,7 @@ LANGUAGE sql AS $$
 		ORDER BY content_hash
 		LIMIT p_batch
 	), ins AS (
-		INSERT INTO messages_fts_v2 (content_hash, account_id, text_body, text_body_tsv, sent_date, created_at)
+		INSERT INTO messages_fts_v2 AS dest (content_hash, account_id, text_body, text_body_tsv, sent_date, created_at)
 		SELECT mc.content_hash, p.account_id,
 		       CASE WHEN mc.text_body_tsv IS NULL THEN mc.text_body END,
 		       mc.text_body_tsv, mc.sent_date, mc.created_at
@@ -78,7 +89,11 @@ LANGUAGE sql AS $$
 			FROM messages m LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
 			WHERE m.content_hash = b.content_hash
 		) p
-		ON CONFLICT (content_hash, account_id) DO NOTHING
+		ON CONFLICT (content_hash, account_id) DO UPDATE
+		SET text_body_tsv = EXCLUDED.text_body_tsv
+		WHERE dest.text_body IS NULL
+		  AND (dest.text_body_tsv IS NULL OR length(dest.text_body_tsv) = 0)
+		  AND length(EXCLUDED.text_body_tsv) > 0
 		RETURNING 1
 	)
 	SELECT (SELECT count(*) FROM ins), (SELECT count(*) FROM batch),
@@ -105,10 +120,10 @@ BEGIN
 		total := total + r.inserted;
 		cur := r.last_hash;
 		COMMIT;
-		RAISE NOTICE '% bodies up to %: % rows added, % in this run. Resume with: CALL sora_fts_recover_message_contents(%, %, %)',
+		RAISE NOTICE '% bodies up to %: % rows restored, % in this run. Resume with: CALL sora_fts_recover_message_contents(%, %, %)',
 			r.bodies, cur, r.inserted, total, quote_literal(cur), p_batch, p_sleep_ms;
 		PERFORM pg_sleep(p_sleep_ms / 1000.0);
 	END LOOP;
-	RAISE NOTICE 'done: % rows added in this run', total;
+	RAISE NOTICE 'done: % rows restored in this run', total;
 END
 $$;
