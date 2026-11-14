@@ -1267,7 +1267,7 @@ func (s *SieveConfig) GetMaxExecutionTime() time.Duration {
 // restarts and prevent thundering herd on the PostgreSQL database.
 type AuthCacheConfig struct {
 	Enabled         bool   `toml:"enabled"`          // Enable persistent auth cache (default: false)
-	Path            string `toml:"path"`             // SQLite database path (default: "/tmp/sora/auth_cache.db")
+	Path            string `toml:"path"`             // SQLite database path (default: DefaultAuthCachePath)
 	MaxAge          string `toml:"max_age"`          // Max age for cached entries (default: "24h")
 	CleanupInterval string `toml:"cleanup_interval"` // How often to purge old entries (default: "1h")
 	PurgeUnused     string `toml:"purge_unused"`     // Purge entries unused for this duration (default: "168h" = 7 days)
@@ -1433,6 +1433,20 @@ func (c *Config) GetBcryptCost() int {
 	return cost
 }
 
+// Default local paths. Nothing sora must keep across a restart defaults to /tmp: a
+// staged upload is the only copy of its message body until it reaches S3, and /tmp is
+// emptied at boot on most systems and on every stop under systemd's PrivateTmp=. The
+// directories match dist/sora.service (/var/spool/sora, CacheDirectory=sora).
+const (
+	DefaultUploaderPath   = "/var/spool/sora/uploads"
+	DefaultLocalCachePath = "/var/cache/sora/cache"
+	DefaultAuthCachePath  = "/var/cache/sora/auth_cache.db"
+
+	// LegacyDefaultUploaderPath is the [uploader] path default of earlier releases.
+	// Bodies a node staged there are stranded if it starts with the new default.
+	LegacyDefaultUploaderPath = "/tmp/sora/uploads"
+)
+
 // NewDefaultConfig creates a Config struct with default values.
 func NewDefaultConfig() Config {
 	return Config{
@@ -1490,7 +1504,7 @@ func NewDefaultConfig() Config {
 		LocalCache: LocalCacheConfig{
 			Capacity:           "1gb",
 			MaxObjectSize:      "5mb",
-			Path:               "/tmp/sora/cache",
+			Path:               DefaultLocalCachePath,
 			MetricsInterval:    "5m",
 			MetricsRetention:   "30d",
 			PurgeInterval:      "12h",
@@ -1499,6 +1513,9 @@ func NewDefaultConfig() Config {
 			WarmupMessageCount: 50,
 			WarmupMailboxes:    []string{"INBOX"},
 			WarmupAsync:        true,
+		},
+		AuthCache: AuthCacheConfig{
+			Path: DefaultAuthCachePath,
 		},
 		Metadata: MetadataConfig{
 			MaxEntrySize:         65536,   // 64KB per entry
@@ -1521,7 +1538,7 @@ func NewDefaultConfig() Config {
 			TrustedNetworks: nil,
 		},
 		Uploader: UploaderConfig{
-			Path:          "/tmp/sora/uploads",
+			Path:          DefaultUploaderPath,
 			BatchSize:     10,
 			Concurrency:   20,
 			MaxAttempts:   DefaultUploaderMaxAttempts,

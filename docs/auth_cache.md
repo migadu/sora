@@ -53,7 +53,7 @@ purge_unused = "168h"      # 7 days - entries unused for this long are removed
 | Parameter | Default | Description |
 |---|---|---|
 | `enabled` | `false` | Enable the persistent auth cache |
-| `path` | `/tmp/sora/auth_cache.db` | Path to the SQLite database file |
+| `path` | `/var/cache/sora/auth_cache.db` | Path to the SQLite database file |
 | `max_age` | `24h` | Maximum age before an entry is considered expired |
 | `cleanup_interval` | `1h` | How often the cleanup loop runs to purge stale entries |
 | `purge_unused` | `168h` (7 days) | Entries unused for this duration are removed |

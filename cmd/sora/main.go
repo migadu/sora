@@ -649,7 +649,17 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		}
 	}
 
-	// Initialize S3 storage if needed
+	// Check the staging path before any uploader or cleanup worker starts.
+	if storageServicesNeeded {
+		// The default [uploader] path moved off /tmp. Before any worker starts, refuse to
+		// strand bodies a previous release staged at the old default.
+		if err := uploader.CheckLegacyStaging(cfg.Uploader.Path, config.DefaultUploaderPath, config.LegacyDefaultUploaderPath); err != nil {
+			errorHandler.ValidationError("uploader path", err)
+			os.Exit(errorHandler.WaitForExit())
+		}
+	}
+
+	// Initialize S3 storage for mail services or a User API body reader.
 	if s3Needed {
 		// Ensure required S3 arguments are provided only if needed
 		if cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
@@ -708,7 +718,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	if cfg.AuthCache.Enabled {
 		acPath := cfg.AuthCache.Path
 		if acPath == "" {
-			acPath = "/tmp/sora/auth_cache.db"
+			acPath = config.DefaultAuthCachePath
 		}
 		acMaxAge := cfg.AuthCache.GetMaxAgeWithDefault()
 		acPurgeUnused := cfg.AuthCache.GetPurgeUnusedWithDefault()
