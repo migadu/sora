@@ -664,6 +664,11 @@ instance_liveness_threshold = "7d" # How long an uploader instance must be silen
 #   - Sieve redirect action: forward messages to external email addresses
 #   - Sieve vacation action: send auto-reply vacation responses
 #
+# Vacation replies are sent from the null reverse-path (RFC 5230 §5.1): MAIL FROM:<> on the
+# SMTP relay, "from": "" in the HTTP relay's request. The relay must accept that. With a
+# null reverse-path SPF checks the HELO name (RFC 7208 §2.4), so DMARC for the user's domain
+# passes only on a DKIM signature aligned with the reply's From address.
+#
 # You can choose between SMTP or HTTP relay:
 #   - SMTP: Traditional SMTP relay (most common)
 #   - HTTP: HTTP API relay for services that provide REST API for email delivery
