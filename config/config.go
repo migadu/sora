@@ -527,9 +527,9 @@ type AuthRateLimiterConfig struct {
 	DelayMultiplier     float64       `toml:"delay_multiplier"`      // Delay increase factor
 
 	// Memory safety limits (prevents unbounded growth during burst attacks)
-	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username tracking entries (0 = unlimited, default: 100000)
-	MaxIPEntries         int `toml:"max_ip_entries"`          // Maximum IP failure tracking entries (0 = unlimited, default: 50000)
-	MaxUsernameEntries   int `toml:"max_username_entries"`    // Maximum username tracking entries (0 = unlimited, default: 50000)
+	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username tracking entries (default: 100000)
+	MaxIPEntries         int `toml:"max_ip_entries"`          // Maximum IP failure tracking entries (default: 50000)
+	MaxUsernameEntries   int `toml:"max_username_entries"`    // Maximum username tracking entries (default: 50000)
 
 	// Networks exempt from IP-based blocking (Tier 1 IP+username and Tier 2 IP-only).
 	// Username statistics are still tracked even for exempt IPs.
