@@ -2093,6 +2093,9 @@ func (cm *ConnectionManager) HasRouting() bool {
 // LookupUserRoute performs a user routing lookup if configured.
 // Note: This is routing-only lookup, so password is empty. clientIP is the real
 // client's IP, the remotelookup URL's $ip placeholder.
+//
+// A user the lookup does not know (404/3xx), the only answer lookup_local_users applies
+// to, is (nil, nil). An account it refused (401/403) is ErrRemoteLookupRefused.
 func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email, clientIP string) (*UserRoutingInfo, error) {
 	if !cm.HasRouting() || email == "" {
 		return nil, nil
@@ -2102,8 +2105,11 @@ func (cm *ConnectionManager) LookupUserRoute(ctx context.Context, email, clientI
 	if err != nil {
 		return nil, err
 	}
-	if authResult == AuthUserNotFound {
+	switch authResult {
+	case AuthUserNotFound:
 		return nil, nil
+	case AuthFailed:
+		return nil, ErrRemoteLookupRefused
 	}
 	return info, nil
 }
@@ -2154,8 +2160,9 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		result.RoutingInfo, lookupErr = cm.LookupUserRoute(routingCtx, params.Username, params.ClientIP)
 		routingCancel()
 		if lookupErr != nil && cm.HasNamedPools() {
-			// No answer is no pool: routing on would put the user in the default pool,
-			// where the account need not live, and drop their affinity in the real one.
+			// No answer, or a refusal of the account (ErrRemoteLookupRefused), is no pool:
+			// routing on would put the user in the default pool, where the account need
+			// not live, and drop their affinity in the real one.
 			logger.Warn("Routing lookup failed - refusing to route without a pool", "proxy", params.ProxyName, "user", params.Username, "error", lookupErr)
 			return result, fmt.Errorf("%w: %w", ErrRouteLookupFailed, lookupErr)
 		}
