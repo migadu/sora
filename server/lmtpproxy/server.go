@@ -291,10 +291,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 			logger.Info("LMTP Proxy: Invalid cleanup interval in auth cache config, using default (5m)", "name", opts.Name, "error", err)
 			cleanupInterval = 5 * time.Minute
 		}
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize <= 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// LMTP proxy doesn't do password validation, so positive revalidation window is not needed (use 0)
 		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, 0)

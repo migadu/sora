@@ -582,9 +582,11 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 	}
 }
 
-// LookupCacheConfig holds configuration for authentication result caching
+// LookupCacheConfig holds configuration for authentication result caching.
+// A [server.lookup_cache] table is decoded on top of DefaultLookupCacheConfig
+// (see UnmarshalTOML), so the keys it leaves out, enabled included, keep their defaults.
 type LookupCacheConfig struct {
-	Enabled                    bool   `toml:"enabled"`                      // Enable in-memory caching of authentication results
+	Enabled                    bool   `toml:"enabled"`                      // Enable in-memory caching of authentication results (default: true; the User API and its proxy cache only with a lookup_cache table)
 	PositiveTTL                string `toml:"positive_ttl"`                 // TTL for successful auth (default: "5m")
 	NegativeTTL                string `toml:"negative_ttl"`                 // TTL for failed auth (default: "1m")
 	MaxSize                    int    `toml:"max_size"`                     // Maximum number of cached entries (default: 50000)
@@ -602,6 +604,44 @@ func DefaultLookupCacheConfig() LookupCacheConfig {
 		CleanupInterval:            "5m",  // Clean up expired entries every 5 minutes
 		PositiveRevalidationWindow: "30s", // Allow password change detection after 30 seconds
 	}
+}
+
+// UnmarshalTOML decodes a [server.lookup_cache] table on top of
+// DefaultLookupCacheConfig, so a table that only tunes, say, positive_ttl leaves
+// the cache enabled with the default max_size. Decoded field by field, an omitted
+// enabled would be false and turn the cache off.
+func (c *LookupCacheConfig) UnmarshalTOML(data any) error {
+	table, ok := data.(map[string]any)
+	if !ok {
+		return fmt.Errorf("lookup_cache must be a table, got %T", data)
+	}
+	// Decode the table's own keys again, into a copy of the defaults. The plain
+	// type has no UnmarshalTOML, so this decodes field by field.
+	var buf strings.Builder
+	if err := toml.NewEncoder(&buf).Encode(table); err != nil {
+		return fmt.Errorf("lookup_cache: %w", err)
+	}
+	type plain LookupCacheConfig
+	decoded := plain(DefaultLookupCacheConfig())
+	md, err := toml.Decode(buf.String(), &decoded)
+	if err != nil {
+		return fmt.Errorf("lookup_cache: %w", err)
+	}
+	// The outer decoder counts every key of a table handled here as decoded, so
+	// report unknown ones here.
+	for _, key := range md.Undecoded() {
+		log.Printf("WARNING: Unknown key 'lookup_cache.%s' will be ignored", key)
+	}
+	*c = LookupCacheConfig(decoded)
+	return nil
+}
+
+// GetMaxSize returns max_size, or the default (50000) when it is zero or negative.
+func (c *LookupCacheConfig) GetMaxSize() int {
+	if c.MaxSize <= 0 {
+		return DefaultLookupCacheConfig().MaxSize
+	}
+	return c.MaxSize
 }
 
 // GetPositiveTTL parses and returns the positive TTL duration

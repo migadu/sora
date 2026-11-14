@@ -180,10 +180,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 			cleanupInterval = 5 * time.Minute
 		}
 
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize == 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
 		if err != nil {
