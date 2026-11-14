@@ -1,8 +1,10 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/migadu/go-imap"
 )
@@ -200,6 +202,15 @@ func (v *SearchCriteriaValidator) validateNode(criteria *imap.SearchCriteria, re
 		result.addErrorWithLimit(fieldPrefix+"flags", fmt.Sprintf("too many flag filters: %d (max: %d)",
 			len(criteria.Flag)+len(criteria.NotFlag), v.MaxFlagFilters), nil, true)
 	}
+	// A KEYWORD is bound as text like a string term, and go-imap's atom admits
+	// the bytes 0xA0-0xFF, so it can hold bytes that are not UTF-8.
+	for _, flags := range [2][]imap.Flag{criteria.Flag, criteria.NotFlag} {
+		for _, flag := range flags {
+			if err := validateSearchString(string(flag)); err != nil {
+				result.addError(fieldPrefix+"flags", "keyword "+err.Error(), flag)
+			}
+		}
+	}
 
 	// Validate headers
 	for i, header := range criteria.Header {
@@ -279,9 +290,8 @@ func (v *SearchCriteriaValidator) validateTextTerms(terms []string, fieldName st
 			return fmt.Errorf("%s[%d]: search term too long: %d characters (max: %d)",
 				fieldName, i, len(term), v.MaxSearchTermLength)
 		}
-		// Check for potentially problematic characters
-		if strings.Contains(term, "\x00") {
-			return fmt.Errorf("%s[%d]: search term contains null characters", fieldName, i)
+		if err := validateSearchString(term); err != nil {
+			return fmt.Errorf("%s[%d]: search term %w", fieldName, i, err)
 		}
 	}
 	return nil
@@ -294,13 +304,37 @@ func (v *SearchCriteriaValidator) validateHeader(header imap.SearchCriteriaHeade
 	if len(header.Key) == 0 {
 		return fmt.Errorf("header key cannot be empty")
 	}
+	if err := validateSearchString(header.Key); err != nil {
+		return fmt.Errorf("header key %w", err)
+	}
 
 	// Validate header value
 	if len(header.Value) > v.MaxSearchTermLength {
 		return fmt.Errorf("header value too long: %d characters (max: %d)",
 			len(header.Value), v.MaxSearchTermLength)
 	}
+	if err := validateSearchString(header.Value); err != nil {
+		return fmt.Errorf("header value %w", err)
+	}
 
+	return nil
+}
+
+// validateSearchString refuses a string PostgreSQL cannot take as a text
+// parameter (SQLSTATE 22021), so the client gets BAD for it rather than the
+// database's error as NO [SERVERBUG]. NUL is in no search string: "The ASCII
+// NUL character, %x00, MUST NOT be used anywhere, with the exception of the
+// OCTET production" (RFC 9051 §9, rule 3), and OCTET is only in literal8,
+// which no search key takes. And the strings are UTF-8: go-imap answers every
+// CHARSET but US-ASCII and UTF-8 with NO [BADCHARSET], and without one
+// "IMAP4rev2 servers MUST assume UTF-8" (RFC 9051 §6.4.4).
+func validateSearchString(s string) error {
+	if strings.IndexByte(s, 0) >= 0 {
+		return errors.New("contains a NUL character")
+	}
+	if !utf8.ValidString(s) {
+		return errors.New("is not valid UTF-8")
+	}
 	return nil
 }
 
