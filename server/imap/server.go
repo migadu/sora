@@ -415,7 +415,7 @@ type IMAPServerOptions struct {
 	AbsoluteSessionTimeout  time.Duration            // Maximum total session duration (0 = no absolute limit)
 	MinBytesPerMinute       int64                    // Minimum throughput to prevent slowloris (0 = disabled)
 	// Auth security
-	InsecureAuth bool // Allow PLAIN auth over non-TLS connections (default: true for backends behind proxy)
+	InsecureAuth bool // Allow plaintext authentication over non-TLS connections
 	// Full config for shared mailboxes and other features
 	Config *config.Config
 	// Spam training client (optional)
