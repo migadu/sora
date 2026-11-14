@@ -44,7 +44,8 @@ func (a AuthResult) String() string {
 var (
 	// ErrRemoteLookupTransient represents a transient error: the lookup service gave no
 	// verdict on the user (network issue, timeout, 5xx, a 4xx other than 401/403/404, a
-	// malformed 200, circuit breaker open). It is never a wrong password.
+	// malformed 200, circuit breaker open, a request that could not be built). It is
+	// never a wrong password. Every error the HTTP lookup client returns wraps it.
 	ErrRemoteLookupTransient = errors.New("remotelookup transient error")
 
 	// ErrRemoteLookupInvalidResponse represents an invalid 200 response (malformed JSON, missing
