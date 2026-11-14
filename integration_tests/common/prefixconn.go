@@ -7,7 +7,7 @@ import "net"
 // loopback). This forces the server's PROXY reader to buffer ClientHello
 // bytes along with the header — the TLS handshake must read through the
 // PROXY conn to see them, which is exactly the listener wrapping-order
-// property under test (see docs/proxy-protocol-tls-composition.md).
+// property under test (see docs/HACKING.md, section 6.5).
 type PrefixConn struct {
 	net.Conn
 	prefix []byte
