@@ -1240,6 +1240,13 @@ func (s *Session) authenticateUser(username, password string) error {
 			// sentinel, because the reply carries the error's text.
 			if proxy.IsTemporaryDBAuthFailure(err) {
 				reason, _ := proxy.ClassifyDBAuthFailure(err)
+				// A login this username has in the lookup cache was verified against
+				// another hash than the one now stored. Drop it: while it stays, every
+				// password that misses it is answered here, uncounted, and the cached
+				// one still signs in, an unmetered guessing oracle until it expires.
+				if errors.Is(err, db.ErrUnverifiableHash) {
+					s.invalidateLookupCache("unverifiable stored hash")
+				}
 				s.WarnLog("authentication unavailable", "reason", reason, "method", "main_db", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable
