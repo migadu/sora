@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,7 +49,8 @@ type JWTClaims struct {
 // reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
 // publishes a new one whole and none is changed after; a request loads it once.
 type reloadableSettings struct {
-	jwtSecret string // JWT secret for token validation
+	jwtSecret      string   // JWT secret for token validation
+	allowedOrigins []string // CORS policy of the responses the proxy writes itself (writeError)
 }
 
 // Server represents a User API proxy server
@@ -109,6 +111,7 @@ type ServerOptions struct {
 	Pools                    []proxy.PoolSpec // Named backend pools ([[pool]] blocks); when set, RemoteAddrs is unused and each pool brings its own backend-leg settings
 	RemotePort               int              // Default port for backends if not in address
 	JWTSecret                string           // JWT secret for token validation
+	AllowedOrigins           []string         // CORS allowed origins (allowed_origins) of the responses the proxy writes itself
 	TLS                      bool
 	TLSCertFile              string
 	TLSKeyFile               string
@@ -389,7 +392,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		connReleases:               make(map[net.Conn]func()),
 	}
 	connManager.OnMaintenanceChange(s.closeBackendIdleConnections)
-	s.settings.Store(&reloadableSettings{jwtSecret: opts.JWTSecret})
+	s.settings.Store(&reloadableSettings{jwtSecret: opts.JWTSecret, allowedOrigins: opts.AllowedOrigins})
 	return s, nil
 }
 
@@ -488,7 +491,7 @@ func (s *Server) setupHandler() http.Handler {
 		// might be in maintenance (proxy.Maintenance.Loaded).
 		if !s.connManager.MaintenanceLoaded() {
 			logger.Error("User API Proxy: backend maintenance list not loaded yet - refusing request", "name", s.name)
-			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+			s.writeError(w, r, "Service unavailable", http.StatusServiceUnavailable)
 			return
 		}
 
@@ -500,7 +503,7 @@ func (s *Server) setupHandler() http.Handler {
 			claims, err := s.extractAndValidateToken(r)
 			if err != nil {
 				logger.Warn("User API Proxy: Authentication failed", "name", s.name, "path", r.URL.Path, "error", err)
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				s.writeError(w, r, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
 
@@ -508,7 +511,7 @@ func (s *Server) setupHandler() http.Handler {
 			route, err := s.getBackendForUser(r.Context(), claims.Email, claims.AccountID)
 			if err != nil {
 				logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "user", claims.Email, "error", err)
-				http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+				s.writeError(w, r, "Service unavailable", http.StatusServiceUnavailable)
 				return
 			}
 
@@ -532,17 +535,27 @@ func (s *Server) setupHandler() http.Handler {
 		}
 		if err != nil {
 			if errors.Is(err, errAuthBodyTooLarge) {
-				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+				s.writeError(w, r, "Request body too large", http.StatusRequestEntityTooLarge)
 				return
 			}
 			logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "path", r.URL.Path, "error", err)
-			http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+			s.writeError(w, r, "Service unavailable", http.StatusServiceUnavailable)
 			return
 		}
 
 		// Proxy unauthenticated request
 		s.proxyRequest(w, r, route)
 	})
+}
+
+// writeError answers r with an error the proxy writes itself, no backend having answered.
+// It carries the CORS headers of the proxy's allowed_origins, as the backend's own errors
+// carry the backend's: without them a browser hands the page a network error instead of
+// the status, and a web client cannot tell an expired token from an outage. A forwarded
+// response carries the backend's CORS headers and must get none here.
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, msg string, code int) {
+	server.SetCORSHeaders(w.Header(), r.Header.Get("Origin"), s.settings.Load().allowedOrigins)
+	http.Error(w, msg, code)
 }
 
 // isCORSPreflight reports whether r is a CORS-preflight request: an OPTIONS request with
@@ -911,12 +924,12 @@ func (s *Server) cacheRoute(email string, entry *lookupcache.CacheEntry) {
 func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route backendRoute) {
 	binding, err := s.connManager.BindBackendRoute(route.pool, route.addr)
 	if err != nil {
-		http.Error(w, "Backend route unavailable", http.StatusServiceUnavailable)
+		s.writeError(w, r, "Backend route unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	transport, err := s.transportFor(route, binding)
 	if err != nil {
-		http.Error(w, "Backend route unavailable", http.StatusServiceUnavailable)
+		s.writeError(w, r, "Backend route unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	// Create reverse proxy to backend
@@ -934,13 +947,19 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 	target, err := url.Parse(fmt.Sprintf("%s://%s", scheme, host))
 	if err != nil {
 		logger.Warn("User API Proxy: Failed to parse backend URL", "name", s.name, "error", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		s.writeError(w, r, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	// Create reverse proxy with shared transport (prevents connection pool leaks)
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = transport
+	// The backend did not answer (the default handler's bare 502): ReverseProxy calls this
+	// before it has copied any backend header, so the response is the proxy's own.
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		logger.Warn("User API Proxy: Backend request failed", "name", s.name, "backend", route.addr, "error", err)
+		s.writeError(w, r, "Bad gateway", http.StatusBadGateway)
+	}
 
 	// Modify request. Capture the original Host BEFORE overwriting r.Host:
 	// the Host of an incoming request lives in r.Host, not in r.Header
@@ -955,8 +974,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 	// Get real client IP (from PROXY protocol or RemoteAddr)
 	realClientIP := s.getRealClientIP(r)
 
-	// Forward real client IP to backend in X-Forwarded-For and X-Real-IP headers
-	// Backend should trust these headers from trusted proxy networks
+	// Forward real client IP to backend in X-Forwarded-For and X-Real-IP headers.
+	// The sora User API backend does not read them: it learns the client address
+	// only from the PROXY protocol header (remote_use_proxy_protocol).
 	r.Header.Set("X-Real-IP", realClientIP)
 	r.Header.Set("X-Forwarded-For", realClientIP)
 
@@ -1094,6 +1114,12 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 			next.jwtSecret = cfg.JWTSecret
 			reloaded = append(reloaded, "jwt_secret")
 		}
+	}
+	// Reload receives the complete config, so an empty or removed list means what it does
+	// at startup: the proxy's own responses authorize no origin.
+	if !slices.Equal(cfg.AllowedOrigins, next.allowedOrigins) {
+		next.allowedOrigins = slices.Clone(cfg.AllowedOrigins)
+		reloaded = append(reloaded, "allowed_origins")
 	}
 
 	if len(reloaded) > 0 {

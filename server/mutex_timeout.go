@@ -22,7 +22,7 @@ type MutexTimeoutHelper struct {
 
 // NewMutexTimeoutHelper creates a new helper for mutex timeout operations. name is
 // the protocol ("imap", "pop3", ...); it labels the session lock metrics, lowercased
-// like every other metric's protocol label.
+// like the protocol label of the command, error and authentication metrics.
 func NewMutexTimeoutHelper(mutex *sync.RWMutex, ctx context.Context, name string, log func(format string, args ...any)) *MutexTimeoutHelper {
 	return &MutexTimeoutHelper{
 		mutex: mutex,

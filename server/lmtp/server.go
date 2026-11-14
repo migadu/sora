@@ -270,7 +270,7 @@ type LMTPServerOptions struct {
 	FTSRetention                time.Duration
 	MaxMessageSize              int64    // Maximum size for incoming messages in bytes
 	SieveExtensions             []string // Sieve extensions to enable (nil/empty = all default extensions)
-	InsecureAuth                bool     // Allow PLAIN auth over non-TLS connections (default: true for LMTP behind trusted network)
+	InsecureAuth                bool     // Allow plaintext authentication over non-TLS connections
 	RedirectRateLimit           int
 	RedirectRateWindow          time.Duration
 	MaxRedirectHops             int

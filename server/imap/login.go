@@ -145,10 +145,11 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		s.DebugLog("failed to parse address", "error", err)
 		// Track invalid address format as client error
 		metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "invalid_address", "client_error").Inc()
-		// Record it: an unparseable address was an unmetered authentication
-		// attempt, and it is the path a non-address master SASL username takes
-		// when it falls through to here (sasl.go section 2), which must be
-		// accounted for exactly like any other failed attempt.
+		// Record and count it: an unparseable address was an unmetered
+		// authentication attempt, and it is the path a non-address master SASL
+		// username takes when it falls through to here (sasl.go section 2), which
+		// must be accounted for exactly like any other failed attempt.
+		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 		if s.server.authLimiter != nil {
 			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 		}
@@ -191,7 +192,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 			return authFailedError()
 		}
 		// Use base address (without suffix) to get account
-		AccountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, addressParsed.BaseAddress())
+		AccountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, addressParsed.BaseAddress())
 		if err != nil {
 			// Check if error is due to context cancellation (server shutdown)
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -200,6 +201,19 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 					Type: imap.StatusResponseTypeNo,
 					Code: imap.ResponseCodeUnavailable,
 					Text: server.ErrServerShuttingDown.Error(),
+				}
+			}
+
+			// The database could not be asked, so nothing is known about the target:
+			// a temporary failure (RFC 5530 section 3), not a failed login charged to
+			// the master credential.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("impersonation target lookup unavailable", "target_user", addressParsed.BaseAddress(), "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
+				return &imap.Error{
+					Type: imap.StatusResponseTypeNo,
+					Code: imap.ResponseCodeUnavailable,
+					Text: server.ErrAuthServiceUnavailable.Error(),
 				}
 			}
 
@@ -262,7 +276,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		}
 	}
 
-	// Ensure default mailboxes (INBOX/Drafts/Sent/Spam/Trash) exist
+	// Ensure the default mailboxes (INBOX/Sent/Drafts/Archive/Junk/Trash, consts.DefaultMailboxes) exist
 	err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, AccountID)
 	if err != nil {
 		return s.internalError("failed to create default mailboxes: %v", err)

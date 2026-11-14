@@ -40,9 +40,10 @@ type ManageSieveSession struct {
 	releaseConn func() // Function to release connection from limiter
 	startTime   time.Time
 
-	// trackedClientAddr is the client address this session was registered
-	// with in the connection tracker, so it is unregistered under that key.
-	// Empty when the tracker refused the session: it has nothing to release.
+	// tracked is set while the session holds a slot in the connection
+	// tracker, registered under trackedClientAddr, so the slot is released
+	// under that key, once. A session the tracker refused never holds one.
+	tracked           bool
 	trackedClientAddr string
 }
 
@@ -63,6 +64,10 @@ var (
 	errServerBusy      = &managesieveserver.Error{Message: msieve.Quote("Server busy, try again later")}
 	errSessionClosed   = &managesieveserver.Error{Message: msieve.Quote("Session closed"), Close: true}
 	errDelayQueueFul   = &managesieveserver.Error{Message: msieve.Quote("Too many concurrent authentication attempts. Please try again later.")}
+
+	// errTooManyConnections refuses a login over max_connections_per_user or
+	// max_connections_per_user_per_ip, with the reply managesieve_proxy sends.
+	errTooManyConnections = &managesieveserver.Error{Code: "TRYLATER", Message: "Too many connections"}
 )
 
 // authUnavailable reports whether a failed Authenticate says nothing about the
@@ -175,8 +180,16 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 				return errAuthFailed
 			}
 
-			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+			accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 			if err != nil {
+				// The database could not be asked, or the command was cut short, so
+				// nothing is known about the target: TRYLATER (RFC 5804 section 1.3),
+				// not a failed login charged to the master credential.
+				if authUnavailable(err) {
+					outcome = "unavailable"
+					s.WarnLog("impersonation target lookup unavailable", "target_user", targetUserToImpersonate, "error", err)
+					return errTryLater
+				}
 				// Same reply and same accounting as a bad credential (see above).
 				s.WarnLog("impersonation target rejected (account not found)", "target_user", targetUserToImpersonate, "error", err)
 				if s.server.authLimiter != nil {
@@ -286,8 +299,14 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// Resolve the account by the base address (stripping any +detail
 		// or @suffix), consistent with the master-username path above and
 		// the IMAP/POP3 backends.
-		accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 		if err != nil {
+			// Unavailable: see the master-username path above.
+			if authUnavailable(err) {
+				outcome = "unavailable"
+				s.WarnLog("impersonation target lookup unavailable", "target_user", authzID, "error", err)
+				return errTryLater
+			}
 			// Same reply and same accounting as a bad credential (see above).
 			s.WarnLog("impersonation target rejected (account not found)", "target_user", authzID, "error", err)
 			if s.server.authLimiter != nil {
@@ -409,12 +428,6 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 func (s *ManageSieveSession) Login(ctx context.Context, username, password string) error {
 	start := time.Now()
 
-	address, err := server.NewAddress(username)
-	if err != nil {
-		s.DebugLog("invalid address", "error", err)
-		return &managesieveserver.Error{Message: msieve.Quote("Invalid address")}
-	}
-
 	netConn := s.conn
 	proxyInfo := s.proxyInfo()
 	// Rate-limit key for this attempt. Canonicalised so the check and every
@@ -427,7 +440,10 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 	// must never charge the account it named.
 	authKey := server.AuthRateLimitKeyWithMaster(username, s.server.masterUsername)
 
-	// Apply progressive authentication delay BEFORE any other checks
+	// Apply progressive authentication delay BEFORE any other checks - including
+	// before the username is parsed, as in AuthenticatePlain: an unparseable username
+	// is recorded as a failed attempt below, and a site that records without first
+	// passing the delay and the block check is metered but never gated.
 	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-LOGIN"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
@@ -445,7 +461,7 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 			var rateLimitErr *server.RateLimitError
 			if errors.As(err, &rateLimitErr) {
 				s.InfoLog("rate limit exceeded",
-					"address", address.FullAddress(),
+					"username", username,
 					"reason", rateLimitErr.Reason,
 					"failure_count", rateLimitErr.FailureCount,
 					"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
@@ -456,6 +472,17 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 			// state isn't an observable oracle. (security-audit M14)
 			return errAuthFailed
 		}
+	}
+
+	address, err := server.NewAddress(username)
+	if err != nil {
+		s.DebugLog("invalid address", "error", err)
+		// A failed login like any other: recorded and counted, as in AuthenticatePlain.
+		if s.server.authLimiter != nil {
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+		}
+		metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
+		return &managesieveserver.Error{Message: msieve.Quote("Invalid address")}
 	}
 
 	// Master username authentication: user@domain.com@MASTER_USERNAME
@@ -473,8 +500,14 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 			authSuccess = true
 			masterAuthUsed = true
 			// Use base address (without suffix) to get account
-			accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+			accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 			if err != nil {
+				// Unavailable: a temporary failure, see AuthenticatePlain.
+				if authUnavailable(err) {
+					s.WarnLog("impersonation target lookup unavailable", "target_user", address.BaseAddress(), "error", err)
+					metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "unavailable").Inc()
+					return errTryLater
+				}
 				s.WarnLog("failed to get account id", "address", address.BaseAddress(), "error", err)
 				if s.server.authLimiter != nil {
 					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
@@ -552,20 +585,28 @@ func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address
 	}
 	defer release()
 
-	s.User = server.NewUser(address, accountID)
-
-	// Increment authenticated connections counter
-	s.server.authenticatedConnections.Add(1)
-
 	// Log authentication success. Regular auth via Authenticate() already
 	// logs in server.go with cached/method; master auth is logged here.
 	if masterAuthUsed {
 		duration := time.Since(start)
 		s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 	}
+	metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "success").Inc()
+
+	// The connection limits come before the session takes the user: a login the
+	// tracker refuses is not logged in, so its close releases neither a count
+	// nor a tracker slot.
+	if err := s.registerConnection(ctx, accountID, address.FullAddress()); err != nil {
+		s.InfoLog("login refused: connection limit reached", "address", address.BaseAddress(), "reason", err)
+		return errTooManyConnections
+	}
+
+	s.User = server.NewUser(address, accountID)
+
+	// Increment authenticated connections counter
+	s.server.authenticatedConnections.Add(1)
 
 	// Track successful authentication
-	metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "success").Inc()
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("managesieve", s.server.name, s.server.hostname).Inc()
 	metrics.CriticalOperationDuration.WithLabelValues("managesieve_authentication").Observe(time.Since(start).Seconds())
 
@@ -573,9 +614,6 @@ func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address
 	// prevent a race: if the session closes between counter increments and
 	// flag setting, cleanup won't decrement.
 	s.authenticated = true
-
-	// Register connection for tracking
-	s.registerConnection(ctx, address.FullAddress())
 
 	// Start termination poller to check for kick commands
 	s.startTerminationPoller()
@@ -971,40 +1009,48 @@ func (s *ManageSieveSession) Close() error {
 	}
 }
 
-// registerConnection registers the connection in the connection tracker.
-// It runs synchronously within the authenticating command, so it is bounded
-// by the per-command context (plus the query timeout).
-func (s *ManageSieveSession) registerConnection(ctx context.Context, email string) {
-	if s.server.connTracker != nil && s.User != nil {
-		// Use configured database query timeout for connection tracking (database INSERT)
-		queryTimeout := s.server.rdb.GetQueryTimeout()
-		ctx, cancel := context.WithTimeout(ctx, queryTimeout)
-		defer cancel()
-
-		// The client's address, not the TCP peer: behind a proxy the peer is
-		// the proxy for every client. RemoteIP already holds the address from
-		// the PROXY header.
-		clientAddr := s.RemoteIP
-
-		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "ManageSieve", clientAddr); err != nil {
-			s.InfoLog("rejected connection registration", "error", err)
-			return
-		}
-		s.trackedClientAddr = clientAddr
+// registerConnection takes a slot for the logging-in account in the connection
+// tracker. The error is the tracker's refusal: the account is at
+// max_connections_per_user or max_connections_per_user_per_ip. It runs
+// synchronously within the authenticating command, so it is bounded by the
+// per-command context (plus the query timeout).
+func (s *ManageSieveSession) registerConnection(ctx context.Context, accountID int64, email string) error {
+	if s.server.connTracker == nil {
+		return nil
 	}
+	// Use configured database query timeout for connection tracking (database INSERT)
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	// The client's address, not the TCP peer: behind a proxy the peer is
+	// the proxy for every client. RemoteIP already holds the address from
+	// the PROXY header.
+	clientAddr := s.RemoteIP
+
+	if err := s.server.connTracker.RegisterConnection(ctx, accountID, email, "ManageSieve", clientAddr); err != nil {
+		return err
+	}
+	s.tracked = true
+	s.trackedClientAddr = clientAddr
+	return nil
 }
 
-// unregisterConnection removes the connection from the connection tracker
+// unregisterConnection releases the session's slot in the connection tracker,
+// if it holds one.
 func (s *ManageSieveSession) unregisterConnection() {
-	if s.server.connTracker != nil && s.User != nil && s.trackedClientAddr != "" {
-		// Use configured database query timeout for connection tracking (database DELETE)
-		queryTimeout := s.server.rdb.GetQueryTimeout()
-		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
-		defer cancel()
+	if !s.tracked {
+		return
+	}
+	s.tracked = false
 
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "ManageSieve", s.trackedClientAddr); err != nil {
-			s.WarnLog("failed to unregister connection", "error", err)
-		}
+	// Use configured database query timeout for connection tracking (database DELETE)
+	queryTimeout := s.server.rdb.GetQueryTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "ManageSieve", s.trackedClientAddr); err != nil {
+		s.WarnLog("failed to unregister connection", "error", err)
 	}
 }
 

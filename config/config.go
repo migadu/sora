@@ -3,7 +3,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"maps"
 	"math"
@@ -65,7 +64,7 @@ type DatabaseConfig struct {
 	Debug            bool                    `toml:"debug"`             // Enable SQL query logging
 	QueryTimeout     string                  `toml:"query_timeout"`     // Default timeout for all database queries (default: "30s")
 	SearchTimeout    string                  `toml:"search_timeout"`    // Specific timeout for complex search queries (default: "60s")
-	WriteTimeout     string                  `toml:"write_timeout"`     // Timeout for write operations (default: "10s")
+	WriteTimeout     string                  `toml:"write_timeout"`     // Timeout for write operations (default: "15s")
 	LockTimeout      string                  `toml:"lock_timeout"`      // Max time a statement waits for a row lock before failing (default: "10s"; "0" disables)
 	MigrationTimeout string                  `toml:"migration_timeout"` // Timeout for auto-migrations at startup (default: "2m")
 	FetchChunkSize   int                     `toml:"fetch_chunk_size"`  // Number of messages to fetch per chunk for large result sets (default: 5000)
@@ -532,7 +531,7 @@ type UploaderConfig struct {
 	MaxAttempts        int    `toml:"max_attempts"`
 	RetryInterval      string `toml:"retry_interval"`
 	CleanupGracePeriod string `toml:"cleanup_grace_period"` // Minimum age of a local upload file before cleanup considers it (default: "1h"). Must exceed the longest possible DB transaction to avoid the race where a file is deleted before its pending_upload record commits.
-	MaxStagingSize     string `toml:"max_staging_size"`     // Maximum size of the global upload staging queue (e.g. "100gb"). If set and exceeded, new appends are rejected.
+	MaxStagingSize     string `toml:"max_staging_size"`     // Maximum size of this node's own upload staging backlog (e.g. "100gb"); other nodes' backlogs do not count. If set and exceeded, new appends are rejected.
 }
 
 // DefaultUploaderMaxAttempts is [uploader] max_attempts when the key is absent.
@@ -769,32 +768,34 @@ func decodeTable(name string, data any, v any) error {
 	if !ok {
 		return fmt.Errorf("%s must be a table, got %T", name, data)
 	}
-	table = maps.Clone(table)
+	decoded := maps.Clone(table)
 	typ := reflect.TypeOf(v).Elem()
 	for i := range typ.NumField() {
 		field := typ.Field(i)
 		if field.Type != reflect.TypeOf(time.Duration(0)) {
 			continue
 		}
-		key := tomlKey(field)
-		value, ok := table[key]
-		if !ok {
-			continue
+		// The toml package decodes a key into a field it matches only
+		// case-insensitively too ("IP_Block_Duration"), so every such key is parsed.
+		for key, value := range table {
+			if !strings.EqualFold(key, tomlKey(field)) {
+				continue
+			}
+			s, ok := value.(string)
+			if !ok {
+				return fmt.Errorf("%s: a duration is a string with a unit, such as \"15m\" or \"1d\", got %v", key, value)
+			}
+			// Parsed here, before LoadConfigFromFile trims every string, so trim it the same way.
+			d, err := helpers.ParseDuration(strings.TrimSpace(s))
+			if err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+			decoded[key] = int64(d) // the toml package decodes an integer into a time.Duration as nanoseconds
 		}
-		s, ok := value.(string)
-		if !ok {
-			return fmt.Errorf("%s: a duration is a string with a unit, such as \"15m\" or \"1d\", got %v", key, value)
-		}
-		// Parsed here, before LoadConfigFromFile trims every string, so trim it the same way.
-		d, err := helpers.ParseDuration(strings.TrimSpace(s))
-		if err != nil {
-			return fmt.Errorf("%s: %w", key, err)
-		}
-		table[key] = int64(d) // the toml package decodes an integer into a time.Duration as nanoseconds
 	}
 
 	var buf strings.Builder
-	if err := toml.NewEncoder(&buf).Encode(table); err != nil {
+	if err := toml.NewEncoder(&buf).Encode(decoded); err != nil {
 		return fmt.Errorf("%s: %w", name, err)
 	}
 	md, err := toml.Decode(buf.String(), v)
@@ -806,7 +807,7 @@ func decodeTable(name string, data any, v any) error {
 	// The outer decoder counts every key of a table handled here as decoded, so
 	// report unknown ones here.
 	for _, key := range md.Undecoded() {
-		log.Printf("WARNING: Unknown key '%s.%s' will be ignored", name, key)
+		warnf("Unknown key '%s.%s' will be ignored", name, key)
 	}
 	return nil
 }
@@ -936,8 +937,8 @@ type RemoteLookupTransportConfig struct {
 	MaxIdleConnsPerHost   int    `toml:"max_idle_conns_per_host"` // Maximum idle connections per host (default: 100)
 	MaxConnsPerHost       int    `toml:"max_conns_per_host"`      // Maximum total connections per host, 0 = unlimited (default: 0)
 	IdleConnTimeout       string `toml:"idle_conn_timeout"`       // How long idle connections stay open (default: "90s")
-	DialTimeout           string `toml:"dial_timeout"`            // TCP connection timeout including DNS (default: "30s")
-	TLSHandshakeTimeout   string `toml:"tls_handshake_timeout"`   // TLS handshake timeout (default: "30s")
+	DialTimeout           string `toml:"dial_timeout"`            // TCP connection timeout including DNS (default: "10s")
+	TLSHandshakeTimeout   string `toml:"tls_handshake_timeout"`   // TLS handshake timeout (default: "10s")
 	ExpectContinueTimeout string `toml:"expect_continue_timeout"` // 100-continue timeout (default: "1s")
 	KeepAlive             string `toml:"keep_alive"`              // TCP keep-alive interval (default: "30s")
 }
@@ -1222,9 +1223,9 @@ type ServerConfig struct {
 	// Connection limits
 	MaxConnections             int `toml:"max_connections,omitempty"`
 	MaxConnectionsPerIP        int `toml:"max_connections_per_ip,omitempty"`
-	MaxConnectionsPerUser      int `toml:"max_connections_per_user,omitempty"`        // Cluster-wide per-user limit (proxy only, requires cluster mode)
+	MaxConnectionsPerUser      int `toml:"max_connections_per_user,omitempty"`        // Per-user limit: IMAP/POP3/ManageSieve servers count per server block on this node; their proxies count cluster-wide, in cluster mode only
 	MaxConnectionsPerUserPerIP int `toml:"max_connections_per_user_per_ip,omitempty"` // Local per-user-per-IP limit
-	ListenBacklog              int `toml:"listen_backlog,omitempty"`                  // TCP listen backlog size (0=system default, typically 128-512; recommended: 4096-8192)
+	ListenBacklog              int `toml:"listen_backlog,omitempty"`                  // TCP listen backlog size (0 = 1024; recommended: 4096-8192)
 
 	// IMAP specific
 	AppendLimit        string `toml:"append_limit,omitempty"`
@@ -1248,11 +1249,14 @@ type ServerConfig struct {
 	MaxMessageSize string `toml:"max_message_size,omitempty"` // Maximum size for incoming LMTP messages
 
 	// Auth security
-	InsecureAuth bool `toml:"insecure_auth,omitempty"` // Allow PLAIN auth over non-TLS connections (default: false for ManageSieve, true for IMAP/LMTP behind proxy)
+	// InsecureAuth allows plaintext authentication over non-TLS connections (default:
+	// false). Without tls = true it is allowed regardless: the IMAP, POP3, ManageSieve and
+	// LMTP servers and the IMAP, POP3 and ManageSieve proxies apply insecure_auth || !tls.
+	InsecureAuth bool `toml:"insecure_auth,omitempty"`
 
 	// ManageSieve specific
 	MaxScriptSize       string   `toml:"max_script_size,omitempty"`
-	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // List of supported Sieve extensions (additional to builtins)
+	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // managesieve_proxy only: Sieve extensions to advertise (additional to builtins); a managesieve server uses [sieve] enabled_extensions
 
 	// Proxy specific
 	RemoteAddrs            []string `toml:"remote_addrs,omitempty"`
@@ -1795,7 +1799,7 @@ func (s *ServerConfig) GetRemoteDNSRefresh() (*time.Duration, error) {
 
 func (s *ServerConfig) GetAuthIdleTimeout() (time.Duration, error) {
 	if s.AuthIdleTimeout == "" {
-		// Default: 2 minutes idle during authentication for all proxy types
+		// Default: 2 minutes idle during authentication, for every server type
 		return 2 * time.Minute, nil
 	}
 	return helpers.ParseDuration(s.AuthIdleTimeout)
@@ -2251,11 +2255,13 @@ func (s *ServerConfig) GetRemoteHealthChecks() bool {
 	return *s.RemoteHealthChecks
 }
 
-// warnf reports a value a ...WithDefault method replaced with its default. It
-// logs at WARN through slog's default logger, which the logger package (it
-// imports config, so config cannot import it) points at the server log. The
-// log package's output reaches that log only at INFO, so a typo logged with
-// log.Printf was filtered out at level = "warn".
+// warnf reports a problem with the configuration: a value a ...WithDefault
+// method replaced with its default, or a key the file gets wrong. It logs at WARN
+// through slog's default logger, which the logger package (it imports config, so
+// config cannot import it) points at the server log. Start-up reads the file
+// before that, and logger.Hold keeps what is logged until then. The log package's
+// output reaches the server log only at INFO, so a typo logged with log.Printf was
+// filtered out at level = "warn".
 func warnf(format string, args ...any) {
 	slog.Warn(fmt.Sprintf(format, args...))
 }
@@ -2299,7 +2305,7 @@ func (s *ServerConfig) GetHashUsernames() bool {
 func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 	limit, err := s.GetAppendLimit()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse append limit for server '%s': %v, using default (25MB)", s.Name, err)
+		warnf("Failed to parse append limit for server '%s': %v, using default (25MB)", s.Name, err)
 		return 25 * 1024 * 1024 // 25MB default
 	}
 	return limit
@@ -2308,7 +2314,7 @@ func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 func (s *ServerConfig) GetMaxScriptSizeWithDefault() int64 {
 	size, err := s.GetMaxScriptSize()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse max script size for server '%s': %v, using default (16KB)", s.Name, err)
+		warnf("Failed to parse max script size for server '%s': %v, using default (16KB)", s.Name, err)
 		return 16 * 1024 // 16KB default
 	}
 	return size
@@ -2317,7 +2323,7 @@ func (s *ServerConfig) GetMaxScriptSizeWithDefault() int64 {
 func (s *ServerConfig) GetConnectTimeoutWithDefault() time.Duration {
 	timeout, err := s.GetConnectTimeout()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse connect timeout for server '%s': %v, using default (30s)", s.Name, err)
+		warnf("Failed to parse connect timeout for server '%s': %v, using default (30s)", s.Name, err)
 		return 30 * time.Second
 	}
 	return timeout
@@ -2335,7 +2341,7 @@ func (s *ServerConfig) GetAuthIdleTimeoutWithDefault() time.Duration {
 func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {
 	size, err := s.GetMaxMessageSize()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
+		warnf("Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
 		return 52428800 // 50MB default
 	}
 	return size
@@ -2360,7 +2366,7 @@ func (s *ServerConfig) GetProxyProtocolTimeoutWithDefault() string {
 func (c *CleanupConfig) GetGracePeriodWithDefault() time.Duration {
 	period, err := c.GetGracePeriod()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup grace_period: %v, using default (14 days)", err)
+		warnf("Failed to parse cleanup grace_period: %v, using default (14 days)", err)
 		return 14 * 24 * time.Hour
 	}
 	return period
@@ -2369,7 +2375,7 @@ func (c *CleanupConfig) GetGracePeriodWithDefault() time.Duration {
 func (c *CleanupConfig) GetPurgePollIntervalWithDefault() time.Duration {
 	interval, err := c.GetPurgePollInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup purge_poll_interval: %v, using default (30s)", err)
+		warnf("Failed to parse cleanup purge_poll_interval: %v, using default (30s)", err)
 		return 30 * time.Second
 	}
 	return interval
@@ -2378,7 +2384,7 @@ func (c *CleanupConfig) GetPurgePollIntervalWithDefault() time.Duration {
 func (c *CleanupConfig) GetWakeIntervalWithDefault() time.Duration {
 	interval, err := c.GetWakeInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup wake_interval: %v, using default (1 hour)", err)
+		warnf("Failed to parse cleanup wake_interval: %v, using default (1 hour)", err)
 		return time.Hour
 	}
 	return interval
@@ -2387,7 +2393,7 @@ func (c *CleanupConfig) GetWakeIntervalWithDefault() time.Duration {
 func (c *CleanupConfig) GetMaxAgeRestrictionWithDefault() time.Duration {
 	restriction, err := c.GetMaxAgeRestriction()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup max_age_restriction: %v, using default (no restriction)", err)
+		warnf("Failed to parse cleanup max_age_restriction: %v, using default (no restriction)", err)
 		return 0
 	}
 	return restriction
@@ -2396,7 +2402,7 @@ func (c *CleanupConfig) GetMaxAgeRestrictionWithDefault() time.Duration {
 func (c *CleanupConfig) GetFTSRetentionWithDefault() time.Duration {
 	retention, err := c.GetFTSRetention()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup fts_retention: %v, using default (keep forever)", err)
+		warnf("Failed to parse cleanup fts_retention: %v, using default (keep forever)", err)
 		return 0
 	}
 	return retention
@@ -2405,7 +2411,7 @@ func (c *CleanupConfig) GetFTSRetentionWithDefault() time.Duration {
 func (c *CleanupConfig) GetHealthStatusRetentionWithDefault() time.Duration {
 	retention, err := c.GetHealthStatusRetention()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup health_status_retention: %v, using default (30 days)", err)
+		warnf("Failed to parse cleanup health_status_retention: %v, using default (30 days)", err)
 		return 30 * 24 * time.Hour
 	}
 	return retention
@@ -2414,12 +2420,12 @@ func (c *CleanupConfig) GetHealthStatusRetentionWithDefault() time.Duration {
 func (c *CleanupConfig) GetInstanceLivenessThresholdWithDefault() time.Duration {
 	threshold, err := c.GetInstanceLivenessThreshold()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cleanup instance_liveness_threshold: %v, using default (7 days)", err)
+		warnf("Failed to parse cleanup instance_liveness_threshold: %v, using default (7 days)", err)
 		return 7 * 24 * time.Hour
 	}
 	if threshold <= 0 {
 		// Non-positive would mean "every instance is dead", i.e. reaping on age alone.
-		log.Printf("WARNING: cleanup instance_liveness_threshold must be positive, got %s, using default (7 days)", threshold)
+		warnf("cleanup instance_liveness_threshold must be positive, got %s, using default (7 days)", threshold)
 		return 7 * 24 * time.Hour
 	}
 	return threshold
@@ -2428,7 +2434,7 @@ func (c *CleanupConfig) GetInstanceLivenessThresholdWithDefault() time.Duration 
 func (c *LocalCacheConfig) GetCapacityWithDefault() int64 {
 	capacity, err := c.GetCapacity()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache size: %v, using default (1GB)", err)
+		warnf("Failed to parse cache size: %v, using default (1GB)", err)
 		return 1024 * 1024 * 1024 // 1GB
 	}
 	return capacity
@@ -2437,7 +2443,7 @@ func (c *LocalCacheConfig) GetCapacityWithDefault() int64 {
 func (c *LocalCacheConfig) GetMaxObjectSizeWithDefault() int64 {
 	size, err := c.GetMaxObjectSize()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache max object size: %v, using default (5MB)", err)
+		warnf("Failed to parse cache max object size: %v, using default (5MB)", err)
 		return 5 * 1024 * 1024 // 5MB
 	}
 	return size
@@ -2446,7 +2452,7 @@ func (c *LocalCacheConfig) GetMaxObjectSizeWithDefault() int64 {
 func (c *LocalCacheConfig) GetPurgeIntervalWithDefault() time.Duration {
 	interval, err := c.GetPurgeInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache purge interval: %v, using default (12 hours)", err)
+		warnf("Failed to parse cache purge interval: %v, using default (12 hours)", err)
 		return 12 * time.Hour
 	}
 	return interval
@@ -2455,7 +2461,7 @@ func (c *LocalCacheConfig) GetPurgeIntervalWithDefault() time.Duration {
 func (c *LocalCacheConfig) GetOrphanCleanupAgeWithDefault() time.Duration {
 	age, err := c.GetOrphanCleanupAge()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache orphan cleanup age: %v, using default (30 days)", err)
+		warnf("Failed to parse cache orphan cleanup age: %v, using default (30 days)", err)
 		return 30 * 24 * time.Hour
 	}
 	return age
@@ -2464,7 +2470,7 @@ func (c *LocalCacheConfig) GetOrphanCleanupAgeWithDefault() time.Duration {
 func (c *LocalCacheConfig) GetMetricsIntervalWithDefault() time.Duration {
 	interval, err := c.GetMetricsInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache metrics_interval: %v, using default (5 minutes)", err)
+		warnf("Failed to parse cache metrics_interval: %v, using default (5 minutes)", err)
 		return 5 * time.Minute
 	}
 	return interval
@@ -2473,7 +2479,7 @@ func (c *LocalCacheConfig) GetMetricsIntervalWithDefault() time.Duration {
 func (c *LocalCacheConfig) GetMetricsRetentionWithDefault() time.Duration {
 	retention, err := c.GetMetricsRetention()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse cache metrics_retention: %v, using default (30 days)", err)
+		warnf("Failed to parse cache metrics_retention: %v, using default (30 days)", err)
 		return 30 * 24 * time.Hour
 	}
 	return retention
@@ -2482,7 +2488,7 @@ func (c *LocalCacheConfig) GetMetricsRetentionWithDefault() time.Duration {
 func (c *UploaderConfig) GetRetryIntervalWithDefault() time.Duration {
 	interval, err := c.GetRetryInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse uploader retry_interval: %v, using default (30 seconds)", err)
+		warnf("Failed to parse uploader retry_interval: %v, using default (30 seconds)", err)
 		return 30 * time.Second
 	}
 	return interval
@@ -2677,7 +2683,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'supported_extensions' configured, but this only applies to ManageSieve proxy servers", s.Name, s.Type)
 		}
 		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP and POP3 proxy servers", s.Name, s.Type)
 		}
 		// Its only timeout setting is timeouts.command_timeout (the idle timeout).
 		s.warnKeysNotApplied(logger, "the LMTP server does not apply it",
@@ -2712,7 +2718,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'max_script_size' configured, but this only applies to ManageSieve servers", s.Name, s.Type)
 		}
 		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP and POP3 proxy servers", s.Name, s.Type)
 		}
 
 	case "pop3_proxy":
@@ -2725,9 +2731,6 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.RemoteUseIDCommand {
 			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
-		}
-		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
 		}
 
 	case "lmtp_proxy":
@@ -2761,7 +2764,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'remote_use_id_command' configured, but this only applies to IMAP proxy servers", s.Name, s.Type)
 		}
 		if s.RemoteUseXCLIENT {
-			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP proxy servers", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP and POP3 proxy servers", s.Name, s.Type)
 		}
 
 	case "metrics", "http_admin_api", "http_user_api":
@@ -2943,9 +2946,7 @@ func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaDa
 		// Note: toml.Decode returns ParseError by value, not by pointer
 		var parseErr toml.ParseError
 		if errors.As(err, &parseErr) && strings.Contains(parseErr.Message, "has already been defined") {
-			log.Printf("WARNING: Configuration file '%s' contains duplicate keys: %s", configPath, parseErr.Error())
-			log.Printf("WARNING: Ignoring duplicate entries. Only the first occurrence of each key will be used.")
-			log.Printf("WARNING: Please fix your configuration file to remove duplicates.")
+			warnf("Configuration file '%s' contains duplicate keys, only the first occurrence of each is used; please remove the duplicates: %s", configPath, parseErr.Error())
 
 			// Parse again with a lenient approach by removing duplicate keys
 			cleanedContent, cleanErr := removeDuplicateKeysFromTOML(string(content))
@@ -2966,12 +2967,8 @@ func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaDa
 	}
 
 	// Warn about unknown keys (might be typos or deprecated settings)
-	if len(metadata.Undecoded()) > 0 {
-		log.Printf("WARNING: Configuration file '%s' contains unknown keys that will be ignored:", configPath)
-		for _, key := range metadata.Undecoded() {
-			log.Printf("WARNING:   - %s", key)
-		}
-		log.Printf("WARNING: These keys may be typos or deprecated settings. Please review your configuration.")
+	for _, key := range metadata.Undecoded() {
+		warnf("Configuration file '%s': unknown key '%s' will be ignored (a typo or a deprecated setting?)", configPath, key)
 	}
 
 	// Trim whitespace from all string fields in the configuration
@@ -3003,22 +3000,8 @@ func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaDa
 // applyConfigDefaults sets default values for config fields where the desired default
 // differs from Go's zero value. Called after loading config from file.
 func applyConfigDefaults(cfg *Config) {
-	// Set default remote_health_checks = true for all proxy servers.
-	// NOTE: Since TOML/Go doesn't distinguish between "not set" and "set to false",
-	// we cannot reliably detect if the user explicitly disabled health checks.
-	// Users MUST explicitly set remote_health_checks = true in their config if they
-	// want health checks enabled (which is the recommended default).
-	// This is acceptable because:
-	// 1. The field name is self-documenting (remote_health_checks = true is obvious)
-	// 2. The example config shows remote_health_checks = true
-	// 3. The safe/recommended default is "enabled" (true)
-	// 4. Users who want to disable must be explicit (remote_health_checks = false)
-	//
-	// Alternative considered: Use *bool (pointer) to distinguish nil/true/false,
-	// but that would require refactoring all config access. Deferred for now.
-
-	// For now, we do nothing here - users must explicitly set remote_health_checks = true
-	// in their config file. The config.toml.example shows this as the default.
+	// remote_health_checks needs nothing here: it is a *bool, and GetRemoteHealthChecks
+	// treats a key left out of the config as true.
 
 	// Apply auth rate limiter defaults for enabled rate limiters
 	// When auth_rate_limit.enabled = true is set without other fields,
@@ -3159,7 +3142,7 @@ func removeDuplicateKeysFromTOML(content string) (string, error) {
 				// Check if we've seen this key before
 				if prevLine, exists := seenKeys[fullKey]; exists {
 					// Duplicate found - comment it out
-					log.Printf("WARNING: Duplicate key '%s' found at line %d (first occurrence at line %d). Ignoring duplicate.",
+					warnf("Duplicate key '%s' found at line %d (first occurrence at line %d). Ignoring duplicate.",
 						fullKey, lineNum+1, prevLine+1)
 					result = append(result, "# DUPLICATE IGNORED: "+line)
 					continue
