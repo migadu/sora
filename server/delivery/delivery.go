@@ -90,6 +90,23 @@ type RecipientInfo struct {
 	DeliveryHash string
 }
 
+// ErrMessageTooLarge is returned for a message larger than consts.MaxStoredMessageSize,
+// the largest message sora can store.
+var ErrMessageTooLarge = errors.New("message too large to store")
+
+// CheckStorableSize refuses a message of size octets that sora cannot store. A
+// delivery's max_message_size is capped at consts.MaxStoredMessageSize, but what it
+// stores is larger than what it read: the Received and Delivered-To trace headers and
+// any Sieve header edits are added afterwards. Checked on the final bytes, before
+// they are staged, so such a message is refused as too large instead of failing at
+// the database insert (messages.size is an INTEGER column).
+func CheckStorableSize(size int) error {
+	if int64(size) > consts.MaxStoredMessageSize {
+		return fmt.Errorf("%w: %d bytes (max: %d)", ErrMessageTooLarge, size, consts.MaxStoredMessageSize)
+	}
+	return nil
+}
+
 // DeliverMessage is the main entry point for message delivery.
 // It handles the complete delivery flow: parsing, Sieve execution, and storage.
 func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes []byte) (*DeliveryResult, error) {
@@ -211,6 +228,11 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		// from the message.
 		messageBytes = outcome.MessageBytes
 		messageEntity = outcome.MessageEntity
+	}
+
+	if err := CheckStorableSize(len(messageBytes)); err != nil {
+		result.ErrorMessage = err.Error()
+		return result, err
 	}
 
 	// Parse message metadata
