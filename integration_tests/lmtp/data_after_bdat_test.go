@@ -14,7 +14,8 @@ import (
 // (#762). RFC 3030 section 2: "DATA and BDAT commands cannot be used in the same
 // transaction. If a DATA statement is issued after a BDAT for the current transaction, a
 // 503 "Bad sequence of commands" MUST be issued." 502 means the command is not
-// implemented (RFC 5321 section 4.2.4), and DATA is.
+// implemented (RFC 5321 section 4.2.4), and DATA is. MAIL and RCPT inside the BDAT
+// transfer are a bad sequence as well.
 func TestLMTP_DataAfterBDATIsBadSequence(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -36,6 +37,11 @@ func TestLMTP_DataAfterBDATIsBadSequence(t *testing.T) {
 		{"RCPT TO:<" + account.Email + ">", "250 "},
 		// The chunk is "Hello\r\n"; SendCommand adds the CRLF.
 		{"BDAT 7\r\nHello", "250 "},
+		// MAIL and RCPT are out of sequence after BDAT too: RFC 3030 section 2 sends
+		// BDAT "After all MAIL and RCPT responses are collected and processed", and
+		// RFC 5321 section 4.3.2 lists 503, not 502, for both.
+		{"MAIL FROM:<other@example.org>", "503 5.5.1 "},
+		{"RCPT TO:<" + account.Email + ">", "503 5.5.1 "},
 		{"DATA", "503 5.5.1 "},
 		// The state after the 503 is indeterminate; RSET clears it.
 		{"RSET", "250 "},
