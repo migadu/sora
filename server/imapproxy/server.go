@@ -179,6 +179,7 @@ type ServerOptions struct {
 	RemoteTLS                bool
 	RemoteTLSUseStartTLS     bool // Dial the backend in plaintext and upgrade with STARTTLS after its greeting (requires RemoteTLS)
 	RemoteTLSVerify          bool
+	RemoteTLSCAFile          string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
 	RemoteUseProxyProtocol   bool
 	ConnectTimeout           time.Duration
 	AuthIdleTimeout          time.Duration
@@ -274,6 +275,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		RemoteAddrs:        opts.RemoteAddrs,
 		RemotePort:         opts.RemotePort,
 		Settings:           proxy.BackendSettings{TLS: opts.RemoteTLS, TLSUseStartTLS: opts.RemoteTLSUseStartTLS, TLSVerify: opts.RemoteTLSVerify, UseProxyProtocol: opts.RemoteUseProxyProtocol},
+		RemoteTLSCAFile:    opts.RemoteTLSCAFile,
 		ConnectTimeout:     connectTimeout,
 		RoutingLookup:      routingLookup,
 		ServerName:         opts.Name,
@@ -470,40 +472,20 @@ func (s *Server) connConfig() server.SoraConnConfig {
 // Start starts the IMAP proxy server.
 func (s *Server) Start() error {
 
-	// Three TLS scenarios:
-	// 1. Per-server TLS: cert files provided
-	// 2. Global TLS: tls=true, no cert files, global TLS config provided
-	// 3. No TLS: tls=false
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (server.ListenerTLS).
 	var tlsConfig *tls.Config
-	if s.tls && s.tlsCertFile != "" && s.tlsKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
+	if s.tls {
+		var err error
+		tlsConfig, err = server.ListenerTLS{
+			Protocol: "IMAP proxy", Name: s.name,
+			CertFile: s.tlsCertFile, KeyFile: s.tlsKeyFile, Verify: s.tlsVerify,
+			Global: s.tlsConfig, ALPN: []string{"imap"},
+		}.Config()
 		if err != nil {
 			s.cancel()
-			return fmt.Errorf("failed to load TLS certificate: %w", err)
+			return err
 		}
-
-		clientAuth := tls.NoClientCert
-		if s.tlsVerify {
-			clientAuth = tls.RequireAndVerifyClientCert
-		}
-
-		tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               clientAuth,
-			ServerName:               s.hostname,
-			PreferServerCipherSuites: true,
-			NextProtos:               []string{"imap"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-	} else if s.tls && s.tlsConfig != nil {
-		// Scenario 2: Global TLS manager
-		tlsConfig = s.tlsConfig
-	} else if s.tls {
-		// TLS enabled but no cert files and no global TLS config provided
-		s.cancel()
-		return fmt.Errorf("TLS enabled for IMAP proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", s.name)
 	}
 
 	s.listenerMu.Lock()
@@ -821,15 +803,23 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 		next.maxAuthErrors = newVal
 		reloaded = append(reloaded, "max_auth_errors")
 	}
-	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != next.authIdleTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetAuthIdleTimeout(); err != nil {
+		logger.Warn("IMAP proxy config reload: invalid auth_idle_timeout, keeping the running value", "name", s.name, "error", err, "running", next.authIdleTimeout)
+	} else if timeout != next.authIdleTimeout {
 		next.authIdleTimeout = timeout
 		reloaded = append(reloaded, "auth_idle_timeout")
 	}
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("IMAP proxy config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("IMAP proxy config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}

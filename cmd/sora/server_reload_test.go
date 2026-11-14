@@ -301,9 +301,10 @@ func TestServerReloadReportsAddedAndRemovedServers(t *testing.T) {
 	}
 }
 
-// A server that has no ReloadConfig (metrics), or has not registered for reload yet
-// (still starting), applies nothing a reload reads, so every change to its block needs a
-// restart. These went unreported: the report covered registered servers only.
+// A server that has no ReloadConfig (metrics), or that start-up skipped (a User API
+// without a jwt_secret), applies nothing a reload reads, so every change to its block
+// needs a restart. These went unreported: the report covered registered servers only.
+// (A reload waits for the servers still starting: startWhenServersRegistered.)
 func TestServerReloadReportsServersThatDoNotReload(t *testing.T) {
 	logs := captureReloadLogs(t)
 	deps := &serverDependencies{config: config.NewDefaultConfig()}

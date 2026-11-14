@@ -327,40 +327,19 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		server.listenBacklog = 1024 // Default backlog
 	}
 
-	// Setup TLS: the global [tls] manager's config when there is one, the
-	// per-server certificate files otherwise.
-	if options.TLS && options.TLSConfig != nil {
-		if options.TLSCertFile != "" || options.TLSKeyFile != "" {
-			logger.Warn("POP3: tls_cert_file/tls_key_file ignored - global [tls] is enabled", "name", name)
-		}
-		server.tlsConfig = options.TLSConfig
-	} else if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (serverPkg.ListenerTLS).
+	if options.TLS {
+		tlsConfig, err := serverPkg.ListenerTLS{
+			Protocol: "POP3", Name: name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig, ALPN: []string{"pop3"},
+		}.Config()
 		if err != nil {
 			serverCancel()
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-		server.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12, // Allow older TLS versions for better compatibility
-			ClientAuth:               tls.NoClientCert,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true, // Prefer server cipher suites over client cipher suites
-			NextProtos:               []string{"pop3"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-
-		// Set InsecureSkipVerify if requested (for self-signed certificates)
-		// This setting on the server listener is intended to control client certificate
-		// verification, which is now explicitly disabled via `ClientAuth: tls.NoClientCert`.
-		if !options.TLSVerify {
-			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
-			logger.Debug("POP3: WARNING - TLS certificate verification not enforced", "name", name)
-		}
-	} else if options.TLS {
-		// Without a certificate the listener would be plaintext on the port meant for TLS.
-		serverCancel()
-		return nil, fmt.Errorf("TLS enabled for POP3 [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
+		server.tlsConfig = tlsConfig
 	}
 
 	// Start connection limiter cleanup
@@ -875,7 +854,11 @@ func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *s.settings.Load()
 
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.libCommandTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("POP3 config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.libCommandTimeout)
+	} else if timeout != next.libCommandTimeout {
 		// Mirror construction: the raw value feeds the per-command execution
 		// timeout (0 = disabled) while the idle timeout keeps the RFC 1939 §3
 		// 10-minute floor.
@@ -887,7 +870,9 @@ func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 		reloaded = append(reloaded, "command_timeout")
 		reportCommandTimeout(timeout)
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("POP3 config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
@@ -895,7 +880,9 @@ func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if limit, err := cfg.GetSessionMemoryLimit(); err == nil && limit != next.sessionMemoryLimit {
+	if limit, err := cfg.GetSessionMemoryLimit(); err != nil {
+		logger.Warn("POP3 config reload: invalid session_memory_limit, keeping the running value", "name", s.name, "error", err, "running", next.sessionMemoryLimit)
+	} else if limit != next.sessionMemoryLimit {
 		next.sessionMemoryLimit = limit
 		reloaded = append(reloaded, "session_memory_limit")
 	}
@@ -983,12 +970,17 @@ func (s *POP3Server) Authenticate(ctx context.Context, address, password string)
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, password); err != nil {
-		// Cache negative result for invalid password if enabled
-		if s.lookupCache != nil {
+		reason := "invalid_password"
+		if errors.Is(err, db.ErrUnverifiableHash) {
+			// No password matches the stored hash: not a wrong password, so nothing is
+			// cached. VerifyPassword logged why, without the address.
+			reason = "unverifiable_hash"
+		} else if s.lookupCache != nil {
+			// Cache negative result for invalid password if enabled
 			// AuthInvalidPassword = 2 (from lookupcache package)
 			s.lookupCache.SetFailure(address, 2)
 		}
-		logger.Info("authentication failed", "address", address, "reason", "invalid_password", "cached", false, "method", "main_db")
+		logger.Info("authentication failed", "address", address, "reason", reason, "cached", false, "method", "main_db")
 		return 0, err
 	}
 

@@ -68,10 +68,7 @@ type Server struct {
 	maxConnections int                  // Max concurrent connections; 0 -> unlimited
 	server         *http.Server
 	tls            bool
-	tlsConfig      *tls.Config // TLS config from manager (takes precedence) or nil
-	tlsCertFile    string
-	tlsKeyFile     string
-	tlsVerify      bool
+	tlsConfig      *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
 	hostname       string
 	// instanceID is the upload-lease key (pending_uploads.instance_id), distinct from
 	// hostname, which is the SMTP-visible name stamped into Received headers.
@@ -241,13 +238,18 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		return nil, err
 	}
 
-	// Validate TLS configuration
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (server.ListenerTLS).
+	var tlsConfig *tls.Config
 	if options.TLS {
-		// If TLSConfig is provided (from manager), use it. Otherwise require cert files.
-		if options.TLSConfig == nil {
-			if options.TLSCertFile == "" || options.TLSKeyFile == "" {
-				return nil, fmt.Errorf("TLS certificate and key files are required when TLS is enabled (or use TLS manager)")
-			}
+		var err error
+		tlsConfig, err = server.ListenerTLS{
+			Protocol: "Admin API", Name: options.Name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig,
+		}.Config()
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -280,10 +282,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		maxMessageSize:     options.MaxMessageSize,
 		maxConnections:     options.MaxConnections,
 		tls:                options.TLS,
-		tlsConfig:          options.TLSConfig,
-		tlsCertFile:        options.TLSCertFile,
-		tlsKeyFile:         options.TLSKeyFile,
-		tlsVerify:          options.TLSVerify,
+		tlsConfig:          tlsConfig,
 		hostname:           options.Hostname,
 		instanceID:         options.InstanceID,
 		uploadMaxAttempts:  options.UploadMaxAttempts,
@@ -453,31 +452,12 @@ func (s *Server) start(ctx context.Context) error {
 		listener = netutil.LimitListener(listener, s.maxConnections)
 	}
 
-	// Start server with or without TLS
+	// Start server with or without TLS. The certificate is in TLSConfig
+	// already: certificate files passed to ServeTLS would be loaded again and
+	// served, next to the global certificate, to clients that send no SNI.
 	if s.tls {
-		// Use TLS config from manager if provided, otherwise create one for static certs
-		var tlsConfig *tls.Config
-		if s.tlsConfig != nil {
-			// Clone the manager's TLS config
-			tlsConfig = s.tlsConfig.Clone()
-		} else {
-			// Create new TLS config for static certificates
-			tlsConfig = &tls.Config{
-				MinVersion:    tls.VersionTLS12,
-				Renegotiation: tls.RenegotiateNever,
-			}
-		}
-
-		// Apply client verification settings
-		if s.tlsVerify {
-			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-		} else {
-			tlsConfig.ClientAuth = tls.NoClientCert
-		}
-		s.server.TLSConfig = tlsConfig
-
-		// Serve with TLS using the listener
-		return s.server.ServeTLS(listener, s.tlsCertFile, s.tlsKeyFile)
+		s.server.TLSConfig = s.tlsConfig
+		return s.server.ServeTLS(listener, "", "")
 	}
 	return s.server.Serve(listener)
 }
@@ -743,9 +723,9 @@ type KickConnectionsRequest struct {
 	ClientAddr string `json:"client_addr,omitempty"`
 }
 
-// ConnectionInfo is one entry of GET /admin/connections: an account with sessions on
-// one of this node's connection trackers. There is one entry per account and tracker,
-// not per session.
+// ConnectionInfo is one entry of GET /admin/connections and GET
+// /admin/connections/user/{email}: an account on one of this node's connection
+// trackers. There is one entry per account and tracker, not per session.
 type ConnectionInfo struct {
 	Protocol   string    `json:"protocol"` // tracker key up to its first dash, e.g. "IMAP"
 	Instance   string    `json:"instance"` // tracker key, e.g. "IMAP-node1-imap-proxy"
@@ -754,18 +734,6 @@ type ConnectionInfo struct {
 	TotalCount int       `json:"total_count"` // LocalCount plus the sessions other nodes report for the protocol through gossip
 	LastUpdate time.Time `json:"last_update"`
 	Email      string    `json:"email"` // address of the session that created the entry (the recipient on an LMTP proxy)
-}
-
-// UserConnectionInfo is one entry of GET /admin/connections/user/{email}. Unlike
-// ConnectionInfo, Protocol is the whole tracker key, and an account this tracker knows
-// only through gossip is listed too, with LocalCount 0.
-type UserConnectionInfo struct {
-	Protocol   string    `json:"protocol"` // tracker key, e.g. "IMAP-node1-imap-proxy"
-	AccountID  int64     `json:"account_id"`
-	Email      string    `json:"email"`
-	LocalCount int       `json:"local_count"`
-	TotalCount int       `json:"total_count"`
-	LastUpdate time.Time `json:"last_update"`
 }
 
 // Import/Export request types removed - these operations are not suitable
@@ -1385,6 +1353,20 @@ func extractProtocolFromKey(key string) string {
 	return key
 }
 
+// newConnectionInfo is the entry for an account on the tracker keyed trackerKey, with
+// localCount of its sessions on that tracker.
+func newConnectionInfo(trackerKey string, localCount int, conn server.UserConnectionInfo) ConnectionInfo {
+	return ConnectionInfo{
+		Protocol:   extractProtocolFromKey(trackerKey),
+		Instance:   trackerKey,
+		AccountID:  conn.AccountID,
+		LocalCount: localCount,
+		TotalCount: conn.GetTotalCount(),
+		LastUpdate: conn.LastUpdate,
+		Email:      conn.Username,
+	}
+}
+
 func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 	trackers := s.trackers()
 	if len(trackers) == 0 {
@@ -1415,20 +1397,7 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 				continue // Skip - this is only gossip data, not an actual connection on this instance
 			}
 
-			// Extract protocol from tracker key
-			// Key format: "PROTOCOL-node-servername" (proxies) or "PROTOCOL-servername"
-			// Display: Just "PROTOCOL" for simplicity
-			protocol := extractProtocolFromKey(trackerKey)
-
-			allConnections = append(allConnections, ConnectionInfo{
-				Protocol:   protocol,
-				Instance:   trackerKey, // Full key for debugging/filtering
-				AccountID:  connInfo.AccountID,
-				LocalCount: localCount,
-				TotalCount: connInfo.GetTotalCount(),
-				LastUpdate: connInfo.LastUpdate,
-				Email:      connInfo.Username,
-			})
+			allConnections = append(allConnections, newConnectionInfo(trackerKey, localCount, connInfo))
 		}
 	}
 
@@ -1595,10 +1564,12 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 	// Collect connections for this user from all trackers
 	// Filter by email string matching (case-insensitive) - no database lookup needed
 	// The connection tracker already stores the username (email) via gossip
-	userConnections := make([]UserConnectionInfo, 0)
+	// Unlike GET /admin/connections, a tracker that knows the account only through
+	// gossip is listed too (local count 0): it reports the sessions on other nodes.
+	userConnections := make([]ConnectionInfo, 0)
 	emailLower := strings.ToLower(email)
 
-	for protocol, tracker := range trackers {
+	for trackerKey, tracker := range trackers {
 		if tracker == nil {
 			continue
 		}
@@ -1607,14 +1578,7 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		for _, connInfo := range conns {
 			// Match email case-insensitively
 			if strings.ToLower(connInfo.Username) == emailLower {
-				userConnections = append(userConnections, UserConnectionInfo{
-					Protocol:   protocol,
-					AccountID:  connInfo.AccountID,
-					Email:      connInfo.Username,
-					LocalCount: connInfo.GetLocalCount(instanceID),
-					TotalCount: connInfo.GetTotalCount(),
-					LastUpdate: connInfo.LastUpdate,
-				})
+				userConnections = append(userConnections, newConnectionInfo(trackerKey, connInfo.GetLocalCount(instanceID), connInfo))
 			}
 		}
 	}

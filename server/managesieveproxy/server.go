@@ -63,10 +63,7 @@ type Server struct {
 	masterPassword     []byte
 	tls                bool
 	tlsUseStartTLS     bool
-	tlsCertFile        string
-	tlsKeyFile         string
-	tlsVerify          bool
-	tlsConfig          *tls.Config // Global TLS config from TLS manager or per-server config
+	tlsConfig          *tls.Config // What the listener serves with (server.ListenerTLS); nil without tls
 	connManager        *proxy.ConnectionManager
 	connTracker        *server.ConnectionTracker
 	wg                 sync.WaitGroup
@@ -130,6 +127,7 @@ type ServerOptions struct {
 	RemoteTLS                bool
 	RemoteTLSUseStartTLS     bool // Use STARTTLS for backend connections
 	RemoteTLSVerify          bool
+	RemoteTLSCAFile          string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
 	RemoteUseProxyProtocol   bool
 	ConnectTimeout           time.Duration
 	AuthIdleTimeout          time.Duration
@@ -213,6 +211,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		RemoteAddrs:        opts.RemoteAddrs,
 		RemotePort:         opts.RemotePort,
 		Settings:           proxy.BackendSettings{TLS: opts.RemoteTLS, TLSUseStartTLS: opts.RemoteTLSUseStartTLS, TLSVerify: opts.RemoteTLSVerify, UseProxyProtocol: opts.RemoteUseProxyProtocol},
+		RemoteTLSCAFile:    opts.RemoteTLSCAFile,
 		ConnectTimeout:     connectTimeout,
 		RoutingLookup:      routingLookup,
 		ServerName:         opts.Name,
@@ -329,9 +328,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		masterPassword:             []byte(opts.MasterPassword),
 		tls:                        opts.TLS,
 		tlsUseStartTLS:             opts.TLSUseStartTLS,
-		tlsCertFile:                opts.TLSCertFile,
-		tlsKeyFile:                 opts.TLSKeyFile,
-		tlsVerify:                  opts.TLSVerify,
 		connManager:                connManager,
 		ctx:                        ctx,
 		cancel:                     cancel,
@@ -358,38 +354,19 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		debug:                  opts.Debug,
 	})
 
-	// Setup TLS config: Support both implicit TLS and STARTTLS
-	// 1. Per-server TLS: cert files provided (for both implicit TLS and STARTTLS)
-	// 2. Global TLS: opts.TLS=true, no cert files, global TLS config provided (for both implicit TLS and STARTTLS)
-	// 3. No TLS: opts.TLS=false
-	if opts.TLS && opts.TLSCertFile != "" && opts.TLSKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(opts.TLSCertFile, opts.TLSKeyFile)
+	// One TLS config for implicit TLS and STARTTLS; the certificate source and
+	// tls_verify follow the rule every listener shares (server.ListenerTLS).
+	if opts.TLS {
+		tlsConfig, err := server.ListenerTLS{
+			Protocol: "ManageSieve proxy", Name: opts.Name,
+			CertFile: opts.TLSCertFile, KeyFile: opts.TLSKeyFile, Verify: opts.TLSVerify,
+			Global: opts.TLSConfig, ALPN: []string{"sieve"},
+		}.Config()
 		if err != nil {
 			cancel()
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-		clientAuth := tls.NoClientCert
-		if opts.TLSVerify {
-			clientAuth = tls.RequireAndVerifyClientCert
-		}
-
-		s.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               clientAuth,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true,
-			NextProtos:               []string{"sieve"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-	} else if opts.TLS && opts.TLSConfig != nil {
-		// Scenario 2: Global TLS manager (works for both implicit TLS and STARTTLS)
-		s.tlsConfig = opts.TLSConfig
-	} else if opts.TLS {
-		// TLS enabled but no cert files and no global TLS config provided
-		cancel()
-		return nil, fmt.Errorf("TLS enabled for ManageSieve proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", opts.Name)
+		s.tlsConfig = tlsConfig
 	}
 
 	s.msLibServer.Store(s.buildLibServer())
@@ -542,14 +519,13 @@ func (s *Server) connConfig() server.SoraConnConfig {
 // Start starts the ManageSieve proxy server.
 func (s *Server) Start() error {
 
-	// Four TLS scenarios:
-	// 1. Per-server TLS with cert files (implicit TLS): Use static certificate with TLS listener
-	// 2. Global TLS manager (implicit TLS): Use dynamic certificate with TLS listener
-	// 3. STARTTLS mode: Use plain listener, upgrade to TLS in session after STARTTLS command
-	// 4. No TLS: Plain text listener
+	// Three TLS scenarios (New resolved the certificate source into s.tlsConfig):
+	// 1. Implicit TLS: TLS listener
+	// 2. STARTTLS mode: Use plain listener, upgrade to TLS in session after STARTTLS command
+	// 3. No TLS: Plain text listener
 
-	if s.tls && !s.tlsUseStartTLS && s.tlsCertFile != "" && s.tlsKeyFile != "" {
-		// Scenario 1: Per-server TLS with cert files (implicit TLS)
+	if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
+		// Scenario 1: Implicit TLS
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
 		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -557,25 +533,12 @@ func (s *Server) Start() error {
 			s.listenerMu.Unlock()
 			return fmt.Errorf("failed to start TCP listener: %w", err)
 		}
-		logger.Debug("ManageSieve Proxy: Using listen backlog with per-server TLS (implicit)", "proxy", s.name, "backlog", s.listenBacklog)
+		logger.Debug("ManageSieve Proxy: Using listen backlog with implicit TLS", "proxy", s.name, "backlog", s.listenBacklog)
 		// Use SoraTLSListener for implicit TLS with JA4 capture and timeout protection
 		s.listener = server.NewSoraTLSListenerFunc(s.wrapProxyProtocol(tcpListener), s.tlsConfig, s.connConfig)
 		s.listenerMu.Unlock()
-	} else if s.tls && !s.tlsUseStartTLS && s.tlsConfig != nil {
-		// Scenario 2: Global TLS manager (implicit TLS)
-		s.listenerMu.Lock()
-		// Create base TCP listener with custom backlog
-		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
-		if err != nil {
-			s.listenerMu.Unlock()
-			return fmt.Errorf("failed to start TCP listener: %w", err)
-		}
-		logger.Debug("ManageSieve Proxy: Using listen backlog with global TLS manager (implicit)", "proxy", s.name, "backlog", s.listenBacklog)
-		// Use SoraTLSListener with global TLS config for implicit TLS
-		s.listener = server.NewSoraTLSListenerFunc(s.wrapProxyProtocol(tcpListener), s.tlsConfig, s.connConfig)
-		s.listenerMu.Unlock()
 	} else if s.tls && s.tlsUseStartTLS {
-		// Scenario 3: STARTTLS mode - plain listener, TLS upgrade happens in session
+		// Scenario 2: STARTTLS mode - plain listener, TLS upgrade happens in session
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
 		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -592,7 +555,7 @@ func (s *Server) Start() error {
 		s.cancel()
 		return fmt.Errorf("TLS enabled for ManageSieve proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", s.name)
 	} else {
-		// Scenario 4: No TLS - plain text listener
+		// Scenario 3: No TLS - plain text listener
 		s.listenerMu.Lock()
 		// Create base TCP listener with custom backlog
 		tcpListener, err := server.ListenWithBacklog(context.Background(), "tcp", s.addr, s.listenBacklog)
@@ -852,15 +815,23 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 		next.maxAuthErrors = newVal
 		reloaded = append(reloaded, "max_auth_errors")
 	}
-	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != next.authIdleTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetAuthIdleTimeout(); err != nil {
+		logger.Warn("ManageSieve proxy config reload: invalid auth_idle_timeout, keeping the running value", "name", s.name, "error", err, "running", next.authIdleTimeout)
+	} else if timeout != next.authIdleTimeout {
 		next.authIdleTimeout = timeout
 		reloaded = append(reloaded, "auth_idle_timeout")
 	}
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("ManageSieve proxy config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("ManageSieve proxy config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}

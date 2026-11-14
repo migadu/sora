@@ -302,7 +302,7 @@ func (si *S3Importer) performDryRun() error {
 	// Get account ID once
 	accountID, err := si.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", si.options.Email, err, si.options.Email)
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", si.options.Email, err, si.options.Email)
 	}
 
 	rows, err := si.db.Query(`
@@ -450,7 +450,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 
 	accountID, err := si.rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
 	if err != nil {
-		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --address %s --password <password>", si.options.Email, err, si.options.Email)
+		return fmt.Errorf("account not found for %s: %w\nHint: Create the account first using: sora-admin accounts create --email %s --password <password>", si.options.Email, err, si.options.Email)
 	}
 	user := server.NewUser(address, accountID)
 

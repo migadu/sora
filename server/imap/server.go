@@ -802,44 +802,18 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// commands (notably MYRIGHTS) are functional on a user's own mailboxes
 	// regardless of whether shared mailboxes are configured.
 
-	// Setup TLS: the global [tls] manager's config when there is one, the
-	// per-server certificate files otherwise.
-	if options.TLS && options.TLSConfig != nil {
-		if options.TLSCertFile != "" || options.TLSKeyFile != "" {
-			logger.Warn("IMAP: tls_cert_file/tls_key_file ignored - global [tls] is enabled", "name", name)
-		}
-		s.tlsConfig = options.TLSConfig
-	} else if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
-		logger.Debug("IMAP: Loading TLS certificate", "name", name, "cert", options.TLSCertFile, "key", options.TLSKeyFile)
-		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (serverPkg.ListenerTLS).
+	if options.TLS {
+		tlsConfig, err := serverPkg.ListenerTLS{
+			Protocol: "IMAP", Name: name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig, ALPN: []string{"imap"},
+		}.Config()
 		if err != nil {
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-
-		// Warn if the certificate chain is incomplete.
-		if len(cert.Certificate) < 2 {
-			logger.Debug("IMAP: WARNING - TLS certificate file contains only one certificate, should contain full chain", "name", name, "cert_file", options.TLSCertFile)
-		}
-
-		s.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12, // Allow older TLS versions for better compatibility
-			ClientAuth:               tls.NoClientCert,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true, // Prefer server cipher suites over client cipher suites
-			NextProtos:               []string{"imap"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-
-		// This setting on the server listener is intended to control client certificate
-		// verification, which is now explicitly disabled via `ClientAuth: tls.NoClientCert`.
-		if !options.TLSVerify {
-			// The InsecureSkipVerify field is for client-side verification, so it's not set here.
-			logger.Debug("IMAP: WARNING - Client TLS certificate verification not enforced", "name", name)
-		}
-	} else if options.TLS {
-		// Without a certificate the listener would be plaintext on the port meant for TLS.
-		return nil, fmt.Errorf("TLS enabled for IMAP [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", name)
+		s.tlsConfig = tlsConfig
 	}
 
 	var debugWriter io.Writer
@@ -1610,8 +1584,10 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 
 	logger.Debug("IMAP: Starting cache warmup", "name", s.name, "account_id", job.accountID, "message_count", job.messageCount, "mailboxes", job.mailboxNames)
 
-	// Get recent message content hashes from database through cache
-	messageHashes, err := s.cache.GetRecentMessagesForWarmup(warmupCtx, job.accountID, job.mailboxNames, job.messageCount)
+	// Get the bodies of the recent messages, each with the S3 key its message row was
+	// stored under. The key keeps the address that was primary when the body was stored,
+	// so it cannot be rebuilt from the account's current primary address.
+	messageBodies, err := s.rdb.GetRecentMessagesForWarmupWithRetry(warmupCtx, job.accountID, job.mailboxNames, job.messageCount)
 	if err != nil {
 		logger.Debug("IMAP: Failed to get recent messages for warmup", "name", s.name, "error", err)
 		metrics.WarmupOperationsTotal.WithLabelValues(s.name, "error").Inc()
@@ -1619,9 +1595,9 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 	}
 
 	totalHashes := 0
-	for mailbox, hashes := range messageHashes {
-		totalHashes += len(hashes)
-		logger.Debug("IMAP: Warmup found messages in mailbox", "name", s.name, "count", len(hashes), "mailbox", mailbox)
+	for mailbox, bodies := range messageBodies {
+		totalHashes += len(bodies)
+		logger.Debug("IMAP: Warmup found messages in mailbox", "name", s.name, "count", len(bodies), "mailbox", mailbox)
 	}
 
 	if totalHashes == 0 {
@@ -1630,20 +1606,13 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 		return
 	}
 
-	// Get user's primary email for S3 key construction
-	address, err := s.rdb.GetPrimaryEmailForAccountWithRetry(warmupCtx, job.accountID)
-	if err != nil {
-		logger.Debug("IMAP: Warmup - failed to get primary address", "name", s.name, "account_id", job.accountID, "error", err)
-		metrics.WarmupOperationsTotal.WithLabelValues(s.name, "error").Inc()
-		return
-	}
-
 	warmedCount := 0
 	skippedCount := 0
 
 	// Pre-fetch each message content
-	for _, hashes := range messageHashes {
-		for _, contentHash := range hashes {
+	for _, bodies := range messageBodies {
+		for _, body := range bodies {
+			contentHash := body.ContentHash
 			// Check for context cancellation
 			select {
 			case <-warmupCtx.Done():
@@ -1672,10 +1641,8 @@ func (s *IMAPServer) executeWarmup(job warmupJob) {
 				continue // Already cached
 			}
 
-			// Build S3 key and fetch from S3 (best-effort)
-			s3Key := helpers.NewS3Key(address.Domain(), address.LocalPart(), contentHash)
-
-			reader, fetchErr := s.s3.GetWithRetry(warmupCtx, s3Key)
+			// Fetch from S3 (best-effort)
+			reader, fetchErr := s.s3.GetWithRetry(warmupCtx, body.Key())
 			if fetchErr != nil {
 				logger.Debug("IMAP: Warmup - skipping, failed to fetch from S3", "name", s.name, "hash", contentHash, "error", fetchErr)
 				skippedCount++
@@ -1889,12 +1856,18 @@ func (s *IMAPServer) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *s.settings.Load()
 
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("IMAP config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 		s.reportCommandTimeout(timeout)
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("IMAP config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
@@ -1902,7 +1875,9 @@ func (s *IMAPServer) ReloadConfig(cfg config.ServerConfig) error {
 		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if limit, err := cfg.GetSessionMemoryLimit(); err == nil && limit != next.sessionMemoryLimit {
+	if limit, err := cfg.GetSessionMemoryLimit(); err != nil {
+		logger.Warn("IMAP config reload: invalid session_memory_limit, keeping the running value", "name", s.name, "error", err, "running", next.sessionMemoryLimit)
+	} else if limit != next.sessionMemoryLimit {
 		next.sessionMemoryLimit = limit
 		reloaded = append(reloaded, "session_memory_limit")
 		warnAppendLimitOverSessionMemory(s.name, s.appendLimit, limit)
@@ -1990,12 +1965,17 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 
 	// Verify password
 	if err := db.VerifyPassword(hashedPassword, password); err != nil {
-		// Cache negative result for invalid password if enabled
-		if s.lookupCache != nil {
+		reason := "invalid_password"
+		if errors.Is(err, db.ErrUnverifiableHash) {
+			// No password matches the stored hash: not a wrong password, so nothing is
+			// cached. VerifyPassword logged why, without the address.
+			reason = "unverifiable_hash"
+		} else if s.lookupCache != nil {
+			// Cache negative result for invalid password if enabled
 			// AuthInvalidPassword = 2 (from lookupcache package)
 			s.lookupCache.SetFailure(address, 2)
 		}
-		logger.Info("authentication failed", "address", address, "reason", "invalid_password", "cached", false, "method", "main_db")
+		logger.Info("authentication failed", "address", address, "reason", reason, "cached", false, "method", "main_db")
 		return 0, err
 	}
 

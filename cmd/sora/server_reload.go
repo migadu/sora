@@ -51,9 +51,11 @@ var reloadableServerSettings = map[string][]string{
 // reloadServers hands each running server its [[server]] block from newCfg, the config
 // a SIGHUP re-read, by name, and reports what the reload leaves for a restart: the
 // settings a block changed that its server does not apply (all of them for a server
-// that does not reload: metrics, or one not registered yet), a block removed from the
-// file, whose server keeps running, and a block added to it, which is not started. The
-// config the servers started with, deps.config, is read and never written.
+// that does not reload: metrics, or one start-up skipped, such as an Admin API without
+// an api_key; a reload waits for the servers still starting), a block removed from the
+// file or set to enabled = false, whose server keeps running, and a block added to it
+// or enabled, which is not started. The config the servers started with, deps.config,
+// is read and never written.
 func (deps *serverDependencies) reloadServers(newCfg *config.Config) {
 	newServers := newCfg.GetAllServers()
 	newByName := make(map[string]config.ServerConfig, len(newServers))

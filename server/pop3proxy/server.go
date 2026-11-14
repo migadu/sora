@@ -3,11 +3,9 @@ package pop3proxy
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -255,6 +253,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		RemoteAddrs:        options.RemoteAddrs,
 		RemotePort:         options.RemotePort,
 		Settings:           proxy.BackendSettings{TLS: options.RemoteTLS, TLSUseStartTLS: options.RemoteTLSUseStartTLS, TLSVerify: options.RemoteTLSVerify, UseProxyProtocol: options.RemoteUseProxyProtocol},
+		RemoteTLSCAFile:    options.RemoteTLSCAFile,
 		ConnectTimeout:     connectTimeout,
 		RoutingLookup:      routingLookup,
 		ServerName:         options.Name,
@@ -275,29 +274,6 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// up without a restart; remote_dns_refresh tunes or disables that.
 	if options.RemoteDNSRefresh != nil {
 		connManager.SetResolveRefreshInterval(*options.RemoteDNSRefresh)
-	}
-
-	// Custom CA for backend certificate verification (private-CA or
-	// self-signed backends): keeps remote_tls_verify usable instead of
-	// forcing it off.
-	if options.RemoteTLSCAFile != "" {
-		pem, err := os.ReadFile(options.RemoteTLSCAFile)
-		if err != nil {
-			if routingLookup != nil {
-				routingLookup.Close()
-			}
-			serverCancel()
-			return nil, fmt.Errorf("failed to read remote_tls_ca_file: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			if routingLookup != nil {
-				routingLookup.Close()
-			}
-			serverCancel()
-			return nil, fmt.Errorf("remote_tls_ca_file %q contains no usable certificates", options.RemoteTLSCAFile)
-		}
-		connManager.SetRemoteTLSRootCAs(pool)
 	}
 
 	// Resolve addresses to expand hostnames to IPs
@@ -419,38 +395,19 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		debug:                  options.Debug,
 	})
 
-	// Setup TLS: Three scenarios
-	// 1. Per-server TLS: cert files provided
-	// 2. Global TLS: options.TLS=true, no cert files, global TLS config provided
-	// 3. No TLS: options.TLS=false
-	if options.TLS && options.TLSCertFile != "" && options.TLSKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(options.TLSCertFile, options.TLSKeyFile)
+	// The certificate source and tls_verify follow the rule every listener
+	// shares (server.ListenerTLS).
+	if options.TLS {
+		tlsConfig, err := server.ListenerTLS{
+			Protocol: "POP3 proxy", Name: options.Name,
+			CertFile: options.TLSCertFile, KeyFile: options.TLSKeyFile, Verify: options.TLSVerify,
+			Global: options.TLSConfig, ALPN: []string{"pop3"},
+		}.Config()
 		if err != nil {
 			serverCancel()
-			return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+			return nil, err
 		}
-		clientAuth := tls.NoClientCert
-		if options.TLSVerify {
-			clientAuth = tls.RequireAndVerifyClientCert
-		}
-
-		srv.tlsConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               clientAuth,
-			ServerName:               hostname,
-			PreferServerCipherSuites: true,
-			NextProtos:               []string{"pop3"},
-			Renegotiation:            tls.RenegotiateNever,
-		}
-	} else if options.TLS && options.TLSConfig != nil {
-		// Scenario 2: Global TLS manager
-		srv.tlsConfig = options.TLSConfig
-	} else if options.TLS {
-		// TLS enabled but no cert files and no global TLS config provided
-		serverCancel()
-		return nil, fmt.Errorf("TLS enabled for POP3 proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", options.Name)
+		srv.tlsConfig = tlsConfig
 	}
 
 	srv.pop3libServer.Store(srv.buildLibServer())
@@ -902,16 +859,23 @@ func (s *POP3ProxyServer) ReloadConfig(cfg config.ServerConfig) error {
 		reloaded = append(reloaded, "max_auth_errors")
 	}
 
-	// Update timeouts (affect new connections only)
-	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != next.authIdleTimeout {
+	// Update timeouts (affect new connections only). A value that does not parse
+	// keeps the running one (start-up, which has none, uses the default).
+	if timeout, err := cfg.GetAuthIdleTimeout(); err != nil {
+		logger.Warn("POP3 proxy config reload: invalid auth_idle_timeout, keeping the running value", "name", s.name, "error", err, "running", next.authIdleTimeout)
+	} else if timeout != next.authIdleTimeout {
 		next.authIdleTimeout = timeout
 		reloaded = append(reloaded, "auth_idle_timeout")
 	}
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("POP3 proxy config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("POP3 proxy config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
