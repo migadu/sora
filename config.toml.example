@@ -1000,6 +1000,8 @@ trusted_networks = []
 # - user_api_proxy: User API proxy server for load balancing
 #
 # IMPORTANT: You must configure at least one server for Sora to start.
+# Every [[server]] block needs type, name and addr; a block missing one stops
+# startup. To keep a block in the file without starting it, add enabled = false.
 
 # IMAP SERVER EXAMPLE
 # =============================================================================
