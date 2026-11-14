@@ -198,6 +198,7 @@ run after it, so with `[logging] output` set to a file their lines go to that fi
 | An IMAP, POP3 or LMTP server is configured and `[s3] endpoint` is empty | `S3 endpoint not specified` |
 | A server that needs the database is configured and there is no database endpoint (see [section 3](#3-defaults)) | `database is required for configured servers but not configured in [database.write] or [database.read]` |
 | `[servers] trusted_networks` has an entry that is neither an IP address nor a CIDR block | names the invalid entry |
+| A server's `auth_rate_limit.exempt_networks` has an entry that is neither an IP address nor a CIDR block | `server "<name>": auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: [...]` |
 | `[relay] type` is set to something other than `"smtp"` or `"http"` | `unsupported [relay] type ...` |
 | `[timeout_scheduler] shard_count` is below -1 | `FATAL: operation 'initialize timeout scheduler' failed: invalid shard count: <n> (must be >= -1)` |
 
