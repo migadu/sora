@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -67,13 +68,40 @@ type Exporter struct {
 
 // NewExporter creates a new Exporter instance.
 func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ExporterOptions) (*Exporter, error) {
+	// Use the shared SQLite database in the maildir path
+	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
+
+	exporter := &Exporter{
+		ctx:          ctx,
+		maildirPath:  maildirPath,
+		email:        email,
+		jobs:         jobs,
+		dbPath:       dbPath,
+		rdb:          rdb,
+		s3:           s3,
+		options:      options,
+		startTime:    time.Now(),
+		uidMappings:  make(map[string][]UIDFileMapping),
+		keywordIndex: make(map[string]map[string]int),
+	}
+
+	// A dry run only reports: it creates neither the maildir nor its cache, and does not
+	// migrate an existing cache. It still reads one, as the export does, to report the
+	// messages already exported there.
+	if options.DryRun {
+		cache, err := openExportCacheForDryRun(dbPath)
+		if err != nil {
+			return nil, err
+		}
+		exporter.db = cache
+		return exporter, nil
+	}
+
 	// Ensure maildir path exists
 	if err := os.MkdirAll(maildirPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create maildir path: %w", err)
 	}
 
-	// Use the shared SQLite database in the maildir path
-	dbPath := filepath.Join(maildirPath, "sora-maildir.db")
 	logger.Info("Using maildir database", "path", dbPath)
 
 	// Open SQLite with proper settings for concurrent access
@@ -154,29 +182,50 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		return nil, fmt.Errorf("failed to create s3_uploaded index: %w", err)
 	}
 
-	exporter := &Exporter{
-		ctx:          ctx,
-		maildirPath:  maildirPath,
-		email:        email,
-		jobs:         jobs,
-		db:           db,
-		dbPath:       dbPath,
-		rdb:          rdb,
-		s3:           s3,
-		options:      options,
-		startTime:    time.Now(),
-		uidMappings:  make(map[string][]UIDFileMapping),
-		keywordIndex: make(map[string]map[string]int),
-	}
-
+	exporter.db = db
 	return exporter, nil
+}
+
+// openExportCacheForDryRun opens the cache of a previous export or import in the maildir
+// for reading, or returns nil when there is none. A missing file is not created
+// (mode=rw), and query_only rejects every write. Not mode=ro: a read-only connection to a
+// WAL-mode database creates its -wal and -shm files but cannot remove them on close.
+func openExportCacheForDryRun(dbPath string) (*sql.DB, error) {
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return nil, nil
+	}
+	absPath, err := filepath.Abs(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve maildir database path: %w", err)
+	}
+	uri := (&url.URL{Scheme: "file", Path: absPath, RawQuery: "mode=rw&_query_only=1&_busy_timeout=5000"}).String()
+	cache, err := sql.Open("sqlite", uri)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
+	}
+	cache.SetMaxOpenConns(1)
+
+	// The export would create the table in a cache without one; nothing is exported yet.
+	var hasMessages bool
+	if err := cache.QueryRow(`SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'messages'`).Scan(&hasMessages); err != nil {
+		cache.Close()
+		return nil, fmt.Errorf("failed to read maildir database %s: %w", dbPath, err)
+	}
+	if !hasMessages {
+		cache.Close()
+		return nil, nil
+	}
+	logger.Info("DRY RUN: Reading maildir database", "path", dbPath)
+	return cache, nil
 }
 
 // Close cleans up resources used by the exporter.
 func (exporter *Exporter) Close() error {
 	if exporter.db != nil {
 		exporter.db.Close()
-		logger.Info("Maildir database saved", "path", exporter.dbPath)
+		if !exporter.options.DryRun {
+			logger.Info("Maildir database saved", "path", exporter.dbPath)
+		}
 	}
 	return nil
 }
@@ -763,6 +812,9 @@ func (exporter *Exporter) buildMaildirFlags(msg *db.Message, mailboxName string)
 // - fileExists: true if file exists on disk, false if needs to be created
 // - filename: original filename from database (empty if not in database)
 func (exporter *Exporter) isMessageExported(contentHash, mailbox string) (bool, string, error) {
+	if exporter.db == nil {
+		return false, "", nil // a dry run against a maildir without a cache
+	}
 	var filename, path string
 	err := exporter.db.QueryRow(
 		"SELECT filename, path FROM messages WHERE hash = ? AND mailbox = ?",
