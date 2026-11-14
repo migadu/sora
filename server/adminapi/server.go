@@ -835,6 +835,12 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 			if hashType == "" {
 				hashType = "bcrypt"
 			}
+			if cred.Password != "" {
+				if err := db.ValidateNewHashType(hashType); err != nil {
+					s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Credential %d: %v", i+1, err))
+					return
+				}
+			}
 
 			dbCredentials[i] = db.CredentialSpec{
 				Email:        cred.Email,
@@ -994,6 +1000,10 @@ func (s *Server) handleAccountExists(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.rdb.AccountExistsWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		logger.Warn("HTTP API: Error checking account existence", "name", s.name, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "Error checking account existence")
 		return
@@ -1014,6 +1024,10 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 
 	accountDetails, err := s.rdb.GetAccountDetailsWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
@@ -1085,6 +1099,10 @@ func (s *Server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	accountID := s.trackedAccountID(ctx, email)
 	err := s.rdb.DeleteAccountWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, err.Error())
 			return
@@ -1116,6 +1134,10 @@ func (s *Server) handleRestoreAccount(w http.ResponseWriter, r *http.Request) {
 
 	err := s.rdb.RestoreAccountWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, err.Error())
 			return
@@ -1188,6 +1210,10 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 
 	err = s.rdb.AddCredentialWithRetry(ctx, addReq)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, consts.ErrDBUniqueViolation) {
 			s.writeError(w, http.StatusConflict, "Credential with this email already exists")
 			return
@@ -1211,6 +1237,10 @@ func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
 
 	credentials, err := s.rdb.ListCredentialsWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, "Account not found")
 			return
@@ -1256,6 +1286,10 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 	accountID := s.trackedAccountID(ctx, email)
 	err := s.rdb.DeleteCredentialWithRetry(ctx, email)
 	if err != nil {
+		if errors.Is(err, server.ErrInvalidAddress) {
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		// Check for specific user-facing errors from the DB layer
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, err.Error())

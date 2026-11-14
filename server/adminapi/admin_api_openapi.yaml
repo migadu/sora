@@ -64,7 +64,7 @@ components:
           type: boolean
         hash_type:
           type: string
-          description: "Password hash type (bcrypt, ssha512, sha512). Defaults to bcrypt if not provided."
+          description: "Hash type for `password` (bcrypt or ssha512; unsalted sha512 is refused). Defaults to bcrypt if not provided."
       required:
         - email
         - is_primary
@@ -1149,6 +1149,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Account'
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Account not found.
           content:
@@ -1266,7 +1272,7 @@ paths:
                     type: string
                     example: "Account soft-deleted successfully. It will be permanently removed after the grace period."
         '400':
-          description: Account is already deleted.
+          description: Account is already deleted, or the address does not parse.
           content:
             application/json:
               schema:
@@ -1313,7 +1319,7 @@ paths:
                     type: string
                     example: "Account restored successfully."
         '400':
-          description: Account is not deleted or cannot be restored.
+          description: Account is not deleted or cannot be restored, or the address does not parse.
           content:
             application/json:
               schema:
@@ -1351,6 +1357,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AccountExists'
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
           content:
@@ -1651,6 +1663,7 @@ paths:
             - Missing required field `email`
             - Neither `password` nor `password_hash` provided  
             - Both `password` and `password_hash` provided (only one allowed)
+            - `email` does not parse as an address
           content:
             application/json:
               schema:
@@ -1738,7 +1751,7 @@ paths:
                   message:
                     type: string
         '400':
-          description: Bad request. The credential is the primary or last credential for the account.
+          description: Bad request. The credential is the primary or last credential for the account, or the address does not parse.
           content:
             application/json:
               schema:

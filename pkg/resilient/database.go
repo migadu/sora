@@ -104,6 +104,7 @@ import (
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/retry"
+	"github.com/migadu/sora/server"
 )
 
 // DatabasePool represents a single database connection pool with health tracking
@@ -218,6 +219,7 @@ func isQuerySuccessful(err error) bool {
 		errors.Is(err, consts.ErrNotPermitted) ||
 		errors.Is(err, consts.ErrDBNotFound) ||
 		errors.Is(err, consts.ErrMessageExists) ||
+		errors.Is(err, server.ErrInvalidAddress) ||
 		errors.Is(err, pgx.ErrNoRows) {
 		return true
 	}
@@ -245,6 +247,7 @@ func isWriteSuccessful(err error) bool {
 		errors.Is(err, consts.ErrDBNotFound) ||
 		errors.Is(err, consts.ErrDBUniqueViolation) ||
 		errors.Is(err, consts.ErrMessageExists) ||
+		errors.Is(err, server.ErrInvalidAddress) ||
 		errors.Is(err, pgx.ErrNoRows) {
 		return true
 	}
@@ -538,6 +541,7 @@ func (rd *ResilientDatabase) isBusinessLogicError(err error) bool {
 		errors.Is(err, consts.ErrDBNotFound) ||
 		errors.Is(err, consts.ErrDBUniqueViolation) ||
 		errors.Is(err, consts.ErrMessageExists) ||
+		errors.Is(err, server.ErrInvalidAddress) ||
 		errors.Is(err, pgx.ErrNoRows)
 }
 
