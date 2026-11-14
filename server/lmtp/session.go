@@ -497,9 +497,9 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	// Cap the delivery pipeline (SIEVE, spool, DB insert) from this point for
 	// the same reason: the body read above is client-paced wire I/O already
-	// governed by the server ReadTimeout and must not consume the execution
-	// budget. On expiry the pipeline aborts with a 4xx and the upstream MTA
-	// requeues the message.
+	// governed by the server ReadTimeout (per read) and DataTimeout (in total)
+	// and must not consume the execution budget. On expiry the pipeline aborts
+	// with a 4xx and the upstream MTA requeues the message.
 	ctx, cancel := applyCommandTimeout(ctx, "DATA", s.backend.commandTimeouts)
 	defer cancel()
 
