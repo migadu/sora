@@ -20,6 +20,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
+	"golang.org/x/net/idna"
 )
 
 // ClientCapabilityFilter defines capability filtering rules for specific clients
@@ -300,7 +301,7 @@ type TLSLetsEncryptS3Config struct {
 // TLSLetsEncryptConfig holds Let's Encrypt automatic certificate management configuration
 type TLSLetsEncryptConfig struct {
 	Email           string                 `toml:"email"`            // Email for Let's Encrypt notifications
-	Domains         []string               `toml:"domains"`          // Domains for certificate (supports multiple)
+	Domains         []string               `toml:"domains"`          // Domains for certificate (supports multiple). Loaded as autocert names: lowercase A-labels without a trailing dot (normalizeDomains)
 	DefaultDomain   string                 `toml:"default_domain"`   // Default domain to use when client doesn't provide SNI (optional, defaults to first domain in list)
 	StorageProvider string                 `toml:"storage_provider"` // Certificate storage backend (currently only "s3")
 	S3              TLSLetsEncryptS3Config `toml:"s3"`               // S3 storage configuration
@@ -308,6 +309,50 @@ type TLSLetsEncryptConfig struct {
 	EnableFallback  *bool                  `toml:"enable_fallback"`  // Enable local filesystem fallback when S3 is unavailable (default: true). Pointer so an absent key is distinguishable from an explicit false.
 	FallbackDir     string                 `toml:"fallback_dir"`     // Local directory for certificate fallback when S3 is unavailable (default: "/var/lib/sora/certs")
 	SyncInterval    string                 `toml:"sync_interval"`    // Interval to check S3 for certificate updates (e.g., "5m"). Default: 5m. Set to "0" to disable periodic sync.
+}
+
+// normalizeDomains rewrites domains and default_domain to the names autocert keeps their
+// certificates under. The certificate sync and the startup pre-warm read the cache under
+// the configured names, so a name kept as written ("Mail.Example.com") had the leader's
+// renewals synced into a local file autocert never reads. A name autocert cannot serve is
+// dropped with a warning; autocert.HostWhitelist drops it silently.
+func (c *TLSLetsEncryptConfig) normalizeDomains() {
+	var domains []string
+	for _, configured := range c.Domains {
+		name, err := autocertName(configured)
+		if err != nil {
+			warnf("[tls.letsencrypt] domains: ignoring %q, no certificate can be served for it: %v", configured, err)
+			continue
+		}
+		if !slices.Contains(domains, name) {
+			domains = append(domains, name)
+		}
+	}
+	c.Domains = domains
+
+	if c.DefaultDomain != "" {
+		name, err := autocertName(c.DefaultDomain)
+		if err != nil {
+			warnf("[tls.letsencrypt] default_domain: ignoring %q, clients without SNI get the first domain's certificate: %v", c.DefaultDomain, err)
+		}
+		c.DefaultDomain = name
+	}
+}
+
+// autocertName returns the name autocert keeps a domain's certificates under: the server
+// name folded by idna.Lookup.ToASCII (lowercase, A-label) without a trailing dot, as
+// autocert.Manager.GetCertificate derives it from a ClientHello. It fails for a name
+// GetCertificate refuses.
+func autocertName(domain string) (string, error) {
+	name, err := idna.Lookup.ToASCII(domain)
+	if err != nil {
+		return "", err
+	}
+	name = strings.TrimSuffix(name, ".")
+	if !strings.Contains(strings.Trim(name, "."), ".") {
+		return "", errors.New("server name component count invalid")
+	}
+	return name, nil
 }
 
 // TLSConfig holds TLS/SSL configuration
@@ -2892,6 +2937,10 @@ func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaDa
 
 	// Trim whitespace from all string fields in the configuration
 	trimStringFields(reflect.ValueOf(cfg).Elem())
+
+	if cfg.TLS.LetsEncrypt != nil {
+		cfg.TLS.LetsEncrypt.normalizeDomains()
+	}
 
 	// Apply default values for fields where the Go zero value differs from the desired default
 	applyConfigDefaults(cfg)
