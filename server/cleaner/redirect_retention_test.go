@@ -53,3 +53,29 @@ func TestCleanupWorker_KeepsRedirectLogForTheRateWindow(t *testing.T) {
 		t.Errorf("redirect_log kept for %v, want %v (the redirect rate window) whatever grace_period is", redirectRetention, window)
 	}
 }
+
+// The cleaner runs on whichever node wins the cleanup lock, with that node's config. A
+// node without an LMTP or Admin API server (an IMAP- or POP3-only backend) knows no
+// redirect rate window but the 1h default, so if New kept redirect_log for the window
+// alone, that node would delete the rows a delivering node's longer window still counts,
+// which grace_period (14 days by default) kept before. The retention is the window or
+// grace_period, whichever is longer.
+func TestNew_RedirectLogRetentionIsWindowOrGracePeriod(t *testing.T) {
+	tests := []struct {
+		name        string
+		gracePeriod time.Duration
+		window      time.Duration
+		want        time.Duration
+	}{
+		{"node that knows only the default window", 14 * 24 * time.Hour, time.Hour, 14 * 24 * time.Hour},
+		{"window longer than grace_period", time.Hour, 24 * time.Hour, 24 * time.Hour},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := New(nil, nil, nil, time.Hour, tt.gracePeriod, 0, 0, time.Hour, tt.window, 0, time.Hour, nil)
+			if w.redirectLogRetention != tt.want {
+				t.Errorf("redirect_log kept for %v with grace_period %v and window %v, want %v", w.redirectLogRetention, tt.gracePeriod, tt.window, tt.want)
+			}
+		})
+	}
+}

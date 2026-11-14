@@ -1170,8 +1170,10 @@ limits.thread_max_messages = 50000
 # limits.preview_s3_max_size = "5mb"     # Largest message downloaded (unset or 0: [local_cache] max_object_size).
 limits.redirect_rate_limit = 100         # Maximum SIEVE redirects per user (default: 100, set to 0 to disable).
 limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h"). The cleaner keeps
-                                         # the redirect records for the longest window of the LMTP and Admin API
-                                         # servers on the node that runs it, so set the same window on every backend.
+                                         # the redirect records for [cleanup] grace_period or the longest window of
+                                         # the LMTP and Admin API servers on the node that runs it, whichever is
+                                         # longer. A window longer than grace_period needs that window on every
+                                         # node with an imap, pop3 or lmtp server (they all run the cleaner).
 limits.max_redirect_hops = 2             # Max times one message may be redirected before suppression — mail-loop
                                          # backstop, counted via the X-Sora-Loop header (default: 2; 1 = allow a
                                          # single redirect then stop; 0 = unlimited). Delivered-To loop detection

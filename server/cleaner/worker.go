@@ -96,7 +96,7 @@ type CleanupWorker struct {
 	maxAgeRestriction     time.Duration
 	ftsRetention          time.Duration // How long to keep FTS vectors
 	healthStatusRetention time.Duration
-	redirectLogRetention  time.Duration // The longest redirect rate window: the limit counts redirect_log rows within it
+	redirectLogRetention  time.Duration // The redirect rate window or grace_period, whichever is longer
 	uploadMaxAttempts     int           // Uploader max_attempts: an upload is only given up on beyond it
 	instanceLiveness      time.Duration // Silence after which an uploader instance counts as gone
 	stopCh                chan struct{}
@@ -106,10 +106,17 @@ type CleanupWorker struct {
 	running               bool
 }
 
-// New creates a new CleanupWorker.
-func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, redirectLogRetention time.Duration, uploadMaxAttempts int, instanceLiveness time.Duration, errCh chan<- error) *CleanupWorker {
+// New creates a new CleanupWorker. redirectRateWindow is the longest redirect rate
+// window of this node's servers (config.LongestRedirectRateWindow).
+func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, redirectRateWindow time.Duration, uploadMaxAttempts int, instanceLiveness time.Duration, errCh chan<- error) *CleanupWorker {
 	// Wrap S3 storage with resilient patterns including circuit breakers
 	resilientS3 := resilient.NewResilientS3Storage(s3)
+
+	// The redirect rate limit counts redirect_log rows within the window, so they are kept
+	// that long, and never for less than grace_period, which kept them before. The cleaner
+	// runs on whichever node wins the lock, and a node without an LMTP or Admin API server
+	// (an IMAP- or POP3-only backend) knows no window but the 1h default.
+	redirectLogRetention := max(gracePeriod, redirectRateWindow)
 
 	return &CleanupWorker{
 		rdb:                   rdb,         // *resilient.ResilientDatabase implements DatabaseManager
@@ -459,7 +466,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// Clean up old redirect-rate-limit log entries: the redirect_log table accumulates
 	// one row per relayed SIEVE redirect, so it must be pruned or it grows unbounded.
 	// The rate limit counts the rows within redirect_rate_window, so they are kept for
-	// the longest window, not for grace_period, the deletion window of expunged messages.
+	// the longest window or grace_period, whichever is longer (see New).
 	redirectCount, err = w.rdb.CleanupOldRedirectsWithRetry(ctx, w.redirectLogRetention)
 	if err != nil {
 		logger.Error("Cleanup: Failed to clean up old redirect log entries", "error", err)
