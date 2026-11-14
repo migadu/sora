@@ -28,6 +28,7 @@ The affinity cache is only meaningful when **cluster mode** and **server affinit
 |---|---|
 | Cluster enabled + affinity enabled + cache\_path set | ✅ Yes |
 | Cluster enabled + affinity enabled + cache\_path empty | ❌ No (in-memory only) |
+| Cluster enabled + affinity disabled | ❌ No (no affinity manager) |
 | Cluster disabled | ❌ No (no affinity manager) |
 
 The cache is **strictly optional**. If it fails to initialize, the proxy continues with in-memory-only affinity (rebuilt from gossip). If writes fail, errors are logged but operations continue normally.

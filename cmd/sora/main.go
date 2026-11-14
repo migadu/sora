@@ -612,6 +612,20 @@ func serverNeedsDatabase(s config.ServerConfig) bool {
 	return false
 }
 
+// proxiesWithAffinity names the enabled proxy servers that set enable_affinity.
+func proxiesWithAffinity(cfg config.Config) []string {
+	var names []string
+	for _, s := range cfg.GetAllServers() {
+		switch s.Type {
+		case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy":
+			if s.EnableAffinity {
+				names = append(names, s.Name)
+			}
+		}
+	}
+	return names
+}
+
 // initializeServices initializes all core services (S3, database, cache, workers) if storage services are needed
 func initializeServices(ctx context.Context, cfg config.Config, errorHandler *errors.ErrorHandler) (*serverDependencies, error) {
 	// This node's two names, resolved together so they cannot drift apart.
@@ -1166,6 +1180,14 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 				deps.affinityManager.LoadPersistedAffinities(ctx)
 				logger.Info("Affinity cache initialized", "path", cfg.Cluster.Affinity.CachePath)
 			}
+		}
+	}
+
+	// enable_affinity is served by the cluster affinity manager. Without one it does
+	// nothing, so say which proxies asked for it rather than drop it silently.
+	if deps.affinityManager == nil {
+		if names := proxiesWithAffinity(cfg); len(names) > 0 {
+			logger.Warn("enable_affinity has no effect without [cluster] and [cluster.affinity] enabled - these proxies route by consistent hash", "servers", names)
 		}
 	}
 
