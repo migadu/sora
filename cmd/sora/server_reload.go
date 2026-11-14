@@ -51,17 +51,11 @@ var reloadableServerSettings = map[string][]string{
 // reloadServers hands each running server its [[server]] block from newCfg, the config
 // a SIGHUP re-read, by name, and reports the settings that block changed but the
 // server's ReloadConfig does not apply, as the global report does for [cleanup] and the
-// like. A server not in newCfg is left as it is. The config each server started with,
-// deps.config, is read and never written.
+// like. A server not in newCfg (its block removed or set to enabled = false) is left
+// running, and a block in newCfg that was not started is not started: both take a
+// restart, and the reload says so. The config each server started with, deps.config,
+// is read and never written.
 func (deps *serverDependencies) reloadServers(newCfg *config.Config) {
-	deps.runningServersMux.Lock()
-	serverCount := len(deps.runningServers)
-	deps.runningServersMux.Unlock()
-
-	if serverCount == 0 {
-		return
-	}
-
 	newServers := newCfg.GetAllServers()
 	serversByName := make(map[string]config.ServerConfig, len(newServers))
 	for _, s := range newServers {
@@ -71,6 +65,22 @@ func (deps *serverDependencies) reloadServers(newCfg *config.Config) {
 	startedByName := make(map[string]config.ServerConfig, len(startedServers))
 	for _, s := range startedServers {
 		startedByName[s.Name] = s
+	}
+
+	for _, s := range startedServers {
+		if _, ok := serversByName[s.Name]; !ok {
+			logger.Info("Config reload: server removed or set to enabled = false, but it keeps running until a restart", "server", s.Name)
+		}
+	}
+	for _, s := range newServers {
+		if _, ok := startedByName[s.Name]; ok {
+			continue
+		}
+		if err := s.Validate(); err != nil {
+			logger.Error("Config reload: invalid server config; a restart will refuse to start with it", "server", s.Name, "type", s.Type, "error", err)
+			continue
+		}
+		logger.Info("Config reload: server is not running; starting it requires a restart", "server", s.Name, "type", s.Type)
 	}
 
 	deps.runningServersMux.Lock()
@@ -92,6 +102,8 @@ func (deps *serverDependencies) reloadServers(newCfg *config.Config) {
 			logger.Error("Failed to reload server config", "server", name, "error", err)
 		}
 		if started, ok := startedByName[name]; ok {
+			// Both blocks are enabled: enabled absent and enabled = true are one setting.
+			started.Enabled, newServerCfg.Enabled = nil, nil
 			changed := started.RestartRequiredChanges(newServerCfg, reloadableServerSettings[started.Type])
 			if len(changed) > 0 {
 				logger.Info("Config reload: server settings changed but require restart to take effect", "server", name, "fields", changed)

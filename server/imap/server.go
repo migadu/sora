@@ -531,13 +531,13 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	if !lookupCacheConfig.Enabled {
 		logger.Info("IMAP: Lookup cache disabled", "name", name)
 	} else {
-		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
-		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
-		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(name)
 
 		maxSize := lookupCacheConfig.GetMaxSize()
 
-		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault()
+		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(name)
 
 		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("IMAP: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
