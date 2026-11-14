@@ -383,6 +383,7 @@ func TestSubmitTrainingDoesNotFollowRedirects(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewClient: %v", err)
 			}
+			t.Cleanup(c.Close)
 
 			err = c.SubmitTraining(context.Background(), &TrainingRequest{
 				Type:      TrainingTypeSpam,
