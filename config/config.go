@@ -584,10 +584,9 @@ type AuthRateLimiterConfig struct {
 // multiplier. Zero means "use the default" (see applyAuthRateLimitDefaults); a negative
 // value has no meaning, and the limiter does not read it consistently
 // (max_attempts_per_ip = -1 blocked an address at its first failure on one path and
-// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check;
-// the limiter converts the multiplied delay to a time.Duration before capping it at
-// max_delay, and that conversion is platform-dependent for them (on amd64 +Inf becomes
-// a negative delay, which switches progressive delays off).
+// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check
+// but are no growth factor. Any finite multiplier is safe: the limiter caps the
+// product at max_delay before converting it to a time.Duration.
 func (c *AuthRateLimiterConfig) Validate() error {
 	v := reflect.ValueOf(c).Elem()
 	for i := 0; i < v.NumField(); i++ {
