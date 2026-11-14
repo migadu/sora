@@ -163,6 +163,8 @@ func TestGlobalReloadReportsAnInvalidRelay(t *testing.T) {
 		{name: "smtp_host without port", relay: "type = \"smtp\"\nsmtp_host = \"smtp2.example.com\"", wantErr: "must be host:port"},
 		{name: "http without http_url", relay: "type = \"http\"", wantErr: "requires http_url"},
 		{name: "http_url other scheme", relay: "type = \"http\"\nhttp_url = \"ftp://api.example.com/deliver?key=fixture-relay-secret\"", wantErr: "must be an absolute http:// or https:// URL"},
+		{name: "http_url without scheme hides query", relay: "type = \"http\"\nhttp_url = \"api.example.com/deliver?key=fixture-relay-secret\"", wantErr: "must be an absolute http:// or https:// URL"},
+		{name: "smtp URL hides userinfo", relay: "type = \"smtp\"\nsmtp_host = \"smtp://user:fixture-relay-secret@smtp.example.com:587\"", wantErr: "must be host:port"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

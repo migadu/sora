@@ -94,15 +94,26 @@ func (r *RelayConfig) validateSMTPHost() error {
 		return errors.New(`[relay] type "smtp" requires smtp_host as host:port`)
 	}
 	host, port, err := net.SplitHostPort(r.SMTPHost)
+	shown := relayEndpointForError(r.SMTPHost)
 	if err != nil {
-		return fmt.Errorf("[relay] smtp_host %q must be host:port: %w", r.SMTPHost, err)
+		// AddrError.Error repeats the raw endpoint, which may contain misplaced
+		// URL credentials. Keep the parser's reason, not its address.
+		reason := "invalid address"
+		var addrErr *net.AddrError
+		if errors.As(err, &addrErr) {
+			reason = addrErr.Err
+		}
+		return fmt.Errorf("[relay] smtp_host %q must be host:port: %s", shown, reason)
 	}
 	if host == "" {
 		// net.Dial would take the local system for it.
-		return fmt.Errorf("[relay] smtp_host %q has no host", r.SMTPHost)
+		return fmt.Errorf("[relay] smtp_host %q has no host", shown)
+	}
+	if strings.ContainsAny(host, " \t\r\n/@?#") {
+		return fmt.Errorf("[relay] smtp_host %q has no valid host", shown)
 	}
 	if !validDialPort(port) {
-		return fmt.Errorf("[relay] smtp_host %q has no valid port", r.SMTPHost)
+		return fmt.Errorf("[relay] smtp_host %q has no valid port", shown)
 	}
 	return nil
 }
@@ -114,7 +125,7 @@ func (r *RelayConfig) validateHTTPURL() error {
 	if r.HTTPURL == "" {
 		return errors.New(`[relay] type "http" requires http_url`)
 	}
-	shown := maskURLCredentials(r.HTTPURL)
+	shown := relayEndpointForError(r.HTTPURL)
 	u, err := url.Parse(r.HTTPURL)
 	if err != nil {
 		// The *url.Error repeats the unmasked URL; keep only its reason.
@@ -131,6 +142,15 @@ func (r *RelayConfig) validateHTTPURL() error {
 		return fmt.Errorf("[relay] http_url %q has no valid port", shown)
 	}
 	return nil
+}
+
+// Validation also handles malformed endpoints, where the usual URL masker cannot
+// identify an authority. Hide a credential-bearing schemeless value completely.
+func relayEndpointForError(value string) string {
+	if !strings.Contains(value, "://") && strings.ContainsAny(value, "?@") {
+		return SecretMask
+	}
+	return maskURLCredentials(value)
 }
 
 // validDialPort reports whether port is a TCP port a dial can reach, resolved as

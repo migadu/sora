@@ -176,3 +176,25 @@ func TestRelayValidateType(t *testing.T) {
 		})
 	}
 }
+
+func TestRelayValidateMalformedEndpointsHideCredentials(t *testing.T) {
+	for _, relay := range []RelayConfig{
+		{Type: "http", HTTPURL: "relay.example/send?api_key=private-relay-token"},
+		{Type: "http", HTTPURL: "user:private-relay-token@relay.example/send"},
+		{Type: "smtp", SMTPHost: "smtp://user:private-relay-token@smtp.example:587"},
+		{Type: "smtp", SMTPHost: "user:private-relay-token@smtp.example:587"},
+	} {
+		err := relay.Validate()
+		if err == nil {
+			t.Fatalf("invalid relay endpoint was accepted: %#v", relay)
+		}
+		if strings.Contains(err.Error(), "private-relay-token") {
+			t.Errorf("validation exposed endpoint credentials: %v", err)
+		}
+	}
+	for _, host := range []string{"smtp bad.example:587", "user@smtp.example:587", "smtp.example/path:587"} {
+		if err := (&RelayConfig{Type: "smtp", SMTPHost: host}).Validate(); err == nil {
+			t.Errorf("non-dialable SMTP host %q accepted", host)
+		}
+	}
+}
