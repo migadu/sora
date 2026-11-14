@@ -104,6 +104,7 @@ import (
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/retry"
+	"github.com/migadu/sora/server"
 )
 
 // DatabasePool represents a single database connection pool with health tracking
@@ -218,6 +219,7 @@ func isQuerySuccessful(err error) bool {
 		errors.Is(err, consts.ErrNotPermitted) ||
 		errors.Is(err, consts.ErrDBNotFound) ||
 		errors.Is(err, consts.ErrMessageExists) ||
+		errors.Is(err, server.ErrInvalidAddress) ||
 		errors.Is(err, pgx.ErrNoRows) {
 		return true
 	}
@@ -245,6 +247,7 @@ func isWriteSuccessful(err error) bool {
 		errors.Is(err, consts.ErrDBNotFound) ||
 		errors.Is(err, consts.ErrDBUniqueViolation) ||
 		errors.Is(err, consts.ErrMessageExists) ||
+		errors.Is(err, server.ErrInvalidAddress) ||
 		errors.Is(err, pgx.ErrNoRows) {
 		return true
 	}
@@ -538,6 +541,7 @@ func (rd *ResilientDatabase) isBusinessLogicError(err error) bool {
 		errors.Is(err, consts.ErrDBNotFound) ||
 		errors.Is(err, consts.ErrDBUniqueViolation) ||
 		errors.Is(err, consts.ErrMessageExists) ||
+		errors.Is(err, server.ErrInvalidAddress) ||
 		errors.Is(err, pgx.ErrNoRows)
 }
 
@@ -567,7 +571,6 @@ func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, arg
 	var rows pgx.Rows
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		queryCtx, cancel := rd.withTimeout(ctx, timeoutRead)
-		defer cancel()
 
 		result, cbErr := rd.queryBreaker.Execute(func() (any, error) {
 			r, queryErr := pool.Query(queryCtx, sql, args...)
@@ -575,20 +578,42 @@ func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, arg
 		})
 
 		if cbErr != nil {
+			cancel()
 			if !rd.isRetryableError(cbErr) {
-				// For non-retryable errors, we'll break the retry loop by returning nil from WithRetry
-				// and handle the error outside
-				return cbErr
+				return retry.Stop(cbErr)
 			}
 			logger.Debug("Retrying query due to retryable error", "error", cbErr)
 			return cbErr // It's retryable, so return the error to signal a retry.
 		}
 
-		rows = result.(pgx.Rows)
+		// pgx reads the rows under queryCtx until they are closed, so the context
+		// lives as long as the rows do.
+		rows = &cancelOnCloseRows{Rows: result.(pgx.Rows), cancel: cancel}
 		return nil
 	}, config)
 
 	return rows, err
+}
+
+// cancelOnCloseRows releases the query's timeout context once the rows are done:
+// when the caller closes them, or when Next reports the end (pgx closes rows itself
+// then, so a caller that drains them need not call Close).
+type cancelOnCloseRows struct {
+	pgx.Rows
+	cancel context.CancelFunc
+}
+
+func (r *cancelOnCloseRows) Next() bool {
+	if r.Rows.Next() {
+		return true
+	}
+	r.cancel()
+	return false
+}
+
+func (r *cancelOnCloseRows) Close() {
+	r.Rows.Close()
+	r.cancel()
 }
 
 // resilientRow implements the pgx.Row interface to defer the Scan operation
