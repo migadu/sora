@@ -832,12 +832,17 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 		accountID, err := s.rdb.CreateAccountWithCredentialsWithRetry(ctx, createReq)
 		if err != nil {
-			if errors.Is(err, consts.ErrDBUniqueViolation) {
+			switch {
+			case errors.Is(err, consts.ErrAccountAlreadyExists):
+				s.writeError(w, http.StatusConflict, err.Error())
+			case errors.Is(err, db.ErrInvalidAccountRequest):
+				s.writeError(w, http.StatusBadRequest, err.Error())
+			case errors.Is(err, consts.ErrDBUniqueViolation):
 				s.writeError(w, http.StatusConflict, "One or more email addresses already exist")
-				return
+			default:
+				logger.Warn("HTTP API: Error creating account with credentials", "name", s.name, "error", err)
+				s.writeError(w, http.StatusInternalServerError, "Failed to create account with credentials")
 			}
-			logger.Warn("HTTP API: Error creating account with credentials", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to create account with credentials")
 			return
 		}
 
@@ -879,12 +884,17 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 		accountID, err := s.rdb.CreateAccountWithRetry(ctx, createReq)
 		if err != nil {
-			if errors.Is(err, consts.ErrDBUniqueViolation) {
+			switch {
+			case errors.Is(err, consts.ErrAccountAlreadyExists):
+				s.writeError(w, http.StatusConflict, err.Error())
+			case errors.Is(err, db.ErrInvalidAccountRequest):
+				s.writeError(w, http.StatusBadRequest, err.Error())
+			case errors.Is(err, consts.ErrDBUniqueViolation):
 				s.writeError(w, http.StatusConflict, "Account already exists")
-				return
+			default:
+				logger.Warn("HTTP API: Error creating account", "name", s.name, "error", err)
+				s.writeError(w, http.StatusInternalServerError, "Failed to create account")
 			}
-			logger.Warn("HTTP API: Error creating account", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to create account")
 			return
 		}
 
@@ -1044,8 +1054,15 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 
 	err := s.rdb.UpdateAccountWithRetry(ctx, updateReq)
 	if err != nil {
-		logger.Warn("HTTP API: Error updating account", "name", s.name, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "Failed to update account")
+		switch {
+		case errors.Is(err, consts.ErrUserNotFound):
+			s.writeError(w, http.StatusNotFound, "Account not found")
+		case errors.Is(err, db.ErrInvalidAccountRequest):
+			s.writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			logger.Warn("HTTP API: Error updating account", "name", s.name, "error", err)
+			s.writeError(w, http.StatusInternalServerError, "Failed to update account")
+		}
 		return
 	}
 
@@ -1178,7 +1195,7 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 
 	err = s.rdb.AddCredentialWithRetry(ctx, addReq)
 	if err != nil {
-		if errors.Is(err, server.ErrInvalidAddress) {
+		if errors.Is(err, server.ErrInvalidAddress) || errors.Is(err, db.ErrInvalidAccountRequest) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -1817,7 +1834,11 @@ func (s *Server) handleHealthStatusByComponent(w http.ResponseWriter, r *http.Re
 		// Get current health status
 		status, err := s.rdb.GetHealthStatusWithRetry(ctx, hostname, component)
 		if err != nil {
-			// This could be a normal "not found" case, so don't log as a server error
+			logger.Warn("HTTP API: Error getting health status", "name", s.name, "hostname", hostname, "component", component, "error", err)
+			s.writeError(w, http.StatusInternalServerError, "Failed to get health status")
+			return
+		}
+		if status == nil {
 			s.writeError(w, http.StatusNotFound, "Health status not found")
 			return
 		}
