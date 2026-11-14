@@ -7,6 +7,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/BurntSushi/toml"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/pkg/resilient"
@@ -22,6 +23,25 @@ func adminTestDBName() string {
 		base = "sora_test_db"
 	}
 	return base + "_admin"
+}
+
+// configTestDatabase returns config-test.toml's database settings, naming
+// SORA_TEST_DB_NAME's database when that is set. The file names sora_test_db, but the
+// other test packages and make's reset-test-db use SORA_TEST_DB_NAME.
+func configTestDatabase(t *testing.T) *config.DatabaseConfig {
+	t.Helper()
+	var cfg AdminConfig
+	if _, err := toml.DecodeFile("../../config-test.toml", &cfg); err != nil {
+		t.Fatalf("Failed to load test configuration: %v", err)
+	}
+	if name := os.Getenv("SORA_TEST_DB_NAME"); name != "" {
+		for _, endpoint := range []*config.DatabaseEndpointConfig{cfg.Database.Write, cfg.Database.Read} {
+			if endpoint != nil {
+				endpoint.Name = name
+			}
+		}
+	}
+	return &cfg.Database
 }
 
 // adminTestDBConfig returns the config for adminTestDBName, creating the database
