@@ -945,6 +945,9 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 		case <-time.After(1 * time.Second):
 			// Timeout waiting for server to shut down
 		}
+		if spamTrainingClient != nil {
+			spamTrainingClient.Close() // stops its worker goroutines
+		}
 		// Clean up temporary directory
 		os.RemoveAll(tempDir)
 	}

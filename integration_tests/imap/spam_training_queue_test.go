@@ -79,6 +79,7 @@ func setupSpamTrainingServer(t *testing.T, cfg config.SpamTrainingConfig) (*imap
 	if err != nil {
 		t.Fatalf("spamtraining.NewClient: %v", err)
 	}
+	t.Cleanup(client.Close)
 
 	server, account, fakeS3 := common.SetupIMAPServerWithRealS3Options(t, func(o *imapserver.IMAPServerOptions) {
 		o.SpamTraining = client
