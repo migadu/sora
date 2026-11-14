@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,4 +128,41 @@ func accountMailboxState(t *testing.T, rdb *resilient.ResilientDatabase, account
 	}
 	sort.Strings(state)
 	return state
+}
+
+// TestS3Importer_DryRunChangesNothing is TestImporter_DryRunChangesNothing for
+// `import s3 --dry-run`, whose analysis created the default mailboxes as well.
+func TestS3Importer_DryRunChangesNothing(t *testing.T) {
+	rdb := setupTestDatabase(t)
+	defer rdb.Close()
+	ctx := context.Background()
+
+	const email = "dryrun-s3@example.com"
+	createSimpleTestAccount(t, rdb, email, "testpassword123")
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := accountMailboxState(t, rdb, accountID)
+
+	si, err := NewS3Importer(rdb, nil, S3ImporterOptions{Email: email, DryRun: true, CleanupDB: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer si.Close()
+	// The analysis reads what the bucket scan recorded: one object stands for it.
+	hash := strings.Repeat("ab", 32)
+	if _, err := si.db.Exec(`INSERT INTO s3_objects (key, size, last_modified, etag, domain, local_part, content_hash)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, "example.com/dryrun-s3/"+hash, 100, "2026-11-01T12:00:00Z", "etag",
+		"example.com", "dryrun-s3", hash); err != nil {
+		t.Fatal(err)
+	}
+	if err := si.performDryRun(); err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+
+	after := accountMailboxState(t, rdb, accountID)
+	if fmt.Sprint(after) != fmt.Sprint(before) {
+		t.Errorf("dry run changed the account\nbefore: %v\nafter:  %v", before, after)
+	}
 }
