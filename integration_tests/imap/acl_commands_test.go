@@ -557,8 +557,8 @@ func TestACL_SetACL_RejectsUnrecognizedRights(t *testing.T) {
 }
 
 // TestACL_FetchDoesNotImplicitlySetSeenWithoutSeenRight verifies RFC 4314 §5.1.1:
-// a non-PEEK BODY[] FETCH must NOT implicitly set \Seen when the user lacks the 's'
-// right, and MUST set it once the 's' right is granted.
+// a non-PEEK BODY[] or BINARY[] FETCH must NOT implicitly set \Seen when the user
+// lacks the 's' right, and MUST set it once the 's' right is granted.
 func TestACL_FetchDoesNotImplicitlySetSeenWithoutSeenRight(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -576,26 +576,6 @@ func TestACL_FetchDoesNotImplicitlySetSeenWithoutSeenRight(t *testing.T) {
 		t.Fatalf("Owner login failed: %v", err)
 	}
 
-	sharedMailbox := fmt.Sprintf("Shared/TestFetchSeen-%d", common.GetTimestamp())
-	if err := c1.Create(sharedMailbox, nil).Wait(); err != nil {
-		t.Fatalf("Failed to create shared mailbox: %v", err)
-	}
-	defer func() { c1.Delete(sharedMailbox).Wait() }()
-
-	msgBody := []byte("Subject: Seen test\r\n\r\nbody")
-	appendCmd := c1.Append(sharedMailbox, int64(len(msgBody)), nil)
-	if _, err := appendCmd.Write(msgBody); err != nil {
-		t.Fatalf("Failed to write APPEND data: %v", err)
-	}
-	if err := appendCmd.Close(); err != nil {
-		t.Fatalf("Failed to APPEND: %v", err)
-	}
-
-	// Grant read but NOT 's'.
-	if err := c1.SetACL(sharedMailbox, imap.RightsIdentifier(email2), imap.RightModificationReplace, imap.RightSet("lr")).Wait(); err != nil {
-		t.Fatalf("SETACL lr failed: %v", err)
-	}
-
 	c2, err := imapclient.DialInsecure(server.Address, nil)
 	if err != nil {
 		t.Fatalf("Failed to dial IMAP server for user2: %v", err)
@@ -604,33 +584,67 @@ func TestACL_FetchDoesNotImplicitlySetSeenWithoutSeenRight(t *testing.T) {
 	if err := c2.Login(email2, password2).Wait(); err != nil {
 		t.Fatalf("Accessor login failed: %v", err)
 	}
-	if _, err := c2.Select(sharedMailbox, nil).Wait(); err != nil {
-		t.Fatalf("Accessor SELECT failed: %v", err)
-	}
 
-	// Non-PEEK BODY[] fetch would implicitly set \Seen; without 's' it MUST NOT.
-	bodyFetch := &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{{}}}
-	if _, err := c2.Fetch(imap.SeqSetNum(1), bodyFetch).Collect(); err != nil {
-		t.Fatalf("Accessor FETCH BODY[] failed: %v", err)
-	}
+	for _, tc := range []struct {
+		name  string
+		fetch *imap.FetchOptions
+	}{
+		{"BODY[]", &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{{}}}},
+		{"BINARY[1]", &imap.FetchOptions{BinarySection: []*imap.FetchItemBinarySection{{Part: []int{1}}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sharedMailbox := fmt.Sprintf("Shared/TestFetchSeen-%d", common.GetTimestamp())
+			if err := c1.Create(sharedMailbox, nil).Wait(); err != nil {
+				t.Fatalf("Failed to create shared mailbox: %v", err)
+			}
+			defer func() {
+				// Both sessions move on to the next case's mailbox.
+				c2.Unselect().Wait()
+				c1.Unselect().Wait()
+				c1.Delete(sharedMailbox).Wait()
+			}()
 
-	if fetchSeenAsOwner(t, c1, sharedMailbox) {
-		t.Errorf("message marked \\Seen by a user lacking the 's' right (RFC 4314 §5.1.1 violation)")
-	} else {
-		t.Logf("✓ \\Seen not set for FETCH by user without 's' right")
-	}
+			msgBody := []byte("Subject: Seen test\r\n\r\nbody")
+			appendCmd := c1.Append(sharedMailbox, int64(len(msgBody)), nil)
+			if _, err := appendCmd.Write(msgBody); err != nil {
+				t.Fatalf("Failed to write APPEND data: %v", err)
+			}
+			if err := appendCmd.Close(); err != nil {
+				t.Fatalf("Failed to APPEND: %v", err)
+			}
 
-	// Grant 's' and confirm the implicit \Seen now happens.
-	if err := c1.SetACL(sharedMailbox, imap.RightsIdentifier(email2), imap.RightModificationAdd, imap.RightSet("s")).Wait(); err != nil {
-		t.Fatalf("SETACL +s failed: %v", err)
-	}
-	if _, err := c2.Fetch(imap.SeqSetNum(1), bodyFetch).Collect(); err != nil {
-		t.Fatalf("Accessor FETCH BODY[] (2) failed: %v", err)
-	}
-	if !fetchSeenAsOwner(t, c1, sharedMailbox) {
-		t.Errorf("message should be \\Seen after FETCH by a user WITH the 's' right")
-	} else {
-		t.Logf("✓ \\Seen set after FETCH by user with 's' right")
+			// Grant read but NOT 's'.
+			if err := c1.SetACL(sharedMailbox, imap.RightsIdentifier(email2), imap.RightModificationReplace, imap.RightSet("lr")).Wait(); err != nil {
+				t.Fatalf("SETACL lr failed: %v", err)
+			}
+			if _, err := c2.Select(sharedMailbox, nil).Wait(); err != nil {
+				t.Fatalf("Accessor SELECT failed: %v", err)
+			}
+
+			// A non-PEEK fetch would implicitly set \Seen; without 's' it MUST NOT.
+			if _, err := c2.Fetch(imap.SeqSetNum(1), tc.fetch).Collect(); err != nil {
+				t.Fatalf("Accessor FETCH %s failed: %v", tc.name, err)
+			}
+
+			if fetchSeenAsOwner(t, c1, sharedMailbox) {
+				t.Errorf("message marked \\Seen by a user lacking the 's' right (RFC 4314 §5.1.1 violation)")
+			} else {
+				t.Logf("✓ \\Seen not set for FETCH %s by user without 's' right", tc.name)
+			}
+
+			// Grant 's' and confirm the implicit \Seen now happens.
+			if err := c1.SetACL(sharedMailbox, imap.RightsIdentifier(email2), imap.RightModificationAdd, imap.RightSet("s")).Wait(); err != nil {
+				t.Fatalf("SETACL +s failed: %v", err)
+			}
+			if _, err := c2.Fetch(imap.SeqSetNum(1), tc.fetch).Collect(); err != nil {
+				t.Fatalf("Accessor FETCH %s (2) failed: %v", tc.name, err)
+			}
+			if !fetchSeenAsOwner(t, c1, sharedMailbox) {
+				t.Errorf("message should be \\Seen after FETCH %s by a user WITH the 's' right", tc.name)
+			} else {
+				t.Logf("✓ \\Seen set after FETCH %s by user with 's' right", tc.name)
+			}
+		})
 	}
 }
 
