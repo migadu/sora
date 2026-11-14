@@ -68,8 +68,10 @@ type shutdownHandshakeConn struct {
 
 func (c *shutdownHandshakeConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
-	c.once.Do(func() { close(c.received) })
-	<-c.release // Hold the client before it can finish the handshake.
+	if n > 0 {
+		c.once.Do(func() { close(c.received) })
+		<-c.release // Hold the client before it can finish the handshake.
+	}
 	return n, err
 }
 
