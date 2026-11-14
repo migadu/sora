@@ -85,7 +85,8 @@ func testDBEndpoint(name string) *config.DatabaseEndpointConfig {
 }
 
 // laggingReplicaDB returns a database with the current schema and no rows, creating
-// and migrating it if needed. Nothing writes to it.
+// and migrating it if needed. Nothing writes to it but replicateAccount, which removes
+// what it adds when its test ends.
 func laggingReplicaDB(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()

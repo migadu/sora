@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/resilient"
@@ -124,6 +125,9 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	if err := fullCfg.SharedMailboxes.Validate(); err != nil {
 		return fmt.Errorf("[shared_mailboxes]: %w", err)
 	}
+	// Passwords hashed here (accounts create/update, credentials add) use the server's
+	// cost: with another one a backend rehashes them at the user's next login.
+	db.SetBcryptCost(fullCfg.GetBcryptCost())
 
 	// Extract the parts we need for admin operations
 	cfg.Database = fullCfg.Database
@@ -397,9 +401,3 @@ func truncateString(s string, maxLen int) string {
 	}
 	return s[:maxLen-3] + "..."
 }
-
-// Affinity Management Functions
-
-// Affinity Management Functions (via HTTP Admin API)
-
-// callAdminAPI makes an HTTP request to the admin API server

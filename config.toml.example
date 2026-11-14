@@ -1096,7 +1096,9 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 
 # --- GLOBAL CAPABILITY CONFIGURATION ---
 # Disable specific IMAP capabilities for ALL clients connecting to this server.
-# Disabled capabilities are not announced in CAPABILITY responses and cannot be used.
+# Disabled capabilities are not announced in CAPABILITY responses and cannot be
+# used: what they add is refused, e.g. with MOVE disabled the MOVE command gets
+# BAD, and with STATUS=SIZE disabled so does STATUS (SIZE).
 #
 # This is different from client_filters which apply based on client identity.
 # Use this when you want to disable capabilities for ALL clients on this server.
@@ -1106,7 +1108,6 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # - CONDSTORE: Conditional STORE (RFC 7162)
 # - IDLE: Push notifications (RFC 2177)
 # - MOVE: Efficient message moving (RFC 6851)
-# - COMPRESS: DEFLATE compression (RFC 4978)
 # - SORT/ESORT: Server-side sorting
 #
 # disabled_caps = ["ESEARCH", "CONDSTORE", "IDLE"]  # Example: disable these capabilities globally
@@ -1116,7 +1117,8 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # extension IMAP4rev2 includes (IDLE, ESEARCH, SEARCHRES, MOVE, NAMESPACE,
 # UIDPLUS, LIST-STATUS, STATUS=SIZE, CHILDREN, ...) also removes IMAP4rev2, so
 # the server offers IMAP4rev1 with its remaining extensions; disabling CONDSTORE
-# also removes QRESYNC. client_filters follow the same rule.
+# also removes QRESYNC; disabling SORT also removes SORT=DISPLAY and ESORT.
+# client_filters follow the same rule.
 # SASL-IR, LITERAL-, UNSELECT, ENABLE and UTF8=ACCEPT are always advertised with
 # IMAP4rev1 and cannot be disabled; naming them only logs a warning.
 # STARTTLS, LOGINDISABLED and AUTH=PLAIN follow tls, tls_use_starttls and

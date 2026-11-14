@@ -824,7 +824,9 @@ type AccountSummary struct {
 // GetAccountsByDomain returns a simplified list of the accounts whose primary address is
 // in domain, soft-deleted ones included. It is what the purge-domain command iterates
 // through, and a purge that failed leaves its account soft-deleted: leaving those out would
-// make a re-run skip exactly the accounts it has to finish.
+// make a re-run skip exactly the accounts it has to finish. The domain is matched exactly,
+// as ListAccountsByDomain matches it: never as a LIKE pattern, where % and _ would name
+// other domains in an irreversible purge.
 func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]AccountSummary, error) {
 	query := `
 		SELECT a.id,
@@ -835,7 +837,7 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 			   0 as message_count
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id AND c.primary_identity = TRUE
-		WHERE LOWER(c.address) LIKE '%' || '@' || LOWER($1)
+		WHERE c.domain = LOWER($1)
 		ORDER BY c.address
 	`
 
@@ -870,13 +872,14 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 // address is in the given domain, across active (non-deleted) accounts. Domain purge uses
 // this to find cross-domain aliases: addresses in the purged domain that hang off accounts
 // whose primary identity lives in a different domain (so the account is not itself purged).
-// Such aliases keep receiving mail for the purged domain unless explicitly removed.
+// Such aliases keep receiving mail for the purged domain unless explicitly removed. The
+// domain is matched exactly, as in GetAccountsByDomain.
 func (db *Database) GetAliasCredentialsByDomain(ctx context.Context, domain string) ([]string, error) {
 	rows, err := db.GetReadPool().Query(ctx, `
 		SELECT c.address
 		FROM credentials c
 		JOIN accounts a ON a.id = c.account_id
-		WHERE LOWER(c.address) LIKE '%' || '@' || LOWER($1)
+		WHERE c.domain = LOWER($1)
 		  AND c.primary_identity = FALSE
 		  AND a.deleted_at IS NULL
 		ORDER BY c.address

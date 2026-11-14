@@ -26,8 +26,8 @@ type RelayConfig struct {
 	SMTPHELOHost    string `toml:"smtp_helo_host"`     // Hostname to send in EHLO/HELO (default: "localhost"). Set to your FQDN for correct deliverability.
 
 	// HTTP API relay configuration
-	HTTPURL   string `toml:"http_url"`   // HTTP API endpoint (e.g., "https://api.example.com/v1/mail/deliver")
-	AuthToken string `toml:"auth_token"` // Bearer token for HTTP Authorization header
+	HTTPURL   string `toml:"http_url"`                 // HTTP API endpoint (e.g., "https://api.example.com/v1/mail/deliver")
+	AuthToken string `toml:"auth_token" secret:"true"` // Bearer token for HTTP Authorization header
 
 	// Queue configuration (nested under [relay.queue] in TOML)
 	Queue RelayQueueConfig `toml:"queue"`
