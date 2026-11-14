@@ -1247,6 +1247,8 @@ auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expire
 # Memory safety limits (prevents unbounded growth during burst attacks)
 # These limits protect against memory exhaustion when under sustained attack. When a map exceeds
 # its size limit, the oldest entries (by FirstFailure time) are evicted using LRU policy.
+# max_ip_entries evicts the counters of addresses that are not blocked first and never removes
+# an IP block: a block lasts until ip_block_duration ends.
 # Set to 0 to disable size-based limits (time-based cleanup only).
 #
 # RECOMMENDED VALUES:

@@ -277,7 +277,33 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		return err
 	}
 
-	// Check cache first (before rate limiter to avoid delays for cached successful auth)
+	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods.
+	// Before the lookup cache: a blocked address or IP+username pair is refused whether or
+	// not the answer is cached (the cache only saves the database work), and a cached
+	// success must not be recorded for an attempt the limiter would have refused.
+	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey); err != nil {
+		// Check if this is a rate limit error
+		var rateLimitErr *server.RateLimitError
+		if errors.As(err, &rateLimitErr) {
+			s.InfoLog("rate limit exceeded",
+				"username", username,
+				"reason", rateLimitErr.Reason,
+				"failure_count", rateLimitErr.FailureCount,
+				"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
+
+			// Track rate limiting
+			metrics.ProtocolErrors.WithLabelValues("managesieve_proxy", "AUTH", "rate_limited", "client_error").Inc()
+
+			// Return the error - caller will send appropriate ManageSieve response
+			return rateLimitErr
+		}
+
+		// Unknown rate limiting error
+		metrics.ProtocolErrors.WithLabelValues("managesieve_proxy", "AUTH", "rate_limited", "client_error").Inc()
+		return err
+	}
+
+	// Check cache
 	// Use server name as cache key to avoid collisions between different proxies/servers
 	if s.server.lookupCache != nil {
 		if cached, found := s.server.lookupCache.Get(s.server.name, username); found {
@@ -373,29 +399,6 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			s.DebugLog("cache miss", "username", username)
 			metrics.CacheOperationsTotal.WithLabelValues("get", "miss").Inc()
 		}
-	}
-
-	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods
-	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey); err != nil {
-		// Check if this is a rate limit error
-		var rateLimitErr *server.RateLimitError
-		if errors.As(err, &rateLimitErr) {
-			s.InfoLog("rate limit exceeded",
-				"username", username,
-				"reason", rateLimitErr.Reason,
-				"failure_count", rateLimitErr.FailureCount,
-				"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
-
-			// Track rate limiting
-			metrics.ProtocolErrors.WithLabelValues("managesieve_proxy", "AUTH", "rate_limited", "client_error").Inc()
-
-			// Return the error - caller will send appropriate ManageSieve response
-			return rateLimitErr
-		}
-
-		// Unknown rate limiting error
-		metrics.ProtocolErrors.WithLabelValues("managesieve_proxy", "AUTH", "rate_limited", "client_error").Inc()
-		return err
 	}
 
 	// Parse username to check for master username or token suffix
