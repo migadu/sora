@@ -169,9 +169,90 @@ func TestMessageStateMigrationKeepsFlags(t *testing.T) {
 		require.NoError(t, err)
 		_, err = database.GetWritePool().Exec(ctx,
 			`INSERT INTO message_state (message_id, mailbox_id) VALUES ($1, $2)`, s.seenID, s.mailboxID)
-		database.Close()
 		require.NoError(t, err)
+		_, err = database.GetWritePool().Exec(ctx, `
+			INSERT INTO message_state
+			SELECT id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq
+			FROM messages WHERE id = $1`, s.unseenID)
+		require.NoError(t, err)
+		var before, after string
+		require.NoError(t, database.GetWritePool().QueryRow(ctx,
+			`SELECT xmin::text FROM message_state WHERE message_id = $1`, s.unseenID).Scan(&before))
+		require.NoError(t, m.Migrate(22))
+		require.NoError(t, database.GetWritePool().QueryRow(ctx,
+			`SELECT xmin::text FROM message_state WHERE message_id = $1`, s.unseenID).Scan(&after))
+		assert.Equal(t, before, after, "an identical pre-copied row should not be rewritten")
+		database.Close()
 		upgrade(t, m)
 		assertKept(t, s)
 	})
+
+	t.Run("all legacy flag bits and nullable metadata survive down and up", func(t *testing.T) {
+		m := migrateTo(t, 21)
+		s := seed(t)
+		database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(t), false)
+		require.NoError(t, err)
+		defer database.Close()
+		pool := database.GetWritePool()
+		// Include the old stored Recent bit, all flag combinations, empty and
+		// multi-keyword arrays, nullable metadata, and expunged/detached rows.
+		_, err = pool.Exec(ctx, `
+			INSERT INTO messages (account_id, mailbox_id, uid, s3_domain, s3_localpart, content_hash,
+			                      recipients_json, message_id, sent_date, internal_date, size,
+			                      body_structure, flags, custom_flags, flags_changed_at,
+			                      created_modseq, updated_modseq, expunged_at)
+			SELECT account_id, CASE WHEN n % 7 = 0 THEN NULL ELSE mailbox_id END, n + 3,
+			       s3_domain, s3_localpart, 'flags_' || n, recipients_json, '<flags_' || n || '@example.com>',
+			       sent_date, internal_date, size, body_structure, n,
+			       CASE WHEN n % 2 = 0 THEN '[]'::jsonb ELSE '["$Work", "$Other"]'::jsonb END,
+			       CASE WHEN n % 3 = 0 THEN NULL ELSE '2026-01-02 03:04:05.123456+00'::timestamptz END,
+			       nextval('messages_modseq'), CASE WHEN n % 5 = 0 THEN NULL ELSE nextval('messages_modseq') END,
+			       CASE WHEN n % 11 = 0 THEN now() ELSE NULL END
+			FROM messages CROSS JOIN generate_series(0, 63) AS n WHERE id = $1`, s.seenID)
+		require.NoError(t, err)
+		_, err = pool.Exec(ctx, `CREATE TABLE expected_message_state AS
+			SELECT id AS message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq
+			FROM messages`)
+		require.NoError(t, err)
+		assertState := func(table, idColumn string) {
+			t.Helper()
+			var differences int
+			err := pool.QueryRow(ctx, fmt.Sprintf(`
+				SELECT count(*) FROM expected_message_state e FULL JOIN %s actual ON actual.%s = e.message_id
+				WHERE (e.message_id, e.mailbox_id, e.flags, e.custom_flags, e.flags_changed_at, e.updated_modseq)
+				IS DISTINCT FROM (actual.%s, actual.mailbox_id, actual.flags, actual.custom_flags,
+				                  actual.flags_changed_at, actual.updated_modseq)`, table, idColumn, idColumn)).Scan(&differences)
+			require.NoError(t, err)
+			assert.Zero(t, differences, "all source state must survive in %s", table)
+		}
+		require.NoError(t, m.Migrate(22))
+		assertState("message_state", "message_id")
+		require.NoError(t, m.Migrate(21))
+		assertState("messages", "id")
+		require.NoError(t, m.Migrate(22))
+		assertState("message_state", "message_id")
+	})
+
+	for _, existingCache := range []string{"null", `["$Reserved"]`} {
+		t.Run("keyword cache "+existingCache, func(t *testing.T) {
+			m := migrateTo(t, 21)
+			s := seed(t)
+			database, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(t), false)
+			require.NoError(t, err)
+			defer database.Close()
+			pool := database.GetWritePool()
+			_, err = pool.Exec(ctx, `UPDATE mailbox_stats SET custom_flags_cache = NULLIF($1::jsonb, 'null'::jsonb)
+				WHERE mailbox_id = $2`, existingCache, s.mailboxID)
+			require.NoError(t, err)
+			require.NoError(t, m.Migrate(24))
+			var cache []byte
+			require.NoError(t, pool.QueryRow(ctx, `SELECT custom_flags_cache FROM mailbox_stats WHERE mailbox_id = $1`,
+				s.mailboxID).Scan(&cache))
+			expected := existingCache
+			if existingCache == "null" {
+				expected = `["$Work"]`
+			}
+			assert.JSONEq(t, expected, string(cache), "only an uninitialized cache should be filled")
+		})
+	}
 }
