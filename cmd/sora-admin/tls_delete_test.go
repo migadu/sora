@@ -1,11 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/pem"
+	"fmt"
 	"io"
 	"maps"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/tlsmanager"
@@ -52,6 +62,10 @@ func (s *tlsStubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusNotFound)
 	case http.MethodGet:
+		if isBucket {
+			s.listObjects(w, path, r.URL.Query().Get("prefix"))
+			return
+		}
 		if !found {
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>`)
@@ -79,11 +93,39 @@ func (s *tlsStubS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// listObjects answers a ListObjectsV2 request on bucketPath in one page. Called with
+// s.mu held.
+func (s *tlsStubS3) listObjects(w http.ResponseWriter, bucketPath, prefix string) {
+	bucket := strings.Trim(bucketPath, "/")
+	var contents strings.Builder
+	count := 0
+	for _, path := range slices.Sorted(maps.Keys(s.objects)) {
+		key, inBucket := strings.CutPrefix(path, "/"+bucket+"/")
+		if !inBucket || !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		count++
+		fmt.Fprintf(&contents, `<Contents><Key>%s</Key><Size>%d</Size><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>"0"</ETag></Contents>`,
+			key, len(s.objects[path]))
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>%s</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>%s</ListBucketResult>`,
+		bucket, prefix, count, contents.String())
+}
+
 // keys returns the stored object paths, sorted.
 func (s *tlsStubS3) keys() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return slices.Sorted(maps.Keys(s.objects))
+}
+
+// certificateKeys returns the paths of the stored objects that hold certificate cache
+// entries, sorted, leaving out the deletion markers tls delete leaves next to them.
+func (s *tlsStubS3) certificateKeys() []string {
+	return slices.DeleteFunc(s.keys(), func(path string) bool {
+		return !strings.HasPrefix(path, "/certs/autocert/cert-")
+	})
 }
 
 func (s *tlsStubS3) failDeletes(status int) {
@@ -169,8 +211,8 @@ func TestTLSDeleteDomainRemovesServerKeys(t *testing.T) {
 				t.Fatalf("deleteTLSCertificate: %v", err)
 			}
 
-			if got := stub.keys(); !slices.Equal(got, unrelated) {
-				t.Errorf("S3 objects after delete = %v, want only the unrelated domain's %v", got, unrelated)
+			if got := stub.certificateKeys(); !slices.Equal(got, unrelated) {
+				t.Errorf("S3 certificates after delete = %v, want only the unrelated domain's %v", got, unrelated)
 			}
 			if got := localNames(t, cacheDir); !slices.Equal(got, []string{"other.example.com"}) {
 				t.Errorf("local cache after delete = %v, want [other.example.com]", got)
@@ -327,5 +369,156 @@ func TestTLSCacheSkipsDomainsAutocertCannotServe(t *testing.T) {
 
 	if err := cacheTLSCertificates(context.Background(), cfg, cacheDir, "*.example.com", false); err == nil {
 		t.Error("cacheTLSCertificates succeeded for --domain *.example.com")
+	}
+}
+
+// certificateEntry is an autocert cache entry - the private key PEM followed by the
+// certificate PEM - for a self-signed certificate valid until notAfter.
+func certificateEntry(t *testing.T, domain string, serial int64, notAfter time.Time) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(serial),
+		Subject:      pkix.Name{CommonName: domain},
+		DNSNames:     []string{domain},
+		NotBefore:    notAfter.Add(-90 * 24 * time.Hour),
+		NotAfter:     notAfter,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	pem.Encode(&buf, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: der})
+	return buf.Bytes()
+}
+
+// startSyncingNode starts a server's TLS manager - the part of a running node that syncs
+// certificates with S3 - whose local fallback cache is dir. It never handles a handshake,
+// so it never contacts an ACME server.
+func startSyncingNode(t *testing.T, cfg AdminConfig, dir string) {
+	t.Helper()
+	le := *cfg.TLS.LetsEncrypt
+	le.Email = "tls-test@example.com"
+	le.StorageProvider = "s3"
+	le.FallbackDir = dir
+	le.SyncInterval = "20ms"
+	m, err := tlsmanager.New(config.TLSConfig{Enabled: true, Provider: "letsencrypt", LetsEncrypt: &le}, nil)
+	if err != nil {
+		t.Fatalf("starting node: %v", err)
+	}
+	t.Cleanup(m.Shutdown)
+}
+
+// TestTLSDeletionSticksOnRunningNodes: a node that holds a certificate in its local
+// fallback cache wrote it back to S3 at its next certificate sync after an operator
+// deleted it there, and the other nodes then downloaded it again. After tls delete or
+// tls clean, the node must drop its copy instead, and S3 must stay without it.
+func TestTLSDeletionSticksOnRunningNodes(t *testing.T) {
+	const name = "mail.example.com"
+	valid := time.Now().Add(60 * 24 * time.Hour)
+	expired := time.Now().Add(-24 * time.Hour)
+
+	tests := []struct {
+		desc     string
+		notAfter time.Time
+		run      func(ctx context.Context, cfg AdminConfig, adminDir string) error
+		deleted  []string // cache entries the command deletes
+		kept     []string // cache entries it leaves alone
+	}{
+		{
+			desc:     "delete --domain",
+			notAfter: valid,
+			run: func(ctx context.Context, cfg AdminConfig, adminDir string) error {
+				return deleteTLSCertificate(ctx, cfg, adminDir, name, "", false)
+			},
+			deleted: []string{name, name + "+rsa"},
+		},
+		{
+			desc:     "delete --key",
+			notAfter: valid,
+			run: func(ctx context.Context, cfg AdminConfig, adminDir string) error {
+				return deleteTLSCertificate(ctx, cfg, adminDir, "", tlsmanager.S3ObjectKey(name+"+rsa"), false)
+			},
+			deleted: []string{name + "+rsa"},
+			kept:    []string{name},
+		},
+		{
+			desc:     "clean",
+			notAfter: expired,
+			run: func(ctx context.Context, cfg AdminConfig, adminDir string) error {
+				return cleanTLSCertificates(ctx, cfg, adminDir, false, true)
+			},
+			deleted: []string{name, name + "+rsa"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			ctx := context.Background()
+			stub, endpoint := newTLSStubS3(t)
+			cfg := tlsTestConfig(endpoint)
+
+			// Every node holds the certificates the server stored in S3.
+			s3, err := tlsmanager.NewS3Cache(cfg.TLS.LetsEncrypt.S3)
+			if err != nil {
+				t.Fatalf("NewS3Cache: %v", err)
+			}
+			adminDir, nodeDir := t.TempDir(), t.TempDir()
+			for i, entry := range []string{name, name + "+rsa"} {
+				data := certificateEntry(t, name, int64(i+1), tt.notAfter)
+				if err := s3.Put(ctx, entry, data); err != nil {
+					t.Fatalf("Put %s: %v", entry, err)
+				}
+				for _, dir := range []string{adminDir, nodeDir} {
+					if err := os.WriteFile(filepath.Join(dir, entry), data, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			startSyncingNode(t, cfg, nodeDir)
+			time.Sleep(100 * time.Millisecond) // the node is running and in sync
+
+			if err := tt.run(ctx, cfg, adminDir); err != nil {
+				t.Fatalf("%s: %v", tt.desc, err)
+			}
+
+			// Give the node's sync worker a few rounds after the deletion.
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) && slices.ContainsFunc(tt.deleted, func(entry string) bool {
+				_, err := os.Stat(filepath.Join(nodeDir, entry))
+				return err == nil
+			}) {
+				time.Sleep(20 * time.Millisecond)
+			}
+			time.Sleep(100 * time.Millisecond)
+
+			objects := stub.keys()
+			for _, entry := range tt.deleted {
+				if slices.Contains(objects, "/certs/"+tlsmanager.S3ObjectKey(entry)) {
+					t.Errorf("%s is back in S3: the running node wrote its local copy back", entry)
+				}
+				if _, err := os.Stat(filepath.Join(nodeDir, entry)); !os.IsNotExist(err) {
+					t.Errorf("%s: the running node kept its local copy (stat err = %v)", entry, err)
+				}
+			}
+			for _, entry := range tt.kept {
+				if !slices.Contains(objects, "/certs/"+tlsmanager.S3ObjectKey(entry)) {
+					t.Errorf("%s is gone from S3, but the command did not delete it", entry)
+				}
+				if _, err := os.Stat(filepath.Join(nodeDir, entry)); err != nil {
+					t.Errorf("%s: the running node lost its local copy: %v", entry, err)
+				}
+			}
+		})
 	}
 }
