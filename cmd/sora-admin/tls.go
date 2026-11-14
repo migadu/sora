@@ -398,7 +398,7 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 			}
 
 			// Check if certificate exists in local cache
-			certInfo.InLocalCache, certInfo.LocalPath = checkLocalCache(cacheDir, certInfo.Domain)
+			certInfo.InLocalCache, certInfo.LocalPath = checkLocalCache(cacheDir, certInfo.S3Key, certInfo.Domain)
 
 			certs = append(certs, certInfo)
 
@@ -552,7 +552,15 @@ func parseCertificateData(data []byte, info *CertificateInfo) {
 	}
 }
 
-func checkLocalCache(cacheDir string, domain string) (bool, string) {
+// isLocalCopyOf reports whether the local fallback cache file name holds the S3 object
+// s3Key. Both caches store an autocert cache entry under its name, the S3 cache at
+// tlsmanager.S3ObjectKey(name), so the file belongs to that one object: a certificate
+// for the same domain kept under any other key (an old copy, a backup) is not in it.
+func isLocalCopyOf(name, s3Key string) bool {
+	return tlsmanager.S3ObjectKey(name) == s3Key
+}
+
+func checkLocalCache(cacheDir string, s3Key string, domain string) (bool, string) {
 	// Check if cache directory exists
 	if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
 		return false, ""
@@ -580,6 +588,9 @@ func checkLocalCache(cacheDir string, domain string) (bool, string) {
 	}
 
 	for _, filename := range filenames {
+		if !isLocalCopyOf(filename, s3Key) {
+			continue
+		}
 		localPath := filepath.Join(cacheDir, filename)
 		if _, err := os.Stat(localPath); err == nil {
 			return true, localPath
@@ -1029,9 +1040,11 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			if cert.CertType == "RSA" {
 				cacheFile += "+rsa"
 			}
-			localPath := filepath.Join(cacheDir, cacheFile)
-			if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
-				logger.Warn("Failed to delete from local cache", "path", localPath, "error", err)
+			if isLocalCopyOf(cacheFile, cert.S3Key) {
+				localPath := filepath.Join(cacheDir, cacheFile)
+				if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+					logger.Warn("Failed to delete from local cache", "path", localPath, "error", err)
+				}
 			}
 		}
 	}
