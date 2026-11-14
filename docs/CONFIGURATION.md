@@ -497,7 +497,7 @@ See [STORAGE.md](STORAGE.md).
 | `concurrency` | integer | `20` | Parallel uploads. |
 | `max_attempts` | integer | `20` | Attempts before an upload is parked. |
 | `retry_interval` | duration | `"30s"` | Wait before retrying a failed upload. |
-| `cleanup_grace_period` | duration | `"1h"` | Minimum age of a staged file before cleanup looks at it. |
+| `cleanup_grace_period` | duration | `"1h"` | Minimum age of a staged file before cleanup looks at it. Must be positive. |
 | `max_staging_size` | size | no limit | Size of this node's staging directory above which new messages are refused. An invalid value stops startup. |
 
 ### 8.7 Cleaner (`[cleanup]`)

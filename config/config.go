@@ -605,11 +605,14 @@ type UploaderConfig struct {
 // DefaultUploaderMaxAttempts is [uploader] max_attempts when the key is absent.
 const DefaultUploaderMaxAttempts = 20
 
-// Validate rejects [uploader] settings that stop or crash the upload worker:
-// batch_size, concurrency and max_attempts must be positive. A zero concurrency
-// blocks the worker (and its instance heartbeat) for good, a negative one panics,
-// a zero batch_size leases nothing and a negative one is refused by PostgreSQL,
-// and max_attempts <= 0 leases nothing and fails the cleaner's failed-upload pass.
+// Validate rejects [uploader] settings that stop or crash the upload worker or lose
+// mail: batch_size, concurrency, max_attempts and cleanup_grace_period must be
+// positive. A zero concurrency blocks the worker (and its instance heartbeat) for
+// good, a negative one panics, a zero batch_size leases nothing and a negative one is
+// refused by PostgreSQL, and max_attempts <= 0 leases nothing and fails the cleaner's
+// failed-upload pass. A negative cleanup_grace_period puts the orphan cleanup's cutoff
+// in the future, so it removes staged bodies whose pending_uploads row is still in an
+// uncommitted delivery transaction.
 func (c *UploaderConfig) Validate() error {
 	for _, f := range []struct {
 		key   string
@@ -622,6 +625,9 @@ func (c *UploaderConfig) Validate() error {
 		if f.value <= 0 {
 			return fmt.Errorf("[uploader] %s must be positive, got %d", f.key, f.value)
 		}
+	}
+	if d, err := c.GetCleanupGracePeriod(); err == nil && d <= 0 {
+		return fmt.Errorf("[uploader] cleanup_grace_period must be positive, got %q", c.CleanupGracePeriod)
 	}
 	return nil
 }

@@ -646,7 +646,8 @@ max_attempts = 5              # Attempts after which an upload is parked ("faile
 retry_interval = "30s"        # Delay before a failed upload is leased again. When every upload in a cycle fails
                               # (provider or database outage) the worker backs off exponentially from this value,
                               # doubling per failed cycle up to 10 minutes, and resumes on the first success.
-cleanup_grace_period = "1h"   # Minimum age of a local upload file before cleanup considers it.
+cleanup_grace_period = "1h"   # Minimum age of a local upload file before cleanup considers it. Must be positive and
+                              # longer than any delivery transaction can take.
 max_staging_size = "100gb"    # Maximum size of this node's own upload staging backlog (e.g. "100gb"); other nodes' backlogs do not count. If set and exceeded, new messages (IMAP APPEND, LMTP and Admin API deliveries) are refused.
 
 # CLEANUP PROCESS CONFIGURATION
