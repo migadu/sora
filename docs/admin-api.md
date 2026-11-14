@@ -801,14 +801,12 @@ Get health status for all components on a specific server.
 
 **Endpoint:** `GET /admin/health/servers/{hostname}/components/{component}`
 
-Get current or historical health status for a specific component.
+Get the current health status of a specific component. Only the current status is kept
+(one row per component and server, rewritten when the status changes and every 20 checks
+while it holds), so there is no history: `history=true` is answered with `400 Bad Request`.
+Use the `sora_component_health_status` metric for the status over time.
 
-**Query Parameters:**
-- `history=true` - Return historical data instead of current
-- `since=2024-01-20T00:00:00Z` - Start time for history
-- `limit=100` - Maximum records to return
-
-**Response (Current):** `200 OK`
+**Response:** `200 OK`
 ```json
 {
   "component_name": "database_write",
@@ -820,17 +818,6 @@ Get current or historical health status for a specific component.
   "metadata": {
     "latency_ms": 5
   }
-}
-```
-
-**Response (History):** `200 OK`
-```json
-{
-  "hostname": "mail-server-01",
-  "component": "database_write",
-  "history": [...],
-  "count": 48,
-  "since": "2024-01-20T00:00:00Z"
 }
 ```
 
@@ -1128,8 +1115,8 @@ curl http://localhost:8080/admin/health/overview \
 curl http://localhost:8080/admin/health/servers/mail-server-01 \
   -H "Authorization: Bearer your-api-key"
 
-# Get component health history
-curl "http://localhost:8080/admin/health/servers/mail-server-01/components/database_write?history=true&limit=50" \
+# Get the current status of one component
+curl http://localhost:8080/admin/health/servers/mail-server-01/components/database \
   -H "Authorization: Bearer your-api-key"
 
 # Get cache statistics

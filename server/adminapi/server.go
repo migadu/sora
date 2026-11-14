@@ -1753,56 +1753,20 @@ func (s *Server) handleHealthStatusByComponent(w http.ResponseWriter, r *http.Re
 
 	ctx := r.Context()
 
-	// Parse query parameters for history
-	showHistory := r.URL.Query().Get("history") == "true"
-	sinceParam := r.URL.Query().Get("since")
-	limitParam := r.URL.Query().Get("limit")
-
-	if showHistory {
-		// Get historical health status
-		var since time.Time
-		if sinceParam != "" {
-			var err error
-			since, err = time.Parse(time.RFC3339, sinceParam)
-			if err != nil {
-				s.writeError(w, http.StatusBadRequest, "Invalid since parameter format (use RFC3339)")
-				return
-			}
-		} else {
-			since = time.Now().Add(-24 * time.Hour) // Default to last 24 hours
-		}
-
-		limit := 100
-		if limitParam != "" {
-			if l, err := strconv.Atoi(limitParam); err == nil && l > 0 {
-				limit = l
-			}
-		}
-
-		history, err := s.rdb.GetHealthHistoryWithRetry(ctx, hostname, component, since, limit)
-		if err != nil {
-			logger.Warn("HTTP API: Error getting health history", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to get health history")
-			return
-		}
-
-		s.writeJSON(w, http.StatusOK, map[string]any{
-			"hostname":  hostname,
-			"component": component,
-			"history":   history,
-			"count":     len(history),
-			"since":     since,
-		})
-	} else {
-		// Get current health status
-		status, err := s.rdb.GetHealthStatusWithRetry(ctx, hostname, component)
-		if err != nil {
-			// This could be a normal "not found" case, so don't log as a server error
-			s.writeError(w, http.StatusNotFound, "Health status not found")
-			return
-		}
-		s.writeJSON(w, http.StatusOK, status)
+	// health_status keeps one row per component and server, rewritten in place: there
+	// is no history to return, and the current row is not one.
+	if r.URL.Query().Get("history") == "true" {
+		s.writeError(w, http.StatusBadRequest, "Health history is not recorded; request the current status without history=true")
+		return
 	}
+
+	status, err := s.rdb.GetHealthStatusWithRetry(ctx, hostname, component)
+	if err != nil {
+		// This could be a normal "not found" case, so don't log as a server error
+		s.writeError(w, http.StatusNotFound, "Health status not found")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, status)
 }
 
 // handleProxyBackends returns backend health status for all proxy servers

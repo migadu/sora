@@ -28,6 +28,12 @@ const (
 	// failures are intermittent rather than consecutive.
 	unhealthyFailureRate = 0.5
 	recentOutcomeWindow  = 10
+	// A status that holds is reported to the status callbacks again every this many
+	// checks (10 minutes at the default 30s interval), not only when it changes. The
+	// database callback keeps the component's health_status row fresh that way; the
+	// cleaner deletes rows not updated within [cleanup] health_status_retention, which
+	// is meant for nodes that are gone, not for a component that stays healthy.
+	statusReportEvery = 20
 )
 
 // failureWindow is a ring of the most recent check outcomes.
@@ -84,9 +90,10 @@ type HealthCheck struct {
 
 	// CheckCount and FailCount are lifetime totals reported to operators; the
 	// status is derived from these recent-outcome fields instead.
-	consecutiveFails int
-	recent           failureWindow
-	everSucceeded    bool
+	consecutiveFails  int
+	recent            failureWindow
+	everSucceeded     bool
+	checksSinceReport int
 }
 
 type HealthMonitor struct {
@@ -121,6 +128,8 @@ func (hm *HealthMonitor) RegisterCheck(check *HealthCheck) {
 	hm.mu.Unlock()
 }
 
+// AddStatusCallback registers a callback that receives a component's status on its
+// first check, on every change, and every statusReportEvery checks while it holds.
 func (hm *HealthMonitor) AddStatusCallback(callback func(name string, status ComponentStatus)) {
 	hm.mu.Lock()
 	hm.statusCallbacks = append(hm.statusCallbacks, callback)
@@ -177,7 +186,7 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 			check.LastError = err
 			check.mu.Unlock()
 
-			hm.notifyStatusChange(check.Name, StatusUnhealthy)
+			hm.notifyStatus(check.Name, StatusUnhealthy)
 			hm.updateOverallStatus()
 		}
 	}()
@@ -233,6 +242,12 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 	}
 
 	currentStatus := check.Status
+	changed := previousStatus != currentStatus || isFirstCheck
+	check.checksSinceReport++
+	report := changed || check.checksSinceReport >= statusReportEvery
+	if report {
+		check.checksSinceReport = 0
+	}
 	check.mu.Unlock()
 
 	// Record health check metrics
@@ -252,19 +267,21 @@ func (hm *HealthMonitor) performCheck(check *HealthCheck) {
 	}
 	metrics.ComponentHealthStatus.WithLabelValues(check.Name, "").Set(statusValue)
 
-	if previousStatus != currentStatus || isFirstCheck {
+	if changed {
 		if isFirstCheck {
 			logger.Info("Health: Check initialized", "check", check.Name, "status", currentStatus)
 		} else {
 			logger.Info("Health: Check status changed", "check", check.Name, "from", previousStatus, "to", currentStatus)
 		}
-		hm.notifyStatusChange(check.Name, currentStatus)
+	}
+	if report {
+		hm.notifyStatus(check.Name, currentStatus)
 	}
 
 	hm.updateOverallStatus()
 }
 
-func (hm *HealthMonitor) notifyStatusChange(name string, status ComponentStatus) {
+func (hm *HealthMonitor) notifyStatus(name string, status ComponentStatus) {
 	hm.mu.RLock()
 	callbacks := make([]func(string, ComponentStatus), len(hm.statusCallbacks))
 	copy(callbacks, hm.statusCallbacks)

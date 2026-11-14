@@ -135,16 +135,15 @@ type RuntimeFailoverManager struct {
 	healthCheckStop chan struct{}
 	healthCheckWg   sync.WaitGroup // Wait for background goroutines to finish
 	mu              sync.RWMutex
+	// readsUseWritePools is set while readPools is the write pools (no replica
+	// configured, or none reachable yet), and cleared when a replica connects.
+	readsUseWritePools atomic.Bool
 }
 
-// readPoolsAreDistinct checks if the read pools are a separate set from the write pools.
+// readPoolsAreDistinct reports whether the read pools are replicas rather than the
+// write pools serving reads.
 func (fm *RuntimeFailoverManager) readPoolsAreDistinct() bool {
-	// If there are no read pools or no write pools, they can't be distinct.
-	if len(fm.readPools) == 0 || len(fm.writePools) == 0 {
-		return false
-	}
-	// Slices are distinct if their first elements' memory addresses are different.
-	return &fm.readPools[0] != &fm.writePools[0]
+	return !fm.readsUseWritePools.Load()
 }
 
 type ResilientDatabase struct {
@@ -455,6 +454,29 @@ func (rd *ResilientDatabase) withTimeout(ctx context.Context, opType timeoutType
 
 func (rd *ResilientDatabase) GetDatabase() *db.Database {
 	return rd.getCurrentDatabase()
+}
+
+// PingReadPools pings, on every read host, the pool reads are served from: each
+// replica's, or the write hosts' while reads use them. The error names every host that
+// failed.
+func (rd *ResilientDatabase) PingReadPools(ctx context.Context) error {
+	rd.failoverManager.mu.RLock()
+	pools := append([]*DatabasePool(nil), rd.failoverManager.readPools...)
+	rd.failoverManager.mu.RUnlock()
+
+	errs := make([]error, len(pools))
+	var wg sync.WaitGroup
+	for i, p := range pools {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := p.database.ReadPool.Ping(ctx); err != nil {
+				errs[i] = fmt.Errorf("read pool %s: %w", p.host, err)
+			}
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // GetQueryTimeout returns the configured query timeout for read operations
@@ -937,6 +959,7 @@ func newRuntimeFailoverManager(ctx context.Context, config *config.DatabaseConfi
 			logger.Info("No read pools configured, using write pools for read operations", "component", "RESILIENT-FAILOVER")
 		}
 		manager.readPools = manager.writePools
+		manager.readsUseWritePools.Store(true)
 		manager.currentReadIdx.Store(manager.currentWriteIdx.Load())
 	}
 
@@ -1324,15 +1347,16 @@ func (rd *ResilientDatabase) attemptReconnectFailedReplicas(ctx context.Context)
 		}
 		dbPool.isHealthy.Store(true)
 
-		// If we were using write pools as fallback, switch to the new read pool
-		wasUsingWritePoolsForReads := !rd.failoverManager.readPoolsAreDistinct()
-
-		rd.failoverManager.readPools = append(rd.failoverManager.readPools, dbPool)
-
-		// If this is the first read pool (was using write pools before), set it as current
-		if wasUsingWritePoolsForReads {
-			rd.failoverManager.currentReadIdx.Store(int64(len(rd.failoverManager.readPools) - 1))
+		if rd.failoverManager.readsUseWritePools.Load() {
+			// The first replica to connect replaces the write pools as the read pools.
+			rd.failoverManager.readPools = []*DatabasePool{dbPool}
+			rd.failoverManager.currentReadIdx.Store(0)
+			rd.failoverManager.readsUseWritePools.Store(false)
 			logger.Info("Switching from write pools to dedicated read replica for read operations", "component", "RESILIENT-FAILOVER")
+		} else {
+			// A fresh array, never one shared with another slice.
+			readPools := rd.failoverManager.readPools
+			rd.failoverManager.readPools = append(readPools[:len(readPools):len(readPools)], dbPool)
 		}
 
 		// Remove from failed replicas list
