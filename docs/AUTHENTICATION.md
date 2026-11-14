@@ -632,7 +632,7 @@ normal load (`Auth rate limiter stats` lines, below).
 
 | Listener | Login while blocked | Connection |
 |---|---|---|
-| `imap` | `NO [AUTHENTICATIONFAILED] Invalid address or password`, the same as a wrong password | Stays open. In addition, a new TCP connection from a Tier 2 blocked IP is closed before the TLS handshake, with no greeting; when a PROXY header names the blocked client, it gets `* BYE [ALERT] Too many failed authentication attempts. Please try again later.` after the TLS handshake instead ([SECURITY.md](SECURITY.md#4-connection-limits)). |
+| `imap` | `NO [AUTHENTICATIONFAILED] Invalid address or password`, the same as a wrong password | Stays open. In addition, a new TCP connection from a Tier 2 blocked IP is closed before the TLS handshake, with no greeting; when a PROXY header names the blocked client, it gets `* BYE [ALERT] Too many failed authentication attempts. Please try again later.` instead, after the TLS handshake on an implicit-TLS listener ([SECURITY.md](SECURITY.md#4-connection-limits)). |
 | `pop3` | `-ERR [AUTH] Authentication failed`, the same as a wrong password | Stays open, but every error counts towards the POP3 error limit (4 errors, then the connection closes; [SECURITY.md](SECURITY.md#6-limits-on-failed-logins-per-connection)). |
 | `managesieve` | `NO "Authentication failed"`, the same as a wrong password | Stays open; 10 errors close it. |
 | `imap_proxy` | `<tag> NO Authentication failed`, then `* BYE [ALERT] Too many failed authentication attempts. Please try again later.` | Closed. |

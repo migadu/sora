@@ -123,7 +123,7 @@ carries its own copy and these server keys are not used for pool members (except
 | `timeouts.command_timeout` | IMAP `30m`, POP3 `10m`, ManageSieve `3m` | Idle timeout. |
 | `timeouts.absolute_session_timeout` | `24h`, LMTP `5m` | Longest a session may last. |
 | `timeouts.min_bytes_per_minute` | `0` (off) | Slow-client guard. |
-| `max_connections`, `max_connections_per_ip` | `0` (unlimited) | Per proxy instance. |
+| `max_connections`, `max_connections_per_ip` | `0` (unlimited) | Per proxy listener, except that in cluster mode the IMAP, POP3 and ManageSieve proxies count `max_connections_per_ip` across all proxy nodes of the protocol. With `proxy_protocol` the per-IP limit counts the client the header names ([SECURITY.md](SECURITY.md#4-connection-limits)). |
 | `max_connections_per_user`, `max_connections_per_user_per_ip` | `0` | IMAP, POP3 and ManageSieve proxies only, and only with `[cluster]` enabled; see [CLUSTER.md](CLUSTER.md). The LMTP proxy ignores them with a warning. |
 | `limits.max_auth_errors` | `2` | Protocol errors before login (unknown or malformed commands, logins refused without TLS) before the connection is closed. Wrong passwords do not count. |
 | `auth_rate_limit` | off | See [AUTHENTICATION.md](AUTHENTICATION.md). |

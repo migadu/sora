@@ -228,8 +228,14 @@ Where each applies:
 `lmtp_proxy` ignores the per-user limits, with a warning.
 
 Behind Sora proxies that send PROXY headers (`remote_use_proxy_protocol`), a backend's
-`max_connections_per_ip` limits each client a second time, by the address the proxy names. Set it no
-lower than on the proxies, or to `0` to leave the limit to them.
+`max_connections_per_ip` limits each client a second time, by the address the proxy names, and a
+client over it fails its login on the proxy. Set it to `0` to leave the limit to the proxies, or
+above the most connections the proxies let one address open in total. In cluster mode that is the
+proxies' own `max_connections_per_ip`, which `imap_proxy`, `pop3_proxy` and `managesieve_proxy`
+count across all proxy nodes of the protocol. Without `[cluster]` each proxy listener counts only
+its own connections, so it is that limit times the number of proxy listeners. Leave headroom above
+it: the cluster-wide count is eventually consistent, and a proxy frees a client's slot a moment
+before the backend sees the connection close.
 
 What a client sees:
 

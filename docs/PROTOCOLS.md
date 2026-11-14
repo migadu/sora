@@ -188,7 +188,7 @@ The PROXY protocol and how Sora's own proxies use it are described in [PROXY.md]
 | Key | Default | Applies to | Effect |
 |---|---|---|---|
 | `max_connections` | `0` (no limit); LMTP: `1000` | all four | Open connections on this listener. |
-| `max_connections_per_ip` | `0` (no limit) | IMAP, POP3, ManageSieve | Open connections from one address. Peers in `trusted_networks` are exempt. |
+| `max_connections_per_ip` | `0` (no limit) | IMAP, POP3, ManageSieve | Open connections from one client address: with `proxy_protocol`, the address the header names. A client whose own address is in `trusted_networks` is exempt. |
 | `max_connections_per_user` | `0` (no limit) | IMAP, POP3, ManageSieve | Logged-in sessions of one account on this server. |
 | `max_connections_per_user_per_ip` | `0` (no limit) | as above | Logged-in sessions of one account from one address on this server. |
 | `listen_backlog` | `1024` when `0` | all four | Kernel accept queue length. |
@@ -196,9 +196,10 @@ The PROXY protocol and how Sora's own proxies use it are described in [PROXY.md]
 A connection over `max_connections` or `max_connections_per_ip` is closed at once, without a
 greeting. On IMAP, a connection from an address that the auth rate limiter has blocked is closed
 the same way. The exception is a client a PROXY header names that is over `max_connections_per_ip`,
-or blocked on IMAP: it gets a refusal greeting after the TLS handshake (IMAP `* BYE`, POP3
-`-ERR [SYS/TEMP]`, ManageSieve `NO (TRYLATER)`), so that a proxy in front fails only that client's
-login and does not count a backend failure. See [SECURITY.md](SECURITY.md#4-connection-limits).
+or blocked on IMAP: it gets a refusal greeting, after the TLS handshake on an implicit-TLS
+listener (IMAP `* BYE`, POP3 `-ERR [SYS/TEMP]`, ManageSieve `NO (TRYLATER)`), so that a proxy in
+front fails only that client's login and does not count a backend failure. See
+[SECURITY.md](SECURITY.md#4-connection-limits).
 
 The per-user limits on a backend count sessions on that one server block only. A login over the
 limit is refused and the session stays unauthenticated: IMAP answers
