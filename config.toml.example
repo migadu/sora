@@ -38,6 +38,7 @@ insecure_skip_verify = true                 # Skip TLS cert verification. Defaul
 # Messages larger than this will be skipped during import
 # Default: 50mb (larger than IMAP append_limit since imports are batch operations)
 # This setting is independent of IMAP server configuration
+# A message above 2147483647 bytes (the largest sora can store) is skipped whatever the limit
 import_message_limit = "50mb"
 
 

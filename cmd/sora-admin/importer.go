@@ -55,7 +55,7 @@ type ImporterOptions struct {
 	BatchSize            int           // Number of messages to process in each batch (default: 20)
 	BatchTransactionMode bool          // Use single transaction per batch (faster but less resilient, default: false)
 	Incremental          bool          // Use SQLite cache to skip already-imported messages (default: false = always read all)
-	MaxMessageSize       int64         // Maximum message size to import (bytes, 0 = use default)
+	MaxMessageSize       int64         // Maximum message size to import (bytes); 0 or above consts.MaxStoredMessageSize means that maximum
 	PathsFile            string        // Path to a file containing a list of relative or absolute paths to import
 	FTSRetention         time.Duration // Skip the search row for messages sent before this window (0 = index all)
 }
@@ -1150,13 +1150,19 @@ func (i *Importer) parseMaildirFlagsWith(filename string, keywords map[int]strin
 	return flags
 }
 
-// validateMessage performs basic validation on a message.
+// validateMessage performs basic validation on a message. Its size limit is
+// MaxMessageSize, never above consts.MaxStoredMessageSize: the database refuses a
+// larger message, so it is skipped here instead of being read and uploaded first.
 func (i *Importer) validateMessage(size int64) error {
 	if size == 0 {
 		return errors.New("empty message")
 	}
-	if i.options.MaxMessageSize > 0 && size > i.options.MaxMessageSize {
-		return fmt.Errorf("message too large: %d bytes (max: %d)", size, i.options.MaxMessageSize)
+	limit := i.options.MaxMessageSize
+	if limit <= 0 || limit > consts.MaxStoredMessageSize {
+		limit = consts.MaxStoredMessageSize
+	}
+	if size > limit {
+		return fmt.Errorf("message too large: %d bytes (max: %d)", size, limit)
 	}
 	return nil
 }
