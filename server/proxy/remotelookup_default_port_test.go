@@ -130,3 +130,56 @@ func TestRemoteLookupServerWithoutPortGetsTheProxysPort(t *testing.T) {
 		})
 	}
 }
+
+// TestRemoteLookupServerWithoutPortImplicitTLSPort: with nothing configured, a port-less
+// lookup server is dialed at the protocol's standard port for the backend leg the lookup
+// configures. Implicit TLS (remote_tls without remote_tls_use_starttls) has its own
+// registered ports for IMAP and POP3 (RFC 8314 §3.1 "pop3s" 995, §3.2 "imaps" 993); the
+// plaintext port there makes the proxy start a TLS handshake against a plaintext greeting.
+// STARTTLS runs on the plaintext port, and ManageSieve and LMTP have no other port.
+func TestRemoteLookupServerWithoutPortImplicitTLSPort(t *testing.T) {
+	lookup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"address": "anna@example.com", "server": "backend1.example.com"})
+	}))
+	defer lookup.Close()
+
+	tests := []struct {
+		protocol      string
+		tls, starttls bool
+		want          string
+	}{
+		{"imap", true, false, "backend1.example.com:993"},
+		{"pop3", true, false, "backend1.example.com:995"},
+		{"imap", true, true, "backend1.example.com:143"},
+		{"pop3", true, true, "backend1.example.com:110"},
+		{"managesieve", true, false, "backend1.example.com:4190"},
+		{"managesieve", true, true, "backend1.example.com:4190"},
+		{"lmtp", true, false, "backend1.example.com:24"},
+		{"lmtp", true, true, "backend1.example.com:24"},
+	}
+	for _, tt := range tests {
+		name := tt.protocol + " implicit TLS"
+		if tt.starttls {
+			name = tt.protocol + " STARTTLS"
+		}
+		t.Run(name, func(t *testing.T) {
+			client, err := proxy.InitializeRemoteLookup(tt.protocol, &config.RemoteLookupConfig{
+				Enabled:              true,
+				URL:                  lookup.URL + "/lookup?email=$email",
+				RemoteTLS:            tt.tls,
+				RemoteTLSUseStartTLS: tt.starttls,
+			}, 0)
+			if err != nil {
+				t.Fatalf("InitializeRemoteLookup: %v", err)
+			}
+			info, result, err := client.LookupUserRouteWithOptions(context.Background(), "anna@example.com", "", true)
+			if err != nil || result != proxy.AuthSuccess || info == nil {
+				t.Fatalf("lookup: result=%v err=%v info=%+v", result, err, info)
+			}
+			if info.ServerAddress != tt.want {
+				t.Errorf("ServerAddress = %q, want %q", info.ServerAddress, tt.want)
+			}
+		})
+	}
+}
