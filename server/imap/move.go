@@ -117,31 +117,35 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		}
 		// Cross-account move: the new row will be owned by the destination mailbox
 		// owner, so the body must be reachable under the owner's S3 path.
-		if msg.IsUploaded {
-			// Body is in S3 under the source's path; copy it to the owner's path
-			// (skip if the owner already has it, e.g. via dedup).
-			sourceKey := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
-			destKey := helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash)
-			exists, err := s.server.s3.ExistsWithRetry(ctx, destKey)
-			if err != nil {
-				s.WarnLog("failed to check if S3 object exists at destination", "destKey", destKey, "error", err)
+		if !msg.IsUploaded {
+			if s.server.uploader == nil {
+				continue
 			}
-			if !exists {
-				if err := s.server.s3.CopyWithRetry(ctx, sourceKey, destKey); err != nil {
-					return s.internalError("failed to copy S3 object for message: %v", err)
-				}
-			}
-		} else if s.server.uploader != nil {
 			// Body is still staged locally under the source account. Hardlink it to
 			// the owner's staging path so the uploader (re-staged in MoveMessages)
 			// uploads it under the owner's path. Failing here would silently lose the
-			// body, so treat it as fatal rather than warning and proceeding.
-			sourcePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-			destPath := s.server.uploader.FilePath(msg.ContentHash, destMailbox.AccountID)
-			if sourcePath != destPath {
-				if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
-					return s.internalError("failed to stage local file for cross-account move: %v", err)
-				}
+			// body, so treat it as fatal rather than warning and proceeding. A body
+			// that is not on this node is in S3 already, or on its way there: it
+			// takes the S3 path below.
+			staged, ierr := s.stageCrossAccountBody("move", msg.ContentHash, msg.AccountID, destMailbox.AccountID)
+			if ierr != nil {
+				return ierr
+			}
+			if staged {
+				continue
+			}
+		}
+		// Body is in S3 under the source's path; copy it to the owner's path
+		// (skip if the owner already has it, e.g. via dedup).
+		sourceKey := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
+		destKey := helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash)
+		exists, err := s.server.s3.ExistsWithRetry(ctx, destKey)
+		if err != nil {
+			s.WarnLog("failed to check if S3 object exists at destination", "destKey", destKey, "error", err)
+		}
+		if !exists {
+			if err := s.server.s3.CopyWithRetry(ctx, sourceKey, destKey); err != nil {
+				return s.crossAccountObjectError(!msg.IsUploaded, err)
 			}
 		}
 	}
