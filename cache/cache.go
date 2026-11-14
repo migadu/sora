@@ -93,7 +93,8 @@ const IndexDB = "cache_index.db"
 const PurgeBatchSize = 1000
 const NumShards = 256
 
-// ErrObjectTooLarge is returned when attempting to cache an object that exceeds the size limit
+// ErrObjectTooLarge is returned when attempting to cache an object that exceeds the size
+// limit: max_object_size, or one shard's share of the capacity (see tooLarge).
 var ErrObjectTooLarge = errors.New("object size exceeds limit")
 
 type cacheShard struct {
@@ -224,10 +225,23 @@ func New(basePath string, maxSizeBytes int64, maxObjectSize int64, purgeInterval
 		c.shards[i] = shard
 	}
 
+	if shardCapacity := maxSizeBytes / NumShards; maxObjectSize > shardCapacity {
+		logger.Info("Cache: max_object_size is above one shard's share of the capacity (capacity/256); larger objects are not cached",
+			"max_object_size", maxObjectSize, "effective_max_object_size", shardCapacity)
+	}
+
 	// No purge loop here: the server starts the one it runs with StartPurgeLoop, and
 	// sora-admin opens the cache of a running server.
 	go c.processAccessLog()
 	return c, nil
+}
+
+// tooLarge reports whether an object of size bytes is refused: above max_object_size, or
+// above its shard's share of the capacity. Capacity is enforced per shard, so an object
+// larger than that share cannot stay cached: writing it would evict every other object
+// of its shard and then the object itself.
+func (c *Cache) tooLarge(size int64) bool {
+	return size > c.maxObjectSize || size > c.capacity/NumShards
 }
 
 func shardIndexPath(basePath string, shard int) string {
@@ -386,10 +400,10 @@ func (c *Cache) Delete(contentHash string) error {
 // MoveIn moves a file into the cache directory structure and tracks it.
 // The file at sourcePath will be removed (either by rename or explicit removal if it already exists).
 // This is typically used to move a downloaded temp file into the cache.
-// A file larger than the cache's max object size is refused with ErrObjectTooLarge; on
-// that and every other error the file is left for the caller to remove.
+// A file the cache does not take (see tooLarge) is refused with ErrObjectTooLarge and,
+// as when the move itself fails, left for the caller to remove.
 func (c *Cache) MoveIn(sourcePath string, contentHash string) error {
-	if info, err := os.Stat(sourcePath); err == nil && info.Size() > c.maxObjectSize {
+	if info, err := os.Stat(sourcePath); err == nil && c.tooLarge(info.Size()) {
 		return ErrObjectTooLarge
 	}
 
@@ -488,7 +502,7 @@ func (c *Cache) Get(contentHash string) ([]byte, error) {
 
 // Put writes an object to the cache.
 func (c *Cache) Put(contentHash string, data []byte) error {
-	if int64(len(data)) > c.maxObjectSize {
+	if c.tooLarge(int64(len(data))) {
 		return ErrObjectTooLarge
 	}
 

@@ -617,10 +617,8 @@ func isIPAllowed(clientIP string, allowedHosts []string) bool {
 // warnUnusableAllowedHosts logs the allowed_hosts entries that are not an IP address
 // or CIDR, when a list is configured (startup) or replaced (reload).
 func warnUnusableAllowedHosts(name string, allowedHosts []string) {
-	for _, entry := range allowedHosts {
-		if _, err := helpers.ParseTrustedNetworks([]string{entry}); err != nil {
-			logger.Warn("HTTP Mail API: allowed_hosts entry is not an IP address or CIDR and matches no client", "name", name, "entry", entry)
-		}
+	for _, entry := range helpers.InvalidNetworkEntries(allowedHosts) {
+		logger.Warn("HTTP Mail API: allowed_hosts entry is not an IP address or CIDR and matches no client", "name", name, "entry", entry)
 	}
 }
 

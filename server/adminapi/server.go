@@ -308,6 +308,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		readOnlyAPIKey: options.ReadOnlyAPIKey,
 		allowedHosts:   options.AllowedHosts,
 	})
+	warnUnusableAllowedHosts(options.Name, options.AllowedHosts)
 
 	return s, nil
 }
@@ -365,6 +366,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	// it does at startup: every host is allowed.
 	if !slices.Equal(cfg.AllowedHosts, next.allowedHosts) {
 		next.allowedHosts = slices.Clone(cfg.AllowedHosts)
+		warnUnusableAllowedHosts(s.name, next.allowedHosts)
 		reloaded = append(reloaded, "allowed_hosts")
 	}
 
@@ -616,7 +618,9 @@ func (s *Server) allowedHostsMiddleware(next http.Handler) http.Handler {
 		clientIP := getClientIP(r)
 
 		// Single shared check: allowedHosts entries may be CIDRs or bare IPs (incl. IPv6,
-		// matched by value rather than string form). See helpers.IPInNetworks.
+		// matched by value rather than string form). See helpers.IPInNetworks. Any other
+		// entry (a host name, a typo) matches no client; warnUnusableAllowedHosts reports
+		// it once per list.
 		allowed := helpers.IPInNetworks(net.ParseIP(clientIP), allowedHosts)
 
 		if !allowed {
@@ -626,6 +630,14 @@ func (s *Server) allowedHostsMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// warnUnusableAllowedHosts logs the allowed_hosts entries that are not an IP address
+// or CIDR, when a list is configured (startup) or replaced (reload).
+func warnUnusableAllowedHosts(name string, allowedHosts []string) {
+	for _, entry := range helpers.InvalidNetworkEntries(allowedHosts) {
+		logger.Warn("HTTP API: allowed_hosts entry is not an IP address or CIDR and matches no client", "name", name, "entry", entry)
+	}
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {

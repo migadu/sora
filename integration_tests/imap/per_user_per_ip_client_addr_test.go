@@ -131,6 +131,25 @@ func TestIMAP_PerUserPerIPLimitCountsIDForwardedClientAddress(t *testing.T) {
 	}
 }
 
+// Behind a layer-4 load balancer that sends PROXY headers, an ID is the client's own:
+// it cannot replace the address the header gave, so a client cannot claim a fresh
+// address for each connection and escape the per-IP count (#540).
+func TestIMAP_PerUserPerIPLimitIgnoresIDFromProxiedClient(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := setupPerUserPerIPBehindProxy(t, 1)
+
+	for i, want := range []string{" OK ", " NO [LIMIT]", " NO [LIMIT]"} {
+		claimed := fmt.Sprintf("203.0.113.%d", i+1)
+		c := dialProxiedIMAP(t, server.Address, "198.51.100.66")
+		if resp := c.do(fmt.Sprintf(`ID ("x-originating-ip" "%s" "x-proxy-ttl" "5")`, claimed)); !strings.Contains(resp, " OK ") {
+			t.Fatalf("ID: %s", resp)
+		}
+		if resp := c.login(account); !strings.Contains(resp, want) {
+			t.Fatalf("LOGIN %d from 198.51.100.66 claiming %s: %s, want %s", i+1, claimed, resp, want)
+		}
+	}
+}
+
 // The connection is unregistered under the address it was registered with,
 // even when an ID after LOGIN changed the session's client address; otherwise
 // the first address keeps a connection that is gone.

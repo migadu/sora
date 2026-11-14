@@ -1745,11 +1745,21 @@ func IMAPAppendLimit(servers []ServerConfig) (int64, error) {
 	return 0, fmt.Errorf("no IMAP server configured")
 }
 
+// GetMaxScriptSize returns the ManageSieve script size limit. Omitted or zero is the
+// 16KB default; there is no unlimited setting (go-managesieve reads a limit of 0 as
+// none, and would then accept a script literal of any length).
 func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 	if s.MaxScriptSize == "" {
 		return 16 * 1024, nil // 16KB default
 	}
-	return helpers.ParseSize(s.MaxScriptSize)
+	size, err := helpers.ParseSize(s.MaxScriptSize)
+	if err != nil {
+		return 0, err
+	}
+	if size == 0 {
+		return 16 * 1024, nil
+	}
+	return size, nil
 }
 
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
@@ -2770,6 +2780,14 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.Type == "metrics" && s.ProxyProtocol {
 			logger("WARNING: Server %s (type: metrics) has 'proxy_protocol' configured, but the metrics endpoint does not read PROXY protocol headers; it is ignored, and 'allowed_hosts' matches the connecting host", s.Name)
+		}
+		// A metrics listener's allowed_hosts is fixed at startup, so this is where an
+		// unusable entry is reported. The Admin and User APIs report theirs when they
+		// install a list, which a reload can replace.
+		if s.Type == "metrics" {
+			for _, entry := range helpers.InvalidNetworkEntries(s.AllowedHosts) {
+				logger("WARNING: Server %s (type: metrics) has 'allowed_hosts' entry %q, which is not an IP address or CIDR and matches no client", s.Name, entry)
+			}
 		}
 	}
 }
