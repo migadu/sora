@@ -173,11 +173,7 @@ func (s *IMAPSession) AdditionalCapabilities() []imap.Cap {
 // 2. For LITERAL+ (non-synchronizing), drain oversized data to prevent stream corruption
 // 3. Advertise APPENDLIMIT=<size> capability to clients
 func (s *IMAPSession) AppendLimit() uint32 {
-	limit := s.server.appendLimit
-	if limit <= 0 {
-		limit = DefaultAppendLimit // 25MB fallback
-	}
-	return uint32(limit)
+	return s.server.appendLimit
 }
 
 // SetClientID stores the client ID information and applies capability filtering
