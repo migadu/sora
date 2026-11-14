@@ -169,7 +169,8 @@ func (d *DatabaseConfig) GetFetchChunkSize() int {
 type S3Config struct {
 	Endpoint      string `toml:"endpoint"`
 	DisableTLS    bool   `toml:"disable_tls"`
-	AccessKey     string `toml:"access_key"`
+	Region        string `toml:"region"`     // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
+	AccessKey     string `toml:"access_key"` // Without both keys the AWS default credential chain is used
 	SecretKey     string `toml:"secret_key"`
 	Bucket        string `toml:"bucket"`
 	Debug         bool   `toml:"debug"`   // Enable detailed S3 request/response tracing

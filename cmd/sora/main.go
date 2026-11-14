@@ -681,9 +681,11 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Initialize S3 storage for mail services or a User API body reader.
 	if s3Needed {
-		// Ensure required S3 arguments are provided only if needed
-		if cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
-			errorHandler.ValidationError("S3 credentials", fmt.Errorf("missing required S3 credentials for mail services (IMAP, LMTP, POP3) or the User API"))
+		// Ensure required S3 arguments are provided only if needed. Without access_key and
+		// secret_key the AWS default credential chain supplies them, and storage.New
+		// refuses to start when it finds none.
+		if cfg.S3.Bucket == "" {
+			errorHandler.ValidationError("S3 bucket", fmt.Errorf("missing required S3 bucket for mail services (IMAP, LMTP, POP3) or the User API"))
 			os.Exit(errorHandler.WaitForExit())
 		}
 
@@ -699,7 +701,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			os.Exit(errorHandler.WaitForExit())
 		}
 		logger.Info("Connecting to S3", "endpoint", s3EndpointToUse, "bucket", cfg.S3.Bucket, "timeout", s3Timeout)
-		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug(), s3Timeout)
+		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug(), s3Timeout, storage.WithRegion(cfg.S3.Region))
 		if err != nil {
 			errorHandler.FatalError(fmt.Sprintf("initialize S3 storage at endpoint '%s'", s3EndpointToUse), err)
 			os.Exit(errorHandler.WaitForExit())

@@ -334,6 +334,7 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 		!s3cfg.DisableTLS,
 		s3cfg.Debug,
 		s3Timeout,
+		storage.WithRegion(s3cfg.Region),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize S3 storage: %w", err)
@@ -720,6 +721,7 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 		!s3cfg.DisableTLS,
 		s3cfg.Debug,
 		s3Timeout,
+		storage.WithRegion(s3cfg.Region),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize S3 storage: %w", err)
@@ -870,6 +872,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		!s3cfg.DisableTLS,
 		s3cfg.Debug,
 		s3Timeout,
+		storage.WithRegion(s3cfg.Region),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize S3 storage: %w", err)
@@ -1022,6 +1025,7 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		!s3cfg.DisableTLS,
 		s3cfg.Debug,
 		s3Timeout,
+		storage.WithRegion(s3cfg.Region),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize S3 storage: %w", err)

@@ -28,6 +28,8 @@ func handleImportCommand(ctx context.Context) {
 		handleImportMaildir(ctx)
 	case "s3":
 		handleImportS3(ctx)
+	case "rekey":
+		handleImportRekey(ctx)
 	case "--help", "-h":
 		printImportUsage()
 	default:
@@ -123,7 +125,7 @@ Examples:
   # Import from specific paths file
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --paths-file failed_paths.txt
 
-  # Import with cleanup (removes SQLite database after completion)
+  # Import with cleanup (removes the SQLite database after a successful import)
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db
 
   # Import from Dovecot with subscriptions and custom keywords
@@ -211,7 +213,7 @@ Examples:
 		if err != nil {
 			logger.Fatalf("Failed to parse S3 timeout: %v", err)
 		}
-		s3, err = storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout)
+		s3, err = storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout, storage.WithRegion(globalConfig.S3.Region))
 		if err != nil {
 			logger.Fatalf("Failed to connect to S3: %v", err)
 		}
@@ -301,7 +303,7 @@ func handleImportS3(ctx context.Context) {
 	if err != nil {
 		logger.Fatalf("Failed to parse S3 timeout: %v", err)
 	}
-	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout)
+	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout, storage.WithRegion(globalConfig.S3.Region))
 	if err != nil {
 		logger.Fatalf("Failed to connect to S3: %v", err)
 	}
@@ -479,7 +481,7 @@ Examples:
 	if err != nil {
 		logger.Fatalf("Failed to parse S3 timeout: %v", err)
 	}
-	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout)
+	s3, err := storage.New(globalConfig.S3.Endpoint, globalConfig.S3.AccessKey, globalConfig.S3.SecretKey, globalConfig.S3.Bucket, !globalConfig.S3.DisableTLS, globalConfig.S3.GetDebug(), s3Timeout, storage.WithRegion(globalConfig.S3.Region))
 	if err != nil {
 		logger.Fatalf("Failed to connect to S3: %v", err)
 	}
@@ -525,6 +527,7 @@ Usage:
 Subcommands:
   maildir        Import maildir data
   s3             Import messages from S3 storage (recovery scenario)
+  rekey          Re-key bodies an older import stored under their SHA-256 digest
   fix-subscriptions  Fix subscription status for default mailboxes
 
 Examples:
@@ -533,6 +536,7 @@ Examples:
   sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
   sora-admin import s3 --email user@example.com --dry-run
   sora-admin import s3 --email user@example.com --workers 5 --batch-size 500
+  sora-admin import rekey --email user@example.com --dry-run
 
 Use 'sora-admin import <subcommand> --help' for detailed help.
 `)
