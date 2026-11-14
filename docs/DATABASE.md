@@ -372,18 +372,25 @@ Sora orders the deletion of a message body in S3 (the cleaner, account purges, `
 against the writes that claim one (uploads, restores, cross-account copies) with advisory locks
 on the write host. A lock excludes only what runs on the server that holds it. So when Sora stops
 writing through a server, it revokes the locks it holds there: the work they guard is cancelled
-and runs again in a later cycle. It does so when it switches to another write host, before it
-writes anything there, and when it reconnects its write host because the server answered
-read-only or in recovery, as soon as it has dropped the old connections. The log shows
-`Database: fencing advisory locks`.
+(a cleanup batch or purge runs again in a later cycle; a copy or `import rekey` fails and can be
+retried). It does so when it switches to another write host, before it writes anything there, and
+when it reconnects its write host because the server answered read-only or in recovery, as soon
+as it has dropped the old connections. The log shows `Database: fencing advisory locks`.
 
 Each node notices a failover by itself, at its next health check or at its first write that
 fails. Until then, a node still connected to the old primary keeps its locks there, and they
 exclude nothing on the new one. Your failover tooling must therefore fence the old primary before
 the new one accepts writes: shut it down, or terminate every client session on it
 (`pg_terminate_backend`) and refuse new ones. Making it read-only is not enough, because a session
-that is already open keeps its locks. Sora notices that the session holding a lock is gone at the
-lock's next keepalive, within a minute, and cancels the work the lock guarded.
+that is already open keeps its locks.
+
+Fencing ends the locks, but not at once the work they guard. Sora notices that the session
+holding a lock is gone only at the lock's next keepalive, which runs at most a minute after the
+lock's last statement (twice the 30-second keepalive interval) and gives up on a server that does
+not answer after 5 seconds. Until then the guarded work goes on: an S3 delete that was already
+under way, and its retries, can still remove the body of a message the new primary has just
+accepted. So the new primary must not accept writes until more than 65 seconds after the old one
+was fenced.
 
 ### Retries
 
