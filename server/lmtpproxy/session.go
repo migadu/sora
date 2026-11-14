@@ -24,10 +24,12 @@ import (
 type Session struct {
 	server                *Server
 	settings              *reloadableSettings // the server's settings when the session started (see reloadableSettings)
-	clientConn            net.Conn            // Reassigned on STARTTLS; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
+	clientConn            net.Conn            // Reassigned under mu on STARTTLS; shutdown/cancellation snapshot it under mu
 	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4 and username, which the TLS conn above it after STARTTLS does not
 	startTLSInProgress    bool                // Between the 220 to STARTTLS and the end of its handshake, under mu: the client reads neither plaintext nor, yet, TLS
-	backendConn           net.Conn            // Reassigned on backend connect/STARTTLS/error; writes must hold mu (same reason)
+	greeted               bool                // The 220 greeting has been written, under mu: before it the implicit-TLS handshake may be pending, and a notice written then would wait for it
+	noticeMu              sync.Mutex          // Orders the greeting and shutdown notice with STARTTLS, without holding mu during socket writes
+	backendConn           net.Conn            // Reassigned under mu on backend connect/STARTTLS/error; shutdown/cancellation snapshot it under mu
 	backendRoute          *proxy.BackendRoute // Authorization of the held socket; survives per-recipient routing and transaction resets
 	backendReader         *bufio.Reader
 	backendWriter         *bufio.Writer
@@ -124,16 +126,13 @@ func (s *Session) handleConnection() {
 	// unblock a read on the backend connection.
 	go func() {
 		<-s.ctx.Done()
-		// Force close connections to unblock any pending Read calls
-		// Use mutex to ensure safe access consistent with close()
 		s.mu.Lock()
-		if s.clientConn != nil {
-			s.clientConn.Close()
-		}
-		if s.backendConn != nil {
-			s.backendConn.Close()
-		}
+		client, backend := s.clientConn, s.backendConn
 		s.mu.Unlock()
+		// A TLS close_notify can wait for its peer. Force the transports
+		// closed without holding the mutex needed by shutdown and teardown.
+		closeSessionTransport(client)
+		closeSessionTransport(backend)
 	}()
 
 	// Enforce absolute session timeout to prevent hung sessions from leaking
@@ -161,7 +160,15 @@ func (s *Session) handleConnection() {
 	}
 
 	// Send greeting
-	if err := s.sendGreeting(); err != nil {
+	s.noticeMu.Lock()
+	err := s.sendGreeting()
+	if err == nil {
+		s.mu.Lock()
+		s.greeted = true
+		s.mu.Unlock()
+	}
+	s.noticeMu.Unlock()
+	if err != nil {
 		s.DebugLog("Failed to send greeting", "error", err)
 		return
 	}
@@ -565,12 +572,13 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// The shutdown notice writes clientConn under mu from another
-			// goroutine: stop it before the reply that makes the client expect
+			// Order a shutdown notice before the reply that makes the client expect
 			// TLS, so no plaintext 421 can follow that reply.
+			s.noticeMu.Lock()
 			s.mu.Lock()
 			s.startTLSInProgress = true
 			s.mu.Unlock()
+			s.noticeMu.Unlock()
 			if err := s.sendResponse("220 2.0.0 Ready to start TLS"); err != nil {
 				s.DebugLog("Failed to send STARTTLS response", "error", err)
 				return
@@ -1571,7 +1579,6 @@ func (s *Session) forwardRCPT(command string) {
 // close closes all connections.
 func (s *Session) close() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Release connection limiter slot IMMEDIATELY (don't wait for goroutine to exit)
 	if s.releaseConn != nil {
@@ -1616,12 +1623,26 @@ func (s *Session) close() {
 		}
 	}
 
-	if s.clientConn != nil {
-		s.clientConn.Close()
+	client, backend := s.clientConn, s.backendConn
+	s.mu.Unlock()
+	// Normal completion retains TLS close_notify. Forced shutdown/cancellation
+	// closes the raw transports separately and can interrupt these closes.
+	if client != nil {
+		client.Close()
 	}
+	if backend != nil {
+		backend.Close()
+	}
+}
 
-	if s.backendConn != nil {
-		s.backendConn.Close()
+// closeSessionTransport interrupts pending I/O before wrapper cleanup. In
+// particular it never waits for TLS close_notify while holding a session lock.
+func closeSessionTransport(conn net.Conn) {
+	if conn != nil {
+		if raw := server.RawConn(conn); raw != nil {
+			raw.Close()
+		}
+		conn.Close()
 	}
 }
 
