@@ -45,6 +45,17 @@ func (rd *ResilientDatabase) IsAddressOwnedByAccountWithRetry(ctx context.Contex
 	return result.(bool), nil
 }
 
+func (rd *ResilientDatabase) IsAnyAddressOwnedByAccountWithRetry(ctx context.Context, accountID int64, addresses []string) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).IsAnyAddressOwnedByAccount(ctx, accountID, addresses)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
 func (rd *ResilientDatabase) DeleteCredentialWithRetry(ctx context.Context, email string) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).DeleteCredential(ctx, tx, email)

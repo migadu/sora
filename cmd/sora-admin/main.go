@@ -40,10 +40,10 @@ type AdminConfig struct {
 	TLS                       config.TLSConfig             `toml:"tls"` // TLS configuration for accessing Let's Encrypt S3 bucket
 	AdminCLI                  config.AdminCLIConfig        `toml:"admin_cli"`
 	DynamicServers            []config.ServerConfig        // Populated from full config
-	Server                    []map[string]any             `toml:"server"`                        // Ignore server config array, not needed for admin commands
-	HTTPAPIAddr               string                       `toml:"http_api_addr"`                 // HTTP API address for kick operations (e.g., "http://localhost:8080")
-	HTTPAPIKey                string                       `toml:"http_api_key"`                  // HTTP API key for authentication
-	HTTPAPIInsecureSkipVerify bool                         `toml:"http_api_insecure_skip_verify"` // Skip TLS cert verification. Default: auto (loopback addr -> skip; remote -> verify).
+	Server                    []map[string]any             `toml:"server"` // Ignore server config array, not needed for admin commands
+	HTTPAPIAddr               string                       `toml:"-"`      // Admin API address, from [admin_cli] addr (e.g., "http://localhost:8080")
+	HTTPAPIKey                string                       `toml:"-"`      // Admin API key, from [admin_cli] api_key
+	HTTPAPIInsecureSkipVerify bool                         `toml:"-"`      // From [admin_cli] insecure_skip_verify. Default: auto (loopback addr -> skip; remote -> verify).
 	Relay                     config.RelayConfig           `toml:"relay"`
 	// Sieve is read so scripts stored by the admin tools (sieve put, import-maildir
 	// --sieve-path) are validated against the same extension set delivery compiles with.
@@ -374,11 +374,11 @@ Commands:
 
 Examples:
   sora-admin --config config.toml accounts create --email user@example.com --password mypassword
-  sora-admin --config config.toml accounts list
+  sora-admin --config config.toml accounts list --domain example.com
   sora-admin --config config.toml credentials add --primary admin@example.com --email alias@example.com --password mypassword
   sora-admin --config config.toml credentials list --email user@example.com
   sora-admin --config config.toml cache stats
-  sora-admin --config config.toml stats auth --window 1h
+  sora-admin --config config.toml stats blocked
   sora-admin --config config.toml connections kick --user user@example.com
   sora-admin --config config.toml affinity set --user user@example.com --protocol imap --backend 192.168.1.10:993
   sora-admin --config config.toml config validate
