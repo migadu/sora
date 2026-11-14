@@ -561,7 +561,7 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 
 		// Broadcast to cluster
 		if a.clusterLimiter != nil {
-			a.clusterLimiter.BroadcastBlockIP(ip, blockedUntil, info.FailureCount, a.protocol, info.FirstFailure)
+			a.clusterLimiter.BroadcastBlockIP(ip, blockedUntil, info.FailureCount, info.FirstFailure)
 		}
 	} else if info.FailureCount >= a.config.DelayStartThreshold {
 		logger.Debug("Auth limiter: Progressive delay for IP", "protocol", a.protocol, "ip", ip, "delay", info.LastDelay, "failures", info.FailureCount)

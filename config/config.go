@@ -1378,6 +1378,14 @@ func NewDefaultConfig() Config {
 			MaxAttempts:   20,
 			RetryInterval: "30s",
 		},
+		Cluster: ClusterConfig{
+			// Only read with [cluster] enabled; on by default as documented.
+			RateLimitSync: ClusterRateLimitSyncConfig{
+				Enabled:           true,
+				SyncBlocks:        true,
+				SyncFailureCounts: true,
+			},
+		},
 	}
 }
 

@@ -156,7 +156,8 @@ type ServerOptions struct {
 	MaxAuthErrors int // Maximum authentication errors before disconnection (0 = use default)
 
 	// Cluster support
-	ClusterManager *cluster.Manager // Optional: enables cluster-wide per-IP limiting
+	ClusterManager       *cluster.Manager                  // Optional: shares per-IP connection counts and auth rate limits with the cluster
+	ClusterRateLimitSync config.ClusterRateLimitSyncConfig // [cluster.rate_limit_sync]; read only with ClusterManager
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
@@ -250,6 +251,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("SIEVE-PROXY", opts.Name, hostname, opts.AuthRateLimit, opts.TrustedProxies)
 	server.RegisterRateLimiter("managesieve_proxy", opts.Name, authLimiter)
+	authLimiter.JoinCluster(opts.ClusterManager, opts.ClusterRateLimitSync)
 
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter

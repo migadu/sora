@@ -443,6 +443,9 @@ max_event_queue_size = 50000                    # Max events per protocol queue 
 # Synchronize authentication rate limiting across cluster nodes via gossip protocol.
 # When enabled, failed authentication attempts on one node immediately block the IP
 # on all other nodes, providing cluster-wide brute-force protection.
+# Applies to the IMAP, POP3 and ManageSieve proxies, each sharing with the proxies of
+# the same protocol; in cluster mode their max_connections_per_ip is cluster-wide too.
+# Backend servers and the User API keep per-node limits.
 [cluster.rate_limit_sync]
 enabled = true                                  # Enable cluster-wide rate limiting (default: true if cluster enabled)
 sync_blocks = true                              # Synchronize IP blocks across nodes (default: true)

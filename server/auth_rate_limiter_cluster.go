@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cluster"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/server/idgen"
 )
@@ -41,10 +42,13 @@ type RateLimitEvent struct {
 	Timestamp time.Time          `json:"timestamp"`
 	NodeID    string             `json:"node_id"`
 
+	// Protocol is the protocol of the limiter that produced the event; only
+	// limiters of the same protocol apply it.
+	Protocol string `json:"protocol,omitempty"`
+
 	// For BLOCK_IP events
 	BlockedUntil time.Time `json:"blocked_until,omitempty"`
 	FailureCount int       `json:"failure_count,omitempty"`
-	Protocol     string    `json:"protocol,omitempty"`
 	FirstFailure time.Time `json:"first_failure,omitempty"`
 
 	// For FAILURE_COUNT events (progressive delays)
@@ -110,8 +114,20 @@ func NewClusterRateLimiter(limiter *AuthRateLimiter, clusterMgr *cluster.Manager
 	return crl
 }
 
+// JoinCluster makes the limiter share its IP blocks, progressive-delay failure
+// counts and username failures with the limiters of the same protocol on the
+// other cluster nodes, as [cluster.rate_limit_sync] configures. It does nothing
+// on a disabled (nil) limiter, without a cluster manager, or with sync disabled.
+// Call it before the limiter records its first attempt.
+func (a *AuthRateLimiter) JoinCluster(clusterMgr *cluster.Manager, sync config.ClusterRateLimitSyncConfig) {
+	if a == nil || clusterMgr == nil || !sync.Enabled {
+		return
+	}
+	a.SetClusterLimiter(NewClusterRateLimiter(a, clusterMgr, sync.SyncBlocks, sync.SyncFailureCounts))
+}
+
 // BroadcastBlockIP broadcasts an IP block event to the cluster
-func (crl *ClusterRateLimiter) BroadcastBlockIP(ip string, blockedUntil time.Time, failureCount int, protocol string, firstFailure time.Time) {
+func (crl *ClusterRateLimiter) BroadcastBlockIP(ip string, blockedUntil time.Time, failureCount int, firstFailure time.Time) {
 	if !crl.syncBlocks {
 		return
 	}
@@ -123,7 +139,6 @@ func (crl *ClusterRateLimiter) BroadcastBlockIP(ip string, blockedUntil time.Tim
 		NodeID:       crl.clusterManager.GetNodeID(),
 		BlockedUntil: blockedUntil,
 		FailureCount: failureCount,
-		Protocol:     protocol,
 		FirstFailure: firstFailure,
 	}
 
@@ -196,6 +211,7 @@ func (crl *ClusterRateLimiter) queueEvent(event RateLimitEvent) {
 	if event.EventID == "" {
 		event.EventID = idgen.New()
 	}
+	event.Protocol = crl.limiter.protocol
 
 	encoded, err := encodeRateLimitEvent(event)
 	if err != nil {
@@ -223,6 +239,14 @@ func (crl *ClusterRateLimiter) HandleClusterEvent(data []byte) {
 
 	// Skip events from this node (we already applied them locally)
 	if event.NodeID == crl.clusterManager.GetNodeID() {
+		return
+	}
+
+	// Every limiter on this node receives every rate-limit event of the cluster.
+	// The limiters of one node are independent of each other - an IMAP failure
+	// does not count against POP3 - so a peer's event belongs only to the limiter
+	// of the protocol that produced it.
+	if event.Protocol != crl.limiter.protocol {
 		return
 	}
 
