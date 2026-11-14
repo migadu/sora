@@ -107,9 +107,9 @@ Examples:
 
 	fmt.Printf("Validating configuration file: %s\n\n", configFile)
 
-	// Load full configuration - this will show all warnings
-	cfg := config.NewDefaultConfig()
-	if err := config.LoadConfigFromFile(configFile, &cfg); err != nil {
+	// Load full configuration as the server does - this will show all warnings
+	var cfg config.Config
+	if err := config.LoadServerConfig(configFile, &cfg); err != nil {
 		fmt.Printf("[FAIL] Configuration validation FAILED:\n")
 		fmt.Printf("   %v\n", err)
 		os.Exit(1)
@@ -240,9 +240,11 @@ Examples:
 		os.Exit(1)
 	}
 
-	// Load full configuration
-	cfg := config.NewDefaultConfig()
-	if err := config.LoadConfigFromFile(configFile, &cfg); err != nil {
+	// Load the configuration as the server runs with it: without the [database.write]
+	// and [database.read] endpoints the file does not define, which NewDefaultConfig
+	// seeds only for the keys a table in the file leaves out.
+	var cfg config.Config
+	if err := config.LoadServerConfig(configFile, &cfg); err != nil {
 		logger.Fatalf("Failed to load config file: %v", err)
 	}
 

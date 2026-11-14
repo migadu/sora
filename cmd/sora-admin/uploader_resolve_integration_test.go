@@ -16,6 +16,7 @@ import (
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/server/uploader"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,26 +24,36 @@ import (
 // is in neither S3 nor the spool. A spool directory that is not on this host is no such
 // proof. With no [uploader] path in the config file, resolve used to look for the body
 // relative to the directory it was run from, find nothing, and delete messages whose
-// bodies were intact in the server's spool.
+// bodies were intact in the server's spool. A body the spool does hold is re-armed.
 func TestResolveKeepsParkedUploadWithoutTheSpool(t *testing.T) {
+	const (
+		kept    = "kept"    // skipped: the parked upload and its message stay as they are
+		rearmed = "rearmed" // the body is in the spool: attempts reset, the message stays
+		deleted = "deleted" // in neither S3 nor the spool: the message is removed
+	)
 	for _, tc := range []struct {
 		name    string
 		uploads func(t *testing.T) string // the [uploader] section, empty for none
-		deleted bool
+		staged  bool                      // stage the body in the spool before resolving
+		want    string
 	}{
 		{"no uploader path", func(t *testing.T) string {
 			if _, err := os.Stat(config.DefaultUploaderPath); err == nil {
 				t.Skipf("the server's default spool %s exists on this host", config.DefaultUploaderPath)
 			}
 			return ""
-		}, false},
+		}, false, kept},
 		{"uploader path not on this host", func(t *testing.T) string {
 			return fmt.Sprintf("[uploader]\npath = %q\n", filepath.Join(t.TempDir(), "missing"))
-		}, false},
+		}, false, kept},
 		// The spool is here and does not hold the body: the content is lost.
 		{"body not in the spool here", func(t *testing.T) string {
 			return fmt.Sprintf("[uploader]\npath = %q\n", t.TempDir())
-		}, true},
+		}, false, deleted},
+		// The spool holds the body: the upload is re-armed for the uploader to retry.
+		{"body in the spool here", func(t *testing.T) string {
+			return fmt.Sprintf("[uploader]\npath = %q\n", t.TempDir())
+		}, true, rearmed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -114,22 +125,35 @@ secret_key = "test"
 				_, _ = rdb.ExecWithRetry(context.Background(), `DELETE FROM pending_uploads WHERE account_id = $1`, accountID)
 			})
 
+			if tc.staged {
+				staged := uploader.StagingFilePath(cfg.Uploader.Path, hash, accountID)
+				require.NoError(t, os.MkdirAll(filepath.Dir(staged), 0o755))
+				require.NoError(t, os.WriteFile(staged, []byte(body), 0o644))
+			}
+
 			// Run from a directory that is not the spool.
 			t.Chdir(t.TempDir())
 			require.NoError(t, resolveFailedUploads(ctx, cfg, false, 100))
 
-			var messages, pending int
+			var messages, pending, attempts int
 			require.NoError(t, rdb.QueryRowWithRetry(ctx,
 				`SELECT count(*) FROM messages WHERE account_id = $1 AND content_hash = $2`, accountID, hash).Scan(&messages))
 			require.NoError(t, rdb.QueryRowWithRetry(ctx,
-				`SELECT count(*) FROM pending_uploads WHERE account_id = $1 AND content_hash = $2`, accountID, hash).Scan(&pending))
-			if tc.deleted {
+				`SELECT count(*), COALESCE(max(attempts), -1) FROM pending_uploads WHERE account_id = $1 AND content_hash = $2`,
+				accountID, hash).Scan(&pending, &attempts))
+			switch tc.want {
+			case deleted:
 				require.Equal(t, 0, messages, "message of a body in neither S3 nor the spool %q", cfg.Uploader.Path)
 				require.Equal(t, 0, pending, "parked upload of a body in neither S3 nor the spool %q", cfg.Uploader.Path)
-				return
+			case rearmed:
+				require.Equal(t, 1, messages, "resolve deleted the message although its body is in the spool %q", cfg.Uploader.Path)
+				require.Equal(t, 1, pending, "resolve dropped the upload although its body is in the spool %q", cfg.Uploader.Path)
+				require.Equal(t, 0, attempts, "resolve did not re-arm the upload whose body is in the spool %q", cfg.Uploader.Path)
+			default:
+				require.Equal(t, 1, messages, "resolve deleted the message although it could not see the spool %q", cfg.Uploader.Path)
+				require.Equal(t, 1, pending, "resolve deleted the parked upload although it could not see the spool %q", cfg.Uploader.Path)
+				require.Equal(t, cfg.Uploader.MaxAttempts, attempts, "resolve changed the parked upload although it could not see the spool %q", cfg.Uploader.Path)
 			}
-			require.Equal(t, 1, messages, "resolve deleted the message although it could not see the spool %q", cfg.Uploader.Path)
-			require.Equal(t, 1, pending, "resolve deleted the parked upload although it could not see the spool %q", cfg.Uploader.Path)
 		})
 	}
 }
