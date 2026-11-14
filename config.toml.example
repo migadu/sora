@@ -873,8 +873,9 @@ enabled = false
 # timeout = "10s"
 
 # Maximum message size to submit (default: "10mb")
-# Messages larger than this are skipped (not submitted for training)
-# Attachments are already stripped, so this applies to the text content size
+# Messages larger than this are skipped (not submitted for training). The size is
+# the stored message size, attachments included, so a larger message is skipped
+# before its body is fetched from S3.
 # max_message_size = "10mb"
 
 # Maximum attachment size threshold (default: "0")
@@ -888,6 +889,16 @@ enabled = false
 # When false, MOVE command waits for training submission to complete
 # RECOMMENDED: Keep true to avoid slowing down IMAP operations
 # async = true
+
+# Workers that fetch and submit training messages, process-wide (default: 4)
+# At most this many message bodies are fetched and sent at once, however many
+# messages a MOVE touches.
+# workers = 4
+
+# Messages waiting for a worker (default: 1000)
+# A message moved while the queue is full is not submitted; it is counted in
+# sora_spam_training_messages_total{result="dropped"}.
+# queue_size = 1000
 
 # Circuit breaker configuration for training endpoint
 # Protects against cascading failures if the training endpoint becomes unavailable
