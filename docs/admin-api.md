@@ -78,7 +78,7 @@ Include the API key in the `Authorization` header:
 
 ```bash
 curl -H "Authorization: Bearer your-secret-api-key-here" \
-     http://localhost:8080/admin/accounts
+     http://localhost:8080/admin/accounts/user@example.com
 ```
 
 **Response on Invalid/Missing API Key:**
