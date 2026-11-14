@@ -27,7 +27,8 @@ func TestUserAPI_SearchAppliesFilters(t *testing.T) {
 	// FTS worker run stands between the inserts and the searches.
 	const word = "zorbulant"
 	base := time.Now().UnixNano()
-	seed := func(i int, subject string, seen bool, senders ...helpers.Recipient) {
+	// Every message gets user@example.com as its last To address, after addrs.
+	seed := func(i int, subject string, seen bool, addrs ...helpers.Recipient) {
 		t.Helper()
 		now := time.Now()
 		hash := fmt.Sprintf("%016x%048x", base, i)
@@ -35,7 +36,7 @@ func TestUserAPI_SearchAppliesFilters(t *testing.T) {
 		if seen {
 			flags = append(flags, imap.FlagSeen)
 		}
-		recipients := append(senders, helpers.Recipient{AddressType: "to", EmailAddress: "user@example.com"})
+		recipients := append(addrs, helpers.Recipient{AddressType: "to", EmailAddress: "user@example.com"})
 		_, _, err := h.rdb.InsertMessageWithRetry(ctx, &db.InsertMessageOptions{
 			AccountID: h.accountID, MailboxID: h.inbox.ID, MailboxName: "INBOX",
 			S3Domain: "example.com", S3Localpart: "user", ContentHash: hash,
@@ -51,7 +52,10 @@ func TestUserAPI_SearchAppliesFilters(t *testing.T) {
 	}
 
 	seed(1, word+" quarterly report", true, from("The Boss", "boss@example.com"))
-	seed(2, word+" lunch", false, from("", "other@example.com"))
+	// user@example.com is the second To address here, so it is in extra_addresses' To
+	// section, which the from filter must not read (FromIsNotTo).
+	seed(2, word+" lunch", false, from("", "other@example.com"),
+		helpers.Recipient{AddressType: "to", EmailAddress: "colleague@example.org"})
 	seed(3, word+" Quarterly numbers", false, from("Assistant", "assistant@example.org"))
 	// boss@example.com is the second From address: it is in extra_addresses, not the sort columns.
 	seed(4, word+" joint memo", false, from("", "first@example.org"), from("", "boss@example.com"))
