@@ -177,8 +177,22 @@ func (s *IMAPSession) AdditionalCapabilities() []imap.Cap {
 // 1. Check literal size BEFORE reading data (prevents memory exhaustion)
 // 2. For LITERAL+ (non-synchronizing), drain oversized data to prevent stream corruption
 // 3. Advertise APPENDLIMIT=<size> capability to clients
+//
+// STATUS and LIST-STATUS report it as well. APPEND reads the whole literal into
+// the session memory budget (readAppendLiteral), so the limit is never above
+// that budget: go-imap then refuses a larger literal with NO [TOOBIG] before
+// asking for it, instead of the session reading it and answering with an
+// [UNAVAILABLE] that no retry cures.
+// The budget is this session's own snapshot of session_memory_limit, which a
+// reload changes for the sessions started after it.
 func (s *IMAPSession) AppendLimit() uint32 {
-	return s.server.appendLimit
+	limit := s.server.appendLimit
+	if s.memTracker != nil {
+		if budget := s.memTracker.MaxAllowed(); budget > 0 && budget < int64(limit) {
+			limit = uint32(budget)
+		}
+	}
+	return limit
 }
 
 // SetClientID stores the client ID information and applies capability filtering
