@@ -1301,6 +1301,8 @@ func (s *Server) trackers() map[string]*server.ConnectionTracker {
 // account) has its derived ID only. A failed lookup is an error: the derived ID alone
 // would leave the sessions of a database account open.
 func (s *Server) sessionAccountIDs(ctx context.Context, address string) ([]int64, error) {
+	// Revocation must see newly added credentials even while read replicas lag.
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	accountID, addresses, err := s.rdb.GetAccountAddressesWithRetry(ctx, address)
 	if errors.Is(err, consts.ErrUserNotFound) {
 		return []int64{proxy.DeriveAccountIDFromEmail(address)}, nil
