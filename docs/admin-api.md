@@ -664,7 +664,7 @@ Get status of the S3 upload queue.
 
 **Query Parameters:**
 - `show_failed=true` - Include list of recent failed uploads
-- `max_attempts=5` - Failure threshold
+- `max_attempts=N` - Failure threshold (default: `[uploader] max_attempts`, 20 unless configured)
 - `failed_limit=10` - Limit failed uploads returned
 
 **Response:** `200 OK`
@@ -690,7 +690,7 @@ Get status of the S3 upload queue.
 Get list of failed S3 uploads.
 
 **Query Parameters:**
-- `max_attempts=5` - Failure threshold
+- `max_attempts=N` - Failure threshold (default: `[uploader] max_attempts`, 20 unless configured)
 - `limit=50` - Maximum records to return
 
 **Response:** `200 OK`
@@ -934,6 +934,7 @@ curl -X POST http://localhost:8080/admin/mail/deliver \
 **Notes:**
 - Messages must be valid RFC822 format
 - Sieve filters are applied to delivered messages
+- `503 Service Unavailable` with `Retry-After` means retry later or on another node: the backend is in maintenance, the node has no upload worker (it runs no `imap`, `pop3` or `lmtp` server), or the single recipient failed for a server-side reason (`"transient": true`)
 - Large messages (up to server limits) are supported
 - Supports MIME multipart messages
 
