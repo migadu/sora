@@ -122,6 +122,46 @@ func TestCredentialChanges_EveryWayALoginStopsWorking(t *testing.T) {
 	require.False(t, changed)
 }
 
+// A change is stamped when its transaction commits, not when it is made. A reader goes
+// back a fixed window before its previous read, which covers the time between a row's
+// stamp and its commit only if that time is short: stamped at the change, a transaction
+// that went on working for longer than the window after it (an operator's psql session, a
+// batch) would commit a row every node has already read past.
+func TestCredentialChanges_StampedAtCommit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("database test")
+	}
+	db := setupTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	accountID, email := credentialChangesAccount(t, db, "commit")
+	removedID, removedEmail := credentialChangesAccount(t, db, "commit-removed")
+
+	var afterChanges time.Time
+	inTx(t, db, func(tx pgx.Tx) {
+		require.NoError(t, db.UpdateAccount(ctx, tx, UpdateAccountRequest{Email: email, Password: "second-password", HashType: "bcrypt"}))
+		require.NoError(t, db.DeleteAccount(ctx, tx, removedEmail))
+		// The transaction goes on after the changes.
+		require.NoError(t, tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&afterChanges))
+	})
+
+	changed, _ := changesSince(t, db, afterChanges, accountID)
+	require.True(t, changed, "the password change was stamped before the commit, not at it")
+	changed, removed := changesSince(t, db, afterChanges, removedID)
+	require.True(t, changed, "the deletion was stamped before the commit, not at it")
+	require.True(t, removed)
+
+	// A change rolled back is not recorded at all.
+	since := dbNow(t, db)
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, db.UpdateAccount(ctx, tx, UpdateAccountRequest{Email: email, Password: "third-password", HashType: "bcrypt"}))
+	require.NoError(t, tx.Rollback(ctx))
+	changed, _ = changesSince(t, db, since, accountID)
+	require.False(t, changed, "a rolled-back change is recorded")
+}
+
 func TestPruneCredentialChanges_DropsOnlyRowsBeforeTheCutoff(t *testing.T) {
 	if testing.Short() {
 		t.Skip("database test")
