@@ -90,7 +90,7 @@ func TestTLSTryDecodeDomainShortNames(t *testing.T) {
 					t.Fatalf("tryDecodeDomain(%q) panicked: %v", key, r)
 				}
 			}()
-			if got := tryDecodeDomain(key); got != want {
+			if got := tryDecodeDomain(key, nil); got != want {
 				t.Errorf("tryDecodeDomain(%q) = %q, want %q", key, got, want)
 			}
 		})

@@ -377,7 +377,7 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 
 			// Try to determine domain from key
 			// Format: autocert/cert-<sha256(domain)> or autocert/cert-<sha256(domain+rsa)>
-			certInfo.Domain = tryDecodeDomain(obj.Key)
+			certInfo.Domain = tryDecodeDomain(obj.Key, cfg.TLS.LetsEncrypt.Domains)
 
 			// Download certificate from S3 to parse it
 			reader, err := s3store.Get(obj.Key)
@@ -430,24 +430,19 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 	return displayCertificatesTable(certs, showDetails)
 }
 
-func tryDecodeDomain(s3Key string) string {
+// tryDecodeDomain names the object at s3Key by the configured domain (the
+// [tls.letsencrypt] domains, loaded as autocert names) whose ECDSA ("<domain>") or RSA
+// ("<domain>+rsa") cache entry the server's S3 cache keeps there. The key is a hash of
+// the entry name, so any other object, such as one of a domain no longer configured, is
+// shown by a hash prefix.
+func tryDecodeDomain(s3Key string, domains []string) string {
 	// Extract hash from key: autocert/cert-<hash>
 	hash, ok := strings.CutPrefix(s3Key, "autocert/cert-")
 	if !ok {
 		return "unknown"
 	}
 
-	// Try common domains
-	commonDomains := []string{
-		"imap.migadu.com",
-		"pop.migadu.com",
-		"lmtp.migadu.com",
-		"smtp.migadu.com",
-		"mail.migadu.com",
-	}
-
-	for _, domain := range commonDomains {
-		// Try both ECDSA (domain) and RSA (domain+rsa)
+	for _, domain := range domains {
 		switch s3Key {
 		case tlsmanager.S3ObjectKey(domain):
 			return domain
@@ -959,7 +954,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			certInfo := CertificateInfo{
 				S3Key: obj.Key,
 			}
-			certInfo.Domain = tryDecodeDomain(obj.Key)
+			certInfo.Domain = tryDecodeDomain(obj.Key, cfg.TLS.LetsEncrypt.Domains)
 
 			// Download and parse certificate to check expiry
 			reader, err := s3store.Get(obj.Key)
