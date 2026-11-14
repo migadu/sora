@@ -255,8 +255,13 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		return result, fmt.Errorf("failed to check file existence: %w", err)
 	}
 
+	ctx := d.Ctx
 	if createMailbox != "" {
-		if err := d.createMissingMailbox(d.Ctx, recipient, createMailbox); err != nil {
+		// The mailbox is created on the writer, and a replica may not have it yet when
+		// the target is resolved below: read from the writer from here on, or the
+		// message would fall back to INBOX (as LMTP does, which pins every delivery).
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+		if err := d.createMissingMailbox(ctx, recipient, createMailbox); err != nil {
 			result.ErrorMessage = fmt.Sprintf("Failed to create Sieve fileinto :create target %s: %v", createMailbox, err)
 			return result, err
 		}
@@ -266,7 +271,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// pending_uploads row can never name a file that is not staged yet - the uploader
 	// treats a missing local file as permanently lost content.
 	if copyMailbox != "" {
-		err := d.SaveMessageToMailbox(d.Ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, deliveryFlags, contentHash, bodyStructure)
+		err := d.SaveMessageToMailbox(ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, deliveryFlags, contentHash, bodyStructure)
 		// A duplicate copy is an accepted delivery, as it is in LMTP: the copy is
 		// already in the mailbox, so a resubmission must not fail the delivery.
 		if err != nil && !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -279,7 +284,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// account), enforce the 'i' right, attribute the message to the mailbox owner, and
 	// stage the already-saved body under the owner's path. The body was stored locally
 	// under recipient.AccountID above.
-	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(d.Ctx, recipient, mailboxName, contentHash)
+	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash)
 	if err != nil {
 		result.ErrorMessage = fmt.Sprintf("Failed to resolve destination mailbox: %v", err)
 		return result, err
@@ -287,7 +292,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 	// Save message to mailbox
 	size := int64(len(messageBytes))
-	_, messageUID, err := d.RDB.InsertMessageWithRetry(d.Ctx,
+	_, messageUID, err := d.RDB.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
 			AccountID:            destAccountID,
 			MailboxID:            mailbox.ID,
