@@ -444,11 +444,12 @@ func (ct *ConnectionTracker) unregisterLocked(accountID int64, protocol, clientA
 	}
 }
 
-// clientIPOf returns the per-user-per-IP key of a client address: the IP
-// without its port, in canonical form. An address without a port is already
-// an IP, IPv6 included: cutting "2001:db8::1" at its last colon would give
-// every address in 2001:db8::/112 one key. The address arrives as text (PROXY
-// v1 header, ID forwarding), so one client can be spelled several ways
+// clientIPOf returns the key a client address is counted under (per-user-per-IP
+// connections, auth rate limiting): the IP without its port, in canonical form.
+// An address without a port is already an IP, IPv6 included: cutting
+// "2001:db8::1" at its last colon would give every address in 2001:db8::/112
+// one key. The address arrives as text (PROXY v1 header, ID forwarding,
+// XCLIENT, a peer's gossip), so one client can be spelled several ways
 // (2001:0DB8::1, ::ffff:192.0.2.1); each must map to the one key. A host that
 // is not an IP is kept as given.
 func clientIPOf(clientAddr string) string {
