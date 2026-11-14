@@ -171,7 +171,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	// Initialize remotelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
 	if opts.RemoteLookup != nil && opts.RemoteLookup.Enabled {
-		remotelookupClient, err := proxy.InitializeRemoteLookup("userapi", opts.RemoteLookup)
+		remotelookupClient, err := proxy.InitializeRemoteLookup("userapi", opts.RemoteLookup, opts.RemotePort)
 		if err != nil {
 			logger.Warn("User API Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
 			if len(opts.Pools) > 0 || !opts.RemoteLookup.ShouldLookupLocalUsers() {
@@ -905,7 +905,13 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, route back
 		scheme = "https"
 	}
 
-	target, err := url.Parse(fmt.Sprintf("%s://%s", scheme, route.addr))
+	// A backend without a port takes the scheme's port. A bare IPv6 literal must then be
+	// bracketed, or the URL reads its last group as the port.
+	host := route.addr
+	if strings.Contains(host, ":") && net.ParseIP(host) != nil {
+		host = "[" + host + "]"
+	}
+	target, err := url.Parse(fmt.Sprintf("%s://%s", scheme, host))
 	if err != nil {
 		logger.Warn("User API Proxy: Failed to parse backend URL", "name", s.name, "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
