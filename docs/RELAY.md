@@ -182,6 +182,11 @@ U+FFFD. Those messages are also sent in `message_base64`. A relay API takes the 
 `message_base64` when it is present and from `message` otherwise; either way it gets the message
 byte for byte.
 
+Update the receiver to accept and prefer `message_base64` before deploying this field.
+A receiver that ignores it still sees the legacy, lossy `message` for non-UTF-8 mail.
+A receiver that rejects unknown fields can return a 4xx response, which Sora treats as a
+permanent relay failure and moves to the failed queue.
+
 Sora reads only the status code of the response.
 
 ---

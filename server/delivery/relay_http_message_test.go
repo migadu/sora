@@ -40,6 +40,19 @@ func TestHTTPRelayRequestKeepsMessageBytes(t *testing.T) {
 	}, {
 		name:    "UTF-8",
 		message: "Subject: Schön\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\nSchön <&>\r\n",
+	}, {
+		name: "all octet values",
+		message: func() string {
+			octets := make([]byte, 256)
+			for i := range octets {
+				octets[i] = byte(i)
+			}
+			return "Content-Type: application/octet-stream\r\n\r\n" + string(octets)
+		}(),
+		lossy: true,
+	}, {
+		name:    "valid replacement rune and JSON escapes",
+		message: "Subject: \uFFFD\r\n\r\nliteral replacement \uFFFD; NUL \x00; separators \u2028\u2029\r\n",
 	}}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
