@@ -27,7 +27,7 @@ func TestSearchConstants(t *testing.T) {
 //     numbers to UID ranges and then served by the optimized "simple" path —
 //     without the unnecessary messages_fts join used by the complex paths.
 //   - A search that also carries an FTS term (BODY) stays on the complex-fast
-//     path, because recomputing complexity after the rewrite still sees the FTS
+//     path, because complexity is decided after the rewrite, which keeps the FTS
 //     criteria.
 //
 // The assertions key off the per-path Prometheus query counters, which is the
@@ -51,7 +51,6 @@ func TestSeqNumSearchQueryPathSelection(t *testing.T) {
 	t.Run("PureSeqNumUsesSimplePath", func(t *testing.T) {
 		simpleBefore := pathCount("search_messages_simple")
 		fastBefore := pathCount("search_messages_complex_fast")
-		legacyBefore := pathCount("search_messages_complex_legacy")
 
 		criteria := &imap.SearchCriteria{
 			SeqNum: []imap.SeqSet{{imap.SeqRange{Start: 1, Stop: 5}}},
@@ -64,17 +63,14 @@ func TestSeqNumSearchQueryPathSelection(t *testing.T) {
 			"pure SeqNum search should be rewritten to UIDs and use the simple query path")
 		assert.Equal(t, 0.0, pathCount("search_messages_complex_fast")-fastBefore,
 			"pure SeqNum search must not use the complex-fast (messages_fts join) path")
-		assert.Equal(t, 0.0, pathCount("search_messages_complex_legacy")-legacyBefore,
-			"pure SeqNum search must not use the legacy ROW_NUMBER path")
 	})
 
 	t.Run("SeqNumWithFTSStaysComplex", func(t *testing.T) {
 		simpleBefore := pathCount("search_messages_simple")
 		fastBefore := pathCount("search_messages_complex_fast")
-		legacyBefore := pathCount("search_messages_complex_legacy")
 
-		// BODY keeps the query complex even after the seqnum→UID rewrite, so the
-		// recompute must NOT downgrade it to the simple path. The FTS term may
+		// BODY keeps the query complex after the seqnum→UID rewrite, so it must
+		// NOT be downgraded to the simple path. The FTS term may
 		// match zero rows in the test environment; only the chosen path matters.
 		criteria := &imap.SearchCriteria{
 			SeqNum: []imap.SeqSet{{imap.SeqRange{Start: 1, Stop: 5}}},
@@ -87,8 +83,6 @@ func TestSeqNumSearchQueryPathSelection(t *testing.T) {
 			"SeqNum+BODY search must not be downgraded to the simple path")
 		assert.Equal(t, 1.0, pathCount("search_messages_complex_fast")-fastBefore,
 			"SeqNum+BODY search should use the complex-fast path (FTS, no ROW_NUMBER)")
-		assert.Equal(t, 0.0, pathCount("search_messages_complex_legacy")-legacyBefore,
-			"SeqNum+BODY search should not need the legacy ROW_NUMBER path")
 	})
 }
 
@@ -167,7 +161,6 @@ func TestCanUseTextUnion(t *testing.T) {
 	tests := []struct {
 		name          string
 		criteria      *imap.SearchCriteria
-		needsSeqNum   bool
 		orderByClause string
 		want          bool
 	}{
@@ -208,12 +201,6 @@ func TestCanUseTextUnion(t *testing.T) {
 			want: false,
 		},
 		{
-			name:        "needsSeqNumSearch is ineligible",
-			criteria:    &imap.SearchCriteria{Text: []string{"invoice"}},
-			needsSeqNum: true,
-			want:        false,
-		},
-		{
 			name:          "ORDER BY seqnum is ineligible",
 			criteria:      &imap.SearchCriteria{Text: []string{"invoice"}},
 			orderByClause: "ORDER BY seqnum DESC",
@@ -223,7 +210,7 @@ func TestCanUseTextUnion(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := db.canUseTextUnion(tt.criteria, tt.needsSeqNum, tt.orderByClause)
+			got := db.canUseTextUnion(tt.criteria, tt.orderByClause)
 			assert.Equal(t, tt.want, got)
 		})
 	}
