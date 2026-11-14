@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"net"
+	"net/http"
 	"os"
 	"reflect"
 	"strconv"
@@ -2046,7 +2047,39 @@ func (s *ServerConfig) Validate() error {
 		return fmt.Errorf("server %q: master_sasl_username is set but master_sasl_password is empty; refusing to start (an empty password would allow impersonation of any account)", s.Name)
 	}
 
+	if s.Type == "metrics" {
+		if s.Path != "" && !strings.HasPrefix(s.Path, "/") {
+			return fmt.Errorf("server %q: metrics path %q must begin with '/'", s.Name, s.Path)
+		}
+		if err := validateMetricsPattern(s.MetricsPath()); err != nil {
+			return fmt.Errorf("server %q: invalid metrics path %q: %w", s.Name, s.Path, err)
+		}
+	}
+
 	return nil
+}
+
+// ServeMux parses patterns when registering a handler and panics on invalid
+// ones. Validate with that same parser before the metrics goroutine starts.
+func validateMetricsPattern(pattern string) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("%v", p)
+		}
+	}()
+	http.NewServeMux().HandleFunc(pattern, func(http.ResponseWriter, *http.Request) {})
+	return nil
+}
+
+// MetricsPath returns the HTTP path the metrics handler is served on. An unset
+// path defaults to "/metrics": net/http.ServeMux panics on an empty pattern,
+// and the panic would run in the metrics goroutine, taking the whole process
+// down with it.
+func (s *ServerConfig) MetricsPath() string {
+	if s.Path == "" {
+		return "/metrics"
+	}
+	return s.Path
 }
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
