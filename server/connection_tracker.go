@@ -388,8 +388,10 @@ func (ct *ConnectionTracker) unregisterLocked(accountID int64, protocol, clientA
 	// Decrement connection count for this instance
 	clientIP := clientIPOf(clientAddr)
 
+	released := false
 	if perIPMap := info.PerIPCountByInstance[ct.instanceID]; perIPMap != nil {
 		if count := perIPMap[clientIP]; count > 0 {
+			released = true
 			if ct.node != nil {
 				ct.node.mu.Lock()
 				ct.node.add(accountID, clientIP, -1)
@@ -427,8 +429,11 @@ func (ct *ConnectionTracker) unregisterLocked(accountID int64, protocol, clientA
 		delete(ct.connections, accountID)
 	}
 
-	// Broadcast to cluster (only in cluster mode and if not snapshot-only mode)
-	if ct.clusterManager == nil || ct.snapshotOnly {
+	// Broadcast to cluster (only in cluster mode and if not snapshot-only mode),
+	// and only an unregister that released a connection this instance counted:
+	// peers count this instance's connections from its events, and one with no
+	// register behind it is held by every peer as a reordered decrement.
+	if ct.clusterManager == nil || ct.snapshotOnly || !released {
 		return nil
 	}
 

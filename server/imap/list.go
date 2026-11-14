@@ -13,11 +13,26 @@ import (
 )
 
 func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
-	// RFC 8438 §1: with LIST-STATUS, SIZE "can be queried for many mailboxes at
-	// once using just one LIST command", so it needs STATUS=SIZE here as well.
-	if options.ReturnStatus != nil && options.ReturnStatus.Size {
-		if err := s.requireCapability(imap.CapStatusSize, "STATUS SIZE"); err != nil {
+	// RFC 5258 §3: each LIST option is "enabled by a capability string", and "a
+	// client MUST NOT send an option for which the server has not advertised
+	// support". go-imap refuses the LIST-EXTENDED syntax itself; the SPECIAL-USE
+	// selection and return options are SPECIAL-USE's (RFC 6154 §2), the STATUS
+	// return option is LIST-STATUS's (RFC 5819 §2).
+	if options.SelectSpecialUse || options.ReturnSpecialUse {
+		if err := s.requireCapability(imap.CapSpecialUse, "LIST SPECIAL-USE"); err != nil {
 			return err
+		}
+	}
+	if options.ReturnStatus != nil {
+		if err := s.requireCapability(imap.CapListStatus, "LIST RETURN (STATUS)"); err != nil {
+			return err
+		}
+		// RFC 8438 §1: with LIST-STATUS, SIZE "can be queried for many mailboxes at
+		// once using just one LIST command", so it needs STATUS=SIZE here as well.
+		if options.ReturnStatus.Size {
+			if err := s.requireCapability(imap.CapStatusSize, "STATUS SIZE"); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -92,12 +107,10 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		return l[i].Mailbox < l[j].Mailbox
 	})
 
-	hasListStatusCap := s.GetCapabilities().Has(imap.CapListStatus)
-
 	// Now handle STATUS returns if needed - after we've processed all mailboxes
 	// Use batch query to fetch all summaries in a single database round-trip
 	// instead of N individual Status() calls (which each do 3 queries).
-	if options.ReturnStatus != nil && hasListStatusCap {
+	if options.ReturnStatus != nil {
 		// Collect mailbox IDs for all listed mailboxes
 		var mailboxIDs []int64
 		for _, data := range l {

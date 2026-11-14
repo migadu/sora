@@ -290,11 +290,7 @@ func (s *IMAPSession) stageCrossAccountBody(command, contentHash string, srcAcco
 	// A fault of this node's spool. The error names its files, which mean nothing to
 	// the client, so the response carries only the cause.
 	s.WarnLog("failed to stage body for cross-account "+command, "hash", contentHash, "error", err)
-	var pathErr *fs.PathError
-	if errors.As(err, &pathErr) {
-		err = pathErr.Err
-	}
-	return false, s.internalError("failed to stage message body for cross-account %s: %v", command, err)
+	return false, s.internalError("failed to stage message body for cross-account %s: %v", command, helpers.FileErrorCause(err))
 }
 
 // crossAccountObjectError answers a failed S3 check or copy of a cross-account body.

@@ -22,6 +22,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/migadu/sora/cluster"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
@@ -477,7 +478,8 @@ func (s *Server) Start() error {
 	// inline listener returned them, and net/http treats non-temporary
 	// Accept errors as fatal — one malformed header killed the listener).
 	// The HTTP variant makes RemoteAddr() report the forwarded client IP,
-	// which is what allowed_hosts and rate limiting read via r.RemoteAddr.
+	// which is what the per-IP connection limit counts and what the
+	// backends are told the client is.
 	listener = server.WrapProxyProtocolHTTP(listener, s.proxyReader, "USER-API-PROXY")
 
 	// Start serving. The certificate is in TLSConfig already: certificate
@@ -556,6 +558,10 @@ func (s *Server) setupHandler() http.Handler {
 				s.writeError(w, r, "Invalid or expired token", http.StatusUnauthorized)
 				return
 			}
+			if errors.Is(err, errLoginRefused) {
+				s.writeLoginRefused(w, r)
+				return
+			}
 			logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "path", r.URL.Path, "error", err)
 			s.writeError(w, r, "Service unavailable", http.StatusServiceUnavailable)
 			return
@@ -574,10 +580,26 @@ func (s *Server) setupHandler() http.Handler {
 // network error instead of the status, and a web client cannot tell an expired token from
 // an outage. A forwarded response carries the backend's CORS headers and must get none here.
 func (s *Server) writeError(w http.ResponseWriter, r *http.Request, msg string, code int) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	s.writeUserAPIError(w, r, msg, code)
+}
+
+// writeLoginRefused answers a login the proxy refuses itself (errLoginRefused) as a
+// backend answers a wrong password (userapi handleLogin): 401 {"error": "Invalid
+// credentials"} with the backend's headers. Unlike writeError it sets no
+// X-Content-Type-Options, which the backend's answer lacks: a header only the proxy sets
+// would show that no backend was asked, and so what the lookup said of the address.
+func (s *Server) writeLoginRefused(w http.ResponseWriter, r *http.Request) {
+	s.writeUserAPIError(w, r, "Invalid credentials", http.StatusUnauthorized)
+}
+
+// writeUserAPIError writes {"error": msg} as application/json with the CORS headers of
+// the proxy's allowed_origins: what a backend's writeError writes behind its CORS
+// middleware.
+func (s *Server) writeUserAPIError(w http.ResponseWriter, r *http.Request, msg string, code int) {
 	h := w.Header()
 	server.SetCORSHeaders(h, r.Header.Get("Origin"), s.settings.Load().allowedOrigins)
 	h.Set("Content-Type", "application/json")
-	h.Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(code)
 	if err := json.NewEncoder(w).Encode(map[string]string{"error": msg}); err != nil {
 		logger.Debug("User API Proxy: Failed to write error response", "name", s.name, "status", code, "error", err)
@@ -639,72 +661,105 @@ var errAuthBodyTooLarge = errors.New("auth request body too large")
 // not be the user's pool.
 var errRefreshTokenRefused = errors.New("refresh token refused")
 
-// routeAuthRequest picks the backend for an unauthenticated auth request.
+// errUserRefused is, with named pools, a user the remote lookup does not know (404/3xx)
+// while lookup_local_users is off, or one whose account it refuses (401/403): a verdict
+// on the user, not an outage. No pool may answer for that user, so routeUser routes the
+// request nowhere.
+var errUserRefused = errors.New("user refused by the remote lookup")
+
+// errLoginRefused is a login for an errUserRefused user, refused by the proxy at the cost
+// of a password verification. It is answered as a backend answers a wrong password
+// (writeLoginRefused).
+var errLoginRefused = errors.New("login refused")
+
+// routeAuthRequest picks the backend for an unauthenticated auth request. A login for a
+// user the lookup does not know or refuses reaches no backend, which would verify the
+// password before answering 401: the proxy verifies it against a dummy hash instead and
+// returns errLoginRefused, so that neither the answer nor its timing shows what the
+// lookup said of the address. A refresh for such a user carries a token the proxy
+// accepted, so its caller learns nothing from the refusal and it stays a temporary one.
 func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, error) {
-	email, tokenAccountID, err := s.peekAuthIdentity(r)
+	id, err := s.peekAuthIdentity(r)
 	if err != nil {
 		return backendRoute{}, err
 	}
-	if email != "" {
-		return s.routeUser(r.Context(), email, tokenAccountID, true)
+	if id.email == "" {
+		return s.routeNameless(r)
 	}
-	return s.routeNameless(r)
+	route, err := s.routeUser(r.Context(), id.email, id.accountID, true)
+	if errors.Is(err, errUserRefused) && id.password != "" {
+		logger.Info("User API Proxy: Login refused", "name", s.name, "user", id.email, "error", err)
+		db.DummyVerifyPassword(id.password)
+		return backendRoute{}, fmt.Errorf("%w: %w", errLoginRefused, err)
+	}
+	return route, err
+}
+
+// authIdentity is the user an auth request is for (see peekAuthIdentity).
+type authIdentity struct {
+	email     string
+	password  string // a login's, never empty; "" for a refresh
+	accountID int64  // a refresh token's; 0 for a login
 }
 
 // peekAuthIdentity reads the user an auth request is for without consuming the request: the
-// email of a login body, or the subject of the (valid) token a refresh body carries. The
-// body is put back for the backend, and read as the backend reads it (the first JSON value)
-// so the two cannot disagree on whose request it is. "" when the request names nobody the
-// proxy can route by (no body, not JSON, no email, no token, another path, or a method
-// other than POST, which the backend answers 405 before reading the body); a backend then
-// answers it from the request alone. A refresh token the proxy refuses is
-// errRefreshTokenRefused. A refresh also carries its token's account ID, for local-fallback
-// ownership checks.
-func (s *Server) peekAuthIdentity(r *http.Request) (string, int64, error) {
+// email and password of a login body, or the subject of the (valid) token a refresh body
+// carries. The body is put back for the backend, and read as the backend reads it (the
+// first JSON value, into the fields the endpoint decodes) so the two cannot disagree on
+// whose request it is. No email when the request names nobody the proxy can route by: no
+// body, a body the backend refuses before looking anyone up (not JSON, a field of the
+// wrong type, no email, a login without a password, a refresh without a token), another
+// path, or a method other than POST, which the backend answers 405 before reading the
+// body. A backend then answers it from the request alone, whatever the lookup knows of
+// the address. A refresh token the proxy refuses is errRefreshTokenRefused. A refresh also
+// carries its token's account ID, for local-fallback ownership checks.
+func (s *Server) peekAuthIdentity(r *http.Request) (authIdentity, error) {
 	if r.Method != http.MethodPost || r.Body == nil || r.Body == http.NoBody {
-		return "", 0, nil
+		return authIdentity{}, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxAuthBodyBytes+1))
 	r.Body.Close()
 	if err != nil {
-		return "", 0, fmt.Errorf("reading auth request body: %w", err)
+		return authIdentity{}, fmt.Errorf("reading auth request body: %w", err)
 	}
 	if len(body) > maxAuthBodyBytes {
-		return "", 0, errAuthBodyTooLarge
+		return authIdentity{}, errAuthBodyTooLarge
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 
 	switch r.URL.Path {
 	case "/user/auth/login":
-		// Decode only fields the login endpoint uses. A refresh-only field must
-		// stay unknown here, just as it is to the backend's login decoder.
+		// Decode only fields the login endpoint uses (userapi.LoginRequest). A
+		// refresh-only field must stay unknown here, just as it is to the backend's
+		// login decoder.
 		var req struct {
-			Email string `json:"email"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
 		}
-		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
-			return "", 0, nil
+		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil || req.Password == "" {
+			return authIdentity{}, nil
 		}
-		return strings.TrimSpace(req.Email), 0, nil
+		return authIdentity{email: strings.TrimSpace(req.Email), password: req.Password}, nil
 	case "/user/auth/refresh":
 		var req struct {
 			Token string `json:"token"`
 		}
 		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil || req.Token == "" {
-			return "", 0, nil
+			return authIdentity{}, nil
 		}
 		claims, err := s.validateToken(req.Token)
 		if err != nil {
-			return "", 0, fmt.Errorf("%w: %w", errRefreshTokenRefused, err)
+			return authIdentity{}, fmt.Errorf("%w: %w", errRefreshTokenRefused, err)
 		}
 		if claims.AccountID <= 0 {
-			return "", 0, fmt.Errorf("%w: refresh token has no valid account ID", errRefreshTokenRefused)
+			return authIdentity{}, fmt.Errorf("%w: refresh token has no valid account ID", errRefreshTokenRefused)
 		}
 		if strings.TrimSpace(claims.Email) == "" {
-			return "", 0, fmt.Errorf("%w: refresh token has no usable email", errRefreshTokenRefused)
+			return authIdentity{}, fmt.Errorf("%w: refresh token has no usable email", errRefreshTokenRefused)
 		}
-		return claims.Email, claims.AccountID, nil
+		return authIdentity{email: claims.Email, accountID: claims.AccountID}, nil
 	}
-	return "", 0, nil
+	return authIdentity{}, nil
 }
 
 // backendRoute is where a request goes and how its backend leg is spoken: with named
@@ -761,7 +816,8 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 // is refused rather than routed into the default pool, because the backends trust the
 // token's account ID and a backend of another pool holds another tenant's account under
 // it. With lookup_local_users, a JWT request the lookup does not know also has to
-// identify an active local account before it can enter the default pool.
+// identify an active local account before it can enter the default pool. A user the
+// lookup does not know (without lookup_local_users) or refuses is errUserRefused.
 //
 // A backend in maintenance is never picked. A pin to one routes the user among that
 // backend's own siblings (refused if its named pool cannot be identified) without
@@ -841,6 +897,10 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 		case routingInfo == nil && result == proxy.AuthUserNotFound:
 			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, IsNegative: true})
 			notFound = true
+		case routingInfo == nil && result == proxy.AuthFailed && named:
+			// 401/403: the lookup refuses the account, a verdict and not an outage. Not
+			// cached, as the lookup client caches no refusal.
+			return backendRoute{}, fmt.Errorf("%w: %w", errUserRefused, proxy.ErrRemoteLookupRefused)
 		case routingInfo == nil:
 			logger.Warn("User API Proxy: RemoteLookup gave no route", "name", s.name, "user", email, "result", result)
 			if named {
@@ -879,7 +939,7 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 	}
 	if notFound && named {
 		if !s.lookupLocalUsers {
-			return backendRoute{}, fmt.Errorf("user is not known to the remote lookup, and lookup_local_users is off")
+			return backendRoute{}, fmt.Errorf("%w: not known to the remote lookup, and lookup_local_users is off", errUserRefused)
 		}
 		// A valid JWT from another pool may carry the ID of an unrelated local
 		// account. A lookup miss is not evidence that its owner is a local user.

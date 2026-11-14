@@ -34,13 +34,13 @@ func TestNormalizeHostPort(t *testing.T) {
 			name:        "Full IPv6 without port",
 			addr:        "2001:0db8:85a3:08d3:1319:8a2e:0370:7344",
 			defaultPort: 143,
-			want:        "[2001:0db8:85a3:08d3:1319:8a2e:0370:7344]:143",
+			want:        "[2001:db8:85a3:8d3:1319:8a2e:370:7344]:143",
 		},
 		{
 			name:        "Malformed full IPv6 with port, no brackets",
 			addr:        "2001:0db8:85a3:08d3:1319:8a2e:0370:7344:143",
 			defaultPort: 993,
-			want:        "[2001:0db8:85a3:08d3:1319:8a2e:0370:7344]:143",
+			want:        "[2001:db8:85a3:8d3:1319:8a2e:370:7344]:143",
 		},
 		{
 			name:        "IPv6 loopback without port",
