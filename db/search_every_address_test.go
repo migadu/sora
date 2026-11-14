@@ -139,7 +139,9 @@ func TestHeaderSearchMatchesEveryAddress(t *testing.T) {
 // TestHeaderSearchOnRowsWithoutExtraAddresses covers rows written before extra_addresses
 // existed (or by a binary that does not write it): NULL there must behave as "no further
 // addresses". The first-address columns keep matching, and a negated key must still return
-// the row, which a bare NULL in the predicate would drop.
+// the row, which a bare NULL in the predicate would drop. The sort columns are nullable as
+// well: to_name_sort was added by migration 000006 without a backfill, so every row written
+// before it holds NULL there, and NOT TO / NOT TEXT must keep those rows too.
 func TestHeaderSearchOnRowsWithoutExtraAddresses(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -151,21 +153,26 @@ func TestHeaderSearchOnRowsWithoutExtraAddresses(t *testing.T) {
 	bs := imap.BodyStructure(&imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Size: 100})
 	bsBytes, err := helpers.SerializeBodyStructureGob(&bs)
 	require.NoError(t, err)
-	// A legacy row: no extra_addresses in the column list, as every row before the migration.
-	_, err = db.GetWritePool().Exec(ctx, `
-		WITH inserted AS (
-			INSERT INTO messages
-			(account_id, mailbox_id, mailbox_path, uid, message_id, in_reply_to, content_hash, s3_domain, s3_localpart,
-			 internal_date, size, subject, sent_date, body_structure, recipients_json, created_modseq,
-			 subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
-			VALUES ($1, $2, 'INBOX', 1, '<legacy@example.com>', '', 'legacyhash', 'd', 'lp', now(), 100, 'legacy', now(), $3,
-			        '[{"type":"to","email":"carol@example.com"},{"type":"to","email":"bob@example.com"},{"type":"from","email":"alice@example.com"}]'::jsonb,
-			        nextval('messages_modseq'), 'legacy', '', 'alice@example.com', '', 'carol@example.com', '')
-			RETURNING id, mailbox_id
-		)
-		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags)
-		SELECT id, mailbox_id, 0, '[]'::jsonb FROM inserted`, accountID, mailboxID, bsBytes)
-	require.NoError(t, err)
+	// Legacy rows: no extra_addresses in the column list, as every row before migration
+	// 000059. UID 1 was written after migration 000006 (to_name_sort ''), UID 2 before it
+	// (to_name_sort NULL).
+	for uid, toNameSort := range map[int64]*string{1: new(string), 2: nil} {
+		_, err = db.GetWritePool().Exec(ctx, `
+			WITH inserted AS (
+				INSERT INTO messages
+				(account_id, mailbox_id, mailbox_path, uid, message_id, in_reply_to, content_hash, s3_domain, s3_localpart,
+				 internal_date, size, subject, sent_date, body_structure, recipients_json, created_modseq,
+				 subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
+				VALUES ($1, $2, 'INBOX', $4, $5, '', $6, 'd', 'lp', now(), 100, 'legacy', now(), $3,
+				        '[{"type":"to","email":"carol@example.com"},{"type":"to","email":"bob@example.com"},{"type":"from","email":"alice@example.com"}]'::jsonb,
+				        nextval('messages_modseq'), 'legacy', '', 'alice@example.com', $7, 'carol@example.com', '')
+				RETURNING id, mailbox_id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags)
+			SELECT id, mailbox_id, 0, '[]'::jsonb FROM inserted`, accountID, mailboxID, bsBytes, uid,
+			fmt.Sprintf("<legacy%d@example.com>", uid), fmt.Sprintf("legacyhash%d", uid), toNameSort)
+		require.NoError(t, err)
+	}
 
 	search := func(c *imap.SearchCriteria) []imap.UID {
 		res, err := db.SearchMessagesWithCriteria(ctx, mailboxID, accountID, c, 0, 10)
@@ -180,9 +187,10 @@ func TestHeaderSearchOnRowsWithoutExtraAddresses(t *testing.T) {
 		return imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: key, Value: value}}}
 	}
 
-	assert.Equal(t, []imap.UID{1}, search(&imap.SearchCriteria{Header: header("To", "carol").Header}))
+	both := []imap.UID{1, 2}
+	assert.ElementsMatch(t, both, search(&imap.SearchCriteria{Header: header("To", "carol").Header}))
 	for _, key := range []string{"From", "To", "Cc"} {
-		assert.Equal(t, []imap.UID{1}, search(&imap.SearchCriteria{Not: []imap.SearchCriteria{header(key, "nobody")}}), "NOT %s on a row without extra_addresses", key)
+		assert.ElementsMatch(t, both, search(&imap.SearchCriteria{Not: []imap.SearchCriteria{header(key, "nobody")}}), "NOT %s on rows without extra_addresses", key)
 	}
-	assert.Equal(t, []imap.UID{1}, search(&imap.SearchCriteria{Not: []imap.SearchCriteria{{Text: []string{"nobody"}}}}), "NOT TEXT on a row without extra_addresses")
+	assert.ElementsMatch(t, both, search(&imap.SearchCriteria{Not: []imap.SearchCriteria{{Text: []string{"nobody"}}}}), "NOT TEXT on rows without extra_addresses")
 }
