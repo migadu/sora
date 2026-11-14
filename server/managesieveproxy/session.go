@@ -17,6 +17,7 @@ import (
 	"github.com/migadu/go-managesieve/managesieve"
 	"github.com/migadu/go-managesieve/managesieveserver"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
@@ -395,6 +396,9 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 						// Different password but too fresh
 						s.DebugLog("cache hit - positive entry with different password (too fresh)", "username", username, "age", time.Since(cached.CreatedAt))
 						metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive_fresh").Inc()
+						// Cost what a failed login for an unknown address costs, or the instant
+						// answer shows that this address has an account. (#346)
+						db.DummyVerifyPassword(password)
 						s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 						metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 						return consts.ErrAuthenticationFailed
@@ -449,7 +453,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for remotelookup authentication
 	if s.server.connManager.HasRouting() {
-		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForRemoteLookup, password, masterAuthValidated)
+		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithClientIP(ctx, usernameForRemoteLookup, password, realClientIP, masterAuthValidated)
 
 		// Log remotelookup response with all details
 		backend := "none"
@@ -736,6 +740,7 @@ func (s *Session) connectToBackendAndAuth() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                   s.ctx,
 		Username:              s.username,
+		ClientIP:              server.GetRealClientIP(s.clientConn, s.proxyInfo),
 		Protocol:              "managesieve",
 		IsRemoteLookupAccount: s.isRemoteLookupAccount,
 		RoutingInfo:           s.routingInfo,
@@ -766,7 +771,8 @@ func (s *Session) connectToBackendAndAuth() error {
 	connectCtx, connectCancel := context.WithTimeout(s.ctx, s.server.connManager.ConnectBudget())
 	defer connectCancel()
 
-	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
+	// The backend's PROXY header names the real client (the incoming PROXY header's source).
+	clientHost, clientPort := server.GetRealClientAddr(s.clientConn, s.proxyInfo)
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	conn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,

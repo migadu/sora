@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
@@ -279,6 +280,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 						// Entry is fresh - likely wrong password attempt
 						s.DebugLog("cache hit - wrong password on fresh positive entry", "username", username)
 						metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive_wrong_pw").Inc()
+						// Cost what a failed login for an unknown address costs, or the instant
+						// answer shows that this address has an account. (#346)
+						db.DummyVerifyPassword(password)
 						s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, false)
 						metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "failure").Inc()
 						return consts.ErrAuthenticationFailed
@@ -332,7 +336,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for remotelookup authentication
 	if s.server.connManager.HasRouting() {
-		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithOptions(ctx, usernameForRemoteLookup, password, masterAuthValidated)
+		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithClientIP(ctx, usernameForRemoteLookup, password, realClientIP, masterAuthValidated)
 
 		// Log remotelookup response with all details
 		backend := "none"
@@ -623,6 +627,7 @@ func (s *POP3ProxySession) connectToBackend() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                   s.ctx,
 		Username:              s.username,
+		ClientIP:              server.GetRealClientIP(s.clientConn, s.proxyInfo),
 		Protocol:              "pop3",
 		IsRemoteLookupAccount: s.isRemoteLookupAccount,
 		RoutingInfo:           s.routingInfo,
@@ -647,7 +652,8 @@ func (s *POP3ProxySession) connectToBackend() error {
 	// Track which routing method was used for this connection.
 	metrics.ProxyRoutingMethod.WithLabelValues("pop3", routeResult.RoutingMethod).Inc()
 
-	clientHost, clientPort := server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
+	// The backend's PROXY header names the real client (the incoming PROXY header's source).
+	clientHost, clientPort := server.GetRealClientAddr(s.clientConn, s.proxyInfo)
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		s.ctx,

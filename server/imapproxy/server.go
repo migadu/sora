@@ -379,7 +379,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		positiveRevalidationWindow = 30 * time.Second
 	}
 
-	if lookupCacheConfig.Enabled {
+	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
 		positiveTTL, err := lookupCacheConfig.GetPositiveTTL()
 		if err != nil {
 			logger.Info("IMAP Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", opts.Name, "error", err)

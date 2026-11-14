@@ -12,9 +12,9 @@ import (
 // sendForwardingParametersToBackend sends an ID command to the backend server
 // with forwarding parameters containing the real client information
 func (s *Session) sendForwardingParametersToBackend() error {
-	// Create forwarding parameters using the helper function.
-	// The session does not have proxyInfo, so we pass nil.
-	forwardingParams := server.NewForwardingParams(s.clientConn, nil)
+	// Create forwarding parameters using the helper function. With a PROXY header the
+	// client is its source address, not the socket peer (the load balancer).
+	forwardingParams := server.NewForwardingParams(s.clientConn, s.proxyInfo)
 
 	// Add proxy-specific information. The session id is generated once at session
 	// construction and reused here so the proxy's logs (session=<id>) and the

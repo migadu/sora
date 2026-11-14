@@ -367,7 +367,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		lookupCacheConfig = &defaultConfig
 	}
 
-	if lookupCacheConfig.Enabled {
+	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(options.RemoteLookup) {
 		positiveTTL, err := lookupCacheConfig.GetPositiveTTL()
 		if err != nil {
 			logger.Info("POP3 Proxy: Invalid positive TTL in auth cache config, using default (5m)", "name", options.Name, "error", err)

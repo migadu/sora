@@ -54,6 +54,52 @@ func (s *LMTPSession) sendToExternalRelay(from string, to string, message []byte
 	return nil
 }
 
+// relayRedirects queues each redirect and charges only successful handoffs.
+func (s *LMTPSession) relayRedirects(ctx context.Context, result sieveengine.Result, messageContent *message.Entity, fullMessageBytes []byte) bool {
+	// Every redirect is relayed, whatever else the script did with the message.
+	redirectFailed := false
+	if len(result.RedirectTo) > 0 {
+		if result.Copy {
+			s.DebugLog("sieve redirect :copy action", "redirect_to", result.RedirectTo)
+		} else {
+			s.DebugLog("sieve redirect action", "redirect_to", result.RedirectTo)
+		}
+
+		// Queue the message for external relay delivery if configured
+		if s.backend.relayQueue != nil {
+			s.DebugLog("queueing message for relay delivery")
+			// Stamp the outgoing copy with an incremented hop count (loop backstop).
+			hops := helpers.RedirectHopCount(helpers.HeaderGetter(messageContent.Header.Map()))
+			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(hops+1))
+			// User.Address is the script owner's primary address, even for aliases.
+			// Replace earlier or sender-supplied attribution on the outgoing copy only.
+			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
+			for _, redirectTo := range result.RedirectTo {
+				if err := s.sendToExternalRelay(s.sender.FullAddress(), redirectTo, relayBytes); err != nil {
+					// Delivery goes on: the message is kept in INBOX unless a fileinto
+					// stores it (Result.Destinations). Say so where an operator will see
+					// it, as the Admin API path does: the user's redirect did not happen.
+					s.WarnLog("sieve redirect could not be queued", "redirect_to", redirectTo, "error", err)
+					redirectFailed = true
+					continue
+				}
+				s.DebugLog("successfully queued message for relay delivery", "redirect_to", redirectTo)
+				// Only a queued redirect counts against the rate limit.
+				if result.RecordRedirect != nil {
+					if err := result.RecordRedirect(ctx); err != nil {
+						s.WarnLog("failed to charge redirect against the rate limit", "redirect_to", redirectTo, "error", err)
+					}
+				}
+			}
+		} else {
+			s.DebugLog("redirect requested but external relay not configured")
+			redirectFailed = true
+		}
+	}
+
+	return !redirectFailed
+}
+
 // LMTPSession represents a single LMTP session.
 type LMTPSession struct {
 	server.Session
@@ -923,50 +969,21 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	bodyStructure := &bodyStructureVal
 	sieveFlags = db.WithAttachmentKeyword(sieveFlags, fullMessageBytes, true)
 
-	// Every redirect is relayed, whatever else the script did with the message.
-	redirectFailed := false
-	if len(result.RedirectTo) > 0 {
-		if result.Copy {
-			s.DebugLog("sieve redirect :copy action", "redirect_to", result.RedirectTo)
-		} else {
-			s.DebugLog("sieve redirect action", "redirect_to", result.RedirectTo)
+	// Store every requested copy before any redirect is handed to the relay. A
+	// temporary storage failure makes the sender retry the whole delivery.
+	destinations := result.Destinations(false)
+	relayAfterStore := len(destinations) > 0 && len(result.RedirectTo) > 0
+	if len(destinations) == 0 && len(result.RedirectTo) > 0 {
+		if s.relayRedirects(ctx, result, messageContent, fullMessageBytes) {
+			recordMetrics("success")
+			return nil
 		}
-
-		// Queue the message for external relay delivery if configured
-		if s.backend.relayQueue != nil {
-			s.DebugLog("queueing message for relay delivery")
-			// Stamp the outgoing copy with an incremented hop count (loop backstop).
-			hops := helpers.RedirectHopCount(helpers.HeaderGetter(messageContent.Header.Map()))
-			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(hops+1))
-			// User.Address is the script owner's primary address, even for aliases.
-			// Replace earlier or sender-supplied attribution on the outgoing copy only.
-			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
-			for _, redirectTo := range result.RedirectTo {
-				if err := s.sendToExternalRelay(s.sender.FullAddress(), redirectTo, relayBytes); err != nil {
-					// Delivery goes on: the message is kept in INBOX unless a fileinto
-					// stores it (Result.Destinations). Say so where an operator will see
-					// it, as the Admin API path does: the user's redirect did not happen.
-					s.WarnLog("sieve redirect could not be queued", "redirect_to", redirectTo, "error", err)
-					redirectFailed = true
-					continue
-				}
-				s.DebugLog("successfully queued message for relay delivery", "redirect_to", redirectTo)
-				// Only a queued redirect counts against the rate limit.
-				if result.RecordRedirect != nil {
-					if err := result.RecordRedirect(ctx); err != nil {
-						s.WarnLog("failed to charge redirect against the rate limit", "redirect_to", redirectTo, "error", err)
-					}
-				}
-			}
-		} else {
-			s.DebugLog("redirect requested but external relay not configured")
-			redirectFailed = true
-		}
+		// Redirect-only delivery needs an INBOX fallback when handoff fails.
+		destinations = result.Destinations(true)
 	}
 
 	// Store one copy in every fileinto target, and in INBOX when the message is kept
 	// (or a failed redirect left it stored nowhere).
-	destinations := result.Destinations(redirectFailed)
 	if len(destinations) == 0 {
 		s.DebugLog("redirect without :copy - skipping local delivery")
 		recordMetrics("success")
@@ -1044,6 +1061,10 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "failure").Inc()
 		recordMetrics("failure")
 		return s.InternalError("failed to save message to %s: %v", dest.Mailbox, err)
+	}
+
+	if relayAfterStore {
+		s.relayRedirects(ctx, result, messageContent, fullMessageBytes)
 	}
 
 	// A duplicate is a delivered message too: the copy is already in the mailbox.
