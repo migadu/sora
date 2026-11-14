@@ -626,18 +626,15 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// Fallback to main DB
 	// If master auth was already validated, just get account ID and continue
 	// Otherwise, authenticate via main DB
-	var address server.Address
-	// Use already parsed address if available
-	if parseErr == nil {
-		address = parsedAddr
-	} else {
-		// Parse failed earlier - try again with NewAddress (shouldn't happen but handle it)
-		var parseErr2 error
-		address, parseErr2 = server.NewAddress(username)
-		if parseErr2 != nil {
-			return fmt.Errorf("invalid address format: %w", parseErr2)
-		}
+	//
+	// A username that does not parse names no account: a failed login like any
+	// other, recorded and counted. Every login without a remote lookup gets here.
+	if parseErr != nil {
+		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
+		metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
+		return fmt.Errorf("invalid address format: %w", parseErr)
 	}
+	address := parsedAddr
 
 	var accountID int64
 	var err error
