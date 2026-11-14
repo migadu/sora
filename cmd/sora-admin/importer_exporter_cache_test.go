@@ -81,8 +81,6 @@ func testInitialImport(t *testing.T, maildirPath, email string, rdb *resilient.R
 	options := ImporterOptions{
 		DryRun:        false,
 		PreserveFlags: true,
-		ShowProgress:  false,
-		ForceReimport: false,
 		CleanupDB:     false, // Keep DB for inspection
 		TestMode:      true,  // Skip actual S3 uploads
 		Incremental:   false, // Non-incremental for initial import (reads all files)
@@ -120,8 +118,6 @@ func testReimportSkipsAll(t *testing.T, maildirPath, email string, rdb *resilien
 	options := ImporterOptions{
 		DryRun:        false,
 		PreserveFlags: true,
-		ShowProgress:  false,
-		ForceReimport: false,
 		CleanupDB:     false,
 		TestMode:      true,
 		Incremental:   incremental, // Use incremental mode to skip already-uploaded messages
@@ -168,8 +164,6 @@ func testIncrementalImport(t *testing.T, maildirPath, email string, rdb *resilie
 	options := ImporterOptions{
 		DryRun:        false,
 		PreserveFlags: true,
-		ShowProgress:  false,
-		ForceReimport: false,
 		CleanupDB:     false,
 		TestMode:      true,
 		Incremental:   incremental, // Use incremental mode to import only new messages
@@ -350,8 +344,6 @@ func testReimportNonIncremental(t *testing.T, maildirPath, email string, rdb *re
 	options := ImporterOptions{
 		DryRun:        false,
 		PreserveFlags: true,
-		ShowProgress:  false,
-		ForceReimport: false,
 		CleanupDB:     false,
 		TestMode:      true,
 		Incremental:   false, // Non-incremental mode: reads all files

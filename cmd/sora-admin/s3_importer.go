@@ -33,9 +33,8 @@ import (
 type S3ImporterOptions struct {
 	Email             string // Email address to import messages for
 	DryRun            bool
-	BatchSize         int // Number of S3 objects to process in each batch
-	MaxObjects        int // Maximum number of objects to process (0 = unlimited)
-	ShowProgress      bool
+	BatchSize         int           // Number of S3 objects to process in each batch
+	MaxObjects        int           // Maximum number of objects to process (0 = unlimited)
 	ForceReimport     bool          // Force reimport even if message already exists
 	CleanupDB         bool          // Cleanup temporary database when done
 	ImportDelay       time.Duration // Delay between imports to control rate
@@ -617,7 +616,8 @@ func (si *S3Importer) getProgressPrefix() string {
 		processed, total, percentage, imported, skipped, failed)
 }
 
-// printSummary prints a summary of the import process
+// printSummary prints a summary of the import process. Its result is the result of
+// Run: an error when any object failed, so the command exits non-zero.
 func (si *S3Importer) printSummary() error {
 	duration := time.Since(si.startTime)
 	fmt.Printf("\n\nS3 Import Summary:\n")
@@ -634,6 +634,9 @@ func (si *S3Importer) printSummary() error {
 	if si.lastContinuationToken != "" {
 		fmt.Printf("  Last processed key:   %s\n", si.lastContinuationToken)
 		fmt.Printf("  Resumption token:     %s\n", si.lastContinuationToken)
+	}
+	if si.failedMessages > 0 {
+		return fmt.Errorf("import completed with %d failed objects", si.failedMessages)
 	}
 	return nil
 }
