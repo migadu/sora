@@ -1564,9 +1564,12 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # for a lookup that fails or answers nothing usable: with pools, no answer is never a
 # guess at the default pool.
 #
-# A User API proxy sends a CORS preflight, which names no user and reaches no account,
-# to the default pool, else to the first pool in this file's order with a backend
-# available. Give the http_user_api backends of every pool the same allowed_origins.
+# A User API proxy sends a CORS preflight, and a login or refresh that names no user
+# (no email, no token, a malformed body), which reach no account, to the default pool,
+# else to the first pool in this file's order with a backend available. Give the
+# http_user_api backends of every pool the same allowed_origins. A refresh whose token
+# the proxy refuses (expired, or not signed with its jwt_secret) is answered 401 by the
+# proxy and sent to no pool.
 #
 # A backend in maintenance (see BACKEND MAINTENANCE) is skipped inside its pool. A user
 # the API pins with "server" to a backend in maintenance is routed among the other

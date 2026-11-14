@@ -535,20 +535,25 @@ func (s *Server) setupHandler() http.Handler {
 
 		// Auth endpoints and CORS preflights carry no JWT. A login names its user in the
 		// body and a refresh carries the user's token, so both are routed like any other
-		// request for that user: the account lives on a backend of the user's pool. An
-		// auth request that names nobody goes to the default pool by path hash, as before
-		// pools; without a default pool it is refused. The backend handles rate limiting.
-		// A preflight names nobody and reaches no account: see routePreflight.
+		// request for that user: the account lives on a backend of the user's pool. A
+		// refresh whose token the proxy refuses is answered here, as on every other
+		// endpoint. A preflight, and an auth request that names nobody otherwise, reaches
+		// no account: see routeNameless. The backend handles rate limiting.
 		var route backendRoute
 		var err error
 		if isCORSPreflight(r) {
-			route, err = s.routePreflight(r)
+			route, err = s.routeNameless(r)
 		} else {
 			route, err = s.routeAuthRequest(r)
 		}
 		if err != nil {
 			if errors.Is(err, errAuthBodyTooLarge) {
 				s.writeError(w, r, "Request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			if errors.Is(err, errRefreshTokenRefused) {
+				logger.Warn("User API Proxy: Authentication failed", "name", s.name, "path", r.URL.Path, "error", err)
+				s.writeError(w, r, "Invalid or expired token", http.StatusUnauthorized)
 				return
 			}
 			logger.Warn("User API Proxy: Failed to get backend", "name", s.name, "path", r.URL.Path, "error", err)
@@ -588,15 +593,17 @@ func isCORSPreflight(r *http.Request) bool {
 	return r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != ""
 }
 
-// routePreflight picks the backend that answers a CORS preflight. A preflight names no
-// user, and a backend answers it in its CORS middleware (with its allowed_origins) before
-// any handler, so it reaches no account. Unlike a request that names a user it is
-// therefore not confined to one pool: it goes to the default pool (the one pool of a flat
-// remote_addrs list), and failing that (no default pool, or no backend of it available)
-// to the first pool in configuration order with a backend available (neither in
-// maintenance nor marked unhealthy). Which pool answers decides whose allowed_origins
-// applies, so every pool's backends should share them.
-func (s *Server) routePreflight(r *http.Request) (backendRoute, error) {
+// routeNameless picks the backend that answers a request naming no user: a CORS
+// preflight, or an auth request whose body names nobody (see peekAuthIdentity). A backend
+// answers a preflight in its CORS middleware (with its allowed_origins) before any
+// handler, and such an auth request from the request alone (400 for a login without an
+// email or a refresh without a token, 404, 405), so it reaches no account. Unlike a
+// request that names a user it is therefore not confined to one pool: it goes to the
+// default pool (the one pool of a flat remote_addrs list), and failing that (no default
+// pool, or no backend of it available) to the first pool in configuration order with a
+// backend available (neither in maintenance nor marked unhealthy). Which pool answers
+// decides whose allowed_origins applies, so every pool's backends should share them.
+func (s *Server) routeNameless(r *http.Request) (backendRoute, error) {
 	tried := ""
 	if pool, err := s.connManager.ResolvePool(""); err == nil {
 		if addr := s.connManager.GetBackendByConsistentHashInPool(pool.Name, r.URL.Path); addr != "" {
@@ -616,7 +623,7 @@ func (s *Server) routePreflight(r *http.Request) (backendRoute, error) {
 			return s.poolRoute(addr, pool), nil
 		}
 	}
-	return backendRoute{}, fmt.Errorf("no backend available for a CORS preflight")
+	return backendRoute{}, fmt.Errorf("no backend available for a request naming no user")
 }
 
 // maxAuthBodyBytes bounds how much of an auth request body the proxy reads to find the
@@ -624,6 +631,13 @@ func (s *Server) routePreflight(r *http.Request) (backendRoute, error) {
 const maxAuthBodyBytes = 64 << 10
 
 var errAuthBodyTooLarge = errors.New("auth request body too large")
+
+// errRefreshTokenRefused is a refresh whose token the proxy refuses (expired, or not
+// signed with its jwt_secret). It is answered 401, as a backend answers it, and never
+// forwarded: a backend whose clock is behind the proxy's could accept the token, and its
+// refresh then reads the token's user from its own pool's database, which need not be the
+// user's (the backends trust the token's account ID).
+var errRefreshTokenRefused = errors.New("refresh token refused")
 
 // routeAuthRequest picks the backend for an unauthenticated auth request.
 func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, error) {
@@ -634,26 +648,20 @@ func (s *Server) routeAuthRequest(r *http.Request) (backendRoute, error) {
 	if email != "" {
 		return s.routeUser(r.Context(), email, tokenAccountID, true)
 	}
-	// Names nobody: the backend answers the malformed request itself, wherever it lands.
-	pool, err := s.connManager.ResolvePool("")
-	if err != nil {
-		return backendRoute{}, err
-	}
-	addr := s.connManager.GetBackendByConsistentHashInPool(pool.Name, r.URL.Path)
-	if addr == "" {
-		return backendRoute{}, fmt.Errorf("no backend available")
-	}
-	return s.poolRoute(addr, pool), nil
+	return s.routeNameless(r)
 }
 
 // peekAuthIdentity reads the user an auth request is for without consuming the request: the
 // email of a login body, or the subject of the (valid) token a refresh body carries. The
 // body is put back for the backend, and read as the backend reads it (the first JSON value)
-// so the two cannot disagree on whose request it is. "" when the body names nobody the
-// proxy can route by; the backend then answers the malformed request itself.
-// A refresh also carries its token's account ID, for local-fallback ownership checks.
+// so the two cannot disagree on whose request it is. "" when the request names nobody the
+// proxy can route by (no body, not JSON, no email, no token, another path, or a method
+// other than POST, which the backend answers 405 before reading the body); a backend then
+// answers it from the request alone. A refresh token the proxy refuses is
+// errRefreshTokenRefused. A refresh also carries its token's account ID, for local-fallback
+// ownership checks.
 func (s *Server) peekAuthIdentity(r *http.Request) (string, int64, error) {
-	if r.Body == nil || r.Body == http.NoBody {
+	if r.Method != http.MethodPost || r.Body == nil || r.Body == http.NoBody {
 		return "", 0, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxAuthBodyBytes+1))
@@ -681,15 +689,17 @@ func (s *Server) peekAuthIdentity(r *http.Request) (string, int64, error) {
 		var req struct {
 			Token string `json:"token"`
 		}
-		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil {
+		if json.NewDecoder(bytes.NewReader(body)).Decode(&req) != nil || req.Token == "" {
 			return "", 0, nil
 		}
-		if claims, err := s.validateToken(req.Token); err == nil {
-			if claims.AccountID <= 0 {
-				return "", 0, fmt.Errorf("refresh token has no valid account ID")
-			}
-			return claims.Email, claims.AccountID, nil
+		claims, err := s.validateToken(req.Token)
+		if err != nil {
+			return "", 0, fmt.Errorf("%w: %w", errRefreshTokenRefused, err)
 		}
+		if claims.AccountID <= 0 {
+			return "", 0, fmt.Errorf("refresh token has no valid account ID")
+		}
+		return claims.Email, claims.AccountID, nil
 	}
 	return "", 0, nil
 }
