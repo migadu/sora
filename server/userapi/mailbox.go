@@ -71,14 +71,15 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// UIDNEXT (mailboxes.highest_uid + 1) of every listed mailbox in one query.
+	// UIDNEXT and counts for every listed mailbox in one query, as IMAP STATUS
+	// reports them. Reuse these counts rather than scanning each mailbox twice.
 	ids := make([]int64, len(listed))
 	for i, mb := range listed {
 		ids[i] = mb.ID
 	}
 	summaries, err := s.rdb.GetMailboxSummariesBatchWithRetry(ctx, ids)
 	if err != nil {
-		// Continue with uid_next 0, as the counts do on error.
+		// Continue with zero counts and uid_next on error.
 		logger.Warn("HTTP Mail API: Error getting mailbox summaries", "name", s.name, "error", err)
 	}
 
@@ -106,21 +107,10 @@ func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Get message counts
-		info.Total, err = s.rdb.GetMessageCountForMailboxWithRetry(ctx, accountID, mb.Name)
-		if err != nil {
-			logger.Warn("HTTP Mail API: Error getting message count", "name", s.name, "mailbox", mb.Name, "error", err)
-			info.Total = 0 // Continue with zero count on error
-		}
-
-		info.Unseen, err = s.rdb.GetUnseenCountForMailboxWithRetry(ctx, accountID, mb.Name)
-		if err != nil {
-			logger.Warn("HTTP Mail API: Error getting unseen count", "name", s.name, "mailbox", mb.Name, "error", err)
-			info.Unseen = 0 // Continue with zero count on error
-		}
-
 		info.UIDValidity = mb.UIDValidity
 		if summary, ok := summaries[mb.ID]; ok {
+			info.Total = summary.NumMessages
+			info.Unseen = summary.UnseenCount
 			info.UIDNext = summary.UIDNext
 		}
 		mailboxInfos = append(mailboxInfos, info)

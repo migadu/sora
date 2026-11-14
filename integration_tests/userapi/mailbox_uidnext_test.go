@@ -102,6 +102,9 @@ func TestUserAPI_MailboxListReportsUIDNext(t *testing.T) {
 	if inbox.Total != 1 {
 		t.Errorf("INBOX total = %d, want 1", inbox.Total)
 	}
+	if inbox.Unseen != 1 {
+		t.Errorf("INBOX unseen = %d, want 1 after expunging the other unseen message", inbox.Unseen)
+	}
 	if mb, ok := got[emptyName]; !ok {
 		t.Errorf("%s missing from listing", emptyName)
 	} else {
