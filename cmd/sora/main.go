@@ -462,8 +462,13 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 
 	// Get all configured servers
 	allServers := cfg.GetAllServers()
+	for _, server := range cfg.DynamicServers {
+		if !server.IsEnabled() {
+			logger.Info("Server block has enabled = false - not starting it", "server", server.Name, "type", server.Type)
+		}
+	}
 
-	// Validate all server configurations
+	// Validate all server configurations, including a block that lacks type, name or addr
 	for _, server := range allServers {
 		if err := server.Validate(); err != nil {
 			errorHandler.ValidationError(fmt.Sprintf("server '%s'", server.Name), err)
@@ -480,6 +485,11 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 
 	if err := cfg.Relay.Validate(); err != nil {
 		errorHandler.ValidationError("[relay]", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
+	if err := cfg.SharedMailboxes.Validate(); err != nil {
+		errorHandler.ValidationError("[shared_mailboxes]", err)
 		os.Exit(errorHandler.WaitForExit())
 	}
 
@@ -1909,6 +1919,8 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseIDCommand:       serverConfig.RemoteUseIDCommand,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2042,6 +2054,8 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:         serverConfig.RemoteUseXCLIENT,
 		RemoteUseUTF8:            serverConfig.RemoteUseUTF8,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2169,6 +2183,8 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		RemoteTLSUseStartTLS:     serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2296,6 +2312,8 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:         serverConfig.RemoteUseXCLIENT,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2475,6 +2493,10 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		MaxRedirectHops:    serverConfig.GetMaxRedirectHops(),
 		SieveExtensions:    deps.config.Sieve.EnabledExtensions,
 		SharedMailboxes:    deps.config.SharedMailboxes,
+		// Incoming PROXY headers, accepted only from trusted_networks.
+		ProxyProtocol:        serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout: serverConfig.GetProxyProtocolTimeoutWithDefault(),
+		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
 	}
 	// Set only when the feature is on: a nil pointer stored in an interface field is a
 	// non-nil interface, and the handlers tell "not enabled on this node" by comparing

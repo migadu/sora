@@ -1,6 +1,11 @@
 package helpers
 
-import "testing"
+import (
+	"errors"
+	"testing"
+
+	"github.com/migadu/sora/consts"
+)
 
 func TestMailboxNameHasTraversal(t *testing.T) {
 	tests := []struct {
@@ -30,6 +35,40 @@ func TestMailboxNameHasTraversal(t *testing.T) {
 	for _, tt := range tests {
 		if got := MailboxNameHasTraversal(tt.name); got != tt.want {
 			t.Errorf("MailboxNameHasTraversal(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestMailboxNameToCreate(t *testing.T) {
+	tests := []struct {
+		name  string
+		want  string
+		valid bool
+	}{
+		{"INBOX", "INBOX", true},
+		{"Archive/2024", "Archive/2024", true},
+		{"Foo.Bar/..baz", "Foo.Bar/..baz", true}, // dots inside a level are fine
+		{"Foo/", "Foo", true},                    // RFC 3501 §6.3.3: no trailing delimiter
+		{"Foo/Bar//", "Foo/Bar", true},
+		{"", "", false},
+		{"/", "", false},
+		{"//", "", false},
+		{"/Foo", "", false},   // empty first level
+		{"x//y", "", false},   // empty middle level
+		{"x//y/", "", false},  // still empty after the trailing delimiter goes
+		{"a/../b", "", false}, // traversal levels
+		{"a/./b", "", false},
+		{"..", "", false},
+		{"Foo/.", "", false},
+	}
+	for _, tt := range tests {
+		got, err := MailboxNameToCreate(tt.name)
+		if tt.valid {
+			if err != nil || got != tt.want {
+				t.Errorf("MailboxNameToCreate(%q) = %q, %v; want %q, nil", tt.name, got, err, tt.want)
+			}
+		} else if !errors.Is(err, consts.ErrMailboxInvalidName) {
+			t.Errorf("MailboxNameToCreate(%q) = %q, %v; want ErrMailboxInvalidName", tt.name, got, err)
 		}
 	}
 }

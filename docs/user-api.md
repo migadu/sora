@@ -212,23 +212,31 @@ List all mailboxes with message counts and metadata.
       "name": "INBOX",
       "path": "INBOX",
       "subscribed": true,
-      "total_messages": 142,
-      "unseen_messages": 5,
-      "uidvalidity": 1234567890,
-      "uidnext": 143
+      "total": 142,
+      "unseen": 5,
+      "uid_next": 143,
+      "uid_validity": 1234567890
     },
     {
       "name": "Sent",
       "path": "Sent",
       "subscribed": true,
-      "total_messages": 87,
-      "unseen_messages": 0,
-      "uidvalidity": 1234567891,
-      "uidnext": 88
+      "total": 87,
+      "unseen": 0,
+      "uid_next": 88,
+      "uid_validity": 1234567891
     }
-  ]
+  ],
+  "count": 2
 }
 ```
+
+`total`, `unseen`, `uid_next` and `uid_validity` are what IMAP STATUS reports as
+MESSAGES, UNSEEN, UIDNEXT and UIDVALIDITY. `uid_next` is the UID the next message
+added to the mailbox will get; it changes whenever a message is added, even one
+expunged afterwards, so a client can poll it to notice new mail while `uid_validity`
+stays the same. All four are 0 for a shared mailbox you may list but not read (ACL
+right `l` without `r`).
 
 **Example:**
 ```bash

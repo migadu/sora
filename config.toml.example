@@ -8,7 +8,8 @@
 # IMPORTANT:
 # - Copy this file to config.toml and modify the values for your deployment
 # - All sections and options are documented with their default values
-# - Duration values accept Go duration format: "1h", "30m", "5s", "100ms"
+# - Duration values accept Go duration format, "1h", "30m", "5s", "100ms",
+#   or whole days, "7d"; they are strings, a bare number is not a duration
 # - Size values accept b, kb, mb, gb and tb suffixes in any case (powers of
 #   1024): "1gb", "100MB", "5kb"; a bare number is bytes
 #
@@ -801,7 +802,7 @@ max_total_size = 1048576       # Maximum total metadata size per account (1MB). 
 
 [shared_mailboxes]
 enabled = false                  # Enable shared mailbox functionality (default: false)
-namespace_prefix = "Shared/"     # IMAP namespace prefix for shared mailboxes (e.g., "Shared/" or "#shared/")
+namespace_prefix = "Shared/"     # IMAP namespace prefix (e.g., "Shared/" or "#shared/"); must end with "/" and cannot be "INBOX/"
 allow_user_create = false        # Allow users to create shared mailboxes over IMAP (false = admin-only: sora-admin mailbox create)
 allow_anyone_identifier = false  # Allow granting rights to "anyone" (every user in the owner's domain); existing grants stay until revoked
 default_rights = "lrswipkxtea"   # Default ACL rights for shared mailbox creators (full rights by default)
@@ -1004,6 +1005,8 @@ trusted_networks = []
 # - user_api_proxy: User API proxy server for load balancing
 #
 # IMPORTANT: You must configure at least one server for Sora to start.
+# Every [[server]] block needs type, name and addr; a block missing one stops
+# startup. To keep a block in the file without starting it, add enabled = false.
 
 # IMAP SERVER EXAMPLE
 # =============================================================================
@@ -1027,9 +1030,12 @@ listen_backlog = 4096               # TCP listen backlog size (0 = default 1024)
 
 # --- IMAP-SPECIFIC CONFIGURATION ---
 append_limit = "25mb"         # Maximum message size for IMAP APPEND, advertised as APPENDLIMIT.
-                              # Empty or "0" = the 25mb default. IMAP carries the limit as a 32-bit
-                              # number, so a value above 4294967295 bytes (4 GiB - 1) is clamped
-                              # to it, with a warning at startup.
+                              # Empty or "0" = the 25mb default. A value above 2147483647 bytes
+                              # (2 GiB - 1, the largest message sora can store) is clamped to it,
+                              # with a warning at startup. APPEND reads the message into the
+                              # session's memory budget, so APPENDLIMIT is never above
+                              # [server.limits] session_memory_limit (default 100mb); a warning
+                              # at startup says when that lowers it.
 
 # --- MASTER USER AUTHENTICATION ---
 master_username = ""          # Master username for administrative IMAP access (e.g., for proxies).
@@ -1704,6 +1710,10 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 #
 # The remote_lookup service is called via HTTP GET with email interpolation.
 # The URL can contain $email placeholder which is replaced with the URL-encoded email address.
+# $ip is replaced with the client's IP address: the source of the PROXY header when the proxy
+# receives one, else the connecting peer. On lmtp_proxy the client is the delivering MTA.
+# A URL containing $ip bypasses the proxy's lookup cache: verdicts and routes may differ
+# between networks, while the cache is keyed by user. Other URLs keep the configured TTLs.
 #
 # Example URLs:
 #   "http://localhost:8080/lookup?email=$email" → GET /lookup?email=user@domain.com
@@ -1903,7 +1913,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # failure_ratio = 0.6             # Failure ratio threshold to open circuit (0.0-1.0, default: 0.6 = 60%)
                                     # Circuit opens when this percentage of recent requests fail
                                     # Production: Consider 0.7-0.8 for less sensitive triggering
-  # min_requests = 3                # Minimum requests before evaluating failure ratio (default: 3)
+  # min_requests = 3                # Minimum completed requests before evaluating failure ratio (default: 3)
                                     # Prevents opening circuit on very few requests
                                     # IMPORTANT: Should be ≤ max_requests to avoid getting stuck
                                     # Production: Consider 5-10 for more stable thresholds

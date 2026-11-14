@@ -305,7 +305,7 @@ Enables RFC 4314 shared mailboxes with Access Control Lists (ACL).
 ```toml
 [shared_mailboxes]
 enabled = true
-namespace_prefix = "Shared/"      # Prefix for shared mailboxes
+namespace_prefix = "Shared/"      # Prefix for shared mailboxes; must end with "/" and cannot be "INBOX/"
 allow_user_create = true          # Allow users to create shared mailboxes
 allow_anyone_identifier = true    # Allow granting rights to "anyone" in the domain
 default_rights = "lrswipkxtea"    # Full rights for creators

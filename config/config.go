@@ -5,17 +5,20 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"maps"
 	"math"
 	"net"
 	"net/http"
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 )
 
@@ -585,10 +588,9 @@ type AuthRateLimiterConfig struct {
 // multiplier. Zero means "use the default" (see applyAuthRateLimitDefaults); a negative
 // value has no meaning, and the limiter does not read it consistently
 // (max_attempts_per_ip = -1 blocked an address at its first failure on one path and
-// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check;
-// the limiter converts the multiplied delay to a time.Duration before capping it at
-// max_delay, and that conversion is platform-dependent for them (on amd64 +Inf becomes
-// a negative delay, which switches progressive delays off).
+// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check
+// but are no growth factor. Any finite multiplier is safe: the limiter caps the
+// product at max_delay before converting it to a time.Duration.
 func (c *AuthRateLimiterConfig) Validate() error {
 	v := reflect.ValueOf(c).Elem()
 	for i := 0; i < v.NumField(); i++ {
@@ -611,6 +613,13 @@ func (c *AuthRateLimiterConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+// UnmarshalTOML decodes an auth_rate_limit table field by field, with its
+// durations parsed like every other duration key (see decodeTable).
+func (c *AuthRateLimiterConfig) UnmarshalTOML(data any) error {
+	type plain AuthRateLimiterConfig
+	return decodeTable("auth_rate_limit", data, (*plain)(c))
 }
 
 // DefaultAuthRateLimiterConfig returns sensible defaults for authentication rate limiting
@@ -682,19 +691,56 @@ var tomlErrorPosition = regexp.MustCompile(`^toml: (?:line \d+ )?\(last key "([^
 // the cache enabled with the default max_size. Decoded field by field, an omitted
 // enabled would be false and turn the cache off.
 func (c *LookupCacheConfig) UnmarshalTOML(data any) error {
-	table, ok := data.(map[string]any)
-	if !ok {
-		return fmt.Errorf("lookup_cache must be a table, got %T", data)
-	}
-	// Decode the table's own keys again, into a copy of the defaults. The plain
-	// type has no UnmarshalTOML, so this decodes field by field.
-	var buf strings.Builder
-	if err := toml.NewEncoder(&buf).Encode(table); err != nil {
-		return fmt.Errorf("lookup_cache: %w", err)
-	}
 	type plain LookupCacheConfig
 	decoded := plain(DefaultLookupCacheConfig())
-	md, err := toml.Decode(buf.String(), &decoded)
+	if err := decodeTable("lookup_cache", data, &decoded); err != nil {
+		return err
+	}
+	*c = LookupCacheConfig(decoded)
+	return nil
+}
+
+// decodeTable decodes data, the table the toml package hands an UnmarshalTOML
+// method, into v, a pointer to a struct type without one: the table is encoded
+// again and decoded field by field. name is the table's key, for messages.
+//
+// A time.Duration field is parsed with helpers.ParseDuration, like every other
+// duration key, so it takes whole days ("1d"). Left to the toml package it would
+// take time.ParseDuration syntax only, and a bare integer as nanoseconds; here an
+// integer has no unit, so it is an error as "900" is for the other keys.
+func decodeTable(name string, data any, v any) error {
+	table, ok := data.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%s must be a table, got %T", name, data)
+	}
+	table = maps.Clone(table)
+	typ := reflect.TypeOf(v).Elem()
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		if field.Type != reflect.TypeOf(time.Duration(0)) {
+			continue
+		}
+		key := tomlKey(field)
+		value, ok := table[key]
+		if !ok {
+			continue
+		}
+		s, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("%s: a duration is a string with a unit, such as \"15m\" or \"1d\", got %v", key, value)
+		}
+		d, err := helpers.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("%s: %w", key, err)
+		}
+		table[key] = int64(d) // the toml package decodes an integer into a time.Duration as nanoseconds
+	}
+
+	var buf strings.Builder
+	if err := toml.NewEncoder(&buf).Encode(table); err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	md, err := toml.Decode(buf.String(), v)
 	if err != nil {
 		// The line in err is one of the re-encoded table, not of the file; the
 		// outer decoder adds the table's own line. Keep the key and the reason.
@@ -703,9 +749,8 @@ func (c *LookupCacheConfig) UnmarshalTOML(data any) error {
 	// The outer decoder counts every key of a table handled here as decoded, so
 	// report unknown ones here.
 	for _, key := range md.Undecoded() {
-		log.Printf("WARNING: Unknown key 'lookup_cache.%s' will be ignored", key)
+		log.Printf("WARNING: Unknown key '%s.%s' will be ignored", name, key)
 	}
-	*c = LookupCacheConfig(decoded)
 	return nil
 }
 
@@ -717,36 +762,69 @@ func (c *LookupCacheConfig) GetMaxSize() int {
 	return c.MaxSize
 }
 
+// The lookup_cache durations a key gets when it is absent.
+const (
+	defaultLookupCachePositiveTTL                = 5 * time.Minute
+	defaultLookupCacheNegativeTTL                = 1 * time.Minute
+	defaultLookupCacheCleanupInterval            = 5 * time.Minute
+	defaultLookupCachePositiveRevalidationWindow = 30 * time.Second
+)
+
 // GetPositiveTTL parses and returns the positive TTL duration
 func (c *LookupCacheConfig) GetPositiveTTL() (time.Duration, error) {
-	if c.PositiveTTL == "" {
-		return 5 * time.Minute, nil
-	}
-	return time.ParseDuration(c.PositiveTTL)
+	return parseLookupCacheDuration(c.PositiveTTL, defaultLookupCachePositiveTTL)
+}
+
+// GetPositiveTTLWithDefault returns positive_ttl, or its default if the value cannot be parsed.
+func (c *LookupCacheConfig) GetPositiveTTLWithDefault() time.Duration {
+	return lookupCacheDurationWithDefault("positive_ttl", c.PositiveTTL, defaultLookupCachePositiveTTL)
 }
 
 // GetNegativeTTL parses and returns the negative TTL duration
 func (c *LookupCacheConfig) GetNegativeTTL() (time.Duration, error) {
-	if c.NegativeTTL == "" {
-		return 1 * time.Minute, nil
-	}
-	return time.ParseDuration(c.NegativeTTL)
+	return parseLookupCacheDuration(c.NegativeTTL, defaultLookupCacheNegativeTTL)
+}
+
+// GetNegativeTTLWithDefault returns negative_ttl, or its default if the value cannot be parsed.
+func (c *LookupCacheConfig) GetNegativeTTLWithDefault() time.Duration {
+	return lookupCacheDurationWithDefault("negative_ttl", c.NegativeTTL, defaultLookupCacheNegativeTTL)
 }
 
 // GetCleanupInterval parses and returns the cleanup interval duration
 func (c *LookupCacheConfig) GetCleanupInterval() (time.Duration, error) {
-	if c.CleanupInterval == "" {
-		return 5 * time.Minute, nil
-	}
-	return time.ParseDuration(c.CleanupInterval)
+	return parseLookupCacheDuration(c.CleanupInterval, defaultLookupCacheCleanupInterval)
+}
+
+// GetCleanupIntervalWithDefault returns cleanup_interval, or its default if the value cannot be parsed.
+func (c *LookupCacheConfig) GetCleanupIntervalWithDefault() time.Duration {
+	return lookupCacheDurationWithDefault("cleanup_interval", c.CleanupInterval, defaultLookupCacheCleanupInterval)
 }
 
 // GetPositiveRevalidationWindow parses and returns the positive revalidation window duration
 func (c *LookupCacheConfig) GetPositiveRevalidationWindow() (time.Duration, error) {
-	if c.PositiveRevalidationWindow == "" {
-		return 30 * time.Second, nil
+	return parseLookupCacheDuration(c.PositiveRevalidationWindow, defaultLookupCachePositiveRevalidationWindow)
+}
+
+// GetPositiveRevalidationWindowWithDefault returns positive_revalidation_window, or its
+// default if the value cannot be parsed.
+func (c *LookupCacheConfig) GetPositiveRevalidationWindowWithDefault() time.Duration {
+	return lookupCacheDurationWithDefault("positive_revalidation_window", c.PositiveRevalidationWindow, defaultLookupCachePositiveRevalidationWindow)
+}
+
+func parseLookupCacheDuration(value string, def time.Duration) (time.Duration, error) {
+	if value == "" {
+		return def, nil
 	}
-	return time.ParseDuration(c.PositiveRevalidationWindow)
+	return helpers.ParseDuration(value)
+}
+
+func lookupCacheDurationWithDefault(key, value string, def time.Duration) time.Duration {
+	d, err := parseLookupCacheDuration(value, def)
+	if err != nil {
+		warnf("Failed to parse lookup_cache.%s: %v, using default (%s)", key, err, def)
+		return def
+	}
+	return d
 }
 
 // RemoteLookupConfig holds configuration for HTTP-based user routing
@@ -788,7 +866,7 @@ type RemoteLookupCircuitBreakerConfig struct {
 	Interval     string  `toml:"interval"`      // Time before resetting failure counts in closed state (default: "0s" - never reset)
 	Timeout      string  `toml:"timeout"`       // Time before transitioning from open to half-open (default: "30s")
 	FailureRatio float64 `toml:"failure_ratio"` // Failure ratio threshold to open circuit (0.0-1.0, default: 0.6)
-	MinRequests  int     `toml:"min_requests"`  // Minimum requests before evaluating failure ratio (default: 3)
+	MinRequests  int     `toml:"min_requests"`  // Minimum completed requests before evaluating failure ratio (default: 3)
 }
 
 // RemoteLookupTransportConfig holds HTTP transport configuration for remote_lookup connection pooling and timeouts
@@ -866,7 +944,7 @@ func (c *RemoteLookupCircuitBreakerConfig) GetFailureRatio() float64 {
 	return c.FailureRatio
 }
 
-// GetMinRequests returns the minimum requests before evaluating failure ratio
+// GetMinRequests returns the minimum completed requests before evaluating failure ratio
 func (c *RemoteLookupCircuitBreakerConfig) GetMinRequests() uint32 {
 	if c.MinRequests <= 0 {
 		return 3 // Default: 3 requests
@@ -1064,6 +1142,9 @@ type ServerConfig struct {
 	Type string `toml:"type"`
 	Name string `toml:"name"`
 	Addr string `toml:"addr"`
+	// Enabled = false keeps the block in the file without starting or validating it.
+	// nil (absent) or true starts it. See IsEnabled.
+	Enabled *bool `toml:"enabled,omitempty"`
 
 	// Common server options
 	TLS              bool   `toml:"tls,omitempty"`
@@ -1234,6 +1315,26 @@ func (c SharedMailboxesConfig) InNamespace(name string) bool {
 	// use that same rule, or a case variant can bypass shared namespace policy.
 	name, prefix := strings.ToLower(name), strings.ToLower(c.NamespacePrefix)
 	return strings.HasPrefix(name, prefix) || name == strings.TrimSuffix(prefix, "/")
+}
+
+// Validate checks namespace_prefix when sharing is enabled. The personal namespace has
+// the empty prefix, so InNamespace tells shared names apart by the prefix alone, and the
+// prefix must be a mailbox name followed by the hierarchy delimiter: an empty prefix puts
+// every mailbox in the shared namespace, and "Shared" also takes in "SharedDocs".
+func (c SharedMailboxesConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	delim := string(consts.MailboxDelimiter)
+	root, ok := strings.CutSuffix(c.NamespacePrefix, delim)
+	if !ok || slices.Contains(strings.Split(root, delim), "") {
+		return fmt.Errorf("namespace_prefix %q must be a mailbox name followed by the hierarchy delimiter %q, such as \"Shared/\"",
+			c.NamespacePrefix, delim)
+	}
+	if strings.EqualFold(root, consts.MailboxInbox) {
+		return fmt.Errorf("namespace_prefix %q conflicts with the reserved personal INBOX", c.NamespacePrefix)
+	}
+	return nil
 }
 
 // AdminCLIConfig holds configuration for sora-admin CLI tool
@@ -2307,10 +2408,15 @@ func (c *UploaderConfig) GetRetryIntervalWithDefault() time.Duration {
 	return interval
 }
 
-// IsEnabled checks if a server should be started based on its configuration
+// IsEnabled reports whether the block is to be started: every [[server]] block is,
+// unless it says enabled = false. An enabled block must pass Validate, which requires
+// type, name and addr; a block missing one is an error, never skipped.
 func (s *ServerConfig) IsEnabled() bool {
-	return s.Type != "" && s.Name != "" && s.Addr != ""
+	return s.Enabled == nil || *s.Enabled
 }
+
+// ServerTypes are the [[server]] types the configuration accepts.
+var ServerTypes = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api", "user_api_proxy"}
 
 // ValidateServerConfig validates a server configuration
 func (s *ServerConfig) Validate() error {
@@ -2318,22 +2424,21 @@ func (s *ServerConfig) Validate() error {
 		return fmt.Errorf("server type is required")
 	}
 	if s.Name == "" {
-		return fmt.Errorf("server name is required")
+		return fmt.Errorf("server name is required (type %q, addr %q)", s.Type, s.Addr)
 	}
 	if s.Addr == "" {
-		return fmt.Errorf("server address is required")
+		return fmt.Errorf("server address is required; set enabled = false to keep a [[server]] block without starting it")
 	}
 
-	validTypes := []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api", "user_api_proxy"}
 	isValidType := false
-	for _, validType := range validTypes {
+	for _, validType := range ServerTypes {
 		if s.Type == validType {
 			isValidType = true
 			break
 		}
 	}
 	if !isValidType {
-		return fmt.Errorf("invalid server type '%s', must be one of: %s", s.Type, strings.Join(validTypes, ", "))
+		return fmt.Errorf("invalid server type '%s', must be one of: %s", s.Type, strings.Join(ServerTypes, ", "))
 	}
 
 	// Master credentials: a configured master username with an EMPTY master
@@ -2534,10 +2639,15 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		if s.Type == "metrics" && s.TLS {
 			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)
 		}
+		if s.Type == "metrics" && s.ProxyProtocol {
+			logger("WARNING: Server %s (type: metrics) has 'proxy_protocol' configured, but the metrics endpoint does not read PROXY protocol headers; it is ignored, and 'allowed_hosts' matches the connecting host", s.Name)
+		}
 	}
 }
 
-// GetAllServers returns all configured servers from the dynamic configuration
+// GetAllServers returns every [[server]] block that does not say enabled = false,
+// complete or not: the callers validate each one, so a block missing type, name or
+// addr is reported instead of being dropped.
 func (c *Config) GetAllServers() []ServerConfig {
 	var allServers []ServerConfig
 
@@ -2561,7 +2671,9 @@ func (c *Config) ProxyProtocolListenersMissingTrust() []string {
 	}
 	var names []string
 	for _, s := range c.GetAllServers() {
-		if s.ProxyProtocol {
+		// The metrics endpoint does not read PROXY headers (its proxy_protocol is warned
+		// about and ignored), so no peer can spoof a client IP through it.
+		if s.ProxyProtocol && s.Type != "metrics" {
 			names = append(names, s.Name)
 		}
 	}

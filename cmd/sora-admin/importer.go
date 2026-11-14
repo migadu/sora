@@ -314,22 +314,37 @@ func (i *Importer) recordFailedPath(path, reason string) {
 	i.failedPaths = append(i.failedPaths, failedImport{path: path, reason: reason})
 }
 
-// Close closes the importer and its resources.
+// Close closes the importer and its resources. The maildir database file stays on
+// disk: Run removes it for --cleanup-db, and only after an import that succeeded.
 func (i *Importer) Close() error {
 	if i.sqliteDB != nil {
 		if err := i.sqliteDB.Close(); err != nil {
 			return fmt.Errorf("failed to close maildir database: %w", err)
 		}
-		if i.options.CleanupDB {
-			logger.Info("Cleaning up import database", "path", i.dbPath)
-			if err := os.Remove(i.dbPath); err != nil {
-				return fmt.Errorf("failed to remove maildir database file: %w", err)
-			}
-		} else {
-			logger.Info("Maildir database saved", "path", i.dbPath)
-		}
 	}
 	return nil
+}
+
+// finish ends Run: it closes the maildir database and, with --cleanup-db, removes it
+// if the run succeeded. The file records which messages are already imported, so after
+// a failed, partly failed or interrupted run it is kept: it is what lets the re-run
+// (--incremental) import only what is missing instead of the whole maildir again.
+func (i *Importer) finish(runErr error) {
+	if err := i.Close(); err != nil {
+		logger.Warn("Failed to close maildir database", "path", i.dbPath, "error", err)
+		return
+	}
+	switch {
+	case !i.options.CleanupDB:
+		logger.Info("Maildir database saved", "path", i.dbPath)
+	case runErr != nil:
+		logger.Warn("Import did not complete, keeping the import database for the next run", "path", i.dbPath, "error", runErr)
+	default:
+		logger.Info("Cleaning up import database", "path", i.dbPath)
+		if err := os.Remove(i.dbPath); err != nil {
+			logger.Warn("Failed to remove import database", "path", i.dbPath, "error", err)
+		}
+	}
 }
 
 // recoveryHashBatchSize is how many cached hashes are checked against
@@ -436,8 +451,8 @@ func (i *Importer) recoverOrphanedSQLiteState() error {
 }
 
 // Run starts the import process.
-func (i *Importer) Run() error {
-	defer i.Close()
+func (i *Importer) Run() (err error) {
+	defer func() { i.finish(err) }()
 
 	// Recovery: Check for messages marked in SQLite but not in PostgreSQL
 	// This can happen if PostgreSQL commit failed after SQLite update
@@ -2320,7 +2335,13 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 		logger.Info("Using individual transaction mode")
 		successHashes, err = i.insertBatchToDB(uploaded)
 		if err != nil {
+			// insertBatchToDB fails only before it stores anything (address or
+			// account lookup), so none of the batch was imported.
 			logger.Error("DB inserts failed", "error", err)
+			for _, up := range uploaded {
+				i.recordFailedPath(up.msg.path, fmt.Sprintf("db insert error: %v", err))
+			}
+			atomic.AddInt64(&i.failedMessages, int64(len(uploaded)))
 			return err
 		}
 
@@ -2503,6 +2524,13 @@ func (i *Importer) importMessages() error {
 		if err := i.processBatch(batch); err != nil {
 			logger.Warn("Final batch had errors", "error", err)
 		}
+	}
+
+	// A cancellation during the final batch is not caught by the loop above, and the
+	// uploads that see it return without counting a failure: such a run is not complete.
+	if err := i.ctx.Err(); err != nil {
+		logger.Info("Import cancelled by user")
+		return err
 	}
 
 	return nil

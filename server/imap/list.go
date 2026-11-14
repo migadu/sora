@@ -174,7 +174,7 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 						statusData.HighestModSeq = summary.HighestModSeq
 					}
 					if options.ReturnStatus.AppendLimit {
-						limit := s.server.appendLimit
+						limit := s.AppendLimit()
 						statusData.AppendLimit = &limit
 					}
 					if options.ReturnStatus.Size {
