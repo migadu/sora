@@ -1561,13 +1561,27 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Collect connections for this user from all trackers
-	// Filter by email string matching (case-insensitive) - no database lookup needed
-	// The connection tracker already stores the username (email) via gossip
+	// A tracker keeps one entry per account ID, with the address of the session that
+	// created it. The address is resolved to its account, as POST /admin/connections/kick
+	// resolves it, so the account's entries are listed whichever of its addresses names
+	// it. An entry created under the address is listed too: a remote lookup account,
+	// which the database does not know, is keyed by an ID derived from the address the
+	// lookup answered, and that is the address its entry keeps.
+	//
 	// Unlike GET /admin/connections, a tracker that knows the account only through
 	// gossip is listed too (local count 0): it reports the sessions on other nodes.
+	var accountID int64 // 0: the database names no account for the address
+	if s.rdb != nil {
+		id, err := s.rdb.GetAccountIDByEmailWithRetry(r.Context(), email)
+		switch {
+		case err == nil:
+			accountID = id
+		case !errors.Is(err, consts.ErrUserNotFound):
+			logger.Warn("HTTP API: Cannot resolve account; listing only the entries created under the address",
+				"name", s.name, "email", email, "error", err)
+		}
+	}
 	userConnections := make([]ConnectionInfo, 0)
-	emailLower := strings.ToLower(email)
 
 	for trackerKey, tracker := range trackers {
 		if tracker == nil {
@@ -1576,8 +1590,7 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		instanceID := tracker.GetInstanceID()
 		conns := tracker.GetAllConnections()
 		for _, connInfo := range conns {
-			// Match email case-insensitively
-			if strings.ToLower(connInfo.Username) == emailLower {
+			if (accountID != 0 && connInfo.AccountID == accountID) || strings.EqualFold(connInfo.Username, email) {
 				userConnections = append(userConnections, newConnectionInfo(trackerKey, connInfo.GetLocalCount(instanceID), connInfo))
 			}
 		}
