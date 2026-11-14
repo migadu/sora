@@ -2401,7 +2401,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		redirectRateWindow = time.Hour
 	}
 
-	return adminapi.ServerOptions{
+	options := adminapi.ServerOptions{
 		Name:               serverConfig.Name,
 		Addr:               serverConfig.Addr,
 		APIKey:             serverConfig.APIKey,
@@ -2423,17 +2423,25 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		InstanceID:         deps.instanceID,
 		MaintenanceGate:    deps.maintenanceGate,
 		FTSRetention:       deps.ftsRetention,
-		AffinityManager:    deps.affinityManager,
 		ValidBackends:      validBackends,
 		ConnectionTrackers: deps.connectionTrackers,
 		ProxyServers:       deps.proxyServers,
-		AuthCache:          deps.authCacheInstance,
 		RedirectRateLimit:  serverConfig.GetRedirectRateLimit(),
 		RedirectRateWindow: redirectRateWindow,
 		MaxRedirectHops:    serverConfig.GetMaxRedirectHops(),
 		SieveExtensions:    deps.config.Sieve.EnabledExtensions,
 		SharedMailboxes:    deps.config.SharedMailboxes,
 	}
+	// Set only when the feature is on: a nil pointer stored in an interface field is a
+	// non-nil interface, and the handlers tell "not enabled on this node" by comparing
+	// the interface with nil.
+	if deps.affinityManager != nil {
+		options.AffinityManager = deps.affinityManager
+	}
+	if deps.authCacheInstance != nil {
+		options.AuthCache = deps.authCacheInstance
+	}
+	return options
 }
 
 func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
