@@ -69,24 +69,24 @@ allowed_hosts = ["127.0.0.1", "10.0.0.0/24"]
 | Key | Default | Meaning |
 |---|---|---|
 | `type` | required | `http_admin_api`. |
-| `name` | required | Names the server in logs. A block without `type`, `name` or `addr` is not started. |
+| `name` | required | Names the server in logs. |
 | `addr` | required | Listen address, for example `":8080"` or `"127.0.0.1:8080"`. |
 | `api_key` | none | The bearer token every request must carry. When it is empty the server is skipped and Sora logs `HTTP Admin API server enabled but no API key configured - skipping`. When it is shorter than 16 characters, or is one of the placeholders from `config.toml.example` (`your-api-key-here`, `your-secret-api-key-here`), Sora refuses to start. |
 | `allowed_hosts` | `[]` (everyone) | Client addresses allowed to connect: IP addresses and CIDR blocks. Entries that are neither, such as host names, never match. |
 | `max_connections` | `0` (no limit) | Most concurrent TCP connections. |
 | `max_message_size` | `"50mb"` | Largest request body `POST /admin/mail/deliver` accepts. |
 | `tls` | `false` | Serve HTTPS. |
-| `tls_cert_file`, `tls_key_file` | none | Certificate and key for `tls = true`. Used when no `[tls]` certificate manager is configured; with one, its certificates are used. See [TLS.md](TLS.md). |
+| `tls_cert_file`, `tls_key_file` | none | Certificate and key for `tls = true`, when this listener does not use the `[tls]` certificate manager. Use one source per listener. See [TLS.md](TLS.md). |
 | `tls_default_domain` | none | Certificate name for clients that send no SNI, when the `[tls]` manager provides certificates. |
 | `tls_verify` | `false` | Require a client certificate. Sora sets no client CA list, so the certificate must chain to the system's trusted roots. |
 | `[server.limits] redirect_rate_limit` | `100` | For Sieve `redirect` during `POST /admin/mail/deliver`: redirects per account per window. `0` is unlimited. |
 | `[server.limits] redirect_rate_window` | `"1h"` | The window for `redirect_rate_limit`. |
 | `[server.limits] max_redirect_hops` | `2` | How often one message may be redirected before further redirects are suppressed. `0` is unlimited. |
 
-`proxy_protocol` and `proxy_protocol_timeout` are not used by the Admin API: the server never
-reads a PROXY protocol header. Do not put a load balancer that sends one in front of it.
-Setting `proxy_protocol = true` on this block still counts for the start-up check that
-refuses PROXY protocol listeners while `[servers] trusted_networks` is empty.
+With `proxy_protocol = true`, the Admin API expects a PROXY protocol header on each
+connection, from an address in `[servers] trusted_networks`. The client address in it is then
+used for `allowed_hosts`. `proxy_protocol_timeout` (default `"5s"`) is how long it waits for
+that header.
 
 The HTTP server's own limits are fixed: 10 seconds to read the request headers, 5 minutes to
 read the whole request and 5 minutes to write the response, 120 seconds for an idle
@@ -108,8 +108,9 @@ The full list of server keys and how the file is read is in
 
 Every request goes through two checks, in this order.
 
-**1. The client address.** When `allowed_hosts` is not empty, the TCP peer's address must
-match one of its entries. A bare address matches itself (as `/32` or `/128`); a CIDR block
+**1. The client address.** When `allowed_hosts` is not empty, the client's address (the TCP
+peer's, or the one in the PROXY header with `proxy_protocol = true`) must match one of its
+entries. A bare address matches itself (as `/32` or `/128`); a CIDR block
 matches every address in it. IPv6 entries are compared by value. Forwarded headers
 (`X-Forwarded-For`, `X-Real-IP`) are never read. A client that does not match gets:
 
@@ -148,18 +149,17 @@ accepts a raw message or a form upload. The handlers decode the body whatever th
 
 **Email addresses in paths** are written as they are: `/admin/accounts/user@example.com`.
 `%40` for `@` works too. Addresses are matched case-insensitively. An address that does not
-parse usually gives `500`, not `400`.
+parse gives `400`.
 
 **Responses** are JSON with `Content-Type: application/json`. Most field names are
 snake_case. A few responses encode internal structures directly and use Go field names
 instead (`Address`, `TotalPending`, `ID`); the sections below name each one.
 
-**Times** are RFC 3339 strings (`2026-03-01T09:30:00Z`), with three exceptions:
+**Times** are RFC 3339 strings (`2026-03-01T09:30:00Z`), with two exceptions:
 
 - `created_at` in account summaries (domain listing and usage) and the credential list's
   `CreatedAt` and `UpdatedAt` are text in Go's default time format, such as
   `2026-03-01 09:30:00.123456 +0000 UTC`.
-- `Uptime` in cache statistics is a number of nanoseconds.
 - Nullable times in the upload queue are objects: `{"Time":"...","Valid":true}`.
 
 **Empty lists** are sometimes `[]` and sometimes `null`. Treat both as empty.
@@ -175,8 +175,8 @@ There are exceptions where the body is plain text from Go's HTTP library:
 - `405` for a known path with the wrong method: `Method not allowed`.
 - `404` for a path that matches no route: `404 page not found`; and under `/admin/domains/`
   for anything but `.../accounts`: `Not found`.
-- Some ACL and affinity errors (missing fields, the affinity `404`, `501` and `503`) have a
-  JSON body but are sent with `Content-Type: text/plain`.
+- Some ACL and affinity errors (missing fields, the affinity `503`) have a JSON body but are
+  sent with `Content-Type: text/plain`.
 
 **Status codes** used across the API:
 
@@ -191,9 +191,8 @@ There are exceptions where the body is plain text from Go's HTTP library:
 | 403 | Wrong key, or client address not in `allowed_hosts`. |
 | 404 | The account, credential, mailbox or record does not exist. |
 | 405 | Wrong method for the path. |
-| 409 | An address already exists (only in some cases, see section 7). |
-| 500 | Server-side failure, and some request errors the handlers do not classify. |
-| 501 | `GET /admin/affinity/list`, which is not implemented. |
+| 409 | An address already exists. |
+| 500 | Server-side failure. |
 | 503 | A component this endpoint needs is not running on this node, or the backend is in maintenance. |
 
 **Pagination** exists only on `GET /admin/usage/accounts`. Other list endpoints take a
@@ -225,7 +224,7 @@ not used by it.
 | POST | `/admin/accounts/{email}/messages/restore` | 9.2 | Restore expunged messages. |
 | POST | `/admin/mail/deliver` | 10 | Deliver a message, as LMTP would. |
 | GET | `/admin/connections` | 11.1 | Accounts with sessions on this node. |
-| GET | `/admin/connections/stats` | 11.2 | Tracked accounts per tracker. |
+| GET | `/admin/connections/stats` | 11.2 | Connection statistics per tracker. |
 | GET | `/admin/connections/user/{email}` | 11.3 | One account's tracked sessions. |
 | POST | `/admin/connections/kick` | 11.4 | End an account's sessions. |
 | POST | `/admin/mailboxes/acl/grant` | 12.1 | Set an identifier's rights on a shared mailbox. |
@@ -235,7 +234,6 @@ not used by it.
 | GET | `/admin/affinity` | 13.2 | A user's affinity backend. |
 | POST | `/admin/affinity` | 13.2 | Set a user's affinity backend. |
 | DELETE | `/admin/affinity` | 13.2 | Remove a user's affinity. |
-| GET | `/admin/affinity/list` | 13.2 | Not implemented (501). |
 | GET | `/admin/affinity/stats` | 13.2 | Affinity table statistics. |
 | GET | `/admin/cache/stats` | 14.1 | This node's local cache. |
 | GET | `/admin/cache/metrics` | 14.2 | Recorded cache hit rates of every node. |
@@ -247,7 +245,7 @@ not used by it.
 | GET | `/admin/auth-cache/stats` | 16.3 | This node's persistent auth cache. |
 | GET | `/admin/health/overview` | 17.1 | Summary of component health. |
 | GET | `/admin/health/servers/{hostname}` | 17.2 | Component health of one host (or all). |
-| GET | `/admin/health/servers/{hostname}/components/{component}` | 17.3 | One component: current state or history. |
+| GET | `/admin/health/servers/{hostname}/components/{component}` | 17.3 | One component's current state. |
 | GET | `/admin/config` | 18 | Server type and a partial endpoint list. |
 
 **Destructive and asynchronous endpoints.** Know these before you script against them:
@@ -274,14 +272,13 @@ servers that create them. An endpoint that needs a missing part answers as liste
 |---|---|---|
 | Accounts, credentials, deleted messages, usage, ACLs, health, cache metrics, upload queue | Database only | Always available. |
 | `DELETE /admin/accounts/{email}?purge=true` | Database to record the request; a purge worker on any node with S3 to carry it out | The request is recorded. It waits until a node with S3 runs. |
-| Ending sessions and dropping cached logins on delete, password change, credential removal | At least one connection tracker (see 11) | The change is made, but no session is ended and no cached login is dropped. |
-| `POST /admin/mail/deliver` | The upload worker: an `imap`, `pop3` or `lmtp` server on this node | Every recipient fails with `Mail delivery not configured: uploader not available`. |
+| `POST /admin/mail/deliver` | The upload worker: an `imap`, `pop3` or `lmtp` server on this node | Mail delivery is not available on this node. |
 | `GET /admin/cache/stats`, `POST /admin/cache/purge` | The local cache: an `imap`, `pop3` or `lmtp` server on this node | `503 {"error":"Cache not available"}` |
 | `/admin/connections*` | Connection trackers | List and stats answer with an empty list and a `note`; kick answers `503`. |
 | `GET /admin/proxy/backends` | Proxy servers on this node | `{"proxies":[]}` |
-| `/admin/affinity*` | `[cluster] enabled = true` | See 13.2: the answers do not say affinity is off. |
+| `/admin/affinity*` | `[cluster] enabled = true` and `[cluster.affinity] enabled = true` | `503 {"error": "Affinity manager not enabled on this server"}` |
 | `GET /admin/auth/blocked` | Servers with `[server.auth_rate_limit] enabled = true` | Empty list. |
-| `GET /admin/auth-cache/stats` | `[auth_cache] enabled = true` | The request fails without a response (see 16.3). |
+| `GET /admin/auth-cache/stats` | `[auth_cache] enabled = true` | `200` with `"enabled": false` (see 16.3). |
 
 **Connection trackers.** Every `imap`, `pop3` and `managesieve` backend server has one for
 its own sessions. An `lmtp_proxy` has a local one. `imap_proxy`, `pop3_proxy` and
@@ -341,7 +338,7 @@ With several addresses at once, use `credentials` and leave the top-level fields
 | `email` | string | Required. |
 | `password` / `password_hash` | string | Exactly one of them. |
 | `is_primary` | bool | Exactly one credential must be `true`. |
-| `hash_type` | string | How `password` is hashed: `bcrypt` (default), `ssha512` or `sha512`. |
+| `hash_type` | string | How `password` is hashed: `bcrypt` (default) or `ssha512`. |
 
 Response `201`:
 
@@ -365,11 +362,9 @@ Errors:
 | 400 | `Cannot specify both password and password_hash` | Both given. |
 | 400 | `Cannot specify email, password, or password_hash when using credentials array` | Both forms mixed. |
 | 400 | `Credential N: email is required` (and the same two password messages, prefixed) | A bad entry in `credentials`. |
-| 409 | `Account already exists` / `One or more email addresses already exist` | Two requests raced for the same address. |
-| 500 | `Failed to create account` / `Failed to create account with credentials` | Everything else, including: an address that already exists, an address held by an account in its deletion grace period, an invalid address, no or several `is_primary`, duplicate addresses in the request, an unknown `hash_type`. The server log has the reason. |
-
-Because an existing address answers `500`, check with `GET /admin/accounts/{email}/exists`
-first when you need to tell the cases apart.
+| 400 | The reason | An invalid address, an address held by an account in its deletion grace period, no or several `is_primary`, duplicate addresses in the request, a `hash_type` other than `bcrypt` or `ssha512`. |
+| 409 | `Account already exists` / `One or more email addresses already exist` | An address already exists. |
+| 500 | `Failed to create account` / `Failed to create account with credentials` | A server-side failure. The server log has the reason. |
 
 ### 7.2 Get account details
 
@@ -421,12 +416,12 @@ with bcrypt.
 
 Response `200 {"message":"Account updated successfully"}`.
 
-After the change, the account's cached logins are dropped on this node's servers and, through
-the cluster, on peers (if the node has connection trackers, section 6). The next login is
-checked against the database. Open sessions are not ended; kick them (11.4) if needed.
+After the change, the account's cached logins are dropped on every node, in the proxies'
+persistent auth cache and in the User API's login cache too. The next login is checked against
+the database. Open sessions are not ended; kick them (11.4) if needed.
 
-Errors: `400` for a bad body or a missing or doubled password field; `500 Failed to update
-account` for anything else, an unknown address included.
+Errors: `400` for a bad body, a missing or doubled password field, or an invalid address;
+`404 Account not found` for an unknown address; `500 Failed to update account` otherwise.
 
 ### 7.4 Soft-delete an account
 
@@ -435,8 +430,7 @@ account` for anything else, an unknown address included.
 Marks the account deleted. It can no longer sign in or receive mail. Its data stays until the
 cleaner removes it after `[cleanup] grace_period` (default 14 days); until then it can be
 restored (7.6). Its sessions are ended and its cached logins dropped, as a kick does (11.4),
-on this node and, through the cluster, on peers. That part needs connection trackers on the
-answering node (section 6).
+on every node.
 
 Response `200`:
 
@@ -511,7 +505,7 @@ Response `200`:
 ```
 
 `status` is `active`, `deleted` (soft-deleted) or `not_found`. An unknown address is still
-`200`, with `exists: false`. An address that does not parse gives `500`.
+`200`, with `exists: false`. An address that does not parse gives `400`.
 
 ### 7.8 List a domain's accounts
 
@@ -582,9 +576,9 @@ credential is not primary. Each credential has its own password.
 
 Response `201 {"new_email":"a.smith@example.com","message":"Credential added successfully"}`.
 
-Errors: `400` for a bad body; `404 Account not found for the specified primary email`;
-`409 Credential with this email already exists`; `500 Failed to add credential` otherwise
-(an invalid address included).
+Errors: `400` for a bad body or an invalid address; `404 Account not found for the specified
+primary email`; `409 Credential with this email already exists`; `500 Failed to add credential`
+otherwise.
 
 ### 8.2 List an account's addresses
 
@@ -637,8 +631,8 @@ unknown address.
 `DELETE /admin/credentials/{email}`
 
 Removes the credential. The address stops signing in and receiving mail at once; the
-account's cached logins are dropped on this node and its cluster peers (section 6). Sessions
-already signed in with it are not ended.
+account's cached logins are dropped on every node. Sessions already signed in with it are not
+ended.
 
 Response `200 {"email":"a.smith@example.com","message":"Credential deleted successfully"}`.
 
@@ -647,8 +641,8 @@ Errors:
 | Status | Body `error` |
 |---|---|
 | 404 | `credential with email ... not found: user not found` |
-| 400 | `cannot delete the primary credential. Use update-account to make another credential primary first` |
-| 400 | `cannot delete the last credential for an account. Use delete-account to remove the entire account` |
+| 400 | `cannot delete the primary credential...` |
+| 400 | `cannot delete the last credential for an account...` |
 | 500 | `Failed to delete credential` |
 
 The API has no endpoint that changes which credential is primary; use `sora-admin` for that.
@@ -661,8 +655,7 @@ When a client expunges a message, Sora keeps the row, marked with the time of th
 the cleaner removes it after `[cleanup] grace_period`. Until then these endpoints can list and
 restore it. See [STORAGE.md](STORAGE.md) for the two-phase deletion.
 
-Both endpoints need an active account. Because the address in these two paths is decoded a
-second time, a `+` in it must be sent as `%252B` (a plain `+` turns into a space).
+Both endpoints need an active account.
 
 ### 9.1 List restorable messages
 
@@ -831,9 +824,6 @@ Status codes:
 | 503 | One recipient, and it failed on the server side. `Retry-After: 30`. |
 | 503 | This backend is in maintenance: `{"error":"Server in maintenance, try again later"}` with `Retry-After: 60`. See [PROXY.md](PROXY.md) for maintenance mode. |
 
-On a node without an upload worker every recipient fails with `Mail delivery not configured:
-uploader not available`, which a single-recipient request reports as `400`.
-
 In-flight deliveries count as this server's sessions while a backend drains for maintenance.
 
 ---
@@ -885,8 +875,6 @@ tracking not available (requires cluster mode or backend server with tracking en
  "source": "in-memory connection tracker"}
 ```
 
-Despite the names, the numbers count **accounts**, not sessions: each tracker's number is how
-many account entries it holds, gossiped ones included, and `total_connections` is their sum.
 The keys are tracker names. Without trackers the answer has zeros and a `note`.
 
 ### 11.3 One account's sessions
@@ -1067,13 +1055,14 @@ A node without proxies answers `{"proxies":[], "timestamp": ...}`.
 ### 13.2 Affinity
 
 Affinity remembers which backend a user last used per protocol, so the proxy sends them back
-there. The table exists only when `[cluster] enabled = true`; it is gossiped to every node. See
+there. The table exists only when `[cluster]` is enabled with `[cluster.affinity] enabled =
+true`; it is gossiped to every node. See
 [PROXY.md](PROXY.md) and [CLUSTER.md](CLUSTER.md).
 
 **Get:** `GET /admin/affinity?user=alice@example.com&protocol=imap`
 
-`200 {"user":"alice@example.com","protocol":"imap","backend":"10.0.0.11:143"}`, or
-`404 {"error": "No affinity set for alice@example.com (imap)"}`.
+Answers with the user's backend for that protocol:
+`200 {"user":"alice@example.com","protocol":"imap","backend":"10.0.0.11:143"}`.
 
 **Set:** `POST /admin/affinity`
 
@@ -1100,8 +1089,6 @@ without configured backends.
 
 `200 {"success":true,"message":"Affinity deleted for alice@example.com (imap) and gossiped to cluster","user":"alice@example.com","protocol":"imap"}`.
 
-**List:** `GET /admin/affinity/list` answers `501` (not implemented). Use get per user.
-
 **Statistics:** `GET /admin/affinity/stats`
 
 ```json
@@ -1118,9 +1105,8 @@ without configured backends.
 }
 ```
 
-**Without a cluster** these endpoints do not say that affinity is off. Get answers `404 No
-affinity set`, set and delete answer `200` but store nothing, and stats answers `500 Failed to
-get affinity stats`.
+**Without the affinity table** every affinity endpoint answers
+`503 {"error": "Affinity manager not enabled on this server"}`.
 
 ---
 
@@ -1132,15 +1118,9 @@ The local cache keeps message bodies on this node's disk. See [STORAGE.md](STORA
 
 `GET /admin/cache/stats`
 
-This node's cache. The fields use Go names:
-
-```json
-{"TotalSizeBytes": 524288000, "ObjectCount": 1523, "Hits": 45678, "Misses": 3421,
- "HitRatio": 0.93, "Uptime": 86400000000000}
-```
-
-`HitRatio` is 0 to 1. `Hits`, `Misses` and `Uptime` (nanoseconds) count from the process
-start. `503 {"error":"Cache not available"}` on a node without a cache.
+This node's cache: its total size in bytes, the number of objects, hits and misses, the hit
+ratio (0 to 1), and uptime. Hits, misses and uptime count from the process start.
+`503 {"error":"Cache not available"}` on a node without a cache.
 
 ### 14.2 Recorded hit rates
 
@@ -1181,9 +1161,11 @@ Empties this node's cache. Bodies are fetched from S3 again as clients ask for t
 
 ```json
 {"message": "Cache purged successfully",
- "stats_before": {"TotalSizeBytes": 524288000, "ObjectCount": 1523, "...": "..."},
- "stats_after": {"TotalSizeBytes": 0, "ObjectCount": 0, "...": "..."}}
+ "stats_before": { ... },
+ "stats_after": { ... }}
 ```
+
+`stats_before` and `stats_after` are the statistics of 14.1.
 
 `503` on a node without a cache.
 
@@ -1195,9 +1177,9 @@ New message bodies are staged on the receiving node and uploaded to S3 in the ba
 waiting upload is a row in the `pending_uploads` table. These endpoints read that table for the
 whole system, not only this node. See [STORAGE.md](STORAGE.md).
 
-Both take `max_attempts`: an upload with at least this many attempts counts as failed. The
-default here is **5**, which is not tied to `[uploader] max_attempts`. Pass your configured
-value to match what the uploader does.
+Both take `max_attempts`: an upload with at least this many attempts counts as failed. It
+defaults to the configured `[uploader] max_attempts`, the limit at which the uploader stops
+retrying.
 
 ### 15.1 Status
 
@@ -1205,7 +1187,7 @@ value to match what the uploader does.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `max_attempts` | `5` | See above. |
+| `max_attempts` | `[uploader] max_attempts` | See above. |
 | `show_failed` | `false` | `true` adds the failed uploads. |
 | `failed_limit` | `10` | How many failed uploads to add. |
 
@@ -1230,7 +1212,7 @@ The fields use Go names:
 
 ### 15.2 Failed uploads
 
-`GET /admin/uploader/failed?max_attempts=5&limit=50`
+`GET /admin/uploader/failed?limit=50`
 
 `limit` defaults to 50. Newest first. Go field names:
 
@@ -1238,12 +1220,12 @@ The fields use Go names:
 {
   "failed_uploads": [
     {"ID": 77, "AccountID": 1042, "ContentHash": "4f1c...", "InstanceID": "mail1",
-     "Size": 48211, "Attempts": 6,
+     "Size": 48211, "Attempts": 20,
      "CreatedAt": "2026-03-09T10:00:00Z", "UpdatedAt": "2026-03-10T07:00:00Z",
      "LastAttempt": {"Time": "2026-03-10T07:00:00Z", "Valid": true}}
   ],
   "count": 1,
-  "max_attempts": 5,
+  "max_attempts": 20,
   "limit": 50
 }
 ```
@@ -1272,7 +1254,7 @@ The fields use Go names:
 `GET /admin/auth/blocked?protocol=imap`
 
 Lists the blocks that the authentication rate limiters of **this node** currently hold. See
-[AUTHENTICATION.md](AUTHENTICATION.md) for how blocks are made and shared in a cluster.
+[AUTHENTICATION.md](AUTHENTICATION.md) for how blocks are made.
 
 `protocol` is optional and exact: `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`,
 `managesieve_proxy` or `userapi`.
@@ -1309,8 +1291,11 @@ On a node with `[auth_cache] enabled = true` (see [PROXY.md](PROXY.md)):
 `session_*` count since the process started; `lifetime_hit_count` sums the hit counts stored
 in the cache file.
 
-On a node without the auth cache, the request fails without a response: the client sees
-the connection close. (The handler has an `"enabled": false` answer, but it is not reached.)
+On a node without the auth cache:
+
+```json
+{"enabled": false, "note": "Auth cache is not enabled. Enable it in [auth_cache] config section."}
+```
 
 ---
 
@@ -1364,22 +1349,8 @@ host's components.
 
 `GET /admin/health/servers/{hostname}/components/{component}`
 
-Without parameters: the current row, as one object of the shape above, or
-`404 {"error":"Health status not found"}`.
-
-With `history=true`:
-
-| Parameter | Default | Meaning |
-|---|---|---|
-| `since` | 24 hours ago | RFC 3339. |
-| `limit` | `100` | Most rows. |
-
-```json
-{"hostname": "mail1", "component": "database", "history": [ ... ], "count": 48,
- "since": "2026-03-09T08:20:00Z"}
-```
-
-`400 Invalid since parameter format (use RFC3339)`.
+The current row, as one object of the shape above. An unknown component answers
+`404 {"error":"Health status not found"}`; a failed database query answers `500`.
 
 ---
 

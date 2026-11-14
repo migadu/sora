@@ -103,8 +103,9 @@ addr = "127.0.0.1:24"
 | `user_api_proxy` | A proxy for the User API. See [USER_API.md](USER_API.md). |
 | `metrics` | The Prometheus metrics endpoint. See [METRICS.md](METRICS.md). |
 
-A block without a `type`, `name` or `addr` is ignored. An unknown `type` is logged and
-skipped. Two blocks with the same `name`, or the same `addr`, stop the server at startup.
+A block without a `type`, `name` or `addr` stops the server at startup, and so do two blocks
+with the same `name`, or the same `addr`. So does an unknown `type`, with
+`invalid server type '<type>', must be one of: ...`.
 
 ---
 
@@ -144,22 +145,20 @@ At startup `sora` looks at the server types in the config and decides what it ne
 | The node runs | PostgreSQL | S3 and the storage workers |
 |---|---|---|
 | `imap`, `pop3` or `lmtp` | Connects (required) | Starts the S3 client, the local cache, the upload worker, the cleanup worker, the purge worker and the search indexing worker |
-| `http_admin_api` or `http_user_api` | Connects (required) | Only if the node also runs `imap`, `pop3` or `lmtp` |
-| A proxy whose `[server.remote_lookup]` sets `lookup_local_users = true` | Connects (required) | No |
-| Only other proxies, `metrics`, or `managesieve` | Does not connect | No |
+| `managesieve` | Connects (required) | No |
+| `http_admin_api` | Connects (required) | Only if the node also runs `imap`, `pop3` or `lmtp` |
+| `http_user_api` | Connects (required) | Starts the S3 client, to serve message bodies |
+| A proxy that checks passwords in the database (no remote lookup, or `[server.remote_lookup]` with `lookup_local_users = true`) | Connects (required) | No |
+| Only proxies that use remote lookup, or `metrics` | Not needed | No |
 
-So run `managesieve` on a node that also runs IMAP, POP3, LMTP or one of the HTTP APIs: on a
-node of its own it has no database to read scripts from.
-
-If a server type needs PostgreSQL and `[database]` has no hosts, `sora` stops with "database
-is required for configured servers but not configured". On a node that needs S3, `[s3]
-endpoint`, `access_key`, `secret_key` and `bucket` must all be set, or `sora` stops with
-"missing required S3 credentials" or "S3 endpoint not specified".
+If a server type needs PostgreSQL and the config has no `[database.write]` section, `sora`
+stops with "database is required for configured servers but not configured". On a node that
+needs S3, `[s3] endpoint`, `access_key`, `secret_key` and `bucket` must all be set, or `sora`
+stops with "missing required S3 credentials" or "S3 endpoint not specified".
 
 A node without storage workers does not need the upload staging directory or the local
-cache. It also has no S3 client, so an Admin API on it cannot deliver messages, and a User API
-on it cannot return message bodies. Run those APIs on a node that also runs `imap`, `pop3` or
-`lmtp` when you need them.
+cache, and an Admin API on it cannot deliver messages. Run the Admin API on a node that also
+runs `imap`, `pop3` or `lmtp` when you need its delivery endpoint.
 
 ---
 
@@ -214,7 +213,7 @@ See [DATABASE.md](DATABASE.md).
 
 **Cluster** ([cluster](../cluster)). Gossip membership between nodes. It shares per-user
 connection counts on proxies, kicks and proxy affinity, and elects the Let's Encrypt leader.
-Login rate limits are not shared: each node counts its own. See [CLUSTER.md](CLUSTER.md).
+See [CLUSTER.md](CLUSTER.md).
 
 **TLS manager** ([tlsmanager](../tlsmanager)). Certificates from files or from Let's Encrypt.
 See [TLS.md](TLS.md).
@@ -250,7 +249,7 @@ safely.
 | Outgoing relay messages | Local disk, `[relay.queue] path` (default `/var/spool/sora/relay`) | See [RELAY.md](RELAY.md). |
 | Auth cache, affinity cache | Local SQLite files on proxy nodes | Disposable. See [PROXY.md](PROXY.md). |
 | Let's Encrypt certificates | The S3 bucket in `[tls.letsencrypt.s3]`, mirrored to a local fallback directory | See [TLS.md](TLS.md). |
-| Login rate-limit counts | Memory of each node, not shared | Lost on restart. See [AUTHENTICATION.md](AUTHENTICATION.md). |
+| Login rate-limit counts | Memory | Lost on restart. See [AUTHENTICATION.md](AUTHENTICATION.md). |
 | Per-user connection counts on proxies, affinity | Memory, shared between nodes by gossip | Lost on restart. See [CLUSTER.md](CLUSTER.md). |
 | Client sessions | Memory of the node that holds the connection | |
 
@@ -294,15 +293,16 @@ sequenceDiagram
 3. **Trace headers are added.** Sora rejects a message that has looped back to it (its own
    loop marker and a `Delivered-To` for this recipient). Otherwise it adds a `Received:`
    header and a `Delivered-To:` header with the primary address.
-4. **Sieve runs.** The server-wide default script runs first, then the user's active script.
+4. **The staging limit is checked.** If `[uploader] max_staging_size` is set and this node
+   already holds that much mail waiting for upload, Sora answers
+   `452 4.3.1 Insufficient system storage` before Sieve runs, so a refused delivery has no
+   side effects.
+5. **Sieve runs.** The server-wide default script runs first, then the user's active script.
    A script can file the message into a folder, discard it, redirect it, send a vacation
    reply, set flags or edit headers. A discarded message stops here. See
    [SIEVE.md](SIEVE.md).
-5. **The body is hashed.** Sora computes a BLAKE3 hash of the final bytes, after any header
+6. **The body is hashed.** Sora computes a BLAKE3 hash of the final bytes, after any header
    edits. This *content hash* names the body from now on.
-6. **The staging limit is checked.** If `[uploader] max_staging_size` is set and this node
-   already holds that much mail waiting for upload, Sora answers
-   `452 4.3.1 Insufficient system storage`.
 7. **The body is written to local disk**, as `<[uploader] path>/<account id>/<content hash>`.
    Sora writes a temporary file, syncs it to disk, renames it into place and syncs the
    directory. If the disk is full or read-only, Sora answers `452 4.3.1`.

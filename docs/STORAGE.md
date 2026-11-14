@@ -451,9 +451,9 @@ not always cost an S3 request. It is per node: nodes do not share caches. The co
 
 ### What it holds
 
-- Bodies this node uploaded. The staged file moves into the cache after the upload,
-  whatever its size.
-- Bodies this node read from S3, if they are no larger than `max_object_size` (default 5 MiB).
+- Bodies this node uploaded, if they are no larger than `max_object_size` (default 5 MiB). The
+  staged file moves into the cache after the upload; a larger one is deleted instead.
+- Bodies this node read from S3, with the same size limit.
 - Bodies fetched by warmup (below), with the same size limit.
 
 Cached bodies are **plaintext**, even with S3 encryption on, and are keyed by content hash
@@ -473,9 +473,8 @@ the first two characters of the hash.
 
 ### Size and eviction
 
-The cache is trimmed by a **purge cycle**, at startup and then every `purge_interval`
-(default 12 hours). Writes do not trim it. Between two cycles the cache can therefore grow
-past `capacity`. Give the disk room for that, or shorten `purge_interval`.
+The cache is kept within `capacity` as bodies are added, and a **purge cycle** runs at startup
+and then every `purge_interval` (default 12 hours).
 
 Each cycle does this:
 
@@ -498,16 +497,13 @@ messages opens quickly.
   It fetches the newest `warmup_message_count` messages (default 50) of each mailbox in
   `warmup_mailboxes` (default `["INBOX"]`) from S3 into the cache, skipping bodies already
   cached.
-- One account is warmed at most once every 24 hours per server. The time of each warmup is
-  saved in `.sora_warmup_state` at shutdown and read back at startup, so a restart does not
-  warm every account again. `warmup_interval` is accepted in the config but not applied: the
-  interval is always 24 hours.
+- One account is warmed at most once every `warmup_interval` (default 24 hours) per server.
+  The time of each warmup is saved in `.sora_warmup_state` at shutdown and read back at
+  startup, so a restart does not warm every account again.
 - With `warmup_async = true` (the default), the warmup runs in the background. Ten workers
   per IMAP server process a queue of 50; a warmup that finds the queue full is dropped and
   tried at the next login. With `warmup_async = false`, the login waits for the warmup.
 - One warmup may take at most `warmup_timeout` (default 5 minutes).
-- Warmup builds the S3 key from the account's current primary address, so messages stored
-  under an earlier address are not warmed.
 
 The counter `sora_warmup_operations_total` shows warmups by state (`enqueued`, `dropped`,
 `started`, `completed`, `cancelled`, `error`).
@@ -693,12 +689,12 @@ minute is raised to 1 minute. In order, one cycle:
    `grace_period` ago (see [section 13](#13-deleting-accounts)).
 4. **Deleted mailboxes.** Removes up to 50 mailboxes deleted over IMAP, expunging their
    messages.
-5. **Vacation records.** Deletes records of vacation replies older than `grace_period`. These
-   records stop a sender from getting a second reply within a vacation's `:days`, so a `:days`
-   longer than `grace_period` is cut to `grace_period` in effect. See [SIEVE.md](SIEVE.md).
+5. **Vacation records.** Deletes records of vacation replies that can no longer stop a reply.
+   These records stop a sender from getting a second reply within a vacation's `:days`. See
+   [SIEVE.md](SIEVE.md).
 6. **Redirect log.** Deletes entries of the Sieve redirect rate limit older than
    `grace_period`.
-7. **Health history.** Deletes health status rows not updated for `health_status_retention`
+7. **Health status.** Deletes health status rows not updated for `health_status_retention`
    (default 30 days; `0` keeps them).
 8. **Mailbox counters.** Repairs unseen counters that have drifted below zero.
 9. **S3 objects.** Deletes the bodies and rows of expired expunged messages (see
@@ -927,7 +923,7 @@ Watch the free space of the staging and cache disks with your usual system monit
 
 All five sections are global: they apply to the whole node, not to one `[[server]]` block.
 They are read at startup; a change needs a restart. Durations take Go syntax plus days
-(`"30s"`, `"12h"`, `"14d"`). Sizes take a number with `b`, `kb`, `mb`, `gb` or `tb`
+(`"30s"`, `"12h"`, `"14d"`). Sizes take a number with `b`, `kb`, `mb` or `gb` in any case
 (1024-based), or a plain number of bytes. See [CONFIGURATION.md](CONFIGURATION.md).
 
 ### `[s3]`
@@ -951,8 +947,8 @@ Required on every storage node.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `path` | string | `"/tmp/sora/cache"` | Cache directory. Created if missing. Put it on the same filesystem as `[uploader] path`. |
-| `capacity` | size | `"1gb"` | Target total size, enforced at each purge cycle. |
-| `max_object_size` | size | `"5mb"` | Largest body cached after an S3 read or a warmup. Bodies moved in after an upload are not limited. Also the default of the IMAP server's `preview_s3_max_size`. |
+| `capacity` | size | `"1gb"` | Total size the cache is kept within. |
+| `max_object_size` | size | `"5mb"` | Largest body cached, after an upload, an S3 read or a warmup. Also the default of the IMAP server's `preview_s3_max_size`. |
 | `purge_interval` | duration | `"12h"` | How often the cache is trimmed and cleaned. |
 | `orphan_cleanup_age` | duration | `"30d"` | Unread time after which a cached body of deleted mail is removed. |
 | `metrics_interval` | duration | `"5m"` | How often hit and miss counts are written to `cache_metrics`. |
@@ -962,7 +958,7 @@ Required on every storage node.
 | `warmup_mailboxes` | list of strings | `["INBOX"]` | Mailboxes to preload. |
 | `warmup_async` | bool | `true` | Warm in the background. `false` makes the login wait. |
 | `warmup_timeout` | duration | `"5m"` | Longest time one warmup may run. |
-| `warmup_interval` | duration | not applied | Accepted but ignored; an account is warmed at most once per 24 hours. |
+| `warmup_interval` | duration | `"24h"` | Shortest interval between two warmups of one account. |
 
 An invalid duration or size in this section is logged as a warning and the default is used.
 
@@ -979,14 +975,11 @@ An invalid duration or size in this section is logged as a warning and the defau
 | `cleanup_grace_period` | duration | `"1h"` | Minimum age of a staging file before the orphan sweep may remove it. An invalid value stops `sora`. |
 | `max_staging_size` | size | no limit | Most bytes this node may hold waiting for upload. An invalid value stops `sora`. |
 
-Keep `batch_size`, `concurrency` and `max_attempts` above 0. Sora does not check them, and 0
-stops all uploads.
-
 ### `[cleanup]`
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `grace_period` | duration | `"14d"` | How long expunged mail and deleted accounts stay restorable. Also the minimum age before unuploaded mail can be reaped, and the age at which vacation records and redirect log entries are deleted. |
+| `grace_period` | duration | `"14d"` | How long expunged mail and deleted accounts stay restorable. Also the minimum age before unuploaded mail can be reaped, and the age at which redirect log entries are deleted. |
 | `wake_interval` | duration | `"1h"` | How often the cleanup cycle runs. At least 1 minute. |
 | `max_age_restriction` | duration | none | Expunge messages whose row is older than this. Empty turns it off. |
 | `fts_retention` | duration | none (keep) | How long search vectors are kept. See [SEARCH.md](SEARCH.md). |
@@ -1003,7 +996,7 @@ and on the account. Entries are stored in PostgreSQL. Only the IMAP server uses 
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `max_entry_size` | int (bytes) | `65536` | Largest single value. Over IMAP a SETMETADATA value sent as a literal is also limited to 4096 bytes (see [PROTOCOLS.md](PROTOCOLS.md)), so larger values cannot be set that way. |
+| `max_entry_size` | int (bytes) | `65536` | Largest single value. |
 | `max_entries_per_mailbox` | int | `100` | Most entries on one mailbox. If `0`, mailbox entries are limited by `max_entries_per_server` instead. |
 | `max_entries_per_server` | int | `50` | Most account-level entries (set on the empty mailbox name `""`). |
 | `max_total_size` | int (bytes) | `1048576` | Most bytes of values per account, mailbox and account entries together. |

@@ -48,10 +48,8 @@ What a node needs:
 
 - **PostgreSQL**, always. Sora refuses to start when an `http_user_api` server is configured
   without `[database]`.
-- **S3 and the upload worker**, to serve message bodies (`/body` and `/raw`). Sora sets these
-  up only on a node that also runs an `imap`, `pop3` or `lmtp` server. On a node without one,
-  every body request answers `503 Storage temporarily unavailable, retry later`. Metadata,
-  flags, search and filters still work.
+- **S3 and the upload worker**, to serve message bodies (`/body` and `/raw`). Metadata, flags,
+  search and filters work without them.
 
 ---
 
@@ -70,16 +68,16 @@ allowed_origins = ["https://webmail.example.com"]
 | Key | Default | Meaning |
 |---|---|---|
 | `type` | required | `http_user_api`. |
-| `name` | required | Names the server in logs and in the rate limiter. A block without `type`, `name` or `addr` is not started. |
+| `name` | required | Names the server in logs and in the rate limiter. |
 | `addr` | required | Listen address. |
 | `jwt_secret` | none | The HMAC key tokens are signed with (HS256). When it is empty the server is skipped and Sora logs `HTTP User API server enabled but no JWT secret configured - skipping`. When it is shorter than 32 bytes, or is the placeholder `your-secret-jwt-signing-key-here`, Sora refuses to start. |
-| `token_duration` | `"24h"` | How long a token is valid. Written as a Go duration: `"12h"`, `"90m"`, `"168h"`. Days (`"7d"`) are not understood: such a value, like any value that does not parse, falls back to `24h` with a log line. Values above `168h` (7 days) are cut to `168h` with a warning. `"0"` means `24h`. |
+| `token_duration` | `"24h"` | How long a token is valid, written like the other durations: `"12h"`, `"90m"`, `"7d"`. Values above `168h` (7 days) are cut to `168h` with a warning. `"0"` means `24h`. Negative values are rejected. |
 | `token_issuer` | `"sora-mail-api"` | Written into each token's `iss` claim, and required to match when a token is checked. |
 | `allowed_origins` | `[]` | Browser origins allowed by CORS (section 11). Empty: no CORS headers, so browsers block cross-origin calls. |
-| `allowed_hosts` | `[]` (everyone) | Client addresses allowed to connect: IP addresses and CIDR blocks. If any entry is neither, the whole list falls back to exact text comparison, and CIDR entries then never match. |
+| `allowed_hosts` | `[]` (everyone) | Client addresses allowed to connect: IP addresses and CIDR blocks. |
 | `max_connections` | `0` (no limit) | Most concurrent TCP connections. |
 | `tls` | `false` | Serve HTTPS. |
-| `tls_cert_file`, `tls_key_file` | none | Certificate and key for `tls = true`, used when no `[tls]` certificate manager is configured. See [TLS.md](TLS.md). |
+| `tls_cert_file`, `tls_key_file` | none | Certificate and key for `tls = true`, when this listener does not use the `[tls]` certificate manager. Use one source per listener. See [TLS.md](TLS.md). |
 | `tls_default_domain` | none | Certificate name for clients without SNI, with the `[tls]` manager. |
 | `tls_verify` | `false` | Require a client certificate, verified against the system's roots. |
 | `proxy_protocol` | `false` | Expect a PROXY protocol header on each connection, from an address in `[servers] trusted_networks`. The client address in it is then used for `allowed_hosts` and rate limiting. See [PROXY.md](PROXY.md). |
@@ -100,9 +98,9 @@ credential lookup and the password check. Every other login is checked against t
 | `cleanup_interval` | `"5m"` | How often expired entries are removed. |
 | `positive_revalidation_window` | `"30s"` | A cached success is used only while it is younger than this. |
 
-The durations here use Go syntax (no `d`); a value that does not parse means the default. A
-password changed through the Admin API does not clear this cache, so the old password can
-keep working for User API logins for up to `positive_revalidation_window`.
+The durations here take Go units or whole days, like the other durations; a value that does not
+parse means the default. A
+password change drops the account's cached logins.
 
 The HTTP server's limits are fixed: 10 seconds for the request headers, 30 seconds to read
 the request, 30 seconds to write the response (this bounds a `/raw` download), 120 seconds for
@@ -233,9 +231,8 @@ Unknown fields are ignored.
 
 **Mailbox names in paths.** Mailbox names use `/` as the hierarchy separator. In a path you
 can write the separator as it is (`/user/mailboxes/Archive/2024/messages`) or as `%2F`. Encode
-spaces and other special characters with percent-encoding. The server decodes the name
-twice, so a literal `+` must be sent as `%252B` and a literal `%` as `%2525`; a plain `+`
-becomes a space.
+spaces and other special characters with percent-encoding. The name is decoded once:
+`Work%2BPersonal` names `Work+Personal`, and `100%25` names `100%`.
 
 Because the path ends in an operation name, a mailbox whose last level is called `messages`,
 `search`, `subscribe` or `unsubscribe` cannot be deleted through the API, and a top-level
@@ -329,8 +326,8 @@ See [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md).
 ```json
 {
   "mailboxes": [
-    {"name": "INBOX", "path": "INBOX", "subscribed": true, "total": 142, "unseen": 5, "uid_next": 0},
-    {"name": "Archive/2024", "path": "Archive/2024", "subscribed": false, "total": 980, "unseen": 0, "uid_next": 0}
+    {"name": "INBOX", "path": "INBOX", "subscribed": true, "total": 142, "unseen": 5, "uid_next": 3871},
+    {"name": "Archive/2024", "path": "Archive/2024", "subscribed": false, "total": 980, "unseen": 0, "uid_next": 981}
   ],
   "count": 2
 }
@@ -341,7 +338,7 @@ See [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md).
 | `name`, `path` | The full mailbox name; both fields are the same. |
 | `subscribed` | Whether the account is subscribed to it. |
 | `total`, `unseen` | Messages, and messages without `\Seen`. `0` for a shared mailbox the account may see but not read (no `r` right), and `0` when counting fails. |
-| `uid_next` | Always `0`; not filled in. |
+| `uid_next` | The UID the next message added to the mailbox gets, as IMAP reports it in `UIDNEXT`. |
 
 The counts are computed per mailbox on each call, so this request costs more with many
 mailboxes.
@@ -395,17 +392,16 @@ Response `200 {"message":"Mailbox deleted successfully","name":"Projects/Acme"}`
 {"message": "Unsubscribed from mailbox successfully", "name": "Archive/2024", "subscribed": false}
 ```
 
-A mailbox that does not exist gives `500 Failed to subscribe to mailbox` (or
-`... unsubscribe ...`), not `404`.
+A mailbox that does not exist gives `404 Mailbox not found`.
 
 ---
 
 ## 7. Messages
 
 Messages are addressed by their `id`, a number that identifies the message row across the
-whole system. The `id`-based endpoints (7.2 to 7.7) work only on messages in the account's own
-mailboxes. A message in another account's shared mailbox can be listed and searched (with the
-`r` right) but its `id` answers `404`.
+whole system. The `id`-based endpoints (7.2 to 7.7) work on every message the account can list,
+in its own mailboxes and in shared mailboxes, subject to the mailbox's ACL as in IMAP: the `r`
+right to read a message, the write and delete rights to change its flags.
 
 ### 7.1 List a mailbox's messages
 
@@ -474,7 +470,7 @@ upload on another node. The answers:
 |---|---|---|
 | 200 | | The body. |
 | 503, `Retry-After: 5` | `Message body not yet available, retry shortly` | The upload is still pending. |
-| 503, `Retry-After: 30` | `Storage temporarily unavailable, retry later` | S3 did not answer, or this node has no S3 (section 1). |
+| 503, `Retry-After: 30` | `Storage temporarily unavailable, retry later` | S3 did not answer. |
 | 410 | `Message body is no longer available` | The body is gone and is not coming back. |
 | 500 | `Failed to parse message` / `Failed to read message body` | `/body` only: the message could not be parsed. |
 
@@ -542,9 +538,8 @@ Response `200 {"message":"Message marked as deleted successfully","id":98321}`.
 
 Searches one mailbox. A message matches when either is true:
 
-- `q`, lower-cased, appears anywhere in the subject, the address or name of the first `From`
-  entry, the address or name of the first `To` entry, or the address of the first `Cc` entry
-  (later recipients are not searched);
+- `q` appears anywhere in the subject, or in the address or name of any `From`, `To` or `Cc`
+  entry, ignoring case;
 - the body text matches `q` as a full-text query: every word of `q` must occur (words are
   lower-cased but not stemmed, so `running` does not find `run`).
 
@@ -568,7 +563,7 @@ Response `200`:
 
 | Field | Meaning |
 |---|---|
-| `messages` | Up to 100 matches, newest arrival first. Message objects without `cc`, `bcc` and `references`. |
+| `messages` | Up to 100 matches, newest arrival first. Message objects without `bcc` and `references`. |
 | `total` | The number of messages in this response. |
 | `truncated` | `true` when more than 100 messages matched. Narrow the query to reach the others. |
 | `limit` | Always `100`. |
@@ -631,7 +626,10 @@ Response `200`: the stored script, in the shape of 9.2.
 |---|---|
 | 400 | `Invalid script name`, `Script name is required`, `Invalid request body` (also for a body far over the size limit), `Script content is required`, `script name contains invalid characters`, `script name too long (max 128 characters)`, `Script validation failed: ...` |
 | 413 | `Script exceeds maximum size` (over 65536 bytes) |
-| 500 | `Failed to save script` (also when the account already has 100 scripts) |
+| 500 | `Failed to save script` |
+
+A new script on an account that already has 100 is refused with a client error that says the
+limit is reached.
 
 ### 9.4 Delete a script
 
@@ -711,7 +709,7 @@ return messages in this shape:
 | `mailbox_id`, `mailbox_path` | The mailbox it is in. |
 | `subject` | The decoded `Subject`. |
 | `from` | The first `From` address, address only (no display name). |
-| `to`, `cc`, `bcc` | Addresses only. `cc` is filled in lists and in `GET /user/messages/{id}`; `bcc` only in lists; search results have neither. Empty lists are left out (or `null` for `to`). |
+| `to`, `cc`, `bcc` | Addresses only. `cc` is filled in lists, search results and `GET /user/messages/{id}`; `bcc` only in lists. Empty lists are left out (or `null` for `to`). |
 | `date` | The message's `Date` header, as stored. |
 | `internal_date` | When the message arrived in Sora. |
 | `size` | Bytes. |
@@ -738,9 +736,10 @@ API decides with `allowed_origins`:
 
 With any allowed origin, the server also sends `Access-Control-Allow-Methods: GET, POST, PUT,
 PATCH, DELETE, OPTIONS`, `Access-Control-Allow-Headers: Content-Type, Authorization` and
-`Access-Control-Max-Age: 3600`. Every `OPTIONS` request is answered `200` without a token.
-Origins are compared as exact strings, so list the scheme and any port:
-`"https://webmail.example.com:8443"`.
+`Access-Control-Max-Age: 3600`. When `allowed_origins` lists specific origins rather than
+`"*"`, every response also carries `Vary: Origin`, so caches keep the answers for different
+origins apart. Every `OPTIONS` request is answered `200` without a token. Origins are compared
+as exact strings, so list the scheme and any port: `"https://webmail.example.com:8443"`.
 
 Use specific origins in production. With `"*"`, any website a user visits can call the API
 with a token it has obtained.
@@ -774,12 +773,14 @@ remote_use_proxy_protocol = true
    unchanged. A body that names nobody goes to a backend of the default pool (or of
    `remote_addrs`), which answers the malformed request. The backend checks the password; the
    proxy does not.
-2. **Every other request** must carry a valid token. The proxy checks the signature with its
-   own `jwt_secret` and the expiry (not the issuer; the backend checks that), and routes by the
-   token's `email`. A missing or bad token gets `401 Unauthorized` from the proxy.
+2. **Every other request** must carry a valid token, except a CORS preflight (12.3). The proxy
+   checks the signature with its own `jwt_secret` and the expiry (not the issuer; the backend
+   checks that), and routes by the token's `email`. A missing or bad token gets
+   `401 Unauthorized` from the proxy.
 3. The backend is chosen by the lookup cache, then the remote lookup (which only routes here:
-   it does not check passwords), then the user's pool, then affinity (in cluster mode), then a
-   consistent hash of the address. Backends in maintenance are skipped.
+   it does not check passwords), then the user's pool, then affinity (with `enable_affinity =
+   true` and the cluster's affinity store), then a consistent hash of the address. Backends in
+   maintenance are skipped.
 4. With named pools, routing fails closed. A lookup that fails or names no usable route gets
    `503 Service unavailable`, never a backend of another pool, because backends trust the
    token's `account_id` and another pool's backend would read another tenant's account.
@@ -822,10 +823,9 @@ These come from the proxy, as plain text, before any backend is involved:
 
 Errors in JSON come from the backend and are passed through unchanged.
 
-The proxy itself sends no CORS headers. A CORS preflight (`OPTIONS`) to `/user/auth/*` is
-passed to a backend, which answers it; a preflight to any other path carries no token, so the
-proxy answers it `401`. Browser clients on another origin therefore cannot call the
-authenticated endpoints through the proxy.
+A CORS preflight (`OPTIONS`) needs no token, on any path. It is answered with the backend's
+CORS headers, as when the backend is reached directly, so browser clients on another origin can
+call the API through the proxy.
 
 ### 12.4 Proxy configuration
 
@@ -836,7 +836,7 @@ authenticated endpoints through the proxy.
 | `remote_addrs` | none | Backend `host:port` list. Either this or `[[pool]]` blocks are required. |
 | `remote_port` | none | Port for backends listed without one. |
 | `remote_tls` | `false` | Speak HTTPS to the backends. |
-| `remote_tls_verify` | `false` | Verify the backends' certificates (system roots for `remote_addrs`; a pool's `remote_tls_ca_file` for its members). The server-level `remote_tls_ca_file` is not used by this proxy. |
+| `remote_tls_verify` | `false` | Verify the backends' certificates: a pool member against its pool's `remote_tls_ca_file`, any other backend against this block's `remote_tls_ca_file`, or the system roots when that is unset. |
 | `remote_use_proxy_protocol` | `false` | Send a PROXY protocol v2 header to the backends (12.2). |
 | `connect_timeout` | `"30s"` | Time to open a backend connection. |
 | `remote_dns_refresh` | `"5m"` | How often backend host names are resolved again. `"0"` keeps the start-up addresses. |
@@ -847,13 +847,14 @@ authenticated endpoints through the proxy.
 | `proxy_protocol_timeout` | `"5s"` | How long to wait for it. |
 | `tls` | `false` | Serve HTTPS. |
 | `tls_cert_file`, `tls_key_file` | none | Certificate files. Without them, `tls = true` uses the `[tls]` certificate manager, and fails at start-up if there is none. |
-| `tls_verify` | `false` | Require client certificates; applies only with `tls_cert_file`. |
+| `tls_verify` | `false` | Require client certificates. |
 | `tls_default_domain` | none | Certificate name for clients without SNI, with the `[tls]` manager. |
 | `[server.remote_lookup]` | off | Route lookups; see [PROXY.md](PROXY.md). |
 | `[server.lookup_cache]` | off | Caches lookup answers; same keys and defaults as in section 2. |
 
-`allowed_hosts`, `allowed_origins`, `token_duration`, `token_issuer` and `enable_affinity` have
-no effect on this proxy. Affinity is used whenever `[cluster]` is enabled. The proxy's HTTP
+`allowed_hosts`, `token_duration` and `token_issuer` have no effect on this proxy. Affinity is
+used when the block sets `enable_affinity = true` and the cluster runs its affinity store
+(`[cluster.affinity] enabled = true`). The proxy's HTTP
 limits are fixed: 30 seconds to read a request and 30 seconds to write a response, 120 seconds
 for an idle connection.
 

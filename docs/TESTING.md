@@ -79,7 +79,7 @@ The Makefile test targets:
 |---|---|
 | `make tests` | `go test -v ./...`: unit tests and database tests, without the `integration` tag. |
 | `make tests-race` | The same with `-race`. |
-| `make integration-tests` | Every integration target below, one after the other. |
+| `make integration-tests` | Every integration target below, one after the other, and every other package with the `integration` tag. |
 | `make integration-tests-quick` | The same, but the IMAP tests run with `-short` and the slowloris tests are left out. |
 | `make integration-tests-race`, `make integration-tests-quick-race` | The two above with `RACE=1`. |
 | `make integration-tests-<scope>` | One area. The scopes are listed in [section 5.2](#52-the-packages-and-their-make-targets). |
@@ -135,21 +135,10 @@ go test ./db
 go test -run 'TestSearch' -v ./db
 ```
 
-### 4.1 `-short` does not keep `./db` off the database
+Every database test starts with `if testing.Short() { t.Skip(...) }`, so `go test -short ./db`
+skips them and needs no PostgreSQL.
 
-Most `db` tests start with `if testing.Short() { t.Skip(...) }`, so `go test -short ./db` skips
-them. Not all of them do. At least these still connect under `-short`:
-
-- the migration tests in `db/concurrent_migration_test.go`;
-- `TestSearchPerformance` (it only switches to a smaller data set);
-- `TestInsertMessagesBatch_LargeVolume`;
-- `TestAddMessageFlagsBatchEnforcesKeywordLimit` and
-  `TestUpdateMessageFlagsFoldsCaseWithoutKeywordCache`.
-
-So without PostgreSQL, `go test -short ./db` fails. To run only the database-free tests of the
-whole repository, leave `./db` out, as in [section 3](#3-unit-tests).
-
-### 4.2 Integration-tagged files in `db`
+### 4.1 Integration-tagged files in `db`
 
 Four files in `db` carry `//go:build integration`: `cross_account_ownership_test.go`,
 `mailbox_case_test.go`, `mailbox_path_maintenance_test.go` and
@@ -159,7 +148,7 @@ Four files in `db` carry `//go:build integration`: `cross_account_ownership_test
 go test -tags=integration ./db
 ```
 
-No Makefile target runs them.
+`make integration-tests` runs them too.
 
 ---
 
@@ -213,9 +202,9 @@ once. The bcrypt cost is set to the minimum in `common`'s `init`, so logins are 
 | `integration_tests/config` | `integration-tests-config` | Configuration loading and IPv6 proxy addresses. |
 | `integration_tests/relay` | `integration-tests-relay` | The relay client against an in-process SMTP server. Needs no database. |
 | `cmd/sora-admin` | `integration-tests-sora-admin` | `sora-admin` import and export, ACLs, purges, mailbox commands. Uses a database of its own. |
-| `integration_tests/delivery` | none | Delivery paths shared by LMTP and the admin API: Sieve, vacation claims, attachment keywords. |
-| `integration_tests/pools` | none | Starts the real `sora` binary from a config file with `[[pool]]` blocks and checks routing from outside. |
-| `integration_tests/tls` | none | TLS and STARTTLS on the LMTP and ManageSieve proxies. |
+| `integration_tests/delivery` | part of `integration-tests` | Delivery paths shared by LMTP and the admin API: Sieve, vacation claims, attachment keywords. |
+| `integration_tests/pools` | part of `integration-tests` | Starts the real `sora` binary from a config file with `[[pool]]` blocks and checks routing from outside. |
+| `integration_tests/tls` | part of `integration-tests` | TLS and STARTTLS on the LMTP and ManageSieve proxies. |
 
 Every `make integration-tests-<scope>` target except `relay` first runs `make reset-test-db`. The
 three IMAP targets (`imap`, `imap-quick`, `imap-slowloris`) also run `make build-test-sora-admin`.
@@ -228,10 +217,10 @@ go test -v -tags=integration -count=1 -timeout=20m .
 The timeout is 40 minutes with `RACE=1`. The slowloris target uses 25 minutes (35 with
 `RACE=1`).
 
-`make integration-tests` does **not** cover `integration_tests/delivery`, `integration_tests/pools`,
-`integration_tests/tls`, or the integration-tagged files in `db`, `pkg/resilient`, `server`,
+`make integration-tests` also covers `integration_tests/delivery`, `integration_tests/pools`,
+`integration_tests/tls`, and the integration-tagged files in `db`, `pkg/resilient`, `server`,
 `server/lmtp`, `server/lmtpproxy`, `server/proxy` and `tlsmanager`. To run everything with the
-tag:
+tag without `make`:
 
 ```sh
 go test -tags=integration -count=1 -timeout=40m ./...
@@ -298,14 +287,9 @@ SORA_TEST_DB_NAME=sora_test_db_mybranch go test -tags=integration -count=1 ./int
 These read it: the helpers in `integration_tests/common`, the `db` tests, `testutils`, the
 `sora-admin` tests, `pkg/resilient`'s integration tests and `scripts/reset-test-db`.
 
-Two exceptions:
-
-- The integration helpers always connect to `localhost:5432` as `postgres` with no password. Only
-  the database name can change.
-- `TestIMAP_MaildirImport_UIDStability` runs `sora-admin` with `config-test.toml`, which names
-  `sora_test_db`, so it imports into the shared database even when you set
-  `SORA_TEST_DB_NAME`. Under a different database name it fails. The shared-mailbox tests that run
-  `sora-admin` rewrite the database name in a temporary copy of the config and are fine.
+The integration helpers always connect to `localhost:5432` as `postgres` with no password. Only
+the database name can change. The tests that run `sora-admin` write the database name into a
+temporary copy of the config.
 
 ### 6.3 Databases the tests create themselves
 
@@ -326,24 +310,24 @@ role must be allowed to create databases.
 `make reset-test-db` runs [`scripts/reset-test-db`](../scripts/reset-test-db/main.go). It:
 
 1. connects to the test database as `postgres` on `localhost:5432` (Make variables `DB_NAME`,
-   `DB_USER`, `DB_HOST`, `DB_PORT`; `DB_NAME` defaults to `sora_test_db`);
+   `DB_USER`, `DB_HOST`, `DB_PORT`; `DB_NAME` defaults to `SORA_TEST_DB_NAME`, or to
+   `sora_test_db` when that is unset);
 2. terminates every other connection to that database;
 3. drops the `pg_trgm` and `btree_gin` extensions and the `public` schema, and creates an empty
    `public` schema;
-4. if that fails, truncates a fixed list of tables instead.
+4. if that fails, truncates every table in the `public` schema instead.
 
-The next test that connects runs all migrations again. The Makefile hides the script's output and
-ignores its exit status, so a failed reset is silent.
+The next test that connects runs all migrations again. A failed reset fails the make target.
 
 Every `integration-tests-<scope>` target except `relay` runs it first. So `make
 integration-tests-imap` cuts off any other run that is using `sora_test_db` at that moment, on
 your machine or by a colleague sharing the server.
 
-The reset uses `DB_NAME`, not `SORA_TEST_DB_NAME`. If you run a make target with your own
-database, set both, or the shared database is reset while your tests use yours:
+With `SORA_TEST_DB_NAME` set, the reset and the tests use that database, and the shared one is
+left alone:
 
 ```sh
-SORA_TEST_DB_NAME=sora_test_db_mybranch make integration-tests-imap DB_NAME=sora_test_db_mybranch
+SORA_TEST_DB_NAME=sora_test_db_mybranch make integration-tests-imap
 ```
 
 ### 6.5 `config-test.toml`
@@ -359,7 +343,7 @@ also has `[s3]` and `[[server]]` blocks with placeholder values. The integration
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `SORA_TEST_DB_NAME` | most database and integration tests, `scripts/reset-test-db` | The test database name. Default `sora_test_db`. |
+| `SORA_TEST_DB_NAME` | most database and integration tests, `scripts/reset-test-db`, `make reset-test-db` | The test database name. Default `sora_test_db`. |
 | `SKIP_INTEGRATION_TESTS=1` | `common.SkipIfDatabaseUnavailable` | Skips every integration test that calls it. |
 | `SKIP_DB_TESTS=true` | many `cmd/sora-admin` tests | Skips them. |
 | `SORA_ADMIN_BIN` | `common.GetSoraAdminBinary` | Use this `sora-admin` binary instead of building one. |
@@ -595,28 +579,20 @@ database first and disconnects everyone using it. Do not run them while another 
 database. Run the package with `go test` instead, or use your own database
 ([section 6.4](#64-make-reset-test-db)).
 
-### 12.5 Tests that run `sora-admin` and a different database
+### 12.5 Leftovers from earlier runs
 
-`TestIMAP_MaildirImport_UIDStability` always uses `sora_test_db` through `config-test.toml`. With
-`SORA_TEST_DB_NAME` set to anything else it fails, because the server under test and the
-`sora-admin` subprocess look at different databases.
-
-### 12.6 Leftovers from earlier runs
-
-Nothing cleans the shared database between runs. Some tests create accounts with fixed addresses
-and do not delete them, so a second run against the same database can fail with
-`account already exists`. A test that queries the whole database with a limit can also stop
-seeing its own rows once many leftover rows exist. When a test fails only on a database that has
-seen many runs, try it on a fresh one before you look for a regression:
+Nothing cleans the shared database between runs. A test that queries the whole database with a
+limit can stop seeing its own rows once many leftover rows exist. When a test fails only on a
+database that has seen many runs, try it on a fresh one before you look for a regression:
 `make reset-test-db`, or a new `SORA_TEST_DB_NAME`.
 
-### 12.7 Your local `config.toml` is a test input
+### 12.6 Your local `config.toml` is a test input
 
 `TestConfigLoading` in `integration_tests/config` loads `config.toml` from the repository root if
 it exists, and fails if it does not parse. The file is ignored by git, so this test can fail on
 your machine and nowhere else.
 
-### 12.8 Timing-sensitive tests on a loaded machine
+### 12.7 Timing-sensitive tests on a loaded machine
 
 Some tests wait for timeouts or measure throughput. Under the race detector or a busy CPU they
 can fail where they pass alone. Rerun the single test with `-count=1 -run '^Name$'` before you

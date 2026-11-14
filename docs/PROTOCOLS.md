@@ -96,18 +96,18 @@ addr = "10.0.0.20:24"
   on the node.
 - `addr` is the listen address, `host:port` or `:port`. It must be unique on the node.
 
-A block that lacks any of `type`, `name` or `addr` is skipped without an error
-([config/config.go](../config/config.go), `IsEnabled`). A block with an unknown `type`, a duplicate
-`name` or a duplicate `addr` stops startup. You may define several blocks of the same type, for
-example one IMAP server with implicit TLS on 993 and one with STARTTLS on 143.
+A block with an unknown `type`, a duplicate `name` or a duplicate `addr` stops startup. You may
+define several blocks of the same type, for example one IMAP server with implicit TLS on 993 and
+one with STARTTLS on 143.
 
-Keys that belong to another server type do not stop startup. For some combinations Sora logs a
+Keys that belong to another server type do not stop startup. Sora logs a
 `WARNING: Server <name> (type: <type>) has '<key>' configured, but this only applies to ...`
-line at startup; others are ignored silently. Section 10 lists which keys each type reads.
+line at startup for each of them. Section 10 lists which keys each type reads.
 
 ### `[servers] trusted_networks`
 
 `trusted_networks` is a list of CIDR blocks (a bare address also works). It is empty by default.
+An entry that is neither stops startup.
 It answers one question: which peers may tell Sora the real client address. On a backend it
 controls:
 
@@ -139,10 +139,9 @@ A listener is in one of three modes:
 | `true` | `true` | Plaintext port that offers STARTTLS (STLS for POP3). |
 
 `tls_use_starttls = true` without `tls = true` is ignored, with a startup warning. The certificate
-comes either from the global `[tls]` section or from `tls_cert_file` and `tls_key_file`; IMAP and
-POP3 prefer the global `[tls]` certificate when both exist, while LMTP and ManageSieve prefer the
-per-server files. `tls_verify` does not request client certificates on any of these servers. All
-TLS details are in [TLS.md](TLS.md).
+comes either from the global `[tls]` section or from `tls_cert_file` and `tls_key_file`; use one
+of the two per listener. `tls_verify = true` requires a client certificate, which mail clients do
+not send, so leave it off on these servers. All TLS details are in [TLS.md](TLS.md).
 
 On IMAP, POP3 and ManageSieve plaintext ports without the PROXY protocol, Sora watches the first
 bytes from the client. If they are a TLS ClientHello (a client set to TLS but pointed at the
@@ -189,8 +188,8 @@ The PROXY protocol and how Sora's own proxies use it are described in [PROXY.md]
 | Key | Default | Applies to | Effect |
 |---|---|---|---|
 | `max_connections` | `0` (no limit); LMTP: `1000` | all four | Open connections on this listener. |
-| `max_connections_per_ip` | `0` (no limit) | IMAP, POP3, ManageSieve | Open connections from one address. Peers in `trusted_networks` are exempt. LMTP ignores the key. |
-| `max_connections_per_user` | `0` (no limit) | IMAP (enforced), POP3 and ManageSieve (counted only) | Logged-in sessions of one account on this server. |
+| `max_connections_per_ip` | `0` (no limit) | IMAP, POP3, ManageSieve | Open connections from one address. Peers in `trusted_networks` are exempt. |
+| `max_connections_per_user` | `0` (no limit) | IMAP, POP3, ManageSieve | Logged-in sessions of one account on this server. |
 | `max_connections_per_user_per_ip` | `0` (no limit) | as above | Logged-in sessions of one account from one address on this server. |
 | `listen_backlog` | `1024` when `0` | all four | Kernel accept queue length. |
 
@@ -198,12 +197,12 @@ A connection over `max_connections` or `max_connections_per_ip` is closed at onc
 greeting. On IMAP, a connection from an address that the auth rate limiter has blocked is closed
 the same way.
 
-The per-user limits on a backend count sessions on that one server block only. On IMAP, a login
-over the limit is answered `NO [LIMIT] Maximum connections reached` and the session stays
-unauthenticated. On POP3 and ManageSieve, Sora logs `rejected connection registration` and lets
-the login proceed. The per-user-per-IP count uses the address of the socket peer, so behind a proxy
-it counts per proxy, not per client. Cluster-wide per-user limits are enforced by the proxies; see
-[PROXY.md](PROXY.md) and [CLUSTER.md](CLUSTER.md).
+The per-user limits on a backend count sessions on that one server block only. A login over the
+limit is refused and the session stays unauthenticated: IMAP answers
+`NO [LIMIT] Maximum connections reached`, and POP3 and ManageSieve answer with a temporary error
+(`-ERR [SYS/TEMP]` and `NO (TRYLATER)`). On IMAP, the per-user-per-IP count uses the client's real
+address, as learned from the PROXY header or from ID forwarding. Cluster-wide per-user limits are
+enforced by the proxies; see [PROXY.md](PROXY.md) and [CLUSTER.md](CLUSTER.md).
 
 For the first 30 seconds after an IMAP, POP3 or ManageSieve listener starts, it accepts at most one
 connection every 5 milliseconds. This spreads the reconnect wave after a restart. It is fixed.
@@ -246,25 +245,25 @@ protocol.
 
 ### Idle and session timeouts
 
-| Key | IMAP | POP3 | ManageSieve | LMTP |
-|---|---|---|---|---|
-| `timeouts.command_timeout` | `30m` | `10m` | `3m` | not read (fixed 5m) |
-| `auth_idle_timeout` | no effect (fixed 30s, see below) | `2m` | `2m` | not read |
-| `timeouts.absolute_session_timeout` | `24h` | `24h` | `24h` | not read |
-| `timeouts.min_bytes_per_minute` | `0` (off) | `0` (off) | `0` (off) | not read |
+| Key | IMAP | POP3 | ManageSieve |
+|---|---|---|---|
+| `timeouts.command_timeout` | `30m` | `10m` | `3m` |
+| `auth_idle_timeout` | `2m` | `2m` | `2m` |
+| `timeouts.absolute_session_timeout` | `24h` | `24h` | `24h` |
+| `timeouts.min_bytes_per_minute` | `0` (off) | `0` (off) | `0` (off) |
+
+LMTP timeouts are in section 8.8.
 
 Notes:
 
 - `command_timeout` is an idle timeout, despite its name. The IMAP default follows the 30-minute
   autologout floor of RFC 3501 §5.4, and the POP3 default the 10-minute floor of RFC 1939 §3.
-- On IMAP, the go-imap library also sets its own read deadlines: 30 seconds while waiting for a
-  command before login, and 35 minutes after login. These are fixed. A client that sends nothing
-  for 30 seconds before logging in is disconnected, so `auth_idle_timeout` has no visible effect on
-  IMAP. A `command_timeout` of 35 minutes or more is capped by the library's 35 minutes, which
+- On IMAP, the go-imap library also sets its own read deadline of 35 minutes after login. It is
+  fixed. A `command_timeout` of 35 minutes or more is capped by the library's 35 minutes, which
   closes the connection without a BYE; Sora logs a warning at startup for such a value.
-- `auth_idle_timeout` is a top-level key of the `[[server]]` block, not part of `timeouts`. On POP3
-  and ManageSieve it replaces `command_timeout` until the client logs in, and also bounds a SASL
-  continuation and the STARTTLS handshake.
+- `auth_idle_timeout` is a top-level key of the `[[server]]` block, not part of `timeouts`. It
+  replaces `command_timeout` until the client logs in. On POP3 and ManageSieve it also bounds a
+  SASL continuation and the STARTTLS handshake.
 - `absolute_session_timeout = "0"` removes the session limit.
 - `min_bytes_per_minute` works in one-minute windows and starts two minutes after the connection
   opens. A window counts as stalled when the client sent some bytes, fewer than the threshold, and
@@ -280,7 +279,6 @@ What the client sees when a timeout fires:
 | IMAP | `* BYE [UNAVAILABLE] Idle timeout, please reconnect` | `* BYE [UNAVAILABLE] Maximum session duration exceeded, please reconnect` | `* BYE [UNAVAILABLE] Connection too slow, please reconnect` |
 | POP3 | `-ERR Idle timeout, connection timed out` | `-ERR [IN-USE] Maximum session duration exceeded` | `-ERR [IN-USE] Connection too slow, please reconnect` |
 | ManageSieve | `BYE (TRYLATER) "Connection timed out due to inactivity, please reconnect"` | `BYE (TRYLATER) "Maximum session duration exceeded, please reconnect"` | `BYE (TRYLATER) "Connection too slow, please reconnect"` |
-| LMTP | `421 4.4.2 Idle timeout, bye bye` | none | none |
 
 Every timeout close is counted in `sora_connection_timeouts_total{protocol, server_name, hostname,
 reason}` with `reason` one of `idle`, `session_max` or `slow_throughput`.
@@ -581,11 +579,11 @@ timeouts.imap_command_timeouts.fetch = "10m"
 
 These come from `github.com/migadu/go-imap` and cannot be configured:
 
-- Before login, a client must send a command within 30 seconds; after login the library allows 35
-  minutes between commands.
+- After login the library allows 35 minutes between commands.
 - One command may be up to 50 KiB, not counting its literals.
-- A literal in any command other than APPEND is limited to 4096 bytes:
-  `NO [TOOBIG] Literals are limited to 4096 bytes for this command`.
+- A literal in any command other than APPEND and SETMETADATA is limited to 4096 bytes:
+  `NO [TOOBIG] Literals are limited to 4096 bytes for this command`. A SETMETADATA value may be as
+  large as the `[metadata]` entry size limit (section 5.9).
 - Before login, a non-synchronising literal (`{n+}`) over 4096 bytes is refused with
   `BAD Non-synchronizing literals are limited to 4096 bytes`.
 
@@ -624,9 +622,9 @@ Rules:
   (logged at debug level).
 - `IMAP4rev2` includes `NAMESPACE`, `UNSELECT`, `UIDPLUS`, `ESEARCH`, `SEARCHRES`, `ENABLE`,
   `IDLE`, `SASL-IR`, `LIST-EXTENDED`, `LIST-STATUS`, `MOVE`, `LITERAL-`, `STATUS=SIZE` and
-  `CHILDREN`. While `IMAP4rev2` stays advertised, the server keeps offering all of them, even if you
-  list one in `disabled_caps`. To remove one of these with `disabled_caps`, list `IMAP4rev2` as well.
-  (`client_filters` does this for you; see below.)
+  `CHILDREN`. Removing one of these with `disabled_caps` also removes `IMAP4rev2`, so clients fall
+  back to IMAP4rev1 and really lose the extension, and Sora logs it. `client_filters` follows the
+  same rule (see below).
 - `SASL-IR`, `STARTTLS`, `LOGINDISABLED`, `AUTH=PLAIN`, `UNSELECT`, `ENABLE`, `UTF8=ACCEPT`,
   `LIST-EXTENDED`, `ACL`, `RIGHTS=` and `APPENDLIMIT=` cannot be removed this way. The first four
   follow `tls`, `tls_use_starttls` and `insecure_auth`.
@@ -702,7 +700,7 @@ When filters apply:
 - A name and version match applies when the client sends `ID`. Clients usually send `ID` early,
   but anything they learned from an earlier `CAPABILITY` stays in their memory.
 
-Unlike `disabled_caps`, a filter that removes a capability included in `IMAP4rev2` also removes
+As with `disabled_caps`, a filter that removes a capability included in `IMAP4rev2` also removes
 `IMAP4rev2` for that session, so the client falls back to IMAP4rev1 and really loses the
 extension. The same list of removable names applies as for `disabled_caps`. When a filter changes
 the list, the session logs `capability filters applied` with the client and the removed names.
@@ -843,7 +841,7 @@ name. `HELO` and `EHLO` get `500 5.5.1 This is a LMTP server, use LHLO`. `LHLO` 
 | `PIPELINING`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `CHUNKING` | Always. |
 | `STARTTLS` | With `tls = true` and `tls_use_starttls = true`, before the upgrade. |
 | `SMTPUTF8` | Always. |
-| `SIZE` | Always, without a number. |
+| `SIZE <bytes>` | Always, with `max_message_size` in bytes (for example `SIZE 52428800`). |
 | `LIMITS RCPTMAX=1` | Always. |
 | `XCLIENT ADDR PORT PROTO HELO LOGIN NAME` | Only to peers in `[servers] trusted_networks`. |
 
@@ -868,11 +866,11 @@ There is no `AUTH`, `DSN` or `BINARYMIME`.
 
 ### 8.4 Message size
 
-`max_message_size` (default `50mb`) is enforced while the message is read. A larger message gets
-`552 5.3.4 message size exceeds maximum allowed size of <n> bytes` after the data. The `SIZE=`
-parameter of `MAIL` is not compared with the limit. `max_message_size = "0"` means the default
-50 MiB, not unlimited. An empty message gets
-`550 5.6.0 empty message rejected: a message must contain at least headers`.
+`max_message_size` (default `50mb`) is advertised in `LHLO` and enforced twice. A `MAIL` command
+whose `SIZE=` parameter is above the limit gets `552 5.3.4` at once. A message that turns out
+larger while it is read gets `552 5.3.4 message size exceeds maximum allowed size of <n> bytes`
+after the data. `max_message_size = "0"` means the default 50 MiB, not unlimited. An empty message
+gets `550 5.6.0 empty message rejected: a message must contain at least headers`.
 
 ### 8.5 Delivery
 
@@ -942,22 +940,18 @@ is not advertised and gets `550 5.7.1 XCLIENT denied`. The LMTP proxy uses XCLIE
 
 | Setting | Value | Notes |
 |---|---|---|
-| Idle timeout | 5 minutes, fixed | `421 4.4.2 Idle timeout, bye bye`. `timeouts.command_timeout` is not read. |
+| Idle timeout | 5 minutes | Applies to each read, between commands and while message data arrives. `421 4.4.2 Idle timeout, bye bye`. |
 | Write timeout | 2 minutes, fixed | |
 | `timeouts.lmtp_command_timeouts.rcpt` | `10s` | Account lookup and mailbox creation at RCPT. `"0"` turns it off. |
 | `timeouts.lmtp_command_timeouts.data` | `60s` | The work after the data has arrived: Sieve, spool, database. Not the transfer itself. `"0"` turns it off. |
 | Command line length | 2000 bytes, fixed | `500 5.4.0 Too long line, closing connection`. |
 | Protocol errors | 3, fixed | After more, `500 5.5.1 Too many errors. Quiting now`. |
 
-The go-smtp library sets its read deadline each time it reads a command line, and does not renew it
-while it reads message data. So the whole message must arrive within 5 minutes of the moment the
-server started waiting for the `DATA` command. For a 50 MiB message (the default limit) that needs
-about 175 KB/s. A transfer that takes longer fails with `421 4.4.2 Error reading message data`, and
-the MTA retries.
+The idle timeout applies to each read, so a large message from an MTA that keeps sending is
+transferred however long it takes as a whole.
 
-The LMTP server does not read `timeouts.absolute_session_timeout`, `timeouts.min_bytes_per_minute`,
-`auth_idle_timeout`, `limits.session_memory_limit`, `max_connections_per_ip`, the per-user
-connection limits, `auth_rate_limit`, `lookup_cache` or the master credentials.
+LMTP has no login, so the LMTP server does not read `auth_rate_limit`, `lookup_cache` or the master
+credentials.
 
 ---
 
@@ -992,9 +986,6 @@ OK "Sora" ManageSieve server ready.
 - `MAXSCRIPTSIZE` is `max_script_size` in bytes (16384 by default).
 - `UNAUTHENTICATE`, `NOTIFY`, `MAXREDIRECTS`, `LANGUAGE` and `OWNER` are not advertised.
 
-The `supported_extensions` key on a `managesieve` server block is not read. Use
-`[sieve] enabled_extensions`.
-
 ### 9.2 Commands
 
 `CAPABILITY`, `STARTTLS`, `AUTHENTICATE` (PLAIN only), `NOOP`, `LOGOUT`, `LISTSCRIPTS`, `GETSCRIPT`,
@@ -1020,7 +1011,7 @@ Behaviour:
 
 ### 9.3 Login and errors
 
-- A failed login gets `NO Authentication failed`.
+- A failed login gets `NO "Authentication failed"`.
 - After 10 errors (failed logins included) the server sends
   `BYE "Too many errors, closing connection"`. This is fixed, and `limits.max_auth_errors` does not
   apply.
@@ -1040,8 +1031,7 @@ of time usually gets `NO (TRYLATER) "Service temporarily unavailable"`.
 ## 10. Server block key reference
 
 This section lists every key the four backend types read. Durations accept Go syntax (`30s`, `5m`,
-`1h30m`) or a whole number of days on its own (`7d`); the keys inside `lookup_cache` take Go syntax
-only. Sizes accept `b`, `kb`, `mb` and `gb` with binary multiples (`25mb` is 26214400 bytes), or a
+`1h30m`) or a whole number of days on its own (`7d`). Sizes accept `b`, `kb`, `mb` and `gb` with binary multiples (`25mb` is 26214400 bytes), or a
 plain number of bytes.
 
 ### 10.1 Identity and logging
@@ -1061,7 +1051,7 @@ plain number of bytes.
 | `tls_use_starttls` | bool | `false` | all | With `tls = true`: plaintext port offering STARTTLS. |
 | `tls_cert_file` | path | none | all | Certificate chain (PEM) when not using global `[tls]`. |
 | `tls_key_file` | path | none | all | Private key (PEM). |
-| `tls_verify` | bool | `false` | all | No effect: client certificates are never requested. |
+| `tls_verify` | bool | `false` | all | Require a client certificate. Mail clients send none; leave it off. |
 | `tls_default_domain` | string | none | all | Certificate name for clients that send no SNI, with global `[tls]`. |
 
 Details in [TLS.md](TLS.md).
@@ -1074,7 +1064,7 @@ Details in [TLS.md](TLS.md).
 | `proxy_protocol_timeout` | duration | `5s` | all | Wait for the PROXY header. |
 | `max_connections` | int | `0` = no limit (LMTP: `1000`) | all | Section 3. |
 | `max_connections_per_ip` | int | `0` = no limit | IMAP, POP3, ManageSieve | Section 3. |
-| `max_connections_per_user` | int | `0` = no limit | IMAP (enforced), POP3, ManageSieve (counted) | Section 3. |
+| `max_connections_per_user` | int | `0` = no limit | IMAP, POP3, ManageSieve | Section 3. |
 | `max_connections_per_user_per_ip` | int | `0` = no limit | as above | Section 3. |
 | `listen_backlog` | int | `1024` when `0` | all | Kernel accept queue. |
 
@@ -1094,10 +1084,10 @@ Details in [TLS.md](TLS.md).
 How these work is in [AUTHENTICATION.md](AUTHENTICATION.md). Two points matter for the server
 block:
 
-- `lookup_cache` is on when the table is absent, with `positive_ttl = "5m"`, `negative_ttl = "1m"`,
-  `max_size = 10000`, `cleanup_interval = "5m"` and `positive_revalidation_window = "30s"`. If you
-  set any `lookup_cache` key, also set `lookup_cache.enabled = true`: without it the cache is off.
-  Keys left out of the table get the defaults above.
+- `lookup_cache` is on by default, with `positive_ttl = "5m"`, `negative_ttl = "1m"`,
+  `max_size = 10000`, `cleanup_interval = "5m"` and `positive_revalidation_window = "30s"`. Keys
+  left out of the table keep these defaults, and the cache stays on unless the table says
+  `enabled = false`.
 - `auth_rate_limit` is off unless `auth_rate_limit.enabled = true`. Its other keys then default to
   the values in [AUTHENTICATION.md](AUTHENTICATION.md).
 
@@ -1105,7 +1095,7 @@ block:
 
 | Key | Type | Default | Read by |
 |---|---|---|---|
-| `auth_idle_timeout` | duration | `2m` | POP3, ManageSieve (IMAP: no effect) |
+| `auth_idle_timeout` | duration | `2m` | IMAP, POP3, ManageSieve |
 | `timeouts.command_timeout` | duration | IMAP `30m`, POP3 `10m`, ManageSieve `3m` | IMAP, POP3, ManageSieve |
 | `timeouts.absolute_session_timeout` | duration | `24h` (`0`: none) | IMAP, POP3, ManageSieve |
 | `timeouts.min_bytes_per_minute` | int | `0` (off) | IMAP, POP3, ManageSieve |
@@ -1113,9 +1103,8 @@ block:
 | `timeouts.pop3_command_timeouts.*` | duration | section 7.6 | POP3 |
 | `timeouts.managesieve_command_timeouts.*` | duration | section 9.4 | ManageSieve |
 | `timeouts.lmtp_command_timeouts.rcpt`, `.data` | duration | `10s`, `60s` | LMTP |
-| `timeouts.scheduler_shard_count` | int | | Not read. Use `[timeout_scheduler] shard_count` ([CONFIGURATION.md](CONFIGURATION.md)). |
 
-Section 4 explains each one.
+Section 4 explains each one; the LMTP timeouts are in section 8.8.
 
 ### 10.6 Limits
 
@@ -1147,7 +1136,6 @@ Section 4 explains each one.
 | `id_name`, `id_version`, `id_vendor`, `id_support_url` | string | section 5.11 | IMAP | `ID` reply fields. |
 | `max_message_size` | size | `50mb` | LMTP | Largest message delivered. `0` also means 50 MiB. |
 | `max_script_size` | size | `16kb` | ManageSieve | Largest Sieve script. |
-| `supported_extensions` | list | none | none | Not read on `managesieve`; see section 9.1. |
 
 Global settings these servers also read: `[servers] trusted_networks` (section 2),
 `[tls]` ([TLS.md](TLS.md)), `[sieve]` ([SIEVE.md](SIEVE.md)), `[metadata]` and `[local_cache]`
@@ -1194,7 +1182,7 @@ Log lines worth knowing:
 |---|---|
 | `Connection closed - timeout` | Sora's own timeout checker closed a connection (every IMAP timeout, and the throughput check on POP3 and ManageSieve); the `reason` field says which. |
 | `capability filters applied` | A client filter removed capabilities for a session. |
-| `connection registration rejected` / `rejected connection registration` | A per-user connection limit was reached (IMAP refuses the login; POP3 and ManageSieve only log). |
+| `connection registration rejected` / `rejected connection registration` | A per-user connection limit was reached and the login was refused. |
 | `login refused: this backend is in maintenance` | The maintenance gate refused an IMAP login. |
 | `connection rejected - not from trusted network` | An LMTP peer outside the admitted networks. |
 | `IMAP: command_timeout is at or above the protocol library's 35m read deadline; ...` | `command_timeout` is too long to take effect. |

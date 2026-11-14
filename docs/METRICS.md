@@ -7,8 +7,7 @@ worth alerting on.
 
 It is for operators who build dashboards and alerts, and for contributors who add a metric. Every
 metric here was found in the code: the definitions are in [pkg/metrics/](../pkg/metrics/) and one in
-[db/db.go](../db/db.go). The counts in older documents are out of date: Sora registers 123 metrics
-of its own.
+[db/db.go](../db/db.go).
 
 ## Contents
 
@@ -41,14 +40,14 @@ api_key = "a-long-random-token"   # optional bearer token
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `addr` | string | required | Listen address. |
-| `path` | string | none | URL path, such as `"/metrics"`. Set it: without it the process stops with a panic (`http: invalid pattern`) as the server starts. Only this exact path serves metrics. |
+| `path` | string | — | URL path, such as `"/metrics"`. Only this exact path serves metrics. |
 | `allowed_hosts` | list of strings | empty (any host) | IP addresses or CIDR blocks allowed to scrape. Other peers get `403 forbidden`. |
 | `api_key` | string | none | When set, every request needs `Authorization: Bearer <key>`. Without the header the answer is `401 unauthorized`; with a wrong key, `403 forbidden`. |
-| `enable_domain_metrics` | bool | `false` | Count activity per mail domain (see [3.18](#318-domain-and-user-metrics)). |
+| `enable_domain_metrics` | bool | `true` | Count activity per mail domain (see [3.18](#318-domain-and-user-metrics)). |
 | `enable_user_metrics` | bool | `false` | Give heavy users their own series (see [3.18](#318-domain-and-user-metrics)). |
-| `user_metrics_threshold` | integer | `0` | Commands plus connections after which a user gets its own series. |
-| `max_tracked_users` | integer | `0` | How many users may get their own series. With `0`, none do. |
-| `hash_usernames` | bool | `false` | Put a 16-character SHA-256 prefix of the user name in labels instead of the name. |
+| `user_metrics_threshold` | integer | `1000` | Commands plus connections after which a user gets its own series. |
+| `max_tracked_users` | integer | `1000` | How many users may get their own series. |
+| `hash_usernames` | bool | `true` | Put a 16-character SHA-256 prefix of the user name in labels instead of the name. |
 
 How access control works ([cmd/sora/metrics_access.go](../cmd/sora/metrics_access.go)):
 
@@ -63,8 +62,8 @@ The endpoint always speaks plain HTTP. A `tls = true` in the block is ignored wi
 warning. If the token has to cross a network you do not trust, put a TLS-terminating proxy in front.
 
 Treat the endpoint as sensitive. With domain metrics on, it shows which domains are active. With
-user metrics on, it can show user names, and with `hash_usernames = false` (the default) it shows
-them in clear text.
+user metrics on, it can show user names, and with `hash_usernames = false` it shows them in clear
+text.
 
 The five `enable_*`, `user_metrics_threshold`, `max_tracked_users` and `hash_usernames` settings
 apply to the whole process. With several `metrics` blocks, the last one in the file wins.
@@ -110,8 +109,7 @@ Scrape every node: each node counts only its own work.
     proxy routing metrics use the backend protocol (`imap`, `pop3`, ...); some use capitals (see
     each table).
   - `server_name` is the `name` of the `[[server]]` block.
-  - `hostname` is the node's host name. It is empty on the health metrics and on the
-    `userapi_proxy` connection metrics.
+  - `hostname` is the node's host name. It is empty on the `userapi_proxy` connection metrics.
   - `role` is `read` or `write`, for the two database pools.
 
 Types: a **counter** only goes up (use `rate()` or `increase()`), a **gauge** goes up and down, a
@@ -135,22 +133,21 @@ Types: a **counter** only goes up (use `rate()` or `increase()`), a **gauge** go
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `sora_authentication_attempts_total` | counter | `protocol`, `server_name`, `hostname`, `result` | Login attempts. `result`: `success`, `failure`; `rate_limited` on `pop3`; `unavailable` on the IMAP, POP3 and ManageSieve proxies (the remote lookup service was temporarily unavailable). The `pop3` backend records no `success`. |
+| `sora_authentication_attempts_total` | counter | `protocol`, `server_name`, `hostname`, `result` | Login attempts. `result`: `success`, `failure`; `rate_limited` on `pop3`; `unavailable` on the IMAP, POP3 and ManageSieve proxies (the remote lookup service was temporarily unavailable). |
 | `sora_password_verification_attempts_total` | counter | `hash_type`, `result` | Password hash checks. `hash_type`: `bcrypt`, `blf_crypt`, `ssha512`, `sha512`, `unknown`. `result`: `success`, `failure`. |
 | `sora_auth_rate_limiter_ip_username_entries` | gauge | `protocol`, `server_name`, `hostname` | Tracked IP-and-user pairs in the login rate limiter. `protocol` here: `IMAP`, `POP3`, `ManageSieve`, `IMAP-PROXY`, `POP3-PROXY`, `SIEVE-PROXY`, `user-api`. |
 | `sora_auth_rate_limiter_ip_entries` | gauge | same | Tracked IPs with failures. |
 | `sora_auth_rate_limiter_username_entries` | gauge | same | Tracked user names with failures. |
 | `sora_auth_rate_limiter_blocked_ips` | gauge | same | IPs blocked now. |
-| `sora_auth_delay_queue_depth` | gauge | `protocol`, `ip` | Logins from one IP waiting in a progressive delay now. |
-| `sora_auth_delay_rejections_total` | counter | `protocol`, `ip` | Logins refused because too many from that IP were already waiting. |
-| `sora_auth_delay_completed_total` | counter | `protocol`, `ip` | Delays that ran to the end. |
-| `sora_auth_delay_cancelled_total` | counter | `protocol`, `ip` | Delays cut short, for example by a disconnect. |
+| `sora_auth_delay_queue_depth` | gauge | `protocol` | Logins waiting in a progressive delay now. |
+| `sora_auth_delay_rejections_total` | counter | `protocol` | Logins refused because too many from the same IP were already waiting. |
+| `sora_auth_delay_completed_total` | counter | `protocol` | Delays that ran to the end. |
+| `sora_auth_delay_cancelled_total` | counter | `protocol` | Delays cut short, for example by a disconnect. |
 
-The `sora_auth_delay_*` metrics carry the client IP as a label and only exist while
-`[server.auth_rate_limit]` is enabled. During an attack from many addresses they create one series
-per address, which stays until Sora restarts. Their `protocol` values name the login path, such as
-`IMAP-LOGIN`, `IMAP-SASL`, `IMAP-PROXY`, `POP3-PROXY`, `MANAGESIEVE-LOGIN`, `MANAGESIEVE-PROXY` or
-`USER-API-LOGIN`. See [AUTHENTICATION.md](AUTHENTICATION.md).
+The `sora_auth_delay_*` metrics only exist while `[server.auth_rate_limit]` is enabled. Their
+`protocol` values name the login path, such as `IMAP-LOGIN`, `IMAP-SASL`, `IMAP-PROXY`,
+`POP3-PROXY`, `MANAGESIEVE-LOGIN`, `MANAGESIEVE-PROXY` or `USER-API-LOGIN`. Per-address detail is in
+the log and in `GET /admin/auth/blocked`. See [AUTHENTICATION.md](AUTHENTICATION.md).
 
 ### 3.3 Commands and protocol errors
 
@@ -175,7 +172,6 @@ Each counted IMAP error is also logged at WARN as `protocol error` with the same
 | `sora_messages_throughput_total` | counter | `protocol`, `operation`, `status` | Messages handled. `imap`: `fetched`, `appended`. `pop3`: `retrieved`, `deleted`. `lmtp` and `http_delivery` (the admin API's delivery endpoint): `received`, `delivered`. `status` is `success`, and for LMTP deliveries also `failure`, `timeout`, `shutdown`. |
 | `sora_bytes_throughput_total` | counter | `protocol`, `direction` | Bytes moved. `direction`: `in`, `out`. Counted by `pop3`, `lmtp`, `http_delivery` and the four proxies. |
 | `sora_message_size_bytes` | histogram | `protocol` | Size of delivered messages, for `lmtp` and `http_delivery`. Buckets from 1 KB to 100 MB. |
-| `sora_message_age_at_fetch_seconds` | histogram | none | Never updated (see [3.20](#320-metrics-that-are-never-updated)). |
 
 ### 3.5 IMAP
 
@@ -220,8 +216,6 @@ See [RELAY.md](RELAY.md) and [SIEVE.md](SIEVE.md).
 | `sora_proxy_pool_route_total` | counter | `protocol`, `pool`, `result` | Routing into named pools. `protocol` adds `userapi`. `pool` is the pool name, or `unknown` for a name the proxy does not have. `result`: `routed`, `unknown_pool`, `no_default`, `ambiguous_pool`. |
 | `sora_remote_lookup_result_total` | counter | `protocol`, `result` | Remote lookup outcomes: `success`, `user_not_found_fallback` (tried the local database), `user_not_found_rejected`, on LMTP `user_not_found_reject` or `user_not_found_tempfail`, `transient_error_rejected`, `shutdown`. |
 | `sora_remote_lookup_duration_seconds` | histogram | `protocol`, `result` | Time of a remote lookup call. Recorded by the LMTP proxy only. `result`: `success`, `user_not_found`, `transient_error`, `shutdown`. Buckets from 1 ms to 5 s. |
-| `sora_proxy_requests_forwarded_total` | counter | `protocol`, `result` | Never updated. |
-| `sora_proxy_backend_latency_seconds` | histogram | `protocol` | Never updated. |
 
 See [PROXY.md](PROXY.md).
 
@@ -264,9 +258,8 @@ See [CLUSTER.md](CLUSTER.md).
 | `sora_message_fetch_chunks` | histogram | `type` | Chunks per chunked read. |
 | `sora_large_body_storage_skipped_total` | counter | none | Message texts cut to 64 KB before full-text indexing because they were larger. |
 | `sora_go_mailbox_lock_wait_seconds` | histogram | none | Time a message insert waited for Sora's in-memory per-mailbox lock before taking a database connection. |
-| `sora_mailbox_lock_duration_seconds` | histogram | `protocol`, `lock_type`, `result` | Time to take a session's internal lock. `protocol`: `IMAP`, `POP3`, `LMTP`, `MANAGESIEVE`. `lock_type`: `read`, `write`. `result`: `success`, `timeout`. |
+| `sora_mailbox_lock_duration_seconds` | histogram | `protocol`, `lock_type`, `result` | Time to take a session's internal lock. `protocol`: `imap`, `pop3`, `lmtp`, `managesieve`. `lock_type`: `read`, `write`. `result`: `success`, `timeout`. |
 | `sora_mailbox_lock_timeouts_total` | counter | `protocol`, `lock_type` | Times that lock could not be taken in time. |
-| `sora_db_circuit_breaker_state`, `sora_db_circuit_breaker_failures_total`, `sora_db_connection_acquire_timeout_total`, `sora_db_connection_pool_wait_seconds`, `sora_db_connection_pool_exhausted_total`, `sora_mailbox_lock_wait_seconds` | various | various | Never updated. |
 
 See [DATABASE.md](DATABASE.md).
 
@@ -278,7 +271,6 @@ See [DATABASE.md](DATABASE.md).
 | `sora_s3_operation_duration_seconds` | histogram | `operation` | Time of each S3 attempt (`GET`, `PUT`, `DELETE`, `DELETE_BULK`). Buckets from 10 ms to 10 s. |
 | `sora_s3_upload_attempts_total` | counter | `result` | Upload attempts by the uploader. `result`: `success`, `failure`. |
 | `sora_storage_errors_total` | counter | `operation`, `error_type` | Failed S3 PUT attempts by cause: `timeout`, `canceled`, `access_denied`, `not_found`, `throttled`, `network_error`, `encryption_error`, `unknown`. |
-| `sora_storage_retries_total` | counter | `operation` | Never updated. |
 
 See [STORAGE.md](STORAGE.md).
 
@@ -286,13 +278,13 @@ See [STORAGE.md](STORAGE.md).
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `sora_cache_operations_total` | counter | `operation`, `result` | Reads of the local body cache (`operation="get"`, `result` `hit`, `miss`, `error`). The line proxies count their login lookup cache in the same series (`hit`, `miss`, `hit_negative`, `revalidate_positive_different_pw`, `revalidate_negative_different_pw`, `hit_positive_wrong_pw` and similar), so on a node that runs proxies the `hit` and `miss` totals mix two caches. |
+| `sora_cache_operations_total` | counter | `operation`, `result` | Reads of the local body cache (`operation="get"`, `result` `hit`, `miss`, `error`). |
 | `sora_cache_size_bytes` | gauge | none | Size of the local body cache. |
 | `sora_cache_objects_total` | gauge | none | Objects in the local body cache. |
 | `sora_lookup_cache_hits_total` | counter | none | Hits of the in-memory login lookup caches, all servers together. |
 | `sora_lookup_cache_misses_total` | counter | none | Misses of those caches. |
-| `sora_lookup_cache_entries_total` | gauge | none | Entries in a lookup cache. Every server has its own cache and writes this gauge, so with several it shows the one that changed last. |
-| `sora_lookup_cache_hit_rate` | gauge | none | Hit rate in percent (0..100), with the same caveat. |
+| `sora_lookup_cache_entries_total` | gauge | per server | Entries in one server's lookup cache. |
+| `sora_lookup_cache_hit_rate` | gauge | per server | Hit rate of one server's lookup cache, in percent (0..100). |
 | `sora_lookup_cache_shared_fetches_total` | counter | none | Lookups whose result was shared by concurrent requests for the same user, so one database or API call served several logins. |
 | `sora_auth_cache_operations_total` | counter | `result` | Reads of the persistent `[auth_cache]`. `result`: `hit`, `miss`, `error`. |
 | `sora_auth_cache_entries_total` | gauge | none | Entries in that cache. |
@@ -313,7 +305,6 @@ See [STORAGE.md](STORAGE.md).
 | `sora_account_purges_total` | counter | `result` | Purge attempts by this node's purge worker. `result`: `success`, `failure`. |
 | `sora_accounts_total` | gauge | none | Accounts, a planner estimate (includes accounts pending purge). |
 | `sora_mailboxes_total` | gauge | none | Mailboxes, a planner estimate. |
-| `sora_active_mailboxes` | gauge | none | Never updated. |
 
 See [STORAGE.md](STORAGE.md) and [SEARCH.md](SEARCH.md).
 
@@ -323,7 +314,6 @@ See [STORAGE.md](STORAGE.md) and [SEARCH.md](SEARCH.md).
 |---|---|---|---|
 | `sora_timeout_scheduler_connections_total` | gauge | `shard` | Connections a scheduler shard watches. |
 | `sora_timeout_scheduler_check_duration_seconds` | histogram | `shard` | Time of one check pass of a shard (every 100 ms). |
-| `sora_command_timeouts_total` | counter | `protocol`, `reason` | Never updated. Use `sora_connection_timeouts_total`. |
 
 ### 3.16 Session memory
 
@@ -336,17 +326,17 @@ See [STORAGE.md](STORAGE.md) and [SEARCH.md](SEARCH.md).
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `sora_component_health_status` | gauge | `component`, `hostname` (empty) | Latest status of a check: `3` healthy, `2` degraded, `1` unhealthy. |
-| `sora_component_health_checks_total` | counter | `component`, `hostname` (empty), `status` | Checks run, by resulting status. |
-| `sora_component_health_check_duration_seconds` | histogram | `component`, `hostname` (empty) | Time of a check. |
+| `sora_component_health_status` | gauge | `component`, `hostname` | Latest status of a check: `3` healthy, `2` degraded, `1` unhealthy. |
+| `sora_component_health_checks_total` | counter | `component`, `hostname`, `status` | Checks run, by resulting status. |
+| `sora_component_health_check_duration_seconds` | histogram | `component`, `hostname` | Time of a check. |
 
 A check's series appear after its first run, one interval after startup. See
 [section 5](#5-health-checks).
 
 ### 3.18 Domain and user metrics
 
-These carry a mail domain or a user in their labels. They can create many series, so they are off
-unless a `metrics` server turns them on.
+These carry a mail domain or a user in their labels, so they can create many series. Domain metrics
+are on by default; user metrics are off unless a `metrics` server turns them on.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
@@ -358,29 +348,16 @@ unless a `metrics` server turns them on.
 | `sora_top_user_commands_total` | counter | `protocol`, `user_hash`, `command` | Commands of a heavy user (`command="total"`). |
 | `sora_heavy_user_operations_total` | counter | `protocol`, `user_hash`, `operation_type` | Activity of a heavy user. `operation_type`: `command`, `connection`. |
 
-`enable_domain_metrics = true` turns on the `sora_domain_*` series. `enable_user_metrics = true`
+`enable_domain_metrics` turns the `sora_domain_*` series on or off. `enable_user_metrics = true`
 counts each user's commands and connections in memory and gives a user its own series once that sum
-reaches `user_metrics_threshold`, up to `max_tracked_users` users. Set all three user keys together:
-with `max_tracked_users` left at `0`, no user is ever promoted. `user_hash` is the user name itself
-unless `hash_usernames = true`.
+reaches `user_metrics_threshold` (default 1000), up to `max_tracked_users` users (default 1000).
+`user_hash` is a hash of the user name, or the user name itself with `hash_usernames = false`.
 
 ### 3.19 Process metrics
 
 The Prometheus client library adds the Go runtime metrics (`go_goroutines`, `go_memstats_*`, ...),
 the process metrics (`process_cpu_seconds_total`, `process_resident_memory_bytes`,
 `process_open_fds`, ...) and `promhttp_metric_handler_requests_total`.
-
-### 3.20 Metrics that are never updated
-
-These are registered, so they appear in the scrape when they have no labels, but no code changes
-them. Do not build alerts on them.
-
-`sora_db_connection_pool_wait_seconds`, `sora_db_connection_pool_exhausted_total`,
-`sora_mailbox_lock_wait_seconds`, `sora_storage_retries_total`, `sora_command_timeouts_total`,
-`sora_slow_operations_total`, `sora_proxy_requests_forwarded_total`,
-`sora_proxy_backend_latency_seconds`, `sora_active_mailboxes`, `sora_message_age_at_fetch_seconds`,
-`sora_db_circuit_breaker_state`, `sora_db_circuit_breaker_failures_total`,
-`sora_db_connection_acquire_timeout_total`.
 
 ---
 
@@ -422,10 +399,8 @@ runs on its own interval, the first time one interval after startup.
 | `relay_queue` | nodes with `[relay]` | 60 s | 5 s | no | Fails when more than 1000 messages are pending or more than 100 are processing. |
 | `circuit_breaker_smtp_relay`, `circuit_breaker_http_relay` | nodes with `[relay]` | 15 s | 5 s | no | Fails while the relay's circuit breaker is open, or when more than half its recent requests failed. |
 
-Sora also registers `remotelookup_http_<server name>` and a circuit breaker check for each proxy with
-a remote lookup. They are registered after the health monitor has started, so they never run: their
-status stays healthy and they produce no metrics. Watch remote lookups through
-`sora_remote_lookup_result_total` and the log instead.
+Sora also runs `remotelookup_http_<server name>` and a circuit breaker check for each proxy with a
+remote lookup. They go unhealthy when the lookup API is down.
 
 ### How a status is decided
 
@@ -448,24 +423,19 @@ and a change of the overall status `Health: Overall system status changed`.
 
 1. **Metrics.** `sora_component_health_status{component="..."}` on each node's metrics endpoint.
    This is the most current view.
-2. **The `health_status` table.** On a node with a database, Sora writes a row per component and
-   node (keyed by the host name) on the first run of a check and whenever its status changes. It
-   does not write while the status stays the same. The cleaner deletes rows not updated within
-   `[cleanup] health_status_retention` (30 days), so a component that stayed healthy longer than
-   that loses its row until the node restarts or the status changes.
+2. **The `health_status` table.** On a node with a database, Sora keeps a row per component and
+   node (keyed by the host name) with the check's current status.
 3. **The admin API**, which reads that table (see [ADMIN_API.md](ADMIN_API.md)):
    - `GET /admin/health/overview` (optional `?hostname=`) counts components by status. It reports
      `unhealthy` when any row is unhealthy, critical or not, and `unreachable` when there are no
      rows.
    - `GET /admin/health/servers/{hostname}` lists the rows of one node.
-   - `GET /admin/health/servers/{hostname}/components/{component}` returns one row
-     (`?history=true` with `since` and `limit` returns the rows updated since then).
+   - `GET /admin/health/servers/{hostname}/components/{component}` returns one row.
    - `GET /admin/proxy/backends` shows the backend health each proxy on that node sees.
 4. **`sora-admin health status`**, which reads the same table, or with `--backends` asks the admin
    API (see [ADMIN_CLI.md](ADMIN_CLI.md)).
 
-Because the table records changes rather than heartbeats, use the metrics for alerting and the table
-for an overview across nodes.
+Use the metrics for alerting and the table for an overview across nodes.
 
 ---
 
@@ -475,7 +445,7 @@ Sora wraps its calls to S3, PostgreSQL, the relay, the remote lookup API and the
 endpoint in circuit breakers. A breaker that sees too many failures opens and fails calls at once
 for a while, then lets a few through to test the service again.
 
-There is no metric for breaker state. You can see it in three ways:
+You can see breaker state in these ways:
 
 - the health checks `circuit_breaker_smtp_relay` and `circuit_breaker_http_relay`
   (`sora_component_health_status`);
@@ -517,7 +487,7 @@ Useful graphs, not alerts:
 - Query latency: `histogram_quantile(0.99, sum by (le, operation) (rate(sora_db_query_duration_seconds_bucket[5m])))`.
 - S3 latency: `histogram_quantile(0.99, sum by (le, operation) (rate(sora_s3_operation_duration_seconds_bucket[5m])))`.
 - Open connections against your `max_connections`: `sum by (instance, server_name) (sora_connections_current)`.
-- Body cache hit ratio on a node without proxies: `rate(sora_cache_operations_total{result="hit"}[5m]) / rate(sora_cache_operations_total{result=~"hit|miss"}[5m])`.
+- Body cache hit ratio: `rate(sora_cache_operations_total{result="hit"}[5m]) / rate(sora_cache_operations_total{result=~"hit|miss"}[5m])`.
 - Timeouts by reason: `sum by (protocol, reason) (rate(sora_connection_timeouts_total[5m]))`.
 
 ---

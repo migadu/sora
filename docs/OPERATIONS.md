@@ -87,20 +87,15 @@ Sora starts in this order. A failure in any step ends the process with status 1,
    logging is not set up yet.
 3. **Validation.** In this order:
    - Unknown names in `[sieve] enabled_extensions` are a warning.
-   - Each `[[server]]` block is validated: a known `type`, and no `master_username` or
-     `master_sasl_username` with an empty password.
+   - Each `[[server]]` block is validated: a `type`, `name` and `addr`, a known `type`, and no
+     `master_username` or `master_sasl_username` with an empty password.
    - `[[pool]]` blocks are validated against the proxies that use them ([PROXY.md](PROXY.md)).
+   - Every `[servers] trusted_networks` entry must be an IP address or a CIDR block.
    - A listener with `proxy_protocol = true` requires a non-empty `[servers] trusted_networks`.
    - Two `[[server]]` blocks may not share a `name` or an `addr`.
    - At least one `[[server]]` block must exist.
-
-   A `[[server]]` block that lacks `type`, `name` or `addr` is skipped without a message: it is not
-   validated and not started.
-4. **Database defaults.** If `[database.write]` (or `[database.read]`) still holds exactly the
-   built-in values (`hosts = ["localhost"]`, `user = "postgres"`, `name = "sora_mail_db"`), Sora treats
-   that endpoint as not configured. This is how a proxy-only node runs without a database. It also
-   means a backend whose config uses exactly those three values fails in step 9 with "database is
-   required". Use another user or database name.
+4. **Database endpoints.** A `[database.write]` or `[database.read]` section that is not in the file
+   counts as not configured. This is how a proxy-only node runs without a database.
 5. **Global settings.** `bcrypt_cost` and `[sieve] max_execution_time` are applied.
 6. **Logging.** The `[logging]` output opens. From here on, log lines go where `[logging] output`
    says ([Logging](#7-logging)). Sora logs `SORA application starting` with its version, commit and
@@ -111,29 +106,32 @@ Sora starts in this order. A failure in any step ends the process with status 1,
    1. The node's two names are resolved and logged: `Resolved instance ID` and
       `Resolved mail hostname` ([Node identity](#9-node-identity)).
    2. Sora decides what it needs. A node with an `imap`, `pop3` or `lmtp` server needs S3 and
-      PostgreSQL. A node with `http_admin_api` or `http_user_api` needs PostgreSQL. On a node with
-      only proxies, Sora connects to PostgreSQL only when a proxy has
-      `[server.remote_lookup] lookup_local_users = true`; otherwise it logs
-      `Skipping database initialization` even if `[database]` is set. A database that is needed but
-      not configured stops startup.
+      PostgreSQL. A node with `managesieve`, `http_admin_api` or `http_user_api` needs PostgreSQL,
+      and `http_user_api` also uses S3 to serve message bodies. A proxy needs PostgreSQL when it
+      checks passwords in the database (no remote lookup, or
+      `[server.remote_lookup] lookup_local_users = true`). A database that is needed but not
+      configured stops startup.
    3. **S3**, when needed: `[s3] access_key`, `secret_key`, `bucket` and `endpoint` must be set. Sora
       does not contact S3 here and does not create the bucket. With `[s3] encrypt = true` the
       encryption key is checked (64 hex characters).
-   4. **PostgreSQL**, when needed: Sora connects to every write host, applies pending migrations on
-      the first one ([Database migrations](#10-database-migrations)), and connects to the read hosts.
-      Read replicas that fail are retried later; if no write host can be reached, Sora logs
+   4. **PostgreSQL**, when needed: Sora connects to every write host, applies pending migrations
+      through the first one it can reach ([Database migrations](#10-database-migrations)), and
+      connects to the read hosts. A failed migration stops startup. Hosts that fail, read or write,
+      are retried later; if no write host can be reached, Sora logs
       `Failed to initialize resilient database` and exits with status 1.
    5. The **auth cache** opens, if `[auth_cache] enabled = true`. If it fails, Sora logs an error and
       runs without it.
    6. On a node with S3 (a backend): the **local cache**, the **FTS worker**, the **cleaner**, the
       **purge worker** and the **uploader** start.
-   7. The **relay queue** and its worker start, if `[relay] type` is set.
-   8. The **cluster** joins, if `[cluster] enabled = true`, and with it the affinity manager and its
-      optional SQLite file.
+   7. The **relay queue** and its worker start, if `[relay] type` is set. A type other than `smtp`
+      or `http` stops startup with `unsupported [relay] type`.
+   8. The **cluster** joins, if `[cluster] enabled = true`, and with it the affinity manager (with
+      `[cluster.affinity] enabled = true`) and its optional SQLite file.
    9. The **TLS manager** starts, if `[tls] enabled = true`: it loads certificate files, or sets up
       Let's Encrypt ([TLS.md](TLS.md)).
    10. Health checks, the metrics collector and the spam-training client start.
-10. **SIGHUP** is handled from this point.
+10. **SIGHUP** reloads the config from this point. An earlier SIGHUP does not end the process,
+    and the log file can be reopened at any time.
 11. **Listeners.** Backend maintenance is loaded (on nodes with proxies and a database), the
     HTTP-01 listener on port 80 starts (Let's Encrypt only), and every `[[server]]` starts. Each logs
     a line when it listens, for example `IMAP server listening with TLS name=imaps addr=:993` or
@@ -159,21 +157,19 @@ journal: look in the log file.
 |---|---|---|
 | `configuration file '...' not found` | The file named with `-config` does not exist. | Check the path. |
 | `failed to parse configuration file` | TOML syntax error. The message points at the line. | Fix the syntax. |
-| `invalid configuration - servers: no servers configured` | No complete `[[server]]` block. | Add one with `type`, `name` and `addr`. |
+| `invalid configuration - servers: no servers configured` | No `[[server]]` block. | Add one with `type`, `name` and `addr`. |
+| `server address is required` (or the name or type) | A `[[server]]` block lacks `addr`, `name` or `type`. | Add the missing key. |
 | `invalid server type` | `type` is misspelled. | Use one of the types in [CONFIGURATION.md](CONFIGURATION.md). |
 | `master_username is set but master_password is empty` | A master user without a password would let anyone in. | Set the password or remove the user. |
 | `proxy_protocol is enabled on server(s) ... but [servers] trusted_networks is empty` | PROXY protocol without trusted senders. | Set `[servers] trusted_networks`. |
 | `duplicate server name` / `duplicate server address` | Two blocks share a `name` or `addr`. | Make them unique. |
-| `database is required for configured servers but not configured` | No database, or a database section that equals the built-in defaults (step 4). | Configure `[database.write]` with your own user or database name. |
+| `database is required for configured servers but not configured` | No `[database.write]` section (step 4). | Configure `[database.write]`. |
 | `missing required S3 credentials` / `S3 endpoint not specified` | A backend without `[s3]` settings. | Set `[s3]`. |
-| `Failed to initialize resilient database` (logged at info level) | No write host reachable, or migrations failed. The line before it says why. | See [Database migrations](#10-database-migrations) and [DATABASE.md](DATABASE.md). |
+| `Failed to initialize resilient database` | No write host reachable, or migrations failed. The line before it says why. | See [Database migrations](#10-database-migrations) and [DATABASE.md](DATABASE.md). |
 | `FATAL: operation 'initialize cache' failed` | `[local_cache] path` cannot be created. | Fix the path or its permissions. |
 | `FATAL: operation 'create upload worker' failed` | `[uploader] path` cannot be created. | Fix the path or its permissions. |
 | `FATAL: operation 'initialize TLS manager' failed` | Certificate files unreadable, or a Let's Encrypt setting is missing. | See [TLS.md](TLS.md). |
 | `FATAL: operation 'server operation' failed` | A listener could not start or failed later, for example `address already in use`. | Free the port, or check privileges for ports below 1024. |
-
-A `[[server]]` block of type `metrics` without `path` makes the process panic when that listener
-starts. Always set `path` (for example `"/metrics"`).
 
 ### Warnings worth reading at startup
 
@@ -207,7 +203,7 @@ masked.
 |---|---|
 | 0 | `-version` or `-help`; or a shutdown after SIGINT or SIGTERM. |
 | 1 | Any startup failure from [Startup](#2-startup); or a listener that fails while Sora runs. |
-| 2 | An unknown flag; or a Go panic (for example a `metrics` server without `path`). |
+| 2 | An unknown flag; or a Go panic. |
 
 A status of 1 after a runtime listener failure skips the shutdown steps in
 [SIGINT and SIGTERM](#sigint-and-sigterm): sessions are cut and workers are not stopped. The
@@ -225,9 +221,7 @@ Sora handles SIGINT, SIGTERM and SIGHUP.
 | SIGINT, SIGTERM | Step 8 of [Startup](#startup-order) | Graceful shutdown. |
 | SIGHUP | Step 10 of [Startup](#startup-order), after all services are up | Reopen the log file, then reload the config. |
 
-Before step 10, SIGHUP still has the default action of the Go runtime and ends the process at once.
-Startup can take minutes while migrations run, so do not send a reload (or rotate logs) until the
-listeners have started.
+Before step 10, a SIGHUP does not end the process, and the log file can be reopened at any time.
 
 ### SIGHUP
 
@@ -280,16 +274,16 @@ The list lives in `reloadableServerSettings` in
 shorter than 16 characters or equal to the placeholder from `config.toml.example`; it then keeps the
 old key and Sora logs `Failed to reload server config`.
 
-A reload never starts or stops a listener:
+A reload never starts or stops a listener, and Sora reports added and removed blocks:
 
 - A `[[server]]` block added to the file is not started.
 - A block removed from the file keeps running.
 - A block whose `name` changed counts as both: the old one keeps running, the new one does not start.
 
-Outside the `[[server]]` blocks, nothing is applied by a reload. Sora reports these sections when
-they change, each with a line `Config reload: <section> changed but requires restart to take effect`:
+Outside the `[[server]]` blocks, nothing is applied by a reload. Sora reports every section that
+changed, each with a line `Config reload: <section> changed but requires restart to take effect`:
 
-- `[logging] level` (only the level: a changed `output` or `format` is not reported)
+- `[logging]` (`level`, `output` and `format`)
 - `[cleanup]`
 - `[shared_mailboxes]`
 - `[sieve]`
@@ -297,11 +291,8 @@ they change, each with a line `Config reload: <section> changed but requires res
 - `[metadata]`
 - `[servers] trusted_networks` (logged as a warning: until a restart, the networks Sora started with
   stay trusted and added ones are not)
-
-Every other top-level setting also needs a restart, and a reload does **not** report it:
-`[database]`, `[s3]`, `[local_cache]`, `[uploader]`, `[relay]`, `[cluster]`, `[tls]`,
-`[auth_cache]`, `[[pool]]`, `[spam_training]`, `[timeout_scheduler]`, `[admin_cli]`,
-`bcrypt_cost`, and `[logging] output` and `format`.
+- `[database]`, `[s3]`, `[local_cache]`, `[uploader]`, `[relay]`, `[cluster]`, `[tls]`,
+  `[auth_cache]`, `[[pool]]`, `[spam_training]`, `[timeout_scheduler]` and `bcrypt_cost`
 
 TLS certificates are never reloaded by SIGHUP. Certificate files (`[tls] cert_file`/`key_file` and
 per-server `tls_cert_file`/`tls_key_file`) are read once, at startup, so a renewed certificate needs
@@ -368,8 +359,8 @@ A restart, planned or not, **loses**:
   LMTP transactions without a final answer are retried by the MTA. ManageSieve sessions are short and
   lose nothing that was saved.
 - **In-memory state:** login lookup caches, auth rate-limit counters and blocks, search rate limits,
-  connection counts. Auth rate limits are kept per node, also in a cluster. In a cluster, the other
-  nodes keep the per-user proxy connection counts ([CLUSTER.md](CLUSTER.md)).
+  connection counts. In a cluster, the other nodes keep the per-user proxy connection counts
+  ([CLUSTER.md](CLUSTER.md)).
 - **Proxy affinity** held in this node's memory, unless `[cluster.affinity] cache_path` is set.
 - **Uploads and relay deliveries in flight.** They are retried after the start.
 
@@ -384,9 +375,8 @@ A restart **keeps** everything on disk and in the shared stores:
   directory.
 
 This only holds if those paths survive a restart. The defaults for the spool, the cache and the auth
-cache are under `/tmp/sora`. Under the shipped systemd unit, `/tmp` is private to the service and
-systemd deletes it when the service stops. Bodies in a spool under `/tmp` are then lost at every
-restart. Always set `[uploader] path` (and the other paths) to a directory that persists
+cache are under `/tmp/sora`, which many systems clear at boot. Always set `[uploader] path` (and the
+other paths) to a directory that persists
 ([What Sora writes to local disk](#6-what-sora-writes-to-local-disk)).
 
 ---
@@ -398,7 +388,7 @@ restart. Always set `[uploader] path` (and the other paths) to a directory that 
 | Upload spool | `[uploader] path` | `/tmp/sora/uploads` | The node has an `imap`, `pop3` or `lmtp` server | One file per message body not yet in S3, at `<path>/<account_id>/<content_hash>`. Written to a `.tmp` name, synced, then renamed. | **No.** Until a body is in S3, this file is its only copy. |
 | Local cache | `[local_cache] path` | `/tmp/sora/cache` | Same | Bodies in `<path>/data/`, 256 SQLite index files `cache_index_00.db` to `cache_index_ff.db` (WAL mode), and `.sora_warmup_state`, written when an IMAP server stops with cache warmup on (the default). | Yes. Sora fetches bodies from S3 again. |
 | Auth cache | `[auth_cache] path` | `/tmp/sora/auth_cache.db` | `[auth_cache] enabled = true` | SQLite file (mode 0600, WAL) with addresses, account IDs and password hashes. Its parent directory is created. | Yes. It refills from the database. Treat it as secret: it holds password hashes. |
-| Affinity cache | `[cluster.affinity] cache_path` | none (off) | Cluster enabled and `cache_path` set | SQLite file (mode 0600, WAL) with user-to-backend affinity. | Yes. Users are routed afresh. |
+| Affinity cache | `[cluster.affinity] cache_path` | none (off) | Cluster and `[cluster.affinity]` enabled, and `cache_path` set | SQLite file (mode 0600, WAL) with user-to-backend affinity. | Yes. Users are routed afresh. |
 | Relay queue | `[relay.queue] path` | `/var/spool/sora/relay` | `[relay] type` is set | `pending/`, `processing/` and `failed/` directories with outgoing Sieve redirects and vacation replies. | Losing `pending/` loses those messages. |
 | Let's Encrypt fallback | `[tls.letsencrypt] fallback_dir` | `/var/lib/sora/certs` | `[tls] provider = "letsencrypt"`, unless `enable_fallback = false` | A local copy of the certificates in S3, including private keys (directory mode 0700). | Yes. It is a mirror of the S3 store. |
 | Log file | `[logging] output` | none (stderr) | `output` is a file path | Log lines, mode 0644, appended. The directory must exist. | Your choice. |
@@ -505,13 +495,14 @@ With `stderr` and journald, the journal does the rotation and nothing else is ne
 
 ### systemd: `dist/sora.service`
 
+The unit, abridged:
+
 ```ini
 [Unit]
 Description=Sora Mail Server
 Documentation=https://github.com/migadu/sora
 After=network-online.target postgresql.service
 Wants=network-online.target
-Requires=postgresql.service
 
 [Service]
 Type=simple
@@ -527,8 +518,7 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-PrivateTmp=true
-ReadWritePaths=/var/spool/sora /var/cache/sora /var/log/sora
+ReadWritePaths=/var/spool/sora /var/cache/sora /var/lib/sora /var/log/sora
 LimitNOFILE=65536
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
@@ -541,9 +531,6 @@ What each part means for you:
 
 - **User `sora`.** Create a system user and group named `sora`. The config file must be readable by
   that group, and so must every certificate and key file Sora loads.
-- **`Requires=postgresql.service`.** This assumes PostgreSQL runs on the same host. If it runs
-  elsewhere, or on a proxy node without a database, remove `postgresql.service` from `After=` and
-  `Requires=`, or the unit will not start.
 - **`ExecReload`** sends SIGHUP: `systemctl reload sora` reopens the log and reloads the config
   ([SIGHUP](#sighup)).
 - **`TimeoutStopSec=30`, `KillMode=mixed`.** systemd sends SIGTERM to Sora and, if it has not exited
@@ -554,31 +541,24 @@ What each part means for you:
   That suits a database that comes up later. For a config error, it repeats the same error until
   you fix it.
 - **`ProtectSystem=strict`, `ReadWritePaths`.** The whole file system is read-only for Sora except
-  `/var/spool/sora`, `/var/cache/sora` and `/var/log/sora`. All three must exist before the unit
-  starts; systemd refuses to start it if one is missing. Every path Sora writes must be under one of
-  them:
+  `/var/spool/sora`, `/var/cache/sora`, `/var/lib/sora` and `/var/log/sora`. All four must exist
+  before the unit starts; systemd refuses to start it if one is missing. Every path Sora writes
+  must be under one of them:
   - set `[uploader] path` to a directory under `/var/spool/sora` (for example
     `/var/spool/sora/uploads`);
   - set `[local_cache] path` to a directory under `/var/cache/sora` (for example
     `/var/cache/sora/cache`), and `[auth_cache] path` too if you use it;
   - the relay queue default, `/var/spool/sora/relay`, already fits;
-  - with Let's Encrypt, the default `fallback_dir` `/var/lib/sora/certs` is **not** writable: set it
-    under `/var/cache/sora`, or add `/var/lib/sora` to `ReadWritePaths`. Otherwise Sora logs
-    `Cannot create certificate fallback directory - degrading to S3-only`.
-- **`PrivateTmp=true`.** Sora gets its own `/tmp`, which systemd empties when the service stops. The
-  built-in defaults for the spool, the cache and the auth cache are under `/tmp/sora`, so leaving them
-  unset loses spooled message bodies at every restart ([What a restart loses and keeps](#5-what-a-restart-loses-and-keeps)).
+  - with Let's Encrypt, the default `fallback_dir`, `/var/lib/sora/certs`, already fits.
 - **`AmbientCapabilities=CAP_NET_BIND_SERVICE`** lets the `sora` user bind ports below 1024 (25, 80,
   110, 143, 993, 995 and so on).
 - **`LimitNOFILE=65536`.** Each client connection uses a file descriptor, and a proxy uses two.
 
-The unit in `/etc/systemd/system/sora.service` is your copy, so edit it to remove
-`postgresql.service`: systemd cannot remove a dependency from a drop-in. To add something, a drop-in
-works, for example `systemctl edit sora` with:
+To add something to the unit, use a drop-in, for example `systemctl edit sora` with:
 
 ```ini
 [Service]
-ReadWritePaths=/var/lib/sora
+ReadWritePaths=/srv/sora
 ```
 
 `ReadWritePaths=` in a drop-in adds to the list in the unit. Run `systemctl daemon-reload` after
@@ -599,11 +579,10 @@ The rc.d script reads these `rc.conf` variables:
 Before it starts Sora, it creates `sora_logdir` and `sora_spooldir` (mode 0750, owned by the user).
 It does not create a cache directory. `service sora reload` sends SIGHUP.
 
-Sora itself stays in the foreground and writes no pid file, while the script runs
-`/usr/local/bin/sora` directly and names `/var/run/sora.pid`. As shipped, `service sora start` does
-not return, and `stop`, `status` and `reload` cannot find the process. Run Sora under `daemon(8)`,
-which detaches it and can write the pid file, and set `[logging] output` to a file such as
-`/var/log/sora/sora.log`. newsyslog needs that pid file to send SIGHUP after rotating the log.
+The script runs Sora under `daemon(8)`, which detaches it and writes the pid file
+`/var/run/sora.pid`. `service sora start` returns once Sora is running, `status` reports its PID,
+`stop` stops it and `reload` sends it SIGHUP. Set `[logging] output` to a file such as
+`/var/log/sora/sora.log`; newsyslog uses the pid file to send SIGHUP after rotating the log.
 
 ---
 
@@ -647,8 +626,8 @@ schema, the migrations and the PostgreSQL requirements; this section covers how 
 ### At startup
 
 Every `sora` process that connects to PostgreSQL applies pending migrations before it serves anyone.
-It does this on the first host in `[database.write] hosts`. If that host cannot be reached, Sora
-connects to the next write host without migrating.
+It does this through the first host in `[database.write] hosts` that it can reach. If a migration
+fails, the process does not start.
 
 1. The process tries to take a migration lock in PostgreSQL. Only one process can hold it.
 2. It reads `schema_migrations`. If the version is at or above the newest migration in its binary,
@@ -683,7 +662,8 @@ does not start. To fix it:
 
 ### With `sora-admin`
 
-`sora-admin --config PATH migrate <subcommand>` works on the first write host:
+`sora-admin --config PATH migrate <subcommand>` connects through `[database.write]`, with the same
+host and port rules as `sora`:
 
 | Subcommand | What it does | Sora must be stopped? |
 |---|---|---|
@@ -700,11 +680,6 @@ Notes:
 - Migrations create the `pg_trgm` and `btree_gin` extensions themselves. The database owner can do
   that without superuser rights on current PostgreSQL versions, because both extensions are trusted
   ([DATABASE.md](DATABASE.md)).
-- `sora-admin migrate` connects to `hosts[0]` and `port` exactly as written. Set `port` explicitly in
-  `[database.write]` and write the first host without a port, or the connection address is wrong.
-  (`sora` itself defaults the port to 5432 and accepts `host:port`.)
-- Sora and `sora-admin` put the database password into a connection URL without escaping it. Avoid
-  `@`, `:`, `/`, `?`, `#` and `%` in the password.
 - Down migrations can delete data. For example, reverting `000055` drops the `backend_maintenance`
   table, and reverting `000057` deletes vacation records the older schema cannot hold. Read the
   `.down.sql` files before you run `migrate down`.
@@ -869,10 +844,6 @@ none of what it shares. See [CLUSTER.md](CLUSTER.md) for what it adds.
 
 **Sora does not start and the journal is empty.** With `[logging] output` set to a file, errors after
 step 6 of [Startup](#startup-order) are in that file.
-
-**Sora exits with "database is required ... but not configured", but `[database.write]` is set.** The
-section holds exactly `localhost`, `postgres` and `sora_mail_db`, which Sora reads as "no database"
-([Startup](#startup-order), step 4). Use another user or database name.
 
 **Can I delete the cache directory?** Yes, with Sora stopped. Do not delete the upload spool: it holds
 bodies that are not in S3 yet.

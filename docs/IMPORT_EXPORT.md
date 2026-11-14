@@ -121,7 +121,7 @@ sora-admin --config config.toml import maildir --email user@example.com \
 |---|---|---|
 | `--email` | | Account to import into (required). See [section 2](#2-before-you-import). |
 | `--maildir-path` | | Root of the maildir (required). |
-| `--dry-run` | `false` | Report what would be imported. Not free of side effects: see [section 10](#10-dry-runs). |
+| `--dry-run` | `false` | Report what would be imported and change nothing in the account. See [section 10](#10-dry-runs). |
 | `--incremental` | `false` | Import only files the cache does not mark as imported. See [section 9](#9-re-runs-duplicates-and-incremental-imports). |
 | `--dovecot` | `false` | Read Dovecot's `dovecot-keywords`, `subscriptions` and `dovecot-uidlist` files. Implies `--preserve-uids`. See [section 6](#6-dovecot-files-keywords-subscriptions-and-uids). |
 | `--preserve-uids` | `false` | Keep the UIDs and UIDVALIDITY from each folder's `dovecot-uidlist`. |
@@ -135,10 +135,7 @@ sora-admin --config config.toml import maildir --email user@example.com \
 | `--jobs` | `4` | Parallel workers for hashing files and for uploads within a batch. |
 | `--batch-size` | `20` | Messages per batch. |
 | `--batch-transaction` | `false` | Insert each batch in one database transaction. See [section 12](#12-batches-and-speed). |
-| `--cleanup-db` | `false` | Delete `sora-maildir.db` when the run ends, whether or not it succeeded. |
-| `--force-reimport` | `false` | Affects only the dry-run report (messages already in Sora are shown as `REIMPORT`). It does not change what a real import does. |
-| `--delay` | `0` | Accepted, but has no effect on `import maildir`. |
-| `--progress` | `true` | Accepted, but has no effect; progress is always logged per batch. |
+| `--cleanup-db` | `false` | Delete `sora-maildir.db` after a run that completed without errors. After a failed or interrupted run the file is kept for the next run. |
 
 The date filters look at the **file modification time**, not at the `Date:` header. Filtered
 files are still scanned and hashed, and are counted as skipped.
@@ -158,16 +155,12 @@ The body is encrypted on the way to S3 when `[s3] encrypt` is on, like any other
 messages are marked uploaded at once; they never go through the upload spool.
 
 **Content hash.** The importer names the S3 object, and fills `content_hash`, with the
-**SHA-256** hex digest of the decompressed content. Messages delivered or appended through the
-server use BLAKE3. Two consequences:
+**BLAKE3** hex digest of the decompressed content, as delivery and APPEND do. A message imported
+here and the same message delivered later share one S3 object, and `sora-admin verify` checks
+imported messages like any other.
 
-- A message imported here and the same message delivered later are not recognised as the same
-  content.
-- `sora-admin verify hash` and `verify s3 --deep` re-hash with BLAKE3 and report imported
-  messages as corrupt. Plain `verify s3` (HEAD only) is not affected.
-
-**Size limit.** Larger than `[admin_cli] import_message_limit` counts as failed. For gzip files
-the limit applies to the decompressed size; for bzip2 files, to the file size.
+**Size limit.** Larger than `[admin_cli] import_message_limit` counts as failed. For compressed
+files the limit applies to the decompressed size.
 
 **Flags.** From the info part of the file name, after `:2,`:
 
@@ -210,24 +203,17 @@ Dovecot stores custom keywords as letters `a` to `z` in file names. Each folder 
 
 - Each folder's own `dovecot-keywords` file maps that folder's letters.
 - A folder without its own file uses the root file's mapping.
-- The root file (INBOX's) is read only with `--dovecot`. Without it, INBOX's keyword letters are
-  not mapped. Use `--dovecot` for a Dovecot source.
 
 ### Subscriptions (`subscriptions`)
 
 With `--dovecot`, the `subscriptions` file at the maildir root is read:
 
 1. Sora's default mailboxes are created: `INBOX`, `Sent`, `Drafts`, `Archive`, `Junk`, `Trash`.
-2. Each name in the file is decoded from modified UTF-7 and recorded as a subscription. No
-   mailbox is created for it: subscriptions are names, and Dovecot allows subscriptions to
-   folders that do not exist.
-
-Two limits apply. Names are not passed through the folder mapping of
-[section 3](#3-the-maildir-layout-sora-reads), so a subscription to `Sent Items` stays
-`Sent Items` while the folder becomes `Sent`. And Dovecot's version-2 file writes the parts of a
-nested name separated by tab characters; the importer reads each part as a separate name, so
-`Work` + tab + `2024` subscribes `Work` and `2024`, not `Work/2024`. Fix such subscriptions
-afterwards with `sora-admin mailbox subscribe` and `mailbox unsubscribe`.
+2. Each name in the file is decoded from modified UTF-7, passed through the folder mapping of
+   [section 3](#3-the-maildir-layout-sora-reads), and recorded as a subscription. Dovecot's
+   version-2 file separates the parts of a nested name with tab characters; they are joined with
+   `/`, so `Work` + tab + `2024` subscribes `Work/2024`. No mailbox is created for it:
+   subscriptions are names, and Dovecot allows subscriptions to folders that do not exist.
 
 ### UIDs (`dovecot-uidlist`)
 
@@ -290,7 +276,7 @@ Table `messages`:
 | Column | Meaning |
 |---|---|
 | `path`, `filename` | Where the file was found. |
-| `hash` | SHA-256 of the (decompressed) content. |
+| `hash` | BLAKE3 hash of the (decompressed) content. |
 | `size` | Content size in bytes. |
 | `mailbox` | Mapped mailbox name. |
 | `s3_uploaded`, `s3_uploaded_at` | `1` once the message is in S3 and PostgreSQL. |
@@ -299,10 +285,9 @@ Rows are unique per (`hash`, `mailbox`) and per (`filename`, `mailbox`).
 
 On every run:
 
-1. **Recovery.** Rows marked imported whose hash matches no live (not expunged) message of the
-   account are reset to "not imported". This repairs a run that stopped between the database and
-   the cache, and also means a message the user deleted in Sora since then is imported again
-   on the next run.
+1. **Recovery.** Rows marked imported whose message never reached PostgreSQL are reset to "not
+   imported". This repairs a run that stopped between the database and the cache. A message the
+   user deleted in Sora since then stays deleted.
 2. **Scan.** The whole maildir (or the `--paths-file` list) is walked and every file is read and
    hashed. New files get rows; files already known keep theirs.
 3. **Import** of the selected rows ([section 9](#9-re-runs-duplicates-and-incremental-imports)).
@@ -310,7 +295,7 @@ On every run:
 
 A cache written by an older build, without the `s3_uploaded` columns, is upgraded on open: the
 columns are added and existing rows are marked imported, then step 1 checks them against
-PostgreSQL. `--cleanup-db` deletes the file when the run ends. `export maildir` uses a file of
+PostgreSQL. `--cleanup-db` deletes the file after a run without errors. `export maildir` uses a file of
 the same name and layout in its target directory ([section 14](#14-export-maildir)).
 
 ---
@@ -320,7 +305,8 @@ the same name and layout in its target directory ([section 14](#14-export-maildi
 Running the importer again is safe: it does not create duplicates.
 
 **Duplicate rule.** A message is skipped when the target mailbox already has a live message with
-the same Message-ID and the same content hash. Skipped messages are counted as `Skipped`.
+the same Message-ID and the same content hash. Skipped messages are counted as `Skipped` and
+marked imported in the cache.
 
 **Without `--incremental`** (the default), every message file in the cache is read again,
 uploaded to S3 again, and offered to the database, which skips the duplicates. This is slow for a
@@ -336,10 +322,6 @@ Things a later pass does not do:
 - It does not **delete** from Sora what was deleted from the maildir.
 - A message **moved** to another folder in the maildir is imported into that folder too; the
   copy in the first folder stays.
-- A message deleted **in Sora** since the last pass comes back (see recovery in
-  [section 8](#8-the-sqlite-cache-sora-maildirdb)).
-- Messages skipped as duplicates are not marked imported, so every `--incremental` run uploads
-  them again and skips them again. This only costs time.
 
 Two copies of the same content in one folder are one row in the cache, so only one is imported.
 The same content in two folders is imported into both.
@@ -352,13 +334,10 @@ The same content in two folders is imported into both.
 subject, file date, size, short hash and flags), then a summary. A message is reported as `SKIP`
 when the mailbox already has a live message with the same hash.
 
-A dry run uploads nothing and inserts no messages, but it is not read-only:
+A dry run uploads nothing and changes nothing in the account: no message, mailbox,
+subscription, UIDVALIDITY or Sieve script.
 
 - It needs the account and writes `sora-maildir.db` into the maildir.
-- It creates the default mailboxes (`INBOX`, `Sent`, `Drafts`, `Archive`, `Junk`, `Trash`).
-- With `--dovecot`, it records the subscriptions.
-- With `--dovecot` or `--preserve-uids`, it creates the mailboxes that have a `dovecot-uidlist`
-  and sets their UIDVALIDITY when they are empty, as in [section 6](#6-dovecot-files-keywords-subscriptions-and-uids).
 - With `--sieve`, it only reports what it would do with the script.
 
 The dry-run duplicate check compares the hash only, so its numbers can differ slightly from a
@@ -387,9 +366,6 @@ the cause and run again with `--incremental`: only rows not yet imported are pro
 `--paths-file` limits the **scan** to the listed files; combine it with `--incremental` so that
 only those files that are not yet imported are processed (without `--incremental`, every row in
 the cache is processed again).
-
-A bzip2-compressed file logs `File content changed since the scan; using its current hash` on its
-first import, because the scan hashes the compressed bytes. This is harmless.
 
 ---
 
@@ -437,7 +413,6 @@ sora-admin --config config.toml import s3 --email user@example.com --workers 10
 | `--import-delay` | `0` | Pause after each imported message (Go duration, for example `200ms`). |
 | `--cleanup-db` | `true` | Delete the temporary SQLite file at the end. |
 | `--fts-retention` | `[cleanup] fts_retention` | As for `import maildir`. |
-| `--show-progress` | `true` | Accepted, but has no effect. |
 
 How it works:
 
@@ -448,7 +423,7 @@ How it works:
    (unless `--force-reimport`). Otherwise it downloads and decrypts the object, parses it, and
    inserts it into **INBOX**: S3 holds no folder information. INTERNALDATE and sent date are the
    `Date:` header (or the current time), and the message has no flags.
-3. It prints a summary. Objects that failed are counted but do not change the exit status.
+3. It prints a summary. If any object failed, the command exits `1`.
 
 Running it again is safe: imported objects are skipped as existing.
 
@@ -475,7 +450,6 @@ sora-admin --config config.toml export maildir --email user@example.com \
 | `--overwrite-flags` | `false` | Rewrite messages exported earlier with their current flags. |
 | `--jobs` | `4` | Messages exported in parallel within a mailbox. |
 | `--delay` | `0` | Pause after each exported message (Go duration). |
-| `--progress` | `true` | Accepted, but has no effect. |
 
 **What is exported.** Every mailbox the account can see, including shared mailboxes it has access
 to, and every message that is not expunged. Bodies are downloaded from S3 under the key stored on
@@ -498,8 +472,9 @@ kept. A folder can name at most 26 keywords; further ones are logged and left ou
 `--dovecot`, keywords are not exported.
 
 **Subscriptions.** With `--dovecot`, `subscriptions` at the root lists every subscribed name,
-also of folders that no longer exist, after a `V` + tab + `2` line, one name per line with `/` as
-the separator.
+also of folders that no longer exist, in Dovecot's version-2 format: a `V` + tab + `2` line and an
+empty line, then one name per line, with the levels of a nested name separated by tab
+characters.
 
 **UID lists.** With `--dovecot` or `--export-dovecot-uidlist`, each exported folder gets a
 `dovecot-uidlist` with the mailbox's UIDVALIDITY and each message's Sora UID. An existing
@@ -524,13 +499,8 @@ Each message is tried three times. If any message or mailbox fails, the command 
 
 - **Dots in names.** Export writes a mailbox `Foo.Bar` as a directory `Foo.Bar`; the importer reads
   that back as `Foo/Bar`.
-- **Hash algorithms.** Imported messages carry SHA-256 content hashes and delivered ones BLAKE3
-  ([section 5](#5-what-sora-stores-for-each-message)). BLAKE3 checks in `verify` report imported
-  messages as corrupt.
 - **Exporting into an imported maildir.** Export and import share the file name
   `sora-maildir.db`. Export into an empty directory, not into a maildir you imported from.
-- **Subscriptions from Dovecot** need checking for nested folders and renamed special folders
-  ([section 6](#6-dovecot-files-keywords-subscriptions-and-uids)).
 - **Not imported:** Dovecot's index files (`dovecot.index*`), quota files, ACL files, and
   anything in `tmp/`. Flags come from the file names, keywords from `dovecot-keywords` and UIDs
   from `dovecot-uidlist`; nothing is read from Dovecot's indexes.

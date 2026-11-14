@@ -54,8 +54,8 @@ in [PROXY.md](PROXY.md).
 | Metrics endpoint | No access control unless configured | 10 |
 | Message bodies in S3 | Not encrypted by Sora | 12 |
 
-Sizes are binary: `1mb` is 1024 × 1024 bytes. Write size units in lower case (`25mb`); `25MB` does
-not parse.
+Sizes are binary: `1mb` is 1024 × 1024 bytes. Size units are not case-sensitive: `25MB` is the
+same as `25mb`.
 
 ---
 
@@ -98,7 +98,7 @@ When plaintext logins are allowed on a listener whose address is reachable from 
 logs a warning at startup:
 
 ```
-plaintext authentication is allowed without TLS on a publicly reachable address; configure TLS or set insecure_auth=false
+plaintext authentication is allowed without TLS on a publicly reachable address; ...
 ```
 
 "Publicly reachable" means bound to a public IP, or to a wildcard address (`:143`, `0.0.0.0`, `::`)
@@ -134,7 +134,7 @@ balancers.
 | Per-IP connection limit | Connections from these addresses do not count against `max_connections_per_ip` (section 4). |
 | Authentication rate limiting | These addresses are exempt, unless the server's `auth_rate_limit.exempt_networks` says otherwise ([AUTHENTICATION.md](AUTHENTICATION.md#105-exempt-networks)). |
 | LMTP backend admission | Only these addresses may connect to an `lmtp` listener. **When the list is empty**, the LMTP backend accepts `127.0.0.0/8`, `::1`, `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16` instead. |
-| LMTP proxy admission | Only these addresses may connect to an `lmtp_proxy` listener. **When the list is empty, nobody can**: every connection is closed and logged as `LMTP Proxy: Connection rejected - not from trusted network`. |
+| LMTP proxy admission | Only these addresses may connect to an `lmtp_proxy` listener. Other connections are closed and logged as `LMTP Proxy: Connection rejected - not from trusted network`. An `lmtp_proxy` with an empty list is reported at startup. |
 
 All of these check the TCP peer, the host that actually connected, except the rate-limit exemption,
 which checks the client address after forwarding.
@@ -160,10 +160,9 @@ front of the connection. Turn it on per listener:
 | `proxy_protocol` | bool | `false` | Require a PROXY header on every connection to this listener. |
 | `proxy_protocol_timeout` | duration | `5s` | How long to wait for the header. |
 
-It works on `imap`, `pop3`, `managesieve`, `lmtp`, `http_user_api` and `user_api_proxy` listeners.
-The mail proxies (`imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `lmtp_proxy`) do not read PROXY
-headers: `proxy_protocol` on those blocks has no effect. Put them where they see the client's own
-address. (Sora proxies send PROXY headers to their backends with `remote_use_proxy_protocol`; see
+It works on `imap`, `pop3`, `managesieve`, `lmtp`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`,
+`lmtp_proxy`, `http_admin_api`, `http_user_api` and `user_api_proxy` listeners. (Sora proxies send
+PROXY headers to their backends with `remote_use_proxy_protocol`; see
 [PROXY.md](PROXY.md#8-the-backend-leg).)
 
 ```toml
@@ -213,26 +212,26 @@ Connection limits stop one client, or a flood, from using up a listener. They ar
 
 Where each applies:
 
-| Key | `imap`, `pop3`, `managesieve` | `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | `lmtp` | `lmtp_proxy` |
-|---|---|---|---|---|
-| `max_connections` | yes | yes | yes; unset, `0` or less gives 1000 | yes |
-| `max_connections_per_ip` | yes, except for trusted networks; not applied when `proxy_protocol = true` | yes, except for trusted networks; counted on each node | ignored | ignored |
-| `max_connections_per_user` | `imap`: enforced, per listener. `pop3`, `managesieve`: counted and logged, not enforced | enforced across the cluster; needs `[cluster]`, otherwise not enforced | ignored | ignored, with a warning |
-| `max_connections_per_user_per_ip` | as above; the IP is the TCP peer, so behind proxies it is the proxy's address | as above | ignored | ignored, with a warning |
+| Key | `imap`, `pop3`, `managesieve` | `imap_proxy`, `pop3_proxy`, `managesieve_proxy` |
+|---|---|---|
+| `max_connections` | yes | yes |
+| `max_connections_per_ip` | yes, except for trusted networks; not applied when `proxy_protocol = true` | yes, except for trusted networks |
+| `max_connections_per_user` | enforced, per listener | enforced across the cluster; needs `[cluster]`, otherwise not enforced |
+| `max_connections_per_user_per_ip` | as above; on `imap` the IP is the client's real address, as forwarded by a proxy | as above |
+
+`max_connections` also applies to `lmtp` (unset, `0` or less gives 1000) and `lmtp_proxy` listeners.
+`lmtp_proxy` ignores the per-user limits, with a warning.
 
 What a client sees:
 
 - Over `max_connections` or `max_connections_per_ip`: the TCP connection is closed before any
   greeting or TLS handshake. Sora sends no banner on purpose, so a flooder cannot see where the limit
   is.
-- Over a per-user limit on the IMAP backend: `NO [LIMIT] Maximum connections reached` after a
-  correct login.
+- Over a per-user limit on a backend, after a correct login: `NO [LIMIT] Maximum connections reached`
+  (IMAP), or a temporary error, `-ERR [SYS/TEMP]` (POP3) or `NO (TRYLATER)` (ManageSieve).
 - Over a per-user limit on a proxy: `<tag> NO [LIMIT] Too many connections` and
   `* BYE Too many connections` (IMAP), `-ERR [SYS/TEMP] Too many connections` (POP3),
   `NO (TRYLATER) "Too many connections"` (ManageSieve). The connection is closed.
-
-On a backend behind proxies, `max_connections_per_user_per_ip` counts the proxy's address, not the
-client's. Set the per-user limits on the proxies instead.
 
 **Startup throttle.** For 30 seconds after a listener starts, it accepts at most about 200
 connections per second (a 5 ms pause between accepts). This spreads out the reconnect wave after a
@@ -276,21 +275,25 @@ Defaults by listener type:
 
 | Type | `command_timeout` | `absolute_session_timeout` | `min_bytes_per_minute` | `auth_idle_timeout` |
 |---|---|---|---|---|
-| `imap` | `30m` | `24h` | off | `2m`; but see 5.3 |
+| `imap` | `30m` | `24h` | off | `2m` |
 | `pop3` | `10m` | `24h` | off | `2m` |
 | `managesieve` | `3m` | `24h` | off | `2m` |
 | `imap_proxy` | `30m` | `24h` | off | `2m` |
 | `pop3_proxy` | `10m` | `24h` | off | `2m` |
 | `managesieve_proxy` | `3m` | `24h` | off | `2m` |
-| `lmtp` | not used (fixed: 5 min to read, 2 min to write) | not used | not used | not used |
-| `lmtp_proxy` | not used | `5m` | not used | `2m`, per read until the first recipient is accepted, and while message data is relayed |
+
+LMTP:
+
+- On `lmtp`, an idle timeout of 5 minutes bounds each read from the client, between commands and
+  while message data arrives; an idle connection gets a `421` reply. Each write may take 2 minutes.
+- On `lmtp_proxy`, `absolute_session_timeout` defaults to `5m`, and `auth_idle_timeout` (`2m`)
+  bounds each read until the first recipient is accepted, and while message data is relayed.
 
 Notes:
 
 - On `pop3` and `managesieve` backends, `command_timeout = "0"` does not turn the idle timer off. The
   protocol library then uses its own default: 10 minutes for POP3, 30 minutes for ManageSieve. On
   the other types, `0` turns the idle timer off (before login, `auth_idle_timeout` still applies).
-- A value that does not parse is logged and replaced by a fallback value.
 - `command_timeout`, `absolute_session_timeout` and `min_bytes_per_minute` reload on SIGHUP for the
   six IMAP, POP3 and ManageSieve types, and `auth_idle_timeout` for the three proxies. Reloaded values
   apply to connections accepted afterwards.
@@ -303,7 +306,6 @@ Notes:
 | `imap_proxy` | `* BYE Idle timeout, please reconnect` | `* BYE Maximum session duration exceeded, please reconnect` | `* BYE Connection too slow, please reconnect` |
 | `pop3` | `-ERR Idle timeout, connection timed out` | `-ERR [IN-USE] Maximum session duration exceeded` | `-ERR [IN-USE] Connection too slow, please reconnect` |
 | `managesieve` | `BYE (TRYLATER) "Connection timed out due to inactivity, please reconnect"` | `BYE (TRYLATER) "Maximum session duration exceeded, please reconnect"` | `BYE (TRYLATER) "Connection too slow, please reconnect"` |
-| `lmtp` | a `421` reply | n/a | n/a |
 
 The connection is then closed. Each timeout is logged as `Connection closed - timeout` with a
 `reason` and counted in `sora_connection_timeouts_total{protocol, server_name, hostname, reason}`,
@@ -330,14 +332,11 @@ reasonable value. The guard works on `imap`, `pop3`, `managesieve` and their thr
 
 ### 5.3 Limits of the IMAP library
 
-The IMAP backend's protocol library has two fixed read limits of its own:
-
-- Before login, it waits at most **30 seconds** for each command. This is shorter than the default
-  `auth_idle_timeout`, so on `imap` listeners the 30 seconds win.
-- After login, it closes a connection silently after **35 minutes** without a command. A
-  `command_timeout` of 35 minutes or more is therefore capped, and Sora warns at startup:
-  `IMAP: command_timeout is at or above the protocol library's 35m read deadline; idle sessions will
-  be closed silently at 35m instead`.
+The IMAP backend's protocol library has a fixed read limit of its own: after login, it closes a
+connection silently after **35 minutes** without a command. A `command_timeout` of 35 minutes or
+more is therefore capped, and Sora warns at startup:
+`IMAP: command_timeout is at or above the protocol library's 35m read deadline; idle sessions will
+be closed silently at 35m instead`.
 
 ### 5.4 Per-command time limits
 
@@ -516,15 +515,14 @@ same key on every node. Details are in [STORAGE.md](STORAGE.md).
 
 | Protection | Counted |
 |---|---|
-| Authentication rate limits (counts, delays, blocks) | Per listener on each node. Not shared, with or without the cluster. |
 | Limit of 10 waiting logins per IP | Per node, over all its listeners. |
-| `max_connections`, `max_connections_per_ip` | Per listener on each node. |
+| `max_connections`; `max_connections_per_ip` on backends | Per listener on each node. |
 | `max_connections_per_user`, `..._per_user_per_ip` on proxies | Across the cluster, through gossip. Not enforced without `[cluster]`. |
 | `max_connections_per_user`, `..._per_user_per_ip` on backends | Per listener. |
 | Search rate limit | Per account in each IMAP listener of each node. |
 | Session memory, error counts, timeouts | Per connection. |
-| Lookup caches | Per listener; the cluster tells other nodes to drop an account's entries after a kick or an Admin API change. |
-| Auth cache | Per proxy node. |
+| Lookup caches | Per listener; an account's entries are dropped on every node after a kick or an Admin API change. |
+| Auth cache | Per proxy node; an account's entries are dropped on every node after an Admin API change. |
 
 See [CLUSTER.md](CLUSTER.md#7-what-the-cluster-does-not-share).
 
@@ -535,10 +533,11 @@ See [CLUSTER.md](CLUSTER.md#7-what-the-cluster-does-not-share).
 Sora **refuses to start** when:
 
 - a listener has `proxy_protocol = true` and `[servers] trusted_networks` is empty (section 3.2);
+- a `[servers] trusted_networks` entry is neither an IP address nor a CIDR block;
 - a block sets `master_username` without `master_password`, or `master_sasl_username` without
   `master_sasl_password` ([AUTHENTICATION.md](AUTHENTICATION.md#8-master-credentials));
 - `master_sasl_allowed_networks` has an entry that is not an IP or CIDR;
-- an `auth_rate_limit` duration is not a Go duration (for example `"1d"`);
+- an `auth_rate_limit` duration does not parse;
 - an `http_admin_api` block has a missing, short or placeholder `api_key`, or an `http_user_api` block
   a missing, short or placeholder `jwt_secret` (section 11);
 - a listener has `tls = true` with neither certificate files nor a global `[tls]` section

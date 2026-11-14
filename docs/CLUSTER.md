@@ -63,7 +63,7 @@ You need the cluster when you want any of the following:
 |---|---|
 | `max_connections_per_user` or `max_connections_per_user_per_ip` on an IMAP, POP3 or ManageSieve **proxy** | A proxy only tracks per-user connections in cluster mode. Without the cluster these two keys have no effect on a proxy, even on a single proxy node. |
 | To kick a user's proxy sessions with `sora-admin connections kick` or the admin API | The kick reaches proxy sessions only through the cluster's connection tracker. |
-| `enable_affinity = true` on a proxy | The affinity store only exists in cluster mode. |
+| `enable_affinity = true` on a proxy | The affinity store only exists in cluster mode, with `[cluster.affinity] enabled = true`. |
 | Several nodes that use Let's Encrypt with one S3 bucket | Without the cluster every node orders and renews certificates on its own. See [TLS.md](TLS.md#8-lets-encrypt-in-a-cluster). |
 
 A single proxy node can run a cluster of one: set `enabled = true`, leave `peers` empty, and the
@@ -90,15 +90,16 @@ addr = "10.0.0.11:7946"     # this node's own address, reachable from the other 
 
 Rules for `addr`:
 
-- It must be an **IPv4 address literal** that exists on this host and that the other nodes can
-  reach. Sora binds to it and advertises it unchanged.
-- `0.0.0.0`, `localhost`, an empty value, `::` and `::1` are refused at startup with
-  `cluster addr '<value>' must be a specific IP address reachable from other nodes`. Other IPv6
-  addresses and host names fail at startup inside memberlist (`failed to create memberlist: ...`):
-  Sora splits `addr` at the first colon, so IPv6 cannot be used.
-- `127.0.0.1` is accepted with a warning. It only works when every node runs on the same machine.
-- The port can be written in `addr` (`"10.0.0.11:7946"`) or in `port`. If `addr` has a port, it
-  wins and a warning says `port` is ignored. With neither, the port is `7946`.
+- It must be an **IP address literal** (IPv4 or IPv6) that exists on this host and that the other
+  nodes can reach. Sora binds to it and advertises it unchanged.
+- `0.0.0.0`, `localhost`, an empty value and `::` are refused at startup with
+  `cluster addr '<value>' must be a specific IP address reachable from other nodes`. Host names fail
+  at startup inside memberlist (`failed to create memberlist: ...`).
+- `127.0.0.1` and `::1` are accepted with a warning. They only work when every node runs on the same
+  machine.
+- The port can be written in `addr` (`"10.0.0.11:7946"`, or `"[2001:db8::11]:7946"` for IPv6) or in
+  `port`. If `addr` has a port, it wins and a warning says `port` is ignored. With neither, the port
+  is `7946`.
 
 ### Ports to open
 
@@ -125,10 +126,11 @@ peers = ["10.0.0.12:7946", "10.0.0.13:7946"]
   list all the other nodes, so a node can start whichever of them is up.
 - If no peer answers, the node starts anyway. It logs
   `Failed to join cluster peers (will retry in background)` and tries again every 10 seconds.
-- The retry stops once the node sees at least as many members as it has peers, plus itself. A peer
-  that is gone for good keeps the retry running, with an Info log line every 10 seconds.
-- Do not list the node itself. Sora removes an entry only if it is exactly equal to this node's
-  `node_id`, which an address never is.
+- For as long as it runs, the node keeps re-joining the configured peers that are not current
+  members. A peer that comes back, or the other side of a healed network split, rejoins the cluster
+  without a restart.
+- An entry equal to this node's own address is dropped, with a warning, so all nodes can share one
+  `peers` list.
 
 ### Node names
 
@@ -140,10 +142,6 @@ Each node has a name in the cluster, `node_id`. It defaults to the host name.
   name, see [ARCHITECTURE.md](ARCHITECTURE.md)), and it is not the upload lease identity, which
   comes from `[uploader] instance_id` (see [STORAGE.md](STORAGE.md)). Changing `node_id` does not
   affect queued uploads.
-
-The connection tracker names each proxy listener by **host name plus `[[server]]` name**, not by
-`node_id`. Two nodes with the same host name and a proxy listener of the same name would read each
-other's events as their own and ignore them. Give every node a distinct host name.
 
 ---
 
@@ -232,9 +230,8 @@ Details:
 - The LMTP proxy keeps a local tracker only, never gossips, and never enforces these limits on
   delivery connections.
 - Without the cluster, these proxies run no tracker, and the two keys do nothing on a proxy.
-- On backends (`imap`, `pop3`, `managesieve`), the same keys are counted per server, from local
-  counts only, and never shared. Which backend protocols enforce them is described in
-  [SECURITY.md](SECURITY.md).
+- On backends (`imap`, `pop3`, `managesieve`), the same keys are enforced per server, from local
+  counts only, and never shared. See [SECURITY.md](SECURITY.md).
 
 The admin API shows these counts: `GET /admin/connections` lists the users connected to this node,
 each with `local_count` (this node) and `total_count` (the whole cluster). See
@@ -261,24 +258,23 @@ What this means for you:
   `503 Connection tracking not available (requires cluster mode)`.
 - Backend trackers do not gossip. A kick closes backend sessions only on the node whose admin API
   handled it. Closing a proxy session also closes its connection to the backend.
-- After a password change or a deleted credential made through the admin API, every proxy node
-  drops the user's entries from its lookup cache, so the next login is looked up again instead of
-  waiting for the entry to expire. The proxies' persistent auth cache (`[auth_cache]`) is not
-  touched by these events; how it handles a changed password is described in
-  [PROXY.md](PROXY.md).
+- A password change, a removed credential or a deleted account made through the admin API or
+  `sora-admin` takes effect on every node, whichever node or tool makes it: every proxy node
+  drops the user's entries from its lookup cache and from its persistent auth cache
+  (`[auth_cache]`), so the next login is checked again instead of waiting for the entry to
+  expire, and the sessions of a deleted account are closed.
 
 ### 6.3 Backend affinity
 
 Affinity remembers which backend a user was last routed to, per protocol, so the next connection
-goes to the same backend (warm caches, fewer surprises for clients). The IMAP, POP3, ManageSieve
-and LMTP proxies use it only when their `[[server]]` block sets `enable_affinity = true`; the User
-API proxy uses it whenever the cluster is on. How routing uses affinity is described in
+goes to the same backend (warm caches, fewer surprises for clients). The proxies use it only when
+their `[[server]]` block sets `enable_affinity = true`. How routing uses affinity is described in
 [PROXY.md](PROXY.md).
 
 The cluster shares the affinity store:
 
-- When the cluster is on, every node has an affinity store, whatever `[cluster.affinity] enabled`
-  says. Without the cluster there is no store, and `enable_affinity` has no effect.
+- A node has an affinity store when the cluster is on and `[cluster.affinity] enabled = true`.
+  Without it, `enable_affinity` has no effect.
 - Each assignment, change and removal is gossiped to every node. When two nodes disagree, the
   newer assignment wins.
 - An entry expires after `[cluster.affinity] ttl` (default `24h`), counted from when it was set.
@@ -288,15 +284,14 @@ The cluster shares the affinity store:
   node writes every entry to a local SQLite file and loads it at startup.
 - The admin API can read one entry (`GET /admin/affinity?user=...&protocol=imap`), set and
   delete entries (`POST` and `DELETE /admin/affinity`), and count them (`GET /admin/affinity/stats`).
-  A change made there is gossiped too. Listing all entries (`/admin/affinity/list`) answers
-  `501 Not Implemented`. See [ADMIN_API.md](ADMIN_API.md).
+  A change made there is gossiped too. See [ADMIN_API.md](ADMIN_API.md).
 
 ### 6.4 Let's Encrypt leadership
 
 The cluster decides which node may order certificates (the leader, section 5). The certificates
 themselves never travel over the cluster: nodes share them through an S3 bucket. On nodes that have
-a database, a PostgreSQL lock additionally makes sure only one node orders a new certificate for a
-name at a time. See [TLS.md](TLS.md#8-lets-encrypt-in-a-cluster).
+a database, a PostgreSQL lock additionally makes sure only one node orders or renews a certificate
+for a name at a time. See [TLS.md](TLS.md#8-lets-encrypt-in-a-cluster).
 
 ---
 
@@ -306,11 +301,10 @@ These stay on one node, or live in PostgreSQL:
 
 | Thing | Where it lives |
 |---|---|
-| Authentication rate limits (failure counts, delays, IP blocks) | In the memory of each listener on each node. An attacker spreading attempts over several nodes meets each node's limits separately. `[cluster.rate_limit_sync]` exists in the config but nothing reads it. See [AUTHENTICATION.md](AUTHENTICATION.md). |
-| `max_connections` and `max_connections_per_ip` | Counted per listener on each node. |
-| Per-user limits on backends | Counted per backend server (see [SECURITY.md](SECURITY.md) for which protocols enforce them). |
+| `max_connections` | Counted per listener on each node. |
+| Per-user limits on backends | Counted per backend server. |
 | The proxies' lookup cache | Per proxy server, in memory. The cluster only tells it to drop a user's entries (section 6.2). |
-| The proxies' auth cache (`[auth_cache]`) | A local SQLite file per node. The cluster does not touch it. |
+| The proxies' auth cache (`[auth_cache]`) | A local SQLite file per node. |
 | Backend health checks | Each proxy checks its backends itself. |
 | Backend maintenance mode | The `backend_maintenance` table in PostgreSQL, polled by every proxy. See [PROXY.md](PROXY.md). |
 | Certificates | The Let's Encrypt S3 bucket and each node's local fallback directory. See [TLS.md](TLS.md). |
@@ -354,14 +348,11 @@ next full-state exchange (within about 30 seconds) and only new affinity assignm
 ### A network split
 
 The cluster has no quorum. During a split each side sees only its own members and elects its own
-leader. For Let's Encrypt this means both sides may renew certificates; ordering a **new**
-certificate is still limited to one node on nodes with a database (section 6.4).
+leader. For Let's Encrypt this means both sides have a leader; ordering or renewing a certificate
+is still limited to one node at a time on nodes with a database (section 6.4).
 
-After the network heals, memberlist only keeps trying to reach a member it declared dead for about
-30 seconds. Sora retries its `peers` list only at startup, until it has seen all of them. So a
-split that lasted longer than about 30 seconds may leave the two sides as two clusters. Check the
-`Cluster leader changed` lines (section 10); if the sides still name different leaders, restart the
-nodes on one side so they join again.
+After the network heals, each node re-joins the configured peers that are not current members, so
+the two sides merge into one cluster again and agree on one leader.
 
 ### Clocks
 
@@ -399,8 +390,8 @@ These details matter when you size a busy cluster or read a warning in the log.
   `Cluster: Gossip handler queue full, dropping events` is logged (at most every 10 seconds).
 - **Full-state exchange.** Every 30 seconds each node exchanges its connection tracker state with
   one random member over TCP. memberlist refuses a state larger than 20 MB.
-- **memberlist's own log.** Sora passes only memberlist's gossip and broadcast lines to its log, at
-  Debug level. memberlist's own warnings and errors are not logged.
+- **memberlist's own log.** Sora logs memberlist's errors and warnings at Error and Warn level, for
+  example `memberlist: Decrypt packet failed` from a node with a different `secret_key`.
 
 ---
 
@@ -414,9 +405,6 @@ Sora has no command or endpoint that lists the members. Use the log, the admin A
 - `Join returned - contacted peers` and `Cluster members after join (expected 2+)` with the member
   count when the join worked, or `Failed to join cluster peers (will retry in background)` when it
   did not.
-- `Cluster: Successfully joined all peers - stopping retry loop` only when one of its own retries
-  completes the join. A node that the others joined, or that saw all its peers at the first
-  attempt, stops retrying without an Info line.
 - `Cluster leader changed` whenever its view of the leader changes.
 
 Every node should end up naming the same leader. With the default logging to standard error under
@@ -457,17 +445,18 @@ The tracker metrics are refreshed every minute, the affinity metrics every `clea
 ## 11. Configuration reference
 
 The cluster is configured once per node. Sora reads `[cluster]` only at startup; a SIGHUP reload
-does not apply changes to it and does not report them. Restart the node instead.
+reports changes to it as changed but requiring a restart to take effect. Restart the node to apply
+them.
 
 ### `[cluster]`
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | `false` | Join a gossip cluster. |
-| `addr` | string | none | This node's gossip address: an IPv4 address, optionally with `:port`. Required when `enabled`. See [section 3](#3-membership-addresses-ports-and-peers). |
+| `addr` | string | none | This node's gossip address: an IP address, optionally with `:port` (IPv6 in brackets with a port: `[2001:db8::11]:7946`). Required when `enabled`. See [section 3](#3-membership-addresses-ports-and-peers). |
 | `port` | integer | `7946` | Gossip port, TCP and UDP, used when `addr` has no port. |
 | `node_id` | string | the host name | This node's name in the cluster. Unique per node; the smallest leads. |
-| `peers` | list of strings | `[]` | Other nodes to contact at startup, as `host` or `host:port`. |
+| `peers` | list of strings | `[]` | Other nodes to join, as `host` or `host:port`. An entry for this node's own address is dropped. |
 | `secret_key` | string | none | Base64 of exactly 32 bytes. Required when `enabled`. The same on every node. |
 | `max_event_queue_size` | integer | `50000` | Outgoing connection events each proxy tracker may queue. A value of `0` or less means the default. |
 
@@ -475,23 +464,13 @@ does not apply changes to it and does not report them. Restart the node instead.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | Has no effect. The affinity store exists whenever the cluster is on; the mail proxies opt in with `enable_affinity`. |
+| `enabled` | bool | `false` | Run the cluster-wide affinity store on this node. The proxies opt in with `enable_affinity`. |
 | `ttl` | duration | `"24h"` | How long an affinity entry lives after it is set. An invalid value logs a warning and uses `24h`. |
 | `cleanup_interval` | duration | `"1h"` | How often expired entries are removed (and the affinity metrics refreshed). An invalid value logs a warning and uses `1h`. |
 | `cache_path` | string | `""` | Path of a SQLite file that keeps affinity entries across restarts. Empty keeps them in memory only. The directory must exist and be writable; if the file cannot be opened Sora logs `Failed to initialize affinity cache - continuing without persistence` and runs without it. A corrupt file is deleted and recreated. |
 
 Durations accept Go units (`"30m"`, `"24h"`) and days (`"7d"`); see
 [CONFIGURATION.md](CONFIGURATION.md).
-
-### `[cluster.rate_limit_sync]`
-
-| Key | Type | Meaning |
-|---|---|---|
-| `enabled` | bool | Read but not used. |
-| `sync_blocks` | bool | Read but not used. |
-| `sync_failure_counts` | bool | Read but not used. |
-
-Authentication rate limits are kept per node; see [section 7](#7-what-the-cluster-does-not-share).
 
 ### Related `[[server]]` keys
 
@@ -515,6 +494,7 @@ peers = ["10.0.0.12:7946", "10.0.0.13:7946"]
 secret_key = "REPLACE-WITH-OUTPUT-OF-openssl-rand-base64-32"
 
 [cluster.affinity]
+enabled = true
 ttl = "24h"
 cleanup_interval = "1h"
 cache_path = "/var/cache/sora/affinity.db"
@@ -532,7 +512,5 @@ On the other nodes only `node_id`, `addr` and `peers` change.
 | [server/gossip.go](../server/gossip.go) | Shared gossip plumbing: bounded transmit queues, priority tiers, duplicate suppression, tombstones for out-of-order removals, the 5-minute staleness rule. |
 | [server/connection_tracker.go](../server/connection_tracker.go) | Per-user connection counts, limits, kicks, "forget logins", heartbeats, state reconciliation. |
 | [server/affinity_manager.go](../server/affinity_manager.go) | Affinity store, its gossip and its optional SQLite persistence ([affinitycache/](../affinitycache/)). |
-| [server/ip_limit_tracker.go](../server/ip_limit_tracker.go) | Cluster-wide per-IP counts. The proxies can use it, but the server does not pass them the cluster, so it is not active. |
-| [server/auth_rate_limiter_cluster.go](../server/auth_rate_limiter_cluster.go) | Cluster sync for authentication rate limits. Not connected to any server. |
 | [tlsmanager/](../tlsmanager/) | Uses leadership for Let's Encrypt; see [TLS.md](TLS.md). |
 | [cmd/sora/main.go](../cmd/sora/main.go) | Starts the cluster, the affinity store and the proxy trackers. |

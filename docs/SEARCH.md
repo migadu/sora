@@ -34,7 +34,7 @@ Sora keeps message metadata in PostgreSQL and message bodies in S3. A search nev
 runs entirely in PostgreSQL, on two kinds of data:
 
 - **Header columns.** Each message row in the `messages` table carries the headers clients
-  search most: Subject, the first From, To and Cc address, Message-ID, In-Reply-To and
+  search most: Subject, the From, To and Cc addresses, Message-ID, In-Reply-To and
   References, plus all recipients as JSON. Header criteria match these columns directly.
 - **Body vectors.** The text of each message body is turned into a PostgreSQL `tsvector`, a list
   of the words in the text, and stored in the table `messages_fts_v2`. Body criteria match these
@@ -68,26 +68,21 @@ it with `strpos()`, so `%` and `_` in a term are ordinary characters, not wildca
 | Criterion | Column | How it matches |
 |---|---|---|
 | `SUBJECT` | `subject` | Substring of the decoded Subject. |
-| `FROM` | `from_email_sort`, `from_name_sort` | Substring of the address or the display name of the **first** From address. |
-| `TO` | `to_email_sort`, `to_name_sort` | Substring of the address or the display name of the **first** To address. |
-| `CC` | `cc_email_sort` | Substring of the **first** Cc address. Display names are not searched. |
-| `BCC`, `HEADER Reply-To` | `recipients_json` | The term must equal a whole Bcc or Reply-To address. Any of them can match. |
+| `FROM` | address columns | Substring of any From address or display name. |
+| `TO` | address columns | Substring of any To address or display name. |
+| `CC` | address columns | Substring of any Cc address or display name. |
+| `BCC`, `HEADER Reply-To` | `recipients_json` | Substring of any Bcc or Reply-To address. |
 | `HEADER Message-ID` | `message_id` | Equal to the Message-ID, ignoring case. Angle brackets in the term are optional. |
-| `HEADER In-Reply-To` | `in_reply_to` | Equal to the whole stored value, ignoring case. Sora stores the message IDs without angle brackets, separated by spaces. |
-| `HEADER References` | `references` | Substring of the stored chain of message IDs (without angle brackets), ignoring case. |
+| `HEADER In-Reply-To` | `in_reply_to` | Substring of the stored message IDs, ignoring case. Angle brackets in the term are optional. |
+| `HEADER References` | `references` | Substring of the stored chain of message IDs, ignoring case. Angle brackets in the term are optional. |
 | `HEADER` with any other name | none | Matches no message. Sora logs `HEADER search on non-indexed header returns no results` at debug level. |
 
 What this means for users:
 
-- **Only the first address of each kind is searchable by `FROM`, `TO` and `CC`.** A message sent
-  to `alice@example.com, bob@example.com` matches `TO alice` but not `TO bob`. The full list of
-  recipients is stored, but only `BCC` and `HEADER Reply-To` search it, and only by whole address.
-- **`BCC` and `Reply-To` compare the whole address.** Sora lowercases the term but stores the
-  address as it appeared in the header. An address written with capital letters in the message
-  does not match.
-- **Search terms with angle brackets.** `HEADER Message-ID "<id@example.com>"` works.
-  `HEADER In-Reply-To` and `HEADER References` with angle brackets in the term do not match,
-  because the stored IDs have none.
+- **Every address counts.** A message sent to `alice@example.com, bob@example.com` matches both
+  `TO alice` and `TO bob`.
+- **Search terms with angle brackets.** `HEADER Message-ID "<id@example.com>"`,
+  `HEADER In-Reply-To "<id@example.com>"` and `HEADER References "<id@example.com>"` all work.
 - **Headers such as `List-Id`, `X-Spam-Flag` or `Sender` are not searchable.** The command
   succeeds with no matches.
 
@@ -162,8 +157,8 @@ anywhere in the text. So:
 ### TEXT
 
 IMAP `TEXT` searches the header and the body. Sora answers it as "the body matches the term as
-described above, **or** the term is a substring of the Subject, or of the first From, To or Cc
-address or name". The header half follows the rules of [section 2](#2-header-search).
+described above, **or** the term is a substring of the Subject, or of a From, To or Cc address or
+name". The header half follows the rules of [section 2](#2-header-search).
 
 ### Shared mailboxes
 
@@ -311,7 +306,7 @@ fts_retention = "365d"   # keep body search for mail sent in the last year
 | a duration, such as `"180d"` or `"4320h"` | Vectors of messages sent longer ago than this are deleted. |
 
 Durations take Go units (`h`, `m`, `s`) or a whole number of days (`"180d"`). An invalid value is
-logged as a warning and treated as empty (keep forever).
+logged as a warning and treated as empty (keep forever). A negative value stops startup.
 
 How it works:
 
@@ -346,8 +341,9 @@ above; plan for it.
 Besides retention, the cleaner removes FTS rows in two more ways.
 
 **Orphans.** When the last message of a body in an account is permanently deleted, that account's
-FTS row is not needed any more. In each cycle the cleaner scans `messages_fts_v2` in key order from
-the start, up to 1,000,000 rows or 30 seconds, collects at most 1000 rows that no message refers
+FTS row is not needed any more. In each cycle the cleaner scans `messages_fts_v2` in key order,
+continuing where the previous cycle stopped and starting again from the beginning once it reaches
+the end, up to 1,000,000 rows or 30 seconds. It collects at most 1000 rows that no message refers
 to, and deletes them. Before deleting, it checks each row again, so a message delivered in the
 meantime keeps its row. The cleaner logs `Cleanup: Deleted orphaned FTS vectors` with the count.
 
@@ -413,7 +409,7 @@ Before it builds a query, Sora checks the criteria of every `SEARCH`, `SORT`, `T
 multi-mailbox `ESEARCH` ([db/search_validator.go](../db/search_validator.go)). A "group" below is
 the top level of the criteria or the inside of one `NOT` or `OR` branch.
 
-These are answered with `NO [SERVERLIMIT] Search criteria too complex`:
+These are answered with `NO [LIMIT] Search criteria too complex`:
 
 | Limit | Value |
 |---|---|
@@ -426,14 +422,15 @@ These are answered with `NO [SERVERLIMIT] Search criteria too complex`:
 | Flag and keyword tests in one group | 20 |
 | Nesting depth of `NOT` and `OR` | 30 |
 | Criteria nodes in the whole command | 256 |
-| Span between `SINCE` and `BEFORE`, or between `SENTSINCE` and `SENTBEFORE` | 365 days |
 
 These are answered with `BAD [CLIENTBUG] Search criteria invalid`:
 
-- an empty `BODY` or `TEXT` term, or a term containing a NUL character;
-- `SINCE` later than `BEFORE`, or `SENTSINCE` later than `SENTBEFORE`;
-- `LARGER` greater than or equal to `SMALLER`;
+- a term containing a NUL character;
 - an empty header name.
+
+Criteria that cannot match, such as `SINCE` later than `BEFORE` or `LARGER` greater than or equal
+to `SMALLER`, are valid: the search succeeds with no matches. An empty `BODY` or `TEXT` term
+matches every message.
 
 The client sees only the generic text. Sora logs the exact reason at debug level as
 `rejecting search criteria` and counts the refusal in
@@ -557,7 +554,7 @@ NO [LIMIT] search rate limit exceeded: 60 searches per 1m0s, please wait 1s befo
 ```
 
 Each refusal is counted in `sora_imap_search_refused_total{reason="rate_limit"}` and in
-`sora_protocol_errors_total{protocol="IMAP",command="SEARCH",error_type="rate_limited"}`. The
+`sora_protocol_errors_total{protocol="imap",command="SEARCH",error_type="rate_limited"}`. The
 limiter logs a refusal at debug level at most once a minute per account.
 
 ---
@@ -572,7 +569,7 @@ limiter logs a refusal at debug level at most once a minute per account.
 - **Multi-mailbox ESEARCH** (RFC 7377, `ESEARCH IN (...)`) runs one search per mailbox in scope.
   It skips mailboxes the user may not read (the `r` right).
 - **User API search** (`GET /user/mailboxes/{name}/search?q=...`) takes one string and matches it
-  like IMAP `TEXT`: a substring of the Subject or of the first From, To or Cc address or name, or
+  like IMAP `TEXT`: a substring of the Subject or of any From, To or Cc address or name, or
   all of its words in the body. It returns the newest 100 matches by arrival time. It is not
   charged to the search rate limit. See [USER_API.md](USER_API.md).
 
@@ -612,7 +609,8 @@ See [METRICS.md](METRICS.md) for the full list.
 - If users report that body search misses new mail, check `sora_fts_queue_depth` and the worker's
   log lines first.
 - If users report that a header search misses mail, check the rules in
-  [section 2](#2-header-search): first address only, whole-address `BCC`, no other headers.
+  [section 2](#2-header-search): only the headers listed there are searchable, and very long
+  values are cut.
 - If a node logs many search timeouts, look at `sora_db_query_duration_seconds` by `operation`
   before you raise the timeouts.
 

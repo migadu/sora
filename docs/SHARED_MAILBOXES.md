@@ -88,11 +88,11 @@ mailboxes stay visible and usable for the users who have rights on them.
 
 ## 3. The shared namespace
 
-- The prefix is `namespace_prefix`, default `Shared/`. **End it with `/`.** Sora compares names by
-  prefix, so `Shared` without the slash would also match a folder called `SharedNotes`, and an
-  empty prefix would make every new folder shared.
+- The prefix is `namespace_prefix`, default `Shared/`. Sora refuses to start with an empty prefix
+  while sharing is on.
 - A name is in the namespace when it starts with the prefix, or equals the prefix without its
-  trailing `/` (the root, `Shared`). Case does not matter.
+  trailing `/` (the root, `Shared`). Case does not matter. A folder such as `SharedNotes` is an
+  ordinary personal folder.
 - **The root is a container.** `CREATE Shared` is refused with
   `NO [CANNOT] Cannot create the shared namespace root directly...`, and `SELECT Shared` with
   `NO [CANNOT] The shared namespace root cannot be selected...`. When the root exists as a parent
@@ -134,8 +134,8 @@ created it.
 
 ### Other paths create personal folders
 
-The User API and Sieve `fileinto :create` never create shared folders. A folder they create under
-the prefix is a personal folder.
+The User API never creates shared folders; a folder it creates under the prefix is a personal
+folder. Sieve `fileinto :create` never creates a folder in the shared namespace.
 
 ### The initial ACL
 
@@ -247,7 +247,7 @@ and authentication are in [ADMIN_API.md](ADMIN_API.md).
 
 The admin tools follow the same rules as IMAP: shared namespace only, same domain, and the
 `anyone` setting. They read that setting from the `[shared_mailboxes]` section of the config they
-run with; when that section has `enabled = false`, they do not restrict `anyone`.
+run with, whether or not that section has `enabled = true`.
 
 ---
 
@@ -320,7 +320,8 @@ A shared folder has no address of its own; LMTP always delivers to a user's acco
 script can file into a shared folder with `fileinto "Shared/Sales"` if the user has the `i` right.
 Without it, the message goes to the user's own INBOX and Sora logs
 `fileinto denied: no insert right on shared mailbox, delivering to INBOX`. `fileinto :create` with
-a shared folder's name creates a personal folder of that name instead ([SIEVE.md](SIEVE.md#5-what-each-action-does)).
+an existing shared folder's name files into that folder, exactly as without `:create`
+([SIEVE.md](SIEVE.md#5-what-each-action-does)).
 
 ### Search
 
@@ -341,12 +342,13 @@ Spam training reacts only to a folder named exactly `Junk`, so moves into a shar
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | `false` | Turns sharing on. |
-| `namespace_prefix` | string | `"Shared/"` | The prefix of the shared namespace. End it with `/`, and never leave it empty while sharing is on. |
+| `namespace_prefix` | string | `"Shared/"` | The prefix of the shared namespace: `Shared/` covers the root `Shared` and the names under `Shared/`. Must not be empty while sharing is on. |
 | `allow_user_create` | bool | `false` | Lets users create top-level shared folders over IMAP. Off: only `sora-admin mailbox create` can. |
 | `allow_anyone_identifier` | bool | `false` | Lets rights be granted to `anyone` (every user of the owner's domain). |
 | `default_rights` | string | `"lrswipkxtea"` | Rights stored as the creator's entry on a new top-level shared folder. Has no practical effect, since the creator is the owner ([section 4](#4-creating-shared-mailboxes)). |
 
-All keys are read at startup. Sora does not validate `namespace_prefix` or `default_rights`.
+All keys are read at startup. Sora checks `namespace_prefix` at startup; it does not validate
+`default_rights`.
 
 ```toml
 [shared_mailboxes]

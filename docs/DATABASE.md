@@ -52,7 +52,7 @@ by their BLAKE3 hash.
 | `redirect_log` | Sieve redirects per account, for the redirect rate limit. |
 | `metadata` | IMAP METADATA entries. |
 | `locks` | Named locks with an expiry, for work that must run on exactly one node (TLS certificate issuance). |
-| `health_status` | Health history of each node's components. |
+| `health_status` | Current health of each node's components. |
 | `cache_metrics` | Hit and miss counts of each node's local cache. |
 | `schema_migrations` | The schema version and its dirty flag ([section 9](#9-migrations)). |
 
@@ -161,7 +161,7 @@ key is missing from the file.
 | `hosts` | list of strings | `["localhost"]` | Database hosts. Each entry is a name or address, optionally with a port (`"db1.example.com:5433"`). With several hosts, Sora uses one at a time and fails over to the next ([section 7](#7-failover-retries-and-circuit-breakers)). |
 | `port` | integer or string | `5432` | Port for host entries written without one. |
 | `user` | string | `"postgres"` | Database user. |
-| `password` | string | `""` | Password. See the character rule below. |
+| `password` | string | `""` | Password. |
 | `name` | string | `"sora_mail_db"` | Database name. |
 | `tls` | boolean | `false` | Encrypt the connection. See [TLS](#tls) below. |
 | `max_connections` | integer | `100` | Most connections in one pool. See [section 4](#4-connection-pools). |
@@ -171,8 +171,7 @@ key is missing from the file.
 | `max_conn_idle_time` | duration | `"5m"` | An idle connection above `min_idle_connections` is closed after this time. |
 | `query_timeout` | duration | `"30s"` | Timeout of read queries. See [section 6](#6-timeouts). |
 
-The defaults of `hosts`, `user` and `name` are not a usable database: together they mean "not
-configured" (see the rules below), so always set at least `hosts`, `user` and `name`.
+Always set at least `hosts`, `user` and `name`.
 
 Durations take Go units such as `"30s"`, `"5m"`, `"1h"`, or a whole number of days such as
 `"7d"`. Setting `max_connections`, `min_connections` or `min_idle_connections` to `0` (or a
@@ -183,22 +182,13 @@ CPUs, whichever is larger).
 
 - **Nothing is inherited.** `[database.read]` does not copy `user`, `password` or `name` from
   `[database.write]`. Repeat them, or the read endpoint uses the defaults above.
-- **An endpoint left at the built-in values counts as not configured.** When an endpoint's
-  `hosts` is exactly `["localhost"]`, its `user` is `"postgres"` and its `name` is
-  `"sora_mail_db"`, Sora treats it as absent, whatever the password and port. This is how a
-  proxy-only node runs without a database. If your real database matches all three values, change
-  one of them, for example write `hosts = ["127.0.0.1"]`. A node that needs a database and has
-  none refuses to start with `database is required for configured servers but not configured in
-  [database.write] or [database.read]`.
-- **Without a read endpoint**, Sora opens a separate pool to the write endpoint for reads, with
-  the write endpoint's settings. Reads and writes then do not compete for the same pool.
-- **User name and password characters.** Sora puts the user name and password into a connection
-  URL without escaping them. A space or one of `/ ? # % [ ] ^ \` makes the connection fail, and
-  `%` followed by two hex digits is decoded. Use letters, digits and `- . _ ~` only, for example
-  a password from `openssl rand -hex 32`.
+- **An endpoint you do not write is not configured.** Without a `[database.write]` (or
+  `[database.read]`) section in the file, Sora has no such endpoint. This is how a proxy-only node
+  runs without a database. A node that needs a database and has none refuses to start with
+  `database is required for configured servers but not configured in [database.write] or
+  [database.read]`.
+- **User name and password** may contain any characters. Sora escapes them in the connection URL.
 - **IPv6 addresses** go in brackets with a port: `hosts = ["[2001:db8::10]:5432"]`.
-- **`sora-admin migrate`** reads only the first entry of `[database.write] hosts` and the `port`
-  key. For it, write the host without a port and set `port` (see [section 9](#9-migrations)).
 
 ### Global keys
 
@@ -217,11 +207,10 @@ These keys go directly under `[database]`:
 `debug` logs the arguments too, which include password hashes, addresses and message text. Use it
 only on a test system.
 
-`sora-admin` starts from empty values rather than these defaults. For it, an absent
-`write_timeout` means 10 seconds and absent pool sizes mean the driver's defaults.
+`sora-admin` uses the same defaults.
 
-Changes to `[database]` take effect on restart. A reload (SIGHUP) neither applies nor reports
-them.
+Changes to `[database]` take effect on restart. A reload (SIGHUP) reports them as changed but
+requiring a restart.
 
 ### TLS
 
@@ -247,19 +236,11 @@ With `tls = false`, Sora sends `sslmode=disable`, and `PGSSLMODE` cannot turn TL
 Each Sora process (`sora` or `sora-admin`) keeps its own pools of connections. Size PostgreSQL,
 or your pooler, for all of them together.
 
-### Two pools per host
+### Pool size
 
-For **every host** in `hosts`, Sora opens **two** pools with that endpoint's settings: one used
-for writes and one used for reads. So:
-
-| Endpoint | Upper limit of connections, per Sora process | Idle connections kept, per Sora process |
-|---|---|---|
-| each write host | 2 × `[database.write] max_connections` | 2 × `[database.write] min_idle_connections` |
-| each read host | 2 × `[database.read] max_connections` | 2 × `[database.read] min_idle_connections` |
-
-With the defaults and no read endpoint, that is up to 200 connections and 10 idle connections
-per process. With one read replica, add up to 200 connections and 20 idle connections on the
-replica. The pools grow only as load needs, but the upper limit is what PostgreSQL must be ready
+For **every host** in `hosts`, Sora opens connections with that endpoint's settings:
+`max_connections` sets the upper limit and `min_idle_connections` the idle connections kept
+ready. The pools grow only as load needs, but the upper limit is what PostgreSQL must be ready
 for.
 
 `sora-admin` connects to the write hosts only, and never to replicas.
@@ -289,7 +270,7 @@ within one process only. The wait is measured in `sora_go_mailbox_lock_wait_seco
 |---|---|
 | Every write and every write transaction | write |
 | Advisory locks ([section 8](#8-pgbouncer-and-other-connection-poolers)) | write |
-| Migrations | the first write host |
+| Migrations | the first write host that connects |
 | Reads: login lookups, folder lists, message lists, FETCH metadata, SEARCH, SORT, THREAD, the User API, metrics statistics, the cleaner's candidate scans | read |
 | Reads in a session that has already written something | write |
 | Reads that must not be fooled by a lagging replica | write |
@@ -313,7 +294,7 @@ stale answer would do harm:
 session can take as long as your replication lag to show up in a session that has not written.
 Search results lag in the same way.
 
-Without `[database.read]`, all of this goes to the write endpoint, through its two pools.
+Without `[database.read]`, all of this goes to the write endpoint.
 
 ---
 
@@ -362,21 +343,19 @@ a temporary `451` reply so your mail transfer agent retries later. See
 ### Several hosts in one endpoint
 
 `hosts` can list several hosts, for example several PgBouncer instances in front of one primary,
-or several replicas. Sora treats each host as a separate pair of pools and uses **one host at a
-time** per endpoint, the "current" one. It does not spread load across them.
+or several replicas. Sora treats each host separately and uses **one host at a time** per
+endpoint, the "current" one. It does not spread load across them.
 
-- At startup, Sora connects to every listed host. A **read** host that cannot be reached is
-  retried in the background after 30 seconds, 1, 2, 5 and then every 10 minutes. A **write** host
-  that cannot be reached is left out until the next restart. If no write host can be reached, Sora
-  exits with `Failed to initialize resilient database`.
+- At startup, Sora connects to every listed host. A host that cannot be reached, read or write,
+  is retried in the background after 30 seconds, 1, 2, 5 and then every 10 minutes. If no write
+  host can be reached, Sora exits with `Failed to initialize resilient database`.
 - If no read host can be reached at startup, reads use the write endpoint until a replica comes
   back.
 - Every 30 seconds Sora pings each host (5-second timeout). A host that fails one ping is marked
   unhealthy, and the next operation switches to the next healthy host of that endpoint. A host
   that answers again is marked healthy.
-- When every host of an endpoint is unhealthy, Sora keeps using the current one. In particular,
-  reads do **not** move to the write endpoint while Sora runs: if your only replica fails, reads
-  fail until it is back, or until you remove `[database.read]` and restart.
+- When no read host is healthy, reads use a healthy write host, as at startup, until a replica
+  answers again. When every write host is unhealthy, Sora keeps using the current one.
 - On a write host, the check also runs `SELECT pg_is_in_recovery()`. A primary that has become a
   standby after a failover is marked unhealthy and its connections are dropped. The same happens
   when a write fails with SQLSTATE `25006` (read-only transaction). New connections then reach
@@ -385,8 +364,7 @@ time** per endpoint, the "current" one. It does not spread load across them.
 So point `[database.write] hosts` at a name or address that always reaches the current primary:
 a DNS name your failover tooling updates, a virtual IP, or a pooler that follows the primary. You
 can also list every server that may become primary. The check marks the standbys unhealthy, and
-writes move to the server that answers as primary within one check interval. A write host that is
-down when Sora starts is not added later, though, so a name that follows the primary is simpler.
+writes move to the server that answers as primary within one check interval.
 
 ### Retries
 
@@ -447,8 +425,6 @@ Sora works behind PgBouncer in **session** or **transaction** pooling mode. It d
   PgBouncer's `idle_transaction_timeout` well above one minute, or turn them off. A shorter
   setting kills the lock holder; the guarded work is then abandoned and done again later, not
   lost.
-- **Migrations.** The migration library takes a session-level advisory lock while it works. Apply
-  migrations over a direct connection to PostgreSQL (see [section 9](#9-migrations)).
 - **Pool size for Sora's user.** See below.
 
 ### Connections held across S3 calls
@@ -498,10 +474,9 @@ changes stay, but `schema_migrations` is left at that version with `dirty` set.
 
 There are two ways, and they do the same thing:
 
-1. **Automatically, at startup.** Every `sora` process that opens the database (a node running
-   IMAP, POP3 or LMTP backends, an Admin or User API server, or a proxy with `lookup_local_users`)
-   applies pending migrations before it starts serving, on the first host of
-   `[database.write] hosts`.
+1. **Automatically, at startup.** Every `sora` process that opens the database applies pending
+   migrations before it starts serving, through the first host of `[database.write] hosts` that
+   it can connect to. If a migration fails, the node does not start.
 2. **By hand**, with `sora-admin migrate up`.
 
 When several nodes start at once, they elect one leader with a transaction-scoped advisory lock:
@@ -550,9 +525,9 @@ sora-admin migrate force   --config /etc/sora/config.toml 49
 | `down` | Reverts the last migration, or `--limit N` of them, or `--all`. |
 | `force VERSION` | Sets the version and clears the dirty flag, without running anything. |
 
-The tool's help asks you to stop Sora before `up`, `down` and `force`. `migrate` connects to the
-first entry of `[database.write] hosts` with the `port` key; write that host without a port and
-set `port`, or it fails with `invalid port`. All options are in [ADMIN_CLI.md](ADMIN_CLI.md).
+The tool's help asks you to stop Sora before `up`, `down` and `force`. `migrate` connects through
+`[database.write]`, with the same host and port rules as the server. All options are in
+[ADMIN_CLI.md](ADMIN_CLI.md).
 
 ### Before you upgrade
 
@@ -564,10 +539,9 @@ set `port`, or it fails with `invalid port`. All options are in [ADMIN_CLI.md](A
    below.
 3. **Check the extensions** the new migrations need ([section 2](#2-requirements)).
 4. **Decide who applies the migrations.** On a small database, the first upgraded node can do it
-   at startup. Otherwise run `sora-admin migrate up` yourself, with a config whose
-   `[database.write]` points straight at PostgreSQL rather than at a transaction pooler, and
-   start the upgraded nodes after it finishes. They then find nothing to do. This also keeps a
-   long migration from making other nodes give up after 3 × `migration_timeout`.
+   at startup. Otherwise run `sora-admin migrate up` yourself, and start the upgraded nodes
+   after it finishes. They then find nothing to do. This also keeps a long migration from making
+   other nodes give up after 3 × `migration_timeout`.
 5. **Plan the mixed-version window.** While nodes are upgraded one by one, old and new binaries
    run against the new schema. See [OPERATIONS.md](OPERATIONS.md) for upgrade order.
 
@@ -713,8 +687,8 @@ the bodies are in S3. See [STORAGE.md](STORAGE.md) and [OPERATIONS.md](OPERATION
 Header search ([SEARCH.md](SEARCH.md#2-header-search)) is answered from the index alone, which is
 fast only while the table's visibility map is current. Each new message's row is updated once
 more when its body has been uploaded, which clears the page's visibility bit until the next
-vacuum. Sora's migrations do not set per-table autovacuum options. On a busy server, consider
-vacuuming `messages` more often than PostgreSQL's default, for example:
+vacuum. On a busy server, consider vacuuming `messages` more often than PostgreSQL's default, for
+example:
 
 ```sql
 ALTER TABLE messages SET (autovacuum_vacuum_scale_factor = 0.01);
@@ -744,7 +718,7 @@ do not need cron jobs for these.
 | `sora_db_query_duration_seconds{operation,role}` | Query time. Search shapes have their own `operation` values ([SEARCH.md](SEARCH.md#8-how-a-search-is-run)). |
 | `sora_db_transactions_total{status}` | Committed and rolled-back transactions. |
 | `sora_db_transaction_duration_seconds` | Transaction time. |
-| `sora_db_pool_total_conns{role}`, `sora_db_pool_idle_conns{role}`, `sora_db_pool_in_use_conns{role}` | Connections of the write and read pools, summed over hosts. The `read` series are zero without a read endpoint. |
+| `sora_db_pool_total_conns{role}`, `sora_db_pool_idle_conns{role}`, `sora_db_pool_in_use_conns{role}` | Connections of the write and read pools, summed over hosts. |
 | `sora_db_pool_exhaustion_total{role}` | Times a pool was found more than 95% in use. |
 | `sora_go_mailbox_lock_wait_seconds` | Time writers waited for the in-memory mailbox lock. |
 | `sora_fts_queue_depth` | Search rows waiting for the FTS worker ([SEARCH.md](SEARCH.md#12-operating-search)). |
@@ -762,14 +736,11 @@ transaction` for a long time are usually the lock holders of [section 8](#8-pgbo
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Startup fails with `database is required for configured servers but not configured` | `[database.write]` is missing, or left at `localhost` / `postgres` / `sora_mail_db`. | Configure the write endpoint; if it really is that database, write `hosts = ["127.0.0.1"]` ([section 3](#3-connecting-the-write-and-read-endpoints)). |
+| Startup fails with `database is required for configured servers but not configured` | `[database.write]` is missing. | Configure the write endpoint ([section 3](#3-connecting-the-write-and-read-endpoints)). |
 | Startup fails with `Failed to initialize resilient database` | No write host could be reached. | Check the host, port, credentials and network. The line before it names the error. |
-| `failed to parse as URL` or `invalid userinfo` | A special character in the user name or password. | Use letters, digits and `- . _ ~` only. |
-| `invalid port` from `sora-admin migrate` | A port inside `hosts`, or no `port` key. | Write the host without a port and set `port`. |
 | Startup fails with `dirty migration state` | A migration failed earlier. | See [A failed migration](#a-failed-migration). |
 | Nodes exit with `timed out waiting for another instance to complete migrations` | A long migration on another node. | Let it finish, then start them; for long migrations, run `sora-admin migrate up` first or raise `migration_timeout`. |
 | `prepared statement ... does not exist` behind PgBouncer | Transaction pooling without prepared-statement support. | PgBouncer 1.21 or later with `max_prepared_statements` above zero. |
 | `out of shared memory` (SQLSTATE `53200`) | The shared lock table is full. | Look for long-held locks in `pg_locks`; with a transaction pooler, look for session-level advisory locks left behind. |
-| Reads fail after a replica went down | Sora does not move reads to the primary at runtime. | Bring the replica back, or remove `[database.read]` and restart. |
 | Writes fail with `read-only transaction` after a failover | The write host name still points at the old primary. | Point it at the new primary (DNS, virtual IP or pooler); Sora reconnects on its own. |
 | Clients get `NO [UNAVAILABLE]` under load | Timeouts, lock timeouts, an open circuit breaker or an exhausted pool. | Check the circuit breaker log lines, `sora_db_pool_in_use_conns` and slow queries in PostgreSQL. |

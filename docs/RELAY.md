@@ -29,7 +29,7 @@ What a script asks for, and when Sora skips a redirect or a reply, is in [SIEVE.
 | Message | Created by | Envelope sender | Envelope recipient |
 |---|---|---|---|
 | Sieve `redirect` | LMTP delivery, Admin API delivery | The original message's envelope sender | The redirect address |
-| Sieve `vacation` reply | LMTP delivery, Admin API delivery | The reply's `From` address (an address of the account) | The original envelope sender |
+| Sieve `vacation` reply | LMTP delivery, Admin API delivery | Empty (`<>`) | The original envelope sender |
 
 Both are put in the relay queue on the node that delivered the message. A background worker on
 that node sends them to the relay.
@@ -51,7 +51,8 @@ then kept in INBOX instead, and vacation replies are not sent.
 
 The relay has to accept these messages from the Sora node. A redirect keeps the original sender's
 address, so the relay must allow foreign senders from Sora; Sora does not rewrite the sender
-(no SRS). A vacation reply is sent from the user's own address.
+(no SRS). A vacation reply has an empty envelope sender, so the relay must also accept null-sender
+mail from Sora.
 
 ---
 
@@ -64,7 +65,7 @@ address, so the relay must allow foreign senders from Sora; Sora does not rewrit
 | empty (the default) | No relay, no queue, no worker. |
 | `"smtp"` | Messages are sent to an SMTP server. |
 | `"http"` | Messages are posted to an HTTP endpoint ([section 3](#3-the-http-relay-request)). |
-| anything else | Sora logs `FATAL: ... unsupported [relay] type "<value>": expected "smtp" or "http"` and keeps running with a queue that nothing sends. Fix the value and restart. |
+| anything else | Sora refuses to start: `unsupported [relay] type "<value>": expected "smtp" or "http"`. |
 
 ### SMTP relay
 
@@ -81,9 +82,9 @@ smtp_helo_host = "mail.example.com"
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `smtp_host` | string | none | The relay as `host:port`. Required for `type = "smtp"`. Sora does not check it at startup: without it every send fails and is retried. |
-| `smtp_tls` | bool | `false` | Use TLS. Without it the connection is plaintext and `smtp_use_starttls` is ignored. |
+| `smtp_tls` | bool | — | Use TLS. Set it explicitly; `true` is recommended. With `smtp_tls = false` the connection is plaintext and `smtp_use_starttls` is ignored. |
 | `smtp_use_starttls` | bool | `false` | With `smtp_tls = true`: connect in plaintext and upgrade with STARTTLS. The attempt fails if the relay does not offer STARTTLS. Without it, TLS starts with the first byte (the port 465 style). |
-| `smtp_tls_verify` | bool | `false` | Verify the relay's certificate against the system roots and the host name in `smtp_host`. **Off unless you turn it on.** |
+| `smtp_tls_verify` | bool | — | Verify the relay's certificate against the system roots and the host name in `smtp_host`. Set it explicitly; `true` is recommended. |
 | `smtp_tls_cert_file` | string | none | Client certificate (PEM) for TLS client authentication. Needs `smtp_tls_key_file` too. |
 | `smtp_tls_key_file` | string | none | The key for `smtp_tls_cert_file`. |
 | `smtp_helo_host` | string | the machine's hostname, or `localhost` if it has none | The name in `EHLO`. Set it to the node's fully qualified name. |
@@ -142,11 +143,9 @@ system roots, with TLS 1.2 or later.
 
 Both relay types send through a circuit breaker, which stops hammering a relay that is down.
 
-- It opens after `circuit_breaker_threshold` (default 5) temporary failures in a row. Permanent
+- It opens after `circuit_breaker_threshold` (default 5) temporary failures in a row, however long
+  each attempt took, so a relay that hangs until each attempt times out opens it too. Permanent
   failures do not count: they are answers about one message, not signs that the relay is down.
-- The failure count restarts every 10 seconds, so the breaker opens only when failures come close
-  together. A failure that takes longer than 10 seconds (a connection that hangs until it times
-  out, for example) is not counted.
 - While it is open, the worker puts messages back in the queue **without** counting an attempt.
 - After `circuit_breaker_timeout` (default `30s`) it lets up to `circuit_breaker_max_requests`
   (default 3) messages through. The first success closes it; any failure opens it again. The
@@ -228,15 +227,14 @@ When the relay is configured, Sora starts one worker per node. It:
 1. At startup, moves anything left in `processing/` back to `pending/` (a crash left it there),
    runs a cleanup pass, and sends whatever is due.
 2. Runs a pass every `worker_interval` (default `1m`).
-3. Runs a pass at once when LMTP delivery queues a message, so redirects and replies from LMTP are
-   sent right away.
+3. Runs a pass at once when a delivery, over LMTP or the Admin API, queues a message, so redirects
+   and replies are sent right away.
 4. Checks the circuit breaker every 5 seconds and runs a pass when it lets messages through.
 5. Runs a cleanup pass every `cleanup_interval` (default `1h`).
 
 A pass takes due messages, earliest retry first, up to `batch_size` (default 100), and sends up to
-`concurrency` (default 5) at the same time. Messages queued by the Admin API delivery path wait for
-the next pass. Files placed in `pending/` from outside, such as by `sora-admin relay requeue`, are
-noticed within a minute.
+`concurrency` (default 5) at the same time. Files placed in `pending/` from outside, such as by
+`sora-admin relay requeue`, are noticed within a minute.
 
 A message that was being sent when the process died is sent again after the restart. The relay
 may then receive it twice.
@@ -342,8 +340,8 @@ so run them on the node that owns the queue. They refuse to run when `[relay] ty
 | `sora-admin relay delete --config FILE --id ID\|all [--queue failed] --confirm` | Deletes one message or all messages of a queue (default queue `failed`). |
 | `sora-admin relay requeue --config FILE --id ID\|all --confirm` | Moves messages from `failed/` back to `pending/`, due now, with attempts and errors reset. |
 
-`stats` prints `max_attempts` and `worker_interval` as written in the config, not the defaults
-Sora uses when they are unset. Full flags are in [ADMIN_CLI.md](ADMIN_CLI.md).
+`stats` also prints the `max_attempts` and `worker_interval` the server uses, defaults included.
+Full flags are in [ADMIN_CLI.md](ADMIN_CLI.md).
 
 ### Log lines
 
@@ -415,18 +413,20 @@ trigger training.
 
 ### What is sent
 
-For each moved message, in the background, Sora reads the message from S3 and strips attachments.
-The `MOVE` answers at once and does not wait.
+For each moved message, Sora hands a report to a bounded queue served by a fixed number of
+background workers, so a large `MOVE` does not start one S3 download per message at once. A worker
+reads the message from S3 and strips attachments. A message larger than `max_message_size` is
+skipped before its body is downloaded. The `MOVE` answers at once and does not wait.
 
 Stripping works like this:
 
 - A message that is not multipart is sent as it is.
-- For a multipart message, Sora keeps the top-level `text/plain` and `text/html` parts and drops
-  everything else. If it keeps exactly one part, that part becomes the body; if several, they are
+- For a multipart message, Sora keeps the `text/plain` and `text/html` parts at any depth of the
+  MIME tree and drops everything else. Each kept part is sent with headers that describe the bytes
+  that follow. If it keeps exactly one part, that part becomes the body; if several, they are
   joined as `multipart/alternative`.
-- If no top-level part is text, the body becomes the line
-  `[No text content - attachments stripped for spam training]`. This includes the common shape of
-  a message with an attachment, where the text sits inside a nested `multipart/alternative`.
+- If the message has no text part, the body becomes the line
+  `[No text content - attachments stripped for spam training]`.
 - If the message cannot be parsed, it is sent unstripped.
 
 Then Sora posts JSON to `endpoint`, with `Authorization: Bearer <auth_token>` when a token is set:
@@ -489,13 +489,10 @@ max_requests = 3
 | `endpoint` | string | none | The URL Sora posts to. |
 | `auth_token` | string | none | Bearer token for the request. |
 | `timeout` | duration | `"10s"` | Time limit for one request. An invalid value logs `Failed to initialize spam training client` and leaves training off. |
+| `max_message_size` | size | `"10mb"` | Larger messages are not submitted. |
 | `circuit_breaker.threshold` | integer | `5` | Failures in a row that open the breaker. `0` or less means 5. |
 | `circuit_breaker.timeout` | duration | `"30s"` | How long the breaker stays open. |
 | `circuit_breaker.max_requests` | integer | `3` | Trial requests while half open. `0` or less means 3. |
-
-`max_message_size`, `max_attachment_size` and `async` are accepted in `[spam_training]` but have no
-effect: reports are always sent in the background, attachments are always stripped, and there is
-no size limit.
 
 When training starts, Sora logs `Spam training client initialized` with the endpoint.
 
@@ -504,7 +501,8 @@ When training starts, Sora logs `Spam training client initialized` with the endp
 ## 8. Startup and reload
 
 - `[relay]`, `[relay.queue]` and `[spam_training]` are read once, at startup. To change them,
-  restart Sora. A reload (`SIGHUP`) neither applies nor reports changes to these sections.
+  restart Sora. A reload (`SIGHUP`) reports a change to these sections as needing a restart and
+  applies nothing.
 - Any node with `[relay] type` set starts a queue and a worker, whatever servers it runs. Set the
   relay on the nodes that deliver mail (the ones with `lmtp` or `http_admin_api` servers).
 - Spam training is used by `imap` servers only.

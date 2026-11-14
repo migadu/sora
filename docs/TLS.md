@@ -2,7 +2,7 @@
 
 This document explains how Sora encrypts the connections that clients make to it: where each
 listener gets its certificate, the difference between implicit TLS and STARTTLS for each protocol,
-what `tls_verify` really does, how SNI and the default domain work, and how automatic certificates
+what `tls_verify` does, how SNI and the default domain work, and how automatic certificates
 from Let's Encrypt are ordered, stored in S3, shared across a cluster, renewed and reloaded.
 
 It is written for operators who put Sora on the internet and for contributors who change the
@@ -114,19 +114,9 @@ See [section 7](#7-lets-encrypt).
 
 ### When both are set
 
-If `[tls]` is enabled **and** a listener has its own `tls_cert_file` and `tls_key_file`, the
-listener types do not all choose the same way:
-
-| Listener `type` | Which certificate it serves |
-|---|---|
-| `imap`, `pop3` | The global `[tls]` certificate. The files are ignored, with the warning `tls_cert_file/tls_key_file ignored - global [tls] is enabled`. |
-| `http_user_api` | The global `[tls]` certificate. The files are ignored without a warning. |
-| `lmtp`, `managesieve` | The listener's own files. |
-| `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `lmtp_proxy`, `user_api_proxy` | The listener's own files. |
-| `http_admin_api` | With `provider = "file"`: the listener's files. With `provider = "letsencrypt"`: the Let's Encrypt certificate for clients that send a server name (SNI), the listener's files for clients that do not. |
-
-To keep things predictable, set either the global `[tls]` section or per-listener files on a given
-listener, not both.
+Give each listener one certificate source: either the global `[tls]` section or its own
+`tls_cert_file` and `tls_key_file`, not both. When both are configured, Sora uses one of them and
+logs a startup warning naming the one it does not use.
 
 ### When neither is set
 
@@ -182,11 +172,12 @@ is captured during the STARTTLS handshake too, so client filters apply from the 
 
 Behaviour on the wrong kind of port:
 
-- A client that sends plaintext to an implicit-TLS port of an IMAP, POP3 or ManageSieve server, or
-  of a mail proxy, gets the line
+- A client that sends plaintext to an implicit-TLS port of an IMAP, POP3, ManageSieve or LMTP
+  server, or of a mail proxy, gets the line
   `ERROR: Plain-text connection attempted on TLS port. Use STARTTLS or connect to the plain-text port.`
   and is disconnected. The log says `Plain-text connection detected on TLS port - rejecting`.
-- A client that starts a TLS handshake on a plaintext port of those listeners gets
+- A client that starts a TLS handshake on a plaintext port of an IMAP, POP3 or ManageSieve server,
+  or of a mail proxy, gets
   `ERROR: TLS connection attempted on plain-text port. Use STARTTLS or connect to the TLS port.`
   and is disconnected. The log says `TLS handshake detected on plain-text port - rejecting`.
 - Both are counted in `sora_connection_timeouts_total` with `reason` `plain_text_on_tls_port` or
@@ -219,17 +210,12 @@ before and after STARTTLS are described in [PROTOCOLS.md](PROTOCOLS.md), and the
 make Sora check anything about its own certificate. It defaults to `false`, and you rarely want it
 on a mail listener.
 
-What it does depends on the listener:
+With `tls_verify = true`, every client of that listener must present a certificate, on every
+listener type and with either certificate source. Connections without one fail the handshake.
+Mail clients do not send client certificates, so leave it off on listeners that mail clients use.
 
-| Listener `type` | `tls_verify = true` |
-|---|---|
-| `imap`, `pop3`, `lmtp`, `managesieve` | Nothing. These listeners never ask for a client certificate. |
-| `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `lmtp_proxy`, `user_api_proxy` with their own `tls_cert_file`/`tls_key_file` | Every client must present a certificate. Connections without one fail the handshake. |
-| The same proxies using the global `[tls]` certificate | Nothing. |
-| `http_admin_api`, `http_user_api` | Every client must present a certificate, with either certificate source. |
-
-When a client certificate is required, it must chain to the host's system root certificates. There
-is no setting for a private client CA.
+The client certificate must chain to the host's system root certificates. There is no setting for
+a private client CA.
 
 Do not confuse it with `remote_tls_verify`, which makes a proxy check its **backends'**
 certificates; see [PROXY.md](PROXY.md).
@@ -317,8 +303,8 @@ You can trigger it yourself after starting Sora:
 openssl s_client -connect mail.example.com:993 -servername mail.example.com </dev/null
 ```
 
-At startup Sora only checks which certificates are already stored and logs
-`Pre-warm: Completed` with `found`, `missing` and `total`.
+At startup Sora checks which certificates are already stored, logs `Pre-warm: Completed` with
+`found`, `missing` and `total`, and arms renewal for every configured name (section 9).
 
 ### Storage in S3
 
@@ -338,12 +324,11 @@ Because every object holds a private key, Sora asks the store to encrypt it at r
 `""` for stores that reject the header (for example MinIO without a KMS): such a store refuses
 every certificate write otherwise. Other values stop startup.
 
-The S3 client uses path-style addressing and signs every request for region `us-east-1`; there is
-no region setting. A store that checks the signature's region refuses other regions, so on AWS put
-the bucket in `us-east-1`. Set both `access_key` and `secret_key`: the client signs its requests
-with them. Without both, it sends unsigned (anonymous) requests. It does not read environment
-variables, the shared AWS config or an instance role, so a private bucket refuses it. At startup Sora checks that the bucket exists and is reachable, and stops with
-`failed to verify S3 bucket access: ...` if it is not.
+The S3 client uses path-style addressing and signs its requests for `region`. With `access_key` and
+`secret_key` set, it signs with them; without them, it uses the AWS default credential chain
+(environment variables, the shared AWS config, an instance role). At startup Sora checks that the
+bucket exists and is reachable, and stops with `failed to verify S3 bucket access: ...` if it is
+not.
 
 Each S3 request has a 5-second time limit, because a TLS handshake may be waiting on it.
 
@@ -356,9 +341,8 @@ Each node keeps a copy of the certificates in a local directory, `fallback_dir`
   reads the local copy first and only goes to S3 when the local copy is missing. A node that has
   its certificates locally keeps serving them while S3 is down.
 - A certificate found in S3 is written to the local directory at once.
-- When an S3 write fails, the certificate is written locally and one more S3 write is tried
-  30 seconds later. If that fails too, the certificate exists only on that node until the next
-  write.
+- When an S3 write fails, the certificate is written locally and Sora keeps retrying the S3 write
+  until it succeeds.
 - When an S3 read fails with anything other than "not found", Sora returns an error to the
   handshake instead of ordering a new certificate, so an S3 outage does not burn Let's Encrypt
   rate limits.
@@ -369,9 +353,9 @@ every handshake for a certificate not yet in memory reads S3, and handshakes fai
 unavailable.
 
 The shipped systemd unit (`dist/sora.service`) makes the file system read-only apart from
-`/var/spool/sora`, `/var/cache/sora` and `/var/log/sora`. The default `/var/lib/sora/certs` is not
-writable under it: either add `/var/lib/sora` to `ReadWritePaths` (and create it), or set
-`fallback_dir` under one of the writable paths.
+`/var/spool/sora`, `/var/cache/sora`, `/var/lib/sora` and `/var/log/sora`, so the default
+`/var/lib/sora/certs` is writable under it. A `fallback_dir` elsewhere must be added to
+`ReadWritePaths`.
 
 ### The sync worker
 
@@ -394,10 +378,10 @@ When several nodes use Let's Encrypt with the same bucket, run them in one clust
   balancer can therefore send port 80 to any node.
 - **A database claim stops duplicate orders.** On nodes that have a database, the leader takes a
   claim in PostgreSQL (the `locks` row `acme_issuance:<name>`, held for up to 10 minutes) before it
-  orders a new certificate. During a network split both sides have a leader, but only one gets the
-  claim. If the database cannot be reached, the order goes ahead anyway: an expired certificate is
-  worse than a duplicate order. Nodes without a database (proxy-only) rely on leadership alone.
-  Renewals of an existing certificate do not take the claim.
+  orders a certificate, for a first issuance and for a renewal alike. During a network split both
+  sides have a leader, but only one gets the claim. If the database cannot be reached, the order
+  goes ahead anyway: an expired certificate is worse than a duplicate order. Nodes without a
+  database (proxy-only) rely on leadership alone.
 - **Other nodes wait for the leader.** A handshake on a non-leader node for a name with no stored
   certificate waits up to 5 seconds, reading the store every second, for the leader to publish one
   (`TLS: Waiting for the cluster leader to publish a certificate`). If none appears, the handshake
@@ -412,8 +396,8 @@ Two consequences:
   smallest `node_id`. If that node does not use `provider = "letsencrypt"`, nobody orders or renews.
   See [CLUSTER.md](CLUSTER.md#5-leader-election).
 
-Without the cluster, every node that uses Let's Encrypt orders and renews on its own: renewals are
-then repeated once per node, and only new orders are serialised by the database claim.
+Without the cluster, every node that uses Let's Encrypt orders and renews on its own, and only the
+database claim keeps two nodes from ordering for the same name at once.
 
 ---
 
@@ -421,8 +405,8 @@ then repeated once per node, and only new orders are serialised by the database 
 
 ### Let's Encrypt certificates
 
-A node keeps each certificate in memory once a client has used it. From then on it runs a renewal
-timer for it:
+Renewal is armed at startup for every name in `domains`, whether or not a client has used it since
+the node started:
 
 - The renewal starts `renew_before` before expiry. Unset (or `"0"`), it is the lesser of 30 days and
   one third of the certificate's lifetime (30 days for Let's Encrypt's 90-day certificates). A
@@ -443,10 +427,6 @@ switches. With `sync_interval = "0"` and the local directory enabled, a non-lead
 its old local copy and never picks up the renewed certificate; it serves the old one until it
 expires.
 
-A renewal timer runs only on a node that has served the name since it started. A leader that never
-receives a connection for a name never renews it. If some names reach the leader rarely or never,
-open a connection to the leader for each such name after it starts (section 7).
-
 ### File certificates
 
 Certificate files, per listener or in `[tls]`, are read once at startup. A SIGHUP reload
@@ -458,7 +438,8 @@ Certificate files, per listener or in `[tls]`, are read once at startup. A SIGHU
   `tls_default_domain` in a `[[server]]` block, a reload logs
   `Config reload: server settings changed but require restart to take effect` with the changed
   fields.
-- Changes to the `[tls]` section are neither applied nor reported by a reload.
+- Changes to the `[tls]` section are not applied by a reload; it reports them as changed but
+  requiring a restart to take effect.
 
 See [OPERATIONS.md](OPERATIONS.md) for what a reload does in general.
 
@@ -468,7 +449,7 @@ See [OPERATIONS.md](OPERATIONS.md) for what a reload does in general.
 
 - TLS 1.2 is the minimum version on every listener. TLS 1.3 is used when the client supports it.
 - Renegotiation is refused.
-- Implicit-TLS handshakes on IMAP, POP3, ManageSieve and the mail proxies have 10 seconds to
+- Implicit-TLS handshakes on IMAP, POP3, ManageSieve, LMTP and the mail proxies have 10 seconds to
   complete. The handshake runs in the connection's own goroutine, so a slow client does not delay
   other connections.
 - ALPN: mail listeners using per-listener files offer their own protocol (`imap`, `pop3`, `sieve`
@@ -500,10 +481,10 @@ See [OPERATIONS.md](OPERATIONS.md) for what a reload does in general.
 | `domains` | list of strings | none | Every name clients connect with. Exact names, no wildcards. Required. |
 | `default_domain` | string | first entry of `domains` | Name used for clients that send no SNI. Must be in `domains`. |
 | `storage_provider` | string | none | Must be `"s3"`. Required: any other value, including empty, stops startup. |
-| `renew_before` | duration | lesser of 30 days and 1/3 of the lifetime | How long before expiry to renew. Go duration syntax only (`"720h"`; `"30d"` is not accepted). Capped at 30 days. An invalid value stops startup. |
+| `renew_before` | duration | lesser of 30 days and 1/3 of the lifetime | How long before expiry to renew, such as `"720h"` or `"30d"`. Capped at 30 days. An invalid value stops startup. |
 | `enable_fallback` | bool | `true` | Keep a local copy of the certificates in `fallback_dir`. |
 | `fallback_dir` | string | `"/var/lib/sora/certs"` | Directory for the local copy. Created if missing. |
-| `sync_interval` | duration | `"5m"` | How often to refresh the local copy from S3. `"0"` turns it off. Go duration syntax only. An invalid value stops startup. |
+| `sync_interval` | duration | `"5m"` | How often to refresh the local copy from S3. `"0"` turns it off. An invalid value stops startup. |
 
 ### `[tls.letsencrypt.s3]`
 
@@ -512,13 +493,12 @@ See [OPERATIONS.md](OPERATIONS.md) for what a reload does in general.
 | `bucket` | string | none | Bucket for certificates. Must exist. Required. |
 | `endpoint` | string | `"s3.amazonaws.com"` | S3 endpoint, with or without `https://`/`http://`. |
 | `disable_tls` | bool | `false` | Use `http://` for an endpoint written without a scheme. Ignored when the endpoint has one. |
-| `access_key` | string | none | Static credentials. Used only when `secret_key` is set too. |
+| `region` | string | none | Region the requests are signed for. |
+| `access_key` | string | none | Static credentials. Used only when `secret_key` is set too. Without both, the AWS default credential chain is used. |
 | `secret_key` | string | none | Static credentials. Used only when `access_key` is set too. |
 | `server_side_encryption` | string | `"AES256"` | Encryption asked of the store on every write: `"AES256"`, `"aws:kms"` or `""` (no header). |
 | `server_side_encryption_kms_key_id` | string | none | KMS key ID. Required with `"aws:kms"`, refused with anything else. |
-| `debug` | bool | `false` | Asks the S3 client to log requests and responses. Sora gives this client no logger, so nothing is printed. |
-
-There is no `region` key; a `region` line is ignored with an "unknown keys" warning.
+| `debug` | bool | `false` | Log the S3 client's requests and responses. |
 
 ### Per-listener keys (in `[[server]]` blocks)
 
@@ -528,7 +508,7 @@ There is no `region` key; a `region` line is ignored with an "unknown keys" warn
 | `tls_use_starttls` | bool | `false` | With `tls = true`: plaintext with STARTTLS instead of implicit TLS. Mail listeners and mail proxies only. |
 | `tls_cert_file` | string | none | PEM certificate (with chain) for this listener. |
 | `tls_key_file` | string | none | PEM private key for this listener. |
-| `tls_verify` | bool | `false` | Require client certificates where supported (section 5). |
+| `tls_verify` | bool | `false` | Require client certificates (section 5). |
 | `tls_default_domain` | string | none | Name used for SNI-less clients on this listener, with Let's Encrypt (section 6). |
 | `insecure_auth` | bool | `false` | Allow plaintext logins on a `tls = true` listener (section 4). |
 
@@ -548,7 +528,7 @@ Sora holds in memory:
 |---|---|
 | `sora-admin tls list` | Lists certificates in S3, whether each is in the local directory, and with `--details` their expiry. |
 | `sora-admin tls cache` | Copies certificates from S3 into the local directory, for example on a new node. |
-| `sora-admin tls delete --key <key>` | Deletes one certificate from S3, by the full key that `tls list --details` shows. `--domain` does not find the S3 objects the server writes; see [ADMIN_CLI.md](ADMIN_CLI.md). |
+| `sora-admin tls delete --domain <name>` | Deletes a name's certificates, ECDSA and RSA, from S3 and from the local directory. `--key` deletes one object from S3 by the full key that `tls list --details` shows. |
 | `sora-admin tls clean` | Deletes expired certificates. |
 
 Flags and output are in [ADMIN_CLI.md](ADMIN_CLI.md).
@@ -576,11 +556,11 @@ Sora also makes TLS connections of its own. They are configured elsewhere:
 |---|---|---|
 | Sora exits at startup with `HTTP-01 challenge server failed` | Something else listens on port 80, or Sora may not bind ports below 1024. | Free port 80, or grant `CAP_NET_BIND_SERVICE` (the shipped unit does). |
 | Sora exits with `failed to verify S3 bucket access` | The bucket does not exist, or the credentials cannot reach it. | Create the bucket; check `endpoint`, keys and network. |
-| The log shows `Cannot create certificate fallback directory - degrading to S3-only` | `fallback_dir` is not writable, often because of the systemd unit's `ProtectSystem=strict`. | Make the directory writable (section 7). |
+| The log shows `Cannot create certificate fallback directory - degrading to S3-only` | `fallback_dir` cannot be created or written by the `sora` user, or is outside the systemd unit's `ReadWritePaths`. | Make the directory writable (section 7). |
 | A client's handshake fails, log `TLS: Rejected certificate request for unconfigured domain` | The client asked for a name that is not in `domains`. | Add the name, or have clients use a listed name. |
 | Handshakes for a new name fail on every node but one | In a cluster only the leader orders the first certificate. | Connect to the leader with that name. |
 | Log `TLS: Domain marked as rate-limited` | Let's Encrypt refused with a rate limit; this node places no new order for that name until the time Let's Encrypt gave (24 hours if it gave none, or until a restart). | Wait; fix the cause of the failed orders (DNS, port 80) first. |
-| Mail clients cannot connect to a proxy that has its own certificate files; the log shows `TLS handshake failed` with `tls: client didn't provide a certificate` | `tls_verify = true` on that proxy: it demands client certificates. | Set `tls_verify = false`. |
+| Mail clients cannot connect; the log shows `TLS handshake failed` with `tls: client didn't provide a certificate` | `tls_verify = true` on that listener: it demands client certificates. | Set `tls_verify = false`. |
 | An old certificate is still served after renewing the files | File certificates are read only at startup. | Restart Sora. |
 | Non-leader nodes serve an expiring certificate the leader has renewed | `sync_interval = "0"`, or S3 writes fail on the leader. | Set `sync_interval`; check the leader's `S3-Cache: Failed to upload certificate to S3` lines. |
 | `ERROR: Plain-text connection attempted on TLS port` | The client is set to plaintext or STARTTLS on an implicit-TLS port. | Change the client to SSL/TLS, or point it to the STARTTLS port. |
@@ -598,6 +578,6 @@ Sora also makes TLS connections of its own. They are configured elsewhere:
 | [tlsmanager/s3cache.go](../tlsmanager/s3cache.go) | S3 storage, key naming, server-side encryption. |
 | [tlsmanager/fallback_cache.go](../tlsmanager/fallback_cache.go) | The local fallback directory in front of S3. |
 | [tlsmanager/cert_sync.go](../tlsmanager/cert_sync.go) | The periodic S3-to-local sync. |
-| [cmd/sora/certificate_fence.go](../cmd/sora/certificate_fence.go) | The PostgreSQL claim for new orders. |
+| [cmd/sora/certificate_fence.go](../cmd/sora/certificate_fence.go) | The PostgreSQL claim for orders and renewals. |
 | [server/sora_conn.go](../server/sora_conn.go) | Implicit-TLS listener, deferred handshake, wrong-port detection, STARTTLS helpers. |
 | [cmd/sora-admin/tls.go](../cmd/sora-admin/tls.go) | `sora-admin tls`. |

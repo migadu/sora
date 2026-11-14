@@ -10,9 +10,9 @@ It is for operators who write or review a Sora configuration, and for contributo
 The tables here say what a key is and what Sora does when it is absent. For the full meaning of a
 key, follow the link to the topic document named at the top of each section.
 
-All keys and defaults below were checked against the code in [config/](../config/) and
-[cmd/sora/main.go](../cmd/sora/main.go). Where this document and
-[config.toml.example](../config.toml.example) disagree, this document describes what the code does.
+The keys are defined in [config/](../config/) and read in [cmd/sora/main.go](../cmd/sora/main.go).
+Where this document and [config.toml.example](../config.toml.example) disagree, this document is
+the reference.
 
 ## Contents
 
@@ -62,7 +62,7 @@ default. After parsing, Sora trims leading and trailing spaces from every string
 `sora-admin` reads the same file with the same loader (see [ADMIN_CLI.md](ADMIN_CLI.md)). It uses
 only some sections (`[database]`, `[s3]`, `[local_cache]`, `[uploader]`, `[cleanup]`,
 `[shared_mailboxes]`, `[tls]`, `[admin_cli]`, `[relay]`, `[sieve]`, `[cluster]` and the
-`[[server]]` blocks), and it starts from empty values rather than from `config.NewDefaultConfig`.
+`[[server]]` blocks), and it starts from the same built-in defaults.
 
 ### Unknown keys
 
@@ -116,25 +116,13 @@ a parse error.
 
 ### Durations
 
-Most duration keys are strings in Go duration syntax: a number and a unit, such as `"300ms"`,
+Duration keys are strings in Go duration syntax: a number and a unit, such as `"300ms"`,
 `"30s"`, `"5m"`, `"2h"` or `"1h30m"`. Valid units are `ns`, `us`, `ms`, `s`, `m` and `h`. `"0"` is
 zero.
 
-Sora adds one unit to most keys: a whole number of days, written `"Nd"`, such as `"14d"` or `"30d"`
+Sora adds one unit: a whole number of days, written `"Nd"`, such as `"14d"` or `"30d"`
 ([helpers/parsers.go](../helpers/parsers.go), `ParseDuration`). Only the plain form works. `"1d12h"`
 and `"1.5d"` are rejected.
-
-These keys accept Go syntax only, without `d`:
-
-| Keys | Why |
-|---|---|
-| `[server.lookup_cache]` `positive_ttl`, `negative_ttl`, `cleanup_interval`, `positive_revalidation_window` | parsed with Go's `time.ParseDuration` |
-| `[server.auth_rate_limit]` durations | decoded straight into Go durations. A string in Go syntax works, and so does an integer, which counts nanoseconds |
-| `token_duration` (`http_user_api`) | `time.ParseDuration` |
-| `proxy_protocol_timeout` | `time.ParseDuration` |
-| `[tls.letsencrypt]` `renew_before`, `sync_interval` | `time.ParseDuration` |
-
-Use hours there: `"168h"` rather than `"7d"`.
 
 What happens with a value that does not parse depends on the key. Some keys stop startup (for
 example `[uploader] max_staging_size` or `[relay.queue] cleanup_interval`), and many fall back to
@@ -142,11 +130,10 @@ their default with a warning in the log. Check the log after a change.
 
 ### Sizes
 
-Size keys are strings: a whole number and a unit, `b`, `kb`, `mb` or `gb`, with optional space:
-`"512kb"`, `"25mb"`, `"1 gb"`. Write the `b` in lower case: `"25MB"` is rejected (`"25Mb"` and a
-lone `"B"` are accepted). A plain number such as `"1048576"` is bytes. Units
-are powers of 1024 (`"1kb"` is 1024 bytes). Fractions (`"1.5gb"`), units without `b` (`"10m"`) and
-`tb` are rejected.
+Size keys are strings: a whole number and a unit, `b`, `kb`, `mb` or `gb`, in any case, with
+optional space: `"512kb"`, `"25MB"`, `"1 gb"`. A plain number such as `"1048576"` is bytes. Units
+are powers of 1024 (`"1kb"` is 1024 bytes). Fractions (`"1.5gb"`) and units without `b` (`"10m"`)
+are rejected.
 
 ### Ports
 
@@ -170,24 +157,21 @@ them differ from the defaults.
 Things to know:
 
 - **Booleans default to `false`.** TOML cannot tell "absent" from "false" for most keys, so a
-  boolean you leave out is `false`. A few keys are pointers in the code and default to `true` when
-  absent: `remote_health_checks`, `[server.remote_lookup] remote_tls_verify`,
-  `[[pool]] remote_tls_verify`, `[tls.letsencrypt] enable_fallback` and
-  `[admin_cli] insecure_skip_verify` (which defaults to "skip only for a loopback address").
+  boolean you leave out is `false`. A few keys default to `true` when absent:
+  `remote_health_checks`, `[server.remote_lookup] remote_tls_verify`,
+  `[[pool]] remote_tls_verify`, `[tls.letsencrypt] enable_fallback`, the `metrics` keys
+  `enable_domain_metrics` and `hash_usernames`, `[server.lookup_cache] enabled` on the server types
+  that use the cache by default, and `[admin_cli] insecure_skip_verify` (which defaults to "skip
+  only for a loopback address").
 - **Zero often means "use the default".** For many number keys, `0` or a negative value means the
   default, not "off". The tables say where `0` means "no limit" or "disabled" instead.
-- **Tables you write replace some table defaults.** A `[server.lookup_cache]` table you write is
-  used as written: if it has no `enabled = true`, the cache is off. Left out completely, the cache is
-  on for most server types. See [9.10](#910-lookup-cache-serverlookup_cache).
-- **The built-in database endpoint is treated as "no database".** When `[database.write]` (or
-  `[database.read]`) ends up with exactly `hosts = ["localhost"]`, `user = "postgres"` and
-  `name = "sora_mail_db"`, the built-in values, Sora clears that endpoint at startup, whatever
-  `port` and `password` say (`cleanupDatabaseDefaults` in [cmd/sora/main.go](../cmd/sora/main.go)).
-  So the built-in database defaults mean "no database". This is how a proxy-only node runs without
-  one. It also means that a real database with exactly those three values is ignored, and a node
-  that needs a database then stops with `database is required for configured servers but not
-  configured in [database.write] or [database.read]`. Change at least one of the three (for example
-  `user = "sora"`, or `127.0.0.1` instead of `localhost`).
+- **A table you write changes only the keys it names.** In a `[server.lookup_cache]` table, for
+  example, the keys you leave out keep their defaults, and the cache stays on unless the table says
+  `enabled = false`. See [9.10](#910-lookup-cache-serverlookup_cache).
+- **A database endpoint you do not write means "no database".** Without a `[database.write]` (or
+  `[database.read]`) section in the file, Sora has no such endpoint. This is how a proxy-only node
+  runs without one. A node that needs a database and has none stops with `database is required for
+  configured servers but not configured in [database.write] or [database.read]`.
 
 ---
 
@@ -208,10 +192,13 @@ run after it, so with `[logging] output` set to a file their lines go to that fi
 | A server has `proxy_protocol = true` and `[servers] trusted_networks` is empty | `trusted_networks: proxy_protocol is enabled on server(s) <names> but [servers] trusted_networks is empty; ...` |
 | Two servers have the same `name` | `duplicate server name '<name>' found. Each server must have a unique name` |
 | Two servers have the same `addr` string | `duplicate server address '<addr>' found. Server '<a>' and '<b>' cannot bind to the same address` |
-| No server is configured | `no servers configured. Please configure at least one server in the [[servers]] section` (the section is `[[server]]`) |
+| A `[[server]]` block lacks `type`, `name` or `addr` | for example `server address is required` |
+| No server is configured | `no servers configured. Please configure at least one server in the [[server]] section` |
 | An IMAP, POP3 or LMTP server is configured but `[s3]` lacks `access_key`, `secret_key` or `bucket` | `missing required S3 credentials for mail services (IMAP, LMTP, POP3)` |
 | An IMAP, POP3 or LMTP server is configured and `[s3] endpoint` is empty | `S3 endpoint not specified` |
 | A server that needs the database is configured and there is no database endpoint (see [section 3](#3-defaults)) | `database is required for configured servers but not configured in [database.write] or [database.read]` |
+| `[servers] trusted_networks` has an entry that is neither an IP address nor a CIDR block | names the invalid entry |
+| `[relay] type` is set to something other than `"smtp"` or `"http"` | `unsupported [relay] type ...` |
 | `[timeout_scheduler] shard_count` is below -1 | `FATAL: operation 'initialize timeout scheduler' failed: invalid shard count: <n> (must be >= -1)` |
 
 The address check compares the strings, so `":143"` and `"0.0.0.0:143"` pass it and fail later when
@@ -227,7 +214,7 @@ These conditions only log, and startup continues:
   has '<key>' configured, but ...`.
 - IMAP, POP3 or ManageSieve (or their proxies) allow plaintext authentication on a publicly
   reachable address: `plaintext authentication is allowed without TLS on a publicly reachable
-  address; configure TLS or set insecure_auth=false`.
+  address`. Configure TLS to clear it.
 - A `metrics` server on a publicly reachable address has neither `allowed_hosts` nor `api_key`:
   `metrics endpoint is served without access control on a publicly reachable address; set
   allowed_hosts and/or api_key`.
@@ -254,8 +241,7 @@ Every listener is one `[[server]]` block, a TOML array of tables. Each block nee
 | `name` | A name, unique in the file. It appears in logs, in metric labels (`server_name`) and in the reload report. |
 | `addr` | The listen address, such as `":143"` or `"192.0.2.10:993"`. |
 
-A block that lacks any of the three is skipped without a message (`ServerConfig.IsEnabled`). Watch
-the startup line `Found configured servers` for the count you expect.
+A block that lacks any of the three stops startup ([section 4](#4-checks-at-startup)).
 
 You can configure several servers of the same type, for example one IMAP listener on 143 with
 STARTTLS and one on 993 with implicit TLS. Every block reads only the keys that apply to its type.
@@ -280,13 +266,11 @@ The server types decide what else Sora starts:
 
 - `imap`, `pop3` or `lmtp` start the mail storage services: the S3 client, the local cache, the
   uploader, the cleaner, the purge worker and the full-text search worker. They need `[s3]` and a
-  database.
-- Sora connects to the database only when the node runs an `imap`, `pop3` or `lmtp` server, an
-  `http_admin_api` or `http_user_api` server, or a proxy whose `[server.remote_lookup]` has
-  `lookup_local_users = true`. On any other node it does not connect, even when `[database]` is set,
-  and logs `Skipping database initialization - running in proxy-only mode with remote_lookup`.
-  A `managesieve` server and a proxy without remote lookup both read the database, so run them on a
-  node that also has one of the servers above.
+  database. An `http_user_api` server also uses the S3 client, to serve message bodies.
+- Sora connects to the database when the node runs a server that reads it: an `imap`, `pop3`,
+  `lmtp` or `managesieve` server, an `http_admin_api` or `http_user_api` server, or a proxy that
+  checks passwords in the database (no remote lookup, or `lookup_local_users = true`). A node whose
+  only servers are proxies that use remote lookup needs no database.
 - Without any database endpoint, Sora logs `Database not configured - forcing proxy-only mode
   (lookup_local_users will be treated as false)`.
 
@@ -352,13 +336,14 @@ Global sections never reload. For these, Sora logs that the change needs a resta
 | `[metadata]` | `Config reload: [metadata] changed but requires restart to take effect` |
 | `[servers] trusted_networks` | WARN `Config reload: servers.trusted_networks changed but requires restart to take effect; ...` |
 
-Every other global setting also needs a restart, and Sora does not say so when it changes:
+Every other global setting also needs a restart, and Sora reports a change to it the same way:
 `[logging] output` and `format`, `[database]`, `[s3]`, `[local_cache]`, `[uploader]`, `[tls]`,
 `[cluster]`, `[auth_cache]`, `[relay]`, `[spam_training]`, `[timeout_scheduler]`, `bcrypt_cost` and
 the `[[pool]]` blocks.
 
-Adding, removing or renaming a `[[server]]` block also needs a restart. A new block is not started,
-and a running server whose block was removed or renamed keeps running with its old settings.
+Adding, removing or renaming a `[[server]]` block also needs a restart, and Sora reports added and
+removed blocks. A new block is not started, and a running server whose block was removed or renamed
+keeps running with its old settings.
 
 The global checks of [section 4](#4-checks-at-startup) (pools, `trusted_networks` against
 `proxy_protocol`, server names and addresses) do not run on a reload.
@@ -384,7 +369,7 @@ How to send the signal, and how shutdown works, is in [OPERATIONS.md](OPERATIONS
 | `[relay]`, `[relay.queue]` | Outbound relay for redirect and vacation | [8.11](#811-relay-relay-and-relayqueue), [RELAY.md](RELAY.md) |
 | `[spam_training]` | Spam filter training on moves to and from Junk | [8.12](#812-spam-training-spam_training), [RELAY.md](RELAY.md) |
 | `[tls]`, `[tls.letsencrypt]`, `[tls.letsencrypt.s3]` | Shared certificates, Let's Encrypt | [8.13](#813-tls-tls), [TLS.md](TLS.md) |
-| `[cluster]`, `[cluster.affinity]`, `[cluster.rate_limit_sync]` | Gossip cluster | [8.14](#814-cluster-cluster), [CLUSTER.md](CLUSTER.md) |
+| `[cluster]`, `[cluster.affinity]` | Gossip cluster | [8.14](#814-cluster-cluster), [CLUSTER.md](CLUSTER.md) |
 | `[auth_cache]` | Persistent login cache for proxies | [8.15](#815-persistent-auth-cache-auth_cache), [PROXY.md](PROXY.md) |
 | `[backend_maintenance]` | How proxies drain backends in maintenance | [8.16](#816-backend-maintenance-backend_maintenance), [PROXY.md](PROXY.md) |
 | `[servers]` | `trusted_networks` | [8.17](#817-trusted-networks-servers), [SECURITY.md](SECURITY.md) |
@@ -433,7 +418,7 @@ See [DATABASE.md](DATABASE.md) for the meaning of each key.
 | `debug` | bool | `false` | Log SQL queries. |
 | `query_timeout` | duration | `"30s"` | Default timeout of a query. |
 | `search_timeout` | duration | `"1m"` | Timeout of search queries. |
-| `write_timeout` | duration | `"15s"` | Timeout of write operations. (`sora-admin`, which does not start from the built-in defaults, uses `10s`.) |
+| `write_timeout` | duration | `"15s"` | Timeout of write operations. |
 | `lock_timeout` | duration | `"10s"` | How long a write waits for a row lock. `"0"` disables it. |
 | `migration_timeout` | duration | `"2m"` | While one node applies migrations at startup, the other nodes wait up to three times this value, then exit. The node applying them has no time limit. See [DATABASE.md](DATABASE.md#9-migrations). |
 | `fetch_chunk_size` | integer | `5000` | Messages fetched per chunk for large result sets. |
@@ -458,9 +443,7 @@ endpoint's value.
 | `max_conn_idle_time` | duration | `"5m"` | |
 | `query_timeout` | duration | `"30s"` | Per-endpoint query timeout. |
 
-These three defaults (`hosts`, `user`, `name`) together count as "not configured": an endpoint
-that keeps all three is cleared at startup, whatever its `port` and `password`. Change at least one
-of them. See [section 3](#3-defaults).
+An endpoint you do not write is not configured. See [section 3](#3-defaults).
 
 ### 8.4 Object storage (`[s3]`)
 
@@ -496,7 +479,7 @@ See [STORAGE.md](STORAGE.md).
 | `warmup_mailboxes` | list of strings | `["INBOX"]` | Mailboxes preloaded. |
 | `warmup_async` | bool | `true` | Preload in the background instead of during login. |
 | `warmup_timeout` | duration | `"5m"` | Time limit of one warmup. |
-| `warmup_interval` | duration | `24h` (fixed) | Accepted but not passed to the IMAP server: the interval between two warmups of one user is always 24 hours. |
+| `warmup_interval` | duration | `"24h"` | Shortest interval between two warmups of one user. |
 
 ### 8.6 Uploader (`[uploader]`)
 
@@ -543,7 +526,7 @@ See [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md).
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | `false` | Turn on shared mailboxes and ACLs. |
-| `namespace_prefix` | string | `"Shared/"` | Prefix of the shared namespace. |
+| `namespace_prefix` | string | `"Shared/"` | Prefix of the shared namespace. `Shared/` covers the root `Shared` and the names under `Shared/`, not `SharedNotes`. Sora refuses to start with an empty prefix while sharing is on. |
 | `allow_user_create` | bool | `false` | Let users create shared mailboxes. |
 | `default_rights` | string | `"lrswipkxtea"` | ACL rights of the creator. |
 | `allow_anyone_identifier` | bool | `false` | Allow the RFC 4314 `anyone` identifier. |
@@ -564,10 +547,10 @@ relay and its disk queue. See [RELAY.md](RELAY.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `type` | string | none | `"smtp"` or `"http"`. Empty disables the relay. Any other value logs `FATAL: operation 'configure relay' failed: unsupported [relay] type ...`, but startup goes on without a relay worker, so queued messages are never sent. |
+| `type` | string | none | `"smtp"` or `"http"`. Empty disables the relay. Any other value stops startup with `unsupported [relay] type ...`. |
 | `smtp_host` | string | none | `host:port` of the SMTP relay. |
-| `smtp_tls` | bool | `false` | Use TLS to the relay. |
-| `smtp_tls_verify` | bool | `false` | Verify the relay's certificate. |
+| `smtp_tls` | bool | — | Use TLS to the relay. Set it explicitly; `true` is recommended. |
+| `smtp_tls_verify` | bool | — | Verify the relay's certificate. Set it explicitly; `true` is recommended. |
 | `smtp_use_starttls` | bool | `false` | Use STARTTLS rather than implicit TLS. |
 | `smtp_tls_cert_file`, `smtp_tls_key_file` | string | none | Client certificate for the relay. |
 | `smtp_helo_host` | string | the host name | Name sent in EHLO. |
@@ -600,9 +583,7 @@ See [RELAY.md](RELAY.md). Training runs only when `enabled = true` and `endpoint
 | `endpoint` | string | none | HTTP endpoint that receives training submissions. |
 | `auth_token` | string | none | Bearer token. |
 | `timeout` | duration | `"10s"` | HTTP timeout. |
-| `max_message_size` | size | none | Accepted, without effect: there is no size limit. |
-| `max_attachment_size` | size | none | Accepted, without effect: attachments are always stripped. |
-| `async` | bool | `false` | Accepted and logged at startup, without effect: submissions always run in the background. |
+| `max_message_size` | size | `"10mb"` | Larger messages are not submitted. |
 
 `[spam_training.circuit_breaker]`:
 
@@ -631,10 +612,10 @@ certificate files of its own. See [TLS.md](TLS.md).
 | `domains` | list of strings | none | Required. Certificates are issued only for these names. |
 | `default_domain` | string | the first domain | Certificate for clients that send no SNI. |
 | `storage_provider` | string | none | Must be `"s3"`. |
-| `renew_before` | duration (Go syntax) | 30 days | Renewal window. |
+| `renew_before` | duration | 30 days | Renewal window. |
 | `enable_fallback` | bool | `true` | Mirror certificates on local disk. |
 | `fallback_dir` | string | `"/var/lib/sora/certs"` | Directory of that mirror. |
-| `sync_interval` | duration (Go syntax) | `"5m"` | How often certificates are re-read from S3. `"0"` disables. |
+| `sync_interval` | duration | `"5m"` | How often certificates are re-read from S3. `"0"` disables. |
 
 `[tls.letsencrypt.s3]`:
 
@@ -642,9 +623,10 @@ certificate files of its own. See [TLS.md](TLS.md).
 |---|---|---|---|
 | `bucket` | string | none | Bucket for certificates. |
 | `endpoint` | string | `"s3.amazonaws.com"` | |
+| `region` | string | none | Region the requests are signed for. |
 | `disable_tls` | bool | `false` | |
 | `debug` | bool | `false` | |
-| `access_key`, `secret_key` | string | none | Set both. Without both, requests are sent unsigned; environment variables, the shared AWS config and instance roles are not read. |
+| `access_key`, `secret_key` | string | none | Static credentials. Without them, Sora uses the AWS default credential chain (environment variables, the shared AWS config, instance roles). |
 | `server_side_encryption` | string | `"AES256"` | `"AES256"`, `"aws:kms"`, or `""` to send no encryption header. |
 | `server_side_encryption_kms_key_id` | string | none | Key id, required with `"aws:kms"`. |
 
@@ -666,14 +648,10 @@ See [CLUSTER.md](CLUSTER.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | Accepted but not read: cluster-wide affinity is on whenever the cluster is. |
+| `enabled` | bool | `false` | Share affinities across the cluster. |
 | `ttl` | duration | `"24h"` | How long an affinity lasts. |
 | `cleanup_interval` | duration | `"1h"` | How often expired affinities are removed. |
 | `cache_path` | string | none | SQLite file that keeps affinities across restarts. Unset keeps them in memory only. |
-
-`[cluster.rate_limit_sync]` has the keys `enabled`, `sync_blocks` and `sync_failure_counts`. Sora
-accepts them and does not read them. Login rate limits (`[server.auth_rate_limit]`) are counted on
-each node and are not shared across the cluster.
 
 ### 8.15 Persistent auth cache (`[auth_cache]`)
 
@@ -684,8 +662,8 @@ A SQLite cache of credentials, used by proxies that check passwords in the datab
 |---|---|---|---|
 | `enabled` | bool | `false` | |
 | `path` | string | `"/tmp/sora/auth_cache.db"` | Database file. Its directory is created. |
-| `max_age` | duration | `"24h"` | Age after which an entry is fetched again. An invalid value means `168h`. |
-| `purge_unused` | duration | `"168h"` | Entries unused this long are removed. An invalid value means `720h`. |
+| `max_age` | duration | `"24h"` | Age after which an entry is fetched again. |
+| `purge_unused` | duration | `"168h"` | Entries unused this long are removed. |
 | `cleanup_interval` | duration | `"1h"` | How often old entries are removed. |
 
 If the cache cannot be opened, Sora logs an error and runs without it.
@@ -707,8 +685,10 @@ See [PROXY.md](PROXY.md).
 | `trusted_networks` | list of strings | empty | Hosts trusted to pass on a client's address (PROXY protocol, XCLIENT, IMAP ID) and, unless `exempt_networks` says otherwise, exempt from authentication rate limits. |
 
 Empty trusts nobody. A listener with `proxy_protocol = true` needs a non-empty list, or Sora does not
-start. LMTP delivery has its own default for accepting connections and keeps working with an empty
-list. See [SECURITY.md](SECURITY.md) and [AUTHENTICATION.md](AUTHENTICATION.md).
+start. An entry that is neither an IP address nor a CIDR block stops startup. An `lmtp` server has
+its own default for accepting connections and keeps working with an empty list; an `lmtp_proxy`
+with an empty list is reported at startup. See [SECURITY.md](SECURITY.md) and
+[AUTHENTICATION.md](AUTHENTICATION.md).
 
 ### 8.18 Timeout scheduler (`[timeout_scheduler]`)
 
@@ -769,12 +749,10 @@ The `metrics` server always speaks plain HTTP. `tls` on it only causes a startup
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
-| `proxy_protocol` | bool | `false` | backends, `http_user_api`, `user_api_proxy` | Expect a PROXY protocol header from hosts in `trusted_networks`. Needs a non-empty `trusted_networks`. |
-| `proxy_protocol_timeout` | duration (Go syntax) | `"5s"` | as `proxy_protocol` | Time to wait for the header. |
+| `proxy_protocol` | bool | `false` | backends, line proxies, `http_admin_api`, `http_user_api`, `user_api_proxy` | Expect a PROXY protocol header from hosts in `trusted_networks`. Needs a non-empty `trusted_networks`. |
+| `proxy_protocol_timeout` | duration | `"5s"` | as `proxy_protocol` | Time to wait for the header. |
 
-On the line proxies and on `http_admin_api` the two keys are accepted but not passed to the server,
-which then reads no PROXY header. `proxy_protocol = true` there still requires a non-empty
-`trusted_networks`. `proxy_protocol_trusted_proxies` is not a key: Sora warns about it as unknown.
+`proxy_protocol_trusted_proxies` is not a key: Sora warns about it as unknown.
 See [SECURITY.md](SECURITY.md) and [PROXY.md](PROXY.md).
 
 ### 9.4 Connection limits
@@ -784,8 +762,8 @@ See [SECURITY.md](SECURITY.md).
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
 | `max_connections` | integer | `0` (no limit); `1000` on `lmtp` | all but `metrics` | Concurrent connections of this server. On `lmtp`, `0` or less means 1000. |
-| `max_connections_per_ip` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `user_api_proxy` | Concurrent connections from one IP. Hosts in `trusted_networks` are not limited. `lmtp` and `lmtp_proxy` do not limit per IP. |
-| `max_connections_per_user` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Logged-in sessions of one user. Enforced on this server by `imap`; `pop3` and `managesieve` only count and log. Enforced across the cluster for proxies, which track connections only with `[cluster] enabled = true`. Ignored by `lmtp_proxy` with a warning. |
+| `max_connections_per_ip` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `user_api_proxy` | Concurrent connections from one IP. Hosts in `trusted_networks` are not limited. |
+| `max_connections_per_user` | integer | `0` (no limit) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Logged-in sessions of one user. Enforced on this server by `imap`, `pop3` and `managesieve`. Enforced across the cluster for proxies, which track connections only with `[cluster] enabled = true`. Ignored by `lmtp_proxy` with a warning. |
 | `max_connections_per_user_per_ip` | integer | `0` (no limit) | as `max_connections_per_user` | Logged-in sessions of one user from one IP. |
 | `listen_backlog` | integer | `1024` | backends, line proxies | TCP listen backlog. `0` means 1024. |
 
@@ -819,7 +797,6 @@ See [SECURITY.md](SECURITY.md) and [PROTOCOLS.md](PROTOCOLS.md).
 | `command_timeout` | duration | `imap`, `imap_proxy`: `30m`; `pop3`, `pop3_proxy`: `10m`; `managesieve`, `managesieve_proxy`: `3m` | `imap`, `pop3`, `managesieve` and their proxies | Idle time before a connection is closed. |
 | `absolute_session_timeout` | duration | `24h`; `lmtp_proxy`: `5m` | `imap`, `pop3`, `managesieve`, line proxies | Longest a session may last. |
 | `min_bytes_per_minute` | integer | `0` (off) | `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` | Minimum throughput before a slow connection is closed. |
-| `scheduler_shard_count` | integer | — | — | Accepted but not read. Use `[timeout_scheduler] shard_count`. |
 
 Per-command time limits are sub-tables of `[server.timeouts]`. Each value is a duration. A key left
 out keeps its default. On POP3, LMTP and ManageSieve an explicit `"0"` turns that limit off.
@@ -850,7 +827,7 @@ See [PROTOCOLS.md](PROTOCOLS.md).
 | `append_limit` | size | `"25mb"` | `imap` | Largest message accepted by APPEND. |
 | `max_message_size` | size | `"50mb"` | `lmtp`, `lmtp_proxy`, `http_admin_api` | Largest message accepted for delivery. |
 | `max_script_size` | size | `"16kb"` | `managesieve` | Largest Sieve script. |
-| `supported_extensions` | list of strings | the default set | `managesieve_proxy` | Sieve extensions the proxy advertises. A `managesieve` backend uses `[sieve] enabled_extensions` and ignores this key. |
+| `supported_extensions` | list of strings | the default set | `managesieve_proxy` | Sieve extensions the proxy advertises. A `managesieve` backend uses `[sieve] enabled_extensions`. |
 | `enable_preview` | bool | `false` | `imap` | Advertise FETCH PREVIEW (RFC 8970). |
 | `disabled_caps` | list of strings | none | `imap` | Capabilities never advertised. |
 | `additional_caps` | list of strings | none | `imap`, `imap_proxy` | Extra capability names advertised as written. |
@@ -882,7 +859,7 @@ See [AUTHENTICATION.md](AUTHENTICATION.md).
 ### 9.9 Authentication rate limit (`[server.auth_rate_limit]`)
 
 Applies to `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy` and
-`http_user_api`. Durations here use Go syntax (no `d`). When `enabled = true`, every key you leave
+`http_user_api`. When `enabled = true`, every key you leave
 out, or set to 0, gets the default below. See [AUTHENTICATION.md](AUTHENTICATION.md).
 
 | Key | Type | Default |
@@ -911,18 +888,18 @@ out, or set to 0, gets the default below. See [AUTHENTICATION.md](AUTHENTICATION
 An in-memory cache of login results. See [AUTHENTICATION.md](AUTHENTICATION.md) and
 [PROXY.md](PROXY.md).
 
-When the table is absent, the cache is on for `imap`, `pop3`, `managesieve` and the line proxies,
-and off for `http_user_api` and `user_api_proxy`. When you write the table, set `enabled = true`
-yourself.
+By default the cache is on for `imap`, `pop3`, `managesieve` and the line proxies, and off for
+`http_user_api` and `user_api_proxy`. A table you write changes only the keys it names; the others,
+`enabled` included, keep their defaults.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | see above | |
-| `positive_ttl` | duration (Go syntax) | `"5m"` | How long a successful lookup is kept. |
-| `negative_ttl` | duration (Go syntax) | `"1m"` | How long a failed lookup is kept. |
-| `max_size` | integer | `10000`; `50000` on line proxies when the table is absent | Entries kept. |
-| `cleanup_interval` | duration (Go syntax) | `"5m"` | How often expired entries are removed. |
-| `positive_revalidation_window` | duration (Go syntax) | `"30s"` | How soon a cached success is checked again when a different password arrives. Not used by `lmtp_proxy`. |
+| `positive_ttl` | duration | `"5m"` | How long a successful lookup is kept. |
+| `negative_ttl` | duration | `"1m"` | How long a failed lookup is kept. |
+| `max_size` | integer | `10000`; `50000` on line proxies | Entries kept. |
+| `cleanup_interval` | duration | `"5m"` | How often expired entries are removed. |
+| `positive_revalidation_window` | duration | `"30s"` | How soon a cached success is checked again when a different password arrives. Not used by `lmtp_proxy`. |
 
 ### 9.11 Proxy keys
 
@@ -935,14 +912,14 @@ Read by the line proxies and `user_api_proxy`. See [PROXY.md](PROXY.md).
 | `remote_tls` | bool | `false` | proxies | TLS to the backends (HTTPS for `user_api_proxy`). |
 | `remote_tls_use_starttls` | bool | `false` | line proxies | STARTTLS to the backends. Needs `remote_tls`. |
 | `remote_tls_verify` | bool | `false` | proxies | Verify backend certificates. |
-| `remote_tls_ca_file` | string | none | `pop3_proxy` | CA file for backend certificates. The other proxies ignore it here: set it on a `[[pool]]`. |
+| `remote_tls_ca_file` | string | none | proxies | CA file for backend certificates. |
 | `remote_use_proxy_protocol` | bool | `false` | proxies | Send a PROXY protocol header to the backends. |
 | `remote_use_id_command` | bool | `false` | `imap_proxy` | Forward the client's address with IMAP ID. |
 | `remote_use_xclient` | bool | `false` | `pop3_proxy`, `lmtp_proxy` | Forward the client's address with XCLIENT. |
 | `remote_use_utf8` | bool | `false` | `pop3_proxy` | Offer POP3 UTF8 and pass it to the backends. Only for Sora backends. |
 | `connect_timeout` | duration | `"30s"` | proxies | Time to connect to a backend. |
-| `auth_idle_timeout` | duration | `"2m"` | `imap`, `pop3`, `managesieve`, line proxies | Idle time allowed before login. On `imap` the IMAP library's own 30-second limit before login is shorter. |
-| `enable_affinity` | bool | `false` | line proxies | Prefer the backend a user used last. |
+| `auth_idle_timeout` | duration | `"2m"` | `imap`, `pop3`, `managesieve`, line proxies | Idle time allowed before login. |
+| `enable_affinity` | bool | `false` | proxies | Prefer the backend a user used last. |
 | `remote_health_checks` | bool | `true` | proxies | Check backend health. |
 | `remote_dns_refresh` | duration | `"5m"` | proxies | How often backend host names are resolved again. `"0"` keeps the startup addresses. |
 
@@ -1001,7 +978,7 @@ See [ADMIN_API.md](ADMIN_API.md) and [USER_API.md](USER_API.md).
 | `api_key` | string | none | `http_admin_api`, `metrics` | Bearer token. Required for `http_admin_api` (without it the server is skipped). Optional for `metrics`. |
 | `allowed_hosts` | list of strings | empty (any host) | `http_admin_api`, `http_user_api`, `metrics` | IPs or CIDR blocks allowed to connect. |
 | `jwt_secret` | string | none | `http_user_api`, `user_api_proxy` | Key that signs and checks JWTs. Without it the server is skipped. |
-| `token_duration` | duration (Go syntax) | `"24h"` | `http_user_api` | Token lifetime. An invalid value, such as `"7d"`, means `24h`. |
+| `token_duration` | duration | `"24h"` | `http_user_api` | Token lifetime. Must not be negative. |
 | `token_issuer` | string | `"sora-mail-api"` | `http_user_api` | JWT issuer. |
 | `allowed_origins` | list of strings | none | `http_user_api` | CORS origins. |
 
@@ -1011,14 +988,14 @@ See [METRICS.md](METRICS.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | none, required | URL path of the metrics, such as `"/metrics"`. Without it the process stops with a panic (`http: invalid pattern`) when the server starts. |
+| `path` | string | — | URL path of the metrics, such as `"/metrics"`. |
 | `allowed_hosts` | list of strings | empty (any host) | IPs or CIDR blocks allowed to scrape, matched against the TCP peer. |
 | `api_key` | string | none | Require `Authorization: Bearer <key>`. |
-| `enable_domain_metrics` | bool | `false` | Per-domain counters. |
+| `enable_domain_metrics` | bool | `true` | Per-domain counters. |
 | `enable_user_metrics` | bool | `false` | Per-user counters for heavy users. |
-| `user_metrics_threshold` | integer | `0` | Commands plus connections after which a user gets its own series. |
-| `max_tracked_users` | integer | `0` | Users with their own series. With `0`, no user is tracked. |
-| `hash_usernames` | bool | `false` | Replace user names by a short SHA-256 prefix in labels. |
+| `user_metrics_threshold` | integer | `1000` | Commands plus connections after which a user gets its own series. |
+| `max_tracked_users` | integer | `1000` | Users with their own series. |
+| `hash_usernames` | bool | `true` | Replace user names by a short SHA-256 prefix in labels. |
 
 These five metric settings are global: if several `metrics` blocks exist, the last one read wins.
 

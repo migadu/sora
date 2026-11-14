@@ -66,7 +66,6 @@ Sora is one Go module, `github.com/migadu/sora`. It builds two programs: `sora`,
 | [`pkg/lookupcache`](../pkg/lookupcache) | The in-memory cache of authentication and routing lookups. |
 | [`pkg/spamtraining`](../pkg/spamtraining) | The client that sends a message to a training endpoint when a user moves it into or out of Junk. |
 | [`pkg/errors`](../pkg/errors) | The error handler `cmd/sora` uses to report fatal startup errors and exit. |
-| [`pkg/degradation`](../pkg/degradation) | Degradation levels and strategies. No production code imports it. |
 
 ### 1.3 The `server` packages
 
@@ -156,10 +155,9 @@ three values at startup in its `SORA application starting` line.
 `go-junit-report`, `go-task`, PostgreSQL and the Garage S3 server. `.envrc` contains `use flake`,
 so `direnv` loads the shell when you enter the directory. You can also run `nix develop`.
 
-The shell hook of `flake.nix` also tries to initialise a PostgreSQL data directory and a Garage
-configuration. Treat that part as a starting point. If it does not work for you, set up PostgreSQL
-yourself as [TESTING.md](TESTING.md#1-what-you-need) describes, and any S3-compatible server for a
-dev server.
+The shell hook of `flake.nix` also initialises a PostgreSQL data directory under the checkout,
+sets the `PG*` variables, defines `start_postgres` and `stop_postgres` helpers, and sets up a
+Garage configuration.
 
 ### 2.5 Release builds
 
@@ -204,12 +202,7 @@ go build -race -o sora ./cmd/sora && ./sora -config config.toml
 `-config` defaults to `config.toml`. The first start migrates the database named in
 `[database.write]`.
 
-Give the development database its own name, such as `sora_dev`, not `sora_mail_db`.
-`cleanupDatabaseDefaults` in [`cmd/sora/main.go`](../cmd/sora/main.go) removes a
-`[database.write]` or `[database.read]` that is exactly `hosts = ["localhost"]`,
-`user = "postgres"`, `name = "sora_mail_db"` (whatever the port or password), treating it as
-unchanged defaults. A server with IMAP, POP3 or LMTP then exits with `database is required for
-configured servers but not configured in [database.write] or [database.read]`.
+A `[database.write]` section for a local development database:
 
 ```toml
 [database.write]
@@ -478,7 +471,7 @@ key-value pairs after the message, not formatted strings.
 
 `logger.Initialize` also makes the logger the `slog` default, and Go then routes the standard
 `log` package's default output through it at INFO level. So a stray `log.Printf` is not lost, but
-it has no level and no fields. A few older `log.Printf` calls remain in `db`; do not add new ones.
+it has no level and no fields.
 
 **Inside a session, log through the session.** Once a session exists, every log line must carry
 its context, so that `grep <session-id>` finds the whole session. Backend sessions embed
@@ -710,8 +703,8 @@ So:
 
 ### 9.3 How migrations run
 
-When `sora` starts, the first write host's pool runs the migrations (see `migrate` in
-[`db/db.go`](../db/db.go)):
+When `sora` starts, the first write pool that connects runs the migrations (see `migrate` in
+[`db/db.go`](../db/db.go)). A migration that fails stops startup.
 
 1. The instance tries to take a transaction-scoped advisory lock. The one that gets it is the
    migration leader. The lock lives in a transaction, so it also works through PgBouncer.

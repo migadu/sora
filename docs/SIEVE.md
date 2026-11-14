@@ -37,7 +37,7 @@ delivery paths run it:
 - **LMTP**, the protocol your mail transfer agent (MTA) uses to hand messages to Sora. This is
   the normal path. See [PROTOCOLS.md](PROTOCOLS.md).
 - **The Admin API delivery endpoint**, which injects a message over HTTP. See
-  [ADMIN_API.md](ADMIN_API.md). It runs Sieve a little differently; see
+  [ADMIN_API.md](ADMIN_API.md). It runs Sieve the same way, with the few differences in
   [section 10](#10-lmtp-and-admin-api-delivery-compared).
 
 Proxies never run Sieve. An `lmtp_proxy` forwards the message to a backend, and the backend runs
@@ -112,7 +112,7 @@ script text and the extension set. A changed script is never served from a stale
 
 ## 3. The built-in default script
 
-Every LMTP delivery runs a built-in script first, before the user's script. It is compiled into
+Every delivery runs a built-in script first, before the user's script. It is compiled into
 Sora ([server/lmtp/default.sieve](../server/lmtp/default.sieve)). There is no setting to change it
 or turn it off, and there is no other global or per-domain script.
 
@@ -160,8 +160,7 @@ If `[sieve] enabled_extensions` leaves any of them out, the LMTP server fails to
 So a user script that only sends a vacation reply does not stop spam from going to Junk, and a
 user script that files a message somewhere takes over from the default script.
 
-The Admin API delivery path does not run this script; see
-[section 10](#10-lmtp-and-admin-api-delivery-compared).
+The Admin API delivery path runs this script and merges the results the same way.
 
 ---
 
@@ -228,8 +227,9 @@ including headers other systems rely on. Even when it is on, `deleteheader` cann
 
 ### Behaviour of particular extensions in Sora
 
-- **`mailbox`:** `fileinto :create` creates the folder ([section 5](#5-what-each-action-does)).
-  The `mailboxexists` test always answers true: Sora does not check whether the folder exists.
+- **`mailbox`:** `fileinto :create` creates a missing folder ([section 5](#5-what-each-action-does)).
+  The `mailboxexists` test is true only when every named folder exists and the user may deliver
+  into it: an own folder, or a shared folder on which the user holds the right to add messages.
 - **`subaddress`:** the separator is `+`. `:user` is the part before the first `+`, `:detail` the
   part after it.
 - **`body`, `mime`, `foreverypart`, `extracttext`:** these walk the MIME structure of the message
@@ -259,17 +259,16 @@ implicit keep (`fileinto` without `:copy`, `redirect` without `:copy`, `discard`
   case-insensitively.
 - If the folder does not exist, the message goes to INBOX instead. Sora logs
   `mailbox not found, falling back to inbox` at warning level.
-- With `:create` (extension `mailbox`), Sora creates the folder, and any missing parent folders,
-  and delivers into it. A folder created this way is a personal folder, even if its name starts
-  with the shared namespace prefix. `:create` looks only at the account's own folders, so
-  `fileinto :create` with the name of a shared folder owned by someone else creates a personal
-  folder of that name. Use `fileinto` without `:create` to file into a shared folder.
+- With `:create` (extension `mailbox`), Sora creates a missing folder, and any missing parent
+  folders, and delivers into it. When the folder already exists, own or shared, `:create` is
+  ignored and the message is filed exactly as without it. `:create` never creates a folder in the
+  shared namespace.
 - With `:copy` (extension `copy`), the message goes to the named folder **and** to INBOX.
 - `fileinto :flags` and `imap4flags` flags are stored on every copy.
-- **Only the first `fileinto` counts.** A script that files one message into two folders stores
-  it in the first one only.
-- **`fileinto` wins over `redirect`.** If one run does both, the redirect is not sent. Use
-  `redirect :copy` with `keep` instead if you need both a forward and a local copy in INBOX.
+- A script that files one message into several folders stores a copy in each; a folder named
+  twice gets one copy.
+- `fileinto` and `redirect` combine: if one run does both, the message is filed and also
+  redirected.
 
 Filing into a shared folder owned by another account needs the insert (`i`) right on that folder.
 Without it, the message goes to the recipient's own INBOX and Sora logs
@@ -437,10 +436,11 @@ A reply goes out only if all of these hold, checked in this order:
 4. A relay is configured. Without one the reply is dropped.
 5. The message is not automatic mail: no empty sender, no `Auto-Submitted` other than `no`, no
    `Precedence` of `bulk`, `junk` or `list`, no `List-Id` header.
-6. The message is personal: at least one address in its `To` or `Cc` header belongs to the
-   account (any of its addresses, with or without a `+detail`). Mail that reached the user only
-   by `Bcc`, or through a list or alias not shown in `To`/`Cc`, gets no reply. If the ownership
-   lookup fails, Sora sends the reply anyway. The `:addresses` list does not extend this check.
+6. The message is personal: at least one address in its `To`, `Cc`, `Bcc`, `Resent-To`,
+   `Resent-Cc` or `Resent-Bcc` header belongs to the account (any of its addresses, with or
+   without a `+detail`) or is one of the script's `:addresses`. Mail that reached the user through
+   a list or alias that none of these headers shows gets no reply. If the ownership lookup fails,
+   Sora sends the reply anyway.
 7. With `:mime`, the reason is valid MIME ([below](#the-reply)).
 8. Sora wins the claim on the `:days` window ([below](#the-days-window-and-the-response-identity)).
 
@@ -470,11 +470,11 @@ reply is sent.
 
 | Part | Value |
 |---|---|
-| Envelope sender | The reply's `From` address (see below). |
+| Envelope sender | Empty (`MAIL FROM:<>`). |
 | Envelope recipient | The original message's envelope sender. |
 | `From` | The `:from` address, if it is a bare address that belongs to the account. Otherwise the account's primary address. A `:from` that is not the account's is ignored (logged at debug level). |
 | `To` | The original envelope sender. |
-| `Subject` | The `:subject`, or `Automated reply` when the script gives none. RFC 2047-encoded when it is not ASCII. |
+| `Subject` | The `:subject`. Without one, `Auto: ` followed by the original subject, or `Automated reply` when the original message has no subject. RFC 2047-encoded when it is not ASCII. |
 | `Message-ID` | `<nanoseconds.vacation@host>`, where host is the machine's hostname. Give the machine a fully qualified name; Sora warns at startup when it is not. |
 | `In-Reply-To`, `References` | Built from the original message so clients thread the reply. |
 | `Auto-Submitted` | `auto-replied` |
@@ -489,8 +489,8 @@ its `Content-*` headers and body as written and takes every other header from th
 Invalid MIME (duplicate `Content-Type`, non-ASCII header bytes, nesting deeper than 64 levels,
 and similar) means no reply; the window is not used up.
 
-The relay must accept mail from Sora with the user's address as envelope sender. If it signs
-outgoing mail (DKIM), it signs these replies too.
+The relay must accept mail from Sora with an empty envelope sender. If it signs outgoing mail
+(DKIM), it signs these replies too.
 
 ### When sending fails
 
@@ -549,21 +549,17 @@ A `managesieve_proxy` advertises its own capability list before login, from
 dropped with a warning). The backend validates scripts against `[sieve] enabled_extensions`. Keep
 the two lists the same, or clients will be offered extensions the backend refuses.
 
-`supported_extensions` on a `managesieve` backend has no effect. The backend always uses
-`[sieve] enabled_extensions`.
-
 ---
 
 ## 10. LMTP and Admin API delivery compared
 
-Both paths use the same extension set, the same script cache, the same redirect and vacation
-code, and the same limits. They differ in these ways:
+Both paths run the built-in default script and the user's script and merge their results the same
+way. They use the same extension set, the same script cache, the same `fileinto` handling
+(`:create` included), the same redirect and vacation code, and the same limits. On both, a queued
+redirect or vacation reply wakes the relay worker at once. They differ in these ways:
 
 | | LMTP | Admin API delivery |
 |---|---|---|
-| Built-in default script | Runs first | Does not run: no `X-Spam` filing to Junk, no `+detail` folders |
-| `fileinto :create` | Creates the folder | Does not create it; the message goes to INBOX if the folder is missing |
-| Redirect and vacation | Queued; the relay worker is woken at once | Queued; sent on the worker's next pass (`worker_interval`) |
 | Explicit target mailbox | Not possible | A request that names a target mailbox skips Sieve completely |
 | Redirect limits | From the `lmtp` `[[server]]` block | From the `http_admin_api` `[[server]]` block |
 

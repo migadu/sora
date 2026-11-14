@@ -72,8 +72,7 @@ sora-admin --config /etc/sora/config.toml <command> <subcommand> [flags]
   so `--flag value`, `--flag=value` and `-flag value` all work. A boolean flag that defaults to
   `true` is turned off with `--flag=false`.
 - `sora-admin <command> --help` lists the subcommands. `sora-admin <command> <subcommand> --help`
-  prints the subcommand's flags. Where that help text and this document disagree, this document
-  follows the code.
+  prints the subcommand's flags.
 
 ### Output, logs and exit status
 
@@ -103,7 +102,7 @@ config file must contain.
 | `accounts create, list, show, update, delete, restore` | yes | | | |
 | `accounts delete --purge`, `accounts purge-domain` | yes | yes | | |
 | `credentials *` | yes | | | |
-| `mailbox *` | yes | `delete --purge` builds an S3 client but does not use it | | |
+| `mailbox *` | yes | | | |
 | `messages *` | yes | | | |
 | `acl *` | yes | | | |
 | `sieve *` | yes | | | |
@@ -119,7 +118,7 @@ config file must contain.
 | `auth-cache status`, `affinity-cache status` | | | yes, via `[admin_cli]` | |
 | `stats blocked`, `stats connection` | | | yes, via `[admin_cli]` | |
 | `connections list`, `connections kick` | | | yes, via `[admin_cli]` | |
-| `affinity set, get, delete` | | | yes, via the `http_admin_api` `[[server]]` block | |
+| `affinity set, get, delete` | | | yes, via `[admin_cli]` | |
 | `backends *` | yes (primary) | | | |
 | `health status` | yes | | `--backends` only, via `[admin_cli]` | |
 | `relay *` | | | | this host's relay queue directory |
@@ -149,7 +148,7 @@ import_message_limit = "100mb"
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `addr` | string | none | Base URL of an Admin API server (an `http_admin_api` `[[server]]` block), including `http://` or `https://`. Required by `auth-cache`, `affinity-cache`, `stats`, `connections` and `health status --backends`. |
+| `addr` | string | none | Base URL of an Admin API server (an `http_admin_api` `[[server]]` block), including `http://` or `https://`. Required by `auth-cache`, `affinity-cache`, `stats`, `connections`, `affinity` and `health status --backends`. |
 | `api_key` | string | none | Sent as `Authorization: Bearer <api_key>`. Must match the `api_key` of that Admin API server. Required by the same commands. |
 | `insecure_skip_verify` | bool | depends on `addr` | When unset, TLS certificate checks are skipped only if `addr` points at a loopback address (`localhost`, `127.0.0.0/8`, `::1`) and kept for any other host. `true` or `false` overrides this. Leave it unset or `false` for a remote Admin API: the API key travels in every request. |
 | `import_message_limit` | size (`"50mb"`) | see below | Largest message `import maildir` accepts. Larger files are counted as failed. |
@@ -160,10 +159,6 @@ file, the limit is 50 MB. An unparsable value logs a warning and falls back the 
 
 The Admin API requests time out after 30 seconds. The Admin API itself is described in
 [ADMIN_API.md](ADMIN_API.md).
-
-The `affinity` commands do not use `[admin_cli]`. They read `addr` and `api_key` from the first
-`[[server]]` block with `type = "http_admin_api"` in the same file (see
-[section 17](#17-affinity)).
 
 ---
 
@@ -199,9 +194,8 @@ sora-admin --config config.toml accounts create --email user@example.com --passw
 | `--credentials` | | JSON list of credentials. Cannot be combined with `--email`, `--password` or `--password-hash`. |
 
 - `--password` and `--password-hash` are mutually exclusive.
-- `bcrypt` hashes are stored as `{BLF-CRYPT}$2a$...` with cost 12. The tool does not read the
-  top-level `bcrypt_cost` key; the server rehashes on the user's next login if its configured
-  cost differs.
+- `bcrypt` hashes are stored as `{BLF-CRYPT}$2a$...` with the cost set by the top-level
+  `bcrypt_cost` key (default 12), as on the server.
 - `--password-hash` is not checked. A hash in a scheme Sora cannot verify is accepted here and
   then fails at every login. Sora verifies `{BLF-CRYPT}`, bare `$2a$`, `$2b$`, `$2y$` bcrypt,
   `{SSHA512}`, `{SSHA512.b64}`, `{SSHA512.HEX}`, `{SHA512}`, `{SHA512.b64}` and `{SHA512.HEX}`
@@ -274,6 +268,8 @@ sora-admin --config config.toml accounts update --email alias@example.com --make
 - `--make-primary` is refused when the new primary is in a different domain and the account
   already has messages: message bodies in S3 are stored under the primary address's domain, and
   the change would split them.
+- A password change drops the account's cached logins on every node, as the Admin API does, so
+  the old password stops working at once.
 
 ### accounts delete
 
@@ -302,8 +298,8 @@ the account stays out of service and marked; a server's purge worker (on a node 
 storage) finishes it, or you run the command again. If a server's purge worker is already
 purging the account, the command waits for it and reports when it is done.
 
-Neither form closes sessions that are already open. Run `connections kick --user ADDRESS`
-afterwards ([section 16](#16-connections)).
+Both forms end the account's open sessions and drop its cached logins on every node, as the
+Admin API does.
 
 ### accounts restore
 
@@ -397,6 +393,8 @@ The primary credential cannot be deleted: make another one primary first with `a
 --make-primary`. The last credential of an account cannot be deleted: delete the account
 instead.
 
+The deleted address's cached logins are dropped on every node, as the Admin API does.
+
 ---
 
 ## 6. mailbox
@@ -444,8 +442,6 @@ sora-admin --config config.toml mailbox delete --email user@example.com --mailbo
   They then show up in `messages list-deleted` and can be restored with `messages restore` until
   the cleaner reclaims them after `[cleanup] grace_period`. The cleaner deletes an S3 object only
   when no other message (a copy in another folder) still uses it.
-- `--purge` creates an S3 client from `[s3]` before it starts, so `[s3]` must be valid even
-  though no object is deleted by this command.
 
 ### mailbox rename
 
@@ -627,7 +623,7 @@ sora-admin --config config.toml verify s3 --email user@example.com --show-missin
 | `--email` | | The account (required). Its domain and local part also form the S3 prefix that is listed. Use the primary address. |
 | `--show-missing` | `false` | List every missing, orphaned and corrupt key. |
 | `--deep` | `false` | Download, decrypt and BLAKE3-hash every object. Slow: it transfers all of the account's mail. |
-| `--fix-orphaned` | `false` | Delete S3 objects under the prefix that no live message uses. |
+| `--fix-orphaned` | `false` | Delete S3 objects under the prefix that no message uses, expunged or not. |
 | `--fix-missing` | `false` | Set `uploaded = false` on live messages whose object is missing. |
 | `--dry-run` | `false` | With the `--fix-*` flags, report and change nothing. |
 | `--batch-size` | `1000` | Messages per batch in the database-to-S3 pass. |
@@ -636,18 +632,14 @@ It runs two passes:
 
 1. **Database to S3.** Every live (not expunged) message's key gets a HEAD request; with
    `--deep`, the full body is also downloaded and checked.
-2. **S3 to database.** Every object under `domain/localpart/` of `--email` is looked up among the
-   account's live messages. Objects no live message uses are reported as orphaned.
+2. **S3 to database.** Every object under `domain/localpart/` of `--email` is looked up among all
+   message rows that reference it, expunged or not and in any account. Objects that no row uses
+   are reported as orphaned.
 
 Things to know before you use the fix flags:
 
-- `--fix-orphaned` treats an object as orphaned when only **expunged** messages use it. Those
-  messages can still be restored with `messages restore` during the grace period; after
-  `--fix-orphaned` they would be restored without a body. The cleaner removes truly unused
-  objects on its own, so prefer leaving orphans to it.
-- Messages still waiting for upload are reported as missing in the first pass.
-- Messages imported with `import maildir` are stored under a SHA-256 hash, while `--deep` checks
-  BLAKE3, so `--deep` reports them as corrupt. See [IMPORT_EXPORT.md](IMPORT_EXPORT.md#5-what-sora-stores-for-each-message).
+- `--fix-orphaned` leaves alone an object that an expunged message still uses: that message can
+  still be restored with `messages restore` during the grace period.
 - `--fix-missing` does not recover a body. Objects that pass HEAD but fail `--deep` are not
   "missing", and `--fix-missing` does not touch them.
 
@@ -673,8 +665,7 @@ sora-admin --config config.toml verify hash --email user@example.com --hash 31fe
 
 Steps: HEAD the key; download, decrypt and BLAKE3-hash the body; then, best effort, list the
 database messages that use the hash and their upload state. If the database cannot be reached,
-the last part is skipped and the S3 result still stands. As with `verify s3 --deep`, an object
-written by `import maildir` fails the hash check.
+the last part is skipped and the S3 result still stands.
 
 ---
 
@@ -718,10 +709,8 @@ sora-admin --config config.toml uploader resolve
 | `[DELETE]` | Not in S3, owned by this host, and no spool file. | Deletes the message rows and the pending row. The message is lost. |
 
 "This host" is the instance ID from `[uploader] instance_id`, or the hostname when unset. The
-spool is `[uploader] path`. Run `resolve` on the backend that owns the uploads, with its own
-config file, and make sure `[uploader] path` is set in that file: `sora-admin` does not apply the
-server's default path, and with no path it finds no spool file and would choose `[DELETE]`.
-Always look at a `--dry-run` first.
+spool is `[uploader] path`, with the server's default when unset. Run `resolve` on the backend
+that owns the uploads, with its own config file. Always look at a `--dry-run` first.
 
 ---
 
@@ -736,9 +725,8 @@ The local cache keeps recently fetched message bodies on a backend's disk. See
 | `metrics` | Shows hit and miss ratios that the servers record in the database, per instance. |
 | `purge` | Deletes every cached object and clears the cache index. |
 
-`stats` and `purge` act on `[local_cache] path` **on the host where you run them**, and they also
-connect to the database. Set `[local_cache] path` in the file: `sora-admin` does not apply the
-server's default and stops with `cache base path cannot be empty` without it.
+`stats` and `purge` act on `[local_cache] path` (the server's default when unset) **on the host
+where you run them**, and they also connect to the database.
 
 `cache purge` flags:
 
@@ -762,8 +750,8 @@ A purge loses nothing: the bodies are in S3 and are fetched again on the next mi
 
 ## 14. auth-cache and affinity-cache
 
-Both call the Admin API set in `[admin_cli]`. Neither takes flags, and `--help` after `status`
-is ignored (the request is made).
+Both call the Admin API set in `[admin_cli]`. Neither takes flags; `--help` after `status`
+prints the usage.
 
 | Command | Admin API endpoint | Shows |
 |---|---|---|
@@ -849,15 +837,11 @@ Affinity pins a user to a backend, per protocol, on proxies. See [PROXY.md](PROX
 | `set` | `--user`, `--protocol`, `--backend` | Pins the user to the backend; the change is gossiped to every node. |
 | `get` | `--user`, `--protocol` | Prints the user's backend, or says there is none. |
 | `delete` | `--user`, `--protocol` | Removes the pin; gossiped to every node. |
-| `list` | | Not supported. It prints a note and exits. |
 
 - `--protocol` is `imap`, `pop3` or `managesieve`. `--backend` is a backend address as the proxy
   knows it, for example `10.0.0.21:993`; the Admin API refuses a backend that is not in its
   configured list for that protocol.
-- These commands do **not** use `[admin_cli]`. They take `addr` and `api_key` from the first
-  `[[server]]` block with `type = "http_admin_api"` in the config file, and add `http://` when
-  `addr` has no scheme. TLS certificates are always verified, and requests time out after 10
-  seconds. Run them with the config file of a node that runs that Admin API.
+- These commands call the Admin API set in `[admin_cli]`, like the other Admin API commands.
 
 ---
 
@@ -955,14 +939,6 @@ metadata file and a `<id>.msg` body in one of `pending/`, `processing/` or `fail
 `--queue` is `pending`, `processing` or `failed`. `--confirm` does not prompt; without it,
 `delete` and `requeue` refuse.
 
-`list` prints only the first 8 characters of each ID. `show`, `delete` and `requeue` need the
-full ID, which is the file name without `.json` in the queue directory:
-
-```sh
-ls /var/spool/sora/relay/failed/
-sora-admin --config config.toml relay show --queue failed --id <full-id>
-```
-
 ---
 
 ## 21. tls
@@ -985,9 +961,8 @@ Notes on `delete`:
 - Give exactly one of `--domain` and `--key`.
 - `--key` takes the full S3 key as `tls list --details` shows it (`autocert/cert-...`). A shorter
   value, or one ending in `...`, is treated as a prefix; it must match exactly one key.
-- `--domain` builds the S3 key without the `cert-` part of the name the server uses, so it does
-  not remove the certificate from S3. It removes only the local mirror file named after the
-  domain, not the `+rsa` one. Use `--key`.
+- `--domain` deletes both the ECDSA and the RSA certificate of the domain, from S3 and from the
+  local mirror.
 - `--key` leaves the local mirror alone.
 
 `cache` writes files with mode `0600` as the user running the command. Run it as the user the
@@ -1005,10 +980,10 @@ Checks and prints a config file. These subcommands read only the file.
 | `dump` | `--format` (`toml` or `json`, default `toml`), `--mask-secrets` (default `true`) | Prints the configuration as loaded, with defaults applied. |
 
 `--mask-secrets` masks the database passwords, `[s3]` access key, secret key and encryption key,
-the `[tls]` certificate and key paths, the Let's Encrypt S3 keys, `[cluster] secret_key`, and the
-`api_key`, `jwt_secret`, `master_password` and `master_sasl_password` of each `[[server]]`. Other
-secrets in the file, such as `[admin_cli] api_key` or relay credentials, are printed as they are.
-Treat the output as secret.
+the `[tls]` certificate and key paths, the Let's Encrypt S3 keys, `[cluster] secret_key`,
+`[admin_cli] api_key`, `[relay] auth_token`, `[spam_training] auth_token`, and the `api_key`,
+`jwt_secret`, `master_password`, `master_sasl_password` and remote lookup `auth_token` of each
+`[[server]]`.
 
 See [CONFIGURATION.md](CONFIGURATION.md) for the file itself.
 
@@ -1033,9 +1008,8 @@ upgrades.
 - `force` is for a dirty state after a failed migration: fix the schema by hand, then force the
   version that matches it.
 - `migrate` connects to the first host of `[database.write] hosts` with `port`, `user`,
-  `password`, `name` and `tls`. It needs `port` set and a host without a port in it; otherwise it
-  fails with `invalid port`. On that error the printed connection string includes the
-  password.
+  `password`, `name` and `tls`, with the server's port rules: a port in the host entry wins, and
+  `port` defaults to `5432`.
 
 ---
 
@@ -1063,12 +1037,12 @@ time. Neither needs a config file.
 | `mailbox delete --purge` | Expunges the messages at once, then deletes the mailbox. | `messages restore` within the grace period. | `--confirm` flag required. |
 | `sieve delete` | One script, also the active one. | None. | None. |
 | `acl revoke` | One ACL entry. | `acl grant` again. | None. |
-| `verify s3 --fix-orphaned` | S3 objects no live message uses, including those of restorable expunged messages. | None. | None; try `--dry-run` first. |
+| `verify s3 --fix-orphaned` | S3 objects that no message uses, expunged or not. | None. | None; try `--dry-run` first. |
 | `verify s3 --fix-missing` | Sets `uploaded = false` on messages with no object. | None. | None; try `--dry-run` first. |
 | `uploader resolve` | `[DELETE]`: message rows whose body is in neither S3 nor the spool. | None. | None; try `--dry-run` first. |
 | `cache purge` | The local cache of this host. | Refills from S3. | `(y/N)` prompt unless `--confirm`. |
 | `relay delete` | Queued relay messages. | None. | `--confirm` flag required. |
-| `tls delete` | A certificate in S3 (with `--key`). | Let's Encrypt issues a new one. | None. |
+| `tls delete` | A certificate in S3 (with `--domain`, also from the local mirror). | Let's Encrypt issues a new one. | None. |
 | `tls clean` | Expired certificates. | None needed. | `[y/N]` prompt unless `--force`. |
 | `migrate down` | Schema objects and their data. | `migrate up` restores the schema, not the data. | None. |
 | `connections kick` | Open sessions (users can log in again). | Not applicable. | `(y/N)` prompt unless `--confirm` or `-y`. |

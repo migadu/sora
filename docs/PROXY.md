@@ -85,7 +85,7 @@ them in full.
 |---|---|---|---|---|
 | `remote_addrs` | list of strings | none | all | The backends, as `host:port` or `host`. Hostnames are resolved (see [section 7](#7-backend-health-dns-and-connect-timeouts)). Required unless the file has `[[pool]]` blocks, and forbidden when it has them. |
 | `remote_port` | integer or string | none | all | Port added to a backend written without one, in `remote_addrs` and in `[[pool]]` blocks. Required when a pool backend has no port. 0 to 65535. |
-| `enable_affinity` | bool | `false` | all but User API | Use cluster-wide affinity when choosing a backend. Needs `[cluster]` enabled. The User API proxy uses affinity whenever the cluster is enabled. |
+| `enable_affinity` | bool | `false` | all | Use cluster-wide affinity when choosing a backend. Needs `[cluster]` with `[cluster.affinity] enabled = true`. |
 | `remote_health_checks` | bool | `true` | all | Track backend failures and skip backends that keep failing. `false` treats every backend as healthy. |
 | `remote_dns_refresh` | duration | `5m` | all | How often backend hostnames are re-resolved. `"0"` keeps the addresses resolved at startup. |
 | `connect_timeout` | duration | `30s` | all | Limit for one TCP connect (and the TLS handshake) to a backend. Also the limit for reading the backend greeting and for the proxy's own login to the backend. |
@@ -105,22 +105,22 @@ carries its own copy and these server keys are not used for pool members (except
 | `remote_tls` | bool | `false` | all | Use TLS to the backend. |
 | `remote_tls_use_starttls` | bool | `false` | IMAP, POP3, ManageSieve, LMTP | Connect in plaintext and upgrade with the protocol's STARTTLS after the greeting. Needs `remote_tls = true`; without it the key is ignored with a warning. The User API proxy has no STARTTLS and warns if it is set. |
 | `remote_tls_verify` | bool | `false` | all | Verify the backend's certificate. Note the default: on a `[[server]]` block it is **off** unless you set it. In `[[pool]]` and `[server.remote_lookup]` it defaults to on. |
-| `remote_tls_ca_file` | path | system roots | POP3 only | PEM file of CA certificates for verifying backends that are in no pool. The other proxy types ignore this key on a `[[server]]` block; use `remote_tls_ca_file` in a `[[pool]]` block instead. |
+| `remote_tls_ca_file` | path | system roots | all | PEM file of CA certificates for verifying backends that are in no pool. Pool members use their pool's `remote_tls_ca_file`. |
 | `remote_use_proxy_protocol` | bool | `false` | all | Send a PROXY protocol v2 header with the client's address at the start of each backend connection. |
 | `remote_use_id_command` | bool | `false` | IMAP | Send an IMAP `ID` command with the client's address before logging in. |
-| `remote_use_xclient` | bool | `false` | POP3, LMTP | Send an `XCLIENT` command with the client's address. (Sora logs a warning that this key "only applies to LMTP proxy servers" when it is set on a POP3 proxy; the POP3 proxy does use it.) |
+| `remote_use_xclient` | bool | `false` | POP3, LMTP | Send an `XCLIENT` command with the client's address. |
 | `remote_use_utf8` | bool | `false` | POP3 | Advertise `UTF8` and `LANG` before login, and repeat a client's pre-login `UTF8` to the backend. Turn on only when every backend is Sora. |
 
 ### Listener, limits and timeouts
 
 | Key | Default for proxies | Notes |
 |---|---|---|
-| `addr` | none (required) | Listen address. A block without `type`, `name` and `addr` is not started. |
+| `addr` | none (required) | Listen address. |
 | `tls`, `tls_cert_file`, `tls_key_file`, `tls_use_starttls`, `tls_default_domain` | off | Client-side TLS. See [TLS.md](TLS.md). |
-| `tls_verify` | `false` | With `tls_cert_file`, `true` requires and verifies a client certificate on the listener. Mail clients do not send one; leave it off. (It has nothing to do with backend certificates, which `remote_tls_verify` covers.) |
+| `tls_verify` | `false` | `true` requires and verifies a client certificate on the listener. Mail clients do not send one; leave it off. (It has nothing to do with backend certificates, which `remote_tls_verify` covers.) |
 | `insecure_auth` | `false` | Plaintext logins are allowed anyway when the listener has no TLS. |
 | `auth_idle_timeout` | `2m` | Idle time allowed before login (LMTP: before the first accepted recipient). |
-| `timeouts.command_timeout` | IMAP `30m`, POP3 `10m`, ManageSieve `3m`, LMTP `2m` | Idle timeout. |
+| `timeouts.command_timeout` | IMAP `30m`, POP3 `10m`, ManageSieve `3m` | Idle timeout. |
 | `timeouts.absolute_session_timeout` | `24h`, LMTP `5m` | Longest a session may last. |
 | `timeouts.min_bytes_per_minute` | `0` (off) | Slow-client guard. |
 | `max_connections`, `max_connections_per_ip` | `0` (unlimited) | Per proxy instance. |
@@ -129,17 +129,16 @@ carries its own copy and these server keys are not used for pool members (except
 | `auth_rate_limit` | off | See [AUTHENTICATION.md](AUTHENTICATION.md). |
 | `listen_backlog` | `1024` (mail proxies) | TCP accept backlog. |
 | `debug` | `false` | Log the protocol exchange, with passwords masked. |
-| `proxy_protocol`, `proxy_protocol_timeout` | off, `5s` | Accept a PROXY header from a load balancer in front of the proxy. **Only the User API proxy reads these keys.** The IMAP, POP3, ManageSieve and LMTP proxies are started without them, so a load balancer in front of them must not send PROXY headers. |
+| `proxy_protocol`, `proxy_protocol_timeout` | off, `5s` | Accept a PROXY header from a load balancer in front of the proxy. The load balancer's address must be in `[servers] trusted_networks`. |
 | `jwt_secret` | none | User API proxy: the secret the backends sign tokens with. The proxy is not started without it. See [USER_API.md](USER_API.md). |
 
 The IMAP, POP3, ManageSieve and LMTP proxies accept new connections slowly for their first 30
 seconds (with a 5 ms pause before each), so a restart does not hit the database with every client
 at once.
 
-The LMTP proxy accepts connections only from addresses in `[servers] trusted_networks`. That list
-is empty by default, and then the LMTP proxy accepts no connection at all: add your MTA's address.
-Remember that the same list also lets those hosts send PROXY headers and client addresses to the
-servers of that node ([SECURITY.md](SECURITY.md)).
+The LMTP proxy accepts connections only from addresses in `[servers] trusted_networks`: add your
+MTA's address. Remember that the same list also lets those hosts send PROXY headers and client
+addresses to the servers of that node ([SECURITY.md](SECURITY.md)).
 
 ---
 
@@ -174,7 +173,8 @@ In words:
    group is `remote_addrs`. With pools it is the pool the lookup named, or the pool marked
    `default = true` when it named none. A pool the proxy does not have, or no pool and no default,
    is a temporary failure; see [section 5](#5-named-backend-pools).
-3. **Affinity.** With `enable_affinity = true` and a cluster, the proxy looks for the backend this
+3. **Affinity.** With `enable_affinity = true` and a cluster that runs the affinity store
+   (`[cluster.affinity] enabled = true`), the proxy looks for the backend this
    user was last connected to, first for this protocol, then for the user's other protocols. It is
    used only if it is a member of the pool, is not in maintenance, and has not been marked unhealthy.
 4. **Consistent hash.** The username is hashed onto a ring of the pool's members. The same user
@@ -233,9 +233,8 @@ The proxy sends `GET` to `url` after replacing placeholders:
 - `$email` becomes the user, URL-encoded. The URL must contain it: nothing else carries the user.
   A `+detail` part is removed first (`anna+lists@example.com` is sent as `anna@example.com`). A
   token suffix is kept (`anna@example.com@TOKEN` is sent as is), so your API can check tokens.
-- `$ip` becomes the client's IP address, **on the IMAP proxy only**. The other proxies leave the
-  text `$ip` in the URL as it is. When the IMAP proxy itself is behind a load balancer, `$ip` is the
-  address of the connection's peer.
+- `$ip` becomes the client's IP address. When the proxy accepts PROXY protocol from a load
+  balancer, this is the client address from the PROXY header.
 - `route_only=true` is appended (with `?` or `&`) when the proxy only needs the route and has
   already settled the password question. That is every LMTP and User API lookup, and an IMAP, POP3
   or ManageSieve login with the proxy's own `master_username` and `master_password`.
@@ -275,9 +274,9 @@ Where the user goes depends on `server` and `pool`:
 | empty, `null` or absent | set | pool | Affinity, hash, round robin inside that pool. |
 | empty, `null` or absent | empty or absent | auth-only | Affinity, hash, round robin inside the default pool (or `remote_addrs`). |
 
-A `server` without a port gets `remote_port` from `[server.remote_lookup]`, or **143** when that is
-not set, whatever the protocol. On a POP3, ManageSieve or LMTP proxy, either answer with a port or
-set `remote_port` in `[server.remote_lookup]`.
+A `server` without a port gets `remote_port` from `[server.remote_lookup]`. When that is not set,
+it gets a port for the proxy's own protocol: the proxy's `remote_port`, or the protocol's standard
+port. A bare IPv6 address gets a port the same way.
 
 The proxy reads at most 1 MiB of the body.
 
@@ -295,9 +294,7 @@ The proxy reads at most 1 MiB of the body.
 | `5xx` | service unavailable | yes |
 | timeout, connection error | service unavailable | yes |
 
-The HTTP client follows redirects that carry a `Location` header, so a `301`, `302`, `303`, `307`
-or `308` with `Location` is followed, and the answer at the new location counts. Only a `3xx` the
-client does not follow is "user not found".
+The HTTP client does not follow redirects: every `3xx` is "user not found".
 
 "User not found" is where `lookup_local_users` matters:
 
@@ -357,7 +354,7 @@ POP3, ManageSieve and LMTP proxy with a remote lookup.
 | `lookup_local_users` | `false` | Check PostgreSQL when the API says "user not found". Also makes a proxy node connect to PostgreSQL ([section 13](#13-proxy-nodes-and-the-database)). |
 | `user_not_found_response` | `"reject"` | LMTP proxy only: `"reject"` (550) or `"tempfail"` (450) for a recipient the API does not know, when `lookup_local_users` is off. Other values mean `"reject"`. |
 | `restrict_to_pool` | `false` | Refuse a `server` that is not one of the proxy's own backends (by configured name or resolved address). Protects against a compromised API pointing the proxy at an internal host. Without pools the user is then routed as in auth-only mode; with pools the login fails. |
-| `remote_port` | none (143 is used) | Port added to a `server` without one. |
+| `remote_port` | none | Port added to a `server` without one. When unset, the port of the proxy's own protocol is used ([section 4.2](#42-the-answer)). |
 | `remote_tls`, `remote_tls_use_starttls`, `remote_use_proxy_protocol`, `remote_use_id_command`, `remote_use_xclient`, `remote_use_utf8` | `false` | Backend-leg settings for a pinned `server` (not for pools). |
 | `remote_tls_verify` | `true` | Verify a pinned `server`'s certificate. |
 
@@ -400,8 +397,8 @@ Examples:
 {"address": "carl@example.net", "password_hash": "$2a$12$Zt..."}
 ```
 
-An LMTP lookup for `anna@example.com` arrives as `GET /sora?email=anna%40example.com&ip=$ip&route_only=true`
-(with the URL from the example above) and may be answered without `password_hash`:
+An LMTP lookup for `anna@example.com` carries `route_only=true` and may be answered without
+`password_hash`:
 
 ```json
 {"address": "anna@example.com", "pool": "pool-a"}
@@ -549,11 +546,10 @@ Affinity remembers the backend a user was last connected to. It matters when the
 differ: when a user failed over to another backend, affinity keeps them there even after the first
 backend recovers, so their client does not jump back and forth.
 
-- Affinity needs `[cluster]` enabled. The affinity map is shared between cluster nodes by gossip,
-  so all proxies agree. Without a cluster there is no affinity and `enable_affinity` has no effect.
-  [CLUSTER.md](CLUSTER.md) describes the gossip.
-- The proxy reads and writes affinity only with `enable_affinity = true` in its block. The User API
-  proxy uses affinity whenever the cluster is enabled.
+- Affinity needs `[cluster]` enabled with `[cluster.affinity] enabled = true`. The affinity map is
+  shared between cluster nodes by gossip, so all proxies agree. Without a cluster there is no
+  affinity and `enable_affinity` has no effect. [CLUSTER.md](CLUSTER.md) describes the gossip.
+- The proxy reads and writes affinity only with `enable_affinity = true` in its block.
 - An entry is kept per user and protocol (`imap`, `pop3`, `lmtp`, `managesieve`, `userapi`). After
   a successful connection the proxy sets the entry if there is none, or changes it if the user
   connected elsewhere. Entries expire after `[cluster.affinity] ttl` (default `24h`) from when they
@@ -570,7 +566,7 @@ backend recovers, so their client does not jump back and forth.
   API later stops pinning that user. It does not set affinity for login and token refresh
   requests, which anyone can send for any user.
 
-`[cluster.affinity] enabled` is not read: the affinity map runs whenever the cluster is enabled.
+`[cluster.affinity] enabled` turns the affinity map on for the node.
 `[cluster.affinity] cache_path` keeps it on disk across restarts ([section 12](#12-affinity-cache)).
 
 ### 6.3 Round robin
@@ -683,7 +679,7 @@ With verification on, the backend's certificate chain is checked against:
 
 - the pool's `remote_tls_ca_file` for a pool member, however the user was routed to it (a lookup
   pin to a member too);
-- for a backend in no pool, the POP3 proxy's own `remote_tls_ca_file`, or the system roots.
+- for a backend in no pool, the proxy's own `remote_tls_ca_file`, or the system roots.
 
 The name checked is the name the backend was configured by. A backend configured as
 `backend1.example.com` is dialed at the address that name resolved to, but its certificate must be
@@ -832,9 +828,11 @@ delete it on a failed backend connection, so an outage does not send one lookup 
 Failures are cached only when definite: a wrong password, or a user who does not exist. Database and
 API outages are not cached.
 
-A consequence: after a password change, the old password still works through a proxy for up to
-`positive_ttl` for a user who used it recently, and the new one may be refused for up to
-`positive_revalidation_window`.
+A password change, credential removal or account deletion made through the Admin API or
+`sora-admin` drops the account's entries from the lookup cache of every proxy, whichever node or
+tool makes the change, so the old credentials stop working at once. A password changed in the remote lookup API's own system reaches
+the proxy as entries expire: the old password still works for up to `positive_ttl` for a user who
+used it recently, and the new one may be refused for up to `positive_revalidation_window`.
 
 ### 10.3 Settings
 
@@ -845,16 +843,16 @@ A consequence: after a password change, the old password still works through a p
 | `enabled` | see below | Turn the cache on. |
 | `positive_ttl` | `5m` | How long a success is kept. |
 | `negative_ttl` | `1m` | How long a failure is kept. |
-| `max_size` | `50000` without the table, `10000` with it | Entries per proxy server. When full, the oldest entry is removed. |
+| `max_size` | `50000` | Entries per proxy server. When full, the oldest entry is removed. |
 | `cleanup_interval` | `5m` | How often expired entries are removed. |
 | `positive_revalidation_window` | `30s` | Age below which a different password on a success entry is rejected without a check. |
 
-Durations here use Go syntax (`90s`, `5m`, `1h`); `d` for days is not accepted.
+Durations take Go units (`90s`, `5m`, `1h`) or whole days (`1d`).
 
-**Default state.** Without a `[server.lookup_cache]` table, the IMAP, POP3, ManageSieve and LMTP
-proxies enable the cache with the defaults above. With the table present, the cache is on only if
-it says `enabled = true`: a table that only sets `positive_ttl` turns the cache off. The User API
-proxy's cache is off unless its table says `enabled = true`.
+**Default state.** The IMAP, POP3, ManageSieve and LMTP proxies enable the cache with the defaults
+above. A `[server.lookup_cache]` table changes only the keys it sets: a table that only sets
+`positive_ttl` keeps the cache on with the other defaults. The User API proxy's cache is off unless
+its table says `enabled = true`.
 
 Backend servers keep a cache of their own; see [AUTHENTICATION.md](AUTHENTICATION.md).
 
@@ -885,9 +883,9 @@ by the remote lookup, and master logins, never use it. It needs the node to have
 Errors reading the file are logged and the login goes to the database. The cache never fails a
 login by itself.
 
-The cache does not learn about password changes: an entry is replaced only when the password the
-client sends does not match it. **Until an entry is older than `max_age`, the old password is still
-accepted by the proxy.** Lower `max_age` if that matters to you.
+A password change, credential removal or account deletion made through the Admin API or
+`sora-admin` removes the account's entries on every node, so the old credentials stop working at
+the proxies at once.
 
 ### 11.3 On disk
 
@@ -926,8 +924,7 @@ Sora logs `AuthCache: Failed to initialize - continuing without auth cache` and 
 | `purge_unused` | `168h` | Entries not used for this long are deleted at cleanup. |
 | `cleanup_interval` | `1h` | How often cleanup runs. |
 
-A value that does not parse is replaced, with a warning, by `168h` (`max_age`), `720h`
-(`purge_unused`) or `1h` (`cleanup_interval`). Durations accept `d` for days (`7d`).
+Durations accept `d` for days (`7d`).
 
 Metrics: `sora_auth_cache_operations_total{result}` (`hit`, `miss`, `error`) and
 `sora_auth_cache_entries_total`. The Admin API reports the cache at `/admin/auth-cache/stats`, and
@@ -943,12 +940,13 @@ The affinity cache keeps the map in a SQLite file so the node starts with it.
 
 ```toml
 [cluster.affinity]
+enabled = true
 ttl = "24h"
 cleanup_interval = "1h"
 cache_path = "/var/lib/sora/affinity_cache.db"
 ```
 
-- Used only with `[cluster]` enabled and `cache_path` set.
+- Used only with `[cluster]` and `[cluster.affinity]` enabled and `cache_path` set.
 - At startup, entries that have not expired are loaded, except for users gossip has already
   provided.
 - Every change (set, update, delete, also those received by gossip) is written to the file in the
@@ -964,8 +962,8 @@ The table holds `key` (`user:protocol`), `username`, `protocol`, `backend`, `ass
 `expires_at` and `node_id`.
 
 Metrics: `sora_affinity_manager_entries` and `sora_affinity_manager_broadcast_queue_size`. The Admin
-API reports affinity at `/admin/affinity/stats` and lists it at `/admin/affinity/list`;
-`sora-admin affinity-cache status` shows the stats.
+API reports affinity at `/admin/affinity/stats`; `sora-admin affinity-cache status` shows the
+stats.
 
 ---
 
@@ -979,28 +977,22 @@ What a proxy needs PostgreSQL for:
 - reading the backend maintenance list;
 - the auth cache, which is attached to the database connection.
 
-Sora decides at startup whether the node connects to PostgreSQL. It connects when the node runs an
-`imap`, `pop3` or `lmtp` server, an `http_admin_api` or `http_user_api` server, or a proxy whose
-`[server.remote_lookup]` sets `lookup_local_users = true`. **A node that runs only proxies and none
-of those connects to no database**, and logs
+A node that runs only proxies, all of them with a remote lookup and none with
+`lookup_local_users = true`, does not need PostgreSQL to check users and can leave `[database]`
+out. It logs
 `Skipping database initialization - running in proxy-only mode with remote_lookup`.
 
-On such a node:
+On a node without database access:
 
-- every proxy must have a remote lookup, because it has nothing else to check users against;
 - backend maintenance is not honored;
 - `[auth_cache]` is not used.
 
-A proxy node that checks passwords in PostgreSQL therefore needs one of the servers above on the
-same node. An `http_admin_api` server is the natural choice: you also need it to see the proxies'
-backend health with `sora-admin health status --backends`, since that state lives in the proxy
-process.
+An `http_admin_api` server on a proxy node lets you see the proxies' backend health with
+`sora-admin health status --backends`, since that state lives in the proxy process.
 
-Sora treats the database as not configured when `[database.write]` and `[database.read]` are absent,
-have empty `hosts`, or still hold exactly the built-in defaults (host `localhost`, user `postgres`,
-database `sora_mail_db`). A proxy-only node can therefore leave `[database]` out. A node that needs
-the database while it counts as not configured refuses to start with
-`database is required for configured servers but not configured in [database.write] or [database.read]`.
+Sora treats the database as not configured when `[database.write]` and `[database.read]` are absent
+or have empty `hosts`. A node that needs the database while it is not configured refuses to start
+with `database is required for configured servers but not configured in [database.write] or [database.read]`.
 
 ---
 
@@ -1009,7 +1001,7 @@ the database while it counts as not configured refuses to start with
 | Situation | IMAP | POP3 | ManageSieve | LMTP | User API |
 |---|---|---|---|---|---|
 | No pool for the route, pin unavailable, no backend reachable, backend login failed | `NO [UNAVAILABLE] Backend server temporarily unavailable` then `* BYE` | `-ERR [SYS/TEMP] Backend server temporarily unavailable` | `NO (UNAVAILABLE) "Backend server temporarily unavailable"` | `451 4.4.1 Backend connection failed` | `503` |
-| Remote lookup unavailable (timeout, 5xx, breaker open) | `NO Authentication failed` | `-ERR [AUTH] Authentication failed` | `NO "Authentication failed"` | `451 4.4.3 Service temporarily unavailable, please try again later` | pools: `503`; no pools: routed by hash |
+| Remote lookup unavailable (timeout, 5xx, breaker open) | `NO [UNAVAILABLE]` | `-ERR [SYS/TEMP]` | `NO (UNAVAILABLE)` | `451 4.4.3 Service temporarily unavailable, please try again later` | pools: `503`; no pools: routed by hash |
 | Remote lookup invalid answer | `NO Authentication failed` | `-ERR [AUTH] Authentication failed` | `NO "Authentication failed"` | `451 4.4.3` | as above |
 | User not found | `NO Authentication failed` | `-ERR [AUTH] Authentication failed` | `NO "Authentication failed"` | `550 5.1.1 User unknown` or `450 4.1.1` | no pools: routed by hash, the backend answers; pools: `503` unless `lookup_local_users` |
 | Proxy shutting down | `NO [UNAVAILABLE]` | `-ERR [SYS/TEMP]` | `NO (UNAVAILABLE)` | `421 4.3.2` | |
@@ -1017,14 +1009,15 @@ the database while it counts as not configured refuses to start with
 
 Notes:
 
-- A remote lookup outage reaches IMAP, POP3 and ManageSieve clients as a failed login, not a
-  temporary error, and counts toward auth rate limiting.
+- A remote lookup outage reaches IMAP, POP3 and ManageSieve clients as a temporary failure they
+  can retry, and does not count as a failed login for auth rate limiting.
 - The IMAP backend-login failure that is not a connection problem reads
   `NO [UNAVAILABLE] Backend server authentication failed`.
-- The LMTP proxy answers a recipient that does not exist with a temporary `450 4.1.1` instead of a
-  bounce when no backend of the default pool (or of `remote_addrs`) is healthy and out of
-  maintenance, because it cannot be sure. For the first lookup of a recipient the remote lookup does
-  not know, this check is not made; it is made when the answer comes from the lookup cache.
+- The LMTP proxy answers a recipient its database does not know with a temporary `450 4.1.1`
+  instead of a bounce when no backend of the default pool (or of `remote_addrs`) is healthy and out
+  of maintenance, because it cannot be sure. A recipient the remote lookup does not know gets the
+  same reply whether the answer is fresh or comes from the lookup cache: `550 5.1.1`, or `450 4.1.1`
+  with `user_not_found_response = "tempfail"`.
 - An LMTP recipient that needs another backend or pool than the session's held connection gets
   `451 4.3.0 Recipient requires different backend server, start new transaction` (or `... pool ...`).
 
@@ -1072,8 +1065,8 @@ The proxies' state lives in the process that runs them, so these go through that
   failure counts, last success and failure, and maintenance state. `sora-admin health status
   --backends` prints the same without the pool, marking pinned backends `[remote_lookup]` and
   drained ones `[maintenance]`.
-- `sora-admin affinity-cache status`, `GET /admin/affinity/stats`, `GET /admin/affinity/list`, and
-  `/admin/affinity` to read, set or delete one user's affinity.
+- `sora-admin affinity-cache status`, `GET /admin/affinity/stats`, and `/admin/affinity` to read,
+  set or delete one user's affinity.
 - `sora-admin auth-cache status`, `GET /admin/auth-cache/stats`.
 
 `sora-admin backends ...` talks to PostgreSQL directly. See [ADMIN_CLI.md](ADMIN_CLI.md) and
@@ -1094,7 +1087,8 @@ On `SIGHUP` the proxies apply these `[[server]]` keys:
 
 Everything else in this document needs a restart: `remote_addrs`, `[[pool]]`, `[server.remote_lookup]`,
 `[server.lookup_cache]`, the backend-leg keys, `[auth_cache]`, `[backend_maintenance]` and
-`[cluster.affinity]`. A reload logs the server settings it found changed but did not apply. See
+`[cluster.affinity]`. A reload logs the settings it found changed but did not apply, server keys
+and global sections alike. See
 [OPERATIONS.md](OPERATIONS.md).
 
 A restarted proxy loses its lookup cache and backend health, and keeps its auth cache and affinity

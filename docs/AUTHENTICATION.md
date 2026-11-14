@@ -100,8 +100,8 @@ sora-admin --config config.toml credentials add --primary user@example.com \
 sora-admin --config config.toml accounts update --email user@example.com --password 'changed-passphrase'
 ```
 
-`sora-admin` writes to PostgreSQL directly. The Admin API writes through the server, which also drops
-the account's cached logins (section 12).
+A change made through the Admin API or `sora-admin` also drops the account's cached logins
+(section 12).
 
 ---
 
@@ -127,7 +127,7 @@ The address that Sora then looks up is the **base address**: lower case, no `+ta
 
 A name that does not parse fails the login. The replies are `NO [AUTHENTICATIONFAILED] Address not in
 the correct format` (IMAP), `-ERR [AUTH] Invalid username format` (POP3),
-`NO Invalid username format` (ManageSieve `AUTHENTICATE`) and `NO Invalid address` (ManageSieve
+`NO "Invalid username format"` (ManageSieve `AUTHENTICATE`) and `NO "Invalid address"` (ManageSieve
 `LOGIN`). Except on ManageSieve's `LOGIN`, it counts as a failed attempt for the rate limiter.
 
 A suffix that is not the configured `master_username`:
@@ -159,9 +159,10 @@ or `$6$...` are not supported. Comparisons of SHA-512 digests are constant-time.
 
 - `bcrypt` (the default): `{BLF-CRYPT}` plus a bcrypt hash.
 - `ssha512`: `{SSHA512}` plus base64 of SHA-512(password + 8 random bytes of salt) and the salt.
-- `sha512`: `{SHA512}` without salt. `sora-admin --hash` refuses this choice. A JSON credentials
-  list (`sora-admin accounts create --credentials`, or the Admin API's `credentials` array) can still
-  ask for it with `"hash_type": "sha512"`. Do not use it for new passwords.
+
+SHA-512 without salt is not written for new passwords: `sora-admin` (`--hash` and a
+`--credentials` JSON list) and the Admin API's `credentials` array refuse `sha512` as a hash
+type.
 
 `--password-hash` (sora-admin) and `password_hash` (Admin API) store a hash you computed elsewhere,
 exactly as given. Sora does not check it. Use one of the prefixes above, or the account cannot log
@@ -187,7 +188,7 @@ bcrypt_cost = 12
 | Type | integer |
 | Default | `12` |
 | Allowed | 10 to 14. A smaller value is raised to 10 and a larger one lowered to 14, without a warning. |
-| When read | At startup of `sora`. A SIGHUP reload does not change it. |
+| When read | At startup of `sora`, and by each `sora-admin` command. A SIGHUP reload does not change it. |
 
 Each step up doubles the CPU time of every bcrypt check. Raise it only if your nodes have CPU to
 spare at the login peak (for example after a restart, when every client logs in again).
@@ -195,10 +196,8 @@ spare at the login peak (for example after a restart, when every client logs in 
 `bcrypt_cost` is used for:
 
 - bcrypt hashes the server writes (Admin API account and credential changes);
+- bcrypt hashes `sora-admin` writes (`accounts create`, `accounts update`, `credentials add`);
 - the rehash target.
-
-`sora-admin` does not read `bcrypt_cost`. It always writes bcrypt at cost 12. If your
-`bcrypt_cost` is not 12, those hashes are rehashed at the account's next login.
 
 **Rehash.** After a successful login that was checked against PostgreSQL, Sora looks at the stored
 hash. If it is bcrypt (with or without `{BLF-CRYPT}`) and its cost differs from `bcrypt_cost`, higher
@@ -240,8 +239,8 @@ This is the order on an IMAP, POP3 or ManageSieve backend. The code is in `serve
     the reply takes about as long as for a wrong password. The address does not leak through timing.
 11. **Verify** the password against the hash (section 4).
 12. **Failure.** The attempt is recorded for the rate limiter and the reply is the "bad credentials"
-    reply of the protocol. A database error is answered and recorded the same way, with the
-    exception below.
+    reply of the protocol. A database error is not a failed login: it gets a temporary failure
+    (below).
 13. **Success.** The attempt is recorded as a success, which clears the failure counts of this IP
     and of this IP and name (section 10.2). Sora caches the login and queues a rehash if needed.
     IMAP and POP3 also create the account's default mailboxes if they are missing, and refuse the
@@ -255,14 +254,13 @@ The bad-credentials replies are:
 |---|---|
 | IMAP | `NO [AUTHENTICATIONFAILED] Invalid address or password` |
 | POP3 | `-ERR [AUTH] Authentication failed` |
-| ManageSieve | `NO Authentication failed` |
+| ManageSieve | `NO "Authentication failed"` |
 
-On IMAP and POP3, a login whose database query timed out or was cancelled (for example because the
-server is shutting down) gets a temporary failure instead and is not recorded as a failure:
-`NO [UNAVAILABLE] server is shutting down, please try again` (IMAP) or
-`-ERR [SYS/TEMP] Service temporarily unavailable, please try again later` (POP3). ManageSieve
-answers every database error as a bad credential. So during a database outage, users can see
-"wrong password" replies and the rate limiter counts them.
+A login that cannot be checked because of a database error, a timeout or a cancellation (for
+example because the server is shutting down) gets a temporary failure instead and is not recorded
+as a failure: `NO [UNAVAILABLE] ...` (IMAP), `-ERR [SYS/TEMP] ...` (POP3) or `NO (TRYLATER) ...`
+(ManageSieve). During a database outage, clients are told to try again later, and once the
+database is back the user logs in normally.
 
 ### The backend lookup cache
 
@@ -280,15 +278,15 @@ Settings are in `[server.lookup_cache]` inside the server block:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` without the table, `false` with it | With the table present, the cache is on only if it says `enabled = true`. |
+| `enabled` | `true` | Set `false` to turn the cache off. Keys left out of the table keep their defaults. |
 | `positive_ttl` | `5m` | How long a success entry is kept. |
 | `negative_ttl` | `1m` | How long a failure entry is kept. |
 | `max_size` | `10000` | Entries per listener. `0` or less gives 10000. When full, the entry that expires first is removed. |
 | `cleanup_interval` | `5m` | How often expired entries are removed. |
 | `positive_revalidation_window` | `30s` | Age up to which a success entry can answer a login. |
 
-Durations use Go syntax (`30s`, `5m`, `1h`). An unparseable value falls back to the default with a
-log line. The proxies use the same table with different rules; see
+Durations take Go units (`30s`, `5m`, `1h`) or whole days (`1d`). An unparseable value falls
+back to the default with a log line. The proxies use the same table with different rules; see
 [PROXY.md](PROXY.md#10-lookup-cache).
 
 ---
@@ -301,9 +299,10 @@ ManageSieve proxies follow the same plan):
 
 1. Plaintext gate and empty-password check, as on a backend.
 2. Progressive delay for the client's IP (section 10.3).
-3. The proxy's lookup cache ([PROXY.md](PROXY.md#10-lookup-cache)). A hit with the same password
-   answers the login without the rate-limit check.
-4. Rate-limit check. A blocked attempt ends the connection (section 10.7).
+3. Rate-limit check. A blocked attempt ends the connection (section 10.7), whether or not the login
+   is cached.
+4. The proxy's lookup cache ([PROXY.md](PROXY.md#10-lookup-cache)). A hit with the same password
+   answers the login without a database query.
 5. A name with the proxy's `master_username` as suffix is checked against the proxy's
    `master_password` here (section 8).
 6. With remote lookup configured, the lookup service authenticates and routes the user
@@ -362,9 +361,9 @@ a1 LOGIN user@example.com@support a-long-random-secret
 - The suffix must equal `master_username` exactly, including case.
 - On a backend with SASL PLAIN, if the client also sends an authorization identity, that identity is
   the user to log in as. Otherwise it is the address before the suffix.
-- The target must be an active account. A wrong master password, or a target that is not a valid
-  address, gets the protocol's bad-credentials reply. On the IMAP backend's `LOGIN` command, a
-  target account that does not exist gets `NO [SERVERBUG] Internal server error` instead.
+- The target must be an active account. A wrong master password, a target that is not a valid
+  address, or a target account that does not exist gets the protocol's bad-credentials reply and is
+  counted as a failed login.
 
 ### 8.2 Master SASL: `master_sasl_username` and `master_sasl_password`
 
@@ -387,8 +386,8 @@ AUTHENTICATE PLAIN base64("user@example.com" NUL "proxyuser" NUL "proxy-secret")
   misconfigured.
 - A client that does not use the master SASL username, and sends an authorization identity that
   differs from its authentication identity, is refused: `NO [AUTHORIZATIONFAILED] Proxy login not permitted for this user.`
-  (IMAP), `-ERR [AUTH] Proxy authentication requires master credentials` (POP3), `NO Proxy
-  authentication requires master_sasl_username and master_sasl_password to be configured`
+  (IMAP), `-ERR [AUTH] Proxy authentication requires master credentials` (POP3), `NO "Proxy
+  authentication requires master_sasl_username and master_sasl_password to be configured"`
   (ManageSieve).
 
 ### 8.3 `master_sasl_allowed_networks`
@@ -407,8 +406,6 @@ master_sasl_allowed_networks = ["10.20.0.5", "10.20.0.6"]
 - An entry that is not an IP or CIDR stops the server at startup.
 - A login with correct master SASL credentials from another address gets the bad-credentials reply
   and logs `master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting`.
-- On POP3 the same list also applies to the master username form of section 8.1. On IMAP and
-  ManageSieve it applies only to master SASL.
 
 ### 8.4 Rules common to both
 
@@ -417,8 +414,8 @@ master_sasl_allowed_networks = ["10.20.0.5", "10.20.0.6"]
   `server "imap": master_username is set but master_password is empty; refusing to start (an empty
   password would allow impersonation of any account)`.
 - Secrets are compared in constant time.
-- Apart from the IMAP `LOGIN` case in 8.1, every failure reply looks like a wrong password, so a
-  reply cannot confirm a guessed master username or password. The real reason is logged at WARN.
+- Every failure reply looks like a wrong password, so a reply cannot confirm a guessed master
+  username or password. The real reason is logged at WARN.
 - Rate limiting counts master attempts under the master credential's own key, never under the
   account they name (section 10.2). A wrong master password therefore cannot lock out the user it
   names, and each source IP gets the normal number of guesses at the master password.
@@ -484,8 +481,8 @@ the backends otherwise.
 With `enabled = true`, every key you leave out, or set to `0`, gets its default. A `0` therefore never
 switches a tier off or removes a size cap.
 
-The duration keys are read as Go durations: `"90s"`, `"15m"`, `"1h"`. A day suffix such as `"1d"` is
-not accepted and stops Sora at startup with a configuration error.
+The duration keys take Go units (`"90s"`, `"15m"`, `"1h"`) or whole days (`"1d"`), like the other
+durations.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -539,8 +536,9 @@ ends: if a failure comes in after the block ends but before the count is forgott
 again at once.
 
 **Success.** A successful login clears the failure counts of that IP (Tier 2), of that IP and name
-(Tier 1), and the name's statistics. It also lifts a Tier 2 block on that IP. A user behind a shared
-address who logs in correctly therefore resets the shared address's count.
+(Tier 1), and the name's statistics. A user behind a shared address who logs in correctly therefore
+resets the shared address's count. While an address is blocked, every login from it is refused,
+cached or not, so a success never lifts a block.
 
 **Statistics.** Every failure, from any IP, also counts towards the name's statistics, kept for
 `username_window_duration`. They feed the stats output only and never block: blocking by name alone
@@ -577,7 +575,7 @@ goroutines with delayed logins. The limit is fixed. The replies are:
 |---|---|
 | IMAP backend | `* BYE [ALERT] Too many concurrent authentication attempts. Please try again later.` |
 | POP3 backend | `-ERR [IN-USE] Too many concurrent authentication attempts. Please try again later.` |
-| ManageSieve backend | `NO Too many concurrent authentication attempts. Please try again later.` |
+| ManageSieve backend | `NO "Too many concurrent authentication attempts. Please try again later."` |
 | IMAP proxy | `<tag> NO Authentication failed` |
 | POP3 proxy | `-ERR [AUTH] Authentication failed` |
 | ManageSieve proxy | `NO "Authentication failed"` |
@@ -611,10 +609,10 @@ which is exempt when it is in `trusted_networks`.
 ### 10.6 Size caps
 
 Each table has a cap (`max_ip_username_entries`, `max_ip_entries`, `max_username_entries`). When a
-table is full and a new entry is needed, the entry with the oldest first failure is dropped. Dropping
-an IP from the Tier 2 table also lifts any block on it. The caps keep memory bounded during a large
-distributed attack. Raise them if the logs show the tables full at normal load
-(`Auth rate limiter stats` lines, below).
+table is full and a new entry is needed, the entry with the oldest first failure is dropped,
+preferring entries that are not blocked. Making room never removes an active block. The caps keep
+memory bounded during a large distributed attack. Raise them if the logs show the tables full at
+normal load (`Auth rate limiter stats` lines, below).
 
 ### 10.7 What the client sees
 
@@ -622,7 +620,7 @@ distributed attack. Raise them if the logs show the tables full at normal load
 |---|---|---|
 | `imap` | `NO [AUTHENTICATIONFAILED] Invalid address or password`, the same as a wrong password | Stays open. In addition, a new TCP connection from a Tier 2 blocked IP is closed before the TLS handshake, with no greeting. |
 | `pop3` | `-ERR [AUTH] Authentication failed`, the same as a wrong password | Stays open, but every error counts towards the POP3 error limit (4 errors, then the connection closes; [SECURITY.md](SECURITY.md#6-limits-on-failed-logins-per-connection)). |
-| `managesieve` | `NO Authentication failed`, the same as a wrong password | Stays open; 10 errors close it. |
+| `managesieve` | `NO "Authentication failed"`, the same as a wrong password | Stays open; 10 errors close it. |
 | `imap_proxy` | `<tag> NO Authentication failed`, then `* BYE [ALERT] Too many failed authentication attempts. Please try again later.` | Closed. |
 | `pop3_proxy` | `-ERR [AUTH] Authentication failed`, the same as a wrong password | Closed. |
 | `managesieve_proxy` | `NO "Authentication failed"`, the same as a wrong password | Closed. |
@@ -638,9 +636,6 @@ The wait of section 10.3 comes before the reply in every case.
 
 - Each `[[server]]` block has its own limiter, in memory. Failures on the IMAP listener do not count
   on the POP3 listener, and two IMAP listeners on one node count separately.
-- Nothing is shared between nodes, with or without the cluster. An attacker who spreads attempts over
-  several nodes meets each node's limits separately. `[cluster.rate_limit_sync]` is accepted in the
-  configuration but nothing reads it ([CLUSTER.md](CLUSTER.md#7-what-the-cluster-does-not-share)).
 - A restart forgets all counts and blocks.
 - `auth_rate_limit` is read at startup. A SIGHUP reload does not change it.
 
@@ -680,24 +675,21 @@ The master SASL gate (`master_sasl_allowed_networks`) is separate and always use
 
 ## 12. Cached logins and password changes
 
-Several caches answer logins without asking PostgreSQL. After a password change, a credential
-deletion or an account deletion, they can briefly still accept the old state:
+Several caches answer logins without asking PostgreSQL. Until an entry is dropped or expires, it
+can still accept the state from before a password change, a credential deletion or an account
+deletion:
 
-| Cache | Where | How long an old password can keep working |
+| Cache | Where | How long an entry can keep answering |
 |---|---|---|
 | Backend lookup cache (section 6) | each backend listener, memory | up to `positive_revalidation_window` (30 s), for a user who logged in with it shortly before |
 | Proxy lookup cache | each proxy listener, memory | up to `positive_ttl` (5 minutes); see [PROXY.md](PROXY.md#10-lookup-cache) |
 | Auth cache (`[auth_cache]`) | each proxy node, SQLite | until the entry is older than `max_age` (24 hours when unset), or until the user logs in through that node with the new password; see [PROXY.md](PROXY.md#11-auth-cache) |
 
-Changes made through the Admin API (password update, credential deletion, account deletion) drop the
-account's entries from the lookup caches on that node and, with the cluster on, on the other nodes.
-An account deletion also ends the account's sessions. Changes made with `sora-admin`, which writes to
-PostgreSQL directly, are seen when the cache entries expire. Kicking a user
-(`sora-admin connections kick`) also drops the lookup-cache entries. None of these clear the SQLite
-auth cache.
-
-If you must cut off an old password at once on proxies with `[auth_cache]` on, lower its `max_age`,
-or stop the proxy, delete the auth cache file and start it again.
+Changes made through the Admin API or `sora-admin` (password update, credential deletion, account
+deletion) take effect across the cluster at once, whichever node or tool makes them: they drop the
+account's entries from the backend and proxy lookup caches, the User API's lookup cache and the
+proxies' SQLite auth cache on every node. An account deletion also ends the account's sessions. Kicking a user
+(`sora-admin connections kick`) also drops the lookup-cache entries.
 
 ---
 
@@ -730,11 +722,10 @@ Metrics (see [METRICS.md](METRICS.md)):
 | `sora_auth_rate_limiter_ip_entries` | same | Tier 2 table size. |
 | `sora_auth_rate_limiter_username_entries` | same | Statistics table size. |
 | `sora_auth_rate_limiter_blocked_ips` | same | IPs blocked by Tier 2. |
-| `sora_auth_delay_queue_depth` | `protocol`, `ip` | Logins waiting on a delay. |
-| `sora_auth_delay_completed_total`, `sora_auth_delay_cancelled_total`, `sora_auth_delay_rejections_total` | `protocol`, `ip` | Delays that ran out, were cut short by a closed connection, or were refused (section 10.4). |
+| `sora_auth_delay_queue_depth` | `protocol` | Logins waiting on a delay. |
+| `sora_auth_delay_completed_total`, `sora_auth_delay_cancelled_total`, `sora_auth_delay_rejections_total` | `protocol` | Delays that ran out, were cut short by a closed connection, or were refused (section 10.4). |
 
-The `sora_auth_delay_*` metrics carry the client IP as a label, so they grow one series per
-attacking address.
+Per-address detail is in the logs and, for blocks, in `GET /admin/auth/blocked` (section 10.9).
 
 ---
 
