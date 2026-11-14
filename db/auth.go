@@ -25,108 +25,54 @@ import (
 )
 
 const (
-	ssha512PrefixB64         = "{SSHA512}"
-	ssha512PrefixB64Explicit = "{SSHA512.b64}"
-	ssha512PrefixHex         = "{SSHA512.HEX}"
+	ssha512PrefixB64 = "{SSHA512}"
+	ssha512PrefixHex = "{SSHA512.HEX}"
 
-	sha512PrefixB64         = "{SHA512}"
-	sha512PrefixB64Explicit = "{SHA512.b64}"
-	sha512PrefixHex         = "{SHA512.HEX}"
+	sha512PrefixB64 = "{SHA512}"
+	sha512PrefixHex = "{SHA512.HEX}"
 
 	blfCryptPrefix = "{BLF-CRYPT}"
-
-	// Standard bcrypt prefixes
-	bcryptPrefix2a = "$2a$"
-	bcryptPrefix2b = "$2b$"
-	bcryptPrefix2y = "$2y$"
-
-	// sha512HashLength is the expected length of a SHA512 hash in bytes.
-	sha512HashLength = 64
-	// ssha512MinSaltLength is the minimum length of a salt for SSHA512.
-	ssha512MinSaltLength = 1 // A salt must exist
 )
 
-// verifySSHA512 checks if the provided password matches the SSHA512 hashed password
-func verifySSHA512(hashedPassword, password string) error {
-	hashPrefix := hashedPassword
-	if len(hashPrefix) > 30 {
-		hashPrefix = hashPrefix[:30] + "..."
-	}
-	logger.Debug("verifySSHA512: Starting verification", "hash_prefix", hashPrefix)
+// verifySSHA512 checks password against SSHA512 data: the SHA-512 digest of the
+// password and the salt, followed by the salt (parsePasswordHash checked the length).
+func verifySSHA512(data []byte, password string) error {
+	digest, salt := data[:sha512.Size], data[sha512.Size:]
 
-	decoded, err := decodePasswordData(hashedPassword, ssha512PrefixB64, ssha512PrefixB64Explicit, ssha512PrefixHex)
-	if err != nil {
-		logger.Debug("verifySSHA512: Decode failed", "hash_prefix", hashPrefix, "error", err)
-		return fmt.Errorf("invalid SSHA512 format/data: %w", err)
-	}
-
-	// The SHA512 hash is 64 bytes (512 bits / 8 bits per byte)
-	// Everything after that is the salt
-	if len(decoded) < sha512HashLength+ssha512MinSaltLength {
-		logger.Debug("verifySSHA512: Hash too short", "decoded_len", len(decoded), "hash_prefix", hashPrefix)
-		return errors.New("invalid SSHA512 hash: too short")
-	}
-
-	// Extract the hash and salt
-	storedHash := decoded[:sha512HashLength]
-	salt := decoded[sha512HashLength:]
-
-	logger.Debug("verifySSHA512: Extracted components", "salt_len", len(salt), "hash_prefix", hashPrefix)
-
-	// Calculate hash for the provided password with the same salt
 	h := sha512.New()
 	h.Write([]byte(password))
 	h.Write(salt)
-	calculatedHash := h.Sum(nil)
 
 	// Compare the hashes using constant-time comparison to prevent timing attacks
-	if subtle.ConstantTimeCompare(storedHash, calculatedHash) != 1 {
-		logger.Debug("verifySSHA512: Hash mismatch", "salt_len", len(salt), "hash_prefix", hashPrefix)
+	if subtle.ConstantTimeCompare(digest, h.Sum(nil)) != 1 {
 		return ErrInvalidCredentials
 	}
-
-	logger.Debug("verifySSHA512: Verification SUCCESS", "salt_len", len(salt), "hash_prefix", hashPrefix)
 	return nil
 }
 
-// verifySHA512 checks if the provided password matches the SHA512 hashed password (without salt)
-// The format is {SHA512}base64_encoded_data, {SHA512.b64}base64_encoded_data or {SHA512.HEX}hex_encoded_data
-func verifySHA512(hashedPassword, password string) error {
-	storedHash, err := decodePasswordData(hashedPassword, sha512PrefixB64, sha512PrefixB64Explicit, sha512PrefixHex)
-	if err != nil {
-		return fmt.Errorf("invalid SHA512 format/data: %w", err)
-	}
-
-	// SHA512 hash should be exactly 64 bytes
-	if len(storedHash) != sha512HashLength {
-		return errors.New("invalid SHA512 hash: incorrect length")
-	}
-
-	// Calculate hash for the provided password
-	h := sha512.New()
-	h.Write([]byte(password))
-	calculatedHash := h.Sum(nil)
+// verifySHA512 checks password against SHA512 data: the unsalted SHA-512 digest.
+func verifySHA512(data []byte, password string) error {
+	digest := sha512.Sum512([]byte(password))
 
 	// Compare the hashes using constant-time comparison to prevent timing attacks
-	if subtle.ConstantTimeCompare(storedHash, calculatedHash) != 1 {
+	if subtle.ConstantTimeCompare(data, digest[:]) != 1 {
 		return ErrInvalidCredentials
 	}
-
 	return nil
 }
 
-// verifyBcrypt checks if the provided password matches the bcrypt hashed password,
-// with or without the {BLF-CRYPT} prefix. A mismatch matches both ErrInvalidCredentials
-// and bcrypt.ErrMismatchedHashAndPassword.
-func verifyBcrypt(hashedPassword, password string) error {
-	// For {BLF-CRYPT}, remove the prefix unconditionally
-	hashedPassword = strings.TrimPrefix(hashedPassword, blfCryptPrefix)
-
-	err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
-	if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+// verifyBcrypt checks password against a bcrypt hash. A mismatch matches both
+// ErrInvalidCredentials and bcrypt.ErrMismatchedHashAndPassword.
+func verifyBcrypt(hash []byte, password string) error {
+	err := bcrypt.CompareHashAndPassword(hash, []byte(password))
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, bcrypt.ErrMismatchedHashAndPassword):
 		return fmt.Errorf("%w: %w", ErrInvalidCredentials, err)
+	default:
+		return fmt.Errorf("%w: %w", ErrUnverifiableHash, err)
 	}
-	return err
 }
 
 // GenerateSSHA512Hash creates a new SSHA512 password hash with a random salt
@@ -251,10 +197,11 @@ func ValidateNewHashType(hashType string) error {
 	return fmt.Errorf("%w %q: use bcrypt or ssha512", ErrUnsupportedHashType, hashType)
 }
 
-// VerifyPassword checks if the provided password matches the stored password hash.
-// It supports bcrypt, BLF-CRYPT, SSHA512, and SHA512 formats with different encodings.
-// A wrong password is reported as ErrInvalidCredentials (errors.Is) for every scheme;
-// any other error means the stored hash could not be checked.
+// VerifyPassword checks if the provided password matches the stored password hash:
+// SSHA512, SHA512, BLF-CRYPT or CRYPT (bcrypt) in any of Dovecot's spellings, or a
+// bare bcrypt hash (see parsePasswordHash). A wrong password is reported as
+// ErrInvalidCredentials (errors.Is) for every scheme; a stored hash that cannot be
+// checked as ErrUnverifiableHash.
 func VerifyPassword(hashedPassword, password string) error {
 	start := time.Now()
 	var hashType string
@@ -274,43 +221,27 @@ func VerifyPassword(hashedPassword, password string) error {
 		}
 	}()
 
-	switch {
-	case strings.HasPrefix(hashedPassword, ssha512PrefixB64),
-		strings.HasPrefix(hashedPassword, ssha512PrefixB64Explicit),
-		strings.HasPrefix(hashedPassword, ssha512PrefixHex):
-		hashType = "ssha512"
-		err = verifySSHA512(hashedPassword, password)
-		return err
-
-	case strings.HasPrefix(hashedPassword, sha512PrefixB64),
-		strings.HasPrefix(hashedPassword, sha512PrefixB64Explicit),
-		strings.HasPrefix(hashedPassword, sha512PrefixHex):
-		hashType = "sha512"
-		err = verifySHA512(hashedPassword, password)
-		return err
-
-	case strings.HasPrefix(hashedPassword, blfCryptPrefix):
-		// BLF-CRYPT is just bcrypt with a prefix
-		hashType = "blf_crypt"
-		err = verifyBcrypt(hashedPassword, password)
-		return err
-
-	// Without scheme, we default to Bcrypt
-	case strings.HasPrefix(hashedPassword, bcryptPrefix2a),
-		strings.HasPrefix(hashedPassword, bcryptPrefix2b),
-		strings.HasPrefix(hashedPassword, bcryptPrefix2y):
-		// Standard bcrypt format
-		hashType = "bcrypt"
-		err = verifyBcrypt(hashedPassword, password)
-		return err
-
-	default:
-		// No known scheme prefix
-		hashType = "unknown"
-		logger.Error("Database: unknown password hash scheme", "hash_prefix", hashedPassword[:min(10, len(hashedPassword))])
-		err = errors.New("unknown password hash scheme")
+	h, err := parsePasswordHash(hashedPassword)
+	hashType = h.scheme
+	if err != nil {
+		if hashType == "" {
+			hashType = "unknown"
+		}
+		// The error names the problem but no part of the value: it may be a password
+		// pasted into the hash field.
+		logger.Error("Password hash cannot be verified", "type", hashType, "error", err)
 		return err
 	}
+
+	switch h.scheme {
+	case "ssha512":
+		err = verifySSHA512(h.data, password)
+	case "sha512":
+		err = verifySHA512(h.data, password)
+	default: // bcrypt, blf_crypt, crypt
+		err = verifyBcrypt(h.data, password)
+	}
+	return err
 }
 
 // dummyHash caches a valid bcrypt hash at dummyHashCost. It is never a real
@@ -353,34 +284,15 @@ func DummyVerifyPassword(password string) {
 	_ = bcrypt.CompareHashAndPassword(dummyHashForCurrentCost(), []byte(password))
 }
 
-// needsRehash checks if a bcrypt hash needs to be rehashed with the current default cost
+// NeedsRehash reports whether a bcrypt hash, in any spelling VerifyPassword accepts
+// (bare, {BLF-CRYPT} or {CRYPT}), has a cost other than BcryptCost.
 func NeedsRehash(hash string) bool {
-	// Only check bcrypt hashes
-	hash = strings.TrimPrefix(hash, "{BLF-CRYPT}")
-
-	// Check if it's a bcrypt hash
-	if !strings.HasPrefix(hash, "$2a$") && !strings.HasPrefix(hash, "$2b$") && !strings.HasPrefix(hash, "$2y$") {
+	h, err := parsePasswordHash(hash)
+	if err != nil || h.scheme == "ssha512" || h.scheme == "sha512" {
 		return false
 	}
-
-	// Extract the cost
-	// bcrypt hash format: $2a$cost$...
-	parts := strings.Split(hash, "$")
-	if len(parts) < 3 {
-		return false
-	}
-
-	costStr := strings.TrimRight(parts[2], "0123456789")
-	if costStr != "" {
-		// Invalid format
-		return false
-	}
-
-	// Current cost should be between the $2a$ and the next $
-	currentCost := parts[2]
-	defaultCost := fmt.Sprintf("%02d", BcryptCost)
-
-	return currentCost != defaultCost
+	cost, err := bcrypt.Cost(h.data)
+	return err == nil && cost != BcryptCost
 }
 
 // UpdatePassword updates the stored password for a user
@@ -525,38 +437,6 @@ func (db *Database) GetActiveAccountIDByAddress(ctx context.Context, address str
 		return 0, fmt.Errorf("database error fetching active account ID: %w", err)
 	}
 	return accountID, nil
-}
-
-// decodePasswordData handles prefix checking and decoding for common hash formats.
-// It returns the raw decoded data.
-func decodePasswordData(hashedPassword, pB64, pB64Explicit, pHex string) (data []byte, err error) {
-	var encodedData string
-	var isHexEncoded bool
-
-	switch {
-	case strings.HasPrefix(hashedPassword, pB64Explicit): // Check more specific explicit b64 first
-		encodedData = hashedPassword[len(pB64Explicit):]
-	case strings.HasPrefix(hashedPassword, pB64):
-		encodedData = hashedPassword[len(pB64):]
-	case strings.HasPrefix(hashedPassword, pHex):
-		encodedData = hashedPassword[len(pHex):]
-		isHexEncoded = true
-	default:
-		return nil, fmt.Errorf("invalid or missing prefix (expected one of %s, %s, %s)", pB64, pB64Explicit, pHex)
-	}
-
-	if isHexEncoded {
-		data, err = hex.DecodeString(encodedData)
-		if err != nil {
-			return nil, fmt.Errorf("error decoding hex data: %w", err)
-		}
-	} else {
-		data, err = base64.StdEncoding.DecodeString(encodedData)
-		if err != nil {
-			return nil, fmt.Errorf("error decoding base64 data: %w", err)
-		}
-	}
-	return data, nil
 }
 
 // GetPrimaryEmailForAccount retrieves the primary email address for a given account ID.
