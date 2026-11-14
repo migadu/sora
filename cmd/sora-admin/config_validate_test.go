@@ -144,6 +144,19 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 			content: "[uploader]\nconcurrency = 0\n" + imapProxy + "remote_addrs = [\"192.0.2.10:143\"]\n",
 		},
 		{
+			// A negative cleanup_grace_period makes the orphan sweep remove staged
+			// bodies of deliveries that have not committed yet (#922).
+			name:    "uploader cleanup_grace_period negative on a mail backend",
+			content: "[uploader]\ncleanup_grace_period = \"-1h\"\n" + imapBackend,
+			wantErr: []string{`[uploader] cleanup_grace_period must be positive, got "-1h"`},
+		},
+		{
+			// The server exits at start-up on a cleanup_grace_period it cannot parse.
+			name:    "uploader cleanup_grace_period unparseable on a mail backend",
+			content: "[uploader]\ncleanup_grace_period = \"soon\"\n" + imapBackend,
+			wantErr: []string{`[uploader] cleanup_grace_period`},
+		},
+		{
 			name:    "cleanup fts_retention negative on a mail backend",
 			content: "[cleanup]\nfts_retention = \"-24h\"\n" + imapBackend,
 			wantErr: []string{"fts_retention must not be negative"},

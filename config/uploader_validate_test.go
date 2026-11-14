@@ -47,7 +47,9 @@ func TestUploaderConfigValidateCleanupGracePeriod(t *testing.T) {
 			t.Errorf("cleanup_grace_period = %q rejected: %v", v, err)
 		}
 	}
-	for _, v := range []string{"0", "0s", "-1ns", "-1h", "-1d"} {
+	// An unparseable value stops sora at start-up (it parses the key with
+	// GetCleanupGracePeriod and exits), so config validate must refuse it too.
+	for _, v := range []string{"0", "0s", "-1ns", "-1h", "-1d", "soon", "1x"} {
 		c := NewDefaultConfig().Uploader
 		c.CleanupGracePeriod = v
 		err := c.Validate()

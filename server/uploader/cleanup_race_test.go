@@ -529,6 +529,21 @@ func TestCleanupOrphanedFiles_NonPositiveGracePeriodUsesDefault(t *testing.T) {
 			_, statErr := os.Stat(filePath)
 			require.NoError(t, statErr, "grace period %v: staged body inside the 1h default was removed", grace)
 			require.Zero(t, mockDB.lookups(), "grace period %v: file inside the 1h default was looked up", grace)
+
+			// The fallback is the default, not a disabled sweep: an orphan older
+			// than 1h is still removed.
+			const orphanHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+			orphanPath := worker.FilePath(orphanHash, accountID)
+			require.NoError(t, os.WriteFile(orphanPath, []byte("orphan"), 0644))
+			old := time.Now().Add(-2 * time.Hour)
+			require.NoError(t, os.Chtimes(orphanPath, old, old))
+
+			require.NoError(t, worker.cleanupOrphanedFiles(context.Background()))
+
+			_, statErr = os.Stat(orphanPath)
+			require.True(t, os.IsNotExist(statErr), "grace period %v: orphan older than the 1h default was kept (stat err: %v)", grace, statErr)
+			_, statErr = os.Stat(filePath)
+			require.NoError(t, statErr, "grace period %v: staged body inside the 1h default was removed", grace)
 		})
 	}
 }
