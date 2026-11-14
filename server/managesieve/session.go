@@ -92,8 +92,8 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	success := false
 	outcome := "failure"
 	defer func() {
-		if !success {
-			// Track failed authentication if not already successful
+		if !success && outcome != "" {
+			// Track failed or unavailable credential check if not already successful
 			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, outcome).Inc()
 			metrics.CriticalOperationDuration.WithLabelValues("managesieve_authentication").Observe(time.Since(start).Seconds())
 		}
@@ -132,6 +132,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		authKey := server.MasterAuthRateLimitKey(authnParsed.Suffix())
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-MASTER"); err != nil {
+			outcome = ""
 			if errors.Is(err, server.ErrDelayQueueFull) {
 				return errDelayQueueFul
 			}
@@ -140,6 +141,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		}
 		if s.server.authLimiter != nil {
 			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, authKey); err != nil {
+				outcome = ""
 				s.DebugLog("rate limited", "error", err)
 				// Same response as bad credentials so rate-limit state isn't an oracle.
 				return errAuthFailed
@@ -257,6 +259,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// Apply progressive authentication delay BEFORE any other checks
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-MASTER-SASL"); err != nil {
+			outcome = ""
 			if errors.Is(err, server.ErrDelayQueueFull) {
 				return errDelayQueueFul
 			}
@@ -265,6 +268,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		}
 		if s.server.authLimiter != nil {
 			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, authKey); err != nil {
+				outcome = ""
 				s.DebugLog("rate limited", "error", err)
 				// Same response as bad credentials so rate-limit state isn't an oracle.
 				return errAuthFailed
@@ -356,6 +360,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 		if !gated {
 			if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-SASL"); err != nil {
+				outcome = ""
 				if errors.Is(err, server.ErrDelayQueueFull) {
 					// Delay queue full - reject immediately to prevent goroutine exhaustion
 					s.InfoLog("delay queue full, rejecting connection")
@@ -369,6 +374,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// Check authentication rate limiting after delay
 		if s.server.authLimiter != nil && !gated {
 			if err := s.server.authLimiter.CanAttemptAuthWithProxy(ctx, netConn, proxyInfo, authKey); err != nil {
+				outcome = ""
 				s.DebugLog("rate limited", "error", err)
 				// Same response as a bad-credential failure so the rate-limit
 				// state isn't an observable oracle. (security-audit M14)
@@ -417,6 +423,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// SASL username without a password check, which confirmed the master SASL
 		// username. Not recorded as a failure: the credentials were right.
 		if authzID != "" && authzID != authnID {
+			outcome = ""
 			s.DebugLog("proxy authentication requires master credentials", "authz_id", authzID, "authn_id", authnID)
 			return &managesieveserver.Error{Message: msieve.Quote("Proxy authentication requires master credentials")}
 		}
@@ -430,6 +437,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	}
 
 	if err := s.completeAuthentication(ctx, *targetAddress, accountID, impersonating, start); err != nil {
+		outcome = ""
 		return err
 	}
 	success = true
@@ -621,6 +629,14 @@ func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address
 	}
 	defer release()
 
+	// The connection limits come before the session takes the user: a login the
+	// tracker refuses is not logged in, so its close releases neither a count
+	// nor a tracker slot, and it must not count as a successful login (#864).
+	if err := s.registerConnection(ctx, accountID, address.FullAddress()); err != nil {
+		s.InfoLog("login refused: connection limit reached", "address", address.BaseAddress(), "reason", err)
+		return errTooManyConnections
+	}
+
 	// Log authentication success. Regular auth via Authenticate() already
 	// logs in server.go with cached/method; master auth is logged here.
 	if masterAuthUsed {
@@ -628,14 +644,6 @@ func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address
 		s.InfoLog("authentication successful", "address", address.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 	}
 	metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "success").Inc()
-
-	// The connection limits come before the session takes the user: a login the
-	// tracker refuses is not logged in, so its close releases neither a count
-	// nor a tracker slot.
-	if err := s.registerConnection(ctx, accountID, address.FullAddress()); err != nil {
-		s.InfoLog("login refused: connection limit reached", "address", address.BaseAddress(), "reason", err)
-		return errTooManyConnections
-	}
 
 	s.User = server.NewUser(address, accountID)
 

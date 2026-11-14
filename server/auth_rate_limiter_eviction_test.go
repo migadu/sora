@@ -136,6 +136,70 @@ func TestAuthLimiterFailureAtCapacityCostIndependentOfSize(t *testing.T) {
 	}
 }
 
+// blockCostAtFullBlockTable returns the best per-failure time over a few rounds of
+// failures that block new pairs in a block table filled to its limit of entries with
+// blocks whose ends are spread evenly over the block duration, each failure taken just
+// after the next block has ended: the steady state of a block table that an attack
+// keeps full while its blocks end. Each failure has to make room first.
+func blockCostAtFullBlockTable(t *testing.T, entries int) time.Duration {
+	const block = 15 * time.Minute
+	limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+		Enabled:                  true,
+		MaxAttemptsPerIPUsername: 1,
+		IPUsernameBlockDuration:  block,
+		IPUsernameWindowDuration: block,
+		CleanupInterval:          time.Hour,
+		MaxIPUsernameEntries:     entries,
+	})
+	t.Cleanup(limiter.Stop)
+	step := block / time.Duration(entries)
+	t0 := time.Now().Add(-block)
+	for i := range entries {
+		limiter.updateIPUsernameFailure("198.51.100.1", fmt.Sprintf("user%d@example.com", i), t0.Add(time.Duration(i)*step))
+	}
+	const rounds, perRound = 5, 100
+	usernames := make([]string, rounds*perRound)
+	for i := range usernames {
+		usernames[i] = fmt.Sprintf("user%d@example.com", entries+i)
+	}
+	best := time.Duration(math.MaxInt64)
+	for r := range rounds {
+		start := time.Now()
+		for i := r * perRound; i < (r+1)*perRound; i++ {
+			// the i-th block ended a nanosecond ago, the next one has not
+			limiter.updateIPUsernameFailure("198.51.100.2", usernames[i], t0.Add(time.Duration(i)*step+block+time.Nanosecond))
+		}
+		if d := time.Since(start) / perRound; d < best {
+			best = d
+		}
+	}
+	limiter.ipUsernameMu.RLock()
+	defer limiter.ipUsernameMu.RUnlock()
+	if _, ok := limiter.blockedIPUsernames["198.51.100.2|"+usernames[len(usernames)-1]]; !ok {
+		t.Fatal("a pair was not blocked although a block had ended")
+	}
+	return best
+}
+
+// While an attack keeps the IP+username block table full, its blocks end one after the
+// other, and each failure that blocks a pair after one has ended makes room while it
+// holds the Tier 1 write lock, which CanAttemptAuth on every connection of the protocol
+// waits for. Its cost must not grow with the table's limit. (#792)
+func TestIPUsernameBlockAtFullBlockTableCostIndependentOfSize(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing test")
+	}
+	discardAuthLimiterLogs(t)
+	small := blockCostAtFullBlockTable(t, 1_000)
+	large := blockCostAtFullBlockTable(t, 100_000)
+	t.Logf("failure blocking a new pair in a full block table: 1000 blocks = %v, 100000 blocks = %v", small, large)
+	// Searching all blocks makes the large table ~100x slower; a queue leaves the
+	// logarithm and the cache misses of the bigger table.
+	if large > 20*small {
+		t.Errorf("blocking a new pair costs %v at 100000 blocks vs %v at 1000: making room scales with the table", large, small)
+	}
+}
+
 // A peer's failure count can carry an earlier first failure than this node saw, for an
 // address it tracks or one it adds: the eviction order follows it.
 func TestIPEvictionFollowsPeerFirstFailure(t *testing.T) {

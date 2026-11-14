@@ -2620,6 +2620,15 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	if s.ReadOnlyAPIKey != "" && s.Type != "http_admin_api" {
 		logger("WARNING: Server %s (type: %s) has 'read_only_api_key' configured, but this only applies to http_admin_api servers", s.Name, s.Type)
 	}
+	// Only these filter clients by address. Every other type, the User API proxy
+	// included, serves every client whatever the list says.
+	if len(s.AllowedHosts) > 0 {
+		switch s.Type {
+		case "metrics", "http_admin_api", "http_user_api":
+		default:
+			logger("WARNING: Server %s (type: %s) has 'allowed_hosts' configured, but this only applies to metrics, http_admin_api and http_user_api servers; it does not restrict which clients this server accepts", s.Name, s.Type)
+		}
+	}
 	if s.TLSUseStartTLS {
 		switch s.Type {
 		case "imap", "lmtp", "managesieve", "pop3", "imap_proxy", "lmtp_proxy", "managesieve_proxy", "pop3_proxy":
@@ -2778,6 +2787,12 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP and POP3 proxy servers", s.Name, s.Type)
 		}
 
+	case "user_api_proxy":
+		// An HTTP request is not a logged-in session: nothing counts connections per user.
+		s.warnKeysNotApplied(logger, "the User API proxy limits only its total connections and those per IP (max_connections, max_connections_per_ip)",
+			configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
+
 	case "metrics", "http_admin_api", "http_user_api":
 		// HTTP servers - warn about protocol-specific options
 		if len(s.SupportedExtensions) > 0 {
@@ -2788,6 +2803,21 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.AppendLimit != "" {
 			logger("WARNING: Server %s (type: %s) has 'append_limit' configured, but this only applies to IMAP servers", s.Name, s.Type)
+		}
+		// An HTTP request is not a logged-in session, so nothing counts connections
+		// per user. The Admin and User APIs cap their total connections, the metrics
+		// listener none.
+		if s.Type == "metrics" {
+			s.warnKeysNotApplied(logger, "the metrics server does not limit its connections",
+				configKey{"max_connections", s.MaxConnections != 0},
+				configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+				configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+				configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
+		} else {
+			s.warnKeysNotApplied(logger, "this server type limits only its total connections (max_connections)",
+				configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+				configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+				configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 		}
 		if s.Type == "metrics" && s.TLS {
 			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)

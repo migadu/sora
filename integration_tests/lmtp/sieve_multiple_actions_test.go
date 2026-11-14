@@ -85,6 +85,41 @@ func TestLMTP_SieveEveryFilingAndRedirectHappens(t *testing.T) {
 			script:     []string{`require ["fileinto"];`, `fileinto "Archive";`, `fileinto "Archive";`},
 			wantStored: []string{"Archive"},
 		},
+		{
+			name:       "repeated target cancels copy implicit keep",
+			script:     []string{`require ["fileinto", "copy"];`, `fileinto :copy "Archive";`, `fileinto "Archive";`},
+			wantStored: []string{"Archive"},
+		},
+		{
+			name:       "repeated copy does not restore implicit keep",
+			script:     []string{`require ["fileinto", "copy"];`, `fileinto "Archive";`, `fileinto :copy "Archive";`},
+			wantStored: []string{"Archive"},
+		},
+		{
+			name:       "repeated copies preserve implicit keep",
+			script:     []string{`require ["fileinto", "copy"];`, `fileinto :copy "Archive";`, `fileinto :copy "Archive";`},
+			wantStored: []string{"Archive", "INBOX"},
+		},
+		{
+			name:       "explicit keep survives repeated target",
+			script:     []string{`require ["fileinto", "copy"];`, `keep;`, `fileinto :copy "Archive";`, `fileinto "Archive";`},
+			wantStored: []string{"Archive", "INBOX"},
+		},
+		{
+			name:       "repeated target adds create",
+			script:     []string{`require ["fileinto", "mailbox"];`, `fileinto "Repeated/After";`, `fileinto :create "Repeated/After";`},
+			wantStored: []string{"Repeated/After"},
+		},
+		{
+			name:       "repeated target preserves create",
+			script:     []string{`require ["fileinto", "mailbox"];`, `fileinto :create "Repeated/Before";`, `fileinto "Repeated/Before";`},
+			wantStored: []string{"Repeated/Before"},
+		},
+		{
+			name:       "repeated create cancels copy implicit keep",
+			script:     []string{`require ["fileinto", "mailbox", "copy"];`, `fileinto :copy "Repeated/Create";`, `fileinto :create "Repeated/Create";`},
+			wantStored: []string{"Repeated/Create"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
