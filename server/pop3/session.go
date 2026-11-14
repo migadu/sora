@@ -234,8 +234,11 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	}
 	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, delayType); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
+			// Refused before the credentials are checked: a temporary failure
+			// (RFC 3206 section 4), never [IN-USE], which says the authentication
+			// succeeded (RFC 2449 section 8.1.2).
 			s.InfoLog("delay queue full, rejecting connection", "username", username)
-			return 0, &pop3server.Error{Code: "IN-USE", Message: "Too many concurrent authentication attempts. Please try again later."}
+			return 0, &pop3server.Error{Code: "SYS/TEMP", Message: "Too many concurrent authentication attempts. Please try again later."}
 		}
 		return 0, err
 	}

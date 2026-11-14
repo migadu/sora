@@ -570,12 +570,13 @@ func (s *POP3Server) connConfig() serverPkg.SoraConnConfig {
 		NoAbsoluteTimeout:    true, // the library enforces absolute_session_timeout
 		OnTimeout: func(conn net.Conn, reason string) {
 			// Best-effort notice before closing, on the connection the library
-			// is using (the TLS one after STLS; see NewSession); RFC 1939
-			// doesn't define timeout response codes, but [IN-USE] is commonly
-			// used.
-			message := "-ERR [IN-USE] Connection timeout, please reconnect\r\n"
+			// is using (the TLS one after STLS; see NewSession). It answers no
+			// command and carries no response code: [IN-USE] says a login
+			// succeeded with the maildrop locked (RFC 2449 section 8.1.2), and
+			// no RFC 2449 or RFC 3206 code describes a timeout.
+			message := "-ERR Connection timeout, please reconnect\r\n"
 			if reason == "slow_throughput" {
-				message = "-ERR [IN-USE] Connection too slow, please reconnect\r\n"
+				message = "-ERR Connection too slow, please reconnect\r\n"
 			}
 			_, _ = fmt.Fprint(conn, message)
 		},
