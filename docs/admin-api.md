@@ -1228,17 +1228,12 @@ curl -X POST http://localhost:8080/admin/mail/deliver \
 
 ## Rate Limiting
 
-The Admin API implements rate limiting based on authentication attempts and API key usage:
+The Admin API has no request or authentication rate limiting of its own. A missing or malformed `Authorization` header is answered `401` and a wrong key `403`, at once and every time: failed attempts are not counted, delayed or blocked, and the authentication rate limiters listed by [`GET /admin/auth/blocked`](#list-blocked-addresses) do not cover the Admin API. Protect it with:
 
-- **Per IP Rate Limit**: Configurable limit on requests per IP address
-- **Authentication Attempts**: Progressive delays on failed authentication
-- **No Hard Request Limits**: By default, but can be configured via reverse proxy
-
-**Recommended Practice:**
-- Implement exponential backoff on client side
-- Cache responses where appropriate
-- Use bulk operations when available
-- Monitor your API usage via logs
+- **`allowed_hosts`**: the IP addresses and CIDR ranges allowed to use the API. A request from any other address is answered `403 {"error": "Host not allowed"}` before its key is compared. An empty list allows every client.
+- **A long random `api_key`** (and `read_only_api_key`): 32 or more random characters, so that guessing one is not practical at any request rate.
+- **`max_connections`**: caps the concurrent connections of the listener, all clients together (`0`, the default, means unlimited). `max_connections_per_ip` does not apply to the Admin API.
+- **A reverse proxy** in front of it, for per-client request or failed-authentication limits.
 
 ## Best Practices
 
