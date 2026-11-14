@@ -194,7 +194,7 @@ so its failure is an ERROR record of the `[logging]` output, in its format.
 | Two servers have the same `name` | `duplicate server name '<name>' found. Each server must have a unique name` |
 | Two servers have the same `addr` string | `duplicate server address '<addr>' found. Server '<a>' and '<b>' cannot bind to the same address` |
 | A `[[server]]` block lacks `type`, `name` or `addr` | for example `server address is required` |
-| No server is configured | `no servers configured. Please configure at least one server in the [[server]] section` |
+| No server is configured | `no servers configured. Please configure at least one server in a [[server]] section` |
 | An IMAP, POP3 or LMTP server is configured, or an `http_user_api` server with any `[s3]` connection setting, and `[s3] bucket` or `endpoint` is empty, or `timeout` is not a duration | `[s3]: bucket is required ...`, `[s3]: endpoint is required ...` or `[s3]: invalid timeout "<value>": ...` |
 | A server that needs the database is configured and there is no database endpoint (see [section 3](#3-defaults)) | `[database]: server "<name>" (<type>) needs the database, but it is not configured in [database.write] or [database.read]` |
 | `[cluster] enabled = true` and `addr` is not an IP address other than `0.0.0.0` or `::`, or `secret_key` is missing or not the base64 of 32 bytes (see [CLUSTER.md](CLUSTER.md)) | `[cluster]: cluster addr '<host>' must be a specific IP address reachable from other nodes, ...`, `[cluster]: cluster secret_key is required when cluster mode is enabled ...`, `[cluster]: failed to decode cluster secret_key: ...` or `[cluster]: cluster secret_key must be 32 bytes (got <n> bytes)` |
@@ -203,7 +203,7 @@ so its failure is an ERROR record of the `[logging]` output, in its format.
 | A server's `auth_rate_limit` has a negative count or duration, or a `delay_multiplier` that is negative, `nan` or `inf` | `server "<name>": auth_rate_limit.<key> must not be negative, got <value>` or `server "<name>": auth_rate_limit.delay_multiplier must be a finite number, got <value>` |
 | An `lmtp` or `http_admin_api` server has a `limits.redirect_rate_window` of zero or less | `server "<name>": limits.redirect_rate_window must be positive, got "<value>" (set limits.redirect_rate_limit = 0 to disable the limit)` |
 | A proxy server has a `remote_port` that is not a port number | `server "<name>": invalid remote_port: ...` |
-| A proxy server has `remote_lookup` enabled without a `url`, with a `url` that [PROXY.md section 4.1](PROXY.md#41-the-request) says is refused, or with a `timeout`, `remote_port`, `circuit_breaker` or `transport` value that does not parse | `server "<name>": remote_lookup.url is required when remote_lookup is enabled`, `server "<name>": remote_lookup.url must use https:// for non-loopback hosts ...` or `server "<name>": invalid remote_lookup.<key>: ...` |
+| A proxy server has `remote_lookup` enabled without a `url`; with a `url` that is not an absolute `http://` or `https://` URL with a host, has `$email` or `$ip` in the host, or uses `http://` to a host other than `localhost` or a loopback address (see [PROXY.md section 4.1](PROXY.md#41-the-request)); or with a `timeout`, `remote_port`, `circuit_breaker` or `transport` value that does not parse | `server "<name>": remote_lookup.url is required when remote_lookup is enabled`, `server "<name>": remote_lookup.url must use https:// for non-loopback hosts ...` or `server "<name>": invalid remote_lookup.<key>: ...` |
 | A `metrics` server's `path` does not begin with `/`, or is not a pattern Go's `http.ServeMux` accepts | `server "<name>": metrics path "<path>" must begin with '/'` or `server "<name>": invalid metrics path "<path>": ...` |
 | `[relay] type` is set to something other than `"smtp"` or `"http"` | `unsupported [relay] type ...` |
 | `[relay] type = "smtp"` and `smtp_host` is not a `host:port` that can be dialed, or `type = "http"` and `http_url` is not an absolute `http://` or `https://` URL with a host and, if it has one, a valid port | `[relay] type "smtp" requires smtp_host as host:port`, `[relay] smtp_host "<value>" must be host:port: ...` (or `has no host`, `has no valid host`, `has no valid port`), `[relay] type "http" requires http_url` or `[relay] http_url "<value>" ...` |
@@ -500,9 +500,9 @@ See [STORAGE.md](STORAGE.md).
 |---|---|---|---|
 | `path` | string | `"/tmp/sora/uploads"` | Staging directory for bodies not yet in S3. |
 | `instance_id` | string | the host name | The node's upload lease identity. Changing it strands queued uploads: read [STORAGE.md](STORAGE.md) first. |
-| `batch_size` | integer | `10` | Uploads leased per batch. |
-| `concurrency` | integer | `20` | Parallel uploads. |
-| `max_attempts` | integer | `20` | Attempts before an upload is parked. |
+| `batch_size` | integer | `10` | Uploads leased per batch. Must be positive. |
+| `concurrency` | integer | `20` | Parallel uploads. Must be positive. |
+| `max_attempts` | integer | `20` | Attempts before an upload is parked. Must be positive. |
 | `retry_interval` | duration | `"30s"` | Wait before retrying a failed upload. |
 | `cleanup_grace_period` | duration | `"1h"` | Minimum age of a staged file before cleanup looks at it. Must be positive. |
 | `max_staging_size` | size | no limit | Size of this node's staging directory above which new messages are refused. An invalid value stops startup. |
@@ -794,7 +794,7 @@ names it.
 | `search_rate_limit_burst` | integer | `search_rate_limit_per_min` | `imap` | Searches allowed back to back. `0` or less means the default. |
 | `thread_max_messages` | integer | `50000` | `imap` | Matches one THREAD command may process. `0` or less means the default. |
 | `redirect_rate_limit` | integer | `100` | `lmtp`, `http_admin_api` | Sieve redirects per account per window. `0` means no limit. |
-| `redirect_rate_window` | duration | `"1h"` | `lmtp`, `http_admin_api` | Window of the redirect limit. |
+| `redirect_rate_window` | duration | `"1h"` | `lmtp`, `http_admin_api` | Window of the redirect limit. Must be positive. |
 | `max_redirect_hops` | integer | `2` | `lmtp`, `http_admin_api` | Redirects of one message before further ones are suppressed. `0` means no limit. |
 | `preview_s3_per_min` | integer | `300` | `imap` | S3 downloads per account per minute to answer FETCH PREVIEW. `0` or less means no limit. |
 | `preview_s3_burst` | integer | `min(200, preview_s3_per_min)` | `imap` | Of those, how many may run back to back. |
@@ -873,7 +873,8 @@ See [AUTHENTICATION.md](AUTHENTICATION.md).
 
 Applies to `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`,
 `http_user_api` and `user_api_proxy`. When `enabled = true`, every key you leave
-out, or set to 0, gets the default below. See [AUTHENTICATION.md](AUTHENTICATION.md).
+out, or set to 0, gets the default below. A negative value, or a `delay_multiplier` of `nan` or
+`inf`, stops startup ([section 4](#4-checks-at-startup)). See [AUTHENTICATION.md](AUTHENTICATION.md).
 
 | Key | Type | Default |
 |---|---|---|
@@ -1004,7 +1005,7 @@ See [METRICS.md](METRICS.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | — | URL path of the metrics, such as `"/metrics"`. |
+| `path` | string | `"/metrics"` | URL path of the metrics. Must begin with `/`. |
 | `allowed_hosts` | list of strings | empty (any host) | IPs or CIDR blocks allowed to scrape, matched against the TCP peer. |
 | `api_key` | string | none | Require `Authorization: Bearer <key>`. |
 | `enable_domain_metrics` | bool | `true` | Per-domain counters. |
