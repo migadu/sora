@@ -86,7 +86,7 @@ func TestAffinityPersistenceFollowsChangeOrder(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			store := &orderedAffinityStore{delay: time.Millisecond, state: make(map[string]string)}
 			am := newTestAffinityManager()
-			am.SetPersistStore(store)
+			am.persistStore = store
 
 			for i := range users {
 				change(am, fmt.Sprintf("user%d@example.com", i))
