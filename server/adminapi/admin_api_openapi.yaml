@@ -2737,7 +2737,7 @@ paths:
           content:
             application/json:
               schema:
-                oneOf:
+                anyOf:
                   - $ref: '#/components/schemas/Error'
                   - $ref: '#/components/schemas/DeliverMailResponse'
               examples:
