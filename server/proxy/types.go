@@ -46,7 +46,9 @@ var (
 	ErrRemoteLookupTransient = errors.New("remotelookup transient error")
 
 	// ErrRemoteLookupInvalidResponse represents an invalid 200 response (malformed JSON, missing
-	// required fields): a lookup service bug. Always returned wrapped in ErrRemoteLookupTransient.
+	// required fields, a password_hash sora cannot verify, which also carries
+	// db.ErrUnverifiableHash): a lookup service bug. Always returned wrapped in
+	// ErrRemoteLookupTransient.
 	ErrRemoteLookupInvalidResponse = errors.New("remotelookup invalid response")
 
 	// ErrUnknownPool is returned when a route names a pool this proxy does not have:

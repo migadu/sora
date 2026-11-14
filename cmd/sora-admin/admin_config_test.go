@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/db"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // A config without [uploader] max_attempts gets the server's default, as cmd/sora does.
@@ -39,6 +41,47 @@ func TestLoadAdminConfig_DefaultsUploaderMaxAttempts(t *testing.T) {
 			}
 			if cfg.Uploader.MaxAttempts != tc.want {
 				t.Fatalf("Uploader.MaxAttempts = %d, want %d", cfg.Uploader.MaxAttempts, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadAdminConfig_AppliesBcryptCost (#316): passwords sora-admin hashes (accounts
+// create/update, credentials add) use the top-level bcrypt_cost, as the server's do. With
+// the package default instead, a backend rehashes the password at the user's next login
+// because the cost differs.
+func TestLoadAdminConfig_AppliesBcryptCost(t *testing.T) {
+	saved := db.BcryptCost
+	t.Cleanup(func() { db.BcryptCost = saved })
+	defaults := config.NewDefaultConfig()
+
+	for _, tc := range []struct {
+		name, toml string
+		want       int
+	}{
+		{"bcrypt_cost 10", "bcrypt_cost = 10\n", 10},
+		{"bcrypt_cost 11", "bcrypt_cost = 11\n", 11},
+		{"unset is the server default", "[database]\n", defaults.GetBcryptCost()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.toml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var cfg AdminConfig
+			if err := loadAdminConfig(path, &cfg); err != nil {
+				t.Fatalf("loadAdminConfig: %v", err)
+			}
+			hash, err := db.GenerateBcryptHash("correct horse battery staple")
+			if err != nil {
+				t.Fatalf("GenerateBcryptHash: %v", err)
+			}
+			cost, err := bcrypt.Cost([]byte(strings.TrimPrefix(hash, "{BLF-CRYPT}")))
+			if err != nil {
+				t.Fatalf("bcrypt.Cost(%q): %v", hash, err)
+			}
+			if cost != tc.want {
+				t.Fatalf("new password hashed with cost %d, want %d", cost, tc.want)
 			}
 		})
 	}

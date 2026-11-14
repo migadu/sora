@@ -76,6 +76,24 @@ func TestAdminAPI_DeliverMail_RunsDefaultSieveAndCreate(t *testing.T) {
 			want:   "Trail",
 		},
 		{name: "default fileinto :create of a detail with a trailing delimiter", detail: "foo/", want: "foo"},
+		// A NUL or a byte that is not UTF-8 cannot be stored in a PostgreSQL text
+		// value; the lookup of such a name failed the delivery, with :create or
+		// without.
+		{
+			name:   "user fileinto :create of a name with a NUL keeps",
+			script: []string{`require ["fileinto", "mailbox", "encoded-character"];`, `fileinto :create "a${hex:00}b";`},
+			want:   "INBOX",
+		},
+		{
+			name:   "user fileinto :create of a name that is not UTF-8 keeps",
+			script: []string{`require ["fileinto", "mailbox", "encoded-character"];`, `fileinto :create "a${hex:ff}b";`},
+			want:   "INBOX",
+		},
+		{
+			name:   "user fileinto of a name that is not UTF-8 keeps",
+			script: []string{`require ["fileinto", "encoded-character"];`, `fileinto "a${hex:ff}b";`},
+			want:   "INBOX",
+		},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

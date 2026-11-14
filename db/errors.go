@@ -20,8 +20,15 @@ var (
 
 	// ErrInvalidCredentials is what VerifyPassword returns (possibly wrapped) when the
 	// password does not match the stored hash, whatever its scheme. A hash that cannot
-	// be checked at all (unknown scheme, malformed data) is a different error.
+	// be checked at all is ErrUnverifiableHash.
 	ErrInvalidCredentials = errors.New("invalid credentials")
+
+	// ErrUnverifiableHash is what VerifyPassword and ValidatePasswordHash return
+	// (wrapped, with the reason) for a stored password value sora cannot check: no or
+	// an unsupported scheme, data that does not decode or has the wrong length. No
+	// password matches it, so it is not a wrong password. The error text never quotes
+	// the value, which may be a password pasted into the hash field.
+	ErrUnverifiableHash = errors.New("password hash cannot be verified")
 
 	// ErrDuplicateAccount indicates that an account with the given email already exists
 	ErrDuplicateAccount = errors.New("account already exists")

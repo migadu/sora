@@ -15,6 +15,9 @@ import (
 // GetMetadata implements the GETMETADATA command (RFC 5464).
 // If mailbox is empty string "", retrieves server metadata.
 func (s *IMAPSession) GetMetadata(ctx context.Context, mailbox string, entries []string, options *imap.GetMetadataOptions) (*imap.GetMetadataData, error) {
+	if err := s.requireCapability(imap.CapMetadata, "GETMETADATA"); err != nil {
+		return nil, err
+	}
 	ctx = s.pinnedContext(ctx)
 
 	s.DebugLog("GETMETADATA command", "mailbox", mailbox, "entries", entries)
@@ -115,6 +118,9 @@ func (s *IMAPSession) MetadataMaxSize() uint32 {
 // If mailbox is empty string "", sets server metadata.
 // To remove an entry, set its value to nil.
 func (s *IMAPSession) SetMetadata(ctx context.Context, mailbox string, entries map[string]*[]byte) error {
+	if err := s.requireCapability(imap.CapMetadata, "SETMETADATA"); err != nil {
+		return err
+	}
 	ctx = s.pinnedContext(ctx)
 
 	// Canonicalise (case-fold) entry names first so the case-insensitivity rule
