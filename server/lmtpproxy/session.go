@@ -251,8 +251,10 @@ func (s *Session) handleConnection() {
 				}
 				s.sendResponse("250-ENHANCEDSTATUSCODES")
 				s.sendResponse("250-8BITMIME")
-				s.sendResponse("250-SMTPUTF8")
-				s.sendResponse("250 DSN")
+				// No DSN, as on the backend: neither issues a "delivered" DSN (RFC 3461
+				// §5.2.3), so the MTA keeps the duties of §5.2.2 (a "relayed" DSN for
+				// NOTIFY=SUCCESS). DSN parameters sent anyway are dropped, not forwarded.
+				s.sendResponse("250 SMTPUTF8")
 			} else {
 				s.sendResponse(fmt.Sprintf("250 %s", s.server.hostname))
 			}
@@ -729,8 +731,9 @@ func (s *Session) ErrorLog(msg string, keyvals ...any) {
 // Allowed RCPT TO parameters for LMTP:
 //   - XRCPTFORWARD: Dovecot-specific forwarding information (original recipient)
 //
-// Stripped parameters (SMTP-only, not supported by typical LMTP servers):
-//   - NOTIFY, ORCPT, RET, ENVID: DSN extensions (RFC 3461)
+// Stripped parameters:
+//   - NOTIFY, ORCPT, RET, ENVID: DSN (RFC 3461), which neither the proxy nor the
+//     backend announces; an MTA should not send them, but some do
 //   - Any other unknown ESMTP parameters
 //
 // Examples:
@@ -1481,8 +1484,8 @@ func (s *Session) invalidateLookupCache(reason string) {
 
 // forwardRCPT sends the RCPT TO command to backend and handles response interception
 func (s *Session) forwardRCPT(command string) {
-	// Strip unsupported ESMTP parameters from RCPT TO before forwarding to backend
-	// Most ESMTP extensions (especially DSN) are SMTP-specific and not supported by LMTP
+	// Strip the RCPT TO parameters the backend does not take before forwarding
+	// (DSN parameters among them: neither the proxy nor the backend announces DSN).
 	cleanedCommand := stripUnsupportedRCPTParameters(command)
 	if cleanedCommand != command {
 		s.DebugLog("Stripped unsupported ESMTP parameters from RCPT TO", "original", command, "cleaned", cleanedCommand)
