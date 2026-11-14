@@ -223,28 +223,28 @@ type ClusterConfig struct {
 	Affinity          ClusterAffinityConfig      `toml:"affinity"`             // Server affinity configuration
 }
 
+// splitClusterAddr splits addr into host and port. addr is a host or IP address,
+// IPv6 bare or bracketed ("2001:db8::40", "[2001:db8::40]"), with an optional
+// port ("10.0.0.40:7946", "[2001:db8::40]:7946"). port is "" when addr has none.
+func splitClusterAddr(addr string) (host, port string) {
+	if h, p, err := net.SplitHostPort(addr); err == nil {
+		return h, p
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]"), ""
+}
+
 // GetBindAddr returns the bind address by parsing the addr field
 func (c *ClusterConfig) GetBindAddr() string {
-	if c.Addr == "" {
-		return ""
-	}
-	// Parse addr to extract just the IP (not port)
-	if strings.Contains(c.Addr, ":") {
-		parts := strings.Split(c.Addr, ":")
-		return parts[0]
-	}
-	return c.Addr
+	host, _ := splitClusterAddr(c.Addr)
+	return host
 }
 
 // GetBindPort returns the bind port from addr or the port field
 func (c *ClusterConfig) GetBindPort() int {
 	// If addr contains a port, use that
-	if c.Addr != "" && strings.Contains(c.Addr, ":") {
-		parts := strings.Split(c.Addr, ":")
-		if len(parts) == 2 {
-			if port, err := strconv.Atoi(parts[1]); err == nil {
-				return port
-			}
+	if _, p := splitClusterAddr(c.Addr); p != "" {
+		if port, err := strconv.Atoi(p); err == nil {
+			return port
 		}
 	}
 
