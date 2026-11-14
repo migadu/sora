@@ -17,7 +17,8 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 	// client MUST NOT send an option for which the server has not advertised
 	// support". go-imap refuses the LIST-EXTENDED syntax itself; the SPECIAL-USE
 	// selection and return options are SPECIAL-USE's (RFC 6154 §2), the STATUS
-	// return option is LIST-STATUS's (RFC 5819 §2).
+	// return option is LIST-STATUS's (RFC 5819 §2) and the METADATA return option
+	// LIST-METADATA's (RFC 9590 §1), which the default capabilities leave out.
 	if options.SelectSpecialUse || options.ReturnSpecialUse {
 		if err := s.requireCapability(imap.CapSpecialUse, "LIST SPECIAL-USE"); err != nil {
 			return err
@@ -33,6 +34,11 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 			if err := s.requireCapability(imap.CapStatusSize, "STATUS SIZE"); err != nil {
 				return err
 			}
+		}
+	}
+	if options.ReturnMetadata != nil {
+		if err := s.requireCapability(imap.CapListMetadata, "LIST RETURN (METADATA)"); err != nil {
+			return err
 		}
 	}
 
