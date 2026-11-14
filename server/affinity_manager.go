@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -655,6 +656,36 @@ func (am *AffinityManager) cleanup() {
 			"broadcast_queue_limit", maxAffinityEventQueueSize,
 			"removed_this_cycle", removed)
 	}
+}
+
+// List returns the unexpired affinities this node holds, in no particular order. Every
+// node applies the affinities the others gossip, so on a converged cluster each node
+// lists the same set.
+func (am *AffinityManager) List() []affinitycache.AffinityEntry {
+	if am == nil || !am.enabled {
+		return nil
+	}
+
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+
+	now := time.Now()
+	list := make([]affinitycache.AffinityEntry, 0, len(am.affinityMap))
+	for key, info := range am.affinityMap {
+		if now.After(info.ExpiresAt) {
+			continue // Expired, will be cleaned up later
+		}
+		list = append(list, affinitycache.AffinityEntry{
+			// The key is "username:protocol" with the entry's own protocol.
+			Username:   strings.TrimSuffix(key, ":"+info.Protocol),
+			Protocol:   info.Protocol,
+			Backend:    info.Backend,
+			AssignedAt: info.AssignedAt,
+			ExpiresAt:  info.ExpiresAt,
+			NodeID:     info.NodeID,
+		})
+	}
+	return list
 }
 
 // GetAffinityCount returns the number of active affinities (for testing/monitoring)

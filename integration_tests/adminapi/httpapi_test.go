@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/migadu/sora/affinitycache"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
@@ -2493,6 +2494,17 @@ func (m *mockAffinityManager) GetStats(ctx context.Context) map[string]any {
 		"enabled":       true,
 		"total_entries": len(m.affinity),
 	}
+}
+
+func (m *mockAffinityManager) List() []affinitycache.AffinityEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var list []affinitycache.AffinityEntry
+	for key, backend := range m.affinity {
+		i := strings.LastIndex(key, ":")
+		list = append(list, affinitycache.AffinityEntry{Username: key[:i], Protocol: key[i+1:], Backend: backend})
+	}
+	return list
 }
 
 // TestAffinityManagement tests the affinity management endpoints
