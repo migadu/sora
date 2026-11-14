@@ -704,21 +704,9 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		if acPath == "" {
 			acPath = "/tmp/sora/auth_cache.db"
 		}
-		acMaxAge, err := cfg.AuthCache.GetMaxAge()
-		if err != nil {
-			logger.Warn("AuthCache: Invalid max_age - using default (168h)", "error", err)
-			acMaxAge = 168 * time.Hour
-		}
-		acPurgeUnused, err := cfg.AuthCache.GetPurgeUnused()
-		if err != nil {
-			logger.Warn("AuthCache: Invalid purge_unused - using default (720h)", "error", err)
-			acPurgeUnused = 720 * time.Hour
-		}
-		acCleanupInterval, err := cfg.AuthCache.GetCleanupInterval()
-		if err != nil {
-			logger.Warn("AuthCache: Invalid cleanup_interval - using default (1h)", "error", err)
-			acCleanupInterval = time.Hour
-		}
+		acMaxAge := cfg.AuthCache.GetMaxAgeWithDefault()
+		acPurgeUnused := cfg.AuthCache.GetPurgeUnusedWithDefault()
+		acCleanupInterval := cfg.AuthCache.GetCleanupIntervalWithDefault()
 
 		// Ensure parent directory exists
 		if dir := filepath.Dir(acPath); dir != "" && dir != "." {
@@ -1395,25 +1383,13 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 	}
 
 	// Parse auth idle timeout
-	authIdleTimeout, err := serverConfig.GetAuthIdleTimeout()
-	if err != nil {
-		logger.Info("IMAP: Invalid auth idle timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
-		authIdleTimeout = 0
-	}
+	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
 	// Parse command timeout
-	commandTimeout, err := serverConfig.GetCommandTimeout()
-	if err != nil {
-		logger.Info("IMAP: Invalid command timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
-		commandTimeout = 5 * time.Minute
-	}
+	commandTimeout := serverConfig.GetCommandTimeoutWithDefault()
 
 	// Parse absolute session timeout
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("IMAP: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 30 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	// Parse per-command timeout overrides (nil if not configured)
 	commandTimeoutOverrides, err := serverConfig.GetCommandTimeoutsOverrides()
@@ -1619,18 +1595,9 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 	}
 
 	// Parse auth idle timeout
-	authIdleTimeout, err := serverConfig.GetAuthIdleTimeout()
-	if err != nil {
-		logger.Info("POP3: Invalid auth idle timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
-		authIdleTimeout = 0
-	}
+	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
-	commandTimeout, err := serverConfig.GetCommandTimeout()
-	if err != nil {
-		logger.Info("POP3: Invalid command timeout - using default (2 minutes)", "name",
-			serverConfig.Name, err)
-		commandTimeout = 2 * time.Minute
-	}
+	commandTimeout := serverConfig.GetCommandTimeoutWithDefault()
 
 	pop3CommandTimeoutOverrides, err := serverConfig.GetPOP3CommandTimeoutsOverrides()
 	if err != nil {
@@ -1639,11 +1606,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 	}
 
 	// Parse absolute session timeout
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("POP3: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 30 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
@@ -1728,18 +1691,9 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
-	authIdleTimeout, err := serverConfig.GetAuthIdleTimeout()
-	if err != nil {
-		logger.Info("ManageSieve: Invalid auth idle timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
-		authIdleTimeout = 0
-	}
+	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 
-	commandTimeout, err := serverConfig.GetCommandTimeout()
-	if err != nil {
-		logger.Info("ManageSieve: Invalid command timeout - using default (3 minutes)", "name",
-			serverConfig.Name, err)
-		commandTimeout = 3 * time.Minute
-	}
+	commandTimeout := serverConfig.GetCommandTimeoutWithDefault()
 
 	msCommandTimeoutOverrides, err := serverConfig.GetManageSieveCommandTimeoutsOverrides()
 	if err != nil {
@@ -1748,11 +1702,7 @@ func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies
 	}
 
 	// Parse absolute session timeout
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("ManageSieve: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 30 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
@@ -1891,17 +1841,9 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Parse timeout configurations
-	commandTimeout, err := serverConfig.GetCommandTimeout()
-	if err != nil {
-		logger.Info("IMAP proxy: Invalid command timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
-		commandTimeout = 0 // IMAP proxy cannot detect IDLE commands, so command_timeout must be disabled
-	}
+	commandTimeout := serverConfig.GetCommandTimeoutWithDefault()
 
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("IMAP proxy: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 30 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
@@ -2029,17 +1971,9 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 	}
 
 	// Parse timeout configurations
-	commandTimeout, err := serverConfig.GetCommandTimeout()
-	if err != nil {
-		logger.Info("POP3 proxy: Invalid command timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
-		commandTimeout = 0 // Proxies should use auth_idle_timeout and absolute_session_timeout
-	}
+	commandTimeout := serverConfig.GetCommandTimeoutWithDefault()
 
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("POP3 proxy: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 30 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
@@ -2163,17 +2097,9 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 	}
 
 	// Parse timeout configurations
-	commandTimeout, err := serverConfig.GetCommandTimeout()
-	if err != nil {
-		logger.Info("ManageSieve proxy: Invalid command timeout - using default (0 = disabled)", "name", serverConfig.Name, "error", err)
-		commandTimeout = 0 // Proxies should use auth_idle_timeout and absolute_session_timeout
-	}
+	commandTimeout := serverConfig.GetCommandTimeoutWithDefault()
 
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("ManageSieve proxy: Invalid absolute session timeout - using default (30 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 30 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	// Get global TLS config if available and wrap with server-specific default domain
 	var tlsConfig *tls.Config
@@ -2296,11 +2222,7 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 	authIdleTimeout := serverConfig.GetAuthIdleTimeoutWithDefault()
 	maxMessageSize := serverConfig.GetMaxMessageSizeWithDefault()
 
-	absoluteSessionTimeout, err := serverConfig.GetAbsoluteSessionTimeout()
-	if err != nil {
-		logger.Info("LMTP proxy: Invalid absolute session timeout - using default (5 minutes)", "name", serverConfig.Name, "error", err)
-		absoluteSessionTimeout = 5 * time.Minute
-	}
+	absoluteSessionTimeout := serverConfig.GetAbsoluteSessionTimeoutWithDefault()
 
 	remotePort, err := serverConfig.GetRemotePort()
 	if err != nil {
@@ -2527,15 +2449,7 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		return
 	}
 
-	// Parse token duration
-	tokenDuration := 24 * time.Hour // Default
-	if serverConfig.TokenDuration != "" {
-		if dur, err := time.ParseDuration(serverConfig.TokenDuration); err == nil {
-			tokenDuration = dur
-		} else {
-			logger.Info("Invalid token_duration for HTTP User API server - using default 24h", "duration", serverConfig.TokenDuration, "name", serverConfig.Name)
-		}
-	}
+	tokenDuration := serverConfig.GetTokenDurationWithDefault()
 
 	// Get auth rate limit config
 	authRateLimit := server.DefaultAuthRateLimiterConfig()

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -1262,33 +1263,70 @@ func (s *SieveConfig) GetMaxExecutionTime() time.Duration {
 type AuthCacheConfig struct {
 	Enabled         bool   `toml:"enabled"`          // Enable persistent auth cache (default: false)
 	Path            string `toml:"path"`             // SQLite database path (default: "/tmp/sora/auth_cache.db")
-	MaxAge          string `toml:"max_age"`          // Max age for cached entries (default: "168h" = 7 days)
+	MaxAge          string `toml:"max_age"`          // Max age for cached entries (default: "24h")
 	CleanupInterval string `toml:"cleanup_interval"` // How often to purge old entries (default: "1h")
-	PurgeUnused     string `toml:"purge_unused"`     // Purge entries unused for this duration (default: "720h" = 30 days)
+	PurgeUnused     string `toml:"purge_unused"`     // Purge entries unused for this duration (default: "168h" = 7 days)
 }
+
+// [auth_cache] defaults, used for absent and for unparsable values alike.
+const (
+	defaultAuthCacheMaxAge          = 24 * time.Hour
+	defaultAuthCacheCleanupInterval = time.Hour
+	defaultAuthCachePurgeUnused     = 7 * 24 * time.Hour
+)
 
 // GetMaxAge parses the max age duration
 func (a *AuthCacheConfig) GetMaxAge() (time.Duration, error) {
 	if a.MaxAge == "" {
-		return 24 * time.Hour, nil // Default: 7 days
+		return defaultAuthCacheMaxAge, nil
 	}
 	return helpers.ParseDuration(a.MaxAge)
+}
+
+// GetMaxAgeWithDefault returns max_age, or its default if the value cannot be parsed.
+func (a *AuthCacheConfig) GetMaxAgeWithDefault() time.Duration {
+	d, err := a.GetMaxAge()
+	if err != nil {
+		warnf("Failed to parse auth_cache max_age: %v, using default (%s)", err, defaultAuthCacheMaxAge)
+		return defaultAuthCacheMaxAge
+	}
+	return d
 }
 
 // GetCleanupInterval parses the cleanup interval duration
 func (a *AuthCacheConfig) GetCleanupInterval() (time.Duration, error) {
 	if a.CleanupInterval == "" {
-		return time.Hour, nil // Default: 1 hour
+		return defaultAuthCacheCleanupInterval, nil
 	}
 	return helpers.ParseDuration(a.CleanupInterval)
+}
+
+// GetCleanupIntervalWithDefault returns cleanup_interval, or its default if the value cannot be parsed.
+func (a *AuthCacheConfig) GetCleanupIntervalWithDefault() time.Duration {
+	d, err := a.GetCleanupInterval()
+	if err != nil {
+		warnf("Failed to parse auth_cache cleanup_interval: %v, using default (%s)", err, defaultAuthCacheCleanupInterval)
+		return defaultAuthCacheCleanupInterval
+	}
+	return d
 }
 
 // GetPurgeUnused parses the purge unused duration
 func (a *AuthCacheConfig) GetPurgeUnused() (time.Duration, error) {
 	if a.PurgeUnused == "" {
-		return 168 * time.Hour, nil // Default: 30 days
+		return defaultAuthCachePurgeUnused, nil
 	}
 	return helpers.ParseDuration(a.PurgeUnused)
+}
+
+// GetPurgeUnusedWithDefault returns purge_unused, or its default if the value cannot be parsed.
+func (a *AuthCacheConfig) GetPurgeUnusedWithDefault() time.Duration {
+	d, err := a.GetPurgeUnused()
+	if err != nil {
+		warnf("Failed to parse auth_cache purge_unused: %v, using default (%s)", err, defaultAuthCachePurgeUnused)
+		return defaultAuthCachePurgeUnused
+	}
+	return d
 }
 
 // MaintenanceConfig ([backend_maintenance]) tunes how proxies honor backends an operator
@@ -1554,6 +1592,37 @@ func (s *ServerConfig) GetAuthIdleTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(s.AuthIdleTimeout)
 }
 
+// defaultTokenDuration is the http_user_api JWT lifetime when token_duration is absent.
+const defaultTokenDuration = 24 * time.Hour
+
+// GetTokenDuration parses token_duration (http_user_api). It takes the same
+// syntax as the other duration keys, including days ("7d"); a negative value
+// would mint tokens that are already expired and is an error.
+func (s *ServerConfig) GetTokenDuration() (time.Duration, error) {
+	if s.TokenDuration == "" {
+		return defaultTokenDuration, nil
+	}
+	d, err := helpers.ParseDuration(s.TokenDuration)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("token_duration must not be negative, got %q", s.TokenDuration)
+	}
+	return d, nil
+}
+
+// GetTokenDurationWithDefault returns token_duration, or the default (24h) if
+// the value is invalid.
+func (s *ServerConfig) GetTokenDurationWithDefault() time.Duration {
+	d, err := s.GetTokenDuration()
+	if err != nil {
+		warnf("Invalid token_duration for server '%s': %v, using default (%s)", s.Name, err, defaultTokenDuration)
+		return defaultTokenDuration
+	}
+	return d
+}
+
 func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
 	if s.ProxyProtocolTimeout == "" {
 		return 5 * time.Second, nil // 5 second default
@@ -1607,13 +1676,29 @@ func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
 	if s.Timeouts != nil && s.Timeouts.CommandTimeout != "" {
 		return helpers.ParseDuration(s.Timeouts.CommandTimeout)
 	}
-	// Protocol-specific defaults
+	return s.defaultCommandTimeout(), nil
+}
+
+// GetCommandTimeoutWithDefault returns command_timeout, or the protocol default
+// (the value an absent key gets) if the value cannot be parsed.
+func (s *ServerConfig) GetCommandTimeoutWithDefault() time.Duration {
+	timeout, err := s.GetCommandTimeout()
+	if err != nil {
+		def := s.defaultCommandTimeout()
+		warnf("Failed to parse command_timeout for server '%s': %v, using default (%s)", s.Name, err, def)
+		return def
+	}
+	return timeout
+}
+
+// defaultCommandTimeout is the protocol-specific command (idle) timeout.
+func (s *ServerConfig) defaultCommandTimeout() time.Duration {
 	switch s.Type {
 	case "pop3", "pop3_proxy":
 		// RFC 1939 §3: the POP3 autologout (inactivity) timer MUST be at least
 		// 10 minutes. This value is wired as the session idle timeout, so the
 		// default must not fall below that floor.
-		return 10 * time.Minute, nil
+		return 10 * time.Minute
 	case "imap", "imap_proxy":
 		// RFC 3501 §5.4: an IMAP inactivity autologout timer MUST be at least
 		// 30 minutes. Clients that poll without IDLE (Outlook, Thunderbird,
@@ -1622,11 +1707,11 @@ func (s *ServerConfig) GetCommandTimeout() (time.Duration, error) {
 		// Must stay below the IMAP library's hardcoded 35-minute read deadline,
 		// which would otherwise close idle sessions silently before this timer
 		// gets to send its BYE.
-		return 30 * time.Minute, nil
+		return 30 * time.Minute
 	case "managesieve", "managesieve_proxy":
-		return 3 * time.Minute, nil // 3 minutes for ManageSieve
+		return 3 * time.Minute // 3 minutes for ManageSieve
 	default:
-		return 2 * time.Minute, nil // Default: 2 minutes
+		return 2 * time.Minute // Default: 2 minutes
 	}
 }
 
@@ -1636,10 +1721,26 @@ func (s *ServerConfig) GetAbsoluteSessionTimeout() (time.Duration, error) {
 	if s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != "" {
 		return helpers.ParseDuration(s.Timeouts.AbsoluteSessionTimeout)
 	}
-	if s.Type == "lmtp_proxy" {
-		return 5 * time.Minute, nil
+	return s.defaultAbsoluteSessionTimeout(), nil
+}
+
+// GetAbsoluteSessionTimeoutWithDefault returns absolute_session_timeout, or the
+// protocol default (the value an absent key gets) if the value cannot be parsed.
+func (s *ServerConfig) GetAbsoluteSessionTimeoutWithDefault() time.Duration {
+	timeout, err := s.GetAbsoluteSessionTimeout()
+	if err != nil {
+		def := s.defaultAbsoluteSessionTimeout()
+		warnf("Failed to parse absolute_session_timeout for server '%s': %v, using default (%s)", s.Name, err, def)
+		return def
 	}
-	return 24 * time.Hour, nil
+	return timeout
+}
+
+func (s *ServerConfig) defaultAbsoluteSessionTimeout() time.Duration {
+	if s.Type == "lmtp_proxy" {
+		return 5 * time.Minute
+	}
+	return 24 * time.Hour
 }
 
 // GetCommandTimeoutsOverrides returns a map of command name to timeout duration
@@ -1918,6 +2019,15 @@ func (s *ServerConfig) GetRemoteHealthChecks() bool {
 	return *s.RemoteHealthChecks
 }
 
+// warnf reports a value a ...WithDefault method replaced with its default. It
+// logs at WARN through slog's default logger, which the logger package (it
+// imports config, so config cannot import it) points at the server log. The
+// log package's output reaches that log only at INFO, so a typo logged with
+// log.Printf was filtered out at level = "warn".
+func warnf(format string, args ...any) {
+	slog.Warn(fmt.Sprintf(format, args...))
+}
+
 // Metrics tuning keys: a key left out of the metrics block keeps the same default
 // as pkg/metrics uses on a node without one.
 
@@ -1984,7 +2094,7 @@ func (s *ServerConfig) GetConnectTimeoutWithDefault() time.Duration {
 func (s *ServerConfig) GetAuthIdleTimeoutWithDefault() time.Duration {
 	timeout, err := s.GetAuthIdleTimeout()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse auth idle timeout for server '%s': %v, using default 2m", s.Name, err)
+		warnf("Failed to parse auth idle timeout for server '%s': %v, using default 2m", s.Name, err)
 		return 2 * time.Minute
 	}
 	return timeout

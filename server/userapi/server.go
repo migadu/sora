@@ -134,8 +134,8 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		return nil, err
 	}
 
-	if options.TokenDuration == 0 {
-		options.TokenDuration = 24 * time.Hour // Default to 24 hours
+	if options.TokenDuration <= 0 {
+		options.TokenDuration = 24 * time.Hour // Default to 24 hours; a negative lifetime would mint expired tokens
 	}
 	if options.TokenDuration > maxTokenDuration {
 		logger.Warn("User API: token_duration exceeds maximum; clamping",

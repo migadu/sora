@@ -536,7 +536,7 @@ cleanup_interval = "1h"                         # How often to clean up expired 
 [auth_cache]
 enabled = true                     # Enable persistent auth cache (default: false)
 path = "/sora/auth_cache.db"       # SQLite database path. Fast storage (SSD) recommended.
-max_age = "24"                     # Max age for cached entries before re-fetching (default: 1 day)
+max_age = "24h"                    # Max age for cached entries before re-fetching (default: 24h)
 cleanup_interval = "1h"            # How often to purge expired/unused entries (default: 1 hour)
 purge_unused = "168h"              # Purge entries unused for this duration (default: 7 days)
 
@@ -1641,7 +1641,7 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 #    - Prevents indefinitely long sessions
 #    - 30 minutes from connection to disconnection, regardless of activity
 #
-timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disable (REQUIRED for IMAP proxy, default: 0).
+timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disable (REQUIRED for IMAP proxy; default when absent or invalid: 30m).
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration from connect to disconnect (default: 24h).
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
@@ -2031,7 +2031,7 @@ auth_idle_timeout = "2m"        # Idle timeout between commands during authentic
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+timeouts.command_timeout = "0"              # Maximum idle time (default when absent or invalid: 10m, the RFC 1939 §3 floor)
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24h)
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
@@ -2087,7 +2087,7 @@ auth_idle_timeout = "2m"        # Idle timeout between commands during authentic
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+timeouts.command_timeout = "0"              # Maximum idle time (default when absent or invalid: 3m)
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24h)
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
