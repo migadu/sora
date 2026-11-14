@@ -139,6 +139,8 @@ The word `Bearer` may be in any case. The key is compared in constant time.
 | Wrong key | 403 | `{"error":"Invalid API key"}` |
 | `read_only_api_key` with a method other than `GET` | 403 | `{"error":"API key is read-only"}` |
 
+The two 401 answers carry the challenge `WWW-Authenticate: Bearer realm="admin-api"`.
+
 `api_key` grants every endpoint. `read_only_api_key`, when set, grants every `GET` endpoint and
 nothing else: every endpoint that changes something uses `POST`, `PUT` or `DELETE`. Give the
 read-only key to monitoring and reporting tools, and keep `api_key` for administration.
@@ -198,7 +200,7 @@ There are exceptions where the body is plain text from Go's HTTP library:
 | 207 | Mail delivery to several recipients where at least one failed. |
 | 400 | The request is wrong: bad JSON, a missing field, a bad parameter, or a refused change. |
 | 401 | No or malformed `Authorization` header. |
-| 403 | Wrong key, or client address not in `allowed_hosts`. |
+| 403 | Wrong key, the read-only key on a write, or client address not in `allowed_hosts`. |
 | 404 | The account, credential, mailbox or record does not exist. |
 | 405 | Wrong method for the path. |
 | 409 | An address already exists. |
@@ -1142,7 +1144,7 @@ node.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `latest` | `false` | `true`: the latest record of each instance, and the other parameters are ignored. |
+| `latest` | `false` | `true`: the latest record of each `instance_id` and `server_hostname` pair, and the other parameters are ignored. |
 | `instance_id` | all | Only this instance. |
 | `since` | 24 hours ago | RFC 3339 only. |
 | `limit` | `100` | Most records. A value that is not a positive number means 100. |
