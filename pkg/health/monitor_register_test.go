@@ -7,6 +7,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // TestCheckRegisteredAfterStartRuns: the proxies register their remote lookup checks
@@ -130,5 +133,123 @@ func TestReplacedCheckInFlightIsCancelledAndDiscarded(t *testing.T) {
 	}
 	if status, _ := hm.GetCheckStatus("dup"); status != StatusHealthy {
 		t.Errorf("status of the replacement = %q, want %q", status, StatusHealthy)
+	}
+}
+
+func TestReplacedCheckPanicIsDiscarded(t *testing.T) {
+	hm := NewHealthMonitor()
+	hm.Start(context.Background())
+	defer hm.Stop()
+	name := t.Name()
+	started, returned := make(chan struct{}), make(chan struct{})
+	published := make(chan ComponentStatus, 1)
+	hm.AddStatusCallback(func(got string, status ComponentStatus) {
+		if got == name {
+			published <- status
+		}
+	})
+	old := &HealthCheck{Name: name, Interval: time.Millisecond, Check: func(ctx context.Context) error {
+		close(started)
+		defer close(returned)
+		<-ctx.Done()
+		panic("replaced check unwinding")
+	}}
+	hm.RegisterCheck(old)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("old check never started")
+	}
+	hm.RegisterCheck(&HealthCheck{Name: name, Interval: time.Hour, Check: func(context.Context) error { return nil }})
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not cancel the old check")
+	}
+	select {
+	case status := <-published:
+		t.Fatalf("replaced check published %s after panicking during cancellation", status)
+	case <-time.After(50 * time.Millisecond):
+	}
+	old.mu.RLock()
+	defer old.mu.RUnlock()
+	if old.Status != StatusHealthy || old.LastError != nil || old.CheckCount != 0 {
+		t.Errorf("canceled panic changed old state: status=%s, error=%v, count=%d", old.Status, old.LastError, old.CheckCount)
+	}
+}
+
+func TestCheckCancelledWhileWaitingToPublishIsDiscarded(t *testing.T) {
+	hm := NewHealthMonitor()
+	name := t.Name()
+	returned := make(chan struct{})
+	check := &HealthCheck{Name: name, Check: func(context.Context) error {
+		close(returned)
+		return errors.New("late failure")
+	}}
+	hm.RegisterCheck(check)
+	metrics.ComponentHealthStatus.WithLabelValues(name, "").Set(3)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	// Hold the state lock while the run completes, then cancel before allowing
+	// publication. Checking cancellation only before taking this lock is too early.
+	check.mu.Lock()
+	go func() { defer close(done); hm.performCheck(ctx, check) }()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		check.mu.Unlock()
+		t.Fatal("check never completed")
+	}
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	check.mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("check did not finish")
+	}
+	check.mu.RLock()
+	defer check.mu.RUnlock()
+	if check.CheckCount != 0 || check.Status != StatusHealthy {
+		t.Errorf("canceled check published count=%d status=%s", check.CheckCount, check.Status)
+	}
+	if got := testutil.ToFloat64(metrics.ComponentHealthStatus.WithLabelValues(name, "")); got != 3 {
+		t.Errorf("canceled check changed gauge to %v, want 3", got)
+	}
+}
+
+func TestCheckPanicPublishesAndCallbackCanReenter(t *testing.T) {
+	hm := NewHealthMonitor()
+	name := t.Name()
+	check := &HealthCheck{Name: name, Check: func(context.Context) error { panic("active check failed") }}
+	hm.RegisterCheck(check)
+	done := make(chan ComponentStatus, 1)
+	hm.AddStatusCallback(func(got string, status ComponentStatus) {
+		if got != name {
+			return
+		}
+		// Both a read and registration from a callback must be able to take
+		// the monitor lock without blocking publication forever.
+		if current, _ := hm.GetCheckStatus(name); current != status {
+			done <- current
+			return
+		}
+		hm.RegisterCheck(&HealthCheck{Name: name, Check: func(context.Context) error { return nil }})
+		done <- status
+	})
+	hm.performCheck(context.Background(), check)
+	select {
+	case status := <-done:
+		if status != StatusUnhealthy {
+			t.Errorf("panic published %s, want unhealthy", status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("callback could not reenter the monitor")
+	}
+	check.mu.RLock()
+	defer check.mu.RUnlock()
+	if check.Status != StatusUnhealthy || check.LastError == nil || check.CheckCount != 1 || check.FailCount != 1 {
+		t.Errorf("panic outcome: status=%s error=%v count=%d failures=%d", check.Status, check.LastError, check.CheckCount, check.FailCount)
 	}
 }
