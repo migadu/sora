@@ -295,10 +295,13 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, remoteAddr net.Add
 					BaseError:    ErrRateLimitExceeded,
 				}
 			}
-			// Block has expired, remove it - must upgrade to write lock
+			// Block has expired, remove it - must upgrade to write lock, and look again
+			// under it: a failure or a cluster block in between may have blocked the IP anew.
 			a.ipMu.RUnlock()
 			a.ipMu.Lock()
-			delete(a.blockedIPs, ip)
+			if blocked, exists := a.blockedIPs[ip]; exists && !time.Now().Before(blocked.BlockedUntil) {
+				delete(a.blockedIPs, ip)
+			}
 			a.ipMu.Unlock()
 		} else {
 			a.ipMu.RUnlock()

@@ -446,6 +446,73 @@ func TestIPUsernameFullBlockTableReusesOutOfOrderBlock(t *testing.T) {
 	}
 }
 
+// CanAttemptAuth removes a block that has ended after trading its read lock for the
+// write lock. A failure that blocks the address (or pair) anew in between must survive
+// that removal. The window is short, so the race is retried many times.
+func TestExpiredBlockRemovalKeepsNewBlock(t *testing.T) {
+	prev := logger.Swap(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { logger.Swap(prev) })
+	const (
+		ip       = "203.0.113.7"
+		username = "user@example.com"
+		key      = ip + "|" + username
+		rounds   = 30000
+	)
+	ctx := context.Background()
+	addr := &StringAddr{Addr: ip}
+
+	race := func(t *testing.T, limiter *AuthRateLimiter, reset func(), fail func(), reason string) {
+		for i := 0; i < rounds; i++ {
+			reset()
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			wg.Add(2)
+			go func() { defer wg.Done(); <-start; _ = limiter.CanAttemptAuth(ctx, addr, username) }()
+			go func() { defer wg.Done(); <-start; fail() }()
+			close(start)
+			wg.Wait()
+			var rlErr *RateLimitError
+			if err := limiter.CanAttemptAuth(ctx, addr, username); !errors.As(err, &rlErr) || rlErr.Reason != reason {
+				t.Fatalf("round %d: the block set by the last failure was removed (CanAttemptAuth = %v)", i, err)
+			}
+		}
+	}
+
+	t.Run("ip", func(t *testing.T) {
+		limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+			Enabled:             true,
+			MaxAttemptsPerIP:    3,
+			IPBlockDuration:     time.Hour,
+			IPWindowDuration:    time.Hour,
+			CleanupInterval:     time.Hour,
+			DelayStartThreshold: 100,
+		})
+		defer limiter.Stop()
+		race(t, limiter, func() {
+			limiter.ipMu.Lock()
+			defer limiter.ipMu.Unlock()
+			limiter.blockedIPs[ip] = &BlockedIPInfo{BlockedUntil: time.Now().Add(-time.Second)}
+			limiter.ipFailureCounts[ip] = &IPFailureInfo{FailureCount: 2, FirstFailure: time.Now()}
+		}, func() { limiter.updateFailureTracking(ip, time.Now()) }, "ip_blocked")
+	})
+
+	t.Run("ip_username", func(t *testing.T) {
+		limiter := NewAuthRateLimiter("test", "", "", AuthRateLimiterConfig{
+			Enabled:                  true,
+			MaxAttemptsPerIPUsername: 1,
+			IPUsernameBlockDuration:  time.Hour,
+			IPUsernameWindowDuration: time.Hour,
+			CleanupInterval:          time.Hour,
+		})
+		defer limiter.Stop()
+		race(t, limiter, func() {
+			limiter.ipUsernameMu.Lock()
+			defer limiter.ipUsernameMu.Unlock()
+			limiter.blockedIPUsernames[key] = &BlockedIPUsernameInfo{BlockedUntil: time.Now().Add(-time.Second)}
+		}, func() { limiter.updateIPUsernameFailure(ip, username, time.Now()) }, "ip_username_blocked")
+	})
+}
+
 // Failed logins of a pair that has reached its threshold while the block table is full
 // of active blocks: each one must not search the whole table.
 func BenchmarkIPUsernameFailureAtFullBlockTable(b *testing.B) {
