@@ -449,22 +449,15 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// Connection admission (at accept): LMTP is internal-only, so when trusted_networks
 	// is unset we default to private networks. This gate intentionally keeps the RFC1918
 	// default — emptying the list must NOT silently reject all delivery.
-	admissionProxies := options.TrustedNetworks
-	if len(admissionProxies) == 0 {
-		admissionProxies = []string{
-			"127.0.0.0/8",    // localhost
-			"::1/128",        // IPv6 localhost
-			"10.0.0.0/8",     // RFC1918 private networks
-			"172.16.0.0/12",  // RFC1918 private networks
-			"192.168.0.0/16", // RFC1918 private networks
-		}
+	admissionProxies := server.LMTPAdmissionNetworks(options.TrustedNetworks)
+	if len(options.TrustedNetworks) == 0 {
 		logger.Info("LMTP: trusted_networks empty; accepting delivery from default private ranges (RFC1918+localhost). Set trusted_networks to restrict.", "name", name)
 	}
+	// A malformed entry is a configuration error: dropping the list would admit no peer
+	// and refuse every delivery.
 	admissionNets, err := helpers.ParseTrustedNetworks(admissionProxies)
 	if err != nil {
-		// Log the error and use empty trusted networks to prevent server crash
-		logger.Debug("failed to parse trusted networks, connection admission disabled", "name", name, "error", err)
-		admissionNets = []*net.IPNet{}
+		return nil, fmt.Errorf("invalid trusted_networks for LMTP [%s]: %w", name, err)
 	}
 	backend.trustedNetworks = admissionNets
 
@@ -475,8 +468,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// explicitly. (security-audit M2)
 	xclientNets, err := helpers.ParseTrustedNetworks(options.TrustedNetworks)
 	if err != nil {
-		logger.Debug("failed to parse XCLIENT trusted networks, XCLIENT disabled", "name", name, "error", err)
-		xclientNets = []*net.IPNet{}
+		return nil, fmt.Errorf("invalid trusted_networks for LMTP [%s]: %w", name, err)
 	}
 	backend.xclientTrustedNets = xclientNets
 	s.XCLIENTTrustedNets = xclientNets

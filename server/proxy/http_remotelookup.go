@@ -449,11 +449,21 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	if resultMap, ok := result.(map[string]any); ok {
 		if authResult, ok := resultMap["result"].(AuthResult); ok {
 			if authResult == AuthUserNotFound {
-				// Don't cache user not found - these should always go to remotelookup
-				// This prevents issues with user creation between cache checks
+				// Not cached here, and no dummy verification here: with lookup_local_users
+				// the caller goes on to the database login, which verifies; otherwise the
+				// caller refuses, spends the verification itself and caches the refusal
+				// for that password, as it does a wrong one.
 				return nil, AuthUserNotFound, nil
 			}
 			if authResult == AuthFailed {
+				// 401/403: the service refused the account by its address, as it never
+				// sees the password. A wrong password for an address it knows is refused
+				// only after verifyPassword below, so spend the same verification here,
+				// or the quicker answer shows that the address has a refused account. A
+				// route-only lookup has no password to verify.
+				if !routeOnly {
+					db.DummyVerifyPassword(password)
+				}
 				// Don't cache auth failures - these could be typos or password changes
 				// Better to always check remotelookup for security
 				return nil, AuthFailed, nil

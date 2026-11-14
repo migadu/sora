@@ -16,13 +16,11 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/smithy-go/logging"
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
+	"github.com/migadu/sora/storage"
 	"golang.org/x/crypto/acme/autocert"
 )
 
@@ -111,67 +109,20 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config, opts ...S3CacheOption) (*S3Ca
 	// Determine if TLS should be used
 	useSSL := !cfg.DisableTLS
 
-	// Build endpoint URL - accept either with or without protocol
-	var endpointURL string
-	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
-		// Endpoint already includes protocol
-		endpointURL = endpoint
-	} else {
-		// Add protocol based on useSSL flag
-		if useSSL {
-			endpointURL = "https://" + endpoint
-		} else {
-			endpointURL = "http://" + endpoint
-		}
-	}
-
-	// Create custom endpoint resolver
-	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-		return aws.Endpoint{
-			URL:               endpointURL,
-			HostnameImmutable: true,
-			Source:            aws.EndpointSourceCustom,
-		}, nil
+	clientCtx, cancel := context.WithTimeout(ctx, s3OperationTimeout)
+	client, err := storage.NewClient(clientCtx, storage.ClientConfig{
+		Endpoint:  endpoint,
+		UseTLS:    useSSL,
+		Region:    cfg.Region,
+		AccessKey: cfg.AccessKey,
+		SecretKey: cfg.SecretKey,
+		Debug:     cfg.Debug,
+		LogPrefix: "S3-Cache",
 	})
-
-	// The SDK's own loader supplies what the configuration leaves out: the region from
-	// AWS_REGION or the shared config file, and credentials from the default chain
-	// (environment, shared credentials file, web identity, container or instance role).
-	// A bare aws.Config has no credentials at all, and the SDK then sends every request
-	// unsigned.
-	var loadOpts []func(*awsconfig.LoadOptions) error
-	if cfg.Region != "" {
-		loadOpts = append(loadOpts, awsconfig.WithRegion(cfg.Region))
-	}
-	if cfg.AccessKey != "" && cfg.SecretKey != "" {
-		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")))
-	}
-	if cfg.Debug {
-		// ClientLogMode alone selects what to trace; without a logger the SDK discards it.
-		loadOpts = append(loadOpts,
-			awsconfig.WithClientLogMode(aws.LogRequest|aws.LogResponse|aws.LogRetries),
-			awsconfig.WithLogger(s3DebugLogger{}))
-	} else {
-		// The loader's own default logger writes to os.Stderr, past the server log - for
-		// one, a warning on every GET from a store that returns no checksum header.
-		loadOpts = append(loadOpts, awsconfig.WithLogger(logging.Nop{}))
-	}
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
+	cancel()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS configuration: %w", err)
+		return nil, err
 	}
-	if awsCfg.Region == "" {
-		// S3-compatible stores generally accept any region; us-east-1 is what this cache
-		// always signed for before the region was configurable.
-		awsCfg.Region = "us-east-1"
-	}
-	awsCfg.EndpointResolverWithOptions = customResolver
-
-	// Create S3 client with path-style addressing for compatibility
-	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.UsePathStyle = true
-	})
 
 	cache := &S3Cache{
 		client:       client,
@@ -191,22 +142,9 @@ func NewS3Cache(cfg config.TLSLetsEncryptS3Config, opts ...S3CacheOption) (*S3Ca
 	}
 
 	logger.Info("S3 autocert cache initialized", "bucket", cfg.Bucket,
-		"endpoint", endpoint, "region", awsCfg.Region, "tls", useSSL, "debug", cfg.Debug,
+		"endpoint", endpoint, "region", client.Options().Region, "tls", useSSL, "debug", cfg.Debug,
 		"server_side_encryption", cache.sseAlgorithm)
 	return cache, nil
-}
-
-// s3DebugLogger writes the SDK's request and response tracing, which debug = true asks
-// for, to the server log. It logs at INFO so that the trace appears without lowering the
-// log level of the whole server.
-type s3DebugLogger struct{}
-
-func (s3DebugLogger) Logf(classification logging.Classification, format string, v ...any) {
-	if classification == logging.Warn {
-		logger.Warn("S3-Cache: AWS SDK", "detail", fmt.Sprintf(format, v...))
-		return
-	}
-	logger.Info("S3-Cache: AWS SDK trace", "detail", fmt.Sprintf(format, v...))
 }
 
 // verifyBucketAccess checks if the S3 bucket exists and is accessible.

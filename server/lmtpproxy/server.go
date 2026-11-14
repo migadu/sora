@@ -146,6 +146,18 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		return nil, fmt.Errorf("no remote addresses or backend pools configured")
 	}
 
+	// Connection admission: as on the LMTP backend, trusted_networks or, when it is
+	// empty, the default private ranges. A malformed entry is a configuration error:
+	// dropping the list would close every connection.
+	trustedNets, err := helpers.ParseTrustedNetworks(server.LMTPAdmissionNetworks(opts.TrustedProxies))
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("invalid trusted_networks: %w", err)
+	}
+	if len(opts.TrustedProxies) == 0 {
+		logger.Info("LMTP Proxy: trusted_networks empty; accepting delivery from default private ranges (RFC1918+localhost). Set trusted_networks to restrict.", "name", opts.Name)
+	}
+
 	// Set default timeout if not specified
 	connectTimeout := opts.ConnectTimeout
 	if connectTimeout == 0 {
@@ -216,14 +228,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		logger.Debug("LMTP Proxy: Failed to resolve addresses", "name", opts.Name, "error", err)
 	}
 
-	// Parse trusted networks for connection filtering
-	trustedNets, err := helpers.ParseTrustedNetworks(opts.TrustedProxies)
-	if err != nil {
-		// Log the error and use empty trusted networks to prevent server crash
-		logger.Debug("LMTP Proxy: WARNING - failed to parse trusted networks, proxy connections will be restricted", "error", err)
-		trustedNets = []*net.IPNet{}
-	}
-
 	// Initialize connection limiter for total connections only (no per-IP for LMTP)
 	var limiter *server.ConnectionLimiter
 	if opts.MaxConnections > 0 {
@@ -276,9 +280,9 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
-		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
-		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
-		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()
+		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault(opts.Name)
+		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault(opts.Name)
+		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(opts.Name)
 		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// LMTP proxy doesn't do password validation, so positive revalidation window is not needed (use 0)
