@@ -261,6 +261,48 @@ func TestConnectToBackendEndsGreetingAtLowerCaseOK(t *testing.T) {
 	}
 }
 
+func TestConnectToBackendCapabilityLiteralsAreNotStatusReplies(t *testing.T) {
+	for _, greeting := range []string{
+		"{2}\r\nNO\r\nOK\r\n",
+		"\"IMPLEMENTATION\" {3}\r\nBYE\r\nOK\r\n",
+		"{2}\r\nNO {3}\r\nBYE\r\nOK\r\n",
+		"\"IMPLEMENTATION\" {6}\r\nNO\r\nOK\r\nOK\r\n",
+		"OK {2}\r\nNO\r\n",
+		"OK (XTEST ({2}\r\nNO))\r\n",
+		"{0}\r\n {3}\r\nBYE\r\nOK\r\n",
+	} {
+		t.Run(greeting, func(t *testing.T) {
+			addr, commands := fakeSieveBackend{greeting: greeting}.start(t)
+			sess, err := connectSieveBackend(t, addr, proxy.BackendSettings{}, nil)
+			if err != nil {
+				t.Fatalf("connectToBackendAndAuth: %v", err)
+			}
+			sess.backendConn.Close()
+			if got := commands(); len(got) != 1 || !strings.HasPrefix(got[0], "AUTHENTICATE \"PLAIN\" ") {
+				t.Errorf("backend received %q, want AUTHENTICATE", got)
+			}
+		})
+	}
+}
+
+func TestBackendCapabilityLiteralBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name, input string
+		want        error
+	}{
+		{"oversized declaration without payload", "{8193}\r\n", server.ErrLineTooLong},
+		{"truncated literal", "{3}\r\nNO", io.EOF},
+		{"record bound includes literal payload", "{8190}\r\n", server.ErrLineTooLong},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := readBackendCapabilityRecord(bufio.NewReader(strings.NewReader(tc.input)))
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("reading capability record: %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
 // What the backend sends behind the post-STARTTLS capabilities sits in the reader that
 // read them. Authentication must go on reading from that reader: a fresh one on the
 // connection silently skips those bytes and takes a later line for the reply.
