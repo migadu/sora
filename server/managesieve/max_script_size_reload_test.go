@@ -37,7 +37,7 @@ func newServerForConfig(t *testing.T, cfg config.ServerConfig, opts ManageSieveS
 
 // dialManageSieve opens a connection served by the library server a new connection
 // gets (the one a reload swaps in), as Start's accept loop does, and returns it with
-// the greeting's capability lines read.
+// the greeting read: its capability lines, then its OK line.
 func dialManageSieve(t *testing.T, srv *ManageSieveServer) (net.Conn, *bufio.Reader, []string) {
 	t.Helper()
 	tcp, err := net.Listen("tcp", "127.0.0.1:0")
@@ -67,10 +67,10 @@ func dialManageSieve(t *testing.T, srv *ManageSieveServer) (net.Conn, *bufio.Rea
 		if err != nil {
 			t.Fatalf("reading the greeting: %v", err)
 		}
+		greeting = append(greeting, strings.TrimRight(line, "\r\n"))
 		if strings.HasPrefix(line, "OK") {
 			return conn, reader, greeting
 		}
-		greeting = append(greeting, strings.TrimRight(line, "\r\n"))
 	}
 }
 

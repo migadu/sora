@@ -79,6 +79,23 @@ func TestNoRepliesAreQuotedStrings(t *testing.T) {
 	}
 }
 
+// The greeting ends with an OK line whose text is a string too (RFC 5804 section 4:
+// response-capability = *(single-capability) response-oknobye; response-ok = "OK"
+// [SP "(" resp-code ")"] [SP string] CRLF). go-managesieve writes Options.Greeting
+// verbatim after "OK ", so the backend must pre-quote all of it, not one word of it.
+func TestGreetingTextIsQuotedString(t *testing.T) {
+	srv := newServerForConfig(t, config.ServerConfig{Name: "sieve-greeting", Type: "managesieve"}, ManageSieveServerOptions{})
+	_, _, greeting := dialManageSieve(t, srv)
+	okLine := greeting[len(greeting)-1]
+	text, ok := strings.CutPrefix(okLine, "OK ")
+	if !ok {
+		t.Fatalf("greeting OK line = %q, want text after \"OK \"", okLine)
+	}
+	if !isQuotedString(text) {
+		t.Errorf("greeting OK line = %q: text %s is not a quoted string", okLine, text)
+	}
+}
+
 // Every uncoded *managesieveserver.Error the backend builds carries a quoted string,
 // including the replies a test cannot easily provoke (server busy, session closed, a
 // full delay queue, a login cut short during its delay). A coded one is quoted by the
