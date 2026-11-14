@@ -12,6 +12,7 @@ import (
 	"github.com/golang-migrate/migrate/v4/database"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/migadu/sora/consts"
 )
 
@@ -53,13 +54,32 @@ func (d *migrationDriver) Run(migration io.Reader) error {
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(string(body)) == "" {
+	query := string(body)
+	if strings.TrimSpace(query) == "" {
 		return nil
 	}
-	if _, err := d.conn.Exec(context.Background(), string(body)); err != nil {
-		return database.Error{OrigErr: err, Err: "migration failed", Query: body}
+	if _, err := d.conn.Exec(context.Background(), query); err != nil {
+		return migrationError(query, err)
 	}
 	return nil
+}
+
+// migrationError describes a failed migration as golang-migrate's pgx/v5 driver does:
+// PostgreSQL's message and detail, and the line of the file that its error position
+// points at (a position counts characters from 1 across the whole file).
+func migrationError(query string, err error) error {
+	e := database.Error{OrigErr: err, Err: "migration failed", Query: []byte(query)}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		e.Err += ": " + pgErr.Message
+		if pgErr.Detail != "" {
+			e.Err += ", " + pgErr.Detail
+		}
+		if runes := []rune(query); pgErr.Position > 0 && int(pgErr.Position) <= len(runes) {
+			e.Line = uint(strings.Count(string(runes[:pgErr.Position]), "\n")) + 1
+		}
+	}
+	return e
 }
 
 func (d *migrationDriver) SetVersion(version int, dirty bool) error {
