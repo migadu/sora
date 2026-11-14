@@ -265,20 +265,28 @@ func RemoveLongTokens(s string, maxTokenLen int) string {
 	return buf.String()
 }
 
-// Byte bounds for the header columns that idx_messages_mailbox_headers (migration 000052)
+// Byte bounds for the header columns that idx_messages_mailbox_headers_v2 (migration 000059)
 // carries as INCLUDE columns so that header searches and SORT are served index-only. A btree
 // index tuple cannot exceed 2704 bytes, and an INSERT whose row would produce a larger tuple
 // FAILS, so every carried text column must be bounded before it is written. Worst case with
-// these bounds: 600 + 600 + 5*200 = 2200 bytes of text plus ~130 bytes of fixed columns and
-// headers, under the limit. Changing a bound upward requires re-checking that sum; existing
-// rows above a bound make CREATE INDEX fail (see the migration's runbook).
+// these bounds: 600 + 600 + 1300 = 2500 bytes of text plus ~170 bytes of fixed columns and
+// headers, under the limit (measured on PostgreSQL 17 with incompressible text: with both
+// subject columns at 600 bytes, the address columns fit up to 1332 bytes). Changing a bound
+// upward requires re-checking that sum; existing rows above a bound make CREATE INDEX fail
+// (see the runbooks in migrations 000052 and 000059).
+//
+// The five first-address sort columns keep their own 200-byte bound (they are the RFC 5256
+// SORT keys) and share MaxAddressColumnsBytes with messages.extra_addresses, which holds
+// every other From/To/Cc name and address for SEARCH: it gets what the five leave, never
+// less than 1300 - 5*200 = 300 bytes.
 //
 // The bounds affect only pathological headers: production avg_width is 48 bytes for subject
 // and 3-26 bytes for the sort columns. A truncated subject is still shown in listings and
 // matched by SEARCH on its first 600 bytes; FETCH ENVELOPE does not read this column.
 const (
-	MaxSubjectBytes    = 600 // messages.subject and messages.subject_sort
-	MaxSortColumnBytes = 200 // messages.{from,to}_{email,name}_sort, cc_email_sort
+	MaxSubjectBytes        = 600  // messages.subject and messages.subject_sort
+	MaxSortColumnBytes     = 200  // messages.{from,to}_{email,name}_sort, cc_email_sort
+	MaxAddressColumnsBytes = 1300 // the five sort columns above plus messages.extra_addresses
 )
 
 // TruncateUTF8Safe safely truncates a UTF-8 string to a maximum byte length without cutting a multibyte rune in half.

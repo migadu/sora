@@ -519,7 +519,7 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 	defer a.ipMu.Unlock()
 
 	// Enforce size limit with LRU eviction (if configured)
-	if a.config.MaxIPEntries > 0 && len(a.ipFailureCounts) >= a.config.MaxIPEntries {
+	if _, exists := a.ipFailureCounts[ip]; !exists && a.config.MaxIPEntries > 0 && len(a.ipFailureCounts) >= a.config.MaxIPEntries {
 		a.evictOldestIP()
 	}
 
@@ -579,11 +579,19 @@ func (a *AuthRateLimiter) updateFailureTracking(ip string, failureTime time.Time
 	}
 }
 
+// clearFailureTracking clears the Tier 2 state of ip after a successful login, unless
+// ip has an active block: a success only resets an address that was allowed to try.
+// Callers check CanAttemptAuth first, so a success during a block comes from a path
+// that skipped the check or from a login verified while concurrent failures blocked
+// the address; neither may end the block before ip_block_duration.
 func (a *AuthRateLimiter) clearFailureTracking(ip string) {
 	a.ipMu.Lock()
+	defer a.ipMu.Unlock()
+	if blocked, exists := a.blockedIPs[ip]; exists && time.Now().Before(blocked.BlockedUntil) {
+		return
+	}
 	delete(a.ipFailureCounts, ip)
 	delete(a.blockedIPs, ip)
-	a.ipMu.Unlock()
 	logger.Debug("Auth limiter: Cleared failure tracking after successful login", "protocol", a.protocol, "ip", ip)
 }
 
@@ -598,7 +606,7 @@ func (a *AuthRateLimiter) updateIPUsernameFailure(ip, username string, failureTi
 	defer a.ipUsernameMu.Unlock()
 
 	// Enforce size limit with LRU eviction (if configured)
-	if a.config.MaxIPUsernameEntries > 0 && len(a.blockedIPUsernames) >= a.config.MaxIPUsernameEntries {
+	if _, exists := a.blockedIPUsernames[ipUsernameKey]; !exists && a.config.MaxIPUsernameEntries > 0 && len(a.blockedIPUsernames) >= a.config.MaxIPUsernameEntries {
 		a.evictOldestIPUsername()
 	}
 
@@ -653,7 +661,8 @@ func (a *AuthRateLimiter) updateIPUsernameFailure(ip, username string, failureTi
 	}
 }
 
-// clearIPUsernameFailure clears IP+username failure tracking after successful auth
+// clearIPUsernameFailure clears IP+username failure tracking after successful auth,
+// unless the pair has an active block (see clearFailureTracking).
 func (a *AuthRateLimiter) clearIPUsernameFailure(ip, username string) {
 	if username == "" {
 		return
@@ -661,8 +670,11 @@ func (a *AuthRateLimiter) clearIPUsernameFailure(ip, username string) {
 
 	ipUsernameKey := ip + "|" + username
 	a.ipUsernameMu.Lock()
+	defer a.ipUsernameMu.Unlock()
+	if entry, exists := a.blockedIPUsernames[ipUsernameKey]; exists && time.Now().Before(entry.BlockedUntil) {
+		return
+	}
 	delete(a.blockedIPUsernames, ipUsernameKey)
-	a.ipUsernameMu.Unlock()
 }
 
 // updateUsernameFailure tracks username authentication failures (cluster-synchronized)
@@ -675,7 +687,7 @@ func (a *AuthRateLimiter) updateUsernameFailure(username string, failureTime tim
 	defer a.usernameMu.Unlock()
 
 	// Enforce size limit with LRU eviction (if configured)
-	if a.config.MaxUsernameEntries > 0 && len(a.usernameFailureCounts) >= a.config.MaxUsernameEntries {
+	if _, exists := a.usernameFailureCounts[username]; !exists && a.config.MaxUsernameEntries > 0 && len(a.usernameFailureCounts) >= a.config.MaxUsernameEntries {
 		a.evictOldestUsername()
 	}
 
@@ -990,31 +1002,41 @@ func (a *AuthRateLimiter) evictOldestIPUsername() {
 	}
 }
 
-// evictOldestIP removes the oldest IP entry by FirstFailure time
+// evictOldestIP drops the failure counter with the oldest FirstFailure to make room
+// in ipFailureCounts. Counters of actively blocked addresses are passed over while any
+// other is left, and the block itself is never touched: it lives in blockedIPs until
+// cleanupExpiredEntries removes it after BlockedUntil. Deleting the block here ended it
+// early, and the longest-blocked addresses, having the oldest first failures, went first.
+// When every tracked address is blocked, the oldest counter goes anyway to keep the
+// table bounded; its block still stands.
 // Caller must hold ipMu write lock
 func (a *AuthRateLimiter) evictOldestIP() {
-	if len(a.ipFailureCounts) == 0 {
-		return
-	}
-
-	var oldestIP string
-	var oldestTime time.Time
-	first := true
+	now := time.Now()
+	var oldestIP, oldestBlockedIP string
+	var oldestTime, oldestBlockedTime time.Time
+	found, foundBlocked := false, false
 
 	for ip, info := range a.ipFailureCounts {
-		if first || info.FirstFailure.Before(oldestTime) {
-			oldestIP = ip
-			oldestTime = info.FirstFailure
-			first = false
+		if blocked, exists := a.blockedIPs[ip]; exists && now.Before(blocked.BlockedUntil) {
+			if !foundBlocked || info.FirstFailure.Before(oldestBlockedTime) {
+				oldestBlockedIP, oldestBlockedTime, foundBlocked = ip, info.FirstFailure, true
+			}
+			continue
+		}
+		if !found || info.FirstFailure.Before(oldestTime) {
+			oldestIP, oldestTime, found = ip, info.FirstFailure, true
 		}
 	}
 
-	if oldestIP != "" {
-		delete(a.ipFailureCounts, oldestIP)
-		// Also remove from blockedIPs if present
-		delete(a.blockedIPs, oldestIP)
-		logger.Debug("Auth limiter: Evicted oldest IP entry (size limit)", "protocol", a.protocol, "ip", oldestIP, "first_failure", oldestTime)
+	if !found {
+		if !foundBlocked {
+			return
+		}
+		oldestIP, oldestTime = oldestBlockedIP, oldestBlockedTime
 	}
+
+	delete(a.ipFailureCounts, oldestIP)
+	logger.Debug("Auth limiter: Evicted oldest IP entry (size limit)", "protocol", a.protocol, "ip", oldestIP, "first_failure", oldestTime, "blocked", !found)
 }
 
 // evictOldestUsername removes the oldest username entry by FirstFailure time

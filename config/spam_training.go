@@ -23,7 +23,8 @@ type SpamTrainingConfig struct {
 	// Timeout for HTTP requests to the training endpoint
 	Timeout string `toml:"timeout"`
 
-	// Maximum message size to submit (messages larger than this are skipped)
+	// Maximum message size to submit, attachments included, as stored with the
+	// message. Larger messages are skipped before their body is fetched.
 	// Default: "10mb"
 	MaxMessageSize string `toml:"max_message_size"`
 
@@ -35,6 +36,14 @@ type SpamTrainingConfig struct {
 	// Async mode: submit training requests in background (don't block MOVE)
 	// Default: true
 	Async bool `toml:"async"`
+
+	// Number of workers that fetch and submit training messages, process-wide.
+	// Default: 4
+	Workers int `toml:"workers"`
+
+	// Messages waiting for a worker. A message moved while the queue is full is
+	// not submitted. Default: 1000
+	QueueSize int `toml:"queue_size"`
 
 	// Circuit breaker configuration for training endpoint
 	CircuitBreaker SpamTrainingCircuitBreakerConfig `toml:"circuit_breaker"`
@@ -74,6 +83,22 @@ func (s *SpamTrainingConfig) GetMaxMessageSize() (int64, error) {
 		return 10 * 1024 * 1024, nil // Default: 10MB
 	}
 	return helpers.ParseSize(s.MaxMessageSize)
+}
+
+// GetWorkers returns the number of training workers
+func (s *SpamTrainingConfig) GetWorkers() int {
+	if s.Workers <= 0 {
+		return 4
+	}
+	return s.Workers
+}
+
+// GetQueueSize returns how many messages may wait for a training worker
+func (s *SpamTrainingConfig) GetQueueSize() int {
+	if s.QueueSize <= 0 {
+		return 1000
+	}
+	return s.QueueSize
 }
 
 // GetMaxAttachmentSize parses and returns the maximum attachment size

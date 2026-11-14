@@ -3,6 +3,7 @@ package sieveengine
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -234,5 +235,5 @@ func evaluateFileintoTarget(compiled *CompiledScript) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return result.Mailbox, nil
+	return strings.Join(result.Mailboxes, ","), nil
 }

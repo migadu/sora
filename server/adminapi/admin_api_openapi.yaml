@@ -228,7 +228,7 @@ components:
           example: "IMAP"
         instance:
           type: string
-          description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<host name>-<server name> on a proxy."
+          description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<cluster node_id>-<server name> on a proxy (the host name in place of the node_id outside cluster mode, where the LMTP proxy is the only proxy that tracks sessions)."
           example: "IMAP-node1-imap-proxy"
         account_id:
           type: integer
@@ -236,7 +236,7 @@ components:
           example: 123
         email:
           type: string
-          description: "Address the account's sessions logged in with."
+          description: "The address of the session that created the entry: the login address, or the recipient on an LMTP proxy."
           example: "user@example.com"
         local_count:
           type: integer
@@ -244,12 +244,12 @@ components:
           example: 2
         total_count:
           type: integer
-          description: "local_count plus the account's sessions on the same protocol that other nodes' trackers report through gossip."
+          description: "local_count plus the account's sessions on the same protocol that other nodes' trackers report through gossip. Backends and LMTP proxies do not gossip, so there it equals local_count."
           example: 3
         last_update:
           type: string
           format: date-time
-          description: "When the tracker last changed this account's counts."
+          description: "When the tracker last updated the entry: a session opened or closed, or gossip about the account arrived (including the periodic full-state exchange, which changes no count)."
 
     UserConnectionInfo:
       type: object
@@ -257,7 +257,7 @@ components:
       properties:
         protocol:
           type: string
-          description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<host name>-<server name> on a proxy."
+          description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<cluster node_id>-<server name> on a proxy (the host name in place of the node_id outside cluster mode, where the LMTP proxy is the only proxy that tracks sessions)."
           example: "IMAP-node1-imap-proxy"
         account_id:
           type: integer
@@ -265,7 +265,7 @@ components:
           example: 123
         email:
           type: string
-          description: "Address the account's sessions logged in with."
+          description: "The address of the session that created the entry: the login address, or the recipient on an LMTP proxy."
           example: "user@example.com"
         local_count:
           type: integer
@@ -273,12 +273,12 @@ components:
           example: 2
         total_count:
           type: integer
-          description: "local_count plus the account's sessions on the same protocol that other nodes' trackers report through gossip."
+          description: "local_count plus the account's sessions on the same protocol that other nodes' trackers report through gossip. Backends and LMTP proxies do not gossip, so there it equals local_count."
           example: 3
         last_update:
           type: string
           format: date-time
-          description: "When the tracker last changed this account's counts."
+          description: "When the tracker last updated the entry: a session opened or closed, or gossip about the account arrived (including the periodic full-state exchange, which changes no count)."
 
     ConnectionStats:
       type: object
@@ -289,7 +289,7 @@ components:
           example: 150
         connections_by_protocol:
           type: object
-          description: "total_connections per connection tracker, keyed <PROTOCOL>-<server name> on a backend and <PROTOCOL>-<host name>-<server name> on a proxy."
+          description: "total_connections per connection tracker, keyed <PROTOCOL>-<server name> on a backend and <PROTOCOL>-<cluster node_id>-<server name> on a proxy (the host name in place of the node_id outside cluster mode)."
           additionalProperties:
             type: integer
           example:
@@ -1123,9 +1123,10 @@ paths:
             - Missing required field `email`
             - Neither `password` nor `password_hash` provided
             - Both `password` and `password_hash` provided (only one allowed)
+            - A `credentials` entry with a `password` whose `hash_type` is not `bcrypt` or `ssha512`
             - An invalid email address
             - A `password` longer than 72 bytes hashed with bcrypt (the default), bcrypt's limit
-            - In a `credentials` array: no or several `is_primary` entries, the same address twice, or an unknown `hash_type`
+            - In a `credentials` array: no or several `is_primary` entries, or the same address twice
           content:
             application/json:
               schema:
@@ -1624,6 +1625,12 @@ paths:
                   count:
                     type: integer
                     example: 2
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Account not found.
           content:
@@ -1887,7 +1894,7 @@ paths:
       tags:
         - Connection Management
       summary: Get connections for a specific user
-      description: One entry per connection tracker on this node that knows the account, matched by the address the sessions logged in with (case-insensitive).
+      description: One entry per connection tracker on this node that knows the account, matched case-insensitively against the entry's email, so an account whose entry was created by an alias login is found only under that alias.
       parameters:
         - name: email
           in: path
@@ -2424,8 +2431,9 @@ paths:
         Returns no counters. Failed logins are tracked in memory by each server's
         authentication rate limiter, per address, and expire on their own; this endpoint
         answers the same fixed description of that tracking on every call. For the
-        addresses blocked right now use GET /auth/blocked. Attempt counts are exported
-        as the Prometheus counter sora_authentication_attempts_total.
+        addresses blocked right now use GET /auth/blocked. IMAP, POP3 and ManageSieve
+        attempt counts (servers and proxies) are exported as the Prometheus counter
+        sora_authentication_attempts_total; User API logins are not counted there.
 
         Query parameters are ignored; the window parameter of older versions is still
         accepted.
