@@ -55,7 +55,13 @@ type Manager struct {
 	// partition elects a leader on both sides and each believes it is the only one.
 	certFence      CertificateFence
 	claimMu        sync.Mutex
-	issuanceClaims map[string]func(context.Context) // domain -> release, for claims held here
+	issuanceClaims map[string]issuanceClaim // claims held here, by domain
+}
+
+// issuanceClaim is a claim this node holds on the certificate fence.
+type issuanceClaim struct {
+	release func(context.Context)
+	expires time.Time // when the fence lets the claim go by itself; no later than its own expiry
 }
 
 // CertificateFence is a store that cannot be partitioned into two writable copies, used
@@ -98,14 +104,22 @@ func (m *Manager) holdIssuance(domain string) error {
 	defer m.claimMu.Unlock()
 
 	// Re-entrant: concurrent handshakes for one domain all reach here, and the second
-	// must not read this node's own claim as somebody else's.
-	if _, held := m.issuanceClaims[domain]; held {
-		return nil
+	// must not read this node's own claim as somebody else's. Only until the fence lets
+	// the claim go, though. It is given back when the certificate is stored, and an order
+	// that fails stores none: autocert retries a failed renewal 30-60 minutes later, by
+	// which time another node may hold the claim, so the retry has to ask the fence.
+	if claim, held := m.issuanceClaims[domain]; held {
+		if time.Now().Before(claim.expires) {
+			return nil
+		}
+		delete(m.issuanceClaims, domain)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), issuanceFenceTimeout)
 	defer cancel()
 
+	// Taken before the fence is asked, so the claim is never thought held past its expiry.
+	asked := time.Now()
 	release, err := m.certFence.TryHoldIssuance(ctx, domain, issuanceClaimTTL)
 	if err != nil {
 		// The fence is unreachable. Allow the order: an expired certificate takes the
@@ -121,9 +135,9 @@ func (m *Manager) holdIssuance(domain string) error {
 	}
 
 	if m.issuanceClaims == nil {
-		m.issuanceClaims = make(map[string]func(context.Context))
+		m.issuanceClaims = make(map[string]issuanceClaim)
 	}
-	m.issuanceClaims[domain] = release
+	m.issuanceClaims[domain] = issuanceClaim{release: release, expires: asked.Add(issuanceClaimTTL)}
 	return nil
 }
 
@@ -131,7 +145,7 @@ func (m *Manager) holdIssuance(domain string) error {
 // so a renewal does not have to wait out issuanceClaimTTL.
 func (m *Manager) releaseIssuance(domain string) {
 	m.claimMu.Lock()
-	release, held := m.issuanceClaims[domain]
+	claim, held := m.issuanceClaims[domain]
 	delete(m.issuanceClaims, domain)
 	m.claimMu.Unlock()
 
@@ -140,7 +154,7 @@ func (m *Manager) releaseIssuance(domain string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), issuanceFenceTimeout)
 	defer cancel()
-	release(ctx)
+	claim.release(ctx)
 }
 
 // New creates a new TLS manager based on the provided configuration.
