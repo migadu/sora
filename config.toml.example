@@ -1700,6 +1700,10 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 #
 # The remote_lookup service is called via HTTP GET with email interpolation.
 # The URL can contain $email placeholder which is replaced with the URL-encoded email address.
+# $ip is replaced with the client's IP address: the source of the PROXY header when the proxy
+# receives one, else the connecting peer. On lmtp_proxy the client is the delivering MTA.
+# A URL containing $ip bypasses the proxy's lookup cache: verdicts and routes may differ
+# between networks, while the cache is keyed by user. Other URLs keep the configured TTLs.
 #
 # Example URLs:
 #   "http://localhost:8080/lookup?email=$email" → GET /lookup?email=user@domain.com

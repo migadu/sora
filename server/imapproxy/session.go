@@ -846,7 +846,6 @@ func (s *Session) authenticateUser(username, password string) error {
 	// the upstream load balancer whenever this proxy sits behind haproxy/nginx/NLB,
 	// and the load balancer never accumulates failures — so keying the delay on it
 	// meant the delay never fired in exactly the deployment proxies exist for.
-	remoteAddr := s.clientConn.RemoteAddr()
 	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
 	delayAddr := &server.StringAddr{Addr: realClientIP}
 	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, delayAddr, "IMAP-PROXY"); err != nil {
@@ -1037,9 +1036,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for remotelookup authentication
 	if s.server.connManager.HasRouting() {
-		// Extract client IP from remote address (remove port)
-		clientIP, _ := server.GetHostPortFromAddr(remoteAddr)
-		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithClientIP(ctx, usernameForRemoteLookup, password, clientIP, masterAuthValidated)
+		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithClientIP(ctx, usernameForRemoteLookup, password, realClientIP, masterAuthValidated)
 
 		// Log remotelookup response with all details
 		backend := "none"
@@ -1311,6 +1308,7 @@ func (s *Session) connectToBackend() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                   s.ctx,
 		Username:              s.username,
+		ClientIP:              server.GetRealClientIP(s.clientConn, s.proxyInfo),
 		Protocol:              "imap",
 		IsRemoteLookupAccount: s.isRemoteLookupAccount,
 		RoutingInfo:           s.routingInfo,
@@ -1355,15 +1353,8 @@ func (s *Session) connectToBackend() error {
 		s.routingInfo.ProxySessionID = s.sessionID
 	}
 
-	// Use real client IP from PROXY protocol if available
-	var clientHost string
-	var clientPort int
-	if s.proxyInfo != nil && s.proxyInfo.SrcIP != "" {
-		clientHost = s.proxyInfo.SrcIP
-		clientPort = s.proxyInfo.SrcPort
-	} else {
-		clientHost, clientPort = server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
-	}
+	// The backend's PROXY header names the real client (the incoming PROXY header's source).
+	clientHost, clientPort := server.GetRealClientAddr(s.clientConn, s.proxyInfo)
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,

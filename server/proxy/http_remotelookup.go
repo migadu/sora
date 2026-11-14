@@ -269,11 +269,9 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	result, err := c.breaker.Execute(func() (any, error) {
 		// Build request URL by interpolating placeholders:
 		// - $email: user email (MasterAddress - includes master token but not +detail)
-		// - $ip: client IP address
+		// - $ip: client IP address; empty when the caller has none, never the literal placeholder
 		requestURL := strings.ReplaceAll(c.baseURL, "$email", url.QueryEscape(lookupEmail))
-		if clientIP != "" {
-			requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
-		}
+		requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
 
 		// Add route_only parameter if requested (for master username authentication)
 		if routeOnly {
