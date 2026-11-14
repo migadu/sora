@@ -35,3 +35,26 @@ func TestUploaderConfigValidate(t *testing.T) {
 		}
 	}
 }
+
+// [uploader] cleanup_grace_period must be positive: with a negative value the orphan
+// cleanup's cutoff lies in the future, so it removes staged bodies whose pending_uploads
+// row is still in an uncommitted delivery transaction (#922). Empty means the 1h default.
+func TestUploaderConfigValidateCleanupGracePeriod(t *testing.T) {
+	for _, v := range []string{"", "1h", "30m", "2d"} {
+		c := NewDefaultConfig().Uploader
+		c.CleanupGracePeriod = v
+		if err := c.Validate(); err != nil {
+			t.Errorf("cleanup_grace_period = %q rejected: %v", v, err)
+		}
+	}
+	for _, v := range []string{"0", "0s", "-1ns", "-1h", "-1d"} {
+		c := NewDefaultConfig().Uploader
+		c.CleanupGracePeriod = v
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("cleanup_grace_period = %q accepted", v)
+		} else if !strings.Contains(err.Error(), "cleanup_grace_period") {
+			t.Errorf("cleanup_grace_period = %q: error %q does not name the key", v, err)
+		}
+	}
+}
