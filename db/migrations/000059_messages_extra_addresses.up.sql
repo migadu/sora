@@ -46,19 +46,56 @@
 --      binaries during the rollout) with scripts/backfill_extra_addresses.sql. Until then those
 --      messages are found by their first From/To/Cc address only, as before this migration.
 --
--- On a large database, do not deploy the binary before steps 1-3. Without step 2 this
--- migration builds the index under the column's lock; without step 3 it drops the old index
--- with a plain DROP INDEX, an ACCESS EXCLUSIVE lock on messages that queues behind every
--- running query and blocks every new one.
+-- On more than 25,000 messages, this migration refuses unfinished preparation before any
+-- DDL. A small database can safely do the work here, as migration 000050 also does. A failed
+-- concurrent build is always refused: an existing INVALID v2 index must never cause the
+-- valid old covering index to be dropped.
+--
+-- Recovery if startup refused: stop the new binaries and complete steps 1-3 above using a
+-- direct primary connection. A failed migration is recorded as version 59, dirty, even
+-- though this transaction rolled back all its DDL. Verify that version/dirty state with
+--   sora-admin --config config.toml migrate version
+-- then clear ONLY that failed attempt with
+--   sora-admin --config config.toml migrate force 58
+-- and restart (or run migrate up). Do not force 59: the migration should run again and
+-- verify the prepared catalog. Older binaries can keep serving during preparation.
 
 DO $$
+DECLARE
+    has_column boolean;
+    has_v2 boolean;
+    valid_v2 boolean;
+    has_old boolean;
+    message_rows bigint;
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_attribute
-                   WHERE attrelid = 'messages'::regclass AND attname = 'extra_addresses' AND NOT attisdropped) THEN
+    SELECT EXISTS (SELECT 1 FROM pg_attribute
+                   WHERE attrelid = 'messages'::regclass AND attname = 'extra_addresses' AND NOT attisdropped)
+      INTO has_column;
+    has_v2 := to_regclass('idx_messages_mailbox_headers_v2') IS NOT NULL;
+    SELECT EXISTS (SELECT 1 FROM pg_index
+                   WHERE indexrelid = to_regclass('idx_messages_mailbox_headers_v2') AND indisvalid AND indisready)
+      INTO valid_v2;
+    has_old := to_regclass('idx_messages_mailbox_headers') IS NOT NULL;
+
+    -- Catalog-only fast path: even a bounded count would lock messages and wait behind
+    -- an exclusive lock. A fully prepared production database needs no table access.
+    IF has_column AND valid_v2 AND NOT has_old THEN
+        RETURN;
+    END IF;
+    IF has_v2 AND NOT valid_v2 THEN
+        RAISE EXCEPTION 'Migration 59: idx_messages_mailbox_headers_v2 is INVALID. Keep the old index; DROP INDEX CONCURRENTLY idx_messages_mailbox_headers_v2, then complete steps 1-3 in 000059_messages_extra_addresses.up.sql. If schema_migrations is 59 dirty, verify preparation, force 58 and retry.';
+    END IF;
+
+    SELECT count(*) INTO message_rows FROM (SELECT 1 FROM messages LIMIT 25001) s;
+    IF message_rows > 25000 THEN
+        RAISE EXCEPTION 'Migration 59: messages has more than 25000 rows and out-of-band preparation is incomplete. Refusing a blocking index rebuild/drop. Complete steps 1-3 in 000059_messages_extra_addresses.up.sql (add extra_addresses, CREATE INDEX CONCURRENTLY v2, verify indisvalid, DROP INDEX CONCURRENTLY old). If schema_migrations is 59 dirty, verify preparation, run sora-admin --config config.toml migrate force 58 and retry.';
+    END IF;
+
+    IF NOT has_column THEN
         ALTER TABLE messages ADD COLUMN extra_addresses TEXT;
     END IF;
 
-    IF to_regclass('idx_messages_mailbox_headers_v2') IS NULL THEN
+    IF NOT has_v2 THEN
         CREATE INDEX idx_messages_mailbox_headers_v2 ON messages (mailbox_id)
           INCLUDE (id, uid, content_hash, created_modseq, expunged_modseq, internal_date, sent_date, size,
                    subject, subject_sort, from_email_sort, from_name_sort, to_email_sort, to_name_sort,
@@ -66,7 +103,7 @@ BEGIN
           WHERE expunged_at IS NULL;
     END IF;
 
-    IF to_regclass('idx_messages_mailbox_headers') IS NOT NULL THEN
+    IF has_old THEN
         DROP INDEX idx_messages_mailbox_headers;
     END IF;
 END $$;

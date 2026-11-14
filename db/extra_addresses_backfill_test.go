@@ -60,6 +60,19 @@ func TestExtraAddressesBackfillMatchesWriter(t *testing.T) {
 	require.NoError(t, err)
 	_, err = tx.Exec(ctx, string(script))
 	require.NoError(t, err, "the backfill script must load as plain DDL")
+	// A zero batch never advances hi; a negative one walks upwards forever.
+	// Reject these before the procedure starts its transaction-control loop.
+	for _, tc := range []struct {
+		batch, sleep int
+		want         string
+	}{{0, 100, "p_batch must be positive"}, {-1, 100, "p_batch must be positive"}, {5000, -1, "p_sleep_ms must not be negative"}} {
+		_, err = tx.Exec(ctx, "SAVEPOINT invalid_settings")
+		require.NoError(t, err)
+		_, err = tx.Exec(ctx, "CALL sora_backfill_extra_addresses(NULL, $1, $2)", tc.batch, tc.sleep)
+		require.ErrorContains(t, err, tc.want)
+		_, err = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT invalid_settings")
+		require.NoError(t, err)
+	}
 
 	for name, id := range ids {
 		var stored, backfilled string

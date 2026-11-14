@@ -121,6 +121,12 @@ DECLARE
 	n bigint;
 	total bigint := 0;
 BEGIN
+	IF p_batch <= 0 THEN
+		RAISE EXCEPTION 'p_batch must be positive, got %', p_batch;
+	END IF;
+	IF p_sleep_ms < 0 THEN
+		RAISE EXCEPTION 'p_sleep_ms must not be negative, got %', p_sleep_ms;
+	END IF;
 	SELECT min(id), COALESCE(hi, max(id)) INTO lo_bound, hi FROM messages;
 	WHILE hi >= lo_bound LOOP
 		lo := greatest(hi - p_batch + 1, lo_bound);
