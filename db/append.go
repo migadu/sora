@@ -704,8 +704,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	saneSubject := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(options.Subject), helpers.MaxSubjectBytes)
 	saneInReplyToStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(inReplyToStr), 2000)
 
-	referencesStr := strings.Join(options.References, " ")
-	saneReferencesStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(referencesStr), 2000)
+	saneReferencesStr := helpers.TrimReferences(options.References, helpers.MaxReferencesBytes)
 
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
 
@@ -1081,8 +1080,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	saneSubject := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(options.Subject), helpers.MaxSubjectBytes)
 	saneInReplyToStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(inReplyToStr), 2000)
 
-	referencesStr := strings.Join(options.References, " ")
-	saneReferencesStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(referencesStr), 2000)
+	saneReferencesStr := helpers.TrimReferences(options.References, helpers.MaxReferencesBytes)
 
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
 
@@ -1333,7 +1331,7 @@ func (d *Database) InsertMessagesBatch(
 			SaneSubject:        helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(opt.Subject), helpers.MaxSubjectBytes),
 			SanePlaintextBody:  helpers.SanitizeUTF8(opt.PlaintextBody),
 			SaneInReplyToStr:   helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(inReplyToStr), 2000),
-			SaneReferencesStr:  helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(strings.Join(opt.References, " ")), 2000),
+			SaneReferencesStr:  helpers.TrimReferences(opt.References, helpers.MaxReferencesBytes),
 			BodyStructureData:  bodyStructureData,
 			RecipientsJSON:     recipientsJSON,
 			CustomKeywordsJSON: customKeywordsJSON,
