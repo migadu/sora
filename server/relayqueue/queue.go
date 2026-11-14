@@ -109,6 +109,12 @@ func NewDiskQueue(basePath string, maxAttempts int, retryBackoff []time.Duration
 	return q, nil
 }
 
+// MaxAttempts returns the number of delivery attempts after which a message is moved to
+// failed/, with the default applied when none was configured.
+func (q *DiskQueue) MaxAttempts() int {
+	return q.maxAttempts
+}
+
 // RecoverOrphanedMessages moves any messages left in processing/ back to pending/
 // This handles crash recovery - messages that were being processed when the server died.
 func (q *DiskQueue) RecoverOrphanedMessages() (int, error) {
@@ -434,6 +440,58 @@ func (q *DiskQueue) Enqueue(from, to, messageType string, messageBytes []byte) e
 	metrics.RelayQueueOperations.WithLabelValues("enqueue", "success").Inc()
 	metrics.RelayQueueOperationDuration.WithLabelValues("enqueue").Observe(time.Since(start).Seconds())
 	logger.Info("RelayQueue: Enqueued message", "type", messageType, "id", id, "from", from, "to", to)
+	return nil
+}
+
+// Requeue moves a message from failed/ back to pending/ with its attempts and error
+// history reset, ready for immediate delivery. Like Enqueue it writes the body before
+// the metadata, each atomically, so a worker that sees the metadata - including a
+// server's worker picking it up on its next resync - always finds the whole body. The
+// failed copy is removed only after that: a crash in between leaves the message in both
+// queues, never in neither.
+func (q *DiskQueue) Requeue(messageID string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	failedMetadataPath := filepath.Join(q.failedDir, messageID+".json")
+	failedMessagePath := filepath.Join(q.failedDir, messageID+".msg")
+
+	var metadata QueuedMessage
+	if err := q.readMetadata(failedMetadataPath, &metadata); err != nil {
+		return fmt.Errorf("could not read metadata: %w", err)
+	}
+	messageBytes, err := os.ReadFile(failedMessagePath)
+	if err != nil {
+		return fmt.Errorf("could not read message body: %w", err)
+	}
+
+	metadata.Attempts = 0
+	metadata.LastAttempt = time.Time{}
+	metadata.NextRetry = time.Now()
+	metadata.Errors = []string{}
+
+	metadataPath := filepath.Join(q.pendingDir, messageID+".json")
+	messagePath := filepath.Join(q.pendingDir, messageID+".msg")
+	if err := q.writeDataAtomic(messagePath, messageBytes); err != nil {
+		return fmt.Errorf("could not write message body to pending: %w", err)
+	}
+	if err := q.writeFileAtomic(metadataPath, metadata); err != nil {
+		// The rename may have happened before the error (a failed directory fsync), so
+		// withdraw the metadata before the body it points at.
+		os.Remove(metadataPath)
+		os.Remove(messagePath)
+		return fmt.Errorf("could not write metadata to pending: %w", err)
+	}
+	q.pending.add(messageID, metadata.NextRetry)
+
+	// Body first, as CleanupOldFailedMessages does: metadata left behind is reclaimed
+	// by retention, a body without it would never be.
+	if err := os.Remove(failedMessagePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("requeued, but could not remove the failed copy: %w", err)
+	}
+	if err := os.Remove(failedMetadataPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("requeued, but could not remove the failed copy: %w", err)
+	}
 	return nil
 }
 
