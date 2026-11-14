@@ -228,6 +228,15 @@ generateToken:
 		return
 	}
 
+	// Account creation makes no mailboxes: like an IMAP or POP3 login, this one
+	// creates the default ones (consts.DefaultMailboxes) for an account that has
+	// none yet, on the cache path as on the database path.
+	if err := s.rdb.CreateDefaultMailboxesWithRetry(ctx, accountID); err != nil {
+		logger.Warn("HTTP Mail API: Error creating default mailboxes", "name", s.name, "account_id", accountID, "error", err)
+		s.writeError(w, http.StatusServiceUnavailable, "Service unavailable")
+		return
+	}
+
 	// Generate JWT token
 	token, expiresAt, err := s.generateToken(req.Email, accountID, epoch.Unix())
 	if err != nil {
