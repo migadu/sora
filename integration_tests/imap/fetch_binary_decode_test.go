@@ -54,7 +54,7 @@ func TestIMAP_FetchBinaryDecodesTransferEncodingOnly(t *testing.T) {
 		t.Fatalf("read greeting failed: %v", err)
 	}
 	tagN := 0
-	do := func(cmd string) (resp, tagged string) {
+	do := func(t *testing.T, cmd string) (resp, tagged string) {
 		t.Helper()
 		tagN++
 		tag := fmt.Sprintf("b%d", tagN)
@@ -65,16 +65,16 @@ func TestIMAP_FetchBinaryDecodesTransferEncodingOnly(t *testing.T) {
 		lines := strings.Split(strings.TrimSuffix(resp, "\r\n"), "\r\n")
 		return resp, lines[len(lines)-1]
 	}
-	mustOK := func(cmd string) string {
+	mustOK := func(t *testing.T, cmd string) string {
 		t.Helper()
-		resp, tagged := do(cmd)
+		resp, tagged := do(t, cmd)
 		if !strings.Contains(tagged, " OK ") {
 			t.Fatalf("%s not OK:\n%s", cmd, resp)
 		}
 		return resp
 	}
 
-	mustOK(fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password))
+	mustOK(t, fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password))
 	for i, msg := range []string{
 		// 1: "line1\nline2\n"
 		binaryDecodeTestMessage("lf", "text/plain", "base64", "bGluZTEKbGluZTIK\r\n"),
@@ -82,6 +82,8 @@ func TestIMAP_FetchBinaryDecodesTransferEncodingOnly(t *testing.T) {
 		binaryDecodeTestMessage("cte", "text/plain", "x-uuencode", "begin 644 a.txt\r\n#86)C\r\n`\r\nend\r\n"),
 		// 3: "café" in iso-8859-1
 		binaryDecodeTestMessage("latin1", "text/plain; charset=iso-8859-1", "quoted-printable", "caf=E9\r\n"),
+		// 4: message 1 with a comment in its Content-Transfer-Encoding
+		binaryDecodeTestMessage("comment", "text/plain", "base64 (encoded)", "bGluZTEKbGluZTIK\r\n"),
 	} {
 		tag := fmt.Sprintf("a%d", i+1)
 		if _, err := fmt.Fprintf(conn, "%s APPEND INBOX {%d+}\r\n%s\r\n", tag, len(msg), msg); err != nil {
@@ -91,7 +93,7 @@ func TestIMAP_FetchBinaryDecodesTransferEncodingOnly(t *testing.T) {
 			t.Fatalf("APPEND %d not OK:\n%s", i+1, resp)
 		}
 	}
-	mustOK("SELECT INBOX")
+	mustOK(t, "SELECT INBOX")
 
 	t.Run("unknown CTE", func(t *testing.T) {
 		for _, cmd := range []string{
@@ -101,7 +103,7 @@ func TestIMAP_FetchBinaryDecodesTransferEncodingOnly(t *testing.T) {
 			"FETCH 2 (FLAGS BINARY.PEEK[1]<0.4>)",
 			"UID FETCH 2 (BINARY.PEEK[1])",
 		} {
-			resp, tagged := do(cmd)
+			resp, tagged := do(t, cmd)
 			if !strings.Contains(tagged, " NO [UNKNOWN-CTE] ") {
 				t.Errorf("%s: want NO [UNKNOWN-CTE], got:\n%s", cmd, resp)
 			}
@@ -113,7 +115,7 @@ func TestIMAP_FetchBinaryDecodesTransferEncodingOnly(t *testing.T) {
 		}
 
 		// The request fails at the message that cannot be decoded.
-		resp, tagged := do("FETCH 1:3 (BINARY.SIZE[1])")
+		resp, tagged := do(t, "FETCH 1:3 (BINARY.SIZE[1])")
 		if !strings.Contains(tagged, " NO [UNKNOWN-CTE] ") || strings.Contains(resp, "* 2 FETCH") || strings.Contains(resp, "* 3 FETCH") {
 			t.Errorf("FETCH 1:3 (BINARY.SIZE[1]): want NO [UNKNOWN-CTE] at message 2, got:\n%s", resp)
 		}
@@ -122,15 +124,25 @@ func TestIMAP_FetchBinaryDecodesTransferEncodingOnly(t *testing.T) {
 	t.Run("text sent with CRLF", func(t *testing.T) {
 		const want = "BINARY[1] ~{14}\r\nline1\r\nline2\r\n BINARY.SIZE[1] 14)"
 		for _, cmd := range []string{"FETCH 1 (BINARY.PEEK[1] BINARY.SIZE[1])", "UID FETCH 1 (BINARY.PEEK[1] BINARY.SIZE[1])"} {
-			if resp := mustOK(cmd); !strings.Contains(resp, want) {
+			if resp := mustOK(t, cmd); !strings.Contains(resp, want) {
 				t.Errorf("%s: want %q in:\n%q", cmd, want, resp)
 			}
 		}
 	})
 
+	// RFC 2045 §1: MIME fields "can include RFC 822 comments, which have no
+	// semantic content and should be ignored during MIME processing", so the
+	// server knows how to decode "base64 (encoded)".
+	t.Run("comment in CTE ignored", func(t *testing.T) {
+		const want = "BINARY[1] ~{14}\r\nline1\r\nline2\r\n BINARY.SIZE[1] 14)"
+		if resp := mustOK(t, "FETCH 4 (BINARY.PEEK[1] BINARY.SIZE[1])"); !strings.Contains(resp, want) {
+			t.Errorf("want %q in:\n%q", want, resp)
+		}
+	})
+
 	t.Run("charset kept", func(t *testing.T) {
 		const want = "BINARY[1] ~{6}\r\ncaf\xe9\r\n BINARY.SIZE[1] 6)"
-		if resp := mustOK("FETCH 3 (BINARY.PEEK[1] BINARY.SIZE[1])"); !strings.Contains(resp, want) {
+		if resp := mustOK(t, "FETCH 3 (BINARY.PEEK[1] BINARY.SIZE[1])"); !strings.Contains(resp, want) {
 			t.Errorf("want %q in:\n%q", want, resp)
 		}
 	})
