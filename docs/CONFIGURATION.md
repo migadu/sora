@@ -190,6 +190,7 @@ so its failure is an ERROR record of the `[logging]` output, in its format.
 | `master_username` is set and `master_password` is empty | `server "<name>": master_username is set but master_password is empty; refusing to start ...` |
 | `master_sasl_username` is set and `master_sasl_password` is empty | `server "<name>": master_sasl_username is set but master_sasl_password is empty; refusing to start ...` |
 | `[[pool]]` blocks are inconsistent (see [section 10](#10-named-backend-pools-pool)) | `[[pool]]: ...` |
+| A proxy server (a type ending in `_proxy`) has no `remote_addrs` and the file has no `[[pool]]` blocks | `server '<name>': remote_addrs is required unless the file declares [[pool]] blocks` |
 | A server has `proxy_protocol = true` and `[servers] trusted_networks` is empty | `trusted_networks: proxy_protocol is enabled on server(s) <names> but [servers] trusted_networks is empty; ...` |
 | Two servers have the same `name` | `duplicate server name '<name>' found. Each server must have a unique name` |
 | Two servers have the same `addr` string | `duplicate server address '<addr>' found. Server '<a>' and '<b>' cannot bind to the same address` |
@@ -912,7 +913,7 @@ Read by the line proxies and `user_api_proxy`. See [PROXY.md](PROXY.md).
 
 | Key | Type | Default | Applies to | Meaning |
 |---|---|---|---|---|
-| `remote_addrs` | list of strings | none | proxies | Backends. Not allowed together with `[[pool]]` blocks. |
+| `remote_addrs` | list of strings | none | proxies | Backends. Required unless the file has `[[pool]]` blocks, and not allowed together with them. |
 | `remote_port` | integer or string | none | proxies | Port for backends written without one. |
 | `remote_tls` | bool | `false` | proxies | TLS to the backends (HTTPS for `user_api_proxy`). |
 | `remote_tls_use_starttls` | bool | `false` | line proxies | STARTTLS to the backends. Needs `remote_tls`. |
