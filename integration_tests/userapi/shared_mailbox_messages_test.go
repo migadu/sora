@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	imap "github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapclient"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
@@ -47,8 +48,8 @@ func apiDo(t *testing.T, ts *httptest.Server, client *http.Client, token, method
 	return resp.StatusCode, string(b)
 }
 
-// imapAppend appends msg to mailbox as the given user.
-func imapAppend(t *testing.T, addr, email, password, mailbox, msg string, create bool) {
+// imapAppend appends msg to mailbox as the given user, with flags if any.
+func imapAppend(t *testing.T, addr, email, password, mailbox, msg string, create bool, flags ...imap.Flag) {
 	t.Helper()
 	c, err := imapclient.DialInsecure(addr, nil)
 	if err != nil {
@@ -63,7 +64,11 @@ func imapAppend(t *testing.T, addr, email, password, mailbox, msg string, create
 			t.Fatalf("create %s: %v", mailbox, err)
 		}
 	}
-	ap := c.Append(mailbox, int64(len(msg)), nil)
+	var opts *imap.AppendOptions
+	if len(flags) > 0 {
+		opts = &imap.AppendOptions{Flags: flags}
+	}
+	ap := c.Append(mailbox, int64(len(msg)), opts)
 	if _, err := ap.Write([]byte(msg)); err != nil {
 		t.Fatalf("append write: %v", err)
 	}
@@ -76,13 +81,14 @@ func imapAppend(t *testing.T, addr, email, password, mailbox, msg string, create
 }
 
 type apiMessage struct {
-	ID      int64    `json:"id"`
-	Subject string   `json:"subject"`
-	From    string   `json:"from"`
-	To      []string `json:"to"`
-	Cc      []string `json:"cc"`
-	Bcc     []string `json:"bcc"`
-	Flags   []string `json:"flags"`
+	ID          int64    `json:"id"`
+	Subject     string   `json:"subject"`
+	From        string   `json:"from"`
+	To          []string `json:"to"`
+	Cc          []string `json:"cc"`
+	Bcc         []string `json:"bcc"`
+	Flags       []string `json:"flags"`
+	CustomFlags []string `json:"custom_flags"`
 }
 
 // findMessage decodes a list or search response and returns the message with subject.
@@ -136,30 +142,32 @@ func TestUserAPI_SharedMailbox_MessageByIDFollowsACL(t *testing.T) {
 	ts := newUserAPITestServer(t, rdb)
 	client := ts.Client()
 	token := h2Login(t, ts, client, granteeEmail, granteePassword)
-	grant := func(rights string) {
+	// grant and messageAt take the calling (sub)test's t: FailNow on the parent test
+	// from a subtest aborts the whole test and skips the remaining subtests.
+	grant := func(t *testing.T, rights string) {
 		t.Helper()
 		if err := rdb.GrantMailboxAccessByIdentifierWithRetry(ctx, ownerID, granteeEmail, shared, rights); err != nil {
 			t.Fatalf("grant %q: %v", rights, err)
 		}
 	}
 
-	grant("lr")
+	grant(t, "lr")
 	code, body := h2Get(t, ts, client, token, "/user/mailboxes/"+shared+"/messages")
 	if code != http.StatusOK {
 		t.Fatalf("list shared mailbox with 'lr': %d (%s)", code, body)
 	}
 	msgPath := fmt.Sprintf("/user/messages/%d", findMessage(t, body, subject).ID)
-	flagsOf := func() []string {
+	messageAt := func(t *testing.T, path string) apiMessage {
 		t.Helper()
-		code, body := h2Get(t, ts, client, token, msgPath)
+		code, body := h2Get(t, ts, client, token, path)
 		if code != http.StatusOK {
-			t.Fatalf("GET %s: %d (%s)", msgPath, code, body)
+			t.Fatalf("GET %s: %d (%s)", path, code, body)
 		}
 		var m apiMessage
 		if err := json.Unmarshal([]byte(body), &m); err != nil {
 			t.Fatalf("decode message: %v (%s)", err, body)
 		}
-		return m.Flags
+		return m
 	}
 
 	t.Run("read right opens the message", func(t *testing.T) {
@@ -176,30 +184,56 @@ func TestUserAPI_SharedMailbox_MessageByIDFollowsACL(t *testing.T) {
 			t.Errorf("DELETE with 'lr': %d (%s), want 403", code, body)
 		}
 
-		grant("lrw")
+		grant(t, "lrw")
 		// RFC 4314 §4: STORE SHOULD NOT fail if at least one flag may be modified;
 		// the others are left alone.
 		if code, body := apiDo(t, ts, client, token, "PATCH", msgPath, map[string]any{"add_flags": []string{`\Seen`, `\Flagged`}}); code != http.StatusOK {
 			t.Errorf("PATCH \\Seen \\Flagged with 'lrw': %d (%s), want 200", code, body)
 		}
-		if flags := flagsOf(); !slices.Contains(flags, `\Flagged`) || slices.Contains(flags, `\Seen`) {
+		if flags := messageAt(t, msgPath).Flags; !slices.Contains(flags, `\Flagged`) || slices.Contains(flags, `\Seen`) {
 			t.Errorf("flags after PATCH with 'lrw' = %v, want \\Flagged set and \\Seen not (no 's' right)", flags)
 		}
 		if code, body := apiDo(t, ts, client, token, "DELETE", msgPath, nil); code != http.StatusForbidden {
 			t.Errorf("DELETE with 'lrw': %d (%s), want 403 (no 't' right)", code, body)
 		}
 
-		grant("lrwt")
+		grant(t, "lrwt")
 		if code, body := apiDo(t, ts, client, token, "DELETE", msgPath, nil); code != http.StatusOK {
 			t.Errorf("DELETE with 'lrwt': %d (%s), want 200", code, body)
 		}
-		if flags := flagsOf(); !slices.Contains(flags, `\Deleted`) {
+		if flags := messageAt(t, msgPath).Flags; !slices.Contains(flags, `\Deleted`) {
 			t.Errorf("flags after DELETE = %v, want \\Deleted", flags)
 		}
 	})
 
+	// Without "w" no keyword changes, neither a requested one nor one the color rule
+	// would drop as a side effect: a color keyword on an unflagged message (IMAP
+	// +FLAGS leaves it) must survive a \Seen change by a grantee holding only "s".
+	t.Run("seen right alone leaves keywords as stored", func(t *testing.T) {
+		const colored = "shared-message-colored"
+		imapAppend(t, imapServer.Address, owner.Email, owner.Password, shared,
+			"From: owner@"+domain+"\r\nTo: team@"+domain+"\r\nSubject: "+colored+"\r\n\r\nbody\r\n", false, "$MailFlagBit0")
+		grant(t, "lrs")
+		code, body := h2Get(t, ts, client, token, "/user/mailboxes/"+shared+"/messages")
+		if code != http.StatusOK {
+			t.Fatalf("list shared mailbox with 'lrs': %d (%s)", code, body)
+		}
+		path := fmt.Sprintf("/user/messages/%d", findMessage(t, body, colored).ID)
+
+		if code, body := apiDo(t, ts, client, token, "PATCH", path, map[string]any{"add_flags": []string{`\Seen`, "$label1"}}); code != http.StatusOK {
+			t.Fatalf("PATCH \\Seen $label1 with 'lrs': %d (%s), want 200", code, body)
+		}
+		m := messageAt(t, path)
+		if !slices.Contains(m.Flags, `\Seen`) {
+			t.Errorf("flags after PATCH with 'lrs' = %v, want \\Seen", m.Flags)
+		}
+		if !slices.Contains(m.CustomFlags, "$MailFlagBit0") || slices.Contains(m.CustomFlags, "$label1") {
+			t.Errorf("keywords after PATCH with 'lrs' = %v, want $MailFlagBit0 kept and $label1 not added (no 'w' right)", m.CustomFlags)
+		}
+	})
+
 	t.Run("lookup right does not open the message", func(t *testing.T) {
-		grant("l")
+		grant(t, "l")
 		if code, body := h2Get(t, ts, client, token, msgPath); code != http.StatusNotFound || strings.Contains(body, subject) {
 			t.Errorf("GET %s with only 'l': %d (%s), want 404", msgPath, code, body)
 		}
