@@ -64,8 +64,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -572,22 +570,17 @@ func (db *Database) checkHostHealth(ctx context.Context, fm *FailoverManager, ho
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	actualHost := host.Host
-	if !strings.Contains(host.Host, ":") {
-		actualHost = fmt.Sprintf("%s:5432", host.Host)
-	}
-
 	// Build a connection string for the health check.
 	// This uses the credentials from the config but connects to the 'postgres'
-	// database with a short timeout. This is more secure and flexible than a
-	// hardcoded user/password/sslmode.
-	endpoint := fm.endpointConfig
-	sslMode := "disable"
-	if endpoint.TLSMode {
-		sslMode = "require"
+	// database with a short timeout.
+	connURL, err := EndpointURL(fm.endpointConfig, host.Host)
+	if err != nil {
+		fm.MarkHostUnhealthy(host.Host, fmt.Errorf("health check failed: %w", err))
+		return
 	}
-	connString := fmt.Sprintf("postgres://%s:%s@%s/postgres?sslmode=%s&connect_timeout=3",
-		endpoint.User, endpoint.Password, actualHost, sslMode)
+	connURL.Path = "/postgres"
+	connURL.RawQuery += "&connect_timeout=3"
+	connString := connURL.String()
 
 	conn, err := pgx.Connect(checkCtx, connString)
 	if err != nil {
@@ -607,6 +600,10 @@ func (db *Database) checkHostHealth(ctx context.Context, fm *FailoverManager, ho
 	// Host is healthy
 	fm.MarkHostHealthy(host.Host)
 }
+
+// ErrMigrationFailed wraps a NewDatabaseFromConfig error that came from running the
+// schema migrations, after the pools had connected.
+var ErrMigrationFailed = errors.New("database migration failed")
 
 // NewDatabaseFromConfig creates a new database connection with read/write split configuration
 func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig, runMigrations bool) (*Database, error) {
@@ -640,6 +637,9 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 			readPool = writePool
 			readFailover = writeFailover // Share the same failover manager
 		}
+	} else if dbConfig.ReadsShareWritePool {
+		readPool = writePool
+		readFailover = writeFailover
 	} else {
 		// If no read config specified, create a dedicated read pool pointing to the write database.
 		// This prevents read queries (UI/IMAP clients) from timing out due to connection pool starvation
@@ -670,7 +670,7 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 		}
 		if err := db.migrate(ctx, migrationTimeout); err != nil {
 			db.Close()
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", ErrMigrationFailed, err)
 		}
 	}
 
@@ -693,43 +693,14 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 			return nil, fmt.Errorf("failed to select host: %w", err)
 		}
 
-		// Handle host:port combination
-		actualHost := selectedHost
-		if !strings.Contains(selectedHost, ":") {
-			port := 5432 // Default PostgreSQL port
-			if endpoint.Port != nil {
-				var p int64
-				var parseErr error
-				switch v := endpoint.Port.(type) {
-				case string:
-					p, parseErr = strconv.ParseInt(v, 10, 32)
-					if parseErr != nil {
-						return nil, fmt.Errorf("invalid string for port: %q", v)
-					}
-				case int:
-					p = int64(v)
-				case int64:
-					p = v
-				default:
-					return nil, fmt.Errorf("invalid type for port: %T", v)
-				}
-				port = int(p)
-			}
-			if port <= 0 || port > 65535 {
-				return nil, fmt.Errorf("port number %d is out of the valid range (1-65535)", port)
-			}
-			actualHost = fmt.Sprintf("%s:%d", selectedHost, port)
+		connURL, err := EndpointURL(endpoint, selectedHost)
+		if err != nil {
+			return nil, err
 		}
-
-		sslMode := "disable"
-		if endpoint.TLSMode {
-			sslMode = "require"
-		}
-
 		// Add connect_timeout to fail fast on unreachable hosts (5 seconds)
 		// This prevents long waits when a database host is down
-		connString := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s&connect_timeout=5",
-			endpoint.User, endpoint.Password, actualHost, endpoint.Name, sslMode)
+		connURL.RawQuery += "&connect_timeout=5"
+		connString := connURL.String()
 
 		config, err := pgxpool.ParseConfig(connString)
 		if err != nil {
@@ -810,7 +781,7 @@ func createPoolFromEndpointWithFailover(ctx context.Context, endpoint *config.Da
 
 		// Connection successful
 		failoverManager.MarkHostHealthy(selectedHost)
-		logger.Info("Database: pool created successfully with failover", "pool_type", poolType, "host", actualHost)
+		logger.Info("Database: pool created successfully with failover", "pool_type", poolType, "host", connURL.Host)
 		return dbPool, nil
 	}
 

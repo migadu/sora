@@ -274,7 +274,7 @@ curl -X POST http://localhost:8081/user/mailboxes \
 **Notes:**
 - Use `/` separator for hierarchical mailboxes
 - Mailbox names are case-sensitive
-- Special characters should be URL-encoded in paths
+- In a path, percent-encode special characters in a name once (RFC 3986): `/` as `%2F`, a space as `%20`, `%` as `%25`. A `+` is a plus sign, not a space
 
 **Errors:**
 - `400 Bad Request` - Invalid mailbox name

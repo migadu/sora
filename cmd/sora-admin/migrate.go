@@ -146,30 +146,13 @@ func handleMigrateVersion(ctx context.Context) {
 	}
 	fs.Parse(os.Args[3:])
 
-	// Query schema_migrations directly instead of going through getMigrateInstance,
-	// which takes the migration leader lock and refuses while a migration runs.
-	// Checking the version must stay a plain read that is safe at any time.
-	dbCfg := globalConfig.Database.Write
-	if dbCfg == nil || len(dbCfg.Hosts) == 0 {
-		logger.Fatalf("Write database configuration is missing or has no hosts")
-	}
-
-	sslMode := "disable"
-	if dbCfg.TLSMode {
-		sslMode = "require"
-	}
-	connString := fmt.Sprintf("postgres://%s:%s@%s:%v/%s?sslmode=%s",
-		dbCfg.User, dbCfg.Password, dbCfg.Hosts[0], dbCfg.Port, dbCfg.Name, sslMode)
-
-	sqlDB, err := sql.Open("pgx", connString)
+	// Query schema_migrations directly instead of taking the migration leader lock.
+	// Checking the version stays a plain read that is safe while sora instances run.
+	sqlDB, err := openMigrationDB(ctx)
 	if err != nil {
-		logger.Fatalf("Failed to open database connection: %v", err)
-	}
-	defer sqlDB.Close()
-
-	if err := sqlDB.PingContext(ctx); err != nil {
 		logger.Fatalf("Failed to connect to database: %v", err)
 	}
+	defer sqlDB.Close()
 
 	var version int
 	var dirty bool
@@ -222,6 +205,28 @@ func handleMigrateForce(ctx context.Context) {
 	showVersion(m)
 }
 
+// openMigrationDB connects to the first write host using the server connection URL.
+func openMigrationDB(ctx context.Context) (*sql.DB, error) {
+	dbCfg := globalConfig.Database.Write
+	if dbCfg == nil || len(dbCfg.Hosts) == 0 {
+		return nil, errors.New("write database configuration is missing or has no hosts")
+	}
+	connURL, err := db.EndpointURL(dbCfg, dbCfg.Hosts[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid write database configuration: %w", err)
+	}
+
+	sqlDB, err := sql.Open("pgx", connURL.String())
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database connection: %w", err)
+	}
+	if err := sqlDB.PingContext(ctx); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+	return sqlDB, nil
+}
+
 // getMigrateInstance connects to the first [database.write] host and returns a
 // golang-migrate instance held under the migration leader lock (db.OpenMigrate): it
 // never runs alongside a starting sora instance's migrations, and it takes no
@@ -233,14 +238,12 @@ func getMigrateInstance(ctx context.Context) (*migrate.Migrate, io.Closer, error
 		return nil, nil, errors.New("write database configuration is missing or has no hosts")
 	}
 
-	sslMode := "disable"
-	if dbCfg.TLSMode {
-		sslMode = "require"
+	connURL, err := db.EndpointURL(dbCfg, dbCfg.Hosts[0])
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid write database configuration: %w", err)
 	}
-	connString := fmt.Sprintf("postgres://%s:%s@%s:%v/%s?sslmode=%s",
-		dbCfg.User, dbCfg.Password, dbCfg.Hosts[0], dbCfg.Port, dbCfg.Name, sslMode)
 
-	pool, err := pgxpool.New(ctx, connString)
+	pool, err := pgxpool.New(ctx, connURL.String())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create connection pool for migrations: %w", err)
 	}

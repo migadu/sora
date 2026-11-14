@@ -66,7 +66,7 @@ func startAdminAPI(t *testing.T, rdb *resilient.ResilientDatabase, trackers map[
 		Addr:               common.GetRandomAddress(t),
 		APIKey:             testAPIKey,
 		AllowedHosts:       []string{},
-		ConnectionTrackers: trackers,
+		ConnectionTrackers: func() map[string]*serverPkg.ConnectionTracker { return trackers },
 	}
 	for _, opt := range opts {
 		opt(&options)
