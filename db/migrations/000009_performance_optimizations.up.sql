@@ -25,9 +25,10 @@ ALTER TABLE mailbox_stats ADD COLUMN IF NOT EXISTS custom_flags_cache JSONB DEFA
 
 -- NOTE: nothing here fills the cache of existing mailboxes. Their rows stay NULL, the Go
 -- code falls back to the full scan for them, and the trigger below rebuilds a mailbox's
--- cache on its next custom-flag change. Migration 000024 later sets every cache still
--- NULL to '[]', after which keywords set before this migration, in a mailbox whose cache
--- was never rebuilt, are missing from the cache and from that mailbox's FLAGS.
+-- cache on its next custom-flag change. Migration 000024 later fills every cache still
+-- NULL from message_state. Before #613 it set them to '[]' instead, so on a database
+-- that ran that 000024, keywords set before this migration, in a mailbox whose cache was
+-- never rebuilt, are missing from the cache and from that mailbox's FLAGS.
 
 -- Trigger function to maintain custom_flags_cache when message flags change
 CREATE OR REPLACE FUNCTION maintain_custom_flags_cache()
