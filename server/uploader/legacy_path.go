@@ -17,8 +17,17 @@ func CheckLegacyStaging(path, newDefault, legacyPath string) error {
 	if filepath.Clean(path) != filepath.Clean(newDefault) {
 		return nil
 	}
+	// The uploader followed a symlinked directory (one way to have kept the /tmp default
+	// on persistent storage), and WalkDir does not: walk its target.
+	root, err := filepath.EvalSymlinks(legacyPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cannot check %s for bodies staged under the previous default [uploader] path: %w", legacyPath, err)
+	}
 	found := ""
-	err := filepath.WalkDir(legacyPath, func(p string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}

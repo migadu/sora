@@ -52,3 +52,38 @@ func TestCheckLegacyStaging(t *testing.T) {
 		t.Errorf("path set to the legacy directory itself: %v", err)
 	}
 }
+
+// TestCheckLegacyStagingFollowsSymlink: an administrator who kept the /tmp default on
+// persistent storage did it with a symlink (/tmp/sora/uploads -> /data/uploads). The
+// uploader followed it, so the bodies behind it are just as stranded by the new default.
+func TestCheckLegacyStagingFollowsSymlink(t *testing.T) {
+	root := t.TempDir()
+	newDefault := filepath.Join(root, "spool", "uploads")
+	target := filepath.Join(root, "data", "uploads")
+	legacy := filepath.Join(root, "tmp", "uploads")
+
+	if err := os.MkdirAll(filepath.Join(target, "42"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "42", strings.Repeat("a", 64)), []byte("staged"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, legacy); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CheckLegacyStaging(newDefault, newDefault, legacy); err == nil {
+		t.Fatal("legacy directory is a symlink to staged bodies: want an error, got nil")
+	}
+
+	// A dangling symlink holds nothing.
+	if err := os.RemoveAll(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckLegacyStaging(newDefault, newDefault, legacy); err != nil {
+		t.Errorf("dangling legacy symlink: %v", err)
+	}
+}
