@@ -3,6 +3,7 @@ package adminapi
 import (
 	"errors"
 	"net/http"
+	"slices"
 
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/logger"
@@ -17,6 +18,9 @@ import (
 func (s *Server) handlePurgeAccount(w http.ResponseWriter, r *http.Request, email string) {
 	ctx := r.Context()
 
+	// The IDs the account's sessions can be held under, as an account delete resolves
+	// them; the account ID the request names on the primary is added below.
+	accountIDs := s.trackedAccountIDs(ctx, email)
 	accountID, requestedAt, err := s.rdb.RequestAccountPurgeWithRetry(ctx, email)
 	if err != nil {
 		if errors.Is(err, server.ErrInvalidAddress) {
@@ -35,7 +39,10 @@ func (s *Server) handlePurgeAccount(w http.ResponseWriter, r *http.Request, emai
 	// Before any data goes: an open session could otherwise keep writing into the
 	// account while it is being emptied. Through gossiping trackers this reaches the
 	// whole cluster.
-	s.endAccountSessions(accountID, email)
+	if !slices.Contains(accountIDs, accountID) {
+		accountIDs = append(accountIDs, accountID)
+	}
+	s.endAccountSessions(accountIDs, email)
 
 	if s.purgeWorker != nil {
 		s.purgeWorker.Wake()

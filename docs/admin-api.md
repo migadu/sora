@@ -539,6 +539,13 @@ the cluster, where each node ends the account's sessions within seconds and drop
 logins. `user_email` is required; `protocol` (IMAP, POP3, ManageSieve or LMTP, any case) limits
 the kick to the trackers of that protocol.
 
+The account is kicked by its database account ID and by the ID derived from each of its
+addresses: a proxy keys a session that remote lookup authenticated by the ID derived from the
+address the lookup answered, also when the database holds the account. An address the database
+does not know (a lookup service's own account) is kicked by the ID derived from it. Ending the
+sessions of a deleted or purged account, and dropping cached logins after a password change or
+a removed credential, use the same IDs.
+
 **Request Body:**
 ```json
 {
@@ -560,6 +567,7 @@ the kick to the trackers of that protocol.
 **Errors:**
 - `400 Bad Request`: `user_email` is missing
 - `404 Not Found`: no tracker on this node serves the requested `protocol`
+- `500 Internal Server Error`: the database cannot resolve the address; nothing was kicked, retry
 - `503 Service Unavailable`: this node has no connection trackers
 
 **Example (Kick all connections for a user):**
