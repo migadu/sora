@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/managesieve"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
 )
 
 // max_connections_per_user was counted but not enforced on the ManageSieve
@@ -99,14 +101,49 @@ func TestManageSieve_MaxConnectionsPerUserRefusalMetrics(t *testing.T) {
 	errChan := make(chan error, 1)
 	go srv.Start(errChan)
 	t.Cleanup(srv.Close)
-	time.Sleep(100 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		select {
+		case err := <-errChan:
+			t.Fatalf("ManageSieve startup: %v", err)
+		default:
+		}
+		conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		conn.Close()
+		return true
+	}, 5*time.Second, 10*time.Millisecond, "ManageSieve listener did not become ready")
 
 	succ := metrics.AuthenticationAttempts.WithLabelValues("managesieve", name, "localhost", "success")
 	fail := metrics.AuthenticationAttempts.WithLabelValues("managesieve", name, "localhost", "failure")
 
 	const ip = "198.51.100.10"
+	checkDelta := func(name string, wantSuccess, wantFailure float64, fn func()) {
+		t.Helper()
+		s0, f0 := testutil.ToFloat64(succ), testutil.ToFloat64(fail)
+		fn()
+		if ds, df := testutil.ToFloat64(succ)-s0, testutil.ToFloat64(fail)-f0; ds != wantSuccess || df != wantFailure {
+			t.Errorf("%s metric deltas = (success=%v, failure=%v), want (%v, %v)", name, ds, df, wantSuccess, wantFailure)
+		}
+	}
+	// Positive controls keep the zero-delta refusals below from passing if
+	// authentication metrics stop being emitted altogether or count twice.
+	wrong := account
+	wrong.Password = "wrong-password"
+	checkDelta("bad AUTHENTICATE PLAIN", 0, 1, func() {
+		if resp := dialProxiedManageSieve(t, address, ip).tryLogin(wrong); !strings.HasPrefix(resp, "NO") {
+			t.Fatalf("bad AUTHENTICATE PLAIN = %q, want NO", resp)
+		}
+	})
+	checkDelta("bad LOGIN", 0, 1, func() {
+		resp := dialProxiedManageSieve(t, address, ip).do(fmt.Sprintf("LOGIN %q %q", wrong.Email, wrong.Password))
+		if !strings.HasPrefix(resp, "NO") {
+			t.Fatalf("bad LOGIN = %q, want NO", resp)
+		}
+	})
 	first := dialProxiedManageSieve(t, address, ip)
-	first.login(account)
+	checkDelta("admitted AUTHENTICATE PLAIN", 1, 0, func() { first.login(account) })
 
 	// Refused AUTHENTICATE PLAIN
 	s0, f0 := testutil.ToFloat64(succ), testutil.ToFloat64(fail)
