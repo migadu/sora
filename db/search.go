@@ -370,16 +370,19 @@ func (db *Database) buildSortOrderClauseWithPrefix(sortCriteria []imap.SortCrite
 		case imap.SortKeySize:
 			orderField = fmt.Sprintf("%ssize", colPrefix)
 		case imap.SortKeyDisplayFrom:
-			// DISPLAYFROM: Use display name if available, fallback to email (RFC 5256)
-			orderField = fmt.Sprintf("COALESCE(%sfrom_name_sort, %sfrom_email_sort)", colPrefix, colPrefix)
+			// DISPLAYFROM: the display name, or the address when the name is empty (RFC 5957
+			// §3). sortColumnsFor stores a missing name as '', not NULL, hence the NULLIF;
+			// the COALESCE also covers a NULL name.
+			orderField = fmt.Sprintf("COALESCE(NULLIF(%sfrom_name_sort, ''), %sfrom_email_sort)", colPrefix, colPrefix)
 		case imap.SortKeyFrom:
 			// FROM: sort by addr-mailbox (the local part) per RFC 5256 §3, not the
 			// full local@domain address. The stored column keeps the full email
 			// (DISPLAYFROM needs it); take the local part at sort time.
 			orderField = fmt.Sprintf("split_part(%sfrom_email_sort, '@', 1)", colPrefix)
 		case imap.SortKeyDisplayTo:
-			// DISPLAYTO: Use display name if available, fallback to email (RFC 5957)
-			orderField = fmt.Sprintf("COALESCE(%sto_name_sort, %sto_email_sort)", colPrefix, colPrefix)
+			// DISPLAYTO: as DISPLAYFROM. to_name_sort is also NULL on rows written before
+			// migration 000006.
+			orderField = fmt.Sprintf("COALESCE(NULLIF(%sto_name_sort, ''), %sto_email_sort)", colPrefix, colPrefix)
 		case imap.SortKeyTo:
 			// TO: sort by addr-mailbox (local part) per RFC 5256 §3.
 			orderField = fmt.Sprintf("split_part(%sto_email_sort, '@', 1)", colPrefix)
