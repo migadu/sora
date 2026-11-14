@@ -3103,13 +3103,25 @@ func LoadServerConfig(configPath string, cfg *Config) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if !md.IsDefined("database", "write") {
+	if !hasTOMLPathFold(md, "database", "write") {
 		cfg.Database.Write = nil
 	}
-	if !md.IsDefined("database", "read") {
+	if !hasTOMLPathFold(md, "database", "read") {
 		cfg.Database.Read = nil
 	}
 	return err
+}
+
+func hasTOMLPathFold(md toml.MetaData, p1, p2 string) bool {
+	if md.IsDefined(p1, p2) {
+		return true
+	}
+	for _, k := range md.Keys() {
+		if len(k) >= 2 && strings.EqualFold(k[0], p1) && strings.EqualFold(k[1], p2) {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadConfigFromFileWithMetadata is LoadConfigFromFile that also returns the file's TOML
