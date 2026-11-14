@@ -1107,7 +1107,8 @@ func (c *RemoteLookupConfig) GetRemotePort() (int, error) {
 	return int(p), nil
 }
 
-// ServerLimitsConfig holds resource limits for a server
+// ServerLimitsConfig holds resource limits for a server. serverLimitKeys lists the
+// server types that apply each one.
 type ServerLimitsConfig struct {
 	SearchRateLimitPerMin *int   `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled, default: 60)
 	SearchRateLimitWindow string `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
@@ -2620,6 +2621,15 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	if s.ReadOnlyAPIKey != "" && s.Type != "http_admin_api" {
 		logger("WARNING: Server %s (type: %s) has 'read_only_api_key' configured, but this only applies to http_admin_api servers", s.Name, s.Type)
 	}
+	// Only these filter clients by address. Every other type, the User API proxy
+	// included, serves every client whatever the list says.
+	if len(s.AllowedHosts) > 0 {
+		switch s.Type {
+		case "metrics", "http_admin_api", "http_user_api":
+		default:
+			logger("WARNING: Server %s (type: %s) has 'allowed_hosts' configured, but this only applies to metrics, http_admin_api and http_user_api servers; it does not restrict which clients this server accepts", s.Name, s.Type)
+		}
+	}
 	if s.TLSUseStartTLS {
 		switch s.Type {
 		case "imap", "lmtp", "managesieve", "pop3", "imap_proxy", "lmtp_proxy", "managesieve_proxy", "pop3_proxy":
@@ -2639,6 +2649,13 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	}
 	if s.Timeouts != nil && s.Timeouts.SchedulerShardCount != 0 {
 		logger("WARNING: Server %s (type: %s) has 'timeouts.scheduler_shard_count' configured, but it has no effect: all servers share one timeout scheduler, sized by [timeout_scheduler] shard_count", s.Name, s.Type)
+	}
+	if s.Limits != nil {
+		for _, k := range serverLimitKeys {
+			if k.set(s.Limits) && !slices.Contains(k.appliedBy, s.Type) {
+				logger("WARNING: Server %s (type: %s) has 'limits.%s' configured, but only %s servers apply it", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "))
+			}
+		}
 	}
 
 	// Check proxy-only options on non-proxy servers
@@ -2700,8 +2717,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		s.warnKeysNotApplied(logger, "the LMTP server does not apply it",
 			configKey{"timeouts.absolute_session_timeout", s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != ""},
 			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0},
-			configKey{"auth_idle_timeout", s.AuthIdleTimeout != ""},
-			configKey{"limits.session_memory_limit", s.Limits != nil && s.Limits.SessionMemoryLimit != ""})
+			configKey{"auth_idle_timeout", s.AuthIdleTimeout != ""})
 		// MTAs deliver many messages at once from few addresses.
 		s.warnKeysNotApplied(logger, "the LMTP server limits only its total connections (max_connections)",
 			configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
@@ -2778,6 +2794,12 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP and POP3 proxy servers", s.Name, s.Type)
 		}
 
+	case "user_api_proxy":
+		// An HTTP request is not a logged-in session: nothing counts connections per user.
+		s.warnKeysNotApplied(logger, "the User API proxy limits only its total connections and those per IP (max_connections, max_connections_per_ip)",
+			configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
+
 	case "metrics", "http_admin_api", "http_user_api":
 		// HTTP servers - warn about protocol-specific options
 		if len(s.SupportedExtensions) > 0 {
@@ -2788,6 +2810,21 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.AppendLimit != "" {
 			logger("WARNING: Server %s (type: %s) has 'append_limit' configured, but this only applies to IMAP servers", s.Name, s.Type)
+		}
+		// An HTTP request is not a logged-in session, so nothing counts connections
+		// per user. The Admin and User APIs cap their total connections, the metrics
+		// listener none.
+		if s.Type == "metrics" {
+			s.warnKeysNotApplied(logger, "the metrics server does not limit its connections",
+				configKey{"max_connections", s.MaxConnections != 0},
+				configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+				configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+				configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
+		} else {
+			s.warnKeysNotApplied(logger, "this server type limits only its total connections (max_connections)",
+				configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+				configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+				configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 		}
 		if s.Type == "metrics" && s.TLS {
 			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)
@@ -2804,6 +2841,33 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			}
 		}
 	}
+}
+
+// serverLimitKeys is every [server.limits] key with the server types whose start
+// functions read it. Every type accepts every key; WarnUnusedConfigOptions reports
+// one set on a type not listed. A new limits key belongs here.
+var serverLimitKeys = []struct {
+	name      string
+	set       func(*ServerLimitsConfig) bool
+	appliedBy []string
+}{
+	// The IMAP backend's search rate limiter, THREAD cap and FETCH PREVIEW budgets.
+	{"search_rate_limit_per_min", func(l *ServerLimitsConfig) bool { return l.SearchRateLimitPerMin != nil }, []string{"imap"}},
+	{"search_rate_limit_window", func(l *ServerLimitsConfig) bool { return l.SearchRateLimitWindow != "" }, []string{"imap"}},
+	{"search_rate_limit_burst", func(l *ServerLimitsConfig) bool { return l.SearchRateLimitBurst != nil }, []string{"imap"}},
+	{"thread_max_messages", func(l *ServerLimitsConfig) bool { return l.ThreadMaxMessages != 0 }, []string{"imap"}},
+	{"preview_s3_per_min", func(l *ServerLimitsConfig) bool { return l.PreviewS3PerMin != nil }, []string{"imap"}},
+	{"preview_s3_burst", func(l *ServerLimitsConfig) bool { return l.PreviewS3Burst != nil }, []string{"imap"}},
+	{"preview_s3_node_per_min", func(l *ServerLimitsConfig) bool { return l.PreviewS3NodePerMin != nil }, []string{"imap"}},
+	{"preview_s3_max_size", func(l *ServerLimitsConfig) bool { return l.PreviewS3MaxSize != "" }, []string{"imap"}},
+	// The session memory tracker.
+	{"session_memory_limit", func(l *ServerLimitsConfig) bool { return l.SessionMemoryLimit != "" }, []string{"imap", "pop3"}},
+	// The login proxies' cap on protocol errors before authentication (wrong passwords do not count).
+	{"max_auth_errors", func(l *ServerLimitsConfig) bool { return l.MaxAuthErrors != 0 }, []string{"imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+	// Sieve on delivery: LMTP and the Admin API's /admin/mail/deliver.
+	{"redirect_rate_limit", func(l *ServerLimitsConfig) bool { return l.RedirectRateLimit != nil }, []string{"lmtp", "http_admin_api"}},
+	{"redirect_rate_window", func(l *ServerLimitsConfig) bool { return l.RedirectRateWindow != "" }, []string{"lmtp", "http_admin_api"}},
+	{"max_redirect_hops", func(l *ServerLimitsConfig) bool { return l.MaxRedirectHops != nil }, []string{"lmtp", "http_admin_api"}},
 }
 
 // configKey is a server setting by its TOML key, and whether the block sets it.
@@ -2864,6 +2928,93 @@ func (c *Config) ProxyProtocolListenersMissingTrust() []string {
 func (c *Config) ValidateTrustedNetworks() error {
 	_, err := helpers.ParseTrustedNetworks(c.Servers.TrustedNetworks)
 	return err
+}
+
+// HasMailBackend reports whether an enabled server stores mail (imap, lmtp, pop3). Such a
+// node runs the upload worker, the cleaner and the local cache, so it reads [uploader]
+// and [cleanup].
+func (c *Config) HasMailBackend() bool {
+	for _, s := range c.GetAllServers() {
+		if s.Type == "imap" || s.Type == "lmtp" || s.Type == "pop3" {
+			return true
+		}
+	}
+	return false
+}
+
+// Problem is one reason Validate refuses a file: the part of the file it is about, as
+// an operator finds it ("server 'imap'", "[relay]", "trusted_networks"), and what is
+// wrong there.
+type Problem struct {
+	Section string
+	Err     error
+}
+
+// Validate runs the shared configuration checks used by sora before service setup and
+// by `sora-admin config validate`, returning every problem these checks find.
+//
+// What a node does not run is not checked: [uploader] and [cleanup] only with a mail
+// backend. Service setup still checks required database and S3 settings, S3 timeout,
+// external connectivity and the node's disk; passing Validate does not check those.
+func (c *Config) Validate() []Problem {
+	var problems []Problem
+	add := func(section string, err error) {
+		if err != nil {
+			problems = append(problems, Problem{Section: section, Err: err})
+		}
+	}
+
+	servers := c.GetAllServers()
+	for i := range servers {
+		add(fmt.Sprintf("server '%s'", servers[i].Name), servers[i].Validate())
+	}
+
+	// Named backend pools are validated as a whole: the checks cross the [[pool]] blocks
+	// and the proxy servers that route into them.
+	add("[[pool]]", c.ValidatePools())
+	add("[relay]", c.Relay.Validate())
+	// One malformed trusted_networks entry would leave LMTP admission with no peers.
+	add("trusted_networks", c.ValidateTrustedNetworks())
+	add("[shared_mailboxes]", c.SharedMailboxes.Validate())
+
+	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
+	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
+	if missing := c.ProxyProtocolListenersMissingTrust(); len(missing) > 0 {
+		add("trusted_networks", fmt.Errorf("proxy_protocol is enabled on server(s) %s but [servers] trusted_networks is empty; "+
+			"set trusted_networks to your trusted proxy IPs/CIDRs (otherwise any client could spoof its "+
+			"source IP via a PROXY header)", strings.Join(missing, ", ")))
+	}
+
+	// A block without a name or addr is reported by its own Validate above.
+	names := make(map[string]bool)
+	addrs := make(map[string]string) // addr -> server name
+	for _, s := range servers {
+		if s.Name != "" {
+			if names[s.Name] {
+				add("server configuration", fmt.Errorf("duplicate server name '%s' found. Each server must have a unique name", s.Name))
+			}
+			names[s.Name] = true
+		}
+		if s.Addr != "" {
+			if other, exists := addrs[s.Addr]; exists {
+				add("server configuration", fmt.Errorf("duplicate server address '%s' found. Server '%s' and '%s' cannot bind to the same address", s.Addr, other, s.Name))
+			} else {
+				addrs[s.Addr] = s.Name
+			}
+		}
+	}
+	if len(servers) == 0 {
+		add("servers", fmt.Errorf("no servers configured. Please configure at least one server in a [[server]] section"))
+	}
+
+	if c.HasMailBackend() {
+		// The cleaner and the upload worker both take [uploader] max_attempts.
+		add("[uploader]", c.Uploader.Validate())
+		// The cleaner and delivery both take [cleanup] fts_retention.
+		add("[cleanup]", c.Cleanup.Validate())
+	}
+
+	return problems
 }
 
 // broadPrivateRanges are the full RFC1918 / IPv6-ULA / link-local supernets. Trusting any

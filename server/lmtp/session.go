@@ -776,7 +776,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			s.backend.redirectRateWindow,
 			s.backend.maxRedirectHops,
 		)
-		defaultResult, defaultEvalErr := defaultSieveExecutor.Evaluate(ctx, sieveCtx)
+		defaultResult, defaultEvalErr := defaultSieveExecutor.Evaluate(readCtx, sieveCtx)
 		if defaultEvalErr != nil {
 			metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
 			s.WarnLog("default sieve script evaluation error", "error", defaultEvalErr)
@@ -812,7 +812,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				s.backend.redirectRateWindow,
 				s.backend.maxRedirectHops,
 			)
-			userResult, userEvalErr := userSieveExecutor.Evaluate(ctx, sieveCtx)
+			userResult, userEvalErr := userSieveExecutor.Evaluate(readCtx, sieveCtx)
 			if userEvalErr != nil {
 				metrics.SieveExecutions.WithLabelValues("lmtp", "failure").Inc()
 				s.WarnLog("user sieve script evaluation error", "error", userEvalErr)
@@ -880,7 +880,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// a discarded one included, and after the header edits, which it has to see
 	// (RFC 5293 §7).
 	if result.Vacation != nil {
-		if err := s.handleVacationResponse(ctx, *result.Vacation, messageContent); err != nil {
+		if err := s.handleVacationResponse(readCtx, *result.Vacation, messageContent); err != nil {
 			s.DebugLog("error handling vacation response", "error", err)
 			// Continue processing even if vacation response fails
 		}
@@ -951,7 +951,10 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 					Message:      "Insufficient system storage, please try again later",
 				}
 			}
-			return s.InternalError("failed to save message to disk: %v", err)
+			// The error names spool files, and the reply text reaches the sending MTA
+			// (and can end up in a bounce): log it and answer with the cause only.
+			s.WarnLog("failed to save message to disk", "error", err)
+			return s.InternalError("failed to save message to disk: %v", helpers.FileErrorCause(err))
 		}
 		s.DebugLog("message accepted locally", "path", *filePath)
 	} else if err == nil {
@@ -967,7 +970,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	} else {
 		// Stat error (permission issue, etc.)
 		recordMetrics("failure")
-		return s.InternalError("failed to check file existence: %v", err)
+		s.WarnLog("failed to check file existence", "error", err)
+		return s.InternalError("failed to check file existence: %v", helpers.FileErrorCause(err))
 	}
 
 	if relayAfterStaging {
@@ -1255,6 +1259,9 @@ func (s *LMTPSession) notifyRelayWorker() {
 // all live there. The send decision and per-sender rate-limiting are handled upstream
 // by the Sieve engine's VacationOracle.
 func (s *LMTPSession) handleVacationResponse(ctx context.Context, reply sieveengine.VacationReply, originalMessage *message.Entity) error {
+	if s.useMasterDB {
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	}
 	handler := &delivery.StandardVacationHandler{
 		Hostname:          s.HostName,
 		RelayQueue:        s.backend.relayQueue,
