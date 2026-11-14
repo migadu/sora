@@ -75,6 +75,7 @@ type Server struct {
 	// instanceID is the upload-lease key (pending_uploads.instance_id), distinct from
 	// hostname, which is the SMTP-visible name stamped into Received headers.
 	instanceID         string
+	uploadMaxAttempts  int // [uploader] max_attempts: the uploader endpoints' default failure threshold
 	ftsRetention       time.Duration
 	affinityManager    AffinityManager
 	validBackends      map[string][]string
@@ -109,6 +110,7 @@ type ServerOptions struct {
 	AllowedHosts       []string
 	Cache              *cache.Cache
 	Uploader           *uploader.UploadWorker
+	UploadMaxAttempts  int // [uploader] max_attempts, when the uploader endpoints count an upload as failed; 0 -> config default
 	Storage            *storage.S3Storage
 	PurgeWorker        *cleaner.PurgeWorker // woken when a purge is requested on this node; nil without object storage
 	RelayQueue         delivery.RelayQueue  // Global relay queue for mail delivery
@@ -275,6 +277,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		tlsVerify:          options.TLSVerify,
 		hostname:           options.Hostname,
 		instanceID:         options.InstanceID,
+		uploadMaxAttempts:  options.UploadMaxAttempts,
 		maintenanceGate:    options.MaintenanceGate,
 		ftsRetention:       options.FTSRetention,
 		affinityManager:    options.AffinityManager,
@@ -288,6 +291,9 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		maxRedirectHops:    options.MaxRedirectHops,
 		sieveExtensions:    sieveengine.EffectiveExtensions(options.SieveExtensions),
 		sharedMailboxes:    options.SharedMailboxes,
+	}
+	if s.uploadMaxAttempts <= 0 {
+		s.uploadMaxAttempts = config.DefaultUploaderMaxAttempts
 	}
 	s.settings.Store(&reloadableSettings{
 		apiKey:         options.APIKey,
@@ -1861,7 +1867,7 @@ func (s *Server) handleUploaderStatus(w http.ResponseWriter, r *http.Request) {
 	showFailedStr := r.URL.Query().Get("show_failed")
 	maxAttemptsStr := r.URL.Query().Get("max_attempts")
 
-	maxAttempts := 5 // Default value
+	maxAttempts := s.uploadMaxAttempts // the uploader gives up after this many
 	if maxAttemptsStr != "" {
 		if ma, err := strconv.Atoi(maxAttemptsStr); err == nil && ma > 0 {
 			maxAttempts = ma
@@ -1911,7 +1917,7 @@ func (s *Server) handleFailedUploads(w http.ResponseWriter, r *http.Request) {
 	maxAttemptsStr := r.URL.Query().Get("max_attempts")
 	limitStr := r.URL.Query().Get("limit")
 
-	maxAttempts := 5 // Default value
+	maxAttempts := s.uploadMaxAttempts // the uploader gives up after this many
 	if maxAttemptsStr != "" {
 		if ma, err := strconv.Atoi(maxAttemptsStr); err == nil && ma > 0 {
 			maxAttempts = ma

@@ -465,6 +465,30 @@ type UploaderConfig struct {
 	MaxStagingSize     string `toml:"max_staging_size"`     // Maximum size of the global upload staging queue (e.g. "100gb"). If set and exceeded, new appends are rejected.
 }
 
+// DefaultUploaderMaxAttempts is [uploader] max_attempts when the key is absent.
+const DefaultUploaderMaxAttempts = 20
+
+// Validate rejects [uploader] settings that stop or crash the upload worker:
+// batch_size, concurrency and max_attempts must be positive. A zero concurrency
+// blocks the worker (and its instance heartbeat) for good, a negative one panics,
+// a zero batch_size leases nothing and a negative one is refused by PostgreSQL,
+// and max_attempts <= 0 leases nothing and fails the cleaner's failed-upload pass.
+func (c *UploaderConfig) Validate() error {
+	for _, f := range []struct {
+		key   string
+		value int
+	}{
+		{"batch_size", c.BatchSize},
+		{"concurrency", c.Concurrency},
+		{"max_attempts", c.MaxAttempts},
+	} {
+		if f.value <= 0 {
+			return fmt.Errorf("[uploader] %s must be positive, got %d", f.key, f.value)
+		}
+	}
+	return nil
+}
+
 // GetRetryInterval parses the retry interval duration
 func (c *UploaderConfig) GetRetryInterval() (time.Duration, error) {
 	if c.RetryInterval == "" {
@@ -1375,7 +1399,7 @@ func NewDefaultConfig() Config {
 			Path:          "/tmp/sora/uploads",
 			BatchSize:     10,
 			Concurrency:   20,
-			MaxAttempts:   20,
+			MaxAttempts:   DefaultUploaderMaxAttempts,
 			RetryInterval: "30s",
 		},
 	}
