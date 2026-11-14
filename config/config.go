@@ -32,6 +32,23 @@ type ClientCapabilityFilter struct {
 	Reason          string   `toml:"reason"`           // Human-readable reason for the filter
 }
 
+// Validate reports the first pattern of the filter that does not compile. The IMAP
+// server skips such a filter, so the capabilities it names stay advertised.
+func (f ClientCapabilityFilter) Validate() error {
+	if _, err := regexp.Compile(f.ClientName); err != nil {
+		return fmt.Errorf("client_name %q: %w", f.ClientName, err)
+	}
+	if _, err := regexp.Compile(f.ClientVersion); err != nil {
+		return fmt.Errorf("client_version %q: %w", f.ClientVersion, err)
+	}
+	for _, pattern := range f.JA4Fingerprints {
+		if _, err := regexp.Compile(pattern); err != nil {
+			return fmt.Errorf("ja4_fingerprints %q: %w", pattern, err)
+		}
+	}
+	return nil
+}
+
 // DatabaseEndpointConfig holds configuration for a single database endpoint
 type DatabaseEndpointConfig struct {
 	// List of database hosts for runtime failover/load balancing
@@ -2716,6 +2733,16 @@ func (s *ServerConfig) Validate() error {
 	if (s.Type == "lmtp" || s.Type == "http_admin_api") && s.Limits != nil && s.Limits.RedirectRateWindow != "" {
 		if window, err := helpers.ParseDuration(s.Limits.RedirectRateWindow); err == nil && window <= 0 {
 			return fmt.Errorf("server %q: limits.redirect_rate_window must be positive, got %q (set limits.redirect_rate_limit = 0 to disable the limit)", s.Name, s.Limits.RedirectRateWindow)
+		}
+	}
+
+	// Only the IMAP backend reads client_filters. It would skip a filter whose pattern
+	// does not compile and keep advertising what the filter hides.
+	if s.Type == "imap" {
+		for i, filter := range s.ClientFilters {
+			if err := filter.Validate(); err != nil {
+				return fmt.Errorf("server %q: client_filters #%d: %w", s.Name, i+1, err)
+			}
 		}
 	}
 

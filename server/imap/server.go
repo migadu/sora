@@ -684,16 +684,18 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		s.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
-	// Pre-compile regex patterns for capability filters for performance and correctness
+	// Pre-compile regex patterns for capability filters for performance and correctness.
+	// Config validation refuses a pattern that does not compile; a server built
+	// without it skips the filter, which must not go unnoticed at the default level.
 	validFilters := make([]ClientCapabilityFilter, 0, len(options.CapabilityFilters))
-	for _, configFilter := range options.CapabilityFilters {
+	for i, configFilter := range options.CapabilityFilters {
 		filter := ClientCapabilityFilter{ClientCapabilityFilter: configFilter}
 		isValid := true
 
 		if filter.ClientName != "" {
 			re, err := regexp.Compile(filter.ClientName)
 			if err != nil {
-				logger.Debug("IMAP: WARNING - invalid client_name regex in capability filter, skipping", "name", name, "pattern", filter.ClientName, "error", err)
+				logger.Warn("IMAP: Skipping client_filters entry, its client_name is not a valid regular expression", "name", name, "entry", i+1, "pattern", filter.ClientName, "error", err)
 				isValid = false
 			} else {
 				filter.clientNameRegexp = re
@@ -702,7 +704,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		if filter.ClientVersion != "" && isValid {
 			re, err := regexp.Compile(filter.ClientVersion)
 			if err != nil {
-				logger.Debug("IMAP: WARNING - invalid client_version regex in capability filter, skipping", "name", name, "pattern", filter.ClientVersion, "error", err)
+				logger.Warn("IMAP: Skipping client_filters entry, its client_version is not a valid regular expression", "name", name, "entry", i+1, "pattern", filter.ClientVersion, "error", err)
 				isValid = false
 			} else {
 				filter.clientVersionRegexp = re
@@ -714,7 +716,7 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 			for _, pattern := range filter.JA4Fingerprints {
 				re, err := regexp.Compile(pattern)
 				if err != nil {
-					logger.Debug("IMAP: WARNING - invalid ja4_fingerprints regex in capability filter, skipping", "name", name, "pattern", pattern, "error", err)
+					logger.Warn("IMAP: Skipping client_filters entry, one of its ja4_fingerprints is not a valid regular expression", "name", name, "entry", i+1, "pattern", pattern, "error", err)
 					isValid = false
 					break
 				}
