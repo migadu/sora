@@ -237,3 +237,20 @@ func TestRelayRequeueDoesNotCreateTheQueue(t *testing.T) {
 		}
 	}
 }
+
+// Opening an incomplete existing queue must not create a root-owned processing directory.
+func TestRelayRequeueDoesNotRepairAnIncompleteQueue(t *testing.T) {
+	queuePath := t.TempDir()
+	for _, dir := range []string{"failed", "pending"} {
+		if err := os.Mkdir(filepath.Join(queuePath, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := relayCommand(t, queuePath, "", "requeue", "--id", "all", "--confirm").CombinedOutput()
+	if err == nil {
+		t.Errorf("requeue on an incomplete queue succeeded:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(queuePath, "processing")); !os.IsNotExist(err) {
+		t.Fatalf("requeue created processing/ (stat: %v)\n%s", err, out)
+	}
+}

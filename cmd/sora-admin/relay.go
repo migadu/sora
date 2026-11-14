@@ -366,9 +366,15 @@ func handleRelayRequeue(_ context.Context) {
 	// would belong to root, where the server, running as its own user, cannot queue:
 	// requeue only works on a queue the server has made.
 	queuePath := cfg.Relay.GetQueuePath()
-	for _, dir := range []string{"failed", "pending"} {
-		if _, err := os.Stat(filepath.Join(queuePath, dir)); err != nil {
+	for _, dir := range []string{"failed", "pending", "processing"} {
+		path := filepath.Join(queuePath, dir)
+		info, err := os.Stat(path)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
+			os.Exit(1)
+		}
+		if !info.IsDir() {
+			fmt.Fprintf(os.Stderr, "Error accessing relay queue: %s is not a directory\n", path)
 			os.Exit(1)
 		}
 	}

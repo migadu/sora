@@ -3,6 +3,7 @@
 package relayqueue
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -121,5 +122,40 @@ func TestRequeueAsRootGivesTheCopiesToTheQueueOwner(t *testing.T) {
 		if st := info.Sys().(*syscall.Stat_t); st.Uid != nobody || st.Gid != nobody {
 			t.Errorf("pending/%s belongs to %d:%d, want the queue owner %d:%d", name, st.Uid, st.Gid, nobody, nobody)
 		}
+	}
+}
+
+// An ownership failure must leave the failed originals and publish no pending pair.
+func TestRequeueOwnerFailureKeepsFailedCopies(t *testing.T) {
+	for _, failAt := range []int{1, 2} {
+		t.Run(map[int]string{1: "body", 2: "metadata"}[failAt], func(t *testing.T) {
+			queue, err := NewDiskQueue(t.TempDir(), 10, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := failMessage(t, queue, "recipient@example.com", "550 rejected")
+			realGeteuid, realChown := geteuid, chownFile
+			t.Cleanup(func() { geteuid, chownFile = realGeteuid, realChown })
+			geteuid = func() int { return os.Geteuid() + 1 }
+			calls := 0
+			chownFile = func(*os.File, int, int) error {
+				calls++
+				if calls == failAt {
+					return os.ErrPermission
+				}
+				return nil
+			}
+			if err := queue.Requeue(id); !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("Requeue = %v, want ownership error", err)
+			}
+			for _, name := range []string{id + ".msg", id + ".json"} {
+				if !fileExists(filepath.Join(queue.failedDir, name)) {
+					t.Errorf("failed/%s was removed after ownership failure", name)
+				}
+				if fileExists(filepath.Join(queue.pendingDir, name)) {
+					t.Errorf("pending/%s remains after ownership failure", name)
+				}
+			}
+		})
 	}
 }
