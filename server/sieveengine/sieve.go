@@ -15,6 +15,7 @@ import (
 	msieve "github.com/migadu/go-managesieve/managesieve"
 	"github.com/migadu/go-sieve"
 	"github.com/migadu/go-sieve/interp"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 )
 
@@ -120,6 +121,13 @@ type Result struct {
 	CreateMailbox bool              // RFC5490 - :create modifier (mailbox extension)
 	HeaderEdits   []HeaderEdit      // RFC5293 - editheader extension (addheader/deleteheader)
 	Additional    map[string]string // future-proofing
+
+	// RecordRedirect charges one redirect against the account's redirect rate limit.
+	// Evaluation charges nothing, since only delivery knows whether a redirect went
+	// out: it calls this once for each RedirectTo address it has queued or sent, and
+	// not for one the relay is missing for or refused, the message being kept then.
+	// It is nil when the action is not a redirect or no rate limit applies.
+	RecordRedirect func(ctx context.Context) error
 
 	// Vacation is the auto-reply the script's vacation action asks for, or nil. It is
 	// not an Action: RFC 5230 §4.7 says "Vacation does not affect Sieve's implicit keep
@@ -375,10 +383,10 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 				result.RedirectTo = append(result.RedirectTo, addr)
 			}
 		}
-		// Charge the rate limit here, for the addresses delivery will relay to,
+		// The rate limit is charged by delivery, for the addresses it relays to,
 		// and not as each redirect command runs: a redirect that fileinto took
-		// over or that a later script error undid is never sent.
-		execPolicy.recordRedirects(timeoutCtx, len(result.RedirectTo))
+		// over, that a later script error undid, or that no relay took is never sent.
+		result.RecordRedirect = execPolicy.redirectRecorder()
 
 		// Check if ImplicitKeep is true (means :copy was used) OR if Keep is true (explicit keep action)
 		// With normal redirect (no :copy), ImplicitKeep would be false, but an explicit keep
@@ -402,7 +410,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 	for sender, vacation := range data.VacationResponses {
 		// RFC 5230 §4.1: clamp to the site's supported range before converting
 		// to time.Duration, which would overflow for large Sieve numbers.
-		days := max(1, min(vacation.Days, 365))
+		days := max(1, min(vacation.Days, consts.MaxVacationDays))
 		duration := time.Duration(days) * 24 * time.Hour
 		allowed, err := execPolicy.VacationResponseAllowed(timeoutCtx, data, sender, vacation.ResponseIdentity, duration)
 		if err != nil || !allowed {
@@ -455,7 +463,7 @@ type SievePolicy struct {
 
 	// redirectsAllowed holds the distinct addresses this evaluation has let a
 	// redirect through to. They count against the rate limit as they
-	// accumulate, though nothing is recorded until the evaluation ends.
+	// accumulate, though nothing is recorded until delivery relays them.
 	redirectsAllowed []string
 }
 
@@ -503,15 +511,17 @@ func (p *SievePolicy) RedirectAllowed(ctx context.Context, d *interp.RuntimeData
 	return true, nil
 }
 
-// recordRedirects charges n relayed redirects against the account's rate limit.
-func (p *SievePolicy) recordRedirects(ctx context.Context, n int) {
-	if p.redirectOracle == nil || p.redirectRateLimit <= 0 {
-		return
+// redirectRecorder returns Result.RecordRedirect, or nil when no rate limit applies.
+// The returned function takes its own context: it runs on the delivery path, after
+// this evaluation's budget has expired.
+func (p *SievePolicy) redirectRecorder() func(context.Context) error {
+	oracle := p.redirectOracle
+	if oracle == nil || p.redirectRateLimit <= 0 {
+		return nil
 	}
-	for range n {
-		if err := p.redirectOracle.RecordRedirect(ctx, p.AccountID); err != nil {
-			// Best effort, log error implicitly or explicitly if a logger becomes available in context
-		}
+	accountID := p.AccountID
+	return func(ctx context.Context) error {
+		return oracle.RecordRedirect(ctx, accountID)
 	}
 }
 
