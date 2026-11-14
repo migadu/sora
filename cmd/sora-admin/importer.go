@@ -2593,9 +2593,12 @@ func parseKeywordsFile(path string) (map[int]string, error) {
 // Dovecot keeps a dovecot-keywords file PER FOLDER, each with its own index → name
 // numbering, so the letters in a file under .Sent/cur/ mean whatever .Sent/dovecot-
 // keywords says — not what the root file says. A folder without its own file, or
-// whose file cannot be read, has no keywords: Dovecot clears the list when the file
-// does not exist (maildir-keywords.c, maildir_keywords_sync), so the root map
-// (INBOX's) names nothing outside the root.
+// whose file cannot be read, gets an empty map: Dovecot clears the folder's list when
+// the file does not exist (maildir-keywords.c, maildir_keywords_sync), so its letters
+// have no name there, and the root map (INBOX's) names nothing outside the root.
+// Dovecot then makes up "unknown-<N>" for such a letter (maildir_keywords_char_idx);
+// the import drops it with the "Unknown keyword ID" warning instead, as it does any
+// letter that the folder's file does not name.
 // Results are cached per folder directory; safe for the parallel workers.
 func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 	// path is <folder>/{cur,new}/<file>

@@ -635,7 +635,15 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 		"----", "--------", "--------", "-----", "------", "-----------")
 
 	// Print connection details. Each row is an account on one tracker, so the totals are
-	// the sums of its Local and Remote columns, not the number of rows.
+	// connections, not the number of rows. Local is the tracker's own sessions and is
+	// summed. Remote is what other nodes report for the account and protocol, which every
+	// tracker of that protocol on this node hears: it is counted once per account and
+	// protocol, as "stats connection --user" does.
+	type accountProtocol struct {
+		accountID int64
+		protocol  string
+	}
+	remote := make(map[accountProtocol]int)
 	totalLocal, totalRemote := 0, 0
 	for _, conn := range filteredConnections {
 		email := conn.Email
@@ -658,7 +666,8 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 		// Calculate remote count (Total - Local)
 		remoteCount := conn.TotalCount - conn.LocalCount
 		totalLocal += conn.LocalCount
-		totalRemote += remoteCount
+		key := accountProtocol{conn.AccountID, conn.Protocol}
+		remote[key] = max(remote[key], remoteCount)
 
 		fmt.Printf("%-25s %-12s %-30s %-12d %-12d %-20s\n",
 			email,
@@ -667,6 +676,9 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 			conn.LocalCount,
 			remoteCount,
 			conn.LastUpdate.Format("2006-01-02 15:04:05"))
+	}
+	for _, n := range remote {
+		totalRemote += n
 	}
 
 	fmt.Printf("\nTotal connections: %d local, %d remote\n", totalLocal, totalRemote)

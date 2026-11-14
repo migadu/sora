@@ -118,24 +118,14 @@ components:
         user_email:
           type: string
           format: email
-          description: "Terminate all connections for this user."
+          description: "End this account's sessions. Any address of the account."
           example: "user@example.com"
         protocol:
           type: string
-          description: "Terminate connections for this protocol (e.g., IMAP, POP3)."
+          description: "Kick only on the connection trackers of this protocol (IMAP, POP3, ManageSieve or LMTP), matched case-insensitively against the tracker key up to its first dash. Every tracker when omitted."
           example: "IMAP"
-        server_addr:
-          type: string
-          description: "Terminate connections to this backend server address."
-          example: "10.0.1.10:143"
-        client_addr:
-          type: string
-          description: "Terminate connections from this client IP address."
-          example: "192.168.1.100"
-        all:
-          type: boolean
-          description: "If true, terminates all connections. Use with caution."
-          example: false
+      required:
+        - user_email
 
     Account:
       type: object
@@ -151,8 +141,13 @@ components:
         deleted_at:
           type: string
           format: date-time
-          nullable: true
-          example: null
+          description: "When the account was soft-deleted. Present only while it is."
+          example: "2023-02-01T12:00:00Z"
+        purge_requested_at:
+          type: string
+          format: date-time
+          description: "When a purge was requested (`DELETE /accounts/{email}?purge=true`). Present only while the purge is pending; once it is done the account answers 404."
+          example: "2023-02-01T12:00:00Z"
         primary_email:
           type: string
           format: email
@@ -1251,8 +1246,11 @@ paths:
     delete:
       tags:
         - Account Management
-      summary: Delete an account (soft delete)
-      description: Soft deletes an account, marking it as deleted but preserving data for the grace period. The account can be restored during this time. Its open sessions are ended and its cached logins dropped, on this node's servers and their cluster peers, as `/admin/connections/kick` does.
+      summary: Delete an account (soft delete), or request its purge
+      description: |
+        Soft deletes an account, marking it as deleted but preserving data for the grace period. The account can be restored during this time. Its open sessions are ended and its cached logins dropped, on this node's servers and their cluster peers, as `/admin/connections/kick` does.
+
+        With `purge=true` it instead requests the permanent deletion of the account and everything it holds, with no grace period, and answers 202. Any node serves the request, a proxy without object storage included: the account is taken out of service (soft-deleted, which an already soft-deleted account may be), its sessions are ended and its cached logins dropped as above, and it is marked for purging. A purge worker on a node with object storage then deletes it. Until it is gone, `GET /accounts/{email}` shows `purge_requested_at`; `POST /accounts/{email}/restore` before then cancels the purge.
       parameters:
         - name: email
           in: path
@@ -1260,6 +1258,13 @@ paths:
           schema:
             type: string
             format: email
+        - name: purge
+          in: query
+          required: false
+          description: "`true` requests the purge instead of a soft delete. Any other value, or none, is a soft delete."
+          schema:
+            type: boolean
+            default: false
       responses:
         '200':
           description: Account soft-deleted successfully.
@@ -1275,8 +1280,27 @@ paths:
                   message:
                     type: string
                     example: "Account soft-deleted successfully. It will be permanently removed after the grace period."
+        '202':
+          description: With `purge=true`, the account is out of service and marked for purging.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:
+                    type: string
+                    format: email
+                    example: "user@example.com"
+                  purge_requested_at:
+                    type: string
+                    format: date-time
+                    description: "When the purge was requested. A repeated request keeps the first time."
+                    example: "2026-10-17T09:12:44.120Z"
+                  message:
+                    type: string
+                    example: "Account is out of service and marked for purging; a purge worker on a node with object storage deletes it. GET /admin/accounts/{email} shows purge_requested_at until the account is gone."
         '400':
-          description: Account is already deleted, or the address does not parse.
+          description: The address does not parse, or (without `purge=true`) the account is already deleted.
           content:
             application/json:
               schema:
@@ -1662,11 +1686,14 @@ paths:
               schema:
                 type: object
                 properties:
-                  email:
+                  new_email:
                     type: string
                     format: email
+                    description: "The added address, as the request's email gave it."
+                    example: "alias@example.com"
                   message:
                     type: string
+                    example: "Credential added successfully"
         '400':
           description: |
             Invalid request body. Common causes:
@@ -1692,6 +1719,18 @@ paths:
                   summary: Both password fields provided
                   value:
                     error: "Cannot specify both password and password_hash"
+        '404':
+          description: No account in service has the address in the path; a soft-deleted account does not count.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The address is already a credential of an account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
           content:
@@ -1831,8 +1870,14 @@ paths:
     post:
       tags:
         - Connection Management
-      summary: Mark connections for termination
-      description: Marks connections matching the criteria to be terminated by the server.
+      summary: End a user's sessions
+      description: |
+        Kicks the account on this node's connection trackers (or on those of one protocol)
+        and broadcasts the kick to the cluster, where each node ends the account's sessions
+        and drops its cached logins.
+        An address the database does not know (a remote lookup user) is kicked by the
+        account ID derived from it, as the proxies derive it. The response does not count
+        sessions: they end within seconds, as each node applies the kick.
       requestBody:
         required: true
         content:
@@ -1841,7 +1886,7 @@ paths:
               $ref: '#/components/schemas/KickConnectionsRequest'
       responses:
         '200':
-          description: Connections marked successfully.
+          description: The kick was issued on the listed trackers and broadcast to the cluster.
           content:
             application/json:
               schema:
@@ -1849,16 +1894,41 @@ paths:
                 properties:
                   message:
                     type: string
-                  connections_marked:
-                    type: integer
+                    example: "User kicked successfully via gossip protocol"
+                  user:
+                    type: string
+                    format: email
+                    description: "The user_email of the request."
+                    example: "user@example.com"
+                  protocols:
+                    type: array
+                    description: "Keys of the connection trackers the kick was issued on (protocol, a dash, the server's name or instance)."
+                    items:
+                      type: string
+                    example: ["IMAP-node1-imap-proxy"]
+                  note:
+                    type: string
+                    example: "Kick event broadcast to cluster. Connections will be terminated within seconds."
         '400':
-          description: Invalid request body.
+          description: The body is not JSON, or user_email is missing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No connection tracker on this node serves the requested protocol.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '500':
-          description: Internal server error.
+          description: The kick could not be issued on any tracker.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: This node has no connection trackers.
           content:
             application/json:
               schema:
@@ -1869,7 +1939,7 @@ paths:
       tags:
         - Connection Management
       summary: Get connections for a specific user
-      description: One entry per connection tracker on this node that knows the account, matched case-insensitively against the entry's email, so an account whose entry was created by an alias login is found only under that alias. Unlike /connections, a tracker that knows the account only through gossip is listed too, with local_count 0.
+      description: One entry per connection tracker on this node that knows the account. The address is resolved to its account in the database, as /connections/kick resolves it, so the account is found under any of its addresses. An entry whose email is the address (case-insensitively) is listed too, which is how a remote lookup account, unknown to the database, is found. Unlike /connections, a tracker that knows the account only through gossip is listed too, with local_count 0.
       parameters:
         - name: email
           in: path
@@ -2736,20 +2806,22 @@ paths:
               schema:
                 type: object
                 properties:
-                  api_version:
-                    type: string
                   server_type:
                     type: string
+                    example: "sora-http-api"
                   features_enabled:
                     type: object
                     additionalProperties:
                       type: boolean
                   endpoints:
                     type: object
+                    description: "Every operation of this API, grouped by area: the method, the path and sometimes a note."
                     additionalProperties:
                       type: array
                       items:
                         type: string
+                    example:
+                      credential_management: ["GET /admin/credentials/{email}", "DELETE /admin/credentials/{email}"]
 
   /mailboxes/acl/grant:
     post:
