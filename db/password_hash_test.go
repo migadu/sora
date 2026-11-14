@@ -125,3 +125,69 @@ func TestVerifyPasswordDoesNotLogTheStoredValue(t *testing.T) {
 		}
 	}
 }
+
+// TestValidatePasswordHash: ValidatePasswordHash accepts exactly the values
+// VerifyPassword can check, and refuses the others with ErrUnverifiableHash and a
+// reason that quotes no part of the value.
+func TestValidatePasswordHash(t *testing.T) {
+	bc, err := bcrypt.GenerateFromPassword([]byte("pw"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ssha, _ := GenerateSSHA512Hash("pw")
+	sshaHex, _ := GenerateSSHA512HashHex("pw")
+	blf, _ := GenerateBcryptHash("pw")
+	accepted := append(dovecotSpellings(t, "pw"),
+		ssha, sshaHex, blf, GenerateSHA512Hash("pw"), GenerateSHA512HashHex("pw"),
+		string(bc), "$2b$"+string(bc[4:]), "$2y$"+string(bc[4:]),
+	)
+	for _, hash := range accepted {
+		if err := ValidatePasswordHash(hash); err != nil {
+			t.Errorf("ValidatePasswordHash(%q) = %v, want nil", hash, err)
+		}
+	}
+
+	salt := strings.Repeat("s", 22)
+	for _, hash := range []string{
+		"",
+		"Secret-2026",
+		"{Secret}2026",
+		"{PLAIN}Secret-2026",
+		sha512CryptOfSecret,
+		"{ARGON2ID}$argon2id$v=19$m=65536,t=3,p=1$c2FsdHNhbHQ$aGFzaGhhc2g",
+		"{CRYPT}" + sha512CryptOfSecret[len("{SHA512-CRYPT}"):], // crypt(3) SHA-512
+		"{CRYPT}abJnggxhB/yWI",             // crypt(3) DES
+		"$1$saltsalt$hashhashhashhashhash", // MD5-CRYPT without a scheme
+		"{SSHA512" + ssha[len("{SSHA512}"):],
+		"{SSHA512.}" + ssha[len("{SSHA512}"):],
+		"{SSHA512.b32}" + ssha[len("{SSHA512}"):],
+		"{SSHA512}" + base64.StdEncoding.EncodeToString([]byte("tooshort")),
+		"{SSHA512}not base64!",
+		"{SSHA512.hex}" + sshaHex[len("{SSHA512.HEX}"):] + "z",
+		"{SHA512}" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xff}, 96)), // not hex either
+		"{SHA512.hex}" + hex.EncodeToString(make([]byte, 63)),
+		"{BLF-CRYPT}$2a$12$tooShortToBeBcrypt",
+		blf + "\n",
+		"$2a$03$" + salt + strings.Repeat("h", 31), // cost below bcrypt.MinCost
+		"$2a$1x$" + salt + strings.Repeat("h", 31),
+		"$2a$12$" + salt + strings.Repeat("h", 30) + "+", // not bcrypt's base64
+		"$2x$" + string(bc[4:]),                          // crypt_blowfish's bug-compatible variant
+		"{BLF-CRYPT}$2x$" + string(bc[4:]),
+	} {
+		err := ValidatePasswordHash(hash)
+		if !errors.Is(err, ErrUnverifiableHash) {
+			t.Errorf("ValidatePasswordHash(%q) = %v, want ErrUnverifiableHash", hash, err)
+			continue
+		}
+		if verr := VerifyPassword(hash, "pw"); !errors.Is(verr, ErrUnverifiableHash) || errors.Is(verr, ErrInvalidCredentials) {
+			t.Errorf("VerifyPassword(%q) = %v, want ErrUnverifiableHash and not ErrInvalidCredentials", hash, verr)
+		}
+		value := hash[strings.IndexByte(hash, '}')+1:]
+		if piece := value[:min(6, len(value))]; len(piece) >= 4 && strings.Contains(strings.ToLower(err.Error()), strings.ToLower(piece)) {
+			t.Errorf("ValidatePasswordHash(%q) = %q: quotes %q from the value", hash, err, piece)
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "secret") {
+			t.Errorf("ValidatePasswordHash(%q) = %q: quotes the value", hash, err)
+		}
+	}
+}
