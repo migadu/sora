@@ -239,9 +239,10 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 	// in unconditionally, so for an account whose address happens to be the master SASL
 	// username that shape is an ordinary login — refusing it here would reject the
 	// account's own password forever. It falls through to regular authentication, which
-	// records its own failure under the same key, so a master-password guess dressed up as
-	// a self-login is still metered. A CORRECT master password keeps entering the block
-	// whatever the target, which is what the proxy flow relies on.
+	// records its own failure under the same key and answers errAuthFailed, so a
+	// master-password guess dressed up as a self-login is still metered and is answered
+	// exactly like the CORRECT master password, which keeps entering the block whatever the
+	// target (what the proxy flow relies on) and fails there when the target does not parse.
 	if !impersonating && authzID != "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
 		checkMasterCredential(authnID, settings.masterSASLUsername) &&
 		(checkMasterCredential(password, settings.masterSASLPassword) || authzID != authnID) {
@@ -381,14 +382,18 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		address, err := server.NewAddress(authnID)
 		if err != nil {
 			s.WarnLog("invalid address format", "error", err)
-			// Record it: an unparseable identity was an unmetered authentication
-			// attempt, and it is the path a non-address master SASL username takes
-			// when it falls through to here, which must be accounted for exactly
-			// like any other failed attempt.
+			// A failed login like any other: recorded, counted and answered exactly
+			// like a wrong password. A master SASL self-login (authorization
+			// identity = authentication identity = a non-address master SASL
+			// username) falls through to here with any password but the master
+			// SASL one, which the master SASL block above answers with
+			// errAuthFailed, so a different reply or count here confirms a guessed
+			// master SASL password. It holds for every username, or the reply
+			// would single out the master SASL one.
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
-			return &managesieveserver.Error{Message: msieve.Quote("Invalid username format")}
+			return errAuthFailed
 		}
 
 		s.DebugLog("authentication attempt", "address", address.FullAddress())
@@ -477,12 +482,13 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 	address, err := server.NewAddress(username)
 	if err != nil {
 		s.DebugLog("invalid address", "error", err)
-		// A failed login like any other: recorded and counted, as in AuthenticatePlain.
+		// A failed login like any other: recorded, counted and answered exactly
+		// like a wrong password, as in AuthenticatePlain.
 		if s.server.authLimiter != nil {
 			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 		}
 		metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
-		return &managesieveserver.Error{Message: msieve.Quote("Invalid address")}
+		return errAuthFailed
 	}
 
 	// Master username authentication: user@domain.com@MASTER_USERNAME
