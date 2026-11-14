@@ -54,6 +54,7 @@ type reloadableSettings struct {
 // Server represents a User API proxy server
 type Server struct {
 	name                       string
+	hostname                   string // labels the metrics, like every other server's hostname
 	addr                       string
 	connManager                *proxy.ConnectionManager
 	remoteUseProxyProtocol     bool // the server's own PROXY-header setting; a named pool's setting overrides it per route
@@ -359,6 +360,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 
 	s := &Server{
 		name:                       opts.Name,
+		hostname:                   config.ResolveMailHostname(),
 		addr:                       opts.Addr,
 		connManager:                connManager,
 		remoteUseProxyProtocol:     opts.RemoteUseProxyProtocol,
@@ -478,9 +480,9 @@ func (s *Server) setupHandler() http.Handler {
 		r = r.WithContext(context.WithValue(r.Context(), clientIPKey, s.getRealClientIP(r)))
 
 		// Track metrics
-		metrics.ConnectionsTotal.WithLabelValues("userapi_proxy", s.name, "").Inc()
-		metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, "").Inc()
-		defer metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, "").Dec()
+		metrics.ConnectionsTotal.WithLabelValues("userapi_proxy", s.name, s.hostname).Inc()
+		metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, s.hostname).Inc()
+		defer metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, s.hostname).Dec()
 
 		// Fail closed until the backend maintenance list has been read: any backend
 		// might be in maintenance (proxy.Maintenance.Loaded).

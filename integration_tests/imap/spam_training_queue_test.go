@@ -25,12 +25,17 @@ import (
 type trainingEndpoint struct {
 	mu       sync.Mutex
 	requests []spamtraining.TrainingRequest
+	auth     []string    // the Authorization header of each request
+	failing  atomic.Bool // answer every request with 500 instead of 200
 }
 
 func newTrainingEndpoint(t *testing.T) (*trainingEndpoint, string) {
 	t.Helper()
 	e := &trainingEndpoint{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ct := r.Header.Get("Content-Type"); r.Method != http.MethodPost || ct != "application/json" {
+			t.Errorf("training request is a %s of %q, want a POST of application/json", r.Method, ct)
+		}
 		var req spamtraining.TrainingRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("training request does not decode: %v", err)
@@ -39,7 +44,12 @@ func newTrainingEndpoint(t *testing.T) (*trainingEndpoint, string) {
 		}
 		e.mu.Lock()
 		e.requests = append(e.requests, req)
+		e.auth = append(e.auth, r.Header.Get("Authorization"))
 		e.mu.Unlock()
+		if e.failing.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)
@@ -50,6 +60,13 @@ func (e *trainingEndpoint) received() []spamtraining.TrainingRequest {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]spamtraining.TrainingRequest(nil), e.requests...)
+}
+
+// authorizations returns the Authorization header of each request received.
+func (e *trainingEndpoint) authorizations() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.auth...)
 }
 
 // waitForTraining waits until the endpoint has received want requests.
@@ -103,9 +120,9 @@ func setupSpamTrainingServer(t *testing.T, cfg config.SpamTrainingConfig) (*imap
 	return c, fakeS3, endpoint, account
 }
 
-func appendToInbox(t *testing.T, c *imapclient.Client, msg string) {
+func appendToMailbox(t *testing.T, c *imapclient.Client, mailbox, msg string) {
 	t.Helper()
-	cmd := c.Append("INBOX", int64(len(msg)), nil)
+	cmd := c.Append(mailbox, int64(len(msg)), nil)
 	if _, err := cmd.Write([]byte(msg)); err != nil {
 		t.Fatalf("APPEND write: %v", err)
 	}
@@ -143,7 +160,7 @@ func TestIMAP_SpamTraining_MoveDoesNotDownloadEveryMessageAtOnce(t *testing.T) {
 
 	c, fakeS3, endpoint, account := setupSpamTrainingServer(t, config.SpamTrainingConfig{})
 	for i := 0; i < moved; i++ {
-		appendToInbox(t, c, trainingMessage(account.Email, fmt.Sprintf("Spam %d", i), "Buy now."))
+		appendToMailbox(t, c, "INBOX", trainingMessage(account.Email, fmt.Sprintf("Spam %d", i), "Buy now."))
 	}
 
 	// Hold every training download until released, and record how many run at once.
@@ -201,8 +218,8 @@ func TestIMAP_SpamTraining_MoveDoesNotDownloadEveryMessageAtOnce(t *testing.T) {
 func TestIMAP_SpamTraining_SkipsOversizedMessageWithoutDownloading(t *testing.T) {
 	c, fakeS3, endpoint, account := setupSpamTrainingServer(t, config.SpamTrainingConfig{MaxMessageSize: "2kb"})
 
-	appendToInbox(t, c, trainingMessage(account.Email, "Small spam", "Buy now."))
-	appendToInbox(t, c, trainingMessage(account.Email, "Large spam", strings.Repeat("Buy now. ", 1000)))
+	appendToMailbox(t, c, "INBOX", trainingMessage(account.Email, "Small spam", "Buy now."))
+	appendToMailbox(t, c, "INBOX", trainingMessage(account.Email, "Large spam", strings.Repeat("Buy now. ", 1000)))
 	getsBefore := fakeS3.GetCount()
 
 	moveAllToJunk(t, c)
@@ -229,7 +246,7 @@ func TestIMAP_SpamTraining_TrainsMessageMovedBeforeUpload(t *testing.T) {
 	c, fakeS3, endpoint, account := setupSpamTrainingServer(t, config.SpamTrainingConfig{})
 	fakeS3.FailPuts(true) // the upload stalls and the body stays staged on this node
 
-	appendToInbox(t, c, trainingMessage(account.Email, "Spam before upload", "Buy now."))
+	appendToMailbox(t, c, "INBOX", trainingMessage(account.Email, "Spam before upload", "Buy now."))
 	if n := fakeS3.ObjectCount(); n != 0 {
 		t.Fatalf("%d objects in S3 after APPEND, want 0: the upload must still be pending", n)
 	}

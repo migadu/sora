@@ -272,7 +272,7 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			// case-insensitively. JSONB containment compared the whole address,
 			// case-sensitively. These are rare searches; like References they are
 			// filtered from the mailbox's rows (recipients_json is deliberately
-			// not in idx_messages_mailbox_headers).
+			// not in idx_messages_mailbox_headers_v2).
 			typeParam := nextParam()
 			args[typeParam] = lowerKey
 			param := nextParam()
@@ -664,17 +664,27 @@ func msgIDListExpr(column string) string {
 // headerSubstringCond is the TEXT header predicate: the bound term as a substring of any
 // searchable header column (subject, the from/to/cc sort columns and every other From/To/Cc
 // address in extra_addresses). prefix is the messages table alias with its trailing dot, or
-// "" when the columns are unqualified.
+// "" when the columns are unqualified. The result is never NULL (see anyOf).
 func headerSubstringCond(prefix, placeholder string) string {
-	return "(" + strings.Join([]string{
+	return anyOf([]string{
 		substringCond(fmt.Sprintf("LOWER(%ssubject)", prefix), placeholder),
 		substringCond(prefix+"from_email_sort", placeholder),
 		substringCond(prefix+"from_name_sort", placeholder),
 		substringCond(prefix+"to_email_sort", placeholder),
 		substringCond(prefix+"to_name_sort", placeholder),
 		substringCond(prefix+"cc_email_sort", placeholder),
-		substringCond(fmt.Sprintf("COALESCE(%sextra_addresses, '')", prefix), placeholder),
-	}, " OR ") + ")"
+		substringCond(prefix+"extra_addresses", placeholder),
+	})
+}
+
+// anyOf ORs the header predicates and turns a NULL result into FALSE. The columns they read
+// are nullable, and a NULL column makes its strpos() NULL: extra_addresses on every row
+// written before migration 000059, to_name_sort on every row written before migration
+// 000006 (added without a backfill). WHERE drops a NULL just like FALSE, but NOT NULL is
+// NULL too, so without this NOT TO and NOT TEXT dropped those rows instead of returning
+// them; a NULL column must simply not match.
+func anyOf(conds []string) string {
+	return "COALESCE(" + strings.Join(conds, " OR ") + ", FALSE)"
 }
 
 // addressHeaderSortColumns are the first-address columns of each address header, and
@@ -690,19 +700,16 @@ var (
 
 // addressHeaderCond is the FROM/TO/CC predicate: the bound term as a substring of the
 // header's first name or address, or of any other one in its extra_addresses section.
-// header is "from", "to" or "cc"; prefix as for headerSubstringCond.
-//
-// The section is split out of the column COALESCEd to the empty string: a NULL column (a
-// row written before migration 000059) then means "no other addresses" and the predicate
-// stays two-valued, so NOT FROM/TO/CC keeps those rows instead of dropping them on a NULL.
+// header is "from", "to" or "cc"; prefix as for headerSubstringCond. A NULL column (see
+// anyOf) does not match, so NOT FROM/TO/CC keeps rows written before those columns existed.
 func addressHeaderCond(prefix, header, placeholder string) string {
 	var conds []string
 	for _, col := range addressHeaderSortColumns[header] {
 		conds = append(conds, substringCond(prefix+col, placeholder))
 	}
-	section := fmt.Sprintf(`split_part(COALESCE(%sextra_addresses, ''), E'\n', %d)`, prefix, addressHeaderSection[header])
+	section := fmt.Sprintf(`split_part(%sextra_addresses, E'\n', %d)`, prefix, addressHeaderSection[header])
 	conds = append(conds, substringCond(section, placeholder))
-	return "(" + strings.Join(conds, " OR ") + ")"
+	return anyOf(conds)
 }
 
 // Sort columns carried through the UNION CTE (in addition to the branch's data

@@ -557,6 +557,13 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 			// [SYS/TEMP]), neither counted as a failed login nor cached.
 			if proxy.IsTemporaryDBAuthFailure(err) {
 				reason, _ := proxy.ClassifyDBAuthFailure(err)
+				// A login this username has in the lookup cache was verified against
+				// another hash than the one now stored. Drop it: while it stays, every
+				// password that misses it is answered here, uncounted, and the cached
+				// one still signs in, an unmetered guessing oracle until it expires.
+				if errors.Is(err, db.ErrUnverifiableHash) {
+					s.invalidateLookupCache("unverifiable stored hash")
+				}
 				s.WarnLog("authentication unavailable", "reason", reason, "method", "main_db", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable

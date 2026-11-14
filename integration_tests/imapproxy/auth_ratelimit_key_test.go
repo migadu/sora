@@ -17,8 +17,8 @@ import (
 )
 
 // setupIMAPProxyWithRateLimiting creates an IMAP proxy with authentication rate
-// limiting enabled, fronting the given backends.
-func setupIMAPProxyWithRateLimiting(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, rateLimitConfig server.AuthRateLimiterConfig) *common.TestServer {
+// limiting enabled, fronting the given backends. Each tune func adjusts the options.
+func setupIMAPProxyWithRateLimiting(t *testing.T, rdb *resilient.ResilientDatabase, proxyAddr string, backendAddrs []string, rateLimitConfig server.AuthRateLimiterConfig, tune ...func(*imapproxy.ServerOptions)) *common.TestServer {
 	t.Helper()
 
 	opts := imapproxy.ServerOptions{
@@ -34,6 +34,10 @@ func setupIMAPProxyWithRateLimiting(t *testing.T, rdb *resilient.ResilientDataba
 		// No TrustedProxies: the proxy passes that list to the auth rate limiter as
 		// its exemption list, and the loopback test client would then be exempt from
 		// all IP-based blocking.
+	}
+
+	for _, f := range tune {
+		f(&opts)
 	}
 
 	proxy, err := imapproxy.New(context.Background(), rdb, "test-proxy-rate-limit", opts)
