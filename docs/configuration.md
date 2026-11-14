@@ -104,7 +104,8 @@ Each protocol (IMAP, LMTP, POP3, ManageSieve) has its own configuration table.
 
 *   `start`: A boolean to enable or disable the server.
 *   `addr`: The listen address and port (e.g., `":143"`).
-*   `tls`: Set to `true` to enable TLS (e.g., for IMAPS on port 993). You must also provide `tls_cert_file` and `tls_key_file`.
+*   `tls`: Set to `true` to enable TLS (e.g., for IMAPS on port 993). The certificate comes from the global `[tls]` section when it is enabled, otherwise from `tls_cert_file` and `tls_key_file`.
+*   `tls_verify`: With `tls = true`, require a client certificate (mutual TLS), verified against the system's trusted CAs. Leave it `false` for mail clients.
 *   `max_connections`: Limits the total concurrent connections to this server.
 *   `auth_rate_limit`: Contains settings to enable and configure brute-force authentication protection.
 *   `proxy_protocol`: Contains settings to enable PROXY protocol, which is essential for seeing real client IPs when Sora is behind a load balancer. **Only enable this if you are behind a trusted proxy.**
