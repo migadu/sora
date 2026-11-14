@@ -60,24 +60,20 @@ var (
 	date    = "unknown"
 )
 
-// serverManager tracks running servers for coordinated shutdown
+// serverManager tracks running servers for coordinated shutdown. It has no bare
+// Add: a server that counted itself from its own goroutine could be missed by a
+// Wait that had already begun (#769).
 type serverManager struct {
 	wg sync.WaitGroup
-	mu sync.Mutex
 }
 
-func (sm *serverManager) Add() {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	sm.wg.Add(1)
+// Go runs start in a new goroutine that Wait waits for. The goroutine is counted
+// before it starts, so a Wait that begins after Go returns includes it.
+func (sm *serverManager) Go(start func()) {
+	sm.wg.Go(start)
 }
 
-func (sm *serverManager) Done() {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	sm.wg.Done()
-}
-
+// Wait returns once every goroutine started by Go has returned.
 func (sm *serverManager) Wait() {
 	sm.wg.Wait()
 }
@@ -1364,11 +1360,12 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 			logger.Info("Unknown server type - skipping", "type", server.Type, "name", server.Name)
 			continue
 		}
-		go func() {
+		// Counted here, before main can wait for the servers on a shutdown signal.
+		deps.serverManager.Go(func() {
 			// One that returns without registering for reload is not waited for.
 			defer deps.startReturned(server.Name)
 			start(ctx, deps, server, errChan)
-		}()
+		})
 	}
 
 	return errChan
@@ -1445,9 +1442,6 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 
 // Dynamic server functions
 func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	appendLimit := serverConfig.GetAppendLimitWithDefault()
 
 	authRateLimit := server.DefaultAuthRateLimiterConfig()
@@ -1601,9 +1595,6 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 }
 
 func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, buildLMTPServerOptions(deps, serverConfig))
 
 	if err != nil {
@@ -1684,9 +1675,6 @@ func buildLMTPServerOptions(deps *serverDependencies, serverConfig config.Server
 }
 
 func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	authRateLimit := server.DefaultAuthRateLimiterConfig()
 	if serverConfig.AuthRateLimit != nil {
 		authRateLimit = *serverConfig.AuthRateLimit
@@ -1785,9 +1773,6 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 }
 
 func startDynamicManageSieveServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	maxSize := serverConfig.GetMaxScriptSizeWithDefault()
 
 	authRateLimit := server.DefaultAuthRateLimiterConfig()
@@ -1893,9 +1878,6 @@ func configureMetrics(server config.ServerConfig) {
 }
 
 func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	mux := http.NewServeMux()
 	mux.Handle(serverConfig.MetricsPath(), metricsAccessGuard(serverConfig.AllowedHosts, serverConfig.APIKey, promhttp.Handler()))
 
@@ -1925,9 +1907,6 @@ func startDynamicMetricsServer(ctx context.Context, deps *serverDependencies, se
 }
 
 func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
 	if err != nil {
@@ -2060,9 +2039,6 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 }
 
 func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
 	if err != nil {
@@ -2190,9 +2166,6 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 }
 
 func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
 	remoteDNSRefresh, err := serverConfig.GetRemoteDNSRefresh()
 	if err != nil {
@@ -2319,9 +2292,6 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 }
 
 func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	// max_connections_per_user(_per_ip) are not applied (local-only tracking with limits
 	// disabled); WarnUnusedConfigOptions says so at startup.
 	connectTimeout := serverConfig.GetConnectTimeoutWithDefault()
@@ -2433,9 +2403,6 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 }
 
 func startDynamicHTTPAdminAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	if serverConfig.APIKey == "" {
 		logger.Info("HTTP Admin API server enabled but no API key configured - skipping", "name", serverConfig.Name)
 		return
@@ -2565,9 +2532,6 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 }
 
 func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	if serverConfig.JWTSecret == "" {
 		logger.Info("HTTP User API server enabled but no JWT secret configured - skipping", "name", serverConfig.Name)
 		return
@@ -2624,9 +2588,6 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 }
 
 func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
-	deps.serverManager.Add()
-	defer deps.serverManager.Done()
-
 	if serverConfig.JWTSecret == "" {
 		logger.Info("User API proxy server enabled but no JWT secret configured - skipping", "name", serverConfig.Name)
 		return
