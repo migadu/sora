@@ -31,7 +31,11 @@ func closedRelayAddr(t *testing.T) string {
 func TestHTTPRelayErrorsHideURLCredentials(t *testing.T) {
 	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// An http-to-https redirect repeats the request URL, query included.
-		w.Header().Set("Location", "https://fixture-user:fixture-password@relay.example.invalid"+r.URL.RequestURI())
+		location := "https://fixture-user:fixture-password@relay.example.invalid" + r.URL.RequestURI()
+		if r.URL.Path == "/malformed" {
+			location = "https://fixture-user:fixture/password@relay.example.invalid/send?api_key=fixture-query-secret"
+		}
+		w.Header().Set("Location", location)
 		w.WriteHeader(http.StatusMovedPermanently)
 	}))
 	defer redirect.Close()
@@ -41,6 +45,7 @@ func TestHTTPRelayErrorsHideURLCredentials(t *testing.T) {
 		{"connection refused", "http://fixture-user:fixture-password@" + closedRelayAddr(t) + "/send?api_key=fixture-query-secret"},
 		{"unparsable", "https://fixture-user:fixture/password@relay.example.invalid/send"},
 		{"redirect", "http://fixture-user:fixture-password@" + redirectHost + "/send?api_key=fixture-query-secret"},
+		{"malformed redirect", redirect.URL + "/malformed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := &HTTPRelayHandler{HTTPURL: tc.url}

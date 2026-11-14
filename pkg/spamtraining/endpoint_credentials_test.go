@@ -27,7 +27,11 @@ func TestSubmitTrainingErrorsHideEndpointCredentials(t *testing.T) {
 
 	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// An http-to-https redirect repeats the request URL, query included.
-		w.Header().Set("Location", "https://fixture-user:fixture-password@train.example.invalid"+r.URL.RequestURI())
+		location := "https://fixture-user:fixture-password@train.example.invalid" + r.URL.RequestURI()
+		if r.URL.Path == "/malformed" {
+			location = "https://fixture-user:fixture/password@train.example.invalid/train?api_key=fixture-query-secret"
+		}
+		w.Header().Set("Location", location)
 		w.WriteHeader(http.StatusMovedPermanently)
 	}))
 	defer redirect.Close()
@@ -37,6 +41,7 @@ func TestSubmitTrainingErrorsHideEndpointCredentials(t *testing.T) {
 		{"connection refused", "http://fixture-user:fixture-password@" + closedAddr + "/train?api_key=fixture-query-secret"},
 		{"unparsable", "https://fixture-user:fixture/password@train.example.invalid/train"},
 		{"redirect", "http://fixture-user:fixture-password@" + redirectHost + "/train?api_key=fixture-query-secret"},
+		{"malformed redirect", redirect.URL + "/malformed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, err := NewClient(&config.SpamTrainingConfig{Enabled: true, Endpoint: tc.endpoint})

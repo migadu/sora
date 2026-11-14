@@ -80,8 +80,9 @@ func MaskEndpointURL(value string) string {
 }
 
 // MaskURLError masks, in place, the URL that the *url.Error in err's chain quotes,
-// as MaskEndpointURL masks it, and returns err. Call it on the error as returned,
-// before it is logged or wrapped: fmt.Errorf copies the text it wraps.
+// as MaskEndpointURL masks it. Call it on an error owned by this request before it
+// is published or logged. Display wrappers preserve the original error chain,
+// including when fmt.Errorf has already copied the URL into its own text.
 // net/http quotes the request URL in its errors with the user name and the query
 // (it replaces only the password, with "***"), and url.Parse quotes the whole string
 // it refuses. Such a string's reason quotes a piece of it too, `invalid port ":pass"
@@ -93,11 +94,51 @@ func MaskURLError(err error) error {
 		return err
 	}
 	masked := MaskEndpointURL(urlErr.URL)
-	if masked != urlErr.URL && urlErr.Op == "parse" && urlErr.Err != nil {
-		urlErr.Err = errors.New(maskQuoted(urlErr.Err.Error()))
+	if urlErr.Err != nil {
+		reason := urlErr.Err.Error()
+		shown := maskURLErrorText(reason)
+		if masked != urlErr.URL && urlErr.Op == "parse" {
+			shown = maskQuoted(shown)
+		}
+		if shown != reason {
+			urlErr.Err = &maskedURLCause{cause: urlErr.Err, text: shown}
+		}
 	}
 	urlErr.URL = masked
+	if err != urlErr {
+		text := err.Error()
+		if shown := maskURLErrorText(text); shown != text {
+			return &maskedURLCause{cause: err, text: shown}
+		}
+	}
 	return err
+}
+
+// A redirect's malformed Location is quoted inside Client.Do's source error,
+// before CheckRedirect can refuse it. When a reason contains a credential URL,
+// mask quoted parts too: its parser may quote only part of the password as an
+// invalid port. Keep the category text, and mask any unquoted URLs as well.
+func maskURLErrorText(text string) string {
+	if shown := maskURLCredentials(text); shown != text {
+		return maskURLCredentials(maskQuoted(text))
+	}
+	return text
+}
+
+type maskedURLCause struct {
+	cause error
+	text  string
+}
+
+func (e *maskedURLCause) Error() string { return e.text }
+func (e *maskedURLCause) Unwrap() error { return e.cause }
+func (e *maskedURLCause) Timeout() bool {
+	var timeout interface{ Timeout() bool }
+	return errors.As(e.cause, &timeout) && timeout.Timeout()
+}
+func (e *maskedURLCause) Temporary() bool {
+	var temporary interface{ Temporary() bool }
+	return errors.As(e.cause, &temporary) && temporary.Temporary()
 }
 
 // maskQuoted replaces every Go-quoted string in s with a quoted SecretMask.

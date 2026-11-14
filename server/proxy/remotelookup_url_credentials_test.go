@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -43,6 +45,24 @@ func TestRemoteLookupHidesURLCredentials(t *testing.T) {
 		errs = append(errs, err)
 	}
 	errs = append(errs, client.HealthCheck(ctx))
+
+	// Client.Do parses Location before the no-redirect hook is called. The
+	// malformed URL and the partial password in its reason must both stay hidden.
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://fixture-user:fixture/password@lookup.example.invalid/lookup?api_key=fixture-query-secret")
+		w.WriteHeader(http.StatusMovedPermanently)
+	}))
+	defer redirect.Close()
+	lookup, err = InitializeRemoteLookup("imap", &config.RemoteLookupConfig{
+		Enabled: true,
+		URL:     redirect.URL + "/lookup?email=$email",
+	}, 0)
+	if err != nil {
+		t.Fatalf("InitializeRemoteLookup redirect fixture: %v", err)
+	}
+	redirectClient := lookup.(*HTTPRemoteLookupClient)
+	_, _, err = redirectClient.LookupUserRoute(ctx, "user@example.com", "password")
+	errs = append(errs, err, redirectClient.HealthCheck(ctx))
 
 	// A URL that does not parse is quoted whole, its reason a piece of it.
 	_, err = InitializeRemoteLookup("imap", &config.RemoteLookupConfig{
