@@ -114,3 +114,71 @@ func TestUnparseableUsernameIsAFailedLogin(t *testing.T) {
 		})
 	}
 }
+
+// refusingLoginLimiter refuses every attempt, as a limiter does once a key is blocked,
+// and counts the failed attempts recorded.
+type refusingLoginLimiter struct{ unparseableLoginLimiter }
+
+func (l *refusingLoginLimiter) CanAttemptAuthWithProxy(context.Context, net.Conn, *server.ProxyProtocolInfo, string) error {
+	l.checks.Add(1)
+	return server.ErrRateLimitExceeded
+}
+
+// TestUnparseableUsernameIsGatedBeforeItIsRecorded: the record for an unparseable
+// username sits BEHIND the rate-limit gate. Recording a failure at a site the gate does
+// not protect is worse than not recording it: the attempt feeds the source IP's Tier-2
+// counter, which is enforced at TCP accept, at full connection rate, while the block it
+// earns is never applied to the attempts creating it. On a shared egress that blocks
+// every other user behind the same address. A refused attempt therefore records
+// nothing and is answered like a bad credential, as the parser's own refusal is.
+func TestUnparseableUsernameIsGatedBeforeItIsRecorded(t *testing.T) {
+	const name = "unparseable-username-gated"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	limiter := &refusingLoginLimiter{}
+	srv, err := New(ctx, name, "localhost", "127.0.0.1:0", &resilient.ResilientDatabase{}, ManageSieveServerOptions{
+		AuthLimiterOverride: limiter,
+		Config:              &config.Config{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logins := []struct {
+		name  string
+		login func(s *ManageSieveSession) error
+	}{
+		{"LOGIN", func(s *ManageSieveSession) error {
+			return s.Login(ctx, "not-an-address", "secret")
+		}},
+		{"AUTHENTICATE", func(s *ManageSieveSession) error {
+			return s.AuthenticatePlain(ctx, "", "not-an-address", "secret")
+		}},
+	}
+	for _, tc := range logins {
+		t.Run(tc.name, func(t *testing.T) {
+			c1, c2 := net.Pipe()
+			defer c1.Close()
+			defer c2.Close()
+			sctx, scancel := context.WithCancel(ctx)
+			defer scancel()
+			s := &ManageSieveSession{server: srv, conn: c1, ctx: sctx, cancel: scancel, startTime: time.Now()}
+			s.Protocol = "ManageSieve"
+			s.RemoteIP = "127.0.0.1"
+			s.Id = "sess"
+			s.Stats = srv
+			s.mutexHelper = server.NewMutexTimeoutHelper(&s.mutex, sctx, "MANAGESIEVE", func(string, ...any) {})
+
+			checks, recorded := limiter.checks.Load(), limiter.failures.Load()
+			if err := tc.login(s); err != errAuthFailed {
+				t.Errorf("a refused login with an unparseable username: %#v, want the bad-credential reply %#v", err, errAuthFailed)
+			}
+			if n := limiter.checks.Load() - checks; n != 1 {
+				t.Errorf("the auth rate limiter was consulted %d times, want 1", n)
+			}
+			if n := limiter.failures.Load() - recorded; n != 0 {
+				t.Errorf("%d failed attempts recorded for a login the gate refused, want 0: the username reached the parser", n)
+			}
+		})
+	}
+}

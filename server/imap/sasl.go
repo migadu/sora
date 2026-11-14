@@ -382,8 +382,10 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// happens to be the master SASL username, answering that from here
 					// would refuse its own password forever. Such a submission falls
 					// through to regular authentication instead, which records its own
-					// failure under the same authKey — so a master-password guess dressed
-					// up as a self-login is still metered, just not privileged.
+					// failure under the same authKey and answers authFailedError() (login.go)
+					// — so a master-password guess dressed up as a self-login is still
+					// metered, just not privileged, and is answered exactly like the correct
+					// master password, which fails above when the target does not parse.
 					s.WarnLog("master SASL authentication failed (invalid password)", "peer", server.GetAddrString(netConn.RemoteAddr()))
 					metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 					if s.server.authLimiter != nil {

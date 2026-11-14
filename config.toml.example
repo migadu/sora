@@ -38,6 +38,7 @@ insecure_skip_verify = true                 # Skip TLS cert verification. Defaul
 # Messages larger than this will be skipped during import
 # Default: 50mb (larger than IMAP append_limit since imports are batch operations)
 # This setting is independent of IMAP server configuration
+# A message above 2147483647 bytes (the largest sora can store) is skipped whatever the limit
 import_message_limit = "50mb"
 
 
@@ -1033,7 +1034,7 @@ debug = false                 # Enable debug logging for this IMAP server
 
 # --- CONNECTION LIMITING AND MEMORY MANAGEMENT ---
 max_connections = 1000              # Maximum concurrent IMAP connections to this server instance.
-max_connections_per_ip = 200        # Max connections per IP. High enough for corporate gateways (~40 users), catches DoS. With proxy_protocol it counts the client the PROXY header names; set 0 to leave it to the proxies in front.
+max_connections_per_ip = 200        # Max connections per IP. High enough for corporate gateways (~40 users), catches DoS. With proxy_protocol it counts the client the PROXY header names and answers its refusal (a proxy fails only that login, not the backend); set 0 to leave it to the proxies in front.
 max_connections_per_user = 15       # Max authenticated connections per user across all IPs. 0 = unlimited. (Requires connection tracking)
 max_connections_per_user_per_ip = 5 # Max connections per user from same IP. KEY PROTECTION against buggy clients & brute force. 0 = unlimited.
 listen_backlog = 4096               # TCP listen backlog size (0 = default 1024). Prevents connection delays under high load.
