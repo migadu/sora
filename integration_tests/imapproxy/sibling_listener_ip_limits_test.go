@@ -153,7 +153,7 @@ func TestIMAPProxySiblingListenersShareIPLimitAcrossNodes(t *testing.T) {
 	waitCounts(3) // Different IP and rejected sockets must not add a charge.
 	second.Close()
 	waitCounts(2)
-	replacement := accept(b2, ip, false)
+	replacement := accept(b2, "::ffff:192.0.2.1", false)
 	waitCounts(3)
 	first.Close()
 	waitCounts(2)
