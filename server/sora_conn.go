@@ -144,7 +144,7 @@ func CopyWithDeadline(ctx context.Context, dst net.Conn, src net.Conn, direction
 type SoraConn struct {
 	// Underlying connection (TLS or plain TCP). A deferred TLS handshake replaces it
 	// with the *tls.Conn under closeMutex (SoraTLSConn.PerformHandshake), so Close
-	// and Unwrap, which other goroutines call, read it under closeMutex too.
+	// and the connection accessors other goroutines call read it under closeMutex too.
 	net.Conn
 	// Cached remote address string to avoid touching the underlying connection
 	// during shutdown/unregister which could race with Close()
@@ -678,6 +678,21 @@ func (c *SoraConn) Unwrap() net.Conn {
 	c.closeMutex.Lock()
 	defer c.closeMutex.Unlock()
 	return c.Conn
+}
+
+// Address and deadline methods may run concurrently with a deferred handshake.
+// Snapshot the current connection before forwarding, without holding closeMutex
+// during socket operations that may block or need Close to interrupt them.
+func (c *SoraConn) LocalAddr() net.Addr  { return c.Unwrap().LocalAddr() }
+func (c *SoraConn) RemoteAddr() net.Addr { return c.Unwrap().RemoteAddr() }
+func (c *SoraConn) SetDeadline(t time.Time) error {
+	return c.Unwrap().SetDeadline(t)
+}
+func (c *SoraConn) SetReadDeadline(t time.Time) error {
+	return c.Unwrap().SetReadDeadline(t)
+}
+func (c *SoraConn) SetWriteDeadline(t time.Time) error {
+	return c.Unwrap().SetWriteDeadline(t)
 }
 
 // CheckedTimeouts are the limits the timeout checker enforces on a connection; a zero

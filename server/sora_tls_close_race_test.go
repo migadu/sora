@@ -86,6 +86,11 @@ func TestSoraTLSConnCloseConcurrentWithHandshakeEnd(t *testing.T) {
 		{"Close", func(c *SoraTLSConn) { _ = c.Close() }},
 		// RawConn walks Unwrap from the forced-close timers.
 		{"Unwrap", func(c *SoraTLSConn) { _ = RawConn(c).Close() }},
+		{"LocalAddr", func(c *SoraTLSConn) { _ = c.LocalAddr() }},
+		{"RemoteAddr", func(c *SoraTLSConn) { _ = c.RemoteAddr() }},
+		{"SetDeadline", func(c *SoraTLSConn) { _ = c.SetDeadline(time.Now().Add(time.Hour)) }},
+		{"SetReadDeadline", func(c *SoraTLSConn) { _ = c.SetReadDeadline(time.Now().Add(time.Hour)) }},
+		{"SetWriteDeadline", func(c *SoraTLSConn) { _ = c.SetWriteDeadline(time.Now().Add(time.Hour)) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ending := make(chan struct{})
@@ -136,5 +141,93 @@ func TestSoraTLSConnHandshakeEndingAfterCloseIsNotPublished(t *testing.T) {
 	}
 	if got := sc.CheckedTimeouts(); got != (CheckedTimeouts{}) {
 		t.Errorf("closed connection checked with %+v, want none", got)
+	}
+}
+
+type handshakeReadConn struct {
+	net.Conn
+	once    sync.Once
+	reading chan struct{}
+}
+
+func (c *handshakeReadConn) Read(p []byte) (int, error) {
+	c.once.Do(func() { close(c.reading) })
+	return c.Conn.Read(p)
+}
+
+// Close must interrupt a stalled pre-handshake read without waiting for the
+// handshake mutex, so cancellation does not wait for the handshake's deadline.
+func TestSoraTLSConnCloseInterruptsPendingHandshake(t *testing.T) {
+	transport, peer := net.Pipe()
+	t.Cleanup(func() { transport.Close(); peer.Close() })
+	reading := make(chan struct{})
+	c := NewSoraTLSConn(&handshakeReadConn{Conn: transport, reading: reading}, &tls.Config{}, SoraConnConfig{Protocol: "test"})
+	handshake := make(chan error, 1)
+	go func() { handshake <- c.PerformHandshake() }()
+	select {
+	case <-reading:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handshake did not start reading")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close waited for the pending handshake")
+	}
+	select {
+	case err := <-handshake:
+		if err == nil {
+			t.Fatal("closed handshake succeeded")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not interrupt the handshake")
+	}
+}
+
+type blockingDeadlineConn struct {
+	net.Conn
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingDeadlineConn) SetReadDeadline(time.Time) error {
+	close(c.entered)
+	<-c.release
+	return nil
+}
+
+func (c *blockingDeadlineConn) Close() error {
+	c.once.Do(func() { close(c.release) })
+	return c.Conn.Close()
+}
+
+// Forwarding a deadline must release closeMutex before calling the socket: a
+// blocked wrapper may need Close to complete, just like Read and Write do.
+func TestSoraConnDeadlineDoesNotPreventClose(t *testing.T) {
+	transport, peer := net.Pipe()
+	raw := &blockingDeadlineConn{Conn: transport, entered: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { raw.Close(); peer.Close() })
+	c := NewSoraConn(raw, SoraConnConfig{Protocol: "test"})
+	deadline := make(chan error, 1)
+	go func() { deadline <- c.SetReadDeadline(time.Now().Add(time.Hour)) }()
+	select {
+	case <-raw.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deadline did not reach the socket")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("forwarded deadline prevented Close")
+	}
+	select {
+	case <-deadline:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not release the deadline call")
 	}
 }
