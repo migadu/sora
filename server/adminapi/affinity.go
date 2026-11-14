@@ -157,8 +157,9 @@ func (s *Server) handleAffinityDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAffinityList handles GET /admin/affinity/list[?protocol=x][&backend=y] - lists
-// this node's affinities, optionally of one protocol or one backend. Every node applies
-// the affinities the others gossip, so any node of a converged cluster lists the same set.
+// this node's affinities, optionally of one protocol or one backend: those it assigned
+// and those it received by gossip. A node that was down or joined after an affinity was
+// gossiped does not hold it (there is no full-state exchange), so nodes can differ.
 func (s *Server) handleAffinityList(w http.ResponseWriter, r *http.Request) {
 	protocol := strings.ToLower(r.URL.Query().Get("protocol"))
 	backend := r.URL.Query().Get("backend")
