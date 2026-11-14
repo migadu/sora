@@ -8,7 +8,7 @@ import (
 // An invalid [server.remote_lookup] remote_port was never rejected: the proxy dropped an
 // unparsable or wrongly typed value with a Debug log and dialed a fallback port, and used
 // a negative or out-of-range number as given. Validate (startup, SIGHUP reload and
-// sora-admin config validate) now refuses it, as main does for the block's own remote_port.
+// sora-admin config validate) now refuses it, as it does the block's own remote_port.
 func TestServerConfigValidateRemoteLookupPort(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -67,4 +67,62 @@ url = "http://127.0.0.1:8080/lookup?email=$email"
 			}
 		})
 	}
+}
+
+// A proxy's own remote_port was parsed only when the proxy started, so sora-admin config
+// validate passed a value sora then refused to start with, and a SIGHUP reload applied
+// the block without a word. Validate refuses it on every proxy type. Other servers never
+// read remote_port or remote_lookup, so an unused value there is not an error.
+func TestServerConfigValidateProxyRemotePort(t *testing.T) {
+	load := func(t *testing.T, typ, extra string) []error {
+		t.Helper()
+		cfg, err := loadPoolsConfig(t, `
+[[server]]
+type = "`+typ+`"
+name = "srv"
+addr = ":1143"
+`+extra)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return validateServers(&cfg)
+	}
+
+	for _, typ := range []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"} {
+		for _, port := range []string{"", "143", `"143"`, `""`, "0", "65535"} {
+			t.Run(typ+" valid "+port, func(t *testing.T) {
+				extra := ""
+				if port != "" {
+					extra = "remote_port = " + port + "\n"
+				}
+				if errs := load(t, typ, extra); len(errs) != 0 {
+					t.Fatalf("validation errors = %v, want none", errs)
+				}
+			})
+		}
+		for _, port := range []string{`"143x"`, "-1", `"-1"`, "70000", "1.5", "true"} {
+			t.Run(typ+" invalid "+port, func(t *testing.T) {
+				errs := load(t, typ, "remote_port = "+port+"\n")
+				if len(errs) != 1 {
+					t.Fatalf("validation errors = %v, want one for remote_port = %s", errs, port)
+				}
+				if msg := errs[0].Error(); !strings.Contains(msg, "invalid remote_port") || !strings.Contains(msg, `"srv"`) {
+					t.Errorf("error = %q, want it to name the server and remote_port", msg)
+				}
+			})
+		}
+	}
+
+	t.Run("unused on a backend", func(t *testing.T) {
+		errs := load(t, "imap", `remote_port = "143x"
+
+[server.remote_lookup]
+enabled = true
+url = "http://127.0.0.1:8080/lookup?email=$email"
+remote_port = "1993x"
+`)
+		if len(errs) != 0 {
+			t.Fatalf("validation errors = %v, want none: an imap server reads neither remote_port", errs)
+		}
+	})
 }
