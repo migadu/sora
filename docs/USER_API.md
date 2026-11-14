@@ -439,7 +439,7 @@ the pages.
 
 `GET /user/messages/{id}`
 
-Returns one message object (section 10), with `references` and without `bcc`.
+Returns one message object (section 10), with `references`.
 
 `400 Invalid message ID`, `404 Message not found`, `500 Failed to retrieve message`.
 
@@ -575,7 +575,7 @@ Response `200`:
 
 | Field | Meaning |
 |---|---|
-| `messages` | Up to 100 matches, newest arrival first. Message objects without `bcc` and `references`. |
+| `messages` | Up to 100 matches, newest arrival first. Message objects without `references`. |
 | `total` | The number of messages in this response. |
 | `truncated` | `true` when more than 100 messages matched. Narrow the query to reach the others. |
 | `limit` | Always `100`. |
@@ -721,14 +721,14 @@ return messages in this shape:
 | `mailbox_id`, `mailbox_path` | The mailbox it is in. |
 | `subject` | The decoded `Subject`. |
 | `from` | The first `From` address, address only (no display name). |
-| `to`, `cc`, `bcc` | Addresses only. `cc` is filled in lists, search results and `GET /user/messages/{id}`; `bcc` only in lists. `to` is always present (`[]` when the message has none); empty `cc` and `bcc` are left out. |
+| `to`, `cc`, `bcc` | Addresses only, the same in lists, search results and `GET /user/messages/{id}`. `to` is always present (`[]` when the message has none); empty `cc` and `bcc` are left out. |
 | `date` | The message's `Date` header, as stored. |
 | `internal_date` | When the message arrived in Sora. |
 | `size` | Bytes. |
 | `flags` | System flags. `[]` when there are none. |
 | `custom_flags` | Keywords. Left out when there are none. |
 | `message_id`, `in_reply_to` | From the headers. |
-| `references` | The `References` header; only in `GET /user/messages/{id}`. |
+| `references` | The `References` header; only in `GET /user/messages/{id}` and the `data` of a flag change. |
 | `content_hash` | The hash that names the stored body. Messages with the same content share it. |
 | `has_attachments` | From the RFC 9979 keywords: `true` with `$hasattachment`, `false` with `$hasnoattachment`, left out when the message carries neither (mail Sora stored before it set them, or mail it could not inspect). |
 
