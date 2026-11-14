@@ -585,13 +585,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
 	}
 }
 
-// writeError answers status with the User API's JSON error. A 401 carries the Bearer
-// challenge that RFC 9110 section 15.5.2 requires on every 401: the one for a request
-// without a token, unless the caller set another (writeTokenRefused).
 func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
-	if status == http.StatusUnauthorized && w.Header().Get("WWW-Authenticate") == "" {
-		server.SetBearerChallenge(w.Header(), server.UserAPIRealm, false)
-	}
 	s.writeJSON(w, status, map[string]string{"error": message})
 }
 

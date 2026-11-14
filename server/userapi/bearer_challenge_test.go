@@ -23,9 +23,9 @@ const (
 	refusedTokenChallenge = `Bearer realm="user-api", error="invalid_token"`
 )
 
-// TestUnauthorizedCarriesBearerChallenge checks that every 401 of the User API carries
-// the Bearer challenge: the token check in front of the protected endpoints, the refresh
-// of a refused token and a refused login.
+// Bearer-protected endpoints challenge their clients. The public JSON login and
+// refresh endpoints keep their legacy 401 status but do not advertise an HTTP
+// authentication scheme they do not accept (#790).
 func TestUnauthorizedCarriesBearerChallenge(t *testing.T) {
 	s, err := New(nil, ServerOptions{Name: "challenge", JWTSecret: "bearer-challenge-test-secret-32-bytes!"})
 	if err != nil {
@@ -47,8 +47,8 @@ func TestUnauthorizedCarriesBearerChallenge(t *testing.T) {
 		{name: "bearer without a token", method: http.MethodGet, path: "/user/filters", auth: "Bearer", want: noTokenChallenge},
 		{name: "expired token", method: http.MethodGet, path: "/user/mailboxes", auth: "Bearer " + expired, want: refusedTokenChallenge},
 		{name: "malformed token", method: http.MethodGet, path: "/user/messages/1", auth: "Bearer not.a.jwt", want: refusedTokenChallenge},
-		{name: "refresh of a malformed token", method: http.MethodPost, path: "/user/auth/refresh", body: `{"token":"not.a.jwt"}`, want: refusedTokenChallenge},
-		{name: "refresh of an expired token", method: http.MethodPost, path: "/user/auth/refresh", body: `{"token":"` + expired + `"}`, want: refusedTokenChallenge},
+		{name: "refresh of a malformed token", method: http.MethodPost, path: "/user/auth/refresh", body: `{"token":"not.a.jwt"}`},
+		{name: "refresh of an expired token", method: http.MethodPost, path: "/user/auth/refresh", body: `{"token":"` + expired + `"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
@@ -60,14 +60,19 @@ func TestUnauthorizedCarriesBearerChallenge(t *testing.T) {
 			if w.Code != http.StatusUnauthorized {
 				t.Fatalf("status %d, want 401 (body %q)", w.Code, w.Body.String())
 			}
-			if got := w.Header().Values("WWW-Authenticate"); len(got) != 1 || got[0] != tc.want {
+			got := w.Header().Values("WWW-Authenticate")
+			if tc.want == "" {
+				if len(got) != 0 {
+					t.Errorf("public JSON endpoint advertised an inapplicable Bearer challenge: %q", got)
+				}
+			} else if len(got) != 1 || got[0] != tc.want {
 				t.Errorf("WWW-Authenticate = %q, want %q", got, tc.want)
 			}
 		})
 	}
 
-	// A refused login presented no bearer token: it gets the realm's challenge without an
-	// error code. The login comes from a blocked address, which is answered as a wrong
+	// A login authenticates JSON credentials rather than an HTTP Bearer token.
+	// The login comes from a blocked address, which is answered as a wrong
 	// password is (security-audit M14) before any database lookup.
 	t.Run("refused login", func(t *testing.T) {
 		const clientIP = "203.0.113.9"
@@ -93,8 +98,8 @@ func TestUnauthorizedCarriesBearerChallenge(t *testing.T) {
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("status %d, want 401 (body %q)", w.Code, w.Body.String())
 		}
-		if got := w.Header().Values("WWW-Authenticate"); len(got) != 1 || got[0] != noTokenChallenge {
-			t.Errorf("WWW-Authenticate = %q, want %q", got, noTokenChallenge)
+		if got := w.Header().Values("WWW-Authenticate"); len(got) != 0 {
+			t.Errorf("public JSON login advertised an inapplicable Bearer challenge: %q", got)
 		}
 	})
 }

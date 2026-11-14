@@ -644,12 +644,14 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
+			server.SetBearerChallenge(w.Header(), bearerRealm, false)
 			s.writeError(w, http.StatusUnauthorized, "Authorization header required")
 			return
 		}
 
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+			server.SetBearerChallenge(w.Header(), bearerRealm, false)
 			s.writeError(w, http.StatusUnauthorized, "Authorization header must be 'Bearer <token>'")
 			return
 		}
@@ -699,14 +701,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {
 // bearerRealm is the realm of the Admin API's Bearer challenge.
 const bearerRealm = "admin-api"
 
-// writeError answers status with the Admin API's JSON error. A 401 carries the Bearer
-// challenge that RFC 9110 section 15.5.2 requires on every 401; the Admin API answers 401
-// only to a request without a bearer token, so the challenge has no error code (RFC 6750
-// section 3.1).
 func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
-	if status == http.StatusUnauthorized {
-		server.SetBearerChallenge(w.Header(), bearerRealm, false)
-	}
 	s.writeJSON(w, status, map[string]string{"error": message})
 }
 
