@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"github.com/migadu/sora/logger"
@@ -25,6 +26,13 @@ var ErrNoProxyHeader = errors.New("no PROXY protocol header found")
 // TRUSTED peers, which indicate a misconfigured proxy fleet (a peer that
 // should send PROXY headers but doesn't).
 var ErrUntrustedProxySource = errors.New("PROXY protocol connection from untrusted source")
+
+// proxyV1Sig opens every PROXY v1 line and proxyV2Sig every v2 header (haproxy
+// doc/proxy-protocol.txt sections 2.1 and 2.2).
+var (
+	proxyV1Sig = []byte("PROXY")
+	proxyV2Sig = []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
+)
 
 // ProxyProtocolConfig is an alias for config.ProxyProtocolConfig for compatibility
 type ProxyProtocolConfig = config.ProxyProtocolConfig
@@ -173,8 +181,16 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 	// Create buffered reader
 	reader := bufio.NewReader(conn)
 
-	// Peek at first few bytes to detect PROXY protocol
-	peek, err := reader.Peek(16) // Peek more bytes to detect PROXY v2 signature
+	// Wait only for the bytes that tell the headers apart. Every v1 line starts
+	// with the 5-byte v1 signature and the shortest one, "PROXY UNKNOWN\r\n", is
+	// 15 bytes; on the server-speaks-first protocols the sender then waits for the
+	// greeting, so waiting for the 16 bytes of a v2 header before looking would
+	// hold that connection until the timeout. Only a stream that starts like the
+	// v2 signature is peeked further.
+	peek, err := reader.Peek(len(proxyV1Sig))
+	if err == nil && bytes.HasPrefix(proxyV2Sig, peek) {
+		peek, err = reader.Peek(len(proxyV2Sig))
+	}
 	if err != nil {
 		// If peeking fails (e.g., connection closed immediately), it's not a "no header" case.
 		// It's a connection error.
@@ -188,7 +204,7 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 	}
 
 	// Check for PROXY v1 signature
-	if len(peek) >= 5 && string(peek[:5]) == "PROXY" {
+	if bytes.Equal(peek, proxyV1Sig) {
 		logger.Debug("PROXY protocol: Detected v1", "remote", GetAddrString(conn.RemoteAddr()))
 		info, err := r.parseProxyV1(reader)
 		if err != nil {
@@ -210,42 +226,29 @@ func (r *ProxyProtocolReader) ReadProxyHeader(conn net.Conn) (*ProxyProtocolInfo
 	}
 
 	// Check for PROXY v2 signature (binary)
-	if len(peek) >= 12 {
-		// PROXY v2 signature: \x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A
-		v2Sig := []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
-		if len(peek) >= len(v2Sig) {
-			match := true
-			for i, b := range v2Sig {
-				if peek[i] != b {
-					match = false
-					break
-				}
-			}
-			if match {
-				logger.Debug("PROXY protocol: Detected v2", "remote", GetAddrString(conn.RemoteAddr()))
-				info, err := r.parseProxyV2(reader)
-				if err != nil {
-					return nil, conn, fmt.Errorf("failed to parse PROXY v2 header: %w", err)
-				}
-
-				if info.SrcIP != "" {
-					logger.Debug("PROXY protocol: Parsed v2", "client_ip", info.SrcIP, "client_port", info.SrcPort, "server_ip", info.DstIP, "server_port", info.DstPort)
-				} else {
-					logger.Debug("PROXY protocol: Parsed v2 command", "command", info.Command)
-				}
-
-				// Clear read deadline
-				conn.SetReadDeadline(time.Time{})
-
-				// Return wrapped connection
-				wrappedConn := &proxyProtocolConn{
-					Conn:   conn,
-					reader: reader,
-				}
-
-				return info, wrappedConn, nil
-			}
+	if bytes.Equal(peek, proxyV2Sig) {
+		logger.Debug("PROXY protocol: Detected v2", "remote", GetAddrString(conn.RemoteAddr()))
+		info, err := r.parseProxyV2(reader)
+		if err != nil {
+			return nil, conn, fmt.Errorf("failed to parse PROXY v2 header: %w", err)
 		}
+
+		if info.SrcIP != "" {
+			logger.Debug("PROXY protocol: Parsed v2", "client_ip", info.SrcIP, "client_port", info.SrcPort, "server_ip", info.DstIP, "server_port", info.DstPort)
+		} else {
+			logger.Debug("PROXY protocol: Parsed v2 command", "command", info.Command)
+		}
+
+		// Clear read deadline
+		conn.SetReadDeadline(time.Time{})
+
+		// Return wrapped connection
+		wrappedConn := &proxyProtocolConn{
+			Conn:   conn,
+			reader: reader,
+		}
+
+		return info, wrappedConn, nil
 	}
 
 	// No PROXY protocol detected, clear deadline and return original connection
@@ -386,11 +389,8 @@ func (r *ProxyProtocolReader) parseProxyV2(reader *bufio.Reader) (*ProxyProtocol
 	}
 
 	// Verify signature (already checked by caller, but double-check)
-	v2Sig := []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
-	for i, b := range v2Sig {
-		if header[i] != b {
-			return nil, fmt.Errorf("invalid PROXY v2 signature")
-		}
+	if !bytes.Equal(header[:len(proxyV2Sig)], proxyV2Sig) {
+		return nil, fmt.Errorf("invalid PROXY v2 signature")
 	}
 
 	// Parse version and command (byte 12)
