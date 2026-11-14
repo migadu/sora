@@ -108,10 +108,9 @@ var ErrObjectTooLarge = errors.New("object size exceeds limit")
 type cacheShard struct {
 	db *sql.DB
 	mu sync.Mutex
-	// size is an upper bound on the bytes the shard's index tracks, guarded by mu. It is
-	// measured when the shard is opened and by every purge of it, and grows with every
-	// object tracked. Removals other than a purge's leave it high, which costs at most
-	// one needless purge check.
+	// size tracks the bytes in the shard's index, guarded by mu. Local inserts,
+	// replacements and removals update it; opening or purging the shard measures it
+	// again because another process (such as sora-admin) can change the shared index.
 	size int64
 }
 

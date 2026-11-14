@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -124,4 +125,37 @@ func TestDuplicateWriteAndDeleteKeepShardSizeAccurate(t *testing.T) {
 	sizeAfterDelete := shard.size
 	shard.mu.Unlock()
 	assert.Equal(t, int64(0), sizeAfterDelete)
+}
+
+func TestMaintenanceRemovalKeepsShardSizeAccurate(t *testing.T) {
+	c, _ := newTestCache(t, 100*NumShards, 100)
+	c.orphanCleanupAge = 0
+	data, hash := randomDataAndHash(t, 40)
+	shard := c.getShard(hash)
+	ctx := context.Background()
+
+	for _, cleanup := range []string{"stale", "orphan", "delete absent"} {
+		t.Run(cleanup, func(t *testing.T) {
+			require.NoError(t, c.Put(hash, data))
+			switch cleanup {
+			case "stale":
+				require.NoError(t, os.Remove(c.GetPathForContentHash(hash)))
+				require.NoError(t, c.removeStaleEntriesForShard(ctx, shard))
+			case "orphan":
+				require.NoError(t, c.PurgeOrphanedContentHashes(ctx))
+			case "delete absent":
+				require.NoError(t, os.Remove(c.GetPathForContentHash(hash)))
+				require.NoError(t, c.Delete(hash))
+				require.NoError(t, c.Delete(hash))
+			}
+			shard.mu.Lock()
+			var indexedSize int64
+			err := shard.db.QueryRow(`SELECT COALESCE(SUM(size), 0) FROM cache_index`).Scan(&indexedSize)
+			trackedSize := shard.size
+			shard.mu.Unlock()
+			require.NoError(t, err)
+			assert.Equal(t, int64(0), indexedSize)
+			assert.Equal(t, indexedSize, trackedSize)
+		})
+	}
 }
