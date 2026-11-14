@@ -732,8 +732,9 @@ func (s *Session) ErrorLog(msg string, keyvals ...any) {
 //   - XRCPTFORWARD: Dovecot-specific forwarding information (original recipient)
 //
 // Stripped parameters:
-//   - NOTIFY, ORCPT, RET, ENVID: DSN (RFC 3461), which neither the proxy nor the
-//     backend announces; an MTA should not send them, but some do
+//   - NOTIFY, ORCPT: DSN (RFC 3461 §4.1, §4.2), which neither the proxy nor the
+//     backend announces; an MTA should not send them, but some do. RET and ENVID,
+//     the DSN parameters of MAIL (§4.3, §4.4), are dropped by backendMailFrom.
 //   - Any other unknown ESMTP parameters
 //
 // Examples:
@@ -1778,6 +1779,7 @@ func isSMTPUTF8Capability(line string) bool {
 }
 
 // backendMailFrom is the MAIL command sent to the backend for the current transaction.
+// The MTA's other MAIL parameters (RET and ENVID among them) are not forwarded.
 // The SMTPUTF8 parameter goes with it only when the backend advertised the extension
 // (RFC 6531 §3.2): a backend without it gets the plain command and, if the envelope is
 // in fact non-ASCII, decides for itself — sora backends accept it — which is what keeps
