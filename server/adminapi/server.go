@@ -62,6 +62,7 @@ type Server struct {
 	storage        *storage.S3Storage
 	purgeWorker    *cleaner.PurgeWorker // this node's purge worker, nil on a node without object storage
 	relayQueue     delivery.RelayQueue  // Global relay queue for mail delivery
+	relayWorker    RelayWorkerNotifier  // woken after mail delivery queues a message; nil waits for its next pass
 	maxMessageSize int64                // Max accepted mail-injection body size (bytes); 0 -> default
 	maxConnections int                  // Max concurrent connections; 0 -> unlimited
 	server         *http.Server
@@ -100,6 +101,11 @@ func (s *Server) DrainSessions() int64 {
 	return s.deliveriesOpen.Load()
 }
 
+// RelayWorkerNotifier wakes the relay worker to send newly queued mail at once.
+type RelayWorkerNotifier interface {
+	NotifyQueued()
+}
+
 // ServerOptions holds configuration options for the HTTP API server
 type ServerOptions struct {
 	Name               string
@@ -113,6 +119,7 @@ type ServerOptions struct {
 	Storage            *storage.S3Storage
 	PurgeWorker        *cleaner.PurgeWorker // woken when a purge is requested on this node; nil without object storage
 	RelayQueue         delivery.RelayQueue  // Global relay queue for mail delivery
+	RelayWorker        RelayWorkerNotifier  // Global relay worker, woken for what mail delivery queues (nil: next pass)
 	MaxMessageSize     int64                // Max accepted mail-injection body size (bytes); 0 -> 50MB default
 	MaxConnections     int                  // Max concurrent connections; 0 -> unlimited
 	TLS                bool
@@ -267,6 +274,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		storage:            options.Storage,
 		purgeWorker:        options.PurgeWorker,
 		relayQueue:         options.RelayQueue,
+		relayWorker:        options.RelayWorker,
 		maxMessageSize:     options.MaxMessageSize,
 		maxConnections:     options.MaxConnections,
 		tls:                options.TLS,
