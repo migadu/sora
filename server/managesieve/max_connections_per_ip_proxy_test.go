@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -40,8 +41,10 @@ func TestMaxConnectionsPerIPCountsPROXYClient(t *testing.T) {
 	} else {
 		t.Logf("first connection from 192.0.2.10: %q", line)
 	}
-	if line, err := dialPROXYClient(t, addr, "192.0.2.10"); err == nil {
-		t.Errorf("second connection from 192.0.2.10 behind a trusted PROXY peer was greeted (%q), want it closed by max_connections_per_ip = 1", line)
+	// Refused with a reply, not a silent close: the PROXY peer is a proxy that has to
+	// tell one client's refusal from a dead backend (#703).
+	if line, err := dialPROXYClient(t, addr, "192.0.2.10"); err != nil || !strings.HasPrefix(line, "NO ") {
+		t.Errorf("second connection from 192.0.2.10 behind a trusted PROXY peer: %q, %v; want max_connections_per_ip = 1 to refuse it with a NO reply", line, err)
 	}
 	if _, err := dialPROXYClient(t, addr, "192.0.2.11"); err != nil {
 		t.Errorf("connection from another client, 192.0.2.11: %v", err)
