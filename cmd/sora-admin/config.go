@@ -130,22 +130,27 @@ func handleConfigDump(_ context.Context) {
 	var configFile string
 	var format string = "toml"
 	var maskSecrets bool = true
+	var configSeen, missingConfigValue bool
 
 	seenDump := false
 	var dumpArgs []string
 	for i := 1; i < len(os.Args); i++ {
 		if os.Args[i] == "--config" {
 			if i+1 < len(os.Args) {
-				if configFile == "" {
+				if !configSeen {
 					configFile = os.Args[i+1]
+					configSeen = true
 				}
 				i++ // the value, even when it starts with "-" or is "dump"
+			} else {
+				missingConfigValue = true
 			}
 			continue
 		}
 		if strings.HasPrefix(os.Args[i], "--config=") {
-			if configFile == "" {
+			if !configSeen {
 				configFile = strings.TrimPrefix(os.Args[i], "--config=")
+				configSeen = true
 			}
 			continue
 		}
@@ -181,6 +186,13 @@ Examples:
 
 	if len(dumpArgs) > 0 {
 		flagSet.Parse(dumpArgs)
+	}
+	// Let an earlier --help retain flag.FlagSet's usual success behavior.
+	// Otherwise a stripped --config still needs its required argument.
+	if missingConfigValue {
+		fmt.Fprintln(os.Stderr, "flag needs an argument: -config")
+		flagSet.Usage()
+		os.Exit(2)
 	}
 
 	if configFile == "" {

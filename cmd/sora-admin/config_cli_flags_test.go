@@ -155,3 +155,30 @@ func TestRootHelpWithConfigFlagExitsZero(t *testing.T) {
 		}
 	})
 }
+
+func TestConfigDumpRejectsIncompleteConfigFlags(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fixture.toml")
+	if err := os.WriteFile(path, []byte("[admin_cli]\naddr = \"https://fixture.example.invalid\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		args []string
+		code int
+	}{
+		{"missing trailing value", []string{"--config", path, "config", "dump", "--config"}, 2},
+		{"missing only value", []string{"config", "dump", "--config"}, 2},
+		{"first empty value stays first", []string{"--config=", "config", "dump", "--config", path}, 1},
+		{"help before missing value", []string{"config", "dump", "--help", "--config"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, code := runAdminMain(t, tc.args...)
+			if code != tc.code {
+				t.Errorf("exit code %d, want %d:\n%s", code, tc.code, out)
+			}
+			if strings.Contains(out, "https://fixture.example.invalid") {
+				t.Errorf("invalid argv unexpectedly dumped the fixture:\n%s", out)
+			}
+		})
+	}
+}
