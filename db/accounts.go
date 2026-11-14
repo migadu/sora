@@ -74,7 +74,7 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 				return 0, fmt.Errorf("failed to generate bcrypt hash: %w", err)
 			}
 		default:
-			return 0, fmt.Errorf("%w: unsupported hash type: %s", ErrInvalidAccountRequest, req.HashType)
+			return 0, fmt.Errorf("%w: %w: %s", ErrInvalidAccountRequest, ErrUnsupportedHashType, req.HashType)
 		}
 	}
 
@@ -146,7 +146,7 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 				return fmt.Errorf("failed to generate bcrypt hash: %w", err)
 			}
 		default:
-			return fmt.Errorf("unsupported hash type: %s", req.NewHashType)
+			return fmt.Errorf("%w: %w: %s", ErrInvalidAccountRequest, ErrUnsupportedHashType, req.NewHashType)
 		}
 	}
 
@@ -236,7 +236,7 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 				return fmt.Errorf("failed to generate bcrypt hash: %w", err)
 			}
 		default:
-			return fmt.Errorf("%w: unsupported hash type: %s", ErrInvalidAccountRequest, req.HashType)
+			return fmt.Errorf("%w: %w: %s", ErrInvalidAccountRequest, ErrUnsupportedHashType, req.HashType)
 		}
 	}
 
@@ -1159,7 +1159,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 					return 0, fmt.Errorf("credential %d: failed to generate bcrypt hash: %w", i+1, err)
 				}
 			default:
-				return 0, fmt.Errorf("%w: credential %d: unsupported hash type: %s", ErrInvalidAccountRequest, i+1, cred.HashType)
+				return 0, fmt.Errorf("%w: credential %d: %w: %s", ErrInvalidAccountRequest, i+1, ErrUnsupportedHashType, cred.HashType)
 			}
 		}
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/migadu/sora/server/sieveengine"
@@ -67,7 +68,7 @@ func TestKeepDefaultActionPreservesDefaultVacation(t *testing.T) {
 				if merged.Vacation != wantReply {
 					t.Errorf("vacation = %+v, want %+v", merged.Vacation, wantReply)
 				}
-				if merged.Action != defaultResult.Action || merged.Mailbox != defaultResult.Mailbox || !slices.Equal(merged.RedirectTo, defaultResult.RedirectTo) {
+				if merged.Action != defaultResult.Action || !slices.Equal(merged.Mailboxes, defaultResult.Mailboxes) || !slices.Equal(merged.RedirectTo, defaultResult.RedirectTo) {
 					t.Errorf("user keep changed the default action: %+v", merged)
 				}
 				if want := []string{"defaulttag", "usertag"}; !slices.Equal(merged.Flags, want) {
@@ -90,7 +91,7 @@ func TestKeepDefaultActionKeepsTheUserScriptsWork(t *testing.T) {
 	userEdit := sieveengine.HeaderEdit{Action: "add", FieldName: "Auto-Submitted", Value: "auto-generated"}
 	defaultResult := sieveengine.Result{
 		Action:      sieveengine.ActionFileInto,
-		Mailbox:     "Junk",
+		Mailboxes:   []string{"Junk"},
 		Flags:       []string{"\\Seen", "Spam"},
 		HeaderEdits: []sieveengine.HeaderEdit{defaultEdit},
 	}
@@ -104,8 +105,8 @@ func TestKeepDefaultActionKeepsTheUserScriptsWork(t *testing.T) {
 
 	merged := keepDefaultAction(defaultResult, userResult)
 
-	if merged.Action != sieveengine.ActionFileInto || merged.Mailbox != "Junk" {
-		t.Errorf("action %s mailbox %q, want the default's fileinto Junk", merged.Action, merged.Mailbox)
+	if merged.Action != sieveengine.ActionFileInto || strings.Join(merged.Mailboxes, ",") != "Junk" {
+		t.Errorf("action %s mailbox %q, want the default's fileinto Junk", merged.Action, strings.Join(merged.Mailboxes, ","))
 	}
 	if want := []string{"\\Seen", "Spam", "usertag"}; !slices.Equal(merged.Flags, want) {
 		t.Errorf("flags %v, want %v", merged.Flags, want)
@@ -261,8 +262,8 @@ func TestMergeSieveResultsUserKeepPreservesDefaultAction(t *testing.T) {
 			if !keptDefault {
 				t.Errorf("keptDefault = false, want the default's filing to stand")
 			}
-			if merged.Action != sieveengine.ActionFileInto || merged.Mailbox != "Junk" {
-				t.Errorf("action %s mailbox %q, want the default's fileinto Junk", merged.Action, merged.Mailbox)
+			if merged.Action != sieveengine.ActionFileInto || strings.Join(merged.Mailboxes, ",") != "Junk" {
+				t.Errorf("action %s mailbox %q, want the default's fileinto Junk", merged.Action, strings.Join(merged.Mailboxes, ","))
 			}
 			wantReply := defaultResult.Vacation
 			if user.ownReply {
