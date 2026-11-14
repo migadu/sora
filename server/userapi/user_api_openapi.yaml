@@ -586,7 +586,9 @@ paths:
         '409':
           description: A new script would exceed the limit of 100 scripts per account
         '413':
-          description: The script is larger than `max_script_size`
+          description: |
+            The script is larger than `max_script_size`, or the request body is larger
+            than the server reads for one script
 
     delete:
       tags:
@@ -835,8 +837,8 @@ components:
         message_id:
           type: string
           description: |
-            The Message-ID header, without angle brackets. A message delivered without
-            one has an ID Sora generated, in angle brackets.
+            The Message-ID header, without angle brackets. A message stored without a
+            Message-ID that parses has an ID Sora generated, in angle brackets.
           example: abc123@example.com
         in_reply_to:
           type: string

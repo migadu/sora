@@ -315,7 +315,7 @@ func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailbo
 // The new rows carry no text: the body was staged (or already indexed) when the source
 // message was delivered, so the FTS worker fills these by copying the finished vector from
 // a sibling rather than tokenising anything again. The EXISTS guard keeps us from creating
-// rows for a body that was never indexed at all -- over 64KB, empty, or already pruned --
+// rows for a body that was never indexed at all -- empty, past fts_retention, or pruned --
 // which would otherwise be queued forever and then poisoned.
 func (db *Database) restageFTS(ctx context.Context, tx pgx.Tx, mailboxID int64, newUIDs []int64) error {
 	if len(newUIDs) == 0 {
@@ -837,7 +837,8 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	// delivered and uploaded to S3 — it just won't be FTS-searchable.
 	if shouldStageFTS(options.FTSRetention, options.SentDate, time.Now()) {
 		// Decide what to store in messages_fts_v2.
-		// Skip very large bodies (>64KB) — the full content is always available in S3.
+		// Very large bodies (>64KB) are truncated to their first 64KB, which is all that
+		// gets indexed; the full content is always available in S3.
 		// text_body is staged in messages_fts_v2, then processed by fts_worker.
 		const maxStoredBodySize = 64 * 1024 // 64 KB
 		var textBodyArg any = sanePlaintextBody
@@ -1126,7 +1127,8 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 
 	if shouldStageFTS(options.FTSRetention, options.SentDate, time.Now()) {
 		// Decide what to store in messages_fts_v2.
-		// Skip very large bodies (>64KB) — the full content is always available in S3.
+		// Very large bodies (>64KB) are truncated to their first 64KB, which is all that
+		// gets indexed; the full content is always available in S3.
 		const maxStoredBodySize = 64 * 1024 // 64 KB
 		var textBodyArg any = sanePlaintextBody
 

@@ -345,7 +345,8 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			// 4. If Message B deletes the file, Message A's pending upload loses its source file
 			//
 			// The file will be cleaned up by the uploader's cleanupOrphanedFiles job
-			// (runs every 5 minutes with 10-minute grace period) if it's truly orphaned.
+			// (runs every 5 minutes; [uploader] cleanup_grace_period, default 1h) if it's
+			// truly orphaned.
 			// This is safer than trying to determine if a pending upload exists, because:
 			// - The pending upload might be for a different account with the same content hash
 			// - The pending upload check itself could race with upload completion

@@ -348,13 +348,21 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 			return 0, errAuthFailed
 		}
 
-		accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, targetAddr.BaseAddress())
+		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, targetAddr.BaseAddress())
 		if err != nil {
 			// The lookup was cut short (server shutdown, client gone), so nothing is
 			// known about the target: a temporary failure, not counted as a failed
 			// login, as on the regular login path below.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				s.InfoLog("master SASL authentication cancelled during the impersonation target lookup", "target_user", targetAddr.BaseAddress(), "error", err)
+				return 0, errTempUnavailable
+			}
+			// The database could not be asked, so nothing is known about the target:
+			// [SYS/TEMP] (RFC 3206 section 4), not a failed login charged to the master
+			// credential.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("impersonation target lookup unavailable", "target_user", targetAddr.BaseAddress(), "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
 				return 0, errTempUnavailable
 			}
 			// Same reply and same accounting as a bad credential (see above).
@@ -428,11 +436,17 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 					return 0, errAuthFailed
 				}
 
-				accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, targetAddr.BaseAddress())
+				accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, targetAddr.BaseAddress())
 				if err != nil {
 					// Cut short: a temporary failure, see the master SASL path above.
 					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 						s.InfoLog("master username authentication cancelled during the impersonation target lookup", "target_user", targetAddr.BaseAddress(), "error", err)
+						return 0, errTempUnavailable
+					}
+					// Database unavailable: see the master SASL path above.
+					if server.IsTemporaryAuthFailure(err) {
+						s.WarnLog("impersonation target lookup unavailable", "target_user", targetAddr.BaseAddress(), "error", err)
+						metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
 						return 0, errTempUnavailable
 					}
 					// Same reply and same accounting as a bad credential (see above).

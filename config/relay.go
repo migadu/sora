@@ -23,7 +23,7 @@ type RelayConfig struct {
 	SMTPUseStartTLS bool   `toml:"smtp_use_starttls"`  // Use STARTTLS instead of direct TLS (default: false); ignored when smtp_tls = false
 	SMTPTLSCertFile string `toml:"smtp_tls_cert_file"` // Client certificate for mTLS (optional)
 	SMTPTLSKeyFile  string `toml:"smtp_tls_key_file"`  // Client key for mTLS (optional)
-	SMTPHELOHost    string `toml:"smtp_helo_host"`     // Hostname to send in EHLO/HELO (default: "localhost"). Set to your FQDN for correct deliverability.
+	SMTPHELOHost    string `toml:"smtp_helo_host"`     // Hostname to send in EHLO/HELO (default: the system hostname, or "localhost" if it cannot be read). Set to your FQDN for correct deliverability.
 
 	// HTTP API relay configuration
 	HTTPURL   string `toml:"http_url"`                 // HTTP API endpoint (e.g., "https://api.example.com/v1/mail/deliver")
