@@ -1,9 +1,12 @@
 package uploader
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,4 +64,55 @@ func TestStagingAccountDirOutlivesItsLastBody(t *testing.T) {
 			require.NoError(t, f.Close())
 		})
 	}
+}
+
+// TestConcurrentStagingsOfOneBody stages one body for one account from several
+// goroutines at once, as two sessions do when they APPEND the same bytes and both pass
+// their callers' Stat before either has renamed its file into place (#752). Every
+// staging must succeed, the staged body must be complete, and no temporary file may be
+// left behind. With one shared <hash>.tmp, one writer's rename moved the name away from
+// under the other, whose own rename then failed with ENOENT (IMAP NO, LMTP 451).
+func TestConcurrentStagingsOfOneBody(t *testing.T) {
+	const (
+		accountID = int64(752)
+		writers   = 8
+		rounds    = 10
+	)
+	w := &UploadWorker{path: t.TempDir()}
+	body := bytes.Repeat([]byte("the same message bytes\r\n"), 4096)
+
+	for round := 1; round <= rounds; round++ {
+		hash := fmt.Sprintf("%064x", round)
+
+		start := make(chan struct{})
+		errs := make(chan error, writers)
+		var wg sync.WaitGroup
+		for range writers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				_, err := w.StoreLocally(hash, accountID, body)
+				errs <- err
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+
+		for err := range errs {
+			require.NoError(t, err, "round %d: a concurrent staging of the same body must succeed", round)
+		}
+		got, err := os.ReadFile(w.FilePath(hash, accountID))
+		require.NoError(t, err)
+		require.True(t, bytes.Equal(body, got), "round %d: staged body has %d bytes, want the complete %d", round, len(got), len(body))
+	}
+
+	entries, err := os.ReadDir(filepath.Dir(w.FilePath(fmt.Sprintf("%064x", 1), accountID)))
+	require.NoError(t, err)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	require.Len(t, names, rounds, "only the staged bodies may remain, no temporary files: %v", names)
 }
