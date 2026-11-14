@@ -243,9 +243,9 @@ With `auth_token` set, the request carries `Authorization: Bearer <auth_token>`.
 
 The URL must use `https://`, unless its host is `localhost` or a loopback address. Sora refuses to
 start a proxy with a plain `http://` URL to any other host, because the request and answer carry
-password hashes. (With `lookup_local_users = true`, a proxy instead logs the error and runs without
-the remote lookup, checking every user in PostgreSQL. The User API proxy does so only when the file
-has no `[[pool]]` blocks.)
+password hashes. It also refuses a URL with `$email` or `$ip` in the host, and a `timeout`,
+`circuit_breaker` or `transport` duration it cannot parse, with `lookup_local_users` or without.
+`sora-admin config validate` fails the file for the same reasons.
 
 ### 4.2 The answer
 
