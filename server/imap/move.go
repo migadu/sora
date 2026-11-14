@@ -2,11 +2,13 @@ package imap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/resilient"
 )
 
 func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet imap.NumSet, dest string) error {
@@ -111,42 +113,44 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		destS3Localpart = localpart
 	}
 
+	// A cross-account move re-keys its rows to the destination owner's S3 path. A body
+	// already in S3 must exist under that path when they commit: MoveMessagesWithRetry
+	// checks or copies it (ensureDestObject) in the move's own transaction while that
+	// holds the object's lock, the lock the cleaner takes before it deletes an object no
+	// row it can see references, which the moved rows are not until that transaction
+	// commits. A body still staged locally is linked to the owner's staging path instead,
+	// for the upload MoveMessages re-stages.
+	type destObject struct {
+		sourceKey, destKey string
+		sourcePending      bool
+	}
+	destObjects := make(map[string]destObject)
+	var destHashes []string
 	for _, msg := range messages {
 		if msg.AccountID == destMailbox.AccountID {
 			continue // Same owner: body already lives under the correct S3 path.
 		}
-		// Cross-account move: the new row will be owned by the destination mailbox
-		// owner, so the body must be reachable under the owner's S3 path.
 		if !msg.IsUploaded {
 			if s.server.uploader == nil {
 				continue
 			}
-			// Body is still staged locally under the source account. Hardlink it to
-			// the owner's staging path so the uploader (re-staged in MoveMessages)
-			// uploads it under the owner's path. Failing here would silently lose the
-			// body, so treat it as fatal rather than warning and proceeding. A body
-			// that is not on this node is in S3 already, or on its way there: it
-			// takes the S3 path below.
-			staged, ierr := s.stageCrossAccountBody("move", msg.ContentHash, msg.AccountID, destMailbox.AccountID)
-			if ierr != nil {
-				return ierr
+			// A local body is linked for the owner's pending upload. If its staging
+			// file is on another node, defer the S3 fallback to the locked phase.
+			staged, err := s.stageCrossAccountBody("move", msg.ContentHash, msg.AccountID, destMailbox.AccountID)
+			if err != nil {
+				return err
 			}
 			if staged {
 				continue
 			}
 		}
-		// Body is in S3 under the source's path; copy it to the owner's path
-		// (skip if the owner already has it, e.g. via dedup).
-		sourceKey := helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash)
-		destKey := helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash)
-		exists, err := s.server.s3.ExistsWithRetry(ctx, destKey)
-		if err != nil {
-			s.WarnLog("failed to check if S3 object exists at destination", "destKey", destKey, "error", err)
-		}
-		if !exists {
-			if err := s.server.s3.CopyWithRetry(ctx, sourceKey, destKey); err != nil {
-				return s.crossAccountObjectError(!msg.IsUploaded, err)
+		if _, seen := destObjects[msg.ContentHash]; !seen {
+			destObjects[msg.ContentHash] = destObject{
+				sourceKey:     helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash),
+				destKey:       helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash),
+				sourcePending: !msg.IsUploaded,
 			}
+			destHashes = append(destHashes, msg.ContentHash)
 		}
 	}
 
@@ -159,8 +163,25 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		}
 	}
 
-	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname)
+	// ensureDestObject runs while the move's transaction holds the object's lock.
+	ensureDestObject := func(ctx context.Context, contentHash string) error {
+		obj := destObjects[contentHash]
+		exists, err := s.server.s3.ExistsWithRetry(ctx, obj.destKey)
+		if err != nil {
+			s.WarnLog("failed to check if S3 object exists at destination", "destKey", obj.destKey, "error", err)
+		}
+		if exists {
+			return nil // e.g. the owner already has the body
+		}
+		return s.server.s3.CopyWithRetry(ctx, obj.sourceKey, obj.destKey)
+	}
+
+	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname, destHashes, ensureDestObject)
 	if err != nil {
+		var destErr *resilient.DestObjectError
+		if errors.As(err, &destErr) {
+			return s.crossAccountObjectError(destObjects[destErr.ContentHash].sourcePending, destErr.Err)
+		}
 		return s.internalError("failed to move messages: %v", err)
 	}
 

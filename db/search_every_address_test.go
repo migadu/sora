@@ -126,7 +126,7 @@ func TestHeaderSearchMatchesEveryAddress(t *testing.T) {
 		copied, _, err := db.CopyMessages(ctx, tx, &copyUIDs, inboxID, archiveID, accountID, "example.com", "everyaddr", "test", nil)
 		require.NoError(t, err)
 		moveUIDs := []imap.UID{imap.UID(uidImport)}
-		moved, err := db.MoveMessages(ctx, tx, &moveUIDs, inboxID, archiveID, accountID, "example.com", "everyaddr", "test")
+		moved, err := db.MoveMessages(ctx, tx, &moveUIDs, inboxID, archiveID, accountID, "example.com", "everyaddr", "test", nil)
 		require.NoError(t, err)
 		require.NoError(t, tx.Commit(ctx))
 
