@@ -11,7 +11,7 @@ import (
 
 // TestRouterErrorsAreJSON covers the errors the router writes itself, before any
 // handler runs: a method the endpoint does not serve and a path no endpoint has.
-// docs/user-api.md ("Error Response Format") promises that every error is a JSON
+// docs/USER_API.md (section 4, "Requests, responses and errors") promises that every error is a JSON
 // object with an "error" field, so these must be application/json like the rest.
 // A 405 must also carry an Allow header listing the endpoint's methods (RFC 9110
 // section 15.5.6).
