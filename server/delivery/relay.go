@@ -67,8 +67,8 @@ type RelayHandler interface {
 // SMTPRelayHandler implements SMTP relay with configurable TLS and circuit breaker.
 type SMTPRelayHandler struct {
 	SMTPHost       string
-	UseTLS         bool   // Use TLS (default: true)
-	TLSVerify      bool   // Verify TLS certificates (default: true)
+	UseTLS         bool   // Use TLS; false relays in plaintext ([relay] smtp_tls, default true)
+	TLSVerify      bool   // Verify the relay's certificate ([relay] smtp_tls_verify, default true)
 	UseStartTLS    bool   // Use STARTTLS instead of direct TLS
 	TLSCertFile    string // Client certificate for mTLS (optional)
 	TLSKeyFile     string // Client key for mTLS (optional)

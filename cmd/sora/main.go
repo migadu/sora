@@ -971,8 +971,8 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					"",
 					"",
 					"relay_queue",
-					cfg.Relay.SMTPTLS,
-					cfg.Relay.SMTPTLSVerify,
+					cfg.Relay.GetSMTPTLS(),
+					cfg.Relay.GetSMTPTLSVerify(),
 					cfg.Relay.SMTPUseStartTLS,
 					cfg.Relay.SMTPTLSCertFile,
 					cfg.Relay.SMTPTLSKeyFile,
@@ -980,7 +980,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					&serverLogger{},
 					cbConfig,
 				)
-				logger.Info("Relay handler configured: type=smtp", "host", cfg.Relay.SMTPHost, "helo", cfg.Relay.GetSMTPHELOHost(), "tls", cfg.Relay.SMTPTLS, "starttls", cfg.Relay.SMTPUseStartTLS, "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
+				logger.Info("Relay handler configured: type=smtp", "host", cfg.Relay.SMTPHost, "helo", cfg.Relay.GetSMTPHELOHost(), "tls", cfg.Relay.GetSMTPTLS(), "tls_verify", cfg.Relay.GetSMTPTLSVerify(), "starttls", cfg.Relay.SMTPUseStartTLS, "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
 			} else if cfg.Relay.IsHTTP() {
 				relayType = "http"
 				relayHandler = delivery.NewRelayHandlerFromConfig(
@@ -999,6 +999,9 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 					cbConfig,
 				)
 				logger.Info("Relay handler configured: type=http", "url", cfg.Relay.HTTPURL, "cb_threshold", cbThreshold, "cb_timeout", cbTimeout, "cb_max_requests", cbMaxRequests)
+			}
+			if warning := cfg.Relay.TransportWarning(); warning != "" {
+				logger.Warn(warning)
 			}
 
 			if relayHandler == nil {
