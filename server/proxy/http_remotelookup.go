@@ -575,8 +575,6 @@ func DeriveAccountIDFromEmail(email string) int64 {
 // interpolating its placeholders:
 //   - $email: user email (MasterAddress - includes master token but not +detail)
 //   - $ip: client IP address; empty when the caller has none, never the literal placeholder
-//
-// validateRemoteLookupURL checks the template through this same function.
 func remoteLookupRequestURL(template, email, clientIP string, routeOnly bool) string {
 	requestURL := strings.ReplaceAll(template, "$email", url.QueryEscape(email))
 	requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
