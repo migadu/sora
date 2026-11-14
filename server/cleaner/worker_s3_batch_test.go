@@ -2,6 +2,7 @@ package cleaner
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -151,4 +152,40 @@ func TestCleanupWorker_S3DeletesAreBatchedAndOutsideTransactions(t *testing.T) {
 	assert.Len(t, probeDB.rowsDeleted, 3,
 		"message rows must be removed once their S3 body is gone")
 	mockDB.AssertExpectations(t)
+}
+
+// A batch can hold several candidates for one key (rows of different accounts point at
+// one object) and candidates whose object other accounts' rows still read (KeepObject).
+// The reaper must ask S3 to delete each key once, count a key once, keep the rows of
+// every candidate whose key S3 refused, and delete the rows of a KeepObject candidate
+// without touching its object.
+func TestReapS3Objects_SharedKeyFailureKeepsEveryCandidatesRows(t *testing.T) {
+	mockDB := new(mockDatabase)
+	mockS3 := new(mockS3)
+	ctx := context.Background()
+	grace := 24 * time.Hour
+
+	refusedA := db.UserScopedObjectForCleanup{AccountID: 1, ContentHash: "h1", S3Domain: "example.com", S3Localpart: "x"}
+	refusedB := db.UserScopedObjectForCleanup{AccountID: 2, ContentHash: "h1", S3Domain: "example.com", S3Localpart: "x"}
+	deletedA := db.UserScopedObjectForCleanup{AccountID: 1, ContentHash: "h2", S3Domain: "example.com", S3Localpart: "y"}
+	deletedC := db.UserScopedObjectForCleanup{AccountID: 3, ContentHash: "h2", S3Domain: "example.com", S3Localpart: "y"}
+	keptA := db.UserScopedObjectForCleanup{AccountID: 1, ContentHash: "h3", S3Domain: "example.com", S3Localpart: "z"}
+	candidates := []db.UserScopedObjectForCleanup{refusedA, refusedB, deletedA, deletedC, keptA}
+
+	keptAFlagged := keptA
+	keptAFlagged.KeepObject = true
+	orphans := []db.UserScopedObjectForCleanup{refusedA, refusedB, deletedA, deletedC, keptAFlagged}
+
+	mockDB.On("ExecuteWithLockedS3Orphans", ctx, candidates, grace).Return(orphans, nil).Once()
+	mockS3.On("DeleteBulkWithRetry", mock.Anything, []string{"example.com/x/h1", "example.com/y/h2"}).
+		Return(map[string]error{"example.com/x/h1": errors.New("refused")}).Once()
+	mockDB.On("DeleteExpungedMessagesByS3KeyPartsBatchWithRetry", mock.Anything,
+		[]db.UserScopedObjectForCleanup{deletedA, deletedC, keptAFlagged}).Return(int64(3), nil).Once()
+
+	deleted, rows, err := reapS3Objects(ctx, mockDB, mockS3, grace, candidates)
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted, "one object is gone from S3")
+	assert.Equal(t, int64(3), rows)
+	mockDB.AssertExpectations(t)
+	mockS3.AssertExpectations(t)
 }
