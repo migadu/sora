@@ -246,7 +246,10 @@ func TestConnectionLimitersOfAProtocolOnTwoNodesShareTheLimit(t *testing.T) {
 	}
 
 	// Node A, once node B's connection reaches it, refuses on both listeners.
+	// Each listener's tracker applies gossip on a goroutine of its own, so the
+	// event can reach one listener before the other: wait for both.
 	waitForCount("node A:143", imapA, 3)
+	waitForCount("node A:993", imapsA, 3)
 	for name, cl := range map[string]*ConnectionLimiter{"node A:143": imapA, "node A:993": imapsA} {
 		if _, err := cl.AcceptWithRealIP(client, ""); !errors.Is(err, ErrMaxConnectionsPerIP) {
 			t.Errorf("%s accept = %v, want %v: node A:143, node A:993 and node B:143 hold one each, max_connections_per_ip = 3", name, err, ErrMaxConnectionsPerIP)
