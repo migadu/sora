@@ -477,7 +477,8 @@ func (s *Server) Start() error {
 	// inline listener returned them, and net/http treats non-temporary
 	// Accept errors as fatal — one malformed header killed the listener).
 	// The HTTP variant makes RemoteAddr() report the forwarded client IP,
-	// which is what allowed_hosts and rate limiting read via r.RemoteAddr.
+	// which is what the per-IP connection limit counts and what the
+	// backends are told the client is.
 	listener = server.WrapProxyProtocolHTTP(listener, s.proxyReader, "USER-API-PROXY")
 
 	// Start serving. The certificate is in TLSConfig already: certificate
@@ -568,7 +569,7 @@ func (s *Server) setupHandler() http.Handler {
 
 // writeError answers r with an error the proxy writes itself, no backend having answered.
 // The body is the User API's error, {"error": msg} as application/json (the backend's
-// writeError, docs/user-api.md "Error Response Format"), so a client reads it as it reads
+// writeError, docs/USER_API.md section 4, "Requests, responses and errors"), so a client reads it as it reads
 // the backend's. It carries the CORS headers of the proxy's allowed_origins, as the
 // backend's own errors carry the backend's: without them a browser hands the page a
 // network error instead of the status, and a web client cannot tell an expired token from
