@@ -199,25 +199,9 @@ func showCacheStats(ctx context.Context, cfg AdminConfig) error {
 	// Parse cache configuration using defaulting methods
 	capacityBytes := cfg.LocalCache.GetCapacityWithDefault()
 	maxObjectSizeBytes := cfg.LocalCache.GetMaxObjectSizeWithDefault()
-	purgeInterval := cfg.LocalCache.GetPurgeIntervalWithDefault()
-	orphanCleanupAge := cfg.LocalCache.GetOrphanCleanupAgeWithDefault()
 
-	// Connect to minimal database instance for cache initialization
-	rdb, err := newAdminDatabase(ctx, &cfg.Database)
-	if err != nil {
-		return fmt.Errorf("failed to initialize resilient database: %w", err)
-	}
-	defer rdb.Close()
-
-	// Initialize cache
-	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, purgeInterval, orphanCleanupAge, rdb)
-	if err != nil {
-		return fmt.Errorf("failed to initialize cache: %w", err)
-	}
-	defer cacheInstance.Close()
-
-	// Get cache statistics
-	stats, err := cacheInstance.GetStats()
+	// Read-only: the cache belongs to the server running on this node.
+	objectCount, totalSize, err := cache.Usage(cfg.LocalCache.Path)
 	if err != nil {
 		return fmt.Errorf("failed to get cache statistics: %w", err)
 	}
@@ -226,11 +210,11 @@ func showCacheStats(ctx context.Context, cfg AdminConfig) error {
 	fmt.Printf("Cache Statistics\n")
 	fmt.Printf("================\n\n")
 	fmt.Printf("Cache path:         %s\n", cfg.LocalCache.Path)
-	fmt.Printf("Object count:       %d\n", stats.ObjectCount)
-	fmt.Printf("Total size:         %d bytes (%s)\n", stats.TotalSizeBytes, formatBytes(stats.TotalSizeBytes))
+	fmt.Printf("Object count:       %d\n", objectCount)
+	fmt.Printf("Total size:         %d bytes (%s)\n", totalSize, formatBytes(totalSize))
 	fmt.Printf("Capacity:           %d bytes (%s)\n", capacityBytes, cfg.LocalCache.Capacity)
 	fmt.Printf("Max object size:    %d bytes (%s)\n", maxObjectSizeBytes, cfg.LocalCache.MaxObjectSize)
-	fmt.Printf("Utilization:        %.1f%%\n", float64(stats.TotalSizeBytes)/float64(capacityBytes)*100)
+	fmt.Printf("Utilization:        %.1f%%\n", float64(totalSize)/float64(capacityBytes)*100)
 
 	return nil
 }
@@ -257,15 +241,8 @@ func purgeCacheWithConfirmation(ctx context.Context, cfg AdminConfig, autoConfir
 	purgeInterval := cfg.LocalCache.GetPurgeIntervalWithDefault()
 	orphanCleanupAge := cfg.LocalCache.GetOrphanCleanupAgeWithDefault()
 
-	// Connect to minimal database instance for cache initialization
-	rdb, err := newAdminDatabase(ctx, &cfg.Database)
-	if err != nil {
-		return fmt.Errorf("failed to initialize resilient database: %w", err)
-	}
-	defer rdb.Close()
-
-	// Initialize cache
-	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, purgeInterval, orphanCleanupAge, rdb)
+	// No database: New starts no purge loop, the only user of one.
+	cacheInstance, err := cache.New(cfg.LocalCache.Path, capacityBytes, maxObjectSizeBytes, purgeInterval, orphanCleanupAge, nil)
 	if err != nil {
 		return fmt.Errorf("failed to initialize cache: %w", err)
 	}

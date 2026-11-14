@@ -596,7 +596,7 @@ capacity = "1gb"              # Maximum total cache size (e.g., "100mb", "1gb").
 max_object_size = "5mb"       # Maximum size for individual cached objects. Prevents large messages from dominating cache.
 metrics_interval = "5m"       # How often cache hit/miss ratios are stored in the database.
 metrics_retention = "30d"     # How long to retain cache metrics in the database.
-purge_interval = "12h"        # How often to run cache cleanup (capacity enforcement, stale entry removal).
+purge_interval = "12h"        # How often to run cache cleanup (orphaned and stale entry removal, capacity re-check). Capacity is also enforced as objects are added.
 orphan_cleanup_age = "30d"    # Minimum age before orphaned cache entries (for deleted DB messages) are removed.
 
 # --- CACHE WARMUP ---
