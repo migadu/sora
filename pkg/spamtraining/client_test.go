@@ -2,9 +2,11 @@ package spamtraining
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,12 +27,19 @@ const testMessage = "From: sender@example.org\r\nTo: user@example.com\r\nSubject
 type recordingEndpoint struct {
 	mu       sync.Mutex
 	requests []TrainingRequest
+	bodies   [][]byte // the request bodies as sent
 }
 
 func (e *recordingEndpoint) received() []TrainingRequest {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]TrainingRequest(nil), e.requests...)
+}
+
+func (e *recordingEndpoint) receivedBodies() [][]byte {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([][]byte(nil), e.bodies...)
 }
 
 func (e *recordingEndpoint) waitFor(t *testing.T, n int) []TrainingRequest {
@@ -51,12 +60,17 @@ func newTestClient(t *testing.T, cfg config.SpamTrainingConfig) (*Client, *recor
 	t.Helper()
 	e := &recordingEndpoint{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading training request: %v", err)
+		}
 		var req TrainingRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.Unmarshal(body, &req); err != nil {
 			t.Errorf("training request does not decode: %v", err)
 		}
 		e.mu.Lock()
 		e.requests = append(e.requests, req)
+		e.bodies = append(e.bodies, body)
 		e.mu.Unlock()
 	}))
 	t.Cleanup(srv.Close)
@@ -255,6 +269,101 @@ func TestWorkerSubmitsTheFetchedMessage(t *testing.T) {
 	}
 }
 
+// TestSubmittedMessageKeepsItsBytes: a JSON string is Unicode, and json.Marshal
+// replaces every byte that is not valid UTF-8 with U+FFFD. 8-bit text in any other
+// charset, in a body, a part kept from a multipart or a raw header value, must
+// still reach the endpoint byte for byte: in message_base64, with message as it
+// was for receivers that do not read message_base64. A UTF-8 message is exact in
+// message and its request has no message_base64.
+func TestSubmittedMessageKeepsItsBytes(t *testing.T) {
+	multipart := "Subject: x\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n" +
+		"--b\r\nContent-Type: text/plain; charset=windows-1251\r\nContent-Transfer-Encoding: 8bit\r\n\r\n" +
+		"\xcf\xf0\xe8\xe2\xe5\xf2\r\n" +
+		"--b\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAAAA\r\n" +
+		"--b--\r\n"
+	strippedMultipart, err := StripAttachments([]byte(multipart))
+	if err != nil {
+		t.Fatalf("StripAttachments: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		message string // as fetched
+		want    string // as it must reach the endpoint
+		lossy   bool   // not valid UTF-8
+	}{{
+		name:    "8-bit iso-8859-1 single part",
+		message: "Subject: test\r\nContent-Type: text/plain; charset=iso-8859-1\r\nContent-Transfer-Encoding: 8bit\r\n\r\nSch\xf6n\r\n",
+		lossy:   true,
+	}, {
+		name:    "raw 8-bit header value",
+		message: "Subject: Sch\xf6n\r\nFrom: sender@example.org\r\n\r\nbody\r\n",
+		lossy:   true,
+	}, {
+		name:    "8-bit windows-1251 part kept from a multipart",
+		message: multipart,
+		want:    string(strippedMultipart),
+		lossy:   true,
+	}, {
+		name:    "UTF-8",
+		message: "Subject: Schön\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\nSchön <&>\r\n",
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			want := tc.want
+			if want == "" {
+				want = tc.message
+			}
+			c, endpoint := newTestClient(t, config.SpamTrainingConfig{})
+			err := c.Enqueue(Job{Type: TrainingTypeSpam, User: "user@example.com",
+				Size: int64(len(tc.message)), Open: openString(tc.message)})
+			if err != nil {
+				t.Fatalf("Enqueue: %v", err)
+			}
+			if got := endpoint.waitFor(t, 1); len(got) != 1 {
+				t.Fatalf("endpoint received %d submissions, want 1", len(got))
+			}
+
+			// Decoded as a receiver outside this package would.
+			var wire struct {
+				Message       string  `json:"message"`
+				MessageBase64 *string `json:"message_base64"`
+			}
+			if err := json.Unmarshal(endpoint.receivedBodies()[0], &wire); err != nil {
+				t.Fatalf("decoding the request: %v", err)
+			}
+
+			if !tc.lossy {
+				if wire.MessageBase64 != nil {
+					t.Errorf("a UTF-8 message was also sent in message_base64")
+				}
+				if wire.Message != want {
+					t.Errorf("message = %q, want %q", wire.Message, want)
+				}
+				return
+			}
+
+			// message is what it always was: the text with each invalid byte replaced.
+			var asBefore string
+			b, _ := json.Marshal(want)
+			_ = json.Unmarshal(b, &asBefore)
+			if wire.Message != asBefore {
+				t.Errorf("message = %q, want %q (unchanged for receivers that do not read message_base64)", wire.Message, asBefore)
+			}
+			if wire.MessageBase64 == nil {
+				t.Fatalf("no message_base64: the endpoint received only %q, the message was %q", wire.Message, want)
+			}
+			got, err := base64.StdEncoding.DecodeString(*wire.MessageBase64)
+			if err != nil {
+				t.Fatalf("message_base64 is not standard base64: %v", err)
+			}
+			if string(got) != want {
+				t.Errorf("message_base64 decodes to %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestCloseStopsWorkersAndRefusesJobs(t *testing.T) {
 	c, endpoint := newTestClient(t, config.SpamTrainingConfig{Workers: 3})
 	c.Close()
@@ -402,5 +511,122 @@ func TestSubmitTrainingDoesNotFollowRedirects(t *testing.T) {
 				t.Errorf("Location was requested %d time(s), want 0 (redirects must not be followed)", n)
 			}
 		})
+	}
+}
+
+// bodyTransport answers every request with status and body, without a network.
+type bodyTransport struct {
+	status int
+	header http.Header
+	body   io.ReadCloser
+}
+
+func (t *bodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		req.Body.Close()
+	}
+	return &http.Response{
+		Status:        http.StatusText(t.status),
+		StatusCode:    t.status,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        t.header,
+		Body:          t.body,
+		ContentLength: -1,
+		Request:       req,
+	}, nil
+}
+
+// TestSubmitTrainingBoundsResponseBody: of the endpoint's answer only the status is
+// needed, and for a refusal a short excerpt of the body for the error. However large
+// a body an accepted, redirected or refused submission is answered with, only a
+// bounded part of it is read, and the body is closed.
+func TestSubmitTrainingBoundsResponseBody(t *testing.T) {
+	const bodySize = 8 << 20
+	const maxRead = 4 << 10
+	for _, tc := range []struct {
+		status  int
+		wantErr bool
+	}{
+		{http.StatusOK, false},
+		{http.StatusFound, true},
+		{http.StatusBadRequest, true},
+		{http.StatusInternalServerError, true},
+	} {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			c, err := NewClient(&config.SpamTrainingConfig{Enabled: true, Endpoint: "http://training.example.com/train"})
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+			t.Cleanup(c.Close)
+
+			body := &countingReader{remaining: bodySize, closed: make(chan struct{})}
+			header := http.Header{}
+			if tc.status >= 300 && tc.status < 400 {
+				header.Set("Location", "http://training.example.com/landing")
+			}
+			c.httpClient.Transport = &bodyTransport{status: tc.status, header: header, body: body}
+
+			err = c.SubmitTraining(context.Background(), &TrainingRequest{Type: TrainingTypeSpam, Message: "body", User: "user@example.com"})
+			if gotErr := err != nil; gotErr != tc.wantErr {
+				t.Fatalf("SubmitTraining = %v for a %d answer, want error: %v", err, tc.status, tc.wantErr)
+			}
+			if got := body.read.Load(); got > maxRead {
+				t.Errorf("read %d bytes of a %d-byte response body, want at most %d", got, bodySize, maxRead)
+			}
+			select {
+			case <-body.closed:
+			default:
+				t.Error("response body was not closed")
+			}
+			if err == nil {
+				return
+			}
+			if n := len(err.Error()); n > maxRead {
+				t.Errorf("error message is %d bytes long, want at most %d", n, maxRead)
+			}
+			if tc.status >= 400 && !strings.Contains(err.Error(), "xxxx") {
+				t.Errorf("error %q does not quote the start of the response body", err)
+			}
+		})
+	}
+}
+
+// TestSubmitTrainingReusesConnection: a short answer is read to its end, so the
+// transport keeps the connection for the next submission rather than opening a new
+// one each time, whether the submission was accepted or refused.
+func TestSubmitTrainingReusesConnection(t *testing.T) {
+	var conns, requests atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if requests.Add(1) == 2 {
+			http.Error(w, "try again later", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	c, err := NewClient(&config.SpamTrainingConfig{Enabled: true, Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(c.Close)
+
+	for i, wantErr := range []bool{false, true, false} {
+		err := c.SubmitTraining(context.Background(), &TrainingRequest{Type: TrainingTypeSpam, Message: "body", User: "user@example.com"})
+		if gotErr := err != nil; gotErr != wantErr {
+			t.Fatalf("submission %d = %v, want error: %v", i+1, err, wantErr)
+		}
+	}
+	if got := conns.Load(); got != 1 {
+		t.Errorf("3 submissions opened %d connections, want 1", got)
 	}
 }

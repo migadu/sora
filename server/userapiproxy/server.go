@@ -115,6 +115,7 @@ type ServerOptions struct {
 	TLSConfig                *tls.Config // Global TLS config from TLS manager (optional)
 	RemoteTLS                bool
 	RemoteTLSVerify          bool
+	RemoteTLSCAFile          string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
 	ConnectTimeout           time.Duration
 	EnableBackendHealthCheck bool                       // Enable backend health checking (default: true)
 	RemoteDNSRefresh         *time.Duration             // Backend DNS re-resolution interval; nil = default, 0 = pin to the startup resolution
@@ -191,6 +192,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 		RemoteAddrs:        opts.RemoteAddrs,
 		RemotePort:         opts.RemotePort,
 		Settings:           proxy.BackendSettings{TLS: opts.RemoteTLS, TLSVerify: opts.RemoteTLSVerify},
+		RemoteTLSCAFile:    opts.RemoteTLSCAFile,
 		ConnectTimeout:     connectTimeout,
 		RoutingLookup:      routingLookup,
 		ServerName:         opts.Name,
@@ -407,34 +409,19 @@ func (s *Server) Start() error {
 	// Note: PROXY protocol is handled by wrapping the listener in Start(),
 	// not via ConnContext, because we need to replace the connection before HTTP server sees it
 
-	// Configure TLS
-	if s.tls && s.tlsCertFile != "" && s.tlsKeyFile != "" {
-		// Scenario 1: Per-server TLS with explicit cert files
-		cert, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
+	// Configure TLS: the certificate source and tls_verify follow the rule
+	// every listener shares (server.ListenerTLS).
+	if s.tls {
+		tlsConfig, err := server.ListenerTLS{
+			Protocol: "User API proxy", Name: s.name,
+			CertFile: s.tlsCertFile, KeyFile: s.tlsKeyFile, Verify: s.tlsVerify,
+			Global: s.tlsConfig,
+		}.Config()
 		if err != nil {
 			s.cancel()
-			return fmt.Errorf("failed to load TLS certificate: %w", err)
+			return err
 		}
-
-		clientAuth := tls.NoClientCert
-		if s.tlsVerify {
-			clientAuth = tls.RequireAndVerifyClientCert
-		}
-
-		s.httpServer.TLSConfig = &tls.Config{
-			Certificates:             []tls.Certificate{cert},
-			MinVersion:               tls.VersionTLS12,
-			ClientAuth:               clientAuth,
-			PreferServerCipherSuites: true,
-			Renegotiation:            tls.RenegotiateNever,
-		}
-	} else if s.tls && s.tlsConfig != nil {
-		// Scenario 2: Global TLS manager
-		s.httpServer.TLSConfig = s.tlsConfig
-	} else if s.tls {
-		// TLS enabled but no cert files and no global TLS config provided
-		s.cancel()
-		return fmt.Errorf("TLS enabled for User API proxy [%s] but no tls_cert_file/tls_key_file provided and no global TLS manager configured", s.name)
+		s.httpServer.TLSConfig = tlsConfig
 	}
 
 	// Start connection limiter cleanup if enabled
@@ -475,9 +462,10 @@ func (s *Server) Start() error {
 	// which is what allowed_hosts and rate limiting read via r.RemoteAddr.
 	listener = server.WrapProxyProtocolHTTP(listener, s.proxyReader, "USER-API-PROXY")
 
-	// Start serving
+	// Start serving. The certificate is in TLSConfig already: certificate
+	// files passed here would be loaded again, on top of the global one.
 	if s.tls {
-		return s.httpServer.ServeTLS(listener, s.tlsCertFile, s.tlsKeyFile)
+		return s.httpServer.ServeTLS(listener, "", "")
 	}
 	return s.httpServer.Serve(listener)
 }

@@ -14,6 +14,7 @@ import (
 // which put every mailbox it created in the shared namespace. A prefix the server
 // refuses at start-up is refused here too.
 func TestLoadAdminConfig_SharedNamespacePrefix(t *testing.T) {
+	keepBcryptCost(t)
 	for _, tc := range []struct {
 		name, toml string
 		wantPrefix string

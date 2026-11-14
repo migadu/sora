@@ -114,20 +114,28 @@ func createHTTPAPIClient(cfg AdminConfig) (*http.Client, error) {
 // loadAdminConfig loads admin configuration from a TOML file with the same safety features as LoadConfigFromFile
 // This provides: duplicate key handling, unknown key warnings, enhanced error messages, and whitespace trimming
 func loadAdminConfig(configPath string, cfg *AdminConfig) error {
-	// Use the full config loader from the config package for consistency. [shared_mailboxes]
-	// starts from the server's defaults: `mailbox create` and `mailbox rename` classify names
-	// by namespace_prefix, and with enabled = true and no prefix an empty one would put every
-	// mailbox in the shared namespace, where the server uses "Shared/".
-	fullCfg := &config.Config{SharedMailboxes: config.NewDefaultConfig().SharedMailboxes}
-	if err := config.LoadConfigFromFile(configPath, fullCfg); err != nil {
+	// Load the file as the server does: the admin commands work on the server's spool,
+	// cache and database, so a setting the file leaves out must take the server's default,
+	// not the zero value. An unset [uploader] path read as "" made `uploader resolve` look
+	// for staged bodies in its working directory and delete the messages of parked uploads
+	// whose bodies were intact in the server's spool; an unset max_attempts read as 0 made
+	// every pending upload count as parked.
+	fullCfg := &config.Config{}
+	if err := config.LoadServerConfig(configPath, fullCfg); err != nil {
 		return err
 	}
+	// `mailbox create` and `mailbox rename` classify names by namespace_prefix.
 	if err := fullCfg.SharedMailboxes.Validate(); err != nil {
 		return fmt.Errorf("[shared_mailboxes]: %w", err)
 	}
 	// Imports index mail by [cleanup] fts_retention, as delivery does.
 	if err := fullCfg.Cleanup.Validate(); err != nil {
 		return fmt.Errorf("[cleanup]: %w", err)
+	}
+	// The server refuses to start with these; max_attempts <= 0 would count every pending
+	// upload as parked.
+	if err := fullCfg.Uploader.Validate(); err != nil {
+		return err
 	}
 	// Passwords hashed here (accounts create/update, credentials add) use the server's
 	// cost: with another one a backend rehashes them at the user's next login.
@@ -138,12 +146,6 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	cfg.S3 = fullCfg.S3
 	cfg.LocalCache = fullCfg.LocalCache
 	cfg.Uploader = fullCfg.Uploader
-	// fullCfg starts empty, not from config.NewDefaultConfig, so an unset max_attempts reads
-	// 0, and every pending upload would count as out of attempts (parked): `uploader
-	// resolve` would treat live uploads as written off. Use the server's default.
-	if cfg.Uploader.MaxAttempts <= 0 {
-		cfg.Uploader.MaxAttempts = config.NewDefaultConfig().Uploader.MaxAttempts
-	}
 	cfg.Cleanup = fullCfg.Cleanup
 	cfg.SharedMailboxes = fullCfg.SharedMailboxes
 	cfg.TLS = fullCfg.TLS
