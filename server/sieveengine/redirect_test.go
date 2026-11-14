@@ -195,18 +195,18 @@ func evalRedirectScript(t *testing.T, script string, ro RedirectOracle, limit in
 // The rate limit is charged for the redirects delivery is asked to make (#230),
 // not for every redirect command the script happened to run.
 func TestRedirectRateLimitChargesWhatIsRelayed(t *testing.T) {
-	t.Run("redirect cancelled by fileinto is not charged", func(t *testing.T) {
+	t.Run("redirect next to fileinto is charged", func(t *testing.T) {
 		ro := &configurableRedirectOracle{}
 		res, err := evalRedirectScript(t, `require "fileinto"; fileinto "Archive"; redirect "forward@example.com";`, ro, 100)
 		if err != nil {
 			t.Fatalf("evaluate: %v", err)
 		}
-		// fileinto still takes the message over and the redirect is not relayed.
-		if res.Action != ActionFileInto {
-			t.Fatalf("expected fileinto, got %s", res.Action)
+		// The message is filed and redirected both (#322), so the redirect is relayed.
+		if res.Action != ActionFileInto || !slices.Equal(res.RedirectTo, []string{"forward@example.com"}) {
+			t.Fatalf("expected fileinto and a redirect, got %s to %v", res.Action, res.RedirectTo)
 		}
-		if ro.recordedN != 0 {
-			t.Errorf("no redirect is relayed, but %d were charged", ro.recordedN)
+		if ro.recordedN != 1 {
+			t.Errorf("one redirect is relayed, but %d were charged", ro.recordedN)
 		}
 	})
 

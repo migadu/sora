@@ -15,6 +15,7 @@ import (
 	msieve "github.com/migadu/go-managesieve/managesieve"
 	"github.com/migadu/go-sieve"
 	"github.com/migadu/go-sieve/interp"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
 )
 
@@ -112,14 +113,19 @@ type HeaderEdit struct {
 }
 
 type Result struct {
-	Action        Action
-	Mailbox       string            // used for fileinto
-	RedirectTo    []string          // used for redirect: every address to relay to, without repeats
-	Flags         []string          // flags to add to the message
-	Copy          bool              // RFC3894 - :copy modifier for redirect and fileinto
-	CreateMailbox bool              // RFC5490 - :create modifier (mailbox extension)
-	HeaderEdits   []HeaderEdit      // RFC5293 - editheader extension (addheader/deleteheader)
-	Additional    map[string]string // future-proofing
+	// Action sums up what the script did with the message, for the log and for the
+	// merge with the default script: fileinto if it filed it anywhere, else redirect
+	// if it redirected it, else discard if nothing keeps it, else keep. It does not
+	// choose between them: delivery carries out every fileinto in Mailboxes and every
+	// redirect in RedirectTo, and Destinations says where the message is stored.
+	Action          Action
+	Mailboxes       []string          // every fileinto target, in script order, without repeats
+	CreateMailboxes []string          // RFC 5490 :create - the Mailboxes to create if missing
+	RedirectTo      []string          // every address to relay to, without repeats
+	Flags           []string          // flags to add to the message
+	Copy            bool              // with fileinto or redirect: the message is also kept (explicit keep, or every one used RFC 3894 :copy)
+	HeaderEdits     []HeaderEdit      // RFC5293 - editheader extension (addheader/deleteheader)
+	Additional      map[string]string // future-proofing
 
 	// Vacation is the auto-reply the script's vacation action asks for, or nil. It is
 	// not an Action: RFC 5230 §4.7 says "Vacation does not affect Sieve's implicit keep
@@ -344,45 +350,30 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		Flags:      make([]string, 0),
 	}
 
-	// Handle fileinto action
-	if len(data.Mailboxes) > 0 {
-		// Use the first mailbox (we could support multiple mailboxes in the future)
+	// Every fileinto and every redirect the script ran is carried out, next to one
+	// another and to a keep: RFC 5228 §2.10.4 lets a site limit the actions, but a
+	// script that hits such a limit is an error, not one whose actions are skipped.
+	// go-sieve has already dropped a repeated fileinto target (§2.10.3); a repeated
+	// redirect address is relayed once.
+	result.Mailboxes = data.Mailboxes
+	result.CreateMailboxes = data.MailboxesCreate
+	for _, addr := range data.RedirectAddr {
+		if !slices.Contains(result.RedirectTo, addr) {
+			result.RedirectTo = append(result.RedirectTo, addr)
+		}
+	}
+	// Charge the rate limit here, for the addresses delivery will relay to, and not
+	// as each redirect command runs: a redirect that a later script error undid is
+	// never sent.
+	execPolicy.recordRedirects(timeoutCtx, len(result.RedirectTo))
+
+	if len(result.Mailboxes) > 0 || len(result.RedirectTo) > 0 {
 		result.Action = ActionFileInto
-		result.Mailbox = data.Mailboxes[0]
-
-		// Check if ImplicitKeep is true (means :copy was used) OR if Keep is true (explicit keep action)
-		// With normal fileinto (no :copy), ImplicitKeep would be false, but an explicit keep
-		// after fileinto should still save a copy to INBOX
-		result.Copy = data.ImplicitKeep || data.Keep
-
-		// Check if :create modifier was used (RFC 5490 - mailbox extension)
-		// MailboxesCreate contains mailboxes that should be created if they don't exist
-		if len(data.MailboxesCreate) > 0 {
-			// Check if the target mailbox should be created
-			for _, createMailbox := range data.MailboxesCreate {
-				if createMailbox == result.Mailbox {
-					result.CreateMailbox = true
-					break
-				}
-			}
+		if len(result.Mailboxes) == 0 {
+			result.Action = ActionRedirect
 		}
-	} else if len(data.RedirectAddr) > 0 {
-		// Handle redirect action. A script may redirect to several addresses
-		// (RFC 5228 §2.10.4); one named twice gets a single copy (§2.10.3).
-		result.Action = ActionRedirect
-		for _, addr := range data.RedirectAddr {
-			if !slices.Contains(result.RedirectTo, addr) {
-				result.RedirectTo = append(result.RedirectTo, addr)
-			}
-		}
-		// Charge the rate limit here, for the addresses delivery will relay to,
-		// and not as each redirect command runs: a redirect that fileinto took
-		// over or that a later script error undid is never sent.
-		execPolicy.recordRedirects(timeoutCtx, len(result.RedirectTo))
-
-		// Check if ImplicitKeep is true (means :copy was used) OR if Keep is true (explicit keep action)
-		// With normal redirect (no :copy), ImplicitKeep would be false, but an explicit keep
-		// after redirect should still save a local copy
+		// The implicit keep survives only a fileinto or redirect with :copy (RFC 3894
+		// §3); an explicit keep stores the message as well.
 		result.Copy = data.ImplicitKeep || data.Keep
 	} else if !data.Keep && !data.ImplicitKeep {
 		// Handle discard action
@@ -737,6 +728,37 @@ func (r Result) RejectLogFields() (action, reason string) {
 		reason = reason[:cut] + "..."
 	}
 	return action, reason
+}
+
+// Destination is a mailbox delivery stores the message in.
+type Destination struct {
+	Mailbox string
+	Create  bool // RFC 5490 §3.2 fileinto :create: create the mailbox if it is missing
+}
+
+// Destinations lists the mailboxes the message is stored in: every fileinto target,
+// then INBOX when the message is kept (RFC 5228 §2.10.2, §4.3), each mailbox once
+// (§2.10.3; mailbox names are case-insensitive here). redirectFailed reports a
+// redirect that could not be handed to the relay: a message then stored nowhere
+// else is kept in INBOX rather than lost (§4.2: "Any ignored redirect MUST NOT
+// cancel the implicit keep"). An empty list means nothing is stored.
+func (r Result) Destinations(redirectFailed bool) []Destination {
+	dests := make([]Destination, 0, len(r.Mailboxes)+1)
+	add := func(mailbox string, create bool) {
+		for _, d := range dests {
+			if strings.EqualFold(d.Mailbox, mailbox) {
+				return
+			}
+		}
+		dests = append(dests, Destination{Mailbox: mailbox, Create: create})
+	}
+	for _, mailbox := range r.Mailboxes {
+		add(mailbox, slices.Contains(r.CreateMailboxes, mailbox))
+	}
+	if r.Action == ActionKeep || r.Copy || (redirectFailed && len(dests) == 0) {
+		add(consts.MailboxInbox, false)
+	}
+	return dests
 }
 
 // scriptRunner is what runScript needs of a compiled script; *sieve.Script

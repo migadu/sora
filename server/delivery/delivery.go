@@ -156,7 +156,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// (the S3 object key, cache key and upload-dedup key) must describe the bytes that are
 	// actually stored.
 	var mailboxName string
-	var copyMailbox string     // Sieve `fileinto :copy` target, saved once the body is staged
+	var copyMailboxes []string // further Sieve destinations, saved once the body is staged
 	var sieveFlags []imap.Flag // flags set by the Sieve script (imap4flags, RFC 5232)
 
 	if recipient.TargetMailbox != "" {
@@ -182,7 +182,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		}
 
 		mailboxName = outcome.MailboxName
-		copyMailbox = outcome.CopyMailbox
+		copyMailboxes = outcome.CopyMailboxes
 		sieveFlags = outcome.Flags
 		// Adopt any header edits the script made (RFC 5293) before anything is derived
 		// from the message.
@@ -249,15 +249,15 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		return result, fmt.Errorf("failed to check file existence: %w", err)
 	}
 
-	// Sieve `fileinto :copy`: save the second copy now that the body is on disk, so its
-	// pending_uploads row can never name a file that is not staged yet - the uploader
-	// treats a missing local file as permanently lost content.
-	if copyMailbox != "" {
+	// The further copies Sieve asked for: save them now that the body is on disk, so
+	// their pending_uploads rows can never name a file that is not staged yet - the
+	// uploader treats a missing local file as permanently lost content.
+	for _, copyMailbox := range copyMailboxes {
 		err := d.SaveMessageToMailbox(d.Ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, deliveryFlags, contentHash, bodyStructure)
 		// A duplicate copy is an accepted delivery, as it is in LMTP: the copy is
 		// already in the mailbox, so a resubmission must not fail the delivery.
 		if err != nil && !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
-			result.ErrorMessage = fmt.Sprintf("Failed to save Sieve :copy to %s: %v", copyMailbox, err)
+			result.ErrorMessage = fmt.Sprintf("Failed to save Sieve copy to %s: %v", copyMailbox, err)
 			return result, err
 		}
 	}
