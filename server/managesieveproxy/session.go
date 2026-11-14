@@ -646,6 +646,15 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				return server.ErrServerShuttingDown
 			}
 
+			// The database could not be asked, so nothing is known about the credentials:
+			// a temporary failure (NO (TRYLATER)), neither counted as a failed login nor
+			// cached.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("authentication unavailable", "method", "main_db", "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+				return server.ErrAuthServiceUnavailable
+			}
+
 			// Cache negative result (authentication failed)
 			// Only cache auth failures, not transient DB errors
 			reason, isDefinitiveFailure := proxy.ClassifyDBAuthFailure(err)
