@@ -20,6 +20,7 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 
+	"github.com/migadu/sora/affinitycache"
 	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -155,6 +156,7 @@ type AffinityManager interface {
 	GetBackend(username, protocol string) (string, bool)
 	DeleteBackend(username, protocol string)
 	GetStats(ctx context.Context) map[string]any
+	List() []affinitycache.AffinityEntry // this node's unexpired affinities, in no particular order
 }
 
 // ProxyServer interface for accessing proxy backend health information
