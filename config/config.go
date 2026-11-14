@@ -620,7 +620,7 @@ type AuthRateLimiterConfig struct {
 	DelayMultiplier     float64       `toml:"delay_multiplier"`      // Delay increase factor
 
 	// Memory safety limits (prevents unbounded growth during burst attacks)
-	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username tracking entries (default: 100000)
+	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Maximum IP+username failure counters, and separately blocks (default: 100000)
 	MaxIPEntries         int `toml:"max_ip_entries"`          // Maximum IP failure tracking entries (default: 50000)
 	MaxUsernameEntries   int `toml:"max_username_entries"`    // Maximum username tracking entries (default: 50000)
 
@@ -707,7 +707,7 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 		DelayMultiplier:     2.0,              // Double delay each time
 
 		// Memory safety limits (prevents OOM during burst attacks)
-		MaxIPUsernameEntries: 100000, // ~25MB per protocol at capacity
+		MaxIPUsernameEntries: 100000, // counters and blocks each: ~50MB per protocol at capacity
 		MaxIPEntries:         50000,  // ~7.5MB per protocol at capacity
 		MaxUsernameEntries:   50000,  // ~7.5MB per protocol at capacity
 	}
