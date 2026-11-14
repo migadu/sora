@@ -921,6 +921,15 @@ components:
 
     Unauthorized:
       description: Unauthorized - invalid or missing JWT token
+      headers:
+        WWW-Authenticate:
+          description: >-
+            Bearer challenge (RFC 9110 section 15.5.2, RFC 6750 section 3):
+            Bearer realm="user-api" for a request without a bearer token,
+            with error="invalid_token" added when a token was sent and refused.
+          schema:
+            type: string
+            example: Bearer realm="user-api", error="invalid_token"
       content:
         application/json:
           schema:

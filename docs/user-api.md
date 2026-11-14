@@ -985,7 +985,7 @@ The User API uses standard HTTP status codes and returns JSON error responses.
 | 200 | OK | Successful request |
 | 201 | Created | Resource created successfully |
 | 400 | Bad Request | Invalid request parameters or body |
-| 401 | Unauthorized | Missing or invalid JWT token |
+| 401 | Unauthorized | Missing or invalid JWT token, or refused login; the `WWW-Authenticate` header carries the Bearer challenge |
 | 403 | Forbidden | Operation not allowed (e.g., delete INBOX) |
 | 404 | Not Found | Resource not found, or no endpoint at that path |
 | 405 | Method Not Allowed | The endpoint does not serve the method; the `Allow` header lists the ones it does |
@@ -1011,6 +1011,8 @@ All errors return a JSON object with an `error` field:
 }
 ```
 → Re-authenticate to get a new token
+
+Every `401` carries a `WWW-Authenticate` challenge (RFC 9110 section 15.5.2, RFC 6750 section 3), the same from the User API proxy as from a backend. A request without a bearer token, a refused login included, gets `Bearer realm="user-api"`; a token that was sent and refused (expired, malformed, badly signed, or refused on refresh) gets `Bearer realm="user-api", error="invalid_token"`. Web clients can read the header: it is listed in `Access-Control-Expose-Headers`.
 
 **Resource Not Found:**
 ```json

@@ -57,7 +57,11 @@ type RefreshTokenRequest struct {
 	Token string `json:"token"`
 }
 
-// handleLogin handles user authentication and JWT token generation
+// handleLogin handles user authentication and JWT token generation. A refused login is
+// answered 401 "Invalid credentials" (docs/user-api.md), the rate-limited one included,
+// and like every 401 it carries the realm's Bearer challenge without an error code
+// (writeError): the login presents no bearer token, and a token of that realm is what it
+// hands out for the endpoints that require one.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
@@ -264,7 +268,7 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 	// Parse and validate existing token
 	claims, err := s.validateToken(req.Token)
 	if err != nil {
-		s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+		s.writeTokenRefused(w)
 		return
 	}
 
@@ -279,7 +283,7 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			// Account soft-deleted or credential removed since the token was issued.
 			logger.Info("HTTP Mail API: Refusing refresh for deleted/unknown account", "name", s.name, "email", claims.Email)
-			s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+			s.writeTokenRefused(w)
 			return
 		}
 		logger.Warn("HTTP Mail API: Error revalidating account on refresh", "name", s.name, "error", err)
@@ -290,7 +294,7 @@ func (s *Server) handleRefreshToken(w http.ResponseWriter, r *http.Request) {
 		// Password changed after this token was issued (or the token predates the
 		// auth_epoch claim) — force a fresh login instead of renewing.
 		logger.Info("HTTP Mail API: Refusing refresh for stale token (password changed)", "name", s.name, "email", claims.Email)
-		s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+		s.writeTokenRefused(w)
 		return
 	}
 
@@ -393,7 +397,7 @@ func (s *Server) jwtAuthMiddleware(next http.Handler) http.Handler {
 		claims, err := s.validateToken(tokenString)
 		if err != nil {
 			logger.Warn("HTTP Mail API: Token validation error", "name", s.name, "error", err)
-			s.writeError(w, http.StatusUnauthorized, "Invalid or expired token")
+			s.writeTokenRefused(w)
 			return
 		}
 
