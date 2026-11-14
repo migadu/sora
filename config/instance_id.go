@@ -44,8 +44,8 @@ func (c Config) NodeIdentity() NodeIdentity {
 // of the Received header LMTP and the delivery API stamp on every message, the domain of
 // the Message-ID on vacation auto-replies, and the SMTP/IMAP/POP3 greeting.
 //
-// It is deliberately independent of cluster.node_id. node_id is a lease key whose only
-// requirement is uniqueness within the cluster, so operators reasonably set it to an
+// It is deliberately independent of cluster.node_id. node_id names this node on the gossip
+// bus and only needs to be unique within the cluster, so operators reasonably set it to an
 // internal label ("node-1"); publishing that label as a mail host stamps a name that does
 // not resolve into the trace headers of real mail, and mints vacation Message-IDs in a
 // non-existent domain - a spam signal on a reply the user did not choose to send.
