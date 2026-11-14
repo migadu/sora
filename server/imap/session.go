@@ -172,9 +172,11 @@ func (s *IMAPSession) requireCapability(c imap.Cap, what string) error {
 // FETCH-style response for this session. Per RFC 7162 §3.2 that requires two things:
 // the client must have become CONDSTORE-aware on this connection (issued a
 // CONDSTORE-enabling command — tracked by go-imap), AND the session must still
-// advertise CONDSTORE (so a capability filter, e.g. for iOS, can suppress it
-// mid-connection). Emitting MODSEQ to a client that never enabled CONDSTORE breaks
-// strict parsers such as mbsync/isync.
+// advertise CONDSTORE. A capability filter (e.g. for iOS) withdraws CONDSTORE only
+// from a client that is not CONDSTORE-aware yet: one matched later leaves it in
+// place (applyCapabilityFilters), since RFC 7162 §3.1 wants mod-sequences "until
+// the connection is closed". Emitting MODSEQ to a client that never enabled
+// CONDSTORE breaks strict parsers such as mbsync/isync.
 func (s *IMAPSession) condStoreEnabled() bool {
 	return s.conn != nil && s.conn.CondStoreEnabled() && s.GetCapabilities().Has(imap.CapCondStore)
 }
@@ -234,9 +236,11 @@ func (s *IMAPSession) applyCapabilityFilters() {
 	// A filter matched after the client enabled an extension (an ID sent after
 	// ENABLE IMAP4rev2, say) gives the extension back: "Once enabled using
 	// ENABLE, each extension remains active until the IMAP connection is
-	// closed" (RFC 9051 §6.3.1). For IMAP4rev2 that keeps every extension it
-	// includes (MOVE, UIDPLUS, IDLE, ESEARCH, ...), whose commands the session
-	// would otherwise refuse while go-imap goes on serving IMAP4rev2.
+	// closed" (RFC 9051 §6.3.1), and a CONDSTORE-aware client gets
+	// mod-sequences "until the connection is closed" (RFC 7162 §3.1). For
+	// IMAP4rev2 that keeps every extension it includes (MOVE, UIDPLUS, IDLE,
+	// ESEARCH, ...), whose commands the session would otherwise refuse while
+	// go-imap goes on serving IMAP4rev2.
 	var kept []string
 	for c := range s.enabledCaps() {
 		if _, offered := s.server.caps[c]; !offered {
@@ -274,8 +278,10 @@ func (s *IMAPSession) applyCapabilityFilters() {
 }
 
 // enabledCaps returns the extensions this connection has enabled: those the
-// client named in ENABLE, and IMAP4rev2 on a server that does not offer
-// IMAP4rev1, where go-imap serves every connection IMAP4rev2.
+// client named in ENABLE, CONDSTORE once the client has issued any CONDSTORE
+// enabling command (SELECT (CONDSTORE), FETCH MODSEQ, ...: RFC 7162 §3.1), and
+// IMAP4rev2 on a server that does not offer IMAP4rev1, where go-imap serves
+// every connection IMAP4rev2.
 func (s *IMAPSession) enabledCaps() imap.CapSet {
 	if s.conn == nil {
 		return nil
@@ -283,6 +289,9 @@ func (s *IMAPSession) enabledCaps() imap.CapSet {
 	enabled := s.conn.EnabledCaps()
 	if s.conn.IsIMAP4rev2() {
 		enabled[imap.CapIMAP4rev2] = struct{}{}
+	}
+	if s.conn.CondStoreEnabled() {
+		enabled[imap.CapCondStore] = struct{}{}
 	}
 	return enabled
 }
