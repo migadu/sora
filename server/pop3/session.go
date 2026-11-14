@@ -300,9 +300,10 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	// field in unconditionally, so for an account whose address happens to be the master
 	// SASL username that shape is an ordinary login. Refusing it here would reject the
 	// account's own password forever; it falls through to regular authentication instead,
-	// which records its own failure under the same authKey, so a master-password guess
-	// dressed up as a self-login is still metered. A CORRECT master password keeps entering
-	// the block whatever the target, which is what the proxy flow relies on.
+	// which records its own failure under the same authKey and answers errAuthFailed, so a
+	// master-password guess dressed up as a self-login is still metered and is answered
+	// exactly like the CORRECT master password, which keeps entering the block whatever the
+	// target (what the proxy flow relies on) and fails there when the target does not parse.
 	if identity != "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
 		checkMasterCredential(username, settings.masterSASLUsername) &&
 		(checkMasterCredential(password, settings.masterSASLPassword) || identity != username) {
@@ -399,15 +400,19 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		newUserAddress, err := server.NewAddress(username)
 		if err != nil {
 			s.DebugLog("invalid username format", "error", err)
-			// Record and count it: an unparseable username was an unmetered
-			// authentication attempt, and it is the path a non-address master SASL
-			// username takes when it falls through to here, which must be accounted
-			// for exactly like any other failed attempt.
+			// A failed login like any other: recorded, counted and answered exactly
+			// like a wrong password. A master SASL self-login (authorization
+			// identity = authentication identity = a non-address master SASL
+			// username) falls through to here with any password but the master
+			// SASL one, which the master SASL block above answers with
+			// errAuthFailed, so a different reply or count here confirms a guessed
+			// master SASL password. It holds for every username, or the reply
+			// would single out the master SASL one.
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
 			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
-			return 0, pop3AuthError("Invalid username format")
+			return 0, errAuthFailed
 		}
 		userAddress = &newUserAddress
 
