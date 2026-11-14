@@ -143,6 +143,18 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		metrics.CommandDuration.WithLabelValues("imap", "FETCH").Observe(time.Since(start).Seconds())
 	}
 
+	// go-imap parses the BINARY FETCH items whatever the session offers. They
+	// are BINARY's (RFC 3516 §4.2) and also IMAP4rev2's, which "includes
+	// additional FETCH items (BINARY, BINARY.PEEK, and BINARY.SIZE) but not
+	// extensions to the APPEND command" (RFC 9051 Appendix B): disabling
+	// BINARY alone keeps them, disabling both refuses them.
+	if (len(options.BinarySection) > 0 || len(options.BinarySectionSize) > 0) && !s.GetCapabilities().Has(imap.CapIMAP4rev2) {
+		if err := s.requireCapability(imap.CapBinary, "FETCH BINARY"); err != nil {
+			recordMetrics(err)
+			return err
+		}
+	}
+
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
 	var selectedMailboxOwnerID int64
@@ -510,23 +522,17 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 			}
 		}
 
+		// Fetch has refused the BINARY items up front unless the session
+		// offers them, through BINARY or IMAP4rev2.
 		if len(options.BinarySection) > 0 {
-			if s.GetCapabilities().Has(imap.CapBinary) {
-				if err := s.handleBinarySections(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
-					return err
-				}
-			} else {
-				s.DebugLog("BINARY section requests ignored due to capability filtering")
+			if err := s.handleBinarySections(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+				return err
 			}
 		}
 
 		if len(options.BinarySectionSize) > 0 {
-			if s.GetCapabilities().Has(imap.CapBinary) {
-				if err := s.handleBinarySectionSize(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
-					return err
-				}
-			} else {
-				s.DebugLog("BINARY section size requests ignored due to capability filtering")
+			if err := s.handleBinarySectionSize(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+				return err
 			}
 		}
 	}
