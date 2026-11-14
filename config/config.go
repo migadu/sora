@@ -1034,10 +1034,10 @@ type ServerConfig struct {
 	// Metrics specific
 	Path                 string `toml:"path,omitempty"`
 	EnableUserMetrics    bool   `toml:"enable_user_metrics,omitempty"`
-	EnableDomainMetrics  bool   `toml:"enable_domain_metrics,omitempty"`
-	UserMetricsThreshold int    `toml:"user_metrics_threshold,omitempty"`
-	MaxTrackedUsers      int    `toml:"max_tracked_users,omitempty"`
-	HashUsernames        bool   `toml:"hash_usernames,omitempty"`
+	EnableDomainMetrics  *bool  `toml:"enable_domain_metrics,omitempty"`  // nil = default (true); see GetEnableDomainMetrics
+	UserMetricsThreshold *int   `toml:"user_metrics_threshold,omitempty"` // nil = default (1000); see GetUserMetricsThreshold
+	MaxTrackedUsers      *int   `toml:"max_tracked_users,omitempty"`      // nil = default (1000); see GetMaxTrackedUsers
+	HashUsernames        *bool  `toml:"hash_usernames,omitempty"`         // nil = default (true); see GetHashUsernames
 
 	// Auth rate limiting (embedded)
 	AuthRateLimit *AuthRateLimiterConfig `toml:"auth_rate_limit,omitempty"`
@@ -1811,6 +1811,41 @@ func (s *ServerConfig) GetRemoteHealthChecks() bool {
 		return true // Default: enabled
 	}
 	return *s.RemoteHealthChecks
+}
+
+// Metrics tuning keys: a key left out of the metrics block keeps the same default
+// as pkg/metrics uses on a node without one.
+
+// GetEnableDomainMetrics returns enable_domain_metrics (default: true).
+func (s *ServerConfig) GetEnableDomainMetrics() bool {
+	if s.EnableDomainMetrics == nil {
+		return true
+	}
+	return *s.EnableDomainMetrics
+}
+
+// GetUserMetricsThreshold returns user_metrics_threshold (default: 1000).
+func (s *ServerConfig) GetUserMetricsThreshold() int {
+	if s.UserMetricsThreshold == nil {
+		return 1000
+	}
+	return *s.UserMetricsThreshold
+}
+
+// GetMaxTrackedUsers returns max_tracked_users (default: 1000).
+func (s *ServerConfig) GetMaxTrackedUsers() int {
+	if s.MaxTrackedUsers == nil {
+		return 1000
+	}
+	return *s.MaxTrackedUsers
+}
+
+// GetHashUsernames returns hash_usernames (default: true).
+func (s *ServerConfig) GetHashUsernames() bool {
+	if s.HashUsernames == nil {
+		return true
+	}
+	return *s.HashUsernames
 }
 
 // Configuration defaulting methods with logging
