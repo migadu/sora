@@ -301,6 +301,74 @@ func TestMetadataDepth(t *testing.T) {
 	}
 }
 
+// TestMetadataDepthMatchesEntryNameLiterally checks that DEPTH 1 and DEPTH
+// infinity select the entries below the requested name only. "_" and "\" are
+// valid entry-name characters (RFC 5464 §3.2 forbids only "*", "%", non-ASCII
+// and control characters), so they must not act as LIKE wildcards or escapes:
+// "/private/a_b" must not match "/private/axb/y", and "/private/c\" must match
+// "/private/c\/x" but not "/private/c/z".
+func TestMetadataDepthMatchesEntryNameLiterally(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping database integration test")
+	}
+
+	db := setupTestDatabase(t)
+	ctx := context.Background()
+	accountID := createTestAccount(t, db, fmt.Sprintf("test-depth-literal-%d@example.com", time.Now().UnixNano()), "password")
+
+	entries := map[string]*[]byte{
+		`/private/a_b`:      bytePtr([]byte("1")),
+		`/private/a_b/x`:    bytePtr([]byte("2")),
+		`/private/a_b/x/y`:  bytePtr([]byte("3")),
+		`/private/axb/y`:    bytePtr([]byte("4")),
+		`/private/axb/y/z`:  bytePtr([]byte("5")),
+		`/private/c\`:       bytePtr([]byte("6")),
+		`/private/c\/x`:     bytePtr([]byte("7")),
+		`/private/c\/x/y`:   bytePtr([]byte("8")),
+		`/private/c/z`:      bytePtr([]byte("9")),
+		`/private/c/z/deep`: bytePtr([]byte("10")),
+	}
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	require.NoError(t, db.SetMetadata(ctx, tx, accountID, nil, entries, nil))
+	require.NoError(t, tx.Commit(ctx))
+
+	tests := []struct {
+		name  string
+		entry string
+		depth imap.GetMetadataDepth
+		want  []string
+	}{
+		{"Underscore_Depth1", `/private/a_b`, imap.GetMetadataDepthOne,
+			[]string{`/private/a_b`, `/private/a_b/x`}},
+		{"Underscore_DepthInfinity", `/private/a_b`, imap.GetMetadataDepthInfinity,
+			[]string{`/private/a_b`, `/private/a_b/x`, `/private/a_b/x/y`}},
+		{"Backslash_Depth1", `/private/c\`, imap.GetMetadataDepthOne,
+			[]string{`/private/c\`, `/private/c\/x`}},
+		{"Backslash_DepthInfinity", `/private/c\`, imap.GetMetadataDepthInfinity,
+			[]string{`/private/c\`, `/private/c\/x`, `/private/c\/x/y`}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tx, err := db.GetReadPool().Begin(ctx)
+			require.NoError(t, err)
+			defer tx.Rollback(ctx)
+
+			result, err := db.GetMetadata(ctx, tx, accountID, nil, []string{tt.entry}, &imap.GetMetadataOptions{Depth: tt.depth})
+			require.NoError(t, err)
+
+			got := make([]string, 0, len(result.Entries))
+			for name := range result.Entries {
+				got = append(got, name)
+			}
+			assert.ElementsMatch(t, tt.want, got)
+		})
+	}
+}
+
 // TestMetadataMaxSize tests MAXSIZE limiting
 func TestMetadataMaxSize(t *testing.T) {
 	if testing.Short() {
