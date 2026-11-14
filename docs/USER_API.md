@@ -707,8 +707,8 @@ return messages in this shape:
   "size": 48211,
   "flags": ["\\Seen"],
   "custom_flags": ["$Work", "$hasattachment"],
-  "message_id": "<abc@example.com>",
-  "in_reply_to": "<xyz@example.com>",
+  "message_id": "abc@example.com",
+  "in_reply_to": "xyz@example.com",
   "content_hash": "4f1c...",
   "has_attachments": true
 }
@@ -727,7 +727,7 @@ return messages in this shape:
 | `size` | Bytes. |
 | `flags` | System flags. `[]` when there are none. |
 | `custom_flags` | Keywords. Left out when there are none. |
-| `message_id`, `in_reply_to` | From the headers. |
+| `message_id`, `in_reply_to` | From the headers, without angle brackets; `in_reply_to` holds its IDs separated by spaces and is left out when there are none. `message_id` is `""` when the message has no `Message-ID` that parses. |
 | `references` | The `References` header; only in `GET /user/messages/{id}`. |
 | `content_hash` | The hash that names the stored body. Messages with the same content share it. |
 | `has_attachments` | From the RFC 9979 keywords: `true` with `$hasattachment`, `false` with `$hasnoattachment`, left out when the message carries neither (mail Sora stored before it set them, or mail it could not inspect). |
