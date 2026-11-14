@@ -11,6 +11,7 @@ import (
 
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/server/adminapi"
 )
 
 // An upload the uploader is still retrying is not failed: without a max_attempts
@@ -75,5 +76,41 @@ func TestUploaderEndpointsDefaultToConfiguredMaxAttempts(t *testing.T) {
 		if u.ContentHash == hash {
 			t.Errorf("/admin/uploader/status lists an upload with 6 attempts as failed")
 		}
+	}
+
+	// A configured max_attempts is the threshold, not just the default's fallback: with
+	// [uploader] max_attempts = 4 the same upload is one the uploader has given up on.
+	configured := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.UploadMaxAttempts = 4 })
+	defer configured.Close()
+
+	resp, body = configured.makeRequest(t, "GET", "/admin/uploader/failed?limit=1000", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /admin/uploader/failed: %d %s", resp.StatusCode, body)
+	}
+	failed.FailedUploads, failed.MaxAttempts = nil, 0
+	configured.expectJSON(t, body, &failed)
+	if failed.MaxAttempts != 4 {
+		t.Errorf("/admin/uploader/failed max_attempts = %d, want the configured 4", failed.MaxAttempts)
+	}
+	listed := false
+	for _, u := range failed.FailedUploads {
+		listed = listed || u.ContentHash == hash
+	}
+	if !listed {
+		t.Errorf("/admin/uploader/failed with max_attempts = 4 does not list an upload with 6 attempts")
+	}
+
+	resp, body = configured.makeRequest(t, "GET", "/admin/uploader/status?show_failed=true&failed_limit=1000", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /admin/uploader/status: %d %s", resp.StatusCode, body)
+	}
+	status.FailedUploads = nil
+	configured.expectJSON(t, body, &status)
+	listed = false
+	for _, u := range status.FailedUploads {
+		listed = listed || u.ContentHash == hash
+	}
+	if !listed {
+		t.Errorf("/admin/uploader/status with max_attempts = 4 does not list an upload with 6 attempts as failed")
 	}
 }
