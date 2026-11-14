@@ -2781,6 +2781,14 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		if s.Type == "metrics" && s.ProxyProtocol {
 			logger("WARNING: Server %s (type: metrics) has 'proxy_protocol' configured, but the metrics endpoint does not read PROXY protocol headers; it is ignored, and 'allowed_hosts' matches the connecting host", s.Name)
 		}
+		// A metrics listener's allowed_hosts is fixed at startup, so this is where an
+		// unusable entry is reported. The Admin and User APIs report theirs when they
+		// install a list, which a reload can replace.
+		if s.Type == "metrics" {
+			for _, entry := range helpers.InvalidNetworkEntries(s.AllowedHosts) {
+				logger("WARNING: Server %s (type: metrics) has 'allowed_hosts' entry %q, which is not an IP address or CIDR and matches no client", s.Name, entry)
+			}
+		}
 	}
 }
 
