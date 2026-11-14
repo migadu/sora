@@ -23,70 +23,61 @@
             pkgs.garage
           ];
           env = {
-            lang = "en_us.utf-8";
+            LANG = "en_US.UTF-8";
 
-            pgdata = "./.pg";
-            pghost = "localhost";
-            pgport = "5432";
-            pguser = "postgres";
-            pgdatabase = "postgres";
-            socket_dir = "./.db/postgres-sockets";
+            PGHOST = "localhost";
+            PGPORT = "5432";
+            PGUSER = "postgres";
+            PGDATABASE = "postgres";
           };
-          shellhook = ''
+          shellHook = ''
 
             echo "setup postgresql"
-            export pgdata="$pwd/.pg"
-            export pg_conf="$pgdata/postgresql.conf"
-            export socket_dir="$pwd/.db/postgres-sockets"
+            export PGDATA="$PWD/.pg"
+            export SOCKET_DIR="$PWD/.db/postgres-sockets"
+            mkdir -p "$SOCKET_DIR"
 
-            if [ ! -d "$pgdata" ]; then
+            if [ ! -d "$PGDATA" ]; then
               echo "initializing postgresql..."
-              ${pkgs.postgresql}/bin/initdb --auth=trust --username=postgres
-              echo "unix_socket_directories = '$socket_dir'" >> "$pgdata/postgresql.conf"
-              cat <<eof > "$pg_conf"
-              # postgresql configurations
+              ${pkgs.postgresql}/bin/initdb -D "$PGDATA" --auth=trust --username=postgres
+              cat <<EOF >> "$PGDATA/postgresql.conf"
+              # sora dev shell
+              unix_socket_directories = '$SOCKET_DIR'
               log_min_messages = warning
               log_min_error_statement = error
               log_min_duration_statement = 100  # ms
               log_connections = on
               log_disconnections = on
               log_duration = on
-              log_timezone = 'utc'
+              log_timezone = 'UTC'
               log_statement = 'all'
               log_directory = 'pg_log'
-              log_filename = 'postgresql-%y-%m-%d_%h%m%s.log'
+              log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
               logging_collector = on
-              log_min_error_statement = error
-            eof
+            EOF
             fi
 
-            function start_postgres() {
-            # start postgresql if not running
-            if ${pkgs.postgresql}/bin/pg_ctl status -d "$pgdata" >/dev/null; then
-              echo "postgresql is already running"
-            else
-              ${pkgs.postgresql}/bin/pg_ctl -l "$pgdata/postgres.log" start -w
-              echo "postgresql started with ${pkgs.postgresql}/bin/pg_ctl"
-              # pg_was_started=1
-            fi
+            start_postgres() {
+              if ${pkgs.postgresql}/bin/pg_ctl -D "$PGDATA" status >/dev/null; then
+                echo "postgresql is already running"
+              else
+                ${pkgs.postgresql}/bin/pg_ctl -D "$PGDATA" -l "$PGDATA/postgres.log" -w start
+              fi
             }
-            function start_postgres() {
-            ${pkgs.postgresql}/bin/pg_ctl -d \"$pgdata\" stop 
-              echo "postgresql stopped with ${pkgs.postgresql}/bin/pg_ctl"
+            stop_postgres() {
+              ${pkgs.postgresql}/bin/pg_ctl -D "$PGDATA" stop
             }
-            alias start_postgres="start_postgres"
-            alias stop_postgres="stop_postgres"
 
 
 
             echo "setup garage s3 storage"
-            export garage_data="$pwd/.garage"
+            export garage_data="$PWD/.garage"
             export garage_conf="$garage_data/garage.toml"
 
             if [ ! -d "$garage_data" ]; then
               mkdir -p "$garage_data"
 
-              cat <<eof > "$garage_conf"
+              cat <<EOF > "$garage_conf"
               # garage config
               metadata_dir = "$garage_data/meta"
               data_dir = "$garage_data/data"
@@ -117,16 +108,21 @@
               api_bind_addr = "[::]:3903"
               admin_token = "$(openssl rand -base64 32)"
               metrics_token = "$(openssl rand -base64 32)"
-            eof
+            EOF
             fi
 
-            cat <<eof > "./garage_setup.sh"
+            cat <<EOF > "./garage_setup.sh"
+            #!/bin/sh
             echo "setup garage s3 storage"
-            ## export garage_log_to_syslog=1
-            garage -c "$garage_conf" server
-            node_id=$(garage -c "$garage_conf" node id -q | cut -d@ -f1)
-            garage -c "$garage_conf" layout assign -z dc1 -c 1g \$node_id
-            garage -c "$garage_conf" layout apply
+            ## export GARAGE_LOG_TO_SYSLOG=1
+            garage -c "$garage_conf" server > "$garage_data/server.log" 2>&1 &
+            until garage -c "$garage_conf" status > /dev/null 2>&1; do
+              kill -0 \$! 2> /dev/null || { echo "garage server exited, see $garage_data/server.log"; exit 1; }
+              sleep 1
+            done
+            node_id=\$(garage -c "$garage_conf" node id -q | cut -d@ -f1)
+            garage -c "$garage_conf" layout assign -z dc1 -c 1G \$node_id
+            garage -c "$garage_conf" layout apply --version 1
             garage -c "$garage_conf" layout show
             garage -c "$garage_conf" status
             garage -c "$garage_conf" bucket create sora-s3
@@ -140,7 +136,7 @@
             echo "app key with secret"
             garage -c "$garage_conf" key info imap-app-key --show-secret
 
-            eof
+            EOF
             chmod u+x ./garage_setup.sh
 
             alias garage="garage -c $garage_conf"
