@@ -345,9 +345,10 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 
 		accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, targetAddr.BaseAddress())
 		if err != nil {
-			// The lookup was cut short (server shutdown, client gone), so nothing is
-			// known about the target: a temporary failure, not counted as a failed
-			// login, as on the regular login path below.
+			// The lookup was cut short (server shutdown, command_timeout, or the
+			// database read timeout), so nothing is known about the target: a
+			// temporary failure, not counted as a failed login, as on the regular
+			// login path below.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				s.InfoLog("master SASL authentication cancelled during the impersonation target lookup", "target_user", targetAddr.BaseAddress(), "error", err)
 				return 0, errTempUnavailable

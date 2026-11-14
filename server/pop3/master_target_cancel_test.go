@@ -59,7 +59,7 @@ func (r *failureRecorder) Stop()                                                
 
 // TestPOP3_MasterTargetLookupCancelledIsTemporary: when the impersonation target lookup
 // of a master login ends because the command's context was cancelled (the server is
-// shutting down, or the client went away), nothing is known about the credentials. The
+// shutting down) or expired (a timeout), nothing is known about the credentials. The
 // login is answered -ERR [SYS/TEMP] (RFC 3206 section 4), not [AUTH], and it is neither
 // recorded by the auth rate limiter nor counted as a failed login, as on the regular
 // login path. The target exists; only the cancelled context stops the lookup.
