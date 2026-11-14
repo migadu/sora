@@ -670,6 +670,9 @@ func NewDatabaseFromConfig(ctx context.Context, dbConfig *config.DatabaseConfig,
 			readPool = writePool
 			readFailover = writeFailover // Share the same failover manager
 		}
+	} else if dbConfig.ReadsShareWritePool {
+		readPool = writePool
+		readFailover = writeFailover
 	} else {
 		// If no read config specified, create a dedicated read pool pointing to the write database.
 		// This prevents read queries (UI/IMAP clients) from timing out due to connection pool starvation
