@@ -615,7 +615,8 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	// Track successful authentication.
 	metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "success").Inc()
 	metrics.TrackDomainConnection("pop3_proxy", address.Domain())
-	metrics.TrackUserActivity("pop3_proxy", address.FullAddress(), "connection", 1)
+	// The base address, the name a lookup-cache hit replaying this login counts the user under.
+	metrics.TrackUserActivity("pop3_proxy", address.BaseAddress(), "connection", 1)
 
 	// Single consolidated log for authentication success
 	method := "main_db"

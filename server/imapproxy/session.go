@@ -1308,9 +1308,10 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Track successful authentication.
 	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
 
-	// Track domain and user connection activity for the login event.
+	// Track domain and user connection activity for the login event. The user is the base
+	// address, the name a lookup-cache hit replaying this login counts it under.
 	metrics.TrackDomainConnection("imap_proxy", address.Domain())
-	metrics.TrackUserActivity("imap_proxy", address.FullAddress(), "connection", 1)
+	metrics.TrackUserActivity("imap_proxy", address.BaseAddress(), "connection", 1)
 
 	// Single consolidated log for authentication success
 	method := "main_db"
