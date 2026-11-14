@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,6 +32,21 @@ func handleAffinityCacheCommand(ctx context.Context) {
 }
 
 func handleAffinityCacheStatus(ctx context.Context) {
+	fs := flag.NewFlagSet("affinity-cache status", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Printf(`Show affinity cache statistics
+
+Usage:
+  sora-admin --config PATH affinity-cache status
+
+Asks the Admin API ([admin_cli] addr and api_key) for the affinity cache's entries and
+broadcast queue.
+`)
+	}
+	if err := fs.Parse(os.Args[3:]); err != nil {
+		logger.Fatalf("Error parsing flags: %v", err)
+	}
+
 	client, err := createHTTPAPIClient(globalConfig)
 	if err != nil {
 		logger.Fatalf("Failed to create HTTP API client: %v", err)
@@ -105,9 +121,14 @@ func handleAffinityCacheStatus(ctx context.Context) {
 	if mem, ok := stats["memory_usage"].(map[string]any); ok {
 		fmt.Println("\n  Memory / Queue Info:")
 		if v, ok := mem["broadcast_queue"].(float64); ok {
-			max := mem["broadcast_queue_max"].(float64)
-			util := mem["queue_utilization"].(float64)
-			fmt.Printf("    Broadcast queue:   %.0f / %.0f (%.1f%%)\n", v, max, util)
+			line := fmt.Sprintf("%.0f", v)
+			if queueMax, ok := mem["broadcast_queue_max"].(float64); ok {
+				line += fmt.Sprintf(" / %.0f", queueMax)
+			}
+			if util, ok := mem["queue_utilization"].(float64); ok {
+				line += fmt.Sprintf(" (%.1f%%)", util)
+			}
+			fmt.Printf("    Broadcast queue:   %s\n", line)
 		}
 	}
 }
