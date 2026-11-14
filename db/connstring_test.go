@@ -1,0 +1,78 @@
+package db_test
+
+import (
+	"context"
+	"strconv"
+	"testing"
+
+	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/testutils"
+)
+
+// credentialsWithReservedCharacters are logins a hand-built "user:password@" URL cannot
+// carry: most make it unparseable, "a%41b" parses to a different password.
+var credentialsWithReservedCharacters = []struct{ user, password string }{
+	{"sora", "pa ss"}, {"sora", "p[ss"}, {"sora", "p^ss"}, {"sora", `p\ss`},
+	{"sora", "p#ss"}, {"sora", "p?ss"}, {"sora", "p/ss"}, {"sora", "p@ss:w"},
+	{"sora", "50%off"}, {"sora", "a%41b"}, {"sora user", "secret"},
+}
+
+// Every pool sora and sora-admin open is built by NewDatabaseFromConfig. The server must
+// receive the configured user and password verbatim, whatever characters they contain.
+func TestNewDatabaseFromConfig_SendsCredentialsVerbatim(t *testing.T) {
+	fake := testutils.StartFakePostgres(t)
+
+	for _, c := range credentialsWithReservedCharacters {
+		t.Run(c.user+"/"+c.password, func(t *testing.T) {
+			cfg := &config.DatabaseConfig{Write: &config.DatabaseEndpointConfig{
+				Hosts:    []string{fake.Host},
+				Port:     int64(fake.Port), // TOML decodes an integer port as int64
+				User:     c.user,
+				Password: c.password,
+				Name:     "sora_mail_db",
+			}}
+			database, err := db.NewDatabaseFromConfig(context.Background(), cfg, false)
+			if err == nil {
+				database.Close()
+				t.Fatal("the fake server refuses every login, NewDatabaseFromConfig must fail")
+			}
+			login := fake.NextLogin(t, err)
+			if login.User != c.user || login.Password != c.password || login.Database != "sora_mail_db" {
+				t.Fatalf("server received user=%q password=%q database=%q, want %q %q %q",
+					login.User, login.Password, login.Database, c.user, c.password, "sora_mail_db")
+			}
+		})
+	}
+}
+
+// A host entry may carry its own port; it is used as is, also when the endpoint's port
+// is set or unset.
+func TestNewDatabaseFromConfig_HostEntryPort(t *testing.T) {
+	fake := testutils.StartFakePostgres(t)
+
+	for name, port := range map[string]any{
+		"port unset":       nil,
+		"other port set":   int64(5432),
+		"string port set":  "5432",
+		"port in host too": strconv.Itoa(fake.Port),
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := &config.DatabaseConfig{Write: &config.DatabaseEndpointConfig{
+				Hosts:    []string{fake.Addr},
+				Port:     port,
+				User:     "sora",
+				Password: "secret",
+				Name:     "sora_mail_db",
+			}}
+			database, err := db.NewDatabaseFromConfig(context.Background(), cfg, false)
+			if err == nil {
+				database.Close()
+				t.Fatal("the fake server refuses every login, NewDatabaseFromConfig must fail")
+			}
+			if login := fake.NextLogin(t, err); login.Password != "secret" {
+				t.Fatalf("server received password %q, want %q", login.Password, "secret")
+			}
+		})
+	}
+}
