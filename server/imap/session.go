@@ -34,6 +34,11 @@ type IMAPSession struct {
 	startTime   time.Time
 	closed      bool // Close has run; guarded by mutex
 
+	// trackedClientAddr is the client address this session was registered
+	// with in the connection tracker, so it is unregistered under the same
+	// key even if an ID after login changed RemoteIP.
+	trackedClientAddr string
+
 	checkedIdleTimeout time.Duration // the idle timeout this connection's checker enforces (the IDLE keepalive beats it)
 
 	inboxWarmupDone atomic.Bool // Ensures warmup runs only once
@@ -624,12 +629,16 @@ func (s *IMAPSession) registerConnection(email string) error {
 		ctx, cancel := context.WithTimeout(s.ctx, queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
+		// The client's address, not the TCP peer: behind a proxy the peer is
+		// the proxy for every client. RemoteIP already holds the address from
+		// the PROXY header or a trusted proxy's ID forwarding.
+		clientAddr := s.RemoteIP
 
 		if err := s.server.connTracker.RegisterConnection(ctx, s.AccountID(), email, "IMAP", clientAddr); err != nil {
 			s.InfoLog("connection registration rejected", "error", err)
 			return err
 		}
+		s.trackedClientAddr = clientAddr
 	}
 	return nil
 }
@@ -642,9 +651,7 @@ func (s *IMAPSession) unregisterConnection() {
 		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
 		defer cancel()
 
-		clientAddr := server.GetAddrString(s.conn.NetConn().RemoteAddr())
-
-		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "IMAP", clientAddr); err != nil {
+		if err := s.server.connTracker.UnregisterConnection(ctx, s.AccountID(), "IMAP", s.trackedClientAddr); err != nil {
 			s.InfoLog("failed to unregister connection", "error", err)
 		}
 	}
