@@ -123,10 +123,6 @@ func (t *testSourceDB) FindExistingContentHashesWithRetry(ctx context.Context, h
 	return nil, nil // Not needed for HTTP API tests
 }
 
-func (t *testSourceDB) GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
-	return nil, nil // Not needed for HTTP API tests
-}
-
 // HTTP client helpers
 func (h *HTTPAPITestServer) makeRequest(t *testing.T, method, endpoint string, body any) (*http.Response, []byte) {
 	t.Helper()
