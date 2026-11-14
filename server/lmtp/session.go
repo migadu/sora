@@ -951,7 +951,10 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 					Message:      "Insufficient system storage, please try again later",
 				}
 			}
-			return s.InternalError("failed to save message to disk: %v", err)
+			// The error names spool files, and the reply text reaches the sending MTA
+			// (and can end up in a bounce): log it and answer with the cause only.
+			s.WarnLog("failed to save message to disk", "error", err)
+			return s.InternalError("failed to save message to disk: %v", helpers.FileErrorCause(err))
 		}
 		s.DebugLog("message accepted locally", "path", *filePath)
 	} else if err == nil {
@@ -967,7 +970,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	} else {
 		// Stat error (permission issue, etc.)
 		recordMetrics("failure")
-		return s.InternalError("failed to check file existence: %v", err)
+		s.WarnLog("failed to check file existence", "error", err)
+		return s.InternalError("failed to check file existence: %v", helpers.FileErrorCause(err))
 	}
 
 	if relayAfterStaging {

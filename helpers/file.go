@@ -1,11 +1,31 @@
 package helpers
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
+
+// FileErrorCause returns the cause of a filesystem error without the file names it
+// carries: the Err of the *fs.PathError or *os.LinkError in err's chain, or err itself
+// when there is none. A reply to a client is built from the cause, since server paths
+// mean nothing to the client and name local details (spool layout, account ids, content
+// hashes); the full error belongs in the log. errors.Is still matches the cause, so
+// syscall.ENOSPC or syscall.EROFS is recognised in the result.
+func FileErrorCause(err error) error {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) {
+		return pathErr.Err
+	}
+	var linkErr *os.LinkError
+	if errors.As(err, &linkErr) {
+		return linkErr.Err
+	}
+	return err
+}
 
 // LinkOrCopyFile attempts to hardlink a file from src to dst. If linking fails
 // (e.g., cross-device link), it falls back to copying the file.
