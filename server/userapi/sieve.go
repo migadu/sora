@@ -107,7 +107,11 @@ func (s *Server) handleGetFilter(w http.ResponseWriter, r *http.Request) {
 // maxSieveScriptSize bounds a user-supplied Sieve script (matches the value advertised
 // by the capabilities endpoint). Enforced on PUT to prevent an oversized body from
 // exhausting memory or bloating the shared sieve_scripts table.
-const maxSieveScriptSize = 65536
+const (
+	maxSieveScriptSize = 65536
+	// JSON permits every ASCII byte to be written as a six-byte Unicode escape.
+	maxSieveScriptRequestSize = 6*maxSieveScriptSize + 1024
+)
 
 // handlePutFilter creates or updates a Sieve script
 func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
@@ -115,9 +119,9 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// Bound the request body before decoding so a huge PUT cannot exhaust memory.
-	// 2x the script cap covers JSON escaping (newlines/quotes/control chars expand) plus the
-	// envelope; the real limit is the len(req.Script) check below after decoding.
-	r.Body = http.MaxBytesReader(w, r.Body, 2*maxSieveScriptSize+1024)
+	// Allow worst-case JSON string escaping plus the envelope. The actual script
+	// limit is checked against its decoded byte length below.
+	r.Body = http.MaxBytesReader(w, r.Body, maxSieveScriptRequestSize)
 
 	accountID, err := getAccountIDFromContext(ctx)
 	if err != nil {
@@ -139,6 +143,12 @@ func (s *Server) handlePutFilter(w http.ResponseWriter, r *http.Request) {
 
 	var req SieveScriptRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// A body over the read cap is too large, not malformed (RFC 9110 section 15.5.14).
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.writeError(w, http.StatusRequestEntityTooLarge, "Request body exceeds maximum size")
+			return
+		}
 		s.writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}

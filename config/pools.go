@@ -28,7 +28,7 @@ type PoolConfig struct {
 	Default bool `toml:"default"`
 
 	RemoteTLS              bool  `toml:"remote_tls"`
-	RemoteTLSUseStartTLS   bool  `toml:"remote_tls_use_starttls"` // LMTP/ManageSieve; IMAP/POP3/User API use implicit TLS
+	RemoteTLSUseStartTLS   bool  `toml:"remote_tls_use_starttls"` // IMAP/POP3/LMTP/ManageSieve; the User API proxy has no STARTTLS
 	RemoteTLSVerify        *bool `toml:"remote_tls_verify"`       // default true
 	RemoteUseProxyProtocol bool  `toml:"remote_use_proxy_protocol"`
 	RemoteUseIDCommand     bool  `toml:"remote_use_id_command"` // IMAP only

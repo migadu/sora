@@ -885,6 +885,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 			return nil
 		}
+	} else if s.server.lookupCache != nil {
+		// A disabled cache (nil) reads nothing and counts nothing.
+		metrics.LookupCacheResults.WithLabelValues("lmtp_proxy", "miss").Inc()
 	}
 
 	// 1. Try remotelookup first

@@ -24,6 +24,21 @@ func TestOpenAPIMailboxMatchesWireFormat(t *testing.T) {
 // user_api_openapi.yaml.
 func openAPISchemaProperties(t *testing.T, name string) []string {
 	t.Helper()
+	var props []string
+	for _, m := range openAPIPropertyName.FindAllStringSubmatch(openAPISchemaBlock(t, name), -1) {
+		props = append(props, m[1])
+	}
+	sort.Strings(props)
+	return props
+}
+
+// openAPIPropertyName matches the line naming a property of a schema.
+var openAPIPropertyName = regexp.MustCompile(`(?m)^        ([A-Za-z_]+):\s*$`)
+
+// openAPISchemaBlock returns the named schema in user_api_openapi.yaml, from its
+// "    Name:" line up to the next schema.
+func openAPISchemaBlock(t *testing.T, name string) string {
+	t.Helper()
 	spec, err := os.ReadFile("user_api_openapi.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -37,12 +52,7 @@ func openAPISchemaProperties(t *testing.T, name string) []string {
 	if end := regexp.MustCompile(`\n    [A-Za-z]`).FindStringIndex(block[len(header):]); end != nil {
 		block = block[:len(header)+end[0]]
 	}
-	var props []string
-	for _, m := range regexp.MustCompile(`(?m)^        ([A-Za-z_]+):\s*$`).FindAllStringSubmatch(block, -1) {
-		props = append(props, m[1])
-	}
-	sort.Strings(props)
-	return props
+	return block
 }
 
 // jsonWireKeys returns the sorted JSON object keys json.Marshal emits for v.

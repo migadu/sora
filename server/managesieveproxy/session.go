@@ -355,7 +355,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					// This ensures that when a domain moves backends or password changes,
 					// active users eventually pick up the changes.
 					s.DebugLog("cache hit - positive entry with matching password", "username", username, "age", time.Since(cached.CreatedAt))
-					metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit_positive").Inc()
+					metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit").Inc()
 
 					// Populate session with cached routing info
 					s.accountID = cached.AccountID
@@ -398,12 +398,12 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					// Different password on positive cache - revalidate if old enough
 					if cached.IsOld(s.server.positiveRevalidationWindow) {
 						s.DebugLog("cache hit - positive entry with different password (old enough to revalidate)", "username", username, "age", time.Since(cached.CreatedAt))
-						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit_positive_revalidate").Inc()
+						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "revalidate_positive_different_pw").Inc()
 						// Fall through to full authentication
 					} else {
 						// Different password but too fresh
 						s.DebugLog("cache hit - positive entry with different password (too fresh)", "username", username, "age", time.Since(cached.CreatedAt))
-						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit_positive_fresh").Inc()
+						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit_positive_wrong_pw").Inc()
 						// Cost what a failed login for an unknown address costs, or the instant
 						// answer shows that this address has an account. (#346)
 						db.DummyVerifyPassword(password)
@@ -626,25 +626,22 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// Fallback to main DB
 	// If master auth was already validated, just get account ID and continue
 	// Otherwise, authenticate via main DB
-	var address server.Address
-	// Use already parsed address if available
-	if parseErr == nil {
-		address = parsedAddr
-	} else {
-		// Parse failed earlier - try again with NewAddress (shouldn't happen but handle it)
-		var parseErr2 error
-		address, parseErr2 = server.NewAddress(username)
-		if parseErr2 != nil {
-			return fmt.Errorf("invalid address format: %w", parseErr2)
-		}
+	//
+	// A username that does not parse names no account: a failed login like any
+	// other, recorded and counted. Every login without a remote lookup gets here.
+	if parseErr != nil {
+		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
+		metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
+		return fmt.Errorf("invalid address format: %w", parseErr)
 	}
+	address := parsedAddr
 
 	var accountID int64
 	var err error
 	if masterAuthValidated {
 		// Master authentication already validated - just get account ID
 		s.DebugLog("master auth already validated, getting account ID from main database")
-		accountID, err = s.server.rdb.GetActiveAccountIDByAddressWithRetry(ctx, address.BaseAddress())
+		accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
 		if err != nil {
 			// Check if error is due to session context cancellation (server shutdown)
 			// Note: Must check s.ctx.Err(), not just the query error, because the query context
@@ -652,6 +649,15 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			if s.ctx.Err() != nil {
 				s.InfoLog("master auth cancelled due to server shutdown")
 				return server.ErrServerShuttingDown
+			}
+
+			// The database could not be asked, so nothing is known about the target: a
+			// temporary failure (NO (TRYLATER)), not a failed login charged to the master
+			// credential.
+			if server.IsTemporaryAuthFailure(err) {
+				s.WarnLog("authentication unavailable", "method", "master", "user", address.BaseAddress(), "error", err)
+				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+				return server.ErrAuthServiceUnavailable
 			}
 
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)

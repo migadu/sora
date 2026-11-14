@@ -43,6 +43,7 @@ func NewErrorHandler() *ErrorHandler {
 }
 
 func (eh *ErrorHandler) FatalError(operation string, err error) {
+	logger.Sync() // what start-up logged before logging was configured
 	gracefulErr := NewGracefulError(operation, err)
 	eh.logger.Printf("FATAL: %v", gracefulErr)
 
@@ -53,6 +54,7 @@ func (eh *ErrorHandler) FatalError(operation string, err error) {
 }
 
 func (eh *ErrorHandler) ConfigError(configPath string, err error) {
+	logger.Sync() // what start-up logged before logging was configured
 	if os.IsNotExist(err) {
 		eh.logger.Printf("ERROR: configuration file '%s' not found: %v", configPath, err)
 	} else {
@@ -66,6 +68,7 @@ func (eh *ErrorHandler) ConfigError(configPath string, err error) {
 }
 
 func (eh *ErrorHandler) ValidationError(field string, err error) {
+	logger.Sync() // what start-up logged before logging was configured
 	eh.logger.Printf("ERROR: invalid configuration - %s: %v", field, err)
 
 	select {
