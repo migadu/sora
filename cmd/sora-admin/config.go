@@ -30,6 +30,9 @@ func handleConfigCommand(ctx context.Context) {
 			skipNext = true
 			continue
 		}
+		if strings.HasPrefix(os.Args[i], "--config=") {
+			continue
+		}
 		if os.Args[i] == "config" {
 			// Skip the "config" command itself
 			continue
@@ -121,32 +124,38 @@ func handleConfigValidate(_ context.Context) {
 }
 
 func handleConfigDump(_ context.Context) {
-	// Extract config path from os.Args (it was preserved for config subcommand)
-	// os.Args format: [prog, --config, PATH, config, dump, FLAGS...]
+	// Extract config path from os.Args (it was preserved for config subcommand;
+	// the first --config counts, matching handleConfigValidate) and collect any
+	// flags after "dump" with --config stripped.
 	var configFile string
 	var format string = "toml"
 	var maskSecrets bool = true
-	var flagsStartIndex int
 
-	// Look for --config flag and find where "dump" ends
-	skipNext := false
+	seenDump := false
+	var dumpArgs []string
 	for i := 1; i < len(os.Args); i++ {
-		if skipNext {
-			skipNext = false
+		if os.Args[i] == "--config" {
+			if i+1 < len(os.Args) {
+				if configFile == "" {
+					configFile = os.Args[i+1]
+				}
+				i++ // the value, even when it starts with "-" or is "dump"
+			}
 			continue
 		}
-		if os.Args[i] == "--config" && i+1 < len(os.Args) {
-			configFile = os.Args[i+1]
-			skipNext = true
-			continue
-		} else if strings.HasPrefix(os.Args[i], "--config=") {
-			configFile = strings.TrimPrefix(os.Args[i], "--config=")
+		if strings.HasPrefix(os.Args[i], "--config=") {
+			if configFile == "" {
+				configFile = strings.TrimPrefix(os.Args[i], "--config=")
+			}
 			continue
 		}
-		if os.Args[i] == "dump" {
-			flagsStartIndex = i + 1
-			break
+		if !seenDump {
+			if os.Args[i] == "dump" {
+				seenDump = true
+			}
+			continue
 		}
+		dumpArgs = append(dumpArgs, os.Args[i])
 	}
 
 	// Parse additional flags after the subcommand
@@ -170,8 +179,8 @@ Examples:
 `)
 	}
 
-	if flagsStartIndex > 0 && flagsStartIndex < len(os.Args) {
-		flagSet.Parse(os.Args[flagsStartIndex:])
+	if len(dumpArgs) > 0 {
+		flagSet.Parse(dumpArgs)
 	}
 
 	if configFile == "" {

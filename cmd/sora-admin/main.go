@@ -224,6 +224,7 @@ func main() {
 
 	// Determine the command first
 	command := ""
+	wantHelp := false
 	for i := 1; i < len(os.Args); i++ {
 		if !strings.HasPrefix(os.Args[i], "-") {
 			command = os.Args[i]
@@ -235,11 +236,16 @@ func main() {
 		} else if strings.HasPrefix(os.Args[i], "--config=") {
 			// Skip the --config=value flag entirely
 			continue
+		} else if os.Args[i] == "--help" || os.Args[i] == "-h" {
+			wantHelp = true
 		}
 	}
 
 	if command == "" {
 		printUsage()
+		if wantHelp {
+			os.Exit(0)
+		}
 		os.Exit(1)
 	}
 
