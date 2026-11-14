@@ -1,8 +1,11 @@
 package imap
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/migadu/go-imap"
@@ -61,5 +64,66 @@ func TestFetch_DecodeBinaryChargesAndRefusesUnknownCTE(t *testing.T) {
 	}, msg)
 	if err != nil || len(b.sections) != 1 || b.sections[0] != nil {
 		t.Errorf("decodeBinary without a body = %+v, %v; want one empty section", b, err)
+	}
+}
+
+// heldBytes returns the octets the slices keep reachable: the capacity of each
+// distinct backing array, which a slice keeps alive however short it is.
+func heldBytes(slices [][]byte) int {
+	held := make(map[*byte]int)
+	for _, s := range slices {
+		if c := cap(s); c > 0 {
+			end := &s[:c][c-1] // shared by every slice of the same array
+			held[end] = max(held[end], c)
+		}
+	}
+	total := 0
+	for _, c := range held {
+		total += c
+	}
+	return total
+}
+
+// A FETCH can name one part many times over: a 50 KiB command line has room
+// for some 2500 items like BINARY.PEEK[1]<0.1>. decodeBinary holds every item
+// until the message's FETCH response is written, so an item must hold no more
+// than it charges to the session budget. DecodeBinarySection returns a
+// <partial> as a slice of the whole decoded section, which would otherwise stay
+// reachable, uncharged, once per item.
+func TestFetch_DecodeBinaryHoldsOnlyWhatItCharges(t *testing.T) {
+	decoded := bytes.Repeat([]byte("0123456789abcdef"), 16*1024) // 256 KiB
+	encoded := base64.StdEncoding.EncodeToString(decoded)
+	var body strings.Builder
+	body.WriteString("Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\n")
+	for len(encoded) > 76 {
+		body.WriteString(encoded[:76] + "\r\n")
+		encoded = encoded[76:]
+	}
+	body.WriteString(encoded + "\r\n")
+
+	const items, chunk = 64, 16
+	options := &imap.FetchOptions{}
+	for i := range items {
+		options.BinarySection = append(options.BinarySection, &imap.FetchItemBinarySection{
+			Part: []int{1}, Peek: true, Partial: &imap.SectionPartial{Offset: int64(i) * 4096, Size: chunk},
+		})
+	}
+
+	bodyData := []byte(body.String())
+	s, tracker := newFetchTestSession(0)
+	bodyFetched := true
+	b, err := s.decodeBinary(context.Background(), &bodyData, &bodyFetched, options, fetchTestMessage(bodyData))
+	if err != nil {
+		t.Fatalf("decodeBinary: %v", err)
+	}
+	defer s.freeSectionCopies(b.charged)
+
+	for i, got := range b.sections {
+		if want := decoded[i*4096 : i*4096+chunk]; !bytes.Equal(got, want) {
+			t.Fatalf("section %d = %q, want %q", i, got, want)
+		}
+	}
+	if held := heldBytes(b.sections); int64(held) > 2*b.charged {
+		t.Errorf("%d items hold %d bytes, but charge %d (tracker %d)", items, held, b.charged, tracker.Current())
 	}
 }
