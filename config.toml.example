@@ -660,7 +660,10 @@ fts_retention = ""                # How long to keep FTS search vectors (text_bo
                                   # NOTE: one row per (body, account), so at a given retention the
                                   # prune volume scales with how widely bodies are shared.
                                   # WARNING: Setting this removes search capability for old messages. Use with caution.
-health_status_retention = "30d"   # How long to retain health status history in the database.
+health_status_retention = "30d"   # How long a node's health_status rows (one per component, no history) may go
+                                  # without an update before they are deleted: this removes nodes that stopped.
+                                  # A running node rewrites each row at least every 20 checks (20 minutes at the
+                                  # longest check interval), so keep this well above that.
 instance_liveness_threshold = "7d" # How long an uploader instance must be silent before it counts as gone.
                                   # A pending upload can only be performed by the instance that created it
                                   # (the message body is a file on that node's local disk), so messages whose

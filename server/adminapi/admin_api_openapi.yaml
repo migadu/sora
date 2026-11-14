@@ -2610,6 +2610,7 @@ paths:
       tags:
         - Health Monitoring
       summary: Get health status for a component
+      description: "The current status only. One row is kept per component and server, rewritten when the status changes and every 20 checks while it holds, so there is no history: history=true is answered with 400. The sora_component_health_status metric gives the status over time."
       parameters:
         - name: hostname
           in: path
@@ -2621,46 +2622,19 @@ paths:
           required: true
           schema:
             type: string
-        - name: history
-          in: query
-          schema:
-            type: boolean
-          description: "If true, returns historical health data instead of the current status."
-        - name: since
-          in: query
-          schema:
-            type: string
-            format: date-time
-          description: "If history=true, return records after this timestamp (RFC3339). Defaults to 24 hours ago."
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            default: 100
-          description: "If history=true, limit the number of historical records returned."
       responses:
         '200':
-          description: Current or historical health status for the component.
+          description: Current health status for the component.
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: '#/components/schemas/HealthStatus'
-                  - type: object
-                    properties:
-                      hostname:
-                        type: string
-                      component:
-                        type: string
-                      history:
-                        type: array
-                        items:
-                          $ref: '#/components/schemas/HealthStatus'
-                      count:
-                        type: integer
-                      since:
-                        type: string
-                        format: date-time
+                $ref: '#/components/schemas/HealthStatus'
+        '400':
+          description: history=true was requested; no health history is recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: Component health status not found.
           content:

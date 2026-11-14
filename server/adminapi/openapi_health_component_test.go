@@ -33,7 +33,7 @@ func TestOpenAPIHealthComponentDescribesNoHistory(t *testing.T) {
 			t.Errorf("GET %s documents the %q parameter, but the handler keeps no history", path, param)
 		}
 	}
-	if strings.Contains(op, "history:") {
+	if regexp.MustCompile(`\n\s+history:\s*\n`).MatchString(op) {
 		t.Errorf("GET %s documents a history response, but the handler only returns the current status", path)
 	}
 	if !strings.Contains(op, "\n        '400':\n") {
