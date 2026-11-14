@@ -56,7 +56,7 @@ type Session struct {
 	proxyInfo             *server.ProxyProtocolInfo
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
 	submittedUsername     string // Username exactly as submitted by the client (lookup-cache key)
-	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
+	connRegistered        bool   // connTracker.RegisterConnection accepted this session: close() unregisters only then
 }
 
 var _ managesieveserver.Session = (*Session)(nil)
@@ -116,9 +116,6 @@ func (s *Session) AuthenticatePlain(_ context.Context, _, username, password str
 	// backend connection.
 	if err := s.registerConnection(); err != nil {
 		s.InfoLog("connection rejected by connection tracker", "error", err)
-		// Mark as rejected so close() does not decrement a slot this session
-		// never held (which would erode the account's limit).
-		s.connRejected = true
 		return &managesieveserver.Error{Code: "TRYLATER", Message: "Too many connections", Close: true}
 	}
 
@@ -283,7 +280,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// meant the delay never fired in exactly the deployment proxies exist for.
 	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
 	remoteAddr := &server.StringAddr{Addr: realClientIP}
-	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-PROXY"); err != nil {
+	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "managesieve_proxy"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			s.InfoLog("delay queue full, rejecting connection", "username", username)
@@ -434,21 +431,31 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// Otherwise: treat as token, send full username (including @SUFFIX) to remotelookup
 	var usernameForRemoteLookup string
 	var masterAuthValidated bool
+	// The master username form with a wrong master password: refused whatever the
+	// credential check below says, even for the account's own password (#801).
+	var wrongMasterPassword bool
 
 	if parseErr == nil && parsedAddr.HasSuffix() {
 		// Has suffix - check if it matches configured master username
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
 			// Suffix matches master username - validate master password locally
 			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
-				// Wrong master password - fail immediately
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return consts.ErrAuthenticationFailed
+				// Wrong master password. Refused like a wrong password under any other
+				// suffix, and only after the same work: the regular credential path below
+				// (lookup, password verification, lookup-cache entry). An
+				// immediate refusal is answered one verification sooner, which confirms
+				// a guessed master username (#801).
+				s.DebugLog("wrong master password, refusing after the credential check of the base address", "address", parsedAddr.BaseAddress())
+				// A refused master guess must query the same submitted name as
+				// another suffix. The service may route or refuse tokens differently.
+				usernameForRemoteLookup = username
+				wrongMasterPassword = true
+			} else {
+				// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
+				s.DebugLog("master username authentication successful, using base address for routing", "address", parsedAddr.BaseAddress())
+				usernameForRemoteLookup = parsedAddr.BaseAddress()
+				masterAuthValidated = true
 			}
-			// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
-			s.DebugLog("master username authentication successful, using base address for routing", "address", parsedAddr.BaseAddress())
-			usernameForRemoteLookup = parsedAddr.BaseAddress()
-			masterAuthValidated = true
 		} else {
 			// Suffix doesn't match master username - treat as token
 			// Send FULL username (including @TOKEN) to remotelookup for validation
@@ -483,6 +490,10 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			s.DebugLog("remotelookup authentication", "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail, "error", err)
 		} else {
 			s.DebugLog("remotelookup authentication", "client_username", username, "sent_to_remotelookup", usernameForRemoteLookup, "master_auth", masterAuthValidated, "result", authResult.String(), "backend", backend, "actual_email", actualEmail)
+		}
+		if err == nil && authResult == proxy.AuthSuccess && wrongMasterPassword {
+			// The account's own password, not the master password: refused as a wrong one.
+			authResult = proxy.AuthFailed
 		}
 
 		if err != nil {
@@ -677,6 +688,10 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		s.DebugLog("Authenticating via main DB")
 		// Use base address (without +detail) for authentication
 		accountID, err = s.server.rdb.AuthenticateWithRetry(ctx, address.BaseAddress(), password)
+		if err == nil && wrongMasterPassword {
+			// The account's own password, not the master password: refused as a wrong one.
+			err = db.ErrInvalidCredentials
+		}
 		if err != nil {
 			// Check if error is due to session context cancellation (server shutdown)
 			// Note: Must check s.ctx.Err(), not just the query error, because the query context
@@ -887,14 +902,14 @@ func (s *Session) connectToBackendAndAuth() error {
 		}
 		backendWriter.Flush()
 
-		// Read STARTTLS response (bounded)
-		response, err := server.ReadBoundedLine(backendReader, 8192)
+		// Read the STARTTLS response (bounded), with any literal its text is sent as
+		response, err := readBackendRecord(backendReader)
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: failed to read STARTTLS response: %w", server.ErrBackendConnectionFailed, err)
 		}
 
-		if !strings.HasPrefix(strings.TrimSpace(response), "OK") {
+		if backendStatus(response) != "OK" {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: backend STARTTLS failed: %s", server.ErrBackendConnectionFailed, strings.TrimSpace(response))
 		}
@@ -938,40 +953,55 @@ func (s *Session) connectToBackendAndAuth() error {
 	return s.authenticateToBackend()
 }
 
+// backendStatus returns the status of a backend response line: "OK", "NO" or "BYE", or
+// "" when the line is none of them. RFC 5804 section 4: response-ok = "OK" [SP "("
+// resp-code ")"] [SP string] CRLF, response-nobye = ("NO" / "BYE") likewise, and
+// "Implementations MUST accept these strings in a case-insensitive fashion". The atom
+// ends at SP or the line end, so neither OKAY nor OK run into its string is an OK.
+func backendStatus(line string) string {
+	atom, _, _ := strings.Cut(strings.TrimSpace(line), " ")
+	for _, status := range []string{"OK", "NO", "BYE"} {
+		if strings.EqualFold(atom, status) {
+			return status
+		}
+	}
+	return ""
+}
+
 // readBackendCapabilities reads a capability list from the backend (its greeting, or the
 // list it re-issues after STARTTLS) up to the response that ends it: RFC 5804 section 4,
 // response-capability = *(single-capability) response-oknobye. A capability name is a
-// quoted or literal string, so a record whose first atom is OK, NO or BYE (case-insensitive,
-// section 4) is that response. Literal data must be consumed before another record's
-// status is inspected. NO or BYE is the backend refusing the connection (a sora
-// backend over its max_connections_per_ip answers NO (TRYLATER)): it ends the read at once
-// with the backend's line instead of being read past until EOF or the read deadline.
-// The argument what names the list in a read error.
+// quoted or literal string, so a record with a backendStatus is that response. Literal
+// data must be consumed before another record's status is inspected. NO or BYE is the
+// backend refusing the connection (a sora backend over its max_connections_per_ip answers
+// NO (TRYLATER)): it ends the read at once with the backend's line instead of being read
+// past until EOF or the read deadline. The argument what names the list in a read error.
 func (s *Session) readBackendCapabilities(r *bufio.Reader, what string) error {
 	for {
 		// Bounded: a misbehaving backend must not be able to grow the buffer
 		// without limit with a newline-less stream inside the deadline window.
-		line, err := readBackendCapabilityRecord(r)
+		line, err := readBackendRecord(r)
 		if err != nil {
 			return fmt.Errorf("%w: failed to read backend %s: %w", server.ErrBackendConnectionFailed, what, err)
 		}
 		line = strings.TrimSpace(line)
-		status, _, _ := strings.Cut(line, " ")
-		switch {
-		case strings.EqualFold(status, "OK"):
+		switch backendStatus(line) {
+		case "OK":
 			return nil
-		case strings.EqualFold(status, "NO"), strings.EqualFold(status, "BYE"):
+		case "NO", "BYE":
 			s.WarnLog("backend refused the connection", "backend", s.serverAddr, "response", line)
 			return fmt.Errorf("%w: backend refused the connection: %s", server.ErrBackendConnectionFailed, line)
 		}
 	}
 }
 
-// readBackendCapabilityRecord returns the first physical line after consuming a
-// whole capability or terminal response, including server literals. Literal
-// contents may contain CRLF and status words; none begin a new response. Keep the
-// existing 8 KiB bound across the complete record, including literal contents.
-func readBackendCapabilityRecord(r *bufio.Reader) (string, error) {
+// readBackendRecord returns the first physical line after consuming a whole
+// capability line or response, including server literals: a capability's value and
+// the text of an OK, NO or BYE are strings, which may be literal-s2c (RFC 5804
+// section 4). Literal contents may contain CRLF and status words; none begin a new
+// response. Keep the existing 8 KiB bound across the complete record, including
+// literal contents.
+func readBackendRecord(r *bufio.Reader) (string, error) {
 	remaining := 8192
 	line, err := server.ReadBoundedLine(r, remaining)
 	if err != nil {
@@ -1032,8 +1062,9 @@ func (s *Session) authenticateToBackend() error {
 	// Bound the backend auth-response read; cleared on success before the relay phase (M6).
 	s.backendConn.SetReadDeadline(time.Now().Add(backendHandshakeTimeout(s.server.connManager.GetConnectTimeout())))
 
-	// Read authentication response (bounded)
-	response, err := server.ReadBoundedLine(backendReader, 8192)
+	// Read the authentication response (bounded), with any literal its text is sent as:
+	// what is left in the reader goes to the client once the relay starts.
+	response, err := readBackendRecord(backendReader)
 	if err != nil {
 		// CRITICAL: Invalidate cache on backend authentication failure
 		s.invalidateLookupCache("backend auth read error")
@@ -1042,7 +1073,7 @@ func (s *Session) authenticateToBackend() error {
 
 	s.DebugLog("Backend auth response", "response", strings.TrimSpace(response))
 
-	if !strings.HasPrefix(response, "OK") {
+	if backendStatus(response) != "OK" {
 		// CRITICAL: Invalidate cache on backend authentication failure
 		// This ensures the next request does fresh remotelookup/database lookup
 		// to pick up backend changes (e.g., domain moved to different server)
@@ -1251,9 +1282,13 @@ func (s *Session) close() {
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
 	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
-	// Skip unregister when registration was rejected; otherwise we would
-	// decrement a slot this session never held (limit erosion for the account).
-	if s.server.connTracker != nil && !s.connRejected {
+	// Only a session the tracker registered unregisters. The account ID is set
+	// as soon as the client's credentials are accepted, before the backend leg
+	// and the registration: a session whose backend leg failed, or whose
+	// registration was refused, holds no slot, and unregistering it would free
+	// the slot of another session of the account from the same IP.
+	if s.server.connTracker != nil && s.connRegistered {
+		s.connRegistered = false // the slot is released once, however often close() runs
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -1288,7 +1323,10 @@ func (s *Session) registerConnection() error {
 
 	// Use cached client address (real IP) to match UnregisterConnection in close()
 	if s.server.connTracker != nil {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "ManageSieve", s.clientAddr)
+		if err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "ManageSieve", s.clientAddr); err != nil {
+			return err
+		}
+		s.connRegistered = true
 	}
 	return nil
 }

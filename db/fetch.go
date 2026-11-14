@@ -21,7 +21,9 @@ func BuildEnvelope(msg *Message) (*imap.Envelope, error) {
 		envelope.Date = msg.InternalDate
 	}
 	envelope.Subject = msg.Subject
-	envelope.MessageID = msg.MessageID
+	// RFC 9051 §7.5.2: an absent Message-ID is a NIL member, which go-imap writes for
+	// "". A synthetic ID is not the header; passed on, it came out in doubled brackets.
+	envelope.MessageID = headerMessageID(msg.MessageID)
 
 	// Split the In-Reply-To header into individual message IDs
 	if msg.InReplyTo != "" {

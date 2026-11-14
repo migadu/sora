@@ -343,15 +343,62 @@ func (c *TLSLetsEncryptConfig) normalizeDomains() {
 // autocert.Manager.GetCertificate derives it from a ClientHello. It fails for a name
 // GetCertificate refuses. sora-admin's tls commands name cache entries with it too.
 func AutocertName(domain string) (string, error) {
+	if domain == "" {
+		return "", errors.New("missing server name")
+	}
+	if strings.ContainsAny(domain, `/\`) {
+		return "", errors.New("server name contains path separator")
+	}
 	name, err := idna.Lookup.ToASCII(domain)
 	if err != nil {
 		return "", err
 	}
 	name = strings.TrimSuffix(name, ".")
-	if !strings.Contains(strings.Trim(name, "."), ".") {
+	if len(name) == 0 || len(name) > 253 {
+		return "", errors.New("server name length invalid")
+	}
+	if net.ParseIP(name) != nil {
+		return "", errors.New("server name must not be an IP address")
+	}
+	labels := strings.Split(name, ".")
+	if len(labels) < 2 {
 		return "", errors.New("server name component count invalid")
 	}
+	for _, label := range labels {
+		if !isValidAutocertLabel(label) {
+			return "", fmt.Errorf("invalid server name label %q", label)
+		}
+	}
+	if isAllASCIIDigits(labels[len(labels)-1]) {
+		return "", errors.New("server name top-level domain must not be all-numeric")
+	}
 	return name, nil
+}
+
+func isValidAutocertLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 {
+		return false
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		c := label[i]
+		if ('a' <= c && c <= 'z') || ('0' <= c && c <= '9') || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isAllASCIIDigits(label string) bool {
+	for i := 0; i < len(label); i++ {
+		if label[i] < '0' || label[i] > '9' {
+			return false
+		}
+	}
+	return len(label) > 0
 }
 
 // TLSConfig holds TLS/SSL configuration
@@ -419,13 +466,34 @@ func (c *CleanupConfig) GetFTSRetention() (time.Duration, error) {
 	return helpers.ParseDuration(c.FTSRetention)
 }
 
-// Validate rejects a negative fts_retention. It parses, but delivery and import index only
-// mail sent after now minus the retention, which would then lie in the future, so no new
-// message would get a search row; and the cleaner prunes only for a positive retention. A
-// value that does not parse falls back to keeping every vector, like any other duration key.
+// Validate rejects durations that parse but have a sign the cleaner cannot use.
+//
+//   - grace_period: every cleaner threshold is now minus the grace period, so a negative
+//     one lies in the future and expunged mail and soft-deleted accounts are hard-deleted
+//     at the next cycle, with no restore window.
+//   - max_age_restriction, health_status_retention: the cleaner acts only on a positive
+//     value, so a negative one turns the restriction or the pruning off without a word.
+//   - fts_retention: delivery and import index only mail sent after now minus the
+//     retention, which would then lie in the future, so no new message would get a search
+//     row; and the cleaner prunes only for a positive retention.
+//   - instance_liveness_threshold must be positive. The runtime getter retains its
+//     default fallback for non-positive values as a safety net.
+//
+// An unset key does not parse here and takes its default; a value that does not parse
+// falls back to the default too, like any other duration key.
 func (c *CleanupConfig) Validate() error {
-	if d, err := helpers.ParseDuration(c.FTSRetention); err == nil && d < 0 {
-		return fmt.Errorf("fts_retention must not be negative, got %q", c.FTSRetention)
+	for _, f := range []struct{ key, value string }{
+		{"grace_period", c.GracePeriod},
+		{"max_age_restriction", c.MaxAgeRestriction},
+		{"fts_retention", c.FTSRetention},
+		{"health_status_retention", c.HealthStatusRetention},
+	} {
+		if d, err := helpers.ParseDuration(f.value); err == nil && d < 0 {
+			return fmt.Errorf("%s must not be negative, got %q", f.key, f.value)
+		}
+	}
+	if d, err := helpers.ParseDuration(c.InstanceLivenessThreshold); err == nil && d <= 0 {
+		return fmt.Errorf("instance_liveness_threshold must be positive, got %q", c.InstanceLivenessThreshold)
 	}
 	return nil
 }
@@ -646,7 +714,15 @@ type AuthRateLimiterConfig struct {
 // disabled the IP block on another). TOML accepts nan and inf, which pass a sign check
 // but are no growth factor. Any finite multiplier is safe: the limiter caps the
 // product at max_delay before converting it to a time.Duration.
+//
+// It also rejects an exempt_networks entry that is neither an IP address nor a CIDR.
+// The limiter's match skips such an entry, so it would exempt nobody, and the host the
+// operator meant to exempt would be counted and blocked with nothing in the log to say
+// why. A malformed [servers] trusted_networks entry is refused the same way.
 func (c *AuthRateLimiterConfig) Validate() error {
+	if invalid := helpers.InvalidNetworkEntries(c.ExemptNetworks); len(invalid) > 0 {
+		return fmt.Errorf("auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: %q", invalid)
+	}
 	v := reflect.ValueOf(c).Elem()
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Field(i)
@@ -1107,7 +1183,8 @@ func (c *RemoteLookupConfig) GetRemotePort() (int, error) {
 	return int(p), nil
 }
 
-// ServerLimitsConfig holds resource limits for a server
+// ServerLimitsConfig holds resource limits for a server. serverLimitKeys lists the
+// server types that apply each one.
 type ServerLimitsConfig struct {
 	SearchRateLimitPerMin *int   `toml:"search_rate_limit_per_min,omitempty"` // Search rate limit (searches per minute, 0=disabled, default: 60)
 	SearchRateLimitWindow string `toml:"search_rate_limit_window,omitempty"`  // Search rate limit time window (default: 1m)
@@ -1766,11 +1843,27 @@ func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 	return size, nil
 }
 
+// GetMaxMessageSize returns max_message_size (LMTP, LMTP proxy, Admin API delivery),
+// 50 MB when omitted, capped at consts.MaxStoredMessageSize: a larger message would be
+// read in full and then refused by the database insert, and the LMTP proxy would
+// advertise a SIZE no backend accepts. RFC 1870 section 5: "The fixed maximum message
+// size is defined as the message size of the largest message that a server is ever
+// willing to accept. [...] The fixed maximum message size may be an implementation
+// artifact of the SMTP server". A value that does not parse is an error: start-up falls
+// back to the default (GetMaxMessageSizeWithDefault), a reload keeps the running limit.
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
 	if s.MaxMessageSize == "" {
 		return 50 * 1024 * 1024, nil // 50MB default
 	}
-	return helpers.ParseSize(s.MaxMessageSize)
+	size, err := helpers.ParseSize(s.MaxMessageSize)
+	if err != nil {
+		return 0, err
+	}
+	if size > consts.MaxStoredMessageSize {
+		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
+		return consts.MaxStoredMessageSize, nil
+	}
+	return size, nil
 }
 
 func (s *ServerConfig) GetConnectTimeout() (time.Duration, error) {
@@ -1843,10 +1936,18 @@ func (s *ServerConfig) GetProxyProtocolTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(s.ProxyProtocolTimeout)
 }
 
-// GetSearchRateLimitWindow parses the search rate limit window duration
+// GetSearchRateLimitWindow parses the search rate limit window duration. A zero or
+// negative window is an error: the rate limiter would replace it with the default.
 func (s *ServerConfig) GetSearchRateLimitWindow() (time.Duration, error) {
 	if s.Limits != nil && s.Limits.SearchRateLimitWindow != "" {
-		return helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
+		window, err := helpers.ParseDuration(s.Limits.SearchRateLimitWindow)
+		if err != nil {
+			return 0, err
+		}
+		if window <= 0 {
+			return 0, fmt.Errorf("limits.search_rate_limit_window must be positive, got %q", s.Limits.SearchRateLimitWindow)
+		}
+		return window, nil
 	}
 	return time.Minute, nil // Default: 1 minute
 }
@@ -2338,22 +2439,13 @@ func (s *ServerConfig) GetAuthIdleTimeoutWithDefault() time.Duration {
 	return timeout
 }
 
-// GetMaxMessageSizeWithDefault returns max_message_size (LMTP, LMTP proxy, Admin API
-// delivery), at start-up and on a reload, capped at consts.MaxStoredMessageSize: a
-// larger message would be read in full and then refused by the database insert, and
-// the LMTP proxy would advertise a SIZE no backend accepts. RFC 1870 section 5: "The
-// fixed maximum message size is defined as the message size of the largest message
-// that a server is ever willing to accept. [...] The fixed maximum message size may
-// be an implementation artifact of the SMTP server".
+// GetMaxMessageSizeWithDefault returns GetMaxMessageSize for start-up, which has no
+// running limit to keep: a value that does not parse is the 50 MB default.
 func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {
 	size, err := s.GetMaxMessageSize()
 	if err != nil {
 		warnf("Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
 		return 52428800 // 50MB default
-	}
-	if size > consts.MaxStoredMessageSize {
-		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
-		return consts.MaxStoredMessageSize
 	}
 	return size
 }
@@ -2566,16 +2658,16 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
-	// A proxy dials a backend address without a port at its remote_port, or at its enabled
-	// lookup's remote_port for a lookup-routed one. No other server reads either, and a
+	// A proxy dials a backend address without a port at its remote_port, and builds a
+	// lookup client from its enabled remote_lookup. No other server reads either, and a
 	// disabled lookup is never initialized.
 	if strings.HasSuffix(s.Type, "_proxy") {
 		if _, err := s.GetRemotePort(); err != nil {
 			return fmt.Errorf("server %q: invalid remote_port: %w", s.Name, err)
 		}
 		if s.RemoteLookup != nil && s.RemoteLookup.Enabled {
-			if _, err := s.RemoteLookup.GetRemotePort(); err != nil {
-				return fmt.Errorf("server %q: invalid remote_lookup.remote_port: %w", s.Name, err)
+			if err := s.RemoteLookup.Validate(); err != nil {
+				return fmt.Errorf("server %q: %w", s.Name, err)
 			}
 		}
 	}
@@ -2617,8 +2709,19 @@ func (s *ServerConfig) MetricsPath() string {
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
-	if s.ReadOnlyAPIKey != "" && s.Type != "http_admin_api" {
-		logger("WARNING: Server %s (type: %s) has 'read_only_api_key' configured, but this only applies to http_admin_api servers", s.Name, s.Type)
+	for _, k := range serverTypeKeys {
+		if k.set(s) && !slices.Contains(k.appliedBy, s.Type) {
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "))
+		}
+	}
+	// Only these filter clients by address. Every other type, the User API proxy
+	// included, serves every client whatever the list says.
+	if len(s.AllowedHosts) > 0 {
+		switch s.Type {
+		case "metrics", "http_admin_api", "http_user_api":
+		default:
+			logger("WARNING: Server %s (type: %s) has 'allowed_hosts' configured, but this only applies to metrics, http_admin_api and http_user_api servers; it does not restrict which clients this server accepts", s.Name, s.Type)
+		}
 	}
 	if s.TLSUseStartTLS {
 		switch s.Type {
@@ -2639,6 +2742,13 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 	}
 	if s.Timeouts != nil && s.Timeouts.SchedulerShardCount != 0 {
 		logger("WARNING: Server %s (type: %s) has 'timeouts.scheduler_shard_count' configured, but it has no effect: all servers share one timeout scheduler, sized by [timeout_scheduler] shard_count", s.Name, s.Type)
+	}
+	if s.Limits != nil {
+		for _, k := range serverLimitKeys {
+			if k.set(s.Limits) && !slices.Contains(k.appliedBy, s.Type) {
+				logger("WARNING: Server %s (type: %s) has 'limits.%s' configured, but only %s servers apply it", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "))
+			}
+		}
 	}
 
 	// Check proxy-only options on non-proxy servers
@@ -2700,8 +2810,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		s.warnKeysNotApplied(logger, "the LMTP server does not apply it",
 			configKey{"timeouts.absolute_session_timeout", s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != ""},
 			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0},
-			configKey{"auth_idle_timeout", s.AuthIdleTimeout != ""},
-			configKey{"limits.session_memory_limit", s.Limits != nil && s.Limits.SessionMemoryLimit != ""})
+			configKey{"auth_idle_timeout", s.AuthIdleTimeout != ""})
 		// MTAs deliver many messages at once from few addresses.
 		s.warnKeysNotApplied(logger, "the LMTP server limits only its total connections (max_connections)",
 			configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
@@ -2778,6 +2887,12 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'remote_use_xclient' configured, but this only applies to LMTP and POP3 proxy servers", s.Name, s.Type)
 		}
 
+	case "user_api_proxy":
+		// An HTTP request is not a logged-in session: nothing counts connections per user.
+		s.warnKeysNotApplied(logger, "the User API proxy limits only its total connections and those per IP (max_connections, max_connections_per_ip)",
+			configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
+
 	case "metrics", "http_admin_api", "http_user_api":
 		// HTTP servers - warn about protocol-specific options
 		if len(s.SupportedExtensions) > 0 {
@@ -2788,6 +2903,21 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 		if s.AppendLimit != "" {
 			logger("WARNING: Server %s (type: %s) has 'append_limit' configured, but this only applies to IMAP servers", s.Name, s.Type)
+		}
+		// An HTTP request is not a logged-in session, so nothing counts connections
+		// per user. The Admin and User APIs cap their total connections, the metrics
+		// listener none.
+		if s.Type == "metrics" {
+			s.warnKeysNotApplied(logger, "the metrics server does not limit its connections",
+				configKey{"max_connections", s.MaxConnections != 0},
+				configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+				configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+				configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
+		} else {
+			s.warnKeysNotApplied(logger, "this server type limits only its total connections (max_connections)",
+				configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
+				configKey{"max_connections_per_user", s.MaxConnectionsPerUser != 0},
+				configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 		}
 		if s.Type == "metrics" && s.TLS {
 			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)
@@ -2804,6 +2934,62 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			}
 		}
 	}
+}
+
+// serverTypeKeys is each [[server]] key that only some server types read, with
+// those types. Every type accepts every key; WarnUnusedConfigOptions reports one
+// set on a type not listed.
+var serverTypeKeys = []struct {
+	name      string
+	set       func(*ServerConfig) bool
+	appliedBy []string
+}{
+	// The mail servers and proxies open their listener with this backlog; the
+	// HTTP servers listen with the kernel's default.
+	{"listen_backlog", func(s *ServerConfig) bool { return s.ListenBacklog != 0 }, []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	{"api_key", func(s *ServerConfig) bool { return s.APIKey != "" }, []string{"metrics", "http_admin_api"}},
+	{"read_only_api_key", func(s *ServerConfig) bool { return s.ReadOnlyAPIKey != "" }, []string{"http_admin_api"}},
+	// The User API backend issues the tokens; the proxy checks them and sets the
+	// CORS headers of the errors it answers itself.
+	{"jwt_secret", func(s *ServerConfig) bool { return s.JWTSecret != "" }, []string{"http_user_api", "user_api_proxy"}},
+	{"allowed_origins", func(s *ServerConfig) bool { return len(s.AllowedOrigins) > 0 }, []string{"http_user_api", "user_api_proxy"}},
+	{"token_duration", func(s *ServerConfig) bool { return s.TokenDuration != "" }, []string{"http_user_api"}},
+	{"token_issuer", func(s *ServerConfig) bool { return s.TokenIssuer != "" }, []string{"http_user_api"}},
+	// The metrics listener's path, and the collection settings only a metrics
+	// block applies (configureMetrics).
+	{"path", func(s *ServerConfig) bool { return s.Path != "" }, []string{"metrics"}},
+	{"enable_user_metrics", func(s *ServerConfig) bool { return s.EnableUserMetrics }, []string{"metrics"}},
+	{"enable_domain_metrics", func(s *ServerConfig) bool { return s.EnableDomainMetrics != nil }, []string{"metrics"}},
+	{"user_metrics_threshold", func(s *ServerConfig) bool { return s.UserMetricsThreshold != nil }, []string{"metrics"}},
+	{"max_tracked_users", func(s *ServerConfig) bool { return s.MaxTrackedUsers != nil }, []string{"metrics"}},
+	{"hash_usernames", func(s *ServerConfig) bool { return s.HashUsernames != nil }, []string{"metrics"}},
+}
+
+// serverLimitKeys is every [server.limits] key with the server types whose start
+// functions read it. Every type accepts every key; WarnUnusedConfigOptions reports
+// one set on a type not listed. A new limits key belongs here.
+var serverLimitKeys = []struct {
+	name      string
+	set       func(*ServerLimitsConfig) bool
+	appliedBy []string
+}{
+	// The IMAP backend's search rate limiter, THREAD cap and FETCH PREVIEW budgets.
+	{"search_rate_limit_per_min", func(l *ServerLimitsConfig) bool { return l.SearchRateLimitPerMin != nil }, []string{"imap"}},
+	{"search_rate_limit_window", func(l *ServerLimitsConfig) bool { return l.SearchRateLimitWindow != "" }, []string{"imap"}},
+	{"search_rate_limit_burst", func(l *ServerLimitsConfig) bool { return l.SearchRateLimitBurst != nil }, []string{"imap"}},
+	{"thread_max_messages", func(l *ServerLimitsConfig) bool { return l.ThreadMaxMessages != 0 }, []string{"imap"}},
+	{"preview_s3_per_min", func(l *ServerLimitsConfig) bool { return l.PreviewS3PerMin != nil }, []string{"imap"}},
+	{"preview_s3_burst", func(l *ServerLimitsConfig) bool { return l.PreviewS3Burst != nil }, []string{"imap"}},
+	{"preview_s3_node_per_min", func(l *ServerLimitsConfig) bool { return l.PreviewS3NodePerMin != nil }, []string{"imap"}},
+	{"preview_s3_max_size", func(l *ServerLimitsConfig) bool { return l.PreviewS3MaxSize != "" }, []string{"imap"}},
+	// The session memory tracker.
+	{"session_memory_limit", func(l *ServerLimitsConfig) bool { return l.SessionMemoryLimit != "" }, []string{"imap", "pop3"}},
+	// The login proxies' cap on protocol errors before authentication (wrong passwords do not count).
+	{"max_auth_errors", func(l *ServerLimitsConfig) bool { return l.MaxAuthErrors != 0 }, []string{"imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+	// Sieve on delivery: LMTP and the Admin API's /admin/mail/deliver.
+	{"redirect_rate_limit", func(l *ServerLimitsConfig) bool { return l.RedirectRateLimit != nil }, []string{"lmtp", "http_admin_api"}},
+	{"redirect_rate_window", func(l *ServerLimitsConfig) bool { return l.RedirectRateWindow != "" }, []string{"lmtp", "http_admin_api"}},
+	{"max_redirect_hops", func(l *ServerLimitsConfig) bool { return l.MaxRedirectHops != nil }, []string{"lmtp", "http_admin_api"}},
 }
 
 // configKey is a server setting by its TOML key, and whether the block sets it.
@@ -2864,6 +3050,96 @@ func (c *Config) ProxyProtocolListenersMissingTrust() []string {
 func (c *Config) ValidateTrustedNetworks() error {
 	_, err := helpers.ParseTrustedNetworks(c.Servers.TrustedNetworks)
 	return err
+}
+
+// HasMailBackend reports whether an enabled server stores mail (imap, lmtp, pop3). Such a
+// node runs the upload worker, the cleaner and the local cache, so it reads [uploader]
+// and [cleanup].
+func (c *Config) HasMailBackend() bool {
+	for _, s := range c.GetAllServers() {
+		if s.Type == "imap" || s.Type == "lmtp" || s.Type == "pop3" {
+			return true
+		}
+	}
+	return false
+}
+
+// Problem is one reason Validate refuses a file: the part of the file it is about, as
+// an operator finds it ("server 'imap'", "[relay]", "trusted_networks"), and what is
+// wrong there.
+type Problem struct {
+	Section string
+	Err     error
+}
+
+// Validate runs the shared configuration checks used by sora before service setup and
+// by `sora-admin config validate`, returning every problem these checks find.
+//
+// What a node does not run is not checked: [uploader] and [cleanup] only with a mail
+// backend. Service setup still checks required database and S3 settings, S3 timeout,
+// external connectivity and the node's disk; passing Validate does not check those.
+func (c *Config) Validate() []Problem {
+	var problems []Problem
+	add := func(section string, err error) {
+		if err != nil {
+			problems = append(problems, Problem{Section: section, Err: err})
+		}
+	}
+
+	servers := c.GetAllServers()
+	for i := range servers {
+		add(fmt.Sprintf("server '%s'", servers[i].Name), servers[i].Validate())
+	}
+
+	// Named backend pools are validated as a whole: the checks cross the [[pool]] blocks
+	// and the proxy servers that route into them.
+	add("[[pool]]", c.ValidatePools())
+	add("[relay]", c.Relay.Validate())
+	if c.Relay.IsQueueEnabled() {
+		add("[relay.queue]", c.Relay.Queue.Validate())
+	}
+	// One malformed trusted_networks entry would leave LMTP admission with no peers.
+	add("trusted_networks", c.ValidateTrustedNetworks())
+	add("[shared_mailboxes]", c.SharedMailboxes.Validate())
+
+	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
+	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
+	if missing := c.ProxyProtocolListenersMissingTrust(); len(missing) > 0 {
+		add("trusted_networks", fmt.Errorf("proxy_protocol is enabled on server(s) %s but [servers] trusted_networks is empty; "+
+			"set trusted_networks to your trusted proxy IPs/CIDRs (otherwise any client could spoof its "+
+			"source IP via a PROXY header)", strings.Join(missing, ", ")))
+	}
+
+	// A block without a name or addr is reported by its own Validate above.
+	names := make(map[string]bool)
+	addrs := make(map[string]string) // addr -> server name
+	for _, s := range servers {
+		if s.Name != "" {
+			if names[s.Name] {
+				add("server configuration", fmt.Errorf("duplicate server name '%s' found. Each server must have a unique name", s.Name))
+			}
+			names[s.Name] = true
+		}
+		if s.Addr != "" {
+			if other, exists := addrs[s.Addr]; exists {
+				add("server configuration", fmt.Errorf("duplicate server address '%s' found. Server '%s' and '%s' cannot bind to the same address", s.Addr, other, s.Name))
+			} else {
+				addrs[s.Addr] = s.Name
+			}
+		}
+	}
+	if len(servers) == 0 {
+		add("servers", fmt.Errorf("no servers configured. Please configure at least one server in a [[server]] section"))
+	}
+
+	if c.HasMailBackend() {
+		// The cleaner and the upload worker both take [uploader] max_attempts.
+		add("[uploader]", c.Uploader.Validate())
+		// The cleaner takes [cleanup]; delivery takes its fts_retention too.
+		add("[cleanup]", c.Cleanup.Validate())
+	}
+
+	return problems
 }
 
 // broadPrivateRanges are the full RFC1918 / IPv6-ULA / link-local supernets. Trusting any
@@ -2937,13 +3213,25 @@ func LoadServerConfig(configPath string, cfg *Config) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if !md.IsDefined("database", "write") {
+	if !hasTOMLPathFold(md, "database", "write") {
 		cfg.Database.Write = nil
 	}
-	if !md.IsDefined("database", "read") {
+	if !hasTOMLPathFold(md, "database", "read") {
 		cfg.Database.Read = nil
 	}
 	return err
+}
+
+func hasTOMLPathFold(md toml.MetaData, p1, p2 string) bool {
+	if md.IsDefined(p1, p2) {
+		return true
+	}
+	for _, k := range md.Keys() {
+		if len(k) >= 2 && strings.EqualFold(k[0], p1) && strings.EqualFold(k[1], p2) {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadConfigFromFileWithMetadata is LoadConfigFromFile that also returns the file's TOML

@@ -74,7 +74,7 @@ func (db *Database) HasRecentVacationResponse(ctx context.Context, AccountID int
 	cutoffTime := time.Now().Add(-duration)
 
 	var exists bool
-	err := db.GetReadPool().QueryRow(ctx, `
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
 		SELECT EXISTS(
 			SELECT 1 FROM vacation_responses 
 			WHERE account_id = $1 

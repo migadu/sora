@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/migadu/go-imap"
@@ -126,6 +127,23 @@ func safeExtractBinarySectionSize(bodyData []byte, section *imap.FetchItemBinary
 	return imapserver.ExtractBinarySectionSize(bytes.NewReader(bodyData), section)
 }
 
+// requireFetchBinary refuses the BINARY, BINARY.PEEK and BINARY.SIZE items of
+// a FETCH, or of NOTIFY's MessageNew fetch-atts, unless the session offers
+// them; go-imap parses them whatever the session offers. They are BINARY's
+// (RFC 3516 §4.2) and also IMAP4rev2's, which "includes additional FETCH items
+// (BINARY, BINARY.PEEK, and BINARY.SIZE) but not extensions to the APPEND
+// command" (RFC 9051 Appendix B): disabling BINARY alone keeps them, disabling
+// both refuses them.
+func (s *IMAPSession) requireFetchBinary(options *imap.FetchOptions) error {
+	if len(options.BinarySection) == 0 && len(options.BinarySectionSize) == 0 {
+		return nil
+	}
+	if s.GetCapabilities().Has(imap.CapIMAP4rev2) {
+		return nil
+	}
+	return s.requireCapability(imap.CapBinary, "FETCH BINARY")
+}
+
 func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
 	ctx = s.pinnedContext(ctx)
 
@@ -143,9 +161,15 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		metrics.CommandDuration.WithLabelValues("imap", "FETCH").Observe(time.Since(start).Seconds())
 	}
 
+	if err := s.requireFetchBinary(options); err != nil {
+		recordMetrics(err)
+		return err
+	}
+
 	// First, safely read necessary session state and decode the sequence numbers all within a single read lock
 	var selectedMailboxID int64
 	var selectedMailboxOwnerID int64
+	var selectedExamined bool
 	var sessionTrackerSnapshot *imapserver.SessionTracker
 	var decodedNumSet imap.NumSet
 
@@ -175,6 +199,7 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 
 	selectedMailboxID = s.selectedMailbox.ID
 	selectedMailboxOwnerID = s.selectedMailbox.AccountID
+	selectedExamined = s.selectedExamined.Load()
 	sessionTrackerSnapshot = s.sessionTracker
 
 	// Capture modseq before unlocking
@@ -239,16 +264,17 @@ func (s *IMAPSession) Fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 		}
 	}
 
-	// Determine if this FETCH implicitly marks messages as \Seen (any non-PEEK body section)
-	markSeen := false
-	for _, bs := range options.BodySection {
-		if !bs.Peek {
-			markSeen = true
-			break
-		}
-	}
+	// Determine if this FETCH implicitly marks messages as \Seen: any BODY[] or
+	// BINARY[] that is not the .PEEK form (RFC 9051 §6.4.5). Not in a mailbox
+	// opened with EXAMINE, where "No changes to the permanent state of the
+	// mailbox, including per-user state, are permitted" (RFC 9051 §6.3.3). A
+	// SELECT that the ACL made read-only is not EXAMINE (RFC 9051 §6.3.2); the
+	// 's' right below decides there.
+	markSeen := !selectedExamined &&
+		(slices.ContainsFunc(options.BodySection, func(bs *imap.FetchItemBodySection) bool { return !bs.Peek }) ||
+			slices.ContainsFunc(options.BinarySection, func(bs *imap.FetchItemBinarySection) bool { return !bs.Peek }))
 
-	// RFC 4314 §5.1.1: a FETCH that would implicitly set \Seen MUST NOT do so when the
+	// RFC 4314 §4: a FETCH that would implicitly set \Seen MUST NOT do so when the
 	// user lacks the 's' right on the mailbox. The owner always holds every right, so
 	// only shared-mailbox grantees incur the permission check. Fail closed (suppress the
 	// implicit \Seen) if the check itself errors.
@@ -510,23 +536,17 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 			}
 		}
 
+		// Fetch has refused the BINARY items up front unless the session
+		// offers them, through BINARY or IMAP4rev2.
 		if len(options.BinarySection) > 0 {
-			if s.GetCapabilities().Has(imap.CapBinary) {
-				if err := s.handleBinarySections(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
-					return err
-				}
-			} else {
-				s.DebugLog("BINARY section requests ignored due to capability filtering")
+			if err := s.handleBinarySections(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+				return err
 			}
 		}
 
 		if len(options.BinarySectionSize) > 0 {
-			if s.GetCapabilities().Has(imap.CapBinary) {
-				if err := s.handleBinarySectionSize(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
-					return err
-				}
-			} else {
-				s.DebugLog("BINARY section size requests ignored due to capability filtering")
+			if err := s.handleBinarySectionSize(ctx, m, &bodyData, &bodyDataFetched, options, msg); err != nil {
+				return err
 			}
 		}
 	}

@@ -20,6 +20,12 @@ import (
 var _ imapserver.SessionThread = (*IMAPSession)(nil)
 
 func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, algorithm imap.ThreadAlgorithm, charset string, criteria *imap.SearchCriteria) ([]imap.ThreadData, error) {
+	// RFC 5256 §1: a server offers each threading algorithm as a capability
+	// "consisting of "THREAD=" followed by a supported threading algorithm name".
+	if err := s.requireCapability(imap.Cap("THREAD="+string(algorithm)), "THREAD "+string(algorithm)); err != nil {
+		return nil, err
+	}
+
 	// Reject pathologically complex/deep criteria before building a query.
 	if err := s.validateSearchCriteria("THREAD", criteria); err != nil {
 		return nil, err

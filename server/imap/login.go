@@ -113,7 +113,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 		// Apply progressive authentication delay BEFORE any other checks
 		// Create a fake net.Addr from the RemoteIP for delay calculation
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "IMAP-LOGIN"); err != nil {
+		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "imap"); err != nil {
 			if errors.Is(err, server.ErrDelayQueueFull) {
 				// Delay queue full - reject immediately to prevent goroutine exhaustion
 				s.InfoLog("delay queue full, rejecting connection", "address", address)
@@ -192,19 +192,16 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 	if len(s.server.masterUsername) > 0 && addressParsed.HasSuffix() && checkMasterCredential(addressParsed.Suffix(), s.server.masterUsername) {
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
-			// Record failed master password authentication
-			metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
-
 			// Master username suffix matched but the password was wrong. Answer exactly like
 			// any other bad credential: a distinct "Invalid master credentials" reply is
 			// reachable with only the master USERNAME (no secret), so it confirms the
 			// configured master username to anyone who can reach the port - the precondition
-			// for every other master-form attack. The reason is kept for the operator at WARN.
+			// for every other master-form attack. At the same cost too: any other suffix is
+			// answered after the regular check of the base address, so a refusal without
+			// it confirms the master username by its response time (#801). The reason is
+			// kept for the operator at WARN.
 			s.WarnLog("master username authentication failed (invalid master password)")
-			return authFailedError()
+			return s.refuseLikeWrongPassword(ctx, address, password, netConn, proxyInfo, authKey)
 		}
 
 		if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {

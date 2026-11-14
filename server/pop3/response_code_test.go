@@ -59,7 +59,7 @@ func TestAuthDelayQueueFullIsTemporaryFailure(t *testing.T) {
 		for started < cap(holders) {
 			started++
 			go func() {
-				holders <- serverPkg.ApplyAuthenticationDelay(holdCtx, limiter, &serverPkg.StringAddr{Addr: ip}, "POP3-PASS")
+				holders <- serverPkg.ApplyAuthenticationDelay(holdCtx, limiter, &serverPkg.StringAddr{Addr: ip}, "pop3")
 			}()
 			select {
 			case err := <-holders:

@@ -35,7 +35,10 @@ import (
 	"github.com/migadu/sora/storage"
 )
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted
@@ -471,79 +474,82 @@ func (s *Server) setupRoutes() http.Handler {
 	// Account management routes. {email} is one segment of the escaped path, which
 	// r.PathValue decodes once: a "/" in a local part (atext, RFC 5322 §3.2.3)
 	// arrives as %2F and is part of the address, never a separator (RFC 3986 §2.4).
-	mux.HandleFunc("/admin/accounts", routeHandler("POST", s.handleCreateAccount))
-	mux.HandleFunc("/admin/accounts/{email}", multiMethodHandler(map[string]http.HandlerFunc{
+	mux.HandleFunc("/admin/accounts", s.routeHandler("POST", s.handleCreateAccount))
+	mux.HandleFunc("/admin/accounts/{email}", s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":    s.handleGetAccount,
 		"PUT":    s.handleUpdateAccount,
 		"DELETE": s.handleDeleteAccount,
 	}))
-	mux.HandleFunc("/admin/accounts/{email}/exists", routeHandler("GET", s.handleAccountExists))
-	mux.HandleFunc("/admin/accounts/{email}/restore", routeHandler("POST", s.handleRestoreAccount))
-	mux.HandleFunc("/admin/accounts/{email}/credentials", multiMethodHandler(map[string]http.HandlerFunc{
+	mux.HandleFunc("/admin/accounts/{email}/exists", s.routeHandler("GET", s.handleAccountExists))
+	mux.HandleFunc("/admin/accounts/{email}/restore", s.routeHandler("POST", s.handleRestoreAccount))
+	mux.HandleFunc("/admin/accounts/{email}/credentials", s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":  s.handleListCredentials,
 		"POST": s.handleAddCredential,
 	}))
-	mux.HandleFunc("/admin/accounts/{email}/messages/deleted", routeHandler("GET", s.handleListDeletedMessages))
-	mux.HandleFunc("/admin/accounts/{email}/messages/restore", routeHandler("POST", s.handleRestoreMessages))
+	mux.HandleFunc("/admin/accounts/{email}/messages/deleted", s.routeHandler("GET", s.handleListDeletedMessages))
+	mux.HandleFunc("/admin/accounts/{email}/messages/restore", s.routeHandler("POST", s.handleRestoreMessages))
 
 	// Domain-scoped account management routes
 	mux.HandleFunc("/admin/domains/", s.handleDomainOperations)
 
 	// Usage: every account's storage, page by page
-	mux.HandleFunc("/admin/usage/accounts", routeHandler("GET", s.handleAccountUsage))
+	mux.HandleFunc("/admin/usage/accounts", s.routeHandler("GET", s.handleAccountUsage))
 
 	// Credential management routes
-	mux.HandleFunc("/admin/credentials/{email}", multiMethodHandler(map[string]http.HandlerFunc{
+	mux.HandleFunc("/admin/credentials/{email}", s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":    s.handleGetCredential,
 		"DELETE": s.handleDeleteCredential,
 	}))
 
 	// Connection management routes
-	mux.HandleFunc("/admin/connections", routeHandler("GET", s.handleListConnections))
-	mux.HandleFunc("/admin/connections/stats", routeHandler("GET", s.handleConnectionStats))
-	mux.HandleFunc("/admin/connections/kick", routeHandler("POST", s.handleKickConnections))
-	mux.HandleFunc("/admin/connections/user/{email}", routeHandler("GET", s.handleGetUserConnections))
+	mux.HandleFunc("/admin/connections", s.routeHandler("GET", s.handleListConnections))
+	mux.HandleFunc("/admin/connections/stats", s.routeHandler("GET", s.handleConnectionStats))
+	mux.HandleFunc("/admin/connections/kick", s.routeHandler("POST", s.handleKickConnections))
+	mux.HandleFunc("/admin/connections/user/{email}", s.routeHandler("GET", s.handleGetUserConnections))
 
 	// Cache management routes
-	mux.HandleFunc("/admin/cache/stats", routeHandler("GET", s.handleCacheStats))
-	mux.HandleFunc("/admin/cache/metrics", routeHandler("GET", s.handleCacheMetrics))
-	mux.HandleFunc("/admin/cache/purge", routeHandler("POST", s.handleCachePurge))
+	mux.HandleFunc("/admin/cache/stats", s.routeHandler("GET", s.handleCacheStats))
+	mux.HandleFunc("/admin/cache/metrics", s.routeHandler("GET", s.handleCacheMetrics))
+	mux.HandleFunc("/admin/cache/purge", s.routeHandler("POST", s.handleCachePurge))
 
 	// Uploader routes
-	mux.HandleFunc("/admin/uploader/status", routeHandler("GET", s.handleUploaderStatus))
-	mux.HandleFunc("/admin/uploader/failed", routeHandler("GET", s.handleFailedUploads))
+	mux.HandleFunc("/admin/uploader/status", s.routeHandler("GET", s.handleUploaderStatus))
+	mux.HandleFunc("/admin/uploader/failed", s.routeHandler("GET", s.handleFailedUploads))
 
 	// Authentication statistics routes
-	mux.HandleFunc("/admin/auth/stats", routeHandler("GET", s.handleAuthStats))
-	mux.HandleFunc("/admin/auth/blocked", routeHandler("GET", s.handleAuthBlocked))
-	mux.HandleFunc("/admin/auth-cache/stats", routeHandler("GET", s.handleAuthCacheStats))
+	mux.HandleFunc("/admin/auth/stats", s.routeHandler("GET", s.handleAuthStats))
+	mux.HandleFunc("/admin/auth/blocked", s.routeHandler("GET", s.handleAuthBlocked))
+	mux.HandleFunc("/admin/auth-cache/stats", s.routeHandler("GET", s.handleAuthCacheStats))
 
-	// Health monitoring routes
-	mux.HandleFunc("/admin/health/overview", routeHandler("GET", s.handleHealthOverview))
-	mux.HandleFunc("/admin/health/servers/", s.handleHealthOperations)
+	// Health monitoring routes. Every path under /admin/health/servers/ is GET only.
+	mux.HandleFunc("/admin/health/overview", s.routeHandler("GET", s.handleHealthOverview))
+	mux.HandleFunc("/admin/health/servers/", s.routeHandler("GET", s.handleHealthOperations))
 
 	// Proxy backend health routes
-	mux.HandleFunc("/admin/proxy/backends", routeHandler("GET", s.handleProxyBackends))
+	mux.HandleFunc("/admin/proxy/backends", s.routeHandler("GET", s.handleProxyBackends))
 
 	// System configuration and status routes
-	mux.HandleFunc("/admin/config", routeHandler("GET", s.handleConfigInfo))
+	mux.HandleFunc("/admin/config", s.routeHandler("GET", s.handleConfigInfo))
 
 	// Mail delivery route
-	mux.HandleFunc("/admin/mail/deliver", routeHandler("POST", s.handleDeliverMail))
+	mux.HandleFunc("/admin/mail/deliver", s.routeHandler("POST", s.handleDeliverMail))
 
 	// ACL management routes
-	mux.HandleFunc("/admin/mailboxes/acl/grant", routeHandler("POST", s.handleACLGrant))
-	mux.HandleFunc("/admin/mailboxes/acl/revoke", routeHandler("POST", s.handleACLRevoke))
-	mux.HandleFunc("/admin/mailboxes/acl", routeHandler("GET", s.handleACLList))
+	mux.HandleFunc("/admin/mailboxes/acl/grant", s.routeHandler("POST", s.handleACLGrant))
+	mux.HandleFunc("/admin/mailboxes/acl/revoke", s.routeHandler("POST", s.handleACLRevoke))
+	mux.HandleFunc("/admin/mailboxes/acl", s.routeHandler("GET", s.handleACLList))
 
 	// Affinity management routes
-	mux.HandleFunc("/admin/affinity", multiMethodHandler(map[string]http.HandlerFunc{
+	mux.HandleFunc("/admin/affinity", s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":    s.handleAffinityGet,
 		"POST":   s.handleAffinitySet,
 		"DELETE": s.handleAffinityDelete,
 	}))
-	mux.HandleFunc("/admin/affinity/list", routeHandler("GET", s.handleAffinityList))
-	mux.HandleFunc("/admin/affinity/stats", routeHandler("GET", s.handleAffinityStats))
+	mux.HandleFunc("/admin/affinity/list", s.routeHandler("GET", s.handleAffinityList))
+	mux.HandleFunc("/admin/affinity/stats", s.routeHandler("GET", s.handleAffinityStats))
+
+	// Every other path (ServeMux's own 404 is text/plain)
+	mux.HandleFunc("/", s.notFound)
 
 	// Wrap with middleware (in reverse order - last applied is outermost).
 	// The host allowlist is outermost so off-allowlist clients are rejected before
@@ -561,37 +567,24 @@ func (s *Server) handleDomainOperations(w http.ResponseWriter, r *http.Request) 
 
 	// Check for /admin/domains/{domain}/accounts
 	if strings.Contains(path, "/accounts") {
-		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		s.handleListAccountsByDomain(w, r)
+		s.routeHandler("GET", s.handleListAccountsByDomain)(w, r)
 		return
 	}
 
 	// Unknown domain operation
-	http.Error(w, "Not found", http.StatusNotFound)
+	s.notFound(w, r)
 }
 
-// handleHealthOperations routes health monitoring operations
+// handleHealthOperations routes health monitoring operations (GET only, checked
+// by the route's wrapper)
 func (s *Server) handleHealthOperations(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-
 	// Check if it's a component-specific operation
-	if strings.Contains(path, "/components/") {
-		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	if strings.Contains(r.URL.Path, "/components/") {
 		s.handleHealthStatusByComponent(w, r)
 		return
 	}
 
 	// Otherwise it's a host-level operation
-	if r.Method != "GET" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	s.handleHealthStatusByHost(w, r)
 }
 
@@ -1156,10 +1149,16 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	parsedPrimary, err := server.NewAddress(primaryEmail)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid email address: %v", err))
+		return
+	}
+
 	ctx := r.Context()
 
 	// 1. Get the account ID for the primary email address in the path.
-	accountID, err := s.rdb.GetActiveAccountIDByAddressWithRetry(ctx, primaryEmail)
+	accountID, err := s.rdb.GetActiveAccountIDByAddressWithRetry(ctx, parsedPrimary.FullAddress())
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, "Account not found for the specified primary email")
@@ -1230,10 +1229,15 @@ func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetCredential(w http.ResponseWriter, r *http.Request) {
 	email := r.PathValue("email")
+	parsed, err := server.NewAddress(email)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid email address: %v", err))
+		return
+	}
 	ctx := r.Context()
 
 	// Get detailed credential information using the same logic as CLI
-	credentialDetails, err := s.rdb.GetCredentialDetailsWithRetry(ctx, email)
+	credentialDetails, err := s.rdb.GetCredentialDetailsWithRetry(ctx, parsed.FullAddress())
 	if err != nil {
 		if errors.Is(err, consts.ErrUserNotFound) {
 			s.writeError(w, http.StatusNotFound, err.Error())
@@ -1306,18 +1310,39 @@ func (s *Server) trackers() map[string]*server.ConnectionTracker {
 // account) has its derived ID only. A failed lookup is an error: the derived ID alone
 // would leave the sessions of a database account open.
 func (s *Server) sessionAccountIDs(ctx context.Context, address string) ([]int64, error) {
+	parsed, err := server.NewAddress(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid email address: %w", err)
+	}
+	normalized := parsed.FullAddress()
+	raw := strings.ToLower(strings.TrimSpace(address))
+	derivedIDs := func(extra ...string) []int64 {
+		var ids []int64
+		for _, a := range append(extra, normalized, raw) {
+			if a == "" {
+				continue
+			}
+			if id := proxy.DeriveAccountIDFromEmail(a); !slices.Contains(ids, id) {
+				ids = append(ids, id)
+			}
+		}
+		return ids
+	}
+	if s.rdb == nil {
+		return derivedIDs(), nil
+	}
 	// Revocation must see newly added credentials even while read replicas lag.
 	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
-	accountID, addresses, err := s.rdb.GetAccountAddressesWithRetry(ctx, address)
+	accountID, addresses, err := s.rdb.GetAccountAddressesWithRetry(ctx, normalized)
 	if errors.Is(err, consts.ErrUserNotFound) {
-		return []int64{proxy.DeriveAccountIDFromEmail(address)}, nil
+		return derivedIDs(), nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	ids := []int64{accountID}
-	for _, a := range addresses {
-		if id := proxy.DeriveAccountIDFromEmail(a); !slices.Contains(ids, id) {
+	for _, id := range derivedIDs(addresses...) {
+		if !slices.Contains(ids, id) {
 			ids = append(ids, id)
 		}
 	}
@@ -1463,6 +1488,10 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "user_email is required for kick operation")
 		return
 	}
+	if _, err := server.NewAddress(req.UserEmail); err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid email address: %v", err))
+		return
+	}
 
 	trackers := s.trackers()
 	if len(trackers) == 0 {
@@ -1593,6 +1622,12 @@ func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request) {
 	email := r.PathValue("email")
+	parsed, err := server.NewAddress(email)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid email address: %v", err))
+		return
+	}
+	normalizedEmail := parsed.FullAddress()
 
 	trackers := s.trackers()
 	if len(trackers) == 0 {
@@ -1619,12 +1654,15 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 	// Unlike GET /admin/connections, a tracker that knows the account only through
 	// gossip is listed too (local count 0): it reports the sessions on other nodes.
 	var accountID int64 // 0: the database names no account for the address
-	addresses := []string{email}
+	addresses := []string{normalizedEmail}
+	if !strings.EqualFold(normalizedEmail, email) {
+		addresses = append(addresses, email)
+	}
 	if s.rdb != nil {
-		id, accountAddresses, err := s.rdb.GetAccountAddressesWithRetry(r.Context(), email)
+		id, accountAddresses, err := s.rdb.GetAccountAddressesWithRetry(r.Context(), normalizedEmail)
 		switch {
 		case err == nil:
-			accountID, addresses = id, append(accountAddresses, email)
+			accountID, addresses = id, append(accountAddresses, addresses...)
 		case !errors.Is(err, consts.ErrUserNotFound):
 			logger.Warn("HTTP API: Cannot resolve account; listing only the entries created under the address",
 				"name", s.name, "email", email, "error", err)
@@ -2037,6 +2075,11 @@ func (s *Server) handleAuthBlocked(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Request) {
 	email := r.PathValue("email")
+	parsed, err := server.NewAddress(email)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid email address: %v", err))
+		return
+	}
 	ctx := r.Context()
 
 	// Parse query parameters
@@ -2047,7 +2090,7 @@ func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Reques
 
 	// Build parameters
 	params := db.ListDeletedMessagesParams{
-		Email: email,
+		Email: parsed.FullAddress(),
 		Limit: 100, // default limit
 	}
 
@@ -2139,9 +2182,15 @@ func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	parsed, err := server.NewAddress(email)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid email address: %v", err))
+		return
+	}
+
 	// Build parameters
 	params := db.RestoreMessagesParams{
-		Email:       email,
+		Email:       parsed.FullAddress(),
 		MessageIDs:  req.MessageIDs,
 		MailboxPath: req.MailboxPath,
 	}

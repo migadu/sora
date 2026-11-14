@@ -102,9 +102,12 @@ func (db *Database) RenameSubscriptions(ctx context.Context, tx pgx.Tx, accountI
 	return nil
 }
 
+// likeEscaper is built once: a strings.Replacer allocates its byte table on
+// first use, and escapeLike runs once per entry name of a GETMETADATA request.
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
 // escapeLike escapes the LIKE metacharacters in s so it can be used as a literal
 // prefix in a `LIKE ... ESCAPE '\'` pattern.
 func escapeLike(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return r.Replace(s)
+	return likeEscaper.Replace(s)
 }

@@ -2,12 +2,10 @@ package imapproxy
 
 import (
 	"context"
-	"errors"
 	"net"
 	"testing"
 	"time"
 
-	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -113,8 +111,6 @@ func TestLoginWithoutLookupCacheCountsNoMiss(t *testing.T) {
 				lookupCache:                tc.cache,
 				authLimiter:                &fakeAuthLimiter{},
 				positiveRevalidationWindow: 30 * time.Second,
-				masterUsername:             []byte("MASTER"),
-				masterPassword:             []byte("master-secret"),
 			}
 
 			miss := map[string]string{"protocol": "imap_proxy", "result": "miss"}
@@ -123,10 +119,11 @@ func TestLoginWithoutLookupCacheCountsNoMiss(t *testing.T) {
 			client, remote := net.Pipe()
 			defer client.Close()
 			defer remote.Close()
-			// A wrong master password is refused right after the cache, without a lookup.
-			err := newSession(srv, client).authenticateUser("user@example.com@MASTER", "wrong")
-			if !errors.Is(err, consts.ErrAuthenticationFailed) {
-				t.Fatalf("login with a wrong master password: %v, want %v", err, consts.ErrAuthenticationFailed)
+			// A username that does not parse is refused right after the cache, without a
+			// lookup. (A wrong master password no longer is: it gets the credential check
+			// of the base address that any other suffix gets, #801.)
+			if err := newSession(srv, client).authenticateUser("not-an-address", "wrong"); err == nil {
+				t.Fatal("login with a username that does not parse succeeded")
 			}
 
 			if d := counterValue(t, "sora_lookup_cache_results_total", miss) - misses0; d != tc.wantMisses {

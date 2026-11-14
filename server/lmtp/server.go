@@ -35,7 +35,10 @@ const DefaultMaxMessageSize = 50 * 1024 * 1024
 // (security-audit M13)
 const defaultLMTPMaxConnections = 1000
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted
@@ -626,6 +629,16 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 	}
 	defer listener.Close()
 
+	// cmd/sora calls Close from a watcher on the application context that
+	// races Start, and go-smtp's Close closes only the listeners Serve has
+	// already registered: a listener created after it would be served until
+	// the process exits. Close it on shutdown, as the POP3 and ManageSieve
+	// servers do.
+	go func() {
+		<-b.appCtx.Done()
+		listener.Close()
+	}()
+
 	// Wrap listener with connection limiting
 	limitedListener := &connectionLimitingListener{
 		Listener: listener,
@@ -653,7 +666,11 @@ func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *b.settings.Load()
 
-	if maxSize := cfg.GetMaxMessageSizeWithDefault(); maxSize != next.maxMessageSize {
+	// A value that does not parse keeps the running limit (start-up, which has none,
+	// uses the default).
+	if maxSize, err := cfg.GetMaxMessageSize(); err != nil {
+		logger.Warn("LMTP config reload: invalid max_message_size, keeping the running value", "name", b.name, "error", err, "running", next.maxMessageSize)
+	} else if maxSize != next.maxMessageSize {
 		next.maxMessageSize = maxSize
 		reloaded = append(reloaded, "max_message_size")
 	}
