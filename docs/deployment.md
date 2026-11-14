@@ -155,7 +155,7 @@ An upload holds no lock across its transfer. Before writing it takes and at once
 Size the pooler's pool for the write user with that in mind:
 
 ```
-pool_size >= 2 + headroom for interactive writes, cross-account copies and short uploader statements
+pool_size >= 2 + headroom for interactive writes, cross-account copies and moves, and short uploader statements
 ```
 
 A pool sized only for short IMAP/LMTP transactions can still queue mail delivery behind the cleaner's S3 deletes, most visibly during an S3 outage when those deletes sit in retry.

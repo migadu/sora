@@ -73,7 +73,7 @@ lock_timeout = "10s"            # Max time a write statement waits for a row loc
                                 #   ALTER ROLE sora SET lock_timeout = '10s';
                                 # Sora keeps no session state on its connections: timeouts are SET LOCAL and every
                                 # advisory lock is transaction-scoped, so any PgBouncer pool_mode works. Locks that
-                                # span an S3 round trip (uploader, cleaner, cross-account IMAP COPY) hold their
+                                # span an S3 round trip (uploader, cleaner, cross-account IMAP COPY/MOVE) hold their
                                 # transaction open for its duration and keep it alive at least every minute, so
                                 # idle_in_transaction_session_timeout must be well above that. See [uploader]
                                 # concurrency for sizing a pooler's pool.
