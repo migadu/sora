@@ -904,8 +904,10 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 		// there is one (the address XCLIENT forwards to the backend as well).
 		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username, server.GetRealClientIP(s.clientConn, s.proxyInfo))
 		remoteLookupDuration := time.Since(remoteLookupStart).Seconds()
+		// 401/403: the lookup refused the account, a verdict and no route (handled below).
+		refused := errors.Is(lookupErr, proxy.ErrRemoteLookupRefused)
 
-		if lookupErr != nil {
+		if lookupErr != nil && !refused {
 			s.InfoLog("remotelookup failed", "username", s.username, "error", lookupErr, "cache", "miss")
 
 			// Check if error is due to context cancellation (server shutdown)
@@ -965,27 +967,38 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 			return nil
 		} else {
-			// User not found in remotelookup (404/3xx or empty response).
+			// No route: the user is not found in remotelookup (404/3xx or empty response),
+			// or the account is refused (401/403). lookup_local_users applies to the first
+			// only: a refused recipient is never looked up, and delivered, in the local
+			// database.
 			duration := time.Since(lookupStart)
-			metrics.RemoteLookupDuration.WithLabelValues("lmtp", "user_not_found").Observe(remoteLookupDuration)
-			if s.server.remotelookupConfig != nil && s.server.remotelookupConfig.ShouldLookupLocalUsers() {
+			outcome := "user_not_found"
+			if refused {
+				outcome = "refused"
+			}
+			metrics.RemoteLookupDuration.WithLabelValues("lmtp", outcome).Observe(remoteLookupDuration)
+			if !refused && s.server.remotelookupConfig != nil && s.server.remotelookupConfig.ShouldLookupLocalUsers() {
 				s.InfoLog("user not found in remote lookup, local lookup enabled - attempting main DB",
 					"username", s.username,
 					"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_fallback").Inc()
 				// Fallthrough to main DB
 			} else {
-				// User not found and no database fallback - use configured response
+				// No database fallback - use configured response
 				response := "reject" // default
 				if s.server.remotelookupConfig != nil {
 					response = s.server.remotelookupConfig.GetUserNotFoundResponse()
 				}
 
-				s.InfoLog("user not found in remote lookup, fallback disabled",
+				msg := "user not found in remote lookup, fallback disabled"
+				if refused {
+					msg = "account refused by remote lookup (401/403), no fallback"
+				}
+				s.InfoLog(msg,
 					"username", s.username,
 					"duration", fmt.Sprintf("%.3fs", duration.Seconds()),
 					"response", response)
-				metrics.RemoteLookupResult.WithLabelValues("lmtp", "user_not_found_"+response).Inc()
+				metrics.RemoteLookupResult.WithLabelValues("lmtp", outcome+"_"+response).Inc()
 
 				// Cache negative result to protect remotelookup. FromRemoteLookup lets a
 				// cache hit give the reply given here (userNotFoundError).
@@ -1802,7 +1815,8 @@ func (s *Session) forwardSimpleCommand(command string) (reply string, ok bool) {
 // userNotFoundError is the error for a recipient known not to exist, whether the
 // knowledge is fresh or cached, so that a negative-cache hit gets the reply the fresh
 // lookup gave. fromRemoteLookup says who reported the recipient unknown:
-//   - the remote lookup, the authority on its users: 550, or 450 when
+//   - the remote lookup, the authority on its users (a 404/3xx without database
+//     fallback, or a 401/403 refusal of the account): 550, or 450 when
 //     user_not_found_response = "tempfail". Backend health does not enter into it.
 //   - the proxy's own database, which may lag the backends: 550 only while a backend
 //     of the default pool is healthy, else 450 (a proxy that cannot verify anything
