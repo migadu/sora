@@ -1163,6 +1163,11 @@ func (rd *ResilientDatabase) getHealthyDatabaseWithFailover(isWrite bool) *db.Da
 			if isWrite {
 				fm.currentWriteIdx.Store(int64(nextIdx))
 				logger.Info("Switched write operations from unhealthy pool to healthy pool", "component", "RESILIENT-FAILOVER", "from", pools[currentIdx].host, "to", pools[nextIdx].host)
+				// The advisory locks held on the former write host exclude nothing on
+				// the new one: revoke them, and the work they guard, before anything
+				// is written there (see db.AdvisoryLockTx).
+				pools[nextIdx].database.ReinstateWriter()
+				pools[currentIdx].database.RetireWriter(fmt.Errorf("write operations moved from %s to %s", pools[currentIdx].host, pools[nextIdx].host))
 			} else {
 				fm.currentReadIdx.Store(int64(nextIdx))
 				logger.Info("Switched read operations from unhealthy pool to healthy pool", "component", "RESILIENT-FAILOVER", "from", pools[currentIdx].host, "to", pools[nextIdx].host)
@@ -1278,9 +1283,19 @@ func (rd *ResilientDatabase) resetCurrentWritePool() {
 		if pool.database != nil && pool.database.WritePool != nil {
 			logger.Info("Resetting write pool connections after read-only error (failover recovery)",
 				"component", "RESILIENT-FAILOVER", "host", pool.host)
-			pool.database.WritePool.Reset()
+			resetWriteHost(pool, fmt.Errorf("write host %s is read-only", pool.host))
 		}
 	}
+}
+
+// resetWriteHost drops every connection of pool's write pool, so the next ones reach
+// whatever server its host leads to now, and then fences the advisory locks held on the
+// old connections: they exclude nothing on that server (see db.AdvisoryLockTx). Reset
+// first: a fence before it could miss a lock transaction that picked up an old
+// connection in between.
+func resetWriteHost(pool *DatabasePool, cause error) {
+	pool.database.WritePool.Reset()
+	pool.database.FenceAdvisoryLocks(cause)
 }
 
 // checkPoolHealth checks the health of a single pool
@@ -1311,7 +1326,7 @@ func (rd *ResilientDatabase) checkPoolHealth(ctx context.Context, pool *Database
 					"component", "RESILIENT-FAILOVER", "host", pool.host)
 				// Reset pool connections immediately so the next attempt uses a fresh TCP
 				// connection that may be routed to the new primary.
-				pool.database.WritePool.Reset()
+				resetWriteHost(pool, fmt.Errorf("write host %s is in recovery", pool.host))
 			}
 		}
 	}

@@ -128,6 +128,8 @@ type Database struct {
 	// Striped locks preventing connection starvation, indexed by mailbox ID (see LockMailbox).
 	mailboxMutexes [mailboxLockStripes]sync.Mutex
 	fetchChunkSize int // Number of messages to fetch per chunk for large result sets
+	// The open AdvisoryLockTx on WritePool, which a failover fences (FenceAdvisoryLocks).
+	advisoryLocks advisoryLockFence
 }
 
 // mailboxLockStripes is the size of the per-mailbox mutex table. A mailbox always
