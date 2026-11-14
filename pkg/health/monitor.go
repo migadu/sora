@@ -87,6 +87,9 @@ type HealthCheck struct {
 	consecutiveFails int
 	recent           failureWindow
 	everSucceeded    bool
+
+	// stop ends the goroutine running this check. Set and called under HealthMonitor.mu.
+	stop context.CancelFunc
 }
 
 type HealthMonitor struct {
@@ -106,6 +109,9 @@ func NewHealthMonitor() *HealthMonitor {
 	}
 }
 
+// RegisterCheck adds a check, replacing any check of the same name. On a running
+// monitor the check starts at once: the proxies register theirs (remote lookup) while
+// they start, after Start.
 func (hm *HealthMonitor) RegisterCheck(check *HealthCheck) {
 	if check.Interval == 0 {
 		check.Interval = 30 * time.Second
@@ -117,8 +123,14 @@ func (hm *HealthMonitor) RegisterCheck(check *HealthCheck) {
 	check.Enabled = true
 
 	hm.mu.Lock()
+	defer hm.mu.Unlock()
+	if old, ok := hm.checks[check.Name]; ok && old.stop != nil {
+		old.stop()
+	}
 	hm.checks[check.Name] = check
-	hm.mu.Unlock()
+	if hm.ctx != nil {
+		hm.startCheckLocked(check)
+	}
 }
 
 func (hm *HealthMonitor) AddStatusCallback(callback func(name string, status ComponentStatus)) {
@@ -128,24 +140,35 @@ func (hm *HealthMonitor) AddStatusCallback(callback func(name string, status Com
 }
 
 func (hm *HealthMonitor) Start(ctx context.Context) {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
 	hm.ctx, hm.cancel = context.WithCancel(ctx)
-
-	hm.mu.RLock()
 	for _, check := range hm.checks {
-		if check.Enabled {
-			go hm.runHealthCheck(check)
-		}
+		hm.startCheckLocked(check)
 	}
-	hm.mu.RUnlock()
+}
+
+// startCheckLocked runs check on its own goroutine until the monitor stops or the
+// check is replaced. hm.mu must be held.
+func (hm *HealthMonitor) startCheckLocked(check *HealthCheck) {
+	if !check.Enabled {
+		return
+	}
+	ctx, cancel := context.WithCancel(hm.ctx)
+	check.stop = cancel
+	go hm.runHealthCheck(ctx, check)
 }
 
 func (hm *HealthMonitor) Stop() {
-	if hm.cancel != nil {
-		hm.cancel()
+	hm.mu.RLock()
+	cancel := hm.cancel
+	hm.mu.RUnlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
-func (hm *HealthMonitor) runHealthCheck(check *HealthCheck) {
+func (hm *HealthMonitor) runHealthCheck(ctx context.Context, check *HealthCheck) {
 	ticker := time.NewTicker(check.Interval)
 	defer ticker.Stop()
 
@@ -155,7 +178,7 @@ func (hm *HealthMonitor) runHealthCheck(check *HealthCheck) {
 	// to allow the application to fully initialize and avoid context cancellation issues
 	for {
 		select {
-		case <-hm.ctx.Done():
+		case <-ctx.Done():
 			logger.Info("Health: Monitoring stopped due to context cancellation", "check", check.Name)
 			return
 		case <-ticker.C:
