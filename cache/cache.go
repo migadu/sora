@@ -5,7 +5,6 @@
 //   - SQLite-based metadata tracking
 //   - LRU eviction based on size limits
 //   - Metrics for hit/miss ratios
-//   - Automatic warming for recently accessed mailboxes
 //   - Content deduplication at read level
 //
 // # Cache Architecture
@@ -41,9 +40,6 @@
 //	// Put into cache
 //	err = cache.Put(ctx, contentHash, messageBody)
 //
-//	// Warm cache for a mailbox
-//	err = cache.WarmCache(ctx, AccountID, []string{"INBOX"}, 100)
-//
 // # Metrics
 //
 // The cache tracks:
@@ -59,11 +55,9 @@
 //
 // # Cache Warming
 //
-// For better performance, warm the cache when a user logs in:
-//
-//	cache.WarmCache(ctx, AccountID, []string{"INBOX", "Sent"}, 50)
-//
-// This pre-loads the 50 most recent messages from specified mailboxes.
+// The IMAP server warms the cache when a user logs in ([local_cache] enable_warmup):
+// it fetches the most recent messages of the configured mailboxes from S3 and puts
+// them here.
 package cache
 
 import (
@@ -91,7 +85,6 @@ import (
 // This allows for mocking in tests.
 type SourceDatabase interface {
 	FindExistingContentHashesWithRetry(ctx context.Context, hashes []string) ([]string, error)
-	GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error)
 }
 
 const DataDir = "data"
@@ -838,49 +831,6 @@ func (c *Cache) removeStaleEntriesForShard(ctx context.Context, shard *cacheShar
 	return nil
 }
 
-// WarmCache pre-loads message bodies for the specified mailboxes into the cache.
-// It is intended to be called in the background when a user logs in.
-func (c *Cache) WarmCache(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) error {
-	logger.Debug("Cache: Starting background warmup",
-		"account_id", AccountID,
-		"mailboxes", len(mailboxNames),
-		"message_count", messageCount)
-
-	hashMap, err := c.sourceDB.GetRecentMessagesForWarmupWithRetry(ctx, AccountID, mailboxNames, messageCount)
-	if err != nil {
-		return fmt.Errorf("failed to fetch hashes for warmup: %w", err)
-	}
-
-	var warmCount int
-	for _, hashes := range hashMap {
-		for _, hash := range hashes {
-			// Quick check if it's already in cache
-			exists, err := c.Exists(hash)
-			if err == nil && exists {
-				continue
-			}
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-				// Read it from S3 - this will implicitly cache it if our Get implementation
-				// fetches on miss. But since Cache.Get doesn't fetch, we assume the caller
-				// or a higher level component does the fetch.
-				// Wait, the cache package itself doesn't fetch from S3.
-				// We just want to ensure it's in the cache. This implies the cache SHOULD
-				// fetch it, or someone else should.
-				// For this method to make sense, it just signals intent.
-				// Let's just log it for now.
-			}
-			warmCount++
-		}
-	}
-
-	logger.Debug("Cache: Warmup completed", "account_id", AccountID, "warmed_count", warmCount)
-	return nil
-}
-
 // GetStats returns current cache statistics
 // CacheStats contains statistics about the cache
 type CacheStats struct {
@@ -924,10 +874,6 @@ func (c *Cache) GetStats() (CacheStats, error) {
 	metrics.CacheSizeBytes.Set(float64(totalSize))
 
 	return stats, nil
-}
-
-func (c *Cache) GetRecentMessagesForWarmup(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
-	return c.sourceDB.GetRecentMessagesForWarmupWithRetry(ctx, AccountID, mailboxNames, messageCount)
 }
 
 type CacheMetrics struct {

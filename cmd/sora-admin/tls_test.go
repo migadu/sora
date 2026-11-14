@@ -96,10 +96,6 @@ func (t *testSourceDB) FindExistingContentHashesWithRetry(ctx context.Context, h
 	return nil, nil
 }
 
-func (t *testSourceDB) GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
-	return nil, nil
-}
-
 func TestInsecureSkipVerify_Enabled(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 

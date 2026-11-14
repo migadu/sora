@@ -20,8 +20,6 @@ import (
 type mockSourceDatabase struct {
 	mu             sync.Mutex
 	existingHashes map[string]bool
-	warmupData     map[string][]string
-	warmupError    error
 }
 
 func newMockSourceDatabase() *mockSourceDatabase {
@@ -47,15 +45,6 @@ func (m *mockSourceDatabase) FindExistingContentHashesWithRetry(ctx context.Cont
 	return existing, nil
 }
 
-func (m *mockSourceDatabase) GetRecentMessagesForWarmupWithRetry(ctx context.Context, AccountID int64, mailboxNames []string, messageCount int) (map[string][]string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.warmupError != nil {
-		return nil, m.warmupError
-	}
-	return m.warmupData, nil
-}
-
 func (m *mockSourceDatabase) SetExistingHashes(hashes ...string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -63,13 +52,6 @@ func (m *mockSourceDatabase) SetExistingHashes(hashes ...string) {
 	for _, h := range hashes {
 		m.existingHashes[h] = true
 	}
-}
-
-func (m *mockSourceDatabase) SetWarmupData(data map[string][]string, err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.warmupData = data
-	m.warmupError = err
 }
 
 // newTestCache is a test helper to create a cache instance in a temporary directory.
@@ -477,29 +459,6 @@ func TestGetPathForContentHash(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
-}
-
-func TestGetRecentMessagesForWarmup(t *testing.T) {
-	c, mockDB := newTestCache(t, 262144, 512)
-	ctx := context.Background()
-
-	t.Run("successful call", func(t *testing.T) {
-		expectedData := map[string][]string{"INBOX": {"hash1", "hash2"}}
-		mockDB.SetWarmupData(expectedData, nil)
-
-		data, err := c.GetRecentMessagesForWarmup(ctx, 1, []string{"INBOX"}, 2)
-		require.NoError(t, err)
-		assert.Equal(t, expectedData, data)
-	})
-
-	t.Run("error call", func(t *testing.T) {
-		expectedError := fmt.Errorf("database is down")
-		mockDB.SetWarmupData(nil, expectedError)
-
-		_, err := c.GetRecentMessagesForWarmup(ctx, 1, []string{"INBOX"}, 2)
-		require.Error(t, err)
-		assert.Equal(t, expectedError, err)
-	})
 }
 
 func TestGet_FileOnDiskNotInIndex(t *testing.T) {
