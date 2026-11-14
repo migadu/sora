@@ -439,6 +439,12 @@ func handleConfigReload(current, next *config.Config) {
 		logger.Warn("Config reload: servers.trusted_networks changed but requires restart to take effect; the networks the servers started with stay trusted until then",
 			"current", current.Servers.TrustedNetworks, "new", next.Servers.TrustedNetworks)
 	}
+
+	// The relay handler is built at start-up and keeps the [relay] it started with. One
+	// that start-up refuses is an error, not just a change: a restart would fail.
+	if err := next.Relay.Validate(); err != nil {
+		logger.Error("Config reload: [relay] is invalid and the server will not start with this config; the relay the server started with stays in use", "error", err)
+	}
 }
 
 // loadAndValidateConfig loads configuration from file and validates all server configurations
@@ -476,44 +482,12 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		}
 	}
 
-	// Validate all server configurations, including a block that lacks type, name or addr
-	for _, server := range allServers {
-		if err := server.Validate(); err != nil {
-			errorHandler.ValidationError(fmt.Sprintf("server '%s'", server.Name), err)
-			os.Exit(errorHandler.WaitForExit())
+	// The whole-file checks are the ones `sora-admin config validate` runs. Report every
+	// problem before exiting, so one restart attempt shows all that is left to fix.
+	if problems := cfg.Validate(); len(problems) > 0 {
+		for _, p := range problems {
+			errorHandler.ValidationError(p.Section, p.Err)
 		}
-	}
-
-	// Named backend pools are validated as a whole: the checks cross the [[pool]] blocks
-	// and the proxy servers that route into them.
-	if err := cfg.ValidatePools(); err != nil {
-		errorHandler.ValidationError("[[pool]]", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-
-	if err := cfg.Relay.Validate(); err != nil {
-		errorHandler.ValidationError("[relay]", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-
-	// One malformed trusted_networks entry would leave LMTP admission with no peers.
-	if err := cfg.ValidateTrustedNetworks(); err != nil {
-		errorHandler.ValidationError("trusted_networks", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-
-	if err := cfg.SharedMailboxes.Validate(); err != nil {
-		errorHandler.ValidationError("[shared_mailboxes]", err)
-		os.Exit(errorHandler.WaitForExit())
-	}
-
-	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
-	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
-	if missing := cfg.ProxyProtocolListenersMissingTrust(); len(missing) > 0 {
-		errorHandler.ValidationError("trusted_networks",
-			fmt.Errorf("proxy_protocol is enabled on server(s) %s but [servers] trusted_networks is empty; "+
-				"set trusted_networks to your trusted proxy IPs/CIDRs (otherwise any client could spoof its "+
-				"source IP via a PROXY header)", strings.Join(missing, ", ")))
 		os.Exit(errorHandler.WaitForExit())
 	}
 
@@ -529,30 +503,6 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 			"networks is trusted to spoof client IPs via PROXY/XCLIENT and to bypass auth rate limiting. " +
 			"Narrow trusted_networks to your actual proxy IPs; use auth_rate_limit.exempt_networks to scope " +
 			"rate-limit exemption separately.")
-	}
-
-	// Check for server name conflicts
-	serverNames := make(map[string]bool)
-	serverAddresses := make(map[string]string) // addr -> server name
-	for _, server := range allServers {
-		if serverNames[server.Name] {
-			errorHandler.ValidationError("server configuration", fmt.Errorf("duplicate server name '%s' found. Each server must have a unique name", server.Name))
-			os.Exit(errorHandler.WaitForExit())
-		}
-		serverNames[server.Name] = true
-
-		// Check for address conflicts
-		if existingServerName, exists := serverAddresses[server.Addr]; exists {
-			errorHandler.ValidationError("server configuration", fmt.Errorf("duplicate server address '%s' found. Server '%s' and '%s' cannot bind to the same address", server.Addr, existingServerName, server.Name))
-			os.Exit(errorHandler.WaitForExit())
-		}
-		serverAddresses[server.Addr] = server.Name
-	}
-
-	// Check if any server is configured
-	if len(allServers) == 0 {
-		errorHandler.ValidationError("servers", fmt.Errorf("no servers configured. Please configure at least one server in a [[server]] section"))
-		os.Exit(errorHandler.WaitForExit())
 	}
 
 	logger.Info("Found configured servers", "count", len(allServers))
@@ -649,7 +599,8 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Determine if any mail storage services are enabled
 	allServers := cfg.GetAllServers()
-	storageServicesNeeded := false
+	// [uploader] and [cleanup] were checked with the file, for a node with a mail backend.
+	storageServicesNeeded := cfg.HasMailBackend()
 	userAPIServed := false
 	var databaseUser *config.ServerConfig // the first server that queries the database
 
@@ -661,9 +612,6 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	for i, server := range allServers {
 		if databaseUser == nil && serverNeedsDatabase(server) {
 			databaseUser = &allServers[i]
-		}
-		if server.Type == "imap" || server.Type == "lmtp" || server.Type == "pop3" {
-			storageServicesNeeded = true
 		}
 		if server.Type == "http_user_api" {
 			userAPIServed = true
@@ -887,17 +835,6 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 				}
 			}
 		}()
-
-		// The cleaner and the upload worker both take [uploader] max_attempts.
-		if err := cfg.Uploader.Validate(); err != nil {
-			errorHandler.ValidationError("[uploader]", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
-		// The cleaner and delivery both take [cleanup] fts_retention.
-		if err := cfg.Cleanup.Validate(); err != nil {
-			errorHandler.ValidationError("[cleanup]", err)
-			os.Exit(errorHandler.WaitForExit())
-		}
 
 		// Initialize and start the cleanup worker using configuration defaulting methods
 		gracePeriod := cfg.Cleanup.GetGracePeriodWithDefault()
@@ -1418,7 +1355,21 @@ func startConnectionTrackerForProxy(protocol string, serverName string, hostname
 
 	// Other proxy protocols use cluster-wide gossip tracking.
 	if clusterMgr == nil {
-		logger.Debug("Proxy: Connection tracking disabled (requires cluster mode)", "protocol", protocol, "name", serverName)
+		// Nothing else counts a user's connections through the proxy, so the per-user
+		// limits the block sets are not applied.
+		var limits []any
+		if maxConnectionsPerUser != 0 {
+			limits = append(limits, "max_connections_per_user", maxConnectionsPerUser)
+		}
+		if maxConnectionsPerUserPerIP != 0 {
+			limits = append(limits, "max_connections_per_user_per_ip", maxConnectionsPerUserPerIP)
+		}
+		if len(limits) == 0 {
+			logger.Debug("Proxy: Connection tracking disabled (requires cluster mode)", "protocol", protocol, "name", serverName)
+			return nil, ""
+		}
+		logger.Warn("Proxy: per-user connection limits are not applied without [cluster]: the proxy counts a user's connections only through the cluster connection tracker",
+			append([]any{"protocol", protocol, "name", serverName}, limits...)...)
 		return nil, ""
 	}
 
