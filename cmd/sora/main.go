@@ -2661,6 +2661,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		Pools:                    proxy.PoolSpecsFromConfig(deps.config.Pools),
 		RemotePort:               remotePort,
 		JWTSecret:                serverConfig.JWTSecret,
+		AllowedOrigins:           serverConfig.AllowedOrigins,
 		TLS:                      serverConfig.TLS,
 		TLSCertFile:              serverConfig.TLSCertFile,
 		TLSKeyFile:               serverConfig.TLSKeyFile,
