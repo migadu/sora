@@ -367,8 +367,8 @@ the message in the relay queue, and the relay worker sends it through the config
 
 ### When a redirect happens
 
-A redirect action is honoured only if all of these hold. If one fails, the redirect is skipped
-and the message is kept, as if the line were not there:
+A redirect action is honoured only if all of these hold. If one of the first four fails, the
+redirect is skipped and the message is kept, as if the line were not there:
 
 1. The target parses as an email address.
 2. The message has been redirected by Sora fewer than `max_redirect_hops` times (default 2). Sora
@@ -381,7 +381,9 @@ and the message is kept, as if the line were not there:
 4. The account is under its redirect rate limit: at most `redirect_rate_limit` redirected
    addresses (default 100) per `redirect_rate_window` (default `1h`). `0` turns the limit off. If
    the database check fails, the redirect is skipped.
-5. A relay is configured (`[relay] type` set).
+5. A relay is configured (`[relay] type` set). Sora checks this at delivery, after the script has
+   run, so without a relay the message is stored as when the relay queue cannot take a redirect
+   (see below).
 
 A script may redirect to several addresses; an address named twice is sent once. More than five
 redirect actions in one run make the run fail, and the message is then handled as in
