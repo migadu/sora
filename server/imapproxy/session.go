@@ -845,7 +845,6 @@ func (s *Session) authenticateUser(username, password string) error {
 	// the upstream load balancer whenever this proxy sits behind haproxy/nginx/NLB,
 	// and the load balancer never accumulates failures — so keying the delay on it
 	// meant the delay never fired in exactly the deployment proxies exist for.
-	remoteAddr := s.clientConn.RemoteAddr()
 	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
 	delayAddr := &server.StringAddr{Addr: realClientIP}
 	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, delayAddr, "IMAP-PROXY"); err != nil {
@@ -1030,9 +1029,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for remotelookup authentication
 	if s.server.connManager.HasRouting() {
-		// Extract client IP from remote address (remove port)
-		clientIP, _ := server.GetHostPortFromAddr(remoteAddr)
-		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithClientIP(ctx, usernameForRemoteLookup, password, clientIP, masterAuthValidated)
+		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithClientIP(ctx, usernameForRemoteLookup, password, realClientIP, masterAuthValidated)
 
 		// Log remotelookup response with all details
 		backend := "none"
@@ -1319,6 +1316,7 @@ func (s *Session) connectToBackend() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                   s.ctx,
 		Username:              s.username,
+		ClientIP:              server.GetRealClientIP(s.clientConn, s.proxyInfo),
 		Protocol:              "imap",
 		IsRemoteLookupAccount: s.isRemoteLookupAccount,
 		RoutingInfo:           s.routingInfo,

@@ -506,6 +506,10 @@ func (s *Server) Start() error {
 // setupHandler creates the HTTP handler with reverse proxy logic
 func (s *Server) setupHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The client's IP travels with the request: routeUser fills the remote lookup's
+		// $ip with it.
+		r = r.WithContext(context.WithValue(r.Context(), clientIPKey, s.getRealClientIP(r)))
+
 		// Track metrics
 		metrics.ConnectionsTotal.WithLabelValues("userapi_proxy", s.name, "").Inc()
 		metrics.ConnectionsCurrent.WithLabelValues("userapi_proxy", s.name, "").Inc()
@@ -759,7 +763,8 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 		lookupCtx, lookupCancel := context.WithTimeout(ctx, s.connManager.GetRemoteLookupTimeout())
 		defer lookupCancel()
 
-		routingInfo, result, err := s.routingLookup.LookupUserRouteWithOptions(lookupCtx, email, "", true)
+		clientIP, _ := ctx.Value(clientIPKey).(string) // set by the handler; "" when unknown
+		routingInfo, result, err := s.routingLookup.LookupUserRouteWithClientIP(lookupCtx, email, "", clientIP, true)
 		switch {
 		case err != nil:
 			logger.Warn("User API Proxy: RemoteLookup failed", "name", s.name, "user", email, "error", err)

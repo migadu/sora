@@ -434,6 +434,7 @@ func (s *Session) handleConnection() {
 				routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 					Ctx:                   s.ctx,
 					Username:              s.originalAddress,
+					ClientIP:              server.GetRealClientIP(s.clientConn, s.proxyInfo),
 					Protocol:              "lmtp",
 					IsRemoteLookupAccount: s.isRemoteLookupAccount,
 					RoutingInfo:           s.routingInfo,
@@ -917,7 +918,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 		defer routingCancel()
 
 		remoteLookupStart := time.Now()
-		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username)
+		// $ip is the delivering MTA: this proxy's client, the PROXY header source when
+		// there is one (the address XCLIENT forwards to the backend as well).
+		routingInfo, lookupErr := s.server.connManager.LookupUserRoute(routingCtx, s.username, server.GetRealClientIP(s.clientConn, s.proxyInfo))
 		remoteLookupDuration := time.Since(remoteLookupStart).Seconds()
 
 		if lookupErr != nil {
@@ -1116,6 +1119,7 @@ func (s *Session) connectToBackend() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                   s.ctx,
 		Username:              s.originalAddress, // Use original address (not resolved address) for route/affinity consistency
+		ClientIP:              server.GetRealClientIP(s.clientConn, s.proxyInfo),
 		Protocol:              "lmtp",
 		IsRemoteLookupAccount: s.isRemoteLookupAccount,
 		RoutingInfo:           s.routingInfo,
