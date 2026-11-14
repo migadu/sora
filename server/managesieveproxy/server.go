@@ -312,7 +312,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		// Parse positive revalidation window from config (used for password change detection)
 		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(opts.Name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("managesieve_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("ManageSieve Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
 		logger.Info("ManageSieve Proxy: Lookup cache disabled", "name", opts.Name)
@@ -420,7 +420,7 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 			var releaseConn func()
 			var err error
 			if s.limiter != nil {
-				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), "")
+				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), server.GetRealClientIP(netConn, proxyInfo))
 				if err != nil {
 					// DELIBERATE silent close, no banner: matches the previous
 					// accept-loop rejection (drop before any greeting), and a

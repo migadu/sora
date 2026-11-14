@@ -93,76 +93,18 @@ func TestDBConnectionPoolMetricsBasic(t *testing.T) {
 	})
 }
 
-func TestDBCircuitBreakerMetricsBasic(t *testing.T) {
-	// Reset metrics
-	DBCircuitBreakerState.Reset()
-	DBCircuitBreakerFailures.Reset()
-	DBConnectionAcquireTimeout.Reset()
+func TestDBPoolExhaustionMetricsBasic(t *testing.T) {
 	DBPoolExhaustion.Reset()
 
-	t.Run("db_circuit_breaker_state", func(t *testing.T) {
-		// Test setting circuit breaker state (typically only one would be active)
-		DBCircuitBreakerState.WithLabelValues("closed").Set(1)
-		DBCircuitBreakerState.WithLabelValues("open").Set(0)
-		DBCircuitBreakerState.WithLabelValues("half_open").Set(0)
+	DBPoolExhaustion.WithLabelValues("read").Add(2)
+	DBPoolExhaustion.WithLabelValues("write").Add(1)
 
-		closedState := testutil.ToFloat64(DBCircuitBreakerState.WithLabelValues("closed"))
-		openState := testutil.ToFloat64(DBCircuitBreakerState.WithLabelValues("open"))
-		halfOpenState := testutil.ToFloat64(DBCircuitBreakerState.WithLabelValues("half_open"))
-
-		if closedState != 1 {
-			t.Errorf("Expected closed state to be 1, got %f", closedState)
-		}
-		if openState != 0 {
-			t.Errorf("Expected open state to be 0, got %f", openState)
-		}
-		if halfOpenState != 0 {
-			t.Errorf("Expected half_open state to be 0, got %f", halfOpenState)
-		}
-	})
-
-	t.Run("db_circuit_breaker_failures", func(t *testing.T) {
-		roles := []string{"read", "write"}
-
-		for _, role := range roles {
-			DBCircuitBreakerFailures.WithLabelValues(role).Add(5)
-		}
-
-		readFailures := testutil.ToFloat64(DBCircuitBreakerFailures.WithLabelValues("read"))
-		writeFailures := testutil.ToFloat64(DBCircuitBreakerFailures.WithLabelValues("write"))
-
-		if readFailures != 5 {
-			t.Errorf("Expected 5 read failures, got %f", readFailures)
-		}
-		if writeFailures != 5 {
-			t.Errorf("Expected 5 write failures, got %f", writeFailures)
-		}
-	})
-
-	t.Run("db_connection_timeouts_and_exhaustion", func(t *testing.T) {
-		DBConnectionAcquireTimeout.WithLabelValues("read").Add(3)
-		DBConnectionAcquireTimeout.WithLabelValues("write").Add(7)
-		DBPoolExhaustion.WithLabelValues("read").Add(2)
-		DBPoolExhaustion.WithLabelValues("write").Add(1)
-
-		readTimeouts := testutil.ToFloat64(DBConnectionAcquireTimeout.WithLabelValues("read"))
-		writeTimeouts := testutil.ToFloat64(DBConnectionAcquireTimeout.WithLabelValues("write"))
-		readExhaustion := testutil.ToFloat64(DBPoolExhaustion.WithLabelValues("read"))
-		writeExhaustion := testutil.ToFloat64(DBPoolExhaustion.WithLabelValues("write"))
-
-		if readTimeouts != 3 {
-			t.Errorf("Expected 3 read timeouts, got %f", readTimeouts)
-		}
-		if writeTimeouts != 7 {
-			t.Errorf("Expected 7 write timeouts, got %f", writeTimeouts)
-		}
-		if readExhaustion != 2 {
-			t.Errorf("Expected 2 read exhaustions, got %f", readExhaustion)
-		}
-		if writeExhaustion != 1 {
-			t.Errorf("Expected 1 write exhaustion, got %f", writeExhaustion)
-		}
-	})
+	if got := testutil.ToFloat64(DBPoolExhaustion.WithLabelValues("read")); got != 2 {
+		t.Errorf("Expected 2 read exhaustions, got %f", got)
+	}
+	if got := testutil.ToFloat64(DBPoolExhaustion.WithLabelValues("write")); got != 1 {
+		t.Errorf("Expected 1 write exhaustion, got %f", got)
+	}
 }
 
 func TestDBMetricsLabels(t *testing.T) {
@@ -185,24 +127,18 @@ func TestDBMetricsLabels(t *testing.T) {
 
 	t.Run("role_labels", func(t *testing.T) {
 		DBPoolTotalConns.Reset()
-		DBCircuitBreakerFailures.Reset()
 
 		validRoles := []string{"read", "write"}
 
 		for _, role := range validRoles {
 			DBPoolTotalConns.WithLabelValues(role).Set(10)
-			DBCircuitBreakerFailures.WithLabelValues(role).Inc()
 		}
 
 		for _, role := range validRoles {
 			poolCount := testutil.ToFloat64(DBPoolTotalConns.WithLabelValues(role))
-			failureCount := testutil.ToFloat64(DBCircuitBreakerFailures.WithLabelValues(role))
 
 			if poolCount != 10 {
 				t.Errorf("Expected 10 total connections for %s role, got %f", role, poolCount)
-			}
-			if failureCount != 1 {
-				t.Errorf("Expected 1 failure for %s role, got %f", role, failureCount)
 			}
 		}
 	})
@@ -214,16 +150,13 @@ func TestDBMetricsIntegration(t *testing.T) {
 	DBPoolTotalConns.Reset()
 	DBPoolIdleConns.Reset()
 	DBPoolInUseConns.Reset()
-	DBCircuitBreakerState.Reset()
-	DBCircuitBreakerFailures.Reset()
+	DBPoolExhaustion.Reset()
 
 	t.Run("healthy_scenario", func(t *testing.T) {
 		// Start with healthy pool state
 		DBPoolTotalConns.WithLabelValues("write").Set(10)
 		DBPoolIdleConns.WithLabelValues("write").Set(8)
 		DBPoolInUseConns.WithLabelValues("write").Set(2)
-		DBCircuitBreakerState.WithLabelValues("closed").Set(1)
-		DBCircuitBreakerState.WithLabelValues("open").Set(0)
 
 		// Execute successful transactions
 		DBTransactionDuration.Observe(0.025)
@@ -234,34 +167,19 @@ func TestDBMetricsIntegration(t *testing.T) {
 		if commitCount != 1 {
 			t.Errorf("Expected 1 commit, got %f", commitCount)
 		}
-
-		closedState := testutil.ToFloat64(DBCircuitBreakerState.WithLabelValues("closed"))
-		if closedState != 1 {
-			t.Errorf("Expected circuit breaker to be closed, got %f", closedState)
-		}
 	})
 
 	t.Run("unhealthy_scenario", func(t *testing.T) {
 		// Simulate unhealthy state
-		DBCircuitBreakerFailures.WithLabelValues("write").Add(5)
 		DBPoolExhaustion.WithLabelValues("write").Inc()
-
-		// Circuit breaker opens
-		DBCircuitBreakerState.WithLabelValues("closed").Set(0)
-		DBCircuitBreakerState.WithLabelValues("open").Set(1)
 
 		// Failed transactions
 		DBTransactionsTotal.WithLabelValues("rollback").Add(3)
 
 		// Verify metrics
-		failureCount := testutil.ToFloat64(DBCircuitBreakerFailures.WithLabelValues("write"))
-		if failureCount != 5 {
-			t.Errorf("Expected 5 circuit breaker failures, got %f", failureCount)
-		}
-
-		openState := testutil.ToFloat64(DBCircuitBreakerState.WithLabelValues("open"))
-		if openState != 1 {
-			t.Errorf("Expected circuit breaker to be open, got %f", openState)
+		exhaustionCount := testutil.ToFloat64(DBPoolExhaustion.WithLabelValues("write"))
+		if exhaustionCount != 1 {
+			t.Errorf("Expected 1 pool exhaustion, got %f", exhaustionCount)
 		}
 
 		rollbackCount := testutil.ToFloat64(DBTransactionsTotal.WithLabelValues("rollback"))

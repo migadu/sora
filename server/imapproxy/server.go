@@ -383,7 +383,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault(opts.Name)
 		maxSize := lookupCacheConfig.GetMaxSize()
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("imap_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("IMAP Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
 		logger.Info("IMAP Proxy: Lookup cache disabled", "name", opts.Name)
@@ -547,10 +547,11 @@ func (s *Server) acceptConnections() error {
 			}
 		}
 
-		// Check connection limits before processing
+		// Check connection limits before processing. Behind a PROXY-protocol load
+		// balancer the per-IP limit counts the client its header names.
 		var releaseConn func()
 		if s.limiter != nil {
-			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), "")
+			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), server.GetRealClientIP(conn, server.GetProxyProtocolInfo(conn)))
 			if err != nil {
 				logger.Info("Connection rejected", "proxy", s.name, "error", err)
 				conn.Close()

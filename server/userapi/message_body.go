@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/migadu/sora/cache"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -169,7 +170,9 @@ func (s *Server) fetchBodyFromS3(ctx context.Context, message *db.DBMessage) ([]
 		return nil, fmt.Errorf("S3 object %s is empty", key)
 	}
 	if s.cache != nil {
-		if err := s.cache.Put(message.ContentHash, data); err != nil {
+		if err := s.cache.Put(message.ContentHash, data); errors.Is(err, cache.ErrObjectTooLarge) {
+			logger.Debug("HTTP Mail API: message body too large for the cache", "name", s.name, "size", len(data))
+		} else if err != nil {
 			logger.Warn("HTTP Mail API: failed to cache message body", "name", s.name, "error", err)
 		}
 	}

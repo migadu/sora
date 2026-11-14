@@ -78,7 +78,7 @@ Include the API key in the `Authorization` header:
 
 ```bash
 curl -H "Authorization: Bearer your-secret-api-key-here" \
-     http://localhost:8080/admin/accounts
+     http://localhost:8080/admin/accounts/user@example.com
 ```
 
 **Response on Invalid/Missing API Key:**
@@ -576,7 +576,7 @@ curl -X POST http://localhost:8080/admin/connections/kick \
 
 **Endpoint:** `GET /admin/connections/user/{email}`
 
-Get the user's entries on this node's connection trackers, matched case-insensitively against each entry's `email`: an account whose entry was created by an alias login is found only under that alias. The entries are those of `GET /admin/connections`, but a tracker that knows the account only through gossip is listed too, with `local_count` 0.
+Get the user's entries on this node's connection trackers. The address is resolved to its account in the database, as `POST /admin/connections/kick` resolves it, so the account's entries are listed whichever of its addresses names it. An entry whose `email` is the address (case-insensitively) is listed too: that is how a remote lookup account, which the database does not know, is found. The entries are those of `GET /admin/connections`, but a tracker that knows the account only through gossip is listed too, with `local_count` 0.
 
 **Response:** `200 OK`
 ```json
@@ -1228,17 +1228,12 @@ curl -X POST http://localhost:8080/admin/mail/deliver \
 
 ## Rate Limiting
 
-The Admin API implements rate limiting based on authentication attempts and API key usage:
+The Admin API has no request or authentication rate limiting of its own. A missing or malformed `Authorization` header is answered `401` and a wrong key `403`, at once and every time: failed attempts are not counted, delayed or blocked, and the authentication rate limiters listed by [`GET /admin/auth/blocked`](#list-blocked-addresses) do not cover the Admin API. Protect it with:
 
-- **Per IP Rate Limit**: Configurable limit on requests per IP address
-- **Authentication Attempts**: Progressive delays on failed authentication
-- **No Hard Request Limits**: By default, but can be configured via reverse proxy
-
-**Recommended Practice:**
-- Implement exponential backoff on client side
-- Cache responses where appropriate
-- Use bulk operations when available
-- Monitor your API usage via logs
+- **`allowed_hosts`**: the IP addresses and CIDR ranges allowed to use the API. A request from any other address is answered `403 {"error": "Host not allowed"}` before its key is compared. An empty list allows every client.
+- **A long random `api_key`** (and `read_only_api_key`): 32 or more random characters, so that guessing one is not practical at any request rate.
+- **`max_connections`**: caps the concurrent connections of the listener, all clients together (`0`, the default, means unlimited). `max_connections_per_ip` does not apply to the Admin API.
+- **A reverse proxy** in front of it, for per-client request or failed-authentication limits.
 
 ## Best Practices
 
@@ -1252,10 +1247,11 @@ The Admin API implements rate limiting based on authentication attempts and API 
    tls_key_file = "/path/to/key.pem"
    ```
 
-2. **Restrict access by IP/hostname**
+2. **Restrict access by IP address or CIDR**
    ```toml
-   allowed_hosts = ["admin.example.com", "10.0.1.0/24"]
+   allowed_hosts = ["192.0.2.10", "10.0.1.0/24"]
    ```
+   Entries are matched against the client address (the PROXY protocol source with `proxy_protocol = true`). Host names are not resolved: an entry that is not an IP address or CIDR matches no client, and is logged as a warning at startup and when a reload installs it.
 
 3. **Use strong API keys** (32+ characters, cryptographically random)
 

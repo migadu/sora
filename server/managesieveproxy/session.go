@@ -236,6 +236,17 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// not the resolved s.username, which can differ for token/master/+detail logins.
 	s.submittedUsername = username
 
+	// Parse once (regular addresses and the user@domain.com@SUFFIX form alike). The base
+	// address, without +detail or @SUFFIX, names the user in every line this attempt logs,
+	// refusals included, until a successful login replaces it with the resolved address;
+	// the raw name stands in when it does not parse.
+	parsedAddr, parseErr := server.NewAddress(username)
+	if parseErr == nil {
+		s.username = parsedAddr.BaseAddress()
+	} else {
+		s.username = username
+	}
+
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
 	// Empty passwords are never valid under any condition
 	if password == "" {
@@ -324,7 +335,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					// after negative_ttl to allow retry. Brute force protection is handled
 					// by rate limiting, not by extending cache TTL.
 					s.DebugLog("cache hit - negative entry with same password", "username", username, "age", time.Since(cached.CreatedAt))
-					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
+					metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit_negative").Inc()
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
 					return consts.ErrAuthenticationFailed
@@ -332,7 +343,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					// Different password - ALWAYS revalidate (user might have fixed their password)
 					// Brute force protection is handled by protocol-level rate limiting
 					s.DebugLog("cache negative entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
-					metrics.CacheOperationsTotal.WithLabelValues("get", "revalidate_negative_different_pw").Inc()
+					metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "revalidate_negative_different_pw").Inc()
 					// Fall through to full authentication
 				}
 			} else {
@@ -344,19 +355,16 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					// This ensures that when a domain moves backends or password changes,
 					// active users eventually pick up the changes.
 					s.DebugLog("cache hit - positive entry with matching password", "username", username, "age", time.Since(cached.CreatedAt))
-					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive").Inc()
+					metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit_positive").Inc()
 
 					// Populate session with cached routing info
 					s.accountID = cached.AccountID
 					s.isRemoteLookupAccount = cached.FromRemoteLookup
 
-					// Otherwise parse username to extract base address
+					// The resolved address when the entry has one; otherwise s.username
+					// keeps the base address set above.
 					if cached.ActualEmail != "" {
 						s.username = cached.ActualEmail
-					} else if parsedAddr, parseErr := server.NewAddress(username); parseErr == nil {
-						s.username = parsedAddr.BaseAddress() // Use base address (without @SUFFIX)
-					} else {
-						s.username = username // Fallback
 					}
 
 					// Rebuild the routing info from the entry whether it carries an explicit
@@ -390,12 +398,12 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					// Different password on positive cache - revalidate if old enough
 					if cached.IsOld(s.server.positiveRevalidationWindow) {
 						s.DebugLog("cache hit - positive entry with different password (old enough to revalidate)", "username", username, "age", time.Since(cached.CreatedAt))
-						metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive_revalidate").Inc()
+						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit_positive_revalidate").Inc()
 						// Fall through to full authentication
 					} else {
 						// Different password but too fresh
 						s.DebugLog("cache hit - positive entry with different password (too fresh)", "username", username, "age", time.Since(cached.CreatedAt))
-						metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive_fresh").Inc()
+						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit_positive_fresh").Inc()
 						// Cost what a failed login for an unknown address costs, or the instant
 						// answer shows that this address has an account. (#346)
 						db.DummyVerifyPassword(password)
@@ -408,7 +416,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		} else {
 			// Cache miss - proceed with full authentication
 			s.DebugLog("cache miss", "username", username)
-			metrics.CacheOperationsTotal.WithLabelValues("get", "miss").Inc()
+			metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "miss").Inc()
 		}
 	}
 
@@ -418,9 +426,6 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// Otherwise: treat as token, send full username (including @SUFFIX) to remotelookup
 	var usernameForRemoteLookup string
 	var masterAuthValidated bool
-
-	// Parse username (handles both regular addresses and addresses with @SUFFIX)
-	parsedAddr, parseErr := server.NewAddress(username)
 
 	if parseErr == nil && parsedAddr.HasSuffix() {
 		// Has suffix - check if it matches configured master username
@@ -672,6 +677,13 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			// (TRYLATER)), neither counted as a failed login nor cached.
 			if proxy.IsTemporaryDBAuthFailure(err) {
 				reason, _ := proxy.ClassifyDBAuthFailure(err)
+				// A login this username has in the lookup cache was verified against
+				// another hash than the one now stored. Drop it: while it stays, every
+				// password that misses it is answered here, uncounted, and the cached
+				// one still signs in, an unmetered guessing oracle until it expires.
+				if errors.Is(err, db.ErrUnverifiableHash) {
+					s.invalidateLookupCache("unverifiable stored hash")
+				}
 				s.WarnLog("authentication unavailable", "reason", reason, "method", "main_db", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable

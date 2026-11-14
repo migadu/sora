@@ -750,8 +750,8 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		logger.Info("Connecting to database with resilient failover configuration")
 		deps.resilientDB, err = resilient.NewResilientDatabase(ctx, &cfg.Database, true, true)
 		if err != nil {
-			logger.Info("Failed to initialize resilient database", "error", err)
-			os.Exit(1)
+			errorHandler.FatalError("initialize resilient database", err)
+			os.Exit(errorHandler.WaitForExit())
 		}
 	} else {
 		logger.Info("Skipping database initialization - no server on this node queries it")
@@ -1287,7 +1287,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 				}()
 
 				if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					logger.Error("HTTP-01 challenge server error", err)
+					logger.Error("HTTP-01 challenge server error", "error", err)
 					errChan <- fmt.Errorf("HTTP-01 challenge server failed: %w", err)
 				}
 			}()
@@ -1691,8 +1691,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 
 	sessionMemoryLimit, err := serverConfig.GetSessionMemoryLimit()
 	if err != nil {
-		logger.Info("POP3: Invalid session memory limit - using default (100MB)", "name",
-			serverConfig.Name, err)
+		logger.Info("POP3: Invalid session memory limit - using default (100MB)", "name", serverConfig.Name, "error", err)
 		sessionMemoryLimit = 100 * 1024 * 1024
 	}
 
