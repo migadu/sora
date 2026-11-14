@@ -77,6 +77,29 @@ func TestNewDatabaseFromConfig_HostEntryPort(t *testing.T) {
 	}
 }
 
+// A host entry ending in a colon ("db.example.com:") has no port. pgx used to read it
+// as the host with the default port, so such an entry connected before EndpointURL
+// existed and must keep connecting, with the endpoint's port.
+func TestNewDatabaseFromConfig_HostEntryEmptyPort(t *testing.T) {
+	fake := testutils.StartFakePostgres(t)
+
+	cfg := &config.DatabaseConfig{Write: &config.DatabaseEndpointConfig{
+		Hosts:    []string{fake.Host + ":"},
+		Port:     int64(fake.Port),
+		User:     "sora",
+		Password: "secret",
+		Name:     "sora_mail_db",
+	}}
+	database, err := db.NewDatabaseFromConfig(context.Background(), cfg, false)
+	if err == nil {
+		database.Close()
+		t.Fatal("the fake server refuses every login, NewDatabaseFromConfig must fail")
+	}
+	if login := fake.NextLogin(t, err); login.Password != "secret" {
+		t.Fatalf("server received password %q, want %q", login.Password, "secret")
+	}
+}
+
 // EndpointURL resolves host entries the way the server always has (a port in the entry
 // wins, then the endpoint's port, then 5432) and brackets IPv6 literals.
 func TestEndpointURL_HostPort(t *testing.T) {
@@ -93,6 +116,10 @@ func TestEndpointURL_HostPort(t *testing.T) {
 		{"2001:db8::1", nil, "[2001:db8::1]:5432"},
 		{"[2001:db8::1]", int64(5433), "[2001:db8::1]:5433"},
 		{"[2001:db8::1]:6432", nil, "[2001:db8::1]:6432"},
+		// An empty port after the colon is no port: the endpoint's port applies.
+		{"db.example.com:", nil, "db.example.com:5432"},
+		{"db.example.com:", int64(5433), "db.example.com:5433"},
+		{"[2001:db8::1]:", int64(5433), "[2001:db8::1]:5433"},
 	} {
 		u, err := db.EndpointURL(&config.DatabaseEndpointConfig{Port: tc.port, Name: "sora_mail_db"}, tc.host)
 		if err != nil {

@@ -208,7 +208,8 @@ type POP3ProxyServerOptions struct {
 	MaxAuthErrors int // Maximum authentication errors before disconnection (0 = use default)
 
 	// Cluster support
-	ClusterManager *cluster.Manager // Optional: enables cluster-wide per-IP limiting
+	ClusterManager       *cluster.Manager                  // Optional: shares per-IP connection counts and auth rate limits with the cluster
+	ClusterRateLimitSync config.ClusterRateLimitSyncConfig // [cluster.rate_limit_sync]; read only with ClusterManager
 }
 
 func New(appCtx context.Context, hostname, addr string, rdb *resilient.ResilientDatabase, options POP3ProxyServerOptions) (*POP3ProxyServer, error) {
@@ -307,6 +308,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("POP3-PROXY", options.Name, hostname, options.AuthRateLimit, options.TrustedProxies)
 	server.RegisterRateLimiter("pop3_proxy", options.Name, authLimiter)
+	authLimiter.JoinCluster(options.ClusterManager, options.ClusterRateLimitSync)
 
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter
@@ -365,7 +367,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		lookupCacheConfig = &defaultConfig
 	}
 
-	if lookupCacheConfig.Enabled {
+	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(options.RemoteLookup) {
 		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
 		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
 		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()

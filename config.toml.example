@@ -27,7 +27,7 @@ bcrypt_cost = 12
 # ADMIN CLI CONFIGURATION (for sora-admin tool)
 # =============================================================================
 # Configuration for the sora-admin CLI tool to connect to the HTTP Admin API server.
-# Required for commands like 'sora-admin stats auth', 'stats connection', 'connections list', 'connections kick', etc.
+# Required for commands like 'sora-admin stats blocked', 'stats connection', 'connections list', 'connections kick', etc.
 
 [admin_cli]
 addr = "http://localhost:8080"              # HTTP Admin API endpoint address (use https:// if TLS is enabled)
@@ -98,7 +98,8 @@ tls = false                   # Enable TLS/SSL for database connection. Recommen
 # also serves the reads through a second, dedicated pool with these same settings (so
 # writes cannot starve reads), and the process can open up to twice max_connections
 # (and keeps twice min_idle_connections) to that host. With [database.read], each
-# write host gets one pool.
+# write host gets one pool, and while no read replica is healthy all reads fall back to
+# that pool, so its max_connections must leave room for them.
 max_connections = 50            # Maximum connections in the write pool. Should be < PostgreSQL max_connections.
 min_connections = 0             # Minimum connections eagerly created on startup (default: 0 to avoid connection spikes).
 min_idle_connections = 5        # Minimum idle connections lazily maintained (recommended: 5-20 for low latency, superior to min_connections).
@@ -380,6 +381,8 @@ enabled = false                                 # Enable cluster mode (default: 
 #   addr = "10.10.10.40:7946"         # Specific IP with port (recommended)
 #   addr = "10.10.10.40"              # Specific IP (uses port from 'port' field below)
 #   addr = "192.168.1.100:7946"       # Private network IP
+#   addr = "[2001:db8::40]:7946"      # IPv6 with port (brackets required with a port)
+#   addr = "2001:db8::40"             # IPv6 (uses port from 'port' field below)
 #
 # INVALID (WILL FAIL):
 #   addr = "0.0.0.0:7946"             # Cannot use 0.0.0.0 - other nodes cannot reach you
@@ -420,10 +423,13 @@ node_id = ""                                    # Unique node ID (default: hostn
                                                 # instance claims them and the cleaner deletes them once they pass
                                                 # uploader.cleanup_grace_period. Before changing this, stop delivery to the
                                                 # node and wait until it owns no pending_uploads rows.
-peers = []                                      # Initial seed nodes for cluster discovery (e.g., ["node-1.example.com:7946", "node-2.example.com:7946"])
-                                                # IMPORTANT: Do NOT include this node's own node_id in the peers list!
-                                                # Only list OTHER nodes in the cluster. Self-references will be filtered out
-                                                # automatically and a warning will be logged.
+peers = []                                      # Seed nodes for cluster discovery (e.g., ["node-1.example.com:7946", "[2001:db8::41]:7946"])
+                                                # A port-less entry uses this node's gossip port. An entry that names only
+                                                # this node's own address is ignored with a warning, so one list can be
+                                                # shared by every node. Peers that are not members (after a partition or a
+                                                # restart) are joined again every 10 seconds; list each node by the address
+                                                # it advertises (its addr): an entry naming several nodes counts as present
+                                                # while any one of them, this node included, is a member.
 secret_key = ""                                 # Cluster encryption key: base64-encoded 32-byte key.
                                                 # REQUIRED whenever cluster mode is enabled — the server refuses to
                                                 # start without it (gossip carries auth/rate-limit/kick state that an
@@ -455,6 +461,11 @@ max_event_queue_size = 50000                    # Max events per protocol queue 
 # Synchronize authentication rate limiting across cluster nodes via gossip protocol.
 # When enabled, failed authentication attempts on one node immediately block the IP
 # on all other nodes, providing cluster-wide brute-force protection.
+# Applies to the IMAP, POP3 and ManageSieve proxies, each sharing with the proxies of
+# the same protocol. In cluster mode their max_connections_per_ip is cluster-wide as
+# well, whatever this section says: it caps an address across all proxy nodes, not
+# on each. Backend servers, the LMTP proxy, the User API and the User API proxy keep
+# per-node limits.
 [cluster.rate_limit_sync]
 enabled = true                                  # Enable cluster-wide rate limiting (default: true if cluster enabled)
 sync_blocks = true                              # Synchronize IP blocks across nodes (default: true)
@@ -469,7 +480,7 @@ sync_failure_counts = true                      # Synchronize progressive delay 
 enabled = false                                 # Enable cluster-wide server affinity (default: false)
 ttl = "24h"                                     # How long affinity persists (default: "24h")
 cleanup_interval = "1h"                         # How often to clean up expired affinities (default: "1h")
-# cache_path = "/sora/affinity_cache.db"        # SQLite path for persistent affinity (survives restarts)
+# cache_path = "/var/cache/sora/affinity_cache.db" # SQLite path for persistent affinity (survives restarts)
 
 # EXAMPLE USAGE (Multi-instance deployment):
 # [cluster]
@@ -546,7 +557,7 @@ cleanup_interval = "1h"                         # How often to clean up expired 
 
 [auth_cache]
 enabled = true                     # Enable persistent auth cache (default: false)
-path = "/sora/auth_cache.db"       # SQLite database path. Fast storage (SSD) recommended.
+path = "/var/cache/sora/auth_cache.db" # SQLite database path (default: "/var/cache/sora/auth_cache.db"). Fast storage (SSD) recommended.
 max_age = "24h"                    # Max age for cached entries before re-fetching (default: 24h)
 cleanup_interval = "1h"            # How often to purge expired/unused entries (default: 1 hour)
 purge_unused = "168h"              # Purge entries unused for this duration (default: 7 days)
@@ -574,7 +585,7 @@ refuse_after = "30s"               # How long a backend in maintenance still acc
 # S3 API calls and improving performance for recently accessed messages.
 
 [local_cache]
-path = "/sora/cache"      # Filesystem path for cache storage. Must be writable. Fast storage (SSD) recommended.
+path = "/var/cache/sora/cache" # Filesystem path for cache storage (default: "/var/cache/sora/cache"). Must be writable. Fast storage (SSD) recommended.
 capacity = "1gb"              # Maximum total cache size (e.g., "100mb", "1gb"). LRU eviction when exceeded.
 max_object_size = "5mb"       # Maximum size for individual cached objects. Prevents large messages from dominating cache.
 metrics_interval = "5m"       # How often cache hit/miss ratios are stored in the database.
@@ -598,7 +609,9 @@ warmup_interval = "24h"       # Minimum time between warmups for the same user. 
 # to S3 storage after messages are initially stored locally.
 
 [uploader]
-path = "/sora/uploads"    # Filesystem path for staging uploads (temporary storage before S3).
+path = "/var/spool/sora/uploads" # Staging directory for bodies not yet in S3 (default: "/var/spool/sora/uploads").
+                              # A staged body is the only copy of its message: keep it on persistent
+                              # storage, never under /tmp.
 # instance_id = ""            # Upload lease identity written to pending_uploads.instance_id and
                               # instance_heartbeats.instance_id. Default: this host's hostname —
                               # the same value earlier releases stamped, so upgrades are
@@ -659,6 +672,11 @@ instance_liveness_threshold = "7d" # How long an uploader instance must be silen
 # Use cases:
 #   - Sieve redirect action: forward messages to external email addresses
 #   - Sieve vacation action: send auto-reply vacation responses
+#
+# Vacation replies are sent from the null reverse-path (RFC 5230 §5.1): MAIL FROM:<> on the
+# SMTP relay, "from": "" in the HTTP relay's request. The relay must accept that. With a
+# null reverse-path SPF checks the HELO name (RFC 7208 §2.4), so DMARC for the user's domain
+# passes only on a DKIM signature aligned with the reply's From address.
 #
 # You can choose between SMTP or HTTP relay:
 #   - SMTP: Traditional SMTP relay (most common)
@@ -862,8 +880,9 @@ enabled = false
 # timeout = "10s"
 
 # Maximum message size to submit (default: "10mb")
-# Messages larger than this are skipped (not submitted for training)
-# Attachments are already stripped, so this applies to the text content size
+# Messages larger than this are skipped (not submitted for training). The size is
+# the stored message size, attachments included, so a larger message is skipped
+# before its body is fetched from S3.
 # max_message_size = "10mb"
 
 # Maximum attachment size threshold (default: "0")
@@ -877,6 +896,16 @@ enabled = false
 # When false, MOVE command waits for training submission to complete
 # RECOMMENDED: Keep true to avoid slowing down IMAP operations
 # async = true
+
+# Workers that fetch and submit training messages, process-wide (default: 4)
+# At most this many message bodies are fetched and sent at once, however many
+# messages a MOVE touches.
+# workers = 4
+
+# Messages waiting for a worker (default: 1000)
+# A message moved while the queue is full is not submitted; it is counted in
+# sora_spam_training_messages_total{result="dropped"}.
+# queue_size = 1000
 
 # Circuit breaker configuration for training endpoint
 # Protects against cascading failures if the training endpoint becomes unavailable
@@ -1072,6 +1101,8 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # UIDPLUS, LIST-STATUS, STATUS=SIZE, CHILDREN, ...) also removes IMAP4rev2, so
 # the server offers IMAP4rev1 with its remaining extensions; disabling CONDSTORE
 # also removes QRESYNC. client_filters follow the same rule.
+# SASL-IR, LITERAL-, UNSELECT, ENABLE and UTF8=ACCEPT are always advertised with
+# IMAP4rev1 and cannot be disabled; naming them only logs a warning.
 # STARTTLS, LOGINDISABLED and AUTH=PLAIN follow tls, tls_use_starttls and
 # insecure_auth; disabled_caps does not change them.
 
@@ -1275,6 +1306,8 @@ auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expire
 # Memory safety limits (prevents unbounded growth during burst attacks)
 # These limits protect against memory exhaustion when under sustained attack. When a map exceeds
 # its size limit, the oldest entries (by FirstFailure time) are evicted using LRU policy.
+# max_ip_entries evicts the counters of addresses that are not blocked first and never removes
+# an IP block: a block lasts until ip_block_duration ends.
 # There is no unlimited setting: 0, like any key left out, takes the default.
 #
 # RECOMMENDED VALUES:
@@ -1555,7 +1588,7 @@ name = "imap-proxy-1"
 addr = ":1143"                # Proxy listen address. Must be different from backend IMAP port.
 remote_addrs = ["backend1.example.com:143", "backend2.example.com:143", "backend3.example.com:143"]
 max_connections = 5000                  # Max connections to this proxy instance (aggregates multiple clients)
-max_connections_per_ip = 500            # High for corporate gateways (~100 users), catches DoS
+max_connections_per_ip = 500            # Cluster-wide in cluster mode. High for corporate gateways (~100 users), catches DoS
 max_connections_per_user = 20           # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
 max_connections_per_user_per_ip = 8     # Per user per IP - slightly higher for proxies
 master_sasl_username = "proxyuser"
@@ -1668,6 +1701,10 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 #
 # The remote_lookup service is called via HTTP GET with email interpolation.
 # The URL can contain $email placeholder which is replaced with the URL-encoded email address.
+# $ip is replaced with the client's IP address: the source of the PROXY header when the proxy
+# receives one, else the connecting peer. On lmtp_proxy the client is the delivering MTA.
+# A URL containing $ip bypasses the proxy's lookup cache: verdicts and routes may differ
+# between networks, while the cache is keyed by user. Other URLs keep the configured TTLs.
 #
 # Example URLs:
 #   "http://localhost:8080/lookup?email=$email" → GET /lookup?email=user@domain.com
@@ -1867,7 +1904,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # failure_ratio = 0.6             # Failure ratio threshold to open circuit (0.0-1.0, default: 0.6 = 60%)
                                     # Circuit opens when this percentage of recent requests fail
                                     # Production: Consider 0.7-0.8 for less sensitive triggering
-  # min_requests = 3                # Minimum requests before evaluating failure ratio (default: 3)
+  # min_requests = 3                # Minimum completed requests before evaluating failure ratio (default: 3)
                                     # Prevents opening circuit on very few requests
                                     # IMPORTANT: Should be ≤ max_requests to avoid getting stuck
                                     # Production: Consider 5-10 for more stable thresholds
@@ -2003,7 +2040,7 @@ name = "pop3-proxy-1"
 addr = ":1110"                # Proxy listen address. Must be different from backend POP3 port.
 remote_addrs = ["backend1.example.com:110", "backend2.example.com:110"]
 max_connections = 2000
-max_connections_per_ip = 200            # High for gateways, POP3 is typically sequential so less needed
+max_connections_per_ip = 200            # Cluster-wide in cluster mode. High for gateways, POP3 is typically sequential
 max_connections_per_user = 5            # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
 max_connections_per_user_per_ip = 3     # POP3 rarely needs multiple simultaneous connections
 master_sasl_username = "proxyuser"
@@ -2067,7 +2104,7 @@ name = "managesieve-proxy-1"
 addr = ":14190"               # Proxy listen address. Must be different from backend ManageSieve port.
 remote_addrs = ["backend1.example.com:4190", "backend2.example.com:4190"]
 max_connections = 500
-max_connections_per_ip = 100            # Low volume protocol, moderate limit sufficient
+max_connections_per_ip = 100            # Cluster-wide in cluster mode. Low volume protocol, moderate limit sufficient
 max_connections_per_user = 5            # Cluster-wide limit per user (requires cluster mode, 0 = unlimited)
 max_connections_per_user_per_ip = 3     # Administrative operations, low concurrency needed
 insecure_auth = false                 # Allow plaintext auth. SECURITY: Should be false in production.

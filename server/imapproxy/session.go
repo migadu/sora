@@ -17,6 +17,7 @@ import (
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/pkg/metrics"
@@ -845,7 +846,6 @@ func (s *Session) authenticateUser(username, password string) error {
 	// the upstream load balancer whenever this proxy sits behind haproxy/nginx/NLB,
 	// and the load balancer never accumulates failures — so keying the delay on it
 	// meant the delay never fired in exactly the deployment proxies exist for.
-	remoteAddr := s.clientConn.RemoteAddr()
 	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
 	delayAddr := &server.StringAddr{Addr: realClientIP}
 	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, delayAddr, "IMAP-PROXY"); err != nil {
@@ -858,7 +858,37 @@ func (s *Session) authenticateUser(username, password string) error {
 		return err
 	}
 
-	// Check cache first (before rate limiter to avoid delays for cached successful auth)
+	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods.
+	// Before the lookup cache: a blocked address or IP+username pair is refused whether or
+	// not the answer is cached (the cache only saves the database work), and a cached
+	// success must not be recorded for an attempt the limiter would have refused.
+	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey); err != nil {
+		// Check if this is a rate limit error
+		var rateLimitErr *server.RateLimitError
+		if errors.As(err, &rateLimitErr) {
+			s.InfoLog("rate limit exceeded",
+				"username", username,
+				"reason", rateLimitErr.Reason,
+				"failure_count", rateLimitErr.FailureCount,
+				"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
+
+			// Track rate limiting as a specific error type
+			metrics.ProtocolErrors.WithLabelValues("imap_proxy", "AUTH", "rate_limited", "client_error").Inc()
+
+			// Send BYE with ALERT to immediately close connection
+			return &imap.Error{
+				Type: imap.StatusResponseTypeBye,
+				Code: imap.ResponseCodeAlert,
+				Text: "Too many failed authentication attempts. Please try again later.",
+			}
+		}
+
+		// Unknown rate limiting error (shouldn't happen, but handle gracefully)
+		metrics.ProtocolErrors.WithLabelValues("imap_proxy", "AUTH", "rate_limited", "client_error").Inc()
+		return err
+	}
+
+	// Check cache
 	// Use server name as cache key to avoid collisions between different proxies/servers
 	if cached, found := s.server.lookupCache.Get(s.server.name, username); found {
 		// Does this login use the same password the entry was cached with?
@@ -950,6 +980,9 @@ func (s *Session) authenticateUser(username, password string) error {
 					// Entry is fresh - likely wrong password attempt
 					s.DebugLog("cache hit - wrong password on fresh positive entry", "username", username)
 					metrics.CacheOperationsTotal.WithLabelValues("get", "hit_positive_wrong_pw").Inc()
+					// Cost what a failed login for an unknown address costs, or the instant
+					// answer shows that this address has an account. (#346)
+					db.DummyVerifyPassword(password)
 					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 					metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 					return consts.ErrAuthenticationFailed
@@ -959,33 +992,6 @@ func (s *Session) authenticateUser(username, password string) error {
 	} else {
 		s.DebugLog("cache miss", "username", username)
 		metrics.CacheOperationsTotal.WithLabelValues("get", "miss").Inc()
-	}
-
-	// Check if the authentication attempt is allowed by the rate limiter using proxy-aware methods
-	if err := s.server.authLimiter.CanAttemptAuthWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey); err != nil {
-		// Check if this is a rate limit error
-		var rateLimitErr *server.RateLimitError
-		if errors.As(err, &rateLimitErr) {
-			s.InfoLog("rate limit exceeded",
-				"username", username,
-				"reason", rateLimitErr.Reason,
-				"failure_count", rateLimitErr.FailureCount,
-				"blocked_until", rateLimitErr.BlockedUntil.Format(time.RFC3339))
-
-			// Track rate limiting as a specific error type
-			metrics.ProtocolErrors.WithLabelValues("imap_proxy", "AUTH", "rate_limited", "client_error").Inc()
-
-			// Send BYE with ALERT to immediately close connection
-			return &imap.Error{
-				Type: imap.StatusResponseTypeBye,
-				Code: imap.ResponseCodeAlert,
-				Text: "Too many failed authentication attempts. Please try again later.",
-			}
-		}
-
-		// Unknown rate limiting error (shouldn't happen, but handle gracefully)
-		metrics.ProtocolErrors.WithLabelValues("imap_proxy", "AUTH", "rate_limited", "client_error").Inc()
-		return err
 	}
 
 	// Parse username to check for master username or token suffix
@@ -1030,9 +1036,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	// - For master username: sends base address to get routing info (password already validated)
 	// - For others: sends full username (may contain token) for remotelookup authentication
 	if s.server.connManager.HasRouting() {
-		// Extract client IP from remote address (remove port)
-		clientIP, _ := server.GetHostPortFromAddr(remoteAddr)
-		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithClientIP(ctx, usernameForRemoteLookup, password, clientIP, masterAuthValidated)
+		routingInfo, authResult, err := s.server.connManager.AuthenticateAndRouteWithClientIP(ctx, usernameForRemoteLookup, password, realClientIP, masterAuthValidated)
 
 		// Log remotelookup response with all details
 		backend := "none"
@@ -1304,6 +1308,7 @@ func (s *Session) connectToBackend() error {
 	routeResult, err := proxy.DetermineRoute(proxy.RouteParams{
 		Ctx:                   s.ctx,
 		Username:              s.username,
+		ClientIP:              server.GetRealClientIP(s.clientConn, s.proxyInfo),
 		Protocol:              "imap",
 		IsRemoteLookupAccount: s.isRemoteLookupAccount,
 		RoutingInfo:           s.routingInfo,
@@ -1348,15 +1353,8 @@ func (s *Session) connectToBackend() error {
 		s.routingInfo.ProxySessionID = s.sessionID
 	}
 
-	// Use real client IP from PROXY protocol if available
-	var clientHost string
-	var clientPort int
-	if s.proxyInfo != nil && s.proxyInfo.SrcIP != "" {
-		clientHost = s.proxyInfo.SrcIP
-		clientPort = s.proxyInfo.SrcPort
-	} else {
-		clientHost, clientPort = server.GetHostPortFromAddr(s.clientConn.RemoteAddr())
-	}
+	// The backend's PROXY header names the real client (the incoming PROXY header's source).
+	clientHost, clientPort := server.GetRealClientAddr(s.clientConn, s.proxyInfo)
 	serverHost, serverPort := server.GetHostPortFromAddr(s.clientConn.LocalAddr())
 	backendConn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,

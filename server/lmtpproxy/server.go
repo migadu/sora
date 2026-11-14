@@ -275,7 +275,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		lookupCacheConfig = &defaultConfig
 	}
 
-	if lookupCacheConfig.Enabled {
+	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
 		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
 		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
 		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()

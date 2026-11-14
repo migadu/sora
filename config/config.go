@@ -71,7 +71,9 @@ type DatabaseConfig struct {
 	PoolTypeOverride string                  `toml:"-"`                 // Internal: Override pool type in logs (not in config file)
 	// Internal (not in config file): with Read unset, serve reads from the write pool
 	// instead of opening a dedicated read pool to the same host. The resilient layer sets
-	// it for every host that does not serve both reads and writes.
+	// it for read replicas, and for write hosts when [database.read] is configured: those
+	// serve reads only while no replica is healthy, or in sora-admin, which skips the
+	// replicas, and then the reads share the one pool with the writes.
 	ReadsShareWritePool bool `toml:"-"`
 }
 
@@ -231,28 +233,28 @@ type ClusterConfig struct {
 	Affinity          ClusterAffinityConfig      `toml:"affinity"`             // Server affinity configuration
 }
 
+// splitClusterAddr splits addr into host and port. addr is a host or IP address,
+// IPv6 bare or bracketed ("2001:db8::40", "[2001:db8::40]"), with an optional
+// port ("10.0.0.40:7946", "[2001:db8::40]:7946"). port is "" when addr has none.
+func splitClusterAddr(addr string) (host, port string) {
+	if h, p, err := net.SplitHostPort(addr); err == nil {
+		return h, p
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]"), ""
+}
+
 // GetBindAddr returns the bind address by parsing the addr field
 func (c *ClusterConfig) GetBindAddr() string {
-	if c.Addr == "" {
-		return ""
-	}
-	// Parse addr to extract just the IP (not port)
-	if strings.Contains(c.Addr, ":") {
-		parts := strings.Split(c.Addr, ":")
-		return parts[0]
-	}
-	return c.Addr
+	host, _ := splitClusterAddr(c.Addr)
+	return host
 }
 
 // GetBindPort returns the bind port from addr or the port field
 func (c *ClusterConfig) GetBindPort() int {
 	// If addr contains a port, use that
-	if c.Addr != "" && strings.Contains(c.Addr, ":") {
-		parts := strings.Split(c.Addr, ":")
-		if len(parts) == 2 {
-			if port, err := strconv.Atoi(parts[1]); err == nil {
-				return port
-			}
+	if _, p := splitClusterAddr(c.Addr); p != "" {
+		if port, err := strconv.Atoi(p); err == nil {
+			return port
 		}
 	}
 
@@ -583,10 +585,9 @@ type AuthRateLimiterConfig struct {
 // multiplier. Zero means "use the default" (see applyAuthRateLimitDefaults); a negative
 // value has no meaning, and the limiter does not read it consistently
 // (max_attempts_per_ip = -1 blocked an address at its first failure on one path and
-// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check;
-// the limiter converts the multiplied delay to a time.Duration before capping it at
-// max_delay, and that conversion is platform-dependent for them (on amd64 +Inf becomes
-// a negative delay, which switches progressive delays off).
+// disabled the IP block on another). TOML accepts nan and inf, which pass a sign check
+// but are no growth factor. Any finite multiplier is safe: the limiter caps the
+// product at max_delay before converting it to a time.Duration.
 func (c *AuthRateLimiterConfig) Validate() error {
 	v := reflect.ValueOf(c).Elem()
 	for i := 0; i < v.NumField(); i++ {
@@ -862,7 +863,7 @@ type RemoteLookupCircuitBreakerConfig struct {
 	Interval     string  `toml:"interval"`      // Time before resetting failure counts in closed state (default: "0s" - never reset)
 	Timeout      string  `toml:"timeout"`       // Time before transitioning from open to half-open (default: "30s")
 	FailureRatio float64 `toml:"failure_ratio"` // Failure ratio threshold to open circuit (0.0-1.0, default: 0.6)
-	MinRequests  int     `toml:"min_requests"`  // Minimum requests before evaluating failure ratio (default: 3)
+	MinRequests  int     `toml:"min_requests"`  // Minimum completed requests before evaluating failure ratio (default: 3)
 }
 
 // RemoteLookupTransportConfig holds HTTP transport configuration for remote_lookup connection pooling and timeouts
@@ -940,7 +941,7 @@ func (c *RemoteLookupCircuitBreakerConfig) GetFailureRatio() float64 {
 	return c.FailureRatio
 }
 
-// GetMinRequests returns the minimum requests before evaluating failure ratio
+// GetMinRequests returns the minimum completed requests before evaluating failure ratio
 func (c *RemoteLookupCircuitBreakerConfig) GetMinRequests() uint32 {
 	if c.MinRequests <= 0 {
 		return 3 // Default: 3 requests
@@ -1344,7 +1345,7 @@ func (s *SieveConfig) GetMaxExecutionTime() time.Duration {
 // restarts and prevent thundering herd on the PostgreSQL database.
 type AuthCacheConfig struct {
 	Enabled         bool   `toml:"enabled"`          // Enable persistent auth cache (default: false)
-	Path            string `toml:"path"`             // SQLite database path (default: "/tmp/sora/auth_cache.db")
+	Path            string `toml:"path"`             // SQLite database path (default: DefaultAuthCachePath)
 	MaxAge          string `toml:"max_age"`          // Max age for cached entries (default: "24h")
 	CleanupInterval string `toml:"cleanup_interval"` // How often to purge old entries (default: "1h")
 	PurgeUnused     string `toml:"purge_unused"`     // Purge entries unused for this duration (default: "168h" = 7 days)
@@ -1510,6 +1511,20 @@ func (c *Config) GetBcryptCost() int {
 	return cost
 }
 
+// Default local paths. Nothing sora must keep across a restart defaults to /tmp: a
+// staged upload is the only copy of its message body until it reaches S3, and /tmp is
+// emptied at boot on most systems and on every stop under systemd's PrivateTmp=. The
+// directories match dist/sora.service (/var/spool/sora, CacheDirectory=sora).
+const (
+	DefaultUploaderPath   = "/var/spool/sora/uploads"
+	DefaultLocalCachePath = "/var/cache/sora/cache"
+	DefaultAuthCachePath  = "/var/cache/sora/auth_cache.db"
+
+	// LegacyDefaultUploaderPath is the [uploader] path default of earlier releases.
+	// Bodies a node staged there are stranded if it starts with the new default.
+	LegacyDefaultUploaderPath = "/tmp/sora/uploads"
+)
+
 // NewDefaultConfig creates a Config struct with default values.
 func NewDefaultConfig() Config {
 	return Config{
@@ -1567,7 +1582,7 @@ func NewDefaultConfig() Config {
 		LocalCache: LocalCacheConfig{
 			Capacity:           "1gb",
 			MaxObjectSize:      "5mb",
-			Path:               "/tmp/sora/cache",
+			Path:               DefaultLocalCachePath,
 			MetricsInterval:    "5m",
 			MetricsRetention:   "30d",
 			PurgeInterval:      "12h",
@@ -1576,6 +1591,9 @@ func NewDefaultConfig() Config {
 			WarmupMessageCount: 50,
 			WarmupMailboxes:    []string{"INBOX"},
 			WarmupAsync:        true,
+		},
+		AuthCache: AuthCacheConfig{
+			Path: DefaultAuthCachePath,
 		},
 		Metadata: MetadataConfig{
 			MaxEntrySize:         65536,   // 64KB per entry
@@ -1598,11 +1616,19 @@ func NewDefaultConfig() Config {
 			TrustedNetworks: nil,
 		},
 		Uploader: UploaderConfig{
-			Path:          "/tmp/sora/uploads",
+			Path:          DefaultUploaderPath,
 			BatchSize:     10,
 			Concurrency:   20,
 			MaxAttempts:   DefaultUploaderMaxAttempts,
 			RetryInterval: "30s",
+		},
+		Cluster: ClusterConfig{
+			// Only read with [cluster] enabled; on by default as documented.
+			RateLimitSync: ClusterRateLimitSyncConfig{
+				Enabled:           true,
+				SyncBlocks:        true,
+				SyncFailureCounts: true,
+			},
 		},
 	}
 }
@@ -2361,6 +2387,9 @@ func (s *ServerConfig) IsEnabled() bool {
 	return s.Type != "" && s.Name != "" && s.Addr != ""
 }
 
+// ServerTypes are the [[server]] types the configuration accepts.
+var ServerTypes = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api", "user_api_proxy"}
+
 // ValidateServerConfig validates a server configuration
 func (s *ServerConfig) Validate() error {
 	if s.Type == "" {
@@ -2373,16 +2402,15 @@ func (s *ServerConfig) Validate() error {
 		return fmt.Errorf("server address is required")
 	}
 
-	validTypes := []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "metrics", "http_admin_api", "http_user_api", "user_api_proxy"}
 	isValidType := false
-	for _, validType := range validTypes {
+	for _, validType := range ServerTypes {
 		if s.Type == validType {
 			isValidType = true
 			break
 		}
 	}
 	if !isValidType {
-		return fmt.Errorf("invalid server type '%s', must be one of: %s", s.Type, strings.Join(validTypes, ", "))
+		return fmt.Errorf("invalid server type '%s', must be one of: %s", s.Type, strings.Join(ServerTypes, ", "))
 	}
 
 	// Master credentials: a configured master username with an EMPTY master
@@ -2583,6 +2611,9 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		if s.Type == "metrics" && s.TLS {
 			logger("WARNING: Server %s (type: metrics) has 'tls' configured, but the metrics endpoint is always served over plain HTTP; terminate TLS in front of it and restrict access with 'allowed_hosts'/'api_key'", s.Name)
 		}
+		if s.Type == "metrics" && s.ProxyProtocol {
+			logger("WARNING: Server %s (type: metrics) has 'proxy_protocol' configured, but the metrics endpoint does not read PROXY protocol headers; it is ignored, and 'allowed_hosts' matches the connecting host", s.Name)
+		}
 	}
 }
 
@@ -2610,7 +2641,9 @@ func (c *Config) ProxyProtocolListenersMissingTrust() []string {
 	}
 	var names []string
 	for _, s := range c.GetAllServers() {
-		if s.ProxyProtocol {
+		// The metrics endpoint does not read PROXY headers (its proxy_protocol is warned
+		// about and ignored), so no peer can spoof a client IP through it.
+		if s.ProxyProtocol && s.Type != "metrics" {
 			names = append(names, s.Name)
 		}
 	}

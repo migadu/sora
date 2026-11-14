@@ -37,6 +37,16 @@ func TestProxyProtocolListenersMissingTrust(t *testing.T) {
 		}
 	})
 
+	// The metrics endpoint does not read PROXY headers, so its proxy_protocol is warned
+	// about and ignored instead (#272); it must not demand trusted_networks.
+	t.Run("proxy_protocol on metrics + empty trusted_networks => ok", func(t *testing.T) {
+		cfg := &Config{}
+		cfg.DynamicServers = []ServerConfig{{Type: "metrics", Name: "metrics", Addr: ":9090", ProxyProtocol: true}}
+		if got := cfg.ProxyProtocolListenersMissingTrust(); got != nil {
+			t.Fatalf("expected nil for a listener that does not read PROXY headers, got %v", got)
+		}
+	})
+
 	t.Run("no proxy_protocol + empty trusted_networks => ok", func(t *testing.T) {
 		cfg := &Config{}
 		cfg.DynamicServers = []ServerConfig{proxyServer("imap-plain", false)}

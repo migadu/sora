@@ -102,6 +102,15 @@ type Counts struct {
 	ConsecutiveFailures  uint32
 }
 
+// Results is how many of the counted requests have completed, successfully or not.
+// Requests also counts the requests still in flight, which have no result yet, so a
+// failure ratio is taken over Results: against a service that fails slowly, about half
+// of Requests are requests that have not failed yet, and a ratio over Requests stays
+// near 0.5 while every result is a failure.
+func (c Counts) Results() uint32 {
+	return c.TotalSuccesses + c.TotalFailures
+}
+
 func (c *Counts) onRequest() {
 	c.Requests++
 }
@@ -383,8 +392,9 @@ func DefaultSettings(name string) Settings {
 		Interval:    10 * time.Second,
 		Timeout:     30 * time.Second,
 		ReadyToTrip: func(counts Counts) bool {
-			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-			return counts.Requests >= 3 && failureRatio >= 0.6
+			results := counts.Results()
+			failureRatio := float64(counts.TotalFailures) / float64(results)
+			return results >= 3 && failureRatio >= 0.6
 		},
 		OnStateChange: func(name string, from State, to State) {
 			fmt.Fprintf(logger.Stdout(), "CircuitBreaker '%s' changed from %s to %s\n", name, from, to)

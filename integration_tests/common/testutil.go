@@ -876,8 +876,8 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 			Endpoint:          opts.SpamTrainingEndpoint,
 			AuthToken:         opts.SpamTrainingToken,
 			Timeout:           "10s",
-			MaxMessageSize:    "10MB",
-			MaxAttachmentSize: "5MB",
+			MaxMessageSize:    "10mb",
+			MaxAttachmentSize: "5mb",
 			Async:             true,
 			CircuitBreaker: config.SpamTrainingCircuitBreakerConfig{
 				Threshold:   opts.SpamTrainingCircuitThreshold,
@@ -946,6 +946,9 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 			}
 		case <-time.After(1 * time.Second):
 			// Timeout waiting for server to shut down
+		}
+		if spamTrainingClient != nil {
+			spamTrainingClient.Close() // stops its worker goroutines
 		}
 		// Clean up temporary directory
 		os.RemoveAll(tempDir)

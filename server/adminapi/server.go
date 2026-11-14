@@ -751,7 +751,7 @@ type ConnectionInfo struct {
 	LocalCount int       `json:"local_count"` // the account's sessions on this tracker
 	TotalCount int       `json:"total_count"` // LocalCount plus the sessions other nodes report for the protocol through gossip
 	LastUpdate time.Time `json:"last_update"`
-	Email      string    `json:"email"` // address the sessions logged in with
+	Email      string    `json:"email"` // address of the session that created the entry (the recipient on an LMTP proxy)
 }
 
 // UserConnectionInfo is one entry of GET /admin/connections/user/{email}. Unlike
@@ -1790,60 +1790,22 @@ func (s *Server) handleHealthStatusByComponent(w http.ResponseWriter, r *http.Re
 
 	ctx := r.Context()
 
-	// Parse query parameters for history
-	showHistory := r.URL.Query().Get("history") == "true"
-	sinceParam := r.URL.Query().Get("since")
-	limitParam := r.URL.Query().Get("limit")
-
-	if showHistory {
-		// Get historical health status
-		var since time.Time
-		if sinceParam != "" {
-			var err error
-			since, err = time.Parse(time.RFC3339, sinceParam)
-			if err != nil {
-				s.writeError(w, http.StatusBadRequest, "Invalid since parameter format (use RFC3339)")
-				return
-			}
-		} else {
-			since = time.Now().Add(-24 * time.Hour) // Default to last 24 hours
-		}
-
-		limit := 100
-		if limitParam != "" {
-			if l, err := strconv.Atoi(limitParam); err == nil && l > 0 {
-				limit = l
-			}
-		}
-
-		history, err := s.rdb.GetHealthHistoryWithRetry(ctx, hostname, component, since, limit)
-		if err != nil {
-			logger.Warn("HTTP API: Error getting health history", "name", s.name, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to get health history")
-			return
-		}
-
-		s.writeJSON(w, http.StatusOK, map[string]any{
-			"hostname":  hostname,
-			"component": component,
-			"history":   history,
-			"count":     len(history),
-			"since":     since,
-		})
-	} else {
-		// Get current health status
-		status, err := s.rdb.GetHealthStatusWithRetry(ctx, hostname, component)
-		if err != nil {
-			logger.Warn("HTTP API: Error getting health status", "name", s.name, "hostname", hostname, "component", component, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "Failed to get health status")
-			return
-		}
-		if status == nil {
-			s.writeError(w, http.StatusNotFound, "Health status not found")
-			return
-		}
-		s.writeJSON(w, http.StatusOK, status)
+	// The table keeps only the current row, not historical transitions.
+	if r.URL.Query().Get("history") == "true" {
+		s.writeError(w, http.StatusBadRequest, "Health history is not recorded; request the current status without history=true")
+		return
 	}
+	status, err := s.rdb.GetHealthStatusWithRetry(ctx, hostname, component)
+	if err != nil {
+		logger.Warn("HTTP API: Error getting health status", "name", s.name, "hostname", hostname, "component", component, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "Failed to get health status")
+		return
+	}
+	if status == nil {
+		s.writeError(w, http.StatusNotFound, "Health status not found")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, status)
 }
 
 // handleProxyBackends returns backend health status for all proxy servers
@@ -2043,8 +2005,7 @@ func (s *Server) handleAuthBlocked(w http.ResponseWriter, r *http.Request) {
 // Message restoration handlers
 
 func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Request) {
-	// Extract email from path: /admin/accounts/{email}/messages/deleted
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/deleted")
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	// Parse query parameters
@@ -2117,8 +2078,7 @@ func (s *Server) handleListDeletedMessages(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	// Extract email from path: /admin/accounts/{email}/messages/restore
-	email := extractPathParam(r.URL.Path, "/admin/accounts/", "/messages/restore")
+	email := r.PathValue("email")
 	ctx := r.Context()
 
 	var req struct {

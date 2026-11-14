@@ -199,7 +199,9 @@ type ServerOptions struct {
 	MaxConnectionsPerIP int              // Maximum connections per client IP (0 = unlimited, cluster-wide if ClusterManager provided)
 	TrustedNetworks     []string         // CIDR blocks for trusted networks that bypass per-IP limits
 	ListenBacklog       int              // TCP listen backlog size (0 = system default; recommended: 4096-8192)
-	ClusterManager      *cluster.Manager // Optional: enables cluster-wide per-IP limiting
+	ClusterManager      *cluster.Manager // Optional: shares per-IP connection counts and auth rate limits with the cluster
+
+	ClusterRateLimitSync config.ClusterRateLimitSyncConfig // [cluster.rate_limit_sync]; read only with ClusterManager
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
@@ -322,6 +324,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize authentication rate limiter with trusted networks
 	authLimiter := server.NewAuthRateLimiterWithTrustedNetworks("IMAP-PROXY", opts.Name, hostname, opts.AuthRateLimit, opts.TrustedProxies)
 	server.RegisterRateLimiter("imap_proxy", opts.Name, authLimiter)
+	authLimiter.JoinCluster(opts.ClusterManager, opts.ClusterRateLimitSync)
 
 	// Initialize connection limiter with trusted networks
 	var limiter *server.ConnectionLimiter
@@ -372,7 +375,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Parse positive revalidation window
 	positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault()
 
-	if lookupCacheConfig.Enabled {
+	if lookupCacheConfig.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
 		positiveTTL := lookupCacheConfig.GetPositiveTTLWithDefault()
 		negativeTTL := lookupCacheConfig.GetNegativeTTLWithDefault()
 		cleanupInterval := lookupCacheConfig.GetCleanupIntervalWithDefault()

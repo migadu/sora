@@ -128,6 +128,12 @@ Examples:
 		}
 	}
 
+	if err := cfg.Relay.Validate(); err != nil {
+		fmt.Printf("[FAIL] [relay] validation failed:\n")
+		fmt.Printf("   %v\n", err)
+		hasErrors = true
+	}
+
 	// Check for server name conflicts
 	serverNames := make(map[string]bool)
 	serverAddresses := make(map[string]string) // addr -> server name

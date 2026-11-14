@@ -112,11 +112,18 @@ func TestUserAPI_SharedMailbox_RequiresReadRight(t *testing.T) {
 	}
 
 	// The mailbox is visible in the listing (that's what 'l' grants), but its counts
-	// must be hidden (shown as 0) rather than leaking the real message count.
-	if total, found := h2MailboxTotal(t, ts, client, token, sharedMailbox); !found {
+	// must be hidden (shown as 0) rather than leaking the real message count. So must
+	// uid_next and uid_validity: RFC 4314 §4 requires "r" for STATUS, and uid_next moves
+	// with every delivery.
+	if mb, found := h2MailboxEntry(t, ts, client, token, sharedMailbox); !found {
 		t.Errorf("shared mailbox should be visible in listing with 'l' right")
-	} else if total != 0 {
-		t.Errorf("LEAK: lookup-only grantee saw message count %d (expected hidden 0)", total)
+	} else {
+		if mb.Total != 0 {
+			t.Errorf("LEAK: lookup-only grantee saw message count %d (expected hidden 0)", mb.Total)
+		}
+		if mb.UIDNext != 0 || mb.UIDValidity != 0 {
+			t.Errorf("LEAK: lookup-only grantee saw uid_next %d, uid_validity %d (expected hidden 0)", mb.UIDNext, mb.UIDValidity)
+		}
 	}
 
 	// === Phase 2: grant 'r' — the grantee may now read (fix must not over-block). ===
@@ -128,8 +135,17 @@ func TestUserAPI_SharedMailbox_RequiresReadRight(t *testing.T) {
 	} else if !strings.Contains(body, secretSubject) {
 		t.Errorf("reader with 'r' should see message subject %q, body: %s", secretSubject, body)
 	}
-	if total, found := h2MailboxTotal(t, ts, client, token, sharedMailbox); !found || total != 1 {
-		t.Errorf("reader with 'r' should see the real count (1); found=%v total=%d", found, total)
+	mb, found := h2MailboxEntry(t, ts, client, token, sharedMailbox)
+	if !found || mb.Total != 1 {
+		t.Errorf("reader with 'r' should see the real count (1); found=%v total=%d", found, mb.Total)
+	}
+	shared, err := rdb.GetMailboxByNameWithRetry(ctx, ownerID, sharedMailbox)
+	if err != nil {
+		t.Fatalf("owner's shared mailbox: %v", err)
+	}
+	if mb.UIDNext != 2 || mb.UIDValidity != shared.UIDValidity {
+		t.Errorf("reader with 'r': uid_next %d, uid_validity %d; want 2 (one message appended), %d",
+			mb.UIDNext, mb.UIDValidity, shared.UIDValidity)
 	}
 }
 
@@ -172,29 +188,26 @@ func h2Get(t *testing.T, ts *httptest.Server, client *http.Client, token, path s
 	return resp.StatusCode, string(b)
 }
 
-// h2MailboxTotal fetches /user/mailboxes and returns the total count reported for
-// the named mailbox (and whether it was present in the listing at all).
-func h2MailboxTotal(t *testing.T, ts *httptest.Server, client *http.Client, token, name string) (int, bool) {
+// h2MailboxEntry fetches /user/mailboxes and returns the entry reported for the named
+// mailbox (and whether it was present in the listing at all).
+func h2MailboxEntry(t *testing.T, ts *httptest.Server, client *http.Client, token, name string) (listedMailbox, bool) {
 	t.Helper()
 	code, body := h2Get(t, ts, client, token, "/user/mailboxes")
 	if code != http.StatusOK {
 		t.Fatalf("list mailboxes: expected 200, got %d (%s)", code, body)
 	}
 	var out struct {
-		Mailboxes []struct {
-			Name  string `json:"name"`
-			Total int    `json:"total"`
-		} `json:"mailboxes"`
+		Mailboxes []listedMailbox `json:"mailboxes"`
 	}
 	if err := json.Unmarshal([]byte(body), &out); err != nil {
 		t.Fatalf("decode mailboxes: %v (body: %s)", err, body)
 	}
 	for _, mb := range out.Mailboxes {
 		if mb.Name == name {
-			return mb.Total, true
+			return mb, true
 		}
 	}
-	return 0, false
+	return listedMailbox{}, false
 }
 
 // newUserAPITestServer stands up a User API HTTP server backed by rdb.
