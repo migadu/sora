@@ -42,6 +42,7 @@ func TestDatabaseBreakerIsSuccessful(t *testing.T) {
 		{"ErrMailboxNotFound", consts.ErrMailboxNotFound, true, true},
 		{"pgx.ErrNoRows", pgx.ErrNoRows, true, true},
 		{"pgx.ErrNoRows wrapped", fmt.Errorf("lookup: %w", pgx.ErrNoRows), true, true},
+		{"invalid account request", fmt.Errorf("%w: invalid email address", db.ErrInvalidAccountRequest), true, true},
 		{"search result limit", db.ErrSearchTooManyResults, true, false},
 		{"wrapped search result limit", fmt.Errorf("search: %w", db.ErrSearchTooManyResults), true, false},
 

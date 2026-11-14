@@ -215,6 +215,7 @@ func isQuerySuccessful(err error) bool {
 		errors.Is(err, consts.ErrMessageNotAvailable) ||
 		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
 		errors.Is(err, consts.ErrAccountAlreadyExists) ||
+		errors.Is(err, db.ErrInvalidAccountRequest) ||
 		errors.Is(err, consts.ErrNotPermitted) ||
 		errors.Is(err, consts.ErrDBNotFound) ||
 		errors.Is(err, consts.ErrMessageExists) ||
@@ -241,6 +242,7 @@ func isWriteSuccessful(err error) bool {
 		errors.Is(err, consts.ErrMessageNotAvailable) ||
 		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
 		errors.Is(err, consts.ErrAccountAlreadyExists) ||
+		errors.Is(err, db.ErrInvalidAccountRequest) ||
 		errors.Is(err, consts.ErrNotPermitted) ||
 		errors.Is(err, consts.ErrDBNotFound) ||
 		errors.Is(err, consts.ErrDBUniqueViolation) ||
@@ -534,6 +536,7 @@ func (rd *ResilientDatabase) isBusinessLogicError(err error) bool {
 		errors.Is(err, consts.ErrMessageNotAvailable) ||
 		errors.Is(err, consts.ErrMailboxAlreadyExists) ||
 		errors.Is(err, consts.ErrAccountAlreadyExists) ||
+		errors.Is(err, db.ErrInvalidAccountRequest) ||
 		errors.Is(err, consts.ErrNotPermitted) ||
 		errors.Is(err, consts.ErrDBNotFound) ||
 		errors.Is(err, consts.ErrDBUniqueViolation) ||
