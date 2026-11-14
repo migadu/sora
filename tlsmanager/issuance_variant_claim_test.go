@@ -85,7 +85,7 @@ func TestFailedRenewalDoesNotLeaveCacheMissOrderReference(t *testing.T) {
 	}
 	// The newOrder payload identifies the domain, not RSA/ECDSA. A sibling RSA
 	// renewal can arrive before this ECDSA cache miss's order, and fail later.
-	failedRenewal, err := nodeA.refuseOrderIssuance(domain)
+	failedRenewal, err := nodeA.refuseOrderIssuance(ctx, domain)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestLateNewOrderFailureDoesNotDropNewClaimReference(t *testing.T) {
 	ctx := context.Background()
 	fence := newFakeFence()
 	nodeA, nodeB := splitBrainNode(fence), splitBrainNode(fence)
-	oldRef, err := nodeA.refuseOrderIssuance(domain)
+	oldRef, err := nodeA.refuseOrderIssuance(ctx, domain)
 	if err != nil {
 		t.Fatal(err)
 	}

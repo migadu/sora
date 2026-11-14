@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -56,25 +57,64 @@ type Manager struct {
 	// partition elects a leader on both sides and each believes it is the only one.
 	certFence      CertificateFence
 	claimMu        sync.Mutex
-	issuanceClaims map[string]issuanceClaim // claims held here, by domain
+	issuanceClaims map[string]issuanceClaim // claims held and issuance work running here, by domain
 }
 
-// issuanceClaim is a claim this node holds on the certificate fence.
-// autocert orders ECDSA ("<domain>") and RSA ("<domain>+rsa") certificates
-// under the same domain; missedKeys and orders keep a fast variant's
-// Put from releasing the domain's claim while the sibling variant still orders.
+// issuanceClaim is this node's issuance state for one domain: the claim it holds on
+// the certificate fence, if any, and the work it started that a Put completes.
+// autocert orders ECDSA ("<domain>") and RSA ("<domain>+rsa") certificates under the
+// same domain; missedKeys and orders keep a fast variant's Put from releasing the
+// domain's claim while the sibling variant still orders.
+//
+// The work is not tied to the claim it started under. A claim lapses after
+// issuanceClaimTTL whatever still runs under it, so an order started late under one
+// can still be running when its sibling's order takes a fresh claim, and neither
+// newOrder nor Put says which claim an order ran under. Each reference therefore
+// lasts until its own autocert exchange is over, across claims.
 type issuanceClaim struct {
-	release    func(context.Context)
-	expires    time.Time           // when the fence lets the claim go by itself; no later than its own expiry
-	missedKeys map[string]struct{} // cache keys that missed Get and have not yet completed Put
-	orders     int                 // accepted newOrder attempts not yet completed by Put
+	release    func(context.Context) // nil while this node holds no claim
+	expires    time.Time             // when the fence lets the claim go by itself; no later than its own expiry
+	missedKeys map[string]time.Time  // cache keys that missed Get and have not yet completed Put, until their exchange ends
+	orders     []time.Time           // accepted newOrder attempts not yet completed by Put, by when their exchange ends
 }
 
-// issuanceOrderRef records the reference taken by one newOrder attempt. A failed
-// attempt must undo its own reference without touching a newer claim.
+// issuanceOrderRef records the reference taken by one newOrder attempt, so a failed
+// attempt can undo its own reference.
 type issuanceOrderRef struct {
-	domain  string
-	expires time.Time
+	domain string
+	until  time.Time
+}
+
+// prune forgets work whose exchange is over: it can no longer store a certificate.
+func (c *issuanceClaim) prune(now time.Time) {
+	for key, until := range c.missedKeys {
+		if !now.Before(until) {
+			delete(c.missedKeys, key)
+		}
+	}
+	c.orders = slices.DeleteFunc(c.orders, func(until time.Time) bool { return !now.Before(until) })
+}
+
+// dropOrder forgets one order whose exchange ends at until.
+func (c *issuanceClaim) dropOrder(until time.Time) {
+	if i := slices.IndexFunc(c.orders, until.Equal); i >= 0 {
+		c.orders = slices.Delete(c.orders, i, i+1)
+	}
+}
+
+func (c *issuanceClaim) busy() bool {
+	return len(c.missedKeys) > 0 || len(c.orders) > 0
+}
+
+// exchangeEnd is when work started under ctx - a cache miss or an order - can no longer
+// store a certificate. autocert runs each exchange, from the cache read through the
+// order to the Put, under one context with a deadline: five minutes for a handshake,
+// ten for a renewal.
+func exchangeEnd(ctx context.Context) time.Time {
+	if deadline, ok := ctx.Deadline(); ok {
+		return deadline.Add(issuanceStoreGrace)
+	}
+	return time.Now().Add(issuanceClaimTTL)
 }
 
 // CertificateFence is a store that cannot be partitioned into two writable copies, used
@@ -90,6 +130,9 @@ const (
 	// whole ACME exchange - order, challenge, validation, finalize - or the claim lapses
 	// while its holder is still working and a second node starts a duplicate order.
 	issuanceClaimTTL = 10 * time.Minute
+	// issuanceStoreGrace covers the Put that follows an exchange which succeeded just
+	// before its context ended; the cache gives up on that same context.
+	issuanceStoreGrace = time.Minute
 	// issuanceFenceTimeout bounds the fence query itself. A TLS handshake is waiting on
 	// it, so it must fail fast rather than hold the handshake open.
 	issuanceFenceTimeout = 3 * time.Second
@@ -107,10 +150,13 @@ func (m *Manager) SetCertificateFence(fence CertificateFence) {
 // holdIssuance reports whether this node may order a certificate for domain, taking the
 // cluster-wide claim if one is available.
 func (m *Manager) holdIssuance(domain string) error {
-	return m.holdIssuanceWith(domain, "", nil)
+	return m.holdIssuanceWith(domain, "", time.Time{}, nil)
 }
 
-func (m *Manager) holdIssuanceWith(domain, cacheKey string, orderRef *issuanceOrderRef) error {
+// holdIssuanceWith is holdIssuance for work that a Put will complete: a cache miss on
+// cacheKey, or the order whose reference it returns in orderRef. until is when that
+// work's exchange ends.
+func (m *Manager) holdIssuanceWith(domain, cacheKey string, until time.Time, orderRef *issuanceOrderRef) error {
 	if m.certFence == nil {
 		// No shared store - a proxy-only node has no database. Gossip leadership is then
 		// the only fence there is, which is the behavior this deployment already had.
@@ -120,18 +166,22 @@ func (m *Manager) holdIssuanceWith(domain, cacheKey string, orderRef *issuanceOr
 	m.claimMu.Lock()
 	defer m.claimMu.Unlock()
 
-	recordRef := func(claim *issuanceClaim) {
+	claim := m.issuanceClaims[domain]
+	claim.prune(time.Now())
+	defer func() { m.storeClaim(domain, claim) }()
+
+	recordRef := func() {
 		if cacheKey != "" {
 			if claim.missedKeys == nil {
-				claim.missedKeys = make(map[string]struct{}, 2)
+				claim.missedKeys = make(map[string]time.Time, 2)
 			}
-			if _, exists := claim.missedKeys[cacheKey]; !exists {
-				claim.missedKeys[cacheKey] = struct{}{}
+			if until.After(claim.missedKeys[cacheKey]) {
+				claim.missedKeys[cacheKey] = until
 			}
 		}
 		if orderRef != nil {
-			*orderRef = issuanceOrderRef{domain: domain, expires: claim.expires}
-			claim.orders++
+			*orderRef = issuanceOrderRef{domain: domain, until: until}
+			claim.orders = append(claim.orders, until)
 		}
 	}
 
@@ -140,14 +190,12 @@ func (m *Manager) holdIssuanceWith(domain, cacheKey string, orderRef *issuanceOr
 	// the claim go, though. It is given back when the certificate is stored, and an order
 	// that fails stores none: autocert retries a failed renewal 30-60 minutes later, by
 	// which time another node may hold the claim, so the retry has to ask the fence.
-	if claim, held := m.issuanceClaims[domain]; held {
-		if time.Now().Before(claim.expires) {
-			recordRef(&claim)
-			m.issuanceClaims[domain] = claim
-			return nil
-		}
-		delete(m.issuanceClaims, domain)
+	if claim.release != nil && time.Now().Before(claim.expires) {
+		recordRef()
+		return nil
 	}
+	// The claim has lapsed, but the work started under it is still running.
+	claim.release = nil
 
 	ctx, cancel := context.WithTimeout(context.Background(), issuanceFenceTimeout)
 	defer cancel()
@@ -161,6 +209,8 @@ func (m *Manager) holdIssuanceWith(domain, cacheKey string, orderRef *issuanceOr
 		// costs rate-limit budget. Availability is the right side to fail to.
 		logger.Warn("TLS: Certificate issuance fence unavailable - ordering without it",
 			"domain", domain, "error", err)
+		// Still this node's work: a claim taken after it must not count its Put as its own.
+		recordRef()
 		return nil
 	}
 	if release == nil {
@@ -168,29 +218,35 @@ func (m *Manager) holdIssuanceWith(domain, cacheKey string, orderRef *issuanceOr
 		return fmt.Errorf("%w: %s (claimed by another node)", errIssuanceDeferred, domain)
 	}
 
-	if m.issuanceClaims == nil {
-		m.issuanceClaims = make(map[string]issuanceClaim)
-	}
-	claim := issuanceClaim{release: release, expires: asked.Add(issuanceClaimTTL)}
-	recordRef(&claim)
-	m.issuanceClaims[domain] = claim
+	claim.release, claim.expires = release, asked.Add(issuanceClaimTTL)
+	recordRef()
 	return nil
 }
 
+// storeClaim records domain's claim, or forgets it once it holds neither the fence nor
+// any work. claimMu must be held.
+func (m *Manager) storeClaim(domain string, claim issuanceClaim) {
+	if claim.release == nil && !claim.busy() {
+		delete(m.issuanceClaims, domain)
+		return
+	}
+	if m.issuanceClaims == nil {
+		m.issuanceClaims = make(map[string]issuanceClaim)
+	}
+	m.issuanceClaims[domain] = claim
+}
+
 // dropFailedOrderRef drops this attempt's reference when newOrder fails.
-// Cache misses still reserve their variants until a Put or expiry. A late
-// failure from an expired claim must not change a newer claim's bookkeeping.
+// Cache misses still reserve their variants until a Put or their exchange ends.
 func (m *Manager) dropFailedOrderRef(ref issuanceOrderRef) {
 	m.claimMu.Lock()
 	defer m.claimMu.Unlock()
 	claim, held := m.issuanceClaims[ref.domain]
-	if !held || !claim.expires.Equal(ref.expires) {
+	if !held {
 		return
 	}
-	if claim.orders > 0 {
-		claim.orders--
-	}
-	m.issuanceClaims[ref.domain] = claim
+	claim.dropOrder(ref.until)
+	m.storeClaim(ref.domain, claim)
 }
 
 // releaseIssuance gives up this node's claim once the order has produced a certificate,
@@ -206,21 +262,31 @@ func (m *Manager) releaseKeyIssuance(domain, cacheKey string) {
 		m.claimMu.Unlock()
 		return
 	}
+	// Finished exchanges first, so that none of them can stand in for this Put's order.
+	claim.prune(time.Now())
 	delete(claim.missedKeys, cacheKey)
 	// Every certificate Put completes an order, whether its variant missed Get
 	// or was renewed. newOrder does not identify the key algorithm, so pairing
 	// attempts with arbitrary misses would miscount retries and mixed variants.
-	if claim.orders > 0 {
-		claim.orders--
+	// Nor does a Put identify the claim its order ran under, so it completes the
+	// order whose exchange ends first. If the Put was in fact a later order's, the
+	// later reference is left for the earlier order's Put: the claim is held too
+	// long at worst, never given away while one of this node's orders still runs.
+	if len(claim.orders) > 0 {
+		claim.dropOrder(slices.MinFunc(claim.orders, time.Time.Compare))
 	}
 
-	if time.Now().Before(claim.expires) && (len(claim.missedKeys) > 0 || claim.orders > 0) {
+	if claim.busy() {
 		m.issuanceClaims[domain] = claim
 		m.claimMu.Unlock()
 		return
 	}
 	delete(m.issuanceClaims, domain)
 	m.claimMu.Unlock()
+
+	if claim.release == nil {
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), issuanceFenceTimeout)
 	defer cancel()
@@ -418,7 +484,9 @@ func (m *Manager) initLetsEncryptProvider() error {
 		// Use Let's Encrypt production directory by default
 		Client: &acme.Client{
 			DirectoryURL: acmeDirectoryURL,
-			HTTPClient:   &http.Client{Transport: &issuanceFence{manager: m, base: http.DefaultTransport}},
+			// No Timeout of its own: a request keeps the context of autocert's exchange,
+			// whose deadline is how long the issuance claim counts the order as running.
+			HTTPClient: &http.Client{Transport: &issuanceFence{manager: m, base: http.DefaultTransport}},
 		},
 	}
 

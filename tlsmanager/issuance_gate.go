@@ -52,7 +52,7 @@ func (g *issuanceGate) Get(ctx context.Context, name string) ([]byte, error) {
 	if !isCertificate {
 		return nil, err
 	}
-	if refusal := g.manager.refuseKeyIssuance(domain, name); refusal != nil {
+	if refusal := g.manager.refuseKeyIssuance(ctx, domain, name); refusal != nil {
 		return nil, refusal
 	}
 
@@ -101,20 +101,24 @@ func (m *Manager) mayIssue() bool {
 // refuseIssuance reports why this node must not order a certificate for domain now, or
 // nil if it may.
 func (m *Manager) refuseIssuance(domain string) error {
-	return m.refuseIssuanceWith(domain, "", nil)
+	return m.refuseIssuanceWith(domain, "", time.Time{}, nil)
 }
 
-func (m *Manager) refuseKeyIssuance(domain, cacheKey string) error {
-	return m.refuseIssuanceWith(domain, cacheKey, nil)
+// refuseKeyIssuance is refuseIssuance for a cache miss on cacheKey, read under the
+// context of the autocert exchange that will order it.
+func (m *Manager) refuseKeyIssuance(ctx context.Context, domain, cacheKey string) error {
+	return m.refuseIssuanceWith(domain, cacheKey, exchangeEnd(ctx), nil)
 }
 
-func (m *Manager) refuseOrderIssuance(domain string) (issuanceOrderRef, error) {
+// refuseOrderIssuance is refuseIssuance for a newOrder sent under ctx, the context of
+// its autocert exchange.
+func (m *Manager) refuseOrderIssuance(ctx context.Context, domain string) (issuanceOrderRef, error) {
 	var ref issuanceOrderRef
-	err := m.refuseIssuanceWith(domain, "", &ref)
+	err := m.refuseIssuanceWith(domain, "", exchangeEnd(ctx), &ref)
 	return ref, err
 }
 
-func (m *Manager) refuseIssuanceWith(domain, cacheKey string, orderRef *issuanceOrderRef) error {
+func (m *Manager) refuseIssuanceWith(domain, cacheKey string, until time.Time, orderRef *issuanceOrderRef) error {
 	if !m.mayIssue() {
 		leader := m.clusterManager.GetLeaderID()
 		// Debug because a waiting handshake arrives here on every poll; the wait itself
@@ -131,7 +135,7 @@ func (m *Manager) refuseIssuanceWith(domain, cacheKey string, orderRef *issuance
 	// Last: leadership above says this node SHOULD issue, the fence says whether it MAY.
 	// Under a partition the check above passes on both sides, because each side elected
 	// its own leader; only one of them can hold the claim.
-	return m.holdIssuanceWith(domain, cacheKey, orderRef)
+	return m.holdIssuanceWith(domain, cacheKey, until, orderRef)
 }
 
 // awaitIssuedCertificate waits, bounded, for a certificate ordered by the cluster leader
@@ -189,14 +193,15 @@ func (f *issuanceFence) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Every order takes the issuance claim, whichever path started it. A first issuance
 	// already holds it from the cache miss (the claim is re-entrant); a renewal reads a
 	// certificate that is still in the cache and reaches no miss, so this is where it
-	// takes the claim. It is given back when the certificate is stored.
+	// takes the claim. It is given back when the certificate is stored, or counted
+	// until the exchange that req's context belongs to ends.
 	domains, err := orderedDomains(req)
 	if err != nil {
 		return nil, err
 	}
 	var claimed []issuanceOrderRef
 	for _, domain := range domains {
-		ref, refusal := f.manager.refuseOrderIssuance(domain)
+		ref, refusal := f.manager.refuseOrderIssuance(req.Context(), domain)
 		if refusal != nil {
 			for _, d := range claimed {
 				f.manager.dropFailedOrderRef(d)
