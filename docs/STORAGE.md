@@ -494,9 +494,10 @@ Warmup preloads recent mail when a user logs in over IMAP, so that the first scr
 messages opens quickly.
 
 - With `enable_warmup = true` (the default), an IMAP login queues a warmup for the account.
-  It fetches the newest `warmup_message_count` messages (default 50) of each mailbox in
-  `warmup_mailboxes` (default `["INBOX"]`) from S3 into the cache, skipping bodies already
-  cached.
+  It fetches the newest `warmup_message_count` uploaded messages (default 50) of each mailbox
+  in `warmup_mailboxes` (default `["INBOX"]`) from S3 into the cache, skipping bodies already
+  cached. A message whose upload is still pending is not in S3 yet and is not counted; the
+  uploader moves its body into the cache of the node that stored it once it is uploaded.
 - One account is warmed at most once every `warmup_interval` (default 24 hours) per server.
   Each IMAP server saves the time of each warmup in its own `.sora_warmup_state.<server hash>`
   (the lowercase SHA-256 of its name) at shutdown and reads it back at startup, so a restart does not
