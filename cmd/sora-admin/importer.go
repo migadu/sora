@@ -2202,7 +2202,24 @@ func (i *Importer) insertBatchToDB(uploaded []uploadedMsg) ([]markedMessage, err
 
 // insertBatchToDBWithTransaction inserts all uploaded messages in a SINGLE transaction
 // This is faster (20x) but less resilient - if one message fails, entire batch rolls back
-func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]markedMessage, error) {
+func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) (_ []markedMessage, err error) {
+	// When the batch is not stored, each of its messages is reported once, here. A
+	// message already reported where it was found (a UID conflict) or skipped as
+	// already in the mailbox is settled and not counted again.
+	settled := make([]bool, len(uploaded))
+	defer func() {
+		if err == nil {
+			return
+		}
+		for k, up := range uploaded {
+			if settled[k] {
+				continue
+			}
+			i.recordFailedPath(up.msg.path, fmt.Sprintf("batch transaction aborted: %v", err))
+			atomic.AddInt64(&i.failedMessages, 1)
+		}
+	}()
+
 	// Get user info once
 	address, err := server.NewAddress(i.email)
 	if err != nil {
@@ -2234,7 +2251,7 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 	}
 
 	// Process all messages in this single transaction
-	for _, up := range uploaded {
+	for k, up := range uploaded {
 		// Get/create mailbox (cached)
 		mailbox, err := i.getOrCreateMailbox(i.ctx, user.AccountID(), up.msg.mailbox)
 		if err != nil {
@@ -2268,16 +2285,20 @@ func (i *Importer) insertBatchToDBWithTransaction(uploaded []uploadedMsg) ([]mar
 		if err != nil {
 			if errors.Is(err, consts.ErrUIDConflict) {
 				// The preserved UID is already taken in the target mailbox: this message
-				// was NOT stored. Report it as failed (never as a dedup skip) and go on
-				// with the batch.
+				// was NOT stored. Report it as failed (never as a dedup skip). The unique
+				// violation behind it has aborted the transaction, so nothing else of the
+				// batch can be stored either: stop here instead of sending statements
+				// PostgreSQL ignores until the rollback.
 				logger.Error("Preserved UID already in use, message not imported", "path", up.msg.path, "hash", up.msg.hash)
 				i.recordFailedPath(up.msg.path, "preserved UID already in use in the target mailbox (re-run without --preserve-uids to import it)")
 				atomic.AddInt64(&i.failedMessages, 1)
-				continue
+				settled[k] = true
+				return nil, fmt.Errorf("preserved UID of %s already in use in the target mailbox: %w", up.msg.path, err)
 			}
 			if errors.Is(err, consts.ErrDBUniqueViolation) {
 				// Message already exists - skip but continue processing batch
 				atomic.AddInt64(&i.skippedMessages, 1)
+				settled[k] = true
 				continue
 			}
 			// Non-recoverable error - rollback entire batch (defer handles this)
@@ -2526,15 +2547,9 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 	}
 
 	if err != nil {
+		// Only BatchTransactionMode gets here: insertBatchToDBWithTransaction has
+		// reported each message of the batch it did not store.
 		logger.Error("Batch processing failed", "error", err)
-		// Everything in uploaded that wasn't successfully inserted is already tracked if individual mode
-		// Let's ensure BatchTransactionMode logs all if it aborted
-		if i.options.BatchTransactionMode {
-			for _, up := range uploaded {
-				i.recordFailedPath(up.msg.path, fmt.Sprintf("batch transaction aborted: %v", err))
-			}
-			atomic.AddInt64(&i.failedMessages, int64(len(uploaded)))
-		}
 		return err
 	}
 
