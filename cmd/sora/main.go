@@ -1001,7 +1001,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			os.Exit(errorHandler.WaitForExit())
 		}
 
-		logger.Info("Relay queue initialized", "path", queuePath, "max_attempts", cfg.Relay.Queue.MaxAttempts)
+		logger.Info("Relay queue initialized", "path", queuePath, "max_attempts", deps.relayQueue.MaxAttempts())
 
 		// Create relay handler from global relay config if configured
 		if cfg.Relay.IsConfigured() {
