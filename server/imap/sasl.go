@@ -127,7 +127,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						return authFailedError()
 					}
 
-					AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
+					AccountID, err := s.server.rdb.GetMasterLoginTargetWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
 						// Check if error is due to context cancellation (server shutdown)
 						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -136,6 +136,19 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 								Type: imap.StatusResponseTypeNo,
 								Code: imap.ResponseCodeUnavailable,
 								Text: server.ErrServerShuttingDown.Error(),
+							}
+						}
+
+						// The database could not be asked, so nothing is known about the
+						// target: a temporary failure (RFC 5530 section 3), not a failed
+						// login charged to the master credential.
+						if server.IsTemporaryAuthFailure(err) {
+							s.WarnLog("impersonation target lookup unavailable", "target_user", targetUserToImpersonate, "error", err)
+							metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
+							return &imap.Error{
+								Type: imap.StatusResponseTypeNo,
+								Code: imap.ResponseCodeUnavailable,
+								Text: server.ErrAuthServiceUnavailable.Error(),
 							}
 						}
 
@@ -258,7 +271,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 						return authFailedError()
 					}
 
-					AccountID, err := s.server.rdb.GetActiveAccountIDByAddressWithRetry(s.ctx, address.BaseAddress())
+					AccountID, err := s.server.rdb.GetMasterLoginTargetWithRetry(s.ctx, address.BaseAddress())
 					if err != nil {
 						// Check if error is due to context cancellation (server shutdown)
 						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -267,6 +280,19 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 								Type: imap.StatusResponseTypeNo,
 								Code: imap.ResponseCodeUnavailable,
 								Text: server.ErrServerShuttingDown.Error(),
+							}
+						}
+
+						// The database could not be asked, so nothing is known about the
+						// target: a temporary failure (RFC 5530 section 3), not a failed
+						// login charged to the master credential.
+						if server.IsTemporaryAuthFailure(err) {
+							s.WarnLog("impersonation target lookup unavailable", "target_user", targetUserToImpersonate, "error", err)
+							metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "unavailable").Inc()
+							return &imap.Error{
+								Type: imap.StatusResponseTypeNo,
+								Code: imap.ResponseCodeUnavailable,
+								Text: server.ErrAuthServiceUnavailable.Error(),
 							}
 						}
 
