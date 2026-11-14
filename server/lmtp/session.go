@@ -895,6 +895,23 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		return nil
 	}
 
+	// Store every requested copy before any redirect is handed to the relay. A
+	// temporary storage failure makes the sender retry the whole delivery. A
+	// redirect without :copy has no copy to wait for: it is relayed now, before the
+	// body is staged, for the same reason as a discard, and the message is staged
+	// and kept in INBOX only when a redirect could not be queued.
+	destinations := result.Destinations(false)
+	relayAfterStore := len(destinations) > 0 && len(result.RedirectTo) > 0
+	if len(destinations) == 0 && len(result.RedirectTo) > 0 && !s.relayRedirects(ctx, result, messageContent, fullMessageBytes) {
+		// Redirect-only delivery needs an INBOX fallback when handoff fails.
+		destinations = result.Destinations(true)
+	}
+	if len(destinations) == 0 {
+		s.DebugLog("redirect without :copy - skipping local delivery")
+		recordMetrics("success")
+		return nil
+	}
+
 	// Store message locally for background upload to S3
 	// This happens AFTER Sieve processing and header edits, so we store the modified message
 	// Check if file already exists to prevent race condition:
@@ -969,26 +986,8 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	bodyStructure := &bodyStructureVal
 	sieveFlags = db.WithAttachmentKeyword(sieveFlags, fullMessageBytes, true)
 
-	// Store every requested copy before any redirect is handed to the relay. A
-	// temporary storage failure makes the sender retry the whole delivery.
-	destinations := result.Destinations(false)
-	relayAfterStore := len(destinations) > 0 && len(result.RedirectTo) > 0
-	if len(destinations) == 0 && len(result.RedirectTo) > 0 {
-		if s.relayRedirects(ctx, result, messageContent, fullMessageBytes) {
-			recordMetrics("success")
-			return nil
-		}
-		// Redirect-only delivery needs an INBOX fallback when handoff fails.
-		destinations = result.Destinations(true)
-	}
-
 	// Store one copy in every fileinto target, and in INBOX when the message is kept
 	// (or a failed redirect left it stored nowhere).
-	if len(destinations) == 0 {
-		s.DebugLog("redirect without :copy - skipping local delivery")
-		recordMetrics("success")
-		return nil
-	}
 	if result.Action == sieveengine.ActionKeep {
 		s.DebugLog("sieve keep action")
 	}
