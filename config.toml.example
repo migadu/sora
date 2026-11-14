@@ -1049,6 +1049,11 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # disabled_caps = ["ESEARCH", "CONDSTORE", "IDLE"]  # Example: disable these capabilities globally
 #
 # NOTE: Do not disable IMAP4rev1, as this will break basic IMAP functionality.
+# A capability another one implies is removed together with it: disabling an
+# extension IMAP4rev2 includes (IDLE, ESEARCH, SEARCHRES, MOVE, NAMESPACE,
+# UIDPLUS, LIST-STATUS, STATUS=SIZE, CHILDREN, ...) also removes IMAP4rev2, so
+# the server offers IMAP4rev1 with its remaining extensions; disabling CONDSTORE
+# also removes QRESYNC. client_filters follow the same rule.
 # STARTTLS, LOGINDISABLED and AUTH=PLAIN follow tls, tls_use_starttls and
 # insecure_auth; disabled_caps does not change them.
 
