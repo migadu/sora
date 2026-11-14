@@ -11,6 +11,10 @@ import (
 
 const configValidateHelperEnv = "SORA_ADMIN_CONFIG_VALIDATE_HELPER_PATH"
 
+// storageTOML gives a file the [database] and [s3] settings a mail backend, or a proxy
+// that authenticates against the database, starts with.
+const storageTOML = "[database.write]\nhosts = [\"db.example.com\"]\n\n[s3]\nendpoint = \"s3.example.com\"\nbucket = \"mail\"\n\n"
+
 // TestConfigValidateCommandHelper is not a test: it is `sora-admin config validate`,
 // run by the TestConfigValidate* tests in a process of its own because the command
 // exits.
@@ -41,7 +45,7 @@ func TestConfigValidateRejectsUnsupportedRelayType(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.toml")
-			content := tt.relay + "\n[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:0\"\n"
+			content := storageTOML + tt.relay + "\n[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:0\"\n"
 			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -82,7 +86,7 @@ func TestConfigValidateRejectsIncompleteServerBlock(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.toml")
-			content := "[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:1143\"\n\n[[server]]\n" + tt.block
+			content := storageTOML + "[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:1143\"\n\n[[server]]\n" + tt.block
 			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -109,11 +113,16 @@ func TestConfigValidateRejectsIncompleteServerBlock(t *testing.T) {
 // added for #516. The CLI printed "[OK] Configuration is valid!" for checks it did not run: [[pool]] blocks,
 // PROXY protocol without trusted_networks, [uploader] and [shared_mailboxes], and it
 // only warned about a file without servers. A file with several problems reports each.
+// Nor did it check what start-up checked only as it set up services (#921): the
+// [relay.queue] durations, [cluster] addr and secret_key, and the [database] and [s3]
+// a node's servers need.
 func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 	const imapBackend = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
 	const imapProxy = "\n[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\n"
 	const proxyProtocolImap = "\n[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\nproxy_protocol = true\n"
 	const remoteLookup = "remote_addrs = [\"192.0.2.10:143\"]\n\n[server.remote_lookup]\nenabled = true\n"
+	const metrics = "\n[[server]]\ntype = \"metrics\"\nname = \"metrics\"\naddr = \"127.0.0.1:9090\"\npath = \"/metrics\"\n"
+	const userAPI = "\n[[server]]\ntype = \"http_user_api\"\nname = \"user-api\"\naddr = \"127.0.0.1:8081\"\njwt_secret = \"secret\"\n"
 	tests := []struct {
 		name    string
 		content string
@@ -126,7 +135,7 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 		},
 		{
 			name:    "PROXY protocol with trusted_networks",
-			content: "[servers]\ntrusted_networks = [\"192.0.2.10\"]\n" + proxyProtocolImap,
+			content: storageTOML + "[servers]\ntrusted_networks = [\"192.0.2.10\"]\n" + proxyProtocolImap,
 		},
 		{
 			name: "pool declared twice",
@@ -163,7 +172,48 @@ func TestConfigValidateRefusesWhatStartupRefuses(t *testing.T) {
 		{
 			// A node without a mail backend runs no upload worker; the server starts it.
 			name:    "uploader concurrency 0 on a proxy",
-			content: "[uploader]\nconcurrency = 0\n" + imapProxy + "remote_addrs = [\"192.0.2.10:143\"]\n",
+			content: storageTOML + "[uploader]\nconcurrency = 0\n" + imapProxy + "remote_addrs = [\"192.0.2.10:143\"]\n",
+		},
+		{
+			// The issue's file: the relay worker runs on any node with [relay].
+			name: "relay.queue circuit_breaker_timeout unparsable",
+			content: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n\n[relay.queue]\npath = \"/tmp/relay\"\ncircuit_breaker_timeout = \"soon\"\n" +
+				metrics,
+			wantErr: []string{`invalid circuit_breaker_timeout "soon"`},
+		},
+		{
+			name:    "relay.queue cleanup_interval unparsable",
+			content: "[relay]\ntype = \"smtp\"\nsmtp_host = \"smtp.example.com:587\"\n\n[relay.queue]\ncleanup_interval = \"hourly\"\n" + metrics,
+			wantErr: []string{`invalid cleanup_interval "hourly"`},
+		},
+		{
+			name:    "cluster addr 0.0.0.0",
+			content: "[cluster]\nenabled = true\naddr = \"0.0.0.0:7946\"\n" + metrics,
+			wantErr: []string{"cluster addr '0.0.0.0' must be a specific IP address reachable from other nodes"},
+		},
+		{
+			name:    "cluster secret_key of 16 bytes",
+			content: "[cluster]\nenabled = true\naddr = \"10.10.10.40:7946\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZg==\"\n" + metrics,
+			wantErr: []string{"cluster secret_key must be 32 bytes (got 16 bytes)"},
+		},
+		{
+			name:    "cluster",
+			content: "[cluster]\nenabled = true\naddr = \"10.10.10.40:7946\"\nsecret_key = \"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\"\n" + metrics,
+		},
+		{
+			name:    "mail backend without database and S3",
+			content: imapBackend,
+			wantErr: []string{`server "imap" (imap) needs the database`, "bucket is required"},
+		},
+		{
+			name:    "mail backend with an S3 timeout without a unit",
+			content: storageTOML + "timeout = \"30\"\n" + imapBackend,
+			wantErr: []string{`invalid timeout "30"`},
+		},
+		{
+			name:    "User API with part of [s3]",
+			content: "[database.write]\nhosts = [\"db.example.com\"]\n\n[s3]\nbucket = \"mail\"\n" + userAPI,
+			wantErr: []string{"endpoint is required"},
 		},
 		{
 			// A negative cleanup_grace_period makes the orphan sweep remove staged

@@ -554,24 +554,6 @@ func logInstanceIdentity(identity config.NodeIdentity) {
 		"note", "SMTP-visible name of this node: protocol greetings, Received 'by' host, vacation Message-ID domain")
 }
 
-// serverNeedsDatabase reports whether a server queries the database. The mail backends,
-// the ManageSieve backend and the HTTP APIs keep their accounts there. A mail proxy
-// authenticates its users there (the LMTP proxy looks up its recipients) unless a remote
-// lookup answers for all of them, which takes remote_lookup enabled with
-// lookup_local_users = false. The User API proxy leaves logins to its backends; it only
-// checks a local user's token there, with lookup_local_users = true.
-func serverNeedsDatabase(s config.ServerConfig) bool {
-	switch s.Type {
-	case "imap", "lmtp", "pop3", "managesieve", "http_admin_api", "http_user_api":
-		return true
-	case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy":
-		return s.RemoteLookup == nil || !s.RemoteLookup.Enabled || s.RemoteLookup.ShouldLookupLocalUsers()
-	case "user_api_proxy":
-		return s.RemoteLookup != nil && s.RemoteLookup.ShouldLookupLocalUsers()
-	}
-	return false
-}
-
 // proxiesWithAffinity names the enabled proxy servers that set enable_affinity.
 func proxiesWithAffinity(cfg config.Config) []string {
 	var names []string
@@ -603,32 +585,11 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	hostname, instanceID := identity.MailHostname, identity.InstanceID
 	logInstanceIdentity(identity)
 
-	// Determine if any mail storage services are enabled
-	allServers := cfg.GetAllServers()
-	// [uploader] and [cleanup] were checked with the file, for a node with a mail backend.
+	// What this node runs decides what it connects to. The settings each needs ([uploader]
+	// and [cleanup] with a mail backend, [database] and [s3]) were checked with the file.
 	storageServicesNeeded := cfg.HasMailBackend()
-	userAPIServed := false
-	var databaseUser *config.ServerConfig // the first server that queries the database
-
-	// Check if database is actually configured
-	// Database is configured if either write or read has valid hosts
-	databaseConfigured := (cfg.Database.Write != nil && len(cfg.Database.Write.Hosts) > 0) ||
-		(cfg.Database.Read != nil && len(cfg.Database.Read.Hosts) > 0)
-
-	for i, server := range allServers {
-		if databaseUser == nil && serverNeedsDatabase(server) {
-			databaseUser = &allServers[i]
-		}
-		if server.Type == "http_user_api" {
-			userAPIServed = true
-		}
-	}
-
-	// If database is needed but not configured, that's an error
-	if databaseUser != nil && !databaseConfigured {
-		errorHandler.ValidationError("database configuration", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write] or [database.read]", databaseUser.Name, databaseUser.Type))
-		os.Exit(errorHandler.WaitForExit())
-	}
+	databaseUser := cfg.DatabaseUser() // the first server that queries the database
+	s3Needed := cfg.NeedsS3()
 
 	deps := &serverDependencies{
 		hostname:           hostname,
@@ -643,12 +604,12 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	// it needs the [s3] connection on a node without mail services too. It reads through
 	// to S3 without the cache and workers those start below. Without any [s3] settings it
 	// serves everything but bodies.
-	s3Needed := storageServicesNeeded
-	if userAPIServed && !storageServicesNeeded {
-		if cfg.S3.Endpoint == "" && cfg.S3.Bucket == "" && cfg.S3.AccessKey == "" && cfg.S3.SecretKey == "" {
-			logger.Warn("User API: no [s3] configured on this node; message bodies (/user/messages/{id}/body and /raw) cannot be served")
-		} else {
-			s3Needed = true
+	if !s3Needed {
+		for _, server := range cfg.GetAllServers() {
+			if server.Type == "http_user_api" {
+				logger.Warn("User API: no [s3] configured on this node; message bodies (/user/messages/{id}/body and /raw) cannot be served")
+				break
+			}
 		}
 	}
 
@@ -664,20 +625,9 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Initialize S3 storage for mail services or a User API body reader.
 	if s3Needed {
-		// Ensure required S3 arguments are provided only if needed. Without access_key and
-		// secret_key the AWS default credential chain supplies them, and storage.New
-		// refuses to start when it finds none.
-		if cfg.S3.Bucket == "" {
-			errorHandler.ValidationError("S3 bucket", fmt.Errorf("missing required S3 bucket for mail services (IMAP, LMTP, POP3) or the User API"))
-			os.Exit(errorHandler.WaitForExit())
-		}
-
-		// Initialize S3 storage
+		// Without access_key and secret_key the AWS default credential chain supplies
+		// them, and storage.New refuses to start when it finds none.
 		s3EndpointToUse := cfg.S3.Endpoint
-		if s3EndpointToUse == "" {
-			errorHandler.ValidationError("S3 endpoint", fmt.Errorf("S3 endpoint not specified"))
-			os.Exit(errorHandler.WaitForExit())
-		}
 		s3Timeout, err := cfg.S3.GetTimeout()
 		if err != nil {
 			errorHandler.ValidationError("S3 timeout", err)

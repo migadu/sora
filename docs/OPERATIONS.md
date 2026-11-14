@@ -171,8 +171,8 @@ show nothing on standard error: look in the log file or in syslog.
 | `master_username is set but master_password is empty` | A master user without a password would let anyone in. | Set the password or remove the user. |
 | `proxy_protocol is enabled on server(s) ... but [servers] trusted_networks is empty` | PROXY protocol without trusted senders. | Set `[servers] trusted_networks`. |
 | `duplicate server name` / `duplicate server address` | Two blocks share a `name` or `addr`. | Make them unique. |
-| `database is required for configured servers but not configured` | No `[database.write]` section (step 4). | Configure `[database.write]`. |
-| `missing required S3 credentials` / `S3 endpoint not specified` | A backend without `[s3]` settings. | Set `[s3]`. |
+| `[database]: server "<name>" (<type>) needs the database, but it is not configured ...` | No `[database.write]` section (step 4). | Configure `[database.write]`. |
+| `[s3]: bucket is required ...` / `[s3]: endpoint is required ...` | A backend without `[s3]` settings. | Set `[s3]`. |
 | `Fatal error` with operation `initialize resilient database` | No write host reachable, or migrations failed. The line before it says why. | See [Database migrations](#10-database-migrations) and [DATABASE.md](DATABASE.md). |
 | `Fatal error` with operation `initialize cache` | `[local_cache] path` cannot be created. | Fix the path or its permissions. |
 | `Fatal error` with operation `create upload worker` | `[uploader] path` cannot be created. | Fix the path or its permissions. |
@@ -197,11 +197,10 @@ Sora starts despite these, but each one points at something to fix:
 ### Checking a config before you start
 
 `sora-admin --config PATH config validate` parses the file, prints unknown and duplicate keys,
-validates every `[[server]]` block and checks for duplicate names and addresses. It connects to
-nothing and exits with status 0 when the file is valid. It does not run every check `sora` runs at
-startup: it skips the `[[pool]]` checks, the `proxy_protocol`/`trusted_networks` check and the
-database and S3 checks. `sora-admin --config PATH config dump` prints the parsed config with secrets
-masked.
+validates every `[[server]]` block and runs the other checks `sora` makes on the file before it
+starts anything (see [CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup)), reporting
+every problem it finds. It connects to nothing and exits with status 0 when the file is valid.
+`sora-admin --config PATH config dump` prints the parsed config with secrets masked.
 
 ---
 

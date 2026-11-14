@@ -184,9 +184,9 @@ CPUs, whichever is larger).
   `[database.write]`. Repeat them, or the read endpoint uses the defaults above.
 - **An endpoint you do not write is not configured.** Without a `[database.write]` (or
   `[database.read]`) section in the file, Sora has no such endpoint. This is how a proxy-only node
-  runs without a database. A node that needs a database and has none refuses to start with
-  `database is required for configured servers but not configured in [database.write] or
-  [database.read]`.
+  runs without a database. A node that needs a database and has none refuses to start, and
+  `sora-admin config validate` refuses the file, with `[database]: server "<name>" (<type>) needs
+  the database, but it is not configured in [database.write] or [database.read]`.
 - **User name and password** may contain any characters. Sora escapes them in the connection URL.
 - **IPv6 addresses** go in brackets with a port: `hosts = ["[2001:db8::10]:5432"]`.
 
@@ -762,7 +762,7 @@ transaction` for a long time are usually the lock holders of [section 8](#8-pgbo
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Startup fails with `database is required for configured servers but not configured` | `[database.write]` is missing. | Configure the write endpoint ([section 3](#3-connecting-the-write-and-read-endpoints)). |
+| Startup fails with `[database]: server "<name>" (<type>) needs the database, but it is not configured ...` | `[database.write]` is missing. | Configure the write endpoint ([section 3](#3-connecting-the-write-and-read-endpoints)). |
 | Startup fails with `Failed to initialize resilient database` | No write host could be reached. | Check the host, port, credentials and network. The line before it names the error. |
 | Startup fails with `dirty migration state` | A migration failed earlier. | See [A failed migration](#a-failed-migration). |
 | Nodes exit with `timed out waiting for another instance to complete migrations` | A long migration on another node. | Let it finish, then start them; for long migrations, run `sora-admin migrate up` first or raise `migration_timeout`. |

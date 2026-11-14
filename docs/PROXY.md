@@ -995,8 +995,9 @@ An `http_admin_api` server on a proxy node lets you see the proxies' backend hea
 `sora-admin health status --backends`, since that state lives in the proxy process.
 
 Sora treats the database as not configured when `[database.write]` and `[database.read]` are absent
-or have empty `hosts`. A node that needs the database while it is not configured refuses to start
-with `database is required for configured servers but not configured in [database.write] or [database.read]`.
+or have empty `hosts`. A node that needs the database while it is not configured refuses to start,
+and `sora-admin config validate` refuses its file, with `[database]: server "<name>" (<type>) needs
+the database, but it is not configured in [database.write] or [database.read]`.
 
 ---
 
