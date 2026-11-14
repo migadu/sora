@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 )
@@ -212,5 +213,65 @@ func TestPeerEventsRespectTheLimiterSizeCaps(t *testing.T) {
 	}
 	if usernames > 10 {
 		t.Errorf("peers' username failures grew the username map to %d entries, over max_username_entries = 10", usernames)
+	}
+}
+
+// TestPeerDelayIsCappedByLocalMaxDelay: a node never applies a progressive delay
+// above its own max_delay, whatever its peers gossip. Peers of one protocol can
+// run with different limits (a rolling change that lowers max_delay, or two
+// [[server]] entries of the same protocol with different auth_rate_limit
+// settings), and the merge adopted a peer's longer delay unchanged.
+func TestPeerDelayIsCappedByLocalMaxDelay(t *testing.T) {
+	crl := newTestClusterRateLimiter(t)
+	crl.syncFailureCounts = true
+	crl.limiter.config.DelayStartThreshold = 2
+	crl.limiter.config.InitialDelay = time.Second
+	crl.limiter.config.MaxDelay = 30 * time.Second
+	crl.limiter.config.DelayMultiplier = 2
+
+	now := time.Now()
+	peerDelay := func(id, ip string, delay time.Duration) {
+		t.Helper()
+		deliverRateLimitEvent(t, crl, RateLimitEvent{
+			Type:         RateLimitEventFailureCount,
+			EventID:      id,
+			IP:           ip,
+			Timestamp:    now,
+			NodeID:       "node-b",
+			Protocol:     crl.limiter.protocol,
+			FailureCount: 3,
+			LastDelay:    delay,
+			FirstFailure: now,
+		})
+	}
+
+	// An address this node has not seen.
+	fresh := &StringAddr{Addr: "192.0.2.17:40000"}
+	peerDelay("peer-delay-fresh", "192.0.2.17", 10*time.Minute)
+	if got := crl.limiter.GetAuthenticationDelay(fresh); got != 30*time.Second {
+		t.Errorf("delay after a peer's 10m on a fresh address = %v, want max_delay 30s", got)
+	}
+
+	// An address this node already delays.
+	ctx := context.Background()
+	known := &StringAddr{Addr: "192.0.2.18:40000"}
+	for range 2 {
+		crl.limiter.RecordAuthAttempt(ctx, known, "", false)
+	}
+	if got := crl.limiter.GetAuthenticationDelay(known); got != time.Second {
+		t.Fatalf("local delay after 2 failures = %v, want 1s", got)
+	}
+	peerDelay("peer-delay-known", "192.0.2.18", time.Duration(math.MaxInt64))
+	if got := crl.limiter.GetAuthenticationDelay(known); got != 30*time.Second {
+		t.Errorf("delay after a peer's %v = %v, want max_delay 30s", time.Duration(math.MaxInt64), got)
+	}
+
+	// A longer delay under the cap is still adopted, a shorter or negative one is not.
+	adopted := &StringAddr{Addr: "192.0.2.19:40000"}
+	peerDelay("peer-delay-under-cap", "192.0.2.19", 8*time.Second)
+	peerDelay("peer-delay-shorter", "192.0.2.19", 2*time.Second)
+	peerDelay("peer-delay-negative", "192.0.2.19", -time.Hour)
+	if got := crl.limiter.GetAuthenticationDelay(adopted); got != 8*time.Second {
+		t.Errorf("delay after peers' 8s, 2s and -1h = %v, want 8s", got)
 	}
 }
