@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -192,6 +193,27 @@ func (s *S3Config) GetTimeout() (time.Duration, error) {
 	return helpers.ParseDuration(s.Timeout)
 }
 
+// Validate checks the [s3] settings a node that uses S3 needs to connect: the bucket and
+// the endpoint, and a timeout that parses. Without access_key and secret_key the AWS
+// default credential chain supplies them, which only connecting can check.
+func (s *S3Config) Validate() error {
+	if s.Bucket == "" {
+		return errors.New("bucket is required for mail services (IMAP, LMTP, POP3) and for the User API to serve message bodies")
+	}
+	if s.Endpoint == "" {
+		return errors.New("endpoint is required for mail services (IMAP, LMTP, POP3) and for the User API to serve message bodies")
+	}
+	if _, err := s.GetTimeout(); err != nil {
+		return fmt.Errorf("invalid timeout %q: %w", s.Timeout, err)
+	}
+	return nil
+}
+
+// hasSettings reports whether the file sets any of the [s3] connection settings.
+func (s *S3Config) hasSettings() bool {
+	return s.Endpoint != "" || s.Bucket != "" || s.AccessKey != "" || s.SecretKey != ""
+}
+
 // ClusterRateLimitSyncConfig holds configuration for cluster-wide auth rate limiting
 type ClusterRateLimitSyncConfig struct {
 	Enabled           bool `toml:"enabled"`             // Enable cluster-wide rate limiting (default: true if cluster enabled)
@@ -276,6 +298,34 @@ func (c *ClusterConfig) GetMaxEventQueueSize() int {
 		return c.MaxEventQueueSize
 	}
 	return 50000 // Default: sufficient for busy servers
+}
+
+// Validate checks an enabled [cluster] for the settings gossip cannot run without.
+//
+// addr must be an IP address the other nodes can reach: it is bound and advertised as
+// is, so 0.0.0.0, ::, localhost or a host name cannot be used. secret_key is required
+// and must be the base64 of 32 bytes (AES-256): gossip carries auth-failure state, IP
+// blocks and connection-kick commands, which any host able to reach the gossip port
+// could forge without encryption.
+func (c *ClusterConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	bindAddr := c.GetBindAddr()
+	if ip := net.ParseIP(bindAddr); ip == nil || ip.IsUnspecified() {
+		return fmt.Errorf("cluster addr '%s' must be a specific IP address reachable from other nodes, such as \"10.10.10.40:7946\" (not 0.0.0.0, ::, localhost or a host name)", bindAddr)
+	}
+	if c.SecretKey == "" {
+		return errors.New("cluster secret_key is required when cluster mode is enabled (generate one with: openssl rand -base64 32)")
+	}
+	key, err := base64.StdEncoding.DecodeString(c.SecretKey)
+	if err != nil {
+		return fmt.Errorf("failed to decode cluster secret_key: %w", err)
+	}
+	if len(key) != 32 {
+		return fmt.Errorf("cluster secret_key must be 32 bytes (got %d bytes)", len(key))
+	}
+	return nil
 }
 
 // TLSLetsEncryptS3Config holds S3-specific configuration for Let's Encrypt certificate storage
@@ -3064,6 +3114,61 @@ func (c *Config) HasMailBackend() bool {
 	return false
 }
 
+// NeedsDatabase reports whether the server queries the database. The mail backends, the
+// ManageSieve backend and the HTTP APIs keep their accounts there. A mail proxy
+// authenticates its users there (the LMTP proxy looks up its recipients) unless a remote
+// lookup answers for all of them, which takes remote_lookup enabled with
+// lookup_local_users = false. The User API proxy leaves logins to its backends; it only
+// checks a local user's token there, with lookup_local_users = true.
+func (s *ServerConfig) NeedsDatabase() bool {
+	switch s.Type {
+	case "imap", "lmtp", "pop3", "managesieve", "http_admin_api", "http_user_api":
+		return true
+	case "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy":
+		return s.RemoteLookup == nil || !s.RemoteLookup.Enabled || s.RemoteLookup.ShouldLookupLocalUsers()
+	case "user_api_proxy":
+		return s.RemoteLookup != nil && s.RemoteLookup.ShouldLookupLocalUsers()
+	}
+	return false
+}
+
+// DatabaseUser returns the first enabled server that queries the database, or nil when
+// the node runs none and so connects to no database.
+func (c *Config) DatabaseUser() *ServerConfig {
+	servers := c.GetAllServers()
+	for i := range servers {
+		if servers[i].NeedsDatabase() {
+			return &servers[i]
+		}
+	}
+	return nil
+}
+
+// HasDatabaseEndpoint reports whether [database.write] or [database.read] names a host.
+func (c *Config) HasDatabaseEndpoint() bool {
+	return (c.Database.Write != nil && len(c.Database.Write.Hosts) > 0) ||
+		(c.Database.Read != nil && len(c.Database.Read.Hosts) > 0)
+}
+
+// NeedsS3 reports whether the node connects to [s3]. A mail backend stores message bodies
+// there. The User API serves them from there (/user/messages/{id}/body and /raw) on a
+// node without a mail backend too, when [s3] has any connection setting; without one it
+// serves everything but bodies.
+func (c *Config) NeedsS3() bool {
+	if c.HasMailBackend() {
+		return true
+	}
+	if !c.S3.hasSettings() {
+		return false
+	}
+	for _, s := range c.GetAllServers() {
+		if s.Type == "http_user_api" {
+			return true
+		}
+	}
+	return false
+}
+
 // Problem is one reason Validate refuses a file: the part of the file it is about, as
 // an operator finds it ("server 'imap'", "[relay]", "trusted_networks"), and what is
 // wrong there.
@@ -3076,8 +3181,9 @@ type Problem struct {
 // by `sora-admin config validate`, returning every problem these checks find.
 //
 // What a node does not run is not checked: [uploader] and [cleanup] only with a mail
-// backend. Service setup still checks required database and S3 settings, S3 timeout,
-// external connectivity and the node's disk; passing Validate does not check those.
+// backend, [database] only with a server that queries it, [s3] only on a node that
+// connects to it, [cluster] only when enabled. Service setup still checks external
+// connectivity and the node's disk; passing Validate does not check those.
 func (c *Config) Validate() []Problem {
 	var problems []Problem
 	add := func(section string, err error) {
@@ -3138,6 +3244,14 @@ func (c *Config) Validate() []Problem {
 		// The cleaner takes [cleanup]; delivery takes its fts_retention too.
 		add("[cleanup]", c.Cleanup.Validate())
 	}
+
+	if user := c.DatabaseUser(); user != nil && !c.HasDatabaseEndpoint() {
+		add("[database]", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write] or [database.read]", user.Name, user.Type))
+	}
+	if c.NeedsS3() {
+		add("[s3]", c.S3.Validate())
+	}
+	add("[cluster]", c.Cluster.Validate())
 
 	return problems
 }

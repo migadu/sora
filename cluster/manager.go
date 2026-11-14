@@ -231,6 +231,11 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	if !cfg.Enabled {
 		return nil, fmt.Errorf("cluster mode is not enabled")
 	}
+	// The addr and secret_key checks are the ones the server runs on the whole file
+	// before it starts anything (config.Config.Validate).
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 
 	// Use hostname as default node ID
 	nodeID := cfg.NodeID
@@ -281,17 +286,6 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 		logger.Warn("To avoid confusion, remove either the port from 'addr' or remove the 'port' field")
 	}
 
-	// Validate bind address - must be a specific IP, not 0.0.0.0 or localhost hostname
-	if bindAddr == "" || bindAddr == "0.0.0.0" || bindAddr == "::" || bindAddr == "localhost" {
-		logger.Error("Cluster mode ERROR: 'addr' must be a specific IP address reachable from other nodes")
-		logger.Error("Current value is not valid for cluster gossip", "addr", bindAddr)
-		logger.Error("The gossip protocol requires advertising a real IP address that other nodes can reach")
-		logger.Error("Example: addr = \"10.10.10.40:7946\" or addr = \"10.10.10.40\" with port = 7946")
-		logger.Error("Cannot use: 0.0.0.0, localhost, or ::")
-		cancel()
-		return nil, fmt.Errorf("cluster addr '%s' must be a specific IP address reachable from other nodes", bindAddr)
-	}
-
 	// Warn about loopback addresses (allowed for testing but not recommended for production)
 	if bindAddr == "127.0.0.1" || bindAddr == "::1" {
 		logger.Warn("Cluster mode: Using loopback address - this only works for single-machine testing", "addr", bindAddr)
@@ -309,31 +303,14 @@ func New(cfg config.ClusterConfig) (*Manager, error) {
 	// Forward memberlist's own log lines at their level
 	mlConfig.LogOutput = &memberlistLogger{prefix: "Cluster: "}
 
-	// Set up encryption if secret key is provided
-	if cfg.SecretKey != "" {
-		keyBytes, err := base64.StdEncoding.DecodeString(cfg.SecretKey)
-		if err != nil {
-			cancel()
-			return nil, fmt.Errorf("failed to decode cluster secret_key: %w", err)
-		}
-		if len(keyBytes) != 32 {
-			cancel()
-			return nil, fmt.Errorf("cluster secret_key must be 32 bytes (got %d bytes)", len(keyBytes))
-		}
-		mlConfig.SecretKey = keyBytes
-		logger.Info("Cluster encryption enabled with secret key")
-	} else {
-		// secret_key is mandatory when cluster mode is enabled. Gossip carries
-		// security-sensitive state (auth-failure counts, IP blocks, connection-kick
-		// commands); without encryption any host able to reach the gossip port can
-		// forge these messages. Fail closed rather than running unauthenticated.
-		logger.Error("Cluster mode ERROR: 'secret_key' is required when cluster mode is enabled")
-		logger.Error("Gossip carries auth-failure state, IP blocks, and connection-kick commands")
-		logger.Error("Without encryption, any host able to reach the gossip port can forge them")
-		logger.Error("Generate a key with: openssl rand -base64 32")
+	// Encrypt gossip with the secret key, which Validate found to be 32 bytes of base64.
+	keyBytes, err := base64.StdEncoding.DecodeString(cfg.SecretKey)
+	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("cluster secret_key is required when cluster mode is enabled (generate one with: openssl rand -base64 32)")
+		return nil, fmt.Errorf("failed to decode cluster secret_key: %w", err)
 	}
+	mlConfig.SecretKey = keyBytes
+	logger.Info("Cluster encryption enabled with secret key")
 
 	// Create memberlist
 	logger.Info("Creating memberlist with config", "node", mlConfig.Name, "bind_addr", mlConfig.BindAddr, "bind_port", mlConfig.BindPort, "delegate", fmt.Sprintf("%p", mlConfig.Delegate))

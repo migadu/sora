@@ -977,7 +977,7 @@ Checks and prints a config file. These subcommands read only the file.
 
 | Subcommand | Flags | What it does |
 |---|---|---|
-| `validate` | | Loads the file with the server's loader (warnings for unknown and duplicate keys), validates every `[[server]]` block, and checks that server names and addresses are unique. Prints `[OK] Configuration is valid!` and the servers, or `[FAIL]` lines. Exits `1` on errors. |
+| `validate` | | Loads the file with the server's loader (warnings for unknown and duplicate keys) and runs the checks `sora` makes on the file before it starts anything ([CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup)), without connecting to anything. Prints `[OK] Configuration is valid!` and the servers, or a `[FAIL]` line for each problem. Exits `1` on errors. |
 | `dump` | `--format` (`toml` or `json`, default `toml`), `--mask-secrets` (default `true`) | Prints the configuration as loaded, with defaults applied. |
 
 `--mask-secrets` masks the database passwords, `[s3]` access key, secret key and encryption key,

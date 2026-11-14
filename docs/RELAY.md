@@ -273,7 +273,8 @@ may then receive it twice.
 | `failed_retention` | duration | `"168h"` (7 days) | How long a message stays in `failed/`, counted from its last attempt. `0` keeps failed messages until they are deleted or requeued. A negative or invalid value stops startup. |
 | `cleanup_interval` | duration | `"1h"` | How often the cleanup pass runs. An invalid value stops startup. |
 
-Durations accept Go syntax (`"90s"`, `"1h30m"`) and whole days (`"7d"`).
+Durations accept Go syntax (`"90s"`, `"1h30m"`) and whole days (`"7d"`). A value that stops
+startup also fails `sora-admin config validate`.
 
 ```toml
 [relay.queue]

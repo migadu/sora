@@ -170,8 +170,9 @@ Things to know:
   `enabled = false`. See [9.10](#910-lookup-cache-serverlookup_cache).
 - **A database endpoint you do not write means "no database".** Without a `[database.write]` (or
   `[database.read]`) section in the file, Sora has no such endpoint. This is how a proxy-only node
-  runs without one. A node that needs a database and has none stops with `database is required for
-  configured servers but not configured in [database.write] or [database.read]`.
+  runs without one. A node that needs a database and has none stops with `[database]: server
+  "<name>" (<type>) needs the database, but it is not configured in [database.write] or
+  [database.read]`.
 
 ---
 
@@ -180,9 +181,8 @@ Things to know:
 After parsing, Sora checks the configuration before it opens any listener. Each failed check below
 stops startup with exit status 1. The checks on the file itself run before logging is set up, so
 they write a line of the form `[ERROR] <date> <time> ERROR: invalid configuration - <what>: <reason>`
-to standard error. The S3 and database checks run after it, so their failures are ERROR records of
-the `[logging]` output, in its format: `msg="Invalid configuration" field=<what> error=<reason>`
-with the console format.
+to standard error, one for each problem the file has. The `[timeout_scheduler]` check runs after it,
+so its failure is an ERROR record of the `[logging]` output, in its format.
 
 | Check | Message |
 |---|---|
@@ -195,13 +195,14 @@ with the console format.
 | Two servers have the same `addr` string | `duplicate server address '<addr>' found. Server '<a>' and '<b>' cannot bind to the same address` |
 | A `[[server]]` block lacks `type`, `name` or `addr` | for example `server address is required` |
 | No server is configured | `no servers configured. Please configure at least one server in the [[server]] section` |
-| An IMAP, POP3 or LMTP server is configured but `[s3]` lacks `access_key`, `secret_key` or `bucket` | `missing required S3 credentials for mail services (IMAP, LMTP, POP3)` |
-| An IMAP, POP3 or LMTP server is configured and `[s3] endpoint` is empty | `S3 endpoint not specified` |
-| A server that needs the database is configured and there is no database endpoint (see [section 3](#3-defaults)) | `database is required for configured servers but not configured in [database.write] or [database.read]` |
+| An IMAP, POP3 or LMTP server is configured, or an `http_user_api` server with any `[s3]` connection setting, and `[s3] bucket` or `endpoint` is empty, or `timeout` is not a duration | `[s3]: bucket is required ...`, `[s3]: endpoint is required ...` or `[s3]: invalid timeout "<value>": ...` |
+| A server that needs the database is configured and there is no database endpoint (see [section 3](#3-defaults)) | `[database]: server "<name>" (<type>) needs the database, but it is not configured in [database.write] or [database.read]` |
+| `[cluster] enabled = true` and `addr` is not an IP address other than `0.0.0.0` or `::`, or `secret_key` is missing or not the base64 of 32 bytes (see [CLUSTER.md](CLUSTER.md)) | `[cluster]: cluster addr '<host>' must be a specific IP address reachable from other nodes, ...`, `[cluster]: cluster secret_key is required when cluster mode is enabled ...`, `[cluster]: failed to decode cluster secret_key: ...` or `[cluster]: cluster secret_key must be 32 bytes (got <n> bytes)` |
 | `[servers] trusted_networks` has an entry that is neither an IP address nor a CIDR block | names the invalid entry |
 | A server's `auth_rate_limit.exempt_networks` has an entry that is neither an IP address nor a CIDR block | `server "<name>": auth_rate_limit.exempt_networks has entries that are neither an IP address nor a CIDR: [...]` |
 | `[relay] type` is set to something other than `"smtp"` or `"http"` | `unsupported [relay] type ...` |
 | `[relay.queue] worker_interval` is `0` or less, or `failed_retention` is negative, with `[relay]` configured | `[relay.queue]: worker_interval must be positive, got ...` or `[relay.queue]: failed_retention must not be negative, got ...` |
+| `[relay.queue] circuit_breaker_timeout`, `cleanup_interval` or `failed_retention` is not a duration, with `[relay]` configured | `[relay.queue]: invalid <key> "<value>": ...` |
 | An IMAP, POP3 or LMTP server is configured and `[cleanup]` has a negative `grace_period`, `max_age_restriction`, `fts_retention` or `health_status_retention`, or an `instance_liveness_threshold` of zero or less | `[cleanup]: <key> must not be negative, got "<value>"` or `[cleanup]: instance_liveness_threshold must be positive, got "<value>"` |
 | `[timeout_scheduler] shard_count` is below -1 | `msg="Fatal error" operation="initialize timeout scheduler" error="invalid shard count: <n> (must be >= -1)"` |
 
@@ -225,13 +226,11 @@ These conditions only log, and startup continues:
 - The host name is not fully qualified: `Mail hostname is not fully qualified`. Sora uses the host
   name in greetings and in the `Received` header.
 
-Later steps can still fail, for example a TLS certificate that cannot be read, an invalid
-`[cluster] secret_key`, or a database that cannot be reached. Those are covered in the topic
-documents.
+Later steps can still fail, for example a TLS certificate that cannot be read, or a database that
+cannot be reached. Those are covered in the topic documents.
 
-`sora-admin config validate` runs part of this list without starting anything: the parse, the
-server type and master password checks, and the duplicate name and address checks. It does not check
-`[[pool]]` blocks, `trusted_networks`, S3 or the database. See [ADMIN_CLI.md](ADMIN_CLI.md).
+`sora-admin config validate` runs every check in this list but the `[timeout_scheduler]` one,
+without starting anything. See [ADMIN_CLI.md](ADMIN_CLI.md).
 
 ---
 
