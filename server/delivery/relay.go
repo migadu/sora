@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/emersion/go-smtp"
 	soralogger "github.com/migadu/sora/logger"
@@ -324,7 +325,14 @@ func (r *HTTPRelayHandler) GetCircuitBreaker() *circuitbreaker.CircuitBreaker {
 type HTTPRelayRequest struct {
 	From       string   `json:"from"`
 	Recipients []string `json:"recipients"`
-	Message    string   `json:"message"` // RFC822 message as string
+	// Message is the RFC 5322 message as a string. A JSON string holds Unicode
+	// text only, so a message that is not valid UTF-8 arrives here with each
+	// invalid byte replaced by U+FFFD and is also sent as MessageBase64.
+	Message string `json:"message"`
+	// MessageBase64 is the message byte for byte, base64 on the wire (RFC 4648
+	// section 4). sendToHTTPRelay sets it when the message is not valid UTF-8,
+	// the one case Message cannot carry exactly; it is absent otherwise.
+	MessageBase64 []byte `json:"message_base64,omitempty"`
 }
 
 // SendToExternalRelay sends a message to the external HTTP API with circuit breaker protection.
@@ -358,6 +366,13 @@ func (r *HTTPRelayHandler) sendToHTTPRelay(from string, to string, messageBytes 
 		From:       from,
 		Recipients: []string{to},
 		Message:    string(messageBytes),
+	}
+	// json.Marshal replaces every byte of a string that is not valid UTF-8 with
+	// U+FFFD, which destroys 8-bit text in any other charset: a body, a part of a
+	// multipart, a raw header value. Such a message also goes byte for byte in
+	// message_base64; message stays as it was for relay APIs that do not read it.
+	if !utf8.Valid(messageBytes) {
+		payload.MessageBase64 = messageBytes
 	}
 
 	jsonData, err := json.Marshal(payload)

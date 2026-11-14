@@ -174,6 +174,13 @@ For each message Sora sends one `POST` to `http_url` with `Content-Type: applica
 | `from` | The envelope sender. |
 | `recipients` | The envelope recipient. Always exactly one address. |
 | `message` | The complete message (RFC 5322 headers and body) as a string. |
+| `message_base64` | The complete message byte for byte, standard base64 (RFC 4648 section 4). Only present when the message is not valid UTF-8. |
+
+A JSON string holds Unicode text only, so `message` cannot carry a message that is not valid UTF-8
+(8-bit text in another charset, raw 8-bit header values): each such byte in it is replaced with
+U+FFFD. Those messages are also sent in `message_base64`. A relay API takes the message from
+`message_base64` when it is present and from `message` otherwise; either way it gets the message
+byte for byte.
 
 Sora reads only the status code of the response.
 
