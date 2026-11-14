@@ -70,7 +70,7 @@ func (deps *serverDependencies) reloadServers(newCfg *config.Config) {
 		startedByName[name] = true
 		newServerCfg, ok := newByName[name]
 		if !ok {
-			logger.Info("Config reload: server removed from the config but keeps running until restart", "server", name, "type", started.Type)
+			logger.Info("Config reload: server removed or set to enabled = false, but it keeps running until a restart", "server", name, "type", started.Type)
 			continue
 		}
 		var reloadable []string
@@ -88,13 +88,19 @@ func (deps *serverDependencies) reloadServers(newCfg *config.Config) {
 			}
 			reloadable = reloadableServerSettings[started.Type]
 		}
+		// Both configurations are enabled; omitted and explicit true are equivalent.
+		started.Enabled, newServerCfg.Enabled = nil, nil
 		if changed := started.RestartRequiredChanges(newServerCfg, reloadable); len(changed) > 0 {
 			logger.Info("Config reload: server settings changed but require restart to take effect", "server", name, "fields", changed)
 		}
 	}
 	for _, s := range newServers {
 		if !startedByName[s.Name] {
-			logger.Info("Config reload: server added to the config but not started until restart", "server", s.Name, "type", s.Type)
+			if err := s.Validate(); err != nil {
+				logger.Error("Config reload: invalid server config; a restart will refuse to start with it", "server", s.Name, "type", s.Type, "error", err)
+				continue
+			}
+			logger.Info("Config reload: server added or enabled but not running; it is not started until restart", "server", s.Name, "type", s.Type)
 		}
 	}
 }

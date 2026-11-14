@@ -113,10 +113,16 @@ func createHTTPAPIClient(cfg AdminConfig) (*http.Client, error) {
 // loadAdminConfig loads admin configuration from a TOML file with the same safety features as LoadConfigFromFile
 // This provides: duplicate key handling, unknown key warnings, enhanced error messages, and whitespace trimming
 func loadAdminConfig(configPath string, cfg *AdminConfig) error {
-	// Use the full config loader from the config package for consistency
-	fullCfg := &config.Config{}
+	// Use the full config loader from the config package for consistency. [shared_mailboxes]
+	// starts from the server's defaults: `mailbox create` and `mailbox rename` classify names
+	// by namespace_prefix, and with enabled = true and no prefix an empty one would put every
+	// mailbox in the shared namespace, where the server uses "Shared/".
+	fullCfg := &config.Config{SharedMailboxes: config.NewDefaultConfig().SharedMailboxes}
 	if err := config.LoadConfigFromFile(configPath, fullCfg); err != nil {
 		return err
+	}
+	if err := fullCfg.SharedMailboxes.Validate(); err != nil {
+		return fmt.Errorf("[shared_mailboxes]: %w", err)
 	}
 
 	// Extract the parts we need for admin operations

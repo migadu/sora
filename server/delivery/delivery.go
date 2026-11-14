@@ -160,6 +160,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// (the S3 object key, cache key and upload-dedup key) must describe the bytes that are
 	// actually stored.
 	var mailboxName string
+	var relayAfterStore func() bool
 	var copyMailboxes []string   // further Sieve destinations, saved once the body is staged
 	var createMailboxes []string // Sieve fileinto :create targets, created if missing
 	var sieveFlags []imap.Flag   // flags set by the Sieve script (imap4flags, RFC 5232)
@@ -184,6 +185,16 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			result.Discarded = true
 			result.Success = true
 			return result, nil
+		}
+
+		if outcome.RedirectOnly {
+			if outcome.Redirect() {
+				result.Discarded = true
+				result.Success = true
+				return result, nil
+			}
+		} else {
+			relayAfterStore = outcome.Redirect
 		}
 
 		mailboxName = outcome.MailboxName
@@ -352,6 +363,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			result.Success = true
 			result.MailboxName = mailbox.Name
 			result.MessageUID = uint32(messageUID)
+			if relayAfterStore != nil {
+				relayAfterStore()
+			}
 			// Don't notify uploader for duplicates
 			return result, nil
 		}
@@ -382,6 +396,10 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 	// Notify uploader
 	d.Uploader.NotifyUploadQueued()
+
+	if relayAfterStore != nil {
+		relayAfterStore()
+	}
 
 	// Track metrics
 	metrics.MessageThroughput.WithLabelValues(d.MetricsLabel, "delivered", "success").Inc()

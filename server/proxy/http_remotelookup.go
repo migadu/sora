@@ -79,7 +79,7 @@ type CircuitBreakerSettings struct {
 	Interval     time.Duration // Time before resetting failure counts in closed state
 	Timeout      time.Duration // Time before transitioning from open to half-open
 	FailureRatio float64       // Failure ratio threshold to open circuit (0.0-1.0)
-	MinRequests  uint32        // Minimum requests before evaluating failure ratio
+	MinRequests  uint32        // Minimum completed requests before evaluating failure ratio
 }
 
 // TransportSettings holds HTTP transport configuration for connection pooling and timeouts
@@ -135,9 +135,11 @@ func NewHTTPRemoteLookupClient(
 	minRequests := cbSettings.MinRequests
 
 	settings.ReadyToTrip = func(counts circuitbreaker.Counts) bool {
-		// Open circuit if failure ratio exceeds threshold
-		ratio := float64(counts.TotalFailures) / float64(counts.Requests)
-		return counts.Requests >= minRequests && ratio >= failureRatio
+		// Pending requests have no verdict yet, including with a configured
+		// counting interval. Take both the minimum and ratio over results.
+		results := counts.Results()
+		ratio := float64(counts.TotalFailures) / float64(results)
+		return results >= minRequests && ratio >= failureRatio
 	}
 	settings.OnStateChange = func(name string, from circuitbreaker.State, to circuitbreaker.State) {
 		logger.Warn("remotelookup: Circuit breaker state changed", "name", name, "from", from, "to", to)
@@ -269,11 +271,9 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	result, err := c.breaker.Execute(func() (any, error) {
 		// Build request URL by interpolating placeholders:
 		// - $email: user email (MasterAddress - includes master token but not +detail)
-		// - $ip: client IP address
+		// - $ip: client IP address; empty when the caller has none, never the literal placeholder
 		requestURL := strings.ReplaceAll(c.baseURL, "$email", url.QueryEscape(lookupEmail))
-		if clientIP != "" {
-			requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
-		}
+		requestURL = strings.ReplaceAll(requestURL, "$ip", url.QueryEscape(clientIP))
 
 		// Add route_only parameter if requested (for master username authentication)
 		if routeOnly {
@@ -449,11 +449,21 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	if resultMap, ok := result.(map[string]any); ok {
 		if authResult, ok := resultMap["result"].(AuthResult); ok {
 			if authResult == AuthUserNotFound {
-				// Don't cache user not found - these should always go to remotelookup
-				// This prevents issues with user creation between cache checks
+				// Not cached here, and no dummy verification here: with lookup_local_users
+				// the caller goes on to the database login, which verifies; otherwise the
+				// caller refuses, spends the verification itself and caches the refusal
+				// for that password, as it does a wrong one.
 				return nil, AuthUserNotFound, nil
 			}
 			if authResult == AuthFailed {
+				// 401/403: the service refused the account by its address, as it never
+				// sees the password. A wrong password for an address it knows is refused
+				// only after verifyPassword below, so spend the same verification here,
+				// or the quicker answer shows that the address has a refused account. A
+				// route-only lookup has no password to verify.
+				if !routeOnly {
+					db.DummyVerifyPassword(password)
+				}
 				// Don't cache auth failures - these could be typos or password changes
 				// Better to always check remotelookup for security
 				return nil, AuthFailed, nil

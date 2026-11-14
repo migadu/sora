@@ -394,8 +394,10 @@ func handleConfigReload(current, next *config.Config) {
 	}
 
 	// Every server and proxy takes trusted_networks at start-up: until a restart, the
-	// networks they started with stay trusted and added ones are not.
-	if !slices.Equal(next.Servers.TrustedNetworks, current.Servers.TrustedNetworks) {
+	// Networks stay fixed until restart; report malformed replacements as errors.
+	if err := next.ValidateTrustedNetworks(); err != nil {
+		logger.Error("Config reload: servers.trusted_networks is invalid and the server will not start with this config; the networks the servers started with stay trusted", "error", err)
+	} else if !slices.Equal(next.Servers.TrustedNetworks, current.Servers.TrustedNetworks) {
 		logger.Warn("Config reload: servers.trusted_networks changed but requires restart to take effect; the networks the servers started with stay trusted until then",
 			"current", current.Servers.TrustedNetworks, "new", next.Servers.TrustedNetworks)
 	}
@@ -430,8 +432,13 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 
 	// Get all configured servers
 	allServers := cfg.GetAllServers()
+	for _, server := range cfg.DynamicServers {
+		if !server.IsEnabled() {
+			logger.Info("Server block has enabled = false - not starting it", "server", server.Name, "type", server.Type)
+		}
+	}
 
-	// Validate all server configurations
+	// Validate all server configurations, including a block that lacks type, name or addr
 	for _, server := range allServers {
 		if err := server.Validate(); err != nil {
 			errorHandler.ValidationError(fmt.Sprintf("server '%s'", server.Name), err)
@@ -451,6 +458,17 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 		os.Exit(errorHandler.WaitForExit())
 	}
 
+	// One malformed trusted_networks entry would leave LMTP admission with no peers.
+	if err := cfg.ValidateTrustedNetworks(); err != nil {
+		errorHandler.ValidationError("trusted_networks", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
+	if err := cfg.SharedMailboxes.Validate(); err != nil {
+		errorHandler.ValidationError("[shared_mailboxes]", err)
+		os.Exit(errorHandler.WaitForExit())
+	}
+
 	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
 	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
 	if missing := cfg.ProxyProtocolListenersMissingTrust(); len(missing) > 0 {
@@ -465,7 +483,8 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	// the insecure-wide pattern. (security-audit M2)
 	if len(cfg.Servers.TrustedNetworks) == 0 {
 		logger.Info("trusted_networks is empty (fail-closed default): PROXY/XCLIENT client-IP forwarding and " +
-			"auth rate-limit exemption are disabled; LMTP still accepts delivery from default private ranges. " +
+			"auth rate-limit exemption are disabled; LMTP and lmtp_proxy still accept delivery from the default " +
+			"private ranges (loopback and RFC 1918). " +
 			"Set [servers] trusted_networks to your proxy IPs to enable forwarding/exemption.")
 	} else if config.TrustedNetworksHaveBroadPrivateRanges(cfg.Servers.TrustedNetworks) {
 		logger.Warn("trusted_networks includes whole private ranges (e.g. 10.0.0.0/8): every host on those " +
@@ -639,9 +658,11 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 
 	// Initialize S3 storage for mail services or a User API body reader.
 	if s3Needed {
-		// Ensure required S3 arguments are provided only if needed
-		if cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
-			errorHandler.ValidationError("S3 credentials", fmt.Errorf("missing required S3 credentials for mail services (IMAP, LMTP, POP3) or the User API"))
+		// Ensure required S3 arguments are provided only if needed. Without access_key and
+		// secret_key the AWS default credential chain supplies them, and storage.New
+		// refuses to start when it finds none.
+		if cfg.S3.Bucket == "" {
+			errorHandler.ValidationError("S3 bucket", fmt.Errorf("missing required S3 bucket for mail services (IMAP, LMTP, POP3) or the User API"))
 			os.Exit(errorHandler.WaitForExit())
 		}
 
@@ -657,7 +678,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			os.Exit(errorHandler.WaitForExit())
 		}
 		logger.Info("Connecting to S3", "endpoint", s3EndpointToUse, "bucket", cfg.S3.Bucket, "timeout", s3Timeout)
-		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug(), s3Timeout)
+		deps.storage, err = storage.New(s3EndpointToUse, cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, !cfg.S3.DisableTLS, cfg.S3.GetDebug(), s3Timeout, storage.WithRegion(cfg.S3.Region))
 		if err != nil {
 			errorHandler.FatalError(fmt.Sprintf("initialize S3 storage at endpoint '%s'", s3EndpointToUse), err)
 			os.Exit(errorHandler.WaitForExit())
@@ -1875,6 +1896,8 @@ func startDynamicIMAPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseIDCommand:       serverConfig.RemoteUseIDCommand,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2008,6 +2031,8 @@ func startDynamicPOP3ProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:         serverConfig.RemoteUseXCLIENT,
 		RemoteUseUTF8:            serverConfig.RemoteUseUTF8,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2135,6 +2160,8 @@ func startDynamicManageSieveProxyServer(ctx context.Context, deps *serverDepende
 		RemoteTLSUseStartTLS:     serverConfig.RemoteTLSUseStartTLS,
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2262,6 +2289,8 @@ func startDynamicLMTPProxyServer(ctx context.Context, deps *serverDependencies, 
 		RemoteTLSVerify:          serverConfig.RemoteTLSVerify,
 		RemoteUseProxyProtocol:   serverConfig.RemoteUseProxyProtocol,
 		RemoteUseXCLIENT:         serverConfig.RemoteUseXCLIENT,
+		ProxyProtocol:            serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout:     serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		ConnectTimeout:           connectTimeout,
 		RemoteDNSRefresh:         remoteDNSRefresh,
 		AuthIdleTimeout:          authIdleTimeout,
@@ -2441,6 +2470,10 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		MaxRedirectHops:    serverConfig.GetMaxRedirectHops(),
 		SieveExtensions:    deps.config.Sieve.EnabledExtensions,
 		SharedMailboxes:    deps.config.SharedMailboxes,
+		// Incoming PROXY headers, accepted only from trusted_networks.
+		ProxyProtocol:        serverConfig.ProxyProtocol,
+		ProxyProtocolTimeout: serverConfig.GetProxyProtocolTimeoutWithDefault(),
+		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
 	}
 	// Set only when the feature is on: a nil pointer stored in an interface field is a
 	// non-nil interface, and the handlers tell "not enabled on this node" by comparing
