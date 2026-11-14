@@ -110,6 +110,9 @@ func parsePasswordHash(stored string) (h parsedHash, err error) {
 				break
 			}
 		}
+		// Dovecot's base64_decode ignores SP, TAB, CR and LF. Go already
+		// ignores CR/LF; remove SP/TAB only here, after encoding detection.
+		data = strings.ReplaceAll(strings.ReplaceAll(data, " ", ""), "\t", "")
 		raw, err = base64.StdEncoding.DecodeString(data)
 	}
 	if err != nil {
@@ -167,6 +170,14 @@ func checkBcrypt(h []byte) error {
 		if !(c == '.' || c == '/' || 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9') {
 			return unverifiable("bcrypt salt and hash are not in bcrypt's base64 alphabet")
 		}
+	}
+	// The 23-byte checksum occupies 31 base64 characters, leaving two unused
+	// low bits in the last one. Go recomputes that checksum canonically; a stored
+	// value with nonzero unused bits can never match any password. Do not impose
+	// this on the salt, whose original spelling Go retains when comparing.
+	const alphabet = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	if strings.IndexByte(alphabet, h[bcryptHashLen-1])&3 != 0 {
+		return unverifiable("bcrypt checksum has nonzero base64 padding bits")
 	}
 	return nil
 }

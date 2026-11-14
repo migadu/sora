@@ -39,6 +39,10 @@ func dovecotSpellings(t *testing.T, password string) []string {
 	}
 	bc2y := "$2y$" + string(bc[4:]) // what Dovecot's BLF-CRYPT and CRYPT generate
 	b64 := base64.StdEncoding.EncodeToString
+	spacedB64 := func(raw []byte) string {
+		encoded := b64(raw)
+		return encoded[:4] + " \t\r\n" + encoded[4:]
+	}
 
 	return []string{
 		"{ssha512}" + b64(sshaRaw),
@@ -56,6 +60,9 @@ func dovecotSpellings(t *testing.T, password string) []string {
 		"{Blf-Crypt}" + string(bc),
 		"{CRYPT}" + bc2y,
 		"{crypt}" + string(bc),
+		"{SSHA512.b64}" + spacedB64(sshaRaw),
+		"{SHA512.b64}" + spacedB64(sha[:]),
+		"{BLF-CRYPT.b64}" + spacedB64([]byte(bc2y)),
 	}
 }
 
@@ -166,6 +173,8 @@ func TestValidatePasswordHash(t *testing.T) {
 		"{SSHA512.hex}" + sshaHex[len("{SSHA512.HEX}"):] + "z",
 		"{SHA512}" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xff}, 96)), // not hex either
 		"{SHA512.hex}" + hex.EncodeToString(make([]byte, 63)),
+		"{SHA512.hex}" + hex.EncodeToString(make([]byte, 32)) + " \t" + hex.EncodeToString(make([]byte, 32)),
+		"{SHA512.b64}" + base64.StdEncoding.EncodeToString(make([]byte, 64)) + "\v",
 		"{BLF-CRYPT}$2a$12$tooShortToBeBcrypt",
 		blf + "\n",
 		"$2a$03$" + salt + strings.Repeat("h", 31), // cost below bcrypt.MinCost
@@ -188,6 +197,37 @@ func TestValidatePasswordHash(t *testing.T) {
 		}
 		if strings.Contains(strings.ToLower(err.Error()), "secret") {
 			t.Errorf("ValidatePasswordHash(%q) = %q: quotes the value", hash, err)
+		}
+	}
+}
+
+// bcrypt encodes 23 checksum bytes in 31 characters: the last character's two
+// low bits are always zero. Go preserves a stored salt's spelling but recomputes
+// the checksum canonically, so a checksum with other low bits can never match.
+func TestValidatePasswordHashRejectsNoncanonicalBcryptChecksum(t *testing.T) {
+	const password = "pw"
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const alphabet = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	last := strings.IndexByte(alphabet, hash[len(hash)-1])
+	hash[len(hash)-1] = alphabet[last|1]
+	if err := bcrypt.CompareHashAndPassword(hash, []byte(password)); !errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+		t.Fatalf("noncanonical checksum compared with its source password: %v", err)
+	}
+	for _, stored := range []string{
+		string(hash),
+		"{BLF-CRYPT}" + string(hash),
+		"{CRYPT}" + string(hash),
+		"{BLF-CRYPT.b64}" + base64.StdEncoding.EncodeToString(hash),
+		"{CRYPT.hex}" + hex.EncodeToString(hash),
+	} {
+		if err := ValidatePasswordHash(stored); !errors.Is(err, ErrUnverifiableHash) {
+			t.Errorf("ValidatePasswordHash(%q) = %v, want ErrUnverifiableHash", stored, err)
+		}
+		if err := VerifyPassword(stored, password); !errors.Is(err, ErrUnverifiableHash) || errors.Is(err, ErrInvalidCredentials) {
+			t.Errorf("VerifyPassword(%q) = %v, want ErrUnverifiableHash and not ErrInvalidCredentials", stored, err)
 		}
 	}
 }

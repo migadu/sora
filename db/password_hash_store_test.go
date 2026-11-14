@@ -51,9 +51,10 @@ func TestStoredPasswordHashesMustBeVerifiable(t *testing.T) {
 
 	const password = "pw-123456"
 	unverifiable := map[string]string{
-		"password in the hash field": "Secret-2026",
-		"unsupported scheme":         sha512CryptOfSecret,
-		"SSHA512 without a salt":     "{SSHA512}" + base64.StdEncoding.EncodeToString([]byte("tooshort")),
+		"password in the hash field":                "Secret-2026",
+		"unsupported scheme":                        sha512CryptOfSecret,
+		"SSHA512 without a salt":                    "{SSHA512}" + base64.StdEncoding.EncodeToString([]byte("tooshort")),
+		"bcrypt checksum with nonzero padding bits": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWz",
 	}
 	dovecot := dovecotSpellings(t, password)[2] // {SSHA512.hex}
 
