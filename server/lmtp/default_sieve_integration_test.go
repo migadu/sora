@@ -123,7 +123,7 @@ vacation :days 7 :subject "Away" "I am away.";
 	}
 	deliver(accountA.Email, 4)
 	assertReplies(accountA.Email, accountB.Email, accountA.Email)
-	assertRecords(accountAID, 2)
+	assertRecords(accountAID, 1) // the new period supersedes the expired one
 	deliver(accountB.Email, 5)
 	assertReplies(accountA.Email, accountB.Email, accountA.Email)
 	assertRecords(accountBID, 1)

@@ -48,6 +48,7 @@ type Server struct {
 	storage                    *storage.S3Storage
 	rs3                        *resilient.ResilientS3Storage // storage behind retries + breaker; nil when storage is
 	uploader                   *uploader.UploadWorker
+	uploadMaxAttempts          int // [uploader] max_attempts for a node without uploader; see ServerOptions
 	cache                      *cache.Cache
 	authCache                  *lookupcache.LookupCache
 	positiveRevalidationWindow time.Duration
@@ -77,7 +78,12 @@ type ServerOptions struct {
 	// Uploader is this node's upload worker: bodies not yet in S3 are read from its
 	// staging spool, and its max_attempts tells a body still on its way from one the
 	// worker has given up on (see loadMessageBody). Optional.
-	Uploader                    *uploader.UploadWorker
+	Uploader *uploader.UploadWorker
+	// UploadMaxAttempts is [uploader] max_attempts, used when there is no Uploader (a
+	// User API node without imap, lmtp or pop3): the uploaders give up on a body after
+	// that many attempts, so it is gone, not "retry later". 0 counts every pending
+	// upload as on its way.
+	UploadMaxAttempts           int
 	AuthRateLimit               server.AuthRateLimiterConfig
 	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
 	TLS                         bool
@@ -128,8 +134,8 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		return nil, err
 	}
 
-	if options.TokenDuration == 0 {
-		options.TokenDuration = 24 * time.Hour // Default to 24 hours
+	if options.TokenDuration <= 0 {
+		options.TokenDuration = 24 * time.Hour // Default to 24 hours; a negative lifetime would mint expired tokens
 	}
 	if options.TokenDuration > maxTokenDuration {
 		logger.Warn("User API: token_duration exceeds maximum; clamping",
@@ -180,10 +186,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 			cleanupInterval = 5 * time.Minute
 		}
 
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize == 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		positiveRevalidationWindow, err = lookupCacheConfig.GetPositiveRevalidationWindow()
 		if err != nil {
@@ -223,6 +226,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		rs3:                        newResilientStorage(options.Storage),
 		cache:                      options.Cache,
 		uploader:                   options.Uploader,
+		uploadMaxAttempts:          options.UploadMaxAttempts,
 		authCache:                  authCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		authLimiter:                authLimiter,
@@ -238,6 +242,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		allowedOrigins: options.AllowedOrigins,
 		allowedHosts:   options.AllowedHosts,
 	})
+	warnUnusableAllowedHosts(options.Name, options.AllowedHosts)
 
 	return s, nil
 }
@@ -269,6 +274,7 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 	}
 	if !slices.Equal(cfg.AllowedHosts, next.allowedHosts) {
 		next.allowedHosts = slices.Clone(cfg.AllowedHosts)
+		warnUnusableAllowedHosts(s.name, next.allowedHosts)
 		reloaded = append(reloaded, "allowed_hosts")
 	}
 
@@ -415,7 +421,10 @@ func (s *Server) SetupRoutes() http.Handler {
 
 // handleMailboxWithName routes mailbox operations that include a mailbox name
 func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
+	// The endpoint is picked by what follows the name, in the escaped path (an
+	// encoded "/" belongs to the name, see pathName) and only after a name: a
+	// DELETE of the top-level mailbox "search" deletes that mailbox.
+	path := strings.TrimPrefix(escapedRoutingPath(r), "/user/mailboxes/")
 
 	// Check for subscribe/unsubscribe operations
 	if strings.HasSuffix(path, "/subscribe") {
@@ -499,10 +508,12 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 
 // handleFilterOperations routes Sieve filter operations
 func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
+	// As in handleMailboxWithName: /activate is matched only after a script
+	// name, so a script named "activate" is addressed by that name.
+	path := strings.TrimPrefix(escapedRoutingPath(r), "/user/filters/")
 
 	// Check for capabilities endpoint
-	if strings.HasSuffix(path, "/capabilities") {
+	if path == "capabilities" {
 		if r.Method != "GET" {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -551,7 +562,9 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 
 		// Check if origin is allowed
 		allowedOrigins := s.settings.Load().allowedOrigins
-		if origin != "" && len(allowedOrigins) > 0 {
+		if len(allowedOrigins) > 0 {
+			// The first matching entry decides: "*" answers with a literal "*",
+			// a listed origin is reflected with credentials.
 			allowed := false
 			wildcard := false
 			for _, allowedOrigin := range allowedOrigins {
@@ -560,10 +573,19 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 					wildcard = true
 					break
 				}
-				if allowedOrigin == origin {
+				if origin != "" && allowedOrigin == origin {
 					allowed = true
 					break
 				}
+			}
+			// Fetch Standard, "CORS protocol and HTTP caches": a "*" is sent on
+			// every response, CORS request or not, and needs no Vary; an answer
+			// that depends on the request's Origin needs Vary: Origin on every
+			// response, including the ones that do not reflect it, or a cache can
+			// answer one origin with a response stored for another. The answer is
+			// the same "*" for everyone only when "*" is the first entry.
+			if allowedOrigins[0] != "*" {
+				w.Header().Add("Vary", "Origin")
 			}
 
 			if allowed {
@@ -624,29 +646,21 @@ func getClientIP(r *http.Request) string {
 	return host
 }
 
+// isIPAllowed reports whether clientIP matches an IP or CIDR entry of allowedHosts.
+// An entry that is neither (a host name, a typo) matches no client but does not stop
+// the other entries from matching; warnUnusableAllowedHosts reports it once per list.
 func isIPAllowed(clientIP string, allowedHosts []string) bool {
-	networks, err := helpers.ParseTrustedNetworks(allowedHosts)
-	if err != nil {
-		logger.Warn("userapi: failed to parse allowed hosts as CIDR, falling back to literal matching", "error", err)
-		for _, allowedHost := range allowedHosts {
-			if allowedHost == clientIP {
-				return true
-			}
-		}
-		return false
-	}
+	return helpers.IPInNetworks(net.ParseIP(clientIP), allowedHosts)
+}
 
-	ip := net.ParseIP(clientIP)
-	if ip == nil {
-		return false
-	}
-
-	for _, network := range networks {
-		if network.Contains(ip) {
-			return true
+// warnUnusableAllowedHosts logs the allowed_hosts entries that are not an IP address
+// or CIDR, when a list is configured (startup) or replaced (reload).
+func warnUnusableAllowedHosts(name string, allowedHosts []string) {
+	for _, entry := range allowedHosts {
+		if _, err := helpers.ParseTrustedNetworks([]string{entry}); err != nil {
+			logger.Warn("HTTP Mail API: allowed_hosts entry is not an IP address or CIDR and matches no client", "name", name, "entry", entry)
 		}
 	}
-	return false
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, data any) {

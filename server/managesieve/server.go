@@ -140,7 +140,7 @@ type ManageSieveServerOptions struct {
 	MasterPassword              string
 	MasterSASLUsername          string
 	MasterSASLPassword          string
-	MasterSASLAllowedNetworks   []string // Source networks allowed to use master SASL (empty = any, anchored to real socket peer)
+	MasterSASLAllowedNetworks   []string // Source networks allowed to use master SASL and the master-username form (empty = any, anchored to real socket peer)
 	MaxConnections              int
 	MaxConnectionsPerIP         int
 	MaxConnectionsPerUser       int      // Maximum connections per user (0=unlimited) - used for local tracking on backends
@@ -225,14 +225,8 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 	// If no config provided, use defaults and enable cache
 	if lookupCacheConfig == nil {
-		lookupCacheConfig = &config.LookupCacheConfig{
-			Enabled:                    true,
-			PositiveTTL:                "5m",
-			NegativeTTL:                "1m",
-			MaxSize:                    10000,
-			CleanupInterval:            "5m",
-			PositiveRevalidationWindow: "30s",
-		}
+		defaultConfig := config.DefaultLookupCacheConfig()
+		lookupCacheConfig = &defaultConfig
 	}
 
 	// Only disable if explicitly set to false
@@ -257,10 +251,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 			cleanupInterval = 5 * time.Minute
 		}
 
-		maxSize := lookupCacheConfig.MaxSize
-		if maxSize == 0 {
-			maxSize = 10000
-		}
+		maxSize := lookupCacheConfig.GetMaxSize()
 
 		positiveRevalidationWindow, err := lookupCacheConfig.GetPositiveRevalidationWindow()
 		if err != nil {

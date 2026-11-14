@@ -400,7 +400,7 @@ func TestTextUnionSearchResults(t *testing.T) {
 }
 
 // Database test helpers for search tests
-func setupSearchTestDatabase(t *testing.T) (*Database, int64, int64) {
+func setupSearchTestDatabase(t testing.TB) (*Database, int64, int64) {
 	db := setupTestDatabase(t)
 
 	ctx := context.Background()
@@ -1071,20 +1071,21 @@ func TestSearchCriteriaValidation(t *testing.T) {
 			valid: true,
 		},
 		{
-			name: "invalid date range",
+			// Valid searches that match nothing (#283).
+			name: "empty date range",
 			criteria: &imap.SearchCriteria{
 				Since:  time.Now(),
 				Before: time.Now().Add(-24 * time.Hour), // Before is after Since
 			},
-			valid: false,
+			valid: true,
 		},
 		{
-			name: "invalid size range",
+			name: "empty size range",
 			criteria: &imap.SearchCriteria{
 				Larger:  1000,
 				Smaller: 500, // Smaller is less than Larger
 			},
-			valid: false,
+			valid: true,
 		},
 		{
 			name: "too many text search terms",

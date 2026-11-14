@@ -127,3 +127,25 @@ func matchProtocolFilter(trackerKey, filterProtocol string) bool {
 
 	return exactMatch || prefixMatch
 }
+
+// TestTrackerInstance covers the Instance column of "connections list". A
+// proxy tracker is keyed "<PROTOCOL>-<node_id>-<listener>", and both names
+// commonly contain dashes, so dropping a fixed number of dash-separated parts
+// printed part of the node ID as if it were the listener.
+func TestTrackerInstance(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+	}{
+		{"IMAP-node-1-imap-proxy", "node-1-imap-proxy"},
+		{"ManageSieve-mx1-sieve-proxy", "mx1-sieve-proxy"},
+		{"POP3-pop3-backend", "pop3-backend"},
+		{"IMAP-imap", "imap"},
+		{"LMTP", "LMTP"},
+	}
+	for _, tt := range tests {
+		if got := trackerInstance(tt.key); got != tt.want {
+			t.Errorf("trackerInstance(%q) = %q, want %q", tt.key, got, tt.want)
+		}
+	}
+}

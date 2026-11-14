@@ -15,6 +15,7 @@ import (
 	"github.com/emersion/go-message/mail"
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -44,6 +45,9 @@ type DeliveryContext struct {
 	SieveExecutor SieveExecutor
 	Logger        Logger
 	OwnerResolver *resilient.OwnerResolver
+	// SharedMailboxes is [shared_mailboxes]: Sieve fileinto :create never makes a
+	// personal mailbox in its namespace.
+	SharedMailboxes config.SharedMailboxesConfig
 }
 
 // uploadInstanceID is the identity this delivery stamps on the pending_uploads row it
@@ -157,6 +161,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// actually stored.
 	var mailboxName string
 	var copyMailbox string     // Sieve `fileinto :copy` target, saved once the body is staged
+	var createMailbox string   // Sieve `fileinto :create` target, created if missing
 	var sieveFlags []imap.Flag // flags set by the Sieve script (imap4flags, RFC 5232)
 
 	if recipient.TargetMailbox != "" {
@@ -183,6 +188,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 		mailboxName = outcome.MailboxName
 		copyMailbox = outcome.CopyMailbox
+		createMailbox = outcome.CreateMailbox
 		sieveFlags = outcome.Flags
 		// Adopt any header edits the script made (RFC 5293) before anything is derived
 		// from the message.
@@ -249,11 +255,23 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		return result, fmt.Errorf("failed to check file existence: %w", err)
 	}
 
+	ctx := d.Ctx
+	if createMailbox != "" {
+		// The mailbox is created on the writer, and a replica may not have it yet when
+		// the target is resolved below: read from the writer from here on, or the
+		// message would fall back to INBOX (as LMTP does, which pins every delivery).
+		ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+		if err := d.createMissingMailbox(ctx, recipient, createMailbox); err != nil {
+			result.ErrorMessage = fmt.Sprintf("Failed to create Sieve fileinto :create target %s: %v", createMailbox, err)
+			return result, err
+		}
+	}
+
 	// Sieve `fileinto :copy`: save the second copy now that the body is on disk, so its
 	// pending_uploads row can never name a file that is not staged yet - the uploader
 	// treats a missing local file as permanently lost content.
 	if copyMailbox != "" {
-		err := d.SaveMessageToMailbox(d.Ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, deliveryFlags, contentHash, bodyStructure)
+		err := d.SaveMessageToMailbox(ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, deliveryFlags, contentHash, bodyStructure)
 		// A duplicate copy is an accepted delivery, as it is in LMTP: the copy is
 		// already in the mailbox, so a resubmission must not fail the delivery.
 		if err != nil && !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
@@ -266,7 +284,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// account), enforce the 'i' right, attribute the message to the mailbox owner, and
 	// stage the already-saved body under the owner's path. The body was stored locally
 	// under recipient.AccountID above.
-	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(d.Ctx, recipient, mailboxName, contentHash)
+	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash)
 	if err != nil {
 		result.ErrorMessage = fmt.Sprintf("Failed to resolve destination mailbox: %v", err)
 		return result, err
@@ -274,7 +292,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 	// Save message to mailbox
 	size := int64(len(messageBytes))
-	_, messageUID, err := d.RDB.InsertMessageWithRetry(d.Ctx,
+	_, messageUID, err := d.RDB.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
 			AccountID:            destAccountID,
 			MailboxID:            mailbox.ID,
@@ -421,6 +439,55 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 		Address:   &primaryAddr, // Primary address (for S3 keys, metrics, etc.)
 		ToAddress: &toAddress,   // Recipient address as sent (may include +alias)
 	}, nil
+}
+
+// CanFileInto reports whether a message for accountID can be filed into the mailbox
+// named name: one of the account's own, or one shared with it with the insert right
+// (RFC 4314 'i'), resolved the way delivery resolves a fileinto target. It is the
+// Sieve mailboxexists test (RFC 5490 §3.1): the mailbox exists "and each allows the
+// user in whose context the Sieve script runs to "deliver" messages into it".
+func CanFileInto(ctx context.Context, rdb *resilient.ResilientDatabase, accountID int64, name string) (bool, error) {
+	mailbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, name)
+	if errors.Is(err, consts.ErrMailboxNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if mailbox.AccountID == accountID {
+		return true, nil
+	}
+	return rdb.CheckMailboxPermissionWithRetry(ctx, mailbox.ID, accountID, db.ACLRightInsert)
+}
+
+// createMissingMailbox carries out a Sieve fileinto :create (RFC 5490 §3.2): it
+// creates the recipient's mailbox named name "if needed". A mailbox the recipient
+// already has by that name, its own or one shared with it, is used as it is ("If the
+// mailbox already exists, this argument is ignored"). None is created in the shared
+// namespace, where a personal namesake would shadow a shared mailbox in later
+// lookups; the message then falls back to INBOX, as for any missing target.
+//
+// A name the mailstore refuses is no delivery failure either: "Failure to create the
+// specified mailbox is considered to be an error" (RFC 5490 §3.2), and on an error
+// implementations "do an implicit keep" (RFC 5228 §2.10.6), so the message goes to
+// INBOX. The name never becomes valid; failing the delivery would only have it
+// retried until it bounces, and through the default script's +detail filing any
+// sender can choose the name.
+func (d *DeliveryContext) createMissingMailbox(ctx context.Context, recipient RecipientInfo, name string) error {
+	_, err := d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, name)
+	if !errors.Is(err, consts.ErrMailboxNotFound) {
+		return err // nil: the mailbox exists
+	}
+	if d.SharedMailboxes.InNamespace(name) {
+		d.Logger.Log("Sieve fileinto :create refused in the shared namespace: %s", name)
+		return nil
+	}
+	_, err = d.RDB.GetOrCreateMailboxByNameWithRetry(ctx, recipient.AccountID, name)
+	if errors.Is(err, consts.ErrMailboxInvalidName) {
+		d.Logger.Log("Sieve fileinto :create of an invalid mailbox name %q, keeping the message: %v", name, err)
+		return nil
+	}
+	return err
 }
 
 // resolveOwnedTarget resolves mailboxName for the recipient, supporting shared

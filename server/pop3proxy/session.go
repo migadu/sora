@@ -352,15 +352,8 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		}
 
 		if err != nil {
-			// Categorize the error type to determine fallback behavior
-			if errors.Is(err, proxy.ErrRemoteLookupInvalidResponse) {
-				// Invalid response from remotelookup (malformed 2xx) - this is a server bug, fail hard
-				s.WarnLog("remotelookup returned invalid response - server bug, rejecting authentication", "error", err)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return fmt.Errorf("remotelookup server error: invalid response")
-			}
-
+			// Categorize the error type to determine fallback behavior. A malformed
+			// answer arrives as ErrRemoteLookupTransient: a broken lookup service.
 			if errors.Is(err, proxy.ErrRemoteLookupTransient) {
 				// Check if this is due to context cancellation (server shutdown)
 				if errors.Is(err, server.ErrServerShuttingDown) {
@@ -370,12 +363,14 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				}
 
 				// Transient error (network, 5xx, circuit breaker) - NEVER fallback to DB
-				// These are service availability issues, not "user not found" cases
+				// These are service availability issues, not "user not found" cases.
+				// Nothing is wrong with the client's credentials: answer a temporary
+				// failure (-ERR [SYS/TEMP]) and do not charge the auth rate limiter, or
+				// clients retrying during an outage get delayed and blocked.
 				s.WarnLog("remotelookup transient error - service unavailable", "error", err)
 				metrics.RemoteLookupResult.WithLabelValues("pop3", "transient_error_rejected").Inc()
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return fmt.Errorf("remotelookup service unavailable")
+				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
+				return server.ErrAuthServiceUnavailable
 			} else {
 				// Unknown error type - fallthrough to main DB auth
 			}
@@ -474,7 +469,7 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				// RemoteLookup service is temporarily unavailable - tell user to retry later
 				s.WarnLog("remotelookup service temporarily unavailable")
 				metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
-				return fmt.Errorf("authentication service temporarily unavailable, please try again later")
+				return server.ErrAuthServiceUnavailable
 
 			case proxy.AuthUserNotFound:
 				// User not found in remotelookup (404/3xx)
@@ -541,19 +536,9 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				return server.ErrServerShuttingDown
 			}
 
-			// Determine failure reason for logging
-			reason := "transient_error"
-			if errors.Is(err, consts.ErrUserNotFound) || strings.Contains(err.Error(), "user not found") {
-				reason = "user_not_found"
-			} else if strings.Contains(err.Error(), "hashedPassword is not the hash") {
-				reason = "invalid_password"
-			}
-
 			// Cache negative result (authentication failed)
 			// Only cache auth failures, not transient DB errors
-			isDefinitiveFailure := errors.Is(err, consts.ErrUserNotFound) ||
-				strings.Contains(err.Error(), "hashedPassword is not the hash") ||
-				strings.Contains(err.Error(), "user not found")
+			reason, isDefinitiveFailure := proxy.ClassifyDBAuthFailure(err)
 
 			if isDefinitiveFailure {
 				if s.server.lookupCache != nil {

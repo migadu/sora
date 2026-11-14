@@ -21,3 +21,9 @@ tasks/
 # Local multi-module dev bridge
 go.work
 go.work.sum
+
+# nix develop (flake.nix): local PostgreSQL and Garage state
+.pg/
+.db/
+.garage/
+garage_setup.sh

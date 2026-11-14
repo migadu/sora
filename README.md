@@ -42,7 +42,6 @@ It provides enterprise-grade email infrastructure with modern storage backends, 
 - **Health monitoring** with component status tracking (26 Prometheus metrics)
 - **Rate limiting** with cluster-wide synchronization and IP blocking
 - **Connection limits** per protocol, per IP, and per user
-- **Graceful degradation** strategies under load
 - **Background workers** with distributed task processing
 - **Relay queue** with disk persistence and exponential backoff retry
 - **JA4 TLS fingerprinting** for client detection and capability filtering

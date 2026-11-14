@@ -1,4 +1,4 @@
-package lmtp
+package delivery
 
 import (
 	"context"
@@ -180,7 +180,7 @@ func TestMergeSieveResultsKeepingUserScriptKeepsTheDefaultScriptsWork(t *testing
 					t.Fatalf("user script did not produce the expected keep: %+v", userResult)
 				}
 
-				merged, keptDefault := mergeSieveResults(defaultResult, userResult)
+				merged, keptDefault := MergeSieveResults(defaultResult, userResult)
 
 				if !keptDefault {
 					t.Errorf("keptDefault = false, want the user's keep to leave the default script's result standing")
@@ -225,7 +225,7 @@ func TestMergeSieveResultsUserActionOverridesDefault(t *testing.T) {
 				t.Fatalf("user script did not produce %s: %+v", user.want, userResult)
 			}
 
-			merged, keptDefault := mergeSieveResults(defaultResult, userResult)
+			merged, keptDefault := MergeSieveResults(defaultResult, userResult)
 
 			if keptDefault {
 				t.Errorf("keptDefault = true, want the user's explicit action to stand alone")
@@ -256,7 +256,7 @@ func TestMergeSieveResultsUserKeepPreservesDefaultAction(t *testing.T) {
 			defaultResult := evaluateSieve(t, `fileinto "Junk";`+defaultKeepWork)
 			userResult := evaluateSieve(t, user.script+` addheader "X-User" "user";`)
 
-			merged, keptDefault := mergeSieveResults(defaultResult, userResult)
+			merged, keptDefault := MergeSieveResults(defaultResult, userResult)
 
 			if !keptDefault {
 				t.Errorf("keptDefault = false, want the default's filing to stand")

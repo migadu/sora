@@ -9,7 +9,8 @@
 # - Copy this file to config.toml and modify the values for your deployment
 # - All sections and options are documented with their default values
 # - Duration values accept Go duration format: "1h", "30m", "5s", "100ms"
-# - Size values accept common suffixes: "1gb", "100mb", "5kb"
+# - Size values accept b, kb, mb, gb and tb suffixes in any case (powers of
+#   1024): "1gb", "100MB", "5kb"; a bare number is bytes
 #
 # CONFIG VALIDATION:
 # - Unknown keys will log warnings but are ignored (helps detect typos)
@@ -92,6 +93,11 @@ tls = false                   # Enable TLS/SSL for database connection. Recommen
 
 # --- WRITE DATABASE CONNECTION POOL SETTINGS ---
 # Fine-tune write database connection management for optimal performance.
+# The settings apply per host and per pool. Without [database.read], each write host
+# also serves the reads through a second, dedicated pool with these same settings (so
+# writes cannot starve reads), and the process can open up to twice max_connections
+# (and keeps twice min_idle_connections) to that host. With [database.read], each
+# write host gets one pool.
 max_connections = 50            # Maximum connections in the write pool. Should be < PostgreSQL max_connections.
 min_connections = 0             # Minimum connections eagerly created on startup (default: 0 to avoid connection spikes).
 min_idle_connections = 5        # Minimum idle connections lazily maintained (recommended: 5-20 for low latency, superior to min_connections).
@@ -104,7 +110,7 @@ query_timeout = "30s"           # Per-endpoint timeout for individual database q
 # =============================================================================
 # Read replica database endpoint(s) for SELECT operations. Can specify multiple
 # hosts for load balancing across read replicas. If not configured, read
-# operations will use the write database connection pool.
+# operations use a dedicated read pool to each write host (see above).
 
 [database.read]
 hosts = ["localhost"]         # Database server hosts for read operations. Can specify multiple for load balancing.
@@ -116,6 +122,7 @@ tls = false                   # Enable TLS/SSL for read database connections.
 
 # --- READ DATABASE CONNECTION POOL SETTINGS ---
 # Fine-tune read database connection management for optimal performance.
+# Each read host gets one pool with these settings.
 max_connections = 100           # Maximum connections in the read pool. Can be higher than write pool.
 min_connections = 0             # Minimum connections eagerly created on startup (default: 0 to avoid connection spikes).
 min_idle_connections = 10       # Minimum idle connections lazily maintained (recommended: 10-50 for read-heavy workloads).
@@ -217,7 +224,8 @@ storage_provider = "s3"                         # Certificate storage backend (c
 # sync_interval = "5m"                          # Interval to check S3 for certificate updates (e.g., "5m", "10m", "1h"). Default: "5m"
 #                                               # Set to "0" to disable periodic sync. When enabled, all cluster nodes will automatically
 #                                               # download renewed certificates from S3 without restart. This ensures all nodes serve the
-#                                               # same certificate even when the leader renews it.
+#                                               # same certificate even when the leader renews it. It also writes to S3 any
+#                                               # certificate a node could only store locally while S3 refused writes.
 
 # OPTIONAL: Local filesystem fallback for S3 outages (enabled by default)
 # enable_fallback = true                        # Enable local filesystem fallback when S3 is unavailable (default: true)
@@ -234,9 +242,12 @@ endpoint = "s3.amazonaws.com"                   # S3-compatible storage endpoint
                                                 # Can include protocol (https:// or http://) or omit it - protocol is automatically added based on disable_tls setting if not present
 disable_tls = false                             # Disable TLS for S3 endpoint (when true, uses http:// instead of https://). Useful for local MinIO setups.
                                                 # Note: Ignored if endpoint already includes a protocol scheme
-debug = false                                   # Enable detailed S3 request/response tracing (impacts performance)
-# access_key = ""                               # AWS/S3 access key (optional - uses IAM credentials chain if omitted)
-# secret_key = ""                               # AWS/S3 secret key (optional - uses IAM credentials chain if omitted)
+debug = false                                   # Log every S3 request and response at INFO (impacts performance)
+# region = "us-east-1"                          # Region requests are signed for. AWS refuses a signature for another region
+#                                               # than the bucket's. Default: AWS_REGION / the shared AWS config, else "us-east-1".
+# access_key = ""                               # AWS/S3 access key (optional - without both keys the AWS default credential
+# secret_key = ""                               # chain is used: environment, shared credentials file, web identity, container
+#                                               # or instance role)
 # server_side_encryption = "AES256"             # Encryption asked of the store on every certificate write. Default: "AES256".
                                                 # Every object here is private key material (each certificate PEM bundle ends with
                                                 # its private key, and "acme_account+key" is the ACME account key), so protection
@@ -535,7 +546,7 @@ cleanup_interval = "1h"                         # How often to clean up expired 
 [auth_cache]
 enabled = true                     # Enable persistent auth cache (default: false)
 path = "/sora/auth_cache.db"       # SQLite database path. Fast storage (SSD) recommended.
-max_age = "24"                     # Max age for cached entries before re-fetching (default: 1 day)
+max_age = "24h"                    # Max age for cached entries before re-fetching (default: 24h)
 cleanup_interval = "1h"            # How often to purge expired/unused entries (default: 1 hour)
 purge_unused = "168h"              # Purge entries unused for this duration (default: 7 days)
 
@@ -657,15 +668,15 @@ type = "smtp"                                      # Relay type: "smtp" or "http
 
 # SMTP Relay Configuration (when type="smtp")
 smtp_host = "smtp.example.com:587"                # SMTP relay host and port
-smtp_tls = true                                   # Use TLS (recommended: true)
-smtp_tls_verify = true                            # Verify TLS certificates (recommended: true)
-smtp_use_starttls = true                          # Use STARTTLS (port 587) instead of direct TLS (port 465)
+smtp_tls = true                                   # Use TLS (default: true); false relays in plaintext (startup warns unless the host is loopback)
+smtp_tls_verify = true                            # Verify the relay's certificate and host name (default: true)
+smtp_use_starttls = true                          # Use STARTTLS (ports 587, 25) instead of implicit TLS (port 465) (default: false); ignored when smtp_tls = false
 # smtp_helo_host = "mail.example.com"            # Hostname sent in EHLO/HELO (default: system hostname). Set to your FQDN for deliverability.
 # smtp_tls_cert_file = "/path/to/client.crt"     # Client certificate for mTLS (optional)
 # smtp_tls_key_file = "/path/to/client.key"      # Client key for mTLS (optional)
 
 # HTTP API Relay Configuration (when type="http")
-# http_url = "https://api.example.com/v1/mail/deliver"  # HTTP API endpoint
+# http_url = "https://api.example.com/v1/mail/deliver"  # HTTP API endpoint (startup warns about http:// unless the host is loopback)
 # auth_token = "your-bearer-token"                      # Bearer token for Authorization header
 
 # Common relay providers:
@@ -982,7 +993,10 @@ listen_backlog = 4096               # TCP listen backlog size (0 = default 1024)
                               # Small backlog causes SYN queue to fill, leading to ~60s connection delays.
 
 # --- IMAP-SPECIFIC CONFIGURATION ---
-append_limit = "25mb"         # Maximum message size for IMAP APPEND. Empty = no limit.
+append_limit = "25mb"         # Maximum message size for IMAP APPEND, advertised as APPENDLIMIT.
+                              # Empty or "0" = the 25mb default. IMAP carries the limit as a 32-bit
+                              # number, so a value above 4294967295 bytes (4 GiB - 1) is clamped
+                              # to it, with a warning at startup.
 
 # --- MASTER USER AUTHENTICATION ---
 master_username = ""          # Master username for administrative IMAP access (e.g., for proxies).
@@ -995,9 +1009,12 @@ master_sasl_password = ""     # Password for master_sasl_username.
 # master SASL secret can log in as any user. As defense-in-depth, restrict which
 # source networks may use master SASL below. The check is anchored to the real TCP
 # peer (NOT forgeable via PROXY/XCLIENT/IMAP ID forwarding), so list the PROXY hosts,
-# not end-client IPs. Support staff use master_username at the proxy front door and
-# are unaffected by this list. Empty = disabled (any source accepted — legacy behavior;
-# a startup WARNING is logged when master SASL is set without this gate).
+# not end-client IPs. The same list also restricts the master_username form
+# (user@domain@master_username) on this server, since it impersonates any user too.
+# Support staff who use master_username at the proxy front door are unaffected: the
+# proxy checks it itself and reaches the backend with master SASL from a proxy host.
+# Empty = disabled (any source accepted — legacy behavior; a startup WARNING is
+# logged when master SASL is set without this gate).
 master_sasl_allowed_networks = []   # e.g. ["10.0.0.0/24", "192.168.1.10"]
 # Master SASL requires a SASL authorization identity (the user to impersonate).
 # A submission without one is NOT a master login: it is handled as an ordinary
@@ -1049,6 +1066,11 @@ proxy_protocol_timeout = "5s"     # Timeout for reading PROXY protocol headers
 # disabled_caps = ["ESEARCH", "CONDSTORE", "IDLE"]  # Example: disable these capabilities globally
 #
 # NOTE: Do not disable IMAP4rev1, as this will break basic IMAP functionality.
+# A capability another one implies is removed together with it: disabling an
+# extension IMAP4rev2 includes (IDLE, ESEARCH, SEARCHRES, MOVE, NAMESPACE,
+# UIDPLUS, LIST-STATUS, STATUS=SIZE, CHILDREN, ...) also removes IMAP4rev2, so
+# the server offers IMAP4rev1 with its remaining extensions; disabling CONDSTORE
+# also removes QRESYNC. client_filters follow the same rule.
 # STARTTLS, LOGINDISABLED and AUTH=PLAIN follow tls, tls_use_starttls and
 # insecure_auth; disabled_caps does not change them.
 
@@ -1169,7 +1191,11 @@ limits.thread_max_messages = 50000
 # limits.preview_s3_node_per_min = 3000  # For the whole server per minute (default: 3000, 0 = unlimited).
 # limits.preview_s3_max_size = "5mb"     # Largest message downloaded (unset or 0: [local_cache] max_object_size).
 limits.redirect_rate_limit = 100         # Maximum SIEVE redirects per user (default: 100, set to 0 to disable).
-limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h").
+limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h"). The cleaner keeps
+                                         # the redirect records for [cleanup] grace_period or the longest window of
+                                         # the LMTP and Admin API servers on the node that runs it, whichever is
+                                         # longer. A window longer than grace_period needs that window on every
+                                         # node with an imap, pop3 or lmtp server (they all run the cleaner).
 limits.max_redirect_hops = 2             # Max times one message may be redirected before suppression — mail-loop
                                          # backstop, counted via the X-Sora-Loop header (default: 2; 1 = allow a
                                          # single redirect then stop; 0 = unlimited). Delivered-To loop detection
@@ -1208,6 +1234,7 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # --- AUTHENTICATION RATE LIMITING ---
 # Two-tier blocking system protects shared IPs while catching distributed attacks
 # Use dotted notation for nested config within [[server]] array element
+# A key left out or set to 0 takes its default; a negative value stops startup.
 auth_rate_limit.enabled = false                   # Enable authentication rate limiting.
 
 # TIER 1: Fast IP+username blocking (protects shared IPs like corporate gateways)
@@ -1249,7 +1276,7 @@ auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expire
 # its size limit, the oldest entries (by FirstFailure time) are evicted using LRU policy.
 # max_ip_entries evicts the counters of addresses that are not blocked first and never removes
 # an IP block: a block lasts until ip_block_duration ends.
-# Set to 0 to disable size-based limits (time-based cleanup only).
+# There is no unlimited setting: 0, like any key left out, takes the default.
 #
 # RECOMMENDED VALUES:
 # - Default (100k/50k/50k): Suitable for most deployments, ~40MB per protocol max
@@ -1261,13 +1288,15 @@ auth_rate_limit.cleanup_interval = "5m"           # How often to clean up expire
 # - IP entries: ~150 bytes each × max_ip_entries
 # - Username entries: ~150 bytes each × max_username_entries
 #
-auth_rate_limit.max_ip_username_entries = 100000  # Max IP+username tracking entries (0 = unlimited, default: 100000)
-auth_rate_limit.max_ip_entries = 50000            # Max IP failure tracking entries (0 = unlimited, default: 50000)
-auth_rate_limit.max_username_entries = 50000      # Max username tracking entries (0 = unlimited, default: 50000)
+auth_rate_limit.max_ip_username_entries = 100000  # Max IP+username tracking entries (default: 100000)
+auth_rate_limit.max_ip_entries = 50000            # Max IP failure tracking entries (default: 50000)
+auth_rate_limit.max_username_entries = 50000      # Max username tracking entries (default: 50000)
 
 # --- LOOKUP CACHE ---
 # Cache authentication results to reduce database queries and improve performance.
-# ENABLED BY DEFAULT with sensible settings. Only configure to override defaults or disable.
+# ENABLED BY DEFAULT with sensible settings. Only configure to override defaults or disable;
+# keys left out of the table keep their defaults (a table without "enabled" leaves it on).
+# Exception: http_user_api and user_api_proxy cache only when the table is present.
 # [server.lookup_cache]
 # enabled = true                          # Enable authentication and routing lookup caching for this server (default: true)
 # positive_ttl = "5m"                     # How long to cache successful authentications (default: 5m)
@@ -1275,7 +1304,7 @@ auth_rate_limit.max_username_entries = 50000      # Max username tracking entrie
 # negative_ttl = "1m"                     # How long to cache failed auth attempts (default: 1m)
 #                                         # Helps mitigate brute force attacks by preventing repeated database queries
 #                                         # Note: Brute force protection itself is handled by protocol-level rate limiting
-# max_size = 50000                        # Maximum cached entries (default: 10000, LRU eviction)
+# max_size = 50000                        # Maximum cached entries (default: 50000, LRU eviction)
 # cleanup_interval = "5m"                 # How often to remove expired entries (default: 5m)
 # positive_revalidation_window = "30s"    # Revalidation window for successful auth with different password (default: 30s)
 #                                         # Protects against unauthorized access when password changes
@@ -1454,7 +1483,7 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # There is no default pool unless one block says default = true: that is where an
 # auth-only answer (no "server", no "pool") and a user found through lookup_local_users
 # are routed. Without a default such an answer is refused with a temporary failure
-# (IMAP NO [UNAVAILABLE], POP3 -ERR [SYS/TEMP], ManageSieve NO, LMTP 451) and logged,
+# (IMAP NO [UNAVAILABLE], POP3 -ERR [SYS/TEMP], ManageSieve NO (TRYLATER), LMTP 451) and logged,
 # never sent to another pool. The same happens for a pool name this proxy lacks, and
 # for a lookup that fails or answers nothing usable: with pools, no answer is never a
 # guess at the default pool.
@@ -1631,7 +1660,7 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 #    - Prevents indefinitely long sessions
 #    - 30 minutes from connection to disconnection, regardless of activity
 #
-timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disable (REQUIRED for IMAP proxy, default: 0).
+timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disable (REQUIRED for IMAP proxy; default when absent or invalid: 30m).
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration from connect to disconnect (default: 24h).
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
@@ -1653,7 +1682,10 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # - server: Backend server address - can be IP/hostname:port OR just IP/hostname (string)
 #   * If port is included: "192.168.1.10:143" or "backend.example.com:993"
 #   * If port is omitted: "192.168.1.10" or "backend.example.com"
-#     → Port from remote_port config will be appended (default: 143)
+#     → The remote_port below is appended; without it the proxy's own remote_port,
+#       and without that the protocol's standard port (IMAP 143, POP3 110,
+#       ManageSieve 4190, LMTP 24; with remote_tls but not remote_tls_use_starttls,
+#       IMAP 993 and POP3 995). A bare IPv6 address is a host without a port.
 # - account_id: Account ID for tracking/metrics (integer, must be > 0)
 #
 # Example JSON Response (with port):
@@ -1677,10 +1709,12 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # - Circuit breaker protects against service failures (60% failure rate triggers open state)
 # - Password formats: bcrypt ($2a$...), SSHA512 ({SSHA512}...), SHA512 ({SHA512}...), BLF-CRYPT ($2b$...)
 # - If HTTP endpoint returns 404/3xx → respects lookup_local_users setting (user partitioning)
-# - If HTTP endpoint returns 401/403 → authentication rejected (no fallback)
-# - If HTTP endpoint returns other 4xx/5xx → service unavailable, ALWAYS reject (no fallback)
+# - If HTTP endpoint returns 401/403 → authentication rejected (no fallback); the way to refuse an account
+# - If HTTP endpoint returns other 4xx/5xx, or a 200 that is not JSON with address and password_hash
+#   → service unavailable (no verdict on the password), ALWAYS reject (no fallback); 5xx, 408, 429
+#   and malformed 200s also count toward the circuit breaker
 # - If HTTP endpoint returns 200 with data but auth fails → connection REJECTED (no fallback)
-# - Server addresses normalized: missing ports use remote_port default (e.g., 143 for IMAP)
+# - Server addresses normalized: a missing port is filled in as described for "server" above
 # - Timeout for HTTP requests is configurable (default: 5s)
 #
 # ALIAS RESOLUTION:
@@ -1782,7 +1816,7 @@ lookup_local_users = true             # Check local DB when remote returns 404/3
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
 remote_tls_verify = true              # Verify backend TLS certificates
-# remote_port = 143                   # Default port to append if server address doesn't include port (default: 143)
+# remote_port = 143                   # Port to append if the server address has none (default: the proxy's remote_port, else the protocol's standard port)
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
 remote_use_id_command = false         # Send IMAP ID command to backends (IMAP only)
 # restrict_to_pool = false            # SSRF defense (routing mode). When true, a backend
@@ -2016,7 +2050,7 @@ auth_idle_timeout = "2m"        # Idle timeout between commands during authentic
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+timeouts.command_timeout = "0"              # Maximum idle time (default when absent or invalid: 10m, the RFC 1939 §3 floor)
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24h)
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
@@ -2072,7 +2106,7 @@ auth_idle_timeout = "2m"        # Idle timeout between commands during authentic
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "0"              # Maximum idle time (default: 0 = disabled for proxies)
+timeouts.command_timeout = "0"              # Maximum idle time (default when absent or invalid: 3m)
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24h)
 timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = disabled, default: 0, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers and silent sessions are unaffected.
 
@@ -2192,6 +2226,8 @@ proxy_protocol_timeout = "5s"
 # proxy_protocol_trusted_proxies = []  # CIDR blocks for PROXY protocol validation (defaults to trusted_networks)
 
 # NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint
+# NOTE: /admin/mail/deliver stages bodies through this node's upload worker, which runs only when the
+#       node also has an imap, pop3 or lmtp server; elsewhere it answers 503 (a start-up warning says so)
 # NOTE: When tls=true and tls_cert_file/tls_key_file are empty, uses Let's Encrypt autocert from [tls] section
 
 
