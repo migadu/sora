@@ -22,6 +22,15 @@ const (
 	// ".json", which commit renames it to.
 	heldExt = ".held"
 
+	// requeueStaged* and requeueRetiring* hold the pending metadata and retiring
+	// failed pair while Requeue hands a message back to pending/ without exposing
+	// failed/<id>.{msg,json} to a post-publish unlink race (#840).
+	requeueStagedPrefix   = ".requeue-"
+	requeueStagedSuffix   = ".staged"
+	requeueRetiringPrefix = ".requeuing-"
+	requeueRetiringJSON   = ".json.old"
+	requeueRetiringMsg    = ".msg.old"
+
 	// orphanGracePeriod is how long a half-written message pair or a leftover temp
 	// file must sit untouched before CleanupOrphans reclaims it. Every write path
 	// holds q.mu, so anything older than this is crash debris rather than a write
@@ -165,6 +174,74 @@ func (q *DiskQueue) RecoverOrphanedMessages() (int, error) {
 		logger.Info("RelayQueue: Recovered orphaned messages from processing directory", "count", recovered)
 	}
 
+	requeueRecovered, err := q.recoverInterruptedRequeues(time.Time{})
+	if err != nil {
+		return recovered, err
+	}
+	recovered += requeueRecovered
+
+	return recovered, nil
+}
+
+// recoverInterruptedRequeues finishes or restores any Requeue whose process died between
+// retiring failed/<id>.{json,msg} to .old and unlinking those retired copies. When cutoff
+// is non-zero (periodic live cleanup), only entries modified before cutoff are touched so
+// an in-flight sora-admin requeue is never disturbed.
+func (q *DiskQueue) recoverInterruptedRequeues(cutoff time.Time) (int, error) {
+	failedEntries, err := os.ReadDir(q.failedDir)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read failed directory: %w", err)
+	}
+
+	recovered := 0
+	for _, entry := range failedEntries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, requeueRetiringPrefix) || !strings.HasSuffix(name, requeueRetiringJSON) {
+			continue
+		}
+		if !cutoff.IsZero() && !modifiedBefore(entry, cutoff) {
+			continue
+		}
+		id := strings.TrimSuffix(strings.TrimPrefix(name, requeueRetiringPrefix), requeueRetiringJSON)
+		retiringMeta := filepath.Join(q.failedDir, name)
+		retiringMsg := filepath.Join(q.failedDir, requeueRetiringPrefix+id+requeueRetiringMsg)
+		stagedMeta := filepath.Join(q.pendingDir, requeueStagedPrefix+id+requeueStagedSuffix)
+		pendingMeta := filepath.Join(q.pendingDir, id+".json")
+		pendingMsg := filepath.Join(q.pendingDir, id+".msg")
+
+		if _, err := os.Stat(stagedMeta); err == nil {
+			if _, msgErr := os.Stat(pendingMsg); msgErr == nil {
+				if err := os.Rename(stagedMeta, pendingMeta); err == nil {
+					_ = syncDir(q.pendingDir)
+					q.pending.invalidate()
+					_ = os.Remove(retiringMsg)
+					_ = os.Remove(retiringMeta)
+					recovered++
+					continue
+				}
+			}
+		}
+
+		// Already published to pending/ (or already acquired into processing/ or re-failed):
+		// drop the retired failed copy unless the message exists in none of the queues.
+		_, inPending := os.Stat(pendingMeta)
+		_, inProcessing := os.Stat(filepath.Join(q.processingDir, id+".json"))
+		_, inFailed := os.Stat(filepath.Join(q.failedDir, id+".json"))
+		if inPending == nil || inProcessing == nil || inFailed == nil {
+			_ = os.Remove(retiringMsg)
+			_ = os.Remove(retiringMeta)
+			continue
+		}
+
+		// Neither staged pair nor published metadata exists: restore the failed entry.
+		if _, err := os.Stat(retiringMsg); err == nil {
+			_ = os.Rename(retiringMsg, filepath.Join(q.failedDir, id+".msg"))
+		}
+		if err := os.Rename(retiringMeta, filepath.Join(q.failedDir, id+".json")); err == nil {
+			_ = syncDir(q.failedDir)
+			recovered++
+		}
+	}
 	return recovered, nil
 }
 
@@ -310,14 +387,22 @@ func (q *DiskQueue) CleanupOrphans() (int, error) {
 	cutoff := time.Now().Add(-orphanGracePeriod)
 	removed := 0
 
-	// Leftover temp files, in every directory writeDataAtomic can target.
+	if _, err := q.recoverInterruptedRequeues(cutoff); err != nil {
+		return removed, err
+	}
+
+	// Leftover temp files, in every directory writeDataAtomic can target, and stale
+	// .requeue-*.staged files whose requeue failed before retiring failed/<id>.json.
 	for _, dir := range []string{q.pendingDir, q.processingDir, q.failedDir} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			return removed, fmt.Errorf("failed to read directory %s: %w", dir, err)
 		}
 		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasPrefix(entry.Name(), tempFilePrefix) || !modifiedBefore(entry, cutoff) {
+			name := entry.Name()
+			isScratch := strings.HasPrefix(name, tempFilePrefix) ||
+				(dir == q.pendingDir && strings.HasPrefix(name, requeueStagedPrefix) && strings.HasSuffix(name, requeueStagedSuffix))
+			if entry.IsDir() || !isScratch || !modifiedBefore(entry, cutoff) {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
@@ -563,27 +648,55 @@ func (q *DiskQueue) Requeue(messageID string) error {
 	}
 
 	metadataPath := filepath.Join(q.pendingDir, messageID+".json")
+	stagedMetadataPath := filepath.Join(q.pendingDir, requeueStagedPrefix+messageID+requeueStagedSuffix)
 	messagePath := filepath.Join(q.pendingDir, messageID+".msg")
 	if err := q.writeDataAtomic(messagePath, messageBytes, owner); err != nil {
 		return fmt.Errorf("could not write message body to pending: %w", err)
 	}
-	if err := q.writeDataAtomic(metadataPath, metadataBytes, owner); err != nil {
-		// The rename may have happened before the error (a failed directory fsync), so
-		// withdraw the metadata before the body it points at.
-		os.Remove(metadataPath)
+	if err := q.writeDataAtomic(stagedMetadataPath, metadataBytes, owner); err != nil {
+		os.Remove(stagedMetadataPath)
 		os.Remove(messagePath)
 		return fmt.Errorf("could not write metadata to pending: %w", err)
 	}
-	q.pending.add(messageID, metadata.NextRetry)
 
-	// Body first, as CleanupOldFailedMessages does: metadata left behind is reclaimed
-	// by retention, a body without it would never be.
-	if err := os.Remove(failedMessagePath); err != nil && !os.IsNotExist(err) {
+	// Retire the failed pair under non-queue names BEFORE publishing pending/<id>.json.
+	// Once pending/<id>.json is visible, a live server worker can acquire <id> and call
+	// MarkPermanentFailure, writing a fresh failed/<id>.{json,msg}; unlinking the old
+	// failed names after publication would delete that newly failed message (#840).
+	retiringMetadataPath := filepath.Join(q.failedDir, requeueRetiringPrefix+messageID+requeueRetiringJSON)
+	retiringMessagePath := filepath.Join(q.failedDir, requeueRetiringPrefix+messageID+requeueRetiringMsg)
+	if err := os.Rename(failedMetadataPath, retiringMetadataPath); err != nil {
+		os.Remove(stagedMetadataPath)
+		os.Remove(messagePath)
+		return fmt.Errorf("could not retire failed metadata: %w", err)
+	}
+	if err := os.Rename(failedMessagePath, retiringMessagePath); err != nil {
+		_ = os.Rename(retiringMetadataPath, failedMetadataPath)
+		os.Remove(stagedMetadataPath)
+		os.Remove(messagePath)
+		return fmt.Errorf("could not retire failed message body: %w", err)
+	}
+
+	if err := os.Rename(stagedMetadataPath, metadataPath); err != nil {
+		_ = os.Rename(retiringMessagePath, failedMessagePath)
+		_ = os.Rename(retiringMetadataPath, failedMetadataPath)
+		os.Remove(stagedMetadataPath)
+		os.Remove(messagePath)
+		return fmt.Errorf("could not publish metadata to pending: %w", err)
+	}
+	q.pending.add(messageID, metadata.NextRetry)
+	if err := syncDir(q.pendingDir); err != nil {
+		return fmt.Errorf("could not fsync pending directory: %w", err)
+	}
+
+	// Body first, as CleanupOldFailedMessages does.
+	if err := os.Remove(retiringMessagePath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("requeued, but could not remove the failed copy: %w", err)
 	}
-	if err := os.Remove(failedMetadataPath); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(retiringMetadataPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("requeued, but could not remove the failed copy: %w", err)
 	}
+	_ = syncDir(q.failedDir)
 	return nil
 }
 

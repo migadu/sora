@@ -1,6 +1,7 @@
 package relayqueue
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -68,5 +69,53 @@ func TestRequeueConcurrentPermanentFailureDoesNotLoseMessage(t *testing.T) {
 	}
 	if got.Attempts != 1 || lastError(got) == "" {
 		t.Fatalf("unexpected failed metadata after second failure: %+v", got)
+	}
+}
+
+func TestRecoverOrphanedMessagesFinishesInterruptedRequeue(t *testing.T) {
+	dir := t.TempDir()
+	q, err := NewDiskQueue(dir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := failMessage(t, q, "recipient@example.com", "550 5.1.1 initial permanent failure")
+
+	// Simulate crash after Requeue staged pending/<id>.msg + pending/.requeue-<id>.staged
+	// and retired failed/<id>.{json,msg} to .old, right before renaming .staged -> .json.
+	metaBytes, err := os.ReadFile(filepath.Join(dir, "failed", id+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgBytes, err := os.ReadFile(filepath.Join(dir, "failed", id+".msg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pending", id+".msg"), msgBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pending", requeueStagedPrefix+id+requeueStagedSuffix), metaBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "failed", id+".json"), filepath.Join(dir, "failed", requeueRetiringPrefix+id+requeueRetiringJSON)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "failed", id+".msg"), filepath.Join(dir, "failed", requeueRetiringPrefix+id+requeueRetiringMsg)); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := q.RecoverOrphanedMessages()
+	if err != nil {
+		t.Fatalf("RecoverOrphanedMessages: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered = %d, want 1", recovered)
+	}
+	pending, processing, failed, err := q.GetStats()
+	if err != nil {
+		t.Fatalf("GetStats: %v", err)
+	}
+	if pending != 1 || processing != 0 || failed != 0 {
+		t.Fatalf("after recovery: pending=%d processing=%d failed=%d, want 1/0/0", pending, processing, failed)
 	}
 }
