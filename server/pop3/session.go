@@ -228,11 +228,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 
 	// Apply progressive authentication delay BEFORE any other checks
 	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-	delayType := "POP3-PASS"
-	if isSASL {
-		delayType = "POP3-SASL"
-	}
-	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, delayType); err != nil {
+	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "pop3"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Refused before the credentials are checked: a temporary failure
 			// (RFC 3206 section 4), never [IN-USE], which says the authentication

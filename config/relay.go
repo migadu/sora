@@ -94,7 +94,7 @@ func (r *RelayConfig) validateSMTPHost() error {
 		return errors.New(`[relay] type "smtp" requires smtp_host as host:port`)
 	}
 	host, port, err := net.SplitHostPort(r.SMTPHost)
-	shown := relayEndpointForError(r.SMTPHost)
+	shown := MaskEndpointURL(r.SMTPHost)
 	if err != nil {
 		// AddrError.Error repeats the raw endpoint, which may contain misplaced
 		// URL credentials. Keep the parser's reason, not its address.
@@ -125,12 +125,13 @@ func (r *RelayConfig) validateHTTPURL() error {
 	if r.HTTPURL == "" {
 		return errors.New(`[relay] type "http" requires http_url`)
 	}
-	shown := relayEndpointForError(r.HTTPURL)
+	shown := MaskEndpointURL(r.HTTPURL)
 	u, err := url.Parse(r.HTTPURL)
 	if err != nil {
-		// The *url.Error repeats the unmasked URL; keep only its reason.
+		// The *url.Error repeats the URL, shown above; keep only its reason, which
+		// MaskURLError masks when it may quote a credential.
 		var urlErr *url.Error
-		if errors.As(err, &urlErr) {
+		if errors.As(MaskURLError(err), &urlErr) {
 			err = urlErr.Err
 		}
 		return fmt.Errorf("[relay] http_url %q is not a valid URL: %w", shown, err)
@@ -142,15 +143,6 @@ func (r *RelayConfig) validateHTTPURL() error {
 		return fmt.Errorf("[relay] http_url %q has no valid port", shown)
 	}
 	return nil
-}
-
-// Validation also handles malformed endpoints, where the usual URL masker cannot
-// identify an authority. Hide a credential-bearing schemeless value completely.
-func relayEndpointForError(value string) string {
-	if !strings.Contains(value, "://") && strings.ContainsAny(value, "?@") {
-		return SecretMask
-	}
-	return maskURLCredentials(value)
 }
 
 // validDialPort reports whether port is a TCP port a dial can reach, resolved as

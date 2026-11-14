@@ -66,7 +66,8 @@ user metrics on, it can show user names, and with `hash_usernames = false` it sh
 text.
 
 The five `enable_*`, `user_metrics_threshold`, `max_tracked_users` and `hash_usernames` settings
-apply to the whole process. With several `metrics` blocks, the last one in the file wins.
+apply to the whole process, but only a `metrics` block sets them: in another block they are ignored,
+with a startup warning. With several `metrics` blocks, the last one in the file wins.
 
 The metrics server is not reloaded by `SIGHUP`: restart Sora to change it. See
 [CONFIGURATION.md](CONFIGURATION.md#6-reloading-with-sighup).
@@ -104,10 +105,10 @@ Scrape every node: each node counts only its own work.
   counter for an error that has not happened yet is absent, not zero. Write alerts that tolerate
   missing series.
 - **Common labels.**
-  - `protocol` names the server type. Values differ between metrics: most use `imap`, `pop3`,
-    `lmtp`, `managesieve` and `imap_proxy`, `pop3_proxy`, `lmtp_proxy`, `managesieve_proxy`;
-    proxy routing metrics use the backend protocol (`imap`, `pop3`, ...); some use capitals (see
-    each table).
+  - `protocol` names the server type: `imap`, `pop3`, `lmtp`, `managesieve`, `imap_proxy`,
+    `pop3_proxy`, `lmtp_proxy`, `managesieve_proxy`, `userapi`, `userapi_proxy`. The proxy
+    routing metrics use the backend protocol instead (`imap`, `pop3`, ...), and a few metrics
+    add other values (see each table).
   - `server_name` is the `name` of the `[[server]]` block.
   - `hostname` is the node's host name. It is empty on the `userapi_proxy` connection metrics.
   - `role` is `read` or `write`, for the two database pools.
@@ -135,7 +136,7 @@ Types: a **counter** only goes up (use `rate()` or `increase()`), a **gauge** go
 |---|---|---|---|
 | `sora_authentication_attempts_total` | counter | `protocol`, `server_name`, `hostname`, `result` | Login attempts. `result`: `success`, `failure`; `rate_limited` on `pop3`; `unavailable` on the IMAP, POP3 and ManageSieve proxies (the remote lookup service was temporarily unavailable). |
 | `sora_password_verification_attempts_total` | counter | `hash_type`, `result` | Password hash checks. `hash_type`: `bcrypt`, `blf_crypt`, `ssha512`, `sha512`, `unknown`. `result`: `success`, `failure`. |
-| `sora_auth_rate_limiter_ip_username_entries` | gauge | `protocol`, `server_name`, `hostname` | Tracked IP-and-user pairs in the login rate limiter. `protocol` here: `IMAP`, `POP3`, `ManageSieve`, `IMAP-PROXY`, `POP3-PROXY`, `SIEVE-PROXY`, `user-api`. |
+| `sora_auth_rate_limiter_ip_username_entries` | gauge | `protocol`, `server_name`, `hostname` | Tracked IP-and-user pairs in the login rate limiter. `protocol`: `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `userapi`. |
 | `sora_auth_rate_limiter_ip_entries` | gauge | same | Tracked IPs with failures. |
 | `sora_auth_rate_limiter_username_entries` | gauge | same | Tracked user names with failures. |
 | `sora_auth_rate_limiter_blocked_ips` | gauge | same | IPs blocked now. |
@@ -145,9 +146,16 @@ Types: a **counter** only goes up (use `rate()` or `increase()`), a **gauge** go
 | `sora_auth_delay_cancelled_total` | counter | `protocol` | Delays cut short, for example by a disconnect. |
 
 The `sora_auth_delay_*` metrics only exist while `[server.auth_rate_limit]` is enabled. Their
-`protocol` values name the login path, such as `IMAP-LOGIN`, `IMAP-SASL`, `IMAP-PROXY`,
-`POP3-PROXY`, `MANAGESIEVE-LOGIN`, `MANAGESIEVE-PROXY` or `USER-API-LOGIN`. Per-address detail is in
+`protocol` is the server type that delayed the login, as in the rate limiter metrics; every login
+method of a server (LOGIN, AUTHENTICATE, master user) counts under it. Per-address detail is in
 the log and in `GET /admin/auth/blocked`. See [AUTHENTICATION.md](AUTHENTICATION.md).
+
+Upgrade note: `sora_auth_rate_limiter_*`, `sora_auth_delay_*` and
+`sora_connection_tracker_*` previously used labels such as `IMAP`, `IMAP-PROXY`,
+`SIEVE-PROXY` and `IMAP-LOGIN`. Update dashboard and alert selectors to the server-type
+values above. Queries must account for both spellings while a rolling upgrade still
+has nodes running the previous version. Auth-delay log `protocol` fields use the new
+server-type values too.
 
 ### 3.3 Commands and protocol errors
 
@@ -233,7 +241,7 @@ See [PROXY.md](PROXY.md).
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `sora_connection_tracker_users` | gauge | `protocol`, `server_name`, `hostname` | Users in the connection tracker. `protocol` is the tracker name: `IMAP`, `POP3`, `ManageSieve`, `LMTP`. |
+| `sora_connection_tracker_users` | gauge | `protocol`, `server_name`, `hostname` | Users in the connection tracker. `protocol`: `imap`, `pop3`, `managesieve` on backends; `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `lmtp_proxy` on proxies. |
 | `sora_connection_tracker_instance_ids` | gauge | same | Instance entries across all tracked users. |
 | `sora_connection_tracker_ips` | gauge | same | Client IPs across all tracked users. |
 | `sora_connection_tracker_broadcast_queue_size` | gauge | same | Gossip messages waiting to be sent. |

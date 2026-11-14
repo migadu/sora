@@ -707,8 +707,8 @@ return messages in this shape:
   "size": 48211,
   "flags": ["\\Seen"],
   "custom_flags": ["$Work", "$hasattachment"],
-  "message_id": "<abc@example.com>",
-  "in_reply_to": "<xyz@example.com>",
+  "message_id": "abc@example.com",
+  "in_reply_to": "xyz@example.com",
   "content_hash": "4f1c...",
   "has_attachments": true
 }
@@ -727,7 +727,7 @@ return messages in this shape:
 | `size` | Bytes. |
 | `flags` | System flags. `[]` when there are none. |
 | `custom_flags` | Keywords. Left out when there are none. |
-| `message_id`, `in_reply_to` | From the headers. |
+| `message_id`, `in_reply_to` | From the headers, without angle brackets; `in_reply_to` holds its IDs separated by spaces and is left out when there are none. `message_id` is `""` when the message has no `Message-ID` that parses. |
 | `references` | The `References` header; only in `GET /user/messages/{id}`. |
 | `content_hash` | The hash that names the stored body. Messages with the same content share it. |
 | `has_attachments` | From the RFC 9979 keywords: `true` with `$hasattachment`, `false` with `$hasnoattachment`, left out when the message carries neither (mail Sora stored before it set them, or mail it could not inspect). |
@@ -856,6 +856,7 @@ call the API through the proxy.
 |---|---|---|
 | `type`, `name`, `addr` | required | `user_api_proxy`, a name, the listen address. |
 | `jwt_secret` | none | Must equal the backends' `jwt_secret`. Empty: the proxy is skipped with `User API proxy server enabled but no JWT secret configured - skipping`. Under 32 bytes or the placeholder: Sora refuses to start. Reloaded on SIGHUP, with the same rules as on the backend. |
+| `allowed_origins` | `[]` | CORS origins of the errors the proxy answers itself (12.3); set it to the backends' list. Reloaded on SIGHUP. |
 | `remote_addrs` | none | Backend `host:port` list. Either this or `[[pool]]` blocks are required. |
 | `remote_port` | none | Port for backends listed without one. |
 | `remote_tls` | `false` | Speak HTTPS to the backends. |
@@ -875,7 +876,8 @@ call the API through the proxy.
 | `[server.remote_lookup]` | off | Route lookups; see [PROXY.md](PROXY.md). |
 | `[server.lookup_cache]` | off | Caches lookup answers; same keys and defaults as in section 2. |
 
-`allowed_hosts`, `token_duration` and `token_issuer` have no effect on this proxy. Affinity is
+`allowed_hosts`, `token_duration` and `token_issuer` have no effect on this proxy; set in its block,
+each is reported with a startup warning. Affinity is
 used when the block sets `enable_affinity = true` and the cluster runs its affinity store
 (`[cluster.affinity] enabled = true`). The proxy's HTTP
 limits are fixed: 30 seconds to read a request and 30 seconds to write a response, 120 seconds

@@ -113,7 +113,7 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 		// Apply progressive authentication delay BEFORE any other checks
 		// Create a fake net.Addr from the RemoteIP for delay calculation
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "IMAP-LOGIN"); err != nil {
+		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "imap"); err != nil {
 			if errors.Is(err, server.ErrDelayQueueFull) {
 				// Delay queue full - reject immediately to prevent goroutine exhaustion
 				s.InfoLog("delay queue full, rejecting connection", "address", address)

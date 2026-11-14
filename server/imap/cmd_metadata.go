@@ -34,7 +34,7 @@ func (s *IMAPSession) GetMetadata(ctx context.Context, mailbox string, entries [
 		}
 	}
 
-	// Canonicalise (case-fold) and validate entry names. RFC 5464 §3.1 makes
+	// Canonicalise (case-fold) and validate entry names. RFC 5464 §3.2 makes
 	// entry names case-insensitive, so we query using the canonical form.
 	canonEntries := make([]string, len(entries))
 	for i, entry := range entries {
@@ -124,7 +124,7 @@ func (s *IMAPSession) SetMetadata(ctx context.Context, mailbox string, entries m
 	ctx = s.pinnedContext(ctx)
 
 	// Canonicalise (case-fold) entry names first so the case-insensitivity rule
-	// (RFC 5464 §3.1) is honoured for storage AND for the /private-vs-/shared
+	// (RFC 5464 §3.2) is honoured for storage AND for the /private-vs-/shared
 	// scope classification below — otherwise a /SHARED/... spelling would be
 	// misclassified as private and skip the shared-scope 'w' ACL check.
 	canonEntries := make(map[string]*[]byte, len(entries))
@@ -237,47 +237,67 @@ func (s *IMAPSession) SetMetadata(ctx context.Context, mailbox string, entries m
 }
 
 // canonicalMetadataEntry returns the canonical form of a metadata entry name.
-// RFC 5464 §3.1 states entry names are case-insensitive, so we fold to lower
+// RFC 5464 §3.2 states entry names are case-insensitive, so we fold to lower
 // case for storage, lookup, and /private-vs-/shared classification. Applying it
 // at the protocol boundary keeps the case-insensitivity invariant in one place
 // (and prevents a /SHARED/... spelling from evading the shared-scope ACL check).
+//
+// Only ASCII letters are folded: entry names "MUST NOT contain non-ASCII
+// characters" (§3.2), and Unicode lower-casing would map U+212A KELVIN SIGN to
+// "k" and U+0130 to "i", turning an invalid name into a valid one before
+// validateMetadataEntry sees it.
 func canonicalMetadataEntry(entry string) string {
-	return strings.ToLower(entry)
+	var folded []byte
+	for i := 0; i < len(entry); i++ {
+		if c := entry[i]; 'A' <= c && c <= 'Z' {
+			if folded == nil {
+				folded = []byte(entry)
+			}
+			folded[i] = c + ('a' - 'A')
+		}
+	}
+	if folded == nil {
+		return entry
+	}
+	return string(folded)
 }
 
 // validateMetadataEntry validates a (canonicalised) metadata entry name per
-// RFC 5464 §3.1 / §4.2.1: entry names live under the /private or /shared
-// hierarchies and, being astrings, may contain any character EXCEPT "*", "%",
-// non-ASCII octets, and control characters. Pass the canonical form.
+// RFC 5464 §3.2: the name lives under /private or /shared with at least one
+// more component, has no empty component (no "//", no trailing "/", so the
+// bare scope roots are not entry names), and contains no "*", "%", non-ASCII
+// octets or control characters. "Invalid entry names result in a BAD response
+// in any IMAP command in which they are used" (§3.2). Pass the canonical form.
 func validateMetadataEntry(entry string) error {
 	if entry == "" {
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeClientBug,
-			Text: "metadata entry name cannot be empty",
-		}
+		return invalidMetadataEntry("metadata entry name cannot be empty")
 	}
 
 	if !strings.HasPrefix(entry, "/private/") && !strings.HasPrefix(entry, "/shared/") {
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeClientBug,
-			Text: "metadata entry must start with /private/ or /shared/",
-		}
+		return invalidMetadataEntry("metadata entry must start with /private/ or /shared/")
 	}
 
-	// RFC 5464 forbids "*", "%", non-ASCII, and control characters (incl. DEL);
-	// everything else in the ASCII printable range is a valid entry-name octet.
+	if strings.HasSuffix(entry, "/") || strings.Contains(entry, "//") {
+		return invalidMetadataEntry(`metadata entry cannot end with "/" or contain "//"`)
+	}
+
+	// RFC 5464 §3.2 forbids "*", "%", non-ASCII and octets 0x00-0x19, and
+	// strongly discourages control characters; the rest of the control range
+	// (0x1a-0x1f, DEL) is refused as well, so only printable ASCII is accepted.
 	for i := 0; i < len(entry); i++ {
 		ch := entry[i]
 		if ch < 0x20 || ch >= 0x7f || ch == '*' || ch == '%' {
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeClientBug,
-				Text: fmt.Sprintf("metadata entry contains invalid character: %q", string(ch)),
-			}
+			return invalidMetadataEntry(fmt.Sprintf("metadata entry contains invalid character: %q", string(ch)))
 		}
 	}
 
 	return nil
+}
+
+func invalidMetadataEntry(text string) error {
+	return &imap.Error{
+		Type: imap.StatusResponseTypeBad,
+		Code: imap.ResponseCodeClientBug,
+		Text: text,
+	}
 }

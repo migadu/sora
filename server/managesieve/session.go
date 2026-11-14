@@ -131,7 +131,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// account, and hand every guess a fresh bucket by varying the target.
 		authKey := server.MasterAuthRateLimitKey(authnParsed.Suffix())
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-MASTER"); err != nil {
+		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "managesieve"); err != nil {
 			outcome = ""
 			if errors.Is(err, server.ErrDelayQueueFull) {
 				return errDelayQueueFul
@@ -259,7 +259,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 
 		// Apply progressive authentication delay BEFORE any other checks
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-MASTER-SASL"); err != nil {
+		if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "managesieve"); err != nil {
 			outcome = ""
 			if errors.Is(err, server.ErrDelayQueueFull) {
 				return errDelayQueueFul
@@ -360,7 +360,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// it earns never applied to it. IMAP and POP3 order these the same way.
 		remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
 		if !gated {
-			if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-SASL"); err != nil {
+			if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "managesieve"); err != nil {
 				outcome = ""
 				if errors.Is(err, server.ErrDelayQueueFull) {
 					// Delay queue full - reject immediately to prevent goroutine exhaustion
@@ -493,7 +493,7 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 	// is recorded as a failed attempt below, and a site that records without first
 	// passing the delay and the block check is metered but never gated.
 	remoteAddr := &server.StringAddr{Addr: s.RemoteIP}
-	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-LOGIN"); err != nil {
+	if err := server.ApplyAuthenticationDelay(ctx, s.server.authLimiter, remoteAddr, "managesieve"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			s.InfoLog("delay queue full, rejecting connection", "username", username)

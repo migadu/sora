@@ -61,7 +61,9 @@ type Session struct {
 	// LMTP sessions can contain multiple RCPT TO commands (multiple recipients).
 	// We register the session as a "connection" against each recipient account we handle.
 	// IMPORTANT: s.accountID is overwritten per RCPT; if we only unregister the last one,
-	// earlier recipients would leak connection counts permanently.
+	// earlier recipients would leak connection counts permanently. Each account is
+	// registered at most once per session (a backend reconnect does not register it
+	// again), so close() unregisters each entry exactly once.
 	registeredAccountIDs map[int64]struct{}
 
 	// Per-transaction state. The backend's view of a transaction must stay the MTA's:
@@ -1660,6 +1662,12 @@ func (s *Session) registerConnection() error {
 
 	// Use cached client address (real IP) to match UnregisterConnection in close()
 	if s.server.connTracker != nil {
+		// One LMTP session counts once per account, however many backend connections
+		// it opens: after a lost backend (loseBackend) the next RCPT TO reconnects and
+		// lands here again, and close() unregisters each account once.
+		if _, ok := s.registeredAccountIDs[s.accountID]; ok {
+			return nil
+		}
 		err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "LMTP", s.clientAddr)
 		if err != nil {
 			return err

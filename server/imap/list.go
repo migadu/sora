@@ -240,17 +240,25 @@ func matchesAnyPattern(name, ref string, patterns []string) bool {
 	return false
 }
 
-// hasSubscribedDescendant reports whether any subscribed name is a proper
-// descendant of lowerName (i.e. lives under "lowerName<delim>…"). The keys of
-// subscribedSet are already lower-cased, and lowerName must be lower-cased too.
-func hasSubscribedDescendant(lowerName, delim string, subscribedSet map[string]string) bool {
+// hasDescendant reports whether any key of names is a proper descendant of
+// lowerName (i.e. lives under "lowerName<delim>…"). The keys of names are
+// already lower-cased, and lowerName must be lower-cased too.
+func hasDescendant[V any](lowerName, delim string, names map[string]V) bool {
 	prefix := lowerName + delim
-	for s := range subscribedSet {
+	for s := range names {
 		if strings.HasPrefix(s, prefix) {
 			return true
 		}
 	}
 	return false
+}
+
+// childAttr is the RFC 5258 §4 child attribute for a mailbox name.
+func childAttr(hasChildren bool) imap.MailboxAttr {
+	if hasChildren {
+		return imap.MailboxAttrHasChildren
+	}
+	return imap.MailboxAttrHasNoChildren
 }
 
 // buildSubscribedList implements the SUBSCRIBED selection option (RFC 5258 §3.5),
@@ -313,7 +321,7 @@ func buildSubscribedList(ref string, patterns []string, options *imap.ListOption
 			continue
 		}
 		_, isSub := subscribedSet[lname]
-		hasSubChild := recursive && hasSubscribedDescendant(lname, delim, subscribedSet)
+		hasSubChild := recursive && hasDescendant(lname, delim, subscribedSet)
 		if !isSub && !hasSubChild {
 			continue // not subscribed and no subscribed descendant → not in SUBSCRIBED response
 		}
@@ -341,6 +349,14 @@ func buildSubscribedList(ref string, patterns []string, options *imap.ListOption
 			if isSub {
 				data.Attrs = append(data.Attrs, imap.MailboxAttrSubscribed)
 			}
+			// RFC 5258 §4: "If the CHILDREN return option is present, the server
+			// MUST return these attributes". A name without a mailbox has
+			// children when a visible mailbox lives under it, e.g. a shared
+			// mailbox whose parent the user cannot see (§3.5: "\NonExistent
+			// \HasChildren").
+			if options.ReturnChildren {
+				data.Attrs = append(data.Attrs, childAttr(hasDescendant(lname, delim, liveByLower)))
+			}
 		}
 
 		if hasSubChild {
@@ -363,12 +379,12 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 		attributes = append(attributes, imap.MailboxAttrNoSelect)
 	}
 
-	if serverCaps.Has(imap.CapChildren) {
-		if mbox.HasChildren {
-			attributes = append(attributes, imap.MailboxAttrHasChildren)
-		} else {
-			attributes = append(attributes, imap.MailboxAttrHasNoChildren)
-		}
+	// RFC 5258 §4: "If the CHILDREN return option is present, the server MUST
+	// return these attributes even if their computation is expensive." The
+	// option belongs to LIST-EXTENDED, which stays advertised when CHILDREN is
+	// disabled; without it a disabled CHILDREN keeps them off.
+	if serverCaps.Has(imap.CapChildren) || options.ReturnChildren {
+		attributes = append(attributes, childAttr(mbox.HasChildren))
 	}
 
 	// RFC 6154 special-use is a persisted per-mailbox attribute (see the
