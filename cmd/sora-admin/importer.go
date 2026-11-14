@@ -1328,12 +1328,14 @@ func (i *Importer) scanMaildir() error {
 
 	var refusedMu sync.Mutex
 	refusedFiles := make(map[maildirFileKey]struct{})
-	// Refusals apply only to this run. Deleting a prior cache row would also lose
-	// a successful legacy import's SHA-256 identity and duplicate it under BLAKE3
-	// if a later run raises the limit again.
-	refuse := func(file fileToProcess, err error) {
-		logger.Warn("Invalid message", "path", file.path, "error", err)
-		i.recordFailedPath(file.path, fmt.Sprintf("invalid message: %v", err))
+	// refuse reports a file the scan drops, once, and leaves it out of this run's
+	// import: a cache row an earlier run left for it would otherwise be read again
+	// and the file reported a second time. Refusals apply only to this run.
+	// Deleting a prior cache row would also lose a successful legacy import's
+	// SHA-256 identity and duplicate it under BLAKE3 if a later run raises the limit
+	// again.
+	refuse := func(file fileToProcess, reason string) {
+		i.recordFailedPath(file.path, reason)
 		atomic.AddInt64(&i.failedMessages, 1)
 		refusedMu.Lock()
 		refusedFiles[maildirFileKey{file.filename, file.mailboxName}] = struct{}{}
@@ -1351,19 +1353,20 @@ func (i *Importer) scanMaildir() error {
 				// never reaches the cache is otherwise invisible to every later count.
 				hash, size, err := hashFile(file.path, i.options.MaxMessageSize)
 				if errors.Is(err, errMessageTooLarge) {
-					refuse(file, err)
+					logger.Warn("Invalid message", "path", file.path, "error", err)
+					refuse(file, fmt.Sprintf("invalid message: %v", err))
 					continue
 				}
 				if err != nil {
 					logger.Warn("Failed to hash file", "path", file.path, "error", err)
-					i.recordFailedPath(file.path, fmt.Sprintf("read/hash error: %v", err))
-					atomic.AddInt64(&i.failedMessages, 1)
+					refuse(file, fmt.Sprintf("read/hash error: %v", err))
 					continue
 				}
 
 				// Validate message
 				if err := i.validateMessage(size); err != nil {
-					refuse(file, err)
+					logger.Warn("Invalid message", "path", file.path, "error", err)
+					refuse(file, fmt.Sprintf("invalid message: %v", err))
 					continue
 				}
 
@@ -1374,8 +1377,7 @@ func (i *Importer) scanMaildir() error {
 					file.path, file.filename, hash, size, file.mailboxName)
 				if err != nil {
 					logger.Warn("Failed to insert message into sqlite db", "path", file.path, "error", err)
-					i.recordFailedPath(file.path, fmt.Sprintf("cache insert error: %v", err))
-					atomic.AddInt64(&i.failedMessages, 1)
+					refuse(file, fmt.Sprintf("cache insert error: %v", err))
 					continue
 				}
 			}
