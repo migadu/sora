@@ -153,8 +153,9 @@ func (s *LMTPSession) mayReplaceClientAddr() bool {
 // xclientTrustedProxies returns the CIDR blocks trusted to send XCLIENT/XRCPTFORWARD
 // source-IP overrides, using exactly the configured lists with no RFC1918 fallback.
 func (s *LMTPSession) xclientTrustedProxies() []string {
-	// With PROXY protocol enabled, honor the (possibly separate) proxy_protocol_trusted_proxies
-	// list, which itself falls back only to the configured trusted_networks — never to RFC1918.
+	// With PROXY protocol enabled, honor the PROXY reader's trust list: the
+	// ProxyProtocolTrustedProxies option, which no config key sets and which falls back
+	// only to the configured trusted_networks — never to RFC1918.
 	if s.backend.proxyReader != nil {
 		return s.backend.proxyReader.GetTrustedProxies()
 	}

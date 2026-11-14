@@ -111,7 +111,15 @@ func TestRelayTransportWarning(t *testing.T) {
 // TestRelayValidateType: [relay] type is "smtp" or "http", exactly, or the section is
 // absent. Anything else used to create the relay queue with no worker to drain it, so
 // every Sieve redirect and vacation reply was accepted into pending/ and never sent (#277).
+//
+// The type's destination is checked too: an "smtp" relay needs an smtp_host it can dial
+// and an "http" relay an http_url it can post to. The SMTP handler dials smtp_host as
+// given, with no default port, and the HTTP handler posts to http_url as given; with
+// either missing or unusable every Sieve redirect and vacation reply was accepted into
+// the queue, failed each attempt as a temporary error and went to failed/ (#532).
 func TestRelayValidateType(t *testing.T) {
+	smtp := func(host string) string { return "type = \"smtp\"\nsmtp_host = \"" + host + "\"" }
+	http := func(url string) string { return "type = \"http\"\nhttp_url = \"" + url + "\"" }
 	tests := []struct {
 		name    string
 		block   string
@@ -124,6 +132,33 @@ func TestRelayValidateType(t *testing.T) {
 		{name: "upper-case SMTP", block: "type = \"SMTP\"\nsmtp_host = \"smtp.example.com:587\"", wantErr: `unsupported [relay] type "SMTP"`},
 		{name: "mixed-case Http", block: "type = \"Http\"\nhttp_url = \"https://api.example.com/deliver\"", wantErr: `unsupported [relay] type "Http"`},
 		{name: "lmtp", block: "type = \"lmtp\"\nsmtp_host = \"smtp.example.com:24\"", wantErr: `unsupported [relay] type "lmtp"`},
+
+		{name: "smtp IPv4:port", block: smtp("192.0.2.10:25"), wantErr: ""},
+		{name: "smtp [IPv6]:port", block: smtp("[2001:db8::10]:465"), wantErr: ""},
+		{name: "smtp service name as port", block: smtp("smtp.example.com:smtp"), wantErr: ""},
+		{name: "smtp_host missing", block: "type = \"smtp\"", wantErr: `[relay] type "smtp" requires smtp_host as host:port`},
+		{name: "smtp_host blank", block: smtp("   "), wantErr: `[relay] type "smtp" requires smtp_host as host:port`},
+		{name: "smtp_host without port", block: smtp("smtp.example.com"), wantErr: `[relay] smtp_host "smtp.example.com" must be host:port`},
+		{name: "smtp bare IPv6 without port", block: smtp("2001:db8::10"), wantErr: `[relay] smtp_host "2001:db8::10" must be host:port`},
+		{name: "smtp_host as URL", block: smtp("smtp://smtp.example.com:587"), wantErr: `[relay] smtp_host "smtp://smtp.example.com:587" must be host:port`},
+		{name: "smtp_host without host", block: smtp(":587"), wantErr: `[relay] smtp_host ":587" has no host`},
+		{name: "smtp_host empty port", block: smtp("smtp.example.com:"), wantErr: `[relay] smtp_host "smtp.example.com:" has no valid port`},
+		{name: "smtp_host port 0", block: smtp("smtp.example.com:0"), wantErr: `[relay] smtp_host "smtp.example.com:0" has no valid port`},
+		{name: "smtp_host port out of range", block: smtp("smtp.example.com:65536"), wantErr: `[relay] smtp_host "smtp.example.com:65536" has no valid port`},
+		{name: "smtp_host unknown service", block: smtp("smtp.example.com:no-such-service"), wantErr: `[relay] smtp_host "smtp.example.com:no-such-service" has no valid port`},
+
+		{name: "http url with port", block: http("http://127.0.0.1:8080/deliver"), wantErr: ""},
+		{name: "upper-case scheme", block: http("HTTPS://api.example.com/deliver"), wantErr: ""},
+		{name: "http_url missing", block: "type = \"http\"", wantErr: `[relay] type "http" requires http_url`},
+		{name: "http_url without scheme", block: http("api.example.com/deliver"), wantErr: `[relay] http_url "api.example.com/deliver" must be an absolute http:// or https:// URL with a host`},
+		{name: "http_url other scheme", block: http("ftp://api.example.com/deliver"), wantErr: `[relay] http_url "ftp://api.example.com/deliver" must be an absolute http:// or https:// URL with a host`},
+		{name: "http_url without host", block: http("https:///deliver"), wantErr: `[relay] http_url "https:///deliver" must be an absolute http:// or https:// URL with a host`},
+		{name: "http_url port without host", block: http("https://:8443/deliver"), wantErr: `[relay] http_url "https://:8443/deliver" must be an absolute http:// or https:// URL with a host`},
+		{name: "http_url port out of range", block: http("https://api.example.com:65536/deliver"), wantErr: `[relay] http_url "https://api.example.com:65536/deliver" has no valid port`},
+		{name: "http_url unparsable", block: http("https://api.example.com:80a/deliver"), wantErr: `[relay] http_url "https://api.example.com:80a/deliver" is not a valid URL`},
+		// The error quotes http_url the way the config dump shows it: a query value may
+		// be the relay's API key.
+		{name: "http_url query value masked", block: http("ftp://api.example.com/deliver?key=relay-secret"), wantErr: `[relay] http_url "ftp://api.example.com/deliver?key=` + SecretMask + `"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -139,5 +174,27 @@ func TestRelayValidateType(t *testing.T) {
 				t.Errorf("Validate() = %v, want an error containing %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestRelayValidateMalformedEndpointsHideCredentials(t *testing.T) {
+	for _, relay := range []RelayConfig{
+		{Type: "http", HTTPURL: "relay.example/send?api_key=private-relay-token"},
+		{Type: "http", HTTPURL: "user:private-relay-token@relay.example/send"},
+		{Type: "smtp", SMTPHost: "smtp://user:private-relay-token@smtp.example:587"},
+		{Type: "smtp", SMTPHost: "user:private-relay-token@smtp.example:587"},
+	} {
+		err := relay.Validate()
+		if err == nil {
+			t.Fatalf("invalid relay endpoint was accepted: %#v", relay)
+		}
+		if strings.Contains(err.Error(), "private-relay-token") {
+			t.Errorf("validation exposed endpoint credentials: %v", err)
+		}
+	}
+	for _, host := range []string{"smtp bad.example:587", "user@smtp.example:587", "smtp.example/path:587"} {
+		if err := (&RelayConfig{Type: "smtp", SMTPHost: host}).Validate(); err == nil {
+			t.Errorf("non-dialable SMTP host %q accepted", host)
+		}
 	}
 }
