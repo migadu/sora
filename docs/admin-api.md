@@ -508,7 +508,7 @@ Retrieve all active connections across all protocols.
 
 **Endpoint:** `GET /admin/connections/stats`
 
-Get the number of active connections on this node, every session counted, in total and per connection tracker (protocol and server name). Connections other nodes report through gossip are not included; sum the nodes for a cluster total.
+Get the number of active connections on this node, every session counted, in total and per connection tracker. Trackers are keyed `<PROTOCOL>-<server name>` on a backend and `<PROTOCOL>-<host name>-<server name>` on a proxy. Connections other nodes report through gossip are not included. For a cluster total, sum the proxy nodes or the backend nodes, not both: a session through a proxy is counted by the proxy and again by its backend (also within one node that runs both).
 
 **Response:** `200 OK`
 ```json

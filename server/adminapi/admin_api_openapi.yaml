@@ -257,11 +257,11 @@ components:
       properties:
         total_connections:
           type: integer
-          description: "Connections on this node, every session counted; connections other nodes report through gossip are not included."
+          description: "Connections on this node, every session counted; connections other nodes report through gossip are not included. A session through a proxy is counted by the proxy and again by its backend, so a cluster total sums the proxy nodes or the backend nodes, not both."
           example: 150
         connections_by_protocol:
           type: object
-          description: "total_connections per connection tracker, keyed by protocol and server name."
+          description: "total_connections per connection tracker, keyed <PROTOCOL>-<server name> on a backend and <PROTOCOL>-<host name>-<server name> on a proxy."
           additionalProperties:
             type: integer
           example:
