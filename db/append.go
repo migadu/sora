@@ -218,7 +218,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				m.content_hash,
 				CASE WHEN m.account_id = $6 THEN m.uploaded ELSE m.content_hash = ANY($10::text[]) END AS uploaded,
 				m.message_id, m.in_reply_to, m."references",
-				m.subject, m.sent_date, m.internal_date, m.size,
+				m.subject, m.sent_date, m.sent_utc_offset, m.internal_date, m.size,
 				m.body_structure, m.recipients_json,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
 				m.id AS original_id,
@@ -235,14 +235,14 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		inserted AS (
 			INSERT INTO messages (
 				account_id, content_hash, uploaded, message_id, in_reply_to, "references",
-				subject, sent_date, internal_date, size,
+				subject, sent_date, sent_utc_offset, internal_date, size,
 				body_structure, recipients_json, s3_domain, s3_localpart,
 				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
 				mailbox_id, mailbox_path, created_modseq, uid
 			)
 			SELECT
 				$6 AS account_id, content_hash, uploaded, message_id, in_reply_to, "references",
-				subject, sent_date, internal_date, size,
+				subject, sent_date, sent_utc_offset, internal_date, size,
 				body_structure, recipients_json,
 				-- The S3 key is per row: the body lives under whatever the account's primary
 				-- address was when the source row was written, and readers build their GET
@@ -489,6 +489,26 @@ func stageFTS(ctx context.Context, tx pgx.Tx, contentHash string, accountID int6
 	tx.Exec(ctx, "RELEASE SAVEPOINT "+savepoint)
 }
 
+// maxSentUTCOffset bounds the Date: header zone offsets kept in messages.sent_utc_offset, in
+// seconds. Real zones lie between -12:00 and +14:00; the RFC 5322 §3.3 grammar admits any
+// four digits. The SENT* search keys rely on the bound: they look the offset up only for
+// messages sent within this distance of the searched date (sentDayCond).
+const maxSentUTCOffset = 24 * 60 * 60
+
+// sentUTCOffset returns the messages.sent_utc_offset value for sentDate: the UTC offset, in
+// seconds, of the zone it is expressed in. Ingress passes the parsed Date: header in its own
+// zone, so sent_date plus this offset is the header's wall-clock time, whose day the SENT*
+// keys compare (RFC 9051 §6.4.4: "disregarding time and timezone"). nil (NULL, searched by
+// the UTC day) for an offset beyond maxSentUTCOffset.
+func sentUTCOffset(sentDate time.Time) *int32 {
+	_, offset := sentDate.Zone()
+	if offset < -maxSentUTCOffset || offset > maxSentUTCOffset {
+		return nil
+	}
+	o := int32(offset)
+	return &o
+}
+
 func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
 	start := time.Now()
 	defer func() {
@@ -722,9 +742,9 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
 			INSERT INTO messages
-				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, delivery_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, "references", body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, delivery_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, in_reply_to, "references", body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
 			VALUES
-				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @delivery_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @in_reply_to, @references, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
+				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @delivery_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @sent_utc_offset, @in_reply_to, @references, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
 			RETURNING id
 		)
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -746,6 +766,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		"size":            options.Size,
 		"subject":         saneSubject,
 		"sent_date":       options.SentDate,
+		"sent_utc_offset": sentUTCOffset(options.SentDate),
 		"in_reply_to":     saneInReplyToStr,
 		"references":      saneReferencesStr,
 		"body_structure":  bodyStructureData,
@@ -1093,9 +1114,9 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
 			INSERT INTO messages
-				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
 			VALUES
-				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @in_reply_to, @references, @body_structure, @recipients_json, true, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
+				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @sent_utc_offset, @in_reply_to, @references, @body_structure, @recipients_json, true, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
 			RETURNING id
 		)
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -1116,6 +1137,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		"size":            options.Size,
 		"subject":         saneSubject,
 		"sent_date":       options.SentDate,
+		"sent_utc_offset": sentUTCOffset(options.SentDate),
 		"in_reply_to":     saneInReplyToStr,
 		"references":      saneReferencesStr,
 		"body_structure":  bodyStructureData,
@@ -1492,9 +1514,9 @@ func (d *Database) InsertMessagesBatch(
 		batch.Queue(`
 			WITH inserted AS (
 				INSERT INTO messages
-					(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
+					(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
 				VALUES
-					($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, nextval('messages_modseq'), $18, $19, $20, $21, $22, $23, $26)
+					($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $27, $13, $14, $15, $16, $17, nextval('messages_modseq'), $18, $19, $20, $21, $22, $23, $26)
 				RETURNING id
 			)
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -1505,7 +1527,7 @@ func (d *Database) InsertMessagesBatch(
 			p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.InternalDate, p.Opt.Size, p.SaneSubject, p.Opt.SentDate,
 			p.SaneInReplyToStr, p.SaneReferencesStr, p.BodyStructureData, p.RecipientsJSON, uploaded, p.SubjectSort,
 			p.FromNameSort, p.FromEmailSort, p.ToNameSort, p.ToEmailSort, p.CcEmailSort,
-			p.BitwiseFlags, p.CustomKeywordsJSON, p.ExtraAddresses,
+			p.BitwiseFlags, p.CustomKeywordsJSON, p.ExtraAddresses, sentUTCOffset(p.Opt.SentDate),
 		)
 
 		if !uploaded && p.Upload != nil {

@@ -127,15 +127,19 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 		args[param] = criteria.Before
 		conditions = append(conditions, fmt.Sprintf("%sinternal_date < @%s", datePrefix, param))
 	}
+	// SENTSINCE / SENTBEFORE compare the day of the Date: header in its own zone (#867). The
+	// test looks the row up by its id, which is ambiguous unqualified in the legacy seqnum
+	// statement (message_seqs has one too); that statement passes no prefix, but it too
+	// names its messages row m.
+	sentAlias := tablePrefix
+	if sentAlias == "" {
+		sentAlias = "m"
+	}
 	if !criteria.SentSince.IsZero() {
-		param := nextParam()
-		args[param] = criteria.SentSince
-		conditions = append(conditions, fmt.Sprintf("%ssent_date >= @%s", datePrefix, param))
+		conditions = append(conditions, sentDayCond(sentAlias, ">=", criteria.SentSince, args, nextParam))
 	}
 	if !criteria.SentBefore.IsZero() {
-		param := nextParam()
-		args[param] = criteria.SentBefore
-		conditions = append(conditions, fmt.Sprintf("%ssent_date < @%s", datePrefix, param))
+		conditions = append(conditions, sentDayCond(sentAlias, "<", criteria.SentBefore, args, nextParam))
 	}
 
 	// Message size
@@ -338,6 +342,33 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	}
 
 	return finalCondition, args, nil
+}
+
+// sentDayCond is the SENTSINCE (op ">=") or SENTBEFORE (op "<") test of the Date: header
+// "disregarding time and timezone" (RFC 9051 §6.4.4) against day, the searched date as
+// midnight UTC. The day meant is the one the header names in its own zone: its wall-clock
+// time, sent_date shifted by sent_utc_offset, compared with day as if both were UTC. A row
+// without an offset (written before migration 000060) counts as UTC, as it always was.
+//
+// sent_utc_offset is deliberately not in idx_messages_mailbox_headers_v2, and naming it on
+// the messages row would turn every date search back into a heap filter over the whole
+// mailbox (the 38 s case in substringCond). No stored offset exceeds maxSentUTCOffset, so a
+// message sent further than that from day is decided by sent_date alone, from the index;
+// the offset is read by primary key, through message_sent_utc_offset (migration 000060, which
+// says why not a subquery), only for the messages in between.
+func sentDayCond(alias, op string, day time.Time, args pgx.NamedArgs, nextParam func() string) string {
+	band := time.Duration(maxSentUTCOffset) * time.Second
+	// Every zone agrees on a match where sent_date op sure holds, and on no match where
+	// sent_date op edge fails; only in between does the zone decide.
+	sure, edge := day.Add(band), day.Add(-band)
+	if op == "<" {
+		sure, edge = edge, sure
+	}
+	dayParam, sureParam, edgeParam := nextParam(), nextParam(), nextParam()
+	args[dayParam], args[sureParam], args[edgeParam] = day, sure, edge
+	headerTime := fmt.Sprintf("%[1]s.sent_date + make_interval(secs => COALESCE(message_sent_utc_offset(%[1]s.id), 0))", alias)
+	return fmt.Sprintf("(%[1]s.sent_date %[2]s @%[3]s OR (%[1]s.sent_date %[2]s @%[4]s AND %[5]s %[2]s @%[6]s))",
+		alias, op, sureParam, edgeParam, headerTime, dayParam)
 }
 
 // buildSortOrderClause builds an SQL ORDER BY clause from IMAP sort criteria
