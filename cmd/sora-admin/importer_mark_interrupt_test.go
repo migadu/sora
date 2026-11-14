@@ -97,3 +97,40 @@ func TestMarkBatchInSQLiteReportsARealTimeout(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Contains(t, err.Error(), "timed out after 50ms")
 }
+
+// A running SQLite statement must also honor the deadline, roll back earlier
+// rows of the batch, and leave no background mark that commits after return.
+func TestMarkBatchInSQLiteInterruptsStatementAndRollsBack(t *testing.T) {
+	saved := sqliteMarkTimeout
+	sqliteMarkTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { sqliteMarkTimeout = saved })
+
+	importer, err := NewImporter(context.Background(), newCleanupDBMaildir(t, 0), "user@example.com", 1, nil, nil, ImporterOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { importer.Close() })
+	for _, hash := range []string{"fast", "slow"} {
+		_, err := importer.sqliteDB.Exec(`INSERT INTO messages (path, filename, hash, size, mailbox, s3_uploaded) VALUES (?, ?, ?, 128, 'INBOX', 0)`, hash, hash, hash)
+		require.NoError(t, err)
+	}
+	_, err = importer.sqliteDB.Exec(`
+		CREATE TRIGGER slow_mark BEFORE UPDATE ON messages WHEN NEW.hash = 'slow'
+		BEGIN
+			SELECT (WITH RECURSIVE seq(x) AS (
+				VALUES(0) UNION ALL SELECT x + 1 FROM seq WHERE x < 1000000000
+			) SELECT sum(x) FROM seq);
+		END`)
+	require.NoError(t, err)
+
+	marked := []markedMessage{{hash: "fast", mailbox: "INBOX"}, {hash: "slow", mailbox: "INBOX"}}
+	err = importer.markBatchInSQLite(marked)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	var uploaded int
+	require.NoError(t, importer.sqliteDB.QueryRow(`SELECT sum(s3_uploaded) FROM messages`).Scan(&uploaded))
+	require.Zero(t, uploaded, "the earlier row must roll back with the interrupted statement")
+
+	_, err = importer.sqliteDB.Exec(`DROP TRIGGER slow_mark`)
+	require.NoError(t, err)
+	require.NoError(t, importer.markBatchInSQLite(marked), "the timed-out transaction must release its connection and locks")
+	require.NoError(t, importer.sqliteDB.QueryRow(`SELECT sum(s3_uploaded) FROM messages`).Scan(&uploaded))
+	require.Equal(t, 2, uploaded)
+}
