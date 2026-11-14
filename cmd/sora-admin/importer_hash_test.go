@@ -47,7 +47,7 @@ func TestImportHashIsDeliveryHash(t *testing.T) {
 			}
 			want := helpers.HashContent(tt.message)
 
-			got, size, err := hashFile(path)
+			got, size, err := hashFile(path, 0)
 			if err != nil {
 				t.Fatalf("hashFile: %v", err)
 			}
