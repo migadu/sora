@@ -773,6 +773,7 @@ circuit_breaker_max_requests = 3                                  # Max requests
 # Automatic cleanup prevents the failed queue from growing indefinitely.
 failed_retention = "168h"                                         # How long to retain failed messages before deletion (default: 168h = 7 days)
                                                                   # Messages older than this are automatically deleted
+                                                                  # "0" keeps them until deleted or requeued (sora-admin relay)
                                                                   # Accepted formats: "24h", "7d", "168h"
                                                                   # Special value: "0" = disable cleanup (keep failed messages forever)
 cleanup_interval = "1h"                                           # How often to run cleanup of old failed messages (default: 1h)

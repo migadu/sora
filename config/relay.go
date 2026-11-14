@@ -233,6 +233,20 @@ func (r *RelayConfig) GetQueuePath() string {
 	return "/var/spool/sora/relay" // Default path
 }
 
+// Validate rejects a worker_interval of zero or less, which the worker's ticker cannot
+// run with, and a negative failed_retention, against which every failed message is
+// overdue for deletion. A value that does not parse is left to start-up, where
+// worker_interval falls back to its default and failed_retention stops the server.
+func (q *RelayQueueConfig) Validate() error {
+	if d, err := q.GetWorkerInterval(); err == nil && d <= 0 {
+		return fmt.Errorf("worker_interval must be positive, got %q", q.WorkerInterval)
+	}
+	if d, err := q.GetFailedRetention(); err == nil && d < 0 {
+		return fmt.Errorf("failed_retention must not be negative, got %q", q.FailedRetention)
+	}
+	return nil
+}
+
 // GetWorkerInterval parses the worker interval duration
 func (q *RelayQueueConfig) GetWorkerInterval() (time.Duration, error) {
 	if q.WorkerInterval == "" {

@@ -199,6 +199,7 @@ run after it, so with `[logging] output` set to a file their lines go to that fi
 | A server that needs the database is configured and there is no database endpoint (see [section 3](#3-defaults)) | `database is required for configured servers but not configured in [database.write] or [database.read]` |
 | `[servers] trusted_networks` has an entry that is neither an IP address nor a CIDR block | names the invalid entry |
 | `[relay] type` is set to something other than `"smtp"` or `"http"` | `unsupported [relay] type ...` |
+| `[relay.queue] worker_interval` is `0` or less, or `failed_retention` is negative, with `[relay]` configured | `[relay.queue]: worker_interval must be positive, got ...` or `[relay.queue]: failed_retention must not be negative, got ...` |
 | `[timeout_scheduler] shard_count` is below -1 | `FATAL: operation 'initialize timeout scheduler' failed: invalid shard count: <n> (must be >= -1)` |
 
 The address check compares the strings, so `":143"` and `"0.0.0.0:143"` pass it and fail later when
@@ -562,7 +563,7 @@ relay and its disk queue. See [RELAY.md](RELAY.md).
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `path` | string | `"/var/spool/sora/relay"` | Queue directory. |
-| `worker_interval` | duration | `"1m"` | How often the queue is processed. |
+| `worker_interval` | duration | `"1m"` | How often the queue is processed. Must be positive. |
 | `batch_size` | integer | `100` | Messages per run. |
 | `concurrency` | integer | `5` | Messages sent in parallel. |
 | `max_attempts` | integer | `10` | Attempts before a message moves to `failed/`. |
@@ -570,7 +571,7 @@ relay and its disk queue. See [RELAY.md](RELAY.md).
 | `circuit_breaker_threshold` | integer | `5` | Consecutive failures that open the circuit breaker. |
 | `circuit_breaker_timeout` | duration | `"30s"` | Wait before the breaker tries again. |
 | `circuit_breaker_max_requests` | integer | `3` | Requests let through while it tries again. |
-| `failed_retention` | duration | `"168h"` | How long failed messages are kept. `"0"` or less also means 7 days. |
+| `failed_retention` | duration | `"168h"` | How long failed messages are kept. `"0"` keeps them until they are deleted or requeued; a negative value is refused. |
 | `cleanup_interval` | duration | `"1h"` | How often old failed messages are removed. |
 
 ### 8.12 Spam training (`[spam_training]`)
