@@ -2888,6 +2888,13 @@ func TrustedNetworksHaveBroadPrivateRanges(networks []string) bool {
 			if err != nil {
 				continue
 			}
+			// Measure an IPv4-mapped network (::ffff:a.b.c.d/96+k) as the IPv4 network
+			// a.b.c.d/k: that is how net.IPNet.Contains, and so every trust check, matches
+			// it against clients. ParseCIDR masks the address, so a mapped one here has a
+			// prefix of at least 96 bits.
+			if ip4 := n.IP.To4(); ip4 != nil && len(n.Mask) == net.IPv6len {
+				n = &net.IPNet{IP: ip4, Mask: n.Mask[net.IPv6len-net.IPv4len:]}
+			}
 			// Match if the configured network covers the whole supernet: it contains the
 			// supernet's base address and its mask is no narrower than the supernet's.
 			ones, _ := n.Mask.Size()
