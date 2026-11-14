@@ -68,3 +68,41 @@ func TestSubmitTrainingDoesNotFollowRedirects(t *testing.T) {
 		})
 	}
 }
+
+// TestSubmitTrainingAccepts2xx: a 2xx answer to the training POST is still an accepted
+// submission, so the redirect check does not reject the normal path.
+func TestSubmitTrainingAccepts2xx(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusAccepted, http.StatusNoContent} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var posts atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost && r.Header.Get("Authorization") == "Bearer training-token" {
+					posts.Add(1)
+				}
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+
+			c, err := NewClient(&config.SpamTrainingConfig{
+				Enabled:   true,
+				Endpoint:  srv.URL + "/train",
+				AuthToken: "training-token",
+			})
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+
+			if err := c.SubmitTraining(context.Background(), &TrainingRequest{
+				Type:      TrainingTypeHam,
+				Message:   "Subject: x\r\n\r\nbody",
+				User:      "user@example.com",
+				Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("SubmitTraining after a %d = %v, want nil", status, err)
+			}
+			if n := posts.Load(); n != 1 {
+				t.Errorf("endpoint received %d authorized POST(s), want 1", n)
+			}
+		})
+	}
+}
