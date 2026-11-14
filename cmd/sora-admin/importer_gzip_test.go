@@ -3,10 +3,22 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
-func TestDecompressIfNeeded(t *testing.T) {
+// readMessageOf writes onDisk to a file and returns readMessage of it.
+func readMessageOf(t *testing.T, onDisk []byte) ([]byte, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "message")
+	if err := os.WriteFile(path, onDisk, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return readMessage(path, 0)
+}
+
+func TestReadMessageDecompresses(t *testing.T) {
 	tests := []struct {
 		name        string
 		input       []byte
@@ -41,13 +53,13 @@ func TestDecompressIfNeeded(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := decompressIfNeeded(tt.input)
+			got, err := readMessageOf(t, tt.input)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("decompressIfNeeded() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("readMessage() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if !tt.wantErr && string(got) != tt.wantContent {
-				t.Errorf("decompressIfNeeded() = %v, want %v", string(got), tt.wantContent)
+				t.Errorf("readMessage() = %v, want %v", string(got), tt.wantContent)
 			}
 		})
 	}
@@ -81,7 +93,7 @@ And some content.
 	compressed := mustGzip([]byte(originalEmail))
 
 	// Test decompression
-	decompressed, err := decompressIfNeeded(compressed)
+	decompressed, err := readMessageOf(t, compressed)
 	if err != nil {
 		t.Fatalf("Failed to decompress: %v", err)
 	}
