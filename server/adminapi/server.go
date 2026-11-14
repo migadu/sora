@@ -78,15 +78,15 @@ type Server struct {
 	ftsRetention       time.Duration
 	affinityManager    AffinityManager
 	validBackends      map[string][]string
-	connectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker
-	proxyServers       map[string]ProxyServer               // proxy name -> proxy server
-	proxyReader        *server.ProxyProtocolReader          // PROXY protocol support
-	authCache          AuthCacheStats                       // persistent auth cache (optional)
-	redirectRateLimit  int                                  // Max redirects per account
-	redirectRateWindow time.Duration                        // Window for redirect limit
-	maxRedirectHops    int                                  // Max redirect hops per message (mail-loop backstop)
-	sieveExtensions    []string                             // [sieve] enabled_extensions, shared with the LMTP path
-	sharedMailboxes    config.SharedMailboxesConfig         // [shared_mailboxes], which ACL grants honour
+	connectionTrackers func() map[string]*server.ConnectionTracker // snapshot: protocol -> tracker
+	proxyServers       func() map[string]ProxyServer               // snapshot: proxy name -> proxy server
+	proxyReader        *server.ProxyProtocolReader                 // PROXY protocol support
+	authCache          AuthCacheStats                              // persistent auth cache (optional)
+	redirectRateLimit  int                                         // Max redirects per account
+	redirectRateWindow time.Duration                               // Window for redirect limit
+	maxRedirectHops    int                                         // Max redirect hops per message (mail-loop backstop)
+	sieveExtensions    []string                                    // [sieve] enabled_extensions, shared with the LMTP path
+	sharedMailboxes    config.SharedMailboxesConfig                // [shared_mailboxes], which ACL grants honour
 
 	// Mail deliveries in flight, reported as this server's drain sessions, admitted by the
 	// maintenance gate, which refuses new ones while this backend is in maintenance.
@@ -124,10 +124,10 @@ type ServerOptions struct {
 	MaintenanceGate    *server.MaintenanceGate // admits mail deliveries; refuses them while this backend is in maintenance (nil admits all)
 	FTSRetention       time.Duration
 	AffinityManager    AffinityManager
-	ValidBackends      map[string][]string                  // Map of protocol -> valid backend addresses
-	ConnectionTrackers map[string]*server.ConnectionTracker // protocol -> tracker (for gossip-based kick)
-	ProxyServers       map[string]ProxyServer               // proxy name -> proxy server (for backend health)
-	AuthCache          AuthCacheStats                       // persistent auth cache (optional)
+	ValidBackends      map[string][]string                         // Map of protocol -> valid backend addresses
+	ConnectionTrackers func() map[string]*server.ConnectionTracker // snapshot of protocol -> tracker (for gossip-based kick), see Server.trackers
+	ProxyServers       func() map[string]ProxyServer               // snapshot of proxy name -> proxy server (for backend health), see Server.trackers
+	AuthCache          AuthCacheStats                              // persistent auth cache (optional)
 	RedirectRateLimit  int
 	RedirectRateWindow time.Duration
 	MaxRedirectHops    int
@@ -1276,11 +1276,23 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// trackers returns a copy of this node's connection trackers (nil without any). The
+// node's servers register their trackers and proxies from their own start goroutines
+// while the Admin API already serves, so the maps are only read through the
+// ConnectionTrackers / ProxyServers accessors, which copy them under the lock their
+// owner writes them under.
+func (s *Server) trackers() map[string]*server.ConnectionTracker {
+	if s.connectionTrackers == nil {
+		return nil
+	}
+	return s.connectionTrackers()
+}
+
 // trackedAccountID resolves the account an account change applies to, for
 // endAccountSessions and forgetAccountLogins. It is zero when this node has no
 // servers to tell, or when the address names no account.
 func (s *Server) trackedAccountID(ctx context.Context, address string) int64 {
-	if len(s.connectionTrackers) == 0 {
+	if len(s.trackers()) == 0 {
 		return 0
 	}
 	accountID, err := s.rdb.GetAccountIDByEmailWithRetry(ctx, address)
@@ -1301,7 +1313,7 @@ func (s *Server) endAccountSessions(accountID int64, address string) {
 	if accountID == 0 {
 		return
 	}
-	for key, tracker := range s.connectionTrackers {
+	for key, tracker := range s.trackers() {
 		if tracker == nil {
 			continue
 		}
@@ -1318,7 +1330,7 @@ func (s *Server) forgetAccountLogins(accountID int64, address string) {
 	if accountID == 0 {
 		return
 	}
-	for key, tracker := range s.connectionTrackers {
+	for key, tracker := range s.trackers() {
 		if tracker == nil {
 			continue
 		}
@@ -1351,7 +1363,8 @@ func extractProtocolFromKey(key string) string {
 }
 
 func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
-	if len(s.connectionTrackers) == 0 {
+	trackers := s.trackers()
+	if len(trackers) == 0 {
 		// No connection trackers available
 		s.writeJSON(w, http.StatusOK, map[string]any{
 			"connections": []any{},
@@ -1365,7 +1378,7 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 	// Only report connections where this tracker instance has actual local connections
 	// This prevents duplicate entries where trackers report gossip data from other instances
 	allConnections := make([]map[string]any, 0)
-	for trackerKey, tracker := range s.connectionTrackers {
+	for trackerKey, tracker := range trackers {
 		if tracker == nil {
 			continue
 		}
@@ -1429,7 +1442,8 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		logger.Info("HTTP API: User not in database, using derived accountID for kick", "name", s.name, "email", req.UserEmail, "derived_account_id", accountID)
 	}
 
-	if len(s.connectionTrackers) == 0 {
+	trackers := s.trackers()
+	if len(trackers) == 0 {
 		// No connection trackers available (not running in cluster/proxy mode)
 		logger.Debug("HTTP API: No connection trackers available - gossip-based kick requires cluster mode", "name", s.name)
 		s.writeError(w, http.StatusServiceUnavailable, "Connection tracking not available (requires cluster mode)")
@@ -1447,7 +1461,7 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 	if req.Protocol != "" {
 		// Find all trackers that match the protocol prefix
 		normalizedProtocol := strings.ToUpper(req.Protocol)
-		for trackerKey, tracker := range s.connectionTrackers {
+		for trackerKey, tracker := range trackers {
 			// Extract protocol from tracker key (format: "PROTOCOL-hostname-servername")
 			trackerProtocol := extractProtocolFromKey(trackerKey)
 			if strings.ToUpper(trackerProtocol) == normalizedProtocol {
@@ -1459,7 +1473,7 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// Kick all trackers if no protocol specified
-		for trackerKey, tracker := range s.connectionTrackers {
+		for trackerKey, tracker := range trackers {
 			trackersToKick = append(trackersToKick, struct {
 				key     string
 				tracker *server.ConnectionTracker
@@ -1507,7 +1521,8 @@ func (s *Server) handleKickConnections(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
-	if len(s.connectionTrackers) == 0 {
+	trackers := s.trackers()
+	if len(trackers) == 0 {
 		// No connection trackers available
 		s.writeJSON(w, http.StatusOK, map[string]any{
 			"total_connections":       0,
@@ -1521,12 +1536,13 @@ func (s *Server) handleConnectionStats(w http.ResponseWriter, r *http.Request) {
 	totalConnections := 0
 	byProtocol := make(map[string]int)
 
-	for protocol, tracker := range s.connectionTrackers {
+	for protocol, tracker := range trackers {
 		if tracker == nil {
 			continue
 		}
-		conns := tracker.GetAllConnections()
-		count := len(conns)
+		// Connections on this node, as GET /admin/connections lists them: not the
+		// number of accounts, and not what other nodes report through gossip.
+		count := tracker.GetLocalConnectionTotal()
 		totalConnections += count
 		byProtocol[protocol] = count
 	}
@@ -1542,7 +1558,8 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 	// Extract email from path: /admin/connections/user/{email}
 	email := extractLastPathSegment(r.URL.Path)
 
-	if len(s.connectionTrackers) == 0 {
+	trackers := s.trackers()
+	if len(trackers) == 0 {
 		// No connection trackers available
 		s.writeJSON(w, http.StatusOK, map[string]any{
 			"email":       email,
@@ -1559,7 +1576,7 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 	userConnections := make([]map[string]any, 0)
 	emailLower := strings.ToLower(email)
 
-	for protocol, tracker := range s.connectionTrackers {
+	for protocol, tracker := range trackers {
 		if tracker == nil {
 			continue
 		}
@@ -1814,7 +1831,7 @@ func (s *Server) handleProxyBackends(w http.ResponseWriter, r *http.Request) {
 
 	// Iterate through all registered proxy servers
 	if s.proxyServers != nil {
-		for proxyName, proxyServer := range s.proxyServers {
+		for proxyName, proxyServer := range s.proxyServers() {
 			if proxyServer == nil {
 				continue
 			}

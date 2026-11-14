@@ -501,6 +501,23 @@ func (ct *ConnectionTracker) GetLocalConnectionCount(accountID int64) int {
 	return 0
 }
 
+// GetLocalConnectionTotal returns the number of connections on this instance, over all
+// accounts; connections other instances report through gossip are not included.
+func (ct *ConnectionTracker) GetLocalConnectionTotal() int {
+	if ct == nil {
+		return 0
+	}
+
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
+
+	total := 0
+	for _, info := range ct.connections {
+		total += info.GetLocalCount(ct.instanceID)
+	}
+	return total
+}
+
 // GetAllConnections returns all tracked connections (for admin tool)
 func (ct *ConnectionTracker) GetAllConnections() []UserConnectionInfo {
 	if ct == nil {

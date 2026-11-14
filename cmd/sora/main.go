@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
 	"os/signal"
@@ -117,6 +118,21 @@ type serverDependencies struct {
 	maintenanceGate       *server.MaintenanceGate              // refuses new sessions while this backend is in maintenance (nil on a node that does not report its sessions)
 	runningServers        map[string]ConfigReloader            // server name -> reloadable server
 	runningServersMux     sync.Mutex                           // protects runningServers map
+}
+
+// connectionTrackersSnapshot and proxyServersSnapshot copy the maps under their mutexes,
+// for readers that run while servers still register (the Admin API serves as soon as
+// its own goroutine starts, independently of the other servers' start goroutines).
+func (deps *serverDependencies) connectionTrackersSnapshot() map[string]*server.ConnectionTracker {
+	deps.connectionTrackersMux.Lock()
+	defer deps.connectionTrackersMux.Unlock()
+	return maps.Clone(deps.connectionTrackers)
+}
+
+func (deps *serverDependencies) proxyServersSnapshot() map[string]adminapi.ProxyServer {
+	deps.proxyServersMux.Lock()
+	defer deps.proxyServersMux.Unlock()
+	return maps.Clone(deps.proxyServers)
 }
 
 // ConfigReloader is implemented by servers that support runtime config reload via SIGHUP.
@@ -2425,8 +2441,8 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		FTSRetention:       deps.ftsRetention,
 		AffinityManager:    deps.affinityManager,
 		ValidBackends:      validBackends,
-		ConnectionTrackers: deps.connectionTrackers,
-		ProxyServers:       deps.proxyServers,
+		ConnectionTrackers: deps.connectionTrackersSnapshot,
+		ProxyServers:       deps.proxyServersSnapshot,
 		AuthCache:          deps.authCacheInstance,
 		RedirectRateLimit:  serverConfig.GetRedirectRateLimit(),
 		RedirectRateWindow: redirectRateWindow,
