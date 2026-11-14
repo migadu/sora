@@ -560,6 +560,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 	// Determine if any mail storage services are enabled
 	allServers := cfg.GetAllServers()
 	storageServicesNeeded := false
+	userAPIServed := false
 	databaseNeeded := false
 
 	// Check if database is actually configured
@@ -582,6 +583,9 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		// Admin API and User API need database for account management
 		if server.Type == "http_admin_api" || server.Type == "http_user_api" {
 			databaseNeeded = true
+		}
+		if server.Type == "http_user_api" {
+			userAPIServed = true
 		}
 	}
 
@@ -607,11 +611,24 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		proxyServers:       make(map[string]adminapi.ProxyServer),
 	}
 
+	// The User API serves message bodies (/user/messages/{id}/body and /raw) from S3, so
+	// it needs the [s3] connection on a node without mail services too. It reads through
+	// to S3 without the cache and workers those start below. Without any [s3] settings it
+	// serves everything but bodies.
+	s3Needed := storageServicesNeeded
+	if userAPIServed && !storageServicesNeeded {
+		if cfg.S3.Endpoint == "" && cfg.S3.Bucket == "" && cfg.S3.AccessKey == "" && cfg.S3.SecretKey == "" {
+			logger.Warn("User API: no [s3] configured on this node; message bodies (/user/messages/{id}/body and /raw) cannot be served")
+		} else {
+			s3Needed = true
+		}
+	}
+
 	// Initialize S3 storage if needed
-	if storageServicesNeeded {
+	if s3Needed {
 		// Ensure required S3 arguments are provided only if needed
 		if cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
-			errorHandler.ValidationError("S3 credentials", fmt.Errorf("missing required S3 credentials for mail services (IMAP, LMTP, POP3)"))
+			errorHandler.ValidationError("S3 credentials", fmt.Errorf("missing required S3 credentials for mail services (IMAP, LMTP, POP3) or the User API"))
 			os.Exit(errorHandler.WaitForExit())
 		}
 
@@ -2494,7 +2511,8 @@ func startDynamicHTTPUserAPIServer(ctx context.Context, deps *serverDependencies
 		AllowedHosts:                serverConfig.AllowedHosts,
 		Storage:                     deps.storage,
 		Cache:                       deps.cacheInstance,
-		Uploader:                    deps.uploadWorker, // spool reads + pending-upload state for bodies not yet in S3
+		Uploader:                    deps.uploadWorker,                // spool reads + pending-upload state for bodies not yet in S3
+		UploadMaxAttempts:           deps.config.Uploader.MaxAttempts, // pending-upload state on a node without an uploader
 		AuthRateLimit:               authRateLimit,
 		LookupCache:                 serverConfig.LookupCache,
 		TLS:                         serverConfig.TLS,

@@ -48,6 +48,7 @@ type Server struct {
 	storage                    *storage.S3Storage
 	rs3                        *resilient.ResilientS3Storage // storage behind retries + breaker; nil when storage is
 	uploader                   *uploader.UploadWorker
+	uploadMaxAttempts          int // [uploader] max_attempts for a node without uploader; see ServerOptions
 	cache                      *cache.Cache
 	authCache                  *lookupcache.LookupCache
 	positiveRevalidationWindow time.Duration
@@ -77,7 +78,12 @@ type ServerOptions struct {
 	// Uploader is this node's upload worker: bodies not yet in S3 are read from its
 	// staging spool, and its max_attempts tells a body still on its way from one the
 	// worker has given up on (see loadMessageBody). Optional.
-	Uploader                    *uploader.UploadWorker
+	Uploader *uploader.UploadWorker
+	// UploadMaxAttempts is [uploader] max_attempts, used when there is no Uploader (a
+	// User API node without imap, lmtp or pop3): the uploaders give up on a body after
+	// that many attempts, so it is gone, not "retry later". 0 counts every pending
+	// upload as on its way.
+	UploadMaxAttempts           int
 	AuthRateLimit               server.AuthRateLimiterConfig
 	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
 	TLS                         bool
@@ -223,6 +229,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		rs3:                        newResilientStorage(options.Storage),
 		cache:                      options.Cache,
 		uploader:                   options.Uploader,
+		uploadMaxAttempts:          options.UploadMaxAttempts,
 		authCache:                  authCache,
 		positiveRevalidationWindow: positiveRevalidationWindow,
 		authLimiter:                authLimiter,
