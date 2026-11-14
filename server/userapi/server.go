@@ -415,7 +415,7 @@ func (s *Server) SetupRoutes() http.Handler {
 
 // handleMailboxWithName routes mailbox operations that include a mailbox name
 func (s *Server) handleMailboxWithName(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
+	path := r.URL.EscapedPath() // an encoded "/" belongs to the name (see pathName)
 
 	// Check for subscribe/unsubscribe operations
 	if strings.HasSuffix(path, "/subscribe") {
@@ -499,7 +499,7 @@ func (s *Server) handleMessageOperations(w http.ResponseWriter, r *http.Request)
 
 // handleFilterOperations routes Sieve filter operations
 func (s *Server) handleFilterOperations(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
+	path := r.URL.EscapedPath() // an encoded "/" belongs to the name (see pathName)
 
 	// Check for capabilities endpoint
 	if strings.HasSuffix(path, "/capabilities") {
