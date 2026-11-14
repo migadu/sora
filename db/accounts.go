@@ -68,8 +68,6 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 			if err != nil {
 				return 0, fmt.Errorf("failed to generate SSHA512 hash: %w", err)
 			}
-		case "sha512":
-			hashedPassword = GenerateSHA512Hash(req.Password)
 		case "bcrypt":
 			hashedPassword, err = GenerateBcryptHash(req.Password)
 			if err != nil {
@@ -142,8 +140,6 @@ func (db *Database) AddCredential(ctx context.Context, tx pgx.Tx, req AddCredent
 			if err != nil {
 				return fmt.Errorf("failed to generate SSHA512 hash: %w", err)
 			}
-		case "sha512":
-			hashedPassword = GenerateSHA512Hash(req.NewPassword)
 		case "bcrypt":
 			hashedPassword, err = GenerateBcryptHash(req.NewPassword)
 			if err != nil {
@@ -234,8 +230,6 @@ func (db *Database) UpdateAccount(ctx context.Context, tx pgx.Tx, req UpdateAcco
 			if err != nil {
 				return fmt.Errorf("failed to generate SSHA512 hash: %w", err)
 			}
-		case "sha512":
-			hashedPassword = GenerateSHA512Hash(req.Password)
 		case "bcrypt":
 			hashedPassword, err = GenerateBcryptHash(req.Password)
 			if err != nil {
@@ -1076,6 +1070,11 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 		if cred.HashType == "" {
 			req.Credentials[i].HashType = "bcrypt" // Default hash type
 		}
+		if cred.Password != "" {
+			if err := ValidateNewHashType(req.Credentials[i].HashType); err != nil {
+				return 0, fmt.Errorf("credential %d: %w", i+1, err)
+			}
+		}
 	}
 
 	// Ensure exactly one primary credential
@@ -1148,8 +1147,6 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 				if err != nil {
 					return 0, fmt.Errorf("credential %d: failed to generate SSHA512 hash: %w", i+1, err)
 				}
-			case "sha512":
-				hashedPassword = GenerateSHA512Hash(cred.Password)
 			case "bcrypt":
 				hashedPassword, err = GenerateBcryptHash(cred.Password)
 				if err != nil {
