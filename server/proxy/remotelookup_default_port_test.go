@@ -192,7 +192,7 @@ func TestRemoteLookupServerWithoutPortImplicitTLSPort(t *testing.T) {
 // (-1 left the address port-less, 70000 was dialed). Every proxy treats an error here as
 // a failed remote lookup initialization and refuses to start.
 func TestInitializeRemoteLookupRejectsInvalidRemotePort(t *testing.T) {
-	for _, port := range []any{"1993x", "-1", "70000", -1, int64(-1), 70000, int64(70000), 1993.5, true} {
+	for _, port := range []any{"1993x", "-1", "70000", -1, int64(-1), 70000, int64(70000), int64(4294969299), 1993.5, true} {
 		t.Run(fmt.Sprintf("%T %v", port, port), func(t *testing.T) {
 			client, err := proxy.InitializeRemoteLookup("imap", &config.RemoteLookupConfig{
 				Enabled:    true,

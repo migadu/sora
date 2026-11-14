@@ -26,6 +26,7 @@ func TestServerConfigValidateRemoteLookupPort(t *testing.T) {
 		{"negative", "-1", true, true},
 		{"negative string", `"-1"`, true, true},
 		{"out of range", "70000", true, true},
+		{"integer would wrap on 32-bit", "4294969299", true, true},
 		{"out of range string", `"70000"`, true, true},
 		{"float", "1993.5", true, true},
 		{"bool", "true", true, true},

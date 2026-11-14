@@ -1043,11 +1043,11 @@ func (c *RemoteLookupConfig) GetRemotePort() (int, error) {
 	default:
 		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
 	}
-	port := int(p)
-	if port < 0 || port > 65535 {
-		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	// Range-check before converting to int: TOML integers are int64 even on 32-bit targets.
+	if p < 0 || p > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", p)
 	}
-	return port, nil
+	return int(p), nil
 }
 
 // ServerLimitsConfig holds resource limits for a server
@@ -2164,11 +2164,11 @@ func (s *ServerConfig) GetRemotePort() (int, error) {
 	default:
 		return 0, fmt.Errorf("invalid type for remote_port: %T", v)
 	}
-	port := int(p)
-	if port < 0 || port > 65535 {
-		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", port)
+	// Range-check before converting to int: TOML integers are int64 even on 32-bit targets.
+	if p < 0 || p > 65535 {
+		return 0, fmt.Errorf("remote_port number %d is out of the valid range (1-65535)", p)
 	}
-	return port, nil
+	return int(p), nil
 }
 
 // GetRemoteHealthChecks returns whether backend health checking is enabled.
