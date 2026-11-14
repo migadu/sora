@@ -226,6 +226,7 @@ func TestMoveMessagesRefusesSourceRenamedSinceCaller(t *testing.T) {
 			S3Localpart:   "user_a",
 			ContentHash:   hash,
 			MessageID:     fmt.Sprintf("<renamed-move-source-%d@example.com>", i),
+			Flags:         []imap.Flag{imap.FlagSeen, imap.FlagFlagged, imap.Flag("MoveRekeyKeyword")},
 			InternalDate:  time.Now(),
 			Size:          1024,
 			Subject:       "Renamed source",
@@ -246,16 +247,31 @@ func TestMoveMessagesRefusesSourceRenamedSinceCaller(t *testing.T) {
 		return destRows, srcLive, highestUID
 	}
 	_, _, highestBefore := state()
+	sourceState := func() string {
+		var snapshot string
+		require.NoError(t, rdb.QueryRowWithRetry(ctx, `
+			SELECT COALESCE(jsonb_agg(jsonb_build_array(m.uid, ms.flags, ms.custom_flags, ms.updated_modseq)
+			                         ORDER BY m.uid), '[]'::jsonb)::text
+			FROM messages m JOIN message_state ms ON ms.message_id = m.id
+			WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL`, srcMailbox.ID).Scan(&snapshot))
+		return snapshot
+	}
+	sourcesBefore := sourceState()
 
 	renamed := map[imap.UID]string{uids[0]: hashes[uids[0]], uids[1]: "0784" + hashes[uids[1]][4:]}
 	missing := map[imap.UID]string{uids[0]: hashes[uids[0]]}
 	for name, sourceHashes := range map[string]map[imap.UID]string{"renamed": renamed, "missing": missing} {
-		_, err := rdb.MoveMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, "example.net", "user_b", "test-instance", sourceHashes, nil, nil)
+		got, err := rdb.MoveMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, "example.net", "user_b", "test-instance", sourceHashes, nil, nil)
 		require.ErrorIs(t, err, db.ErrMoveSourceChanged, name)
+		assert.Empty(t, got, "%s: a refused move returned a UID map", name)
 		destRows, srcLive, highest := state()
 		assert.Zero(t, destRows, "%s: a refused move wrote rows", name)
 		assert.Equal(t, len(uids), srcLive, "%s: a refused move expunged its sources", name)
 		assert.Equal(t, highestBefore, highest, "%s: a refused move allocated UIDs", name)
+		assert.Equal(t, sourcesBefore, sourceState(), "%s: a refused move changed source flags or modseq", name)
+		var pending int
+		require.NoError(t, rdb.QueryRowWithRetry(ctx, `SELECT COUNT(*) FROM pending_uploads WHERE account_id = $1`, accountID_B).Scan(&pending))
+		assert.Zero(t, pending, "%s: a refused move staged destination uploads", name)
 	}
 
 	uidMap, err := rdb.MoveMessagesWithRetry(ctx, &uids, srcMailbox.ID, destMailbox.ID, accountID_B, "example.net", "user_b", "test-instance", hashes, nil, nil)
