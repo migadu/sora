@@ -16,6 +16,12 @@ import (
 	imapserver "github.com/migadu/sora/server/imap"
 )
 
+// binaryFetchTestMessage holds "hello world" in base64, so BINARY answers
+// differ from BODY's.
+const binaryFetchTestMessage = "From: a@example.com\r\nTo: b@example.com\r\nSubject: binary\r\n" +
+	"MIME-Version: 1.0\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n" +
+	"\r\naGVsbG8gd29ybGQ=\r\n"
+
 // TestIMAP_DisabledBinaryFetchItems: RFC 9051 Appendix B, "IMAP4rev2
 // incorporates a subset of functionality provided by the BINARY extension
 // [RFC3516]; in particular, it includes additional FETCH items (BINARY,
@@ -113,10 +119,7 @@ func TestIMAP_DisabledBinaryFetchItems(t *testing.T) {
 				t.Fatalf("literal8 APPEND with BINARY disabled: want BAD, got:\n%s", resp)
 			}
 
-			// "hello world" in base64, so BINARY answers differ from BODY's.
-			msg := "From: a@example.com\r\nTo: b@example.com\r\nSubject: binary\r\n" +
-				"MIME-Version: 1.0\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n" +
-				"\r\naGVsbG8gd29ybGQ=\r\n"
+			msg := binaryFetchTestMessage
 			if _, err := fmt.Fprintf(conn, "a1 APPEND INBOX {%d+}\r\n%s\r\n", len(msg), msg); err != nil {
 				t.Fatalf("write APPEND failed: %v", err)
 			}
@@ -159,6 +162,66 @@ func TestIMAP_DisabledBinaryFetchItems(t *testing.T) {
 			}
 			if resp := mustOK("FETCH 1 (FLAGS)"); strings.Contains(resp, `\Seen`) {
 				t.Errorf("a refused or peeked BINARY set \\Seen:\n%s", resp)
+			}
+		})
+	}
+}
+
+// TestIMAP_DisabledBinaryNotifyFetchItems: the fetch-atts of NOTIFY's
+// MessageNew event (RFC 5465 §5.2) are FETCH items, answered through Fetch for
+// each new message. While IMAP4rev2 is offered the BINARY items are delivered
+// with the new message. Once neither BINARY nor IMAP4rev2 is offered, NOTIFY
+// SET naming them is refused with BAD (RFC 5465 §3.1: "BAD - Command unknown,
+// invalid, unsupported, or has unknown arguments"): accepting it left every
+// MessageNew FETCH to fail in the background, so the client got EXISTS and
+// never the FETCH it asked for.
+func TestIMAP_DisabledBinaryNotifyFetchItems(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	const notify = "NOTIFY SET (SELECTED (MessageNew (UID BINARY.PEEK[1] BINARY.SIZE[1]) MessageExpunge))"
+	for _, tc := range []struct {
+		name     string
+		disabled []string
+		rev2     bool // the session still offers IMAP4rev2
+	}{
+		{"disabled_caps BINARY", []string{"BINARY"}, true},
+		{"disabled_caps BINARY IMAP4rev2", []string{"BINARY", "IMAP4rev2"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, account, _ := common.SetupIMAPServerWithRealS3Options(t, func(o *imapserver.IMAPServerOptions) {
+				o.DisabledCaps = tc.disabled
+			})
+			t.Cleanup(server.Close)
+			login := fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password)
+
+			watcher := dialRawIMAP(t, server.Address)
+			watcher.do(login)
+			watcher.do("SELECT INBOX")
+			if status := watcher.status(notify); strings.HasPrefix(status, "BAD ") == tc.rev2 {
+				t.Fatalf("%s: got %s, want BAD = %v", notify, status, !tc.rev2)
+			}
+			if !tc.rev2 {
+				return
+			}
+
+			other := dialRawIMAP(t, server.Address)
+			other.do(login)
+			other.appendMsg("INBOX", binaryFetchTestMessage)
+
+			var got strings.Builder
+			if err := watcher.conn.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
+				t.Fatalf("SetReadDeadline: %v", err)
+			}
+			for !strings.Contains(got.String(), "BINARY.SIZE[1] ") {
+				line, err := watcher.r.ReadString('\n')
+				got.WriteString(line)
+				if err != nil {
+					t.Fatalf("waiting for the MessageNew FETCH: %v, got:\n%s", err, got.String())
+				}
+			}
+			if !strings.Contains(got.String(), "BINARY[1] ") || !strings.Contains(got.String(), "hello world") ||
+				!strings.Contains(got.String(), "BINARY.SIZE[1] 11") {
+				t.Errorf("MessageNew FETCH: want the decoded BINARY[1] and BINARY.SIZE[1] 11, got:\n%s", got.String())
 			}
 		})
 	}
