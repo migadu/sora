@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"math"
 	"net"
 	"os"
@@ -1180,7 +1181,7 @@ func (a *AuthCacheConfig) GetMaxAge() (time.Duration, error) {
 func (a *AuthCacheConfig) GetMaxAgeWithDefault() time.Duration {
 	d, err := a.GetMaxAge()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse auth_cache max_age: %v, using default (%s)", err, defaultAuthCacheMaxAge)
+		warnf("Failed to parse auth_cache max_age: %v, using default (%s)", err, defaultAuthCacheMaxAge)
 		return defaultAuthCacheMaxAge
 	}
 	return d
@@ -1198,7 +1199,7 @@ func (a *AuthCacheConfig) GetCleanupInterval() (time.Duration, error) {
 func (a *AuthCacheConfig) GetCleanupIntervalWithDefault() time.Duration {
 	d, err := a.GetCleanupInterval()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse auth_cache cleanup_interval: %v, using default (%s)", err, defaultAuthCacheCleanupInterval)
+		warnf("Failed to parse auth_cache cleanup_interval: %v, using default (%s)", err, defaultAuthCacheCleanupInterval)
 		return defaultAuthCacheCleanupInterval
 	}
 	return d
@@ -1216,7 +1217,7 @@ func (a *AuthCacheConfig) GetPurgeUnused() (time.Duration, error) {
 func (a *AuthCacheConfig) GetPurgeUnusedWithDefault() time.Duration {
 	d, err := a.GetPurgeUnused()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse auth_cache purge_unused: %v, using default (%s)", err, defaultAuthCachePurgeUnused)
+		warnf("Failed to parse auth_cache purge_unused: %v, using default (%s)", err, defaultAuthCachePurgeUnused)
 		return defaultAuthCachePurgeUnused
 	}
 	return d
@@ -1510,7 +1511,7 @@ func (s *ServerConfig) GetTokenDuration() (time.Duration, error) {
 func (s *ServerConfig) GetTokenDurationWithDefault() time.Duration {
 	d, err := s.GetTokenDuration()
 	if err != nil {
-		log.Printf("WARNING: Invalid token_duration for server '%s': %v, using default (%s)", s.Name, err, defaultTokenDuration)
+		warnf("Invalid token_duration for server '%s': %v, using default (%s)", s.Name, err, defaultTokenDuration)
 		return defaultTokenDuration
 	}
 	return d
@@ -1578,7 +1579,7 @@ func (s *ServerConfig) GetCommandTimeoutWithDefault() time.Duration {
 	timeout, err := s.GetCommandTimeout()
 	if err != nil {
 		def := s.defaultCommandTimeout()
-		log.Printf("WARNING: Failed to parse command_timeout for server '%s': %v, using default (%s)", s.Name, err, def)
+		warnf("Failed to parse command_timeout for server '%s': %v, using default (%s)", s.Name, err, def)
 		return def
 	}
 	return timeout
@@ -1623,7 +1624,7 @@ func (s *ServerConfig) GetAbsoluteSessionTimeoutWithDefault() time.Duration {
 	timeout, err := s.GetAbsoluteSessionTimeout()
 	if err != nil {
 		def := s.defaultAbsoluteSessionTimeout()
-		log.Printf("WARNING: Failed to parse absolute_session_timeout for server '%s': %v, using default (%s)", s.Name, err, def)
+		warnf("Failed to parse absolute_session_timeout for server '%s': %v, using default (%s)", s.Name, err, def)
 		return def
 	}
 	return timeout
@@ -1912,6 +1913,15 @@ func (s *ServerConfig) GetRemoteHealthChecks() bool {
 	return *s.RemoteHealthChecks
 }
 
+// warnf reports a value a ...WithDefault method replaced with its default. It
+// logs at WARN through slog's default logger, which the logger package (it
+// imports config, so config cannot import it) points at the server log. The
+// log package's output reaches that log only at INFO, so a typo logged with
+// log.Printf was filtered out at level = "warn".
+func warnf(format string, args ...any) {
+	slog.Warn(fmt.Sprintf(format, args...))
+}
+
 // Configuration defaulting methods with logging
 func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 	limit, err := s.GetAppendLimit()
@@ -1943,7 +1953,7 @@ func (s *ServerConfig) GetConnectTimeoutWithDefault() time.Duration {
 func (s *ServerConfig) GetAuthIdleTimeoutWithDefault() time.Duration {
 	timeout, err := s.GetAuthIdleTimeout()
 	if err != nil {
-		log.Printf("WARNING: Failed to parse auth idle timeout for server '%s': %v, using default 2m", s.Name, err)
+		warnf("Failed to parse auth idle timeout for server '%s': %v, using default 2m", s.Name, err)
 		return 2 * time.Minute
 	}
 	return timeout

@@ -1,6 +1,10 @@
 package config
 
 import (
+	"bytes"
+	"log"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -119,6 +123,45 @@ func TestGetTokenDuration(t *testing.T) {
 			if d := cfg.GetTokenDurationWithDefault(); d != 24*time.Hour {
 				t.Errorf("GetTokenDurationWithDefault(%q) = %v, want the default 24h", tt.in, d)
 			}
+		}
+	}
+}
+
+// The fallback for an invalid value is logged at WARN (#295). The logger
+// package makes its logger slog's default and bridges the log package to it at
+// INFO, so a log.Printf "WARNING:" line was dropped at level = "warn".
+func TestInvalidValueFallbacksLogAtWarn(t *testing.T) {
+	var buf bytes.Buffer
+	prevDefault, prevOut, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() {
+		slog.SetDefault(prevDefault)
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+
+	srv := ServerConfig{
+		Type:            "imap",
+		Name:            "imap",
+		AuthIdleTimeout: "2 min",
+		TokenDuration:   "-1h",
+		Timeouts:        &ServerTimeoutsConfig{CommandTimeout: "30 min", AbsoluteSessionTimeout: "1 day"},
+	}
+	ac := AuthCacheConfig{MaxAge: "24", PurgeUnused: "1 week", CleanupInterval: "hourly"}
+
+	for key, fallback := range map[string]func(){
+		"command_timeout":          func() { srv.GetCommandTimeoutWithDefault() },
+		"absolute_session_timeout": func() { srv.GetAbsoluteSessionTimeoutWithDefault() },
+		"auth idle timeout":        func() { srv.GetAuthIdleTimeoutWithDefault() },
+		"token_duration":           func() { srv.GetTokenDurationWithDefault() },
+		"auth_cache max_age":       func() { ac.GetMaxAgeWithDefault() },
+		"auth_cache purge_unused":  func() { ac.GetPurgeUnusedWithDefault() },
+		"auth_cache cleanup":       func() { ac.GetCleanupIntervalWithDefault() },
+	} {
+		buf.Reset()
+		fallback()
+		if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, key) {
+			t.Errorf("invalid %s: logged %q, want a WARN record naming it", key, out)
 		}
 	}
 }
