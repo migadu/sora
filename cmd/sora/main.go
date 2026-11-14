@@ -1472,6 +1472,30 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 	deps.serverManager.Add()
 	defer deps.serverManager.Done()
 
+	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, buildLMTPServerOptions(deps, serverConfig))
+
+	if err != nil {
+		errChan <- fmt.Errorf("failed to create LMTP server: %w", err)
+		return
+	}
+
+	go func() {
+		<-ctx.Done()
+		logger.Info("Shutting down LMTP server", "name", serverConfig.Name)
+		if err := lmtpServer.Close(); err != nil {
+			logger.Info("Error closing LMTP server", "error", err)
+		}
+	}()
+
+	deps.registerServer(serverConfig.Name, lmtpServer)
+
+	lmtpServer.Start(errChan)
+}
+
+// buildLMTPServerOptions maps the running config onto the LMTP server options, split out
+// of the start path (as buildAdminAPIServerOptions is) so the config -> options threading
+// is exercised on its own.
+func buildLMTPServerOptions(deps *serverDependencies, serverConfig config.ServerConfig) lmtp.LMTPServerOptions {
 	proxyProtocolTimeout := serverConfig.GetProxyProtocolTimeoutWithDefault()
 
 	maxMessageSize := serverConfig.GetMaxMessageSizeWithDefault()
@@ -1496,7 +1520,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		lmtpCommandTimeoutOverrides = nil
 	}
 
-	lmtpServer, err := lmtp.New(ctx, serverConfig.Name, deps.hostname, serverConfig.Addr, deps.storage, deps.resilientDB, deps.uploadWorker, lmtp.LMTPServerOptions{
+	return lmtp.LMTPServerOptions{
 		InstanceID:              deps.instanceID,
 		MaintenanceGate:         deps.maintenanceGate,
 		RelayQueue:              deps.relayQueue,  // Global relay queue
@@ -1522,24 +1546,7 @@ func startDynamicLMTPServer(ctx context.Context, deps *serverDependencies, serve
 		RedirectRateWindow:      redirectRateWindow,
 		MaxRedirectHops:         serverConfig.GetMaxRedirectHops(),
 		CommandTimeoutOverrides: lmtpCommandTimeoutOverrides,
-	})
-
-	if err != nil {
-		errChan <- fmt.Errorf("failed to create LMTP server: %w", err)
-		return
 	}
-
-	go func() {
-		<-ctx.Done()
-		logger.Info("Shutting down LMTP server", "name", serverConfig.Name)
-		if err := lmtpServer.Close(); err != nil {
-			logger.Info("Error closing LMTP server", "error", err)
-		}
-	}()
-
-	deps.registerServer(serverConfig.Name, lmtpServer)
-
-	lmtpServer.Start(errChan)
 }
 
 func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
