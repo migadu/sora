@@ -74,6 +74,32 @@ func TestLookupCacheTableRejectsWrongType(t *testing.T) {
 	}
 }
 
+// A wrongly typed value is reported at the table's line in the file and by its
+// key, not at a line of the table as UnmarshalTOML re-encodes it.
+func TestLookupCacheTableWrongTypeErrorPosition(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := "[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \":143\"\n\n[server.lookup_cache]\npositive_ttl = \"10m\"\nenabled = \"yes\"\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var cfg Config
+	err := LoadConfigFromFile(path, &cfg)
+	if err == nil {
+		t.Fatal("enabled = \"yes\" loaded without error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "line 6 ") {
+		t.Errorf("error does not name line 6, where the table starts: %s", msg)
+	}
+	if n := strings.Count(msg, "line "); n != 1 {
+		t.Errorf("error names %d lines, want only the file's: %s", n, msg)
+	}
+	if !strings.Contains(msg, "enabled: incompatible types") {
+		t.Errorf("error does not name the key: %s", msg)
+	}
+}
+
 // A typo inside the table is still reported as an unknown key.
 func TestLookupCacheTableUnknownKeyIsReported(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")

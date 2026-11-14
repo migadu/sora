@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -606,6 +607,10 @@ func DefaultLookupCacheConfig() LookupCacheConfig {
 	}
 }
 
+// tomlErrorPosition matches the position prefix of a toml decode error,
+// capturing the key: `toml: line 1 (last key "enabled"): `.
+var tomlErrorPosition = regexp.MustCompile(`^toml: (?:line \d+ )?\(last key "([^"]*)"\): `)
+
 // UnmarshalTOML decodes a [server.lookup_cache] table on top of
 // DefaultLookupCacheConfig, so a table that only tunes, say, positive_ttl leaves
 // the cache enabled with the default max_size. Decoded field by field, an omitted
@@ -625,7 +630,9 @@ func (c *LookupCacheConfig) UnmarshalTOML(data any) error {
 	decoded := plain(DefaultLookupCacheConfig())
 	md, err := toml.Decode(buf.String(), &decoded)
 	if err != nil {
-		return fmt.Errorf("lookup_cache: %w", err)
+		// The line in err is one of the re-encoded table, not of the file; the
+		// outer decoder adds the table's own line. Keep the key and the reason.
+		return errors.New(tomlErrorPosition.ReplaceAllString(err.Error(), "$1: "))
 	}
 	// The outer decoder counts every key of a table handled here as decoded, so
 	// report unknown ones here.
