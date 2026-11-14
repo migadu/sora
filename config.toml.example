@@ -1248,7 +1248,10 @@ limits.thread_max_messages = 50000
 # limits.preview_s3_node_per_min = 3000  # For the whole server per minute (default: 3000, 0 = unlimited).
 # limits.preview_s3_max_size = "5mb"     # Largest message downloaded (unset or 0: [local_cache] max_object_size).
 limits.redirect_rate_limit = 100         # Maximum SIEVE redirects per user (default: 100, set to 0 to disable).
-limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h"). The cleaner keeps
+limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h"). Must be positive
+                                         # on lmtp and http_admin_api servers: sora refuses to start with a zero or
+                                         # negative window, and a SIGHUP reload with one keeps that server's running
+                                         # settings (disable the limit with redirect_rate_limit = 0). The cleaner keeps
                                          # the redirect records for [cleanup] grace_period or the longest window of
                                          # the LMTP and Admin API servers on the node that runs it, whichever is
                                          # longer. A window longer than grace_period needs that window on every
@@ -1915,14 +1918,17 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # - HALF-OPEN: Testing recovery, limited requests allowed to check if endpoint recovered
   #
   # RECOVERY PROCESS:
-  # 1. Circuit opens after failure_ratio threshold reached (default: 60% of last 3 requests fail)
+  # 1. Circuit opens once min_requests answers have completed (default: 3) and failure_ratio of them
+  #    (default: 60%) were failures, counted since the breaker last changed state (or per interval, if set)
   # 2. Waits for timeout period (default: 30s)
   # 3. Transitions to half-open and allows max_requests concurrent test requests (default: 3)
   # 4. If tests succeed → circuit closes and normal operation resumes
   # 5. If tests fail → circuit re-opens and waits another timeout period
   #
-  # IMPORTANT: Only server errors (5xx), timeouts, and network failures trigger the circuit breaker.
-  # Valid responses like 404 (user not found) do NOT count as failures.
+  # IMPORTANT: These count as failures: network errors, timeouts, 5xx, 408, 429, a 2xx other than
+  # 200, and a 200 with invalid JSON or no address. Authentication lookups also require password_hash;
+  # route-only lookups do not. 404, 3xx, 401, 403 and the other 4xx do NOT count, nor does a 200
+  # whose password_hash sora cannot verify.
   #
   # PRODUCTION RECOMMENDATIONS:
   # - timeout: 60s-300s (longer allows more time for service recovery)

@@ -139,14 +139,14 @@ func handleListCredentials(ctx context.Context) {
 		fmt.Printf(`List all credentials for an account
 
 Usage:
-  sora-admin list-credentials [options]
+  sora-admin credentials list [options]
 
 Options:
   --email string       Email address associated with the account (required)
 
 Examples:
-  sora-admin --config config.toml list-credentials --email user@example.com
-  sora-admin --config custom.toml list-credentials --email alias@example.com
+  sora-admin --config config.toml credentials list --email user@example.com
+  sora-admin --config custom.toml credentials list --email alias@example.com
 `)
 	}
 
@@ -229,19 +229,20 @@ func handleDeleteCredential(ctx context.Context) {
 This command removes a specific credential (email/password combination) from an account.
 
 Restrictions:
-- You cannot delete the primary credential. Use update-account to make another
-  credential primary first, then delete the old one.
-- You cannot delete the last credential of an account. Use delete-account to
-  remove the entire account and all its data.
+- You cannot delete the primary credential. Make another credential primary
+  first (sora-admin accounts update --email <address> --make-primary), then
+  delete the old one.
+- You cannot delete the last credential of an account. Delete the account
+  instead (sora-admin accounts delete), which removes all its data.
 
 Usage:
-  sora-admin delete-credential [options]
+  sora-admin credentials delete [options]
 
 Options:
   --email string      Email address of the credential to delete (required)
 
 Examples:
-  sora-admin --config config.toml delete-credential --email alias@example.com
+  sora-admin --config config.toml credentials delete --email alias@example.com
 `)
 	}
 
