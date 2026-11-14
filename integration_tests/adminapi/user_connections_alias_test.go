@@ -95,6 +95,28 @@ func TestAdminAPI_UserConnections_FindsAccountUnderAnyAddress(t *testing.T) {
 		listed(t, address, address)
 	})
 
+	// The usual remote lookup deployment: the lookup service answers for accounts the
+	// Admin API's database holds too (the backends' database), and the proxy still keys
+	// the session by the ID derived from the address the lookup answered, with that
+	// address. The database account ID matches no such entry, so the account's other
+	// addresses must name it.
+	rlPrimary, rlAlias := addAccount("remote-lookup")
+	for _, c := range []struct{ name, answered, named string }{
+		{"the lookup answered the primary address, named by the alias", rlPrimary, rlAlias},
+		{"the lookup answered the alias, named by the primary address", rlAlias, rlPrimary},
+	} {
+		t.Run("remote lookup session in the database: "+c.name, func(t *testing.T) {
+			accountID := proxy.DeriveAccountIDFromEmail(c.answered)
+			if err := s.tracker.RegisterConnection(context.Background(), accountID, c.answered, "IMAP", "192.0.2.2:50000"); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { s.tracker.UnregisterConnection(context.Background(), accountID, "IMAP", "192.0.2.2:50000") })
+			if got := listed(t, c.named, c.answered); got["account_id"] != float64(accountID) {
+				t.Errorf("account_id %v, want the derived ID %d the proxy keys the session by", got["account_id"], accountID)
+			}
+		})
+	}
+
 	t.Run("kick under the alias ends the session listed under it", func(t *testing.T) {
 		s.request(t, "POST", "/admin/connections/kick", map[string]string{"user_email": alias}, http.StatusOK)
 		waitClosed(t, byPrimary, "the session the alias names")
