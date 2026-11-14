@@ -67,7 +67,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Email == "" || req.Password == "" {
+	// An email of blanks is no email: the credential lookup trims it and refuses what is
+	// left with an error that is not "user not found" (and the User API proxy, which trims
+	// it to route the login, finds no user in it either).
+	if strings.TrimSpace(req.Email) == "" || req.Password == "" {
 		s.writeError(w, http.StatusBadRequest, "Email and password are required")
 		return
 	}
