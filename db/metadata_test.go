@@ -369,6 +369,20 @@ func TestMetadataDepthMatchesEntryNameLiterally(t *testing.T) {
 	}
 }
 
+// TestEscapeLikeReusesReplacer checks that escapeLike escapes exactly the LIKE
+// metacharacters and does not build a strings.Replacer per call: GETMETADATA
+// DEPTH 1/infinity calls it once per requested entry name, and a fresh
+// Replacer allocates its 256-entry byte table (about 6.7 KB) on first use.
+func TestEscapeLikeReusesReplacer(t *testing.T) {
+	assert.Equal(t, `/private/a\_b/c\\/d\%/`, escapeLike(`/private/a_b/c\/d%/`))
+	assert.Equal(t, `/private/plain/`, escapeLike(`/private/plain/`))
+
+	var out string
+	allocs := testing.AllocsPerRun(100, func() { out = escapeLike(`/private/a_b/`) })
+	assert.LessOrEqual(t, allocs, 1.0, "escapeLike allocates beyond its result")
+	_ = out
+}
+
 // TestMetadataMaxSize tests MAXSIZE limiting
 func TestMetadataMaxSize(t *testing.T) {
 	if testing.Short() {
