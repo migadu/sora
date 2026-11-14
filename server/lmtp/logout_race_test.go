@@ -152,9 +152,9 @@ func TestLogoutRacesReset(t *testing.T) {
 func TestLogoutRacesXCLIENT(t *testing.T) {
 	for range 10 {
 		s := newLogoutTestSession(t)
-		s.conn = &smtp.Conn{} // Conn() reports no network connection
-		s.ProxyIP = "10.0.0.1"
-		s.backend.xclientTrustedNets = mustParseNets(t, []string{"10.0.0.0/8"})
+		// A trusted peer: the hook judges the forwarded address by the connection's.
+		s.conn = loopbackConn(t)
+		s.backend.xclientTrustedNets = mustParseNets(t, []string{"127.0.0.0/8"})
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() {

@@ -241,7 +241,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 
 		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("managesieve", name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("ManageSieve: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
@@ -285,24 +285,11 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		serverInstance.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
-	// Create connection limiter with trusted networks from server configuration
-	// For ManageSieve backend:
-	// - If PROXY protocol is enabled: only connections from trusted networks allowed, no per-IP limiting
-	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
-	var limiterTrustedNets []string
-	var limiterMaxPerIP int
-
-	if options.ProxyProtocol {
-		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = 0 // No per-IP limiting when PROXY protocol is enabled
-	} else {
-		// PROXY protocol disabled: use trusted networks for per-IP bypass
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = options.MaxConnectionsPerIP
-	}
-
-	serverInstance.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
+	// Create the connection limiter. max_connections_per_ip counts the client a PROXY
+	// header names when there is one, else the socket peer, and trusted_networks
+	// exempt the counted address: a trusted proxy or load balancer passes the limit
+	// on to its clients and is only exempt itself when it names none.
+	serverInstance.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, options.MaxConnectionsPerIP, options.TrustedNetworks)
 
 	// Set listen backlog with reasonable default
 	serverInstance.listenBacklog = options.ListenBacklog
@@ -467,7 +454,7 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 			logFunc := func(format string, args ...any) {
 				session.InfoLog(format, args...)
 			}
-			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "MANAGESIEVE", logFunc)
+			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "managesieve", logFunc)
 
 			// Log connection with session context (protocol, remote, session id)
 			session.DebugLog("new connection")
@@ -809,7 +796,11 @@ func (s *ManageSieveServer) ReloadConfig(cfg config.ServerConfig) error {
 		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if maxSize := cfg.GetMaxScriptSizeWithDefault(); maxSize != next.maxScriptSize {
+	// A value that does not parse keeps the running limit (start-up, which has none,
+	// uses the default).
+	if maxSize, err := cfg.GetMaxScriptSize(); err != nil {
+		logger.Warn("ManageSieve config reload: invalid max_script_size, keeping the running value", "name", s.name, "error", err, "running", next.maxScriptSize)
+	} else if maxSize != next.maxScriptSize {
 		next.maxScriptSize = maxSize
 		reloaded = append(reloaded, "max_script_size")
 	}

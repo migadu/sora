@@ -285,7 +285,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 		maxSize := lookupCacheConfig.GetMaxSize()
 
 		// LMTP proxy doesn't do password validation, so positive revalidation window is not needed (use 0)
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, 0)
+		lookupCache = lookupcache.New("lmtp_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, 0)
 		logger.Info("LMTP Proxy: Lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
 	} else {
 		logger.Info("LMTP Proxy: Lookup cache disabled", "name", opts.Name)

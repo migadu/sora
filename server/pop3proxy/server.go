@@ -352,7 +352,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 		// Parse positive revalidation window from config (used for password change detection)
 		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(options.Name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("pop3_proxy", options.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("POP3 Proxy: Lookup cache enabled", "name", options.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	} else {
 		logger.Info("POP3 Proxy: Lookup cache disabled", "name", options.Name)
@@ -475,7 +475,7 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 			var releaseConn func()
 			var err error
 			if s.limiter != nil {
-				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), "")
+				releaseConn, err = s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), server.GetRealClientIP(netConn, proxyInfo))
 				if err != nil {
 					// DELIBERATE silent close, no banner: matches the previous
 					// accept-loop rejection (drop before any greeting), and an

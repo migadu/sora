@@ -840,7 +840,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			// User previously not found - return cached failure
 			// Note: Do NOT refresh negative entries - let them expire naturally so we can
 			// re-check the database in case the user was created since last check
-			metrics.CacheOperationsTotal.WithLabelValues("get", "hit_negative").Inc()
+			metrics.LookupCacheResults.WithLabelValues("lmtp_proxy", "hit_negative").Inc()
 
 			// Single consolidated log for lookup failure
 			duration := time.Since(lookupStart)
@@ -857,7 +857,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 			return s.userNotFoundError(cached.FromRemoteLookup)
 		} else {
 			// User found - use cached routing info
-			metrics.CacheOperationsTotal.WithLabelValues("get", "hit").Inc()
+			metrics.LookupCacheResults.WithLabelValues("lmtp_proxy", "hit").Inc()
 
 			s.accountID = cached.AccountID
 			s.isRemoteLookupAccount = cached.FromRemoteLookup
@@ -885,6 +885,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 			return nil
 		}
+	} else if s.server.lookupCache != nil {
+		// A disabled cache (nil) reads nothing and counts nothing.
+		metrics.LookupCacheResults.WithLabelValues("lmtp_proxy", "miss").Inc()
 	}
 
 	// 1. Try remotelookup first

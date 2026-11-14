@@ -244,6 +244,13 @@ func main() {
 		os.Exit(0)
 	}
 
+	// Logging is configured by the file loadAndValidateConfig reads. What is logged until
+	// logger.Initialize, the warnings about that file among it, is held and then written
+	// where [logging] says, at its level.
+	logger.Hold()
+	logger.Info("---------------------")
+	logger.Info("SORA application starting", "version", version, "commit", commit, "built", date)
+
 	// Load and validate configuration
 	loadAndValidateConfig(*configPath, &cfg, errorHandler)
 
@@ -254,7 +261,7 @@ func main() {
 	// soft-wait cap). Clamped to a sane range inside the setter.
 	sieveengine.SetScriptExecutionTimeout(cfg.Sieve.GetMaxExecutionTime())
 
-	// Initialize logging with zap logger
+	// Initialize logging, which writes out what was held since logger.Hold
 	logFile, err := logger.Initialize(cfg.Logging)
 	if err != nil {
 		fmt.Fprintf(logger.Stderr(), "SORA: Warning initializing logger: %v\n", err)
@@ -271,8 +278,6 @@ func main() {
 		defer logger.Sync() // Still sync even without a log file
 	}
 
-	logger.Info("---------------------")
-	logger.Info("SORA application starting", "version", version, "commit", commit, "built", date)
 	logger.Info("Logging configuration", "format", cfg.Logging.Format, "level", cfg.Logging.Level)
 
 	// Initialize global timeout scheduler with configured shard count
@@ -750,8 +755,8 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		logger.Info("Connecting to database with resilient failover configuration")
 		deps.resilientDB, err = resilient.NewResilientDatabase(ctx, &cfg.Database, true, true)
 		if err != nil {
-			logger.Info("Failed to initialize resilient database", "error", err)
-			os.Exit(1)
+			errorHandler.FatalError("initialize resilient database", err)
+			os.Exit(errorHandler.WaitForExit())
 		}
 	} else {
 		logger.Info("Skipping database initialization - no server on this node queries it")
@@ -1287,7 +1292,7 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 				}()
 
 				if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					logger.Error("HTTP-01 challenge server error", err)
+					logger.Error("HTTP-01 challenge server error", "error", err)
 					errChan <- fmt.Errorf("HTTP-01 challenge server failed: %w", err)
 				}
 			}()
@@ -1691,8 +1696,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 
 	sessionMemoryLimit, err := serverConfig.GetSessionMemoryLimit()
 	if err != nil {
-		logger.Info("POP3: Invalid session memory limit - using default (100MB)", "name",
-			serverConfig.Name, err)
+		logger.Info("POP3: Invalid session memory limit - using default (100MB)", "name", serverConfig.Name, "error", err)
 		sessionMemoryLimit = 100 * 1024 * 1024
 	}
 
@@ -2661,6 +2665,7 @@ func startDynamicUserAPIProxyServer(ctx context.Context, deps *serverDependencie
 		Pools:                    proxy.PoolSpecsFromConfig(deps.config.Pools),
 		RemotePort:               remotePort,
 		JWTSecret:                serverConfig.JWTSecret,
+		AllowedOrigins:           serverConfig.AllowedOrigins,
 		TLS:                      serverConfig.TLS,
 		TLSCertFile:              serverConfig.TLSCertFile,
 		TLSKeyFile:               serverConfig.TLSKeyFile,

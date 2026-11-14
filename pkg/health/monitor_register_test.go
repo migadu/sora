@@ -187,7 +187,7 @@ func TestCheckCancelledWhileWaitingToPublishIsDiscarded(t *testing.T) {
 		return errors.New("late failure")
 	}}
 	hm.RegisterCheck(check)
-	metrics.ComponentHealthStatus.WithLabelValues(name, "").Set(3)
+	metrics.ComponentHealthStatus.WithLabelValues(name, hm.hostname).Set(3)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
@@ -214,7 +214,7 @@ func TestCheckCancelledWhileWaitingToPublishIsDiscarded(t *testing.T) {
 	if check.CheckCount != 0 || check.Status != StatusHealthy {
 		t.Errorf("canceled check published count=%d status=%s", check.CheckCount, check.Status)
 	}
-	if got := testutil.ToFloat64(metrics.ComponentHealthStatus.WithLabelValues(name, "")); got != 3 {
+	if got := testutil.ToFloat64(metrics.ComponentHealthStatus.WithLabelValues(name, hm.hostname)); got != 3 {
 		t.Errorf("canceled check changed gauge to %v, want 3", got)
 	}
 }

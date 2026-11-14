@@ -535,6 +535,7 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		s.InfoLog("authentication successful", "address", userAddress.BaseAddress(), "account_id", accountID, "cached", false, "method", "master", "duration", fmt.Sprintf("%.3fs", time.Since(start).Seconds()))
 	}
 
+	metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "success").Inc()
 	metrics.AuthenticatedConnectionsCurrent.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
 	s.authenticated.Store(true)
 

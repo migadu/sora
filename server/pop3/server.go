@@ -235,7 +235,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 
 		positiveRevalidationWindow := lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(name)
 
-		lookupCache = lookupcache.New(positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
+		lookupCache = lookupcache.New("pop3", name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
 		logger.Info("POP3: Lookup cache enabled", "name", name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
 	}
 
@@ -302,24 +302,11 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		server.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
-	// Create connection limiter with trusted networks from server configuration
-	// For POP3 backend:
-	// - If PROXY protocol is enabled: only connections from trusted networks allowed, no per-IP limiting
-	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
-	var limiterTrustedNets []string
-	var limiterMaxPerIP int
-
-	if options.ProxyProtocol {
-		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = 0 // No per-IP limiting when PROXY protocol is enabled
-	} else {
-		// PROXY protocol disabled: use trusted networks for per-IP bypass
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = options.MaxConnectionsPerIP
-	}
-
-	server.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("POP3", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
+	// Create the connection limiter. max_connections_per_ip counts the client a PROXY
+	// header names when there is one, else the socket peer, and trusted_networks
+	// exempt the counted address: a trusted proxy or load balancer passes the limit
+	// on to its clients and is only exempt itself when it names none.
+	server.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("POP3", options.MaxConnections, options.MaxConnectionsPerIP, options.TrustedNetworks)
 
 	// Set listen backlog with reasonable default
 	server.listenBacklog = options.ListenBacklog
@@ -489,7 +476,7 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 			session.Id = idgen.New()
 			session.HostName = s.hostname
 			session.Stats = s
-			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "POP3", session.InfoLog)
+			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "pop3", session.InfoLog)
 
 			session.InfoLog("connected")
 			s.addSession(session)
