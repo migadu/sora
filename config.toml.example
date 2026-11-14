@@ -2299,7 +2299,8 @@ name = "admin-api"
 addr = ":8080"
 api_key = "your-secret-api-key-here"  # REQUIRED for API access.
 # read_only_api_key = ""      # [OPTIONAL] Second key that may only make GET requests (monitoring, dashboards). Must differ from api_key.
-allowed_hosts = []            # Empty = all hosts (not recommended for production).
+allowed_hosts = []            # IP/CIDR allow-list, e.g. ["10.0.1.0/24", "192.0.2.10"]; host names are not resolved
+                              # and match no client. Empty = all hosts (not recommended for production).
 tls = false
 tls_cert_file = ""            # Static cert file; ignored when the global [tls] section is enabled
 tls_key_file = ""             # Static key file; ignored when the global [tls] section is enabled
@@ -2333,7 +2334,7 @@ token_duration = "24h"        # JWT token validity duration (e.g., "24h", "7d", 
                               # at /user/auth/refresh, so a leaked token survives at most one token_duration.
 token_issuer = "sora-mail-api" # JWT issuer field (optional, for token validation).
 allowed_origins = ["*"]       # CORS allowed origins for web clients. Use specific origins in production: ["https://mail.example.com"]
-allowed_hosts = []            # IP addresses allowed to access API. Empty = all hosts.
+allowed_hosts = []            # IP/CIDR allow-list; host names are not resolved and match no client. Empty = all hosts.
 tls = false
 tls_cert_file = ""            # Static cert file; ignored when the global [tls] section is enabled
 tls_key_file = ""             # Static key file; ignored when the global [tls] section is enabled

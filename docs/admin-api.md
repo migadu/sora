@@ -1252,10 +1252,11 @@ The Admin API implements rate limiting based on authentication attempts and API 
    tls_key_file = "/path/to/key.pem"
    ```
 
-2. **Restrict access by IP/hostname**
+2. **Restrict access by IP address or CIDR**
    ```toml
-   allowed_hosts = ["admin.example.com", "10.0.1.0/24"]
+   allowed_hosts = ["192.0.2.10", "10.0.1.0/24"]
    ```
+   Entries are matched against the client address (the PROXY protocol source with `proxy_protocol = true`). Host names are not resolved: an entry that is not an IP address or CIDR matches no client, and is logged as a warning at startup and when a reload installs it.
 
 3. **Use strong API keys** (32+ characters, cryptographically random)
 
