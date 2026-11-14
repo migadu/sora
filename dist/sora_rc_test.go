@@ -10,17 +10,19 @@ import (
 )
 
 // rcSubrStub stands in for FreeBSD's /etc/rc.subr. Its run_rc_command reports what the
-// real one acts on (rc.subr(8), run_rc_command): it accepts only the directives in
-// $_keywords (reload only when $extra_commands lists it; anything else is "unknown
-// directive" and exit 1), starts "$command $rc_flags $command_args" through su(1) when
-// ${name}_user is set, and status, stop and reload find the process with check_pidfile
-// "$pidfile" "${procname:-$command}" and signal that PID (reload with $sig_reload). It
-// then runs the directive's precmd with install(1) stubbed.
+// real one acts on (rc.subr(8), run_rc_command): ${name}_program replaces $command; only
+// the directives in $_keywords are accepted (reload only when $extra_commands lists it;
+// anything else is "unknown directive" and exit 1); start runs "$command $rc_flags
+// $command_args" through su(1) when ${name}_user is set; status, stop and reload find the
+// process with check_pidfile "$pidfile" "${procname:-$command}" and signal that PID
+// (reload with $sig_reload). It then runs the directive's precmd with install(1) stubbed.
 const rcSubrStub = `
 load_rc_config() { eval "$TEST_RC_CONF"; }
 install() { echo "install=$*"; }
 run_rc_command() {
 	rc_arg=$1
+	eval _override_command=\$${name}_program
+	command=${_override_command:-$command}
 	_keywords="start stop restart rcvar enable disable delete enabled describe extracommands $extra_commands"
 	if [ -n "${procname:-$command}" ]; then _keywords="$_keywords status poll"; fi
 	for _elem in $_keywords; do
@@ -88,15 +90,18 @@ func runRCScript(t *testing.T, rcArg, rcConf string) (vars map[string]string, in
 // status/stop/reload look for a pidfile that never appears. daemon(8) must detach it and
 // write sora's PID to $pidfile, and since daemon changes the user itself (-u, which needs
 // root to write the pidfile and to drop privileges), ${name}_user must not be set when
-// run_rc_command runs, or rc.subr would start daemon through su(1) as that user.
+// run_rc_command runs, or rc.subr would start daemon through su(1) as that user. An rc.conf
+// ${name}_program names the sora binary daemon runs; rc.subr must not run it in place of
+// daemon.
 func TestRCScriptDetachesAndWritesPidfile(t *testing.T) {
 	for _, tc := range []struct {
-		rcConf, user string
+		name, rcConf, user, program string
 	}{
-		{"", "sora"},
-		{"sora_user=mailer", "mailer"},
+		{"default", "", "sora", "/usr/local/bin/sora"},
+		{"sora_user", "sora_user=mailer", "mailer", "/usr/local/bin/sora"},
+		{"sora_program", "sora_program=/opt/sora/bin/sora", "sora", "/opt/sora/bin/sora"},
 	} {
-		t.Run("user="+tc.user, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			vars, installs := runRCScript(t, "start", tc.rcConf)
 			args := strings.Fields(vars["command_args"])
 			flag := func(f string) string {
@@ -112,11 +117,11 @@ func TestRCScriptDetachesAndWritesPidfile(t *testing.T) {
 			if vars["pidfile"] == "" || flag("-p") != vars["pidfile"] {
 				t.Errorf("command_args %q do not write sora's PID (-p) to pidfile %q", vars["command_args"], vars["pidfile"])
 			}
-			if vars["procname"] != "/usr/local/bin/sora" {
-				t.Errorf("procname = %q: check_pidfile must match the sora process, not $command", vars["procname"])
+			if vars["procname"] != tc.program {
+				t.Errorf("procname = %q, want %q: check_pidfile must match the sora process, not $command", vars["procname"], tc.program)
 			}
-			if i := slices.Index(args, "/usr/local/bin/sora"); i < 0 || !slices.Contains(args[i:], "--config") {
-				t.Errorf("command_args %q do not run /usr/local/bin/sora --config", vars["command_args"])
+			if i := slices.Index(args, tc.program); i < 0 || !slices.Contains(args[i:], "--config") {
+				t.Errorf("command_args %q do not run %s --config", vars["command_args"], tc.program)
 			}
 			if flag("-u") != tc.user {
 				t.Errorf("command_args %q: daemon -u = %q, want %q", vars["command_args"], flag("-u"), tc.user)

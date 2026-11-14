@@ -35,7 +35,7 @@ load_rc_config $name
 # ${supervisor_pidfile}, so newsyslog can signal it to reopen sora.out (-H).
 pidfile="/var/run/${name}.pid"
 supervisor_pidfile="/var/run/${name}_daemon.pid"
-procname="/usr/local/bin/sora"
+procname="${sora_program:-/usr/local/bin/sora}"
 command="/usr/sbin/daemon"
 command_args="-f -p ${pidfile} -P ${supervisor_pidfile} -u ${sora_user} -H -o ${sora_logdir}/sora.out ${procname} --config ${sora_config}"
 
@@ -54,7 +54,8 @@ sora_precmd()
 
 # daemon(8) changes to sora_user itself (-u), and must start as root to write ${pidfile}.
 # With sora_user set, rc.subr would start it through su(1) as that user instead.
+# sora_program names the sora binary (procname); rc.subr would run it in place of daemon.
 sora_runas=${sora_user}
-unset sora_user
+unset sora_user sora_program
 
 run_rc_command "$1"
