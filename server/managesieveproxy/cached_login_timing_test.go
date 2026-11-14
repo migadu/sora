@@ -12,6 +12,8 @@ import (
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/proxy"
+	"github.com/migadu/sora/testutils"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // TestFreshCachedLoginWrongPasswordCostsAVerification covers the lookup-cache side of
@@ -20,10 +22,11 @@ import (
 // login for an unknown address costs a password verification, so that refusal must cost
 // one as well, or a near-instant answer shows that the address has an account.
 func TestFreshCachedLoginWrongPasswordCostsAVerification(t *testing.T) {
-	// Cost 10 keeps one verification in the tens of milliseconds, far above the rest of
-	// the cached path. The dummy hash follows BcryptCost.
+	// The verifications are counted, not timed (#782): a wall-clock floor calibrated
+	// under CPU contention fails a correct refusal that runs after the contention eases.
+	// The dummy hash follows BcryptCost, so the cheapest cost keeps the test fast.
 	origCost := db.BcryptCost
-	db.BcryptCost = 10
+	db.BcryptCost = bcrypt.MinCost
 	t.Cleanup(func() { db.BcryptCost = origCost })
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -56,23 +59,13 @@ func TestFreshCachedLoginWrongPasswordCostsAVerification(t *testing.T) {
 	defer remote.Close()
 	sess := &Session{server: srv, clientConn: client, listenerConn: client, ctx: ctx, cancel: cancel}
 
-	// One password verification, as a failed login for an unknown address pays. Load
-	// only ever adds time, so the fastest of a few runs is the floor.
-	db.DummyVerifyPassword("warm-up") // generates the dummy hash at this cost
-	verification := time.Duration(1 << 62)
-	for range 3 {
-		start := time.Now()
-		db.DummyVerifyPassword("wrong-password")
-		verification = min(verification, time.Since(start))
-	}
-
-	start := time.Now()
-	err = sess.authenticateUser("user@example.com", "wrong-password", start)
-	elapsed := time.Since(start)
+	before := testutils.PasswordVerifications()
+	err = sess.authenticateUser("user@example.com", "wrong-password", time.Now())
+	verifications := testutils.PasswordVerifications() - before
 	if !errors.Is(err, consts.ErrAuthenticationFailed) {
 		t.Fatalf("authenticateUser error = %v, want %v", err, consts.ErrAuthenticationFailed)
 	}
-	if elapsed < verification/2 {
-		t.Fatalf("wrong password for a freshly cached login refused in %v; a failed login for an unknown address costs a password verification (%v), so the fast answer shows the address has an account", elapsed, verification)
+	if verifications != 1 {
+		t.Fatalf("wrong password for a freshly cached login refused after %d password verifications; a failed login for an unknown address costs one, so a different cost shows the address has an account", verifications)
 	}
 }

@@ -212,7 +212,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 			SELECT
 				m.content_hash,
 				CASE WHEN m.account_id = $6 THEN m.uploaded ELSE m.content_hash = ANY($10::text[]) END AS uploaded,
-				m.message_id, m.in_reply_to,
+				m.message_id, m.in_reply_to, m."references",
 				m.subject, m.sent_date, m.internal_date, m.size,
 				m.body_structure, m.recipients_json,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
@@ -229,14 +229,14 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		),
 		inserted AS (
 			INSERT INTO messages (
-				account_id, content_hash, uploaded, message_id, in_reply_to,
+				account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 				subject, sent_date, internal_date, size,
 				body_structure, recipients_json, s3_domain, s3_localpart,
 				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
 				mailbox_id, mailbox_path, created_modseq, uid
 			)
 			SELECT
-				$6 AS account_id, content_hash, uploaded, message_id, in_reply_to,
+				$6 AS account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 				subject, sent_date, internal_date, size,
 				body_structure, recipients_json,
 				-- The S3 key is per row: the body lives under whatever the account's primary

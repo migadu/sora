@@ -280,8 +280,12 @@ func dummyHashForCurrentCost() []byte {
 // takes ~the same time as the "wrong password" branch (which runs bcrypt). Without it,
 // a non-existent account returns measurably faster than an existing one, giving an
 // attacker a user-enumeration timing oracle. (security-audit M14)
+//
+// Each call is counted in sora_password_dummy_verifications_total once the comparison
+// is done, as VerifyPassword counts its own in sora_password_verification_attempts_total.
 func DummyVerifyPassword(password string) {
 	_ = bcrypt.CompareHashAndPassword(dummyHashForCurrentCost(), []byte(password))
+	metrics.PasswordDummyVerifications.Inc()
 }
 
 // NeedsRehash reports whether a bcrypt hash, in any spelling VerifyPassword accepts
