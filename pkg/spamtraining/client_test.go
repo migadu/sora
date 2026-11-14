@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -276,5 +277,72 @@ func TestNewClientRejectsInvalidMaxMessageSize(t *testing.T) {
 			c.Close()
 			t.Errorf("NewClient accepted max_message_size %q", size)
 		}
+	}
+}
+
+// While the training endpoint is down the circuit breaker is open and refuses every
+// submission. A worker must not download a body it cannot send.
+func TestOpenCircuitBreakerSkipsTheFetch(t *testing.T) {
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := config.SpamTrainingConfig{
+		Enabled: true, Endpoint: srv.URL, Workers: 1,
+		CircuitBreaker: config.SpamTrainingCircuitBreakerConfig{Threshold: 1, Timeout: "1h"},
+	}
+	c, err := NewClient(&cfg)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(c.Close)
+
+	failed := metrics.SpamTrainingMessagesTotal.WithLabelValues("failed")
+	failedBefore := testutil.ToFloat64(failed)
+	waitForFailed := func(n float64) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for testutil.ToFloat64(failed)-failedBefore < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("%v jobs failed, want %v", testutil.ToFloat64(failed)-failedBefore, n)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	var opens atomic.Int32
+	job := Job{
+		Type: TrainingTypeSpam, User: "user@example.com", Size: int64(len(testMessage)),
+		Open: func(context.Context) (io.ReadCloser, error) {
+			opens.Add(1)
+			return io.NopCloser(strings.NewReader(testMessage)), nil
+		},
+	}
+
+	// The first submission fails and opens the breaker.
+	if err := c.Enqueue(job); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	waitForFailed(1)
+	if state := c.GetCircuitBreakerState(); state != circuitbreaker.StateOpen {
+		t.Fatalf("circuit breaker is %v after a failed submission with threshold 1, want open", state)
+	}
+
+	const more = 5
+	for i := 0; i < more; i++ {
+		if err := c.Enqueue(job); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+	waitForFailed(1 + more)
+
+	if got := opens.Load(); got != 1 {
+		t.Errorf("%d bodies fetched, want 1: with the breaker open the other %d cannot be sent", got, more)
+	}
+	if got := posts.Load(); got != 1 {
+		t.Errorf("endpoint received %d submissions, want 1", got)
 	}
 }
