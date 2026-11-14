@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -12,6 +13,22 @@ import (
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 )
+
+// ErrMaxConnectionsPerIP is a refusal over max_connections_per_ip: one client has too
+// many connections, as opposed to the server being full (max_connections).
+var ErrMaxConnectionsPerIP = errors.New("maximum connections per IP reached")
+
+// IsProxiedClientRefusal reports whether err, a ConnectionLimiter refusal, refused the
+// client a PROXY header named over that client's own max_connections_per_ip. Such a
+// refusal is answered with a protocol reply after the TLS handshake instead of a silent
+// close: the PROXY peer is a proxy or load balancer (the header is only read from a
+// trusted peer), and a sora proxy that sees the socket close before its TLS handshake
+// counts a backend failure, quarantining the backend for every user over one client.
+// Every other refusal stays a silent close, so a flooder connecting directly is told
+// nothing.
+func IsProxiedClientRefusal(err error, proxyInfo *ProxyProtocolInfo) bool {
+	return proxyInfo != nil && proxyInfo.SrcIP != "" && errors.Is(err, ErrMaxConnectionsPerIP)
+}
 
 // ConnectionLimiter manages connection limits for protocol servers
 type ConnectionLimiter struct {
@@ -164,7 +181,7 @@ func (cl *ConnectionLimiter) CanAccept(remoteAddr net.Addr) error {
 			current := ipCounter.Load()
 			if current >= int64(cl.maxPerIP) {
 				logger.Info("Connection limiter: Maximum connections per IP reached", "protocol", cl.protocol, "ip", ip, "current", current, "max", cl.maxPerIP)
-				return fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", ip, current, cl.maxPerIP)
+				return fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, ip, current, cl.maxPerIP)
 			}
 		}
 	}
@@ -223,7 +240,7 @@ func (cl *ConnectionLimiter) AcceptWithRealIP(remoteAddr net.Addr, realClientIP 
 				ipCounter.Add(-1)
 			}
 			cl.currentTotal.Add(-1)
-			return nil, fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", trackingIP, cl.maxPerIP, cl.maxPerIP)
+			return nil, fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, trackingIP, cl.maxPerIP, cl.maxPerIP)
 		}
 
 		if realClientIP != "" {
@@ -332,7 +349,7 @@ func (cl *ConnectionLimiter) CanAcceptWithRealIP(remoteAddr net.Addr, realClient
 		}
 
 		if current >= int64(cl.maxPerIP) {
-			return fmt.Errorf("maximum connections per IP reached for %s (%d/%d)", checkIP, current, cl.maxPerIP)
+			return fmt.Errorf("%w for %s (%d/%d)", ErrMaxConnectionsPerIP, checkIP, current, cl.maxPerIP)
 		}
 	}
 

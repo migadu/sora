@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -93,24 +92,17 @@ const (
 
 var extraAddressesValue = strings.NewReplacer("\t", " ", "\n", " ")
 
+// ErrCopySourceChanged is returned by CopyMessages when a source row owned by another
+// account than the destination no longer has the content hash the caller made its body
+// available for under the destination owner's S3 path. Nothing is written; reading the
+// source again and copying anew can succeed.
+var ErrCopySourceChanged = errors.New("a source message changed during the copy")
+
 func truncateHash(hash string) string {
 	if len(hash) > 12 {
 		return hash[:12]
 	}
 	return hash
-}
-
-// HeldDestObjects are the destination objects of a cross-account copy: for every hash in
-// Hashes, the copy has made the object exist under the destination owner's key while Lock
-// held its lock (GetS3ObjectLockID of the owner and the hash) in shared mode, and Lock
-// stays open until CopyMessages has returned.
-type HeldDestObjects struct {
-	Lock   *AdvisoryLockTx
-	Hashes map[string]bool
-}
-
-func (h *HeldDestObjects) holds(contentHash string) bool {
-	return h != nil && h.Hashes[contentHash]
 }
 
 // CopyMessages copies multiple messages from a source mailbox to a destination mailbox within a given transaction.
@@ -123,12 +115,23 @@ func (h *HeldDestObjects) holds(contentHash string) bool {
 // to learn — exactly, and immune to concurrency — whether the copy actually landed. See
 // server/imap/copy.go for that resolution.
 //
-// A copy of another account's row is re-keyed to destAccountID's S3 path. It is uploaded
-// exactly when held holds its body (see takeOverDestObjects); any other is staged for an
-// upload under the owner's path, from the staging file the caller linked there. held may
-// be nil, as it is when every source row belongs to destAccountID.
-func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, held *HeldDestObjects) (map[imap.UID]imap.UID, []int64, error) {
+// A copy of a row owned by another account than destAccountID is re-keyed to
+// destAccountID's S3 path, where the caller must first have made the body available (its
+// object, or the staging file of the upload restagePendingUploads queues). sourceHashes
+// holds, by source UID, the content hash each such row had when the caller did so, and
+// the row is copied only if it still has it: sora-admin import rekey renames a body's hash
+// (RekeyContentHash) under no lock the copy takes, and a copy under the new hash would
+// point at a key nothing wrote. A renamed source fails the copy with ErrCopySourceChanged
+// before anything commits. The check is made by the INSERT, the statement that copies the
+// rows' hashes; once inserted, a copy keeps its hash whatever happens to the source.
+// destObjects names the destination bodies made to exist in S3 while tx holds their
+// shared object locks. Only those re-keyed rows are uploaded; all other re-keyed rows
+// are staged for upload, even if their source's upload finished in the meantime.
+func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string) (map[imap.UID]imap.UID, []int64, error) {
 	messageUIDMap := make(map[imap.UID]imap.UID)
+	if destObjects == nil {
+		destObjects = []string{} // = ANY(NULL) would be NULL, not false.
+	}
 	if srcMailboxID == destMailboxID {
 		return nil, nil, fmt.Errorf("source and destination mailboxes cannot be the same")
 	}
@@ -136,7 +139,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	// The caller is responsible for beginning and committing/rolling back the transaction.
 
 	// Get the source message IDs and UIDs
-	rows, err := tx.Query(ctx, `SELECT id, uid, account_id, content_hash FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid`, srcMailboxID, uids)
+	rows, err := tx.Query(ctx, `SELECT id, uid, account_id FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid`, srcMailboxID, uids)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
@@ -144,27 +147,18 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 
 	var messageIDs []int64
 	var sourceUIDsForMap []imap.UID
-	var destObjectHeld []bool // per message: a re-keyed copy whose object held holds
-	var heldHashes []string
-	seenHeld := make(map[string]bool)
-	crossAccount := false // any source row owned by another account: see restageFTS
+	var expectedHashes []string // per message: sourceHashes, checked for re-keyed rows only
+	crossAccount := false       // any source row owned by another account: see restageFTS
 	for rows.Next() {
 		var messageID, sourceAccountID int64
 		var sourceUID imap.UID
-		var contentHash string
-		if err := rows.Scan(&messageID, &sourceUID, &sourceAccountID, &contentHash); err != nil {
+		if err := rows.Scan(&messageID, &sourceUID, &sourceAccountID); err != nil {
 			return nil, nil, fmt.Errorf("failed to scan message ID and UID: %w", err)
 		}
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
-		reKeyed := sourceAccountID != destAccountID
-		crossAccount = crossAccount || reKeyed
-		objectHeld := reKeyed && held.holds(contentHash)
-		destObjectHeld = append(destObjectHeld, objectHeld)
-		if objectHeld && !seenHeld[contentHash] {
-			seenHeld[contentHash] = true
-			heldHashes = append(heldHashes, contentHash)
-		}
+		expectedHashes = append(expectedHashes, sourceHashes[sourceUID])
+		crossAccount = crossAccount || sourceAccountID != destAccountID
 	}
 	if err = rows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("error iterating through source messages: %w", err)
@@ -172,10 +166,6 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 
 	if len(messageIDs) == 0 {
 		return messageUIDMap, nil, nil // No messages to copy
-	}
-
-	if err := takeOverDestObjects(ctx, tx, destAccountID, heldHashes, held); err != nil {
-		return nil, nil, err
 	}
 
 	// Atomically increment highest_uid for the number of messages being copied.
@@ -220,12 +210,8 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	insRows, err := tx.Query(ctx, `
 		WITH src_data AS (
 			SELECT
-				-- A row re-keyed to another account is uploaded exactly when the caller
-				-- made its object exist under the owner's key (held). Whether the source
-				-- is uploaded says nothing about that key: an upload of the source that
-				-- finished after the caller looked wrote only the source's key.
 				m.content_hash,
-				CASE WHEN m.account_id = $6 THEN m.uploaded ELSE d.dest_object_held END AS uploaded,
+				CASE WHEN m.account_id = $6 THEN m.uploaded ELSE m.content_hash = ANY($10::text[]) END AS uploaded,
 				m.message_id, m.in_reply_to,
 				m.subject, m.sent_date, m.internal_date, m.size,
 				m.body_structure, m.recipients_json,
@@ -235,7 +221,11 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				d.new_uid,
 				d.custom_flags_canon
 			FROM messages m
-			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[], $9::boolean[]) AS d(message_id, new_uid, custom_flags_canon, dest_object_held) ON m.id = d.message_id
+			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[], $9::text[]) AS d(message_id, new_uid, custom_flags_canon, expected_hash) ON m.id = d.message_id
+			-- A row re-keyed to another account is copied only with the hash whose body the
+			-- caller made available under the owner's key (sourceHashes); a row left out
+			-- here fails the copy below.
+			WHERE m.account_id = $6 OR m.content_hash = d.expected_hash
 		),
 		inserted AS (
 			INSERT INTO messages (
@@ -273,7 +263,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 			RETURNING message_id
 		)
 		SELECT id FROM inserted ORDER BY uid
-	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, destObjectHeld)
+	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, expectedHashes, destObjects)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to batch copy messages: %w", err)
 	}
@@ -289,6 +279,9 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	insRows.Close()
 	if err := insRows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("error iterating new message ids: %w", err)
+	}
+	if len(newMessageIDs) != len(messageIDs) {
+		return nil, nil, fmt.Errorf("%w: copied %d of %d messages", ErrCopySourceChanged, len(newMessageIDs), len(messageIDs))
 	}
 
 	// Re-stage uploads for any copied rows whose body is not yet in S3, so the
@@ -308,46 +301,6 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	}
 
 	return messageUIDMap, newMessageIDs, nil
-}
-
-// takeOverDestObjects keeps the cleaner from deleting the held destination objects of
-// hashes until tx ends, taking their locks over from held.Lock.
-//
-// The copied rows point at the owner's key. The cleaner deletes the object under it when,
-// holding its lock (GetS3ObjectLockID, try-locked in ExecuteWithLockedS3Orphans), it sees
-// no live or recently expunged row of the owner for the body, and it sees none of this
-// transaction's rows before the commit. The caller checked or copied each object while
-// held.Lock held the lock in shared mode, and keeps holding it; this transaction takes the
-// same locks in shared mode, which held.Lock does not exclude, and then proves held.Lock
-// is still alive. From the caller's check to this commit, one of the two holds every lock,
-// and the commit that makes the rows visible to the cleaner is what releases this one: the
-// hand-over RestoreMessages gets by taking the lock in its own transaction. The S3 round
-// trips stay outside every write transaction and its timeout.
-//
-// The locks are only tried: one that is not granted at once has an exclusive locker queued
-// for it (a restore or a rekey of the body; the cleaner never queues), which waits for
-// held.Lock and so for this copy. Failing is safe, as no row is written yet.
-func takeOverDestObjects(ctx context.Context, tx pgx.Tx, destAccountID int64, hashes []string, held *HeldDestObjects) error {
-	if len(hashes) == 0 {
-		return nil
-	}
-	lockIDs := make([]int64, len(hashes))
-	for i, hash := range hashes {
-		lockIDs[i] = GetS3ObjectLockID(destAccountID, hash)
-	}
-	slices.Sort(lockIDs)
-	var granted bool
-	if err := tx.QueryRow(ctx, `SELECT bool_and(pg_try_advisory_xact_lock_shared(id)) FROM unnest($1::bigint[]) AS t(id)`, lockIDs).Scan(&granted); err != nil {
-		return fmt.Errorf("failed to lock destination objects: %w", err)
-	}
-	if !granted {
-		return fmt.Errorf("%w: a destination object is locked by another operation", ErrDBLockTimeout)
-	}
-	if err := held.Lock.Ping(ctx); err != nil {
-		// %v: the error belongs to the other connection, not to this transaction.
-		return fmt.Errorf("%w: the destination object locks were lost before the copy took them over: %v", ErrDBLockTimeout, err)
-	}
-	return nil
 }
 
 // restagePendingUploads ensures every just-inserted, not-yet-uploaded message in

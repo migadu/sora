@@ -484,8 +484,8 @@ func (s *IMAPSession) Close() error {
 		s.cancel()
 	}
 
-	// Mark session as done in WaitGroup for graceful drain
-	s.server.sessionsWg.Done()
+	// Count the session out of Close's drain
+	s.server.sessions.Done()
 
 	return nil
 }

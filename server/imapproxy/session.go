@@ -932,12 +932,12 @@ func (s *Session) authenticateUser(username, password string) error {
 				// its enforcement and every backend-leg setting the lookup answer carried.
 				s.routingInfo = proxy.RouteFromCache(cached)
 				s.routingInfo.ClientConn = s.listenerConn // Always set current client connection for JA4
-				// If cache has ActualEmail (e.g., "user@example.com" for "user@TOKEN"), use it
-				// Otherwise fall back to submitted username
+				// The resolved address when the entry has one (e.g. "user@example.com" for
+				// "user@TOKEN"); otherwise s.username keeps the base address set above, the
+				// name the uncached login routed by. The submitted name would route a
+				// +detail or @SUFFIX login under another key than the uncached one.
 				if cached.ActualEmail != "" {
 					s.username = cached.ActualEmail
-				} else {
-					s.username = username
 				}
 
 				// Use actual username (resolved email) for rate limiting and metrics
@@ -1308,9 +1308,10 @@ func (s *Session) authenticateUser(username, password string) error {
 	// Track successful authentication.
 	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
 
-	// Track domain and user connection activity for the login event.
+	// Track domain and user connection activity for the login event. The user is the base
+	// address, the name a lookup-cache hit replaying this login counts it under.
 	metrics.TrackDomainConnection("imap_proxy", address.Domain())
-	metrics.TrackUserActivity("imap_proxy", address.FullAddress(), "connection", 1)
+	metrics.TrackUserActivity("imap_proxy", address.BaseAddress(), "connection", 1)
 
 	// Single consolidated log for authentication success
 	method := "main_db"

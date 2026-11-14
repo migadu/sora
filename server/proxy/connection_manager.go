@@ -1283,6 +1283,10 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 	}
 	cm.refreshResolvedAddrsIfStale()
 
+	// failedPreferred is the preferred backend whose dial just failed. The round-robin
+	// fallback does not dial it again: that would count one failed attempt twice
+	// against its health, and spend a second connect timeout on a dead backend.
+	var failedPreferred string
 	if preferredAddr != "" {
 		if err := cm.backendPoolError(preferredAddr); err != nil {
 			return nil, "", err
@@ -1291,6 +1295,9 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 		if !fallback {
 			// If no fallback is needed, we either succeeded or had a hard failure.
 			return conn, addr, err
+		}
+		if err != nil {
+			failedPreferred = preferredAddr
 		}
 		// If fallback is true, the connection failed but we should proceed to round-robin.
 		// The error from tryPreferredAddress is logged but not returned to the client yet.
@@ -1325,6 +1332,10 @@ func (cm *ConnectionManager) ConnectWithProxy(ctx context.Context, preferredAddr
 
 		if cm.InMaintenance(addr) {
 			inMaintenance++
+			continue
+		}
+
+		if addr == failedPreferred {
 			continue
 		}
 

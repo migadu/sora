@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"strings"
 
 	"github.com/migadu/go-imap"
@@ -102,69 +103,74 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 		destS3Localpart = localpart
 	}
 
-	// A cross-account copy re-keys its rows to the destination owner's S3 path. A body
-	// already in S3 is made to exist under that path here, while LockS3ObjectsShared holds
-	// its lock: the lock the cleaner takes before it deletes an object no row it can see
-	// references, which the copied rows are not until they commit. CopyMessages takes the
-	// lock over in the copy's transaction, so it is released only by that commit
-	// (db.HeldDestObjects). A body still staged locally is linked to the owner's staging
-	// path instead, for the upload CopyMessages re-stages.
-	type destObject struct{ sourceKey, destKey string }
-	destObjects := make(map[string]destObject)
+	// COPY's transaction holds the destination object locks before checking S3 and
+	// until its rows commit, as MOVE does. A body staged locally is re-staged instead.
+	type crossAccountObject struct {
+		sourceKey, destKey string
+		sourcePending      bool
+	}
+	destObjects := make(map[string]crossAccountObject)
 	var destHashes []string
+	// The hash each cross-account body is made available for below. CopyMessages copies a
+	// source only if it still has it, since a rekey can rename it before the INSERT.
+	sourceHashes := make(map[imap.UID]string)
+
 	for _, msg := range messages {
 		if msg.AccountID == destMailbox.AccountID {
 			continue // Same owner: body already lives under the correct S3 path.
 		}
-		if msg.IsUploaded {
-			if _, seen := destObjects[msg.ContentHash]; !seen {
-				destObjects[msg.ContentHash] = destObject{
-					sourceKey: helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash),
-					destKey:   helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash),
-				}
-				destHashes = append(destHashes, msg.ContentHash)
+		// Cross-account copy: the new row will be owned by the destination mailbox
+		// owner, so the body must be reachable under the owner's S3 path.
+		sourceHashes[msg.UID] = msg.ContentHash
+		if !msg.IsUploaded {
+			if s.server.uploader == nil {
+				continue
 			}
-		} else if s.server.uploader != nil {
 			// Body is still staged locally under the source account. Hardlink it to
 			// the owner's staging path so the uploader (re-staged in CopyMessages)
 			// uploads it under the owner's path. Failing here would silently lose the
-			// body, so treat it as fatal rather than warning and proceeding.
-			sourcePath := s.server.uploader.FilePath(msg.ContentHash, msg.AccountID)
-			destPath := s.server.uploader.FilePath(msg.ContentHash, destMailbox.AccountID)
-			if sourcePath != destPath {
-				if err := helpers.LinkOrCopyFile(sourcePath, destPath); err != nil {
-					return nil, s.internalError("failed to stage local file for cross-account copy: %v", err)
-				}
+			// body, so treat it as fatal rather than warning and proceeding. A body
+			// that is not on this node is in S3 already, or on its way there: it
+			// takes the S3 path below.
+			staged, ierr := s.stageCrossAccountBody("copy", msg.ContentHash, msg.AccountID, destMailbox.AccountID)
+			if ierr != nil {
+				return nil, ierr
+			}
+			if staged {
+				continue
 			}
 		}
+		// Body is in S3 under the source's path; copy it to the owner's path.
+		if _, seen := destObjects[msg.ContentHash]; seen {
+			continue
+		}
+		destObjects[msg.ContentHash] = crossAccountObject{
+			sourceKey:     helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash),
+			destKey:       helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash),
+			sourcePending: !msg.IsUploaded,
+		}
+		destHashes = append(destHashes, msg.ContentHash)
 	}
 
-	var held *db.HeldDestObjects
-	if len(destHashes) > 0 {
-		lock, err := s.server.rdb.LockS3ObjectsShared(ctx, destMailbox.AccountID, destHashes)
+	ensureDestObject := func(ctx context.Context, contentHash string) error {
+		obj := destObjects[contentHash]
+		exists, err := s.server.s3.ExistsWithRetry(ctx, obj.destKey)
 		if err != nil {
-			return nil, s.internalError("failed to lock S3 objects for cross-account copy: %v", err)
+			s.WarnLog("failed to check if S3 object exists at destination", "destKey", obj.destKey, "error", err)
 		}
-		defer lock.Release()
-		guarded, done := lock.Guard(ctx)
-		held = &db.HeldDestObjects{Lock: lock, Hashes: make(map[string]bool, len(destHashes))}
-		for _, hash := range destHashes {
-			if err := s.ensureDestObject(guarded, destObjects[hash].sourceKey, destObjects[hash].destKey); err != nil {
-				done()
-				return nil, s.internalError("failed to copy S3 object for message: %v", err)
-			}
-			held.Hashes[hash] = true
+		if exists {
+			return nil
 		}
-		done()
+		return s.server.s3.CopyWithRetry(ctx, obj.sourceKey, obj.destKey)
 	}
 
 	// Perform the batch copy operation
-	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname, held)
-	if held != nil {
-		held.Lock.Release() // the copy's transaction holds the locks it needs, or has ended
-	}
+	uidMap, newMessageIDs, err := s.server.rdb.CopyMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.hostname, sourceHashes, destHashes, ensureDestObject)
 	if err != nil {
+		var destErr *resilient.DestObjectError
 		switch {
+		case errors.As(err, &destErr):
+			return nil, s.crossAccountObjectError(destObjects[destErr.ContentHash].sourcePending, destErr.Err)
 		case errors.Is(err, resilient.ErrCommitOutcomeUnknown):
 			// The COMMIT's acknowledgement was lost: the copy may or may not have applied.
 			// Answering OK here on a copy that rolled back is the dangerous outcome — a
@@ -194,6 +200,17 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 			// authoritative, so fall through to the normal success path.
 			s.WarnLog("COPY commit acknowledgement was lost but read-back confirms the copy committed; answering OK",
 				"messages", len(newMessageIDs))
+		case errors.Is(err, db.ErrCopySourceChanged):
+			// A source body was renamed (sora-admin import rekey) after it was made
+			// available above, under the old hash. Nothing was written; a new COPY reads the
+			// new hash. RFC 5530 §3: INUSE, "The operation may succeed if the client tries
+			// again later."
+			s.InfoLog("COPY source changed during the copy; answering retryable NO", "error", err)
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeInUse,
+				Text: "Messages changed during the copy, please retry",
+			}
 		case strings.Contains(err.Error(), "source and destination mailboxes cannot be the same"):
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
@@ -254,15 +271,44 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	return copyData, nil
 }
 
-// ensureDestObject makes the object under destKey exist, copying it from sourceKey when
-// it is missing. The caller holds the object's lock.
-func (s *IMAPSession) ensureDestObject(ctx context.Context, sourceKey, destKey string) error {
-	exists, err := s.server.s3.ExistsWithRetry(ctx, destKey)
-	if err != nil {
-		s.WarnLog("failed to check if S3 object exists at destination", "destKey", destKey, "error", err)
+// stageCrossAccountBody links the staging file of a body that is not uploaded yet from
+// the source account's spool directory to the destination owner's, where the upload that
+// CopyMessages or MoveMessages re-stages under the owner reads it. It reports false, with
+// no error, when the file is not on this node: the body was staged on another backend
+// and is still pending there, or its upload finished and removed the file after the
+// command read the message (a read racing the upload, or a lagging replica). The caller
+// then handles the body as an uploaded one, in S3.
+func (s *IMAPSession) stageCrossAccountBody(command, contentHash string, srcAccountID, destAccountID int64) (bool, *imap.Error) {
+	err := helpers.LinkOrCopyFile(s.server.uploader.FilePath(contentHash, srcAccountID), s.server.uploader.FilePath(contentHash, destAccountID))
+	if err == nil {
+		return true, nil
 	}
-	if exists {
-		return nil
+	if errors.Is(err, fs.ErrNotExist) {
+		s.InfoLog("staged body is not on this node, copying it in S3 instead", "command", command, "hash", contentHash, "source_account_id", srcAccountID)
+		return false, nil
 	}
-	return s.server.s3.CopyWithRetry(ctx, sourceKey, destKey)
+	// A fault of this node's spool. The error names its files, which mean nothing to
+	// the client, so the response carries only the cause.
+	s.WarnLog("failed to stage body for cross-account "+command, "hash", contentHash, "error", err)
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) {
+		err = pathErr.Err
+	}
+	return false, s.internalError("failed to stage message body for cross-account %s: %v", command, err)
+}
+
+// crossAccountObjectError answers a failed S3 check or copy of a cross-account body.
+// notStagedHere is set for a body the command read as not uploaded and did not find in
+// this node's spool: when its source object is missing too, it is staged on another
+// backend whose upload is still pending, and a retry succeeds once that upload is done.
+func (s *IMAPSession) crossAccountObjectError(notStagedHere bool, err error) *imap.Error {
+	if notStagedHere && resilient.IsNotFoundError(err) {
+		s.InfoLog("body is neither on this node nor in S3 yet, answering UNAVAILABLE", "error", err)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeUnavailable,
+			Text: "Message is still being stored, please try again later",
+		}
+	}
+	return s.internalError("failed to copy S3 object for message: %v", err)
 }

@@ -6,41 +6,39 @@ import (
 )
 
 // ParseTrustedNetworks parses a slice of CIDR strings into a slice of *net.IPNet.
-// Automatically adds /32 for IPv4 and /128 for IPv6 addresses without subnet notation, so a
-// bare IP is accepted as a single-host network. This is the construction-time parser; its
-// check-time counterpart is IPInNetworks, and the two MUST agree on bare-IP handling (see
-// IPInNetworks for the bug that divergence caused).
+// A bare IP without subnet notation is accepted as a single-host network (/32 for IPv4,
+// /128 for IPv6). This is the construction-time parser; its check-time counterpart is
+// IPInNetworks, and the two MUST agree on bare-IP handling (see IPInNetworks for the bug
+// that divergence caused), which is why both parse each entry with parseNetwork.
 func ParseTrustedNetworks(cidrs []string) ([]*net.IPNet, error) {
 	var networks []*net.IPNet
 	for _, cidr := range cidrs {
-		// Try parsing as CIDR first
-		_, network, err := net.ParseCIDR(cidr)
+		network, err := parseNetwork(cidr)
 		if err != nil {
-			// If CIDR parsing fails, try parsing as plain IP and add appropriate subnet
-			ip := net.ParseIP(cidr)
-			if ip == nil {
-				return nil, fmt.Errorf("invalid trusted network '%s': not a valid IP address or CIDR", cidr)
-			}
-
-			// Determine if IPv4 or IPv6 and add appropriate subnet
-			var cidrWithSubnet string
-			if ip.To4() != nil {
-				// IPv4 address
-				cidrWithSubnet = cidr + "/32"
-			} else {
-				// IPv6 address
-				cidrWithSubnet = cidr + "/128"
-			}
-
-			// Parse the corrected CIDR
-			_, network, err = net.ParseCIDR(cidrWithSubnet)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse corrected CIDR '%s': %w", cidrWithSubnet, err)
-			}
+			return nil, err
 		}
 		networks = append(networks, network)
 	}
 	return networks, nil
+}
+
+// parseNetwork parses one list entry: a CIDR, or a bare IP as the single-host network of
+// that address. The host network is built from the parsed address, not by appending a
+// prefix length to the entry's text: a bare IPv4-mapped address such as ::ffff:192.0.2.5
+// is the IPv4 host 192.0.2.5/32, whereas the text "::ffff:192.0.2.5/32" is the IPv6
+// network ::/32, which matches no IPv4 client and does match ::1.
+func parseNetwork(entry string) (*net.IPNet, error) {
+	if _, network, err := net.ParseCIDR(entry); err == nil {
+		return network, nil
+	}
+	ip := net.ParseIP(entry)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid trusted network '%s': not a valid IP address or CIDR", entry)
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}, nil
+	}
+	return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}, nil
 }
 
 // InvalidNetworkEntries returns the entries of networks that are neither an IP address nor
@@ -50,7 +48,7 @@ func ParseTrustedNetworks(cidrs []string) ([]*net.IPNet, error) {
 func InvalidNetworkEntries(networks []string) []string {
 	var invalid []string
 	for _, entry := range networks {
-		if _, err := ParseTrustedNetworks([]string{entry}); err != nil {
+		if _, err := parseNetwork(entry); err != nil {
 			invalid = append(invalid, entry)
 		}
 	}
@@ -71,20 +69,9 @@ func IPInNetworks(ip net.IP, networks []string) bool {
 		return false
 	}
 	for _, entry := range networks {
-		_, network, err := net.ParseCIDR(entry)
+		network, err := parseNetwork(entry)
 		if err != nil {
-			// Not CIDR notation — accept a bare IP as a single-host network.
-			parsed := net.ParseIP(entry)
-			if parsed == nil {
-				continue
-			}
-			mask := "/32"
-			if parsed.To4() == nil {
-				mask = "/128"
-			}
-			if _, network, err = net.ParseCIDR(entry + mask); err != nil {
-				continue
-			}
+			continue
 		}
 		if network.Contains(ip) {
 			return true

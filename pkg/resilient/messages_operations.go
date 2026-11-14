@@ -3,6 +3,7 @@ package resilient
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
@@ -152,15 +153,118 @@ func (rd *ResilientDatabase) SearchMessagesSortedWithRetry(ctx context.Context, 
 	return result.([]db.SearchMessageResult), nil
 }
 
-func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).MoveMessages(ctx, tx, ids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID)
+// destObjectKeepalive is the longest a COPY/MOVE transaction sits without a statement while
+// it makes its destination objects exist in S3. The server kills a session idle in a
+// transaction for idle_in_transaction_session_timeout, and the S3 round trips of a large
+// operation can outlast that. A variable so tests can shorten it.
+var destObjectKeepalive = 30 * time.Second
+
+// MoveMessagesWithRetry moves ids from srcMailboxID into destMailboxID, owned by
+// destAccountID, in one write transaction (db.MoveMessages).
+//
+// destObjects are the bodies of a cross-account move that are in S3 under their source
+// key. The moved rows point at destAccountID's key, and ensureDestObject makes the
+// object under it exist. The transaction first takes their object locks in shared mode
+// (db.LockS3ObjectsSharedInTx), runs ensureDestObject for each while it holds them, and
+// only then moves the rows, marked uploaded for exactly these bodies. The cleaner
+// deletes an object only under the same lock, after a re-check that finds no row of the
+// owner for it, and the moved rows are invisible to that re-check until they commit:
+// holding the lock from the check to that commit is what keeps it from deleting the
+// object in between. The lock, the check and the rows share one transaction, so no
+// second connection is needed while the first is held, and the lock is held in the
+// database the rows are written to whatever the write pool fails over to.
+//
+// The S3 round trips run before the transaction's first write and first row lock, so
+// meanwhile it holds the shared locks and its connection but no transaction id or
+// snapshot. They are not database time: they run under ctx, not the write timeout, and
+// the writes get a write timeout of their own afterwards. A failed S3 call fails the
+// move with a *DestObjectError, which the write circuit breaker does not count and the
+// retry does not repeat (the S3 calls retry on their own). A statement keeps the
+// transaction alive at least every destObjectKeepalive.
+func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, destObjects []string, ensureDestObject func(ctx context.Context, contentHash string) error) (map[imap.UID]imap.UID, error) {
+	op := func(opCtx context.Context, tx pgx.Tx) (any, error) {
+		if len(destObjects) > 0 {
+			if err := db.LockS3ObjectsSharedInTx(opCtx, tx, destAccountID, destObjects); err != nil {
+				return nil, err
+			}
+			if err := rd.ensureDestObjects(ctx, tx, destObjects, ensureDestObject); err != nil {
+				return nil, err
+			}
+			writeCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
+			defer cancel()
+			opCtx = writeCtx
+		}
+		return rd.getOperationalDatabaseForOperation(opCtx, true).MoveMessages(opCtx, tx, ids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID, destObjects)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	if err != nil {
 		return nil, err
 	}
 	return result.(map[imap.UID]imap.UID), nil
+}
+
+// ensureDestObjects runs ensure for every hash while tx holds their locks. The
+// keepalive also runs during a single slow S3 request. Only its goroutine uses tx
+// during this phase; it is joined before the caller starts any database writes.
+func (rd *ResilientDatabase) ensureDestObjects(ctx context.Context, tx pgx.Tx, hashes []string, ensure func(ctx context.Context, contentHash string) error) (resultErr error) {
+	ensureCtx, cancelEnsure := context.WithCancel(ctx)
+	defer cancelEnsure()
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(destObjectKeepalive)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				done <- nil
+				return
+			case <-ctx.Done():
+				// The caller's deadline is not a database failure. The S3 callback
+				// observes the same cancellation and retains its error classification.
+				done <- nil
+				return
+			case <-ticker.C:
+				pingCtx, cancel := rd.withTimeout(ctx, timeoutWrite)
+				_, err := tx.Exec(pingCtx, "SELECT 1")
+				cancel()
+				if err != nil {
+					cancelEnsure()
+					if ctx.Err() != nil {
+						done <- nil
+					} else {
+						done <- fmt.Errorf("failed to keep the destination object transaction alive: %w", err)
+					}
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		if err := <-done; err != nil {
+			resultErr = err
+		}
+	}()
+	for _, hash := range hashes {
+		if err := ensure(ensureCtx, hash); err != nil {
+			return &DestObjectError{ContentHash: hash, Err: err}
+		}
+	}
+	return nil
+}
+
+// DestObjectError is a failure to make a cross-account COPY/MOVE destination object exist
+// in S3. It has no Unwrap on purpose: an S3 timeout, a refused connection or an open S3
+// circuit breaker must not pass for a database failure with the write circuit breaker
+// or the retry. The caller classifies Err itself.
+type DestObjectError struct {
+	ContentHash string
+	Err         error
+}
+
+func (e *DestObjectError) Error() string {
+	return fmt.Sprintf("failed to make destination object %s exist: %v", e.ContentHash, e.Err)
 }
 
 // --- POP3 and Message List Wrappers ---

@@ -36,22 +36,43 @@ func (s *IMAPSession) refusedInMaintenance() *imap.Error {
 	}
 }
 
+// createDefaultMailboxes makes sure the account has its default mailboxes
+// (consts.DefaultMailboxes), as every login does before the session starts. When the
+// read pool did not show them, this is the account's first login: they have just
+// been created on the writer, and a replica that has not replayed that yet has no
+// INBOX. The session then reads from the writer, as after any write of its own.
+func (s *IMAPSession) createDefaultMailboxes(ctx context.Context, accountID int64) error {
+	onWriter, err := s.server.rdb.EnsureDefaultMailboxesWithRetry(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	if onWriter {
+		s.useMasterDB.Store(true)
+	}
+	return nil
+}
+
 // Login handles the IMAP LOGIN command. It always applies the authentication
 // gate (progressive delay + rate-limit check) before authenticating.
 func (s *IMAPSession) Login(ctx context.Context, address, password string) error {
-	return s.login(ctx, address, password, true)
+	return s.login(ctx, address, password, "", true)
 }
 
 // login authenticates address/password. applyGate controls whether the
 // progressive authentication delay and per-IP/username rate-limit check are
 // applied here.
 //
+// authzid is the SASL authorization identity, empty for LOGIN. One naming somebody
+// other than address is refused, but only after the credentials checked out: RFC
+// 4616 section 2 verifies the authentication identity and password first, then that
+// they permit acting as the authorization identity.
+//
 // The LOGIN command passes applyGate=true. The SASL PLAIN handler (sasl.go)
 // passes applyGate=false for the regular-user path because it has ALREADY
 // applied the delay + rate-limit once for the AUTHENTICATE command. Without
 // this, AUTHENTICATE would apply both twice — roughly doubling auth latency and
 // double-counting against the rate limiter relative to LOGIN.
-func (s *IMAPSession) login(ctx context.Context, address, password string, applyGate bool) error {
+func (s *IMAPSession) login(ctx context.Context, address, password, authzid string, applyGate bool) error {
 	authStart := time.Now()
 
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
@@ -145,19 +166,18 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		s.DebugLog("failed to parse address", "error", err)
 		// Track invalid address format as client error
 		metrics.ProtocolErrors.WithLabelValues("imap", "LOGIN", "invalid_address", "client_error").Inc()
-		// Record and count it: an unparseable address was an unmetered
-		// authentication attempt, and it is the path a non-address master SASL
-		// username takes when it falls through to here (sasl.go section 2), which
-		// must be accounted for exactly like any other failed attempt.
+		// A failed login like any other: recorded, counted and answered exactly
+		// like a wrong password. A master SASL self-login (authorization identity
+		// = authentication identity = a non-address master SASL username) falls
+		// through to here with any password but the master SASL one, which
+		// sasl.go section 2 answers with authFailedError(), so a different reply
+		// or count here confirms a guessed master SASL password. It holds for
+		// every username, or the reply would single out the master SASL one.
 		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
 		if s.server.authLimiter != nil {
 			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 		}
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeAuthenticationFailed,
-			Text: "Address not in the correct format",
-		}
+		return authFailedError()
 	}
 
 	// The account the session is for, and how it was authenticated. Both branches
@@ -276,9 +296,27 @@ func (s *IMAPSession) login(ctx context.Context, address, password string, apply
 		}
 	}
 
+	// The credentials checked out; now the authorization (RFC 4616 section 2). Acting
+	// as somebody else is the master SASL credentials' privilege (sasl.go), so this
+	// account may act only as itself. Refused here, not before the password, so only a
+	// client that proved its credentials learns it is not permitted, which is what RFC
+	// 5530 section 3 defines AUTHORIZATIONFAILED as: "Authentication succeeded in using
+	// the authentication identity, but the server cannot or will not allow the
+	// authentication identity to act as the requested authorization identity".
+	// Refusing it earlier answered every username but the master SASL one without a
+	// password check, which confirmed the master SASL username. Not recorded as a
+	// failure: the credentials were right.
+	if authzid != "" && authzid != address {
+		s.DebugLog("proxy login not allowed for non-master users", "username", address, "identity", authzid)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeAuthorizationFailed,
+			Text: "Proxy login not permitted for this user.",
+		}
+	}
+
 	// Ensure the default mailboxes (INBOX/Sent/Drafts/Archive/Junk/Trash, consts.DefaultMailboxes) exist
-	err = s.server.rdb.CreateDefaultMailboxesWithRetry(ctx, AccountID)
-	if err != nil {
+	if err := s.createDefaultMailboxes(ctx, AccountID); err != nil {
 		return s.internalError("failed to create default mailboxes: %v", err)
 	}
 

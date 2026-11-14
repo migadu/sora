@@ -79,6 +79,10 @@ type Manager struct {
 	stateProviders map[string]stateProvider
 	stateMu        sync.RWMutex
 
+	// Values the subsystems of this node share (see Shared)
+	shared   map[string]any
+	sharedMu sync.Mutex
+
 	// Rate limit event handling
 	rateLimitHandlers   []*handlerQueue
 	rateLimitMu         sync.RWMutex
@@ -951,6 +955,26 @@ func (m *Manager) getIPLimitBroadcasts(overhead, limit int) [][]byte {
 	m.ipLimitBroadcastMu.RUnlock()
 
 	return collectBroadcasts("ip-limit", markerIPLimit, broadcasters, overhead, limit)
+}
+
+// Shared returns the value this node keeps under key for its subsystems,
+// storing newValue() there first if there is none. memberlist delivers neither
+// gossip nor push/pull state back to the member that sent it, so subsystems of
+// one node that must see each other's state (the connection trackers of two
+// listeners of one protocol) share it through here.
+func (m *Manager) Shared(key string, newValue func() any) any {
+	m.sharedMu.Lock()
+	defer m.sharedMu.Unlock()
+
+	if v, ok := m.shared[key]; ok {
+		return v
+	}
+	if m.shared == nil {
+		m.shared = make(map[string]any)
+	}
+	v := newValue()
+	m.shared[key] = v
+	return v
 }
 
 // RegisterStateProvider registers a subsystem's full-state exchange with

@@ -294,36 +294,23 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 	// authorization identity IS the impersonation target. USER/PASS carries none
 	// at all, and a SASL submission without one cannot be a master login either —
 	// see the no-authorization-identity note below.
-	// The trailing clause excludes one case from this block: a WRONG master password on a
-	// submission whose authorization identity equals its authentication identity. RFC 4616
-	// defines authzid == authcid as "no impersonation", and several SASL libraries fill the
-	// field in unconditionally, so for an account whose address happens to be the master
-	// SASL username that shape is an ordinary login. Refusing it here would reject the
-	// account's own password forever; it falls through to regular authentication instead,
-	// which records its own failure under the same authKey, so a master-password guess
-	// dressed up as a self-login is still metered. A CORRECT master password keeps entering
-	// the block whatever the target, which is what the proxy flow relies on.
+	// Any other password falls through to regular authentication, which verifies
+	// the credentials like any other username's (RFC 4616 section 2: the
+	// authentication identity and password first, the authorization identity
+	// second) and answers and records their failure under the same authKey. A reply
+	// or accounting of its own for a wrong master SASL password, beside the
+	// authorization refusal any other username got, confirmed the master SASL
+	// username to anyone who could reach the port.
+	// A self-login falls through too if its peer is not allowed to use the master
+	// credential, or if the account does not exist (below). This keeps its cost
+	// and cache behavior identical to a self-login using any other password.
+	// The preliminary network check is logged but leaves failure accounting to
+	// regular authentication, so the attempt is gated and recorded only once.
+	selfLogin := identity == username
 	if identity != "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
 		checkMasterCredential(username, settings.masterSASLUsername) &&
-		(checkMasterCredential(password, settings.masterSASLPassword) || identity != username) {
-		if !checkMasterCredential(password, settings.masterSASLPassword) {
-			// The submitted username IS the master SASL username, an impersonation
-			// was requested, but the password is wrong. This must be recorded as an
-			// authentication failure and must not fall through to regular
-			// authentication: master SASL is a tenant-wide impersonation capability,
-			// and the regular path rejects the (non-address) master username before
-			// any RecordAuthAttempt* call, which left the credential brute-forceable
-			// at connection rate. Recorded under authKey — the master username's own
-			// bucket — so the impersonation target is not locked out.
-			s.WarnLog("master SASL authentication failed (invalid password)", "peer", server.GetAddrString(netConn.RemoteAddr()))
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
-			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
-			// Reply exactly like any other bad credential: a distinct reply would
-			// confirm the master SASL username to an attacker.
-			return 0, errAuthFailed
-		}
+		checkMasterCredential(password, settings.masterSASLPassword) &&
+		(!selfLogin || s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master SASL self-login")) {
 		if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master SASL") {
 			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
 			return 0, errAuthFailed
@@ -365,18 +352,28 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "unavailable").Inc()
 				return 0, errTempUnavailable
 			}
-			// Same reply and same accounting as a bad credential (see above).
 			s.WarnLog("impersonation target rejected (account not found)", "target_user", targetAddr.BaseAddress(), "error", err)
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+			if !selfLogin {
+				// Same reply and same accounting as a bad credential (see above).
+				if s.server.authLimiter != nil {
+					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+				}
+				metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
+				return 0, errAuthFailed
 			}
-			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
-			return 0, errAuthFailed
+			// A self-login: answered by regular authentication below (see above).
+		} else {
+			authSuccess = true
+			masterAuthUsed = true
+			// The session belongs to the impersonated account, not the master credential.
+			userAddress = &targetAddr
 		}
-		authSuccess = true
-		masterAuthUsed = true
-		// The session belongs to the impersonated account, not the master credential.
-		userAddress = &targetAddr
+	} else if identity != "" && identity != username && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
+		checkMasterCredential(username, settings.masterSASLUsername) {
+		// The master SASL username asking to act as somebody else, with a wrong
+		// password: answered by regular authentication (see above). Logged for the
+		// operator debugging a proxy with the wrong master SASL password.
+		s.WarnLog("master SASL authentication failed (invalid password)", "peer", server.GetAddrString(netConn.RemoteAddr()))
 	} else if identity == "" && len(settings.masterSASLUsername) > 0 && len(settings.masterSASLPassword) > 0 &&
 		checkMasterCredential(username, settings.masterSASLUsername) &&
 		checkMasterCredential(password, settings.masterSASLPassword) {
@@ -399,15 +396,19 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 		newUserAddress, err := server.NewAddress(username)
 		if err != nil {
 			s.DebugLog("invalid username format", "error", err)
-			// Record and count it: an unparseable username was an unmetered
-			// authentication attempt, and it is the path a non-address master SASL
-			// username takes when it falls through to here, which must be accounted
-			// for exactly like any other failed attempt.
+			// A failed login like any other: recorded, counted and answered exactly
+			// like a wrong password. A master SASL self-login (authorization
+			// identity = authentication identity = a non-address master SASL
+			// username) falls through to here with any password but the master
+			// SASL one, which the master SASL block above answers with
+			// errAuthFailed, so a different reply or count here confirms a guessed
+			// master SASL password. It holds for every username, or the reply
+			// would single out the master SASL one.
 			if s.server.authLimiter != nil {
 				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 			}
 			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
-			return 0, pop3AuthError("Invalid username format")
+			return 0, errAuthFailed
 		}
 		userAddress = &newUserAddress
 
@@ -476,10 +477,6 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 
 	// Regular authentication
 	if !authSuccess {
-		if identity != "" && identity != username {
-			return 0, pop3AuthError("Proxy authentication requires master credentials")
-		}
-
 		var err error
 		accountID, err = s.server.Authenticate(ctx, userAddress.BaseAddress(), password)
 		if err != nil {
@@ -500,6 +497,18 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 			}
 			metrics.AuthenticationAttempts.WithLabelValues("pop3", s.server.name, s.server.hostname, "failure").Inc()
 			return 0, errAuthFailed
+		}
+
+		// The credentials checked out; now the authorization (RFC 4616 section 2).
+		// Acting as somebody else is the master SASL credentials' privilege, so this
+		// account may act only as itself. Refused here, not before the password, so
+		// only a client that proved its credentials learns it is not permitted:
+		// refusing it earlier answered every username but the master SASL one without
+		// a password check, which confirmed the master SASL username. Not recorded as
+		// a failure: the credentials were right.
+		if identity != "" && identity != username {
+			s.DebugLog("proxy authentication requires master credentials", "username", username, "identity", identity)
+			return 0, pop3AuthError("Proxy authentication requires master credentials")
 		}
 		authSuccess = true
 	}

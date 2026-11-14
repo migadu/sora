@@ -131,7 +131,7 @@ func TestMaildirDovecotCompression(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			hash, size, hashErr := hashFile(path)
+			hash, size, hashErr := hashFile(path, 0)
 			content, decErr := decompressIfNeeded(tt.onDisk)
 
 			if tt.wantErr != "" {
@@ -179,7 +179,7 @@ func TestMaildirZstdDecoderReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	scanAndUpload := func() {
-		if _, _, err := hashFile(path); err != nil {
+		if _, _, err := hashFile(path, 0); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := decompressIfNeeded(onDisk); err != nil {
@@ -235,7 +235,7 @@ func TestMaildirZstdConcurrentFiles(t *testing.T) {
 			for n := range 40 {
 				i := (g + n) % len(files)
 				f := files[i]
-				hash, _, hashErr := hashFile(filepath.Join(dir, strconv.Itoa(i)))
+				hash, _, hashErr := hashFile(filepath.Join(dir, strconv.Itoa(i)), 0)
 				content, decErr := decompressIfNeeded(f.onDisk)
 				if f.message == nil {
 					if hashErr == nil || decErr == nil {

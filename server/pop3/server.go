@@ -113,7 +113,7 @@ type POP3Server struct {
 	// Active session tracking for graceful shutdown
 	activeSessionsMutex sync.RWMutex
 	activeSessions      map[*POP3Session]struct{}
-	sessionsWg          sync.WaitGroup // Tracks active sessions for graceful drain
+	sessions            serverPkg.SessionGroup // Tracks active sessions for graceful drain
 
 	// The library server is rebuilt (for new connections only) when runtime
 	// settings change on SIGHUP; existing connections keep their snapshot.
@@ -418,8 +418,9 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 		Caps:                caps,
 		Greeting:            "Sora-POP3-Server ready",
 		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
-			// Connection limiting check
 			netConn := c.NetConn()
+			endInitialization := s.sessions.GuardInitialization(s.appCtx, netConn)
+			defer endInitialization()
 			proxyInfo := serverPkg.GetProxyProtocolInfo(netConn)
 
 			clientIP, proxyIP := serverPkg.GetConnectionIPs(netConn, proxyInfo)
@@ -429,10 +430,19 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 			// an "-ERR too many connections" banner would tell a flooder
 			// exactly when the limiter engages so they can pace under it.
 			// Test-enforced (connection-limit tests assert the rejected
-			// socket never sees "+OK") — do not add a banner.
+			// socket never sees "+OK") — do not add a banner. The exception
+			// is a client a PROXY peer named over its per-IP limit: that
+			// peer is a proxy, which fails the client's login on the reply
+			// but would count a silent close against the backend.
 			releaseConn, err := s.limiter.AcceptWithRealIP(netConn.RemoteAddr(), clientIP)
 			if err != nil {
-				return nil, fmt.Errorf("%w: %w", pop3server.ErrSilentReject, err)
+				if !serverPkg.IsProxiedClientRefusal(err, proxyInfo) {
+					return nil, fmt.Errorf("%w: %w", pop3server.ErrSilentReject, err)
+				}
+				if _, hsErr := serverPkg.PerformDeferredTLSHandshake(netConn); hsErr != nil {
+					return nil, fmt.Errorf("%w: TLS handshake: %w", pop3server.ErrSilentReject, hsErr)
+				}
+				return nil, fmt.Errorf("%w: %w", errTooManyConnections, err)
 			}
 
 			// Implicit-TLS listeners (SoraTLSListener) defer the TLS handshake
@@ -659,16 +669,20 @@ func (s *POP3Server) Start(errChan chan error) {
 		// connections never inflate the gauges (they have no session to
 		// decrement them).
 
-		s.sessionsWg.Add(1)
-		go func() {
-			defer s.sessionsWg.Done()
+		started := s.sessions.Go(func() {
 			defer func() {
 				if r := recover(); r != nil {
 					logger.Error("POP3: panic in connection handler", "panic", r, "stack", string(debug.Stack()))
 				}
 			}()
 			s.pop3libServer.Load().ServeConn(conn)
-		}()
+		})
+		if !started {
+			// Close is draining the sessions and no longer waits for new ones.
+			conn.Close()
+			logger.Info("POP3 server stopped gracefully", "name", s.name)
+			return
+		}
 	}
 }
 
@@ -683,6 +697,7 @@ func (s *POP3Server) SetConnTracker(tracker *serverPkg.ConnectionTracker) {
 }
 
 func (s *POP3Server) Close() {
+	s.sessions.BeginDrain()
 	// Unregister rate limiter from global registry
 	serverPkg.UnregisterRateLimiter("pop3", s.name)
 
@@ -715,16 +730,9 @@ func (s *POP3Server) Close() {
 
 // waitForSessionsDrain waits for all active sessions to finish with a timeout
 func (s *POP3Server) waitForSessionsDrain(timeout time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		s.sessionsWg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
+	if s.sessions.Drain(timeout) {
 		logger.Debug("POP3: All sessions drained gracefully", "name", s.name)
-	case <-time.After(timeout):
+	} else {
 		logger.Debug("POP3: Session drain timeout, forcing shutdown", "name", s.name, "timeout", timeout)
 	}
 }
