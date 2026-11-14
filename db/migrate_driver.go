@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"strings"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database"
@@ -49,6 +50,8 @@ func (d *migrationDriver) Close() error { return d.conn.Close(context.Background
 func (d *migrationDriver) Lock() error   { return nil }
 func (d *migrationDriver) Unlock() error { return nil }
 
+const migrationRollbackTimeout = 5 * time.Second
+
 func (d *migrationDriver) Run(migration io.Reader) error {
 	body, err := io.ReadAll(migration)
 	if err != nil {
@@ -63,7 +66,16 @@ func (d *migrationDriver) Run(migration io.Reader) error {
 		// the pinned session in an aborted transaction (TxStatus 'E'); roll it
 		// back so Version/SetVersion on this connection do not fail with 25P02.
 		if d.conn.PgConn() != nil && d.conn.PgConn().TxStatus() != 'I' {
-			_, _ = d.conn.Exec(context.Background(), "ROLLBACK")
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), migrationRollbackTimeout)
+			_, rollbackErr := d.conn.Exec(rollbackCtx, "ROLLBACK")
+			cancel()
+			if rollbackErr != nil {
+				// A failed cleanup must neither hold Run indefinitely nor leave an
+				// aborted session available for reuse. Preserve the original SQL error.
+				closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+				_ = d.conn.Close(closeCtx)
+				cancel()
+			}
 		}
 		return migrationError(query, err)
 	}

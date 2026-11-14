@@ -22,6 +22,7 @@ import (
 // same driver (such as golang-migrate's Version() and Force()) do not fail with
 // SQLSTATE 25P02 ("current transaction is aborted").
 func TestMigrationDriverRunRollsBackFailedExplicitTransaction(t *testing.T) {
+	skipDatabaseTestInShortMode(t)
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, migrationTestConnStr(t))
 	if err != nil {
@@ -111,6 +112,10 @@ func TestMigrationDriverRunRollsBackFailedExplicitTransaction(t *testing.T) {
 		}
 		if v != 2 || !dirty {
 			t.Fatalf("m.Version() = (%d, %v), want (2, true)", v, dirty)
+		}
+		var inserted int
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM items").Scan(&inserted); err != nil || inserted != 0 {
+			t.Fatalf("failed explicit migration left %d rows, err=%v, want no partial writes", inserted, err)
 		}
 
 		if err := m.Force(1); err != nil {
