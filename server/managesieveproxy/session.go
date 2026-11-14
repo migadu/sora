@@ -399,6 +399,13 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					if cached.IsOld(s.server.positiveRevalidationWindow) {
 						s.DebugLog("cache hit - positive entry with different password (old enough to revalidate)", "username", username, "age", time.Since(cached.CreatedAt))
 						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "revalidate_positive_different_pw").Inc()
+						// The database or the remote lookup decides this password, so drop
+						// the entry before asking (the SQLite auth cache drops a missed entry
+						// the same way). Kept, it would outlive an outage, which gives no
+						// verdict and is not counted, and still sign in its password: every
+						// guess during the outage would be checked against it, unseen by the
+						// auth rate limiter, until it expired.
+						s.invalidateLookupCache("password differs from cached login")
 						// Fall through to full authentication
 					} else {
 						// Different password but too fresh
@@ -683,13 +690,6 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			// (TRYLATER)), neither counted as a failed login nor cached.
 			if proxy.IsTemporaryDBAuthFailure(err) {
 				reason, _ := proxy.ClassifyDBAuthFailure(err)
-				// A login this username has in the lookup cache was verified against
-				// another hash than the one now stored. Drop it: while it stays, every
-				// password that misses it is answered here, uncounted, and the cached
-				// one still signs in, an unmetered guessing oracle until it expires.
-				if errors.Is(err, db.ErrUnverifiableHash) {
-					s.invalidateLookupCache("unverifiable stored hash")
-				}
 				s.WarnLog("authentication unavailable", "reason", reason, "method", "main_db", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable

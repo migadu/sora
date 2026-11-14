@@ -147,7 +147,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		plaintextBody = &emptyBody
 	}
 
-	// Safety guard: Reject if global staging limit is exceeded. Checked before Sieve runs,
+	// Safety guard: Reject if this node's staging limit is exceeded. Checked before Sieve runs,
 	// so a rejected delivery cannot have redirected or auto-replied first.
 	if d.Uploader.IsStagingLimitExceeded(int64(len(messageBytes))) {
 		d.Logger.Log("Rejecting delivery due to upload staging size limit exceeded")

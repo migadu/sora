@@ -10,7 +10,7 @@ import (
 )
 
 // TestRedirectHopBackstopIsEnforced covers the mail-loop backstop configured by
-// [servers.*.limits] max_redirect_hops: a message Sora has already redirected
+// [server.limits] max_redirect_hops: a message Sora has already redirected
 // that many times must not be redirected again.
 //
 // Evaluate builds a fresh per-execution SievePolicy from the executor's template

@@ -54,6 +54,13 @@ var (
 	// ErrRemoteLookupTransient.
 	ErrRemoteLookupInvalidResponse = errors.New("remotelookup invalid response")
 
+	// ErrRemoteLookupRefused is returned by a routing lookup (ConnectionManager.LookupUserRoute)
+	// that the lookup service answered 401/403: it refused the account. Unlike a 404 the
+	// account is not "unknown here", so there is no fallback to the local database
+	// (lookup_local_users), and named-pool routing refuses to use the default pool.
+	// Unlike an outage it is a verdict. Not wrapped in ErrRemoteLookupTransient.
+	ErrRemoteLookupRefused = errors.New("remotelookup refused the account")
+
 	// ErrUnknownPool is returned when a route names a pool this proxy does not have:
 	// a lookup answer for a pool the proxy's config lacks (rollout skew, a typo in
 	// the API). The connection fails; it is never spilled into another pool.
