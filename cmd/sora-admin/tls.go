@@ -1109,7 +1109,13 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 		domain, err := autocertName(configured)
 		if err != nil {
-			return err
+			if specificDomain != "" {
+				return err
+			}
+			// autocert.HostWhitelist drops such a configured domain silently and the
+			// server serves the others, so skip it rather than stop syncing them.
+			logger.Warn("Skipping configured domain autocert cannot serve", "domain", configured, "error", err)
+			continue
 		}
 
 		// Cache both ECDSA and RSA variants

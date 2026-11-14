@@ -280,3 +280,27 @@ func TestTLSAutocertNameRejectsNonDomainPaths(t *testing.T) {
 		t.Fatalf("trailing-dot normalization = %q, %v", name, err)
 	}
 }
+
+// TestTLSCacheSkipsDomainsAutocertCannotServe: autocert.HostWhitelist silently drops a
+// configured domain that idna.Lookup refuses, so the server runs and serves the others.
+// tls cache must do the same for the configured list instead of stopping at that entry;
+// an explicit --domain of that kind is still an error.
+func TestTLSCacheSkipsDomainsAutocertCannotServe(t *testing.T) {
+	_, endpoint := newTLSStubS3(t)
+	cfg := tlsTestConfig(endpoint)
+	cfg.TLS.LetsEncrypt.Domains = []string{"*.example.com", "mail.example.com"}
+	cacheDir := t.TempDir()
+	putServerCertificates(t, cfg, "mail.example.com", "mail.example.com+rsa")
+
+	if err := cacheTLSCertificates(context.Background(), cfg, cacheDir, "", false); err != nil {
+		t.Fatalf("cacheTLSCertificates: %v", err)
+	}
+	want := []string{"mail.example.com", "mail.example.com+rsa"}
+	if got := localNames(t, cacheDir); !slices.Equal(got, want) {
+		t.Errorf("local cache = %v, want %v", got, want)
+	}
+
+	if err := cacheTLSCertificates(context.Background(), cfg, cacheDir, "*.example.com", false); err == nil {
+		t.Error("cacheTLSCertificates succeeded for --domain *.example.com")
+	}
+}
