@@ -1020,8 +1020,9 @@ type ServerConfig struct {
 	RemoteDNSRefresh string `toml:"remote_dns_refresh,omitempty"`
 
 	// HTTP API specific
-	APIKey       string   `toml:"api_key,omitempty"`
-	AllowedHosts []string `toml:"allowed_hosts,omitempty"`
+	APIKey         string   `toml:"api_key,omitempty"`
+	ReadOnlyAPIKey string   `toml:"read_only_api_key,omitempty"` // http_admin_api: optional second key, GET requests only
+	AllowedHosts   []string `toml:"allowed_hosts,omitempty"`
 
 	// Mail HTTP API specific (stateless JWT-based authentication)
 	JWTSecret      string   `toml:"jwt_secret,omitempty"`      // Secret key for signing JWT tokens
@@ -2050,6 +2051,9 @@ func (s *ServerConfig) Validate() error {
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
+	if s.ReadOnlyAPIKey != "" && s.Type != "http_admin_api" {
+		logger("WARNING: Server %s (type: %s) has 'read_only_api_key' configured, but this only applies to http_admin_api servers", s.Name, s.Type)
+	}
 	if s.TLSUseStartTLS {
 		switch s.Type {
 		case "imap", "lmtp", "managesieve", "pop3", "imap_proxy", "lmtp_proxy", "managesieve_proxy", "pop3_proxy":
