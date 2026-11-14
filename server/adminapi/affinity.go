@@ -39,26 +39,26 @@ type AffinityListEntry struct {
 func (s *Server) handleAffinitySet(w http.ResponseWriter, r *http.Request) {
 	var req AffinitySetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "Invalid JSON"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
 	// Validate required fields
 	if req.User == "" || req.Protocol == "" || req.Backend == "" {
-		http.Error(w, `{"error": "user, protocol, and backend are required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "user, protocol, and backend are required")
 		return
 	}
 
 	// Validate protocol
 	req.Protocol = strings.ToLower(req.Protocol)
 	if req.Protocol != "imap" && req.Protocol != "pop3" && req.Protocol != "managesieve" {
-		http.Error(w, `{"error": "protocol must be imap, pop3, or managesieve"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "protocol must be imap, pop3, or managesieve")
 		return
 	}
 
 	// Check if affinity manager is available
 	if s.affinityManager == nil {
-		http.Error(w, `{"error": "Affinity manager not enabled on this server"}`, http.StatusServiceUnavailable)
+		s.writeError(w, http.StatusServiceUnavailable, "Affinity manager not enabled on this server")
 		return
 	}
 
@@ -72,12 +72,12 @@ func (s *Server) handleAffinitySet(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !found {
-			http.Error(w, fmt.Sprintf(`{"error": "Backend %s is not configured for protocol %s. Valid backends: %v"}`, req.Backend, req.Protocol, validBackends), http.StatusBadRequest)
+			s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Backend %s is not configured for protocol %s. Valid backends: %v", req.Backend, req.Protocol, validBackends))
 			return
 		}
 	} else {
 		// If no backends configured for this protocol, reject
-		http.Error(w, fmt.Sprintf(`{"error": "No backends configured for protocol %s"}`, req.Protocol), http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("No backends configured for protocol %s", req.Protocol))
 		return
 	}
 
@@ -101,13 +101,13 @@ func (s *Server) handleAffinityGet(w http.ResponseWriter, r *http.Request) {
 	protocol := strings.ToLower(r.URL.Query().Get("protocol"))
 
 	if user == "" || protocol == "" {
-		http.Error(w, `{"error": "user and protocol query parameters are required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "user and protocol query parameters are required")
 		return
 	}
 
 	// Check if affinity manager is available
 	if s.affinityManager == nil {
-		http.Error(w, `{"error": "Affinity manager not enabled on this server"}`, http.StatusServiceUnavailable)
+		s.writeError(w, http.StatusServiceUnavailable, "Affinity manager not enabled on this server")
 		return
 	}
 
@@ -115,7 +115,7 @@ func (s *Server) handleAffinityGet(w http.ResponseWriter, r *http.Request) {
 	backend, found := s.affinityManager.GetBackend(user, protocol)
 
 	if !found {
-		http.Error(w, fmt.Sprintf(`{"error": "No affinity set for %s (%s)"}`, user, protocol), http.StatusNotFound)
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("No affinity set for %s (%s)", user, protocol))
 		return
 	}
 
@@ -133,13 +133,13 @@ func (s *Server) handleAffinityDelete(w http.ResponseWriter, r *http.Request) {
 	protocol := strings.ToLower(r.URL.Query().Get("protocol"))
 
 	if user == "" || protocol == "" {
-		http.Error(w, `{"error": "user and protocol query parameters are required"}`, http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "user and protocol query parameters are required")
 		return
 	}
 
 	// Check if affinity manager is available
 	if s.affinityManager == nil {
-		http.Error(w, `{"error": "Affinity manager not enabled on this server"}`, http.StatusServiceUnavailable)
+		s.writeError(w, http.StatusServiceUnavailable, "Affinity manager not enabled on this server")
 		return
 	}
 
@@ -165,7 +165,7 @@ func (s *Server) handleAffinityList(w http.ResponseWriter, r *http.Request) {
 
 	// Check if affinity manager is available
 	if s.affinityManager == nil {
-		http.Error(w, `{"error": "Affinity manager not enabled on this server"}`, http.StatusServiceUnavailable)
+		s.writeError(w, http.StatusServiceUnavailable, "Affinity manager not enabled on this server")
 		return
 	}
 
