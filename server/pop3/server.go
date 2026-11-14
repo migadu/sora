@@ -302,24 +302,11 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		server.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
-	// Create connection limiter with trusted networks from server configuration
-	// For POP3 backend:
-	// - If PROXY protocol is enabled: only connections from trusted networks allowed, no per-IP limiting
-	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
-	var limiterTrustedNets []string
-	var limiterMaxPerIP int
-
-	if options.ProxyProtocol {
-		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = 0 // No per-IP limiting when PROXY protocol is enabled
-	} else {
-		// PROXY protocol disabled: use trusted networks for per-IP bypass
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = options.MaxConnectionsPerIP
-	}
-
-	server.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("POP3", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
+	// Create the connection limiter. max_connections_per_ip counts the client a PROXY
+	// header names when there is one, else the socket peer, and trusted_networks
+	// exempt the counted address: a trusted proxy or load balancer passes the limit
+	// on to its clients and is only exempt itself when it names none.
+	server.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("POP3", options.MaxConnections, options.MaxConnectionsPerIP, options.TrustedNetworks)
 
 	// Set listen backlog with reasonable default
 	server.listenBacklog = options.ListenBacklog
@@ -854,7 +841,11 @@ func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *s.settings.Load()
 
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.libCommandTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("POP3 config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.libCommandTimeout)
+	} else if timeout != next.libCommandTimeout {
 		// Mirror construction: the raw value feeds the per-command execution
 		// timeout (0 = disabled) while the idle timeout keeps the RFC 1939 §3
 		// 10-minute floor.
@@ -866,7 +857,9 @@ func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 		reloaded = append(reloaded, "command_timeout")
 		reportCommandTimeout(timeout)
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("POP3 config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}
@@ -874,7 +867,9 @@ func (s *POP3Server) ReloadConfig(cfg config.ServerConfig) error {
 		next.minBytesPerMinute = bpm
 		reloaded = append(reloaded, "min_bytes_per_minute")
 	}
-	if limit, err := cfg.GetSessionMemoryLimit(); err == nil && limit != next.sessionMemoryLimit {
+	if limit, err := cfg.GetSessionMemoryLimit(); err != nil {
+		logger.Warn("POP3 config reload: invalid session_memory_limit, keeping the running value", "name", s.name, "error", err, "running", next.sessionMemoryLimit)
+	} else if limit != next.sessionMemoryLimit {
 		next.sessionMemoryLimit = limit
 		reloaded = append(reloaded, "session_memory_limit")
 	}

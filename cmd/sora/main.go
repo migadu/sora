@@ -1001,7 +1001,7 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 			os.Exit(errorHandler.WaitForExit())
 		}
 
-		logger.Info("Relay queue initialized", "path", queuePath, "max_attempts", cfg.Relay.Queue.MaxAttempts)
+		logger.Info("Relay queue initialized", "path", queuePath, "max_attempts", deps.relayQueue.MaxAttempts())
 
 		// Create relay handler from global relay config if configured
 		if cfg.Relay.IsConfigured() {
@@ -1547,6 +1547,7 @@ func startDynamicIMAPServer(ctx context.Context, deps *serverDependencies, serve
 			WarmupMailboxes:              deps.config.LocalCache.WarmupMailboxes,
 			WarmupAsync:                  deps.config.LocalCache.WarmupAsync,
 			WarmupTimeout:                deps.config.LocalCache.WarmupTimeout,
+			WarmupInterval:               deps.config.LocalCache.WarmupInterval,
 			CapabilityFilters:            serverConfig.ClientFilters,
 			DisabledCaps:                 serverConfig.DisabledCaps,
 			AdditionalCaps:               serverConfig.AdditionalCaps,

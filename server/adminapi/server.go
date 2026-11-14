@@ -723,9 +723,9 @@ type KickConnectionsRequest struct {
 	ClientAddr string `json:"client_addr,omitempty"`
 }
 
-// ConnectionInfo is one entry of GET /admin/connections: an account with sessions on
-// one of this node's connection trackers. There is one entry per account and tracker,
-// not per session.
+// ConnectionInfo is one entry of GET /admin/connections and GET
+// /admin/connections/user/{email}: an account on one of this node's connection
+// trackers. There is one entry per account and tracker, not per session.
 type ConnectionInfo struct {
 	Protocol   string    `json:"protocol"` // tracker key up to its first dash, e.g. "IMAP"
 	Instance   string    `json:"instance"` // tracker key, e.g. "IMAP-node1-imap-proxy"
@@ -734,18 +734,6 @@ type ConnectionInfo struct {
 	TotalCount int       `json:"total_count"` // LocalCount plus the sessions other nodes report for the protocol through gossip
 	LastUpdate time.Time `json:"last_update"`
 	Email      string    `json:"email"` // address of the session that created the entry (the recipient on an LMTP proxy)
-}
-
-// UserConnectionInfo is one entry of GET /admin/connections/user/{email}. Unlike
-// ConnectionInfo, Protocol is the whole tracker key, and an account this tracker knows
-// only through gossip is listed too, with LocalCount 0.
-type UserConnectionInfo struct {
-	Protocol   string    `json:"protocol"` // tracker key, e.g. "IMAP-node1-imap-proxy"
-	AccountID  int64     `json:"account_id"`
-	Email      string    `json:"email"`
-	LocalCount int       `json:"local_count"`
-	TotalCount int       `json:"total_count"`
-	LastUpdate time.Time `json:"last_update"`
 }
 
 // Import/Export request types removed - these operations are not suitable
@@ -1365,6 +1353,20 @@ func extractProtocolFromKey(key string) string {
 	return key
 }
 
+// newConnectionInfo is the entry for an account on the tracker keyed trackerKey, with
+// localCount of its sessions on that tracker.
+func newConnectionInfo(trackerKey string, localCount int, conn server.UserConnectionInfo) ConnectionInfo {
+	return ConnectionInfo{
+		Protocol:   extractProtocolFromKey(trackerKey),
+		Instance:   trackerKey,
+		AccountID:  conn.AccountID,
+		LocalCount: localCount,
+		TotalCount: conn.GetTotalCount(),
+		LastUpdate: conn.LastUpdate,
+		Email:      conn.Username,
+	}
+}
+
 func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 	trackers := s.trackers()
 	if len(trackers) == 0 {
@@ -1395,20 +1397,7 @@ func (s *Server) handleListConnections(w http.ResponseWriter, r *http.Request) {
 				continue // Skip - this is only gossip data, not an actual connection on this instance
 			}
 
-			// Extract protocol from tracker key
-			// Key format: "PROTOCOL-node-servername" (proxies) or "PROTOCOL-servername"
-			// Display: Just "PROTOCOL" for simplicity
-			protocol := extractProtocolFromKey(trackerKey)
-
-			allConnections = append(allConnections, ConnectionInfo{
-				Protocol:   protocol,
-				Instance:   trackerKey, // Full key for debugging/filtering
-				AccountID:  connInfo.AccountID,
-				LocalCount: localCount,
-				TotalCount: connInfo.GetTotalCount(),
-				LastUpdate: connInfo.LastUpdate,
-				Email:      connInfo.Username,
-			})
+			allConnections = append(allConnections, newConnectionInfo(trackerKey, localCount, connInfo))
 		}
 	}
 
@@ -1572,29 +1561,37 @@ func (s *Server) handleGetUserConnections(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Collect connections for this user from all trackers
-	// Filter by email string matching (case-insensitive) - no database lookup needed
-	// The connection tracker already stores the username (email) via gossip
-	userConnections := make([]UserConnectionInfo, 0)
-	emailLower := strings.ToLower(email)
+	// A tracker keeps one entry per account ID, with the address of the session that
+	// created it. The address is resolved to its account, as POST /admin/connections/kick
+	// resolves it, so the account's entries are listed whichever of its addresses names
+	// it. An entry created under the address is listed too: a remote lookup account,
+	// which the database does not know, is keyed by an ID derived from the address the
+	// lookup answered, and that is the address its entry keeps.
+	//
+	// Unlike GET /admin/connections, a tracker that knows the account only through
+	// gossip is listed too (local count 0): it reports the sessions on other nodes.
+	var accountID int64 // 0: the database names no account for the address
+	if s.rdb != nil {
+		id, err := s.rdb.GetAccountIDByEmailWithRetry(r.Context(), email)
+		switch {
+		case err == nil:
+			accountID = id
+		case !errors.Is(err, consts.ErrUserNotFound):
+			logger.Warn("HTTP API: Cannot resolve account; listing only the entries created under the address",
+				"name", s.name, "email", email, "error", err)
+		}
+	}
+	userConnections := make([]ConnectionInfo, 0)
 
-	for protocol, tracker := range trackers {
+	for trackerKey, tracker := range trackers {
 		if tracker == nil {
 			continue
 		}
 		instanceID := tracker.GetInstanceID()
 		conns := tracker.GetAllConnections()
 		for _, connInfo := range conns {
-			// Match email case-insensitively
-			if strings.ToLower(connInfo.Username) == emailLower {
-				userConnections = append(userConnections, UserConnectionInfo{
-					Protocol:   protocol,
-					AccountID:  connInfo.AccountID,
-					Email:      connInfo.Username,
-					LocalCount: connInfo.GetLocalCount(instanceID),
-					TotalCount: connInfo.GetTotalCount(),
-					LastUpdate: connInfo.LastUpdate,
-				})
+			if (accountID != 0 && connInfo.AccountID == accountID) || strings.EqualFold(connInfo.Username, email) {
+				userConnections = append(userConnections, newConnectionInfo(trackerKey, connInfo.GetLocalCount(instanceID), connInfo))
 			}
 		}
 	}
@@ -2192,6 +2189,7 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 			},
 			"credential_management": {
 				"GET /admin/credentials/{email}",
+				"DELETE /admin/credentials/{email}",
 			},
 			"message_restoration": {
 				"GET /admin/accounts/{email}/messages/deleted",
@@ -2220,9 +2218,28 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 			"auth_statistics": {
 				"GET /admin/auth/stats",
 				"GET /admin/auth/blocked",
+				"GET /admin/auth-cache/stats",
+			},
+			"proxy_monitoring": {
+				"GET /admin/proxy/backends",
 			},
 			"system_information": {
 				"GET /admin/config",
+			},
+			"mail_delivery": {
+				"POST /admin/mail/deliver",
+			},
+			"acl_management": {
+				"POST /admin/mailboxes/acl/grant",
+				"POST /admin/mailboxes/acl/revoke",
+				"GET /admin/mailboxes/acl",
+			},
+			"affinity_management": {
+				"GET /admin/affinity",
+				"POST /admin/affinity",
+				"DELETE /admin/affinity",
+				"GET /admin/affinity/list",
+				"GET /admin/affinity/stats",
 			},
 		},
 	})

@@ -20,6 +20,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/helpers"
+	"golang.org/x/net/idna"
 )
 
 // ClientCapabilityFilter defines capability filtering rules for specific clients
@@ -300,7 +301,7 @@ type TLSLetsEncryptS3Config struct {
 // TLSLetsEncryptConfig holds Let's Encrypt automatic certificate management configuration
 type TLSLetsEncryptConfig struct {
 	Email           string                 `toml:"email"`            // Email for Let's Encrypt notifications
-	Domains         []string               `toml:"domains"`          // Domains for certificate (supports multiple)
+	Domains         []string               `toml:"domains"`          // Domains for certificate (supports multiple). Loaded as autocert names: lowercase A-labels without a trailing dot (normalizeDomains)
 	DefaultDomain   string                 `toml:"default_domain"`   // Default domain to use when client doesn't provide SNI (optional, defaults to first domain in list)
 	StorageProvider string                 `toml:"storage_provider"` // Certificate storage backend (currently only "s3")
 	S3              TLSLetsEncryptS3Config `toml:"s3"`               // S3 storage configuration
@@ -308,6 +309,50 @@ type TLSLetsEncryptConfig struct {
 	EnableFallback  *bool                  `toml:"enable_fallback"`  // Enable local filesystem fallback when S3 is unavailable (default: true). Pointer so an absent key is distinguishable from an explicit false.
 	FallbackDir     string                 `toml:"fallback_dir"`     // Local directory for certificate fallback when S3 is unavailable (default: "/var/lib/sora/certs")
 	SyncInterval    string                 `toml:"sync_interval"`    // Interval to check S3 for certificate updates (e.g., "5m"). Default: 5m. Set to "0" to disable periodic sync.
+}
+
+// normalizeDomains rewrites domains and default_domain to the names autocert keeps their
+// certificates under. The certificate sync and the startup pre-warm read the cache under
+// the configured names, so a name kept as written ("Mail.Example.com") had the leader's
+// renewals synced into a local file autocert never reads. A name autocert cannot serve is
+// dropped with a warning; autocert.HostWhitelist drops it silently.
+func (c *TLSLetsEncryptConfig) normalizeDomains() {
+	var domains []string
+	for _, configured := range c.Domains {
+		name, err := autocertName(configured)
+		if err != nil {
+			warnf("[tls.letsencrypt] domains: ignoring %q, no certificate can be served for it: %v", configured, err)
+			continue
+		}
+		if !slices.Contains(domains, name) {
+			domains = append(domains, name)
+		}
+	}
+	c.Domains = domains
+
+	if c.DefaultDomain != "" {
+		name, err := autocertName(c.DefaultDomain)
+		if err != nil {
+			warnf("[tls.letsencrypt] default_domain: ignoring %q, clients without SNI get the first domain's certificate: %v", c.DefaultDomain, err)
+		}
+		c.DefaultDomain = name
+	}
+}
+
+// autocertName returns the name autocert keeps a domain's certificates under: the server
+// name folded by idna.Lookup.ToASCII (lowercase, A-label) without a trailing dot, as
+// autocert.Manager.GetCertificate derives it from a ClientHello. It fails for a name
+// GetCertificate refuses.
+func autocertName(domain string) (string, error) {
+	name, err := idna.Lookup.ToASCII(domain)
+	if err != nil {
+		return "", err
+	}
+	name = strings.TrimSuffix(name, ".")
+	if !strings.Contains(strings.Trim(name, "."), ".") {
+		return "", errors.New("server name component count invalid")
+	}
+	return name, nil
 }
 
 // TLSConfig holds TLS/SSL configuration
@@ -1068,7 +1113,7 @@ type ServerLimitsConfig struct {
 	SearchRateLimitBurst  *int   `toml:"search_rate_limit_burst,omitempty"`   // Searches allowed back to back (default: search_rate_limit_per_min)
 	ThreadMaxMessages     int    `toml:"thread_max_messages,omitempty"`       // Maximum matches per THREAD command (IMAP backend only, <=0 uses default: 50000)
 	RedirectRateLimit     *int   `toml:"redirect_rate_limit,omitempty"`       // Redirect rate limit (per account across the window, 0=unlimited, default: 100)
-	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (default: 1h)
+	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (must be positive, default: 1h)
 	MaxRedirectHops       *int   `toml:"max_redirect_hops,omitempty"`         // Max times one message may be redirected before suppression (mail-loop backstop, 0=unlimited, default: 2)
 	SessionMemoryLimit    string `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
 	MaxAuthErrors         int    `toml:"max_auth_errors,omitempty"`           // Maximum authentication errors before disconnection (default: 2)
@@ -2494,6 +2539,16 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	// The Sieve redirect rate limit (LMTP and Admin API delivery) counts the redirects
+	// newer than now - redirect_rate_window. A zero or negative window counts none, so
+	// every redirect would be allowed; redirect_rate_limit = 0 is how the limit is
+	// switched off. An unparsable window falls back to the 1h default at startup.
+	if (s.Type == "lmtp" || s.Type == "http_admin_api") && s.Limits != nil && s.Limits.RedirectRateWindow != "" {
+		if window, err := helpers.ParseDuration(s.Limits.RedirectRateWindow); err == nil && window <= 0 {
+			return fmt.Errorf("server %q: limits.redirect_rate_window must be positive, got %q (set limits.redirect_rate_limit = 0 to disable the limit)", s.Name, s.Limits.RedirectRateWindow)
+		}
+	}
+
 	// A proxy dials a backend address without a port at its remote_port, or at its enabled
 	// lookup's remote_port for a lookup-routed one. No other server reads either, and a
 	// disabled lookup is never initialized.
@@ -2913,6 +2968,23 @@ func LoadConfigFromFileWithMetadata(configPath string, cfg *Config) (toml.MetaDa
 
 	// Trim whitespace from all string fields in the configuration
 	trimStringFields(reflect.ValueOf(cfg).Elem())
+
+	if cfg.TLS.LetsEncrypt != nil {
+		cfg.TLS.LetsEncrypt.normalizeDomains()
+		for i := range cfg.DynamicServers {
+			srv := &cfg.DynamicServers[i]
+			if srv.TLSDefaultDomain == "" {
+				continue
+			}
+			name, err := autocertName(srv.TLSDefaultDomain)
+			if err != nil {
+				warnf("server %q: ignoring tls_default_domain %q, clients without SNI use the global default: %v", srv.Name, srv.TLSDefaultDomain, err)
+			}
+			// The per-listener SNI-less override reaches the same whitelist as
+			// default_domain, before autocert can normalize it itself.
+			srv.TLSDefaultDomain = name
+		}
+	}
 
 	// Apply default values for fields where the Go zero value differs from the desired default
 	applyConfigDefaults(cfg)

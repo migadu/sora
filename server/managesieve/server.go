@@ -285,24 +285,11 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 		serverInstance.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
 	}
 
-	// Create connection limiter with trusted networks from server configuration
-	// For ManageSieve backend:
-	// - If PROXY protocol is enabled: only connections from trusted networks allowed, no per-IP limiting
-	// - If PROXY protocol is disabled: trusted networks bypass per-IP limits, others are limited per-IP
-	var limiterTrustedNets []string
-	var limiterMaxPerIP int
-
-	if options.ProxyProtocol {
-		// PROXY protocol enabled: use trusted networks, disable per-IP limiting
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = 0 // No per-IP limiting when PROXY protocol is enabled
-	} else {
-		// PROXY protocol disabled: use trusted networks for per-IP bypass
-		limiterTrustedNets = options.TrustedNetworks
-		limiterMaxPerIP = options.MaxConnectionsPerIP
-	}
-
-	serverInstance.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, limiterMaxPerIP, limiterTrustedNets)
+	// Create the connection limiter. max_connections_per_ip counts the client a PROXY
+	// header names when there is one, else the socket peer, and trusted_networks
+	// exempt the counted address: a trusted proxy or load balancer passes the limit
+	// on to its clients and is only exempt itself when it names none.
+	serverInstance.limiter = serverPkg.NewConnectionLimiterWithTrustedNets("ManageSieve", options.MaxConnections, options.MaxConnectionsPerIP, options.TrustedNetworks)
 
 	// Set listen backlog with reasonable default
 	serverInstance.listenBacklog = options.ListenBacklog
@@ -790,12 +777,18 @@ func (s *ManageSieveServer) ReloadConfig(cfg config.ServerConfig) error {
 	var reloaded []string
 	next := *s.settings.Load()
 
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("ManageSieve config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 		reportCommandTimeout(timeout)
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("ManageSieve config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}

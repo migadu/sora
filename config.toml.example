@@ -602,7 +602,7 @@ capacity = "1gb"              # Maximum total cache size (e.g., "100mb", "1gb").
 max_object_size = "5mb"       # Maximum size for individual cached objects. Prevents large messages from dominating cache.
 metrics_interval = "5m"       # How often cache hit/miss ratios are stored in the database.
 metrics_retention = "30d"     # How long to retain cache metrics in the database.
-purge_interval = "12h"        # How often to run cache cleanup (capacity enforcement, stale entry removal).
+purge_interval = "12h"        # How often to run cache cleanup (orphaned and stale entry removal, capacity re-check). Capacity is also enforced as objects are added.
 orphan_cleanup_age = "30d"    # Minimum age before orphaned cache entries (for deleted DB messages) are removed.
 
 # --- CACHE WARMUP ---
@@ -978,8 +978,10 @@ shard_count = 0  # Default: 0 (runtime.NumCPU())
 # Note: Debug logging is now configured per-server using the 'debug' option on individual servers
 
 # --- TRUSTED NETWORKS ---
-# Hosts trusted to (a) assert a client IP via PROXY protocol / XCLIENT / IMAP ID, and
-# (b) skip auth rate limiting (unless auth_rate_limit.exempt_networks overrides this).
+# Hosts trusted to (a) assert a client IP via PROXY protocol / XCLIENT / IMAP ID,
+# (b) skip auth rate limiting (unless auth_rate_limit.exempt_networks overrides this), and
+# (c) skip max_connections_per_ip. With a PROXY header that limit counts the client the
+#     header names, and (c) applies to that client, not to the proxy that sent it.
 #
 # EMPTY BY DEFAULT (fail-closed): no host is trusted. Set it to the IPs/CIDRs of YOUR
 # proxies — keep it as narrow as possible. Do NOT list whole private ranges
@@ -1033,7 +1035,7 @@ debug = false                 # Enable debug logging for this IMAP server
 
 # --- CONNECTION LIMITING AND MEMORY MANAGEMENT ---
 max_connections = 1000              # Maximum concurrent IMAP connections to this server instance.
-max_connections_per_ip = 200        # Max connections per IP. High enough for corporate gateways (~40 users), catches DoS. Set to 0 if behind load balancer.
+max_connections_per_ip = 200        # Max connections per IP. High enough for corporate gateways (~40 users), catches DoS. With proxy_protocol it counts the client the PROXY header names; set 0 to leave it to the proxies in front.
 max_connections_per_user = 15       # Max authenticated connections per user across all IPs. 0 = unlimited. (Requires connection tracking)
 max_connections_per_user_per_ip = 5 # Max connections per user from same IP. KEY PROTECTION against buggy clients & brute force. 0 = unlimited.
 listen_backlog = 4096               # TCP listen backlog size (0 = default 1024). Prevents connection delays under high load.
@@ -1248,7 +1250,10 @@ limits.thread_max_messages = 50000
 # limits.preview_s3_node_per_min = 3000  # For the whole server per minute (default: 3000, 0 = unlimited).
 # limits.preview_s3_max_size = "5mb"     # Largest message downloaded (unset or 0: [local_cache] max_object_size).
 limits.redirect_rate_limit = 100         # Maximum SIEVE redirects per user (default: 100, set to 0 to disable).
-limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h"). The cleaner keeps
+limits.redirect_rate_window = "1h"       # Time window for redirect rate limiting (default: "1h"). Must be positive
+                                         # on lmtp and http_admin_api servers: sora refuses to start with a zero or
+                                         # negative window, and a SIGHUP reload with one keeps that server's running
+                                         # settings (disable the limit with redirect_rate_limit = 0). The cleaner keeps
                                          # the redirect records for [cleanup] grace_period or the longest window of
                                          # the LMTP and Admin API servers on the node that runs it, whichever is
                                          # longer. A window longer than grace_period needs that window on every

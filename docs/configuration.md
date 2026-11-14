@@ -164,9 +164,11 @@ Proxy servers also support the same multi-layered timeout protection as direct p
 *   `absolute_session_timeout`: Maximum total session duration (default: `"24h"`, or `"5m"` for `lmtp_proxy`). Set `"0"` to disable this limit. Defaults are the same at startup and after SIGHUP.
 *   `min_bytes_per_minute`: Slowloris guard, same semantics as for backends (default: `0`, disabled).
 
-Timeout settings reloaded by SIGHUP apply to new connections. Changing `debug` on
-`lmtp`, `lmtp_proxy`, or `imap_proxy` requires a restart because their protocol
-writers are configured at startup; SIGHUP reports that requirement.
+Timeout settings reloaded by SIGHUP apply to new connections. A reloaded value that
+does not parse is logged at WARN and the running value is kept (at startup it falls
+back to the default). Changing `debug` on `lmtp`, `lmtp_proxy`, or `imap_proxy`
+requires a restart because their protocol writers are configured at startup; SIGHUP
+reports that requirement.
 
 **Important:** When configuring timeout values for proxies, ensure the proxy's `command_timeout` is **longer** than any backend timeout values (including `proxy_protocol_timeout` if PROXY protocol is enabled on backends). This prevents the proxy from timing out while waiting for backend responses.
 

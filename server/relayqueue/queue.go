@@ -419,7 +419,7 @@ func (q *DiskQueue) Enqueue(from, to, messageType string, messageBytes []byte) e
 	// becoming visible must imply the body is already on disk. The reverse order
 	// leaves an undeliverable .json behind if the process dies between the two writes.
 	messagePath := filepath.Join(q.pendingDir, id+".msg")
-	if err := q.writeDataAtomic(messagePath, messageBytes); err != nil {
+	if err := q.writeDataAtomic(messagePath, messageBytes, nil); err != nil {
 		metrics.RelayQueueOperations.WithLabelValues("enqueue", "error").Inc()
 		metrics.RelayQueueOperationDuration.WithLabelValues("enqueue").Observe(time.Since(start).Seconds())
 		return fmt.Errorf("failed to write message: %w", err)
@@ -449,6 +449,12 @@ func (q *DiskQueue) Enqueue(from, to, messageType string, messageBytes []byte) e
 // server's worker picking it up on its next resync - always finds the whole body. The
 // failed copy is removed only after that: a crash in between leaves the message in both
 // queues, never in neither.
+//
+// It runs in sora-admin, often as root, while the server reads pending/ as its own
+// user: a 0600 file root wrote there is one the server cannot open, so the message
+// would sit in pending/, logged as unreadable on every resync. The copies are given to
+// the owner of the pending directory before they get their names, as the server's own
+// moves (renames) keep theirs.
 func (q *DiskQueue) Requeue(messageID string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -469,13 +475,22 @@ func (q *DiskQueue) Requeue(messageID string) error {
 	metadata.LastAttempt = time.Time{}
 	metadata.NextRetry = time.Now()
 	metadata.Errors = []string{}
+	metadataBytes, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("could not marshal metadata: %w", err)
+	}
+
+	owner, err := foreignOwner(q.pendingDir)
+	if err != nil {
+		return fmt.Errorf("could not look up the owner of the pending queue: %w", err)
+	}
 
 	metadataPath := filepath.Join(q.pendingDir, messageID+".json")
 	messagePath := filepath.Join(q.pendingDir, messageID+".msg")
-	if err := q.writeDataAtomic(messagePath, messageBytes); err != nil {
+	if err := q.writeDataAtomic(messagePath, messageBytes, owner); err != nil {
 		return fmt.Errorf("could not write message body to pending: %w", err)
 	}
-	if err := q.writeFileAtomic(metadataPath, metadata); err != nil {
+	if err := q.writeDataAtomic(metadataPath, metadataBytes, owner); err != nil {
 		// The rename may have happened before the error (a failed directory fsync), so
 		// withdraw the metadata before the body it points at.
 		os.Remove(metadataPath)
@@ -857,8 +872,16 @@ func (q *DiskQueue) writeFileAtomic(path string, data any) error {
 		return err
 	}
 
-	return q.writeDataAtomic(path, jsonBytes)
+	return q.writeDataAtomic(path, jsonBytes, nil)
 }
+
+// fileOwner is the user and group a file written by writeDataAtomic is given.
+type fileOwner struct {
+	uid, gid int
+}
+
+// chownFile is (*os.File).Chown, replaced in tests to see which files are given away.
+var chownFile = (*os.File).Chown
 
 // writeDataAtomic writes raw bytes to a file atomically using temp file + rename.
 // Both the data and the directory entry are fsynced: for a Sieve redirect without
@@ -867,7 +890,8 @@ func (q *DiskQueue) writeFileAtomic(path string, data any) error {
 // land the new name over an unwritten (zero-length) body that would then be relayed.
 // Reporting a sync failure is safe: LMTP falls back to local delivery when Enqueue
 // fails, and the other callers leave the message in processing/ for crash recovery.
-func (q *DiskQueue) writeDataAtomic(path string, data []byte) error {
+// A non-nil owner is given the file before it gets its name; nil keeps the writer's.
+func (q *DiskQueue) writeDataAtomic(path string, data []byte, owner *fileOwner) error {
 	dir := filepath.Dir(path)
 	tmpFile, err := os.CreateTemp(dir, tempFilePrefix)
 	if err != nil {
@@ -875,11 +899,18 @@ func (q *DiskQueue) writeDataAtomic(path string, data []byte) error {
 	}
 	tmpPath := tmpFile.Name()
 
-	// Write, flush to stable storage, and close
+	// Write, hand over, flush to stable storage, and close
 	if _, err := tmpFile.Write(data); err != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
 		return err
+	}
+	if owner != nil {
+		if err := chownFile(tmpFile, owner.uid, owner.gid); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return err
+		}
 	}
 	if err := tmpFile.Sync(); err != nil {
 		tmpFile.Close()

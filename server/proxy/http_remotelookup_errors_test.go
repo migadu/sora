@@ -293,6 +293,34 @@ func TestHTTPRemoteLookupNetworkError(t *testing.T) {
 	t.Logf("✓ Network error correctly returns AuthTemporarilyUnavailable with ErrRemoteLookupTransient: %v", err)
 }
 
+// TestHTTPRemoteLookupUnbuildableRequestIsUnavailable (#518): a lookup whose request
+// cannot be built gives no verdict on the user either. $email in the host passes the URL
+// check at startup, but the escaped address ("user%40example.com") is not a valid host,
+// so every request fails before it is sent. That was AuthFailed with an error the
+// proxies did not classify, and they fell back to the database.
+func TestHTTPRemoteLookupUnbuildableRequestIsUnavailable(t *testing.T) {
+	client := NewHTTPRemoteLookupClient(
+		"https://$email.lookup.example.com/lookup",
+		time.Second,
+		"",
+		143,
+		false, // remoteTLS
+		false, // remoteTLSUseStartTLS
+		false, // remoteTLSVerify
+		false, // remoteUseProxyProtocol
+		false, // remoteUseIDCommand
+		false, // remoteUseXCLIENT
+		false, // remoteUseUTF8
+		nil,   // circuit breaker settings (use defaults)
+		nil,   // transport settings (use defaults)
+	)
+
+	_, authResult, err := client.LookupUserRoute(context.Background(), "user@example.com", "secret")
+	if authResult != AuthTemporarilyUnavailable || !errors.Is(err, ErrRemoteLookupTransient) {
+		t.Fatalf("lookup with a request that cannot be built: %v, %v; want %v with ErrRemoteLookupTransient", authResult, err, AuthTemporarilyUnavailable)
+	}
+}
+
 // TestHTTPRemoteLookupCircuitBreaker verifies that circuit breaker open returns ErrRemoteLookupTransient
 func TestHTTPRemoteLookupCircuitBreaker(t *testing.T) {
 	// Create a server that always fails

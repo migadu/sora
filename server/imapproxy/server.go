@@ -547,10 +547,11 @@ func (s *Server) acceptConnections() error {
 			}
 		}
 
-		// Check connection limits before processing
+		// Check connection limits before processing. Behind a PROXY-protocol load
+		// balancer the per-IP limit counts the client its header names.
 		var releaseConn func()
 		if s.limiter != nil {
-			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), "")
+			releaseConn, err = s.limiter.AcceptWithRealIP(conn.RemoteAddr(), server.GetRealClientIP(conn, server.GetProxyProtocolInfo(conn)))
 			if err != nil {
 				logger.Info("Connection rejected", "proxy", s.name, "error", err)
 				conn.Close()
@@ -803,15 +804,23 @@ func (s *Server) ReloadConfig(cfg config.ServerConfig) error {
 		next.maxAuthErrors = newVal
 		reloaded = append(reloaded, "max_auth_errors")
 	}
-	if timeout := cfg.GetAuthIdleTimeoutWithDefault(); timeout != next.authIdleTimeout {
+	// A value that does not parse keeps the running one (start-up, which has none,
+	// uses the default).
+	if timeout, err := cfg.GetAuthIdleTimeout(); err != nil {
+		logger.Warn("IMAP proxy config reload: invalid auth_idle_timeout, keeping the running value", "name", s.name, "error", err, "running", next.authIdleTimeout)
+	} else if timeout != next.authIdleTimeout {
 		next.authIdleTimeout = timeout
 		reloaded = append(reloaded, "auth_idle_timeout")
 	}
-	if timeout, err := cfg.GetCommandTimeout(); err == nil && timeout != next.commandTimeout {
+	if timeout, err := cfg.GetCommandTimeout(); err != nil {
+		logger.Warn("IMAP proxy config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
+	} else if timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 	}
-	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err == nil && timeout != next.absoluteSessionTimeout {
+	if timeout, err := cfg.GetAbsoluteSessionTimeout(); err != nil {
+		logger.Warn("IMAP proxy config reload: invalid absolute_session_timeout, keeping the running value", "name", s.name, "error", err, "running", next.absoluteSessionTimeout)
+	} else if timeout != next.absoluteSessionTimeout {
 		next.absoluteSessionTimeout = timeout
 		reloaded = append(reloaded, "absolute_session_timeout")
 	}

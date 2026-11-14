@@ -173,13 +173,14 @@ curl -X POST http://localhost:8080/admin/accounts \
 **Endpoint:** `GET /admin/accounts/{email}`
 
 Retrieve detailed information about an account including credentials, mailbox count, and message count.
+`deleted_at` is present only while the account is soft-deleted, and `purge_requested_at` only while a
+requested purge is pending.
 
 **Response:** `200 OK`
 ```json
 {
   "account_id": 123,
   "created_at": "2024-01-15T10:30:00Z",
-  "deleted_at": null,
   "primary_email": "user@example.com",
   "status": "active",
   "credentials": [
@@ -372,10 +373,14 @@ Add a new email alias to an existing account.
 **Response:** `201 Created`
 ```json
 {
-  "email": "newalias@example.com",
+  "new_email": "newalias@example.com",
   "message": "Credential added successfully"
 }
 ```
+
+**Errors:**
+- `404 Not Found`: no account in service has the address in the path
+- `409 Conflict`: the new address is already a credential
 
 **Example:**
 ```bash
@@ -529,26 +534,33 @@ Get the number of active connections on this node, every session counted, in tot
 
 **Endpoint:** `POST /admin/connections/kick`
 
-Mark connections for termination based on criteria.
+End a user's sessions. The kick is issued on this node's connection trackers and broadcast to
+the cluster, where each node ends the account's sessions within seconds and drops its cached
+logins. `user_email` is required; `protocol` (IMAP, POP3, ManageSieve or LMTP, any case) limits
+the kick to the trackers of that protocol.
 
 **Request Body:**
 ```json
 {
   "user_email": "user@example.com",
-  "protocol": "IMAP",
-  "server_addr": "10.0.1.10:143",
-  "client_addr": "192.168.1.100",
-  "all": false
+  "protocol": "IMAP"
 }
 ```
 
-**Response:** `200 OK`
+**Response:** `200 OK`. `protocols` lists the keys of the trackers the kick was issued on.
 ```json
 {
-  "message": "Connections marked for termination",
-  "connections_marked": 5
+  "message": "User kicked successfully via gossip protocol",
+  "user": "user@example.com",
+  "protocols": ["IMAP-node1-imap-proxy"],
+  "note": "Kick event broadcast to cluster. Connections will be terminated within seconds."
 }
 ```
+
+**Errors:**
+- `400 Bad Request`: `user_email` is missing
+- `404 Not Found`: no tracker on this node serves the requested `protocol`
+- `503 Service Unavailable`: this node has no connection trackers
 
 **Example (Kick all connections for a user):**
 ```bash
@@ -564,7 +576,7 @@ curl -X POST http://localhost:8080/admin/connections/kick \
 
 **Endpoint:** `GET /admin/connections/user/{email}`
 
-Get the user's entries on this node's connection trackers, matched case-insensitively against each entry's `email`: an account whose entry was created by an alias login is found only under that alias. Unlike `GET /admin/connections`, `protocol` is the whole tracker key, there is no `instance`, and a tracker that knows the account only through gossip is listed with `local_count` 0.
+Get the user's entries on this node's connection trackers. The address is resolved to its account in the database, as `POST /admin/connections/kick` resolves it, so the account's entries are listed whichever of its addresses names it. An entry whose `email` is the address (case-insensitively) is listed too: that is how a remote lookup account, which the database does not know, is found. The entries are those of `GET /admin/connections`, but a tracker that knows the account only through gossip is listed too, with `local_count` 0.
 
 **Response:** `200 OK`
 ```json
@@ -572,7 +584,8 @@ Get the user's entries on this node's connection trackers, matched case-insensit
   "email": "user@example.com",
   "connections": [
     {
-      "protocol": "IMAP-node1-imap-proxy",
+      "protocol": "IMAP",
+      "instance": "IMAP-node1-imap-proxy",
       "account_id": 123,
       "email": "user@example.com",
       "local_count": 2,
@@ -868,24 +881,23 @@ Get API configuration and available endpoints.
 
 **Endpoint:** `GET /admin/config`
 
-Get API version, features, and available endpoints.
+Get the enabled features and every endpoint of the API, grouped by area.
 
-**Response:** `200 OK`
+**Response:** `200 OK` (shortened)
 ```json
 {
-  "api_version": "v1",
-  "server_type": "admin",
+  "server_type": "sora-http-api",
   "features_enabled": {
-    "cache": true,
-    "health_monitoring": true,
-    "mail_delivery": true
+    "account_management": true,
+    "cache_management": true,
+    "health_monitoring": true
   },
   "endpoints": {
-    "accounts": ["GET", "POST", "PUT", "DELETE"],
-    "connections": ["GET"],
-    "cache": ["GET", "POST"],
-    "health": ["GET"],
-    "mail": ["POST"]
+    "credential_management": [
+      "GET /admin/credentials/{email}",
+      "DELETE /admin/credentials/{email}"
+    ],
+    "mail_delivery": ["POST /admin/mail/deliver"]
   }
 }
 ```
