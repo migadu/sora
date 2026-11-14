@@ -2477,8 +2477,10 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 	logger.Info("Upload phase complete", "uploaded", len(uploaded), "batch_size", len(batch))
 
 	if len(uploaded) == 0 {
-		logger.Warn("All S3 uploads in batch failed")
-		atomic.AddInt64(&i.failedMessages, int64(len(batch)))
+		// uploadBatchToS3 already counted and recorded each message it dropped. The
+		// others were skipped by a cancellation, which importMessages reports: they
+		// were never attempted, so they are not failures.
+		logger.Warn("No message in the batch was uploaded", "batch_size", len(batch))
 		return nil
 	}
 
