@@ -131,6 +131,15 @@ func (l *AdvisoryLockTx) Lock(ctx context.Context, id int64) error {
 	})
 }
 
+// LockS3ObjectsShared is LockS3ObjectsSharedInTx on the lock transaction, for work that
+// claims the objects across S3 round trips and transactions of its own. Cancel ctx to
+// stop waiting; the transaction is then aborted and must be released.
+func (l *AdvisoryLockTx) LockS3ObjectsShared(ctx context.Context, accountID int64, contentHashes []string) error {
+	return l.run(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		return LockS3ObjectsSharedInTx(ctx, tx, accountID, contentHashes)
+	})
+}
+
 // TryLock takes the advisory lock id if it is free and reports whether it did.
 func (l *AdvisoryLockTx) TryLock(ctx context.Context, id int64) (bool, error) {
 	var acquired bool
