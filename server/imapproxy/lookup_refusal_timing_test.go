@@ -14,18 +14,20 @@ import (
 	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/testutils"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // lookupRefusal is what two logins with the same wrong password leave behind.
 type lookupRefusal struct {
-	errs     [2]string
-	verified bool  // the first refusal took at least half a password verification
-	failures int32 // failed attempts charged to the auth rate limiter
-	lookups  int32 // requests that reached the lookup service
-	cached   bool  // a lookup-cache entry was written for the user
+	errs          [2]string
+	verifications [2]int // password verifications each login ran
+	failures      int32  // failed attempts charged to the auth rate limiter
+	lookups       int32  // requests that reached the lookup service
+	cached        bool   // a lookup-cache entry was written for the user
 }
 
-func refuseTwiceAgainstLookup(t *testing.T, verification time.Duration, answer http.HandlerFunc) lookupRefusal {
+func refuseTwiceAgainstLookup(t *testing.T, answer http.HandlerFunc) lookupRefusal {
 	t.Helper()
 	var lookups atomic.Int32
 	lookup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,11 +52,9 @@ func refuseTwiceAgainstLookup(t *testing.T, verification time.Duration, answer h
 	var out lookupRefusal
 	for i := range out.errs {
 		client, remote := net.Pipe()
-		start := time.Now()
+		before := testutils.PasswordVerifications()
 		out.errs[i] = fmt.Sprint(newSession(srv, remote).authenticateUser("anna@example.com", "wrong-password"))
-		if i == 0 {
-			out.verified = time.Since(start) >= verification/2
-		}
+		out.verifications[i] = testutils.PasswordVerifications() - before
 		client.Close()
 		remote.Close()
 	}
@@ -71,32 +71,27 @@ func refuseTwiceAgainstLookup(t *testing.T, verification time.Duration, answer h
 // whether the lookup service knows the address. Before the fix a 404 or 3xx (with
 // lookup_local_users off) and a 401 or 403 were refused without a verification, and a
 // 404 or 3xx was not cached, so a repeat of the same password asked the service again.
+//
+// The verifications are counted, not timed (#782): a wall-clock floor calibrated
+// under CPU contention fails a correct login that runs after the contention eases.
+// The dummy hash follows BcryptCost, so a refusal verifying it does the same bcrypt
+// work as one verifying the returned hash (TestDummyBcryptHash_Valid), and the cheapest
+// cost keeps the test fast.
 func TestIMAPProxyLookupRefusalsLookAlike(t *testing.T) {
-	// Cost 10 keeps one verification in the tens of milliseconds, far above a lookup
-	// round trip on loopback. The dummy hash follows BcryptCost.
 	origCost := db.BcryptCost
-	db.BcryptCost = 10
+	db.BcryptCost = bcrypt.MinCost
 	t.Cleanup(func() { db.BcryptCost = origCost })
 
 	hash, err := db.GenerateBcryptHash("right-password")
 	if err != nil {
 		t.Fatalf("GenerateBcryptHash: %v", err)
 	}
-	// One password verification. Load only ever adds time, so the fastest of a few runs
-	// is the floor.
-	db.DummyVerifyPassword("warm-up") // generates the dummy hash at this cost
-	verification := time.Duration(1 << 62)
-	for range 3 {
-		start := time.Now()
-		db.DummyVerifyPassword("wrong-password")
-		verification = min(verification, time.Since(start))
-	}
 
-	known := refuseTwiceAgainstLookup(t, verification, func(w http.ResponseWriter, r *http.Request) {
+	known := refuseTwiceAgainstLookup(t, func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"address": "anna@example.com", "password_hash": hash})
 	})
-	if !known.verified || known.lookups != 1 || !known.cached {
-		t.Fatalf("known address, wrong password: %+v; want a verification, one lookup and a cached refusal", known)
+	if known.verifications[0] != 1 || known.lookups != 1 || !known.cached {
+		t.Fatalf("known address, wrong password: %+v; want one verification, one lookup and a cached refusal", known)
 	}
 	for _, c := range []struct {
 		name   string
@@ -108,7 +103,7 @@ func TestIMAPProxyLookupRefusalsLookAlike(t *testing.T) {
 		{"403", func(w http.ResponseWriter, r *http.Request) { http.Error(w, "refused", http.StatusForbidden) }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			if got := refuseTwiceAgainstLookup(t, verification, c.answer); got != known {
+			if got := refuseTwiceAgainstLookup(t, c.answer); got != known {
 				t.Errorf("lookup answered %s: %+v\nknown address, wrong password: %+v", c.name, got, known)
 			}
 		})
