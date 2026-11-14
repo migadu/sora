@@ -237,7 +237,7 @@ func TestImporter_DryRunPreviewsTheImport(t *testing.T) {
 
 // TestImporter_DovecotKeywordsPerFolder: the keyword letters in a maildir filename
 // index the dovecot-keywords file of that message's folder, and a folder without one
-// has no keywords (Dovecot maildir-keywords.c clears the list on ENOENT). The dry-run
+// names none (Dovecot maildir-keywords.c clears the list on ENOENT). The dry-run
 // listing must show each message's flags as the import stores them, and neither may
 // read a folder's letters through INBOX's file at the maildir root.
 func TestImporter_DovecotKeywordsPerFolder(t *testing.T) {
