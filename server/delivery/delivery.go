@@ -422,6 +422,11 @@ func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string)
 
 	lookupAddress := toAddress.BaseAddress()
 
+	// Recipient existence is a delivery verdict: a replica may not have replayed
+	// a new account or its deletion yet. Read the writer before accepting or
+	// permanently refusing the recipient, as the rest of the delivery does.
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+
 	// Lookup user account and get primary address in one query
 	// This finds the account by alias/recipient address, but returns the primary address
 	var AccountID int64

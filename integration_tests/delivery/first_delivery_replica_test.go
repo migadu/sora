@@ -25,7 +25,9 @@ import (
 //
 // The read pool is a migrated database holding only the account and its credentials:
 // a replica that has replayed the account's creation but none of this delivery's
-// writes. The calls are the ones the Admin API makes for each recipient.
+// writes. Further cases leave creation or deletion unreplayed, so recipient
+// existence must also come from the writer. The calls are the ones the Admin API
+// makes for each recipient.
 func TestDelivery_FirstDeliveryReadsTheDefaultMailboxesFromTheWriter(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	rdb := common.SetupTestDatabase(t)
@@ -44,13 +46,17 @@ func TestDelivery_FirstDeliveryReadsTheDefaultMailboxesFromTheWriter(t *testing.
 	uploader := common.NewSyncUploaderWithS3(t, rdb, fake, "first-delivery-host")
 
 	cases := []struct {
-		name   string
-		header string // an extra header line
-		want   string
+		name      string
+		header    string // an extra header line
+		want      string
+		replicate bool
+		deleted   bool
 	}{
-		{name: "INBOX", want: "INBOX"},
+		{name: "INBOX", want: "INBOX", replicate: true},
 		// The default script files spam into Junk, another default mailbox.
-		{name: "Junk", header: "X-Spam: Yes\r\n", want: "Junk"},
+		{name: "Junk", header: "X-Spam: Yes\r\n", want: "Junk", replicate: true},
+		{name: "account creation not replayed", want: "INBOX"},
+		{name: "account deletion not replayed", replicate: true, deleted: true},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -62,7 +68,12 @@ func TestDelivery_FirstDeliveryReadsTheDefaultMailboxesFromTheWriter(t *testing.
 			mailboxes, err := rdb.GetMailboxesWithRetry(ctx, accountID, false)
 			require.NoError(t, err)
 			require.Empty(t, mailboxes, "the account must not have its default mailboxes yet")
-			replicateAccount(t, rdb, replica, accountID)
+			if tc.replicate {
+				replicateAccount(t, rdb, replica, accountID)
+			}
+			if tc.deleted {
+				require.NoError(t, rdb.DeleteAccountWithRetry(ctx, email))
+			}
 
 			dctx := &delivery.DeliveryContext{
 				Ctx:          ctx,
@@ -78,6 +89,11 @@ func TestDelivery_FirstDeliveryReadsTheDefaultMailboxesFromTheWriter(t *testing.
 			}
 
 			recipient, err := dctx.LookupRecipient(ctx, email)
+			if tc.deleted {
+				require.ErrorContains(t, err, "recipient not found")
+				require.Nil(t, recipient, "a stale replica must not allow delivery to a deleted account")
+				return
+			}
 			require.NoError(t, err)
 			require.Equal(t, accountID, recipient.AccountID)
 
