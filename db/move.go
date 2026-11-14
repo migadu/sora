@@ -166,7 +166,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		_, err = tx.Exec(ctx, `
 			WITH src_data AS (
 				SELECT
-					m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
+					m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to, m."references",
 					m.subject, m.sent_date, m.internal_date, m.size,
 					m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
@@ -177,14 +177,14 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 			),
 			inserted AS (
 				INSERT INTO messages (
-					account_id, content_hash, uploaded, message_id, in_reply_to,
+					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
 					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
 					mailbox_id, mailbox_path, created_modseq, uid
 				)
 				SELECT
-					account_id, content_hash, uploaded, message_id, in_reply_to,
+					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
 					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
@@ -222,7 +222,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		_, err = tx.Exec(ctx, `
 			WITH src_data AS (
 				SELECT
-					m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
+					m.content_hash, m.uploaded, m.message_id, m.in_reply_to, m."references",
 					m.subject, m.sent_date, m.internal_date, m.size,
 					m.body_structure, m.recipients_json,
 					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
@@ -235,7 +235,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 			),
 			inserted AS (
 				INSERT INTO messages (
-					account_id, content_hash, uploaded, message_id, in_reply_to,
+					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
 					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
@@ -244,7 +244,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 				SELECT
 					$6 AS account_id, content_hash,
 					CASE WHEN src_account_id = $6 THEN uploaded ELSE content_hash = ANY($9::text[]) END AS uploaded,
-					message_id, in_reply_to,
+					message_id, in_reply_to, "references",
 					subject, sent_date, internal_date, size,
 					body_structure, recipients_json,
 					-- Same-account moves keep the source row's S3 key (the object lives there);
