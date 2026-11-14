@@ -19,8 +19,7 @@ import (
 // These pin the schemas to the keys json.Marshal emits and to the JSON type of each.
 
 func TestOpenAPIMessageMatchesWireFormat(t *testing.T) {
-	// recipients is declared but never set: setRecipients fills from, to, cc and bcc.
-	assertSchemaMatchesWire(t, "Message", filledWireShapes[db.DBMessage](t), "recipients")
+	assertSchemaMatchesWire(t, "Message", filledWireShapes[db.DBMessage](t))
 }
 
 func TestOpenAPIFilterMatchesWireFormat(t *testing.T) {
