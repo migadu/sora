@@ -51,7 +51,7 @@ type HTTPRemoteLookupClient struct {
 	authToken              string // Bearer token for HTTP authentication
 	client                 *http.Client
 	breaker                *circuitbreaker.CircuitBreaker
-	remotePort             int // Default port for backend connections when not in server address
+	remotePort             int // Port for a server address without one (0 = leave it port-less)
 	remoteTLS              bool
 	remoteTLSUseStartTLS   bool
 	remoteTLSVerify        bool
@@ -512,24 +512,11 @@ func (c *HTTPRemoteLookupClient) verifyPassword(password, hash string) bool {
 	return err == nil
 }
 
-// normalizeServerAddress ensures the server address has a port
+// normalizeServerAddress gives a server address without a port the client's default
+// port, the same way a port-less pool or remote_addrs backend gets the proxy's
+// remote_port (a bare IPv6 literal is one host, not host:port).
 func (c *HTTPRemoteLookupClient) normalizeServerAddress(addr string) string {
-	addr = strings.TrimSpace(addr)
-	if addr == "" {
-		return addr
-	}
-
-	// If already has port, return as-is
-	if strings.Contains(addr, ":") {
-		return addr
-	}
-
-	// Add configured default port, or 143 if not specified
-	defaultPort := c.remotePort
-	if defaultPort == 0 {
-		defaultPort = 143 // Default IMAP port
-	}
-	return fmt.Sprintf("%s:%d", addr, defaultPort)
+	return normalizeHostPort(strings.TrimSpace(addr), c.remotePort)
 }
 
 // DeriveAccountIDFromEmail creates a stable, unique int64 ID from an email address

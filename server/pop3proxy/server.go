@@ -223,7 +223,7 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	// Initialize remotelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
 	if options.RemoteLookup != nil && options.RemoteLookup.Enabled {
-		remotelookupClient, err := proxy.InitializeRemoteLookup("pop3", options.RemoteLookup)
+		remotelookupClient, err := proxy.InitializeRemoteLookup("pop3", options.RemoteLookup, options.RemotePort)
 		if err != nil {
 			logger.Debug("POP3 Proxy: Failed to initialize remotelookup client", "proxy", options.Name, "error", err)
 			if !options.RemoteLookup.ShouldLookupLocalUsers() {

@@ -167,7 +167,7 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	// Initialize remotelookup client if configured
 	var routingLookup proxy.UserRoutingLookup
 	if opts.RemoteLookup.Enabled {
-		remotelookupClient, err := proxy.InitializeRemoteLookup("lmtp", opts.RemoteLookup)
+		remotelookupClient, err := proxy.InitializeRemoteLookup("lmtp", opts.RemoteLookup, opts.RemotePort)
 		if err != nil {
 			logger.Debug("LMTP Proxy: Failed to initialize remotelookup client", "name", opts.Name, "error", err)
 			if !opts.RemoteLookup.ShouldLookupLocalUsers() {

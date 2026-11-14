@@ -1651,7 +1651,9 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # - server: Backend server address - can be IP/hostname:port OR just IP/hostname (string)
 #   * If port is included: "192.168.1.10:143" or "backend.example.com:993"
 #   * If port is omitted: "192.168.1.10" or "backend.example.com"
-#     → Port from remote_port config will be appended (default: 143)
+#     → The remote_port below is appended; without it the proxy's own remote_port,
+#       and without that the protocol's standard port (IMAP 143, POP3 110,
+#       ManageSieve 4190, LMTP 24). A bare IPv6 address is a host without a port.
 # - account_id: Account ID for tracking/metrics (integer, must be > 0)
 #
 # Example JSON Response (with port):
@@ -1678,7 +1680,7 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # - If HTTP endpoint returns 401/403 → authentication rejected (no fallback)
 # - If HTTP endpoint returns other 4xx/5xx → service unavailable, ALWAYS reject (no fallback)
 # - If HTTP endpoint returns 200 with data but auth fails → connection REJECTED (no fallback)
-# - Server addresses normalized: missing ports use remote_port default (e.g., 143 for IMAP)
+# - Server addresses normalized: a missing port is filled in as described for "server" above
 # - Timeout for HTTP requests is configurable (default: 5s)
 #
 # ALIAS RESOLUTION:
@@ -1780,7 +1782,7 @@ lookup_local_users = true             # Check local DB when remote returns 404/3
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
 remote_tls_verify = true              # Verify backend TLS certificates
-# remote_port = 143                   # Default port to append if server address doesn't include port (default: 143)
+# remote_port = 143                   # Port to append if the server address has none (default: the proxy's remote_port, else the protocol's standard port)
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
 remote_use_id_command = false         # Send IMAP ID command to backends (IMAP only)
 # restrict_to_pool = false            # SSRF defense (routing mode). When true, a backend
