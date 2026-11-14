@@ -45,9 +45,13 @@ func (g *gateCounter) Stop()                                                    
 
 // passwordVerification raises the bcrypt cost for the rest of the test (the
 // integration harness runs at the minimum, where a verification is no slower than
-// a database round trip) and returns the time one password verification takes. Load
-// only ever adds time, so the fastest of a few runs is the floor.
+// a database round trip) and estimates the time one verification takes. Scheduling
+// can inflate even the fastest sample, so timing assertions run outside -short
+// (#782); short runs retain the functional and accounting checks.
 func passwordVerification(t *testing.T) time.Duration {
+	if testing.Short() {
+		return 0
+	}
 	saved := db.BcryptCost
 	db.BcryptCost = 10
 	t.Cleanup(func() { db.BcryptCost = saved })
@@ -72,8 +76,8 @@ func passwordVerification(t *testing.T) time.Duration {
 // authentication, which verifies a dummy hash for an address it does not know; the
 // master SASL password used to be answered from the master SASL block without one
 // (the target lookup found nothing, or the gate refused the peer), so the response
-// time confirmed a guessed master SASL password. The lookup cache is off, as in the
-// report: with it on, only the first wrong attempt per negative TTL verifies. Both
+// time confirmed a guessed master SASL password. Both cache modes are covered:
+// backend negative entries revalidate on every attempt. Both
 // passwords also pass the progressive delay and the rate-limit check once and are
 // recorded once: a master SASL self-login handed on to regular authentication must not
 // be delayed or checked a second time there.
@@ -86,11 +90,14 @@ func TestManageSieve_MasterSASLSelfLoginTimingIsNotAPasswordOracle(t *testing.T)
 	const saslPass = "master-sasl-secret"
 
 	for _, gate := range []struct {
-		name     string
-		networks []string
+		name         string
+		networks     []string
+		cacheEnabled bool
 	}{
-		{"no_allowed_networks", nil},
-		{"peer_outside_allowed_networks", []string{"192.0.2.0/24"}},
+		{"no_allowed_networks", nil, false},
+		{"peer_outside_allowed_networks", []string{"192.0.2.0/24"}, false},
+		{"cached_no_allowed_networks", nil, true},
+		{"cached_peer_outside_allowed_networks", []string{"192.0.2.0/24"}, true},
 	} {
 		t.Run(gate.name, func(t *testing.T) {
 			address := common.GetRandomAddress(t)
@@ -102,7 +109,7 @@ func TestManageSieve_MasterSASLSelfLoginTimingIsNotAPasswordOracle(t *testing.T)
 					MasterSASLUsername:        saslUser,
 					MasterSASLPassword:        saslPass,
 					MasterSASLAllowedNetworks: gate.networks,
-					LookupCache:               &config.LookupCacheConfig{Enabled: false},
+					LookupCache:               &config.LookupCacheConfig{Enabled: gate.cacheEnabled},
 					AuthLimiterOverride:       limiter,
 				})
 			if err != nil {
@@ -138,11 +145,13 @@ func TestManageSieve_MasterSASLSelfLoginTimingIsNotAPasswordOracle(t *testing.T)
 			if want := (outcome{reply: wrong.reply, delays: 1, checks: 1, failures: 1}); wrong != want {
 				t.Fatalf("wrong password: %+v, want one delay lookup, one rate-limit check and one recorded failure", wrong)
 			}
-			if wrongTook < verification/2 {
-				t.Fatalf("wrong password answered in %v, under half a password verification (%v)", wrongTook, verification)
-			}
-			if masterTook < verification/2 {
-				t.Errorf("master SASL password answered in %v, wrong password in %v (one password verification: %v): the response time confirms the master SASL password", masterTook, wrongTook, verification)
+			if !testing.Short() {
+				if wrongTook < verification/2 {
+					t.Fatalf("wrong password answered in %v, under half a password verification (%v)", wrongTook, verification)
+				}
+				if masterTook < verification/2 {
+					t.Errorf("master SASL password answered in %v, wrong password in %v (one password verification: %v): the response time confirms the master SASL password", masterTook, wrongTook, verification)
+				}
 			}
 		})
 	}

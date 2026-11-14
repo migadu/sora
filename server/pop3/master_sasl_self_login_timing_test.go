@@ -24,28 +24,27 @@ import (
 // authentication, which verifies a dummy hash for an address it does not know; the
 // master SASL password used to be answered from the master SASL block without one
 // (the target lookup found nothing, or the gate refused the peer), so the response
-// time confirmed a guessed master SASL password. The lookup cache is off, as in the
-// report: with it on, only the first wrong attempt per negative TTL verifies. The
+// time confirmed a guessed master SASL password. Both cache modes are covered:
+// backend negative entries revalidate on every attempt. The
 // session is driven directly: over the wire every failed command is held back by
 // the POP3 error delay, which would hide the difference.
 func TestPOP3_MasterSASLSelfLoginTimingIsNotAPasswordOracle(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	rdb := common.SetupTestDatabase(t)
 
-	// The integration harness runs bcrypt at the minimum cost, where a verification is
-	// no slower than a database round trip.
-	saved := db.BcryptCost
-	db.BcryptCost = 10
-	t.Cleanup(func() { db.BcryptCost = saved })
-	// One password verification. Load only ever adds time, so the fastest of a few runs
-	// is the floor.
-	db.DummyVerifyPassword("warm-up") // generates the dummy hash at this cost
-	verification := time.Duration(1 << 62)
-	for range 3 {
-		start := time.Now()
-		db.DummyVerifyPassword("wrong-password")
-		if took := time.Since(start); took < verification {
-			verification = took
+	// Keep scheduling-sensitive calibration out of short runs (#782). Reply
+	// equivalence still runs below, using the harness's normal bcrypt cost.
+	var verification time.Duration
+	if !testing.Short() {
+		saved := db.BcryptCost
+		db.BcryptCost = 10
+		t.Cleanup(func() { db.BcryptCost = saved })
+		db.DummyVerifyPassword("warm-up")
+		verification = time.Duration(1 << 62)
+		for range 3 {
+			start := time.Now()
+			db.DummyVerifyPassword("wrong-password")
+			verification = min(verification, time.Since(start))
 		}
 	}
 
@@ -53,12 +52,15 @@ func TestPOP3_MasterSASLSelfLoginTimingIsNotAPasswordOracle(t *testing.T) {
 	const saslPass = "master-sasl-secret"
 
 	for _, gate := range []struct {
-		name     string
-		networks []string
+		name         string
+		networks     []string
+		cacheEnabled bool
 	}{
-		{"no_allowed_networks", nil},
+		{"no_allowed_networks", nil, false},
 		// The session runs on a net.Pipe, whose peer is in no network.
-		{"peer_outside_allowed_networks", []string{"192.0.2.0/24"}},
+		{"peer_outside_allowed_networks", []string{"192.0.2.0/24"}, false},
+		{"cached_no_allowed_networks", nil, true},
+		{"cached_peer_outside_allowed_networks", []string{"192.0.2.0/24"}, true},
 	} {
 		t.Run(gate.name, func(t *testing.T) {
 			srv, err := pop3.New(context.Background(), "test-master-sasl-self-login-timing", "localhost", common.GetRandomAddress(t),
@@ -69,7 +71,7 @@ func TestPOP3_MasterSASLSelfLoginTimingIsNotAPasswordOracle(t *testing.T) {
 					MasterSASLUsername:        saslUser,
 					MasterSASLPassword:        saslPass,
 					MasterSASLAllowedNetworks: gate.networks,
-					LookupCache:               &config.LookupCacheConfig{Enabled: false},
+					LookupCache:               &config.LookupCacheConfig{Enabled: gate.cacheEnabled},
 				})
 			if err != nil {
 				t.Fatalf("Failed to create POP3 server: %v", err)
@@ -91,11 +93,13 @@ func TestPOP3_MasterSASLSelfLoginTimingIsNotAPasswordOracle(t *testing.T) {
 			if masterReply != wrongReply {
 				t.Fatalf("self-login answered differently by password:\n  wrong password:  %s\n  master password: %s", wrongReply, masterReply)
 			}
-			if wrongTook < verification/2 {
-				t.Fatalf("wrong password answered in %v, under half a password verification (%v)", wrongTook, verification)
-			}
-			if masterTook < verification/2 {
-				t.Errorf("master SASL password answered in %v, wrong password in %v (one password verification: %v): the response time confirms the master SASL password", masterTook, wrongTook, verification)
+			if !testing.Short() {
+				if wrongTook < verification/2 {
+					t.Fatalf("wrong password answered in %v, under half a password verification (%v)", wrongTook, verification)
+				}
+				if masterTook < verification/2 {
+					t.Errorf("master SASL password answered in %v, wrong password in %v (one password verification: %v): the response time confirms the master SASL password", masterTook, wrongTook, verification)
+				}
 			}
 		})
 	}
