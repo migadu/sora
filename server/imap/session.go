@@ -61,7 +61,8 @@ type IMAPSession struct {
 	lastHighestUID        imap.UID
 	recentAboveUID        imap.UID    // Messages above this UID are \Recent in this session (RFC 3501 §2.3.2); set by SELECT
 	useMasterDB           atomic.Bool // Pin session to master DB after a write to ensure consistency
-	selectedReadOnly      atomic.Bool // True when the selected mailbox was opened with EXAMINE (RFC 3501 §6.3.2)
+	selectedReadOnly      atomic.Bool // True when the selected mailbox is read-only: opened with EXAMINE, or SELECTed without any of the 'iestw' rights
+	selectedExamined      atomic.Bool // True when the selected mailbox was opened with EXAMINE itself (RFC 9051 §6.3.3)
 
 	// A CONDSTORE STORE .SILENT answers its changed rows itself with
 	// FETCH (UID MODSEQ) (RFC 7162 §3.1.3). ownStoreMu serializes that STORE
@@ -497,6 +498,7 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.releaseBodySectionCache()
 	s.selectedMailbox = nil
 	s.selectedReadOnly.Store(false)
+	s.selectedExamined.Store(false)
 	s.mailboxTracker = nil
 	s.sessionTracker = nil
 	s.currentHighestModSeq.Store(0)
