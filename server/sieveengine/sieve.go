@@ -759,8 +759,10 @@ type Destination struct {
 func (r Result) Destinations(redirectFailed bool) []Destination {
 	dests := make([]Destination, 0, len(r.Mailboxes)+1)
 	add := func(mailbox string, create bool) {
-		for _, d := range dests {
-			if strings.EqualFold(d.Mailbox, mailbox) {
+		for i := range dests {
+			if strings.EqualFold(dests[i].Mailbox, mailbox) {
+				// One copy, but a :create on either spelling still creates it.
+				dests[i].Create = dests[i].Create || create
 				return
 			}
 		}

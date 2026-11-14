@@ -103,6 +103,12 @@ func TestResultDestinations(t *testing.T) {
 			result: Result{Action: ActionFileInto, Mailboxes: []string{"inbox", "Archive", "archive"}, Copy: true},
 			want:   []Destination{{Mailbox: "inbox"}, {Mailbox: "Archive"}},
 		},
+		{
+			// The second fileinto asked for the mailbox to be created (RFC 5490 §3.2).
+			name:   "one mailbox named twice is created if either asks",
+			result: Result{Action: ActionFileInto, Mailboxes: []string{"archive", "Archive"}, CreateMailboxes: []string{"Archive"}},
+			want:   []Destination{{Mailbox: "archive", Create: true}},
+		},
 		{name: "redirect", result: Result{Action: ActionRedirect, RedirectTo: []string{"a@example.org"}}},
 		{
 			name:   "redirect :copy",
